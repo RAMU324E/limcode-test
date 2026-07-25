@@ -1,109 +1,130 @@
-import type { WorldReader } from '../ecs/types';
-import type { ConversationRunHistorySaveMode, StorageCapability } from '../capabilities/types';
+import type { ComponentType, WorldReader } from '../ecs/types';
+import type { StorageCapability } from '../capabilities/types';
 import { StorageStateContributorsKey } from '../world/storageProjection/resources';
 import { projectStorageStateWithCache, type StorageContributorProjectionState } from '../world/storageProjection/projection';
-import type { AgentRunStatus, ClientState, ClientStateTableKey, ConversationOriginLinkRecord, MessageContent, MessageRecord, SidebarConversationHistoryEntry } from '../../shared/protocol';
-import { conversationCreatedAtFromId, displayConversationTitle } from '../../shared/conversationTitle';
-import { collectChangedClientStateConversationIds } from '../../shared/clientStateConversationScope';
-import { conversationRenderDetailSlice, conversationRunHistorySlice } from '../capabilities/vscodeStorage/clientStateStore';
+import type { ClientState } from '../../shared/protocol';
+import { createEmptyClientState } from '../../shared/clientStateSchema';
+import { Agent, AgentConversationLink, AgentKind, AgentStatus, ConversationAgentSelection } from '../world/modules/agent/components';
+import { Conversation, ConversationBranchLink, ConversationOriginLink, ConversationReuseLink } from '../world/modules/chat/components';
+import { ConversationWorkflowSelection, ModelProfile, ModelProfileScopeLink, SystemPrompt, SystemPromptScopeLink, ToolPolicy, Workflow } from '../world/modules/workflow/components';
+import { PlanReviewPolicy, PlanReviewPolicyScopeLink } from '../world/modules/plan/components';
+import { ToolPolicyScopeLink } from '../world/modules/tools/components';
+import { SkillPolicy, SkillPolicyScopeLink } from '../world/modules/skill/components';
+import { RuntimeContext, RuntimeContextScopeLink } from '../world/modules/runtimeContext/components';
+import { ConversationProjectLink, ProjectContext } from '../world/modules/project/components';
+import { ConversationWorkEnvironmentLink, WorkEnvironment, WorkEnvironmentPolicy, WorkEnvironmentPolicyScopeLink } from '../world/modules/workEnvironment/components';
+import { CheckpointPolicy, CheckpointPolicyScopeLink, ShadowRepository } from '../world/modules/checkpoint/components';
 
 const DEFAULT_PERSIST_DEBOUNCE_MS = 500;
 
-const RUN_HISTORY_TABLE_KEYS = [
-  'agentRuns',
-  'agentRunSourceLinks',
-  'agentRunTargetLinks',
-  'messageRunLinks',
-  'toolCallRunLinks',
-  'runConversationPolicies',
-  'runContextPolicies',
-  'runDeliveryPolicies',
-  'runEditPolicies',
-  'runWorkflowLinks',
-  'runSystemPromptLinks',
-  'runModelProfileLinks',
-  'runToolPolicyLinks',
-  'runRuntimeContextSnapshotLinks',
-  'runConversationPolicyLinks',
-  'runContextPolicyLinks',
-  'runDeliveryPolicyLinks',
-  'runEditPolicyLinks',
-  'llmInvocations',
-  'runLlmInvocationLinks',
-  'messageLlmInvocationLinks',
-  'runWorkEnvironmentLinks',
-  'agentRunInputRevisions',
-  'runCompressionBlockLinks'
-] as const;
-
-export interface ClientStatePersistenceOptions {
-  isConversationRenderDetailLoaded?: (conversationId: string) => boolean;
-  renderLoadedConversationIds?: () => Iterable<string>;
-  isConversationRunHistoryLoaded?: (conversationId: string) => boolean;
-  runHistoryLoadedConversationIds?: () => Iterable<string>;
-  /**
-   * 历史摘要只能由完整聊天渲染详情生成。
-   *
-   * 仅加载尾部消息用于快速显示时，也需要允许增量保存消息块；但不能用这份
-   * partial state 覆盖 conversation-history，否则重启后会把长对话标题/预览/条数
-   * 降级成“新对话 / 暂无消息”或尾部工具响应。
-   */
-  isConversationHistorySummaryComplete?: (conversationId: string) => boolean;
-}
-
-interface PendingRunHistoryState {
-  readonly state: ClientState;
-  readonly mode: ConversationRunHistorySaveMode;
-}
+/**
+ * Exact version gate for the independent-domain skeleton below. It intentionally excludes
+ * Message/Streaming/ToolCall/AgentRun and other conversation-runtime facts: those are committed by
+ * FileConversationTransactionBackend and must not schedule a full skeleton projection per delta.
+ *
+ * Entity identities referenced by a Link are immutable. Creating/repointing such a relation writes
+ * the Link itself, so runtime source entities used only to resolve a cold id do not belong here.
+ */
+const SKELETON_PERSISTENCE_COMPONENTS: readonly ComponentType<unknown>[] = [
+  Agent,
+  AgentConversationLink,
+  ConversationAgentSelection,
+  AgentKind,
+  AgentStatus,
+  Conversation,
+  ConversationReuseLink,
+  ConversationBranchLink,
+  ConversationOriginLink,
+  Workflow,
+  ToolPolicy,
+  SystemPrompt,
+  SystemPromptScopeLink,
+  ModelProfile,
+  ModelProfileScopeLink,
+  ConversationWorkflowSelection,
+  PlanReviewPolicy,
+  PlanReviewPolicyScopeLink,
+  ToolPolicyScopeLink,
+  SkillPolicy,
+  SkillPolicyScopeLink,
+  RuntimeContext,
+  RuntimeContextScopeLink,
+  ProjectContext,
+  ConversationProjectLink,
+  WorkEnvironment,
+  WorkEnvironmentPolicy,
+  WorkEnvironmentPolicyScopeLink,
+  ConversationWorkEnvironmentLink,
+  CheckpointPolicy,
+  CheckpointPolicyScopeLink,
+  ShadowRepository
+];
 
 /**
- * Storage 持久化使用独立投影缓存。懒加载后必须把骨架、聊天渲染详情与运行历史分开保存，
- * 避免普通聊天只加载 messages/toolCalls 时把未加载的 runHistory index 覆盖为空。
+ * Persists only independent, non-conversation aggregate records and links.
+ *
+ * Conversation control/runtime/timeline/compression facts are committed exclusively by
+ * FileConversationTransactionBackend. Run History and conversation history are derived read models
+ * and therefore do not enter this writer.
  */
 export class ClientStatePersistence {
   private enabled = false;
   private lastPersistedSkeletonJson = '';
-  private pendingSkeletonState: ClientState | undefined;
-  private readonly lastPersistedRenderDetailJson = new Map<string, string>();
-  private readonly lastPersistedRunHistoryJson = new Map<string, string>();
-  private readonly pendingRenderDetailStates = new Map<string, ClientState>();
-  private readonly pendingRunHistoryStates = new Map<string, PendingRunHistoryState>();
-  private readonly pendingHistoryStates = new Map<string, ClientState>();
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
   private persistInFlight = false;
   private persistPendingAfterInFlight = false;
   private readonly persistIdleWaiters: Array<() => void> = [];
-
   private projectionClock = '';
   private contributorStates: Record<string, StorageContributorProjectionState> = {};
   private lastProjectedState: ClientState | undefined;
+  private lastAdmittedSkeletonClock = '';
 
   public constructor(
     private readonly world: WorldReader,
     private readonly storage: StorageCapability,
-    private readonly options: ClientStatePersistenceOptions = {},
     private readonly debounceMs = DEFAULT_PERSIST_DEBOUNCE_MS
   ) {}
 
   public enable(): void { this.enabled = true; }
+
+  /** Stops new debounce admission and waits for any active independent-domain write. */
+  public async suspend(): Promise<void> {
+    this.enabled = false;
+    this.clearPersistTimer();
+    this.persistPendingAfterInFlight = false;
+    await this.waitForPersistIdle();
+  }
 
   public rememberPersistedState(state: ClientState): void {
     this.lastPersistedSkeletonJson = JSON.stringify(skeletonPersistenceSlice(state));
     this.lastProjectedState = state;
     this.projectionClock = '';
     this.contributorStates = {};
-    this.lastPersistedRenderDetailJson.clear();
-    this.lastPersistedRunHistoryJson.clear();
+    this.lastAdmittedSkeletonClock = skeletonPersistenceVersionClock(this.world);
   }
 
+  /** Explicit mutation path: always performs one debounced equality check. */
   public queuePersist(): void {
     if (!this.enabled) return;
+    this.lastAdmittedSkeletonClock = skeletonPersistenceVersionClock(this.world);
     this.schedulePersistCheck();
   }
 
-  public async persistImmediately(options: { force?: boolean; ensurePersisted?: boolean; forceConversationId?: string; throwOnError?: boolean } = {}): Promise<void> {
-    this.clearPersistTimer();
+  /** Scheduler path: transient conversation ticks are rejected before allocating a timer/projection. */
+  public queuePersistIfSkeletonChanged(): void {
+    if (!this.enabled) return;
+    const clock = skeletonPersistenceVersionClock(this.world);
+    if (clock === this.lastAdmittedSkeletonClock) return;
+    this.lastAdmittedSkeletonClock = clock;
+    this.schedulePersistCheck();
+  }
 
+  public async persistImmediately(options: {
+    force?: boolean;
+    ensurePersisted?: boolean;
+    throwOnError?: boolean;
+  } = {}): Promise<void> {
+    this.clearPersistTimer();
     if (this.persistInFlight) {
       this.persistPendingAfterInFlight = true;
       await this.waitForPersistIdle();
@@ -111,52 +132,21 @@ export class ClientStatePersistence {
     }
 
     const latest = this.projectLatestState();
-    const forcedConversationId = options.forceConversationId?.trim();
     const latestState = latest?.state ?? this.lastProjectedState;
-    if (!options.force && !options.ensurePersisted && !forcedConversationId && latest && !latest.changed && !this.hasPendingStates()) return;
-
     if (!this.enabled || !latestState) return;
-
-    const targetConversationIds = options.force || options.ensurePersisted
-      ? undefined
-      : latest?.previousState
-        ? collectChangedClientStateConversationIds(latest.previousState, latestState, latest.changedTableKeys)
-        : undefined;
-    this.collectPendingStates(latestState, !!options.force, targetConversationIds);
-    if (forcedConversationId) this.collectForcedConversationState(latestState, forcedConversationId);
-    if (!this.pendingSkeletonState && this.pendingRenderDetailStates.size === 0 && this.pendingRunHistoryStates.size === 0 && this.pendingHistoryStates.size === 0) return;
-
-    const skeletonState = this.pendingSkeletonState;
-    const renderDetailStates = [...this.pendingRenderDetailStates.entries()];
-    const runHistoryStates = [...this.pendingRunHistoryStates.entries()];
-    const historyStates = [...this.pendingHistoryStates.entries()];
-    this.pendingSkeletonState = undefined;
-    this.pendingRenderDetailStates.clear();
-    this.pendingRunHistoryStates.clear();
-    this.pendingHistoryStates.clear();
+    const skeleton = skeletonPersistenceSlice(latestState);
+    const skeletonJson = JSON.stringify(skeleton);
+    if (!options.force && !options.ensurePersisted && skeletonJson === this.lastPersistedSkeletonJson) return;
 
     this.persistInFlight = true;
     try {
-      if (skeletonState) {
-        await this.storage.saveClientStateSkeleton(skeletonState);
-        this.lastPersistedSkeletonJson = JSON.stringify(skeletonPersistenceSlice(skeletonState));
-      }
-
-      // 每个 conversation 使用独立存储目录，可并行落盘；共享 history index 仍在下方串行更新。
-      await awaitAllPersistTasks(renderDetailStates.map(async ([conversationId, state]) => {
-        await this.storage.saveConversationRenderDetail(conversationId, state);
-        this.lastPersistedRenderDetailJson.set(conversationId, JSON.stringify(conversationRenderDetailSlice(state, conversationId)));
-      }));
-
-      await awaitAllPersistTasks(runHistoryStates.map(async ([conversationId, pending]) => {
-        await this.storage.saveConversationRunHistory(conversationId, pending.state, { mode: pending.mode });
-        this.lastPersistedRunHistoryJson.set(conversationId, JSON.stringify(conversationRunHistorySlice(pending.state, conversationId)));
-      }));
-
-      await this.persistHistoryEntries(historyStates);
+      await this.storage.saveClientStateSkeleton(skeleton);
+      this.lastPersistedSkeletonJson = skeletonJson;
     } catch (error) {
-      this.restorePendingStates(skeletonState, renderDetailStates, runHistoryStates, historyStates);
-      console.warn('[LimCode] Failed to persist client state:', error);
+      // Re-admit the current version on the next scheduler tick instead of permanently suppressing
+      // retries merely because the failed version had already crossed the cheap gate.
+      this.lastAdmittedSkeletonClock = '';
+      console.error('[LimCode] Failed to persist independent client-state domains:', error);
       if (options.throwOnError) throw error;
     } finally {
       this.persistInFlight = false;
@@ -166,138 +156,6 @@ export class ClientStatePersistence {
         this.schedulePersistCheck();
       }
     }
-  }
-
-  private hasPendingStates(): boolean {
-    return !!this.pendingSkeletonState
-      || this.pendingRenderDetailStates.size > 0
-      || this.pendingRunHistoryStates.size > 0
-      || this.pendingHistoryStates.size > 0;
-  }
-
-  private restorePendingStates(
-    skeletonState: ClientState | undefined,
-    renderDetailStates: Array<[string, ClientState]>,
-    runHistoryStates: Array<[string, PendingRunHistoryState]>,
-    historyStates: Array<[string, ClientState]>
-  ): void {
-    if (skeletonState && !this.pendingSkeletonState) this.pendingSkeletonState = skeletonState;
-    for (const [conversationId, state] of renderDetailStates) {
-      if (!this.pendingRenderDetailStates.has(conversationId)) this.pendingRenderDetailStates.set(conversationId, state);
-    }
-    for (const [conversationId, state] of runHistoryStates) {
-      if (!this.pendingRunHistoryStates.has(conversationId)) this.pendingRunHistoryStates.set(conversationId, state);
-    }
-    for (const [conversationId, state] of historyStates) {
-      if (!this.pendingHistoryStates.has(conversationId)) this.pendingHistoryStates.set(conversationId, state);
-    }
-  }
-
-  private collectPendingStates(state: ClientState, force: boolean, targetConversationIds?: ReadonlySet<string>): void {
-    const skeletonJson = JSON.stringify(skeletonPersistenceSlice(state));
-    if (force || skeletonJson !== this.lastPersistedSkeletonJson) {
-      this.pendingSkeletonState = state;
-    }
-
-    const targetIdsAreKnownChanged = !!targetConversationIds && !force;
-    for (const conversationId of this.renderLoadedConversationIds(state)) {
-      if (targetConversationIds && !targetConversationIds.has(conversationId)) continue;
-      if (!targetIdsAreKnownChanged) {
-        const detail = conversationRenderDetailSlice(state, conversationId);
-        const detailJson = JSON.stringify(detail);
-        if (!force && detailJson === this.lastPersistedRenderDetailJson.get(conversationId)) continue;
-      }
-      this.pendingRenderDetailStates.set(conversationId, state);
-      if (this.shouldPersistHistorySummary(conversationId)) {
-        this.pendingHistoryStates.set(conversationId, state);
-      }
-    }
-
-    const replaceRunHistoryIds = new Set(this.runHistoryLoadedConversationIds(state));
-    for (const conversationId of replaceRunHistoryIds) {
-      if (targetConversationIds && !targetConversationIds.has(conversationId)) continue;
-      this.collectPendingRunHistoryState(state, conversationId, 'replace', force, true);
-    }
-
-    for (const conversationId of knownRunHistoryConversationIds(state)) {
-      if (targetConversationIds && !targetConversationIds.has(conversationId)) continue;
-      if (replaceRunHistoryIds.has(conversationId)) continue;
-      this.collectPendingRunHistoryState(state, conversationId, 'merge', force, false);
-    }
-  }
-
-  private collectForcedConversationState(state: ClientState, conversationId: string): void {
-    if (this.renderLoadedConversationIds(state).includes(conversationId)) {
-      this.pendingRenderDetailStates.set(conversationId, state);
-      if (this.shouldPersistHistorySummary(conversationId)) {
-        this.pendingHistoryStates.set(conversationId, state);
-      }
-    }
-
-    if (this.runHistoryLoadedConversationIds(state).includes(conversationId)) {
-      this.pendingRunHistoryStates.set(conversationId, { state, mode: 'replace' });
-      this.pendingHistoryStates.set(conversationId, state);
-      return;
-    }
-
-    if (knownRunHistoryConversationIds(state).includes(conversationId)) {
-      const detail = conversationRunHistorySlice(state, conversationId);
-      if (hasRunHistoryRecords(detail)) {
-        this.pendingRunHistoryStates.set(conversationId, { state, mode: 'merge' });
-        this.pendingHistoryStates.set(conversationId, state);
-      }
-    }
-  }
-
-  private collectPendingRunHistoryState(
-    state: ClientState,
-    conversationId: string,
-    mode: ConversationRunHistorySaveMode,
-    force: boolean,
-    allowEmpty: boolean
-  ): void {
-    const detail = conversationRunHistorySlice(state, conversationId);
-    if (!allowEmpty && !hasRunHistoryRecords(detail)) return;
-
-    const shouldCompareJson = !force;
-    if (shouldCompareJson) {
-      const detailJson = JSON.stringify(detail);
-      if (detailJson === this.lastPersistedRunHistoryJson.get(conversationId)) return;
-    }
-
-    const existing = this.pendingRunHistoryStates.get(conversationId);
-    if (existing?.mode === 'replace') return;
-    this.pendingRunHistoryStates.set(conversationId, { state, mode });
-    if (this.shouldPersistHistorySummary(conversationId)) {
-      this.pendingHistoryStates.set(conversationId, state);
-    }
-  }
-
-  private shouldPersistHistorySummary(conversationId: string): boolean {
-    return this.options.isConversationHistorySummaryComplete?.(conversationId) ?? true;
-  }
-
-  private renderLoadedConversationIds(state: ClientState): string[] {
-    const explicit = this.options.renderLoadedConversationIds?.();
-    if (explicit) {
-      const ids = new Set(uniqueIds(explicit).filter((id) => this.options.isConversationRenderDetailLoaded?.(id) ?? true));
-      return [...ids];
-    }
-
-    const ids = new Set(state.messages.map((message) => message.conversationId));
-    for (const conversation of state.conversations) {
-      if (this.options.isConversationRenderDetailLoaded?.(conversation.id)) ids.add(conversation.id);
-    }
-    return [...ids];
-  }
-
-  private runHistoryLoadedConversationIds(state: ClientState): string[] {
-    const explicit = this.options.runHistoryLoadedConversationIds?.();
-    if (explicit) return uniqueIds(explicit).filter((id) => this.options.isConversationRunHistoryLoaded?.(id) ?? true);
-
-    return state.conversations
-      .map((conversation) => conversation.id)
-      .filter((id) => this.options.isConversationRunHistoryLoaded?.(id) ?? false);
   }
 
   private schedulePersistCheck(): void {
@@ -320,9 +178,7 @@ export class ClientStatePersistence {
 
   private waitForPersistIdle(): Promise<void> {
     if (!this.persistInFlight) return Promise.resolve();
-    return new Promise((resolve) => {
-      this.persistIdleWaiters.push(resolve);
-    });
+    return new Promise((resolve) => this.persistIdleWaiters.push(resolve));
   }
 
   private resolvePersistIdleWaiters(): void {
@@ -330,17 +186,10 @@ export class ClientStatePersistence {
     for (const resolve of waiters) resolve();
   }
 
-  private async persistHistoryEntries(historyStates: Array<[string, ClientState]>): Promise<void> {
-    for (const [conversationId, state] of historyStates) {
-      const entry = projectConversationHistoryEntry(state, conversationId);
-      if (entry) await this.storage.upsertConversationHistoryEntry(entry, originLinkForConversation(state, conversationId));
-    }
-  }
-
-  private projectLatestState(): { state: ClientState; changed: boolean; previousState?: ClientState; changedTableKeys?: readonly ClientStateTableKey[] } | undefined {
+  private projectLatestState(): { state: ClientState; changed: boolean } | undefined {
     const previousState = this.lastProjectedState;
     const registry = this.world.tryGetResource(StorageStateContributorsKey);
-    if (!registry) return previousState ? { state: previousState, changed: false, previousState } : undefined;
+    if (!registry) return previousState ? { state: previousState, changed: false } : undefined;
 
     const projection = projectStorageStateWithCache(this.world, registry.list(), {
       projectionClock: this.projectionClock,
@@ -349,234 +198,58 @@ export class ClientStatePersistence {
     this.projectionClock = projection.projectionClock;
     this.contributorStates = projection.contributorStates;
     this.lastProjectedState = projection.state;
-    return {
-      state: projection.state,
-      changed: projection.changed,
-      previousState,
-      changedTableKeys: changedStorageTableKeys(projection.changedContributorKeys, projection.contributorStates)
-    };
+    return { state: projection.state, changed: projection.changed };
   }
 }
 
-async function awaitAllPersistTasks(tasks: Promise<void>[]): Promise<void> {
-  const results = await Promise.allSettled(tasks);
-  const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
-  if (failure) throw failure.reason;
-}
-
-function changedStorageTableKeys(
-  changedContributorKeys: readonly string[],
-  contributorStates: Record<string, StorageContributorProjectionState>
-): readonly ClientStateTableKey[] | undefined {
-  if (changedContributorKeys.length === 0) return undefined;
-  const tableKeys = new Set<ClientStateTableKey>();
-  for (const key of changedContributorKeys) {
-    const slice = contributorStates[key]?.slice;
-    const keys = slice ? Object.keys(slice) as ClientStateTableKey[] : [];
-    if (keys.length === 0) return undefined;
-    for (const tableKey of keys) tableKeys.add(tableKey);
-  }
-  return [...tableKeys];
-}
-
+/**
+ * Explicit allow-list: adding a new ClientState table never makes it durable through this writer by
+ * accident. Conversation aggregates and all Run/timeline/compression tables remain empty.
+ */
 function skeletonPersistenceSlice(state: ClientState): ClientState {
-  return {
-    ...state,
-    checkpoints: state.checkpoints.filter((checkpoint) => checkpoint.status !== 'pending'),
-    checkpointTimelineAnchors: state.checkpointTimelineAnchors.filter((anchor) => state.checkpoints.some((checkpoint) => checkpoint.id === anchor.checkpointId && checkpoint.status !== 'pending')),
-    messages: [],
-    messageRevisions: [],
-    messageCurrentRevisionLinks: [],
-    toolCalls: [],
-    toolCallEvents: [],
-    agentRuns: [],
-    agentRunSourceLinks: [],
-    agentRunTargetLinks: [],
-    messageRunLinks: [],
-    toolCallRunLinks: [],
-    runConversationPolicies: [],
-    runContextPolicies: [],
-    runDeliveryPolicies: [],
-    runEditPolicies: [],
-    runWorkflowLinks: [],
-    runSystemPromptLinks: [],
-    runModelProfileLinks: [],
-    runToolPolicyLinks: [],
-    runRuntimeContextSnapshotLinks: [],
-    runConversationPolicyLinks: [],
-    runContextPolicyLinks: [],
-    runDeliveryPolicyLinks: [],
-    runEditPolicyLinks: [],
-    llmInvocations: [],
-    runLlmInvocationLinks: [],
-    messageLlmInvocationLinks: [],
-    agentRunInputRevisions: [],
-    compressionBlocks: [],
-    compressionBlockSourceLinks: [],
-    compressionContextVariants: [],
-    compressionBlockLlmInvocationLinks: [],
-    runCompressionBlockLinks: []
-  };
+  const skeleton = createEmptyClientState();
+  skeleton.agents = state.agents;
+  skeleton.agentConversationLinks = state.agentConversationLinks;
+  skeleton.conversationAgentSelections = state.conversationAgentSelections;
+
+  skeleton.workflows = state.workflows;
+  skeleton.conversationWorkflowSelections = state.conversationWorkflowSelections;
+  skeleton.planReviewPolicies = state.planReviewPolicies;
+  skeleton.planReviewPolicyScopeLinks = state.planReviewPolicyScopeLinks.filter(notRunScoped);
+  skeleton.toolPolicies = state.toolPolicies;
+  skeleton.toolPolicyScopeLinks = state.toolPolicyScopeLinks.filter(notRunScoped);
+  skeleton.skillPolicies = state.skillPolicies;
+  skeleton.skillPolicyScopeLinks = state.skillPolicyScopeLinks.filter(notRunScoped);
+  skeleton.systemPrompts = state.systemPrompts;
+  skeleton.systemPromptScopeLinks = state.systemPromptScopeLinks.filter(notRunScoped);
+  skeleton.runtimeContexts = state.runtimeContexts;
+  skeleton.runtimeContextScopeLinks = state.runtimeContextScopeLinks.filter(notRunScoped);
+  skeleton.modelProfiles = state.modelProfiles;
+  skeleton.modelProfileScopeLinks = state.modelProfileScopeLinks.filter(notRunScoped);
+
+  skeleton.conversationReuseLinks = state.conversationReuseLinks;
+  skeleton.conversationBranchLinks = state.conversationBranchLinks;
+  skeleton.conversationOriginLinks = state.conversationOriginLinks;
+  skeleton.projectContexts = state.projectContexts;
+  skeleton.conversationProjectLinks = state.conversationProjectLinks;
+
+  skeleton.workEnvironments = state.workEnvironments;
+  skeleton.workEnvironmentPolicies = state.workEnvironmentPolicies;
+  skeleton.workEnvironmentPolicyScopeLinks = state.workEnvironmentPolicyScopeLinks.filter(notRunScoped);
+  skeleton.conversationWorkEnvironmentLinks = state.conversationWorkEnvironmentLinks;
+
+  skeleton.checkpointPolicies = state.checkpointPolicies;
+  skeleton.checkpointPolicyScopeLinks = state.checkpointPolicyScopeLinks.filter(notRunScoped);
+  skeleton.shadowRepositories = state.shadowRepositories;
+  return skeleton;
 }
 
-function knownRunHistoryConversationIds(state: ClientState): string[] {
-  const ids = new Set<string>();
-  const messageConversationIds = new Map(state.messages.map((message) => [message.id, message.conversationId]));
-  const toolCallMessageIds = new Map(state.toolCalls.map((toolCall) => [toolCall.id, toolCall.messageId]));
-  const compressionConversationIds = new Map(state.compressionBlocks.map((block) => [block.id, block.conversationId]));
-
-  for (const link of state.agentRunTargetLinks) addId(ids, link.conversationId);
-  for (const link of state.agentRunSourceLinks) addId(ids, link.sourceConversationId);
-  for (const link of state.messageRunLinks) addId(ids, messageConversationIds.get(link.messageId));
-  for (const link of state.toolCallRunLinks) addId(ids, conversationIdForToolCall(link.toolCallId, toolCallMessageIds, messageConversationIds));
-  for (const input of state.agentRunInputRevisions) addId(ids, input.conversationId);
-  for (const link of state.runCompressionBlockLinks) addId(ids, compressionConversationIds.get(link.blockId));
-  for (const policy of state.runConversationPolicies) {
-    addId(ids, policy.conversationId);
-    addId(ids, policy.branchFromConversationId);
-  }
-  for (const policy of state.runDeliveryPolicies) addId(ids, policy.targetConversationId);
-
-  return [...ids];
+function notRunScoped<TRecord extends { scopeKind: string }>(record: TRecord): boolean {
+  return record.scopeKind !== 'run';
 }
 
-function conversationIdForToolCall(toolCallId: string, toolCallMessageIds: ReadonlyMap<string, string>, messageConversationIds: ReadonlyMap<string, string>): string | undefined {
-  const messageId = toolCallMessageIds.get(toolCallId);
-  return messageId ? messageConversationIds.get(messageId) : undefined;
-}
-
-function hasRunHistoryRecords(state: ClientState): boolean {
-  return RUN_HISTORY_TABLE_KEYS.some((key) => state[key].length > 0);
-}
-
-function uniqueIds(ids: Iterable<string>): string[] {
-  const result = new Set<string>();
-  for (const id of ids) addId(result, id);
-  return [...result];
-}
-
-function addId(target: Set<string>, id: string | undefined): void {
-  if (id) target.add(id);
-}
-
-function projectConversationHistoryEntry(state: ClientState, conversationId: string): SidebarConversationHistoryEntry | undefined {
-  const conversation = state.conversations.find((candidate) => candidate.id === conversationId);
-  if (!conversation) return undefined;
-  const messages = state.messages
-    .filter((message) => message.conversationId === conversationId)
-    .sort((left, right) => left.seq - right.seq || left.createdAt - right.createdAt);
-  const latest = latestMessage(messages);
-  const runSummary = activeRunSummary(state, conversationId);
-  const project = projectInfoForConversation(state, conversationId);
-  const title = displayConversationTitle({ id: conversation.id, title: conversation.title, messages });
-  const fallbackUpdatedAt = conversationCreatedAtFromId(conversation.id);
-  const preview = latest ? messagePreview(latest) : '暂无消息，点击开始新的交流。';
-  const entry: SidebarConversationHistoryEntry = {
-    id: conversation.id,
-    title,
-    preview,
-    messageCount: messages.length,
-    status: latest?.status ?? 'empty',
-    isRunning: !!runSummary,
-    ...(latest ? { updatedAt: latest.createdAt } : fallbackUpdatedAt !== undefined ? { updatedAt: fallbackUpdatedAt } : {}),
-    ...(agentNameForConversation(state, conversationId) ? { agentName: agentNameForConversation(state, conversationId) } : {}),
-    ...(project?.uri ? { projectFolderUri: project.uri } : {}),
-    ...(project?.name ? { projectName: project.name } : {})
-  };
-  const previewState = latest ? aiPreviewState(latest) : undefined;
-  if (previewState) entry.previewState = previewState;
-  if (runSummary) {
-    entry.runStatus = runSummary.status;
-    entry.runStatusLabel = runSummary.label;
-    entry.updatedAt = Math.max(entry.updatedAt ?? 0, runSummary.updatedAt);
-  }
-  return entry;
-}
-
-function latestMessage(messages: MessageRecord[]): MessageRecord | undefined {
-  return messages.reduce<MessageRecord | undefined>((latest, message) => {
-    if (!latest) return message;
-    return message.createdAt > latest.createdAt || (message.createdAt === latest.createdAt && message.seq > latest.seq) ? message : latest;
-  }, undefined);
-}
-
-function messagePreview(message: MessageRecord): string {
-  const text = normalizeText(textPreview(message.content));
-  if (text) return truncateText(text, 72);
-  const state = aiPreviewState(message);
-  return message.role === 'user' ? '用户消息' : state === 'pending' ? '响应中' : '空响应';
-}
-
-function aiPreviewState(message: MessageRecord): 'pending' | 'empty' | undefined {
-  if (message.role !== 'model' || normalizeText(textPreview(message.content))) return undefined;
-  return message.status === 'streaming' ? 'pending' : 'empty';
-}
-
-function textPreview(content: MessageContent): string {
-  for (const part of content.parts) {
-    if ('text' in part && part.thought !== true && part.text.trim()) return part.text;
-    if ('functionCall' in part) return `调用工具：${part.functionCall.name}`;
-    if ('functionResponse' in part) return `工具返回：${part.functionResponse.name}`;
-    if ('fileData' in part) return `文件：${part.fileData.uri}`;
-    if ('inlineData' in part) return `附件：${part.inlineData.mimeType}`;
-  }
-  return '';
-}
-
-function activeRunSummary(state: ClientState, conversationId: string): { status: AgentRunStatus; label: string; updatedAt: number } | undefined {
-  const runIds = new Set(state.agentRunTargetLinks.filter((link) => link.conversationId === conversationId).map((link) => link.runId));
-  return state.agentRuns
-    .filter((run) => runIds.has(run.id) && isActiveAgentRunStatus(run.status))
-    .sort((left, right) => right.updatedAt - left.updatedAt)[0]
-    ? (() => {
-        const run = state.agentRuns.filter((candidate) => runIds.has(candidate.id) && isActiveAgentRunStatus(candidate.status)).sort((left, right) => right.updatedAt - left.updatedAt)[0];
-        return { status: run.status, label: labelForAgentRunStatus(run.status), updatedAt: run.updatedAt };
-      })()
-    : undefined;
-}
-
-function agentNameForConversation(state: ClientState, conversationId: string): string | undefined {
-  const link = state.agentConversationLinks.find((candidate) => candidate.conversationId === conversationId && candidate.role === 'default')
-    ?? state.agentConversationLinks.find((candidate) => candidate.conversationId === conversationId);
-  return state.agents.find((agent) => agent.id === link?.agentId)?.name;
-}
-
-function projectInfoForConversation(state: ClientState, conversationId: string): { uri: string; name: string } | undefined {
-  const link = state.conversationProjectLinks.find((candidate) => candidate.conversationId === conversationId && candidate.role === 'primary');
-  const project = state.projectContexts.find((candidate) => candidate.id === link?.projectContextId);
-  return project ? { uri: project.uri, name: project.name } : undefined;
-}
-
-function originLinkForConversation(state: ClientState, conversationId: string): ConversationOriginLinkRecord | undefined {
-  return state.conversationOriginLinks
-    .filter((candidate) => candidate.conversationId === conversationId)
-    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))[0];
-}
-
-function normalizeText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
-}
-
-function truncateText(text: string, maxLength: number): string {
-  return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 1))}…` : text;
-}
-
-function isActiveAgentRunStatus(status: AgentRunStatus): boolean {
-  return status !== 'completed' && status !== 'failed' && status !== 'cancelled' && status !== 'stale';
-}
-
-function labelForAgentRunStatus(status: AgentRunStatus): string {
-  switch (status) {
-    case 'queued': return '排队中';
-    case 'preparing': return '准备中';
-    case 'running': return '执行中';
-    case 'waiting_tool': return '等待工具';
-    case 'waiting_child_run': return '等待子任务';
-    case 'delivering': return '整理回复';
-    case 'paused': return '已暂停';
-    case 'completed': return '已完成';
-    case 'failed': return '失败';
-    case 'cancelled': return '已终止';
-    case 'stale': return '已过期';
-  }
+export function skeletonPersistenceVersionClock(world: WorldReader): string {
+  return SKELETON_PERSISTENCE_COMPONENTS
+    .map((component) => `${component.name}:${world.componentVersion(component)}`)
+    .join('|');
 }
