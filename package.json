@@ -1,10 +1,14 @@
 {
-  "name": "limcode",
-  "displayName": "LimCode",
+  "name": "limcode-test",
+  "displayName": "Limcode test",
   "description": "VS Code extension with a TypeScript ECS backend, Vue webview frontend, and a basic AI chat flow.",
-  "version": "0.0.1",
+  "version": "0.0.8",
   "publisher": "your-publisher",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lianues/limcode2.git"
+  },
   "engines": {
     "vscode": "^1.89.0"
   },
@@ -13,42 +17,52 @@
   ],
   "main": "./dist/extension/vscode/extension.js",
   "activationEvents": [
-    "onWebviewPanel:limcode.mainPanel"
+    "onWebviewPanel:limcode-test.mainPanel"
   ],
   "contributes": {
     "commands": [
       {
-        "command": "limcode.openPanel",
-        "title": "LimCode: Open AI Chat",
-        "category": "LimCode"
+        "command": "limcode-test.openPanel",
+        "title": "Limcode test: Open AI Chat",
+        "category": "Limcode test"
       },
       {
-        "command": "limcode.revealGlobalStorage",
-        "title": "LimCode: Reveal Data Storage Folder",
-        "category": "LimCode"
+        "command": "limcode-test.revealGlobalStorage",
+        "title": "Limcode test: Reveal Data Storage Folder",
+        "category": "Limcode test"
+      },
+      {
+        "command": "limcode-test.inspectReliability",
+        "title": "Limcode test: Inspect Reliability State (Development)",
+        "category": "Limcode test"
+      },
+      {
+        "command": "limcode-test.resetDevelopmentData",
+        "title": "Limcode test: Archive and Reset Development Data",
+        "category": "Limcode test"
       }
     ],
     "keybindings": [
       {
-        "command": "limcode.applyLiveDiffPreview",
+        "command": "limcode-test.applyLiveDiffPreview",
         "key": "ctrl+s",
         "mac": "cmd+s",
-        "when": "resourceScheme == limcode-live-diff"
+        "when": "resourceScheme == limcode-test-live-diff"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "limcode-sidebar",
-          "title": "LIMCODE",
+          "id": "limcode-test-sidebar",
+          "title": "LIMCODE TEST",
           "icon": "assets/icons/activity-bar.svg"
         }
       ]
     },
     "views": {
-      "limcode-sidebar": [
+      "limcode-test-sidebar": [
         {
-          "id": "limcode-entry-view",
+          "id": "limcode-test-entry-view",
           "name": "",
           "type": "webview",
           "icon": "assets/icons/activity-bar.svg"
@@ -66,7 +80,7 @@
     "compile": "npm run clean:extension && tsc -p tsconfig.json",
     "watch": "tsc -watch -p tsconfig.json",
     "build:webview": "vite build",
-    "dev:webview": "vite --host 127.0.0.1 --port 31819 --strictPort",
+    "dev:webview": "vite --host 127.0.0.1 --port 31820 --strictPort",
     "build": "npm run compile && npm run build:webview",
     "typecheck:webview": "vue-tsc -p tsconfig.webview.json --noEmit",
     "check": "npm run compile && npm run typecheck:webview",
@@ -78,6 +92,7 @@
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^20.14.10",
     "@types/vscode": "^1.89.0",
+    "@types/ws": "8.18.1",
     "@vitejs/plugin-vue": "^5.0.5",
     "@vscode/vsce": "^3.7.1",
     "katex": "^0.17.0",
@@ -91,8 +106,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "https-proxy-agent": "7.0.6",
     "tokenx": "^1.3.0",
     "undici": "^6.26.0",
-    "unified-llm-provider": "^0.1.24"
+    "unified-llm-provider": "0.1.29",
+    "ws": "8.21.1"
   }
 }
