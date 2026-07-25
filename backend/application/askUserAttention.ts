@@ -1,5 +1,6 @@
 import { askUserRequestFromArgs } from '../../shared/askUser';
 import { ASK_USER_TOOL_NAME } from '../../shared/protocol';
+import { EXTENSION_BRAND } from '../../shared/extensionIdentity';
 import type { WorldReader } from '../ecs/types';
 import { runForToolCall, runTarget } from '../world/modules/agentRun/queries';
 import { Conversation } from '../world/modules/chat/components';
@@ -16,8 +17,8 @@ export interface PendingAskUserAttention {
 }
 
 /**
- * 按 AgentRun 自己的目标 conversation 标签页聚合待回答问题。
- * 未打开标签页的 ask_user 会由 AskUserSystem 自动回答，不应弹出用户通知。
+ * 按执行 Turn 的目标 Conversation 标签页聚合待回答问题。
+ * Interaction 是唯一回答权威；本函数只从已投影的等待态生成提醒，不决定或自动提交答案。
  */
 export function collectPendingAskUserAttention(world: WorldReader): PendingAskUserAttention[] {
   const openConversationIds = new Set(world.tryGetResource(OpenConversationPanelIdsKey) ?? []);
@@ -66,10 +67,10 @@ export class AskUserAttentionTracker extends ConversationAttentionTracker<Pendin
 export function askUserAttentionMessage(request: PendingAskUserAttention): string {
   const tabLabel = request.conversationTitle?.trim() || '当前对话';
   if (request.questionCount > 1) {
-    return `LimCode：标签页“${compactAttentionText(tabLabel, 36)}”有 ${request.questionCount} 个问题等待回答。`;
+    return `${EXTENSION_BRAND}：标签页“${compactAttentionText(tabLabel, 36)}”有 ${request.questionCount} 个问题等待回答。`;
   }
   const question = request.firstQuestion?.trim();
   return question
-    ? `LimCode 需要你的回答：${compactAttentionText(question, 96)}`
-    : `LimCode：标签页“${compactAttentionText(tabLabel, 36)}”有问题等待回答。`;
+    ? `${EXTENSION_BRAND} 需要你的回答：${compactAttentionText(question, 96)}`
+    : `${EXTENSION_BRAND}：标签页“${compactAttentionText(tabLabel, 36)}”有问题等待回答。`;
 }

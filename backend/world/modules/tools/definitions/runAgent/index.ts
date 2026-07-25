@@ -68,7 +68,7 @@ You have two options instead:
         },
         wait: {
           type: 'string',
-          description: 'Whether this tool call should wait for preceding tool calls before it starts. The default is parallel execution without waiting; pass "true" to wait.'
+          description: 'Legacy scheduling hint. Prefer scheduling. Pass "true" for serial or "false" for parallel when scheduling is omitted.'
         },
         scheduling: {
           type: 'string',
@@ -133,6 +133,7 @@ function resolveRunAgentScheduling(rawArgs: unknown): { mode: 'parallel' | 'seri
 
   const wait = typeof args.wait === 'string' ? args.wait.trim().toLowerCase() : '';
   if (wait === 'true') return { mode: 'serial', reason: 'wait_true' };
+  if (wait === 'false') return { mode: 'parallel', reason: 'wait_false' };
   return { mode: 'parallel', reason: 'default_parallel' };
 }
 

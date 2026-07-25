@@ -101,7 +101,16 @@ export const readFileTool: ToolDefinition = {
       accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
       allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true)
     });
-    return { ok: true, output: text };
+    return {
+      ok: true,
+      output: {
+        path: text.path,
+        startLine: text.startLine,
+        endLine: text.endLine,
+        totalLines: text.totalLines,
+        content: text.content
+      }
+    };
   }
 };
 

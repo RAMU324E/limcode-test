@@ -72,8 +72,8 @@ Provide 2-8 concise options using only user-facing labels and optional descripti
   scheduling: staticToolScheduling('parallel', 'await_user_answer'),
   summary: summarizeAskUserToolCall,
   async execute() {
-    // 该工具由 ToolDispatchSystem 切换到等待用户回答状态，再由 AskUserSystem 接收回答并完成。
-    return { ok: false, output: 'ask_user 必须由 ECS 交互系统处理。' };
+    // 该工具由可靠 Interaction 控制面创建请求，并以身份围栏接收唯一响应。
+    return { ok: false, output: 'ask_user 必须由可靠 Interaction 控制面处理。' };
   }
 };
 

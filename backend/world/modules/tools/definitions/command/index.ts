@@ -1,7 +1,7 @@
 import type { CommandCapability, CommandOutputLimits } from '../../../../../capabilities/types';
 import type { ToolConfigRecord } from '../../../../../../shared/protocol';
-import { BackgroundCommandEventType } from '../../../backgroundCommand/events';
 import type { ToolDefinition } from '../../registry';
+import { normalizeSchedulingHint } from '../../scheduling';
 import { defineToolDefinitionModule } from '../types';
 
 export const commandToolModule = defineToolDefinitionModule({
@@ -48,13 +48,22 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             type: 'string',
             description: 'Do not provide this when mode=execute. The runtime generates and returns processId when an execute command is moved to the background. Required only for mode=output or mode=kill; copy it from a previous shell/bash result or background notification.'
           },
+          consume: {
+            type: 'boolean',
+            description: 'Only used by mode=output. Defaults to false (peek). Set true to explicitly consume terminal logs; subsequent reads then return not_found. Running-process reads never consume.'
+          },
           readonly: {
             type: 'string',
             description: 'Whether this command is read-only and does not modify files, system state, or network state. Use "true" for read-only commands; read-only commands may be auto-approved when the policy allows it.'
           },
           wait: {
             type: 'string',
-            description: 'Whether to wait for previous tool calls before starting this one. Defaults to serial execution. Set to "false" to allow parallel execution.'
+            description: 'Legacy scheduling hint. Prefer the scheduling field. "true" means serial and "false" means parallel when scheduling is omitted.'
+          },
+          scheduling: {
+            type: 'string',
+            enum: ['parallel', 'serial'],
+            description: 'Tool-call scheduling mode. Defaults to serial. Use parallel only when this command is independent from sibling tool calls.'
           }
         },
         required: ['explanation', 'foregroundWaitMs']
@@ -127,7 +136,15 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
       if (mode === 'output') {
         const processId = (args.processId ?? '').trim();
         if (!processId) return { ok: false, output: '缺少 processId：mode=output 需要指定后台进程 id。' };
-        return { ok: true, output: deps.command.readOutput(processId, limits) };
+        return {
+          ok: true,
+          output: deps.command.readOutput(processId, limits, {
+            consume: args.consume === true,
+            // Only a model tool poll participates in the terminal-revision claim. Webview reads call
+            // CommandCapability directly without this flag and remain passive.
+            claimTerminal: true
+          })
+        };
       }
 
       if (mode === 'kill') {
@@ -144,42 +161,39 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
       const deniedBy = firstMatchedCommandRule(commandText, config.denyCommands);
       if (deniedBy) return { ok: false, output: `命令已被工具策略黑名单拒绝：${deniedBy}` };
 
-      const result = await deps.command.run({ command: args.command, cwd: args.cwd, foregroundWaitMs: args.foregroundWaitMs, executionId: ctx?.toolCallId }, {
+      const origin = ctx?.runId && ctx.conversationId && ctx.attemptId && ctx.generation !== undefined
+        ? {
+            sourceToolCallId: ctx.toolCallId,
+            sourceRunId: ctx.runId,
+            conversationId: ctx.conversationId,
+            sourceAttemptId: ctx.attemptId,
+            sourceGeneration: ctx.generation
+          }
+        : undefined;
+      const result = await deps.command.run({
+        command: args.command,
+        cwd: args.cwd,
+        foregroundWaitMs: args.foregroundWaitMs,
+        executionId: ctx?.toolCallId,
+        ...(origin ? { backgroundProcessOrigin: origin } : {}),
+        ...(ctx?.signal ? { signal: ctx.signal } : {})
+      }, {
         onEvent(event) {
           ctx?.emit({
             kind: event.kind,
             ...(event.delta !== undefined ? { delta: event.delta } : {}),
             ...(event.payload !== undefined ? { payload: event.payload } : {})
           });
-        },
-        onBackgroundExit(event) {
-          if (!ctx?.emitWorldEvent) return;
-          const output = event.result;
-          const processId = output.processId?.trim();
-          if (!processId) return;
-          ctx.emitWorldEvent({
-            type: BackgroundCommandEventType.Exited,
-            payload: {
-              processId,
-              toolName: command.toolName,
-              toolCallId: ctx.toolCallId,
-              ...(ctx.runId ? { runId: ctx.runId } : {}),
-              ...(ctx.conversationId ? { conversationId: ctx.conversationId } : {}),
-              command: output.command,
-              cwd: resolvedCommandCwd(args.cwd, ctx.workEnvironment?.rootPath),
-              status: output.status === 'killed' ? 'killed' : 'exited',
-              exitCode: output.exitCode,
-              killed: output.killed,
-              stdout: output.stdout,
-              stderr: output.stderr,
-              ...(output.droppedChars !== undefined ? { droppedChars: output.droppedChars } : {})
-            }
-          });
         }
       }, { workEnvironment: ctx?.workEnvironment, accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments }, limits);
-      // 转入后台(running)不算失败；否则以退出码判定。
       const ok = result.status === 'running' || result.exitCode === 0;
-      return { ok, output: result };
+      return {
+        ok,
+        output: result,
+        ...(result.status === 'running' && result.processId
+          ? { backgroundProcesses: [{ id: result.processId, processId: result.processId, status: 'running' as const }] }
+          : {})
+      };
     }
   };
 }
@@ -190,16 +204,12 @@ type CommandToolArgs = {
   foregroundWaitMs?: number;
   mode?: string;
   processId?: string;
+  consume?: boolean;
   readonly?: string;
   wait?: string;
+  scheduling?: string;
   explanation?: string;
 };
-
-function resolvedCommandCwd(cwd: string | undefined, rootPath: string | undefined): string {
-  const explicit = cwd?.trim();
-  if (explicit) return explicit;
-  return rootPath?.trim() ?? '';
-}
 
 function summarizeCommandToolCall(rawArgs: unknown): string | undefined {
   const args = (rawArgs ?? {}) as CommandToolArgs;
@@ -208,12 +218,16 @@ function summarizeCommandToolCall(rawArgs: unknown): string | undefined {
   return explanation.replace(/\s+/g, ' ');
 }
 
-/** 串并行调度：默认串行；仅当 wait 显式为 "false" 时并行(不等待前面的工具)。 */
+/** Canonical LLM scheduling wins; legacy wait remains a compatibility hint; commands default to serial. */
 function resolveCommandScheduling(rawArgs: unknown): { mode: 'parallel' | 'serial'; reason: string } {
   const args = (rawArgs ?? {}) as CommandToolArgs;
+  const scheduling = normalizeSchedulingHint(args.scheduling);
+  if (scheduling !== 'auto') return { mode: scheduling, reason: `llm_selected_${scheduling}` };
+
   const wait = typeof args.wait === 'string' ? args.wait.trim().toLowerCase() : '';
-  if (wait === 'false') return { mode: 'parallel', reason: 'explicit_parallel' };
-  return { mode: 'serial', reason: 'default_serial' };
+  if (wait === 'false') return { mode: 'parallel', reason: 'legacy_wait_false' };
+  if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true' };
+  return { mode: 'serial', reason: 'default_serial_command' };
 }
 
 /** 判断某次命令工具调用是否被模型标记为只读（供审批放行使用）。 */

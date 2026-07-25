@@ -3,7 +3,7 @@ import { readEvents } from '../../../events';
 import { InFlight } from '../../chat/components';
 import { ToolCallEventBundle, spawnToolCallEvent } from '../bundles';
 import { ToolCall, ToolState, type ToolStateData } from '../components';
-import { ToolEventType } from '../events';
+import { ToolEventType, type ToolStatePayload } from '../events';
 import { isTerminalToolStatus, transitionToolState } from '../state';
 import { simplifyToolResponseForModel } from '../responseSimplifier';
 import type { ToolCallEventKind } from '../../../../../shared/protocol';
@@ -32,12 +32,13 @@ export const ToolPollSystem = defineSystem({
     const { world, cmd } = ctx;
     const pendingStates = new Map<number, ToolStateData>();
     for (const payload of readEvents(ctx, ToolEventType.State)) {
-      const entity = world.query(ToolCall, ToolState).find((candidate) => world.get(candidate, ToolCall)?.id === payload.toolCallId);
+      const indexed = world.entityByRecordId(ToolCall, payload.toolCallId);
+      const entity = indexed !== undefined && world.has(indexed, ToolState) ? indexed : undefined;
       if (entity === undefined) continue;
 
       const call = world.get(entity, ToolCall);
       const current = pendingStates.get(entity) ?? world.get(entity, ToolState);
-      if (!call || !current) continue;
+      if (!call || !current || !toolStateEventMatchesExecution(current, payload)) continue;
       // 工具已终态（如被用户中断置为 error）或已进入“等待提交结果”后，
       // 忽略在途执行迟到 resolve 发来的 tool:state；后者代表结果已定稿等待用户确认，
       // 不能再被不响应 AbortSignal 的运行时工具迟到 success 覆盖。
@@ -77,6 +78,13 @@ export const ToolPollSystem = defineSystem({
     }
   }
 });
+
+export function toolStateEventMatchesExecution(state: ToolStateData, payload: ToolStatePayload): boolean {
+  const tagged = payload.attemptId !== undefined || payload.generation !== undefined;
+  const epoch = state.reliableExecutionEpoch;
+  if (!epoch) return !tagged;
+  return payload.attemptId === epoch.attemptId && payload.generation === epoch.generation;
+}
 
 function eventKindForPayload(preferred: ToolCallEventKind | undefined, status: ReturnType<typeof transitionToolState>['status']): ToolCallEventKind {
   if (preferred) return preferred;

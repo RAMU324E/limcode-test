@@ -43,7 +43,7 @@ export const submitAgentAnswerTool: ToolDefinition = {
   scheduling: staticToolScheduling('serial', 'agent_answer_submit'),
   summary: summarizeSubmitAgentAnswerToolCall,
   async execute() {
-    return { ok: false, output: 'submit_agent_answer 必须由 ECS ToolDispatchSystem 处理。' };
+    return { ok: false, output: 'submit_agent_answer 必须由可靠 AnswerBridge/RuntimeInbox 控制面处理。' };
   }
 };
 
@@ -70,7 +70,7 @@ export const readAgentAnswerTool: ToolDefinition = {
   scheduling: staticToolScheduling('parallel', 'agent_answer_read'),
   summary: summarizeReadAgentAnswerToolCall,
   async execute() {
-    return { ok: false, output: 'read_agent_answer 必须由 ECS ToolDispatchSystem 处理。' };
+    return { ok: false, output: 'read_agent_answer 必须由可靠 AnswerBridge 控制面处理。' };
   }
 };
 

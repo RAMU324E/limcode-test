@@ -1,5 +1,6 @@
 import { submitPlanRequestFromArgs } from '../../shared/planReview';
 import { SUBMIT_PLAN_TOOL_NAME } from '../../shared/protocol';
+import { EXTENSION_BRAND } from '../../shared/extensionIdentity';
 import type { WorldReader } from '../ecs/types';
 import { runForToolCall, runTarget } from '../world/modules/agentRun/queries';
 import { Conversation } from '../world/modules/chat/components';
@@ -16,8 +17,8 @@ export interface PendingPlanReviewAttention {
 }
 
 /**
- * 按 AgentRun 自己的目标 Conversation 聚合待审批 Plan。
- * 未打开标签页的 submit_plan 会由 PlanProposalDecisionSystem 自动批准，不应弹出用户通知。
+ * 按执行 Turn 的目标 Conversation 聚合待审批 Plan。
+ * Interaction 是唯一审批权威；本函数只从已投影的等待态生成提醒，不决定或自动提交审批结果。
  */
 export function collectPendingPlanReviewAttention(world: WorldReader): PendingPlanReviewAttention[] {
   const openConversationIds = new Set(world.tryGetResource(OpenConversationPanelIdsKey) ?? []);
@@ -67,12 +68,12 @@ export class PlanReviewAttentionTracker extends ConversationAttentionTracker<Pen
 export function planReviewAttentionMessage(request: PendingPlanReviewAttention): string {
   const tabLabel = request.conversationTitle?.trim() || '当前对话';
   if (request.planCount > 1) {
-    return `LimCode：标签页“${compactAttentionText(tabLabel, 36)}”有 ${request.planCount} 个 Plan 等待审批。`;
+    return `${EXTENSION_BRAND}：标签页“${compactAttentionText(tabLabel, 36)}”有 ${request.planCount} 个 Plan 等待审批。`;
   }
   const plan = request.firstPlan?.trim();
   return plan
-    ? `LimCode 需要你审批 Plan：${compactAttentionText(plan, 96)}`
-    : `LimCode：标签页“${compactAttentionText(tabLabel, 36)}”有 Plan 等待审批。`;
+    ? `${EXTENSION_BRAND} 需要你审批 Plan：${compactAttentionText(plan, 96)}`
+    : `${EXTENSION_BRAND}：标签页“${compactAttentionText(tabLabel, 36)}”有 Plan 等待审批。`;
 }
 
 function isWaitingForPlanReview(value: unknown): boolean {

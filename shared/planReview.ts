@@ -1,4 +1,5 @@
 import { taskListOperationFromArgs } from './taskListProjection';
+import { renderPlanMarkdown } from './planMarkdown';
 import type {
   PlanProposalStatus,
   SubmitPlanDecisionStatus,
@@ -31,6 +32,26 @@ export function submitPlanRequestFromArgs(value: unknown): SubmitPlanToolRequest
   } catch {
     return undefined;
   }
+}
+
+export function createDelegatedPlanPrompt(request: SubmitPlanToolRequestRecord): string {
+  const planMarkdown = renderPlanMarkdown({
+    plan: request.plan,
+    ...(request.taskList ? { taskList: request.taskList } : {}),
+    statusLabel: 'Plan 已批准'
+  });
+  return [
+    '[Approved Plan Delegation]',
+    '用户已批准以下实施 Plan，并选择由你在新的 Agent 对话中负责执行。请独立完成实际落地，不要只复述或重新规划。',
+    '',
+    planMarkdown,
+    '',
+    '## 执行要求',
+    '1. 严格按照已批准 Plan 和任务清单推进；仅在确有必要时做最小调整。',
+    '2. 如果提供了任务清单，先使用 update_task_list 将其同步到当前子对话，并在执行过程中持续更新状态。',
+    '3. 完成实现后运行适当验证，清楚记录结果、剩余风险和任何未完成事项。',
+    '4. 完成或需要向来源 Agent 返回阶段性结论时，必须调用 submit_agent_answer({ title, content })；不要只依赖普通自然语言回复。'
+  ].join('\n');
 }
 
 export function createSubmitPlanToolOutput(input: {

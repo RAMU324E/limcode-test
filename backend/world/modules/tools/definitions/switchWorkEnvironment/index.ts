@@ -39,8 +39,8 @@ Just pass the target work environment id. After switching, subsequent tool argum
   scheduling: staticToolScheduling('serial', 'work_environment_switch'),
   summary: summarizeSwitchWorkEnvironmentToolCall,
   async execute() {
-    // 该工具由 ToolDispatchSystem 在 ECS 内处理，以便原子更新 Conversation/Run 与工作环境的 Link。
-    return { ok: false, output: 'switch_work_environment 必须由 ECS ToolDispatchSystem 处理。' };
+    // 该工具必须由可靠工具规划器在 durable transition 中原子更新 Turn 与工作环境关系。
+    return { ok: false, output: 'switch_work_environment 必须由可靠工具规划器处理。' };
   }
 };
 

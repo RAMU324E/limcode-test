@@ -12,6 +12,9 @@ export const ASK_USER_MAX_OPTION_LABEL_LENGTH = 200;
 export const ASK_USER_MAX_OPTION_DESCRIPTION_LENGTH = 500;
 export const ASK_USER_MAX_CUSTOM_ANSWER_LENGTH = 4_000;
 
+/** 后台无可交互前端时，对 ask_user 使用的显式系统回答。 */
+export const BACKGROUND_ASK_USER_AUTO_ANSWER = '请根据现有上下文自行选择最优方案并继续执行，无需等待用户确认。';
+
 /** 把模型工具参数规范化为前后端共用的 Ask User 请求。自定义回答固定可用。 */
 export function normalizeAskUserToolRequest(value: unknown): AskUserToolRequestRecord {
   const record = asRecord(parseJsonValue(value));
@@ -101,7 +104,7 @@ export function resolveAskUserAnswer(request: AskUserToolRequestRecord, value: u
   };
 }
 
-/** 从 ToolCallRecord.result（含标准 { ok, output } envelope）中读取已回答结果。 */
+/** 从 ToolResultArtifact 投影出的模型结果（含标准 { ok, output } envelope）中读取已回答结果。 */
 export function askUserOutputFromResult(value: unknown): AskUserToolOutputRecord | undefined {
   const envelope = asRecord(value);
   const rawOutput = envelope && 'output' in envelope ? envelope.output : value;

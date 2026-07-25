@@ -1,10 +1,11 @@
 import type { Scheduler } from '../../../../ecs/Scheduler';
-import { AskUserSystem } from './AskUserSystem';
-import { ToolDispatchSystem } from './ToolDispatchSystem';
+import { ToolCallPreviewSystem } from './ToolCallPreviewSystem';
 import { ToolPollSystem } from './ToolPollSystem';
 import { ToolPolicyScopeSystem } from './ToolPolicyScopeSystem';
-import { ToolResultSystem } from './ToolResultSystem';
 
+/**
+ * Tool 生命周期由可靠事务控制面拥有；ECS 仅保留策略投影、瞬态预览与 runtime event 投影。
+ */
 export function registerToolSystems(scheduler: Scheduler): void {
-  scheduler.addMany([ToolPolicyScopeSystem, ToolDispatchSystem, AskUserSystem, ToolPollSystem, ToolResultSystem]);
+  scheduler.addMany([ToolPolicyScopeSystem, ToolCallPreviewSystem, ToolPollSystem]);
 }

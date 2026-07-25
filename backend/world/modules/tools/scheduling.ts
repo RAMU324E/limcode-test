@@ -108,12 +108,27 @@ function isExecutionBlockingToolCall(world: WorldReader, entity: Entity): boolea
 export function toolSchedulingDecision(world: WorldReader, entity: Entity): ToolSchedulingDecision {
   const call = world.get(entity, ToolCall);
   if (!call) return { mode: 'serial', reason: 'missing_tool_call' };
-  const runtimeDefinition = (world.tryGetResource(ToolRuntimeDefinitionsKey) ?? []).find((tool) => tool.declaration.name === call.name);
-  const args = parseToolArgs(call.argsJson);
-  const dynamic = runtimeDefinition?.scheduling?.(args, { toolName: call.name });
+  if (call.schedulingMode) {
+    return {
+      mode: call.schedulingMode,
+      ...(call.schedulingReason ? { reason: call.schedulingReason } : {})
+    };
+  }
+  return toolSchedulingDecisionForCall(world, call.name, call.argsJson);
+}
+
+/** Resolves scheduling before a ToolCall entity exists so reliable execution can freeze the decision durably. */
+export function toolSchedulingDecisionForCall(
+  world: WorldReader,
+  toolName: string,
+  argsJson: string
+): ToolSchedulingDecision {
+  const runtimeDefinition = (world.tryGetResource(ToolRuntimeDefinitionsKey) ?? []).find((tool) => tool.declaration.name === toolName);
+  const args = parseToolArgs(argsJson);
+  const dynamic = runtimeDefinition?.scheduling?.(args, { toolName });
   if (dynamic?.mode === 'parallel' || dynamic?.mode === 'serial') return dynamic;
 
-  const definition = (world.tryGetResource(ToolDefinitionsKey) ?? []).find((tool) => tool.name === call.name);
+  const definition = (world.tryGetResource(ToolDefinitionsKey) ?? []).find((tool) => tool.name === toolName);
   if (
     definition?.metadata?.readonly === true
     || definition?.metadata?.riskLevel === 'read'

@@ -1,4 +1,4 @@
-import type { ClientState, McpToolSourceRecord, ToolCallEventRecord, ToolCallRecord, ToolDefinitionRecord, ToolPolicyScopeLinkRecord, ToolChangeApplyPolicyRecord, ToolDisplayPolicyRecord } from '../../../../shared/protocol';
+import type { ClientState, McpToolSourceRecord, ToolCallEventRecord, ToolCallPreviewRecord, ToolCallPreviewTargetLinkRecord, ToolCallRecord, ToolCallResultLinkRecord, ToolDefinitionRecord, ToolPolicyScopeLinkRecord, ToolResultArtifactRecord, ToolChangeApplyPolicyRecord, ToolDisplayPolicyRecord } from '../../../../shared/protocol';
 import type { AccessDeclaration, WorldReader } from '../../../ecs/types';
 import { Agent } from '../agent/components';
 import {
@@ -13,7 +13,7 @@ import { Conversation, Message, PartOf } from '../chat/components';
 import { ConversationWorkflowSelection, Workflow, ToolPolicy } from '../workflow/components';
 import { McpToolSourcesKey, ToolDefinitionsKey, ToolRuntimeDefinitionsKey } from './resources';
 import { toolSchedulingDecision } from './scheduling';
-import { ToolCall, ToolCallEvent, ToolPolicyScopeLink, ToolResultConsumed, ToolState, type ToolCallData, type ToolPolicyScopeLinkData, type ToolStateData } from './components';
+import { ToolCall, ToolCallEvent, ToolCallPreview, ToolCallPreviewTargetLink, ToolCallResultLink, ToolPolicyScopeLink, ToolResultArtifact, ToolResultConsumed, ToolState, type ToolCallData, type ToolPolicyScopeLinkData, type ToolStateData } from './components';
 import { isYoloToolPolicy } from './policy';
 
 export const toolsRuntimeStateProjectionReads: AccessDeclaration = {
@@ -33,6 +33,8 @@ export const toolsRuntimeStateProjectionReads: AccessDeclaration = {
     ToolCall,
     ToolState,
     ToolCallEvent,
+    ToolResultArtifact,
+    ToolCallResultLink,
     ToolResultConsumed,
     ToolPolicyScopeLink
   ],
@@ -41,12 +43,17 @@ export const toolsRuntimeStateProjectionReads: AccessDeclaration = {
 
 export const toolsClientStateProjectionReads: AccessDeclaration = {
   ...toolsRuntimeStateProjectionReads,
+  components: [
+    ...(toolsRuntimeStateProjectionReads.components ?? []),
+    ToolCallPreview,
+    ToolCallPreviewTargetLink
+  ],
   resources: [ToolDefinitionsKey, ToolRuntimeDefinitionsKey, McpToolSourcesKey]
 };
 
 export const toolsStateProjectionReads = toolsClientStateProjectionReads;
 
-export function projectToolsRuntimeState(world: WorldReader): Partial<ClientState> {
+export function projectToolsRuntimeState(world: WorldReader) {
   const toolCalls = world
     .query(ToolCall, ToolState, PartOf)
     .map((entity) => buildToolCallRecord(world, entity))
@@ -58,27 +65,63 @@ export function projectToolsRuntimeState(world: WorldReader): Partial<ClientStat
     .filter((item): item is ToolCallEventRecord => item !== undefined)
     .sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
 
+  const toolResultArtifacts = world
+    .query(ToolResultArtifact)
+    .map((entity) => world.get(entity, ToolResultArtifact))
+    .filter((item): item is NonNullable<typeof item> => item !== undefined);
+
+  const toolCallResultLinks = world
+    .query(ToolCallResultLink)
+    .map((entity): ToolCallResultLinkRecord | undefined => world.get(entity, ToolCallResultLink))
+    .filter((item): item is ToolCallResultLinkRecord => item !== undefined);
+
   const toolPolicyScopeLinks = world
     .query(ToolPolicyScopeLink)
     .map((entity) => buildToolPolicyScopeLinkRecord(world, entity))
     .filter((item): item is ToolPolicyScopeLinkRecord => item !== undefined);
 
-  return { toolCalls, toolCallEvents, toolPolicyScopeLinks };
+  return { toolCalls, toolCallEvents, toolResultArtifacts, toolCallResultLinks, toolPolicyScopeLinks };
 }
 
 export function projectToolsClientState(world: WorldReader): Partial<ClientState> {
   const toolDefinitions = world.tryGetResource(ToolDefinitionsKey) ?? [];
   const mcpToolSources = world.tryGetResource(McpToolSourcesKey) ?? [];
+  const runtime = projectToolsRuntimeState(world);
+  const toolCallPreviews = world.query(ToolCallPreview)
+    .map((entity): ToolCallPreviewRecord | undefined => world.get(entity, ToolCallPreview))
+    .filter((preview): preview is ToolCallPreviewRecord => preview !== undefined);
+  const toolCallPreviewTargetLinks = world.query(ToolCallPreviewTargetLink)
+    .map((entity): ToolCallPreviewTargetLinkRecord | undefined => {
+      const link = world.get(entity, ToolCallPreviewTargetLink);
+      if (!link) return undefined;
+      const preview = world.get(link.preview, ToolCallPreview);
+      if (!preview) return undefined;
+      return {
+        id: link.id,
+        previewId: preview.id,
+        requestId: link.requestId,
+        messageId: link.messageId,
+        conversationId: link.conversationId,
+        createdAt: link.createdAt,
+        updatedAt: link.updatedAt
+      };
+    })
+    .filter((link): link is ToolCallPreviewTargetLinkRecord => link !== undefined);
   return {
     toolDefinitions: toolDefinitions.map((tool): ToolDefinitionRecord => ({ ...tool })),
     mcpToolSources: mcpToolSources.map((source): McpToolSourceRecord => ({ ...source })),
-    ...projectToolsRuntimeState(world)
+    toolCallPreviews,
+    toolCallPreviewTargetLinks,
+    ...runtime,
+    toolResultArtifacts: runtime.toolResultArtifacts.map((artifact): ToolResultArtifactRecord => {
+      const { modelResponse: _modelResponse, ...clientArtifact } = artifact;
+      return clientArtifact;
+    })
   };
 }
 
 export const projectToolsState = projectToolsClientState;
 
-const strippedToolResultCache = new WeakMap<object, unknown>();
 
 function buildToolCallRecord(world: WorldReader, entity: number): ToolCallRecord | undefined {
   const call = world.get(entity, ToolCall);
@@ -101,9 +144,10 @@ function buildToolCallRecord(world: WorldReader, entity: number): ToolCallRecord
     args: call.argsJson,
     ...(summary ? { summary } : {}),
     status: state.status,
-    ...(state.result !== undefined ? { result: stripToolResultAttachments(state.result) } : {}),
+    ...(state.responseParts?.length ? { responseParts: state.responseParts.map((part) => ({ inlineData: { ...part.inlineData } })) } : {}),
     ...(state.error !== undefined ? { error: state.error } : {}),
     ...(state.progress !== undefined ? { progress: state.progress } : {}),
+    ...(call.schedulingOrdinal !== undefined ? { schedulingOrdinal: call.schedulingOrdinal } : {}),
     schedulingMode: scheduling.mode,
     ...(scheduling.reason ? { schedulingReason: scheduling.reason } : {}),
     ...(display ? { display } : {}),
@@ -111,49 +155,6 @@ function buildToolCallRecord(world: WorldReader, entity: number): ToolCallRecord
     ...(state.durationMs !== undefined ? { durationMs: state.durationMs } : {}),
     createdAt: call.createdAt,
     updatedAt: state.updatedAt
-  };
-}
-
-function stripToolResultAttachments(value: unknown): unknown {
-  if (!value || typeof value !== 'object') return value;
-  const cached = strippedToolResultCache.get(value);
-  if (cached !== undefined) return cached;
-  const result = Array.isArray(value)
-    ? value.map(stripToolResultAttachments)
-    : stripToolResultRecord(value as Record<string, unknown>);
-  strippedToolResultCache.set(value, result);
-  return result;
-}
-
-function stripToolResultRecord(record: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(record)) {
-    if (key === 'proposal') {
-      result.proposal = stripFileChangeProposal(child);
-      continue;
-    }
-    if (key === 'parts' && Array.isArray(child)) {
-      result.parts = child.map((part) => {
-        const inlineData = (part as { inlineData?: unknown })?.inlineData;
-        if (!inlineData || typeof inlineData !== 'object') return part;
-        const source = inlineData as Record<string, unknown>;
-        return { inlineData: { ...source, data: undefined } };
-      });
-      continue;
-    }
-    result[key] = stripToolResultAttachments(child);
-  }
-  return result;
-}
-
-function stripFileChangeProposal(value: unknown): unknown {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  return {
-    kind: record.kind,
-    operation: record.operation,
-    path: record.path,
-    baseExisted: record.baseExisted
   };
 }
 

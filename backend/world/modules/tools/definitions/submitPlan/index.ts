@@ -52,8 +52,8 @@ Approval can execute in the current conversation or delegate the approved Plan t
   scheduling: staticToolScheduling('serial', 'await_plan_review'),
   summary: summarizeSubmitPlanToolCall,
   async execute() {
-    // 该工具由 ToolDispatchSystem 创建 PlanProposal 并切换到等待用户审批状态。
-    return { ok: false, output: 'submit_plan 必须由 ECS 计划审批系统处理。' };
+    // 该工具由可靠 Interaction 控制面创建可审计请求并等待显式决策。
+    return { ok: false, output: 'submit_plan 必须由可靠 Interaction 控制面处理。' };
   }
 };
 
