@@ -11,7 +11,7 @@ import {
 export function agentAnswerById(world: WorldReader, id: string): Entity | undefined {
   const normalized = id.trim();
   if (!normalized) return undefined;
-  return world.query(AgentAnswer).find((entity) => world.get(entity, AgentAnswer)?.id === normalized);
+  return world.entityByRecordId(AgentAnswer, normalized);
 }
 
 export function agentAnswerRecordById(world: WorldReader, id: string): { entity: Entity; data: AgentAnswerData } | undefined {
