@@ -158,10 +158,7 @@ export function taskListOperationFromToolCall(
   if (!toolCall) return undefined;
 
   if (toolCall.name === TASK_LIST_TOOL_NAME) {
-    const resultOperation = taskListOperationFromToolResult(toolCall.result);
-    if (resultOperation) return resultOperation;
-    if (options.allowArgsFallback) return taskListOperationFromArgsJson(toolCall.args);
-    return undefined;
+    return options.allowArgsFallback ? taskListOperationFromArgsJson(toolCall.args) : undefined;
   }
 
   if (toolCall.name === SUBMIT_PLAN_TOOL_NAME) {
@@ -270,33 +267,11 @@ function functionCallPartIndex(message: MessageRecord | undefined, toolCall: Too
 
 function isAppliedTaskListToolCall(toolCall: ToolCallRecord): boolean {
   if (toolCall.status !== 'success' && toolCall.status !== 'warning') return false;
-  const result = asRecord(toolCall.result);
-  if (result?.ok === false) return false;
   if (toolCall.name === SUBMIT_PLAN_TOOL_NAME) return !!taskListOperationFromSubmitPlanToolCall(toolCall);
   return true;
 }
 
-function taskListOperationFromToolResult(result: unknown): TaskListToolOperationRecord | undefined {
-  const resultRecord = asRecord(result);
-  const output = resultRecord && 'output' in resultRecord ? resultRecord.output : result;
-  const outputRecord = asRecord(output);
-  if (!outputRecord) return undefined;
-
-  if (outputRecord.kind === 'task_list.result') {
-    return normalizeOperation(outputRecord.operation);
-  }
-  if (outputRecord.kind === 'task_list.operation') {
-    return normalizeOperation(outputRecord);
-  }
-  return undefined;
-}
-
 function taskListOperationFromSubmitPlanToolCall(toolCall: ToolCallRecord): TaskListToolOperationRecord | undefined {
-  const resultRecord = asRecord(toolCall.result);
-  const output = resultRecord && 'output' in resultRecord ? resultRecord.output : toolCall.result;
-  const outputRecord = asRecord(output);
-  if (!outputRecord || outputRecord.kind !== 'submit_plan.result' || outputRecord.status !== 'approved') return undefined;
-
   const args = asRecord(parseJson(toolCall.args));
   return normalizeOperation(args?.taskList);
 }

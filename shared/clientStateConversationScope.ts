@@ -9,8 +9,8 @@ export function collectChangedClientStateConversationIds(prev: ClientState, next
   const nextIndex = new ConversationReferenceIndex(next);
 
   for (const tableKey of tableKeys) {
-    const prevRecords = prev[tableKey] as ClientStateRecord[];
-    const nextRecords = next[tableKey] as ClientStateRecord[];
+    const prevRecords = prev[tableKey] as unknown as ClientStateRecord[];
+    const nextRecords = next[tableKey] as unknown as ClientStateRecord[];
     if (prevRecords === nextRecords) continue;
     if (prevRecords.length === 0 && nextRecords.length === 0) continue;
 
@@ -101,7 +101,7 @@ class ConversationReferenceIndex {
         addOptionalSetToSetMap(result, link.runId, link.sourceMessageId ? setOf(this.messageIdToConversationId.get(link.sourceMessageId)) : undefined);
         addOptionalSetToSetMap(result, link.runId, link.sourceToolCallId ? this.messageToolCallIdToConversationIds.get(link.sourceToolCallId) : undefined);
       }
-      for (const link of this.state.messageRunLinks) addOptionalToSetMap(result, link.runId, this.messageIdToConversationId.get(link.messageId));
+      for (const link of this.state.messageTurnLinks) addOptionalToSetMap(result, link.turnId, this.messageIdToConversationId.get(link.messageId));
       for (const link of this.state.toolCallRunLinks) addOptionalSetToSetMap(result, link.runId, this.messageToolCallIdToConversationIds.get(link.toolCallId));
       for (const input of this.state.agentRunInputRevisions) addToSetMap(result, input.runId, input.conversationId);
 

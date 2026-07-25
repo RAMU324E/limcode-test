@@ -1,4 +1,27 @@
 import type { CLIENT_STATE_TABLES } from './clientStateSchema';
+import type { RunExecutionPhase, RunLifecycleStatus } from './runLifecycle';
+import type {
+  AuthoritySnapshotRecord,
+  CommandAck,
+  CommandServiceError,
+  CommandStatus,
+  CommandTransportReceipt,
+  CommittedConversationHead,
+  DurableInteractionRequestRecord,
+  DurableInteractionDecision,
+  ExecutionLeaseRecord,
+  InteractionOwnerLinkRecord,
+  InteractionResponseRecord,
+  JsonValue,
+  MessageTurnLinkRecord,
+  PendingTurnInputRecord,
+  RuntimeDeliveryLinkRecord,
+  StatePatchBatch,
+  TransientStreamEpoch,
+  TurnIntentRecord,
+  TurnIntentRevisionRecord,
+  TurnRecord
+} from './conversationReliability';
 import type { TimelineProjectionContextRecord } from './timelineProjection';
 
 export type MessageId = string;
@@ -23,7 +46,7 @@ export interface WebviewClientMeta {
 
 export const GLOBAL_CLIENT_STATE_STREAM_ID = 'global:state';
 export const GLOBAL_SETTINGS_STREAM_PREFIX = 'settings:global:';
-export const GLOBAL_SETTINGS_SECTIONS = ['common', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'runHistory', 'mcpServers'] as const;
+export const GLOBAL_SETTINGS_SECTIONS = ['common', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'mcpServers'] as const;
 export type GlobalSettingsSection = typeof GLOBAL_SETTINGS_SECTIONS[number];
 
 export function globalSettingsStreamId(section: GlobalSettingsSection): string {
@@ -80,8 +103,27 @@ export enum BridgeMessageType {
   WorkspaceInfo = 'workspace.info',
   ShowInfo = 'vscode.showInfo',
   Error = 'bridge.error',
-  ChatSend = 'chat.send',
-  ChatAbort = 'chat.abort',
+  CommandReceipt = 'command.receipt',
+  CommandResult = 'command.result',
+  InteractionResult = 'interaction.result',
+  CommandStatusGet = 'command.status.get',
+  CommandStatusResult = 'command.status.result',
+  ConversationHeadGet = 'command.head.get',
+  ConversationHeadSnapshot = 'command.head.snapshot',
+  ConversationCommittedPatch = 'command.state.patch',
+  CommandOutcomeResolve = 'command.outcome.resolve',
+  TurnStart = 'turn.start',
+  TurnEnqueue = 'turn.enqueue',
+  TurnSteer = 'turn.steer',
+  TurnInterrupt = 'turn.interrupt',
+  TurnIntentUpdate = 'turnIntent.update',
+  TurnIntentCancel = 'turnIntent.cancel',
+  TurnIntentReorder = 'turnIntent.reorder',
+  TurnIntentPause = 'turnIntent.pause',
+  TurnIntentResume = 'turnIntent.resume',
+  TurnIntentResumeAll = 'turnIntent.resumeAll',
+  TurnIntentPromote = 'turnIntent.promote',
+  InteractionResolve = 'interaction.resolve',
   ConversationOpen = 'conversation.open',
   ConversationCreate = 'conversation.create',
   ConversationFork = 'conversation.fork',
@@ -99,19 +141,6 @@ export enum BridgeMessageType {
   MessageEdit = 'message.edit',
   MessageDeleteFrom = 'message.deleteFrom',
   MessageRetryFrom = 'message.retryFrom',
-  AgentRunCancel = 'agentRun.cancel',
-  AgentRunPause = 'agentRun.pause',
-  AgentRunResume = 'agentRun.resume',
-  AgentRunRetry = 'agentRun.retry',
-  AgentRunRegenerate = 'agentRun.regenerate',
-  AgentRunMarkStale = 'agentRun.markStale',
-  QueuePromote = 'queue.promote',
-  QueueRemove = 'queue.remove',
-  QueueReorder = 'queue.reorder',
-  QueuePause = 'queue.pause',
-  QueueResume = 'queue.resume',
-  QueueResumeAll = 'queue.resumeAll',
-  QueueInputUpdate = 'queue.input.update',
   ToolPolicyScopeSet = 'toolPolicy.scope.set',
   ToolPolicyScopeClear = 'toolPolicy.scope.clear',
   SkillPolicyScopeSet = 'skillPolicy.scope.set',
@@ -119,18 +148,10 @@ export enum BridgeMessageType {
   SkillCatalogRefresh = 'skill.catalog.refresh',
   RulesFileSave = 'rules.file.save',
   RulesCatalogRefresh = 'rules.catalog.refresh',
-  ToolExecutionApprove = 'tool.execution.approve',
-  ToolExecutionReject = 'tool.execution.reject',
   ToolExecutionCancel = 'tool.execution.cancel',
   ToolDiffOpen = 'tool.diff.open',
-  ToolChangeApply = 'tool.change.apply',
-  ToolChangeReject = 'tool.change.reject',
-  ToolResultSubmit = 'tool.result.submit',
-  ToolResultReject = 'tool.result.reject',
-  AskUserAnswerSubmit = 'askUser.answer.submit',
-  PlanProposalApprove = 'planProposal.approve',
-  PlanProposalRequestChanges = 'planProposal.requestChanges',
-  PlanProposalReject = 'planProposal.reject',
+  ToolResultArtifactGet = 'tool.resultArtifact.get',
+  ToolResultArtifactSnapshot = 'tool.resultArtifact.snapshot',
   PlanProposalOpen = 'planProposal.open',
   PlanProposalExport = 'planProposal.export',
   CheckpointDiffOpen = 'checkpoint.diff.open',
@@ -195,8 +216,8 @@ export enum BridgeMessageType {
   CompressionEnable = 'compression.enable',
   FsStatGet = 'fs.stat.get',
   FsStatResult = 'fs.stat.result',
-  BackgroundCommandOutputGet = 'backgroundCommand.output.get',
-  BackgroundCommandOutputResult = 'backgroundCommand.output.result'
+  BackgroundProcessOutputGet = 'backgroundProcess.output.get',
+  BackgroundProcessOutputResult = 'backgroundProcess.output.result'
 }
 
 export interface BridgeEnvelope<TType extends string = string, TPayload = unknown> {
@@ -211,10 +232,30 @@ export interface BridgeEnvelope<TType extends string = string, TPayload = unknow
   payload?: TPayload;
 }
 
+export interface RuntimeBuildInfoRecord {
+  extensionName: string;
+  extensionVersion: string;
+  providerVersion: string;
+  webSocketVersion: string;
+  proxyAgentVersion: string;
+  wsImplementation: string;
+  /** Extension Host 激活时实际加载的代码指纹。 */
+  buildFingerprint: string;
+  /** 当前磁盘上对应编译产物的指纹；与 buildFingerprint 不同时必须重载 Extension Host。 */
+  currentBuildFingerprint: string;
+  reloadRequired: boolean;
+  reloadReason?: 'extension_files_changed';
+  runtimeInstanceId: string;
+  activatedAt: number;
+  processId: number;
+  nodeVersion: string;
+}
+
 export interface BridgeHelloPayload {
   clientId: BridgeClientId;
   attachedAt: number;
   meta: WebviewClientMeta;
+  runtime: RuntimeBuildInfoRecord;
 }
 
 export interface BridgeAckPayload {
@@ -247,8 +288,9 @@ export interface SidebarConversationHistoryEntry {
   preview: string;
   previewState?: 'pending' | 'empty';
   messageCount: number;
-  status: MsgStatus | 'empty';
-  updatedAt?: number;
+  status: MessageMaterializationStatus | 'empty';
+  createdAt: number;
+  updatedAt: number;
   agentName?: string;
   isRunning: boolean;
   runStatus?: AgentRunStatus;
@@ -296,8 +338,14 @@ export interface ConversationHistoryPageRecord {
 }
 
 export type MsgRole = 'user' | 'model';
-export type MsgStatus = 'streaming' | 'complete' | 'error';
-export type MessageStopReason = 'paused' | 'cancelled' | 'replaced' | 'stale';
+/** 仅描述 Message.content 是否仍在物化；执行失败、取消和暂停由 Run 事实表达。 */
+export const MESSAGE_MATERIALIZATION_STATUSES = ['streaming', 'final', 'partial'] as const;
+export type MessageMaterializationStatus = typeof MESSAGE_MATERIALIZATION_STATUSES[number];
+
+export function isMessageMaterializationStatus(value: unknown): value is MessageMaterializationStatus {
+  return typeof value === 'string'
+    && (MESSAGE_MATERIALIZATION_STATUSES as readonly string[]).includes(value);
+}
 
 export const TOOL_CALL_STATUSES = [
   'streaming',
@@ -489,6 +537,7 @@ export interface SubmitPlanToolOutputRecord {
 
 export type LlmProviderKind = 'openai-compatible' | 'openai-responses' | 'claude' | 'gemini' | 'deepseek';
 export type LlmToolCallFormat = 'function-call';
+export type LlmOpenAIResponsesTransport = 'http' | 'websocket';
 export type LlmPromptCacheTtl = '5m' | '30m' | '1h';
 /**
  * LimCode 暴露的 Prompt Cache 请求模式。
@@ -697,6 +746,7 @@ export interface LlmProviderModelConfigRecord {
   /** 绑定当前渠道模型列表中的模型 ID。 */
   modelId: string;
   toolCallFormat: LlmToolCallFormat;
+  openaiResponsesTransport: LlmOpenAIResponsesTransport;
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
@@ -721,6 +771,7 @@ export interface LlmProviderConfigRecord {
   models: LlmProviderModelRecord[];
   apiKey: string;
   toolCallFormat: LlmToolCallFormat;
+  openaiResponsesTransport: LlmOpenAIResponsesTransport;
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
@@ -753,6 +804,7 @@ export interface LlmInvocationSettingsSnapshotRecord {
   modelName?: string;
   displayModelName?: string;
   toolCallFormat?: LlmToolCallFormat;
+  openaiResponsesTransport?: LlmOpenAIResponsesTransport;
   stream?: boolean;
   retryOnError?: boolean;
   retryMaxAttempts?: number;
@@ -764,6 +816,8 @@ export interface LlmInvocationSettingsSnapshotRecord {
   compressionConfigId?: string;
   compressionMethodKind?: LlmCompressionMethodKind;
   compressionTrigger?: LlmCompressionConfigRecord['trigger'];
+  /** Immutable non-secret compression configuration used by this invocation. */
+  compressionConfigSnapshot?: LlmCompressionConfigRecord;
   /** header 名保留；敏感值会被 mask，不持久化真实 secret。 */
   headers?: LlmProviderHeadersRecord;
 }
@@ -832,15 +886,11 @@ export interface AgentRecord {
 }
 
 export type AgentRunKind = 'chat' | 'tool_invoked' | 'delegated' | 'review' | 'notification' | 'scheduled';
-export type AgentRunStatus = 'queued' | 'preparing' | 'running' | 'waiting_tool' | 'waiting_child_run' | 'delivering' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'stale';
-export type AgentRunQueueHoldReason = 'restored' | 'manual';
+export type AgentRunStatus = 'queued' | 'preparing' | 'running' | 'waiting_tool' | 'waiting_child_run' | 'delivering' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'stale' | 'interrupted';
 
-export type AgentRunEndReason = 'completed' | 'failed' | 'cancelled_by_user' | 'cancelled_by_policy' | 'stale_source_edited' | 'retry_requested' | 'regenerate_requested';
-export type AgentRunErrorType = 'llm' | 'tool' | 'policy' | 'cancelled' | 'stale' | 'unknown';
 export type AgentRunSourceKind = 'user' | 'toolCall' | 'agentRun' | 'schedule' | 'system';
 export type ConversationOriginKind = 'user' | 'agent' | 'system';
 export type AgentRunTargetRole = 'executor';
-export type MessageRunRole = 'input' | 'model' | 'tool_response' | 'notification';
 export type ToolCallRunRole = 'produced_by';
 export type PolicyBindingRole = 'active';
 export type ToolPolicyScopeKind = 'global' | 'conversation' | 'agent' | 'agentSystem' | 'workflow' | 'run';
@@ -913,9 +963,9 @@ export interface ToolDisplayPolicyRecord {
 }
 
 export interface ToolChangeApplyPolicyRecord {
-  /** true 时前端/运行时可在进入等待应用阶段后自动发起应用。 */
+  /** true 时后端策略 actor 会在持久 deadline 到期后自动解决请求；前端只展示倒计时。 */
   autoApply?: boolean;
-  /** 0 表示直接应用；大于 0 表示等待对应秒数后自动应用。 */
+  /** 0 表示服务端立即调度；大于 0 表示持久 grace window 的秒数。 */
   autoApplyDelaySeconds?: number;
 }
 
@@ -1140,6 +1190,8 @@ export interface ConversationRecord {
   id: string;
   title?: string;
   visibility?: 'visible' | 'hidden' | 'collapsed';
+  createdAt: number;
+  lastActivityAt: number;
 }
 
 export interface ConversationReuseLinkRecord {
@@ -1530,6 +1582,8 @@ export interface InlineDataPart {
     name?: string;
     /** 托管附件 id，指向 <dataRoot>/attachments。 */
     attachmentId?: string;
+    /** 托管附件原始字节的完整 SHA-256；durable managed 引用必须携带。 */
+    sha256?: string;
     /** 超过托管阈值或用户选择本地引用时的源文件绝对路径。 */
     sourcePath?: string;
     storage?: AttachmentStorageMode;
@@ -1573,18 +1627,21 @@ export function textContent(role: ContentRole, text: string): MessageContent {
   return { role, parts: text ? [{ text }] : [] };
 }
 
+export type MessagePresentation = 'visible' | 'internal';
+
 export interface MessageRecord {
   id: string;
   conversationId: string;
   role: MsgRole;
   model?: string;
+  /** Whether this message is part of the user-facing transcript or model-only control context. */
+  presentation?: MessagePresentation;
   content: MessageContent;
-  status: MsgStatus;
+  status: MessageMaterializationStatus;
   createdAt: number;
   requestStartedAt?: number;
   streamOutputDurationMs?: number;
   usageMetadata?: LlmUsageMetadataRecord;
-  stopReason?: MessageStopReason;
   seq: number;
 }
 
@@ -1613,14 +1670,77 @@ export interface ToolCallRecord {
   args: string;
   summary?: string;
   status: ToolCallStatus;
-  result?: unknown;
+  /** Canonical durable attachment references returned by the tool; bytes are materialized only at provider/UI boundaries. */
+  responseParts?: InlineDataPart[];
   error?: string;
   progress?: unknown;
+  /** Stable zero-based order within the model message's tool-call batch. */
+  schedulingOrdinal?: number;
   schedulingMode?: ToolSchedulingMode;
   schedulingReason?: string;
   display?: ToolDisplayPolicyRecord;
   changeApply?: ToolChangeApplyPolicyRecord;
   durationMs?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Process-local preview of one function call while its JSON arguments are still arriving. */
+export interface ToolCallPreviewRecord {
+  id: string;
+  callId: string;
+  name?: string;
+  streamIndex?: string;
+  /** Complete arguments while small, otherwise the immutable leading window. */
+  argumentsHead: string;
+  /** Rolling trailing window after the 64 KiB preview limit is crossed. */
+  argumentsTail: string;
+  receivedChars: number;
+  truncated: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Independent transient relationship from a preview to its request/message/conversation. */
+export interface ToolCallPreviewTargetLinkRecord {
+  id: string;
+  previewId: string;
+  requestId: string;
+  messageId: string;
+  conversationId: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type ToolResultArtifactStorageKind = 'inline' | 'blob';
+
+/** Blob-first result admission output before a conversation transaction publishes Artifact identity. */
+export interface StagedToolResultContent {
+  contentHash: string;
+  mediaType: 'application/json';
+  byteLength: number;
+  storageKind: ToolResultArtifactStorageKind;
+  inlineContent?: JsonValue;
+  blobHash?: string;
+  /** Bounded UTF-8 preview for list/card rendering; never authoritative full content. */
+  preview: string;
+}
+
+/** Canonical owner of one tool result. Large payload bytes live only in the content-addressed blob. */
+export interface ToolResultArtifactRecord extends StagedToolResultContent {
+  id: string;
+  conversationId: string;
+  /** Backend-only modelResponse is deliberately excluded from ClientState; UI loads full blobs lazily. */
+  createdAt: number;
+}
+
+/** Independent relationship between a ToolCall and one immutable result Artifact. */
+export interface ToolCallResultLinkRecord {
+  id: string;
+  conversationId: string;
+  toolCallId: string;
+  artifactId: string;
+  role: 'final' | 'partial' | 'audit';
   createdAt: number;
   updatedAt: number;
 }
@@ -1692,19 +1812,83 @@ export interface RunEditPolicyRecord {
   onNewUserMessageWhileRunning: NewMessageWhileRunningBehavior;
 }
 
+export interface OutcomeUnknownOperationRecord {
+  operationId: string;
+  reason: 'outcome_unknown';
+  allowedResolutions: Array<'restart_proved_not_executed' | 'submit_verified_result' | 'abandon'>;
+  createdAt: number;
+}
+
+export const RUN_TERMINATION_KINDS = ['cancelled', 'stale', 'interrupted', 'failed'] as const;
+export type RunTerminationKind = typeof RUN_TERMINATION_KINDS[number];
+
+export const RUN_TERMINATION_ACTORS = ['user', 'system', 'provider', 'tool', 'parent_run'] as const;
+export type RunTerminationActor = typeof RUN_TERMINATION_ACTORS[number];
+
+export const RUN_TERMINATION_REASON_CODES = [
+  'user_cancelled',
+  'run_promoted',
+  'removed_from_queue',
+  'conversation_deleted',
+  'message_deleted',
+  'source_revision_edited',
+  'retry_requested',
+  'regenerate_requested',
+  'answer_bridge_continued',
+  'agent_interrupt_requested',
+  'parent_run_terminated',
+  'callback_rejected',
+  'operation_timed_out',
+  'extension_host_restarted',
+  'parent_outcome_unknown',
+  'unknown_outcome_abandoned',
+  'invocation_failed',
+  'llm_request_failed',
+  'empty_model_result'
+] as const;
+export type RunTerminationReasonCode = typeof RUN_TERMINATION_REASON_CODES[number];
+
+export interface RunTerminationRecord {
+  id: string;
+  runId: string;
+  kind: RunTerminationKind;
+  actor: RunTerminationActor;
+  /** Run.phase immediately before the terminal transition. */
+  interruptedPhase: Exclude<RunExecutionPhase, 'terminal'>;
+  reasonCode: RunTerminationReasonCode;
+  /** Present when another Run caused this Run to terminate. */
+  triggerRunId?: string;
+  createdAt: number;
+}
+
+export function isRunTerminationKind(value: unknown): value is RunTerminationKind {
+  return typeof value === 'string' && (RUN_TERMINATION_KINDS as readonly string[]).includes(value);
+}
+
+export function isRunTerminationActor(value: unknown): value is RunTerminationActor {
+  return typeof value === 'string' && (RUN_TERMINATION_ACTORS as readonly string[]).includes(value);
+}
+
+export function isRunTerminationReasonCode(value: unknown): value is RunTerminationReasonCode {
+  return typeof value === 'string' && (RUN_TERMINATION_REASON_CODES as readonly string[]).includes(value);
+}
+
 export interface AgentRunRecord {
   id: string;
   kind: AgentRunKind;
   status: AgentRunStatus;
+  /** Durable lifecycle/phase; status remains a compact UI projection during the ECS cutover. */
+  lifecycle?: RunLifecycleStatus;
+  phase?: RunExecutionPhase;
+  rowVersion?: number;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
-  endReason?: AgentRunEndReason;
-  errorType?: AgentRunErrorType;
-  error?: string;
   usageMetadata?: LlmUsageMetadataRecord;
   retryOfRunId?: string;
   attempt?: number;
+  /** Explicit durable pauses that require a user resolution before the Run may advance. */
+  outcomeUnknownOperations?: OutcomeUnknownOperationRecord[];
 }
 
 export interface AgentRunSourceLinkRecord {
@@ -1725,40 +1909,6 @@ export interface AgentRunTargetLinkRecord {
   agentId: string;
   conversationId: string;
   role: AgentRunTargetRole;
-}
-
-export interface AgentRunQueueOrderRecord {
-  id: string;
-  runId: string;
-  conversationId: string;
-  order: number;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface AgentRunQueueHoldRecord {
-  id: string;
-  runId: string;
-  conversationId: string;
-  reason: AgentRunQueueHoldReason;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface AgentRunQueuedInputRecord {
-  id: string;
-  runId: string;
-  conversationId: string;
-  content: MessageContent;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface MessageRunLinkRecord {
-  id: string;
-  messageId: string;
-  runId: string;
-  role: MessageRunRole;
 }
 
 export interface ToolCallRunLinkRecord {
@@ -1833,6 +1983,8 @@ export interface AgentRunInputRevisionRecord {
 
 export interface AgentAnswerRecord {
   id: string;
+  /** Stable immutable submission identity materialized by the file-schema migration. */
+  submissionId?: string;
   title: string;
   content: string;
   createdAt: number;
@@ -1867,6 +2019,64 @@ export type CompressionBlockSourceRole = 'source' | 'retained' | 'anchor';
 export type CompressionContextVariantKind = 'provider_native' | 'provider_neutral_summary';
 export type CompressionContextUseMode = 'provider_native' | 'summary_fallback' | 'raw_history_fallback';
 
+export type ModelContextProjectionPurposeKind = 'turn' | 'compression';
+export type ModelContextProjectionMode = 'fresh' | 'same_run_resume' | 'dry_run' | 'auto' | 'manual';
+export type ModelContextProjectionSourceKind = 'messageRevision' | 'compressionVariant' | 'runTermination' | 'toolCall' | 'runtimeContextSnapshot';
+
+export interface ModelContextProjectionRecord {
+  id: string;
+  conversationId: string;
+  purposeKind: ModelContextProjectionPurposeKind;
+  mode: ModelContextProjectionMode;
+  contents: MessageContent[];
+  fingerprint: string;
+  tokenCount: number;
+  modelMessageId?: string;
+  runId?: string;
+  /** Exact method-specific compression inputs retained for replay/dry-run. */
+  segments?: MessageContent[][];
+  priorSummaryContents?: MessageContent[];
+  /** Deterministic content appended after provider compaction (for example a task-list snapshot). */
+  resultAddenda?: MessageContent[];
+  diagnostics: Array<{ code: string; severity: 'info' | 'warning' | 'error'; sourceId?: string }>;
+  createdAt: number;
+}
+
+export interface ModelContextProjectionSourceLinkRecord {
+  id: string;
+  /** Storage owner of this relation and its ModelContextProjection. */
+  conversationId: string;
+  /** Domain owner of the referenced source fact; may differ for source-conversation context. */
+  sourceConversationId: string;
+  projectionId: string;
+  sourceKind: ModelContextProjectionSourceKind;
+  sourceId: string;
+  /** Hash of the exact immutable source fact consumed by this projection. */
+  fingerprint: string;
+  order: number;
+  messageId?: string;
+  revisionId?: string;
+  blockId?: string;
+  runId?: string;
+  seq?: number;
+}
+
+export interface RequestModelContextProjectionLinkRecord {
+  id: string;
+  requestId: string;
+  projectionId: string;
+  role: 'input';
+  createdAt: number;
+}
+
+export interface CompressionModelContextProjectionLinkRecord {
+  id: string;
+  blockId: string;
+  projectionId: string;
+  role: 'source';
+  createdAt: number;
+}
+
 export interface CompressionBlockRecord {
   id: string;
   conversationId: string;
@@ -1885,6 +2095,9 @@ export interface CompressionBlockRecord {
   tokenCountAfter?: number;
   tokenSaved?: number;
   sourceHash?: string;
+  /** Immutable execution snapshots used for exact compact replay/dry-run. */
+  providerSettingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
+  compressionConfigSnapshot?: LlmCompressionConfigRecord;
   staleReason?: string;
   error?: string;
   createdAt: number;
@@ -1948,6 +2161,49 @@ export interface CompressionUpdatePayload { conversationId: string; blockId: str
 export interface CompressionRegeneratePayload { conversationId: string; blockId: string; methodConfigId?: string }
 export interface CompressionTogglePayload { conversationId: string; blockId: string }
 
+/**
+ * 独立后台进程的公开投影。Process 的生命周期可以长于启动它的 Tool Attempt；
+ * stdout/stderr 正文由后台进程存储持有，不进入 ClientState。
+ */
+export type BackgroundProcessStatus = 'running' | 'exited' | 'killed' | 'abnormal';
+
+export interface BackgroundProcessRecord {
+  id: string;
+  processId: string;
+  pid?: number;
+  toolName: 'shell' | 'bash';
+  command: string;
+  cwd: string;
+  status: BackgroundProcessStatus;
+  exitCode: number | null;
+  killed: boolean;
+  startedAt: number;
+  backgroundedAt: number;
+  updatedAt: number;
+  exitedAt?: number;
+  terminalRevision: number;
+  stdoutChars: number;
+  stderrChars: number;
+  droppedChars: number;
+  outputAvailable: boolean;
+  outputConsumedAt?: number;
+  abnormalReason?: string;
+}
+
+/** ToolCall/Run/Conversation 与 BackgroundProcess 之间的独立来源关系。 */
+export interface BackgroundProcessOriginLinkRecord {
+  id: string;
+  backgroundProcessId: string;
+  processId: string;
+  sourceToolCallId: string;
+  sourceRunId: string;
+  conversationId: string;
+  sourceAttemptId: string;
+  sourceGeneration: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ClientStateRecordByTable {
   agents: AgentRecord;
   toolDefinitions: ToolDefinitionRecord;
@@ -1996,6 +2252,10 @@ export interface ClientStateRecordByTable {
   messages: MessageRecord;
   messageRevisions: MessageRevisionRecord;
   messageCurrentRevisionLinks: MessageCurrentRevisionLinkRecord;
+  modelContextProjections: ModelContextProjectionRecord;
+  modelContextProjectionSourceLinks: ModelContextProjectionSourceLinkRecord;
+  requestModelContextProjectionLinks: RequestModelContextProjectionLinkRecord;
+  compressionModelContextProjectionLinks: CompressionModelContextProjectionLinkRecord;
   llmInvocations: LlmInvocationRecord;
   runLlmInvocationLinks: RunLlmInvocationLinkRecord;
   messageLlmInvocationLinks: MessageLlmInvocationLinkRecord;
@@ -2005,14 +2265,28 @@ export interface ClientStateRecordByTable {
   runCompressionBlockLinks: RunCompressionBlockLinkRecord;
   compressionBlockLlmInvocationLinks: CompressionBlockLlmInvocationLinkRecord;
   toolCalls: ToolCallRecord;
+  toolCallPreviews: ToolCallPreviewRecord;
+  toolCallPreviewTargetLinks: ToolCallPreviewTargetLinkRecord;
   toolCallEvents: ToolCallEventRecord;
+  toolResultArtifacts: ToolResultArtifactRecord;
+  toolCallResultLinks: ToolCallResultLinkRecord;
+  interactionRequests: DurableInteractionRequestRecord;
+  backgroundProcesses: BackgroundProcessRecord;
+  backgroundProcessOriginLinks: BackgroundProcessOriginLinkRecord;
   agentRuns: AgentRunRecord;
+  turns: TurnRecord;
+  turnIntents: TurnIntentRecord;
+  turnIntentRevisions: TurnIntentRevisionRecord;
+  pendingTurnInputs: PendingTurnInputRecord;
+  executionLeases: ExecutionLeaseRecord;
+  authoritySnapshots: AuthoritySnapshotRecord;
+  interactionOwnerLinks: InteractionOwnerLinkRecord;
+  interactionResponses: InteractionResponseRecord;
+  runtimeDeliveryLinks: RuntimeDeliveryLinkRecord;
+  runTerminations: RunTerminationRecord;
   agentRunSourceLinks: AgentRunSourceLinkRecord;
   agentRunTargetLinks: AgentRunTargetLinkRecord;
-  agentRunQueueOrders: AgentRunQueueOrderRecord;
-  agentRunQueueHolds: AgentRunQueueHoldRecord;
-  agentRunQueuedInputs: AgentRunQueuedInputRecord;
-  messageRunLinks: MessageRunLinkRecord;
+  messageTurnLinks: MessageTurnLinkRecord;
   toolCallRunLinks: ToolCallRunLinkRecord;
   runConversationPolicies: RunConversationPolicyRecord;
   runContextPolicies: RunContextPolicyRecord;
@@ -2074,16 +2348,77 @@ export interface ChatModelOverrideRecord {
   model: string;
 }
 
-export interface ChatSendPayload {
+export interface ConversationCommandMetadata {
+  commandId: string;
+  expectedVersion: number;
+  issuedAt: number;
+}
+
+export interface TurnStartPayload {
   conversationId: string;
+  command: ConversationCommandMetadata;
   text?: string;
   content?: MessageContent;
   agentId?: string;
   model?: ChatModelOverrideRecord;
 }
-export interface ChatAbortPayload {
+
+export interface TurnEnqueuePayload {
   conversationId: string;
+  command: ConversationCommandMetadata;
+  text?: string;
+  content?: MessageContent;
+  agentId?: string;
+  model?: ChatModelOverrideRecord;
 }
+
+export interface TurnSteerPayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  targetTurnId: string;
+  targetLeaseEpoch: number;
+  fallback: 'queue_next' | 'return_to_draft' | 'reject';
+  text?: string;
+  content?: MessageContent;
+}
+
+export interface TurnInterruptPayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  turnId: string;
+  leaseEpoch: number;
+  cascadeChildAgents?: boolean;
+}
+
+export interface TurnIntentControlPayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  intentId: string;
+  rowVersion: number;
+}
+
+export interface TurnIntentUpdatePayload extends TurnIntentControlPayload {
+  text?: string;
+  content?: MessageContent;
+}
+
+export interface TurnIntentReorderPayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  intents: Array<{ intentId: string; rowVersion: number }>;
+}
+
+export interface TurnIntentResumeAllPayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+}
+
+export interface TurnIntentPromotePayload extends TurnIntentControlPayload {
+  replaceActive: boolean;
+  expectedActiveTurnId?: string;
+  expectedLeaseEpoch?: number;
+}
+
 export interface LlmRetryCancelPayload {
   requestId: string;
   conversationId?: string;
@@ -2093,6 +2428,7 @@ export interface LlmRetryCancelPayload {
 }
 export interface MessageEditPayload {
   conversationId: string;
+  command: ConversationCommandMetadata;
   messageId: string;
   text?: string;
   content?: MessageContent;
@@ -2111,68 +2447,54 @@ export interface AgentUpdatePayload { agentId: string; name?: string; descriptio
 export interface AgentDeletePayload { agentId: string }
 export interface MessageDeleteFromPayload {
   conversationId: string;
+  command: ConversationCommandMetadata;
   messageId: string;
 }
 export interface MessageRetryFromPayload {
   conversationId: string;
+  command: ConversationCommandMetadata;
   messageId: string;
   model?: ChatModelOverrideRecord;
 }
-export interface AgentRunControlPayload {
-  runId: string;
-  conversationId?: string;
+export type InteractionOutcomeStatus =
+  | 'committed'
+  | 'already_applied'
+  | 'already_satisfied'
+  | 'already_resolved'
+  | 'stale'
+  | 'rejected'
+  | 'blocked'
+  | 'outcome_unknown';
+
+export interface InteractionResultPayload {
+  requestType: string;
+  conversationId: string;
+  targetId: string;
+  status: InteractionOutcomeStatus;
+  transitionId?: string;
+  /** Atomic control-plane commit proof for every conversation scope touched by the interaction. */
+  controlHeads?: CommittedConversationHead[];
+  /** Only projection patches emitted by this interaction; clients wait solely for views they own. */
+  projectionHeads?: CommittedConversationHead[];
+  result?: JsonValue;
   reason?: string;
-  /** true 表示显式终止整个子 Agent 树；默认中断会先把当前批次的 run_agent 转后台并保留子任务。 */
-  cascadeChildAgents?: boolean;
 }
-export interface QueuePromotePayload {
+
+export interface InteractionResolvePayload {
   conversationId: string;
-  runId: string;
+  interactionRequestId: string;
+  interactionRevision: number;
+  ownerTurnId: string;
+  decision: DurableInteractionDecision;
+  response: JsonValue;
 }
-export interface QueueRemovePayload {
-  conversationId: string;
-  runId: string;
-}
-export interface QueueReorderPayload {
-  conversationId: string;
-  runIds: string[];
-}
-export interface QueuePausePayload {
-  conversationId: string;
-  runId: string;
-}
-export interface QueueResumePayload {
-  conversationId: string;
-  runId: string;
-}
-export interface QueueResumeAllPayload {
-  conversationId: string;
-}
-export interface QueueInputUpdatePayload {
-  conversationId: string;
-  runId: string;
-  text?: string;
-  content?: MessageContent;
-}
+
 export interface ToolDecisionPayload {
   toolCallId: string;
   conversationId?: string;
   reason?: string;
 }
-export interface AskUserAnswerSubmitPayload {
-  toolCallId: string;
-  answer: AskUserAnswerRecord;
-}
-export interface PlanProposalDecisionPayload {
-  toolCallId: string;
-  planProposalId: string;
-  conversationId?: string;
-  message?: string;
-}
-export type PlanProposalApprovalPayload = PlanProposalDecisionPayload & (
-  | { executionTarget: 'current_conversation'; agentType?: never }
-  | { executionTarget: 'new_conversation'; agentType: string }
-);
+
 export interface PlanProposalOpenPayload {
   conversationId?: string;
   toolCallId?: string;
@@ -2186,6 +2508,18 @@ export interface PlanProposalExportPayload {
 export interface ToolDiffOpenPayload {
   toolCallId: string;
   conversationId?: string;
+}
+
+export interface ToolResultArtifactGetPayload {
+  conversationId: string;
+  artifactId: string;
+}
+
+export interface ToolResultArtifactSnapshotPayload {
+  conversationId: string;
+  artifactId: string;
+  contentHash: string;
+  content: JsonValue;
 }
 export interface ToolPolicyScopeSetPayload {
   scopeKind: ToolPolicyScopeKind;
@@ -2276,6 +2610,35 @@ export interface ClientResyncPayload {
   streamId?: string;
   conversationId?: string;
 }
+
+export interface CommandStatusGetPayload { commandId: string }
+export interface ConversationHeadGetPayload { conversationId: string }
+export interface ConversationHeadSnapshotPayload {
+  conversationId: string;
+  version: number;
+  streamId: string;
+  patchNextSeq: number;
+}
+export interface CommandReceiptPayload extends CommandTransportReceipt {}
+export interface CommandResultPayload {
+  ack?: CommandAck;
+  error?: CommandServiceError;
+}
+export interface CommandStatusResultPayload {
+  commandId: string;
+  result: CommandStatus;
+}
+export interface ConversationCommittedPatchPayload extends StatePatchBatch {
+  conversationId: string;
+}
+export interface CommandOutcomeResolvePayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  operationId: string;
+  resolution: 'restart_proved_not_executed' | 'submit_verified_result' | 'abandon';
+  evidenceRef?: string;
+  verifiedResult?: unknown;
+}
 export interface WorkflowCreatePayload {
   name: string;
   description?: string;
@@ -2356,11 +2719,18 @@ export interface ClientSnapshotPayload {
   streamId: string;
   streamSeq: number;
   state: ClientState;
+  /**
+   * Conversation streams bind the projected state to the exact durable conversation HEAD.
+   * This removes the snapshot-then-HEAD-query race when settling reliable command overlays.
+   */
+  conversationHead?: ConversationHeadSnapshotPayload;
 }
 export interface ClientPatchPayload {
   streamId: string;
   streamSeq: number;
   patches: ClientPatchOp[];
+  /** Present only for non-authoritative LLM stream fast patches. */
+  transientStreamEpoch?: TransientStreamEpoch;
 }
 
 export interface LlmRawErrorInfoRecord {
@@ -2389,6 +2759,7 @@ export interface LlmTransientNoticePayload {
   conversationId: string;
   messageId: string;
   requestId: string;
+  transientStreamEpoch?: TransientStreamEpoch;
   runId?: string;
   invocationId?: string;
   message: string;
@@ -2413,9 +2784,6 @@ export interface ConversationRunSummaryRecord {
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
-  endReason?: AgentRunEndReason;
-  errorType?: AgentRunErrorType;
-  error?: string;
   retryOfRunId?: string;
   attempt?: number;
   sourceKind?: AgentRunSourceKind;
@@ -2474,12 +2842,10 @@ export interface LlmDryRunGetPayload {
   includeApiKey?: boolean;
 }
 
-export interface LlmDryRunSnapshotPayload {
-  conversationId: string;
-  runId?: string;
-  compressionBlockId?: string;
-  invocationId?: string;
-  settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
+export interface LlmDryRunHttpCallRecord {
+  id: string;
+  label: string;
+  ordinal: number;
   provider?: LlmProviderKind;
   model?: string;
   providerName?: string;
@@ -2498,6 +2864,18 @@ export interface LlmDryRunSnapshotPayload {
   maskedSecrets: boolean;
   /** 当前是否能从配置中取到真实 API Key；false 时 dry-run 使用占位 key 生成请求结构。 */
   apiKeyAvailable?: boolean;
+}
+
+export interface LlmDryRunSnapshotPayload {
+  conversationId: string;
+  runId?: string;
+  compressionBlockId?: string;
+  invocationId?: string;
+  settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
+  executionKind: 'single_request' | 'multiple_requests' | 'no_provider_call';
+  calls: LlmDryRunHttpCallRecord[];
+  note?: string;
+  generatedAt: number;
 }
 
 export interface LlmProviderModelsGetPayload {
@@ -2527,10 +2905,6 @@ export interface CheckpointMaintenanceSettingsRecord {
 export interface AttachmentSettingsRecord {
   /** base64 附件超过该大小时不复制进 dataRoot/attachments，默认 20MB。 */
   maxStoredInlineFileMb: number;
-}
-export interface RunHistorySettingsRecord {
-  /** 是否持久化每次 run 的详情快照；默认关闭，避免超长对话产生巨型 run-history/runs JSON。 */
-  detailPersistenceEnabled: boolean;
 }
 export type McpServerTransportRecord =
   | { kind: 'stdio'; command: string; args?: string[]; env?: Record<string, string>; cwd?: string }
@@ -2569,7 +2943,7 @@ export interface AppearanceSettingsRecord {
   /** AI 已输出工具调用、工具正在排队或执行时显示的文字。 */
   streamingTextToolExecuting: string;
 }
-export type GlobalSettingsSectionValue = GlobalSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | AttachmentSettingsRecord | RunHistorySettingsRecord | McpServersSettingsRecord;
+export type GlobalSettingsSectionValue = GlobalSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | AttachmentSettingsRecord | McpServersSettingsRecord;
 export interface GlobalSettingsGetPayload {
   section: GlobalSettingsSection;
 }
@@ -2686,12 +3060,12 @@ export interface AttachmentReloadResultPayload {
   error?: string;
 }
 
-export interface BackgroundCommandOutputGetPayload {
+export interface BackgroundProcessOutputGetPayload {
   processId: string;
   consume?: boolean;
 }
 
-export interface BackgroundCommandOutputResultPayload {
+export interface BackgroundProcessOutputResultPayload {
   processId: string;
   command: string;
   exitCode: number;
@@ -2710,8 +3084,21 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.Ping, { text: string; sentAt: number }>
   | BridgeEnvelope<BridgeMessageType.GetWorkspaceInfo, undefined>
   | BridgeEnvelope<BridgeMessageType.ShowInfo, { message: string }>
-  | BridgeEnvelope<BridgeMessageType.ChatSend, ChatSendPayload>
-  | BridgeEnvelope<BridgeMessageType.ChatAbort, ChatAbortPayload>
+  | BridgeEnvelope<BridgeMessageType.CommandStatusGet, CommandStatusGetPayload>
+  | BridgeEnvelope<BridgeMessageType.ConversationHeadGet, ConversationHeadGetPayload>
+  | BridgeEnvelope<BridgeMessageType.CommandOutcomeResolve, CommandOutcomeResolvePayload>
+  | BridgeEnvelope<BridgeMessageType.TurnStart, TurnStartPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnEnqueue, TurnEnqueuePayload>
+  | BridgeEnvelope<BridgeMessageType.TurnSteer, TurnSteerPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnInterrupt, TurnInterruptPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnIntentUpdate, TurnIntentUpdatePayload>
+  | BridgeEnvelope<BridgeMessageType.TurnIntentCancel, TurnIntentControlPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnIntentReorder, TurnIntentReorderPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnIntentPause, TurnIntentControlPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnIntentResume, TurnIntentControlPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnIntentResumeAll, TurnIntentResumeAllPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnIntentPromote, TurnIntentPromotePayload>
+  | BridgeEnvelope<BridgeMessageType.InteractionResolve, InteractionResolvePayload>
   | BridgeEnvelope<BridgeMessageType.LlmRetryCancel, LlmRetryCancelPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationOpen, ConversationOpenPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationCreate, ConversationCreatePayload>
@@ -2731,19 +3118,6 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.MessageEdit, MessageEditPayload>
   | BridgeEnvelope<BridgeMessageType.MessageDeleteFrom, MessageDeleteFromPayload>
   | BridgeEnvelope<BridgeMessageType.MessageRetryFrom, MessageRetryFromPayload>
-  | BridgeEnvelope<BridgeMessageType.AgentRunCancel, AgentRunControlPayload>
-  | BridgeEnvelope<BridgeMessageType.AgentRunPause, AgentRunControlPayload>
-  | BridgeEnvelope<BridgeMessageType.AgentRunResume, AgentRunControlPayload>
-  | BridgeEnvelope<BridgeMessageType.AgentRunRetry, AgentRunControlPayload>
-  | BridgeEnvelope<BridgeMessageType.AgentRunRegenerate, AgentRunControlPayload>
-  | BridgeEnvelope<BridgeMessageType.AgentRunMarkStale, AgentRunControlPayload>
-  | BridgeEnvelope<BridgeMessageType.QueuePromote, QueuePromotePayload>
-  | BridgeEnvelope<BridgeMessageType.QueueRemove, QueueRemovePayload>
-  | BridgeEnvelope<BridgeMessageType.QueueReorder, QueueReorderPayload>
-  | BridgeEnvelope<BridgeMessageType.QueuePause, QueuePausePayload>
-  | BridgeEnvelope<BridgeMessageType.QueueResume, QueueResumePayload>
-  | BridgeEnvelope<BridgeMessageType.QueueResumeAll, QueueResumeAllPayload>
-  | BridgeEnvelope<BridgeMessageType.QueueInputUpdate, QueueInputUpdatePayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeSet, ToolPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeClear, ToolPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.SkillPolicyScopeSet, SkillPolicyScopeSetPayload>
@@ -2755,18 +3129,9 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.PlanReviewPolicyScopeClear, PlanReviewPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointPolicyScopeSet, CheckpointPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointPolicyScopeClear, CheckpointPolicyScopeClearPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolExecutionApprove, ToolDecisionPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolExecutionReject, ToolDecisionPayload>
   | BridgeEnvelope<BridgeMessageType.ToolExecutionCancel, ToolDecisionPayload>
   | BridgeEnvelope<BridgeMessageType.ToolDiffOpen, ToolDiffOpenPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolChangeApply, ToolDecisionPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolChangeReject, ToolDecisionPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolResultSubmit, ToolDecisionPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolResultReject, ToolDecisionPayload>
-  | BridgeEnvelope<BridgeMessageType.AskUserAnswerSubmit, AskUserAnswerSubmitPayload>
-  | BridgeEnvelope<BridgeMessageType.PlanProposalApprove, PlanProposalApprovalPayload>
-  | BridgeEnvelope<BridgeMessageType.PlanProposalRequestChanges, PlanProposalDecisionPayload>
-  | BridgeEnvelope<BridgeMessageType.PlanProposalReject, PlanProposalDecisionPayload>
+  | BridgeEnvelope<BridgeMessageType.ToolResultArtifactGet, ToolResultArtifactGetPayload>
   | BridgeEnvelope<BridgeMessageType.PlanProposalOpen, PlanProposalOpenPayload>
   | BridgeEnvelope<BridgeMessageType.PlanProposalExport, PlanProposalExportPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpen, CheckpointDiffOpenPayload>
@@ -2806,13 +3171,19 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentPolicyScopeSet, WorkEnvironmentPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentPolicyScopeClear, WorkEnvironmentPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.FsStatGet, FsStatGetPayload>
-  | BridgeEnvelope<BridgeMessageType.BackgroundCommandOutputGet, BackgroundCommandOutputGetPayload>;
+  | BridgeEnvelope<BridgeMessageType.BackgroundProcessOutputGet, BackgroundProcessOutputGetPayload>;
 
 export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>
   | BridgeEnvelope<BridgeMessageType.Pong, { text: string; receivedAt: number }>
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
   | BridgeEnvelope<BridgeMessageType.Error, { requestType?: string; message: string }>
+  | BridgeEnvelope<BridgeMessageType.CommandReceipt, CommandReceiptPayload>
+  | BridgeEnvelope<BridgeMessageType.CommandResult, CommandResultPayload>
+  | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
+  | BridgeEnvelope<BridgeMessageType.CommandStatusResult, CommandStatusResultPayload>
+  | BridgeEnvelope<BridgeMessageType.ConversationHeadSnapshot, ConversationHeadSnapshotPayload>
+  | BridgeEnvelope<BridgeMessageType.ConversationCommittedPatch, ConversationCommittedPatchPayload>
   | BridgeEnvelope<BridgeMessageType.ClientSnapshot, ClientSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ClientPatch, ClientPatchPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationTimelinePageSnapshot, ConversationTimelinePageRecord>
@@ -2828,11 +3199,12 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.CheckpointRestoreResult, CheckpointRestoreResultPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpenResult, CheckpointDiffOpenResultPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReloadResult, AttachmentReloadResultPayload>
+  | BridgeEnvelope<BridgeMessageType.ToolResultArtifactSnapshot, ToolResultArtifactSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsSnapshot, GlobalSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsSnapshot, ConversationSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ProjectFoldersSnapshot, ProjectFoldersSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.FsStatResult, FsStatResultPayload>
-  | BridgeEnvelope<BridgeMessageType.BackgroundCommandOutputResult, BackgroundCommandOutputResultPayload>;
+  | BridgeEnvelope<BridgeMessageType.BackgroundProcessOutputResult, BackgroundProcessOutputResultPayload>;
 
 export function createMessageId(): MessageId {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
