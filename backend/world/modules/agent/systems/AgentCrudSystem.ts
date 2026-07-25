@@ -9,6 +9,7 @@ import { ToolPolicyScopeLink } from '../../tools/components';
 import { WorkEnvironmentPolicyScopeLink } from '../../workEnvironment/components';
 import { Agent, AgentConversationLink, AgentKind, AgentStatus, ConversationAgentSelection } from '../components';
 import { AgentEventType } from '../events';
+import { nextAuxiliaryId } from '../../../../reliability/stableIdFactory';
 
 export const AgentCrudSystem = defineSystem({
   name: 'AgentCrudSystem',
@@ -165,6 +166,7 @@ function resolveScope(world: WorldReader, scopeKind: ConfigScopeKind, rawScopeId
     case 'run': {
       if (!scopeId) return { ok: false };
       const run = findByRecordId(world, AgentRun, scopeId);
+      if (run !== undefined && world.get(run, AgentRun)?.lifecycle !== undefined) return { ok: false };
       return { ok: true, scopeId, data: run !== undefined ? { run } : {} };
     }
   }
@@ -201,7 +203,7 @@ function ensureAgentConversationLink(world: WorldReader, cmd: { spawn(): Entity;
   if (exists) return;
   const now = Date.now();
   const entity = cmd.spawn();
-  cmd.add(entity, AgentConversationLink, { id: `acl${entity}`, agent, conversation, role: 'participant', createdAt: now, updatedAt: now });
+  cmd.add(entity, AgentConversationLink, { id: nextAuxiliaryId('acl'), agent, conversation, role: 'participant', createdAt: now, updatedAt: now });
 }
 
 function latestSystemPromptScopeLink(world: WorldReader, scopeKind: ConfigScopeKind, scopeId: string | undefined) {
@@ -228,7 +230,7 @@ function scopeLinkEntities<T extends { scopeKind: ConfigScopeKind; scopeId?: str
 }
 
 function findByRecordId<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
-  return world.query(component).find((entity) => world.get(entity, component)?.id === id);
+  return world.entityByRecordId(component, id);
 }
 
 function normalizeName(value: string | undefined, fallback: string): string { return value?.trim().replace(/\s+/g, ' ') || fallback; }

@@ -1,6 +1,7 @@
 import { defineBundle, type Entity, type World } from '../../../ecs/types';
 import { Conversation } from '../chat/components';
 import { ConversationProjectLink, ProjectContext } from './components';
+import { nextAuxiliaryId } from '../../../reliability/stableIdFactory';
 
 export const ProjectContextBundle = defineBundle({ name: 'ProjectContextBundle', writes: [ProjectContext], mutationMode: 'create', spawns: true });
 export const ConversationProjectLinkBundle = defineBundle({ name: 'ConversationProjectLinkBundle', writes: [ConversationProjectLink], mutationMode: 'create', spawns: true });
@@ -62,7 +63,7 @@ export function setConversationProject(world: World, input: SetConversationProje
 
   const linkEntity = world.spawn();
   world.add(linkEntity, ConversationProjectLink, {
-    id: `cpl-${linkEntity}`,
+    id: nextAuxiliaryId('cpl'),
     conversation: input.conversation,
     projectContext,
     role: 'primary',

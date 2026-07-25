@@ -1,4 +1,4 @@
-import { defineSystem, type Entity, type WorldReader } from '../../../../ecs/types';
+import { defineSystem, type ComponentType, type Entity, type WorldReader } from '../../../../ecs/types';
 import { readEvents } from '../../../events';
 import { Agent } from '../../agent/components';
 import { AgentRun } from '../../agentRun/components';
@@ -127,6 +127,7 @@ function resolveScope(world: WorldReader, scopeKind: SkillPolicyScopeKind, rawSc
     case 'run': {
       if (!scopeId) return { ok: false };
       const run = findByRecordId(world, AgentRun, scopeId);
+      if (run !== undefined && world.get(run, AgentRun)?.lifecycle !== undefined) return { ok: false };
       return { ok: true, scopeId, data: run !== undefined ? { run } : {} };
     }
     case 'agentSystem':
@@ -194,6 +195,6 @@ function findSkillPolicyById(world: WorldReader, id: string): Entity | undefined
   return findByRecordId(world, SkillPolicy, id);
 }
 
-function findByRecordId<T extends { id: string }>(world: WorldReader, component: { id: symbol }, id: string): Entity | undefined {
-  return world.query(component as never).find((entity) => (world.get(entity, component as never) as T | undefined)?.id === id);
+function findByRecordId<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
+  return world.entityByRecordId(component, id);
 }

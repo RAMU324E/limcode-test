@@ -65,5 +65,5 @@ function upsertConversationWorkflowSelection(
 }
 
 export function findWorkflowById(world: World, workflowId: string): Entity | undefined {
-  return world.query(Workflow).find((entity) => world.get(entity, Workflow)?.id === workflowId);
+  return world.entityByRecordId(Workflow, workflowId);
 }

@@ -5,9 +5,7 @@ export interface AgentSpawnRequestData {
   kind: string;
   agentId?: string;
   agentName?: string;
-  conversationId?: string;
-  conversationTitle?: string;
-  initialMessage?: string;
+  conversationId: string;
 }
 
 export const AgentSpawnRequest = defineComponent<AgentSpawnRequestData>('AgentSpawnRequest');

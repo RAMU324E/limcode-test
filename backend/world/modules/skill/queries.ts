@@ -78,7 +78,7 @@ function entityForSkillPolicyScope(world: WorldReader, scopeKind: SkillPolicySco
 }
 
 function findRecordEntity<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
-  return world.query(component).find((entity) => world.get(entity, component)?.id === id);
+  return world.entityByRecordId(component, id);
 }
 
 function isNewerLink(entity: Entity, link: SkillPolicyScopeLinkData, previousEntity: Entity, previous: SkillPolicyScopeLinkData): boolean {

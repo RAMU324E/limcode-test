@@ -1,7 +1,6 @@
 import type { StorageCapability, WebviewCapability } from '../capabilities/types';
 import {
   BridgeMessageType,
-  GLOBAL_SETTINGS_SECTIONS,
   globalSettingsStreamId,
   createMessageId,
   type BridgeClientId,
@@ -15,6 +14,8 @@ export interface GlobalSettingsBridgeDeps {
   storage: StorageCapability;
   webview: WebviewCapability;
   beforeDataRootChange?: () => Promise<void>;
+  afterDataRootChange?: () => Promise<void>;
+  dataRootChangeFailed?: (error: unknown) => Promise<void>;
   beforeUpdate?: (payload: GlobalSettingsUpdatePayload) => Promise<void> | void;
   afterUpdate?: (payload: GlobalSettingsUpdatePayload) => Promise<void> | void;
 }
@@ -45,30 +46,38 @@ export class GlobalSettingsBridge {
   public async update(payload: GlobalSettingsUpdatePayload | undefined, correlationId?: string): Promise<void> {
     if (!payload) return;
 
+    let dataRootPathChanged = false;
+    let dataRootHandoffStarted = false;
     try {
-      const dataRootPathChanged = payload.section === 'common' && await this.isDataRootPathChange(payload);
+      dataRootPathChanged = payload.section === 'common' && await this.isDataRootPathChange(payload);
       if (dataRootPathChanged) {
+        dataRootHandoffStarted = true;
         await this.deps.beforeDataRootChange?.();
       }
       await this.deps.beforeUpdate?.(payload);
 
       const stored = await this.deps.storage.saveGlobalSettings(payload.section, payload.settings);
-      await this.deps.afterUpdate?.(payload);
       this.deps.webview.broadcastToStream(
         globalSettingsStreamId(payload.section),
         this.createSnapshotMessage(stored, correlationId)
       );
       if (dataRootPathChanged) {
-        for (const section of GLOBAL_SETTINGS_SECTIONS) {
-          if (section === 'common') continue;
-          const nextStored = await this.deps.storage.loadGlobalSettings(section);
-          this.deps.webview.broadcastToStream(
-            globalSettingsStreamId(section),
-            this.createSnapshotMessage(nextStored, correlationId)
-          );
+        // The old World and writer must never continue against paths that now resolve to another
+        // data root. The reload boundary reconstructs every projection and capability from scratch.
+        await this.deps.afterDataRootChange?.();
+        return;
+      }
+      await this.deps.afterUpdate?.(payload);
+    } catch (error) {
+      if (dataRootHandoffStarted) {
+        try {
+          await this.deps.dataRootChangeFailed?.(error);
+        } catch (recoveryError) {
+          const originalMessage = error instanceof Error ? error.message : String(error);
+          const recoveryMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+          error = new Error(`Data-root update failed (${originalMessage}); reliability writer recovery also failed (${recoveryMessage}).`);
         }
       }
-    } catch (error) {
       console.warn('[LimCode] Failed to update global settings:', error);
       this.postSettingsError(BridgeMessageType.GlobalSettingsUpdate, payload.section, error, correlationId);
     }

@@ -1,6 +1,4 @@
 import { defineBundle, type CommandSink, type Entity, type WorldReader } from '../../../ecs/types';
-import { Conversation, ConversationOriginLink, PartOf, Message } from '../chat/components';
-import { spawnConversation, spawnConversationOriginLink, spawnUserMessage } from '../chat/bundles';
 import {
   Agent,
   AgentConversationLink,
@@ -17,12 +15,12 @@ import {
   SystemPromptScopeLink,
   ToolPolicy
 } from '../workflow/components';
-import { selectDefaultWorkflowForConversation } from '../workflow/bundles';
 import { ToolPolicyScopeLink } from '../tools/components';
 import { PlanReviewPolicy, PlanReviewPolicyScopeLink } from '../plan/components';
 import { normalizePlanReviewPolicy } from '../plan/bundles';
 import type { BuiltinAgentDefinition, BuiltinWorkflowDefinition } from './blueprints';
 import type { AgentSource, ConfigScopeKind, ToolPolicyScopeKind } from '../../../../shared/protocol';
+import { nextAuxiliaryId } from '../../../reliability/stableIdFactory';
 
 export const AgentFromBlueprintBundle = defineBundle({
   name: 'AgentFromBlueprintBundle',
@@ -39,13 +37,9 @@ export const AgentFromBlueprintBundle = defineBundle({
     ToolPolicyScopeLink,
     PlanReviewPolicy,
     PlanReviewPolicyScopeLink,
-    Conversation,
-    ConversationOriginLink,
     ConversationWorkflowSelection,
     AgentConversationLink,
-    ConversationAgentSelection,
-    Message,
-    PartOf
+    ConversationAgentSelection
   ],
   mutationMode: 'create',
   spawns: true,
@@ -65,19 +59,6 @@ export interface SpawnAgentRuntimeMirrorInput {
   name: string;
   description?: string;
   source?: AgentSource;
-}
-
-export interface SpawnAgentWithConversationInput extends SpawnAgentProfileInput {
-  conversationId: string;
-  initialMessage?: string;
-  conversationTitle?: string;
-}
-
-export interface SpawnAgentWithConversationResult {
-  agent: Entity;
-  conversation: Entity;
-  link: Entity;
-  selection: Entity;
 }
 
 export function spawnAgentProfileFromBlueprint(cmd: CommandSink, input: SpawnAgentProfileInput): Entity {
@@ -184,21 +165,6 @@ export function spawnWorkflowFromDefinition(cmd: CommandSink, definition: Builti
   return workflow;
 }
 
-export function spawnAgentFromBlueprint(cmd: CommandSink, input: SpawnAgentWithConversationInput): SpawnAgentWithConversationResult {
-  const agent = spawnAgentProfileFromBlueprint(cmd, input);
-  const conversation = spawnConversation(cmd, { id: input.conversationId, title: input.conversationTitle });
-  spawnConversationOriginLink(cmd, { conversation, originKind: 'user', sourceKind: 'user' });
-  const link = linkAgentToConversation(cmd, { agent, conversation, role: 'default' });
-  const selection = selectAgentForConversation(cmd, { agent, conversation, conversationId: input.conversationId, agentId: input.agentId ?? input.definition.id });
-  selectDefaultWorkflowForConversation(cmd, conversation, input.conversationId);
-
-  if (input.initialMessage?.trim()) {
-    spawnUserMessage(cmd, conversation, input.initialMessage.trim());
-  }
-
-  return { agent, conversation, link, selection };
-}
-
 export function linkAgentToConversation(
   cmd: CommandSink,
   input: { agent: Entity; conversation: Entity; role?: 'default' | 'participant' | 'reviewer' }
@@ -206,7 +172,7 @@ export function linkAgentToConversation(
   const link = cmd.spawn();
   const now = Date.now();
   cmd.add(link, AgentConversationLink, {
-    id: `acl${link}`,
+    id: nextAuxiliaryId('acl'),
     agent: input.agent,
     conversation: input.conversation,
     role: input.role ?? 'participant',

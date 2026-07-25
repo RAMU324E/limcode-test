@@ -50,9 +50,9 @@ export const ConversationWorkflowSelectionSystem = defineSystem({
 });
 
 function findConversationById(world: WorldReader, conversationId: string): Entity | undefined {
-  return world.query(Conversation).find((entity) => world.get(entity, Conversation)?.id === conversationId);
+  return world.entityByRecordId(Conversation, conversationId);
 }
 
 function findWorkflowById(world: WorldReader, workflowId: string): Entity | undefined {
-  return world.query(Workflow).find((entity) => world.get(entity, Workflow)?.id === workflowId);
+  return world.entityByRecordId(Workflow, workflowId);
 }

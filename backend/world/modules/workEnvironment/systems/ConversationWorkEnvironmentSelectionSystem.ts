@@ -22,7 +22,7 @@ export const ConversationWorkEnvironmentSelectionSystem = defineSystem({
   run(ctx) {
     const { world, cmd } = ctx;
     for (const payload of readEvents(ctx, WorkEnvironmentEventType.ConversationSelectRequested)) {
-      const conversation = world.query(Conversation).find((entity) => world.get(entity, Conversation)?.id === payload.conversationId);
+      const conversation = world.entityByRecordId(Conversation, payload.conversationId);
       const workEnvironment = findWorkEnvironmentById(world, payload.workEnvironmentId);
       const data = workEnvironment !== undefined ? world.get(workEnvironment, WorkEnvironment) : undefined;
       if (conversation === undefined || workEnvironment === undefined || data?.available !== true) continue;

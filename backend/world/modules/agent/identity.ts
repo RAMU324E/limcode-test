@@ -1,4 +1,5 @@
 import type { AgentSource } from '../../../../shared/protocol';
+import { isUuidV7 } from '../../../../shared/stableIds';
 import type { Entity, WorldReader } from '../../../ecs/types';
 import { Agent, AgentKind } from './components';
 
@@ -19,15 +20,20 @@ export function agentTypeEntityForRuntimeAgent(world: WorldReader, agent: Entity
 }
 
 export function findAgentTypeEntity(world: WorldReader, selector: string): Entity | undefined {
-  return world.query(Agent).find((entity) => {
-    if (isTemporaryAgentEntity(world, entity)) return false;
-    return world.get(entity, Agent)?.id === selector || world.get(entity, AgentKind)?.kind === selector;
-  });
+  const exact = world.entityByRecordId(Agent, selector);
+  if (exact !== undefined && !isTemporaryAgentEntity(world, exact)) return exact;
+  const matches = world.query(Agent).filter((entity) => !isTemporaryAgentEntity(world, entity)
+    && world.get(entity, AgentKind)?.kind === selector);
+  if (matches.length > 1) throw new Error(`Agent type selector is ambiguous: ${selector}`);
+  return matches[0];
 }
 
 export function isRunAgentTemporaryId(id: string, kind: string): boolean {
-  const prefix = `agent-${agentSelectorSlug(kind)}-`;
-  return id.startsWith(prefix) && /^[a-z0-9]+-[a-z0-9]{8}$/.test(id.slice(prefix.length));
+  const slug = agentSelectorSlug(kind);
+  const stablePrefix = `agent${slug.replace(/[^a-z0-9]/g, '')}_`;
+  if (id.startsWith(stablePrefix) && isUuidV7(id.slice(stablePrefix.length))) return true;
+  const legacyPrefix = `agent-${slug}-`;
+  return id.startsWith(legacyPrefix) && /^[a-z0-9]+-[a-z0-9]{8}$/.test(id.slice(legacyPrefix.length));
 }
 
 export function agentSelectorSlug(value: string): string {

@@ -1,5 +1,6 @@
 import { defineSystem, type CommandSink, type ComponentType, type Entity, type WorldReader } from '../../../../ecs/types';
-import { createMessageId, type RuleKind, type RuleScope } from '../../../../../shared/protocol';
+import type { RuleKind, RuleScope } from '../../../../../shared/protocol';
+import { nextAuxiliaryId } from '../../../../reliability/stableIdFactory';
 import { RulesCatalogKey } from '../../rules/resources';
 import { readEvents } from '../../../events';
 import { Agent } from '../../agent/components';
@@ -60,9 +61,7 @@ export const RuntimeContextSnapshotSystem = defineSystem({
       resources: [RulesCatalogKey]
     },
     writes: { components: [RuntimeContextSnapshot, ConversationRuntimeContextSnapshotLink, RunRuntimeContextSnapshotLink], mutationMode: 'update' },
-    events: { read: [RuntimeContextEventType.Refresh, RuntimeContextEventType.SnapshotClear] },
-    after: ['ContextAssemblySystem'],
-    before: ['LlmDispatchSystem']
+    events: { read: [RuntimeContextEventType.Refresh, RuntimeContextEventType.SnapshotClear] }
   },
   run(ctx) {
     const { world, cmd } = ctx;
@@ -107,7 +106,7 @@ export const RuntimeContextSnapshotSystem = defineSystem({
       if (!refreshedRuns.has(data.run) && runRuntimeContextSnapshots(world, data.run).length > 0) continue;
       const snapshot = ensureConversationSnapshot(world, cmd, data.run, data.conversation, refreshedConversations.has(data.conversation));
       if (snapshot === undefined) continue;
-      linkRuntimeContextSnapshotToRun(cmd, { run: data.run, snapshot, id: `run-runtime-context:${data.run}:${snapshot}` });
+      linkRuntimeContextSnapshotToRun(cmd, { run: data.run, snapshot, id: nextAuxiliaryId('rrcs') });
     }
   }
 });
@@ -119,7 +118,7 @@ function ensureConversationSnapshot(world: WorldReader, cmd: CommandSink, run: E
   if (!built) return undefined;
   const snapshot = spawnRuntimeContextSnapshot(cmd, built);
   clearConversationSnapshotLinks(world, cmd, conversation);
-  linkRuntimeContextSnapshotToConversation(cmd, { conversation, snapshot, id: `conversation-runtime-context:${conversation}` });
+  linkRuntimeContextSnapshotToConversation(cmd, { conversation, snapshot, id: nextAuxiliaryId('crcs') });
   return snapshot;
 }
 
@@ -147,7 +146,7 @@ function buildSnapshot(world: WorldReader, run: Entity | undefined, conversation
   const text = allParts.join('\n\n');
   const now = Date.now();
   return {
-    id: `runtime-context-snapshot:${createMessageId()}`,
+    id: nextAuxiliaryId('rcs'),
     name: '运行时上下文快照',
     text,
     template,
@@ -198,5 +197,5 @@ function clearRunSnapshotLinks(world: WorldReader, cmd: { despawn(entity: Entity
 }
 
 function findByRecordId<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
-  return world.query(component).find((entity) => world.get(entity, component)?.id === id);
+  return world.entityByRecordId(component, id);
 }

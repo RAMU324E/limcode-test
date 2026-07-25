@@ -27,6 +27,7 @@ export interface ConversationSettingsBridgeDeps {
   storage: StorageCapability;
   webview: WebviewCapability;
   requestSnapshot: (conversationId?: string) => void;
+  renameConversation(conversationId: string, title: string): Promise<boolean>;
   afterRead?: (stored: StoredConversationSettings) => Promise<void> | void;
   afterUpdate?: (stored: StoredConversationSettings) => Promise<void> | void;
 }
@@ -45,9 +46,9 @@ export class ConversationSettingsBridge {
   public async update(payload: ConversationSettingsUpdatePayload | undefined, correlationId?: string): Promise<void> {
     if (!payload) return;
     const settings = normalizeConversationSettings(payload.section, payload.settings);
-    if (payload.section === 'common') this.applyCommonSettingsToWorld(settings as ConversationSettingsRecord);
-
-    const stored = await this.deps.storage.saveConversationSettings(payload.section, settings);
+    const stored = payload.section === 'common'
+      ? await this.renameCommonSettings(settings as ConversationSettingsRecord)
+      : await this.deps.storage.saveConversationSettings(payload.section, settings);
     this.deps.webview.broadcastToStream(conversationSettingsStreamId(stored.conversationId, stored.section), this.createSnapshotMessage(stored, correlationId));
     this.deps.requestSnapshot();
     this.deps.requestSnapshot(stored.conversationId);
@@ -55,23 +56,29 @@ export class ConversationSettingsBridge {
   }
 
   private async readSettings(conversationId: string, section: ConversationSettingsSection): Promise<{ conversationId: string; section: ConversationSettingsSection; settings: ConversationSettingsSectionValue; filePath: string }> {
-    const stored = await this.deps.storage.loadConversationSettings(conversationId, section);
-    if (section === 'llm') {
-      const settings = stored?.settings as ConversationLlmSettingsRecord | undefined;
+    if (section === 'common') {
+      const entity = this.findConversation(conversationId);
+      const conversation = entity === undefined ? undefined : this.deps.world.get(entity, Conversation);
+      if (!conversation) throw new Error(`Conversation settings require committed authority: ${conversationId}`);
       return {
         conversationId,
         section,
-        settings: normalizeConversationLlmSettings(conversationId, settings),
-        filePath: stored?.filePath ?? ''
+        settings: normalizeConversationCommonSettings(conversationId, {
+          conversationId,
+          name: displayConversationTitle({ id: conversationId, title: conversation.title })
+        }),
+        filePath: ''
       };
     }
 
-    const entity = this.findConversation(conversationId);
-    const conversation = entity === undefined ? undefined : this.deps.world.get(entity, Conversation);
-    const settings = conversation
-      ? { conversationId, name: displayConversationTitle({ id: conversationId, title: conversation.title }) }
-      : (stored?.settings as ConversationSettingsRecord | undefined) ?? { conversationId, name: DEFAULT_CONVERSATION_TITLE };
-    return { conversationId, section, settings: normalizeConversationCommonSettings(conversationId, settings), filePath: stored?.filePath ?? '' };
+    const stored = await this.deps.storage.loadConversationSettings(conversationId, section);
+    const settings = stored?.settings as ConversationLlmSettingsRecord | undefined;
+    return {
+      conversationId,
+      section,
+      settings: normalizeConversationLlmSettings(conversationId, settings),
+      filePath: stored?.filePath ?? ''
+    };
   }
 
   private createSnapshotMessage(stored: { conversationId: string; section: ConversationSettingsSection; settings: ConversationSettingsSectionValue; filePath: string }, correlationId?: string): ExtensionToWebviewMessage {
@@ -85,16 +92,19 @@ export class ConversationSettingsBridge {
     };
   }
 
-  private applyCommonSettingsToWorld(settings: ConversationSettingsRecord): void {
-    const conversationId = settings.conversationId;
-    const entity = this.findConversation(conversationId);
-    if (entity === undefined) return;
-    const conversation = this.deps.world.get(entity, Conversation);
-    if (conversation) this.deps.world.add(entity, Conversation, { ...conversation, title: settings.name });
+  private async renameCommonSettings(settings: ConversationSettingsRecord): Promise<StoredConversationSettings> {
+    const committed = await this.deps.renameConversation(settings.conversationId, settings.name);
+    if (!committed) throw new Error(`Conversation rename was rejected: ${settings.conversationId}`);
+    return {
+      conversationId: settings.conversationId,
+      section: 'common',
+      settings,
+      filePath: ''
+    };
   }
 
   private findConversation(conversationId: string): number | undefined {
-    return this.deps.world.query(Conversation).find((entity) => this.deps.world.get(entity, Conversation)?.id === conversationId);
+    return this.deps.world.entityByRecordId(Conversation, conversationId);
   }
 }
 

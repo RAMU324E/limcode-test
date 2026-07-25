@@ -26,6 +26,7 @@ import {
   workEnvironmentIdForKind,
   workEnvironmentIdFromUri as sharedWorkEnvironmentIdFromUri
 } from '../../../../shared/workEnvironmentCatalog';
+import { nextAuxiliaryId } from '../../../reliability/stableIdFactory';
 
 export const WorkEnvironmentBundle = defineBundle({
   name: 'WorkEnvironmentBundle',
@@ -102,7 +103,7 @@ export function selectConversationWorkEnvironment(
 
   const entity = cmd.spawn();
   cmd.add(entity, ConversationWorkEnvironmentLink, {
-    id: `cwel${entity}`,
+    id: nextAuxiliaryId('cwel'),
     conversation,
     workEnvironment,
     role: 'active',
@@ -141,7 +142,7 @@ export function selectRunWorkEnvironment(
 
   const entity = cmd.spawn();
   cmd.add(entity, RunWorkEnvironmentLink, {
-    id: `rwel${entity}`,
+    id: nextAuxiliaryId('rwel'),
     run,
     workEnvironment,
     role: 'active',
@@ -220,11 +221,11 @@ export function upsertWorkEnvironmentPolicyScopeLink(
 }
 
 export function findWorkEnvironmentById(world: WorldReader, id: string): Entity | undefined {
-  return world.query(WorkEnvironment).find((entity) => world.get(entity, WorkEnvironment)?.id === id);
+  return world.entityByRecordId(WorkEnvironment, id);
 }
 
 export function findWorkEnvironmentPolicyById(world: WorldReader, id: string): Entity | undefined {
-  return world.query(WorkEnvironmentPolicy).find((entity) => world.get(entity, WorkEnvironmentPolicy)?.id === id);
+  return world.entityByRecordId(WorkEnvironmentPolicy, id);
 }
 
 export function findActivePolicyScopeLink(world: WorldReader, scopeKind: WorkEnvironmentPolicyScopeKind, scopeId: string | undefined): { entity: Entity; link: WorkEnvironmentPolicyScopeLinkData } | undefined {

@@ -67,7 +67,7 @@ export const WorkflowCrudSystem = defineSystem({
 });
 
 function findWorkflowById(world: WorldReader, workflowId: string): Entity | undefined {
-  return world.query(Workflow).find((entity) => world.get(entity, Workflow)?.id === workflowId);
+  return world.entityByRecordId(Workflow, workflowId);
 }
 
 function relatedSelectionEntities(world: WorldReader, workflow: Entity): Entity[] {

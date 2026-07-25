@@ -13,6 +13,7 @@ export const RunWorkEnvironmentSnapshotSystem = defineSystem({
   shouldRun({ world }) {
     if (world.query(WorkEnvironment).every((entity) => world.get(entity, WorkEnvironment)?.available !== true)) return false;
     return world.query(AgentRun).some((run) => {
+      if (world.get(run, AgentRun)?.lifecycle !== undefined) return false;
       if (effectiveWorkEnvironmentPolicyForRun(world, run).policy?.enabled !== true) return false;
       const linked = linkedWorkEnvironmentForRun(world, run);
       const resolved = activeWorkEnvironmentForRun(world, run);
@@ -25,6 +26,7 @@ export const RunWorkEnvironmentSnapshotSystem = defineSystem({
   },
   run({ world, cmd }) {
     for (const run of world.query(AgentRun)) {
+      if (world.get(run, AgentRun)?.lifecycle !== undefined) continue;
       if (effectiveWorkEnvironmentPolicyForRun(world, run).policy?.enabled !== true) continue;
       const linked = linkedWorkEnvironmentForRun(world, run);
       const resolved = activeWorkEnvironmentForRun(world, run);
