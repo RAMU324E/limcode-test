@@ -1,6 +1,6 @@
-# LimCode
+# Limcode test
 
-LimCode 是一个 VS Code 扩展原型：后端使用 TypeScript ECS world，前端使用 Vue Webview，当前已接入最基础的 AI 对话链路。
+Limcode test 是 LimCode 的独立 Fork：后端使用 TypeScript ECS world，前端使用 Vue Webview，并使用独立的扩展、命令、视图与数据命名空间，可与原版同时安装。
 
 ## 当前能力
 
@@ -33,8 +33,8 @@ npm run build
 常用命令：
 
 ```text
-LimCode: Open AI Chat
-LimCode: Reveal Global Storage Folder
+Limcode test: Open AI Chat
+Limcode test: Reveal Data Storage Folder
 ```
 
 ## 常用脚本
@@ -55,4 +55,11 @@ backend/                 # ECS world、application composition root、capabiliti
 shared/                  # Webview 与扩展共享协议
 vscode/                  # VS Code extension entry、commands、panels、views
 webview/                 # Vue Webview 前端
+docs/                    # 架构与开发约束说明
 ```
+
+## 架构文档
+
+- [Conversation 可靠存储权威模型](docs/conversation-storage-authority.md)
+- [模型上下文投影、中断与压缩一致性](docs/model-context-projection.md)
+- [后台进程 completion 可靠注入语义](docs/background-process-reliability.md)
