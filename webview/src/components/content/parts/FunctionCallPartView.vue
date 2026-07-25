@@ -1,17 +1,22 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { IconTool, IconPlayerStop } from '@tabler/icons-vue';
-import { SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
+import { conversationClientStateStreamId, SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
 import { submitPlanOutputFromResult } from '@shared/planReview';
 import type {
   FunctionCallPart,
+  InteractionResultPayload,
   ToolCallEventRecord,
   ToolCallRecord,
   ToolCallStatus,
   ToolSchedulingMode
 } from '@shared/protocol';
+import type { DurableInteractionRequestKind } from '@shared/conversationReliability';
+import { interactionForTool, type InteractionView } from '@webview/domain/interactionProjection';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
+import { useInteractionStore } from '@webview/stores/useInteractionStore';
+import { finalToolResultArtifact, toolResultForState, useToolResultArtifactStore } from '@webview/stores/useToolResultArtifactStore';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import AskUserContent from '@webview/components/askUser/AskUserContent.vue';
 import PlanProposalContent from '@webview/components/plan/PlanProposalContent.vue';
@@ -42,13 +47,21 @@ const props = defineProps<{
 
 const clientState = useClientStateStore();
 const conversationTimeline = useConversationTimelineStore();
+const interactions = useInteractionStore();
+const toolResults = useToolResultArtifactStore();
 const expanded = ref(false);
 const userChangedExpanded = ref(false);
 const autoOpenedActionIds = ref<Set<string>>(new Set());
 const expandedPlanSectionKeys = ref<Set<string>>(new Set());
 const autoApplyCountdown = ref<number | undefined>(undefined);
-let autoApplyTimer: ReturnType<typeof setTimeout> | undefined;
+const cancelFeedback = ref<{
+  requestId: string;
+  phase: 'submitting' | 'committed' | 'failed';
+  message: string;
+} | undefined>(undefined);
 let autoApplyCountdownTimer: ReturnType<typeof setInterval> | undefined;
+let cancelProjectionTimer: ReturnType<typeof setTimeout> | undefined;
+const CANCEL_PROJECTION_DEADLINE_MS = 30_000;
 const toolCall = computed<ToolCallRecord | undefined>(() => {
   const partId = props.part.id;
   if (!props.messageId || !partId) return undefined;
@@ -56,20 +69,34 @@ const toolCall = computed<ToolCallRecord | undefined>(() => {
     (call) => call.messageId === props.messageId && (call.id === partId || call.functionCallId === partId)
   );
 });
+const resultArtifact = computed(() => {
+  const callId = toolCall.value?.id;
+  return callId ? finalToolResultArtifact(conversationTimeline.currentTimeline.state, callId) : undefined;
+});
+const toolResult = computed(() => {
+  const call = toolCall.value;
+  if (!call) return undefined;
+  return toolResultForState(conversationTimeline.currentTimeline.state, call.id, toolResults.loadedByArtifactId);
+});
 const toolEvents = computed<ToolCallEventRecord[]>(() => {
   const callId = toolCall.value?.id;
   if (!callId) return [];
   return clientState.toolCallEvents.filter((event) => event.toolCallId === callId).sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
 });
+const executionInteraction = computed(() => interactionForTool(clientState, toolCall.value?.id, 'exec_approval'));
+const fileChangeInteractionView = computed(() => interactionForTool(clientState, toolCall.value?.id, 'patch_approval'));
+const resultReviewInteraction = computed(() => interactionForTool(clientState, toolCall.value?.id, 'result_review'));
+const fileChangeInteraction = computed(() => fileChangeInteractionView.value?.request);
+const finalizing = computed(() => isFinalizingProgress(toolCall.value?.progress));
 const displayProgress = computed(() => {
   const progress = toolCall.value?.progress;
-  if (isInternalApprovalProgress(progress)) return undefined;
+  if (isInternalApprovalProgress(progress) || isFinalizingProgress(progress)) return undefined;
   return progress;
 });
 const toolDisplay = computed(() => resolveToolDisplay({
   toolName: props.part.functionCall.name,
   args: props.part.functionCall.args,
-  result: toolCall.value?.result,
+  result: toolResult.value,
   progress: displayProgress.value,
   events: toolEvents.value,
   toolCall: toolCall.value,
@@ -92,29 +119,39 @@ const hasArgs = computed(() => inputSections.value.length > 0);
 const hasOutput = computed(() => outputSections.value.length > 0);
 const executionApproved = computed(() => isExecutionApprovedProgress(toolCall.value?.progress));
 const executionApprovalPending = computed(() => toolCall.value?.status === 'awaiting_approval' && executionApproved.value);
-const needsExecutionDecision = computed(() => toolCall.value?.status === 'awaiting_approval' && !executionApproved.value);
-const needsChangeApplyDecision = computed(() => toolCall.value?.status === 'awaiting_change_apply');
-const needsResultSubmitDecision = computed(() => toolCall.value?.status === 'awaiting_result_submit');
+const needsExecutionDecision = computed(() => executionInteraction.value?.request.state === 'pending');
+const needsChangeApplyDecision = computed(() => fileChangeInteractionView.value?.request.state === 'pending');
+const needsResultSubmitDecision = computed(() => resultReviewInteraction.value?.request.state === 'pending');
+const interactionDecisionPending = computed(() => [executionInteraction.value, fileChangeInteractionView.value, resultReviewInteraction.value]
+  .some((target) => !!target && interactions.isPending(target.request.id)));
 const hasDetails = computed(() => hasArgs.value || hasOutput.value || Boolean(toolCall.value?.error) || executionApprovalPending.value);
 const autoExpandDetails = computed(() => toolCall.value?.display?.autoExpand === true);
 const autoOpenDiffPreview = computed(() => toolCall.value?.display?.autoOpenDiffPreview === true);
-const autoApplyChange = computed(() => toolCall.value?.changeApply?.autoApply === true);
+const autoApplyChange = computed(() => {
+  const policy = fileChangeInteraction.value?.policySnapshot;
+  return policy?.autoDecision === 'accept' && (policy.mode === 'auto_at' || policy.mode === 'auto_immediate');
+});
 const autoApplyDelaySeconds = computed(() => {
-  const value = toolCall.value?.changeApply?.autoApplyDelaySeconds;
-  return typeof value === 'number' && Number.isFinite(value) ? Math.min(600, Math.max(0, Math.floor(value))) : 3;
+  const request = fileChangeInteraction.value;
+  const notBeforeAt = request?.policySnapshot.notBeforeAt;
+  if (!request || notBeforeAt === undefined) return 0;
+  return Math.max(0, Math.ceil((notBeforeAt - request.createdAt) / 1000));
 });
 const autoApplyHint = computed(() => {
   if (!needsChangeApplyDecision.value || !autoApplyChange.value) return undefined;
   const remaining = autoApplyCountdown.value ?? autoApplyDelaySeconds.value;
-  return remaining <= 0 ? '即将自动应用更改' : `${remaining} 秒后自动应用更改`;
+  return remaining <= 0 ? '正在等待系统应用更改' : `${remaining} 秒后自动应用更改`;
 });
-const commandRuntimeStatus = computed(() => toolCall.value ? shellRuntimeStatusLabel(toolCall.value) : undefined);
-const statusLabel = computed(() => commandRuntimeStatus.value?.label ?? (toolCall.value ? labelForToolCall(toolCall.value) : '工具请求已生成'));
+const commandRuntimeStatus = computed(() => toolCall.value ? shellRuntimeStatusLabel(toolCall.value, toolResult.value) : undefined);
+const statusLabel = computed(() => cancelFeedback.value?.message
+  ?? (finalizing.value ? '工具已完成，正在提交结果' : undefined)
+  ?? commandRuntimeStatus.value?.label
+  ?? (toolCall.value ? labelForToolCall(toolCall.value, toolResult.value) : '工具请求已生成'));
 // 可中断：正在推进（排队/执行/应用更改）或已批准待执行；等待用户决策的状态各有专用按钮，不重复给中断入口。
 // 注意：命令工具转后台后是终态 success（已把“成功”返回给 AI），不再算可中断——后台命令的终止在后台命令面板里做。
 const canCancel = computed(() => {
   const call = toolCall.value;
-  if (!call) return false;
+  if (!call || finalizing.value) return false;
   switch (call.status) {
     case 'queued':
     case 'awaiting_user_input':
@@ -129,6 +166,7 @@ const canCancel = computed(() => {
 });
 const statusTitle = computed(() => {
   if (!toolCall.value) return '等待后端创建工具调用记录';
+  if (finalizing.value) return '外部工具执行已结束，正在提交可靠终态';
   const runtimeStatus = commandRuntimeStatus.value?.status;
   return runtimeStatus ? '工具状态：' + toolCall.value.status + ' · shell ' + runtimeStatus : '工具状态：' + toolCall.value.status;
 });
@@ -185,6 +223,16 @@ const toggleLabel = computed(() => {
   return expanded.value ? '收起工具调用内容' : '展开工具调用内容';
 });
 
+watch(
+  () => `${expanded.value}:${needsChangeApplyDecision.value}:${resultArtifact.value?.id ?? ''}:${resultArtifact.value?.contentHash ?? ''}`,
+  () => {
+    if (!expanded.value && !needsChangeApplyDecision.value) return;
+    const conversationId = conversationTimeline.currentTimeline.conversationId || clientState.currentConversationId;
+    if (conversationId) toolResults.ensureFullResult(conversationId, resultArtifact.value);
+  },
+  { immediate: true }
+);
+
 watch(autoExpandDetails, (autoExpand) => {
   if (autoExpand && !userChangedExpanded.value) expanded.value = true;
 }, { immediate: true });
@@ -209,17 +257,35 @@ watch(
 );
 
 watch(
-  () => `${toolCall.value?.id ?? ''}:${toolCall.value?.status ?? ''}:${toolCall.value?.updatedAt ?? 0}:${autoApplyChange.value}:${autoApplyDelaySeconds.value}`,
-  scheduleAutoApply,
+  () => `${fileChangeInteraction.value?.id ?? ''}:${fileChangeInteraction.value?.revision ?? 0}:${fileChangeInteraction.value?.state ?? ''}:${fileChangeInteraction.value?.updatedAt ?? 0}:${fileChangeInteraction.value?.policySnapshot.notBeforeAt ?? 0}`,
+  scheduleAutoApplyCountdown,
   { immediate: true }
 );
 
+const stopInteractionResult = bridge.on(BridgeMessageType.InteractionResult, (message) => {
+  const pending = cancelFeedback.value;
+  const call = toolCall.value;
+  if (!pending || !call || message.correlationId !== pending.requestId || message.payload?.targetId !== call.id) return;
+  applyInteractionFeedback(message.payload);
+});
+
 onBeforeUnmount(() => {
   clearAutoApplyTimers();
+  clearCancelProjectionTimer();
+  stopInteractionResult();
 });
 
 watch(() => toolCall.value?.id, () => {
   expandedPlanSectionKeys.value = new Set();
+  clearCancelProjectionTimer();
+  cancelFeedback.value = undefined;
+});
+
+watch(() => toolCall.value?.status, (status) => {
+  if (status === 'success' || status === 'warning' || status === 'error') {
+    clearCancelProjectionTimer();
+    cancelFeedback.value = undefined;
+  }
 });
 
 function isCommandTool(toolName: string): boolean {
@@ -251,43 +317,112 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function sendToolDecision(type:
-  | BridgeMessageType.ToolExecutionApprove
-  | BridgeMessageType.ToolExecutionReject
-  | BridgeMessageType.ToolExecutionCancel
-  | BridgeMessageType.ToolChangeApply
-  | BridgeMessageType.ToolChangeReject
-  | BridgeMessageType.ToolResultSubmit
-  | BridgeMessageType.ToolResultReject
-): void {
-  const call = toolCall.value;
-  if (!call) return;
-  if (type === BridgeMessageType.ToolChangeApply || type === BridgeMessageType.ToolChangeReject) clearAutoApplyTimers();
-  bridge.request(type, { toolCallId: call.id, conversationId: clientState.currentConversationId });
+function resolveToolInteraction(kind: DurableInteractionRequestKind, decision: 'accept' | 'reject'): void {
+  const target: InteractionView | undefined = kind === 'exec_approval'
+    ? executionInteraction.value
+    : kind === 'patch_approval'
+      ? fileChangeInteractionView.value
+      : kind === 'result_review'
+        ? resultReviewInteraction.value
+        : undefined;
+  if (!target || target.request.state !== 'pending') return;
+  if (kind === 'patch_approval') clearAutoApplyTimers();
+  interactions.resolve(target, decision, decision === 'reject' ? { reason: rejectionReason(kind) } : {});
 }
 
-function scheduleAutoApply(): void {
-  clearAutoApplyTimers();
+function cancelToolExecution(): void {
   const call = toolCall.value;
-  if (!call || call.status !== 'awaiting_change_apply' || !autoApplyChange.value) return;
-  const delaySeconds = autoApplyDelaySeconds.value;
-  autoApplyCountdown.value = delaySeconds;
-  if (delaySeconds <= 0) {
-    autoApplyTimer = setTimeout(() => sendToolDecision(BridgeMessageType.ToolChangeApply), 0);
-    return;
+  if (!call || (cancelFeedback.value && cancelFeedback.value.phase !== 'failed')) return;
+  const requestId = bridge.request(BridgeMessageType.ToolExecutionCancel, {
+    toolCallId: call.id,
+    conversationId: clientState.currentConversationId
+  });
+  clearCancelProjectionTimer();
+  cancelFeedback.value = { requestId, phase: 'submitting', message: '正在提交中断' };
+}
+
+function rejectionReason(kind: DurableInteractionRequestKind): string {
+  if (kind === 'exec_approval') return '用户拒绝执行工具。';
+  if (kind === 'patch_approval') return '用户拒绝应用更改。';
+  return '用户拒绝将工具结果回传给 AI。';
+}
+
+function applyInteractionFeedback(result: InteractionResultPayload): void {
+  const current = cancelFeedback.value;
+  if (!current) return;
+  switch (result.status) {
+    case 'committed':
+    case 'already_applied':
+      cancelFeedback.value = { ...current, phase: 'committed', message: '中断已提交，等待状态同步' };
+      requestCancelProjectionRecovery(result.conversationId);
+      return;
+    case 'already_satisfied':
+    case 'already_resolved':
+      cancelFeedback.value = { ...current, phase: 'committed', message: '目标已结束，正在同步状态' };
+      requestCancelProjectionRecovery(result.conversationId);
+      return;
+    case 'stale':
+      clearCancelProjectionTimer();
+      cancelFeedback.value = { ...current, phase: 'failed', message: '目标状态已变化，已请求重新同步' };
+      requestConversationResync(result.conversationId);
+      return;
+    case 'rejected':
+    case 'blocked':
+    case 'outcome_unknown':
+      clearCancelProjectionTimer();
+      cancelFeedback.value = { ...current, phase: 'failed', message: result.reason?.trim() || '中断未能完成，请重试' };
   }
-  const startedAt = Date.now();
+}
+
+function requestCancelProjectionRecovery(conversationId: string): void {
+  requestConversationResync(conversationId);
+  clearCancelProjectionTimer();
+  cancelProjectionTimer = setTimeout(() => {
+    cancelProjectionTimer = undefined;
+    const current = cancelFeedback.value;
+    if (!current || current.phase !== 'committed') return;
+    cancelFeedback.value = {
+      ...current,
+      phase: 'failed',
+      message: '中断已提交，但页面状态尚未同步；请重试同步或重载窗口'
+    };
+    requestConversationResync(conversationId);
+  }, CANCEL_PROJECTION_DEADLINE_MS);
+}
+
+function requestConversationResync(conversationId: string): void {
+  bridge.request(BridgeMessageType.ClientResync, {
+    conversationId,
+    streamId: conversationClientStateStreamId(conversationId)
+  });
+}
+
+function clearCancelProjectionTimer(): void {
+  if (cancelProjectionTimer !== undefined) clearTimeout(cancelProjectionTimer);
+  cancelProjectionTimer = undefined;
+}
+
+function scheduleAutoApplyCountdown(): void {
+  clearAutoApplyTimers();
+  const request = fileChangeInteraction.value;
+  const notBeforeAt = request?.policySnapshot.notBeforeAt;
+  if (!request || request.state !== 'pending' || !autoApplyChange.value || notBeforeAt === undefined) return;
+  const update = () => {
+    autoApplyCountdown.value = Math.max(0, Math.ceil((notBeforeAt - Date.now()) / 1000));
+  };
+  update();
+  if (autoApplyCountdown.value === 0) return;
   autoApplyCountdownTimer = setInterval(() => {
-    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-    autoApplyCountdown.value = Math.max(0, delaySeconds - elapsed);
+    update();
+    if (autoApplyCountdown.value === 0 && autoApplyCountdownTimer) {
+      clearInterval(autoApplyCountdownTimer);
+      autoApplyCountdownTimer = undefined;
+    }
   }, 250);
-  autoApplyTimer = setTimeout(() => sendToolDecision(BridgeMessageType.ToolChangeApply), delaySeconds * 1000);
 }
 
 function clearAutoApplyTimers(): void {
-  if (autoApplyTimer) clearTimeout(autoApplyTimer);
   if (autoApplyCountdownTimer) clearInterval(autoApplyCountdownTimer);
-  autoApplyTimer = undefined;
   autoApplyCountdownTimer = undefined;
   autoApplyCountdown.value = undefined;
 }
@@ -323,9 +458,9 @@ function invokeHeaderAction(action: ToolHeaderAction): void {
   action.invoke();
 }
 
-function shellRuntimeStatusLabel(call: ToolCallRecord): { label: string; status: string } | undefined {
+function shellRuntimeStatusLabel(call: ToolCallRecord, result: unknown): { label: string; status: string } | undefined {
   if (!isCommandTool(call.name)) return undefined;
-  const output = parseShellResultOutput(call.result);
+  const output = parseShellResultOutput(result);
   if (!output) return undefined;
   if (output.running === true || output.status === 'running') return { label: '后台运行中', status: 'running' };
   if (output.killed === true || output.status === 'killed') return { label: '已终止', status: 'killed' };
@@ -333,25 +468,25 @@ function shellRuntimeStatusLabel(call: ToolCallRecord): { label: string; status:
   if (output.status === 'exited') return { label: '已退出', status: 'exited' };
   return undefined;
 }
-function labelForToolCall(call: ToolCallRecord): string {
+function labelForToolCall(call: ToolCallRecord, result: unknown): string {
   if (call.status === 'awaiting_approval' && isExecutionApprovedProgress(call.progress)) {
     return isWaitingForPreviousProgress(call.progress) ? '已批准，等待前序批次' : '已批准，等待执行';
   }
   if (call.name === SUBMIT_PLAN_TOOL_NAME) {
-    const planOutput = submitPlanOutputFromResult(call.result);
+    const planOutput = submitPlanOutputFromResult(result);
     if (call.status === 'awaiting_user_input') return '等待审批 Plan';
     if (planOutput?.status === 'approved') return 'Plan 已批准';
     if (planOutput?.status === 'change_requested') return '要求修改 Plan';
     if (planOutput?.status === 'rejected') return 'Plan 已拒绝';
   }
-  if (call.status === 'error' && isInterruptedResult(call.result)) {
+  if (call.status === 'error' && isInterruptedResult(result)) {
     return '已被用户中断';
   }
-  if (call.status === 'error' && isDeniedResult(call.result)) {
-    return deniedStatusLabel(call.result, call.error);
+  if (call.status === 'error' && isDeniedResult(result)) {
+    return deniedStatusLabel(result, call.error);
   }
-  if (call.status === 'success' && isAsyncAgentRunResult(call.result)) return '子任务已启动';
-  if (call.status === 'warning' && isPartialEditResult(call.result)) return '部分成功';
+  if (call.status === 'success' && isAsyncAgentRunResult(result)) return '子任务已启动';
+  if (call.status === 'warning' && isPartialEditResult(result)) return '部分成功';
   return labelForStatus(call.status);
 }
 
@@ -418,6 +553,10 @@ function isInternalApprovalProgress(progress: unknown): boolean {
   if (!isRecord(progress) || progress.executionApproved !== true) return false;
   return Object.keys(progress).every((key) => key === 'executionApproved' || key === 'waitingForPrevious');
 }
+
+function isFinalizingProgress(progress: unknown): boolean {
+  return isRecord(progress) && progress.phase === 'finalizing';
+}
 </script>
 
 <template>
@@ -482,10 +621,11 @@ function isInternalApprovalProgress(progress: unknown): boolean {
         class="tool-header-action tool-header-action-cancel"
         title="中断此工具调用"
         aria-label="中断此工具调用"
-        @click.stop="sendToolDecision(BridgeMessageType.ToolExecutionCancel)"
+        :disabled="cancelFeedback?.phase === 'submitting' || cancelFeedback?.phase === 'committed'"
+        @click.stop="cancelToolExecution"
       >
         <IconPlayerStop class="tool-header-action-icon" stroke="2" aria-hidden="true" />
-        <span class="tool-header-action-label">中断</span>
+        <span class="tool-header-action-label">{{ cancelFeedback?.phase === 'submitting' ? '中断中' : cancelFeedback?.phase === 'committed' ? '已提交' : '中断' }}</span>
       </button>
     </template>
 
@@ -519,6 +659,7 @@ function isInternalApprovalProgress(progress: unknown): boolean {
           class="tool-display-ask-user"
           :request="section.askUser.request"
           :tool-call="section.askUser.toolCall"
+          :result="toolResult"
           placement="tool-detail"
         />
         <PlanProposalContent
@@ -527,6 +668,7 @@ function isInternalApprovalProgress(progress: unknown): boolean {
           :request="section.planProposal.request"
           :proposal-id="section.planProposal.proposalId"
           :tool-call="section.planProposal.toolCall"
+          :result="toolResult"
           @panel-expanded-change="updatePlanSectionExpanded(section, $event)"
         />
       </ContentBlockSection>
@@ -559,6 +701,7 @@ function isInternalApprovalProgress(progress: unknown): boolean {
           class="tool-display-ask-user"
           :request="section.askUser.request"
           :tool-call="section.askUser.toolCall"
+          :result="toolResult"
           placement="tool-detail"
         />
         <PlanProposalContent
@@ -567,6 +710,7 @@ function isInternalApprovalProgress(progress: unknown): boolean {
           :request="section.planProposal.request"
           :proposal-id="section.planProposal.proposalId"
           :tool-call="section.planProposal.toolCall"
+          :result="toolResult"
           @panel-expanded-change="updatePlanSectionExpanded(section, $event)"
         />
       </ContentBlockSection>
@@ -581,17 +725,17 @@ function isInternalApprovalProgress(progress: unknown): boolean {
   </CollapsibleContentBlock>
 
   <div v-if="needsExecutionDecision" class="tool-decision-actions is-external">
-    <button type="button" @click="sendToolDecision(BridgeMessageType.ToolExecutionApprove)">批准执行</button>
-    <button type="button" class="secondary" @click="sendToolDecision(BridgeMessageType.ToolExecutionReject)">拒绝</button>
+    <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'accept')">批准执行</button>
+    <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'reject')">拒绝</button>
   </div>
   <div v-else-if="needsChangeApplyDecision" class="tool-decision-actions is-external">
     <span v-if="autoApplyHint" class="tool-decision-hint">{{ autoApplyHint }}</span>
-    <button type="button" @click="sendToolDecision(BridgeMessageType.ToolChangeApply)">应用更改</button>
-    <button type="button" class="secondary" @click="sendToolDecision(BridgeMessageType.ToolChangeReject)">拒绝更改</button>
+    <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('patch_approval', 'accept')">应用更改</button>
+    <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('patch_approval', 'reject')">拒绝更改</button>
   </div>
   <div v-else-if="needsResultSubmitDecision" class="tool-decision-actions is-external">
-    <button type="button" @click="sendToolDecision(BridgeMessageType.ToolResultSubmit)">回传结果给 AI</button>
-    <button type="button" class="secondary" @click="sendToolDecision(BridgeMessageType.ToolResultReject)">拒绝结果并告知 AI</button>
+    <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('result_review', 'accept')">回传结果给 AI</button>
+    <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('result_review', 'reject')">拒绝结果并告知 AI</button>
   </div>
 </template>
 
