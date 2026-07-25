@@ -16,3 +16,9 @@ README copy.md
 .cursor
 .claude
 src copy
+docs/*
+!docs/background-process-reliability.md
+!docs/conversation-storage-authority.md
+!docs/model-context-projection.md
+/tests/
+/scripts/benchmark-*
