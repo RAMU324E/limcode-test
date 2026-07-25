@@ -12,18 +12,37 @@ export function observedUsageTokenCount(usage: LlmUsageMetadataRecord): number |
   return sum > 0 ? sum : undefined;
 }
 
-export function compressionThresholdTokens(settings: LlmInvocationSettingsSnapshotRecord): number | undefined {
+export type CompressionThresholdResolution =
+  | { kind: 'resolved'; unit: 'tokens' | 'percent'; thresholdTokens: number }
+  | {
+      kind: 'unavailable';
+      reason: 'trigger_missing' | 'threshold_unit_missing' | 'threshold_tokens_missing' | 'threshold_percent_missing' | 'context_window_missing';
+    };
+
+/** Resolves only the field selected by the frozen thresholdUnit; no cross-unit fallback is allowed. */
+export function resolveCompressionThreshold(settings: LlmInvocationSettingsSnapshotRecord): CompressionThresholdResolution {
   const trigger = settings.compressionTrigger;
-  if (!trigger) return undefined;
+  if (!trigger) return { kind: 'unavailable', reason: 'trigger_missing' };
+  if (trigger.thresholdUnit === 'tokens') {
+    const thresholdTokens = finitePositiveInteger(trigger.thresholdTokens);
+    return thresholdTokens === undefined
+      ? { kind: 'unavailable', reason: 'threshold_tokens_missing' }
+      : { kind: 'resolved', unit: 'tokens', thresholdTokens };
+  }
+  if (trigger.thresholdUnit === 'percent') {
+    const thresholdPercent = finitePercent(trigger.thresholdPercent);
+    if (thresholdPercent === undefined) return { kind: 'unavailable', reason: 'threshold_percent_missing' };
+    const contextWindowTokens = finitePositiveInteger(settings.contextWindowTokens);
+    return contextWindowTokens === undefined
+      ? { kind: 'unavailable', reason: 'context_window_missing' }
+      : { kind: 'resolved', unit: 'percent', thresholdTokens: Math.max(1, Math.floor(contextWindowTokens * thresholdPercent / 100)) };
+  }
+  return { kind: 'unavailable', reason: 'threshold_unit_missing' };
+}
 
-  const contextWindowTokens = finitePositiveInteger(settings.contextWindowTokens);
-  const configuredTokens = finitePositiveInteger(trigger.thresholdTokens);
-  if (configuredTokens !== undefined) return configuredTokens;
-
-  const thresholdPercent = finitePercent(trigger.thresholdPercent);
-  return contextWindowTokens !== undefined && thresholdPercent !== undefined
-    ? Math.floor(contextWindowTokens * thresholdPercent / 100)
-    : undefined;
+export function compressionThresholdTokens(settings: LlmInvocationSettingsSnapshotRecord): number | undefined {
+  const resolved = resolveCompressionThreshold(settings);
+  return resolved.kind === 'resolved' ? resolved.thresholdTokens : undefined;
 }
 
 function finitePositiveInteger(value: unknown): number | undefined {
@@ -33,6 +52,6 @@ function finitePositiveInteger(value: unknown): number | undefined {
 
 function finitePercent(value: unknown): number | undefined {
   const number = Number(value);
-  if (!Number.isFinite(number) || number <= 0) return undefined;
-  return Math.min(100, Math.max(1, number));
+  if (!Number.isFinite(number) || number <= 0 || number > 100) return undefined;
+  return number;
 }

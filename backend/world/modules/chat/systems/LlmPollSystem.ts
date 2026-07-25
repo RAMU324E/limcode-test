@@ -1,3 +1,4 @@
+import { canonicalFunctionCallId } from '../../../../modelContext/toolCallIdentity';
 import { defineQuery, defineSystem, type CommandSink, type Entity, type WorldReader } from '../../../../ecs/types';
 import {
   LlmEventType,
@@ -15,8 +16,10 @@ import { LlmInvocation, type LlmInvocationData } from '../../llm/components';
 import { compressionThresholdTokens, observedUsageTokenCount } from '../../llm/usage';
 import { ToolCall, ToolCallEvent } from '../../tools/components';
 import { spawnToolCall, ToolCallBundle } from '../../tools/bundles';
-import { AgentRun, AgentRunSourceLink, ToolCallRunLink } from '../../agentRun/components';
+import { AgentRun, AgentRunSourceLink, RunTermination, ToolCallRunLink } from '../../agentRun/components';
 import { spawnToolCallRunLink } from '../../agentRun/bundles';
+import { terminateLegacyAgentRun } from '../../agentRun/termination';
+import { isTerminalRunStatus } from '../../agentRun/queries';
 import { CompressionBlock } from '../../compression/components';
 import { CompressionEventType } from '../../compression/events';
 import { LlmRequest, Message, Streaming, Conversation, PartOf, type LlmRequestData, type MessageData } from '../components';
@@ -33,9 +36,10 @@ import {
   type LlmTransientNoticeKind,
   type LlmUsageMetadataRecord
 } from '../../../../../shared/protocol';
-import { CheckpointEventType } from '../../checkpoint/events';
+import { CheckpointEventType, enqueueCheckpointRequest } from '../../checkpoint/events';
 import { markClientStateConversationsDirty } from '../../../clientSync/dirtyConversations';
 import { ClientStateDirtyConversationIdsKey, ClientSyncFastPatchStateKey, type ClientSyncFastPatchBatch } from '../../../clientSync/resources';
+import type { TransientStreamEpoch } from '../../../../../shared/conversationReliability';
 
 type PendingOperation =
   | { kind: 'started'; payload: LlmStartedPayload }
@@ -55,6 +59,11 @@ interface PendingRequestUpdate {
   operations: PendingOperation[];
 }
 
+type StreamEpochAdmission =
+  | { kind: 'legacy' }
+  | { kind: 'reliable'; epoch: TransientStreamEpoch }
+  | { kind: 'invalid' };
+
 const LlmInvocationsByIdQuery = defineQuery({
   name: 'LlmInvocationsById',
   all: [LlmInvocation],
@@ -68,6 +77,7 @@ const LlmRequestsByIdQuery = defineQuery({
   name: 'LlmRequestsById',
   all: [LlmRequest],
   read: [LlmRequest, Conversation],
+  write: [LlmRequest],
   remove: [LlmRequest],
   mutationMode: 'consume',
   role: 'lookup'
@@ -89,12 +99,30 @@ const ToolCallLookupQuery = defineQuery({
   role: 'lookup'
 });
 
+const LLM_POLL_EVENT_TYPES = new Set<string>([
+  LlmEventType.Started,
+  LlmEventType.ThoughtDelta,
+  LlmEventType.ThoughtProgress,
+  LlmEventType.ThoughtDone,
+  LlmEventType.Delta,
+  LlmEventType.ToolCall,
+  LlmEventType.Done,
+  LlmEventType.Error,
+  LlmEventType.RetryScheduled,
+  LlmEventType.RetryStarted,
+  LlmEventType.RetryCancelled,
+  LlmEventType.RetryRecovered
+]);
+
 export const LlmPollSystem = defineSystem({
   name: 'LlmPollSystem',
+  shouldRun(ctx) {
+    return ctx.events.some((event) => LLM_POLL_EVENT_TYPES.has(event.type));
+  },
   access: {
     queries: [LlmInvocationsByIdQuery, LlmRequestsByIdQuery, ModelMessagesQuery, ToolCallLookupQuery],
-    reads: { components: [PartOf, CompressionBlock, ToolCallEvent, ToolCallRunLink, AgentRunSourceLink] },
-    writes: { components: [Streaming, AgentRun, ToolCall, ToolCallEvent, ToolCallRunLink] },
+    reads: { components: [PartOf, CompressionBlock, ToolCallEvent, ToolCallRunLink, AgentRunSourceLink, RunTermination] },
+    writes: { components: [Streaming, AgentRun, RunTermination, ToolCall, ToolCallEvent, ToolCallRunLink] },
     resources: { read: [ClientSyncFastPatchStateKey, ClientStateDirtyConversationIdsKey], write: [ClientSyncFastPatchStateKey, ClientStateDirtyConversationIdsKey], mutationMode: 'update' },
     events: { read: [LlmEventType.Started, LlmEventType.ThoughtDelta, LlmEventType.ThoughtProgress, LlmEventType.ThoughtDone, LlmEventType.Delta, LlmEventType.ToolCall, LlmEventType.Done, LlmEventType.Error, LlmEventType.RetryScheduled, LlmEventType.RetryStarted, LlmEventType.RetryCancelled, LlmEventType.RetryRecovered], emit: [CheckpointEventType.Requested, CompressionEventType.Create] },
     effects: { emit: ['client.transientNotice'] },
@@ -181,7 +209,7 @@ function updateFor(updates: Map<string, PendingRequestUpdate>, requestId: string
 }
 
 function requestOf(world: WorldReader, requestId: string): Entity | undefined {
-  return world.query(LlmRequest).find((request) => world.get(request, LlmRequest)?.id === requestId);
+  return world.entityByRecordId(LlmRequest, requestId);
 }
 
 function maybeEnqueueAutoCompression(
@@ -293,6 +321,30 @@ function applyRequestUpdate(world: WorldReader, cmd: CommandSink, requestId: str
   const requestData = world.get(request, LlmRequest);
   if (!requestData) return emptyApplyResult();
 
+  const streamEpochAdmission = classifyStreamEpoch(requestId, update, requestData.reliableStreamEpoch);
+  if (streamEpochAdmission.kind === 'invalid' || (streamEpochAdmission.kind === 'reliable' && hasReliableDurableBoundaryOperation(update))) {
+    console.warn('[LimCode][Reliability]', {
+      kind: 'stale_callback',
+      timestamp: Date.now(),
+      requestId,
+      phase: 'backend_transient_stream_admission',
+      reasonCode: streamEpochAdmission.kind === 'invalid'
+        ? 'invalid_or_non_monotonic_stream_epoch'
+        : 'reliable_event_bypassed_durable_boundary'
+    });
+    return emptyApplyResult();
+  }
+  if (streamEpochAdmission.kind === 'reliable' && streamEpochAdmission.epoch.streamSeq !== requestData.reliableStreamEpoch!.streamSeq) {
+    cmd.add(request, LlmRequest, {
+      ...requestData,
+      reliableStreamEpoch: {
+        attemptId: streamEpochAdmission.epoch.attemptId,
+        generation: streamEpochAdmission.epoch.generation,
+        streamSeq: streamEpochAdmission.epoch.streamSeq
+      }
+    });
+  }
+
   const modelMessage = requestData.modelMessage;
   const current = world.get(modelMessage, Message);
   if (!current) return emptyApplyResult();
@@ -379,7 +431,7 @@ function applyRequestUpdate(world: WorldReader, cmd: CommandSink, requestId: str
           }
 
           if (!toolCallExists(world, toolCallId)) {
-            const toolCall = spawnToolCall(cmd, { modelMessage, id: toolCallId, name: rawCall.name, argsJson: rawCall.argsJson });
+            const toolCall = spawnToolCall(cmd, { modelMessage, functionCallId: toolCallId, name: rawCall.name, argsJson: rawCall.argsJson });
             spawnToolCallRunLink(cmd, { toolCall, run: requestData.run });
           }
         }
@@ -387,19 +439,38 @@ function applyRequestUpdate(world: WorldReader, cmd: CommandSink, requestId: str
       case 'error':
         errorMessage = operation.payload.message;
         emitTransientNotice(world, cmd, requestId, requestData, next, 'error', operation.payload);
-        next = withLlmTiming({ ...next, status: 'error' }, operation.payload, nextInvocation?.startedAt);
+        next = withLlmTiming({ ...next, status: 'partial' }, operation.payload, nextInvocation?.startedAt);
         nextInvocation = markInvocationError(nextInvocation, operation.payload.message, operation.payload);
         shouldFinish = true;
         fastPatchSafe = false;
         break;
       case 'done':
         usageMetadata = operation.payload.usageMetadata;
-        next = withLlmTiming({ ...next, status: 'complete' }, operation.payload, nextInvocation?.startedAt);
+        next = withLlmTiming({ ...next, status: 'final' }, operation.payload, nextInvocation?.startedAt);
         nextInvocation = markInvocationComplete(nextInvocation, operation.payload);
         shouldFinish = true;
         fastPatchSafe = false;
         break;
     }
+  }
+
+  const hasToolCall = next.content.parts.some(isFunctionCallPart);
+  const emptyModelResult = shouldFinish
+    && !errorMessage
+    && !hasToolCall
+    && !next.content.parts.some(isVisibleTextPart);
+  if (emptyModelResult) {
+    errorMessage = 'empty_model_result';
+    next = { ...next, status: 'partial' };
+    if (nextInvocation) {
+      nextInvocation = {
+        ...nextInvocation,
+        status: 'error',
+        error: errorMessage,
+        completedAt: Date.now()
+      };
+    }
+    fastPatchSafe = false;
   }
 
   if (next !== current) {
@@ -419,8 +490,13 @@ function applyRequestUpdate(world: WorldReader, cmd: CommandSink, requestId: str
       ...(invocationChanged || sawToolCall || shouldFinish ? runSourceConversationIds(world, requestData.run) : [])
     ]);
   }
-  const fastPatchBatches = fastPatchSafe && fastPatches.length > 0 && conversation
-    ? [{ streamId: conversationClientStateStreamId(conversation.id), patches: fastPatches }]
+  const transientStreamEpoch = streamEpochAdmission.kind === 'reliable' ? streamEpochAdmission.epoch : undefined;
+  const fastPatchBatches: ClientSyncFastPatchBatch[] = fastPatchSafe && fastPatches.length > 0 && conversation
+    ? [{
+        streamId: conversationClientStateStreamId(conversation.id),
+        patches: fastPatches,
+        ...(transientStreamEpoch ? { transientStreamEpoch } : {})
+      }]
     : [];
 
   if (shouldFinish) {
@@ -432,9 +508,12 @@ function applyRequestUpdate(world: WorldReader, cmd: CommandSink, requestId: str
       const waitsForTool = sawToolCall || next.content.parts.some(isFunctionCallPart);
       const nextStatus = errorMessage ? 'failed' : waitsForTool ? 'waiting_tool' : 'delivering';
       if (!errorMessage && conversation) {
-        cmd.enqueue({
-          type: CheckpointEventType.Requested,
-          payload: { conversationId: conversation.id, runId: run.id, floorMessageId: current.id, anchorPosition: 'after', trigger: 'llm_response_after' }
+        enqueueCheckpointRequest(cmd, {
+          conversationId: conversation.id,
+          runId: run.id,
+          floorMessageId: current.id,
+          anchorPosition: 'after',
+          trigger: 'llm_response_after'
         });
         if (waitsForTool) {
           debugAutoCompression('llm.done.deferForToolResponses', {
@@ -445,19 +524,67 @@ function applyRequestUpdate(world: WorldReader, cmd: CommandSink, requestId: str
           maybeEnqueueAutoCompression(world, cmd, { conversation: requestData.conversation, endMessage: next, invocation: requestData.invocation, usageMetadata, stage: 'llm_response_after' });
         }
       }
-      cmd.add(requestData.run, AgentRun, {
-        ...run,
-        status: nextStatus,
-        updatedAt: now,
-        ...(errorMessage ? { error: errorMessage, completedAt: now, endReason: 'failed' as const, errorType: 'llm' as const } : {}),
-        ...(usageMetadata ? { usageMetadata: mergeUsageMetadata(run.usageMetadata, usageMetadata) } : {})
-      });
+      if (run.lifecycle === undefined) {
+        if (errorMessage) {
+          terminateLegacyAgentRun(world, cmd, requestData.run, {
+            status: 'failed',
+            kind: 'failed',
+            actor: 'provider',
+            reasonCode: errorMessage === 'empty_model_result' ? 'empty_model_result' : 'llm_request_failed'
+          }, now);
+        } else {
+          cmd.add(requestData.run, AgentRun, {
+            ...run,
+            status: nextStatus,
+            updatedAt: now,
+            ...(usageMetadata ? { usageMetadata: mergeUsageMetadata(run.usageMetadata, usageMetadata) } : {})
+          });
+        }
+      }
     }
   }
 
   return {
     fastPatchBatches,
     requireFullSync: !fastPatchSafe || shouldFinish
+  };
+}
+
+export function classifyStreamEpoch(
+  requestId: string,
+  update: PendingRequestUpdate,
+  expected?: { attemptId: TransientStreamEpoch['attemptId']; generation: number; streamSeq: number }
+): StreamEpochAdmission {
+  const hasEpochMetadata = update.operations.some(({ payload }) =>
+    payload.attemptId !== undefined || payload.generation !== undefined || payload.streamSeq !== undefined
+  );
+  if (!expected) return hasEpochMetadata ? { kind: 'invalid' } : { kind: 'legacy' };
+  if (!hasEpochMetadata) return { kind: 'invalid' };
+
+  const first = update.operations[0] ? streamEpochFromPayload(requestId, update.operations[0].payload) : undefined;
+  if (!first || first.attemptId !== expected.attemptId || first.generation !== expected.generation || first.streamSeq < expected.streamSeq) {
+    return { kind: 'invalid' };
+  }
+  let streamSeq = first.streamSeq;
+  for (const operation of update.operations) {
+    const epoch = streamEpochFromPayload(requestId, operation.payload);
+    if (!epoch || epoch.attemptId !== expected.attemptId || epoch.generation !== expected.generation || epoch.streamSeq < streamSeq) {
+      return { kind: 'invalid' };
+    }
+    streamSeq = epoch.streamSeq;
+  }
+  return { kind: 'reliable', epoch: { ...first, streamSeq } };
+}
+
+function streamEpochFromPayload(requestId: string, payload: PendingOperation['payload']): TransientStreamEpoch | undefined {
+  const { attemptId, generation, streamSeq } = payload;
+  if (!attemptId || !Number.isInteger(generation) || generation === undefined || generation < 1
+    || !Number.isInteger(streamSeq) || streamSeq === undefined || streamSeq < 0) return undefined;
+  return {
+    requestId: requestId as TransientStreamEpoch['requestId'],
+    attemptId: attemptId as TransientStreamEpoch['attemptId'],
+    generation,
+    streamSeq
   };
 }
 
@@ -478,6 +605,7 @@ function emitTransientNotice(
   if (!conversation) return;
   const run = world.get(requestData.run, AgentRun);
   const invocation = requestData.invocation !== undefined ? world.get(requestData.invocation, LlmInvocation) : undefined;
+  const transientStreamEpoch = streamEpochFromPayload(requestId, payload);
   cmd.effect({
     kind: 'client.transientNotice',
     streamId: conversationClientStateStreamId(conversation.id),
@@ -487,6 +615,7 @@ function emitTransientNotice(
       conversationId: conversation.id,
       messageId: message.id,
       requestId,
+      ...(transientStreamEpoch ? { transientStreamEpoch } : {}),
       ...(run?.id ? { runId: run.id } : {}),
       ...(invocation?.id ? { invocationId: invocation.id } : {}),
       message: payload.message,
@@ -500,11 +629,10 @@ function emitTransientNotice(
 }
 
 function resetMessageForRetry(message: MessageData): MessageData {
-  const { usageMetadata: _usageMetadata, streamOutputDurationMs: _streamOutputDurationMs, requestStartedAt: _requestStartedAt, stopReason: _stopReason, ...rest } = message;
+  const { usageMetadata: _usageMetadata, streamOutputDurationMs: _streamOutputDurationMs, requestStartedAt: _requestStartedAt, ...rest } = message;
   void _usageMetadata;
   void _streamOutputDurationMs;
   void _requestStartedAt;
-  void _stopReason;
   return {
     ...rest,
     status: 'streaming',
@@ -707,32 +835,37 @@ function normalizeToolCallId(
   call: { id?: string; name: string; argsJson: string; thoughtSignature?: string },
   fallbackIndex: number
 ): string {
-  return call.id || `tool-${requestId}-${call.name}-${shortHash(call.argsJson)}-${fallbackIndex}`;
+  return canonicalFunctionCallId({
+    providerId: call.id,
+    requestId,
+    name: call.name,
+    argsJson: call.argsJson,
+    ordinal: fallbackIndex
+  });
 }
 
-function toolCallExists(world: WorldReader, toolCallId: string): boolean {
-  return world.query(ToolCall).some((entity) => world.get(entity, ToolCall)?.id === toolCallId);
-}
-
-function shortHash(input: string): string {
-  let hash = 5381;
-  for (let index = 0; index < input.length; index += 1) {
-    hash = ((hash << 5) + hash) ^ input.charCodeAt(index);
-  }
-  return (hash >>> 0).toString(36);
+function toolCallExists(world: WorldReader, functionCallId: string): boolean {
+  return world.query(ToolCall).some((entity) => {
+    const call = world.get(entity, ToolCall);
+    return call?.functionCallId === functionCallId || call?.id === functionCallId;
+  });
 }
 
 function isRunCancelledOrStale(world: WorldReader, run: Entity): boolean {
   const data = world.get(run, AgentRun);
-  return data?.status === 'cancelled' || data?.status === 'stale' || data?.status === 'paused';
+  return data !== undefined && (isTerminalRunStatus(data.status) || data.status === 'paused');
 }
 
 function hasTerminalOperation(update: PendingRequestUpdate): boolean {
   return update.operations.some((operation) => operation.kind === 'done' || operation.kind === 'error');
 }
 
+function hasReliableDurableBoundaryOperation(update: PendingRequestUpdate): boolean {
+  return update.operations.some((operation) => operation.kind === 'toolCall' || operation.kind === 'done' || operation.kind === 'error');
+}
+
 function cleanupCancelledRequest(world: WorldReader, cmd: CommandSink, request: Entity, modelMessage: Entity, current: MessageData, invocation: Entity | undefined): void {
-  cmd.add(modelMessage, Message, { ...current, status: 'error' });
+  cmd.add(modelMessage, Message, { ...current, status: 'partial' });
   if (invocation !== undefined) {
     const currentInvocation = world.get(invocation, LlmInvocation);
     if (currentInvocation) cmd.add(invocation, LlmInvocation, { ...currentInvocation, status: 'cancelled', completedAt: Date.now() });

@@ -9,6 +9,8 @@ export const LlmEventType = {
   ThoughtDelta: 'llm:thoughtDelta',
   ThoughtProgress: 'llm:thoughtProgress',
   ThoughtDone: 'llm:thoughtDone',
+  ToolCallDelta: 'llm:toolCallDelta',
+  ToolCallPreviewDone: 'llm:toolCallPreviewDone',
   ToolCall: 'llm:toolcall',
   Done: 'llm:done',
   Error: 'llm:error',
@@ -20,7 +22,13 @@ export const LlmEventType = {
   CompactError: 'llm:compactError'
 } as const;
 
-export interface LlmStartedPayload {
+export interface LlmStreamEpochPayload {
+  attemptId?: string;
+  generation?: number;
+  streamSeq?: number;
+}
+
+export interface LlmStartedPayload extends LlmStreamEpochPayload {
   requestId: string;
   invocationId?: string;
   model?: string;
@@ -38,37 +46,64 @@ export interface LlmInvocationResolveErrorPayload {
   message: string;
   resolvedAt: number;
 }
-export interface LlmDeltaPayload {
+export interface LlmDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
   text: string;
 }
-export interface LlmThoughtDeltaPayload {
+export interface LlmThoughtDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
   text: string;
   thoughtSignature?: string;
   thoughtElapsedMs?: number;
 }
-export interface LlmThoughtProgressPayload {
+export interface LlmThoughtProgressPayload extends LlmStreamEpochPayload {
   requestId: string;
   thoughtElapsedMs: number;
   thoughtSignature?: string;
 }
-export interface LlmThoughtDonePayload {
+export interface LlmThoughtDonePayload extends LlmStreamEpochPayload {
   requestId: string;
   thoughtDurationMs: number;
   thoughtSignature?: string;
 }
-export interface LlmToolCallPayload {
+export interface LlmToolCallDeltaPayload extends LlmStreamEpochPayload {
+  requestId: string;
+  calls: Array<{
+    id: string;
+    name?: string;
+    argumentsDelta: string;
+    replace?: boolean;
+    streamIndex?: string;
+  }>;
+}
+export interface LlmToolCallPreviewDonePayload extends LlmStreamEpochPayload {
+  requestId: string;
+  callIds?: string[];
+  all?: boolean;
+}
+export interface LlmToolCallPayload extends LlmStreamEpochPayload {
   requestId: string;
   calls: Array<{ id?: string; name: string; argsJson: string; thoughtSignature?: string }>;
 }
-export interface LlmDonePayload {
+export interface LlmStreamAggregationMetrics {
+  intervalMs: number;
+  rawDeltaEvents: number;
+  emittedDeltaEvents: number;
+  mergedDeltaEvents: number;
+  flushCount: number;
+  maxBatchEvents: number;
+  maxBufferedChars: number;
+  maxBufferDelayMs: number;
+}
+
+export interface LlmDonePayload extends LlmStreamEpochPayload {
   requestId: string;
   createdAt?: number;
   streamOutputDurationMs?: number;
   usageMetadata?: LlmUsageMetadataRecord;
+  streamAggregation?: LlmStreamAggregationMetrics;
 }
-export interface LlmErrorPayload {
+export interface LlmErrorPayload extends LlmStreamEpochPayload {
   requestId: string;
   message: string;
   rawError?: LlmRawErrorInfoRecord;
@@ -76,8 +111,9 @@ export interface LlmErrorPayload {
   retryMaxAttempts?: number;
   createdAt?: number;
   streamOutputDurationMs?: number;
+  streamAggregation?: LlmStreamAggregationMetrics;
 }
-export interface LlmRetryPayload {
+export interface LlmRetryPayload extends LlmStreamEpochPayload {
   requestId: string;
   message: string;
   rawError?: LlmRawErrorInfoRecord;
@@ -113,6 +149,8 @@ declare module '@backend/world/events' {
     'llm:thoughtDelta': LlmThoughtDeltaPayload;
     'llm:thoughtProgress': LlmThoughtProgressPayload;
     'llm:thoughtDone': LlmThoughtDonePayload;
+    'llm:toolCallDelta': LlmToolCallDeltaPayload;
+    'llm:toolCallPreviewDone': LlmToolCallPreviewDonePayload;
     'llm:toolcall': LlmToolCallPayload;
     'llm:done': LlmDonePayload;
     'llm:error': LlmErrorPayload;

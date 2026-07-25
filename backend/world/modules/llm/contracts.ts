@@ -66,12 +66,29 @@ export interface LlmCompactRequest {
   invocationId?: string;
   methodConfigId?: string;
   methodKind?: LlmCompressionConfigRecord['kind'];
+  /** Frozen snapshots are supplied only for exact replay/dry-run. */
+  methodConfigSnapshot?: LlmCompressionConfigRecord;
+  settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
   contents: MessageContent[];
   /** 分段总结：按回合切分的消息组（仅 segmented_summary 使用）。 */
   segments?: MessageContent[][];
   /** 分段总结：作为“回合1前情”的历史总结内容（逐字保留，不重新总结）。 */
   priorSummaryContents?: MessageContent[];
   sourceHash?: string;
+}
+
+export interface LlmCompactDryRunCall extends LlmDryRunResult {
+  id: string;
+  label: string;
+  ordinal: number;
+}
+
+export interface LlmCompactDryRunResult {
+  kind: 'provider_requests' | 'no_provider_call';
+  methodKind: LlmCompressionConfigRecord['kind'];
+  calls: LlmCompactDryRunCall[];
+  note?: string;
+  generatedAt: number;
 }
 
 export interface LlmCompactResult {
