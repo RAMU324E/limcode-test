@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import AgentSettingsPanel from '@webview/components/settings/AgentSettingsPanel.vue';
+import { EXTENSION_AGENT_NAME } from '@shared/extensionIdentity';
 </script>
 
 <template>
   <div class="agent-settings-view">
     <header class="view-header">
-      <span class="view-title">LimCode Agent 设置</span>
+      <span class="view-title">{{ EXTENSION_AGENT_NAME }} 设置</span>
       <span class="view-hint">配置 Agent 角色层：人格 Prompt、能力上限与默认模型。</span>
     </header>
     <div class="view-body">

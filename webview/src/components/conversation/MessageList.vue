@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, watch } from 'vue';
-import type { CheckpointRecord, CompressionBlockRecord, MessageRecord } from '@shared/protocol';
+import { TERMINAL_TOOL_CALL_STATUSES, type CheckpointRecord, type CompressionBlockRecord, type MessageContent, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
+import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 import { useConversationUiStore, type ConversationTimelineViewRow, type LlmErrorBlockRecord, type MessageViewRow } from '@webview/stores/useConversationUiStore';
 import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import { useChat } from '@webview/composables/useChat';
 import { useRunHistoryStore } from '@webview/stores/useRunHistoryStore';
+import { useConversationCommandStore, type CheckpointRestoreSaga } from '@webview/stores/useConversationCommandStore';
 import { useCompression } from '@webview/composables/useCompression';
 import CompressionTimelineCard from './CompressionTimelineCard.vue';
 import MessageItem from './MessageItem.vue';
@@ -23,6 +25,7 @@ const timeline = useConversationTimelineStore();
 const { retryMessageFrom, deleteMessagesFrom, forkConversationFrom, cancelLlmAutoRetry } = useChat();
 const { createCompression, deleteCompression, regenerateCompression, setCompressionEnabled } = useCompression();
 const runHistory = useRunHistoryStore();
+const commands = useConversationCommandStore();
 
 const AUTO_LOAD_TOP_THRESHOLD_PX = 480;
 const AUTO_LOAD_BOTTOM_GUARD_PX = 16;
@@ -36,6 +39,13 @@ interface TimelineRowAnchor {
   top: number;
 }
 
+interface PendingSendView {
+  commandId: string;
+  message: MessageRecord;
+  floorNumber: number;
+  label: string;
+}
+
 watch(() => props.scroller, attachScroller, { immediate: true, flush: 'post' });
 watch(
   () => `${timeline.currentTimeline.status}:${timeline.currentHasOlder}:${timeline.currentTimeline.loadedChunkIds.join('\u0001')}:${ui.timelineRows.length}`,
@@ -45,16 +55,19 @@ watch(
 
 onBeforeUnmount(detachScroller);
 
-function onDeleteFrom(message: MessageRecord): void {
-  ui.playExitFrom(message.id, () => deleteMessagesFrom(message.conversationId, message.id));
+function onDeleteFrom(message: MessageRecord, saga?: CheckpointRestoreSaga): void {
+  // Keep committed messages authoritative; pending deletion is a visual overlay only.
+  deleteMessagesFrom(message.conversationId, message.id, saga);
 }
 
 function onEditMessage(row: MessageViewRow): void {
   ui.startEditMessage(row.message, row.deleteCount);
 }
 
-function onRetryFrom(message: MessageRecord): void {
-  ui.playExitFrom(message.id, () => retryMessageFrom(message.conversationId, message.id));
+function onRetryFrom(message: MessageRecord, saga?: CheckpointRestoreSaga): void {
+  // 只有后端权威 commit 后才移除消息；若此前 workspace restore 已成功而命令被拒绝，
+  // command store 会保留显式 partial-success saga，原消息继续可见。
+  retryMessageFrom(message.conversationId, message.id, saga);
 }
 
 function onCompactTo(message: MessageRecord): void {
@@ -76,8 +89,29 @@ function onCancelErrorRetry(block: LlmErrorBlockRecord): void {
 
 const runIdByMessageId = computed<Record<string, string>>(() => {
   const result: Record<string, string> = {};
-  for (const link of timeline.currentTimeline.state.messageRunLinks) {
-    if (link.role === 'model' || result[link.messageId] === undefined) result[link.messageId] = link.runId;
+  for (const link of timeline.currentTimeline.state.messageTurnLinks) {
+    if (link.role === 'model' || result[link.messageId] === undefined) result[link.messageId] = link.turnId;
+  }
+  return result;
+});
+
+const terminationByRunId = computed<Record<string, RunTerminationRecord>>(() => Object.fromEntries(
+  timeline.currentTimeline.state.runTerminations.map((termination) => [termination.runId, termination])
+));
+const runsWithCompletedTools = computed<Set<string>>(() => {
+  const runIdsByMessageId = new Map<string, Set<string>>();
+  for (const link of timeline.currentTimeline.state.messageTurnLinks) {
+    let runIds = runIdsByMessageId.get(link.messageId);
+    if (!runIds) {
+      runIds = new Set();
+      runIdsByMessageId.set(link.messageId, runIds);
+    }
+    runIds.add(link.turnId);
+  }
+  const result = new Set<string>();
+  for (const tool of timeline.currentTimeline.state.toolCalls) {
+    if (!TERMINAL_TOOL_CALL_STATUSES.has(tool.status)) continue;
+    for (const runId of runIdsByMessageId.get(tool.messageId) ?? []) result.add(runId);
   }
   return result;
 });
@@ -107,8 +141,48 @@ const errorBlocksByMessageId = computed<Record<string, LlmErrorBlockRecord[]>>((
   return result;
 });
 
+const pendingSendMessages = computed<PendingSendView[]>(() => {
+  const conversationId = timeline.currentConversationId;
+  const seqBase = Math.max(0, ...timeline.currentMessages.map((message) => message.seq));
+  const floorBase = timeline.currentTotalMessages;
+  return commands.pendingCommands
+    .filter((command) => command.kind === 'start'
+      && command.conversationId === conversationId
+      && command.projectionObservedAt === undefined)
+    .map((command, index) => {
+      const payload = command.payload as { text?: string; content?: MessageContent };
+      const text = payload.text?.trim() ?? '';
+      const content: MessageContent = payload.content?.parts?.length
+        ? { role: 'user', parts: payload.content.parts }
+        : { role: 'user', parts: text ? [{ text }] : [] };
+      return {
+        commandId: command.commandId,
+        message: {
+          id: `pending-send:${command.commandId}`,
+          conversationId,
+          role: 'user',
+          content,
+          status: 'final',
+          createdAt: command.startedAt,
+          seq: seqBase + index + 1
+        },
+        floorNumber: floorBase + index + 1,
+        label: command.phase === 'blocked'
+          ? command.error?.code === 'runtime_unavailable' ? '运行时不可用' : '发送失败'
+          : command.phase === 'outcome_unknown'
+            ? '发送结果待确认'
+            : command.phase === 'committed_waiting_patch'
+              ? '正在同步'
+              : command.phase === 'projection_recovery'
+                ? '已提交，等待页面恢复'
+                : '正在发送'
+      };
+    });
+});
+
 const rollbackCheckpointByMessageId = computed<Record<string, CheckpointRecord>>(() => {
   const result: Record<string, CheckpointRecord> = {};
+  if (!CHECKPOINT_FEATURE_ENABLED) return result;
   const checkpointsById = new Map(timeline.currentCheckpoints.map((checkpoint) => [checkpoint.id, checkpoint]));
   const anchors = [...timeline.currentCheckpointTimelineAnchors]
     .filter((anchor) => anchor.position === 'before')
@@ -130,6 +204,16 @@ function runIdForMessage(message: MessageRecord): string | undefined {
   return runIdByMessageId.value[message.id];
 }
 
+function terminationForMessage(message: MessageRecord): RunTerminationRecord | undefined {
+  const runId = runIdForMessage(message);
+  return runId ? terminationByRunId.value[runId] : undefined;
+}
+
+function runHadCompletedTools(message: MessageRecord): boolean {
+  const runId = runIdForMessage(message);
+  return !!runId && runsWithCompletedTools.value.has(runId);
+}
+
 function isRunDetailLoading(message: MessageRecord): boolean {
   const runId = runIdForMessage(message);
   return !!runId && runHistory.activeDetail?.conversationId === message.conversationId && runHistory.activeDetail.runId === runId && runHistory.activeDetailState?.status === 'loadingDetail';
@@ -142,6 +226,12 @@ function onViewRunDetail(message: MessageRecord): void {
 
 function onViewCompressionDetail(block: CompressionBlockRecord): void {
   runHistory.openCompressionDetail(block.conversationId, block.id);
+}
+
+function isMessageMutationPending(message: MessageRecord): boolean {
+  return commands.isTargetPending(message.conversationId, message.id, 'delete')
+    || commands.isTargetPending(message.conversationId, message.id, 'retry')
+    || commands.isTargetPending(message.conversationId, message.id, 'edit');
 }
 
 function isEditingTarget(row: MessageViewRow): boolean {
@@ -258,12 +348,15 @@ function maybeLoadOlder(): void {
         v-if="row.kind === 'message'"
         :message="row.message"
         :run-id="runIdForMessage(row.message)"
+        :termination="terminationForMessage(row.message)"
+        :run-had-completed-tools="runHadCompletedTools(row.message)"
         :run-detail-loading="isRunDetailLoading(row.message)"
         :delete-count="row.deleteCount"
         :floor-number="row.messageFloorNumber"
         :deleting="row.phase === 'exiting'"
         :entering="row.phase === 'entering'"
         :editing-highlighted="isEditingTarget(row)"
+        :mutation-pending="isMessageMutationPending(row.message)"
         :rollback-checkpoint="rollbackCheckpointForMessage(row.message)"
         :compact-count="compactCountForMessage(row.message)"
         :error-blocks="errorBlocksByMessageId[row.message.id] ?? []"
@@ -288,9 +381,23 @@ function maybeLoadOlder(): void {
       <TimelineActivityRow
         v-else-if="row.kind === 'activity'"
         :activity-kind="row.activityKind"
+        :label="row.label"
       />
     </div>
-    <div v-if="!ui.timelineRows.length" class="message-empty-container">
+    <div
+      v-for="pending in pendingSendMessages"
+      :key="pending.commandId"
+      class="message-list-row"
+      :data-timeline-row-key="`pending:${pending.commandId}`"
+    >
+      <MessageItem
+        :message="pending.message"
+        :floor-number="pending.floorNumber"
+        :mutation-pending="true"
+        :pending-label="pending.label"
+      />
+    </div>
+    <div v-if="!ui.timelineRows.length && !pendingSendMessages.length" class="message-empty-container">
       <p class="message-empty">{{ emptyHint }}</p>
     </div>
   </div>

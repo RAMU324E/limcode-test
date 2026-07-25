@@ -15,11 +15,13 @@ import {
   IconRefresh,
   IconTrash
 } from '@tabler/icons-vue';
-import { isVisibleTextPart, type CheckpointRecord, type LlmUsageMetadataRecord, type MessageRecord, type MessageStopReason } from '@shared/protocol';
+import { isVisibleTextPart, type CheckpointRecord, type LlmUsageMetadataRecord, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
+import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 import RichContentView from '@webview/components/content/RichContentView.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import { useCheckpointPolicyStore } from '@webview/stores/useCheckpointPolicyStore';
+import type { CheckpointRestoreSaga } from '@webview/stores/useConversationCommandStore';
 import type { LlmErrorBlockRecord } from '@webview/stores/useConversationUiStore';
 import LlmErrorBlock from './LlmErrorBlock.vue';
 import { rollbackConfirmActionTitle } from './checkpointRollback';
@@ -29,6 +31,8 @@ const props = withDefaults(
   defineProps<{
     message: MessageRecord;
     runId?: string;
+    termination?: RunTerminationRecord;
+    runHadCompletedTools?: boolean;
     runDetailLoading?: boolean;
     deleteCount?: number;
     floorNumber?: number;
@@ -37,15 +41,17 @@ const props = withDefaults(
     deleting?: boolean;
     entering?: boolean;
     editingHighlighted?: boolean;
+    mutationPending?: boolean;
+    pendingLabel?: string;
     errorBlocks?: LlmErrorBlockRecord[];
   }>(),
-  { runId: undefined, runDetailLoading: false, deleteCount: 1, floorNumber: 0, rollbackCheckpoint: undefined, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, errorBlocks: () => [] }
+  { runId: undefined, termination: undefined, runHadCompletedTools: false, runDetailLoading: false, deleteCount: 1, floorNumber: 0, rollbackCheckpoint: undefined, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, mutationPending: false, pendingLabel: '正在提交操作', errorBlocks: () => [] }
 );
 
 const emit = defineEmits<{
   (event: 'edit-message', message: MessageRecord): void;
-  (event: 'retry-from', message: MessageRecord): void;
-  (event: 'delete-from', message: MessageRecord): void;
+  (event: 'retry-from', message: MessageRecord, saga?: CheckpointRestoreSaga): void;
+  (event: 'delete-from', message: MessageRecord, saga?: CheckpointRestoreSaga): void;
   (event: 'compact-to', message: MessageRecord): void;
   (event: 'fork-from', message: MessageRecord): void;
   (event: 'view-run-detail', message: MessageRecord): void;
@@ -102,6 +108,7 @@ const LOCAL_DAY_MS = 86_400_000;
 const streaming = computed(() => props.message.status === 'streaming');
 const checkpointStore = useCheckpointPolicyStore();
 const copied = ref(false);
+const terminatedContentExpanded = ref(false);
 const confirmRetryOpen = ref(false);
 const confirmDeleteOpen = ref(false);
 const confirmCompactOpen = ref(false);
@@ -110,14 +117,16 @@ const rollbackPending = ref(false);
 const deleteDescriptionHtml = computed(
   () => `将删除这条消息以及它之后的所有共 ${props.deleteCount} 条消息，此操作<strong>无法撤销</strong>。`
 );
-const compactDescriptionHtml = computed(
-  () => `确定从此处开始往前进行总结吗？共 <strong>${props.compactCount}</strong> 条消息（前面的总结块本身额外算一条）。总结块会追加到这条消息后面。`
+const compactDescriptionHtml = computed(() => terminatedPartial.value
+  ? `确定总结到此处吗？共 <strong>${props.compactCount}</strong> 条消息。已终止回复的 partial 原文不会进入摘要，只保留终止边界与已完成工具事实。`
+  : `确定从此处开始往前进行总结吗？共 <strong>${props.compactCount}</strong> 条消息（前面的总结块本身额外算一条）。总结块会追加到这条消息后面。`
 );
 const forkDescriptionHtml = computed(
   () => `将从对话开头复制到此处，共 <strong>${Math.max(1, props.floorNumber)}</strong> 条消息。确认后会创建并自动打开新的分支对话。`
 );
-const retryDescriptionHtml = computed(
-  () => `确定要重试此消息吗？这将删除此消息及后续共 ${props.deleteCount} 条消息，然后重新请求 AI 响应。此操作<strong>不可撤销</strong>。`
+const retryDescriptionHtml = computed(() => terminatedPartial.value
+  ? `确定重试这次已终止回复吗？将删除其审计 partial 内容及后续共 ${props.deleteCount} 条消息，并从冻结的用户输入重新请求 AI。此操作<strong>不可撤销</strong>。`
+  : `确定要重试此消息吗？这将删除此消息及后续共 ${props.deleteCount} 条消息，然后重新请求 AI 响应。此操作<strong>不可撤销</strong>。`
 );
 const messageText = computed(() =>
   props.message.content.parts
@@ -244,7 +253,7 @@ const deleteConfirmActions = computed<ConfirmPanelAction[]>(() => {
   const actions: ConfirmPanelAction[] = [
     { key: 'cancel', label: '取消', variant: 'secondary', disabled: rollbackPending.value }
   ];
-  if (props.rollbackCheckpoint || rollbackPending.value) actions.push(rollbackConfirmAction.value);
+  if (CHECKPOINT_FEATURE_ENABLED && (props.rollbackCheckpoint || rollbackPending.value)) actions.push(rollbackConfirmAction.value);
   actions.push({ key: 'confirm', label: '删除', disabled: rollbackPending.value });
   return actions;
 });
@@ -252,7 +261,7 @@ const retryConfirmActions = computed<ConfirmPanelAction[]>(() => {
   const actions: ConfirmPanelAction[] = [
     { key: 'cancel', label: '取消', variant: 'secondary', disabled: rollbackPending.value }
   ];
-  if (props.rollbackCheckpoint || rollbackPending.value) actions.push(rollbackConfirmAction.value);
+  if (CHECKPOINT_FEATURE_ENABLED && (props.rollbackCheckpoint || rollbackPending.value)) actions.push(rollbackConfirmAction.value);
   actions.push({ key: 'confirm', label: '确认', disabled: rollbackPending.value });
   return actions;
 });
@@ -261,40 +270,49 @@ onBeforeUnmount(() => {
   if (copiedResetTimer !== undefined) window.clearTimeout(copiedResetTimer);
 });
 
-const stopReasonLabel = computed<string | undefined>(() => {
-  switch (props.message.stopReason) {
-    case 'paused':
-      return '已暂停';
-    case 'cancelled':
-      return '已终止';
-    case 'replaced':
-      return '已替换';
-    case 'stale':
-      return '已失效';
-    default:
-      return undefined;
-  }
+const terminationLabel = computed<string | undefined>(() => {
+  const termination = props.termination;
+  if (!termination) return undefined;
+  if (termination.kind === 'stale') return '已失效';
+  if (termination.reasonCode === 'empty_model_result') return '未生成正文';
+  if (termination.kind === 'failed') return '执行失败';
+  if (termination.reasonCode === 'run_promoted'
+    || termination.reasonCode === 'retry_requested'
+    || termination.reasonCode === 'regenerate_requested'
+    || termination.reasonCode === 'answer_bridge_continued') return '已替换';
+  return '已终止';
 });
 
-const stopReasonClass = computed<string | undefined>(() => {
-  return props.message.stopReason ? `stop-${props.message.stopReason}` : undefined;
-});
-
-const stopReasonTitle = computed(() => titleForStopReason(props.message.stopReason));
-
-function titleForStopReason(reason: MessageStopReason | undefined): string | undefined {
-  switch (reason) {
-    case 'paused':
-      return '当前回复已暂停，可稍后恢复继续执行。';
-    case 'cancelled':
-      return '当前回复已被手动终止。';
-    case 'replaced':
-      return '当前回复已被新的任务替换。';
-    case 'stale':
-      return '当前回复已因上下文变化而失效。';
-    default:
-      return undefined;
+const terminationClass = computed<string | undefined>(() => props.termination
+  ? `termination-${props.termination.kind}`
+  : undefined);
+const terminatedPartial = computed(() => props.message.role === 'model'
+  && props.message.status === 'partial'
+  && props.termination !== undefined);
+const hasTerminatedAuditContent = computed(() => terminatedPartial.value && props.message.content.parts.length > 0);
+const showMessageContent = computed(() => !terminatedPartial.value || terminatedContentExpanded.value);
+const terminationNotice = computed(() => {
+  if (props.termination?.reasonCode === 'empty_model_result') {
+    return props.runHadCompletedTools
+      ? '工具调用已完成，但模型没有返回可显示的最终说明。本轮已明确失败，工具结果仍会保留。'
+      : '模型调用已结束，但没有返回可显示的正文。本轮已明确失败，不会以空回复静默完成。';
   }
+  if (props.runHadCompletedTools) {
+    return '本轮在工具调用后被终止，未生成最终说明；工具结果已保留，未完成回复不会计入后续模型上下文。';
+  }
+  return props.termination?.kind === 'failed'
+    ? '本次回复未正常完成。未完成的回复正文不会进入后续模型上下文；已完成的工具事实和中断边界仍会保留。'
+    : '本次回复已终止。未完成的回复正文不会进入后续模型上下文；已完成的工具事实和中断边界仍会保留。';
+});
+const terminationTooltipRows = computed(() => props.termination ? [
+  { label: '原因', value: props.termination.reasonCode },
+  { label: '上下文', value: '未完成正文不进入后续模型上下文' },
+  { label: '保留事实', value: '已执行工具结果与中断边界' }
+] : []);
+const copyableMessageText = computed(() => terminatedPartial.value && !terminatedContentExpanded.value ? '' : messageText.value);
+
+function toggleTerminatedContent(): void {
+  terminatedContentExpanded.value = !terminatedContentExpanded.value;
 }
 
 function usageNumber(usage: LlmUsageMetadataRecord, keys: readonly string[]): number | undefined {
@@ -584,7 +602,7 @@ function tokenUsageTooltipRows(item: TokenUsageItem): TooltipPanelItem[] {
 
 
 async function copyMessage(): Promise<void> {
-  const text = messageText.value;
+  const text = copyableMessageText.value;
   if (!text) return;
 
   const ok = await writeClipboard(text);
@@ -669,40 +687,49 @@ function cancelRetry(): void {
   confirmRetryOpen.value = false;
 }
 
-async function restoreBeforeConfirm(): Promise<boolean> {
-  if (!props.rollbackCheckpoint || rollbackPending.value) return false;
+async function restoreBeforeConfirm(): Promise<CheckpointRestoreSaga | undefined> {
+  if (!props.rollbackCheckpoint || rollbackPending.value) return undefined;
   rollbackPending.value = true;
   try {
     const checkpoint = props.rollbackCheckpoint;
     const result = await checkpointStore.restoreCheckpoint(checkpoint);
-    if (result.status !== 'restored') return false;
+    if (result.status !== 'restored') return undefined;
     checkpointStore.dismissCheckpoint(checkpoint.id, checkpoint.conversationId);
-    return true;
+    return {
+      kind: 'checkpoint_restore_then_command',
+      checkpointId: checkpoint.id,
+      restoredAt: Date.now(),
+      message: result.message,
+      ...(result.restoredFileCount !== undefined ? { restoredFileCount: result.restoredFileCount } : {}),
+      ...(result.removedFileCount !== undefined ? { removedFileCount: result.removedFileCount } : {})
+    };
   } finally {
     rollbackPending.value = false;
   }
 }
 
-function confirmRetry(): void {
-  emit('retry-from', props.message);
+function confirmRetry(saga?: CheckpointRestoreSaga): void {
+  emit('retry-from', props.message, saga);
   confirmRetryOpen.value = false;
 }
 
 async function rollbackAndConfirmRetry(): Promise<void> {
-  if (await restoreBeforeConfirm()) confirmRetry();
+  const saga = await restoreBeforeConfirm();
+  if (saga) confirmRetry(saga);
 }
 
 function cancelDelete(): void {
   confirmDeleteOpen.value = false;
 }
 
-function confirmDelete(): void {
-  emit('delete-from', props.message);
+function confirmDelete(saga?: CheckpointRestoreSaga): void {
+  emit('delete-from', props.message, saga);
   confirmDeleteOpen.value = false;
 }
 
 async function rollbackAndConfirmDelete(): Promise<void> {
-  if (await restoreBeforeConfirm()) confirmDelete();
+  const saga = await restoreBeforeConfirm();
+  if (saga) confirmDelete(saga);
 }
 
 function cancelCompact(): void {
@@ -737,7 +764,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 </script>
 
 <template>
-  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted }]" :data-scroll-marker-id="message.id">
+  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted, 'is-mutation-pending': mutationPending }]" :data-scroll-marker-id="message.id">
     <div class="floor-container">
       <div class="floor-content-column">
         <header class="floor-header">
@@ -745,17 +772,34 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
             <span class="role-dot" aria-hidden="true"></span>
             <span class="floor-role-name">{{ roleLabel }}</span>
           </span>
-          <span
-            v-if="stopReasonLabel"
+          <span v-if="mutationPending" class="floor-status-badge is-pending">{{ pendingLabel }}</span>
+          <HoverTooltipPanel
+            v-if="terminationLabel"
             class="floor-status-badge is-stop"
-            :class="stopReasonClass"
-            :title="stopReasonTitle"
+            :class="terminationClass"
+            :aria-label="terminationLabel"
+            :panel-title="terminationLabel"
+            :rows="terminationTooltipRows"
+            tabindex="0"
           >
-            {{ stopReasonLabel }}
-          </span>
+            <span>{{ terminationLabel }}</span>
+          </HoverTooltipPanel>
         </header>
         <div class="floor-body">
+          <div v-if="terminatedPartial" class="terminated-message-placeholder">
+            <p>{{ terminationNotice }}</p>
+            <button
+              v-if="hasTerminatedAuditContent"
+              type="button"
+              class="terminated-content-toggle"
+              :aria-expanded="terminatedContentExpanded"
+              @click="toggleTerminatedContent"
+            >
+              {{ terminatedContentExpanded ? '收起已终止内容' : '展开已终止内容' }}
+            </button>
+          </div>
           <RichContentView
+            v-if="showMessageContent"
             :parts="message.content.parts"
             :markdown="message.role !== 'user'"
             :streaming="streaming"
@@ -770,22 +814,22 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
           />
         </div>
         <footer v-if="messageFooterVisible" class="message-footer">
-          <div v-if="floorNumber > 0 || runMetricItems.length > 0" class="message-run-metrics" aria-label="消息楼层与 LLM 调用指标">
+          <div v-if="floorNumber > 0 || runMetricItems.length > 0" class="message-turn-metrics" aria-label="消息楼层与 LLM 调用指标">
             <span v-if="floorNumber > 0" class="message-floor-index">#{{ floorNumber }}</span>
             <HoverTooltipPanel
               v-for="metric in runMetricItems"
               :key="metric.key"
-              class="message-run-metric"
+              class="message-turn-metric"
               :class="`is-${metric.key}`"
               :aria-label="`${metric.label} ${metric.value}`"
               :panel-title="metric.tooltipTitle"
               :rows="metric.details"
               tabindex="0"
             >
-              <IconHourglassEmpty v-if="metric.key === 'ttft'" class="message-run-metric-icon" stroke="2" aria-hidden="true" />
-              <IconClock v-else-if="metric.key === 'total'" class="message-run-metric-icon" stroke="2" aria-hidden="true" />
-              <IconBolt v-else-if="metric.key === 'speed'" class="message-run-metric-icon" stroke="2" aria-hidden="true" />
-              <span class="message-run-metric-value">{{ metric.value }}</span>
+              <IconHourglassEmpty v-if="metric.key === 'ttft'" class="message-turn-metric-icon" stroke="2" aria-hidden="true" />
+              <IconClock v-else-if="metric.key === 'total'" class="message-turn-metric-icon" stroke="2" aria-hidden="true" />
+              <IconBolt v-else-if="metric.key === 'speed'" class="message-turn-metric-icon" stroke="2" aria-hidden="true" />
+              <span class="message-turn-metric-value">{{ metric.value }}</span>
             </HoverTooltipPanel>
           </div>
           <div v-if="tokenUsageItems.length > 0" class="token-usage-row" aria-label="Token 用量">
@@ -830,6 +874,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
         v-if="message.role === 'user'"
         type="button"
         class="message-action-button"
+        :disabled="mutationPending"
         aria-label="编辑消息"
         title="编辑消息"
         @click="editMessage"
@@ -840,6 +885,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
         v-if="message.role !== 'user'"
         type="button"
         class="message-action-button"
+        :disabled="mutationPending"
         aria-label="重试此消息"
         title="重试此消息"
         @click="openRetryConfirm"
@@ -862,9 +908,9 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
       <button
         type="button"
         class="message-action-button"
-        :disabled="streaming || floorNumber < 1"
-        aria-label="复制本对话至此"
-        title="复制本对话至此"
+        :disabled="streaming || terminatedPartial || floorNumber < 1"
+        :aria-label="terminatedPartial ? '已终止的 partial 回复不能作为分支边界' : '复制本对话至此'"
+        :title="terminatedPartial ? '请选择上一条完整消息创建分支' : '复制本对话至此'"
         @click="openForkConfirm"
       >
         <IconArrowFork class="message-action-icon" stroke="2" aria-hidden="true" />
@@ -873,7 +919,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
         type="button"
         class="message-action-button"
         :class="{ 'is-copied': copied }"
-        :disabled="!messageText"
+        :disabled="!copyableMessageText"
         :aria-label="copied ? '已复制消息' : '复制消息'"
         :title="copied ? '已复制' : '复制消息'"
         @click="copyMessage"
@@ -884,6 +930,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
       <button
         type="button"
         class="message-action-button"
+        :disabled="mutationPending"
         aria-label="删除到此消息"
         title="删除到此消息"
         @click="openDeleteConfirm"
@@ -945,6 +992,10 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 .message-floor.model,
 .message-floor.assistant {
   background-color: color-mix(in srgb, var(--vscode-editor-background) 97%, var(--vscode-foreground) 3%);
+}
+
+.message-floor.is-mutation-pending {
+  opacity: 0.7;
 }
 
 .message-floor.is-deleting {
@@ -1093,22 +1144,15 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
   background-color: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-foreground) 6%);
 }
 
-.floor-status-badge.stop-paused {
-  color: var(--vscode-testing-iconSkipped, var(--vscode-descriptionForeground));
-}
-
-.floor-status-badge.stop-cancelled {
+.floor-status-badge.termination-cancelled,
+.floor-status-badge.termination-interrupted,
+.floor-status-badge.termination-failed {
   color: var(--vscode-errorForeground);
   border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-panel-border));
   background-color: var(--vscode-inputValidation-errorBackground, color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-foreground) 6%));
 }
 
-.floor-status-badge.stop-replaced {
-  color: var(--vscode-foreground);
-  border-color: var(--vscode-focusBorder, var(--vscode-panel-border));
-}
-
-.floor-status-badge.stop-stale {
+.floor-status-badge.termination-stale {
   color: var(--vscode-descriptionForeground);
   border-style: dashed;
 }
@@ -1124,6 +1168,41 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
   min-height: 1.6em;
 }
 
+.terminated-message-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
+  font-size: var(--font-size-sm);
+}
+
+.terminated-message-placeholder p {
+  margin: 0;
+}
+
+.terminated-content-toggle {
+  padding: 0;
+  border: 0;
+  color: var(--vscode-foreground);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.terminated-content-toggle:hover,
+.terminated-content-toggle:focus-visible {
+  color: var(--vscode-foreground);
+  background: transparent;
+  outline: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.45));
+  outline-offset: 2px;
+}
+
 .message-footer {
   display: flex;
   align-items: center;
@@ -1133,7 +1212,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
   margin-top: var(--space-2);
 }
 
-.message-run-metrics {
+.message-turn-metrics {
   min-width: 0;
   display: flex;
   align-items: center;
@@ -1160,7 +1239,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
   opacity: 0.78;
 }
 
-.message-run-metric,
+.message-turn-metric,
 .token-usage-item {
   display: inline-flex;
   align-items: center;
@@ -1171,30 +1250,30 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
   outline: none;
 }
 
-.message-run-metric {
+.message-turn-metric {
   min-width: 0;
   gap: 4px;
   color: inherit;
   opacity: 0.78;
 }
 
-.message-run-metric.is-time {
+.message-turn-metric.is-time {
   opacity: 0.82;
 }
 
-.message-run-metric:hover {
+.message-turn-metric:hover {
   color: var(--vscode-foreground);
   opacity: 0.96;
 }
 
-.message-run-metric:focus-visible {
+.message-turn-metric:focus-visible {
   color: var(--vscode-foreground);
   opacity: 0.96;
   outline: 1px solid var(--vscode-focusBorder, currentColor);
   outline-offset: 2px;
 }
 
-.message-run-metric-icon,
+.message-turn-metric-icon,
 .token-usage-icon {
   width: 12px;
   height: 12px;
@@ -1202,7 +1281,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
   display: block;
 }
 
-.message-run-metric-value,
+.message-turn-metric-value,
 .token-usage-value,
 .token-usage-suffix {
   display: inline-flex;
@@ -1213,7 +1292,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
   line-height: 14px;
 }
 
-.message-run-metric-value {
+.message-turn-metric-value {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -3,27 +3,32 @@ import { BridgeMessageType, type BridgeChannel, type WebviewToExtensionMessage }
 /** 把出站消息类型映射到桥接通道。逻辑与旧 vscodeBridge 保持一致。 */
 export function channelForType(type: WebviewToExtensionMessage['type']): BridgeChannel {
   switch (type) {
-    case BridgeMessageType.ChatSend:
-    case BridgeMessageType.ChatAbort:
+    case BridgeMessageType.CommandStatusGet:
+    case BridgeMessageType.CommandOutcomeResolve:
+    case BridgeMessageType.TurnStart:
+    case BridgeMessageType.TurnEnqueue:
+    case BridgeMessageType.TurnSteer:
+    case BridgeMessageType.TurnInterrupt:
+    case BridgeMessageType.TurnIntentUpdate:
+    case BridgeMessageType.TurnIntentCancel:
+    case BridgeMessageType.TurnIntentReorder:
+    case BridgeMessageType.TurnIntentPause:
+    case BridgeMessageType.TurnIntentResume:
+    case BridgeMessageType.TurnIntentResumeAll:
+    case BridgeMessageType.TurnIntentPromote:
+    case BridgeMessageType.InteractionResolve:
     case BridgeMessageType.LlmRetryCancel:
     case BridgeMessageType.ConversationCreate:
     case BridgeMessageType.ConversationFork:
     case BridgeMessageType.MessageEdit:
     case BridgeMessageType.MessageDeleteFrom:
     case BridgeMessageType.MessageRetryFrom:
-    case BridgeMessageType.AgentRunCancel:
-    case BridgeMessageType.AgentRunPause:
-    case BridgeMessageType.AgentRunResume:
-    case BridgeMessageType.AgentRunRetry:
-    case BridgeMessageType.AgentRunRegenerate:
-    case BridgeMessageType.AgentRunMarkStale:
-    case BridgeMessageType.QueuePromote:
-    case BridgeMessageType.QueueRemove:
-    case BridgeMessageType.QueueReorder:
-    case BridgeMessageType.QueuePause:
-    case BridgeMessageType.QueueResume:
-    case BridgeMessageType.QueueResumeAll:
-    case BridgeMessageType.QueueInputUpdate:
+    case BridgeMessageType.CompressionCreate:
+    case BridgeMessageType.CompressionDelete:
+    case BridgeMessageType.CompressionUpdate:
+    case BridgeMessageType.CompressionRegenerate:
+    case BridgeMessageType.CompressionDisable:
+    case BridgeMessageType.CompressionEnable:
     case BridgeMessageType.WorkflowCreate:
     case BridgeMessageType.WorkflowUpdate:
     case BridgeMessageType.WorkflowDelete:
@@ -55,27 +60,19 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.CheckpointShadowDelete:
     case BridgeMessageType.CheckpointDismiss:
     case BridgeMessageType.CheckpointRestore:
-    case BridgeMessageType.ToolExecutionApprove:
-    case BridgeMessageType.ToolExecutionReject:
     case BridgeMessageType.ToolExecutionCancel:
     case BridgeMessageType.ToolDiffOpen:
-    case BridgeMessageType.ToolChangeApply:
-    case BridgeMessageType.ToolChangeReject:
-    case BridgeMessageType.ToolResultSubmit:
-    case BridgeMessageType.ToolResultReject:
-    case BridgeMessageType.AskUserAnswerSubmit:
-    case BridgeMessageType.PlanProposalApprove:
-    case BridgeMessageType.PlanProposalRequestChanges:
-    case BridgeMessageType.PlanProposalReject:
     case BridgeMessageType.PlanProposalOpen:
     case BridgeMessageType.PlanProposalExport:
     case BridgeMessageType.CheckpointDiffOpen:
     case BridgeMessageType.AttachmentOpen:
       return 'command';
+    case BridgeMessageType.ConversationHeadGet:
     case BridgeMessageType.ClientResync:
     case BridgeMessageType.ConversationTimelinePageGet:
+    case BridgeMessageType.ToolResultArtifactGet:
     case BridgeMessageType.FsStatGet:
-    case BridgeMessageType.BackgroundCommandOutputGet:
+    case BridgeMessageType.BackgroundProcessOutputGet:
     case BridgeMessageType.ProjectFoldersGet:
     case BridgeMessageType.RunHistoryPageGet:
     case BridgeMessageType.RunHistoryDetailGet:

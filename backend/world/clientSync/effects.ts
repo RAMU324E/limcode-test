@@ -1,4 +1,5 @@
-import type { ClientPatchOp, ClientState, LlmTransientNoticePayload } from '../../../shared/protocol';
+import type { ClientPatchOp, ClientState, ConversationHeadSnapshotPayload, LlmTransientNoticePayload } from '../../../shared/protocol';
+import type { TransientStreamEpoch } from '../../../shared/conversationReliability';
 
 export interface ClientSnapshotEffect {
   kind: 'client.snapshot';
@@ -6,6 +7,7 @@ export interface ClientSnapshotEffect {
   /** 当前 state stream 的顺序号，不是协议版本。 */
   streamSeq: number;
   state: ClientState;
+  conversationHead?: ConversationHeadSnapshotPayload;
 }
 
 export interface ClientPatchEffect {
@@ -14,6 +16,8 @@ export interface ClientPatchEffect {
   /** 当前 state stream 的顺序号，不是协议版本。 */
   streamSeq: number;
   patches: ClientPatchOp[];
+  /** Reliable transient patches are admitted only while this Attempt generation is live. */
+  transientStreamEpoch?: TransientStreamEpoch;
 }
 
 export interface ClientTransientNoticeEffect {

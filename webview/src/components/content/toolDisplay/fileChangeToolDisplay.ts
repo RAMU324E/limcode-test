@@ -1,5 +1,6 @@
 import { IconFileDiff, IconPencil, IconTrash, IconWriting } from '@tabler/icons-vue';
 import { DELETE_TOOL_NAME, EDIT_TOOL_NAME, WRITE_TOOL_NAME } from '@shared/protocol';
+import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useCheckpointPolicyStore } from '@webview/stores/useCheckpointPolicyStore';
 import type { CheckpointRecord, CheckpointTimelineAnchorRecord } from '@shared/protocol';
@@ -264,6 +265,7 @@ function diffHeaderActions(context: ToolDisplayContext, diff: ToolDisplayDiff): 
   const toolCallId = context.toolCall?.id;
   if (!filePath || !toolCallId) return [];
   if (context.toolCall?.status === 'awaiting_change_apply') return liveDiffHeaderAction(context, toolCallId);
+  if (!CHECKPOINT_FEATURE_ENABLED) return [];
   if (context.toolCall?.status === 'applying_change') return disabledDiffHeaderAction(toolCallId, '更改正在应用，完成后可查看存档点差异');
   return checkpointDiffHeaderAction(context, toolCallId, filePath);
 }

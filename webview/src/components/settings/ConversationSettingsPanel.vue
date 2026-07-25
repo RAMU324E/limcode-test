@@ -10,6 +10,7 @@ import CheckpointPolicyEditor from '@webview/components/settings/checkpoints/Che
 import CheckpointListPanel from '@webview/components/settings/checkpoints/CheckpointListPanel.vue';
 import SystemPromptScopeEditor from '@webview/components/settings/config/SystemPromptScopeEditor.vue';
 import RuntimeContextScopeEditor from '@webview/components/settings/config/RuntimeContextScopeEditor.vue';
+import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 
 const settings = useConversationSettingsStore();
 
@@ -82,7 +83,7 @@ function reload(): void {
     />
 
     <CheckpointPolicyEditor
-      v-if="hasConversation"
+      v-if="CHECKPOINT_FEATURE_ENABLED && hasConversation"
       scope-kind="conversation"
       :scope-id="settings.common.conversationId"
       title="对话存档点策略"
@@ -90,7 +91,7 @@ function reload(): void {
     />
 
     <CheckpointListPanel
-      v-if="hasConversation"
+      v-if="CHECKPOINT_FEATURE_ENABLED && hasConversation"
       :conversation-id="settings.common.conversationId"
     />
   </section>

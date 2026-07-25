@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import type { WebviewClientMeta } from '@shared/protocol';
+import type { RuntimeBuildInfoRecord, WebviewClientMeta } from '@shared/protocol';
 
 /** 当前 webview 这个"任务单元"承载的视图类型。 */
 export type SessionViewKind = 'chat' | 'globalSettings' | 'workflowSettings' | 'agentSettings' | 'planDetail' | 'unknown';
@@ -13,6 +13,8 @@ interface SessionState {
   toolCallId: string;
   /** Plan 详情页绑定的 PlanProposal id。 */
   planProposalId: string;
+  /** Extension Host 进程级构建指纹；用于识别 stale host / transport 实现。 */
+  runtime: RuntimeBuildInfoRecord | null;
   /** 连接状态：是否已收到 Hello。 */
   status: 'connecting' | 'ready';
 }
@@ -29,6 +31,7 @@ export const useSessionStore = defineStore('session', {
     conversationId: '',
     toolCallId: '',
     planProposalId: '',
+    runtime: null,
     status: 'connecting'
   }),
   getters: {
@@ -39,7 +42,7 @@ export const useSessionStore = defineStore('session', {
     isPlanDetail: (state): boolean => state.viewKind === 'planDetail'
   },
   actions: {
-    applyHello(meta: WebviewClientMeta | undefined): void {
+    applyHello(meta: WebviewClientMeta | undefined, runtime?: RuntimeBuildInfoRecord): void {
       this.viewKind = meta?.kind === 'globalSettings'
         ? 'globalSettings'
         : meta?.kind === 'workflowSettings'
@@ -52,6 +55,7 @@ export const useSessionStore = defineStore('session', {
       if (meta?.conversationId) this.conversationId = meta.conversationId;
       this.toolCallId = meta?.toolCallId ?? '';
       this.planProposalId = meta?.planProposalId ?? '';
+      this.runtime = runtime ? { ...runtime } : null;
       this.status = 'ready';
     },
     setConversationId(conversationId: string): void {

@@ -1,6 +1,7 @@
 import { defineResource } from '../../ecs/types';
 import type { ClientPatchOp, ClientState } from '../../../shared/protocol';
 import type { ClientStateContributorRegistry } from './contributors';
+import type { CommittedConversationHead, TransientStreamEpoch } from '../../../shared/conversationReliability';
 import type { ClientContributorProjectionState } from './projection';
 
 export interface ClientStreamState {
@@ -21,6 +22,8 @@ export interface ClientSyncState {
   contributorStates: Record<string, ClientContributorProjectionState>;
   /** 已纳入本同步游标的 dirty conversation resource version。 */
   dirtyConversationResourceVersion: number;
+  /** 已由 lastState/full projection 或精确 fast patch 覆盖到的高频 component versions。 */
+  fastPatchedComponentVersions?: Readonly<Record<string, number>>;
   /** 按 stream 独立维护前端同步游标：global 与 conversation 互不影响。 */
   streams: Record<string, ClientStreamState>;
 }
@@ -34,6 +37,7 @@ export interface ClientStateDirtyConversationIdsState {
 export interface ClientSyncFastPatchBatch {
   readonly streamId: string;
   readonly patches: readonly ClientPatchOp[];
+  readonly transientStreamEpoch?: TransientStreamEpoch;
 }
 
 export interface ClientSyncFastPatchState {
@@ -49,3 +53,5 @@ export const ClientStateContributorsKey = defineResource<ClientStateContributorR
 export const ClientSyncStateKey = defineResource<ClientSyncState>('ClientSyncState');
 export const ClientSyncFastPatchStateKey = defineResource<ClientSyncFastPatchState>('ClientSyncFastPatchState');
 export const ClientStateDirtyConversationIdsKey = defineResource<ClientStateDirtyConversationIdsState>('ClientStateDirtyConversationIds');
+/** Durable HEADs whose facts have been installed into the loaded World projection. */
+export const CommittedConversationHeadsKey = defineResource<Readonly<Record<string, CommittedConversationHead>>>('CommittedConversationHeads');

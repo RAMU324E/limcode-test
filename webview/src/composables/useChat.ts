@@ -4,15 +4,22 @@ import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useConversationSettingsStore } from '@webview/stores/useConversationSettingsStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
+import { useConversationCommandStore, type CheckpointRestoreSaga } from '@webview/stores/useConversationCommandStore';
 import type { ChatModelOverrideRecord, MessageContent } from '@shared/protocol';
 
-/** 对话相关的出站动作收口，组件通过它发送消息而不直接接触 bridge。 */
+export interface TurnIntentIdentity {
+  id: string;
+  rowVersion: number;
+}
+
+/** 对话控制动作只使用 Turn/Intent/Lease 权威身份，不再从 AgentRun 或可见 Message 猜测语义。 */
 export function useChat() {
   const clientState = useClientStateStore();
   const agentStore = useAgentStore();
   const conversationSettings = useConversationSettingsStore();
   const globalSettings = useGlobalSettingsStore();
   const modelProfileStore = useModelProfileStore();
+  const commands = useConversationCommandStore();
 
   function sendMessage(text: string, content?: MessageContent): boolean {
     const conversationId = clientState.currentConversationId;
@@ -20,8 +27,46 @@ export function useChat() {
     if ((!trimmed && !content?.parts?.length) || !conversationId) return false;
     const agentId = agentStore.activeAgentForConversation(conversationId)?.id;
     const model = currentConversationModelOverride(conversationId);
-    const payload = { conversationId, text: trimmed, ...(content?.parts?.length ? { content } : {}), ...(agentId ? { agentId } : {}), ...(model ? { model } : {}) };
-    bridge.request(BridgeMessageType.ChatSend, payload);
+    const payload = {
+      conversationId,
+      text: trimmed,
+      ...(content?.parts?.length ? { content } : {}),
+      ...(agentId ? { agentId } : {}),
+      ...(model ? { model } : {})
+    };
+    const startAdmissionPending = commands.pendingCommands.some((command) =>
+      command.conversationId === conversationId
+      && command.kind === 'start'
+      && command.phase !== 'blocked'
+      && command.phase !== 'outcome_unknown'
+      && command.phase !== 'partial_success'
+      && command.phase !== 'projection_recovery');
+    if (clientState.currentExecution || startAdmissionPending) {
+      commands.submit(BridgeMessageType.TurnEnqueue, payload, { kind: 'enqueue', targetId: conversationId });
+    } else {
+      commands.submit(BridgeMessageType.TurnStart, payload, { kind: 'start', targetId: conversationId });
+    }
+    return true;
+  }
+
+  /** 显式 steer；普通发送永远不会偷偷解除 Interaction 或注入当前 Turn。 */
+  function steerCurrentTurn(
+    text: string,
+    content?: MessageContent,
+    fallback: 'queue_next' | 'return_to_draft' | 'reject' = 'queue_next'
+  ): boolean {
+    const conversationId = clientState.currentConversationId;
+    const execution = clientState.currentExecution;
+    const trimmed = text.trim();
+    if (!conversationId || !execution || (!trimmed && !content?.parts?.length)) return false;
+    commands.submit(BridgeMessageType.TurnSteer, {
+      conversationId,
+      targetTurnId: execution.turn.id,
+      targetLeaseEpoch: execution.lease.epoch,
+      fallback,
+      text: trimmed,
+      ...(content?.parts?.length ? { content } : {})
+    }, { kind: 'steer', targetId: execution.turn.id });
     return true;
   }
 
@@ -30,22 +75,21 @@ export function useChat() {
     if (!conversationId || !messageId || !trimmed) return false;
     const model = currentConversationModelOverride(conversationId);
     const payload = { conversationId, messageId, text: trimmed, ...options, ...(model ? { model } : {}) };
-    bridge.request(BridgeMessageType.MessageEdit, payload);
+    commands.submit(BridgeMessageType.MessageEdit, payload, { kind: 'edit', targetId: messageId });
     return true;
   }
 
-  function retryMessageFrom(conversationId: string, messageId: string): boolean {
+  function retryMessageFrom(conversationId: string, messageId: string, saga?: CheckpointRestoreSaga): boolean {
     if (!conversationId || !messageId) return false;
     const model = currentConversationModelOverride(conversationId);
     const payload = { conversationId, messageId, ...(model ? { model } : {}) };
-    bridge.request(BridgeMessageType.MessageRetryFrom, payload);
+    commands.submit(BridgeMessageType.MessageRetryFrom, payload, { kind: 'retry', targetId: messageId, ...(saga ? { saga } : {}) });
     return true;
   }
 
-  function deleteMessagesFrom(conversationId: string, messageId: string): boolean {
+  function deleteMessagesFrom(conversationId: string, messageId: string, saga?: CheckpointRestoreSaga): boolean {
     if (!conversationId || !messageId) return false;
-    const payload = { conversationId, messageId };
-    bridge.request(BridgeMessageType.MessageDeleteFrom, payload);
+    commands.submit(BridgeMessageType.MessageDeleteFrom, { conversationId, messageId }, { kind: 'delete', targetId: messageId, ...(saga ? { saga } : {}) });
     return true;
   }
 
@@ -61,61 +105,97 @@ export function useChat() {
     return true;
   }
 
-  function abortCurrentConversation(reason = 'user_requested_abort'): boolean {
+  function interruptCurrentConversation(cascadeChildAgents = false): boolean {
+    const conversationId = clientState.currentConversationId;
+    const execution = clientState.currentExecution;
+    if (!conversationId || !execution) return false;
+    commands.submit(BridgeMessageType.TurnInterrupt, {
+      conversationId,
+      turnId: execution.turn.id,
+      leaseEpoch: execution.lease.epoch,
+      ...(cascadeChildAgents ? { cascadeChildAgents: true } : {})
+    }, { kind: 'interrupt', targetId: execution.turn.id });
+    return true;
+  }
+
+  function cancelTurnIntent(intent: TurnIntentIdentity): boolean {
+    const conversationId = clientState.currentConversationId;
+    if (!conversationId || !intent.id) return false;
+    commands.submit(BridgeMessageType.TurnIntentCancel, {
+      conversationId,
+      intentId: intent.id,
+      rowVersion: intent.rowVersion
+    }, { kind: 'intent_control', targetId: intent.id });
+    return true;
+  }
+
+  function promoteTurnIntent(intent: TurnIntentIdentity): boolean {
+    const conversationId = clientState.currentConversationId;
+    if (!conversationId || !intent.id) return false;
+    const execution = clientState.currentExecution;
+    commands.submit(BridgeMessageType.TurnIntentPromote, {
+      conversationId,
+      intentId: intent.id,
+      rowVersion: intent.rowVersion,
+      replaceActive: execution !== undefined,
+      ...(execution ? {
+        expectedActiveTurnId: execution.turn.id,
+        expectedLeaseEpoch: execution.lease.epoch
+      } : {})
+    }, { kind: 'promote', targetId: intent.id });
+    return true;
+  }
+
+  function reorderTurnIntents(intents: TurnIntentIdentity[]): boolean {
+    const conversationId = clientState.currentConversationId;
+    if (!conversationId || intents.length === 0) return false;
+    commands.submit(BridgeMessageType.TurnIntentReorder, {
+      conversationId,
+      intents: intents.map((intent) => ({ intentId: intent.id, rowVersion: intent.rowVersion }))
+    }, { kind: 'intent_control', targetId: conversationId });
+    return true;
+  }
+
+  function pauseTurnIntent(intent: TurnIntentIdentity): boolean {
+    return submitIntentControl(BridgeMessageType.TurnIntentPause, intent);
+  }
+
+  function resumeTurnIntent(intent: TurnIntentIdentity): boolean {
+    return submitIntentControl(BridgeMessageType.TurnIntentResume, intent);
+  }
+
+  function resumeAllTurnIntents(): boolean {
     const conversationId = clientState.currentConversationId;
     if (!conversationId) return false;
-    void reason;
-    bridge.request(BridgeMessageType.ChatAbort, { conversationId });
+    commands.submit(BridgeMessageType.TurnIntentResumeAll, { conversationId }, { kind: 'intent_control', targetId: conversationId });
     return true;
   }
 
-  function removeQueueRun(runId: string): boolean {
-    const conversationId = clientState.currentConversationId;
-    if (!conversationId || !runId) return false;
-    bridge.request(BridgeMessageType.QueueRemove, { runId, conversationId });
-    return true;
-  }
-
-  function promoteQueueRun(runId: string): boolean {
-    const conversationId = clientState.currentConversationId;
-    if (!conversationId || !runId) return false;
-    bridge.request(BridgeMessageType.QueuePromote, { conversationId, runId });
-    return true;
-  }
-
-  function reorderQueue(runIds: string[]): boolean {
-    const conversationId = clientState.currentConversationId;
-    if (!conversationId || runIds.length === 0) return false;
-    bridge.request(BridgeMessageType.QueueReorder, { conversationId, runIds });
-    return true;
-  }
-
-  function pauseQueueRun(runId: string): boolean {
-    const conversationId = clientState.currentConversationId;
-    if (!conversationId || !runId) return false;
-    bridge.request(BridgeMessageType.QueuePause, { conversationId, runId });
-    return true;
-  }
-
-  function resumeQueueRun(runId: string): boolean {
-    const conversationId = clientState.currentConversationId;
-    if (!conversationId || !runId) return false;
-    bridge.request(BridgeMessageType.QueueResume, { conversationId, runId });
-    return true;
-  }
-
-  function resumeAllQueueRuns(): boolean {
-    const conversationId = clientState.currentConversationId;
-    if (!conversationId) return false;
-    bridge.request(BridgeMessageType.QueueResumeAll, { conversationId });
-    return true;
-  }
-
-  function updateQueueInput(runId: string, text: string, content?: MessageContent): boolean {
+  function updateTurnIntent(intent: TurnIntentIdentity, text: string, content?: MessageContent): boolean {
     const conversationId = clientState.currentConversationId;
     const trimmed = text.trim();
-    if (!conversationId || !runId || (!trimmed && !content?.parts?.length)) return false;
-    bridge.request(BridgeMessageType.QueueInputUpdate, { conversationId, runId, text: trimmed, ...(content?.parts?.length ? { content } : {}) });
+    if (!conversationId || !intent.id || (!trimmed && !content?.parts?.length)) return false;
+    commands.submit(BridgeMessageType.TurnIntentUpdate, {
+      conversationId,
+      intentId: intent.id,
+      rowVersion: intent.rowVersion,
+      text: trimmed,
+      ...(content?.parts?.length ? { content } : {})
+    }, { kind: 'intent_control', targetId: intent.id });
+    return true;
+  }
+
+  function submitIntentControl(
+    type: BridgeMessageType.TurnIntentPause | BridgeMessageType.TurnIntentResume,
+    intent: TurnIntentIdentity
+  ): boolean {
+    const conversationId = clientState.currentConversationId;
+    if (!conversationId || !intent.id) return false;
+    commands.submit(type, {
+      conversationId,
+      intentId: intent.id,
+      rowVersion: intent.rowVersion
+    }, { kind: 'intent_control', targetId: intent.id });
     return true;
   }
 
@@ -142,5 +222,21 @@ export function useChat() {
     return config.model?.trim() === id || config.models.some((model) => model.id === id);
   }
 
-  return { sendMessage, editMessage, retryMessageFrom, deleteMessagesFrom, forkConversationFrom, cancelLlmAutoRetry, abortCurrentConversation, removeQueueRun, promoteQueueRun, reorderQueue, pauseQueueRun, resumeQueueRun, resumeAllQueueRuns, updateQueueInput };
+  return {
+    sendMessage,
+    steerCurrentTurn,
+    editMessage,
+    retryMessageFrom,
+    deleteMessagesFrom,
+    forkConversationFrom,
+    cancelLlmAutoRetry,
+    interruptCurrentConversation,
+    cancelTurnIntent,
+    promoteTurnIntent,
+    reorderTurnIntents,
+    pauseTurnIntent,
+    resumeTurnIntent,
+    resumeAllTurnIntents,
+    updateTurnIntent
+  };
 }

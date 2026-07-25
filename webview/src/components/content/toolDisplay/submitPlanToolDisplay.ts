@@ -8,7 +8,7 @@ export const submitPlanToolDisplay: ToolDisplayResolver = (context) => {
     ?? submitPlanRequestFromArgs(context.toolCall?.args);
   if (!request) return undefined;
 
-  const output = submitPlanOutputFromResult(context.toolCall?.result);
+  const output = submitPlanOutputFromResult(context.result);
   const proposalId = proposalIdFromProgress(context.toolCall?.progress) ?? output?.proposalId;
 
   return {

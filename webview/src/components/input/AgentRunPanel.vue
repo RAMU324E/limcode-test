@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconMessage2, IconRobot, IconX } from '@tabler/icons-vue';
+import {
+  agentRunActivityBlocker,
+  foregroundAnswerReceiptState,
+  type AgentRunActivityBlocker
+} from '@shared/agentRunActivity';
 import type {
   AgentAnswerRecord,
   AgentRunRecord,
@@ -13,6 +18,7 @@ import type {
 } from '@shared/protocol';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
+import { toolResultForState, useToolResultArtifactStore, type ToolResultState } from '@webview/stores/useToolResultArtifactStore';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -38,6 +44,8 @@ interface RunAgentArgsLike {
   };
 }
 
+type AgentActivityStage = 'running' | 'waiting_delivery' | 'processing' | AgentRunActivityBlocker | 'processed' | 'warning' | 'error';
+
 interface AgentPanelEntry {
   toolCallId: string;
   runId?: string;
@@ -50,6 +58,7 @@ interface AgentPanelEntry {
   status: AgentRunStatus | ToolCallStatus | string;
   statusLabel: string;
   statusTone: 'running' | 'done' | 'warning' | 'error';
+  activityStage: AgentActivityStage;
   toolCalls: ToolCallRecord[];
   startedAt: number;
   updatedAt: number;
@@ -72,12 +81,13 @@ type AgentRunTooltipItem = AgentRunTooltipRow | AgentRunTooltipDivider;
 const RUN_AGENT_TOOL_NAME = 'run_agent';
 const SUBMIT_PLAN_TOOL_NAME = 'submit_plan';
 const DEFAULT_RUN_AGENT_TYPE = 'worker';
-const TERMINAL_RUN_STATUSES = new Set<AgentRunStatus>(['completed', 'failed', 'cancelled', 'stale']);
+const TERMINAL_RUN_STATUSES = new Set<AgentRunStatus>(['completed', 'failed', 'cancelled', 'stale', 'interrupted']);
 const TERMINAL_TOOL_STATUSES = new Set<ToolCallStatus>(['success', 'warning', 'error']);
 const MAX_TOOLTIP_TOOL_CALLS = 2;
 
 const clientState = useClientStateStore();
 const conversationTimeline = useConversationTimelineStore();
+const toolResults = useToolResultArtifactStore();
 const open = ref(false);
 const selectedKey = ref<string | undefined>();
 const rootRef = ref<HTMLElement | null>(null);
@@ -85,12 +95,14 @@ const listScroller = ref<HTMLElement | null>(null);
 const detailScroller = ref<HTMLElement | null>(null);
 
 const entries = computed<AgentPanelEntry[]>(() => buildEntries());
-const runningCount = computed(() => entries.value.filter((entry) => entry.statusTone === 'running').length);
+const activityEntries = computed(() => entries.value.filter((entry) => isActiveActivityStage(entry.activityStage)));
+const runningCount = computed(() => activityEntries.value.filter((entry) => entry.activityStage === 'running' || entry.activityStage === 'processing').length);
 const selectedEntry = computed(() => entries.value.find((entry) => entryKey(entry) === selectedKey.value) ?? entries.value[0]);
 const panelSummary = computed(() => {
   if (entries.value.length === 0) return '暂无后台 Agent';
-  return runningCount.value > 0 ? `${runningCount.value} 个运行中 / ${entries.value.length} 个 AgentRun` : `${entries.value.length} 个 AgentRun`;
+  return activityEntries.value.length > 0 ? `${activityEntries.value.length} 个活动 / ${entries.value.length} 个 AgentRun` : `${entries.value.length} 个 AgentRun`;
 });
+const activitySummary = computed(() => summarizeActivities(activityEntries.value));
 const detailRefreshKey = computed(() => `${entryKey(selectedEntry.value)}:${selectedEntry.value?.updatedAt ?? 0}`);
 
 watch(entries, (nextEntries) => {
@@ -199,22 +211,43 @@ function buildEntry(
   toolCallsByRunId: Map<string, ToolCallRecord[]>
 ): AgentPanelEntry | undefined {
   const args = parseJson<RunAgentArgsLike>(call.args) ?? {};
-  const toolData = readRunAgentPayload(call.result) ?? readRunAgentPayload(call.progress) ?? {};
+  const toolData = readRunAgentPayload(resolvedToolResult(call)) ?? readRunAgentPayload(call.progress) ?? {};
   const source = sourceLinks
     .filter((link) => link.sourceToolCallId === call.id || (toolData.runId && link.runId === toolData.runId) || (toolData.childRunId && link.runId === toolData.childRunId))
     .sort((left, right) => right.id.localeCompare(left.id))[0];
   const initialRunId = toolData.runId || toolData.childRunId || source?.runId;
   const answerBridgeId = toolData.answerBridgeId || source?.answerBridgeId;
-  const bridgedRunIds = answerBridgeId
-    ? sourceLinks.filter((link) => link.answerBridgeId === answerBridgeId).map((link) => link.runId)
-    : [];
-  const run = selectDisplayRun([initialRunId, ...bridgedRunIds], runsById);
-  const runId = run?.id ?? initialRunId;
+  const bridgeSources = answerBridgeId ? sourceLinks.filter((link) => link.answerBridgeId === answerBridgeId) : [];
+  const childRun = selectDisplayRun([
+    initialRunId,
+    ...bridgeSources.filter((link) => link.sourceKind === 'toolCall').map((link) => link.runId)
+  ], runsById);
+  const notificationRun = selectDisplayRun(
+    bridgeSources.filter((link) => link.sourceKind === 'agentRun').map((link) => link.runId),
+    runsById
+  );
+  const run = notificationRun ?? childRun;
+  const runId = childRun?.id ?? initialRunId ?? run?.id;
   const target = runId ? targetsByRunId.get(runId) : undefined;
   const answer = answerBridgeId ? answersById.get(answerBridgeId) : undefined;
+  const childToolCalls = childRun
+    ? selectActiveToolCalls(childRun.status, toolCallsByRunId.get(childRun.id) ?? [])
+    : [];
+  const notificationToolCalls = notificationRun
+    ? selectActiveToolCalls(notificationRun.status, toolCallsByRunId.get(notificationRun.id) ?? [])
+    : [];
+  const deliveryStatus = resolveAgentActivityStatus({
+    answer,
+    childRun,
+    notificationRun,
+    call,
+    payloadStatus: toolData.status,
+    childToolCalls,
+    notificationToolCalls
+  });
   const status = run?.status ?? call.status;
-  const statusLabel = answer ? '已提交' : run ? runStatusLabel(run.status) : toolStatusLabel(call.status, toolData.status);
-  const statusTone = run ? runStatusTone(run.status, !!answer) : toolStatusTone(call.status, !!answer);
+  const statusLabel = deliveryStatus.label;
+  const statusTone = deliveryStatus.tone;
   const agentId = toolData.agentId || target?.agentId;
   const conversationId = toolData.conversationId || target?.conversationId;
   const prompt = args.prompt?.trim() || args.plan?.trim() || '';
@@ -223,9 +256,7 @@ function buildEntry(
     || toolData.agentType
     || agentId
     || DEFAULT_RUN_AGENT_TYPE;
-  const toolCalls = runId
-    ? selectActiveToolCalls(run?.status, toolCallsByRunId.get(runId) ?? [])
-    : [];
+  const toolCalls = notificationRun ? notificationToolCalls : childToolCalls;
 
   return {
     toolCallId: call.id,
@@ -239,10 +270,17 @@ function buildEntry(
     status,
     statusLabel,
     statusTone,
+    activityStage: deliveryStatus.stage,
     toolCalls,
     startedAt: call.createdAt,
-    updatedAt: Math.max(call.updatedAt, run?.updatedAt ?? 0, answer?.updatedAt ?? 0, ...toolCalls.map((toolCall) => toolCall.updatedAt))
+    updatedAt: Math.max(call.updatedAt, childRun?.updatedAt ?? 0, notificationRun?.updatedAt ?? 0, answer?.updatedAt ?? 0, ...toolCalls.map((toolCall) => toolCall.updatedAt))
   };
+}
+
+function resolvedToolResult(call: ToolCallRecord): unknown {
+  const timelineResult = toolResultForState(conversationTimeline.currentTimeline.state, call.id, toolResults.loadedByArtifactId);
+  const globalResult = toolResultForState(clientState.$state as unknown as ToolResultState, call.id, toolResults.loadedByArtifactId);
+  return timelineResult ?? globalResult;
 }
 
 function readRunAgentPayload(value: unknown): RunAgentPayloadLike | undefined {
@@ -264,7 +302,7 @@ function readRunAgentPayload(value: unknown): RunAgentPayloadLike | undefined {
 
 function isDelegatedPlanToolCall(call: ToolCallRecord): boolean {
   if (call.name !== SUBMIT_PLAN_TOOL_NAME) return false;
-  const payload = readRunAgentPayload(call.result);
+  const payload = readRunAgentPayload(resolvedToolResult(call));
   return payload?.executionTarget === 'new_conversation' && !!payload.answerBridgeId;
 }
 
@@ -364,9 +402,101 @@ function entryKey(entry: AgentPanelEntry | undefined): string {
 }
 
 function statusPriority(entry: AgentPanelEntry): number {
-  if (entry.statusTone === 'running') return 0;
+  if (isActiveActivityStage(entry.activityStage)) return 0;
   if (entry.answer) return 1;
   return 2;
+}
+
+function resolveAgentActivityStatus(input: {
+  answer?: AgentAnswerRecord;
+  childRun?: AgentRunRecord;
+  notificationRun?: AgentRunRecord;
+  call: ToolCallRecord;
+  payloadStatus?: string;
+  childToolCalls: readonly ToolCallRecord[];
+  notificationToolCalls: readonly ToolCallRecord[];
+}): { label: string; tone: AgentPanelEntry['statusTone']; stage: AgentActivityStage } {
+  if (input.answer) {
+    const notification = input.notificationRun;
+    if (notification) {
+      if (notification.status === 'failed' || notification.status === 'cancelled' || notification.status === 'interrupted' || notification.status === 'stale') {
+        return { label: '结果交付后处理失败', tone: 'error', stage: 'error' };
+      }
+      if (notification.status === 'completed') {
+        return { label: '结果已处理', tone: 'done', stage: 'processed' };
+      }
+      if (notification.status === 'queued') {
+        return { label: '已完成 · 等待主 Agent 接收', tone: 'warning', stage: 'waiting_delivery' };
+      }
+      const blocker = agentRunActivityBlocker(notification, input.notificationToolCalls.map((toolCall) => toolCall.status));
+      if (blocker) return blockingActivityStatus(blocker, true);
+      if (notification.status === 'preparing') {
+        return { label: '结果已接收 · 主 Agent 正在整理', tone: 'running', stage: 'processing' };
+      }
+      return { label: '结果已交付 · 主 Agent 正在处理', tone: 'running', stage: 'processing' };
+    }
+
+    switch (foregroundAnswerReceiptState({
+      hasAnswer: true,
+      notificationRunPresent: false,
+      childRun: input.childRun,
+      parentToolStatus: input.call.status,
+      payloadStatus: input.payloadStatus
+    })) {
+      case 'processed': return { label: '结果已处理', tone: 'done', stage: 'processed' };
+      case 'parent_failed': return { label: '结果接收失败', tone: 'error', stage: 'error' };
+      case 'waiting_child_completion': return { label: '结果已提交 · 子 Agent 仍在运行', tone: 'running', stage: 'running' };
+      case 'waiting_notification':
+      case 'waiting_parent_tool':
+      case 'not_applicable':
+        return { label: '已完成 · 等待主 Agent 接收', tone: 'warning', stage: 'waiting_delivery' };
+    }
+  }
+
+  if (input.childRun) {
+    if (input.childRun.status === 'completed') return { label: '已完成 · 未提交结果', tone: 'warning', stage: 'warning' };
+    if (input.childRun.status === 'failed' || input.childRun.status === 'cancelled' || input.childRun.status === 'interrupted' || input.childRun.status === 'stale') {
+      return { label: runStatusLabel(input.childRun.status), tone: 'error', stage: 'error' };
+    }
+    const blocker = agentRunActivityBlocker(input.childRun, input.childToolCalls.map((toolCall) => toolCall.status));
+    if (blocker) return blockingActivityStatus(blocker, false);
+    return { label: runStatusLabel(input.childRun.status), tone: runStatusTone(input.childRun.status, false), stage: 'running' };
+  }
+
+  if (input.payloadStatus === 'backgrounded') return { label: '后台运行中', tone: 'running', stage: 'running' };
+  const label = toolStatusLabel(input.call.status, input.payloadStatus);
+  const tone = toolStatusTone(input.call.status, false);
+  return { label, tone, stage: tone === 'running' ? 'running' : tone === 'error' ? 'error' : tone === 'warning' ? 'warning' : 'processed' };
+}
+
+function blockingActivityStatus(blocker: AgentRunActivityBlocker, hasAnswer: boolean): { label: string; tone: AgentPanelEntry['statusTone']; stage: AgentActivityStage } {
+  const prefix = hasAnswer ? '结果已接收 · ' : '';
+  switch (blocker) {
+    case 'waiting_tool': return { label: `${prefix}等待工具`, tone: 'running', stage: blocker };
+    case 'waiting_child_run': return { label: `${prefix}等待子任务`, tone: 'running', stage: blocker };
+    case 'waiting_user': return { label: `${prefix}等待用户回答`, tone: 'warning', stage: blocker };
+    case 'waiting_plan_review': return { label: `${prefix}等待 Plan 审批`, tone: 'warning', stage: blocker };
+    case 'paused': return { label: hasAnswer ? '结果处理已暂停' : '已暂停', tone: 'warning', stage: blocker };
+  }
+}
+
+function isActiveActivityStage(stage: AgentActivityStage): boolean {
+  return stage !== 'processed' && stage !== 'warning' && stage !== 'error';
+}
+
+function summarizeActivities(active: readonly AgentPanelEntry[]): string | undefined {
+  if (active.length === 0) return undefined;
+  const count = (stage: AgentActivityStage): number => active.filter((entry) => entry.activityStage === stage).length;
+  const parts: string[] = [];
+  if (count('running') > 0) parts.push(`${count('running')} 个子代理运行中`);
+  if (count('waiting_delivery') > 0) parts.push(`${count('waiting_delivery')} 个已完成，等待主 Agent 接收`);
+  if (count('processing') > 0) parts.push(`${count('processing')} 个结果处理中`);
+  if (count('waiting_tool') > 0) parts.push(`${count('waiting_tool')} 个等待工具`);
+  if (count('waiting_child_run') > 0) parts.push(`${count('waiting_child_run')} 个等待子任务`);
+  if (count('waiting_user') > 0) parts.push(`${count('waiting_user')} 个等待用户回答`);
+  if (count('waiting_plan_review') > 0) parts.push(`${count('waiting_plan_review')} 个等待 Plan 审批`);
+  if (count('paused') > 0) parts.push(`${count('paused')} 个已暂停`);
+  return parts.join(' · ');
 }
 
 function runStatusLabel(status: AgentRunStatus): string {
@@ -381,13 +511,14 @@ function runStatusLabel(status: AgentRunStatus): string {
     case 'completed': return '已完成';
     case 'failed': return '失败';
     case 'cancelled': return '已终止';
+    case 'interrupted': return '已中断';
     case 'stale': return '已过期';
   }
 }
 
 function runStatusTone(status: AgentRunStatus, hasAnswer: boolean): AgentPanelEntry['statusTone'] {
   if (hasAnswer || status === 'completed') return 'done';
-  if (status === 'failed' || status === 'cancelled' || status === 'stale') return 'error';
+  if (status === 'failed' || status === 'cancelled' || status === 'stale' || status === 'interrupted') return 'error';
   if (status === 'paused') return 'warning';
   return TERMINAL_RUN_STATUSES.has(status) ? 'done' : 'running';
 }
@@ -446,15 +577,25 @@ function entryStatusTooltipRows(entry: AgentPanelEntry): AgentRunTooltipItem[] {
       const otherNames = entry.toolCalls.slice(MAX_TOOLTIP_TOOL_CALLS).map((call) => call.name).join('、');
       rows.push({ label: '其他工具', value: compactTooltipValue(otherNames, 72) });
     }
-  } else if (entry.status === 'waiting_tool') {
+  } else if (entry.activityStage === 'waiting_tool') {
     rows.push(
       { kind: 'divider', id: 'tools-pending' },
       { label: '等待对象', value: '工具信息同步中' }
     );
-  } else if (entry.status === 'waiting_child_run') {
+  } else if (entry.activityStage === 'waiting_child_run') {
     rows.push(
       { kind: 'divider', id: 'child-run' },
       { label: '等待对象', value: '子任务' }
+    );
+  } else if (entry.activityStage === 'waiting_user' || entry.activityStage === 'waiting_plan_review') {
+    rows.push(
+      { kind: 'divider', id: 'user-wait' },
+      { label: '等待对象', value: entry.activityStage === 'waiting_plan_review' ? 'Plan 审批' : '用户回答' }
+    );
+  } else if (entry.activityStage === 'paused') {
+    rows.push(
+      { kind: 'divider', id: 'paused' },
+      { label: '当前状态', value: '运行已暂停，等待恢复' }
     );
   }
   return rows;
@@ -535,17 +676,19 @@ function readAnswerPayload(entry: AgentPanelEntry): string {
 </script>
 
 <template>
-  <div ref="rootRef" class="agent-run-root">
+  <div ref="rootRef" class="agent-run-root" :class="{ 'has-activity': !!activitySummary }">
     <button
       type="button"
       class="agent-run-trigger"
-      :class="{ 'is-active': open, 'has-running': runningCount > 0 }"
-      aria-label="Agent 面板"
+      :class="{ 'is-active': open, 'has-running': runningCount > 0, 'has-activity': !!activitySummary }"
+      :aria-label="activitySummary || 'Agent 面板'"
       :aria-expanded="open"
+      :aria-live="activitySummary ? 'polite' : undefined"
       @click.stop="toggleOpen"
     >
       <IconRobot class="agent-run-trigger-icon" stroke="2" aria-hidden="true" />
-      <span v-if="entries.length" class="agent-run-count">{{ entries.length }}</span>
+      <span v-if="activitySummary" class="agent-run-activity-text">{{ activitySummary }}</span>
+      <span v-if="entries.length" class="agent-run-count">{{ activityEntries.length || entries.length }}</span>
     </button>
 
     <section v-if="open" class="agent-run-panel" role="dialog" aria-label="Agent 面板">
@@ -651,6 +794,7 @@ function readAnswerPayload(entry: AgentPanelEntry): string {
 .agent-run-root {
   position: relative;
   flex: 0 0 auto;
+  min-width: 0;
 }
 
 .agent-run-trigger {
@@ -669,6 +813,15 @@ function readAnswerPayload(entry: AgentPanelEntry): string {
   background: transparent;
 }
 
+.agent-run-trigger.has-activity {
+  width: auto;
+  max-width: min(560px, 58vw);
+  padding: 0 24px 0 8px;
+  gap: 6px;
+  border-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 42%, transparent);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 10%, transparent);
+}
+
 .agent-run-trigger:hover,
 .agent-run-trigger:focus-visible,
 .agent-run-trigger.is-active {
@@ -685,6 +838,17 @@ function readAnswerPayload(entry: AgentPanelEntry): string {
 .agent-run-trigger-icon {
   width: 16px;
   height: 16px;
+  flex: 0 0 auto;
+}
+
+.agent-run-activity-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-foreground);
+  font-size: var(--font-size-xs);
+  line-height: 1;
 }
 
 .agent-run-count {

@@ -4,7 +4,6 @@ import {
   GLOBAL_CLIENT_STATE_STREAM_ID,
   conversationClientStateStreamId,
   conversationIdFromClientStateStreamId,
-  isFunctionResponsePart,
   type AgentRunRecord,
   type AgentRunStatus,
   type CheckpointRecord,
@@ -17,6 +16,15 @@ import {
   type ProjectContextRecord,
   type WorkEnvironmentRecord
 } from '@shared/protocol';
+import type {
+  DurableInteractionRequestRecord,
+  ExecutionLeaseRecord,
+  InteractionOwnerLinkRecord,
+  RuntimeDeliveryLinkRecord,
+  TurnIntentRecord,
+  TurnRecord
+} from '@shared/conversationReliability';
+import { isUserVisibleTimelineMessage } from '@shared/messagePresentation';
 import { workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import { createClientStateDb, type ClientStateDb } from './clientStateDb';
 import { compactClientPatchOps } from './clientPatchCompaction';
@@ -35,6 +43,18 @@ export interface CurrentModelSummary {
   model?: string;
 }
 
+export interface CurrentExecution {
+  lease: ExecutionLeaseRecord;
+  turn: TurnRecord;
+  /** AgentRun is a read-only compatibility/display projection of the same Turn, never execution authority. */
+  run?: AgentRunRecord;
+}
+
+export interface CurrentInteraction {
+  request: DurableInteractionRequestRecord;
+  owner: InteractionOwnerLinkRecord;
+}
+
 export interface CurrentRunSummary {
   activeRuns: AgentRunRecord[];
   primaryRun?: AgentRunRecord;
@@ -43,7 +63,7 @@ export interface CurrentRunSummary {
   isRunning: boolean;
 }
 
-const TERMINAL_AGENT_RUN_STATUSES = new Set<AgentRunStatus>(['completed', 'failed', 'cancelled', 'stale']);
+const TERMINAL_AGENT_RUN_STATUSES = new Set<AgentRunStatus>(['completed', 'failed', 'cancelled', 'stale', 'interrupted']);
 
 export function isActiveAgentRunStatus(status: AgentRunStatus): boolean {
   return !TERMINAL_AGENT_RUN_STATUSES.has(status);
@@ -89,7 +109,7 @@ function clearPendingClientStatePatch(streamId: string): void {
  * 只负责"应用 snapshot/patch + 暴露按当前对话过滤的只读视图"，
  * 领域语义由 shared/clientStateSchema 驱动的 clientStateDb 执行器机械完成。
  */
-export const useClientStateStore = defineStore('clientState', {
+const useClientStateStoreDefinition = defineStore('clientState', {
   state: (): ClientStateStoreState => ({
     ...createEmptyClientState(),
     streamSeqs: {},
@@ -133,13 +153,13 @@ export const useClientStateStore = defineStore('clientState', {
         .sort((left, right) => workEnvironmentSortKey(left).localeCompare(workEnvironmentSortKey(right), 'zh-CN') || left.id.localeCompare(right.id))
         [0];
     },
-    /** 当前对话下、按 seq 排序、剔除纯工具响应的消息（工具响应不直接展示）。 */
+    /** 当前对话下、按 seq 排序、剔除模型内部控制输入与纯工具响应。 */
     currentMessages(state): MessageRecord[] {
       return state.messages
         .filter(
           (message) =>
             message.conversationId === state.currentConversationId &&
-            !message.content.parts.some(isFunctionResponsePart)
+            isUserVisibleTimelineMessage(message)
         )
         .sort((left, right) => left.seq - right.seq);
     },
@@ -158,17 +178,39 @@ export const useClientStateStore = defineStore('clientState', {
         .filter((block) => block.conversationId === state.currentConversationId)
         .sort((left, right) => (left.anchorSeq ?? left.endSeq ?? 0) - (right.anchorSeq ?? right.endSeq ?? 0) || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
     },
+    currentExecution(state): CurrentExecution | undefined {
+      return executionForConversation(state, state.currentConversationId);
+    },
     currentActiveRuns(state): AgentRunRecord[] {
-      return activeRunsForConversation(state, state.currentConversationId);
+      const execution = executionForConversation(state, state.currentConversationId);
+      return execution?.run ? [execution.run] : [];
+    },
+    currentQueuedTurnIntents(state): TurnIntentRecord[] {
+      return state.turnIntents
+        .filter((intent) => intent.conversationId === state.currentConversationId && intent.state === 'queued')
+        .sort((left, right) => left.order - right.order || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    },
+    currentPendingInteractions(state): CurrentInteraction[] {
+      return pendingInteractionsForConversation(
+        state.interactionRequests as unknown as DurableInteractionRequestRecord[],
+        state.interactionOwnerLinks as unknown as InteractionOwnerLinkRecord[],
+        state.currentConversationId
+      );
+    },
+    currentPendingRuntimeDeliveries(state): RuntimeDeliveryLinkRecord[] {
+      return state.runtimeDeliveryLinks
+        .filter((delivery) => delivery.destinationConversationId === state.currentConversationId
+          && (delivery.state === 'pending' || delivery.state === 'delivering'))
+        .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
     },
     currentRunSummary(state): CurrentRunSummary {
-      const activeRuns = activeRunsForConversation(state, state.currentConversationId);
-      const primaryRun = activeRuns[0];
+      const execution = executionForConversation(state, state.currentConversationId);
+      const primaryRun = execution?.run;
       return {
-        activeRuns,
+        activeRuns: primaryRun ? [primaryRun] : [],
         ...(primaryRun ? { primaryRun, status: primaryRun.status } : {}),
-        label: primaryRun ? labelForRunStatus(primaryRun.status) : '空闲',
-        isRunning: activeRuns.length > 0
+        label: execution ? labelForTurn(execution.turn) : '空闲',
+        isRunning: execution !== undefined
       };
     },
     currentModelSummary(state): CurrentModelSummary {
@@ -207,7 +249,7 @@ export const useClientStateStore = defineStore('clientState', {
     applyClientSnapshot(streamId: string, streamSeq: number, state: ClientState): void {
       clearPendingClientStatePatch(streamId);
       this.streamSeqs[streamId] = streamSeq;
-      if (!dbFor(this).applySnapshot(streamId, state)) return;
+      if (!dbFor(this as unknown as ClientStateStoreState).applySnapshot(streamId, state)) return;
       this.ensureCurrentConversation();
     },
     applyClientPatch(streamId: string, streamSeq: number, patches: ClientPatchOp[]): boolean {
@@ -236,8 +278,18 @@ export const useClientStateStore = defineStore('clientState', {
         return true;
       }
 
-      dbFor(this).applyPatches(compactClientPatchOps(patches));
+      dbFor(this as unknown as ClientStateStoreState).applyPatches(compactClientPatchOps(patches));
       this.streamSeqs[streamId] = streamSeq;
+      this.ensureCurrentConversation();
+      return true;
+    },
+    applyCommittedConversationPatch(streamId: string, patches: ClientPatchOp[]): boolean {
+      if (!conversationIdFromClientStateStreamId(streamId)) return false;
+      // Commit patches and the high-frequency ClientSync stream have independent sequence heads.
+      // Flush already-accepted transient deltas first so an older RAF batch cannot overwrite a
+      // newly committed durable post-state.
+      this.flushPendingClientStatePatch(streamId);
+      dbFor(this as unknown as ClientStateStoreState).applyPatches(compactClientPatchOps(patches));
       this.ensureCurrentConversation();
       return true;
     },
@@ -247,7 +299,7 @@ export const useClientStateStore = defineStore('clientState', {
       pendingClientStatePatchBatches.delete(streamId);
       const currentStreamSeq = this.streamSeqs[streamId] ?? 0;
       if (batch.streamSeq <= currentStreamSeq) return;
-      dbFor(this).applyPatches(compactClientPatchOps(batch.patches));
+      dbFor(this as unknown as ClientStateStoreState).applyPatches(compactClientPatchOps(batch.patches));
       this.streamSeqs[streamId] = batch.streamSeq;
       this.ensureCurrentConversation();
     },
@@ -275,18 +327,105 @@ export const useClientStateStore = defineStore('clientState', {
   }
 });
 
-function activeRunsForConversation(state: ClientStateStoreState, conversationId: string): AgentRunRecord[] {
+/**
+ * ClientState 表数量较多，直接导出 Pinia 对整个 options store 推导出的递归泛型，会让
+ * vue-tsc 在每个消费组件中反复展开 ClientState/JsonValue，最终触发 TS2589。
+ * 这里显式冻结 Webview 实际使用的公共表面；运行时仍是同一个 Pinia store。
+ */
+export interface ClientStateStorePublic extends ClientStateStoreState {
+  $state: ClientStateStoreState;
+
+  readonly currentConversationDetailLoaded: boolean;
+  readonly settingsClientStateReady: boolean;
+  readonly settingsClientStateLoading: boolean;
+  readonly isConfigScopeClientStateLoading: (scopeKind?: string, scopeId?: string) => boolean;
+  readonly currentConversation: ConversationRecord | undefined;
+  readonly currentProjectContext: ProjectContextRecord | undefined;
+  readonly currentWorkEnvironment: WorkEnvironmentRecord | undefined;
+  readonly currentMessages: MessageRecord[];
+  readonly currentCheckpoints: CheckpointRecord[];
+  readonly currentCheckpointTimelineAnchors: CheckpointTimelineAnchorRecord[];
+  readonly currentCompressionBlocks: CompressionBlockRecord[];
+  readonly currentExecution: CurrentExecution | undefined;
+  readonly currentActiveRuns: AgentRunRecord[];
+  readonly currentQueuedTurnIntents: TurnIntentRecord[];
+  readonly currentPendingInteractions: CurrentInteraction[];
+  readonly currentPendingRuntimeDeliveries: RuntimeDeliveryLinkRecord[];
+  readonly currentRunSummary: CurrentRunSummary;
+  readonly currentModelSummary: CurrentModelSummary;
+
+  applyClientSnapshot(streamId: string, streamSeq: number, state: ClientState): void;
+  applyClientPatch(streamId: string, streamSeq: number, patches: ClientPatchOp[]): boolean;
+  applyCommittedConversationPatch(streamId: string, patches: ClientPatchOp[]): boolean;
+  flushPendingClientStatePatch(streamId: string): void;
+  setCurrentConversation(conversationId: string): void;
+  ensureCurrentConversation(): void;
+}
+
+export const useClientStateStore = useClientStateStoreDefinition as unknown as () => ClientStateStorePublic;
+
+interface ExecutionLookupState {
+  executionLeases: ExecutionLeaseRecord[];
+  turns: TurnRecord[];
+  agentRuns: AgentRunRecord[];
+}
+
+function executionForConversation(state: ExecutionLookupState, conversationId: string): CurrentExecution | undefined {
+  if (!conversationId) return undefined;
+  const leases = state.executionLeases.filter((lease) => lease.conversationId === conversationId && lease.state !== 'released');
+  if (leases.length !== 1) return undefined;
+  const lease = leases[0];
+  const turn = state.turns.find((candidate) => candidate.id === lease.turnId && candidate.conversationId === conversationId);
+  if (!turn || turn.lifecycle !== 'active' || turn.phase === 'terminal') return undefined;
+  const run = state.agentRuns.find((candidate) => candidate.id === turn.id);
+  return { lease, turn, ...(run ? { run } : {}) };
+}
+
+function pendingInteractionsForConversation(
+  interactionRequests: readonly DurableInteractionRequestRecord[],
+  interactionOwnerLinks: readonly InteractionOwnerLinkRecord[],
+  conversationId: string
+): CurrentInteraction[] {
   if (!conversationId) return [];
-  const runIds = new Set(
-    state.agentRunTargetLinks
-      .filter((link) => link.conversationId === conversationId)
-      .map((link) => link.runId)
-  );
-  if (runIds.size === 0) return [];
-  const heldRunIds = new Set(state.agentRunQueueHolds.filter((hold) => hold.conversationId === conversationId).map((hold) => hold.runId));
-  return state.agentRuns
-    .filter((run) => runIds.has(run.id) && isActiveAgentRunStatus(run.status) && !(run.status === 'queued' && heldRunIds.has(run.id)))
-    .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+  const requestById = new Map(interactionRequests.map((request) => [request.id, request]));
+  return interactionOwnerLinks
+    .filter((owner) => owner.conversationId === conversationId)
+    .flatMap((owner) => {
+      const request = requestById.get(owner.interactionRequestId);
+      return request?.state === 'pending' ? [{ request, owner }] : [];
+    })
+    .sort((left, right) => left.request.createdAt - right.request.createdAt || left.request.id.localeCompare(right.request.id));
+}
+
+function labelForTurn(turn: TurnRecord): string {
+  switch (turn.phase) {
+    case 'loading_context':
+      return '加载上下文';
+    case 'waiting_compression':
+      return '等待压缩';
+    case 'resolving_invocation':
+    case 'waiting_checkpoint_before_llm':
+    case 'llm_request_pending':
+      return '准备中';
+    case 'llm_streaming':
+      return '执行中';
+    case 'waiting_tools':
+      return '等待工具';
+    case 'waiting_child_run':
+      return '等待子任务';
+    case 'waiting_user':
+      return '等待用户';
+    case 'waiting_plan_review':
+      return '等待 Plan 审批';
+    case 'waiting_checkpoint_after_llm':
+      return '保存检查点';
+    case 'delivering':
+      return '整理回复';
+    case 'paused':
+      return '已暂停';
+    case 'terminal':
+      return '空闲';
+  }
 }
 
 function labelForRunStatus(status: AgentRunStatus): string {
@@ -311,7 +450,8 @@ function labelForRunStatus(status: AgentRunStatus): string {
       return '失败';
     case 'cancelled':
       return '已终止';
-
+    case 'interrupted':
+      return '已中断';
     case 'stale':
       return '已过期';
   }
@@ -325,7 +465,13 @@ function latestScopeLink<T extends { createdAt: number; updatedAt: number; id: s
   return [...links].sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt || right.id.localeCompare(left.id))[0];
 }
 
-function isSettingsClientStateReady(state: ClientStateStoreState): boolean {
+function isSettingsClientStateReady(state: {
+  streamSeqs: Record<string, number>;
+  workEnvironments: readonly unknown[];
+  workEnvironmentPolicies: readonly unknown[];
+  checkpointPolicies: readonly unknown[];
+  shadowRepositories: readonly unknown[];
+}): boolean {
   const streamSeq = state.streamSeqs[GLOBAL_CLIENT_STATE_STREAM_ID] ?? 0;
   if (streamSeq >= SETTINGS_READY_MIN_GLOBAL_STREAM_SEQ) return true;
   if (streamSeq <= 0) return false;

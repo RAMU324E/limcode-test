@@ -2,7 +2,7 @@ import type {
   LlmUsageMetadataRecord,
   MessageRecord,
   MsgRole,
-  MsgStatus
+  MessageMaterializationStatus
 } from '@shared/protocol';
 
 const hasOwn = Object.prototype.hasOwnProperty;
@@ -35,7 +35,7 @@ export interface TokenUsageMessageEntry {
   messageSeq?: number;
   label?: string;
   role?: MsgRole;
-  status?: MsgStatus;
+  status?: MessageMaterializationStatus;
   createdAt?: number;
   total: number;
   input?: number;

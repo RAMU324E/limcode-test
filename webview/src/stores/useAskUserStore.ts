@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia';
 import { resolveAskUserAnswer } from '@shared/askUser';
+import type { JsonValue } from '@shared/conversationReliability';
 import type { AskUserAnswerRecord, AskUserToolRequestRecord } from '@shared/protocol';
-import { bridge, BridgeMessageType } from '@webview/transport';
+import { useInteractionStore, type InteractionResolveTarget } from '@webview/stores/useInteractionStore';
 
 export interface AskUserDraftState {
   selectedOptionIndexes: number[];
@@ -64,7 +65,7 @@ export const useAskUserStore = defineStore('askUser', {
         error: undefined
       };
     },
-    submit(toolCallId: string, request: AskUserToolRequestRecord): boolean {
+    submit(toolCallId: string, request: AskUserToolRequestRecord, target: InteractionResolveTarget): boolean {
       const current = this.draftFor(toolCallId);
       if (current.submitting) return false;
 
@@ -87,21 +88,25 @@ export const useAskUserStore = defineStore('askUser', {
         submittingAction: 'answer',
         error: undefined
       };
-      bridge.request(BridgeMessageType.AskUserAnswerSubmit, {
-        toolCallId,
+      const accepted = useInteractionStore().resolve(target, 'submit', {
         answer: plainAnswer(answer)
-      });
+      } as unknown as JsonValue);
+      if (!accepted) {
+        this.drafts[toolCallId] = { ...current, submitting: false, submittingAction: undefined, error: '问题状态已变化，请等待同步后重试。' };
+        return false;
+      }
       this.scheduleSubmitTimeout(toolCallId);
       return true;
     },
-    cancel(toolCallId: string): void {
+    cancel(toolCallId: string, target: InteractionResolveTarget): void {
       const current = this.draftFor(toolCallId);
       if (current.submitting) return;
       this.drafts[toolCallId] = { ...current, submitting: true, submittingAction: 'cancel', error: undefined };
-      bridge.request(BridgeMessageType.ToolExecutionCancel, {
-        toolCallId,
-        reason: '用户取消了问题。'
-      });
+      const accepted = useInteractionStore().resolve(target, 'cancel', { reason: '用户取消了问题。' });
+      if (!accepted) {
+        this.drafts[toolCallId] = { ...current, submitting: false, submittingAction: undefined, error: '问题状态已变化，请等待同步后重试。' };
+        return;
+      }
       this.scheduleSubmitTimeout(toolCallId);
     },
     clearDraft(toolCallId: string): void {

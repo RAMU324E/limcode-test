@@ -1,7 +1,7 @@
 <script lang="ts">
 import { ref as moduleRef } from 'vue';
 
-const VIEWED_TERMINAL_OUTPUTS_STORAGE_KEY = 'limcode.backgroundCommand.viewedTerminalOutputs';
+const VIEWED_TERMINAL_OUTPUTS_STORAGE_KEY = 'limcode.backgroundProcess.viewedTerminalOutputs';
 const MAX_VIEWED_TERMINAL_OUTPUTS = 800;
 const viewedTerminalOutputs = moduleRef<Record<string, true>>(loadViewedTerminalOutputs());
 
@@ -55,18 +55,19 @@ function pruneViewedTerminalOutputs(value: Record<string, true>): Record<string,
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconTerminal2, IconX } from '@tabler/icons-vue';
-import { BridgeMessageType, type BackgroundCommandOutputResultPayload, type ToolCallEventRecord, type ToolCallRecord } from '@shared/protocol';
+import {
+  BridgeMessageType,
+  type BackgroundProcessOutputResultPayload,
+  type BackgroundProcessRecord
+} from '@shared/protocol';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import { bridge } from '@webview/transport';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import {
   parseShellCallArgs,
-  parseShellResultOutput,
-  shellProgressText,
-  shellStreamText,
-  type ShellArgs,
-  type ShellResultOutput
+  type ShellArgs
 } from '@webview/components/content/toolDisplay/shellToolModel';
 
 interface CommandEntry {
@@ -87,6 +88,7 @@ interface CommandEntry {
   exitCode?: number;
   killed?: boolean;
   running?: boolean;
+  outputAvailable: boolean;
   callCount: number;
   startedAt: number;
   updatedAt: number;
@@ -108,6 +110,7 @@ interface CommandDraft {
   exitCode?: number;
   killed?: boolean;
   running?: boolean;
+  outputAvailable: boolean;
   callCount: number;
   startedAt: number;
   updatedAt: number;
@@ -121,7 +124,12 @@ const selectedProcessId = ref<string | undefined>();
 const rootRef = ref<HTMLElement | null>(null);
 const listScroller = ref<HTMLElement | null>(null);
 const detailScroller = ref<HTMLElement | null>(null);
-const runtimeOutputs = ref<Record<string, BackgroundCommandOutputResultPayload>>({});
+const runtimeOutputs = ref<Record<string, BackgroundProcessOutputResultPayload>>({});
+const consumeConfirmOpen = ref(false);
+const consumeConfirmActions: ConfirmPanelAction[] = [
+  { key: 'cancel', label: '取消', variant: 'secondary' },
+  { key: 'confirm', label: '清理日志', variant: 'danger' }
+];
 const pendingOutputRequests = new Set<string>();
 let pollTimer: number | undefined;
 let stopOutputListener: (() => void) | undefined;
@@ -149,6 +157,7 @@ watch(open, (isOpen) => {
   if (!isOpen) {
     stopPolling();
     markVisibleTerminalEntriesViewed();
+    consumeConfirmOpen.value = false;
     return;
   }
   refreshRunningOutputs();
@@ -166,7 +175,7 @@ watch(() => entries.value.map((entry) => `${entry.processId}:${entry.statusTone}
 
 onMounted(() => {
   document.addEventListener('pointerdown', onDocumentPointerDown, true);
-  stopOutputListener = bridge.on(BridgeMessageType.BackgroundCommandOutputResult, (message) => {
+  stopOutputListener = bridge.on(BridgeMessageType.BackgroundProcessOutputResult, (message) => {
     const payload = message.payload;
     if (!payload) return;
     runtimeOutputs.value = { ...runtimeOutputs.value, [payload.processId]: payload };
@@ -195,15 +204,12 @@ function closePanel(): void {
 function markVisibleTerminalEntriesViewed(): void {
   const terminalEntries = entries.value.filter((entry) => entry.statusTone !== 'running');
   if (terminalEntries.length === 0) return;
-  const terminalProcessIds = terminalEntries.map((entry) => entry.processId);
-  markViewedTerminalOutputs(terminalProcessIds);
-  for (const processId of terminalProcessIds) requestOutput(processId, true);
-  if (selectedProcessId.value && viewedTerminalOutputs.value[selectedProcessId.value]) selectedProcessId.value = undefined;
+  markViewedTerminalOutputs(terminalEntries.map((entry) => entry.processId));
 }
 
 function selectEntry(entry: CommandEntry): void {
   selectedProcessId.value = entry.processId;
-  requestOutput(entry.processId, true);
+  requestOutput(entry.processId, false);
   void nextTick(() => detailScroller.value?.scrollTo({ top: 0 }));
 }
 
@@ -215,92 +221,55 @@ function onDocumentPointerDown(event: PointerEvent): void {
 }
 
 function buildCommandEntries(): CommandEntry[] {
-  const toolCalls = conversationTimeline.currentTimeline.state.toolCalls
-    .filter((call) => isCommandTool(call.name))
-    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-  const eventsByCallId = new Map<string, ToolCallEventRecord[]>();
-  for (const event of clientState.toolCallEvents) {
-    const events = eventsByCallId.get(event.toolCallId) ?? [];
-    events.push(event);
-    eventsByCallId.set(event.toolCallId, events);
-  }
+  const conversationId = clientState.currentConversationId;
+  const origins = clientState.backgroundProcessOriginLinks.filter((link) => link.conversationId === conversationId);
+  const originByProcessId = new Map(origins.map((link) => [link.backgroundProcessId, link]));
+  const toolCallsById = new Map(conversationTimeline.currentTimeline.state.toolCalls.map((call) => [call.id, call]));
 
-  const drafts = new Map<string, CommandDraft>();
-  for (const call of toolCalls) {
-    const args = parseShellCallArgs(call.args);
-    const output = parseShellResultOutput(call.result);
-    const processId = (output?.processId ?? args.processId)?.trim();
-    if (!processId) continue;
-
-    const events = (eventsByCallId.get(call.id) ?? []).sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
-    const draft = drafts.get(processId) ?? createDraft(processId, call, args, output);
-    mergeCall(draft, call, args, output, events);
-    drafts.set(processId, draft);
-  }
-
-  return [...drafts.values()]
+  return clientState.backgroundProcesses
+    .filter((process) => originByProcessId.has(process.id))
+    .map((process) => {
+      const origin = originByProcessId.get(process.id);
+      const call = origin ? toolCallsById.get(origin.sourceToolCallId) : undefined;
+      const args = call ? parseShellCallArgs(call.args) : {} as ShellArgs;
+      return createDraftFromProcess(process, args);
+    })
     .map((draft) => applyRuntimeOutput(draft, runtimeOutputs.value[draft.processId]))
     .map((draft) => ({
       ...draft,
       statusLabel: statusLabel(draft.status, draft.running, draft.exitCode, draft.killed),
       statusTone: statusTone(draft.status, draft.running, draft.exitCode)
     }))
-    .filter((entry) => entry.killed !== true && !(viewedTerminalOutputs.value[entry.processId] && selectedProcessId.value !== entry.processId))
+    .filter((entry) => entry.outputAvailable && entry.killed !== true && !(viewedTerminalOutputs.value[entry.processId] && selectedProcessId.value !== entry.processId))
     .sort((left, right) => right.updatedAt - left.updatedAt || right.startedAt - left.startedAt || left.processId.localeCompare(right.processId));
 }
 
-function createDraft(processId: string, call: ToolCallRecord, args: ShellArgs, output: ShellResultOutput | undefined): CommandDraft {
+function createDraftFromProcess(process: BackgroundProcessRecord, args: ShellArgs): CommandDraft {
   return {
-    processId,
-    shell: call.name,
-    command: args.command?.trim() || output?.command?.trim() || '',
-    cwd: args.cwd?.trim() || undefined,
+    processId: process.processId,
+    shell: process.toolName,
+    command: process.command,
+    cwd: process.cwd || undefined,
     foregroundWaitMs: args.foregroundWaitMs,
-    mode: normalizeMode(args.mode),
+    mode: 'execute',
     accessLabel: readonlyLabel(args),
-    status: output?.status ?? call.status,
+    status: process.status,
     stdout: '',
     stderr: '',
     progress: '',
-    droppedChars: output?.droppedChars,
-    exitCode: output?.exitCode,
-    killed: output?.killed,
-    running: output?.running,
-    callCount: 0,
-    startedAt: call.createdAt,
-    updatedAt: call.updatedAt,
-    latestOutputAt: 0
+    droppedChars: process.droppedChars || undefined,
+    exitCode: process.exitCode ?? undefined,
+    killed: process.killed,
+    running: process.status === 'running',
+    outputAvailable: process.outputAvailable,
+    callCount: 1,
+    startedAt: process.startedAt,
+    updatedAt: process.updatedAt,
+    latestOutputAt: process.updatedAt
   };
 }
 
-function mergeCall(draft: CommandDraft, call: ToolCallRecord, args: ShellArgs, output: ShellResultOutput | undefined, events: ToolCallEventRecord[]): void {
-  draft.callCount += 1;
-  draft.startedAt = Math.min(draft.startedAt, call.createdAt);
-  draft.updatedAt = Math.max(draft.updatedAt, call.updatedAt);
-  if (!draft.command) draft.command = args.command?.trim() || output?.command?.trim() || '';
-  if (!draft.cwd && args.cwd?.trim()) draft.cwd = args.cwd.trim();
-  if (draft.foregroundWaitMs === undefined && args.foregroundWaitMs !== undefined) draft.foregroundWaitMs = args.foregroundWaitMs;
-  if (!draft.mode) draft.mode = normalizeMode(args.mode);
-  if (args.readonly !== undefined) draft.accessLabel = readonlyLabel(args);
-
-  const stdout = shellStreamText(events, 'stdout') || output?.stdout || '';
-  const stderr = shellStreamText(events, 'stderr') || output?.stderr || '';
-  const progress = shellProgressText(events, stringifyValue);
-  const hasRuntimeSnapshot = output !== undefined || stdout.length > 0 || stderr.length > 0 || progress.length > 0;
-  if (hasRuntimeSnapshot && call.updatedAt >= draft.latestOutputAt) {
-    draft.latestOutputAt = call.updatedAt;
-    draft.status = output?.status ?? call.status;
-    draft.stdout = stdout;
-    draft.stderr = stderr;
-    draft.progress = progress;
-    draft.droppedChars = output?.droppedChars;
-    draft.exitCode = output?.exitCode;
-    draft.killed = output?.killed;
-    draft.running = output?.running;
-  }
-}
-
-function applyRuntimeOutput(draft: CommandDraft, output: BackgroundCommandOutputResultPayload | undefined): CommandDraft {
+function applyRuntimeOutput(draft: CommandDraft, output: BackgroundProcessOutputResultPayload | undefined): CommandDraft {
   if (!output) return draft;
   return {
     ...draft,
@@ -313,6 +282,7 @@ function applyRuntimeOutput(draft: CommandDraft, output: BackgroundCommandOutput
     exitCode: output.exitCode,
     killed: output.killed,
     running: output.running,
+    outputAvailable: output.status !== 'not_found' && draft.outputAvailable,
     updatedAt: draft.updatedAt,
     latestOutputAt: draft.latestOutputAt
   };
@@ -320,7 +290,7 @@ function applyRuntimeOutput(draft: CommandDraft, output: BackgroundCommandOutput
 
 function refreshRunningOutputs(): void {
   for (const entry of entries.value) {
-    if (entry.statusTone === 'running') requestOutput(entry.processId, entry.processId === selectedProcessId.value);
+    if (entry.statusTone === 'running') requestOutput(entry.processId, false);
   }
 }
 
@@ -328,7 +298,7 @@ function requestOutput(processId: string, consume = false): void {
   const pendingKey = processId + ':' + (consume ? 'consume' : 'peek');
   if (!processId || pendingOutputRequests.has(pendingKey)) return;
   pendingOutputRequests.add(pendingKey);
-  bridge.request(BridgeMessageType.BackgroundCommandOutputGet, { processId, consume }, { channel: 'state' });
+  bridge.request(BridgeMessageType.BackgroundProcessOutputGet, { processId, consume }, { channel: 'state' });
 }
 
 function startPolling(): void {
@@ -342,13 +312,15 @@ function stopPolling(): void {
   pollTimer = undefined;
 }
 
-function isCommandTool(toolName: string): boolean {
-  return toolName === 'shell' || toolName === 'bash';
+function requestConsumeSelected(): void {
+  if (!selectedEntry.value || selectedEntry.value.statusTone === 'running') return;
+  consumeConfirmOpen.value = true;
 }
 
-function normalizeMode(mode: string | undefined): string {
-  const value = mode?.trim();
-  return value || 'execute';
+function onConsumeConfirmAction(action: ConfirmPanelAction): void {
+  consumeConfirmOpen.value = false;
+  if (action.key !== 'confirm' || !selectedEntry.value || selectedEntry.value.statusTone === 'running') return;
+  requestOutput(selectedEntry.value.processId, true);
 }
 
 function readonlyLabel(args: ShellArgs): string {
@@ -394,14 +366,6 @@ function middleEllipsis(value: string, maxLength: number): string {
   return `${value.slice(0, keep)}...${value.slice(value.length - keep)}`;
 }
 
-function stringifyValue(value: unknown): string {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
 </script>
 
 <template>
@@ -455,6 +419,14 @@ function stringifyValue(value: unknown): string {
           <header class="command-detail-header">
             <span class="command-status" :class="`is-${selectedEntry.statusTone}`">{{ selectedEntry.statusLabel }}</span>
             <span class="command-detail-id">{{ selectedEntry.processId }}</span>
+            <button
+              v-if="selectedEntry.statusTone !== 'running' && selectedEntry.outputAvailable"
+              type="button"
+              class="command-log-consume"
+              @click="requestConsumeSelected"
+            >
+              清理日志
+            </button>
           </header>
           <div class="command-detail-scroll-shell">
             <div ref="detailScroller" class="command-detail-scroll">
@@ -495,6 +467,15 @@ function stringifyValue(value: unknown): string {
 
       <div v-else class="background-command-empty">暂无后台命令。</div>
     </section>
+    <ConfirmPanel
+      :open="consumeConfirmOpen"
+      title="清理后台命令日志？"
+      description="清理后，UI 和模型再次读取该进程日志都会得到 not_found；完成通知与对话记录不会被删除。"
+      :actions="consumeConfirmActions"
+      danger
+      @action="onConsumeConfirmAction"
+      @cancel="consumeConfirmOpen = false"
+    />
   </div>
 </template>
 
@@ -768,6 +749,25 @@ function stringifyValue(value: unknown): string {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Consolas, monospace);
+}
+
+.command-log-consume {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 2px 7px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.36));
+  border-radius: var(--radius-sm);
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  font-size: var(--font-size-xs);
+}
+
+.command-log-consume:hover,
+.command-log-consume:focus-visible {
+  color: var(--vscode-errorForeground);
+  border-color: color-mix(in srgb, var(--vscode-errorForeground) 55%, var(--vscode-panel-border) 45%);
+  background: color-mix(in srgb, var(--vscode-errorForeground) 8%, transparent);
+  outline: none;
 }
 
 .command-detail-scroll-shell {

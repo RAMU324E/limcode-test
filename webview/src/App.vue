@@ -2,15 +2,16 @@
 import { computed, defineAsyncComponent, h, type Component } from 'vue';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { useBridgeBootstrap } from '@webview/composables/useBridgeBootstrap';
+import { EXTENSION_BRAND } from '@shared/extensionIdentity';
 
 const LoadingFallback: Component = {
   name: 'LimcodeViewLoading',
   setup() {
     return () => h('main', { class: 'limcode-loading-shell', role: 'status', 'aria-live': 'polite' }, [
-      h('section', { class: 'limcode-loading-card', 'aria-label': '正在打开 LimCode' }, [
+      h('section', { class: 'limcode-loading-card', 'aria-label': `正在打开 ${EXTENSION_BRAND}` }, [
         h('div', { class: 'limcode-loading-mark', 'aria-hidden': 'true' }, [h('span'), h('span'), h('span')]),
         h('div', { class: 'limcode-loading-copy' }, [
-          h('div', { class: 'limcode-loading-eyebrow' }, 'LimCode'),
+          h('div', { class: 'limcode-loading-eyebrow' }, EXTENSION_BRAND),
           h('h1', '正在打开视图'),
           h('p', '正在加载当前视图资源。'),
           h('div', { class: 'limcode-loading-progress', 'aria-hidden': 'true' }, [h('span')])

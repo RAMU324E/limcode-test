@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import GlobalSettingsPanel from '@webview/components/settings/GlobalSettingsPanel.vue';
+import { EXTENSION_BRAND } from '@shared/extensionIdentity';
 </script>
 
 <template>
   <div class="global-settings-view">
     <header class="view-header">
-      <span class="view-title">LimCode 全局设置</span>
+      <span class="view-title">{{ EXTENSION_BRAND }} 全局设置</span>
       <span class="view-hint">渠道配置会作为后端默认 LLM 连接配置同步给全局设置订阅者。</span>
     </header>
     <div class="view-body">

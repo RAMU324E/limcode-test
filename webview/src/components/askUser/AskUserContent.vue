@@ -5,26 +5,34 @@ import { ASK_USER_MAX_CUSTOM_ANSWER_LENGTH, askUserOptionKey, askUserOutputFromR
 import type { AskUserOptionRecord, AskUserToolRequestRecord, ToolCallRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
+import { interactionForTool } from '@webview/domain/interactionProjection';
 import { useAskUserStore, type AskUserDraftState } from '@webview/stores/useAskUserStore';
+import { useClientStateStore } from '@webview/stores/useClientStateStore';
+import { useInteractionStore } from '@webview/stores/useInteractionStore';
 
 const props = withDefaults(defineProps<{
   request: AskUserToolRequestRecord;
   toolCall?: ToolCallRecord;
+  result?: unknown;
   placement?: 'tool-detail' | 'composer';
 }>(), {
   placement: 'tool-detail'
 });
 
 const askUser = useAskUserStore();
+const clientState = useClientStateStore();
+const interactions = useInteractionStore();
 const optionsRoot = ref<HTMLElement | null>(null);
 const customInput = ref<HTMLTextAreaElement | null>(null);
 const toolCallId = computed(() => props.toolCall?.id ?? '');
 const draft = computed<AskUserDraftState>(() => toolCallId.value ? askUser.draftFor(toolCallId.value) : emptyDraft());
-const output = computed(() => askUserOutputFromResult(props.toolCall?.result));
+const output = computed(() => askUserOutputFromResult(props.result));
 const answeredOptionKeys = computed(() => new Set((output.value?.selectedOptions ?? []).map(askUserOptionKey)));
-const pending = computed(() => props.toolCall?.status === 'awaiting_user_input');
-const submitting = computed(() => pending.value && draft.value.submitting);
-const interactive = computed(() => pending.value && !submitting.value && !!toolCallId.value);
+const interaction = computed(() => interactionForTool(clientState, toolCallId.value, 'ask_user'));
+const pending = computed(() => interaction.value?.request.state === 'pending');
+const submitting = computed(() => pending.value && !!interaction.value
+  && (draft.value.submitting || interactions.isPending(interaction.value.request.id)));
+const interactive = computed(() => pending.value && !submitting.value && !!toolCallId.value && !!interaction.value);
 const customSelected = computed(() => output.value ? !!output.value.customText : draft.value.customSelected);
 const customText = computed(() => output.value?.customText ?? draft.value.customText);
 const canSubmit = computed(() => pending.value
@@ -43,10 +51,10 @@ const statusLabel = computed(() => {
 });
 
 watch(
-  () => `${props.toolCall?.id ?? ''}:${props.toolCall?.status ?? ''}`,
+  () => `${props.toolCall?.id ?? ''}:${interaction.value?.request.id ?? ''}:${interaction.value?.request.revision ?? 0}:${interaction.value?.request.state ?? 'missing'}`,
   () => {
     const call = props.toolCall;
-    if (call && call.status !== 'awaiting_user_input') askUser.clearDraft(call.id);
+    if (call && !pending.value) askUser.clearDraft(call.id);
   },
   { immediate: true }
 );
@@ -98,13 +106,15 @@ function updateCustomText(event: Event): void {
 }
 
 function submit(): void {
-  if (!toolCallId.value || !pending.value) return;
-  askUser.submit(toolCallId.value, props.request);
+  const target = interaction.value;
+  if (!toolCallId.value || !pending.value || !target) return;
+  askUser.submit(toolCallId.value, props.request, target);
 }
 
 function cancel(): void {
-  if (!toolCallId.value || !interactive.value) return;
-  askUser.cancel(toolCallId.value);
+  const target = interaction.value;
+  if (!toolCallId.value || !interactive.value || !target) return;
+  askUser.cancel(toolCallId.value, target);
 }
 
 function submitFromTextarea(event: KeyboardEvent): void {

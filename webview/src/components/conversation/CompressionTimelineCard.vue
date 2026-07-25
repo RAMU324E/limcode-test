@@ -112,7 +112,7 @@ onBeforeUnmount(() => {
 
 function onDeleteAction(action: ConfirmPanelAction): void {
   confirmDeleteOpen.value = false;
-  if (action.key === 'confirm') emit('delete', props.block);
+  if (action.key === 'confirm' && !isWorking.value) emit('delete', props.block);
 }
 
 function toggleExpanded(): void {
@@ -241,7 +241,13 @@ function formatRetryAttempt(attempt: number | undefined, max: number | undefined
         <IconCheck v-if="copied" class="compression-action-icon" size="15" stroke="1.8" />
         <IconCopy v-else class="compression-action-icon" size="15" stroke="1.8" />
       </button>
-      <button type="button" class="compression-action-button" title="删除压缩记录" @click="confirmDeleteOpen = true">
+      <button
+        type="button"
+        class="compression-action-button"
+        :disabled="isWorking"
+        :title="isWorking ? '压缩进行中，当前版本暂不支持取消或删除' : '删除压缩记录'"
+        @click="confirmDeleteOpen = true"
+      >
         <IconTrash class="compression-action-icon" size="15" stroke="1.8" />
       </button>
     </div>

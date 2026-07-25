@@ -6,21 +6,27 @@ import {
   type ClientPatchOp,
   type ClientState,
   type ClientStateTableKey,
-  type MessageRecord
+  type MessageRecord,
+  type ToolCallPreviewRecord,
+  type ToolCallPreviewTargetLinkRecord
 } from '../../../../shared/protocol';
 import { clientStateWithTables, createEmptyClientState, GLOBAL_CLIENT_STATE_TABLE_KEYS } from '../../../../shared/clientStateSchema';
 import { collectChangedClientStateConversationIds } from '../../../../shared/clientStateConversationScope';
-import { defineSystem, type AccessDeclaration, type WorldReader } from '../../../ecs/types';
+import { defineSystem, type AccessDeclaration, type WorldEvent, type WorldReader } from '../../../ecs/types';
 import { readEvents } from '../../events';
 import { LlmRequest, Message } from '../../modules/chat/components';
+import { ToolCallPreview, ToolCallPreviewTargetLink } from '../../modules/tools/components';
 import type { ClientStateContributor } from '../contributors';
 import { diffClientStateTables } from '../diff';
 import { ClientSyncEventType } from '../events';
-import { ClientStateContributorsKey, ClientStateDirtyConversationIdsKey, ClientSyncFastPatchStateKey, ClientSyncStateKey, type ClientStreamState, type ClientSyncFastPatchState, type ClientSyncState } from '../resources';
+import { mergeFastPatchBatches } from '../fastPatchBatches';
+import { ClientStateContributorsKey, ClientStateDirtyConversationIdsKey, ClientSyncFastPatchStateKey, ClientSyncStateKey, CommittedConversationHeadsKey, type ClientStreamState, type ClientSyncFastPatchState, type ClientSyncState } from '../resources';
 import { projectClientStateWithCache } from '../projection';
 import { contributorClock } from '../../projection/cache';
+import type { TransientStreamEpoch } from '../../../../shared/conversationReliability';
 
 const CONVERSATION_STREAM_RECENT_MESSAGE_LIMIT = 240;
+const FAST_PATCH_COMPONENTS = [Message, ToolCallPreview, ToolCallPreviewTargetLink] as const;
 
 export const ClientSyncSystem = defineSystem({
   name: 'ClientSyncSystem',
@@ -32,7 +38,7 @@ export const ClientSyncSystem = defineSystem({
         components: [...(projectionReads.components ?? []), LlmRequest]
       },
       resources: {
-        read: [ClientStateContributorsKey, ClientSyncStateKey, ClientSyncFastPatchStateKey, ClientStateDirtyConversationIdsKey],
+        read: [ClientStateContributorsKey, ClientSyncStateKey, ClientSyncFastPatchStateKey, ClientStateDirtyConversationIdsKey, CommittedConversationHeadsKey],
         write: [ClientSyncStateKey, ClientSyncFastPatchStateKey],
         mutationMode: 'update'
       },
@@ -40,11 +46,15 @@ export const ClientSyncSystem = defineSystem({
       effects: { emit: ['client.snapshot', 'client.patch'] }
     };
   },
+  shouldRun({ world, events }) {
+    return shouldRunClientSync(world, events);
+  },
   run(ctx) {
     const { world, cmd } = ctx;
     const registry = world.getResource(ClientStateContributorsKey);
     const storedSyncState = world.getResource(ClientSyncStateKey);
     const fastPatchState = world.getResource(ClientSyncFastPatchStateKey);
+    const committedConversationHeads = world.getResource(CommittedConversationHeadsKey);
     const contributors = registry.list();
     const resyncRequests = readEvents(ctx, ClientSyncEventType.Resync);
     const requestedStreamIds = new Set(resyncRequests.map((request) =>
@@ -54,22 +64,45 @@ export const ClientSyncSystem = defineSystem({
     const releasedStreamIds = new Set(
       readEvents(ctx, ClientSyncEventType.StreamsReleased).flatMap((payload) => payload.streamIds)
     );
-    const syncState = releaseUnusedStreamStates(storedSyncState, releasedStreamIds, requestedStreamIds);
+    let syncState = releaseUnusedStreamStates(storedSyncState, releasedStreamIds, requestedStreamIds);
     const didReleaseStreamStates = syncState !== storedSyncState;
     const hasResyncRequests = resyncRequests.length > 0;
     const hasActiveLlmRequests = world.query(LlmRequest).length > 0;
     const shouldDeferFullSync = fastPatchState.deferFullSync && hasActiveLlmRequests;
-    const canUseFastPath = fastPatchState.patches.length > 0
-      && shouldDeferFullSync
-      && !fastPatchState.requireFullSync
-      && syncState.lastState !== null
-      && !hasResyncRequests
+    const hasOnlyFastPatchChanges = syncState.lastState !== null
       && hasOnlyFastPatchCompatibleChanges(world, contributors, syncState);
-    if (canUseFastPath) {
-      if (emitFastPatches(cmd, syncState, fastPatchState)) return;
+    // Apply epoch-tagged stream deltas to the local baseline before any required full projection.
+    // A mixed full diff can then carry unrelated durable changes without smuggling an untagged
+    // transient delta across a terminal fence.
+    const canApplyFastPatches = fastPatchState.patches.length > 0
+      && syncState.lastState !== null
+      && !hasResyncRequests;
+    const fastPatchesCoverAllMessageChanges = canApplyFastPatches
+      && doFastPatchesCoverAllComponentChanges(world, syncState, fastPatchState);
+    let didApplyFastPatches = false;
+    if (canApplyFastPatches) {
+      const fastPatchedState = emitFastPatches(world, cmd, syncState, fastPatchState);
+      if (fastPatchedState) {
+        syncState = fastPatchedState;
+        didApplyFastPatches = true;
+        if (shouldDeferFullSync && !fastPatchState.requireFullSync && hasOnlyFastPatchChanges && fastPatchesCoverAllMessageChanges) {
+          cmd.setResource(ClientSyncStateKey, syncState);
+          cmd.setResource(ClientSyncFastPatchStateKey, {
+            patches: [],
+            deferFullSync: fastPatchState.deferFullSync,
+            requireFullSync: false
+          });
+          return;
+        }
+      }
     }
 
-    if (shouldDeferFullSync && !fastPatchState.requireFullSync && !hasResyncRequests && fastPatchState.patches.length === 0 && canSkipFullSyncForActiveStream(world, contributors, syncState)) {
+    if (shouldDeferFullSync
+      && !fastPatchState.requireFullSync
+      && !hasResyncRequests
+      && fastPatchState.patches.length === 0
+      && fastPatchedComponentVersionsAreCurrent(world, syncState)
+      && hasOnlyFastPatchCompatibleChanges(world, contributors, syncState)) {
       if (didReleaseStreamStates) cmd.setResource(ClientSyncStateKey, syncState);
       return;
     }
@@ -99,7 +132,7 @@ export const ClientSyncSystem = defineSystem({
     }
 
     if (!sourceChanged && !hasResyncRequests) {
-      if (didReleaseStreamStates) cmd.setResource(ClientSyncStateKey, syncState);
+      if (didReleaseStreamStates || didApplyFastPatches) cmd.setResource(ClientSyncStateKey, syncState);
       clearFastPatchStateIfNeeded(cmd, fastPatchState);
       return;
     }
@@ -127,7 +160,7 @@ export const ClientSyncSystem = defineSystem({
       if (!requested && !existing) continue;
       const next = conversationClientState(nextFull, conversationId);
       if (requested || !existing?.lastState) {
-        streams[streamId] = emitSnapshot(cmd, streamId, existing, next);
+        streams[streamId] = emitSnapshot(cmd, streamId, existing, next, committedConversationHeads[conversationId]);
         didUpdateStreams = true;
         continue;
       }
@@ -144,6 +177,7 @@ export const ClientSyncSystem = defineSystem({
         projectionClock: projection.projectionClock,
         contributorStates: projection.contributorStates,
         dirtyConversationResourceVersion: nextDirtyConversationResourceVersion,
+        fastPatchedComponentVersions: currentFastPatchComponentVersions(world),
         streams
       });
     }
@@ -168,17 +202,79 @@ function releaseUnusedStreamStates(
   return { ...state, streams };
 }
 
-function canSkipFullSyncForActiveStream(world: WorldReader, contributors: readonly ClientStateContributor[], syncState: ClientSyncState): boolean {
-  if (!syncState.lastState) return false;
-  return contributors.every((contributor) => {
-    const previousClock = syncState.contributorStates[contributor.key]?.clock;
-    const nextClock = contributorClock(world, contributor);
-    return previousClock === nextClock;
-  });
+export function shouldRunClientSync(world: WorldReader, events: ReadonlyArray<WorldEvent>): boolean {
+  if (events.some((event) => event.type === ClientSyncEventType.Resync || event.type === ClientSyncEventType.StreamsReleased)) return true;
+  const registry = world.tryGetResource(ClientStateContributorsKey);
+  const syncState = world.tryGetResource(ClientSyncStateKey);
+  const fastPatchState = world.tryGetResource(ClientSyncFastPatchStateKey);
+  if (!registry || !syncState || !fastPatchState || syncState.lastState === null) return true;
+  if (fastPatchState.patches.length > 0 || fastPatchState.requireFullSync) return true;
+
+  const contributors = registry.list();
+  const hasActiveLlmRequests = world.query(LlmRequest).length > 0;
+  if (fastPatchState.deferFullSync) {
+    if (!hasActiveLlmRequests) return true;
+    // Message clock 在快路径期间故意落后；只要其他 projection source 没变，就无需再跑一个空 pass。
+    if (fastPatchedComponentVersionsAreCurrent(world, syncState)
+      && hasOnlyFastPatchCompatibleChanges(world, contributors, syncState)) return false;
+  }
+
+  return contributors.some((contributor) =>
+    syncState.contributorStates[contributor.key]?.clock !== contributorClock(world, contributor)
+  );
+}
+
+function currentFastPatchComponentVersions(world: WorldReader): Readonly<Record<string, number>> {
+  return Object.fromEntries(FAST_PATCH_COMPONENTS.map((component) => [component.name, world.componentVersion(component)]));
+}
+
+function fastPatchedComponentVersionsAreCurrent(world: WorldReader, syncState: ClientSyncState): boolean {
+  const versions = syncState.fastPatchedComponentVersions;
+  return !!versions && FAST_PATCH_COMPONENTS.every((component) => versions[component.name] === world.componentVersion(component));
+}
+
+function fastPatchComponentName(patch: ClientPatchOp): string | undefined {
+  if (isMessageFastPatch(patch)) return Message.name;
+  if (patch.kind === 'toolCallPreview.upsert' || patch.kind === 'toolCallPreview.remove') return ToolCallPreview.name;
+  if (patch.kind === 'toolCallPreviewTargetLink.upsert' || patch.kind === 'toolCallPreviewTargetLink.remove') return ToolCallPreviewTargetLink.name;
+  return undefined;
+}
+
+function fastPatchRecordId(patch: ClientPatchOp): string {
+  if ('id' in patch && typeof patch.id === 'string') return patch.id;
+  if (patch.kind === 'toolCallPreview.upsert') return patch.preview.id;
+  if (patch.kind === 'toolCallPreviewTargetLink.upsert') return patch.link.id;
+  return '';
+}
+
+function doFastPatchesCoverAllComponentChanges(
+  world: WorldReader,
+  syncState: ClientSyncState,
+  fastPatchState: ClientSyncFastPatchState
+): boolean {
+  const baselineVersions = syncState.fastPatchedComponentVersions;
+  if (!baselineVersions) return false;
+  const changedIds = new Map<string, Set<string>>();
+  for (const batch of fastPatchState.patches) {
+    for (const patch of batch.patches) {
+      const componentName = fastPatchComponentName(patch);
+      if (!componentName) return false;
+      const ids = changedIds.get(componentName) ?? new Set<string>();
+      ids.add(fastPatchRecordId(patch));
+      changedIds.set(componentName, ids);
+    }
+  }
+  for (const component of FAST_PATCH_COMPONENTS) {
+    const baselineVersion = baselineVersions[component.name];
+    if (baselineVersion === undefined) return false;
+    const changedVersions = world.componentVersion(component) - baselineVersion;
+    if (changedVersions < 0 || changedVersions > (changedIds.get(component.name)?.size ?? 0)) return false;
+  }
+  return true;
 }
 
 /**
- * 流式快路径只能吞掉 Message 文本/思考增量。
+ * 流式快路径只能吞掉已显式登记的 Message 文本/思考增量与 ToolCallPreview 变化。
  * 任一其他 component/resource 同轮发生变化（例如另一对话新建消息、Run、Conversation）时，
  * 必须立即走 full projection，不能因为某个对话持续吐 token 而让其他对话饥饿。
  */
@@ -187,26 +283,32 @@ function hasOnlyFastPatchCompatibleChanges(
   contributors: readonly ClientStateContributor[],
   syncState: ClientSyncState
 ): boolean {
-  const messageClockPrefix = `c:${Message.name}:`;
+  const ignoredClockPrefixes = FAST_PATCH_COMPONENTS.map((component) => `c:${component.name}:`);
   for (const contributor of contributors) {
     const previousClock = syncState.contributorStates[contributor.key]?.clock;
     if (previousClock === undefined) return false;
     const nextClock = contributorClock(world, contributor);
-    if (clockWithoutPrefix(previousClock, messageClockPrefix) !== clockWithoutPrefix(nextClock, messageClockPrefix)) return false;
+    if (clockWithoutPrefixes(previousClock, ignoredClockPrefixes) !== clockWithoutPrefixes(nextClock, ignoredClockPrefixes)) return false;
   }
   return true;
 }
 
-function clockWithoutPrefix(clock: string, prefix: string): string {
+function clockWithoutPrefixes(clock: string, prefixes: readonly string[]): string {
   return clock
     .split('|')
-    .filter((part) => !part.startsWith(prefix))
+    .filter((part) => !prefixes.some((prefix) => part.startsWith(prefix)))
     .join('|');
 }
 
-function emitSnapshot(cmd: { effect(effect: unknown): void }, streamId: string, current: ClientStreamState | undefined, state: ClientState): ClientStreamState {
+function emitSnapshot(
+  cmd: { effect(effect: unknown): void },
+  streamId: string,
+  current: ClientStreamState | undefined,
+  state: ClientState,
+  conversationHead?: import('../../../../shared/conversationReliability').CommittedConversationHead
+): ClientStreamState {
   const stream = nextStreamSnapshot(current, state);
-  cmd.effect({ kind: 'client.snapshot', streamId, streamSeq: stream.streamSeq, state });
+  cmd.effect({ kind: 'client.snapshot', streamId, streamSeq: stream.streamSeq, state, ...(conversationHead ? { conversationHead } : {}) });
   return stream;
 }
 
@@ -226,77 +328,119 @@ function emitPatchIfChanged(
 }
 
 function emitFastPatches(
-  cmd: { effect(effect: unknown): void; setResource<T>(key: { readonly id: symbol; readonly name: string; readonly __t?: T }, value: T): void },
-  syncState: { lastState: ClientState | null; projectionClock: string; contributorStates: Record<string, unknown>; dirtyConversationResourceVersion: number; streams: Record<string, ClientStreamState> },
+  world: WorldReader,
+  cmd: { effect(effect: unknown): void },
+  syncState: ClientSyncState,
   fastPatchState: ClientSyncFastPatchState
-): boolean {
-  if (!syncState.lastState) return false;
+): ClientSyncState | undefined {
+  if (!syncState.lastState) return undefined;
   const batches = mergeFastPatchBatches(fastPatchState.patches);
   const allPatches = batches.flatMap((batch) => batch.patches);
-  const nextFull = applyMessageFastPatches(syncState.lastState, allPatches);
-  if (!nextFull) return false;
+  const nextFull = applyFastPatches(syncState.lastState, allPatches);
+  if (!nextFull) return undefined;
 
   const streams: Record<string, ClientStreamState> = { ...syncState.streams };
-  const emitted: Array<{ streamId: string; streamSeq: number; patches: readonly ClientPatchOp[] }> = [];
+  const emitted: Array<{
+    streamId: string;
+    streamSeq: number;
+    patches: readonly ClientPatchOp[];
+    transientStreamEpoch?: TransientStreamEpoch;
+  }> = [];
 
   for (const batch of batches) {
     const existing = streams[batch.streamId];
     if (!existing) continue;
-    if (!existing.lastState) return false;
-    const nextStreamState = applyMessageFastPatches(existing.lastState, batch.patches);
-    if (!nextStreamState) return false;
+    if (!existing.lastState) return undefined;
+    const nextStreamState = applyFastPatches(existing.lastState, batch.patches);
+    if (!nextStreamState) return undefined;
     const stream: ClientStreamState = { streamSeq: existing.streamSeq + 1, lastState: nextStreamState };
     streams[batch.streamId] = stream;
-    emitted.push({ streamId: batch.streamId, streamSeq: stream.streamSeq, patches: batch.patches });
+    emitted.push({
+      streamId: batch.streamId,
+      streamSeq: stream.streamSeq,
+      patches: batch.patches,
+      ...(batch.transientStreamEpoch ? { transientStreamEpoch: batch.transientStreamEpoch } : {})
+    });
   }
-
-  cmd.setResource(ClientSyncStateKey, {
-    lastState: nextFull,
-    projectionClock: syncState.projectionClock,
-    contributorStates: syncState.contributorStates as never,
-    dirtyConversationResourceVersion: syncState.dirtyConversationResourceVersion,
-    streams
-  });
-  cmd.setResource(ClientSyncFastPatchStateKey, {
-    patches: [],
-    deferFullSync: fastPatchState.deferFullSync,
-    requireFullSync: false
-  });
 
   for (const item of emitted) {
-    cmd.effect({ kind: 'client.patch', streamId: item.streamId, streamSeq: item.streamSeq, patches: item.patches });
+    cmd.effect({
+      kind: 'client.patch',
+      streamId: item.streamId,
+      streamSeq: item.streamSeq,
+      patches: item.patches,
+      ...(item.transientStreamEpoch ? { transientStreamEpoch: item.transientStreamEpoch } : {})
+    });
   }
-  return true;
+  return {
+    lastState: nextFull,
+    projectionClock: syncState.projectionClock,
+    contributorStates: syncState.contributorStates,
+    dirtyConversationResourceVersion: syncState.dirtyConversationResourceVersion,
+    fastPatchedComponentVersions: currentFastPatchComponentVersions(world),
+    streams
+  };
 }
 
-function mergeFastPatchBatches(batches: ClientSyncFastPatchState['patches']): Array<{ streamId: string; patches: readonly ClientPatchOp[] }> {
-  const byStreamId = new Map<string, ClientPatchOp[]>();
-  for (const batch of batches) {
-    const patches = byStreamId.get(batch.streamId) ?? [];
-    patches.push(...batch.patches);
-    byStreamId.set(batch.streamId, patches);
-  }
-  return [...byStreamId.entries()].map(([streamId, patches]) => ({ streamId, patches }));
-}
-
-function applyMessageFastPatches(state: ClientState, patches: readonly ClientPatchOp[]): ClientState | undefined {
+function applyFastPatches(state: ClientState, patches: readonly ClientPatchOp[]): ClientState | undefined {
   let nextMessages: MessageRecord[] | undefined;
-  const indexById = new Map(state.messages.map((message, index) => [message.id, index]));
+  let nextPreviews: ToolCallPreviewRecord[] | undefined;
+  let nextPreviewLinks: ToolCallPreviewTargetLinkRecord[] | undefined;
+  const messageIndexById = new Map(state.messages.map((message, index) => [message.id, index]));
 
   for (const patch of patches) {
-    if (!isMessageFastPatch(patch)) return undefined;
-    const index = indexById.get(patch.id);
-    if (index === undefined) return undefined;
-    const messages = nextMessages ?? state.messages;
-    const message = messages[index];
-    if (!message) return undefined;
-    const nextMessage = applyMessageFastPatch(message, patch);
-    if (!nextMessage) return undefined;
-    nextMessages ??= [...state.messages];
-    nextMessages[index] = nextMessage;
+    if (isMessageFastPatch(patch)) {
+      const index = messageIndexById.get(patch.id);
+      if (index === undefined) return undefined;
+      const messages = nextMessages ?? state.messages;
+      const message = messages[index];
+      if (!message) return undefined;
+      const nextMessage = applyMessageFastPatch(message, patch);
+      if (!nextMessage) return undefined;
+      nextMessages ??= [...state.messages];
+      nextMessages[index] = nextMessage;
+      continue;
+    }
+
+    if (patch.kind === 'toolCallPreview.upsert') {
+      nextPreviews = upsertFastPatchRecord(nextPreviews ?? state.toolCallPreviews, patch.preview);
+      continue;
+    }
+    if (patch.kind === 'toolCallPreview.remove') {
+      nextPreviews = removeFastPatchRecord(nextPreviews ?? state.toolCallPreviews, patch.id);
+      continue;
+    }
+    if (patch.kind === 'toolCallPreviewTargetLink.upsert') {
+      nextPreviewLinks = upsertFastPatchRecord(nextPreviewLinks ?? state.toolCallPreviewTargetLinks, patch.link);
+      continue;
+    }
+    if (patch.kind === 'toolCallPreviewTargetLink.remove') {
+      nextPreviewLinks = removeFastPatchRecord(nextPreviewLinks ?? state.toolCallPreviewTargetLinks, patch.id);
+      continue;
+    }
+    return undefined;
   }
 
-  return nextMessages ? { ...state, messages: nextMessages } : state;
+  return nextMessages || nextPreviews || nextPreviewLinks
+    ? {
+        ...state,
+        ...(nextMessages ? { messages: nextMessages } : {}),
+        ...(nextPreviews ? { toolCallPreviews: nextPreviews } : {}),
+        ...(nextPreviewLinks ? { toolCallPreviewTargetLinks: nextPreviewLinks } : {})
+      }
+    : state;
+}
+
+function upsertFastPatchRecord<T extends { id: string }>(records: readonly T[], record: T): T[] {
+  const index = records.findIndex((candidate) => candidate.id === record.id);
+  if (index < 0) return [...records, clonePatchValue(record)];
+  const next = [...records];
+  next[index] = clonePatchValue(record);
+  return next;
+}
+
+function removeFastPatchRecord<T extends { id: string }>(records: readonly T[], id: string): T[] {
+  return records.filter((record) => record.id !== id);
 }
 
 type MessageFastPatch = Extract<ClientPatchOp, { kind: 'message.partText.append' | 'message.partThoughtElapsed.set' | 'message.part.insert' }>;
@@ -362,6 +506,9 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
   // 父对话的 Agent 面板需要解释关联子 Run 的 waiting_tool；仅补入这些 Run 当前仍活跃的工具详情。
   for (const toolCallId of collectRunDetailToolCallIds(state, runIds)) toolCallIds.add(toolCallId);
   const toolCalls = state.toolCalls.filter((toolCall) => toolCallIds.has(toolCall.id));
+  const toolCallResultLinks = state.toolCallResultLinks.filter((link) => toolCallIds.has(link.toolCallId));
+  const toolResultArtifactIds = new Set(toolCallResultLinks.map((link) => link.artifactId));
+  const toolCallPreviewState = conversationToolCallPreviewState(state, conversationId);
   const runPolicyIds = collectRunPolicyIds(state, runIds);
   const conversationProjectLinks = state.conversationProjectLinks.filter((link) => link.conversationId === conversationId);
   const projectContextIds = new Set(conversationProjectLinks.map((link) => link.projectContextId));
@@ -422,14 +569,15 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
     runLlmInvocationLinks: state.runLlmInvocationLinks.filter((link) => runIds.has(link.runId) || invocationIds.has(link.invocationId)),
     messageLlmInvocationLinks: state.messageLlmInvocationLinks.filter((link) => messageIds.has(link.messageId) || invocationIds.has(link.invocationId)),
     toolCalls,
+    toolCallPreviews: toolCallPreviewState.previews,
+    toolCallPreviewTargetLinks: toolCallPreviewState.links,
     toolCallEvents: state.toolCallEvents.filter((event) => toolCallIds.has(event.toolCallId)),
+    toolCallResultLinks,
+    toolResultArtifacts: state.toolResultArtifacts.filter((artifact) => toolResultArtifactIds.has(artifact.id)),
     agentRuns: state.agentRuns.filter((run) => runIds.has(run.id)),
     agentRunSourceLinks: state.agentRunSourceLinks.filter((link) => runIds.has(link.runId) || (link.sourceRunId !== undefined && runIds.has(link.sourceRunId))),
     agentRunTargetLinks: state.agentRunTargetLinks.filter((link) => runIds.has(link.runId)),
-    agentRunQueueOrders: state.agentRunQueueOrders.filter((order) => runIds.has(order.runId)),
-    agentRunQueueHolds: state.agentRunQueueHolds.filter((hold) => runIds.has(hold.runId)),
-    agentRunQueuedInputs: state.agentRunQueuedInputs.filter((input) => runIds.has(input.runId)),
-    messageRunLinks: state.messageRunLinks.filter((link) => runIds.has(link.runId) || messageIds.has(link.messageId)),
+    messageTurnLinks: state.messageTurnLinks.filter((link) => runIds.has(link.turnId) || messageIds.has(link.messageId)),
     toolCallRunLinks: state.toolCallRunLinks.filter((link) => toolCallIds.has(link.toolCallId)),
     runConversationPolicies: state.runConversationPolicies.filter((policy) => runPolicyIds.conversationPolicyIds.has(policy.id)),
     runContextPolicies: state.runContextPolicies.filter((policy) => runPolicyIds.contextPolicyIds.has(policy.id)),
@@ -449,6 +597,21 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
     runRuntimeContextSnapshotLinks,
     conversationWorkEnvironmentLinks,
     runWorkEnvironmentLinks
+  };
+}
+
+function conversationToolCallPreviewState(
+  state: ClientState,
+  conversationId: string
+): { previews: ToolCallPreviewRecord[]; links: ToolCallPreviewTargetLinkRecord[] } {
+  const previewsById = new Map(state.toolCallPreviews.map((preview) => [preview.id, preview]));
+  const links = state.toolCallPreviewTargetLinks.filter((link) =>
+    link.conversationId === conversationId && previewsById.has(link.previewId)
+  );
+  const previewIds = new Set(links.map((link) => link.previewId));
+  return {
+    previews: state.toolCallPreviews.filter((preview) => previewIds.has(preview.id)),
+    links
   };
 }
 
@@ -511,7 +674,7 @@ function collectConversationRunIds(state: ClientState, conversationId: string, m
         add(link.runId);
       }
     }
-    for (const link of state.messageRunLinks) if (messageIds.has(link.messageId) || runIds.has(link.runId)) add(link.runId);
+    for (const link of state.messageTurnLinks) if (messageIds.has(link.messageId) || runIds.has(link.turnId)) add(link.turnId);
     for (const link of state.toolCallRunLinks) if (toolCallIds.has(link.toolCallId) || runIds.has(link.runId)) add(link.runId);
   }
   return runIds;

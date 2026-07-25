@@ -7,6 +7,7 @@ import type {
   ConversationOriginLinkRecord,
   OpenConversationPanelRecord
 } from '@shared/protocol';
+import { createMessageId } from '@shared/protocol';
 import { displayConversationTitle as formatConversationTitle } from '@shared/conversationTitle';
 import {
   buildConversationHistoryForest,
@@ -52,6 +53,10 @@ const SCOPE_PAGE_SIZE = 3;
 const view = ref<SidebarView>('history');
 const entries = ref<SidebarConversationHistoryEntry[]>([]);
 const originLinks = ref<ConversationOriginLinkRecord[]>([]);
+const deletingConversationIds = ref<Set<string>>(new Set());
+const removedConversationIds = ref<Set<string>>(new Set());
+const abortingConversationIds = ref<Set<string>>(new Set());
+const operationNotice = ref<{ text: string; kind: 'info' | 'error' }>();
 const expandedConversationIds = ref<Set<string>>(new Set());
 const projectFolders = ref<ProjectFolderCandidateRecord[]>([]);
 const activeScopeKind = ref<SidebarHistoryScopeKind>('currentProject');
@@ -64,12 +69,16 @@ const renameTarget = ref<SidebarConversationHistoryEntry>();
 const deleteTarget = ref<SidebarConversationHistoryEntry>();
 const abortTarget = ref<SidebarConversationHistoryEntry>();
 const historyList = ref<HTMLElement | null>(null);
-const historyForest = computed(() => buildConversationHistoryForest(entries.value, originLinks.value));
+const visibleEntries = computed(() => entries.value.filter((entry) =>
+  !deletingConversationIds.value.has(entry.id) && !removedConversationIds.value.has(entry.id)
+));
+const historyForest = computed(() => buildConversationHistoryForest(visibleEntries.value, originLinks.value));
 const originLinkByConversationId = computed(() => selectConversationOriginLinks(originLinks.value));
 const visibleHistoryNodes = computed(() => flattenVisibleHistoryNodes(historyForest.value, expandedConversationIds.value));
-const historyScrollbarRefreshKey = computed(() => `${entries.value.length}:${visibleHistoryNodes.value.length}`);
+const historyScrollbarRefreshKey = computed(() => `${visibleEntries.value.length}:${visibleHistoryNodes.value.length}`);
 const historyCountText = computed(() => {
-  const total = pageInfo.value?.total ?? entries.value.length;
+  const hiddenPendingDeletes = entries.value.length - visibleEntries.value.length;
+  const total = Math.max(0, (pageInfo.value?.total ?? entries.value.length) - hiddenPendingDeletes);
   const page = pageInfo.value ? `第 ${pageInfo.value.pageIndex + 1} 页` : '当前页';
   return `${total} 个对话 · ${page}`;
 });
@@ -152,9 +161,26 @@ const abortConfirmActions: ConfirmPanelAction[] = [
 let disposeMessages: (() => void) | undefined;
 let currentHistoryPageIdentity = '';
 let autoExpandedActiveConversationId: string | undefined;
+let operationNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 
 onMounted(() => {
   disposeMessages = onSidebarMessage((message) => {
+    if (message.type === SIDEBAR_MESSAGE.conversationOperationResult) {
+      setConversationOperationPending(message.operation, message.conversationId, false);
+      if (message.operation === 'delete' && message.ok) {
+        const next = new Set(removedConversationIds.value);
+        next.add(message.conversationId);
+        removedConversationIds.value = next;
+      }
+      const text = message.message
+        ?? (message.operation === 'delete'
+          ? '对话已删除。'
+          : message.status === 'already_satisfied'
+            ? '目标任务已经结束，无需再次终止。'
+            : '后台任务已终止。');
+      showOperationNotice(text, message.ok ? 'info' : 'error');
+      return;
+    }
     if (message.type !== SIDEBAR_MESSAGE.state) return;
     const nextScopeKind = message.activeScopeKind ?? activeScopeKind.value;
     const nextPageIdentity = historyPageIdentity(message.history);
@@ -179,6 +205,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   disposeMessages?.();
+  if (operationNoticeTimer !== undefined) clearTimeout(operationNoticeTimer);
 });
 
 function setView(next: SidebarView): void {
@@ -273,6 +300,7 @@ function confirmDeleteConversation(): void {
   const target = deleteTarget.value;
   deleteTarget.value = undefined;
   if (!target) return;
+  setConversationOperationPending('delete', target.id, true);
   postSidebarMessage({ type: SIDEBAR_MESSAGE.deleteConversation, conversationId: target.id });
 }
 
@@ -288,7 +316,12 @@ function confirmAbortConversation(): void {
   const target = abortTarget.value;
   abortTarget.value = undefined;
   if (!target) return;
-  postSidebarMessage({ type: SIDEBAR_MESSAGE.abortConversation, conversationId: target.id });
+  setConversationOperationPending('abort', target.id, true);
+  postSidebarMessage({
+    type: SIDEBAR_MESSAGE.abortConversation,
+    conversationId: target.id,
+    requestId: createMessageId()
+  });
 }
 
 function closeAbortDialog(): void {
@@ -323,17 +356,42 @@ function onHistoryItemKeydown(event: KeyboardEvent, node: VisibleHistoryTreeNode
 function statusClass(entry: SidebarConversationHistoryEntry): string {
   if (entry.isRunning) return 'status-running';
   if (entry.status === 'streaming') return 'status-streaming';
-  if (entry.status === 'complete') return 'status-complete';
-  if (entry.status === 'error') return 'status-error';
+  if (entry.status === 'final') return 'status-final';
+  if (entry.status === 'partial') return 'status-partial';
   return 'status-empty';
 }
 
 function statusText(entry: SidebarConversationHistoryEntry): string {
-  if (entry.isRunning) return `后台任务：${entry.runStatusLabel || '执行中'}`;
-  if (entry.status === 'streaming') return '正在响应';
-  if (entry.status === 'complete') return '已完成';
-  if (entry.status === 'error') return '出现错误';
-  return '暂无消息';
+  if (abortingConversationIds.value.has(entry.id)) return '正在终止后台任务';
+  const childAgentConversation = originLinkByConversationId.value.get(entry.id)?.originKind === 'agent';
+  if (entry.isRunning) return childAgentConversation
+    ? `子代理：${entry.runStatusLabel || '运行中'}`
+    : `后台任务：${entry.runStatusLabel || '执行中'}`;
+  if (entry.status === 'streaming') return childAgentConversation ? '子代理正在响应' : '正在响应';
+  if (entry.status === 'final') return childAgentConversation ? '子代理已完成' : '已完成';
+  if (entry.status === 'partial') return childAgentConversation ? '子代理回复未完成' : '回复未完成';
+  return childAgentConversation ? '子代理尚未开始' : '暂无消息';
+}
+
+function isConversationOperationPending(entry: SidebarConversationHistoryEntry): boolean {
+  return deletingConversationIds.value.has(entry.id) || abortingConversationIds.value.has(entry.id);
+}
+
+function setConversationOperationPending(operation: 'delete' | 'abort', conversationId: string, pending: boolean): void {
+  const source = operation === 'delete' ? deletingConversationIds : abortingConversationIds;
+  const next = new Set(source.value);
+  if (pending) next.add(conversationId);
+  else next.delete(conversationId);
+  source.value = next;
+}
+
+function showOperationNotice(text: string, kind: 'info' | 'error'): void {
+  operationNotice.value = { text, kind };
+  if (operationNoticeTimer !== undefined) clearTimeout(operationNoticeTimer);
+  operationNoticeTimer = setTimeout(() => {
+    operationNotice.value = undefined;
+    operationNoticeTimer = undefined;
+  }, kind === 'error' ? 5000 : 2600);
 }
 
 function historyMeta(entry: SidebarConversationHistoryEntry): string {
@@ -548,6 +606,10 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
         </div>
       </div>
 
+      <div v-if="operationNotice" class="operation-notice" :class="`is-${operationNotice.kind}`" role="status">
+        {{ operationNotice.text }}
+      </div>
+
       <div class="history-list-shell">
         <div ref="historyList" class="history-list" role="tree" aria-label="分级对话历史">
           <div
@@ -605,28 +667,28 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
               <div class="history-preview" :class="{ 'is-pending': node.entry.previewState === 'pending', 'is-empty': node.entry.previewState === 'empty' }">{{ node.entry.preview || '暂无消息，点击继续对话。' }}</div>
               <div class="history-meta">
                 <span>{{ historyMeta(node.entry) }}</span>
-                <span v-if="node.entry.isRunning" class="run-badge" :aria-label="`后台任务：${node.entry.runStatusLabel || '执行中'}`">
+                <span v-if="node.entry.isRunning" class="run-badge" :aria-label="statusText(node.entry)">
                   <span class="run-badge-dot" aria-hidden="true"></span>
-                  <span>{{ node.entry.runStatusLabel || '执行中' }}</span>
+                  <span>{{ abortingConversationIds.has(node.entry.id) ? '正在终止' : (node.entry.runStatusLabel || '执行中') }}</span>
                 </span>
               </div>
             </div>
             <div class="history-actions" @click.stop @keydown.stop>
-              <button type="button" class="history-action-button" title="重命名对话标题" aria-label="重命名对话标题" @click="renameConversation(node.entry)">
+              <button type="button" class="history-action-button" title="重命名对话标题" aria-label="重命名对话标题" :disabled="isConversationOperationPending(node.entry)" @click="renameConversation(node.entry)">
                 <IconEdit class="history-action-icon" stroke="2" aria-hidden="true" />
               </button>
-              <button type="button" class="history-action-button" title="删除对话" aria-label="删除对话" @click="deleteConversation(node.entry)">
+              <button type="button" class="history-action-button" title="删除对话" aria-label="删除对话" :disabled="isConversationOperationPending(node.entry)" @click="deleteConversation(node.entry)">
                 <IconTrash class="history-action-icon" stroke="2" aria-hidden="true" />
               </button>
               <button
                 type="button"
                 class="history-action-button"
                 :class="{ 'is-hidden': !node.entry.isRunning }"
-                :disabled="!node.entry.isRunning"
+                :disabled="!node.entry.isRunning || isConversationOperationPending(node.entry)"
                 :aria-hidden="!node.entry.isRunning"
-                :tabindex="node.entry.isRunning ? 0 : -1"
-                title="终止后台任务"
-                aria-label="终止后台任务"
+                :tabindex="node.entry.isRunning && !isConversationOperationPending(node.entry) ? 0 : -1"
+                :title="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务' : '终止后台任务'"
+                :aria-label="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务' : '终止后台任务'"
                 @click="node.entry.isRunning && abortConversation(node.entry)"
               >
                 <IconPlayerStop class="history-action-icon" stroke="2" aria-hidden="true" />
@@ -641,7 +703,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
         />
       </div>
 
-      <div v-if="!entries.length" class="empty-state">
+      <div v-if="!visibleEntries.length" class="empty-state">
         <p class="empty-state-title">暂无对话历史</p>
         <p class="empty-state-desc">点击“新对话”创建一个独立会话空间。</p>
       </div>

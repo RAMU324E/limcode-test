@@ -2,12 +2,14 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
-import { ASK_USER_TOOL_NAME, type AgentRecord, type InlineDataPart, type LlmProviderConfigRecord, type LlmProviderModelRecord, type MessageContent, type WorkEnvironmentRecord } from '@shared/protocol';
+import type { AgentRecord, InlineDataPart, LlmProviderConfigRecord, LlmProviderModelRecord, MessageContent, WorkEnvironmentRecord } from '@shared/protocol';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useConversationSettingsStore } from '@webview/stores/useConversationSettingsStore';
 import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
+import { useConversationCommandStore } from '@webview/stores/useConversationCommandStore';
+import { useSessionStore } from '@webview/stores/useSessionStore';
 import { DEFAULT_WORKFLOW_OPTION_ID, useWorkflowStore } from '@webview/stores/useWorkflowStore';
 import { useWorkEnvironmentStore } from '@webview/stores/useWorkEnvironmentStore';
 import { useAgentStore } from '@webview/stores/useAgentStore';
@@ -21,8 +23,10 @@ import SettingsDropdown, { type SettingsDropdownOption } from '@webview/componen
 import SettingsSelectableList, { type SettingsSelectableListItem } from '@webview/components/settings/global/SettingsSelectableList.vue';
 import ContextTokenUsageBar from '@webview/components/conversation/ContextTokenUsageBar.vue';
 import AgentRunPanel from '@webview/components/input/AgentRunPanel.vue';
+import ReliabilityCommandPanel from '@webview/components/input/ReliabilityCommandPanel.vue';
 import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 
 const props = withDefaults(
   defineProps<{
@@ -47,7 +51,17 @@ const modelProfileStore = useModelProfileStore();
 const workEnvironmentStore = useWorkEnvironmentStore();
 const compression = useCompression();
 const ui = useConversationUiStore();
-const { abortCurrentConversation, removeQueueRun, promoteQueueRun, reorderQueue, pauseQueueRun, resumeQueueRun, resumeAllQueueRuns } = useChat();
+const commands = useConversationCommandStore();
+const session = useSessionStore();
+const {
+  interruptCurrentConversation,
+  cancelTurnIntent,
+  promoteTurnIntent,
+  reorderTurnIntents,
+  pauseTurnIntent,
+  resumeTurnIntent,
+  resumeAllTurnIntents
+} = useChat();
 const highlighted = ref(false);
 const editorExpanded = ref(false);
 const editor = ref<{ focus: () => void } | null>(null);
@@ -66,20 +80,24 @@ const draft = computed({
   get: () => ui.composerDraft,
   set: (next: string) => ui.setComposerDraft(next)
 });
-const hasPendingAskUser = computed(() => conversationTimeline.currentTimeline.state.toolCalls.some(
-  (call) => call.name === ASK_USER_TOOL_NAME && call.status === 'awaiting_user_input'
-));
-const conversationInputDisabled = computed(() => props.disabled || hasPendingAskUser.value);
-const effectivePlaceholder = computed(() => hasPendingAskUser.value ? '请先回答上方问题' : props.placeholder);
+// Interaction 与普通输入是独立控制面：等待 AskUser/Plan 时，用户仍可创建排队 TurnIntent。
+const conversationInputDisabled = computed(() => props.disabled);
+const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
 const sendTitle = computed(() => {
-  if (hasPendingAskUser.value) return '请先回答上方问题';
   if (ui.isEditing) return '提交编辑';
-  return runSummary.value.isRunning ? '加入消息队列，下次 LLM 调用时合并发送' : '发送';
+  return runSummary.value.isRunning ? '加入消息队列（不会解除当前审批或等待）' : '发送';
 });
-const compacting = computed(() => conversationTimeline.currentCompressionBlocks.some((block) => block.status === 'pending' || block.status === 'running'));
-const compactTitle = computed(() => compacting.value ? '取消上下文压缩' : '压缩当前上下文');
+const compacting = compression.compressionActive;
+const compressionBusy = computed(() => compacting.value || compression.compressionRequestPending.value);
+const compactTitle = computed(() => compressionBusy.value ? '上下文压缩进行中（当前版本暂不支持取消）' : '压缩当前上下文');
 const runSummary = computed(() => clientState.currentRunSummary);
+const execution = computed(() => clientState.currentExecution);
+const interruptPending = computed(() => !!execution.value && commands.isTargetPending(
+  clientState.currentConversationId,
+  execution.value.turn.id,
+  'interrupt'
+));
 const channelOptions = computed<SettingsDropdownOption[]>(() =>
   globalSettings.llmProviderConfigs.configs.map((config) => {
     const model = selectedModelForConfig(config);
@@ -148,6 +166,49 @@ const activeChannelId = computed({
   },
   set: (configId: string) => selectChannel(configId)
 });
+const activeChannelConfig = computed(() => globalSettings.llmProviderConfigs.configs.find((config) => config.id === activeChannelId.value));
+const activeTransport = computed<'http' | 'websocket'>(() => {
+  const config = activeChannelConfig.value;
+  if (!config || config.provider !== 'openai-responses') return 'http';
+  const modelId = selectedModelForConfig(config);
+  const modelConfig = config.modelConfigs.find((candidate) => candidate.modelId === modelId);
+  return modelConfig?.openaiResponsesTransport ?? config.openaiResponsesTransport ?? 'http';
+});
+const runtimeTransportLabel = computed(() => activeTransport.value === 'websocket' ? 'WS' : 'HTTP');
+const runtimeReloadRequired = computed(() => session.status === 'ready' && (!session.runtime || session.runtime.reloadRequired));
+const runtimeBadgeLabel = computed(() => runtimeReloadRequired.value ? '重载' : runtimeTransportLabel.value);
+const runtimeDiagnosticRows = computed(() => {
+  const runtime = session.runtime;
+  const config = activeChannelConfig.value;
+  if (!runtime) {
+    return [
+      { label: '状态', value: '当前 Extension Host 未提供构建指纹，请执行 Developer: Reload Window' },
+      { label: '传输配置', value: `${runtimeTransportLabel.value} · ${config ? providerLabel(config.provider) : '未选择渠道'}` }
+    ];
+  }
+  return [
+    ...(runtime.reloadRequired
+      ? [{ label: '状态', value: '磁盘编译产物已变化，请执行 Developer: Reload Window' }]
+      : [{ label: '状态', value: '运行时代码与磁盘编译产物一致' }]),
+    { label: '传输配置', value: `${runtimeTransportLabel.value} · ${config ? providerLabel(config.provider) : '未选择渠道'}` },
+    { label: '模型', value: config ? selectedModelForConfig(config) || config.model : '—' },
+    { label: '扩展', value: `${runtime.extensionName} ${runtime.extensionVersion}` },
+    { label: 'Provider', value: runtime.providerVersion },
+    { label: 'WS 运行库', value: runtime.webSocketVersion },
+    { label: '代理运行库', value: runtime.proxyAgentVersion },
+    { label: 'WS 实现', value: runtime.wsImplementation },
+    { label: '已加载指纹', value: runtime.buildFingerprint },
+    ...(runtime.currentBuildFingerprint !== runtime.buildFingerprint
+      ? [{ label: '磁盘指纹', value: runtime.currentBuildFingerprint }]
+      : []),
+    { label: '进程实例', value: `${runtime.runtimeInstanceId.slice(0, 8)} · PID ${runtime.processId}` },
+    { label: '激活时间', value: new Date(runtime.activatedAt).toLocaleString() }
+  ];
+});
+const runtimeDiagnosticAriaLabel = computed(() => runtimeReloadRequired.value
+  ? 'Extension Host 代码已过期，需要重载；查看诊断'
+  : `当前传输 ${runtimeTransportLabel.value}，查看运行时诊断`);
+
 const activeWorkEnvironmentId = computed({
   get: () => workEnvironmentStore.activeEnvironmentForConversation(clientState.currentConversationId)?.id ?? workEnvironmentOptions.value[0]?.value ?? '',
   set: (workEnvironmentId: string) => selectWorkEnvironment(workEnvironmentId)
@@ -291,40 +352,40 @@ function onAttachmentWheel(event: WheelEvent): void {
   element.scrollLeft = Math.max(0, Math.min(maxScrollLeft, element.scrollLeft + rawDelta * unit));
 }
 
-function abortConversation(): void {
-  abortCurrentConversation();
+function interruptConversation(): void {
+  interruptCurrentConversation();
 }
 
 function onQueueEdit(item: QueueItem): void {
-  ui.startEditQueueItem(item.runId, item.text);
+  ui.startEditTurnIntent({ intentId: item.intentId, rowVersion: item.rowVersion }, item.text);
 }
 
-function onQueueDelete(runId: string): void {
-  removeQueueRun(runId);
+function onQueueDelete(item: QueueItem): void {
+  cancelTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
 }
 
-function onQueueForceSend(runId: string): void {
-  promoteQueueRun(runId);
+function onQueueForceSend(item: QueueItem): void {
+  promoteTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
 }
 
-function onQueueReorder(runIds: string[]): void {
-  reorderQueue(runIds);
+function onQueueReorder(items: QueueItem[]): void {
+  reorderTurnIntents(items.map((item) => ({ id: item.intentId, rowVersion: item.rowVersion })));
 }
 
-function onQueuePause(runId: string): void {
-  pauseQueueRun(runId);
+function onQueuePause(item: QueueItem): void {
+  pauseTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
 }
 
-function onQueueResume(runId: string): void {
-  resumeQueueRun(runId);
+function onQueueResume(item: QueueItem): void {
+  resumeTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
 }
 
 function onQueueResumeAll(): void {
-  resumeAllQueueRuns();
+  resumeAllTurnIntents();
 }
 
 function compactConversation(): void {
-  if (conversationInputDisabled.value) return;
+  if (conversationInputDisabled.value || compressionBusy.value) return;
   compression.createCompression();
 }
 
@@ -557,6 +618,7 @@ function middleEllipsis(value: string, maxLength: number): string {
   <div class="composer" :class="{ 'is-editing': ui.isEditing, 'is-highlighted': highlighted, 'is-editor-expanded': editorExpanded }">
     <div class="composer-zone composer-zone-top" aria-label="输入框上方功能区">
       <div class="composer-top-main">
+        <ReliabilityCommandPanel />
         <AskUserTopPanel />
         <QueuePanel
           @edit="onQueueEdit"
@@ -571,7 +633,7 @@ function middleEllipsis(value: string, maxLength: number): string {
           <span class="composer-edit-indicator-icon" aria-hidden="true">
             <IconPencilExclamation stroke="2" />
           </span>
-          <span class="composer-edit-text">{{ ui.editingQueueRunId ? '正在编辑排队消息，发送后替换原排队消息。' : '正在编辑消息，发送前需要确认。' }}</span>
+          <span class="composer-edit-text">{{ ui.editingTurnIntent ? '正在编辑排队消息，发送后创建新的不可变 Revision。' : '正在编辑消息，发送前需要确认。' }}</span>
           <button type="button" class="composer-edit-cancel" @click="ui.cancelEditMode">取消编辑</button>
         </div>
         <div v-if="selectedAttachments.length" class="composer-attachments-shell">
@@ -606,7 +668,7 @@ function middleEllipsis(value: string, maxLength: number): string {
           ref="editor"
           v-model="draft"
           class="composer-editor"
-          :placeholder="ui.isEditing ? (ui.editingQueueRunId ? '编辑排队消息内容...' : '编辑消息内容...') : effectivePlaceholder"
+          :placeholder="ui.isEditing ? (ui.editingTurnIntent ? '编辑排队消息内容...' : '编辑消息内容...') : effectivePlaceholder"
           :disabled="conversationInputDisabled"
           :rows="5"
           @submit="submit"
@@ -678,12 +740,13 @@ function middleEllipsis(value: string, maxLength: number): string {
           <IconPaperclip class="composer-side-action-icon" stroke="2" aria-hidden="true" />
         </button>
         <button
-          v-if="runSummary.isRunning"
+          v-if="execution"
           type="button"
           class="composer-side-action composer-side-abort"
           aria-label="终止当前对话正在执行的任务"
-          title="终止当前对话正在执行的任务"
-          @click="abortConversation"
+          :title="interruptPending ? '正在提交身份围栏中断请求' : '中断当前 Turn（后台进程保持独立运行）'"
+          :disabled="interruptPending"
+          @click="interruptConversation"
         >
           <IconPlayerStop class="composer-side-action-icon" stroke="2" aria-hidden="true" />
         </button>
@@ -784,17 +847,33 @@ function middleEllipsis(value: string, maxLength: number): string {
           />
         </template>
       </div>
+      <HoverTooltipPanel
+        v-if="session.status === 'ready'"
+        class="composer-runtime-tooltip"
+        panel-title="运行时与传输"
+        :rows="runtimeDiagnosticRows"
+        :delay-ms="180"
+      >
+        <button
+          type="button"
+          class="composer-runtime-badge"
+          :class="{ 'is-websocket': activeTransport === 'websocket', 'is-reload-required': runtimeReloadRequired }"
+          :aria-label="runtimeDiagnosticAriaLabel"
+        >
+          {{ runtimeBadgeLabel }}
+        </button>
+      </HoverTooltipPanel>
       <ContextTokenUsageBar class="composer-token-usage" />
       <button
         type="button"
         class="composer-compact"
-        :class="{ 'is-compacting': compacting }"
-        :disabled="conversationInputDisabled || (!compacting && conversationTimeline.currentMessages.length < 2)"
-        aria-label="压缩上下文"
+        :class="{ 'is-compacting': compressionBusy }"
+        :disabled="conversationInputDisabled || compressionBusy || conversationTimeline.currentTotalMessages < 2"
+        :aria-label="compactTitle"
         :title="compactTitle"
         @click="compactConversation"
       >
-        <svg class="composer-compact-icon" :class="{ 'is-compacting': compacting }" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+        <svg class="composer-compact-icon" :class="{ 'is-compacting': compressionBusy }" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
           <path class="composer-compact-icon-top" d="M5 5h14l-7 6z" />
           <path class="composer-compact-icon-bottom" d="M5 19h14l-7 -6z" />
         </svg>
@@ -1274,6 +1353,45 @@ function middleEllipsis(value: string, maxLength: number): string {
 
 .composer-meta-dropdown :deep(.settings-dropdown-caret) {
   color: currentColor;
+}
+
+.composer-runtime-tooltip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--space-1);
+}
+
+.composer-runtime-badge {
+  min-width: 34px;
+  min-height: 22px;
+  padding: 1px 6px;
+  border: 1px solid var(--vscode-panel-border, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  font: inherit;
+  font-size: var(--font-size-xs);
+  line-height: 1;
+  letter-spacing: 0.03em;
+}
+
+.composer-runtime-badge.is-websocket {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-descriptionForeground);
+}
+
+.composer-runtime-badge.is-reload-required {
+  color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+  border-color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
+.composer-runtime-badge:hover,
+.composer-runtime-badge:focus-visible {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-foreground);
+  background: var(--vscode-list-hoverBackground, transparent);
+  outline: none;
 }
 
 .composer-token-usage {

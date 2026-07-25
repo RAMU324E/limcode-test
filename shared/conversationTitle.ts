@@ -1,4 +1,5 @@
-import type { MessageContent, MsgRole } from './protocol';
+import type { MessageContent, MessagePresentation, MsgRole } from './protocol';
+import { isInternalMessage } from './messagePresentation';
 
 export const DEFAULT_CONVERSATION_ID = 'default';
 export const DEFAULT_CONVERSATION_TITLE = '新对话';
@@ -8,6 +9,7 @@ export const DEFAULT_CONVERSATION_TITLE_MAX_LENGTH = 28;
 
 export interface ConversationTitleMessage {
   role: MsgRole;
+  presentation?: MessagePresentation;
   content: MessageContent;
   seq?: number;
   createdAt?: number;
@@ -27,7 +29,7 @@ export function displayConversationTitle(input: DisplayConversationTitleInput): 
   const generatedIdTitle = isGeneratedConversationId(explicitTitle, input.id);
   if (explicitTitle && !placeholderTitle && !generatedIdTitle) return truncateConversationTitle(explicitTitle, maxLength);
 
-  const firstUserMessage = input.messages?.find((message) => message.role === 'user');
+  const firstUserMessage = input.messages?.find((message) => message.role === 'user' && !isInternalMessage(message));
   const titleFromMessage = firstUserMessage ? normalizeConversationTitleText(conversationTitleTextPreview(firstUserMessage.content)) : '';
   if (titleFromMessage) return truncateConversationTitle(titleFromMessage, maxLength);
 
@@ -49,13 +51,6 @@ export function createNewConversationTitle(now = new Date()): string {
   const second = pad2(now.getSeconds());
   const millisecond = now.getMilliseconds().toString().padStart(3, '0');
   return `${GENERATED_CONVERSATION_TITLE_PREFIX}${year}${month}${day}-${hour}${minute}${second}-${millisecond}`;
-}
-
-export function conversationCreatedAtFromId(conversationId: string | undefined): number | undefined {
-  const normalized = conversationId?.startsWith('conversation-') ? conversationId.slice('conversation-'.length) : conversationId;
-  const encodedTimestamp = normalized?.split('-')[0];
-  const timestamp = encodedTimestamp ? Number.parseInt(encodedTimestamp, 36) : Number.NaN;
-  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : undefined;
 }
 
 function conversationTitleTextPreview(content: MessageContent): string {

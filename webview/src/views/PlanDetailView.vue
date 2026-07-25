@@ -3,18 +3,24 @@ import { computed, ref } from 'vue';
 import { IconClipboardList, IconExternalLink } from '@tabler/icons-vue';
 import { submitPlanOutputFromResult, submitPlanRequestFromArgs } from '@shared/planReview';
 import { SUBMIT_PLAN_TOOL_NAME, type SubmitPlanToolRequestRecord, type ToolCallRecord } from '@shared/protocol';
+import { interactionForTool } from '@webview/domain/interactionProjection';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
+import { toolResultForState, useToolResultArtifactStore, type ToolResultState } from '@webview/stores/useToolResultArtifactStore';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import PlanProposalContent from '@webview/components/plan/PlanProposalContent.vue';
 
 const session = useSessionStore();
 const clientState = useClientStateStore();
+const toolResults = useToolResultArtifactStore();
 const scroller = ref<HTMLElement | null>(null);
 
 const planProposalId = computed(() => session.planProposalId || proposalIdFromToolCall(toolCallById(session.toolCallId)) || '');
 const proposal = computed(() => clientState.planProposals.find((item) => item.id === planProposalId.value));
 const toolCall = computed(() => toolCallById(session.toolCallId) ?? toolCallForProposal(planProposalId.value));
+const toolResult = computed(() => toolCall.value
+  ? toolResultForState(clientState.$state as unknown as ToolResultState, toolCall.value.id, toolResults.loadedByArtifactId)
+  : undefined);
 const request = computed<SubmitPlanToolRequestRecord | undefined>(() => {
   const fromToolCall = submitPlanRequestFromArgs(toolCall.value?.args);
   if (fromToolCall) return fromToolCall;
@@ -26,11 +32,12 @@ const request = computed<SubmitPlanToolRequestRecord | undefined>(() => {
   };
 });
 const loaded = computed(() => clientState.currentConversationDetailLoaded);
+const planInteraction = computed(() => interactionForTool(clientState, toolCall.value?.id, 'plan_review'));
 const title = computed(() => {
   if (proposal.value?.status === 'approved') return 'Plan 已批准';
   if (proposal.value?.status === 'change_requested') return 'Plan 要求修改';
   if (proposal.value?.status === 'rejected') return 'Plan 已拒绝';
-  if (toolCall.value?.status === 'awaiting_user_input') return '等待审批 Plan';
+  if (planInteraction.value?.request.state === 'pending') return '等待审批 Plan';
   return 'Plan 详情';
 });
 const subtitle = computed(() => [
@@ -58,7 +65,11 @@ function toolCallForProposal(proposalId: string): ToolCallRecord | undefined {
 
 function proposalIdFromToolCall(call: ToolCallRecord | undefined): string | undefined {
   if (!call || call.name !== SUBMIT_PLAN_TOOL_NAME) return undefined;
-  const outputProposalId = submitPlanOutputFromResult(call.result)?.proposalId;
+  const outputProposalId = submitPlanOutputFromResult(toolResultForState(
+    clientState.$state as unknown as ToolResultState,
+    call.id,
+    toolResults.loadedByArtifactId
+  ))?.proposalId;
   if (outputProposalId) return outputProposalId;
   const progress = call.progress;
   if (!progress || typeof progress !== 'object' || Array.isArray(progress)) return undefined;
@@ -92,6 +103,7 @@ function proposalIdFromToolCall(call: ToolCallRecord | undefined): string | unde
           :request="request"
           :proposal-id="planProposalId || undefined"
           :tool-call="toolCall"
+          :result="toolResult"
           layout="full"
         />
         <div v-else class="plan-detail-empty">

@@ -35,8 +35,9 @@ export interface ActivityTimelineRowInput {
   id: string;
   conversationId: string;
   runId?: string;
-  hiddenMessageId?: string;
   activityKind: 'preparing';
+  /** Transient phase label derived from the authoritative Run projection; never persisted. */
+  label?: string;
 }
 
 export interface ActivityViewRow extends ActivityTimelineRowInput {
@@ -55,6 +56,11 @@ export interface EditingMessageState {
   message: MessageRecord;
   deleteCount: number;
   originalText: string;
+}
+
+export interface EditingTurnIntentState {
+  intentId: string;
+  rowVersion: number;
 }
 
 export type LlmErrorBlockStatus = 'retrying' | 'cancelled' | 'resolved' | 'failed';
@@ -116,7 +122,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
   const composerMode = ref<ComposerMode>('chat');
   const composerHighlightKey = ref(0);
   const editingMessage = shallowRef<EditingMessageState>();
-  const editingQueueRunId = ref<string | undefined>(undefined);
+  const editingTurnIntent = shallowRef<EditingTurnIntentState>();
   const editConfirmOpen = ref(false);
   const pendingEditText = ref('');
 
@@ -156,20 +162,16 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
       totalMessageCount
     };
 
-    const hiddenMessageIds = new Set(activityRows.map((row) => row.hiddenMessageId).filter((id): id is string => !!id));
     const currentIds = new Set(messages.map((message) => message.id));
-    const activeIds = new Set([...currentIds, ...hiddenMessageIds]);
     pruneErrorBlocks(currentIds);
     for (const id of [...enterTimers.keys()]) {
-      if (!activeIds.has(id)) clearEntering(id);
+      if (!currentIds.has(id)) clearEntering(id);
     }
 
     if (!initializedMessages) {
       for (const message of messages) seenMessageIds.add(message.id);
-      for (const id of hiddenMessageIds) seenMessageIds.add(id);
       initializedMessages = true;
     } else {
-      for (const id of hiddenMessageIds) seenMessageIds.add(id);
       for (const message of messages) {
         if (seenMessageIds.has(message.id)) continue;
         // 新消息一出现就标记进入态。AI/model 消息通常会先以「streaming + 空内容」占位创建，
@@ -265,16 +267,16 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
 
   function cancelEditMode(): void {
     editingMessage.value = undefined;
-    editingQueueRunId.value = undefined;
+    editingTurnIntent.value = undefined;
     pendingEditText.value = '';
     editConfirmOpen.value = false;
     composerMode.value = 'chat';
     composerSnapshots.value.edit = createComposerSnapshot();
   }
 
-  function startEditQueueItem(runId: string, messageText: string): void {
+  function startEditTurnIntent(intent: EditingTurnIntentState, messageText: string): void {
     editingMessage.value = undefined;
-    editingQueueRunId.value = runId;
+    editingTurnIntent.value = { ...intent };
     pendingEditText.value = '';
     editConfirmOpen.value = false;
     composerMode.value = 'edit';
@@ -405,7 +407,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     composerHighlightKey,
     composerDraft,
     editingMessage,
-    editingQueueRunId,
+    editingTurnIntent,
     editConfirmOpen,
     pendingEditText,
     isEditing,
@@ -414,7 +416,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     toggleCheckpointMarker,
     playExitFrom,
     startEditMessage,
-    startEditQueueItem,
+    startEditTurnIntent,
     cancelEditMode,
     setComposerDraft,
     clearChatDraft,

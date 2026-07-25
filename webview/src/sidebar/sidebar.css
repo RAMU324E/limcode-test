@@ -316,6 +316,22 @@ button {
   border-color: var(--line);
 }
 
+.operation-notice {
+  flex: 0 0 auto;
+  margin: 7px 10px 0;
+  padding: 6px 8px;
+  border-left: 2px solid var(--vscode-testing-iconPassed, var(--vscode-foreground));
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-sideBar-background) 90%, var(--vscode-foreground) 10%);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.operation-notice.is-error {
+  border-left-color: var(--vscode-testing-iconFailed, var(--vscode-errorForeground));
+  color: var(--vscode-errorForeground);
+}
+
 .history-list-shell {
   position: relative;
   flex: 1 1 0;
@@ -596,13 +612,13 @@ button {
   opacity: 1;
 }
 
-.status-complete {
+.status-final {
   background: var(--vscode-testing-iconPassed);
   opacity: 1;
 }
 
-.status-error {
-  background: var(--vscode-testing-iconFailed);
+.status-partial {
+  background: var(--vscode-descriptionForeground);
   opacity: 1;
 }
 
@@ -718,6 +734,12 @@ button {
   background: transparent;
   border-color: transparent;
   outline: none;
+}
+
+.history-action-button:disabled {
+  opacity: 0.42;
+  cursor: default;
+  transform: none;
 }
 
 .history-action-button.is-hidden {

@@ -1,7 +1,7 @@
 import type { WorldPlugin } from '../plugin';
 import { ClientStateContributorRegistry } from './contributors';
 import { emptyDirtyConversationState } from './dirtyConversations';
-import { ClientStateContributorsKey, ClientStateDirtyConversationIdsKey, ClientSyncFastPatchStateKey, ClientSyncStateKey } from './resources';
+import { ClientStateContributorsKey, ClientStateDirtyConversationIdsKey, ClientSyncFastPatchStateKey, ClientSyncStateKey, CommittedConversationHeadsKey } from './resources';
 
 export function clientSyncPlugin(): WorldPlugin {
   return {
@@ -21,6 +21,7 @@ export function clientSyncPlugin(): WorldPlugin {
         requireFullSync: false
       });
       ctx.world.setResource(ClientStateDirtyConversationIdsKey, emptyDirtyConversationState());
+      ctx.world.setResource(CommittedConversationHeadsKey, {});
     }
   };
 }

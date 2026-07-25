@@ -4,8 +4,10 @@ import { IconArrowsMaximize, IconArrowsMinimize, IconClipboardList, IconCircleCh
 import { renderPlanMarkdown } from '@shared/planMarkdown';
 import { DELEGATED_PLAN_APPROVAL_MESSAGE, submitPlanOutputFromResult } from '@shared/planReview';
 import type { AgentRecord, PlanProposalRecord, PlanProposalStatus, SubmitPlanToolRequestRecord, ToolCallRecord } from '@shared/protocol';
+import { interactionForTool } from '@webview/domain/interactionProjection';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
+import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import TextPartView from '@webview/components/content/parts/TextPartView.vue';
@@ -20,6 +22,7 @@ const props = withDefaults(defineProps<{
   request: SubmitPlanToolRequestRecord;
   proposalId?: string;
   toolCall?: ToolCallRecord;
+  result?: unknown;
   layout?: 'embedded' | 'full';
 }>(), {
   layout: 'embedded'
@@ -34,6 +37,7 @@ const MAX_PLAN_FEEDBACK_LENGTH = 4_000;
 const attrs = useAttrs();
 const clientState = useClientStateStore();
 const agentStore = useAgentStore();
+const interactions = useInteractionStore();
 const submitting = ref<undefined | 'approve-current' | 'approve-new' | 'changes' | 'reject'>(undefined);
 const changeFeedbackOpen = ref(false);
 const dispatchPanelOpen = ref(false);
@@ -42,14 +46,27 @@ const changeFeedbackText = ref('');
 const changeFeedbackInput = ref<HTMLTextAreaElement | null>(null);
 const planScroller = ref<HTMLElement | null>(null);
 const panelExpanded = ref(false);
-const output = computed(() => submitPlanOutputFromResult(props.toolCall?.result));
+const output = computed(() => submitPlanOutputFromResult(props.result));
 const proposal = computed<PlanProposalRecord | undefined>(() => {
   const id = props.proposalId ?? output.value?.proposalId;
   if (!id) return undefined;
   return clientState.planProposals.find((item) => item.id === id);
 });
-const status = computed<PlanProposalStatus>(() => output.value?.status ?? proposal.value?.status ?? (props.toolCall?.status === 'awaiting_user_input' ? 'pending' : 'pending'));
-const pending = computed(() => props.toolCall?.status === 'awaiting_user_input' && status.value === 'pending');
+const interaction = computed(() => interactionForTool(clientState, props.toolCall?.id, 'plan_review'));
+const interactionStatus = computed<PlanProposalStatus | undefined>(() => {
+  const target = interaction.value;
+  if (!target) return undefined;
+  if (target.request.state === 'pending') return 'pending';
+  const response = clientState.interactionResponses.find((candidate) =>
+    candidate.interactionRequestId === target.request.id
+    && candidate.interactionRevision === target.request.revision);
+  if (!response) return target.request.state === 'cancelled' ? 'rejected' : undefined;
+  if (response.decision === 'accept') return 'approved';
+  if (response.decision === 'submit') return 'change_requested';
+  return 'rejected';
+});
+const status = computed<PlanProposalStatus>(() => output.value?.status ?? interactionStatus.value ?? proposal.value?.status ?? 'pending');
+const pending = computed(() => interaction.value?.request.state === 'pending');
 const planBody = computed(() => props.request.plan || proposal.value?.body || '');
 const taskListOperation = computed(() => props.request.taskList ?? proposal.value?.taskList);
 const taskListItems = computed(() => taskListOperation.value ? taskListDisplayItemsFromOperation(taskListOperation.value) : []);
@@ -123,7 +140,7 @@ watch(
 );
 
 watch(
-  () => `${props.toolCall?.id ?? ''}:${props.toolCall?.status ?? ''}:${status.value}`,
+  () => `${props.toolCall?.id ?? ''}:${interaction.value?.request.id ?? ''}:${interaction.value?.request.revision ?? 0}:${interaction.value?.request.state ?? 'missing'}:${status.value}`,
   () => {
     if (!pending.value) {
       submitting.value = undefined;
@@ -133,6 +150,13 @@ watch(
     }
   },
   { immediate: true }
+);
+
+watch(
+  () => interaction.value ? interactions.isPending(interaction.value.request.id) : false,
+  (active, previous) => {
+    if (previous && !active && pending.value) submitting.value = undefined;
+  }
 );
 
 function approveInCurrentConversation(): void {
@@ -164,47 +188,40 @@ function confirmDispatch(): void {
 }
 
 function submitApproval(target: 'current_conversation' | 'new_conversation', agentType?: string): void {
-  const toolCallId = props.toolCall?.id;
+  const interactionTarget = interaction.value;
   const planProposalId = props.proposalId ?? output.value?.proposalId;
-  if (!toolCallId || !planProposalId || !pending.value || submitting.value) return;
-  const conversationId = clientState.currentConversationId.trim();
+  if (!interactionTarget || !planProposalId || !pending.value || submitting.value) return;
   if (target === 'new_conversation') {
     const normalizedAgentType = agentType?.trim();
     if (!normalizedAgentType) return;
-    submitting.value = 'approve-new';
-    bridge.request(BridgeMessageType.PlanProposalApprove, {
-      toolCallId,
+    const accepted = interactions.resolve(interactionTarget, 'accept', {
       planProposalId,
-      ...(conversationId ? { conversationId } : {}),
       message: DELEGATED_PLAN_APPROVAL_MESSAGE,
       executionTarget: 'new_conversation',
       agentType: normalizedAgentType
     });
+    if (accepted) submitting.value = 'approve-new';
     return;
   }
 
-  submitting.value = 'approve-current';
-  bridge.request(BridgeMessageType.PlanProposalApprove, {
-    toolCallId,
+  const accepted = interactions.resolve(interactionTarget, 'accept', {
     planProposalId,
-    ...(conversationId ? { conversationId } : {}),
     message: defaultMessageForDecision('approve'),
     executionTarget: 'current_conversation'
   });
+  if (accepted) submitting.value = 'approve-current';
 }
 
 function decide(kind: 'changes' | 'reject', message = defaultMessageForDecision(kind)): void {
-  const toolCallId = props.toolCall?.id;
+  const interactionTarget = interaction.value;
   const planProposalId = props.proposalId ?? output.value?.proposalId;
-  if (!toolCallId || !planProposalId || !pending.value || submitting.value) return;
+  if (!interactionTarget || !planProposalId || !pending.value || submitting.value) return;
   const userMessage = message.trim() || defaultMessageForDecision(kind);
-  submitting.value = kind;
-  bridge.request(messageTypeForDecision(kind), {
-    toolCallId,
+  const accepted = interactions.resolve(interactionTarget, kind === 'changes' ? 'submit' : 'reject', {
     planProposalId,
-    ...(clientState.currentConversationId ? { conversationId: clientState.currentConversationId } : {}),
     message: userMessage
   });
+  if (accepted) submitting.value = kind;
 }
 
 function openChangeFeedback(): void {
@@ -230,12 +247,6 @@ function submitChangeFeedback(): void {
     return;
   }
   decide('changes', changeFeedbackText.value.trim() || defaultMessageForDecision('changes'));
-}
-
-function messageTypeForDecision(kind: 'changes' | 'reject'):
-  | BridgeMessageType.PlanProposalRequestChanges
-  | BridgeMessageType.PlanProposalReject {
-  return kind === 'changes' ? BridgeMessageType.PlanProposalRequestChanges : BridgeMessageType.PlanProposalReject;
 }
 
 function defaultMessageForDecision(kind: 'approve' | 'changes' | 'reject'): string {

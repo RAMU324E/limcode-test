@@ -1,5 +1,5 @@
 import { onBeforeUnmount, watch } from 'vue';
-import { GLOBAL_SETTINGS_SECTIONS, conversationClientStateStreamId, type BridgeScope, type GlobalSettingsSection } from '@shared/protocol';
+import { GLOBAL_SETTINGS_SECTIONS, conversationClientStateStreamId, conversationIdFromClientStateStreamId, type BridgeScope, type ClientPatchOp, type GlobalSettingsSection } from '@shared/protocol';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
@@ -10,6 +10,10 @@ import { useConversationTimelineStore } from '@webview/stores/useConversationTim
 import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
 import { useSystemPromptStore } from '@webview/stores/useSystemPromptStore';
 import { useRuntimeContextStore } from '@webview/stores/useRuntimeContextStore';
+import { useConversationCommandStore } from '@webview/stores/useConversationCommandStore';
+import { useInteractionStore } from '@webview/stores/useInteractionStore';
+import { useToolResultArtifactStore } from '@webview/stores/useToolResultArtifactStore';
+import { settleCompressionRequestsFromPatch, takeCompressionRequestError } from './compressionRequestState';
 
 /**
  * 在 App 根组件挂载时调用一次：集中注册所有入站桥接监听并接入对应 store，
@@ -26,6 +30,18 @@ function globalSettingsSectionFromScope(scope: BridgeScope | undefined): GlobalS
 
 function logCompressionClientDebug(stage: string, payload: Record<string, unknown>): void {
   console.info('[LimCode][Compression][Webview]', stage, payload);
+}
+
+function compressionCommandLabel(requestType: string): string {
+  switch (requestType) {
+    case BridgeMessageType.CompressionCreate: return '创建上下文压缩';
+    case BridgeMessageType.CompressionDelete: return '删除压缩记录';
+    case BridgeMessageType.CompressionUpdate: return '更新压缩记录';
+    case BridgeMessageType.CompressionRegenerate: return '重新生成上下文压缩';
+    case BridgeMessageType.CompressionDisable: return '禁用压缩记录';
+    case BridgeMessageType.CompressionEnable: return '启用压缩记录';
+    default: return '上下文压缩操作';
+  }
 }
 
 function compressionSnapshotDebug(state: { compressionBlocks?: Array<{ id: string; status: string; error?: string; sourceHash?: string; anchorSeq?: number; endSeq?: number; methodKind?: string }>; compressionBlockLlmInvocationLinks?: Array<{ blockId: string; invocationId: string }>; llmInvocations?: Array<{ id: string; status: string; error?: string }> }): Record<string, unknown> | undefined {
@@ -86,8 +102,17 @@ export function useBridgeBootstrap(): void {
   const conversationUi = useConversationUiStore();
   const systemPromptStore = useSystemPromptStore();
   const runtimeContextStore = useRuntimeContextStore();
+  const conversationCommands = useConversationCommandStore();
+  const interactions = useInteractionStore();
+  const toolResults = useToolResultArtifactStore();
 
   const disposers: Array<() => void> = [];
+  watch(
+    () => clientState.interactionRequests.map((request) => `${request.id}:${request.revision}:${request.state}`).join('|'),
+    () => interactions.reconcile(clientState.interactionRequests),
+    { immediate: true }
+  );
+  let pendingCommandsResumed = false;
   const requestedConversationStreams = new Set<string>();
 
   function ensureConversationStream(conversationId: string): void {
@@ -112,7 +137,12 @@ export function useBridgeBootstrap(): void {
 
   disposers.push(
     bridge.on(BridgeMessageType.Hello, (message) => {
-      session.applyHello(message.payload?.meta);
+      session.applyHello(message.payload?.meta, message.payload?.runtime);
+      if (message.payload?.runtime) console.info('[LimCode][Runtime]', { ...message.payload.runtime });
+      if (!pendingCommandsResumed) {
+        pendingCommandsResumed = true;
+        conversationCommands.resumePending();
+      }
       if (session.viewKind === 'globalSettings') {
         globalSettings.requestAll();
         return;
@@ -141,6 +171,7 @@ export function useBridgeBootstrap(): void {
       if (debug) logCompressionClientDebug('clientSnapshot.received', { streamId: message.payload.streamId, streamSeq: message.payload.streamSeq, ...debug });
       clientState.applyClientSnapshot(message.payload.streamId, message.payload.streamSeq, message.payload.state);
       conversationTimeline.applyClientStateSnapshot(message.payload.streamId, message.payload.streamSeq, message.payload.state);
+      conversationCommands.observeClientSnapshot(message.payload);
       systemPromptStore.reconcilePendingSave();
       runtimeContextStore.reconcilePendingSave();
       if (debug) logCompressionClientDebug('clientSnapshot.applied', { streamId: message.payload.streamId, streamSeq: message.payload.streamSeq });
@@ -150,6 +181,24 @@ export function useBridgeBootstrap(): void {
   disposers.push(
     bridge.on(BridgeMessageType.ClientPatch, (message) => {
       if (!message.payload) return;
+      const epoch = message.payload.transientStreamEpoch;
+      if (epoch && conversationCommands.isStreamEpochTerminal(epoch.requestId, epoch.attemptId, epoch.generation)) {
+        const conversationId = conversationIdFromClientStateStreamId(message.payload.streamId);
+        console.warn('[LimCode][Reliability]', {
+          kind: 'late_stream_patch_dropped',
+          timestamp: Date.now(),
+          ...(conversationId ? { conversationId } : {}),
+          requestId: epoch.requestId,
+          attemptId: epoch.attemptId,
+          generation: epoch.generation,
+          streamSeq: epoch.streamSeq,
+          phase: 'frontend_transient_patch_admission',
+          reasonCode: 'terminal_stream_epoch'
+        });
+        if (conversationId) conversationCommands.resyncConversation(conversationId);
+        else bridge.request(BridgeMessageType.ClientResync, { streamId: message.payload.streamId });
+        return;
+      }
       const debug = compressionPatchDebug(message.payload.patches);
       if (debug) logCompressionClientDebug('clientPatch.received', { streamId: message.payload.streamId, streamSeq: message.payload.streamSeq, ...debug });
       const applied = clientState.applyClientPatch(
@@ -166,6 +215,57 @@ export function useBridgeBootstrap(): void {
       if (!applied) {
         if (debug) logCompressionClientDebug('clientPatch.resync', { streamId: message.payload.streamId, streamSeq: message.payload.streamSeq });
         resync();
+      }
+    })
+  );
+
+  disposers.push(
+    bridge.on(BridgeMessageType.CommandReceipt, (message) => {
+      if (message.payload) conversationCommands.applyTransportReceipt(message.payload.commandId);
+    })
+  );
+
+  disposers.push(
+    bridge.on(BridgeMessageType.CommandResult, (message) => {
+      if (message.payload) conversationCommands.applyCommandResult(message.payload);
+    })
+  );
+
+  disposers.push(
+    bridge.on(BridgeMessageType.InteractionResult, (message) => {
+      if (!message.payload) return;
+      interactions.applyResult(message.payload, message.correlationId);
+      conversationCommands.applyInteractionResult(message.payload, message.correlationId);
+    })
+  );
+
+  disposers.push(
+    bridge.on(BridgeMessageType.CommandStatusResult, (message) => {
+      if (message.payload) conversationCommands.applyStatusResult(message.payload, message.correlationId);
+    })
+  );
+
+  disposers.push(
+    bridge.on(BridgeMessageType.ConversationHeadSnapshot, (message) => {
+      if (message.payload) conversationCommands.applyHeadSnapshot(message.payload);
+    })
+  );
+
+  disposers.push(
+    bridge.on(BridgeMessageType.ConversationCommittedPatch, (message) => {
+      const payload = message.payload;
+      if (!payload) return;
+      settleCompressionRequestsFromPatch(payload);
+      if (!conversationCommands.applyCommittedPatch(payload)) return;
+      const patches = payload.operations as unknown as ClientPatchOp[];
+      try {
+        const stateApplied = clientState.applyCommittedConversationPatch(payload.streamId, patches);
+        const timelineApplied = conversationTimeline.applyCommittedConversationPatch(payload.streamId, patches);
+        if (!stateApplied || !timelineApplied) throw new Error(`Committed patch uses an invalid conversation stream: ${payload.streamId}`);
+        conversationCommands.confirmCommittedPatch(payload);
+      } catch (error) {
+        console.error('[LimCode][Reliability] Failed to apply committed conversation patch.', error);
+        conversationCommands.resyncConversation(payload.conversationId);
       }
     })
   );
@@ -214,11 +314,31 @@ export function useBridgeBootstrap(): void {
 
   disposers.push(
     bridge.on(BridgeMessageType.LlmTransientNotice, (message) => {
-      if (message.payload) conversationUi.applyLlmTransientNotice(message.payload);
+      const payload = message.payload;
+      if (!payload) return;
+      const epoch = payload.transientStreamEpoch;
+      if (epoch && conversationCommands.isStreamEpochTerminal(epoch.requestId, epoch.attemptId, epoch.generation)) {
+        console.warn('[LimCode][Reliability]', {
+          kind: 'late_stream_notice_dropped',
+          timestamp: Date.now(),
+          conversationId: payload.conversationId,
+          requestId: epoch.requestId,
+          attemptId: epoch.attemptId,
+          generation: epoch.generation,
+          streamSeq: epoch.streamSeq,
+          phase: 'frontend_transient_notice_admission',
+          reasonCode: 'terminal_stream_epoch'
+        });
+        return;
+      }
+      conversationUi.applyLlmTransientNotice(payload);
     })
   );
 
   disposers.push(
+    bridge.on(BridgeMessageType.ToolResultArtifactSnapshot, (message) => {
+      if (message.payload) toolResults.applySnapshot(message.payload);
+    }),
     bridge.on(BridgeMessageType.LlmProviderModelsSnapshot, (message) => {
       if (message.payload) globalSettings.applyLlmProviderModelsSnapshot(message.payload);
     })
@@ -226,6 +346,24 @@ export function useBridgeBootstrap(): void {
 
   disposers.push(
     bridge.on(BridgeMessageType.Error, (message) => {
+      if (message.payload?.requestType === BridgeMessageType.ToolResultArtifactGet
+        && toolResults.applyRequestError(message.correlationId, message.payload.message)) return;
+      const failedCompressionRequest = takeCompressionRequestError(message.correlationId, message.payload?.requestType);
+      if (failedCompressionRequest && message.payload) {
+        logCompressionClientDebug('command.error', {
+          requestId: failedCompressionRequest.requestId,
+          requestType: failedCompressionRequest.requestType,
+          conversationId: failedCompressionRequest.conversationId,
+          message: message.payload.message
+        });
+        conversationCommands.resyncConversation(failedCompressionRequest.conversationId);
+        if (failedCompressionRequest.conversationId === clientState.currentConversationId) {
+          bridge.request(BridgeMessageType.ShowInfo, {
+            message: `${compressionCommandLabel(failedCompressionRequest.requestType)}失败：${message.payload.message}`
+          });
+        }
+        return;
+      }
       if (
         message.payload?.requestType === BridgeMessageType.GlobalSettingsGet
         || message.payload?.requestType === BridgeMessageType.GlobalSettingsUpdate
@@ -251,6 +389,7 @@ export function useBridgeBootstrap(): void {
         if ((session.viewKind !== 'chat' && session.viewKind !== 'planDetail') || !conversationId) return;
         conversationTimeline.setCurrentConversation(conversationId);
         ensureConversationStream(conversationId);
+        conversationCommands.requestHead(conversationId);
         if (session.viewKind === 'chat' && conversationTimeline.ensureTimeline(conversationId).pageInfo === undefined) {
           conversationTimeline.requestInitial(conversationId);
         }

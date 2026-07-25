@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import WorkflowSettingsPanel from '@webview/components/settings/WorkflowSettingsPanel.vue';
+import { EXTENSION_BRAND } from '@shared/extensionIdentity';
 </script>
 
 <template>
   <div class="workflow-settings-view">
     <header class="view-header">
-      <span class="view-title">LimCode 工作流编辑</span>
+      <span class="view-title">{{ EXTENSION_BRAND }} 工作流编辑</span>
       <span class="view-hint">查看和编辑内置工作流、用户工作流的原始数据。</span>
     </header>
     <div class="view-body">

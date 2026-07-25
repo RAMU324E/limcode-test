@@ -504,10 +504,10 @@ function statusLabel(status: TokenUsageMessageEntry['status']): string {
   switch (status) {
     case 'streaming':
       return '流式输出中';
-    case 'complete':
-      return '完成';
-    case 'error':
-      return '错误';
+    case 'final':
+      return '已完成';
+    case 'partial':
+      return '未完成';
   }
 }
 

@@ -6,10 +6,11 @@ import {
   isVisibleTextPart,
   type CheckpointRecord,
   type ClientState,
-  type LlmInvocationRecord,
-  type MessageContent,
-  type MessageRecord
+  type MessageContent
 } from '@shared/protocol';
+import { isInternalMessage } from '@shared/messagePresentation';
+import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
+import type { RunExecutionPhase } from '@shared/runLifecycle';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import { useConversationUiStore, type ActivityTimelineRowInput } from '@webview/stores/useConversationUiStore';
@@ -30,9 +31,9 @@ const conversationTimeline = useConversationTimelineStore();
 const conversationUi = useConversationUiStore();
 const checkpointStore = useCheckpointPolicyStore();
 const settings = useGlobalSettingsStore();
-const { currentConversationId } = storeToRefs(clientState);
+const currentConversationId = computed(() => clientState.currentConversationId);
 const { currentTimeline, currentMessages, currentAnchorMessages, currentCheckpoints, currentCheckpointTimelineAnchors, currentCompressionBlocks, currentMessageFloorById, currentTotalMessages } = storeToRefs(conversationTimeline);
-const { sendMessage, editMessage, updateQueueInput } = useChat();
+const { sendMessage, editMessage, updateTurnIntent } = useChat();
 
 const scroller = ref<HTMLElement | null>(null);
 const conversationBody = ref<HTMLElement | null>(null);
@@ -62,6 +63,7 @@ const timelineActivityRows = computed<ActivityTimelineRowInput[]>(() =>
 );
 const editRollbackPending = ref(false);
 const editRollbackCheckpoint = computed(() => {
+  if (!CHECKPOINT_FEATURE_ENABLED) return undefined;
   const editing = conversationUi.editingMessage;
   return editing ? checkpointBeforeMessageFloor(currentCheckpoints.value, currentCheckpointTimelineAnchors.value, editing.message.id) : undefined;
 });
@@ -193,8 +195,11 @@ function cancelInitialBottomScrollFrame(): void {
 }
 
 function onSubmit(text: string, content?: MessageContent): void {
-  if (conversationUi.editingQueueRunId) {
-    updateQueueInput(conversationUi.editingQueueRunId, text, content);
+  if (conversationUi.editingTurnIntent) {
+    updateTurnIntent({
+      id: conversationUi.editingTurnIntent.intentId,
+      rowVersion: conversationUi.editingTurnIntent.rowVersion
+    }, text, content);
     conversationUi.cancelEditMode();
     return;
   }
@@ -264,42 +269,48 @@ function truncatePreview(text: string): string {
 
 function buildPreparingActivityRows(state: ClientState, conversationId: string): ActivityTimelineRowInput[] {
   if (!conversationId) return [];
-  const rows = new Map<string, ActivityTimelineRowInput>();
-
-  for (const message of state.messages) {
-    if (message.conversationId !== conversationId || !isPreStartEmptyModelMessage(message, state)) continue;
-    const runId = runIdForModelMessage(message.id, state);
-    const key = runId ?? message.id;
-    rows.set(key, {
-      id: message.id,
-      conversationId,
-      ...(runId ? { runId } : {}),
-      hiddenMessageId: message.id,
-      activityKind: 'preparing'
-    });
-  }
-
   const runIds = new Set(state.agentRunTargetLinks
     .filter((link) => link.conversationId === conversationId)
     .map((link) => link.runId));
+  const internalMessageIds = new Set(state.messages.filter(isInternalMessage).map((message) => message.id));
+  const internalRunIds = new Set(state.agentRunSourceLinks
+    .filter((source) => !!source.sourceMessageId && internalMessageIds.has(source.sourceMessageId))
+    .map((source) => source.runId));
   const activeRuns = state.agentRuns
-    .filter((run) => runIds.has(run.id))
+    .filter((run) => runIds.has(run.id) && !internalRunIds.has(run.id))
     .filter((run) => run.status === 'preparing' || run.status === 'running')
     .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
 
-  for (const run of activeRuns) {
-    if (rows.has(run.id)) continue;
-    if (hasActiveToolWork(run.id, state)) continue;
-    if (hasVisibleStreamingModelMessage(run.id, state)) continue;
-    rows.set(run.id, {
-      id: `activity:preparing:${run.id}`,
-      conversationId,
-      runId: run.id,
-      activityKind: 'preparing'
+  return activeRuns
+    .filter((run) => !hasActiveToolWork(run.id, state) && !hasStreamingModelMessage(run.id, state))
+    .map((run) => {
+      const label = preparingActivityLabel(run.phase);
+      return {
+        id: `activity:preparing:${run.id}`,
+        conversationId,
+        runId: run.id,
+        activityKind: 'preparing' as const,
+        ...(label ? { label } : {})
+      };
     });
-  }
+}
 
-  return [...rows.values()];
+function preparingActivityLabel(phase: RunExecutionPhase | undefined): string | undefined {
+  switch (phase) {
+    case 'loading_context': return '正在加载上下文';
+    case 'waiting_compression': return '正在压缩上下文';
+    case 'resolving_invocation': return '正在解析模型配置';
+    case 'waiting_checkpoint_before_llm':
+    case 'waiting_checkpoint_after_llm': return '正在准备下一步';
+    case 'llm_request_pending': return '正在启动模型请求';
+    case 'llm_streaming': return '正在等待模型输出';
+    case 'waiting_tools': return '正在衔接工具结果';
+    case 'waiting_child_run': return '正在等待子 Agent';
+    case 'waiting_user': return '正在等待你的操作';
+    case 'waiting_plan_review': return '正在等待计划确认';
+    case 'delivering': return '正在交付 Agent 结果';
+    default: return undefined;
+  }
 }
 
 function hasActiveToolWork(runId: string, state: ClientState): boolean {
@@ -309,31 +320,18 @@ function hasActiveToolWork(runId: string, state: ClientState): boolean {
   return state.toolCalls.some((call) => toolCallIds.has(call.id) && !TERMINAL_TOOL_CALL_STATUSES.has(call.status));
 }
 
-function hasVisibleStreamingModelMessage(runId: string, state: ClientState): boolean {
-  const messageIds = new Set(state.messageRunLinks
-    .filter((link) => link.runId === runId && link.role === 'model')
+function hasStreamingModelMessage(runId: string, state: ClientState): boolean {
+  const messageIds = new Set<string>(state.messageTurnLinks
+    .filter((link) => link.turnId === runId && link.role === 'model')
     .map((link) => link.messageId));
-  return state.messages.some((message) => messageIds.has(message.id) && message.status === 'streaming' && !isPreStartEmptyModelMessage(message, state));
-}
-
-function runIdForModelMessage(messageId: string, state: ClientState): string | undefined {
-  return state.messageRunLinks.find((link) => link.messageId === messageId && link.role === 'model')?.runId
-    ?? state.messageRunLinks.find((link) => link.messageId === messageId)?.runId;
-}
-
-function isPreStartEmptyModelMessage(message: MessageRecord, state: ClientState): boolean {
-  if (message.role !== 'model' || message.status !== 'streaming' || message.content.parts.length > 0) return false;
-  const invocation = invocationForMessage(message.id, state);
-  return !!invocation && invocation.status !== 'streaming';
-}
-
-function invocationForMessage(messageId: string, state: ClientState): LlmInvocationRecord | undefined {
-  const link = state.messageLlmInvocationLinks.find((candidate) => candidate.messageId === messageId);
-  if (!link) return undefined;
-  return state.llmInvocations.find((invocation) => invocation.id === link.invocationId);
+  return state.messages.some((message) => messageIds.has(message.id) && message.status === 'streaming');
 }
 
 function syncCheckpointAutoDismiss(): void {
+  if (!CHECKPOINT_FEATURE_ENABLED) {
+    clearCheckpointAutoDismissTimers();
+    return;
+  }
   settings.ensureCheckpointMaintenance();
   if (!settings.loadedSections.checkpointMaintenance || !settings.checkpointMaintenance.autoDismissEnabled) {
     clearCheckpointAutoDismissTimers();
@@ -384,6 +382,7 @@ function clearCheckpointAutoDismissTimers(): void {
         <MessageList :empty-hint="emptyHint" :scroller="scroller" />
       </div>
       <ConversationTimelineMarkers
+        v-if="CHECKPOINT_FEATURE_ENABLED"
         :markers="conversationUi.checkpointMarkers"
         :scroller="scroller"
         @toggle="conversationUi.toggleCheckpointMarker"

@@ -9,6 +9,7 @@ import {
   type WebviewToExtensionMessage
 } from '../../shared/protocol';
 import { displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
+import { EXTENSION_AGENT_NAME, EXTENSION_BRAND, MAIN_PANEL_VIEW_TYPE, WEBVIEW_DEV_PORT } from '../../shared/extensionIdentity';
 import { getWebviewHtml } from '../webview/getWebviewHtml';
 import type { BackendApplication } from '../../backend/application/BackendApplication';
 
@@ -27,7 +28,7 @@ const PANEL_TAB_TITLE_MAX_DISPLAY_UNITS = 20;
 const PANEL_TAB_TITLE_ELLIPSIS = '...';
 
 export class MainPanel {
-  public static readonly viewType = 'limcode.mainPanel';
+  public static readonly viewType = MAIN_PANEL_VIEW_TYPE;
 
   private static readonly panels = new Map<string, MainPanel>();
   private static readonly conversationPanelStateEmitter = new vscode.EventEmitter<void>();
@@ -98,7 +99,7 @@ export class MainPanel {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'dist', 'webview')],
-      portMapping: [{ webviewPort: 31819, extensionHostPort: 31819 }]
+      portMapping: [{ webviewPort: WEBVIEW_DEV_PORT, extensionHostPort: WEBVIEW_DEV_PORT }]
     };
   }
 
@@ -204,7 +205,7 @@ export class MainPanel {
       .catch((error) => {
         console.warn('[LimCode] Failed to fork panel conversation.', error);
         const message = error instanceof Error ? error.message : '无法创建分支对话。';
-        void vscode.window.showErrorMessage(`LimCode: ${message}`);
+        void vscode.window.showErrorMessage(`${EXTENSION_BRAND}: ${message}`);
       });
   }
 
@@ -236,7 +237,7 @@ export class MainPanel {
   }
 
   private refreshTitleFromOutgoingMessage(message: WebviewToExtensionMessage): void {
-    if (message.type !== BridgeMessageType.ChatSend) return;
+    if (message.type !== BridgeMessageType.TurnStart) return;
     const payload = message.payload;
     if (!this.conversationId || !payload || payload.conversationId !== this.conversationId) return;
     if (!isDefaultConversationTitle(this.panel.title)) return;
@@ -251,9 +252,7 @@ export class MainPanel {
 
   public static closePanelsByConversationId(conversationId: string): void {
     for (const panel of [...MainPanel.panels.values()]) {
-      if (panel.kind === 'chat' && panel.conversationId === conversationId) {
-        panel.panel.dispose();
-      }
+      if (panel.conversationId === conversationId) panel.panel.dispose();
     }
   }
 
@@ -284,11 +283,11 @@ function panelKind(options: MainPanelOptions): MainPanelKind {
 }
 
 function panelTitle(options: MainPanelOptions, backendApp: BackendApplication): string {
-  if (options.kind === 'globalSettings') return 'LimCode 设置';
-  if (options.kind === 'workflowSettings') return 'LimCode 工作流编辑';
-  if (options.kind === 'agentSettings') return 'LimCode Agent 设置';
+  if (options.kind === 'globalSettings') return `${EXTENSION_BRAND} 设置`;
+  if (options.kind === 'workflowSettings') return `${EXTENSION_BRAND} 工作流编辑`;
+  if (options.kind === 'agentSettings') return `${EXTENSION_AGENT_NAME} 设置`;
   if (options.kind === 'planDetail') return panelTabTitle(options.title?.trim() || 'Plan 详情');
-  if (!options.conversationId) return panelTabTitle('LimCode');
+  if (!options.conversationId) return panelTabTitle(EXTENSION_BRAND);
   const title = options.title
     ? displayConversationTitle({ id: options.conversationId, title: options.title })
     : backendApp.getConversationDisplayTitle(options.conversationId);
@@ -296,7 +295,7 @@ function panelTitle(options: MainPanelOptions, backendApp: BackendApplication): 
 }
 
 function isDefaultConversationTitle(title: string): boolean {
-  return title === '新对话' || title === '默认对话' || title === 'LimCode' || title.startsWith('LimCode: ');
+  return title === '新对话' || title === '默认对话' || title === EXTENSION_BRAND || title.startsWith(`${EXTENSION_BRAND}: `);
 }
 
 function optionsFromSerializedState(state: unknown, fallbackTitle: string): MainPanelOptions {
@@ -306,15 +305,15 @@ function optionsFromSerializedState(state: unknown, fallbackTitle: string): Main
   const isGlobalSettings =
     serializedKind === 'globalSettings' ||
     meta?.kind === 'globalSettings' ||
-    fallbackTitle === 'LimCode 设置';
+    fallbackTitle === `${EXTENSION_BRAND} 设置`;
   const isWorkflowSettings =
     serializedKind === 'workflowSettings' ||
     meta?.kind === 'workflowSettings' ||
-    fallbackTitle === 'LimCode 工作流编辑';
+    fallbackTitle === `${EXTENSION_BRAND} 工作流编辑`;
   const isAgentSettings =
     serializedKind === 'agentSettings' ||
     meta?.kind === 'agentSettings' ||
-    fallbackTitle === 'LimCode Agent 设置';
+    fallbackTitle === `${EXTENSION_AGENT_NAME} 设置`;
   const isPlanDetail = serializedKind === 'planDetail' || meta?.kind === 'planDetail';
 
   if (isGlobalSettings) {
@@ -346,7 +345,7 @@ function optionsFromSerializedState(state: unknown, fallbackTitle: string): Main
 }
 
 function conversationIdFromPanelTitle(title: string): string | undefined {
-  const prefix = 'LimCode: ';
+  const prefix = `${EXTENSION_BRAND}: `;
   return title.startsWith(prefix) ? title.slice(prefix.length).trim() || undefined : undefined;
 }
 

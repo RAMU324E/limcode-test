@@ -24,6 +24,7 @@ import {
   type LlmCompressionSettingsRecord,
   type LlmProviderKind,
   type LlmProviderHeadersRecord,
+  type LlmOpenAIResponsesTransport,
   type LlmProviderConfigRecord,
   type LlmProviderModelConfigRecord,
   type LlmProviderModelRecord,
@@ -36,7 +37,6 @@ import {
   type LlmProviderConfigsRecord,
   type LlmSettingsRecord,
   type McpServerConfigRecord,
-  type RunHistorySettingsRecord,
   type McpServersSettingsRecord,
   type McpServerTransportRecord
 } from '@shared/protocol';
@@ -69,8 +69,6 @@ interface GlobalSettingsState {
   appearance: AppearanceSettingsRecord;
   /** 附件：控制 base64 小附件托管阈值。 */
   attachments: AttachmentSettingsRecord;
-  /** 运行历史：控制是否持久化每次 run 的详情快照。 */
-  runHistory: RunHistorySettingsRecord;
   mcpServers: McpServersSettingsRecord;
   /** 各 section 的来源文件路径，用于在 UI 展示。 */
   filePaths: Partial<Record<GlobalSettingsSection, string>>;
@@ -143,10 +141,6 @@ function emptyAttachments(): AttachmentSettingsRecord {
   return { maxStoredInlineFileMb: 20 };
 }
 
-function emptyRunHistory(): RunHistorySettingsRecord {
-  return { detailPersistenceEnabled: false };
-}
-
 function emptyMcpServers(): McpServersSettingsRecord {
   return { servers: [] };
 }
@@ -189,6 +183,7 @@ function createDefaultProviderConfig(name = '新渠道配置', provider: LlmProv
     models: [],
     apiKey: '',
     toolCallFormat: 'function-call',
+    openaiResponsesTransport: 'http',
     stream: true,
     retryOnError: DEFAULT_LLM_RETRY_ON_ERROR,
     retryMaxAttempts: DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -210,6 +205,7 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     id: `llm-model-config-${slugId(modelId)}-${createMessageId()}`,
     modelId,
     toolCallFormat: config.toolCallFormat,
+    openaiResponsesTransport: normalizeOpenAIResponsesTransport(config.openaiResponsesTransport),
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -258,6 +254,7 @@ function normalizeProviderConfigForUi(config: LlmProviderConfigRecord): LlmProvi
     provider,
     model,
     models,
+    openaiResponsesTransport: normalizeOpenAIResponsesTransport(config.openaiResponsesTransport),
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -309,6 +306,7 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     id: config.id?.trim() || `llm-model-config-${createMessageId()}`,
     modelId,
     toolCallFormat: config.toolCallFormat === 'function-call' ? config.toolCallFormat : 'function-call',
+    openaiResponsesTransport: normalizeOpenAIResponsesTransport(config.openaiResponsesTransport),
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -321,6 +319,10 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     createdAt: Number.isFinite(config.createdAt) && config.createdAt > 0 ? config.createdAt : now,
     updatedAt: Number.isFinite(config.updatedAt) && config.updatedAt > 0 ? config.updatedAt : now
   };
+}
+
+function normalizeOpenAIResponsesTransport(value: unknown): LlmOpenAIResponsesTransport {
+  return value === 'websocket' ? 'websocket' : 'http';
 }
 
 function normalizePromptCacheForUi(input: LlmPromptCacheConfigRecord | undefined, provider: LlmProviderKind): LlmPromptCacheConfigRecord {
@@ -599,6 +601,7 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
     models,
     apiKey: config.apiKey,
     toolCallFormat: config.toolCallFormat,
+    openaiResponsesTransport: normalizeOpenAIResponsesTransport(config.openaiResponsesTransport),
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -619,6 +622,7 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
     id: config.id,
     modelId: config.modelId.trim(),
     toolCallFormat: config.toolCallFormat === 'function-call' ? config.toolCallFormat : 'function-call',
+    openaiResponsesTransport: normalizeOpenAIResponsesTransport(config.openaiResponsesTransport),
     stream: config.stream !== false,
     retryOnError: config.retryOnError !== false,
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -803,7 +807,6 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     checkpointMaintenance: emptyCheckpointMaintenance(),
     appearance: emptyAppearance(),
     attachments: emptyAttachments(),
-    runHistory: emptyRunHistory(),
     mcpServers: emptyMcpServers(),
     filePaths: {},
     pendingActiveProviderConfigIdAfterConfigsSave: '',
@@ -961,26 +964,6 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         section: 'attachments',
         settings: {
           maxStoredInlineFileMb: this.attachments.maxStoredInlineFileMb
-        }
-      });
-    },
-    ensureRunHistory(): void {
-      if (this.loadedSections.runHistory || this.loadingSettingsSections.runHistory) return;
-      this.markLoadingSettingSection('runHistory');
-      bridge.request(BridgeMessageType.GlobalSettingsGet, { section: 'runHistory' });
-    },
-    setRunHistorySettings(patch: Partial<RunHistorySettingsRecord>): void {
-      const next = { ...this.runHistory, ...patch };
-      this.runHistory = { detailPersistenceEnabled: next.detailPersistenceEnabled === true };
-      this.saveRunHistory();
-    },
-    saveRunHistory(): void {
-      this.markPendingSettingSection('runHistory');
-      this.status = '正在保存运行历史设置...';
-      bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
-        section: 'runHistory',
-        settings: {
-          detailPersistenceEnabled: this.runHistory.detailPersistenceEnabled === true
         }
       });
     },
@@ -1713,8 +1696,6 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         this.appearance = { ...emptyAppearance(), ...(payload.settings as AppearanceSettingsRecord) };
       } else if (payload.section === 'attachments') {
         this.attachments = { ...emptyAttachments(), ...(payload.settings as AttachmentSettingsRecord) };
-      } else if (payload.section === 'runHistory') {
-        this.runHistory = { ...emptyRunHistory(), ...(payload.settings as RunHistorySettingsRecord) };
       } else if (payload.section === 'mcpServers') {
         const settings = payload.settings as McpServersSettingsRecord;
         this.mcpServers = { servers: [...(settings.servers ?? [])].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id)) };

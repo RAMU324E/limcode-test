@@ -47,7 +47,7 @@ export function buildConversationHistoryForest(
       entry,
       ...(originLink ? { originLink } : {}),
       children: [],
-      latestUpdatedAt: entry.updatedAt ?? 0
+      latestUpdatedAt: entry.updatedAt
     });
   }
 
@@ -139,7 +139,7 @@ function parentPathContainsCycle(
 }
 
 function updateSubtreeActivityAndSort(node: ConversationHistoryTreeNode): number {
-  let latestUpdatedAt = node.entry.updatedAt ?? 0;
+  let latestUpdatedAt = node.entry.updatedAt;
   for (const child of node.children) {
     latestUpdatedAt = Math.max(latestUpdatedAt, updateSubtreeActivityAndSort(child));
   }
@@ -160,9 +160,9 @@ function compareConversationHistoryEntries(
   left: SidebarConversationHistoryEntry,
   right: SidebarConversationHistoryEntry
 ): number {
-  return (right.updatedAt ?? 0) - (left.updatedAt ?? 0)
-    || left.title.localeCompare(right.title, 'zh-CN')
-    || left.id.localeCompare(right.id, 'zh-CN');
+  return right.updatedAt - left.updatedAt
+    || right.createdAt - left.createdAt
+    || right.id.localeCompare(left.id, 'zh-CN');
 }
 
 function compareOriginLinks(

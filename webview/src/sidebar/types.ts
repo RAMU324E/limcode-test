@@ -18,8 +18,11 @@ export const SIDEBAR_MESSAGE = {
   ready: 'sidebar.ready',
   renameConversation: 'renameConversation',
   deleteConversation: 'deleteConversation',
-  abortConversation: 'abortConversation'
+  abortConversation: 'abortConversation',
+  conversationOperationResult: 'sidebar.conversationOperation.result'
 } as const;
+
+export type SidebarConversationOperation = 'delete' | 'abort';
 
 export type SidebarToExtensionMessage =
   | { type: typeof SIDEBAR_MESSAGE.ready }
@@ -31,7 +34,7 @@ export type SidebarToExtensionMessage =
   | { type: typeof SIDEBAR_MESSAGE.historyPageGet; scopeKind: SidebarHistoryScopeKind; projectFolderUri?: string; cursor?: string; limit?: number }
   | { type: typeof SIDEBAR_MESSAGE.renameConversation; conversationId: string; title: string }
   | { type: typeof SIDEBAR_MESSAGE.deleteConversation; conversationId: string }
-  | { type: typeof SIDEBAR_MESSAGE.abortConversation; conversationId: string };
+  | { type: typeof SIDEBAR_MESSAGE.abortConversation; conversationId: string; requestId: string };
 
 export type ExtensionToSidebarMessage =
   | {
@@ -42,6 +45,16 @@ export type ExtensionToSidebarMessage =
       currentProjectScope: ConversationHistoryScope;
       projectFolders: ProjectFolderCandidateRecord[];
       openConversations: OpenConversationPanelRecord[];
+    }
+  | {
+      type: typeof SIDEBAR_MESSAGE.conversationOperationResult;
+      operation: SidebarConversationOperation;
+      conversationId: string;
+      ok: boolean;
+      requestId?: string;
+      status?: 'committed' | 'already_applied' | 'already_satisfied' | 'stale';
+      runId?: string;
+      message?: string;
     };
 
 export type {

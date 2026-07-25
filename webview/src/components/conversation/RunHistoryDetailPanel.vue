@@ -13,12 +13,15 @@ import {
   type ToolCallRecord,
   type ToolCallStatus
 } from '@shared/protocol';
+import { isInternalMessage } from '@shared/messagePresentation';
 import { useRunHistoryStore } from '@webview/stores/useRunHistoryStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
+import { toolResultForState, useToolResultArtifactStore } from '@webview/stores/useToolResultArtifactStore';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 
 const runHistory = useRunHistoryStore();
 const clientState = useClientStateStore();
+const toolResults = useToolResultArtifactStore();
 const detailScroller = ref<HTMLElement | null>(null);
 const curlCopied = ref(false);
 const detailCopied = ref(false);
@@ -26,6 +29,7 @@ const apiKeyCopied = ref(false);
 const curlOpen = ref(false);
 const rawDetailOpen = ref(false);
 const includeApiKey = ref(false);
+const selectedDryRunCallIndex = ref(0);
 
 const compressionDetailMode = computed(() => !!runHistory.activeDetail?.compressionBlockId);
 const activeCompressionBlock = computed(() => {
@@ -71,6 +75,9 @@ const dryRun = computed(() => {
   }
   return undefined;
 });
+const dryRunCalls = computed(() => dryRun.value?.calls ?? []);
+const activeDryRunCall = computed(() => dryRunCalls.value[selectedDryRunCallIndex.value] ?? dryRunCalls.value[0]);
+
 const dryRunLoading = computed(() => {
   const active = runHistory.activeDetail;
   if (!active) return false;
@@ -120,9 +127,11 @@ const selectedToolCallIdentity = computed(() => {
   }
   return { ids, names };
 });
-const apiKeyHeader = computed(() => sensitiveHeader(dryRun.value?.headers));
+const apiKeyHeader = computed(() => sensitiveHeader(activeDryRunCall.value?.headers));
 const apiKeyValue = computed(() => includeApiKey.value ? apiKeyHeader.value?.value ?? '' : '••••••••');
-const displayCurl = computed(() => includeApiKey.value ? dryRun.value?.curl ?? '' : dryRun.value?.maskedCurl ?? dryRun.value?.curl ?? '');
+const displayCurl = computed(() => includeApiKey.value
+  ? activeDryRunCall.value?.curl ?? ''
+  : activeDryRunCall.value?.maskedCurl ?? activeDryRunCall.value?.curl ?? '');
 
 watch(activeKey, () => {
   curlOpen.value = false;
@@ -131,6 +140,7 @@ watch(activeKey, () => {
   curlCopied.value = false;
   detailCopied.value = false;
   apiKeyCopied.value = false;
+  selectedDryRunCallIndex.value = 0;
 });
 
 function close(): void {
@@ -230,8 +240,10 @@ function messagesForRoles(roles: string[]): MessageRecord[] {
   const state = activeState.value;
   if (!state) return [];
   const roleSet = new Set(roles);
-  const ids = new Set(state.messageRunLinks.filter((link) => roleSet.has(link.role)).map((link) => link.messageId));
-  return state.messages.filter((message) => ids.has(message.id)).sort((left, right) => left.seq - right.seq || left.createdAt - right.createdAt);
+  const ids = new Set<string>(state.messageTurnLinks.filter((link) => roleSet.has(link.role)).map((link) => link.messageId));
+  return state.messages
+    .filter((message) => ids.has(message.id) && !isInternalMessage(message))
+    .sort((left, right) => left.seq - right.seq || left.createdAt - right.createdAt);
 }
 
 function isSelectedDetailMessage(message: MessageRecord): boolean {
@@ -310,7 +322,7 @@ function toolCallForResponsePart(message: MessageRecord, part: Extract<ContentPa
   }
 
   const responseFingerprint = jsonFingerprint(part.functionResponse.response);
-  const byResult = candidates.find((call) => jsonFingerprint(call.result) === responseFingerprint);
+  const byResult = candidates.find((call) => jsonFingerprint(resolvedToolResult(call)) === responseFingerprint);
   if (byResult) return byResult;
 
   return candidates.length === 1 ? candidates[0] : undefined;
@@ -320,7 +332,7 @@ function runScopedToolCalls(message: MessageRecord, toolName: string): ToolCallR
   const state = activeState.value;
   if (!state) return [];
 
-  const runIds = new Set(state.messageRunLinks.filter((link) => link.messageId === message.id).map((link) => link.runId));
+  const runIds = new Set<string>(state.messageTurnLinks.filter((link) => link.messageId === message.id).map((link) => link.turnId));
   const toolCallIds = new Set(state.toolCallRunLinks.filter((link) => runIds.has(link.runId)).map((link) => link.toolCallId));
   return state.toolCalls.filter((call) => toolCallIds.has(call.id) && call.name === toolName);
 }
@@ -354,6 +366,11 @@ function toolInputJson(part: ContentPart): string {
 function toolOutputJson(part: ContentPart): string {
   if (isFunctionResponsePart(part)) return stringifyJson(part.functionResponse.response);
   return '';
+}
+
+function resolvedToolResult(call: ToolCallRecord): unknown {
+  const state = activeState.value;
+  return state ? toolResultForState(state, call.id, toolResults.loadedByArtifactId) : undefined;
 }
 
 function toolExecutionInfo(call: ToolCallRecord | undefined): string {
@@ -610,7 +627,7 @@ function sensitiveHeader(headers: Record<string, string> | undefined): { name: s
                         <IconEyeOff v-else stroke="2" aria-hidden="true" />
                       </button>
                       <button
-                        v-if="curlOpen && dryRun?.curl"
+                        v-if="curlOpen && activeDryRunCall?.curl"
                         type="button"
                         class="run-detail-copy"
                         :title="curlCopied ? '已复制' : '复制 curl'"
@@ -626,14 +643,29 @@ function sensitiveHeader(headers: Record<string, string> | undefined): { name: s
                   <template v-if="curlOpen">
                     <p v-if="dryRunLoading" class="run-detail-empty">正在通过 unified-llm-provider dry-run 构建 curl...</p>
                     <p v-else-if="dryRunError" class="run-detail-empty is-error">{{ dryRunError }}</p>
-                    <template v-else-if="dryRun">
+                    <template v-else-if="dryRun && activeDryRunCall">
+                      <div v-if="dryRunCalls.length > 1" class="run-detail-dryrun-calls" role="tablist" aria-label="压缩 Provider 请求">
+                        <button
+                          v-for="(call, index) in dryRunCalls"
+                          :key="call.id"
+                          type="button"
+                          class="run-detail-dryrun-call"
+                          :class="{ 'is-active': index === selectedDryRunCallIndex }"
+                          role="tab"
+                          :aria-selected="index === selectedDryRunCallIndex"
+                          @click="selectedDryRunCallIndex = index"
+                        >
+                          {{ call.label }}
+                        </button>
+                      </div>
                       <dl class="run-detail-grid run-detail-dryrun-meta">
-                        <div><dt>Provider</dt><dd>{{ dryRun.provider ?? '—' }}</dd></div>
-                        <div><dt>Model</dt><dd>{{ dryRun.model ?? '—' }}</dd></div>
-                        <div><dt>URL</dt><dd>{{ dryRun.url }}</dd></div>
+                        <div><dt>Provider</dt><dd>{{ activeDryRunCall.provider ?? '—' }}</dd></div>
+                        <div><dt>Model</dt><dd>{{ activeDryRunCall.model ?? '—' }}</dd></div>
+                        <div><dt>URL</dt><dd>{{ activeDryRunCall.url }}</dd></div>
                       </dl>
                       <pre class="run-detail-json run-detail-curl">{{ displayCurl }}</pre>
                     </template>
+                    <p v-else-if="dryRun?.executionKind === 'no_provider_call'" class="run-detail-empty">{{ dryRun.note ?? '该压缩方法不调用 Provider。' }}</p>
                     <p v-else class="run-detail-empty">点击眼睛后会构建压缩 dry-run curl，不发送网络请求。</p>
                   </template>
                   <p v-else class="run-detail-empty">curl 默认隐藏，点击闭眼按钮后再构建并显示。</p>
@@ -794,7 +826,7 @@ function sensitiveHeader(headers: Record<string, string> | undefined): { name: s
                       <IconEyeOff v-else stroke="2" aria-hidden="true" />
                     </button>
                     <button
-                      v-if="curlOpen && dryRun?.curl"
+                      v-if="curlOpen && activeDryRunCall?.curl"
                       type="button"
                       class="run-detail-copy"
                       :title="curlCopied ? '已复制' : '复制 curl'"
@@ -810,11 +842,25 @@ function sensitiveHeader(headers: Record<string, string> | undefined): { name: s
                 <template v-if="curlOpen">
                   <p v-if="dryRunLoading" class="run-detail-empty">正在通过 unified-llm-provider dry-run 构建 curl...</p>
                   <p v-else-if="dryRunError" class="run-detail-empty is-error">{{ dryRunError }}</p>
-                  <template v-else-if="dryRun">
+                  <template v-else-if="dryRun && activeDryRunCall">
+                    <div v-if="dryRunCalls.length > 1" class="run-detail-dryrun-calls" role="tablist" aria-label="Provider 请求">
+                      <button
+                        v-for="(call, index) in dryRunCalls"
+                        :key="call.id"
+                        type="button"
+                        class="run-detail-dryrun-call"
+                        :class="{ 'is-active': index === selectedDryRunCallIndex }"
+                        role="tab"
+                        :aria-selected="index === selectedDryRunCallIndex"
+                        @click="selectedDryRunCallIndex = index"
+                      >
+                        {{ call.label }}
+                      </button>
+                    </div>
                     <dl class="run-detail-grid run-detail-dryrun-meta">
-                      <div><dt>Provider</dt><dd>{{ dryRun.provider ?? '—' }}</dd></div>
-                      <div><dt>Model</dt><dd>{{ dryRun.model ?? '—' }}</dd></div>
-                      <div><dt>URL</dt><dd>{{ dryRun.url }}</dd></div>
+                      <div><dt>Provider</dt><dd>{{ activeDryRunCall.provider ?? '—' }}</dd></div>
+                      <div><dt>Model</dt><dd>{{ activeDryRunCall.model ?? '—' }}</dd></div>
+                      <div><dt>URL</dt><dd>{{ activeDryRunCall.url }}</dd></div>
                       <div>
                         <dt class="run-detail-api-key-title">
                           <span>API Key</span>
@@ -847,6 +893,7 @@ function sensitiveHeader(headers: Record<string, string> | undefined): { name: s
                     </dl>
                     <pre class="run-detail-json run-detail-curl">{{ displayCurl }}</pre>
                   </template>
+                  <p v-else-if="dryRun?.executionKind === 'no_provider_call'" class="run-detail-empty">{{ dryRun.note ?? '该执行不调用 Provider。' }}</p>
                   <p v-else class="run-detail-empty">点击眼睛后会构建 dry-run curl，不发送网络请求。</p>
                 </template>
                 <p v-else class="run-detail-empty">curl 默认隐藏，点击闭眼按钮后再构建并显示。</p>
@@ -1243,6 +1290,32 @@ function sensitiveHeader(headers: Record<string, string> | undefined): { name: s
 
 .run-detail-curl {
   margin-top: var(--space-2);
+}
+
+.run-detail-dryrun-calls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: var(--space-2);
+}
+
+.run-detail-dryrun-call {
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+  border-radius: 3px;
+  padding: 3px 7px;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.run-detail-dryrun-call:hover,
+.run-detail-dryrun-call:focus-visible,
+.run-detail-dryrun-call.is-active {
+  color: var(--vscode-foreground);
+  border-color: color-mix(in srgb, var(--vscode-foreground) 38%, transparent);
+  background: color-mix(in srgb, var(--vscode-foreground) 9%, transparent);
+  outline: none;
 }
 
 .run-detail-dryrun-meta {

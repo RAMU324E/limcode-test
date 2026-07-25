@@ -5,7 +5,9 @@ import { askUserRequestFromArgs } from '@shared/askUser';
 import { ASK_USER_TOOL_NAME, type AskUserToolRequestRecord, type ToolCallRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import CollapsibleContentBlock from '@webview/components/content/CollapsibleContentBlock.vue';
+import { pendingInteractionsForConversation } from '@webview/domain/interactionProjection';
 import { useAskUserStore } from '@webview/stores/useAskUserStore';
+import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import AskUserContent from './AskUserContent.vue';
 
@@ -16,11 +18,12 @@ interface PendingAskUserView {
 
 interface PendingAskUserBatchView {
   key: string;
-  runId?: string;
+  turnId: string;
   items: PendingAskUserView[];
 }
 
 const askUser = useAskUserStore();
+const clientState = useClientStateStore();
 const conversationTimeline = useConversationTimelineStore();
 const expanded = ref(true);
 const scroller = ref<HTMLElement | null>(null);
@@ -28,19 +31,20 @@ const activeIndexByBatch = ref<Record<string, number>>({});
 
 const pendingBatches = computed<PendingAskUserBatchView[]>(() => {
   const state = conversationTimeline.currentTimeline.state;
-  const runIdByToolCallId = new Map(
-    state.toolCallRunLinks.map((link) => [link.toolCallId, link.runId])
-  );
+  const toolCallById = new Map(state.toolCalls.map((toolCall) => [toolCall.id, toolCall]));
   const batches = new Map<string, PendingAskUserBatchView>();
+  const pending = pendingInteractionsForConversation(clientState, clientState.currentConversationId, 'ask_user');
 
-  for (const toolCall of state.toolCalls) {
-    if (toolCall.name !== ASK_USER_TOOL_NAME || toolCall.status !== 'awaiting_user_input') continue;
+  for (const interaction of pending) {
+    const toolCall = interaction.owner.sourceToolCallId
+      ? toolCallById.get(interaction.owner.sourceToolCallId)
+      : undefined;
+    if (!toolCall || toolCall.name !== ASK_USER_TOOL_NAME) continue;
     const request = askUserRequestFromArgs(toolCall.args);
     if (!request) continue;
-    const runId = runIdByToolCallId.get(toolCall.id);
-    // 同一 Run 同时处于 awaiting_user_input 的调用就是当前活动并行批；后续批次仍为 queued。
-    const key = runId ? `run:${runId}` : `message:${toolCall.messageId}`;
-    const batch = batches.get(key) ?? { key, ...(runId ? { runId } : {}), items: [] };
+    // 同一 Turn 的多个 pending AskUser Interaction 构成当前并行回答批。
+    const key = `turn:${interaction.owner.turnId}`;
+    const batch = batches.get(key) ?? { key, turnId: interaction.owner.turnId, items: [] };
     batch.items.push({ toolCall, request });
     batches.set(key, batch);
   }
@@ -88,13 +92,14 @@ watch(pendingQuestionCount, (nextCount, previousCount) => {
 });
 
 watch(
-  () => conversationTimeline.currentTimeline.state.toolCalls
-    .filter((call) => call.name === ASK_USER_TOOL_NAME)
-    .map((call) => `${call.id}:${call.status}`)
+  () => clientState.interactionRequests
+    .filter((request) => request.kind === 'ask_user')
+    .map((request) => `${request.id}:${request.revision}:${request.state}`)
     .join('|'),
   () => {
+    const activeToolCallIds = new Set(pendingBatches.value.flatMap((batch) => batch.items.map((item) => item.toolCall.id)));
     for (const call of conversationTimeline.currentTimeline.state.toolCalls) {
-      if (call.name === ASK_USER_TOOL_NAME && call.status !== 'awaiting_user_input') askUser.clearDraft(call.id);
+      if (call.name === ASK_USER_TOOL_NAME && !activeToolCallIds.has(call.id)) askUser.clearDraft(call.id);
     }
   },
   { immediate: true }

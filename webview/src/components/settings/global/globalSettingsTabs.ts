@@ -12,6 +12,7 @@ import RulesSettingsTab from './RulesSettingsTab.vue';
 import WorkEnvironmentSettingsTab from './WorkEnvironmentSettingsTab.vue';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
+import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 
 export type GlobalSettingsTabKey = 'channels' | 'prompts' | 'tools' | 'mcp-tools' | 'skills' | 'rules' | 'checkpoints' | 'work-environments' | 'appearance' | 'other';
 
@@ -87,13 +88,15 @@ export const GLOBAL_SETTINGS_TABS: readonly GlobalSettingsTabDefinition[] = [
     icon: IconFileText,
     component: RulesSettingsTab
   },
-  {
-    key: 'checkpoints',
-    label: '存档点',
-    description: '内部 shadow git 存档策略',
-    icon: IconArchive,
-    component: CheckpointSettingsTab
-  },
+  ...(CHECKPOINT_FEATURE_ENABLED
+    ? [{
+        key: 'checkpoints' as const,
+        label: '存档点',
+        description: '内部 shadow git 存档策略',
+        icon: IconArchive,
+        component: CheckpointSettingsTab
+      }]
+    : []),
   {
     key: 'work-environments',
     label: '工作环境',

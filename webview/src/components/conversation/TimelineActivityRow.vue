@@ -4,6 +4,7 @@ import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 
 const props = defineProps<{
   activityKind: 'preparing';
+  label?: string;
 }>();
 
 const settings = useGlobalSettingsStore();
@@ -20,7 +21,7 @@ const settings = useGlobalSettingsStore();
           </span>
         </header>
         <div class="activity-body">
-          <StreamingIndicatorTail :text="settings.appearance.streamingTextPreparing" variant="preparing" />
+          <StreamingIndicatorTail :text="props.label || settings.appearance.streamingTextPreparing" variant="preparing" />
         </div>
       </div>
     </div>

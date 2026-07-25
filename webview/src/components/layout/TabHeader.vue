@@ -236,6 +236,7 @@ function agentRunStatusLabel(status: AgentRunStatus): string {
     case 'completed': return '已完成';
     case 'failed': return '失败';
     case 'cancelled': return '已终止';
+    case 'interrupted': return '已中断';
     case 'stale': return '已过期';
   }
 }

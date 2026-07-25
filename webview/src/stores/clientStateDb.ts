@@ -278,7 +278,7 @@ class ClientStateDbImpl implements ClientStateDb {
   }
 
   private recordsFrom(source: ClientState, tableKey: ClientStateTableKey): ClientStateMutableRecord[] {
-    return source[tableKey] as ClientStateMutableRecord[];
+    return source[tableKey] as unknown as ClientStateMutableRecord[];
   }
 }
 

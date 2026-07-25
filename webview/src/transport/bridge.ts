@@ -46,9 +46,9 @@ export class Bridge {
   public request<TType extends WebviewToExtensionMessage['type']>(
     type: TType,
     payload?: Extract<WebviewToExtensionMessage, { type: TType }>['payload'],
-    options: { channel?: BridgeChannel; scope?: BridgeScope; correlationId?: string } = {}
+    options: { channel?: BridgeChannel; scope?: BridgeScope; correlationId?: string; requestId?: string } = {}
   ): string {
-    const id = createMessageId();
+    const id = options.requestId?.trim() || createMessageId();
 
     this.post({
       id,
@@ -60,6 +60,16 @@ export class Bridge {
     } as Extract<WebviewToExtensionMessage, { type: TType }>);
 
     return id;
+  }
+
+  public readPersistedState<T>(key: string): T | undefined {
+    const state = this.host.getState<Record<string, unknown>>() ?? {};
+    return state[key] as T | undefined;
+  }
+
+  public writePersistedState<T>(key: string, value: T): void {
+    const state = this.host.getState<Record<string, unknown>>() ?? {};
+    this.host.setState({ ...state, [key]: value });
   }
 
   public ready(): string {

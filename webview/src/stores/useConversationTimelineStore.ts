@@ -18,9 +18,9 @@ import {
   type ConversationTimelinePageInfo,
   type ConversationTimelinePageRecord,
   type ConversationTimelinePatchPayload,
-  type LlmInvocationRecord,
   type MessageRecord
 } from '@shared/protocol';
+import { isUserVisibleTimelineMessage } from '@shared/messagePresentation';
 import type { TimelineProjectionContextRecord } from '@shared/timelineProjection';
 import { bridge } from '@webview/transport';
 import { createClientStateDb } from './clientStateDb';
@@ -88,18 +88,14 @@ export const useConversationTimelineStore = defineStore('conversationTimeline', 
       return this.currentTimeline.state;
     },
     currentMessages(): MessageRecord[] {
-      const state = this.currentTimeline.state;
       return this.currentTimeline.state.messages
         .filter((message) => message.conversationId === this.currentConversationId)
-        .filter((message) => !message.content.parts.some((part) => 'functionResponse' in part))
-        .filter((message) => !isPreStartEmptyModelMessage(message, state))
+        .filter(isUserVisibleTimelineMessage)
         .sort(compareMessages);
     },
     currentAnchorMessages(): MessageRecord[] {
-      const state = this.currentTimeline.state;
       return this.currentTimeline.state.messages
         .filter((message) => message.conversationId === this.currentConversationId)
-        .filter((message) => !isPreStartEmptyModelMessage(message, state))
         .sort(compareMessages);
     },
     currentCheckpoints(): CheckpointRecord[] {
@@ -310,6 +306,19 @@ export const useConversationTimelineStore = defineStore('conversationTimeline', 
         this.flushPendingClientStatePatch(streamId);
       });
     },
+    applyCommittedConversationPatch(streamId: string, patches: ClientPatchOp[]): boolean {
+      const conversationId = conversationIdFromClientStateStreamId(streamId);
+      if (!conversationId) return false;
+      this.flushPendingClientStatePatch(streamId);
+      const timeline = this.ensureTimeline(conversationId);
+      const compacted = compactClientPatchOps(patches);
+      const windowStable = areTimelineWindowStablePatches(compacted);
+      createClientStateDb(timeline.streamState).applyPatches(compacted);
+      if (!windowStable) pruneClientStateToTimelineWindow(timeline, timeline.streamState);
+      createClientStateDb(timeline.state).applyPatches(compacted);
+      if (!windowStable) pruneClientStateToTimelineWindow(timeline, timeline.state);
+      return true;
+    },
     flushPendingClientStatePatch(streamId: string): void {
       const conversationId = conversationIdFromClientStateStreamId(streamId);
       if (!conversationId) return;
@@ -418,8 +427,11 @@ function pruneClientStateToTimelineWindow(timeline: ConversationTimelineState, s
   state.toolCalls = state.toolCalls.filter((toolCall) => messageIds.has(toolCall.messageId) || runToolCallIds.has(toolCall.id));
   const toolCallIds = new Set(state.toolCalls.map((toolCall) => toolCall.id));
   state.toolCallEvents = state.toolCallEvents.filter((event) => toolCallIds.has(event.toolCallId));
+  state.toolCallResultLinks = state.toolCallResultLinks.filter((link) => toolCallIds.has(link.toolCallId));
+  const artifactIds = new Set(state.toolCallResultLinks.map((link) => link.artifactId));
+  state.toolResultArtifacts = state.toolResultArtifacts.filter((artifact) => artifactIds.has(artifact.id));
   state.toolCallRunLinks = state.toolCallRunLinks.filter((link) => toolCallIds.has(link.toolCallId));
-  state.messageRunLinks = state.messageRunLinks.filter((link) => messageIds.has(link.messageId));
+  state.messageTurnLinks = state.messageTurnLinks.filter((link) => messageIds.has(link.messageId));
   state.messageLlmInvocationLinks = state.messageLlmInvocationLinks.filter((link) => messageIds.has(link.messageId));
 
   state.compressionBlocks = state.compressionBlocks.filter((block) =>
@@ -472,8 +484,8 @@ function compressionBlockInTimelineWindow(block: CompressionBlockRecord, window:
 
 function mergeClientState(target: ClientState, source: ClientState): void {
   for (const key of CLIENT_STATE_TABLE_KEYS) {
-    const targetList = target[key] as ClientStateRecord[];
-    const sourceList = source[key] as ClientStateRecord[];
+    const targetList = target[key] as unknown as ClientStateRecord[];
+    const sourceList = source[key] as unknown as ClientStateRecord[];
     upsertAll(targetList, sourceList);
     sortTable(key, targetList);
   }
@@ -559,16 +571,4 @@ function newestLoadedChunk(timeline: ConversationTimelineState): ConversationTim
 
 function compareMessages(left: MessageRecord, right: MessageRecord): number {
   return left.seq - right.seq || left.createdAt - right.createdAt || left.id.localeCompare(right.id);
-}
-
-function isPreStartEmptyModelMessage(message: MessageRecord, state: ClientState): boolean {
-  if (message.role !== 'model' || message.status !== 'streaming' || message.content.parts.length > 0) return false;
-  const invocation = invocationForMessage(message.id, state);
-  return !!invocation && invocation.status !== 'streaming';
-}
-
-function invocationForMessage(messageId: string, state: ClientState): LlmInvocationRecord | undefined {
-  const link = state.messageLlmInvocationLinks.find((candidate) => candidate.messageId === messageId);
-  if (!link) return undefined;
-  return state.llmInvocations.find((invocation) => invocation.id === link.invocationId);
 }

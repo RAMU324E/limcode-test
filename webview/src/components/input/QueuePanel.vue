@@ -1,89 +1,97 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { IconBolt, IconClock, IconGripVertical, IconPencil, IconPlayerPause, IconPlayerPlay, IconTrash } from '@tabler/icons-vue';
-import { isVisibleTextPart, type AgentRunQueueHoldReason } from '@shared/protocol';
+import type { TurnIntentHold } from '@shared/conversationReliability';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
+import { useConversationCommandStore } from '@webview/stores/useConversationCommandStore';
 import CollapsibleContentBlock from '@webview/components/content/CollapsibleContentBlock.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 
 export interface QueueItem {
-  runId: string;
-  queuedInputId: string;
+  intentId: string;
+  revisionId: string;
+  rowVersion: number;
   text: string;
   order: number;
   createdAt: number;
-  holdReason?: AgentRunQueueHoldReason;
+  hold: TurnIntentHold;
+  optimistic: boolean;
 }
 
 const emit = defineEmits<{
   (event: 'edit', item: QueueItem): void;
-  (event: 'delete', runId: string): void;
-  (event: 'force-send', runId: string): void;
-  (event: 'reorder', runIds: string[]): void;
-  (event: 'pause', runId: string): void;
-  (event: 'resume', runId: string): void;
+  (event: 'delete', item: QueueItem): void;
+  (event: 'force-send', item: QueueItem): void;
+  (event: 'reorder', items: QueueItem[]): void;
+  (event: 'pause', item: QueueItem): void;
+  (event: 'resume', item: QueueItem): void;
   (event: 'resume-all'): void;
 }>();
 
 const clientState = useClientStateStore();
+const commands = useConversationCommandStore();
 const scroller = ref<HTMLElement | null>(null);
-const draggingRunId = ref<string | undefined>();
-const dragOverRunId = ref<string | undefined>();
+const draggingIntentId = ref<string | undefined>();
+const dragOverIntentId = ref<string | undefined>();
 const dragInsertAfter = ref(false);
-const localOrderRunIds = ref<string[]>([]);
+const localOrderIntentIds = ref<string[]>([]);
 const expanded = ref(true);
+
+const committedQueueItems = computed<QueueItem[]>(() => clientState.currentQueuedTurnIntents.flatMap((intent) => {
+  const revision = clientState.turnIntentRevisions.find((candidate) =>
+    candidate.id === intent.currentRevisionId && candidate.turnIntentId === intent.id);
+  if (!revision) return [];
+  return [{
+    intentId: intent.id,
+    revisionId: revision.id,
+    rowVersion: intent.rowVersion,
+    text: visibleText(revision.content),
+    order: intent.order,
+    createdAt: intent.createdAt,
+    hold: intent.hold,
+    optimistic: false
+  }];
+}));
 
 const queueItems = computed<QueueItem[]>(() => {
   const conversationId = clientState.currentConversationId;
-  if (!conversationId) return [];
-
-  const runIds = new Set(
-    clientState.agentRunTargetLinks
-      .filter((link) => link.conversationId === conversationId)
-      .map((link) => link.runId)
-  );
-  if (runIds.size === 0) return [];
-
-  const queuedRuns = clientState.agentRuns
-    .filter((run) => runIds.has(run.id) && run.status === 'queued')
-    .map((run) => {
-      const order = clientState.agentRunQueueOrders.find((candidate) => candidate.runId === run.id && candidate.conversationId === conversationId);
-      return { run, order: order?.order ?? run.createdAt };
-    })
-    .sort((left, right) => left.order - right.order || left.run.createdAt - right.run.createdAt || left.run.id.localeCompare(right.run.id));
-
-  if (queuedRuns.length === 0) return [];
-
-  const items = queuedRuns.map(({ run, order }) => {
-    const queuedInput = clientState.agentRunQueuedInputs.find((candidate) => candidate.runId === run.id && candidate.conversationId === conversationId);
-    const hold = clientState.agentRunQueueHolds.find((candidate) => candidate.runId === run.id && candidate.conversationId === conversationId);
-    const text = queuedInput
-      ? queuedInput.content.parts.filter(isVisibleTextPart).map((part) => part.text).join('').trim()
-      : '';
-    return { runId: run.id, queuedInputId: queuedInput?.id ?? '', text, order, createdAt: run.createdAt, ...(hold ? { holdReason: hold.reason } : {}) };
-  });
-
-  return items;
+  const committed = committedQueueItems.value;
+  const nextOrder = Math.max(0, ...committed.map((item) => item.order)) + 1_000;
+  const optimistic = commands.pendingCommands
+    .filter((command) => command.kind === 'enqueue'
+      && command.conversationId === conversationId
+      && command.projectionObservedAt === undefined)
+    .map((command, index): QueueItem => {
+      const payload = command.payload as { text?: string; content?: unknown };
+      return {
+        intentId: `pending-enqueue:${command.commandId}`,
+        revisionId: '',
+        rowVersion: 0,
+        text: visibleText(payload.content) || payload.text?.trim() || '',
+        order: nextOrder + index * 1_000,
+        createdAt: command.startedAt,
+        hold: 'none',
+        optimistic: true
+      };
+    });
+  return [...committed, ...optimistic];
 });
 
 const displayQueueItems = computed<QueueItem[]>(() => {
   const items = queueItems.value;
-  if (localOrderRunIds.value.length === 0) return items;
-
-  const itemByRunId = new Map(items.map((item) => [item.runId, item]));
-  const ordered: QueueItem[] = [];
-  for (const runId of localOrderRunIds.value) {
-    const item = itemByRunId.get(runId);
-    if (item) ordered.push(item);
-  }
-  for (const item of items) {
-    if (!localOrderRunIds.value.includes(item.runId)) ordered.push(item);
-  }
-  return ordered;
+  if (localOrderIntentIds.value.length === 0) return items;
+  const itemByIntentId = new Map(items.map((item) => [item.intentId, item]));
+  return [
+    ...localOrderIntentIds.value.flatMap((intentId) => {
+      const item = itemByIntentId.get(intentId);
+      return item ? [item] : [];
+    }),
+    ...items.filter((item) => !localOrderIntentIds.value.includes(item.intentId))
+  ];
 });
 
-const heldQueueItems = computed(() => queueItems.value.filter((item) => !!item.holdReason));
-const hasRestoredHold = computed(() => heldQueueItems.value.some((item) => item.holdReason === 'restored'));
+const heldQueueItems = computed(() => queueItems.value.filter((item) => item.hold !== 'none'));
+const hasRestoredHold = computed(() => heldQueueItems.value.some((item) => item.hold === 'restored'));
 const queueSummaryText = computed(() => {
   const total = queueItems.value.length;
   const held = heldQueueItems.value.length;
@@ -91,62 +99,93 @@ const queueSummaryText = computed(() => {
   return `${total} 条`;
 });
 
-function queueHoldLabel(reason: AgentRunQueueHoldReason | undefined): string {
-  if (reason === 'restored') return '已恢复，待继续';
-  if (reason === 'manual') return '已暂停';
+function itemPending(intentId: string): boolean {
+  return intentId.startsWith('pending-enqueue:')
+    || commands.isTargetPending(clientState.currentConversationId, intentId);
+}
+
+function conversationQueuePending(): boolean {
+  const conversationId = clientState.currentConversationId;
+  return commands.isTargetPending(conversationId, conversationId, 'intent_control')
+    || commands.pendingCommands.some((command) => command.conversationId === conversationId && command.kind === 'enqueue');
+}
+
+function queueHoldLabel(item: QueueItem): string {
+  if (item.optimistic) return '正在入队';
+  const hold = item.hold;
+  if (hold === 'restored') return '已恢复，待继续';
+  if (hold === 'manual') return '已暂停';
   return '排队中';
 }
 
 function onDragStart(event: DragEvent, item: QueueItem): void {
-  if (displayQueueItems.value.length <= 1) return;
-  draggingRunId.value = item.runId;
-  localOrderRunIds.value = displayQueueItems.value.map((candidate) => candidate.runId);
-  event.dataTransfer?.setData('text/plain', item.runId);
+  if (displayQueueItems.value.length <= 1 || itemPending(item.intentId) || conversationQueuePending()) return;
+  draggingIntentId.value = item.intentId;
+  localOrderIntentIds.value = displayQueueItems.value.map((candidate) => candidate.intentId);
+  event.dataTransfer?.setData('text/plain', item.intentId);
   if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
 }
 
 function onDragOver(event: DragEvent, item: QueueItem): void {
-  if (!draggingRunId.value || draggingRunId.value === item.runId) return;
+  if (!draggingIntentId.value || draggingIntentId.value === item.intentId) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
   const element = event.currentTarget as HTMLElement | null;
   const rect = element?.getBoundingClientRect();
   const insertAfter = rect ? event.clientY > rect.top + rect.height / 2 : false;
-  moveDraggingItem(item.runId, insertAfter);
+  moveDraggingItem(item.intentId, insertAfter);
 }
 
 function onDrop(event: DragEvent): void {
-  if (!draggingRunId.value) return;
+  if (!draggingIntentId.value) return;
   event.preventDefault();
-  const nextOrder = localOrderRunIds.value.length > 0 ? [...localOrderRunIds.value] : displayQueueItems.value.map((item) => item.runId);
+  const nextOrderIds = localOrderIntentIds.value.length > 0
+    ? [...localOrderIntentIds.value]
+    : displayQueueItems.value.map((item) => item.intentId);
+  const itemByIntentId = new Map(queueItems.value.map((item) => [item.intentId, item]));
+  const nextItems = nextOrderIds.flatMap((intentId) => {
+    const item = itemByIntentId.get(intentId);
+    return item ? [item] : [];
+  });
   clearDragState();
-  emit('reorder', nextOrder);
+  if (nextItems.length === queueItems.value.length) emit('reorder', nextItems);
 }
 
 function onDragEnd(): void {
   clearDragState();
 }
 
-function moveDraggingItem(targetRunId: string, insertAfter: boolean): void {
-  const dragging = draggingRunId.value;
+function moveDraggingItem(targetIntentId: string, insertAfter: boolean): void {
+  const dragging = draggingIntentId.value;
   if (!dragging) return;
-  const current = localOrderRunIds.value.length > 0 ? [...localOrderRunIds.value] : displayQueueItems.value.map((item) => item.runId);
-  const withoutDragging = current.filter((runId) => runId !== dragging);
-  const targetIndex = withoutDragging.indexOf(targetRunId);
+  const current = localOrderIntentIds.value.length > 0
+    ? [...localOrderIntentIds.value]
+    : displayQueueItems.value.map((item) => item.intentId);
+  const withoutDragging = current.filter((intentId) => intentId !== dragging);
+  const targetIndex = withoutDragging.indexOf(targetIntentId);
   if (targetIndex < 0) return;
   withoutDragging.splice(targetIndex + (insertAfter ? 1 : 0), 0, dragging);
-
-  const next = withoutDragging;
-  if (next.join('\n') !== current.join('\n')) localOrderRunIds.value = next;
-  dragOverRunId.value = targetRunId;
+  if (withoutDragging.join('\n') !== current.join('\n')) localOrderIntentIds.value = withoutDragging;
+  dragOverIntentId.value = targetIntentId;
   dragInsertAfter.value = insertAfter;
 }
 
 function clearDragState(): void {
-  draggingRunId.value = undefined;
-  dragOverRunId.value = undefined;
+  draggingIntentId.value = undefined;
+  dragOverIntentId.value = undefined;
   dragInsertAfter.value = false;
-  localOrderRunIds.value = [];
+  localOrderIntentIds.value = [];
+}
+
+function visibleText(content: unknown): string {
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return '';
+  const parts = (content as { parts?: unknown }).parts;
+  if (!Array.isArray(parts)) return '';
+  return parts.flatMap((part) => {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return [];
+    const text = (part as { text?: unknown }).text;
+    return typeof text === 'string' ? [text] : [];
+  }).join('').trim();
 }
 </script>
 
@@ -167,21 +206,22 @@ function clearDragState(): void {
         <span class="queue-panel-summary">{{ queueSummaryText }}</span>
       </template>
       <template v-if="heldQueueItems.length > 0" #actions>
-        <button type="button" class="queue-hold-banner-action" aria-label="全部继续排队" @click="emit('resume-all')">全部继续</button>
+        <button type="button" class="queue-hold-banner-action" aria-label="全部继续排队" :disabled="conversationQueuePending()" @click="emit('resume-all')">全部继续</button>
       </template>
 
       <div ref="scroller" class="queue-panel-scroll">
       <div
         v-for="(item, index) in displayQueueItems"
-        :key="item.runId"
+        :key="item.intentId"
         class="queue-item"
         :class="{
-          'is-held': !!item.holdReason,
-          'is-dragging': draggingRunId === item.runId,
-          'is-drag-over-before': dragOverRunId === item.runId && !dragInsertAfter,
-          'is-drag-over-after': dragOverRunId === item.runId && dragInsertAfter
+          'is-held': item.hold !== 'none',
+          'is-pending': itemPending(item.intentId),
+          'is-dragging': draggingIntentId === item.intentId,
+          'is-drag-over-before': dragOverIntentId === item.intentId && !dragInsertAfter,
+          'is-drag-over-after': dragOverIntentId === item.intentId && dragInsertAfter
         }"
-        :draggable="displayQueueItems.length > 1"
+        :draggable="displayQueueItems.length > 1 && !itemPending(item.intentId) && !conversationQueuePending()"
         @dragstart="onDragStart($event, item)"
         @dragover="onDragOver($event, item)"
         @drop="onDrop"
@@ -194,22 +234,23 @@ function clearDragState(): void {
           <IconClock :size="14" stroke="2" />
         </span>
         <span class="queue-item-index">{{ index + 1 }}</span>
-        <span class="queue-item-status" :class="{ 'is-held': !!item.holdReason }">{{ queueHoldLabel(item.holdReason) }}</span>
+        <span class="queue-item-status" :class="{ 'is-held': item.hold !== 'none' }">{{ queueHoldLabel(item) }}</span>
         <span class="queue-item-text">{{ item.text || '(空消息)' }}</span>
         <div class="queue-item-actions">
-          <button type="button" class="queue-item-action" aria-label="编辑排队消息" :disabled="!item.queuedInputId" draggable="false" @click="emit('edit', item)">
+          <button type="button" class="queue-item-action" aria-label="编辑排队消息" :disabled="itemPending(item.intentId)" draggable="false" @click="emit('edit', item)">
             <IconPencil :size="14" stroke="2" />
           </button>
-          <button type="button" class="queue-item-action" aria-label="删除排队消息" :disabled="!item.queuedInputId" draggable="false" @click="emit('delete', item.runId)">
+          <button type="button" class="queue-item-action" aria-label="删除排队消息" :disabled="itemPending(item.intentId)" draggable="false" @click="emit('delete', item)">
             <IconTrash :size="14" stroke="2" />
           </button>
           <button
-            v-if="item.holdReason"
+            v-if="item.hold !== 'none'"
             type="button"
             class="queue-item-action"
             aria-label="继续这条排队消息"
+            :disabled="itemPending(item.intentId)"
             draggable="false"
-            @click="emit('resume', item.runId)"
+            @click="emit('resume', item)"
           >
             <IconPlayerPlay :size="14" stroke="2" />
           </button>
@@ -218,12 +259,13 @@ function clearDragState(): void {
             type="button"
             class="queue-item-action"
             aria-label="暂停这条排队消息"
+            :disabled="itemPending(item.intentId)"
             draggable="false"
-            @click="emit('pause', item.runId)"
+            @click="emit('pause', item)"
           >
             <IconPlayerPause :size="14" stroke="2" />
           </button>
-          <button type="button" class="queue-item-action queue-item-action--promote" aria-label="中断当前请求并发送队列" title="中断当前请求并发送队列" draggable="false" @click="emit('force-send', item.runId)">
+          <button type="button" class="queue-item-action queue-item-action--promote" aria-label="立即执行这条排队消息" title="当前有执行时会按身份围栏替换；空闲时直接执行" :disabled="itemPending(item.intentId)" draggable="false" @click="emit('force-send', item)">
             <IconBolt :size="14" stroke="2" />
           </button>
         </div>
@@ -320,6 +362,10 @@ function clearDragState(): void {
 
 .queue-item:hover {
   background: var(--vscode-list-hoverBackground, transparent);
+}
+
+.queue-item.is-pending {
+  opacity: 0.62;
 }
 
 .queue-item.is-held {

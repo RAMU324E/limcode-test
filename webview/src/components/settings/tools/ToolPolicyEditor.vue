@@ -650,7 +650,7 @@ function inputNumber(event: Event): number {
                         >
                           <span class="permission-copy">
                             <span class="permission-title">自动打开差异预览</span>
-                            <span class="permission-desc">有可用存档点时，自动触发聊天卡片里的“查看差异”。</span>
+                            <span class="permission-desc">工具生成可预览的修改提案时，自动触发聊天卡片里的“查看差异”。</span>
                           </span>
                         </LcCheckbox>
                         <LcCheckbox

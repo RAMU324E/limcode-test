@@ -9,7 +9,7 @@ export const askUserToolDisplay: ToolDisplayResolver = (context) => {
 
   const call = context.toolCall;
   const reachedWaitingState = call?.status === 'awaiting_user_input'
-    || !!askUserOutputFromResult(call?.result)
+    || !!askUserOutputFromResult(context.result)
     || context.events.some((event) => event.status === 'awaiting_user_input');
   if (!reachedWaitingState) {
     return { headerIcon: IconMessageQuestion, inputSections: [], outputSections: [] };
