@@ -44,6 +44,15 @@ export type MarkdownRenderedPart =
   | { kind: 'html'; html: string }
   | { kind: 'code'; code: string; language: string; info: string };
 
+export interface StreamingMarkdownRendererDiagnostics {
+  stableChars: number;
+  stablePartCount: number;
+  tailChars: number;
+  incrementalDisabled: boolean;
+  parseCalls: number;
+  parsedChars: number;
+}
+
 const FINAL_CACHE_LIMIT = 80;
 
 // ChatView 本身会在 bridge 握手后按需加载；解析器随 ChatView 一起就绪，避免消息首帧后再发起 Markdown 分包请求。
@@ -93,6 +102,132 @@ export function renderMarkdownParts(text: string, options: { streaming?: boolean
 
   if (!options.streaming) rememberFinalParts(normalized, parts);
   return parts;
+}
+
+/**
+ * Stateful Codex-style renderer: completed top-level blocks become an immutable prefix;
+ * only the final mutable block is reparsed for each streaming frame. Final output is still
+ * rendered once as a whole document so reference/link/list semantics remain authoritative.
+ */
+export function createStreamingMarkdownPartsRenderer() {
+  let previousText = '';
+  let stableChars = 0;
+  let stableParts: MarkdownRenderedPart[] = [];
+  let incrementalDisabled = false;
+  let parseCalls = 0;
+  let parsedChars = 0;
+
+  const renderStreamingChunk = (source: string): MarkdownRenderedPart[] => {
+    if (!source) return [];
+    parseCalls += 1;
+    parsedChars += source.length;
+    return renderMarkdownParts(source, { streaming: true });
+  };
+
+  const reset = (): void => {
+    previousText = '';
+    stableChars = 0;
+    stableParts = [];
+    incrementalDisabled = false;
+    parseCalls = 0;
+    parsedChars = 0;
+  };
+
+  return {
+    render(text: string, options: { streaming?: boolean } = {}): MarkdownRenderedPart[] {
+      const normalized = text.trimStart();
+      if (!normalized) {
+        reset();
+        return [];
+      }
+      if (!options.streaming) {
+        const final = renderMarkdownParts(normalized, { streaming: false });
+        reset();
+        return final;
+      }
+
+      if (!normalized.startsWith(previousText) || previousText.length < stableChars) reset();
+      previousText = normalized;
+      if (containsGlobalMarkdownDefinition(normalized)) incrementalDisabled = true;
+      if (incrementalDisabled) return renderStreamingChunk(normalized);
+
+      const tail = normalized.slice(stableChars);
+      const commitIndex = findStreamingMarkdownCommitIndex(tail);
+      if (commitIndex > 0) {
+        const committed = tail.slice(0, commitIndex);
+        stableParts = [...stableParts, ...renderStreamingChunk(committed)];
+        stableChars += commitIndex;
+      }
+      const mutableTail = normalized.slice(stableChars);
+      return [...stableParts, ...renderStreamingChunk(mutableTail)];
+    },
+    reset,
+    diagnostics(): StreamingMarkdownRendererDiagnostics {
+      return {
+        stableChars,
+        stablePartCount: stableParts.length,
+        tailChars: Math.max(0, previousText.length - stableChars),
+        incrementalDisabled,
+        parseCalls,
+        parsedChars
+      };
+    }
+  };
+}
+
+export function findStreamingMarkdownCommitIndex(source: string): number {
+  if (!source.includes('\n\n')) return 0;
+  const lines = source.split('\n');
+  let offset = 0;
+  let previousBlank = false;
+  let fence: { marker: '`' | '~'; length: number } | undefined;
+  let displayMathOpen = false;
+  let candidate = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const lineStart = offset;
+    const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+    const outsideMultilineBlock = !fence && !displayMathOpen;
+    if (outsideMultilineBlock && previousBlank && isSafeTopLevelBlockStart(line)) candidate = lineStart;
+
+    if (fenceMatch) {
+      const marker = fenceMatch[1]![0] as '`' | '~';
+      const length = fenceMatch[1]!.length;
+      if (!fence) {
+        fence = { marker, length };
+      } else {
+        // CommonMark closing fences may contain only the marker and trailing spaces. A line such as
+        // ```example inside the code body must not accidentally expose later blank lines as stable.
+        const closingFence = new RegExp(`^\\s{0,3}${escapeRegExp(marker)}{${fence.length},}\\s*$`);
+        if (fence.marker === marker && closingFence.test(line)) fence = undefined;
+      }
+    } else if (!fence && trimmed === '$$') {
+      displayMathOpen = !displayMathOpen;
+    }
+
+    previousBlank = trimmed.length === 0 && !fence && !displayMathOpen;
+    offset += line.length + 1;
+  }
+  return candidate;
+}
+
+function isSafeTopLevelBlockStart(line: string): boolean {
+  if (!line.trim()) return false;
+  if (/^(?:\t| {4})/.test(line)) return false;
+  const trimmed = line.replace(/^ {0,3}/, '');
+  if (/^(?:[-+*]|\d+[.)])\s+/.test(trimmed)) return false;
+  if (/^>/.test(trimmed)) return false;
+  if (/^\[[^\]]+\]:/.test(trimmed)) return false;
+  return true;
+}
+
+function containsGlobalMarkdownDefinition(source: string): boolean {
+  return /^\s{0,3}\[[^\]]+\]:\s*\S+/m.test(source);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function tokensToRenderedParts(parser: MarkdownParser, tokens: MarkdownToken[]): MarkdownRenderedPart[] {

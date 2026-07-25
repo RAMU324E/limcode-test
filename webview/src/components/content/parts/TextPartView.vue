@@ -4,7 +4,7 @@ import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import CodeBlockViewer from '../CodeBlockViewer.vue';
 import StreamingIndicatorTail from '../StreamingIndicatorTail.vue';
 import { useSmoothStreamingText } from '../useSmoothStreamingText';
-import { renderMarkdownParts, type MarkdownRenderedPart } from '../markdown/markdownRenderer';
+import { createStreamingMarkdownPartsRenderer, type MarkdownRenderedPart } from '../markdown/markdownRenderer';
 
 const props = withDefaults(
   defineProps<{
@@ -32,6 +32,7 @@ const { displayedText, replacing: replaceAnimating } = useSmoothStreamingText(
   { animateReplace: true }
 );
 const renderedParts = shallowRef<MarkdownRenderedPart[]>([]);
+const streamingMarkdownRenderer = createStreamingMarkdownPartsRenderer();
 // displayedText 已经由平滑输出逻辑控制更新频率；Markdown 紧跟它同步解析，不再额外等待下一帧。
 const markdownReady = computed(() => props.markdown);
 
@@ -43,13 +44,18 @@ watch(
 
 function renderCurrentMarkdown(): void {
   if (!markdownReady.value) {
+    streamingMarkdownRenderer.reset();
     renderedParts.value = [];
     return;
   }
 
   try {
-    renderedParts.value = renderMarkdownParts(displayedText.value, { streaming: props.streaming });
+    // Provider 已结束后，平滑输出可能仍在追赶 backlog；此时仍按流式尾块处理，
+    // 直到 displayedText 真正追上最终文本，才做一次权威的整文解析并写入最终缓存。
+    const effectivelyStreaming = props.streaming || displayedText.value !== props.text;
+    renderedParts.value = streamingMarkdownRenderer.render(displayedText.value, { streaming: effectivelyStreaming });
   } catch (error) {
+    streamingMarkdownRenderer.reset();
     console.warn('[LimCode] Failed to render markdown.', error);
     renderedParts.value = [];
   }
