@@ -25,7 +25,7 @@ import {
   AgentRunSourceLink,
   type AgentRunSourceLinkData,
   AgentRunTargetLink,
-  MessageRunLink,
+  MessageTurnLink,
   RunContextPolicy,
   RunContextPolicyLink,
   RunDeliveryPolicy,
@@ -67,20 +67,22 @@ function latestSelectionForConversation(world: WorldReader, conversation: Entity
 }
 
 export function findConversationById(world: WorldReader, conversationId: string): Entity | undefined {
-  return world.query(Conversation).find((entity) => world.get(entity, Conversation)?.id === conversationId);
+  return world.entityByRecordId(Conversation, conversationId);
 }
 
 export function findAgentById(world: WorldReader, agentId: string): Entity | undefined {
-  return world.query(Agent).find((entity) => world.get(entity, Agent)?.id === agentId);
+  return world.entityByRecordId(Agent, agentId);
 }
 
 export function findAgentByKind(world: WorldReader, kind: string): Entity | undefined {
-  return world.query(Agent).find((entity) => {
-    const agent = world.get(entity, Agent);
-    if (!agent) return false;
-    if (agent.id === kind) return true;
-    return agentTypeEntityForRuntimeAgent(world, entity) === entity && world.get(entity, AgentKind)?.kind === kind;
-  });
+  const matches = new Set<Entity>();
+  const direct = world.entityByRecordId(Agent, kind);
+  if (direct !== undefined) matches.add(direct);
+  for (const entity of world.query(Agent, AgentKind)) {
+    if (agentTypeEntityForRuntimeAgent(world, entity) === entity && world.get(entity, AgentKind)?.kind === kind) matches.add(entity);
+  }
+  if (matches.size > 1) throw new Error(`Agent selector is ambiguous: ${kind}`);
+  return [...matches][0];
 }
 
 export function runTarget(world: WorldReader, run: Entity): { agent: Entity; conversation: Entity } | undefined {
@@ -192,7 +194,7 @@ export function runForToolCall(world: WorldReader, toolCall: Entity): Entity | u
 }
 
 export function toolCallEntityById(world: WorldReader, toolCallId: string): Entity | undefined {
-  return world.query(ToolCall).find((entity) => world.get(entity, ToolCall)?.id === toolCallId);
+  return world.entityByRecordId(ToolCall, toolCallId);
 }
 
 export function messageConversation(world: WorldReader, message: Entity): Entity | undefined {
@@ -201,8 +203,8 @@ export function messageConversation(world: WorldReader, message: Entity): Entity
 
 export function runFinalModelText(world: WorldReader, run: Entity): string {
   const messages = world
-    .query(Message, MessageRunLink)
-    .filter((entity) => world.get(entity, MessageRunLink)?.run === run && world.get(entity, MessageRunLink)?.role === 'model')
+    .query(Message, MessageTurnLink)
+    .filter((entity) => world.get(entity, MessageTurnLink)?.turn === run && world.get(entity, MessageTurnLink)?.role === 'model')
     .map((entity) => world.get(entity, Message))
     .filter((message): message is NonNullable<typeof message> => !!message)
     .sort((a, b) => a.seq - b.seq);
@@ -242,6 +244,13 @@ export function activeWorkflowForAgent(_world: WorldReader, _agent: Entity): Ent
 }
 
 export function systemPromptsForRun(world: WorldReader, run: Entity): SystemPromptData[] {
+  const frozenRunLink = world
+    .query(RunSystemPromptLink)
+    .map((entity) => world.get(entity, RunSystemPromptLink))
+    .find((candidate) => candidate?.run === run && candidate.role === 'active');
+  const frozenPrompt = frozenRunLink ? world.get(frozenRunLink.systemPrompt, SystemPrompt) : undefined;
+  if (frozenPrompt) return frozenPrompt.text.trim() ? [frozenPrompt] : [];
+
   const target = runTarget(world, run);
   const workflow = activeWorkflowForRun(world, run);
   const scopes: ScopeEntity[] = [
@@ -260,20 +269,16 @@ export function systemPromptsForRun(world: WorldReader, run: Entity): SystemProm
     }
   }
 
-  const runLink = world
-    .query(RunSystemPromptLink)
-    .map((entity) => world.get(entity, RunSystemPromptLink))
-    .find((candidate) => candidate?.run === run && candidate.role === 'active');
-  const runPrompt = runLink ? world.get(runLink.systemPrompt, SystemPrompt) : undefined;
-  if (runPrompt?.text.trim()) prompts.push(runPrompt);
   return prompts;
 }
 
 export function activeSystemPromptForRun(world: WorldReader, run: Entity): SystemPromptData | undefined {
   const prompts = systemPromptsForRun(world, run);
   if (prompts.length === 0) return undefined;
+  const runId = world.get(run, AgentRun)?.id;
+  if (!runId) throw new Error('Effective System Prompt owner Run has no Stable ID.');
   return {
-    id: `effective-system-prompt:${run}`,
+    id: `effective-system-prompt:${runId}`,
     name: 'Effective System Prompt',
     text: prompts.map((prompt) => prompt.text.trim()).filter(Boolean).join('\n\n')
   };
@@ -304,6 +309,12 @@ export function activeModelProfileForRun(world: WorldReader, run: Entity): Model
 }
 
 export function activeToolPolicyForRun(world: WorldReader, run: Entity): ToolPolicyData | undefined {
+  const frozenRunLink = world
+    .query(RunToolPolicyLink)
+    .map((entity) => world.get(entity, RunToolPolicyLink))
+    .find((candidate) => candidate?.run === run && candidate.role === 'active');
+  if (frozenRunLink) return world.get(frozenRunLink.toolPolicy, ToolPolicy);
+
   const target = runTarget(world, run);
   const workflow = activeWorkflowForRun(world, run);
   const policies: ToolPolicyData[] = [];
@@ -314,12 +325,6 @@ export function activeToolPolicyForRun(world: WorldReader, run: Entity): ToolPol
   if (workflow !== undefined) push(activeToolPolicyForScopeEntity(world, 'workflow', workflow));
   if (target) push(activeToolPolicyForScopeEntity(world, 'conversation', target.conversation));
   push(activeToolPolicyForScopeEntity(world, 'run', run));
-
-  const runLink = world
-    .query(RunToolPolicyLink)
-    .map((entity) => world.get(entity, RunToolPolicyLink))
-    .find((candidate) => candidate?.run === run && candidate.role === 'active');
-  if (runLink) push(world.get(runLink.toolPolicy, ToolPolicy));
 
   if (policies.length === 0) return undefined;
   return intersectToolPolicies(policies, `effective-tool-policy:${run}`);
@@ -461,7 +466,7 @@ function entityForToolPolicyScope(world: WorldReader, scopeKind: ToolPolicyScope
 }
 
 function findRecordEntity<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
-  return world.query(component).find((entity) => world.get(entity, component)?.id === id);
+  return world.entityByRecordId(component, id);
 }
 
 function intersectToolPolicies(policies: ToolPolicyData[], id: string): ToolPolicyData {

@@ -1,8 +1,6 @@
 import { defineComponent, type Entity } from '../../../ecs/types';
 import type {
   AgentRunKind,
-  AgentRunEndReason,
-  AgentRunErrorType,
   AgentRunSourceKind,
   AgentRunStatus,
   AgentRunTargetRole,
@@ -10,35 +8,50 @@ import type {
   ConversationPolicyMode,
   ConversationVisibility,
   DeliveryMode,
-  MessageRunRole,
   NewMessageWhileRunningBehavior,
   PolicyBindingRole,
   SourceEditBehavior,
   ToolCallRunRole,
   TranscriptInclusion,
   LlmUsageMetadataRecord,
-  MessageContent,
-  AgentRunQueueHoldReason
+  OutcomeUnknownOperationRecord,
+  RunTerminationActor,
+  RunTerminationKind,
+  RunTerminationReasonCode
 } from '../../../../shared/protocol';
+import type { MessageTurnRole } from '../../../../shared/conversationReliability';
+import type { RunExecutionPhase, RunLifecycleStatus } from '../../../../shared/runLifecycle';
 
 export interface AgentRunData {
   id: string;
   kind: AgentRunKind;
   status: AgentRunStatus;
+  /** Committed durable state; status is the UI-compatible projection. */
+  lifecycle?: RunLifecycleStatus;
+  phase?: RunExecutionPhase;
+  rowVersion?: number;
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
-  endReason?: AgentRunEndReason;
-  errorType?: AgentRunErrorType;
-  error?: string;
   usageMetadata?: LlmUsageMetadataRecord;
   retryOfRunId?: string;
   attempt?: number;
+  outcomeUnknownOperations?: OutcomeUnknownOperationRecord[];
 }
 export const AgentRun = defineComponent<AgentRunData>('AgentRun');
 
-/** Run-scoped trigger for the next LLM cycle. Replaces conversation-level NeedsResponse. */
-export const AgentRunNeedsModel = defineComponent<{ since: number }>('AgentRunNeedsModel');
+export interface RunTerminationData {
+  id: string;
+  run: Entity;
+  kind: RunTerminationKind;
+  actor: RunTerminationActor;
+  interruptedPhase: Exclude<RunExecutionPhase, 'terminal'>;
+  reasonCode: RunTerminationReasonCode;
+  triggerRunId?: string;
+  triggerRun?: Entity;
+  createdAt: number;
+}
+export const RunTermination = defineComponent<RunTerminationData>('RunTermination');
 
 export interface AgentRunSourceLinkData {
   id: string;
@@ -66,45 +79,15 @@ export interface AgentRunTargetLinkData {
 }
 export const AgentRunTargetLink = defineComponent<AgentRunTargetLinkData>('AgentRunTargetLink');
 
-export interface AgentRunQueueOrderData {
-  id: string;
-  run: Entity;
-  conversation: Entity;
-  order: number;
-  createdAt: number;
-  updatedAt: number;
-}
-export const AgentRunQueueOrder = defineComponent<AgentRunQueueOrderData>('AgentRunQueueOrder');
-
-export interface AgentRunQueueHoldData {
-  id: string;
-  run: Entity;
-  conversation: Entity;
-  reason: AgentRunQueueHoldReason;
-  createdAt: number;
-  updatedAt: number;
-}
-export const AgentRunQueueHold = defineComponent<AgentRunQueueHoldData>('AgentRunQueueHold');
-
-export interface AgentRunQueuedInputData {
-  id: string;
-  run: Entity;
-  conversation: Entity;
-  content: MessageContent;
-  createdAt: number;
-  updatedAt: number;
-}
-export const AgentRunQueuedInput = defineComponent<AgentRunQueuedInputData>('AgentRunQueuedInput');
-
-export interface MessageRunLinkData {
+export interface MessageTurnLinkData {
   id: string;
   message: Entity;
-  run: Entity;
-  role: MessageRunRole;
+  turn: Entity;
+  role: MessageTurnRole;
   createdAt: number;
   updatedAt: number;
 }
-export const MessageRunLink = defineComponent<MessageRunLinkData>('MessageRunLink');
+export const MessageTurnLink = defineComponent<MessageTurnLinkData>('MessageTurnLink');
 
 export interface ToolCallRunLinkData {
   id: string;

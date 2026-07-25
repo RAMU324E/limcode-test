@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../world/modules/tools/registry';
 import type { McpRuntimeManager } from './mcpRuntimeManager';
+import type { BackgroundProcessManager } from '../capabilities/backgroundProcessManager';
 import type {
   CommandCapability,
   FsCapability,
@@ -26,6 +27,7 @@ export interface RuntimeEnv {
   llm: LlmCapability;
   fs: FsCapability;
   command: CommandCapability;
+  backgroundProcesses: BackgroundProcessManager;
   workEnvironment: WorkEnvironmentRuntimeCapability;
   webview: WebviewCapability;
   storage: StorageCapability;

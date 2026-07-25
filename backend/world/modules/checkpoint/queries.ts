@@ -79,7 +79,7 @@ export function localCheckpointPolicyForScope(
 export function findRunById(world: WorldReader, runId: string | undefined): Entity | undefined {
   const id = runId?.trim();
   if (!id) return undefined;
-  return world.query(AgentRun).find((entity) => world.get(entity, AgentRun)?.id === id);
+  return world.entityByRecordId(AgentRun, id);
 }
 
 function localCheckpointPolicyForScopeEntity(world: WorldReader, scopeKind: CheckpointPolicyScopeKind, scopeEntity: Entity | undefined): Partial<CheckpointPolicyResolution> {

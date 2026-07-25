@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
-import type { ConversationLlmSettingsRecord, GlobalSettingsRecord, LlmInvocationSettingsSnapshotRecord, LlmProviderConfigRecord, ToolDefinitionRecord } from '../../shared/protocol';
+import type { ConversationLlmSettingsRecord, GlobalSettingsRecord, InlineDataPart, LlmInvocationSettingsSnapshotRecord, LlmProviderConfigRecord, ToolDefinitionRecord } from '../../shared/protocol';
 import {
   createLlmProviderCapability,
   createCommandCapability,
+  BackgroundProcessManager,
   createWorkEnvironmentRuntimeCapability,
   createVsCodeFsCapability,
   createVsCodeStorageCapability,
@@ -11,17 +12,27 @@ import {
   createRulesCatalogCapability
 } from '../capabilities';
 import { createGlobalSettingsRecord } from '../capabilities/vscodeStorage/globalStatus';
-import { resolveAttachmentForClient } from '../capabilities/vscodeStorage/attachmentStore';
 import { createToolRegistry } from '../world/modules';
 import type { ToolSchema } from '../world/modules/llm/contracts';
 import { toolDefinitionRecord, type ToolDefinition } from '../world/modules/tools/registry';
+import { EXTENSION_PACKAGE_NAME, EXTENSION_VERSION } from '../../shared/extensionIdentity';
 import type { RuntimeEnv } from './RuntimeEnv';
 import { McpRuntimeManager } from './mcpRuntimeManager';
+
+export interface RuntimeAttachmentInput {
+  attachmentId?: string;
+  sourcePath?: string;
+  mimeType?: string;
+  name?: string;
+}
+
+export type RuntimeAttachmentResolver = (input: RuntimeAttachmentInput) => Promise<InlineDataPart>;
 
 export interface RuntimeEnvSetup {
   env: RuntimeEnv;
   toolSchemas: ToolSchema[];
   toolDefinitions: ToolDefinitionRecord[];
+  installAttachmentResolver(resolver: RuntimeAttachmentResolver): void;
 }
 
 /**
@@ -30,14 +41,16 @@ export interface RuntimeEnvSetup {
  */
 export function createRuntimeEnv(context: vscode.ExtensionContext): RuntimeEnvSetup {
   const storage = createVsCodeStorageCapability(context);
-  const command = createCommandCapability({ paths: () => storage.paths });
+  let attachmentResolver: RuntimeAttachmentResolver | undefined;
+  const backgroundProcesses = new BackgroundProcessManager({ paths: () => storage.paths });
+  const command = createCommandCapability({ backgroundProcesses });
   const workEnvironment = createWorkEnvironmentRuntimeCapability();
   const registry = createToolRegistry(command);
   const mcp = new McpRuntimeManager(storage);
   const llm = createLlmProviderCapability({
     settings: async (request) => {
       if (request && 'settingsSnapshot' in request && request.settingsSnapshot) return resolveSnapshotLlmProviderConfig(storage, request.settingsSnapshot, request.conversationId);
-      const override = request?.model;
+      const override = request && 'model' in request ? request.model : undefined;
       const overrideConfig = override?.providerConfigId ? await storage.loadLlmProviderConfigById(override.providerConfigId) : undefined;
       const base = overrideConfig ?? await storage.loadActiveLlmProviderConfig(request?.conversationId);
       const overrideModel = override?.model?.trim();
@@ -62,11 +75,11 @@ export function createRuntimeEnv(context: vscode.ExtensionContext): RuntimeEnvSe
       const activeProvider = await storage.loadActiveLlmProviderConfig(request?.conversationId);
       return storage.loadActiveLlmCompressionConfig(activeProvider.id, activeProvider.model);
     },
-    headers: { 'User-Agent': 'LimCode/0.0.1' },
+    headers: { 'User-Agent': `${EXTENSION_PACKAGE_NAME}/${EXTENSION_VERSION}` },
     proxy: async () => createGlobalSettingsRecord(context).proxy || undefined,
     resolveAttachment: async (input) => {
-      const result = await resolveAttachmentForClient(storage.paths, input);
-      return result.status === 'available' ? result.part : undefined;
+      if (!attachmentResolver) throw new Error('Canonical attachment resolver has not been installed.');
+      return attachmentResolver(input);
     }
   });
   const fs = createVsCodeFsCapability();
@@ -82,6 +95,7 @@ export function createRuntimeEnv(context: vscode.ExtensionContext): RuntimeEnvSe
       llm,
       fs,
       command,
+      backgroundProcesses,
       workEnvironment,
       webview,
       storage,
@@ -92,7 +106,11 @@ export function createRuntimeEnv(context: vscode.ExtensionContext): RuntimeEnvSe
       rules
     },
     toolSchemas,
-    toolDefinitions
+    toolDefinitions,
+    installAttachmentResolver(resolver) {
+      if (attachmentResolver) throw new Error('Canonical attachment resolver is already installed.');
+      attachmentResolver = resolver;
+    }
   };
 }
 
@@ -128,6 +146,7 @@ function applyModelSpecificConfig(config: LlmProviderConfigRecord): LlmProviderC
   const next: LlmProviderConfigRecord = {
     ...config,
     toolCallFormat: modelConfig.toolCallFormat,
+    openaiResponsesTransport: modelConfig.openaiResponsesTransport,
     stream: modelConfig.stream,
     retryOnError: modelConfig.retryOnError,
     retryMaxAttempts: modelConfig.retryMaxAttempts,
@@ -170,6 +189,7 @@ async function resolveSnapshotLlmProviderConfig(
     model: modelId,
     models: modelId ? [{ id: modelId, name: modelName }, ...base.models.filter((model) => model.id !== modelId)] : base.models,
     ...(snapshot.toolCallFormat ? { toolCallFormat: snapshot.toolCallFormat } : {}),
+    ...(snapshot.openaiResponsesTransport ? { openaiResponsesTransport: snapshot.openaiResponsesTransport } : {}),
     ...(snapshot.stream !== undefined ? { stream: snapshot.stream } : {}),
     ...(snapshot.retryOnError !== undefined ? { retryOnError: snapshot.retryOnError } : {}),
     ...(snapshot.retryMaxAttempts !== undefined ? { retryMaxAttempts: snapshot.retryMaxAttempts } : {}),

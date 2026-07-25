@@ -61,7 +61,8 @@ export async function runRemoteServerCommand(
   return executeRemoteServerScript(environment, script, {
     timeout: resolveRemoteTimeout(args.foregroundWaitMs),
     observer,
-    displayCommand: command
+    displayCommand: command,
+    ...(args.signal ? { signal: args.signal } : {})
   });
 }
 
@@ -179,7 +180,7 @@ export function openRemoteServerWriteStream(environment: WorkEnvironmentRecord, 
 export function executeRemoteServerScript(
   environment: WorkEnvironmentRecord,
   script: string,
-  options: { timeout?: number; observer?: CommandRunObserver; displayCommand?: string } = {}
+  options: { timeout?: number; observer?: CommandRunObserver; displayCommand?: string; signal?: AbortSignal } = {}
 ): Promise<CommandRunResult> {
   const handle = spawnRemoteServerScript(environment, script, options);
   return handle.done;
@@ -188,7 +189,7 @@ export function executeRemoteServerScript(
 export function spawnRemoteServerScript(
   environment: WorkEnvironmentRecord,
   script: string,
-  options: { timeout?: number; observer?: CommandRunObserver; displayCommand?: string; captureStdout?: boolean; closeStdin?: boolean } = {}
+  options: { timeout?: number; observer?: CommandRunObserver; displayCommand?: string; captureStdout?: boolean; closeStdin?: boolean; signal?: AbortSignal } = {}
 ): RemoteServerStreamHandle {
   assertRemoteServerCommandSupported(environment);
   const command = options.displayCommand ?? script;
@@ -202,13 +203,20 @@ export function spawnRemoteServerScript(
     const stderr = new OutputAccumulator(MAX_OUTPUT_CHARS);
     let killed = false;
     let settled = false;
+    let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+    const abort = (): void => {
+      if (settled || killed) return;
+      killed = true;
+      child.kill('SIGTERM');
+      forceKillTimer = setTimeout(() => {
+        if (!settled) child.kill('SIGKILL');
+      }, 1_500);
+      forceKillTimer.unref?.();
+    };
     const streamEvents = createStreamEventEmitter(options.observer);
     const timeout = options.timeout ?? DEFAULT_REMOTE_TIMEOUT_MS;
     const timer = timeout > 0
-      ? setTimeout(() => {
-        killed = true;
-        child.kill('SIGTERM');
-      }, timeout)
+      ? setTimeout(abort, timeout)
       : undefined;
     timer?.unref?.();
 
@@ -216,9 +224,14 @@ export function spawnRemoteServerScript(
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      options.signal?.removeEventListener('abort', abort);
       streamEvents.flush();
       resolve({ command, exitCode, killed, stdout: stdout.value(), stderr: stderr.value() });
     };
+
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
 
     if (options.captureStdout !== false) child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');

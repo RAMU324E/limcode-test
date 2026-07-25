@@ -17,6 +17,7 @@ export class MapWorld implements SchedulerWorld {
   private nextEntity = 1;
   private readonly alive = new Set<Entity>();
   private readonly stores = new Map<symbol, Map<Entity, unknown>>();
+  private readonly recordIdIndexes = new Map<symbol, Map<string, Entity>>();
   private readonly resources = new Map<symbol, unknown>();
   private readonly componentVersions = new Map<symbol, number>();
   private readonly resourceVersions = new Map<symbol, number>();
@@ -47,7 +48,9 @@ export class MapWorld implements SchedulerWorld {
       return;
     }
     for (const [componentId, store] of this.stores) {
+      const previous = store.get(entity);
       if (store.delete(entity)) {
+        this.unbindRecordId(componentId, entity, previous);
         this.bumpComponentId(componentId);
       }
     }
@@ -55,14 +58,22 @@ export class MapWorld implements SchedulerWorld {
   }
 
   public add<T>(entity: Entity, component: ComponentType<T>, value: T): void {
-    this.storeOf(component).set(entity, value);
+    const store = this.storeOf(component);
+    const previous = store.get(entity);
+    this.assertRecordIdImmutable(component, previous, value);
+    this.assertRecordIdAvailable(component.id, entity, value);
+    this.unbindRecordId(component.id, entity, previous);
+    store.set(entity, value);
+    this.bindRecordId(component.id, entity, value);
     this.bumpComponent(component);
     this._version++;
   }
 
   public remove<T>(entity: Entity, component: ComponentType<T>): void {
     const store = this.stores.get(component.id);
+    const previous = store?.get(entity);
     if (store && store.delete(entity)) {
+      this.unbindRecordId(component.id, entity, previous);
       this.bumpComponent(component);
       this._version++;
     }
@@ -74,6 +85,22 @@ export class MapWorld implements SchedulerWorld {
 
   public has(entity: Entity, component: ComponentType<unknown>): boolean {
     return this.stores.get(component.id)?.has(entity) ?? false;
+  }
+
+  public entityByRecordId<T extends { id: string }>(component: ComponentType<T>, id: string): Entity | undefined {
+    return this.recordIdIndexes.get(component.id)?.get(id);
+  }
+
+  /** Development inspection of the loaded Stable ID projection; never answers durable existence. */
+  public loadedRecordIdEntries(): Array<{ component: string; stableId: string; entity: Entity }> {
+    const entries: Array<{ component: string; stableId: string; entity: Entity }> = [];
+    for (const [componentId, bindings] of this.recordIdIndexes) {
+      const component = componentId.description ?? String(componentId);
+      for (const [stableId, entity] of bindings) entries.push({ component, stableId, entity });
+    }
+    return entries.sort((left, right) => left.component.localeCompare(right.component)
+      || left.stableId.localeCompare(right.stableId)
+      || left.entity - right.entity);
   }
 
   public query(...components: ComponentType<unknown>[]): Entity[] {
@@ -163,6 +190,7 @@ export class MapWorld implements SchedulerWorld {
   }
 
   public commit(commands: readonly WorldCommand[], applyEffect: (effect: unknown) => void): void {
+    this.validateIdentityCommands(commands);
     for (const command of commands) {
       switch (command.kind) {
         case 'spawn':
@@ -228,6 +256,99 @@ export class MapWorld implements SchedulerWorld {
     };
   }
 
+  private validateIdentityCommands(commands: readonly WorldCommand[]): void {
+    const overlays = new Map<symbol, Map<string, Entity>>();
+    const entityIds = new Map<symbol, Map<Entity, string>>();
+    const indexFor = (componentId: symbol): Map<string, Entity> => {
+      let index = overlays.get(componentId);
+      if (!index) {
+        index = new Map(this.recordIdIndexes.get(componentId));
+        overlays.set(componentId, index);
+      }
+      return index;
+    };
+    const idsFor = (componentId: symbol): Map<Entity, string> => {
+      let ids = entityIds.get(componentId);
+      if (!ids) {
+        ids = new Map<Entity, string>();
+        for (const [entity, value] of this.stores.get(componentId) ?? []) {
+          const id = recordIdOf(value);
+          if (id) ids.set(entity, id);
+        }
+        entityIds.set(componentId, ids);
+      }
+      return ids;
+    };
+    const removeEntity = (entity: Entity, componentId?: symbol): void => {
+      const componentIds = componentId ? [componentId] : [...new Set([...this.stores.keys(), ...entityIds.keys()])];
+      for (const id of componentIds) {
+        const previous = idsFor(id).get(entity);
+        if (!previous) continue;
+        if (indexFor(id).get(previous) === entity) indexFor(id).delete(previous);
+        idsFor(id).delete(entity);
+      }
+    };
+
+    for (const command of commands) {
+      if (command.kind === 'despawn') {
+        removeEntity(command.entity);
+        continue;
+      }
+      if (command.kind === 'remove') {
+        removeEntity(command.entity, command.component.id);
+        continue;
+      }
+      if (command.kind !== 'add') continue;
+      const componentId = command.component.id;
+      const previousId = idsFor(componentId).get(command.entity);
+      const stableId = recordIdOf(command.value);
+      if (previousId && stableId !== previousId) {
+        throw new Error(`${command.component.name} record id is immutable: ${previousId}.`);
+      }
+      removeEntity(command.entity, componentId);
+      if (!stableId) continue;
+      const conflict = indexFor(componentId).get(stableId);
+      if (conflict !== undefined && conflict !== command.entity) {
+        throw new Error(`${command.component.name} record id conflict: ${stableId} is bound to entities ${conflict} and ${command.entity}.`);
+      }
+      indexFor(componentId).set(stableId, command.entity);
+      idsFor(componentId).set(command.entity, stableId);
+    }
+  }
+
+  private assertRecordIdImmutable(component: ComponentType<unknown>, previous: unknown, value: unknown): void {
+    const previousId = recordIdOf(previous);
+    if (previousId && recordIdOf(value) !== previousId) {
+      throw new Error(`${component.name} record id is immutable: ${previousId}.`);
+    }
+  }
+
+  private assertRecordIdAvailable(componentId: symbol, entity: Entity, value: unknown): void {
+    const id = recordIdOf(value);
+    if (!id) return;
+    const conflict = this.recordIdIndexes.get(componentId)?.get(id);
+    if (conflict !== undefined && conflict !== entity) throw new Error(`Record id conflict: ${id} is bound to entities ${conflict} and ${entity}.`);
+  }
+
+  private bindRecordId(componentId: symbol, entity: Entity, value: unknown): void {
+    const id = recordIdOf(value);
+    if (!id) return;
+    let index = this.recordIdIndexes.get(componentId);
+    if (!index) {
+      index = new Map();
+      this.recordIdIndexes.set(componentId, index);
+    }
+    index.set(id, entity);
+  }
+
+  private unbindRecordId(componentId: symbol, entity: Entity, value: unknown): void {
+    const id = recordIdOf(value);
+    if (!id) return;
+    const index = this.recordIdIndexes.get(componentId);
+    if (index?.get(id) === entity) index.delete(id);
+    if (index?.size === 0) this.recordIdIndexes.delete(componentId);
+  }
+
   private storeOf(component: ComponentType<unknown>): Map<Entity, unknown> {
     let store = this.stores.get(component.id);
     if (!store) {
@@ -248,6 +369,12 @@ export class MapWorld implements SchedulerWorld {
   private bumpResource(resource: ResourceKey<unknown>): void {
     this.resourceVersions.set(resource.id, (this.resourceVersions.get(resource.id) ?? 0) + 1);
   }
+}
+
+function recordIdOf(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const id = (value as { id?: unknown }).id;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
 }
 
 function assertNever(value: never): never {

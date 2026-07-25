@@ -1,16 +1,15 @@
 import * as vscode from 'vscode';
 import type { Entity, World } from '../ecs/types';
 import type { CommandCapability, FsCapability, LlmCapability, StorageCapability, WebviewCapability, FsPendingFileChangeProposal } from '../capabilities/types';
-import { ChatEventType } from '../world/modules/chat/events';
-import { AgentRunEventType } from '../world/modules/agentRun/events';
 import { AgentRun } from '../world/modules/agentRun/components';
-import { Conversation, Message, PartOf } from '../world/modules/chat/components';
+import { Conversation, LlmRequest, Message, PartOf } from '../world/modules/chat/components';
 import { LlmInvocation, MessageLlmInvocationLink, RunLlmInvocationLink } from '../world/modules/llm/components';
-import { buildLlmStartRequestForRun } from '../world/modules/chat/systems/LlmDispatchSystem';
-import { CompressionBlock, CompressionBlockLlmInvocationLink, CompressionBlockSourceLink } from '../world/modules/compression/components';
+import { buildLlmStartRequestForRun } from '../world/modules/chat/llmRequestPlanning';
+import { CompressionModelContextProjectionLink, ModelContextProjection, RequestModelContextProjectionLink } from '../world/modules/modelContext/components';
+import { CompressionBlock, CompressionBlockLlmInvocationLink } from '../world/modules/compression/components';
 import { ToolEventType } from '../world/modules/tools/events';
 import { PlanReviewEventType } from '../world/modules/plan/events';
-import { ToolCall, ToolState } from '../world/modules/tools/components';
+import { ToolCall, ToolCallResultLink, ToolResultArtifact, ToolState } from '../world/modules/tools/components';
 import { activeToolPolicyForRun, runForToolCall } from '../world/modules/agentRun/queries';
 import { activeWorkEnvironmentForRun, pathAccessibleWorkEnvironmentsForRun, toPublicWorkEnvironmentRecord } from '../world/modules/workEnvironment/queries';
 import { allowOutsideProjectPathsFromConfig } from '../world/modules/tools/definitions/filePathPolicy';
@@ -19,7 +18,6 @@ import { WorkflowEventType } from '../world/modules/workflow/events';
 import { WorkEnvironmentEventType } from '../world/modules/workEnvironment/events';
 import { CheckpointEventType } from '../world/modules/checkpoint/events';
 import { AgentEventType } from '../world/modules/agent/events';
-import { CompressionEventType } from '../world/modules/compression/events';
 import { RuntimeContextEventType } from '../world/modules/runtimeContext/events';
 import { Checkpoint, ShadowRepository } from '../world/modules/checkpoint/components';
 import { ModelProfile, ModelProfileScopeLink, type ModelProfileScopeLinkData } from '../world/modules/workflow/components';
@@ -33,42 +31,36 @@ import {
   conversationSettingsStreamId,
   globalSettingsStreamId,
   createMessageId,
-  isFileDataPart,
-  isFunctionCallPart,
-  isFunctionResponsePart,
-  isInlineDataPart,
-  isProviderContextPart,
-  isTextPart,
-  type BackgroundCommandOutputGetPayload,
+  type BackgroundProcessOutputGetPayload,
   type ChatModelOverrideRecord,
   type BridgeClientId,
   type CheckpointDiffOpenPayload,
   type CheckpointRestorePayload,
   type AttachmentOpenPayload,
   type AttachmentReloadPayload,
-  type ContentPart,
   type FsStatGetPayload,
   type FsStatResultEntry,
   type ToolDiffOpenPayload,
+  type ToolResultArtifactGetPayload,
   type PlanProposalExportPayload,
   type ConversationTimelinePageRequest,
-  type LlmInvocationSettingsSnapshotRecord,
-  type MessageContent,
-  type MessageDeleteFromPayload,
-  type MessageEditPayload,
-  type MessageRetryFromPayload,
+  type ConversationRunDetailRecord,
+  type ConversationRunDetailRequest,
+  type ConversationRunHistoryPageRecord,
+  type ConversationRunHistoryPageRequest,
   type LlmProviderModelsGetPayload,
   type ProjectFolderCandidateRecord,
   type RuleScope,
   type WebviewToExtensionMessage
 } from '../../shared/protocol';
-import { hydrateConversationDetail } from './clientStateHydration';
-import { materializeAttachmentFileUri, resolveAttachmentForClient } from '../capabilities/vscodeStorage/attachmentStore';
+import { EXTENSION_BRAND } from '../../shared/extensionIdentity';
+import type { ResolvedAttachmentInlineData } from '../capabilities/vscodeStorage/attachmentStore';
 
 import type { GlobalSettingsBridge } from './GlobalSettingsBridge';
 import type { ConversationSettingsBridge } from './ConversationSettingsBridge';
 import type { SetConversationProjectFolderInput } from './BackendApplication';
 import type { WebviewClientRegistry } from './WebviewClientRegistry';
+import { getRuntimeBuildInfo } from './runtimeBuildInfo';
 
 export interface WebviewMessageRouterDeps {
   world: World;
@@ -81,17 +73,24 @@ export interface WebviewMessageRouterDeps {
   globalSettingsBridge: GlobalSettingsBridge;
   conversationSettingsBridge: ConversationSettingsBridge;
   isHydrated: () => boolean;
+  isAuthoritativeStorageReady: () => boolean;
   requestSnapshot: (conversationId?: string) => void;
   requestPersist?: (reason: string) => void;
-  flushPersistence?: (reason: string) => Promise<void>;
   ensureConversationDetailLoaded: (conversationId: string) => Promise<void>;
   ensureConversationTailLoaded: (conversationId: string) => Promise<void>;
+  loadConversationTimelinePage: (request: ConversationTimelinePageRequest) => Promise<import('../../shared/protocol').ConversationTimelinePageRecord>;
+  loadConversationRunHistoryPage: (request: ConversationRunHistoryPageRequest) => Promise<ConversationRunHistoryPageRecord>;
+  loadConversationRunDetail: (request: ConversationRunDetailRequest) => Promise<ConversationRunDetailRecord | undefined>;
+  resolveConversationRunIdForMessage: (conversationId: string, messageId: string) => Promise<string | undefined>;
+  resolveAttachmentForClient: (input: AttachmentReloadPayload) => Promise<ResolvedAttachmentInlineData>;
+  materializeAttachmentFileUri: (input: AttachmentOpenPayload) => Promise<vscode.Uri | undefined>;
   getProjectFolderCandidates: () => ProjectFolderCandidateRecord[];
   setConversationProjectFolder: (input: SetConversationProjectFolderInput) => boolean;
   importWorkEnvironmentsFromVscode: () => Promise<number>;
   refreshSkillCatalog: () => Promise<void>;
   refreshRulesCatalog: () => Promise<void>;
   saveRuleFile: (scope: RuleScope, content: string) => Promise<void>;
+  applyToolChangeFromEditor: (conversationId: string, toolCallId: string) => Promise<void>;
 }
 
 /**
@@ -103,47 +102,6 @@ export class WebviewMessageRouter {
 
   public handle(clientId: BridgeClientId, message: WebviewToExtensionMessage): void {
     switch (message.type) {
-      case BridgeMessageType.ChatSend:
-        if (!message.payload) return;
-        {
-          const payload = message.payload;
-          this.upsertConversationModelOverride(payload.conversationId, payload.model);
-          void this.enqueueAfterConversationTailLoaded(payload.conversationId, () => {
-            this.deps.world.enqueue({ type: ChatEventType.Send, payload });
-          });
-        }
-        break;
-      case BridgeMessageType.ChatAbort:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.CancelConversation, payload: { conversationId: message.payload.conversationId, reason: 'chat_abort' } });
-        break;
-      case BridgeMessageType.LlmRetryCancel:
-        if (!this.deps.isHydrated() || !message.payload?.requestId) return;
-        this.deps.llm.cancelRetry(message.payload.requestId);
-        break;
-      case BridgeMessageType.MessageEdit:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        {
-          const payload = message.payload;
-          this.upsertConversationModelOverride(payload.conversationId, payload.model);
-          void this.handleMessageEdit(payload);
-        }
-        break;
-      case BridgeMessageType.MessageDeleteFrom:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        {
-          const payload = message.payload;
-          void this.handleMessageDeleteFrom(payload);
-        }
-        break;
-      case BridgeMessageType.MessageRetryFrom:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        {
-          const payload = message.payload;
-          this.upsertConversationModelOverride(payload.conversationId, payload.model);
-          void this.handleMessageRetryFrom(payload);
-        }
-        break;
       case BridgeMessageType.ToolPolicyScopeSet:
         if (!this.deps.isHydrated() || !message.payload) return;
         this.deps.world.enqueue({ type: ToolEventType.PolicyScopeSetRequested, payload: message.payload });
@@ -180,117 +138,20 @@ export class WebviewMessageRouter {
         if (!this.deps.isHydrated()) return;
         void this.deps.refreshRulesCatalog().catch((error) => this.postRequestError(clientId, message.type, error instanceof Error ? error.message : '无法刷新规则目录。', message.id));
         break;
-      case BridgeMessageType.ToolExecutionApprove:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.ExecutionApproveRequested, payload: message.payload });
-        break;
-      case BridgeMessageType.ToolExecutionReject:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.ExecutionRejectRequested, payload: message.payload });
-        break;
-      case BridgeMessageType.ToolExecutionCancel:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.ExecutionCancelRequested, payload: message.payload });
-        break;
       case BridgeMessageType.ToolDiffOpen:
         if (!this.deps.isHydrated() || !message.payload) return;
         void this.handleToolDiffOpen(message.payload).catch((error) => {
           const messageText = error instanceof Error ? error.message : '无法打开实时差异视图。';
-          void vscode.window.showWarningMessage(`LimCode ${messageText}`);
+          void vscode.window.showWarningMessage(`${EXTENSION_BRAND} ${messageText}`);
         });
-        break;
-      case BridgeMessageType.ToolChangeApply:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.ChangeApplyRequested, payload: message.payload });
-        void this.deps.fs.closePendingFileChangeDiff(message.payload.toolCallId, message.payload.conversationId);
-        break;
-      case BridgeMessageType.ToolChangeReject:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.ChangeRejectRequested, payload: message.payload });
-        break;
-      case BridgeMessageType.ToolResultSubmit:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.ResultSubmitRequested, payload: message.payload });
-        break;
-      case BridgeMessageType.ToolResultReject:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.ResultRejectRequested, payload: message.payload });
-        break;
-      case BridgeMessageType.AskUserAnswerSubmit:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: ToolEventType.AskUserAnswerSubmitted, payload: message.payload });
-        break;
-      case BridgeMessageType.PlanProposalApprove:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: PlanReviewEventType.ProposalApproveRequested, payload: message.payload });
-        break;
-      case BridgeMessageType.PlanProposalRequestChanges:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: PlanReviewEventType.ProposalChangesRequested, payload: message.payload });
-        break;
-      case BridgeMessageType.PlanProposalReject:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: PlanReviewEventType.ProposalRejectRequested, payload: message.payload });
         break;
       case BridgeMessageType.PlanProposalExport:
         if (!message.payload) return;
         void this.handlePlanProposalExport(message.payload).catch((error) => {
           const messageText = error instanceof Error ? error.message : '无法导出 Plan。';
           this.postRequestError(clientId, message.type, messageText, message.id);
-          void vscode.window.showErrorMessage(`LimCode: ${messageText}`);
+          void vscode.window.showErrorMessage(`${EXTENSION_BRAND}: ${messageText}`);
         });
-        break;
-      case BridgeMessageType.AgentRunCancel:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.Cancel, payload: message.payload });
-        break;
-      case BridgeMessageType.AgentRunPause:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.Pause, payload: message.payload });
-        break;
-      case BridgeMessageType.AgentRunResume:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.Resume, payload: message.payload });
-        break;
-      case BridgeMessageType.AgentRunRetry:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.Retry, payload: message.payload });
-        break;
-      case BridgeMessageType.AgentRunRegenerate:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.Regenerate, payload: message.payload });
-        break;
-      case BridgeMessageType.AgentRunMarkStale:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.MarkStale, payload: message.payload });
-        break;
-      case BridgeMessageType.QueuePromote:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.Promote, payload: message.payload });
-        break;
-      case BridgeMessageType.QueueRemove:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.RemoveQueued, payload: message.payload });
-        break;
-      case BridgeMessageType.QueueReorder:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.ReorderQueue, payload: message.payload });
-        break;
-      case BridgeMessageType.QueuePause:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.PauseQueue, payload: message.payload });
-        break;
-      case BridgeMessageType.QueueResume:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.ResumeQueue, payload: message.payload });
-        break;
-      case BridgeMessageType.QueueResumeAll:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.ResumeQueueConversation, payload: message.payload });
-        break;
-      case BridgeMessageType.QueueInputUpdate:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: AgentRunEventType.UpdateQueuedInput, payload: message.payload });
         break;
       case BridgeMessageType.AgentCreate:
         if (!this.deps.isHydrated() || !message.payload) return;
@@ -386,6 +247,9 @@ export class WebviewMessageRouter {
       case BridgeMessageType.ConversationTimelinePageGet:
         if (message.payload) void this.postConversationTimelinePage(clientId, message.payload, message.id);
         break;
+      case BridgeMessageType.ToolResultArtifactGet:
+        if (message.payload) void this.postToolResultArtifact(clientId, message.payload, message.id);
+        break;
       case BridgeMessageType.RunHistoryPageGet:
         if (message.payload) void this.postRunHistoryPage(clientId, message.payload, message.id);
         break;
@@ -406,63 +270,6 @@ export class WebviewMessageRouter {
         break;
       case BridgeMessageType.CheckpointShadowDelete:
         if (message.payload) void this.handleCheckpointShadowDelete(clientId, message.payload.storageKeys, message.id);
-        break;
-      case BridgeMessageType.CompressionCreate: {
-        if (!this.deps.isHydrated() || !message.payload) {
-          this.logCompressionRoute('create.skipNotReady', { hydrated: this.deps.isHydrated(), hasPayload: !!message.payload });
-          return;
-        }
-        const payload = message.payload;
-        this.logCompressionRoute('create.received', {
-          payload,
-          beforeLoad: this.compressionRouteConversationDebug(payload.conversationId)
-        });
-        void (payload.startMessageId || payload.endMessageId
-          ? this.enqueueAfterTimelineRangeLoaded({ conversationId: payload.conversationId, mode: 'between', startMessageId: payload.startMessageId, endMessageId: payload.endMessageId }, () => {
-            this.logCompressionRoute('create.enqueueAfterRangeLoaded', {
-              payload,
-              afterLoad: this.compressionRouteConversationDebug(payload.conversationId)
-            });
-            this.deps.world.enqueue({ type: CompressionEventType.Create, payload });
-          })
-          : this.enqueueAfterConversationLoaded(payload.conversationId, () => {
-            this.logCompressionRoute('create.enqueueAfterConversationLoaded', {
-              payload,
-              afterLoad: this.compressionRouteConversationDebug(payload.conversationId)
-            });
-            this.deps.world.enqueue({ type: CompressionEventType.Create, payload });
-          }));
-        break;
-      }
-      case BridgeMessageType.CompressionDelete:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        void this.enqueueAfterConversationLoaded(message.payload.conversationId, () => {
-          this.deps.world.enqueue({ type: CompressionEventType.Delete, payload: message.payload });
-        });
-        break;
-      case BridgeMessageType.CompressionUpdate:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        void this.enqueueAfterConversationLoaded(message.payload.conversationId, () => {
-          this.deps.world.enqueue({ type: CompressionEventType.Update, payload: message.payload });
-        });
-        break;
-      case BridgeMessageType.CompressionRegenerate:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        void this.enqueueAfterConversationLoaded(message.payload.conversationId, () => {
-          this.deps.world.enqueue({ type: CompressionEventType.Regenerate, payload: message.payload });
-        });
-        break;
-      case BridgeMessageType.CompressionDisable:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        void this.enqueueAfterConversationLoaded(message.payload.conversationId, () => {
-          this.deps.world.enqueue({ type: CompressionEventType.Disable, payload: message.payload });
-        });
-        break;
-      case BridgeMessageType.CompressionEnable:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        void this.enqueueAfterConversationLoaded(message.payload.conversationId, () => {
-          this.deps.world.enqueue({ type: CompressionEventType.Enable, payload: message.payload });
-        });
         break;
       case BridgeMessageType.GlobalSettingsGet:
         if (!message.payload) return;
@@ -558,12 +365,6 @@ export class WebviewMessageRouter {
         this.deps.requestSnapshot();
         this.deps.requestPersist?.('checkpointPolicy.scope.clear');
         break;
-      case BridgeMessageType.CheckpointDismiss:
-        if (!this.deps.isHydrated() || !message.payload) return;
-        this.deps.world.enqueue({ type: CheckpointEventType.DismissRequested, payload: { checkpointId: message.payload.checkpointId } });
-        this.deps.requestSnapshot(message.payload.conversationId);
-        this.deps.requestSnapshot();
-        break;
       case BridgeMessageType.CheckpointRestore:
         if (message.payload) void this.handleCheckpointRestore(clientId, message.payload, message.id);
         break;
@@ -586,8 +387,8 @@ export class WebviewMessageRouter {
           }
           this.deps.webview.subscribe(clientId, GLOBAL_CLIENT_STATE_STREAM_ID);
           this.deps.requestSnapshot();
-          if (!this.deps.isHydrated()) break;
-          // 仅在数据就绪时立即推送 settings section 快照。
+          if (!this.deps.isHydrated() || !this.deps.isAuthoritativeStorageReady()) break;
+          // 仅在迁移与初始 hydration 都成功后推送可能物化默认值的 settings 快照。
           for (const section of GLOBAL_SETTINGS_SECTIONS) {
             void this.deps.globalSettingsBridge.postSnapshot(clientId, section, message.id);
           }
@@ -625,8 +426,8 @@ export class WebviewMessageRouter {
       case BridgeMessageType.FsStatGet:
         if (message.payload) void this.postFsStatResult(clientId, message.payload, message.id);
         break;
-      case BridgeMessageType.BackgroundCommandOutputGet:
-        if (message.payload) this.postBackgroundCommandOutputResult(clientId, message.payload, message.id);
+      case BridgeMessageType.BackgroundProcessOutputGet:
+        if (message.payload) this.postBackgroundProcessOutputResult(clientId, message.payload, message.id);
         break;
       default:
         break;
@@ -634,56 +435,21 @@ export class WebviewMessageRouter {
   }
 
 
-  private logCompressionRoute(stage: string, payload: Record<string, unknown>): void {
-    console.info('[LimCode][Compression][Router]', stage, payload);
-  }
-
-  private compressionRouteConversationDebug(conversationId: string): Record<string, unknown> {
-    const conversation = this.deps.world.query(Conversation).find((entity) => this.deps.world.get(entity, Conversation)?.id === conversationId);
-    if (conversation === undefined) {
-      return { conversationId, conversationFound: false };
-    }
-    const messages = this.deps.world
-      .query(Message, PartOf)
-      .filter((entity) => this.deps.world.get(entity, PartOf)?.parent === conversation)
-      .map((entity) => this.deps.world.get(entity, Message))
-      .filter((record): record is NonNullable<typeof record> => !!record)
-      .sort((left, right) => left.seq - right.seq || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    const blocks = this.deps.world
-      .query(CompressionBlock)
-      .map((entity) => this.deps.world.get(entity, CompressionBlock))
-      .filter((block): block is NonNullable<typeof block> => !!block && block.conversation === conversation)
-      .sort((left, right) => (left.anchorSeq ?? left.endSeq ?? 0) - (right.anchorSeq ?? right.endSeq ?? 0) || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    return {
-      conversationId,
-      conversationFound: true,
-      hydratedMessageCount: messages.length,
-      firstSeq: messages[0]?.seq,
-      lastSeq: messages[messages.length - 1]?.seq,
-      streamingMessageCount: messages.filter((message) => message.status === 'streaming').length,
-      compressionBlockCount: blocks.length,
-      runningCompressionBlocks: blocks
-        .filter((block) => block.status === 'pending' || block.status === 'running')
-        .map((block) => ({ id: block.id, status: block.status, anchorSeq: block.anchorSeq, endSeq: block.endSeq }))
-    };
-  }
-
-
-  private postBackgroundCommandOutputResult(clientId: BridgeClientId, payload: BackgroundCommandOutputGetPayload, correlationId: string): void {
+  private postBackgroundProcessOutputResult(clientId: BridgeClientId, payload: BackgroundProcessOutputGetPayload, correlationId: string): void {
     const processId = payload.processId.trim();
     if (!processId) {
-      this.postRequestError(clientId, BridgeMessageType.BackgroundCommandOutputGet, '缺少后台命令 processId。', correlationId);
+      this.postRequestError(clientId, BridgeMessageType.BackgroundProcessOutputGet, '缺少后台命令 processId。', correlationId);
       return;
     }
-    const consume = payload.consume !== false;
+    const consume = payload.consume === true;
     const output = this.deps.command.readOutput(processId, { maxOutputLines: 1000, maxOutputChars: 100_000 }, { consume });
     const terminal = output.running === false || output.status === 'exited' || output.status === 'killed' || output.status === 'not_found';
     this.deps.webview.post(clientId, {
       id: createMessageId(),
-      type: BridgeMessageType.BackgroundCommandOutputResult,
+      type: BridgeMessageType.BackgroundProcessOutputResult,
       channel: 'state',
       correlationId,
-      payload: { ...output, processId, consumed: consume && terminal }
+      payload: { ...output, processId, consumed: consume && terminal && output.status !== 'not_found' }
     });
   }
   private async postFsStatResult(clientId: BridgeClientId, payload: FsStatGetPayload, correlationId: string): Promise<void> {
@@ -698,113 +464,14 @@ export class WebviewMessageRouter {
     });
   }
 
-  private async enqueueAfterConversationLoaded(conversationId: string, action: () => void): Promise<void> {
-    try {
-      await this.deps.ensureConversationDetailLoaded(conversationId);
-      action();
-    } catch (error) {
-      console.warn('[LimCode] Failed to hydrate conversation before command.', error);
-    }
-  }
-
   private async enqueueAfterConversationTailLoaded(conversationId: string, action: () => void): Promise<void> {
     try {
       await this.deps.ensureConversationTailLoaded(conversationId);
-    } catch (error) {
-      console.warn('[LimCode] Failed to hydrate conversation tail before command.', error);
-    }
-    action();
-  }
-
-  private async handleMessageDeleteFrom(payload: MessageDeleteFromPayload): Promise<void> {
-    try {
-      await this.enqueueAfterTimelineRangeLoaded({ conversationId: payload.conversationId, mode: 'between', startMessageId: payload.messageId, endMessageId: payload.messageId, contextBeforeChunks: 1 }, () => undefined);
-      const deletePayload = this.normalizeDeleteFromPayload(payload);
-      await this.deps.flushPersistence?.('before-message-delete-truncate');
-      await this.deps.storage.truncateConversationTimeline({ conversationId: deletePayload.conversationId, anchorMessageId: deletePayload.messageId, keepAnchor: false });
-      this.deps.world.enqueue({ type: ChatEventType.DeleteFrom, payload: deletePayload });
-    } catch (error) {
-      console.warn('[LimCode] Failed to truncate conversation before deleting messages.', error);
-    }
-  }
-
-  private normalizeDeleteFromPayload(payload: MessageDeleteFromPayload): MessageDeleteFromPayload {
-    const boundaryMessageId = this.functionCallBoundaryForToolResponse(payload.conversationId, payload.messageId);
-    return boundaryMessageId && boundaryMessageId !== payload.messageId ? { ...payload, messageId: boundaryMessageId } : payload;
-  }
-
-  private functionCallBoundaryForToolResponse(conversationId: string, messageId: string): string | undefined {
-    const conversation = this.deps.world.query(Conversation).find((entity) => this.deps.world.get(entity, Conversation)?.id === conversationId);
-    if (conversation === undefined) return undefined;
-    const messages = this.deps.world
-      .query(Message, PartOf)
-      .filter((entity) => this.deps.world.get(entity, PartOf)?.parent === conversation)
-      .sort((left, right) => (this.deps.world.get(left, Message)?.seq ?? 0) - (this.deps.world.get(right, Message)?.seq ?? 0));
-    const index = messages.findIndex((entity) => this.deps.world.get(entity, Message)?.id === messageId);
-    if (index < 0) return undefined;
-    const message = this.deps.world.get(messages[index], Message);
-    const response = message?.content.parts.find(isFunctionResponsePart);
-    if (!response || !isFunctionResponsePart(response)) return undefined;
-    const responseId = response.id?.trim();
-    const responseName = response.functionResponse.name;
-    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
-      const candidate = this.deps.world.get(messages[cursor], Message);
-      if (!candidate) continue;
-      const matched = candidate.content.parts.some((part) => {
-        if (!isFunctionCallPart(part)) return false;
-        if (responseId && part.id?.trim() === responseId) return true;
-        return !responseId && part.functionCall.name === responseName;
-      });
-      if (matched) return candidate.id;
-      if (candidate.role === 'user' && !candidate.content.parts.some(isFunctionResponsePart)) break;
-    }
-    return undefined;
-  }
-
-  private async handleMessageEdit(payload: MessageEditPayload): Promise<void> {
-    try {
-      await this.enqueueAfterTimelineRangeLoaded({ conversationId: payload.conversationId, mode: 'between', startMessageId: payload.messageId, endMessageId: payload.messageId, contextBeforeChunks: 1 }, () => undefined);
-      if (payload.deleteFollowing) {
-        await this.deps.flushPersistence?.('before-message-edit-truncate');
-        await this.deps.storage.truncateConversationTimeline({ conversationId: payload.conversationId, anchorMessageId: payload.messageId, keepAnchor: true });
-      }
-      this.deps.world.enqueue({ type: ChatEventType.Edit, payload });
-    } catch (error) {
-      console.warn('[LimCode] Failed to prepare conversation before editing message.', error);
-    }
-  }
-
-  private async handleMessageRetryFrom(payload: MessageRetryFromPayload): Promise<void> {
-    try {
-      await this.enqueueAfterTimelineRangeLoaded({ conversationId: payload.conversationId, mode: 'between', startMessageId: payload.messageId, endMessageId: payload.messageId, contextBeforeChunks: 1 }, () => undefined);
-      await this.deps.flushPersistence?.('before-message-retry-truncate');
-      await this.deps.storage.truncateConversationTimeline({ conversationId: payload.conversationId, anchorMessageId: payload.messageId, keepAnchor: false });
-      this.deps.world.enqueue({ type: ChatEventType.RetryFrom, payload });
-    } catch (error) {
-      console.warn('[LimCode] Failed to truncate conversation before retrying message.', error);
-    }
-  }
-
-  private async enqueueAfterTimelineRangeLoaded(
-    request: {
-      conversationId: string;
-      mode: 'suffix' | 'prefix' | 'between';
-      anchorMessageId?: string;
-      startMessageId?: string;
-      endMessageId?: string;
-      contextBeforeChunks?: number;
-    },
-    action: () => void
-  ): Promise<void> {
-    try {
-      const detail = await this.deps.storage.loadConversationTimelineRange(request);
-      if (detail) await hydrateConversationDetail(this.deps.world, detail, request.conversationId);
       action();
     } catch (error) {
-      console.warn('[LimCode] Failed to hydrate conversation timeline range before command.', error);
+      console.error('[LimCode] Conversation command blocked because committed tail hydration failed.', error);
     }
   }
-
 
   private handleClientResync(clientId: BridgeClientId, streamId: string | undefined, conversationId: string | undefined): void {
     this.subscribeRequestedStream(clientId, streamId, conversationId);
@@ -817,6 +484,44 @@ export class WebviewMessageRouter {
     void this.enqueueAfterConversationTailLoaded(requestedConversationId, () => this.deps.requestSnapshot(requestedConversationId));
   }
 
+  private async postToolResultArtifact(
+    clientId: BridgeClientId,
+    payload: ToolResultArtifactGetPayload,
+    correlationId?: string
+  ): Promise<void> {
+    try {
+      await this.deps.ensureConversationDetailLoaded(payload.conversationId);
+      const artifacts = this.deps.world.query(ToolResultArtifact)
+        .map((entity) => this.deps.world.get(entity, ToolResultArtifact))
+        .filter((artifact): artifact is NonNullable<typeof artifact> => artifact?.id === payload.artifactId);
+      if (artifacts.length !== 1 || artifacts[0].conversationId !== payload.conversationId) {
+        throw new Error(`ToolResult Artifact 不存在或不属于当前对话：${payload.artifactId}`);
+      }
+      const artifact = artifacts[0];
+      const content = await this.deps.storage.loadToolResultContent(artifact);
+      this.deps.webview.post(clientId, {
+        id: createMessageId(),
+        type: BridgeMessageType.ToolResultArtifactSnapshot,
+        channel: 'state',
+        scope: { kind: 'conversation', id: payload.conversationId },
+        correlationId,
+        payload: {
+          conversationId: payload.conversationId,
+          artifactId: artifact.id,
+          contentHash: artifact.contentHash,
+          content
+        }
+      });
+    } catch (error) {
+      this.postRequestError(
+        clientId,
+        BridgeMessageType.ToolResultArtifactGet,
+        error instanceof Error ? error.message : '无法加载完整工具结果。',
+        correlationId
+      );
+    }
+  }
+
   private async postConversationTimelinePage(
     clientId: BridgeClientId,
     payload: ConversationTimelinePageRequest,
@@ -824,7 +529,7 @@ export class WebviewMessageRouter {
   ): Promise<void> {
     try {
       this.deps.webview.subscribe(clientId, conversationTimelineStreamId(payload.conversationId));
-      const page = await this.deps.storage.loadConversationTimelinePage(payload);
+      const page = await this.deps.loadConversationTimelinePage(payload);
       this.deps.webview.post(clientId, {
         id: createMessageId(),
         type: BridgeMessageType.ConversationTimelinePageSnapshot,
@@ -845,7 +550,7 @@ export class WebviewMessageRouter {
     correlationId?: string
   ): Promise<void> {
     try {
-      const page = await this.deps.storage.loadConversationRunHistoryPage(payload);
+      const page = await this.deps.loadConversationRunHistoryPage(payload);
       this.deps.webview.post(clientId, {
         id: createMessageId(),
         type: BridgeMessageType.RunHistoryPageSnapshot,
@@ -861,7 +566,7 @@ export class WebviewMessageRouter {
 
   private async postRunHistoryDetail(clientId: BridgeClientId, payload: { conversationId: string; runId?: string; messageId?: string }, correlationId?: string): Promise<void> {
     try {
-      const detail = await this.deps.storage.loadConversationRunDetail(payload);
+      const detail = await this.deps.loadConversationRunDetail(payload);
       if (!detail) {
         this.postRequestError(clientId, BridgeMessageType.RunHistoryDetailGet, '无法找到该运行详情。', correlationId);
         return;
@@ -880,7 +585,7 @@ export class WebviewMessageRouter {
         return;
       }
 
-      const runId = payload.runId ?? (payload.messageId ? await this.deps.storage.resolveConversationRunIdForMessage(payload.conversationId, payload.messageId) : undefined);
+      const runId = payload.runId ?? (payload.messageId ? await this.deps.resolveConversationRunIdForMessage(payload.conversationId, payload.messageId) : undefined);
       if (!runId) {
         this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '无法根据这条消息找到对应的 run。', correlationId);
         return;
@@ -900,7 +605,46 @@ export class WebviewMessageRouter {
       }
 
       const invocationData = this.deps.world.get(invocation, LlmInvocation);
-      const request = buildLlmStartRequestForRun(this.deps.world, { run, invocation, requestId: `dryrun-${invocationData?.id ?? runId}-${Date.now()}` });
+      const originalRequestEntity = invocationData?.requestId
+        ? this.deps.world.entityByRecordId(LlmRequest, invocationData.requestId)
+        : undefined;
+      const originalRequest = originalRequestEntity === undefined ? undefined : this.deps.world.get(originalRequestEntity, LlmRequest);
+      const invocationMessageLinks = this.deps.world.query(MessageLlmInvocationLink)
+        .map((entity) => this.deps.world.get(entity, MessageLlmInvocationLink))
+        .filter((link): link is NonNullable<typeof link> => !!link && link.invocation === invocation && link.role === 'modelOutput');
+      if (invocationMessageLinks.length > 1) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '历史 invocation 存在多个 modelMessage 关系，无法确定性重放。', correlationId);
+        return;
+      }
+      const modelMessage = originalRequest?.modelMessage ?? invocationMessageLinks[0]?.message;
+      const conversation = originalRequest?.conversation ?? (modelMessage === undefined ? undefined : this.deps.world.get(modelMessage, PartOf)?.parent);
+      if (modelMessage === undefined || conversation === undefined) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '历史 invocation 缺少精确 Request/modelMessage 关系，已拒绝猜测最新消息。', correlationId);
+        return;
+      }
+      const originalRequestId = invocationData?.requestId ?? originalRequest?.id;
+      const projectionLinks = originalRequestId
+        ? this.deps.world.query(RequestModelContextProjectionLink)
+            .map((entity) => this.deps.world.get(entity, RequestModelContextProjectionLink))
+            .filter((link): link is NonNullable<typeof link> => !!link && link.requestId === originalRequestId && link.role === 'input')
+        : [];
+      if (projectionLinks.length !== 1) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, `历史 Request 缺少唯一的 ModelContextProjection（找到 ${projectionLinks.length} 条），已拒绝从当前消息重算。`, correlationId);
+        return;
+      }
+      const persistedProjection = this.deps.world.get(projectionLinks[0].projection, ModelContextProjection);
+      if (!persistedProjection || persistedProjection.runId !== runId || persistedProjection.modelMessageId !== this.deps.world.get(modelMessage, Message)?.id) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '历史 ModelContextProjection 与 Run/modelMessage 身份不一致。', correlationId);
+        return;
+      }
+      const request = buildLlmStartRequestForRun(this.deps.world, {
+        run,
+        conversation,
+        modelMessage,
+        invocation,
+        requestId: `dryrun-${invocationData?.id ?? runId}-${Date.now()}`,
+        contextContents: persistedProjection.contents
+      });
       if (!request) {
         this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '无法从当前 ECS 状态构建本次 LLM 请求。', correlationId);
         return;
@@ -912,7 +656,14 @@ export class WebviewMessageRouter {
         type: BridgeMessageType.LlmDryRunSnapshot,
         channel: 'state',
         correlationId,
-        payload: { conversationId: payload.conversationId, runId, ...(invocationData ? { invocationId: invocationData.id, settingsSnapshot: invocationData.settings } : {}), ...dryRun }
+        payload: {
+          conversationId: payload.conversationId,
+          runId,
+          ...(invocationData ? { invocationId: invocationData.id, settingsSnapshot: invocationData.settings } : {}),
+          executionKind: 'single_request',
+          calls: [{ ...dryRun, id: request.id, label: 'LLM Request', ordinal: 0 }],
+          generatedAt: dryRun.generatedAt
+        }
       });
     } catch (error) {
       console.warn('[LimCode] Failed to dry-run LLM request.', error);
@@ -933,68 +684,68 @@ export class WebviewMessageRouter {
         this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '无法找到该压缩块，不能构建 dry-run 请求。', correlationId);
         return;
       }
-      if (block.methodKind === 'openai_responses_compact') {
-        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, 'OpenAI 原生压缩暂不支持 curl dry-run。', correlationId);
+      const projectionLinks = this.deps.world.query(CompressionModelContextProjectionLink)
+        .map((entity) => this.deps.world.get(entity, CompressionModelContextProjectionLink))
+        .filter((link): link is NonNullable<typeof link> => !!link && link.block === blockEntity && link.role === 'source');
+      if (projectionLinks.length !== 1) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, `压缩块缺少唯一的 ModelContextProjection（找到 ${projectionLinks.length} 条）。`, correlationId);
+        return;
+      }
+      const projection = this.deps.world.get(projectionLinks[0].projection, ModelContextProjection);
+      if (!projection || projection.purposeKind !== 'compression' || projection.fingerprint !== block.sourceHash) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '压缩块与其不可变 ModelContextProjection 身份不一致。', correlationId);
+        return;
+      }
+      if (!block.compressionConfigSnapshot) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '压缩块缺少不可变方法配置快照，已拒绝使用当前设置猜测。', correlationId);
+        return;
+      }
+      const requiresProvider = block.methodKind !== 'deterministic_summary' && block.methodKind !== 'manual_summary';
+      if (requiresProvider && !block.providerSettingsSnapshot) {
+        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '压缩块缺少 Provider 设置快照，已拒绝使用当前渠道猜测。', correlationId);
         return;
       }
 
       const invocationEntity = this.findCompressionInvocation(blockEntity, payload.invocationId);
       const invocation = invocationEntity !== undefined ? this.deps.world.get(invocationEntity, LlmInvocation) : undefined;
-      if (!invocation?.settings) {
-        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '无法找到本次压缩调用快照，不能构建 dry-run 请求。', correlationId);
-        return;
-      }
+      const request = {
+        id: `dryrun-${block.id}-${Date.now()}`,
+        blockId: block.id,
+        conversationId: payload.conversationId,
+        ...(invocation ? { invocationId: invocation.id } : {}),
+        ...(block.methodConfigId ? { methodConfigId: block.methodConfigId } : {}),
+        methodKind: block.methodKind,
+        methodConfigSnapshot: block.compressionConfigSnapshot,
+        ...(block.providerSettingsSnapshot ? { settingsSnapshot: block.providerSettingsSnapshot } : {}),
+        contents: projection.contents,
+        ...(projection.segments ? { segments: projection.segments } : {}),
+        ...(projection.priorSummaryContents ? { priorSummaryContents: projection.priorSummaryContents } : {}),
+        sourceHash: projection.fingerprint
+      };
 
-      const request = this.buildCompressionSummaryDryRunRequest(payload.conversationId, payload.compressionBlockId, invocation.id, invocation.settings);
-      if (!request) {
-        this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, '无法从压缩块来源构建 dry-run 请求。', correlationId);
-        return;
-      }
-
-      const dryRun = await this.deps.llm.dryRun(request, { includeApiKey: payload.includeApiKey === true });
+      const dryRun = await this.deps.llm.dryRunCompact(request, { includeApiKey: payload.includeApiKey === true });
       this.deps.webview.post(clientId, {
         id: createMessageId(),
         type: BridgeMessageType.LlmDryRunSnapshot,
         channel: 'state',
         correlationId,
-        payload: { conversationId: payload.conversationId, compressionBlockId: payload.compressionBlockId, invocationId: invocation.id, settingsSnapshot: invocation.settings, ...dryRun }
+        payload: {
+          conversationId: payload.conversationId,
+          compressionBlockId: payload.compressionBlockId,
+          ...(invocation ? { invocationId: invocation.id } : {}),
+          ...(block.providerSettingsSnapshot ? { settingsSnapshot: block.providerSettingsSnapshot } : {}),
+          executionKind: dryRun.kind === 'no_provider_call'
+            ? 'no_provider_call'
+            : dryRun.calls.length > 1 ? 'multiple_requests' : 'single_request',
+          calls: dryRun.calls,
+          ...(dryRun.note ? { note: dryRun.note } : {}),
+          generatedAt: dryRun.generatedAt
+        }
       });
     } catch (error) {
       console.warn('[LimCode] Failed to dry-run compression LLM request.', error);
       this.postRequestError(clientId, BridgeMessageType.LlmDryRunGet, error instanceof Error ? error.message : '无法生成压缩 LLM dry-run curl。', correlationId);
     }
-  }
-
-  private buildCompressionSummaryDryRunRequest(
-    conversationId: string,
-    blockId: string,
-    invocationId: string,
-    settingsSnapshot: LlmInvocationSettingsSnapshotRecord
-  ): import('../world/modules/llm/contracts').LlmStartRequest | undefined {
-    const blockEntity = this.findCompressionBlockEntity(blockId);
-    if (blockEntity === undefined) return undefined;
-    const contents = this.compressionSourceContents(blockEntity);
-    if (contents.length === 0) return undefined;
-    const systemPrompt = 'You have written a partial transcript for the initial task above. Please write a summary of the transcript. The purpose of this summary is to provide continuity so you can continue to make progress towards solving the task in a future context, where the raw history above may not be accessible and will be replaced with this summary. Write down anything that would be helpful, including the state, next steps, learnings etc. You must wrap your summary in a <summary></summary> block.';
-    const transcript = renderContentsForSummary(contents);
-    return {
-      id: `dryrun-${invocationId}-${Date.now()}`,
-      invocationId,
-      systemInstruction: { role: 'user', parts: [{ text: systemPrompt }] },
-      contents: [{ role: 'user', parts: [{ text: `Transcript:\n\n${transcript}` }] }],
-      tools: [],
-      conversationId,
-      settingsSnapshot
-    };
-  }
-
-  private compressionSourceContents(block: number): MessageContent[] {
-    return this.deps.world.query(CompressionBlockSourceLink)
-      .map((entity) => this.deps.world.get(entity, CompressionBlockSourceLink))
-      .filter((link): link is NonNullable<typeof link> => !!link && link.block === block && link.source !== undefined)
-      .sort((left, right) => left.order - right.order)
-      .map((link) => link.source !== undefined ? this.deps.world.get(link.source, Message)?.content : undefined)
-      .filter((content): content is MessageContent => !!content);
   }
 
 
@@ -1063,14 +814,14 @@ export class WebviewMessageRouter {
     try {
       const result = await this.deps.storage.restoreShadowCheckpoint(payload);
       if (result.status === 'restored') {
-        void vscode.window.showInformationMessage(`LimCode 回档完成：${result.message}`);
+        void vscode.window.showInformationMessage(`${EXTENSION_BRAND} 回档完成：${result.message}`);
       } else {
-        void vscode.window.showWarningMessage(`LimCode ${result.message}`);
+        void vscode.window.showWarningMessage(`${EXTENSION_BRAND} ${result.message}`);
       }
       this.postCheckpointRestoreResult(clientId, payload, result, correlationId);
     } catch (error) {
       const result = { status: 'failed' as const, message: error instanceof Error ? error.message : '回档失败。' };
-      void vscode.window.showWarningMessage(`LimCode ${result.message}`);
+      void vscode.window.showWarningMessage(`${EXTENSION_BRAND} ${result.message}`);
       this.postCheckpointRestoreResult(clientId, payload, result, correlationId);
     }
   }
@@ -1081,12 +832,27 @@ export class WebviewMessageRouter {
     const call = entity !== undefined ? this.deps.world.get(entity, ToolCall) : undefined;
     const state = entity !== undefined ? this.deps.world.get(entity, ToolState) : undefined;
     if (entity === undefined || !call || !state) {
-      void vscode.window.showWarningMessage('LimCode 无法找到该工具调用。');
+      void vscode.window.showWarningMessage(`${EXTENSION_BRAND} 无法找到该工具调用。`);
       return;
     }
-    const proposal = this.pendingFileChangeProposal(state.result);
+    let rawResult = state.result;
+    if (rawResult === undefined) {
+      const links = this.deps.world.query(ToolCallResultLink)
+        .map((linkEntity) => this.deps.world.get(linkEntity, ToolCallResultLink))
+        .filter((link) => link?.toolCallId === call.id && link.role === 'final');
+      if (links.length > 1) throw new Error(`工具 ${call.id} 存在多个 final 结果关系。`);
+      const link = links[0];
+      if (link) {
+        const artifacts = this.deps.world.query(ToolResultArtifact)
+          .map((artifactEntity) => this.deps.world.get(artifactEntity, ToolResultArtifact))
+          .filter((artifact) => artifact?.id === link.artifactId);
+        if (artifacts.length !== 1) throw new Error(`工具 ${call.id} 的结果 Artifact 缺失或冲突。`);
+        rawResult = await this.deps.storage.loadToolResultContent(artifacts[0]!);
+      }
+    }
+    const proposal = this.pendingFileChangeProposal(rawResult);
     if (!proposal) {
-      void vscode.window.showWarningMessage('LimCode 该工具调用没有可预览的文件变更提案。');
+      void vscode.window.showWarningMessage(`${EXTENSION_BRAND} 该工具调用没有可预览的文件变更提案。`);
       return;
     }
 
@@ -1103,17 +869,13 @@ export class WebviewMessageRouter {
       allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(config, false),
       toolCallId: call.id,
       conversationId: payload.conversationId,
-      onSave: (event) => {
-        this.deps.world.enqueue({
-          type: ToolEventType.ChangeApplyRequested,
-          payload: {
-            toolCallId: event.toolCallId ?? call.id,
-            conversationId: event.conversationId ?? payload.conversationId
-          }
-        });
+      onSave: async (event) => {
+        const conversationId = event.conversationId ?? payload.conversationId;
+        if (!conversationId) throw new Error('文件变更保存回调缺少 conversationId。');
+        await this.deps.applyToolChangeFromEditor(conversationId, event.toolCallId ?? call.id);
       }
     });
-    if (result.status === 'failed') void vscode.window.showWarningMessage(`LimCode ${result.message}`);
+    if (result.status === 'failed') void vscode.window.showWarningMessage(`${EXTENSION_BRAND} ${result.message}`);
   }
 
   private async handleCheckpointDiffOpen(clientId: BridgeClientId, payload: CheckpointDiffOpenPayload, correlationId?: string): Promise<void> {
@@ -1166,7 +928,7 @@ export class WebviewMessageRouter {
   }
 
   private postCheckpointDiffOpenResult(clientId: BridgeClientId, payload: CheckpointDiffOpenPayload, result: { status: 'opened' | 'failed'; message: string }, correlationId?: string): void {
-    if (result.status === 'failed') void vscode.window.showWarningMessage(`LimCode ${result.message}`);
+    if (result.status === 'failed') void vscode.window.showWarningMessage(`${EXTENSION_BRAND} ${result.message}`);
     this.deps.webview.post(clientId, {
       id: createMessageId(),
       type: BridgeMessageType.CheckpointDiffOpenResult,
@@ -1178,7 +940,7 @@ export class WebviewMessageRouter {
 
   private async handleAttachmentOpen(clientId: BridgeClientId, payload: AttachmentOpenPayload, correlationId?: string): Promise<void> {
     try {
-      const uri = await materializeAttachmentFileUri(this.deps.storage.paths, payload);
+      const uri = await this.deps.materializeAttachmentFileUri(payload);
       if (!uri) {
         this.postRequestError(clientId, BridgeMessageType.AttachmentOpen, '无法找到附件文件。', correlationId);
         return;
@@ -1187,12 +949,12 @@ export class WebviewMessageRouter {
     } catch (error) {
       const message = error instanceof Error ? error.message : '无法打开附件。';
       this.postRequestError(clientId, BridgeMessageType.AttachmentOpen, message, correlationId);
-      void vscode.window.showWarningMessage(`LimCode ${message}`);
+      void vscode.window.showWarningMessage(`${EXTENSION_BRAND} ${message}`);
     }
   }
 
   private async postAttachmentReloadResult(clientId: BridgeClientId, payload: AttachmentReloadPayload, correlationId?: string): Promise<void> {
-    const result = await resolveAttachmentForClient(this.deps.storage.paths, payload);
+    const result = await this.deps.resolveAttachmentForClient(payload);
     this.deps.webview.post(clientId, {
       id: createMessageId(),
       type: BridgeMessageType.AttachmentReloadResult,
@@ -1208,16 +970,16 @@ export class WebviewMessageRouter {
   }
 
   private findCheckpointEntity(checkpointId: string): number | undefined {
-    return this.deps.world.query(Checkpoint).find((entity) => this.deps.world.get(entity, Checkpoint)?.id === checkpointId);
+    return this.deps.world.entityByRecordId(Checkpoint, checkpointId);
   }
 
   private findToolCallEntity(toolCallId: string): number | undefined {
-    return this.deps.world.query(ToolCall, ToolState).find((entity) => this.deps.world.get(entity, ToolCall)?.id === toolCallId);
+    const entity = this.deps.world.entityByRecordId(ToolCall, toolCallId);
+    return entity !== undefined && this.deps.world.has(entity, ToolState) ? entity : undefined;
   }
 
   private pendingFileChangeProposal(result: unknown): FsPendingFileChangeProposal | undefined {
-    const output = this.asPlainRecord(this.asPlainRecord(result)?.output);
-    const proposal = this.asPlainRecord(output?.proposal);
+    const proposal = this.asPlainRecord(this.asPlainRecord(result)?.proposal);
     if (proposal?.kind !== 'file_change.proposal') return undefined;
     if (proposal.operation !== 'write' && proposal.operation !== 'edit') return undefined;
     if (typeof proposal.path !== 'string' || typeof proposal.baseContent !== 'string' || typeof proposal.targetContent !== 'string') return undefined;
@@ -1231,23 +993,21 @@ export class WebviewMessageRouter {
 
   private async ensureRunDetailHydrated(conversationId: string, runId: string): Promise<void> {
     if (this.findRunEntity(runId) !== undefined) return;
-    const detail = await this.deps.storage.loadConversationRunDetail({ conversationId, runId });
-    if (!detail) return;
-    await hydrateConversationDetail(this.deps.world, detail.state, conversationId);
+    await this.deps.ensureConversationDetailLoaded(conversationId);
   }
 
   private findRunEntity(runId: string): number | undefined {
-    return this.deps.world.query(AgentRun).find((entity) => this.deps.world.get(entity, AgentRun)?.id === runId);
+    return this.deps.world.entityByRecordId(AgentRun, runId);
   }
 
   private findInvocationForDryRun(input: { run: number; messageId?: string; invocationId?: string }): number | undefined {
     if (input.invocationId) {
-      const direct = this.deps.world.query(LlmInvocation).find((entity) => this.deps.world.get(entity, LlmInvocation)?.id === input.invocationId);
+      const direct = this.deps.world.entityByRecordId(LlmInvocation, input.invocationId);
       if (direct !== undefined) return direct;
     }
 
     if (input.messageId) {
-      const message = this.deps.world.query(Message).find((entity) => this.deps.world.get(entity, Message)?.id === input.messageId);
+      const message = this.deps.world.entityByRecordId(Message, input.messageId);
       if (message !== undefined) {
         const link = this.deps.world
           .query(MessageLlmInvocationLink)
@@ -1291,18 +1051,19 @@ export class WebviewMessageRouter {
       payload: {
         clientId,
         attachedAt: client.attachedAt,
-        meta: client.meta
+        meta: client.meta,
+        runtime: getRuntimeBuildInfo()
       }
     });
   }
 
   private findCompressionBlockEntity(blockId: string): number | undefined {
-    return this.deps.world.query(CompressionBlock).find((entity) => this.deps.world.get(entity, CompressionBlock)?.id === blockId);
+    return this.deps.world.entityByRecordId(CompressionBlock, blockId);
   }
 
   private findCompressionInvocation(block: number, invocationId?: string): number | undefined {
     if (invocationId) {
-      const direct = this.deps.world.query(LlmInvocation).find((entity) => this.deps.world.get(entity, LlmInvocation)?.id === invocationId);
+      const direct = this.deps.world.entityByRecordId(LlmInvocation, invocationId);
       if (direct !== undefined) return direct;
     }
     return this.deps.world
@@ -1316,7 +1077,7 @@ export class WebviewMessageRouter {
     const model = input?.model?.trim();
     const scopeId = conversationId.trim();
     if (!scopeId || !model) return;
-    const conversation = this.deps.world.query(Conversation).find((entity) => this.deps.world.get(entity, Conversation)?.id === scopeId);
+    const conversation = this.deps.world.entityByRecordId(Conversation, scopeId);
     if (conversation === undefined) return;
     const now = Date.now();
     const existing = this.latestConversationModelProfileLink(conversation, scopeId);
@@ -1357,7 +1118,7 @@ export class WebviewMessageRouter {
   private async handlePlanProposalExport(payload: PlanProposalExportPayload): Promise<void> {
     const markdown = payload.markdown.trim();
     if (!markdown) {
-      void vscode.window.showWarningMessage('LimCode: 没有可导出的 Plan 内容。');
+      void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: 没有可导出的 Plan 内容。`);
       return;
     }
 
@@ -1376,7 +1137,7 @@ export class WebviewMessageRouter {
 
     await vscode.workspace.fs.writeFile(target, Buffer.from(ensureTrailingNewline(markdown), 'utf8'));
     const targetPath = target.scheme === 'file' ? target.fsPath : target.toString(true);
-    void vscode.window.showInformationMessage(`LimCode: Plan 已导出到 ${targetPath}`);
+    void vscode.window.showInformationMessage(`${EXTENSION_BRAND}: Plan 已导出到 ${targetPath}`);
   }
 
   private postRequestError(clientId: BridgeClientId, requestType: string, message: string, correlationId?: string): void {
@@ -1409,23 +1170,6 @@ function ensureTrailingNewline(input: string): string {
   return input.endsWith('\n') ? input : `${input}\n`;
 }
 
-function renderContentsForSummary(contents: MessageContent[]): string {
-  return contents.map((content, index) => `${index + 1}. ${content.role}: ${content.parts.map(renderSummaryPart).filter(Boolean).join('\n') || '[empty]'}`).join('\n\n');
-}
-
-function renderSummaryPart(part: ContentPart): string {
-  if (isTextPart(part)) return part.thought === true ? '' : part.text;
-  if (isFunctionCallPart(part)) return `[tool call] ${part.functionCall.name}: ${safeStringifyJson(part.functionCall.args)}`;
-  if (isFunctionResponsePart(part)) return `[tool result] ${part.functionResponse.name}: ${safeStringifyJson(part.functionResponse.response)}`;
-  if (isInlineDataPart(part)) return `[inline data] ${part.inlineData.mimeType}`;
-  if (isFileDataPart(part)) return `[file] ${part.fileData.uri}`;
-  if (isProviderContextPart(part)) return `[provider context] ${part.providerContext.format}:${part.providerContext.itemType ?? 'context'}`;
-  return '';
-}
-
-function safeStringifyJson(value: unknown): string {
-  try { return JSON.stringify(value); } catch { return String(value); }
-}
 
 async function statPath(path: string): Promise<FsStatResultEntry> {
   try {

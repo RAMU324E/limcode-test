@@ -89,17 +89,18 @@ function resolveScope(world: WorldReader, scopeKind: PlanReviewPolicyScopeKind, 
     case 'run': {
       if (!scopeId) return { ok: false };
       const run = findByRecordId(world, AgentRun, scopeId);
+      if (run !== undefined && world.get(run, AgentRun)?.lifecycle !== undefined) return { ok: false };
       return { ok: true, scopeId, data: run !== undefined ? { run } : {} };
     }
   }
 }
 
 function findByRecordId<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
-  return world.query(component).find((entity) => world.get(entity, component)?.id === id);
+  return world.entityByRecordId(component, id);
 }
 
 function findPlanReviewPolicyById(world: WorldReader, id: string): Entity | undefined {
-  return world.query(PlanReviewPolicy).find((entity) => world.get(entity, PlanReviewPolicy)?.id === id);
+  return world.entityByRecordId(PlanReviewPolicy, id);
 }
 
 function findActiveScopeLink(world: WorldReader, scopeKind: PlanReviewPolicyScopeKind, scopeId: string | undefined): { entity: Entity; link: PlanReviewPolicyScopeLinkData } | undefined {

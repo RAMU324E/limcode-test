@@ -1,5 +1,5 @@
-import { defineQuery, defineSystem, type CommandSink, type Entity, type WorldReader } from '../../../../ecs/types';
-import { createMessageId } from '../../../../../shared/protocol';
+import { defineQuery, defineSystem, type CommandSink, type ComponentType, type Entity, type WorldReader } from '../../../../ecs/types';
+import { stableIds } from '../../../../reliability/stableIdFactory';
 import { readEvents } from '../../../events';
 import { Agent } from '../../agent/components';
 import { AgentRun, AgentRunTargetLink } from '../../agentRun/components';
@@ -19,6 +19,7 @@ import {
 import { effectiveCheckpointPolicyForRequest, findRunById } from '../queries';
 import { effectiveCheckpointToolTriggerConfig, triggerConfigKey } from '../policy';
 import type { CheckpointFloorAnchorPosition, CheckpointPolicyRecord } from '../../../../../shared/protocol';
+import { CHECKPOINT_FEATURE_ENABLED } from '../../../../../shared/featureFlags';
 import { ToolDefinitionsKey } from '../../tools/resources';
 import { markCheckpointBarrierPending, releaseCheckpointBarriers } from '../barriers';
 
@@ -58,7 +59,11 @@ export const CheckpointRequestSystem = defineSystem({
   run(ctx) {
     const { world, cmd } = ctx;
     for (const payload of readEvents(ctx, CheckpointEventType.Requested)) {
-      const checkpointId = payload.checkpointId ?? createMessageId();
+      const checkpointId = payload.checkpointId ?? stableIds.nextCheckpointId();
+      if (!CHECKPOINT_FEATURE_ENABLED) {
+        releaseCheckpointBarriers(world, cmd, checkpointId, 'policy_disabled');
+        continue;
+      }
       const conversation = findConversationById(world, payload.conversationId);
       if (conversation === undefined) {
         releaseCheckpointBarriers(world, cmd, checkpointId, 'missing_conversation');
@@ -132,7 +137,7 @@ export const CheckpointRequestSystem = defineSystem({
 });
 
 function findConversationById(world: WorldReader, conversationId: string): Entity | undefined {
-  return world.query(Conversation).find((entity) => world.get(entity, Conversation)?.id === conversationId);
+  return world.entityByRecordId(Conversation, conversationId);
 }
 
 function primaryProjectForConversation(world: WorldReader, conversation: Entity): { entity: Entity; data: ProjectContextData } | undefined {
@@ -188,7 +193,8 @@ function toolNameForCheckpointRequest(world: WorldReader, payload: CheckpointReq
   if (explicit) return explicit;
   const id = payload.toolCallId?.trim();
   if (!id) return undefined;
-  return world.query(ToolCall).map((entity) => world.get(entity, ToolCall)).find((toolCall) => toolCall?.id === id)?.name;
+  const entity = world.entityByRecordId(ToolCall, id);
+  return entity === undefined ? undefined : world.get(entity, ToolCall)?.name;
 }
 
 function addCheckpointTimelineAnchor(
@@ -220,25 +226,23 @@ function checkpointTimelineAnchorId(checkpointId: string): string {
 
 function entityByRecordId<TKey extends string>(
   world: WorldReader,
-  component: { id: symbol },
+  component: ComponentType<{ id: string }>,
   id: string,
   key: TKey
 ): Record<TKey, Entity> | Record<string, never> {
-  const entity = world.query(component as never).find((candidate) => (world.get(candidate, component as never) as { id: string } | undefined)?.id === id);
+  const entity = world.entityByRecordId(component, id);
   return entity === undefined ? {} : { [key]: entity } as Record<TKey, Entity>;
 }
 
 
 function findConversationMessageById(world: WorldReader, conversation: Entity, messageId: string): Entity | undefined {
-  return world.query(Message, PartOf).find((entity) => {
-    const message = world.get(entity, Message);
-    const parent = world.get(entity, PartOf)?.parent;
-    return message?.id === messageId && parent === conversation;
-  });
+  const entity = world.entityByRecordId(Message, messageId);
+  return entity !== undefined && world.get(entity, PartOf)?.parent === conversation ? entity : undefined;
 }
 
 function messageForToolCall(world: WorldReader, conversation: Entity, toolCallId: string): { id: string } | undefined {
-  const toolCall = world.query(ToolCall, PartOf).find((entity) => world.get(entity, ToolCall)?.id === toolCallId);
+  const indexed = world.entityByRecordId(ToolCall, toolCallId);
+  const toolCall = indexed !== undefined && world.has(indexed, PartOf) ? indexed : undefined;
   const messageEntity = toolCall !== undefined ? world.get(toolCall, PartOf)?.parent : undefined;
   if (messageEntity === undefined || world.get(messageEntity, PartOf)?.parent !== conversation) return undefined;
   return world.get(messageEntity, Message);

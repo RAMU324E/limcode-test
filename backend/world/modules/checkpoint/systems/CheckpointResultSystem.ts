@@ -1,4 +1,4 @@
-import { defineSystem, type Entity, type WorldReader } from '../../../../ecs/types';
+import { defineSystem, type ComponentType, type Entity, type WorldReader } from '../../../../ecs/types';
 import { readEvents } from '../../../events';
 import { AgentRun } from '../../agentRun/components';
 import { Conversation, Message } from '../../chat/components';
@@ -87,7 +87,7 @@ function checkpointTimelineAnchorId(checkpointId: string): string {
 
 function entityByRecordId<TKey extends string>(
   world: WorldReader,
-  component: { id: symbol },
+  component: ComponentType<{ id: string }>,
   id: string,
   key: TKey
 ): Record<TKey, Entity> | Record<string, never> {
@@ -95,6 +95,6 @@ function entityByRecordId<TKey extends string>(
   return entity === undefined ? {} : { [key]: entity } as Record<TKey, Entity>;
 }
 
-function findByRecordId<T extends { id: string }>(world: WorldReader, component: { id: symbol }, id: string): Entity | undefined {
-  return world.query(component as never).find((entity) => (world.get(entity, component as never) as T | undefined)?.id === id);
+function findByRecordId<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
+  return world.entityByRecordId(component, id);
 }

@@ -70,6 +70,7 @@ function messageMetadataChanged(prev: MessageRecord, next: MessageRecord): boole
   return prev.conversationId !== next.conversationId
     || prev.role !== next.role
     || prev.model !== next.model
+    || prev.presentation !== next.presentation
     || prev.createdAt !== next.createdAt
     || prev.streamOutputDurationMs !== next.streamOutputDurationMs
     || prev.seq !== next.seq

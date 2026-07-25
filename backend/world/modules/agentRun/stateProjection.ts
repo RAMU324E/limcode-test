@@ -1,13 +1,9 @@
 import type {
   AgentRunInputRevisionRecord,
   AgentRunRecord,
-  AgentRunQueueHoldRecord,
-  AgentRunQueueOrderRecord,
-  AgentRunQueuedInputRecord,
   AgentRunSourceLinkRecord,
   AgentRunTargetLinkRecord,
   ClientState,
-  MessageRunLinkRecord,
   RunContextPolicyLinkRecord,
   RunContextPolicyRecord,
   RunConversationPolicyLinkRecord,
@@ -19,9 +15,11 @@ import type {
   RunWorkflowLinkRecord,
   RunModelProfileLinkRecord,
   RunSystemPromptLinkRecord,
+  RunTerminationRecord,
   RunToolPolicyLinkRecord,
   ToolCallRunLinkRecord
 } from '../../../../shared/protocol';
+import type { MessageTurnLinkRecord } from '../../../../shared/conversationReliability';
 import type { AccessDeclaration, WorldReader } from '../../../ecs/types';
 import { Agent } from '../agent/components';
 import { Conversation, Message, MessageRevision } from '../chat/components';
@@ -30,12 +28,9 @@ import { ToolCall } from '../tools/components';
 import {
   AgentRun,
   AgentRunInputRevision,
-  AgentRunQueueHold,
-  AgentRunQueueOrder,
-  AgentRunQueuedInput,
   AgentRunSourceLink,
   AgentRunTargetLink,
-  MessageRunLink,
+  MessageTurnLink,
   RunContextPolicy,
   RunContextPolicyLink,
   RunConversationPolicy,
@@ -47,6 +42,7 @@ import {
   RunWorkflowLink,
   RunModelProfileLink,
   RunSystemPromptLink,
+  RunTermination,
   RunToolPolicyLink,
   ToolCallRunLink
 } from './components';
@@ -63,12 +59,10 @@ export const agentRunStateProjectionReads: AccessDeclaration = {
     SystemPrompt,
     ModelProfile,
     AgentRun,
-    AgentRunQueueHold,
-    AgentRunQueueOrder,
-    AgentRunQueuedInput,
+    RunTermination,
     AgentRunSourceLink,
     AgentRunTargetLink,
-    MessageRunLink,
+    MessageTurnLink,
     ToolCallRunLink,
     RunConversationPolicy,
     RunContextPolicy,
@@ -88,17 +82,12 @@ export const agentRunStateProjectionReads: AccessDeclaration = {
 
 export function projectAgentRunState(world: WorldReader): Partial<ClientState> {
   const agentRuns = world.query(AgentRun).map((entity): AgentRunRecord => ({ ...world.get(entity, AgentRun)! }));
-  const agentRunQueueOrders = world.query(AgentRunQueueOrder).map((entity) => buildQueueOrderRecord(world, entity)).filter(isDefined);
-  const agentRunQueueHolds = world.query(AgentRunQueueHold).map((entity) => buildQueueHoldRecord(world, entity)).filter(isDefined);
-  const agentRunQueuedInputs = world.query(AgentRunQueuedInput).map((entity) => buildQueuedInputRecord(world, entity)).filter(isDefined);
   return {
     agentRuns,
+    runTerminations: world.query(RunTermination).map((entity) => buildRunTerminationRecord(world, entity)).filter(isDefined),
     agentRunSourceLinks: world.query(AgentRunSourceLink).map((entity) => buildSourceLinkRecord(world, entity)).filter(isDefined),
     agentRunTargetLinks: world.query(AgentRunTargetLink).map((entity) => buildTargetLinkRecord(world, entity)).filter(isDefined),
-    agentRunQueueOrders,
-    agentRunQueueHolds,
-    agentRunQueuedInputs,
-    messageRunLinks: world.query(MessageRunLink).map((entity) => buildMessageRunLinkRecord(world, entity)).filter(isDefined),
+    messageTurnLinks: world.query(MessageTurnLink).map((entity) => buildMessageTurnLinkRecord(world, entity)).filter(isDefined),
     toolCallRunLinks: world.query(ToolCallRunLink).map((entity) => buildToolCallRunLinkRecord(world, entity)).filter(isDefined),
     runConversationPolicies: world.query(RunConversationPolicy).map((entity): RunConversationPolicyRecord => ({ ...world.get(entity, RunConversationPolicy)! })),
     runContextPolicies: world.query(RunContextPolicy).map((entity): RunContextPolicyRecord => ({ ...world.get(entity, RunContextPolicy)! })),
@@ -113,6 +102,24 @@ export function projectAgentRunState(world: WorldReader): Partial<ClientState> {
     runDeliveryPolicyLinks: world.query(RunDeliveryPolicyLink).map((entity) => buildRunPolicyLinkRecord(world, entity, RunDeliveryPolicyLink, RunDeliveryPolicy)).filter(isDefined),
     runEditPolicyLinks: world.query(RunEditPolicyLink).map((entity) => buildRunPolicyLinkRecord(world, entity, RunEditPolicyLink, RunEditPolicy)).filter(isDefined),
     agentRunInputRevisions: world.query(AgentRunInputRevision).map((entity) => buildInputRevisionRecord(world, entity)).filter(isDefined)
+  };
+}
+
+function buildRunTerminationRecord(world: WorldReader, entity: number): RunTerminationRecord | undefined {
+  const termination = world.get(entity, RunTermination);
+  if (!termination) return undefined;
+  const run = world.get(termination.run, AgentRun);
+  if (!run) return undefined;
+  const triggerRun = termination.triggerRun === undefined ? undefined : world.get(termination.triggerRun, AgentRun);
+  return {
+    id: termination.id,
+    runId: run.id,
+    kind: termination.kind,
+    actor: termination.actor,
+    interruptedPhase: termination.interruptedPhase,
+    reasonCode: termination.reasonCode,
+    ...((triggerRun?.id ?? termination.triggerRunId) ? { triggerRunId: triggerRun?.id ?? termination.triggerRunId } : {}),
+    createdAt: termination.createdAt
   };
 }
 
@@ -144,40 +151,18 @@ function buildTargetLinkRecord(world: WorldReader, entity: number): AgentRunTarg
   return { id: link.id, runId: run.id, agentId: agent.id, conversationId: conversation.id, role: link.role };
 }
 
-function buildQueueOrderRecord(world: WorldReader, entity: number): AgentRunQueueOrderRecord | undefined {
-  const order = world.get(entity, AgentRunQueueOrder);
-  if (!order) return undefined;
-  const run = world.get(order.run, AgentRun);
-  const conversation = world.get(order.conversation, Conversation);
-  if (!run || !conversation) return undefined;
-  return { id: order.id, runId: run.id, conversationId: conversation.id, order: order.order, createdAt: order.createdAt, updatedAt: order.updatedAt };
-}
-
-function buildQueueHoldRecord(world: WorldReader, entity: number): AgentRunQueueHoldRecord | undefined {
-  const hold = world.get(entity, AgentRunQueueHold);
-  if (!hold) return undefined;
-  const run = world.get(hold.run, AgentRun);
-  const conversation = world.get(hold.conversation, Conversation);
-  if (!run || !conversation) return undefined;
-  return { id: hold.id, runId: run.id, conversationId: conversation.id, reason: hold.reason, createdAt: hold.createdAt, updatedAt: hold.updatedAt };
-}
-
-function buildQueuedInputRecord(world: WorldReader, entity: number): AgentRunQueuedInputRecord | undefined {
-  const input = world.get(entity, AgentRunQueuedInput);
-  if (!input) return undefined;
-  const run = world.get(input.run, AgentRun);
-  const conversation = world.get(input.conversation, Conversation);
-  if (!run || !conversation) return undefined;
-  return { id: input.id, runId: run.id, conversationId: conversation.id, content: input.content, createdAt: input.createdAt, updatedAt: input.updatedAt };
-}
-
-function buildMessageRunLinkRecord(world: WorldReader, entity: number): MessageRunLinkRecord | undefined {
-  const link = world.get(entity, MessageRunLink);
+function buildMessageTurnLinkRecord(world: WorldReader, entity: number): MessageTurnLinkRecord | undefined {
+  const link = world.get(entity, MessageTurnLink);
   if (!link) return undefined;
   const message = world.get(link.message, Message);
-  const run = world.get(link.run, AgentRun);
-  if (!message || !run) return undefined;
-  return { id: link.id, messageId: message.id, runId: run.id, role: link.role };
+  const turn = world.get(link.turn, AgentRun);
+  if (!message || !turn) return undefined;
+  return {
+    id: link.id,
+    messageId: message.id as MessageTurnLinkRecord['messageId'],
+    turnId: turn.id as MessageTurnLinkRecord['turnId'],
+    role: link.role
+  };
 }
 
 function buildToolCallRunLinkRecord(world: WorldReader, entity: number): ToolCallRunLinkRecord | undefined {

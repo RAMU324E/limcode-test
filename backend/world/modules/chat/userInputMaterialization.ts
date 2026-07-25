@@ -1,8 +1,9 @@
 import type { CommandSink, Entity, WorldReader } from '../../../ecs/types';
-import { createMessageId, type MessageContent } from '../../../../shared/protocol';
+import type { MessageContent, MessagePresentation } from '../../../../shared/protocol';
+import { stableIds } from '../../../reliability/stableIdFactory';
 import { spawnCheckpointBarrier } from '../checkpoint/barriers';
 import { Checkpoint } from '../checkpoint/components';
-import { CheckpointEventType } from '../checkpoint/events';
+import { checkpointRequestsEnabled, enqueueCheckpointRequest } from '../checkpoint/events';
 import { spawnUserContentMessage, spawnUserMessage } from './bundles';
 import { Conversation } from './components';
 import { conversationMessages } from './queries';
@@ -12,19 +13,28 @@ export function materializeUserInputMessage(
   cmd: CommandSink,
   conversation: Entity,
   conversationId: string,
-  content: MessageContent
+  content: MessageContent,
+  presentation: MessagePresentation = 'visible'
 ): Entity {
-  const isFirstMessage = conversationMessages(world, conversation).length === 0;
+  const isFirstMessage = checkpointRequestsEnabled() && conversationMessages(world, conversation).length === 0;
   const needsInitialCheckpoint = isFirstMessage && !hasInitialCheckpoint(world, conversation);
-  const message = spawnInputMessage(cmd, conversation, content);
+  const messageId = stableIds.nextMessageId();
+  const message = spawnInputMessage(cmd, conversation, content, messageId, presentation);
   if (needsInitialCheckpoint) requestInitialCheckpoint(cmd, conversationId);
-  requestUserMessageCheckpoints(cmd, conversationId, conversation, message);
+  requestUserMessageCheckpoints(cmd, conversationId, conversation, message, messageId);
   return message;
 }
 
-export function spawnInputMessage(cmd: CommandSink, conversation: Entity, content: MessageContent): Entity {
-  if (content.parts.length === 1 && 'text' in content.parts[0]) return spawnUserMessage(cmd, conversation, content.parts[0].text);
-  return spawnUserContentMessage(cmd, conversation, content);
+export function spawnInputMessage(
+  cmd: CommandSink,
+  conversation: Entity,
+  content: MessageContent,
+  messageId = stableIds.nextMessageId(),
+  presentation: MessagePresentation = 'visible'
+): Entity {
+  const identity = { messageId, revisionId: stableIds.nextMessageRevisionId(), presentation };
+  if (content.parts.length === 1 && 'text' in content.parts[0]) return spawnUserMessage(cmd, conversation, content.parts[0].text, identity);
+  return spawnUserContentMessage(cmd, conversation, content, identity);
 }
 
 function hasInitialCheckpoint(world: WorldReader, conversation: Entity): boolean {
@@ -35,15 +45,12 @@ function hasInitialCheckpoint(world: WorldReader, conversation: Entity): boolean
 }
 
 function requestInitialCheckpoint(cmd: CommandSink, conversationId: string): void {
-  cmd.enqueue({
-    type: CheckpointEventType.Requested,
-    payload: { conversationId, trigger: 'conversation_initial' }
-  });
+  enqueueCheckpointRequest(cmd, { conversationId, trigger: 'conversation_initial' });
 }
 
-function requestUserMessageCheckpoints(cmd: CommandSink, conversationId: string, conversation: Entity, floorMessage: Entity): void {
-  const floorMessageId = `m${floorMessage}`;
-  const beforeCheckpointId = createMessageId();
+function requestUserMessageCheckpoints(cmd: CommandSink, conversationId: string, conversation: Entity, floorMessage: Entity, floorMessageId: string): void {
+  if (!checkpointRequestsEnabled()) return;
+  const beforeCheckpointId = stableIds.nextCheckpointId();
   spawnCheckpointBarrier(cmd, {
     checkpointId: beforeCheckpointId,
     conversation,
@@ -52,14 +59,18 @@ function requestUserMessageCheckpoints(cmd: CommandSink, conversationId: string,
     targetMessage: floorMessage,
     targetMessageId: floorMessageId
   });
-  cmd.enqueue({
-    type: CheckpointEventType.Requested,
-    payload: { checkpointId: beforeCheckpointId, conversationId, trigger: 'user_message_before', floorMessageId, anchorPosition: 'before' }
+  enqueueCheckpointRequest(cmd, {
+    checkpointId: beforeCheckpointId,
+    conversationId,
+    trigger: 'user_message_before',
+    floorMessageId,
+    anchorPosition: 'before'
   });
-
-  cmd.enqueue({
-    type: CheckpointEventType.Requested,
-    payload: { conversationId, trigger: 'user_message_after', floorMessageId, anchorPosition: 'after' }
+  enqueueCheckpointRequest(cmd, {
+    conversationId,
+    trigger: 'user_message_after',
+    floorMessageId,
+    anchorPosition: 'after'
   });
 }
 

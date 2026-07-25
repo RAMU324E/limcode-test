@@ -7,6 +7,8 @@ import {
   type CheckpointStatus,
   type WebviewClientMeta
 } from '../../../../shared/protocol';
+import { EXTENSION_BRAND } from '../../../../shared/extensionIdentity';
+import { CHECKPOINT_FEATURE_ENABLED } from '../../../../shared/featureFlags';
 import { CheckpointEventType } from '../../../world/modules/checkpoint/events';
 import type { CheckpointCreateEffect } from '../../../world/modules/checkpoint/effects';
 import type { Emit } from '../../../capabilities/types';
@@ -37,8 +39,10 @@ async function runCheckpointCreate(effect: CheckpointCreateEffect, storage: Stor
   try {
     const record = await storage.createShadowCheckpoint(effect);
     emitCompletedCheckpoint(record, effect, emit);
-    void broadcastShadowStats(storage, webview);
-    maybeNotifyCheckpointIssue({ conversationId: record.conversationId, status: record.status, skipReason: record.skipReason, message: record.message }, webview);
+    if (CHECKPOINT_FEATURE_ENABLED) {
+      void broadcastShadowStats(storage, webview);
+      maybeNotifyCheckpointIssue({ conversationId: record.conversationId, status: record.status, skipReason: record.skipReason, message: record.message }, webview);
+    }
   } catch (error) {
     const now = Date.now();
     const message = error instanceof Error ? error.message : String(error);
@@ -63,8 +67,10 @@ async function runCheckpointCreate(effect: CheckpointCreateEffect, storage: Stor
         ...(effect.sourceToolCallId ? { sourceToolCallId: effect.sourceToolCallId } : {})
       }
     });
-    void broadcastShadowStats(storage, webview);
-    maybeNotifyCheckpointIssue({ conversationId: effect.conversationId, status: 'failed', skipReason: 'io_error', message }, webview);
+    if (CHECKPOINT_FEATURE_ENABLED) {
+      void broadcastShadowStats(storage, webview);
+      maybeNotifyCheckpointIssue({ conversationId: effect.conversationId, status: 'failed', skipReason: 'io_error', message }, webview);
+    }
   }
 }
 
@@ -136,17 +142,17 @@ function checkpointNoticeClientMatches(meta: WebviewClientMeta, conversationId: 
 function checkpointIssueNotice(input: CheckpointIssueInput): { message: string } | undefined {
   if (input.status === 'skipped' && input.skipReason === 'initial_size_exceeded') {
     return {
-      message: `LimCode 存档点未创建：${input.message ?? '项目体积超过初始存档大小上限。'} 可在「设置 → 存档点」调高初始存档大小上限。`
+      message: `${EXTENSION_BRAND} 存档点未创建：${input.message ?? '项目体积超过初始存档大小上限。'} 可在「设置 → 存档点」调高初始存档大小上限。`
     };
   }
   if (input.status === 'failed' && input.skipReason === 'git_unavailable') {
     return {
-      message: `LimCode 存档点未创建：未检测到系统 Git。${input.message ?? ''}`.trim()
+      message: `${EXTENSION_BRAND} 存档点未创建：未检测到系统 Git。${input.message ?? ''}`.trim()
     };
   }
   if (input.status === 'failed') {
     return {
-      message: `LimCode 存档点创建失败：${input.message ?? '未知错误'}`
+      message: `${EXTENSION_BRAND} 存档点创建失败：${input.message ?? '未知错误'}`
     };
   }
   return undefined;

@@ -1,12 +1,7 @@
 import type { Scheduler } from '../../../../ecs/Scheduler';
-import { ContextAssemblySystem } from './ContextAssemblySystem';
-import { InputSystem } from './InputSystem';
-import { LlmDispatchSystem } from './LlmDispatchSystem';
 import { LlmPollSystem } from './LlmPollSystem';
-import { MessageDeleteSystem } from './MessageDeleteSystem';
-import { MessageEditSystem } from './MessageEditSystem';
-import { MessageRetrySystem } from './MessageRetrySystem';
 
+/** LLM 派发由可靠 effect dispatcher 拥有；ECS 只消费并投影 provider 流事件。 */
 export function registerChatSystems(scheduler: Scheduler): void {
-  scheduler.addMany([InputSystem, MessageEditSystem, MessageDeleteSystem, MessageRetrySystem, ContextAssemblySystem, LlmDispatchSystem, LlmPollSystem]);
+  scheduler.addMany([LlmPollSystem]);
 }

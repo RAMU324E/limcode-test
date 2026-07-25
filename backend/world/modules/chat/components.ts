@@ -6,11 +6,12 @@ import type {
   LlmCompressionMethodKind,
   LlmUsageMetadataRecord,
   MessageContent,
+  MessagePresentation,
   MessageRevisionReason,
-  MessageStopReason,
-  MsgRole,
-  MsgStatus
+  MessageMaterializationStatus,
+  MsgRole
 } from '../../../../shared/protocol';
+import type { AttemptId } from '../../../../shared/stableIds';
 
 export interface ConversationData {
   id: string;
@@ -18,6 +19,13 @@ export interface ConversationData {
   visibility?: 'visible' | 'hidden' | 'collapsed';
 }
 export const Conversation = defineComponent<ConversationData>('Conversation');
+
+/** Explicit conversation chronology; stable IDs never carry business time semantics. */
+export interface ConversationTimelineData {
+  createdAt: number;
+  lastActivityAt: number;
+}
+export const ConversationTimeline = defineComponent<ConversationTimelineData>('ConversationTimeline');
 export const ConversationFullContextPending = defineComponent<{ startedAt: number }>('ConversationFullContextPending');
 export const ConversationFullContextLoaded = defineComponent<{ loadedAt: number }>('ConversationFullContextLoaded');
 
@@ -68,14 +76,14 @@ export interface MessageData {
   id: string;
   role: MsgRole;
   model?: string;
+  presentation?: MessagePresentation;
   content: MessageContent;
-  status: MsgStatus;
+  status: MessageMaterializationStatus;
   seq: number;
   createdAt: number;
   requestStartedAt?: number;
   streamOutputDurationMs?: number;
   usageMetadata?: LlmUsageMetadataRecord;
-  stopReason?: MessageStopReason;
 }
 export const Message = defineComponent<MessageData>('Message');
 export const PartOf = defineComponent<{ parent: Entity }>('PartOf');
@@ -96,6 +104,12 @@ export interface LlmRequestData {
   conversation: Entity;
   modelMessage: Entity;
   invocation?: Entity;
+  /** Process-local admission fence for transient events from one durable Attempt. */
+  reliableStreamEpoch?: {
+    attemptId: AttemptId;
+    generation: number;
+    streamSeq: number;
+  };
 }
 export const LlmRequest = defineComponent<LlmRequestData>('LlmRequest');
 

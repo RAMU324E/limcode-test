@@ -154,11 +154,11 @@ function cloneTaskListOperation(operation: TaskListToolOperationRecord): TaskLis
 }
 
 export function findPlanReviewPolicyById(world: WorldReader, id: string): Entity | undefined {
-  return world.query(PlanReviewPolicy).find((entity) => world.get(entity, PlanReviewPolicy)?.id === id);
+  return world.entityByRecordId(PlanReviewPolicy, id);
 }
 
 export function findPlanProposalById(world: WorldReader, id: string): Entity | undefined {
-  return world.query(PlanProposal).find((entity) => world.get(entity, PlanProposal)?.id === id);
+  return world.entityByRecordId(PlanProposal, id);
 }
 
 function findActivePlanReviewPolicyScopeLink(

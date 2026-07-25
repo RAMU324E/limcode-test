@@ -12,18 +12,25 @@ import type { AccessDeclaration, WorldReader } from '../../../ecs/types';
 import { Agent } from '../agent/components';
 import { AgentRun } from '../agentRun/components';
 import { ToolCall } from '../tools/components';
-import { Conversation, ConversationBranchLink, ConversationOriginLink, ConversationReuseLink, Message, MessageCurrentRevisionLink, MessageRevision, PartOf } from './components';
+import { Conversation, ConversationBranchLink, ConversationOriginLink, ConversationReuseLink, ConversationTimeline, Message, MessageCurrentRevisionLink, MessageRevision, PartOf } from './components';
 
 export const chatStateProjectionReads: AccessDeclaration = {
-  components: [Agent, AgentRun, ToolCall, Message, MessageRevision, MessageCurrentRevisionLink, PartOf, Conversation, ConversationReuseLink, ConversationBranchLink, ConversationOriginLink]
+  components: [Agent, AgentRun, ToolCall, Message, MessageRevision, MessageCurrentRevisionLink, PartOf, Conversation, ConversationTimeline, ConversationReuseLink, ConversationBranchLink, ConversationOriginLink]
 };
 
 export function projectChatState(world: WorldReader): Partial<ClientState> {
-  const conversations: ConversationRecord[] = world.query(Conversation).map((entity) => ({
-    id: world.get(entity, Conversation)!.id,
-    title: world.get(entity, Conversation)!.title,
-    visibility: world.get(entity, Conversation)!.visibility
-  }));
+  const conversations: ConversationRecord[] = world.query(Conversation).map((entity) => {
+    const conversation = world.get(entity, Conversation)!;
+    const timeline = world.get(entity, ConversationTimeline);
+    if (!timeline) throw new Error(`Conversation ${conversation.id} has no ConversationTimeline.`);
+    return {
+      id: conversation.id,
+      title: conversation.title,
+      visibility: conversation.visibility,
+      createdAt: timeline.createdAt,
+      lastActivityAt: timeline.lastActivityAt
+    };
+  });
 
   const conversationReuseLinks: ConversationReuseLinkRecord[] = world
     .query(ConversationReuseLink)
@@ -51,13 +58,13 @@ export function projectChatState(world: WorldReader): Partial<ClientState> {
         conversationId: world.get(conversationEntity, Conversation)!.id,
         role: message.role,
         ...(message.model !== undefined ? { model: message.model } : {}),
+        ...(message.presentation !== undefined ? { presentation: message.presentation } : {}),
         content: message.content,
         status: message.status,
         createdAt: message.createdAt,
         ...(message.streamOutputDurationMs !== undefined ? { streamOutputDurationMs: message.streamOutputDurationMs } : {}),
         ...(message.requestStartedAt !== undefined ? { requestStartedAt: message.requestStartedAt } : {}),
         ...(message.usageMetadata !== undefined ? { usageMetadata: message.usageMetadata } : {}),
-        ...(message.stopReason !== undefined ? { stopReason: message.stopReason } : {}),
         seq: message.seq
       };
     })

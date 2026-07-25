@@ -55,6 +55,8 @@ export interface WorldReader {
   has(entity: Entity, component: ComponentType<unknown>): boolean;
   /** 组件交集查询，返回同时拥有全部给定组件的实体。 */
   query(...components: ComponentType<unknown>[]): Entity[];
+  /** 通过组件记录的持久 id 做唯一解析；重复身份属于不变量错误而不是 first-match。 */
+  entityByRecordId<T extends { id: string }>(component: ComponentType<T>, id: string): Entity | undefined;
   /** 取资源，不存在则抛错。 */
   getResource<T>(key: ResourceKey<T>): T;
   /** 取资源，不存在返回 undefined。 */

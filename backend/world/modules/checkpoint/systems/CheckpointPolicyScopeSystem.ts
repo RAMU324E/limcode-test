@@ -1,4 +1,4 @@
-import { defineSystem, type Entity, type WorldReader } from '../../../../ecs/types';
+import { defineSystem, type ComponentType, type Entity, type WorldReader } from '../../../../ecs/types';
 import { createMessageId } from '../../../../../shared/protocol';
 import type { CheckpointPolicyScopeKind } from '../../../../../shared/protocol';
 import { readEvents } from '../../../events';
@@ -90,6 +90,7 @@ function resolveScope(world: WorldReader, scopeKind: CheckpointPolicyScopeKind, 
     case 'run': {
       if (!scopeId) return { ok: false };
       const run = findByRecordId(world, AgentRun, scopeId);
+      if (run !== undefined && world.get(run, AgentRun)?.lifecycle !== undefined) return { ok: false };
       return { ok: true, scopeId, data: run !== undefined ? { run } : {} };
     }
   }
@@ -105,6 +106,6 @@ function defaultPolicyName(scopeKind: CheckpointPolicyScopeKind): string {
   }
 }
 
-function findByRecordId<T extends { id: string }>(world: WorldReader, component: { id: symbol }, id: string): Entity | undefined {
-  return world.query(component as never).find((entity) => (world.get(entity, component as never) as T | undefined)?.id === id);
+function findByRecordId<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
+  return world.entityByRecordId(component, id);
 }

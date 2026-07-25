@@ -120,7 +120,7 @@ export function proposalBelongsToRun(world: WorldReader, run: Entity, planPropos
 export function findPlanProposalById(world: WorldReader, id: string): Entity | undefined {
   const normalized = id.trim();
   if (!normalized) return undefined;
-  return world.query(PlanProposal).find((entity) => world.get(entity, PlanProposal)?.id === normalized);
+  return world.entityByRecordId(PlanProposal, normalized);
 }
 
 function normalizedDecisionMessage(status: SubmitPlanDecisionStatus, value: string | undefined): string | undefined {

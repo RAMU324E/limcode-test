@@ -1,10 +1,12 @@
 import type { Entity, WorldReader } from '../../../ecs/types';
-import type { PlanReviewPolicyRecord, PlanReviewPolicyScopeKind, PlanReviewRequiredToolRiskLevel } from '../../../../shared/protocol';
+import { SUBMIT_PLAN_TOOL_NAME, type PlanReviewPolicyRecord, type PlanReviewPolicyScopeKind, type PlanReviewRequiredToolRiskLevel } from '../../../../shared/protocol';
+import { submitPlanOutputFromResult } from '../../../../shared/planReview';
 import { Agent } from '../agent/components';
 import { agentTypeEntityForRuntimeAgent } from '../agent/identity';
-import { AgentRun } from '../agentRun/components';
+import { AgentRun, ToolCallRunLink } from '../agentRun/components';
 import { activeWorkflowForRun, activeWorkflowSelectionForConversation, runTarget } from '../agentRun/queries';
 import { Conversation } from '../chat/components';
+import { ToolCall, ToolState } from '../tools/components';
 import { Workflow } from '../workflow/components';
 import {
   PlanProposal,
@@ -64,10 +66,20 @@ export function effectivePlanReviewPolicyForConversation(world: WorldReader, con
 }
 
 export function hasApprovedPlanForRun(world: WorldReader, run: Entity): boolean {
-  return world.query(RunPlanProposalLink).some((entity) => {
+  if (world.query(RunPlanProposalLink).some((entity) => {
     const link = world.get(entity, RunPlanProposalLink);
     if (!link || link.run !== run || link.role !== 'active') return false;
     return world.get(link.planProposal, PlanProposal)?.status === 'approved';
+  })) return true;
+
+  // Reliable projections preserve the immutable submit_plan ToolCall result rather than depending
+  // on an ECS-only PlanProposal entity. That committed result is equally strong approval evidence.
+  return world.query(ToolCallRunLink).some((entity) => {
+    const link = world.get(entity, ToolCallRunLink);
+    if (!link || link.run !== run) return false;
+    const call = world.get(link.toolCall, ToolCall);
+    const state = world.get(link.toolCall, ToolState);
+    return call?.name === SUBMIT_PLAN_TOOL_NAME && submitPlanOutputFromResult(state?.result)?.status === 'approved';
   });
 }
 

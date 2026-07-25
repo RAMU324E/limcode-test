@@ -10,6 +10,7 @@ import type {
 export class SnapshotWorldReader implements WorldReader {
   private readonly alive: Set<Entity>;
   private readonly stores = new Map<string, Map<Entity, unknown>>();
+  private readonly recordIdIndexes = new Map<string, Map<string, Entity>>();
   private readonly resources = new Map<string, unknown>();
   private readonly componentVersions = new Map<string, number>();
   private readonly resourceVersions = new Map<string, number>();
@@ -19,6 +20,16 @@ export class SnapshotWorldReader implements WorldReader {
 
     for (const store of snap.components) {
       this.stores.set(store.name, new Map(store.values));
+      const ids = new Map<string, Entity>();
+      for (const [entity, value] of store.values) {
+        const id = recordIdOf(value);
+        if (!id) continue;
+        const conflict = ids.get(id);
+        if (conflict !== undefined && conflict !== entity) throw new Error(`${store.name} record id conflict in WorldSnapshot: ${id}.`);
+        ids.set(id, entity);
+      }
+
+      if (ids.size > 0) this.recordIdIndexes.set(store.name, ids);
     }
 
     for (const item of snap.resources) {
@@ -35,6 +46,10 @@ export class SnapshotWorldReader implements WorldReader {
 
   public has(entity: Entity, component: ComponentType<unknown>): boolean {
     return this.stores.get(component.name)?.has(entity) ?? false;
+  }
+
+  public entityByRecordId<T extends { id: string }>(component: ComponentType<T>, id: string): Entity | undefined {
+    return this.recordIdIndexes.get(component.name)?.get(id);
   }
 
   public query(...components: ComponentType<unknown>[]): Entity[] {
@@ -92,4 +107,10 @@ export class SnapshotWorldReader implements WorldReader {
   public resourceVersion(resource: ResourceKey<unknown>): number {
     return this.resourceVersions.get(resource.name) ?? 0;
   }
+}
+
+function recordIdOf(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const id = (value as { id?: unknown }).id;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
 }

@@ -4,29 +4,10 @@ import { Scheduler } from '../ecs/Scheduler';
 import type { ComponentType, Entity } from '../ecs/types';
 import { ClientSyncEventType } from '../world/clientSync/events';
 import { EffectOutbox, type WorldEffect } from '../world/effects';
-import { installWorldPlugins } from '../world/plugin';
-import {
-  agentPlugin,
-  chatPlugin,
-  commonPlugin,
-  workflowPlugin,
-  planReviewPlugin,
-  agentRunPlugin,
-  agentAnswerPlugin,
-  checkpointPlugin,
-  compressionPlugin,
-  llmPlugin,
-  requestSpawnAgent,
-  projectPlugin,
-  runtimeContextPlugin,
-  toolsPlugin,
-  backgroundCommandPlugin,
-  skillPlugin,
-  rulesPlugin,
-  workEnvironmentPlugin
-} from '../world/modules';
+import { requestSpawnAgent } from '../world/modules';
+import { installProductionWorld } from '../world/productionWorld';
 import type { AgentSpawnRequestData } from '../world/modules/agent/requests';
-import { Agent, AgentConversationLink, AgentKind, AgentStatus as AgentStatusComponent, ConversationAgentSelection } from '../world/modules/agent/components';
+import { Agent, AgentConversationLink, ConversationAgentSelection } from '../world/modules/agent/components';
 import {
   Conversation,
   ConversationBranchLink,
@@ -34,6 +15,7 @@ import {
   ConversationFullContextPending,
   ConversationOriginLink,
   ConversationReuseLink,
+  ConversationTimeline,
   LlmRequest,
   Message,
   MessageCurrentRevisionLink,
@@ -48,7 +30,7 @@ import {
   AgentRunInputRevision,
   AgentRunSourceLink,
   AgentRunTargetLink,
-  MessageRunLink,
+  MessageTurnLink,
   RunContextPolicy,
   RunContextPolicyLink,
   RunConversationPolicy,
@@ -63,31 +45,38 @@ import {
   RunToolPolicyLink,
   ToolCallRunLink
 } from '../world/modules/agentRun/components';
-import { AgentRunEventType } from '../world/modules/agentRun/events';
 import { setConversationProject } from '../world/modules/project/bundles';
 import { ConversationProjectLink, ProjectContext } from '../world/modules/project/components';
 import { upsertDefaultWorkflowSelection } from '../world/modules/workflow/bundles';
 import { ConversationWorkflowSelection, ModelProfile, ModelProfileScopeLink, type ModelProfileScopeLinkData } from '../world/modules/workflow/components';
 import { ToolCall, ToolCallEvent } from '../world/modules/tools/components';
 import { WorkEnvironmentEventType, workEnvironmentIdFromUri } from '../world/modules/workEnvironment';
+import { BackgroundProcessSnapshotKey } from '../world/modules/backgroundProcess/resources';
 import type { LocalWorkEnvironmentCandidate } from '../world/modules/workEnvironment';
-import { clientSyncPlugin, registerClientSyncSystems } from '../world/clientSync';
-import { ClientSyncStateKey } from '../world/clientSync/resources';
-import { storageProjectionPlugin } from '../world/storageProjection';
+import { ClientStateContributorsKey, ClientSyncStateKey, CommittedConversationHeadsKey } from '../world/clientSync/resources';
+import { projectClientState } from '../world/clientSync/projection';
 import { CLIENT_STATE_TABLE_KEYS } from '../../shared/clientStateSchema';
 import { EffectHandlerRegistry, registerApplicationEffectHandlers } from './effectHandlers';
 import { flushEffects, flushEffectsWhere } from './executeEffects';
 import type { RuntimeEnv } from './RuntimeEnv';
+import type { StorageDataResetResult } from '../capabilities/types';
 import { BridgeMessageType, GLOBAL_SETTINGS_SECTIONS, conversationClientStateStreamId, createMessageId } from '../../shared/protocol';
 import type {
   AgentRunStatus,
+  AttachmentOpenPayload,
+  AttachmentReloadPayload,
   CheckpointMaintenanceSettingsRecord,
   BridgeClientId,
   ConversationHistoryPageRecord,
   ConversationHistoryScope,
   ClientState,
   ConversationLlmSettingsRecord,
-  ConversationSettingsRecord,
+  ConversationRunDetailRecord,
+  ConversationRunDetailRequest,
+  ConversationRunHistoryPageRecord,
+  ConversationRunHistoryPageRequest,
+  ConversationTimelinePageRecord,
+  ConversationTimelinePageRequest,
   LlmProviderKind,
   MessageContent,
   ProjectFolderCandidateRecord,
@@ -100,28 +89,66 @@ import type {
 } from '../../shared/protocol';
 import { createRuntimeEnv, recordsForTools, schemasForTools } from './createRuntimeEnv';
 import { dedupeMcpToolNames } from './mcpRuntimeManager';
-import { createDefaultAgentRecord, createDefaultAgentSpawnRequest, DEFAULT_AGENT_ID } from './defaults';
-import { hydrateClientStateSkeleton, hydrateConversationDetail } from './clientStateHydration';
-import { backfillMissingToolResponsesForStatelessLoad } from './toolResponseBackfill';
+import { createDefaultAgentSpawnRequest, DEFAULT_AGENT_ID } from './defaults';
+import {
+  hydrateClientStateSkeleton,
+  hydrateConversationDetail
+} from './clientStateHydration';
 import { ClientStatePersistence } from './ClientStatePersistence';
 import { GlobalSettingsBridge } from './GlobalSettingsBridge';
 import { ConversationSettingsBridge } from './ConversationSettingsBridge';
 import { WebviewClientRegistry } from './WebviewClientRegistry';
 import { WebviewMessageRouter } from './WebviewMessageRouter';
-import { conversationCreatedAtFromId, createNewConversationTitle, DEFAULT_CONVERSATION_ID, displayConversationTitle } from '../../shared/conversationTitle';
+import { createNewConversationTitle, displayConversationTitle } from '../../shared/conversationTitle';
+import { isInternalMessage } from '../../shared/messagePresentation';
 import { loadRemoteServerWorkEnvironmentRecordsFromVscode } from './workEnvironments/vscodeSshImport';
 import { McpToolSourcesKey, ToolDefinitionsKey, ToolRuntimeDefinitionsKey, ToolSchemasKey } from '../world/modules/tools/resources';
 import { SkillCatalogKey } from '../world/modules/skill/resources';
 import { RulesCatalogKey } from '../world/modules/rules/resources';
 import { conversationDetailEvictionBlocker, evictConversationDetail } from './conversationDetailEviction';
-import { forkConversationInWorld } from './conversationFork';
+import { materializeForkRelationsInWorld } from './conversationFork';
 import { AskUserAttentionTracker, askUserAttentionMessage, collectPendingAskUserAttention } from './askUserAttention';
 import { ConversationAttentionTracker, type ConversationAttentionRequest } from './conversationAttention';
 import { PlanReviewAttentionTracker, collectPendingPlanReviewAttention, planReviewAttentionMessage } from './planReviewAttention';
+import { canPrepareConversationForSidebarOpen, historyEntryWithLiveRunState, type ConversationRunHistoryRuntimeSummary } from './conversationHistoryRuntime';
+import { nextAuxiliaryId, stableIds } from '../reliability/stableIdFactory';
+import { DurableFileSystem, DataRootOwnerManager } from '../reliability/fileDurability';
+import { RuntimeAuthorityAdapter, factsToClientState } from '../reliability/runtimeAuthorityStore';
+import { compileEffectiveTurnAuthority } from '../reliability/authorityCompiler';
+import { requireCanonicalManagedAttachmentData } from '../reliability/attachmentResource';
+import { ATTACHMENT_STORAGE_RESOURCE_KEY } from '../reliability/storagePathAuthority';
+import {
+  materializeAttachmentFileUri as materializeResolvedAttachmentFileUri,
+  resolveAttachmentForClient as resolveAttachmentReferenceForClient,
+  type ResolvedAttachmentInlineData
+} from '../capabilities/vscodeStorage/attachmentStore';
+import {
+  projectConversationRunDetail,
+  projectConversationRunHistoryPage,
+  resolveConversationRunIdForMessage as resolveRunIdForMessageProjection
+} from '../reliability/derived/runHistoryProjection';
+import { projectConversationTimelinePage } from '../reliability/derived/timelinePageProjection';
+import { FileConversationTransactionBackend } from '../reliability/fileConversationTransactionBackend';
+import {
+  ReliabilityDiagnosticJournal,
+  ReliabilityInspector,
+  type ReliabilityInspectionSnapshot
+} from '../reliability/reliabilityInspector';
+import { ConversationCommandGateway, type HostTurnInterruptResult } from '../reliability/conversationCommandGateway';
+import { CommittedConversationWorldProjection, CommittedHeadOnlyWorldProjection, CommittedMultiConversationWorldProjection, rehydrateCommittedFacts } from '../reliability/conversationWorldProjection';
+import { PrimaryEffectDispatcher } from '../reliability/primaryEffectDispatcher';
+import { BackgroundProcessDeliveryDispatcher } from '../reliability/backgroundProcessDeliveryDispatcher';
+import type { StoragePaths } from '../capabilities/vscodeStorage/clientStateStore';
+import type { ConversationId, ToolCallId } from '../../shared/stableIds';
+import type { CommandServiceError } from '../../shared/conversationReliability';
+import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
+import { CHECKPOINT_FEATURE_ENABLED } from '../../shared/featureFlags';
+import { requiresHydratedStorage, shouldDeferUntilHydrated } from './startupHydrationAdmission';
+import { committedReadView } from '../reliability/domain/internalHandlers';
 
 const MAX_WARM_CLOSED_CONVERSATIONS = 3;
 const USER_ATTENTION_NOTIFICATION_ACTION = '打开标签页';
-const OPEN_PANEL_COMMAND = 'limcode.openPanel';
+const OPEN_PANEL_COMMAND = EXTENSION_COMMAND_IDS.openPanel;
 
 export interface CreateConversationOptions {
   projectFolderUri?: string;
@@ -150,6 +177,17 @@ export class BackendApplication {
   private readonly webviewRouter: WebviewMessageRouter;
   private readonly askUserAttentionTracker = new AskUserAttentionTracker();
   private readonly planReviewAttentionTracker = new PlanReviewAttentionTracker();
+  private reliabilityBackend: FileConversationTransactionBackend | undefined;
+  private reliabilityAdapter: RuntimeAuthorityAdapter | undefined;
+  private reliabilityInspector: ReliabilityInspector | undefined;
+  private conversationCommands: ConversationCommandGateway | undefined;
+  private primaryEffectDispatcher: PrimaryEffectDispatcher | undefined;
+  private backgroundProcessDeliveryDispatcher: BackgroundProcessDeliveryDispatcher | undefined;
+  private reliabilityUnavailableError: Error | undefined;
+  private storageStartupNoticeShown = false;
+  private dataRootChangeInProgress = false;
+  /** True only after migration, recovery, initial hydration and long-lived process reconciliation succeed. */
+  private authoritativeStorageReady = false;
   private hydrated = false;
   private resolveHydrated: () => void = () => undefined;
   private readonly hydratedReady = new Promise<void>((resolve) => { this.resolveHydrated = resolve; });
@@ -171,26 +209,37 @@ export class BackendApplication {
   private readonly recentClosedConversationIds: string[] = [];
   /** 冷卸载后仅保留历史列表摘要，避免重命名等轻量更新把预览误写为空。 */
   private readonly coldConversationHistoryEntries = new Map<string, SidebarConversationHistoryEntry>();
+  /** 删除请求一旦开始即成为本进程内 tombstone，阻止旧历史卡片或延迟加载复活同一 ID。 */
+  private readonly deletedConversationIds = new Set<string>();
+  private readonly conversationDeletionInFlight = new Map<string, Promise<boolean>>();
   private readonly conversationEvictionGeneration = new Map<string, number>();
   private conversationEvictionInFlight: string | undefined;
   private readonly conversationHistoryChangedEmitter = new vscode.EventEmitter<void>();
+  private readonly pendingConversationHistoryRefreshes = new Set<string>();
+  private conversationHistoryRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private conversationHistoryRefreshTail: Promise<void> = Promise.resolve();
   private readonly disposables: vscode.Disposable[] = [];
+  private backgroundProcessProjectionAttached = false;
   public readonly onDidChangeConversationHistory = this.conversationHistoryChangedEmitter.event;
 
   public constructor(context: vscode.ExtensionContext) {
-    const { env, toolSchemas, toolDefinitions } = createRuntimeEnv(context);
+    const runtimeSetup = createRuntimeEnv(context);
+    const { env, toolSchemas, toolDefinitions } = runtimeSetup;
     this.env = env;
+    runtimeSetup.installAttachmentResolver(async (input) => {
+      const resolved = await this.resolveAttachmentReference(input);
+      if (resolved.status !== 'available') throw new Error(resolved.error ?? '附件不可用。');
+      return resolved.part;
+    });
     this.world.setResource(OpenConversationPanelIdsKey, []);
     this.env.mcp.setStateChangeListener(() => this.syncMcpRuntimeResources());
-    this.persistence = new ClientStatePersistence(this.world, this.env.storage, {
-      renderLoadedConversationIds: () => this.persistableRenderDetailConversationIds(),
-      runHistoryLoadedConversationIds: () => this.runHistoryLoadedConversationDetails,
-      isConversationHistorySummaryComplete: (conversationId) => this.isConversationHistorySummaryComplete(conversationId)
-    });
+    this.persistence = new ClientStatePersistence(this.world, this.env.storage);
     this.globalSettingsBridge = new GlobalSettingsBridge({
       storage: this.env.storage,
       webview: this.env.webview,
-      beforeDataRootChange: () => this.persistence.persistImmediately({ force: true, throwOnError: true }),
+      beforeDataRootChange: () => this.prepareDataRootChange(),
+      afterDataRootChange: () => this.commitDataRootChange(),
+      dataRootChangeFailed: () => this.recoverDataRootChange(),
       beforeUpdate: (payload) => this.beforeGlobalSettingsUpdate(payload),
       afterUpdate: (payload) => this.afterGlobalSettingsUpdate(payload)
     });
@@ -199,6 +248,7 @@ export class BackendApplication {
       storage: this.env.storage,
       webview: this.env.webview,
       requestSnapshot: (conversationId) => this.requestSnapshot(conversationId),
+      renameConversation: (conversationId, title) => this.renameConversationTitle(conversationId, title),
       afterRead: (stored) => this.afterConversationSettingsRead(stored),
       afterUpdate: (stored) => this.afterConversationSettingsUpdate(stored)
     });
@@ -213,22 +263,36 @@ export class BackendApplication {
       globalSettingsBridge: this.globalSettingsBridge,
       conversationSettingsBridge: this.conversationSettingsBridge,
       isHydrated: () => this.hydrated,
+      isAuthoritativeStorageReady: () => this.authoritativeStorageReady,
       requestSnapshot: (conversationId) => this.requestSnapshot(conversationId),
       requestPersist: (reason) => this.requestPersistSoon(reason),
-      flushPersistence: (_reason) => this.persistence.persistImmediately({ ensurePersisted: true, throwOnError: true }),
       ensureConversationDetailLoaded: (conversationId) => this.ensureConversationDetailLoaded(conversationId),
       ensureConversationTailLoaded: (conversationId) => this.ensureConversationTailLoaded(conversationId),
+      loadConversationTimelinePage: (request) => this.loadCommittedTimelinePage(request),
+      loadConversationRunHistoryPage: (request) => this.loadCommittedRunHistoryPage(request),
+      loadConversationRunDetail: (request) => this.loadCommittedRunDetail(request),
+      resolveConversationRunIdForMessage: (conversationId, messageId) => this.resolveCommittedRunIdForMessage(conversationId, messageId),
+      resolveAttachmentForClient: (input) => this.resolveAttachmentReference(input),
+      materializeAttachmentFileUri: (input) => this.materializeAttachmentFile(input),
       getProjectFolderCandidates: () => this.getProjectFolderCandidates(),
       setConversationProjectFolder: (input) => this.setConversationProjectFolder(input),
       importWorkEnvironmentsFromVscode: () => this.importWorkEnvironmentsFromVscode(),
       refreshSkillCatalog: () => this.syncSkillCatalogResource(),
       refreshRulesCatalog: () => this.syncRulesCatalogResource(),
-      saveRuleFile: (scope, content) => this.saveRuleFile(scope, content)
+      saveRuleFile: (scope, content) => this.saveRuleFile(scope, content),
+      applyToolChangeFromEditor: async (conversationId, toolCallId) => {
+        const gateway = this.conversationCommands;
+        if (!gateway) throw new Error('可靠 conversation transaction backend 尚未就绪。');
+        await gateway.applyToolChangeFromEditor(conversationId as ConversationId, toolCallId as ToolCallId);
+      }
     });
 
     registerApplicationEffectHandlers(this.effectHandlers);
     this.registerConversationContextEffectHandler();
     this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      // The final deferred-hydration pass re-reads the current workspace. Do not let an early VS Code
+      // event start catalog or persistence work while Stable ID migration owns the source inventory.
+      if (!this.authoritativeStorageReady) return;
       this.syncWorkEnvironmentsFromWorkspaceFolders();
       void this.syncSkillCatalogResource();
       void this.syncRulesCatalogResource();
@@ -242,7 +306,7 @@ export class BackendApplication {
       afterTick: () => {
         flushEffects(this.outbox, this.env, (event) => this.world.enqueue(event), this.effectHandlers);
         this.notifyPendingUserAttention();
-        this.persistence.queuePersist();
+        this.persistence.queuePersistIfSkeletonChanged();
         this.conversationHistoryChangedEmitter.fire();
         this.processConversationDetailEvictions();
       }
@@ -251,39 +315,43 @@ export class BackendApplication {
       workerPoolSize: 2
     });
 
-    installWorldPlugins(
+    installProductionWorld(
       { world: this.world, scheduler: this.scheduler },
-      [commonPlugin(), clientSyncPlugin(), storageProjectionPlugin(), agentPlugin(), workflowPlugin(), planReviewPlugin(), projectPlugin(), workEnvironmentPlugin(), runtimeContextPlugin(), checkpointPlugin(), compressionPlugin(), llmPlugin(), agentAnswerPlugin(), toolsPlugin({ toolSchemas, toolDefinitions, toolRuntimeDefinitions: this.env.tools.registry }), backgroundCommandPlugin(), skillPlugin(), rulesPlugin(), chatPlugin(), agentRunPlugin()]
+      { toolSchemas, toolDefinitions, toolRuntimeDefinitions: this.env.tools.registry }
     );
-    registerClientSyncSystems(this.scheduler);
+    // Compile the exact production graph before hydration or Bridge command admission. A broken
+    // graph must fail activation explicitly rather than leaving safe-point callers pending forever.
+    this.scheduler.prepare();
 
     void this.initializeClientState();
   }
 
-  /** 由外部显式请求生成 agent；基础对话会在初始化时创建 main/default。 */
+  /** 由外部显式请求生成 Agent，并链接到已经提交的独立 Conversation。 */
   public requestAgentSpawn(request: AgentSpawnRequestData): void {
-    requestSpawnAgent(this.world, request);
+    const conversationId = request.conversationId.trim();
+    if (!conversationId || this.findConversationEntity(conversationId) === undefined) {
+      throw new Error(`Agent spawn requires an existing committed Conversation: ${conversationId || '<empty>'}`);
+    }
+    requestSpawnAgent(this.world, { ...request, conversationId });
   }
 
-  /** 创建一个独立 conversation，并用独立 AgentConversationLink 绑定到默认 agent。 */
+  /** 先提交独立 Conversation aggregate，再创建 Agent/Project 等独立关系对象。 */
   public async createConversation(options: CreateConversationOptions = {}): Promise<string> {
-    const conversationId = `conversation-${createMessageId()}`;
-    const title = createNewConversationTitle();
-    const agent = this.findDefaultAgent();
-    if (agent === undefined) {
-      requestSpawnAgent(this.world, { ...createDefaultAgentSpawnRequest(), conversationId, conversationTitle: title, initialMessage: undefined });
-      this.requestSnapshot(conversationId);
-      return conversationId;
-    }
+    await this.waitUntilHydrated();
+    this.requireAuthoritativeStorage();
+    const gateway = this.conversationCommands;
+    if (!gateway) throw new Error('可靠 conversation transaction backend 尚未就绪。');
 
-    const conversation = this.world.spawn();
-    this.world.add(conversation, Conversation, { id: conversationId, title, visibility: 'visible' });
-    this.world.add(conversation, ConversationFullContextLoaded, { loadedAt: Date.now() });
+    const conversationId = stableIds.nextConversationId();
+    const title = createNewConversationTitle();
+    await gateway.createConversation(conversationId, title);
+    const conversation = this.findConversationEntity(conversationId);
+    if (conversation === undefined) throw new Error(`已提交的 Conversation 未投影到 ECS：${conversationId}`);
 
     const now = Date.now();
     const origin = this.world.spawn();
     this.world.add(origin, ConversationOriginLink, {
-      id: `col${origin}`,
+      id: nextAuxiliaryId('col'),
       conversation,
       originKind: 'user',
       sourceKind: 'user',
@@ -291,28 +359,32 @@ export class BackendApplication {
       updatedAt: now
     });
 
-    const link = this.world.spawn();
-    this.world.add(link, AgentConversationLink, {
-      id: `acl${link}`,
-      agent,
-      conversation,
-      role: 'default',
-      createdAt: now,
-      updatedAt: now
-    });
+    const agent = this.findDefaultAgent();
+    if (agent === undefined) {
+      requestSpawnAgent(this.world, createDefaultAgentSpawnRequest(conversationId));
+    } else {
+      const link = this.world.spawn();
+      this.world.add(link, AgentConversationLink, {
+        id: nextAuxiliaryId('acl'),
+        agent,
+        conversation,
+        role: 'default',
+        createdAt: now,
+        updatedAt: now
+      });
 
-    const selection = this.world.spawn();
-    const agentRecord = this.world.get(agent, Agent);
-    this.world.add(selection, ConversationAgentSelection, {
-      id: `conversation-agent:${conversationId}:${agentRecord?.id ?? DEFAULT_AGENT_ID}`,
-      conversation,
-      agent,
-      role: 'active',
-      createdAt: now,
-      updatedAt: now
-    });
-
-    upsertDefaultWorkflowSelection(this.world, conversation, conversationId);
+      const selection = this.world.spawn();
+      const agentRecord = this.world.get(agent, Agent);
+      this.world.add(selection, ConversationAgentSelection, {
+        id: `conversation-agent:${conversationId}:${agentRecord?.id ?? DEFAULT_AGENT_ID}`,
+        conversation,
+        agent,
+        role: 'active',
+        createdAt: now,
+        updatedAt: now
+      });
+      upsertDefaultWorkflowSelection(this.world, conversation, conversationId);
+    }
 
     const projectFolder = this.resolveProjectFolderForNewConversation(options.projectFolderUri);
     if (projectFolder) setConversationProject(this.world, { conversation, uri: projectFolder.uri, name: projectFolder.name });
@@ -320,26 +392,35 @@ export class BackendApplication {
     this.renderLoadedConversationDetails.add(conversationId);
     this.runHistoryLoadedConversationDetails.add(conversationId);
     this.conversationTailLoaded.add(conversationId);
+    this.persistence.queuePersist();
     this.requestSnapshot();
     void this.upsertConversationHistoryEntry(conversationId)
       .catch((error) => console.warn('[LimCode] Failed to persist new conversation history entry.', error));
     return conversationId;
   }
 
-  /** 从源对话开头复制到指定消息（含）并创建一条独立的 fork conversation。 */
+  /** 从已提交源 timeline 创建独立 fork aggregate，再物化跨领域 Link。 */
   public async forkConversation(sourceConversationId: string, messageId: string): Promise<string> {
     const normalizedSourceId = sourceConversationId.trim();
     const normalizedMessageId = messageId.trim();
     if (!normalizedSourceId || !normalizedMessageId) throw new Error('缺少源对话或目标消息。');
 
     await this.waitUntilHydrated();
+    this.requireAuthoritativeStorage();
     await this.ensureConversationDetailLoaded(normalizedSourceId);
+    const gateway = this.conversationCommands;
+    if (!gateway) throw new Error('可靠 conversation transaction backend 尚未就绪。');
 
-    const conversationId = `conversation-${createMessageId()}`;
-    forkConversationInWorld(this.world, {
+    const conversationId = stableIds.nextConversationId();
+    await gateway.forkConversation(
+      normalizedSourceId as ConversationId,
+      conversationId,
+      normalizedMessageId
+    );
+    materializeForkRelationsInWorld(this.world, {
       sourceConversationId: normalizedSourceId,
-      throughMessageId: normalizedMessageId,
-      targetConversationId: conversationId
+      targetConversationId: conversationId,
+      throughMessageId: normalizedMessageId
     });
 
     this.renderLoadedConversationDetails.add(conversationId);
@@ -347,9 +428,9 @@ export class BackendApplication {
     this.conversationTailLoaded.add(conversationId);
     await this.copyConversationSettings(normalizedSourceId, conversationId);
 
+    this.persistence.queuePersist();
     this.requestSnapshot();
     this.requestSnapshot(conversationId);
-    await this.persistence.persistImmediately({ forceConversationId: conversationId });
     return conversationId;
   }
 
@@ -363,7 +444,9 @@ export class BackendApplication {
 
     for (const entity of this.world.query(Conversation)) {
       const conversation = this.world.get(entity, Conversation);
-      if (!conversation?.id) continue;
+      if (!conversation?.id || conversation.visibility === 'hidden') continue;
+      const timeline = this.world.get(entity, ConversationTimeline);
+      if (!timeline) throw new Error(`Conversation ${conversation.id} has no ConversationTimeline.`);
       const messages = messagesByConversation.get(entity) ?? [];
       const latest = latestMessage(messages);
       const agentName = agentNamesByConversation.get(entity);
@@ -376,12 +459,12 @@ export class BackendApplication {
         preview,
         messageCount: messages.length,
         status: latest?.status ?? 'empty',
-        isRunning: !!runSummary
+        createdAt: timeline.createdAt,
+        isRunning: !!runSummary,
+        updatedAt: Math.max(timeline.createdAt, timeline.lastActivityAt, latest?.createdAt ?? 0)
       };
       const previewState = latest ? aiPreviewState(latest) : undefined;
       if (previewState) entry.previewState = previewState;
-      const fallbackUpdatedAt = conversationCreatedAtFromId(conversation.id);
-      if (latest) entry.updatedAt = latest.createdAt; else if (fallbackUpdatedAt !== undefined) entry.updatedAt = fallbackUpdatedAt;
       if (agentName) entry.agentName = agentName;
       if (project) {
         entry.projectFolderUri = project.uri;
@@ -395,11 +478,13 @@ export class BackendApplication {
       entries.push(entry);
     }
 
-    return entries.filter((entry) => entry.title).sort(compareConversationHistoryEntries);
+    return entries
+      .filter((entry) => entry.title && !this.deletedConversationIds.has(entry.id))
+      .sort(compareConversationHistoryEntries);
   }
 
   public getConversationDisplayTitle(conversationId: string | undefined): string {
-    if (!conversationId) return 'LimCode';
+    if (!conversationId) return EXTENSION_BRAND;
     const entity = this.findConversationEntity(conversationId);
     if (entity === undefined) return displayConversationTitle({ id: conversationId });
     const conversation = this.world.get(entity, Conversation);
@@ -409,108 +494,96 @@ export class BackendApplication {
     return displayConversationTitle({ id: conversation.id, title: conversation.title, messages });
   }
 
-  public ensureConversationPlaceholder(conversationId: string, title?: string): boolean {
+  /** 侧边栏打开历史会话前的唯一入口；hydration 完成后绝不凭陈旧卡片创建缺失会话。 */
+  public prepareConversationForSidebarOpen(conversationId: string, title?: string): boolean {
     const normalizedConversationId = conversationId.trim();
     if (!normalizedConversationId) return false;
+    const deleted = this.deletedConversationIds.has(normalizedConversationId);
     const existing = this.findConversationEntity(normalizedConversationId);
-    if (existing !== undefined) {
-      const current = this.world.get(existing, Conversation);
-      const nextTitle = title?.trim() ? normalizeConversationTitle(title) : undefined;
-      if (current && nextTitle && !current.title) {
-        this.world.add(existing, Conversation, { ...current, title: nextTitle });
-        this.requestSnapshot();
-        this.requestSnapshot(normalizedConversationId);
-        this.persistence.queuePersist();
-        return true;
+    if (!canPrepareConversationForSidebarOpen({ hydrated: this.hydrated, deleted, exists: existing !== undefined })) return false;
+    if (!this.hydrated) return true;
+    void title;
+    return existing !== undefined && this.world.get(existing, Conversation)?.visibility !== 'hidden';
+  }
+
+  public ensureConversationPlaceholder(conversationId: string, title?: string): boolean {
+    const normalizedConversationId = conversationId.trim();
+    void title;
+    return !!normalizedConversationId
+      && !this.deletedConversationIds.has(normalizedConversationId)
+      && this.findConversationEntity(normalizedConversationId) !== undefined;
+  }
+
+  public async renameConversationTitle(conversationId: string, title: string): Promise<boolean> {
+    const normalizedConversationId = conversationId.trim();
+    const normalizedTitle = normalizeConversationTitle(title);
+    if (!normalizedConversationId || !normalizedTitle || this.deletedConversationIds.has(normalizedConversationId)) return false;
+    await this.waitUntilHydrated();
+    const gateway = this.conversationCommands;
+    if (!gateway) throw this.reliabilityUnavailableError ?? new Error('可靠 conversation transaction backend 尚未就绪。');
+    return gateway.renameConversationFromHost(normalizedConversationId as ConversationId, normalizedTitle);
+  }
+
+  public deleteConversation(conversationId: string): Promise<boolean> {
+    const normalizedConversationId = conversationId.trim();
+    if (!normalizedConversationId) return Promise.resolve(false);
+    const existing = this.conversationDeletionInFlight.get(normalizedConversationId);
+    if (existing) return existing;
+
+    const deletion = this.deleteConversationInternal(normalizedConversationId);
+    this.conversationDeletionInFlight.set(normalizedConversationId, deletion);
+    const clear = (): void => {
+      if (this.conversationDeletionInFlight.get(normalizedConversationId) === deletion) {
+        this.conversationDeletionInFlight.delete(normalizedConversationId);
       }
-      return false;
-    }
-
-    const now = Date.now();
-    const conversation = this.world.spawn();
-    this.world.add(conversation, Conversation, {
-      id: normalizedConversationId,
-      title: normalizeConversationTitle(title ?? ''),
-      visibility: 'visible'
-    });
-
-    const origin = this.world.spawn();
-    this.world.add(origin, ConversationOriginLink, {
-      id: `col${origin}`,
-      conversation,
-      originKind: 'user',
-      sourceKind: 'user',
-      createdAt: now,
-      updatedAt: now
-    });
-
-    const agent = this.findDefaultAgent() ?? this.ensurePreHydrationAgent(DEFAULT_AGENT_ID);
-    this.ensurePreHydrationAgentConversationLink(conversation, normalizedConversationId, agent, now);
-
-    const agentRecord = this.world.get(agent, Agent);
-    const selection = this.world.spawn();
-    this.world.add(selection, ConversationAgentSelection, {
-      id: `conversation-agent:${normalizedConversationId}:${agentRecord?.id ?? DEFAULT_AGENT_ID}`,
-      conversation,
-      agent,
-      role: 'active',
-      createdAt: now,
-      updatedAt: now
-    });
-
-    upsertDefaultWorkflowSelection(this.world, conversation, normalizedConversationId);
-    void this.upsertConversationHistoryEntry(normalizedConversationId);
-    this.requestSnapshot();
-    this.requestSnapshot(normalizedConversationId);
-    this.persistence.queuePersist();
-    return true;
+    };
+    void deletion.then(clear, clear);
+    return deletion;
   }
 
-  public renameConversationTitle(conversationId: string, title: string): boolean {
-    const entity = this.findConversationEntity(conversationId);
-    if (entity === undefined) return false;
-    const conversation = this.world.get(entity, Conversation);
-    if (!conversation) return false;
+  private async deleteConversationInternal(conversationId: string): Promise<boolean> {
+    await this.waitUntilHydrated();
+    await this.deferredSkeletonReady;
+    const gateway = this.conversationCommands;
+    if (!gateway) throw this.reliabilityUnavailableError ?? new Error('可靠 conversation transaction backend 尚未就绪。');
+    const committed = await gateway.deleteConversationFromHost(conversationId as ConversationId);
+    if (!committed) return false;
 
-    this.world.add(entity, Conversation, { ...conversation, title: normalizeConversationTitle(title) });
-    void this.upsertConversationHistoryEntry(conversationId);
-    this.requestSnapshot();
-    this.requestSnapshot(conversationId);
-    return true;
-  }
-
-  public deleteConversation(conversationId: string): boolean {
-    const entity = this.findConversationEntity(conversationId);
-    if (entity === undefined) return false;
-
-    const cascade = this.collectConversationCascadeEntities(entity, conversationId);
-    for (const target of cascade) {
-      const request = this.world.get(target, LlmRequest);
-      if (request?.id) this.env.llm.abort(request.id);
-    }
-    for (const target of cascade) {
-      this.world.despawn(target);
-    }
+    // The durable tombstone and Run graph termination are already committed. Everything below is a
+    // rebuildable process/read-model cleanup and must never turn the domain result back into failure.
+    this.deletedConversationIds.add(conversationId);
     this.renderLoadedConversationDetails.delete(conversationId);
     this.runHistoryLoadedConversationDetails.delete(conversationId);
     this.conversationTailLoaded.delete(conversationId);
     this.coldConversationHistoryEntries.delete(conversationId);
     this.removeRecentClosedConversation(conversationId);
     this.bumpConversationEvictionGeneration(conversationId);
-    void this.env.storage.removeConversationHistoryEntry(conversationId);
     this.requestSnapshot();
     this.requestSnapshot(conversationId);
+    this.conversationHistoryChangedEmitter.fire();
+    void this.cleanupDeletedConversationReadModels(conversationId);
     return true;
   }
 
-  public abortConversation(conversationId: string): boolean {
-    const entity = this.findConversationEntity(conversationId);
-    if (entity === undefined) return false;
+  private async cleanupDeletedConversationReadModels(conversationId: string): Promise<void> {
+    try {
+      await this.scheduler.waitForIdle();
+      await this.persistence.persistImmediately({ force: true, throwOnError: true });
+      await this.env.storage.removeConversationHistoryEntry(conversationId);
+    } catch (error) {
+      console.warn(`[LimCode][Reliability] Conversation ${conversationId} was deleted durably, but read-model cleanup failed.`, error);
+    }
+  }
 
-    this.world.enqueue({ type: AgentRunEventType.CancelConversation, payload: { conversationId, reason: 'sidebar_abort' } });
-    this.requestSnapshot();
-    this.requestSnapshot(conversationId);
-    return true;
+  public async abortConversation(conversationId: string, requestId?: string): Promise<HostTurnInterruptResult> {
+    const normalizedConversationId = conversationId.trim();
+    if (!normalizedConversationId || this.deletedConversationIds.has(normalizedConversationId)) {
+      return { status: 'already_satisfied', reason: 'conversation_not_available' };
+    }
+    await this.waitUntilHydrated();
+    const gateway = this.conversationCommands;
+    if (!gateway) throw this.reliabilityUnavailableError ?? new Error('可靠 conversation transaction backend 尚未就绪。');
+    return gateway.cancelConversationFromHost(normalizedConversationId as ConversationId, requestId);
   }
 
   public getProjectFolderCandidates(): ProjectFolderCandidateRecord[] {
@@ -545,8 +618,43 @@ export class BackendApplication {
     return this.env.storage.paths.globalStorageUri;
   }
 
+  /**
+   * Stops every writer, archives only LimCode-managed data, stamps the current epoch and leaves the
+   * process unavailable until VS Code reloads. This is intentionally a reset, not an old-format migration.
+   */
+  public async resetDevelopmentData(): Promise<StorageDataResetResult> {
+    await this.hydratedReady;
+    if (this.dataRootChangeInProgress) throw new Error('数据根操作正在进行中。');
+    this.dataRootChangeInProgress = true;
+    this.reliabilityUnavailableError = codedError('migration_required', '正在归档并重置开发数据；重载窗口前命令入口保持关闭。');
+
+    const dispatcher = this.primaryEffectDispatcher;
+    const backend = this.reliabilityBackend;
+    this.conversationCommands = undefined;
+    this.primaryEffectDispatcher = undefined;
+    this.reliabilityBackend = undefined;
+    this.reliabilityAdapter = undefined;
+    this.reliabilityInspector = undefined;
+
+    await dispatcher?.dispose();
+    await backend?.quiesce();
+    await this.persistence.suspend();
+    await backend?.dispose();
+    await this.scheduler.stopAndDrain();
+    await this.env.mcp.dispose();
+    return this.env.storage.resetDataRoot({ archive: true });
+  }
+
   public getConversationHistoryRootUri(): vscode.Uri {
     return this.env.storage.paths.conversationHistoryRootUri;
+  }
+
+  public async inspectReliability(conversationId?: string): Promise<ReliabilityInspectionSnapshot> {
+    await this.hydratedReady;
+    const inspector = this.reliabilityInspector;
+    if (!inspector) throw this.reliabilityUnavailableError ?? new Error('可靠存储 inspector 尚未就绪。');
+    const scope = conversationId?.trim();
+    return inspector.snapshot(scope ? scope as ConversationId : undefined);
   }
 
   public attachWebview(webview: vscode.Webview, meta: WebviewClientMeta = { kind: 'unknown' }): BridgeClientId {
@@ -562,7 +670,7 @@ export class BackendApplication {
 
   public ensureConversationTailLoaded(conversationId: string): Promise<void> {
     const normalizedConversationId = conversationId.trim();
-    if (!normalizedConversationId || this.isConversationTailLoaded(normalizedConversationId)) return Promise.resolve();
+    if (!normalizedConversationId || this.deletedConversationIds.has(normalizedConversationId) || this.isConversationTailLoaded(normalizedConversationId)) return Promise.resolve();
 
     const existing = this.conversationTailLoadInFlight.get(normalizedConversationId);
     if (existing) return existing;
@@ -590,28 +698,25 @@ export class BackendApplication {
   }
 
   private async loadConversationTail(conversationId: string): Promise<void> {
-    const page = await this.env.storage.loadConversationTimelinePage({
+    if (this.deletedConversationIds.has(conversationId)) return;
+    const page = await this.loadCommittedTimelinePage({
       conversationId,
       direction: 'initial',
       chunkCount: 1
     });
-    if (page.state.messages.length > 0 && this.findConversationEntity(conversationId) === undefined) {
-      this.spawnPreHydrationConversation(conversationId);
+    if (this.deletedConversationIds.has(conversationId)) return;
+    if (this.findConversationEntity(conversationId) === undefined) {
+      throw new Error(`Timeline page has no committed Conversation projection: ${conversationId}`);
     }
     if (page.state.messages.length > 0) {
-      const backfilled = backfillMissingToolResponsesForStatelessLoad(page.state, conversationId);
-      await hydrateConversationDetail(this.world, backfilled.state, conversationId);
-      if (backfilled.addedCount > 0) {
-        this.requestSnapshot(conversationId);
-        this.persistence.queuePersist();
-      }
+      await hydrateConversationDetail(this.world, page.state, conversationId);
     }
     this.conversationTailLoaded.add(conversationId);
   }
 
   public ensureConversationDetailLoaded(conversationId: string): Promise<void> {
     const normalizedConversationId = conversationId.trim();
-    if (!normalizedConversationId) return Promise.resolve();
+    if (!normalizedConversationId || this.deletedConversationIds.has(normalizedConversationId)) return Promise.resolve();
     if (this.renderLoadedConversationDetails.has(normalizedConversationId)) {
       this.markConversationFullContextLoaded(normalizedConversationId);
       return Promise.resolve();
@@ -634,37 +739,23 @@ export class BackendApplication {
 
   private async loadConversationDetail(conversationId: string): Promise<void> {
     if (!this.hydrated) await this.waitUntilHydrated();
+    if (this.deletedConversationIds.has(conversationId)) return;
     if (this.renderLoadedConversationDetails.has(conversationId)) {
       this.markConversationFullContextLoaded(conversationId);
       return;
     }
 
-    const storedDetail = await this.env.storage.loadConversationDetail(conversationId, { includeRunHistory: false });
-    // 历史 timeline 可能因为截断/重试/增量持久化交错留下“ToolCall 终态存在，但
-    // Message.content 中缺少 functionResponse”的不一致记录。无论是冷加载还是无状态
-    // 加载，都先用已保存的 toolCalls 结果补齐消息层响应，避免后续压缩/模型上下文被
-    // 半截 functionCall 卡住。
-    const backfilled = storedDetail
-      ? backfillMissingToolResponsesForStatelessLoad(storedDetail, conversationId)
-      : { state: storedDetail, addedCount: 0 };
-    const detail = backfilled.state;
-
-    if (detail && this.findConversationEntity(conversationId) === undefined) {
-      this.spawnPreHydrationConversation(conversationId);
+    const detail = await this.loadCommittedConversationClientState(conversationId);
+    if (this.deletedConversationIds.has(conversationId)) return;
+    if (this.findConversationEntity(conversationId) === undefined) {
+      throw new Error(`Conversation detail has no committed aggregate projection: ${conversationId}`);
     }
-
-    const hydrated = detail ? await hydrateConversationDetail(this.world, detail, conversationId) : false;
-    if (detail && hydrated) this.primeConversationStreamState(conversationId, detail);
-    const loaded = hydrated || this.findConversationEntity(conversationId) !== undefined;
-    if (loaded) {
-      this.renderLoadedConversationDetails.add(conversationId);
-      this.coldConversationHistoryEntries.delete(conversationId);
-      this.markConversationFullContextLoaded(conversationId);
-    }
-    if (hydrated && backfilled.addedCount > 0) {
-      this.requestSnapshot(conversationId);
-      this.persistence.queuePersist();
-    }
+    const hydrated = await hydrateConversationDetail(this.world, detail, conversationId);
+    if (!hydrated) throw new Error(`Committed Conversation detail could not be hydrated: ${conversationId}`);
+    this.primeConversationStreamState(conversationId, detail);
+    this.renderLoadedConversationDetails.add(conversationId);
+    this.coldConversationHistoryEntries.delete(conversationId);
+    this.markConversationFullContextLoaded(conversationId);
   }
 
   public getCurrentProjectHistoryScope(): ConversationHistoryScope {
@@ -678,6 +769,8 @@ export class BackendApplication {
   }
 
   public async getConversationHistoryPage(input: { scopeKind: SidebarHistoryScopeKind; projectFolderUri?: string; cursor?: string; limit?: number }): Promise<ConversationHistoryPageRecord> {
+    await this.waitUntilHydrated();
+    this.requireAuthoritativeStorage();
     const scope = this.resolveHistoryScope(input.scopeKind, input.projectFolderUri);
     const page = await this.env.storage.loadConversationHistoryPage({ scope, cursor: input.cursor, limit: input.limit });
     return this.mergeLiveConversationHistoryPage(page, scope);
@@ -691,13 +784,30 @@ export class BackendApplication {
   }
 
   private mergeLiveConversationHistoryPage(page: ConversationHistoryPageRecord, scope: ConversationHistoryScope): ConversationHistoryPageRecord {
-    const entriesById = new Map(page.entries.map((entry) => [entry.id, entry]));
+    const runSummariesById = new Map<string, ConversationRunHistoryRuntimeSummary>();
+    for (const [entity, summary] of this.collectRunSummariesByConversation()) {
+      const conversationId = this.world.get(entity, Conversation)?.id;
+      if (conversationId && !this.deletedConversationIds.has(conversationId)) runSummariesById.set(conversationId, summary);
+    }
+
+    const entriesById = new Map<string, SidebarConversationHistoryEntry>();
+    let changed = false;
+    let removedStoredCount = 0;
+    for (const stored of page.entries) {
+      if (this.deletedConversationIds.has(stored.id)) {
+        changed = true;
+        removedStoredCount += 1;
+        continue;
+      }
+      const summary = runSummariesById.get(stored.id);
+      const normalized = historyEntryWithLiveRunState(stored, summary);
+      if (JSON.stringify(stored) !== JSON.stringify(normalized)) changed = true;
+      entriesById.set(normalized.id, normalized);
+    }
+
     const liveEntries = this.getConversationHistoryEntries()
       .filter((entry) => this.isConversationHistorySummaryComplete(entry.id) && (historyEntryMatchesScope(entry, scope) || entriesById.has(entry.id)));
-    if (liveEntries.length === 0) return page;
-
     const isFirstPage = page.pageInfo.pageIndex === 0;
-    let changed = false;
     for (const entry of liveEntries) {
       if (!isFirstPage && !entriesById.has(entry.id)) continue;
       const existing = entriesById.get(entry.id);
@@ -725,19 +835,74 @@ export class BackendApplication {
       originLinks: [...originLinksByConversationId.values()].filter((link) => visibleEntryIds.has(link.conversationId)),
       pageInfo: {
         ...page.pageInfo,
-        total: Math.max(page.pageInfo.total, visibleEntries.length)
+        total: Math.max(Math.max(0, page.pageInfo.total - removedStoredCount), visibleEntries.length)
       }
     };
   }
 
-  private persistableRenderDetailConversationIds(): string[] {
-    const ids = new Set(this.renderLoadedConversationDetails);
-    for (const conversationId of this.conversationTailLoaded) ids.add(conversationId);
-    return [...ids].filter((conversationId) => this.findConversationEntity(conversationId) !== undefined);
-  }
-
   private isConversationHistorySummaryComplete(conversationId: string): boolean {
     return this.renderLoadedConversationDetails.has(conversationId);
+  }
+
+  private async resolveAttachmentReference(input: AttachmentReloadPayload): Promise<ResolvedAttachmentInlineData> {
+    return resolveAttachmentReferenceForClient(
+      this.env.storage.paths,
+      input,
+      (attachmentId) => this.loadCanonicalManagedAttachment(attachmentId)
+    );
+  }
+
+  private async materializeAttachmentFile(input: AttachmentOpenPayload): Promise<vscode.Uri | undefined> {
+    return materializeResolvedAttachmentFileUri(
+      this.env.storage.paths,
+      input,
+      (attachmentId) => this.loadCanonicalManagedAttachment(attachmentId)
+    );
+  }
+
+  private async loadCanonicalManagedAttachment(attachmentId: string): Promise<import('../../shared/protocol').InlineDataPart> {
+    const backend = this.reliabilityBackend;
+    if (!backend) throw this.reliabilityUnavailableError ?? new Error('可靠 attachment resource backend 尚未就绪。');
+    const files = new DurableFileSystem(this.env.storage.paths.globalStoragePath);
+    return backend.readStorageResource(
+      [ATTACHMENT_STORAGE_RESOURCE_KEY],
+      () => requireCanonicalManagedAttachmentData(files, attachmentId)
+    );
+  }
+
+  private async loadCommittedTimelinePage(request: ConversationTimelinePageRequest): Promise<ConversationTimelinePageRecord> {
+    const gateway = this.conversationCommands;
+    if (!gateway) throw this.reliabilityUnavailableError ?? new Error('可靠 conversation transaction backend 尚未就绪。');
+    return projectConversationTimelinePage(
+      await gateway.readCommittedConversationFacts(request.conversationId as ConversationId),
+      request
+    );
+  }
+
+  private async loadCommittedRunHistoryPage(request: ConversationRunHistoryPageRequest): Promise<ConversationRunHistoryPageRecord> {
+    return projectConversationRunHistoryPage(
+      await this.loadCommittedConversationClientState(request.conversationId),
+      request
+    );
+  }
+
+  private async loadCommittedRunDetail(request: ConversationRunDetailRequest): Promise<ConversationRunDetailRecord | undefined> {
+    const state = await this.loadCommittedConversationClientState(request.conversationId);
+    const runId = request.runId
+      ?? (request.messageId ? resolveRunIdForMessageProjection(state, request.conversationId, request.messageId) : undefined);
+    return runId ? projectConversationRunDetail(state, request.conversationId, runId) : undefined;
+  }
+
+  private async resolveCommittedRunIdForMessage(conversationId: string, messageId: string): Promise<string | undefined> {
+    const state = await this.loadCommittedConversationClientState(conversationId);
+    return resolveRunIdForMessageProjection(state, conversationId, messageId);
+  }
+
+  private async loadCommittedConversationClientState(conversationId: string): Promise<ClientState> {
+    const gateway = this.conversationCommands;
+    if (!gateway) throw this.reliabilityUnavailableError ?? new Error('可靠 conversation transaction backend 尚未就绪。');
+    const facts = await gateway.readCommittedConversationFacts(conversationId as ConversationId);
+    return factsToClientState(facts);
   }
 
   private collectConversationOriginLinksById(): Map<string, ConversationOriginLinkRecord> {
@@ -750,7 +915,19 @@ export class BackendApplication {
   }
 
 
+  private async refreshConversationHistoryReadModel(conversationId: string): Promise<void> {
+    const entity = this.findConversationEntity(conversationId);
+    const conversation = entity === undefined ? undefined : this.world.get(entity, Conversation);
+    if (!conversation || conversation.visibility === 'hidden' || this.deletedConversationIds.has(conversationId)) {
+      await this.env.storage.removeConversationHistoryEntry(conversationId);
+    } else {
+      await this.upsertConversationHistoryEntry(conversationId);
+    }
+    this.conversationHistoryChangedEmitter.fire();
+  }
+
   private async upsertConversationHistoryEntry(conversationId: string): Promise<void> {
+    if (this.deletedConversationIds.has(conversationId)) return;
     const projected = this.getConversationHistoryEntries().find((candidate) => candidate.id === conversationId);
     if (!projected) return;
     const retained = this.coldConversationHistoryEntries.get(conversationId);
@@ -784,7 +961,7 @@ export class BackendApplication {
   }
 
   private scheduleConversationContextLoad(conversationId: string): void {
-    if (!conversationId || this.conversationContextLoadInFlight.has(conversationId)) return;
+    if (!conversationId || this.deletedConversationIds.has(conversationId) || this.conversationContextLoadInFlight.has(conversationId)) return;
     this.conversationContextLoadInFlight.add(conversationId);
     setTimeout(() => {
       void this.ensureConversationDetailLoaded(conversationId)
@@ -828,8 +1005,7 @@ export class BackendApplication {
     if (conversationId) {
       this.syncOpenConversationPanelPresence(conversationId);
       if (!this.hasOpenConversationPanel(conversationId)) this.rememberRecentlyClosedConversation(conversationId);
-      void this.persistence.persistImmediately({ forceConversationId: conversationId })
-        .catch((error) => console.warn(`[LimCode] Failed to persist conversation "${conversationId}" after panel detach.`, error));
+      this.persistence.queuePersist();
     }
   }
 
@@ -941,7 +1117,6 @@ export class BackendApplication {
   private async persistAndEvictConversationDetail(conversationId: string, generation: number): Promise<void> {
     let continueDraining = true;
     try {
-      await this.persistence.persistImmediately({ forceConversationId: conversationId, throwOnError: true });
       if ((this.conversationEvictionGeneration.get(conversationId) ?? 0) !== generation) return;
       if (this.hasOpenConversationPanel(conversationId)) return;
       if (this.conversationTailLoadInFlight.has(conversationId)
@@ -977,97 +1152,29 @@ export class BackendApplication {
 
   public handleWebviewMessage(clientId: BridgeClientId, message: WebviewToExtensionMessage): void {
     if (this.disposing) return;
-    if (!this.hydrated && this.handlePreHydrationChatSend(clientId, message)) return;
     if (!this.hydrated && shouldDeferUntilHydrated(message)) {
       this.pendingHydrationMessages.push({ clientId, message });
+      return;
+    }
+    if (this.hydrated && !this.authoritativeStorageReady && requiresHydratedStorage(message)) {
+      this.postReliabilityUnavailable(clientId, message);
       return;
     }
     if (this.hydrated && !this.deferredSkeletonComplete && shouldDeferUntilDeferredSkeleton(message)) {
       this.pendingDeferredSkeletonMessages.push({ clientId, message });
       return;
     }
-    this.webviewRouter.handle(clientId, message);
-  }
-
-  private handlePreHydrationChatSend(clientId: BridgeClientId, message: WebviewToExtensionMessage): boolean {
-    if (message.type !== BridgeMessageType.ChatSend || !message.payload) return false;
-    this.ensurePreHydrationChatTarget(message.payload.conversationId, message.payload.agentId);
-    this.webviewRouter.handle(clientId, message);
-    return true;
-  }
-
-  private ensurePreHydrationChatTarget(conversationId: string, agentId: string | undefined): void {
-    const normalizedConversationId = conversationId.trim();
-    if (!normalizedConversationId) return;
-    const now = Date.now();
-
-    const conversation = this.findConversationEntity(normalizedConversationId) ?? this.spawnPreHydrationConversation(normalizedConversationId);
-    const existingSelection = this.activeSelectionForConversation(conversation);
-    const selectedAgent = agentId?.trim()
-      ? this.ensurePreHydrationAgent(agentId.trim())
-      : existingSelection?.agent ?? this.findDefaultAgent() ?? this.ensurePreHydrationAgent(DEFAULT_AGENT_ID);
-
-    this.ensurePreHydrationAgentConversationLink(conversation, normalizedConversationId, selectedAgent, now);
-    if (existingSelection) {
-      const current = this.world.get(existingSelection.entity, ConversationAgentSelection);
-      if (current && current.agent !== selectedAgent) {
-        this.world.add(existingSelection.entity, ConversationAgentSelection, { ...current, agent: selectedAgent, updatedAt: now });
-      }
-    } else {
-      const agent = this.world.get(selectedAgent, Agent);
-      const selection = this.world.spawn();
-      this.world.add(selection, ConversationAgentSelection, {
-        id: `conversation-agent:${normalizedConversationId}:${agent?.id ?? DEFAULT_AGENT_ID}`,
-        conversation,
-        agent: selectedAgent,
-        role: 'active',
-        createdAt: now,
-        updatedAt: now
-      });
+    if (this.conversationCommands?.handle(clientId, message)) return;
+    if (isReliabilityBridgeMessageType(message.type)) {
+      this.postReliabilityUnavailable(clientId, message);
+      return;
     }
+    this.webviewRouter.handle(clientId, message);
   }
 
-  private spawnPreHydrationConversation(conversationId: string): Entity {
-    const conversation = this.world.spawn();
-    this.world.add(conversation, Conversation, { id: conversationId, visibility: 'visible' });
-    upsertDefaultWorkflowSelection(this.world, conversation, conversationId);
-    return conversation;
-  }
-
-  private ensurePreHydrationAgent(agentId: string): Entity {
-    const existing = this.findAgentEntity(agentId);
-    if (existing !== undefined) return existing;
-
-    const defaultAgent = createDefaultAgentRecord();
-    const isDefault = agentId === DEFAULT_AGENT_ID;
-    const agent = this.world.spawn();
-    this.world.add(agent, Agent, {
-      id: agentId,
-      name: isDefault ? defaultAgent.name : agentId,
-      source: isDefault ? defaultAgent.source : 'user'
-    });
-    this.world.add(agent, AgentKind, { kind: isDefault ? defaultAgent.kind : agentId });
-    this.world.add(agent, AgentStatusComponent, { status: 'idle' });
-    return agent;
-  }
-
-  private ensurePreHydrationAgentConversationLink(conversation: Entity, conversationId: string, agent: Entity, now: number): void {
-    const agentRecord = this.world.get(agent, Agent);
-    const exists = this.world.query(AgentConversationLink).some((entity) => {
-      const link = this.world.get(entity, AgentConversationLink);
-      return link?.conversation === conversation && link.agent === agent;
-    });
-    if (exists) return;
-
-    const link = this.world.spawn();
-    this.world.add(link, AgentConversationLink, {
-      id: `acl:early:${conversationId}:${agentRecord?.id ?? DEFAULT_AGENT_ID}`,
-      conversation,
-      agent,
-      role: 'default',
-      createdAt: now,
-      updatedAt: now
-    });
+  private requireAuthoritativeStorage(): void {
+    if (this.authoritativeStorageReady) return;
+    throw this.reliabilityUnavailableError ?? new Error('权威存储尚未完成启动。');
   }
 
   public dispose(): Promise<void> {
@@ -1081,11 +1188,18 @@ export class BackendApplication {
     this.env.webview.detachAll();
     this.webviewClients.clear();
     this.env.mcp.setStateChangeListener(undefined);
-    this.env.command.dispose();
 
     await this.hydratedReady;
     await this.deferredSkeletonReady;
+    await this.backgroundProcessDeliveryDispatcher?.dispose();
+    await this.primaryEffectDispatcher?.dispose();
+    this.env.command.dispose();
     await this.scheduler.stopAndDrain();
+    this.env.llm.dispose();
+    if (this.conversationHistoryRefreshTimer) clearTimeout(this.conversationHistoryRefreshTimer);
+    this.conversationHistoryRefreshTimer = undefined;
+    this.flushConversationHistoryRefreshes();
+    await this.conversationHistoryRefreshTail;
 
     let persistenceError: unknown;
     try {
@@ -1094,6 +1208,7 @@ export class BackendApplication {
       persistenceError = error;
     }
 
+    await this.reliabilityBackend?.dispose();
     await this.env.mcp.dispose();
     if (persistenceError) throw persistenceError;
   }
@@ -1115,36 +1230,280 @@ export class BackendApplication {
     let startupStorageHealthy = true;
     try {
       await this.env.storage.ensureReady();
+      await this.initializeReliabilityInfrastructure();
+      const gateway = this.conversationCommands;
+      const adapter = this.reliabilityAdapter;
+      if (!gateway || !adapter) throw new Error('可靠 conversation transaction backend 初始化不完整。');
+
+      const runtimeConversationIds = await adapter.listRuntimeConversationIds();
+      await gateway.adoptExistingRuntimeConversations(runtimeConversationIds, {
+        rehydrateConversationIds: runtimeConversationIds
+      });
+
       const restored = await this.env.storage.loadClientStateSkeleton({ profile: 'startup' });
-      const hasPreHydrationMessages = this.world.query(Message).length > 0;
-      if (restored && await hydrateClientStateSkeleton(this.world, restored, { resetMessageSeq: !hasPreHydrationMessages })) {
-        this.persistence.rememberPersistedState(restored);
-      } else if (this.world.query(Agent).length > 0 || this.world.query(Conversation).length > 0) {
-        // Early chat.send may have created the minimal ECS target before startup skeleton finished.
-      } else {
-        requestSpawnAgent(this.world, createDefaultAgentSpawnRequest());
+      if (restored?.conversations.length) {
+        throw codedError('migration_required', '独立领域 skeleton 不得包含 Conversation aggregate；请重置开发数据 Epoch。');
       }
+      if (restored) {
+        await hydrateClientStateSkeleton(this.world, restored, {
+          allowDefaults: false,
+          resetMessageSeq: runtimeConversationIds.length === 0
+        });
+        this.persistence.rememberPersistedState(restored);
+      }
+
+      if (runtimeConversationIds.length === 0) {
+        const conversationId = stableIds.nextConversationId();
+        await gateway.createConversation(conversationId, createNewConversationTitle());
+        const conversation = this.findConversationEntity(conversationId);
+        if (conversation === undefined) throw new Error(`Fresh-root Conversation projection is missing: ${conversationId}`);
+        const now = Date.now();
+        const origin = this.world.spawn();
+        this.world.add(origin, ConversationOriginLink, {
+          id: nextAuxiliaryId('col'),
+          conversation,
+          originKind: 'user',
+          sourceKind: 'user',
+          createdAt: now,
+          updatedAt: now
+        });
+        requestSpawnAgent(this.world, createDefaultAgentSpawnRequest(conversationId));
+        this.renderLoadedConversationDetails.add(conversationId);
+        this.runHistoryLoadedConversationDetails.add(conversationId);
+        this.conversationTailLoaded.add(conversationId);
+      }
+
+      await this.primaryEffectDispatcher?.reconcileStartup();
+      this.attachBackgroundProcessProjection();
+      this.authoritativeStorageReady = true;
     } catch (error) {
       startupStorageHealthy = false;
-      console.warn('[LimCode] Failed to initialize stored chat state. Starting with a fresh in-memory conversation; skeleton persistence remains disabled to protect existing data.', error);
-      requestSpawnAgent(this.world, createDefaultAgentSpawnRequest());
+      this.authoritativeStorageReady = false;
+      this.reliabilityUnavailableError = error instanceof Error ? error : new Error(String(error));
+      const dispatcher = this.primaryEffectDispatcher;
+      const backgroundDelivery = this.backgroundProcessDeliveryDispatcher;
+      const backend = this.reliabilityBackend;
+      this.conversationCommands = undefined;
+      this.primaryEffectDispatcher = undefined;
+      this.backgroundProcessDeliveryDispatcher = undefined;
+      this.reliabilityAdapter = undefined;
+      this.reliabilityInspector = undefined;
+      this.reliabilityBackend = undefined;
+      await backgroundDelivery?.dispose().catch((disposeError) => console.error('[LimCode] Failed to stop background-process delivery after startup rejection.', disposeError));
+      await dispatcher?.dispose().catch((disposeError) => console.error('[LimCode] Failed to stop reliability dispatcher after startup rejection.', disposeError));
+      await backend?.dispose().catch((disposeError) => console.error('[LimCode] Failed to release reliability storage after startup rejection.', disposeError));
+      await this.persistence.suspend();
+      console.error('[LimCode] Stored state was rejected; no fallback Conversation or writer was started.', error);
+      this.notifyStorageStartupFailure(this.reliabilityUnavailableError);
     } finally {
       this.hydrated = true;
+      if (this.authoritativeStorageReady) {
+        this.primaryEffectDispatcher?.start();
+        this.backgroundProcessDeliveryDispatcher?.start();
+      }
       this.deferredSkeletonComplete = false;
       // 工作环境、存档点等策略属于 deferred skeleton。先启动 deferred hydration，再放行配置类消息，
       // 避免设置页刚打开时的修改被尚未加载的旧 skeleton 覆盖或因 scope 依赖未就绪而丢弃。
       this.deferredSkeletonReady = this.startDeferredClientStateSkeletonLoad(startupStorageHealthy);
       this.flushPendingSnapshots();
       this.flushPendingHydrationMessages();
-      for (const section of GLOBAL_SETTINGS_SECTIONS) {
-        void this.globalSettingsBridge.postSnapshot(undefined, section);
+      if (this.authoritativeStorageReady) {
+        for (const section of GLOBAL_SETTINGS_SECTIONS) {
+          void this.globalSettingsBridge.postSnapshot(undefined, section);
+        }
+        this.startCheckpointShadowAutoCleanup();
+        void this.refreshMcpRuntime(true);
+        void this.syncSkillCatalogResource();
+        void this.syncRulesCatalogResource();
       }
-      this.startCheckpointShadowAutoCleanup();
-      void this.refreshMcpRuntime(true);
-      void this.syncSkillCatalogResource();
-      void this.syncRulesCatalogResource();
       this.resolveHydrated();
     }
+  }
+
+  private attachBackgroundProcessProjection(): void {
+    if (this.backgroundProcessProjectionAttached) return;
+    const initialSnapshot = this.env.backgroundProcesses.snapshot();
+    this.world.setResource(BackgroundProcessSnapshotKey, initialSnapshot);
+    const unsubscribe = this.env.backgroundProcesses.onSnapshotChanged((snapshot) => {
+      if (this.disposing) return;
+      void this.scheduler.runAtSafePoint(() => {
+        if (this.disposing) return;
+        this.world.setResource(BackgroundProcessSnapshotKey, snapshot);
+        this.world.enqueue({ type: ClientSyncEventType.Resync, payload: {} });
+      });
+    });
+    this.disposables.push({ dispose: unsubscribe });
+    this.backgroundProcessProjectionAttached = true;
+  }
+
+  private async initializeReliabilityInfrastructure(): Promise<void> {
+    if (this.reliabilityBackend) return;
+    const files = new DurableFileSystem(this.env.storage.paths.globalStoragePath);
+    const owner = new DataRootOwnerManager(files);
+    const adapter = new RuntimeAuthorityAdapter({
+      files,
+      projectionFactory: (facts, plan, baseStorageHeads) => isTransientCheckpointTransition(plan)
+        ? new CommittedHeadOnlyWorldProjection(plan.transitionId, this.world, this.scheduler, plan, baseStorageHeads)
+        : facts.length === 1
+          ? new CommittedConversationWorldProjection(plan.transitionId, this.world, this.scheduler, facts[0], plan, baseStorageHeads)
+          : new CommittedMultiConversationWorldProjection(plan.transitionId, this.world, this.scheduler, facts, plan, baseStorageHeads),
+      afterCommit: (plan) => {
+        for (const hint of plan.cleanupHints) this.primaryEffectDispatcher?.handleCleanupHint(hint);
+      }
+    });
+    const diagnostics = new ReliabilityDiagnosticJournal(
+      256,
+      (event) => console.info('[LimCode][Reliability]', event)
+    );
+    const backend = new FileConversationTransactionBackend({
+      files,
+      owner,
+      adapter,
+      diagnostics
+    });
+    await backend.initialize();
+
+    this.reliabilityAdapter = adapter;
+    this.reliabilityBackend = backend;
+    this.reliabilityInspector = new ReliabilityInspector({ backend, world: this.world, diagnostics });
+    const gateway = new ConversationCommandGateway({
+      backend,
+      adapter,
+      storage: this.env.storage,
+      webview: this.env.webview,
+      resolveAgentId: (conversationId, requestedAgentId) => this.resolveCommandAgentId(conversationId, requestedAgentId),
+      resolveTurnAuthority: (conversationId, agentId, executionPolicy) => compileEffectiveTurnAuthority(
+        projectClientState(this.world, this.world.getResource(ClientStateContributorsKey).list()),
+        { conversationId, agentId, executionPolicy }
+      ),
+      resolveToolConversationId: (toolCallId) => this.resolveToolConversationId(toolCallId),
+      installCommittedHead: (head) => this.scheduler.runAtSafePoint(() => {
+        this.world.setResource(CommittedConversationHeadsKey, {
+          ...this.world.getResource(CommittedConversationHeadsKey),
+          [head.conversationId]: head
+        });
+      }),
+      rehydrateCommittedConversation: async (conversationId) => {
+        const view = await backend.readCommittedView(committedReadView('application.rehydrate', conversationId));
+        await this.scheduler.runAtSafePoint(() => rehydrateCommittedFacts(this.world, view.facts));
+      },
+      onCommitted: (conversationIds) => this.afterReliableCommit(conversationIds)
+    });
+    this.conversationCommands = gateway;
+    this.primaryEffectDispatcher = new PrimaryEffectDispatcher({
+      backend,
+      adapter,
+      files,
+      world: this.world,
+      scheduler: this.scheduler,
+      env: this.env,
+      conversationIds: () => gateway.managedConversationIds(),
+      ensureConversationLoaded: (conversationId) => this.ensureConversationDetailLoaded(conversationId),
+      prepareConversationOwnership: (conversationId) => gateway.prepareInternalConversation(conversationId),
+      adoptCommittedConversation: (conversationId) => gateway.adoptCommittedInternalConversation(conversationId),
+      cleanupCheckpointGarbage: () => this.startCheckpointShadowAutoCleanup(),
+      onCommitted: (conversationIds) => this.afterReliableCommit(conversationIds),
+      onIntegrityError: (conversationId, error) => console.error(`[LimCode][Reliability] Conversation ${conversationId} runtime blocked.`, error)
+    });
+    this.backgroundProcessDeliveryDispatcher = new BackgroundProcessDeliveryDispatcher({
+      processes: this.env.backgroundProcesses,
+      target: this.primaryEffectDispatcher,
+      onError: (error) => console.error('[LimCode][BackgroundProcessDelivery]', error)
+    });
+    this.reliabilityUnavailableError = undefined;
+  }
+
+  private afterReliableCommit(conversationIds: readonly ConversationId[]): void {
+    this.primaryEffectDispatcher?.wake(conversationIds);
+    for (const conversationId of conversationIds) this.pendingConversationHistoryRefreshes.add(conversationId);
+    if (this.conversationHistoryRefreshTimer || this.disposing) return;
+    this.conversationHistoryRefreshTimer = setTimeout(() => {
+      this.conversationHistoryRefreshTimer = undefined;
+      this.flushConversationHistoryRefreshes();
+    }, 100);
+  }
+
+  private flushConversationHistoryRefreshes(): void {
+    const pending = [...this.pendingConversationHistoryRefreshes];
+    this.pendingConversationHistoryRefreshes.clear();
+    if (pending.length === 0) return;
+    this.conversationHistoryRefreshTail = this.conversationHistoryRefreshTail
+      .then(async () => {
+        for (const conversationId of pending) await this.refreshConversationHistoryReadModel(conversationId);
+      })
+      .catch((error) => console.warn('[LimCode][Reliability] Failed to refresh conversation history read models.', error));
+  }
+
+  private resolveToolConversationId(toolCallId: string): string | undefined {
+    const toolCall = this.world.entityByRecordId(ToolCall, toolCallId);
+    if (toolCall === undefined) return undefined;
+    const runLinks = this.world.query(ToolCallRunLink)
+      .map((entity) => this.world.get(entity, ToolCallRunLink))
+      .filter((link): link is NonNullable<typeof link> => !!link && link.toolCall === toolCall);
+    if (runLinks.length !== 1) {
+      if (runLinks.length > 1) throw new Error(`ToolCall ${toolCallId} has ambiguous Run ownership.`);
+      return undefined;
+    }
+    const targets = this.world.query(AgentRunTargetLink)
+      .map((entity) => this.world.get(entity, AgentRunTargetLink))
+      .filter((link): link is NonNullable<typeof link> => !!link && link.run === runLinks[0].run && link.role === 'executor');
+    if (targets.length !== 1) {
+      if (targets.length > 1) throw new Error(`Run target ownership is ambiguous for ToolCall ${toolCallId}.`);
+      return undefined;
+    }
+    return this.world.get(targets[0].conversation, Conversation)?.id;
+  }
+
+  private resolveCommandAgentId(conversationId: string, requestedAgentId?: string): string | undefined {
+    const requested = requestedAgentId?.trim();
+    if (requested) return this.findAgentEntity(requested) !== undefined ? requested : undefined;
+    const conversation = this.findConversationEntity(conversationId);
+    if (conversation === undefined) return undefined;
+    const selected = this.activeSelectionForConversation(conversation)?.agent;
+    const agent = selected ?? this.findDefaultAgent();
+    return agent !== undefined ? this.world.get(agent, Agent)?.id : undefined;
+  }
+
+  private postReliabilityUnavailable(clientId: BridgeClientId, message: WebviewToExtensionMessage): void {
+    const commandId = reliableCommandId(message);
+    if (commandId) {
+      this.env.webview.post(clientId, {
+        id: createMessageId(),
+        type: BridgeMessageType.CommandResult,
+        channel: 'command',
+        correlationId: message.id,
+        payload: {
+          error: {
+            commandId: commandId as import('../../shared/stableIds').CommandId,
+            status: 'unavailable',
+            code: reliabilityUnavailableCode(this.reliabilityUnavailableError),
+            message: this.reliabilityUnavailableError?.message ?? '可靠存储后端不可用。'
+          }
+        }
+      });
+      return;
+    }
+    this.env.webview.post(clientId, {
+      id: createMessageId(),
+      type: BridgeMessageType.Error,
+      channel: 'diagnostics',
+      correlationId: message.id,
+      payload: { requestType: message.type, message: this.reliabilityUnavailableError?.message ?? '可靠存储后端不可用。' }
+    });
+  }
+
+  private notifyStorageStartupFailure(error: Error): void {
+    if (this.storageStartupNoticeShown) return;
+    this.storageStartupNoticeShown = true;
+    const migrationRequired = errorCodeOf(error) === 'migration_required';
+    const actions = migrationRequired ? ['归档并重置开发数据', '打开数据目录'] as const : ['打开数据目录'] as const;
+    void vscode.window.showErrorMessage(`${EXTENSION_BRAND}: ${error.message}`, ...actions).then((action) => {
+      if (action === '归档并重置开发数据') {
+        void vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.resetDevelopmentData);
+      } else if (action === '打开数据目录') {
+        void vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.revealGlobalStorage);
+      }
+    });
   }
 
   private async startDeferredClientStateSkeletonLoad(startupStorageHealthy: boolean): Promise<void> {
@@ -1180,6 +1539,7 @@ export class BackendApplication {
   }
 
   private startCheckpointShadowAutoCleanup(): void {
+    if (!CHECKPOINT_FEATURE_ENABLED) return;
     void (async () => {
       try {
         const loaded = await this.env.storage.loadGlobalSettings('checkpointMaintenance');
@@ -1213,6 +1573,69 @@ export class BackendApplication {
     this.world.enqueue({ type: ClientSyncEventType.Resync, payload: conversationId ? { conversationId } : {} });
   }
 
+  private async prepareDataRootChange(): Promise<void> {
+    if (this.dataRootChangeInProgress) throw new Error('Data-root change is already in progress.');
+    this.dataRootChangeInProgress = true;
+    this.authoritativeStorageReady = false;
+    this.reliabilityUnavailableError = new Error('数据根正在切换，可靠命令入口已关闭。');
+
+    const dispatcher = this.primaryEffectDispatcher;
+    const backgroundDelivery = this.backgroundProcessDeliveryDispatcher;
+    const backend = this.reliabilityBackend;
+    this.conversationCommands = undefined;
+    this.primaryEffectDispatcher = undefined;
+    this.backgroundProcessDeliveryDispatcher = undefined;
+    await backgroundDelivery?.dispose();
+    await dispatcher?.dispose();
+    this.env.command.quiesce();
+
+    await backend?.quiesce();
+    await this.persistence.persistImmediately({ force: true, throwOnError: true });
+    await this.persistence.suspend();
+    await backend?.dispose();
+    this.reliabilityBackend = undefined;
+    this.reliabilityAdapter = undefined;
+    this.reliabilityInspector = undefined;
+  }
+
+  private async commitDataRootChange(): Promise<void> {
+    await vscode.commands.executeCommand('workbench.action.reloadWindow');
+  }
+
+  private async recoverDataRootChange(): Promise<void> {
+    const staleBackend = this.reliabilityBackend;
+    await this.backgroundProcessDeliveryDispatcher?.dispose();
+    await this.primaryEffectDispatcher?.dispose();
+    this.backgroundProcessDeliveryDispatcher = undefined;
+    this.primaryEffectDispatcher = undefined;
+    this.conversationCommands = undefined;
+    this.reliabilityBackend = undefined;
+    this.reliabilityAdapter = undefined;
+    this.reliabilityInspector = undefined;
+    try { await staleBackend?.dispose(); }
+    finally { this.persistence.enable(); }
+
+    await this.initializeReliabilityInfrastructure();
+    const conversationIds = this.world.query(Conversation)
+      .map((entity) => this.world.get(entity, Conversation)?.id)
+      .filter((id): id is string => !!id);
+    const adapter = this.reliabilityAdapter as RuntimeAuthorityAdapter | undefined;
+    const runtimeConversationIds = await adapter?.listRuntimeConversationIds() ?? [];
+    const projected = new Set(conversationIds);
+    const commands = this.conversationCommands as ConversationCommandGateway | undefined;
+    const dispatcher = this.primaryEffectDispatcher as PrimaryEffectDispatcher | undefined;
+    const backgroundDelivery = this.backgroundProcessDeliveryDispatcher as BackgroundProcessDeliveryDispatcher | undefined;
+    await commands?.adoptExistingRuntimeConversations(
+      [...new Set([...conversationIds, ...runtimeConversationIds])],
+      { rehydrateConversationIds: runtimeConversationIds.filter((conversationId) => !projected.has(conversationId)) }
+    );
+    await dispatcher?.reconcileStartup();
+    this.authoritativeStorageReady = true;
+    dispatcher?.start();
+    backgroundDelivery?.start();
+    this.dataRootChangeInProgress = false;
+  }
+
   private async beforeGlobalSettingsUpdate(payload: { section: string; settings?: unknown }): Promise<void> {
     if (payload.section === 'llm') {
       await this.freezeLoadedConversationsToCurrentGlobalLlmDefault();
@@ -1224,24 +1647,6 @@ export class BackendApplication {
   }
 
   private async copyConversationSettings(sourceConversationId: string, targetConversationId: string): Promise<void> {
-    try {
-      const common = await this.env.storage.loadConversationSettings(sourceConversationId, 'common');
-      const settings = common?.settings as ConversationSettingsRecord | undefined;
-      if (settings) {
-        await this.env.storage.saveConversationSettings('common', {
-          conversationId: targetConversationId,
-          name: settings.name
-        });
-        const target = this.findConversationEntity(targetConversationId);
-        const conversation = target !== undefined ? this.world.get(target, Conversation) : undefined;
-        if (target !== undefined && conversation) {
-          this.world.add(target, Conversation, { ...conversation, title: settings.name });
-        }
-      }
-    } catch (error) {
-      console.warn(`[LimCode] Failed to copy common settings to fork "${targetConversationId}".`, error);
-    }
-
     try {
       const llm = await this.env.storage.loadConversationSettings(sourceConversationId, 'llm');
       const settings = llm?.settings as ConversationLlmSettingsRecord | undefined;
@@ -1478,12 +1883,11 @@ export class BackendApplication {
 
 
   private findDefaultAgent(): Entity | undefined {
-    return this.world.query(Agent).find((entity) => this.world.get(entity, Agent)?.id === DEFAULT_AGENT_ID)
-      ?? this.world.query(Agent)[0];
+    return this.world.entityByRecordId(Agent, DEFAULT_AGENT_ID) ?? this.world.query(Agent)[0];
   }
 
   private findAgentEntity(agentId: string): Entity | undefined {
-    return this.world.query(Agent).find((entity) => this.world.get(entity, Agent)?.id === agentId);
+    return this.world.entityByRecordId(Agent, agentId);
   }
 
   private activeSelectionForConversation(conversation: Entity): { entity: Entity; agent: Entity } | undefined {
@@ -1516,7 +1920,7 @@ export class BackendApplication {
   }
 
   private findConversationEntity(conversationId: string): Entity | undefined {
-    return this.world.query(Conversation).find((entity) => this.world.get(entity, Conversation)?.id === conversationId);
+    return this.world.entityByRecordId(Conversation, conversationId);
   }
 
   private upsertConversationModelProfile(
@@ -1564,229 +1968,10 @@ export class BackendApplication {
       .sort((left, right) => (right.link.updatedAt || right.link.createdAt) - (left.link.updatedAt || left.link.createdAt) || right.entity - left.entity)[0];
   }
 
-  private collectConversationCascadeEntities(conversation: Entity, conversationId: string): Set<Entity> {
-    const entities = new Set<Entity>([conversation]);
-    const messages = this.collectMessagesForConversation(conversation);
-    const revisions = this.collectRevisionsForMessages(messages);
-    const toolCalls = this.collectToolCallsForMessages(messages);
-    const toolCallEvents = this.collectToolCallEventsForToolCalls(toolCalls);
-    const runPolicies = new Set<Entity>();
-    const runs = this.collectRunsForConversationCascade(conversation, conversationId, messages, revisions, toolCalls, runPolicies, entities);
-
-    addAll(entities, messages);
-    addAll(entities, revisions);
-    addAll(entities, toolCalls);
-    addAll(entities, toolCallEvents);
-
-    for (const entity of this.world.query(MessageCurrentRevisionLink)) {
-      const link = this.world.get(entity, MessageCurrentRevisionLink);
-      if (!link) continue;
-      if (messages.has(link.message) || revisions.has(link.revision)) {
-        entities.add(entity);
-        revisions.add(link.revision);
-        entities.add(link.revision);
-      }
-    }
-
-    for (const entity of this.world.query(AgentConversationLink)) {
-      const link = this.world.get(entity, AgentConversationLink);
-      if (link?.conversation === conversation) entities.add(entity);
-    }
-
-    for (const entity of this.world.query(ConversationAgentSelection)) {
-      const selection = this.world.get(entity, ConversationAgentSelection);
-      if (selection?.conversation === conversation) entities.add(entity);
-    }
-
-    for (const entity of this.world.query(ConversationWorkflowSelection)) {
-      const selection = this.world.get(entity, ConversationWorkflowSelection);
-      if (selection?.conversation === conversation) entities.add(entity);
-    }
-
-    for (const entity of this.world.query(ConversationProjectLink)) {
-      const link = this.world.get(entity, ConversationProjectLink);
-      if (link?.conversation === conversation) entities.add(entity);
-    }
-
-    for (const entity of this.world.query(ConversationOriginLink)) {
-      const link = this.world.get(entity, ConversationOriginLink);
-      if (link?.conversation === conversation) entities.add(entity);
-    }
-
-    for (const entity of this.world.query(ConversationReuseLink)) {
-      const link = this.world.get(entity, ConversationReuseLink);
-      if (link?.conversation === conversation) entities.add(entity);
-    }
-
-    for (const entity of this.world.query(ConversationBranchLink)) {
-      const link = this.world.get(entity, ConversationBranchLink);
-      if (!link) continue;
-      if (link.sourceConversation === conversation || link.targetConversation === conversation || (link.sourceRevision !== undefined && revisions.has(link.sourceRevision))) {
-        entities.add(entity);
-      }
-    }
-
-    this.collectRunOwnedEntities(runs, runPolicies, entities);
-    return entities;
-  }
-
-  private collectMessagesForConversation(conversation: Entity): Set<Entity> {
-    const messages = new Set<Entity>();
-    for (const entity of this.world.query(Message, PartOf)) {
-      if (this.world.get(entity, PartOf)?.parent === conversation) messages.add(entity);
-    }
-    return messages;
-  }
-
-  private collectRevisionsForMessages(messages: ReadonlySet<Entity>): Set<Entity> {
-    const revisions = new Set<Entity>();
-    for (const entity of this.world.query(MessageRevision, PartOf)) {
-      if (messages.has(this.world.get(entity, PartOf)?.parent ?? -1)) revisions.add(entity);
-    }
-    return revisions;
-  }
-
-  private collectToolCallsForMessages(messages: ReadonlySet<Entity>): Set<Entity> {
-    const toolCalls = new Set<Entity>();
-    for (const entity of this.world.query(ToolCall, PartOf)) {
-      if (messages.has(this.world.get(entity, PartOf)?.parent ?? -1)) toolCalls.add(entity);
-    }
-    return toolCalls;
-  }
-
-  private collectToolCallEventsForToolCalls(toolCalls: ReadonlySet<Entity>): Set<Entity> {
-    const events = new Set<Entity>();
-    for (const entity of this.world.query(ToolCallEvent, PartOf)) {
-      if (toolCalls.has(this.world.get(entity, PartOf)?.parent ?? -1)) events.add(entity);
-    }
-    return events;
-  }
-
-  private collectRunsForConversationCascade(
-    conversation: Entity,
-    conversationId: string,
-    messages: ReadonlySet<Entity>,
-    revisions: ReadonlySet<Entity>,
-    toolCalls: ReadonlySet<Entity>,
-    runPolicies: Set<Entity>,
-    entities: Set<Entity>
-  ): Set<Entity> {
-    const runs = new Set<Entity>();
-    let changed = true;
-    while (changed) {
-      changed = false;
-      const addRun = (run: Entity | undefined): void => {
-        if (run === undefined || runs.has(run)) return;
-        runs.add(run);
-        changed = true;
-      };
-      const addRunPolicy = (policy: Entity | undefined): void => {
-        if (policy === undefined || runPolicies.has(policy)) return;
-        runPolicies.add(policy);
-        entities.add(policy);
-        changed = true;
-      };
-
-      for (const entity of this.world.query(LlmRequest)) {
-        const request = this.world.get(entity, LlmRequest);
-        if (!request) continue;
-        if (request.conversation === conversation || messages.has(request.modelMessage) || runs.has(request.run)) {
-          entities.add(entity);
-          addRun(request.run);
-        }
-      }
-
-      for (const entity of this.world.query(AgentRunSourceLink)) {
-        const link = this.world.get(entity, AgentRunSourceLink);
-        if (!link) continue;
-        const matches = link.sourceConversation === conversation
-          || (link.sourceMessage !== undefined && messages.has(link.sourceMessage))
-          || (link.sourceToolCall !== undefined && toolCalls.has(link.sourceToolCall))
-          || (link.sourceRun !== undefined && runs.has(link.sourceRun))
-          || runs.has(link.run);
-        if (matches) {
-          entities.add(entity);
-          addRun(link.run);
-        }
-      }
-
-      for (const entity of this.world.query(AgentRunTargetLink)) {
-        const link = this.world.get(entity, AgentRunTargetLink);
-        if (!link) continue;
-        if (link.conversation === conversation || runs.has(link.run)) {
-          entities.add(entity);
-          addRun(link.run);
-        }
-      }
-
-      for (const entity of this.world.query(MessageRunLink)) {
-        const link = this.world.get(entity, MessageRunLink);
-        if (!link) continue;
-        if (messages.has(link.message) || runs.has(link.run)) {
-          entities.add(entity);
-          addRun(link.run);
-        }
-      }
-
-      for (const entity of this.world.query(ToolCallRunLink)) {
-        const link = this.world.get(entity, ToolCallRunLink);
-        if (!link) continue;
-        if (toolCalls.has(link.toolCall) || runs.has(link.run)) {
-          entities.add(entity);
-          addRun(link.run);
-        }
-      }
-
-      for (const entity of this.world.query(AgentRunInputRevision)) {
-        const input = this.world.get(entity, AgentRunInputRevision);
-        if (!input) continue;
-        if (input.conversation === conversation || revisions.has(input.revision) || runs.has(input.run)) {
-          entities.add(entity);
-          addRun(input.run);
-        }
-      }
-
-      for (const entity of this.world.query(RunConversationPolicy)) {
-        const policy = this.world.get(entity, RunConversationPolicy);
-        if (!policy) continue;
-        if (policy.conversationId === conversationId || policy.branchFromConversationId === conversationId) addRunPolicy(entity);
-      }
-
-      for (const entity of this.world.query(RunDeliveryPolicy)) {
-        const policy = this.world.get(entity, RunDeliveryPolicy);
-        if (!policy) continue;
-        if (policy.targetConversation === conversation || (policy.targetToolCall !== undefined && toolCalls.has(policy.targetToolCall))) addRunPolicy(entity);
-      }
-
-      for (const entity of this.world.query(RunConversationPolicyLink)) this.collectRunPolicyLink(entity, RunConversationPolicyLink, runs, runPolicies, entities, addRun, addRunPolicy);
-      for (const entity of this.world.query(RunContextPolicyLink)) this.collectRunPolicyLink(entity, RunContextPolicyLink, runs, runPolicies, entities, addRun, addRunPolicy);
-      for (const entity of this.world.query(RunDeliveryPolicyLink)) this.collectRunPolicyLink(entity, RunDeliveryPolicyLink, runs, runPolicies, entities, addRun, addRunPolicy);
-      for (const entity of this.world.query(RunEditPolicyLink)) this.collectRunPolicyLink(entity, RunEditPolicyLink, runs, runPolicies, entities, addRun, addRunPolicy);
-    }
-    return runs;
-  }
-
-  private collectRunPolicyLink<T extends { run: Entity; policy: Entity }>(
-    entity: Entity,
-    component: ComponentType<T>,
-    runs: ReadonlySet<Entity>,
-    runPolicies: ReadonlySet<Entity>,
-    entities: Set<Entity>,
-    addRun: (run: Entity | undefined) => void,
-    addRunPolicy: (policy: Entity | undefined) => void
-  ): void {
-    const link = this.world.get(entity, component);
-    if (!link) return;
-    if (runs.has(link.run) || runPolicies.has(link.policy)) {
-      entities.add(entity);
-      addRun(link.run);
-      addRunPolicy(link.policy);
-    }
-  }
-
   private collectConversationOriginsByConversation(): Map<Entity, ConversationOriginLinkRecord> {
     const result = new Map<Entity, ConversationOriginLinkRecord>();
     for (const entity of this.world.query(ConversationOriginLink)) {
+
       const link = this.world.get(entity, ConversationOriginLink);
       if (!link) continue;
       const conversation = this.world.get(link.conversation, Conversation);
@@ -1816,22 +2001,6 @@ export class BackendApplication {
     return result;
   }
 
-  private collectRunOwnedEntities(runs: ReadonlySet<Entity>, runPolicies: ReadonlySet<Entity>, entities: Set<Entity>): void {
-    addAll(entities, runs);
-    addAll(entities, runPolicies);
-
-    for (const entity of this.world.query(AgentRun)) if (runs.has(entity)) entities.add(entity);
-    for (const entity of this.world.query(RunConversationPolicy)) if (runPolicies.has(entity)) entities.add(entity);
-    for (const entity of this.world.query(RunContextPolicy)) if (runPolicies.has(entity)) entities.add(entity);
-    for (const entity of this.world.query(RunDeliveryPolicy)) if (runPolicies.has(entity)) entities.add(entity);
-    for (const entity of this.world.query(RunEditPolicy)) if (runPolicies.has(entity)) entities.add(entity);
-
-    for (const entity of this.world.query(RunWorkflowLink)) if (runs.has(this.world.get(entity, RunWorkflowLink)?.run ?? -1)) entities.add(entity);
-    for (const entity of this.world.query(RunSystemPromptLink)) if (runs.has(this.world.get(entity, RunSystemPromptLink)?.run ?? -1)) entities.add(entity);
-    for (const entity of this.world.query(RunModelProfileLink)) if (runs.has(this.world.get(entity, RunModelProfileLink)?.run ?? -1)) entities.add(entity);
-    for (const entity of this.world.query(RunToolPolicyLink)) if (runs.has(this.world.get(entity, RunToolPolicyLink)?.run ?? -1)) entities.add(entity);
-
-  }
 
   private collectProjectsByConversation(): Map<Entity, { uri: string; name: string }> {
     const result = new Map<Entity, { uri: string; name: string }>();
@@ -1851,7 +2020,7 @@ export class BackendApplication {
     for (const messageEntity of this.world.query(Message)) {
       const message = this.world.get(messageEntity, Message);
       const partOf = this.world.get(messageEntity, PartOf);
-      if (!message || !partOf) continue;
+      if (!message || !partOf || isInternalMessage(message)) continue;
       const list = result.get(partOf.parent) ?? [];
       list.push(message);
       result.set(partOf.parent, list);
@@ -1893,9 +2062,9 @@ export class BackendApplication {
 }
 
 function compareConversationHistoryEntries(left: SidebarConversationHistoryEntry, right: SidebarConversationHistoryEntry): number {
-  return (right.updatedAt ?? 0) - (left.updatedAt ?? 0)
-    || left.title.localeCompare(right.title, 'zh-CN')
-    || left.id.localeCompare(right.id, 'zh-CN');
+  return right.updatedAt - left.updatedAt
+    || right.createdAt - left.createdAt
+    || right.id.localeCompare(left.id, 'zh-CN');
 }
 
 function historyEntryMatchesScope(entry: SidebarConversationHistoryEntry, scope: ConversationHistoryScope): boolean {
@@ -1962,16 +2131,13 @@ function projectFolderNameFromUri(uri: string): string {
   }
 }
 
-function addAll<T>(target: Set<T>, source: Iterable<T>): void {
-  for (const item of source) target.add(item);
-}
 
 function truncateText(text: string, maxLength: number): string {
   return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 1))}…` : text;
 }
 
 function isActiveAgentRunStatus(status: AgentRunStatus): boolean {
-  return status !== 'completed' && status !== 'failed' && status !== 'cancelled' && status !== 'stale';
+  return status !== 'completed' && status !== 'failed' && status !== 'cancelled' && status !== 'stale' && status !== 'interrupted';
 }
 
 function labelForAgentRunStatus(status: AgentRunStatus): string {
@@ -2000,8 +2166,16 @@ function labelForAgentRunStatus(status: AgentRunStatus): string {
       return '已终止';
     case 'stale':
       return '已过期';
+    case 'interrupted':
+      return '已中断';
   }
 }
+function isTransientCheckpointTransition(plan: { patches: ReadonlyArray<{ operations: readonly unknown[] }> }): boolean {
+  return plan.patches.length > 0 && plan.patches.every((patch) => patch.operations.length > 0 && patch.operations.every((operation) => {
+    return !!operation && typeof operation === 'object' && !Array.isArray(operation) && (operation as { kind?: unknown }).kind === 'stream.checkpoint';
+  }));
+}
+
 function isPassFlushEffect(effect: WorldEffect): boolean {
   const kind = (effect as { kind?: string }).kind;
   return kind === 'client.patch'
@@ -2020,7 +2194,7 @@ function isPassFlushEffect(effect: WorldEffect): boolean {
 
 function mainPanelConversationId(meta: WebviewClientMeta): string | undefined {
   if (meta.kind !== 'mainPanel' && meta.kind !== 'planDetail') return undefined;
-  return meta.conversationId?.trim() || DEFAULT_CONVERSATION_ID;
+  return meta.conversationId?.trim() || undefined;
 }
 
 function modelProfileIdForConversation(conversationId: string): string { return `model-profile:conversation:${conversationId}`; }
@@ -2031,61 +2205,38 @@ function modelExistsInProviderConfig(config: { model?: string; models: Array<{ i
   return config.model?.trim() === id || config.models.some((candidate) => candidate.id.trim() === id);
 }
 
-function shouldDeferUntilHydrated(message: WebviewToExtensionMessage): boolean {
-  switch (message.type) {
-    case 'chat.abort':
-    case 'llm.retry.cancel':
-    case 'message.edit':
-    case 'message.deleteFrom':
-    case 'message.retryFrom':
-    case 'agent.create':
-    case 'agent.update':
-    case 'agent.delete':
-    case 'conversation.agent.select':
-    case 'systemPrompt.scope.set':
-    case 'systemPrompt.scope.clear':
-    case 'runtimeContext.scope.set':
-    case 'runtimeContext.scope.clear':
-    case 'runtimeContext.refresh':
-    case 'runtimeContext.snapshot.clear':
-    case 'modelProfile.scope.set':
-    case 'modelProfile.scope.clear':
-    case 'toolPolicy.scope.set':
-    case 'toolPolicy.scope.clear':
-    case 'skillPolicy.scope.set':
-    case 'skillPolicy.scope.clear':
-    case 'planReviewPolicy.scope.set':
-    case 'planReviewPolicy.scope.clear':
-    case 'checkpointPolicy.scope.set':
-    case 'checkpointPolicy.scope.clear':
-    case 'tool.execution.approve':
-    case 'tool.execution.reject':
-    case 'tool.change.apply':
-    case 'tool.change.reject':
-    case 'tool.result.submit':
-    case 'tool.result.reject':
-    case 'agentRun.cancel':
-    case 'agentRun.pause':
-    case 'agentRun.resume':
-    case 'agentRun.retry':
-    case 'agentRun.regenerate':
-    case 'agentRun.markStale':
-    case 'workflow.create':
-    case 'workflow.update':
-    case 'workflow.delete':
-    case 'conversation.workflow.select':
-    case 'conversation.project.set':
-    case 'workEnvironment.select':
-    case 'workEnvironment.upsert':
-    case 'workEnvironment.remove':
-    case 'workEnvironment.importFromVscode':
-    case 'workEnvironmentPolicy.scope.set':
-    case 'workEnvironmentPolicy.scope.clear':
-    case 'client.resync':
-      return true;
-    default:
-      return false;
-  }
+function isReliabilityBridgeMessageType(type: string): boolean {
+  return type === BridgeMessageType.TurnStart
+    || type === BridgeMessageType.TurnEnqueue
+    || type === BridgeMessageType.TurnSteer
+    || type === BridgeMessageType.TurnInterrupt
+    || type === BridgeMessageType.TurnIntentUpdate
+    || type === BridgeMessageType.TurnIntentCancel
+    || type === BridgeMessageType.TurnIntentReorder
+    || type === BridgeMessageType.TurnIntentPause
+    || type === BridgeMessageType.TurnIntentResume
+    || type === BridgeMessageType.TurnIntentResumeAll
+    || type === BridgeMessageType.TurnIntentPromote
+    || type === BridgeMessageType.InteractionResolve
+    || type === BridgeMessageType.MessageEdit
+    || type === BridgeMessageType.MessageDeleteFrom
+    || type === BridgeMessageType.MessageRetryFrom
+    || type === BridgeMessageType.CompressionCreate
+    || type === BridgeMessageType.CompressionDelete
+    || type === BridgeMessageType.CompressionUpdate
+    || type === BridgeMessageType.CompressionRegenerate
+    || type === BridgeMessageType.CompressionDisable
+    || type === BridgeMessageType.CompressionEnable
+    || type === BridgeMessageType.CommandOutcomeResolve
+    || type === BridgeMessageType.CommandStatusGet
+    || type === BridgeMessageType.ConversationHeadGet
+    || type === BridgeMessageType.ToolExecutionCancel;
+}
+
+function reliableCommandId(message: WebviewToExtensionMessage): string | undefined {
+  if (!isReliabilityBridgeMessageType(message.type) || !message.payload || typeof message.payload !== 'object') return undefined;
+  const command = (message.payload as { command?: { commandId?: unknown } }).command;
+  return typeof command?.commandId === 'string' ? command.commandId : undefined;
 }
 
 function shouldDeferUntilDeferredSkeleton(message: WebviewToExtensionMessage): boolean {
@@ -2124,6 +2275,25 @@ function shouldDeferUntilDeferredSkeleton(message: WebviewToExtensionMessage): b
     default:
       return false;
   }
+}
+
+function errorCodeOf(error: unknown): string {
+  return error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : '';
+}
+
+function codedError<TCode extends string>(code: TCode, message: string): Error & { code: TCode } {
+  return Object.assign(new Error(message), { code });
+}
+
+function reliabilityUnavailableCode(error: unknown): CommandServiceError['code'] {
+  const code = errorCodeOf(error);
+  if (code === 'migration_required') return 'migration_required';
+  if (code === 'scheduler_compile_failed' || code === 'runtime_unavailable') return 'runtime_unavailable';
+  if (code === 'integrity_violation' || (error instanceof Error && error.name === 'FileTransactionIntegrityError')) return 'integrity_violation';
+  if (code === 'recovery_required') return 'recovery_required';
+  return 'storage_unavailable';
 }
 
 function cloneClientState(state: ClientState): ClientState {

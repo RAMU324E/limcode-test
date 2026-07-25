@@ -31,5 +31,5 @@ export const CheckpointDismissSystem = defineSystem({
 });
 
 function findCheckpointById(world: WorldReader, id: string): Entity | undefined {
-  return world.query(Checkpoint).find((entity) => world.get(entity, Checkpoint)?.id === id);
+  return world.entityByRecordId(Checkpoint, id);
 }

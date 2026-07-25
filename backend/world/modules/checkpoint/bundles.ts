@@ -1,4 +1,4 @@
-import { defineBundle, type CommandSink, type Entity, type WorldReader } from '../../../ecs/types';
+import { defineBundle, type CommandSink, type ComponentType, type Entity, type WorldReader } from '../../../ecs/types';
 import { Agent } from '../agent/components';
 import { AgentRun } from '../agentRun/components';
 import { Conversation } from '../chat/components';
@@ -218,6 +218,6 @@ function scopeIdForLink(world: WorldReader, link: CheckpointPolicyScopeLinkData)
   }
 }
 
-function findByRecordId<T extends { id: string }>(world: WorldReader, component: { id: symbol }, id: string): Entity | undefined {
-  return world.query(component as never).find((entity) => (world.get(entity, component as never) as T | undefined)?.id === id);
+function findByRecordId<T extends { id: string }>(world: WorldReader, component: ComponentType<T>, id: string): Entity | undefined {
+  return world.entityByRecordId(component, id);
 }
