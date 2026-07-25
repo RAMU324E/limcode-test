@@ -32,11 +32,11 @@ import {
 } from './workEnvironmentProvider';
 import { buildFileDiffRecord, buildFileReplacementHunks } from './fileDiff';
 import { applyHunkEdit, applyInsertEdit, applyDeleteEdit } from './editStrategies';
+import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS, LIVE_DIFF_SCHEME } from '../../shared/extensionIdentity';
 
 const MAX_BYTES = 256 * 1024;
 const MAX_EDIT_READ_BYTES = 2 * 1024 * 1024;
-const LIVE_DIFF_SCHEME = 'limcode-live-diff';
-const LIVE_DIFF_APPLY_COMMAND = 'limcode.applyLiveDiffPreview';
+const LIVE_DIFF_APPLY_COMMAND = EXTENSION_COMMAND_IDS.applyLiveDiffPreview;
 const LIVE_DIFF_DOCUMENT_TTL_MS = 10 * 60 * 1000;
 
 interface RawTextReadResult {
@@ -436,7 +436,7 @@ async function applyLiveDiffPreviewFromActiveEditor(): Promise<void> {
 
   const document = liveDiffDocumentForApply(activeUri);
   if (!document?.proposal || !document.onSave) {
-    void vscode.window.showWarningMessage('LimCode 当前差异预览没有可应用的文件变更。');
+    void vscode.window.showWarningMessage(`${EXTENSION_BRAND} 当前差异预览没有可应用的文件变更。`);
     return;
   }
   if (document.saveHandled) return;
@@ -477,7 +477,7 @@ export async function closePendingWorkspaceFileChangeDiff(toolCallId?: string, c
   }
 
   if (shouldRevealConversation) {
-    await vscode.commands.executeCommand('limcode.openPanel', {
+    await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.openPanel, {
       ...(conversationId ? { conversationId, reuse: true } : {})
     });
   }

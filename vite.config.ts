@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
+import { WEBVIEW_DEV_PORT } from './shared/extensionIdentity';
 
 export default defineConfig({
   root: 'webview',
@@ -14,12 +15,12 @@ export default defineConfig({
   },
   server: {
     host: '127.0.0.1',
-    port: 31819,
+    port: WEBVIEW_DEV_PORT,
     strictPort: true,
     cors: true,
     hmr: {
       host: 'localhost',
-      clientPort: 31819
+      clientPort: WEBVIEW_DEV_PORT
     }
   },
   build: {

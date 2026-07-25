@@ -3,6 +3,7 @@ import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotoc
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServerConfigRecord, McpServersSettingsRecord, McpToolSourceRecord, InlineDataPart } from '../../shared/protocol';
+import { EXTENSION_PACKAGE_NAME, EXTENSION_VERSION } from '../../shared/extensionIdentity';
 import type { StorageCapability } from '../capabilities/types';
 import type { ToolDefinition, ToolResultOut } from '../world/modules/tools/registry';
 
@@ -104,7 +105,7 @@ export class McpRuntimeManager {
 async function connectServer(config: McpServerConfigRecord): Promise<McpConnection> {
   validateConnectableConfig(config);
   const client = new Client(
-    { name: 'LimCode', version: '0.0.1' },
+    { name: EXTENSION_PACKAGE_NAME, version: EXTENSION_VERSION },
     { capabilities: {} }
   );
   const transport = config.transport.kind === 'stdio'

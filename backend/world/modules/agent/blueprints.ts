@@ -1,5 +1,6 @@
 import { defineResource } from '../../../ecs/types';
 import type { LlmProviderKind, PlanReviewPolicyRecord, ToolPolicyToolConfigRecord, WorkflowIconKey } from '../../../../shared/protocol';
+import { EXTENSION_AGENT_NAME, EXTENSION_BRAND } from '../../../../shared/extensionIdentity';
 import {
   ASK_USER_TOOL_NAME,
   DELETE_TOOL_NAME,
@@ -57,7 +58,7 @@ export interface BuiltinAgentRegistry {
 
 export const AgentBlueprintsKey = defineResource<BuiltinAgentRegistry>('AgentBlueprints');
 
-export const DEFAULT_SYSTEM_PROMPT = 'You are LimCode, a concise and helpful AI coding assistant running inside VS Code. Reply in the user\'s language unless asked otherwise.';
+export const DEFAULT_SYSTEM_PROMPT = `You are ${EXTENSION_BRAND}, a concise and helpful AI coding assistant running inside VS Code. Reply in the user's language unless asked otherwise.`;
 
 export const DEFAULT_INTEGRATED_SYSTEM_PROMPT = [
   'You are {{$agent.name}}, a concise and helpful AI coding assistant running inside VS Code.',
@@ -76,7 +77,7 @@ export function createDefaultAgentBlueprints(): BuiltinAgentRegistry {
       main: {
         id: 'main',
         kind: 'main',
-        name: 'LimCode Agent',
+        name: EXTENSION_AGENT_NAME,
         description: 'General-purpose Agent for daily conversation and development collaboration.',
         systemPrompt: DEFAULT_SYSTEM_PROMPT,
         toolPolicy: { name: 'Main Agent Tools', allowedTools: DEFAULT_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS }
@@ -86,7 +87,7 @@ export function createDefaultAgentBlueprints(): BuiltinAgentRegistry {
         kind: 'worker',
         name: 'Worker Agent',
         description: 'General-purpose worker Agent capable of multi-step tool operations.',
-        systemPrompt: 'You are a peer LimCode worker agent. Complete assigned implementation or investigation tasks independently, use tools when useful, and report concise results with important details.',
+        systemPrompt: `You are a peer ${EXTENSION_BRAND} worker agent. Complete assigned implementation or investigation tasks independently, use tools when useful, and report concise results with important details.`,
         toolPolicy: { name: 'Worker Agent Tools', allowedTools: DEFAULT_TOOLS, toolConfigs: DEFAULT_TOOL_CONFIGS }
       },
       explore: {

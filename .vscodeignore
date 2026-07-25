@@ -7,6 +7,8 @@ backend/**
 shared/**
 vscode/**
 webview/**
+tests/**
+
 src/**
 src copy/**
 scripts/**

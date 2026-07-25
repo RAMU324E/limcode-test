@@ -9,8 +9,9 @@
 import * as http from 'http';
 import * as tls from 'tls';
 import { URL } from 'url';
+import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
 
-const USER_AGENT = 'LimCode';
+const USER_AGENT = EXTENSION_PACKAGE_NAME;
 
 /**
  * 创建一个支持代理的 fetch 函数。

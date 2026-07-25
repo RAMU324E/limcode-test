@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as vscode from 'vscode';
+import { EXTENSION_BRAND } from '../../shared/extensionIdentity';
 
 const WEBVIEW_DEV_SERVER_ENV = 'VSCODE_WEBVIEW_DEV_SERVER';
 
@@ -13,7 +14,7 @@ export interface WebviewHtmlOptions {
 export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri, options: WebviewHtmlOptions = {}): string {
   const htmlFileName = options.htmlFileName ?? 'index.html';
   const devEntry = options.devEntry ?? '/src/main.ts';
-  const title = options.title ?? 'LimCode';
+  const title = options.title ?? EXTENSION_BRAND;
   const rootId = options.rootId ?? 'app';
   const webviewDistUri = vscode.Uri.joinPath(extensionUri, 'dist', 'webview');
   const indexUri = vscode.Uri.joinPath(webviewDistUri, htmlFileName);
@@ -151,7 +152,7 @@ function getMissingBuildHtml(csp: string): string {
   <meta charset="UTF-8">
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LimCode</title>
+  <title>${escapeHtml(EXTENSION_BRAND)}</title>
   <style>
     body { font-family: var(--vscode-font-family); padding: 24px; color: var(--vscode-foreground); }
     code { background: var(--vscode-textCodeBlock-background); padding: 2px 6px; border-radius: 4px; }
@@ -201,7 +202,7 @@ function getLoadingCopy(options: LoadingTransitionOptions): LoadingCopy {
 
   if (options.title.includes('设置')) {
     return {
-      title: '正在打开 LimCode 设置',
+      title: `正在打开 ${EXTENSION_BRAND} 设置`,
       description: '正在读取模型、工具和数据目录配置。'
     };
   }
@@ -222,7 +223,7 @@ function createLoadingTransitionMarkup(copy: LoadingCopy): string {
           <span></span>
         </div>
         <div class="limcode-loading-copy">
-          <div class="limcode-loading-eyebrow">LimCode</div>
+          <div class="limcode-loading-eyebrow">${escapeHtml(EXTENSION_BRAND)}</div>
           <h1>${escapeHtml(copy.title)}</h1>
           <p>${escapeHtml(copy.description)}</p>
           <div class="limcode-loading-progress" aria-hidden="true"><span></span></div>
