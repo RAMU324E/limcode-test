@@ -25,9 +25,9 @@ interface SchedulerHooks {
   /** System 通过 cmd.effect 产出的 effect 会在 wave commit 时交给 Imperative Shell 收集。 */
   applyEffect?(effect: unknown): void;
   /** 每轮 schedule pass 后调用。适合 flush client patch 等实时、只读外部副作用。 */
-  afterPass?(): void;
+  afterPass?(): void | Promise<void>;
   /** 每次 tick 达到不动点后调用。用于 Imperative Shell 执行稳定阶段 effects。 */
-  afterTick?(): void;
+  afterTick?(): void | Promise<void>;
 }
 
 export interface SchedulerOptions {
@@ -56,6 +56,8 @@ interface AccessSummary {
   readonly conflictReads: Set<TokenKey>;
   /** 参与拓扑/冲突判断的写入。 */
   readonly writes: Set<TokenKey>;
+  /** token 的稳定可读名称，用于输出可操作的拓扑诊断。 */
+  readonly tokenLabels: Map<TokenKey, string>;
   readonly mutationModes: WriteModeMap;
   readonly snapshotComponents: Set<ComponentType<unknown>>;
   readonly snapshotResources: Set<ResourceKey<unknown>>;
@@ -75,6 +77,36 @@ interface CompiledSchedule {
   readonly waves: readonly SystemNode[][];
 }
 
+export type SchedulerHealth = 'initializing' | 'ready' | 'failed' | 'disposed';
+
+export interface SchedulerHealthSnapshot {
+  readonly status: SchedulerHealth;
+  readonly error?: Error;
+}
+
+export class SchedulerCompileError extends Error {
+  public readonly code = 'scheduler_compile_failed';
+  public readonly originalCause: unknown;
+
+  public constructor(message: string, options: { cause?: unknown } = {}) {
+    super(message);
+    this.name = 'SchedulerCompileError';
+    this.originalCause = options.cause;
+  }
+}
+
+export class SchedulerDependencyCycleError extends SchedulerCompileError {
+  public readonly cycleSystems: readonly string[];
+  public readonly dependencyEdges: readonly string[];
+
+  public constructor(cycleSystems: readonly string[], dependencyEdges: readonly string[]) {
+    super(`[ECS] system dependency cycle detected: ${cycleSystems.join(' -> ')}. Edges: ${dependencyEdges.join('; ')}`);
+    this.name = 'SchedulerDependencyCycleError';
+    this.cycleSystems = cycleSystems;
+    this.dependencyEdges = dependencyEdges;
+  }
+}
+
 /**
  * 事件驱动调度器。
  * - 入队事件 → wake() → microtask 中 tick()。
@@ -88,7 +120,15 @@ export class Scheduler {
   private running = false;
   private scheduled = false;
   private stopped = false;
+  private health: SchedulerHealth = 'initializing';
+  private failure: Error | undefined;
   private nextOrder = 0;
+  private readonly idleWaiters: Array<{ resolve(): void; reject(error: unknown): void }> = [];
+  private readonly safePointRequests: Array<{
+    action: () => unknown | Promise<unknown>;
+    resolve(value: unknown): void;
+    reject(error: unknown): void;
+  }> = [];
   private readonly workerPool?: SystemWorkerPool;
 
   public constructor(
@@ -103,10 +143,13 @@ export class Scheduler {
   }
 
   public add(system: System): this {
+    if (this.stopped) throw new Error('Cannot register a system after Scheduler disposal.');
+    if (this.health === 'failed') throw this.failure ?? new SchedulerCompileError('Scheduler is in a failed state.');
     if (this.systems.some((item) => item.system.name === system.name)) {
       throw new Error(`[ECS] Duplicate system name: ${system.name}`);
     }
     this.systems.push({ system, order: this.nextOrder++ });
+    this.health = 'initializing';
     return this;
   }
 
@@ -119,18 +162,69 @@ export class Scheduler {
 
   public dispose(): void {
     this.stopped = true;
+    this.health = 'disposed';
     this.workerPool?.dispose();
+    const error = new Error('Scheduler disposed before safe-point work completed.');
+    for (const request of this.safePointRequests.splice(0)) request.reject(error);
+    this.resolveIdleWaiters(true);
+  }
+
+  /** 在开放业务命令前编译完整生产图；失败会使 Scheduler 永久进入 failed。 */
+  public prepare(): void {
+    if (this.stopped) throw new Error('Scheduler is stopped.');
+    if (this.health === 'failed') throw this.failure;
+    try {
+      this.compileSchedule();
+      this.health = 'ready';
+    } catch (error) {
+      const failure = this.fail(error);
+      throw failure;
+    }
+  }
+
+  public healthSnapshot(): SchedulerHealthSnapshot {
+    return this.failure ? { status: this.health, error: this.failure } : { status: this.health };
+  }
+
+  /** 等待当前已排队事件及其派生事件达到稳定状态；不会停止 Scheduler。 */
+  public waitForIdle(): Promise<void> {
+    if (this.health === 'failed') return Promise.reject(this.failure);
+    if (this.stopped || (!this.running && !this.scheduled && this.world.pendingCount() === 0 && this.safePointRequests.length === 0)) return Promise.resolve();
+    if (!this.running && !this.scheduled && this.world.pendingCount() > 0) this.wake();
+    return new Promise((resolve, reject) => {
+      this.idleWaiters.push({ resolve, reject });
+    });
   }
 
   public async stopAndDrain(): Promise<void> {
     if (this.stopped) return;
     for (;;) {
-      if (!this.running && !this.scheduled && this.world.pendingCount() === 0) break;
+      if (this.health === 'failed') break;
+      if (!this.running && !this.scheduled && this.world.pendingCount() === 0 && this.safePointRequests.length === 0) break;
       if (!this.running && !this.scheduled && this.world.pendingCount() > 0) this.wake();
       await yieldToEventLoop();
     }
     this.stopped = true;
+    this.health = 'disposed';
     this.workerPool?.dispose();
+  }
+
+  /**
+   * 在 system wave 之外、Scheduler 持有单线程写权时执行投影切换。
+   * 文件事务在 storage_committed 后通过这里提交 ECS projection，避免与 CommandBuffer 交错。
+   */
+  public runAtSafePoint<T>(action: () => T | Promise<T>): Promise<T> {
+    if (this.health === 'failed') return Promise.reject(this.failure);
+    if (this.stopped) return Promise.reject(new Error('Scheduler is stopped.'));
+    const result = new Promise<T>((resolve, reject) => {
+      this.safePointRequests.push({
+        action,
+        resolve: (value) => resolve(value as T),
+        reject
+      });
+    });
+    this.wake();
+    return result;
   }
 
   /** 供调试/测试查看当前拓扑结果。 */
@@ -144,7 +238,7 @@ export class Scheduler {
   }
 
   private wake(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.health === 'failed') return;
     // 运行期间的同步入队由不动点循环消化；空闲时才安排下一次 tick。
     if (this.scheduled || this.running) {
       return;
@@ -157,10 +251,17 @@ export class Scheduler {
   }
 
   private tick(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.health === 'failed') return;
     this.running = true;
-    const schedule = this.compileSchedule();
-    void this.runTick(schedule);
+    let schedule: CompiledSchedule;
+    try {
+      schedule = this.compileSchedule();
+      this.health = 'ready';
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    void this.runTick(schedule).catch((error) => this.fail(error));
   }
 
   private async runTick(schedule: CompiledSchedule): Promise<void> {
@@ -175,17 +276,29 @@ export class Scheduler {
         await this.runSchedule(schedule, ctx);
 
         try {
-          this.hooks.afterPass?.();
+          await this.hooks.afterPass?.();
         } catch (error) {
           console.error('[ECS] afterPass hook threw:', error);
         }
 
         guard += 1;
-        if (this.world.version() === before) {
-          break; // 不动点：本轮没有任何状态变化。
+        const reachedFixedPoint = this.world.version() === before;
+        let drainedSafePointBatch = false;
+        if (reachedFixedPoint) {
+          if (this.safePointRequests.length === 0) break;
+          await this.drainSafePointRequests();
+          drainedSafePointBatch = true;
+          // Safe-point projection may change components without enqueuing an event. Run another
+          // pass so progress systems observe the committed projection before Ack is released.
         }
         if (guard >= MAX_ITER) {
           console.warn(`[ECS] scheduler hit MAX_ITER(${MAX_ITER}); forcing break.`);
+          // A completed pass is a legal safe-point boundary: every wave command buffer has been
+          // committed and afterPass has finished. Drain one snapshot even without a fixed point so
+          // continuously changing systems cannot leave projection/Ack work stranded indefinitely.
+          if (!drainedSafePointBatch && this.safePointRequests.length > 0) {
+            await this.drainSafePointRequests();
+          }
           break;
         }
 
@@ -200,15 +313,45 @@ export class Scheduler {
     }
 
     try {
-      this.hooks.afterTick?.();
+      await this.hooks.afterTick?.();
     } catch (error) {
       console.error('[ECS] afterTick hook threw:', error);
     }
 
-    // 兜底：若运行期间仍有未处理事件，安排下一次 tick。
-    if (this.world.pendingCount() > 0) {
+    // 兜底：若运行期间仍有未处理事件或 safe-point 请求，安排下一次 tick。
+    // drainSafePointRequests 使用批次快照；action 期间追加的请求由下一合法边界处理。
+    if (this.world.pendingCount() > 0 || this.safePointRequests.length > 0) {
       this.wake();
     }
+    this.resolveIdleWaiters();
+  }
+
+  private async drainSafePointRequests(): Promise<void> {
+    const requests = this.safePointRequests.splice(0);
+    for (const request of requests) {
+      try { request.resolve(await request.action()); }
+      catch (error) { request.reject(error); }
+    }
+  }
+
+  private resolveIdleWaiters(force = false): void {
+    if (!force && (this.running || this.scheduled || this.world.pendingCount() > 0 || this.safePointRequests.length > 0)) return;
+    const waiters = this.idleWaiters.splice(0);
+    for (const waiter of waiters) waiter.resolve();
+  }
+
+  private fail(error: unknown): Error {
+    const failure = normalizeSchedulerFailure(error);
+    if (this.health !== 'failed') {
+      console.error(failure.message, failure instanceof SchedulerCompileError ? failure.originalCause ?? '' : '');
+    }
+    this.failure = failure;
+    this.health = 'failed';
+    this.running = false;
+    this.scheduled = false;
+    for (const request of this.safePointRequests.splice(0)) request.reject(failure);
+    for (const waiter of this.idleWaiters.splice(0)) waiter.reject(failure);
+    return failure;
   }
 
   private async runSchedule(schedule: CompiledSchedule, ctx: SystemContext): Promise<void> {
@@ -313,20 +456,28 @@ export class Scheduler {
 
     const byName = new Map(nodes.map((node) => [node.registered.system.name, node]));
     const outgoing = new Map<SystemNode, Set<SystemNode>>();
+    const edgeReasons = new Map<SystemNode, Map<SystemNode, Set<string>>>();
     const indegree = new Map<SystemNode, number>();
 
     for (const node of nodes) {
       outgoing.set(node, new Set());
+      edgeReasons.set(node, new Map());
       indegree.set(node, 0);
     }
 
     const addEdge = (from: SystemNode, to: SystemNode, reason: string): void => {
       if (from === to) return;
+      const reasonsByTarget = edgeReasons.get(from)!;
+      let reasons = reasonsByTarget.get(to);
+      if (!reasons) {
+        reasons = new Set();
+        reasonsByTarget.set(to, reasons);
+      }
+      reasons.add(reason);
       const edges = outgoing.get(from)!;
       if (edges.has(to)) return;
       edges.add(to);
       indegree.set(to, indegree.get(to)! + 1);
-      void reason; // reason 留给未来调试输出。
     };
 
     for (const producer of nodes) {
@@ -336,8 +487,9 @@ export class Scheduler {
         // 如果 consumer 注册顺序更早，说明这是一个反馈读取；由固定注册顺序 + 不动点多 pass 在下一 pass 消化，
         // 否则互相读写同一 component 的系统会形成无法拓扑排序的静态环。
         if (producer.registered.order > consumer.registered.order) continue;
-        if (intersects(producer.access.writes, consumer.access.topoReads)) {
-          addEdge(producer, consumer, 'write->read');
+        for (const token of intersectionValues(producer.access.writes, consumer.access.topoReads)) {
+          const label = producer.access.tokenLabels.get(token) ?? consumer.access.tokenLabels.get(token) ?? String(token);
+          addEdge(producer, consumer, `write->read:${label}`);
         }
       }
     }
@@ -346,16 +498,16 @@ export class Scheduler {
       for (const targetName of node.access.before) {
         const target = byName.get(targetName);
         if (!target) throw new Error(`[ECS] system "${node.registered.system.name}" declares before unknown system "${targetName}".`);
-        addEdge(node, target, 'before');
+        addEdge(node, target, `before:${targetName}`);
       }
       for (const targetName of node.access.after) {
         const target = byName.get(targetName);
         if (!target) throw new Error(`[ECS] system "${node.registered.system.name}" declares after unknown system "${targetName}".`);
-        addEdge(target, node, 'after');
+        addEdge(target, node, `after:${targetName}`);
       }
     }
 
-    return buildWaves(nodes, outgoing, indegree);
+    return buildWaves(nodes, outgoing, indegree, edgeReasons);
   }
 }
 
@@ -368,6 +520,7 @@ function summarizeAccess(access: SystemAccess): AccessSummary {
   const topoReads = new Set<TokenKey>();
   const conflictReads = new Set<TokenKey>();
   const writes = new Set<TokenKey>();
+  const tokenLabels = new Map<TokenKey, string>();
   const mutationModes: WriteModeMap = new Map();
   const snapshotComponents = new Set<ComponentType<unknown>>();
   const snapshotResources = new Set<ResourceKey<unknown>>();
@@ -376,6 +529,7 @@ function summarizeAccess(access: SystemAccess): AccessSummary {
   const addComponentReads = (components: readonly ComponentType<unknown>[] | undefined, topology: boolean): void => {
     for (const component of components ?? []) {
       const key = componentToken(component);
+      tokenLabels.set(key, `component:${component.name}`);
       conflictReads.add(key);
       snapshotComponents.add(component);
       if (topology) topoReads.add(key);
@@ -384,6 +538,7 @@ function summarizeAccess(access: SystemAccess): AccessSummary {
   const addComponentWrites = (components: readonly ComponentType<unknown>[] | undefined, mode: MutationMode = 'update'): void => {
     for (const component of components ?? []) {
       const key = componentToken(component);
+      tokenLabels.set(key, `component:${component.name}`);
       writes.add(key);
       addWriteMode(mutationModes, key, mode);
       snapshotComponents.add(component);
@@ -392,6 +547,7 @@ function summarizeAccess(access: SystemAccess): AccessSummary {
   const addResourceReads = (resources: readonly ResourceKey<unknown>[] | undefined, topology: boolean): void => {
     for (const resource of resources ?? []) {
       const key = resourceToken(resource);
+      tokenLabels.set(key, `resource:${resource.name}`);
       conflictReads.add(key);
       snapshotResources.add(resource);
       if (topology) topoReads.add(key);
@@ -400,13 +556,18 @@ function summarizeAccess(access: SystemAccess): AccessSummary {
   const addResourceWrites = (resources: readonly ResourceKey<unknown>[] | undefined, mode: MutationMode = 'update'): void => {
     for (const resource of resources ?? []) {
       const key = resourceToken(resource);
+      tokenLabels.set(key, `resource:${resource.name}`);
       writes.add(key);
       addWriteMode(mutationModes, key, mode);
       snapshotResources.add(resource);
     }
   };
   const addEventReads = (events: readonly string[] | undefined): void => {
-    for (const event of events ?? []) conflictReads.add(eventToken(event));
+    for (const event of events ?? []) {
+      const key = eventToken(event);
+      tokenLabels.set(key, `event:${event}`);
+      conflictReads.add(key);
+    }
   };
 
   for (const query of access.queries ?? []) {
@@ -434,6 +595,7 @@ function summarizeAccess(access: SystemAccess): AccessSummary {
     topoReads,
     conflictReads,
     writes,
+    tokenLabels,
     mutationModes,
     snapshotComponents,
     snapshotResources,
@@ -462,7 +624,8 @@ function summarizeQuery(
 function buildWaves(
   nodes: SystemNode[],
   outgoing: Map<SystemNode, Set<SystemNode>>,
-  indegree: Map<SystemNode, number>
+  indegree: Map<SystemNode, number>,
+  edgeReasons: Map<SystemNode, Map<SystemNode, Set<string>>>
 ): CompiledSchedule {
   const remaining = new Set(nodes);
   const order: SystemNode[] = [];
@@ -474,8 +637,17 @@ function buildWaves(
       .sort((a, b) => a.registered.order - b.registered.order);
 
     if (ready.length === 0) {
-      const cycle = [...remaining].map((node) => node.registered.system.name).join(' -> ');
-      throw new Error(`[ECS] system dependency cycle detected: ${cycle}`);
+      const cycleNodes = [...remaining].sort((a, b) => a.registered.order - b.registered.order);
+      const dependencyEdges = cycleNodes.flatMap((from) => [...(outgoing.get(from) ?? [])]
+        .filter((to) => remaining.has(to))
+        .map((to) => {
+          const reasons = [...(edgeReasons.get(from)?.get(to) ?? [])].sort().join(',');
+          return `${from.registered.system.name} -[${reasons || 'dependency'}]-> ${to.registered.system.name}`;
+        }));
+      throw new SchedulerDependencyCycleError(
+        cycleNodes.map((node) => node.registered.system.name),
+        dependencyEdges
+      );
     }
 
     const wave: SystemNode[] = [];
@@ -545,11 +717,24 @@ function addWriteMode(map: WriteModeMap, token: TokenKey, mode: MutationMode): v
 }
 
 function intersects<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): boolean {
-  if (a.size > b.size) return intersects(b, a);
-  for (const item of a) {
-    if (b.has(item)) return true;
+  return intersectionValues(a, b).length > 0;
+}
+
+function intersectionValues<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): T[] {
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  const values: T[] = [];
+  for (const item of small) {
+    if (large.has(item)) values.push(item);
   }
-  return false;
+  return values;
+}
+
+function normalizeSchedulerFailure(error: unknown): Error {
+  if (error instanceof SchedulerCompileError) return error;
+  if (error instanceof Error) {
+    return new SchedulerCompileError(`[ECS] scheduler failed: ${error.message}`, { cause: error });
+  }
+  return new SchedulerCompileError(`[ECS] scheduler failed: ${String(error)}`, { cause: error });
 }
 
 function componentToken(component: ComponentType<unknown>): TokenKey {

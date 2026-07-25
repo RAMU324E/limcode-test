@@ -4,9 +4,11 @@ import { spawn } from 'child_process';
 import * as vscode from 'vscode';
 import type { CheckpointGitStatusRecord, CheckpointRecord, CheckpointSkipReason, CheckpointRestorePayload, ShadowCheckpointRestoreResult } from '../../../shared/protocol';
 import type { CheckpointPolicyRecord } from '../../../shared/protocol';
+import { CHECKPOINT_FEATURE_ENABLED } from '../../../shared/featureFlags';
 import type { ShadowCheckpointCreateRequest } from '../types';
 import type { StoragePaths } from './clientStateStore';
 import { emptyDirectoryManifest, workspaceContainsProject } from '../../world/modules/checkpoint/policy';
+import { EXTENSION_BRAND, EXTENSION_PACKAGE_NAME } from '../../../shared/extensionIdentity';
 
 const EMPTY_DIRECTORY_MANIFEST_RELATIVE_PATH = '.limcode/checkpoint-empty-directories.json';
 
@@ -57,7 +59,13 @@ export async function detectSystemGit(cwd = process.cwd()): Promise<CheckpointGi
   }
 }
 
+export function disabledShadowCheckpointRecord(request: ShadowCheckpointCreateRequest): CheckpointRecord {
+  const now = Date.now();
+  return skipped(baseRecord(request, now), 'disabled', 'Checkpoint 功能当前已停用。');
+}
+
 export async function createShadowCheckpoint(paths: StoragePaths, request: ShadowCheckpointCreateRequest): Promise<CheckpointRecord> {
+  if (!CHECKPOINT_FEATURE_ENABLED) return disabledShadowCheckpointRecord(request);
   const now = Date.now();
   const base = baseRecord(request, now);
   const projectPath = fsPathFromProjectUri(request.projectUri);
@@ -499,8 +507,8 @@ async function commitWorktree(worktreePath: string, request: ShadowCheckpointCre
     return { created: false, ...(sha ? { sha } : {}) };
   }
   await runGit(worktreePath, [
-    '-c', 'user.name=LimCode Checkpoint',
-    '-c', 'user.email=limcode-checkpoint@example.invalid',
+    '-c', `user.name=${EXTENSION_BRAND} Checkpoint`,
+    '-c', `user.email=${EXTENSION_PACKAGE_NAME}-checkpoint@example.invalid`,
     'commit',
     '-m',
     `checkpoint: ${request.trigger} ${request.checkpointId}`

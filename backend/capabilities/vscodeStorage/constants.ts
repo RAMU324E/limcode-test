@@ -1,4 +1,18 @@
 export const STORAGE_VERSION = 1;
+/**
+ * 整个 data root 的开发期兼容边界。它与单个 index 文件的 schemaVersion 分离：
+ * data epoch 不匹配时整根目录拒绝加载，不做旧数据兜底或隐式迁移。
+ */
+/**
+ * The current data format establishes independent Turn, TurnIntent, ExecutionLease, Authority,
+ * RuntimeInbox and Interaction domains on top of transaction-first Conversation storage. Earlier
+ * data roots are reset as one development-format cutover; no schema migration, dual writer, or
+ * legacy import exists.
+ */
+export const DATA_FORMAT_EPOCH = 7;
+export const DATA_ROOT_MARKER_FILE = '.limcode-data-root.json';
+export const DATA_ROOT_RESET_PENDING_FILE = '.limcode-data-reset-pending.json';
+export const DATA_ROOT_BACKUPS_DIR = '.limcode-data-backups';
 export const INDEX_FILE = 'index.json';
 export const RECORDS_DIR = 'records';
 
@@ -27,12 +41,16 @@ export const CONVERSATION_HISTORY_ROOT_DIR = 'conversation-history';
 export const ATTACHMENTS_ROOT_DIR = 'attachments';
 export const PROJECT_CONTEXTS_ROOT_DIR = 'project-contexts';
 export const CONVERSATION_PROJECT_LINKS_ROOT_DIR = 'conversation-project-links';
-export const RUN_HISTORY_ROOT_DIR = 'run-history';
 export const AGENT_ANSWERS_ROOT_DIR = 'agent-answers';
 export const AGENT_ANSWER_SUBMISSION_LINKS_ROOT_DIR = 'agent-answer-submission-links';
 export const AGENT_ANSWER_TARGET_LINKS_ROOT_DIR = 'agent-answer-target-links';
 export const SETTINGS_ROOT_DIR = 'settings';
-export const BACKGROUND_COMMANDS_ROOT_DIR = 'background-commands';
+export const BACKGROUND_PROCESSES_ROOT_DIR = 'background-processes';
+export const BACKGROUND_PROCESS_ORIGIN_LINKS_ROOT_DIR = 'background-process-origin-links';
+export const BACKGROUND_PROCESS_EXIT_RECEIPTS_ROOT_DIR = 'background-process-exit-receipts';
+export const BACKGROUND_PROCESS_NOTIFICATION_DELIVERIES_ROOT_DIR = 'background-process-notification-deliveries';
+/** 可靠事务 WAL、HEAD、receipt、writer owner 等控制面数据。 */
+export const OPERATIONS_ROOT_DIR = 'operations';
 export const WORK_ENVIRONMENTS_ROOT_DIR = 'work-environments';
 export const CONVERSATION_WORK_ENVIRONMENT_LINKS_ROOT_DIR = 'conversation-work-environment-links';
 export const RUN_WORK_ENVIRONMENT_LINKS_ROOT_DIR = 'run-work-environment-links';
@@ -49,7 +67,21 @@ export const COMPRESSION_BLOCKS_ROOT_DIR = 'compression-blocks';
 export const COMPRESSION_BLOCK_SOURCE_LINKS_ROOT_DIR = 'compression-block-source-links';
 export const COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR = 'compression-context-variants';
 export const COMPRESSION_BLOCK_LLM_INVOCATION_LINKS_ROOT_DIR = 'compression-block-llm-invocation-links';
-export const COMPRESSION_LLM_INVOCATIONS_ROOT_DIR = 'compression-llm-invocations';
+export const TURNS_ROOT_DIR = 'turns';
+export const CHILD_TURN_LINKS_ROOT_DIR = 'child-turn-links';
+export const MESSAGE_TURN_LINKS_ROOT_DIR = 'message-turn-links';
+export const TURN_INTENTS_ROOT_DIR = 'turn-intents';
+export const TURN_INTENT_REVISIONS_ROOT_DIR = 'turn-intent-revisions';
+export const TURN_EXECUTION_PRESET_REVISIONS_ROOT_DIR = 'turn-execution-preset-revisions';
+export const PENDING_TURN_INPUTS_ROOT_DIR = 'pending-turn-inputs';
+export const EXECUTION_LEASES_ROOT_DIR = 'execution-leases';
+export const AUTHORITY_SNAPSHOTS_ROOT_DIR = 'authority-snapshots';
+export const AUTHORITY_DERIVATION_LINKS_ROOT_DIR = 'authority-derivation-links';
+export const RUNTIME_INBOX_ITEMS_ROOT_DIR = 'runtime-inbox-items';
+export const RUNTIME_DELIVERY_LINKS_ROOT_DIR = 'runtime-delivery-links';
+export const INTERACTIONS_ROOT_DIR = 'interactions';
+export const INTERACTION_OWNER_LINKS_ROOT_DIR = 'interaction-owner-links';
+export const INTERACTION_RESPONSES_ROOT_DIR = 'interaction-responses';
 
 /**
  * 当前插件明确注册的数据根目录名。
@@ -81,7 +113,6 @@ export const REGISTERED_STORAGE_ROOT_DIRS = [
   ATTACHMENTS_ROOT_DIR,
   PROJECT_CONTEXTS_ROOT_DIR,
   CONVERSATION_PROJECT_LINKS_ROOT_DIR,
-  RUN_HISTORY_ROOT_DIR,
   AGENT_ANSWERS_ROOT_DIR,
   AGENT_ANSWER_SUBMISSION_LINKS_ROOT_DIR,
   AGENT_ANSWER_TARGET_LINKS_ROOT_DIR,
@@ -101,14 +132,34 @@ export const REGISTERED_STORAGE_ROOT_DIRS = [
   COMPRESSION_BLOCK_SOURCE_LINKS_ROOT_DIR,
   COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR,
   COMPRESSION_BLOCK_LLM_INVOCATION_LINKS_ROOT_DIR,
-  COMPRESSION_LLM_INVOCATIONS_ROOT_DIR,
-  BACKGROUND_COMMANDS_ROOT_DIR,
-  SETTINGS_ROOT_DIR
+  TURNS_ROOT_DIR,
+  CHILD_TURN_LINKS_ROOT_DIR,
+  MESSAGE_TURN_LINKS_ROOT_DIR,
+  TURN_INTENTS_ROOT_DIR,
+  TURN_INTENT_REVISIONS_ROOT_DIR,
+  TURN_EXECUTION_PRESET_REVISIONS_ROOT_DIR,
+  PENDING_TURN_INPUTS_ROOT_DIR,
+  EXECUTION_LEASES_ROOT_DIR,
+  AUTHORITY_SNAPSHOTS_ROOT_DIR,
+  AUTHORITY_DERIVATION_LINKS_ROOT_DIR,
+  RUNTIME_INBOX_ITEMS_ROOT_DIR,
+  RUNTIME_DELIVERY_LINKS_ROOT_DIR,
+  INTERACTIONS_ROOT_DIR,
+  INTERACTION_OWNER_LINKS_ROOT_DIR,
+  INTERACTION_RESPONSES_ROOT_DIR,
+  BACKGROUND_PROCESSES_ROOT_DIR,
+  BACKGROUND_PROCESS_ORIGIN_LINKS_ROOT_DIR,
+  BACKGROUND_PROCESS_EXIT_RECEIPTS_ROOT_DIR,
+  BACKGROUND_PROCESS_NOTIFICATION_DELIVERIES_ROOT_DIR,
+  SETTINGS_ROOT_DIR,
+  OPERATIONS_ROOT_DIR
 ] as const;
+
+/** 迁移/归档时与受管目录一起处理的 data-root 顶层文件。 */
+export const REGISTERED_STORAGE_ROOT_FILES = [DATA_ROOT_MARKER_FILE] as const;
 
 export const LLM_SETTINGS_FILE = 'llm.json';
 export const LLM_COMPRESSION_SETTINGS_FILE = 'llm-compression.json';
 export const CHECKPOINT_MAINTENANCE_SETTINGS_FILE = 'checkpoint-maintenance.json';
 export const APPEARANCE_SETTINGS_FILE = 'appearance.json';
 export const ATTACHMENT_SETTINGS_FILE = 'attachments.json';
-export const RUN_HISTORY_SETTINGS_FILE = 'run-history.json';

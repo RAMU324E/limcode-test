@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { REGISTERED_STORAGE_ROOT_DIRS } from './constants';
+import { REGISTERED_STORAGE_ROOT_DIRS, REGISTERED_STORAGE_ROOT_FILES } from './constants';
 import { comparableFsPath, sameFsPath } from './globalStatus';
 
 export interface StorageRootMigrationResult {
@@ -24,6 +24,10 @@ export async function migrateStorageRoot(sourceRoot: vscode.Uri, targetRoot: vsc
   assertSafeMigrationRoots(fromPath, toPath);
 
   await vscode.workspace.fs.createDirectory(targetRoot);
+  const targetManagedEntries = await managedEntriesAt(targetRoot);
+  if (targetManagedEntries.length > 0) {
+    throw new Error(`目标数据目录已包含 LimCode 受管数据（${targetManagedEntries.join('、')}），拒绝合并覆盖；请选择空目录。`);
+  }
 
   const copiedEntries: string[] = [];
   for (const name of REGISTERED_STORAGE_ROOT_DIRS) {
@@ -34,10 +38,18 @@ export async function migrateStorageRoot(sourceRoot: vscode.Uri, targetRoot: vsc
     copiedEntries.push(name);
   }
 
+  for (const name of REGISTERED_STORAGE_ROOT_FILES) {
+    const source = vscode.Uri.joinPath(sourceRoot, name);
+    const target = vscode.Uri.joinPath(targetRoot, name);
+    if (!await entryExists(source)) continue;
+    await vscode.workspace.fs.copy(source, target, { overwrite: true });
+    copiedEntries.push(name);
+  }
+
   const deletedEntries: string[] = [];
   for (const name of copiedEntries) {
     const source = vscode.Uri.joinPath(sourceRoot, name);
-    if (await deleteDirectoryIfExists(source)) deletedEntries.push(name);
+    if (await deleteEntryIfExists(source)) deletedEntries.push(name);
   }
 
   return { fromPath, toPath, migratedAt, copiedEntries, deletedEntries, skipped: false };
@@ -56,6 +68,14 @@ function isNestedPath(parent: string, child: string): boolean {
   return relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
+async function managedEntriesAt(root: vscode.Uri): Promise<string[]> {
+  const entries: string[] = [];
+  for (const name of [...REGISTERED_STORAGE_ROOT_DIRS, ...REGISTERED_STORAGE_ROOT_FILES]) {
+    if (await entryExists(vscode.Uri.joinPath(root, name))) entries.push(name);
+  }
+  return entries;
+}
+
 async function isDirectory(uri: vscode.Uri): Promise<boolean> {
   try {
     const stat = await vscode.workspace.fs.stat(uri);
@@ -66,7 +86,17 @@ async function isDirectory(uri: vscode.Uri): Promise<boolean> {
   }
 }
 
-async function deleteDirectoryIfExists(uri: vscode.Uri): Promise<boolean> {
+async function entryExists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch (error) {
+    if (isFileNotFound(error)) return false;
+    throw error;
+  }
+}
+
+async function deleteEntryIfExists(uri: vscode.Uri): Promise<boolean> {
   try {
     await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: false });
     return true;

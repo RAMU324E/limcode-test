@@ -22,12 +22,14 @@ import {
   CONVERSATION_RUNTIME_CONTEXT_SNAPSHOT_LINKS_ROOT_DIR,
   RUN_RUNTIME_CONTEXT_SNAPSHOT_LINKS_ROOT_DIR,
   PROJECT_CONTEXTS_ROOT_DIR,
-  RUN_HISTORY_ROOT_DIR,
   AGENT_ANSWERS_ROOT_DIR,
   AGENT_ANSWER_SUBMISSION_LINKS_ROOT_DIR,
   AGENT_ANSWER_TARGET_LINKS_ROOT_DIR,
   SETTINGS_ROOT_DIR,
-  BACKGROUND_COMMANDS_ROOT_DIR,
+  BACKGROUND_PROCESSES_ROOT_DIR,
+  BACKGROUND_PROCESS_ORIGIN_LINKS_ROOT_DIR,
+  BACKGROUND_PROCESS_EXIT_RECEIPTS_ROOT_DIR,
+  BACKGROUND_PROCESS_NOTIFICATION_DELIVERIES_ROOT_DIR,
   SYSTEM_PROMPT_SCOPE_LINKS_ROOT_DIR,
   SYSTEM_PROMPTS_ROOT_DIR,
   TOOL_POLICY_SCOPE_LINKS_ROOT_DIR,
@@ -48,12 +50,35 @@ import {
   CHECKPOINT_SHADOW_WORKTREES_ROOT_DIR,
   COMPRESSION_BLOCK_LLM_INVOCATION_LINKS_ROOT_DIR,
   COMPRESSION_BLOCKS_ROOT_DIR,
-  COMPRESSION_LLM_INVOCATIONS_ROOT_DIR,
   COMPRESSION_BLOCK_SOURCE_LINKS_ROOT_DIR,
-  COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR
+  COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR,
+  TURNS_ROOT_DIR,
+  CHILD_TURN_LINKS_ROOT_DIR,
+  MESSAGE_TURN_LINKS_ROOT_DIR,
+  TURN_INTENTS_ROOT_DIR,
+  TURN_INTENT_REVISIONS_ROOT_DIR,
+  TURN_EXECUTION_PRESET_REVISIONS_ROOT_DIR,
+  PENDING_TURN_INPUTS_ROOT_DIR,
+  EXECUTION_LEASES_ROOT_DIR,
+  AUTHORITY_SNAPSHOTS_ROOT_DIR,
+  AUTHORITY_DERIVATION_LINKS_ROOT_DIR,
+  RUNTIME_INBOX_ITEMS_ROOT_DIR,
+  RUNTIME_DELIVERY_LINKS_ROOT_DIR,
+  INTERACTIONS_ROOT_DIR,
+  INTERACTION_OWNER_LINKS_ROOT_DIR,
+  INTERACTION_RESPONSES_ROOT_DIR,
+  DATA_ROOT_BACKUPS_DIR,
+  DATA_ROOT_MARKER_FILE,
+  DATA_ROOT_RESET_PENDING_FILE,
+  OPERATIONS_ROOT_DIR
 } from './constants';
 
 export interface VscodeStorageUris {
+  /** data root 级兼容 epoch 与受控重置路径。 */
+  dataEpochUri: vscode.Uri;
+  dataResetPendingUri: vscode.Uri;
+  dataBackupsRootUri: vscode.Uri;
+  operationsRootUri: vscode.Uri;
   agentsRootUri: vscode.Uri;
   agentsIndexUri: vscode.Uri;
   workflowsRootUri: vscode.Uri;
@@ -125,8 +150,6 @@ export interface VscodeStorageUris {
   compressionContextVariantsIndexUri: vscode.Uri;
   compressionBlockLlmInvocationLinksRootUri: vscode.Uri;
   compressionBlockLlmInvocationLinksIndexUri: vscode.Uri;
-  compressionLlmInvocationsRootUri: vscode.Uri;
-  compressionLlmInvocationsIndexUri: vscode.Uri;
   linksRootUri: vscode.Uri;
   linksIndexUri: vscode.Uri;
   systemPromptScopeLinksRootUri: vscode.Uri;
@@ -137,16 +160,20 @@ export interface VscodeStorageUris {
   conversationWorkflowSelectionsIndexUri: vscode.Uri;
   conversationAgentSelectionsRootUri: vscode.Uri;
   conversationAgentSelectionsIndexUri: vscode.Uri;
-  runHistoryRootUri: vscode.Uri;
-  runHistoryIndexUri: vscode.Uri;
   agentAnswersRootUri: vscode.Uri;
   agentAnswersIndexUri: vscode.Uri;
   agentAnswerSubmissionLinksRootUri: vscode.Uri;
   agentAnswerSubmissionLinksIndexUri: vscode.Uri;
   agentAnswerTargetLinksRootUri: vscode.Uri;
   agentAnswerTargetLinksIndexUri: vscode.Uri;
-  backgroundCommandsRootUri: vscode.Uri;
-  backgroundCommandsIndexUri: vscode.Uri;
+  backgroundProcessesRootUri: vscode.Uri;
+  backgroundProcessesIndexUri: vscode.Uri;
+  backgroundProcessOriginLinksRootUri: vscode.Uri;
+  backgroundProcessOriginLinksIndexUri: vscode.Uri;
+  backgroundProcessExitReceiptsRootUri: vscode.Uri;
+  backgroundProcessExitReceiptsIndexUri: vscode.Uri;
+  backgroundProcessNotificationDeliveriesRootUri: vscode.Uri;
+  backgroundProcessNotificationDeliveriesIndexUri: vscode.Uri;
   settingsRootUri: vscode.Uri;
   llmSettingsUri: vscode.Uri;
 }
@@ -157,6 +184,27 @@ function root(globalStorageUri: vscode.Uri, dir: string): { rootUri: vscode.Uri;
 }
 
 export function createVscodeStoragePaths(globalStorageUri: vscode.Uri): RuntimePaths & VscodeStorageUris {
+  const dataEpochUri = vscode.Uri.joinPath(globalStorageUri, DATA_ROOT_MARKER_FILE);
+  const dataResetPendingUri = vscode.Uri.joinPath(globalStorageUri, DATA_ROOT_RESET_PENDING_FILE);
+  const dataBackupsRootUri = vscode.Uri.joinPath(globalStorageUri, DATA_ROOT_BACKUPS_DIR);
+  const operationsRootUri = vscode.Uri.joinPath(globalStorageUri, OPERATIONS_ROOT_DIR);
+  const turnControlRoots = {
+    turns: root(globalStorageUri, TURNS_ROOT_DIR),
+    childTurnLinks: root(globalStorageUri, CHILD_TURN_LINKS_ROOT_DIR),
+    messageTurnLinks: root(globalStorageUri, MESSAGE_TURN_LINKS_ROOT_DIR),
+    turnIntents: root(globalStorageUri, TURN_INTENTS_ROOT_DIR),
+    turnIntentRevisions: root(globalStorageUri, TURN_INTENT_REVISIONS_ROOT_DIR),
+    turnExecutionPresetRevisions: root(globalStorageUri, TURN_EXECUTION_PRESET_REVISIONS_ROOT_DIR),
+    pendingTurnInputs: root(globalStorageUri, PENDING_TURN_INPUTS_ROOT_DIR),
+    executionLeases: root(globalStorageUri, EXECUTION_LEASES_ROOT_DIR),
+    authoritySnapshots: root(globalStorageUri, AUTHORITY_SNAPSHOTS_ROOT_DIR),
+    authorityDerivationLinks: root(globalStorageUri, AUTHORITY_DERIVATION_LINKS_ROOT_DIR),
+    runtimeInboxItems: root(globalStorageUri, RUNTIME_INBOX_ITEMS_ROOT_DIR),
+    runtimeDeliveryLinks: root(globalStorageUri, RUNTIME_DELIVERY_LINKS_ROOT_DIR),
+    interactions: root(globalStorageUri, INTERACTIONS_ROOT_DIR),
+    interactionOwnerLinks: root(globalStorageUri, INTERACTION_OWNER_LINKS_ROOT_DIR),
+    interactionResponses: root(globalStorageUri, INTERACTION_RESPONSES_ROOT_DIR)
+  } as const;
   const agents = root(globalStorageUri, AGENTS_ROOT_DIR);
   const workflows = root(globalStorageUri, WORKFLOWS_ROOT_DIR);
   const planReviewPolicies = root(globalStorageUri, PLAN_REVIEW_POLICIES_ROOT_DIR);
@@ -193,23 +241,34 @@ export function createVscodeStoragePaths(globalStorageUri: vscode.Uri): RuntimeP
   const compressionBlockSourceLinks = root(globalStorageUri, COMPRESSION_BLOCK_SOURCE_LINKS_ROOT_DIR);
   const compressionContextVariants = root(globalStorageUri, COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR);
   const compressionBlockLlmInvocationLinks = root(globalStorageUri, COMPRESSION_BLOCK_LLM_INVOCATION_LINKS_ROOT_DIR);
-  const compressionLlmInvocations = root(globalStorageUri, COMPRESSION_LLM_INVOCATIONS_ROOT_DIR);
   const links = root(globalStorageUri, AGENT_CONVERSATION_LINKS_ROOT_DIR);
   const systemPromptScopeLinks = root(globalStorageUri, SYSTEM_PROMPT_SCOPE_LINKS_ROOT_DIR);
   const modelProfileScopeLinks = root(globalStorageUri, MODEL_PROFILE_SCOPE_LINKS_ROOT_DIR);
   const conversationWorkflowSelections = root(globalStorageUri, CONVERSATION_WORKFLOW_SELECTIONS_ROOT_DIR);
   const conversationAgentSelections = root(globalStorageUri, CONVERSATION_AGENT_SELECTIONS_ROOT_DIR);
-  const runHistory = root(globalStorageUri, RUN_HISTORY_ROOT_DIR);
   const agentAnswers = root(globalStorageUri, AGENT_ANSWERS_ROOT_DIR);
   const agentAnswerSubmissionLinks = root(globalStorageUri, AGENT_ANSWER_SUBMISSION_LINKS_ROOT_DIR);
   const agentAnswerTargetLinks = root(globalStorageUri, AGENT_ANSWER_TARGET_LINKS_ROOT_DIR);
-  const backgroundCommands = root(globalStorageUri, BACKGROUND_COMMANDS_ROOT_DIR);
+  const backgroundProcesses = root(globalStorageUri, BACKGROUND_PROCESSES_ROOT_DIR);
+  const backgroundProcessOriginLinks = root(globalStorageUri, BACKGROUND_PROCESS_ORIGIN_LINKS_ROOT_DIR);
+  const backgroundProcessExitReceipts = root(globalStorageUri, BACKGROUND_PROCESS_EXIT_RECEIPTS_ROOT_DIR);
+  const backgroundProcessNotificationDeliveries = root(globalStorageUri, BACKGROUND_PROCESS_NOTIFICATION_DELIVERIES_ROOT_DIR);
   const settingsRootUri = vscode.Uri.joinPath(globalStorageUri, SETTINGS_ROOT_DIR);
   const llmSettingsUri = vscode.Uri.joinPath(settingsRootUri, LLM_SETTINGS_FILE);
 
   return {
     globalStorageUri,
     globalStoragePath: globalStorageUri.fsPath,
+    dataEpochUri,
+    dataResetPendingUri,
+    dataBackupsRootUri,
+    operationsRootUri,
+    turnControlRoots: Object.fromEntries(Object.entries(turnControlRoots).map(([key, value]) => [key, {
+      rootUri: value.rootUri,
+      rootPath: value.rootUri.fsPath,
+      indexUri: value.indexUri,
+      indexPath: value.indexUri.fsPath
+    }])) as RuntimePaths['turnControlRoots'],
     agentsRootUri: agents.rootUri,
     agentsRootPath: agents.rootUri.fsPath,
     agentsIndexUri: agents.indexUri,
@@ -352,10 +411,6 @@ export function createVscodeStoragePaths(globalStorageUri: vscode.Uri): RuntimeP
     compressionBlockLlmInvocationLinksRootPath: compressionBlockLlmInvocationLinks.rootUri.fsPath,
     compressionBlockLlmInvocationLinksIndexUri: compressionBlockLlmInvocationLinks.indexUri,
     compressionBlockLlmInvocationLinksIndexPath: compressionBlockLlmInvocationLinks.indexUri.fsPath,
-    compressionLlmInvocationsRootUri: compressionLlmInvocations.rootUri,
-    compressionLlmInvocationsRootPath: compressionLlmInvocations.rootUri.fsPath,
-    compressionLlmInvocationsIndexUri: compressionLlmInvocations.indexUri,
-    compressionLlmInvocationsIndexPath: compressionLlmInvocations.indexUri.fsPath,
     linksRootUri: links.rootUri,
     linksRootPath: links.rootUri.fsPath,
     linksIndexUri: links.indexUri,
@@ -376,10 +431,6 @@ export function createVscodeStoragePaths(globalStorageUri: vscode.Uri): RuntimeP
     conversationAgentSelectionsRootPath: conversationAgentSelections.rootUri.fsPath,
     conversationAgentSelectionsIndexUri: conversationAgentSelections.indexUri,
     conversationAgentSelectionsIndexPath: conversationAgentSelections.indexUri.fsPath,
-    runHistoryRootUri: runHistory.rootUri,
-    runHistoryRootPath: runHistory.rootUri.fsPath,
-    runHistoryIndexUri: runHistory.indexUri,
-    runHistoryIndexPath: runHistory.indexUri.fsPath,
     agentAnswersRootUri: agentAnswers.rootUri,
     agentAnswersRootPath: agentAnswers.rootUri.fsPath,
     agentAnswersIndexUri: agentAnswers.indexUri,
@@ -392,10 +443,22 @@ export function createVscodeStoragePaths(globalStorageUri: vscode.Uri): RuntimeP
     agentAnswerTargetLinksRootPath: agentAnswerTargetLinks.rootUri.fsPath,
     agentAnswerTargetLinksIndexUri: agentAnswerTargetLinks.indexUri,
     agentAnswerTargetLinksIndexPath: agentAnswerTargetLinks.indexUri.fsPath,
-    backgroundCommandsRootUri: backgroundCommands.rootUri,
-    backgroundCommandsRootPath: backgroundCommands.rootUri.fsPath,
-    backgroundCommandsIndexUri: backgroundCommands.indexUri,
-    backgroundCommandsIndexPath: backgroundCommands.indexUri.fsPath,
+    backgroundProcessesRootUri: backgroundProcesses.rootUri,
+    backgroundProcessesRootPath: backgroundProcesses.rootUri.fsPath,
+    backgroundProcessesIndexUri: backgroundProcesses.indexUri,
+    backgroundProcessesIndexPath: backgroundProcesses.indexUri.fsPath,
+    backgroundProcessOriginLinksRootUri: backgroundProcessOriginLinks.rootUri,
+    backgroundProcessOriginLinksRootPath: backgroundProcessOriginLinks.rootUri.fsPath,
+    backgroundProcessOriginLinksIndexUri: backgroundProcessOriginLinks.indexUri,
+    backgroundProcessOriginLinksIndexPath: backgroundProcessOriginLinks.indexUri.fsPath,
+    backgroundProcessExitReceiptsRootUri: backgroundProcessExitReceipts.rootUri,
+    backgroundProcessExitReceiptsRootPath: backgroundProcessExitReceipts.rootUri.fsPath,
+    backgroundProcessExitReceiptsIndexUri: backgroundProcessExitReceipts.indexUri,
+    backgroundProcessExitReceiptsIndexPath: backgroundProcessExitReceipts.indexUri.fsPath,
+    backgroundProcessNotificationDeliveriesRootUri: backgroundProcessNotificationDeliveries.rootUri,
+    backgroundProcessNotificationDeliveriesRootPath: backgroundProcessNotificationDeliveries.rootUri.fsPath,
+    backgroundProcessNotificationDeliveriesIndexUri: backgroundProcessNotificationDeliveries.indexUri,
+    backgroundProcessNotificationDeliveriesIndexPath: backgroundProcessNotificationDeliveries.indexUri.fsPath,
     settingsRootUri,
     settingsRootPath: settingsRootUri.fsPath,
     llmSettingsUri,

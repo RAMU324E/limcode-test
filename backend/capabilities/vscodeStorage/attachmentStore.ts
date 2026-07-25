@@ -8,18 +8,16 @@ import type {
   ContentPart,
   FunctionResponsePart,
   InlineDataPart,
-  MessageContent,
-  MessageRecord,
-  MessageRevisionRecord
+  MessageContent
 } from '../../../shared/protocol';
 import { isFunctionResponsePart, isInlineDataPart } from '../../../shared/protocol';
 import { STORAGE_VERSION } from './constants';
 import type { StoragePaths } from './clientStateStore';
 import { loadGlobalSettingsFile } from './globalSettings';
-import { loadRecordStore, loadRecordStoreByIds, upsertRecordStoreRecords } from './recordStore';
-import { readJson, writeJson } from './json';
+import { DurableFileSystem, jsonBytes } from '../../reliability/fileDurability';
+import { StoragePathAuthorityRegistry } from '../../reliability/storagePathAuthority';
+import { canonicalAttachmentBase64 } from '../../reliability/attachmentBase64';
 
-const ATTACHMENT_RECORD_KEY = 'attachment';
 const ATTACHMENT_BLOBS_DIR = 'blobs';
 const ATTACHMENT_OPENED_DIR = 'opened';
 const DEFAULT_MAX_STORED_INLINE_FILE_MB = 20;
@@ -44,9 +42,18 @@ export interface AttachmentInlineDataInput {
   name?: string;
 }
 
+export interface AttachmentReferenceInput {
+  attachmentId?: string;
+  sourcePath?: string;
+  mimeType?: string;
+  name?: string;
+}
+
+export type ManagedAttachmentDataLoader = (attachmentId: string) => Promise<InlineDataPart>;
+
 export interface ResolvedAttachmentInlineData {
   part: InlineDataPart;
-  status: 'available' | 'missing' | 'failed';
+  status: 'available' | 'missing';
   error?: string;
 }
 
@@ -61,80 +68,63 @@ export async function loadAttachmentSettings(paths: StoragePaths): Promise<Attac
   };
 }
 
-export async function saveManagedAttachment(paths: StoragePaths, input: AttachmentInlineDataInput): Promise<AttachmentRecord> {
-  const data = sanitizeBase64(input.data);
+/** Writes only the immutable/rebuildable blob. Its durable record is published by the conversation transaction. */
+export async function stageManagedAttachmentBlob(paths: StoragePaths, input: AttachmentInlineDataInput): Promise<AttachmentRecord> {
+  const data = canonicalAttachmentBase64(input.data);
   const bytes = Buffer.from(data, 'base64');
   const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
   const id = `attachment-${sha256.slice(0, 24)}`;
   const now = Date.now();
   const blobFile = `${ATTACHMENT_BLOBS_DIR}/${sha256}.base64.json`;
-  const existing = (await loadAttachmentRecordsByIds(paths, [id]))[0];
-  const record: AttachmentRecord = {
-    id,
-    mimeType: input.mimeType,
-    ...(input.name ? { name: input.name } : existing?.name ? { name: existing.name } : {}),
-    sizeBytes: bytes.byteLength,
-    base64Bytes: Buffer.byteLength(data, 'utf8'),
-    sha256,
-    blobFile: existing?.blobFile ?? blobFile,
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now
-  };
-
-  await ensureAttachmentRoots(paths);
-  await writeJson(vscode.Uri.joinPath(paths.attachmentsRootUri, ...record.blobFile.split('/')), {
+  const relativePath = `attachments/${blobFile}`;
+  new StoragePathAuthorityRegistry().assertLiveWriteAllowed(relativePath, 'immutable-content-writer');
+  const files = new DurableFileSystem(paths.globalStoragePath);
+  const candidate: AttachmentBlobFile = {
     schemaVersion: STORAGE_VERSION,
     savedAt: new Date(now).toISOString(),
     attachmentId: id,
     mimeType: input.mimeType,
     ...(input.name ? { name: input.name } : {}),
     data
-  } satisfies AttachmentBlobFile);
-  await upsertRecordStoreRecords(paths.attachmentsRootUri, paths.attachmentsIndexUri, [record], ATTACHMENT_RECORD_KEY, (item) => item.name ?? item.mimeType ?? item.id);
-  return record;
-}
-
-export async function loadAttachmentRecords(paths: StoragePaths): Promise<AttachmentRecord[]> {
-  return await loadRecordStore<AttachmentRecord, typeof ATTACHMENT_RECORD_KEY>(paths.attachmentsRootUri, paths.attachmentsIndexUri, ATTACHMENT_RECORD_KEY) ?? [];
-}
-
-export async function loadAttachmentRecordsByIds(paths: StoragePaths, ids: Iterable<string>): Promise<AttachmentRecord[]> {
-  return loadRecordStoreByIds<AttachmentRecord, typeof ATTACHMENT_RECORD_KEY>(paths.attachmentsRootUri, paths.attachmentsIndexUri, ATTACHMENT_RECORD_KEY, ids);
-}
-
-export async function loadManagedAttachmentData(paths: StoragePaths, attachmentId: string): Promise<InlineDataPart | undefined> {
-  const id = attachmentId.trim();
-  if (!id) return undefined;
-  const record = (await loadAttachmentRecordsByIds(paths, [id]))[0];
-  if (!record) return undefined;
-  const blob = await readJson<AttachmentBlobFile>(vscode.Uri.joinPath(paths.attachmentsRootUri, ...record.blobFile.split('/')));
-  if (!blob || blob.schemaVersion !== STORAGE_VERSION || blob.attachmentId !== id || typeof blob.data !== 'string') return undefined;
+  };
+  try {
+    await files.atomicWrite(relativePath, jsonBytes(candidate), { createOnly: true });
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== 'EEXIST') throw error;
+  }
+  const blob = await files.readJson<AttachmentBlobFile>(relativePath);
+  const createdAt = blob ? Date.parse(blob.savedAt) : Number.NaN;
+  if (!blob || blob.schemaVersion !== STORAGE_VERSION || blob.attachmentId !== id
+    || blob.data !== data || !blob.mimeType || !Number.isFinite(createdAt)) {
+    throw new Error(`Immutable managed attachment blob is invalid: ${id}`);
+  }
   return {
-    inlineData: {
-      mimeType: blob.mimeType || record.mimeType,
-      data: blob.data,
-      ...(blob.name || record.name ? { name: blob.name ?? record.name } : {}),
-      attachmentId: id,
-      storage: 'managed',
-      status: 'available',
-      sizeBytes: record.sizeBytes
-    }
+    id,
+    mimeType: blob.mimeType,
+    ...(blob.name ? { name: blob.name } : {}),
+    sizeBytes: bytes.byteLength,
+    base64Bytes: Buffer.byteLength(data, 'utf8'),
+    sha256,
+    blobFile,
+    createdAt,
+    updatedAt: createdAt
   };
 }
 
-export async function externalizeClientStateAttachments(paths: StoragePaths, state: ClientState): Promise<ClientState> {
+/**
+ * Persists inline bytes before a conversation command publishes their reference. A crash between
+ * these two commits can only leave an unreferenced immutable blob, which attachment mark/sweep may
+ * collect; it can never leave a durable Message pointing at bytes that were not written.
+ */
+export async function ingestMessageContentAttachments(paths: StoragePaths, content: MessageContent): Promise<MessageContent> {
+  if (!hasInlineDataPart(content)) return content;
   const settings = await loadAttachmentSettings(paths);
-  const context: ExternalizeContext = {
+  const normalized = await externalizeContentAttachments(paths, content, {
     maxStoredBytes: settings.maxStoredInlineFileMb * 1024 * 1024,
     cache: new Map()
-  };
-  const messages = await Promise.all(state.messages.map((message) => externalizeMessageRecord(paths, message, context)));
-  const messageRevisions = await Promise.all(state.messageRevisions.map((revision) => externalizeMessageRevisionRecord(paths, revision, context)));
-  return {
-    ...state,
-    messages,
-    messageRevisions
-  };
+  });
+  assertCanonicalDurableMessageContentAttachments(normalized);
+  return normalized;
 }
 
 export function markClientStateAttachmentsForClient(state: ClientState): ClientState {
@@ -143,16 +133,23 @@ export function markClientStateAttachmentsForClient(state: ClientState): ClientS
   return state;
 }
 
-export async function resolveAttachmentForClient(paths: StoragePaths, input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }): Promise<ResolvedAttachmentInlineData> {
+export async function resolveAttachmentForClient(
+  paths: StoragePaths,
+  input: AttachmentReferenceInput,
+  requireManagedAttachment: ManagedAttachmentDataLoader
+): Promise<ResolvedAttachmentInlineData> {
   if (input.attachmentId?.trim()) {
-    try {
-      const part = await loadManagedAttachmentData(paths, input.attachmentId);
-      if (part) return { part, status: 'available' };
-      return { part: unavailableInlineData(input, 'missing', '附件文件不存在'), status: 'missing', error: '附件文件不存在' };
-    } catch (error) {
-      const message = errorMessage(error);
-      return { part: unavailableInlineData(input, 'failed', message), status: 'failed', error: message };
-    }
+    const part = await requireManagedAttachment(input.attachmentId.trim());
+    return {
+      part: {
+        inlineData: {
+          ...part.inlineData,
+          ...(input.mimeType ? { mimeType: input.mimeType } : {}),
+          ...(input.name ? { name: input.name } : {})
+        }
+      },
+      status: 'available'
+    };
   }
 
   if (input.sourcePath?.trim()) {
@@ -182,36 +179,26 @@ export async function resolveAttachmentForClient(paths: StoragePaths, input: { a
   return { part: unavailableInlineData(input, 'missing', '缺少附件引用'), status: 'missing', error: '缺少附件引用' };
 }
 
-export async function materializeAttachmentFileUri(paths: StoragePaths, input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }): Promise<vscode.Uri | undefined> {
+export async function materializeAttachmentFileUri(
+  paths: StoragePaths,
+  input: AttachmentReferenceInput,
+  requireManagedAttachment: ManagedAttachmentDataLoader
+): Promise<vscode.Uri | undefined> {
   if (input.sourcePath?.trim()) return vscode.Uri.file(input.sourcePath.trim());
   if (!input.attachmentId?.trim()) return undefined;
-  const resolved = await resolveAttachmentForClient(paths, input);
-  const data = resolved.part?.inlineData.data;
-  if (!data) return undefined;
+  const resolved = await resolveAttachmentForClient(paths, input, requireManagedAttachment);
+  const data = resolved.part.inlineData.data;
+  if (!data) throw new Error(`Canonical managed attachment has no bytes: ${input.attachmentId}`);
   const fileName = safeAttachmentFileName(input.attachmentId, resolved.part.inlineData.name ?? input.name, resolved.part.inlineData.mimeType);
-  const uri = vscode.Uri.joinPath(paths.attachmentsRootUri, ATTACHMENT_OPENED_DIR, fileName);
-  await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(paths.attachmentsRootUri, ATTACHMENT_OPENED_DIR));
-  await vscode.workspace.fs.writeFile(uri, Buffer.from(data, 'base64'));
-  return uri;
-}
-
-export async function ensureAttachmentRoots(paths: StoragePaths): Promise<void> {
-  await Promise.all([
-    vscode.workspace.fs.createDirectory(paths.attachmentsRootUri),
-    vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(paths.attachmentsRootUri, ATTACHMENT_BLOBS_DIR))
-  ]);
-}
-
-async function externalizeMessageRecord(paths: StoragePaths, message: MessageRecord, context: ExternalizeContext): Promise<MessageRecord> {
-  return { ...message, content: await externalizeContentAttachments(paths, message.content, context) };
-}
-
-async function externalizeMessageRevisionRecord(paths: StoragePaths, revision: MessageRevisionRecord, context: ExternalizeContext): Promise<MessageRevisionRecord> {
-  return { ...revision, content: await externalizeContentAttachments(paths, revision.content, context) };
+  const relativePath = `attachments/${ATTACHMENT_OPENED_DIR}/${fileName}`;
+  new StoragePathAuthorityRegistry().assertLiveWriteAllowed(relativePath, 'derived-projection-writer');
+  await new DurableFileSystem(paths.globalStoragePath).atomicWrite(relativePath, Buffer.from(data, 'base64'));
+  return vscode.Uri.joinPath(paths.attachmentsRootUri, ATTACHMENT_OPENED_DIR, fileName);
 }
 
 async function externalizeContentAttachments(paths: StoragePaths, content: MessageContent, context: ExternalizeContext): Promise<MessageContent> {
-  const parts = await Promise.all(content.parts.map((part) => externalizePartAttachments(paths, part, context)));
+  const parts: ContentPart[] = [];
+  for (const part of content.parts) parts.push(await externalizePartAttachments(paths, part, context));
   return { ...content, parts };
 }
 
@@ -224,7 +211,8 @@ async function externalizePartAttachments(paths: StoragePaths, part: ContentPart
 async function externalizeFunctionResponsePart(paths: StoragePaths, part: FunctionResponsePart, context: ExternalizeContext): Promise<FunctionResponsePart> {
   const parts = part.functionResponse.parts;
   if (!parts?.length) return part;
-  const nextParts = await Promise.all(parts.map((inlinePart) => externalizeInlineDataPart(paths, inlinePart, context)));
+  const nextParts: InlineDataPart[] = [];
+  for (const inlinePart of parts) nextParts.push(await externalizeInlineDataPart(paths, inlinePart, context));
   return {
     ...part,
     functionResponse: {
@@ -236,49 +224,24 @@ async function externalizeFunctionResponsePart(paths: StoragePaths, part: Functi
 
 async function externalizeInlineDataPart(paths: StoragePaths, part: InlineDataPart, context: ExternalizeContext): Promise<InlineDataPart> {
   const data = part.inlineData.data;
-  if (!data) return stripRuntimeStatus(part);
-  const base64Bytes = Buffer.byteLength(data, 'utf8');
-  const rawBytes = Math.floor(base64Bytes * 0.75);
+  if (!data) return canonicalizeExistingAttachmentReference(part);
+  const sanitized = canonicalAttachmentBase64(data);
+  const rawBytes = Buffer.from(sanitized, 'base64').byteLength;
 
   if (rawBytes > context.maxStoredBytes) {
-    if (part.inlineData.sourcePath) {
-      return {
-        inlineData: {
-          mimeType: part.inlineData.mimeType,
-          ...(part.inlineData.name ? { name: part.inlineData.name } : {}),
-          sourcePath: part.inlineData.sourcePath,
-          storage: 'localPath',
-          status: 'available',
-          sizeBytes: rawBytes
-        }
-      };
-    }
-    return {
-      inlineData: {
-        mimeType: part.inlineData.mimeType,
-        ...(part.inlineData.name ? { name: part.inlineData.name } : {}),
-        storage: 'embedded',
-        status: 'tooLarge',
-        error: `附件超过托管阈值 ${Math.floor(context.maxStoredBytes / 1024 / 1024)}MB，且没有可恢复的本地路径。`,
-        sizeBytes: rawBytes
-      }
-    };
+    if (part.inlineData.sourcePath) return localPathReference(part, rawBytes);
+    throw new Error(`附件超过托管阈值 ${Math.floor(context.maxStoredBytes / 1024 / 1024)}MB，且没有可恢复的本地路径。`);
   }
 
-  const cacheKey = `${part.inlineData.mimeType}\n${part.inlineData.name ?? ''}\n${data}`;
+  const cacheKey = `${part.inlineData.mimeType}\n${part.inlineData.name ?? ''}\n${sanitized}`;
   const cached = context.cache.get(cacheKey);
-  const record = cached ?? await saveManagedAttachment(paths, { mimeType: part.inlineData.mimeType, data, name: part.inlineData.name });
+  const record = cached ?? await stageManagedAttachmentBlob(paths, {
+    mimeType: part.inlineData.mimeType,
+    data: sanitized,
+    name: part.inlineData.name
+  });
   context.cache.set(cacheKey, record);
-  return {
-    inlineData: {
-      mimeType: record.mimeType,
-      ...(record.name ? { name: record.name } : part.inlineData.name ? { name: part.inlineData.name } : {}),
-      attachmentId: record.id,
-      storage: 'managed',
-      status: 'available',
-      sizeBytes: record.sizeBytes
-    }
-  };
+  return managedAttachmentReference(record, { mimeType: part.inlineData.mimeType, name: part.inlineData.name });
 }
 
 function markContentAttachmentsForClient(content: MessageContent): MessageContent {
@@ -307,23 +270,79 @@ function markInlineDataPartForClient(part: InlineDataPart): InlineDataPart {
   return { inlineData: { ...inlineData, status: inlineData.status ?? 'missing' } };
 }
 
-function stripRuntimeStatus(part: InlineDataPart): InlineDataPart {
+function canonicalizeExistingAttachmentReference(part: InlineDataPart): InlineDataPart {
+  const inlineData = part.inlineData;
+  if (inlineData.attachmentId?.trim()) {
+    const attachmentId = inlineData.attachmentId.trim();
+    if (inlineData.storage !== 'managed' || !attachmentId.startsWith('attachment-')
+      || typeof inlineData.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(inlineData.sha256)
+      || !Number.isInteger(inlineData.sizeBytes) || inlineData.sizeBytes! < 0) {
+      throw new Error(`托管附件引用不完整：${attachmentId}`);
+    }
+    return {
+      inlineData: {
+        mimeType: inlineData.mimeType,
+        ...(inlineData.name ? { name: inlineData.name } : {}),
+        attachmentId,
+        sha256: inlineData.sha256,
+        storage: 'managed',
+        sizeBytes: inlineData.sizeBytes
+      }
+    };
+  }
+  if (inlineData.sourcePath?.trim()) return localPathReference(part, inlineData.sizeBytes);
+  throw new Error(`附件 ${inlineData.name ?? inlineData.mimeType} 没有 canonical durable reference。`);
+}
+
+function managedAttachmentReference(record: AttachmentRecord, input?: { mimeType?: string; name?: string }): InlineDataPart {
+  return {
+    inlineData: {
+      mimeType: input?.mimeType || record.mimeType,
+      ...(input?.name ? { name: input.name } : record.name ? { name: record.name } : {}),
+      attachmentId: record.id,
+      sha256: record.sha256,
+      storage: 'managed',
+      sizeBytes: record.sizeBytes
+    }
+  };
+}
+
+function localPathReference(part: InlineDataPart, sizeBytes?: number): InlineDataPart {
   const inlineData = part.inlineData;
   return {
     inlineData: {
       mimeType: inlineData.mimeType,
       ...(inlineData.name ? { name: inlineData.name } : {}),
-      ...(inlineData.attachmentId ? { attachmentId: inlineData.attachmentId } : {}),
-      ...(inlineData.sourcePath ? { sourcePath: inlineData.sourcePath } : {}),
-      ...(inlineData.storage ? { storage: inlineData.storage } : {}),
-      ...(inlineData.status ? { status: inlineData.status } : {}),
-      ...(inlineData.error ? { error: inlineData.error } : {}),
-      ...(inlineData.sizeBytes !== undefined ? { sizeBytes: inlineData.sizeBytes } : {})
+      sourcePath: inlineData.sourcePath!,
+      storage: 'localPath',
+      ...(sizeBytes !== undefined ? { sizeBytes } : {})
     }
   };
 }
 
-function unavailableInlineData(input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }, status: 'missing' | 'failed', error: string): InlineDataPart {
+function hasInlineDataPart(content: MessageContent): boolean {
+  return content.parts.some((part) => isInlineDataPart(part)
+    || isFunctionResponsePart(part) && (part.functionResponse.parts?.length ?? 0) > 0);
+}
+
+export function assertCanonicalDurableMessageContentAttachments(content: MessageContent): void {
+  const inspect = (part: InlineDataPart): void => {
+    const value = part.inlineData;
+    if (value.data) throw new Error('Durable MessageContent cannot contain embedded attachment bytes.');
+    const managed = !!value.attachmentId && value.storage === 'managed'
+      && typeof value.sha256 === 'string' && /^[0-9a-f]{64}$/.test(value.sha256)
+      && Number.isInteger(value.sizeBytes) && value.sizeBytes! >= 0;
+    const local = !!value.sourcePath && value.storage === 'localPath';
+    if (!!value.attachmentId && !!value.sourcePath) throw new Error('Durable attachment cannot have both managed and local references.');
+    if (!managed && !local) throw new Error(`附件 ${value.name ?? value.mimeType} 没有 canonical durable reference。`);
+  };
+  for (const part of content.parts) {
+    if (isInlineDataPart(part)) inspect(part);
+    else if (isFunctionResponsePart(part)) for (const nested of part.functionResponse.parts ?? []) inspect(nested);
+  }
+}
+
+function unavailableInlineData(input: AttachmentReferenceInput, status: 'missing', error: string): InlineDataPart {
   return {
     inlineData: {
       mimeType: input.mimeType || 'application/octet-stream',
@@ -335,10 +354,6 @@ function unavailableInlineData(input: { attachmentId?: string; sourcePath?: stri
       error
     }
   };
-}
-
-function sanitizeBase64(value: string): string {
-  return value.replace(/^data:[^,]+,/, '').replace(/\s+/g, '');
 }
 
 function safeAttachmentFileName(id: string, name: string | undefined, mimeType: string): string {

@@ -12,6 +12,7 @@ import type {
   McpServersSettingsRecord
 } from '../../../shared/protocol';
 import type { StorageCapability } from '../types';
+import { CHECKPOINT_FEATURE_ENABLED } from '../../../shared/featureFlags';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from './globalSettings';
 import { loadLlmProviderConfigsSettings, saveLlmProviderConfigsSettings } from './llmProviderConfigs';
 import { loadLlmCompressionConfigsSettings, normalizeLlmCompressionSettings, saveLlmCompressionConfigsSettings } from './llmCompressionConfigs';
@@ -27,43 +28,51 @@ import { migrateStorageRoot } from './migration';
 import { createVscodeStoragePaths } from './paths';
 import { readJson, writeJson } from './json';
 import {
-  appendToolCallEventRecord,
   loadClientStateSkeletonFromStores,
-  loadConversationDetailFromStores,
-  loadConversationRunDetailFromStores,
-  loadConversationRunHistoryPageFromStores,
-  loadConversationTimelinePageFromStores,
-  loadConversationTimelineRangeFromStores,
-  resolveConversationRunIdForMessageFromStores,
-  removeMessageRecord,
-  saveClientStateSkeletonToStores,
-  saveConversationRenderDetailToStores,
-  saveConversationRunHistoryToStores,
-  saveMessageRecord,
-  saveToolCallRecord,
-  truncateConversationTimelineFromStores
+  saveClientStateSkeletonToStores
 } from './clientStateStore';
-import { loadTimelineProjectionContext } from './conversationTimelineStore';
 import {
   loadConversationHistoryPageFromStore,
   removeConversationHistoryEntryFromStore,
   upsertConversationHistoryEntryInStore
 } from './conversationHistoryStore';
-import { createShadowCheckpoint, detectSystemGit as detectSystemGitCommand, restoreShadowCheckpoint } from './shadowCheckpoint';
+import { createShadowCheckpoint, detectSystemGit as detectSystemGitCommand, disabledShadowCheckpointRecord, restoreShadowCheckpoint } from './shadowCheckpoint';
 import { openShadowCheckpointDiff, registerShadowDiffProvider } from './shadowDiff';
 import { cleanupUnusedShadowWorktrees, collectShadowWorktreeStats, deleteShadowWorktrees } from './shadowCheckpointMaintenance';
+import { withConversationDataTransaction } from './conversationDataStore';
+import { conversationSettingsFileName } from './naming';
+import { ingestMessageContentAttachments } from './attachmentStore';
+import { loadToolResultContent, stagePreparedToolResultContent, stageToolResultContent } from './toolResultStore';
+import { ensureCurrentDataEpoch, resetManagedDataRoot } from './dataEpoch';
 
 type StoragePaths = ReturnType<typeof createVscodeStoragePaths>;
 
 export function createVsCodeStorageCapability(context: vscode.ExtensionContext): StorageCapability {
   let currentPaths = createVscodeStoragePaths(resolveDataRootUri(context));
-  registerShadowDiffProvider(context);
+  let readyRootPath: string | undefined;
+  let readinessCheck: { rootPath: string; promise: Promise<void> } | undefined;
+  if (CHECKPOINT_FEATURE_ENABLED) registerShadowDiffProvider(context);
 
   function getPaths(): StoragePaths {
     currentPaths = createVscodeStoragePaths(resolveDataRootUri(context));
     return currentPaths;
   }
 
+  async function ensurePathsReady(paths: StoragePaths): Promise<void> {
+    if (readyRootPath === paths.globalStoragePath) return;
+    if (readinessCheck?.rootPath === paths.globalStoragePath) return readinessCheck.promise;
+    const promise = ensureCurrentDataEpoch(paths).then(() => {
+      if (readinessCheck?.rootPath === paths.globalStoragePath) readyRootPath = paths.globalStoragePath;
+    });
+    readinessCheck = { rootPath: paths.globalStoragePath, promise };
+    return promise;
+  }
+
+  async function getReadyPaths(): Promise<StoragePaths> {
+    const paths = getPaths();
+    await ensurePathsReady(paths);
+    return paths;
+  }
 
   async function loadCommonGlobalSettings(): Promise<{ section: 'common'; settings: GlobalSettingsRecord; filePath: string }> {
     return { section: 'common', settings: createGlobalSettingsRecord(context), filePath: LIMCODE_GLOBAL_STATUS_LABEL };
@@ -71,7 +80,7 @@ export function createVsCodeStorageCapability(context: vscode.ExtensionContext):
 
   async function saveCommonGlobalSettings(settings: GlobalSettingsSectionValue): Promise<{ section: 'common'; settings: GlobalSettingsRecord; filePath: string }> {
     const input = settings as Partial<GlobalSettingsRecord> | undefined;
-    const previousPaths = getPaths();
+    const previousPaths = await getReadyPaths();
     const targetDataRootPath = normalizeStatusDataRootPath(context, input?.dataFilePath ?? '');
     const targetRootUri = resolveDataRootUri(context, targetDataRootPath);
     const migration = await migrateStorageRoot(previousPaths.globalStorageUri, targetRootUri);
@@ -91,115 +100,87 @@ export function createVsCodeStorageCapability(context: vscode.ExtensionContext):
   return {
     get paths() { return getPaths(); },
     async ensureReady() {
-      // 读路径懒加载：启动阶段不预创建/读取 settings，避免阻塞侧边栏首屏。
+      await ensurePathsReady(getPaths());
+    },
+    async resetDataRoot(options) {
+      const paths = getPaths();
+      const result = await resetManagedDataRoot(paths, options);
+      readyRootPath = paths.globalStoragePath;
+      readinessCheck = { rootPath: paths.globalStoragePath, promise: Promise.resolve() };
+      return result;
+    },
+    async ingestMessageContentAttachments(content) {
+      return ingestMessageContentAttachments(await getReadyPaths(), content);
+    },
+    async stageToolResultContent(content) {
+      return stageToolResultContent(await getReadyPaths(), content);
+    },
+    async stagePreparedToolResultContent(content) {
+      return stagePreparedToolResultContent(await getReadyPaths(), content);
+    },
+    async loadToolResultContent(artifact) {
+      return loadToolResultContent(await getReadyPaths(), artifact);
     },
     async loadClientStateSkeleton(options) {
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       return loadClientStateSkeletonFromStores(paths, options);
     },
-    async loadConversationDetail(conversationId, options) {
-      const paths = getPaths();
-      const includeRunHistory = options?.includeRunHistory ?? false;
-      return loadConversationDetailFromStores(paths, conversationId, { includeRunHistory });
-    },
-    async loadConversationTimelineProjectionContext(conversationId, projectionKey, chunkId) {
-      const paths = getPaths();
-      return loadTimelineProjectionContext(paths, conversationId, projectionKey, chunkId);
-    },
-    async loadConversationTimelinePage(request) {
-      const paths = getPaths();
-      return loadConversationTimelinePageFromStores(paths, request);
-    },
-    async loadConversationTimelineRange(request) {
-      const paths = getPaths();
-      return loadConversationTimelineRangeFromStores(paths, request);
-    },
-    async truncateConversationTimeline(request) {
-      const paths = getPaths();
-      return truncateConversationTimelineFromStores(paths, request);
-    },
     async saveClientStateSkeleton(state) {
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       await saveClientStateSkeletonToStores(paths, state);
     },
-    async saveConversationRenderDetail(conversationId, state) {
-      const paths = getPaths();
-      await saveConversationRenderDetailToStores(paths, conversationId, state);
-    },
-    async saveConversationRunHistory(conversationId, state, options) {
-      const paths = getPaths();
-      await saveConversationRunHistoryToStores(paths, conversationId, state, options);
-    },
-    async loadConversationRunHistoryPage(request) {
-      const paths = getPaths();
-      return loadConversationRunHistoryPageFromStores(paths, request);
-    },
-    async loadConversationRunDetail(request) {
-      const paths = getPaths();
-      return loadConversationRunDetailFromStores(paths, request);
-    },
-    async resolveConversationRunIdForMessage(conversationId, messageId) {
-      const paths = getPaths();
-      return resolveConversationRunIdForMessageFromStores(paths, conversationId, messageId);
-    },
     async loadConversationHistoryPage(request) {
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       return loadConversationHistoryPageFromStore(paths, request);
     },
     async upsertConversationHistoryEntry(entry, originLink) {
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       await upsertConversationHistoryEntryInStore(paths, entry, originLink);
     },
     async removeConversationHistoryEntry(conversationId) {
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       await removeConversationHistoryEntryFromStore(paths, conversationId);
     },
-    async saveMessageSnapshot(conversationId, message) {
-      const paths = getPaths();
-      await saveMessageRecord(paths, conversationId, message);
-    },
-    async removeMessage(_conversationId, messageId) {
-      const paths = getPaths();
-      await removeMessageRecord(paths, _conversationId, messageId);
-    },
-    async saveToolCallSnapshot(_conversationId, toolCall) {
-      const paths = getPaths();
-      await saveToolCallRecord(paths, _conversationId, toolCall);
-    },
-    async appendToolCallEvent(_conversationId, event) {
-      const paths = getPaths();
-      await appendToolCallEventRecord(paths, _conversationId, event);
-    },
+
     async detectSystemGit() {
+      if (!CHECKPOINT_FEATURE_ENABLED) {
+        return { available: false, checkedAt: Date.now(), message: 'Checkpoint 功能当前已停用。' };
+      }
       return detectSystemGitCommand();
     },
     async createShadowCheckpoint(request) {
-      const paths = getPaths();
+      if (!CHECKPOINT_FEATURE_ENABLED) return disabledShadowCheckpointRecord(request);
+      const paths = await getReadyPaths();
       return createShadowCheckpoint(paths, request);
     },
     async restoreShadowCheckpoint(request) {
-      const paths = getPaths();
+      if (!CHECKPOINT_FEATURE_ENABLED) return { status: 'failed', message: 'Checkpoint 功能当前已停用。' };
+      const paths = await getReadyPaths();
       return restoreShadowCheckpoint(paths, request);
     },
     async openShadowCheckpointDiff(request) {
-      const paths = getPaths();
+      if (!CHECKPOINT_FEATURE_ENABLED) return { status: 'failed', message: 'Checkpoint 功能当前已停用。' };
+      const paths = await getReadyPaths();
       return openShadowCheckpointDiff(paths, request);
     },
     async collectShadowWorktreeStats() {
-      const paths = getPaths();
+      if (!CHECKPOINT_FEATURE_ENABLED) return [];
+      const paths = await getReadyPaths();
       return collectShadowWorktreeStats(paths);
     },
     async deleteShadowWorktrees(storageKeys) {
-      const paths = getPaths();
+      if (!CHECKPOINT_FEATURE_ENABLED) return { deletedStorageKeys: [] };
+      const paths = await getReadyPaths();
       return deleteShadowWorktrees(paths, storageKeys);
     },
     async cleanupUnusedShadowWorktrees(maxAgeDays) {
-      const paths = getPaths();
+      if (!CHECKPOINT_FEATURE_ENABLED) return { deletedStorageKeys: [] };
+      const paths = await getReadyPaths();
       return cleanupUnusedShadowWorktrees(paths, maxAgeDays);
     },
     async loadGlobalSettings(section) {
       if (section === 'common') return loadCommonGlobalSettings();
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       if (section === 'llm') return loadNormalizedLlmGlobalSettings(paths);
       if (section === 'llmProviderConfigs') {
         const stored = await loadLlmProviderConfigsSettings(paths);
@@ -226,7 +207,7 @@ export function createVsCodeStorageCapability(context: vscode.ExtensionContext):
     },
     async saveGlobalSettings(section, settings) {
       if (section === 'common') return saveCommonGlobalSettings(settings);
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       if (section === 'llm') return saveNormalizedLlmGlobalSettings(paths, settings);
       if (section === 'llmProviderConfigs') {
         const stored = await saveLlmProviderConfigsSettings(paths, settings as Partial<LlmProviderConfigsRecord> | undefined);
@@ -253,7 +234,7 @@ export function createVsCodeStorageCapability(context: vscode.ExtensionContext):
       return loadGlobalSettingsFile(paths.settingsRootUri, section);
     },
     async loadActiveLlmProviderConfig(conversationId) {
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       await ensureLlmSettingsRoots(paths);
       const configs = (await loadLlmProviderConfigsSettings(paths)).settings.configs;
       if (conversationId) {
@@ -270,12 +251,12 @@ export function createVsCodeStorageCapability(context: vscode.ExtensionContext):
     async loadLlmProviderConfigById(configId) {
       const id = configId.trim();
       if (!id) return undefined;
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       await ensureLlmSettingsRoots(paths);
       return (await loadLlmProviderConfigsSettings(paths)).settings.configs.find((config) => config.id === id);
     },
     async loadActiveLlmCompressionConfig(providerConfigId, modelId) {
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       await vscode.workspace.fs.createDirectory(paths.settingsRootUri);
       const configs = (await loadLlmCompressionConfigsSettings(paths)).settings.configs;
       const stored = await loadGlobalSettingsFile(paths.settingsRootUri, 'llmCompression');
@@ -293,45 +274,45 @@ export function createVsCodeStorageCapability(context: vscode.ExtensionContext):
     async loadLlmCompressionConfigById(configId) {
       const id = configId.trim();
       if (!id) return undefined;
-      const paths = getPaths();
+      const paths = await getReadyPaths();
       return (await loadLlmCompressionConfigsSettings(paths)).settings.configs.find((config) => config.id === id);
     },
     async loadConversationSettings(conversationId, section) {
-      const paths = getPaths();
-      const uri = conversationSettingsUri(paths, conversationId, section);
-      if (section === 'llm') {
-        const settings = await readJson<ConversationLlmSettingsRecord>(uri);
-        const normalized = normalizeConversationLlmSettings(conversationId, settings);
-        if (normalized.activeProviderConfigId) {
-          return { conversationId, section, settings: normalized, filePath: uri.fsPath };
-        }
+      const paths = await getReadyPaths();
+      return withConversationDataTransaction(paths, conversationId, async () => {
+        const uri = conversationSettingsUri(paths, conversationId, section);
+        if (section === 'llm') {
+          const settings = await readJson<ConversationLlmSettingsRecord>(uri);
+          const normalized = normalizeConversationLlmSettings(conversationId, settings);
+          if (normalized.activeProviderConfigId) {
+            return { conversationId, section, settings: normalized, filePath: uri.fsPath };
+          }
 
-        const frozen = await freezeConversationLlmSettingsToCurrentGlobal(paths, conversationId, uri);
-        return { conversationId, section, settings: frozen, filePath: uri.fsPath };
-      }
-      const settings = await readJson<ConversationSettingsRecord>(uri);
-      return settings ? { conversationId, section, settings: normalizeConversationCommonSettings(conversationId, settings), filePath: uri.fsPath } : undefined;
+          const frozen = await freezeConversationLlmSettingsToCurrentGlobal(paths, conversationId, uri);
+          return { conversationId, section, settings: frozen, filePath: uri.fsPath };
+        }
+        const settings = await readJson<ConversationSettingsRecord>(uri);
+        return settings ? { conversationId, section, settings: normalizeConversationCommonSettings(conversationId, settings), filePath: uri.fsPath } : undefined;
+      });
     },
     async saveConversationSettings(section, settings) {
-      const paths = getPaths();
-      await vscode.workspace.fs.createDirectory(paths.settingsRootUri);
+      const paths = await getReadyPaths();
       const conversationId = (settings as ConversationSettingsRecord | ConversationLlmSettingsRecord).conversationId;
       const normalized = section === 'llm'
         ? normalizeConversationLlmSettings(conversationId, settings as Partial<ConversationLlmSettingsRecord>)
         : normalizeConversationCommonSettings(conversationId, settings as Partial<ConversationSettingsRecord>);
       const uri = conversationSettingsUri(paths, conversationId, section);
-      await writeJson(uri, normalized);
+      await withConversationDataTransaction(paths, conversationId, async () => {
+        await vscode.workspace.fs.createDirectory(paths.settingsRootUri);
+        await writeJson(uri, normalized);
+      });
       return { conversationId, section, settings: normalized, filePath: uri.fsPath };
     }
   };
 }
 
 function conversationSettingsUri(paths: StoragePaths, conversationId: string, section: string): vscode.Uri {
-  return vscode.Uri.joinPath(paths.settingsRootUri, `conversation-${safeFileName(conversationId)}-${section}.json`);
-}
-
-function safeFileName(input: string): string {
-  return input.replace(/[^a-zA-Z0-9_.-]+/g, '_');
+  return vscode.Uri.joinPath(paths.settingsRootUri, `conversation-${conversationSettingsFileName(conversationId)}-${section}.json`);
 }
 
 async function ensureLlmSettingsRoots(paths: StoragePaths): Promise<void> {

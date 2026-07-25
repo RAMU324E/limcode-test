@@ -175,48 +175,6 @@ async function saveRecordStoreUnlocked<TRecord extends { id: string }, TKey exte
 }
 
 
-export async function upsertRecordStoreRecords<TRecord extends { id: string }, TKey extends string>(
-  root: vscode.Uri,
-  indexUri: vscode.Uri,
-  records: TRecord[],
-  recordKey: TKey,
-  labelForRecord: (record: TRecord) => string = (record) => record.id
-): Promise<void> {
-  return withRecordStoreMutationLock(indexUri, () => upsertRecordStoreRecordsUnlocked(root, indexUri, records, recordKey, labelForRecord));
-}
-
-async function upsertRecordStoreRecordsUnlocked<TRecord extends { id: string }, TKey extends string>(
-  root: vscode.Uri,
-  indexUri: vscode.Uri,
-  records: TRecord[],
-  recordKey: TKey,
-  labelForRecord: (record: TRecord) => string
-): Promise<void> {
-  const savedAt = new Date().toISOString();
-  const recordsRoot = vscode.Uri.joinPath(root, RECORDS_DIR);
-  await vscode.workspace.fs.createDirectory(recordsRoot);
-  const previousIndex = await loadRecordsIndex(indexUri, false);
-  const previousRecords = await readableIndexRecords(root, previousIndex?.records ?? [], recordKey);
-  const nextById = new Map(previousRecords.map((record) => [record.id, record]));
-
-  for (const record of records) {
-    const file = nextById.get(record.id)?.file ?? `${RECORDS_DIR}/${sortableName(record.id, labelForRecord(record))}.json`;
-    await writeJson(vscode.Uri.joinPath(root, ...file.split('/')), {
-      schemaVersion: STORAGE_VERSION,
-      savedAt,
-      [recordKey]: record
-    } as RecordFile<TKey, TRecord>);
-    nextById.set(record.id, { id: record.id, file, updatedAt: savedAt });
-  }
-
-  await writeJson(indexUri, {
-    schemaVersion: STORAGE_VERSION,
-    savedAt,
-    records: [...nextById.values()]
-  } satisfies RecordsIndexFile);
-}
-
-
 export async function removeRecordStoreRecord(
   root: vscode.Uri,
   indexUri: vscode.Uri,
@@ -234,27 +192,31 @@ async function removeRecordStoreRecordUnlocked(
 ): Promise<void> {
   const savedAt = new Date().toISOString();
   const previousIndex = await loadRecordsIndex(indexUri, false);
-  if (!previousIndex) return;
-  const readableRecords = await readableIndexRecords(root, previousIndex.records, recordKey);
+  const readableRecords = previousIndex
+    ? await readableIndexRecords(root, previousIndex.records, recordKey)
+    : [];
 
   const removed = readableRecords.find((record) => record.id === id);
   const nextRecords = readableRecords.filter((record) => record.id !== id);
-  if (!removed && nextRecords.length === previousIndex.records.length) return;
-
-  // 删除也先提交索引，避免旧索引在短窗口内指向已删除文件。
-  await writeJson(indexUri, {
-    schemaVersion: STORAGE_VERSION,
-    savedAt,
-    records: nextRecords
-  } satisfies RecordsIndexFile);
-
-  if (removed) {
-    try {
-      await vscode.workspace.fs.delete(vscode.Uri.joinPath(root, ...removed.file.split('/')));
-    } catch (error) {
-      if (!isFileNotFound(error)) console.warn(`[LimCode] Failed to delete record file: ${removed.file}`, error);
-    }
+  if (previousIndex && (removed || nextRecords.length !== previousIndex.records.length)) {
+    // 删除也先提交索引，避免旧索引在短窗口内指向已删除文件。
+    await writeJson(indexUri, {
+      schemaVersion: STORAGE_VERSION,
+      savedAt,
+      records: nextRecords
+    } satisfies RecordsIndexFile);
   }
+
+  // 全量骨架保存可能已经先从 index 移除了记录，但未 prune 对应文件；按 id
+  // 扫描并清理这些 orphan，保证显式删除不会留下可被直接读取的记录文件。
+  const filesToDelete = new Set<string>();
+  if (removed) filesToDelete.add(removed.file);
+  for (const file of await listRecordFiles(root)) {
+    if (filesToDelete.has(file)) continue;
+    const record = await loadRecordFile<{ id: string }, string>(root, file, recordKey);
+    if (record?.id === id) filesToDelete.add(file);
+  }
+  await Promise.all([...filesToDelete].map((file) => deleteRecordFile(root, file)));
 }
 
 async function loadRecordFilesInBatches<TRecord extends { id: string }, TKey extends string>(

@@ -37,13 +37,5 @@ export const taskListTimelineProjection: TimelineProjectionSpec<TaskListSnapshot
 };
 
 function isAppliedTaskListToolCall(toolCall: ToolCallRecord): boolean {
-  if (toolCall.status !== 'success' && toolCall.status !== 'warning') return false;
-  const result = asRecord(toolCall.result);
-  return result?.ok !== false;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
+  return toolCall.status === 'success' || toolCall.status === 'warning';
 }

@@ -14,12 +14,9 @@ import {
 import {
   AgentRun,
   AgentRunInputRevision,
-  AgentRunQueueHold,
-  AgentRunQueueOrder,
-  AgentRunQueuedInput,
   AgentRunSourceLink,
   AgentRunTargetLink,
-  MessageRunLink,
+  MessageTurnLink,
   RunContextPolicy,
   RunContextPolicyLink,
   RunConversationPolicy,
@@ -31,6 +28,7 @@ import {
   RunWorkflowLink,
   RunModelProfileLink,
   RunSystemPromptLink,
+  RunTermination,
   RunToolPolicyLink,
   ToolCallRunLink
 } from '../world/modules/agentRun/components';
@@ -39,7 +37,8 @@ import {
   Checkpoint,
   CheckpointBarrier,
   CheckpointPolicyScopeLink,
-  CheckpointTimelineAnchor
+  CheckpointTimelineAnchor,
+  ConversationCheckpointRepositoryLink
 } from '../world/modules/checkpoint/components';
 import {
   CompressionBlock,
@@ -49,6 +48,13 @@ import {
   RunCompressionBlockLink
 } from '../world/modules/compression/components';
 import { LlmInvocation, MessageLlmInvocationLink, RunLlmInvocationLink } from '../world/modules/llm/components';
+import {
+  CompressionModelContextProjectionLink,
+  ModelContextProjection,
+  ModelContextProjectionConversationLink,
+  ModelContextProjectionSourceLink,
+  RequestModelContextProjectionLink
+} from '../world/modules/modelContext/components';
 import { ModelProfileScopeLink, SystemPromptScopeLink } from '../world/modules/workflow/components';
 import { RuntimeContextScopeLink, RunRuntimeContextSnapshotLink } from '../world/modules/runtimeContext/components';
 import { SkillPolicyScopeLink } from '../world/modules/skill/components';
@@ -100,12 +106,12 @@ export function conversationDetailEvictionBlocker(world: World, conversation: En
     if (link && graph.runs.has(link.run) && link.conversation !== conversation) return 'multi_conversation_run';
   }
 
-  for (const entity of world.query(MessageRunLink)) {
-    const link = world.get(entity, MessageRunLink);
+  for (const entity of world.query(MessageTurnLink)) {
+    const link = world.get(entity, MessageTurnLink);
     if (!link || !graph.messages.has(link.message)) continue;
-    const run = world.get(link.run, AgentRun);
+    const run = world.get(link.turn, AgentRun);
     if (run && isActiveAgentRunStatus(run.status)) return 'related_agent_run_active';
-    if (!graph.runs.has(link.run)) return 'external_message_run_reference';
+    if (!graph.runs.has(link.turn)) return 'external_message_turn_reference';
   }
 
   for (const entity of world.query(ToolCallRunLink)) {
@@ -122,12 +128,6 @@ export function conversationDetailEvictionBlocker(world: World, conversation: En
     const run = world.get(input.run, AgentRun);
     if (run && isActiveAgentRunStatus(run.status)) return 'related_agent_run_active';
     if (!graph.runs.has(input.run)) return 'external_input_revision_reference';
-  }
-
-  if (hasActiveQueueItems(world, AgentRunQueueOrder, conversation, graph.runs)
-    || hasActiveQueueItems(world, AgentRunQueueHold, conversation, graph.runs)
-    || hasActiveQueueItems(world, AgentRunQueuedInput, conversation, graph.runs)) {
-    return 'agent_run_queued';
   }
 
   for (const entity of world.query(LlmRequest)) {
@@ -230,9 +230,9 @@ function buildConversationDetailGraph(world: World, conversation: Entity): Conve
     runsWithTargets.add(link.run);
     if (link.conversation === conversation) runs.add(link.run);
   }
-  for (const entity of world.query(MessageRunLink)) {
-    const link = world.get(entity, MessageRunLink);
-    if (link && messages.has(link.message) && !runsWithTargets.has(link.run)) runs.add(link.run);
+  for (const entity of world.query(MessageTurnLink)) {
+    const link = world.get(entity, MessageTurnLink);
+    if (link && messages.has(link.message) && !runsWithTargets.has(link.turn)) runs.add(link.turn);
   }
   for (const entity of world.query(ToolCallRunLink)) {
     const link = world.get(entity, ToolCallRunLink);
@@ -267,10 +267,8 @@ function collectDetailEntities(world: World, graph: ConversationDetailGraph): Se
 
   addMatching(world, AgentRunSourceLink, entities, (link) => graph.runs.has(link.run));
   addMatching(world, AgentRunTargetLink, entities, (link) => graph.runs.has(link.run));
-  addMatching(world, AgentRunQueueOrder, entities, (item) => graph.runs.has(item.run));
-  addMatching(world, AgentRunQueueHold, entities, (item) => graph.runs.has(item.run));
-  addMatching(world, AgentRunQueuedInput, entities, (item) => graph.runs.has(item.run));
-  addMatching(world, MessageRunLink, entities, (link) => graph.runs.has(link.run) || graph.messages.has(link.message));
+  addMatching(world, RunTermination, entities, (termination) => graph.runs.has(termination.run));
+  addMatching(world, MessageTurnLink, entities, (link) => graph.runs.has(link.turn) || graph.messages.has(link.message));
   addMatching(world, ToolCallRunLink, entities, (link) => graph.runs.has(link.run) || graph.toolCalls.has(link.toolCall));
   addMatching(world, AgentRunInputRevision, entities, (input) => graph.runs.has(input.run));
   addMatching(world, RunWorkflowLink, entities, (link) => graph.runs.has(link.run));
@@ -288,6 +286,26 @@ function collectDetailEntities(world: World, graph: ConversationDetailGraph): Se
   addMatching(world, CompressionBlockSourceLink, entities, (link) => graph.compressionBlocks.has(link.block));
   addMatching(world, CompressionContextVariant, entities, (variant) => graph.compressionBlocks.has(variant.block));
   addMatching(world, RunCompressionBlockLink, entities, (link) => graph.runs.has(link.run) || graph.compressionBlocks.has(link.block));
+
+  const contextProjections = new Set<Entity>();
+  addMatching(world, ModelContextProjectionConversationLink, entities, (link) => {
+    if (link.conversation !== graph.conversation) return false;
+    contextProjections.add(link.projection);
+    return true;
+  });
+  addAll(entities, contextProjections);
+  addMatching(world, ModelContextProjectionSourceLink, entities, (link) => contextProjections.has(link.projection));
+  addMatching(world, RequestModelContextProjectionLink, entities, (link) => contextProjections.has(link.projection));
+  addMatching(world, CompressionModelContextProjectionLink, entities, (link) => contextProjections.has(link.projection) || graph.compressionBlocks.has(link.block));
+
+  const checkpoints = new Set<Entity>();
+  for (const entity of world.query(Checkpoint)) {
+    if (world.get(entity, Checkpoint)?.conversation === graph.conversation) checkpoints.add(entity);
+  }
+  addAll(entities, checkpoints);
+  addMatching(world, CheckpointTimelineAnchor, entities, (anchor) =>
+    anchor.conversation === graph.conversation || checkpoints.has(anchor.checkpoint));
+  addMatching(world, ConversationCheckpointRepositoryLink, entities, (link) => link.conversation === graph.conversation);
 
   const removableInvocationLinks = new Set<Entity>();
   addMatching(world, RunLlmInvocationLink, removableInvocationLinks, (link) => graph.runs.has(link.run));
@@ -378,6 +396,16 @@ function normalizeStableReferences(world: World, removed: ReadonlySet<Entity>): 
       targetRun: removeRun ? undefined : link.targetRun,
       sourceToolCallId: removeTool ? world.get(link.sourceToolCall!, ToolCall)?.id ?? link.sourceToolCallId : link.sourceToolCallId,
       sourceToolCall: removeTool ? undefined : link.sourceToolCall
+    });
+  }
+
+  for (const entity of world.query(RunTermination)) {
+    const termination = world.get(entity, RunTermination);
+    if (!termination?.triggerRun || !removed.has(termination.triggerRun) || removed.has(entity)) continue;
+    world.add(entity, RunTermination, {
+      ...termination,
+      triggerRunId: world.get(termination.triggerRun, AgentRun)?.id ?? termination.triggerRunId,
+      triggerRun: undefined
     });
   }
 
@@ -480,20 +508,6 @@ function checkpointBarrierTouchesGraph(
     || (barrier.targetRun !== undefined && graph.runs.has(barrier.targetRun))
     || (barrier.targetToolCall !== undefined && graph.toolCalls.has(barrier.targetToolCall))
     || (barrier.targetMessage !== undefined && graph.messages.has(barrier.targetMessage));
-}
-
-function hasActiveQueueItems<T extends { conversation: Entity; run: Entity }>(
-  world: World,
-  component: ComponentType<T>,
-  conversation: Entity,
-  runs: ReadonlySet<Entity>
-): boolean {
-  return world.query(component).some((entity) => {
-    const item = world.get(entity, component);
-    if (!item || (item.conversation !== conversation && !runs.has(item.run))) return false;
-    const run = world.get(item.run, AgentRun);
-    return !run || isActiveAgentRunStatus(run.status);
-  });
 }
 
 function addMatching<T>(

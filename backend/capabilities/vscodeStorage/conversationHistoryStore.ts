@@ -14,6 +14,7 @@ import {
 import { INDEX_FILE, STORAGE_VERSION } from './constants';
 import { readJson, writeJson } from './json';
 import type { StoragePaths } from './clientStateStore';
+import { withRecordStoreTransaction } from './recordStore';
 
 const DEFAULT_PAGE_SIZE = 50;
 const PAGES_DIR = 'pages';
@@ -107,20 +108,31 @@ export async function upsertConversationHistoryEntryInStore(
   entry: SidebarConversationHistoryEntry,
   originLink?: ConversationOriginLinkRecord
 ): Promise<void> {
-  const scoped = entry.projectFolderUri
-    ? { kind: 'project' as const, folderUri: entry.projectFolderUri }
-    : { kind: 'unbound' as const };
-  const targetScopes: ConversationHistoryScope[] = [{ kind: 'all' }, scoped];
-  await Promise.all(targetScopes.map((scope) => upsertIntoScope(paths, scope, entry, originLink)));
-  await removeFromStaleScopes(paths, entry.id, targetScopes);
+  await withConversationHistoryMutation(paths, async () => {
+    const scoped = entry.projectFolderUri
+      ? { kind: 'project' as const, folderUri: entry.projectFolderUri }
+      : { kind: 'unbound' as const };
+    const targetScopes: ConversationHistoryScope[] = [{ kind: 'all' }, scoped];
+    await Promise.all(targetScopes.map((scope) => upsertIntoScope(paths, scope, entry, originLink)));
+    await removeFromStaleScopes(paths, entry.id, targetScopes);
+  });
 }
 
 export async function removeConversationHistoryEntryFromStore(
   paths: StoragePaths,
   conversationId: string
 ): Promise<void> {
-  const scopes = await existingScopes(paths);
-  await Promise.all(scopes.map((scope) => removeFromScope(paths, scope, conversationId)));
+  await withConversationHistoryMutation(paths, async () => {
+    const scopes = await existingScopes(paths);
+    await Promise.all(scopes.map((scope) => removeFromScope(paths, scope, conversationId)));
+  });
+}
+
+function withConversationHistoryMutation<T>(paths: StoragePaths, action: () => Promise<T>): Promise<T> {
+  return withRecordStoreTransaction(
+    vscode.Uri.joinPath(paths.conversationHistoryRootUri, '.conversation-history-transaction'),
+    action
+  );
 }
 
 async function upsertIntoScope(

@@ -1,15 +1,12 @@
 import type * as vscode from 'vscode';
-import type { LlmCompactRequest, LlmDryRunOptions, LlmDryRunResult, LlmResolveInvocationRequest, LlmStartRequest } from '../world/modules/llm/contracts';
+import type { LlmCompactDryRunResult, LlmCompactRequest, LlmDryRunOptions, LlmDryRunResult, LlmResolveInvocationRequest, LlmStartRequest } from '../world/modules/llm/contracts';
 import type { WorldEvent } from '../ecs/types';
+import type { BackgroundProcessOriginDescriptor } from './backgroundProcessTypes';
 import type {
   BridgeClientId,
   ClientState,
   ConversationHistoryPageRecord,
   ConversationHistoryPageRequest,
-  ConversationRunDetailRecord,
-  ConversationRunDetailRequest,
-  ConversationRunHistoryPageRecord,
-  ConversationRunHistoryPageRequest,
   ConversationTimelinePageRecord,
   ConversationTimelinePageRequest,
   ConversationSettingsSection,
@@ -18,7 +15,6 @@ import type {
   GlobalSettingsSection,
   GlobalSettingsSectionValue,
   LlmCompressionConfigRecord,
-  MessageRecord,
   LlmProviderConfigRecord,
   LlmProviderModelRecord,
   CheckpointRecord,
@@ -28,8 +24,6 @@ import type {
   ShadowRepositoryDiskStatRecord,
   CheckpointPolicyRecord,
   CheckpointTriggerKind,
-  ToolCallEventRecord,
-  ToolCallRecord,
   SkillDefinitionRecord,
   SkillSource,
   RuleFileRecord,
@@ -48,9 +42,11 @@ export interface LlmCapability {
   start(request: LlmStartRequest, emit: Emit): void;
   compact(request: LlmCompactRequest, emit: Emit): void;
   dryRun(request: LlmStartRequest, options?: LlmDryRunOptions): Promise<LlmDryRunResult>;
+  dryRunCompact(request: LlmCompactRequest, options?: LlmDryRunOptions): Promise<LlmCompactDryRunResult>;
   listModels(config: LlmProviderConfigRecord): Promise<LlmProviderModelRecord[]>;
   cancelRetry(requestId: string): void;
   abort(requestId: string): void;
+  dispose(): void;
 }
 
 /** 文件系统能力：隐藏 vscode.workspace.fs 等外部句柄。 */
@@ -235,15 +231,8 @@ export interface CommandRunEvent {
   payload?: unknown;
 }
 
-export interface CommandBackgroundExitEvent {
-  kind: 'background.exit';
-  result: CommandRunResult;
-}
-
 export interface CommandRunObserver {
   onEvent?: (event: CommandRunEvent) => void;
-  /** 后台进程自然退出后的单次终态回调；不消费后台日志。 */
-  onBackgroundExit?: (event: CommandBackgroundExitEvent) => void;
 }
 
 export interface CommandRunArgs {
@@ -253,6 +242,10 @@ export interface CommandRunArgs {
   foregroundWaitMs?: number;
   /** 内部执行标识（通常为 toolCallId），用于在父 Run 中断前主动把前台命令转入后台。 */
   executionId?: string;
+  /** Tool -> ProcessManager handoff 时持久化为独立 OriginLink 的来源关系快照。 */
+  backgroundProcessOrigin?: BackgroundProcessOriginDescriptor;
+  /** 仅控制仍属当前 Tool Attempt 的前台命令；转入独立后台进程后不再跟随该 signal。 */
+  signal?: AbortSignal;
 }
 
 /** 返回给模型的 stdout/stderr 输出上限（保留末尾内容）。 */
@@ -285,6 +278,8 @@ export interface CommandRunResult {
   running?: boolean;
   /** 因后台 buffer 上限被丢弃的字符数（>0 时提示模型有更早输出被截断）。 */
   droppedChars?: number;
+  /** 模型 output 查询终态时的 durable revision owner；被 auto 接管时正文不会重复返回。 */
+  terminalRevisionClaim?: 'model_poll' | 'auto_delivery';
 }
 
 export type WorkEnvironmentTransferKind = 'auto' | 'file' | 'directory';
@@ -348,10 +343,12 @@ export interface CommandCapability {
   run(args: CommandRunArgs, observer?: CommandRunObserver, options?: WorkEnvironmentCapabilityOptions, limits?: CommandOutputLimits): Promise<CommandRunResult>;
   /** 将仍在前台等待的本地命令立即转入后台；不存在、已结束或不支持后台化时返回 false。 */
   backgroundForeground(executionId: string): boolean;
-  /** 读取某后台进程当前已累积的全部日志，并返回其运行状态；默认读取终态日志后清理，consume=false 仅同步。 */
-  readOutput(processId: string, limits: CommandOutputLimits, options?: { consume?: boolean }): CommandRunResult;
-  /** 终止某后台进程；终止后日志临时保留一小段时间，可用 readOutput 查看最终结果。 */
+  /** 读取某后台进程当前已累积的日志；默认 peek。模型 mode=output 可 claimTerminal，Webview 被动读取不得 claim。 */
+  readOutput(processId: string, limits: CommandOutputLimits, options?: { consume?: boolean; claimTerminal?: boolean }): CommandRunResult;
+  /** 终止某后台进程；终止后日志仍保留，直到显式 consume。 */
   kill(processId: string): CommandRunResult;
+  /** data-root 切换前把所有前台命令完成 handoff，并终止/持久化本实例拥有的后台进程。 */
+  quiesce(): void;
   /** 扩展关闭时终止所有残留后台进程并清理。 */
   dispose(): void;
 }
@@ -377,11 +374,42 @@ export interface WebviewCapability {
   clientRecords(): WebviewClientRuntimeRecord[];
 }
 
+export type TurnControlStorageRootKey =
+  | 'turns'
+  | 'childTurnLinks'
+  | 'messageTurnLinks'
+  | 'turnIntents'
+  | 'turnIntentRevisions'
+  | 'turnExecutionPresetRevisions'
+  | 'pendingTurnInputs'
+  | 'executionLeases'
+  | 'authoritySnapshots'
+  | 'authorityDerivationLinks'
+  | 'runtimeInboxItems'
+  | 'runtimeDeliveryLinks'
+  | 'interactions'
+  | 'interactionOwnerLinks'
+  | 'interactionResponses';
+
+export interface RecordStorageRootPaths {
+  rootUri: vscode.Uri;
+  rootPath: string;
+  indexUri: vscode.Uri;
+  indexPath: string;
+}
+
 /** 插件数据目录：集中记录所有持久化数据的当前根位置；可由扩展级 globalState 指向自定义目录。 */
 export interface RuntimePaths {
   /** 当前 active data root；未配置自定义目录时等于 VS Code context.globalStorageUri。 */
   globalStorageUri: vscode.Uri;
   globalStoragePath: string;
+  /** data root 级兼容 marker、未完成重置 marker、归档与可靠事务控制面路径。 */
+  dataEpochUri: vscode.Uri;
+  dataResetPendingUri: vscode.Uri;
+  dataBackupsRootUri: vscode.Uri;
+  operationsRootUri: vscode.Uri;
+  /** Turn/Intent/Lease/Authority/Inbox/Interaction 独立记录根，全部由当前 data root 动态派生。 */
+  turnControlRoots: Record<TurnControlStorageRootKey, RecordStorageRootPaths>;
   /** Agent 数据根目录：<dataRoot>/agents */
   agentsRootUri: vscode.Uri;
   agentsRootPath: string;
@@ -559,11 +587,6 @@ export interface RuntimePaths {
   compressionBlockLlmInvocationLinksIndexUri: vscode.Uri;
   compressionBlockLlmInvocationLinksIndexPath: string;
 
-  compressionLlmInvocationsRootUri: vscode.Uri;
-  compressionLlmInvocationsRootPath: string;
-  compressionLlmInvocationsIndexUri: vscode.Uri;
-  compressionLlmInvocationsIndexPath: string;
-
   /** Agent 与 Conversation 的关系数据根目录：<dataRoot>/agent-conversation-links */
   linksRootUri: vscode.Uri;
   linksRootPath: string;
@@ -579,10 +602,6 @@ export interface RuntimePaths {
   conversationAgentSelectionsRootPath: string;
   conversationAgentSelectionsIndexUri: vscode.Uri;
   conversationAgentSelectionsIndexPath: string;
-  runHistoryRootUri: vscode.Uri;
-  runHistoryRootPath: string;
-  runHistoryIndexUri: vscode.Uri;
-  runHistoryIndexPath: string;
   /** Agent 回答数据根目录：<dataRoot>/agent-answers */
   agentAnswersRootUri: vscode.Uri;
   agentAnswersRootPath: string;
@@ -599,11 +618,26 @@ export interface RuntimePaths {
   agentAnswerTargetLinksIndexUri: vscode.Uri;
   agentAnswerTargetLinksIndexPath: string;
 
-  /** 后台命令日志数据根目录：<dataRoot>/background-commands */
-  backgroundCommandsRootUri: vscode.Uri;
-  backgroundCommandsRootPath: string;
-  backgroundCommandsIndexUri: vscode.Uri;
-  backgroundCommandsIndexPath: string;
+  /** 独立后台进程主体与日志：<dataRoot>/background-processes */
+  backgroundProcessesRootUri: vscode.Uri;
+  backgroundProcessesRootPath: string;
+  backgroundProcessesIndexUri: vscode.Uri;
+  backgroundProcessesIndexPath: string;
+  /** BackgroundProcess 与 ToolCall/Run/Conversation 的来源关系。 */
+  backgroundProcessOriginLinksRootUri: vscode.Uri;
+  backgroundProcessOriginLinksRootPath: string;
+  backgroundProcessOriginLinksIndexUri: vscode.Uri;
+  backgroundProcessOriginLinksIndexPath: string;
+  /** 不可变进程退出事实。 */
+  backgroundProcessExitReceiptsRootUri: vscode.Uri;
+  backgroundProcessExitReceiptsRootPath: string;
+  backgroundProcessExitReceiptsIndexUri: vscode.Uri;
+  backgroundProcessExitReceiptsIndexPath: string;
+  /** 退出事实到可靠对话命令的 durable outbox。 */
+  backgroundProcessNotificationDeliveriesRootUri: vscode.Uri;
+  backgroundProcessNotificationDeliveriesRootPath: string;
+  backgroundProcessNotificationDeliveriesIndexUri: vscode.Uri;
+  backgroundProcessNotificationDeliveriesIndexPath: string;
   /** 通用设置根目录：<dataRoot>/settings */
   settingsRootUri: vscode.Uri;
   settingsRootPath: string;
@@ -613,52 +647,38 @@ export interface RuntimePaths {
 }
 
 /** VS Code 存储能力：通过 workspace.fs/globalState 读写插件全局数据。 */
-export type ConversationRunHistorySaveMode = 'merge' | 'replace';
+export interface StorageDataResetResult {
+  dataRootPath: string;
+  epoch: number;
+  archivedEntries: string[];
+  backupPath?: string;
+}
 
 export interface StorageCapability {
   /** 当前 active data root 派生出的路径；数据目录切换后 getter 会返回新路径。 */
   readonly paths: RuntimePaths;
   ensureReady(): Promise<void>;
+  /** 归档或删除 LimCode 受管条目后创建当前 data epoch；不会触碰 data root 内的其它用户文件。 */
+  resetDataRoot(options?: { archive?: boolean }): Promise<StorageDataResetResult>;
+  /**
+   * Blob-first attachment admission boundary. Returns the only MessageContent representation that
+   * may enter durable conversation facts: immutable managed/local references with no inline bytes.
+   */
+  ingestMessageContentAttachments(content: import('../../shared/protocol').MessageContent): Promise<import('../../shared/protocol').MessageContent>;
+  /** Canonicalizes and blob-first stages one raw tool result before the reliable terminal transaction. */
+  stageToolResultContent(content: import('../../shared/conversationReliability').JsonValue): Promise<import('../../shared/protocol').StagedToolResultContent>;
+  /** Publishes already-canonicalized bytes while the caller holds the ToolResult blob resource lock. */
+  stagePreparedToolResultContent(content: import('../reliability/toolResultPayload').PreparedToolResultContent): Promise<import('../../shared/protocol').StagedToolResultContent>;
+  /** Strict lazy read of one canonical ToolResult Artifact. */
+  loadToolResultContent(artifact: import('../../shared/protocol').ToolResultArtifactRecord): Promise<import('../../shared/conversationReliability').JsonValue>;
   loadClientStateSkeleton(options?: { profile?: 'startup' | 'deferred' | 'full' }): Promise<ClientState | undefined>;
-  loadConversationDetail(
-    conversationId: string,
-    options?: { includeRunHistory?: boolean }
-  ): Promise<ClientState | undefined>;
-  loadConversationTimelineProjectionContext(
-    conversationId: string,
-    projectionKey: string,
-    chunkId?: string
-  ): Promise<TimelineProjectionContextRecord | undefined>;
-  loadConversationTimelinePage(request: ConversationTimelinePageRequest): Promise<ConversationTimelinePageRecord>;
-  loadConversationTimelineRange(request: {
-    conversationId: string;
-    mode: 'suffix' | 'prefix' | 'between';
-    anchorMessageId?: string;
-    startMessageId?: string;
-    endMessageId?: string;
-    contextBeforeChunks?: number;
-  }): Promise<ClientState | undefined>;
-  truncateConversationTimeline(request: {
-    conversationId: string;
-    anchorMessageId: string;
-    keepAnchor: boolean;
-  }): Promise<{ conversationId: string; removedMessageIds: string[] }>;
   saveClientStateSkeleton(state: ClientState): Promise<void>;
-  saveConversationRenderDetail(conversationId: string, state: ClientState): Promise<void>;
-  saveConversationRunHistory(conversationId: string, state: ClientState, options: { mode: ConversationRunHistorySaveMode }): Promise<void>;
-  loadConversationRunHistoryPage(request: ConversationRunHistoryPageRequest): Promise<ConversationRunHistoryPageRecord>;
-  loadConversationRunDetail(request: ConversationRunDetailRequest): Promise<ConversationRunDetailRecord | undefined>;
-  resolveConversationRunIdForMessage(conversationId: string, messageId: string): Promise<string | undefined>;
   loadConversationHistoryPage(request: ConversationHistoryPageRequest): Promise<ConversationHistoryPageRecord>;
   upsertConversationHistoryEntry(
     entry: import('../../shared/protocol').SidebarConversationHistoryEntry,
     originLink?: import('../../shared/protocol').ConversationOriginLinkRecord
   ): Promise<void>;
   removeConversationHistoryEntry(conversationId: string): Promise<void>;
-  saveMessageSnapshot(conversationId: string, message: import('../../shared/protocol').MessageRecord): Promise<void>;
-  removeMessage(conversationId: string, messageId: string): Promise<void>;
-  saveToolCallSnapshot(conversationId: string, toolCall: ToolCallRecord): Promise<void>;
-  appendToolCallEvent(conversationId: string, event: ToolCallEventRecord): Promise<void>;
   detectSystemGit(): Promise<CheckpointGitStatusRecord>;
   createShadowCheckpoint(request: ShadowCheckpointCreateRequest): Promise<CheckpointRecord>;
   restoreShadowCheckpoint(request: CheckpointRestorePayload): Promise<ShadowCheckpointRestoreResult>;

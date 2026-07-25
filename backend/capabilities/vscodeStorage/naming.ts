@@ -10,6 +10,22 @@ export function sortableNameWithExactIdSuffix(id: string): string {
   return `${timestampForFileName()}-${fileSafeId(id)}`;
 }
 
+/** conversation runtime、timeline 与 compression 领域共享的稳定分片目录名。 */
+export function conversationShardName(id: string): string {
+  const slug = id
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'conversation';
+  return `${slug}-${shortHash(id)}`;
+}
+
+/** conversation settings 使用的稳定文件名片段。 */
+export function conversationSettingsFileName(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_.-]+/g, '_');
+}
+
 function timestampForFileName(date = new Date()): string {
   return date.toISOString().replace(/[-:]/g, '').replace('T', '-').replace('Z', '').replace('.', '-');
 }
