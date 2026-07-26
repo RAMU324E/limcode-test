@@ -7,7 +7,7 @@
   "private": true,
   "repository": {
     "type": "git",
-    "url": "https://github.com/Lianues/limcode2.git"
+    "url": "https://github.com/lurenxing628/limcode2.git"
   },
   "engines": {
     "vscode": "^1.89.0"

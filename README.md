@@ -1,6 +1,10 @@
 # Limcode test
 
-Limcode test 是 LimCode 的独立 Fork：后端使用 TypeScript ECS world，前端使用 Vue Webview，并使用独立的扩展、命令、视图与数据命名空间，可与原版同时安装。
+Limcode test 是基于 [LimCode](https://github.com/Lianues/limcode2) 演进、由 [lurenxing628](https://github.com/lurenxing628) 独立维护的衍生项目。当前仓库独立管理发布与开发历史，并使用独立的扩展、命令、视图及数据命名空间，可与原版同时安装。
+
+- 当前仓库：[lurenxing628/limcode2](https://github.com/lurenxing628/limcode2)
+- 上游来源：[Lianues/limcode2](https://github.com/Lianues/limcode2)
+- 开源许可：[GNU GPL v3](LICENSE)
 
 ## 当前能力
 
