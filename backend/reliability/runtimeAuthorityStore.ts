@@ -638,10 +638,15 @@ function applyScopedMutations(
 } {
   const nextById = new Map([...currentById].map(([id, facts]) => [id, forkFacts(facts)]));
   const mutationsByConversation = new Map<ConversationId, RecordMutation[]>();
+  const interactionRequestOwners = plannedInteractionRequestOwners(currentById, plan.recordMutations);
   for (const mutation of plan.recordMutations) {
     const scopedMutations = mutation.kind === 'remove_many'
       ? splitRemoveManyByOwner(mutation, currentById)
-      : [[mutationOwner(mutation, mutation.kind === 'remove' ? currentById : nextById), mutation] as const];
+      : [[mutationOwner(
+          mutation,
+          mutation.kind === 'remove' ? currentById : nextById,
+          interactionRequestOwners
+        ), mutation] as const];
     for (const [owner, scopedMutation] of scopedMutations) {
       if (!plan.scopes.includes(owner)) throw new Error(`Transition ${plan.transitionId} mutates conversation ${owner} outside its leased scope.`);
       const facts = requireConversationFacts(nextById, owner);
@@ -662,6 +667,68 @@ function forkFacts(facts: DurableConversationFacts): DurableConversationFacts {
   ])) as unknown as DurableConversationFacts;
 }
 
+interface PlannedInteractionOwnerLink {
+  id: string;
+  interactionRequestId: string;
+  conversationId: ConversationId;
+  turnId: string;
+}
+
+/**
+ * InteractionRequest deliberately has no embedded conversationId. Resolve its scope from the
+ * effective owner-link set for the whole transaction so request/link mutation order is irrelevant.
+ */
+function plannedInteractionRequestOwners(
+  currentById: ReadonlyMap<ConversationId, DurableConversationFacts>,
+  mutations: readonly RecordMutation[]
+): Map<string, PlannedInteractionOwnerLink> {
+  const linksById = new Map<string, PlannedInteractionOwnerLink>();
+  for (const [conversationId, facts] of currentById) {
+    for (const link of facts.interactionOwnerLinks) {
+      if (link.conversationId !== conversationId) {
+        throw new Error(`InteractionOwnerLink ${link.id} is stored outside conversation ${link.conversationId}.`);
+      }
+      if (linksById.has(link.id)) throw new Error(`InteractionOwnerLink ${link.id} has duplicate durable identities.`);
+      linksById.set(link.id, {
+        id: link.id,
+        interactionRequestId: link.interactionRequestId,
+        conversationId: link.conversationId,
+        turnId: link.turnId
+      });
+    }
+  }
+
+  for (const mutation of mutations) {
+    if (mutation.family !== 'interactionOwnerLinks') continue;
+    if (mutation.kind === 'remove_many') {
+      for (const id of mutation.ids) linksById.delete(id);
+      continue;
+    }
+    if (mutation.kind === 'remove') {
+      linksById.delete(mutation.id);
+      continue;
+    }
+
+    const record = mutation.record as unknown as Record<string, unknown>;
+    const interactionRequestId = stringField(record, 'interactionRequestId');
+    const conversationId = stringField(record, 'conversationId') as ConversationId | undefined;
+    const turnId = stringField(record, 'turnId');
+    if (!interactionRequestId || !conversationId || !turnId || !currentById.has(conversationId)) {
+      throw new Error(`InteractionOwnerLink ${mutation.id} has no valid conversation ownership.`);
+    }
+    linksById.set(mutation.id, { id: mutation.id, interactionRequestId, conversationId, turnId });
+  }
+
+  const owners = new Map<string, PlannedInteractionOwnerLink>();
+  for (const link of linksById.values()) {
+    if (owners.has(link.interactionRequestId)) {
+      throw new Error(`InteractionRequest ${link.interactionRequestId} has ambiguous transaction-visible owner links.`);
+    }
+    owners.set(link.interactionRequestId, link);
+  }
+  return owners;
+}
+
 function splitRemoveManyByOwner(
   mutation: Extract<RecordMutation, { kind: 'remove_many' }>,
   originalFactsById: ReadonlyMap<ConversationId, DurableConversationFacts>
@@ -678,11 +745,32 @@ function splitRemoveManyByOwner(
     .map(([owner, ids]) => [owner, { ...mutation, ids }] as const);
 }
 
-function mutationOwner(mutation: Exclude<RecordMutation, { kind: 'remove_many' }>, factsById: ReadonlyMap<ConversationId, DurableConversationFacts>): ConversationId {
+function mutationOwner(
+  mutation: Exclude<RecordMutation, { kind: 'remove_many' }>,
+  factsById: ReadonlyMap<ConversationId, DurableConversationFacts>,
+  interactionRequestOwners: ReadonlyMap<string, PlannedInteractionOwnerLink>
+): ConversationId {
   if (mutation.kind === 'remove') return ownerByRecord(mutation.family as DurableRecordFamily, mutation.id, factsById);
   const record = mutation.record as unknown as Record<string, unknown>;
   const family = mutation.family as DurableRecordFamily;
   if (family === 'conversation') return requireConversationId(record.id, mutation);
+  if (family === 'interactionRequests') {
+    const owner = interactionRequestOwners.get(mutation.id);
+    if (!owner) throw new Error(`InteractionRequest ${mutation.id} has no transaction-visible owner link.`);
+    return owner.conversationId;
+  }
+  if (family === 'interactionResponses') {
+    const interactionRequestId = stringField(record, 'interactionRequestId');
+    const ownerTurnId = stringField(record, 'ownerTurnId');
+    const owner = interactionRequestId ? interactionRequestOwners.get(interactionRequestId) : undefined;
+    if (!owner || !ownerTurnId) {
+      throw new Error(`InteractionResponse ${mutation.id} has no transaction-visible owner link.`);
+    }
+    if (owner.turnId !== ownerTurnId) {
+      throw new Error(`InteractionResponse ${mutation.id} owner Turn differs from InteractionOwnerLink ${owner.id}.`);
+    }
+    return owner.conversationId;
+  }
   const direct = stringField(record, 'conversationId');
   if (direct && factsById.has(direct as ConversationId)) return direct as ConversationId;
   if (family === 'answerBridges') {

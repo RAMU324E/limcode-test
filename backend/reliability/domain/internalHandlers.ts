@@ -90,7 +90,12 @@ import {
 import { appendRuntimeCleanupOutbox } from './runtimeCleanup';
 import { runGraphCascadeForPolicy } from './cancellationIntent';
 import { hasRemainingToolWork, scheduledToolOrdinal } from './toolSchedule';
-import { appendBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
+import {
+  appendBoundedInlineToolResult,
+  replacedFinalToolResultLinks,
+  replaceFinalToolResultLink,
+  withoutEmbeddedToolResult
+} from './toolResultArtifacts';
 import { DURABLE_CONVERSATION_RECORD_FAMILIES } from './familyRegistry';
 import {
   interactionOwnerLink,
@@ -718,7 +723,7 @@ export class CompleteCompressionBarrierHandler implements InternalCommandHandler
           status: 'complete',
           methodKind,
           ...(result.methodConfig?.id ? { methodConfigId: result.methodConfig.id } : {}),
-          summaryPreview: compressionPreview(contents),
+          summaryPreview: compressionPreview(result.contents),
           ...(result.settingsSnapshot ? { providerSettingsSnapshot: clone(result.settingsSnapshot) } : {}),
           ...(result.methodConfig ? { compressionConfigSnapshot: clone(result.methodConfig) } : {}),
           updatedAt: payload.completedAt,
@@ -1053,8 +1058,13 @@ export class CompleteToolOperationHandler implements InternalCommandHandler<Json
     const builder = builderFor(view, context, payload.conversationId);
     builder
       .generatedId(payload.resultArtifact.id, payload.resultLink.id)
-      .upsert('toolResultArtifacts', clone(payload.resultArtifact))
-      .upsert('toolCallResultLinks', clone(payload.resultLink));
+      .upsert('toolResultArtifacts', clone(payload.resultArtifact));
+    replaceFinalToolResultLink(
+      builder,
+      view.facts.toolCallResultLinks,
+      clone(payload.resultLink),
+      payload.completedAt
+    );
     const changeResumePayload = payload.outcome === 'awaiting_change_apply'
       ? effectPayloadForOperation(view.facts, payload.operationId)
       : undefined;
@@ -1175,8 +1185,14 @@ export class CompleteToolOperationBatchHandler implements InternalCommandHandler
       completedOperationIds.push(completion.operationId);
       builder
         .generatedId(completion.resultArtifact.id, completion.resultLink.id)
-        .upsert('toolResultArtifacts', clone(completion.resultArtifact))
-        .upsert('toolCallResultLinks', clone(completion.resultLink))
+        .upsert('toolResultArtifacts', clone(completion.resultArtifact));
+      replaceFinalToolResultLink(
+        builder,
+        view.facts.toolCallResultLinks,
+        clone(completion.resultLink),
+        completion.completedAt
+      );
+      builder
         .upsert('toolCalls', projected)
         .upsert('toolExecutions', { ...item.execution, state: completion.outcome === 'failed' ? 'error' : 'complete', rowVersion: item.execution.rowVersion + 1 });
       if (completion.outcome === 'awaiting_change_apply' || completion.outcome === 'awaiting_result_submit') {
@@ -1206,6 +1222,14 @@ export class CompleteToolOperationBatchHandler implements InternalCommandHandler
       operationIds: completedOperationIds
     });
     if (continued) {
+      const projectedLinks = current.reduce<ToolCallResultLinkRecord[]>(
+        (links, item) => replacedFinalToolResultLinks(
+          links,
+          clone(item.payload.resultLink),
+          item.payload.completedAt
+        ),
+        view.facts.toolCallResultLinks.map((link) => clone(link))
+      );
       const projectedFacts: DurableConversationFacts = {
         ...view.facts,
         toolCalls: view.facts.toolCalls.map((tool) => projectedTools.get(tool.id) ?? tool),
@@ -1213,10 +1237,7 @@ export class CompleteToolOperationBatchHandler implements InternalCommandHandler
           ...view.facts.toolResultArtifacts,
           ...current.map((item) => clone(item.payload.resultArtifact))
         ],
-        toolCallResultLinks: [
-          ...view.facts.toolCallResultLinks,
-          ...current.map((item) => clone(item.payload.resultLink))
-        ]
+        toolCallResultLinks: projectedLinks
       };
       const continuation = [...current].sort((left, right) =>
         (left.tool.schedulingOrdinal ?? Number.MAX_SAFE_INTEGER) - (right.tool.schedulingOrdinal ?? Number.MAX_SAFE_INTEGER)

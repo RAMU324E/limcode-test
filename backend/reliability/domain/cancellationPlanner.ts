@@ -22,7 +22,7 @@ import {
   type TerminateRunGraphPlan
 } from './terminateRunGraph';
 import type { ConversationTransitionBuilder } from './transitionBuilder';
-import { appendBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
+import { replaceWithBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
 import type { DurableConversationFacts } from './types';
 
 export interface OwnedSourceToolContinuationIds {
@@ -98,7 +98,7 @@ export function appendSettleOwnedSourceToolCancellation(
     return { settled: false, result };
   }
 
-  const materialized = appendBoundedInlineToolResult(builder, {
+  const materialized = replaceWithBoundedInlineToolResult(builder, facts.toolCallResultLinks, {
     conversationId: input.ownership.sourceConversationId,
     tool,
     status: 'error',

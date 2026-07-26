@@ -83,7 +83,7 @@
     "dev:webview": "vite --host 127.0.0.1 --port 31820 --strictPort",
     "build": "npm run compile && npm run build:webview",
     "typecheck:webview": "vue-tsc -p tsconfig.webview.json --noEmit",
-    "check": "npm run compile && npm run typecheck:webview",
+    "check": "npm run compile && npm run typecheck:webview && node --test tests/*.test.cjs",
     "vscode:prepublish": "npm run build",
     "package:local": "vsce package --allow-missing-repository"
   },

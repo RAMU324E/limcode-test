@@ -10,7 +10,7 @@ import { appendTerminalRun, type RunTerminationSpec } from './runTermination';
 import { releaseExecutionLease } from './executionLease';
 import { collectCompressionBlockDependencyClosure, projectionIdsDependingOnSources } from './modelContextProjection';
 import { appendRuntimeCleanupOutbox } from './runtimeCleanup';
-import { appendBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
+import { replaceWithBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
 
 export interface TerminateRunGraphOptions {
   rootRunIds: readonly RunId[];
@@ -278,7 +278,7 @@ export function appendTerminateRunGraphMutations(
     const tool = facts.toolCalls.find((candidate) => candidate.id === execution.id);
     if (tool && tool.status !== 'success' && tool.status !== 'warning' && tool.status !== 'error') {
       const reasonCode = terminationForOperation(facts, terminationByRun, execution.operationId, plan.rootTermination).reasonCode;
-      appendBoundedInlineToolResult(builder, {
+      replaceWithBoundedInlineToolResult(builder, facts.toolCallResultLinks, {
         conversationId: execution.conversationId,
         tool,
         status: 'error',

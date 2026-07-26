@@ -4,6 +4,14 @@ import {
   TOOL_RESULT_BLOBS_RESOURCE_KEY
 } from '../../shared/conversationReliability';
 import type { ConversationId } from '../../shared/stableIds';
+import {
+  ANSWER_BRIDGE_LINKS_ROOT_DIR,
+  TOOL_CALL_EVENTS_ROOT_DIR,
+  TOOL_CALL_RESULT_LINKS_ROOT_DIR,
+  TOOL_CALLS_ROOT_DIR,
+  TOOL_RESULT_ARTIFACTS_ROOT_DIR,
+  TOOL_RESULT_BLOBS_ROOT_DIR
+} from '../capabilities/vscodeStorage/constants';
 import { conversationShardName } from '../capabilities/vscodeStorage/naming';
 import type { DurableFileSystem } from './fileDurability';
 
@@ -33,7 +41,7 @@ export type ConversationStorageDomain =
 
 export const ATTACHMENT_STORAGE_RESOURCE_KEY = CONVERSATION_ATTACHMENTS_RESOURCE_KEY;
 export const ANSWER_BRIDGE_LINKS_STORAGE_RESOURCE_KEY = ANSWER_BRIDGE_LINKS_RESOURCE_KEY;
-export const ANSWER_BRIDGE_LINKS_ROOT = 'answer-bridge-links';
+export const ANSWER_BRIDGE_LINKS_ROOT = ANSWER_BRIDGE_LINKS_ROOT_DIR;
 
 export type StorageHeadOwner =
   | {
@@ -97,10 +105,10 @@ const RUNTIME_INBOX_DOMAIN_ROOTS = ['runtime-inbox-items', 'runtime-delivery-lin
 const AUTHORITATIVE_INSPECTION_ENTRIES: ReadonlyArray<{ path: string; kind: 'file' | 'directory' }> = [
   { path: 'conversations/details', kind: 'directory' },
   ...AUTHORITATIVE_COMPRESSION_ROOTS.map((root) => ({ path: `${root}/conversations`, kind: 'directory' as const })),
-  { path: 'tool-calls/conversations', kind: 'directory' },
-  { path: 'tool-call-events/conversations', kind: 'directory' },
-  { path: 'tool-result-artifacts/conversations', kind: 'directory' },
-  { path: 'tool-call-result-links/conversations', kind: 'directory' },
+  { path: `${TOOL_CALLS_ROOT_DIR}/conversations`, kind: 'directory' },
+  { path: `${TOOL_CALL_EVENTS_ROOT_DIR}/conversations`, kind: 'directory' },
+  { path: `${TOOL_RESULT_ARTIFACTS_ROOT_DIR}/conversations`, kind: 'directory' },
+  { path: `${TOOL_CALL_RESULT_LINKS_ROOT_DIR}/conversations`, kind: 'directory' },
   { path: 'interactions/conversations', kind: 'directory' },
   { path: 'interaction-owner-links/conversations', kind: 'directory' },
   { path: 'interaction-responses/conversations', kind: 'directory' },
@@ -265,19 +273,19 @@ export function conversationCompressionRootRelativePaths(conversationId: Convers
 }
 
 export function conversationToolCallsRootRelativePath(conversationId: ConversationId): string {
-  return `tool-calls/conversations/${conversationShardName(conversationId)}`;
+  return `${TOOL_CALLS_ROOT_DIR}/conversations/${conversationShardName(conversationId)}`;
 }
 
 export function conversationToolCallEventsRootRelativePath(conversationId: ConversationId): string {
-  return `tool-call-events/conversations/${conversationShardName(conversationId)}`;
+  return `${TOOL_CALL_EVENTS_ROOT_DIR}/conversations/${conversationShardName(conversationId)}`;
 }
 
 export function conversationToolResultArtifactsRootRelativePath(conversationId: ConversationId): string {
-  return `tool-result-artifacts/conversations/${conversationShardName(conversationId)}`;
+  return `${TOOL_RESULT_ARTIFACTS_ROOT_DIR}/conversations/${conversationShardName(conversationId)}`;
 }
 
 export function conversationToolCallResultLinksRootRelativePath(conversationId: ConversationId): string {
-  return `tool-call-result-links/conversations/${conversationShardName(conversationId)}`;
+  return `${TOOL_CALL_RESULT_LINKS_ROOT_DIR}/conversations/${conversationShardName(conversationId)}`;
 }
 
 export function conversationInteractionsRootRelativePath(conversationId: ConversationId): string {
@@ -420,7 +428,7 @@ function staticNamespaceRules(): NamespaceRule[] {
     exactRule('attachment-index', 'authoritative-mutable', 'attachments/index.json', attachmentOwner),
     prefixRule('attachment-records', 'authoritative-mutable', attachmentRecordsRootRelativePath(), attachmentOwner),
     prefixRule('attachment-blobs', 'immutable-content', 'attachments/blobs'),
-    prefixRule('tool-result-blobs', 'immutable-content', 'tool-result-blobs/sha256'),
+    prefixRule('tool-result-blobs', 'immutable-content', `${TOOL_RESULT_BLOBS_ROOT_DIR}/sha256`),
     prefixRule('attachment-opened-files', 'derived-projection', 'attachments/opened'),
     exactRule('answer-bridge-link-index', 'authoritative-mutable', `${ANSWER_BRIDGE_LINKS_ROOT}/index.json`, answerBridgeOwner),
     prefixRule('answer-bridge-link-records', 'authoritative-mutable', answerBridgeLinksRecordsRootRelativePath(), answerBridgeOwner),

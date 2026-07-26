@@ -116,10 +116,10 @@ export type ModelContextIrItem =
       contents: readonly MessageContent[];
     }
   | {
+      /** Structured control-plane boundary consumed by the normalizer; never serialized as prompt text. */
       kind: 'interruption_boundary';
       runId: string;
       termination: RunTerminationRecord;
-      content: MessageContent;
     }
   | {
       kind: 'runtime_snapshot';
@@ -145,6 +145,7 @@ export interface ModelContextDiagnostic {
     | 'foreign_active_run_input_excluded'
     | 'internal_message_target_mismatch'
     | 'internal_message_excluded'
+    | 'terminated_run_without_tool_facts_excluded'
     | 'source_boundary_missing'
     | 'compression_variant_incompatible'
     | 'orphan_run_termination'

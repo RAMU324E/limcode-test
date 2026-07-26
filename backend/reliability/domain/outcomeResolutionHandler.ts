@@ -30,7 +30,7 @@ import type { DurableConversationFacts, ResolveUnknownOutcomePayload } from './t
 import { copyOperationOwner, requireRunOperationOwner } from './operationOwner';
 import { appendTerminalRun } from './runTermination';
 import { releaseExecutionLease } from './executionLease';
-import { appendBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
+import { replaceWithBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
 
 interface ResolutionIds extends Record<string, string> {
   operationId: OperationId;
@@ -179,7 +179,7 @@ export class ResolveUnknownOutcomeCommandHandler implements ConversationCommandH
     const execution = facts.toolExecutions.find((candidate) => candidate.operationId === operation.id);
     const tool = execution ? unique(facts.toolCalls, execution.id, 'ToolCall') : undefined;
     if (!execution || !tool) throw new Error('Verified completion currently requires a Tool Operation owner.');
-    const materialized = appendBoundedInlineToolResult(builder, {
+    const materialized = replaceWithBoundedInlineToolResult(builder, facts.toolCallResultLinks, {
       conversationId: operation.conversationId,
       tool,
       status: 'success',

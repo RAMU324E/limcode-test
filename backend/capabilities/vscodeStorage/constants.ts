@@ -4,12 +4,12 @@ export const STORAGE_VERSION = 1;
  * data epoch 不匹配时整根目录拒绝加载，不做旧数据兜底或隐式迁移。
  */
 /**
- * The current data format establishes independent Turn, TurnIntent, ExecutionLease, Authority,
- * RuntimeInbox and Interaction domains on top of transaction-first Conversation storage. Earlier
- * data roots are reset as one development-format cutover; no schema migration, dual writer, or
- * legacy import exists.
+ * The current data format keeps RunTermination as structured projection provenance, never as
+ * model-visible marker text, and separates provider compression output from frozen result addenda.
+ * Earlier data roots may contain incompatible CompressionVariant contents and are archived/reset as
+ * one development-format cutover; no schema migration, dual writer, or legacy import exists.
  */
-export const DATA_FORMAT_EPOCH = 7;
+export const DATA_FORMAT_EPOCH = 8;
 export const DATA_ROOT_MARKER_FILE = '.limcode-data-root.json';
 export const DATA_ROOT_RESET_PENDING_FILE = '.limcode-data-reset-pending.json';
 export const DATA_ROOT_BACKUPS_DIR = '.limcode-data-backups';
@@ -67,6 +67,12 @@ export const COMPRESSION_BLOCKS_ROOT_DIR = 'compression-blocks';
 export const COMPRESSION_BLOCK_SOURCE_LINKS_ROOT_DIR = 'compression-block-source-links';
 export const COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR = 'compression-context-variants';
 export const COMPRESSION_BLOCK_LLM_INVOCATION_LINKS_ROOT_DIR = 'compression-block-llm-invocation-links';
+export const TOOL_CALLS_ROOT_DIR = 'tool-calls';
+export const TOOL_CALL_EVENTS_ROOT_DIR = 'tool-call-events';
+export const TOOL_RESULT_ARTIFACTS_ROOT_DIR = 'tool-result-artifacts';
+export const TOOL_CALL_RESULT_LINKS_ROOT_DIR = 'tool-call-result-links';
+export const TOOL_RESULT_BLOBS_ROOT_DIR = 'tool-result-blobs';
+export const ANSWER_BRIDGE_LINKS_ROOT_DIR = 'answer-bridge-links';
 export const TURNS_ROOT_DIR = 'turns';
 export const CHILD_TURN_LINKS_ROOT_DIR = 'child-turn-links';
 export const MESSAGE_TURN_LINKS_ROOT_DIR = 'message-turn-links';
@@ -132,6 +138,12 @@ export const REGISTERED_STORAGE_ROOT_DIRS = [
   COMPRESSION_BLOCK_SOURCE_LINKS_ROOT_DIR,
   COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR,
   COMPRESSION_BLOCK_LLM_INVOCATION_LINKS_ROOT_DIR,
+  TOOL_CALLS_ROOT_DIR,
+  TOOL_CALL_EVENTS_ROOT_DIR,
+  TOOL_RESULT_ARTIFACTS_ROOT_DIR,
+  TOOL_CALL_RESULT_LINKS_ROOT_DIR,
+  TOOL_RESULT_BLOBS_ROOT_DIR,
+  ANSWER_BRIDGE_LINKS_ROOT_DIR,
   TURNS_ROOT_DIR,
   CHILD_TURN_LINKS_ROOT_DIR,
   MESSAGE_TURN_LINKS_ROOT_DIR,

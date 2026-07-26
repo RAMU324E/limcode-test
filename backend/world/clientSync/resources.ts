@@ -40,6 +40,14 @@ export interface ClientSyncFastPatchBatch {
   readonly transientStreamEpoch?: TransientStreamEpoch;
 }
 
+export interface CommittedConversationControlStates {
+  /**
+   * 已加载 conversation 的可靠控制面 ClientState slice。每个表仍保存独立 record/link；
+   * 该资源只是 durable facts 到 ClientSync contributor 的进程内投影源。
+   */
+  readonly byConversationId: Readonly<Record<string, ClientState>>;
+}
+
 export interface ClientSyncFastPatchState {
   /** 已由领域 system 精确计算好的轻量 patch，ClientSyncSystem 只负责校验、编号和投递。 */
   readonly patches: readonly ClientSyncFastPatchBatch[];
@@ -53,5 +61,6 @@ export const ClientStateContributorsKey = defineResource<ClientStateContributorR
 export const ClientSyncStateKey = defineResource<ClientSyncState>('ClientSyncState');
 export const ClientSyncFastPatchStateKey = defineResource<ClientSyncFastPatchState>('ClientSyncFastPatchState');
 export const ClientStateDirtyConversationIdsKey = defineResource<ClientStateDirtyConversationIdsState>('ClientStateDirtyConversationIds');
+export const CommittedConversationControlStatesKey = defineResource<CommittedConversationControlStates>('CommittedConversationControlStates');
 /** Durable HEADs whose facts have been installed into the loaded World projection. */
 export const CommittedConversationHeadsKey = defineResource<Readonly<Record<string, CommittedConversationHead>>>('CommittedConversationHeads');

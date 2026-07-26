@@ -1685,6 +1685,9 @@ export interface ToolCallRecord {
   updatedAt: number;
 }
 
+export const TOOL_CALL_PREVIEW_MAX_CHARS = 64 * 1024;
+export const TOOL_CALL_PREVIEW_HEAD_CHARS = 8 * 1024;
+
 /** Process-local preview of one function call while its JSON arguments are still arriving. */
 export interface ToolCallPreviewRecord {
   id: string;

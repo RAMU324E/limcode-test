@@ -285,7 +285,7 @@ export class CompleteStandaloneCompressionHandler implements InternalCommandHand
           status: 'complete',
           methodKind,
           ...(result.methodConfig?.id ? { methodConfigId: result.methodConfig.id } : {}),
-          summaryPreview: compressionPreview(contents),
+          summaryPreview: compressionPreview(result.contents),
           ...(result.settingsSnapshot ? { providerSettingsSnapshot: clone(result.settingsSnapshot) } : {}),
           ...(result.methodConfig ? { compressionConfigSnapshot: clone(result.methodConfig) } : {}),
           updatedAt: payload.completedAt,

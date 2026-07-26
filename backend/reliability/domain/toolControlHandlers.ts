@@ -43,7 +43,7 @@ import { interactionRequestForTool } from './interactionState';
 import { appendCancelOwnedChildWork, appendSettleOwnedSourceToolCancellation } from './cancellationPlanner';
 import type { DurableConversationFacts } from './types';
 import { appendRuntimeCleanupOutbox } from './runtimeCleanup';
-import { appendBoundedInlineToolResult, demoteFinalToolResultLinks, withoutEmbeddedToolResult } from './toolResultArtifacts';
+import { replaceWithBoundedInlineToolResult, withoutEmbeddedToolResult } from './toolResultArtifacts';
 
 interface ContinuationIds {
   toolCallEventId: ToolCallEventId;
@@ -179,8 +179,7 @@ export class ApplyToolChangeHandler implements InternalCommandHandler<JsonValue,
     if (payload.decision === 'reject') {
       const reason = payload.reason?.trim() || defaultRejection('tool_change_apply');
       const result = asJson({ ok: false, denied: true, reason });
-      demoteFinalToolResultLinks(builder, view.facts.toolCallResultLinks, tool.id, payload.completedAt);
-      const materialized = appendBoundedInlineToolResult(builder, {
+      const materialized = replaceWithBoundedInlineToolResult(builder, view.facts.toolCallResultLinks, {
         conversationId: payload.conversationId,
         tool,
         status: 'error',
@@ -289,9 +288,8 @@ export class SettleWaitingToolHandler implements InternalCommandHandler<JsonValu
       : undefined;
     if (accepted && !acceptedArtifact) throw new Error(`ToolCall ${tool.id} result review has no final Artifact.`);
     const builder = builderFor(view, context, payload.conversationId);
-    if (result !== undefined) demoteFinalToolResultLinks(builder, view.facts.toolCallResultLinks, tool.id, payload.completedAt);
     const rejectedResult = result !== undefined
-      ? appendBoundedInlineToolResult(builder, {
+      ? replaceWithBoundedInlineToolResult(builder, view.facts.toolCallResultLinks, {
           conversationId: payload.conversationId,
           tool,
           status,
@@ -342,7 +340,7 @@ export class CancelToolOperationHandler implements InternalCommandHandler<JsonVa
     if (operation.state === 'pending' || operation.state === 'running') {
       const result = asJson({ ok: false, interrupted: true, reason });
       const builder = builderFor(view, context, payload.conversationId);
-      const materialized = appendBoundedInlineToolResult(builder, {
+      const materialized = replaceWithBoundedInlineToolResult(builder, view.facts.toolCallResultLinks, {
         conversationId: payload.conversationId,
         tool,
         status: 'error',

@@ -287,7 +287,7 @@ export function inspectConversationIntegrity(facts: DurableConversationFacts): R
     return artifact ? [[link.toolCallId, artifact.modelResponse] as const] : [];
   }));
   const normalized = normalizeToolTurnSequence({
-    entries: messages.map((message) => ({ messageId: message.id, content: message.content })),
+    entries: messages.map((message) => ({ kind: 'content' as const, messageId: message.id, content: message.content })),
     toolCalls: facts.toolCalls,
     modelResponsesByToolCallId,
     runIdsByMessage,

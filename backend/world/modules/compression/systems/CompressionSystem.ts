@@ -430,7 +430,7 @@ function completeCompressionBlock(world: WorldReader, cmd: CommandSink, payload:
   const methodKind = payload.result.methodConfig?.kind ?? block.methodKind;
   const compactedContents = applyCompressionResultAddenda(payload.result.contents, identity.projection.resultAddenda);
   const tokenCountAfter = estimateModelContextTokens(compactedContents);
-  const summaryPreview = previewFromContents(compactedContents) || block.summaryPreview;
+  const summaryPreview = previewFromContents(payload.result.contents) || block.summaryPreview;
   cmd.add(blockEntity, CompressionBlock, {
     ...block,
     status: 'complete',

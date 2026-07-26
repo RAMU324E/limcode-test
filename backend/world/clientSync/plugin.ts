@@ -1,13 +1,17 @@
 import type { WorldPlugin } from '../plugin';
+import { committedConversationControlClientSyncContributor } from './committedConversationControlState';
 import { ClientStateContributorRegistry } from './contributors';
 import { emptyDirtyConversationState } from './dirtyConversations';
-import { ClientStateContributorsKey, ClientStateDirtyConversationIdsKey, ClientSyncFastPatchStateKey, ClientSyncStateKey, CommittedConversationHeadsKey } from './resources';
+import { ClientStateContributorsKey, ClientStateDirtyConversationIdsKey, ClientSyncFastPatchStateKey, ClientSyncStateKey, CommittedConversationControlStatesKey, CommittedConversationHeadsKey } from './resources';
 
 export function clientSyncPlugin(): WorldPlugin {
   return {
     name: 'clientSync',
     install(ctx) {
-      ctx.world.setResource(ClientStateContributorsKey, new ClientStateContributorRegistry());
+      const contributors = new ClientStateContributorRegistry();
+      contributors.register(committedConversationControlClientSyncContributor);
+      ctx.world.setResource(ClientStateContributorsKey, contributors);
+      ctx.world.setResource(CommittedConversationControlStatesKey, { byConversationId: {} });
       ctx.world.setResource(ClientSyncStateKey, {
         lastState: null,
         projectionClock: '',

@@ -502,7 +502,16 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
   const messageToolCalls = state.toolCalls.filter((toolCall) => messageIds.has(toolCall.messageId));
   const messageToolCallIds = new Set(messageToolCalls.map((toolCall) => toolCall.id));
   const runIds = collectConversationRunIds(state, conversationId, messageIds, messageToolCallIds);
+  const turns = state.turns.filter((turn) => turn.conversationId === conversationId);
+  for (const turn of turns) runIds.add(turn.id);
+  const runPlanProposalLinks = state.runPlanProposalLinks.filter((link) => runIds.has(link.runId));
+  const planProposalIds = new Set(runPlanProposalLinks.map((link) => link.planProposalId));
+  const turnIntents = state.turnIntents.filter((intent) => intent.conversationId === conversationId);
+  const turnIntentIds = new Set(turnIntents.map((intent) => intent.id));
+  const interactionOwnerLinks = state.interactionOwnerLinks.filter((link) => link.conversationId === conversationId);
+  const interactionRequestIds = new Set(interactionOwnerLinks.map((link) => link.interactionRequestId));
   const toolCallIds = new Set(messageToolCallIds);
+  for (const owner of interactionOwnerLinks) if (owner.sourceToolCallId) toolCallIds.add(owner.sourceToolCallId);
   // 父对话的 Agent 面板需要解释关联子 Run 的 waiting_tool；仅补入这些 Run 当前仍活跃的工具详情。
   for (const toolCallId of collectRunDetailToolCallIds(state, runIds)) toolCallIds.add(toolCallId);
   const toolCalls = state.toolCalls.filter((toolCall) => toolCallIds.has(toolCall.id));
@@ -531,6 +540,15 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
   });
   const compressionBlocks = state.compressionBlocks.filter((block) => block.conversationId === conversationId && compressionBlockInMessageWindow(block, messages));
   const compressionBlockIds = new Set(compressionBlocks.map((block) => block.id));
+  const modelContextProjections = state.modelContextProjections.filter((projection) => projection.conversationId === conversationId);
+  const modelContextProjectionIds = new Set(modelContextProjections.map((projection) => projection.id));
+  const modelContextProjectionSourceLinks = state.modelContextProjectionSourceLinks.filter((link) =>
+    link.conversationId === conversationId && modelContextProjectionIds.has(link.projectionId)
+  );
+  const requestModelContextProjectionLinks = state.requestModelContextProjectionLinks.filter((link) => modelContextProjectionIds.has(link.projectionId));
+  const compressionModelContextProjectionLinks = state.compressionModelContextProjectionLinks.filter((link) =>
+    compressionBlockIds.has(link.blockId) && modelContextProjectionIds.has(link.projectionId)
+  );
   const compressionVariantIds = new Set(state.runCompressionBlockLinks.filter((link) => compressionBlockIds.has(link.blockId)).map((link) => link.variantId).filter((id): id is string => !!id));
   const compressionBlockLlmInvocationLinks = state.compressionBlockLlmInvocationLinks.filter((link) => compressionBlockIds.has(link.blockId));
   const invocationIds = new Set(compressionBlockLlmInvocationLinks.map((link) => link.invocationId));
@@ -557,9 +575,25 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
     checkpoints,
     checkpointTimelineAnchors,
     conversationWorkflowSelections,
+    planProposals: state.planProposals.filter((proposal) => planProposalIds.has(proposal.id)),
+    runPlanProposalLinks,
+    turns,
+    turnIntents,
+    turnIntentRevisions: state.turnIntentRevisions.filter((revision) => turnIntentIds.has(revision.turnIntentId)),
+    pendingTurnInputs: state.pendingTurnInputs.filter((input) => input.conversationId === conversationId),
+    executionLeases: state.executionLeases.filter((lease) => lease.conversationId === conversationId),
+    authoritySnapshots: state.authoritySnapshots.filter((snapshot) => snapshot.conversationId === conversationId),
+    interactionRequests: state.interactionRequests.filter((request) => interactionRequestIds.has(request.id)),
+    interactionOwnerLinks,
+    interactionResponses: state.interactionResponses.filter((response) => interactionRequestIds.has(response.interactionRequestId)),
+    runtimeDeliveryLinks: state.runtimeDeliveryLinks.filter((link) => link.destinationConversationId === conversationId),
     messages,
     messageRevisions: state.messageRevisions.filter((revision) => messageIds.has(revision.messageId)),
     messageCurrentRevisionLinks: state.messageCurrentRevisionLinks.filter((link) => messageIds.has(link.messageId)),
+    modelContextProjections,
+    modelContextProjectionSourceLinks,
+    requestModelContextProjectionLinks,
+    compressionModelContextProjectionLinks,
     compressionBlocks,
     compressionBlockSourceLinks: state.compressionBlockSourceLinks.filter((link) => compressionBlockIds.has(link.blockId)),
     compressionContextVariants: state.compressionContextVariants.filter((variant) => compressionBlockIds.has(variant.blockId) || compressionVariantIds.has(variant.id)),
@@ -575,6 +609,7 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
     toolCallResultLinks,
     toolResultArtifacts: state.toolResultArtifacts.filter((artifact) => toolResultArtifactIds.has(artifact.id)),
     agentRuns: state.agentRuns.filter((run) => runIds.has(run.id)),
+    runTerminations: state.runTerminations.filter((termination) => runIds.has(termination.runId)),
     agentRunSourceLinks: state.agentRunSourceLinks.filter((link) => runIds.has(link.runId) || (link.sourceRunId !== undefined && runIds.has(link.sourceRunId))),
     agentRunTargetLinks: state.agentRunTargetLinks.filter((link) => runIds.has(link.runId)),
     messageTurnLinks: state.messageTurnLinks.filter((link) => runIds.has(link.turnId) || messageIds.has(link.messageId)),
@@ -596,7 +631,7 @@ function conversationClientState(state: ClientState, conversationId: string): Cl
     conversationRuntimeContextSnapshotLinks,
     runRuntimeContextSnapshotLinks,
     conversationWorkEnvironmentLinks,
-    runWorkEnvironmentLinks
+    runWorkEnvironmentLinks,
   };
 }
 

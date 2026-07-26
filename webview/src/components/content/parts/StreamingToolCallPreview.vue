@@ -4,6 +4,7 @@ import { IconBraces, IconPencil, IconTerminal2, IconWriting } from '@tabler/icon
 import type { ToolCallPreviewRecord } from '@shared/protocol';
 import { toolCallPreviewPresentation } from '@shared/toolCallPreview';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import TextPartView from './TextPartView.vue';
 
 const props = defineProps<{
   preview: ToolCallPreviewRecord;
@@ -17,7 +18,7 @@ let frameTimer: number | undefined;
 
 const presentation = computed(() => toolCallPreviewPresentation(framedPreview.value));
 const icon = computed(() => {
-  if (presentation.value.kind === 'write') return IconWriting;
+  if (presentation.value.kind === 'write' || presentation.value.kind === 'plan') return IconWriting;
   if (presentation.value.kind === 'edit') return IconPencil;
   if (presentation.value.kind === 'command') return IconTerminal2;
   return IconBraces;
@@ -60,13 +61,17 @@ function flushPreviewFrame(): void {
     <div class="tool-preview-detail">{{ presentation.detail }}</div>
     <div v-if="presentation.previewText" class="tool-preview-code-shell">
       <div ref="previewScroller" class="tool-preview-code-scroll">
-        <pre><code>{{ presentation.previewText }}</code><span class="tool-preview-caret" aria-hidden="true"></span></pre>
+        <TextPartView
+          v-if="presentation.renderMode === 'markdown'"
+          class="tool-preview-markdown"
+          :text="presentation.previewText"
+          streaming
+          markdown
+          :show-streaming-indicator="false"
+        />
+        <pre v-else><code>{{ presentation.previewText }}</code><span class="tool-preview-caret" aria-hidden="true"></span></pre>
       </div>
-      <AdvancedScrollbar
-        :scroller="previewScroller"
-        :refresh-key="presentation.previewText"
-        variant="minimal"
-      />
+      <AdvancedScrollbar :scroller="previewScroller" variant="minimal" />
     </div>
   </section>
 </template>
@@ -161,15 +166,16 @@ function flushPreviewFrame(): void {
 
 .tool-preview-code-scroll {
   max-height: 168px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   scrollbar-width: none;
 }
 
 .tool-preview-code-scroll::-webkit-scrollbar { display: none; }
 
 .tool-preview-code-scroll pre {
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
+  min-width: 0;
   margin: 0;
   padding: var(--space-2) var(--space-3);
   box-sizing: border-box;
@@ -177,7 +183,18 @@ function flushPreviewFrame(): void {
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: var(--vscode-editor-font-size, 12px);
   line-height: 1.5;
-  white-space: pre;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-preview-markdown {
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  box-sizing: border-box;
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .tool-preview-caret {

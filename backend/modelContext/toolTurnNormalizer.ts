@@ -2,7 +2,6 @@ import {
   TERMINAL_TOOL_CALL_STATUSES,
   isFunctionCallPart,
   isFunctionResponsePart,
-  isTextPart,
   type ContentPart,
   type FunctionCallPart,
   type FunctionResponsePart,
@@ -13,10 +12,17 @@ import {
 import type { JsonValue } from '../../shared/conversationReliability';
 import type { ModelContextDiagnostic } from './types';
 
-export interface ToolSequenceEntry {
-  content: MessageContent;
-  messageId?: string;
-}
+export type ToolSequenceEntry =
+  | {
+      kind: 'content';
+      content: MessageContent;
+      messageId?: string;
+    }
+  | {
+      /** Internal control-plane fact used only to close calls owned by this terminated Run. */
+      kind: 'termination';
+      termination: RunTerminationRecord;
+    };
 
 export interface ToolTurnNormalizerInput {
   entries: readonly ToolSequenceEntry[];
@@ -54,10 +60,14 @@ export function normalizeToolTurnSequence(input: ToolTurnNormalizerInput): ToolT
   const contents: MessageContent[] = [];
 
   for (const entry of input.entries) {
-    if (isInterruptionBoundary(entry.content)) {
-      const termination = boundaryTermination(entry.content, input.terminationsByRun);
-      if (termination) contents.push(...closeRunCalls(pending, termination, diagnostics, referencedToolCallIds, input.modelResponsesByToolCallId));
-      contents.push(clone(entry.content));
+    if (entry.kind === 'termination') {
+      contents.push(...closeRunCalls(
+        pending,
+        entry.termination,
+        diagnostics,
+        referencedToolCallIds,
+        input.modelResponsesByToolCallId
+      ));
       continue;
     }
 
@@ -257,8 +267,9 @@ function interruptedResponse(call: PendingCall, termination: RunTerminationRecor
       response: {
         ok: false,
         interrupted: true,
+        outcomeUnknown: true,
         reasonCode: termination.reasonCode,
-        message: 'Tool execution was interrupted before a terminal result was committed.'
+        message: 'Tool execution ended without a committed terminal result. Verify current state before retrying any side effect.'
       }
     }
   };
@@ -319,19 +330,6 @@ function ownerRunForMessage(
 ): string | undefined {
   const terminated = (runIdsByMessage.get(messageId) ?? []).filter((runId) => terminationsByRun.has(runId));
   return terminated.length === 1 ? terminated[0] : undefined;
-}
-
-function isInterruptionBoundary(content: MessageContent): boolean {
-  return content.parts.some((part) => isTextPart(part) && part.text.includes('<turn_aborted '));
-}
-
-function boundaryTermination(
-  content: MessageContent,
-  terminationsByRun: ReadonlyMap<string, RunTerminationRecord>
-): RunTerminationRecord | undefined {
-  const text = content.parts.filter(isTextPart).map((part) => part.text).join('\n');
-  const runId = /<turn_aborted run_id="([^"]+)"/.exec(text)?.[1];
-  return runId ? terminationsByRun.get(runId) : undefined;
 }
 
 function callKey(part: FunctionCallPart): string {

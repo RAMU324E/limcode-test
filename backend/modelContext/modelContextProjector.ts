@@ -47,6 +47,8 @@ interface ProjectionIndexes {
   terminationsByRun: Map<string, RunTerminationRecord>;
   messageLinks: Map<string, ModelContextFactView['messageTurnLinks'][number][]>;
   toolsByMessage: Map<string, ModelContextFactView['toolCalls'][number][]>;
+  /** Terminated Runs with at least one durable ToolCall need their tool exchange retained. */
+  toolRunIds: Set<string>;
   modelResponsesByToolCallId: Map<string, JsonValue>;
 }
 
@@ -393,13 +395,18 @@ function buildIndexes(facts: ModelContextFactView, diagnostics: ModelContextDiag
     tools.push(tool);
     toolsByMessage.set(tool.messageId, tools);
   }
+  const toolRunIds = new Set<string>();
+  for (const [messageId, tools] of toolsByMessage) {
+    if (tools.length === 0) continue;
+    for (const link of messageLinks.get(messageId) ?? []) toolRunIds.add(link.turnId);
+  }
   const modelResponsesByToolCallId = toolModelResponses(facts);
   for (const tools of toolsByMessage.values()) {
     tools.sort((left, right) => (left.schedulingOrdinal ?? Number.MAX_SAFE_INTEGER) - (right.schedulingOrdinal ?? Number.MAX_SAFE_INTEGER)
       || left.createdAt - right.createdAt
       || left.id.localeCompare(right.id));
   }
-  return { messages, revisions, runs, terminationsByRun, messageLinks, toolsByMessage, modelResponsesByToolCallId };
+  return { messages, revisions, runs, terminationsByRun, messageLinks, toolsByMessage, toolRunIds, modelResponsesByToolCallId };
 }
 
 function appendRuntimeSnapshots(
@@ -506,6 +513,7 @@ function isEligibleTurnMessage(
   runScoped: boolean,
   diagnostics: ModelContextDiagnostic[]
 ): boolean {
+  if (excludeTerminatedRunWithoutToolFacts(indexes, message, diagnostics)) return false;
   if (isInternalMessage(message)) {
     const attachedToCurrentRun = (indexes.messageLinks.get(message.id) ?? [])
       .some((link) => link.turnId === purpose.turn.runId && link.role === 'notification');
@@ -555,6 +563,7 @@ function isEligibleCompressionMessage(
   mode: 'fresh' | 'same_run_resume' | 'dry_run' | 'auto' | 'manual',
   diagnostics: ModelContextDiagnostic[]
 ): boolean {
+  if (excludeTerminatedRunWithoutToolFacts(indexes, message, diagnostics)) return false;
   if (isInternalMessage(message)) {
     diagnostics.push({ code: 'internal_message_excluded', severity: 'info', message: `Internal Message ${message.id} was excluded from compression.`, sourceId: message.id });
     return false;
@@ -568,6 +577,31 @@ function isEligibleCompressionMessage(
     return false;
   }
   return !message.content.parts.every(isProviderContextPart) || message.status === 'partial';
+}
+
+/**
+ * A terminated Run without a durable ToolCall has no model-visible fact worth replaying. Its input
+ * and partial model body form one cancelled/failed empty task and are excluded as a unit. Runs with
+ * ToolCall facts are retained so the normalizer can preserve committed results or close unresolved
+ * calls with a structured interrupted response.
+ */
+function excludeTerminatedRunWithoutToolFacts(
+  indexes: ProjectionIndexes,
+  message: MessageRecord,
+  diagnostics: ModelContextDiagnostic[]
+): boolean {
+  const excludedRunId = (indexes.messageLinks.get(message.id) ?? []).find((link) => {
+    if (!indexes.terminationsByRun.has(link.turnId) || indexes.toolRunIds.has(link.turnId)) return false;
+    return link.role === 'input' || (link.role === 'model' && message.status === 'partial');
+  })?.turnId;
+  if (!excludedRunId) return false;
+  diagnostics.push({
+    code: 'terminated_run_without_tool_facts_excluded',
+    severity: 'info',
+    message: `Message ${message.id} from terminated Run ${excludedRunId} was excluded because the Run has no durable ToolCall facts.`,
+    sourceId: message.id
+  });
+  return true;
 }
 
 function isForeignActiveRunInput(
@@ -753,17 +787,8 @@ function materializeSelections(
       if (lastIndex !== index || !modelSeenByTerminatedRun.has(runId)) continue;
       const termination = indexes.terminationsByRun.get(runId);
       if (!termination) continue;
-      const content = interruptionBoundaryContent(termination);
-      items.push({ kind: 'interruption_boundary', runId, termination, content });
-      contents.push(content);
-      sources.push({
-        kind: 'runTermination',
-        id: `runTermination:${termination.id}`,
-        sourceConversationId: sourceConversationIdForRun(facts, runId),
-        runId,
-        terminationId: termination.id,
-        fingerprint: runTerminationSourceFingerprint(termination)
-      });
+      items.push({ kind: 'interruption_boundary', runId, termination });
+      sources.push(runTerminationSource(facts, termination));
     }
   });
   return { items, contents, sources };
@@ -985,16 +1010,6 @@ function toolFactsOnlyContent(indexes: ProjectionIndexes, messageId: string): Me
   return { role: 'model', parts };
 }
 
-function interruptionBoundaryContent(termination: RunTerminationRecord): MessageContent {
-  const text = [
-    `<turn_aborted run_id="${termination.runId}" actor="${termination.actor}" reason="${termination.reasonCode}">`,
-    'The prior assistant turn ended before completion. Do not continue or repeat unfinished text.',
-    'Treat completed tool results in the transcript as durable facts; unresolved calls are interrupted.',
-    '</turn_aborted>'
-  ].join('\n');
-  return textContent(text);
-}
-
 function syntheticTranscriptContent(title: string, selections: readonly ModelContextMessageSelection[]): MessageContent | undefined {
   if (selections.length === 0) return undefined;
   const body = selections.map((selection) => renderMessageContent(selection.role, selection.messageId, selection.content)).filter(Boolean).join('\n\n');
@@ -1060,6 +1075,17 @@ function toolSource(indexes: ProjectionIndexes, tool: ModelContextFactView['tool
   };
 }
 
+function runTerminationSource(facts: ModelContextFactView, termination: RunTerminationRecord): ModelContextSourceRef {
+  return {
+    kind: 'runTermination',
+    id: `runTermination:${termination.id}`,
+    sourceConversationId: sourceConversationIdForRun(facts, termination.runId),
+    runId: termination.runId,
+    terminationId: termination.id,
+    fingerprint: runTerminationSourceFingerprint(termination)
+  };
+}
+
 function sourceConversationIdForRun(facts: ModelContextFactView, runId: string): string {
   const run = facts.runs.find((candidate) => candidate.id === runId);
   if (!run) throw new Error(`Cannot identify source conversation for Run ${runId}.`);
@@ -1114,19 +1140,32 @@ function toolModelResponses(facts: ModelContextFactView): Map<string, JsonValue>
   return result;
 }
 
-function toolSequenceEntries(items: readonly ModelContextIrItem[]): Array<{ content: MessageContent; messageId?: string }> {
-  return items.flatMap((item) => {
+function toolSequenceEntries(items: readonly ModelContextIrItem[]): Array<
+  | { kind: 'content'; content: MessageContent; messageId?: string }
+  | { kind: 'termination'; termination: RunTerminationRecord }
+> {
+  const entries: Array<
+    | { kind: 'content'; content: MessageContent; messageId?: string }
+    | { kind: 'termination'; termination: RunTerminationRecord }
+  > = [];
+  for (const item of items) {
     switch (item.kind) {
       case 'message':
-        return [{ content: clone(item.selection.content), messageId: item.selection.messageId }];
+        entries.push({ kind: 'content', content: clone(item.selection.content), messageId: item.selection.messageId });
+        break;
       case 'compression_variant':
-        return item.contents.map((content) => ({ content: clone(content) }));
+        entries.push(...item.contents.map((content) => ({ kind: 'content' as const, content: clone(content) })));
+        break;
       case 'interruption_boundary':
+        entries.push({ kind: 'termination', termination: clone(item.termination) });
+        break;
       case 'runtime_snapshot':
       case 'synthetic_transcript':
-        return [{ content: clone(item.content) }];
+        entries.push({ kind: 'content', content: clone(item.content) });
+        break;
     }
-  });
+  }
+  return entries;
 }
 
 function dedupeSources(sources: readonly ModelContextSourceRef[]): ModelContextSourceRef[] {

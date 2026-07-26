@@ -13,6 +13,7 @@ import {
   type ToolCallRecord,
   type ToolCallStatus
 } from '@shared/protocol';
+import { compressionProviderContents } from '@shared/compressionPresentation';
 import { isInternalMessage } from '@shared/messagePresentation';
 import { useRunHistoryStore } from '@webview/stores/useRunHistoryStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
@@ -41,7 +42,18 @@ const activeCompressionVariants = computed(() => {
   return block ? clientState.compressionContextVariants.filter((variant) => variant.blockId === block.id) : [];
 });
 const activeCompressionSummaryVariant = computed(() => activeCompressionVariants.value.find((variant) => variant.kind === 'provider_neutral_summary') ?? activeCompressionVariants.value[0]);
-const activeCompressionSummaryText = computed(() => activeCompressionSummaryVariant.value?.contents.map(visibleContentText).filter(Boolean).join('\n\n').trim() ?? '');
+const activeCompressionProviderContents = computed(() => {
+  const block = activeCompressionBlock.value;
+  const variant = activeCompressionSummaryVariant.value;
+  if (!block || !variant) return [];
+  return compressionProviderContents({
+    blockId: block.id,
+    canonicalContents: variant.contents,
+    projections: clientState.modelContextProjections,
+    compressionLinks: clientState.compressionModelContextProjectionLinks
+  }) ?? [];
+});
+const activeCompressionSummaryText = computed(() => activeCompressionProviderContents.value.map(visibleContentText).filter(Boolean).join('\n\n').trim());
 const activeCompressionUsageJson = computed(() => activeCompressionSummaryVariant.value?.usageMetadata ? stringifyJson(activeCompressionSummaryVariant.value.usageMetadata) : '');
 const activeCompressionRawResponseJson = computed(() => activeCompressionSummaryVariant.value?.rawResponse !== undefined ? stringifyJson(activeCompressionSummaryVariant.value.rawResponse) : '');
 const panelTitle = computed(() => compressionDetailMode.value ? '压缩调用详情' : 'LLM 调用详情');

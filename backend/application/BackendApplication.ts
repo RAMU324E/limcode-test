@@ -54,6 +54,7 @@ import { WorkEnvironmentEventType, workEnvironmentIdFromUri } from '../world/mod
 import { BackgroundProcessSnapshotKey } from '../world/modules/backgroundProcess/resources';
 import type { LocalWorkEnvironmentCandidate } from '../world/modules/workEnvironment';
 import { ClientStateContributorsKey, ClientSyncStateKey, CommittedConversationHeadsKey } from '../world/clientSync/resources';
+import { installCommittedConversationControlState, removeCommittedConversationControlState } from '../world/clientSync/committedConversationControlState';
 import { projectClientState } from '../world/clientSync/projection';
 import { CLIENT_STATE_TABLE_KEYS } from '../../shared/clientStateSchema';
 import { EffectHandlerRegistry, registerApplicationEffectHandlers } from './effectHandlers';
@@ -552,6 +553,7 @@ export class BackendApplication {
     // The durable tombstone and Run graph termination are already committed. Everything below is a
     // rebuildable process/read-model cleanup and must never turn the domain result back into failure.
     this.deletedConversationIds.add(conversationId);
+    removeCommittedConversationControlState(this.world, conversationId);
     this.renderLoadedConversationDetails.delete(conversationId);
     this.runHistoryLoadedConversationDetails.delete(conversationId);
     this.conversationTailLoaded.delete(conversationId);
@@ -752,6 +754,7 @@ export class BackendApplication {
     }
     const hydrated = await hydrateConversationDetail(this.world, detail, conversationId);
     if (!hydrated) throw new Error(`Committed Conversation detail could not be hydrated: ${conversationId}`);
+    installCommittedConversationControlState(this.world, conversationId, detail);
     this.primeConversationStreamState(conversationId, detail);
     this.renderLoadedConversationDetails.add(conversationId);
     this.coldConversationHistoryEntries.delete(conversationId);
@@ -1133,6 +1136,7 @@ export class BackendApplication {
       const historyEntry = this.getConversationHistoryEntries().find((candidate) => candidate.id === conversationId);
       if (historyEntry) this.coldConversationHistoryEntries.set(conversationId, historyEntry);
       const result = evictConversationDetail(this.world, conversation);
+      removeCommittedConversationControlState(this.world, conversationId);
       this.renderLoadedConversationDetails.delete(conversationId);
       this.runHistoryLoadedConversationDetails.delete(conversationId);
       this.conversationTailLoaded.delete(conversationId);

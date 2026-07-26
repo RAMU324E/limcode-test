@@ -58,6 +58,56 @@ export function demoteFinalToolResultLinks(
   }
 }
 
+/** Returns the exact post-state produced when one final result supersedes any earlier final result. */
+export function replacedFinalToolResultLinks(
+  links: readonly ToolCallResultLinkRecord[],
+  nextLink: ToolCallResultLinkRecord,
+  now: number
+): ToolCallResultLinkRecord[] {
+  if (nextLink.role !== 'final') throw new Error(`Replacement ToolResultLink must be final: ${nextLink.id}`);
+  return [
+    ...links
+      .filter((link) => link.id !== nextLink.id)
+      .map((link) => link.toolCallId === nextLink.toolCallId && link.role === 'final'
+        ? { ...link, role: 'audit' as const, updatedAt: now }
+        : { ...link }),
+    { ...nextLink }
+  ];
+}
+
+/** Atomically supersedes the current final result while retaining every prior Artifact as audit history. */
+export function replaceFinalToolResultLink(
+  builder: ConversationTransitionBuilder,
+  links: readonly ToolCallResultLinkRecord[],
+  nextLink: ToolCallResultLinkRecord,
+  now: number
+): void {
+  if (nextLink.role !== 'final') throw new Error(`Replacement ToolResultLink must be final: ${nextLink.id}`);
+  demoteFinalToolResultLinks(builder, links, nextLink.toolCallId, now);
+  builder.upsert('toolCallResultLinks', nextLink);
+}
+
+/** Publishes a synthesized terminal result that may supersede a proposal/review result. */
+export function replaceWithBoundedInlineToolResult(
+  builder: ConversationTransitionBuilder,
+  links: readonly ToolCallResultLinkRecord[],
+  input: {
+    conversationId: string;
+    tool: ToolCallRecord;
+    status: ToolCallStatus;
+    result: JsonValue;
+    now: number;
+    error?: string;
+  }
+): MaterializedInlineToolResult {
+  const materialized = boundedInlineToolResult(input);
+  builder
+    .generatedId(materialized.artifact.id, materialized.link.id)
+    .upsert('toolResultArtifacts', materialized.artifact);
+  replaceFinalToolResultLink(builder, links, materialized.link, input.now);
+  return materialized;
+}
+
 export function boundedInlineToolResult(input: {
   conversationId: string;
   tool: ToolCallRecord;

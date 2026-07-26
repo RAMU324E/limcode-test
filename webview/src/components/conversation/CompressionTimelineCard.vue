@@ -13,6 +13,7 @@ import {
   type LlmInvocationRecord,
   type MessageContent
 } from '@shared/protocol';
+import { compressionProviderContents } from '@shared/compressionPresentation';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import CompressionRetryStatus from './CompressionRetryStatus.vue';
@@ -94,8 +95,18 @@ const previewText = computed(() => {
 });
 const blockVariants = computed(() => clientState.compressionContextVariants.filter((variant) => variant.blockId === props.block.id));
 const summaryVariant = computed(() => blockVariants.value.find((variant) => variant.kind === 'provider_neutral_summary') ?? blockVariants.value[0]);
+const providerSummaryContents = computed(() => {
+  const variant = summaryVariant.value;
+  if (!variant) return [];
+  return compressionProviderContents({
+    blockId: props.block.id,
+    canonicalContents: variant.contents,
+    projections: clientState.modelContextProjections,
+    compressionLinks: clientState.compressionModelContextProjectionLinks
+  }) ?? [];
+});
 const copyText = computed(() => {
-  const variantText = summaryVariant.value?.contents.map(renderContent).filter(Boolean).join('\n\n').trim();
+  const variantText = providerSummaryContents.value.map(renderContent).filter(Boolean).join('\n\n').trim();
   return variantText || props.block.summaryPreview?.trim() || previewText.value.trim();
 });
 

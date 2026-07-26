@@ -2035,7 +2035,16 @@ export class PrimaryEffectDispatcher {
         for (const entry of batch) entry.resolve();
         this.wake([conversationId]);
       } catch (error) {
-        for (const entry of batch) entry.reject(error);
+        const detail = error instanceof Error ? error.message : String(error);
+        const reason = `result_persistence_failed: external tool execution may have completed, but its result could not be persisted; inspect the workspace. ${detail}`;
+        for (const entry of batch) {
+          try {
+            await this.settleCurrentAttemptAfterCallbackFailure(entry.payload, 'tool.final_batch', reason);
+          } catch (settlementError) {
+            this.options.onIntegrityError?.(conversationId, settlementError);
+          }
+          entry.reject(error);
+        }
         this.options.onIntegrityError?.(conversationId, error);
       }
     }
@@ -2643,16 +2652,24 @@ export class PrimaryEffectDispatcher {
   }
 
   private async failCurrentAttemptCallbackIfRejected(
-    token: AttemptToken,
+    token: Pick<AttemptToken, 'conversationId' | 'operationId' | 'attemptId' | 'generation'>,
     callbackType: string,
     result: { status: string; result: JsonValue }
   ): Promise<void> {
     if (result.status !== 'stale') return;
+    const reason = jsonResultReason(result.result) ?? 'callback_handler_rejected_current_attempt';
+    await this.settleCurrentAttemptAfterCallbackFailure(token, callbackType, reason);
+  }
+
+  private async settleCurrentAttemptAfterCallbackFailure(
+    token: Pick<AttemptToken, 'conversationId' | 'operationId' | 'attemptId' | 'generation'>,
+    callbackType: string,
+    reason: string
+  ): Promise<void> {
     const facts = await this.loadCommittedFacts(token.conversationId);
     const current = matchCurrentAttempt(facts, token);
     if (current.status !== 'matched' || current.attempt.state !== 'dispatched') return;
 
-    const reason = jsonResultReason(result.result) ?? 'callback_handler_rejected_current_attempt';
     const payload: RejectDispatchedAttemptPayload = {
       conversationId: token.conversationId,
       operationId: token.operationId,

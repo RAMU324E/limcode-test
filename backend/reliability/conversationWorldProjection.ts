@@ -22,6 +22,7 @@ import type { CommittedConversationHead, PreparedProjectionBatch, StorageHead, T
 import type { ConversationId } from '../../shared/stableIds';
 import type { DurableConversationFacts } from './domain/types';
 import { factsToClientState } from './runtimeAuthorityStore';
+import { installCommittedConversationControlState } from '../world/clientSync/committedConversationControlState';
 import { CommittedConversationHeadsKey } from '../world/clientSync/resources';
 
 /** Full authoritative projection swap; no durable fact is reconstructed from the live World. */
@@ -225,9 +226,11 @@ export async function rehydrateCommittedFacts(world: World, facts: DurableConver
     }
   }
 
-  const hydrated = await hydrateConversationDetail(world, factsToClientState(facts), conversationId);
+  const clientState = factsToClientState(facts);
+  const hydrated = await hydrateConversationDetail(world, clientState, conversationId);
   if (!hydrated) throw new Error(`Committed conversation projection could not be hydrated: ${conversationId}`);
   restoreTransientLlmRequests(world, facts, conversation, transientLlmRequests);
+  installCommittedConversationControlState(world, conversationId, clientState);
   world.add(conversation, ConversationFullContextLoaded, { loadedAt: Date.now() });
 
   for (const run of facts.turns) {

@@ -16,6 +16,8 @@ import {
 } from '../components';
 import {
   conversationClientStateStreamId,
+  TOOL_CALL_PREVIEW_HEAD_CHARS,
+  TOOL_CALL_PREVIEW_MAX_CHARS,
   type ClientPatchOp,
   type ToolCallPreviewRecord,
   type ToolCallPreviewTargetLinkRecord
@@ -24,9 +26,7 @@ import { ClientSyncFastPatchStateKey, type ClientSyncFastPatchBatch } from '../.
 import type { TransientStreamEpoch } from '../../../../../shared/conversationReliability';
 import type { AttemptId, RequestId } from '../../../../../shared/stableIds';
 
-const PREVIEW_MAX_CHARS = 64 * 1024;
-const PREVIEW_HEAD_CHARS = 8 * 1024;
-const PREVIEW_TAIL_CHARS = PREVIEW_MAX_CHARS - PREVIEW_HEAD_CHARS;
+const PREVIEW_TAIL_CHARS = TOOL_CALL_PREVIEW_MAX_CHARS - TOOL_CALL_PREVIEW_HEAD_CHARS;
 
 interface WorkingPreview {
   previewEntity: Entity;
@@ -324,7 +324,7 @@ function appendPreviewArguments(
       ? current.argumentsHead + current.argumentsTail + delta
       : current.argumentsHead + delta;
   const receivedChars = replace ? delta.length : current.receivedChars + delta.length;
-  if (source.length <= PREVIEW_MAX_CHARS && (replace || !current.truncated)) {
+  if (source.length <= TOOL_CALL_PREVIEW_MAX_CHARS && (replace || !current.truncated)) {
     return {
       ...current,
       ...(name ? { name } : {}),
@@ -340,7 +340,7 @@ function appendPreviewArguments(
     ...current,
     ...(name ? { name } : {}),
     ...(streamIndex ? { streamIndex } : {}),
-    argumentsHead: source.slice(0, PREVIEW_HEAD_CHARS),
+    argumentsHead: source.slice(0, TOOL_CALL_PREVIEW_HEAD_CHARS),
     argumentsTail: source.slice(-PREVIEW_TAIL_CHARS),
     receivedChars,
     truncated: true,

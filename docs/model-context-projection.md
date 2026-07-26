@@ -114,10 +114,11 @@ DurableConversationFacts[] -> modelContextFactsFromDurable
 用于新的模型回合：
 
 - 排除 streaming Message；
-- partial model Message 不发送 raw text、thought、signature、provider context 或未提交 function call；
-- 保留显式 `<turn_aborted>` 边界；
-- 保留已完成的 durable ToolCall/Tool result；
-- unresolved call 生成确定性的 interrupted output；
+- partial model Message 不发送 raw text、thought、signature 或 provider context；
+- 终止且没有 durable ToolCall 的 Run 整体排除其 input/partial model Message；
+- 终止且存在 ToolCall 的 Run 保留原输入、canonical call 与已提交 result；
+- `RunTermination` 只作为结构化 IR boundary 与 projection provenance，绝不物化为通用 prompt marker；
+- 未取得终态的 ToolCall 只生成一次 `interrupted: true`、`outcomeUnknown: true`、`reasonCode` 的 function response，并要求重试前核对当前状态；
 - 排除属于其他 queued/active Run 的输入；
 - `historyMode` 只作用于非当前 Run-scoped 历史。
 
@@ -143,11 +144,13 @@ DurableConversationFacts[] -> modelContextFactsFromDurable
 
 自动、手动、分段和 task-list snapshot 共用 projector：
 
-- stopped raw partial 不进入 summary source；
-- 工具 call/result 必须以完整交换为选择单位；
+- stopped raw partial 与无工具事实的终止 Run input 不进入 summary source；
+- termination boundary 继续进入 IR、source provenance 与 fingerprint，但压缩正文不包含 Run ID、actor、reason XML 或通用英文控制模板；
+- 工具 call/result 必须以完整交换为选择单位，终止 Run 的 unresolved call 仅以结构化 interrupted output 出现；
 - predecessor variant、segments、prior summary 和 result addenda 在规划时冻结；
 - task-list addendum 从边界内 canonical ToolCall facts 生成；
-- Provider 完成后只能附加冻结的 addendum，不能重新读取 live World。
+- Provider 完成后只能附加冻结的 addendum，不能重新读取 live World；
+- UI 通过 `CompressionModelContextProjectionLink -> ModelContextProjection.resultAddenda` 拆分 provider summary 与模型附加上下文：摘要正文、时间线 preview、普通复制只展示 provider summary，Raw Detail 保留完整 canonical variant。
 
 ## 5. Revision 与精确重放
 

@@ -11,9 +11,10 @@ const props = withDefaults(
     text: string;
     streaming?: boolean;
     streamingPhase?: 'waiting' | 'thinking' | 'writing';
+    showStreamingIndicator?: boolean;
     markdown?: boolean;
   }>(),
-  { streaming: false, streamingPhase: 'writing', markdown: false }
+  { streaming: false, streamingPhase: 'writing', showStreamingIndicator: true, markdown: false }
 );
 
 const globalSettings = useGlobalSettingsStore();
@@ -76,9 +77,9 @@ function markdownPartKey(part: MarkdownRenderedPart, index: number): string {
       </template>
     </template>
     <pre v-else class="rc-text">{{ displayedText }}</pre>
-    <StreamingIndicatorTail v-if="streaming" :text="tailText" :variant="streamingPhase" />
+    <StreamingIndicatorTail v-if="streaming && showStreamingIndicator" :text="tailText" :variant="streamingPhase" />
   </div>
-  <pre v-else class="rc-text" :class="{ replacing: replaceAnimating }">{{ displayedText }}<StreamingIndicatorTail v-if="streaming" :text="tailText" :variant="streamingPhase" /></pre>
+  <pre v-else class="rc-text" :class="{ replacing: replaceAnimating }">{{ displayedText }}<StreamingIndicatorTail v-if="streaming && showStreamingIndicator" :text="tailText" :variant="streamingPhase" /></pre>
 </template>
 
 <style scoped>
