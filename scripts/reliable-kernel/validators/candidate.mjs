@@ -1,3 +1,4 @@
+import childProcess from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -17,8 +18,36 @@ if (!group) {
 const gate = (registry.gates ?? []).find((entry) => entry.id === group.introducedAt);
 const stageLabel = (gate?.stages ?? []).join('-') || '未知';
 
+function option(name) {
+  const inline = process.argv.find((argument) => argument.startsWith(`--${name}=`));
+  if (inline) return inline.slice(name.length + 3);
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 ? process.argv[index + 1] : null;
+}
+
+function runPhaseCCheck(checkId) {
+  const args = [
+    path.join(root, 'scripts/reliable-kernel/run-candidate-check.mjs'),
+    `--check=${checkId}`,
+    ...(option('commit') ? [`--commit=${option('commit')}`] : [])
+  ];
+  const run = childProcess.spawnSync(process.execPath, args, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 120000,
+    maxBuffer: 16 * 1024 * 1024
+  });
+  const diagnostic = [run.stdout, run.stderr].filter(Boolean).join('\n').trim();
+  if (run.error) return `${checkId}执行失败：${run.error.message}`;
+  if (run.status !== 0) return diagnostic || `${checkId}退出码${run.status}`;
+  if (diagnostic) console.log(diagnostic);
+  return null;
+}
+
 /** @type {Map<string, () => string | null>} */
-const implemented = new Map();
+const implemented = new Map([
+  ['candidate.turn-sole-execution-identity', () => runPhaseCCheck('candidate.turn-sole-execution-identity')]
+]);
 
 const failures = [];
 const pending = [];

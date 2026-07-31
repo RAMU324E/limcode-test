@@ -27,6 +27,7 @@ import {
   type RepositoryInsertMutation,
   type RepositoryMutation,
   type RepositoryRead,
+  type RepositorySavepointOnError,
   type RepositoryTransactionStep
 } from './repositories';
 
@@ -178,6 +179,10 @@ function executeSteps(
   allocatedSequences: RuntimeAllocatedSequence[]
 ): void {
   for (const step of steps) {
+    if (step.kind === 'assert') {
+      executeAssertion(database, step.domain, step.id, step.where);
+      continue;
+    }
     if (step.kind !== 'savepoint') {
       executeMutation(database, step, allocatedSequences);
       continue;
@@ -193,8 +198,36 @@ function executeSteps(
       database.exec(`ROLLBACK TO SAVEPOINT ${marker}`);
       database.exec(`RELEASE SAVEPOINT ${marker}`);
       allocatedSequences.length = sequenceCount;
-      if (step.onError === 'propagate') throw error;
+      if (!matchesSavepointContinuation(error, step.onError)) throw error;
     }
+  }
+}
+
+function executeAssertion(
+  database: Database.Database,
+  domain: string,
+  id: string,
+  where: DomainRow
+): void {
+  const repository = DOMAIN_REPOSITORIES.domain(domain);
+  const encoded = repository.codec.encodeWhere(where);
+  const predicates = ['id = @__id'];
+  const parameters: EncodedRow & { __id: string } = { __id: requireRuntimeId(id) };
+  for (const [name, value] of Object.entries(encoded)) {
+    if (name === 'id') throw new Error(`${repository.name} assertion id must be supplied separately.`);
+    if (value === null) predicates.push(`${quote(name)} IS NULL`);
+    else {
+      predicates.push(`${quote(name)} = @${name}`);
+      parameters[name] = value;
+    }
+  }
+  const matched = database.prepare(
+    `SELECT 1 AS matched FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
+  ).get(parameters);
+  if (!matched) {
+    const error = new Error(`${repository.name} transaction assertion failed for ${id}.`) as Error & { code: string };
+    error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+    throw error;
   }
 }
 
@@ -205,8 +238,9 @@ function executeMutation(
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(mutation.domain);
   const schema = repository.schema;
-  if (!schema.mutations.includes(mutation.kind)) {
-    throw new Error(`${schema.repository} does not allow ${mutation.kind}.`);
+  const mutationKind = mutation.kind === 'deleteWhere' ? 'delete' : mutation.kind;
+  if (!schema.mutations.includes(mutationKind)) {
+    throw new Error(`${schema.repository} does not allow ${mutationKind}.`);
   }
 
   if (mutation.kind === 'insert') {
@@ -236,6 +270,14 @@ function executeMutation(
     const result = database.prepare(`UPDATE ${quote(schema.table)} SET ${assignments.join(', ')} WHERE id = @__id`)
       .run({ ...encoded, __id: id });
     if (result.changes !== 1) throw new Error(`${schema.repository} update expected one row: ${id}`);
+  } else if (mutation.kind === 'deleteWhere') {
+    const encoded = repository.codec.encodeWhere(mutation.where);
+    const { predicates, parameters } = whereClause(encoded);
+    if (predicates.length === 0) throw new Error(`${schema.repository}.deleteWhere requires predicates.`);
+    const result = database.prepare(`DELETE FROM ${quote(schema.table)} WHERE ${predicates.join(' AND ')}`).run(parameters);
+    if (result.changes > mutation.maxChanges) {
+      throw new Error(`${schema.repository}.deleteWhere exceeded ${mutation.maxChanges} row.`);
+    }
   } else {
     const id = requireRuntimeId(mutation.id);
     const result = database.prepare(`DELETE FROM ${quote(schema.table)} WHERE id = ?`).run(id);
@@ -251,8 +293,10 @@ function allocateNextSequence(
   const allocation = mutation.allocateSequence;
   if (!allocation) return mutation.row;
   const column = repository.codec.column(allocation.column);
-  if (!column || column.type !== 'INTEGER' || !allocation.column.endsWith('_seq')) {
-    throw new Error(`${repository.name}.${allocation.column} is not an allocatable sequence.`);
+  const isSequence = allocation.column.endsWith('_seq');
+  const isPendingInputPosition = repository.schema.key === 'PendingTurnInput' && allocation.column === 'position';
+  if (!column || column.type !== 'INTEGER' || (!isSequence && !isPendingInputPosition)) {
+    throw new Error(`${repository.name}.${allocation.column} is not an allocatable writer INTEGER.`);
   }
   if (allocation.column in mutation.row) throw new Error(`${repository.name}.${allocation.column} was supplied and allocated.`);
   const scope = repository.codec.encodeWhere(allocation.scope);
@@ -277,6 +321,44 @@ function allocateNextSequence(
   const result = database.prepare(sql).get(parameters) as { next_value: bigint };
   if (typeof result.next_value !== 'bigint' || result.next_value <= 0n) throw new Error('SQLite sequence allocation failed.');
   return { ...mutation.row, [allocation.column]: result.next_value };
+}
+
+function matchesSavepointContinuation(error: unknown, onError: RepositorySavepointOnError): boolean {
+  if (onError === 'propagate') return false;
+  const value = error as { code?: unknown; message?: unknown };
+  if (
+    typeof value.code !== 'string'
+    || !['SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_CONSTRAINT_PRIMARYKEY'].includes(value.code)
+    || typeof value.message !== 'string'
+  ) return false;
+  const marker = 'UNIQUE constraint failed:';
+  const markerIndex = value.message.indexOf(marker);
+  if (markerIndex < 0) return false;
+  const actualColumns = value.message
+    .slice(markerIndex + marker.length)
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .sort();
+  return onError.constraints.some((constraint) => {
+    const table = DOMAIN_REPOSITORIES.domain(constraint.domain).schema.table;
+    const expectedColumns = constraint.columns.map((column) => `${table}.${column}`).sort();
+    return actualColumns.length === expectedColumns.length
+      && actualColumns.every((column, index) => column === expectedColumns[index]);
+  });
+}
+
+function whereClause(encoded: EncodedRow): { predicates: string[]; parameters: EncodedRow } {
+  const predicates: string[] = [];
+  const parameters: EncodedRow = {};
+  for (const [name, value] of Object.entries(encoded)) {
+    if (value === null) predicates.push(`${quote(name)} IS NULL`);
+    else {
+      predicates.push(`${quote(name)} = @${name}`);
+      parameters[name] = value;
+    }
+  }
+  return { predicates, parameters };
 }
 
 function executeSnapshot(

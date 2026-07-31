@@ -31,15 +31,43 @@ export interface RepositoryDeleteMutation {
   id: string;
 }
 
+export interface RepositoryDeleteWhereMutation {
+  kind: 'deleteWhere';
+  domain: string;
+  where: DomainRow;
+  maxChanges: 1;
+}
+
+export interface RepositoryAssertStep {
+  kind: 'assert';
+  domain: string;
+  id: string;
+  where: DomainRow;
+}
+
+export interface RepositoryExpectedUniqueConstraint {
+  domain: string;
+  columns: string[];
+}
+
+export type RepositorySavepointOnError = 'propagate' | {
+  kind: 'rollback-and-continue-on-unique';
+  constraints: RepositoryExpectedUniqueConstraint[];
+};
+
 export interface RepositorySavepoint {
   kind: 'savepoint';
   name: string;
   steps: RepositoryTransactionStep[];
-  onError: 'propagate' | 'rollback-and-continue';
+  onError: RepositorySavepointOnError;
 }
 
-export type RepositoryMutation = RepositoryInsertMutation | RepositoryUpdateMutation | RepositoryDeleteMutation;
-export type RepositoryTransactionStep = RepositoryMutation | RepositorySavepoint;
+export type RepositoryMutation =
+  | RepositoryInsertMutation
+  | RepositoryUpdateMutation
+  | RepositoryDeleteMutation
+  | RepositoryDeleteWhereMutation;
+export type RepositoryTransactionStep = RepositoryMutation | RepositoryAssertStep | RepositorySavepoint;
 
 export interface RepositoryGetRead {
   kind: 'get';
@@ -162,23 +190,24 @@ export class DomainRepository {
     row: DomainRow,
     allocation: { column: string; scope: DomainRow }
   ): RepositoryInsertMutation {
-    this.requireMutation('insert');
-    const column = this.codec.column(allocation.column);
-    if (!column || column.type !== 'INTEGER' || !allocation.column.endsWith('_seq')) {
-      throw new TypeError(`${this.name}.${allocation.column} is not an allocatable INTEGER sequence column.`);
+    if (!allocation.column.endsWith('_seq')) {
+      throw new TypeError(`${this.name}.${allocation.column} is not a sequence column.`);
     }
-    if (allocation.column in row) throw new TypeError(`${this.name}.${allocation.column} must be allocated by the writer.`);
-    this.codec.encodeInsert({ ...row, [allocation.column]: '1' });
-    this.codec.encodeWhere(allocation.scope);
-    return {
-      kind: 'insert',
-      domain: this.schema.key,
-      row: clonePlainRecord(row),
-      allocateSequence: {
-        column: allocation.column,
-        scope: clonePlainRecord(allocation.scope)
-      }
-    };
+    return this.insertWithNextAllocatedInteger(row, allocation);
+  }
+
+  public insertWithNextPosition(row: DomainRow): RepositoryInsertMutation {
+    if (this.schema.key !== 'PendingTurnInput') {
+      throw new TypeError(`${this.name} does not support writer-allocated position.`);
+    }
+    const turnId = row.turn_id;
+    if (typeof turnId !== 'string' || turnId.length === 0) {
+      throw new TypeError(`${this.name}.turn_id is required to allocate position.`);
+    }
+    return this.insertWithNextAllocatedInteger(row, {
+      column: 'position',
+      scope: { turn_id: turnId }
+    });
   }
 
   public update(id: string, patch: DomainRow): RepositoryUpdateMutation {
@@ -192,6 +221,21 @@ export class DomainRepository {
     this.requireMutation('delete');
     requireId(id);
     return { kind: 'delete', domain: this.schema.key, id };
+  }
+
+  public deleteByUnique(where: DomainRow): RepositoryDeleteWhereMutation {
+    this.requireMutation('delete');
+    if (!coversUniqueIdentity(this.schema, where)) {
+      throw new TypeError(`${this.name}.deleteByUnique requires a declared UNIQUE identity.`);
+    }
+    this.codec.encodeWhere(where);
+    return { kind: 'deleteWhere', domain: this.schema.key, where: clonePlainRecord(where), maxChanges: 1 };
+  }
+
+  public assert(id: string, where: DomainRow): RepositoryAssertStep {
+    requireId(id);
+    this.codec.encodeWhere(where);
+    return { kind: 'assert', domain: this.schema.key, id, where: clonePlainRecord(where) };
   }
 
   public get(id: string): RepositoryGetRead {
@@ -213,6 +257,29 @@ export class DomainRepository {
       ...(options.where ? { where: clonePlainRecord(options.where) } : {}),
       ...(options.orderBy ? { orderBy: { ...options.orderBy } } : {}),
       limit: options.limit
+    };
+  }
+
+  private insertWithNextAllocatedInteger(
+    row: DomainRow,
+    allocation: { column: string; scope: DomainRow }
+  ): RepositoryInsertMutation {
+    this.requireMutation('insert');
+    const column = this.codec.column(allocation.column);
+    if (!column || column.type !== 'INTEGER') {
+      throw new TypeError(`${this.name}.${allocation.column} is not an allocatable INTEGER column.`);
+    }
+    if (allocation.column in row) throw new TypeError(`${this.name}.${allocation.column} must be allocated by the writer.`);
+    this.codec.encodeInsert({ ...row, [allocation.column]: '1' });
+    this.codec.encodeWhere(allocation.scope);
+    return {
+      kind: 'insert',
+      domain: this.schema.key,
+      row: clonePlainRecord(row),
+      allocateSequence: {
+        column: allocation.column,
+        scope: clonePlainRecord(allocation.scope)
+      }
     };
   }
 
@@ -266,10 +333,15 @@ export const DOMAIN_REPOSITORIES = new DomainRepositorySet();
 export function savepoint(
   name: string,
   steps: RepositoryTransactionStep[],
-  onError: RepositorySavepoint['onError'] = 'propagate'
+  onError: RepositorySavepointOnError = 'propagate'
 ): RepositorySavepoint {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(name)) throw new TypeError(`Invalid savepoint name: ${name}`);
-  return { kind: 'savepoint', name, steps: steps.map(cloneStep), onError };
+  return {
+    kind: 'savepoint',
+    name,
+    steps: steps.map(cloneStep),
+    onError: cloneSavepointOnError(onError)
+  };
 }
 
 export function schemaForDomain(domainKey: string): RuntimeDomainSchema {
@@ -305,6 +377,16 @@ function encodeValue(column: ColumnDefinition, value: unknown, codecName: string
   throw new TypeError(`${codecName}.${column.name} must be a bigint or decimal integer string.`);
 }
 
+function coversUniqueIdentity(schema: RuntimeDomainSchema, where: DomainRow): boolean {
+  const fields = new Set(Object.keys(where));
+  if (fields.has('id')) return true;
+  return schema.indexes.some((index) => {
+    if (!index.endsWith(' UNIQUE') || index.includes(' WHERE ')) return false;
+    const columns = index.slice(0, -' UNIQUE'.length).split(',').map((column) => column.trim());
+    return columns.length > 0 && columns.every((column) => fields.has(column));
+  });
+}
+
 function rejectUnknownKeys(
   record: DomainRow,
   columns: ReadonlyMap<string, ColumnDefinition>,
@@ -333,6 +415,8 @@ function clonePlainValue(value: unknown): unknown {
 
 function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
   if (step.kind === 'savepoint') return savepoint(step.name, step.steps, step.onError);
+  if (step.kind === 'assert') return { ...step, where: clonePlainRecord(step.where) };
+  if (step.kind === 'deleteWhere') return { ...step, where: clonePlainRecord(step.where) };
   if (step.kind === 'insert') return {
     ...step,
     row: clonePlainRecord(step.row),
@@ -345,4 +429,26 @@ function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
   };
   if (step.kind === 'update') return { ...step, patch: clonePlainRecord(step.patch) };
   return { ...step };
+}
+
+function cloneSavepointOnError(onError: RepositorySavepointOnError): RepositorySavepointOnError {
+  if (onError === 'propagate') return onError;
+  if (onError.constraints.length === 0) throw new TypeError('Expected UNIQUE savepoint requires constraints.');
+  return {
+    kind: onError.kind,
+    constraints: onError.constraints.map((constraint) => {
+      const repository = DOMAIN_REPOSITORIES.domain(constraint.domain);
+      if (constraint.columns.length === 0) throw new TypeError('Expected UNIQUE constraint requires columns.');
+      for (const column of constraint.columns) {
+        if (!repository.codec.hasColumn(column)) {
+          throw new TypeError(`${repository.name} expected UNIQUE constraint references unknown column ${column}.`);
+        }
+      }
+      const identityShape = Object.fromEntries(constraint.columns.map((column) => [column, true]));
+      if (!coversUniqueIdentity(repository.schema, identityShape)) {
+        throw new TypeError(`${repository.name} expected constraint is not a declared UNIQUE identity.`);
+      }
+      return { domain: constraint.domain, columns: [...constraint.columns] };
+    })
+  };
 }

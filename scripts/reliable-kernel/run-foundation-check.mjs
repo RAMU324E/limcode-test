@@ -83,7 +83,10 @@ async function checkSingleDatabaseWorker() {
       conversations.insert(conversation('conv-a', now)),
       kernel.savepoint('duplicate_conversation', [
         conversations.insert(conversation('conv-a', now))
-      ], 'rollback-and-continue'),
+      ], {
+        kind: 'rollback-and-continue-on-unique',
+        constraints: [{ domain: 'Conversation', columns: ['id'] }]
+      }),
       conversations.insert(conversation('conv-b', now))
     ]);
     assert.equal(first.commitSeq, '1');

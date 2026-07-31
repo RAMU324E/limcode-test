@@ -95,6 +95,8 @@
     "check:gate": "node scripts/reliable-kernel/check-stage-gate.mjs",
     "check:foundation": "npm run compile && node scripts/reliable-kernel/validators/foundation.mjs",
     "test:foundation": "npm run compile && node --test tests/reliable-kernel/phase-b-foundation.test.mjs",
+    "test:phase-c": "npm run compile && node --test tests/reliable-kernel/phase-c-turn-control-plane.test.mjs",
+    "check:candidate": "npm run compile && node scripts/reliable-kernel/validators/candidate.mjs",
     "smoke:sqlite:host": "node scripts/reliable-kernel/sqlite-extension-host-smoke.mjs",
     "rebuild:sqlite:electron": "node scripts/reliable-kernel/rebuild-sqlite-electron.mjs",
     "check:local": "npm run check:plan && node scripts/reliable-kernel/run-local-tests.mjs",

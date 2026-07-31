@@ -4,6 +4,8 @@ export * from './databaseSchema';
 export * from './repositories';
 export * from './rootAuthority';
 export * from './runtimeDatabase';
+export * from './turnControlPlane';
+export * from './turnRecovery';
 export * from './schema/domainManifest';
 export * from './schema/types';
 export * from './vscodeRootAuthority';

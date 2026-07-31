@@ -2,7 +2,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
-import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import {
+  DOMAIN_REPOSITORIES,
+  type DomainRow,
+  type RepositoryInsertMutation
+} from './repositories';
 import { RootAuthority, sameBindingIdentity } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -21,6 +25,11 @@ export interface ContentObjectMetadata extends DomainRow {
   byte_length: bigint;
   storage_key: string;
   created_at: string;
+}
+
+export interface PreparedContentObject {
+  metadata: ContentObjectMetadata;
+  insert?: RepositoryInsertMutation;
 }
 
 export class ContentAddressedStore {
@@ -68,39 +77,45 @@ export class ContentAddressedStore {
     };
   }
 
+  /**
+   * Publishes bytes first, then prepares (but does not commit) the ContentObject mutation. This lets
+   * a domain command commit its receipt, ContentObject reference and state transition atomically.
+   */
+  public async prepare(
+    database: RuntimeDatabase,
+    content: Uint8Array | string,
+    contentType: string
+  ): Promise<PreparedContentObject> {
+    if (!sameBindingIdentity(database.binding, this.binding)) {
+      throw new Error('CAS and RuntimeDatabase must use the same RootBinding.');
+    }
+    const published = await this.publish(content, contentType);
+    const repository = DOMAIN_REPOSITORIES.domain('ContentObject');
+    const where = contentObjectIdentity(published);
+    const existing = await database.snapshot([repository.list({ where, limit: 1 })]);
+    const row = (existing.snapshot[0] as DomainRow[])[0];
+    if (row) return { metadata: asContentObjectMetadata(row) };
+    const metadata = contentObjectMetadata(published);
+    return { metadata, insert: repository.insert(metadata) };
+  }
+
   /** CAS publish completes before the ContentObject Repository transaction starts. */
   public async ingest(
     database: RuntimeDatabase,
     content: Uint8Array | string,
     contentType: string
   ): Promise<ContentObjectMetadata> {
-    if (!sameBindingIdentity(database.binding, this.binding)) {
-      throw new Error('CAS and RuntimeDatabase must use the same RootBinding.');
-    }
-    const published = await this.publish(content, contentType);
-    const repository = DOMAIN_REPOSITORIES.domain('ContentObject');
-    const where = {
-      content_type: published.contentType,
-      sha256: published.sha256,
-      byte_length: published.byteLength
-    };
-    const existing = await database.snapshot([repository.list({ where, limit: 1 })]);
-    const row = (existing.snapshot[0] as DomainRow[])[0];
-    if (row) return asContentObjectMetadata(row);
-
-    const metadata: ContentObjectMetadata = {
-      id: contentObjectId(published),
-      content_type: published.contentType,
-      sha256: published.sha256,
-      byte_length: published.byteLength,
-      storage_key: published.storageKey,
-      created_at: new Date().toISOString()
-    };
+    const prepared = await this.prepare(database, content, contentType);
+    if (!prepared.insert) return prepared.metadata;
     try {
-      await database.transaction([repository.insert(metadata)]);
-      return metadata;
+      await database.transaction([prepared.insert]);
+      return prepared.metadata;
     } catch (error) {
-      const raced = await database.snapshot([repository.list({ where, limit: 1 })]);
+      const repository = DOMAIN_REPOSITORIES.domain('ContentObject');
+      const raced = await database.snapshot([repository.list({
+        where: contentObjectIdentityFromMetadata(prepared.metadata),
+        limit: 1
+      })]);
       const racedRow = (raced.snapshot[0] as DomainRow[])[0];
       if (racedRow) return asContentObjectMetadata(racedRow);
       throw error;
@@ -134,6 +149,33 @@ function contentObjectId(content: PublishedContent): string {
     .update(content.byteLength.toString())
     .digest('hex');
   return `content_${digest}`;
+}
+
+function contentObjectIdentity(content: PublishedContent): DomainRow {
+  return {
+    content_type: content.contentType,
+    sha256: content.sha256,
+    byte_length: content.byteLength
+  };
+}
+
+function contentObjectIdentityFromMetadata(metadata: ContentObjectMetadata): DomainRow {
+  return {
+    content_type: metadata.content_type,
+    sha256: metadata.sha256,
+    byte_length: metadata.byte_length
+  };
+}
+
+function contentObjectMetadata(content: PublishedContent): ContentObjectMetadata {
+  return {
+    id: contentObjectId(content),
+    content_type: content.contentType,
+    sha256: content.sha256,
+    byte_length: content.byteLength,
+    storage_key: content.storageKey,
+    created_at: new Date().toISOString()
+  };
 }
 
 function absoluteCasPath(binding: RootBinding, storageKey: string): string {
