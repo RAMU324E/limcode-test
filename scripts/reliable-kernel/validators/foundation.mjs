@@ -1,3 +1,4 @@
+import childProcess from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -29,6 +30,25 @@ function option(name) {
   return index >= 0 ? process.argv[index + 1] : null;
 }
 
+function runPhaseBCheck(checkId) {
+  const args = [
+    path.join(root, 'scripts/reliable-kernel/run-foundation-check.mjs'),
+    `--check=${checkId}`,
+    `--commit=${option('commit') ?? currentCommit(root)}`
+  ];
+  const run = childProcess.spawnSync(process.execPath, args, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 60000,
+    maxBuffer: 8 * 1024 * 1024
+  });
+  const diagnostic = [run.stdout, run.stderr].filter(Boolean).join('\n').trim();
+  if (run.error) return `${checkId}执行失败：${run.error.message}`;
+  if (run.status !== 0) return diagnostic || `${checkId}退出码${run.status}`;
+  if (diagnostic) console.log(diagnostic);
+  return null;
+}
+
 function checkBaselinesNonPlaceholder() {
   const expectedCommit = option('commit') ?? currentCommit(root);
   const result = validateBaselineFile({
@@ -49,6 +69,13 @@ function checkBaselinesNonPlaceholder() {
 
 /** @type {Map<string, () => string | null>} */
 const implemented = new Map([
+  ['foundation.sqlite-driver-load', () => runPhaseBCheck('foundation.sqlite-driver-load')],
+  ['foundation.single-db-worker', () => runPhaseBCheck('foundation.single-db-worker')],
+  ['foundation.schema-repositories', () => runPhaseBCheck('foundation.schema-repositories')],
+  ['foundation.cas-publish-before-reference', () => runPhaseBCheck('foundation.cas-publish-before-reference')],
+  ['foundation.root-binding-fence', () => runPhaseBCheck('foundation.root-binding-fence')],
+  ['foundation.no-legacy-fallback', () => runPhaseBCheck('foundation.no-legacy-fallback')],
+  ['foundation.empty-root-current-epoch', () => runPhaseBCheck('foundation.empty-root-current-epoch')],
   ['foundation.baselines-non-placeholder', checkBaselinesNonPlaceholder]
 ]);
 

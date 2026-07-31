@@ -1,0 +1,38 @@
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+
+const root = process.cwd();
+const version = option('electron-version');
+if (!version || !/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(version)) {
+  console.error('用法：node scripts/reliable-kernel/rebuild-sqlite-electron.mjs --electron-version=<VS Code Electron版本>');
+  process.exit(2);
+}
+if (process.platform !== 'linux' || process.arch !== 'x64') {
+  console.error(`当前冻结目标只支持linux/x64，实际为${process.platform}/${process.arch}`);
+  process.exit(1);
+}
+const executable = path.join(root, 'node_modules/.bin/electron-rebuild');
+const result = childProcess.spawnSync(
+  executable,
+  ['--version', version, '--arch', 'x64', '--which-module', 'better-sqlite3', '--force'],
+  { cwd: root, encoding: 'utf8', stdio: 'inherit' }
+);
+if (result.error) throw result.error;
+if (result.status !== 0) process.exit(result.status ?? 1);
+const rebuilt = path.join(root, 'node_modules/better-sqlite3/build/Release/better_sqlite3.node');
+const packaged = path.join(root, 'node_modules/better-sqlite3/prebuilds/linux-x64.node');
+if (!fs.existsSync(rebuilt)) {
+  console.error(`Electron rebuild未生成预期native addon：${rebuilt}`);
+  process.exit(1);
+}
+fs.copyFileSync(rebuilt, packaged);
+console.log(`已将Electron ${version} ABI的better-sqlite3写入Linux x64打包入口：${packaged}`);
+
+function option(name) {
+  const inline = process.argv.find((argument) => argument.startsWith(`--${name}=`));
+  if (inline) return inline.slice(name.length + 3);
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 ? process.argv[index + 1] : null;
+}

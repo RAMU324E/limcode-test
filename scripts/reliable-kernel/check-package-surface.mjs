@@ -40,6 +40,10 @@ const forbidden = [
     }
   },
   { id: '正式或基准脚本', match: (file) => /^scripts\//.test(file) },
+  {
+    id: '未批准的根级Markdown',
+    match: (file) => !file.includes('/') && file.toLowerCase().endsWith('.md') && file.toLowerCase() !== 'readme.md'
+  },
   { id: '内部架构文档', match: (file) => /(^|\/)docs\/architecture\//.test(file) },
   { id: '内部工具报告', match: (file) => /(^|\/)\.ide-tool-test\//.test(file) },
   { id: 'TypeScript或Vue源码', match: (file) => /^(backend|shared|vscode|webview)\/.*\.(?:ts|tsx|vue)$/.test(file) },
@@ -53,8 +57,10 @@ for (const rule of forbidden) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-const required = ['package.json', 'README.md', 'LICENSE', String(manifest.main ?? '').replace(/^\.\//, '')];
+const required = ['package.json', String(manifest.main ?? '').replace(/^\.\//, '')];
 for (const file of required) if (!files.includes(file)) failures.push(`安装包缺少必需文件：${file}`);
+if (!files.some((file) => file.toLowerCase() === 'readme.md')) failures.push('安装包缺少README');
+if (!files.some((file) => /^license(?:\.[^/]+)?$/i.test(file))) failures.push('安装包缺少LICENSE');
 if (!files.some((file) => file.startsWith('dist/webview/') && file.endsWith('.html'))) failures.push('安装包缺少编译后的网页视图HTML');
 if (!files.some((file) => file.startsWith('dist/webview/') && file.endsWith('.css'))) failures.push('安装包缺少编译后的网页视图CSS');
 

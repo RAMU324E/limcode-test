@@ -122,6 +122,19 @@ for (const groupId of validators) {
   }
 }
 
+if (blockers.length === 0 && validators.includes('foundation')) {
+  const compile = childProcess.spawnSync('npm', ['run', 'compile'], {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 180000,
+    maxBuffer: 8 * 1024 * 1024
+  });
+  if (compile.error || compile.status !== 0) {
+    const diagnostic = [compile.stdout, compile.stderr].filter(Boolean).join('\n').trim();
+    add('build', compile.error?.message ?? (diagnostic || `退出码${compile.status}`));
+  }
+}
+
 if (blockers.length === 0) {
   for (const groupId of validators) {
     const definition = documents['gate-registry.json'].validatorGroups.find((entry) => entry.id === groupId);

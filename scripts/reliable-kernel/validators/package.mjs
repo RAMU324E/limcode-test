@@ -110,6 +110,10 @@ const forbidden = [
     }
   },
   { id: '正式或基准脚本', match: (file) => /^scripts\//.test(file) },
+  {
+    id: '未批准的根级Markdown',
+    match: (file) => !file.includes('/') && file.toLowerCase().endsWith('.md') && file.toLowerCase() !== 'readme.md'
+  },
   { id: '内部架构文档', match: (file) => /(^|\/)docs\/architecture\//.test(file) },
   { id: '内部工具报告', match: (file) => /(^|\/)\.ide-tool-test\//.test(file) },
   { id: 'TypeScript或Vue源码', match: (file) => /^(backend|shared|vscode|webview)\/.*\.(?:ts|tsx|vue)$/.test(file) },
@@ -126,8 +130,10 @@ function checkVsixFileListing() {
     const matches = files.filter(rule.match);
     if (matches.length) problems.push(`${rule.id}: ${matches.slice(0, 8).join(', ')}${matches.length > 8 ? ` (+${matches.length - 8})` : ''}`);
   }
-  const required = ['package.json', 'README.md', 'LICENSE', readVsixMainEntry(absolute)];
+  const required = ['package.json', readVsixMainEntry(absolute)];
   for (const file of required) if (!files.includes(file)) problems.push(`缺少必需文件：${file}`);
+  if (!files.some((file) => file.toLowerCase() === 'readme.md')) problems.push('缺少README');
+  if (!files.some((file) => /^license(?:\.[^/]+)?$/i.test(file))) problems.push('缺少LICENSE');
   if (!files.includes('dist/build-provenance.json')) problems.push('缺少构建来源文件：dist/build-provenance.json');
   if (!files.some((file) => file.startsWith('dist/webview/') && file.endsWith('.html'))) problems.push('缺少编译后的网页视图HTML');
   if (!files.some((file) => file.startsWith('dist/webview/') && file.endsWith('.css'))) problems.push('缺少编译后的网页视图CSS');
