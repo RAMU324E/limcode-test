@@ -55,7 +55,7 @@
       "restart-scan"
     ],
     "atomicity": "single-transaction",
-    "rule": "Turn 终止或 recovery.file-change-unresolved 发现未决 FileChangeSet 时，在同一事务内写入 expired 的 FileChangeDecision、cancelled 的 ToolOutcome 和唯一 ToolModelResult。",
+    "rule": "Turn 终止或 recovery.file-change-unresolved 发现未决 FileChangeSet 时，在同一事务内写入 expired 的 FileChangeDecision、cancelled 的 ToolOutcome 和唯一 ToolModelResult；受更早call_seq阻塞的候选只defer本Turn，不中止其他Turn；identity判断为finalize且无Lease时只取得终止收口权限，不重建执行Lease。",
     "recoveryScanId": "recovery.file-change-unresolved"
   },
   "pathBoundary": {
@@ -96,6 +96,8 @@
         "actualDigest?"
       ],
       "deletePolicy": "cascade-with-receipt",
+      "missingDetailRule": "EffectReceipt detail缺失时按已批准成员逐条写outcome_unknown/actualDigest=NULL，不允许空成员集合冒充完整审计。",
+      "prefixValidation": "detail存在时memberId/memberSeq必须是批准request的唯一有序前缀；首个非成功成员后停止。",
       "rule": "成员级核对结果逐一落 FileMutationReceiptMember；receipt 级 outcome 由成员结果汇聚。"
     },
     "reconcileRules": [

@@ -15,7 +15,7 @@ import type {
   DatabaseWorkerResponse,
   SerializedWorkerError
 } from './databaseWorkerProtocol';
-import type { DomainRow, RepositoryRead, RepositoryTransactionStep } from './repositories';
+import type { DomainRow, RepositoryListRead, RepositoryRead, RepositoryTransactionStep } from './repositories';
 import { RootAuthority } from './rootAuthority';
 
 export interface SnapshotSubscription<T> {
@@ -89,6 +89,11 @@ export class RuntimeDatabase {
     reads: RepositoryRead[]
   ): Promise<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>> {
     return this.request<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>>({ kind: 'snapshot', reads });
+  }
+
+  /** Reads every page of one repository list inside one SQLite read transaction. */
+  public async snapshotAll(read: RepositoryListRead): Promise<SnapshotBarrier<DomainRow[]>> {
+    return this.request<SnapshotBarrier<DomainRow[]>>({ kind: 'snapshotAll', read });
   }
 
   /**

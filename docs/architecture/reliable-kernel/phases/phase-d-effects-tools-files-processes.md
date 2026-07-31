@@ -15,8 +15,8 @@
 - task list 继续作为 update_task_list Tool facts，F 从事实派生 UI；
 - 允许无冲突只读或 independent effect tools 并行；
 - 建立 detached wrapper、bounded spool、stable nonce/process group/start fingerprint 与 atomic exit receipt；
-- ProcessOutputChunk metadata 入 SQLite、正文入 CAS，并强制 per-process bytes/chunks/flush limits；
-- MCP settings 继续位于 settings root，connection memory-only 重建；每次调用创建 `mcp_tool_call` EffectIntent/Receipt；
+- ProcessOutputChunk metadata 入 SQLite、正文入 CAS；reader按manifest稳定前缀合并CAS/spool并核对完整覆盖，terminal counters不得倒退；wrapper按250ms合并flush；
+- MCP settings 继续位于 settings root，connection memory-only 重建；风险只取registry权威annotations，明确policy拒绝持久收口，每次获批调用创建 `mcp_tool_call` EffectIntent/Receipt；
 - 建立通用 recovery scanner framework，但只注册 D owner 项。
 
 ## D recovery owner
@@ -24,7 +24,9 @@
 本阶段只拥有：
 
 - `recovery.effect-intent-hanging`：核验 dispatched 且无 receipt 的 EffectIntent；文件看 digest，进程看 wrapper evidence，MCP 等不可查询作用写 outcome_unknown；绝不自动重复 dispatch；
-- `recovery.file-change-unresolved`：同事务写 expired FileChangeDecision、cancelled ToolOutcome 与唯一 ToolModelResult。
+- `recovery.file-change-unresolved`：同事务写 expired FileChangeDecision、cancelled ToolOutcome 与唯一 ToolModelResult；一个Turn被call_seq阻塞不影响其他Turn；identity判为finalize且无Lease时只做终止收口。
+
+`receipt_written → domain reconcile` 与已持久化 no-effect/response 的 ordered finalizer 是启动编排中的纯数据库 continuation：在两个稳定 ID 前后各执行一次，不注册第三个 recovery ID，也不计入上述 stable-ID 指标。
 
 AnswerSubmission/Inbox、pending Delivery、foreground answer wait 与 cancelled subtree 全部属于 F；D 不得导入或重复实现它们的 handler。
 
@@ -42,8 +44,8 @@ AnswerSubmission/Inbox、pending Delivery、foreground answer wait 与 cancelled
 
 ## MCP 边界
 
-- Tool annotations 映射风险：readOnlyHint→read，destructiveHint→write，其余→command；
-- approval 复用 ToolPolicy/PlanReviewPolicy；
+- Tool annotations 从 settings-backed memory registry 的已解析工具定义读取；readOnlyHint→read，destructiveHint→write，冲突 hints 在 Intent 前拒绝；
+- approval 复用 ToolPolicy/PlanReviewPolicy；明确拒绝写 rejected Tool facts，不用裸异常留下 pending Tool；
 - connection rebuild 不是 call recovery；
 - dispatch 后无法查询同一 call 结果 → outcome_unknown；
 - Extension Host restart 后不自动重试；

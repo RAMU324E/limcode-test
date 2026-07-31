@@ -150,8 +150,16 @@ export interface TurnCommandResult {
   ignoredBecauseTerminal?: boolean;
 }
 
+export interface TurnUnresolvedFileClosure {
+  prepareUnresolvedTurnClosure(
+    turnId: string,
+    options?: { requireLease?: boolean }
+  ): Promise<RepositoryTransactionStep[]>;
+}
+
 export interface TurnControlPlaneOptions {
   authorityCompiler: TurnAuthorityCompiler;
+  unresolvedFileClosure?: TurnUnresolvedFileClosure;
   now?: () => string;
 }
 
@@ -191,6 +199,7 @@ interface CommandCommit {
 export class TurnControlPlane {
   private readonly now: () => string;
   private readonly authorityCompiler: TurnAuthorityCompiler;
+  private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -201,6 +210,7 @@ export class TurnControlPlane {
       throw new TypeError('TurnControlPlane requires a server-side TurnAuthorityCompiler.');
     }
     this.authorityCompiler = options.authorityCompiler;
+    this.unresolvedFileClosure = options.unresolvedFileClosure;
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -245,6 +255,76 @@ export class TurnControlPlane {
 
   public terminal(command: TurnTerminalCommand): Promise<TurnCommandResult> {
     return this.recordTerminal(command);
+  }
+
+  /** Finalize-only recovery for the identity.json active/no-lease orphan combination. */
+  public async finalizeRecovery(command: TurnTerminalCommand): Promise<TurnCommandResult> {
+    const source = normalizeTerminalSource(command.source);
+    if (source.kind !== 'recovery') throw new TypeError('Turn recovery finalization requires recovery source kind.');
+    const turnId = requireId(command.turnId, 'turnId');
+    const reason = requireText(command.reason, 'reason');
+    requireTerminalStatus(command.terminalStatus);
+    const facts = await this.recoveryFacts(turnId);
+    if (facts.judgment !== 'finalize') {
+      throw new Error(`Turn ${turnId} recovery judgment is ${facts.judgment}, not finalize.`);
+    }
+    const turn = await this.getTurn(turnId);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const terminationId = commandEntityId(source, 'terminal', 'turn_termination', turnId);
+    const receiptId = commandEntityId(source, 'terminal', 'command_receipt', turnId);
+    const duplicate = await this.findReceipt(source);
+    if (duplicate) return this.replayTerminalResult(duplicate, receiptId, turnId, terminationId);
+    if (turn.status === TURN_STATUS_TERMINATED) {
+      const committed = await this.commitWithReceipt({ source, receiptId, conversationId, turnId, steps: [] });
+      return {
+        receiptId: committed.receipt.id as string,
+        deduplicated: committed.deduplicated,
+        commitSeq: committed.commitSeq,
+        conversationId,
+        turnId,
+        terminalRecorded: false,
+        ignoredBecauseTerminal: true
+      };
+    }
+    const unresolvedFileSteps = this.unresolvedFileClosure
+      ? await this.unresolvedFileClosure.prepareUnresolvedTurnClosure(turnId, { requireLease: false })
+      : [];
+    const now = this.timestamp();
+    const committed = await this.commitWithReceipt({
+      source,
+      receiptId,
+      conversationId,
+      turnId,
+      steps: [
+        DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assertNone({ turn_id: turnId }),
+        DOMAIN_REPOSITORIES.domain('PendingTurnInput').assertNone({ turn_id: turnId }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
+        ...unresolvedFileSteps,
+        DOMAIN_REPOSITORIES.domain('ToolCall').assertAll({ turn_id: turnId }, { status: 'terminal' }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').insert({
+          id: terminationId,
+          turn_id: turnId,
+          terminal_status: command.terminalStatus,
+          reason,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Turn').update(turnId, {
+          status: TURN_STATUS_TERMINATED,
+          updated_at: now,
+          terminal_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+      ]
+    });
+    return {
+      receiptId: committed.receipt.id as string,
+      deduplicated: committed.deduplicated,
+      commitSeq: committed.commitSeq,
+      conversationId,
+      turnId,
+      terminalRecorded: true
+    };
   }
 
   public async recoveryFacts(turnId: string): Promise<TurnRecoveryFacts & { judgment: TurnRecoveryJudgment }> {
@@ -665,6 +745,9 @@ export class TurnControlPlane {
     }
     requireActiveTurn(turn, turnId);
     const now = this.timestamp();
+    const unresolvedFileSteps = this.unresolvedFileClosure
+      ? await this.unresolvedFileClosure.prepareUnresolvedTurnClosure(turnId)
+      : [];
     try {
       const committed = await this.commitWithReceipt({
         source,
@@ -673,6 +756,10 @@ export class TurnControlPlane {
         turnId,
         steps: [
           DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+          ...unresolvedFileSteps,
+          // A terminal Turn may not strand a pending or in-flight ToolCall. This assertion runs
+          // after the pending-file closure steps in the same writer transaction.
+          DOMAIN_REPOSITORIES.domain('ToolCall').assertAll({ turn_id: turnId }, { status: 'terminal' }),
           DOMAIN_REPOSITORIES.domain('ExecutionLease').deleteByUnique({ conversation_id: conversationId, turn_id: turnId }),
           DOMAIN_REPOSITORIES.domain('TurnTermination').insert({
             id: terminationId,

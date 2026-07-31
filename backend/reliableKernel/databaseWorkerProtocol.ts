@@ -1,5 +1,5 @@
 import type { RootBinding, RuntimeCommitResult, SnapshotBarrier } from './contracts';
-import type { DomainRow, RepositoryRead, RepositoryTransactionStep } from './repositories';
+import type { DomainRow, RepositoryListRead, RepositoryRead, RepositoryTransactionStep } from './repositories';
 import type { DatabaseFoundationInspection } from './databaseSchema';
 
 export interface DatabaseWorkerData {
@@ -11,6 +11,7 @@ export interface DatabaseWorkerData {
 export type DatabaseWorkerRequestPayload =
   | { kind: 'transaction'; steps: RepositoryTransactionStep[] }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
+  | { kind: 'snapshotAll'; read: RepositoryListRead }
   | { kind: 'inspect' }
   | { kind: 'close' };
 
@@ -29,7 +30,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | DatabaseWorkerDiagnostics | null }
+  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | DatabaseWorkerDiagnostics | null }
   | { type: 'response'; id: number; ok: false; error: SerializedWorkerError }
   | { type: 'commit'; result: RuntimeCommitResult }
   | { type: 'fatal'; error: SerializedWorkerError };

@@ -25,17 +25,20 @@ function option(name) {
   return index >= 0 ? process.argv[index + 1] : null;
 }
 
-function runPhaseCCheck(checkId) {
+function runCandidateCheck(checkId) {
+  const runner = checkId === 'candidate.turn-sole-execution-identity'
+    ? 'run-candidate-check.mjs'
+    : 'run-phase-d-check.mjs';
   const args = [
-    path.join(root, 'scripts/reliable-kernel/run-candidate-check.mjs'),
+    path.join(root, 'scripts/reliable-kernel', runner),
     `--check=${checkId}`,
     ...(option('commit') ? [`--commit=${option('commit')}`] : [])
   ];
   const run = childProcess.spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
-    timeout: 120000,
-    maxBuffer: 16 * 1024 * 1024
+    timeout: 180000,
+    maxBuffer: 32 * 1024 * 1024
   });
   const diagnostic = [run.stdout, run.stderr].filter(Boolean).join('\n').trim();
   if (run.error) return `${checkId}执行失败：${run.error.message}`;
@@ -46,7 +49,16 @@ function runPhaseCCheck(checkId) {
 
 /** @type {Map<string, () => string | null>} */
 const implemented = new Map([
-  ['candidate.turn-sole-execution-identity', () => runPhaseCCheck('candidate.turn-sole-execution-identity')]
+  ['candidate.turn-sole-execution-identity', () => runCandidateCheck('candidate.turn-sole-execution-identity')],
+  ['candidate.tool-model-result-exactly-once', () => runCandidateCheck('candidate.tool-model-result-exactly-once')],
+  ['candidate.file-proposal-result-separated', () => runCandidateCheck('candidate.file-proposal-result-separated')],
+  ['candidate.effect-receipt-reconcile', () => runCandidateCheck('candidate.effect-receipt-reconcile')],
+  ['candidate.attachment-cas-ingest', () => runCandidateCheck('candidate.attachment-cas-ingest')],
+  ['candidate.mcp-effect-recovery', () => runCandidateCheck('candidate.mcp-effect-recovery')],
+  ['candidate.process-wrapper-recovery', () => runCandidateCheck('candidate.process-wrapper-recovery')],
+  ['candidate.process-output-bounds', () => runCandidateCheck('candidate.process-output-bounds')],
+  ['candidate.recovery.effect-intent-hanging', () => runCandidateCheck('candidate.recovery.effect-intent-hanging')],
+  ['candidate.recovery.file-change-unresolved', () => runCandidateCheck('candidate.recovery.file-change-unresolved')]
 ]);
 
 const failures = [];

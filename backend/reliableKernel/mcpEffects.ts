@@ -1,0 +1,304 @@
+import {
+  EffectControlPlane,
+  type PhaseDCommandSource,
+  type PreparedEffectIntent,
+  type ToolSettlementResult,
+  type ToolTerminalResult
+} from './effectControlPlane';
+import { normalizePlainJson } from './plainJson';
+import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import { RuntimeDatabase } from './runtimeDatabase';
+
+export type McpRiskLevel = 'read' | 'write' | 'command';
+
+export interface McpToolAnnotations {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+}
+
+export interface McpToolCallRequest {
+  serverId: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+  riskLevel: McpRiskLevel;
+}
+
+export interface McpAuthorizationRequest extends McpToolCallRequest {
+  toolCallId: string;
+}
+
+export type McpPreparationResult =
+  | ({ disposition: 'prepared' } & PreparedEffectIntent)
+  | { disposition: 'rejected'; settlement: ToolSettlementResult };
+
+export type McpCallObservation =
+  | { outcome: 'succeeded'; result: unknown }
+  | { outcome: 'failed'; error: string; result: unknown }
+  | { outcome: 'outcome_unknown'; error: string };
+
+/** Connection objects are intentionally memory-only and rebuilt from settings by the host. */
+export interface McpMemoryConnectionRegistry {
+  toolAnnotations(serverId: string, toolName: string): Promise<McpToolAnnotations>;
+  callTool(serverId: string, toolName: string, args: Record<string, unknown>): Promise<unknown>;
+}
+
+/** Explicit pre/post-dispatch certainty supplied by the existing MCP adapter. */
+export class McpInvocationError extends Error {
+  public constructor(
+    public readonly certainty: 'not_dispatched' | 'explicit_failure' | 'ambiguous_after_dispatch',
+    message: string
+  ) {
+    super(message);
+    this.name = 'McpInvocationError';
+  }
+}
+
+/** Adapter to the existing ToolPolicy and PlanReviewPolicy authorities; it owns no policy state. */
+export interface McpExistingPolicyGate {
+  authorize(request: McpAuthorizationRequest): Promise<{
+    toolPolicyAllowed: boolean;
+    planReviewAllowed: boolean;
+    reason?: string;
+  }>;
+}
+
+const MCP_EFFECT_KIND = 'mcp_tool_call' as const;
+
+/** Dedicated MCP dispatcher. It never persists settings or connection/client objects. */
+export class McpEffectDispatcher {
+  public constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly effects: EffectControlPlane,
+    private readonly connections: McpMemoryConnectionRegistry,
+    private readonly policyGate: McpExistingPolicyGate
+  ) {}
+
+  public async prepare(input: {
+    source: PhaseDCommandSource;
+    toolCallId: string;
+    serverId: string;
+    toolName: string;
+    arguments?: Record<string, unknown>;
+  }): Promise<McpPreparationResult> {
+    if (input.source.kind !== 'internal') throw new TypeError('MCP prepare requires internal source kind.');
+    const toolCallId = requireId(input.toolCallId, 'toolCallId');
+    const serverId = requireId(input.serverId, 'serverId');
+    const toolName = requireText(input.toolName, 'toolName');
+    const annotations = normalizeAnnotations(await this.connections.toolAnnotations(serverId, toolName));
+    const request: McpToolCallRequest = {
+      serverId,
+      toolName,
+      arguments: normalizeArguments(input.arguments),
+      riskLevel: mapMcpRisk(annotations)
+    };
+    const authorization = await this.policyGate.authorize({ ...request, toolCallId });
+    if (!authorization.toolPolicyAllowed || !authorization.planReviewAllowed) {
+      const settlement = await this.effects.settleWithoutEffect({
+        source: input.source,
+        toolCallId,
+        status: 'rejected',
+        detail: {
+          kind: 'mcp-policy-rejection',
+          serverId,
+          toolName,
+          reason: authorization.reason || 'Existing ToolPolicy/PlanReviewPolicy rejected the MCP call.'
+        }
+      });
+      return { disposition: 'rejected', settlement };
+    }
+    const effect = await this.effects.prepareEffectIntent({
+      source: input.source,
+      toolCallId,
+      effectKind: MCP_EFFECT_KIND,
+      request
+    });
+    return { disposition: 'prepared', ...effect };
+  }
+
+  public async dispatch(effectIntentIdInput: string): Promise<{
+    observation: McpCallObservation | null;
+    terminal: ToolTerminalResult | null;
+  }> {
+    const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
+    if (!await this.effects.claimEffectDispatch(effectIntentId)) return { observation: null, terminal: null };
+    const observation = await this.executeDispatched(effectIntentId);
+    const intent = await this.requireExisting('EffectIntent', effectIntentId);
+    const recorded = await this.effects.recordEffectReceipt({
+      source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
+      attemptId: intent.attempt_id as string,
+      effectKind: MCP_EFFECT_KIND,
+      outcome: observation.outcome,
+      detail: observation
+    });
+    return {
+      observation,
+      terminal: await this.reconcileEffectReceipt(recorded.effectReceiptId, 'internal')
+    };
+  }
+
+  /** Executes one committed dispatch. The returned observation may be lost and later recovered as unknown. */
+  public async executeDispatched(effectIntentIdInput: string): Promise<McpCallObservation> {
+    const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
+    const intent = await this.requireExisting('EffectIntent', effectIntentId);
+    if (intent.effect_kind !== MCP_EFFECT_KIND || intent.dispatch_state !== 'dispatched') {
+      throw new Error('MCP call requires a committed dispatched mcp_tool_call EffectIntent.');
+    }
+    if ((await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1)).length > 0) {
+      throw new Error('mcp_tool_call already has a Receipt and cannot execute again.');
+    }
+    const request = normalizeRequest(await this.effects.readEffectRequest<McpToolCallRequest>(effectIntentId));
+    try {
+      const result = await this.connections.callTool(request.serverId, request.toolName, request.arguments);
+      if (isObservedMcpToolFailure(result)) {
+        return { outcome: 'failed', error: mcpFailureMessage(result), result };
+      }
+      return { outcome: 'succeeded', result };
+    } catch (error) {
+      if (error instanceof McpInvocationError && error.certainty !== 'ambiguous_after_dispatch') {
+        return { outcome: 'failed', error: error.message, result: null };
+      }
+      return {
+        outcome: 'outcome_unknown',
+        error: `MCP call was dispatched but its result cannot be proved: ${errorMessage(error)}`
+      };
+    }
+  }
+
+  /** A rebuilt connection is not proof of a prior call result; recovery never invokes callTool again. */
+  public async recoverDispatched(input: {
+    source: PhaseDCommandSource;
+    effectIntentId: string;
+  }): Promise<ToolTerminalResult | null> {
+    if (input.source.kind !== 'recovery') throw new TypeError('MCP recovery requires recovery source kind.');
+    const effectIntentId = requireId(input.effectIntentId, 'effectIntentId');
+    const intent = await this.requireExisting('EffectIntent', effectIntentId);
+    if (intent.effect_kind !== MCP_EFFECT_KIND) {
+      throw new Error('MCP recovery target must be an mcp_tool_call EffectIntent.');
+    }
+    const existing = (await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2))[0];
+    if (existing) return this.reconcileEffectReceipt(existing.id as string, 'recovery');
+    if (intent.dispatch_state !== 'dispatched') {
+      throw new Error('MCP recovery without a Receipt requires dispatch_state=dispatched.');
+    }
+    const recorded = await this.effects.recordEffectReceipt({
+      source: input.source,
+      attemptId: intent.attempt_id as string,
+      effectKind: MCP_EFFECT_KIND,
+      outcome: 'outcome_unknown',
+      detail: {
+        reason: 'MCP service cannot prove the result of the already-dispatched call after host restart.',
+        automaticRetry: false
+      }
+    });
+    return this.reconcileEffectReceipt(recorded.effectReceiptId, 'recovery');
+  }
+
+  public async reconcileEffectReceipt(
+    effectReceiptId: string,
+    sourceKind: 'internal' | 'recovery'
+  ): Promise<ToolTerminalResult | null> {
+    const receipt = await this.requireExisting('EffectReceipt', effectReceiptId);
+    const outcome = requireMcpReceiptOutcome(receipt.outcome);
+    return this.effects.completeOperation({
+      source: { kind: sourceKind, key: `mcp-reconcile:${effectReceiptId}` },
+      effectReceiptId,
+      outcome
+    });
+  }
+
+  private async requireExisting(domain: string, id: string): Promise<DomainRow> {
+    const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)]);
+    const row = snapshot.snapshot[0];
+    if (!row || Array.isArray(row)) throw new Error(`${domain} ${id} does not exist.`);
+    return row;
+  }
+
+  private async list(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {
+    const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({ where, limit })]);
+    const rows = snapshot.snapshot[0];
+    if (!Array.isArray(rows)) throw new TypeError(`${domain} list did not return rows.`);
+    return rows;
+  }
+}
+
+export function mapMcpRisk(annotations: McpToolAnnotations | undefined): McpRiskLevel {
+  if (annotations?.readOnlyHint === true && annotations.destructiveHint === true) {
+    throw new TypeError('MCP tool annotations cannot be both read-only and destructive.');
+  }
+  if (annotations?.destructiveHint === true) return 'write';
+  if (annotations?.readOnlyHint === true) return 'read';
+  return 'command';
+}
+
+function normalizeRequest(value: McpToolCallRequest): McpToolCallRequest {
+  if (!value || typeof value !== 'object') throw new TypeError('Invalid mcp_tool_call request.');
+  if (!['read', 'write', 'command'].includes(value.riskLevel)) throw new TypeError('Invalid MCP riskLevel.');
+  return {
+    serverId: requireId(value.serverId, 'serverId'),
+    toolName: requireText(value.toolName, 'toolName'),
+    arguments: normalizeArguments(value.arguments),
+    riskLevel: value.riskLevel
+  };
+}
+
+function normalizeArguments(value: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (value === undefined) return {};
+  const normalized = normalizePlainJson(value, 'MCP arguments');
+  if (!normalized || Array.isArray(normalized) || typeof normalized !== 'object') {
+    throw new TypeError('MCP arguments must be a plain object.');
+  }
+  return normalized as Record<string, unknown>;
+}
+
+function normalizeAnnotations(value: McpToolAnnotations): McpToolAnnotations {
+  const normalized = normalizePlainJson(value, 'MCP tool annotations');
+  if (!normalized || Array.isArray(normalized) || typeof normalized !== 'object') {
+    throw new TypeError('MCP tool annotations must be a plain object.');
+  }
+  const record = normalized as Record<string, unknown>;
+  const unknown = Object.keys(record).filter((key) => key !== 'readOnlyHint' && key !== 'destructiveHint');
+  if (unknown.length > 0) throw new TypeError(`Unsupported MCP annotation fields: ${unknown.join(', ')}.`);
+  if (record.readOnlyHint !== undefined && typeof record.readOnlyHint !== 'boolean') {
+    throw new TypeError('MCP readOnlyHint must be boolean when present.');
+  }
+  if (record.destructiveHint !== undefined && typeof record.destructiveHint !== 'boolean') {
+    throw new TypeError('MCP destructiveHint must be boolean when present.');
+  }
+  return {
+    ...(record.readOnlyHint === undefined ? {} : { readOnlyHint: record.readOnlyHint }),
+    ...(record.destructiveHint === undefined ? {} : { destructiveHint: record.destructiveHint })
+  };
+}
+
+function requireId(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
+  return value;
+}
+
+function requireText(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty text.`);
+  return value;
+}
+
+function isObservedMcpToolFailure(value: unknown): value is Record<string, unknown> & { isError: true } {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && (value as Record<string, unknown>).isError === true;
+}
+
+function mcpFailureMessage(value: Record<string, unknown>): string {
+  const content = value.content;
+  return typeof content === 'string' ? content : 'MCP server returned an observed tool error result.';
+}
+
+function requireMcpReceiptOutcome(
+  value: unknown
+): 'succeeded' | 'failed' | 'cancelled' | 'conflict' | 'outcome_unknown' {
+  if (!['succeeded', 'failed', 'cancelled', 'conflict', 'outcome_unknown'].includes(String(value))) {
+    throw new TypeError(`Invalid MCP EffectReceipt outcome: ${String(value)}.`);
+  }
+  return value as 'succeeded' | 'failed' | 'cancelled' | 'conflict' | 'outcome_unknown';
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

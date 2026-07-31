@@ -7,7 +7,7 @@
     "r3 Subagent: ChildExecution 是稳定谱系，Parent/Turn/Intent/ActiveTurn 分别由独立 Link 表达，AnswerBridge 归属 ChildExecution",
     "r3: EffectIntent/EffectReceipt/FileMutationReceipt/ProcessReceipt 为 dataset-reset-only，跨 deletePolicy 引用使用软引用",
     "r3: 所有 *_seq 列使用 SQLite INTEGER 并由单写者事务分配，message_seq 含软删消息终身不复用",
-    "r3: CommandReceipt 使用 source_kind,source_key UNIQUE 覆盖 command/callback/internal/recovery",
+    "r3: CommandReceipt 使用 source_kind,source_key UNIQUE 覆盖 command/callback/internal/recovery；detached Operation 的 conversation_id/turn_id 为 NULL，不使用伪 Conversation sentinel",
     "r3: AgentConversationLink 表达当前默认 agent 指针，历史执行归属由 TurnExecutorLink 承担",
     "r3: runtimeDomains 精确集合由 plan validator 与各领域合同交叉核对",
     "r4: 首发禁用 ProviderContinuation，不建对应运行表；保留 Conversation fork 三类独立 Link",
@@ -565,7 +565,7 @@
         "conversation_id,created_at"
       ],
       "notes": [
-        "source_kind ∈ {command,callback,internal,recovery}；source_key 为各来源自有键，替代原单一 command_id UNIQUE"
+        "source_kind ∈ {command,callback,internal,recovery}；source_key 为各来源自有键，替代原单一 command_id UNIQUE；Process-owned detached Operation 的 conversation_id/turn_id 为 NULL。"
       ]
     },
     {

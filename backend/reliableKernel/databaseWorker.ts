@@ -25,6 +25,7 @@ import {
   type DomainRow,
   type EncodedRow,
   type RepositoryInsertMutation,
+  type RepositoryListRead,
   type RepositoryMutation,
   type RepositoryRead,
   type RepositorySavepointOnError,
@@ -79,6 +80,12 @@ async function start(): Promise<void> {
       if (request.kind === 'snapshot') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeSnapshot(reader, request.reads, commitSeq);
+        post({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'snapshotAll') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeSnapshotAll(reader, request.read, commitSeq);
         post({ type: 'response', id: request.id, ok: true, result });
         return;
       }
@@ -183,6 +190,14 @@ function executeSteps(
       executeAssertion(database, step.domain, step.id, step.where);
       continue;
     }
+    if (step.kind === 'assertAll') {
+      executeAssertAll(database, step.domain, step.where, step.expected);
+      continue;
+    }
+    if (step.kind === 'assertNone') {
+      executeAssertNone(database, step.domain, step.where);
+      continue;
+    }
     if (step.kind !== 'savepoint') {
       executeMutation(database, step, allocatedSequences);
       continue;
@@ -226,6 +241,61 @@ function executeAssertion(
   ).get(parameters);
   if (!matched) {
     const error = new Error(`${repository.name} transaction assertion failed for ${id}.`) as Error & { code: string };
+    error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+    throw error;
+  }
+}
+
+function executeAssertAll(
+  database: Database.Database,
+  domain: string,
+  where: DomainRow,
+  expected: DomainRow
+): void {
+  const repository = DOMAIN_REPOSITORIES.domain(domain);
+  const encodedWhere = repository.codec.encodeWhere(where);
+  const encodedExpected = repository.codec.encodeWhere(expected);
+  if (Object.keys(encodedExpected).length === 0) throw new Error(`${repository.name} assertAll requires expected fields.`);
+  const predicates: string[] = [];
+  const violations: string[] = [];
+  const parameters: EncodedRow = {};
+  for (const [name, value] of Object.entries(encodedWhere)) {
+    if (value === null) predicates.push(`${quote(name)} IS NULL`);
+    else {
+      const parameter = `where_${name}`;
+      predicates.push(`${quote(name)} = @${parameter}`);
+      parameters[parameter] = value;
+    }
+  }
+  for (const [name, value] of Object.entries(encodedExpected)) {
+    if (value === null) violations.push(`${quote(name)} IS NOT NULL`);
+    else {
+      const parameter = `expected_${name}`;
+      violations.push(`(${quote(name)} IS NULL OR ${quote(name)} != @${parameter})`);
+      parameters[parameter] = value;
+    }
+  }
+  const sql = `SELECT id FROM ${quote(repository.schema.table)}`
+    + `${predicates.length ? ` WHERE ${predicates.join(' AND ')} AND (${violations.join(' OR ')})` : ` WHERE ${violations.join(' OR ')}`}`
+    + ' LIMIT 1';
+  const violating = database.prepare(sql).get(parameters) as { id?: unknown } | undefined;
+  if (violating) {
+    const error = new Error(`${repository.name} transaction assertAll failed for ${String(violating.id)}.`) as Error & { code: string };
+    error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+    throw error;
+  }
+}
+
+function executeAssertNone(database: Database.Database, domain: string, where: DomainRow): void {
+  const repository = DOMAIN_REPOSITORIES.domain(domain);
+  const encoded = repository.codec.encodeWhere(where);
+  const { predicates, parameters } = whereClause(encoded);
+  if (predicates.length === 0) throw new Error(`${repository.name} assertNone requires predicates.`);
+  const matched = database.prepare(
+    `SELECT id FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
+  ).get(parameters) as { id?: unknown } | undefined;
+  if (matched) {
+    const error = new Error(`${repository.name} transaction assertNone failed for ${String(matched.id)}.`) as Error & { code: string };
     error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
     throw error;
   }
@@ -378,6 +448,37 @@ function executeSnapshot(
   }
 }
 
+function executeSnapshotAll(
+  database: Database.Database,
+  read: RepositoryListRead,
+  commitSeq: bigint
+): SnapshotBarrier<DomainRow[]> {
+  if (read.orderBy?.column !== 'id' || read.orderBy.direction !== 'asc') {
+    throw new TypeError('snapshotAll requires id ascending order.');
+  }
+  database.exec('BEGIN');
+  try {
+    const rows: DomainRow[] = [];
+    let afterId = read.afterId;
+    for (;;) {
+      const page = executeRead(database, { ...read, ...(afterId ? { afterId } : {}) });
+      if (!Array.isArray(page)) throw new TypeError('snapshotAll list did not return rows.');
+      rows.push(...page);
+      if (page.length < read.limit) break;
+      const lastId = page[page.length - 1]?.id;
+      if (typeof lastId !== 'string' || lastId.length === 0 || lastId === afterId) {
+        throw new Error('snapshotAll pagination did not advance.');
+      }
+      afterId = lastId;
+    }
+    database.exec('COMMIT');
+    return { snapshotCommitSeq: commitSeq.toString(), snapshot: rows };
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 function executeRead(database: Database.Database, read: RepositoryRead): DomainRow | DomainRow[] | null {
   const repository = DOMAIN_REPOSITORIES.domain(read.domain);
   const schema = repository.schema;
@@ -390,7 +491,7 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
   }
   const encodedWhere = repository.codec.encodeWhere(read.where ?? {});
   const predicates: string[] = [];
-  const parameters: EncodedRow & { __limit?: bigint } = {};
+  const parameters: EncodedRow & { __after_id?: string; __limit?: bigint } = {};
   for (const [name, value] of Object.entries(encodedWhere)) {
     if (value === null) predicates.push(`${quote(name)} IS NULL`);
     else {
@@ -401,6 +502,11 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
   const orderColumn = read.orderBy?.column ?? 'id';
   if (!repository.codec.hasColumn(orderColumn)) throw new Error(`${schema.repository} cannot order by ${orderColumn}.`);
   const direction = read.orderBy?.direction === 'desc' ? 'DESC' : 'ASC';
+  if (read.afterId !== undefined) {
+    if (orderColumn !== 'id' || direction !== 'ASC') throw new TypeError('Repository afterId pagination requires id ascending order.');
+    parameters.__after_id = requireRuntimeId(read.afterId);
+    predicates.push(`${quote('id')} > @__after_id`);
+  }
   parameters.__limit = BigInt(read.limit);
   const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction} LIMIT @__limit`;
   return (database.prepare(sql).all(parameters) as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));

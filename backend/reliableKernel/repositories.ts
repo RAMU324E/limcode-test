@@ -45,6 +45,19 @@ export interface RepositoryAssertStep {
   where: DomainRow;
 }
 
+export interface RepositoryAssertAllStep {
+  kind: 'assertAll';
+  domain: string;
+  where: DomainRow;
+  expected: DomainRow;
+}
+
+export interface RepositoryAssertNoneStep {
+  kind: 'assertNone';
+  domain: string;
+  where: DomainRow;
+}
+
 export interface RepositoryExpectedUniqueConstraint {
   domain: string;
   columns: string[];
@@ -67,7 +80,12 @@ export type RepositoryMutation =
   | RepositoryUpdateMutation
   | RepositoryDeleteMutation
   | RepositoryDeleteWhereMutation;
-export type RepositoryTransactionStep = RepositoryMutation | RepositoryAssertStep | RepositorySavepoint;
+export type RepositoryTransactionStep =
+  | RepositoryMutation
+  | RepositoryAssertStep
+  | RepositoryAssertAllStep
+  | RepositoryAssertNoneStep
+  | RepositorySavepoint;
 
 export interface RepositoryGetRead {
   kind: 'get';
@@ -80,6 +98,7 @@ export interface RepositoryListRead {
   domain: string;
   where?: DomainRow;
   orderBy?: { column: string; direction: 'asc' | 'desc' };
+  afterId?: string;
   limit: number;
 }
 
@@ -238,6 +257,26 @@ export class DomainRepository {
     return { kind: 'assert', domain: this.schema.key, id, where: clonePlainRecord(where) };
   }
 
+  /** Transaction-local assertion: every row matching `where` must also match `expected`. */
+  public assertAll(where: DomainRow, expected: DomainRow): RepositoryAssertAllStep {
+    this.codec.encodeWhere(where);
+    this.codec.encodeWhere(expected);
+    if (Object.keys(expected).length === 0) throw new TypeError(`${this.name}.assertAll requires expected fields.`);
+    return {
+      kind: 'assertAll',
+      domain: this.schema.key,
+      where: clonePlainRecord(where),
+      expected: clonePlainRecord(expected)
+    };
+  }
+
+  /** Transaction-local assertion that no row matches `where`. */
+  public assertNone(where: DomainRow): RepositoryAssertNoneStep {
+    this.codec.encodeWhere(where);
+    if (Object.keys(where).length === 0) throw new TypeError(`${this.name}.assertNone requires predicates.`);
+    return { kind: 'assertNone', domain: this.schema.key, where: clonePlainRecord(where) };
+  }
+
   public get(id: string): RepositoryGetRead {
     requireId(id);
     return { kind: 'get', domain: this.schema.key, id };
@@ -251,11 +290,18 @@ export class DomainRepository {
     if (options.orderBy && !this.codec.hasColumn(options.orderBy.column)) {
       throw new TypeError(`${this.name} cannot order by unknown column ${options.orderBy.column}.`);
     }
+    if (options.afterId !== undefined) {
+      requireId(options.afterId);
+      if (options.orderBy && (options.orderBy.column !== 'id' || options.orderBy.direction !== 'asc')) {
+        throw new TypeError(`${this.name} afterId pagination requires id ascending order.`);
+      }
+    }
     return {
       kind: 'list',
       domain: this.schema.key,
       ...(options.where ? { where: clonePlainRecord(options.where) } : {}),
       ...(options.orderBy ? { orderBy: { ...options.orderBy } } : {}),
+      ...(options.afterId ? { afterId: options.afterId } : {}),
       limit: options.limit
     };
   }
@@ -416,6 +462,11 @@ function clonePlainValue(value: unknown): unknown {
 function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
   if (step.kind === 'savepoint') return savepoint(step.name, step.steps, step.onError);
   if (step.kind === 'assert') return { ...step, where: clonePlainRecord(step.where) };
+  if (step.kind === 'assertAll') return {
+    ...step,
+    where: clonePlainRecord(step.where),
+    expected: clonePlainRecord(step.expected)
+  };
   if (step.kind === 'deleteWhere') return { ...step, where: clonePlainRecord(step.where) };
   if (step.kind === 'insert') return {
     ...step,

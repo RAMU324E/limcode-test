@@ -99,7 +99,7 @@ export const CORE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     key: 'CommandReceipt', table: 'command_receipt', repository: 'CommandReceiptRepository', codec: 'CommandReceiptRowCodec',
     mutations: ['insert'], client: 'none', deletePolicy: 'dataset-reset-only',
     indexes: ['source_kind,source_key UNIQUE', 'conversation_id,created_at'],
-    columns: [id(), text('source_kind'), text('source_key'), text('conversation_id'), text('turn_id', { nullable: true }), text('created_at')]
+    columns: [id(), text('source_kind'), text('source_key'), text('conversation_id', { nullable: true }), text('turn_id', { nullable: true }), text('created_at')]
   }),
   domain({
     key: 'Message', table: 'message', repository: 'MessageRepository', codec: 'MessageRowCodec',

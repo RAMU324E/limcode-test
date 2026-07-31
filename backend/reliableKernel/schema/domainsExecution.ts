@@ -99,13 +99,24 @@ export const EXECUTION_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     key: 'FileChangeSet', table: 'file_change_set', repository: 'FileChangeSetRepository', codec: 'FileChangeSetRowCodec',
     mutations: ['insert', 'update'], client: 'detail', deletePolicy: 'cascade-with-tool-call',
     indexes: ['tool_call_id UNIQUE', 'status'],
-    columns: [id(), ref('tool_call_id', 'tool_call'), text('workspace_uri'), text('status'), text('created_at'), text('updated_at')]
+    columns: [id(), ref('tool_call_id', 'tool_call'), text('status'), text('created_at'), text('updated_at')]
   }),
   domain({
     key: 'FileChangeSetMember', table: 'file_change_set_member', repository: 'FileChangeSetMemberRepository', codec: 'FileChangeSetMemberRowCodec',
     mutations: ['insert'], client: 'detail', deletePolicy: 'cascade-with-change-set',
     indexes: ['change_set_id,member_seq UNIQUE', 'change_set_id,target_path'],
-    columns: [id(), ref('change_set_id', 'file_change_set'), integer('member_seq'), text('target_path'), text('base_digest', { nullable: true }), text('target_digest'), ref('content_object_id', 'content_object'), text('created_at')]
+    columns: [
+      id(),
+      ref('change_set_id', 'file_change_set'),
+      integer('member_seq'),
+      text('operation'),
+      text('work_environment_id'),
+      text('target_path'),
+      text('base_digest', { nullable: true }),
+      ref('target_content_object_id', 'content_object', true, 'RESTRICT'),
+      text('target_digest', { nullable: true }),
+      text('created_at')
+    ]
   }),
   domain({
     key: 'FileChangeDecision', table: 'file_change_decision', repository: 'FileChangeDecisionRepository', codec: 'FileChangeDecisionRowCodec',

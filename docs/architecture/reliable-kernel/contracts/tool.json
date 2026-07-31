@@ -132,6 +132,12 @@
         "action": "沿 ChildExecutionParentLink 续扫，补写终止意图并取消 pending intent。"
       }
     ],
+    "startupContinuation": {
+      "registeredStableId": false,
+      "target": "已提交 EffectReceipt 但领域 reconcile 未完成，或 terminal Operation/持久 no-effect resolution 尚未生成有序 ToolOutcome/ToolModelResult",
+      "action": "runAll 在两个稳定 ID 前后执行纯 SQLite/CAS 幂等续收口；不调用外部 capability，不混入 stable-ID scanned/reconciled 统计。",
+      "transitionBarrier": "尾部再扫一次，覆盖 receipt 在 startup continuation 与 dispatched scan 之间提交的状态迁移。"
+    },
     "rule": "重启后不以内存状态回答外部结果；凡不能证明的结果一律 outcome_unknown。"
   },
   "lateReceipt": {
@@ -141,7 +147,9 @@
   "parallelReconcile": {
     "receiptWrites": "每条 EffectReceipt 各自独立事务落库，回执之间不互相阻塞",
     "lease": "Reconcile 不持有 ExecutionLease",
-    "outcomeWrites": "ToolOutcome、ToolModelResult 和 message_seq 由持有 ExecutionLease 的 Turn 在单事务内按 call_seq 串行落库"
+    "outcomeWrites": "ToolOutcome、ToolModelResult 和 message_seq 由持有 ExecutionLease 的 Turn 在单事务内按 call_seq 串行落库",
+    "orderedNoEffectCompletion": "内部无外部作用工具先以 terminal Operation + ToolResultArtifact 持久化完成事实；仅 ToolOutcome/ToolModelResult 等待更早 call_seq。",
+    "terminalMonotonicity": "terminal ToolCall/ToolExecution 不得再次 prepare/claim；no-effect 旁路不得接管含非终态 Operation 的 ToolCall。"
   },
   "preview": {
     "channel": "client-feed.json preview 节（ephemeral-preview 消息）",
@@ -202,14 +210,15 @@
         "commandDigest",
         "spoolPath"
       ],
-      "stdoutStderr": "wrapper 持续 drain 并写有界 spool；Extension Host 不把不可恢复 pipe 当成跨重启权威。",
-      "exitReceipt": "wrapper 在同一 spool root 原子写 nonce/fingerprint/exitCode/signal/exitedAt/droppedBytes；新宿主核验后生成 EffectReceipt/ProcessReceipt。",
+      "stdoutStderr": "wrapper 持续 drain 并写有界 spool；live tail/manifest 最迟250ms合并原子发布，terminal receipt保留强fsync；Extension Host 不把不可恢复 pipe 当成跨重启权威。",
+      "startupHandshake": "命令在wrapper持久化identity/初始manifest并取得start fingerprint前不得执行，避免极快退出丢失真实exit tuple。",
+      "exitReceipt": "wrapper 在同一 spool root 原子写 nonce/fingerprint/exitCode/signal/exitedAt/droppedBytes；exitCode与signal必须恰有一个非空；新宿主核验后生成 EffectReceipt/ProcessReceipt。",
       "noDaemonBroker": true,
       "spoolPathRule": "spool root必须由当前RootAuthority fenced RootBinding中的getPaths结果解析；每次read/wait/stop重验binding generation，禁止缓存裸路径。"
     },
-    "readOutput": "只读，不消费也不删除；读取已登记 ProcessOutputChunk 与 wrapper spool 的可验证部分，并返回 retained/dropped/truncated 计数。",
+    "readOutput": "只读，不消费也不删除；SQLite+CAS已登记chunk为正文权威，wrapper spool仅补未登记的manifest稳定前缀/live tail；返回正文必须精确覆盖所报告retained计数，缺口报integrity error。",
     "wait": "只观察已有 wrapper/exit receipt/ProcessReceipt；本地等待超时不制造外部副作用。",
-    "stop": "创建 process_stop_request EffectIntent；只有 stable nonce + start fingerprint + process group 全部匹配才向 wrapper 请求停止，禁止对裸 PID stop。",
+    "stop": "创建 process_stop_request EffectIntent；只有 stable nonce + start fingerprint + process group 全部匹配才向 wrapper 请求停止，禁止对裸 PID stop；重启恢复只核对已存在stop-request/exit证据，绝不重发signal，并从first-wins EffectReceipt派生结论。",
     "exitObservation": "真实 exit receipt 由 wrapper 产生；没有 receipt 且无法证明时为 outcome_unknown，不伪造 abnormal 或 exitCode=1。",
     "completion": "ProcessReceipt 先持久化，再通过 RuntimeInbox 通知需要它的 Turn；进程类结果仅可经 Process 表查询。",
     "restartRules": [
@@ -229,6 +238,8 @@
     "unverifiableCrashOutcome": "outcome_unknown"
   },
   "notes": [
+    "r5: stable recovery ID保持原target；receipt_written与有序finalizer由runAll前后纯数据库startup continuation负责，不冒充第三个stable ID",
+    "r5: terminal状态单调、无effect完成先持久化、Process输出稳定前缀/覆盖/终态计数和MCP权威annotations均明确冻结",
     "r4: recoveryScan 使用六个稳定 ID，D 拥有通用 Effect/File 两项，F 拥有四项子代理扫描",
     "r4: 后台进程首发使用 detached wrapper + bounded spool + atomic exit receipt，不凭裸 PID 恢复或停止",
     "r4: MCP 工具调用进入 mcp_tool_call EffectIntent/Receipt，不再由 runtime tool 直接调用外部服务"
@@ -261,6 +272,8 @@
       "truncated"
     ],
     "rule": "CAS 只解决内容寻址，不替代容量上限；每个 Process 独立有界。",
+    "stablePrefixRule": "reader先读manifest，再只处理chunkSeq<nextChunkSeq的不可变前缀；Process与已登记chunk在同一SQLite snapshot读取。",
+    "terminalCounterRule": "output import更新Process时断言原status/counters；ProcessReceipt已写终态后，旧manifest事务不得覆盖或倒退终态计数。",
     "terminalTailBudgetRule": "stdout/stderr terminal tail均计入maxRetainedBytesPerProcess与maxRetainedChunksPerProcess；streaming writer预留尾部预算，任何路径都不得越过总上限。"
   },
   "mcpCapability": {
@@ -270,11 +283,14 @@
     "effectKind": "mcp_tool_call",
     "operationOwner": "tool_execution",
     "riskMapping": {
+      "annotationAuthority": "settings-backed memory registry resolved tool annotations",
       "readOnlyHintTrue": "read",
       "destructiveHintTrue": "write",
+      "conflictingHints": "reject-before-intent",
       "otherwise": "command"
     },
-    "approval": "复用 ToolPolicy 与 PlanReviewPolicy，不建 MCP 专用审批权威。",
+    "approval": "复用 ToolPolicy 与 PlanReviewPolicy，不建 MCP 专用审批权威；明确拒绝持久化rejected Tool facts且不创建Attempt/EffectIntent。",
+    "errorMapping": "adapter明确not_dispatched/explicit_failure或协议isError写failed；只有dispatch后无法证明结果的transport断裂写outcome_unknown。",
     "crashRule": "派发后无法向 MCP server 查询同一调用结果时写 outcome_unknown，不自动重试。",
     "resultRule": "终态经 EffectReceipt -> ToolOutcome -> 唯一 ToolModelResult；连接重建不等于调用恢复。"
   }
