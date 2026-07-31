@@ -1,0 +1,120 @@
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+import {
+  CONTRACT_FILES,
+  loadContractDocuments,
+  selectGateValidators,
+  validateContractDocuments
+} from './lib/contract-model.mjs';
+
+const root = process.cwd();
+const failures = [];
+const notes = [];
+const requireTracked = process.argv.includes('--require-tracked');
+
+function read(relativePath) {
+  return fs.readFileSync(path.join(root, relativePath), 'utf8');
+}
+
+function git(args) {
+  return childProcess.execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+}
+
+function listFiles(directory) {
+  const files = [];
+  function walk(current) {
+    if (!fs.existsSync(current)) return;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(absolute);
+      else files.push(path.relative(root, absolute).replaceAll(path.sep, '/'));
+    }
+  }
+  walk(directory);
+  return files.sort();
+}
+
+function isTestArtifactPath(file) {
+  const normalized = file.replaceAll('\\', '/');
+  const base = path.posix.basename(normalized);
+  return /(^|\/)(?:test|tests|spec|specs|__tests__|fixture|fixtures|benchmark|benchmarks)(?:\/|$)/i.test(normalized)
+    || /^(?:test|spec|benchmark)-/i.test(base)
+    || /^(?:tests?|specs?)\.(?:[cm]?js|tsx?|jsx?)$/i.test(base)
+    || /\.(?:test|spec|benchmark)\.[^/]+$/i.test(base);
+}
+
+function checkTrackedInputs() {
+  let tracked = [];
+  try {
+    tracked = git(['ls-files', '-z']).split('\0').filter(Boolean);
+  } catch {
+    failures.push('无法读取Git跟踪文件清单');
+  }
+  const trackedTests = tracked.filter(isTestArtifactPath);
+  if (trackedTests.length) failures.push(`测试、夹具或基准不得进入版本库：${trackedTests.join(', ')}`);
+  if (!read('.gitignore').split(/\r?\n/).includes('/tests/')) failures.push('.gitignore必须忽略根目录/tests/');
+
+  if (!requireTracked) {
+    notes.push('当前只检查工作区内容；准备合入时再运行 npm run check:plan:tracked');
+    return;
+  }
+  const formalInputs = [
+    ...listFiles(path.join(root, 'docs/architecture/reliable-kernel')),
+    ...listFiles(path.join(root, 'scripts/reliable-kernel')),
+    '.gitignore',
+    '.vscodeignore',
+    'AGENTS.md',
+    'package.json',
+    'package-lock.json'
+  ];
+  for (const relative of formalInputs) {
+    try {
+      git(['ls-files', '--error-unmatch', '--', relative]);
+    } catch {
+      failures.push(`正式输入未被版本库跟踪：${relative}`);
+    }
+  }
+}
+
+function checkPackageScripts() {
+  const manifest = JSON.parse(read('package.json'));
+  const scripts = manifest.scripts ?? {};
+  for (const name of ['check', 'check:contracts:plan', 'check:package:surface', 'check:plan', 'check:plan:tracked', 'check:gate', 'check:local']) {
+    if (typeof scripts[name] !== 'string' || scripts[name] === '') failures.push(`package.json缺少脚本${name}`);
+  }
+  for (const command of ['npm run build', 'npm run typecheck:webview', 'npm run check:contracts:plan']) {
+    if (!scripts['check:plan']?.includes(command)) failures.push(`check:plan缺少${command}`);
+  }
+  if (scripts['check:plan']?.includes('check:package:surface')) failures.push('普通计划检查不应每次枚举完整安装包表面');
+  if (!scripts['check:plan:tracked']?.includes('--require-tracked')) failures.push('check:plan:tracked必须启用跟踪文件检查');
+  if (!scripts['check:local']?.includes('run-local-tests.mjs')) failures.push('check:local必须运行本机被忽略的测试入口');
+}
+
+let documents = {};
+try {
+  documents = loadContractDocuments(root);
+  failures.push(...validateContractDocuments(root, documents));
+} catch (error) {
+  failures.push(error instanceof Error ? error.stack ?? error.message : String(error));
+}
+
+checkPackageScripts();
+checkTrackedInputs();
+
+if (failures.length) {
+  console.error(`可靠内核计划检查失败，共${failures.length}项：`);
+  for (const failure of failures) console.error(`- ${failure}`);
+  process.exit(1);
+}
+
+const gates = documents['gate-registry.json'];
+const stages = [...new Set(gates.gates.flatMap((gate) => gate.stages))];
+const summaries = [...gates.gates]
+  .sort((left, right) => left.order - right.order)
+  .map((gate) => `${gate.id}=${selectGateValidators(gates, gate.id).join('+')}`);
+console.log(`可靠内核计划检查通过：${CONTRACT_FILES.length}份合同，${stages.length}个实施阶段，${gates.gates.length}个正式出口，${gates.validatorGroups.length}个直接校验器。`);
+console.log('这只证明计划结构自洽，不代表实现、故障恢复或本机安装已经通过。');
+for (const note of notes) console.log(`- ${note}`);
+console.log(`- 出口校验器：${summaries.join('；')}`);

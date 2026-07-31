@@ -8,6 +8,25 @@ shared/**
 vscode/**
 webview/**
 tests/**
+**/test/**
+**/tests/**
+**/spec/**
+**/specs/**
+**/__tests__/**
+**/fixture/**
+**/fixtures/**
+**/benchmark/**
+**/benchmarks/**
+**/*.test.*
+**/*.spec.*
+**/*.benchmark.*
+**/test.js
+**/tests.js
+**/spec.js
+**/specs.js
+**/test-*
+**/spec-*
+**/benchmark-*
 
 src/**
 src copy/**
@@ -17,10 +36,17 @@ milestone/**
 remote-exec/**
 tsconfig*.json
 vite.config.ts
-*.map
+*.vsix
 .gitignore
 AGENTS.md
 README copy.md
-!dist/**
-!package.json
-!README.md
+.ide-tool-test/**
+!dist/**/*.js
+!dist/**/*.css
+!dist/**/*.html
+!dist/**/*.woff
+!dist/**/*.woff2
+!dist/**/*.ttf
+!dist/**/*.node
+!dist/**/*.wasm
+!dist/**/*.json

@@ -1,0 +1,2105 @@
+{
+  "contractKind": "migration",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "未发布运行时从自制文件数据库一次切换到SQLite和CAS；配置与Workspace独立保留。",
+  "strategy": "archive-reset-hard-cut",
+  "legacyRuntimeImport": false,
+  "dualWrite": false,
+  "fallbackToLegacyRuntime": false,
+  "runtimeProtocolNegotiation": false,
+  "candidateRoot": {
+    "isolated": true,
+    "mayReadLegacyRuntime": false,
+    "purpose": "在不污染当前开发数据的情况下验证完整能力"
+  },
+  "releaseDecisions": {
+    "cutoverActor": "final-vsix-cutover-only-coordinator",
+    "agentSystemScopeLinks": "reset-no-authority",
+    "checkpointConfiguration": "preserve",
+    "checkpointRuntime": "archive-reset-disabled"
+  },
+  "preserve": [
+    "configuration-manifest-preserved-entries",
+    "global-skills-and-rules",
+    "workspace-external",
+    "unknown-data-root-files"
+  ],
+  "archiveAndReset": [
+    "conversations-and-messages",
+    "turns-and-runs",
+    "tools-and-effects",
+    "model-context-runtime",
+    "runtime-inbox-and-delivery",
+    "process-runtime",
+    "checkpoint-runtime",
+    "client-runtime-state"
+  ],
+  "physicalManifest": {
+    "sourceCrosswalk": {
+      "registeredDirectories": "backend/capabilities/vscodeStorage/constants.ts#REGISTERED_STORAGE_ROOT_DIRS",
+      "registeredFiles": "backend/capabilities/vscodeStorage/constants.ts#REGISTERED_STORAGE_ROOT_FILES",
+      "storagePaths": "backend/capabilities/vscodeStorage/paths.ts#createVscodeStoragePaths",
+      "globalSettingsSections": "shared/protocol.ts#GLOBAL_SETTINGS_SECTIONS",
+      "conversationSettingsSections": "shared/protocol.ts#CONVERSATION_SETTINGS_SECTIONS"
+    },
+    "allowedPhysicalKinds": [
+      "registered-root",
+      "registered-file",
+      "settings-section",
+      "external-data-root-input",
+      "workspace-external",
+      "root-authority-control"
+    ],
+    "allowedDispositions": [
+      "preserve-whole",
+      "archive-reset-whole",
+      "filter-by-scope",
+      "preserve-in-place",
+      "external-untouched"
+    ],
+    "scopePolicy": {
+      "preservedScopeKinds": [
+        "global",
+        "agent",
+        "workflow"
+      ],
+      "resetScopeKinds": [
+        "conversation",
+        "run",
+        "agentSystem"
+      ],
+      "rule": "scope link 过滤后原子重写 index 与 records；不得留下悬空 index 或 orphan record。"
+    },
+    "registeredRoots": [
+      {
+        "id": "root.agents",
+        "logicalDomain": "Agent",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "AGENTS_ROOT_DIR",
+          "relativePath": "agents",
+          "storagePathsProperty": "agentsRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:agents",
+        "codec": "AgentRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.workflows",
+        "logicalDomain": "Workflow",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "WORKFLOWS_ROOT_DIR",
+          "relativePath": "workflows",
+          "storagePathsProperty": "workflowsRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:workflows",
+        "codec": "WorkflowRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.plan-review-policies",
+        "logicalDomain": "PlanReviewPolicy",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "PLAN_REVIEW_POLICIES_ROOT_DIR",
+          "relativePath": "plan-review-policies",
+          "storagePathsProperty": "planReviewPoliciesRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:planReviewPolicies",
+        "codec": "PlanReviewPolicyRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.plan-review-policy-scope-links",
+        "logicalDomain": "PlanReviewPolicyScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "PLAN_REVIEW_POLICY_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "plan-review-policy-scope-links",
+          "storagePathsProperty": "planReviewPolicyScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:planReviewPolicyScopeLinks",
+        "codec": "PlanReviewPolicyScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.tool-policies",
+        "logicalDomain": "ToolPolicy",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TOOL_POLICIES_ROOT_DIR",
+          "relativePath": "tool-policies",
+          "storagePathsProperty": "toolPoliciesRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:toolPolicies",
+        "codec": "ToolPolicyRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.tool-policy-scope-links",
+        "logicalDomain": "ToolPolicyScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TOOL_POLICY_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "tool-policy-scope-links",
+          "storagePathsProperty": "toolPolicyScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:toolPolicyScopeLinks",
+        "codec": "ToolPolicyScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.skill-policies",
+        "logicalDomain": "SkillPolicy",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "SKILL_POLICIES_ROOT_DIR",
+          "relativePath": "skill-policies",
+          "storagePathsProperty": "skillPoliciesRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:skillPolicies",
+        "codec": "SkillPolicyRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.skill-policy-scope-links",
+        "logicalDomain": "SkillPolicyScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "SKILL_POLICY_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "skill-policy-scope-links",
+          "storagePathsProperty": "skillPolicyScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:skillPolicyScopeLinks",
+        "codec": "SkillPolicyScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.system-prompts",
+        "logicalDomain": "SystemPrompt",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "SYSTEM_PROMPTS_ROOT_DIR",
+          "relativePath": "system-prompts",
+          "storagePathsProperty": "systemPromptsRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:systemPrompts",
+        "codec": "SystemPromptRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.model-profiles",
+        "logicalDomain": "ModelProfile",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "MODEL_PROFILES_ROOT_DIR",
+          "relativePath": "model-profiles",
+          "storagePathsProperty": "modelProfilesRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:modelProfiles",
+        "codec": "ModelProfileRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.agent-conversation-links",
+        "logicalDomain": "AgentConversationLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "AGENT_CONVERSATION_LINKS_ROOT_DIR",
+          "relativePath": "agent-conversation-links",
+          "storagePathsProperty": "linksRootUri"
+        },
+        "repository": "LegacyAgentConversationLinkArchiveReader",
+        "codec": "LegacyAgentConversationLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.system-prompt-scope-links",
+        "logicalDomain": "SystemPromptScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "SYSTEM_PROMPT_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "system-prompt-scope-links",
+          "storagePathsProperty": "systemPromptScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:systemPromptScopeLinks",
+        "codec": "SystemPromptScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.runtime-contexts",
+        "logicalDomain": "RuntimeContext",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "RUNTIME_CONTEXTS_ROOT_DIR",
+          "relativePath": "runtime-contexts",
+          "storagePathsProperty": "runtimeContextsRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:runtimeContexts",
+        "codec": "RuntimeContextRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.runtime-context-scope-links",
+        "logicalDomain": "RuntimeContextScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "RUNTIME_CONTEXT_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "runtime-context-scope-links",
+          "storagePathsProperty": "runtimeContextScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:runtimeContextScopeLinks",
+        "codec": "RuntimeContextScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.runtime-context-snapshots",
+        "logicalDomain": "RuntimeContextSnapshot",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "RUNTIME_CONTEXT_SNAPSHOTS_ROOT_DIR",
+          "relativePath": "runtime-context-snapshots",
+          "storagePathsProperty": "runtimeContextSnapshotsRootUri"
+        },
+        "repository": "LegacyRuntimeContextSnapshotArchiveReader",
+        "codec": "LegacyRuntimeContextSnapshotRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.conversation-runtime-context-snapshot-links",
+        "logicalDomain": "ConversationRuntimeContextSnapshotLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATION_RUNTIME_CONTEXT_SNAPSHOT_LINKS_ROOT_DIR",
+          "relativePath": "conversation-runtime-context-snapshot-links",
+          "storagePathsProperty": "conversationRuntimeContextSnapshotLinksRootUri"
+        },
+        "repository": "LegacyConversationRuntimeContextSnapshotLinkArchiveReader",
+        "codec": "LegacyConversationRuntimeContextSnapshotLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.run-runtime-context-snapshot-links",
+        "logicalDomain": "RunRuntimeContextSnapshotLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "RUN_RUNTIME_CONTEXT_SNAPSHOT_LINKS_ROOT_DIR",
+          "relativePath": "run-runtime-context-snapshot-links",
+          "storagePathsProperty": "runRuntimeContextSnapshotLinksRootUri"
+        },
+        "repository": "LegacyRunRuntimeContextSnapshotLinkArchiveReader",
+        "codec": "LegacyRunRuntimeContextSnapshotLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.model-profile-scope-links",
+        "logicalDomain": "ModelProfileScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "MODEL_PROFILE_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "model-profile-scope-links",
+          "storagePathsProperty": "modelProfileScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:modelProfileScopeLinks",
+        "codec": "ModelProfileScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.conversation-workflow-selections",
+        "logicalDomain": "ConversationWorkflowSelection",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATION_WORKFLOW_SELECTIONS_ROOT_DIR",
+          "relativePath": "conversation-workflow-selections",
+          "storagePathsProperty": "conversationWorkflowSelectionsRootUri"
+        },
+        "repository": "LegacyConversationWorkflowSelectionArchiveReader",
+        "codec": "LegacyConversationWorkflowSelectionRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.conversation-agent-selections",
+        "logicalDomain": "ConversationAgentSelection",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATION_AGENT_SELECTIONS_ROOT_DIR",
+          "relativePath": "conversation-agent-selections",
+          "storagePathsProperty": "conversationAgentSelectionsRootUri"
+        },
+        "repository": "LegacyConversationAgentSelectionArchiveReader",
+        "codec": "LegacyConversationAgentSelectionRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.conversations",
+        "logicalDomain": "Conversation",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATIONS_ROOT_DIR",
+          "relativePath": "conversations",
+          "storagePathsProperty": "conversationsRootUri"
+        },
+        "repository": "LegacyConversationsArchiveReader",
+        "codec": "LegacyConversationsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.conversation-history",
+        "logicalDomain": "ConversationHistory",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATION_HISTORY_ROOT_DIR",
+          "relativePath": "conversation-history",
+          "storagePathsProperty": "conversationHistoryRootUri"
+        },
+        "repository": "LegacyConversationHistoryArchiveReader",
+        "codec": "LegacyConversationHistoryRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.attachments",
+        "logicalDomain": "Attachment",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "ATTACHMENTS_ROOT_DIR",
+          "relativePath": "attachments",
+          "storagePathsProperty": "attachmentsRootUri"
+        },
+        "repository": "LegacyAttachmentsArchiveReader",
+        "codec": "LegacyAttachmentsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.project-contexts",
+        "logicalDomain": "ProjectContext",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "PROJECT_CONTEXTS_ROOT_DIR",
+          "relativePath": "project-contexts",
+          "storagePathsProperty": "projectContextsRootUri"
+        },
+        "repository": "LegacyProjectContextArchiveReader",
+        "codec": "LegacyProjectContextRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.conversation-project-links",
+        "logicalDomain": "ConversationProjectLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATION_PROJECT_LINKS_ROOT_DIR",
+          "relativePath": "conversation-project-links",
+          "storagePathsProperty": "conversationProjectLinksRootUri"
+        },
+        "repository": "LegacyConversationProjectLinkArchiveReader",
+        "codec": "LegacyConversationProjectLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.agent-answers",
+        "logicalDomain": "AgentAnswer",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "AGENT_ANSWERS_ROOT_DIR",
+          "relativePath": "agent-answers",
+          "storagePathsProperty": "agentAnswersRootUri"
+        },
+        "repository": "LegacyAgentAnswerArchiveReader",
+        "codec": "LegacyAgentAnswerRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.agent-answer-submission-links",
+        "logicalDomain": "AgentAnswerSubmissionLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "AGENT_ANSWER_SUBMISSION_LINKS_ROOT_DIR",
+          "relativePath": "agent-answer-submission-links",
+          "storagePathsProperty": "agentAnswerSubmissionLinksRootUri"
+        },
+        "repository": "LegacyAgentAnswerSubmissionLinkArchiveReader",
+        "codec": "LegacyAgentAnswerSubmissionLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.agent-answer-target-links",
+        "logicalDomain": "AgentAnswerTargetLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "AGENT_ANSWER_TARGET_LINKS_ROOT_DIR",
+          "relativePath": "agent-answer-target-links",
+          "storagePathsProperty": "agentAnswerTargetLinksRootUri"
+        },
+        "repository": "LegacyAgentAnswerTargetLinkArchiveReader",
+        "codec": "LegacyAgentAnswerTargetLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.work-environments",
+        "logicalDomain": "WorkEnvironment",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "WORK_ENVIRONMENTS_ROOT_DIR",
+          "relativePath": "work-environments",
+          "storagePathsProperty": "workEnvironmentsRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:workEnvironments",
+        "codec": "WorkEnvironmentRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.conversation-work-environment-links",
+        "logicalDomain": "ConversationWorkEnvironmentLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATION_WORK_ENVIRONMENT_LINKS_ROOT_DIR",
+          "relativePath": "conversation-work-environment-links",
+          "storagePathsProperty": "conversationWorkEnvironmentLinksRootUri"
+        },
+        "repository": "LegacyConversationWorkEnvironmentLinkArchiveReader",
+        "codec": "LegacyConversationWorkEnvironmentLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.run-work-environment-links",
+        "logicalDomain": "RunWorkEnvironmentLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "RUN_WORK_ENVIRONMENT_LINKS_ROOT_DIR",
+          "relativePath": "run-work-environment-links",
+          "storagePathsProperty": "runWorkEnvironmentLinksRootUri"
+        },
+        "repository": "LegacyRunWorkEnvironmentLinkArchiveReader",
+        "codec": "LegacyRunWorkEnvironmentLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.work-environment-policies",
+        "logicalDomain": "WorkEnvironmentPolicy",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "WORK_ENVIRONMENT_POLICIES_ROOT_DIR",
+          "relativePath": "work-environment-policies",
+          "storagePathsProperty": "workEnvironmentPoliciesRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:workEnvironmentPolicies",
+        "codec": "WorkEnvironmentPolicyRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.work-environment-policy-scope-links",
+        "logicalDomain": "WorkEnvironmentPolicyScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "WORK_ENVIRONMENT_POLICY_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "work-environment-policy-scope-links",
+          "storagePathsProperty": "workEnvironmentPolicyScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:workEnvironmentPolicyScopeLinks",
+        "codec": "WorkEnvironmentPolicyScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.checkpoint-policies",
+        "logicalDomain": "CheckpointPolicy",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CHECKPOINT_POLICIES_ROOT_DIR",
+          "relativePath": "checkpoint-policies",
+          "storagePathsProperty": "checkpointPoliciesRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:checkpointPolicies",
+        "codec": "CheckpointPolicyRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-and-preserve-all-indexed-records",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.checkpoint-policy-scope-links",
+        "logicalDomain": "CheckpointPolicyScopeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CHECKPOINT_POLICY_SCOPE_LINKS_ROOT_DIR",
+          "relativePath": "checkpoint-policy-scope-links",
+          "storagePathsProperty": "checkpointPolicyScopeLinksRootUri"
+        },
+        "repository": "load/saveClientStateSkeletonFromStores:checkpointPolicyScopeLinks",
+        "codec": "CheckpointPolicyScopeLinkRecord",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global",
+          "agent",
+          "workflow"
+        ],
+        "resetScopeKinds": [
+          "conversation",
+          "run",
+          "agentSystem"
+        ],
+        "indexPolicy": "filter-records-then-atomically-rewrite-index",
+        "recordsPolicy": "preserve-only-declared-scope-kinds-and-remove-orphans",
+        "verification": [
+          "all-json-parse",
+          "index-record-bijection",
+          "no-dangling-index-entry"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.shadow-repositories",
+        "logicalDomain": "ShadowRepository",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "SHADOW_REPOSITORIES_ROOT_DIR",
+          "relativePath": "shadow-repositories",
+          "storagePathsProperty": "shadowRepositoriesRootUri"
+        },
+        "repository": "LegacyShadowRepositoryArchiveReader",
+        "codec": "LegacyShadowRepositoryRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.conversation-checkpoint-repository-links",
+        "logicalDomain": "ConversationCheckpointRepositoryLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CONVERSATION_CHECKPOINT_REPOSITORY_LINKS_ROOT_DIR",
+          "relativePath": "conversation-checkpoint-repository-links",
+          "storagePathsProperty": "conversationCheckpointRepositoryLinksRootUri"
+        },
+        "repository": "LegacyConversationCheckpointRepositoryLinkArchiveReader",
+        "codec": "LegacyConversationCheckpointRepositoryLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.checkpoints",
+        "logicalDomain": "Checkpoint",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CHECKPOINTS_ROOT_DIR",
+          "relativePath": "checkpoints",
+          "storagePathsProperty": "checkpointsRootUri"
+        },
+        "repository": "LegacyCheckpointsArchiveReader",
+        "codec": "LegacyCheckpointsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.checkpoint-timeline-anchors",
+        "logicalDomain": "CheckpointTimelineAnchor",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CHECKPOINT_TIMELINE_ANCHORS_ROOT_DIR",
+          "relativePath": "checkpoint-timeline-anchors",
+          "storagePathsProperty": "checkpointTimelineAnchorsRootUri"
+        },
+        "repository": "LegacyCheckpointTimelineAnchorArchiveReader",
+        "codec": "LegacyCheckpointTimelineAnchorRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.checkpoint-shadow-worktrees",
+        "logicalDomain": "CheckpointShadowWorktree",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CHECKPOINT_SHADOW_WORKTREES_ROOT_DIR",
+          "relativePath": "checkpoint-shadow-worktrees",
+          "storagePathsProperty": "checkpointShadowWorktreesRootUri"
+        },
+        "repository": "LegacyCheckpointShadowWorktreeArchiveReader",
+        "codec": "LegacyCheckpointShadowWorktreeRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.compression-blocks",
+        "logicalDomain": "CompressionBlock",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "COMPRESSION_BLOCKS_ROOT_DIR",
+          "relativePath": "compression-blocks",
+          "storagePathsProperty": "compressionBlocksRootUri"
+        },
+        "repository": "LegacyCompressionBlocksArchiveReader",
+        "codec": "LegacyCompressionBlocksRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.compression-block-source-links",
+        "logicalDomain": "CompressionBlockSourceLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "COMPRESSION_BLOCK_SOURCE_LINKS_ROOT_DIR",
+          "relativePath": "compression-block-source-links",
+          "storagePathsProperty": "compressionBlockSourceLinksRootUri"
+        },
+        "repository": "LegacyCompressionBlockSourceLinkArchiveReader",
+        "codec": "LegacyCompressionBlockSourceLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.compression-context-variants",
+        "logicalDomain": "CompressionContextVariant",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "COMPRESSION_CONTEXT_VARIANTS_ROOT_DIR",
+          "relativePath": "compression-context-variants",
+          "storagePathsProperty": "compressionContextVariantsRootUri"
+        },
+        "repository": "LegacyCompressionContextVariantArchiveReader",
+        "codec": "LegacyCompressionContextVariantRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.compression-block-llm-invocation-links",
+        "logicalDomain": "CompressionBlockLlmInvocationLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "COMPRESSION_BLOCK_LLM_INVOCATION_LINKS_ROOT_DIR",
+          "relativePath": "compression-block-llm-invocation-links",
+          "storagePathsProperty": "compressionBlockLlmInvocationLinksRootUri"
+        },
+        "repository": "LegacyCompressionBlockLlmInvocationLinkArchiveReader",
+        "codec": "LegacyCompressionBlockLlmInvocationLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.tool-calls",
+        "logicalDomain": "ToolCall",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TOOL_CALLS_ROOT_DIR",
+          "relativePath": "tool-calls",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyToolCallsArchiveReader",
+        "codec": "LegacyToolCallsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.tool-call-events",
+        "logicalDomain": "ToolCallEvent",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TOOL_CALL_EVENTS_ROOT_DIR",
+          "relativePath": "tool-call-events",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyToolCallEventsArchiveReader",
+        "codec": "LegacyToolCallEventsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.tool-result-artifacts",
+        "logicalDomain": "ToolResultArtifact",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TOOL_RESULT_ARTIFACTS_ROOT_DIR",
+          "relativePath": "tool-result-artifacts",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyToolResultArtifactsArchiveReader",
+        "codec": "LegacyToolResultArtifactsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.tool-call-result-links",
+        "logicalDomain": "ToolCallResultLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TOOL_CALL_RESULT_LINKS_ROOT_DIR",
+          "relativePath": "tool-call-result-links",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyToolCallResultLinkArchiveReader",
+        "codec": "LegacyToolCallResultLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.tool-result-blobs",
+        "logicalDomain": "ToolResultBlob",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TOOL_RESULT_BLOBS_ROOT_DIR",
+          "relativePath": "tool-result-blobs",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyToolResultBlobArchiveReader",
+        "codec": "LegacyToolResultBlobRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.answer-bridge-links",
+        "logicalDomain": "LegacyAnswerBridgeLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "ANSWER_BRIDGE_LINKS_ROOT_DIR",
+          "relativePath": "answer-bridge-links",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyAnswerBridgeLinkArchiveReader",
+        "codec": "LegacyAnswerBridgeLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.turns",
+        "logicalDomain": "Turn",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TURNS_ROOT_DIR",
+          "relativePath": "turns",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyTurnsArchiveReader",
+        "codec": "LegacyTurnsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.child-turn-links",
+        "logicalDomain": "LegacyChildTurnLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "CHILD_TURN_LINKS_ROOT_DIR",
+          "relativePath": "child-turn-links",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyChildTurnLinkArchiveReader",
+        "codec": "LegacyChildTurnLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.message-turn-links",
+        "logicalDomain": "MessageTurnLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "MESSAGE_TURN_LINKS_ROOT_DIR",
+          "relativePath": "message-turn-links",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyMessageTurnLinksArchiveReader",
+        "codec": "LegacyMessageTurnLinksRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.turn-intents",
+        "logicalDomain": "TurnIntent",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TURN_INTENTS_ROOT_DIR",
+          "relativePath": "turn-intents",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyTurnIntentsArchiveReader",
+        "codec": "LegacyTurnIntentsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.turn-intent-revisions",
+        "logicalDomain": "TurnIntentRevision",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TURN_INTENT_REVISIONS_ROOT_DIR",
+          "relativePath": "turn-intent-revisions",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyTurnIntentRevisionsArchiveReader",
+        "codec": "LegacyTurnIntentRevisionsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.turn-execution-preset-revisions",
+        "logicalDomain": "TurnExecutionPresetRevision",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "TURN_EXECUTION_PRESET_REVISIONS_ROOT_DIR",
+          "relativePath": "turn-execution-preset-revisions",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyTurnExecutionPresetRevisionsArchiveReader",
+        "codec": "LegacyTurnExecutionPresetRevisionsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.pending-turn-inputs",
+        "logicalDomain": "PendingTurnInput",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "PENDING_TURN_INPUTS_ROOT_DIR",
+          "relativePath": "pending-turn-inputs",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyPendingTurnInputsArchiveReader",
+        "codec": "LegacyPendingTurnInputsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.execution-leases",
+        "logicalDomain": "ExecutionLease",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "EXECUTION_LEASES_ROOT_DIR",
+          "relativePath": "execution-leases",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyExecutionLeasesArchiveReader",
+        "codec": "LegacyExecutionLeasesRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.authority-snapshots",
+        "logicalDomain": "AuthoritySnapshot",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "AUTHORITY_SNAPSHOTS_ROOT_DIR",
+          "relativePath": "authority-snapshots",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyAuthoritySnapshotsArchiveReader",
+        "codec": "LegacyAuthoritySnapshotsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.authority-derivation-links",
+        "logicalDomain": "AuthorityDerivationLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "AUTHORITY_DERIVATION_LINKS_ROOT_DIR",
+          "relativePath": "authority-derivation-links",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyAuthorityDerivationLinkArchiveReader",
+        "codec": "LegacyAuthorityDerivationLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.runtime-inbox-items",
+        "logicalDomain": "RuntimeInboxItem",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "RUNTIME_INBOX_ITEMS_ROOT_DIR",
+          "relativePath": "runtime-inbox-items",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyRuntimeInboxItemsArchiveReader",
+        "codec": "LegacyRuntimeInboxItemsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.runtime-delivery-links",
+        "logicalDomain": "LegacyRuntimeDeliveryLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "RUNTIME_DELIVERY_LINKS_ROOT_DIR",
+          "relativePath": "runtime-delivery-links",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyRuntimeDeliveryLinkArchiveReader",
+        "codec": "LegacyRuntimeDeliveryLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.interactions",
+        "logicalDomain": "InteractionRequest",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "INTERACTIONS_ROOT_DIR",
+          "relativePath": "interactions",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyInteractionsArchiveReader",
+        "codec": "LegacyInteractionsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.interaction-owner-links",
+        "logicalDomain": "InteractionOwnerLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "INTERACTION_OWNER_LINKS_ROOT_DIR",
+          "relativePath": "interaction-owner-links",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyInteractionOwnerLinksArchiveReader",
+        "codec": "LegacyInteractionOwnerLinksRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.interaction-responses",
+        "logicalDomain": "InteractionResponse",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "INTERACTION_RESPONSES_ROOT_DIR",
+          "relativePath": "interaction-responses",
+          "resolution": "getPaths().globalStorageUri + registered constant"
+        },
+        "repository": "LegacyInteractionResponsesArchiveReader",
+        "codec": "LegacyInteractionResponsesRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.background-processes",
+        "logicalDomain": "LegacyBackgroundProcess",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "BACKGROUND_PROCESSES_ROOT_DIR",
+          "relativePath": "background-processes",
+          "storagePathsProperty": "backgroundProcessesRootUri"
+        },
+        "repository": "LegacyBackgroundProcessesArchiveReader",
+        "codec": "LegacyBackgroundProcessesRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.background-process-origin-links",
+        "logicalDomain": "BackgroundProcessOriginLink",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "BACKGROUND_PROCESS_ORIGIN_LINKS_ROOT_DIR",
+          "relativePath": "background-process-origin-links",
+          "storagePathsProperty": "backgroundProcessOriginLinksRootUri"
+        },
+        "repository": "LegacyBackgroundProcessOriginLinkArchiveReader",
+        "codec": "LegacyBackgroundProcessOriginLinkRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.background-process-exit-receipts",
+        "logicalDomain": "BackgroundProcessExitReceipt",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "BACKGROUND_PROCESS_EXIT_RECEIPTS_ROOT_DIR",
+          "relativePath": "background-process-exit-receipts",
+          "storagePathsProperty": "backgroundProcessExitReceiptsRootUri"
+        },
+        "repository": "LegacyBackgroundProcessExitReceiptArchiveReader",
+        "codec": "LegacyBackgroundProcessExitReceiptRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.background-process-notification-deliveries",
+        "logicalDomain": "BackgroundProcessNotificationDelivery",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "BACKGROUND_PROCESS_NOTIFICATION_DELIVERIES_ROOT_DIR",
+          "relativePath": "background-process-notification-deliveries",
+          "storagePathsProperty": "backgroundProcessNotificationDeliveriesRootUri"
+        },
+        "repository": "LegacyBackgroundProcessNotificationDeliveryArchiveReader",
+        "codec": "LegacyBackgroundProcessNotificationDeliveryRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      },
+      {
+        "id": "root.settings",
+        "logicalDomain": "GlobalAndConversationSettings",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "SETTINGS_ROOT_DIR",
+          "relativePath": "settings",
+          "storagePathsProperty": "settingsRootUri"
+        },
+        "repository": "GlobalSettingsRepository+ConversationSettingsRepository",
+        "codec": "GlobalSettingsSectionCodec+ConversationSettingsCodec",
+        "disposition": "filter-by-scope",
+        "preservedScopeKinds": [
+          "global"
+        ],
+        "resetScopeKinds": [
+          "conversation"
+        ],
+        "indexPolicy": "apply-settings-manifest-per-section",
+        "recordsPolicy": "preserve-global-delete-conversation-settings-and-transaction-locks",
+        "verification": [
+          "all-preserved-json-parse",
+          "no-conversation-setting-remains"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "root.operations",
+        "logicalDomain": "LegacyReliableOperations",
+        "physicalKind": "registered-root",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "OPERATIONS_ROOT_DIR",
+          "relativePath": "operations",
+          "storagePathsProperty": "operationsRootUri"
+        },
+        "repository": "LegacyLegacyReliableOperationsArchiveReader",
+        "codec": "LegacyLegacyReliableOperationsRecordCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "archive-byte-for-byte-with-tree-digest",
+        "recordsPolicy": "archive-all-owned-content-then-reset",
+        "verification": [
+          "tree-digest-matches-archive",
+          "source-restorable-before-activation"
+        ],
+        "unknownFilePolicy": "archive-with-owned-root"
+      }
+    ],
+    "registeredFiles": [
+      {
+        "id": "file.data-root-marker",
+        "logicalDomain": "LegacyDataEpochMarker",
+        "physicalKind": "registered-file",
+        "pathSource": {
+          "getPathsRequired": true,
+          "constant": "DATA_ROOT_MARKER_FILE",
+          "relativePath": ".limcode-data-root.json",
+          "storagePathsProperty": "dataEpochUri"
+        },
+        "repository": "DataEpochRepository",
+        "codec": "LegacyDataRootMarkerCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "not-applicable",
+        "recordsPolicy": "archive-old-marker-do-not-copy-epoch-to-new-runtime",
+        "verification": [
+          "archived-bytes-match-source"
+        ],
+        "unknownFilePolicy": "not-applicable"
+      }
+    ],
+    "settingsSections": [
+      {
+        "id": "setting.common",
+        "logicalDomain": "GlobalCommonSettings",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "source": "VS Code globalState",
+          "key": "limcode.globalStatus",
+          "target": "settings/common.json"
+        },
+        "repository": "RootAuthorityStatusRepository+GlobalSettingsRepository",
+        "codec": "LimCodeGlobalStatus+GlobalSettingsRecordCodec",
+        "disposition": "filter-by-scope",
+        "preserveFields": [
+          "dataRootPath",
+          "lastMigration"
+        ],
+        "relocateFields": [
+          "proxy"
+        ],
+        "derivedFields": [
+          "activeDataRootPath",
+          "defaultDataRootPath"
+        ],
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "root-control-fields-stay-in-globalState-business-settings-move-to-settings-root",
+        "verification": [
+          "root-authority-fields-parse",
+          "proxy-round-trip-in-settings-root"
+        ],
+        "unknownFilePolicy": "not-applicable"
+      },
+      {
+        "id": "setting.llm",
+        "logicalDomain": "LlmActiveProviderSelection",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "llm.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "LlmSettingsRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "setting.llmProviderConfigs",
+        "logicalDomain": "LlmProviderConfig",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "llm-provider-configs"
+        },
+        "repository": "LlmProviderConfigSettingsRepository",
+        "codec": "LlmProviderConfigRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "setting.llmCompression",
+        "logicalDomain": "LlmCompressionSelection",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "llm-compression.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "LlmCompressionSettingsRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "setting.llmCompressionConfigs",
+        "logicalDomain": "LlmCompressionConfig",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "llm-compression-configs"
+        },
+        "repository": "LlmCompressionConfigSettingsRepository",
+        "codec": "LlmCompressionConfigRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "setting.checkpointMaintenance",
+        "logicalDomain": "CheckpointMaintenanceSettings",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "checkpoint-maintenance.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "CheckpointMaintenanceSettingsRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "setting.appearance",
+        "logicalDomain": "AppearanceSettings",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "appearance.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "AppearanceSettingsRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "setting.attachments",
+        "logicalDomain": "AttachmentSettings",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "attachments.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "AttachmentSettingsRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
+        "id": "setting.mcpServers",
+        "logicalDomain": "McpServerConfig",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "mcp-servers"
+        },
+        "repository": "McpServerConfigSettingsRepository",
+        "codec": "McpServerConfigRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "verify-index-record-bijection-and-preserve",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      }
+    ],
+    "conversationSettings": {
+      "sections": [
+        "common",
+        "llm"
+      ],
+      "filePattern": "settings/conversation-{conversationSettingsFileName(conversationId)}-{section}.json",
+      "transactionRoot": "settings/.conversation-settings-transactions",
+      "disposition": "archive-reset-whole",
+      "rule": "Conversation authority 重置；所有 conversation settings 文件与事务锁目录归档后删除，不复制到新 Runtime。"
+    },
+    "externalEntries": [
+      {
+        "id": "external.global-skills",
+        "logicalDomain": "SkillCatalogInput",
+        "physicalKind": "external-data-root-input",
+        "pathSource": {
+          "relativePath": "skills",
+          "resolver": "getPaths().globalStorageUri"
+        },
+        "repository": "SkillCatalog",
+        "codec": "SkillMarkdownCodec",
+        "disposition": "preserve-in-place",
+        "indexPolicy": "rescan-on-startup",
+        "recordsPolicy": "leave-directory-byte-identical",
+        "verification": [
+          "path-unchanged"
+        ],
+        "unknownFilePolicy": "leave-untouched"
+      },
+      {
+        "id": "external.global-agents-rule",
+        "logicalDomain": "GlobalAgentsRule",
+        "physicalKind": "external-data-root-input",
+        "pathSource": {
+          "relativePath": "AGENTS.md",
+          "resolver": "getPaths().globalStorageUri"
+        },
+        "repository": "RulesCatalog",
+        "codec": "MarkdownTextCodec",
+        "disposition": "preserve-in-place",
+        "indexPolicy": "not-applicable",
+        "recordsPolicy": "leave-file-byte-identical",
+        "verification": [
+          "path-and-digest-unchanged"
+        ],
+        "unknownFilePolicy": "not-applicable"
+      },
+      {
+        "id": "external.global-claude-rule",
+        "logicalDomain": "GlobalClaudeRule",
+        "physicalKind": "external-data-root-input",
+        "pathSource": {
+          "relativePath": "CLAUDE.md",
+          "resolver": "getPaths().globalStorageUri"
+        },
+        "repository": "RulesCatalog",
+        "codec": "MarkdownTextCodec",
+        "disposition": "preserve-in-place",
+        "indexPolicy": "not-applicable",
+        "recordsPolicy": "leave-file-byte-identical",
+        "verification": [
+          "path-and-digest-unchanged"
+        ],
+        "unknownFilePolicy": "not-applicable"
+      },
+      {
+        "id": "external.workspace",
+        "logicalDomain": "WorkspaceFilesAndProjectCatalogInputs",
+        "physicalKind": "workspace-external",
+        "pathSource": {
+          "resolver": "vscode.workspace.workspaceFolders"
+        },
+        "repository": "WorkspaceExternal",
+        "codec": "not-applicable",
+        "disposition": "external-untouched",
+        "indexPolicy": "not-applicable",
+        "recordsPolicy": "do-not-move-modify-or-enumerate-for-cutover",
+        "verification": [
+          "no-workspace-mutation-receipt-during-cutover"
+        ],
+        "unknownFilePolicy": "leave-untouched"
+      },
+      {
+        "id": "external.unknown-data-root-files",
+        "logicalDomain": "UserOwnedUnknownDataRootContent",
+        "physicalKind": "external-data-root-input",
+        "pathSource": {
+          "resolver": "getPaths().globalStorageUri minus declared manifest entries"
+        },
+        "repository": "none-user-owned",
+        "codec": "opaque",
+        "disposition": "external-untouched",
+        "indexPolicy": "not-applicable",
+        "recordsPolicy": "never-move-delete-or-rewrite",
+        "verification": [
+          "pre-post-path-and-digest-set-identical"
+        ],
+        "unknownFilePolicy": "leave-untouched"
+      },
+      {
+        "id": "control.data-root-backups",
+        "logicalDomain": "ExistingDataRootBackups",
+        "physicalKind": "root-authority-control",
+        "pathSource": {
+          "storagePathsProperty": "dataBackupsRootUri",
+          "relativePath": ".limcode-data-backups"
+        },
+        "repository": "DataEpochRepository",
+        "codec": "opaque-existing-backup",
+        "disposition": "preserve-in-place",
+        "indexPolicy": "not-applicable",
+        "recordsPolicy": "do-not-fold-existing-backups-into-new-archive",
+        "verification": [
+          "path-unchanged"
+        ],
+        "unknownFilePolicy": "leave-untouched"
+      },
+      {
+        "id": "control.data-reset-pending",
+        "logicalDomain": "LegacyResetPendingMarker",
+        "physicalKind": "root-authority-control",
+        "pathSource": {
+          "storagePathsProperty": "dataResetPendingUri",
+          "relativePath": ".limcode-data-reset-pending.json"
+        },
+        "repository": "DataEpochRepository",
+        "codec": "LegacyResetPendingCodec",
+        "disposition": "archive-reset-whole",
+        "indexPolicy": "not-applicable",
+        "recordsPolicy": "must-be-absent-before-cutover-or-archive-with-legacy-control-data",
+        "verification": [
+          "not-present-in-new-runtime-root"
+        ],
+        "unknownFilePolicy": "not-applicable"
+      },
+      {
+        "id": "control.root-binding-pointer",
+        "logicalDomain": "RootAuthorityBinding",
+        "physicalKind": "root-authority-control",
+        "pathSource": {
+          "relativePath": "root-binding.json",
+          "resolver": "data-root-parent"
+        },
+        "repository": "RootAuthority",
+        "codec": "RootBindingCodec",
+        "disposition": "preserve-in-place",
+        "indexPolicy": "atomic-pointer-revision",
+        "recordsPolicy": "replace-only-after-archive-config-verification-sqlite-cas-and-epoch-ready",
+        "verification": [
+          "generation-fence",
+          "pointer-revision",
+          "runtime-kernel-epoch"
+        ],
+        "unknownFilePolicy": "not-applicable"
+      }
+    ]
+  },
+  "cutoverActor": {
+    "oldHost": "关闭新命令 admission、完成 drain、持久化 cutover request 后退出；不在退出后继续执行。",
+    "installer": "VS Code 关闭后用本机 code --install-extension 安装同一个最终 VSIX。",
+    "finalHost": "最终 VSIX 先进入 cutover-only coordinator；归档与校验完成前禁止打开 SQLite 或启动 Runtime。"
+  },
+  "cutoverSequence": [
+    "close-command-admission",
+    "drain-checks",
+    "persist-cutover-request",
+    "quit-vscode-window",
+    "install-final-vsix",
+    "restart-extension-host-cutover-only",
+    "archive-runtime-with-journal",
+    "filter-and-verify-configuration",
+    "create-new-root-binding-pending",
+    "create-limcode-sqlite-and-cas",
+    "write-current-runtime-kernel-epoch",
+    "atomic-activate-root-binding",
+    "open-new-runtime-only",
+    "run-installed-gate"
+  ],
+  "stopLegacyWritesMechanism": "旧宿主先关闭 admission 并 drain，再持久化 cutover request；退出 VS Code 窗口后旧 Extension Host 不再存在。最终 VSIX 的 cutover-only coordinator 是归档执行主体。",
+  "drainChecklist": [
+    "no-active-turn",
+    "no-background-process",
+    "no-pending-provider-stream",
+    "no-persist-inflight"
+  ],
+  "archiveContract": {
+    "location": "backups/<timestamp>/，与数据根同级",
+    "actor": "final-vsix-cutover-only-coordinator",
+    "method": "同文件系统优先 journaled rename；跨文件系统使用 copy+digest verify，全部验证后再删除源；每一步写 pending journal。",
+    "verification": "逐 physicalManifest entry 核对 disposition、树摘要、JSON/index/records 一致性和配置过滤结果。",
+    "rollback": "RootBinding 激活前失败时按 journal 逆序恢复 rename，或从已验证 copy 恢复已删除源；旧 active pointer 不变。",
+    "failureRule": "归档或核对失败属于激活前失败：不得写新 active pointer，不视为已切换。"
+  },
+  "preserveAndVerify": {
+    "verify": "以 physicalManifest 为唯一物理清单；不再用“七个配置域目录”自然语言代替。",
+    "configurationManifest": "authority.json#configurationDomains",
+    "rules": [
+      "global settings records preserved",
+      "conversation settings removed",
+      "conversation/run/agentSystem scope links removed",
+      "global/agent/workflow scope links preserved",
+      "all rewritten indexes match records",
+      "skills/rules unchanged and rescanned",
+      "workspace untouched",
+      "unknown user files untouched"
+    ]
+  },
+  "rootBinding": {
+    "pointer": "root-binding.json，位于数据根上级",
+    "writeProtocol": [
+      "write-new-root-pending",
+      "create-limcode-sqlite-and-cas",
+      "write-runtime-kernel-epoch",
+      "fsync",
+      "atomic-rename-pointer",
+      "delete-pending"
+    ],
+    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；普通启动发现 pending 或缺少 epoch 时拒绝打开 Runtime。"
+  },
+  "epochPolicy": {
+    "current": "runtimeKernelEpoch bump = 运行数据归档重置（对话历史丢失）",
+    "status": "已接受的永久策略",
+    "roadmapNote": "后续可考虑引入最小迁移机制"
+  },
+  "failureRule": "激活前失败保持旧 active pointer 且旧数据可恢复；激活后失败只修复新内核，不自动回退旧写入器。",
+  "rootChange": "最终 VSIX 的新宿主在数据库打开前完成 cutover-only coordinator 与 RootBinding 原子激活。"
+}

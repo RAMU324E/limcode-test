@@ -1,0 +1,267 @@
+{
+  "contractKind": "subagent",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "保留日常多Agent协作能力，用稳定子执行谱系、答案桥和运行时收件箱表达控制与交付。",
+  "toolName": "run_agent",
+  "operations": [
+    "spawn",
+    "send",
+    "wait",
+    "list",
+    "cancel",
+    "cancel_subtree"
+  ],
+  "lineage": {
+    "domains": [
+      "ChildExecution",
+      "ChildExecutionParentLink",
+      "ChildExecutionTurnLink",
+      "ChildExecutionIntentLink",
+      "ChildExecutionActiveTurnLink"
+    ],
+    "identity": "ChildExecution 是一次稳定子代理谱系；首次 Turn、续接 Turn 和尚未 admit 的 TurnIntent 均通过独立 Link 归属它",
+    "treeEdge": "ChildExecutionParentLink 是稳定树边；续接时不改 parent，后代不会因 active Turn 切换而丢失",
+    "activeTurn": "ChildExecutionActiveTurnLink 只表达当前活动 Turn，不用于推导树归属",
+    "rule": "树遍历按 ChildExecutionParentLink 递归，执行控制再读取各 lineage 的 ActiveTurnLink 与 pending IntentLink。"
+  },
+  "spawn": {
+    "creates": [
+      "child Conversation when needed",
+      "ChildExecution",
+      "ChildExecutionParentLink",
+      "child Turn",
+      "ChildExecutionTurnLink",
+      "ChildExecutionActiveTurnLink",
+      "AnswerBridge"
+    ],
+    "unique": [
+      "ChildExecution.childConversationId",
+      "ChildExecutionParentLink.childExecutionId",
+      "ChildExecutionParentLink.sourceToolCallId",
+      "ChildExecutionTurnLink.turnId",
+      "ChildExecutionActiveTurnLink.childExecutionId",
+      "AnswerBridge.childExecutionId"
+    ],
+    "completionPolicies": [
+      "wait_for_answer",
+      "background"
+    ],
+    "precheck": "父树已终止（父Turn终态或所属ChildExecution子树已写入终止意图）时拒绝创建，不产生半创建事实。",
+    "prepareAtomicity": "ChildExecution、稳定父边、首个Turn、membership、active link、AnswerBridge与spawn EffectIntent在一个SQLite事务中建立。",
+    "rule": "wait_for_answer可以在本地等待到期后转为后台返回控制句柄，子Turn继续运行；background在启动成功后立即返回控制句柄。",
+    "failureSettlement": {
+      "syncOrDispatchFailure": "同步创建失败或派发失败经EffectReceipt(failed) reconcile为ToolOutcome(failed)，生成唯一ToolModelResult，并终止已准备但未启动的child Turn。",
+      "unknownAfterDispatch": "已派发但无法核验时写outcome_unknown receipt，ChildExecution进入needs_human/terminated，不自动重复spawn。"
+    }
+  },
+  "completionPolicyConsumption": {
+    "wait_for_answer": "答案在前台等待期内到达时，用答案结算原ToolCall；等待到期时用后台控制句柄结算原ToolCall，后续答案改走RuntimeInbox。",
+    "background": "ChildExecution和AnswerBridge创建成功后，用后台控制句柄结算原ToolCall；后续答案始终走RuntimeInbox。",
+    "secondToolModelResultAllowed": false,
+    "foregroundWait": {
+      "deadlineColumn": "ToolExecution.wait_deadline_at",
+      "waitingStatus": "waiting_answer",
+      "rule": "前台等待的deadline持久化在ToolExecution.wait_deadline_at列；等待期内ToolExecution.status=waiting_answer。",
+      "expiredSweep": "重启扫描发现已过期的前台等待，按到期同一规则转后台控制句柄结算原ToolCall。",
+      "lateAnswerBehavior": "转后台后答案到达走RuntimeInbox，可进入下一次明确启动的Turn，但不强行启动父模型。"
+    }
+  },
+  "send": {
+    "modes": [
+      "queue_next_turn",
+      "interrupt_current_turn"
+    ],
+    "storage": [
+      "TurnIntent",
+      "PendingTurnInput"
+    ],
+    "rule": "追加信息走正常Turn输入；排队模式建立TurnIntent与ChildExecutionIntentLink，打断模式先请求结束当前Turn，再创建明确续接Turn。",
+    "continuationTurn": {
+      "createsNewChildExecution": false,
+      "turnMembership": "每个续接Turn写ChildExecutionTurnLink并按lineage内turn_seq排序",
+      "queuedIntentMembership": "尚未admit的续接意图写ChildExecutionIntentLink",
+      "activePointer": "新Turn取得执行权时同事务更新ChildExecutionActiveTurnLink",
+      "bridgeReuse": "AnswerBridge挂ChildExecution，所有续接Turn复用同一bridge。"
+    }
+  },
+  "wait": {
+    "readOnly": true,
+    "mayUseLocalTimeout": true,
+    "changesDeliveryState": false,
+    "snapshotRule": "wait基于单SQLite读事务快照观察，不跨多次读取拼接状态，也不长期持有读事务。",
+    "rule": "等待只观察ChildExecution、当前Turn、答案和交付状态，不消费答案，也不制造新的运行事实。"
+  },
+  "answer": {
+    "domains": [
+      "AnswerBridge",
+      "AnswerSubmission"
+    ],
+    "bridgeOwner": "ChildExecution",
+    "oneCurrentSubmissionPerBridge": true,
+    "largeContent": "cas",
+    "atomicCommit": "AnswerSubmission insert、AnswerBridge.current_submission_id update和RuntimeInboxItem insert在同一事务提交。",
+    "dedupeKey": "answer:{answerBridgeId}:{submissionId}",
+    "bridgeFlip": "bridge翻转到新submission后，旧submission已生成的pending RuntimeDelivery保留可交付，UI按submission分别展示。",
+    "rule": "答案先成为ChildExecution对应AnswerBridge上的持久事实，再创建RuntimeInboxItem；父Turn是否正在运行不影响答案存在。",
+    "interruptedAnswer": "ChildExecution当前Turn被中断时，提取已积累的部分结果作为答案正文入库，submission标interrupted=true；父消费后当弱信号处理。"
+  },
+  "delivery": {
+    "domains": [
+      "RuntimeInboxItem",
+      "RuntimeDelivery",
+      "RuntimeDeliveryInputLink"
+    ],
+    "inboxBoundary": "RuntimeInboxItem只保存来源事实；目标Conversation、目标Turn、phase与attempt都属于RuntimeDelivery。",
+    "phases": [
+      "current_turn",
+      "next_turn",
+      "notify_only"
+    ],
+    "states": [
+      "pending",
+      "consumed",
+      "failed"
+    ],
+    "deadLetterQueue": false,
+    "targetGone": "目标Conversation/Turn不存在时，RuntimeInboxItem保留为事实，RuntimeDelivery置failed(reason=target-gone)。",
+    "identity": {
+      "attemptSeq": "每个inbox+destination+phase从1开始",
+      "targetNullUnique": "(inbox_item_id,target_conversation_id,phase,attempt_seq) UNIQUE WHERE target_turn_id IS NULL",
+      "targetPresentUnique": "(inbox_item_id,target_conversation_id,target_turn_id,phase,attempt_seq) UNIQUE WHERE target_turn_id IS NOT NULL",
+      "redeliver": "用户明确重投时创建attempt_seq+1的新RuntimeDelivery并写retry_of_delivery_id；旧failed行不复活"
+    },
+    "nextTurnTarget": {
+      "targetTurnIdNullable": true,
+      "writebackRule": "phase=next_turn的RuntimeDelivery.target_turn_id允许为空，由新Turn在启动事务内回写。",
+      "advancementMatrix": [
+        {
+          "phase": "current_turn",
+          "targetTurn": "active",
+          "action": "保持pending，在目标Turn下一安全边界创建RuntimeDeliveryInputLink并注入后置consumed"
+        },
+        {
+          "phase": "current_turn",
+          "targetTurn": "terminated",
+          "action": "按当前可注入性改投：可注入新Turn则转next_turn(target_turn_id=NULL)，否则转notify_only"
+        },
+        {
+          "phase": "next_turn",
+          "targetTurn": "none",
+          "action": "保持pending，等待新Turn启动事务内回写target_turn_id"
+        },
+        {
+          "phase": "next_turn",
+          "targetTurn": "active",
+          "action": "创建RuntimeDeliveryInputLink并注入后置consumed；执行器吸收对应输入时写handled_at"
+        },
+        {
+          "phase": "next_turn",
+          "targetTurn": "terminated",
+          "action": "按当前可注入性改投新Turn(next_turn)或notify_only"
+        },
+        {
+          "phase": "notify_only",
+          "targetTurn": "any",
+          "action": "不自动启动模型；UI确认通知后可置consumed，用户明确注入时创建下一delivery attempt"
+        }
+      ]
+    },
+    "parentTurnRecovery": "父Turn重启后的恢复判定以identity.json recoveryJudgment节为唯一权威。",
+    "rule": "当前Turn可以安全接收时注入本轮，否则进入下一轮或只通知；失败保留原因，人工重投创建新attempt。"
+  },
+  "parentHandling": {
+    "source": "RuntimeDelivery.state + RuntimeDeliveryInputLink.handled_at",
+    "deliveryConsumedMeansParentCompleted": false,
+    "rule": "consumed只表示答案已可靠注入目标Turn输入；只有对应InputLink写入handled_at后，界面才显示父Turn已处理。"
+  },
+  "parentHandlingStates": {
+    "values": [
+      "unhandled",
+      "handled",
+      "not_applicable"
+    ],
+    "inputs": [
+      "delivery.state",
+      "delivery.phase",
+      "deliveryInputLink存在性",
+      "deliveryInputLink.handled_at"
+    ],
+    "precedence": "按derivation列出顺序取首个匹配，覆盖全部组合。",
+    "derivation": [
+      {
+        "deliveryState": "failed",
+        "phase": "any",
+        "inputLink": "any",
+        "handledAt": "any",
+        "parentHandlingState": "unhandled"
+      },
+      {
+        "deliveryState": "pending",
+        "phase": "any",
+        "inputLink": "any",
+        "handledAt": "any",
+        "parentHandlingState": "unhandled"
+      },
+      {
+        "deliveryState": "consumed",
+        "phase": "notify_only",
+        "inputLink": "absent",
+        "handledAt": "absent",
+        "parentHandlingState": "not_applicable"
+      },
+      {
+        "deliveryState": "consumed",
+        "phase": "current_turn|next_turn",
+        "inputLink": "exists",
+        "handledAt": "absent",
+        "parentHandlingState": "unhandled"
+      },
+      {
+        "deliveryState": "consumed",
+        "phase": "current_turn|next_turn",
+        "inputLink": "exists",
+        "handledAt": "exists",
+        "parentHandlingState": "handled"
+      }
+    ],
+    "materialization": "RuntimeDeliveryRepository根据同一事务写入的InputLink/handled_at物化parent_handling_state，前端只读。",
+    "candidateChecks": "全组合推导表登记candidate checks逐条验证。",
+    "idempotentTransition": "旧delivery只允许pending→consumed或pending→failed；redeliver创建新attempt，不改旧终态。",
+    "consumedSemantics": "consumed是持久化注入ACK；handled_at才是父执行器已吸收对应输入的持久事实。",
+    "interruptedSignalRule": "消费interrupted=true答案并写handled_at后仍为handled，但UI必须显示中断态弱信号。"
+  },
+  "cancel": {
+    "single": "向ChildExecutionActiveTurnLink指向的目标Turn发出正常终止命令",
+    "subtree": "从目标ChildExecution沿ChildExecutionParentLink递归枚举全部后代；同一事务对所有ActiveTurnLink目标写终止意图，并把所有pending ChildExecutionIntentLink置cancelled",
+    "requestIsTerminal": false,
+    "lateAnswer": "答案仍可保存，但不会重新打开已结束的父Turn；中断时提取部分结果标interrupted入库。",
+    "restartSweep": "重启后续扫已写子树终止意图但仍有active Turn或pending Intent的lineage并补写终止/取消。"
+  },
+  "recoveryOwnership": {
+    "stage": "F",
+    "scanIds": [
+      "recovery.answer-inbox-invariant",
+      "recovery.delivery-pending",
+      "recovery.foreground-answer-wait-expired",
+      "recovery.cancelled-subtree-incomplete"
+    ],
+    "rule": "D 只提供通用 scanner 框架并实现 D owner 项；以上四项只由 F 注册与实现。"
+  },
+  "uiFacts": [
+    "childExecutionState",
+    "activeChildTurnState",
+    "answerSubmissionState",
+    "runtimeDeliveryState",
+    "parentHandlingState",
+    "terminationState"
+  ],
+  "forbiddenInference": [
+    "AgentRun.activityStage",
+    "notificationRun",
+    "display-text"
+  ],
+  "releaseDecisions": {
+    "cancelSubtree": "required-first-release"
+  }
+}

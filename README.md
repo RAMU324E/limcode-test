@@ -49,7 +49,8 @@ npm run watch            # 监听并编译扩展后端 TS
 npm run dev:webview      # 启动 Vue Webview Vite dev server
 npm run build:webview    # 构建 Webview 静态资源
 npm run build            # 编译后端 + 构建 Webview
-npm run check            # 编译后端 + Webview 类型检查
+npm run check            # 构建、类型检查和可靠内核计划合同校验
+npm run check:local      # 在上述校验后，再运行仅本机存在且被Git忽略的tests/
 ```
 
 ## 目录概览
@@ -64,6 +65,7 @@ docs/                    # 架构与开发约束说明
 
 ## 架构文档
 
-- [Conversation 可靠存储权威模型](docs/conversation-storage-authority.md)
-- [模型上下文投影、中断与压缩一致性](docs/model-context-projection.md)
-- [后台进程 completion 可靠注入语义](docs/background-process-reliability.md)
+- [可靠运行内核目标计划](docs/architecture/reliable-kernel/README.md)：未来目标和实施门禁，当前尚未完成。
+- [Conversation 可靠存储权威模型](docs/conversation-storage-authority.md)：当前文件后端实现说明；对应能力切换后转为历史记录。
+- [模型上下文投影、中断与压缩一致性](docs/model-context-projection.md)：当前实现说明；Provider/Context 能力切换后转为历史记录。
+- [后台进程 completion 可靠注入语义](docs/background-process-reliability.md)：当前实现说明；Runtime/Tool/File 能力切换后转为历史记录。

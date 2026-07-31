@@ -1,0 +1,1698 @@
+{
+  "contractKind": "authority",
+  "notes": [
+    "r3 Context: ContentObject 去重正文，ContextSegment 表达来源出现；序列允许分支并由 ConversationContextHeadLink 显式选择当前 root",
+    "r3 Context: 压缩 root 使用 tail_node_id+tail_segment_count；root/node 保留到 dataset reset；ModelStreamCheckpoint 仅允许终态维护删除",
+    "r3 Delivery: RuntimeInboxItem 只保存来源事实；RuntimeDelivery 使用 NULL/非 NULL 部分唯一索引、attempt_seq 与 RuntimeDeliveryInputLink",
+    "r3 Subagent: ChildExecution 是稳定谱系，Parent/Turn/Intent/ActiveTurn 分别由独立 Link 表达，AnswerBridge 归属 ChildExecution",
+    "r3: EffectIntent/EffectReceipt/FileMutationReceipt/ProcessReceipt 为 dataset-reset-only，跨 deletePolicy 引用使用软引用",
+    "r3: 所有 *_seq 列使用 SQLite INTEGER 并由单写者事务分配，message_seq 含软删消息终身不复用",
+    "r3: CommandReceipt 使用 source_kind,source_key UNIQUE 覆盖 command/callback/internal/recovery",
+    "r3: AgentConversationLink 表达当前默认 agent 指针，历史执行归属由 TurnExecutorLink 承担",
+    "r3: runtimeDomains 精确集合由 plan validator 与各领域合同交叉核对",
+    "r4: 首发禁用 ProviderContinuation，不建对应运行表；保留 Conversation fork 三类独立 Link",
+    "r4: 配置 authority 逐对象/ScopeLink crosswalk 到 migration physical manifest；不再用聚合 Policy 代替独立领域",
+    "r4: Process 使用 detached wrapper 与每进程有界 CAS chunks；MCP 调用复用 EffectIntent/Receipt"
+  ],
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "productScope": "single-user-local-extension",
+  "runtimeDatabase": {
+    "engine": "sqlite",
+    "fileName": "limcode.sqlite",
+    "filesPerDataSet": 1,
+    "genericJsonTables": false,
+    "arbitrarySqlBatch": false,
+    "businessWritesThroughRepositories": true,
+    "pragmas": {
+      "journal_mode": "wal",
+      "synchronous": "normal",
+      "busy_timeout_ms": 5000,
+      "foreign_keys": "on-per-connection"
+    },
+    "connectionModel": {
+      "writer": "single-dedicated-worker",
+      "reader": "wal-snapshot"
+    },
+    "nestingPolicy": "savepoint"
+  },
+  "schemaPolicy": {
+    "currentManifestRequired": true,
+    "runtimeKernelEpoch": "single-current-epoch",
+    "incrementalLegacyMigrationChain": false,
+    "incompatibleRuntimeData": "archive-and-reset"
+  },
+  "sequenceAllocation": {
+    "columnType": "INTEGER",
+    "allocation": "single-writer-transaction-max-plus-one",
+    "concurrency": "single-writer-no-race",
+    "messageSeqReuse": "never-including-soft-deleted-messages"
+  },
+  "rootPolicy": {
+    "mode": "offline-restart-only",
+    "onlineMigration": false,
+    "pathSource": "getPaths-and-RootAuthority",
+    "rootBindingFields": [
+      "paths",
+      "dataSetId",
+      "rootInstanceId",
+      "rootGeneration",
+      "pointerRevision",
+      "runtimeKernelEpoch"
+    ]
+  },
+  "configurationDomains": [
+    {
+      "key": "Agent",
+      "authority": "configuration-file-root",
+      "repository": "AgentSettingsRepository",
+      "codec": "AgentSettingsCodec",
+      "migrationEntryIds": [
+        "root.agents"
+      ]
+    },
+    {
+      "key": "Workflow",
+      "authority": "configuration-file-root",
+      "repository": "WorkflowSettingsRepository",
+      "codec": "WorkflowSettingsCodec",
+      "migrationEntryIds": [
+        "root.workflows"
+      ]
+    },
+    {
+      "key": "PlanReviewPolicy",
+      "authority": "configuration-file-root",
+      "repository": "PlanReviewPolicySettingsRepository",
+      "codec": "PlanReviewPolicySettingsCodec",
+      "migrationEntryIds": [
+        "root.plan-review-policies"
+      ]
+    },
+    {
+      "key": "PlanReviewPolicyScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "PlanReviewPolicyScopeLinkSettingsRepository",
+      "codec": "PlanReviewPolicyScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.plan-review-policy-scope-links"
+      ]
+    },
+    {
+      "key": "ToolPolicy",
+      "authority": "configuration-file-root",
+      "repository": "ToolPolicySettingsRepository",
+      "codec": "ToolPolicySettingsCodec",
+      "migrationEntryIds": [
+        "root.tool-policies"
+      ]
+    },
+    {
+      "key": "ToolPolicyScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "ToolPolicyScopeLinkSettingsRepository",
+      "codec": "ToolPolicyScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.tool-policy-scope-links"
+      ]
+    },
+    {
+      "key": "SkillPolicy",
+      "authority": "configuration-file-root",
+      "repository": "SkillPolicySettingsRepository",
+      "codec": "SkillPolicySettingsCodec",
+      "migrationEntryIds": [
+        "root.skill-policies"
+      ]
+    },
+    {
+      "key": "SkillPolicyScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "SkillPolicyScopeLinkSettingsRepository",
+      "codec": "SkillPolicyScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.skill-policy-scope-links"
+      ]
+    },
+    {
+      "key": "SystemPrompt",
+      "authority": "configuration-file-root",
+      "repository": "SystemPromptSettingsRepository",
+      "codec": "SystemPromptSettingsCodec",
+      "migrationEntryIds": [
+        "root.system-prompts"
+      ]
+    },
+    {
+      "key": "SystemPromptScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "SystemPromptScopeLinkSettingsRepository",
+      "codec": "SystemPromptScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.system-prompt-scope-links"
+      ]
+    },
+    {
+      "key": "ModelProfile",
+      "authority": "configuration-file-root",
+      "repository": "ModelProfileSettingsRepository",
+      "codec": "ModelProfileSettingsCodec",
+      "migrationEntryIds": [
+        "root.model-profiles"
+      ]
+    },
+    {
+      "key": "ModelProfileScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "ModelProfileScopeLinkSettingsRepository",
+      "codec": "ModelProfileScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.model-profile-scope-links"
+      ]
+    },
+    {
+      "key": "GlobalSettings",
+      "authority": "configuration-file-root",
+      "repository": "GlobalSettingsRepository",
+      "codec": "GlobalSettingsSectionCodec",
+      "migrationEntryIds": [
+        "setting.common",
+        "setting.llm",
+        "setting.llmCompression",
+        "setting.checkpointMaintenance",
+        "setting.appearance",
+        "setting.attachments"
+      ]
+    },
+    {
+      "key": "LlmProviderConfig",
+      "authority": "configuration-file-root",
+      "repository": "LlmProviderConfigSettingsRepository",
+      "codec": "LlmProviderConfigSettingsCodec",
+      "migrationEntryIds": [
+        "setting.llmProviderConfigs"
+      ]
+    },
+    {
+      "key": "LlmCompressionConfig",
+      "authority": "configuration-file-root",
+      "repository": "LlmCompressionConfigSettingsRepository",
+      "codec": "LlmCompressionConfigSettingsCodec",
+      "migrationEntryIds": [
+        "setting.llmCompressionConfigs"
+      ]
+    },
+    {
+      "key": "McpServerConfig",
+      "authority": "configuration-file-root",
+      "repository": "McpServerConfigSettingsRepository",
+      "codec": "McpServerConfigSettingsCodec",
+      "migrationEntryIds": [
+        "setting.mcpServers"
+      ]
+    },
+    {
+      "key": "WorkEnvironment",
+      "authority": "configuration-file-root",
+      "repository": "WorkEnvironmentSettingsRepository",
+      "codec": "WorkEnvironmentSettingsCodec",
+      "migrationEntryIds": [
+        "root.work-environments"
+      ]
+    },
+    {
+      "key": "WorkEnvironmentPolicy",
+      "authority": "configuration-file-root",
+      "repository": "WorkEnvironmentPolicySettingsRepository",
+      "codec": "WorkEnvironmentPolicySettingsCodec",
+      "migrationEntryIds": [
+        "root.work-environment-policies"
+      ]
+    },
+    {
+      "key": "WorkEnvironmentPolicyScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "WorkEnvironmentPolicyScopeLinkSettingsRepository",
+      "codec": "WorkEnvironmentPolicyScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.work-environment-policy-scope-links"
+      ]
+    },
+    {
+      "key": "RuntimeContext",
+      "authority": "configuration-file-root",
+      "repository": "RuntimeContextSettingsRepository",
+      "codec": "RuntimeContextSettingsCodec",
+      "migrationEntryIds": [
+        "root.runtime-contexts"
+      ]
+    },
+    {
+      "key": "RuntimeContextScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "RuntimeContextScopeLinkSettingsRepository",
+      "codec": "RuntimeContextScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.runtime-context-scope-links"
+      ]
+    },
+    {
+      "key": "CheckpointPolicy",
+      "authority": "configuration-file-root",
+      "repository": "CheckpointPolicySettingsRepository",
+      "codec": "CheckpointPolicySettingsCodec",
+      "migrationEntryIds": [
+        "root.checkpoint-policies"
+      ]
+    },
+    {
+      "key": "CheckpointPolicyScopeLink",
+      "authority": "configuration-file-root",
+      "repository": "CheckpointPolicyScopeLinkSettingsRepository",
+      "codec": "CheckpointPolicyScopeLinkSettingsCodec",
+      "migrationEntryIds": [
+        "root.checkpoint-policy-scope-links"
+      ]
+    }
+  ],
+  "domainEntryFields": [
+    "key",
+    "table",
+    "repository",
+    "codec",
+    "mutations",
+    "client",
+    "deletePolicy",
+    "resetPolicy",
+    "indexes"
+  ],
+  "runtimeDomains": [
+    {
+      "key": "ContentObject",
+      "table": "content_object",
+      "repository": "ContentObjectRepository",
+      "codec": "ContentObjectRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "content_type,sha256,byte_length UNIQUE"
+      ]
+    },
+    {
+      "key": "Conversation",
+      "table": "conversation",
+      "repository": "ConversationRepository",
+      "codec": "ConversationRowCodec",
+      "mutations": [
+        "insert",
+        "update",
+        "delete"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-runtime-children",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "updated_at,id"
+      ]
+    },
+    {
+      "key": "ConversationReuseLink",
+      "table": "conversation_reuse_link",
+      "repository": "ConversationReuseLinkRepository",
+      "codec": "ConversationReuseLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update",
+        "delete"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "reuse_key UNIQUE",
+        "conversation_id",
+        "agent_id"
+      ],
+      "notes": [
+        "稳定 reuse key 到 Conversation/Agent 的独立关系；不嵌入 Conversation。"
+      ]
+    },
+    {
+      "key": "ConversationBranchLink",
+      "table": "conversation_branch_link",
+      "repository": "ConversationBranchLinkRepository",
+      "codec": "ConversationBranchLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-target-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "target_conversation_id UNIQUE",
+        "source_conversation_id,created_at"
+      ],
+      "notes": [
+        "字段使用 source_message_revision_id?；目标 fork 只登记一个直接 branch 来源。"
+      ]
+    },
+    {
+      "key": "ConversationOriginLink",
+      "table": "conversation_origin_link",
+      "repository": "ConversationOriginLinkRepository",
+      "codec": "ConversationOriginLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id UNIQUE",
+        "source_conversation_id",
+        "source_turn_id",
+        "source_tool_call_id"
+      ],
+      "notes": [
+        "历史执行来源使用 source_turn_id，不允许 source_run_id；Agent/Conversation/MessageRevision/ToolCall/Turn 均为软来源引用。"
+      ]
+    },
+    {
+      "key": "AgentConversationLink",
+      "table": "agent_conversation_link",
+      "repository": "AgentConversationLinkRepository",
+      "codec": "AgentConversationLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update",
+        "delete"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,role UNIQUE",
+        "agent_id"
+      ],
+      "notes": [
+        "(conversation_id,role) UNIQUE 语义为当前默认 agent 指针；历史执行归属由 TurnExecutorLink 承担"
+      ]
+    },
+    {
+      "key": "Turn",
+      "table": "turn",
+      "repository": "TurnRepository",
+      "codec": "TurnRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,created_at,id",
+        "status"
+      ]
+    },
+    {
+      "key": "TurnIntent",
+      "table": "turn_intent",
+      "repository": "TurnIntentRepository",
+      "codec": "TurnIntentRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id"
+      ],
+      "notes": [
+        "turn_id 可空（admit 前为空），普通索引非 UNIQUE"
+      ]
+    },
+    {
+      "key": "TurnIntentRevision",
+      "table": "turn_intent_revision",
+      "repository": "TurnIntentRevisionRepository",
+      "codec": "TurnIntentRevisionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-intent",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "intent_id,revision_seq UNIQUE"
+      ]
+    },
+    {
+      "key": "TurnExecutionPresetRevision",
+      "table": "turn_execution_preset_revision",
+      "repository": "TurnExecutionPresetRevisionRepository",
+      "codec": "TurnExecutionPresetRevisionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-intent",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "intent_id,revision_seq UNIQUE"
+      ]
+    },
+    {
+      "key": "PendingTurnInput",
+      "table": "pending_turn_input",
+      "repository": "PendingTurnInputRepository",
+      "codec": "PendingTurnInputRowCodec",
+      "mutations": [
+        "insert",
+        "update",
+        "delete"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id,position UNIQUE"
+      ]
+    },
+    {
+      "key": "ExecutionLease",
+      "table": "execution_lease",
+      "repository": "ExecutionLeaseRepository",
+      "codec": "ExecutionLeaseRowCodec",
+      "mutations": [
+        "insert",
+        "update",
+        "delete"
+      ],
+      "client": "summary",
+      "deletePolicy": "release-on-terminal",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id UNIQUE",
+        "turn_id UNIQUE"
+      ]
+    },
+    {
+      "key": "AuthoritySnapshot",
+      "table": "authority_snapshot",
+      "repository": "AuthoritySnapshotRepository",
+      "codec": "AuthoritySnapshotRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id,created_at"
+      ]
+    },
+    {
+      "key": "TurnTermination",
+      "table": "turn_termination",
+      "repository": "TurnTerminationRepository",
+      "codec": "TurnTerminationRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id UNIQUE"
+      ]
+    },
+    {
+      "key": "TurnExecutorLink",
+      "table": "turn_executor_link",
+      "repository": "TurnExecutorLinkRepository",
+      "codec": "TurnExecutorLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id UNIQUE",
+        "agent_id"
+      ]
+    },
+    {
+      "key": "CommandReceipt",
+      "table": "command_receipt",
+      "repository": "CommandReceiptRepository",
+      "codec": "CommandReceiptRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "source_kind,source_key UNIQUE",
+        "conversation_id,created_at"
+      ],
+      "notes": [
+        "source_kind ∈ {command,callback,internal,recovery}；source_key 为各来源自有键，替代原单一 command_id UNIQUE"
+      ]
+    },
+    {
+      "key": "Message",
+      "table": "message",
+      "repository": "MessageRepository",
+      "codec": "MessageRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "window",
+      "deletePolicy": "soft-delete",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "created_at,id"
+      ],
+      "notes": [
+        "软删不触发 cascade，revision 保留；edit/delete 创建新的 current ContextSequenceRoot，既有 root/projection 不按当前软删状态重解释；message_seq 终身不复用（含软删消息）"
+      ]
+    },
+    {
+      "key": "MessageRevision",
+      "table": "message_revision",
+      "repository": "MessageRevisionRepository",
+      "codec": "MessageRevisionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "window",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id,revision_seq UNIQUE"
+      ]
+    },
+    {
+      "key": "MessageCurrentRevisionLink",
+      "table": "message_current_revision_link",
+      "repository": "MessageCurrentRevisionLinkRepository",
+      "codec": "MessageCurrentRevisionLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id UNIQUE",
+        "revision_id UNIQUE"
+      ]
+    },
+    {
+      "key": "MessagePartOfConversation",
+      "table": "message_part_of_conversation",
+      "repository": "MessagePartOfConversationRepository",
+      "codec": "MessagePartOfConversationRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,message_seq UNIQUE",
+        "message_id UNIQUE"
+      ]
+    },
+    {
+      "key": "MessageTurnLink",
+      "table": "message_turn_link",
+      "repository": "MessageTurnLinkRepository",
+      "codec": "MessageTurnLinkRowCodec",
+      "mutations": [
+        "insert",
+        "delete"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id,message_id,role UNIQUE",
+        "message_id"
+      ]
+    },
+    {
+      "key": "Attachment",
+      "table": "attachment",
+      "repository": "AttachmentRepository",
+      "codec": "AttachmentRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "id UNIQUE",
+        "sha256"
+      ],
+      "notes": [
+        "字段：id,sha256,byte_length,mime_type,name,storage_mode,content_object_id?,created_at"
+      ]
+    },
+    {
+      "key": "AttachmentLink",
+      "table": "attachment_link",
+      "repository": "AttachmentLinkRepository",
+      "codec": "AttachmentLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-message",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_revision_id,attachment_id,position UNIQUE"
+      ]
+    },
+    {
+      "key": "InteractionRequest",
+      "table": "interaction_request",
+      "repository": "InteractionRequestRepository",
+      "codec": "InteractionRequestRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "status,created_at"
+      ]
+    },
+    {
+      "key": "InteractionOwnerLink",
+      "table": "interaction_owner_link",
+      "repository": "InteractionOwnerLinkRepository",
+      "codec": "InteractionOwnerLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-request",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "request_id UNIQUE",
+        "turn_id"
+      ]
+    },
+    {
+      "key": "InteractionResponse",
+      "table": "interaction_response",
+      "repository": "InteractionResponseRepository",
+      "codec": "InteractionResponseRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-request",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "request_id UNIQUE"
+      ]
+    },
+    {
+      "key": "ToolCall",
+      "table": "tool_call",
+      "repository": "ToolCallRepository",
+      "codec": "ToolCallRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id,call_seq UNIQUE",
+        "status"
+      ]
+    },
+    {
+      "key": "ToolCallEvent",
+      "table": "tool_call_event",
+      "repository": "ToolCallEventRepository",
+      "codec": "ToolCallEventRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id,event_seq UNIQUE"
+      ]
+    },
+    {
+      "key": "ToolExecution",
+      "table": "tool_execution",
+      "repository": "ToolExecutionRepository",
+      "codec": "ToolExecutionRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id UNIQUE",
+        "status"
+      ],
+      "notes": [
+        "增 wait_deadline_at 列：前台等待 deadline 持久化；等待期 status=waiting_answer；重启扫描过期等待转后台控制句柄结算"
+      ]
+    },
+    {
+      "key": "Operation",
+      "table": "operation",
+      "repository": "OperationRepository",
+      "codec": "OperationRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-owner",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "owner_kind,owner_id,operation_seq UNIQUE",
+        "tool_call_id",
+        "status"
+      ],
+      "notes": [
+        "owner_kind ∈ {tool_execution,file_change_set,process,child_execution,model_request}"
+      ]
+    },
+    {
+      "key": "Attempt",
+      "table": "attempt",
+      "repository": "AttemptRepository",
+      "codec": "AttemptRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-operation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "operation_id,attempt_seq UNIQUE",
+        "status"
+      ]
+    },
+    {
+      "key": "OutcomePause",
+      "table": "outcome_pause",
+      "repository": "OutcomePauseRepository",
+      "codec": "OutcomePauseRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-operation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "operation_id"
+      ]
+    },
+    {
+      "key": "OperationResolution",
+      "table": "operation_resolution",
+      "repository": "OperationResolutionRepository",
+      "codec": "OperationResolutionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-pause",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "pause_id UNIQUE"
+      ]
+    },
+    {
+      "key": "EffectIntent",
+      "table": "effect_intent",
+      "repository": "EffectIntentRepository",
+      "codec": "EffectIntentRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "attempt_id UNIQUE",
+        "dispatch_state"
+      ],
+      "notes": [
+        "跨 deletePolicy 引用一律软引用（不建外键约束）；dispatch_state ∈ {pending,dispatched,receipt_written}"
+      ]
+    },
+    {
+      "key": "EffectReceipt",
+      "table": "effect_receipt",
+      "repository": "EffectReceiptRepository",
+      "codec": "EffectReceiptRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "attempt_id UNIQUE",
+        "effect_kind,received_at"
+      ],
+      "notes": [
+        "冗余来源标识 conversation_id/tool_call_id/operation_id/effect_kind，来源删除后仍可审计；跨域引用均为软引用"
+      ]
+    },
+    {
+      "key": "ToolOutcome",
+      "table": "tool_outcome",
+      "repository": "ToolOutcomeRepository",
+      "codec": "ToolOutcomeRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id UNIQUE"
+      ]
+    },
+    {
+      "key": "ToolModelResult",
+      "table": "tool_model_result",
+      "repository": "ToolModelResultRepository",
+      "codec": "ToolModelResultRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "window",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id UNIQUE",
+        "message_revision_id UNIQUE"
+      ]
+    },
+    {
+      "key": "ToolResultArtifact",
+      "table": "tool_result_artifact",
+      "repository": "ToolResultArtifactRepository",
+      "codec": "ToolResultArtifactRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id,role UNIQUE"
+      ],
+      "notes": [
+        "role ∈ {inline_content,model_response}；字段：tool_call_id,role,content_object_id"
+      ]
+    },
+    {
+      "key": "FileChangeSet",
+      "table": "file_change_set",
+      "repository": "FileChangeSetRepository",
+      "codec": "FileChangeSetRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id UNIQUE",
+        "status"
+      ]
+    },
+    {
+      "key": "FileChangeSetMember",
+      "table": "file_change_set_member",
+      "repository": "FileChangeSetMemberRepository",
+      "codec": "FileChangeSetMemberRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-change-set",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "change_set_id,member_seq UNIQUE",
+        "change_set_id,target_path"
+      ]
+    },
+    {
+      "key": "FileChangeDecision",
+      "table": "file_change_decision",
+      "repository": "FileChangeDecisionRepository",
+      "codec": "FileChangeDecisionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-change-set",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "change_set_id UNIQUE"
+      ]
+    },
+    {
+      "key": "FileMutationReceipt",
+      "table": "file_mutation_receipt",
+      "repository": "FileMutationReceiptRepository",
+      "codec": "FileMutationReceiptRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "effect_receipt_id UNIQUE",
+        "change_set_id UNIQUE"
+      ],
+      "notes": [
+        "跨 deletePolicy 引用一律软引用（不建外键约束）"
+      ]
+    },
+    {
+      "key": "FileMutationReceiptMember",
+      "table": "file_mutation_receipt_member",
+      "repository": "FileMutationReceiptMemberRepository",
+      "codec": "FileMutationReceiptMemberRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-receipt",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "receipt_id,member_id UNIQUE"
+      ],
+      "notes": [
+        "字段：receipt_id,member_id,outcome,actual_digest?"
+      ]
+    },
+    {
+      "key": "Process",
+      "table": "process",
+      "repository": "ProcessRepository",
+      "codec": "ProcessRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "status,started_at"
+      ],
+      "notes": [
+        "字段含 wrapper nonce/pid、child pid、process group、start fingerprint、command digest、spool locator 与 retained/dropped/truncated counters。",
+        "状态无法由 wrapper/exit receipt 证明时为 outcome_unknown；禁止伪造 abnormal/exitCode=1。"
+      ]
+    },
+    {
+      "key": "ProcessOriginLink",
+      "table": "process_origin_link",
+      "repository": "ProcessOriginLinkRepository",
+      "codec": "ProcessOriginLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-process",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "process_id UNIQUE",
+        "tool_call_id"
+      ]
+    },
+    {
+      "key": "ProcessOutputChunk",
+      "table": "process_output_chunk",
+      "repository": "ProcessOutputChunkRepository",
+      "codec": "ProcessOutputChunkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-process",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "process_id,chunk_seq UNIQUE"
+      ],
+      "notes": [
+        "正文进入 CAS；字段：process_id,chunk_seq,stream_kind,content_object_id,byte_length,created_at。",
+        "每进程 maxChunkBytes=65536、maxRetainedBytes=4194304、maxRetainedChunks=256；超限只累计 droppedBytes/truncated，不再写正文或 metadata。"
+      ]
+    },
+    {
+      "key": "ProcessReceipt",
+      "table": "process_receipt",
+      "repository": "ProcessReceiptRepository",
+      "codec": "ProcessReceiptRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "process_id UNIQUE"
+      ],
+      "notes": [
+        "跨 deletePolicy 引用一律软引用（不建外键约束）；由退出回执 reconcile 生成",
+        "由通过 stable nonce/start fingerprint 核验的 wrapper atomic exit receipt reconcile 生成；无有效 receipt 且无法证明时 outcome_unknown。"
+      ]
+    },
+    {
+      "key": "ContextSegment",
+      "table": "context_segment",
+      "repository": "ContextSegmentRepository",
+      "codec": "ContextSegmentRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "content_object_id,segment_kind"
+      ],
+      "notes": [
+        "ContextSegment 表达稳定来源/语义出现；相同正文不同来源可共享 ContentObject，但不得因正文相同合并 segment"
+      ]
+    },
+    {
+      "key": "ContextSegmentSource",
+      "table": "context_segment_source",
+      "repository": "ContextSegmentSourceRepository",
+      "codec": "ContextSegmentSourceRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-segment",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "source_kind,source_id,source_revision UNIQUE",
+        "segment_id,source_kind"
+      ],
+      "notes": [
+        "source_kind ∈ {message_revision,tool_call,tool_model_result,compression_block,system,runtime_context}；tool_pair 段写两行（tool_call+tool_model_result，同一 source_revision=call_seq）；一个稳定来源 tuple 只归属一个 segment"
+      ]
+    },
+    {
+      "key": "ContextSequenceNode",
+      "table": "context_sequence_node",
+      "repository": "ContextSequenceNodeRepository",
+      "codec": "ContextSequenceNodeRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "parent_node_id",
+        "parent_node_id,segment_id UNIQUE"
+      ],
+      "notes": [
+        "可分支 parent DAG：同一 parent 可有多个不同 segment 后继；复合 UNIQUE 只保证同一次追加幂等"
+      ]
+    },
+    {
+      "key": "ContextSequenceRoot",
+      "table": "context_sequence_root",
+      "repository": "ContextSequenceRootRepository",
+      "codec": "ContextSequenceRootRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,root_seq UNIQUE",
+        "root_node_id"
+      ],
+      "notes": [
+        "字段增 root_seq 与 tail_segment_count；压缩物化=摘要+从 tail_node_id 起精确回溯 tail_segment_count 个节点；root/node 首版保留到 runtime dataset reset"
+      ]
+    },
+    {
+      "key": "ConversationContextHeadLink",
+      "table": "conversation_context_head_link",
+      "repository": "ConversationContextHeadLinkRepository",
+      "codec": "ConversationContextHeadLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update",
+        "delete"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id UNIQUE",
+        "root_id"
+      ],
+      "notes": [
+        "显式表达 Conversation 当前选择的 ContextSequenceRoot；retry/edit/fork 在创建新 root 的同一事务内更新本 Link"
+      ]
+    },
+    {
+      "key": "ModelContextProjection",
+      "table": "model_context_projection",
+      "repository": "ModelContextProjectionRepository",
+      "codec": "ModelContextProjectionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "owner_kind,owner_id UNIQUE",
+        "root_id"
+      ],
+      "notes": [
+        "owner 多态：owner_kind ∈ {model_request,compression_block}；root_id 软引用"
+      ]
+    },
+    {
+      "key": "ModelRequest",
+      "table": "model_request",
+      "repository": "ModelRequestRepository",
+      "codec": "ModelRequestRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id,request_seq UNIQUE",
+        "status"
+      ],
+      "notes": [
+        "增 authority_snapshot_id（软引用）、settings_snapshot_object_id?、usage 与 stream_stats；update 仅允许 status/终态/usage/stream_stats，recipe 字段不可变"
+      ]
+    },
+    {
+      "key": "CompressionBlock",
+      "table": "compression_block",
+      "repository": "CompressionBlockRepository",
+      "codec": "CompressionBlockRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,created_at",
+        "status"
+      ],
+      "notes": [
+        "正文、来源和摘要不可变；update 仅允许 status∈{enabled,disabled,soft_deleted}，regenerate 创建新 CompressionBlock"
+      ]
+    },
+    {
+      "key": "CompressionBlockSource",
+      "table": "compression_block_source",
+      "repository": "CompressionBlockSourceRepository",
+      "codec": "CompressionBlockSourceRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "compression_block_id,segment_id,position UNIQUE"
+      ]
+    },
+    {
+      "key": "ModelStreamCheckpoint",
+      "table": "model_stream_checkpoint",
+      "repository": "ModelStreamCheckpointRepository",
+      "codec": "ModelStreamCheckpointRowCodec",
+      "mutations": [
+        "insert",
+        "delete"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-model-request",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "model_request_id,attempt_seq,socket_generation,stream_seq UNIQUE"
+      ],
+      "notes": [
+        "delete 仅允许 ModelStreamFence 已提交后的 maintenance prune；保留最新 socket_generation 尾部 32 条+终态摘要"
+      ]
+    },
+    {
+      "key": "ModelStreamFence",
+      "table": "model_stream_fence",
+      "repository": "ModelStreamFenceRepository",
+      "codec": "ModelStreamFenceRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-model-request",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "model_request_id UNIQUE"
+      ]
+    },
+    {
+      "key": "ChildExecution",
+      "table": "child_execution",
+      "repository": "ChildExecutionRepository",
+      "codec": "ChildExecutionRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-child-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "child_conversation_id UNIQUE",
+        "status"
+      ],
+      "notes": [
+        "一次稳定子代理谱系身份；首次 Turn、续接 Turn 与排队 TurnIntent 都通过独立 Link 归属本 execution"
+      ]
+    },
+    {
+      "key": "ChildExecutionParentLink",
+      "table": "child_execution_parent_link",
+      "repository": "ChildExecutionParentLinkRepository",
+      "codec": "ChildExecutionParentLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-child-execution",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "child_execution_id UNIQUE",
+        "source_tool_call_id UNIQUE",
+        "parent_child_execution_id",
+        "parent_turn_id"
+      ],
+      "notes": [
+        "稳定树边；根子代理以 parent_turn_id 标识来源，子代理创建的后代同时记录 parent_child_execution_id，续接时不改写"
+      ]
+    },
+    {
+      "key": "ChildExecutionTurnLink",
+      "table": "child_execution_turn_link",
+      "repository": "ChildExecutionTurnLinkRepository",
+      "codec": "ChildExecutionTurnLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-child-execution",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "child_execution_id,turn_seq UNIQUE",
+        "turn_id UNIQUE"
+      ],
+      "notes": [
+        "首次与续接 Turn 均登记；历史 membership 不因 active pointer 变化而丢失"
+      ]
+    },
+    {
+      "key": "ChildExecutionIntentLink",
+      "table": "child_execution_intent_link",
+      "repository": "ChildExecutionIntentLinkRepository",
+      "codec": "ChildExecutionIntentLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-child-execution",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "child_execution_id,intent_seq UNIQUE",
+        "turn_intent_id UNIQUE",
+        "state"
+      ],
+      "notes": [
+        "登记尚未 admit 的续接 TurnIntent；cancel_subtree 同事务将 pending intent 置 cancelled"
+      ]
+    },
+    {
+      "key": "ChildExecutionActiveTurnLink",
+      "table": "child_execution_active_turn_link",
+      "repository": "ChildExecutionActiveTurnLinkRepository",
+      "codec": "ChildExecutionActiveTurnLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update",
+        "delete"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-child-execution",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "child_execution_id UNIQUE",
+        "turn_id UNIQUE"
+      ],
+      "notes": [
+        "只表达当前活动 Turn；树遍历依据 ChildExecutionParentLink，不依据本可变指针"
+      ]
+    },
+    {
+      "key": "AnswerBridge",
+      "table": "answer_bridge",
+      "repository": "AnswerBridgeRepository",
+      "codec": "AnswerBridgeRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-child-execution",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "child_execution_id UNIQUE",
+        "current_submission_id"
+      ],
+      "notes": [
+        "bridge 挂稳定 ChildExecution，所有续接 Turn 复用同一 bridge"
+      ]
+    },
+    {
+      "key": "AnswerSubmission",
+      "table": "answer_submission",
+      "repository": "AnswerSubmissionRepository",
+      "codec": "AnswerSubmissionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-answer-bridge",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "answer_bridge_id,submission_seq UNIQUE"
+      ]
+    },
+    {
+      "key": "AnswerPayload",
+      "table": "answer_payload",
+      "repository": "AnswerPayloadRepository",
+      "codec": "AnswerPayloadRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "detail",
+      "deletePolicy": "cascade-with-answer-bridge",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "submission_id UNIQUE"
+      ],
+      "notes": [
+        "字段：submission_id,title?,content_object_id,byte_length"
+      ]
+    },
+    {
+      "key": "RuntimeInboxItem",
+      "table": "runtime_inbox_item",
+      "repository": "RuntimeInboxRepository",
+      "codec": "RuntimeInboxItemRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "dedupe_key UNIQUE",
+        "source_kind,source_id",
+        "state,created_at"
+      ],
+      "notes": [
+        "只保存来源事实与来源引用；目标 Conversation/Turn 和消费语义全部属于 RuntimeDelivery"
+      ]
+    },
+    {
+      "key": "RuntimeDelivery",
+      "table": "runtime_delivery",
+      "repository": "RuntimeDeliveryRepository",
+      "codec": "RuntimeDeliveryRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-inbox-item",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "inbox_item_id,target_conversation_id,phase,attempt_seq UNIQUE WHERE target_turn_id IS NULL",
+        "inbox_item_id,target_conversation_id,target_turn_id,phase,attempt_seq UNIQUE WHERE target_turn_id IS NOT NULL",
+        "retry_of_delivery_id",
+        "target_conversation_id,state,created_at"
+      ],
+      "notes": [
+        "target_turn_id 可空；attempt_seq 从 1 开始，人工 redeliver 创建 attempt+1 并写 retry_of_delivery_id；目标不存在时置 failed(reason=target-gone)"
+      ]
+    },
+    {
+      "key": "RuntimeDeliveryInputLink",
+      "table": "runtime_delivery_input_link",
+      "repository": "RuntimeDeliveryInputLinkRepository",
+      "codec": "RuntimeDeliveryInputLinkRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-delivery",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "delivery_id UNIQUE",
+        "pending_turn_input_id UNIQUE",
+        "handled_at"
+      ],
+      "notes": [
+        "Delivery 注入目标 Turn 时创建；执行器真正吸收对应 PendingTurnInput 时同事务写 handled_at，父处理状态只据此推导"
+      ]
+    }
+  ],
+  "metadataTables": [
+    {
+      "table": "root_binding",
+      "purpose": "数据根绑定元数据（非 runtimeDomains，不随 dataset reset）"
+    },
+    {
+      "table": "schema_manifest",
+      "purpose": "当前 schema 清单元数据（非 runtimeDomains，不随 dataset reset）"
+    }
+  ],
+  "contentAuthority": {
+    "store": "cas-directory",
+    "publishOrder": [
+      "write-temporary-content",
+      "fsync-or-close",
+      "publish-by-digest",
+      "commit-sqlite-reference"
+    ],
+    "orphanPolicy": "allow-until-dataset-reset",
+    "onlineGcInFirstRelease": false
+  },
+  "executionAuthority": {
+    "identity": "Turn",
+    "runOrAgentRunMayOwnLifecycle": false,
+    "ecs": "committed-read-projection",
+    "clientState": "bounded-read-model"
+  },
+  "externalWorld": {
+    "protocol": [
+      "EffectIntent",
+      "dispatch",
+      "EffectReceipt",
+      "reconcile"
+    ],
+    "exactlyOnceExternalEffects": false,
+    "unknownOutcome": "outcome_unknown"
+  },
+  "disabledCapabilities": [
+    {
+      "capability": "workspace-checkpoint",
+      "featureFlag": "CHECKPOINT_FEATURE_ENABLED",
+      "status": "disabled-in-current-build",
+      "deferredDomains": [
+        "Checkpoint",
+        "CheckpointTimelineAnchor",
+        "ShadowRepository",
+        "ConversationCheckpointRepositoryLink",
+        "ProjectContext",
+        "ConversationProjectLink"
+      ],
+      "rule": "存档点（工作区快照回滚）功能当前已停用（代码开关 CHECKPOINT_FEATURE_ENABLED=false）。首版不建这些表，不导入存量存档数据。将来功能重启时按真实字段补表，ShadowRepository 改用 GitShadow 命名（repository=GitShadowRepository）避免叠字。注意：本能力与 context.json 的 ModelStreamCheckpoint（流式输出检查点）无关，后者为活跃能力。"
+    }
+  ],
+  "configurationDomainEntryFields": [
+    "key",
+    "authority",
+    "repository",
+    "codec",
+    "migrationEntryIds"
+  ],
+  "capabilityDispositions": [
+    {
+      "id": "conversation-fork",
+      "disposition": "rebuild",
+      "ownerStage": "F",
+      "target": "ConversationReuseLink+ConversationBranchLink+ConversationOriginLink+ContextSequence shared prefix",
+      "acceptance": [
+        "fork behavior preserved",
+        "three independent Link domains",
+        "no source Run authority"
+      ]
+    },
+    {
+      "id": "mcp-settings-connections",
+      "disposition": "keep-config-rebuild-runtime",
+      "ownerStage": "D",
+      "target": "settings/mcp-servers + memory-only connection rebuild",
+      "acceptance": [
+        "settings preserved",
+        "connection state not in Runtime SQLite"
+      ]
+    },
+    {
+      "id": "mcp-tool-call",
+      "disposition": "rebuild",
+      "ownerStage": "D",
+      "target": "mcp_tool_call EffectIntent/EffectReceipt",
+      "acceptance": [
+        "risk mapping and approval",
+        "no restart auto retry",
+        "outcome_unknown when unverifiable",
+        "one ToolModelResult"
+      ]
+    },
+    {
+      "id": "attachments",
+      "disposition": "rebuild",
+      "ownerStage": "D",
+      "target": "Attachment+AttachmentLink+CAS",
+      "acceptance": [
+        "ingest size limit",
+        "MessageRevision link",
+        "on-demand read",
+        "old runtime attachments not imported",
+        "attachment settings preserved"
+      ]
+    },
+    {
+      "id": "ask-user",
+      "disposition": "rebuild-on-generic-tool-interaction-domains",
+      "ownerStage": "D",
+      "target": "ToolCall+ToolExecution+InteractionRequest+InteractionOwnerLink+InteractionResponse+OutcomePause+OperationResolution+ToolOutcome+ToolModelResult",
+      "acceptance": [
+        "no AskUser runtime table"
+      ]
+    },
+    {
+      "id": "task-list",
+      "disposition": "keep-derived-client-projection",
+      "ownerStage": "F",
+      "target": "update_task_list ToolCall/ToolOutcome derived projection",
+      "acceptance": [
+        "reload from tool facts",
+        "no TaskList authority table",
+        "UI state never writes a second authority"
+      ]
+    },
+    {
+      "id": "compression-management",
+      "disposition": "rebuild-immutable-replacement",
+      "ownerStage": "E",
+      "target": "CompressionBlock status update + replacement block creation",
+      "acceptance": [
+        "no in-place title/summary update",
+        "historical projection immutable"
+      ]
+    },
+    {
+      "id": "skills",
+      "disposition": "keep-config-rescan",
+      "ownerStage": "D",
+      "target": "<dataRoot>/skills and workspace catalogs",
+      "acceptance": [
+        "not in Runtime SQLite",
+        "cutover leaves content unchanged",
+        "startup rescan"
+      ]
+    },
+    {
+      "id": "rules",
+      "disposition": "keep-config-rescan",
+      "ownerStage": "D",
+      "target": "<dataRoot>/AGENTS.md + CLAUDE.md and workspace rules",
+      "acceptance": [
+        "not in Runtime SQLite",
+        "cutover leaves content unchanged",
+        "startup rescan"
+      ]
+    },
+    {
+      "id": "workspace-checkpoint",
+      "disposition": "disabled-reset-runtime-keep-config",
+      "ownerStage": "B",
+      "target": "no checkpoint Runtime tables; preserve CheckpointPolicy configuration",
+      "acceptance": [
+        "no legacy checkpoint import",
+        "not confused with ModelStreamCheckpoint"
+      ]
+    }
+  ]
+}

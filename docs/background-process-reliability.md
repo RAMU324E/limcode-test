@@ -1,5 +1,7 @@
 # 后台进程退出的可靠投递语义
 
+> 状态：本文描述当前文件后端实现，只用于理解现有后台进程语义和迁移来源，不是可靠运行内核目标合同。目标定义以[`docs/architecture/reliable-kernel/contracts/`](./architecture/reliable-kernel/contracts/README.md)为准；Runtime/Tool/File能力切换后，本文转为历史记录。
+
 ## 1. 领域边界
 
 后台化的 shell/bash 进程与启动它的 Tool Attempt 是独立对象。Tool 在进程已持久化后即可返回 `status=running`，后续退出不能依赖原 Attempt、原 Tool controller 或 Extension Host 进程继续存活。

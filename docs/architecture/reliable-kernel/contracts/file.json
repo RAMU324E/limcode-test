@@ -1,0 +1,114 @@
+{
+  "contractKind": "file",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "让用户批准的文件提案和真正发生的文件修改成为两类事实。",
+  "threatModel": "trusted-single-user-local-plugin",
+  "changeSet": {
+    "domain": "FileChangeSet",
+    "memberDomain": "FileChangeSetMember",
+    "onePerToolCall": true,
+    "fields": [
+      "changeSetId",
+      "toolCallId",
+      "status",
+      "createdAt"
+    ],
+    "memberFields": [
+      "memberId",
+      "changeSetId",
+      "memberSeq",
+      "operation",
+      "workEnvironmentId",
+      "targetPath",
+      "baseDigest?",
+      "targetContentObjectId?",
+      "targetDigest?"
+    ],
+    "operations": [
+      "create_file",
+      "replace_file",
+      "delete_file",
+      "create_directory",
+      "delete_directory_tree"
+    ],
+    "contentStorage": "cas-before-sqlite-reference",
+    "modelResult": false
+  },
+  "decision": {
+    "domain": "FileChangeDecision",
+    "firstResponseWins": true,
+    "outcomes": [
+      "approved",
+      "rejected",
+      "expired"
+    ],
+    "approval": "文件审批显式走 InteractionRequest/InteractionResponse，FileChangeDecision 与对应 InteractionRequest 同键关联（见 01 §7）。",
+    "approved": "创建Operation、Attempt和EffectIntent",
+    "rejected": "直接生成rejected ToolOutcome和唯一ToolModelResult，不派发外部操作",
+    "expired": "直接生成cancelled ToolOutcome和唯一ToolModelResult，不派发外部操作",
+    "bypassExemption": "rejected 与 expired 均属未发起外部作用豁免：不创建 Operation/Attempt/EffectIntent（豁免条款见 01 §6）。"
+  },
+  "unresolvedClosure": {
+    "triggers": [
+      "turn-terminal",
+      "restart-scan"
+    ],
+    "atomicity": "single-transaction",
+    "rule": "Turn 终止或 recovery.file-change-unresolved 发现未决 FileChangeSet 时，在同一事务内写入 expired 的 FileChangeDecision、cancelled 的 ToolOutcome 和唯一 ToolModelResult。",
+    "recoveryScanId": "recovery.file-change-unresolved"
+  },
+  "pathBoundary": {
+    "source": "registered-work-environment",
+    "rule": "执行前重新解析目标并确认仍在用户选定的工作环境内；目标本身是符号链接或路径越界时明确冲突。",
+    "sameAccountMaliciousProcessProtection": false,
+    "recursiveComponentSecurityWalk": false
+  },
+  "apply": {
+    "order": "memberSeq",
+    "stopOnFirstFailure": true,
+    "automaticRollback": false,
+    "automaticRetry": false,
+    "overwriteWithoutBaseCheck": false,
+    "rule": "只执行批准的成员；替换和删除先核对baseDigest，创建要求目标不存在。发生部分成功时如实记录每个已处理成员，不伪装成全部失败或全部成功。"
+  },
+  "receipt": {
+    "domain": "FileMutationReceipt",
+    "linksTo": [
+      "FileChangeSet",
+      "EffectReceipt"
+    ],
+    "outcomes": [
+      "succeeded",
+      "failed",
+      "partial",
+      "conflict",
+      "cancelled",
+      "outcome_unknown"
+    ],
+    "memberDetail": {
+      "domain": "FileMutationReceiptMember",
+      "unique": "receipt_id,member_id",
+      "fields": [
+        "receipt_id",
+        "member_id",
+        "outcome",
+        "actualDigest?"
+      ],
+      "deletePolicy": "cascade-with-receipt",
+      "rule": "成员级核对结果逐一落 FileMutationReceiptMember；receipt 级 outcome 由成员结果汇聚。"
+    },
+    "reconcileRules": [
+      "实际摘要等于targetDigest：该成员已经成功",
+      "实际摘要等于baseDigest：该成员尚未应用",
+      "实际摘要两者都不等：该成员冲突",
+      "无法读取或无法证明：outcome_unknown",
+      "每条核对结论写入对应 FileMutationReceiptMember（outcome 与 actualDigest）"
+    ]
+  },
+  "toolResult": {
+    "proposalIsFinal": false,
+    "oneToolModelResultPerToolCall": true,
+    "rule": "审批、执行和核对全部结束后才生成唯一模型结果。"
+  }
+}

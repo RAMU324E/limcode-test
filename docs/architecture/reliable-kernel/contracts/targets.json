@@ -1,0 +1,179 @@
+{
+  "contractKind": "targets",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "usage": "single-user-local",
+  "distribution": "manual-vsix",
+  "localTarget": {
+    "id": "local-linux-x64",
+    "platform": "linux",
+    "arch": "x64",
+    "extensionHostKind": "local"
+  },
+  "sqliteDriver": {
+    "choice": "better-sqlite3",
+    "packaging": "打包期用 @electron/rebuild 对齐本机 VS Code Electron ABI",
+    "foundationGate": "foundation 出口必须在真实 Extension Host 验证驱动加载",
+    "fallback": {
+      "choice": "node:sqlite",
+      "condition": "better-sqlite3 未通过真实 Extension Host 加载验证",
+      "requirements": [
+        "VS Code 内建 Node >= 22.5",
+        "提升 engines.vscode 下限"
+      ]
+    }
+  },
+  "validation": {
+    "requiredAt": [
+      "installed"
+    ],
+    "input": "artifact path + current clean commit",
+    "buildProvenance": {
+      "packageEntry": "dist/build-provenance.json",
+      "generator": "scripts/reliable-kernel/write-build-provenance.mjs",
+      "fields": [
+        "commitSha",
+        "mainEntrySha256",
+        "worktreeClean"
+      ],
+      "mainEntrySource": "VSIX内package.json.main",
+      "worktreeCleanSource": "生成器写provenance前执行git status --porcelain --untracked-files=all；仅空输出记为true",
+      "packageVerification": "从VSIX读取package.json.main指向的真实入口并重算SHA-256，与provenance.mainEntrySha256比较；provenance.worktreeClean必须为true。",
+      "installedVerification": "安装后重算实际加载入口SHA-256，并与同一VSIX入口摘要比较。",
+      "rule": "安装包由构建时干净工作区生成；生成脚本读取项目package.json.main、记录worktreeClean并在build后写入dist/build-provenance.json；package validator以VSIX内manifest为制品权威，不得只检查provenance字段存在。"
+    },
+    "smoke": [
+      {
+        "id": "smoke.open-extension",
+        "description": "打开最终安装的扩展并确认新 Runtime 正常启动。",
+        "steps": [
+          "启动 VS Code",
+          "打开 LimCode 主界面"
+        ],
+        "assertions": [
+          "加载入口摘要已核对",
+          "只打开当前 SQLite/CAS Runtime",
+          "无旧 writer fallback"
+        ]
+      },
+      {
+        "id": "smoke.send-message",
+        "description": "发送一条普通用户消息并完成一个 Turn。",
+        "steps": [
+          "创建或打开 Conversation",
+          "发送唯一测试消息",
+          "等待 assistant 终态"
+        ],
+        "assertions": [
+          "Turn 进入真实终态",
+          "只生成一条对应 assistant MessageRevision"
+        ]
+      },
+      {
+        "id": "smoke.read-only-tool",
+        "description": "执行一个只读工具并验证唯一模型结果。",
+        "steps": [
+          "请求读取临时只读文件",
+          "等待工具与模型完成"
+        ],
+        "assertions": [
+          "Workspace 未改变",
+          "ToolCall 只有一个 ToolModelResult"
+        ]
+      },
+      {
+        "id": "smoke.file-proposal-approve-apply",
+        "description": "文件提案经批准后真实修改临时 Workspace 文件。",
+        "steps": [
+          "创建临时文件目标",
+          "生成 FileChangeSet",
+          "用户批准",
+          "执行真实写入"
+        ],
+        "assertions": [
+          "actual digest 等于 target digest",
+          "FileMutationReceipt=succeeded",
+          "只生成一个 ToolModelResult"
+        ]
+      },
+      {
+        "id": "smoke.command-run-and-wait",
+        "description": "运行命令并等待真实退出。",
+        "steps": [
+          "启动输出已知内容和 exit code 的命令",
+          "必要时转后台",
+          "wait 到终态"
+        ],
+        "assertions": [
+          "wrapper exit receipt 可核验",
+          "输出与真实 exit code 匹配"
+        ]
+      },
+      {
+        "id": "smoke.subagent-start-and-cancel",
+        "description": "启动子 Agent 并通过稳定 ChildExecution 取消。",
+        "steps": [
+          "启动 child execution",
+          "确认 active child Turn",
+          "发出 cancel",
+          "等待终态"
+        ],
+        "assertions": [
+          "终止请求与真实终态分离",
+          "不误伤其他 child execution"
+        ]
+      },
+      {
+        "id": "smoke.turn-interrupt",
+        "description": "中断普通流式 Turn，而非仅取消子 Agent。",
+        "steps": [
+          "启动普通流式 Turn",
+          "发出 Turn interrupt",
+          "等待终态"
+        ],
+        "assertions": [
+          "Turn 进入真实终态",
+          "迟到 stream 不重新打开 Turn",
+          "ExecutionLease 已释放"
+        ]
+      },
+      {
+        "id": "smoke.extension-host-restart",
+        "description": "在存在可恢复事实时重启 Extension Host。",
+        "steps": [
+          "准备 pending delivery 或 wrapper process",
+          "重启 Extension Host",
+          "重新打开界面"
+        ],
+        "assertions": [
+          "hostBootId 改变",
+          "客户端重取 snapshot",
+          "旧 session changes 被丢弃"
+        ]
+      },
+      {
+        "id": "smoke.recovery-verification",
+        "description": "核对六类 recovery scan 与异步结果恢复。",
+        "steps": [
+          "运行可用的 recovery fixtures",
+          "触发扫描",
+          "检查持久事实"
+        ],
+        "assertions": [
+          "六个 scan ID 各有结论",
+          "不可核验作用为 outcome_unknown",
+          "没有自动重复外部副作用"
+        ]
+      }
+    ],
+    "smokeAuthority": "本 smoke 对象数组是 installed 冒烟 ID、步骤与断言的唯一定义；phase-g、gate-registry 与 package validator 只引用这些稳定 ID。"
+  },
+  "unsupported": [
+    "marketplace",
+    "github-release",
+    "continuous-integration-artifact",
+    "remote-extension-host",
+    "windows",
+    "multi-user-installation"
+  ]
+}

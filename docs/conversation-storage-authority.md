@@ -1,5 +1,7 @@
 # Conversation 可靠存储权威模型（Epoch 6）
 
+> 状态：本文描述当前文件后端实现，只用于理解现状和迁移来源，不是可靠运行内核目标合同。目标定义以[`docs/architecture/reliable-kernel/contracts/`](./architecture/reliable-kernel/contracts/README.md)为准；对应能力切换后，本文转为历史记录。
+
 ## 1. 目标
 
 Conversation 可靠存储采用**单写者、显式文件归属、mutation 驱动编译、HEAD 提交点**。任何权威文件都必须由唯一 Storage HEAD 持有；任何读取权威文件的路径都必须先取得对应 HEAD 的稳定租约。

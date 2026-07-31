@@ -1,0 +1,217 @@
+{
+  "contractKind": "context",
+  "notes": [
+    "r3: ContentObject 只负责正文去重；ContextSegment 表达一次稳定来源/语义出现，相同正文不同来源不得合并",
+    "r3: ContextSequenceNode 使用可分支 parent DAG；(parent_node_id,segment_id) 只做幂等追加，不限制同一 parent 的不同后继",
+    "r3: 当前上下文分支由 ConversationContextHeadLink 显式表达，不从 created_at 推导",
+    "r3: 压缩 root 使用 tail_node_id + tail_segment_count 明确尾部切片，物化时不得越过边界重新读入已压缩原文",
+    "r3: Context root/node 首版保留到 runtime dataset reset，不建设在线 retention/GC",
+    "r3: edit/delete 生成新 current root；历史 projection 按冻结 root 重放，不读取 Message 当前 soft-delete 状态",
+    "r3: ModelStreamCheckpoint 允许受 Repository 约束的 maintenance delete，以执行终态裁剪",
+    "r4: ProviderContinuation 首发禁用；所有请求发送完整配方，不建 ProviderContinuation 运行表，不产生或读取 suffix",
+    "r4: Conversation fork 保留独立 Reuse/Branch/Origin Link；CompressionUpdate 改为创建不可变 replacement"
+  ],
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "用结构共享保存模型上下文，并保留压缩、流式续接和有限提供方重试。",
+  "domains": [
+    "ContextSegment",
+    "ContextSegmentSource",
+    "ContextSequenceNode",
+    "ContextSequenceRoot",
+    "ConversationContextHeadLink",
+    "ModelContextProjection",
+    "ModelRequest",
+    "CompressionBlock",
+    "CompressionBlockSource",
+    "ModelStreamCheckpoint",
+    "ModelStreamFence"
+  ],
+  "segment": {
+    "content": "cas",
+    "immutable": true,
+    "identity": "source-occurrence",
+    "sourceLinks": "每个稳定来源出现登记一次；tool_pair segment 登记 tool_call 与 tool_model_result 两个来源",
+    "kinds": [
+      "system",
+      "message",
+      "tool_pair",
+      "compression",
+      "runtime_context"
+    ],
+    "toolPairAtomic": true,
+    "contentObjectMayBeShared": true,
+    "contentObjectDoesNotDefineSegmentIdentity": true,
+    "semanticHashColumn": false,
+    "dedupeOwner": "ContentObject-only",
+    "softDeletedMessageRule": "edit/delete 事务创建不含已删除来源的新 current root；既有 root 与既有 ModelContextProjection 的解释保持不变"
+  },
+  "segmentSources": {
+    "sourceKinds": [
+      "message_revision",
+      "tool_call",
+      "tool_model_result",
+      "compression_block",
+      "system",
+      "runtime_context"
+    ],
+    "toolPairRows": "tool_pair 段写两行：tool_call 与 tool_model_result 各一行，共用同一 source_revision=call_seq",
+    "sourceRevisionMeaning": "message=revision_seq、tool 类=call_seq、compression/system/runtime=0",
+    "sourceIdentityUnique": "source_kind,source_id,source_revision UNIQUE",
+    "rule": "相同 ContentObject 可被多个 segment 引用；一个稳定来源 tuple 只归属一个 segment"
+  },
+  "persistentSequence": {
+    "firstReleaseShape": "persistent-parent-dag",
+    "branching": "同一 parent_node_id 可有多个不同 segment 后继；(parent_node_id,segment_id) UNIQUE 仅保证同一次追加幂等",
+    "node": [
+      "nodeId",
+      "parentNodeId?",
+      "segmentId"
+    ],
+    "root": [
+      "rootId",
+      "conversationId",
+      "rootSeq",
+      "rootNodeId",
+      "tailNodeId?",
+      "tailSegmentCount",
+      "segmentCount",
+      "estimatedTokens"
+    ],
+    "estimatedTokensRule": "root 上的 estimatedTokens 仅为参考缓存；压缩触发判定使用的令牌数在构造 projection 时按 AuthoritySnapshot 冻结的 ModelProfile 估算器重算",
+    "rootRetention": "ContextSequenceRoot 与 ContextSequenceNode 首版保留到 runtime dataset reset，不在线删除",
+    "currentHead": "ConversationContextHeadLink(conversation_id UNIQUE,root_id) 在创建新 current root 的同一事务内更新",
+    "fullPrefixStoredPerProjection": false,
+    "fullSourceLinksCopiedPerProjection": false,
+    "balancedTreeRequired": false,
+    "rule": "每轮只写新增片段、少量序列节点和一个新根；retry/edit/fork 可从旧 parent 分支并共享不可变前缀。"
+  },
+  "projection": {
+    "fields": [
+      "projectionId",
+      "ownerKind",
+      "ownerId",
+      "rootId",
+      "purpose",
+      "createdAt"
+    ],
+    "ownerKinds": [
+      "model_request",
+      "compression_block"
+    ],
+    "ownerUnique": [
+      "owner_kind",
+      "owner_id"
+    ],
+    "deletePolicy": "dataset-reset-only",
+    "rootIdReference": "soft",
+    "fullPromptContent": false,
+    "clientDefaultIncludesSegments": false
+  },
+  "modelRequest": {
+    "extraFields": [
+      "authoritySnapshotId",
+      "settingsSnapshotContentObjectId?",
+      "usage",
+      "streamStats"
+    ],
+    "authoritySnapshotReference": "soft",
+    "mutableFields": [
+      "status",
+      "terminalState",
+      "usage",
+      "streamStats"
+    ],
+    "recipeImmutable": true,
+    "rule": "insert 后 recipe 字段不可变；update 仅允许 status、终态、usage 与 streamStats 字段"
+  },
+  "compression": {
+    "source": "contiguous-sequence-range",
+    "replacement": "single-compression-segment",
+    "preserveSourceLinks": true,
+    "splitToolPair": false,
+    "retry": "new-model-request-attempt",
+    "attachment": "新建摘要 segment+node(parent NULL)+新 root；root.tailNodeId 指向未压缩尾部链头，root.tailSegmentCount 精确限定只回溯多少个尾部节点；物化顺序=摘要 segment+该有限尾部切片",
+    "sourceRegistration": "CompressionBlockSource 登记被压缩的 segment 区间（compression_block_id,segment_id,position UNIQUE）",
+    "trigger": "新 segment 追加后由压缩规划器判定；阈值来源=AuthoritySnapshot 冻结的 ModelProfile 字段；estimatedTokens 按 profile 估算器在构造 projection 时重算",
+    "writeCost": "序列挂接单次新增节点数=O(1)（≤4）；来源登记按本次被压缩区间写入，不冒充 O(1)",
+    "invalidatesInFlightContinuation": true,
+    "management": {
+      "regenerate": "创建新的 CompressionBlock、summary segment 与 root，不改旧正文。",
+      "replace": "用户修改 title/summary 时创建新的 immutable CompressionBlock/replacement；同事务按明确选择将旧块 status 置 disabled 或 soft_deleted，并更新 current head。",
+      "enableDisableDelete": "只更新 CompressionBlock.status；delete 为 soft_deleted，不物理删除来源与历史 projection。",
+      "legacyCompressionUpdate": "removed-no-in-place-title-or-summary-mutation"
+    }
+  },
+  "replay": {
+    "uses": [
+      "ContextSequenceRoot",
+      "AuthoritySnapshot",
+      "immutable-model-request-recipe"
+    ],
+    "mutatesRuntime": false,
+    "readsCurrentConversationHistory": false,
+    "rule": "dry-run和历史重放读取当时保存的序列根与执行快照，不读取 Message 当前 soft-delete 状态，也不拿当前会话状态拼出近似版本。"
+  },
+  "providerContinuation": {
+    "releaseMode": "optional-transport-optimization",
+    "releaseDecision": "disabled-full-request",
+    "runtimeDomainRequired": false,
+    "disabledBehavior": "always-send-full-request",
+    "disabledRules": [
+      "每个 ModelRequest 都从冻结 ContextSequenceRoot 与 immutable recipe 构造完整请求",
+      "不读取 ProviderContinuation",
+      "不产生或发送 suffix",
+      "连接重建、压缩与 retry 的功能正确性不依赖 continuation"
+    ],
+    "futureEnabledContract": {
+      "requiresContractRevision": true,
+      "requestRecipe": "immutable-original-model-request",
+      "resumeValidation": "strict-prefix",
+      "strictPrefixRule": "以物化 segment 的 segmentId 序列做前缀比较",
+      "compressionInvalidatesInFlight": "压缩使在途 continuation 失效，回退发送完整请求",
+      "webSocketRules": [
+        "续接时复用完整原始请求配方",
+        "只接受严格接在已提交输出后面的新增内容",
+        "OutputItemDone只结束当前输出项，不结束整个模型请求",
+        "Completed才允许写ModelStreamFence",
+        "旧socketGeneration的事件全部忽略"
+      ]
+    },
+    "runtimeProtocolNegotiation": false
+  },
+  "streamCheckpoint": {
+    "retention": "终态围栏写入后，由 ModelStreamCheckpointRepository maintenance delete 仅保留最新 socket_generation 尾部 32 条与终态摘要",
+    "maintenanceMutation": "delete-after-terminal-fence-only",
+    "rowBound": "行数上界见 appendices/performance-and-packaging-gates.md（≤活跃请求×64+终态请求×33）"
+  },
+  "providerRetry": {
+    "automaticTransientRetry": true,
+    "maxAttempts": 2,
+    "visible": true,
+    "cancelable": true,
+    "afterExtensionRestart": "no-automatic-retry",
+    "newAttemptKeepsSameModelRequest": true
+  },
+  "performance": {
+    "storageGrowth": "每轮新增存储≤1.5×本轮新增内容字节+128KB；量化判定式以 appendices/performance-and-packaging-gates.md 为唯一权威",
+    "ordinaryTransactionScale": "2x 规模普通事务耗时增长≤2.5x",
+    "chainMaterialization": "千节点链物化<50ms",
+    "checkpointRowBound": "checkpoint 行数≤(活跃请求×64+终态请求×33)",
+    "compressionWriteCost": "单次压缩新增序列节点数=O(1)（≤4）",
+    "ordinaryTransactionMayHashFullHistory": false,
+    "ordinaryTransactionMayRewriteFullHistory": false,
+    "clientMayDeepCloneFullHistory": false
+  },
+  "conversationFork": {
+    "releaseDecision": "keep-relations-and-rebuild",
+    "domains": [
+      "ConversationReuseLink",
+      "ConversationBranchLink",
+      "ConversationOriginLink"
+    ],
+    "contextRule": "fork 从选定旧 parent/root 创建目标 Conversation 的新 root/head，结构共享不可变 ContextSequence 前缀。",
+    "relationRule": "Reuse、Branch、Origin 分别建独立表/Repository/Codec/Client mapping；不得嵌入 Conversation。",
+    "legacyRunReference": "forbidden-use-source-turn-id-instead"
+  }
+}

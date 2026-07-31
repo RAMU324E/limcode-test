@@ -12,6 +12,10 @@
   "engines": {
     "vscode": "^1.89.0"
   },
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
   "categories": [
     "Other"
   ],
@@ -81,9 +85,15 @@
     "watch": "tsc -watch -p tsconfig.json",
     "build:webview": "vite build",
     "dev:webview": "vite --host 127.0.0.1 --port 31820 --strictPort",
-    "build": "npm run compile && npm run build:webview",
+    "build": "npm run compile && npm run build:webview && node scripts/reliable-kernel/write-build-provenance.mjs",
     "typecheck:webview": "vue-tsc -p tsconfig.webview.json --noEmit",
-    "check": "npm run compile && npm run typecheck:webview && node --test tests/*.test.cjs",
+    "check": "npm run check:plan",
+    "check:contracts:plan": "node scripts/reliable-kernel/check-plan.mjs",
+    "check:package:surface": "node scripts/reliable-kernel/check-package-surface.mjs",
+    "check:plan": "npm run build && npm run typecheck:webview && npm run check:contracts:plan",
+    "check:plan:tracked": "npm run build && npm run typecheck:webview && node scripts/reliable-kernel/check-plan.mjs --require-tracked",
+    "check:gate": "node scripts/reliable-kernel/check-stage-gate.mjs",
+    "check:local": "npm run check:plan && node scripts/reliable-kernel/run-local-tests.mjs",
     "vscode:prepublish": "npm run build",
     "package:local": "vsce package --allow-missing-repository"
   },

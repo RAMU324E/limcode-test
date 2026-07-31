@@ -1,0 +1,194 @@
+{
+  "contractKind": "client-feed",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
+  "persistence": {
+    "clientChangeLog": false,
+    "clientCommitTables": false,
+    "sessionState": "memory-only",
+    "rule": "事务提交后直接返回类型化变化；网页视图重载或发现缺口时重新读取有界快照。"
+  },
+  "session": {
+    "fields": [
+      "sessionId",
+      "hostBootId",
+      "nextMessageSeq",
+      "inflightMessageSeq?",
+      "lastAckedCommitSeq?",
+      "snapshotRequired"
+    ],
+    "maxInflightDataMessages": 1,
+    "rule": "每次网页视图连接创建新sessionId，关闭或重载后旧消息因sessionId不匹配被忽略。",
+    "hostBootIdRule": "snapshot 与 changes 均携带 hostBootId；扩展宿主重启后 hostBootId 变化，客户端据此丢弃旧会话状态。",
+    "unknownSessionRule": "出站请求收到 unknown-session 错误时，客户端整份重取快照，不逐条补拉或本地猜测合并。",
+    "maxQueuedBatches": 8,
+    "maxQueuedBytes": 4194304,
+    "snapshotRequiredCoalesced": true,
+    "queueOverflowRule": "丢弃尚未发送的普通 changes，合并为一个 snapshot-required 控制状态；等待当前 inflight 包结束后读取新快照。"
+  },
+  "snapshot": {
+    "projections": [
+      "navigation-summary",
+      "active-conversation-window",
+      "active-turn-summary",
+      "active-tool-and-interaction-summary",
+      "subagent-delivery-summary"
+    ],
+    "messageWindowLimit": 200,
+    "activeRecordLimitPerType": 200,
+    "maxBytes": 5242880,
+    "maxBytesEnforcement": "hard-limit",
+    "windowRecordSummaryMaxBytes": 2048,
+    "windowRecordRule": "窗口记录只含摘要（单条不超过 windowRecordSummaryMaxBytes），正文一律经 details.onDemand 按需读取。",
+    "includesFullContextHistory": false,
+    "includesLargeToolContent": false,
+    "fields": [
+      "sessionId",
+      "hostBootId",
+      "snapshotCommitSeq",
+      "projections"
+    ],
+    "snapshotCommitSeq": "快照读事务可见的最后 commitSeq；使用十进制整数字符串。"
+  },
+  "changes": {
+    "source": "committed-transaction-result",
+    "format": "typed-upsert-remove-batch",
+    "oneBatchPerDatabaseCommit": true,
+    "durableReplayAcrossExtensionRestart": false,
+    "applyOrder": "server-foreign-key-topological",
+    "applyAtomicity": "客户端原子应用整批：任一条目应用失败则整批作废并请求新快照。",
+    "unknownTypeRule": "遇到未知 change type 时请求新快照，不做本地猜测合并。",
+    "gapRule": "丢失、乱序、未知类型或应用失败时请求新快照",
+    "fields": [
+      "sessionId",
+      "hostBootId",
+      "commitSeq",
+      "changes"
+    ],
+    "maxChangeBatchRecords": 500,
+    "maxChangeBatchBytes": 1048576,
+    "oneCommitOneAtomicBatch": true,
+    "singleCommitOverflowRule": "不拆分事务形成半可见状态；不发送该普通批次，直接置 snapshot-required。",
+    "queueOverflowRule": "不无限排队；丢弃未发送普通批次并合并为单一 snapshot-required。",
+    "snapshotRequiredRule": "snapshot-required 本身只是一位控制状态，不形成队列；当前 inflight 完成后读取新有界快照。"
+  },
+  "pagination": {
+    "mode": "keyset",
+    "offsetAllowed": false,
+    "frozenRowsAllowed": false,
+    "requestFields": [
+      "query",
+      "sortId",
+      "limit",
+      "afterSortKey?",
+      "afterId?"
+    ],
+    "responseFields": [
+      "rows",
+      "nextSortKey?",
+      "nextId?",
+      "hasMore"
+    ],
+    "stableOrder": "sortKey + id",
+    "sortIdRegistry": {
+      "message": "message_seq",
+      "conversation": "created_at+id"
+    },
+    "sortKeyRule": "sortKey 一经发布不可变；禁止以 updated_at 类可变列注册 sortId。",
+    "recencyReorderRule": "updated_at 类可变字段引起的重排由 changes upsert 在前端本地进行，不改变 keyset 排序键。",
+    "maxPageRows": 200,
+    "maxPageBytes": 524288,
+    "rule": "使用上一页最后一行的稳定排序键继续查询；新插入的行不会让后续页重复或漏读已有行。"
+  },
+  "details": {
+    "onDemand": [
+      "message-content",
+      "tool-result-content",
+      "file-change-content",
+      "process-output",
+      "context-projection-detail",
+      "answer-content"
+    ],
+    "maxResponseBytes": 2097152,
+    "chunkedRead": {
+      "when": "单条记录超过 maxResponseBytes",
+      "requestFields": [
+        "recordId",
+        "offset",
+        "maxBytes"
+      ],
+      "responseFields": [
+        "chunk",
+        "nextOffset?",
+        "totalBytes",
+        "hasMore"
+      ],
+      "rule": "按偏移分段读取直到 hasMore=false；每段响应仍受 maxResponseBytes 约束，客户端负责拼接。"
+    }
+  },
+  "preview": {
+    "messageType": "ephemeral-preview",
+    "binding": "toolCallId",
+    "persisted": false,
+    "discardable": true,
+    "resendOnReload": false,
+    "rule": "工具预览为短暂消息：绑定 toolCallId，不入库、任一侧可丢弃，网页视图重载后不补发。"
+  },
+  "rendering": {
+    "largeLists": "virtual-or-segmented",
+    "messageHistory": "virtual-or-segmented",
+    "customScrollbar": "AdvancedScrollbar",
+    "customScrollbarPath": "webview/src/components/navigation/AdvancedScrollbar.vue",
+    "virtualizedLists": [
+      "message-timeline",
+      "turn-history-list",
+      "large-record-list"
+    ],
+    "acceptance": "千条消息时间线同时挂载的 Vue 组件数不超过 100。",
+    "rule": "分页限制传输总量，虚拟滚动或分段渲染限制同时创建的Vue组件数量。"
+  },
+  "bridgePayload": {
+    "structuredClonePlainDataOnly": true,
+    "forbidden": [
+      "Vue-or-Pinia-Proxy",
+      "function",
+      "DOM-event",
+      "class-instance",
+      "Map",
+      "Set"
+    ]
+  },
+  "secrets": {
+    "allowed": [
+      "dedicated-settings-read",
+      "dedicated-settings-update"
+    ],
+    "forbidden": [
+      "runtime-sqlite",
+      "cas",
+      "ordinary-client-state",
+      "log",
+      "error",
+      "vsix"
+    ]
+  },
+  "notes": [
+    "r4: commitSeq 只在同一 hostBootId 内单调；snapshot 与 changes 通过原子 barrier 交接",
+    "r4: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；超限合并为单一 snapshot-required"
+  ],
+  "sequence": {
+    "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",
+    "commitSeq": "同一 hostBootId 内由数据库提交路径单调分配的十进制整数字符串",
+    "persistenceAcrossHostRestart": false,
+    "wireType": "decimal-integer-string",
+    "rule": "hostBootId 变化或 commitSeq gap 时客户端丢弃本地增量状态并整份重取快照。"
+  },
+  "snapshotFeedHandoff": {
+    "mode": "atomic-commit-seq-barrier",
+    "registration": "snapshot read 与 changes feed 注册在 writer barrier 或等价原子机制下交接",
+    "rule": "订阅不得遗漏 snapshotCommitSeq 之后的 commit；changes.commitSeq 必须严格连续，大于 snapshotCommitSeq。",
+    "implementationFreedom": "合同不固定具体 mutex/worker 消息实现，但必须证明无 gap。",
+    "persistentClientChangeLog": false
+  }
+}

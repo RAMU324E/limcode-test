@@ -1,0 +1,542 @@
+{
+  "contractKind": "transition-ledger",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "compatibilityAdaptersAllowed": false,
+  "scope": "帮助实施者找到当前旧入口；最终完成仍以真实源码和导入图为准。",
+  "entries": [
+    {
+      "key": "file-transaction-backend",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "SQLiteRuntimeTransaction",
+      "selector": {
+        "path": "backend/reliability/fileConversationTransactionBackend.ts",
+        "symbol": "FileConversationTransactionBackend"
+      }
+    },
+    {
+      "key": "file-runtime-authority",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "DomainRepositorySet",
+      "selector": {
+        "path": "backend/reliability/runtimeAuthorityStore.ts",
+        "symbol": "RuntimeAuthorityAdapter"
+      }
+    },
+    {
+      "key": "online-root-migrator",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "OfflineRootActivation",
+      "selector": {
+        "path": "backend/capabilities/vscodeStorage/migration.ts",
+        "symbol": "migrateStorageRoot"
+      }
+    },
+    {
+      "key": "file-durability-cohort",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "SqliteRuntimeFoundation",
+      "selector": {
+        "path": "backend/reliability/fileDurability.ts",
+        "symbol": "DurableFileSystem"
+      },
+      "cohort": [
+        "backend/reliability/fileDurability.ts",
+        "backend/reliability/fileTransactionTypes.ts",
+        "backend/reliability/storagePathAuthority.ts",
+        "backend/reliability/canonicalRecordStore.ts",
+        "backend/reliability/canonicalJson.ts"
+      ]
+    },
+    {
+      "key": "id-and-lease-cohort",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "RuntimeStableIdAndLeaseServices",
+      "selector": {
+        "path": "backend/reliability/stableIdFactory.ts",
+        "symbol": "RuntimeStableIdFactory"
+      },
+      "cohort": [
+        "backend/reliability/stableIdFactory.ts",
+        "backend/reliability/runtimeLeaseRegistry.ts",
+        "backend/reliability/logicalScopeExecutor.ts"
+      ]
+    },
+    {
+      "key": "storage-compilers-cohort",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "SqliteRepositoryWriters",
+      "selector": {
+        "path": "backend/reliability/storageCompilers/recordStoreCompiler.ts",
+        "symbol": "compileRecordStore"
+      },
+      "cohort": [
+        "backend/reliability/storageCompilers/recordStoreCompiler.ts",
+        "backend/reliability/storageCompilers/answerBridgeCompiler.ts",
+        "backend/reliability/storageCompilers/attachmentCompiler.ts",
+        "backend/reliability/storageCompilers/compressionCompiler.ts",
+        "backend/reliability/storageCompilers/interactionCompiler.ts",
+        "backend/reliability/storageCompilers/timelineCompiler.ts",
+        "backend/reliability/storageCompilers/toolCallCompiler.ts",
+        "backend/reliability/storageCompilers/toolCallEventCompiler.ts",
+        "backend/reliability/storageCompilers/toolResultCompiler.ts",
+        "backend/reliability/storageCompilers/turnControlCompiler.ts"
+      ]
+    },
+    {
+      "key": "canonical-resource-loaders-cohort",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "SqliteDomainRepositories",
+      "selector": {
+        "path": "backend/reliability/toolResultResource.ts",
+        "symbol": "loadCanonicalToolResultState"
+      },
+      "cohort": [
+        "backend/reliability/toolResultResource.ts",
+        "backend/reliability/toolResultPayload.ts",
+        "backend/reliability/toolResultTypes.ts",
+        "backend/reliability/toolCallResource.ts",
+        "backend/reliability/toolCallEventResource.ts",
+        "backend/reliability/timelineResource.ts",
+        "backend/reliability/timelineFormat.ts",
+        "backend/reliability/turnControlResource.ts",
+        "backend/reliability/interactionResource.ts",
+        "backend/reliability/interactionResolution.ts",
+        "backend/reliability/compressionResource.ts",
+        "backend/reliability/modelContextDurableFacts.ts"
+      ]
+    },
+    {
+      "key": "attachment-cohort",
+      "replacementStage": "B",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "AttachmentRepositoryAndCas",
+      "selector": {
+        "path": "backend/reliability/attachmentResource.ts",
+        "symbol": "loadCanonicalAttachmentRecords"
+      },
+      "cohort": [
+        "backend/reliability/attachmentResource.ts",
+        "backend/reliability/attachmentBase64.ts",
+        "backend/reliability/managedAttachmentReferences.ts"
+      ]
+    },
+    {
+      "key": "agent-run-public-authority",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "TurnSummaryRecord",
+      "selector": {
+        "path": "shared/protocol.ts",
+        "symbol": "AgentRunRecord"
+      }
+    },
+    {
+      "key": "direct-tool-finalization",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "EffectReceiptToToolOutcome",
+      "selector": {
+        "path": "backend/application/effectHandlers/tools/index.ts",
+        "symbol": "registerToolEffectHandlers"
+      }
+    },
+    {
+      "key": "process-output-consume-mode",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "ReadOnlyProcessOutput",
+      "selector": {
+        "path": "backend/world/modules/tools/definitions/command/index.ts",
+        "symbol": "createCommandTool",
+        "member": "consume"
+      }
+    },
+    {
+      "key": "process-terminal-claim",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "ProcessReceipt",
+      "selector": {
+        "path": "backend/capabilities/backgroundProcessManager.ts",
+        "symbol": "BackgroundProcessManager",
+        "member": "claimTerminalRevisionForModelPoll"
+      }
+    },
+    {
+      "key": "giant-primary-effect-dispatcher",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "split-and-delete",
+      "replacement": "PerCapabilityDispatcher",
+      "selector": {
+        "path": "backend/reliability/primaryEffectDispatcher.ts",
+        "symbol": "PrimaryEffectDispatcher"
+      }
+    },
+    {
+      "key": "domain-handlers-cohort",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "EffectDrivenCommandHandlers",
+      "selector": {
+        "path": "backend/reliability/domain/internalHandlers.ts",
+        "symbol": "AdmitTurnIntentHandler"
+      },
+      "cohort": [
+        "backend/reliability/domain/internalHandlers.ts",
+        "backend/reliability/domain/answerDeliveryHandlers.ts",
+        "backend/reliability/domain/runtimeCleanupHandlers.ts",
+        "backend/reliability/domain/humanInteractionHandlers.ts",
+        "backend/reliability/domain/types.ts"
+      ]
+    },
+    {
+      "key": "demote-final-tool-result-links",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "ToolResultArtifactRepository",
+      "selector": {
+        "path": "backend/reliability/domain/toolResultArtifacts.ts",
+        "symbol": "demoteFinalToolResultLinks"
+      }
+    },
+    {
+      "key": "runtime-orchestration-cohort",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "ReliableKernelOrchestrationServices",
+      "selector": {
+        "path": "backend/reliability/conversationCommandGateway.ts",
+        "symbol": "ConversationCommandGateway"
+      },
+      "cohort": [
+        "backend/reliability/conversationCommandGateway.ts",
+        "backend/reliability/authorityCompiler.ts",
+        "backend/reliability/llmPreflightPlanner.ts",
+        "backend/reliability/preparedProjectionBatch.ts",
+        "backend/reliability/conversationWorldProjection.ts",
+        "backend/reliability/backgroundProcessDeliveryDispatcher.ts",
+        "backend/reliability/reliabilityInspector.ts"
+      ]
+    },
+    {
+      "key": "full-context-projection-commit",
+      "replacementStage": "E",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "PersistentContextSequenceCommit",
+      "selector": {
+        "path": "backend/modelContext/projectionRecords.ts",
+        "symbol": "buildModelContextProjectionCommitData"
+      }
+    },
+    {
+      "key": "auto-compression-planner",
+      "replacementStage": "E",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "PersistentContextSequenceCompression",
+      "selector": {
+        "path": "backend/reliability/reliableAutoCompressionPlanner.ts",
+        "symbol": "planReliableAutoCompressionProjection"
+      }
+    },
+    {
+      "key": "legacy-runtime-delivery-states",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "RuntimeDeliveryPendingConsumedFailed",
+      "selector": {
+        "path": "shared/conversationReliability.ts",
+        "symbol": "RuntimeDeliveryState",
+        "member": "dead_letter"
+      }
+    },
+    {
+      "key": "child-link-answer-bridge-backref",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "AnswerBridgeChildExecutionOwner",
+      "selector": {
+        "path": "shared/conversationReliability.ts",
+        "symbol": "ChildTurnLinkRecord",
+        "member": "answerBridgeId"
+      }
+    },
+    {
+      "key": "persisted-bridge-client-id",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "InMemoryClientSessionId",
+      "selector": {
+        "path": "webview/src/transport/bridge.ts",
+        "symbol": "Bridge",
+        "member": "clientId"
+      }
+    },
+    {
+      "key": "client-stream-snapshot-protocol",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "BoundedSnapshotAndChangeBatch",
+      "selector": {
+        "path": "shared/protocol.ts",
+        "symbol": "ClientSnapshotPayload",
+        "member": "streamSeq"
+      }
+    },
+    {
+      "key": "client-state-database-copy",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "BoundedPiniaReadModel",
+      "selector": {
+        "path": "webview/src/stores/clientStateDb.ts",
+        "symbol": "ClientStateDb",
+        "member": "applySnapshot"
+      }
+    },
+    {
+      "key": "runtime-secret-history-option",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "SettingsOnlySecretAccess",
+      "selector": {
+        "path": "shared/protocol.ts",
+        "symbol": "LlmDryRunGetPayload",
+        "member": "includeApiKey"
+      }
+    },
+    {
+      "key": "run-graph-validation-cohort",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "TurnCentricInvariantChecks",
+      "selector": {
+        "path": "backend/reliability/runGraphClosureResolver.ts",
+        "symbol": "resolveRunGraphClosure"
+      },
+      "cohort": [
+        "backend/reliability/runGraphClosureResolver.ts",
+        "backend/reliability/runInvariantValidator.ts"
+      ]
+    },
+    {
+      "key": "derived-projections-cohort",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "ClientFeedReadModelProjections",
+      "selector": {
+        "path": "backend/reliability/derived/runHistoryProjection.ts",
+        "symbol": "projectConversationRunHistoryPage"
+      },
+      "cohort": [
+        "backend/reliability/derived/runHistoryProjection.ts",
+        "backend/reliability/derived/timelinePageProjection.ts"
+      ]
+    },
+    {
+      "key": "shared-run-protocol-types",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "TurnCentricProtocolTypes",
+      "selector": {
+        "path": "shared/protocol.ts",
+        "symbol": "AgentRunStatus"
+      },
+      "cohort": [
+        "shared/protocol.ts"
+      ]
+    },
+    {
+      "key": "shared-run-lifecycle",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "TurnLifecycleOnly",
+      "selector": {
+        "path": "shared/runLifecycle.ts",
+        "symbol": "RunLifecycleStatus"
+      }
+    },
+    {
+      "key": "shared-agent-run-activity",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "TurnActivityProjection",
+      "selector": {
+        "path": "shared/agentRunActivity.ts",
+        "symbol": "agentRunActivityBlocker"
+      }
+    },
+    {
+      "key": "webview-agent-run-panel",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "RemovedRunHistoryUi",
+      "selector": {
+        "path": "webview/src/components/input/AgentRunPanel.vue",
+        "symbol": "foregroundAnswerReceiptState"
+      }
+    },
+    {
+      "key": "webview-run-history-store",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "RemovedRunHistoryReadModel",
+      "selector": {
+        "path": "webview/src/stores/useRunHistoryStore.ts",
+        "symbol": "useRunHistoryStore"
+      }
+    },
+    {
+      "key": "webview-run-history-detail-panel",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "RemovedRunHistoryUi",
+      "selector": {
+        "path": "webview/src/components/conversation/RunHistoryDetailPanel.vue",
+        "symbol": "sensitiveHeader"
+      }
+    },
+    {
+      "key": "webview-client-state-active-runs",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "TurnCentricClientState",
+      "selector": {
+        "path": "webview/src/stores/useClientStateStore.ts",
+        "symbol": "ClientStateStoreState",
+        "member": "activeRuns"
+      }
+    },
+    {
+      "key": "webview-message-router-run-history",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "RemovedRunHistoryHandlers",
+      "selector": {
+        "path": "backend/application/WebviewMessageRouter.ts",
+        "symbol": "WebviewMessageRouter",
+        "member": "postRunHistoryPage"
+      }
+    },
+    {
+      "key": "agent-run-world-module",
+      "replacementStage": "G",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "RemovedWithRunEcs",
+      "selector": {
+        "path": "backend/world/modules/agentRun/components.ts",
+        "symbol": "AgentRun"
+      },
+      "cohort": [
+        "backend/world/modules/agentRun/components.ts",
+        "backend/world/modules/agentRun/stateProjection.ts",
+        "backend/world/modules/agentRun/storageProjection.ts",
+        "backend/world/modules/agentRun/clientSync.ts",
+        "backend/world/modules/agentRun/systems/index.ts",
+        "backend/world/modules/agentRun/index.ts",
+        "backend/world/modules/agentRun/bundles.ts",
+        "backend/world/modules/agentRun/contextPolicy.ts",
+        "backend/world/modules/agentRun/llmRequestCleanup.ts",
+        "backend/world/modules/agentRun/modelContextWorldFacts.ts",
+        "backend/world/modules/agentRun/plugin.ts",
+        "backend/world/modules/agentRun/queries.ts",
+        "backend/world/modules/agentRun/termination.ts"
+      ]
+    },
+    {
+      "key": "conversation-fork-link-cohort",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "ConversationReuseBranchOriginLinkRepositories",
+      "selector": {
+        "path": "backend/world/modules/chat/components.ts",
+        "symbol": "ConversationReuseLink"
+      },
+      "cohort": [
+        "backend/world/modules/chat/components.ts",
+        "backend/application/conversationFork.ts",
+        "backend/capabilities/vscodeStorage/clientStateStore.ts"
+      ]
+    },
+    {
+      "key": "mcp-direct-runtime-execution",
+      "replacementStage": "D",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "McpToolCallEffectDispatcher",
+      "selector": {
+        "path": "backend/application/mcpRuntimeManager.ts",
+        "symbol": "mcpToolDefinition",
+        "member": "client.callTool"
+      }
+    },
+    {
+      "key": "mutable-compression-update",
+      "replacementStage": "E",
+      "deleteStage": "G",
+      "disposition": "replace-and-delete",
+      "replacement": "ImmutableCompressionReplacementCommand",
+      "selector": {
+        "path": "shared/protocol.ts",
+        "symbol": "CompressionUpdate",
+        "member": "summaryContents"
+      }
+    },
+    {
+      "key": "agent-system-scope-kind",
+      "replacementStage": "F",
+      "deleteStage": "G",
+      "disposition": "delete",
+      "replacement": "SupportedConfigurationScopesWithoutAgentSystem",
+      "selector": {
+        "path": "shared/protocol.ts",
+        "symbol": "ToolPolicyScopeKind",
+        "member": "agentSystem"
+      }
+    }
+  ],
+  "rule": "replacementStage 表示新能力完成阶段；A-F 旧源码可继续服务日常旧内核，但候选路由必须不可达。deleteStage 表示物理删除阶段，所有旧 Runtime 入口固定为 G；只有源码实际删除后才写 deletedAtCommit，条目永久保留。禁止旧格式导入、双写和兼容适配器。"
+}

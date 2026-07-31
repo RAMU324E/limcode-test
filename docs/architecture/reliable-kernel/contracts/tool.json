@@ -1,0 +1,281 @@
+{
+  "contractKind": "tool",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "保留自用编程Agent需要的工具能力，同时把调用、执行、外部回执和模型结果拆开。",
+  "executionChain": [
+    "ToolCall",
+    "ToolExecution",
+    "Operation",
+    "Attempt",
+    "EffectIntent",
+    "EffectReceipt",
+    "ToolOutcome",
+    "ToolModelResult"
+  ],
+  "resultCardinality": {
+    "toolExecutionPerCall": "exactly-one",
+    "toolOutcomePerCall": "at-most-one",
+    "toolModelResultPerCall": "exactly-one-after-terminal",
+    "proposalMayBeModelResult": false,
+    "oldFinalDemotionIsTargetArchitecture": false,
+    "toolOutcomeOutcomes": [
+      "succeeded",
+      "failed",
+      "partial",
+      "rejected",
+      "cancelled",
+      "conflict",
+      "outcome_unknown"
+    ]
+  },
+  "operation": {
+    "ownerKinds": [
+      "tool_execution",
+      "file_change_set",
+      "process",
+      "child_execution",
+      "model_request"
+    ],
+    "indexes": [
+      "owner_kind,owner_id,operation_seq UNIQUE",
+      "tool_call_id",
+      "status"
+    ],
+    "rule": "Operation 归属五类所有者之一；子代理操作归属稳定 ChildExecution；tool_call_id 普通索引用于汇聚该 ToolCall 下全部 Operation 以触发 ToolOutcome。"
+  },
+  "effectIntent": {
+    "effectKinds": [
+      "file_mutation",
+      "process_start",
+      "process_exit",
+      "process_stop_request",
+      "subagent_spawn",
+      "subagent_cancel",
+      "mcp_tool_call"
+    ],
+    "dispatchStates": [
+      "pending",
+      "dispatched",
+      "receipt_written"
+    ],
+    "rule": "dispatch_state 随派发与回执写入推进；重启后仍处于 dispatched 且无回执的意图进入 recoveryScan。"
+  },
+  "effectReceipt": {
+    "fields": [
+      "effectReceiptId",
+      "attemptId",
+      "effectKind",
+      "outcome",
+      "detailContentObjectId?",
+      "receivedAt"
+    ],
+    "outcomes": [
+      "succeeded",
+      "failed",
+      "cancelled",
+      "conflict",
+      "outcome_unknown"
+    ],
+    "rule": "回执只陈述外部操作目前能证明的结果，业务结论由对应领域仓储生成。"
+  },
+  "outcomeAggregation": {
+    "trigger": "该 ToolCall 下全部 Operation 达到终态时汇聚生成 ToolOutcome",
+    "priority": [
+      "conflict",
+      "failed",
+      "outcome_unknown",
+      "partial",
+      "succeeded"
+    ],
+    "detail": "汇聚明细写入 CAS 对象，由 ToolOutcome.detail_object_id 引用",
+    "rule": "汇聚优先级 conflict>failed>outcome_unknown>partial>succeeded；rejected/cancelled 不经汇聚矩阵，分别来自审批旁路和取消/收口路径。"
+  },
+  "recoveryScan": {
+    "runsOn": "extension-host-restart",
+    "frameworkOwnerStage": "D",
+    "scans": [
+      {
+        "id": "recovery.effect-intent-hanging",
+        "ownerStage": "D",
+        "target": "dispatch_state=dispatched 且无 EffectReceipt 的 EffectIntent",
+        "action": "按 effectKind 使用可验证证据核验；file_mutation 做摘要对账，process 类读取 wrapper nonce/fingerprint/spool/exit receipt，MCP 等不可查询作用写 outcome_unknown；禁止自动重复派发。"
+      },
+      {
+        "id": "recovery.file-change-unresolved",
+        "ownerStage": "D",
+        "target": "未决 FileChangeSet",
+        "action": "按 file.json unresolvedClosure 节在同一事务置 expired，并生成 cancelled ToolOutcome 与唯一 ToolModelResult。"
+      },
+      {
+        "id": "recovery.answer-inbox-invariant",
+        "ownerStage": "F",
+        "target": "AnswerSubmission 已存在但 RuntimeInboxItem 缺失",
+        "action": "按 AnswerSubmission/AnswerBridge 稳定身份补建 RuntimeInboxItem。"
+      },
+      {
+        "id": "recovery.delivery-pending",
+        "ownerStage": "F",
+        "target": "pending RuntimeDelivery",
+        "action": "按 subagent.json delivery advancement matrix 重新评估并继续投递。"
+      },
+      {
+        "id": "recovery.foreground-answer-wait-expired",
+        "ownerStage": "F",
+        "target": "ToolExecution.wait_deadline_at 已过期且仍 waiting_answer",
+        "action": "按前台等待到期规则转后台控制句柄，原 ToolCall 只结算一次。"
+      },
+      {
+        "id": "recovery.cancelled-subtree-incomplete",
+        "ownerStage": "F",
+        "target": "已登记 cancel_subtree 但仍有 active Turn 或 pending ChildExecutionIntentLink 的 lineage",
+        "action": "沿 ChildExecutionParentLink 续扫，补写终止意图并取消 pending intent。"
+      }
+    ],
+    "rule": "重启后不以内存状态回答外部结果；凡不能证明的结果一律 outcome_unknown。"
+  },
+  "lateReceipt": {
+    "duplicate": "同 attemptId 重复回执按 dedupe 丢弃并记日志",
+    "afterTerminal": "终态后首到回执正常落库，但不改变既有 ToolOutcome/Attempt 终态；与既有结论的分歧仅在 receipt.detail 中体现"
+  },
+  "parallelReconcile": {
+    "receiptWrites": "每条 EffectReceipt 各自独立事务落库，回执之间不互相阻塞",
+    "lease": "Reconcile 不持有 ExecutionLease",
+    "outcomeWrites": "ToolOutcome、ToolModelResult 和 message_seq 由持有 ExecutionLease 的 Turn 在单事务内按 call_seq 串行落库"
+  },
+  "preview": {
+    "channel": "client-feed.json preview 节（ephemeral-preview 消息）",
+    "rule": "工具预览经 client-feed 的 ephemeral preview 消息下发：绑定 toolCallId，不入库、可丢弃，网页视图重载后不补发。"
+  },
+  "planProposal": {
+    "derivedFrom": "name=submit_plan 的 ToolCall 及其 ToolOutcome",
+    "dedicatedTable": false,
+    "rule": "PlanProposal 是派生视图，由 submit_plan 调用的 ToolCall 与 ToolOutcome 读出，不建表（见 01 §4）。"
+  },
+  "approvalBypass": {
+    "outcomes": [
+      "rejected",
+      "expired"
+    ],
+    "exemption": "未发起外部作用",
+    "rule": "FileChangeDecision 为 rejected 或 expired 时不创建 Operation/Attempt/EffectIntent，直接生成对应 ToolOutcome 与唯一 ToolModelResult；豁免条款见 file.json decision 节与 01 §6。"
+  },
+  "retryPolicy": {
+    "automaticKinds": [
+      "provider-transient"
+    ],
+    "providerMaxAttempts": 2,
+    "visibleToUser": true,
+    "cancelable": true,
+    "automaticAfterExtensionRestart": false,
+    "fileMutationAutomaticRetry": false,
+    "commandExecutionAutomaticRetry": false,
+    "subagentStartAutomaticRetry": false,
+    "rule": "只有连接中断、限流和明确临时服务错误允许在当前活动请求内重试一次；其他操作由用户明确重新发起。"
+  },
+  "parallelExecution": {
+    "supported": true,
+    "eligible": [
+      "read-only-tools",
+      "independent-tools-with-distinct-effect-intents"
+    ],
+    "orderedResultAssembly": "tool-call-sequence",
+    "rule": "能并行的工具并行执行；共享同一修改目标或存在先后依赖时保持串行。"
+  },
+  "processCapability": {
+    "releaseMode": "detached-wrapper-exact-recovery",
+    "operations": [
+      "execute",
+      "read_output",
+      "wait",
+      "stop"
+    ],
+    "executeResult": "进程快速结束时返回终态；超过前台等待时间时返回 processId，detached wrapper 继续独立观察真实命令。",
+    "wrapper": {
+      "kind": "packaged-small-detached-wrapper",
+      "requiredEvidence": [
+        "stableNonce",
+        "wrapperPid",
+        "childPid",
+        "processGroupId",
+        "startFingerprint",
+        "commandDigest",
+        "spoolPath"
+      ],
+      "stdoutStderr": "wrapper 持续 drain 并写有界 spool；Extension Host 不把不可恢复 pipe 当成跨重启权威。",
+      "exitReceipt": "wrapper 在同一 spool root 原子写 nonce/fingerprint/exitCode/signal/exitedAt/droppedBytes；新宿主核验后生成 EffectReceipt/ProcessReceipt。",
+      "noDaemonBroker": true,
+      "spoolPathRule": "spool root必须由当前RootAuthority fenced RootBinding中的getPaths结果解析；每次read/wait/stop重验binding generation，禁止缓存裸路径。"
+    },
+    "readOutput": "只读，不消费也不删除；读取已登记 ProcessOutputChunk 与 wrapper spool 的可验证部分，并返回 retained/dropped/truncated 计数。",
+    "wait": "只观察已有 wrapper/exit receipt/ProcessReceipt；本地等待超时不制造外部副作用。",
+    "stop": "创建 process_stop_request EffectIntent；只有 stable nonce + start fingerprint + process group 全部匹配才向 wrapper 请求停止，禁止对裸 PID stop。",
+    "exitObservation": "真实 exit receipt 由 wrapper 产生；没有 receipt 且无法证明时为 outcome_unknown，不伪造 abnormal 或 exitCode=1。",
+    "completion": "ProcessReceipt 先持久化，再通过 RuntimeInbox 通知需要它的 Turn；进程类结果仅可经 Process 表查询。",
+    "restartRules": [
+      "wrapper+fingerprint 存活：Process 保持 running",
+      "exit receipt 有效：写真实终态和 exit code",
+      "wrapper 不可达且无有效 receipt：写 outcome_unknown",
+      "不承诺从普通 child pipe 恢复任何事实"
+    ]
+  },
+  "cancellation": {
+    "localAbortSignalIsTerminal": false,
+    "lateReceiptRule": "原Attempt已经终态时只保留审计信息，不得结束新的Attempt或重新打开Turn。"
+  },
+  "externalEffectPromise": {
+    "modelResultExactlyOnce": true,
+    "externalSideEffectExactlyOnce": false,
+    "unverifiableCrashOutcome": "outcome_unknown"
+  },
+  "notes": [
+    "r4: recoveryScan 使用六个稳定 ID，D 拥有通用 Effect/File 两项，F 拥有四项子代理扫描",
+    "r4: 后台进程首发使用 detached wrapper + bounded spool + atomic exit receipt，不凭裸 PID 恢复或停止",
+    "r4: MCP 工具调用进入 mcp_tool_call EffectIntent/Receipt，不再由 runtime tool 直接调用外部服务"
+  ],
+  "processOutput": {
+    "metadataDomain": "ProcessOutputChunk",
+    "contentStorage": "cas",
+    "fields": [
+      "processId",
+      "chunkSeq",
+      "streamKind",
+      "contentObjectId",
+      "byteLength",
+      "createdAt"
+    ],
+    "streamKinds": [
+      "stdout",
+      "stderr"
+    ],
+    "maxChunkBytes": 65536,
+    "maxRetainedBytesPerProcess": 4194304,
+    "maxRetainedChunksPerProcess": 256,
+    "maxTerminalTailBytesPerStream": 32768,
+    "maxFlushDelayMs": 250,
+    "overflow": "达到 bytes 或 chunk count 任一上限后继续 drain 外部 pipe，但不再写 CAS 正文或 chunk metadata；累加 droppedBytes 并置 truncated=true。",
+    "processCounters": [
+      "retainedBytes",
+      "retainedChunks",
+      "droppedBytes",
+      "truncated"
+    ],
+    "rule": "CAS 只解决内容寻址，不替代容量上限；每个 Process 独立有界。",
+    "terminalTailBudgetRule": "stdout/stderr terminal tail均计入maxRetainedBytesPerProcess与maxRetainedChunksPerProcess；streaming writer预留尾部预算，任何路径都不得越过总上限。"
+  },
+  "mcpCapability": {
+    "releaseDecision": "keep-settings-rebuild-effect",
+    "settingsAuthority": "settings/mcp-servers index+records",
+    "connectionState": "memory-only-rebuild-on-extension-host-start",
+    "effectKind": "mcp_tool_call",
+    "operationOwner": "tool_execution",
+    "riskMapping": {
+      "readOnlyHintTrue": "read",
+      "destructiveHintTrue": "write",
+      "otherwise": "command"
+    },
+    "approval": "复用 ToolPolicy 与 PlanReviewPolicy，不建 MCP 专用审批权威。",
+    "crashRule": "派发后无法向 MCP server 查询同一调用结果时写 outcome_unknown，不自动重试。",
+    "resultRule": "终态经 EffectReceipt -> ToolOutcome -> 唯一 ToolModelResult；连接重建不等于调用恢复。"
+  }
+}

@@ -1,0 +1,456 @@
+{
+  "contractKind": "gate-registry",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "七个实施阶段只汇总成三个正式出口，避免每个小步骤都制造一套门禁。",
+  "gates": [
+    {
+      "id": "foundation",
+      "order": 1,
+      "stages": [
+        "A",
+        "B"
+      ],
+      "artifact": "not-allowed"
+    },
+    {
+      "id": "candidate",
+      "order": 2,
+      "stages": [
+        "C",
+        "D",
+        "E",
+        "F"
+      ],
+      "artifact": "not-allowed"
+    },
+    {
+      "id": "installed",
+      "order": 3,
+      "stages": [
+        "G"
+      ],
+      "artifact": "required"
+    }
+  ],
+  "validatorGroups": [
+    {
+      "id": "plan",
+      "introducedAt": "foundation",
+      "path": "scripts/reliable-kernel/validators/plan.mjs",
+      "checks": [
+        {
+          "id": "plan.contract-coherence",
+          "description": "背景、总纲、机器合同和迁移规则自洽。",
+          "ownerStage": "A"
+        },
+        {
+          "id": "plan.transition-disposition",
+          "description": "旧实现入口都有 replacement/delete 明确去向。",
+          "ownerStage": "A",
+          "contractRef": "transition-ledger.json"
+        },
+        {
+          "id": "plan.no-legacy-compatibility",
+          "description": "没有旧 Runtime 导入、双写、协议协商或 fallback。",
+          "ownerStage": "A",
+          "contractRef": "migration.json"
+        }
+      ]
+    },
+    {
+      "id": "foundation",
+      "introducedAt": "foundation",
+      "path": "scripts/reliable-kernel/validators/foundation.mjs",
+      "checks": [
+        {
+          "id": "foundation.sqlite-driver-load",
+          "description": "SQLite 驱动可在真实 Extension Host 加载。",
+          "ownerStage": "B"
+        },
+        {
+          "id": "foundation.single-db-worker",
+          "description": "一个数据库工作线程持有连接。",
+          "ownerStage": "B"
+        },
+        {
+          "id": "foundation.schema-repositories",
+          "description": "当前 schema、外键、索引和独立领域 Repository 可建立。",
+          "ownerStage": "B",
+          "contractRef": "authority.json#runtimeDomains"
+        },
+        {
+          "id": "foundation.cas-publish-before-reference",
+          "description": "CAS 先发布内容再提交数据库引用。",
+          "ownerStage": "B",
+          "contractRef": "authority.json#contentAuthority"
+        },
+        {
+          "id": "foundation.root-binding-fence",
+          "description": "RootBinding 逐事务校验且只能重启换根。",
+          "ownerStage": "B",
+          "contractRef": "authority.json#rootPolicy"
+        },
+        {
+          "id": "foundation.no-legacy-fallback",
+          "description": "SQLite/CAS 故障不改走旧写入器。",
+          "ownerStage": "B",
+          "contractRef": "migration.json"
+        },
+        {
+          "id": "foundation.empty-root-current-epoch",
+          "description": "空数据根可直接创建当前 Runtime epoch。",
+          "ownerStage": "B"
+        },
+        {
+          "id": "foundation.baselines-non-placeholder",
+          "description": "性能与打包基线字段均为非占位值。",
+          "ownerStage": "A",
+          "contractRef": "appendices/performance-and-packaging-gates.md"
+        }
+      ]
+    },
+    {
+      "id": "candidate",
+      "introducedAt": "candidate",
+      "path": "scripts/reliable-kernel/validators/candidate.mjs",
+      "checks": [
+        {
+          "id": "candidate.turn-sole-execution-identity",
+          "description": "Turn 是唯一执行身份。",
+          "ownerStage": "C",
+          "contractRef": "identity.json#turnIdentity"
+        },
+        {
+          "id": "candidate.tool-model-result-exactly-once",
+          "description": "每个终态 ToolCall 只有一次模型结果。",
+          "ownerStage": "D",
+          "contractRef": "tool.json#resultCardinality"
+        },
+        {
+          "id": "candidate.file-proposal-result-separated",
+          "description": "FileChangeSet 与真实执行结果分开。",
+          "ownerStage": "D",
+          "contractRef": "file.json"
+        },
+        {
+          "id": "candidate.effect-receipt-reconcile",
+          "description": "EffectReceipt 可在 Conversation callback 失败后独立重建结果。",
+          "ownerStage": "D",
+          "contractRef": "tool.json"
+        },
+        {
+          "id": "candidate.context-storage-growth",
+          "description": "ContextSequence 不复制历史前缀并满足量化增长上限。",
+          "ownerStage": "E",
+          "contractRef": "context.json#performance"
+        },
+        {
+          "id": "candidate.context-compression-node-bound",
+          "description": "单次 compression 只新增 O(1) ContextSequence nodes，数量不超过合同上限。",
+          "ownerStage": "E",
+          "contractRef": "context.json#performance.compressionWriteCost"
+        },
+        {
+          "id": "candidate.provider-continuation-disabled-full-request",
+          "description": "首发禁用 ProviderContinuation：始终完整请求且不读写 suffix。",
+          "ownerStage": "E",
+          "contractRef": "context.json#providerContinuation"
+        },
+        {
+          "id": "candidate.conversation-fork-links",
+          "description": "Conversation fork 使用三个独立 Link 并共享不可变 Context 前缀。",
+          "ownerStage": "F",
+          "contractRef": "context.json#conversationFork"
+        },
+        {
+          "id": "candidate.compression-immutable-replacement",
+          "description": "压缩 title/summary 修改创建不可变 replacement，不原地改正文。",
+          "ownerStage": "E",
+          "contractRef": "context.json#compression"
+        },
+        {
+          "id": "candidate.attachment-cas-ingest",
+          "description": "附件受大小限制进入 CAS 并由 MessageRevision 的 AttachmentLink 引用。",
+          "ownerStage": "D",
+          "contractRef": "authority.json#capabilityDispositions"
+        },
+        {
+          "id": "candidate.mcp-effect-recovery",
+          "description": "MCP 调用经 mcp_tool_call Effect 结算，崩溃后不自动重试。",
+          "ownerStage": "D",
+          "contractRef": "tool.json#mcpCapability"
+        },
+        {
+          "id": "candidate.process-wrapper-recovery",
+          "description": "detached wrapper 跨重启保留可核验 spool 与真实 exit receipt。",
+          "ownerStage": "D",
+          "contractRef": "tool.json#processCapability"
+        },
+        {
+          "id": "candidate.process-output-bounds",
+          "description": "ProcessOutputChunk 正文与 metadata 均按每进程硬上限收敛。",
+          "ownerStage": "D",
+          "contractRef": "tool.json#processOutput"
+        },
+        {
+          "id": "candidate.subagent-answer-restart-delivery",
+          "description": "子代理答案可跨重启投递。",
+          "ownerStage": "F",
+          "contractRef": "subagent.json#answer"
+        },
+        {
+          "id": "candidate.subagent-cancel-subtree",
+          "description": "cancel_subtree 沿稳定 lineage 终止且不误伤其他子树。",
+          "ownerStage": "F",
+          "contractRef": "subagent.json#cancel"
+        },
+        {
+          "id": "candidate.client-snapshot-bounds",
+          "description": "Client snapshot 满足 records 与 bytes 硬上限。",
+          "ownerStage": "F",
+          "contractRef": "client-feed.json#snapshot"
+        },
+        {
+          "id": "candidate.client-change-batch-bounds",
+          "description": "一个 commit 一个原子 changes batch，records 与 bytes 有硬上限。",
+          "ownerStage": "F",
+          "contractRef": "client-feed.json#changes"
+        },
+        {
+          "id": "candidate.client-queue-bounds",
+          "description": "Extension Host changes 队列有 batch/bytes 硬上限并合并 snapshot-required。",
+          "ownerStage": "F",
+          "contractRef": "client-feed.json#session"
+        },
+        {
+          "id": "candidate.client-snapshot-feed-barrier",
+          "description": "snapshotCommitSeq 与 commitSeq barrier 保证 snapshot→changes 无 gap。",
+          "ownerStage": "F",
+          "contractRef": "client-feed.json#snapshotFeedHandoff"
+        },
+        {
+          "id": "candidate.old-writer-not-routed",
+          "description": "旧 writer 可留在源码但候选导入图和路由不可达。",
+          "ownerStage": "F",
+          "contractRef": "transition-ledger.json"
+        },
+        {
+          "id": "candidate.recovery.effect-intent-hanging",
+          "description": "重启后核验悬挂 EffectIntent。",
+          "ownerStage": "D",
+          "contractRef": "recovery.effect-intent-hanging"
+        },
+        {
+          "id": "candidate.recovery.file-change-unresolved",
+          "description": "重启后收口未决 FileChangeSet。",
+          "ownerStage": "D",
+          "contractRef": "recovery.file-change-unresolved"
+        },
+        {
+          "id": "candidate.recovery.answer-inbox-invariant",
+          "description": "重启后修复 AnswerSubmission/RuntimeInboxItem 不变量。",
+          "ownerStage": "F",
+          "contractRef": "recovery.answer-inbox-invariant"
+        },
+        {
+          "id": "candidate.recovery.pending-delivery",
+          "description": "重启后重新评估 pending RuntimeDelivery。",
+          "ownerStage": "F",
+          "contractRef": "recovery.delivery-pending"
+        },
+        {
+          "id": "candidate.recovery.foreground-wait-expired",
+          "description": "重启后收口过期前台 answer wait。",
+          "ownerStage": "F",
+          "contractRef": "recovery.foreground-answer-wait-expired"
+        },
+        {
+          "id": "candidate.recovery.cancelled-subtree-incomplete",
+          "description": "重启后续扫未完成 cancel_subtree。",
+          "ownerStage": "F",
+          "contractRef": "recovery.cancelled-subtree-incomplete"
+        },
+        {
+          "id": "candidate.parent-handling-matrix",
+          "description": "parentHandlingState 只按对应 RuntimeDeliveryInputLink.handled_at 推导。",
+          "ownerStage": "F",
+          "contractRef": "subagent.json#parentHandlingStates"
+        }
+      ]
+    },
+    {
+      "id": "package",
+      "introducedAt": "installed",
+      "path": "scripts/reliable-kernel/validators/package.mjs",
+      "checks": [
+        {
+          "id": "package.legacy-runtime-archived",
+          "description": "旧运行时按 physical migration manifest 完整归档。",
+          "ownerStage": "G",
+          "contractRef": "migration.json#physicalManifest"
+        },
+        {
+          "id": "package.legacy-entry-unreachable",
+          "description": "旧写入入口在最终安装路径不可达。",
+          "ownerStage": "G",
+          "contractRef": "transition-ledger.json"
+        },
+        {
+          "id": "package.provenance-clean-commit",
+          "description": "安装包 provenance 证明构建时 worktreeClean=true，且 commitSha 等于当前干净提交。",
+          "ownerStage": "G",
+          "contractRef": "targets.json#validation.buildProvenance"
+        },
+        {
+          "id": "package.provenance-vsix-main-entry-digest",
+          "description": "重算 VSIX 内真实 main entry 摘要并与 provenance.mainEntrySha256 相等。",
+          "ownerStage": "G",
+          "contractRef": "targets.json#validation.buildProvenance"
+        },
+        {
+          "id": "package.installed-main-entry-digest",
+          "description": "安装后实际加载入口摘要与同一 VSIX main entry 摘要相等。",
+          "ownerStage": "G",
+          "contractRef": "targets.json#validation.buildProvenance"
+        },
+        {
+          "id": "package.surface-forbidden-files",
+          "description": "安装包不含测试、夹具、基准、密钥、源码或开发数据库。",
+          "ownerStage": "G"
+        },
+        {
+          "id": "package.configuration-manifest",
+          "description": "physical migration manifest 中所有配置 preserve/filter 验证通过。",
+          "ownerStage": "G",
+          "contractRef": "migration.json#physicalManifest"
+        },
+        {
+          "id": "package.empty-root",
+          "description": "空数据根无迁移直接建立 limcode.sqlite 与 CAS。",
+          "ownerStage": "G"
+        },
+        {
+          "id": "package.runtime-epoch",
+          "description": "runtimeKernelEpoch 按 RootBinding 协议落盘后才打开数据库。",
+          "ownerStage": "G",
+          "contractRef": "migration.json#rootBinding"
+        },
+        {
+          "id": "package.source-symbols-removed",
+          "description": "transition ledger 旧源码 selector 的最终符号 grep=0。",
+          "ownerStage": "G",
+          "contractRef": "transition-ledger.json"
+        },
+        {
+          "id": "package.dist-import-unreachable",
+          "description": "dist 导入图不可达旧入口。",
+          "ownerStage": "G",
+          "contractRef": "transition-ledger.json"
+        },
+        {
+          "id": "package.vsix-legacy-entry-absent",
+          "description": "VSIX 文件清单不含旧入口。",
+          "ownerStage": "G",
+          "contractRef": "transition-ledger.json"
+        },
+        {
+          "id": "package.bridge-payload-plain",
+          "description": "Bridge payload 只含 structured-clone plain data。",
+          "ownerStage": "G",
+          "contractRef": "client-feed.json#bridgePayload"
+        },
+        {
+          "id": "package.baselines-non-placeholder",
+          "description": "性能与打包基线字段均为非占位值。",
+          "ownerStage": "G",
+          "contractRef": "appendices/performance-and-packaging-gates.md"
+        },
+        {
+          "id": "package.smoke.open-extension",
+          "description": "打开最终安装的扩展并确认新 Runtime 正常启动。",
+          "ownerStage": "G",
+          "contractRef": "smoke.open-extension"
+        },
+        {
+          "id": "package.smoke.send-message",
+          "description": "发送一条普通用户消息并完成一个 Turn。",
+          "ownerStage": "G",
+          "contractRef": "smoke.send-message"
+        },
+        {
+          "id": "package.smoke.read-only-tool",
+          "description": "执行一个只读工具并验证唯一模型结果。",
+          "ownerStage": "G",
+          "contractRef": "smoke.read-only-tool"
+        },
+        {
+          "id": "package.smoke.file-proposal-approve-apply",
+          "description": "文件提案经批准后真实修改临时 Workspace 文件。",
+          "ownerStage": "G",
+          "contractRef": "smoke.file-proposal-approve-apply"
+        },
+        {
+          "id": "package.smoke.command-run-and-wait",
+          "description": "运行命令并等待真实退出。",
+          "ownerStage": "G",
+          "contractRef": "smoke.command-run-and-wait"
+        },
+        {
+          "id": "package.smoke.subagent-start-and-cancel",
+          "description": "启动子 Agent 并通过稳定 ChildExecution 取消。",
+          "ownerStage": "G",
+          "contractRef": "smoke.subagent-start-and-cancel"
+        },
+        {
+          "id": "package.smoke.turn-interrupt",
+          "description": "中断普通流式 Turn，而非仅取消子 Agent。",
+          "ownerStage": "G",
+          "contractRef": "smoke.turn-interrupt"
+        },
+        {
+          "id": "package.smoke.extension-host-restart",
+          "description": "在存在可恢复事实时重启 Extension Host。",
+          "ownerStage": "G",
+          "contractRef": "smoke.extension-host-restart"
+        },
+        {
+          "id": "package.smoke.recovery-verification",
+          "description": "核对六类 recovery scan 与异步结果恢复。",
+          "ownerStage": "G",
+          "contractRef": "smoke.recovery-verification"
+        }
+      ]
+    }
+  ],
+  "runner": {
+    "arguments": [
+      "--stage=foundation|candidate|installed",
+      "--artifact=<path> only for installed"
+    ],
+    "validatorArguments": [
+      "--stage=<gate-id>",
+      "--commit=<current-commit>",
+      "--artifact=<path> when required"
+    ],
+    "result": "exit-code-and-plain-diagnostics",
+    "rule": "正式出口要求干净工作区并直接运行已被Git跟踪的校验器；测试和基准只从被忽略的根目录/tests读取。"
+  },
+  "capabilityCutover": {
+    "gate": "installed",
+    "stage": "G",
+    "capabilities": [
+      "runtime",
+      "tool",
+      "file",
+      "process",
+      "context",
+      "provider",
+      "subagent",
+      "client"
+    ],
+    "fallback": false
+  },
+  "checkIdentity": "stable-id-not-description",
+  "handlerProtocol": "Map<checkId,handler>"
+}

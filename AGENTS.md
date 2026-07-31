@@ -7,7 +7,9 @@ commit 内容用中文填写，例如：feat: 添加xx功能
 
 ### 1.0 兼容原则
 
-当前项目仍然处于开发模式，因此不要对旧格式有任何兜底，也不需要保留旧功能代码的兼容和体验，也不需要写什么协议v1，v2等之类的内部版本号，全面使用新格式新功能更优秀的代码
+当前项目仍然处于开发模式，因此不要对旧格式有任何兜底，也不需要保留旧功能代码的兼容和体验，也不需要写什么协议v1，v2等之类的运行时内部版本号，全面使用新格式新功能更优秀的代码。
+
+允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。
 
 ### 1.1 独立领域对象必须独立建模
 
@@ -241,7 +243,9 @@ Storage capability 只负责读写当前投影数据
 
 ### 5.1 文件层也必须解耦
 
-如果 ECS 和协议层已经拆成独立对象，存储层不能再把它们塞回一个文件或一个强绑定目录。
+如果 ECS 和协议层已经拆成独立对象，存储层不能再把它们塞回一个大JSON记录或一个表达领域ownership的强绑定目录。
+
+可靠运行内核可以让多个Runtime领域表物理共用一个SQLite文件，但这只是共同事务介质，不表示领域ownership。强制要求：每个领域对象/Link具有独立table、schema owner、Repository、codec、mutation mapping、Client mapping、delete/reset/index policy；禁止generic family JSON表、任意SQL batch和跨领域聚合记录。Agent/Workflow/Policy/Settings等配置authority仍使用独立settings roots，不迁入Runtime SQLite。该例外必须由`docs/architecture/reliable-kernel/contracts/authority.json`逐项machine crosswalk约束。
 
 推荐结构：
 
@@ -330,9 +334,11 @@ function getPaths(): StoragePaths {
 
 ```text
 1. 业务数据文件必须写到 getPaths() 返回的对应 root/index 路径下，例如 agentsRootUri、conversationsRootUri、linksRootUri、settingsRootUri 等。
-2. 每次 load/save/ensure storage roots 前都应重新调用 getPaths()，不要长期缓存旧路径。
-3. 不要直接使用 VS Code extension context 的 globalStorageUri/globalStoragePath/globalState 拼接业务数据路径。
-4. globalStatus 只用于保存数据根目录配置、当前激活数据目录与迁移记录，不用于承载业务数据文件。
+2. 普通文件配置/业务store每次load/save/ensure storage roots前都应重新调用getPaths()，不要长期缓存旧路径。
+3. SQLite长连接只允许缓存由RootAuthority通过getPaths建立的immutable、fenced `RootBinding { paths, dataSetId, rootInstanceId, rootGeneration, pointerRevision, runtimeKernelEpoch }`；禁止缓存裸路径。每个request/transaction必须重验binding generation，root switch通过新binding reopen。
+4. CAS和配置operation每次从RootAuthority获取current binding/operation registration；不能由各模块自行读取Memento重新选root。
+5. 不要直接使用VS Code extension context的globalStorageUri/globalStoragePath/globalState拼接业务数据路径。
+6. globalStatus只用于保存数据根目录配置、当前激活数据目录与迁移控制元数据，不用于承载业务数据文件或proxy等业务设置；业务设置进入`GLOBAL_SETTINGS_SECTIONS`对应settings root。
 ```
 
 原因：
@@ -403,7 +409,7 @@ webview/src/components/ui/HoverTooltipPanel.vue
 
 ### 5.7 配置项数据对接标准
 
-新增任何设置项 / 配置页 / 可复用配置记录前，必须先阅读：
+新增任何设置项 / 配置页 / 可复用配置记录前，必须先阅读（该文为 settings 子系统长期规范，可靠内核切换后继续有效）：
 
 ```text
 docs/global-settings-data-integration.md
@@ -455,10 +461,10 @@ docs/global-settings-data-integration.md
 3. 切换关系是否能只改 link，而不用改主体对象？
 4. ClientState 是否把独立对象重新塞进另一个对象？
 5. Effect payload 是否携带了长期领域关系？
-6. 存储文件是否把多个独立对象混在一个文件或目录里？
+6. 是否把多个领域对象塞进同一大 JSON / 聚合记录，或在共用 SQLite 时遗漏独立 table、Repository、Link/FK 与 mutation mapping？
 7. 是否为了未发布的旧格式写了兼容/迁移代码？如果没有发布，应该删除。
-8. 数据文件路径是否通过 getPaths() 获取，而不是直接使用 extension globalStorage/globalState/globalStatus？
-9. 新增配置项前是否已阅读 docs/global-settings-data-integration.md，并区分配置管理 scope 与配置数据 scope？
+8. 数据文件路径是否通过 getPaths() 获取，或由 RootAuthority 建立并逐事务校验 fenced RootBinding，而不是直接使用 extension globalStorage/globalState/globalStatus？
+9. 新增配置项前是否已阅读 docs/global-settings-data-integration.md（settings 子系统长期规范），并区分配置管理 scope 与配置数据 scope？
 ```
 
 如果发现耦合，优先拆成：
@@ -469,7 +475,7 @@ docs/global-settings-data-integration.md
 Link / Relation 对象
 System 解释 Link
 Effect 执行外部能力
-Storage 分目录持久化
+Storage 按领域分目录，或在共用 SQLite 中按领域独立表与 Repository 持久化
 ```
 
 ## 8. 当前 Agent / Conversation 案例

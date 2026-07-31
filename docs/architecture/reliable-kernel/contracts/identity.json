@@ -1,0 +1,149 @@
+{
+  "contractKind": "identity",
+  "contractRevision": "2026-07-31-r4",
+  "status": "planned",
+  "scope": "只定义会影响去重、迟到隔离和重启恢复的身份，不为每一步增加额外代次。",
+  "turnIdentity": {
+    "field": "turnId",
+    "generatedOnce": true,
+    "soleExecutionIdentity": true,
+    "dedupeBy": "CommandReceipt(source_kind,source_key)",
+    "runIdAuthorityAllowed": false
+  },
+  "effectIdentity": {
+    "fields": [
+      "operationId",
+      "attemptId",
+      "effectIntentId",
+      "effectReceiptId"
+    ],
+    "constraints": [
+      "Attempt(operationId,attemptSeq) UNIQUE",
+      "EffectIntent(attemptId) UNIQUE",
+      "EffectReceipt(attemptId) UNIQUE"
+    ],
+    "rule": "一次人工或系统明确发起的重试创建新Attempt；旧回执只能结束旧Attempt。"
+  },
+  "deliveryIdentity": {
+    "inboxDedupe": "RuntimeInboxItem.dedupeKey UNIQUE",
+    "answerDedupeKey": "answer:{answerBridgeId}:{submissionId}",
+    "deliveryAttempt": "attempt_seq 从 1 开始；人工 redeliver 创建 attempt_seq+1 并写 retry_of_delivery_id",
+    "deliveryDedupeWhenTargetNull": "RuntimeDelivery(inbox_item_id,target_conversation_id,phase,attempt_seq) UNIQUE WHERE target_turn_id IS NULL",
+    "deliveryDedupeWhenTargetPresent": "RuntimeDelivery(inbox_item_id,target_conversation_id,target_turn_id,phase,attempt_seq) UNIQUE WHERE target_turn_id IS NOT NULL",
+    "targetTurnIdNullable": "phase=next_turn的RuntimeDelivery.target_turn_id允许为空，由新Turn在启动事务内回写。",
+    "inputLink": "RuntimeDeliveryInputLink(delivery_id UNIQUE,pending_turn_input_id UNIQUE)；执行器吸收对应输入时写 handled_at",
+    "rule": "重复回调只能命中同一 inbox 与同一 delivery attempt；同一 attempt 不能重复注入，失败重投必须显式创建下一 attempt。"
+  },
+  "providerStreamIdentity": {
+    "fields": [
+      "modelRequestId",
+      "attemptSeq",
+      "socketGeneration",
+      "streamSeq"
+    ],
+    "checkpointUnique": "modelRequestId + attemptSeq + socketGeneration + streamSeq",
+    "terminalFenceUnique": "modelRequestId",
+    "rule": "旧连接、旧尝试和终态后的迟到事件全部忽略。"
+  },
+  "recoveryJudgment": {
+    "values": [
+      "resume",
+      "finalize",
+      "needs_human"
+    ],
+    "inputs": [
+      "Turn.status",
+      "ExecutionLease存在性",
+      "PendingTurnInput存在性",
+      "TurnTermination存在性"
+    ],
+    "statusCategories": {
+      "active": "非终态：崩溃时执行可能尚未完成",
+      "terminated": "终态：Turn生命周期已结束"
+    },
+    "semantics": {
+      "resume": "恢复执行所有权并继续：重建执行或消费PendingTurnInput，迟到回执照常reconcile；不自动重试工具（见tool.json retryPolicy）。",
+      "finalize": "不再继续，按既有事实收口；对已是终态的Turn为幂等确认，对无租约无输入无终止事实的孤儿Turn在同一事务补写终态事实。",
+      "needs_human": "持久化状态自相矛盾，不自动判定，需人工确认。"
+    },
+    "precedence": "按derivation列出顺序取首个匹配，覆盖全部组合。",
+    "derivation": [
+      {
+        "turnStatus": "terminated",
+        "executionLease": "absent",
+        "pendingTurnInput": "any",
+        "turnTermination": "any",
+        "judgment": "finalize"
+      },
+      {
+        "turnStatus": "terminated",
+        "executionLease": "exists",
+        "pendingTurnInput": "any",
+        "turnTermination": "any",
+        "judgment": "needs_human"
+      },
+      {
+        "turnStatus": "active",
+        "executionLease": "any",
+        "pendingTurnInput": "any",
+        "turnTermination": "exists",
+        "judgment": "needs_human"
+      },
+      {
+        "turnStatus": "active",
+        "executionLease": "exists",
+        "pendingTurnInput": "any",
+        "turnTermination": "absent",
+        "judgment": "resume"
+      },
+      {
+        "turnStatus": "active",
+        "executionLease": "absent",
+        "pendingTurnInput": "exists",
+        "turnTermination": "absent",
+        "judgment": "resume"
+      },
+      {
+        "turnStatus": "active",
+        "executionLease": "absent",
+        "pendingTurnInput": "absent",
+        "turnTermination": "absent",
+        "judgment": "finalize"
+      }
+    ],
+    "rule": "Extension Host重启后对每个Turn按本矩阵判定恢复去向；本矩阵是Turn恢复判定的唯一权威，其他合同不另立矩阵。",
+    "candidateChecks": "全组合推导表登记candidate checks逐条验证。"
+  },
+  "recoveryScan": {
+    "runsOn": "extension-host-restart",
+    "authority": "tool.json#recoveryScan",
+    "scanIds": [
+      "recovery.effect-intent-hanging",
+      "recovery.file-change-unresolved",
+      "recovery.answer-inbox-invariant",
+      "recovery.delivery-pending",
+      "recovery.foreground-answer-wait-expired",
+      "recovery.cancelled-subtree-incomplete"
+    ],
+    "rule": "身份合同只登记稳定 scan ID；owner、target 和 action 以 tool.json 为唯一权威。",
+    "candidateChecks": "六个 scan ID 分别映射到原子 candidate check。"
+  },
+  "rootBinding": {
+    "fields": [
+      "paths",
+      "dataSetId",
+      "rootInstanceId",
+      "rootGeneration",
+      "pointerRevision",
+      "runtimeKernelEpoch"
+    ],
+    "cache": "immutable-complete-binding-only",
+    "validation": "每个请求或事务开始时核对当前代次",
+    "staleRule": "拒绝继续并要求重启，不在线换根，也不切回旧存储"
+  },
+  "sequencePolicy": {
+    "storage": "sqlite-integer",
+    "wire": "decimal-integer-string",
+    "javascript": "string-or-bigint-never-number"
+  }
+}
