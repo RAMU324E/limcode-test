@@ -236,10 +236,11 @@ CompressionBlock 正文、来源和摘要 immutable。enable/disable/soft delete
 ProviderContinuation 首发为 `disabled-full-request`：
 
 - Runtime domain exact set 中没有 ProviderContinuation；
-- 每次请求都由 ContextSequenceRoot + frozen recipe 完整物化；
+- 每次请求都由 ContextSequenceRoot + frozen recipe 完整物化；Message role 来自 source 指向的 immutable MessageRevision，正文必须可精确解码为 UTF-8；
 - 不读写 suffix；
 - retry/compression/reconnect 均走完整请求；
-- ModelStreamCheckpoint 与 ModelStreamFence 仍负责 stream identity、迟到隔离与 terminal fence。
+- ModelStreamCheckpoint 与 ModelStreamFence 仍负责 stream identity、迟到隔离与 terminal fence；相同 stream identity 的 kind/content 不同必须冲突；
+- request-level cancel-current 在 writer 中终止当时最新 attempt/socket；adapter 迟到结果按 durable first-wins 分类，不能覆盖 Completed 或新 generation。
 
 未来 enabled contract 可规定同物理 connection、strict prefix、Completed fence 与 socketGeneration，但首发实现和 gate 不得假装已启用。
 

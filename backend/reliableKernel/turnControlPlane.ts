@@ -3,6 +3,8 @@ import {
   ContentAddressedStore,
   type PreparedContentObject
 } from './contentAddressedStore';
+import { ContextSequenceControlPlane } from './contextSequence';
+import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   DOMAIN_REPOSITORIES,
   savepoint,
@@ -200,6 +202,7 @@ export class TurnControlPlane {
   private readonly now: () => string;
   private readonly authorityCompiler: TurnAuthorityCompiler;
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
+  private readonly contextSequence: ContextSequenceControlPlane;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -212,6 +215,7 @@ export class TurnControlPlane {
     this.authorityCompiler = options.authorityCompiler;
     this.unresolvedFileClosure = options.unresolvedFileClosure;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
   }
 
   public input(command: TurnInputCommand): Promise<TurnCommandResult> {
@@ -302,6 +306,7 @@ export class TurnControlPlane {
         DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
         ...unresolvedFileSteps,
         DOMAIN_REPOSITORIES.domain('ToolCall').assertAll({ turn_id: turnId }, { status: 'terminal' }),
+        DOMAIN_REPOSITORIES.domain('ModelRequest').assertAll({ turn_id: turnId }, { status: 'terminal' }),
         DOMAIN_REPOSITORIES.domain('TurnTermination').insert({
           id: terminationId,
           turn_id: turnId,
@@ -449,6 +454,14 @@ export class TurnControlPlane {
       compiled.authoritySnapshot.contentType
     );
 
+    const messageContext = messageContent
+      ? await this.contextSequence.prepareMessageAppendMutation({
+          conversationId: conversation.id as string,
+          messageRevisionId: requireId(ids.messageRevision, 'message revision id'),
+          contentObjectId: messageContent.metadata.id
+        })
+      : null;
+
     const admission: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Turn').insert({
         id: ids.turn,
@@ -467,7 +480,7 @@ export class TurnControlPlane {
         acquired_at: now,
         expires_at: command.leaseExpiresAt
       }),
-      ...preparedContentSteps([authorityContent], 'authority'),
+      ...preparedContentObjectSteps([authorityContent], 'authority'),
       DOMAIN_REPOSITORIES.domain('TurnIntent').update(ids.intent, {
         turn_id: ids.turn,
         state: TURN_INTENT_STATE_ADMITTED,
@@ -486,7 +499,10 @@ export class TurnControlPlane {
         created_at: now
       })
     ];
-    if (messageContent) admission.push(...messageAdmissionSteps(ids, messageContent, conversation.id as string, now));
+    if (messageContent) {
+      admission.push(...messageAdmissionSteps(ids, messageContent, conversation.id as string, now));
+      admission.push(...messageContext!.steps);
+    }
 
     const commit = await this.commitWithReceipt({
       source,
@@ -494,7 +510,7 @@ export class TurnControlPlane {
       conversationId: conversation.id as string,
       turnId: null,
       steps: [
-        ...preparedContentSteps([
+        ...preparedContentObjectSteps([
           intentContent,
           presetContent,
           ...(messageContent ? [messageContent] : [])
@@ -549,6 +565,13 @@ export class TurnControlPlane {
       commandInput.content,
       requireContentType(commandInput.contentType ?? 'text/plain')
     );
+    const contextPlan = await this.contextSequence.prepareMessageEditMutation({
+      conversationId,
+      previousMessageRevisionId: requireId(relation.currentRevision.id, 'current MessageRevision.id'),
+      nextMessageRevisionId: revisionId,
+      contentObjectId: content.metadata.id,
+      contentByteLength: content.metadata.byte_length
+    });
     const commit = await this.commitWithReceipt({
       source,
       receiptId,
@@ -556,7 +579,7 @@ export class TurnControlPlane {
       turnId: null,
       steps: [
         DOMAIN_REPOSITORIES.domain('Message').assert(messageId, { deleted_at: null }),
-        ...preparedContentSteps([content], 'edit_content'),
+        ...preparedContentObjectSteps([content], 'edit_content'),
         DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
           id: revisionId,
           message_id: messageId,
@@ -567,6 +590,7 @@ export class TurnControlPlane {
           column: 'revision_seq',
           scope: { message_id: messageId }
         }),
+        ...contextPlan.steps,
         DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(relation.currentLink.id as string, {
           revision_id: revisionId,
           updated_at: now
@@ -606,6 +630,11 @@ export class TurnControlPlane {
         ? basicDuplicateResult(committed.receipt, receiptId, 'delete', { conversationId, messageId })
         : basicCommittedResult(committed, { conversationId, messageId });
     }
+    const contextPlan = await this.contextSequence.prepareMessageDeleteMutation({
+      conversationId,
+      messageRevisionId: requireId(relation.currentRevision.id, 'current MessageRevision.id'),
+      idempotencyKey: source.key
+    });
     try {
       const committed = await this.commitWithReceipt({
         source,
@@ -614,6 +643,7 @@ export class TurnControlPlane {
         turnId: null,
         steps: [
           DOMAIN_REPOSITORIES.domain('Message').assert(messageId, { deleted_at: null }),
+          ...contextPlan.steps,
           DOMAIN_REPOSITORIES.domain('Message').update(messageId, { deleted_at: now, updated_at: now }),
           DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
         ]
@@ -670,7 +700,7 @@ export class TurnControlPlane {
         turnId,
         steps: [
           DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
-          ...preparedContentSteps([content], 'interrupt_content'),
+          ...preparedContentObjectSteps([content], 'interrupt_content'),
           DOMAIN_REPOSITORIES.domain('PendingTurnInput').insertWithNextPosition({
             id: pendingTurnInputId,
             turn_id: turnId,
@@ -760,6 +790,7 @@ export class TurnControlPlane {
           // A terminal Turn may not strand a pending or in-flight ToolCall. This assertion runs
           // after the pending-file closure steps in the same writer transaction.
           DOMAIN_REPOSITORIES.domain('ToolCall').assertAll({ turn_id: turnId }, { status: 'terminal' }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').assertAll({ turn_id: turnId }, { status: 'terminal' }),
           DOMAIN_REPOSITORIES.domain('ExecutionLease').deleteByUnique({ conversation_id: conversationId, turn_id: turnId }),
           DOMAIN_REPOSITORIES.domain('TurnTermination').insert({
             id: terminationId,
@@ -1087,13 +1118,15 @@ function messageAdmissionSteps(
   const revision = requireId(ids.messageRevision, 'message revision id');
   return [
     DOMAIN_REPOSITORIES.domain('Message').insert({ id: message, created_at: now, updated_at: now, deleted_at: null }),
-    DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
+    DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
       id: revision,
       message_id: message,
-      revision_seq: '1',
       role: 'user',
       content_object_id: messageContent.metadata.id,
       created_at: now
+    }, {
+      column: 'revision_seq',
+      scope: { message_id: message }
     }),
     DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
       id: requireId(ids.currentRevisionLink, 'current revision link id'),
@@ -1118,33 +1151,6 @@ function messageAdmissionSteps(
       created_at: now
     })
   ];
-}
-
-function preparedContentSteps(
-  prepared: readonly PreparedContentObject[],
-  savepointPrefix: string
-): RepositoryTransactionStep[] {
-  const unique = new Map(prepared.map((content) => [content.metadata.id, content]));
-  const steps: RepositoryTransactionStep[] = [];
-  let index = 0;
-  for (const content of unique.values()) {
-    if (content.insert) {
-      steps.push(savepoint(`${savepointPrefix}_${index++}`, [content.insert], {
-        kind: 'rollback-and-continue-on-unique',
-        constraints: [
-          { domain: 'ContentObject', columns: ['id'] },
-          { domain: 'ContentObject', columns: ['content_type', 'sha256', 'byte_length'] }
-        ]
-      }));
-    }
-    steps.push(DOMAIN_REPOSITORIES.domain('ContentObject').assert(content.metadata.id, {
-      content_type: content.metadata.content_type,
-      sha256: content.metadata.sha256,
-      byte_length: content.metadata.byte_length,
-      storage_key: content.metadata.storage_key
-    }));
-  }
-  return steps;
 }
 
 function normalizeExecutionCommand(

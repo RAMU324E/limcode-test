@@ -25,10 +25,19 @@ function option(name) {
   return index >= 0 ? process.argv[index + 1] : null;
 }
 
+const phaseEChecks = new Set([
+  'candidate.context-storage-growth',
+  'candidate.context-compression-node-bound',
+  'candidate.provider-continuation-disabled-full-request',
+  'candidate.compression-immutable-replacement'
+]);
+
 function runCandidateCheck(checkId) {
   const runner = checkId === 'candidate.turn-sole-execution-identity'
     ? 'run-candidate-check.mjs'
-    : 'run-phase-d-check.mjs';
+    : phaseEChecks.has(checkId)
+      ? 'run-phase-e-check.mjs'
+      : 'run-phase-d-check.mjs';
   const args = [
     path.join(root, 'scripts/reliable-kernel', runner),
     `--check=${checkId}`,
@@ -53,6 +62,10 @@ const implemented = new Map([
   ['candidate.tool-model-result-exactly-once', () => runCandidateCheck('candidate.tool-model-result-exactly-once')],
   ['candidate.file-proposal-result-separated', () => runCandidateCheck('candidate.file-proposal-result-separated')],
   ['candidate.effect-receipt-reconcile', () => runCandidateCheck('candidate.effect-receipt-reconcile')],
+  ['candidate.context-storage-growth', () => runCandidateCheck('candidate.context-storage-growth')],
+  ['candidate.context-compression-node-bound', () => runCandidateCheck('candidate.context-compression-node-bound')],
+  ['candidate.provider-continuation-disabled-full-request', () => runCandidateCheck('candidate.provider-continuation-disabled-full-request')],
+  ['candidate.compression-immutable-replacement', () => runCandidateCheck('candidate.compression-immutable-replacement')],
   ['candidate.attachment-cas-ingest', () => runCandidateCheck('candidate.attachment-cas-ingest')],
   ['candidate.mcp-effect-recovery', () => runCandidateCheck('candidate.mcp-effect-recovery')],
   ['candidate.process-wrapper-recovery', () => runCandidateCheck('candidate.process-wrapper-recovery')],

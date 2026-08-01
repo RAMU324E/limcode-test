@@ -8,9 +8,15 @@ import {
   type SnapshotBarrier
 } from './contracts';
 import type {
+  ContextContentMaterializationSnapshot,
+  ContextMaterializationSnapshot,
   DatabaseWorkerData,
   DatabaseWorkerDiagnostics,
   DatabaseWorkerRequest,
+  ModelStreamEventCommitInput,
+  ModelStreamEventCommitResult,
+  ModelRequestCancelInput,
+  ModelRequestCancelResult,
   DatabaseWorkerRequestPayload,
   DatabaseWorkerResponse,
   SerializedWorkerError
@@ -131,6 +137,34 @@ export class RuntimeDatabase {
   public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
     this.commitListeners.add(listener);
     return () => this.commitListeners.delete(listener);
+  }
+
+  /** Fixed domain read; no caller-supplied SQL or closure-table state. */
+  public async materializeContext(rootId: string): Promise<SnapshotBarrier<ContextMaterializationSnapshot>> {
+    if (typeof rootId !== 'string' || rootId.length === 0) throw new TypeError('Context rootId must be non-empty.');
+    return this.request<SnapshotBarrier<ContextMaterializationSnapshot>>({ kind: 'contextMaterialization', rootId });
+  }
+
+  /** Fixed Context + CAS read executed off the Extension Host event loop. */
+  public async materializeContextContent(
+    rootId: string
+  ): Promise<SnapshotBarrier<ContextContentMaterializationSnapshot>> {
+    if (typeof rootId !== 'string' || rootId.length === 0) throw new TypeError('Context rootId must be non-empty.');
+    return this.request<SnapshotBarrier<ContextContentMaterializationSnapshot>>({
+      kind: 'contextContentMaterialization', rootId
+    });
+  }
+
+  public async commitModelStreamEvent(
+    input: ModelStreamEventCommitInput
+  ): Promise<ModelStreamEventCommitResult> {
+    return this.request<ModelStreamEventCommitResult>({ kind: 'modelStreamEvent', input });
+  }
+
+  public async cancelCurrentModelRequest(
+    input: ModelRequestCancelInput
+  ): Promise<ModelRequestCancelResult> {
+    return this.request<ModelRequestCancelResult>({ kind: 'cancelCurrentModelRequest', input });
   }
 
   public async inspect(): Promise<DatabaseWorkerDiagnostics> {

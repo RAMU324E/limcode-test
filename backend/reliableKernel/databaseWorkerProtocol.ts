@@ -1,6 +1,74 @@
 import type { RootBinding, RuntimeCommitResult, SnapshotBarrier } from './contracts';
-import type { DomainRow, RepositoryListRead, RepositoryRead, RepositoryTransactionStep } from './repositories';
+import type {
+  DomainRow,
+  RepositoryInsertMutation,
+  RepositoryListRead,
+  RepositoryRead,
+  RepositoryTransactionStep
+} from './repositories';
 import type { DatabaseFoundationInspection } from './databaseSchema';
+
+export const MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT = 33;
+export const MODEL_STREAM_TERMINAL_TAIL = 32;
+
+export interface ContextMaterializationRecord {
+  node: DomainRow;
+  segment: DomainRow;
+  contentObject: DomainRow;
+  /** Immutable MessageRevision role resolved through ContextSegmentSource; NULL for non-message segments. */
+  messageRole: string | null;
+}
+
+export interface ContextMaterializationSnapshot {
+  root: DomainRow;
+  records: ContextMaterializationRecord[];
+}
+
+export interface ContextContentMaterializationRecord extends ContextMaterializationRecord {
+  content: Uint8Array;
+}
+
+export interface ContextContentMaterializationSnapshot {
+  root: DomainRow;
+  records: ContextContentMaterializationRecord[];
+}
+
+export interface ModelStreamEventCommitInput {
+  modelRequestId: string;
+  checkpointId: string;
+  attemptSeq: bigint;
+  socketGeneration: bigint;
+  streamSeq: bigint;
+  checkpointKind: 'output_delta' | 'output_item_done' | 'terminal_summary';
+  terminalFenceId: string | null;
+  contentObject: DomainRow;
+  contentInsert?: RepositoryInsertMutation;
+  usage: unknown | null;
+  terminalStats: DomainRow | null;
+  now: string;
+}
+
+export interface ModelStreamEventCommitResult {
+  accepted: boolean;
+  checkpointed: boolean;
+  terminal: boolean;
+  ignoredReason?: 'old-attempt' | 'old-socket-generation' | 'terminal' | 'checkpoint-capacity' | 'duplicate';
+  commit?: RuntimeCommitResult;
+}
+
+export interface ModelRequestCancelInput {
+  modelRequestId: string;
+  terminalState: string;
+  now: string;
+}
+
+export interface ModelRequestCancelResult {
+  cancelled: boolean;
+  terminalState: string | null;
+  attemptSeq: string;
+  socketGeneration: string;
+  commit?: RuntimeCommitResult;
+}
 
 export interface DatabaseWorkerData {
   mode: 'initialize' | 'runtime';
@@ -12,6 +80,10 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'transaction'; steps: RepositoryTransactionStep[] }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'snapshotAll'; read: RepositoryListRead }
+  | { kind: 'contextMaterialization'; rootId: string }
+  | { kind: 'contextContentMaterialization'; rootId: string }
+  | { kind: 'modelStreamEvent'; input: ModelStreamEventCommitInput }
+  | { kind: 'cancelCurrentModelRequest'; input: ModelRequestCancelInput }
   | { kind: 'inspect' }
   | { kind: 'close' };
 
@@ -30,7 +102,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | DatabaseWorkerDiagnostics | null }
+  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelRequestCancelResult | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | null }
   | { type: 'response'; id: number; ok: false; error: SerializedWorkerError }
   | { type: 'commit'; result: RuntimeCommitResult }
   | { type: 'fatal'; error: SerializedWorkerError };

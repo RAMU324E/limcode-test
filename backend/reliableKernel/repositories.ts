@@ -16,6 +16,8 @@ export interface RepositoryInsertMutation {
     column: string;
     scope: DomainRow;
   };
+  /** Fixed writer dataflow: copy this MessageRevision's allocated revision_seq into ContextSegmentSource.source_revision. */
+  messageRevisionSequenceReferenceId?: string;
 }
 
 export interface RepositoryUpdateMutation {
@@ -29,6 +31,15 @@ export interface RepositoryDeleteMutation {
   kind: 'delete';
   domain: string;
   id: string;
+}
+
+export interface RepositoryCheckpointPruneMutation {
+  kind: 'pruneModelStreamCheckpoints';
+  domain: 'ModelStreamCheckpoint';
+  modelRequestId: string;
+  attemptSeq: bigint;
+  socketGeneration: bigint;
+  terminalCheckpointId: string;
 }
 
 export interface RepositoryDeleteWhereMutation {
@@ -79,7 +90,8 @@ export type RepositoryMutation =
   | RepositoryInsertMutation
   | RepositoryUpdateMutation
   | RepositoryDeleteMutation
-  | RepositoryDeleteWhereMutation;
+  | RepositoryDeleteWhereMutation
+  | RepositoryCheckpointPruneMutation;
 export type RepositoryTransactionStep =
   | RepositoryMutation
   | RepositoryAssertStep
@@ -215,6 +227,31 @@ export class DomainRepository {
     return this.insertWithNextAllocatedInteger(row, allocation);
   }
 
+  /** Fixed MessageRevision -> Context source relation resolved inside the same writer transaction. */
+  public insertMessageContextSourceForRevision(
+    row: DomainRow,
+    messageRevisionId: string
+  ): RepositoryInsertMutation {
+    this.requireMutation('insert');
+    if (this.schema.key !== 'ContextSegmentSource') {
+      throw new TypeError(`${this.name} is not the ContextSegmentSource Repository.`);
+    }
+    if ('source_revision' in row) {
+      throw new TypeError(`${this.name}.source_revision cannot be supplied for a writer-allocated Message revision.`);
+    }
+    requireId(messageRevisionId);
+    if (row.source_kind !== 'message_revision' || row.source_id !== messageRevisionId) {
+      throw new TypeError('Message Context source must identify the referenced MessageRevision.');
+    }
+    this.codec.encodeInsert({ ...row, source_revision: 1n });
+    return {
+      kind: 'insert',
+      domain: 'ContextSegmentSource',
+      row: clonePlainRecord(row),
+      messageRevisionSequenceReferenceId: messageRevisionId
+    };
+  }
+
   public insertWithNextPosition(row: DomainRow): RepositoryInsertMutation {
     if (this.schema.key !== 'PendingTurnInput') {
       throw new TypeError(`${this.name} does not support writer-allocated position.`);
@@ -232,6 +269,7 @@ export class DomainRepository {
   public update(id: string, patch: DomainRow): RepositoryUpdateMutation {
     this.requireMutation('update');
     requireId(id);
+    assertRuntimeDomainUpdatePatch(this.schema.key, patch);
     this.codec.encodePatch(patch);
     return { kind: 'update', domain: this.schema.key, id, patch: clonePlainRecord(patch) };
   }
@@ -239,11 +277,43 @@ export class DomainRepository {
   public delete(id: string): RepositoryDeleteMutation {
     this.requireMutation('delete');
     requireId(id);
+    if (this.schema.key === 'ModelStreamCheckpoint') {
+      throw new Error('ModelStreamCheckpoint delete is limited to the fixed writer pruneAfterTerminalFence operation.');
+    }
     return { kind: 'delete', domain: this.schema.key, id };
+  }
+
+  public pruneAfterTerminalFence(
+    modelRequestId: string,
+    attemptSeq: bigint,
+    socketGeneration: bigint,
+    terminalCheckpointId: string
+  ): RepositoryCheckpointPruneMutation {
+    this.requireMutation('delete');
+    if (this.schema.key !== 'ModelStreamCheckpoint') {
+      throw new Error(`${this.name} does not support ModelStream checkpoint pruning.`);
+    }
+    requireId(modelRequestId);
+    requireId(terminalCheckpointId);
+    if (typeof attemptSeq !== 'bigint' || attemptSeq <= 0n) throw new TypeError('attemptSeq must be positive.');
+    if (typeof socketGeneration !== 'bigint' || socketGeneration <= 0n) {
+      throw new TypeError('socketGeneration must be positive.');
+    }
+    return {
+      kind: 'pruneModelStreamCheckpoints',
+      domain: 'ModelStreamCheckpoint',
+      modelRequestId,
+      attemptSeq,
+      socketGeneration,
+      terminalCheckpointId
+    };
   }
 
   public deleteByUnique(where: DomainRow): RepositoryDeleteWhereMutation {
     this.requireMutation('delete');
+    if (this.schema.key === 'ModelStreamCheckpoint') {
+      throw new Error('ModelStreamCheckpoint delete is limited to the fixed writer pruneAfterTerminalFence operation.');
+    }
     if (!coversUniqueIdentity(this.schema, where)) {
       throw new TypeError(`${this.name}.deleteByUnique requires a declared UNIQUE identity.`);
     }
@@ -433,6 +503,24 @@ function coversUniqueIdentity(schema: RuntimeDomainSchema, where: DomainRow): bo
   });
 }
 
+function declaresUniqueConstraint(schema: RuntimeDomainSchema, columnsInput: readonly string[]): boolean {
+  const columns = [...columnsInput].sort();
+  if (columns.length === 1 && columns[0] === 'id') return true;
+  return schema.indexes.some((index) => {
+    const partialMarker = ' UNIQUE WHERE ';
+    const definition = index.includes(partialMarker)
+      ? index.slice(0, index.indexOf(partialMarker))
+      : index.endsWith(' UNIQUE')
+        ? index.slice(0, -' UNIQUE'.length)
+        : null;
+    if (definition === null) return false;
+    const declared = definition.split(',').map((column) => column.trim()).sort();
+    return declared.length === columns.length
+      && declared.every((column, position) => column === columns[position]);
+  });
+}
+
+
 function rejectUnknownKeys(
   record: DomainRow,
   columns: ReadonlyMap<string, ColumnDefinition>,
@@ -468,6 +556,7 @@ function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
     expected: clonePlainRecord(step.expected)
   };
   if (step.kind === 'deleteWhere') return { ...step, where: clonePlainRecord(step.where) };
+  if (step.kind === 'pruneModelStreamCheckpoints') return { ...step };
   if (step.kind === 'insert') return {
     ...step,
     row: clonePlainRecord(step.row),
@@ -476,10 +565,34 @@ function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
         column: step.allocateSequence.column,
         scope: clonePlainRecord(step.allocateSequence.scope)
       }
-    } : {})
+    } : {}),
+    ...(step.messageRevisionSequenceReferenceId
+      ? { messageRevisionSequenceReferenceId: step.messageRevisionSequenceReferenceId }
+      : {})
   };
   if (step.kind === 'update') return { ...step, patch: clonePlainRecord(step.patch) };
   return { ...step };
+}
+
+const RESTRICTED_UPDATE_COLUMNS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['ModelRequest', new Set(['status', 'terminal_state', 'usage_json', 'stream_stats_json', 'updated_at'])],
+  ['CompressionBlock', new Set(['status', 'updated_at'])],
+  ['Operation', new Set(['status', 'updated_at'])],
+  ['Attempt', new Set(['status', 'updated_at', 'completed_at'])]
+]);
+
+export function assertRuntimeDomainUpdatePatch(domain: string, patch: DomainRow): void {
+  const allowed = RESTRICTED_UPDATE_COLUMNS.get(domain);
+  if (!allowed) return;
+  for (const column of Object.keys(patch)) {
+    if (!allowed.has(column)) throw new Error(`${domain}.${column} is immutable after insert.`);
+  }
+  if (domain === 'CompressionBlock' && 'status' in patch) {
+    const status = patch.status;
+    if (!['enabled', 'disabled', 'soft_deleted'].includes(String(status))) {
+      throw new TypeError('CompressionBlock.status must be enabled, disabled, or soft_deleted.');
+    }
+  }
 }
 
 function cloneSavepointOnError(onError: RepositorySavepointOnError): RepositorySavepointOnError {
@@ -495,8 +608,7 @@ function cloneSavepointOnError(onError: RepositorySavepointOnError): RepositoryS
           throw new TypeError(`${repository.name} expected UNIQUE constraint references unknown column ${column}.`);
         }
       }
-      const identityShape = Object.fromEntries(constraint.columns.map((column) => [column, true]));
-      if (!coversUniqueIdentity(repository.schema, identityShape)) {
+      if (!declaresUniqueConstraint(repository.schema, constraint.columns)) {
         throw new TypeError(`${repository.name} expected constraint is not a declared UNIQUE identity.`);
       }
       return { domain: constraint.domain, columns: [...constraint.columns] };

@@ -81,7 +81,7 @@
   },
   "scripts": {
     "clean:extension": "node -e \"require('fs').rmSync('dist/extension',{recursive:true,force:true})\"",
-    "compile": "npm run clean:extension && tsc -p tsconfig.json",
+    "compile": "npm run clean:extension && tsc -p tsconfig.json && node scripts/reliable-kernel/write-compile-provenance.mjs",
     "watch": "tsc -watch -p tsconfig.json",
     "build:webview": "vite build",
     "dev:webview": "vite --host 127.0.0.1 --port 31820 --strictPort",
@@ -97,6 +97,7 @@
     "test:foundation": "npm run compile && node --test tests/reliable-kernel/phase-b-foundation.test.mjs",
     "test:phase-c": "npm run compile && node --test tests/reliable-kernel/phase-c-turn-control-plane.test.mjs",
     "test:phase-d": "npm run compile && node --test tests/reliable-kernel/phase-d-effects-tools-files-processes.test.mjs",
+    "test:phase-e": "npm run compile && node --test tests/reliable-kernel/phase-e-context-provider.test.mjs",
     "check:phase-d": "npm run compile && node --test tests/reliable-kernel/phase-c-turn-control-plane.test.mjs tests/reliable-kernel/phase-d-effects-tools-files-processes.test.mjs",
     "check:candidate": "npm run compile && node scripts/reliable-kernel/validators/candidate.mjs",
     "smoke:sqlite:host": "node scripts/reliable-kernel/sqlite-extension-host-smoke.mjs",

@@ -280,7 +280,18 @@ async function checkCasPublishBeforeReference() {
   return withRuntime('cas', async ({ authority, binding, database }) => {
     const store = new kernel.ContentAddressedStore(authority, binding);
     const contentObjects = kernel.DOMAIN_REPOSITORIES.domain('ContentObject');
-    const orphan = await store.publish('published-before-reference', 'text/plain');
+    const durability = await traceFsDurability(async (events) => {
+      const firstStart = events.length;
+      const orphan = await store.publish('published-before-reference', 'text/plain');
+      const first = events.slice(firstStart);
+      const secondStart = events.length;
+      const duplicate = await store.publish('published-before-reference', 'text/plain');
+      return { orphan, duplicate, first, second: events.slice(secondStart) };
+    });
+    const orphan = durability.orphan;
+    assert.equal(durability.duplicate.absolutePath, orphan.absolutePath);
+    assertDurablePublishTrace(durability.first, binding, orphan.absolutePath, 'linked');
+    assertDurablePublishTrace(durability.second, binding, orphan.absolutePath, 'EEXIST');
     const beforeReference = await database.snapshot([contentObjects.list({
       where: { content_type: orphan.contentType, sha256: orphan.sha256, byte_length: orphan.byteLength },
       limit: 10
@@ -307,7 +318,7 @@ async function checkCasPublishBeforeReference() {
     await assert.rejects(store.publish('cannot-publish', 'text/plain'));
     const afterFailure = await database.snapshot([contentObjects.list({ limit: 100 })]);
     assert.equal(afterFailure.snapshot[0].length, 1);
-    return 'CAS对象先原子发布再提交ContentObject；orphan允许，缺失/发布失败均无SQLite引用';
+    return 'CAS对象先原子发布并fsync新建目录/对象目录项，EEXIST观察者也重验并fsync；随后才提交ContentObject；orphan允许，缺失/发布失败均无SQLite引用';
   });
 }
 
@@ -450,6 +461,73 @@ async function checkEmptyRootCurrentEpoch() {
     if (database) await database.close().catch(() => undefined);
     await fs.rm(parent, { recursive: true, force: true });
   }
+}
+
+async function traceFsDurability(body) {
+  const promises = require('node:fs/promises');
+  const originalOpen = promises.open;
+  const originalLink = promises.link;
+  const events = [];
+  promises.open = async (filePath, ...args) => {
+    const handle = await originalOpen(filePath, ...args);
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === 'sync') {
+          return async (...syncArgs) => {
+            events.push({ kind: 'sync', path: path.resolve(String(filePath)) });
+            return target.sync(...syncArgs);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+  };
+  promises.link = async (sourcePath, targetPath) => {
+    const event = {
+      kind: 'link',
+      sourcePath: path.resolve(String(sourcePath)),
+      targetPath: path.resolve(String(targetPath)),
+      outcome: 'pending'
+    };
+    events.push(event);
+    try {
+      const result = await originalLink(sourcePath, targetPath);
+      event.outcome = 'linked';
+      return result;
+    } catch (error) {
+      event.outcome = error?.code ?? 'error';
+      throw error;
+    }
+  };
+  try {
+    return await body(events);
+  } finally {
+    promises.open = originalOpen;
+    promises.link = originalLink;
+  }
+}
+
+function assertDurablePublishTrace(events, binding, objectPath, expectedLinkOutcome) {
+  const target = path.resolve(objectPath);
+  const linkIndex = events.findIndex((event) => event.kind === 'link' && event.targetPath === target);
+  assert.ok(linkIndex >= 0, `CAS trace missed link for ${target}`);
+  assert.equal(events[linkIndex].outcome, expectedLinkOutcome);
+  const beforeLink = events.slice(0, linkIndex);
+  const afterLink = events.slice(linkIndex + 1);
+  const casRoot = path.resolve(binding.paths.casRootPath);
+  const temporaryRoot = path.join(casRoot, 'tmp');
+  const digestRoot = path.join(casRoot, 'sha256');
+  const digestPrefix = path.dirname(target);
+  const syncCount = (part, directory) => part.filter((event) =>
+    event.kind === 'sync' && event.path === directory
+  ).length;
+  assert.ok(syncCount(beforeLink, temporaryRoot) >= 1, 'CAS tmp directory was not synced before publish');
+  assert.ok(syncCount(beforeLink, casRoot) >= 2, 'CAS root was not synced for both direct child directories');
+  assert.ok(syncCount(beforeLink, digestRoot) >= 2, 'CAS digest root was not synced as child and prefix parent');
+  assert.ok(syncCount(beforeLink, digestPrefix) >= 1, 'CAS digest prefix was not synced before publish');
+  assert.ok(syncCount(afterLink, digestPrefix) >= 1, 'CAS object directory entry was not synced after link/EEXIST');
+  assert.ok(syncCount(afterLink, temporaryRoot) >= 1, 'CAS temporary unlink was not synced');
 }
 
 async function withRuntime(label, body) {

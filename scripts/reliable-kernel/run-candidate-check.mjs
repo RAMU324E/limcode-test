@@ -464,11 +464,10 @@ async function assertRecoveryMatrixAgainstContract() {
 }
 
 async function assertForkSourceOnly(control, database, sourceConversationId, input) {
-  await database.transaction([kernel.DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insert({
-    id: 'context-root-source', conversation_id: sourceConversationId, root_seq: '1', root_node_id: null,
-    tail_node_id: null, tail_segment_count: '0', summary_segment_id: null,
-    created_at: '2026-07-31T10:05:00.000Z'
-  })]);
+  const sourceHead = (await list(database, 'ConversationContextHeadLink', {
+    conversation_id: sourceConversationId
+  }))[0];
+  assert.ok(sourceHead?.root_id, 'Phase E input admission must create the source Context head');
   const conversationCount = (await list(database, 'Conversation', {})).length;
   const headCount = (await list(database, 'ConversationContextHeadLink', {})).length;
   const validated = await control.validateForkSource({
@@ -476,10 +475,11 @@ async function assertForkSourceOnly(control, database, sourceConversationId, inp
     sourceTurnId: input.turnId,
     sourceMessageId: input.messageId,
     sourceMessageRevisionId: input.messageRevisionId,
-    sourceContextRootId: 'context-root-source'
+    sourceContextRootId: sourceHead.root_id
   });
   assert.equal(validated.messageRevisionSeq, '1');
-  assert.equal(validated.contextRootSeq, '1');
+  const sourceRoot = await get(database, 'ContextSequenceRoot', sourceHead.root_id);
+  assert.equal(validated.contextRootSeq, sourceRoot.root_seq.toString());
   assert.equal((await list(database, 'Conversation', {})).length, conversationCount);
   assert.equal((await list(database, 'ConversationContextHeadLink', {})).length, headCount);
   assert.equal(typeof control.fork, 'undefined');
@@ -560,6 +560,8 @@ function proxyDatabase(database, hooks = {}) {
       await hooks.beforeTransaction?.(steps);
       return database.transaction(steps);
     },
+    async materializeContext(rootId) { return database.materializeContext(rootId); },
+    async snapshotAll(read) { return database.snapshotAll(read); },
     onCommit(listener) { return database.onCommit(listener); }
   };
 }

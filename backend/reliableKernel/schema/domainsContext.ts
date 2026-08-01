@@ -20,14 +20,18 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   domain({
     key: 'ContextSequenceNode', table: 'context_sequence_node', repository: 'ContextSequenceNodeRepository', codec: 'ContextSequenceNodeRowCodec',
     mutations: ['insert'], client: 'none', deletePolicy: 'dataset-reset-only',
-    indexes: ['parent_node_id', 'parent_node_id,segment_id UNIQUE'],
+    indexes: [
+      'parent_node_id',
+      'parent_node_id,segment_id UNIQUE',
+      'segment_id UNIQUE WHERE parent_node_id IS NULL'
+    ],
     columns: [id(), ref('parent_node_id', 'context_sequence_node', true, 'RESTRICT'), ref('segment_id', 'context_segment', false, 'RESTRICT'), text('created_at')]
   }),
   domain({
     key: 'ContextSequenceRoot', table: 'context_sequence_root', repository: 'ContextSequenceRootRepository', codec: 'ContextSequenceRootRowCodec',
     mutations: ['insert'], client: 'detail', deletePolicy: 'dataset-reset-only',
     indexes: ['conversation_id,root_seq UNIQUE', 'root_node_id'],
-    columns: [id(), text('conversation_id'), integer('root_seq'), ref('root_node_id', 'context_sequence_node', true, 'RESTRICT'), ref('tail_node_id', 'context_sequence_node', true, 'RESTRICT'), integer('tail_segment_count'), ref('summary_segment_id', 'context_segment', true, 'RESTRICT'), text('created_at')]
+    columns: [id(), text('conversation_id'), integer('root_seq'), ref('root_node_id', 'context_sequence_node', true, 'RESTRICT'), ref('tail_node_id', 'context_sequence_node', true, 'RESTRICT'), integer('tail_segment_count'), integer('segment_count'), integer('estimated_tokens'), text('created_at')]
   }),
   domain({
     key: 'ConversationContextHeadLink', table: 'conversation_context_head_link', repository: 'ConversationContextHeadLinkRepository', codec: 'ConversationContextHeadLinkRowCodec',
@@ -39,19 +43,19 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     key: 'ModelContextProjection', table: 'model_context_projection', repository: 'ModelContextProjectionRepository', codec: 'ModelContextProjectionRowCodec',
     mutations: ['insert'], client: 'detail', deletePolicy: 'dataset-reset-only',
     indexes: ['owner_kind,owner_id UNIQUE', 'root_id'],
-    columns: [id(), text('owner_kind'), text('owner_id'), text('root_id'), ref('content_object_id', 'content_object'), text('created_at')]
+    columns: [id(), text('owner_kind'), text('owner_id'), text('root_id'), text('purpose'), text('created_at')]
   }),
   domain({
     key: 'ModelRequest', table: 'model_request', repository: 'ModelRequestRepository', codec: 'ModelRequestRowCodec',
     mutations: ['insert', 'update'], client: 'summary', deletePolicy: 'cascade-with-turn',
     indexes: ['turn_id,request_seq UNIQUE', 'status'],
-    columns: [id(), ref('turn_id', 'turn'), integer('request_seq'), text('status'), text('provider_id'), text('model_id'), text('authority_snapshot_id'), ref('settings_snapshot_object_id', 'content_object', true, 'RESTRICT'), ref('request_object_id', 'content_object'), text('usage_json', { nullable: true, json: true }), text('stream_stats_json', { nullable: true, json: true }), text('created_at'), text('updated_at'), text('completed_at', { nullable: true })]
+    columns: [id(), ref('turn_id', 'turn'), integer('request_seq'), text('status'), text('terminal_state', { nullable: true }), text('provider_id'), text('model_id'), text('authority_snapshot_id'), ref('settings_snapshot_object_id', 'content_object', true, 'RESTRICT'), ref('recipe_object_id', 'content_object'), text('usage_json', { nullable: true, json: true }), text('stream_stats_json', { nullable: true, json: true }), text('created_at'), text('updated_at')]
   }),
   domain({
     key: 'CompressionBlock', table: 'compression_block', repository: 'CompressionBlockRepository', codec: 'CompressionBlockRowCodec',
     mutations: ['insert', 'update'], client: 'detail', deletePolicy: 'cascade-with-conversation',
     indexes: ['conversation_id,created_at', 'status'],
-    columns: [id(), ref('conversation_id', 'conversation'), text('status'), ref('title_object_id', 'content_object'), ref('summary_object_id', 'content_object'), text('created_at'), text('updated_at')]
+    columns: [id(), ref('conversation_id', 'conversation'), text('status'), text('authority_snapshot_id'), ref('title_object_id', 'content_object'), ref('summary_object_id', 'content_object'), text('created_at'), text('updated_at')]
   }),
   domain({
     key: 'CompressionBlockSource', table: 'compression_block_source', repository: 'CompressionBlockSourceRepository', codec: 'CompressionBlockSourceRowCodec',
@@ -63,7 +67,7 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     key: 'ModelStreamCheckpoint', table: 'model_stream_checkpoint', repository: 'ModelStreamCheckpointRepository', codec: 'ModelStreamCheckpointRowCodec',
     mutations: ['insert', 'delete'], client: 'none', deletePolicy: 'cascade-with-model-request',
     indexes: ['model_request_id,attempt_seq,socket_generation,stream_seq UNIQUE'],
-    columns: [id(), ref('model_request_id', 'model_request'), integer('attempt_seq'), integer('socket_generation'), integer('stream_seq'), ref('content_object_id', 'content_object'), text('created_at')]
+    columns: [id(), ref('model_request_id', 'model_request'), integer('attempt_seq'), integer('socket_generation'), integer('stream_seq'), text('checkpoint_kind'), ref('content_object_id', 'content_object'), text('created_at')]
   }),
   domain({
     key: 'ModelStreamFence', table: 'model_stream_fence', repository: 'ModelStreamFenceRepository', codec: 'ModelStreamFenceRowCodec',

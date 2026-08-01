@@ -25,7 +25,7 @@
 | ModelStreamCheckpoint rows | ≤ active request×64 + terminal request×33 |
 | compression sequence nodes | 单次 ≤4，O(1) |
 
-普通 transaction 不得 hash/rewrite/deep-clone full history。Context root/node 首发保留到 dataset reset；这不允许每轮复制历史。
+普通 transaction 不得 hash/rewrite/deep-clone full history，并须以常数个 identity-bounded Repository read 完成；Context root/node 首发保留到 dataset reset，这不允许每轮复制历史。Context CAS 正文读取/摘要校验必须在专用 database worker 或有界异步路径执行，不得在 Extension Host 用同步文件 I/O 换取 wall-clock gate 数字。
 
 ### Client feed
 
@@ -60,6 +60,7 @@
 ### Foundation
 
 - SQLite transaction commit 前 host exit；
+- CAS 新建 `tmp/sha256/prefix` 目录后分别 fsync child+parent；对象 hard-link 与 EEXIST 竞争观察路径都在 SQLite reference 前 fsync 对象目录项；
 - CAS published 但 SQLite 尚未 reference；
 - stale RootBinding generation；
 - pending/epoch incomplete 时 fail closed；
@@ -101,7 +102,7 @@
 
 ## 4. installed package 门槛
 
-- gate 运行时 worktree clean，validator tracked；
+- gate 运行时 worktree clean，validator tracked；candidate evidence 还必须显式绑定 current commit，并重算 `tsconfig` 全部 source 输入与 `dist/extension` 全部 emitted JS 闭包；所有 source 输入必须被 Git 跟踪；
 - VSIX provenance 记录构建时 `worktreeClean=true`，commit 等于 current commit；
 - 以 VSIX 内 package manifest 为权威，重算其 main entry SHA-256 与 provenance 匹配；
 - 重算 installed loaded entry digest 与同一 VSIX 匹配；

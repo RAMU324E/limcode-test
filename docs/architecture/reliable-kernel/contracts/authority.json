@@ -1151,10 +1151,11 @@
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "parent_node_id",
-        "parent_node_id,segment_id UNIQUE"
+        "parent_node_id,segment_id UNIQUE",
+        "segment_id UNIQUE WHERE parent_node_id IS NULL"
       ],
       "notes": [
-        "可分支 parent DAG：同一 parent 可有多个不同 segment 后继；复合 UNIQUE 只保证同一次追加幂等"
+        "可分支 parent DAG：同一 parent 可有多个不同 segment 后继；复合 UNIQUE 只保证同一次追加幂等；NULL parent 由部分 UNIQUE 单独补齐 SQLite NULL 语义"
       ]
     },
     {

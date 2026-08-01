@@ -62,7 +62,7 @@
   },
   "persistentSequence": {
     "firstReleaseShape": "persistent-parent-dag",
-    "branching": "同一 parent_node_id 可有多个不同 segment 后继；(parent_node_id,segment_id) UNIQUE 仅保证同一次追加幂等",
+    "branching": "同一 parent_node_id 可有多个不同 segment 后继；非 NULL parent 使用 (parent_node_id,segment_id) UNIQUE 保证同一次追加幂等；NULL parent 额外使用 segment_id UNIQUE WHERE parent_node_id IS NULL 补齐 SQLite NULL 语义",
     "node": [
       "nodeId",
       "parentNodeId?",
@@ -123,7 +123,9 @@
       "streamStats"
     ],
     "recipeImmutable": true,
-    "rule": "insert 后 recipe 字段不可变；update 仅允许 status、终态、usage 与 streamStats 字段"
+    "aggregateAuthority": "ModelRequest、其唯一Operation、1至2个连续Attempt及可选Completed Fence必须由writer按最终状态整体校验；通用update不得制造聚合不一致",
+    "cancelMutation": "request-level fixed writer cancel-current：事务内读取并终止当时最新attempt/socket；旧provider outcome仍只允许按精确identity收口",
+    "rule": "insert 后 recipe 字段不可变；update 仅允许 status、终态、usage 与 streamStats 字段；status 单调，terminal 不得复活；任何允许列更新仍须通过聚合不变量"
   },
   "compression": {
     "source": "contiguous-sequence-range",
@@ -138,7 +140,7 @@
     "invalidatesInFlightContinuation": true,
     "management": {
       "regenerate": "创建新的 CompressionBlock、summary segment 与 root，不改旧正文。",
-      "replace": "用户修改 title/summary 时创建新的 immutable CompressionBlock/replacement；同事务按明确选择将旧块 status 置 disabled 或 soft_deleted，并更新 current head。",
+      "replace": "用户修改 title/summary 时创建新的 immutable CompressionBlock/replacement；同事务按明确选择将旧块 status 置 disabled 或 soft_deleted，并更新 current head；该previousStatus disposition属于持久幂等命令身份，相同key不同disposition必须冲突。",
       "enableDisableDelete": "只更新 CompressionBlock.status；delete 为 soft_deleted，不物理删除来源与历史 projection。",
       "legacyCompressionUpdate": "removed-no-in-place-title-or-summary-mutation"
     }
@@ -160,6 +162,7 @@
     "disabledBehavior": "always-send-full-request",
     "disabledRules": [
       "每个 ModelRequest 都从冻结 ContextSequenceRoot 与 immutable recipe 构造完整请求",
+      "Message segment 的role来自该segment冻结source所指向的immutable MessageRevision；模型正文必须可精确解码为UTF-8，非法字节在外调前失败",
       "不读取 ProviderContinuation",
       "不产生或发送 suffix",
       "连接重建、压缩与 retry 的功能正确性不依赖 continuation"
@@ -181,14 +184,17 @@
     "runtimeProtocolNegotiation": false
   },
   "streamCheckpoint": {
-    "retention": "终态围栏写入后，由 ModelStreamCheckpointRepository maintenance delete 仅保留最新 socket_generation 尾部 32 条与终态摘要",
-    "maintenanceMutation": "delete-after-terminal-fence-only",
+    "retention": "Completed 终态围栏与摘要写入的同一 writer 事务内，由 ModelStreamCheckpointRepository 固定 pruneAfterTerminalFence mutation 仅保留当前 attempt/socket generation 尾部 32 条与终态摘要",
+    "maintenanceMutation": "fixed-writer-prune-after-terminal-fence-only",
+    "genericInsertDelete": false,
+    "eventIdempotency": "同一(modelRequestId,attemptSeq,socketGeneration,streamSeq)仅checkpoint kind与canonical content identity完全相同时可重放；不同事件必须明确冲突，不得吞掉Completed",
     "rowBound": "行数上界见 appendices/performance-and-packaging-gates.md（≤活跃请求×64+终态请求×33）"
   },
   "providerRetry": {
     "automaticTransientRetry": true,
     "maxAttempts": 2,
     "visible": true,
+    "visibilityAuthority": "只读取已提交ModelRequest/Attempt事实或commit feed；不得建立瞬时retry observer第二authority",
     "cancelable": true,
     "afterExtensionRestart": "no-automatic-retry",
     "newAttemptKeepsSameModelRequest": true
@@ -201,6 +207,7 @@
     "compressionWriteCost": "单次压缩新增序列节点数=O(1)（≤4）",
     "ordinaryTransactionMayHashFullHistory": false,
     "ordinaryTransactionMayRewriteFullHistory": false,
+    "extensionHostMaySynchronouslyReadContextCas": false,
     "clientMayDeepCloneFullHistory": false
   },
   "conversationFork": {

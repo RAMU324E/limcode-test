@@ -27,6 +27,14 @@ export interface ContentObjectMetadata extends DomainRow {
   created_at: string;
 }
 
+export interface ContentObjectIdentity {
+  id: string;
+  content_type: string;
+  sha256: string;
+  byte_length: bigint;
+  storage_key: string;
+}
+
 export interface PreparedContentObject {
   metadata: ContentObjectMetadata;
   insert?: RepositoryInsertMutation;
@@ -38,6 +46,26 @@ export class ContentAddressedStore {
     public readonly binding: RootBinding
   ) {}
 
+  public identity(content: Uint8Array | string, contentType: string): ContentObjectIdentity {
+    const normalizedType = requireContentType(contentType);
+    const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const published: PublishedContent = {
+      contentType: normalizedType,
+      sha256,
+      byteLength: BigInt(bytes.length),
+      storageKey: storageKeyForDigest(sha256),
+      absolutePath: ''
+    };
+    return {
+      id: contentObjectId(published),
+      content_type: normalizedType,
+      sha256,
+      byte_length: published.byteLength,
+      storage_key: published.storageKey
+    };
+  }
+
   public async publish(content: Uint8Array | string, contentType: string): Promise<PublishedContent> {
     await this.authority.validate(this.binding);
     const normalizedType = requireContentType(contentType);
@@ -45,9 +73,13 @@ export class ContentAddressedStore {
     const sha256 = createHash('sha256').update(bytes).digest('hex');
     const storageKey = storageKeyForDigest(sha256);
     const absolutePath = absoluteCasPath(this.binding, storageKey);
-    const temporaryRoot = path.join(this.binding.paths.casRootPath, 'tmp');
-    await fs.mkdir(temporaryRoot, { recursive: true });
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    const casRoot = this.binding.paths.casRootPath;
+    const temporaryRoot = path.join(casRoot, 'tmp');
+    const digestRoot = path.join(casRoot, 'sha256');
+    const digestPrefix = path.dirname(absolutePath);
+    await ensureDurableChildDirectory(casRoot, temporaryRoot);
+    await ensureDurableChildDirectory(casRoot, digestRoot);
+    await ensureDurableChildDirectory(digestRoot, digestPrefix);
     const temporaryPath = path.join(temporaryRoot, `${process.pid}-${randomUUID()}.tmp`);
     const handle = await fs.open(temporaryPath, 'wx', 0o600);
     try {
@@ -58,11 +90,15 @@ export class ContentAddressedStore {
     }
 
     try {
-      await fs.link(temporaryPath, absolutePath);
-      await syncDirectory(path.dirname(absolutePath));
-    } catch (error) {
-      if (!isAlreadyExists(error)) throw error;
-      await assertExistingObject(absolutePath, sha256, BigInt(bytes.length));
+      try {
+        await fs.link(temporaryPath, absolutePath);
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error;
+        await assertExistingObject(absolutePath, sha256, BigInt(bytes.length));
+      }
+      // Both the publisher and an EEXIST observer must durably publish the directory entry before
+      // either is allowed to commit a SQLite reference.
+      await syncDirectory(digestPrefix);
     } finally {
       await fs.rm(temporaryPath, { force: true });
       await syncDirectory(temporaryRoot);
@@ -124,13 +160,30 @@ export class ContentAddressedStore {
 
   public async read(metadata: ContentObjectMetadata): Promise<Buffer> {
     await this.authority.validate(this.binding);
-    const expectedKey = storageKeyForDigest(metadata.sha256);
-    if (metadata.storage_key !== expectedKey) throw new Error('ContentObject storage key does not match sha256.');
-    const filePath = absoluteCasPath(this.binding, expectedKey);
-    const bytes = await fs.readFile(filePath);
-    if (BigInt(bytes.length) !== metadata.byte_length) throw new Error('CAS object byte length mismatch.');
-    if (createHash('sha256').update(bytes).digest('hex') !== metadata.sha256) throw new Error('CAS object digest mismatch.');
-    return bytes;
+    return readPublishedObject(this.binding, metadata);
+  }
+
+  /** One fenced async operation; duplicate ContentObjects are read and verified once, then fanned out. */
+  public async readMany(metadata: readonly ContentObjectMetadata[]): Promise<Buffer[]> {
+    await this.authority.validate(this.binding);
+    const unique = [...new Map(metadata.map((entry) => [entry.id, entry])).values()];
+    const contents = new Map<string, Buffer>();
+    const concurrency = Math.min(32, Math.max(1, unique.length));
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: concurrency }, async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= unique.length) return;
+        const entry = unique[index];
+        contents.set(entry.id, await readPublishedObject(this.binding, entry));
+      }
+    }));
+    return metadata.map((entry) => {
+      const bytes = contents.get(entry.id);
+      if (!bytes) throw new Error(`CAS batch read lost ContentObject ${entry.id}.`);
+      return bytes;
+    });
   }
 }
 
@@ -185,11 +238,40 @@ function absoluteCasPath(binding: RootBinding, storageKey: string): string {
   return candidate;
 }
 
+function validatePublishedBytes(metadata: ContentObjectMetadata, bytes: Buffer): Buffer {
+  if (BigInt(bytes.length) !== metadata.byte_length) throw new Error('CAS object byte length mismatch.');
+  if (createHash('sha256').update(bytes).digest('hex') !== metadata.sha256) throw new Error('CAS object digest mismatch.');
+  return bytes;
+}
+
+async function readPublishedObject(binding: RootBinding, metadata: ContentObjectMetadata): Promise<Buffer> {
+  const expectedKey = storageKeyForDigest(metadata.sha256);
+  if (metadata.storage_key !== expectedKey) throw new Error('ContentObject storage key does not match sha256.');
+  const filePath = absoluteCasPath(binding, expectedKey);
+  return validatePublishedBytes(metadata, await fs.readFile(filePath));
+}
+
 async function assertExistingObject(filePath: string, digest: string, byteLength: bigint): Promise<void> {
   const stat = await fs.stat(filePath);
   if (!stat.isFile() || BigInt(stat.size) !== byteLength) throw new Error('Existing CAS object has the wrong length.');
   const bytes = await fs.readFile(filePath);
   if (createHash('sha256').update(bytes).digest('hex') !== digest) throw new Error('Existing CAS object has the wrong digest.');
+}
+
+async function ensureDurableChildDirectory(parentPath: string, childPath: string): Promise<void> {
+  if (path.dirname(childPath) !== parentPath) {
+    throw new Error(`CAS durable directory ${childPath} is not a direct child of ${parentPath}.`);
+  }
+  try {
+    await fs.mkdir(childPath);
+  } catch (error) {
+    if (!isAlreadyExists(error)) throw error;
+    const stat = await fs.stat(childPath);
+    if (!stat.isDirectory()) throw new Error(`CAS path ${childPath} exists but is not a directory.`);
+  }
+  // Sync both sides even after EEXIST: a competing creator may not yet have synced the parent.
+  await syncDirectory(childPath);
+  await syncDirectory(parentPath);
 }
 
 async function syncDirectory(directoryPath: string): Promise<void> {
