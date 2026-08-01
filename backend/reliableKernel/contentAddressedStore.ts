@@ -163,6 +163,35 @@ export class ContentAddressedStore {
     return readPublishedObject(this.binding, metadata);
   }
 
+  /** Fenced on-demand chunk read; callers still enforce their wire response budget. */
+  public async readChunk(
+    metadata: ContentObjectMetadata,
+    offset: number,
+    maxBytes: number
+  ): Promise<{ chunk: Buffer; nextOffset?: number; totalBytes: number; hasMore: boolean }> {
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new RangeError('CAS chunk offset must be a non-negative integer.');
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new RangeError('CAS chunk maxBytes must be a positive integer.');
+    await this.authority.validate(this.binding);
+    const expectedKey = storageKeyForDigest(metadata.sha256);
+    if (metadata.storage_key !== expectedKey) throw new Error('ContentObject storage key does not match sha256.');
+    const totalBytes = Number(metadata.byte_length);
+    if (!Number.isSafeInteger(totalBytes)) throw new RangeError('CAS object is too large for chunk addressing.');
+    if (offset > totalBytes) throw new RangeError('CAS chunk offset exceeds object length.');
+    const length = Math.min(maxBytes, totalBytes - offset);
+    // The whole object is verified against its committed digest before exposing any range. This is an
+    // on-demand wire chunk, not a second unverified content authority.
+    const verified = await readPublishedObject(this.binding, metadata);
+    const chunk = verified.subarray(offset, offset + length);
+    const nextOffset = offset + length;
+    const hasMore = nextOffset < totalBytes;
+    return {
+      chunk,
+      ...(hasMore ? { nextOffset } : {}),
+      totalBytes,
+      hasMore
+    };
+  }
+
   /** One fenced async operation; duplicate ContentObjects are read and verified once, then fanned out. */
   public async readMany(metadata: readonly ContentObjectMetadata[]): Promise<Buffer[]> {
     await this.authority.validate(this.binding);

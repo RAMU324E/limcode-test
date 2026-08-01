@@ -98,6 +98,7 @@
     "test:phase-c": "npm run compile && node --test tests/reliable-kernel/phase-c-turn-control-plane.test.mjs",
     "test:phase-d": "npm run compile && node --test tests/reliable-kernel/phase-d-effects-tools-files-processes.test.mjs",
     "test:phase-e": "npm run compile && node --test tests/reliable-kernel/phase-e-context-provider.test.mjs",
+    "test:phase-f": "npm run compile && node --test tests/reliable-kernel/phase-f-subagent-client.test.mjs",
     "check:phase-d": "npm run compile && node --test tests/reliable-kernel/phase-c-turn-control-plane.test.mjs tests/reliable-kernel/phase-d-effects-tools-files-processes.test.mjs",
     "check:candidate": "npm run compile && node scripts/reliable-kernel/validators/candidate.mjs",
     "smoke:sqlite:host": "node scripts/reliable-kernel/sqlite-extension-host-smoke.mjs",

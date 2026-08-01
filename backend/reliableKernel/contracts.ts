@@ -41,6 +41,8 @@ export interface RuntimeChange {
   domain: string;
   kind: 'upsert' | 'remove';
   id: string;
+  /** Final committed row projection for upsert; removals carry identity only. */
+  record?: Record<string, unknown>;
 }
 
 export interface RuntimeAllocatedSequence {

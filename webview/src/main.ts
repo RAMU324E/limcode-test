@@ -1,6 +1,7 @@
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
 import App from './App.vue';
+import { installReliableKernelClientFeed } from './transport/reliableKernelFeed';
 import 'katex/dist/katex.min.css';
 import './theme/tokens.css';
 import './theme/base.css';
@@ -13,5 +14,7 @@ import './theme/motion/composer.css';
 import './theme/motion/status.css';
 
 const app = createApp(App);
-app.use(createPinia());
+const pinia = createPinia();
+app.use(pinia);
+installReliableKernelClientFeed(pinia);
 app.mount('#app');

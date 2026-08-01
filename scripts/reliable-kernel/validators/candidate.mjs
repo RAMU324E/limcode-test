@@ -31,13 +31,30 @@ const phaseEChecks = new Set([
   'candidate.provider-continuation-disabled-full-request',
   'candidate.compression-immutable-replacement'
 ]);
+const phaseFChecks = new Set([
+  'candidate.conversation-fork-links',
+  'candidate.subagent-answer-restart-delivery',
+  'candidate.subagent-cancel-subtree',
+  'candidate.client-snapshot-bounds',
+  'candidate.client-change-batch-bounds',
+  'candidate.client-queue-bounds',
+  'candidate.client-snapshot-feed-barrier',
+  'candidate.old-writer-not-routed',
+  'candidate.recovery.answer-inbox-invariant',
+  'candidate.recovery.pending-delivery',
+  'candidate.recovery.foreground-wait-expired',
+  'candidate.recovery.cancelled-subtree-incomplete',
+  'candidate.parent-handling-matrix'
+]);
 
 function runCandidateCheck(checkId) {
   const runner = checkId === 'candidate.turn-sole-execution-identity'
     ? 'run-candidate-check.mjs'
     : phaseEChecks.has(checkId)
       ? 'run-phase-e-check.mjs'
-      : 'run-phase-d-check.mjs';
+      : phaseFChecks.has(checkId)
+        ? 'run-phase-f-check.mjs'
+        : 'run-phase-d-check.mjs';
   const args = [
     path.join(root, 'scripts/reliable-kernel', runner),
     `--check=${checkId}`,
@@ -71,7 +88,20 @@ const implemented = new Map([
   ['candidate.process-wrapper-recovery', () => runCandidateCheck('candidate.process-wrapper-recovery')],
   ['candidate.process-output-bounds', () => runCandidateCheck('candidate.process-output-bounds')],
   ['candidate.recovery.effect-intent-hanging', () => runCandidateCheck('candidate.recovery.effect-intent-hanging')],
-  ['candidate.recovery.file-change-unresolved', () => runCandidateCheck('candidate.recovery.file-change-unresolved')]
+  ['candidate.recovery.file-change-unresolved', () => runCandidateCheck('candidate.recovery.file-change-unresolved')],
+  ['candidate.conversation-fork-links', () => runCandidateCheck('candidate.conversation-fork-links')],
+  ['candidate.subagent-answer-restart-delivery', () => runCandidateCheck('candidate.subagent-answer-restart-delivery')],
+  ['candidate.subagent-cancel-subtree', () => runCandidateCheck('candidate.subagent-cancel-subtree')],
+  ['candidate.client-snapshot-bounds', () => runCandidateCheck('candidate.client-snapshot-bounds')],
+  ['candidate.client-change-batch-bounds', () => runCandidateCheck('candidate.client-change-batch-bounds')],
+  ['candidate.client-queue-bounds', () => runCandidateCheck('candidate.client-queue-bounds')],
+  ['candidate.client-snapshot-feed-barrier', () => runCandidateCheck('candidate.client-snapshot-feed-barrier')],
+  ['candidate.old-writer-not-routed', () => runCandidateCheck('candidate.old-writer-not-routed')],
+  ['candidate.recovery.answer-inbox-invariant', () => runCandidateCheck('candidate.recovery.answer-inbox-invariant')],
+  ['candidate.recovery.pending-delivery', () => runCandidateCheck('candidate.recovery.pending-delivery')],
+  ['candidate.recovery.foreground-wait-expired', () => runCandidateCheck('candidate.recovery.foreground-wait-expired')],
+  ['candidate.recovery.cancelled-subtree-incomplete', () => runCandidateCheck('candidate.recovery.cancelled-subtree-incomplete')],
+  ['candidate.parent-handling-matrix', () => runCandidateCheck('candidate.parent-handling-matrix')]
 ]);
 
 const failures = [];

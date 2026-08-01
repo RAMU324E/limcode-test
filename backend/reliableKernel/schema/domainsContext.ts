@@ -115,7 +115,7 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     key: 'AnswerSubmission', table: 'answer_submission', repository: 'AnswerSubmissionRepository', codec: 'AnswerSubmissionRowCodec',
     mutations: ['insert'], client: 'detail', deletePolicy: 'cascade-with-answer-bridge',
     indexes: ['answer_bridge_id,submission_seq UNIQUE'],
-    columns: [id(), ref('answer_bridge_id', 'answer_bridge'), integer('submission_seq'), text('turn_id', { nullable: true }), text('created_at')]
+    columns: [id(), ref('answer_bridge_id', 'answer_bridge'), integer('submission_seq'), text('turn_id', { nullable: true }), integer('interrupted'), text('created_at')]
   }),
   domain({
     key: 'AnswerPayload', table: 'answer_payload', repository: 'AnswerPayloadRepository', codec: 'AnswerPayloadRowCodec',

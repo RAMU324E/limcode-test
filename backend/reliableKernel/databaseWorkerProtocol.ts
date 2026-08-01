@@ -70,6 +70,31 @@ export interface ModelRequestCancelResult {
   commit?: RuntimeCommitResult;
 }
 
+export interface ClientProjectionSnapshot {
+  navigationSummary: Record<string, unknown>;
+  activeConversationWindow: Record<string, unknown>;
+  activeTurnSummary: Record<string, unknown>;
+  activeToolAndInteractionSummary: Record<string, unknown>;
+  subagentDeliverySummary: Record<string, unknown>;
+}
+
+export interface ClientKeysetPageInput {
+  query: 'message' | 'conversation';
+  sortId: 'message_seq' | 'created_at+id';
+  conversationId?: string;
+  limit: number;
+  afterSortKey?: string;
+  afterId?: string;
+}
+
+export interface ClientKeysetPageResult {
+  rows: Array<Record<string, unknown>>;
+  nextSortKey?: string;
+  nextId?: string;
+  hasMore: boolean;
+  responseBytes: number;
+}
+
 export interface DatabaseWorkerData {
   mode: 'initialize' | 'runtime';
   binding: RootBinding;
@@ -84,6 +109,8 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'contextContentMaterialization'; rootId: string }
   | { kind: 'modelStreamEvent'; input: ModelStreamEventCommitInput }
   | { kind: 'cancelCurrentModelRequest'; input: ModelRequestCancelInput }
+  | { kind: 'clientProjectionSnapshot'; activeConversationId: string | null }
+  | { kind: 'clientKeysetPage'; input: ClientKeysetPageInput }
   | { kind: 'inspect' }
   | { kind: 'close' };
 
@@ -102,7 +129,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelRequestCancelResult | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | null }
+  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelRequestCancelResult | ClientKeysetPageResult | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | null }
   | { type: 'response'; id: number; ok: false; error: SerializedWorkerError }
   | { type: 'commit'; result: RuntimeCommitResult }
   | { type: 'fatal'; error: SerializedWorkerError };

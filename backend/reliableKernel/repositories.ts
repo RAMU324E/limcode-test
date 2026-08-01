@@ -69,6 +69,13 @@ export interface RepositoryAssertNoneStep {
   where: DomainRow;
 }
 
+export interface RepositoryAssertExactIdsStep {
+  kind: 'assertExactIds';
+  domain: string;
+  where: DomainRow;
+  expectedIds: string[];
+}
+
 export interface RepositoryExpectedUniqueConstraint {
   domain: string;
   columns: string[];
@@ -97,6 +104,7 @@ export type RepositoryTransactionStep =
   | RepositoryAssertStep
   | RepositoryAssertAllStep
   | RepositoryAssertNoneStep
+  | RepositoryAssertExactIdsStep
   | RepositorySavepoint;
 
 export interface RepositoryGetRead {
@@ -340,6 +348,23 @@ export class DomainRepository {
     };
   }
 
+  /** Transaction-local assertion that a scoped relation set has exactly these stable row ids. */
+  public assertExactIds(where: DomainRow, expectedIds: readonly string[]): RepositoryAssertExactIdsStep {
+    this.codec.encodeWhere(where);
+    if (Object.keys(where).length === 0) throw new TypeError(`${this.name}.assertExactIds requires predicates.`);
+    const ids = expectedIds.map((id) => {
+      requireId(id);
+      return id;
+    });
+    if (new Set(ids).size !== ids.length) throw new TypeError(`${this.name}.assertExactIds received duplicate ids.`);
+    return {
+      kind: 'assertExactIds',
+      domain: this.schema.key,
+      where: clonePlainRecord(where),
+      expectedIds: [...ids].sort()
+    };
+  }
+
   /** Transaction-local assertion that no row matches `where`. */
   public assertNone(where: DomainRow): RepositoryAssertNoneStep {
     this.codec.encodeWhere(where);
@@ -555,6 +580,12 @@ function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
     where: clonePlainRecord(step.where),
     expected: clonePlainRecord(step.expected)
   };
+  if (step.kind === 'assertExactIds') return {
+    ...step,
+    where: clonePlainRecord(step.where),
+    expectedIds: [...step.expectedIds]
+  };
+  if (step.kind === 'assertNone') return { ...step, where: clonePlainRecord(step.where) };
   if (step.kind === 'deleteWhere') return { ...step, where: clonePlainRecord(step.where) };
   if (step.kind === 'pruneModelStreamCheckpoints') return { ...step };
   if (step.kind === 'insert') return {
@@ -578,7 +609,14 @@ const RESTRICTED_UPDATE_COLUMNS: ReadonlyMap<string, ReadonlySet<string>> = new 
   ['ModelRequest', new Set(['status', 'terminal_state', 'usage_json', 'stream_stats_json', 'updated_at'])],
   ['CompressionBlock', new Set(['status', 'updated_at'])],
   ['Operation', new Set(['status', 'updated_at'])],
-  ['Attempt', new Set(['status', 'updated_at', 'completed_at'])]
+  ['Attempt', new Set(['status', 'updated_at', 'completed_at'])],
+  ['ChildExecution', new Set(['status', 'updated_at'])],
+  ['ChildExecutionIntentLink', new Set(['state', 'updated_at'])],
+  ['ChildExecutionActiveTurnLink', new Set(['turn_id', 'updated_at'])],
+  ['AnswerBridge', new Set(['current_submission_id', 'status', 'updated_at'])],
+  ['RuntimeInboxItem', new Set(['state', 'updated_at'])],
+  ['RuntimeDelivery', new Set(['target_turn_id', 'phase', 'state', 'failure_reason', 'updated_at'])],
+  ['RuntimeDeliveryInputLink', new Set(['handled_at', 'updated_at'])]
 ]);
 
 export function assertRuntimeDomainUpdatePatch(domain: string, patch: DomainRow): void {

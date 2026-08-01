@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import { TERMINAL_TOOL_CALL_STATUSES, type CheckpointRecord, type CompressionBlockRecord, type MessageContent, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
 import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 import { useConversationUiStore, type ConversationTimelineViewRow, type LlmErrorBlockRecord, type MessageViewRow } from '@webview/stores/useConversationUiStore';
@@ -11,6 +11,13 @@ import { useCompression } from '@webview/composables/useCompression';
 import CompressionTimelineCard from './CompressionTimelineCard.vue';
 import MessageItem from './MessageItem.vue';
 import TimelineActivityRow from './TimelineActivityRow.vue';
+import {
+  PENDING_TIMELINE_MOUNT_LIMIT,
+  TIMELINE_MOUNT_LIMIT,
+  TIMELINE_SEGMENT_STEP,
+  clampTimelineSegmentStart,
+  latestTimelineSegmentStart
+} from './segmentedTimeline';
 
 const props = withDefaults(
   defineProps<{
@@ -246,7 +253,41 @@ function rowKey(row: ConversationTimelineViewRow): string {
   return row.id;
 }
 
-const rowKeySignature = computed(() => ui.timelineRows.map(rowKey).join('\u0001'));
+const segmentStart = ref(0);
+const visibleTimelineRows = computed(() => ui.timelineRows.slice(
+  segmentStart.value,
+  segmentStart.value + TIMELINE_MOUNT_LIMIT
+));
+const visiblePendingSendMessages = computed(() => pendingSendMessages.value.slice(-PENDING_TIMELINE_MOUNT_LIMIT));
+const hasEarlierSegment = computed(() => segmentStart.value > 0);
+const hasLaterSegment = computed(() => segmentStart.value + TIMELINE_MOUNT_LIMIT < ui.timelineRows.length);
+
+watch(
+  () => ui.timelineRows.length,
+  (total, previous = 0) => {
+    const wasAtLatest = segmentStart.value >= latestTimelineSegmentStart(previous);
+    segmentStart.value = wasAtLatest
+      ? latestTimelineSegmentStart(total)
+      : clampTimelineSegmentStart(total, segmentStart.value);
+  },
+  { immediate: true }
+);
+
+function showEarlierSegment(): void {
+  segmentStart.value = clampTimelineSegmentStart(
+    ui.timelineRows.length,
+    segmentStart.value - TIMELINE_SEGMENT_STEP
+  );
+}
+
+function showLaterSegment(): void {
+  segmentStart.value = clampTimelineSegmentStart(
+    ui.timelineRows.length,
+    segmentStart.value + TIMELINE_SEGMENT_STEP
+  );
+}
+
+const rowKeySignature = computed(() => visibleTimelineRows.value.map(rowKey).join('\u0001'));
 const isLoadingOlder = computed(() => timeline.currentTimeline.status === 'loadingOlder');
 
 watch(rowKeySignature, () => {
@@ -338,8 +379,16 @@ function maybeLoadOlder(): void {
         <span>正在加载更早消息…</span>
       </div>
     </div>
+    <button
+      v-if="hasEarlierSegment"
+      class="message-list-segment-control"
+      type="button"
+      @click="showEarlierSegment"
+    >
+      显示更早内容
+    </button>
     <div
-      v-for="row in ui.timelineRows"
+      v-for="row in visibleTimelineRows"
       :key="rowKey(row)"
       class="message-list-row"
       :data-timeline-row-key="rowKey(row)"
@@ -384,8 +433,16 @@ function maybeLoadOlder(): void {
         :label="row.label"
       />
     </div>
+    <button
+      v-if="hasLaterSegment"
+      class="message-list-segment-control"
+      type="button"
+      @click="showLaterSegment"
+    >
+      显示较新内容
+    </button>
     <div
-      v-for="pending in pendingSendMessages"
+      v-for="pending in visiblePendingSendMessages"
       :key="pending.commandId"
       class="message-list-row"
       :data-timeline-row-key="`pending:${pending.commandId}`"
@@ -414,6 +471,23 @@ function maybeLoadOlder(): void {
 
 .message-list-row {
   display: block;
+}
+
+.message-list-segment-control {
+  align-self: center;
+  margin: var(--space-2) 0;
+  padding: 4px 10px;
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+  background: color-mix(in srgb, var(--vscode-foreground) 5%, transparent);
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+}
+
+.message-list-segment-control:hover,
+.message-list-segment-control:focus-visible {
+  background: color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+  border-color: color-mix(in srgb, var(--vscode-foreground) 30%, transparent);
+  outline: none;
 }
 
 .message-list-loading-layer {

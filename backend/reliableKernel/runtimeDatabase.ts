@@ -8,6 +8,9 @@ import {
   type SnapshotBarrier
 } from './contracts';
 import type {
+  ClientKeysetPageInput,
+  ClientKeysetPageResult,
+  ClientProjectionSnapshot,
   ContextContentMaterializationSnapshot,
   ContextMaterializationSnapshot,
   DatabaseWorkerData,
@@ -110,6 +113,44 @@ export class RuntimeDatabase {
     reads: RepositoryRead[],
     onCommit: (result: RuntimeCommitResult) => void
   ): Promise<SnapshotSubscription<Array<DomainRow | DomainRow[] | null>>> {
+    return this.barrierAndSubscribe(() => this.snapshot(reads), onCommit);
+  }
+
+  public async clientProjectionSnapshot(
+    activeConversationId: string | null
+  ): Promise<SnapshotBarrier<ClientProjectionSnapshot>> {
+    if (activeConversationId !== null && (typeof activeConversationId !== 'string' || activeConversationId.length === 0)) {
+      throw new TypeError('activeConversationId must be a non-empty id or null.');
+    }
+    return this.request<SnapshotBarrier<ClientProjectionSnapshot>>({
+      kind: 'clientProjectionSnapshot',
+      activeConversationId
+    });
+  }
+
+  public async clientProjectionSnapshotAndSubscribe(
+    activeConversationId: string | null,
+    onCommit: (result: RuntimeCommitResult) => void
+  ): Promise<SnapshotSubscription<ClientProjectionSnapshot>> {
+    return this.barrierAndSubscribe(
+      () => this.clientProjectionSnapshot(activeConversationId),
+      onCommit
+    );
+  }
+
+  public async clientKeysetPage(input: ClientKeysetPageInput): Promise<ClientKeysetPageResult> {
+    return this.request<ClientKeysetPageResult>({ kind: 'clientKeysetPage', input });
+  }
+
+  public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
+    this.commitListeners.add(listener);
+    return () => this.commitListeners.delete(listener);
+  }
+
+  private async barrierAndSubscribe<T>(
+    readBarrier: () => Promise<SnapshotBarrier<T>>,
+    onCommit: (result: RuntimeCommitResult) => void
+  ): Promise<SnapshotSubscription<T>> {
     const buffered: RuntimeCommitResult[] = [];
     let live = false;
     const listener = (result: RuntimeCommitResult) => {
@@ -118,7 +159,7 @@ export class RuntimeDatabase {
     };
     this.commitListeners.add(listener);
     try {
-      const barrier = await this.snapshot(reads);
+      const barrier = await readBarrier();
       const visible = BigInt(barrier.snapshotCommitSeq);
       for (const result of buffered) {
         if (BigInt(result.commitSeq) > visible) onCommit(result);
@@ -132,11 +173,6 @@ export class RuntimeDatabase {
       this.commitListeners.delete(listener);
       throw error;
     }
-  }
-
-  public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
-    this.commitListeners.add(listener);
-    return () => this.commitListeners.delete(listener);
   }
 
   /** Fixed domain read; no caller-supplied SQL or closure-table state. */

@@ -8,6 +8,7 @@ import {
   type WebviewClientMeta,
   type WebviewToExtensionMessage
 } from '@shared/protocol';
+import { toStructuredClonePlainData } from '@shared/plainData';
 import type { HostApi } from '../platform/hostApi';
 import { channelForType } from './channels';
 
@@ -16,22 +17,21 @@ type ExtensionMessageListener<T extends ExtensionToWebviewMessage = ExtensionToW
 ) => void;
 
 interface BridgePersistedState {
-  clientId?: BridgeClientId;
   meta?: WebviewClientMeta;
 }
 
 /**
  * IDE 无关的协议桥。
  *
- * 只依赖 HostApi 收发原始消息，自身负责：clientId 捕获/附带、按类型选通道、
+ * 只依赖 HostApi 收发原始消息，自身负责：内存 session 捕获/附带、按类型选通道、
  * request/on/onAny/ready 等协议级能力。不直接接触任何具体 IDE API。
  */
 export class Bridge {
   private readonly listeners = new Map<string, Set<ExtensionMessageListener>>();
-  private clientId: BridgeClientId | undefined;
+  /** Extension Host session identity is memory-only and is never restored after Webview reload. */
+  private sessionId: BridgeClientId | undefined;
 
   public constructor(private readonly host: HostApi) {
-    this.clientId = this.host.getState<BridgePersistedState>()?.clientId;
     this.host.onMessage((raw) => {
       const message = raw as ExtensionToWebviewMessage;
       this.captureTransportState(message);
@@ -40,7 +40,12 @@ export class Bridge {
   }
 
   public post(message: WebviewToExtensionMessage): void {
-    this.host.postMessage({ ...message, clientId: this.clientId });
+    this.postRaw({ ...message, clientId: this.sessionId });
+  }
+
+  /** Candidate bounded feed control messages use the same recursively plain bridge boundary. */
+  public postRaw(message: unknown): void {
+    this.host.postMessage(toStructuredClonePlainData(message, 'bridge message'));
   }
 
   public request<TType extends WebviewToExtensionMessage['type']>(
@@ -104,14 +109,8 @@ export class Bridge {
     const nextState: BridgePersistedState = { ...currentState };
     let changed = false;
 
-    if (message.clientId) {
-      if (message.clientId !== this.clientId) {
-        this.clientId = message.clientId;
-      }
-      if (currentState.clientId !== message.clientId) {
-        nextState.clientId = message.clientId;
-        changed = true;
-      }
+    if (message.clientId && message.clientId !== this.sessionId) {
+      this.sessionId = message.clientId;
     }
 
     const meta = message.type === BridgeMessageType.Hello ? message.payload?.meta : undefined;

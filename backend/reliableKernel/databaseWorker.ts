@@ -18,6 +18,9 @@ import {
 import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
   MODEL_STREAM_TERMINAL_TAIL,
+  type ClientKeysetPageInput,
+  type ClientKeysetPageResult,
+  type ClientProjectionSnapshot,
   type ContextContentMaterializationSnapshot,
   type ContextMaterializationRecord,
   type ContextMaterializationSnapshot,
@@ -31,6 +34,13 @@ import {
   type ModelRequestCancelResult,
   type SerializedWorkerError
 } from './databaseWorkerProtocol';
+import {
+  CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
+  CLIENT_MESSAGE_WINDOW_LIMIT,
+  CLIENT_PAGE_MAX_BYTES,
+  CLIENT_PAGE_MAX_ROWS,
+  CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES
+} from './clientFeedBounds';
 import {
   DOMAIN_REPOSITORIES,
   assertRuntimeDomainUpdatePatch,
@@ -136,6 +146,22 @@ async function start(): Promise<void> {
         post({ type: 'response', id: request.id, ok: true, result });
         return;
       }
+      if (request.kind === 'clientProjectionSnapshot') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeClientProjectionSnapshot(
+          reader,
+          request.activeConversationId,
+          commitSeq
+        );
+        post({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'clientKeysetPage') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeClientKeysetPage(reader, request.input);
+        post({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
       if (request.kind === 'inspect') {
         assertDatabaseBinding(writer, data.binding);
         const result: DatabaseWorkerDiagnostics = {
@@ -193,7 +219,7 @@ function configureTransactionChangeCapture(database: Database.Database): void {
 
 function readTransactionChanges(database: Database.Database): RuntimeChange[] {
   const rows = database.prepare(`
-    SELECT current.domain, current.id, current.kind
+    SELECT current.sequence, current.domain, current.id, current.kind
       FROM runtime_transaction_change AS current
       JOIN (
         SELECT domain, id, MAX(sequence) AS sequence
@@ -202,8 +228,50 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       ) AS latest
         ON latest.sequence = current.sequence
      ORDER BY current.sequence
-  `).all() as Array<{ domain: string; id: string; kind: 'upsert' | 'remove' }>;
-  return rows.map((row) => ({ domain: row.domain, id: row.id, kind: row.kind }));
+  `).all() as Array<{ sequence: bigint; domain: string; id: string; kind: 'upsert' | 'remove' }>;
+  const topology = new Map(DOMAIN_REPOSITORIES.all().map((repository, index) => [repository.schema.key, index]));
+  return rows
+    .map((row) => {
+      if (row.kind === 'remove') return { ...row };
+      const repository = DOMAIN_REPOSITORIES.domain(row.domain);
+      const raw = database.prepare(`SELECT * FROM ${quote(repository.schema.table)} WHERE id = ?`).get(row.id);
+      if (!raw) throw new Error(`Committed upsert projection ${row.domain}/${row.id} is missing.`);
+      const record = repository.codec.decode(raw as Record<string, unknown>);
+      if (row.domain === 'RuntimeDelivery') {
+        const links = database.prepare(`
+          SELECT handled_at
+            FROM runtime_delivery_input_link
+           WHERE delivery_id = ?
+           LIMIT 2
+        `).all(row.id) as Array<{ handled_at: string | null }>;
+        if (links.length > 1) throw new Error(`RuntimeDelivery ${row.id} has multiple input links.`);
+        record.parent_handling_state = deriveCommittedParentHandling(record, links[0] ?? null);
+      }
+      return { ...row, record };
+    })
+    .sort((left, right) => {
+      if (left.kind !== right.kind) return left.kind === 'remove' ? -1 : 1;
+      const leftOrder = topology.get(left.domain);
+      const rightOrder = topology.get(right.domain);
+      if (leftOrder === undefined || rightOrder === undefined) throw new Error('Runtime change references an unknown domain.');
+      const dependencyOrder = left.kind === 'remove' ? rightOrder - leftOrder : leftOrder - rightOrder;
+      if (dependencyOrder !== 0) return dependencyOrder;
+      return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0;
+    })
+    .map(({ sequence: _sequence, ...change }) => change);
+}
+
+function deriveCommittedParentHandling(
+  delivery: DomainRow,
+  inputLink: { handled_at: string | null } | null
+): 'unhandled' | 'handled' | 'not_applicable' {
+  if (delivery.state === 'pending' || delivery.state === 'failed') return 'unhandled';
+  if (delivery.state !== 'consumed') throw new Error(`RuntimeDelivery ${String(delivery.id)} has invalid state.`);
+  if (delivery.phase === 'notify_only' && inputLink === null) return 'not_applicable';
+  if ((delivery.phase === 'current_turn' || delivery.phase === 'next_turn') && inputLink) {
+    return inputLink.handled_at === null ? 'unhandled' : 'handled';
+  }
+  throw new Error(`Consumed RuntimeDelivery ${String(delivery.id)} has an invalid InputLink combination.`);
 }
 
 function executeTransaction(
@@ -537,6 +605,10 @@ function executeSteps(
       executeAssertNone(database, step.domain, step.where);
       continue;
     }
+    if (step.kind === 'assertExactIds') {
+      executeAssertExactIds(database, step.domain, step.where, step.expectedIds);
+      continue;
+    }
     if (step.kind !== 'savepoint') {
       executeMutation(database, step, allocatedSequences);
       continue;
@@ -620,6 +692,30 @@ function executeAssertAll(
   const violating = database.prepare(sql).get(parameters) as { id?: unknown } | undefined;
   if (violating) {
     const error = new Error(`${repository.name} transaction assertAll failed for ${String(violating.id)}.`) as Error & { code: string };
+    error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+    throw error;
+  }
+}
+
+function executeAssertExactIds(
+  database: Database.Database,
+  domain: string,
+  where: DomainRow,
+  expectedIds: readonly string[]
+): void {
+  const repository = DOMAIN_REPOSITORIES.domain(domain);
+  const encoded = repository.codec.encodeWhere(where);
+  const { predicates, parameters } = whereClause(encoded);
+  if (predicates.length === 0) throw new Error(`${repository.name} assertExactIds requires predicates.`);
+  const actualIds = (database.prepare(
+    `SELECT id FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} ORDER BY id ASC`
+  ).all(parameters) as Array<{ id: unknown }>).map((row) => requireRuntimeId(row.id));
+  const expected = [...expectedIds].map(requireRuntimeId).sort();
+  if (
+    actualIds.length !== expected.length
+    || actualIds.some((id, index) => id !== expected[index])
+  ) {
+    const error = new Error(`${repository.name} transaction assertExactIds failed.`) as Error & { code: string };
     error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
     throw error;
   }
@@ -860,7 +956,12 @@ function assertTouchedRuntimeAggregates(
       step.steps.forEach(visit);
       return;
     }
-    if (step.kind === 'assert' || step.kind === 'assertAll' || step.kind === 'assertNone') return;
+    if (
+      step.kind === 'assert'
+      || step.kind === 'assertAll'
+      || step.kind === 'assertNone'
+      || step.kind === 'assertExactIds'
+    ) return;
     if (step.domain === 'ModelRequest') {
       const id = step.kind === 'insert' ? step.row.id : 'id' in step ? step.id : null;
       if (typeof id === 'string') modelRequestIds.add(id);
@@ -994,6 +1095,35 @@ function assertRuntimeStateTransition(
   id: string,
   patch: DomainRow
 ): void {
+  if (domain === 'RuntimeDelivery') {
+    const current = database.prepare('SELECT state FROM runtime_delivery WHERE id = ?').get(id) as {
+      state?: unknown;
+    } | undefined;
+    if (!current || typeof current.state !== 'string') {
+      throw new Error(`RuntimeDeliveryRepository update expected one row: ${id}`);
+    }
+    const nextState = 'state' in patch ? String(patch.state) : current.state;
+    const allowed: Record<string, readonly string[]> = {
+      pending: ['pending', 'consumed', 'failed'],
+      consumed: [],
+      failed: []
+    };
+    if (!allowed[current.state]?.includes(nextState)) {
+      throw new Error(`RuntimeDelivery state cannot transition from ${current.state} to ${nextState}.`);
+    }
+    return;
+  }
+  if (domain === 'RuntimeDeliveryInputLink') {
+    const current = database.prepare('SELECT handled_at FROM runtime_delivery_input_link WHERE id = ?').get(id) as {
+      handled_at?: unknown;
+    } | undefined;
+    if (!current) throw new Error(`RuntimeDeliveryInputLinkRepository update expected one row: ${id}`);
+    const nextHandledAt = 'handled_at' in patch ? patch.handled_at : current.handled_at;
+    if (current.handled_at !== null || typeof nextHandledAt !== 'string' || nextHandledAt.length === 0) {
+      throw new Error('RuntimeDeliveryInputLink.handled_at may only transition once from NULL to a timestamp.');
+    }
+    return;
+  }
   if (domain === 'ModelRequest') {
     const raw = database.prepare('SELECT * FROM model_request WHERE id = ?').get(id);
     if (!raw) throw new Error(`ModelRequestRepository update expected one row: ${id}`);
@@ -1201,20 +1331,7 @@ function attachContextContent(
     const metadata = record.contentObject;
     const id = requireRuntimeId(metadata.id);
     if (unique.has(id)) continue;
-    const sha256 = typeof metadata.sha256 === 'string' && /^[a-f0-9]{64}$/.test(metadata.sha256)
-      ? metadata.sha256
-      : (() => { throw new Error(`ContentObject ${id} has an invalid sha256.`); })();
-    const expectedKey = `sha256/${sha256.slice(0, 2)}/${sha256}`;
-    if (metadata.storage_key !== expectedKey) throw new Error(`ContentObject ${id} storage key does not match sha256.`);
-    const candidate = path.resolve(rootPath, ...expectedKey.split('/'));
-    if (!candidate.startsWith(`${rootPath}${path.sep}`)) throw new Error('CAS storage key escapes its active root.');
-    const bytes = fs.readFileSync(candidate);
-    if (typeof metadata.byte_length !== 'bigint' || BigInt(bytes.length) !== metadata.byte_length) {
-      throw new Error(`ContentObject ${id} byte length mismatch.`);
-    }
-    if (createHash('sha256').update(bytes).digest('hex') !== sha256) {
-      throw new Error(`ContentObject ${id} digest mismatch.`);
-    }
+    const bytes = readVerifiedCasBytes(metadata, rootPath);
     totalBytes += bytes.length;
     if (!Number.isSafeInteger(totalBytes)) throw new RangeError('Materialized Context bytes exceed the safe packed-buffer range.');
     unique.set(id, bytes);
@@ -1242,6 +1359,26 @@ function attachContextContent(
   };
 }
 
+function readVerifiedCasBytes(metadata: DomainRow, resolvedCasRootPath: string): Buffer {
+  const id = requireRuntimeId(metadata.id);
+  const sha256 = typeof metadata.sha256 === 'string' && /^[a-f0-9]{64}$/.test(metadata.sha256)
+    ? metadata.sha256
+    : (() => { throw new Error(`ContentObject ${id} has an invalid sha256.`); })();
+  const expectedKey = `sha256/${sha256.slice(0, 2)}/${sha256}`;
+  if (metadata.storage_key !== expectedKey) throw new Error(`ContentObject ${id} storage key does not match sha256.`);
+  if (!path.isAbsolute(resolvedCasRootPath)) throw new Error('CAS root must be resolved before verified reads.');
+  // The path segments are derived only from a validated lowercase SHA-256, so no per-object resolve
+  // or traversal check is needed on this 1000-record materialization hot path.
+  const candidate = path.join(resolvedCasRootPath, 'sha256', sha256.slice(0, 2), sha256);
+  const bytes = fs.readFileSync(candidate);
+  if (typeof metadata.byte_length !== 'bigint' || BigInt(bytes.length) !== metadata.byte_length) {
+    throw new Error(`ContentObject ${id} byte length mismatch.`);
+  }
+  if (createHash('sha256').update(bytes).digest('hex') !== sha256) {
+    throw new Error(`ContentObject ${id} digest mismatch.`);
+  }
+  return bytes;
+}
 
 function readContextChain(
   database: Database.Database,
@@ -1392,6 +1529,414 @@ function nonNegativeSafeInteger(value: unknown, label: string): number {
     throw new TypeError(`${label} must be a non-negative safe SQLite INTEGER.`);
   }
   return Number(value);
+}
+
+function executeClientProjectionSnapshot(
+  database: Database.Database,
+  activeConversationId: string | null,
+  commitSeq: bigint
+): SnapshotBarrier<ClientProjectionSnapshot> {
+  const conversationId = activeConversationId === null ? null : requireRuntimeId(activeConversationId);
+  database.exec('BEGIN');
+  try {
+    const conversations = queryPlainRows(database, `
+      SELECT id, title, status, created_at, updated_at
+        FROM conversation
+       ORDER BY updated_at DESC, id DESC
+       LIMIT @limit
+    `, { limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) });
+    const emptyWindow = {
+      conversationId,
+      messages: [],
+      conversationReuseLinks: [],
+      conversationBranchLinks: [],
+      conversationOriginLinks: [],
+      taskList: []
+    };
+    const emptyTurns = {
+      turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [], modelRequests: []
+    };
+    const emptyTools = {
+      toolCalls: [], toolExecutions: [], toolOutcomes: [], interactionRequests: [],
+      interactionOwnerLinks: [], interactionResponses: [], processes: [], processReceipts: []
+    };
+    const emptySubagents = {
+      childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
+      childExecutionActiveTurnLinks: [], answerBridges: [], answerSubmissions: [],
+      runtimeInboxItems: [], runtimeDeliveries: []
+    };
+    if (conversationId === null) {
+      database.exec('COMMIT');
+      return {
+        snapshotCommitSeq: commitSeq.toString(),
+        snapshot: {
+          navigationSummary: { conversations },
+          activeConversationWindow: emptyWindow,
+          activeTurnSummary: emptyTurns,
+          activeToolAndInteractionSummary: emptyTools,
+          subagentDeliverySummary: emptySubagents
+        }
+      };
+    }
+
+    const params = { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) };
+    const messageRows = queryPlainRows(database, `
+      SELECT m.id,
+             membership.conversation_id,
+             membership.message_seq,
+             m.created_at,
+             m.updated_at,
+             m.deleted_at,
+             revision.id AS revision_id,
+             revision.revision_seq,
+             revision.role,
+             revision.content_object_id,
+             content.content_type,
+             content.byte_length
+        FROM message_part_of_conversation AS membership
+        JOIN message AS m ON m.id = membership.message_id
+        JOIN message_current_revision_link AS current_revision ON current_revision.message_id = m.id
+        JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+        JOIN content_object AS content ON content.id = revision.content_object_id
+       WHERE membership.conversation_id = @conversationId
+       ORDER BY membership.message_seq DESC, m.id DESC
+       LIMIT @messageLimit
+    `, { conversationId, messageLimit: BigInt(CLIENT_MESSAGE_WINDOW_LIMIT) }).reverse();
+    const reuseLinks = queryPlainRows(database, `
+      SELECT * FROM conversation_reuse_link
+       WHERE conversation_id = @conversationId
+       ORDER BY created_at DESC, id DESC LIMIT @limit
+    `, params);
+    const branchLinks = queryPlainRows(database, `
+      SELECT * FROM conversation_branch_link
+       WHERE target_conversation_id = @conversationId OR source_conversation_id = @conversationId
+       ORDER BY created_at DESC, id DESC LIMIT @limit
+    `, params);
+    const originLinks = queryPlainRows(database, `
+      SELECT * FROM conversation_origin_link
+       WHERE conversation_id = @conversationId OR source_conversation_id = @conversationId
+       ORDER BY created_at DESC, id DESC LIMIT @limit
+    `, params);
+    const turns = queryPlainRows(database, `
+      SELECT * FROM turn
+       WHERE conversation_id = @conversationId
+       ORDER BY created_at DESC, id DESC LIMIT @limit
+    `, params);
+    const turnIds = turns.map((row) => String(row.id));
+    const leases = queryByIds(database, 'execution_lease', 'turn_id', turnIds);
+    const terminations = queryByIds(database, 'turn_termination', 'turn_id', turnIds);
+    const executorLinks = queryByIds(database, 'turn_executor_link', 'turn_id', turnIds);
+    const modelRequests = queryByIds(database, 'model_request', 'turn_id', turnIds);
+    const toolCalls = queryByIds(database, 'tool_call', 'turn_id', turnIds);
+    const toolCallIds = toolCalls.map((row) => String(row.id));
+    const toolExecutions = queryByIds(database, 'tool_execution', 'tool_call_id', toolCallIds);
+    const toolOutcomes = queryByIds(database, 'tool_outcome', 'tool_call_id', toolCallIds);
+    const taskList = toolCalls
+      .filter((row) => row.tool_name === 'update_task_list')
+      .map((row) => {
+        const outcome = toolOutcomes.find((candidate) => candidate.tool_call_id === row.id) ?? null;
+        return {
+          tool_call_id: row.id,
+          turn_id: row.turn_id,
+          call_seq: row.call_seq,
+          state: row.status,
+          outcome: outcome?.status ?? null,
+          ...taskListProjectionFromOutcome(database, outcome, String(row.id))
+        };
+      });
+    const interactionOwnerLinks = queryByIds(database, 'interaction_owner_link', 'turn_id', turnIds);
+    const interactionRequestIds = interactionOwnerLinks.map((row) => String(row.request_id));
+    const interactionRequests = queryByIds(database, 'interaction_request', 'id', interactionRequestIds);
+    const interactionResponses = queryByIds(database, 'interaction_response', 'request_id', interactionRequestIds);
+    const processRows = queryPlainRows(database, `
+      SELECT process.*
+        FROM process
+        JOIN process_origin_link AS origin ON origin.process_id = process.id
+        JOIN tool_call ON tool_call.id = origin.tool_call_id
+        JOIN turn ON turn.id = tool_call.turn_id
+       WHERE turn.conversation_id = @conversationId
+       ORDER BY process.started_at DESC, process.id DESC LIMIT @limit
+    `, params);
+    const processReceipts = queryByIds(database, 'process_receipt', 'process_id', processRows.map((row) => String(row.id)));
+
+    const childExecutions = queryPlainRows(database, `
+      SELECT DISTINCT child.*
+        FROM child_execution AS child
+        JOIN child_execution_parent_link AS parent_link
+          ON parent_link.child_execution_id = child.id
+        LEFT JOIN tool_call AS source_call ON source_call.id = parent_link.source_tool_call_id
+        LEFT JOIN turn AS source_turn ON source_turn.id = source_call.turn_id
+       WHERE child.child_conversation_id = @conversationId
+          OR source_turn.conversation_id = @conversationId
+       ORDER BY child.created_at DESC, child.id DESC LIMIT @limit
+    `, params);
+    const childIds = childExecutions.map((row) => String(row.id));
+    const childParentLinks = queryByIds(database, 'child_execution_parent_link', 'child_execution_id', childIds);
+    const childTurnLinks = queryByIds(database, 'child_execution_turn_link', 'child_execution_id', childIds);
+    const childActiveLinks = queryByIds(database, 'child_execution_active_turn_link', 'child_execution_id', childIds);
+    const answerBridges = queryByIds(database, 'answer_bridge', 'child_execution_id', childIds);
+    const bridgeIds = answerBridges.map((row) => String(row.id));
+    const answerSubmissions = queryByIds(database, 'answer_submission', 'answer_bridge_id', bridgeIds);
+    const deliveries = queryPlainRows(database, `
+      SELECT * FROM runtime_delivery
+       WHERE target_conversation_id = @conversationId
+       ORDER BY created_at DESC, id DESC LIMIT @limit
+    `, params);
+    const deliveryIds = deliveries.map((row) => String(row.id));
+    const deliveryInputLinks = queryByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
+    const projectedDeliveries = deliveries.map((delivery) => {
+      const matching = deliveryInputLinks.filter((link) => link.delivery_id === delivery.id);
+      if (matching.length > 1) throw new Error(`RuntimeDelivery ${String(delivery.id)} has multiple input links.`);
+      return {
+        ...delivery,
+        parent_handling_state: deriveCommittedParentHandling(
+          delivery,
+          matching[0] ? { handled_at: matching[0].handled_at as string | null } : null
+        )
+      };
+    });
+    const inboxIds = deliveries.map((row) => String(row.inbox_item_id));
+    const inboxItems = queryByIds(database, 'runtime_inbox_item', 'id', inboxIds);
+
+    const snapshot: ClientProjectionSnapshot = {
+      navigationSummary: { conversations },
+      activeConversationWindow: {
+        conversationId,
+        messages: messageRows,
+        conversationReuseLinks: reuseLinks,
+        conversationBranchLinks: branchLinks,
+        conversationOriginLinks: originLinks,
+        taskList
+      },
+      activeTurnSummary: {
+        turns,
+        executionLeases: leases,
+        turnTerminations: terminations,
+        turnExecutorLinks: executorLinks,
+        modelRequests
+      },
+      activeToolAndInteractionSummary: {
+        toolCalls,
+        toolExecutions,
+        toolOutcomes,
+        interactionRequests,
+        interactionOwnerLinks,
+        interactionResponses,
+        processes: processRows,
+        processReceipts
+      },
+      subagentDeliverySummary: {
+        childExecutions,
+        childExecutionParentLinks: childParentLinks,
+        childExecutionTurnLinks: childTurnLinks,
+        childExecutionActiveTurnLinks: childActiveLinks,
+        answerBridges,
+        answerSubmissions,
+        runtimeInboxItems: inboxItems,
+        runtimeDeliveries: projectedDeliveries
+      }
+    };
+    database.exec('COMMIT');
+    return { snapshotCommitSeq: commitSeq.toString(), snapshot };
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function taskListProjectionFromOutcome(
+  database: Database.Database,
+  outcome: Record<string, unknown> | null,
+  toolCallId: string
+): { items: unknown[] | null; detail_on_demand: boolean } {
+  if (!outcome || outcome.content_object_id === null) return { items: null, detail_on_demand: false };
+  const contentObjectId = requireRuntimeId(outcome.content_object_id);
+  const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
+  if (!raw) throw new Error(`Task-list ToolOutcome ${toolCallId} references missing ContentObject ${contentObjectId}.`);
+  const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
+  if (
+    typeof metadata.byte_length !== 'bigint'
+    || metadata.byte_length > BigInt(CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES * 16)
+  ) {
+    return { items: null, detail_on_demand: true };
+  }
+  const bytes = readVerifiedCasBytes(metadata, path.resolve(data.binding.paths.casRootPath));
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.toString('utf8'));
+  } catch (error) {
+    throw new Error(`Task-list ToolOutcome ${toolCallId} content is not JSON: ${String(error)}`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Task-list ToolOutcome ${toolCallId} content is not an object.`);
+  }
+  const record = value as Record<string, unknown>;
+  const detail = record.detail;
+  if (
+    record.toolCallId !== toolCallId
+    || !detail
+    || typeof detail !== 'object'
+    || Array.isArray(detail)
+    || (detail as Record<string, unknown>).kind !== 'task-list'
+    || !Array.isArray((detail as Record<string, unknown>).items)
+  ) {
+    return { items: null, detail_on_demand: true };
+  }
+  return {
+    items: (detail as Record<string, unknown>).items as unknown[],
+    detail_on_demand: false
+  };
+}
+
+function executeClientKeysetPage(
+  database: Database.Database,
+  input: ClientKeysetPageInput
+): ClientKeysetPageResult {
+  if (!Number.isSafeInteger(input.limit) || input.limit <= 0 || input.limit > CLIENT_PAGE_MAX_ROWS) {
+    throw new RangeError(`Client keyset page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
+  }
+  if ((input.afterSortKey === undefined) !== (input.afterId === undefined)) {
+    throw new TypeError('Client keyset cursor requires both afterSortKey and afterId.');
+  }
+  const afterId = input.afterId === undefined ? undefined : requireRuntimeId(input.afterId);
+  database.exec('BEGIN');
+  try {
+    let candidates: Array<Record<string, unknown>>;
+    let sortKey: (row: Record<string, unknown>) => string;
+    if (input.query === 'conversation') {
+      if (input.sortId !== 'created_at+id') throw new TypeError('Conversation keyset sortId must be created_at+id.');
+      const afterSortKey = input.afterSortKey;
+      candidates = queryPlainRows(database, `
+        SELECT id, title, status, created_at, updated_at
+          FROM conversation
+         ${afterSortKey === undefined ? '' : 'WHERE created_at > @afterSortKey OR (created_at = @afterSortKey AND id > @afterId)'}
+         ORDER BY created_at ASC, id ASC
+         LIMIT @limit
+      `, {
+        ...(afterSortKey === undefined ? {} : { afterSortKey, afterId: afterId! }),
+        limit: BigInt(input.limit + 1)
+      });
+      sortKey = (row) => String(row.created_at);
+    } else if (input.query === 'message') {
+      if (input.sortId !== 'message_seq') throw new TypeError('Message keyset sortId must be message_seq.');
+      const conversationId = requireRuntimeId(input.conversationId);
+      const afterSortKey = input.afterSortKey === undefined
+        ? undefined
+        : requireNonNegativeIntegerString(input.afterSortKey, 'afterSortKey');
+      candidates = queryPlainRows(database, `
+        SELECT message.id,
+               membership.conversation_id,
+               membership.message_seq,
+               message.created_at,
+               message.updated_at,
+               message.deleted_at,
+               revision.id AS revision_id,
+               revision.revision_seq,
+               revision.role,
+               revision.content_object_id,
+               content.content_type,
+               content.byte_length
+          FROM message_part_of_conversation AS membership
+          JOIN message ON message.id = membership.message_id
+          JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
+          JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+          JOIN content_object AS content ON content.id = revision.content_object_id
+         WHERE membership.conversation_id = @conversationId
+           ${afterSortKey === undefined ? '' : 'AND (membership.message_seq > @afterSortKey OR (membership.message_seq = @afterSortKey AND message.id > @afterId))'}
+         ORDER BY membership.message_seq ASC, message.id ASC
+         LIMIT @limit
+      `, {
+        conversationId,
+        ...(afterSortKey === undefined ? {} : { afterSortKey: BigInt(afterSortKey), afterId: afterId! }),
+        limit: BigInt(input.limit + 1)
+      });
+      sortKey = (row) => String(row.message_seq);
+    } else {
+      throw new TypeError(`Unsupported client keyset query: ${String(input.query)}.`);
+    }
+
+    let hasMore = candidates.length > input.limit;
+    const boundedCandidates = candidates.slice(0, input.limit);
+    const rows: Array<Record<string, unknown>> = [];
+    for (const candidate of boundedCandidates) {
+      const tentative = [...rows, candidate];
+      const last = tentative[tentative.length - 1];
+      const responseProbe = {
+        rows: tentative,
+        nextSortKey: sortKey(last),
+        nextId: String(last.id),
+        hasMore: true
+      };
+      if (wireJsonBytes(responseProbe) > CLIENT_PAGE_MAX_BYTES) {
+        hasMore = true;
+        break;
+      }
+      rows.push(candidate);
+    }
+    if (rows.length === 0 && boundedCandidates.length > 0) {
+      throw new Error('A single client keyset summary exceeds maxPageBytes.');
+    }
+    const last = rows[rows.length - 1];
+    const result: ClientKeysetPageResult = {
+      rows,
+      ...(last ? { nextSortKey: sortKey(last), nextId: String(last.id) } : {}),
+      hasMore: hasMore || rows.length < boundedCandidates.length,
+      responseBytes: 0
+    };
+    result.responseBytes = wireJsonBytes(result);
+    if (result.responseBytes > CLIENT_PAGE_MAX_BYTES) throw new Error('Client keyset response exceeds maxPageBytes.');
+    database.exec('COMMIT');
+    return result;
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function queryPlainRows(
+  database: Database.Database,
+  sql: string,
+  parameters: Record<string, string | bigint> = {}
+): Array<Record<string, unknown>> {
+  return database.prepare(sql).all(parameters) as Array<Record<string, unknown>>;
+}
+
+function queryByIds(
+  database: Database.Database,
+  table: string,
+  column: string,
+  ids: readonly string[]
+): Array<Record<string, unknown>> {
+  if (!/^[a-z][a-z0-9_]*$/.test(table) || !/^[a-z][a-z0-9_]*$/.test(column)) {
+    throw new Error('Fixed client projection contains an unsafe identifier.');
+  }
+  const unique = [...new Set(ids)].slice(0, CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE);
+  if (unique.length === 0) return [];
+  const parameters: Record<string, string | bigint> = {
+    limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE)
+  };
+  const placeholders = unique.map((id, index) => {
+    parameters[`id${index}`] = id;
+    return `@id${index}`;
+  });
+  return queryPlainRows(database, `
+    SELECT * FROM ${quote(table)}
+     WHERE ${quote(column)} IN (${placeholders.join(',')})
+     ORDER BY id ASC LIMIT @limit
+  `, parameters);
+}
+
+function wireJsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value, (_key, nested) =>
+    typeof nested === 'bigint' ? nested.toString() : nested
+  ), 'utf8');
+}
+
+function requireNonNegativeIntegerString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new TypeError(`${label} must be a decimal integer string.`);
+  }
+  return value;
 }
 
 function executeSnapshot(
