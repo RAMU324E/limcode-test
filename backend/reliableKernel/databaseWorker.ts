@@ -56,6 +56,74 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 
+const CONTEXT_CAS_CACHE_MAX_ENTRIES = 4_096;
+const CONTEXT_CAS_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+
+interface VerifiedContextCasCacheEntry {
+  id: string;
+  sha256: string;
+  byteLength: bigint;
+  storageKey: string;
+  bytes: Buffer;
+}
+
+/**
+ * Context materialization repeatedly reads immutable CAS objects while compiling adjacent model
+ * rounds. Keep only verified bytes in a strict LRU budget so 1000-node histories do not issue 1000
+ * filesystem reads on every round. Entries never cross a worker/RootBinding lifetime, and callers
+ * receive copies in the packed transfer buffer rather than mutable cache Buffers.
+ */
+class VerifiedContextCasCache {
+  private readonly entries = new Map<string, VerifiedContextCasCacheEntry>();
+  private totalBytes = 0;
+  private hits = 0;
+  private misses = 0;
+  private evictions = 0;
+
+  public read(metadata: DomainRow, resolvedCasRootPath: string): Buffer {
+    const identity = contextCasIdentity(metadata);
+    const cached = this.entries.get(identity.id);
+    if (cached) {
+      assertSameContextCasIdentity(cached, identity);
+      this.entries.delete(identity.id);
+      this.entries.set(identity.id, cached);
+      this.hits += 1;
+      return cached.bytes;
+    }
+    this.misses += 1;
+    const bytes = readVerifiedCasBytes(metadata, resolvedCasRootPath);
+    if (bytes.length <= CONTEXT_CAS_CACHE_MAX_BYTES) {
+      while (
+        this.entries.size >= CONTEXT_CAS_CACHE_MAX_ENTRIES
+        || this.totalBytes + bytes.length > CONTEXT_CAS_CACHE_MAX_BYTES
+      ) {
+        const oldestId = this.entries.keys().next().value as string | undefined;
+        if (!oldestId) break;
+        const oldest = this.entries.get(oldestId);
+        this.entries.delete(oldestId);
+        if (oldest) this.totalBytes -= oldest.bytes.length;
+        this.evictions += 1;
+      }
+      const entry: VerifiedContextCasCacheEntry = { ...identity, bytes };
+      this.entries.set(identity.id, entry);
+      this.totalBytes += bytes.length;
+    }
+    return bytes;
+  }
+
+  public inspect(): DatabaseWorkerDiagnostics['contextCasCache'] {
+    return {
+      entries: this.entries.size,
+      bytes: this.totalBytes,
+      maxEntries: CONTEXT_CAS_CACHE_MAX_ENTRIES,
+      maxBytes: CONTEXT_CAS_CACHE_MAX_BYTES,
+      hits: this.hits,
+      misses: this.misses,
+      evictions: this.evictions
+    };
+  }
+}
+
 const port = requireParentPort();
 const data = workerData as DatabaseWorkerData;
 
@@ -88,6 +156,7 @@ async function start(): Promise<void> {
   assertCurrentSchema(reader, data.binding);
   let commitSeq = 0n;
   let closed = false;
+  const contextCasCache = new VerifiedContextCasCache();
 
   post({ type: 'ready', workerThreadId: threadId, mode: data.mode });
   port.on('message', (request: DatabaseWorkerRequest) => {
@@ -122,7 +191,7 @@ async function start(): Promise<void> {
       if (request.kind === 'contextContentMaterialization') {
         assertDatabaseBinding(reader, data.binding);
         const structure = executeContextMaterialization(reader, request.rootId, commitSeq);
-        const attached = attachContextContent(structure, data.binding.paths.casRootPath);
+        const attached = attachContextContent(structure, data.binding.paths.casRootPath, contextCasCache);
         post({ type: 'response', id: request.id, ok: true, result: attached.result }, attached.transferList);
         return;
       }
@@ -173,7 +242,8 @@ async function start(): Promise<void> {
           readerJournalMode: String(reader.pragma('journal_mode', { simple: true })),
           readerForeignKeys: BigInt(reader.pragma('foreign_keys', { simple: true }) as number | bigint),
           readerBusyTimeoutMs: BigInt(reader.pragma('busy_timeout', { simple: true }) as number | bigint),
-          currentCommitSeq: commitSeq.toString()
+          currentCommitSeq: commitSeq.toString(),
+          contextCasCache: contextCasCache.inspect()
         };
         post({ type: 'response', id: request.id, ok: true, result });
         return;
@@ -215,6 +285,39 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       `);
     }
   }
+
+  // Message 是独立事实，conversation membership/current revision 也是独立 Link。Link 改变时
+  // 重新投影 Message 窗口记录；尚未组成完整窗口的 Message 只产生幂等 remove，不阻塞写事务。
+  for (const relation of [
+    { table: 'message_part_of_conversation', messageColumn: 'message_id' },
+    { table: 'message_current_revision_link', messageColumn: 'message_id' }
+  ]) {
+    for (const operation of ['insert', 'update', 'delete'] as const) {
+      const row = operation === 'delete' ? 'OLD' : 'NEW';
+      const kind = operation === 'delete' ? 'remove' : 'upsert';
+      database.exec(`
+        CREATE TEMP TRIGGER ${quote(`capture_message_from_${relation.table}_${operation}`)}
+        AFTER ${operation.toUpperCase()} ON ${quote(relation.table)}
+        BEGIN
+          INSERT INTO runtime_transaction_change (domain, id, kind)
+          VALUES ('Message', ${row}.${quote(relation.messageColumn)}, '${kind}');
+        END
+      `);
+    }
+  }
+
+  // RuntimeDeliveryInputLink 本身不是客户端领域；它改变的是 RuntimeDelivery 的派生
+  // parent_handling_state，因此在同一 commit 中重新投影对应 Delivery。
+  for (const operation of ['insert', 'update'] as const) {
+    database.exec(`
+      CREATE TEMP TRIGGER ${quote(`capture_runtime_delivery_from_input_link_${operation}`)}
+      AFTER ${operation.toUpperCase()} ON runtime_delivery_input_link
+      BEGIN
+        INSERT INTO runtime_transaction_change (domain, id, kind)
+        VALUES ('RuntimeDelivery', NEW.delivery_id, 'upsert');
+      END
+    `);
+  }
 }
 
 function readTransactionChanges(database: Database.Database): RuntimeChange[] {
@@ -236,7 +339,15 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       const repository = DOMAIN_REPOSITORIES.domain(row.domain);
       const raw = database.prepare(`SELECT * FROM ${quote(repository.schema.table)} WHERE id = ?`).get(row.id);
       if (!raw) throw new Error(`Committed upsert projection ${row.domain}/${row.id} is missing.`);
-      const record = repository.codec.decode(raw as Record<string, unknown>);
+      let record = repository.codec.decode(raw as Record<string, unknown>);
+      if (row.domain === 'Message') {
+        const projected = projectMessageWindowRecord(database, row.id);
+        if (!projected) return { ...row, kind: 'remove' as const };
+        record = projected;
+      }
+      if (row.domain === 'AnswerBridge') {
+        record = projectAnswerBridgeRecord(database, row.id);
+      }
       if (row.domain === 'RuntimeDelivery') {
         const links = database.prepare(`
           SELECT handled_at
@@ -259,6 +370,52 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0;
     })
     .map(({ sequence: _sequence, ...change }) => change);
+}
+
+function projectMessageWindowRecord(database: Database.Database, messageId: string): DomainRow | null {
+  const rows = queryPlainRows(database, `
+    SELECT message.id,
+           membership.conversation_id,
+           membership.message_seq,
+           message.created_at,
+           message.updated_at,
+           message.deleted_at,
+           revision.id AS revision_id,
+           revision.revision_seq,
+           revision.role,
+           revision.content_object_id,
+           content.content_type,
+           content.byte_length
+      FROM message
+      JOIN message_part_of_conversation AS membership ON membership.message_id = message.id
+      JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
+      JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+      JOIN content_object AS content ON content.id = revision.content_object_id
+     WHERE message.id = @messageId
+     LIMIT 1
+  `, { messageId });
+  if (rows.length > 1) throw new Error(`Message ${messageId} has multiple client window projections.`);
+  return rows[0] ?? null;
+}
+
+function projectAnswerBridgeRecord(database: Database.Database, answerBridgeId: string): DomainRow {
+  const rows = queryPlainRows(database, `
+    SELECT bridge.*,
+           submission.submission_seq AS current_submission_seq,
+           submission.turn_id AS current_turn_id,
+           submission.interrupted AS current_submission_interrupted,
+           submission.created_at AS current_submission_created_at,
+           payload.id AS current_payload_id,
+           payload.title AS current_title,
+           payload.byte_length AS current_byte_length
+      FROM answer_bridge AS bridge
+      LEFT JOIN answer_submission AS submission ON submission.id = bridge.current_submission_id
+      LEFT JOIN answer_payload AS payload ON payload.submission_id = submission.id
+     WHERE bridge.id = @answerBridgeId
+     LIMIT 1
+  `, { answerBridgeId });
+  if (rows.length !== 1) throw new Error(`AnswerBridge ${answerBridgeId} does not exist.`);
+  return rows[0];
 }
 
 function deriveCommittedParentHandling(
@@ -1319,7 +1476,8 @@ function executeContextMaterialization(
 
 function attachContextContent(
   barrier: SnapshotBarrier<ContextMaterializationSnapshot>,
-  casRootPath: string
+  casRootPath: string,
+  cache: VerifiedContextCasCache
 ): {
   result: SnapshotBarrier<ContextContentMaterializationSnapshot>;
   transferList: ArrayBuffer[];
@@ -1331,7 +1489,7 @@ function attachContextContent(
     const metadata = record.contentObject;
     const id = requireRuntimeId(metadata.id);
     if (unique.has(id)) continue;
-    const bytes = readVerifiedCasBytes(metadata, rootPath);
+    const bytes = cache.read(metadata, rootPath);
     totalBytes += bytes.length;
     if (!Number.isSafeInteger(totalBytes)) throw new RangeError('Materialized Context bytes exceed the safe packed-buffer range.');
     unique.set(id, bytes);
@@ -1357,6 +1515,32 @@ function attachContextContent(
     },
     transferList: packed.byteLength > 0 ? [packed.buffer] : []
   };
+}
+
+function contextCasIdentity(metadata: DomainRow): Omit<VerifiedContextCasCacheEntry, 'bytes'> {
+  const id = requireRuntimeId(metadata.id);
+  const sha256 = typeof metadata.sha256 === 'string' && /^[a-f0-9]{64}$/.test(metadata.sha256)
+    ? metadata.sha256
+    : (() => { throw new Error(`ContentObject ${id} has an invalid sha256.`); })();
+  const byteLength = typeof metadata.byte_length === 'bigint' && metadata.byte_length >= 0n
+    ? metadata.byte_length
+    : (() => { throw new Error(`ContentObject ${id} has an invalid byte length.`); })();
+  const storageKey = `sha256/${sha256.slice(0, 2)}/${sha256}`;
+  if (metadata.storage_key !== storageKey) throw new Error(`ContentObject ${id} storage key does not match sha256.`);
+  return { id, sha256, byteLength, storageKey };
+}
+
+function assertSameContextCasIdentity(
+  cached: VerifiedContextCasCacheEntry,
+  current: Omit<VerifiedContextCasCacheEntry, 'bytes'>
+): void {
+  if (
+    cached.sha256 !== current.sha256
+    || cached.byteLength !== current.byteLength
+    || cached.storageKey !== current.storageKey
+  ) {
+    throw new Error(`ContentObject ${current.id} metadata changed during one Runtime worker lifetime.`);
+  }
 }
 
 function readVerifiedCasBytes(metadata: DomainRow, resolvedCasRootPath: string): Buffer {
@@ -1551,18 +1735,24 @@ function executeClientProjectionSnapshot(
       conversationReuseLinks: [],
       conversationBranchLinks: [],
       conversationOriginLinks: [],
+      agentConversationLinks: [],
       taskList: []
     };
     const emptyTurns = {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [], modelRequests: []
     };
     const emptyTools = {
-      toolCalls: [], toolExecutions: [], toolOutcomes: [], interactionRequests: [],
-      interactionOwnerLinks: [], interactionResponses: [], processes: [], processReceipts: []
+      messageTurnLinks: [],
+      toolCalls: [], toolCallEvents: [], toolExecutions: [], toolOutcomes: [], toolModelResults: [],
+      toolResultArtifacts: [], interactionRequests: [], interactionOwnerLinks: [], interactionResponses: [],
+      fileChangeSets: [], fileChangeSetMembers: [], fileChangeDecisions: [], fileMutationReceipts: [],
+      fileMutationReceiptMembers: [], processes: [], processOriginLinks: [], processOutputChunks: [],
+      processReceipts: []
     };
     const emptySubagents = {
       childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
-      childExecutionActiveTurnLinks: [], answerBridges: [], answerSubmissions: [],
+      childExecutionActiveTurnLinks: [], childTurns: [], childTurnTerminations: [], childTurnExecutorLinks: [],
+      answerBridges: [], answerSubmissions: [],
       runtimeInboxItems: [], runtimeDeliveries: []
     };
     if (conversationId === null) {
@@ -1617,6 +1807,11 @@ function executeClientProjectionSnapshot(
        WHERE conversation_id = @conversationId OR source_conversation_id = @conversationId
        ORDER BY created_at DESC, id DESC LIMIT @limit
     `, params);
+    const agentConversationLinks = queryPlainRows(database, `
+      SELECT * FROM agent_conversation_link
+       WHERE conversation_id = @conversationId
+       ORDER BY updated_at DESC, id DESC LIMIT @limit
+    `, params);
     const turns = queryPlainRows(database, `
       SELECT * FROM turn
        WHERE conversation_id = @conversationId
@@ -1627,10 +1822,30 @@ function executeClientProjectionSnapshot(
     const terminations = queryByIds(database, 'turn_termination', 'turn_id', turnIds);
     const executorLinks = queryByIds(database, 'turn_executor_link', 'turn_id', turnIds);
     const modelRequests = queryByIds(database, 'model_request', 'turn_id', turnIds);
+    const messageTurnLinks = queryByIds(
+      database,
+      'message_turn_link',
+      'message_id',
+      messageRows.map((row) => String(row.id))
+    );
     const toolCalls = queryByIds(database, 'tool_call', 'turn_id', turnIds);
     const toolCallIds = toolCalls.map((row) => String(row.id));
+    const toolCallEvents = queryByIds(database, 'tool_call_event', 'tool_call_id', toolCallIds);
     const toolExecutions = queryByIds(database, 'tool_execution', 'tool_call_id', toolCallIds);
     const toolOutcomes = queryByIds(database, 'tool_outcome', 'tool_call_id', toolCallIds);
+    const toolModelResults = queryByIds(database, 'tool_model_result', 'tool_call_id', toolCallIds);
+    const toolResultArtifacts = queryByIds(database, 'tool_result_artifact', 'tool_call_id', toolCallIds);
+    const fileChangeSets = queryByIds(database, 'file_change_set', 'tool_call_id', toolCallIds);
+    const fileChangeSetIds = fileChangeSets.map((row) => String(row.id));
+    const fileChangeSetMembers = queryByIds(database, 'file_change_set_member', 'change_set_id', fileChangeSetIds);
+    const fileChangeDecisions = queryByIds(database, 'file_change_decision', 'change_set_id', fileChangeSetIds);
+    const fileMutationReceipts = queryByIds(database, 'file_mutation_receipt', 'change_set_id', fileChangeSetIds);
+    const fileMutationReceiptMembers = queryByIds(
+      database,
+      'file_mutation_receipt_member',
+      'receipt_id',
+      fileMutationReceipts.map((row) => String(row.id))
+    );
     const taskList = toolCalls
       .filter((row) => row.tool_name === 'update_task_list')
       .map((row) => {
@@ -1647,6 +1862,7 @@ function executeClientProjectionSnapshot(
     const interactionOwnerLinks = queryByIds(database, 'interaction_owner_link', 'turn_id', turnIds);
     const interactionRequestIds = interactionOwnerLinks.map((row) => String(row.request_id));
     const interactionRequests = queryByIds(database, 'interaction_request', 'id', interactionRequestIds);
+    const interactionToolCallLinks = queryByIds(database, 'interaction_tool_call_link', 'request_id', interactionRequestIds);
     const interactionResponses = queryByIds(database, 'interaction_response', 'request_id', interactionRequestIds);
     const processRows = queryPlainRows(database, `
       SELECT process.*
@@ -1657,7 +1873,10 @@ function executeClientProjectionSnapshot(
        WHERE turn.conversation_id = @conversationId
        ORDER BY process.started_at DESC, process.id DESC LIMIT @limit
     `, params);
-    const processReceipts = queryByIds(database, 'process_receipt', 'process_id', processRows.map((row) => String(row.id)));
+    const processIds = processRows.map((row) => String(row.id));
+    const processOriginLinks = queryByIds(database, 'process_origin_link', 'process_id', processIds);
+    const processOutputChunks = queryByIds(database, 'process_output_chunk', 'process_id', processIds);
+    const processReceipts = queryByIds(database, 'process_receipt', 'process_id', processIds);
 
     const childExecutions = queryPlainRows(database, `
       SELECT DISTINCT child.*
@@ -1674,7 +1893,12 @@ function executeClientProjectionSnapshot(
     const childParentLinks = queryByIds(database, 'child_execution_parent_link', 'child_execution_id', childIds);
     const childTurnLinks = queryByIds(database, 'child_execution_turn_link', 'child_execution_id', childIds);
     const childActiveLinks = queryByIds(database, 'child_execution_active_turn_link', 'child_execution_id', childIds);
-    const answerBridges = queryByIds(database, 'answer_bridge', 'child_execution_id', childIds);
+    const childTurnIds = childTurnLinks.map((row) => String(row.turn_id));
+    const childTurns = queryByIds(database, 'turn', 'id', childTurnIds);
+    const childTurnTerminations = queryByIds(database, 'turn_termination', 'turn_id', childTurnIds);
+    const childTurnExecutorLinks = queryByIds(database, 'turn_executor_link', 'turn_id', childTurnIds);
+    const answerBridges = queryByIds(database, 'answer_bridge', 'child_execution_id', childIds)
+      .map((bridge) => projectAnswerBridgeRecord(database, String(bridge.id)));
     const bridgeIds = answerBridges.map((row) => String(row.id));
     const answerSubmissions = queryByIds(database, 'answer_submission', 'answer_bridge_id', bridgeIds);
     const deliveries = queryPlainRows(database, `
@@ -1706,6 +1930,7 @@ function executeClientProjectionSnapshot(
         conversationReuseLinks: reuseLinks,
         conversationBranchLinks: branchLinks,
         conversationOriginLinks: originLinks,
+        agentConversationLinks,
         taskList
       },
       activeTurnSummary: {
@@ -1716,13 +1941,25 @@ function executeClientProjectionSnapshot(
         modelRequests
       },
       activeToolAndInteractionSummary: {
+        messageTurnLinks,
         toolCalls,
+        toolCallEvents,
         toolExecutions,
         toolOutcomes,
+        toolModelResults,
+        toolResultArtifacts,
         interactionRequests,
         interactionOwnerLinks,
+        interactionToolCallLinks,
         interactionResponses,
+        fileChangeSets,
+        fileChangeSetMembers,
+        fileChangeDecisions,
+        fileMutationReceipts,
+        fileMutationReceiptMembers,
         processes: processRows,
+        processOriginLinks,
+        processOutputChunks,
         processReceipts
       },
       subagentDeliverySummary: {
@@ -1730,6 +1967,9 @@ function executeClientProjectionSnapshot(
         childExecutionParentLinks: childParentLinks,
         childExecutionTurnLinks: childTurnLinks,
         childExecutionActiveTurnLinks: childActiveLinks,
+        childTurns,
+        childTurnTerminations,
+        childTurnExecutorLinks,
         answerBridges,
         answerSubmissions,
         runtimeInboxItems: inboxItems,

@@ -21,6 +21,11 @@
   ],
   "main": "./dist/extension/vscode/extension.js",
   "activationEvents": [
+    "onCommand:limcode-test.openPanel",
+    "onCommand:limcode-test.revealGlobalStorage",
+    "onCommand:limcode-test.inspectReliability",
+    "onCommand:limcode-test.resetDevelopmentData",
+    "onView:limcode-test-entry-view",
     "onWebviewPanel:limcode-test.mainPanel"
   ],
   "contributes": {
@@ -81,7 +86,9 @@
   },
   "scripts": {
     "clean:extension": "node -e \"require('fs').rmSync('dist/extension',{recursive:true,force:true})\"",
-    "compile": "npm run clean:extension && tsc -p tsconfig.json && node scripts/reliable-kernel/write-compile-provenance.mjs",
+    "generate:cutover-manifest": "node scripts/reliable-kernel/generate-physical-cutover-manifest.mjs",
+    "check:cutover-manifest": "node scripts/reliable-kernel/generate-physical-cutover-manifest.mjs --check",
+    "compile": "npm run check:cutover-manifest && npm run clean:extension && tsc -p tsconfig.json && node scripts/reliable-kernel/write-compile-provenance.mjs",
     "watch": "tsc -watch -p tsconfig.json",
     "build:webview": "vite build",
     "dev:webview": "vite --host 127.0.0.1 --port 31820 --strictPort",
@@ -104,7 +111,7 @@
     "smoke:sqlite:host": "node scripts/reliable-kernel/sqlite-extension-host-smoke.mjs",
     "rebuild:sqlite:electron": "node scripts/reliable-kernel/rebuild-sqlite-electron.mjs",
     "check:local": "npm run check:plan && node scripts/reliable-kernel/run-local-tests.mjs",
-    "vscode:prepublish": "npm run build",
+    "vscode:prepublish": "npm run build && node scripts/reliable-kernel/prune-package-dist.mjs",
     "package:local": "vsce package --allow-missing-repository"
   },
   "devDependencies": {
@@ -133,6 +140,7 @@
     "tokenx": "^1.3.0",
     "undici": "^6.26.0",
     "unified-llm-provider": "0.1.29",
-    "ws": "8.21.1"
+    "ws": "8.21.1",
+    "zod": "4.4.3"
   }
 }

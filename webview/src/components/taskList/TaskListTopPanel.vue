@@ -1,48 +1,26 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { IconChevronRight, IconListNumbers } from '@tabler/icons-vue';
-import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import TaskListDisplay from './TaskListDisplay.vue';
 import {
-  applyTaskListOperationsAfterMessageSeq,
   buildTaskListTimeline,
   emptyTaskListSnapshot,
   formatTaskListProgress,
   type TaskListSnapshotView
 } from './taskListModel';
-import type { TimelineProjectionContextRecord } from '@shared/timelineProjection';
 
-const clientState = useClientStateStore();
-const conversationTimeline = useConversationTimelineStore();
+const reliableConversation = useReliableConversation();
 const expanded = ref(false);
 const listScroller = ref<HTMLElement | null>(null);
 
 const timeline = computed(() => buildTaskListTimeline({
-  messages: conversationTimeline.currentTimeline.state.messages,
-  toolCalls: conversationTimeline.currentTimeline.state.toolCalls,
-  conversationId: clientState.currentConversationId
+  messages: reliableConversation.projection.value.messages,
+  toolCalls: reliableConversation.projection.value.toolCalls,
+  conversationId: reliableConversation.conversationId.value
 }));
-const snapshot = computed<TaskListSnapshotView>(() => {
-  const projection = conversationTimeline.currentTaskListProjection as TimelineProjectionContextRecord<TaskListSnapshotView> | undefined;
-  if (!projection?.latestSnapshot) return timeline.value.snapshot ?? emptyTaskListSnapshot();
-
-  if (conversationTimeline.currentTimeline.hasStreamSnapshot) {
-    const liveTimeline = timeline.value;
-    if (liveTimeline.entries.length > 0 || projection.latestSnapshot.stats.total === 0) {
-      return liveTimeline.snapshot ?? emptyTaskListSnapshot();
-    }
-  }
-
-  return applyTaskListOperationsAfterMessageSeq({
-    snapshot: projection.latestSnapshot,
-    messages: conversationTimeline.currentTimeline.state.messages,
-    toolCalls: conversationTimeline.currentTimeline.state.toolCalls,
-    conversationId: clientState.currentConversationId,
-    minSeqExclusive: projection.latestChunkEndSeq
-  });
-});
+const snapshot = computed<TaskListSnapshotView>(() => timeline.value.snapshot ?? emptyTaskListSnapshot());
 const visible = computed(() => snapshot.value.items.length > 0);
 const progressLabel = computed(() => formatTaskListProgress(snapshot.value));
 const activeLabel = computed(() => {
@@ -55,7 +33,7 @@ const statsLabel = computed(() => {
 });
 const refreshKey = computed(() => snapshot.value.items.map((item) => `${item.key}:${item.status}:${item.updatedOrder}`).join('|'));
 
-watch(() => clientState.currentConversationId, () => {
+watch(reliableConversation.conversationId, () => {
   expanded.value = false;
 });
 

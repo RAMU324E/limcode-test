@@ -179,15 +179,16 @@ async function checkSchemaRepositories() {
     indexes: entry.indexes
   }));
   assert.deepEqual(projected, expected);
-  assert.equal(kernel.DOMAIN_REPOSITORIES.all().length, 69);
-  assert.equal(new Set(kernel.DOMAIN_REPOSITORIES.all().map((entry) => entry.name)).size, 69);
-  assert.equal(new Set(kernel.DOMAIN_REPOSITORIES.all().map((entry) => entry.codec.name)).size, 69);
+  const domainCount = expected.length;
+  assert.equal(kernel.DOMAIN_REPOSITORIES.all().length, domainCount);
+  assert.equal(new Set(kernel.DOMAIN_REPOSITORIES.all().map((entry) => entry.name)).size, domainCount);
+  assert.equal(new Set(kernel.DOMAIN_REPOSITORIES.all().map((entry) => entry.codec.name)).size, domainCount);
 
   return withRuntime('schema', async ({ authority, binding, database }) => {
     const inspection = await database.inspect();
-    assert.equal(inspection.tables.length, 71);
+    assert.equal(inspection.tables.length, domainCount + 2);
     assert.deepEqual(inspection.triggers, ['delete_interaction_request_with_turn']);
-    assert.equal(inspection.manifestDomainCount, 69);
+    assert.equal(inspection.manifestDomainCount, domainCount);
     assert.equal(inspection.indexes.length, expected.reduce((count, entry) => count + entry.indexes.length, 0));
     assert.equal(inspection.foreignKeys, 1n);
     assert.equal(inspection.foreignKeyViolationCount, 0);
@@ -272,7 +273,7 @@ async function checkSchemaRepositories() {
       'Operation:upsert:operation-schema',
       'Conversation:remove:conv-schema'
     ]) assert.ok(changed.has(expectedChange), `缺少隐式SQLite变化：${expectedChange}`);
-    return '69域/71表 exact set、独立Repository/Codec、FK/级联删除及其changes、普通与NULL部分UNIQUE索引均真实生效';
+    return `${domainCount}域/${domainCount + 2}表 exact set、独立Repository/Codec、FK/级联删除及其changes、普通与NULL部分UNIQUE索引均真实生效`;
   });
 }
 
@@ -424,7 +425,7 @@ async function checkEmptyRootCurrentEpoch() {
       await fs.stat(required);
     }
     database = await kernel.RuntimeDatabase.open(authority);
-    assert.equal((await database.inspect()).manifestDomainCount, 69);
+    assert.equal((await database.inspect()).manifestDomainCount, kernel.RUNTIME_DOMAIN_SCHEMAS.length);
     await database.close();
     database = undefined;
     await fs.rm(binding.paths.runtimeEpochPath);

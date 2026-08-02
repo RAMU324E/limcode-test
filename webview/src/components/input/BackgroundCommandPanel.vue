@@ -1,70 +1,9 @@
-<script lang="ts">
-import { ref as moduleRef } from 'vue';
-
-const VIEWED_TERMINAL_OUTPUTS_STORAGE_KEY = 'limcode.backgroundProcess.viewedTerminalOutputs';
-const MAX_VIEWED_TERMINAL_OUTPUTS = 800;
-const viewedTerminalOutputs = moduleRef<Record<string, true>>(loadViewedTerminalOutputs());
-
-function loadViewedTerminalOutputs(): Record<string, true> {
-  if (typeof window === 'undefined') return {};
-  try {
-    const raw = window.localStorage.getItem(VIEWED_TERMINAL_OUTPUTS_STORAGE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return {};
-    const result: Record<string, true> = {};
-    for (const item of parsed) {
-      const processId = typeof item === 'string' ? item.trim() : '';
-      if (processId) result[processId] = true;
-    }
-    return pruneViewedTerminalOutputs(result);
-  } catch {
-    return {};
-  }
-}
-
-function markViewedTerminalOutputs(processIds: readonly string[]): void {
-  const next: Record<string, true> = { ...viewedTerminalOutputs.value };
-  let changed = false;
-  for (const rawProcessId of processIds) {
-    const processId = rawProcessId.trim();
-    if (!processId || next[processId]) continue;
-    next[processId] = true;
-    changed = true;
-  }
-  if (!changed) return;
-  viewedTerminalOutputs.value = pruneViewedTerminalOutputs(next);
-  persistViewedTerminalOutputs(viewedTerminalOutputs.value);
-}
-
-function persistViewedTerminalOutputs(value: Record<string, true>): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(VIEWED_TERMINAL_OUTPUTS_STORAGE_KEY, JSON.stringify(Object.keys(value).sort().slice(-MAX_VIEWED_TERMINAL_OUTPUTS)));
-  } catch {
-    // 忽略持久化失败，内存态仍然生效。
-  }
-}
-
-function pruneViewedTerminalOutputs(value: Record<string, true>): Record<string, true> {
-  const processIds = Object.keys(value).sort().slice(-MAX_VIEWED_TERMINAL_OUTPUTS);
-  return Object.fromEntries(processIds.map((processId) => [processId, true as const]));
-}
-</script>
-
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconTerminal2, IconX } from '@tabler/icons-vue';
-import {
-  BridgeMessageType,
-  type BackgroundProcessOutputResultPayload,
-  type BackgroundProcessRecord
-} from '@shared/protocol';
-import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
-import { bridge } from '@webview/transport';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { reliableKernelDetailKey } from '@webview/stores/useReliableKernelClientFeedStore';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
-import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import {
   parseShellCallArgs,
   type ShellArgs
@@ -76,7 +15,7 @@ interface CommandEntry {
   command: string;
   cwd?: string;
   foregroundWaitMs?: number;
-  mode?: string;
+  mode: string;
   accessLabel: string;
   status: string;
   statusLabel: string;
@@ -87,61 +26,32 @@ interface CommandEntry {
   droppedChars?: number;
   exitCode?: number;
   killed?: boolean;
-  running?: boolean;
+  running: boolean;
   outputAvailable: boolean;
   callCount: number;
   startedAt: number;
   updatedAt: number;
 }
 
-interface CommandDraft {
-  processId: string;
-  shell: string;
-  command: string;
-  cwd?: string;
-  foregroundWaitMs?: number;
-  mode?: string;
-  accessLabel: string;
-  status: string;
-  stdout: string;
-  stderr: string;
-  progress: string;
-  droppedChars?: number;
-  exitCode?: number;
-  killed?: boolean;
-  running?: boolean;
-  outputAvailable: boolean;
-  callCount: number;
-  startedAt: number;
-  updatedAt: number;
-  latestOutputAt: number;
-}
+type ReliableRecord = Record<string, unknown>;
 
-const clientState = useClientStateStore();
-const conversationTimeline = useConversationTimelineStore();
+const reliableConversation = useReliableConversation();
 const open = ref(false);
-const selectedProcessId = ref<string | undefined>();
+const selectedProcessId = ref<string>();
 const rootRef = ref<HTMLElement | null>(null);
 const listScroller = ref<HTMLElement | null>(null);
 const detailScroller = ref<HTMLElement | null>(null);
-const runtimeOutputs = ref<Record<string, BackgroundProcessOutputResultPayload>>({});
-const consumeConfirmOpen = ref(false);
-const consumeConfirmActions: ConfirmPanelAction[] = [
-  { key: 'cancel', label: '取消', variant: 'secondary' },
-  { key: 'confirm', label: '清理日志', variant: 'danger' }
-];
-const pendingOutputRequests = new Set<string>();
-let pollTimer: number | undefined;
-let stopOutputListener: (() => void) | undefined;
 
-const entries = computed<CommandEntry[]>(() => buildCommandEntries());
+const entries = computed<CommandEntry[]>(buildCommandEntries);
 const runningCount = computed(() => entries.value.filter((entry) => entry.statusTone === 'running').length);
 const selectedEntry = computed(() => entries.value.find((entry) => entry.processId === selectedProcessId.value) ?? entries.value[0]);
 const panelSummary = computed(() => {
   if (entries.value.length === 0) return '暂无后台命令';
-  return runningCount.value > 0 ? `${runningCount.value} 个运行中 / ${entries.value.length} 个后台命令` : `${entries.value.length} 个后台命令`;
+  return runningCount.value > 0
+    ? `${runningCount.value} 个运行中 / ${entries.value.length} 个后台命令`
+    : `${entries.value.length} 个后台命令`;
 });
-const detailRefreshKey = computed(() => `${selectedEntry.value?.processId ?? 'none'}:${selectedEntry.value?.updatedAt ?? 0}`);
+const detailRefreshKey = computed(() => `${selectedEntry.value?.processId ?? 'none'}:${selectedEntry.value?.updatedAt ?? 0}:${selectedEntry.value?.stdout.length ?? 0}:${selectedEntry.value?.stderr.length ?? 0}`);
 
 watch(entries, (nextEntries) => {
   if (nextEntries.length === 0) {
@@ -154,44 +64,23 @@ watch(entries, (nextEntries) => {
 }, { immediate: true });
 
 watch(open, (isOpen) => {
-  if (!isOpen) {
-    stopPolling();
-    markVisibleTerminalEntriesViewed();
-    consumeConfirmOpen.value = false;
-    return;
-  }
-  refreshRunningOutputs();
-  startPolling();
+  if (!isOpen) return;
   void nextTick(() => {
     listScroller.value?.scrollTo({ top: 0 });
     detailScroller.value?.scrollTo({ top: 0 });
   });
 });
 
-watch(() => entries.value.map((entry) => `${entry.processId}:${entry.statusTone}`).join('|'), () => {
-  if (!open.value) return;
-  refreshRunningOutputs();
-});
+watch(
+  () => Object.values(reliableConversation.feed.records.ProcessOutputChunk ?? {})
+    .map((chunk) => `${text(chunk.id) ?? ''}:${decimal(chunk.chunk_seq) ?? ''}`)
+    .join('|'),
+  ensureOutputDetails,
+  { immediate: true }
+);
 
-onMounted(() => {
-  document.addEventListener('pointerdown', onDocumentPointerDown, true);
-  stopOutputListener = bridge.on(BridgeMessageType.BackgroundProcessOutputResult, (message) => {
-    const payload = message.payload;
-    if (!payload) return;
-    runtimeOutputs.value = { ...runtimeOutputs.value, [payload.processId]: payload };
-    pendingOutputRequests.delete(payload.processId + ':peek');
-    pendingOutputRequests.delete(payload.processId + ':consume');
-    if (payload.consumed === true) {
-      markViewedTerminalOutputs([payload.processId]);
-    }
-  });
-});
-
-onBeforeUnmount(() => {
-  document.removeEventListener('pointerdown', onDocumentPointerDown, true);
-  stopOutputListener?.();
-  stopPolling();
-});
+onMounted(() => document.addEventListener('pointerdown', onDocumentPointerDown, true));
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocumentPointerDown, true));
 
 function toggleOpen(): void {
   open.value = !open.value;
@@ -201,15 +90,8 @@ function closePanel(): void {
   open.value = false;
 }
 
-function markVisibleTerminalEntriesViewed(): void {
-  const terminalEntries = entries.value.filter((entry) => entry.statusTone !== 'running');
-  if (terminalEntries.length === 0) return;
-  markViewedTerminalOutputs(terminalEntries.map((entry) => entry.processId));
-}
-
 function selectEntry(entry: CommandEntry): void {
   selectedProcessId.value = entry.processId;
-  requestOutput(entry.processId, false);
   void nextTick(() => detailScroller.value?.scrollTo({ top: 0 }));
 }
 
@@ -220,134 +102,118 @@ function onDocumentPointerDown(event: PointerEvent): void {
   open.value = false;
 }
 
-function buildCommandEntries(): CommandEntry[] {
-  const conversationId = clientState.currentConversationId;
-  const origins = clientState.backgroundProcessOriginLinks.filter((link) => link.conversationId === conversationId);
-  const originByProcessId = new Map(origins.map((link) => [link.backgroundProcessId, link]));
-  const toolCallsById = new Map(conversationTimeline.currentTimeline.state.toolCalls.map((call) => [call.id, call]));
-
-  return clientState.backgroundProcesses
-    .filter((process) => originByProcessId.has(process.id))
-    .map((process) => {
-      const origin = originByProcessId.get(process.id);
-      const call = origin ? toolCallsById.get(origin.sourceToolCallId) : undefined;
-      const args = call ? parseShellCallArgs(call.args) : {} as ShellArgs;
-      return createDraftFromProcess(process, args);
-    })
-    .map((draft) => applyRuntimeOutput(draft, runtimeOutputs.value[draft.processId]))
-    .map((draft) => ({
-      ...draft,
-      statusLabel: statusLabel(draft.status, draft.running, draft.exitCode, draft.killed),
-      statusTone: statusTone(draft.status, draft.running, draft.exitCode)
-    }))
-    .filter((entry) => entry.outputAvailable && entry.killed !== true && !(viewedTerminalOutputs.value[entry.processId] && selectedProcessId.value !== entry.processId))
-    .sort((left, right) => right.updatedAt - left.updatedAt || right.startedAt - left.startedAt || left.processId.localeCompare(right.processId));
-}
-
-function createDraftFromProcess(process: BackgroundProcessRecord, args: ShellArgs): CommandDraft {
-  return {
-    processId: process.processId,
-    shell: process.toolName,
-    command: process.command,
-    cwd: process.cwd || undefined,
-    foregroundWaitMs: args.foregroundWaitMs,
-    mode: 'execute',
-    accessLabel: readonlyLabel(args),
-    status: process.status,
-    stdout: '',
-    stderr: '',
-    progress: '',
-    droppedChars: process.droppedChars || undefined,
-    exitCode: process.exitCode ?? undefined,
-    killed: process.killed,
-    running: process.status === 'running',
-    outputAvailable: process.outputAvailable,
-    callCount: 1,
-    startedAt: process.startedAt,
-    updatedAt: process.updatedAt,
-    latestOutputAt: process.updatedAt
-  };
-}
-
-function applyRuntimeOutput(draft: CommandDraft, output: BackgroundProcessOutputResultPayload | undefined): CommandDraft {
-  if (!output) return draft;
-  return {
-    ...draft,
-    command: draft.command || output.command,
-    status: output.status ?? draft.status,
-    stdout: output.stdout,
-    stderr: output.stderr,
-    progress: draft.progress,
-    droppedChars: output.droppedChars,
-    exitCode: output.exitCode,
-    killed: output.killed,
-    running: output.running,
-    outputAvailable: output.status !== 'not_found' && draft.outputAvailable,
-    updatedAt: draft.updatedAt,
-    latestOutputAt: draft.latestOutputAt
-  };
-}
-
-function refreshRunningOutputs(): void {
-  for (const entry of entries.value) {
-    if (entry.statusTone === 'running') requestOutput(entry.processId, false);
+function ensureOutputDetails(): void {
+  for (const chunk of Object.values(reliableConversation.feed.records.ProcessOutputChunk ?? {})) {
+    const id = text(chunk.id);
+    if (id) reliableConversation.feed.requestDetail('process-output', id);
   }
 }
 
-function requestOutput(processId: string, consume = false): void {
-  const pendingKey = processId + ':' + (consume ? 'consume' : 'peek');
-  if (!processId || pendingOutputRequests.has(pendingKey)) return;
-  pendingOutputRequests.add(pendingKey);
-  bridge.request(BridgeMessageType.BackgroundProcessOutputGet, { processId, consume }, { channel: 'state' });
+function buildCommandEntries(): CommandEntry[] {
+  const records = reliableConversation.feed.records;
+  const origins = new Map(Object.values(records.ProcessOriginLink ?? {})
+    .map((link) => [text(link.process_id), text(link.tool_call_id)] as const)
+    .filter((entry): entry is readonly [string, string] => Boolean(entry[0] && entry[1])));
+  const calls = new Map(reliableConversation.projection.value.toolCalls.map((call) => [call.id, call]));
+  const receipts = new Map<string, ReliableRecord>();
+  for (const receipt of Object.values(records.ProcessReceipt ?? {})) {
+    const processId = text(receipt.process_id);
+    if (processId) receipts.set(processId, receipt);
+  }
+  const chunksByProcess = groupByProcess(Object.values(records.ProcessOutputChunk ?? {}));
+
+  return Object.values(records.Process ?? {})
+    .flatMap((process): CommandEntry[] => {
+      const processId = text(process.id);
+      const status = text(process.status);
+      if (!processId || !status) return [];
+      const call = calls.get(origins.get(processId) ?? '');
+      const args = call ? parseShellCallArgs(call.args) : {} as ShellArgs;
+      const output = materializeOutput(chunksByProcess.get(processId) ?? []);
+      const receipt = receipts.get(processId);
+      const exitCode = signedInteger(receipt?.exit_code);
+      const running = status === 'running';
+      const killed = status === 'cancelled' || receipt?.outcome === 'cancelled';
+      return [{
+        processId,
+        shell: call?.name ?? 'shell',
+        command: args.command || '(命令正文未投影)',
+        ...(args.cwd ? { cwd: args.cwd } : {}),
+        ...(args.foregroundWaitMs !== undefined ? { foregroundWaitMs: args.foregroundWaitMs } : {}),
+        mode: args.mode ?? 'execute',
+        accessLabel: readonlyLabel(args),
+        status,
+        statusLabel: statusLabel(status, exitCode, killed),
+        statusTone: statusTone(status, exitCode),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        progress: output.loading ? '输出分片加载中…' : '',
+        ...(nonNegativeInteger(process.dropped_bytes) !== undefined
+          ? { droppedChars: nonNegativeInteger(process.dropped_bytes) }
+          : {}),
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(killed ? { killed: true } : {}),
+        running,
+        outputAvailable: output.hasChunks || running,
+        callCount: 1,
+        startedAt: timestamp(process.started_at),
+        updatedAt: timestamp(process.updated_at)
+      }];
+    })
+    .sort((left, right) => right.updatedAt - left.updatedAt || right.startedAt - left.startedAt || left.processId.localeCompare(right.processId));
 }
 
-function startPolling(): void {
-  stopPolling();
-  pollTimer = window.setInterval(refreshRunningOutputs, 2000);
+function groupByProcess(chunks: ReliableRecord[]): Map<string, ReliableRecord[]> {
+  const grouped = new Map<string, ReliableRecord[]>();
+  for (const chunk of chunks) {
+    const processId = text(chunk.process_id);
+    if (!processId) continue;
+    const group = grouped.get(processId) ?? [];
+    group.push(chunk);
+    grouped.set(processId, group);
+  }
+  for (const group of grouped.values()) {
+    group.sort((left, right) => compareDecimal(decimal(left.chunk_seq), decimal(right.chunk_seq)));
+  }
+  return grouped;
 }
 
-function stopPolling(): void {
-  if (pollTimer === undefined) return;
-  window.clearInterval(pollTimer);
-  pollTimer = undefined;
-}
-
-function requestConsumeSelected(): void {
-  if (!selectedEntry.value || selectedEntry.value.statusTone === 'running') return;
-  consumeConfirmOpen.value = true;
-}
-
-function onConsumeConfirmAction(action: ConfirmPanelAction): void {
-  consumeConfirmOpen.value = false;
-  if (action.key !== 'confirm' || !selectedEntry.value || selectedEntry.value.statusTone === 'running') return;
-  requestOutput(selectedEntry.value.processId, true);
+function materializeOutput(chunks: ReliableRecord[]): { stdout: string; stderr: string; loading: boolean; hasChunks: boolean } {
+  let stdout = '';
+  let stderr = '';
+  let loading = false;
+  for (const chunk of chunks) {
+    const id = text(chunk.id);
+    const stream = text(chunk.stream_kind);
+    if (!id || (stream !== 'stdout' && stream !== 'stderr')) continue;
+    const detail = reliableConversation.feed.details[reliableKernelDetailKey('process-output', id)];
+    if (detail?.status !== 'ready') {
+      loading = true;
+      continue;
+    }
+    if (stream === 'stdout') stdout += detail.text;
+    else stderr += detail.text;
+  }
+  return { stdout, stderr, loading, hasChunks: chunks.length > 0 };
 }
 
 function readonlyLabel(args: ShellArgs): string {
   return args.readonly?.trim().toLowerCase() === 'true' ? '只读' : '读写';
 }
 
-function statusLabel(status: string, running: boolean | undefined, exitCode: number | undefined, killed: boolean | undefined): string {
-  if (running === true) return '运行中';
+function statusLabel(status: string, exitCode: number | undefined, killed: boolean): string {
+  if (status === 'running') return '运行中';
   if (killed) return '已终止';
+  if (status === 'outcome_unknown') return '结果未知';
   if (exitCode !== undefined && exitCode !== 0) return '异常终止';
-  switch (status) {
-    case 'running': return '运行中';
-    case 'exited': return '已退出';
-    case 'killed': return '已终止';
-    case 'not_found': return '未找到';
-    case 'completed':
-    case 'success': return '已完成';
-    case 'error': return '失败';
-    default: return status || '未知';
-  }
+  if (status === 'exited') return '已退出';
+  return status || '未知';
 }
 
-function statusTone(status: string, running: boolean | undefined, exitCode: number | undefined): CommandEntry['statusTone'] {
-  if (running === true || status === 'running') return 'running';
+function statusTone(status: string, exitCode: number | undefined): CommandEntry['statusTone'] {
+  if (status === 'running') return 'running';
+  if (status === 'outcome_unknown' || status === 'cancelled') return 'warning';
   if (exitCode !== undefined && exitCode !== 0) return 'error';
-  if (status === 'killed' || status === 'not_found') return 'warning';
-  if (status === 'error') return 'error';
   return 'done';
 }
 
@@ -366,7 +232,41 @@ function middleEllipsis(value: string, maxLength: number): string {
   return `${value.slice(0, keep)}...${value.slice(value.length - keep)}`;
 }
 
+function text(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function decimal(value: unknown): string | undefined {
+  if (typeof value === 'bigint' && value >= 0n) return value.toString();
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return String(value);
+  return typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value) ? value : undefined;
+}
+
+function signedInteger(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value === 'string' && /^-?(?:0|[1-9]\d*)$/.test(value)) return Number(value);
+  return undefined;
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  const parsed = signedInteger(value);
+  return parsed !== undefined && parsed >= 0 ? parsed : undefined;
+}
+
+function timestamp(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareDecimal(left: string | undefined, right: string | undefined): number {
+  return Number(BigInt(left ?? '0') - BigInt(right ?? '0'));
+}
 </script>
+
+
 
 <template>
   <div ref="rootRef" class="background-command-root">
@@ -419,14 +319,6 @@ function middleEllipsis(value: string, maxLength: number): string {
           <header class="command-detail-header">
             <span class="command-status" :class="`is-${selectedEntry.statusTone}`">{{ selectedEntry.statusLabel }}</span>
             <span class="command-detail-id">{{ selectedEntry.processId }}</span>
-            <button
-              v-if="selectedEntry.statusTone !== 'running' && selectedEntry.outputAvailable"
-              type="button"
-              class="command-log-consume"
-              @click="requestConsumeSelected"
-            >
-              清理日志
-            </button>
           </header>
           <div class="command-detail-scroll-shell">
             <div ref="detailScroller" class="command-detail-scroll">
@@ -467,15 +359,6 @@ function middleEllipsis(value: string, maxLength: number): string {
 
       <div v-else class="background-command-empty">暂无后台命令。</div>
     </section>
-    <ConfirmPanel
-      :open="consumeConfirmOpen"
-      title="清理后台命令日志？"
-      description="清理后，UI 和模型再次读取该进程日志都会得到 not_found；完成通知与对话记录不会被删除。"
-      :actions="consumeConfirmActions"
-      danger
-      @action="onConsumeConfirmAction"
-      @cancel="consumeConfirmOpen = false"
-    />
   </div>
 </template>
 

@@ -1,15 +1,15 @@
 import type { Pinia } from 'pinia';
-import { useReliableKernelClientFeedStore, isReliableKernelFeedDataMessage } from '@webview/stores/useReliableKernelClientFeedStore';
+import { useReliableKernelClientFeedStore, isReliableKernelFeedMessage } from '@webview/stores/useReliableKernelClientFeedStore';
 import { bridge } from './index';
 
 let installed = false;
 
-/** Installs the bounded candidate feed alongside the daily pre-cutover route without sharing state. */
+/** 安装唯一 bounded Runtime Feed；业务视图只通过 store/selectors 消费其纯数据。 */
 export function installReliableKernelClientFeed(pinia: Pinia): void {
   if (installed) return;
   installed = true;
   const store = useReliableKernelClientFeedStore(pinia);
   bridge.onAny((message) => {
-    if (isReliableKernelFeedDataMessage(message)) store.observe(message);
+    if (isReliableKernelFeedMessage(message)) store.observe(message);
   });
 }

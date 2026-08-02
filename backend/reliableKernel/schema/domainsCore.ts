@@ -66,6 +66,18 @@ export const CORE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     columns: [id(), ref('intent_id', 'turn_intent'), integer('revision_seq'), ref('preset_object_id', 'content_object'), text('created_at')]
   }),
   domain({
+    key: 'TurnIntentAuthorityRevision', table: 'turn_intent_authority_revision', repository: 'TurnIntentAuthorityRevisionRepository', codec: 'TurnIntentAuthorityRevisionRowCodec',
+    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-intent',
+    indexes: ['intent_id,revision_seq UNIQUE'],
+    columns: [id(), ref('intent_id', 'turn_intent'), integer('revision_seq'), ref('authority_object_id', 'content_object'), text('created_at')]
+  }),
+  domain({
+    key: 'TurnIntentExecutorLink', table: 'turn_intent_executor_link', repository: 'TurnIntentExecutorLinkRepository', codec: 'TurnIntentExecutorLinkRowCodec',
+    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-intent',
+    indexes: ['intent_id UNIQUE', 'agent_id'],
+    columns: [id(), ref('intent_id', 'turn_intent'), text('agent_id'), text('created_at')]
+  }),
+  domain({
     key: 'PendingTurnInput', table: 'pending_turn_input', repository: 'PendingTurnInputRepository', codec: 'PendingTurnInputRowCodec',
     mutations: ['insert', 'update', 'delete'], client: 'none', deletePolicy: 'cascade-with-turn',
     indexes: ['turn_id,position UNIQUE'],

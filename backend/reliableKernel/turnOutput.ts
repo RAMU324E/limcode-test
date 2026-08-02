@@ -1,0 +1,189 @@
+import { createHash } from 'node:crypto';
+import { ContentAddressedStore } from './contentAddressedStore';
+import { preparedContentObjectSteps } from './contentObjectTransaction';
+import { ContextSequenceControlPlane } from './contextSequence';
+import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import { RuntimeDatabase } from './runtimeDatabase';
+
+export interface AssistantMessageCommit {
+  messageId: string;
+  messageRevisionId: string;
+  contentObjectId: string;
+  contextRootId: string;
+  deduplicated: boolean;
+  commitSeq?: string;
+}
+
+/** 将一次模型输出原子提交为 Message aggregate 与新的 ContextSequence head。 */
+export class TurnOutputControlPlane {
+  private readonly context: ContextSequenceControlPlane;
+  private readonly now: () => string;
+
+  public constructor(
+    private readonly database: RuntimeDatabase,
+    private readonly contentStore: ContentAddressedStore,
+    options: { now?: () => string } = {}
+  ) {
+    this.now = options.now ?? (() => new Date().toISOString());
+    this.context = new ContextSequenceControlPlane(database, contentStore, options);
+  }
+
+  public async appendAssistantMessage(input: {
+    turnId: string;
+    sourceKey: string;
+    content: string | Uint8Array;
+    contentType?: string;
+  }): Promise<AssistantMessageCommit> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const sourceKey = requireText(input.sourceKey, 'sourceKey');
+    const contentType = requireText(input.contentType ?? 'application/vnd.limcode.message+json', 'contentType');
+    const ids = outputIds(turnId, sourceKey);
+    const identity = this.contentStore.identity(input.content, contentType);
+    const existing = await this.maybeGet('Message', ids.messageId);
+    if (existing) return this.replay(ids, identity.id);
+
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
+    if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
+    const content = await this.contentStore.prepare(this.database, input.content, contentType);
+    const context = await this.context.prepareMessageAppendMutation({
+      conversationId,
+      messageRevisionId: ids.revisionId,
+      contentObjectId: content.metadata.id
+    });
+    const now = requireText(this.now(), 'clock result');
+
+    try {
+      const committed = await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(requireId(leaseRows[0].id, 'ExecutionLease.id'), {
+          conversation_id: conversationId,
+          turn_id: turnId
+        }),
+        ...preparedContentObjectSteps([content], 'assistant_output'),
+        DOMAIN_REPOSITORIES.domain('Message').insert({
+          id: ids.messageId,
+          created_at: now,
+          updated_at: now,
+          deleted_at: null
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+          id: ids.revisionId,
+          message_id: ids.messageId,
+          role: 'model',
+          content_object_id: content.metadata.id,
+          created_at: now
+        }, {
+          column: 'revision_seq',
+          scope: { message_id: ids.messageId }
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
+          id: ids.currentRevisionLinkId,
+          message_id: ids.messageId,
+          revision_id: ids.revisionId,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insertWithNextSequence({
+          id: ids.membershipId,
+          conversation_id: conversationId,
+          message_id: ids.messageId,
+          created_at: now
+        }, {
+          column: 'message_seq',
+          scope: { conversation_id: conversationId }
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
+          id: ids.turnLinkId,
+          turn_id: turnId,
+          message_id: ids.messageId,
+          role: 'model',
+          created_at: now
+        }),
+        ...context.steps,
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+      ]);
+      const contextRootId = await this.context.currentHeadRootId(conversationId);
+      if (!contextRootId) throw new Error(`Conversation ${conversationId} has no Context head after assistant output commit.`);
+      return {
+        messageId: ids.messageId,
+        messageRevisionId: ids.revisionId,
+        contentObjectId: content.metadata.id,
+        contextRootId,
+        deduplicated: false,
+        commitSeq: committed.commitSeq
+      };
+    } catch (error) {
+      if (!isUniqueOrAssertionFailure(error) || !await this.maybeGet('Message', ids.messageId)) throw error;
+      return this.replay(ids, identity.id);
+    }
+  }
+
+  private async replay(ids: ReturnType<typeof outputIds>, expectedContentObjectId: string): Promise<AssistantMessageCommit> {
+    const revision = await this.requireExisting('MessageRevision', ids.revisionId);
+    if (revision.message_id !== ids.messageId || revision.content_object_id !== expectedContentObjectId || revision.role !== 'model') {
+      throw new Error(`Assistant output ${ids.messageId} was replayed with different facts.`);
+    }
+    const membership = (await this.list('MessagePartOfConversation', { message_id: ids.messageId }, 2))[0];
+    if (!membership) throw new Error(`Assistant output ${ids.messageId} lacks Conversation membership.`);
+    const heads = await this.list('ConversationContextHeadLink', {
+      conversation_id: requireId(membership.conversation_id, 'MessagePartOfConversation.conversation_id')
+    }, 2);
+    if (heads.length !== 1) throw new Error('Conversation must have exactly one Context head.');
+    return {
+      messageId: ids.messageId,
+      messageRevisionId: ids.revisionId,
+      contentObjectId: expectedContentObjectId,
+      contextRootId: requireId(heads[0].root_id, 'ConversationContextHeadLink.root_id'),
+      deduplicated: true
+    };
+  }
+
+  private async maybeGet(domain: string, id: string): Promise<DomainRow | null> {
+    const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)]);
+    return snapshot.snapshot[0] as DomainRow | null;
+  }
+
+  private async requireExisting(domain: string, id: string): Promise<DomainRow> {
+    const row = await this.maybeGet(domain, id);
+    if (!row) throw new Error(`${domain} ${id} does not exist.`);
+    return row;
+  }
+
+  private async list(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {
+    const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({ where, limit })]);
+    const rows = snapshot.snapshot[0];
+    if (!Array.isArray(rows)) throw new TypeError(`${domain} list did not return rows.`);
+    return rows;
+  }
+}
+
+function outputIds(turnId: string, sourceKey: string) {
+  const id = (kind: string): string => `rk_${kind}_${createHash('sha256')
+    .update(JSON.stringify([turnId, sourceKey, kind]))
+    .digest('hex')
+    .slice(0, 32)}`;
+  return {
+    messageId: id('message'),
+    revisionId: id('message_revision'),
+    currentRevisionLinkId: id('message_current_revision'),
+    membershipId: id('message_membership'),
+    turnLinkId: id('message_turn_link')
+  };
+}
+
+function isUniqueOrAssertionFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('UNIQUE constraint failed') || message.includes('assertion failed');
+}
+
+function requireId(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw new TypeError(`${label} must be a non-empty id.`);
+  return value;
+}
+
+function requireText(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
+  return value.trim();
+}

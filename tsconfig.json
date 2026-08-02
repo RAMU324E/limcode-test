@@ -26,8 +26,10 @@
     ]
   },
   "include": [
-    "backend/**/*.ts",
-    "shared/**/*.ts",
+    "backend/reliableKernel/**/*.ts",
+    "backend/application/reliableKernel/**/*.ts",
+    "backend/application/mcpRuntimeManager.ts",
+    "backend/application/runtimeBuildInfo.ts",
     "vscode/**/*.ts"
   ],
   "exclude": [

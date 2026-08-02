@@ -46,6 +46,22 @@ export interface AnswerSubmitResult {
   commitSeq?: string;
 }
 
+export type AnswerReadResult =
+  | { status: 'not_found' }
+  | { status: 'running'; answerBridgeId: string; childExecutionId: string }
+  | { status: 'interrupted'; answerBridgeId: string; childExecutionId: string }
+  | {
+      status: 'submitted';
+      answerBridgeId: string;
+      childExecutionId: string;
+      submissionId: string;
+      sourceTurnId: string | null;
+      title: string | null;
+      content: string;
+      contentType: string;
+      interrupted: boolean;
+    };
+
 export interface RuntimeDeliveryCreateCommand {
   inboxItemId: string;
   targetConversationId: string;
@@ -132,6 +148,44 @@ export class AnswerControlPlane {
       if (!raced) throw error;
       return raced;
     }
+  }
+
+  /** Read-only latest-answer selector. It never consumes RuntimeInbox or changes delivery state. */
+  public async readCurrent(answerBridgeIdInput: string): Promise<AnswerReadResult> {
+    const answerBridgeId = requirePhaseFId(answerBridgeIdInput, 'answerBridgeId');
+    const bridge = await this.maybeGet('AnswerBridge', answerBridgeId);
+    if (!bridge) return { status: 'not_found' };
+    const childExecutionId = requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+    const snapshot = await this.children.readExecutionSnapshot(childExecutionId);
+    if (!snapshot.currentSubmission) {
+      const running = snapshot.activeTurn?.status === ACTIVE_TURN
+        || ['starting', 'active'].includes(String(snapshot.childExecution.status));
+      return running
+        ? { status: 'running', answerBridgeId, childExecutionId }
+        : { status: 'interrupted', answerBridgeId, childExecutionId };
+    }
+    const submissionId = requirePhaseFId(snapshot.currentSubmission.id, 'AnswerSubmission.id');
+    const payloads = await this.listRows('AnswerPayload', { submission_id: submissionId }, 2);
+    if (payloads.length !== 1) throw new Error('Current AnswerSubmission must have exactly one AnswerPayload.');
+    const payload = payloads[0];
+    const contentRow = await this.requireExisting(
+      'ContentObject',
+      requirePhaseFId(payload.content_object_id, 'AnswerPayload.content_object_id')
+    ) as ContentObjectMetadata;
+    const content = (await this.contentStore.read(contentRow)).toString('utf8');
+    return {
+      status: 'submitted',
+      answerBridgeId,
+      childExecutionId,
+      submissionId,
+      sourceTurnId: snapshot.currentSubmission.turn_id === null
+        ? null
+        : requirePhaseFId(snapshot.currentSubmission.turn_id, 'AnswerSubmission.turn_id'),
+      title: payload.title === null ? null : requirePhaseFText(payload.title, 'AnswerPayload.title'),
+      content,
+      contentType: contentRow.content_type,
+      interrupted: snapshot.currentSubmission.interrupted === 1n
+    };
   }
 
   /** Recovery-only invariant repair. It never flips the bridge or settles a ToolCall. */

@@ -1,6 +1,6 @@
 import { READ_AGENT_ANSWER_TOOL_NAME, SUBMIT_AGENT_ANSWER_TOOL_NAME } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
-import { staticToolScheduling } from '../../scheduling';
+import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 
 export const submitAgentAnswerToolModule = defineToolDefinitionModule({

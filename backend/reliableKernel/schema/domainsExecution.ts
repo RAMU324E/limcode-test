@@ -13,9 +13,15 @@ export const EXECUTION_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   }),
   domain({
     key: 'InteractionOwnerLink', table: 'interaction_owner_link', repository: 'InteractionOwnerLinkRepository', codec: 'InteractionOwnerLinkRowCodec',
-    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-request',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-request',
     indexes: ['request_id UNIQUE', 'turn_id'],
     columns: [id(), ref('request_id', 'interaction_request'), ref('turn_id', 'turn'), text('created_at')]
+  }),
+  domain({
+    key: 'InteractionToolCallLink', table: 'interaction_tool_call_link', repository: 'InteractionToolCallLinkRepository', codec: 'InteractionToolCallLinkRowCodec',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-request',
+    indexes: ['request_id UNIQUE', 'tool_call_id'],
+    columns: [id(), ref('request_id', 'interaction_request'), ref('tool_call_id', 'tool_call'), text('created_at')]
   }),
   domain({
     key: 'InteractionResponse', table: 'interaction_response', repository: 'InteractionResponseRepository', codec: 'InteractionResponseRowCodec',
@@ -113,6 +119,7 @@ export const EXECUTION_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
       text('work_environment_id'),
       text('target_path'),
       text('base_digest', { nullable: true }),
+      ref('base_content_object_id', 'content_object', true, 'RESTRICT'),
       ref('target_content_object_id', 'content_object', true, 'RESTRICT'),
       text('target_digest', { nullable: true }),
       text('created_at')

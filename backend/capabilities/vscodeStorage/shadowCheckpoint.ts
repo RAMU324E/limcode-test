@@ -6,7 +6,7 @@ import type { CheckpointGitStatusRecord, CheckpointRecord, CheckpointSkipReason,
 import type { CheckpointPolicyRecord } from '../../../shared/protocol';
 import { CHECKPOINT_FEATURE_ENABLED } from '../../../shared/featureFlags';
 import type { ShadowCheckpointCreateRequest } from '../types';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 import { emptyDirectoryManifest, workspaceContainsProject } from '../../world/modules/checkpoint/policy';
 import { EXTENSION_BRAND, EXTENSION_PACKAGE_NAME } from '../../../shared/extensionIdentity';
 

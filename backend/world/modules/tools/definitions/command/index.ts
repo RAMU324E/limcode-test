@@ -1,7 +1,7 @@
 import type { CommandCapability, CommandOutputLimits } from '../../../../../capabilities/types';
 import type { ToolConfigRecord } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
-import { normalizeSchedulingHint } from '../../scheduling';
+import { normalizeSchedulingHint } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 
 export const commandToolModule = defineToolDefinitionModule({
@@ -47,10 +47,6 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           processId: {
             type: 'string',
             description: 'Do not provide this when mode=execute. The runtime generates and returns processId when an execute command is moved to the background. Required only for mode=output or mode=kill; copy it from a previous shell/bash result or background notification.'
-          },
-          consume: {
-            type: 'boolean',
-            description: 'Only used by mode=output. Defaults to false (peek). Set true to explicitly consume terminal logs; subsequent reads then return not_found. Running-process reads never consume.'
           },
           readonly: {
             type: 'string',
@@ -138,12 +134,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
         if (!processId) return { ok: false, output: '缺少 processId：mode=output 需要指定后台进程 id。' };
         return {
           ok: true,
-          output: deps.command.readOutput(processId, limits, {
-            consume: args.consume === true,
-            // Only a model tool poll participates in the terminal-revision claim. Webview reads call
-            // CommandCapability directly without this flag and remain passive.
-            claimTerminal: true
-          })
+          output: deps.command.readOutput(processId, limits)
         };
       }
 
@@ -204,7 +195,6 @@ type CommandToolArgs = {
   foregroundWaitMs?: number;
   mode?: string;
   processId?: string;
-  consume?: boolean;
   readonly?: string;
   wait?: string;
   scheduling?: string;

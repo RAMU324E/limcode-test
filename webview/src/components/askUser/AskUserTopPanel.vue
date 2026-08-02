@@ -5,15 +5,18 @@ import { askUserRequestFromArgs } from '@shared/askUser';
 import { ASK_USER_TOOL_NAME, type AskUserToolRequestRecord, type ToolCallRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import CollapsibleContentBlock from '@webview/components/content/CollapsibleContentBlock.vue';
-import { pendingInteractionsForConversation } from '@webview/domain/interactionProjection';
+import {
+  interactionViewFromReliableRuntime,
+  type InteractionView
+} from '@webview/domain/interactionProjection';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useAskUserStore } from '@webview/stores/useAskUserStore';
-import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import AskUserContent from './AskUserContent.vue';
 
 interface PendingAskUserView {
   toolCall: ToolCallRecord;
   request: AskUserToolRequestRecord;
+  interactionView: InteractionView;
 }
 
 interface PendingAskUserBatchView {
@@ -23,30 +26,26 @@ interface PendingAskUserBatchView {
 }
 
 const askUser = useAskUserStore();
-const clientState = useClientStateStore();
-const conversationTimeline = useConversationTimelineStore();
+const reliableConversation = useReliableConversation();
 const expanded = ref(true);
 const scroller = ref<HTMLElement | null>(null);
 const activeIndexByBatch = ref<Record<string, number>>({});
 
 const pendingBatches = computed<PendingAskUserBatchView[]>(() => {
-  const state = conversationTimeline.currentTimeline.state;
-  const toolCallById = new Map(state.toolCalls.map((toolCall) => [toolCall.id, toolCall]));
   const batches = new Map<string, PendingAskUserBatchView>();
-  const pending = pendingInteractionsForConversation(clientState, clientState.currentConversationId, 'ask_user');
-
-  for (const interaction of pending) {
-    const toolCall = interaction.owner.sourceToolCallId
-      ? toolCallById.get(interaction.owner.sourceToolCallId)
-      : undefined;
-    if (!toolCall || toolCall.name !== ASK_USER_TOOL_NAME) continue;
-    const request = askUserRequestFromArgs(toolCall.args);
-    if (!request) continue;
-    // 同一 Turn 的多个 pending AskUser Interaction 构成当前并行回答批。
-    const key = `turn:${interaction.owner.turnId}`;
-    const batch = batches.get(key) ?? { key, turnId: interaction.owner.turnId, items: [] };
-    batch.items.push({ toolCall, request });
-    batches.set(key, batch);
+  const projection = reliableConversation.projection.value;
+  for (const toolCall of projection.toolCalls) {
+    if (toolCall.name !== ASK_USER_TOOL_NAME) continue;
+    const interaction = projection.interactionByToolCallId[toolCall.id];
+    if (!interaction) continue;
+    const interactionView = interactionViewFromReliableRuntime({
+      interaction,
+      conversationId: reliableConversation.conversationId.value,
+      toolCallId: toolCall.id,
+      expectedKind: 'ask_user'
+    });
+    if (!interactionView || interactionView.request.state !== 'pending') continue;
+    appendPendingQuestion(batches, toolCall, interactionView);
   }
 
   return [...batches.values()]
@@ -71,7 +70,9 @@ const panelSummary = computed(() => {
   return activeQuestionLabel.value ? `${countLabel} · ${activeQuestionLabel.value}` : countLabel;
 });
 const refreshKey = computed(() => `${expanded.value ? 'expanded' : 'collapsed'}:${pendingBatches.value
-  .map((batch) => `${batch.key}:${activeIndex(batch)}:${batch.items.map(({ toolCall }) => `${toolCall.id}:${toolCall.updatedAt}`).join(',')}`)
+  .map((batch) => `${batch.key}:${activeIndex(batch)}:${batch.items
+    .map(({ toolCall, interactionView }) => `${toolCall.id}:${toolCall.updatedAt}:${interactionView.request.updatedAt}`)
+    .join(',')}`)
   .join('|')}`);
 
 watch(
@@ -92,18 +93,45 @@ watch(pendingQuestionCount, (nextCount, previousCount) => {
 });
 
 watch(
-  () => clientState.interactionRequests
-    .filter((request) => request.kind === 'ask_user')
-    .map((request) => `${request.id}:${request.revision}:${request.state}`)
-    .join('|'),
+  () => {
+    const calls = reliableConversation.projection.value.toolCalls;
+    return `reliable:${calls
+      .filter((call) => call.name === ASK_USER_TOOL_NAME)
+      .map((call) => {
+        const interaction = reliableConversation.projection.value.interactionByToolCallId[call.id];
+        return `${call.id}:${call.updatedAt}:${interaction?.id ?? ''}:${interaction?.status ?? ''}:${interaction?.updatedAt ?? 0}`;
+      })
+      .join('|')}`;
+  },
   () => {
     const activeToolCallIds = new Set(pendingBatches.value.flatMap((batch) => batch.items.map((item) => item.toolCall.id)));
-    for (const call of conversationTimeline.currentTimeline.state.toolCalls) {
+    const calls = reliableConversation.projection.value.toolCalls;
+    for (const call of calls) {
       if (call.name === ASK_USER_TOOL_NAME && !activeToolCallIds.has(call.id)) askUser.clearDraft(call.id);
     }
   },
   { immediate: true }
 );
+
+watch(
+  () => reliableConversation.projection.value.missingToolArgumentIds.join('|'),
+  reliableConversation.ensureDetails,
+  { immediate: true }
+);
+
+function appendPendingQuestion(
+  batches: Map<string, PendingAskUserBatchView>,
+  toolCall: ToolCallRecord,
+  interactionView: InteractionView
+): void {
+  const request = askUserRequestFromArgs(toolCall.args);
+  if (!request) return;
+  // 同一 Turn 的多个 pending AskUser Interaction 构成当前并行回答批。
+  const key = `turn:${interactionView.owner.turnId}`;
+  const batch = batches.get(key) ?? { key, turnId: interactionView.owner.turnId, items: [] };
+  batch.items.push({ toolCall, request, interactionView });
+  batches.set(key, batch);
+}
 
 function activeIndex(batch: PendingAskUserBatchView): number {
   return Math.min(activeIndexByBatch.value[batch.key] ?? 0, Math.max(0, batch.items.length - 1));
@@ -170,6 +198,7 @@ function selectQuestion(batch: PendingAskUserBatchView, index: number): void {
               :key="activeQuestion(batch).toolCall.id"
               :request="activeQuestion(batch).request"
               :tool-call="activeQuestion(batch).toolCall"
+              :interaction-view="activeQuestion(batch).interactionView"
               placement="composer"
             />
           </section>

@@ -1,7 +1,5 @@
 import type { Component } from 'vue';
 import type {
-  AgentRunSourceLinkRecord,
-  AgentRunTargetLinkRecord,
   AskUserToolRequestRecord,
   CheckpointRecord,
   SubmitPlanToolRequestRecord,
@@ -71,8 +69,6 @@ export interface ToolDisplayContext {
   toolCall?: ToolCallRecord;
   messages?: MessageRecord[];
   toolCalls?: ToolCallRecord[];
-  agentRunSourceLinks?: AgentRunSourceLinkRecord[];
-  agentRunTargetLinks?: AgentRunTargetLinkRecord[];
   checkpoints?: CheckpointRecord[];
   checkpointTimelineAnchors?: CheckpointTimelineAnchorRecord[];
   shadowRepositories?: ShadowRepositoryRecord[];

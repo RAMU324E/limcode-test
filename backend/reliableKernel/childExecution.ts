@@ -3,12 +3,14 @@ import {
   type PreparedContentObject
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
+import { ContextSequenceControlPlane } from './contextSequence';
 import {
   EffectControlPlane,
   type EffectObservedOutcome,
   type RecordedEffectReceipt,
   type ToolOutcomeStatus,
-  type ToolTerminalPlan
+  type ToolTerminalPlan,
+  type ToolTerminalResult
 } from './effectControlPlane';
 import { canonicalPlainJson } from './plainJson';
 import {
@@ -27,6 +29,10 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import {
+  normalizeCompiledTurnAuthority,
+  type TurnAuthorityCompiler
+} from './turnControlPlane';
 
 export type ChildCompletionPolicy = 'wait_for_answer' | 'background';
 export type ChildSendMode = 'queue_next_turn' | 'interrupt_current_turn';
@@ -34,7 +40,7 @@ export type ChildSendMode = 'queue_next_turn' | 'interrupt_current_turn';
 export interface ChildExecutionSpawnCommand {
   sourceToolCallId: string;
   childAgentId: string;
-  prompt: unknown;
+  prompt: string;
   completionPolicy: ChildCompletionPolicy;
   waitDeadlineAt?: string;
   childConversationId?: string;
@@ -58,18 +64,24 @@ export interface ChildExecutionSpawnResult {
 
 export interface ChildExecutionSendCommand {
   sourceKey: string;
+  sourceToolCallId: string;
   childExecutionId: string;
   mode: ChildSendMode;
   content: string | Uint8Array;
   contentType?: string;
+  completionPolicy: ChildCompletionPolicy;
+  waitDeadlineAt?: string;
 }
 
 export interface ChildExecutionSendResult {
   childExecutionId: string;
   turnIntentId: string;
   intentLinkId: string;
-  pendingTurnInputId: string;
+  pendingTurnInputId?: string;
+  operationId: string;
+  pauseId?: string;
   mode: ChildSendMode;
+  completionPolicy: ChildCompletionPolicy;
   deduplicated: boolean;
   commitSeq?: string;
 }
@@ -130,6 +142,7 @@ export interface PreparedForegroundSettlement {
 
 export interface ChildExecutionControlPlaneOptions {
   now?: () => string;
+  authorityCompiler: TurnAuthorityCompiler;
   /** Allows Turn admission to attach pending next_turn deliveries in the very same writer transaction. */
   prepareNextTurnDeliverySteps?: (
     conversationId: string,
@@ -141,12 +154,16 @@ export interface ChildExecutionControlPlaneOptions {
 interface SpawnIds {
   childExecutionId: string;
   childConversationId: string;
-  childRootId: string;
-  childHeadLinkId: string;
   childAgentLinkId: string;
   childTurnId: string;
   childLeaseId: string;
   childExecutorLinkId: string;
+  childAuthoritySnapshotId: string;
+  childMessageId: string;
+  childMessageRevisionId: string;
+  childMessageCurrentLinkId: string;
+  childMessageMembershipId: string;
+  childMessageTurnLinkId: string;
   parentLinkId: string;
   turnLinkId: string;
   activeTurnLinkId: string;
@@ -169,15 +186,22 @@ const TERMINAL_OPERATION_STATES = new Set([
 /** Stable ChildExecution lineage and run_agent control plane for Phase F. */
 export class ChildExecutionControlPlane {
   private readonly now: () => string;
+  private readonly authorityCompiler: TurnAuthorityCompiler;
+  private readonly contextSequence: ContextSequenceControlPlane;
   private readonly prepareNextTurnDeliverySteps?: ChildExecutionControlPlaneOptions['prepareNextTurnDeliverySteps'];
 
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore,
     private readonly effects: EffectControlPlane,
-    options: ChildExecutionControlPlaneOptions = {}
+    options: ChildExecutionControlPlaneOptions
   ) {
+    if (!options.authorityCompiler || typeof options.authorityCompiler.compile !== 'function') {
+      throw new TypeError('ChildExecutionControlPlane requires a server-side TurnAuthorityCompiler.');
+    }
     this.now = options.now ?? (() => new Date().toISOString());
+    this.authorityCompiler = options.authorityCompiler;
+    this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
   }
 
@@ -207,11 +231,31 @@ export class ChildExecutionControlPlane {
       throw new Error(`Source ToolCall cannot spawn from ${String(parent.toolCall.status)}/${String(parent.toolExecution.status)}.`);
     }
 
-    const requestContent = await this.contentStore.prepare(
-      this.database,
-      canonicalPlainJson(spawnRequestPayload(command, ids)),
-      SUBAGENT_SPAWN_CONTENT_TYPE
-    );
+    const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
+      conversationId: ids.childConversationId,
+      turnId: ids.childTurnId,
+      executorAgentId: command.childAgentId,
+      intentKind: 'input'
+    }), ids.childTurnId, command.childAgentId);
+    const [requestContent, promptContent, authorityContent] = await Promise.all([
+      this.contentStore.prepare(
+        this.database,
+        canonicalPlainJson(spawnRequestPayload(command, ids)),
+        SUBAGENT_SPAWN_CONTENT_TYPE
+      ),
+      this.contentStore.prepare(this.database, command.prompt, 'text/plain'),
+      this.contentStore.prepare(
+        this.database,
+        compiled.authoritySnapshot.content,
+        compiled.authoritySnapshot.contentType
+      )
+    ]);
+    const promptContext = this.contextSequence.prepareFreshConversationMessageMutation({
+      conversationId: ids.childConversationId,
+      messageRevisionId: ids.childMessageRevisionId,
+      contentObjectId: promptContent.metadata.id,
+      contentByteLength: promptContent.metadata.byte_length
+    });
     const now = this.timestamp();
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
@@ -235,31 +279,15 @@ export class ChildExecutionControlPlane {
             status: parent.parentChildExecution.status
           })]
         : []),
-      ...preparedContentObjectSteps([requestContent], 'subagent_spawn_request'),
+      ...preparedContentObjectSteps(
+        uniquePrepared([requestContent, promptContent, authorityContent]),
+        'subagent_spawn_content'
+      ),
       DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: ids.childConversationId,
         title: command.title,
         status: 'active',
         created_at: now,
-        updated_at: now
-      }),
-      DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
-        id: ids.childRootId,
-        conversation_id: ids.childConversationId,
-        root_node_id: null,
-        tail_node_id: null,
-        tail_segment_count: '0',
-        segment_count: '0',
-        estimated_tokens: '0',
-        created_at: now
-      }, {
-        column: 'root_seq',
-        scope: { conversation_id: ids.childConversationId }
-      }),
-      DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').insert({
-        id: ids.childHeadLinkId,
-        conversation_id: ids.childConversationId,
-        root_id: ids.childRootId,
         updated_at: now
       }),
       DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
@@ -308,6 +336,51 @@ export class ChildExecutionControlPlane {
         agent_id: command.childAgentId,
         created_at: now
       }),
+      DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
+        id: ids.childAuthoritySnapshotId,
+        turn_id: ids.childTurnId,
+        content_object_id: authorityContent.metadata.id,
+        created_at: now
+      }),
+      DOMAIN_REPOSITORIES.domain('Message').insert({
+        id: ids.childMessageId,
+        created_at: now,
+        updated_at: now,
+        deleted_at: null
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+        id: ids.childMessageRevisionId,
+        message_id: ids.childMessageId,
+        role: 'user',
+        content_object_id: promptContent.metadata.id,
+        created_at: now
+      }, {
+        column: 'revision_seq',
+        scope: { message_id: ids.childMessageId }
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
+        id: ids.childMessageCurrentLinkId,
+        message_id: ids.childMessageId,
+        revision_id: ids.childMessageRevisionId,
+        updated_at: now
+      }),
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insertWithNextSequence({
+        id: ids.childMessageMembershipId,
+        conversation_id: ids.childConversationId,
+        message_id: ids.childMessageId,
+        created_at: now
+      }, {
+        column: 'message_seq',
+        scope: { conversation_id: ids.childConversationId }
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
+        id: ids.childMessageTurnLinkId,
+        turn_id: ids.childTurnId,
+        message_id: ids.childMessageId,
+        role: 'input',
+        created_at: now
+      }),
+      ...promptContext.steps,
       DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').insert({
         id: ids.turnLinkId,
         child_execution_id: ids.childExecutionId,
@@ -507,9 +580,21 @@ export class ChildExecutionControlPlane {
       || CANCELLING_CHILD_STATES.has(String(snapshot.childExecution.status))) {
       throw new Error('Cannot send to a terminal or cancelling ChildExecution.');
     }
-    if (!snapshot.activeTurnLink || !snapshot.activeTurn || snapshot.activeTurn.status !== ACTIVE_TURN) {
-      throw new Error('ChildExecution send requires a current active Turn.');
+    const parent = await this.readSpawnParent(command.sourceToolCallId);
+    if (parent.turn.status !== ACTIVE_TURN || parent.termination !== null || !parent.lease) {
+      throw new Error('Child continuation requires an active parent Turn and ExecutionLease.');
     }
+    if (parent.toolCall.status !== 'pending' || parent.toolExecution.status !== 'pending') {
+      throw new Error('Child continuation source ToolCall is no longer pending.');
+    }
+    if (!!snapshot.activeTurnLink !== !!snapshot.activeTurn) {
+      throw new Error('ChildExecution active Turn facts are incomplete.');
+    }
+    if (snapshot.activeTurn && snapshot.activeTurn.status !== ACTIVE_TURN && snapshot.activeTurn.status !== TERMINATED_TURN) {
+      throw new Error(`ChildExecution active Turn has unsupported status ${String(snapshot.activeTurn.status)}.`);
+    }
+    const currentTurn = snapshot.activeTurn?.status === ACTIVE_TURN ? snapshot.activeTurn : null;
+    const currentActiveLink = currentTurn ? snapshot.activeTurnLink : null;
     const content = await this.contentStore.prepare(
       this.database,
       command.content,
@@ -520,7 +605,7 @@ export class ChildExecutionControlPlane {
       canonicalPlainJson({ kind: 'child-continuation', mode: command.mode }),
       'application/vnd.limcode.turn-execution-preset+json'
     );
-    const interrupt = command.mode === 'interrupt_current_turn'
+    const interrupt = currentTurn && command.mode === 'interrupt_current_turn'
       ? await this.contentStore.prepare(
           this.database,
           canonicalPlainJson({
@@ -531,25 +616,46 @@ export class ChildExecutionControlPlane {
           'application/vnd.limcode.turn-interrupt-request+json'
         )
       : content;
+    const backgroundPlan = command.completionPolicy === 'background'
+      ? await this.effects.prepareTerminalPlan(
+          command.sourceToolCallId,
+          'succeeded',
+          childControlHandle(snapshot.childExecution, snapshot.answerBridge),
+          ids.commandReceiptId
+        )
+      : null;
     const now = this.timestamp();
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
         id: ids.commandReceiptId,
         source_kind: 'command',
         source_key: command.sourceKey,
-        conversation_id: snapshot.childExecution.child_conversation_id,
-        turn_id: snapshot.activeTurn.id,
+        conversation_id: parent.conversation.id,
+        turn_id: parent.turn.id,
         created_at: now
       }),
+      DOMAIN_REPOSITORIES.domain('Turn').assert(parent.turn.id as string, { status: ACTIVE_TURN }),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(parent.lease.id as string, {
+        conversation_id: parent.conversation.id,
+        turn_id: parent.turn.id
+      }),
+      DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: parent.turn.id }),
+      DOMAIN_REPOSITORIES.domain('ToolCall').assert(command.sourceToolCallId, { status: 'pending' }),
+      DOMAIN_REPOSITORIES.domain('ToolExecution').assert(parent.toolExecution.id as string, { status: 'pending' }),
       DOMAIN_REPOSITORIES.domain('ChildExecution').assert(command.childExecutionId, {
         status: snapshot.childExecution.status
       }),
-      DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(snapshot.activeTurnLink.id as string, {
-        child_execution_id: command.childExecutionId,
-        turn_id: snapshot.activeTurn.id
-      }),
-      DOMAIN_REPOSITORIES.domain('Turn').assert(snapshot.activeTurn.id as string, { status: ACTIVE_TURN }),
-      ...preparedContentObjectSteps(uniquePrepared([content, preset, interrupt]), 'child_send_content'),
+      ...(currentTurn && currentActiveLink ? [
+        DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(currentActiveLink.id as string, {
+          child_execution_id: command.childExecutionId,
+          turn_id: currentTurn.id
+        }),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(currentTurn.id as string, { status: ACTIVE_TURN })
+      ] : []),
+      ...preparedContentObjectSteps(
+        uniquePrepared([content, preset, ...(currentTurn ? [interrupt] : [])]),
+        'child_send_content'
+      ),
       DOMAIN_REPOSITORIES.domain('TurnIntent').insert({
         id: ids.turnIntentId,
         conversation_id: snapshot.childExecution.child_conversation_id,
@@ -583,22 +689,53 @@ export class ChildExecutionControlPlane {
         column: 'intent_seq',
         scope: { child_execution_id: command.childExecutionId }
       }),
-      DOMAIN_REPOSITORIES.domain('PendingTurnInput').insertWithNextPosition({
+      DOMAIN_REPOSITORIES.domain('Operation').insertWithNextSequence({
+        id: ids.operationId,
+        owner_kind: 'answer_bridge_wait',
+        owner_id: snapshot.answerBridge.id,
+        tool_call_id: command.sourceToolCallId,
+        status: command.completionPolicy === 'wait_for_answer' ? 'waiting_answer' : 'succeeded',
+        created_at: now,
+        updated_at: now
+      }, {
+        column: 'operation_seq',
+        scope: { owner_kind: 'answer_bridge_wait', owner_id: snapshot.answerBridge.id }
+      }),
+      ...(command.completionPolicy === 'wait_for_answer' ? [
+        DOMAIN_REPOSITORIES.domain('OutcomePause').insert({
+          id: ids.pauseId,
+          operation_id: ids.operationId,
+          status: 'waiting',
+          reason: 'child_answer',
+          created_at: now,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').update(command.sourceToolCallId, {
+          status: 'waiting_answer',
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').update(parent.toolExecution.id as string, {
+          status: 'waiting_answer',
+          wait_deadline_at: command.waitDeadlineAt,
+          updated_at: now
+        })
+      ] : backgroundPlan?.steps ?? []),
+      ...(currentTurn ? [DOMAIN_REPOSITORIES.domain('PendingTurnInput').insertWithNextPosition({
         id: ids.pendingTurnInputId,
-        turn_id: snapshot.activeTurn.id,
+        turn_id: currentTurn.id,
         input_kind: command.mode,
         content_object_id: interrupt.metadata.id,
         state: 'pending',
         created_at: now,
         updated_at: now
-      }),
+      })] : []),
       DOMAIN_REPOSITORIES.domain('Conversation').update(snapshot.childExecution.child_conversation_id as string, {
         updated_at: now
       })
     ];
     try {
       const commit = await this.database.transaction(steps);
-      return sendResult(command, ids, false, commit.commitSeq);
+      return sendResult(command, ids, currentTurn !== null, false, commit.commitSeq);
     } catch (error) {
       if (!isExpectedSendIdentityConflict(error)) throw error;
       const raced = await this.findSendReplay(command, ids, content);
@@ -641,6 +778,14 @@ export class ChildExecutionControlPlane {
       DOMAIN_REPOSITORIES.domain('AgentConversationLink').list({
         where: { role: 'default' },
         limit: 1000
+      }),
+      DOMAIN_REPOSITORIES.domain('PendingTurnInput').get(
+        queuedIntentPendingInputId(command.childExecutionId, command.turnIntentId)
+      ),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').list({
+        where: { child_execution_id: command.childExecutionId },
+        orderBy: { column: 'turn_seq', direction: 'desc' },
+        limit: 1
       })
     ]);
     const child = requireRow(snapshot.snapshot[0], `ChildExecution ${command.childExecutionId}`);
@@ -662,12 +807,26 @@ export class ChildExecutionControlPlane {
     const activeLinks = requireRows(snapshot.snapshot[5], 'ChildExecutionActiveTurnLink admission lookup');
     if (activeLinks.length > 1) throw new Error('ChildExecution has multiple active Turn links.');
     const activeLink = activeLinks[0] ?? null;
-    let previousTurn: DomainRow | null = null;
-    if (activeLink) {
-      previousTurn = await this.requireExisting('Turn', requirePhaseFId(activeLink.turn_id, 'ActiveTurnLink.turn_id'));
-      if (previousTurn.status === ACTIVE_TURN) {
-        throw new Error('Queued continuation cannot be admitted while the previous child Turn is active.');
-      }
+    const sourcePendingInput = snapshot.snapshot[8] === null
+      ? null
+      : requireRow(snapshot.snapshot[8], 'Queued continuation source PendingTurnInput');
+    const latestTurnLinks = requireRows(snapshot.snapshot[9], 'ChildExecution latest Turn membership lookup');
+    const previousTurnId = sourcePendingInput
+      ? requirePhaseFId(sourcePendingInput.turn_id, 'PendingTurnInput.turn_id')
+      : activeLink
+        ? requirePhaseFId(activeLink.turn_id, 'ActiveTurnLink.turn_id')
+        : latestTurnLinks[0]
+          ? requirePhaseFId(latestTurnLinks[0].turn_id, 'ChildExecutionTurnLink.turn_id')
+          : null;
+    const previousTurn = previousTurnId
+      ? await this.requireExisting('Turn', previousTurnId)
+      : null;
+    if (!previousTurn) throw new Error('Child continuation requires a previous lineage Turn.');
+    if (previousTurn.status === ACTIVE_TURN) {
+      throw new Error('Queued continuation cannot be admitted while the previous child Turn is active.');
+    }
+    if (previousTurn.status !== TERMINATED_TURN) {
+      throw new Error(`Previous child Turn has unsupported status ${String(previousTurn.status)}.`);
     }
     const bridges = requireRows(snapshot.snapshot[6], 'AnswerBridge admission lookup');
     if (bridges.length !== 1) throw new Error('ChildExecution must retain exactly one AnswerBridge.');
@@ -675,6 +834,24 @@ export class ChildExecutionControlPlane {
     const agentLinks = requireRows(snapshot.snapshot[7], 'AgentConversationLink admission lookup')
       .filter((row) => row.conversation_id === child.child_conversation_id);
     if (agentLinks.length !== 1) throw new Error('Child Conversation must have one default Agent link.');
+    const executorAgentId = requirePhaseFId(agentLinks[0].agent_id, 'AgentConversationLink.agent_id');
+    const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
+      conversationId: requirePhaseFId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
+      turnId: ids.turnId,
+      executorAgentId,
+      intentKind: 'continuation',
+      sourceTurnId: requirePhaseFId(previousTurn.id, 'previous Turn.id')
+    }), ids.turnId, executorAgentId);
+    const authorityContent = await this.contentStore.prepare(
+      this.database,
+      compiled.authoritySnapshot.content,
+      compiled.authoritySnapshot.contentType
+    );
+    const messageContext = await this.contextSequence.prepareMessageAppendMutation({
+      conversationId: requirePhaseFId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
+      messageRevisionId: ids.messageRevisionId,
+      contentObjectId: requirePhaseFId(revisions[0].content_object_id, 'TurnIntentRevision.content_object_id')
+    });
     const now = this.timestamp();
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps
       ? await this.prepareNextTurnDeliverySteps(child.child_conversation_id as string, ids.turnId, now)
@@ -712,7 +889,7 @@ export class ChildExecutionControlPlane {
               child_execution_id: command.childExecutionId,
               turn_id: activeLink.turn_id
             }),
-            DOMAIN_REPOSITORIES.domain('Turn').assert(previousTurn!.id as string, { status: TERMINATED_TURN })
+            DOMAIN_REPOSITORIES.domain('Turn').assert(previousTurn.id as string, { status: TERMINATED_TURN })
           ]
         : []),
       DOMAIN_REPOSITORIES.domain('Turn').insert({
@@ -732,27 +909,67 @@ export class ChildExecutionControlPlane {
         acquired_at: now,
         expires_at: command.leaseExpiresAt
       }),
+      ...preparedContentObjectSteps([authorityContent], 'child_continuation_authority'),
       DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
         id: ids.authoritySnapshotId,
         turn_id: ids.turnId,
-        content_object_id: presets[0].preset_object_id,
+        content_object_id: authorityContent.metadata.id,
         created_at: now
       }),
       DOMAIN_REPOSITORIES.domain('TurnExecutorLink').insert({
         id: ids.executorLinkId,
         turn_id: ids.turnId,
-        agent_id: agentLinks[0].agent_id,
+        agent_id: executorAgentId,
         created_at: now
       }),
-      DOMAIN_REPOSITORIES.domain('PendingTurnInput').insertWithNextPosition({
-        id: ids.pendingTurnInputId,
-        turn_id: ids.turnId,
-        input_kind: 'continuation',
-        content_object_id: revisions[0].content_object_id,
-        state: 'pending',
+      DOMAIN_REPOSITORIES.domain('Message').insert({
+        id: ids.messageId,
         created_at: now,
+        updated_at: now,
+        deleted_at: null
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+        id: ids.messageRevisionId,
+        message_id: ids.messageId,
+        role: 'user',
+        content_object_id: revisions[0].content_object_id,
+        created_at: now
+      }, {
+        column: 'revision_seq',
+        scope: { message_id: ids.messageId }
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
+        id: ids.messageCurrentLinkId,
+        message_id: ids.messageId,
+        revision_id: ids.messageRevisionId,
         updated_at: now
       }),
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insertWithNextSequence({
+        id: ids.messageMembershipId,
+        conversation_id: child.child_conversation_id,
+        message_id: ids.messageId,
+        created_at: now
+      }, {
+        column: 'message_seq',
+        scope: { conversation_id: child.child_conversation_id }
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
+        id: ids.messageTurnLinkId,
+        turn_id: ids.turnId,
+        message_id: ids.messageId,
+        role: 'input',
+        created_at: now
+      }),
+      ...messageContext.steps,
+      ...(sourcePendingInput ? [
+        DOMAIN_REPOSITORIES.domain('PendingTurnInput').assert(
+          requirePhaseFId(sourcePendingInput.id, 'PendingTurnInput.id'),
+          { turn_id: previousTurn.id, state: 'pending' }
+        ),
+        DOMAIN_REPOSITORIES.domain('PendingTurnInput').delete(
+          requirePhaseFId(sourcePendingInput.id, 'PendingTurnInput.id')
+        )
+      ] : []),
       DOMAIN_REPOSITORIES.domain('TurnIntent').update(command.turnIntentId, {
         turn_id: ids.turnId,
         state: 'admitted',
@@ -1187,6 +1404,49 @@ export class ChildExecutionControlPlane {
     });
   }
 
+  /** Settles every still-waiting continuation invocation bound to this stable AnswerBridge. */
+  public async settleContinuationWaits(input: {
+    answerBridgeId: string;
+    detail: unknown;
+    sourceIdentity: string;
+    observedAt?: string;
+    toolCallId?: string;
+  }): Promise<ToolTerminalResult[]> {
+    const answerBridgeId = requirePhaseFId(input.answerBridgeId, 'answerBridgeId');
+    const sourceIdentity = requirePhaseFText(input.sourceIdentity, 'sourceIdentity');
+    const observedAt = requireIsoTimestamp(input.observedAt ?? this.timestamp(), 'observedAt');
+    const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
+    const operations = (await this.listRows('Operation', {
+      owner_kind: 'answer_bridge_wait',
+      owner_id: answerBridgeId,
+      status: 'waiting_answer'
+    }, 1000)).filter((operation) =>
+      input.toolCallId === undefined
+      || operation.tool_call_id === requirePhaseFId(input.toolCallId, 'toolCallId')
+    );
+    const terminals: ToolTerminalResult[] = [];
+    for (const operation of operations) {
+      const toolCallId = requirePhaseFId(operation.tool_call_id, 'Operation.tool_call_id');
+      const executions = await this.listRows('ToolExecution', { tool_call_id: toolCallId }, 2);
+      if (executions.length !== 1) throw new Error('Continuation wait requires exactly one ToolExecution.');
+      const deadline = requireIsoTimestamp(executions[0].wait_deadline_at, 'ToolExecution.wait_deadline_at');
+      const detail = Date.parse(observedAt) <= Date.parse(deadline)
+        ? input.detail
+        : childControlHandle(
+            await this.requireExisting('ChildExecution', requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id')),
+            bridge
+          );
+      const terminal = await this.settleContinuationOperation({
+        operation,
+        execution: executions[0],
+        detail,
+        sourceIdentity: `${sourceIdentity}:${Date.parse(observedAt) <= Date.parse(deadline) ? 'answer' : 'timeout'}`
+      });
+      if (terminal) terminals.push(terminal);
+    }
+    return terminals;
+  }
+
   /** Prepares first-wins foreground ToolCall settlement steps for an answer or deadline transaction. */
   public async prepareForegroundSettlement(input: {
     childExecutionId: string;
@@ -1231,6 +1491,81 @@ export class ChildExecutionControlPlane {
         ...plan.steps
       ]
     };
+  }
+
+  private async settleContinuationOperation(input: {
+    operation: DomainRow;
+    execution: DomainRow;
+    detail: unknown;
+    sourceIdentity: string;
+  }): Promise<ToolTerminalResult | null> {
+    const operationId = requirePhaseFId(input.operation.id, 'Operation.id');
+    const toolCallId = requirePhaseFId(input.operation.tool_call_id, 'Operation.tool_call_id');
+    const pauses = await this.listRows('OutcomePause', { operation_id: operationId }, 2);
+    if (pauses.length !== 1) throw new Error('Continuation wait Operation must have exactly one OutcomePause.');
+    const pause = pauses[0];
+    const receiptId = stablePhaseFId(
+      'command_receipt',
+      'continuation-wait-settle',
+      input.sourceIdentity,
+      toolCallId
+    );
+    const existingReceipt = await this.findCommandReceipt('internal', `continuation-wait:${input.sourceIdentity}:${toolCallId}`);
+    if (existingReceipt) return this.effects.readTerminalResult(toolCallId, true);
+    const plan = await this.effects.prepareTerminalPlan(toolCallId, 'succeeded', input.detail, receiptId);
+    const resolution = await this.contentStore.prepare(
+      this.database,
+      canonicalPlainJson({ kind: 'child-answer-wait-resolution', detail: input.detail }),
+      'application/vnd.limcode.child-answer-resolution+json'
+    );
+    const toolCall = await this.requireExisting('ToolCall', toolCallId);
+    const turn = await this.requireExisting('Turn', requirePhaseFId(toolCall.turn_id, 'ToolCall.turn_id'));
+    const now = this.timestamp();
+    const sourceKey = `continuation-wait:${input.sourceIdentity}:${toolCallId}`;
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+          id: receiptId,
+          source_kind: 'internal',
+          source_key: sourceKey,
+          conversation_id: turn.conversation_id,
+          turn_id: turn.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Operation').assert(operationId, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('OutcomePause').assert(
+          requirePhaseFId(pause.id, 'OutcomePause.id'),
+          { status: 'waiting', operation_id: operationId }
+        ),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').assert(
+          requirePhaseFId(input.execution.id, 'ToolExecution.id'),
+          { status: 'waiting_answer', wait_deadline_at: input.execution.wait_deadline_at }
+        ),
+        ...preparedContentObjectSteps([resolution], 'child_answer_wait_resolution'),
+        DOMAIN_REPOSITORIES.domain('OperationResolution').insert({
+          id: stablePhaseFId('operation_resolution', 'continuation-wait', pause.id),
+          pause_id: pause.id,
+          resolution_kind: 'succeeded',
+          content_object_id: resolution.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('OutcomePause').update(requirePhaseFId(pause.id, 'OutcomePause.id'), {
+          status: 'resolved',
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Operation').update(operationId, {
+          status: 'succeeded',
+          updated_at: now
+        }),
+        ...plan.steps
+      ]);
+      return this.effects.readTerminalResult(toolCallId, true);
+    } catch (error) {
+      if (!isExpectedSettlementRace(error)) throw error;
+      const terminal = await this.effects.readTerminalResult(toolCallId, true);
+      if (!terminal) throw error;
+      return terminal;
+    }
   }
 
   /** Expired foreground wait settles with a background control handle and never dispatches spawn. */
@@ -1334,7 +1669,14 @@ export class ChildExecutionControlPlane {
       DOMAIN_REPOSITORIES.domain('AnswerBridge').get(ids.answerBridgeId),
       DOMAIN_REPOSITORIES.domain('Operation').get(ids.operationId),
       DOMAIN_REPOSITORIES.domain('Attempt').get(ids.attemptId),
-      DOMAIN_REPOSITORIES.domain('EffectIntent').get(ids.effectIntentId)
+      DOMAIN_REPOSITORIES.domain('EffectIntent').get(ids.effectIntentId),
+      DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').get(ids.childAuthoritySnapshotId),
+      DOMAIN_REPOSITORIES.domain('MessageRevision').get(ids.childMessageRevisionId),
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').get(ids.childMessageMembershipId),
+      DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').list({
+        where: { conversation_id: ids.childConversationId },
+        limit: 2
+      })
     ]);
     const child = requireRow(snapshot.snapshot[0], `ChildExecution ${ids.childExecutionId}`);
     const turnLink = requireRow(snapshot.snapshot[1], `ChildExecutionTurnLink ${ids.turnLinkId}`);
@@ -1343,10 +1685,15 @@ export class ChildExecutionControlPlane {
     const operation = requireRow(snapshot.snapshot[4], `Operation ${ids.operationId}`);
     const attempt = requireRow(snapshot.snapshot[5], `Attempt ${ids.attemptId}`);
     const intent = requireRow(snapshot.snapshot[6], `EffectIntent ${ids.effectIntentId}`);
+    const authority = requireRow(snapshot.snapshot[7], `AuthoritySnapshot ${ids.childAuthoritySnapshotId}`);
+    const promptRevision = requireRow(snapshot.snapshot[8], `MessageRevision ${ids.childMessageRevisionId}`);
+    const promptMembership = requireRow(snapshot.snapshot[9], `MessagePartOfConversation ${ids.childMessageMembershipId}`);
+    const contextHeads = requireRows(snapshot.snapshot[10], 'Child Conversation Context head replay lookup');
     const expectedRequestObjectId = preparedRequest?.metadata.id ?? this.contentStore.identity(
       canonicalPlainJson(spawnRequestPayload(command, ids)),
       SUBAGENT_SPAWN_CONTENT_TYPE
     ).id;
+    const expectedPromptObjectId = this.contentStore.identity(command.prompt, 'text/plain').id;
     if (
       child.child_conversation_id !== ids.childConversationId
       || turnLink.turn_id !== ids.childTurnId
@@ -1359,6 +1706,13 @@ export class ChildExecutionControlPlane {
       || intent.attempt_id !== ids.attemptId
       || intent.effect_kind !== 'subagent_spawn'
       || intent.request_object_id !== expectedRequestObjectId
+      || authority.turn_id !== ids.childTurnId
+      || promptRevision.message_id !== ids.childMessageId
+      || promptRevision.role !== 'user'
+      || promptRevision.content_object_id !== expectedPromptObjectId
+      || promptMembership.conversation_id !== ids.childConversationId
+      || promptMembership.message_id !== ids.childMessageId
+      || contextHeads.length !== 1
     ) throw new Error('ChildExecution spawn source was replayed with different facts.');
     return spawnResult(ids, command.completionPolicy, true);
   }
@@ -1409,21 +1763,40 @@ export class ChildExecutionControlPlane {
       DOMAIN_REPOSITORIES.domain('TurnIntent').get(ids.turnIntentId),
       DOMAIN_REPOSITORIES.domain('TurnIntentRevision').get(ids.turnIntentRevisionId),
       DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').get(ids.intentLinkId),
-      DOMAIN_REPOSITORIES.domain('PendingTurnInput').get(ids.pendingTurnInputId)
+      DOMAIN_REPOSITORIES.domain('PendingTurnInput').get(ids.pendingTurnInputId),
+      DOMAIN_REPOSITORIES.domain('Operation').get(ids.operationId),
+      DOMAIN_REPOSITORIES.domain('OutcomePause').get(ids.pauseId),
+      DOMAIN_REPOSITORIES.domain('AnswerBridge').list({
+        where: { child_execution_id: command.childExecutionId },
+        limit: 2
+      })
     ]);
     const intent = requireRow(snapshot.snapshot[0], `TurnIntent ${ids.turnIntentId}`);
     const revision = requireRow(snapshot.snapshot[1], `TurnIntentRevision ${ids.turnIntentRevisionId}`);
     const link = requireRow(snapshot.snapshot[2], `ChildExecutionIntentLink ${ids.intentLinkId}`);
-    requireRow(snapshot.snapshot[3], `PendingTurnInput ${ids.pendingTurnInputId}`);
+    const pendingInput = snapshot.snapshot[3] === null
+      ? null
+      : requireRow(snapshot.snapshot[3], `PendingTurnInput ${ids.pendingTurnInputId}`);
+    const operation = requireRow(snapshot.snapshot[4], `Operation ${ids.operationId}`);
+    const pause = snapshot.snapshot[5] === null
+      ? null
+      : requireRow(snapshot.snapshot[5], `OutcomePause ${ids.pauseId}`);
+    const bridges = requireRows(snapshot.snapshot[6], 'AnswerBridge send replay lookup');
     const expectedContentObjectId = preparedContent?.metadata.id
       ?? this.contentStore.identity(command.content, command.contentType).id;
     if (
-      intent.conversation_id !== receipt.conversation_id
+      receipt.id !== ids.commandReceiptId
+      || bridges.length !== 1
       || link.child_execution_id !== command.childExecutionId
       || link.turn_intent_id !== ids.turnIntentId
       || revision.content_object_id !== expectedContentObjectId
+      || operation.owner_kind !== 'answer_bridge_wait'
+      || operation.owner_id !== bridges[0]?.id
+      || operation.tool_call_id !== command.sourceToolCallId
+      || (command.completionPolicy === 'wait_for_answer') !== (pause !== null)
+      || (pause !== null && pause.operation_id !== ids.operationId)
     ) throw new Error('ChildExecution send source was replayed with different facts.');
-    return sendResult(command, ids, true);
+    return sendResult(command, ids, pendingInput !== null, true);
   }
 
   private async findAdmissionReplay(
@@ -1438,17 +1811,29 @@ export class ChildExecutionControlPlane {
       DOMAIN_REPOSITORIES.domain('AnswerBridge').list({
         where: { child_execution_id: command.childExecutionId },
         limit: 2
-      })
+      }),
+      DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').get(ids.authoritySnapshotId),
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').get(ids.messageTurnLinkId),
+      DOMAIN_REPOSITORIES.domain('MessageRevision').get(ids.messageRevisionId)
     ]);
     const intent = requireRow(snapshot.snapshot[0], `TurnIntent ${command.turnIntentId}`);
     const turnLink = requireRow(snapshot.snapshot[1], `ChildExecutionTurnLink ${ids.turnLinkId}`);
     const bridges = requireRows(snapshot.snapshot[2], 'AnswerBridge admission replay');
+    const authority = requireRow(snapshot.snapshot[3], `AuthoritySnapshot ${ids.authoritySnapshotId}`);
+    const messageLink = requireRow(snapshot.snapshot[4], `MessageTurnLink ${ids.messageTurnLinkId}`);
+    const messageRevision = requireRow(snapshot.snapshot[5], `MessageRevision ${ids.messageRevisionId}`);
     if (
       intent.turn_id !== ids.turnId
       || intent.state !== 'admitted'
       || turnLink.child_execution_id !== command.childExecutionId
       || turnLink.turn_id !== ids.turnId
       || bridges.length !== 1
+      || authority.turn_id !== ids.turnId
+      || messageLink.turn_id !== ids.turnId
+      || messageLink.message_id !== ids.messageId
+      || messageLink.role !== 'input'
+      || messageRevision.message_id !== ids.messageId
+      || messageRevision.role !== 'user'
     ) throw new Error('Child continuation admission source was replayed with different facts.');
     return {
       childExecutionId: command.childExecutionId,
@@ -1561,7 +1946,7 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   return {
     sourceToolCallId,
     childAgentId,
-    prompt: command.prompt,
+    prompt: requirePhaseFText(command.prompt, 'prompt'),
     completionPolicy,
     ...(waitDeadlineAt ? { waitDeadlineAt } : {}),
     ...(optionalPhaseFId(command.childConversationId, 'childConversationId')
@@ -1579,14 +1964,27 @@ function normalizeSendCommand(command: ChildExecutionSendCommand) {
   if (typeof command.content !== 'string' && !(command.content instanceof Uint8Array)) {
     throw new TypeError('ChildExecution send content must be text or bytes.');
   }
+  const completionPolicy = requireCompletionPolicy(command.completionPolicy);
+  const waitDeadlineAt = command.waitDeadlineAt === undefined
+    ? undefined
+    : requireIsoTimestamp(command.waitDeadlineAt, 'waitDeadlineAt');
+  if (completionPolicy === 'wait_for_answer' && !waitDeadlineAt) {
+    throw new TypeError('wait_for_answer continuation requires a persisted waitDeadlineAt.');
+  }
+  if (completionPolicy === 'background' && waitDeadlineAt) {
+    throw new TypeError('background continuation must not persist a wait deadline.');
+  }
   return {
     sourceKey: requirePhaseFText(command.sourceKey, 'sourceKey'),
+    sourceToolCallId: requirePhaseFId(command.sourceToolCallId, 'sourceToolCallId'),
     childExecutionId: requirePhaseFId(command.childExecutionId, 'childExecutionId'),
     mode: requireSendMode(command.mode),
     content: command.content,
     contentType: command.contentType === undefined
       ? 'text/plain'
-      : requirePhaseFText(command.contentType, 'contentType')
+      : requirePhaseFText(command.contentType, 'contentType'),
+    completionPolicy,
+    ...(waitDeadlineAt ? { waitDeadlineAt } : {})
   };
 }
 
@@ -1615,12 +2013,16 @@ function spawnIds(command: ReturnType<typeof normalizeSpawnCommand>): SpawnIds {
   return {
     childExecutionId,
     childConversationId,
-    childRootId: stablePhaseFId('context_sequence_root', 'child', source),
-    childHeadLinkId: stablePhaseFId('conversation_context_head_link', 'child', source),
     childAgentLinkId: stablePhaseFId('agent_conversation_link', 'child', source),
     childTurnId: stablePhaseFId('turn', 'child-first', source),
     childLeaseId: stablePhaseFId('execution_lease', 'child-first', source),
     childExecutorLinkId: stablePhaseFId('turn_executor_link', 'child-first', source),
+    childAuthoritySnapshotId: stablePhaseFId('authority_snapshot', 'child-first', source),
+    childMessageId: stablePhaseFId('message', 'child-first', source),
+    childMessageRevisionId: stablePhaseFId('message_revision', 'child-first', source),
+    childMessageCurrentLinkId: stablePhaseFId('message_current_revision_link', 'child-first', source),
+    childMessageMembershipId: stablePhaseFId('message_conversation_link', 'child-first', source),
+    childMessageTurnLinkId: stablePhaseFId('message_turn_link', 'child-first', source),
     parentLinkId: stablePhaseFId('child_execution_parent_link', source),
     turnLinkId: stablePhaseFId('child_execution_turn_link', 'first', source),
     activeTurnLinkId: stablePhaseFId('child_execution_active_turn_link', source),
@@ -1642,6 +2044,9 @@ function spawnRequestPayload(
     childTurnId: ids.childTurnId,
     answerBridgeId: ids.answerBridgeId,
     childAgentId: command.childAgentId,
+    authoritySnapshotId: ids.childAuthoritySnapshotId,
+    inputMessageId: ids.childMessageId,
+    inputMessageRevisionId: ids.childMessageRevisionId,
     completionPolicy: command.completionPolicy,
     waitDeadlineAt: command.waitDeadlineAt ?? null,
     title: command.title,
@@ -1672,20 +2077,23 @@ function spawnResult(
 }
 
 function sendIds(command: ReturnType<typeof normalizeSendCommand>) {
-  const scope = [command.childExecutionId, command.sourceKey, command.mode];
+  const scope = [command.childExecutionId, command.sourceKey, command.sourceToolCallId, command.mode];
   return {
     commandReceiptId: stablePhaseFId('command_receipt', 'child-send', ...scope),
     turnIntentId: stablePhaseFId('turn_intent', 'child-send', ...scope),
     turnIntentRevisionId: stablePhaseFId('turn_intent_revision', 'child-send', ...scope),
     presetRevisionId: stablePhaseFId('turn_execution_preset_revision', 'child-send', ...scope),
     intentLinkId: stablePhaseFId('child_execution_intent_link', 'child-send', ...scope),
-    pendingTurnInputId: stablePhaseFId('pending_turn_input', 'child-send', ...scope)
+    pendingTurnInputId: queuedIntentPendingInputId(command.childExecutionId, stablePhaseFId('turn_intent', 'child-send', ...scope)),
+    operationId: stablePhaseFId('operation', 'child-send', ...scope),
+    pauseId: stablePhaseFId('outcome_pause', 'child-send', ...scope)
   };
 }
 
 function sendResult(
   command: ReturnType<typeof normalizeSendCommand>,
   ids: ReturnType<typeof sendIds>,
+  hasPendingTurnInput: boolean,
   deduplicated: boolean,
   commitSeq?: string
 ): ChildExecutionSendResult {
@@ -1693,11 +2101,18 @@ function sendResult(
     childExecutionId: command.childExecutionId,
     turnIntentId: ids.turnIntentId,
     intentLinkId: ids.intentLinkId,
-    pendingTurnInputId: ids.pendingTurnInputId,
+    ...(hasPendingTurnInput ? { pendingTurnInputId: ids.pendingTurnInputId } : {}),
+    operationId: ids.operationId,
+    ...(command.completionPolicy === 'wait_for_answer' ? { pauseId: ids.pauseId } : {}),
     mode: command.mode,
+    completionPolicy: command.completionPolicy,
     deduplicated,
     ...(commitSeq ? { commitSeq } : {})
   };
+}
+
+function queuedIntentPendingInputId(childExecutionId: string, turnIntentId: string): string {
+  return stablePhaseFId('pending_turn_input', 'child-send-intent', childExecutionId, turnIntentId);
 }
 
 function admissionIds(command: ReturnType<typeof normalizeAdmissionCommand>) {
@@ -1708,7 +2123,11 @@ function admissionIds(command: ReturnType<typeof normalizeAdmissionCommand>) {
     leaseId: stablePhaseFId('execution_lease', 'child-continuation', ...scope),
     authoritySnapshotId: stablePhaseFId('authority_snapshot', 'child-continuation', ...scope),
     executorLinkId: stablePhaseFId('turn_executor_link', 'child-continuation', ...scope),
-    pendingTurnInputId: stablePhaseFId('pending_turn_input', 'child-continuation', ...scope),
+    messageId: stablePhaseFId('message', 'child-continuation', ...scope),
+    messageRevisionId: stablePhaseFId('message_revision', 'child-continuation', ...scope),
+    messageCurrentLinkId: stablePhaseFId('message_current_revision_link', 'child-continuation', ...scope),
+    messageMembershipId: stablePhaseFId('message_conversation_link', 'child-continuation', ...scope),
+    messageTurnLinkId: stablePhaseFId('message_turn_link', 'child-continuation', ...scope),
     turnLinkId: stablePhaseFId('child_execution_turn_link', 'child-continuation', ...scope)
   };
 }

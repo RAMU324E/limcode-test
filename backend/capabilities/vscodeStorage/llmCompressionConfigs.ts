@@ -8,7 +8,7 @@ import type {
   LlmCompressionTriggerMode
 } from '../../../shared/protocol';
 import { DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS, DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT, createDefaultLlmCompressionConfig } from '../../../shared/protocol';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 import { INDEX_FILE } from './constants';
 import { loadRecordStore, removeRecordStoreRecord, saveRecordStore } from './recordStore';
 

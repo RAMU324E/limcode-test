@@ -1,0 +1,129 @@
+import type {
+  InlineDataPart,
+  LlmProviderConfigRecord,
+  LlmProviderKind
+} from '../../shared/protocol';
+import { createLlmProviderCapability } from '../capabilities/llmProvider';
+import type { ReliableAgentProviderRegistry } from './agentLoop';
+import { LlmCapabilityFullRequestAdapter } from './llmCapabilityProviderAdapter';
+import type { FullRequestProviderAdapter } from './modelProviderControlPlane';
+
+export interface ReliableLlmProviderRegistryOptions {
+  loadProviderConfig(providerConfigId: string): Promise<LlmProviderConfigRecord>;
+  proxy?: () => string | undefined | Promise<string | undefined>;
+  headers?: Record<string, string>;
+  resolveAttachment?: (input: {
+    attachmentId?: string;
+    sourcePath?: string;
+    mimeType?: string;
+    name?: string;
+  }) => Promise<InlineDataPart | undefined>;
+}
+
+/**
+ * Product Provider registry backed by the existing stateless LLM capability.
+ *
+ * Provider/model identity always comes from the frozen ModelRequest. Capability-local retries are
+ * disabled because ModelProviderControlPlane owns the visible, durable two-attempt retry contract.
+ */
+export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistry {
+  private readonly adapters = new Map<string, FullRequestProviderAdapter>();
+  private readonly capability;
+  private disposed = false;
+
+  public constructor(private readonly options: ReliableLlmProviderRegistryOptions) {
+    this.capability = createLlmProviderCapability({
+      settings: async (request) => {
+        const frozen = request && 'model' in request ? request.model : undefined;
+        const providerConfigId = requireId(frozen?.providerConfigId, 'Frozen providerConfigId');
+        const modelId = requireId(frozen?.model, 'Frozen modelId');
+        const config = await this.options.loadProviderConfig(providerConfigId);
+        if (config.id !== providerConfigId) {
+          throw new Error(`Provider settings authority returned ${config.id} for frozen id ${providerConfigId}.`);
+        }
+        return applyFrozenModelProviderConfig(config, modelId, frozen?.provider);
+      },
+      ...(this.options.proxy ? { proxy: this.options.proxy } : {}),
+      ...(this.options.headers ? { headers: { ...this.options.headers } } : {}),
+      ...(this.options.resolveAttachment ? { resolveAttachment: this.options.resolveAttachment } : {})
+    });
+  }
+
+  public resolve(providerIdInput: string): FullRequestProviderAdapter {
+    this.requireOpen();
+    const providerId = requireId(providerIdInput, 'providerId');
+    const existing = this.adapters.get(providerId);
+    if (existing) return existing;
+    const adapter = new LlmCapabilityFullRequestAdapter(providerId, this.capability);
+    this.adapters.set(providerId, adapter);
+    return adapter;
+  }
+
+  public listModels(config: LlmProviderConfigRecord) {
+    this.requireOpen();
+    return this.capability.listModels(config);
+  }
+
+  public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.adapters.clear();
+    this.capability.dispose();
+  }
+
+  private requireOpen(): void {
+    if (this.disposed) throw new Error('ReliableLlmProviderRegistry is disposed.');
+  }
+}
+
+/** Applies the exact frozen model and its complete per-model settings without mutating config data. */
+export function applyFrozenModelProviderConfig(
+  config: LlmProviderConfigRecord,
+  modelIdInput: string,
+  providerOverride?: LlmProviderKind
+): LlmProviderConfigRecord {
+  const modelId = requireId(modelIdInput, 'modelId');
+  const known = config.model.trim() === modelId
+    || config.models.some((candidate) => candidate.id.trim() === modelId)
+    || config.modelConfigs.some((candidate) => candidate.modelId.trim() === modelId);
+  if (!known) throw new Error(`Provider ${config.id} does not contain frozen model ${modelId}.`);
+
+  const modelConfig = config.modelConfigs.find((candidate) => candidate.modelId.trim() === modelId);
+  const resolved: LlmProviderConfigRecord = {
+    ...config,
+    ...(providerOverride ? { provider: providerOverride } : {}),
+    model: modelId,
+    ...(modelConfig ? {
+      toolCallFormat: modelConfig.toolCallFormat,
+      openaiResponsesTransport: modelConfig.openaiResponsesTransport,
+      stream: modelConfig.stream,
+      enableMultimodalTools: modelConfig.enableMultimodalTools,
+      ...(modelConfig.contextWindowTokens === undefined
+        ? { contextWindowTokens: undefined }
+        : { contextWindowTokens: modelConfig.contextWindowTokens }),
+      ...(modelConfig.promptCache === undefined ? { promptCache: undefined } : { promptCache: modelConfig.promptCache }),
+      ...(modelConfig.headers === undefined ? { headers: undefined } : { headers: { ...modelConfig.headers } }),
+      ...(modelConfig.generationConfig === undefined
+        ? { generationConfig: undefined }
+        : { generationConfig: { ...modelConfig.generationConfig } }),
+      ...(modelConfig.requestBody === undefined
+        ? { requestBody: undefined }
+        : { requestBody: { ...modelConfig.requestBody } })
+    } : {}),
+    // Reliable retry identity lives in ModelRequest/Attempt; the capability must not retry invisibly.
+    retryOnError: false,
+    retryMaxAttempts: 0
+  };
+
+  if (modelConfig?.contextWindowTokens === undefined) delete resolved.contextWindowTokens;
+  if (modelConfig?.promptCache === undefined && modelConfig) delete resolved.promptCache;
+  if (modelConfig?.headers === undefined && modelConfig) delete resolved.headers;
+  if (modelConfig?.generationConfig === undefined && modelConfig) delete resolved.generationConfig;
+  if (modelConfig?.requestBody === undefined && modelConfig) delete resolved.requestBody;
+  return resolved;
+}
+
+function requireId(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
+  return value.trim();
+}

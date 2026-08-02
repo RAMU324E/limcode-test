@@ -4,26 +4,20 @@ import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, Icon
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import type { AgentRecord, InlineDataPart, LlmProviderConfigRecord, LlmProviderModelRecord, MessageContent, WorkEnvironmentRecord } from '@shared/protocol';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useConversationSettingsStore } from '@webview/stores/useConversationSettingsStore';
 import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
-import { useConversationCommandStore } from '@webview/stores/useConversationCommandStore';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { DEFAULT_WORKFLOW_OPTION_ID, useWorkflowStore } from '@webview/stores/useWorkflowStore';
 import { useWorkEnvironmentStore } from '@webview/stores/useWorkEnvironmentStore';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
-import { useCompression } from '@webview/composables/useCompression';
 import { useChat } from '@webview/composables/useChat';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import RichContentEditor from '@webview/components/content/RichContentEditor.vue';
 import AskUserTopPanel from '@webview/components/askUser/AskUserTopPanel.vue';
-import QueuePanel, { type QueueItem } from '@webview/components/input/QueuePanel.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import SettingsSelectableList, { type SettingsSelectableListItem } from '@webview/components/settings/global/SettingsSelectableList.vue';
-import ContextTokenUsageBar from '@webview/components/conversation/ContextTokenUsageBar.vue';
-import AgentRunPanel from '@webview/components/input/AgentRunPanel.vue';
-import ReliabilityCommandPanel from '@webview/components/input/ReliabilityCommandPanel.vue';
 import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
@@ -42,26 +36,16 @@ const emit = defineEmits<{
 }>();
 
 const clientState = useClientStateStore();
-const conversationTimeline = useConversationTimelineStore();
 const globalSettings = useGlobalSettingsStore();
 const conversationSettings = useConversationSettingsStore();
 const workflowStore = useWorkflowStore();
 const agentStore = useAgentStore();
 const modelProfileStore = useModelProfileStore();
 const workEnvironmentStore = useWorkEnvironmentStore();
-const compression = useCompression();
 const ui = useConversationUiStore();
-const commands = useConversationCommandStore();
 const session = useSessionStore();
-const {
-  interruptCurrentConversation,
-  cancelTurnIntent,
-  promoteTurnIntent,
-  reorderTurnIntents,
-  pauseTurnIntent,
-  resumeTurnIntent,
-  resumeAllTurnIntents
-} = useChat();
+const reliableConversation = useReliableConversation();
+const { interruptCurrentConversation } = useChat();
 const highlighted = ref(false);
 const editorExpanded = ref(false);
 const editor = ref<{ focus: () => void } | null>(null);
@@ -86,18 +70,12 @@ const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
 const sendTitle = computed(() => {
   if (ui.isEditing) return '提交编辑';
-  return runSummary.value.isRunning ? '加入消息队列（不会解除当前审批或等待）' : '发送';
+  return execution.value ? '加入消息队列（不会解除当前审批或等待）' : '发送';
 });
-const compacting = compression.compressionActive;
-const compressionBusy = computed(() => compacting.value || compression.compressionRequestPending.value);
-const compactTitle = computed(() => compressionBusy.value ? '上下文压缩进行中（当前版本暂不支持取消）' : '压缩当前上下文');
-const runSummary = computed(() => clientState.currentRunSummary);
-const execution = computed(() => clientState.currentExecution);
-const interruptPending = computed(() => !!execution.value && commands.isTargetPending(
-  clientState.currentConversationId,
-  execution.value.turn.id,
-  'interrupt'
+const execution = computed(() => Object.values(reliableConversation.feed.records.Turn ?? {}).find((turn) =>
+  turn.conversation_id === reliableConversation.conversationId.value && turn.status === 'active'
 ));
+const interruptPending = ref(false);
 const channelOptions = computed<SettingsDropdownOption[]>(() =>
   globalSettings.llmProviderConfigs.configs.map((config) => {
     const model = selectedModelForConfig(config);
@@ -356,40 +334,6 @@ function interruptConversation(): void {
   interruptCurrentConversation();
 }
 
-function onQueueEdit(item: QueueItem): void {
-  ui.startEditTurnIntent({ intentId: item.intentId, rowVersion: item.rowVersion }, item.text);
-}
-
-function onQueueDelete(item: QueueItem): void {
-  cancelTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
-}
-
-function onQueueForceSend(item: QueueItem): void {
-  promoteTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
-}
-
-function onQueueReorder(items: QueueItem[]): void {
-  reorderTurnIntents(items.map((item) => ({ id: item.intentId, rowVersion: item.rowVersion })));
-}
-
-function onQueuePause(item: QueueItem): void {
-  pauseTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
-}
-
-function onQueueResume(item: QueueItem): void {
-  resumeTurnIntent({ id: item.intentId, rowVersion: item.rowVersion });
-}
-
-function onQueueResumeAll(): void {
-  resumeAllTurnIntents();
-}
-
-function compactConversation(): void {
-  if (conversationInputDisabled.value || compressionBusy.value) return;
-  compression.createCompression();
-}
-
-
 function toggleEditorExpanded(): void {
   if (!editorExpanded.value) {
     collapsedEditorHeight.value = editorShell.value?.getBoundingClientRect().height ?? 0;
@@ -618,17 +562,7 @@ function middleEllipsis(value: string, maxLength: number): string {
   <div class="composer" :class="{ 'is-editing': ui.isEditing, 'is-highlighted': highlighted, 'is-editor-expanded': editorExpanded }">
     <div class="composer-zone composer-zone-top" aria-label="输入框上方功能区">
       <div class="composer-top-main">
-        <ReliabilityCommandPanel />
         <AskUserTopPanel />
-        <QueuePanel
-          @edit="onQueueEdit"
-          @delete="onQueueDelete"
-          @force-send="onQueueForceSend"
-          @reorder="onQueueReorder"
-          @pause="onQueuePause"
-          @resume="onQueueResume"
-          @resume-all="onQueueResumeAll"
-        />
         <div v-if="ui.isEditing" class="composer-edit-indicator">
           <span class="composer-edit-indicator-icon" aria-hidden="true">
             <IconPencilExclamation stroke="2" />
@@ -656,7 +590,6 @@ function middleEllipsis(value: string, maxLength: number): string {
         </div>
       </div>
       <div class="composer-top-actions">
-        <AgentRunPanel />
         <BackgroundCommandPanel />
       </div>
     </div>
@@ -863,21 +796,6 @@ function middleEllipsis(value: string, maxLength: number): string {
           {{ runtimeBadgeLabel }}
         </button>
       </HoverTooltipPanel>
-      <ContextTokenUsageBar class="composer-token-usage" />
-      <button
-        type="button"
-        class="composer-compact"
-        :class="{ 'is-compacting': compressionBusy }"
-        :disabled="conversationInputDisabled || compressionBusy || conversationTimeline.currentTotalMessages < 2"
-        :aria-label="compactTitle"
-        :title="compactTitle"
-        @click="compactConversation"
-      >
-        <svg class="composer-compact-icon" :class="{ 'is-compacting': compressionBusy }" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
-          <path class="composer-compact-icon-top" d="M5 5h14l-7 6z" />
-          <path class="composer-compact-icon-bottom" d="M5 19h14l-7 -6z" />
-        </svg>
-      </button>
       <button
         type="button"
         class="composer-send"

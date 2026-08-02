@@ -1,34 +1,24 @@
 import type { Entity, WorldReader } from '../../../ecs/types';
 import { ToolCallRunLink } from '../agentRun/components';
+import {
+  type ToolSchedulingDecision,
+  type ToolSchedulingMode
+} from './schedulingContract';
+export {
+  normalizeSchedulingHint,
+  staticToolScheduling,
+  type ToolSchedulingContext,
+  type ToolSchedulingDecision,
+  type ToolSchedulingMode,
+  type ToolSchedulingResolver
+} from './schedulingContract';
 import { InFlight } from '../chat/components';
 import { ToolCall, ToolResultConsumed, ToolState, type ToolStateData } from './components';
 import { ToolDefinitionsKey, ToolRuntimeDefinitionsKey } from './resources';
 
-export type ToolSchedulingMode = 'parallel' | 'serial';
-
-export interface ToolSchedulingDecision {
-  mode: ToolSchedulingMode;
-  reason?: string;
-}
-
-export interface ToolSchedulingContext {
-  toolName: string;
-}
-
-export type ToolSchedulingResolver = (args: unknown, ctx: ToolSchedulingContext) => ToolSchedulingDecision | undefined;
-
 export interface ActiveToolExecutionBatch {
   mode: ToolSchedulingMode;
   calls: Set<Entity>;
-}
-
-export function staticToolScheduling(mode: ToolSchedulingMode, reason?: string): ToolSchedulingResolver {
-  return () => ({ mode, ...(reason ? { reason } : {}) });
-}
-
-export function normalizeSchedulingHint(value: unknown): 'auto' | 'parallel' | 'serial' {
-  if (value === 'parallel' || value === 'serial') return value;
-  return 'auto';
 }
 
 export function isInActiveExecutionBatch(world: WorldReader, run: Entity, toolCall: Entity): boolean {

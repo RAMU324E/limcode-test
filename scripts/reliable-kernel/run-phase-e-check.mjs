@@ -457,6 +457,17 @@ async function checkContextStorageGrowth() {
     );
     const p95 = percentile95(samples);
     assert.ok(p95 < 50, `1000-node full materialization p95 ${p95}ms (structure p95 ${structuralP95}ms)`);
+    const workerDiagnostics = await ctx.database.inspect();
+    assert.ok(workerDiagnostics.contextCasCache.entries <= workerDiagnostics.contextCasCache.maxEntries);
+    assert.ok(workerDiagnostics.contextCasCache.bytes <= workerDiagnostics.contextCasCache.maxBytes);
+    assert.ok(
+      workerDiagnostics.contextCasCache.hits >= 40_000,
+      `expected warmed Context CAS reuse, got ${workerDiagnostics.contextCasCache.hits} hits`
+    );
+    assert.ok(
+      workerDiagnostics.contextCasCache.misses <= 1_000,
+      `expected at most one verified filesystem read per immutable Context object, got ${workerDiagnostics.contextCasCache.misses} misses`
+    );
     await closeAndCheckpoint(ctx);
     await reopen(ctx, 'phase-e-performance-long-history-write');
     const longHistoryContext = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
@@ -487,6 +498,7 @@ async function checkContextStorageGrowth() {
       materializationP95Ms: p95,
       heartbeatTicks,
       responsiveMaterializationSamples: responsiveSamples,
+      contextCasCache: workerDiagnostics.contextCasCache,
       ordinaryAppendHistoricalReads: forbiddenHistoryReads,
       ordinaryAppendRepositoryReads: ordinaryReads.length,
       longHistoryWriteBytes,
@@ -494,7 +506,7 @@ async function checkContextStorageGrowth() {
     };
   });
   metrics.performance = performanceMetrics;
-  assertions.push(`普通append使用≤20次identity-bounded Repository读取且不物化/哈希历史；2x规模中位耗时比${performanceMetrics.scaleRatio.toFixed(3)}≤2.5；真实1000节点+CAS物化p95=${performanceMetrics.materializationP95Ms.toFixed(3)}ms<50ms，至少30/40次调用期间事件循环持续心跳；1000节点后的单次DB+WAL+CAS写入仍低于量化上限`);
+  assertions.push(`普通append使用≤20次identity-bounded Repository读取且不物化/哈希历史；2x规模中位耗时比${performanceMetrics.scaleRatio.toFixed(3)}≤2.5；真实1000节点+CAS物化p95=${performanceMetrics.materializationP95Ms.toFixed(3)}ms<50ms，至少30/40次调用期间事件循环持续心跳；Context CAS缓存保持有界且命中${performanceMetrics.contextCasCache.hits}次；1000节点后的单次DB+WAL+CAS写入仍低于量化上限`);
 
   return { assertions, faults, metrics };
 }

@@ -1,7 +1,7 @@
 import { normalizeSubmitPlanToolRequest, submitPlanOutputFromResult } from '../../../../../../shared/planReview';
 import { SUBMIT_PLAN_TOOL_NAME } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
-import { staticToolScheduling } from '../../scheduling';
+import { staticToolScheduling } from '../../schedulingContract';
 import { TASK_LIST_OPERATION_SCHEMA } from '../taskList';
 import { defineToolDefinitionModule } from '../types';
 

@@ -1,7 +1,7 @@
 import { askUserOutputFromResult, normalizeAskUserToolRequest } from '../../../../../../shared/askUser';
 import { ASK_USER_TOOL_NAME } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
-import { staticToolScheduling } from '../../scheduling';
+import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 
 const OPTION_SCHEMA: Record<string, unknown> = {

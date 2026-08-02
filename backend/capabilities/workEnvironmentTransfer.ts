@@ -577,7 +577,8 @@ class RemoteCommandEndpoint implements Endpoint {
   }
 }
 
-function assertExecOk(result: { exitCode: number; killed: boolean; stderr: string }, op: string): void {
+function assertExecOk(result: { exitCode: number | null; killed: boolean; stderr: string }, op: string): void {
+  if (result.exitCode === null) throw new Error(`${op} 未进入终态，无法判定执行结果。`);
   if (result.exitCode !== 0 || result.killed) throw new Error(`${op} 失败: exitCode=${result.exitCode} stderr=${result.stderr}`);
 }
 

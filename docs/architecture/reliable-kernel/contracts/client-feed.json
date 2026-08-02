@@ -104,8 +104,11 @@
   "details": {
     "onDemand": [
       "message-content",
+      "tool-arguments-content",
       "tool-result-content",
+      "file-change-base-content",
       "file-change-content",
+      "file-change-diff",
       "process-output",
       "context-projection-detail",
       "answer-content"

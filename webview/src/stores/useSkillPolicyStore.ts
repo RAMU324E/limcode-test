@@ -42,7 +42,6 @@ function defaultPolicyName(scopeKind: SkillPolicyScopeKind): string {
     case 'global': return '全局默认技能策略';
     case 'conversation': return '对话技能策略';
     case 'agent': return 'Agent 技能策略';
-    case 'agentSystem': return '多 Agent 系统技能策略';
     case 'workflow': return '工作流技能策略';
     case 'run': return '运行技能策略';
   }

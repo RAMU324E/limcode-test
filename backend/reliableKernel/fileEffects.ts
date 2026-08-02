@@ -33,6 +33,9 @@ export interface FileChangeProposalMemberInput {
   workEnvironmentId: string;
   targetPath: string;
   baseDigest?: string | null;
+  /** Exact pre-mutation bytes for replace/delete. Persisted in CAS so a completed Diff can reopen. */
+  baseContent?: string | Uint8Array;
+  baseContentType?: string;
   targetContent?: string | Uint8Array;
   contentType?: string;
 }
@@ -55,6 +58,18 @@ export interface FileChangeDecisionResult {
   preparedEffect?: PreparedEffectIntent;
   terminal?: ToolTerminalResult;
   commitSeq?: string;
+}
+
+export interface FileChangeDiffMemberSnapshot {
+  memberId: string;
+  changeSetId: string;
+  toolCallId: string;
+  memberSeq: string;
+  operation: FileChangeOperation;
+  workEnvironmentId: string;
+  targetPath: string;
+  baseContent: Buffer | null;
+  targetContent: Buffer | null;
 }
 
 export interface FileMutationMemberObservation {
@@ -94,6 +109,7 @@ interface StoredMember {
   workEnvironmentId: string;
   targetPath: string;
   baseDigest: string | null;
+  baseContentObjectId: string | null;
   targetContentObjectId: string | null;
   targetDigest: string | null;
 }
@@ -107,6 +123,7 @@ interface FileEffectRequest {
     workEnvironmentId: string;
     targetPath: string;
     baseDigest: string | null;
+    baseContentObjectId: string | null;
     targetContentObjectId: string | null;
     targetDigest: string | null;
   }>;
@@ -160,18 +177,32 @@ export class FileChangeControlPlane {
       throw new Error(`ToolCall ${toolCallId} cannot create a FileChangeSet from ${String(facts.toolCall.status)}/${String(facts.execution.status)}.`);
     }
     const now = this.timestamp();
-    const preparedMembers: Array<{ row: DomainRow; content?: PreparedContentObject }> = [];
+    const preparedMembers: Array<{
+      row: DomainRow;
+      baseContent?: PreparedContentObject;
+      targetContent?: PreparedContentObject;
+    }> = [];
     for (let index = 0; index < input.members.length; index += 1) {
       const member = normalizeProposalMember(input.members[index]);
       const memberId = stablePhaseDId('file_change_set_member', `${changeSetId}:${index + 1}`);
-      const content = member.targetContent === undefined
+      const baseContent = member.baseContent === undefined
+        ? undefined
+        : await this.contentStore.prepare(
+            this.database,
+            member.baseContent,
+            member.baseContentType ?? 'application/octet-stream'
+          );
+      if (baseContent && baseContent.metadata.sha256 !== member.baseDigest) {
+        throw new Error('baseContent digest does not match FileChangeSetMember.baseDigest.');
+      }
+      const targetContent = member.targetContent === undefined
         ? undefined
         : await this.contentStore.prepare(
             this.database,
             member.targetContent,
             member.contentType ?? 'application/octet-stream'
           );
-      const targetDigest = content?.metadata.sha256 ?? targetDigestWithoutContent(member.operation);
+      const targetDigest = targetContent?.metadata.sha256 ?? targetDigestWithoutContent(member.operation);
       preparedMembers.push({
         row: {
           id: memberId,
@@ -181,11 +212,13 @@ export class FileChangeControlPlane {
           work_environment_id: member.workEnvironmentId,
           target_path: member.targetPath,
           base_digest: member.baseDigest,
-          target_content_object_id: content?.metadata.id ?? null,
+          base_content_object_id: baseContent?.metadata.id ?? null,
+          target_content_object_id: targetContent?.metadata.id ?? null,
           target_digest: targetDigest,
           created_at: now
         },
-        ...(content ? { content } : {})
+        ...(baseContent ? { baseContent } : {}),
+        ...(targetContent ? { targetContent } : {})
       });
     }
     const proposalBody = await this.contentStore.prepare(
@@ -200,13 +233,18 @@ export class FileChangeControlPlane {
           workEnvironmentId: row.work_environment_id,
           targetPath: row.target_path,
           baseDigest: row.base_digest,
+          baseContentObjectId: row.base_content_object_id,
           targetContentObjectId: row.target_content_object_id,
           targetDigest: row.target_digest
         }))
       }),
       'application/vnd.limcode.file-change-proposal+json'
     );
-    const allContent = [proposalBody, ...preparedMembers.flatMap((entry) => entry.content ? [entry.content] : [])];
+    const allContent = [
+      proposalBody,
+      ...preparedMembers.flatMap((entry) => [entry.baseContent, entry.targetContent]
+        .filter((content): content is PreparedContentObject => content !== undefined))
+    ];
     const committed = await this.commitSource({
       source,
       receiptId,
@@ -241,6 +279,12 @@ export class FileChangeControlPlane {
           id: stablePhaseDId('interaction_owner_link', interactionRequestId),
           request_id: interactionRequestId,
           turn_id: facts.turn.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').insert({
+          id: stablePhaseDId('interaction_tool_call_link', interactionRequestId),
+          request_id: interactionRequestId,
+          tool_call_id: toolCallId,
           created_at: now
         }),
         DOMAIN_REPOSITORIES.domain('ToolCall').update(toolCallId, {
@@ -357,6 +401,7 @@ export class FileChangeControlPlane {
           workEnvironmentId: member.workEnvironmentId,
           targetPath: member.targetPath,
           baseDigest: member.baseDigest,
+          baseContentObjectId: member.baseContentObjectId,
           targetContentObjectId: member.targetContentObjectId,
           targetDigest: member.targetDigest
         }))
@@ -504,6 +549,26 @@ export class FileChangeControlPlane {
       commitSeq: committed.commitSeq,
       ...(terminal ? { terminal: { ...terminal, receiptId } } : {})
     };
+  }
+
+  /** Reads immutable proposal bytes for inline/VS Code Diff. Workspace state is intentionally ignored. */
+  public async readDiffMember(memberIdInput: string): Promise<FileChangeDiffMemberSnapshot> {
+    const memberId = requireId(memberIdInput, 'memberId');
+    const row = await this.requireExisting('FileChangeSetMember', memberId);
+    const stored = this.storedMemberFromRow(row);
+    await this.assertStoredMemberContent(stored);
+    const changeSetId = requireId(row.change_set_id, 'FileChangeSetMember.change_set_id');
+    const changeSet = await this.requireExisting('FileChangeSet', changeSetId);
+    return this.materializeDiffMember(stored, changeSetId, requireId(changeSet.tool_call_id, 'FileChangeSet.tool_call_id'));
+  }
+
+  public async readToolDiffMembers(toolCallIdInput: string): Promise<FileChangeDiffMemberSnapshot[]> {
+    const toolCallId = requireId(toolCallIdInput, 'toolCallId');
+    const changeSets = await this.list('FileChangeSet', { tool_call_id: toolCallId }, 2);
+    if (changeSets.length !== 1) throw new Error(`ToolCall ${toolCallId} must have one FileChangeSet to open Diff.`);
+    const changeSetId = requireId(changeSets[0].id, 'FileChangeSet.id');
+    const members = await this.readStoredMembers(changeSetId);
+    return Promise.all(members.map((member) => this.materializeDiffMember(member, changeSetId, toolCallId)));
   }
 
   /** Builds only the unresolved-file facts that must share the Turn terminal transaction. */
@@ -831,16 +896,70 @@ export class FileChangeControlPlane {
       ) throw new Error('File proposal member reference does not match SQLite facts.');
       return row;
     }));
-    return rows.map((row) => ({
+    return Promise.all(rows.map(async (row) => {
+      const member = this.storedMemberFromRow(row);
+      await this.assertStoredMemberContent(member);
+      return member;
+    }));
+  }
+
+  private storedMemberFromRow(row: DomainRow): StoredMember {
+    return {
       id: requireId(row.id, 'FileChangeSetMember.id'),
       memberSeq: requireBigInt(row.member_seq, 'FileChangeSetMember.member_seq'),
       operation: requireOperation(row.operation),
       workEnvironmentId: requireId(row.work_environment_id, 'FileChangeSetMember.work_environment_id'),
       targetPath: requireText(row.target_path, 'FileChangeSetMember.target_path'),
       baseDigest: nullableDigest(row.base_digest, 'FileChangeSetMember.base_digest'),
+      baseContentObjectId: nullableId(row.base_content_object_id, 'FileChangeSetMember.base_content_object_id'),
       targetContentObjectId: nullableId(row.target_content_object_id, 'FileChangeSetMember.target_content_object_id'),
       targetDigest: nullableTargetDigest(row.target_digest, 'FileChangeSetMember.target_digest')
-    }));
+    };
+  }
+
+  private async materializeDiffMember(
+    member: StoredMember,
+    changeSetId: string,
+    toolCallId: string
+  ): Promise<FileChangeDiffMemberSnapshot> {
+    const read = async (contentObjectId: string | null): Promise<Buffer | null> => {
+      if (!contentObjectId) return null;
+      return this.contentStore.read(await this.requireContentObject(contentObjectId));
+    };
+    return {
+      memberId: member.id,
+      changeSetId,
+      toolCallId,
+      memberSeq: member.memberSeq.toString(),
+      operation: member.operation,
+      workEnvironmentId: member.workEnvironmentId,
+      targetPath: member.targetPath,
+      baseContent: await read(member.baseContentObjectId),
+      targetContent: await read(member.targetContentObjectId)
+    };
+  }
+
+  private async assertStoredMemberContent(member: StoredMember): Promise<void> {
+    const requiresFileBase = member.operation === 'replace_file' || member.operation === 'delete_file';
+    if (requiresFileBase !== (member.baseContentObjectId !== null)) {
+      throw new Error(`${member.operation} has an invalid base ContentObject reference.`);
+    }
+    if (member.baseContentObjectId) {
+      const metadata = await this.requireContentObject(member.baseContentObjectId);
+      if (metadata.sha256 !== member.baseDigest) {
+        throw new Error('Base ContentObject digest does not match FileChangeSetMember.baseDigest.');
+      }
+    }
+    const requiresTargetContent = member.operation === 'create_file' || member.operation === 'replace_file';
+    if (requiresTargetContent !== (member.targetContentObjectId !== null)) {
+      throw new Error(`${member.operation} has an invalid target ContentObject reference.`);
+    }
+    if (member.targetContentObjectId) {
+      const metadata = await this.requireContentObject(member.targetContentObjectId);
+      if (metadata.sha256 !== member.targetDigest) {
+        throw new Error('Target ContentObject digest does not match FileChangeSetMember.targetDigest.');
+      }
+    }
   }
 
   private async decisionReceiptWon(changeSetId: string, receiptId: string): Promise<boolean> {
@@ -1239,6 +1358,8 @@ function normalizeProposalMember(input: FileChangeProposalMemberInput): {
   workEnvironmentId: string;
   targetPath: string;
   baseDigest: string | null;
+  baseContent?: string | Uint8Array;
+  baseContentType?: string;
   targetContent?: string | Uint8Array;
   contentType?: string;
 } {
@@ -1262,11 +1383,23 @@ function normalizeProposalMember(input: FileChangeProposalMemberInput): {
   } else if (baseDigest === null) {
     throw new TypeError(`${operation} requires baseDigest.`);
   }
+  const requiresFileBase = operation === 'replace_file' || operation === 'delete_file';
+  if (requiresFileBase && input.baseContent === undefined) {
+    throw new TypeError(`${operation} requires baseContent so its completed Diff remains reproducible.`);
+  }
+  if (!requiresFileBase && input.baseContent !== undefined) {
+    throw new TypeError(`${operation} cannot carry baseContent.`);
+  }
+  if (input.baseContentType && input.baseContent === undefined) {
+    throw new TypeError('baseContentType requires baseContent.');
+  }
   return {
     operation,
     workEnvironmentId: requireId(input.workEnvironmentId, 'workEnvironmentId'),
     targetPath: requireText(input.targetPath, 'targetPath'),
     baseDigest,
+    ...(input.baseContent !== undefined ? { baseContent: input.baseContent } : {}),
+    ...(input.baseContentType ? { baseContentType: requireText(input.baseContentType, 'baseContentType') } : {}),
     ...(targetContent !== undefined ? { targetContent } : {}),
     ...(input.contentType ? { contentType: requireText(input.contentType, 'contentType') } : {})
   };
@@ -1289,13 +1422,35 @@ function normalizeEffectRequest(value: FileEffectRequest): FileEffectRequest {
     workEnvironmentId: requireId(member.workEnvironmentId, 'workEnvironmentId'),
     targetPath: requireText(member.targetPath, 'targetPath'),
     baseDigest: nullableDigest(member.baseDigest, 'baseDigest'),
+    baseContentObjectId: nullableId(member.baseContentObjectId, 'baseContentObjectId'),
     targetContentObjectId: nullableId(member.targetContentObjectId, 'targetContentObjectId'),
     targetDigest: nullableTargetDigest(member.targetDigest, 'targetDigest')
   })).sort((left, right) => compareDecimalStrings(left.memberSeq, right.memberSeq));
   for (let index = 0; index < members.length; index += 1) {
-    if (members[index].memberSeq !== String(index + 1)) throw new Error('FileChangeSetMember memberSeq must be contiguous from 1.');
+    const member = members[index];
+    if (member.memberSeq !== String(index + 1)) throw new Error('FileChangeSetMember memberSeq must be contiguous from 1.');
+    assertEffectRequestMemberShape(member);
   }
   return { changeSetId: requireId(value.changeSetId, 'changeSetId'), members };
+}
+
+function assertEffectRequestMemberShape(member: FileEffectRequest['members'][number]): void {
+  const hasBaseContent = member.baseContentObjectId !== null;
+  const requiresBaseContent = member.operation === 'replace_file' || member.operation === 'delete_file';
+  if (hasBaseContent !== requiresBaseContent) {
+    throw new Error(`${member.operation} has an invalid base ContentObject reference.`);
+  }
+  if (requiresBaseContent && (member.baseDigest === null || member.baseDigest === DIRECTORY_DIGEST)) {
+    throw new Error(`${member.operation} requires a file baseDigest.`);
+  }
+  if (!requiresBaseContent && member.baseContentObjectId !== null) {
+    throw new Error(`${member.operation} cannot carry base content.`);
+  }
+  const hasTargetContent = member.targetContentObjectId !== null;
+  const requiresTargetContent = member.operation === 'create_file' || member.operation === 'replace_file';
+  if (hasTargetContent !== requiresTargetContent) {
+    throw new Error(`${member.operation} has an invalid target ContentObject reference.`);
+  }
 }
 
 function normalizeObservation(value: unknown, changeSetId: string): FileMutationObservation {

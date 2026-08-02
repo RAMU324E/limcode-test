@@ -1,11 +1,11 @@
 import * as vscode from 'vscode';
 import { MainPanel, type MainPanelOptions } from '../panels/MainPanel';
-import type { BackendApplication } from '../../backend/application/BackendApplication';
+import type { ApplicationFacade } from '../ApplicationFacade';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 
-export function registerCommands(context: vscode.ExtensionContext, backendApp: BackendApplication): void {
-  const openPanelCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.openPanel, (options?: unknown) => {
-    MainPanel.createOrShow(context.extensionUri, backendApp, openPanelOptions(options));
+export function registerCommands(context: vscode.ExtensionContext, backendApp: ApplicationFacade): void {
+  const openPanelCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.openPanel, async (options?: unknown) => {
+    MainPanel.createOrShow(context.extensionUri, backendApp, await resolveOpenPanelOptions(backendApp, options));
   });
 
   const revealGlobalStorageCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.revealGlobalStorage, async () => {
@@ -73,6 +73,20 @@ function requestedConversationId(value: unknown): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const conversationId = (value as { conversationId?: unknown }).conversationId;
   return typeof conversationId === 'string' ? conversationId.trim() : undefined;
+}
+
+async function resolveOpenPanelOptions(backendApp: ApplicationFacade, value: unknown): Promise<MainPanelOptions> {
+  const options = openPanelOptions(value);
+  if (options.kind !== undefined && options.kind !== 'chat') return options;
+  if (options.conversationId) return options;
+  const existing = backendApp.getConversationHistoryEntries()[0];
+  const conversationId = existing?.id ?? await backendApp.createConversation();
+  return {
+    ...options,
+    conversationId,
+    title: options.title ?? existing?.title ?? backendApp.getConversationDisplayTitle(conversationId),
+    reuse: options.reuse ?? true
+  };
 }
 
 function openPanelOptions(value: unknown): MainPanelOptions {

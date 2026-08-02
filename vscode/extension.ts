@@ -2,20 +2,21 @@ import * as vscode from 'vscode';
 import { registerCommands } from './commands/registerCommands';
 import { MainPanel } from './panels/MainPanel';
 import { registerSidebarEntryView } from './views/SidebarEntryView';
-import { BackendApplication } from '../backend/application/BackendApplication';
+import { VscodeReliableKernelApplicationFacade } from '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade';
 import { EXTENSION_BRAND } from '../shared/extensionIdentity';
 import { RUNTIME_BUILD_INFO } from '../backend/application/runtimeBuildInfo';
 
-let backendApp: BackendApplication | undefined;
+let backendApp: VscodeReliableKernelApplicationFacade | undefined;
 
-export function activate(context: vscode.ExtensionContext): void {
-  backendApp = new BackendApplication(context);
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const application = await VscodeReliableKernelApplicationFacade.open(context);
+  backendApp = application;
 
-  MainPanel.registerSerializer(context, backendApp);
-  registerCommands(context, backendApp);
-  registerSidebarEntryView(context, backendApp);
+  MainPanel.registerSerializer(context, application);
+  registerCommands(context, application);
+  registerSidebarEntryView(context, application);
 
-  console.log(`${EXTENSION_BRAND} (ECS backend) is active.`, JSON.stringify(RUNTIME_BUILD_INFO));
+  console.log(`${EXTENSION_BRAND} reliable SQLite/CAS Runtime is active.`, JSON.stringify(RUNTIME_BUILD_INFO));
 }
 
 export async function deactivate(): Promise<void> {

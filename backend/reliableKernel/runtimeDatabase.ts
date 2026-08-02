@@ -264,6 +264,11 @@ export async function initializeEmptyRuntimeRoot(authority: RootAuthority): Prom
   return authority.initializeEmptyRoot(initializeBindingStorage);
 }
 
+/** Fixed SQLite/CAS initializer used only by RootAuthority's offline cutover activation. */
+export async function initializeCutoverRuntimeBinding(binding: RootBinding): Promise<void> {
+  return initializeBindingStorage(binding);
+}
+
 export async function resetCandidateRuntimeRoot(candidateParentPath: string): Promise<{
   authority: RootAuthority;
   binding: RootBinding;

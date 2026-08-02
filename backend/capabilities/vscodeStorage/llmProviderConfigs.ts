@@ -27,7 +27,7 @@ import {
   defaultLlmPromptCacheTtlForProvider
 } from '../../../shared/protocol';
 import { DEFAULT_LLM_BASE_URL } from '../llmProvider';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 import { INDEX_FILE } from './constants';
 import { loadRecordStore, removeRecordStoreRecord, saveRecordStore } from './recordStore';
 

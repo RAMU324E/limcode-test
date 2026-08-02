@@ -5,10 +5,12 @@ import {
   RELIABLE_KERNEL_SNAPSHOT_MESSAGE,
   type ReliableKernelChangesMessage,
   type ReliableKernelClientChange,
+  type ReliableKernelClientDetailKind,
   type ReliableKernelDataMessage,
   type ReliableKernelSnapshotMessage
 } from '../../shared/reliableKernelClientFeed';
 import type { PlainData } from '../../shared/plainData';
+import { buildFileDiffRecord } from '../capabilities/fileDiff';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
   CLIENT_CHANGE_BATCH_MAX_BYTES,
@@ -32,8 +34,8 @@ import {
   ContentAddressedStore,
   type ContentObjectMetadata
 } from './contentAddressedStore';
-import type { RuntimeCommitResult } from './contracts';
-import { requirePhaseFId } from './phaseFIdentity';
+import type { RuntimeChange, RuntimeCommitResult } from './contracts';
+import { requirePhaseFId, requirePhaseFText } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -75,6 +77,9 @@ interface ClientFeedSession {
   refreshing: boolean;
   collectingRefresh: boolean;
   handoffCommits: RuntimeCommitResult[];
+  activeRecordIds: Set<string>;
+  navigationConversationIds: Set<string>;
+  newVisibleRecordsSinceSnapshot: number;
   closed: boolean;
 }
 
@@ -121,6 +126,9 @@ export class BoundedClientFeed {
       refreshing: false,
       collectingRefresh: false,
       handoffCommits: [],
+      activeRecordIds: new Set<string>(),
+      navigationConversationIds: new Set<string>(),
+      newVisibleRecordsSinceSnapshot: 0,
       closed: false
     };
     this.sessions.set(session.sessionId, session);
@@ -214,7 +222,12 @@ export class BoundedClientFeed {
 
   private enqueueCommit(session: ClientFeedSession, commit: RuntimeCommitResult): void {
     if (session.closed || session.snapshotRequired) return;
-    const message = this.createChangesMessage(session, commit);
+    const scoped = this.scopeCommit(session, commit);
+    if (scoped.requiresSnapshot) {
+      this.enterSnapshotRequired(session);
+      return;
+    }
+    const message = this.createChangesMessage(session, { ...commit, changes: scoped.changes });
     const bytes = wireBytes(message);
     if (message.changes.length > CLIENT_CHANGE_BATCH_MAX_RECORDS || bytes > CLIENT_CHANGE_BATCH_MAX_BYTES) {
       this.enterSnapshotRequired(session);
@@ -301,6 +314,7 @@ export class BoundedClientFeed {
   ): ReliableKernelSnapshotMessage {
     const messageSeq = this.allocateMessageSeq(session);
     const projections = boundProjectionRecords(toWirePlain(projectionInput) as Record<string, PlainData>);
+    this.resetVisibleIdentities(session, projections);
     const message: ReliableKernelSnapshotMessage = {
       type: RELIABLE_KERNEL_SNAPSHOT_MESSAGE,
       sessionId: session.sessionId,
@@ -339,6 +353,98 @@ export class BoundedClientFeed {
     };
   }
 
+  private scopeCommit(
+    session: ClientFeedSession,
+    commit: RuntimeCommitResult
+  ): { changes: RuntimeChange[]; requiresSnapshot: boolean } {
+    const accepted: RuntimeChange[] = [];
+    const pending: RuntimeChange[] = [];
+    let requiresSnapshot = false;
+
+    for (const change of commit.changes) {
+      if (change.domain === 'Conversation') {
+        accepted.push(change);
+        if (change.kind === 'remove') {
+          session.navigationConversationIds.delete(change.id);
+        } else if (!session.navigationConversationIds.has(change.id)) {
+          if (session.navigationConversationIds.size >= CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) requiresSnapshot = true;
+          else session.navigationConversationIds.add(change.id);
+        }
+        continue;
+      }
+      if (change.kind === 'remove') {
+        if (session.activeRecordIds.has(change.id)) accepted.push(change);
+        session.activeRecordIds.delete(change.id);
+        continue;
+      }
+      pending.push(change);
+    }
+
+    let changed = true;
+    while (changed && pending.length > 0) {
+      changed = false;
+      for (let index = pending.length - 1; index >= 0; index -= 1) {
+        const change = pending[index];
+        const record = change.record;
+        if (!record || !this.recordVisibleToSession(session, change.id, record)) continue;
+        const wasKnown = session.activeRecordIds.has(change.id);
+        accepted.push(change);
+        pending.splice(index, 1);
+        collectRecordIdentities(record, session.activeRecordIds);
+        session.activeRecordIds.add(change.id);
+        if (!wasKnown) session.newVisibleRecordsSinceSnapshot += 1;
+        changed = true;
+      }
+    }
+
+    if (session.newVisibleRecordsSinceSnapshot >= 100) requiresSnapshot = true;
+    const acceptedIds = new Set(accepted.map((change) => `${change.domain}\0${change.id}\0${change.kind}`));
+    return {
+      changes: commit.changes.filter((change) => acceptedIds.has(`${change.domain}\0${change.id}\0${change.kind}`)),
+      requiresSnapshot
+    };
+  }
+
+  private recordVisibleToSession(
+    session: ClientFeedSession,
+    id: string,
+    record: Record<string, unknown>
+  ): boolean {
+    if (session.activeRecordIds.has(id)) return true;
+    const activeConversationId = session.activeConversationId;
+    if (!activeConversationId) return false;
+    for (const [key, value] of Object.entries(record)) {
+      if (typeof value !== 'string') continue;
+      if (
+        (key === 'conversation_id' || key === 'target_conversation_id' || key === 'child_conversation_id')
+        && value === activeConversationId
+      ) return true;
+      if (isIdentityField(key) && session.activeRecordIds.has(value)) return true;
+    }
+    return false;
+  }
+
+  private resetVisibleIdentities(
+    session: ClientFeedSession,
+    projections: Record<string, PlainData>
+  ): void {
+    session.activeRecordIds.clear();
+    session.navigationConversationIds.clear();
+    session.newVisibleRecordsSinceSnapshot = 0;
+    const navigation = projections.navigationSummary;
+    if (isPlainRecord(navigation) && Array.isArray(navigation.conversations)) {
+      for (const conversation of navigation.conversations) {
+        if (!isPlainRecord(conversation)) continue;
+        const id = conversation.id;
+        if (typeof id === 'string' && id) session.navigationConversationIds.add(id);
+      }
+    }
+    for (const [key, value] of Object.entries(projections)) {
+      if (key === 'navigationSummary') continue;
+      collectPlainIdentities(value, session.activeRecordIds);
+    }
+  }
+
   private allocateMessageSeq(session: ClientFeedSession): string {
     const value = session.nextMessageSeq;
     session.nextMessageSeq += 1n;
@@ -374,13 +480,7 @@ export class ClientHistoryReader {
   }
 }
 
-export type ClientDetailKind =
-  | 'message-content'
-  | 'tool-result-content'
-  | 'file-change-content'
-  | 'process-output'
-  | 'context-projection-detail'
-  | 'answer-content';
+export type ClientDetailKind = ReliableKernelClientDetailKind;
 
 export interface ClientDetailChunk {
   recordId: string;
@@ -410,8 +510,10 @@ export class ClientDetailReader {
     if (!Number.isSafeInteger(input.offset) || input.offset < 0) throw new RangeError('Detail offset must be non-negative.');
     if (!Number.isSafeInteger(input.maxBytes) || input.maxBytes <= 0) throw new RangeError('Detail maxBytes must be positive.');
     const maxRawBytes = detailRawByteLimit(input.maxBytes);
-    if (input.kind === 'context-projection-detail') {
-      const bytes = await this.materializeContextProjectionDetail(recordId);
+    if (input.kind === 'context-projection-detail' || input.kind === 'file-change-diff') {
+      const bytes = input.kind === 'context-projection-detail'
+        ? await this.materializeContextProjectionDetail(recordId)
+        : await this.materializeFileChangeDiff(recordId);
       if (input.offset > bytes.length) throw new RangeError('Detail offset exceeds structural payload length.');
       const end = Math.min(bytes.length, input.offset + maxRawBytes);
       return buildDetailChunk(recordId, input.offset, bytes.subarray(input.offset, end), bytes.length);
@@ -445,16 +547,55 @@ export class ClientDetailReader {
     return Buffer.from(JSON.stringify(structural), 'utf8');
   }
 
-  private async resolveContentObjectId(kind: Exclude<ClientDetailKind, 'context-projection-detail'>, recordId: string): Promise<string> {
+  private async materializeFileChangeDiff(recordId: string): Promise<Buffer> {
+    const member = await this.requireExisting('FileChangeSetMember', recordId);
+    const operation = requireFileChangeOperation(member.operation);
+    const targetPath = requirePhaseFText(member.target_path, 'FileChangeSetMember.target_path');
+    const baseContent = await this.readOptionalContent(member.base_content_object_id, 'FileChangeSetMember.base_content_object_id');
+    const targetContent = await this.readOptionalContent(member.target_content_object_id, 'FileChangeSetMember.target_content_object_id');
+    const before = decodeUtf8DiffContent(baseContent, 'base');
+    const after = decodeUtf8DiffContent(targetContent, 'target');
+    const diff = operation === 'create_directory' || operation === 'delete_directory_tree'
+      ? undefined
+      : buildFileDiffRecord(targetPath, before, after, operation !== 'create_file');
+    return Buffer.from(JSON.stringify(toWirePlain({
+      memberId: recordId,
+      operation,
+      path: targetPath,
+      action: operation === 'create_file'
+        ? 'created'
+        : operation === 'delete_file' || operation === 'delete_directory_tree'
+          ? 'deleted'
+          : operation === 'create_directory'
+            ? 'created-directory'
+            : 'modified',
+      ...(diff ? { diff } : {})
+    })), 'utf8');
+  }
+
+  private async readOptionalContent(value: unknown, label: string): Promise<Buffer> {
+    if (value === null) return Buffer.alloc(0);
+    const metadata = await this.requireExisting('ContentObject', requirePhaseFId(value, label)) as ContentObjectMetadata;
+    return this.contentStore.read(metadata);
+  }
+
+  private async resolveContentObjectId(
+    kind: Exclude<ClientDetailKind, 'context-projection-detail' | 'file-change-diff'>,
+    recordId: string
+  ): Promise<string> {
     switch (kind) {
       case 'message-content':
         return this.objectIdFromRow('MessageRevision', recordId, 'content_object_id');
+      case 'tool-arguments-content':
+        return this.objectIdFromRow('ToolCall', recordId, 'arguments_object_id');
       case 'tool-result-content': {
         const outcome = await this.maybeGet('ToolOutcome', recordId)
           ?? (await this.listRows('ToolOutcome', { tool_call_id: recordId }, 2))[0];
         if (!outcome) throw new Error(`Tool result ${recordId} does not exist.`);
         return requirePhaseFId(outcome.content_object_id, 'ToolOutcome.content_object_id');
       }
+      case 'file-change-base-content':
+        return this.objectIdFromRow('FileChangeSetMember', recordId, 'base_content_object_id');
       case 'file-change-content':
         return this.objectIdFromRow('FileChangeSetMember', recordId, 'target_content_object_id');
       case 'process-output':
@@ -492,6 +633,47 @@ export class ClientDetailReader {
     if (!row) throw new Error(`${domain} ${id} does not exist.`);
     return row;
   }
+}
+
+function requireFileChangeOperation(value: unknown): 'create_file' | 'replace_file' | 'delete_file' | 'create_directory' | 'delete_directory_tree' {
+  if (!['create_file', 'replace_file', 'delete_file', 'create_directory', 'delete_directory_tree'].includes(String(value))) {
+    throw new TypeError(`Unsupported FileChangeSetMember operation: ${String(value)}.`);
+  }
+  return value as 'create_file' | 'replace_file' | 'delete_file' | 'create_directory' | 'delete_directory_tree';
+}
+
+function decodeUtf8DiffContent(bytes: Buffer, role: string): string {
+  const text = bytes.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(bytes)) {
+    throw new Error(`File change ${role} content is not exact UTF-8 text and cannot be rendered as an inline Diff.`);
+  }
+  return text;
+}
+
+function isIdentityField(key: string): boolean {
+  return key === 'id' || key.endsWith('_id');
+}
+
+function collectRecordIdentities(record: Record<string, unknown>, target: Set<string>): void {
+  for (const [key, value] of Object.entries(record)) {
+    if (isIdentityField(key) && typeof value === 'string' && value) target.add(value);
+  }
+}
+
+function collectPlainIdentities(value: PlainData, target: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectPlainIdentities(entry, target);
+    return;
+  }
+  if (!isPlainRecord(value)) return;
+  for (const [key, nested] of Object.entries(value)) {
+    if (isIdentityField(key) && typeof nested === 'string' && nested) target.add(nested);
+    collectPlainIdentities(nested, target);
+  }
+}
+
+function isPlainRecord(value: PlainData | undefined): value is { [key: string]: PlainData } {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function detailRawByteLimit(requestedMaxBytes: number): number {

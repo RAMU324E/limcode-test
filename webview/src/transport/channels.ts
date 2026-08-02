@@ -3,39 +3,21 @@ import { BridgeMessageType, type BridgeChannel, type WebviewToExtensionMessage }
 /** 把出站消息类型映射到桥接通道。逻辑与旧 vscodeBridge 保持一致。 */
 export function channelForType(type: WebviewToExtensionMessage['type']): BridgeChannel {
   switch (type) {
-    case BridgeMessageType.CommandStatusGet:
-    case BridgeMessageType.CommandOutcomeResolve:
     case BridgeMessageType.TurnStart:
     case BridgeMessageType.TurnEnqueue:
-    case BridgeMessageType.TurnSteer:
     case BridgeMessageType.TurnInterrupt:
-    case BridgeMessageType.TurnIntentUpdate:
-    case BridgeMessageType.TurnIntentCancel:
-    case BridgeMessageType.TurnIntentReorder:
-    case BridgeMessageType.TurnIntentPause:
-    case BridgeMessageType.TurnIntentResume:
-    case BridgeMessageType.TurnIntentResumeAll:
-    case BridgeMessageType.TurnIntentPromote:
     case BridgeMessageType.InteractionResolve:
-    case BridgeMessageType.LlmRetryCancel:
     case BridgeMessageType.ConversationCreate:
     case BridgeMessageType.ConversationFork:
     case BridgeMessageType.MessageEdit:
     case BridgeMessageType.MessageDeleteFrom:
     case BridgeMessageType.MessageRetryFrom:
-    case BridgeMessageType.CompressionCreate:
-    case BridgeMessageType.CompressionDelete:
-    case BridgeMessageType.CompressionUpdate:
-    case BridgeMessageType.CompressionRegenerate:
-    case BridgeMessageType.CompressionDisable:
-    case BridgeMessageType.CompressionEnable:
     case BridgeMessageType.WorkflowCreate:
     case BridgeMessageType.WorkflowUpdate:
     case BridgeMessageType.WorkflowDelete:
     case BridgeMessageType.ConversationWorkflowSelect:
     case BridgeMessageType.ModelProfileScopeSet:
     case BridgeMessageType.ModelProfileScopeClear:
-    case BridgeMessageType.ConversationProjectSet:
     case BridgeMessageType.WorkEnvironmentSelect:
     case BridgeMessageType.WorkEnvironmentUpsert:
     case BridgeMessageType.WorkEnvironmentRemove:
@@ -51,8 +33,6 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.RulesCatalogRefresh:
     case BridgeMessageType.RuntimeContextScopeSet:
     case BridgeMessageType.RuntimeContextScopeClear:
-    case BridgeMessageType.RuntimeContextRefresh:
-    case BridgeMessageType.RuntimeContextSnapshotClear:
     case BridgeMessageType.PlanReviewPolicyScopeSet:
     case BridgeMessageType.PlanReviewPolicyScopeClear:
     case BridgeMessageType.CheckpointPolicyScopeSet:
@@ -67,16 +47,9 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.CheckpointDiffOpen:
     case BridgeMessageType.AttachmentOpen:
       return 'command';
-    case BridgeMessageType.ConversationHeadGet:
     case BridgeMessageType.ClientResync:
-    case BridgeMessageType.ConversationTimelinePageGet:
-    case BridgeMessageType.ToolResultArtifactGet:
     case BridgeMessageType.FsStatGet:
-    case BridgeMessageType.BackgroundProcessOutputGet:
     case BridgeMessageType.ProjectFoldersGet:
-    case BridgeMessageType.RunHistoryPageGet:
-    case BridgeMessageType.RunHistoryDetailGet:
-    case BridgeMessageType.LlmDryRunGet:
     case BridgeMessageType.LlmProviderModelsGet:
     case BridgeMessageType.CheckpointGitStatusGet:
     case BridgeMessageType.CheckpointShadowStatsGet:

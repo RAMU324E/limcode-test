@@ -12,7 +12,7 @@ import type {
 } from '../../../shared/protocol';
 import { isFunctionResponsePart, isInlineDataPart } from '../../../shared/protocol';
 import { STORAGE_VERSION } from './constants';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 import { loadGlobalSettingsFile } from './globalSettings';
 import { DurableFileSystem, jsonBytes } from '../../reliability/fileDurability';
 import { StoragePathAuthorityRegistry } from '../../reliability/storagePathAuthority';

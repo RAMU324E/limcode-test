@@ -26,7 +26,7 @@ interface BridgePersistedState {
  * 只依赖 HostApi 收发原始消息，自身负责：内存 session 捕获/附带、按类型选通道、
  * request/on/onAny/ready 等协议级能力。不直接接触任何具体 IDE API。
  */
-export class Bridge {
+export class WebviewBridge {
   private readonly listeners = new Map<string, Set<ExtensionMessageListener>>();
   /** Extension Host session identity is memory-only and is never restored after Webview reload. */
   private sessionId: BridgeClientId | undefined;

@@ -7,8 +7,6 @@ import type {
   ClientState,
   ConversationHistoryPageRecord,
   ConversationHistoryPageRequest,
-  ConversationTimelinePageRecord,
-  ConversationTimelinePageRequest,
   ConversationSettingsSection,
   ConversationSettingsSectionValue,
   ExtensionToWebviewMessage,
@@ -32,7 +30,6 @@ import type {
   WorkEnvironmentRecord
 } from '../../shared/protocol';
 import type { EditToolMode } from '../../shared/protocol';
-import type { TimelineProjectionContextRecord } from '../../shared/timelineProjection';
 
 export type Emit = (event: WorldEvent) => void;
 
@@ -266,7 +263,8 @@ export type CommandRunStatus = 'completed' | 'running' | 'exited' | 'killed' | '
 
 export interface CommandRunResult {
   command: string;
-  exitCode: number;
+  /** Running processes do not have an exit code yet; only terminal observations carry a number. */
+  exitCode: number | null;
   killed: boolean;
   stdout: string;
   stderr: string;
@@ -667,8 +665,6 @@ export interface StorageCapability {
   ingestMessageContentAttachments(content: import('../../shared/protocol').MessageContent): Promise<import('../../shared/protocol').MessageContent>;
   /** Canonicalizes and blob-first stages one raw tool result before the reliable terminal transaction. */
   stageToolResultContent(content: import('../../shared/conversationReliability').JsonValue): Promise<import('../../shared/protocol').StagedToolResultContent>;
-  /** Publishes already-canonicalized bytes while the caller holds the ToolResult blob resource lock. */
-  stagePreparedToolResultContent(content: import('../reliability/toolResultPayload').PreparedToolResultContent): Promise<import('../../shared/protocol').StagedToolResultContent>;
   /** Strict lazy read of one canonical ToolResult Artifact. */
   loadToolResultContent(artifact: import('../../shared/protocol').ToolResultArtifactRecord): Promise<import('../../shared/conversationReliability').JsonValue>;
   loadClientStateSkeleton(options?: { profile?: 'startup' | 'deferred' | 'full' }): Promise<ClientState | undefined>;

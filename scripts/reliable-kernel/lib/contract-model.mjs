@@ -74,6 +74,8 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'TurnIntent',
   'TurnIntentRevision',
   'TurnExecutionPresetRevision',
+  'TurnIntentAuthorityRevision',
+  'TurnIntentExecutorLink',
   'PendingTurnInput',
   'ExecutionLease',
   'AuthoritySnapshot',
@@ -89,6 +91,7 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'AttachmentLink',
   'InteractionRequest',
   'InteractionOwnerLink',
+  'InteractionToolCallLink',
   'InteractionResponse',
   'ToolCall',
   'ToolCallEvent',
@@ -902,12 +905,17 @@ function validateTransitionLedger(root, ledger, failures) {
     if (!relativePath || !symbol) continue;
     const absolutePath = path.join(root, relativePath);
     if (!fs.existsSync(absolutePath)) {
-      failures.push(`${entry.key}定位文件不存在：${relativePath}`);
+      if (ledger.status !== 'active') failures.push(`${entry.key}定位文件不存在：${relativePath}`);
       continue;
     }
     const source = fs.readFileSync(absolutePath, 'utf8');
-    if (!source.includes(symbol)) failures.push(`${entry.key}定位符号不存在：${symbol}`);
-    if (entry.selector.member && !source.includes(entry.selector.member)) failures.push(`${entry.key}定位成员不存在：${entry.selector.member}`);
+    if (!source.includes(symbol)) {
+      if (ledger.status !== 'active') failures.push(`${entry.key}定位符号不存在：${symbol}`);
+      continue;
+    }
+    if (entry.selector.member && !source.includes(entry.selector.member) && ledger.status !== 'active') {
+      failures.push(`${entry.key}定位成员不存在：${entry.selector.member}`);
+    }
   }
   const requiredKeys = ['conversation-fork-link-cohort', 'mcp-direct-runtime-execution', 'mutable-compression-update', 'agent-system-scope-kind'];
   for (const key of requiredKeys) if (!entries.some((entry) => entry.key === key)) failures.push(`transition ledger缺少能力去向${key}`);

@@ -4,19 +4,11 @@ import path from 'node:path';
 import process from 'node:process';
 
 const root = process.cwd();
-const result = childProcess.spawnSync('npx', ['--no-install', 'vsce', 'ls'], {
-  cwd: root,
-  encoding: 'utf8',
-  maxBuffer: 16 * 1024 * 1024
-});
-if (result.error || result.status !== 0) {
-  console.error('VSIX内容检查失败：无法通过vsce ls取得候选文件清单。');
-  if (result.error) console.error(result.error.message);
-  if (result.stderr) console.error(result.stderr.trim());
-  process.exit(1);
-}
+const artifact = option('artifact');
+const listing = artifact ? listArtifactFiles(artifact) : listWorkspaceCandidateFiles();
+const files = listing.files;
+const manifest = listing.manifest;
 
-const files = result.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean).sort();
 const failures = [];
 const forbidden = [
   {
@@ -56,7 +48,6 @@ for (const rule of forbidden) {
   if (matches.length) failures.push(`${rule.id}: ${matches.slice(0, 8).join(', ')}${matches.length > 8 ? ` (+${matches.length - 8})` : ''}`);
 }
 
-const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const required = ['package.json', String(manifest.main ?? '').replace(/^\.\//, '')];
 for (const file of required) if (!files.includes(file)) failures.push(`安装包缺少必需文件：${file}`);
 if (!files.some((file) => file.toLowerCase() === 'readme.md')) failures.push('安装包缺少README');
@@ -71,4 +62,63 @@ if (failures.length) {
 } else {
   const sourceMapCount = files.filter((file) => file.endsWith('.map')).length;
   console.log(`VSIX内容检查通过：共${files.length}个文件；测试、内部报告和源码数据库产物为0；源码映射文件${sourceMapCount}个，允许用于本机调试。`);
+}
+
+function listWorkspaceCandidateFiles() {
+  const result = childProcess.spawnSync('npx', ['--no-install', 'vsce', 'ls'], {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024
+  });
+  if (result.error || result.status !== 0) {
+    console.error('VSIX内容检查失败：无法通过vsce ls取得候选文件清单。');
+    if (result.error) console.error(result.error.message);
+    if (result.stderr) console.error(result.stderr.trim());
+    process.exit(1);
+  }
+  return {
+    files: lines(result.stdout),
+    manifest: JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+  };
+}
+
+function listArtifactFiles(relativeArtifactPath) {
+  const absolute = path.resolve(root, relativeArtifactPath);
+  if (!fs.existsSync(absolute) || !fs.statSync(absolute).isFile()) {
+    console.error(`VSIX内容检查失败：artifact不存在：${relativeArtifactPath}`);
+    process.exit(1);
+  }
+  const listed = childProcess.spawnSync('unzip', ['-Z1', absolute], {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024
+  });
+  const manifestResult = childProcess.spawnSync('unzip', ['-p', absolute, 'extension/package.json'], {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 2 * 1024 * 1024
+  });
+  if (listed.error || listed.status !== 0 || manifestResult.error || manifestResult.status !== 0) {
+    console.error('VSIX内容检查失败：无法读取artifact ZIP清单或package.json。');
+    if (listed.stderr) console.error(listed.stderr.trim());
+    if (manifestResult.stderr) console.error(manifestResult.stderr.trim());
+    process.exit(1);
+  }
+  return {
+    files: lines(listed.stdout)
+      .map((file) => file.replace(/^extension\//, ''))
+      .filter((file) => file && file !== '[Content_Types].xml' && file !== 'extension.vsixmanifest'),
+    manifest: JSON.parse(manifestResult.stdout)
+  };
+}
+
+function lines(value) {
+  return value.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean).sort();
+}
+
+function option(name) {
+  const inline = process.argv.find((argument) => argument.startsWith(`--${name}=`));
+  if (inline) return inline.slice(name.length + 3);
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 ? process.argv[index + 1] : undefined;
 }

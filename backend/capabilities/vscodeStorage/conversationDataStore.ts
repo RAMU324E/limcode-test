@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 import { conversationShardName } from './naming';
 import { withRecordStoreTransaction } from './recordStore';
 

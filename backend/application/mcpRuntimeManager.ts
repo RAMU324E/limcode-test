@@ -1,27 +1,30 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { McpServerConfigRecord, McpServersSettingsRecord, McpToolSourceRecord, InlineDataPart } from '../../shared/protocol';
+import type { McpServerConfigRecord, McpServersSettingsRecord, McpToolSourceRecord } from '../../shared/protocol';
 import { EXTENSION_PACKAGE_NAME, EXTENSION_VERSION } from '../../shared/extensionIdentity';
-import type { StorageCapability } from '../capabilities/types';
 import type { ToolDefinition, ToolResultOut } from '../world/modules/tools/registry';
+import { McpInvocationError, type McpMemoryConnectionRegistry, type McpToolAnnotations } from '../reliableKernel/mcpEffects';
 
 interface McpConnection {
   config: McpServerConfigRecord;
   client: Client;
   transport: { close(): Promise<void> };
   tools: ToolDefinition[];
+  annotations: Map<string, McpToolAnnotations>;
   status: McpToolSourceRecord;
 }
 
-export class McpRuntimeManager {
+export interface McpSettingsAuthority {
+  loadGlobalSettings(section: 'mcpServers'): Promise<{ settings: unknown }>;
+}
+
+export class McpRuntimeManager implements McpMemoryConnectionRegistry {
   private readonly connections = new Map<string, McpConnection>();
   private readonly disabledSources = new Map<string, McpToolSourceRecord>();
   private refreshing = Promise.resolve();
   private onStateChange: (() => void) | undefined;
 
-  public constructor(private readonly storage: StorageCapability) {}
+  public constructor(private readonly storage: McpSettingsAuthority) {}
 
   public setStateChangeListener(listener: (() => void) | undefined): void {
     this.onStateChange = listener;
@@ -42,6 +45,29 @@ export class McpRuntimeManager {
 
   public runtimeTools(): ToolDefinition[] {
     return [...this.connections.values()].flatMap((connection) => connection.tools);
+  }
+
+  public async toolAnnotations(serverId: string, toolName: string): Promise<McpToolAnnotations> {
+    const connection = this.connections.get(serverId);
+    if (!connection) throw new McpInvocationError('not_dispatched', `MCP server is not connected: ${serverId}`);
+    const annotations = connection.annotations.get(toolName);
+    if (!annotations) throw new McpInvocationError('not_dispatched', `MCP tool is not available: ${serverId}/${toolName}`);
+    return { ...annotations };
+  }
+
+  public async callTool(serverId: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {
+    const connection = this.connections.get(serverId);
+    if (!connection || !connection.annotations.has(toolName)) {
+      throw new McpInvocationError('not_dispatched', `MCP tool is not connected: ${serverId}/${toolName}`);
+    }
+    try {
+      return await connection.client.callTool({ name: toolName, arguments: args });
+    } catch (error) {
+      throw new McpInvocationError(
+        'ambiguous_after_dispatch',
+        `MCP call result cannot be proved after dispatch: ${messageFromError(error)}`
+      );
+    }
   }
 
   public sourceRecords(): McpToolSourceRecord[] {
@@ -104,6 +130,7 @@ export class McpRuntimeManager {
 
 async function connectServer(config: McpServerConfigRecord): Promise<McpConnection> {
   validateConnectableConfig(config);
+  const { Client, getDefaultEnvironment, StdioClientTransport, StreamableHTTPClientTransport } = await loadMcpSdkRuntime();
   const client = new Client(
     { name: EXTENSION_PACKAGE_NAME, version: EXTENSION_VERSION },
     { capabilities: {} }
@@ -121,12 +148,17 @@ async function connectServer(config: McpServerConfigRecord): Promise<McpConnecti
       });
   await client.connect(transport);
   const listed = await client.listTools();
-  const tools = listed.tools.map((tool) => mcpToolDefinition(config, client, tool));
+  const tools = listed.tools.map((tool) => mcpToolDeclaration(config, tool));
+  const annotations = new Map(listed.tools.map((tool) => [tool.name, {
+    ...(tool.annotations?.readOnlyHint === undefined ? {} : { readOnlyHint: tool.annotations.readOnlyHint }),
+    ...(tool.annotations?.destructiveHint === undefined ? {} : { destructiveHint: tool.annotations.destructiveHint })
+  }]));
   return {
     config,
     client,
     transport,
     tools,
+    annotations,
     status: {
       id: config.id,
       name: config.name,
@@ -137,6 +169,40 @@ async function connectServer(config: McpServerConfigRecord): Promise<McpConnecti
       updatedAt: Date.now()
     }
   };
+}
+
+interface McpSdkRuntime {
+  Client: typeof import('@modelcontextprotocol/sdk/client/index.js').Client;
+  getDefaultEnvironment: typeof import('@modelcontextprotocol/sdk/client/stdio.js').getDefaultEnvironment;
+  StdioClientTransport: typeof import('@modelcontextprotocol/sdk/client/stdio.js').StdioClientTransport;
+  StreamableHTTPClientTransport: typeof import('@modelcontextprotocol/sdk/client/streamableHttp.js').StreamableHTTPClientTransport;
+}
+
+let mcpSdkRuntimePromise: Promise<McpSdkRuntime> | undefined;
+
+/**
+ * VS Code 1.130 的 Node 24 Extension Host 会用抛错 getter 暴露错误读取全局 `navigator` 的依赖。
+ * Zod 4 的对象 JIT 能力探测会读取该全局；在加载会立即构造 Zod schema 的 MCP SDK 前，显式关闭
+ * JIT，既避免动态代码生成，也使 SDK 在 Node Extension Host 中保持确定性。SDK 必须保持懒加载，
+ * 否则静态 import 会先于这里的配置执行。
+ */
+function loadMcpSdkRuntime(): Promise<McpSdkRuntime> {
+  mcpSdkRuntimePromise ??= (async () => {
+    const zod = await import('zod/v4');
+    zod.config({ jitless: true });
+    const [clientModule, stdioModule, streamableHttpModule] = await Promise.all([
+      import('@modelcontextprotocol/sdk/client/index.js'),
+      import('@modelcontextprotocol/sdk/client/stdio.js'),
+      import('@modelcontextprotocol/sdk/client/streamableHttp.js')
+    ]);
+    return {
+      Client: clientModule.Client,
+      getDefaultEnvironment: stdioModule.getDefaultEnvironment,
+      StdioClientTransport: stdioModule.StdioClientTransport,
+      StreamableHTTPClientTransport: streamableHttpModule.StreamableHTTPClientTransport
+    };
+  })();
+  return mcpSdkRuntimePromise;
 }
 
 function validateConnectableConfig(config: McpServerConfigRecord): void {
@@ -155,7 +221,7 @@ function validateConnectableConfig(config: McpServerConfigRecord): void {
   }
 }
 
-function mcpToolDefinition(source: McpServerConfigRecord, client: Client, tool: Tool): ToolDefinition {
+function mcpToolDeclaration(source: McpServerConfigRecord, tool: Tool): ToolDefinition {
   return {
     execution: 'runtime',
     declaration: {
@@ -179,40 +245,10 @@ function mcpToolDefinition(source: McpServerConfigRecord, client: Client, tool: 
         defaultAutoApplyChange: false
       }
     },
-    async execute(args, _deps, ctx): Promise<ToolResultOut> {
-      const result = await client.callTool(
-        { name: tool.name, arguments: isPlainRecord(args) ? args : {} },
-        undefined,
-        ctx?.signal ? { signal: ctx.signal } : undefined
-      );
-      return convertMcpToolResult(result);
+    async execute(): Promise<ToolResultOut> {
+      throw new Error('MCP execution must use the reliable McpEffect control plane.');
     }
   };
-}
-
-function convertMcpToolResult(result: Awaited<ReturnType<Client['callTool']>>): ToolResultOut {
-  if ('toolResult' in result) return { ok: true, output: result.toolResult };
-  const text: string[] = [];
-  const parts: InlineDataPart[] = [];
-  for (const item of result.content ?? []) {
-    if (item.type === 'text') {
-      text.push(item.text);
-      continue;
-    }
-    if (item.type === 'image' || item.type === 'audio') {
-      parts.push({ inlineData: { mimeType: item.mimeType, data: item.data } });
-      continue;
-    }
-    if (item.type === 'resource') {
-      const resource = item.resource;
-      if ('text' in resource) text.push(resource.text);
-      else parts.push({ inlineData: { mimeType: resource.mimeType ?? 'application/octet-stream', data: resource.blob, name: resource.uri } });
-      continue;
-    }
-    text.push(JSON.stringify(item));
-  }
-  const output = result.structuredContent ?? (text.length ? text.join('\n') : { content: result.content ?? [] });
-  return { ok: result.isError !== true, output, ...(parts.length > 0 ? { parts } : {}) };
 }
 
 /**
@@ -284,10 +320,6 @@ async function closeConnection(connection: McpConnection): Promise<void> {
   } catch (error) {
     console.warn(`[LimCode] Failed to close MCP server ${connection.config.id}:`, error);
   }
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function slug(value: string): string {

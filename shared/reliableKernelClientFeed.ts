@@ -7,6 +7,11 @@ export const RELIABLE_KERNEL_SNAPSHOT_MESSAGE = 'reliable-kernel.snapshot';
 export const RELIABLE_KERNEL_CHANGES_MESSAGE = 'reliable-kernel.changes';
 export const RELIABLE_KERNEL_ACK_MESSAGE = 'reliable-kernel.ack';
 export const RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE = 'reliable-kernel.snapshot-request';
+export const RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE = 'reliable-kernel.detail-request';
+export const RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE = 'reliable-kernel.detail-result';
+export const RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE = 'reliable-kernel.detail-error';
+export const RELIABLE_KERNEL_TRANSIENT_MESSAGE = 'reliable-kernel.transient';
+export const RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE = 'reliable-kernel.client-diagnostic';
 
 export interface ReliableKernelClientChange {
   type: string;
@@ -46,6 +51,79 @@ export interface ReliableKernelSnapshotRequestMessage {
   activeConversationId?: string;
 }
 
+export type ReliableKernelClientDetailKind =
+  | 'message-content'
+  | 'tool-arguments-content'
+  | 'tool-result-content'
+  | 'file-change-base-content'
+  | 'file-change-content'
+  | 'file-change-diff'
+  | 'process-output'
+  | 'context-projection-detail'
+  | 'answer-content';
+
+export interface ReliableKernelDetailRequestMessage {
+  type: typeof RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE;
+  requestId: string;
+  sessionId?: string;
+  kind: ReliableKernelClientDetailKind;
+  recordId: string;
+  offset: number;
+  maxBytes: number;
+}
+
+export interface ReliableKernelDetailResultMessage {
+  type: typeof RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  detail: {
+    recordId: string;
+    offset: number;
+    chunk: string;
+    encoding: 'base64';
+    nextOffset?: number;
+    totalBytes: number;
+    hasMore: boolean;
+    responseBytes: number;
+  };
+}
+
+export interface ReliableKernelDetailErrorMessage {
+  type: typeof RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  message: string;
+}
+
+/** Memory-only low-latency stream overlay. Durable final authority remains Message/ModelRequest. */
+export interface ReliableKernelTransientMessage {
+  type: typeof RELIABLE_KERNEL_TRANSIENT_MESSAGE;
+  hostBootId: string;
+  conversationId: string;
+  turnId: string;
+  modelRequestId: string;
+  observedAt: string;
+  event: {
+    kind: 'output_delta' | 'output_item_done' | 'completed';
+    streamSeq: string;
+    content: PlainData;
+    usage?: PlainData;
+  };
+}
+
+/** Client-reported paint markers contain identities/timestamps only; arbitrary metadata is forbidden. */
+export interface ReliableKernelClientDiagnosticMessage {
+  type: typeof RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE;
+  sessionId: string;
+  eventKind: 'feed-painted' | 'transient-painted';
+  observedAt: string;
+  conversationId?: string;
+  turnId?: string;
+  messageSeq?: string;
+  modelRequestId?: string;
+  streamSeq?: string;
+}
+
 export type ReliableKernelDataMessage = ReliableKernelSnapshotMessage | ReliableKernelChangesMessage;
 
 export interface ReliableKernelBoundedClientState {
@@ -76,14 +154,25 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'TurnExecutorLink',
   'Message',
   'MessageRevision',
+  'MessageTurnLink',
   'InteractionRequest',
+  'InteractionOwnerLink',
+  'InteractionToolCallLink',
   'InteractionResponse',
   'ToolCall',
+  'ToolCallEvent',
   'ToolExecution',
   'ToolOutcome',
   'ToolModelResult',
+  'ToolResultArtifact',
+  'FileChangeSet',
+  'FileChangeSetMember',
   'FileChangeDecision',
+  'FileMutationReceipt',
+  'FileMutationReceiptMember',
   'Process',
+  'ProcessOriginLink',
+  'ProcessOutputChunk',
   'ProcessReceipt',
   'ModelRequest',
   'ChildExecution',
@@ -208,22 +297,39 @@ function seedRecordsFromSnapshot(
     conversationReuseLinks: 'ConversationReuseLink',
     conversationBranchLinks: 'ConversationBranchLink',
     conversationOriginLinks: 'ConversationOriginLink',
+    agentConversationLinks: 'AgentConversationLink',
     turns: 'Turn',
     executionLeases: 'ExecutionLease',
     turnTerminations: 'TurnTermination',
     turnExecutorLinks: 'TurnExecutorLink',
+    messageTurnLinks: 'MessageTurnLink',
     toolCalls: 'ToolCall',
+    toolCallEvents: 'ToolCallEvent',
     toolExecutions: 'ToolExecution',
     toolOutcomes: 'ToolOutcome',
+    toolModelResults: 'ToolModelResult',
+    toolResultArtifacts: 'ToolResultArtifact',
     interactionRequests: 'InteractionRequest',
+    interactionOwnerLinks: 'InteractionOwnerLink',
+    interactionToolCallLinks: 'InteractionToolCallLink',
     interactionResponses: 'InteractionResponse',
+    fileChangeSets: 'FileChangeSet',
+    fileChangeSetMembers: 'FileChangeSetMember',
+    fileChangeDecisions: 'FileChangeDecision',
+    fileMutationReceipts: 'FileMutationReceipt',
+    fileMutationReceiptMembers: 'FileMutationReceiptMember',
     processes: 'Process',
+    processOriginLinks: 'ProcessOriginLink',
+    processOutputChunks: 'ProcessOutputChunk',
     processReceipts: 'ProcessReceipt',
     modelRequests: 'ModelRequest',
     childExecutions: 'ChildExecution',
     childExecutionParentLinks: 'ChildExecutionParentLink',
     childExecutionTurnLinks: 'ChildExecutionTurnLink',
     childExecutionActiveTurnLinks: 'ChildExecutionActiveTurnLink',
+    childTurns: 'Turn',
+    childTurnTerminations: 'TurnTermination',
+    childTurnExecutorLinks: 'TurnExecutorLink',
     answerBridges: 'AnswerBridge',
     answerSubmissions: 'AnswerSubmission',
     runtimeInboxItems: 'RuntimeInboxItem',

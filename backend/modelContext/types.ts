@@ -17,13 +17,13 @@ import type {
 } from '../../shared/protocol';
 import type { MessageTurnLinkRecord } from '../../shared/conversationReliability';
 import type { DurableToolResultArtifactRecord } from '../reliability/toolResultTypes';
-import type { RunExecutionPhase, RunLifecycleStatus } from '../../shared/runLifecycle';
+import type { TurnExecutionPhase, TurnLifecycleStatus } from '../../shared/turnLifecycle';
 
 export interface ModelContextRunFact {
   id: string;
   conversationId: string;
-  lifecycle?: RunLifecycleStatus;
-  phase?: RunExecutionPhase;
+  lifecycle?: TurnLifecycleStatus;
+  phase?: TurnExecutionPhase;
   createdAt: number;
   updatedAt: number;
 }

@@ -43,6 +43,7 @@
 ## 人读附录
 
 - [性能与打包边界](./appendices/performance-and-packaging-gates.md)
+- [可靠 Runtime 有界诊断](./appendices/runtime-diagnostics.md)
 - [术语](./appendices/terminology.md)
 
 ## 旧文档去向（legacy docs disposition）

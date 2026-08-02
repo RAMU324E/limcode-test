@@ -43,6 +43,7 @@ export interface ContextToolPairAppendCommand {
   conversationId: string;
   toolCallId: string;
   toolModelResultId: string;
+  providerCallId?: string;
   baseRootId?: string | null;
   expectedHeadRootId?: string | null;
   activate?: boolean;
@@ -69,6 +70,18 @@ export interface MaterializedContextSegment {
 
 export interface ContextMutationPlan {
   steps: RepositoryTransactionStep[];
+}
+
+export interface FreshConversationMessageContextPlan extends ContextMutationPlan {
+  rootId: string;
+  headLinkId: string;
+}
+
+export interface FreshConversationMessageContextPlanInput {
+  conversationId: string;
+  messageRevisionId: string;
+  contentObjectId: string;
+  contentByteLength: bigint;
 }
 
 export interface MessageContextAppendPlanInput {
@@ -172,6 +185,9 @@ export class ContextSequenceControlPlane {
     const conversationId = requireId(command.conversationId, 'conversationId');
     const toolCallId = requireId(command.toolCallId, 'toolCallId');
     const toolModelResultId = requireId(command.toolModelResultId, 'toolModelResultId');
+    const providerCallId = command.providerCallId === undefined
+      ? undefined
+      : requireId(command.providerCallId, 'providerCallId');
     const snapshot = await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('ToolCall').get(toolCallId),
       DOMAIN_REPOSITORIES.domain('ToolModelResult').get(toolModelResultId)
@@ -210,6 +226,7 @@ export class ContextSequenceControlPlane {
       kind: 'tool_pair',
       toolCall: {
         id: toolCallId,
+        ...(providerCallId ? { providerCallId } : {}),
         callSeq: callSeq.toString(),
         toolName: requireText(toolCall.tool_name, 'ToolCall.tool_name'),
         argumentsContentType: argumentMetadata.content_type,
@@ -265,6 +282,58 @@ export class ContextSequenceControlPlane {
   public async currentHeadRootId(conversationId: string): Promise<string | null> {
     const head = await this.getHead(requireId(conversationId, 'conversationId'));
     return head ? requireId(head.root_id, 'ConversationContextHeadLink.root_id') : null;
+  }
+
+  /**
+   * Builds the first Message Context root for a Conversation that is created in the same writer
+   * transaction. No database read is performed, so ChildExecution can atomically establish its
+   * Conversation, first Turn, input Message, frozen Authority and Context head.
+   */
+  public prepareFreshConversationMessageMutation(
+    input: FreshConversationMessageContextPlanInput
+  ): FreshConversationMessageContextPlan {
+    const conversationId = requireId(input.conversationId, 'conversationId');
+    const revisionId = requireId(input.messageRevisionId, 'messageRevisionId');
+    const contentObjectId = requireId(input.contentObjectId, 'contentObjectId');
+    const contentByteLength = requireBigInt(input.contentByteLength, 'contentByteLength');
+    if (contentByteLength < 0n) throw new TypeError('contentByteLength must be non-negative.');
+    const segmentId = stableSegmentId([{
+      sourceKind: 'message_revision', sourceId: revisionId, sourceRevision: 0n
+    }]);
+    const nodeId = contextSequenceNodeId(null, segmentId);
+    const rootId = stableId('context_root_append', conversationId, '<null>', nodeId);
+    const headLinkId = stableId('conversation_context_head', conversationId);
+    const now = this.timestamp();
+    return {
+      rootId,
+      headLinkId,
+      steps: [
+        DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assertNone({ conversation_id: conversationId }),
+        ...messageOccurrenceWithAllocatedRevisionSteps({
+          segmentId,
+          revisionId,
+          contentObjectId,
+          now
+        }),
+        ...nodeInsertSteps([{ id: nodeId, parentNodeId: null, segmentId, now }], 'fresh_message_context_node'),
+        DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
+          id: rootId,
+          conversation_id: conversationId,
+          root_node_id: nodeId,
+          tail_node_id: null,
+          tail_segment_count: 0n,
+          segment_count: 1n,
+          estimated_tokens: estimateTokens(contentByteLength),
+          created_at: now
+        }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+        DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').insert({
+          id: headLinkId,
+          conversation_id: conversationId,
+          root_id: rootId,
+          updated_at: now
+        })
+      ]
+    };
   }
 
   /** Prepared steps are committed by TurnControlPlane together with the new MessageRevision. */

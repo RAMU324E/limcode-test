@@ -2,7 +2,7 @@ import * as fs from 'fs/promises';
 import type { Dirent } from 'fs';
 import * as path from 'path';
 import type { ShadowRepositoryDiskStatRecord } from '../../../shared/protocol';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 
 const SCAN_TEMP_PREFIX = '.checkpoint-scan-';
 const MS_PER_DAY = 24 * 60 * 60 * 1000;

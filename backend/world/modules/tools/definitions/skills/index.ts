@@ -1,6 +1,6 @@
 import { SKILLS_TOOL_NAME, type SkillSource } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
-import { staticToolScheduling } from '../../scheduling';
+import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 
 const SKILL_SOURCES: readonly SkillSource[] = ['agents', 'claude', 'global'];

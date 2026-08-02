@@ -4,8 +4,7 @@ import {
   type ConfigScopeKind,
   type PromptPlaceholderRecord,
   type RuntimeContextRecord,
-  type RuntimeContextScopeLinkRecord,
-  type RuntimeContextSnapshotRecord
+  type RuntimeContextScopeLinkRecord
 } from '@shared/protocol';
 import { bridge } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
@@ -40,12 +39,6 @@ export const useRuntimeContextStore = defineStore('runtimeContext', {
       const link = latest(clientState.runtimeContextScopeLinks.filter((item) => matches(item, scopeKind, scopeId)));
       const runtimeContext = clientState.runtimeContexts.find((item) => item.id === link?.runtimeContextId);
       return { ...(runtimeContext ? { runtimeContext } : {}), ...(link ? { link } : {}) };
-    },
-    activeSnapshotForConversation(conversationId?: string): RuntimeContextSnapshotRecord | undefined {
-      if (!conversationId) return undefined;
-      const clientState = useClientStateStore();
-      const link = latest(clientState.conversationRuntimeContextSnapshotLinks.filter((item) => item.conversationId === conversationId && item.role === 'active'));
-      return clientState.runtimeContextSnapshots.find((item) => item.id === link?.runtimeContextSnapshotId);
     },
     setContextForScope(scopeKind: ConfigScopeKind, scopeId: string | undefined, template: string, name?: string): void {
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
@@ -94,18 +87,6 @@ export const useRuntimeContextStore = defineStore('runtimeContext', {
       if (local.link.updatedAt < pending.requestedAt) return;
       this.pendingSave = undefined;
       this.status = '运行时模板已同步';
-    },
-    refreshConversationSnapshot(conversationId?: string): void {
-      if (!conversationId) return;
-      bridge.request(BridgeMessageType.RuntimeContextRefresh, { conversationId });
-      this.status = '正在刷新运行时快照...';
-    },
-    clearConversationSnapshot(conversationId?: string): void {
-      if (!conversationId) return;
-      const clientState = useClientStateStore();
-      clientState.conversationRuntimeContextSnapshotLinks = clientState.conversationRuntimeContextSnapshotLinks.filter((link) => link.conversationId !== conversationId);
-      bridge.request(BridgeMessageType.RuntimeContextSnapshotClear, { conversationId });
-      this.status = '已清除运行时快照。';
     }
   }
 });

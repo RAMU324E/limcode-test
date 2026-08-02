@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { ShadowCheckpointDiffOpenRequest, ShadowCheckpointDiffOpenResult } from '../types';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 import { SHADOW_DIFF_SCHEME } from '../../../shared/extensionIdentity';
 const EMPTY_DOCUMENT_COMMIT = '__limcode_empty__';
 const GIT_COMMAND_TIMEOUT_MS = 30_000;

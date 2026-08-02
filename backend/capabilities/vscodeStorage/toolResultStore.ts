@@ -12,7 +12,7 @@ import {
   requireCanonicalToolResultContent,
   toolResultBlobRelativePath
 } from '../../reliability/toolResultResource';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 
 
 /**

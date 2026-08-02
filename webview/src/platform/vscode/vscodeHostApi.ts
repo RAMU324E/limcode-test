@@ -1,3 +1,4 @@
+import { toStructuredClonePlainData } from '@shared/plainData';
 import type { HostApi } from '../hostApi';
 
 type VscodeHostWindow = Window & typeof globalThis & {
@@ -15,7 +16,7 @@ export function createVscodeHostApi(): HostApi {
 
   return {
     postMessage(message: unknown): void {
-      vscode.postMessage(message);
+      vscode.postMessage(toStructuredClonePlainData(message, 'VS Code host message'));
     },
     onMessage(handler: (message: unknown) => void): () => void {
       const listener = (event: MessageEvent<unknown>): void => handler(event.data);

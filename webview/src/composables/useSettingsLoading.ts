@@ -20,7 +20,6 @@ export function settingsScopeLabel(scopeKind: string | undefined): string {
     case 'workflow': return '工作流';
     case 'conversation': return '对话';
     case 'run': return '运行';
-    case 'agentSystem': return '多 Agent 系统';
     case 'global':
     default:
       return '';

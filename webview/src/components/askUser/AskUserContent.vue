@@ -5,7 +5,7 @@ import { ASK_USER_MAX_CUSTOM_ANSWER_LENGTH, askUserOptionKey, askUserOutputFromR
 import type { AskUserOptionRecord, AskUserToolRequestRecord, ToolCallRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
-import { interactionForTool } from '@webview/domain/interactionProjection';
+import { interactionForTool, type InteractionView } from '@webview/domain/interactionProjection';
 import { useAskUserStore, type AskUserDraftState } from '@webview/stores/useAskUserStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
@@ -14,6 +14,7 @@ const props = withDefaults(defineProps<{
   request: AskUserToolRequestRecord;
   toolCall?: ToolCallRecord;
   result?: unknown;
+  interactionView?: InteractionView;
   placement?: 'tool-detail' | 'composer';
 }>(), {
   placement: 'tool-detail'
@@ -28,7 +29,9 @@ const toolCallId = computed(() => props.toolCall?.id ?? '');
 const draft = computed<AskUserDraftState>(() => toolCallId.value ? askUser.draftFor(toolCallId.value) : emptyDraft());
 const output = computed(() => askUserOutputFromResult(props.result));
 const answeredOptionKeys = computed(() => new Set((output.value?.selectedOptions ?? []).map(askUserOptionKey)));
-const interaction = computed(() => interactionForTool(clientState, toolCallId.value, 'ask_user'));
+const interaction = computed(() => props.interactionView?.request.kind === 'ask_user'
+  ? props.interactionView
+  : interactionForTool(clientState, toolCallId.value, 'ask_user'));
 const pending = computed(() => interaction.value?.request.state === 'pending');
 const submitting = computed(() => pending.value && !!interaction.value
   && (draft.value.submitting || interactions.isPending(interaction.value.request.id)));

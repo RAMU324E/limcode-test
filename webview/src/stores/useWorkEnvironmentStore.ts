@@ -51,7 +51,6 @@ function defaultPolicyName(scopeKind: WorkEnvironmentPolicyScopeKind): string {
     case 'global': return '全局默认工作环境策略';
     case 'conversation': return '对话工作环境策略';
     case 'agent': return 'Agent 工作环境策略';
-    case 'agentSystem': return '多 Agent 系统工作环境策略';
     case 'workflow': return '工作流工作环境策略';
     case 'run': return '运行工作环境策略';
   }

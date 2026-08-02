@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { AttachmentSettingsRecord } from '../../shared/protocol';
+import type { AttachmentSettingsRecord, InlineDataPart } from '../../shared/protocol';
 import {
   ContentAddressedStore,
   type ContentObjectMetadata
@@ -135,6 +135,23 @@ export class AttachmentIngestService {
       || BigInt(bytes.byteLength) !== requireBigInt(attachment.byte_length, 'Attachment.byte_length')
     ) throw new Error(`Attachment ${attachmentId} CAS content does not match its immutable metadata.`);
     return bytes;
+  }
+
+  public async resolveInlineData(attachmentIdInput: string): Promise<InlineDataPart> {
+    const attachmentId = requireId(attachmentIdInput, 'attachmentId');
+    const attachment = await this.requireExisting('Attachment', attachmentId);
+    const bytes = await this.read(attachmentId);
+    return {
+      inlineData: {
+        attachmentId,
+        mimeType: requireText(attachment.mime_type, 'Attachment.mime_type'),
+        name: requireText(attachment.name, 'Attachment.name'),
+        sha256: requireText(attachment.sha256, 'Attachment.sha256'),
+        storage: 'managed',
+        status: 'available',
+        data: bytes.toString('base64')
+      }
+    };
   }
 
   private async loadSettings(): Promise<AttachmentSettingsRecord> {

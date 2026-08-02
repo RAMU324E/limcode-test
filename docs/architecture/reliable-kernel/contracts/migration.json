@@ -1,7 +1,7 @@
 {
   "contractKind": "migration",
   "contractRevision": "2026-07-31-r4",
-  "status": "planned",
+  "status": "active",
   "scope": "未发布运行时从自制文件数据库一次切换到SQLite和CAS；配置与Workspace独立保留。",
   "strategy": "archive-reset-hard-cut",
   "legacyRuntimeImport": false,

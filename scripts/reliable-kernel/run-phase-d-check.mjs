@@ -610,6 +610,7 @@ async function checkFileProposalResultSeparated() {
         workEnvironmentId: 'workspace',
         targetPath: 'main.txt',
         baseDigest: sha256('base'),
+        baseContent: 'base',
         targetContent: 'target'
       }]
     });
@@ -762,7 +763,7 @@ async function checkFileProposalResultSeparated() {
       toolCallId: partialTool.toolCallId,
       members: [
         { operation: 'create_file', workEnvironmentId: 'workspace', targetPath: 'first.txt', targetContent: 'first' },
-        { operation: 'replace_file', workEnvironmentId: 'workspace', targetPath: 'conflict.txt', baseDigest: sha256('expected'), targetContent: 'second' },
+        { operation: 'replace_file', workEnvironmentId: 'workspace', targetPath: 'conflict.txt', baseDigest: sha256('expected'), baseContent: 'expected', targetContent: 'second' },
         { operation: 'create_file', workEnvironmentId: 'workspace', targetPath: 'never.txt', targetContent: 'never' }
       ]
     });
@@ -835,6 +836,7 @@ async function checkFileProposalResultSeparated() {
         workEnvironmentId: 'workspace',
         targetPath: 'unapplied.txt',
         baseDigest: sha256('still-base'),
+        baseContent: 'still-base',
         targetContent: 'never-applied'
       }]
     });

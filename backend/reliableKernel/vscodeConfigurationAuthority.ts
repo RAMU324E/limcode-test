@@ -1,0 +1,815 @@
+import type * as vscode from 'vscode';
+import type {
+  AgentRecord,
+  CheckpointPolicyRecord,
+  CheckpointPolicyScopeLinkRecord,
+  ClientState,
+  ConfigScopeKind,
+  ConversationWorkflowSelectionRecord,
+  ConversationWorkEnvironmentLinkRecord,
+  GlobalSettingsRecord,
+  GlobalSettingsSection,
+  GlobalSettingsSectionValue,
+  LlmCompressionConfigsRecord,
+  LlmCompressionSettingsRecord,
+  LlmProviderConfigRecord,
+  LlmProviderConfigsRecord,
+  LlmSettingsRecord,
+  McpServersSettingsRecord,
+  ModelProfileRecord,
+  ModelProfileScopeLinkRecord,
+  PlanReviewPolicyRecord,
+  PlanReviewPolicyScopeLinkRecord,
+  RuntimeContextRecord,
+  RuntimeContextScopeLinkRecord,
+  SkillPolicyRecord,
+  SkillPolicyScopeLinkRecord,
+  SystemPromptRecord,
+  SystemPromptScopeLinkRecord,
+  ToolPolicyRecord,
+  ToolPolicyScopeLinkRecord,
+  WorkEnvironmentPolicyRecord,
+  WorkEnvironmentPolicyScopeLinkRecord,
+  WorkEnvironmentRecord,
+  WorkflowRecord
+} from '../../shared/protocol';
+import { createEmptyClientState } from '../../shared/clientStateSchema';
+import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
+import {
+  loadLlmCompressionConfigsSettings,
+  normalizeLlmCompressionSettings,
+  saveLlmCompressionConfigsSettings
+} from '../capabilities/vscodeStorage/llmCompressionConfigs';
+import {
+  loadLlmProviderConfigsSettings,
+  saveLlmProviderConfigsSettings
+} from '../capabilities/vscodeStorage/llmProviderConfigs';
+import { loadMcpServersSettings, saveMcpServersSettings } from '../capabilities/vscodeStorage/mcpServers';
+import {
+  createGlobalSettingsRecord,
+  LIMCODE_GLOBAL_STATUS_LABEL,
+  saveGlobalStatus
+} from '../capabilities/vscodeStorage/globalStatus';
+import type { StoragePaths } from '../capabilities/vscodeStorage/paths';
+import { loadRecordStore } from '../capabilities/vscodeStorage/recordStore';
+import { createDefaultAgentBlueprints } from '../world/modules/agent/blueprints';
+import { VscodeConfigurationMutations } from './vscodeConfigurationMutations';
+import type { AttachmentSettingsAuthority } from './attachmentIngest';
+import type {
+  CompiledTurnAuthority,
+  TurnAuthorityCompilationRequest,
+  TurnAuthorityCompiler
+} from './turnControlPlane';
+
+const BUILTIN_BLUEPRINTS = createDefaultAgentBlueprints();
+const BUILTIN_AGENT_DEFINITIONS = BUILTIN_BLUEPRINTS.agents;
+const BUILTIN_WORKFLOW_DEFINITIONS = BUILTIN_BLUEPRINTS.workflows;
+
+interface ConfigurationRecords {
+  agents: AgentRecord[];
+  workflows: WorkflowRecord[];
+  modelProfiles: ModelProfileRecord[];
+  modelProfileScopeLinks: ModelProfileScopeLinkRecord[];
+  planReviewPolicies: PlanReviewPolicyRecord[];
+  planReviewPolicyScopeLinks: PlanReviewPolicyScopeLinkRecord[];
+  toolPolicies: ToolPolicyRecord[];
+  toolPolicyScopeLinks: ToolPolicyScopeLinkRecord[];
+  skillPolicies: SkillPolicyRecord[];
+  skillPolicyScopeLinks: SkillPolicyScopeLinkRecord[];
+  systemPrompts: SystemPromptRecord[];
+  systemPromptScopeLinks: SystemPromptScopeLinkRecord[];
+  runtimeContexts: RuntimeContextRecord[];
+  runtimeContextScopeLinks: RuntimeContextScopeLinkRecord[];
+  workEnvironments: WorkEnvironmentRecord[];
+  workEnvironmentPolicies: WorkEnvironmentPolicyRecord[];
+  workEnvironmentPolicyScopeLinks: WorkEnvironmentPolicyScopeLinkRecord[];
+  checkpointPolicies: CheckpointPolicyRecord[];
+  checkpointPolicyScopeLinks: CheckpointPolicyScopeLinkRecord[];
+  conversationWorkflowSelections: ConversationWorkflowSelectionRecord[];
+  conversationWorkEnvironmentLinks: ConversationWorkEnvironmentLinkRecord[];
+  providerConfigs: LlmProviderConfigRecord[];
+  activeProviderConfigId: string;
+}
+
+/** 每次 operation 重新经 getPaths 解析 settings authority；不读取或写入 Runtime SQLite。 */
+export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, AttachmentSettingsAuthority {
+  public readonly mutations: VscodeConfigurationMutations;
+
+  public constructor(
+    private readonly getPaths: () => StoragePaths,
+    private readonly context?: vscode.ExtensionContext
+  ) {
+    this.mutations = new VscodeConfigurationMutations(getPaths);
+  }
+
+  public async compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
+    const records = await this.loadRecords();
+    const agentId = requireId(request.executorAgentId, 'executorAgentId');
+    const agent = records.agents.find((candidate) => candidate.id === agentId);
+    if (!agent) throw new Error(`配置 authority 中不存在 executor Agent：${agentId}`);
+    const builtinAgent = BUILTIN_AGENT_DEFINITIONS[agent.kind] ?? BUILTIN_AGENT_DEFINITIONS[agent.id];
+    const workflowSelection = latestScopedSelection(
+      records.conversationWorkflowSelections.filter((selection) =>
+        selection.conversationId === request.conversationId && selection.role === 'active'
+      )
+    );
+    const workflowId = workflowSelection?.scopeKind === 'workflow' ? workflowSelection.workflowId : undefined;
+    const workflow = workflowId ? records.workflows.find((candidate) => candidate.id === workflowId) : undefined;
+    const builtinWorkflow = workflow
+      ? BUILTIN_WORKFLOW_DEFINITIONS[workflow.id]
+        ?? Object.values(BUILTIN_WORKFLOW_DEFINITIONS).find((candidate) => candidate.id === workflow.id)
+      : undefined;
+    const scopesLowToHigh: ScopeReference[] = [
+      { scopeKind: 'global' },
+      { scopeKind: 'agent', scopeId: agentId },
+      ...(workflowId ? [{ scopeKind: 'workflow' as const, scopeId: workflowId }] : []),
+      { scopeKind: 'conversation', scopeId: request.conversationId },
+      { scopeKind: 'run', scopeId: request.turnId }
+    ];
+    const scopesHighToLow = [...scopesLowToHigh].reverse();
+
+    const modelProfile = resolveScopedRecord(
+      records.modelProfileScopeLinks,
+      records.modelProfiles,
+      scopesHighToLow,
+      (link) => link.modelProfileId
+    );
+    const builtinModel = builtinWorkflow?.model ?? builtinAgent?.model;
+    const providerConfigId = modelProfile?.providerConfigId?.trim() || records.activeProviderConfigId;
+    const provider = records.providerConfigs.find((config) => config.id === providerConfigId)
+      ?? records.providerConfigs[0];
+    if (!provider) throw new Error('没有可用的 LLM Provider 配置。');
+    const modelId = modelProfile?.model?.trim() || builtinModel?.model?.trim() || provider.model?.trim();
+    if (!modelId) throw new Error(`Provider ${provider.id} 没有可用模型。`);
+    if (!providerContainsModel(provider, modelId)) {
+      throw new Error(`Provider ${provider.id} 不包含 ModelProfile 冻结的模型 ${modelId}。`);
+    }
+
+    const planReviewPolicy = resolveScopedRecord(
+      records.planReviewPolicyScopeLinks,
+      records.planReviewPolicies,
+      scopesHighToLow,
+      (link) => link.planReviewPolicyId
+    );
+    const builtinPlanReviewPolicy = builtinWorkflow?.planReviewPolicy;
+    const toolPolicy = resolveScopedRecord(
+      records.toolPolicyScopeLinks,
+      records.toolPolicies,
+      scopesHighToLow,
+      (link) => link.toolPolicyId
+    );
+    const builtinToolPolicy = builtinWorkflow?.toolPolicy ?? builtinAgent?.toolPolicy;
+    const skillPolicy = resolveScopedRecord(
+      records.skillPolicyScopeLinks,
+      records.skillPolicies,
+      scopesHighToLow,
+      (link) => link.skillPolicyId
+    );
+    const systemPrompts = resolveScopedRecords(
+      records.systemPromptScopeLinks,
+      records.systemPrompts,
+      scopesLowToHigh,
+      (link) => link.systemPromptId
+    );
+    const agentPrompt = resolveRecordAtScope(
+      records.systemPromptScopeLinks,
+      records.systemPrompts,
+      { scopeKind: 'agent', scopeId: agentId },
+      (link) => link.systemPromptId
+    );
+    const workflowPrompt = workflowId ? resolveRecordAtScope(
+      records.systemPromptScopeLinks,
+      records.systemPrompts,
+      { scopeKind: 'workflow', scopeId: workflowId },
+      (link) => link.systemPromptId
+    ) : undefined;
+    const promptParts = systemPrompts
+      .filter((prompt) => prompt !== agentPrompt && prompt !== workflowPrompt)
+      .map((prompt) => prompt.text.trim())
+      .filter(Boolean);
+    const globalPrompt = resolveRecordAtScope(
+      records.systemPromptScopeLinks,
+      records.systemPrompts,
+      { scopeKind: 'global' },
+      (link) => link.systemPromptId
+    );
+    const orderedPromptParts = [
+      globalPrompt?.text,
+      agentPrompt?.text ?? builtinAgent?.systemPrompt,
+      workflowPrompt?.text ?? builtinWorkflow?.systemPrompt,
+      ...promptParts.filter((part) => part !== globalPrompt?.text?.trim())
+    ].map((part) => part?.trim()).filter((part): part is string => !!part);
+    const systemPrompt = systemPrompts[systemPrompts.length - 1];
+    const runtimeContexts = resolveScopedRecords(
+      records.runtimeContextScopeLinks,
+      records.runtimeContexts,
+      scopesLowToHigh,
+      (link) => link.runtimeContextId
+    );
+    const runtimeContext = runtimeContexts[runtimeContexts.length - 1];
+    const workEnvironmentPolicy = resolveScopedRecord(
+      records.workEnvironmentPolicyScopeLinks,
+      records.workEnvironmentPolicies,
+      scopesHighToLow,
+      (link) => link.workEnvironmentPolicyId
+    );
+    const selectedModelConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId);
+    const contextWindow = resolveContextWindow(provider, modelId);
+    const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
+    const compressionThresholdTokens = Math.max(
+      1_000,
+      contextWindow - Math.min(20_000, Math.floor(contextWindow * 0.2))
+    );
+    const allowedTools = [...new Set(
+      toolPolicy?.allowedTools ?? builtinToolPolicy?.allowedTools ?? []
+    )].sort();
+    const availableWorkEnvironmentIds = records.workEnvironments
+      .filter((environment) => environment.available)
+      .map((environment) => environment.id);
+    const allowedWorkEnvironmentIds = [...new Set(
+      workEnvironmentPolicy?.allowedWorkEnvironmentIds ?? availableWorkEnvironmentIds
+    )]
+      .filter((id) => availableWorkEnvironmentIds.includes(id))
+      .sort();
+    const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
+      link.conversationId === request.conversationId && link.role === 'active'
+    ));
+    const preferredWorkEnvironmentId = selectedEnvironment?.workEnvironmentId
+      && allowedWorkEnvironmentIds.includes(selectedEnvironment.workEnvironmentId)
+      ? selectedEnvironment.workEnvironmentId
+      : workEnvironmentPolicy?.defaultWorkEnvironmentId;
+    const defaultWorkEnvironmentId = preferredWorkEnvironmentId
+      && allowedWorkEnvironmentIds.includes(preferredWorkEnvironmentId)
+      ? preferredWorkEnvironmentId
+      : allowedWorkEnvironmentIds[0] ?? null;
+
+    const executionPreset = {
+      kind: 'turn-execution-preset',
+      turnId: request.turnId,
+      executorAgentId: agentId,
+      providerConfigId: provider.id,
+      modelId,
+      allowedTools,
+      defaultWorkEnvironmentId
+    };
+    const authoritySnapshot = {
+      kind: 'effective-turn-authority',
+      turnId: request.turnId,
+      conversationId: request.conversationId,
+      executorAgentId: agentId,
+      intentKind: request.intentKind,
+      ...(request.sourceTurnId ? { sourceTurnId: request.sourceTurnId } : {}),
+      model: {
+        providerConfigId: provider.id,
+        provider: modelProfile?.provider ?? builtinModel?.provider ?? provider.provider,
+        modelId,
+        enableMultimodalTools
+      },
+      modelProfile: {
+        id: modelProfile?.id ?? null,
+        compressionThresholdTokens,
+        contextWindowTokens: contextWindow,
+        tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
+      },
+      planReviewPolicy: {
+        id: planReviewPolicy?.id ?? builtinPlanReviewPolicy?.id ?? null,
+        mode: planReviewPolicy?.mode ?? builtinPlanReviewPolicy?.mode ?? 'off',
+        allowReadonlyBeforeApproval: planReviewPolicy?.allowReadonlyBeforeApproval ?? builtinPlanReviewPolicy?.allowReadonlyBeforeApproval ?? true,
+        requireForToolRiskLevels: [...(planReviewPolicy?.requireForToolRiskLevels ?? builtinPlanReviewPolicy?.requireForToolRiskLevels ?? [])]
+      },
+      toolPolicy: {
+        id: toolPolicy?.id ?? null,
+        allowedTools,
+        preset: toolPolicy?.preset ?? 'custom',
+        toolConfigs: clonePlainRecord(toolPolicy?.toolConfigs ?? builtinToolPolicy?.toolConfigs),
+        sourceConfigs: clonePlainRecord(toolPolicy?.sourceConfigs)
+      },
+      skillPolicy: {
+        id: skillPolicy?.id ?? null,
+        sourceConfigs: clonePlainRecord(skillPolicy?.sourceConfigs)
+      },
+      systemPrompt: {
+        id: systemPrompt?.id ?? (builtinWorkflow ? `builtin-system-prompt:${workflow?.id}` : builtinAgent ? `builtin-system-prompt:${agentId}` : null),
+        text: orderedPromptParts.join('\n\n')
+      },
+      runtimeContext: {
+        id: runtimeContext?.id ?? null,
+        name: runtimeContexts.map((context) => context.name.trim()).filter(Boolean).join(' + '),
+        template: runtimeContexts.map((context) => context.template.trim()).filter(Boolean).join('\n\n')
+      },
+      workEnvironmentPolicy: {
+        id: workEnvironmentPolicy?.id ?? null,
+        enabled: workEnvironmentPolicy?.enabled ?? false,
+        allowedWorkEnvironmentIds,
+        defaultWorkEnvironmentId
+      }
+    };
+    return {
+      turnId: request.turnId,
+      executorAgentId: agentId,
+      executionPreset: {
+        content: JSON.stringify(executionPreset),
+        contentType: 'application/vnd.limcode.turn-execution-preset+json'
+      },
+      authoritySnapshot: {
+        content: JSON.stringify(authoritySnapshot),
+        contentType: 'application/vnd.limcode.turn-authority-snapshot+json'
+      }
+    };
+  }
+
+  public async agents(): Promise<AgentRecord[]> {
+    return (await this.loadRecords()).agents.map((agent) => ({ ...agent }));
+  }
+
+  public async workflow(workflowIdInput: string): Promise<WorkflowRecord> {
+    const workflowId = requireId(workflowIdInput, 'workflowId');
+    const workflow = (await this.loadRecords()).workflows.find((candidate) => candidate.id === workflowId);
+    if (!workflow) throw new Error(`Workflow 不存在：${workflowId}`);
+    return { ...workflow };
+  }
+
+  public synchronizeWorkspaceFolders(
+    folders: readonly { uri: string; name: string; rootPath: string; index: number }[]
+  ): Promise<void> {
+    return this.mutations.synchronizeWorkspaceFolders(folders);
+  }
+
+  /** Configuration-only projection. Runtime facts remain exclusively on the bounded reliable Feed. */
+  public async configurationClientState(): Promise<ClientState> {
+    const records = await this.loadRecords();
+    return Object.assign(createEmptyClientState(), {
+      agents: records.agents.map(clonePlain),
+      workflows: records.workflows.map(clonePlain),
+      modelProfiles: records.modelProfiles.map(clonePlain),
+      modelProfileScopeLinks: records.modelProfileScopeLinks.map(clonePlain),
+      planReviewPolicies: records.planReviewPolicies.map(clonePlain),
+      planReviewPolicyScopeLinks: records.planReviewPolicyScopeLinks.map(clonePlain),
+      toolPolicies: records.toolPolicies.map(clonePlain),
+      toolPolicyScopeLinks: records.toolPolicyScopeLinks.map(clonePlain),
+      skillPolicies: records.skillPolicies.map(clonePlain),
+      skillPolicyScopeLinks: records.skillPolicyScopeLinks.map(clonePlain),
+      systemPrompts: records.systemPrompts.map(clonePlain),
+      systemPromptScopeLinks: records.systemPromptScopeLinks.map(clonePlain),
+      runtimeContexts: records.runtimeContexts.map(clonePlain),
+      runtimeContextScopeLinks: records.runtimeContextScopeLinks.map(clonePlain),
+      workEnvironments: records.workEnvironments.map(clonePlain),
+      workEnvironmentPolicies: records.workEnvironmentPolicies.map(clonePlain),
+      workEnvironmentPolicyScopeLinks: records.workEnvironmentPolicyScopeLinks.map(clonePlain),
+      checkpointPolicies: records.checkpointPolicies.map(clonePlain),
+      checkpointPolicyScopeLinks: records.checkpointPolicyScopeLinks.map(clonePlain),
+      conversationWorkflowSelections: records.conversationWorkflowSelections.map(clonePlain),
+      conversationWorkEnvironmentLinks: records.conversationWorkEnvironmentLinks.map(clonePlain)
+    });
+  }
+
+  public async resolveAgent(input: { agentId?: string; agentType?: string }): Promise<{
+    agentId: string;
+    agentType: string;
+    title: string;
+  }> {
+    const records = await this.loadRecords();
+    const requestedId = input.agentId?.trim();
+    const requestedType = input.agentType?.trim() || 'worker';
+    const selected = requestedId
+      ? records.agents.find((agent) => agent.id === requestedId)
+      : records.agents.find((agent) => agent.id === requestedType)
+        ?? records.agents.find((agent) => agent.kind === requestedType);
+    if (!selected) {
+      throw new Error(`未知 Agent：${requestedId || requestedType}。可用类型：${records.agents.map((agent) => agent.kind).join(', ')}`);
+    }
+    return {
+      agentId: selected.id,
+      agentType: selected.kind,
+      title: selected.name
+    };
+  }
+
+  public async providerConfig(providerConfigId: string): Promise<LlmProviderConfigRecord> {
+    const records = await this.loadRecords();
+    const id = requireId(providerConfigId, 'providerConfigId');
+    const config = records.providerConfigs.find((candidate) => candidate.id === id);
+    if (!config) throw new Error(`LLM Provider 配置不存在：${id}`);
+    return config;
+  }
+
+  public async activeProviderConfig(): Promise<LlmProviderConfigRecord> {
+    const records = await this.loadRecords();
+    const config = records.providerConfigs.find((candidate) => candidate.id === records.activeProviderConfigId)
+      ?? records.providerConfigs[0];
+    if (!config) throw new Error('没有可用的 LLM Provider 配置。');
+    return config;
+  }
+
+  public async workEnvironment(workEnvironmentId: string): Promise<WorkEnvironmentRecord> {
+    const id = requireId(workEnvironmentId, 'workEnvironmentId');
+    const environment = (await this.loadRecords()).workEnvironments.find((candidate) => candidate.id === id);
+    if (!environment) throw new Error(`工作环境配置不存在：${id}`);
+    return { ...environment };
+  }
+
+  public async workEnvironments(): Promise<WorkEnvironmentRecord[]> {
+    return (await this.loadRecords()).workEnvironments.map((environment) => ({ ...environment }));
+  }
+
+  public async loadGlobalSettings(section: GlobalSettingsSection): Promise<{
+    section: GlobalSettingsSection;
+    settings: GlobalSettingsSectionValue;
+    filePath: string;
+  }> {
+    if (section === 'common') {
+      const context = this.requireContext();
+      return {
+        section,
+        settings: createGlobalSettingsRecord(context),
+        filePath: LIMCODE_GLOBAL_STATUS_LABEL
+      };
+    }
+    const paths = this.getPaths();
+    if (section === 'llm') return this.loadNormalizedLlmSettings(paths);
+    if (section === 'llmProviderConfigs') {
+      const stored = await loadLlmProviderConfigsSettings(paths);
+      return { section, settings: stored.settings, filePath: stored.filePath };
+    }
+    if (section === 'llmCompressionConfigs') {
+      const stored = await loadLlmCompressionConfigsSettings(paths);
+      return { section, settings: stored.settings, filePath: stored.filePath };
+    }
+    if (section === 'llmCompression') {
+      const configs = (await loadLlmCompressionConfigsSettings(paths)).settings.configs;
+      const stored = await loadGlobalSettingsFile(paths.settingsRootUri, section);
+      const settings = normalizeLlmCompressionSettings(
+        stored.settings as Partial<LlmCompressionSettingsRecord> | undefined,
+        configs
+      );
+      if (JSON.stringify(settings) !== JSON.stringify(stored.settings)) {
+        await writeGlobalSettingsFile(paths.settingsRootUri, section, settings);
+      }
+      return { section, settings, filePath: stored.filePath };
+    }
+    if (section === 'mcpServers') {
+      const stored = await loadMcpServersSettings(paths);
+      return { section, settings: stored.settings, filePath: stored.filePath };
+    }
+    return loadGlobalSettingsFile(paths.settingsRootUri, section);
+  }
+
+  public async saveGlobalSettings(
+    section: GlobalSettingsSection,
+    settings: GlobalSettingsSectionValue
+  ): Promise<{ section: GlobalSettingsSection; settings: GlobalSettingsSectionValue; filePath: string }> {
+    if (section === 'common') {
+      const context = this.requireContext();
+      const current = createGlobalSettingsRecord(context);
+      const input = settings as Partial<GlobalSettingsRecord>;
+      const requestedDataRootPath = input.dataFilePath?.trim() ?? current.dataFilePath;
+      if (requestedDataRootPath !== current.dataFilePath) {
+        throw new Error('可靠 Runtime 运行期间不能切换 data root；请通过受控重置/切换命令并重载窗口。');
+      }
+      await saveGlobalStatus(context, current.dataFilePath, input.proxy ?? current.proxy);
+      return {
+        section,
+        settings: createGlobalSettingsRecord(context),
+        filePath: LIMCODE_GLOBAL_STATUS_LABEL
+      };
+    }
+    const paths = this.getPaths();
+    if (section === 'llm') {
+      const configs = (await loadLlmProviderConfigsSettings(paths)).settings.configs;
+      const input = settings as Partial<LlmSettingsRecord>;
+      const active = configs.find((config) => config.id === input.activeProviderConfigId) ?? configs[0];
+      const normalized: LlmSettingsRecord = { activeProviderConfigId: active?.id ?? '' };
+      await writeGlobalSettingsFile(paths.settingsRootUri, section, normalized);
+      return this.loadNormalizedLlmSettings(paths);
+    }
+    if (section === 'llmProviderConfigs') {
+      const stored = await saveLlmProviderConfigsSettings(
+        paths,
+        settings as Partial<LlmProviderConfigsRecord> | undefined
+      );
+      await this.loadNormalizedLlmSettings(paths);
+      return { section, settings: stored.settings, filePath: stored.filePath };
+    }
+    if (section === 'llmCompressionConfigs') {
+      const stored = await saveLlmCompressionConfigsSettings(
+        paths,
+        settings as Partial<LlmCompressionConfigsRecord> | undefined
+      );
+      return { section, settings: stored.settings, filePath: stored.filePath };
+    }
+    if (section === 'llmCompression') {
+      const configs = (await loadLlmCompressionConfigsSettings(paths)).settings.configs;
+      const normalized = normalizeLlmCompressionSettings(
+        settings as Partial<LlmCompressionSettingsRecord> | undefined,
+        configs
+      );
+      await writeGlobalSettingsFile(paths.settingsRootUri, section, normalized);
+      return this.loadGlobalSettings(section);
+    }
+    if (section === 'mcpServers') {
+      const stored = await saveMcpServersSettings(
+        paths,
+        settings as Partial<McpServersSettingsRecord> | undefined
+      );
+      return { section, settings: stored.settings, filePath: stored.filePath };
+    }
+    await writeGlobalSettingsFile(paths.settingsRootUri, section, settings);
+    return this.loadGlobalSettings(section);
+  }
+
+  private async loadNormalizedLlmSettings(paths: StoragePaths): Promise<{
+    section: 'llm';
+    settings: LlmSettingsRecord;
+    filePath: string;
+  }> {
+    const configs = (await loadLlmProviderConfigsSettings(paths)).settings.configs;
+    const stored = await loadGlobalSettingsFile(paths.settingsRootUri, 'llm');
+    const input = stored.settings as Partial<LlmSettingsRecord>;
+    const active = configs.find((config) => config.id === input.activeProviderConfigId) ?? configs[0];
+    const settings: LlmSettingsRecord = { activeProviderConfigId: active?.id ?? '' };
+    if (JSON.stringify(settings) !== JSON.stringify(stored.settings)) {
+      await writeGlobalSettingsFile(paths.settingsRootUri, 'llm', settings);
+    }
+    return { section: 'llm', settings, filePath: stored.filePath };
+  }
+
+  private requireContext(): vscode.ExtensionContext {
+    if (!this.context) throw new Error('该配置操作需要 VS Code ExtensionContext。');
+    return this.context;
+  }
+
+  private async loadRecords(): Promise<ConfigurationRecords> {
+    const paths = this.getPaths();
+    const [
+      agents,
+      workflows,
+      modelProfiles,
+      modelProfileScopeLinks,
+      planReviewPolicies,
+      planReviewPolicyScopeLinks,
+      toolPolicies,
+      toolPolicyScopeLinks,
+      skillPolicies,
+      skillPolicyScopeLinks,
+      systemPrompts,
+      systemPromptScopeLinks,
+      runtimeContexts,
+      runtimeContextScopeLinks,
+      workEnvironments,
+      workEnvironmentPolicies,
+      workEnvironmentPolicyScopeLinks,
+      checkpointPolicies,
+      checkpointPolicyScopeLinks,
+      conversationWorkflowSelections,
+      conversationWorkEnvironmentLinks,
+      providerConfigs,
+      llmSelection
+    ] = await Promise.all([
+      loadRecordStore<AgentRecord, 'agent'>(paths.agentsRootUri, paths.agentsIndexUri, 'agent'),
+      loadRecordStore<WorkflowRecord, 'workflow'>(paths.workflowsRootUri, paths.workflowsIndexUri, 'workflow'),
+      loadRecordStore<ModelProfileRecord, 'modelProfile'>(
+        paths.modelProfilesRootUri,
+        paths.modelProfilesIndexUri,
+        'modelProfile'
+      ),
+      loadRecordStore<ModelProfileScopeLinkRecord, 'link'>(
+        paths.modelProfileScopeLinksRootUri,
+        paths.modelProfileScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<PlanReviewPolicyRecord, 'policy'>(
+        paths.planReviewPoliciesRootUri,
+        paths.planReviewPoliciesIndexUri,
+        'policy'
+      ),
+      loadRecordStore<PlanReviewPolicyScopeLinkRecord, 'link'>(
+        paths.planReviewPolicyScopeLinksRootUri,
+        paths.planReviewPolicyScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<ToolPolicyRecord, 'toolPolicy'>(paths.toolPoliciesRootUri, paths.toolPoliciesIndexUri, 'toolPolicy'),
+      loadRecordStore<ToolPolicyScopeLinkRecord, 'link'>(
+        paths.toolPolicyScopeLinksRootUri,
+        paths.toolPolicyScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<SkillPolicyRecord, 'skillPolicy'>(
+        paths.skillPoliciesRootUri,
+        paths.skillPoliciesIndexUri,
+        'skillPolicy'
+      ),
+      loadRecordStore<SkillPolicyScopeLinkRecord, 'link'>(
+        paths.skillPolicyScopeLinksRootUri,
+        paths.skillPolicyScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<SystemPromptRecord, 'systemPrompt'>(
+        paths.systemPromptsRootUri,
+        paths.systemPromptsIndexUri,
+        'systemPrompt'
+      ),
+      loadRecordStore<SystemPromptScopeLinkRecord, 'link'>(
+        paths.systemPromptScopeLinksRootUri,
+        paths.systemPromptScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<RuntimeContextRecord, 'runtimeContext'>(
+        paths.runtimeContextsRootUri,
+        paths.runtimeContextsIndexUri,
+        'runtimeContext'
+      ),
+      loadRecordStore<RuntimeContextScopeLinkRecord, 'link'>(
+        paths.runtimeContextScopeLinksRootUri,
+        paths.runtimeContextScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<WorkEnvironmentRecord, 'workEnvironment'>(
+        paths.workEnvironmentsRootUri,
+        paths.workEnvironmentsIndexUri,
+        'workEnvironment'
+      ),
+      loadRecordStore<WorkEnvironmentPolicyRecord, 'policy'>(
+        paths.workEnvironmentPoliciesRootUri,
+        paths.workEnvironmentPoliciesIndexUri,
+        'policy'
+      ),
+      loadRecordStore<WorkEnvironmentPolicyScopeLinkRecord, 'link'>(
+        paths.workEnvironmentPolicyScopeLinksRootUri,
+        paths.workEnvironmentPolicyScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<CheckpointPolicyRecord, 'policy'>(
+        paths.checkpointPoliciesRootUri,
+        paths.checkpointPoliciesIndexUri,
+        'policy'
+      ),
+      loadRecordStore<CheckpointPolicyScopeLinkRecord, 'link'>(
+        paths.checkpointPolicyScopeLinksRootUri,
+        paths.checkpointPolicyScopeLinksIndexUri,
+        'link'
+      ),
+      loadRecordStore<ConversationWorkflowSelectionRecord, 'selection'>(
+        paths.conversationWorkflowSelectionsRootUri,
+        paths.conversationWorkflowSelectionsIndexUri,
+        'selection'
+      ),
+      loadRecordStore<ConversationWorkEnvironmentLinkRecord, 'link'>(
+        paths.conversationWorkEnvironmentLinksRootUri,
+        paths.conversationWorkEnvironmentLinksIndexUri,
+        'link'
+      ),
+      loadLlmProviderConfigsSettings(paths),
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llm')
+    ]);
+    return {
+      agents: mergeAgentsWithBuiltins(agents ?? []),
+      workflows: mergeWorkflowsWithBuiltins(workflows ?? []),
+      modelProfiles: modelProfiles ?? [],
+      modelProfileScopeLinks: modelProfileScopeLinks ?? [],
+      planReviewPolicies: planReviewPolicies ?? [],
+      planReviewPolicyScopeLinks: planReviewPolicyScopeLinks ?? [],
+      toolPolicies: toolPolicies ?? [],
+      toolPolicyScopeLinks: toolPolicyScopeLinks ?? [],
+      skillPolicies: skillPolicies ?? [],
+      skillPolicyScopeLinks: skillPolicyScopeLinks ?? [],
+      systemPrompts: systemPrompts ?? [],
+      systemPromptScopeLinks: systemPromptScopeLinks ?? [],
+      runtimeContexts: runtimeContexts ?? [],
+      runtimeContextScopeLinks: runtimeContextScopeLinks ?? [],
+      workEnvironments: workEnvironments ?? [],
+      workEnvironmentPolicies: workEnvironmentPolicies ?? [],
+      workEnvironmentPolicyScopeLinks: workEnvironmentPolicyScopeLinks ?? [],
+      checkpointPolicies: checkpointPolicies ?? [],
+      checkpointPolicyScopeLinks: checkpointPolicyScopeLinks ?? [],
+      conversationWorkflowSelections: conversationWorkflowSelections ?? [],
+      conversationWorkEnvironmentLinks: conversationWorkEnvironmentLinks ?? [],
+      providerConfigs: providerConfigs.settings.configs,
+      activeProviderConfigId: (llmSelection.settings as LlmSettingsRecord).activeProviderConfigId
+    };
+  }
+}
+
+function mergeAgentsWithBuiltins(configured: AgentRecord[]): AgentRecord[] {
+  const byId = new Map(configured.map((agent) => [agent.id, { ...agent }]));
+  for (const definition of Object.values(BUILTIN_AGENT_DEFINITIONS)) {
+    if (byId.has(definition.id)) continue;
+    byId.set(definition.id, {
+      id: definition.id,
+      name: definition.name,
+      ...(definition.description ? { description: definition.description } : {}),
+      kind: definition.kind,
+      source: 'builtin',
+      status: 'idle'
+    });
+  }
+  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function mergeWorkflowsWithBuiltins(configured: WorkflowRecord[]): WorkflowRecord[] {
+  const byId = new Map(configured.map((workflow) => [workflow.id, { ...workflow }]));
+  for (const definition of Object.values(BUILTIN_WORKFLOW_DEFINITIONS)) {
+    if (byId.has(definition.id)) continue;
+    byId.set(definition.id, {
+      id: definition.id,
+      name: definition.name,
+      ...(definition.description ? { description: definition.description } : {}),
+      source: 'builtin',
+      ...(definition.icon ? { icon: definition.icon } : {}),
+      createdAt: 0,
+      updatedAt: 0
+    });
+  }
+  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+interface ScopeReference {
+  scopeKind: ConfigScopeKind;
+  scopeId?: string;
+}
+
+function resolveScopedRecord<
+  TLink extends { scopeKind: string; scopeId?: string; role: string; updatedAt: number; createdAt: number; id: string },
+  TRecord extends { id: string }
+>(
+  links: TLink[],
+  records: TRecord[],
+  scopesHighToLow: readonly ScopeReference[],
+  recordId: (link: TLink) => string
+): TRecord | undefined {
+  for (const scope of scopesHighToLow) {
+    const record = resolveRecordAtScope(links, records, scope, recordId);
+    if (record) return record;
+  }
+  return undefined;
+}
+
+function resolveScopedRecords<
+  TLink extends { scopeKind: string; scopeId?: string; role: string; updatedAt: number; createdAt: number; id: string },
+  TRecord extends { id: string }
+>(
+  links: TLink[],
+  records: TRecord[],
+  scopesLowToHigh: readonly ScopeReference[],
+  recordId: (link: TLink) => string
+): TRecord[] {
+  const result: TRecord[] = [];
+  const seen = new Set<string>();
+  for (const scope of scopesLowToHigh) {
+    const record = resolveRecordAtScope(links, records, scope, recordId);
+    if (!record || seen.has(record.id)) continue;
+    seen.add(record.id);
+    result.push(record);
+  }
+  return result;
+}
+
+function resolveRecordAtScope<
+  TLink extends { scopeKind: string; scopeId?: string; role: string; updatedAt: number; createdAt: number; id: string },
+  TRecord extends { id: string }
+>(
+  links: TLink[],
+  records: TRecord[],
+  scope: ScopeReference,
+  recordId: (link: TLink) => string
+): TRecord | undefined {
+  const selected = links
+    .filter((link) => link.role === 'active'
+      && link.scopeKind === scope.scopeKind
+      && (scope.scopeKind === 'global' ? link.scopeId === undefined : link.scopeId === scope.scopeId))
+    .sort((left, right) => right.updatedAt - left.updatedAt
+      || right.createdAt - left.createdAt
+      || right.id.localeCompare(left.id))[0];
+  return selected ? records.find((record) => record.id === recordId(selected)) : undefined;
+}
+
+function latestScopedSelection<T extends { id: string; createdAt: number; updatedAt: number }>(records: T[]): T | undefined {
+  return [...records].sort((left, right) => right.updatedAt - left.updatedAt
+    || right.createdAt - left.createdAt
+    || right.id.localeCompare(left.id))[0];
+}
+
+function resolveContextWindow(provider: LlmProviderConfigRecord, modelId: string): number {
+  const modelConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId);
+  const value = modelConfig?.contextWindowTokens ?? provider.contextWindowTokens;
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : 128_000;
+}
+
+function providerContainsModel(provider: LlmProviderConfigRecord, modelId: string): boolean {
+  return provider.model.trim() === modelId
+    || provider.models.some((candidate) => candidate.id.trim() === modelId)
+    || provider.modelConfigs.some((candidate) => candidate.modelId.trim() === modelId);
+}
+
+function clonePlainRecord<T>(value: Record<string, T> | undefined): Record<string, T> {
+  if (!value) return {};
+  return JSON.parse(JSON.stringify(value)) as Record<string, T>;
+}
+
+function clonePlain<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function requireId(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
+  return value.trim();
+}

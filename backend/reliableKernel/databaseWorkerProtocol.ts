@@ -125,6 +125,16 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
   readerForeignKeys: bigint;
   readerBusyTimeoutMs: bigint;
   currentCommitSeq: string;
+  /** Bounded verified Context CAS cache counters; metadata only, never content bytes. */
+  contextCasCache: {
+    entries: number;
+    bytes: number;
+    maxEntries: number;
+    maxBytes: number;
+    hits: number;
+    misses: number;
+    evictions: number;
+  };
 }
 
 export type DatabaseWorkerResponse =

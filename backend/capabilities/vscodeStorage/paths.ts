@@ -73,6 +73,8 @@ import {
   OPERATIONS_ROOT_DIR
 } from './constants';
 
+export type StoragePaths = ReturnType<typeof createVscodeStoragePaths>;
+
 export interface VscodeStorageUris {
   /** data root 级兼容 epoch 与受控重置路径。 */
   dataEpochUri: vscode.Uri;

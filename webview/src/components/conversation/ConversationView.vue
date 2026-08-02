@@ -1,91 +1,52 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
-import { storeToRefs } from 'pinia';
-import {
-  TERMINAL_TOOL_CALL_STATUSES,
-  isVisibleTextPart,
-  type CheckpointRecord,
-  type ClientState,
-  type MessageContent
-} from '@shared/protocol';
-import { isInternalMessage } from '@shared/messagePresentation';
-import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
-import type { RunExecutionPhase } from '@shared/runLifecycle';
-import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
-import { useConversationUiStore, type ActivityTimelineRowInput } from '@webview/stores/useConversationUiStore';
+import { isVisibleTextPart, type MessageContent } from '@shared/protocol';
+import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
 import { useChat } from '@webview/composables/useChat';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useBottomStickyScroller } from '@webview/composables/useBottomStickyScroller';
-import { useCheckpointPolicyStore } from '@webview/stores/useCheckpointPolicyStore';
-import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
-import MessageList from './MessageList.vue';
+import ReliableMessageList from './ReliableMessageList.vue';
 import Composer from '@webview/components/input/Composer.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
-import RunHistoryDetailPanel from './RunHistoryDetailPanel.vue';
-import ConversationTimelineMarkers from './ConversationTimelineMarkers.vue';
-import { checkpointBeforeMessageFloor, rollbackConfirmActionTitle } from './checkpointRollback';
 
-const clientState = useClientStateStore();
-const conversationTimeline = useConversationTimelineStore();
 const conversationUi = useConversationUiStore();
-const checkpointStore = useCheckpointPolicyStore();
-const settings = useGlobalSettingsStore();
-const currentConversationId = computed(() => clientState.currentConversationId);
-const { currentTimeline, currentMessages, currentAnchorMessages, currentCheckpoints, currentCheckpointTimelineAnchors, currentCompressionBlocks, currentMessageFloorById, currentTotalMessages } = storeToRefs(conversationTimeline);
-const { sendMessage, editMessage, updateTurnIntent } = useChat();
+const reliableConversation = useReliableConversation();
+const { sendMessage, editMessage } = useChat();
+const currentConversationId = reliableConversation.conversationId;
+const currentDisplayMessages = computed(() => reliableConversation.projection.value.messages);
 
 const scroller = ref<HTMLElement | null>(null);
 const conversationBody = ref<HTMLElement | null>(null);
-const autoDismissTimers = new Map<string, number>();
 const bottomStickyScroller = useBottomStickyScroller(scroller);
 let pendingInitialBottomConversationId = '';
 let initialBottomScrollFrame: number | undefined;
-let timelineSyncFrame: number | undefined;
-let pendingTimelineSync: Parameters<typeof conversationUi.syncTimeline> | undefined;
 
-const loadingDetail = computed(() => !!currentConversationId.value && currentTimeline.value.status === 'loadingInitial' && currentMessages.value.length === 0);
-const ready = computed(() => !!currentConversationId.value && !loadingDetail.value);
+const loadingDetail = computed(() =>
+  Boolean(reliableConversation.feed.sessionId)
+  && Boolean(currentConversationId.value)
+  && currentDisplayMessages.value.length === 0
+  && reliableConversation.projection.value.loadingMessageRevisionIds.length > 0
+);
+const ready = computed(() => Boolean(reliableConversation.feed.sessionId && currentConversationId.value) && !loadingDetail.value);
 const placeholder = computed(() =>
   ready.value
     ? '输入消息，Enter 发送，Shift+Enter 换行'
-    : loadingDetail.value ? '对话内容加载中...' : '默认对话初始化中...'
+    : loadingDetail.value ? '对话内容加载中...' : '可靠 Runtime 初始化中...'
 );
 const emptyHint = computed(() =>
-  ready.value ? '还没有消息，发一条试试。' : loadingDetail.value ? '正在加载对话内容，请稍候。' : '默认对话初始化中，请稍候。'
+  ready.value ? '还没有消息，发一条试试。' : loadingDetail.value ? '正在加载对话内容，请稍候。' : '可靠 Runtime 初始化中，请稍候。'
 );
 const editFollowupCount = computed(() => Math.max(0, (conversationUi.editingMessage?.deleteCount ?? 1) - 1));
 const editConfirmDescriptionHtml = computed(
   () => `是否编辑此消息？将同时删除后续 ${editFollowupCount.value} 条消息，此操作<strong>不可撤销</strong>`
 );
-const timelineActivityRows = computed<ActivityTimelineRowInput[]>(() =>
-  buildPreparingActivityRows(currentTimeline.value.state, currentConversationId.value)
-);
-const editRollbackPending = ref(false);
-const editRollbackCheckpoint = computed(() => {
-  if (!CHECKPOINT_FEATURE_ENABLED) return undefined;
-  const editing = conversationUi.editingMessage;
-  return editing ? checkpointBeforeMessageFloor(currentCheckpoints.value, currentCheckpointTimelineAnchors.value, editing.message.id) : undefined;
-});
-const editConfirmActions = computed<ConfirmPanelAction[]>(() => {
-  const actions: ConfirmPanelAction[] = [
-    { key: 'cancel', label: '取消', variant: 'secondary', disabled: editRollbackPending.value }
-  ];
-  if (editRollbackCheckpoint.value || editRollbackPending.value) {
-    actions.push({
-      key: 'rollback-confirm',
-      label: editRollbackPending.value ? '正在回档...' : '回档并确认',
-      variant: editRollbackPending.value || !editRollbackCheckpoint.value ? 'secondary' : 'default',
-      disabled: editRollbackPending.value || !editRollbackCheckpoint.value,
-      title: rollbackConfirmActionTitle(editRollbackCheckpoint.value)
-    });
-  }
-  actions.push({ key: 'direct-confirm', label: '直接确认', disabled: editRollbackPending.value });
-  return actions;
-});
-
+const editConfirmActions: ConfirmPanelAction[] = [
+  { key: 'cancel', label: '取消', variant: 'secondary' },
+  { key: 'direct-confirm', label: '确认编辑' }
+];
 const scrollMarkers = computed(() =>
-  currentMessages.value
+  currentDisplayMessages.value
     .filter((message) => message.role === 'user')
     .map((message, index) => {
       const editing = conversationUi.editingMessage?.message.id === message.id;
@@ -105,16 +66,7 @@ const scrollMarkers = computed(() =>
 );
 
 watch(
-  [currentMessages, currentAnchorMessages, currentCheckpoints, currentCheckpointTimelineAnchors, currentCompressionBlocks, timelineActivityRows, currentMessageFloorById, currentTotalMessages],
-  ([messages, anchorMessages, checkpoints, checkpointAnchors, compressionBlocks, activityRows, floorByMessageId, totalMessages]) => {
-    scheduleTimelineSync(messages, anchorMessages, checkpoints, checkpointAnchors, compressionBlocks, activityRows, floorByMessageId, totalMessages);
-  },
-  { immediate: true, flush: 'post' }
-);
-
-// 初次进入/切换历史对话时，初始分页是最新 chunk；需要等数据落 DOM 后主动贴底，避免首帧停在顶部触发 older chunk 加载。
-watch(
-  () => currentConversationId.value,
+  currentConversationId,
   (conversationId) => {
     pendingInitialBottomConversationId = conversationId;
     bottomStickyScroller.scrollToBottomNow();
@@ -124,64 +76,24 @@ watch(
 );
 
 watch(
-  () => `${currentConversationId.value}:${currentTimeline.value.status}:${conversationUi.timelineRows.length}:${currentTimeline.value.loadedChunkIds.join('\u0001')}:${currentTimeline.value.pageInfo?.loadedAt ?? 0}`,
+  () => `${currentConversationId.value}:${currentDisplayMessages.value.length}:${reliableConversation.feed.lastCommitSeq ?? ''}:${Object.keys(reliableConversation.feed.transientModelRequests).length}`,
   () => scheduleInitialConversationBottomScroll(),
   { flush: 'post' }
 );
 
-watch(
-  [
-    currentCheckpoints,
-    () => settings.loadedSections.checkpointMaintenance,
-    () => settings.checkpointMaintenance.autoDismissEnabled,
-    () => settings.checkpointMaintenance.autoDismissSeconds
-  ],
-  () => syncCheckpointAutoDismiss(),
-  { immediate: true }
-);
-
-onBeforeUnmount(() => {
-  clearCheckpointAutoDismissTimers();
-  cancelInitialBottomScrollFrame();
-  cancelTimelineSyncFrame();
-});
-
-function scheduleTimelineSync(...args: Parameters<typeof conversationUi.syncTimeline>): void {
-  pendingTimelineSync = args;
-  if (timelineSyncFrame !== undefined) return;
-  timelineSyncFrame = window.requestAnimationFrame(() => {
-    timelineSyncFrame = undefined;
-    const next = pendingTimelineSync;
-    pendingTimelineSync = undefined;
-    if (next) conversationUi.syncTimeline(...next);
-  });
-}
-
-function cancelTimelineSyncFrame(): void {
-  if (timelineSyncFrame !== undefined) window.cancelAnimationFrame(timelineSyncFrame);
-  timelineSyncFrame = undefined;
-  pendingTimelineSync = undefined;
-}
+onBeforeUnmount(() => cancelInitialBottomScrollFrame());
 
 function scheduleInitialConversationBottomScroll(): void {
   const conversationId = currentConversationId.value;
   if (!conversationId || pendingInitialBottomConversationId !== conversationId) return;
-
-  const timeline = currentTimeline.value;
-  const rowCount = conversationUi.timelineRows.length;
-  const hasTimelinePage = timeline.loadedChunkIds.length > 0 || timeline.pageInfo !== undefined;
-  if (timeline.status === 'loadingInitial' && rowCount === 0) return;
-  if (!hasTimelinePage && rowCount === 0) return;
-
+  if (currentDisplayMessages.value.length === 0 && loadingDetail.value) return;
   void nextTick(() => {
     if (pendingInitialBottomConversationId !== conversationId || currentConversationId.value !== conversationId) return;
-
     bottomStickyScroller.scrollToBottomNow();
     cancelInitialBottomScrollFrame();
     initialBottomScrollFrame = window.requestAnimationFrame(() => {
       initialBottomScrollFrame = undefined;
       if (pendingInitialBottomConversationId !== conversationId || currentConversationId.value !== conversationId) return;
-
       bottomStickyScroller.scrollToBottomNow();
       pendingInitialBottomConversationId = '';
     });
@@ -195,14 +107,6 @@ function cancelInitialBottomScrollFrame(): void {
 }
 
 function onSubmit(text: string, content?: MessageContent): void {
-  if (conversationUi.editingTurnIntent) {
-    updateTurnIntent({
-      id: conversationUi.editingTurnIntent.intentId,
-      rowVersion: conversationUi.editingTurnIntent.rowVersion
-    }, text, content);
-    conversationUi.cancelEditMode();
-    return;
-  }
   if (conversationUi.isEditing) {
     conversationUi.pendingEditText = text;
     conversationUi.editConfirmOpen = true;
@@ -211,167 +115,42 @@ function onSubmit(text: string, content?: MessageContent): void {
   sendMessage(text, content);
 }
 
-async function handleEditConfirmAction(action: ConfirmPanelAction): Promise<void> {
+function handleEditConfirmAction(action: ConfirmPanelAction): void {
   if (action.key === 'cancel') {
     conversationUi.editConfirmOpen = false;
     return;
   }
-
-  if (action.key === 'rollback-confirm') {
-    if (!editRollbackCheckpoint.value || editRollbackPending.value) return;
-    editRollbackPending.value = true;
-    try {
-      const checkpoint = editRollbackCheckpoint.value;
-      const result = await checkpointStore.restoreCheckpoint(checkpoint);
-      if (result.status !== 'restored') return;
-      checkpointStore.dismissCheckpoint(checkpoint.id, checkpoint.conversationId);
-    } finally {
-      editRollbackPending.value = false;
-    }
-    commitEditMessage();
-    return;
-  }
-
-  if (action.key === 'direct-confirm') {
-    commitEditMessage();
-  }
+  if (action.key === 'direct-confirm') commitEditMessage();
 }
 
 function commitEditMessage(): void {
   const editing = conversationUi.editingMessage;
   const text = conversationUi.pendingEditText.trim();
   if (!editing || !text) return;
-
   conversationUi.editConfirmOpen = false;
-
   const commit = (): void => {
     editMessage(editing.message.conversationId, editing.message.id, text, { runAfterEdit: true, deleteFollowing: true });
     conversationUi.cancelEditMode();
   };
-
   const nextMessage = nextMessageAfter(editing.message.id);
   if (nextMessage) {
     conversationUi.playExitFrom(nextMessage.id, commit);
     return;
   }
-
   commit();
 }
 
 function nextMessageAfter(messageId: string) {
-  const index = currentMessages.value.findIndex((message) => message.id === messageId);
-  return index >= 0 ? currentMessages.value[index + 1] : undefined;
+  const index = currentDisplayMessages.value.findIndex((message) => message.id === messageId);
+  return index >= 0 ? currentDisplayMessages.value[index + 1] : undefined;
+}
+
+function startReliableMessageEdit(message: (typeof currentDisplayMessages.value)[number], deleteCount: number): void {
+  conversationUi.startEditMessage(message, deleteCount);
 }
 
 function truncatePreview(text: string): string {
   return text.length > 180 ? `${text.slice(0, 180)}...` : text;
-}
-
-function buildPreparingActivityRows(state: ClientState, conversationId: string): ActivityTimelineRowInput[] {
-  if (!conversationId) return [];
-  const runIds = new Set(state.agentRunTargetLinks
-    .filter((link) => link.conversationId === conversationId)
-    .map((link) => link.runId));
-  const internalMessageIds = new Set(state.messages.filter(isInternalMessage).map((message) => message.id));
-  const internalRunIds = new Set(state.agentRunSourceLinks
-    .filter((source) => !!source.sourceMessageId && internalMessageIds.has(source.sourceMessageId))
-    .map((source) => source.runId));
-  const activeRuns = state.agentRuns
-    .filter((run) => runIds.has(run.id) && !internalRunIds.has(run.id))
-    .filter((run) => run.status === 'preparing' || run.status === 'running')
-    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-
-  return activeRuns
-    .filter((run) => !hasActiveToolWork(run.id, state) && !hasStreamingModelMessage(run.id, state))
-    .map((run) => {
-      const label = preparingActivityLabel(run.phase);
-      return {
-        id: `activity:preparing:${run.id}`,
-        conversationId,
-        runId: run.id,
-        activityKind: 'preparing' as const,
-        ...(label ? { label } : {})
-      };
-    });
-}
-
-function preparingActivityLabel(phase: RunExecutionPhase | undefined): string | undefined {
-  switch (phase) {
-    case 'loading_context': return '正在加载上下文';
-    case 'waiting_compression': return '正在压缩上下文';
-    case 'resolving_invocation': return '正在解析模型配置';
-    case 'waiting_checkpoint_before_llm':
-    case 'waiting_checkpoint_after_llm': return '正在准备下一步';
-    case 'llm_request_pending': return '正在启动模型请求';
-    case 'llm_streaming': return '正在等待模型输出';
-    case 'waiting_tools': return '正在衔接工具结果';
-    case 'waiting_child_run': return '正在等待子 Agent';
-    case 'waiting_user': return '正在等待你的操作';
-    case 'waiting_plan_review': return '正在等待计划确认';
-    case 'delivering': return '正在交付 Agent 结果';
-    default: return undefined;
-  }
-}
-
-function hasActiveToolWork(runId: string, state: ClientState): boolean {
-  const toolCallIds = new Set(state.toolCallRunLinks
-    .filter((link) => link.runId === runId)
-    .map((link) => link.toolCallId));
-  return state.toolCalls.some((call) => toolCallIds.has(call.id) && !TERMINAL_TOOL_CALL_STATUSES.has(call.status));
-}
-
-function hasStreamingModelMessage(runId: string, state: ClientState): boolean {
-  const messageIds = new Set<string>(state.messageTurnLinks
-    .filter((link) => link.turnId === runId && link.role === 'model')
-    .map((link) => link.messageId));
-  return state.messages.some((message) => messageIds.has(message.id) && message.status === 'streaming');
-}
-
-function syncCheckpointAutoDismiss(): void {
-  if (!CHECKPOINT_FEATURE_ENABLED) {
-    clearCheckpointAutoDismissTimers();
-    return;
-  }
-  settings.ensureCheckpointMaintenance();
-  if (!settings.loadedSections.checkpointMaintenance || !settings.checkpointMaintenance.autoDismissEnabled) {
-    clearCheckpointAutoDismissTimers();
-    return;
-  }
-
-  const eligibleCheckpoints = new Map(
-    currentCheckpoints.value
-      .filter(checkpointShouldAutoDismiss)
-      .map((checkpoint) => [checkpoint.id, checkpoint])
-  );
-
-  for (const id of [...autoDismissTimers.keys()]) {
-    if (eligibleCheckpoints.has(id)) continue;
-    clearCheckpointAutoDismissTimer(id);
-  }
-
-  const delayMs = Math.max(1, Math.floor(settings.checkpointMaintenance.autoDismissSeconds || 5)) * 1000;
-  for (const checkpoint of eligibleCheckpoints.values()) {
-    if (autoDismissTimers.has(checkpoint.id)) continue;
-    const timer = window.setTimeout(() => {
-      autoDismissTimers.delete(checkpoint.id);
-      checkpointStore.dismissCheckpoint(checkpoint.id, checkpoint.conversationId);
-    }, delayMs);
-    autoDismissTimers.set(checkpoint.id, timer);
-  }
-}
-
-function checkpointShouldAutoDismiss(checkpoint: CheckpointRecord): boolean {
-  return checkpoint.status === 'failed' || (checkpoint.status === 'skipped' && checkpoint.skipReason !== 'no_changes');
-}
-
-function clearCheckpointAutoDismissTimer(id: string): void {
-  const timer = autoDismissTimers.get(id);
-  if (timer !== undefined) window.clearTimeout(timer);
-  autoDismissTimers.delete(id);
-}
-
-function clearCheckpointAutoDismissTimers(): void {
-  for (const id of [...autoDismissTimers.keys()]) clearCheckpointAutoDismissTimer(id);
 }
 </script>
 
@@ -379,14 +158,12 @@ function clearCheckpointAutoDismissTimers(): void {
   <div class="conversation">
     <div ref="conversationBody" class="conversation-body">
       <div ref="scroller" class="conversation-scroll">
-        <MessageList :empty-hint="emptyHint" :scroller="scroller" />
+        <ReliableMessageList
+          :empty-hint="emptyHint"
+          :scroller="scroller"
+          @edit-message="startReliableMessageEdit"
+        />
       </div>
-      <ConversationTimelineMarkers
-        v-if="CHECKPOINT_FEATURE_ENABLED"
-        :markers="conversationUi.checkpointMarkers"
-        :scroller="scroller"
-        @toggle="conversationUi.toggleCheckpointMarker"
-      />
       <AdvancedScrollbar
         class="conversation-main-scrollbar"
         :scroller="scroller"
@@ -407,7 +184,6 @@ function clearCheckpointAutoDismissTimers(): void {
       @action="handleEditConfirmAction"
       @cancel="conversationUi.editConfirmOpen = false"
     />
-    <RunHistoryDetailPanel />
   </div>
 </template>
 

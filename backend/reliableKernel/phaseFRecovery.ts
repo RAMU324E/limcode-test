@@ -122,6 +122,14 @@ export class PhaseFRecoveryScanner {
       String(link.source_tool_call_id),
       String(link.child_execution_id)
     ]));
+    const continuationOperations = await listAllDomainRows(this.database, 'Operation', {
+      owner_kind: 'answer_bridge_wait',
+      status: 'waiting_answer'
+    });
+    const continuationByToolCall = new Map(continuationOperations.map((operation) => [
+      String(operation.tool_call_id),
+      operation
+    ]));
     const affectedIds: string[] = [];
     let unchanged = 0;
     for (const execution of executions) {
@@ -130,15 +138,31 @@ export class PhaseFRecoveryScanner {
         unchanged += 1;
         continue;
       }
-      const childExecutionId = childByToolCall.get(String(execution.tool_call_id));
-      if (!childExecutionId) {
-        throw new Error(`Expired subagent ToolExecution ${String(execution.id)} has no ChildExecution ParentLink.`);
+      const toolCallId = String(execution.tool_call_id);
+      const childExecutionId = childByToolCall.get(toolCallId);
+      if (childExecutionId) {
+        if (await this.children.settleForegroundTimeout(childExecutionId, now)) {
+          affectedIds.push(String(execution.id));
+        } else {
+          unchanged += 1;
+        }
+        continue;
       }
-      if (await this.children.settleForegroundTimeout(childExecutionId, now)) {
-        affectedIds.push(String(execution.id));
-      } else {
-        unchanged += 1;
+      const continuation = continuationByToolCall.get(toolCallId);
+      if (continuation) {
+        const settled = await this.children.settleContinuationWaits({
+          answerBridgeId: String(continuation.owner_id),
+          toolCallId,
+          detail: { timeout: true, recovered: true },
+          sourceIdentity: `recovery-foreground-timeout:${toolCallId}:${String(deadline)}`,
+          observedAt: now
+        });
+        if (settled.length > 0) affectedIds.push(String(execution.id));
+        else unchanged += 1;
+        continue;
       }
+      // ask_user and other independent waiting operations are owned by their own recovery scanners.
+      unchanged += 1;
     }
     return {
       id: PHASE_F_RECOVERY_FOREGROUND_WAIT_EXPIRED,

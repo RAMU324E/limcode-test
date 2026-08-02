@@ -1,82 +1,80 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { IconClipboardList, IconExternalLink } from '@tabler/icons-vue';
 import { submitPlanOutputFromResult, submitPlanRequestFromArgs } from '@shared/planReview';
 import { SUBMIT_PLAN_TOOL_NAME, type SubmitPlanToolRequestRecord, type ToolCallRecord } from '@shared/protocol';
-import { interactionForTool } from '@webview/domain/interactionProjection';
+import { interactionViewFromReliableRuntime } from '@webview/domain/interactionProjection';
 import { useSessionStore } from '@webview/stores/useSessionStore';
-import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { toolResultForState, useToolResultArtifactStore, type ToolResultState } from '@webview/stores/useToolResultArtifactStore';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import PlanProposalContent from '@webview/components/plan/PlanProposalContent.vue';
 
 const session = useSessionStore();
-const clientState = useClientStateStore();
-const toolResults = useToolResultArtifactStore();
+const reliableConversation = useReliableConversation();
 const scroller = ref<HTMLElement | null>(null);
 
-const planProposalId = computed(() => session.planProposalId || proposalIdFromToolCall(toolCallById(session.toolCallId)) || '');
-const proposal = computed(() => clientState.planProposals.find((item) => item.id === planProposalId.value));
-const toolCall = computed(() => toolCallById(session.toolCallId) ?? toolCallForProposal(planProposalId.value));
+const toolCall = computed(() => toolCallById(session.toolCallId) ?? toolCallForProposal(session.planProposalId));
 const toolResult = computed(() => toolCall.value
-  ? toolResultForState(clientState.$state as unknown as ToolResultState, toolCall.value.id, toolResults.loadedByArtifactId)
+  ? reliableConversation.projection.value.toolResultByCallId[toolCall.value.id]
   : undefined);
-const request = computed<SubmitPlanToolRequestRecord | undefined>(() => {
-  const fromToolCall = submitPlanRequestFromArgs(toolCall.value?.args);
-  if (fromToolCall) return fromToolCall;
-  const currentProposal = proposal.value;
-  if (!currentProposal) return undefined;
-  return {
-    plan: currentProposal.body,
-    ...(currentProposal.taskList ? { taskList: currentProposal.taskList } : {})
-  };
+const planProposalId = computed(() => session.planProposalId || submitPlanOutputFromResult(toolResult.value)?.proposalId || '');
+const request = computed<SubmitPlanToolRequestRecord | undefined>(() => submitPlanRequestFromArgs(toolCall.value?.args));
+const loaded = computed(() => Boolean(reliableConversation.feed.sessionId)
+  && reliableConversation.projection.value.missingToolArgumentIds.length === 0
+  && reliableConversation.projection.value.missingToolResultIds.length === 0);
+const planInteraction = computed(() => {
+  const call = toolCall.value;
+  if (!call) return undefined;
+  const interaction = reliableConversation.projection.value.interactionByToolCallId[call.id];
+  if (!interaction) return undefined;
+  return interactionViewFromReliableRuntime({
+    interaction,
+    conversationId: reliableConversation.conversationId.value,
+    toolCallId: call.id,
+    expectedKind: 'plan_review'
+  });
 });
-const loaded = computed(() => clientState.currentConversationDetailLoaded);
-const planInteraction = computed(() => interactionForTool(clientState, toolCall.value?.id, 'plan_review'));
 const title = computed(() => {
-  if (proposal.value?.status === 'approved') return 'Plan 已批准';
-  if (proposal.value?.status === 'change_requested') return 'Plan 要求修改';
-  if (proposal.value?.status === 'rejected') return 'Plan 已拒绝';
+  const result = submitPlanOutputFromResult(toolResult.value);
+  if (result?.status === 'approved') return 'Plan 已批准';
+  if (result?.status === 'change_requested') return 'Plan 要求修改';
+  if (result?.status === 'rejected') return 'Plan 已拒绝';
   if (planInteraction.value?.request.state === 'pending') return '等待审批 Plan';
   return 'Plan 详情';
 });
 const subtitle = computed(() => [
-  clientState.currentConversation?.title || clientState.currentConversationId,
+  reliableConversation.conversationId.value,
   planProposalId.value
 ].filter(Boolean).join(' · '));
+
+watch(
+  () => [
+    ...reliableConversation.projection.value.missingToolArgumentIds,
+    ...reliableConversation.projection.value.missingToolResultIds
+  ].join('|'),
+  reliableConversation.ensureDetails,
+  { immediate: true }
+);
 
 function toolCallById(toolCallId: string): ToolCallRecord | undefined {
   const normalized = toolCallId.trim();
   if (!normalized) return undefined;
-  return clientState.toolCalls.find((item) => item.id === normalized || item.functionCallId === normalized);
+  return reliableConversation.projection.value.toolCalls.find((item) =>
+    item.id === normalized || item.functionCallId === normalized
+  );
 }
 
 function toolCallForProposal(proposalId: string): ToolCallRecord | undefined {
   const normalized = proposalId.trim();
   if (!normalized) return undefined;
-  const runLink = clientState.runPlanProposalLinks.find((item) => item.planProposalId === normalized);
-  if (!runLink) return undefined;
-  const candidates = clientState.toolCallRunLinks
-    .filter((item) => item.runId === runLink.runId)
-    .map((item) => toolCallById(item.toolCallId))
-    .filter((item): item is ToolCallRecord => item?.name === SUBMIT_PLAN_TOOL_NAME);
-  return candidates.find((item) => proposalIdFromToolCall(item) === normalized) ?? candidates[0];
-}
-
-function proposalIdFromToolCall(call: ToolCallRecord | undefined): string | undefined {
-  if (!call || call.name !== SUBMIT_PLAN_TOOL_NAME) return undefined;
-  const outputProposalId = submitPlanOutputFromResult(toolResultForState(
-    clientState.$state as unknown as ToolResultState,
-    call.id,
-    toolResults.loadedByArtifactId
-  ))?.proposalId;
-  if (outputProposalId) return outputProposalId;
-  const progress = call.progress;
-  if (!progress || typeof progress !== 'object' || Array.isArray(progress)) return undefined;
-  const id = (progress as Record<string, unknown>).planProposalId;
-  return typeof id === 'string' && id.trim() ? id.trim() : undefined;
+  return reliableConversation.projection.value.toolCalls.find((call) =>
+    call.name === SUBMIT_PLAN_TOOL_NAME
+    && submitPlanOutputFromResult(reliableConversation.projection.value.toolResultByCallId[call.id])?.proposalId === normalized
+  );
 }
 </script>
+
+
 
 <template>
   <main class="plan-detail-view">

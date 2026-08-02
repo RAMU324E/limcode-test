@@ -1,7 +1,7 @@
 {
   "contractKind": "transition-ledger",
   "contractRevision": "2026-07-31-r4",
-  "status": "planned",
+  "status": "active",
   "compatibilityAdaptersAllowed": false,
   "scope": "帮助实施者找到当前旧入口；最终完成仍以真实源码和导入图为准。",
   "entries": [
@@ -14,7 +14,8 @@
       "selector": {
         "path": "backend/reliability/fileConversationTransactionBackend.ts",
         "symbol": "FileConversationTransactionBackend"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "file-runtime-authority",
@@ -25,7 +26,8 @@
       "selector": {
         "path": "backend/reliability/runtimeAuthorityStore.ts",
         "symbol": "RuntimeAuthorityAdapter"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "online-root-migrator",
@@ -36,7 +38,8 @@
       "selector": {
         "path": "backend/capabilities/vscodeStorage/migration.ts",
         "symbol": "migrateStorageRoot"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "file-durability-cohort",
@@ -54,7 +57,8 @@
         "backend/reliability/storagePathAuthority.ts",
         "backend/reliability/canonicalRecordStore.ts",
         "backend/reliability/canonicalJson.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "id-and-lease-cohort",
@@ -70,7 +74,8 @@
         "backend/reliability/stableIdFactory.ts",
         "backend/reliability/runtimeLeaseRegistry.ts",
         "backend/reliability/logicalScopeExecutor.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "storage-compilers-cohort",
@@ -93,7 +98,8 @@
         "backend/reliability/storageCompilers/toolCallEventCompiler.ts",
         "backend/reliability/storageCompilers/toolResultCompiler.ts",
         "backend/reliability/storageCompilers/turnControlCompiler.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "canonical-resource-loaders-cohort",
@@ -118,7 +124,8 @@
         "backend/reliability/interactionResolution.ts",
         "backend/reliability/compressionResource.ts",
         "backend/reliability/modelContextDurableFacts.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "attachment-cohort",
@@ -134,7 +141,8 @@
         "backend/reliability/attachmentResource.ts",
         "backend/reliability/attachmentBase64.ts",
         "backend/reliability/managedAttachmentReferences.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "agent-run-public-authority",
@@ -145,7 +153,8 @@
       "selector": {
         "path": "shared/protocol.ts",
         "symbol": "AgentRunRecord"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "direct-tool-finalization",
@@ -156,7 +165,8 @@
       "selector": {
         "path": "backend/application/effectHandlers/tools/index.ts",
         "symbol": "registerToolEffectHandlers"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "process-output-consume-mode",
@@ -168,7 +178,8 @@
         "path": "backend/world/modules/tools/definitions/command/index.ts",
         "symbol": "createCommandTool",
         "member": "consume"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "process-terminal-claim",
@@ -180,7 +191,8 @@
         "path": "backend/capabilities/backgroundProcessManager.ts",
         "symbol": "BackgroundProcessManager",
         "member": "claimTerminalRevisionForModelPoll"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "giant-primary-effect-dispatcher",
@@ -191,7 +203,8 @@
       "selector": {
         "path": "backend/reliability/primaryEffectDispatcher.ts",
         "symbol": "PrimaryEffectDispatcher"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "domain-handlers-cohort",
@@ -209,7 +222,8 @@
         "backend/reliability/domain/runtimeCleanupHandlers.ts",
         "backend/reliability/domain/humanInteractionHandlers.ts",
         "backend/reliability/domain/types.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "demote-final-tool-result-links",
@@ -220,7 +234,8 @@
       "selector": {
         "path": "backend/reliability/domain/toolResultArtifacts.ts",
         "symbol": "demoteFinalToolResultLinks"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "runtime-orchestration-cohort",
@@ -240,7 +255,8 @@
         "backend/reliability/conversationWorldProjection.ts",
         "backend/reliability/backgroundProcessDeliveryDispatcher.ts",
         "backend/reliability/reliabilityInspector.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "full-context-projection-commit",
@@ -251,7 +267,8 @@
       "selector": {
         "path": "backend/modelContext/projectionRecords.ts",
         "symbol": "buildModelContextProjectionCommitData"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "auto-compression-planner",
@@ -262,7 +279,8 @@
       "selector": {
         "path": "backend/reliability/reliableAutoCompressionPlanner.ts",
         "symbol": "planReliableAutoCompressionProjection"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "legacy-runtime-delivery-states",
@@ -274,7 +292,8 @@
         "path": "shared/conversationReliability.ts",
         "symbol": "RuntimeDeliveryState",
         "member": "dead_letter"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "child-link-answer-bridge-backref",
@@ -286,7 +305,8 @@
         "path": "shared/conversationReliability.ts",
         "symbol": "ChildTurnLinkRecord",
         "member": "answerBridgeId"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "persisted-bridge-client-id",
@@ -298,7 +318,8 @@
         "path": "webview/src/transport/bridge.ts",
         "symbol": "Bridge",
         "member": "clientId"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "client-stream-snapshot-protocol",
@@ -310,7 +331,8 @@
         "path": "shared/protocol.ts",
         "symbol": "ClientSnapshotPayload",
         "member": "streamSeq"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "client-state-database-copy",
@@ -322,7 +344,8 @@
         "path": "webview/src/stores/clientStateDb.ts",
         "symbol": "ClientStateDb",
         "member": "applySnapshot"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "runtime-secret-history-option",
@@ -334,7 +357,8 @@
         "path": "shared/protocol.ts",
         "symbol": "LlmDryRunGetPayload",
         "member": "includeApiKey"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "run-graph-validation-cohort",
@@ -349,7 +373,8 @@
       "cohort": [
         "backend/reliability/runGraphClosureResolver.ts",
         "backend/reliability/runInvariantValidator.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "derived-projections-cohort",
@@ -364,7 +389,8 @@
       "cohort": [
         "backend/reliability/derived/runHistoryProjection.ts",
         "backend/reliability/derived/timelinePageProjection.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "shared-run-protocol-types",
@@ -378,7 +404,8 @@
       },
       "cohort": [
         "shared/protocol.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "shared-run-lifecycle",
@@ -389,7 +416,8 @@
       "selector": {
         "path": "shared/runLifecycle.ts",
         "symbol": "RunLifecycleStatus"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "shared-agent-run-activity",
@@ -400,7 +428,8 @@
       "selector": {
         "path": "shared/agentRunActivity.ts",
         "symbol": "agentRunActivityBlocker"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "webview-agent-run-panel",
@@ -411,7 +440,8 @@
       "selector": {
         "path": "webview/src/components/input/AgentRunPanel.vue",
         "symbol": "foregroundAnswerReceiptState"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "webview-run-history-store",
@@ -422,7 +452,8 @@
       "selector": {
         "path": "webview/src/stores/useRunHistoryStore.ts",
         "symbol": "useRunHistoryStore"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "webview-run-history-detail-panel",
@@ -433,7 +464,8 @@
       "selector": {
         "path": "webview/src/components/conversation/RunHistoryDetailPanel.vue",
         "symbol": "sensitiveHeader"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "webview-client-state-active-runs",
@@ -445,7 +477,8 @@
         "path": "webview/src/stores/useClientStateStore.ts",
         "symbol": "ClientStateStoreState",
         "member": "activeRuns"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "webview-message-router-run-history",
@@ -457,7 +490,8 @@
         "path": "backend/application/WebviewMessageRouter.ts",
         "symbol": "WebviewMessageRouter",
         "member": "postRunHistoryPage"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "agent-run-world-module",
@@ -483,7 +517,8 @@
         "backend/world/modules/agentRun/plugin.ts",
         "backend/world/modules/agentRun/queries.ts",
         "backend/world/modules/agentRun/termination.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "conversation-fork-link-cohort",
@@ -499,7 +534,8 @@
         "backend/world/modules/chat/components.ts",
         "backend/application/conversationFork.ts",
         "backend/capabilities/vscodeStorage/clientStateStore.ts"
-      ]
+      ],
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "mcp-direct-runtime-execution",
@@ -511,7 +547,8 @@
         "path": "backend/application/mcpRuntimeManager.ts",
         "symbol": "mcpToolDefinition",
         "member": "client.callTool"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "mutable-compression-update",
@@ -523,7 +560,8 @@
         "path": "shared/protocol.ts",
         "symbol": "CompressionUpdate",
         "member": "summaryContents"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     },
     {
       "key": "agent-system-scope-kind",
@@ -535,7 +573,8 @@
         "path": "shared/protocol.ts",
         "symbol": "ToolPolicyScopeKind",
         "member": "agentSystem"
-      }
+      },
+      "deletedAtCommit": "dcff190bf9fd86bb0e9b05ccbcd59d2a03f1f804"
     }
   ],
   "rule": "replacementStage 表示新能力完成阶段；A-F 旧源码可继续服务日常旧内核，但候选路由必须不可达。deleteStage 表示物理删除阶段，所有旧 Runtime 入口固定为 G；只有源码实际删除后才写 deletedAtCommit，条目永久保留。禁止旧格式导入、双写和兼容适配器。"

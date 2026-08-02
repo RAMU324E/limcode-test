@@ -1,11 +1,6 @@
-import type { CLIENT_STATE_TABLES } from './clientStateSchema';
-import type { RunExecutionPhase, RunLifecycleStatus } from './runLifecycle';
+import type { TurnExecutionPhase, TurnLifecycleStatus } from './turnLifecycle';
 import type {
   AuthoritySnapshotRecord,
-  CommandAck,
-  CommandServiceError,
-  CommandStatus,
-  CommandTransportReceipt,
   CommittedConversationHead,
   DurableInteractionRequestRecord,
   DurableInteractionDecision,
@@ -16,13 +11,10 @@ import type {
   MessageTurnLinkRecord,
   PendingTurnInputRecord,
   RuntimeDeliveryLinkRecord,
-  StatePatchBatch,
-  TransientStreamEpoch,
   TurnIntentRecord,
   TurnIntentRevisionRecord,
   TurnRecord
 } from './conversationReliability';
-import type { TimelineProjectionContextRecord } from './timelineProjection';
 
 export type MessageId = string;
 export type BridgeClientId = string;
@@ -44,54 +36,11 @@ export interface WebviewClientMeta {
   planProposalId?: string;
 }
 
-export const GLOBAL_CLIENT_STATE_STREAM_ID = 'global:state';
-export const GLOBAL_SETTINGS_STREAM_PREFIX = 'settings:global:';
 export const GLOBAL_SETTINGS_SECTIONS = ['common', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'mcpServers'] as const;
 export type GlobalSettingsSection = typeof GLOBAL_SETTINGS_SECTIONS[number];
 
-export function globalSettingsStreamId(section: GlobalSettingsSection): string {
-  return `${GLOBAL_SETTINGS_STREAM_PREFIX}${section}`;
-}
-
-export const CONVERSATION_SETTINGS_STREAM_PREFIX = 'settings:conversation:';
 export const CONVERSATION_SETTINGS_SECTIONS = ['common', 'llm'] as const;
 export type ConversationSettingsSection = typeof CONVERSATION_SETTINGS_SECTIONS[number];
-export const CONVERSATION_CLIENT_STATE_STREAM_PREFIX = 'conversation:';
-export const CONVERSATION_CLIENT_STATE_STREAM_SUFFIX = ':state';
-export const CONVERSATION_TIMELINE_STREAM_PREFIX = 'conversation:';
-export const CONVERSATION_TIMELINE_STREAM_SUFFIX = ':timeline';
-
-export function conversationSettingsStreamId(conversationId: string, section: ConversationSettingsSection = 'common'): string {
-  return `${CONVERSATION_SETTINGS_STREAM_PREFIX}${conversationId}:${section}`;
-}
-
-export function conversationIdFromSettingsStreamId(streamId: string): string | undefined {
-  if (!streamId.startsWith(CONVERSATION_SETTINGS_STREAM_PREFIX)) return undefined;
-  const rest = streamId.slice(CONVERSATION_SETTINGS_STREAM_PREFIX.length);
-  const separator = rest.lastIndexOf(':');
-  return separator >= 0 ? rest.slice(0, separator) : rest;
-}
-
-export function conversationClientStateStreamId(conversationId: string): string {
-  return `${CONVERSATION_CLIENT_STATE_STREAM_PREFIX}${conversationId}${CONVERSATION_CLIENT_STATE_STREAM_SUFFIX}`;
-}
-
-export function conversationTimelineStreamId(conversationId: string): string {
-  return `${CONVERSATION_TIMELINE_STREAM_PREFIX}${conversationId}${CONVERSATION_TIMELINE_STREAM_SUFFIX}`;
-}
-
-export function conversationIdFromClientStateStreamId(streamId: string): string | undefined {
-  return streamId.startsWith(CONVERSATION_CLIENT_STATE_STREAM_PREFIX) && streamId.endsWith(CONVERSATION_CLIENT_STATE_STREAM_SUFFIX)
-    ? streamId.slice(CONVERSATION_CLIENT_STATE_STREAM_PREFIX.length, -CONVERSATION_CLIENT_STATE_STREAM_SUFFIX.length)
-    : undefined;
-}
-
-export function conversationIdFromTimelineStreamId(streamId: string): string | undefined {
-  return streamId.startsWith(CONVERSATION_TIMELINE_STREAM_PREFIX) && streamId.endsWith(CONVERSATION_TIMELINE_STREAM_SUFFIX)
-    ? streamId.slice(CONVERSATION_TIMELINE_STREAM_PREFIX.length, -CONVERSATION_TIMELINE_STREAM_SUFFIX.length)
-    : undefined;
-}
-
 
 export enum BridgeMessageType {
   Hello = 'bridge.hello',
@@ -103,26 +52,10 @@ export enum BridgeMessageType {
   WorkspaceInfo = 'workspace.info',
   ShowInfo = 'vscode.showInfo',
   Error = 'bridge.error',
-  CommandReceipt = 'command.receipt',
-  CommandResult = 'command.result',
   InteractionResult = 'interaction.result',
-  CommandStatusGet = 'command.status.get',
-  CommandStatusResult = 'command.status.result',
-  ConversationHeadGet = 'command.head.get',
-  ConversationHeadSnapshot = 'command.head.snapshot',
-  ConversationCommittedPatch = 'command.state.patch',
-  CommandOutcomeResolve = 'command.outcome.resolve',
   TurnStart = 'turn.start',
   TurnEnqueue = 'turn.enqueue',
-  TurnSteer = 'turn.steer',
   TurnInterrupt = 'turn.interrupt',
-  TurnIntentUpdate = 'turnIntent.update',
-  TurnIntentCancel = 'turnIntent.cancel',
-  TurnIntentReorder = 'turnIntent.reorder',
-  TurnIntentPause = 'turnIntent.pause',
-  TurnIntentResume = 'turnIntent.resume',
-  TurnIntentResumeAll = 'turnIntent.resumeAll',
-  TurnIntentPromote = 'turnIntent.promote',
   InteractionResolve = 'interaction.resolve',
   ConversationOpen = 'conversation.open',
   ConversationCreate = 'conversation.create',
@@ -134,8 +67,6 @@ export enum BridgeMessageType {
   SystemPromptScopeClear = 'systemPrompt.scope.clear',
   RuntimeContextScopeSet = 'runtimeContext.scope.set',
   RuntimeContextScopeClear = 'runtimeContext.scope.clear',
-  RuntimeContextRefresh = 'runtimeContext.refresh',
-  RuntimeContextSnapshotClear = 'runtimeContext.snapshot.clear',
   ModelProfileScopeSet = 'modelProfile.scope.set',
   ModelProfileScopeClear = 'modelProfile.scope.clear',
   MessageEdit = 'message.edit',
@@ -150,8 +81,6 @@ export enum BridgeMessageType {
   RulesCatalogRefresh = 'rules.catalog.refresh',
   ToolExecutionCancel = 'tool.execution.cancel',
   ToolDiffOpen = 'tool.diff.open',
-  ToolResultArtifactGet = 'tool.resultArtifact.get',
-  ToolResultArtifactSnapshot = 'tool.resultArtifact.snapshot',
   PlanProposalOpen = 'planProposal.open',
   PlanProposalExport = 'planProposal.export',
   CheckpointDiffOpen = 'checkpoint.diff.open',
@@ -160,20 +89,7 @@ export enum BridgeMessageType {
   AttachmentReloadResult = 'attachment.reload.result',
   CheckpointDiffOpenResult = 'checkpoint.diff.open.result',
   ClientResync = 'client.resync',
-  ClientSnapshot = 'state.snapshot',
-  ClientPatch = 'state.patch',
-  ConversationTimelinePageGet = 'conversationTimeline.page.get',
-  ConversationTimelinePageSnapshot = 'conversationTimeline.page.snapshot',
-  ConversationTimelinePatch = 'conversationTimeline.patch',
-  ConversationTimelineMetaSnapshot = 'conversationTimeline.meta.snapshot',
-  RunHistoryPageGet = 'runHistory.page.get',
-  RunHistoryPageSnapshot = 'runHistory.page.snapshot',
-  RunHistoryDetailGet = 'runHistory.detail.get',
-  RunHistoryDetailSnapshot = 'runHistory.detail.snapshot',
-  LlmDryRunGet = 'llm.dryRun.get',
-  LlmDryRunSnapshot = 'llm.dryRun.snapshot',
-  LlmRetryCancel = 'llm.retry.cancel',
-  LlmTransientNotice = 'llm.transient.notice',
+  ConfigurationSnapshot = 'configuration.snapshot',
   LlmProviderModelsGet = 'llm.providerModels.get',
   LlmProviderModelsSnapshot = 'llm.providerModels.snapshot',
   GlobalSettingsGet = 'settings.global.get',
@@ -189,7 +105,6 @@ export enum BridgeMessageType {
   WorkflowDelete = 'workflow.delete',
   ConversationWorkflowSelect = 'conversation.workflow.select',
   ConversationAgentSelect = 'conversation.agent.select',
-  ConversationProjectSet = 'conversation.project.set',
   WorkEnvironmentSelect = 'workEnvironment.select',
   WorkEnvironmentUpsert = 'workEnvironment.upsert',
   WorkEnvironmentRemove = 'workEnvironment.remove',
@@ -208,16 +123,9 @@ export enum BridgeMessageType {
   CheckpointDismiss = 'checkpoint.dismiss',
   CheckpointRestore = 'checkpoint.restore',
   CheckpointRestoreResult = 'checkpoint.restore.result',
-  CompressionCreate = 'compression.create',
-  CompressionDelete = 'compression.delete',
-  CompressionUpdate = 'compression.update',
-  CompressionRegenerate = 'compression.regenerate',
-  CompressionDisable = 'compression.disable',
-  CompressionEnable = 'compression.enable',
   FsStatGet = 'fs.stat.get',
   FsStatResult = 'fs.stat.result',
-  BackgroundProcessOutputGet = 'backgroundProcess.output.get',
-  BackgroundProcessOutputResult = 'backgroundProcess.output.result'
+
 }
 
 export interface BridgeEnvelope<TType extends string = string, TPayload = unknown> {
@@ -293,7 +201,6 @@ export interface SidebarConversationHistoryEntry {
   updatedAt: number;
   agentName?: string;
   isRunning: boolean;
-  runStatus?: AgentRunStatus;
   runStatusLabel?: string;
   projectFolderUri?: string;
   projectName?: string;
@@ -822,6 +729,20 @@ export interface LlmInvocationSettingsSnapshotRecord {
   headers?: LlmProviderHeadersRecord;
 }
 
+export interface LlmRawErrorInfoRecord {
+  kind?: string;
+  status?: number;
+  headers?: Record<string, unknown>;
+  bodyText?: string;
+  rawBody?: unknown;
+  rawChunk?: unknown;
+  rawResponse?: unknown;
+  data?: unknown;
+  message?: string;
+  [key: string]: unknown;
+}
+
+
 export interface LlmInvocationRecord {
   id: string;
   requestId: string;
@@ -885,15 +806,15 @@ export interface AgentRecord {
   typeAgentId?: string;
 }
 
-export type AgentRunKind = 'chat' | 'tool_invoked' | 'delegated' | 'review' | 'notification' | 'scheduled';
-export type AgentRunStatus = 'queued' | 'preparing' | 'running' | 'waiting_tool' | 'waiting_child_run' | 'delivering' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'stale' | 'interrupted';
+export type TurnSummaryKind = 'chat' | 'tool_invoked' | 'delegated' | 'review' | 'notification' | 'scheduled';
+export type TurnSummaryStatus = 'queued' | 'preparing' | 'running' | 'waiting_tool' | 'waiting_child_run' | 'delivering' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'stale' | 'interrupted';
 
 export type AgentRunSourceKind = 'user' | 'toolCall' | 'agentRun' | 'schedule' | 'system';
 export type ConversationOriginKind = 'user' | 'agent' | 'system';
 export type AgentRunTargetRole = 'executor';
 export type ToolCallRunRole = 'produced_by';
 export type PolicyBindingRole = 'active';
-export type ToolPolicyScopeKind = 'global' | 'conversation' | 'agent' | 'agentSystem' | 'workflow' | 'run';
+export type ToolPolicyScopeKind = 'global' | 'conversation' | 'agent' | 'workflow' | 'run';
 export type ConfigScopeKind = 'global' | 'conversation' | 'agent' | 'workflow' | 'run';
 export type ConfigScopeBindingRole = 'active';
 
@@ -1010,7 +931,7 @@ export interface ToolPolicyRecord {
 export interface ToolPolicyScopeLinkRecord {
   id: string;
   scopeKind: ToolPolicyScopeKind;
-  /** global scope 无 scopeId；agentSystem 当前预留为普通 id；其余 scope 使用对应领域对象 id。 */
+  /** global scope 无 scopeId；其余 scope 使用对应领域对象 id。 */
   scopeId?: string;
   toolPolicyId: string;
   role: PolicyBindingRole;
@@ -1050,7 +971,7 @@ export interface SkillPolicyRecord {
 export interface SkillPolicyScopeLinkRecord {
   id: string;
   scopeKind: SkillPolicyScopeKind;
-  /** global scope 无 scopeId；agentSystem 当前预留为普通 id；其余 scope 使用对应领域对象 id。 */
+  /** global scope 无 scopeId；其余 scope 使用对应领域对象 id。 */
   scopeId?: string;
   skillPolicyId: string;
   role: PolicyBindingRole;
@@ -1235,7 +1156,7 @@ export type WorkEnvironmentKind = BuiltinWorkEnvironmentKind | (string & {});
 export type WorkEnvironmentSource = 'workspaceFolder' | 'vscodeSshConfig' | 'manual' | (string & {});
 export type WorkEnvironmentOs = 'linux' | 'windows' | 'macos' | 'unknown' | string;
 export type WorkEnvironmentCapabilityKind = 'localFileRead' | 'localCommand' | 'remoteFileRead' | 'remoteCommand' | 'containerFileRead' | 'containerCommand' | 'fileTransferRead' | 'fileTransferWrite' | (string & {});
-export type WorkEnvironmentPolicyScopeKind = 'global' | 'conversation' | 'agent' | 'agentSystem' | 'workflow' | 'run';
+export type WorkEnvironmentPolicyScopeKind = 'global' | 'conversation' | 'agent' | 'workflow' | 'run';
 
 export interface ProjectContextRecord {
   id: string;
@@ -1857,7 +1778,7 @@ export interface RunTerminationRecord {
   kind: RunTerminationKind;
   actor: RunTerminationActor;
   /** Run.phase immediately before the terminal transition. */
-  interruptedPhase: Exclude<RunExecutionPhase, 'terminal'>;
+  interruptedPhase: Exclude<TurnExecutionPhase, 'terminal'>;
   reasonCode: RunTerminationReasonCode;
   /** Present when another Run caused this Run to terminate. */
   triggerRunId?: string;
@@ -1876,13 +1797,12 @@ export function isRunTerminationReasonCode(value: unknown): value is RunTerminat
   return typeof value === 'string' && (RUN_TERMINATION_REASON_CODES as readonly string[]).includes(value);
 }
 
-export interface AgentRunRecord {
+export interface TurnSummaryRecord {
   id: string;
-  kind: AgentRunKind;
-  status: AgentRunStatus;
-  /** Durable lifecycle/phase; status remains a compact UI projection during the ECS cutover. */
-  lifecycle?: RunLifecycleStatus;
-  phase?: RunExecutionPhase;
+  kind: TurnSummaryKind;
+  status: TurnSummaryStatus;
+  lifecycle?: TurnLifecycleStatus;
+  phase?: TurnExecutionPhase;
   rowVersion?: number;
   createdAt: number;
   updatedAt: number;
@@ -1890,7 +1810,6 @@ export interface AgentRunRecord {
   usageMetadata?: LlmUsageMetadataRecord;
   retryOfRunId?: string;
   attempt?: number;
-  /** Explicit durable pauses that require a user resolution before the Run may advance. */
   outcomeUnknownOperations?: OutcomeUnknownOperationRecord[];
 }
 
@@ -2150,20 +2069,6 @@ export interface RunCompressionBlockLinkRecord {
   updatedAt: number;
 }
 
-export interface CompressionCreatePayload {
-  conversationId: string;
-  startMessageId?: string;
-  endMessageId?: string;
-  methodConfigId?: string;
-  methodKind?: LlmCompressionMethodKind;
-  trigger?: 'manual' | 'auto';
-}
-
-export interface CompressionDeletePayload { conversationId: string; blockId: string }
-export interface CompressionUpdatePayload { conversationId: string; blockId: string; title?: string; summaryPreview?: string; summaryContents?: MessageContent[] }
-export interface CompressionRegeneratePayload { conversationId: string; blockId: string; methodConfigId?: string }
-export interface CompressionTogglePayload { conversationId: string; blockId: string }
-
 /**
  * 独立后台进程的公开投影。Process 的生命周期可以长于启动它的 Tool Attempt；
  * stdout/stderr 正文由后台进程存储持有，不进入 ClientState。
@@ -2276,7 +2181,7 @@ export interface ClientStateRecordByTable {
   interactionRequests: DurableInteractionRequestRecord;
   backgroundProcesses: BackgroundProcessRecord;
   backgroundProcessOriginLinks: BackgroundProcessOriginLinkRecord;
-  agentRuns: AgentRunRecord;
+  agentRuns: TurnSummaryRecord;
   turns: TurnRecord;
   turnIntents: TurnIntentRecord;
   turnIntentRevisions: TurnIntentRevisionRecord;
@@ -2315,36 +2220,6 @@ export type ClientState = {
   [TKey in ClientStateTableKey]: ClientStateTableRecord<TKey>[];
 };
 
-type ClientStateTableRegistrySpec = typeof CLIENT_STATE_TABLES;
-type StringLiteral<T> = T extends string ? T : never;
-
-type UpsertPatchForTable<TKey extends ClientStateTableKey> = ClientStateTableRegistrySpec[TKey] extends {
-  readonly patch: { readonly upsert: { readonly kind: infer TKind; readonly payloadField: infer TField } };
-} ? { kind: StringLiteral<TKind> } & { [TFieldKey in StringLiteral<TField>]: ClientStateTableRecord<TKey> } : never;
-
-type AppendPatchForTable<TKey extends ClientStateTableKey> = ClientStateTableRegistrySpec[TKey] extends {
-  readonly patch: { readonly append: { readonly kind: infer TKind; readonly payloadField: infer TField } };
-} ? { kind: StringLiteral<TKind> } & { [TFieldKey in StringLiteral<TField>]: ClientStateTableRecord<TKey> } : never;
-
-type RemovePatchForTable<TKey extends ClientStateTableKey> = ClientStateTableRegistrySpec[TKey] extends {
-  readonly patch: { readonly remove: { readonly kind: infer TKind } };
-} ? { kind: StringLiteral<TKind>; id: string } : never;
-
-export type ClientStateTablePatchOp = {
-  [TKey in ClientStateTableKey]: UpsertPatchForTable<TKey> | AppendPatchForTable<TKey> | RemovePatchForTable<TKey> | MutationPatchForTable<TKey>;
-}[ClientStateTableKey];
-
-type MutationPatchForSpec<TSpec> = TSpec extends {
-  readonly kind: infer TKind;
-  readonly __payload?: infer TPayload;
-} ? { kind: StringLiteral<TKind> } & (TPayload extends object ? TPayload : never) : never;
-
-type MutationPatchForTable<TKey extends ClientStateTableKey> = ClientStateTableRegistrySpec[TKey] extends {
-  readonly clientSync: { readonly mutations: readonly (infer TMutationSpec)[] };
-} ? MutationPatchForSpec<TMutationSpec> : never;
-
-export type ClientPatchOp = ClientStateTablePatchOp;
-
 export interface ChatModelOverrideRecord {
   providerConfigId?: string;
   provider?: LlmProviderKind;
@@ -2375,16 +2250,6 @@ export interface TurnEnqueuePayload {
   model?: ChatModelOverrideRecord;
 }
 
-export interface TurnSteerPayload {
-  conversationId: string;
-  command: ConversationCommandMetadata;
-  targetTurnId: string;
-  targetLeaseEpoch: number;
-  fallback: 'queue_next' | 'return_to_draft' | 'reject';
-  text?: string;
-  content?: MessageContent;
-}
-
 export interface TurnInterruptPayload {
   conversationId: string;
   command: ConversationCommandMetadata;
@@ -2393,42 +2258,6 @@ export interface TurnInterruptPayload {
   cascadeChildAgents?: boolean;
 }
 
-export interface TurnIntentControlPayload {
-  conversationId: string;
-  command: ConversationCommandMetadata;
-  intentId: string;
-  rowVersion: number;
-}
-
-export interface TurnIntentUpdatePayload extends TurnIntentControlPayload {
-  text?: string;
-  content?: MessageContent;
-}
-
-export interface TurnIntentReorderPayload {
-  conversationId: string;
-  command: ConversationCommandMetadata;
-  intents: Array<{ intentId: string; rowVersion: number }>;
-}
-
-export interface TurnIntentResumeAllPayload {
-  conversationId: string;
-  command: ConversationCommandMetadata;
-}
-
-export interface TurnIntentPromotePayload extends TurnIntentControlPayload {
-  replaceActive: boolean;
-  expectedActiveTurnId?: string;
-  expectedLeaseEpoch?: number;
-}
-
-export interface LlmRetryCancelPayload {
-  requestId: string;
-  conversationId?: string;
-  messageId?: string;
-  runId?: string;
-  reason?: string;
-}
 export interface MessageEditPayload {
   conversationId: string;
   command: ConversationCommandMetadata;
@@ -2513,17 +2342,6 @@ export interface ToolDiffOpenPayload {
   conversationId?: string;
 }
 
-export interface ToolResultArtifactGetPayload {
-  conversationId: string;
-  artifactId: string;
-}
-
-export interface ToolResultArtifactSnapshotPayload {
-  conversationId: string;
-  artifactId: string;
-  contentHash: string;
-  content: JsonValue;
-}
 export interface ToolPolicyScopeSetPayload {
   scopeKind: ToolPolicyScopeKind;
   scopeId?: string;
@@ -2590,16 +2408,6 @@ export interface RuntimeContextScopeSetPayload {
   order?: number;
 }
 export interface RuntimeContextScopeClearPayload { scopeKind: ConfigScopeKind; scopeId?: string }
-export interface RuntimeContextRefreshPayload {
-  conversationId?: string;
-  runId?: string;
-  scopeKind?: ConfigScopeKind;
-  scopeId?: string;
-}
-export interface RuntimeContextSnapshotClearPayload {
-  conversationId?: string;
-  runId?: string;
-}
 export interface ModelProfileScopeSetPayload {
   scopeKind: ConfigScopeKind;
   scopeId?: string;
@@ -2614,34 +2422,6 @@ export interface ClientResyncPayload {
   conversationId?: string;
 }
 
-export interface CommandStatusGetPayload { commandId: string }
-export interface ConversationHeadGetPayload { conversationId: string }
-export interface ConversationHeadSnapshotPayload {
-  conversationId: string;
-  version: number;
-  streamId: string;
-  patchNextSeq: number;
-}
-export interface CommandReceiptPayload extends CommandTransportReceipt {}
-export interface CommandResultPayload {
-  ack?: CommandAck;
-  error?: CommandServiceError;
-}
-export interface CommandStatusResultPayload {
-  commandId: string;
-  result: CommandStatus;
-}
-export interface ConversationCommittedPatchPayload extends StatePatchBatch {
-  conversationId: string;
-}
-export interface CommandOutcomeResolvePayload {
-  conversationId: string;
-  command: ConversationCommandMetadata;
-  operationId: string;
-  resolution: 'restart_proved_not_executed' | 'submit_verified_result' | 'abandon';
-  evidenceRef?: string;
-  verifiedResult?: unknown;
-}
 export interface WorkflowCreatePayload {
   name: string;
   description?: string;
@@ -2662,223 +2442,9 @@ export interface ConversationAgentSelectPayload {
   conversationId: string; agentId: string;
 }
 
-export type ConversationTimelinePageDirection = 'initial' | 'older' | 'newer' | 'around';
-export type ConversationTimelinePageApplyMode = 'replace' | 'prepend' | 'append' | 'merge';
-
-export interface ConversationTimelinePageRequest {
-  conversationId: string;
-  direction?: ConversationTimelinePageDirection;
-  cursor?: string;
-  anchorMessageId?: string;
-  chunkCount?: number;
-  includeProjections?: string[];
-}
-
-export interface ConversationTimelineChunkSummaryRecord {
-  id: string;
-  index: number;
-  startSeq: number;
-  endSeq: number;
-  messageCount: number;
-  messageOffsetStart: number;
-  messageOffsetEnd: number;
-  toolCallCount: number;
-  toolCallEventCount: number;
-}
-
-export interface ConversationTimelinePageInfo {
-  conversationId: string;
-  chunkIds: string[];
-  totalChunks: number;
-  totalMessages: number;
-  startSeq?: number;
-  endSeq?: number;
-  oldestChunkId?: string;
-  newestChunkId?: string;
-  previousCursor?: string;
-  nextCursor?: string;
-  hasOlder: boolean;
-  hasNewer: boolean;
+export interface ConfigurationSnapshotPayload {
+  state: ClientState;
   loadedAt: number;
-}
-
-export interface ConversationTimelinePageRecord {
-  conversationId: string;
-  applyMode: ConversationTimelinePageApplyMode;
-  chunks: ConversationTimelineChunkSummaryRecord[];
-  pageInfo: ConversationTimelinePageInfo;
-  state: ClientState;
-  projections?: Record<string, TimelineProjectionContextRecord>;
-}
-
-export interface ConversationTimelinePatchPayload {
-  conversationId: string;
-  streamSeq: number;
-  patches: ClientPatchOp[];
-  pageInfo?: Partial<ConversationTimelinePageInfo>;
-}
-
-export interface ClientSnapshotPayload {
-  streamId: string;
-  streamSeq: number;
-  state: ClientState;
-  /**
-   * Conversation streams bind the projected state to the exact durable conversation HEAD.
-   * This removes the snapshot-then-HEAD-query race when settling reliable command overlays.
-   */
-  conversationHead?: ConversationHeadSnapshotPayload;
-}
-export interface ClientPatchPayload {
-  streamId: string;
-  streamSeq: number;
-  patches: ClientPatchOp[];
-  /** Present only for non-authoritative LLM stream fast patches. */
-  transientStreamEpoch?: TransientStreamEpoch;
-}
-
-export interface LlmRawErrorInfoRecord {
-  kind?: string;
-  status?: number;
-  headers?: Record<string, unknown>;
-  bodyText?: string;
-  rawBody?: unknown;
-  rawChunk?: unknown;
-  rawResponse?: unknown;
-  data?: unknown;
-  message?: string;
-  [key: string]: unknown;
-}
-
-export type LlmTransientNoticeKind =
-  | 'retryScheduled'
-  | 'retryStarted'
-  | 'retryCancelled'
-  | 'retryRecovered'
-  | 'error';
-
-export interface LlmTransientNoticePayload {
-  id: string;
-  kind: LlmTransientNoticeKind;
-  conversationId: string;
-  messageId: string;
-  requestId: string;
-  transientStreamEpoch?: TransientStreamEpoch;
-  runId?: string;
-  invocationId?: string;
-  message: string;
-  rawError?: LlmRawErrorInfoRecord;
-  retryAttempt?: number;
-  retryMaxAttempts?: number;
-  retryDelayMs?: number;
-  createdAt: number;
-}
-
-export interface ConversationRunHistoryPageRequest {
-  conversationId: string;
-  cursor?: string;
-  limit?: number;
-}
-
-export interface ConversationRunSummaryRecord {
-  id: string;
-  conversationId: string;
-  kind: AgentRunKind;
-  status: AgentRunStatus;
-  createdAt: number;
-  updatedAt: number;
-  completedAt?: number;
-  retryOfRunId?: string;
-  attempt?: number;
-  sourceKind?: AgentRunSourceKind;
-  sourceMessageId?: string;
-  sourceToolCallId?: string;
-  sourceRunId?: string;
-  targetAgentId?: string;
-  targetConversationId?: string;
-  inputMessageCount: number;
-  outputMessageCount: number;
-  inputMessageIds?: string[];
-  outputMessageIds?: string[];
-  toolCallIds?: string[];
-  toolCallCount: number;
-  inputPreview?: string;
-  outputPreview?: string;
-}
-
-export interface ConversationRunHistoryPageInfo {
-  cursor?: string;
-  nextCursor?: string;
-  previousCursor?: string;
-  pageIndex: number;
-  pageSize: number;
-  total: number;
-  hasNext: boolean;
-  hasPrevious: boolean;
-}
-
-export interface ConversationRunHistoryPageRecord {
-  conversationId: string;
-  runs: ConversationRunSummaryRecord[];
-  pageInfo: ConversationRunHistoryPageInfo;
-}
-
-export interface ConversationRunDetailRequest {
-  conversationId: string;
-  runId?: string;
-  messageId?: string;
-}
-
-export interface ConversationRunDetailRecord {
-  conversationId: string;
-  runId: string;
-  summary?: ConversationRunSummaryRecord;
-  state: ClientState;
-}
-
-export interface LlmDryRunGetPayload {
-  conversationId: string;
-  runId?: string;
-  messageId?: string;
-  invocationId?: string;
-  compressionBlockId?: string;
-  /** true 时 curl 中显示 API Key；默认 false，避免泄漏密钥。 */
-  includeApiKey?: boolean;
-}
-
-export interface LlmDryRunHttpCallRecord {
-  id: string;
-  label: string;
-  ordinal: number;
-  provider?: LlmProviderKind;
-  model?: string;
-  providerName?: string;
-  url: string;
-  method: 'POST';
-  stream: boolean;
-  headers: Record<string, string>;
-  body: unknown;
-  bodyText: string;
-  curl: string;
-  /** 始终隐藏敏感 header 的 curl，用于前端本地显示/隐藏切换，避免重复 dry-run。 */
-  maskedCurl: string;
-  inputFormat?: string;
-  outputFormat?: string;
-  generatedAt: number;
-  maskedSecrets: boolean;
-  /** 当前是否能从配置中取到真实 API Key；false 时 dry-run 使用占位 key 生成请求结构。 */
-  apiKeyAvailable?: boolean;
-}
-
-export interface LlmDryRunSnapshotPayload {
-  conversationId: string;
-  runId?: string;
-  compressionBlockId?: string;
-  invocationId?: string;
-  settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
-  executionKind: 'single_request' | 'multiple_requests' | 'no_provider_call';
-  calls: LlmDryRunHttpCallRecord[];
-  note?: string;
-  generatedAt: number;
 }
 
 export interface LlmProviderModelsGetPayload {
@@ -2996,12 +2562,6 @@ export interface ProjectFoldersSnapshotPayload {
   folders: ProjectFolderCandidateRecord[];
 }
 
-export interface ConversationProjectSetPayload {
-  conversationId: string;
-  folderUri: string;
-  name?: string;
-}
-
 export interface WorkEnvironmentSelectPayload {
   conversationId: string;
   workEnvironmentId: string;
@@ -3063,46 +2623,16 @@ export interface AttachmentReloadResultPayload {
   error?: string;
 }
 
-export interface BackgroundProcessOutputGetPayload {
-  processId: string;
-  consume?: boolean;
-}
-
-export interface BackgroundProcessOutputResultPayload {
-  processId: string;
-  command: string;
-  exitCode: number;
-  killed: boolean;
-  stdout: string;
-  stderr: string;
-  status?: 'completed' | 'running' | 'exited' | 'killed' | 'not_found';
-  running?: boolean;
-  droppedChars?: number;
-  consumed?: boolean;
-}
-
 export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.Ready, undefined>
   | BridgeEnvelope<BridgeMessageType.Ack, BridgeAckPayload>
   | BridgeEnvelope<BridgeMessageType.Ping, { text: string; sentAt: number }>
   | BridgeEnvelope<BridgeMessageType.GetWorkspaceInfo, undefined>
   | BridgeEnvelope<BridgeMessageType.ShowInfo, { message: string }>
-  | BridgeEnvelope<BridgeMessageType.CommandStatusGet, CommandStatusGetPayload>
-  | BridgeEnvelope<BridgeMessageType.ConversationHeadGet, ConversationHeadGetPayload>
-  | BridgeEnvelope<BridgeMessageType.CommandOutcomeResolve, CommandOutcomeResolvePayload>
   | BridgeEnvelope<BridgeMessageType.TurnStart, TurnStartPayload>
   | BridgeEnvelope<BridgeMessageType.TurnEnqueue, TurnEnqueuePayload>
-  | BridgeEnvelope<BridgeMessageType.TurnSteer, TurnSteerPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterrupt, TurnInterruptPayload>
-  | BridgeEnvelope<BridgeMessageType.TurnIntentUpdate, TurnIntentUpdatePayload>
-  | BridgeEnvelope<BridgeMessageType.TurnIntentCancel, TurnIntentControlPayload>
-  | BridgeEnvelope<BridgeMessageType.TurnIntentReorder, TurnIntentReorderPayload>
-  | BridgeEnvelope<BridgeMessageType.TurnIntentPause, TurnIntentControlPayload>
-  | BridgeEnvelope<BridgeMessageType.TurnIntentResume, TurnIntentControlPayload>
-  | BridgeEnvelope<BridgeMessageType.TurnIntentResumeAll, TurnIntentResumeAllPayload>
-  | BridgeEnvelope<BridgeMessageType.TurnIntentPromote, TurnIntentPromotePayload>
   | BridgeEnvelope<BridgeMessageType.InteractionResolve, InteractionResolvePayload>
-  | BridgeEnvelope<BridgeMessageType.LlmRetryCancel, LlmRetryCancelPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationOpen, ConversationOpenPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationCreate, ConversationCreatePayload>
   | BridgeEnvelope<BridgeMessageType.ConversationFork, ConversationForkPayload>
@@ -3114,8 +2644,6 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.SystemPromptScopeClear, SystemPromptScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.RuntimeContextScopeSet, RuntimeContextScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.RuntimeContextScopeClear, RuntimeContextScopeClearPayload>
-  | BridgeEnvelope<BridgeMessageType.RuntimeContextRefresh, RuntimeContextRefreshPayload>
-  | BridgeEnvelope<BridgeMessageType.RuntimeContextSnapshotClear, RuntimeContextSnapshotClearPayload>
   | BridgeEnvelope<BridgeMessageType.ModelProfileScopeSet, ModelProfileScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.ModelProfileScopeClear, ModelProfileScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.MessageEdit, MessageEditPayload>
@@ -3134,29 +2662,18 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.CheckpointPolicyScopeClear, CheckpointPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.ToolExecutionCancel, ToolDecisionPayload>
   | BridgeEnvelope<BridgeMessageType.ToolDiffOpen, ToolDiffOpenPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolResultArtifactGet, ToolResultArtifactGetPayload>
   | BridgeEnvelope<BridgeMessageType.PlanProposalOpen, PlanProposalOpenPayload>
   | BridgeEnvelope<BridgeMessageType.PlanProposalExport, PlanProposalExportPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpen, CheckpointDiffOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentOpen, AttachmentOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReload, AttachmentReloadPayload>
   | BridgeEnvelope<BridgeMessageType.ClientResync, ClientResyncPayload>
-  | BridgeEnvelope<BridgeMessageType.ConversationTimelinePageGet, ConversationTimelinePageRequest>
-  | BridgeEnvelope<BridgeMessageType.RunHistoryPageGet, ConversationRunHistoryPageRequest>
-  | BridgeEnvelope<BridgeMessageType.RunHistoryDetailGet, ConversationRunDetailRequest>
-  | BridgeEnvelope<BridgeMessageType.LlmDryRunGet, LlmDryRunGetPayload>
   | BridgeEnvelope<BridgeMessageType.LlmProviderModelsGet, LlmProviderModelsGetPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointGitStatusGet, undefined>
   | BridgeEnvelope<BridgeMessageType.CheckpointShadowStatsGet, undefined>
   | BridgeEnvelope<BridgeMessageType.CheckpointShadowDelete, CheckpointShadowDeletePayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDismiss, CheckpointDismissPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointRestore, CheckpointRestorePayload>
-  | BridgeEnvelope<BridgeMessageType.CompressionCreate, CompressionCreatePayload>
-  | BridgeEnvelope<BridgeMessageType.CompressionDelete, CompressionDeletePayload>
-  | BridgeEnvelope<BridgeMessageType.CompressionUpdate, CompressionUpdatePayload>
-  | BridgeEnvelope<BridgeMessageType.CompressionRegenerate, CompressionRegeneratePayload>
-  | BridgeEnvelope<BridgeMessageType.CompressionDisable, CompressionTogglePayload>
-  | BridgeEnvelope<BridgeMessageType.CompressionEnable, CompressionTogglePayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsGet, GlobalSettingsGetPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsUpdate, GlobalSettingsUpdatePayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsGet, ConversationSettingsGetPayload>
@@ -3166,48 +2683,31 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.WorkflowUpdate, WorkflowUpdatePayload>
   | BridgeEnvelope<BridgeMessageType.WorkflowDelete, WorkflowDeletePayload>
   | BridgeEnvelope<BridgeMessageType.ConversationWorkflowSelect, ConversationWorkflowSelectPayload>
-  | BridgeEnvelope<BridgeMessageType.ConversationProjectSet, ConversationProjectSetPayload>
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentSelect, WorkEnvironmentSelectPayload>
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentUpsert, WorkEnvironmentUpsertPayload>
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentRemove, WorkEnvironmentRemovePayload>
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentImportFromVscode, WorkEnvironmentImportFromVscodePayload>
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentPolicyScopeSet, WorkEnvironmentPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.WorkEnvironmentPolicyScopeClear, WorkEnvironmentPolicyScopeClearPayload>
-  | BridgeEnvelope<BridgeMessageType.FsStatGet, FsStatGetPayload>
-  | BridgeEnvelope<BridgeMessageType.BackgroundProcessOutputGet, BackgroundProcessOutputGetPayload>;
+  | BridgeEnvelope<BridgeMessageType.FsStatGet, FsStatGetPayload>;
 
 export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>
   | BridgeEnvelope<BridgeMessageType.Pong, { text: string; receivedAt: number }>
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
   | BridgeEnvelope<BridgeMessageType.Error, { requestType?: string; message: string }>
-  | BridgeEnvelope<BridgeMessageType.CommandReceipt, CommandReceiptPayload>
-  | BridgeEnvelope<BridgeMessageType.CommandResult, CommandResultPayload>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
-  | BridgeEnvelope<BridgeMessageType.CommandStatusResult, CommandStatusResultPayload>
-  | BridgeEnvelope<BridgeMessageType.ConversationHeadSnapshot, ConversationHeadSnapshotPayload>
-  | BridgeEnvelope<BridgeMessageType.ConversationCommittedPatch, ConversationCommittedPatchPayload>
-  | BridgeEnvelope<BridgeMessageType.ClientSnapshot, ClientSnapshotPayload>
-  | BridgeEnvelope<BridgeMessageType.ClientPatch, ClientPatchPayload>
-  | BridgeEnvelope<BridgeMessageType.ConversationTimelinePageSnapshot, ConversationTimelinePageRecord>
-  | BridgeEnvelope<BridgeMessageType.ConversationTimelinePatch, ConversationTimelinePatchPayload>
-  | BridgeEnvelope<BridgeMessageType.ConversationTimelineMetaSnapshot, ConversationTimelinePageRecord>
-  | BridgeEnvelope<BridgeMessageType.RunHistoryPageSnapshot, ConversationRunHistoryPageRecord>
-  | BridgeEnvelope<BridgeMessageType.RunHistoryDetailSnapshot, ConversationRunDetailRecord>
-  | BridgeEnvelope<BridgeMessageType.LlmDryRunSnapshot, LlmDryRunSnapshotPayload>
-  | BridgeEnvelope<BridgeMessageType.LlmTransientNotice, LlmTransientNoticePayload>
+  | BridgeEnvelope<BridgeMessageType.ConfigurationSnapshot, ConfigurationSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.LlmProviderModelsSnapshot, LlmProviderModelsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointGitStatusSnapshot, CheckpointGitStatusSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointShadowStatsSnapshot, CheckpointShadowStatsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointRestoreResult, CheckpointRestoreResultPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpenResult, CheckpointDiffOpenResultPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReloadResult, AttachmentReloadResultPayload>
-  | BridgeEnvelope<BridgeMessageType.ToolResultArtifactSnapshot, ToolResultArtifactSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsSnapshot, GlobalSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsSnapshot, ConversationSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ProjectFoldersSnapshot, ProjectFoldersSnapshotPayload>
-  | BridgeEnvelope<BridgeMessageType.FsStatResult, FsStatResultPayload>
-  | BridgeEnvelope<BridgeMessageType.BackgroundProcessOutputResult, BackgroundProcessOutputResultPayload>;
+  | BridgeEnvelope<BridgeMessageType.FsStatResult, FsStatResultPayload>;
 
 export function createMessageId(): MessageId {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;

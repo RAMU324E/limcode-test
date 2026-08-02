@@ -127,8 +127,8 @@ function createIndexSql(schema: RuntimeDomainSchema, authorityIndex: string, ord
 }
 
 function validateDomainManifest(): void {
-  if (RUNTIME_DOMAIN_SCHEMAS.length !== 69) {
-    throw new Error(`Runtime domain schema exact set must contain 69 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
+  if (RUNTIME_DOMAIN_SCHEMAS.length !== 72) {
+    throw new Error(`Runtime domain schema exact set must contain 72 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
   }
   for (const field of ['key', 'table', 'repository', 'codec'] as const) {
     const values = RUNTIME_DOMAIN_SCHEMAS.map((entry) => entry[field]);

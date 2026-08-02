@@ -15,7 +15,7 @@
 - 通过 `getPaths()` + RootAuthority 建立 immutable `RootBinding { paths, dataSetId, rootInstanceId, rootGeneration, pointerRevision, runtimeKernelEpoch }`；
 - 每个 request/transaction 开始时重验 binding generation；root switch 只通过 restart/reopen；
 - 创建单个 `limcode.sqlite`；
-- 按 authority.json 的 69 个 Runtime domain exact set 建独立 table、Repository、Codec、mutation/client mapping 与 delete/reset policy；
+- 按 authority.json 的 72 个 Runtime domain exact set 建独立 table、Repository、Codec、mutation/client mapping 与 delete/reset policy；
 - 首发不创建 ChildTurnLink、ProviderContinuation、ClientChangeLog、AskUser、TaskList 或 MCP 专表；
 - 创建 CAS 与 ContentObject metadata；先 publish CAS，再 commit SQLite reference；
 - 建立 commitSeq source 与 transaction result changes 接口，为 snapshot/feed barrier 提供原子水位；
@@ -52,7 +52,7 @@ B 只实现 candidate root 与 RootBinding foundation，不执行真实 producti
 
 - SQLite 可独立 create/commit/rollback/reopen；
 - foreign keys、partial UNIQUE 与 indexes 真实生效；
-- 69 个 target domain exact set 与 schema manifest 一致；
+- 72 个 target domain exact set 与 schema manifest 一致；
 - CAS committed reference 永不指向缺失对象；
 - RootBinding stale generation fail closed；
 - empty root 无 legacy migration 可创建 current epoch；

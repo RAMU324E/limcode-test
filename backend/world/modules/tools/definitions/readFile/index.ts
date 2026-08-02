@@ -1,6 +1,6 @@
 import { READ_TOOL_NAME, type InlineDataPart } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
-import { staticToolScheduling } from '../../scheduling';
+import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, allowOutsideProjectPathsFromConfig, filePathPolicyDescription } from '../filePathPolicy';
 

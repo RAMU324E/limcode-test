@@ -11,7 +11,13 @@ import {
 import { displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { EXTENSION_AGENT_NAME, EXTENSION_BRAND, MAIN_PANEL_VIEW_TYPE, WEBVIEW_DEV_PORT } from '../../shared/extensionIdentity';
 import { getWebviewHtml } from '../webview/getWebviewHtml';
-import type { BackendApplication } from '../../backend/application/BackendApplication';
+import {
+  RELIABLE_KERNEL_ACK_MESSAGE,
+  RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
+  RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
+} from '../../shared/reliableKernelClientFeed';
+import type { ApplicationFacade } from '../ApplicationFacade';
 
 export interface MainPanelOptions {
   conversationId?: string;
@@ -36,7 +42,7 @@ export class MainPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly extensionUri: vscode.Uri;
-  private readonly backendApp: BackendApplication;
+  private readonly backendApp: ApplicationFacade;
   private readonly panelId: string;
   private readonly clientId: BridgeClientId;
   private readonly kind: MainPanelKind;
@@ -45,11 +51,12 @@ export class MainPanel {
   private readonly planProposalId?: string;
   private readonly disposables: vscode.Disposable[] = [];
 
-  public static registerSerializer(context: vscode.ExtensionContext, backendApp: BackendApplication): void {
+  public static registerSerializer(context: vscode.ExtensionContext, backendApp: ApplicationFacade): void {
     context.subscriptions.push(
       vscode.window.registerWebviewPanelSerializer(MainPanel.viewType, {
         async deserializeWebviewPanel(webviewPanel, state) {
-          const options = optionsFromSerializedState(state, webviewPanel.title);
+          const serialized = optionsFromSerializedState(state, webviewPanel.title);
+          const options = await resolveRestoredPanelOptions(backendApp, serialized);
           MainPanel.revive(webviewPanel, context.extensionUri, backendApp, options);
         }
       })
@@ -58,7 +65,7 @@ export class MainPanel {
 
   public static createOrShow(
     extensionUri: vscode.Uri,
-    backendApp: BackendApplication,
+    backendApp: ApplicationFacade,
     options: MainPanelOptions = {}
   ): void {
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
@@ -86,7 +93,7 @@ export class MainPanel {
   private static revive(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
-    backendApp: BackendApplication,
+    backendApp: ApplicationFacade,
     options: MainPanelOptions = {}
   ): void {
     const instance = new MainPanel(panel, extensionUri, backendApp, options);
@@ -106,7 +113,7 @@ export class MainPanel {
   private constructor(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
-    backendApp: BackendApplication,
+    backendApp: ApplicationFacade,
     options: MainPanelOptions
   ) {
     this.panel = panel;
@@ -134,7 +141,15 @@ export class MainPanel {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.onDidChangeViewState(() => MainPanel.notifyConversationPanelStateChanged(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
-      (message: WebviewToExtensionMessage) => {
+      (raw: unknown) => {
+        if (isReliableKernelControlMessage(raw)) {
+          const handled = this.backendApp.handleReliableKernelControl?.(this.clientId, raw);
+          if (handled instanceof Promise) {
+            void handled.catch((error) => console.warn('[LimCode] Reliable client feed control failed.', error));
+          }
+          return;
+        }
+        const message = raw as WebviewToExtensionMessage;
         if (message.type === BridgeMessageType.ConversationOpen && message.payload?.conversationId) {
           MainPanel.createOrShow(this.extensionUri, this.backendApp, {
             conversationId: message.payload.conversationId,
@@ -282,7 +297,7 @@ function panelKind(options: MainPanelOptions): MainPanelKind {
   return options.kind === 'globalSettings' ? 'globalSettings' : 'chat';
 }
 
-function panelTitle(options: MainPanelOptions, backendApp: BackendApplication): string {
+function panelTitle(options: MainPanelOptions, backendApp: ApplicationFacade): string {
   if (options.kind === 'globalSettings') return `${EXTENSION_BRAND} 设置`;
   if (options.kind === 'workflowSettings') return `${EXTENSION_BRAND} 工作流编辑`;
   if (options.kind === 'agentSettings') return `${EXTENSION_AGENT_NAME} 设置`;
@@ -292,6 +307,30 @@ function panelTitle(options: MainPanelOptions, backendApp: BackendApplication): 
     ? displayConversationTitle({ id: options.conversationId, title: options.title })
     : backendApp.getConversationDisplayTitle(options.conversationId);
   return panelTabTitle(title);
+}
+
+function isReliableKernelControlMessage(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const type = (value as Record<string, unknown>).type;
+  return type === RELIABLE_KERNEL_ACK_MESSAGE
+    || type === RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
+    || type === RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE
+    || type === RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE;
+}
+
+async function resolveRestoredPanelOptions(
+  backendApp: ApplicationFacade,
+  options: MainPanelOptions
+): Promise<MainPanelOptions> {
+  if (panelKind(options) !== 'chat' || options.conversationId) return options;
+  const existing = backendApp.getConversationHistoryEntries()[0];
+  const conversationId = existing?.id ?? await backendApp.createConversation();
+  return {
+    ...options,
+    conversationId,
+    title: existing?.title ?? backendApp.getConversationDisplayTitle(conversationId),
+    reuse: true
+  };
 }
 
 function isDefaultConversationTitle(title: string): boolean {

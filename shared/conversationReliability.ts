@@ -24,12 +24,9 @@ import type {
   AuthoritySnapshotId
 } from './stableIds';
 import type {
-  RunExecutionPhase,
-  RunLifecycleStatus,
-  RunProgressSourceKind,
   TurnExecutionPhase,
   TurnLifecycleStatus
-} from './runLifecycle';
+} from './turnLifecycle';
 
 export const CONVERSATION_ATTACHMENTS_RESOURCE_KEY = 'conversation-attachments';
 export const ANSWER_BRIDGE_LINKS_RESOURCE_KEY = 'answer-bridge-links';
@@ -558,7 +555,7 @@ export type RuntimeDeliveryPolicy =
   | 'start_continuation_when_idle'
   | 'defer_until_next_user_turn'
   | 'notify_only';
-export type RuntimeDeliveryState = 'pending' | 'delivering' | 'consumed' | 'dead_letter';
+export type RuntimeDeliveryState = 'pending' | 'delivering' | 'consumed' | 'failed';
 
 export interface RuntimeDeliveryLinkRecord {
   id: string;
@@ -573,7 +570,7 @@ export interface RuntimeDeliveryLinkRecord {
   updatedAt: number;
   deliveringAt?: number;
   consumedAt?: number;
-  deadLetterAt?: number;
+  failedAt?: number;
   error?: string;
 }
 
@@ -583,7 +580,6 @@ export interface ChildTurnLinkRecord {
   parentConversationId: ConversationId;
   childTurnId: RunId;
   childConversationId: ConversationId;
-  answerBridgeId: AnswerBridgeId;
   mode: 'foreground' | 'background' | 'detached';
   completionPolicy: RuntimeDeliveryPolicy;
   sourceToolCallId?: ToolCallId;
@@ -665,15 +661,6 @@ export interface DurableInteractionRequestRecord {
   };
   createdAt: number;
   updatedAt: number;
-}
-
-export interface RunProgressSnapshot {
-  runId: RunId;
-  lifecycle: RunLifecycleStatus;
-  phase: RunExecutionPhase;
-  hasSlot: boolean;
-  counts: Partial<Record<RunProgressSourceKind, number>>;
-  completedAt?: number;
 }
 
 export interface AnswerBridgeRecord {

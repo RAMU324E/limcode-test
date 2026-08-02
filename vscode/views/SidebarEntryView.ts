@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
 import { MainPanel } from '../panels/MainPanel';
 import { getWebviewHtml } from '../webview/getWebviewHtml';
-import type { BackendApplication } from '../../backend/application/BackendApplication';
+import type { ApplicationFacade } from '../ApplicationFacade';
 import { EXTENSION_BRAND, SIDEBAR_ENTRY_VIEW_ID } from '../../shared/extensionIdentity';
+import { toStructuredClonePlainData } from '../../shared/plainData';
 import type {
   ConversationHistoryPageRecord,
   ConversationHistoryScope,
@@ -47,7 +48,7 @@ interface SidebarStateMessage {
   openConversations: OpenConversationPanelRecord[];
 }
 
-export function registerSidebarEntryView(context: vscode.ExtensionContext, backendApp: BackendApplication): void {
+export function registerSidebarEntryView(context: vscode.ExtensionContext, backendApp: ApplicationFacade): void {
   const provider = new SidebarEntryViewProvider(context.extensionUri, backendApp);
 
   context.subscriptions.push(
@@ -74,7 +75,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
 
   public constructor(
     private readonly extensionUri: vscode.Uri,
-    private readonly backendApp: BackendApplication
+    private readonly backendApp: ApplicationFacade
   ) {}
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -173,7 +174,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
     }
     const message = this.withLivePanelState(this.lastStateMessage);
     this.lastStateMessage = message;
-    void target.postMessage(message);
+    void postSidebarWebviewMessage(target, message);
   }
 
   private postSidebarStateWhenReady(webview: vscode.Webview, scopeKind: SidebarHistoryScopeKind = 'currentProject', cursor?: string, limit?: number, projectFolderUri?: string): Promise<void> {
@@ -297,7 +298,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
     } = {}
   ): Promise<void> {
     try {
-      await webview.postMessage({
+      await postSidebarWebviewMessage(webview, {
         type: CONVERSATION_OPERATION_RESULT_MESSAGE,
         operation,
         conversationId,
@@ -330,7 +331,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
       openConversations: []
     });
     this.lastStateMessage = message;
-    await webview.postMessage(message);
+    await postSidebarWebviewMessage(webview, message);
   }
 
   private withLivePanelState(message: SidebarStateMessage): SidebarStateMessage {
@@ -341,4 +342,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
       openConversations: MainPanel.getOpenConversationPanelStates()
     };
   }
+}
+
+function postSidebarWebviewMessage(webview: vscode.Webview, message: unknown): Thenable<boolean> {
+  return webview.postMessage(toStructuredClonePlainData(message, 'sidebar webview message'));
 }

@@ -1,6 +1,6 @@
 import { SWITCH_WORK_ENVIRONMENT_TOOL_NAME } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
-import { staticToolScheduling } from '../../scheduling';
+import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 
 export const switchWorkEnvironmentToolModule = defineToolDefinitionModule({

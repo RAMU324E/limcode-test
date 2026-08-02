@@ -151,6 +151,7 @@ export class ModelProviderControlPlane {
   private readonly context: ContextSequenceControlPlane;
   private readonly now: () => string;
   private readonly activeSockets = new Map<string, Set<AbortController>>();
+  private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -172,7 +173,7 @@ export class ModelProviderControlPlane {
     const recipe = normalizePlainJson(command.recipe, 'ModelRequest recipe');
     const recipeBytes = canonicalPlainJson(recipe, 'ModelRequest recipe');
     const recipeIdentity = this.contentStore.identity(recipeBytes, CONTENT_TYPE_RECIPE);
-    const modelRequestId = stableId('model_request', turnId, idempotencyKey);
+    const modelRequestId = modelRequestIdFor(turnId, idempotencyKey);
     const projectionId = stableId('model_request_projection', modelRequestId);
     const operationId = stableId('model_request_operation', modelRequestId);
     const attemptId = stableId('model_request_attempt', modelRequestId, '1');
@@ -339,6 +340,44 @@ export class ModelProviderControlPlane {
     modelRequestIdInput: string,
     adapter: FullRequestProviderAdapter,
     options: ProviderDispatchOptions = {}
+  ): Promise<ProviderDispatchResult> {
+    const task = this.dispatchRequest(modelRequestIdInput, adapter, options);
+    this.activeDispatches.add(task);
+    try {
+      return await task;
+    } finally {
+      this.activeDispatches.delete(task);
+    }
+  }
+
+  /** Cancels only non-terminal ModelRequests owned by one Turn; sibling Turns keep streaming. */
+  public async cancelTurnDispatches(turnIdInput: string, reason = 'turn-interrupt-requested'): Promise<number> {
+    const turnId = requireId(turnIdInput, 'turnId');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ModelRequest').list({ where: { turn_id: turnId }, limit: 1000 })
+    ]);
+    const rows = snapshot.snapshot[0];
+    if (!Array.isArray(rows)) throw new TypeError('ModelRequest list did not return rows.');
+    const active = rows.filter((row) => row.status !== 'terminal');
+    await Promise.all(active.map((row) => this.cancel(
+      requireId(row.id, 'ModelRequest.id'),
+      requireText(reason, 'cancel reason')
+    )));
+    return active.length;
+  }
+
+  /** Stops transient provider work and waits until every dispatch has durably observed cancellation. */
+  public async abortAllActiveDispatches(): Promise<void> {
+    for (const sockets of this.activeSockets.values()) {
+      for (const controller of sockets) controller.abort();
+    }
+    await Promise.allSettled([...this.activeDispatches]);
+  }
+
+  private async dispatchRequest(
+    modelRequestIdInput: string,
+    adapter: FullRequestProviderAdapter,
+    options: ProviderDispatchOptions
   ): Promise<ProviderDispatchResult> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
     if (!adapter || typeof adapter.sendFullRequest !== 'function') {
@@ -957,6 +996,14 @@ function allocatedValue(
   );
   if (!entry) throw new Error(`Missing writer allocation ${domain}.${column} for ${id}.`);
   return entry.value;
+}
+
+export function modelRequestIdFor(turnIdInput: string, idempotencyKeyInput: string): string {
+  return stableId(
+    'model_request',
+    requireId(turnIdInput, 'turnId'),
+    requireText(idempotencyKeyInput, 'idempotencyKey')
+  );
 }
 
 function stableId(kind: string, ...parts: string[]): string {

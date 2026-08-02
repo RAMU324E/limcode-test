@@ -22,6 +22,7 @@
       "workEnvironmentId",
       "targetPath",
       "baseDigest?",
+      "baseContentObjectId?",
       "targetContentObjectId?",
       "targetDigest?"
     ],
@@ -33,6 +34,7 @@
       "delete_directory_tree"
     ],
     "contentStorage": "cas-before-sqlite-reference",
+    "completedDiffRule": "replace_file/delete_file 的精确 base bytes 与 create_file/replace_file 的 target bytes 都在提案事务前进入 CAS；完成后通过独立 detail kind 重开 Diff，不依赖 Workspace 当前内容或瞬态预览。",
     "modelResult": false
   },
   "decision": {

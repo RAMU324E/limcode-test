@@ -429,10 +429,6 @@ function deletePathRows(output: FileChangeOutput): Array<{ label: string; value:
   const compact = compactDeletePathRows(output.paths);
   if (compact.length > 0) return compact;
 
-  const legacyDeleted = legacyDeleteRows(output.deleted, true);
-  const legacyFailed = legacyDeleteRows(output.failed, false);
-  if (legacyDeleted.length > 0 || legacyFailed.length > 0) return [...legacyDeleted, ...legacyFailed];
-
   const explicitPaths = stringArray(output.paths);
   if (explicitPaths.length > 0) return explicitPaths.map((path, index) => ({ label: String(index + 1), value: `${normalizePath(path)} · 成功` }));
 
@@ -453,18 +449,6 @@ function compactDeletePathRows(value: unknown): Array<{ label: string; value: st
     const path = stringValue(record?.path);
     const success = booleanValue(record?.success);
     if (!path || success === undefined) continue;
-    rows.push({ label: String(rows.length + 1), value: `${normalizePath(path)} · ${success ? '成功' : '失败'}` });
-  }
-  return rows;
-}
-
-function legacyDeleteRows(value: unknown, success: boolean): Array<{ label: string; value: string }> {
-  if (!Array.isArray(value)) return [];
-  const rows: Array<{ label: string; value: string }> = [];
-  for (const item of value) {
-    const record = asRecord(item);
-    const path = stringValue(record?.path) ?? stringValue(record?.inputPath);
-    if (!path) continue;
     rows.push({ label: String(rows.length + 1), value: `${normalizePath(path)} · ${success ? '成功' : '失败'}` });
   }
   return rows;

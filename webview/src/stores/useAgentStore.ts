@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia';
-import { createMessageId, type AgentRecord, type ConversationAgentSelectionRecord } from '@shared/protocol';
+import type { AgentRecord } from '@shared/protocol';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
+import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
 
 function agentLabel(agent: AgentRecord): string {
   return agent.name.trim() || agent.id;
@@ -9,12 +10,6 @@ function agentLabel(agent: AgentRecord): string {
 
 function isConfigurableAgent(agent: AgentRecord): boolean {
   return agent.runtimeRole !== 'mirror';
-}
-
-function upsertById<T extends { id: string }>(items: T[], record: T): void {
-  const index = items.findIndex((item) => item.id === record.id);
-  if (index >= 0) items[index] = record;
-  else items.push(record);
 }
 
 export const useAgentStore = defineStore('agent', {
@@ -37,28 +32,17 @@ export const useAgentStore = defineStore('agent', {
   actions: {
     activeAgentForConversation(conversationId: string): AgentRecord | undefined {
       const clientState = useClientStateStore();
-      const selection = clientState.conversationAgentSelections
-        .filter((item) => item.conversationId === conversationId && item.role === 'active')
-        .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt || right.id.localeCompare(left.id))[0];
-      const fallbackLink = selection ? undefined : clientState.agentConversationLinks.find((link) => link.conversationId === conversationId && link.role === 'default') ?? clientState.agentConversationLinks.find((link) => link.conversationId === conversationId);
-      return clientState.agents.find((agent) => agent.id === (selection?.agentId ?? fallbackLink?.agentId));
+      const feed = useReliableKernelClientFeedStore();
+      const links = Object.values(feed.records.AgentConversationLink ?? {});
+      const link = links.find((candidate) =>
+        text(candidate.conversation_id) === conversationId && text(candidate.role) === 'default'
+      ) ?? links.find((candidate) => text(candidate.conversation_id) === conversationId);
+      return clientState.agents.find((agent) => agent.id === text(link?.agent_id));
     },
     selectAgent(conversationId: string, agentId: string): void {
       if (!conversationId || !agentId) return;
       const clientState = useClientStateStore();
       if (!clientState.agents.some((agent) => agent.id === agentId && isConfigurableAgent(agent))) return;
-      const now = Date.now();
-      const existing = clientState.conversationAgentSelections.find((selection) => selection.conversationId === conversationId && selection.role === 'active');
-      const selection: ConversationAgentSelectionRecord = {
-        id: existing?.id ?? `conversation-agent-local-${createMessageId()}`,
-        conversationId,
-        agentId,
-        role: 'active',
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now
-      };
-      clientState.conversationAgentSelections = clientState.conversationAgentSelections.filter((item) => !(item.conversationId === conversationId && item.role === 'active'));
-      upsertById(clientState.conversationAgentSelections, selection);
       bridge.request(BridgeMessageType.ConversationAgentSelect, { conversationId, agentId });
     },
     createAgent(name: string): void {
@@ -90,9 +74,12 @@ export const useAgentStore = defineStore('agent', {
       const agent = clientState.agents.find((item) => item.id === agentId);
       if (!agent || agent.source === 'builtin') return;
       clientState.agents = clientState.agents.filter((item) => item.id !== agentId);
-      clientState.conversationAgentSelections = clientState.conversationAgentSelections.filter((item) => item.agentId !== agentId);
       this.status = '正在删除 Agent...';
       bridge.request(BridgeMessageType.AgentDelete, { agentId });
     }
   }
 });
+
+function text(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}

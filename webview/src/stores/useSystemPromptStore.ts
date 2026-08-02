@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { type ConfigScopeKind, type PromptPlaceholderRecord, type SystemPromptRecord, type SystemPromptScopeLinkRecord } from '@shared/protocol';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
+import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedStore';
 
 interface PendingSystemPromptSave {
   scopeKind: ConfigScopeKind;
@@ -143,17 +144,20 @@ export const useSystemPromptStore = defineStore('systemPrompt', {
 });
 
 function activeAgentIdForConversation(conversationId: string): string | undefined {
-  const clientState = useClientStateStore();
-  const selection = latest(clientState.conversationAgentSelections.filter((item) => item.conversationId === conversationId && item.role === 'active'));
-  const fallbackLink = selection
-    ? undefined
-    : clientState.agentConversationLinks.find((link) => link.conversationId === conversationId && link.role === 'default')
-      ?? clientState.agentConversationLinks.find((link) => link.conversationId === conversationId);
-  return selection?.agentId ?? fallbackLink?.agentId;
+  const feed = useReliableKernelClientFeedStore();
+  const links = Object.values(feed.records.AgentConversationLink ?? {});
+  const link = links.find((candidate) =>
+    plainText(candidate.conversation_id) === conversationId && plainText(candidate.role) === 'default'
+  ) ?? links.find((candidate) => plainText(candidate.conversation_id) === conversationId);
+  return plainText(link?.agent_id);
 }
 
 function activeWorkflowIdForConversation(conversationId: string): string | undefined {
   const clientState = useClientStateStore();
   const selection = latest(clientState.conversationWorkflowSelections.filter((item) => item.conversationId === conversationId && item.role === 'active'));
   return selection?.scopeKind === 'workflow' ? selection.workflowId : undefined;
+}
+
+function plainText(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }

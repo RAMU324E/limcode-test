@@ -1,4 +1,4 @@
-import type { CommandCapability, FsCapability, SkillCatalogCapability, StorageCapability, WorkEnvironmentRuntimeCapability } from '../../../capabilities/types';
+import type { CommandCapability, FsCapability, SkillCatalogCapability, WorkEnvironmentRuntimeCapability } from '../../../capabilities/types';
 import type {
   ToolCallEventKind,
   ToolConfigRecord,
@@ -11,13 +11,12 @@ import type {
   LlmInvocationSettingsSnapshotRecord,
   WorkEnvironmentRecord
 } from '../../../../shared/protocol';
-import type { ToolSchedulingResolver } from './scheduling';
+import type { ToolSchedulingResolver } from './schedulingContract';
 
 export interface ToolDeps {
   fs: FsCapability;
   command: CommandCapability;
   workEnvironment: WorkEnvironmentRuntimeCapability;
-  storage: StorageCapability;
   skills: SkillCatalogCapability;
 }
 

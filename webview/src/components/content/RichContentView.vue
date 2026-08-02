@@ -4,15 +4,13 @@ import {
   isFunctionCallPart,
   type ContentPart,
   type FunctionCallPart,
-  type ToolCallPreviewRecord,
   type ToolCallRecord,
   type ToolCallStatus,
   type ToolSchedulingMode
 } from '@shared/protocol';
-import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import StreamingIndicatorTail from './StreamingIndicatorTail.vue';
-import StreamingToolCallPreview from './parts/StreamingToolCallPreview.vue';
 import { partViewComponent, toRenderNodes, type RichRenderNode } from './partRegistry';
 
 const props = defineProps<{
@@ -39,21 +37,9 @@ interface ToolCallNodeInfo {
   blocking: boolean;
 }
 
-const conversationTimeline = useConversationTimelineStore();
+const reliableConversation = useReliableConversation();
 const globalSettings = useGlobalSettingsStore();
 const nodes = computed(() => withToolBatchMeta(toRenderNodes(props.parts)));
-const streamingToolPreviews = computed<ToolCallPreviewRecord[]>(() => {
-  if (!props.messageId) return [];
-  const state = conversationTimeline.currentTimeline.state;
-  const finalCallIds = new Set(state.toolCalls
-    .filter((call) => call.messageId === props.messageId)
-    .flatMap((call) => [call.id, call.functionCallId].filter((id): id is string => !!id)));
-  return state.toolCallPreviewTargetLinks
-    .filter((link) => link.messageId === props.messageId)
-    .map((link) => state.toolCallPreviews.find((preview) => preview.id === link.previewId))
-    .filter((preview): preview is ToolCallPreviewRecord => !!preview && !finalCallIds.has(preview.callId))
-    .sort((left, right) => (left.streamIndex ?? '').localeCompare(right.streamIndex ?? '') || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-});
 const showToolExecutingTail = computed(() => {
   if (props.streaming || !props.messageId) return false;
   return nodes.value.some((node) => {
@@ -63,14 +49,14 @@ const showToolExecutingTail = computed(() => {
   });
 });
 const showStandaloneStreamingTail = computed(() => {
-  if (!props.streaming || nodes.value.length === 0 || streamingToolPreviews.value.length > 0) return false;
+  if (!props.streaming || nodes.value.length === 0) return false;
   const lastIndex = nodes.value.length - 1;
   const last = nodes.value[lastIndex];
   return !!last && !nodeStreaming(last, lastIndex);
 });
 
 function nodeStreaming(node: RichRenderNode, index: number): boolean {
-  if (!props.streaming || streamingToolPreviews.value.length > 0 || index !== nodes.value.length - 1) return false;
+  if (!props.streaming || index !== nodes.value.length - 1) return false;
   if (node.kind === 'thought') return node.props.thoughtOpen === true;
   return node.kind === 'text';
 }
@@ -203,9 +189,10 @@ function toolCallForNode(node: RichRenderNode): ToolCallRecord | undefined {
   if (!isFunctionCallPart(part as ContentPart)) return undefined;
   const functionCallPart = part as FunctionCallPart;
   const partId = functionCallPart.id;
-  if (!partId) return undefined;
-  return conversationTimeline.currentTimeline.state.toolCalls.find(
-    (call) => call.messageId === props.messageId && (call.id === partId || call.functionCallId === partId)
+  const calls = reliableConversation.projection.value.toolCalls;
+  return calls.find((call) =>
+    call.messageId === props.messageId
+    && (partId ? call.id === partId || call.functionCallId === partId : call.name === functionCallPart.functionCall.name)
   );
 }
 
@@ -237,17 +224,12 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
 
 <template>
   <div class="rich-content">
-    <template v-if="nodes.length || streamingToolPreviews.length">
+    <template v-if="nodes.length">
       <component
         :is="partViewComponent(node.kind)"
         v-for="(node, index) in nodes"
         :key="node.key"
         v-bind="nodeComponentProps(node, index)"
-      />
-      <StreamingToolCallPreview
-        v-for="preview in streamingToolPreviews"
-        :key="preview.id"
-        :preview="preview"
       />
       <div v-if="showStandaloneStreamingTail" class="rich-streaming-tail-row">
         <StreamingIndicatorTail :text="globalSettings.appearance.streamingTextWriting" variant="writing" />

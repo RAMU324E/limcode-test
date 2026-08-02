@@ -15,5 +15,6 @@ export const MAIN_PANEL_VIEW_TYPE = 'limcode-test.mainPanel';
 export const SIDEBAR_CONTAINER_ID = 'limcode-test-sidebar';
 export const SIDEBAR_ENTRY_VIEW_ID = 'limcode-test-entry-view';
 export const LIVE_DIFF_SCHEME = 'limcode-test-live-diff';
+export const RELIABLE_DIFF_SCHEME = 'limcode-test-reliable-diff';
 export const SHADOW_DIFF_SCHEME = 'limcode-test-shadow';
 export const WEBVIEW_DEV_PORT = 31_820;

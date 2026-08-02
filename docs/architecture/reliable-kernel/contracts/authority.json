@@ -469,6 +469,43 @@
       ]
     },
     {
+      "key": "TurnIntentAuthorityRevision",
+      "table": "turn_intent_authority_revision",
+      "repository": "TurnIntentAuthorityRevisionRepository",
+      "codec": "TurnIntentAuthorityRevisionRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-intent",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "intent_id,revision_seq UNIQUE"
+      ],
+      "notes": [
+        "排队时冻结有效Authority；后续admit只引用该CAS对象，不按当时配置重新编译"
+      ]
+    },
+    {
+      "key": "TurnIntentExecutorLink",
+      "table": "turn_intent_executor_link",
+      "repository": "TurnIntentExecutorLinkRepository",
+      "codec": "TurnIntentExecutorLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-intent",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "intent_id UNIQUE",
+        "agent_id"
+      ],
+      "notes": [
+        "排队Intent与配置域Agent的冻结关系；admit时生成独立TurnExecutorLink"
+      ]
+    },
+    {
       "key": "PendingTurnInput",
       "table": "pending_turn_input",
       "repository": "PendingTurnInputRepository",
@@ -710,12 +747,28 @@
       "mutations": [
         "insert"
       ],
-      "client": "none",
+      "client": "summary",
       "deletePolicy": "cascade-with-request",
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "request_id UNIQUE",
         "turn_id"
+      ]
+    },
+    {
+      "key": "InteractionToolCallLink",
+      "table": "interaction_tool_call_link",
+      "repository": "InteractionToolCallLinkRepository",
+      "codec": "InteractionToolCallLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-request",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "request_id UNIQUE",
+        "tool_call_id"
       ]
     },
     {
@@ -973,6 +1026,9 @@
       "indexes": [
         "change_set_id,member_seq UNIQUE",
         "change_set_id,target_path"
+      ],
+      "notes": [
+        "字段：change_set_id,member_seq,operation,work_environment_id,target_path,base_digest,base_content_object_id,target_content_object_id,target_digest；base/target正文均为独立CAS引用，支持完成态Diff重开"
       ]
     },
     {
@@ -1637,7 +1693,7 @@
       "id": "ask-user",
       "disposition": "rebuild-on-generic-tool-interaction-domains",
       "ownerStage": "D",
-      "target": "ToolCall+ToolExecution+InteractionRequest+InteractionOwnerLink+InteractionResponse+OutcomePause+OperationResolution+ToolOutcome+ToolModelResult",
+      "target": "ToolCall+ToolExecution+InteractionRequest+InteractionOwnerLink+InteractionToolCallLink+InteractionResponse+OutcomePause+OperationResolution+ToolOutcome+ToolModelResult",
       "acceptance": [
         "no AskUser runtime table"
       ]

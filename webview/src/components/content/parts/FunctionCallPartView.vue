@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
-import { IconTool, IconPlayerStop } from '@tabler/icons-vue';
-import { conversationClientStateStreamId, SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
+import { IconFileDiff, IconTool, IconPlayerStop } from '@tabler/icons-vue';
+import { SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
 import { submitPlanOutputFromResult } from '@shared/planReview';
 import type {
   FunctionCallPart,
@@ -12,11 +12,12 @@ import type {
   ToolSchedulingMode
 } from '@shared/protocol';
 import type { DurableInteractionRequestKind } from '@shared/conversationReliability';
-import { interactionForTool, type InteractionView } from '@webview/domain/interactionProjection';
-import { useClientStateStore } from '@webview/stores/useClientStateStore';
-import { useConversationTimelineStore } from '@webview/stores/useConversationTimelineStore';
+import {
+  interactionViewFromReliableRuntime,
+  type InteractionView
+} from '@webview/domain/interactionProjection';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
-import { finalToolResultArtifact, toolResultForState, useToolResultArtifactStore } from '@webview/stores/useToolResultArtifactStore';
+import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import AskUserContent from '@webview/components/askUser/AskUserContent.vue';
 import PlanProposalContent from '@webview/components/plan/PlanProposalContent.vue';
@@ -27,7 +28,7 @@ import ContentBlockSection from '../ContentBlockSection.vue';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
 import ToolDiffView from '../toolDisplay/ToolDiffView.vue';
 import TextPartView from './TextPartView.vue';
-import type { ToolDisplaySection, ToolHeaderAction } from '../toolDisplay/types';
+import type { ToolDisplayDiff, ToolDisplaySection, ToolHeaderAction } from '../toolDisplay/types';
 
 const props = defineProps<{
   part: FunctionCallPart;
@@ -45,10 +46,8 @@ const props = defineProps<{
   batchColorIndex?: number;
 }>();
 
-const clientState = useClientStateStore();
-const conversationTimeline = useConversationTimelineStore();
+const reliableConversation = useReliableConversation();
 const interactions = useInteractionStore();
-const toolResults = useToolResultArtifactStore();
 const expanded = ref(false);
 const userChangedExpanded = ref(false);
 const autoOpenedActionIds = ref<Set<string>>(new Set());
@@ -64,28 +63,23 @@ let cancelProjectionTimer: ReturnType<typeof setTimeout> | undefined;
 const CANCEL_PROJECTION_DEADLINE_MS = 30_000;
 const toolCall = computed<ToolCallRecord | undefined>(() => {
   const partId = props.part.id;
-  if (!props.messageId || !partId) return undefined;
-  return conversationTimeline.currentTimeline.state.toolCalls.find(
-    (call) => call.messageId === props.messageId && (call.id === partId || call.functionCallId === partId)
+  if (!props.messageId) return undefined;
+  const calls = reliableConversation.projection.value.toolCalls;
+  return calls.find((call) =>
+    call.messageId === props.messageId
+    && (partId ? call.id === partId || call.functionCallId === partId : call.name === props.part.functionCall.name)
   );
-});
-const resultArtifact = computed(() => {
-  const callId = toolCall.value?.id;
-  return callId ? finalToolResultArtifact(conversationTimeline.currentTimeline.state, callId) : undefined;
 });
 const toolResult = computed(() => {
   const call = toolCall.value;
   if (!call) return undefined;
-  return toolResultForState(conversationTimeline.currentTimeline.state, call.id, toolResults.loadedByArtifactId);
+  return reliableConversation.projection.value.toolResultByCallId[call.id];
 });
-const toolEvents = computed<ToolCallEventRecord[]>(() => {
-  const callId = toolCall.value?.id;
-  if (!callId) return [];
-  return clientState.toolCallEvents.filter((event) => event.toolCallId === callId).sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
-});
-const executionInteraction = computed(() => interactionForTool(clientState, toolCall.value?.id, 'exec_approval'));
-const fileChangeInteractionView = computed(() => interactionForTool(clientState, toolCall.value?.id, 'patch_approval'));
-const resultReviewInteraction = computed(() => interactionForTool(clientState, toolCall.value?.id, 'result_review'));
+const toolEvents = computed<ToolCallEventRecord[]>(() => []);
+const executionInteraction = computed(() => reliableInteractionForKind('exec_approval'));
+const fileChangeInteractionView = computed(() => reliableInteractionForKind('patch_approval'));
+const resultReviewInteraction = computed(() => reliableInteractionForKind('result_review'));
+const askUserInteractionView = computed(() => reliableInteractionForKind('ask_user'));
 const fileChangeInteraction = computed(() => fileChangeInteractionView.value?.request);
 const finalizing = computed(() => isFinalizingProgress(toolCall.value?.progress));
 const displayProgress = computed(() => {
@@ -100,20 +94,64 @@ const toolDisplay = computed(() => resolveToolDisplay({
   progress: displayProgress.value,
   events: toolEvents.value,
   toolCall: toolCall.value,
-  messages: conversationTimeline.currentTimeline.state.messages,
-  toolCalls: conversationTimeline.currentTimeline.state.toolCalls,
-  agentRunSourceLinks: conversationTimeline.currentTimeline.state.agentRunSourceLinks,
-  agentRunTargetLinks: conversationTimeline.currentTimeline.state.agentRunTargetLinks,
-  checkpoints: conversationTimeline.currentTimeline.state.checkpoints,
-  checkpointTimelineAnchors: conversationTimeline.currentTimeline.state.checkpointTimelineAnchors,
-  shadowRepositories: conversationTimeline.currentTimeline.state.shadowRepositories,
-  currentConversationId: clientState.currentConversationId,
+  messages: reliableConversation.projection.value.messages,
+  toolCalls: reliableConversation.projection.value.toolCalls,
+  checkpoints: [],
+  checkpointTimelineAnchors: [],
+  shadowRepositories: [],
+  currentConversationId: reliableConversation.conversationId.value,
   stringifyValue
 }));
+const reliableFileDiff = computed<ToolDisplayDiff | undefined>(() => {
+  const callId = toolCall.value?.id;
+  if (!callId) return undefined;
+  const projection = reliableConversation.projection.value.fileDiffByToolCallId[callId];
+  if (!projection) return undefined;
+  return {
+    files: projection.files.map((file) => ({
+      path: file.path,
+      action: file.action,
+      added: file.added,
+      removed: file.removed,
+      truncated: file.truncated,
+      text: file.text
+    }))
+  };
+});
 const inputSections = computed(() => toolDisplay.value.inputSections);
-const outputSections = computed(() => toolDisplay.value.outputSections);
+const outputSections = computed(() => {
+  const sections = [...toolDisplay.value.outputSections];
+  if (reliableFileDiff.value && !sections.some((section) => section.diff)) {
+    sections.push({ kind: 'output', title: 'Diff 预览', diff: reliableFileDiff.value });
+  }
+  return sections;
+});
 const toolIcon = computed(() => toolDisplay.value.headerIcon ?? IconTool);
-const headerActions = computed(() => toolDisplay.value.headerActions);
+const headerActions = computed<ToolHeaderAction[]>(() => {
+  const call = toolCall.value;
+  if (
+    call
+    && reliableConversation.projection.value.fileChangeSetIdByToolCallId[call.id]
+    && reliableFileDiff.value
+  ) {
+    return [{
+      id: `open-reliable-diff-${call.id}`,
+      label: '查看差异',
+      title: '从可靠内核保存的原始与目标内容重新打开 Diff，不依赖当前 Workspace 或瞬态预览',
+      icon: IconFileDiff,
+      disabled: false,
+      invoke: () => {
+        bridge.request(BridgeMessageType.ToolDiffOpen, {
+          toolCallId: call.id,
+          ...(reliableConversation.conversationId.value
+            ? { conversationId: reliableConversation.conversationId.value }
+            : {})
+        });
+      }
+    }];
+  }
+  return toolDisplay.value.headerActions;
+});
 const headerPreview = computed(() => toolDisplay.value.headerPreview);
 const hasArgs = computed(() => inputSections.value.length > 0);
 const hasOutput = computed(() => outputSections.value.length > 0);
@@ -223,16 +261,6 @@ const toggleLabel = computed(() => {
   return expanded.value ? '收起工具调用内容' : '展开工具调用内容';
 });
 
-watch(
-  () => `${expanded.value}:${needsChangeApplyDecision.value}:${resultArtifact.value?.id ?? ''}:${resultArtifact.value?.contentHash ?? ''}`,
-  () => {
-    if (!expanded.value && !needsChangeApplyDecision.value) return;
-    const conversationId = conversationTimeline.currentTimeline.conversationId || clientState.currentConversationId;
-    if (conversationId) toolResults.ensureFullResult(conversationId, resultArtifact.value);
-  },
-  { immediate: true }
-);
-
 watch(autoExpandDetails, (autoExpand) => {
   if (autoExpand && !userChangedExpanded.value) expanded.value = true;
 }, { immediate: true });
@@ -317,6 +345,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function reliableInteractionForKind(kind: DurableInteractionRequestKind): InteractionView | undefined {
+  const callId = toolCall.value?.id;
+  if (!callId) return undefined;
+  const interaction = reliableConversation.projection.value.interactionByToolCallId[callId];
+  if (!interaction) return undefined;
+  return interactionViewFromReliableRuntime({
+    interaction,
+    conversationId: reliableConversation.conversationId.value,
+    toolCallId: callId,
+    expectedKind: kind
+  });
+}
+
 function resolveToolInteraction(kind: DurableInteractionRequestKind, decision: 'accept' | 'reject'): void {
   const target: InteractionView | undefined = kind === 'exec_approval'
     ? executionInteraction.value
@@ -335,7 +376,7 @@ function cancelToolExecution(): void {
   if (!call || (cancelFeedback.value && cancelFeedback.value.phase !== 'failed')) return;
   const requestId = bridge.request(BridgeMessageType.ToolExecutionCancel, {
     toolCallId: call.id,
-    conversationId: clientState.currentConversationId
+    conversationId: reliableConversation.conversationId.value
   });
   clearCancelProjectionTimer();
   cancelFeedback.value = { requestId, phase: 'submitting', message: '正在提交中断' };
@@ -391,10 +432,7 @@ function requestCancelProjectionRecovery(conversationId: string): void {
 }
 
 function requestConversationResync(conversationId: string): void {
-  bridge.request(BridgeMessageType.ClientResync, {
-    conversationId,
-    streamId: conversationClientStateStreamId(conversationId)
-  });
+  bridge.request(BridgeMessageType.ClientResync, { conversationId });
 }
 
 function clearCancelProjectionTimer(): void {
@@ -660,6 +698,7 @@ function isFinalizingProgress(progress: unknown): boolean {
           :request="section.askUser.request"
           :tool-call="section.askUser.toolCall"
           :result="toolResult"
+          :interaction-view="askUserInteractionView"
           placement="tool-detail"
         />
         <PlanProposalContent
@@ -702,6 +741,7 @@ function isFinalizingProgress(progress: unknown): boolean {
           :request="section.askUser.request"
           :tool-call="section.askUser.toolCall"
           :result="toolResult"
+          :interaction-view="askUserInteractionView"
           placement="tool-detail"
         />
         <PlanProposalContent

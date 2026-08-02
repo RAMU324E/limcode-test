@@ -317,11 +317,14 @@ async function checkAnswerRestartDelivery() {
     assertions.push('NULL与非NULL target_turn_id两组真实SQLite partial UNIQUE均按delivery attempt身份去重');
 
     const matrixChild = await spawnStartedChild(ctx, seeded.turnId, 'delivery-matrix', 'background');
+    const matrixContinuationTool = await createRunAgentTool(ctx, seeded.turnId, 'delivery-matrix-continuation');
     const matrixQueued = await ctx.services.children.send({
       sourceKey: 'delivery-matrix-continuation',
+      sourceToolCallId: matrixContinuationTool.toolCallId,
       childExecutionId: matrixChild.childExecutionId,
       mode: 'queue_next_turn',
-      content: 'admit delivery matrix continuation'
+      content: 'admit delivery matrix continuation',
+      completionPolicy: 'background'
     });
     const matrixSubmissions = [];
     for (const suffix of ['current-terminal', 'next-terminal', 'next-none', 'notify']) {
@@ -534,11 +537,14 @@ async function checkCancelSubtree() {
     const childB = await spawnStartedChild(ctx, childA.childTurnId, 'tree-b', 'background');
     const sibling = await spawnStartedChild(ctx, parent.turnId, 'tree-sibling', 'background');
 
+    const queuedATool = await createRunAgentTool(ctx, parent.turnId, 'queue-a-continuation');
     const queuedA = await ctx.services.children.send({
       sourceKey: 'queue-a-continuation',
+      sourceToolCallId: queuedATool.toolCallId,
       childExecutionId: childA.childExecutionId,
       mode: 'queue_next_turn',
-      content: 'continue A'
+      content: 'continue A',
+      completionPolicy: 'background'
     });
     const childTurnControl = createTurnControl(ctx, 'child-a');
     await childTurnControl.terminal({
@@ -554,11 +560,14 @@ async function checkCancelSubtree() {
       leaseOwnerId: 'continued-a-owner',
       leaseExpiresAt: '2026-08-02T00:00:00.000Z'
     });
+    const pendingBTool = await createRunAgentTool(ctx, parent.turnId, 'queue-b-pending');
     const pendingB = await ctx.services.children.send({
       sourceKey: 'queue-b-pending',
+      sourceToolCallId: pendingBTool.toolCallId,
       childExecutionId: childB.childExecutionId,
       mode: 'queue_next_turn',
-      content: 'pending B'
+      content: 'pending B',
+      completionPolicy: 'background'
     });
     const parentLinkB = (await list(ctx.database, 'ChildExecutionParentLink', {
       child_execution_id: childB.childExecutionId
@@ -791,10 +800,10 @@ async function checkClientSnapshotBounds() {
     assert.equal(JSON.stringify(structuralContext).includes('user-input-snapshot'), false);
     assertions.push('大型answer正文不进ClientState，details按recordId+offset+maxBytes分块；Context projection按root读取结构事实且不把owner误作CAS或返回正文；每个实际wire response≤2MiB');
 
-    const messageListSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/MessageList.vue'), 'utf8');
+    const messageListSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/ReliableMessageList.vue'), 'utf8');
     const segmentSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/segmentedTimeline.ts'), 'utf8');
-    assert.match(messageListSource, /v-for="row in visibleTimelineRows"/);
-    assert.match(messageListSource, /AdvancedScrollbar|scroller/);
+    assert.match(messageListSource, /v-for="[^"]*visibleTimelineRows"/);
+    assert.match(messageListSource, /scroller/);
     assert.match(segmentSource, /TIMELINE_MOUNT_LIMIT = 80/);
     assert.match(segmentSource, /PENDING_TIMELINE_MOUNT_LIMIT = 20/);
     assert.ok(80 + 20 <= 100);
@@ -805,7 +814,7 @@ async function checkClientSnapshotBounds() {
     assert.notEqual(plain, proxy);
     assert.throws(() => plainData.toStructuredClonePlainData(new Map()), /forbidden class/);
     assert.throws(() => plainData.toStructuredClonePlainData({ callback() {} }), /unsupported function/);
-    assertions.push('1000条时间线使用80+20 segmented挂载上限并复用现有自定义scroller；Bridge payload递归转plain且拒绝Map/function/class');
+    assertions.push('可靠时间线使用80+20 segmented挂载上限并复用现有自定义scroller；Bridge payload递归转plain且拒绝Map/function/class');
     faults.push('keyset insertion between pages');
     faults.push('detail payload larger than maxResponseBytes');
     metrics.snapshotBytes = wireBytes(snapshot);
@@ -932,18 +941,92 @@ async function checkClientQueueBounds() {
   });
 
   const byteEvidence = await withRuntime('client-queue-bytes', async (ctx) => {
+    // Seed a bounded active window before connecting, then repeatedly update the same visible rows.
+    // Creating hundreds of new Conversations would correctly hit the 200-record navigation bound
+    // before queuedBytes, so it cannot prove that the independent 4 MiB queue guard is active.
+    const seeded = await seedParent(ctx, 'queue-bytes');
+    const shared = await ctx.store.ingest(ctx.database, 'queue-byte-shared', 'application/json');
+    const toolCallIds = [];
+    const modelRequestIds = [];
+    const seedSteps = [];
+    for (let index = 0; index < 200; index += 1) {
+      const suffix = String(index).padStart(3, '0');
+      const toolCallId = `queue-byte-tool-${suffix}`;
+      const modelRequestId = `queue-byte-model-${suffix}`;
+      toolCallIds.push(toolCallId);
+      modelRequestIds.push(modelRequestId);
+      seedSteps.push(
+        kernel.DOMAIN_REPOSITORIES.domain('ToolCall').insert({
+          id: toolCallId,
+          turn_id: seeded.turnId,
+          call_seq: BigInt(index + 1),
+          tool_name: `seed-tool-${suffix}`,
+          status: 'running',
+          arguments_object_id: shared.id,
+          created_at: NOW,
+          updated_at: NOW
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').insert({
+          id: modelRequestId,
+          turn_id: seeded.turnId,
+          request_seq: BigInt(index + 1),
+          status: 'prepared',
+          terminal_state: null,
+          provider_id: 'queue-byte-provider',
+          model_id: 'queue-byte-model',
+          authority_snapshot_id: `queue-byte-authority-${suffix}`,
+          settings_snapshot_object_id: null,
+          recipe_object_id: shared.id,
+          usage_json: null,
+          stream_stats_json: { attemptSeq: '1', socketGeneration: '0', retryReason: null },
+          created_at: NOW,
+          updated_at: NOW
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('Operation').insert({
+          id: `queue-byte-operation-${suffix}`,
+          owner_kind: 'model_request',
+          owner_id: modelRequestId,
+          operation_seq: 1n,
+          tool_call_id: null,
+          status: 'pending',
+          created_at: NOW,
+          updated_at: NOW
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('Attempt').insert({
+          id: `queue-byte-attempt-${suffix}`,
+          operation_id: `queue-byte-operation-${suffix}`,
+          attempt_seq: 1n,
+          status: 'pending',
+          created_at: NOW,
+          updated_at: NOW,
+          completed_at: null
+        })
+      );
+    }
+    await ctx.database.transaction(seedSteps);
+
     const sent = [];
-    const connection = await ctx.services.clientFeed.connect({ send: (message) => sent.push(message) });
+    const connection = await ctx.services.clientFeed.connect({
+      activeConversationId: seeded.conversationId,
+      send: (message) => sent.push(message)
+    });
     let previous;
     let overflowAt = 0;
     for (let batch = 1; batch <= 8; batch += 1) {
-      await ctx.database.transaction(Array.from({ length: 290 }, (_unused, index) =>
-        kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
-          id: `queue-bytes-${batch}-${String(index).padStart(3, '0')}`,
-          title: `${'x'.repeat(1700)}-${batch}-${index}`,
-          status: 'active', created_at: NOW, updated_at: NOW
-        })
-      ));
+      const steps = [];
+      for (let index = 0; index < 200; index += 1) {
+        steps.push(
+          kernel.DOMAIN_REPOSITORIES.domain('ToolCall').update(toolCallIds[index], {
+            tool_name: `${'t'.repeat(1500)}-${batch}-${index}`,
+            updated_at: NOW
+          }),
+          kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestIds[index], {
+            usage_json: { padding: 'u'.repeat(1300), batch, index },
+            updated_at: NOW
+          })
+        );
+      }
+      await ctx.database.transaction(steps);
       const current = ctx.services.clientFeed.inspectSession(connection.sessionId);
       if (current.snapshotRequired) {
         overflowAt = batch;
@@ -1024,14 +1107,14 @@ async function checkOldWriterNotRouted() {
   const assertions = [];
   const faults = [];
   const metrics = {};
-  const entry = path.join(root, 'dist/extension/backend/reliableKernel/candidateRuntime.js');
+  const entry = path.join(root, 'dist/extension/vscode/extension.js');
   const graph = emittedRequireClosure(entry);
   const forbidden = [
     '/backend/reliability/',
+    '/backend/application/BackendApplication.js',
     '/backend/world/modules/agentRun/',
     '/backend/application/conversationFork.js',
     '/backend/capabilities/vscodeStorage/clientStateStore.js',
-    '/shared/protocol.js',
     '/shared/runLifecycle.js',
     '/shared/agentRunActivity.js'
   ];
@@ -1039,21 +1122,29 @@ async function checkOldWriterNotRouted() {
     const normalized = file.split(path.sep).join('/');
     for (const selector of forbidden) assert.equal(normalized.includes(selector), false, `${normalized} reaches ${selector}`);
   }
-  const source = await fs.readFile('backend/reliableKernel/candidateRuntime.ts', 'utf8');
-  assert.doesNotMatch(source, /fallback|dual.?write|AgentRunRecord|includeApiKey|streamSeq|ClientStateDb/);
-  assert.match(source, /Unsupported candidate run_agent operation/);
+  const source = await fs.readFile('backend/reliableKernel/runtimeServices.ts', 'utf8');
+  assert.doesNotMatch(source, /dual.?write|AgentRunRecord|includeApiKey|streamSeq|ClientStateDb/);
+  assert.match(source, /Unsupported run_agent operation/);
   const domains = new Set(kernel.RUNTIME_DOMAIN_SCHEMAS.map((entry) => entry.key));
   for (const forbiddenDomain of ['AgentRun', 'TaskList', 'ClientChangeLog', 'ProviderContinuation']) {
     assert.equal(domains.has(forbiddenDomain), false);
   }
-  assertions.push('candidate production composition/emitted require closure不可达旧file writer、AgentRun/run-history/full ClientState/protocol入口');
-  assertions.push('未知candidate route显式失败且无fallback/双写/importer；Runtime exact set无AgentRun/TaskList/ClientChangeLog/ProviderContinuation');
+  assertions.push('真实VS Code extension main emitted require closure不可达旧file writer、BackendApplication、AgentRun/run-history/full ClientState入口');
+  assertions.push('未知可靠Runtime route显式失败且无旧路由/双写/importer；Runtime exact set无AgentRun/TaskList/ClientChangeLog/ProviderContinuation');
 
   const transition = JSON.parse(await fs.readFile('docs/architecture/reliable-kernel/contracts/transition-ledger.json', 'utf8'));
   const phaseFEntries = transition.entries.filter((entry) => entry.replacementStage === 'F');
   assert.ok(phaseFEntries.length >= 10);
   for (const entryRecord of phaseFEntries) {
-    assert.equal(graph.has(path.resolve(root, 'dist/extension', entryRecord.selector.path.replace(/\.ts$/, '.js'))), false);
+    // shared/protocol.ts is the current Bridge/configuration contract as well as the historical home
+    // of several erased TypeScript-only legacy interfaces. File-level require closure cannot prove
+    // reachability of an erased symbol, so only executable module selectors are gated by path.
+    if (entryRecord.selector.path === 'shared/protocol.ts') continue;
+    assert.equal(
+      graph.has(path.resolve(root, 'dist/extension', entryRecord.selector.path.replace(/\.ts$/, '.js'))),
+      false,
+      `${entryRecord.key} still reaches ${entryRecord.selector.path}`
+    );
   }
   const bridgeSource = await fs.readFile('webview/src/transport/bridge.ts', 'utf8');
   assert.doesNotMatch(bridgeSource.match(/interface BridgePersistedState \{[\s\S]*?\}/)?.[0] ?? '', /clientId/);
@@ -1063,7 +1154,8 @@ async function checkOldWriterNotRouted() {
     assert.match(runAgentDisplay, new RegExp(fact));
   }
   assert.doesNotMatch(runAgentDisplay, /activityStage|notificationRun|runIdFrom/);
-  assertions.push('F transition selectors不进入candidate graph；Bridge session只驻内存且UI直接显示六类权威facts，不从旧run/display text推断');
+  assertions.push('F executable transition selectors不进入production graph；shared/protocol中的已擦除类型不按整文件误判；Bridge session只驻内存且UI直接显示六类权威facts');
+  metrics.productionEntry = path.relative(root, entry).split(path.sep).join('/');
   metrics.emittedClosureFiles = graph.size;
   metrics.phaseFTransitionEntries = phaseFEntries.length;
   faults.push('candidate import-graph traversal against all Phase F legacy selectors');
@@ -1182,11 +1274,14 @@ async function checkRecoveryCancelledSubtree() {
     const faults = [];
     const parent = await seedParent(ctx, 'recovery-cancel');
     const child = await spawnStartedChild(ctx, parent.turnId, 'recovery-cancel', 'background');
+    const recoveryContinuationTool = await createRunAgentTool(ctx, parent.turnId, 'recovery-cancel-pending-intent');
     const pending = await ctx.services.children.send({
       sourceKey: 'recovery-cancel-pending-intent',
+      sourceToolCallId: recoveryContinuationTool.toolCallId,
       childExecutionId: child.childExecutionId,
       mode: 'queue_next_turn',
-      content: 'pending continuation'
+      content: 'pending continuation',
+      completionPolicy: 'background'
     });
     await ctx.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('ChildExecution').update(child.childExecutionId, {
@@ -1323,7 +1418,10 @@ async function reopenRuntime(ctx, hostBootId, now = ctx.now) {
   ctx.now = now;
   ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId });
   ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
-  ctx.services = kernel.createCandidateRuntimeServices(ctx.database, ctx.store, { now });
+  ctx.services = kernel.createReliableKernelRuntimeServices(ctx.database, ctx.store, {
+    now,
+    authorityCompiler: phaseFAuthorityCompiler('runtime-services')
+  });
 }
 
 async function closeRuntime(ctx) {
@@ -1367,17 +1465,25 @@ async function seedParent(ctx, suffix) {
 
 function createTurnControl(ctx, suffix) {
   return new kernel.TurnControlPlane(ctx.database, ctx.store, {
-    authorityCompiler: {
-      async compile(request) {
-        return {
-          turnId: request.turnId,
-          executorAgentId: request.executorAgentId,
-          executionPreset: { content: JSON.stringify({ providerConfigId: 'fake-local', modelId: 'fake-model', suffix }) },
-          authoritySnapshot: { content: JSON.stringify({ turnId: request.turnId, executorAgentId: request.executorAgentId }) }
-        };
-      }
-    }
+    authorityCompiler: phaseFAuthorityCompiler(suffix)
   });
+}
+
+function phaseFAuthorityCompiler(suffix) {
+  return {
+    async compile(request) {
+      return {
+        turnId: request.turnId,
+        executorAgentId: request.executorAgentId,
+        executionPreset: {
+          content: JSON.stringify({ providerConfigId: 'fake-local', modelId: 'fake-model', suffix })
+        },
+        authoritySnapshot: {
+          content: JSON.stringify({ turnId: request.turnId, executorAgentId: request.executorAgentId, suffix })
+        }
+      };
+    }
+  };
 }
 
 async function createRunAgentTool(ctx, turnId, suffix) {

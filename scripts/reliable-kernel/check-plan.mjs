@@ -76,6 +76,13 @@ function checkTrackedInputs() {
       failures.push(`正式输入未被版本库跟踪：${relative}`);
     }
   }
+  const ledger = documents['transition-ledger.json'];
+  const missingDeletionCommits = (ledger?.entries ?? [])
+    .filter((entry) => entry.deleteStage === 'G' && !(entry.deletedAtCommit ?? entry['deleted-at-commit']))
+    .map((entry) => entry.key);
+  if (ledger?.status === 'active' && missingDeletionCommits.length > 0) {
+    failures.push(`Phase G旧源码删除尚未绑定干净提交：${missingDeletionCommits.join(', ')}`);
+  }
 }
 
 function checkPackageScripts() {

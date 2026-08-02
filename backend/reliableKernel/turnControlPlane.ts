@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   ContentAddressedStore,
+  type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
@@ -11,6 +12,7 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   judgeTurnRecovery,
@@ -178,6 +180,8 @@ interface StartCommandIds {
   intent: string;
   intentRevision: string;
   presetRevision: string;
+  authorityRevision: string;
+  intentExecutorLink: string;
   turn: string;
   lease: string;
   authoritySnapshot: string;
@@ -259,6 +263,26 @@ export class TurnControlPlane {
 
   public terminal(command: TurnTerminalCommand): Promise<TurnCommandResult> {
     return this.recordTerminal(command);
+  }
+
+  /** Admits the oldest ordinary queued Intent after the prior lease is released. Child intents use their lineage control plane. */
+  public async admitNextQueued(input: {
+    conversationId: string;
+    leaseOwnerId: string;
+    hostBootId: string;
+    leaseExpiresAt: string;
+  }): Promise<TurnCommandResult | null> {
+    const conversationId = requireId(input.conversationId, 'conversationId');
+    const queued = (await listAllDomainRows(this.database, 'TurnIntent', { conversation_id: conversationId }))
+      .filter((intent) => intent.state === TURN_INTENT_STATE_QUEUED && intent.turn_id === null)
+      .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at))
+        || String(left.id).localeCompare(String(right.id)));
+    if (queued.length === 0) return null;
+    const childIntentLinks = await listAllDomainRows(this.database, 'ChildExecutionIntentLink', { state: 'pending' });
+    const childIntentIds = new Set(childIntentLinks.map((link) => String(link.turn_intent_id)));
+    const intent = queued.find((candidate) => !childIntentIds.has(String(candidate.id)));
+    if (!intent) return null;
+    return this.admitQueuedIntent(intent, input);
   }
 
   /** Finalize-only recovery for the identity.json active/no-lease orphan combination. */
@@ -399,6 +423,157 @@ export class TurnControlPlane {
     };
   }
 
+  private async admitQueuedIntent(
+    intent: DomainRow,
+    input: { conversationId: string; leaseOwnerId: string; hostBootId: string; leaseExpiresAt: string }
+  ): Promise<TurnCommandResult | null> {
+    const intentId = requireId(intent.id, 'TurnIntent.id');
+    const conversationId = requireId(intent.conversation_id, 'TurnIntent.conversation_id');
+    if (conversationId !== input.conversationId) throw new Error('Queued TurnIntent belongs to another Conversation.');
+    const [intentRevisions, presetRevisions, authorityRevisions, executorLinks] = await Promise.all([
+      this.listRows('TurnIntentRevision', { intent_id: intentId }, 2),
+      this.listRows('TurnExecutionPresetRevision', { intent_id: intentId }, 2),
+      this.listRows('TurnIntentAuthorityRevision', { intent_id: intentId }, 2),
+      this.listRows('TurnIntentExecutorLink', { intent_id: intentId }, 2)
+    ]);
+    if (intentRevisions.length !== 1 || presetRevisions.length !== 1 || authorityRevisions.length !== 1 || executorLinks.length !== 1) {
+      throw new Error(`Queued TurnIntent ${intentId} has incomplete frozen admission facts.`);
+    }
+    const intentContent = await this.readContentObject(
+      requireId(intentRevisions[0].content_object_id, 'TurnIntentRevision.content_object_id')
+    );
+    // Ensure the frozen preset still exists even though admission needs only its independent authority/executor facts.
+    await this.requireExisting('ContentObject', requireId(presetRevisions[0].preset_object_id, 'TurnExecutionPresetRevision.preset_object_id'));
+    const authorityObjectId = requireId(
+      authorityRevisions[0].authority_object_id,
+      'TurnIntentAuthorityRevision.authority_object_id'
+    );
+    await this.requireExisting('ContentObject', authorityObjectId);
+    const executorAgentId = requireId(executorLinks[0].agent_id, 'TurnIntentExecutorLink.agent_id');
+    const decoded = await this.decodeQueuedIntent(intentContent);
+    const ids = dependentStartCommandIds(intentId, decoded.messageContent !== null);
+    const admissionReceiptId = intentDependentEntityId(intentId, 'admission_command_receipt');
+    const now = this.timestamp();
+    const messageContext = decoded.messageContent
+      ? await this.contextSequence.prepareMessageAppendMutation({
+          conversationId,
+          messageRevisionId: requireId(ids.messageRevision, 'messageRevisionId'),
+          contentObjectId: decoded.messageContent.metadata.id
+        })
+      : null;
+    const steps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
+      DOMAIN_REPOSITORIES.domain('TurnIntentAuthorityRevision').assert(
+        requireId(authorityRevisions[0].id, 'TurnIntentAuthorityRevision.id'),
+        { intent_id: intentId, authority_object_id: authorityObjectId }
+      ),
+      DOMAIN_REPOSITORIES.domain('TurnIntentExecutorLink').assert(
+        requireId(executorLinks[0].id, 'TurnIntentExecutorLink.id'),
+        { intent_id: intentId, agent_id: executorAgentId }
+      ),
+      DOMAIN_REPOSITORIES.domain('Turn').insert({
+        id: ids.turn,
+        conversation_id: conversationId,
+        status: TURN_STATUS_ACTIVE,
+        created_at: now,
+        updated_at: now,
+        terminal_at: null
+      }),
+      DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+        id: admissionReceiptId,
+        source_kind: 'internal',
+        source_key: `turn-intent-admit:${intentId}`,
+        conversation_id: conversationId,
+        turn_id: ids.turn,
+        created_at: now
+      }),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').insert({
+        id: ids.lease,
+        conversation_id: conversationId,
+        turn_id: ids.turn,
+        owner_id: requireText(input.leaseOwnerId, 'leaseOwnerId'),
+        host_boot_id: requireText(input.hostBootId, 'hostBootId'),
+        acquired_at: now,
+        expires_at: requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt')
+      }),
+      DOMAIN_REPOSITORIES.domain('TurnIntent').update(intentId, {
+        turn_id: ids.turn,
+        state: TURN_INTENT_STATE_ADMITTED,
+        updated_at: now
+      }),
+      DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
+        id: ids.authoritySnapshot,
+        turn_id: ids.turn,
+        content_object_id: authorityObjectId,
+        created_at: now
+      }),
+      DOMAIN_REPOSITORIES.domain('TurnExecutorLink').insert({
+        id: ids.executorLink,
+        turn_id: ids.turn,
+        agent_id: executorAgentId,
+        created_at: now
+      }),
+      ...(decoded.messageContent ? messageAdmissionSteps(
+        { receipt: admissionReceiptId, intent: intentId, ...ids },
+        decoded.messageContent,
+        conversationId,
+        now
+      ) : []),
+      ...(messageContext?.steps ?? []),
+      DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+    ];
+    try {
+      const commit = await this.database.transaction(steps);
+      return {
+        receiptId: admissionReceiptId,
+        deduplicated: false,
+        commitSeq: commit.commitSeq,
+        conversationId,
+        intentId,
+        admitted: true,
+        turnId: ids.turn,
+        ...(decoded.messageContent ? {
+          messageId: ids.message,
+          messageRevisionId: ids.messageRevision,
+          messageRevisionSeq: allocatedRuntimeValue(
+            commit.allocatedSequences,
+            'MessageRevision',
+            requireId(ids.messageRevision, 'messageRevisionId'),
+            'revision_seq'
+          )
+        } : {})
+      };
+    } catch (error) {
+      if (isTransactionAssertionError(error) || isLeaseAdmissionConflict(error)) return null;
+      throw error;
+    }
+  }
+
+  private async decodeQueuedIntent(intentContent: ContentObjectMetadata): Promise<{
+    operation: 'input' | 'retry' | 'continuation';
+    messageContent: PreparedContentObject | null;
+  }> {
+    if (intentContent.content_type !== CONTENT_TYPE_INTENT) {
+      return { operation: 'input', messageContent: { metadata: intentContent } };
+    }
+    const value = JSON.parse((await this.contentStore.read(intentContent)).toString('utf8')) as Record<string, unknown>;
+    if (value.kind === 'retry') return { operation: 'retry', messageContent: null };
+    if (value.kind !== 'continuation') throw new Error('Queued TurnIntent has an unsupported intent envelope.');
+    const objectId = requireId(value.messageContentObjectId, 'TurnIntent continuation.messageContentObjectId');
+    return { operation: 'continuation', messageContent: { metadata: await this.readContentObject(objectId) } };
+  }
+
+  private async readContentObject(id: string): Promise<ContentObjectMetadata> {
+    return await this.requireExisting('ContentObject', id) as ContentObjectMetadata;
+  }
+
+  private async listRows(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {
+    const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({ where, limit })]);
+    const rows = snapshot.snapshot[0];
+    if (!Array.isArray(rows)) throw new TypeError(`${domain} list did not return rows.`);
+    return rows;
+  }
+
   private async startIntent(plan: StartIntentPlan): Promise<TurnCommandResult> {
     const command = normalizeExecutionCommand(plan.command, plan.operation);
     const source = normalizeInitiatingSource(command.source, plan.operation);
@@ -416,7 +591,7 @@ export class TurnControlPlane {
       }
     }
     const defaultAgent = await this.getDefaultAgent(conversation.id as string);
-    const compiled = normalizeCompiledAuthority(await this.authorityCompiler.compile({
+    const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
       conversationId: conversation.id as string,
       turnId: ids.turn,
       executorAgentId: defaultAgent.agent_id as string,
@@ -480,7 +655,6 @@ export class TurnControlPlane {
         acquired_at: now,
         expires_at: command.leaseExpiresAt
       }),
-      ...preparedContentObjectSteps([authorityContent], 'authority'),
       DOMAIN_REPOSITORIES.domain('TurnIntent').update(ids.intent, {
         turn_id: ids.turn,
         state: TURN_INTENT_STATE_ADMITTED,
@@ -513,6 +687,7 @@ export class TurnControlPlane {
         ...preparedContentObjectSteps([
           intentContent,
           presetContent,
+          authorityContent,
           ...(messageContent ? [messageContent] : [])
         ], 'intent_content'),
         DOMAIN_REPOSITORIES.domain('TurnIntent').insert({
@@ -535,6 +710,19 @@ export class TurnControlPlane {
           intent_id: ids.intent,
           revision_seq: '1',
           preset_object_id: presetContent.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnIntentAuthorityRevision').insert({
+          id: ids.authorityRevision,
+          intent_id: ids.intent,
+          revision_seq: '1',
+          authority_object_id: authorityContent.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnIntentExecutorLink').insert({
+          id: ids.intentExecutorLink,
+          intent_id: ids.intent,
+          agent_id: compiled.executorAgentId,
           created_at: now
         }),
         DOMAIN_REPOSITORIES.domain('Conversation').update(conversation.id as string, { updated_at: now }),
@@ -1088,12 +1276,18 @@ function startCommandIds(
   hasMessage: boolean,
   commandScope: string
 ): StartCommandIds {
-  const id = (kind: string) => commandEntityId(source, operation, kind, commandScope);
+  const receipt = commandEntityId(source, operation, 'command_receipt', commandScope);
+  const intent = commandEntityId(source, operation, 'turn_intent', commandScope);
+  return { receipt, intent, ...dependentStartCommandIds(intent, hasMessage) };
+}
+
+function dependentStartCommandIds(intentId: string, hasMessage: boolean): Omit<StartCommandIds, 'receipt' | 'intent'> {
+  const id = (kind: string) => intentDependentEntityId(intentId, kind);
   return {
-    receipt: id('command_receipt'),
-    intent: id('turn_intent'),
     intentRevision: id('turn_intent_revision'),
     presetRevision: id('turn_preset_revision'),
+    authorityRevision: id('turn_intent_authority_revision'),
+    intentExecutorLink: id('turn_intent_executor_link'),
     turn: id('turn'),
     lease: id('execution_lease'),
     authoritySnapshot: id('authority_snapshot'),
@@ -1106,6 +1300,17 @@ function startCommandIds(
       messageTurnLink: id('message_turn_link')
     } : {})
   };
+}
+
+function intentDependentEntityId(intentId: string, kind: string): string {
+  const normalizedKind = requireText(kind, 'intent dependent kind').toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+  const digest = createHash('sha256')
+    .update('limcode-turn-intent-dependent\0')
+    .update(requireId(intentId, 'intentId'))
+    .update('\0')
+    .update(normalizedKind)
+    .digest('hex');
+  return `${normalizedKind}_${digest}`;
 }
 
 function messageAdmissionSteps(
@@ -1167,7 +1372,7 @@ function normalizeExecutionCommand(
   };
 }
 
-function normalizeCompiledAuthority(
+export function normalizeCompiledTurnAuthority(
   compiled: CompiledTurnAuthority,
   expectedTurnId: string,
   expectedExecutorAgentId: string
@@ -1249,7 +1454,16 @@ function allocatedValue(
   id: string,
   column: string
 ): string {
-  const allocated = commit.allocatedSequences.find((entry) =>
+  return allocatedRuntimeValue(commit.allocatedSequences, domain, id, column);
+}
+
+function allocatedRuntimeValue(
+  allocatedSequences: ReadonlyArray<{ domain: string; id: string; column: string; value: string }>,
+  domain: string,
+  id: string,
+  column: string
+): string {
+  const allocated = allocatedSequences.find((entry) =>
     entry.domain === domain && entry.id === id && entry.column === column
   );
   if (!allocated) throw new Error(`${domain} ${id} did not return writer-allocated ${column}.`);
@@ -1337,6 +1551,12 @@ function requireContentType(value: unknown): string {
   return requireText(value, 'content type');
 }
 
+function requireTimestamp(value: unknown, label: string): string {
+  const text = requireText(value, label);
+  if (!Number.isFinite(Date.parse(text))) throw new TypeError(`${label} must be an ISO timestamp.`);
+  return text;
+}
+
 function requireBigInt(value: unknown, label: string): bigint {
   if (typeof value !== 'bigint') throw new TypeError(`${label} must remain bigint inside JavaScript.`);
   return value;
@@ -1351,4 +1571,10 @@ function requireDecimalIntegerString(value: unknown, label: string): string {
 
 function isTransactionAssertionError(error: unknown): boolean {
   return (error as { code?: unknown })?.code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+}
+
+function isLeaseAdmissionConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('UNIQUE constraint failed: execution_lease.conversation_id')
+    || message.includes('UNIQUE constraint failed: execution_lease.turn_id');
 }

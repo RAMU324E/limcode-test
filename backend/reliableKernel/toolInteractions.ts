@@ -114,6 +114,12 @@ export class ToolInteractionControlPlane {
           turn_id: facts.turn.id,
           created_at: now
         }),
+        DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').insert({
+          id: stablePhaseDId('interaction_tool_call_link', requestId),
+          request_id: requestId,
+          tool_call_id: toolCallId,
+          created_at: now
+        }),
         DOMAIN_REPOSITORIES.domain('ToolCall').update(toolCallId, { status: 'waiting_answer', updated_at: now }),
         DOMAIN_REPOSITORIES.domain('ToolExecution').update(facts.execution.id as string, {
           status: 'waiting_answer',

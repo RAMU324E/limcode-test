@@ -1,7 +1,7 @@
 import { DELETE_TOOL_NAME } from '../../../../../../shared/protocol';
 import type { FsDeletePathResult } from '../../../../../capabilities/types';
 import type { ToolDefinition } from '../../registry';
-import { staticToolScheduling } from '../../scheduling';
+import { staticToolScheduling } from '../../schedulingContract';
 import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, allowOutsideProjectPathsFromConfig } from '../filePathPolicy';
 import { defineToolDefinitionModule } from '../types';
 

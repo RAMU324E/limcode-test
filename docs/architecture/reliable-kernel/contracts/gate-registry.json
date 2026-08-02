@@ -431,7 +431,11 @@
     "validatorArguments": [
       "--stage=<gate-id>",
       "--commit=<current-commit>",
-      "--artifact=<path> when required"
+      "--artifact=<path> when required",
+      "--installed-root=<installed extension root> for installed main/smoke checks",
+      "--installed-data-root=<extension globalStorage root> for installed smoke checks",
+      "--smoke-workspace-root=<isolated workspace root> for installed smoke checks",
+      "--smoke-receipt=<secret-free installed smoke receipt> for installed smoke checks"
     ],
     "result": "exit-code-and-plain-diagnostics",
     "rule": "正式出口要求干净工作区并直接运行已被Git跟踪的校验器；测试和基准只从被忽略的根目录/tests读取。"

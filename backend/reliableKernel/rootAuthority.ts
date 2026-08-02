@@ -46,6 +46,11 @@ export class RootAuthority {
     return createRuntimeRootPaths(this.getDataRootPath());
   }
 
+  /** Reads the active pointer without requiring the referenced root/epoch to remain online. */
+  public async readPointer(): Promise<RootBinding | undefined> {
+    return readBindingFile(this.expectedPaths().rootPointerPath);
+  }
+
   public async current(): Promise<RootBinding> {
     const expected = this.expectedPaths();
     if (await exists(expected.rootPendingPath)) {
@@ -74,6 +79,19 @@ export class RootAuthority {
 
   public async withValidatedBinding<T>(binding: RootBinding, operation: (current: RootBinding) => Promise<T>): Promise<T> {
     return operation(await this.validate(binding));
+  }
+
+  /**
+   * Activates a fresh root during an explicit offline cutover. The old pointer remains authoritative
+   * until the pending root, database, CAS and epoch are all durable and the final rename commits.
+   */
+  public async activateCutoverRoot(initializer: RuntimeRootInitializer): Promise<RootBinding> {
+    const paths = this.expectedPaths();
+    if (await exists(paths.rootPendingPath)) {
+      throw new RootAuthorityError('root-binding-pending', `Cannot cut over while pending exists: ${paths.rootPendingPath}`);
+    }
+    const previous = await readBindingFile(paths.rootPointerPath);
+    return this.activateOffline(paths, previous, initializer);
   }
 
   /** Initializes the selected root when no active pointer exists. No legacy data is inspected. */

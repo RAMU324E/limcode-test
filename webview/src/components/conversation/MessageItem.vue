@@ -15,16 +15,10 @@ import {
   IconRefresh,
   IconTrash
 } from '@tabler/icons-vue';
-import { isVisibleTextPart, type CheckpointRecord, type LlmUsageMetadataRecord, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
-import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
+import { isVisibleTextPart, type LlmUsageMetadataRecord, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
 import RichContentView from '@webview/components/content/RichContentView.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
-import { useCheckpointPolicyStore } from '@webview/stores/useCheckpointPolicyStore';
-import type { CheckpointRestoreSaga } from '@webview/stores/useConversationCommandStore';
-import type { LlmErrorBlockRecord } from '@webview/stores/useConversationUiStore';
-import LlmErrorBlock from './LlmErrorBlock.vue';
-import { rollbackConfirmActionTitle } from './checkpointRollback';
 import { normalizeTokenUsage } from './tokenUsageModel';
 
 const props = withDefaults(
@@ -36,27 +30,23 @@ const props = withDefaults(
     runDetailLoading?: boolean;
     deleteCount?: number;
     floorNumber?: number;
-    rollbackCheckpoint?: CheckpointRecord;
     compactCount?: number;
     deleting?: boolean;
     entering?: boolean;
     editingHighlighted?: boolean;
     mutationPending?: boolean;
     pendingLabel?: string;
-    errorBlocks?: LlmErrorBlockRecord[];
   }>(),
-  { runId: undefined, termination: undefined, runHadCompletedTools: false, runDetailLoading: false, deleteCount: 1, floorNumber: 0, rollbackCheckpoint: undefined, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, mutationPending: false, pendingLabel: '正在提交操作', errorBlocks: () => [] }
+  { runId: undefined, termination: undefined, runHadCompletedTools: false, runDetailLoading: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, mutationPending: false, pendingLabel: '正在提交操作' }
 );
 
 const emit = defineEmits<{
   (event: 'edit-message', message: MessageRecord): void;
-  (event: 'retry-from', message: MessageRecord, saga?: CheckpointRestoreSaga): void;
-  (event: 'delete-from', message: MessageRecord, saga?: CheckpointRestoreSaga): void;
+  (event: 'retry-from', message: MessageRecord): void;
+  (event: 'delete-from', message: MessageRecord): void;
   (event: 'compact-to', message: MessageRecord): void;
   (event: 'fork-from', message: MessageRecord): void;
   (event: 'view-run-detail', message: MessageRecord): void;
-  (event: 'close-error-block', id: string): void;
-  (event: 'cancel-error-retry', block: LlmErrorBlockRecord): void;
 }>();
 
 const roleLabel = computed(() => {
@@ -106,14 +96,12 @@ interface TokenUsageItem {
 const hasOwn = Object.prototype.hasOwnProperty;
 const LOCAL_DAY_MS = 86_400_000;
 const streaming = computed(() => props.message.status === 'streaming');
-const checkpointStore = useCheckpointPolicyStore();
 const copied = ref(false);
 const terminatedContentExpanded = ref(false);
 const confirmRetryOpen = ref(false);
 const confirmDeleteOpen = ref(false);
 const confirmCompactOpen = ref(false);
 const confirmForkOpen = ref(false);
-const rollbackPending = ref(false);
 const deleteDescriptionHtml = computed(
   () => `将删除这条消息以及它之后的所有共 ${props.deleteCount} 条消息，此操作<strong>无法撤销</strong>。`
 );
@@ -242,29 +230,14 @@ function createTokenUsageItem(key: TokenUsageKind, label: string, value: number 
 
 let copiedResetTimer: number | undefined;
 
-const rollbackConfirmAction = computed<ConfirmPanelAction>(() => ({
-  key: 'rollback-confirm',
-  label: rollbackPending.value ? '正在回档...' : '回档并确认',
-  variant: rollbackPending.value || !props.rollbackCheckpoint ? 'secondary' : 'default',
-  disabled: rollbackPending.value || !props.rollbackCheckpoint,
-  title: rollbackConfirmActionTitle(props.rollbackCheckpoint)
-}));
-const deleteConfirmActions = computed<ConfirmPanelAction[]>(() => {
-  const actions: ConfirmPanelAction[] = [
-    { key: 'cancel', label: '取消', variant: 'secondary', disabled: rollbackPending.value }
-  ];
-  if (CHECKPOINT_FEATURE_ENABLED && (props.rollbackCheckpoint || rollbackPending.value)) actions.push(rollbackConfirmAction.value);
-  actions.push({ key: 'confirm', label: '删除', disabled: rollbackPending.value });
-  return actions;
-});
-const retryConfirmActions = computed<ConfirmPanelAction[]>(() => {
-  const actions: ConfirmPanelAction[] = [
-    { key: 'cancel', label: '取消', variant: 'secondary', disabled: rollbackPending.value }
-  ];
-  if (CHECKPOINT_FEATURE_ENABLED && (props.rollbackCheckpoint || rollbackPending.value)) actions.push(rollbackConfirmAction.value);
-  actions.push({ key: 'confirm', label: '确认', disabled: rollbackPending.value });
-  return actions;
-});
+const deleteConfirmActions: ConfirmPanelAction[] = [
+  { key: 'cancel', label: '取消', variant: 'secondary' },
+  { key: 'confirm', label: '删除' }
+];
+const retryConfirmActions: ConfirmPanelAction[] = [
+  { key: 'cancel', label: '取消', variant: 'secondary' },
+  { key: 'confirm', label: '确认' }
+];
 
 onBeforeUnmount(() => {
   if (copiedResetTimer !== undefined) window.clearTimeout(copiedResetTimer);
@@ -616,14 +589,6 @@ async function copyMessage(): Promise<void> {
   }, 1400);
 }
 
-function closeErrorBlock(id: string): void {
-  emit('close-error-block', id);
-}
-
-function cancelErrorRetry(block: LlmErrorBlockRecord): void {
-  emit('cancel-error-retry', block);
-}
-
 
 async function writeClipboard(text: string): Promise<boolean> {
   if (navigator.clipboard?.writeText) {
@@ -687,49 +652,18 @@ function cancelRetry(): void {
   confirmRetryOpen.value = false;
 }
 
-async function restoreBeforeConfirm(): Promise<CheckpointRestoreSaga | undefined> {
-  if (!props.rollbackCheckpoint || rollbackPending.value) return undefined;
-  rollbackPending.value = true;
-  try {
-    const checkpoint = props.rollbackCheckpoint;
-    const result = await checkpointStore.restoreCheckpoint(checkpoint);
-    if (result.status !== 'restored') return undefined;
-    checkpointStore.dismissCheckpoint(checkpoint.id, checkpoint.conversationId);
-    return {
-      kind: 'checkpoint_restore_then_command',
-      checkpointId: checkpoint.id,
-      restoredAt: Date.now(),
-      message: result.message,
-      ...(result.restoredFileCount !== undefined ? { restoredFileCount: result.restoredFileCount } : {}),
-      ...(result.removedFileCount !== undefined ? { removedFileCount: result.removedFileCount } : {})
-    };
-  } finally {
-    rollbackPending.value = false;
-  }
-}
-
-function confirmRetry(saga?: CheckpointRestoreSaga): void {
-  emit('retry-from', props.message, saga);
+function confirmRetry(): void {
+  emit('retry-from', props.message);
   confirmRetryOpen.value = false;
-}
-
-async function rollbackAndConfirmRetry(): Promise<void> {
-  const saga = await restoreBeforeConfirm();
-  if (saga) confirmRetry(saga);
 }
 
 function cancelDelete(): void {
   confirmDeleteOpen.value = false;
 }
 
-function confirmDelete(saga?: CheckpointRestoreSaga): void {
-  emit('delete-from', props.message, saga);
+function confirmDelete(): void {
+  emit('delete-from', props.message);
   confirmDeleteOpen.value = false;
-}
-
-async function rollbackAndConfirmDelete(): Promise<void> {
-  const saga = await restoreBeforeConfirm();
-  if (saga) confirmDelete(saga);
 }
 
 function cancelCompact(): void {
@@ -752,13 +686,11 @@ function confirmFork(): void {
 
 function onDeleteConfirmAction(action: ConfirmPanelAction): void {
   if (action.key === 'cancel') cancelDelete();
-  if (action.key === 'rollback-confirm') void rollbackAndConfirmDelete();
   if (action.key === 'confirm') confirmDelete();
 }
 
 function onRetryConfirmAction(action: ConfirmPanelAction): void {
   if (action.key === 'cancel') cancelRetry();
-  if (action.key === 'rollback-confirm') void rollbackAndConfirmRetry();
   if (action.key === 'confirm') confirmRetry();
 }
 </script>
@@ -804,13 +736,6 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
             :markdown="message.role !== 'user'"
             :streaming="streaming"
             :message-id="message.id"
-          />
-          <LlmErrorBlock
-            v-for="block in errorBlocks"
-            :key="block.id"
-            :block="block"
-            @close="closeErrorBlock"
-            @cancel-retry="cancelErrorRetry"
           />
         </div>
         <footer v-if="messageFooterVisible" class="message-footer">

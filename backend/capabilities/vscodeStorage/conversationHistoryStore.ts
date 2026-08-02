@@ -13,7 +13,7 @@ import {
 } from '../../../shared/conversationHistoryTree';
 import { INDEX_FILE, STORAGE_VERSION } from './constants';
 import { readJson, writeJson } from './json';
-import type { StoragePaths } from './clientStateStore';
+import type { StoragePaths } from './paths';
 import { withRecordStoreTransaction } from './recordStore';
 
 const DEFAULT_PAGE_SIZE = 50;

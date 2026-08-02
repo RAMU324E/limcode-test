@@ -139,26 +139,3 @@ export interface LlmCompactErrorPayload {
   retryMaxAttempts?: number;
   completedAt: number;
 }
-
-declare module '@backend/world/events' {
-  interface WorldEventPayloadMap {
-    'llm:invocationResolved': LlmInvocationResolvedPayload;
-    'llm:invocationResolveError': LlmInvocationResolveErrorPayload;
-    'llm:started': LlmStartedPayload;
-    'llm:delta': LlmDeltaPayload;
-    'llm:thoughtDelta': LlmThoughtDeltaPayload;
-    'llm:thoughtProgress': LlmThoughtProgressPayload;
-    'llm:thoughtDone': LlmThoughtDonePayload;
-    'llm:toolCallDelta': LlmToolCallDeltaPayload;
-    'llm:toolCallPreviewDone': LlmToolCallPreviewDonePayload;
-    'llm:toolcall': LlmToolCallPayload;
-    'llm:done': LlmDonePayload;
-    'llm:error': LlmErrorPayload;
-    'llm:retryScheduled': LlmRetryPayload;
-    'llm:retryStarted': LlmRetryPayload;
-    'llm:retryCancelled': LlmRetryPayload;
-    'llm:retryRecovered': LlmRetryPayload;
-    'llm:compactDone': LlmCompactDonePayload;
-    'llm:compactError': LlmCompactErrorPayload;
-  }
-}
