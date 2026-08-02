@@ -189,7 +189,7 @@
         },
         {
           "id": "candidate.process-output-bounds",
-          "description": "ProcessOutputChunk 正文与 metadata 均按每进程硬上限收敛。",
+          "description": "ProcessOutputChunk正文完整保留；metadata按keyset和事务wire bytes分批收敛，mode=output以handle分页遍历。",
           "ownerStage": "D",
           "contractRef": "tool.json#processOutput"
         },
@@ -201,7 +201,7 @@
         },
         {
           "id": "candidate.subagent-cancel-subtree",
-          "description": "cancel_subtree 沿稳定 lineage 终止且不误伤其他子树。",
+          "description": "interrupt_subtree 沿稳定 lineage 终止且不误伤其他子树。",
           "ownerStage": "F",
           "contractRef": "subagent.json#cancel"
         },
@@ -266,10 +266,10 @@
           "contractRef": "recovery.foreground-answer-wait-expired"
         },
         {
-          "id": "candidate.recovery.cancelled-subtree-incomplete",
-          "description": "重启后续扫未完成 cancel_subtree。",
+          "id": "candidate.recovery.interrupted-subtree-incomplete",
+          "description": "重启后续扫未完成 interrupt_subtree。",
           "ownerStage": "F",
-          "contractRef": "recovery.cancelled-subtree-incomplete"
+          "contractRef": "recovery.interrupted-subtree-incomplete"
         },
         {
           "id": "candidate.parent-handling-matrix",

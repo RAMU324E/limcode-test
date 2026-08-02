@@ -187,7 +187,10 @@ async function checkSchemaRepositories() {
   return withRuntime('schema', async ({ authority, binding, database }) => {
     const inspection = await database.inspect();
     assert.equal(inspection.tables.length, domainCount + 2);
-    assert.deepEqual(inspection.triggers, ['delete_interaction_request_with_turn']);
+    assert.deepEqual(inspection.triggers, [
+      'delete_interaction_request_with_turn',
+      'prevent_runtime_delivery_after_final_output_fence'
+    ]);
     assert.equal(inspection.manifestDomainCount, domainCount);
     assert.equal(inspection.indexes.length, expected.reduce((count, entry) => count + entry.indexes.length, 0));
     assert.equal(inspection.foreignKeys, 1n);
@@ -240,12 +243,16 @@ async function checkSchemaRepositories() {
       database.transaction([deliveries.insert(delivery('delivery-null-duplicate', null, 1n, now))]),
       /UNIQUE|constraint/i
     );
-    await database.transaction([deliveries.insert(delivery('delivery-turn-1', 'turn-soft', 1n, now))]);
     await assert.rejects(
-      database.transaction([deliveries.insert(delivery('delivery-turn-duplicate', 'turn-soft', 1n, now))]),
+      database.transaction([deliveries.insert(delivery('delivery-turn-same-attempt', 'turn-soft', 1n, now))]),
       /UNIQUE|constraint/i
     );
-    await database.transaction([deliveries.insert(delivery('delivery-null-attempt-2', null, 2n, now))]);
+    await database.transaction([deliveries.insert(delivery('delivery-turn-attempt-2', 'turn-soft', 2n, now))]);
+    await assert.rejects(
+      database.transaction([deliveries.insert(delivery('delivery-turn-attempt-2-duplicate', 'turn-soft', 2n, now))]),
+      /UNIQUE|constraint/i
+    );
+    await database.transaction([deliveries.insert(delivery('delivery-null-attempt-3', null, 3n, now))]);
     await assert.rejects(database.transaction([attempts.insert({
       id: 'attempt-missing-parent', operation_id: 'missing-operation', attempt_seq: 1n,
       status: 'pending', created_at: now, updated_at: now
@@ -273,7 +280,7 @@ async function checkSchemaRepositories() {
       'Operation:upsert:operation-schema',
       'Conversation:remove:conv-schema'
     ]) assert.ok(changed.has(expectedChange), `缺少隐式SQLite变化：${expectedChange}`);
-    return `${domainCount}域/${domainCount + 2}表 exact set、独立Repository/Codec、FK/级联删除及其changes、普通与NULL部分UNIQUE索引均真实生效`;
+    return `${domainCount}域/${domainCount + 2}表 exact set、独立Repository/Codec、FK/级联删除及其changes、自动投递全局attempt UNIQUE索引均真实生效`;
   });
 }
 

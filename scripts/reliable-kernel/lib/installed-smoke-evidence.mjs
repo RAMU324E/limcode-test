@@ -8,7 +8,7 @@ export const INSTALLED_SMOKE_RECEIPT_REVISION = '2026-08-02';
 
 const REQUIRED_RECOVERY_IDS = [
   'recovery.answer-inbox-invariant',
-  'recovery.cancelled-subtree-incomplete',
+  'recovery.interrupted-subtree-incomplete',
   'recovery.delivery-pending',
   'recovery.effect-intent-hanging',
   'recovery.file-change-unresolved',
@@ -168,7 +168,7 @@ function checkChildCancel(evidence) {
   const controlId = requireId(receipt.facts.controlChildExecutionId, 'controlChildExecutionId');
   if (cancelledId === controlId) throw new Error('取消目标与控制ChildExecution相同');
   const cancelled = one(database, 'select status from child_execution where id=?', [cancelledId], 'cancelled ChildExecution');
-  requireEqual(cancelled.status, 'cancel_subtree_requested', 'cancelled ChildExecution.status');
+  requireEqual(cancelled.status, 'interrupting', 'cancelled ChildExecution.status');
   if (scalar(database, 'select count(*) from child_execution_active_turn_link where child_execution_id=?', [cancelledId]) !== 0) throw new Error('取消目标仍有ActiveTurnLink');
   const cancelledTurn = one(database, `select t.id,t.status,termination.terminal_status from child_execution_turn_link link join turn t on t.id=link.turn_id left join turn_termination termination on termination.turn_id=t.id where link.child_execution_id=? order by link.turn_seq desc limit 1`, [cancelledId], 'cancelled child Turn');
   requireEqual(cancelledTurn.status, 'terminated', 'cancelled child Turn.status');
@@ -280,9 +280,16 @@ function assertRecoverySet(events, label) {
 
 function assertMarkerInSpool(dataRoot, processId, markerInput) {
   const marker = requireMarker(markerInput, `${processId} output marker`);
-  const spool = path.join(dataRoot, '.limcode-runtime', 'active', 'process-spool', processId);
-  const chunks = fs.readdirSync(spool).filter((name) => /-(?:stdout|stderr)\.bin$/.test(name)).sort();
-  const bytes = Buffer.concat(chunks.map((name) => fs.readFileSync(path.join(spool, name))));
+  const chunksRoot = path.join(
+    dataRoot,
+    '.limcode-runtime',
+    'active',
+    'process-spool',
+    processId,
+    'chunks'
+  );
+  const chunks = fs.readdirSync(chunksRoot).filter((name) => /-(?:stdout|stderr)\.bin$/.test(name)).sort();
+  const bytes = Buffer.concat(chunks.map((name) => fs.readFileSync(path.join(chunksRoot, name))));
   const count = bytes.toString('utf8').split(marker).length - 1;
   if (count !== 1) throw new Error(`进程输出marker ${marker}出现${count}次，而不是1次`);
 }

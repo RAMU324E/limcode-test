@@ -34,7 +34,13 @@ export type SidebarToExtensionMessage =
   | { type: typeof SIDEBAR_MESSAGE.historyPageGet; scopeKind: SidebarHistoryScopeKind; projectFolderUri?: string; cursor?: string; limit?: number }
   | { type: typeof SIDEBAR_MESSAGE.renameConversation; conversationId: string; title: string }
   | { type: typeof SIDEBAR_MESSAGE.deleteConversation; conversationId: string }
-  | { type: typeof SIDEBAR_MESSAGE.abortConversation; conversationId: string; requestId: string };
+  | {
+      type: typeof SIDEBAR_MESSAGE.abortConversation;
+      conversationId: string;
+      requestId: string;
+      turnId: string;
+      leaseGeneration: string;
+    };
 
 export type ExtensionToSidebarMessage =
   | {

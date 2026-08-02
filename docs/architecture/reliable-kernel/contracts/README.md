@@ -11,7 +11,7 @@
 - `tool.json`：Tool/Effect、六个 recovery ID、detached process wrapper/output bounds、MCP Effect；
 - `file.json`：FileChangeSet、approval、actual mutation 与 receipt；
 - `context.json`：source-occurrence Context DAG、HeadLink、compression replacement、Provider `disabled-full-request`；
-- `subagent.json`：ChildExecution lineage、required cancel_subtree、Answer/Delivery/InputLink；
+- `subagent.json`：ChildExecution lineage、required interrupt_subtree、Answer/Delivery/InputLink；
 - `client-feed.json`：bounded snapshot/changes/queue、commitSeq barrier、pagination；
 - `migration.json`：71 个 registered roots、files/settings/external inputs 的 physical manifest 与 cutover actor；
 - `gate-registry.json`：三个出口、四组 validator、stable atomic check IDs；
@@ -26,7 +26,7 @@
 - RuntimeDelivery 使用 NULL/非 NULL partial UNIQUE、attempt_seq/redelivery 与 RuntimeDeliveryInputLink.handled_at；
 - ChildExecution Parent/Turn/Intent/ActiveTurn Links 分离；
 - CommandReceipt 使用 `(source_kind, source_key)`；
-- cancel_subtree 首发必选；
+- interrupt_subtree 首发必选；
 - ProviderContinuation 首发禁用且不建表；
 - process 使用 detached wrapper，不凭 PID 猜终态；
 - MCP call 使用 `mcp_tool_call` Effect；

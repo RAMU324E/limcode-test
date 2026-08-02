@@ -8,6 +8,16 @@
   "dualWrite": false,
   "fallbackToLegacyRuntime": false,
   "runtimeProtocolNegotiation": false,
+  "boundedEpochUpgrade": {
+    "fromEpoch": 2,
+    "toEpoch": 3,
+    "mode": "offline-startup-exact-predecessor-only",
+    "sourcePolicy": "exact-table-index-trigger-manifest-and-binding-fingerprint",
+    "backupPolicy": "sqlite-backup-api-plus-root-binding-and-epoch-manifest",
+    "recoveryPolicy": "durable-journal-forward-only",
+    "unknownDriftPolicy": "fail-before-pending-pointer",
+    "compatibilityFallback": false
+  },
   "candidateRoot": {
     "isolated": true,
     "mayReadLegacyRuntime": false,
@@ -2093,12 +2103,12 @@
       "atomic-rename-pointer",
       "delete-pending"
     ],
-    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；普通启动发现 pending 或缺少 epoch 时拒绝打开 Runtime。"
+    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；精确 epoch-2 predecessor 可在数据库打开前按 boundedEpochUpgrade 离线升级并向前恢复；其他 pending、缺少 epoch 或未知漂移拒绝打开 Runtime。"
   },
   "epochPolicy": {
-    "current": "runtimeKernelEpoch bump = 运行数据归档重置（对话历史丢失）",
-    "status": "已接受的永久策略",
-    "roadmapNote": "后续可考虑引入最小迁移机制"
+    "current": "只允许一次精确 epoch 2→3 离线升级；其他 runtimeKernelEpoch 不兼容数据仍归档重置",
+    "status": "单一当前 schema，不做协议协商或长期 migration chain",
+    "roadmapNote": "新增 epoch 必须另行决策，不能自动沿用本次升级器"
   },
   "failureRule": "激活前失败保持旧 active pointer 且旧数据可恢复；激活后失败只修复新内核，不自动回退旧写入器。",
   "rootChange": "最终 VSIX 的新宿主在数据库打开前完成 cutover-only coordinator 与 RootBinding 原子激活。"

@@ -606,17 +606,29 @@ function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
 }
 
 const RESTRICTED_UPDATE_COLUMNS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['ExecutionLease', new Set(['owner_id', 'host_boot_id', 'generation', 'acquired_at', 'expires_at'])],
   ['ModelRequest', new Set(['status', 'terminal_state', 'usage_json', 'stream_stats_json', 'updated_at'])],
   ['CompressionBlock', new Set(['status', 'updated_at'])],
   ['Operation', new Set(['status', 'updated_at'])],
   ['Attempt', new Set(['status', 'updated_at', 'completed_at'])],
+  // request_object_id may change exactly once with pending -> dispatched to wrap the immutable
+  // capability request in its durable dispatch lease fence.
+  ['EffectIntent', new Set(['dispatch_state', 'request_object_id', 'updated_at'])],
   ['ChildExecution', new Set(['status', 'updated_at'])],
   ['ChildExecutionIntentLink', new Set(['state', 'updated_at'])],
   ['ChildExecutionActiveTurnLink', new Set(['turn_id', 'updated_at'])],
   ['AnswerBridge', new Set(['current_submission_id', 'status', 'updated_at'])],
   ['RuntimeInboxItem', new Set(['state', 'updated_at'])],
   ['RuntimeDelivery', new Set(['target_turn_id', 'phase', 'state', 'failure_reason', 'updated_at'])],
-  ['RuntimeDeliveryInputLink', new Set(['handled_at', 'updated_at'])]
+  ['RuntimeDeliveryInputLink', new Set(['handled_at', 'updated_at'])],
+  ['ProcessCompletionDispatch', new Set([
+    'state', 'claim_owner_host_boot_id', 'claim_generation', 'claim_expires_at', 'attempt_count',
+    'failure_count', 'next_attempt_at', 'last_error', 'completed_at', 'updated_at'
+  ])],
+  ['RuntimeDeliveryWake', new Set([
+    'state', 'claim_owner_host_boot_id', 'claim_generation', 'claim_expires_at', 'attempt_count',
+    'failure_count', 'next_attempt_at', 'last_error', 'acknowledged_at', 'updated_at'
+  ])]
 ]);
 
 export function assertRuntimeDomainUpdatePatch(domain: string, patch: DomainRow): void {

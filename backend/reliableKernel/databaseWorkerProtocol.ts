@@ -11,6 +11,16 @@ import type { DatabaseFoundationInspection } from './databaseSchema';
 export const MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT = 33;
 export const MODEL_STREAM_TERMINAL_TAIL = 32;
 
+/** Structured-clone-safe immutable execution token supplied by the Extension Host. */
+export interface ExecutionLeaseFencePayload {
+  id: string;
+  conversationId: string;
+  turnId: string;
+  ownerId: string;
+  hostBootId: string;
+  generation: bigint;
+}
+
 export interface ContextMaterializationRecord {
   node: DomainRow;
   segment: DomainRow;
@@ -46,6 +56,7 @@ export interface ModelStreamEventCommitInput {
   usage: unknown | null;
   terminalStats: DomainRow | null;
   now: string;
+  executionFence?: ExecutionLeaseFencePayload;
 }
 
 export interface ModelStreamEventCommitResult {
@@ -60,6 +71,7 @@ export interface ModelRequestCancelInput {
   modelRequestId: string;
   terminalState: string;
   now: string;
+  executionFence?: ExecutionLeaseFencePayload;
 }
 
 export interface ModelRequestCancelResult {
@@ -95,6 +107,64 @@ export interface ClientKeysetPageResult {
   responseBytes: number;
 }
 
+export interface ConversationHistoryProjectionInput {
+  scopeKind: 'all' | 'unbound' | 'project';
+  projectFolderUri?: string;
+  limit: number;
+  afterUpdatedAt?: string;
+  afterId?: string;
+  expectedCommitSeq?: string;
+}
+
+export interface ConversationHistoryProjectionResult {
+  snapshotCommitSeq: string;
+  cursorReset: boolean;
+  seedRows: DomainRow[];
+  conversations: DomainRow[];
+  origins: DomainRow[];
+  turns: DomainRow[];
+  leases: DomainRow[];
+  agentLinks: DomainRow[];
+  messageSummaries: DomainRow[];
+  previewTargets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>;
+  childExecutions: DomainRow[];
+  activeChildTurnLinks: DomainRow[];
+  answerBridges: DomainRow[];
+  inboxItems: DomainRow[];
+  deliveries: DomainRow[];
+  deliveryWakes: DomainRow[];
+  deliveryInputLinks: DomainRow[];
+  projectContexts: DomainRow[];
+  conversationProjectLinks: DomainRow[];
+  total: number;
+  hasMore: boolean;
+}
+
+export interface ProcessOutputRegistrationMismatch {
+  processId: string;
+  expectedChunks: string;
+  registeredChunks: string;
+  expectedBytes: string;
+  registeredBytes: string;
+}
+
+export interface EffectReceiptReconciliationCandidate {
+  effectIntentId: string;
+  effectReceiptId: string;
+}
+
+export interface ChildConversationOriginCandidate {
+  childExecutionId: string;
+}
+
+export interface ChildProcessCleanupMaterializationCandidate {
+  turnLinkId: string;
+  interruptionRequestId: string;
+  turnId: string;
+  sourceLinkId: string;
+  processId: string;
+}
+
 export interface DatabaseWorkerData {
   mode: 'initialize' | 'runtime';
   binding: RootBinding;
@@ -105,12 +175,18 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'transaction'; steps: RepositoryTransactionStep[] }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'snapshotAll'; read: RepositoryListRead }
+  | { kind: 'processOutputRegistrationMismatches' }
+  | { kind: 'effectReceiptReconciliationCandidates' }
+  | { kind: 'childConversationOriginCandidates' }
+  | { kind: 'childProcessCleanupMaterializationCandidates' }
   | { kind: 'contextMaterialization'; rootId: string }
   | { kind: 'contextContentMaterialization'; rootId: string }
   | { kind: 'modelStreamEvent'; input: ModelStreamEventCommitInput }
   | { kind: 'cancelCurrentModelRequest'; input: ModelRequestCancelInput }
   | { kind: 'clientProjectionSnapshot'; activeConversationId: string | null }
   | { kind: 'clientKeysetPage'; input: ClientKeysetPageInput }
+  | { kind: 'conversationHistoryProjection'; input: ConversationHistoryProjectionInput }
+  | { kind: 'externalDataVersion' }
   | { kind: 'inspect' }
   | { kind: 'close' };
 
@@ -139,7 +215,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelRequestCancelResult | ClientKeysetPageResult | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | null }
+  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelRequestCancelResult | ClientKeysetPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | string | null }
   | { type: 'response'; id: number; ok: false; error: SerializedWorkerError }
   | { type: 'commit'; result: RuntimeCommitResult }
   | { type: 'fatal'; error: SerializedWorkerError };

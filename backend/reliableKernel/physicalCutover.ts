@@ -4,7 +4,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
 import { PHYSICAL_CUTOVER_MANIFEST, type PhysicalCutoverManifestEntry } from './generatedPhysicalCutoverManifest';
-import { RootAuthority } from './rootAuthority';
+import { RootAuthority, type HistoricalRootBinding } from './rootAuthority';
 
 export const CUTOVER_CONTROL_DIRECTORY = '.limcode-runtime';
 export const CUTOVER_REQUEST_FILE = 'cutover-request.json';
@@ -244,7 +244,7 @@ export async function performPhysicalCutover(
   requireCompleteDrainProof(request.drain);
   await recoverInterruptedPhysicalCutover(dataRootPath, authority);
 
-  const previousBinding = await authority.readPointer();
+  const previousBinding = await authority.readHistoricalPointerForCutover();
   const attemptId = randomUUID();
   const archiveDirectoryName = `${timestampSlug()}-${attemptId.slice(0, 8)}`;
   const preservedEvidence = await capturePreservedEvidence(dataRootPath);
@@ -784,7 +784,7 @@ async function currentIfValid(authority: RootAuthority): Promise<RootBinding | u
   }
 }
 
-function bindingIdentity(binding: RootBinding): BindingIdentity {
+function bindingIdentity(binding: RootBinding | HistoricalRootBinding): BindingIdentity {
   return {
     dataSetId: binding.dataSetId,
     rootInstanceId: binding.rootInstanceId,

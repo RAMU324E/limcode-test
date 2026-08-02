@@ -77,7 +77,7 @@ function toggleExpanded(): void {
       :class="{ 'is-expanded': isExpanded }"
       :aria-hidden="!isExpanded"
     >
-      <div class="lc-collapsible-content-frame lc-collapse-frame">
+      <div v-if="isExpanded" class="lc-collapsible-content-frame lc-collapse-frame">
         <slot />
       </div>
     </div>

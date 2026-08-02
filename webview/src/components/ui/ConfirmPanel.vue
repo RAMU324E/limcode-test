@@ -20,6 +20,7 @@ const props = withDefaults(
     cancelLabel?: string;
     confirmLabel?: string;
     danger?: boolean;
+    testId?: string;
   }>(),
   {
     description: '',
@@ -59,7 +60,13 @@ function onAction(action: ConfirmPanelAction): void {
 <template>
   <Teleport to="body">
     <div v-if="open" class="confirm-panel-backdrop" @click.self="emit('cancel')">
-      <section class="confirm-panel" role="dialog" aria-modal="true" :aria-label="title">
+      <section
+        class="confirm-panel"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="title"
+        :data-testid="testId"
+      >
         <header class="confirm-panel-head">
           <h2 class="confirm-panel-title">
             <span class="confirm-panel-title-icon" aria-hidden="true">
@@ -82,6 +89,7 @@ function onAction(action: ConfirmPanelAction): void {
             :class="actionVariant(action)"
             :disabled="action.disabled"
             :title="action.title"
+            :data-testid="testId ? `${testId}-${action.key}` : undefined"
             @click="onAction(action)"
           >
             {{ action.label }}

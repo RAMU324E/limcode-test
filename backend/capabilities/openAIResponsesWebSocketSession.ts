@@ -12,6 +12,11 @@ import type {
 const MAX_SOCKET_AGE_MS = 55 * 60 * 1_000;
 const MAX_RETAINED_SESSIONS = 32;
 const IDLE_SESSION_TTL_MS = 15 * 60 * 1_000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+const DEFAULT_SEND_TIMEOUT_MS = 10_000;
+const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 60_000;
+const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_RESPONSE_TIMEOUT_MS = 15 * 60 * 1_000;
 
 export const LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION = 'codex-output-items-v1';
 
@@ -58,6 +63,35 @@ export interface OpenAIResponsesWebSocketStreamOptions {
   signal?: AbortSignal;
   proxy?: string;
   onDecision?: (decision: OpenAIResponsesWebSocketDecision) => void;
+  /** Transport deadlines are independently configurable for deterministic tests and slow relays. */
+  timeouts?: Partial<OpenAIResponsesWebSocketTimeouts>;
+}
+
+export interface OpenAIResponsesWebSocketTimeouts {
+  handshakeMs: number;
+  sendMs: number;
+  firstEventMs: number;
+  eventIdleMs: number;
+  responseMs: number;
+}
+
+export type OpenAIResponsesWebSocketTimeoutPhase =
+  | 'handshake'
+  | 'send'
+  | 'first_event'
+  | 'event_idle'
+  | 'response';
+
+export class OpenAIResponsesWebSocketTimeoutError extends Error {
+  public readonly code = 'LLM_TRANSPORT_TIMEOUT';
+
+  public constructor(
+    public readonly phase: OpenAIResponsesWebSocketTimeoutPhase,
+    public readonly timeoutMs: number
+  ) {
+    super(`OpenAI Responses WebSocket ${phase} timed out after ${timeoutMs}ms.`);
+    this.name = 'OpenAIResponsesWebSocketTimeoutError';
+  }
 }
 
 interface LastRequestState {
@@ -160,7 +194,12 @@ async function* streamLocked(
   let completed = false;
 
   try {
-    for await (const raw of sendCreateAndReadEvents(socket, prepared.payload, options.signal)) {
+    for await (const raw of sendCreateAndReadEvents(
+      socket,
+      prepared.payload,
+      resolvedTimeouts(options.timeouts),
+      options.signal
+    )) {
       const type = eventType(raw);
       responseId = responseIdFromPayload(raw) ?? responseId;
       captureOutputItemDone(raw, completedOutputItems, completedOutputKeys);
@@ -362,7 +401,11 @@ async function ensureSocket(
 
   // previous_response_id is connection-local. Any physical reconnect starts a new chain.
   closeAndInvalidate(session, true);
-  session.socket = await openSocket(connection, options.signal);
+  session.socket = await openSocket(
+    connection,
+    resolvedTimeouts(options.timeouts).handshakeMs,
+    options.signal
+  );
   session.connectedAt = Date.now();
   session.connectionIdentityHash = connection.identityHash;
   session.connectionGeneration += 1;
@@ -508,7 +551,11 @@ function normalizeCompletedOutputItems(
   }
 }
 
-async function openSocket(connection: WebSocketConnectionConfig, signal?: AbortSignal): Promise<WebSocket> {
+async function openSocket(
+  connection: WebSocketConnectionConfig,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<WebSocket> {
   throwIfAborted(signal);
   const agent = proxyAgent(connection.proxy);
   return new Promise<WebSocket>((resolve, reject) => {
@@ -520,6 +567,7 @@ async function openSocket(connection: WebSocketConnectionConfig, signal?: AbortS
       ...(connection.proxy ? { rejectUnauthorized: false } : {})
     });
     const cleanup = () => {
+      clearTimeout(timeout);
       signal?.removeEventListener('abort', onAbort);
       socket.off('open', onOpen);
       socket.off('error', onError);
@@ -541,6 +589,10 @@ async function openSocket(connection: WebSocketConnectionConfig, signal?: AbortS
       new Error(`OpenAI Responses WebSocket closed before open: ${code} ${reason.toString('utf8')}`.trim())
     );
     signal?.addEventListener('abort', onAbort, { once: true });
+    const timeout = setTimeout(
+      () => finish(new OpenAIResponsesWebSocketTimeoutError('handshake', timeoutMs)),
+      timeoutMs
+    );
     socket.once('open', onOpen);
     socket.once('error', onError);
     socket.once('close', onClose);
@@ -550,11 +602,32 @@ async function openSocket(connection: WebSocketConnectionConfig, signal?: AbortS
 async function* sendCreateAndReadEvents(
   socket: WebSocket,
   payload: Record<string, unknown>,
+  timeouts: OpenAIResponsesWebSocketTimeouts,
   signal?: AbortSignal
 ): AsyncGenerator<Record<string, unknown>> {
   const queue = new MergeableAsyncQueue<Record<string, unknown>>(mergeDeltaEvents);
   let sawTerminal = false;
+  let sawEvent = false;
+  let firstEventTimeout: ReturnType<typeof setTimeout> | undefined;
+  let eventIdleTimeout: ReturnType<typeof setTimeout> | undefined;
+  let responseTimeout: ReturnType<typeof setTimeout> | undefined;
+  const clearResponseTimeouts = () => {
+    if (firstEventTimeout !== undefined) clearTimeout(firstEventTimeout);
+    if (eventIdleTimeout !== undefined) clearTimeout(eventIdleTimeout);
+    if (responseTimeout !== undefined) clearTimeout(responseTimeout);
+    firstEventTimeout = undefined;
+    eventIdleTimeout = undefined;
+    responseTimeout = undefined;
+  };
+  const failAfter = (phase: OpenAIResponsesWebSocketTimeoutPhase, timeoutMs: number) => {
+    queue.fail(new OpenAIResponsesWebSocketTimeoutError(phase, timeoutMs));
+  };
+  const armEventIdleTimeout = () => {
+    if (eventIdleTimeout !== undefined) clearTimeout(eventIdleTimeout);
+    eventIdleTimeout = setTimeout(() => failAfter('event_idle', timeouts.eventIdleMs), timeouts.eventIdleMs);
+  };
   const cleanup = () => {
+    clearResponseTimeouts();
     signal?.removeEventListener('abort', onAbort);
     socket.off('message', onMessage);
     socket.off('error', onError);
@@ -568,9 +641,16 @@ async function* sendCreateAndReadEvents(
       return;
     }
     const value = parsed.value;
+    if (!sawEvent) {
+      sawEvent = true;
+      if (firstEventTimeout !== undefined) clearTimeout(firstEventTimeout);
+      firstEventTimeout = undefined;
+    }
+    armEventIdleTimeout();
     queue.push(value);
     if (isTerminalEvent(value)) {
       sawTerminal = true;
+      clearResponseTimeouts();
       queue.end();
     }
   };
@@ -588,13 +668,67 @@ async function* sendCreateAndReadEvents(
 
   try {
     throwIfAborted(signal);
-    await new Promise<void>((resolve, reject) => {
-      socket.send(JSON.stringify(payload), (error) => error ? reject(error) : resolve());
-    });
+    firstEventTimeout = setTimeout(
+      () => failAfter('first_event', timeouts.firstEventMs),
+      timeouts.firstEventMs
+    );
+    responseTimeout = setTimeout(
+      () => failAfter('response', timeouts.responseMs),
+      timeouts.responseMs
+    );
+    await sendWithDeadline(socket, JSON.stringify(payload), timeouts.sendMs, signal);
     yield* queue;
   } finally {
     cleanup();
   }
+}
+
+function sendWithDeadline(
+  socket: WebSocket,
+  payload: string,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => finish(abortError(signal));
+    const timeout = setTimeout(
+      () => finish(new OpenAIResponsesWebSocketTimeoutError('send', timeoutMs)),
+      timeoutMs
+    );
+    signal?.addEventListener('abort', onAbort, { once: true });
+    socket.send(payload, (error) => finish(error ?? undefined));
+  });
+}
+
+function resolvedTimeouts(
+  overrides: Partial<OpenAIResponsesWebSocketTimeouts> | undefined
+): OpenAIResponsesWebSocketTimeouts {
+  return {
+    handshakeMs: positiveTimeout(overrides?.handshakeMs, DEFAULT_HANDSHAKE_TIMEOUT_MS, 'handshakeMs'),
+    sendMs: positiveTimeout(overrides?.sendMs, DEFAULT_SEND_TIMEOUT_MS, 'sendMs'),
+    firstEventMs: positiveTimeout(overrides?.firstEventMs, DEFAULT_FIRST_EVENT_TIMEOUT_MS, 'firstEventMs'),
+    eventIdleMs: positiveTimeout(overrides?.eventIdleMs, DEFAULT_EVENT_IDLE_TIMEOUT_MS, 'eventIdleMs'),
+    responseMs: positiveTimeout(overrides?.responseMs, DEFAULT_RESPONSE_TIMEOUT_MS, 'responseMs')
+  };
+}
+
+function positiveTimeout(value: number | undefined, fallback: number, label: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${label} must be a positive integer.`);
+  return value;
 }
 
 class MergeableAsyncQueue<T> implements AsyncIterable<T> {
@@ -849,7 +983,7 @@ function isTerminalEvent(value: Record<string, unknown>): boolean {
 
 function isProviderErrorPayload(value: Record<string, unknown>): boolean {
   const type = eventType(value);
-  if (type === 'error' || type.includes('error') || type.includes('failed') || type.includes('incomplete')) return true;
+  if (type === 'response.cancelled' || type === 'error' || type.includes('error') || type.includes('failed') || type.includes('incomplete')) return true;
   if (value.error !== undefined && value.error !== null) return true;
   const response = value.response;
   if (!isRecord(response)) return false;
@@ -867,7 +1001,9 @@ function errorInfoFromPayload(payload: Record<string, unknown>): Record<string, 
     event: eventType(payload) || undefined,
     ...(status !== undefined ? { status } : {}),
     ...(payload.headers && isRecord(payload.headers) ? { headers: cloneJson(payload.headers) } : {}),
-    ...(nestedMessage(payload) ? { message: nestedMessage(payload) } : {}),
+    ...(nestedMessage(payload)
+      ? { message: nestedMessage(payload) }
+      : { message: `OpenAI Responses WebSocket received ${eventType(payload) || 'a terminal error'} before response.completed.` }),
     rawBody: cloneJson(payload)
   };
 }

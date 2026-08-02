@@ -35,13 +35,17 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
     this.capability = createLlmProviderCapability({
       settings: async (request) => {
         const frozen = request && 'model' in request ? request.model : undefined;
-        const providerConfigId = requireId(frozen?.providerConfigId, 'Frozen providerConfigId');
-        const modelId = requireId(frozen?.model, 'Frozen modelId');
+        const snapshot = request && 'settingsSnapshot' in request ? request.settingsSnapshot : undefined;
+        const providerConfigId = requireId(
+          frozen?.providerConfigId || snapshot?.providerConfigId,
+          'Frozen providerConfigId'
+        );
+        const modelId = requireId(frozen?.model || snapshot?.modelId, 'Frozen modelId');
         const config = await this.options.loadProviderConfig(providerConfigId);
         if (config.id !== providerConfigId) {
           throw new Error(`Provider settings authority returned ${config.id} for frozen id ${providerConfigId}.`);
         }
-        return applyFrozenModelProviderConfig(config, modelId, frozen?.provider);
+        return applyFrozenModelProviderConfig(config, modelId, frozen?.provider ?? snapshot?.provider);
       },
       ...(this.options.proxy ? { proxy: this.options.proxy } : {}),
       ...(this.options.headers ? { headers: { ...this.options.headers } } : {}),

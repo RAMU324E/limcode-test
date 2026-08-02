@@ -12,7 +12,8 @@
     "r3: runtimeDomains 精确集合由 plan validator 与各领域合同交叉核对",
     "r4: 首发禁用 ProviderContinuation，不建对应运行表；保留 Conversation fork 三类独立 Link",
     "r4: 配置 authority 逐对象/ScopeLink crosswalk 到 migration physical manifest；不再用聚合 Policy 代替独立领域",
-    "r4: Process 使用 detached wrapper 与每进程有界 CAS chunks；MCP 调用复用 EffectIntent/Receipt"
+    "r4: Process 使用 detached wrapper、durable spool与可续CAS chunks；MCP 调用复用 EffectIntent/Receipt",
+    "r5: Provider 工具批次使用 ToolCallSourceLink 独立表达来源，并由 ToolCallPolicySnapshot 冻结展示、门禁、change-apply 与调度决定"
   ],
   "contractRevision": "2026-07-31-r4",
   "status": "planned",
@@ -40,7 +41,8 @@
     "currentManifestRequired": true,
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
-    "incompatibleRuntimeData": "archive-and-reset"
+    "incompatibleRuntimeData": "archive-and-reset",
+    "exactPredecessorUpgrade": "offline-epoch-2-to-3-only-with-exact-schema-fingerprint-and-durable-backup"
   },
   "sequenceAllocation": {
     "columnType": "INTEGER",
@@ -320,6 +322,46 @@
       ]
     },
     {
+      "key": "ProjectContext",
+      "table": "project_context",
+      "repository": "ProjectContextRepository",
+      "codec": "ProjectContextRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "summary",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "uri UNIQUE",
+        "updated_at,id"
+      ],
+      "notes": [
+        "工作区文件夹是独立可复用的项目上下文，不嵌入 Conversation。"
+      ]
+    },
+    {
+      "key": "ConversationProjectLink",
+      "table": "conversation_project_link",
+      "repository": "ConversationProjectLinkRepository",
+      "codec": "ConversationProjectLinkRowCodec",
+      "mutations": [
+        "insert",
+        "delete"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id UNIQUE",
+        "project_context_id,conversation_id"
+      ],
+      "notes": [
+        "每个 Conversation 至多一个 primary 项目关系；未绑定由关系缺失表达。"
+      ]
+    },
+    {
       "key": "ConversationReuseLink",
       "table": "conversation_reuse_link",
       "repository": "ConversationReuseLinkRepository",
@@ -519,7 +561,8 @@
       "deletePolicy": "cascade-with-turn",
       "resetPolicy": "runtime-dataset",
       "indexes": [
-        "turn_id,position UNIQUE"
+        "turn_id,position UNIQUE",
+        "turn_id,input_kind UNIQUE WHERE state = 'pending' AND input_kind = 'interrupt_request'"
       ]
     },
     {
@@ -681,7 +724,7 @@
         "insert",
         "delete"
       ],
-      "client": "none",
+      "client": "summary",
       "deletePolicy": "cascade-with-message",
       "resetPolicy": "runtime-dataset",
       "indexes": [
@@ -804,6 +847,41 @@
       ]
     },
     {
+      "key": "ToolCallSourceLink",
+      "table": "tool_call_source_link",
+      "repository": "ToolCallSourceLinkRepository",
+      "codec": "ToolCallSourceLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id UNIQUE",
+        "model_request_id,provider_ordinal UNIQUE",
+        "model_request_id,provider_call_id UNIQUE WHERE provider_call_id IS NOT NULL",
+        "batch_id,batch_ordinal UNIQUE",
+        "message_id"
+      ]
+    },
+    {
+      "key": "ToolCallPolicySnapshot",
+      "table": "tool_call_policy_snapshot",
+      "repository": "ToolCallPolicySnapshotRepository",
+      "codec": "ToolCallPolicySnapshotRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-tool-call",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "tool_call_id UNIQUE",
+        "scheduling_mode,created_at"
+      ]
+    },
+    {
       "key": "ToolCallEvent",
       "table": "tool_call_event",
       "repository": "ToolCallEventRepository",
@@ -856,7 +934,7 @@
         "status"
       ],
       "notes": [
-        "owner_kind ∈ {tool_execution,file_change_set,process,child_execution,model_request}"
+        "owner_kind ∈ {tool_execution,file_change_set,process,child_execution,child_turn_answer_wait,answer_bridge_wait,model_request}；answer_bridge_wait 仅为 legacy recovery read path"
       ]
     },
     {
@@ -1111,12 +1189,33 @@
       "mutations": [
         "insert"
       ],
-      "client": "none",
+      "client": "summary",
       "deletePolicy": "cascade-with-process",
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "process_id UNIQUE",
         "tool_call_id"
+      ]
+    },
+    {
+      "key": "ProcessCompletionSourceLink",
+      "table": "process_completion_source_link",
+      "repository": "ProcessCompletionSourceLinkRepository",
+      "codec": "ProcessCompletionSourceLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-process",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "process_id UNIQUE",
+        "conversation_id,created_at",
+        "source_turn_id",
+        "source_tool_call_id"
+      ],
+      "notes": [
+        "进程启动时冻结 completion 的 Conversation/Turn/ToolCall 软引用；后续删除来源 Runtime 对象不会改变投递路由证据。"
       ]
     },
     {
@@ -1135,7 +1234,7 @@
       ],
       "notes": [
         "正文进入 CAS；字段：process_id,chunk_seq,stream_kind,content_object_id,byte_length,created_at。",
-        "每进程 maxChunkBytes=65536、maxRetainedBytes=4194304、maxRetainedChunks=256；超限只累计 droppedBytes/truncated，不再写正文或 metadata。"
+        "maxChunkBytes=65536只约束单个不可变chunk；每进程正文与metadata没有总量截断。登记按process_id+chunk_seq keyset和单事务wire预算持续分批，mode=output以opaque outputHandle完整遍历。"
       ]
     },
     {
@@ -1155,6 +1254,48 @@
       "notes": [
         "跨 deletePolicy 引用一律软引用（不建外键约束）；由退出回执 reconcile 生成",
         "由通过 stable nonce/start fingerprint 核验的 wrapper atomic exit receipt reconcile 生成；无有效 receipt 且无法证明时 outcome_unknown。"
+      ]
+    },
+    {
+      "key": "ProcessCompletionDispatch",
+      "table": "process_completion_dispatch",
+      "repository": "ProcessCompletionDispatchRepository",
+      "codec": "ProcessCompletionDispatchRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-process-receipt",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "process_receipt_id UNIQUE",
+        "state,next_attempt_at",
+        "claim_owner_host_boot_id,claim_expires_at"
+      ],
+      "notes": [
+        "detached process_exit 的 Receipt 同事务创建 reconciliation outbox；claim owner/generation 提供跨 host fence，失败按 next_attempt_at 退避并有界进入 dead_letter。"
+      ]
+    },
+    {
+      "key": "ChildInterruptionProcessCleanup",
+      "table": "child_interruption_process_cleanup",
+      "repository": "ChildInterruptionProcessCleanupRepository",
+      "codec": "ChildInterruptionProcessCleanupRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-child-interruption",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "interruption_request_id,process_id UNIQUE",
+        "state,updated_at",
+        "process_id"
+      ],
+      "notes": [
+        "显式 Child subtree interruption 的持久化 level-trigger cleanup；只允许停止冻结 Turn target 通过 ProcessCompletionSourceLink 拥有的进程。"
       ]
     },
     {
@@ -1290,7 +1431,26 @@
         "status"
       ],
       "notes": [
-        "增 authority_snapshot_id（软引用）、settings_snapshot_object_id?、usage 与 stream_stats；update 仅允许 status/终态/usage/stream_stats，recipe 字段不可变"
+        "增 authority_snapshot_id（软引用）、settings_snapshot_object_id?、冻结 context_window_tokens/compression_threshold_tokens、usage 与 stream_stats；update 仅允许 status/终态/usage/stream_stats，recipe 与冻结配置字段不可变"
+      ]
+    },
+    {
+      "key": "ModelRequestMessageLink",
+      "table": "model_request_message_link",
+      "repository": "ModelRequestMessageLinkRepository",
+      "codec": "ModelRequestMessageLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-model-request",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "model_request_id UNIQUE",
+        "message_id UNIQUE"
+      ],
+      "notes": [
+        "精确表达一次 ModelRequest 生成的唯一 assistant Message；UI 与恢复逻辑不得依赖 Turn 内位置猜测"
       ]
     },
     {
@@ -1360,6 +1520,25 @@
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "model_request_id UNIQUE"
+      ]
+    },
+    {
+      "key": "TurnFinalOutputFence",
+      "table": "turn_final_output_fence",
+      "repository": "TurnFinalOutputFenceRepository",
+      "codec": "TurnFinalOutputFenceRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-turn",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "turn_id UNIQUE",
+        "model_request_id UNIQUE"
+      ],
+      "notes": [
+        "无工具调用的最终模型输出在可见Message提交前建立；自动后台投递不得再注入该Turn"
       ]
     },
     {
@@ -1440,7 +1619,7 @@
         "state"
       ],
       "notes": [
-        "登记尚未 admit 的续接 TurnIntent；cancel_subtree 同事务将 pending intent 置 cancelled"
+        "登记尚未 admit 的续接 TurnIntent；interrupt_subtree 同事务将 pending intent 置 cancelled"
       ]
     },
     {
@@ -1462,6 +1641,80 @@
       ],
       "notes": [
         "只表达当前活动 Turn；树遍历依据 ChildExecutionParentLink，不依据本可变指针"
+      ]
+    },
+    {
+      "key": "ChildInterruptionRequest",
+      "table": "child_interruption_request",
+      "repository": "ChildInterruptionRequestRepository",
+      "codec": "ChildInterruptionRequestRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-child-execution",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "source_kind,source_key UNIQUE",
+        "root_child_execution_id"
+      ],
+      "notes": [
+        "冻结一次显式 subtree interruption 的根、命令身份与原因；精确 replay 只读取原 target 集。"
+      ]
+    },
+    {
+      "key": "ChildInterruptionLineageLink",
+      "table": "child_interruption_lineage_link",
+      "repository": "ChildInterruptionLineageLinkRepository",
+      "codec": "ChildInterruptionLineageLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-child-interruption",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "interruption_request_id,child_execution_id UNIQUE",
+        "child_execution_id"
+      ]
+    },
+    {
+      "key": "ChildInterruptionTurnLink",
+      "table": "child_interruption_turn_link",
+      "repository": "ChildInterruptionTurnLinkRepository",
+      "codec": "ChildInterruptionTurnLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-child-interruption",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "interruption_request_id,turn_id UNIQUE",
+        "child_execution_id",
+        "turn_id"
+      ],
+      "notes": [
+        "冻结可终止及可清理 owned Process 的精确 Child Turn generation。"
+      ]
+    },
+    {
+      "key": "ChildInterruptionIntentLink",
+      "table": "child_interruption_intent_link",
+      "repository": "ChildInterruptionIntentLinkRepository",
+      "codec": "ChildInterruptionIntentLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-child-interruption",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "interruption_request_id,child_execution_intent_link_id UNIQUE",
+        "child_execution_id"
+      ],
+      "notes": [
+        "冻结本次 interruption 可取消的 pending ChildExecutionIntentLink；后续新 intent 不受旧命令 replay 影响。"
       ]
     },
     {
@@ -1539,6 +1792,25 @@
       ]
     },
     {
+      "key": "RuntimeInboxPayloadLink",
+      "table": "runtime_inbox_payload_link",
+      "repository": "RuntimeInboxPayloadLinkRepository",
+      "codec": "RuntimeInboxPayloadLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-inbox-item",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "inbox_item_id UNIQUE",
+        "content_object_id"
+      ],
+      "notes": [
+        "通用 RuntimeInbox 内容关系；来源领域只提交自己的 payload CAS，不把 payload 或目标投递字段嵌入 RuntimeInboxItem"
+      ]
+    },
+    {
       "key": "RuntimeDelivery",
       "table": "runtime_delivery",
       "repository": "RuntimeDeliveryRepository",
@@ -1551,13 +1823,12 @@
       "deletePolicy": "cascade-with-inbox-item",
       "resetPolicy": "runtime-dataset",
       "indexes": [
-        "inbox_item_id,target_conversation_id,phase,attempt_seq UNIQUE WHERE target_turn_id IS NULL",
-        "inbox_item_id,target_conversation_id,target_turn_id,phase,attempt_seq UNIQUE WHERE target_turn_id IS NOT NULL",
+        "inbox_item_id,target_conversation_id,attempt_seq UNIQUE",
         "retry_of_delivery_id",
         "target_conversation_id,state,created_at"
       ],
       "notes": [
-        "target_turn_id 可空；attempt_seq 从 1 开始，人工 redeliver 创建 attempt+1 并写 retry_of_delivery_id；目标不存在时置 failed(reason=target-gone)"
+        "target_turn_id 可空；同一Inbox/Conversation的初始自动投递只有一个attempt=1，phase/target可在authority CAS下收敛；人工 redeliver 创建全局attempt+1并写 retry_of_delivery_id；目标不存在时置 failed(reason=target-gone)"
       ]
     },
     {
@@ -1579,6 +1850,27 @@
       ],
       "notes": [
         "Delivery 注入目标 Turn 时创建；执行器真正吸收对应 PendingTurnInput 时同事务写 handled_at，父处理状态只据此推导"
+      ]
+    },
+    {
+      "key": "RuntimeDeliveryWake",
+      "table": "runtime_delivery_wake",
+      "repository": "RuntimeDeliveryWakeRepository",
+      "codec": "RuntimeDeliveryWakeRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-delivery",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "delivery_id UNIQUE",
+        "state,next_attempt_at",
+        "claim_owner_host_boot_id,claim_expires_at"
+      ],
+      "notes": [
+        "level-triggered 持久唤醒 outbox；claim owner/generation 跨 host fence；产品调度器只有在已持久安排幂等 resume/continuation/notification 后才写 acknowledged，毒消息有界退避后进入 dead_letter"
       ]
     }
   ],
@@ -1628,9 +1920,7 @@
         "Checkpoint",
         "CheckpointTimelineAnchor",
         "ShadowRepository",
-        "ConversationCheckpointRepositoryLink",
-        "ProjectContext",
-        "ConversationProjectLink"
+        "ConversationCheckpointRepositoryLink"
       ],
       "rule": "存档点（工作区快照回滚）功能当前已停用（代码开关 CHECKPOINT_FEATURE_ENABLED=false）。首版不建这些表，不导入存量存档数据。将来功能重启时按真实字段补表，ShadowRepository 改用 GitShadow 命名（repository=GitShadowRepository）避免叠字。注意：本能力与 context.json 的 ModelStreamCheckpoint（流式输出检查点）无关，后者为活跃能力。"
     }
@@ -1647,10 +1937,10 @@
       "id": "conversation-fork",
       "disposition": "rebuild",
       "ownerStage": "F",
-      "target": "ConversationReuseLink+ConversationBranchLink+ConversationOriginLink+ContextSequence shared prefix",
+      "target": "ConversationReuseLink+ConversationBranchLink+ConversationOriginLink+ConversationProjectLink+ContextSequence shared prefix",
       "acceptance": [
         "fork behavior preserved",
-        "three independent Link domains",
+        "four independent Link domains including project inheritance",
         "no source Run authority"
       ]
     },

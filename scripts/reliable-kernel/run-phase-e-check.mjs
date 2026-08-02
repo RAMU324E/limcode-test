@@ -230,6 +230,7 @@ async function checkContextStorageGrowth() {
         created_at: new Date().toISOString()
       })
     ]), /UNIQUE constraint failed/);
+    await terminateSeededTurn(suffixSeed, 'shared-suffix-history-mutation');
     await suffixSeed.control.delete({
       source: { kind: 'command', key: 'delete-message-with-partially-shared-suffix' },
       conversationId: suffixSeed.conversationId,
@@ -237,10 +238,8 @@ async function checkContextStorageGrowth() {
     });
     assert.deepEqual((await context.materialize(
       await context.currentHeadRootId(suffixSeed.conversationId)
-    )).segments.map((segment) => segment.content.toString('utf8')), [
-      'SHARED-SUFFIX-C', 'SHARED-SUFFIX-D'
-    ]);
-    assertions.push('NULL parent的segment_id partial UNIQUE真实阻止重复根节点；edit/delete suffix rebuild遇到首个共享node已存在、后继尚不存在时逐node savepoint仍完整提交');
+    )).segments.map((segment) => segment.content.toString('utf8')), []);
+    assertions.push('NULL parent的segment_id partial UNIQUE真实阻止重复根节点；删除历史消息按结构截断其完整suffix，后续runtime segment不会残留在可物化上下文');
 
     const headBeforeFault = await context.currentHeadRootId(seeded.conversationId);
     const rootCountBeforeFault = await countAll(ctx.database, 'ContextSequenceRoot');
@@ -404,7 +403,12 @@ async function checkContextStorageGrowth() {
     for (const domain of ['ContentObject', 'ContextSegment', 'ContextSequenceRoot']) {
       assert.equal(appendChangesByDomain[domain]?.length, 1, `${domain} ordinary append visible mutation count`);
     }
-    assert.equal(appendCommit.changes.length, 3, 'ordinary append must not rewrite historical client-visible rows');
+    assert.equal(
+      appendChangesByDomain.ConversationContextStatus?.length,
+      1,
+      'ordinary append must atomically project exactly one derived current-context status'
+    );
+    assert.equal(appendCommit.changes.length, 4, 'ordinary append must not rewrite historical client-visible rows');
     for (let index = 201; index < 212; index += 1) {
       const started = performance.now();
       await appendOne(index);
@@ -546,7 +550,14 @@ async function checkCompressionNodeBound() {
     assertions.push('tool call与唯一ToolModelResult形成一个tool_pair segment并登记两条同call_seq source，压缩只能按整个segment选取');
 
     const rootBefore = await get(ctx.database, 'ContextSequenceRoot', sourceRootId);
-    assert.ok(Number(rootBefore.estimated_tokens) < sourceMaterialized.segments.reduce((sum, segment) => sum + Number((segment.contentObject.byte_length + 3n) / 4n), 0));
+    assert.equal(
+      Number(rootBefore.estimated_tokens),
+      sourceMaterialized.segments.reduce(
+        (sum, segment) => sum + Number((segment.contentObject.byte_length + 3n) / 4n),
+        0
+      ),
+      'root token estimate must include every message and non-message segment exactly once'
+    );
     const compression = new kernel.ContextCompressionControlPlane(ctx.database, ctx.store);
     const decision = await compression.evaluate(sourceRootId, seeded.authoritySnapshotId);
     assert.equal(decision.shouldCompress, true);
@@ -671,6 +682,7 @@ async function checkCompressionNodeBound() {
       compressSegmentCount: 1,
       title: 'outer', summary: 'OUTER-SUMMARY', idempotencyKey: 'outer'
     });
+    await terminateSeededTurn(nestedSeed, 'nested-compression-history-mutation');
     await nestedSeed.control.edit({
       source: { kind: 'command', key: 'nested-compressed-edit' },
       conversationId: nestedSeed.conversationId,
@@ -717,6 +729,7 @@ async function checkCompressionNodeBound() {
       compressSegmentCount: 2,
       title: 'retained-outer', summary: 'RETAINED-OUTER-SUMMARY', idempotencyKey: 'retained-outer'
     });
+    await terminateSeededTurn(retainedSeed, 'retained-compression-history-mutation');
     await retainedSeed.control.edit({
       source: { kind: 'command', key: 'retained-inner-summary-edit' },
       conversationId: retainedSeed.conversationId,
@@ -855,6 +868,7 @@ async function checkProviderFullRequest() {
       executorAgentId: seeded.agentId,
       modelProfile: {
         compressionThresholdTokens: 4,
+        contextWindowTokens: 8,
         tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
       },
       model: { providerConfigId: 'fake-local', modelId: 'fake-model' },
@@ -901,22 +915,27 @@ async function checkProviderFullRequest() {
     assert.deepEqual((await provider.replay(settingsRequest.modelRequestId)).settingsSnapshot, {
       endpointMode: 'local-fake', maxOutputTokens: 64
     });
-    let settingsPayload;
-    await provider.dispatch(settingsRequest.modelRequestId, {
-      providerId: 'fake-local',
-      async sendFullRequest(request) { settingsPayload = request; }
-    });
-    assert.deepEqual(settingsPayload.settingsSnapshot, {
-      endpointMode: 'local-fake', maxOutputTokens: 64
-    });
-    assert.deepEqual(settingsPayload.context, expectedOriginalContext);
     let mismatchedAdapterCalls = 0;
     await assert.rejects(provider.dispatch(settingsRequest.modelRequestId, {
       providerId: 'wrong-current-provider',
       async sendFullRequest() { mismatchedAdapterCalls += 1; }
     }), /does not match frozen provider/);
     assert.equal(mismatchedAdapterCalls, 0);
-    assert.equal(await provider.cancel(settingsRequest.modelRequestId, 'settings-fixture-complete'), true);
+    let settingsPayload;
+    await provider.dispatch(settingsRequest.modelRequestId, {
+      providerId: 'fake-local',
+      async sendFullRequest(request, controls) {
+        settingsPayload = request;
+        await controls.onEvent({
+          kind: 'completed', streamSeq: '1', content: { fixture: 'settings-payload-complete' }
+        });
+      }
+    });
+    assert.deepEqual(settingsPayload.settingsSnapshot, {
+      endpointMode: 'local-fake', maxOutputTokens: 64
+    });
+    assert.deepEqual(settingsPayload.context, expectedOriginalContext);
+    assert.equal((await get(ctx.database, 'ModelRequest', settingsRequest.modelRequestId)).terminal_state, 'completed');
     let externalCalls = 0;
     await closeAndCheckpoint(ctx);
     assert.equal(externalCalls, 0);
@@ -935,10 +954,12 @@ async function checkProviderFullRequest() {
       recipe: { fault: 'checkpoint-before-fence' },
       idempotencyKey: 'checkpoint-fence-fault'
     });
-    const checkpointFaultSocket = await provider.dispatch(checkpointFaultRequest.modelRequestId, {
-      providerId: 'fake-local',
-      async sendFullRequest() { externalCalls += 1; }
-    });
+    const checkpointFaultSocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      checkpointFaultRequest.modelRequestId,
+      async () => { externalCalls += 1; }
+    );
     const checkpointRowsBeforeFault = await count(ctx.database, 'ModelStreamCheckpoint', {
       model_request_id: checkpointFaultRequest.modelRequestId
     });
@@ -976,29 +997,26 @@ async function checkProviderFullRequest() {
     faults.push('checkpoint insert before terminal fence transaction rollback');
 
     const payloads = [];
-    const first = await provider.dispatch(created.modelRequestId, {
-      providerId: 'fake-local',
-      async sendFullRequest(request, controls) {
+    const first = await openPendingProviderSocket(ctx, provider, created.modelRequestId, async (request, controls) => {
         externalCalls += 1;
         payloads.push(request);
         assertNoContinuationPayload(request);
         await controls.onEvent({ kind: 'output_item_done', streamSeq: '1', content: { item: 'done' } });
-      }
     });
     assert.equal((await list(ctx.database, 'ModelStreamFence', {
       model_request_id: created.modelRequestId
     })).length, 0);
+    await provider.quiesceAllActiveDispatches();
+    assert.equal((await first.settled).status, 'rejected');
+    assert.equal((await checkpointFaultSocket.settled).status, 'rejected');
     await closeAndCheckpoint(ctx);
     await reopen(ctx, 'phase-e-provider-reconnect-reopen');
     provider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store);
     context = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
-    const reconnect = await provider.dispatch(created.modelRequestId, {
-      providerId: 'fake-local',
-      async sendFullRequest(request) {
+    const reconnect = await openPendingProviderSocket(ctx, provider, created.modelRequestId, async (request) => {
         externalCalls += 1;
         payloads.push(request);
         assertNoContinuationPayload(request);
-      }
     }, { reconnect: true });
     assert.equal(reconnect.attemptSeq, '1');
     assert.equal(reconnect.socketGeneration, '2');
@@ -1018,6 +1036,8 @@ async function checkProviderFullRequest() {
       socketGeneration: '2'
     });
     assert.ok(!payloads[0].context.some((item) => item.content === 'CURRENT-HEAD-AFTER-FROZEN-REQUEST'));
+    await provider.quiesceTurnDispatches(seeded.turnId);
+    assert.equal((await reconnect.settled).status, 'rejected');
     assertions.push('首次请求与Extension Host数据库重开后的显式reconnect均逐字段等于冻结root/authority/recipe完整oracle；推进current head不改变payload；OutputItemDone不冒充Completed fence且重启不自动dispatch');
 
     const staleOutcomeRequest = await provider.createModelRequest({
@@ -1040,10 +1060,13 @@ async function checkProviderFullRequest() {
       }
     });
     await oldSocketEntered;
-    const newerSocket = await provider.dispatch(staleOutcomeRequest.modelRequestId, {
-      providerId: 'fake-local',
-      async sendFullRequest() {}
-    }, { reconnect: true });
+    const newerSocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      staleOutcomeRequest.modelRequestId,
+      async () => {},
+      { reconnect: true }
+    );
     assert.equal(newerSocket.socketGeneration, '2');
     releaseOldSocketResolve();
     const staleOutcome = await oldSocketDispatch;
@@ -1057,6 +1080,7 @@ async function checkProviderFullRequest() {
     }))[0];
     assert.equal((await list(ctx.database, 'Attempt', { operation_id: staleOperation.id })).length, 1);
     assert.equal(await provider.cancel(staleOutcomeRequest.modelRequestId, 'stale-outcome-fixture-complete'), true);
+    assert.equal((await newerSocket.settled).status, 'rejected');
 
     const staleResolveRequest = await provider.createModelRequest({
       turnId: seeded.turnId,
@@ -1077,13 +1101,18 @@ async function checkProviderFullRequest() {
       }
     });
     await staleResolveEntered;
-    const staleResolveNewSocket = await provider.dispatch(staleResolveRequest.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    }, { reconnect: true });
+    const staleResolveNewSocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      staleResolveRequest.modelRequestId,
+      async () => {},
+      { reconnect: true }
+    );
     assert.equal(staleResolveNewSocket.socketGeneration, '2');
     releaseStaleResolveResolve();
     assert.equal((await staleResolveDispatch).superseded, true);
     assert.equal(await provider.cancel(staleResolveRequest.modelRequestId, 'stale-resolve-fixture-complete'), true);
+    assert.equal((await staleResolveNewSocket.settled).status, 'rejected');
 
     const staleEventRequest = await provider.createModelRequest({
       turnId: seeded.turnId,
@@ -1092,9 +1121,12 @@ async function checkProviderFullRequest() {
       recipe: { staleEvent: true },
       idempotencyKey: 'stale-socket-event'
     });
-    const staleEventSocket = await provider.dispatch(staleEventRequest.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    });
+    const staleEventSocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      staleEventRequest.modelRequestId,
+      async () => {}
+    );
     let staleEventPublishedResolve;
     const staleEventPublished = new Promise((resolve) => { staleEventPublishedResolve = resolve; });
     let releaseStaleEventResolve;
@@ -1116,9 +1148,13 @@ async function checkProviderFullRequest() {
       { kind: 'output_delta', streamSeq: '1', content: 'STALE-EVENT-AFTER-PREFLIGHT' }
     );
     await staleEventPublished;
-    const staleEventNewSocket = await provider.dispatch(staleEventRequest.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    }, { reconnect: true });
+    const staleEventNewSocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      staleEventRequest.modelRequestId,
+      async () => {},
+      { reconnect: true }
+    );
     assert.equal(staleEventNewSocket.socketGeneration, '2');
     releaseStaleEventResolve();
     const staleEventResult = await staleEventPromise;
@@ -1128,12 +1164,15 @@ async function checkProviderFullRequest() {
     }), 0);
     assert.equal(await countAll(ctx.database, 'ContentObject'), contentRowsBeforeStaleEvent);
     assert.equal(await provider.cancel(staleEventRequest.modelRequestId, 'stale-event-fixture-complete'), true);
+    assert.equal((await staleEventSocket.settled).status, 'rejected');
+    assert.equal((await staleEventNewSocket.settled).status, 'rejected');
     assertions.push('旧socket transient或正常resolve都标记superseded；已通过reader预检、CAS发布后才遇到reconnect的迟到event由writer精确identity忽略，不终止新socket、不建attempt 2且不留SQLite引用');
 
     let retryDispatchCalls = 0;
+    let outputItemHadNoFence = false;
     await provider.dispatch(created.modelRequestId, {
       providerId: 'fake-local',
-      async sendFullRequest(request) {
+      async sendFullRequest(request, controls) {
         externalCalls += 1;
         retryDispatchCalls += 1;
         payloads.push(request);
@@ -1141,6 +1180,23 @@ async function checkProviderFullRequest() {
         if (retryDispatchCalls === 1) {
           throw new kernel.ProviderTransientError('connection_interrupted', 'deterministic connection break');
         }
+        const oldAttemptLate = await provider.recordStreamEvent(
+          created.modelRequestId,
+          '1',
+          '3',
+          { kind: 'output_delta', streamSeq: '2', content: 'late-old-attempt' }
+        );
+        assert.equal(oldAttemptLate.ignoredReason, 'old-attempt');
+        await controls.onEvent({ kind: 'output_item_done', streamSeq: '1', content: { outputItem: 1 } });
+        outputItemHadNoFence = (await list(ctx.database, 'ModelStreamFence', {
+          model_request_id: created.modelRequestId
+        })).length === 0;
+        for (let seq = 2; seq <= 38; seq += 1) {
+          await controls.onEvent({ kind: 'output_delta', streamSeq: String(seq), content: `delta-${seq}` });
+        }
+        await controls.onEvent({
+          kind: 'completed', streamSeq: '39', content: { completed: true }, usage: { totalTokens: 39 }
+        });
       }
     }, { reconnect: true });
     assert.equal(retryDispatchCalls, 2);
@@ -1215,39 +1271,6 @@ async function checkProviderFullRequest() {
     assert.equal((await get(ctx.database, 'ModelRequest', buildFailure.modelRequestId)).status, 'terminal');
     assertions.push('普通Error只外调一次且不retry；attempt 2再次临时失败后严格停在总attempt=2；冻结请求本地CAS构造失败在外调前收口terminal而不留下running');
 
-    const oldAttemptLate = await provider.recordStreamEvent(
-      created.modelRequestId,
-      '1',
-      '3',
-      { kind: 'output_delta', streamSeq: '2', content: 'late-old-attempt' }
-    );
-    assert.equal(oldAttemptLate.ignoredReason, 'old-attempt');
-    let outputItemHadNoFence = false;
-    const completedPayloads = [];
-    await provider.dispatch(created.modelRequestId, {
-      providerId: 'fake-local',
-      async sendFullRequest(request, controls) {
-        payloads.push(request);
-        completedPayloads.push(request);
-        const oldSocket = await provider.recordStreamEvent(
-          created.modelRequestId,
-          '2',
-          '1',
-          { kind: 'output_delta', streamSeq: '1', content: 'late-old-socket' }
-        );
-        assert.equal(oldSocket.ignoredReason, 'old-socket-generation');
-        await controls.onEvent({ kind: 'output_item_done', streamSeq: '1', content: { outputItem: 1 } });
-        outputItemHadNoFence = (await list(ctx.database, 'ModelStreamFence', {
-          model_request_id: created.modelRequestId
-        })).length === 0;
-        for (let seq = 2; seq <= 38; seq += 1) {
-          await controls.onEvent({ kind: 'output_delta', streamSeq: String(seq), content: `delta-${seq}` });
-        }
-        await controls.onEvent({
-          kind: 'completed', streamSeq: '39', content: { completed: true }, usage: { totalTokens: 39 }
-        });
-      }
-    }, { reconnect: true });
     assert.equal(outputItemHadNoFence, true);
     assert.equal((await list(ctx.database, 'ModelStreamFence', {
       model_request_id: created.modelRequestId
@@ -1324,41 +1347,6 @@ async function checkProviderFullRequest() {
     assertions.push('compression后的新ModelRequest仍发送summary+finite tail完整请求，不发送suffix或已替换原文');
 
     const controlAfterReopen = createTurnControl(ctx, 'provider-full');
-    const edited = await controlAfterReopen.edit({
-      source: { kind: 'command', key: 'provider-edit-current-message' },
-      conversationId: seeded.conversationId,
-      messageId: seeded.messageId,
-      content: 'edited-current-message'
-    });
-    const editedSource = (await list(ctx.database, 'ContextSegmentSource', {
-      source_kind: 'message_revision', source_id: edited.messageRevisionId
-    }))[0];
-    assert.equal(editedSource.source_revision, 2n);
-    const historicalAfterEdit = await provider.replay(created.modelRequestId);
-    assert.deepEqual(historicalAfterEdit.context, frozenBefore.context);
-    const currentAfterCompressedEdit = await context.materialize(
-      await context.currentHeadRootId(seeded.conversationId)
-    );
-    const currentAfterCompressedEditText = currentAfterCompressedEdit.segments.map((segment) => segment.content.toString('utf8'));
-    assert.ok(currentAfterCompressedEditText.includes('edited-current-message'));
-    assert.ok(!currentAfterCompressedEditText.includes(seeded.inputContent));
-    assert.ok(!currentAfterCompressedEditText.includes('PROVIDER-SUMMARY'));
-    await controlAfterReopen.delete({
-      source: { kind: 'command', key: 'provider-soft-delete' },
-      conversationId: seeded.conversationId,
-      messageId: seeded.messageId
-    });
-    const historicalAfterDelete = await provider.replay(created.modelRequestId);
-    assert.deepEqual(historicalAfterDelete.context, frozenBefore.context);
-    assert.deepEqual(historicalAfterDelete.recipe, frozenBefore.recipe);
-    const currentAfterCompressedDelete = await context.materialize(
-      await context.currentHeadRootId(seeded.conversationId)
-    );
-    const currentAfterCompressedDeleteText = currentAfterCompressedDelete.segments.map((segment) => segment.content.toString('utf8'));
-    assert.ok(!currentAfterCompressedDeleteText.includes('edited-current-message'));
-    assert.ok(!currentAfterCompressedDeleteText.includes(seeded.inputContent));
-    assert.ok(!currentAfterCompressedDeleteText.includes('PROVIDER-SUMMARY'));
-    assertions.push('压缩来源Message edit/delete会在同事务禁用旧block并重建正确current root；writer revision_seq与Context source一致；既有terminal projection仍字节级不变');
 
     const nestedSuffixRequest = await provider.createModelRequest({
       turnId: seeded.turnId,
@@ -1389,9 +1377,12 @@ async function checkProviderFullRequest() {
       authoritySnapshotId: seeded.authoritySnapshotId,
       recipe: {}, idempotencyKey: 'stream-event-idempotency'
     });
-    const eventIdentitySocket = await provider.dispatch(eventIdentityRequest.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    });
+    const eventIdentitySocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      eventIdentityRequest.modelRequestId,
+      async () => {}
+    );
     const firstEvent = {
       kind: 'output_delta', streamSeq: '1', content: 'event-identity-A'
     };
@@ -1423,6 +1414,7 @@ async function checkProviderFullRequest() {
       model_request_id: eventIdentityRequest.modelRequestId
     }), 0);
     assert.equal(await provider.cancel(eventIdentityRequest.modelRequestId, 'stream-event-idempotency-complete'), true);
+    assert.equal((await eventIdentitySocket.settled).status, 'rejected');
 
     const aggregateGuardRequest = await provider.createModelRequest({
       turnId: seeded.turnId,
@@ -1456,9 +1448,11 @@ async function checkProviderFullRequest() {
       recipe: {}, idempotencyKey: 'checkpoint-capacity'
     });
     let capacityDrops = 0;
-    await provider.dispatch(capacityRequest.modelRequestId, {
-      providerId: 'fake-local',
-      async sendFullRequest(_request, controls) {
+    const capacitySocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      capacityRequest.modelRequestId,
+      async (_request, controls) => {
         const results = await Promise.all(Array.from({ length: 70 }, (_unused, index) => {
           const seq = index + 1;
           return controls.onEvent({
@@ -1467,7 +1461,7 @@ async function checkProviderFullRequest() {
         }));
         capacityDrops = results.filter((result) => result.ignoredReason === 'checkpoint-capacity').length;
       }
-    });
+    );
     assert.equal(await count(ctx.database, 'ModelStreamCheckpoint', {
       model_request_id: capacityRequest.modelRequestId
     }), 33);
@@ -1489,9 +1483,12 @@ async function checkProviderFullRequest() {
       authoritySnapshotId: seeded.authoritySnapshotId,
       recipe: {}, idempotencyKey: 'checkpoint-terminal-race'
     });
-    const concurrentSocket = await provider.dispatch(concurrentTerminalRequest.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    });
+    const concurrentSocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      concurrentTerminalRequest.modelRequestId,
+      async () => {}
+    );
     for (let seq = 1; seq <= 32; seq += 1) {
       const checkpoint = await provider.recordStreamEvent(
         concurrentTerminalRequest.modelRequestId,
@@ -1530,6 +1527,8 @@ async function checkProviderFullRequest() {
       { kind: 'completed', streamSeq: '34', content: { completed: true } }
     );
     assert.equal(completedResult.terminal, true);
+    concurrentSocket.close();
+    assert.equal((await concurrentSocket.settled).status, 'fulfilled');
     const contentRowsAfterCompleted = await countAll(ctx.database, 'ContentObject');
     releaseLateResolve();
     const lateDeltaResult = await lateDeltaPromise;
@@ -1646,20 +1645,29 @@ async function checkProviderFullRequest() {
       }
     });
     const reconnectCancelProvider = new kernel.ModelProviderControlPlane(reconnectCancelDatabase, ctx.store);
-    await reconnectCancelProvider.dispatch(reconnectCancelRequest.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    });
+    const reconnectCancelSocket = await openPendingProviderSocket(
+      ctx,
+      reconnectCancelProvider,
+      reconnectCancelRequest.modelRequestId,
+      async () => {}
+    );
     const reconnectCancelPromise = reconnectCancelProvider.cancel(
       reconnectCancelRequest.modelRequestId,
       'cancelled-during-reconnect-race'
     );
     await reconnectCancelEntered;
-    const reconnectedBeforeCancel = await reconnectCancelProvider.dispatch(reconnectCancelRequest.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    }, { reconnect: true });
+    const reconnectedBeforeCancel = await openPendingProviderSocket(
+      ctx,
+      reconnectCancelProvider,
+      reconnectCancelRequest.modelRequestId,
+      async () => {},
+      { reconnect: true }
+    );
     assert.equal(reconnectedBeforeCancel.socketGeneration, '2');
     releaseReconnectCancelResolve();
     assert.equal(await reconnectCancelPromise, true);
+    assert.equal((await reconnectCancelSocket.settled).status, 'rejected');
+    assert.equal((await reconnectedBeforeCancel.settled).status, 'rejected');
     const reconnectCancelledRow = await get(ctx.database, 'ModelRequest', reconnectCancelRequest.modelRequestId);
     assert.equal(reconnectCancelledRow.status, 'terminal');
     assert.equal(reconnectCancelledRow.stream_stats_json.socketGeneration, '2');
@@ -1742,10 +1750,14 @@ async function checkProviderFullRequest() {
       authoritySnapshotId: seeded.authoritySnapshotId,
       recipe: {}, idempotencyKey: 'cancel-before-completed'
     });
-    const cancelledBeforeCompletedSocket = await provider.dispatch(cancelledBeforeCompleted.modelRequestId, {
-      providerId: 'fake-local', async sendFullRequest() {}
-    });
+    const cancelledBeforeCompletedSocket = await openPendingProviderSocket(
+      ctx,
+      provider,
+      cancelledBeforeCompleted.modelRequestId,
+      async () => {}
+    );
     assert.equal(await provider.cancel(cancelledBeforeCompleted.modelRequestId, 'cancelled-before-completed'), true);
+    assert.equal((await cancelledBeforeCompletedSocket.settled).status, 'rejected');
     assert.equal((await provider.recordStreamEvent(
       cancelledBeforeCompleted.modelRequestId,
       cancelledBeforeCompletedSocket.attemptSeq,
@@ -1803,6 +1815,7 @@ async function checkProviderFullRequest() {
     assert.equal(await provider.cancel(checkpointFaultRequest.modelRequestId, 'fault-fixture-complete'), true);
     assert.equal(await provider.cancel(nestedSuffixRequest.modelRequestId, 'nested-recipe-fixture-complete'), true);
     assert.equal(await provider.cancel(capacityRequest.modelRequestId, 'capacity-fixture-complete'), true);
+    assert.equal((await capacitySocket.settled).status, 'rejected');
     assert.equal(await count(ctx.database, 'ModelStreamCheckpoint', {
       model_request_id: capacityRequest.modelRequestId
     }), 33);
@@ -1820,6 +1833,42 @@ async function checkProviderFullRequest() {
     assert.equal(finalActiveRequests, 0);
     await controlAfterReopen.terminal(terminalCommand);
     assert.equal((await get(ctx.database, 'Turn', seeded.turnId)).status, 'terminated');
+
+    const edited = await controlAfterReopen.edit({
+      source: { kind: 'command', key: 'provider-edit-current-message' },
+      conversationId: seeded.conversationId,
+      messageId: seeded.messageId,
+      content: 'edited-current-message'
+    });
+    const editedSource = (await list(ctx.database, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: edited.messageRevisionId
+    }))[0];
+    assert.equal(editedSource.source_revision, 2n);
+    const historicalAfterEdit = await provider.replay(created.modelRequestId);
+    assert.deepEqual(historicalAfterEdit.context, frozenBefore.context);
+    const currentAfterCompressedEdit = await context.materialize(
+      await context.currentHeadRootId(seeded.conversationId)
+    );
+    const currentAfterCompressedEditText = currentAfterCompressedEdit.segments.map((segment) => segment.content.toString('utf8'));
+    assert.ok(currentAfterCompressedEditText.includes('edited-current-message'));
+    assert.ok(!currentAfterCompressedEditText.includes(seeded.inputContent));
+    assert.ok(!currentAfterCompressedEditText.includes('PROVIDER-SUMMARY'));
+    await controlAfterReopen.delete({
+      source: { kind: 'command', key: 'provider-soft-delete' },
+      conversationId: seeded.conversationId,
+      messageId: seeded.messageId
+    });
+    const historicalAfterDelete = await provider.replay(created.modelRequestId);
+    assert.deepEqual(historicalAfterDelete.context, frozenBefore.context);
+    assert.deepEqual(historicalAfterDelete.recipe, frozenBefore.recipe);
+    const currentAfterCompressedDelete = await context.materialize(
+      await context.currentHeadRootId(seeded.conversationId)
+    );
+    const currentAfterCompressedDeleteText = currentAfterCompressedDelete.segments.map((segment) => segment.content.toString('utf8'));
+    assert.ok(!currentAfterCompressedDeleteText.includes('edited-current-message'));
+    assert.ok(!currentAfterCompressedDeleteText.includes(seeded.inputContent));
+    assert.ok(!currentAfterCompressedDeleteText.includes('PROVIDER-SUMMARY'));
+    assertions.push('Turn终止后，压缩来源Message edit/delete会在同事务结构化截断并重建current root；writer revision_seq与Context source一致；既有terminal projection仍字节级不变');
     assertions.push('Provider request-level cancel由writer原子命中最新reconnect/attempt2 identity；adapter永不settle也会立即收口；Completed与cancel durable first-wins一致；dispatch前Abort不外调；非UTF-8 frozen Context在外调前明确失败；全部终态checkpoint≤33后Turn才可终止，不扩展通用外部自动重试');
 
     return { assertions, faults, metrics };
@@ -1988,6 +2037,359 @@ async function checkImmutableReplacement() {
     ))).toString('utf8'), 'PARTIAL-CONTENT-RACE-SUMMARY');
     assertions.push('title ContentObject在prepare后被并发提交、summary仍未提交时，每个ContentObject独立savepoint保证compression仍完整提交，不会整批跳过summary');
 
+    const coordinatorPolicy = {
+      enabled: true,
+      binding: { kind: 'provider', id: 'compression-binding-fixture' },
+      methodKind: 'deterministic_summary',
+      thresholdTokens: 2,
+      preserveLatestMessages: 2,
+      trigger: {
+        mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 2,
+        preserveLatestMessages: 2, reserveLatestUserMessageTokens: 1
+      },
+      provider: {
+        providerConfigId: 'fake-local', provider: 'openai-compatible', modelId: 'fake-model'
+      },
+      config: {
+        id: 'compression-config-fixture', name: 'fixture', kind: 'deterministic_summary',
+        trigger: {
+          mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 2,
+          preserveLatestMessages: 2, reserveLatestUserMessageTokens: 1
+        },
+        createdAt: 1, updatedAt: 1
+      }
+    };
+    const coordinatorSeed = await seedTurn(ctx, 'compression-coordinator', {
+      thresholdTokens: 2,
+      compressionPolicy: coordinatorPolicy
+    });
+    for (let index = 0; index < 4; index += 1) {
+      await appendMessageContextFixture(
+        ctx,
+        coordinatorSeed,
+        `compression-coordinator-${index}`,
+        index % 2 === 0 ? 'assistant' : 'user',
+        `coordinator-message-${index}-${'x'.repeat(256)}`
+      );
+    }
+    const coordinatorHead = await context.currentHeadRootId(coordinatorSeed.conversationId);
+    const coordinatorModelProvider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store);
+    let compactDispatches = 0;
+    let frozenCompressionBlockId;
+    const coordinator = new kernel.ReliableContextCompressionCoordinator(
+      ctx.database,
+      ctx.store,
+      coordinatorModelProvider,
+      {
+        resolve(providerId) {
+          return {
+            providerId,
+            async sendFullRequest(request, controls) {
+              compactDispatches += 1;
+              assert.equal(request.recipe.kind, 'reliable-context-compression');
+              assert.equal(request.recipe.requestKind, 'context_compression_pre');
+              assert.equal(request.recipe.sourceSegmentCount, 3);
+              assert.equal(request.context.length, 3);
+              frozenCompressionBlockId = request.recipe.blockId;
+              await controls.onEvent({
+                kind: 'completed',
+                streamSeq: '1',
+                content: {
+                  type: 'compression_result',
+                  contents: [{
+                    role: 'model',
+                    parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }]
+                  }]
+                },
+                usage: { promptTokenCount: 77, totalTokenCount: 91 }
+              });
+            }
+          };
+        }
+      }
+    );
+    const coordinated = await coordinator.coordinate({
+      turnId: coordinatorSeed.turnId,
+      authoritySnapshotId: coordinatorSeed.authoritySnapshotId,
+      headRootId: coordinatorHead,
+      trigger: 'auto'
+    });
+    assert.equal(coordinated.status, 'compressed');
+    assert.equal(coordinated.sourceSegmentCount, 3);
+    assert.equal(compactDispatches, 1);
+    assert.equal(frozenCompressionBlockId, coordinated.result.compressionBlockId);
+    const coordinatedReplay = await coordinator.coordinate({
+      turnId: coordinatorSeed.turnId,
+      authoritySnapshotId: coordinatorSeed.authoritySnapshotId,
+      headRootId: coordinatorHead,
+      trigger: 'auto'
+    });
+    assert.equal(coordinatedReplay.status, 'compressed');
+    assert.equal(coordinatedReplay.result.deduplicated, true);
+    assert.equal(coordinatedReplay.modelRequestId, coordinated.modelRequestId);
+    assert.equal(compactDispatches, 1);
+    const coordinatedRequest = await get(ctx.database, 'ModelRequest', coordinated.modelRequestId);
+    assert.equal(coordinatedRequest.status, 'terminal');
+    assert.equal(coordinatedRequest.terminal_state, 'completed');
+    const coordinatedOperation = (await list(ctx.database, 'Operation', {
+      owner_kind: 'model_request', owner_id: coordinated.modelRequestId
+    }))[0];
+    const coordinatedAttempts = await list(ctx.database, 'Attempt', { operation_id: coordinatedOperation.id });
+    assert.equal(coordinatedAttempts.length, 1);
+    assert.equal(coordinatedAttempts[0].status, 'completed');
+    const coordinatedBlock = await get(ctx.database, 'CompressionBlock', coordinated.result.compressionBlockId);
+    const structuredMetadata = await get(ctx.database, 'ContentObject', coordinatedBlock.summary_object_id);
+    assert.equal(structuredMetadata.content_type, kernel.CONTENT_TYPE_COMPRESSION_CONTENTS);
+    assert.deepEqual(JSON.parse((await ctx.store.read(structuredMetadata)).toString('utf8')), {
+      kind: 'compression_contents', version: 1,
+      contents: [{ role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] }],
+      trigger: 'auto',
+      methodKind: 'deterministic_summary'
+    });
+    const coordinatedMaterialized = await context.materialize(coordinated.result.rootId);
+    assert.equal(coordinatedMaterialized.segments.length, 3);
+    assert.equal(coordinatedMaterialized.segments[0].segmentKind, 'compression');
+    let adapterCompactRequest;
+    let adapterStartRequest;
+    const capabilityAdapter = new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
+      compact(request, emit) {
+        adapterCompactRequest = request;
+        emit({
+          type: 'llm:compactDone',
+          payload: {
+            requestId: request.id,
+            blockId: request.blockId,
+            conversationId: request.conversationId,
+            result: { contents: [{ role: 'model', parts: [{ text: 'ADAPTER-COMPACTED' }] }] },
+            completedAt: Date.now()
+          }
+        });
+      },
+      start(request, emit) {
+        adapterStartRequest = request;
+        emit({ type: 'llm:done', payload: { requestId: request.id, usageMetadata: { totalTokenCount: 1 } } });
+      },
+      abort() {}, cancelRetry() {}, dispose() {},
+      resolveInvocation() {},
+      async dryRun() { throw new Error('unused'); },
+      async dryRunCompact() { throw new Error('unused'); },
+      async listModels() { return []; }
+    });
+    const adapterAuthority = {
+      kind: 'effective-turn-authority',
+      conversationId: coordinatorSeed.conversationId,
+      model: { providerConfigId: 'fake-local', provider: 'openai-compatible', modelId: 'fake-model' },
+      toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} },
+      compression: {
+        ...coordinatorPolicy,
+        methodKind: 'segmented_summary',
+        config: {
+          ...coordinatorPolicy.config,
+          kind: 'segmented_summary',
+          llmSummary: { providerConfigId: 'fake-local', model: 'fake-model', targetTokens: 256 }
+        }
+      }
+    };
+    const structuredContent = JSON.stringify({
+      kind: 'compression_contents', version: 1,
+      contents: [{ role: 'model', parts: [{ text: 'PRIOR-STRUCTURED' }] }]
+    });
+    const compactEvents = [];
+    await capabilityAdapter.sendFullRequest({
+      kind: 'full-model-request', modelRequestId: 'adapter-compact', attemptSeq: '1', socketGeneration: '1',
+      providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
+      recipe: {
+        kind: 'reliable-context-compression', sourceSegmentCount: 2,
+        blockId: 'adapter-block', sourceHash: 'adapter-source'
+      },
+      context: [
+        {
+          segmentId: 'adapter-summary', segmentKind: 'compression', messageRole: null,
+          contentType: kernel.CONTENT_TYPE_COMPRESSION_CONTENTS, content: structuredContent
+        },
+        {
+          segmentId: 'adapter-user', segmentKind: 'message', messageRole: 'user',
+          contentType: 'application/vnd.limcode.message+json',
+          content: JSON.stringify({ role: 'user', parts: [{ text: 'TAIL-USER' }] })
+        },
+        {
+          segmentId: 'adapter-excluded', segmentKind: 'runtime_context', messageRole: null,
+          contentType: 'text/plain', content: 'MUST-NOT-COMPACT'
+        }
+      ]
+    }, {
+      async onEvent(event) { compactEvents.push(event); return { accepted: true, checkpointed: true, terminal: true }; }
+    });
+    assert.deepEqual(adapterCompactRequest.contents, [
+      { role: 'model', parts: [{ text: 'PRIOR-STRUCTURED' }] },
+      { role: 'user', parts: [{ text: 'TAIL-USER' }] }
+    ]);
+    assert.equal(adapterCompactRequest.priorSummaryContents[0].parts[0].text, 'PRIOR-STRUCTURED');
+    assert.equal(compactEvents.length, 1);
+    assert.equal(compactEvents[0].kind, 'completed');
+    assert.equal(compactEvents[0].content.type, 'compression_result');
+    const ordinaryEvents = [];
+    await capabilityAdapter.sendFullRequest({
+      kind: 'full-model-request', modelRequestId: 'adapter-ordinary', attemptSeq: '1', socketGeneration: '1',
+      providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
+      recipe: { kind: 'reliable-agent-turn', round: '1', tools: [] },
+      context: [{
+        segmentId: 'adapter-summary', segmentKind: 'compression', messageRole: null,
+        contentType: kernel.CONTENT_TYPE_COMPRESSION_CONTENTS, content: structuredContent
+      }]
+    }, {
+      async onEvent(event) { ordinaryEvents.push(event); return { accepted: true, checkpointed: true, terminal: true }; }
+    });
+    assert.deepEqual(adapterStartRequest.contents, [
+      { role: 'model', parts: [{ text: 'PRIOR-STRUCTURED' }] }
+    ]);
+    assert.equal(ordinaryEvents.at(-1).kind, 'completed');
+    const manualPolicy = {
+      ...coordinatorPolicy,
+      binding: { kind: 'provider', id: 'manual-compression-binding' },
+      thresholdTokens: 100000,
+      preserveLatestMessages: 1,
+      trigger: {
+        mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 100000,
+        preserveLatestMessages: 1, reserveLatestUserMessageTokens: 1
+      },
+      config: {
+        ...coordinatorPolicy.config,
+        id: 'manual-compression-config',
+        trigger: {
+          mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 100000,
+          preserveLatestMessages: 1, reserveLatestUserMessageTokens: 1
+        }
+      }
+    };
+    const manualSeed = await seedTurn(ctx, 'manual-compression-coordinator', {
+      thresholdTokens: 100000,
+      compressionPolicy: manualPolicy
+    });
+    await appendMessageContextFixture(
+      ctx, manualSeed, 'manual-compression-large-source', 'assistant', `manual-large-source-${'x'.repeat(2048)}`
+    );
+    await appendMessageContextFixture(
+      ctx, manualSeed, 'manual-compression-tail', 'assistant', 'manual-tail-message'
+    );
+    const manualModelProvider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store);
+    let manualDispatches = 0;
+    const manualCoordinator = new kernel.ReliableContextCompressionCoordinator(
+      ctx.database,
+      ctx.store,
+      manualModelProvider,
+      {
+        resolve(providerId) {
+          return {
+            providerId,
+            async sendFullRequest(request, controls) {
+              manualDispatches += 1;
+              assert.equal(request.recipe.requestKind, 'context_compression_manual');
+              await controls.onEvent({
+                kind: 'completed', streamSeq: '1',
+                content: {
+                  type: 'compression_result',
+                  contents: [{ role: 'user', parts: [{ text: 'MANUAL-BELOW-THRESHOLD' }] }]
+                }
+              });
+            }
+          };
+        }
+      }
+    );
+    const manualHead = await context.currentHeadRootId(manualSeed.conversationId);
+    const autoAgainstManualPolicy = await manualCoordinator.coordinate({
+      turnId: manualSeed.turnId,
+      authoritySnapshotId: manualSeed.authoritySnapshotId,
+      headRootId: manualHead,
+      trigger: 'auto'
+    });
+    assert.deepEqual(autoAgainstManualPolicy, { status: 'skipped', reason: 'manual_only' });
+    const manualBelowThreshold = await manualCoordinator.manualCurrentTurn({
+      turnId: manualSeed.turnId,
+      compressSegmentCount: 2,
+      title: 'Manual below threshold fixture'
+    });
+    assert.equal(manualBelowThreshold.status, 'compressed');
+    assert.equal(manualBelowThreshold.sourceSegmentCount, 2);
+    assert.equal(manualDispatches, 1);
+    assert.equal((await context.materialize(manualBelowThreshold.result.rootId)).segments.length, 2);
+
+    const nonReducingPolicy = {
+      ...coordinatorPolicy,
+      binding: { kind: 'provider', id: 'non-reducing-compression-binding' },
+      thresholdTokens: 1,
+      preserveLatestMessages: 1,
+      trigger: {
+        mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 1,
+        preserveLatestMessages: 1, reserveLatestUserMessageTokens: 1
+      },
+      config: {
+        ...coordinatorPolicy.config,
+        id: 'non-reducing-compression-config',
+        trigger: {
+          mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 1,
+          preserveLatestMessages: 1, reserveLatestUserMessageTokens: 1
+        }
+      }
+    };
+    const nonReducingSeed = await seedTurn(ctx, 'non-reducing-compression', {
+      thresholdTokens: 1,
+      compressionPolicy: nonReducingPolicy
+    });
+    await appendMessageContextFixture(ctx, nonReducingSeed, 'non-reducing-source', 'assistant', 'small-source');
+    await appendMessageContextFixture(ctx, nonReducingSeed, 'non-reducing-tail', 'user', 'protected-tail');
+    const nonReducingHead = await context.currentHeadRootId(nonReducingSeed.conversationId);
+    let nonReducingDispatches = 0;
+    const nonReducingCoordinator = new kernel.ReliableContextCompressionCoordinator(
+      ctx.database,
+      ctx.store,
+      new kernel.ModelProviderControlPlane(ctx.database, ctx.store),
+      {
+        resolve(providerId) {
+          return {
+            providerId,
+            async sendFullRequest(_request, controls) {
+              nonReducingDispatches += 1;
+              await controls.onEvent({
+                kind: 'completed', streamSeq: '1',
+                content: {
+                  type: 'compression_result',
+                  contents: [{ role: 'model', parts: [{ text: `NON-REDUCING-${'x'.repeat(4096)}` }] }]
+                }
+              });
+            }
+          };
+        }
+      }
+    );
+    const nonReducing = await nonReducingCoordinator.coordinate({
+      turnId: nonReducingSeed.turnId,
+      authoritySnapshotId: nonReducingSeed.authoritySnapshotId,
+      headRootId: nonReducingHead,
+      trigger: 'auto'
+    });
+    assert.equal(nonReducing.status, 'skipped');
+    assert.equal(nonReducing.reason, 'non_reducing');
+    assert.equal(await context.currentHeadRootId(nonReducingSeed.conversationId), nonReducingHead);
+    assert.equal(await count(ctx.database, 'CompressionBlock', {
+      conversation_id: nonReducingSeed.conversationId
+    }), 0);
+    const nonReducingReplay = await nonReducingCoordinator.coordinate({
+      turnId: nonReducingSeed.turnId,
+      authoritySnapshotId: nonReducingSeed.authoritySnapshotId,
+      headRootId: nonReducingHead,
+      trigger: 'auto'
+    });
+    assert.equal(nonReducingReplay.status, 'skipped');
+    assert.equal(nonReducingReplay.reason, 'non_reducing');
+    assert.equal(nonReducingDispatches, 1);
+    assertions.push('自动压缩协调器把request kind/source prefix冻结进recipe，复用ModelRequest/Operation/Attempt/fence；exact replay零外调；provider-native MessageContent[]按版本化codec持久化并保留2-message finite tail');
+    assertions.push('LLM capability adapter只发送冻结prefix，识别prior structured summary，并把CompactDone映射为单一durable completed事件；后续普通请求会展开版本化MessageContent[]而不是把JSON当Markdown');
+    assertions.push('manual-only配置不会被自动调度；manualCurrentTurn在远低于冻结阈值时可显式压缩closed prefix，同时保留finite tail并冻结manual request kind');
+    assertions.push('受保护tail使上下文越阈值但eligible prefix已不可缩小时，协调器按同head durable request精确跳过而不失败主Turn或重复外调');
+    faults.push('compression provider completed before ContextCompression head-CAS commit then exact coordinator replay');
+
     const currentBlock = await get(ctx.database, 'CompressionBlock', replacement.compressionBlockId);
     const raceDomains = [
       'ContentObject', 'ContextSegment', 'ContextSegmentSource', 'ContextSequenceNode',
@@ -2105,6 +2507,60 @@ async function seedTurn(ctx, suffix, options = {}) {
   };
 }
 
+async function terminateSeededTurn(seeded, key) {
+  await seeded.control.terminal({
+    source: { kind: 'callback', key: `fixture-terminal:${key}` },
+    turnId: seeded.turnId,
+    terminalStatus: 'completed',
+    reason: `fixture completed before ${key}`
+  });
+}
+
+async function openPendingProviderSocket(ctx, provider, modelRequestId, onOpen, options = {}) {
+  let openedResolve;
+  let openedReject;
+  const opened = new Promise((resolve, reject) => {
+    openedResolve = resolve;
+    openedReject = reject;
+  });
+  let requestPayload;
+  let closeResolve;
+  const closeRequested = new Promise((resolve) => { closeResolve = resolve; });
+  const dispatch = provider.dispatch(modelRequestId, {
+    providerId: 'fake-local',
+    async sendFullRequest(request, controls) {
+      requestPayload = request;
+      try {
+        await onOpen(request, controls);
+        openedResolve();
+      } catch (error) {
+        openedReject(error);
+        throw error;
+      }
+      await Promise.race([closeRequested, new Promise((resolve, reject) => {
+        const signal = controls.signal;
+        if (!signal) return;
+        const onAbort = () => reject(signal.reason ?? new Error('fixture provider socket aborted'));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      })]);
+    }
+  }, options);
+  const settled = dispatch.then(
+    (value) => ({ status: 'fulfilled', value }),
+    (reason) => ({ status: 'rejected', reason })
+  );
+  await opened;
+  const row = await get(ctx.database, 'ModelRequest', modelRequestId);
+  return {
+    attemptSeq: row.stream_stats_json.attemptSeq,
+    socketGeneration: row.stream_stats_json.socketGeneration,
+    request: requestPayload,
+    close: () => closeResolve(),
+    settled
+  };
+}
+
 function createTurnControl(ctx, suffix, options = {}) {
   const thresholdTokens = options.thresholdTokens ?? 1024;
   return new kernel.TurnControlPlane(ctx.database, ctx.store, {
@@ -2121,9 +2577,11 @@ function createTurnControl(ctx, suffix, options = {}) {
               executorAgentId: request.executorAgentId,
               modelProfile: {
                 compressionThresholdTokens: thresholdTokens,
+                contextWindowTokens: thresholdTokens * 2,
                 tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
               },
               model: { providerConfigId: 'fake-local', modelId: 'fake-model' },
+              ...(options.compressionPolicy ? { compression: options.compressionPolicy } : {}),
               policies: { toolPolicyId: 'tools-default', systemPromptId: 'prompt-default' }
             })
           }
@@ -2142,7 +2600,8 @@ async function appendMessageContextFixture(ctx, seeded, suffix, role, content) {
   const plan = await context.prepareMessageAppendMutation({
     conversationId: seeded.conversationId,
     messageRevisionId: revisionId,
-    contentObjectId: contentObject.id
+    contentObjectId: contentObject.id,
+    contentByteLength: contentObject.byte_length
   });
   await ctx.database.transaction([
     kernel.DOMAIN_REPOSITORIES.domain('Message').insert({
@@ -2415,7 +2874,6 @@ async function writeEvidence(stableId, evidence, commitSha) {
   const sourceFilesTracked = manifestFilesAreTracked(root, sourceManifest);
   const compiledClosureMatches = compileProvenance.kind === 'limcode-reliable-kernel-compile-provenance'
     && compileProvenance.commitSha === commitSha
-    && compileProvenance.sourceFilesTracked === true
     && compileProvenance.sourceTreeSha256 === sourceManifest.sha256
     && compileProvenance.compiledClosureSha256 === compiledManifest.sha256;
   const sqlite = new Database(':memory:');
@@ -2439,6 +2897,7 @@ async function writeEvidence(stableId, evidence, commitSha) {
         && requestedCommit === commitSha
         && sourceFilesTracked
         && compileProvenance.worktreeClean === true
+        && compileProvenance.sourceFilesTracked === true
         && compiledClosureMatches,
       runnerSha256: await fileSha256(runnerPath),
       sourceTreeSha256: sourceManifest.sha256,

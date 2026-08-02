@@ -39,7 +39,7 @@ function reload(): void {
       <span class="settings-status">{{ settings.status }}</span>
     </div>
     <p class="settings-note">
-      对话级 common 设置会保存到当前 conversation 目录下的 <code>settings/common.json</code>。
+      对话名称直接保存在可靠 Runtime 的 Conversation 记录中；模型选择由独立的 ModelProfile 管理。
     </p>
 
     <SystemPromptScopeEditor

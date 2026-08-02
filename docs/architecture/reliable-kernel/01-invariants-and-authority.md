@@ -154,7 +154,7 @@ Effect kind 首发包括 `mcp_tool_call`。MCP connection rebuild 不是 call re
 | `recovery.answer-inbox-invariant` | F | AnswerSubmission 已提交但缺 InboxItem |
 | `recovery.delivery-pending` | F | pending RuntimeDelivery 重评估 |
 | `recovery.foreground-answer-wait-expired` | F | 前台 answer wait 到期转后台 |
-| `recovery.cancelled-subtree-incomplete` | F | cancel_subtree 后仍有 active Turn/pending Intent |
+| `recovery.interrupted-subtree-incomplete` | F | interrupt_subtree 后仍有 active Turn/pending Intent |
 
 D 建 scanner framework，但不得实现 F 的领域规则。candidate gate 为每个 ID 提供独立 check，不能再用“恢复三类”复合 prose。
 
@@ -181,7 +181,7 @@ stable nonce
 + process group
 + start fingerprint
 + command digest
-+ bounded spool path
++ durable append-only spool path
 + atomic exit receipt
 ```
 
@@ -244,7 +244,7 @@ ProviderContinuation 首发为 `disabled-full-request`：
 
 未来 enabled contract 可规定同物理 connection、strict prefix、Completed fence 与 socketGeneration，但首发实现和 gate 不得假装已启用。
 
-## 15. ChildExecution 与 cancel_subtree
+## 15. ChildExecution 与 interrupt_subtree
 
 - ChildExecution 是稳定 lineage；
 - ParentLink 是稳定树边；
@@ -254,7 +254,7 @@ ProviderContinuation 首发为 `disabled-full-request`：
 - AnswerBridge 归属 ChildExecution，续接 Turn 复用同一 bridge；
 - queue 与 interrupt 是不同输入语义；
 - wait/list 为单次短 SQLite snapshot read，不改变 delivery；
-- cancel_subtree 首发必选，沿 ParentLink 递归，并在同一事务覆盖 active Turn 与 pending Intent；
+- interrupt_subtree 首发必选，沿 ParentLink 递归，并在同一事务覆盖 active Turn 与 pending Intent；
 - 终止请求不是终态，partial interrupted answer 可保存但不得重开父 Turn。
 
 UI 直接显示 childExecution、activeChildTurn、answerSubmission、runtimeDelivery、parentHandling 与 termination facts，不通过旧 activityStage、notificationRun 或 display text 猜测。
@@ -276,6 +276,8 @@ UI 直接显示 childExecution、activeChildTurn、answerSubmission、runtimeDel
 SQLite long-lived connection 只能缓存由 RootAuthority 建立的 immutable fenced RootBinding；每个 request/transaction 开始时重验 generation。root switch 只在 restart 后、数据库打开前完成。
 
 最终 VSIX 的 cutover-only coordinator 是 archive actor。它按 physical manifest journaled archive Runtime、filter settings/scope links、验证配置与外部 untouched 项，再创建 SQLite/CAS/epoch 并原子切 pointer。激活前失败按 journal 恢复；激活后不自动回退旧 writer。
+
+已落盘 SQLite epoch 2 到当前 epoch 3 只允许在 Extension Host 重启后的数据库打开前做一次精确、有界升级：先校验完整 predecessor 指纹并生成一致性备份，再写 pending writer fence，以单个 SQLite 事务升级并通过 durable journal 向前收敛。未知 schema、缺失备份或绑定冲突都 fail closed；这不改变单一当前 epoch，也不允许运行期协议协商或长期 migration chain。
 
 ## 18. 失败原则
 

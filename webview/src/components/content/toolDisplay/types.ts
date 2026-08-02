@@ -73,6 +73,8 @@ export interface ToolDisplayContext {
   checkpointTimelineAnchors?: CheckpointTimelineAnchorRecord[];
   shadowRepositories?: ShadowRepositoryRecord[];
   currentConversationId?: string;
+  /** Reliable plan identity is derived independently from the Interaction request identity. */
+  planProposalId?: string;
   stringifyValue(value: unknown): string;
 }
 

@@ -17,6 +17,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { handoffReason } from './executionLeaseFence';
 
 export type FileChangeOperation =
   | 'create_file'
@@ -1069,13 +1070,29 @@ export class FileMutationDispatcher {
     private readonly resolveBoundary: WorkEnvironmentBoundaryResolver
   ) {}
 
-  public async dispatch(effectIntentId: string): Promise<FileMutationObservation | null> {
+  public async dispatch(
+    effectIntentId: string,
+    signal?: AbortSignal
+  ): Promise<FileMutationObservation | null> {
+    if (signal?.aborted) {
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      const cancelled = await this.effects.cancelPendingEffect({
+        source: { kind: 'internal', key: `file-mutation:${effectIntentId}:cancel-before-dispatch` },
+        effectIntentId,
+        detail: { reason: 'File mutation cancelled before capability dispatch.' }
+      });
+      if (cancelled) return null;
+    }
     if (!await this.effects.claimEffectDispatch(effectIntentId)) return null;
-    return this.executeDispatched(effectIntentId);
+    return this.executeDispatched(effectIntentId, signal);
   }
 
   /** Executes one already-dispatched intent and returns observation; caller persists the Receipt. */
-  public async executeDispatched(effectIntentIdInput: string): Promise<FileMutationObservation> {
+  public async executeDispatched(
+    effectIntentIdInput: string,
+    signal?: AbortSignal
+  ): Promise<FileMutationObservation> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     if (intent.effect_kind !== FILE_EFFECT_KIND || intent.dispatch_state !== 'dispatched') {
@@ -1084,16 +1101,25 @@ export class FileMutationDispatcher {
     const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1);
     if (receipts.length > 0) throw new Error('File mutation EffectIntent already has a Receipt and cannot execute again.');
     const request = await this.effects.readEffectRequest<FileEffectRequest>(effectIntentId);
-    return this.apply(request);
+    return this.apply(request, signal);
   }
 
-  public async dispatchRecordAndReconcile(effectIntentIdInput: string): Promise<{
+  public async dispatchRecordAndReconcile(effectIntentIdInput: string, signal?: AbortSignal): Promise<{
     observation: FileMutationObservation | null;
     terminal: ToolTerminalResult | null;
   }> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
-    const observation = await this.dispatch(effectIntentId);
-    if (!observation) return { observation: null, terminal: null };
+    const observation = await this.dispatch(effectIntentId, signal);
+    if (!observation) {
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      const attempt = await this.requireExisting('Attempt', requireId(intent.attempt_id, 'EffectIntent.attempt_id'));
+      const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
+      const toolCallId = requireId(operation.tool_call_id, 'Operation.tool_call_id');
+      return {
+        observation: null,
+        terminal: await this.effects.readTerminalResult(toolCallId, false)
+      };
+    }
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     const recorded = await this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `file-effect:${String(intent.attempt_id)}:receipt` },
@@ -1120,11 +1146,23 @@ export class FileMutationDispatcher {
     };
   }
 
-  private async apply(requestInput: FileEffectRequest): Promise<FileMutationObservation> {
+  private async apply(
+    requestInput: FileEffectRequest,
+    signal?: AbortSignal
+  ): Promise<FileMutationObservation> {
     const request = normalizeEffectRequest(requestInput);
     const members: FileMutationMemberObservation[] = [];
     for (const member of request.members) {
-      const observation = await this.applyMember(member);
+      if (signal?.aborted) {
+        members.push(memberObservation(
+          member,
+          'cancelled',
+          null,
+          'File mutation cancelled before this member was dispatched.'
+        ));
+        break;
+      }
+      const observation = await this.applyMember(member, signal);
       members.push(observation);
       if (observation.outcome !== 'succeeded') break;
     }
@@ -1135,7 +1173,10 @@ export class FileMutationDispatcher {
     };
   }
 
-  private async applyMember(member: FileEffectRequest['members'][number]): Promise<FileMutationMemberObservation> {
+  private async applyMember(
+    member: FileEffectRequest['members'][number],
+    signal?: AbortSignal
+  ): Promise<FileMutationMemberObservation> {
     let resolved: string;
     try {
       resolved = await resolveBoundedTarget(this.resolveBoundary, member.workEnvironmentId, member.targetPath);
@@ -1156,15 +1197,28 @@ export class FileMutationDispatcher {
         creates ? 'Create target already exists.' : 'baseDigest does not match the actual target.'
       );
     }
+    if (signal?.aborted) {
+      return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before member dispatch.');
+    }
 
     try {
       switch (member.operation) {
-        case 'create_file':
-          await fs.writeFile(resolved, await this.readTargetBytes(member), { flag: 'wx' });
+        case 'create_file': {
+          const bytes = await this.readTargetBytes(member);
+          if (signal?.aborted) {
+            return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before write dispatch.');
+          }
+          await fs.writeFile(resolved, bytes, { flag: 'wx' });
           break;
-        case 'replace_file':
-          await fs.writeFile(resolved, await this.readTargetBytes(member), { flag: 'w' });
+        }
+        case 'replace_file': {
+          const bytes = await this.readTargetBytes(member);
+          if (signal?.aborted) {
+            return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before write dispatch.');
+          }
+          await fs.writeFile(resolved, bytes, { flag: 'w' });
           break;
+        }
         case 'delete_file':
           await fs.unlink(resolved);
           break;

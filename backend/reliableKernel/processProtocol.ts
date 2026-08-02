@@ -3,8 +3,6 @@ import * as path from 'node:path';
 import type { RootBinding } from './contracts';
 
 export const PROCESS_OUTPUT_MAX_CHUNK_BYTES = 65_536;
-export const PROCESS_OUTPUT_MAX_RETAINED_BYTES = 4_194_304;
-export const PROCESS_OUTPUT_MAX_RETAINED_CHUNKS = 256;
 export const PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM = 32_768;
 export const PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS = 250;
 export const PROCESS_SPOOL_DIRECTORY = 'process-spool';

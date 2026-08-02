@@ -9,7 +9,9 @@ export const submitPlanToolDisplay: ToolDisplayResolver = (context) => {
   if (!request) return undefined;
 
   const output = submitPlanOutputFromResult(context.result);
-  const proposalId = proposalIdFromProgress(context.toolCall?.progress) ?? output?.proposalId;
+  const proposalId = context.planProposalId
+    ?? proposalIdFromProgress(context.toolCall?.progress)
+    ?? output?.proposalId;
 
   return {
     headerIcon: IconClipboardList,

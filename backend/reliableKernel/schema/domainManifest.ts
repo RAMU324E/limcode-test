@@ -31,6 +31,20 @@ BEGIN
       WHERE turn_id = OLD.id
    );
 END`
+  }),
+  Object.freeze({
+    name: 'prevent_runtime_delivery_after_final_output_fence',
+    sql: `CREATE TRIGGER prevent_runtime_delivery_after_final_output_fence
+BEFORE INSERT ON pending_turn_input
+WHEN NEW.input_kind = 'runtime_delivery'
+ AND EXISTS (
+   SELECT 1
+     FROM turn_final_output_fence
+    WHERE turn_id = NEW.turn_id
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'runtime delivery crossed final-output fence');
+END`
   })
 ] as const);
 
@@ -46,10 +60,10 @@ export function createRuntimeSchemaSql(): string[] {
   const statements = [
     createRootBindingTableSql(),
     createSchemaManifestTableSql(),
-    ...RUNTIME_DOMAIN_SCHEMAS.map(createTableSql)
+    ...RUNTIME_DOMAIN_SCHEMAS.map((schema) => createRuntimeDomainTableSql(schema))
   ];
   for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
-    schema.indexes.forEach((index, ordinal) => statements.push(createIndexSql(schema, index, ordinal)));
+    schema.indexes.forEach((index, ordinal) => statements.push(createRuntimeDomainIndexSql(schema, index, ordinal)));
   }
   statements.push(...RUNTIME_SCHEMA_TRIGGERS.map((trigger) => trigger.sql));
   return statements;
@@ -93,7 +107,10 @@ function createSchemaManifestTableSql(): string {
   )`;
 }
 
-function createTableSql(schema: RuntimeDomainSchema): string {
+export function createRuntimeDomainTableSql(
+  schema: RuntimeDomainSchema,
+  tableName = schema.table
+): string {
   const columns = schema.columns.map((column) => {
     const fragments = [quote(column.name), column.type];
     if (column.name === 'id') fragments.push('PRIMARY KEY');
@@ -105,10 +122,14 @@ function createTableSql(schema: RuntimeDomainSchema): string {
     }
     return `  ${fragments.join(' ')}`;
   });
-  return `CREATE TABLE ${quote(schema.table)} (\n${columns.join(',\n')}\n)`;
+  return `CREATE TABLE ${quote(tableName)} (\n${columns.join(',\n')}\n)`;
 }
 
-function createIndexSql(schema: RuntimeDomainSchema, authorityIndex: string, ordinal: number): string {
+export function createRuntimeDomainIndexSql(
+  schema: RuntimeDomainSchema,
+  authorityIndex: string,
+  ordinal: number
+): string {
   const partialMarker = ' UNIQUE WHERE ';
   let columns = authorityIndex;
   let unique = false;
@@ -127,8 +148,8 @@ function createIndexSql(schema: RuntimeDomainSchema, authorityIndex: string, ord
 }
 
 function validateDomainManifest(): void {
-  if (RUNTIME_DOMAIN_SCHEMAS.length !== 72) {
-    throw new Error(`Runtime domain schema exact set must contain 72 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
+  if (RUNTIME_DOMAIN_SCHEMAS.length !== 87) {
+    throw new Error(`Runtime domain schema exact set must contain 87 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
   }
   for (const field of ['key', 'table', 'repository', 'codec'] as const) {
     const values = RUNTIME_DOMAIN_SCHEMAS.map((entry) => entry[field]);

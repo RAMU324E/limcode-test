@@ -3,11 +3,19 @@ import {
   type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
-import { ChildExecutionControlPlane, type PreparedForegroundSettlement } from './childExecution';
+import {
+  AutomaticRuntimeDeliveryRouter,
+  type AutomaticRuntimeDeliveryDecision
+} from './automaticRuntimeDelivery';
+import {
+  ChildExecutionControlPlane,
+  type ChildWaitSettlement,
+  type PreparedForegroundSettlement
+} from './childExecution';
+import { requireChildExecutionStatus } from './childExecutionState';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   isTransactionAssertionFailure,
-  optionalPhaseFId,
   requireIsoTimestamp,
   requirePhaseFId,
   requirePhaseFText,
@@ -20,6 +28,7 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export type RuntimeDeliveryPhase = 'current_turn' | 'next_turn' | 'notify_only';
@@ -29,11 +38,11 @@ export type ParentHandlingState = 'unhandled' | 'handled' | 'not_applicable';
 export interface AnswerSubmitCommand {
   answerBridgeId: string;
   submissionId: string;
-  sourceTurnId?: string;
+  /** Exact Child Turn generation that owns this submission. */
+  sourceTurnId: string;
   title?: string;
   content: string | Uint8Array;
   contentType?: string;
-  interrupted?: boolean;
 }
 
 export interface AnswerSubmitResult {
@@ -43,7 +52,18 @@ export interface AnswerSubmitResult {
   inboxItemId: string;
   foregroundSettled: boolean;
   deduplicated: boolean;
+  /** Exact historical callback replay; callers must not re-run wait/delivery orchestration. */
+  historicalReplay: boolean;
   commitSeq?: string;
+}
+
+export interface AnswerWaitRecoveryResult {
+  answerBridgeId: string;
+  submissionId: string;
+  inboxItemId: string;
+  sourceTurnId: string;
+  newlySettledToolCallIds: string[];
+  settledByAnswer: boolean;
 }
 
 export type AnswerReadResult =
@@ -55,7 +75,7 @@ export type AnswerReadResult =
       answerBridgeId: string;
       childExecutionId: string;
       submissionId: string;
-      sourceTurnId: string | null;
+      sourceTurnId: string;
       title: string | null;
       content: string;
       contentType: string;
@@ -80,6 +100,42 @@ export interface RuntimeDeliveryAdvanceResult extends RuntimeDeliveryResult {
   commitSeq?: string;
 }
 
+export type AnswerDeliveryRecoveryDisposition =
+  | {
+      kind: 'existing';
+      submissionId: string;
+      inboxItemId: string;
+      deliveryIds: string[];
+    }
+  | {
+      kind: 'settled_by_answer';
+      submissionId: string;
+      inboxItemId: string;
+    }
+  | {
+      kind: 'deferred_live_owner';
+      submissionId: string;
+      inboxItemId: string;
+      sourceTurnId: string;
+    }
+  | {
+      kind: 'delivery_required';
+      submissionId: string;
+      inboxItemId: string;
+      command: RuntimeDeliveryCreateCommand;
+      automaticSourceTurnId: string;
+    };
+
+interface AnswerSubmissionAuthority {
+  bridge: DomainRow;
+  childExecution: DomainRow;
+  turnLink: DomainRow;
+  turn: DomainRow;
+  activeTurnLink: DomainRow | null;
+  termination: DomainRow | null;
+  currentSubmission: DomainRow | null;
+}
+
 const DELIVERY_PHASES = new Set<RuntimeDeliveryPhase>(['current_turn', 'next_turn', 'notify_only']);
 const DELIVERY_STATES = new Set<RuntimeDeliveryState>(['pending', 'consumed', 'failed']);
 const ACTIVE_TURN = 'active';
@@ -88,6 +144,7 @@ const TERMINATED_TURN = 'terminated';
 /** AnswerSubmission + AnswerBridge flip + RuntimeInboxItem atomic writer. */
 export class AnswerControlPlane {
   private readonly now: () => string;
+  private readonly automaticDeliveryRouter: AutomaticRuntimeDeliveryRouter;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -96,6 +153,7 @@ export class AnswerControlPlane {
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
   }
 
   public async submit(commandInput: AnswerSubmitCommand): Promise<AnswerSubmitResult> {
@@ -104,6 +162,7 @@ export class AnswerControlPlane {
     const replay = await this.findReplay(command, ids);
     if (replay) return replay;
     const bridge = await this.requireExisting('AnswerBridge', command.answerBridgeId);
+    const authority = await this.readSubmissionAuthority(command, bridge);
     const childExecutionId = requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
     const payloadContent = await this.contentStore.prepare(
       this.database,
@@ -118,7 +177,7 @@ export class AnswerControlPlane {
         answerBridgeId: command.answerBridgeId,
         answerSubmissionId: command.submissionId,
         answerContentObjectId: payloadContent.metadata.id,
-        interrupted: command.interrupted
+        interrupted: false
       },
       sourceIdentity: `answer:${command.answerBridgeId}:${command.submissionId}`
     });
@@ -128,10 +187,15 @@ export class AnswerControlPlane {
 
     try {
       const commit = await this.database.transaction([
-        ...answerFactSteps(command, ids, bridge, payloadContent, now),
+        ...answerAuthoritySteps(command, authority),
+        ...answerFactSteps(command, ids, bridge, payloadContent, now, false),
         ...(eligibleForeground ? eligibleForeground.steps : [])
       ]);
-      return answerResult(command, ids, eligibleForeground !== null, false, commit.commitSeq);
+      if (eligibleForeground) {
+        await this.children.finalizeWaitSettlement(eligibleForeground.toolCallId);
+        await this.markInboxSettled(ids.inboxItemId);
+      }
+      return answerResult(command, ids, eligibleForeground !== null, false, false, commit.commitSeq);
     } catch (error) {
       if (
         eligibleForeground
@@ -140,13 +204,168 @@ export class AnswerControlPlane {
       ) {
         // The deadline/another answer durably won the ToolCall. Only this exact persisted winner
         // permits retrying the answer-only transaction; unrelated assertion failures propagate.
-        const commit = await this.commitAnswerOnlyAfterForegroundRace(command, ids, bridge, payloadContent, now);
-        return answerResult(command, ids, false, commit.deduplicated, commit.commitSeq);
+        const commit = await this.commitAnswerOnlyAfterForegroundRace(
+          command,
+          ids,
+          bridge,
+          authority,
+          payloadContent,
+          now
+        );
+        return answerResult(
+          command,
+          ids,
+          false,
+          commit.deduplicated,
+          commit.historicalReplay,
+          commit.commitSeq
+        );
       }
       if (!isExpectedAnswerIdentityConflict(error)) throw error;
       const raced = await this.findReplay(command, ids, payloadContent);
       if (!raced) throw error;
       return raced;
+    }
+  }
+
+  /**
+   * Materializes one deterministic weak-signal answer when cancellation terminated a child Turn
+   * before submit_agent_answer ran. Already submitted answers always win; concurrent recovery
+   * contenders share the same submission identity and the bridge's current-submission CAS.
+   */
+  public async ensureInterruptedPartial(input: {
+    childExecutionId: string;
+    turnId: string;
+    reason: string;
+  }): Promise<AnswerSubmitResult | null> {
+    const childExecutionId = requirePhaseFId(input.childExecutionId, 'childExecutionId');
+    const turnId = requirePhaseFId(input.turnId, 'turnId');
+    const reason = requirePhaseFText(input.reason, 'reason');
+    const snapshot = await this.children.readExecutionSnapshot(childExecutionId);
+    if (snapshot.currentSubmission) return null;
+    const childStatus = requireChildExecutionStatus(snapshot.childExecution.status);
+    if (childStatus !== 'interrupting' && childStatus !== 'interrupted') return null;
+    if (snapshot.activeTurnLink !== null) return null;
+    const allTurnLinks = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
+      child_execution_id: childExecutionId
+    });
+    const sourceTurnLink = allTurnLinks.find((link) => link.turn_id === turnId);
+    if (!sourceTurnLink) {
+      throw new Error(`Turn ${turnId} is not a member of ChildExecution ${childExecutionId}.`);
+    }
+    const latestTurnLink = [...allTurnLinks].sort((left, right) => {
+      const a = BigInt(String(left.turn_seq));
+      const b = BigInt(String(right.turn_seq));
+      return a < b ? 1 : a > b ? -1 : 0;
+    })[0];
+    if (!latestTurnLink || latestTurnLink.id !== sourceTurnLink.id) return null;
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== TERMINATED_TURN) return null;
+    const terminations = await this.listRows('TurnTermination', { turn_id: turnId }, 2);
+    if (terminations.length !== 1 || !['interrupted', 'cancelled'].includes(String(terminations[0].terminal_status))) {
+      return null;
+    }
+    const bridge = snapshot.answerBridge;
+    if (!['open', 'interrupted'].includes(String(bridge.status))) return null;
+    const content = await this.interruptedPartialContent(turnId, reason);
+    const submissionId = stablePhaseFId('answer_submission', 'interrupted-partial', childExecutionId, turnId);
+    const command = normalizeAnswerCommand({
+      answerBridgeId: requirePhaseFId(bridge.id, 'AnswerBridge.id'),
+      submissionId,
+      sourceTurnId: turnId,
+      title: '子 Agent 已中断（部分结果）',
+      content,
+      contentType: 'text/markdown'
+    });
+    const ids = answerIds(command.answerBridgeId, submissionId);
+    const replay = await this.findReplay(command, ids, undefined, true);
+    if (replay) return replay.historicalReplay ? null : replay;
+    const payloadContent = await this.contentStore.prepare(this.database, content, command.contentType);
+    const now = this.timestamp();
+    const foreground = await this.children.prepareForegroundSettlement({
+      childExecutionId,
+      status: 'partial',
+      detail: {
+        answerBridgeId: command.answerBridgeId,
+        answerSubmissionId: submissionId,
+        answerContentObjectId: payloadContent.metadata.id,
+        interrupted: true
+      },
+      sourceIdentity: `interrupted-answer:${command.answerBridgeId}:${submissionId}`
+    });
+    const eligibleForeground = foreground && Date.parse(now) <= Date.parse(foreground.waitDeadlineAt)
+      ? foreground
+      : null;
+    const authority: AnswerSubmissionAuthority = {
+      bridge,
+      childExecution: snapshot.childExecution,
+      turnLink: sourceTurnLink,
+      turn,
+      activeTurnLink: null,
+      termination: terminations[0],
+      currentSubmission: null
+    };
+    const authoritySteps = interruptedAnswerAuthoritySteps(
+      command,
+      authority,
+      allTurnLinks.map((link) => requirePhaseFId(link.id, 'ChildExecutionTurnLink.id'))
+    );
+    try {
+      const commit = await this.database.transaction([
+        ...authoritySteps,
+        ...answerFactSteps(command, ids, bridge, payloadContent, now, true),
+        ...(eligibleForeground ? eligibleForeground.steps : [])
+      ]);
+      if (eligibleForeground) {
+        await this.children.finalizeWaitSettlement(eligibleForeground.toolCallId);
+        await this.markInboxSettled(ids.inboxItemId);
+      }
+      return answerResult(command, ids, eligibleForeground !== null, false, false, commit.commitSeq);
+    } catch (error) {
+      if (
+        eligibleForeground
+        && isExpectedForegroundRace(error)
+        && await this.foregroundRaceHasDurableWinner(eligibleForeground)
+      ) {
+        try {
+          const commit = await this.database.transaction([
+            ...authoritySteps,
+            ...answerFactSteps(command, ids, bridge, payloadContent, now, true)
+          ]);
+          return answerResult(command, ids, false, false, false, commit.commitSeq);
+        } catch (retryError) {
+          error = retryError;
+        }
+      }
+      if (isTransactionAssertionFailure(error)) return null;
+      if (!isExpectedAnswerIdentityConflict(error)) throw error;
+      const raced = await this.findReplay(command, ids, payloadContent, true);
+      if (raced) return raced.historicalReplay ? null : raced;
+      const latest = await this.children.readExecutionSnapshot(childExecutionId);
+      if (latest.currentSubmission) return null;
+      throw error;
+    }
+  }
+
+  private async markInboxSettled(inboxItemId: string): Promise<void> {
+    const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+    if (inbox.state === 'settled') return;
+    if (inbox.state !== 'available') {
+      throw new Error(`RuntimeInboxItem ${inboxItemId} cannot settle from ${String(inbox.state)}.`);
+    }
+    const now = this.timestamp();
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(inboxItemId, { state: 'available' }),
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').update(inboxItemId, {
+          state: 'settled',
+          updated_at: now
+        })
+      ]);
+    } catch (error) {
+      if (!isTransactionAssertionFailure(error)) throw error;
+      const raced = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+      if (raced.state !== 'settled') throw error;
     }
   }
 
@@ -178,9 +397,7 @@ export class AnswerControlPlane {
       answerBridgeId,
       childExecutionId,
       submissionId,
-      sourceTurnId: snapshot.currentSubmission.turn_id === null
-        ? null
-        : requirePhaseFId(snapshot.currentSubmission.turn_id, 'AnswerSubmission.turn_id'),
+      sourceTurnId: requirePhaseFId(snapshot.currentSubmission.turn_id, 'AnswerSubmission.turn_id'),
       title: payload.title === null ? null : requirePhaseFText(payload.title, 'AnswerPayload.title'),
       content,
       contentType: contentRow.content_type,
@@ -188,16 +405,32 @@ export class AnswerControlPlane {
     };
   }
 
-  /** Recovery-only invariant repair. It never flips the bridge or settles a ToolCall. */
+  /** Recovery-only invariant repair, fenced against a live source-Turn owner. */
   public async ensureInboxForSubmission(answerSubmissionIdInput: string): Promise<{
     inboxItemId: string;
     created: boolean;
+    deferredLiveOwner?: string;
     commitSeq?: string;
   }> {
     const submissionId = requirePhaseFId(answerSubmissionIdInput, 'answerSubmissionId');
     const submission = await this.requireExisting('AnswerSubmission', submissionId);
     const bridgeId = requirePhaseFId(submission.answer_bridge_id, 'AnswerSubmission.answer_bridge_id');
     const ids = answerIds(bridgeId, submissionId);
+    const sourceTurnId = requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id');
+    const sourceAuthority = await this.readRecoverySourceAuthority(sourceTurnId);
+    if (sourceAuthority.liveOwner) {
+      return {
+        inboxItemId: ids.inboxItemId,
+        created: false,
+        deferredLiveOwner: sourceTurnId
+      };
+    }
+    const payloads = await this.listRows('AnswerPayload', { submission_id: submissionId }, 2);
+    if (payloads.length !== 1) throw new Error('AnswerSubmission must have exactly one AnswerPayload before inbox repair.');
+    const payloadContentObjectId = requirePhaseFId(
+      payloads[0].content_object_id,
+      'AnswerPayload.content_object_id'
+    );
     const rows = await this.listRows('RuntimeInboxItem', {
       dedupe_key: answerDedupeKey(bridgeId, submissionId)
     }, 2);
@@ -205,12 +438,19 @@ export class AnswerControlPlane {
       if (rows[0].source_kind !== 'answer_submission' || rows[0].source_id !== submissionId) {
         throw new Error('Answer RuntimeInboxItem dedupe key points to a different source identity.');
       }
+      await this.ensureInboxPayloadLink(
+        requirePhaseFId(rows[0].id, 'RuntimeInboxItem.id'),
+        ids.inboxPayloadLinkId,
+        payloadContentObjectId,
+        sourceAuthority.steps
+      );
       return { inboxItemId: rows[0].id as string, created: false };
     }
     if (rows.length > 1) throw new Error('Answer RuntimeInboxItem dedupe identity is not unique.');
     const now = this.timestamp();
     try {
       const commit = await this.database.transaction([
+        ...sourceAuthority.steps,
         DOMAIN_REPOSITORIES.domain('AnswerSubmission').assert(submissionId, {
           answer_bridge_id: bridgeId,
           submission_seq: submission.submission_seq
@@ -223,56 +463,568 @@ export class AnswerControlPlane {
           state: 'available',
           created_at: now,
           updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxPayloadLink').insert({
+          id: ids.inboxPayloadLinkId,
+          inbox_item_id: ids.inboxItemId,
+          content_object_id: payloadContentObjectId,
+          created_at: now
         })
       ]);
       return { inboxItemId: ids.inboxItemId, created: true, commitSeq: commit.commitSeq };
     } catch (error) {
       if (!sqliteUniqueFailureIncludes(error, [
         'runtime_inbox_item.dedupe_key',
-        'runtime_inbox_item.id'
+        'runtime_inbox_item.id',
+        'runtime_inbox_payload_link.id',
+        'runtime_inbox_payload_link.inbox_item_id'
       ])) throw error;
       const raced = await this.listRows('RuntimeInboxItem', {
         dedupe_key: answerDedupeKey(bridgeId, submissionId)
       }, 2);
       if (raced.length !== 1) throw error;
+      await this.ensureInboxPayloadLink(
+        requirePhaseFId(raced[0].id, 'RuntimeInboxItem.id'),
+        ids.inboxPayloadLinkId,
+        payloadContentObjectId,
+        sourceAuthority.steps
+      );
       return { inboxItemId: raced[0].id as string, created: false };
     }
+  }
+
+  /**
+   * Replays the post-submit parent-wait edge from immutable AnswerSubmission facts.
+   *
+   * AnswerSubmission/RuntimeInboxItem commit before coordinator orchestration. If that caller is
+   * interrupted after the commit (or its submit_agent_answer ToolCall is subsequently failed), the
+   * answer must still win every eligible parent wait bound to its exact child Turn generation.
+   * This method is deliberately idempotent and is shared by live coordinator and startup recovery.
+   */
+  public async reconcileCommittedWaits(
+    answerSubmissionIdInput: string
+  ): Promise<AnswerWaitRecoveryResult> {
+    const submissionId = requirePhaseFId(answerSubmissionIdInput, 'answerSubmissionId');
+    const submission = await this.requireExisting('AnswerSubmission', submissionId);
+    const answerBridgeId = requirePhaseFId(
+      submission.answer_bridge_id,
+      'AnswerSubmission.answer_bridge_id'
+    );
+    const sourceTurnId = requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id');
+    const observedAt = requireIsoTimestamp(submission.created_at, 'AnswerSubmission.created_at');
+    const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
+    const childExecutionId = requirePhaseFId(
+      bridge.child_execution_id,
+      'AnswerBridge.child_execution_id'
+    );
+    const parentLinks = await this.listRows('ChildExecutionParentLink', {
+      child_execution_id: childExecutionId
+    }, 2);
+    if (parentLinks.length !== 1) {
+      throw new Error('Answer wait recovery requires exactly one ChildExecutionParentLink.');
+    }
+    const payloads = await this.listRows('AnswerPayload', { submission_id: submissionId }, 2);
+    if (payloads.length !== 1) {
+      throw new Error('Answer wait recovery requires exactly one AnswerPayload.');
+    }
+    const payload = payloads[0];
+    const contentRow = await this.requireExisting(
+      'ContentObject',
+      requirePhaseFId(payload.content_object_id, 'AnswerPayload.content_object_id')
+    ) as ContentObjectMetadata;
+    const content = (await this.contentStore.read(contentRow)).toString('utf8');
+    const title = payload.title === null
+      ? null
+      : requirePhaseFText(payload.title, 'AnswerPayload.title');
+    const interrupted = submission.interrupted === 1n;
+    const detail = interrupted
+      ? {
+          ok: false,
+          status: 'interrupted',
+          partial: true,
+          interrupted: true,
+          answerBridgeId,
+          submissionId,
+          title,
+          content
+        }
+      : {
+          ok: true,
+          answerBridgeId,
+          submissionId,
+          title,
+          content
+        };
+    const continuationSettlements: ChildWaitSettlement[] = [];
+    const waitingOperations = (await this.children.listContinuationWaitOperations({
+      answerBridgeId,
+      sourceTurnId,
+      status: 'waiting_answer'
+    })).sort((left, right) => compareCounter(left.operation_seq, right.operation_seq));
+    for (const operation of waitingOperations) {
+      const toolCallId = requirePhaseFId(operation.tool_call_id, 'Operation.tool_call_id');
+      // Settlement identity is per ToolCall. One durable winner for this submission must not make
+      // recovery skip another wait from the same child Turn generation.
+      if (await this.wasSubmissionUsedToSettleToolCall(submissionId, toolCallId)) continue;
+      continuationSettlements.push(...await this.children.settleContinuationWaits({
+        answerBridgeId,
+        sourceTurnId,
+        toolCallId,
+        detail,
+        status: interrupted ? 'partial' : 'succeeded',
+        sourceIdentity: `${interrupted ? 'interrupted-answer' : 'answer'}:${submissionId}`,
+        observedAt
+      }));
+    }
+
+    // A crash may leave a terminal Operation + ToolResultArtifact behind an earlier ToolCall in
+    // the ordered batch. Retrying finalization is required even when there is no waiting Operation.
+    const waitToolCallIds = new Set<string>([
+      requirePhaseFId(
+        parentLinks[0].source_tool_call_id,
+        'ChildExecutionParentLink.source_tool_call_id'
+      )
+    ]);
+    const continuationOperations = await this.children.listContinuationWaitOperations({
+      answerBridgeId,
+      sourceTurnId
+    });
+    for (const operation of continuationOperations) {
+      if (operation.tool_call_id !== null) {
+        waitToolCallIds.add(requirePhaseFId(operation.tool_call_id, 'Operation.tool_call_id'));
+      }
+    }
+    for (const toolCallId of waitToolCallIds) {
+      await this.children.finalizeWaitSettlement(toolCallId);
+    }
+
+    const inboxRows = await this.listRows('RuntimeInboxItem', {
+      dedupe_key: answerDedupeKey(answerBridgeId, submissionId)
+    }, 2);
+    if (inboxRows.length !== 1) {
+      throw new Error('Answer wait recovery requires exactly one RuntimeInboxItem.');
+    }
+    const inboxItemId = requirePhaseFId(inboxRows[0].id, 'RuntimeInboxItem.id');
+    return {
+      answerBridgeId,
+      submissionId,
+      inboxItemId,
+      sourceTurnId,
+      newlySettledToolCallIds: continuationSettlements.map((settlement) => settlement.toolCallId),
+      settledByAnswer: await this.wasSubmissionUsedToSettleAnyWait(
+        submissionId,
+        answerBridgeId,
+        parentLinks[0],
+        sourceTurnId
+      )
+    };
+  }
+
+  /**
+   * Recovery-only classifier for the AnswerSubmission -> RuntimeDelivery crash boundary.
+   *
+   * The submit transaction deliberately commits the immutable answer before product orchestration
+   * chooses a parent destination.  A Host can therefore die with a complete Submission/Inbox but
+   * no Delivery.  This method reconstructs that missing decision exclusively from stable lineage
+   * and durable wait artifact/outcome content. A live source Turn is deferred so a second Extension
+   * Host cannot race the coordinator between answer commit and foreground settlement/delivery
+   * creation.
+   */
+  public async classifyDeliveryRecovery(
+    answerSubmissionIdInput: string
+  ): Promise<AnswerDeliveryRecoveryDisposition> {
+    const submissionId = requirePhaseFId(answerSubmissionIdInput, 'answerSubmissionId');
+    const submission = await this.requireExisting('AnswerSubmission', submissionId);
+    const answerBridgeId = requirePhaseFId(
+      submission.answer_bridge_id,
+      'AnswerSubmission.answer_bridge_id'
+    );
+    const inboxRows = await this.listRows('RuntimeInboxItem', {
+      dedupe_key: answerDedupeKey(answerBridgeId, submissionId)
+    }, 2);
+    if (inboxRows.length !== 1) {
+      throw new Error('AnswerSubmission delivery recovery requires exactly one RuntimeInboxItem.');
+    }
+    const inboxItemId = requirePhaseFId(inboxRows[0].id, 'RuntimeInboxItem.id');
+    if (
+      inboxRows[0].source_kind !== 'answer_submission'
+      || inboxRows[0].source_id !== submissionId
+    ) throw new Error('AnswerSubmission RuntimeInboxItem has a conflicting source identity.');
+
+    const existingDeliveries = await listAllDomainRows(this.database, 'RuntimeDelivery', {
+      inbox_item_id: inboxItemId
+    });
+    if (existingDeliveries.length > 0) {
+      return {
+        kind: 'existing',
+        submissionId,
+        inboxItemId,
+        deliveryIds: existingDeliveries.map((row) =>
+          requirePhaseFId(row.id, 'RuntimeDelivery.id')
+        )
+      };
+    }
+
+    const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
+    const childExecutionId = requirePhaseFId(
+      bridge.child_execution_id,
+      'AnswerBridge.child_execution_id'
+    );
+    const parentLinks = await this.listRows('ChildExecutionParentLink', {
+      child_execution_id: childExecutionId
+    }, 2);
+    if (parentLinks.length !== 1) {
+      throw new Error('AnswerSubmission delivery recovery requires exactly one ChildExecutionParentLink.');
+    }
+    const sourceTurnId = requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id');
+    if (await this.wasSubmissionUsedToSettleAnyWait(
+      submissionId,
+      answerBridgeId,
+      parentLinks[0],
+      sourceTurnId
+    )) {
+      return { kind: 'settled_by_answer', submissionId, inboxItemId };
+    }
+
+    if (await this.isTurnOwnedByLiveHost(sourceTurnId)) {
+      return { kind: 'deferred_live_owner', submissionId, inboxItemId, sourceTurnId };
+    }
+
+    const parentTurnId = requirePhaseFId(
+      parentLinks[0].parent_turn_id,
+      'ChildExecutionParentLink.parent_turn_id'
+    );
+    const parentTurn = await this.requireExisting('Turn', parentTurnId);
+    const targetConversationId = requirePhaseFId(
+      parentTurn.conversation_id,
+      'Parent Turn.conversation_id'
+    );
+    const decision = await this.automaticDeliveryRouter.resolve({
+      targetConversationId,
+      sourceTurnId: parentTurnId
+    });
+    return {
+      kind: 'delivery_required',
+      submissionId,
+      inboxItemId,
+      automaticSourceTurnId: parentTurnId,
+      command: {
+        inboxItemId,
+        targetConversationId,
+        targetTurnId: decision.targetTurnId,
+        phase: decision.phase
+      }
+    };
+  }
+
+  /** Read-only ownership preflight for recovery orchestrators before any invariant repair. */
+  public async liveSourceTurnForRecovery(
+    answerSubmissionIdInput: string
+  ): Promise<string | null> {
+    const submissionId = requirePhaseFId(answerSubmissionIdInput, 'answerSubmissionId');
+    const submission = await this.requireExisting('AnswerSubmission', submissionId);
+    const sourceTurnId = requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id');
+    return await this.isTurnOwnedByLiveHost(sourceTurnId) ? sourceTurnId : null;
+  }
+
+  private async interruptedPartialContent(turnId: string, reason: string): Promise<string> {
+    const links = (await listAllDomainRows(this.database, 'MessageTurnLink', {
+      turn_id: turnId,
+      role: 'model'
+    })).sort((left, right) => String(left.created_at).localeCompare(String(right.created_at))
+      || String(left.id).localeCompare(String(right.id)));
+    const visible: string[] = [];
+    for (const link of links) {
+      const messageId = requirePhaseFId(link.message_id, 'MessageTurnLink.message_id');
+      const current = await this.listRows('MessageCurrentRevisionLink', { message_id: messageId }, 2);
+      if (current.length !== 1) continue;
+      const revision = await this.requireExisting(
+        'MessageRevision',
+        requirePhaseFId(current[0].revision_id, 'MessageCurrentRevisionLink.revision_id')
+      );
+      const metadata = await this.requireExisting(
+        'ContentObject',
+        requirePhaseFId(revision.content_object_id, 'MessageRevision.content_object_id')
+      ) as ContentObjectMetadata;
+      const raw = (await this.contentStore.read(metadata)).toString('utf8');
+      const extracted = extractVisibleAssistantText(raw, metadata.content_type);
+      if (extracted) visible.push(extracted);
+    }
+    const joined = visible.join('\n\n').trim();
+    return joined
+      ? `> 子 Agent 在完成前被中断；以下是中断前已经持久化的可见结果。\n\n${joined}\n\n---\n中断原因：${reason}`
+      : `> 子 Agent 在提交完整回答前被中断，尚未形成可持久化的可见部分结果。\n\n中断原因：${reason}`;
+  }
+
+  private async ensureInboxPayloadLink(
+    inboxItemId: string,
+    linkId: string,
+    contentObjectId: string,
+    authoritySteps: RepositoryTransactionStep[] = []
+  ): Promise<void> {
+    const links = await this.listRows('RuntimeInboxPayloadLink', { inbox_item_id: inboxItemId }, 2);
+    if (links.length === 1) {
+      if (links[0].id !== linkId || links[0].content_object_id !== contentObjectId) {
+        throw new Error('Answer RuntimeInboxPayloadLink points to a different payload identity.');
+      }
+      return;
+    }
+    if (links.length > 1) throw new Error('RuntimeInboxItem has multiple payload links.');
+    const now = this.timestamp();
+    try {
+      await this.database.transaction([
+        ...authoritySteps,
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(inboxItemId, {
+          source_kind: 'answer_submission'
+        }),
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxPayloadLink').insert({
+          id: linkId,
+          inbox_item_id: inboxItemId,
+          content_object_id: contentObjectId,
+          created_at: now
+        })
+      ]);
+    } catch (error) {
+      if (!sqliteUniqueFailureIncludes(error, [
+        'runtime_inbox_payload_link.id',
+        'runtime_inbox_payload_link.inbox_item_id'
+      ])) throw error;
+      const raced = await this.listRows('RuntimeInboxPayloadLink', { inbox_item_id: inboxItemId }, 2);
+      if (raced.length !== 1 || raced[0].id !== linkId || raced[0].content_object_id !== contentObjectId) {
+        throw error;
+      }
+    }
+  }
+
+  private async readRecoverySourceAuthority(sourceTurnId: string): Promise<{
+    liveOwner: boolean;
+    steps: RepositoryTransactionStep[];
+  }> {
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(sourceTurnId),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').list({
+        where: { turn_id: sourceTurnId },
+        limit: 2
+      })
+    ]);
+    const turn = requireRow(snapshot.snapshot[0], `Turn ${sourceTurnId}`);
+    const leases = requireRows(snapshot.snapshot[1], 'Answer recovery source ExecutionLease');
+    if (leases.length > 1) throw new Error('Turn has multiple ExecutionLeases.');
+    const lease = leases[0] ?? null;
+    const liveOwner = turn.status === ACTIVE_TURN
+      && lease !== null
+      && await this.database.isHostAlive(
+        requirePhaseFId(lease.host_boot_id, 'ExecutionLease.host_boot_id')
+      );
+    return {
+      liveOwner,
+      steps: [
+        DOMAIN_REPOSITORIES.domain('Turn').assert(sourceTurnId, { status: turn.status }),
+        ...(lease
+          ? [DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(
+              requirePhaseFId(lease.id, 'ExecutionLease.id'),
+              {
+                turn_id: sourceTurnId,
+                owner_id: lease.owner_id,
+                host_boot_id: lease.host_boot_id,
+                generation: lease.generation
+              }
+            )]
+          : [DOMAIN_REPOSITORIES.domain('ExecutionLease').assertNone({ turn_id: sourceTurnId })])
+      ]
+    };
+  }
+
+  private async wasSubmissionUsedToSettleAnyWait(
+    submissionId: string,
+    answerBridgeId: string,
+    parentLink: DomainRow,
+    sourceTurnId: string
+  ): Promise<boolean> {
+    const toolCallIds = new Set<string>([
+      requirePhaseFId(parentLink.source_tool_call_id, 'ChildExecutionParentLink.source_tool_call_id')
+    ]);
+    const continuationOperations = await this.children.listContinuationWaitOperations({
+      answerBridgeId,
+      sourceTurnId
+    });
+    for (const operation of continuationOperations) {
+      if (operation.tool_call_id !== null) {
+        toolCallIds.add(requirePhaseFId(operation.tool_call_id, 'Operation.tool_call_id'));
+      }
+    }
+    for (const toolCallId of toolCallIds) {
+      if (await this.wasSubmissionUsedToSettleToolCall(submissionId, toolCallId)) return true;
+    }
+    return false;
+  }
+
+  private async wasSubmissionUsedToSettleToolCall(
+    submissionId: string,
+    toolCallId: string
+  ): Promise<boolean> {
+    const artifacts = await this.listRows('ToolResultArtifact', {
+      tool_call_id: toolCallId,
+      role: 'no_effect_result'
+    }, 2);
+    if (artifacts.length > 1) throw new Error('ToolCall has multiple no-effect ToolResultArtifacts.');
+    if (artifacts.length === 1 && await this.contentIdentifiesSubmission(
+      requirePhaseFId(artifacts[0].content_object_id, 'ToolResultArtifact.content_object_id'),
+      submissionId,
+      `ToolResultArtifact ${String(artifacts[0].id)}`
+    )) return true;
+    const outcomes = await this.listRows('ToolOutcome', { tool_call_id: toolCallId }, 2);
+    if (outcomes.length > 1) throw new Error('ToolCall has multiple terminal ToolOutcomes.');
+    if (outcomes.length === 0) return false;
+    return this.contentIdentifiesSubmission(
+      requirePhaseFId(outcomes[0].content_object_id, 'ToolOutcome.content_object_id'),
+      submissionId,
+      `ToolOutcome ${String(outcomes[0].id)}`
+    );
+  }
+
+  private async contentIdentifiesSubmission(
+    contentObjectId: string,
+    submissionId: string,
+    label: string
+  ): Promise<boolean> {
+    const content = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse((await this.contentStore.read(content)).toString('utf8'));
+    } catch (error) {
+      const detail = error instanceof Error ? `: ${error.message}` : '';
+      throw new Error(`${label} has invalid terminal JSON${detail}.`);
+    }
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return false;
+    const detail = (decoded as { detail?: unknown }).detail;
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return false;
+    const identity = detail as { submissionId?: unknown; answerSubmissionId?: unknown };
+    return identity.submissionId === submissionId
+      || identity.answerSubmissionId === submissionId;
+  }
+
+  private async isTurnOwnedByLiveHost(turnId: string): Promise<boolean> {
+    const turn = await this.maybeGet('Turn', turnId);
+    if (!turn || turn.status !== ACTIVE_TURN) return false;
+    const leases = await this.listRows('ExecutionLease', { turn_id: turnId }, 2);
+    if (leases.length > 1) throw new Error('Turn has multiple ExecutionLeases.');
+    if (leases.length === 0) return false;
+    return this.database.isHostAlive(
+      requirePhaseFId(leases[0].host_boot_id, 'ExecutionLease.host_boot_id')
+    );
   }
 
   private async foregroundRaceHasDurableWinner(
     settlement: PreparedForegroundSettlement
   ): Promise<boolean> {
-    const results = await this.listRows('ToolModelResult', {
-      tool_call_id: settlement.toolCallId
-    }, 2);
-    if (results.length > 1) throw new Error('Foreground ToolCall has multiple ToolModelResults.');
-    return results.length === 1;
+    return (await this.children.finalizeWaitSettlement(settlement.toolCallId)) !== null;
+  }
+
+  private async readSubmissionAuthority(
+    command: ReturnType<typeof normalizeAnswerCommand>,
+    bridge: DomainRow
+  ): Promise<AnswerSubmissionAuthority> {
+    const childExecutionId = requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ChildExecution').get(childExecutionId),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').list({
+        where: { turn_id: command.sourceTurnId },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('Turn').get(command.sourceTurnId),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').list({
+        where: { child_execution_id: childExecutionId },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('TurnTermination').list({
+        where: { turn_id: command.sourceTurnId },
+        limit: 2
+      }),
+      ...(bridge.current_submission_id === null
+        ? []
+        : [DOMAIN_REPOSITORIES.domain('AnswerSubmission').get(
+            requirePhaseFId(bridge.current_submission_id, 'AnswerBridge.current_submission_id')
+          )])
+    ]);
+    const childExecution = requireRow(snapshot.snapshot[0], `ChildExecution ${childExecutionId}`);
+    const turnLinks = requireRows(snapshot.snapshot[1], 'Answer ChildExecutionTurnLink authority');
+    const turn = requireRow(snapshot.snapshot[2], `Turn ${command.sourceTurnId}`);
+    const activeLinks = requireRows(snapshot.snapshot[3], 'Answer active Child Turn authority');
+    const terminations = requireRows(snapshot.snapshot[4], 'Answer TurnTermination authority');
+    const currentSubmission = bridge.current_submission_id === null
+      ? null
+      : requireRow(snapshot.snapshot[5], `AnswerSubmission ${String(bridge.current_submission_id)}`);
+    if (turnLinks.length !== 1 || turnLinks[0].child_execution_id !== childExecutionId) {
+      throw new Error(
+        `Answer submission Turn ${command.sourceTurnId} is not a member of AnswerBridge ${command.answerBridgeId}.`
+      );
+    }
+    if (activeLinks.length > 1 || terminations.length > 1) {
+      throw new Error('Answer submission authority is not unique.');
+    }
+    const childStatus = requireChildExecutionStatus(childExecution.status);
+    if (bridge.status === 'closed' || childStatus === 'closed' || childStatus === 'needs_human') {
+      throw new Error('Answer submission is rejected because the ChildExecution is closed.');
+    }
+
+    const activeTurnLink = activeLinks[0] ?? null;
+    const termination = terminations[0] ?? null;
+    if (turn.status !== ACTIVE_TURN || termination) {
+      throw new Error(`Answer submission rejected for stale or terminal Child Turn ${command.sourceTurnId}.`);
+    }
+    if (!activeTurnLink || activeTurnLink.turn_id !== command.sourceTurnId) {
+      throw new Error(`Answer submission rejected because Child Turn ${command.sourceTurnId} is not the active generation.`);
+    }
+    if (childStatus !== 'active') {
+      throw new Error(`Answer submission rejected from ChildExecution state ${childStatus}.`);
+    }
+    if (!['open', 'submitted'].includes(String(bridge.status))) {
+      throw new Error(`AnswerBridge ${command.answerBridgeId} is not open for the active Child Turn.`);
+    }
+    if (currentSubmission && currentSubmission.turn_id !== command.sourceTurnId) {
+      throw new Error('AnswerBridge still points at a different Child Turn generation.');
+    }
+    return {
+      bridge,
+      childExecution,
+      turnLink: turnLinks[0],
+      turn,
+      activeTurnLink,
+      termination,
+      currentSubmission
+    };
   }
 
   private async commitAnswerOnlyAfterForegroundRace(
     command: ReturnType<typeof normalizeAnswerCommand>,
     ids: ReturnType<typeof answerIds>,
     bridge: DomainRow,
+    authority: AnswerSubmissionAuthority,
     payloadContent: PreparedContentObject,
     now: string
-  ): Promise<{ deduplicated: boolean; commitSeq?: string }> {
+  ): Promise<{ deduplicated: boolean; historicalReplay: boolean; commitSeq?: string }> {
     const replay = await this.findReplay(command, ids, payloadContent);
-    if (replay) return { deduplicated: true };
+    if (replay) return { deduplicated: true, historicalReplay: replay.historicalReplay };
     try {
-      const commit = await this.database.transaction(answerFactSteps(command, ids, bridge, payloadContent, now));
-      return { deduplicated: false, commitSeq: commit.commitSeq };
+      const commit = await this.database.transaction([
+        ...answerAuthoritySteps(command, authority),
+        ...answerFactSteps(command, ids, bridge, payloadContent, now, false)
+      ]);
+      return { deduplicated: false, historicalReplay: false, commitSeq: commit.commitSeq };
     } catch (error) {
       if (!isExpectedAnswerIdentityConflict(error)) throw error;
       const raced = await this.findReplay(command, ids, payloadContent);
       if (!raced) throw error;
-      return { deduplicated: true };
+      return { deduplicated: true, historicalReplay: raced.historicalReplay };
     }
   }
 
   private async findReplay(
     command: ReturnType<typeof normalizeAnswerCommand>,
     ids: ReturnType<typeof answerIds>,
-    prepared?: PreparedContentObject
+    prepared?: PreparedContentObject,
+    interrupted = false
   ): Promise<AnswerSubmitResult | null> {
     const submission = await this.maybeGet('AnswerSubmission', command.submissionId);
     if (!submission) return null;
@@ -285,31 +1037,46 @@ export class AnswerControlPlane {
         where: { dedupe_key: answerDedupeKey(command.answerBridgeId, command.submissionId) },
         limit: 2
       }),
+      DOMAIN_REPOSITORIES.domain('RuntimeInboxPayloadLink').list({
+        where: { inbox_item_id: ids.inboxItemId },
+        limit: 2
+      }),
       DOMAIN_REPOSITORIES.domain('AnswerBridge').get(command.answerBridgeId)
     ]);
     const payloads = requireRows(snapshot.snapshot[0], 'AnswerPayload replay lookup');
     const inboxRows = requireRows(snapshot.snapshot[1], 'RuntimeInboxItem replay lookup');
-    const bridge = requireRow(snapshot.snapshot[2], `AnswerBridge ${command.answerBridgeId}`);
-    if (payloads.length !== 1 || inboxRows.length !== 1) {
-      throw new Error('Committed AnswerSubmission is missing its atomic payload/inbox facts.');
+    const payloadLinks = requireRows(snapshot.snapshot[2], 'RuntimeInboxPayloadLink replay lookup');
+    const bridge = requireRow(snapshot.snapshot[3], `AnswerBridge ${command.answerBridgeId}`);
+    if (payloads.length !== 1 || inboxRows.length !== 1 || payloadLinks.length !== 1) {
+      throw new Error('Committed AnswerSubmission is missing its atomic payload/inbox/link facts.');
     }
     const payload = payloads[0];
     const inbox = inboxRows[0];
+    const payloadLink = payloadLinks[0];
     const expectedContentObjectId = prepared?.metadata.id
       ?? this.contentStore.identity(command.content, command.contentType).id;
     if (
       submission.answer_bridge_id !== command.answerBridgeId
-      || submission.turn_id !== (command.sourceTurnId ?? null)
-      || submission.interrupted !== BigInt(command.interrupted ? 1 : 0)
+      || submission.turn_id !== command.sourceTurnId
+      || submission.interrupted !== BigInt(interrupted ? 1 : 0)
       || payload.id !== ids.answerPayloadId
       || payload.title !== (command.title ?? null)
       || payload.content_object_id !== expectedContentObjectId
       || inbox.id !== ids.inboxItemId
       || inbox.source_kind !== 'answer_submission'
       || inbox.source_id !== command.submissionId
+      || payloadLink.id !== ids.inboxPayloadLinkId
+      || payloadLink.inbox_item_id !== ids.inboxItemId
+      || payloadLink.content_object_id !== expectedContentObjectId
       || bridge.child_execution_id === null
     ) throw new Error('Answer callback identity was replayed with different facts.');
-    return answerResult(command, ids, false, true);
+    return answerResult(
+      command,
+      ids,
+      false,
+      true,
+      bridge.current_submission_id !== command.submissionId
+    );
   }
 
   private async listRows(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {
@@ -336,24 +1103,37 @@ export class AnswerControlPlane {
 /** RuntimeInbox destination/attempt state machine and parentHandling repository projection. */
 export class RuntimeDeliveryControlPlane {
   private readonly now: () => string;
+  private readonly automaticDeliveryRouter: AutomaticRuntimeDeliveryRouter;
 
   public constructor(
     private readonly database: RuntimeDatabase,
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database);
   }
 
   public async create(commandInput: RuntimeDeliveryCreateCommand): Promise<RuntimeDeliveryResult & {
     deduplicated: boolean;
     commitSeq?: string;
-  }> {
+  }>;
+  public async create(
+    commandInput: RuntimeDeliveryCreateCommand,
+    authoritySteps: RepositoryTransactionStep[]
+  ): Promise<RuntimeDeliveryResult & { deduplicated: boolean; commitSeq?: string }>;
+  public async create(
+    commandInput: RuntimeDeliveryCreateCommand,
+    authoritySteps: RepositoryTransactionStep[] = []
+  ): Promise<RuntimeDeliveryResult & { deduplicated: boolean; commitSeq?: string }> {
     const command = normalizeDeliveryCommand(commandInput);
     const attemptSeq = 1n;
     const deliveryId = deliveryIdFor(command, attemptSeq);
     const existing = await this.maybeGet('RuntimeDelivery', deliveryId);
-    if (existing) return { ...(await this.summaryFromRow(existing)), deduplicated: true };
-    await this.requireExisting('RuntimeInboxItem', command.inboxItemId);
+    if (existing) {
+      await this.markInboxRouted(command.inboxItemId);
+      return { ...(await this.summaryFromRow(existing)), deduplicated: true };
+    }
+    const inbox = await this.requireExisting('RuntimeInboxItem', command.inboxItemId);
     const conversation = await this.maybeGet('Conversation', command.targetConversationId);
     const targetTurn = command.targetTurnId
       ? await this.maybeGet('Turn', command.targetTurnId)
@@ -366,8 +1146,10 @@ export class RuntimeDeliveryControlPlane {
     try {
       const commit = await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(command.inboxItemId, {
-          source_kind: (await this.requireExisting('RuntimeInboxItem', command.inboxItemId)).source_kind
+          source_kind: inbox.source_kind,
+          state: inbox.state
         }),
+        ...authoritySteps,
         DOMAIN_REPOSITORIES.domain('RuntimeDelivery').insert({
           id: deliveryId,
           inbox_item_id: command.inboxItemId,
@@ -380,16 +1162,64 @@ export class RuntimeDeliveryControlPlane {
           failure_reason: targetGone ? 'target-gone' : null,
           created_at: now,
           updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').update(command.inboxItemId, {
+          state: inbox.state === 'settled' ? 'settled' : 'routed',
+          updated_at: now
         })
       ]);
       const row = await this.requireExisting('RuntimeDelivery', deliveryId);
       return { ...(await this.summaryFromRow(row)), deduplicated: false, commitSeq: commit.commitSeq };
     } catch (error) {
-      if (!isExpectedDeliveryIdentityConflict(error)) throw error;
+      if (!isExpectedDeliveryIdentityConflict(error) && !isTransactionAssertionFailure(error)) throw error;
       const raced = await this.findDeliveryByIdentity(command, attemptSeq);
       if (!raced) throw error;
+      await this.markInboxRouted(command.inboxItemId);
       return { ...(await this.summaryFromRow(raced)), deduplicated: true };
     }
+  }
+
+  private async markInboxRouted(inboxItemId: string): Promise<void> {
+    const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+    if (inbox.state === 'routed' || inbox.state === 'settled') return;
+    if (inbox.state !== 'available') {
+      throw new Error(`RuntimeInboxItem ${inboxItemId} has unsupported routing state ${String(inbox.state)}.`);
+    }
+    const now = this.timestamp();
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(inboxItemId, { state: 'available' }),
+        DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').update(inboxItemId, {
+          state: 'routed',
+          updated_at: now
+        })
+      ]);
+    } catch (error) {
+      if (!isTransactionAssertionFailure(error)) throw error;
+      const raced = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+      if (raced.state !== 'routed' && raced.state !== 'settled') throw error;
+    }
+  }
+
+  /** Resolves and commits one automatic delivery under the same source-Turn authority CAS. */
+  public async createAutomatic(input: {
+    inboxItemId: string;
+    targetConversationId: string;
+    sourceTurnId: string;
+  }): Promise<RuntimeDeliveryResult & { deduplicated: boolean; commitSeq?: string }> {
+    const inboxItemId = requirePhaseFId(input.inboxItemId, 'inboxItemId');
+    const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
+    const sourceTurnId = requirePhaseFId(input.sourceTurnId, 'sourceTurnId');
+    const decision = await this.automaticDeliveryRouter.resolve({
+      targetConversationId,
+      sourceTurnId
+    });
+    return this.create({
+      inboxItemId,
+      targetConversationId,
+      targetTurnId: decision.targetTurnId,
+      phase: decision.phase
+    }, decision.authoritySteps);
   }
 
   public async redeliver(failedDeliveryIdInput: string): Promise<RuntimeDeliveryResult & {
@@ -400,13 +1230,11 @@ export class RuntimeDeliveryControlPlane {
     const failed = await this.requireExisting('RuntimeDelivery', failedDeliveryId);
     if (failed.state !== 'failed') throw new Error('Only a failed RuntimeDelivery can be redelivered.');
     const phase = requireDeliveryPhase(failed.phase);
-    const peers = await this.listRows('RuntimeDelivery', {
+    const peers = await listAllDomainRows(this.database, 'RuntimeDelivery', {
       inbox_item_id: failed.inbox_item_id,
-      target_conversation_id: failed.target_conversation_id,
-      phase
-    }, 1000);
-    const matching = peers.filter((row) => row.target_turn_id === failed.target_turn_id);
-    const nextAttempt = matching.reduce((maximum, row) => {
+      target_conversation_id: failed.target_conversation_id
+    });
+    const nextAttempt = peers.reduce((maximum, row) => {
       const attempt = requirePositiveInteger(row.attempt_seq, 'RuntimeDelivery.attempt_seq');
       return attempt > maximum ? attempt : maximum;
     }, 0n) + 1n;
@@ -468,11 +1296,19 @@ export class RuntimeDeliveryControlPlane {
     }
     if (!targetTurn) throw new Error('current_turn delivery requires a target Turn.');
     if (targetTurn.conversation_id !== conversation.id) return this.failTargetGone(delivery);
-    if (targetTurn.status === ACTIVE_TURN) return this.inject(delivery, targetTurn);
-    if (targetTurn.status !== TERMINATED_TURN) {
+    const decision = await this.automaticDeliveryRouter.resolve({
+      targetConversationId: requirePhaseFId(conversation.id, 'Conversation.id'),
+      sourceTurnId: requirePhaseFId(targetTurn.id, 'Turn.id')
+    });
+    if (
+      targetTurn.status === ACTIVE_TURN
+      && decision.phase === 'current_turn'
+      && decision.targetTurnId === targetTurn.id
+    ) return this.inject(delivery, targetTurn, decision.authoritySteps);
+    if (targetTurn.status !== ACTIVE_TURN && targetTurn.status !== TERMINATED_TURN) {
       throw new Error(`RuntimeDelivery target Turn has unsupported status ${String(targetTurn.status)}.`);
     }
-    return this.retargetAfterTerminal(delivery, conversation);
+    return this.retargetWithDecision(delivery, decision);
   }
 
   /** Called before a new Turn transaction; returned steps write back target + inject atomically. */
@@ -484,12 +1320,12 @@ export class RuntimeDeliveryControlPlane {
     const conversationId = requirePhaseFId(conversationIdInput, 'conversationId');
     const turnId = requirePhaseFId(turnIdInput, 'turnId');
     const now = requireIsoTimestamp(nowInput, 'now');
-    const deliveries = await this.listRows('RuntimeDelivery', {
+    const deliveries = await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_conversation_id: conversationId,
       target_turn_id: null,
       phase: 'next_turn',
       state: 'pending'
-    }, 200);
+    });
     const steps: RepositoryTransactionStep[] = [];
     for (const delivery of deliveries) {
       const contentObjectId = await this.contentObjectIdForInbox(delivery.inbox_item_id as string);
@@ -505,7 +1341,7 @@ export class RuntimeDeliveryControlPlane {
         );
         continue;
       }
-      steps.push(...injectionSteps(delivery, turnId, contentObjectId, now, true));
+      steps.push(...injectionSteps(delivery, turnId, contentObjectId, now, true, []));
     }
     return steps;
   }
@@ -518,18 +1354,27 @@ export class RuntimeDeliveryControlPlane {
     if (delivery.phase !== 'notify_only') throw new Error('Only notify_only delivery can be acknowledged without input injection.');
     if (delivery.state !== 'pending') return { ...(await this.summaryFromRow(delivery)), changed: false };
     const now = this.timestamp();
-    const commit = await this.database.transaction([
-      DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(delivery.id as string, {
-        state: 'pending', phase: 'notify_only'
-      }),
-      DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(delivery.id as string, {
-        state: 'consumed',
-        failure_reason: null,
-        updated_at: now
-      })
-    ]);
-    const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
-    return { ...(await this.summaryFromRow(latest)), changed: true, commitSeq: commit.commitSeq };
+    try {
+      const commit = await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(delivery.id as string, {
+          state: 'pending', phase: 'notify_only'
+        }),
+        DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(delivery.id as string, {
+          state: 'consumed',
+          failure_reason: null,
+          updated_at: now
+        })
+      ]);
+      const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
+      return { ...(await this.summaryFromRow(latest)), changed: true, commitSeq: commit.commitSeq };
+    } catch (error) {
+      if (!isTransactionAssertionFailure(error)) throw error;
+      const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
+      if (latest.phase === 'notify_only' && latest.state === 'consumed') {
+        return { ...(await this.summaryFromRow(latest)), changed: false };
+      }
+      throw error;
+    }
   }
 
   /** Executor ACK for the exact injected PendingTurnInput; unrelated inputs cannot affect handling. */
@@ -588,11 +1433,13 @@ export class RuntimeDeliveryControlPlane {
     return this.summaryFromRow(delivery, links[0] ?? null);
   }
 
-  private async inject(delivery: DomainRow, targetTurn: DomainRow): Promise<RuntimeDeliveryAdvanceResult> {
+  private async inject(
+    delivery: DomainRow,
+    targetTurn: DomainRow,
+    authoritySteps: RepositoryTransactionStep[]
+  ): Promise<RuntimeDeliveryAdvanceResult> {
     const contentObjectId = await this.contentObjectIdForInbox(delivery.inbox_item_id as string);
-    if (!contentObjectId) return this.retargetAfterTerminal(delivery, await this.requireExisting(
-      'Conversation', delivery.target_conversation_id as string
-    ));
+    if (!contentObjectId) return this.failTargetGone(delivery);
     const now = this.timestamp();
     try {
       const commit = await this.database.transaction(injectionSteps(
@@ -600,7 +1447,8 @@ export class RuntimeDeliveryControlPlane {
         targetTurn.id as string,
         contentObjectId,
         now,
-        false
+        false,
+        authoritySteps
       ));
       const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
       return { ...(await this.summaryFromRow(latest)), changed: true, commitSeq: commit.commitSeq };
@@ -613,11 +1461,10 @@ export class RuntimeDeliveryControlPlane {
     }
   }
 
-  private async retargetAfterTerminal(
+  private async retargetWithDecision(
     delivery: DomainRow,
-    conversation: DomainRow
+    decision: AutomaticRuntimeDeliveryDecision
   ): Promise<RuntimeDeliveryAdvanceResult> {
-    const nextPhase: RuntimeDeliveryPhase = conversation.status === 'active' ? 'next_turn' : 'notify_only';
     const now = this.timestamp();
     const commit = await this.database.transaction([
       DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(delivery.id as string, {
@@ -625,9 +1472,10 @@ export class RuntimeDeliveryControlPlane {
         phase: delivery.phase,
         target_turn_id: delivery.target_turn_id
       }),
+      ...decision.authoritySteps,
       DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(delivery.id as string, {
-        phase: nextPhase,
-        target_turn_id: null,
+        phase: decision.phase,
+        target_turn_id: decision.targetTurnId,
         updated_at: now
       })
     ]);
@@ -650,11 +1498,10 @@ export class RuntimeDeliveryControlPlane {
   }
 
   private async contentObjectIdForInbox(inboxItemId: string): Promise<string | null> {
-    const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
-    if (inbox.source_kind !== 'answer_submission') return null;
-    const payloads = await this.listRows('AnswerPayload', { submission_id: inbox.source_id }, 2);
-    if (payloads.length !== 1) throw new Error('Answer RuntimeInboxItem must resolve exactly one AnswerPayload.');
-    return requirePhaseFId(payloads[0].content_object_id, 'AnswerPayload.content_object_id');
+    await this.requireExisting('RuntimeInboxItem', inboxItemId);
+    const links = await this.listRows('RuntimeInboxPayloadLink', { inbox_item_id: inboxItemId }, 2);
+    if (links.length !== 1) throw new Error('RuntimeInboxItem must resolve exactly one RuntimeInboxPayloadLink.');
+    return requirePhaseFId(links[0].content_object_id, 'RuntimeInboxPayloadLink.content_object_id');
   }
 
   private async findDeliveryByIdentity(
@@ -664,12 +1511,10 @@ export class RuntimeDeliveryControlPlane {
     const where: DomainRow = {
       inbox_item_id: command.inboxItemId,
       target_conversation_id: command.targetConversationId,
-      target_turn_id: command.targetTurnId,
-      phase: command.phase,
       attempt_seq: attemptSeq
     };
     const rows = await this.listRows('RuntimeDelivery', where, 2);
-    if (rows.length > 1) throw new Error('RuntimeDelivery partial UNIQUE identity is violated.');
+    if (rows.length > 1) throw new Error('RuntimeDelivery logical attempt identity is violated.');
     return rows[0] ?? null;
   }
 
@@ -734,22 +1579,21 @@ function normalizeAnswerCommand(command: AnswerSubmitCommand) {
   return {
     answerBridgeId: requirePhaseFId(command.answerBridgeId, 'answerBridgeId'),
     submissionId: requirePhaseFId(command.submissionId, 'submissionId'),
-    ...(optionalPhaseFId(command.sourceTurnId, 'sourceTurnId')
-      ? { sourceTurnId: optionalPhaseFId(command.sourceTurnId, 'sourceTurnId')! }
-      : {}),
+    sourceTurnId: requirePhaseFId(command.sourceTurnId, 'sourceTurnId'),
     ...(typeof command.title === 'string' && command.title.trim() ? { title: command.title.trim() } : {}),
     content: command.content,
     contentType: command.contentType === undefined
       ? 'text/plain'
-      : requirePhaseFText(command.contentType, 'contentType'),
-    interrupted: command.interrupted === true
+      : requirePhaseFText(command.contentType, 'contentType')
   };
 }
 
 function answerIds(answerBridgeId: string, submissionId: string) {
+  const inboxItemId = stablePhaseFId('runtime_inbox_item', 'answer', answerBridgeId, submissionId);
   return {
     answerPayloadId: stablePhaseFId('answer_payload', answerBridgeId, submissionId),
-    inboxItemId: stablePhaseFId('runtime_inbox_item', 'answer', answerBridgeId, submissionId)
+    inboxItemId,
+    inboxPayloadLinkId: stablePhaseFId('runtime_inbox_payload_link', inboxItemId)
   };
 }
 
@@ -757,24 +1601,104 @@ function answerDedupeKey(answerBridgeId: string, submissionId: string): string {
   return `answer:${answerBridgeId}:${submissionId}`;
 }
 
+function answerAuthoritySteps(
+  command: ReturnType<typeof normalizeAnswerCommand>,
+  authority: AnswerSubmissionAuthority
+): RepositoryTransactionStep[] {
+  const common: RepositoryTransactionStep[] = [
+    DOMAIN_REPOSITORIES.domain('ChildExecution').assert(
+      requirePhaseFId(authority.childExecution.id, 'ChildExecution.id'),
+      { status: authority.childExecution.status }
+    ),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(
+      requirePhaseFId(authority.turnLink.id, 'ChildExecutionTurnLink.id'),
+      {
+        child_execution_id: authority.childExecution.id,
+        turn_id: command.sourceTurnId,
+        turn_seq: authority.turnLink.turn_seq
+      }
+    ),
+    DOMAIN_REPOSITORIES.domain('Turn').assert(command.sourceTurnId, {
+      status: authority.turn.status
+    })
+  ];
+  if (!authority.activeTurnLink) throw new Error('Active answer authority lost its ActiveTurnLink.');
+  common.push(
+    DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: command.sourceTurnId }),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(
+      requirePhaseFId(authority.activeTurnLink.id, 'ChildExecutionActiveTurnLink.id'),
+      {
+        child_execution_id: authority.childExecution.id,
+        turn_id: command.sourceTurnId
+      }
+    )
+  );
+  return common;
+}
+
+function interruptedAnswerAuthoritySteps(
+  command: ReturnType<typeof normalizeAnswerCommand>,
+  authority: AnswerSubmissionAuthority,
+  exactTurnLinkIds: string[]
+): RepositoryTransactionStep[] {
+  if (!authority.termination) throw new Error('Interrupted answer authority lost its TurnTermination.');
+  const childExecutionId = requirePhaseFId(authority.childExecution.id, 'ChildExecution.id');
+  const childStatus = requireChildExecutionStatus(authority.childExecution.status);
+  if (childStatus !== 'interrupting' && childStatus !== 'interrupted') {
+    throw new Error('Interrupted answer authority requires an interrupted ChildExecution.');
+  }
+  return [
+    DOMAIN_REPOSITORIES.domain('ChildExecution').assert(childExecutionId, {
+      status: childStatus
+    }),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertExactIds(
+      { child_execution_id: childExecutionId },
+      exactTurnLinkIds
+    ),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(
+      requirePhaseFId(authority.turnLink.id, 'ChildExecutionTurnLink.id'),
+      {
+        child_execution_id: childExecutionId,
+        turn_id: command.sourceTurnId,
+        turn_seq: authority.turnLink.turn_seq
+      }
+    ),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assertNone({
+      child_execution_id: childExecutionId
+    }),
+    DOMAIN_REPOSITORIES.domain('Turn').assert(command.sourceTurnId, {
+      status: TERMINATED_TURN
+    }),
+    DOMAIN_REPOSITORIES.domain('TurnTermination').assert(
+      requirePhaseFId(authority.termination.id, 'TurnTermination.id'),
+      {
+        turn_id: command.sourceTurnId,
+        terminal_status: authority.termination.terminal_status
+      }
+    )
+  ];
+}
+
 function answerFactSteps(
   command: ReturnType<typeof normalizeAnswerCommand>,
   ids: ReturnType<typeof answerIds>,
   bridge: DomainRow,
   payloadContent: PreparedContentObject,
-  now: string
+  now: string,
+  interrupted: boolean
 ): RepositoryTransactionStep[] {
   return [
     DOMAIN_REPOSITORIES.domain('AnswerBridge').assert(command.answerBridgeId, {
       child_execution_id: bridge.child_execution_id,
-      status: bridge.status
+      status: bridge.status,
+      current_submission_id: interrupted ? null : bridge.current_submission_id
     }),
     ...preparedContentObjectSteps([payloadContent], 'answer_payload'),
     DOMAIN_REPOSITORIES.domain('AnswerSubmission').insertWithNextSequence({
       id: command.submissionId,
       answer_bridge_id: command.answerBridgeId,
-      turn_id: command.sourceTurnId ?? null,
-      interrupted: command.interrupted ? '1' : '0',
+      turn_id: command.sourceTurnId,
+      interrupted: interrupted ? '1' : '0',
       created_at: now
     }, {
       column: 'submission_seq',
@@ -790,6 +1714,7 @@ function answerFactSteps(
     }),
     DOMAIN_REPOSITORIES.domain('AnswerBridge').update(command.answerBridgeId, {
       current_submission_id: command.submissionId,
+      status: interrupted ? 'interrupted' : 'submitted',
       updated_at: now
     }),
     DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').insert({
@@ -800,6 +1725,12 @@ function answerFactSteps(
       state: 'available',
       created_at: now,
       updated_at: now
+    }),
+    DOMAIN_REPOSITORIES.domain('RuntimeInboxPayloadLink').insert({
+      id: ids.inboxPayloadLinkId,
+      inbox_item_id: ids.inboxItemId,
+      content_object_id: payloadContent.metadata.id,
+      created_at: now
     })
   ];
 }
@@ -809,6 +1740,7 @@ function answerResult(
   ids: ReturnType<typeof answerIds>,
   foregroundSettled: boolean,
   deduplicated: boolean,
+  historicalReplay: boolean,
   commitSeq?: string
 ): AnswerSubmitResult {
   return {
@@ -818,6 +1750,7 @@ function answerResult(
     inboxItemId: ids.inboxItemId,
     foregroundSettled,
     deduplicated,
+    historicalReplay,
     ...(commitSeq ? { commitSeq } : {})
   };
 }
@@ -854,7 +1787,8 @@ function injectionSteps(
   targetTurnId: string,
   contentObjectId: string,
   now: string,
-  writebackTarget: boolean
+  writebackTarget: boolean,
+  authoritySteps: RepositoryTransactionStep[]
 ): RepositoryTransactionStep[] {
   const deliveryId = requirePhaseFId(delivery.id, 'RuntimeDelivery.id');
   const inputId = stablePhaseFId('pending_turn_input', 'runtime-delivery', deliveryId);
@@ -866,7 +1800,10 @@ function injectionSteps(
       target_turn_id: writebackTarget ? null : delivery.target_turn_id,
       attempt_seq: delivery.attempt_seq
     }),
+    ...authoritySteps,
     DOMAIN_REPOSITORIES.domain('Turn').assert(targetTurnId, { status: ACTIVE_TURN }),
+    DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: targetTurnId }),
+    DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assertNone({ turn_id: targetTurnId }),
     DOMAIN_REPOSITORIES.domain('PendingTurnInput').insertWithNextPosition({
       id: inputId,
       turn_id: targetTurnId,
@@ -912,12 +1849,15 @@ function isExpectedAnswerIdentityConflict(error: unknown): boolean {
     'answer_submission.id',
     'answer_submission.answer_bridge_id, answer_submission.submission_seq',
     'answer_payload.submission_id',
-    'runtime_inbox_item.dedupe_key'
+    'runtime_inbox_item.dedupe_key',
+    'runtime_inbox_payload_link.inbox_item_id'
   ]);
 }
 
 function isExpectedForegroundRace(error: unknown): boolean {
   return isTransactionAssertionFailure(error) || sqliteUniqueFailureIncludes(error, [
+    'tool_result_artifact.id',
+    'tool_result_artifact.tool_call_id, tool_result_artifact.role',
     'tool_outcome.tool_call_id',
     'tool_model_result.tool_call_id',
     'tool_model_result.message_revision_id'
@@ -927,8 +1867,7 @@ function isExpectedForegroundRace(error: unknown): boolean {
 function isExpectedDeliveryIdentityConflict(error: unknown): boolean {
   return sqliteUniqueFailureIncludes(error, [
     'runtime_delivery.id',
-    'runtime_delivery.inbox_item_id, runtime_delivery.target_conversation_id, runtime_delivery.phase, runtime_delivery.attempt_seq',
-    'runtime_delivery.inbox_item_id, runtime_delivery.target_conversation_id, runtime_delivery.target_turn_id, runtime_delivery.phase, runtime_delivery.attempt_seq'
+    'runtime_delivery.inbox_item_id, runtime_delivery.target_conversation_id, runtime_delivery.attempt_seq'
   ]);
 }
 
@@ -938,6 +1877,32 @@ function isExpectedDeliveryInjectionRace(error: unknown): boolean {
     'runtime_delivery_input_link.pending_turn_input_id',
     'pending_turn_input.id'
   ]);
+}
+
+function extractVisibleAssistantText(raw: string, contentType: string): string {
+  if (contentType !== 'application/vnd.limcode.message+json') return raw.trim();
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    return '';
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return '';
+  const parts = (decoded as Record<string, unknown>).parts;
+  if (!Array.isArray(parts)) return '';
+  return parts
+    .filter((part): part is Record<string, unknown> => Boolean(part) && typeof part === 'object' && !Array.isArray(part))
+    .filter((part) => part.thought !== true && typeof part.text === 'string')
+    .map((part) => String(part.text).trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function compareCounter(left: unknown, right: unknown): number {
+  const a = typeof left === 'bigint' ? left : BigInt(String(left));
+  const b = typeof right === 'bigint' ? right : BigInt(String(right));
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function requireRow(value: unknown, label: string): DomainRow {

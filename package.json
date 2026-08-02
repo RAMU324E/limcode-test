@@ -13,7 +13,6 @@
     "vscode": "^1.89.0"
   },
   "extensionKind": [
-    "ui",
     "workspace"
   ],
   "categories": [
@@ -56,7 +55,7 @@
         "command": "limcode-test.applyLiveDiffPreview",
         "key": "ctrl+s",
         "mac": "cmd+s",
-        "when": "resourceScheme == limcode-test-live-diff"
+        "when": "resourceScheme == 'limcode-test-live-diff'"
       }
     ],
     "viewsContainers": {

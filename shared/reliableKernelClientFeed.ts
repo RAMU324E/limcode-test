@@ -25,6 +25,8 @@ export interface ReliableKernelSnapshotMessage {
   sessionId: string;
   hostBootId: string;
   messageSeq: string;
+  /** Webview navigation generation, attached by the host bridge. */
+  navigationGeneration?: string;
   snapshotCommitSeq: string;
   projections: { [key: string]: PlainData };
 }
@@ -34,6 +36,8 @@ export interface ReliableKernelChangesMessage {
   sessionId: string;
   hostBootId: string;
   messageSeq: string;
+  /** Webview navigation generation, attached by the host bridge. */
+  navigationGeneration?: string;
   commitSeq: string;
   changes: ReliableKernelClientChange[];
 }
@@ -55,11 +59,17 @@ export type ReliableKernelClientDetailKind =
   | 'message-content'
   | 'tool-arguments-content'
   | 'tool-result-content'
+  | 'tool-event-content'
+  | 'interaction-prompt'
   | 'file-change-base-content'
   | 'file-change-content'
   | 'file-change-diff'
   | 'process-output'
+  | 'process-stdout'
+  | 'process-stderr'
   | 'context-projection-detail'
+  | 'compression-content'
+  | 'compression-title'
   | 'answer-content';
 
 export interface ReliableKernelDetailRequestMessage {
@@ -70,6 +80,8 @@ export interface ReliableKernelDetailRequestMessage {
   recordId: string;
   offset: number;
   maxBytes: number;
+  /** Freezes a mutable detail prefix after the first page; omitted on a new demand or refresh. */
+  expectedTotalBytes?: number;
 }
 
 export interface ReliableKernelDetailResultMessage {
@@ -98,16 +110,34 @@ export interface ReliableKernelDetailErrorMessage {
 /** Memory-only low-latency stream overlay. Durable final authority remains Message/ModelRequest. */
 export interface ReliableKernelTransientMessage {
   type: typeof RELIABLE_KERNEL_TRANSIENT_MESSAGE;
+  /** Exact bounded-feed session. Navigation creates a new session and retires old overlays. */
+  sessionId: string;
+  navigationGeneration?: string;
   hostBootId: string;
   conversationId: string;
   turnId: string;
   modelRequestId: string;
+  /** Frozen durable request identity; never derived from the current UI model selection. */
+  requestSeq: string;
+  providerId: string;
+  modelId: string;
+  /** Provider retry identity. A changed attempt/generation starts a fresh transient accumulator. */
+  attemptSeq?: string;
+  socketGeneration?: string;
+  /** Durable feed frontier that must be painted before this overlay is causally displayable. */
+  afterCommitSeq?: string;
   observedAt: string;
   event: {
-    kind: 'output_delta' | 'output_item_done' | 'completed';
+    kind: 'output_delta' | 'output_item_done' | 'completed' | 'failed' | 'cancelled';
     streamSeq: string;
     content: PlainData;
     usage?: PlainData;
+    timing?: {
+      providerStartedAt?: number;
+      firstOutputAt?: number;
+      completedAt?: number;
+      streamOutputDurationMs?: number;
+    };
   };
 }
 
@@ -122,6 +152,8 @@ export interface ReliableKernelClientDiagnosticMessage {
   messageSeq?: string;
   modelRequestId?: string;
   streamSeq?: string;
+  attemptSeq?: string;
+  socketGeneration?: string;
 }
 
 export type ReliableKernelDataMessage = ReliableKernelSnapshotMessage | ReliableKernelChangesMessage;
@@ -129,6 +161,7 @@ export type ReliableKernelDataMessage = ReliableKernelSnapshotMessage | Reliable
 export interface ReliableKernelBoundedClientState {
   sessionId: string | null;
   hostBootId: string | null;
+  lastMessageSeq: string | null;
   lastCommitSeq: string | null;
   projections: { [key: string]: PlainData };
   records: Record<string, Record<string, { [key: string]: PlainData }>>;
@@ -139,11 +172,13 @@ export interface ReliableKernelClientApplyResult {
   state: ReliableKernelBoundedClientState;
   ack?: ReliableKernelAckMessage;
   snapshotRequired: boolean;
-  reason?: 'host-boot-mismatch' | 'session-mismatch' | 'commit-gap' | 'unknown-change-type' | 'apply-failed';
+  reason?: 'host-boot-mismatch' | 'session-mismatch' | 'message-gap' | 'commit-order' | 'unknown-change-type' | 'apply-failed';
 }
 
 export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'Conversation',
+  'ProjectContext',
+  'ConversationProjectLink',
   'ConversationReuseLink',
   'ConversationBranchLink',
   'ConversationOriginLink',
@@ -160,6 +195,8 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'InteractionToolCallLink',
   'InteractionResponse',
   'ToolCall',
+  'ToolCallSourceLink',
+  'ToolCallPolicySnapshot',
   'ToolCallEvent',
   'ToolExecution',
   'ToolOutcome',
@@ -175,6 +212,10 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'ProcessOutputChunk',
   'ProcessReceipt',
   'ModelRequest',
+  'ModelRequestMessageLink',
+  'CompressionBlock',
+  /** Derived bounded view; not a persisted Runtime domain or schema-manifest entry. */
+  'ConversationContextStatus',
   'ChildExecution',
   'ChildExecutionParentLink',
   'ChildExecutionTurnLink',
@@ -189,6 +230,7 @@ export function createEmptyReliableKernelClientState(): ReliableKernelBoundedCli
   return {
     sessionId: null,
     hostBootId: null,
+    lastMessageSeq: null,
     lastCommitSeq: null,
     projections: {},
     records: {},
@@ -225,6 +267,7 @@ export function applyReliableKernelDataMessage(
       const state: ReliableKernelBoundedClientState = {
         sessionId: message.sessionId,
         hostBootId: message.hostBootId,
+        lastMessageSeq: message.messageSeq,
         lastCommitSeq: message.snapshotCommitSeq,
         projections,
         records: seedRecordsFromSnapshot(projections),
@@ -243,10 +286,14 @@ export function applyReliableKernelDataMessage(
   if (current.hostBootId !== message.hostBootId) return requireSnapshot(current, 'host-boot-mismatch');
   if (current.sessionId !== message.sessionId) return requireSnapshot(current, 'session-mismatch');
   try {
-    requireDecimal(message.messageSeq, 'changes.messageSeq');
+    const messageSeq = requireDecimal(message.messageSeq, 'changes.messageSeq');
+    const expectedMessageSeq = BigInt(requireDecimal(current.lastMessageSeq, 'state.lastMessageSeq')) + 1n;
+    if (BigInt(messageSeq) !== expectedMessageSeq) return requireSnapshot(current, 'message-gap');
     const commitSeq = requireDecimal(message.commitSeq, 'changes.commitSeq');
-    const expected = BigInt(requireDecimal(current.lastCommitSeq, 'state.lastCommitSeq')) + 1n;
-    if (BigInt(commitSeq) !== expected) return requireSnapshot(current, 'commit-gap');
+    // commitSeq is a database frontier, not a transport sequence. Invisible commits are deliberately
+    // omitted by the host, so the next visible commit may jump forward but may never repeat/regress.
+    const priorCommitSeq = BigInt(requireDecimal(current.lastCommitSeq, 'state.lastCommitSeq'));
+    if (BigInt(commitSeq) <= priorCommitSeq) return requireSnapshot(current, 'commit-order');
     if (!Array.isArray(message.changes)) throw new TypeError('changes.changes must be an array.');
     const nextRecords: ReliableKernelBoundedClientState['records'] = { ...current.records };
     const copiedTypes = new Set<string>();
@@ -278,6 +325,7 @@ export function applyReliableKernelDataMessage(
     }
     const state: ReliableKernelBoundedClientState = {
       ...current,
+      lastMessageSeq: messageSeq,
       lastCommitSeq: commitSeq,
       records: nextRecords,
       snapshotRequired: false
@@ -294,16 +342,21 @@ function seedRecordsFromSnapshot(
   const records: ReliableKernelBoundedClientState['records'] = {};
   const arrayKeyToType: Record<string, string> = {
     conversations: 'Conversation',
+    projectContexts: 'ProjectContext',
+    conversationProjectLinks: 'ConversationProjectLink',
     conversationReuseLinks: 'ConversationReuseLink',
     conversationBranchLinks: 'ConversationBranchLink',
     conversationOriginLinks: 'ConversationOriginLink',
     agentConversationLinks: 'AgentConversationLink',
+    messages: 'Message',
     turns: 'Turn',
     executionLeases: 'ExecutionLease',
     turnTerminations: 'TurnTermination',
     turnExecutorLinks: 'TurnExecutorLink',
     messageTurnLinks: 'MessageTurnLink',
     toolCalls: 'ToolCall',
+    toolCallSourceLinks: 'ToolCallSourceLink',
+    toolCallPolicySnapshots: 'ToolCallPolicySnapshot',
     toolCallEvents: 'ToolCallEvent',
     toolExecutions: 'ToolExecution',
     toolOutcomes: 'ToolOutcome',
@@ -323,11 +376,15 @@ function seedRecordsFromSnapshot(
     processOutputChunks: 'ProcessOutputChunk',
     processReceipts: 'ProcessReceipt',
     modelRequests: 'ModelRequest',
+    modelRequestMessageLinks: 'ModelRequestMessageLink',
+    compressionBlocks: 'CompressionBlock',
+    conversationContextStatuses: 'ConversationContextStatus',
     childExecutions: 'ChildExecution',
     childExecutionParentLinks: 'ChildExecutionParentLink',
     childExecutionTurnLinks: 'ChildExecutionTurnLink',
     childExecutionActiveTurnLinks: 'ChildExecutionActiveTurnLink',
     childTurns: 'Turn',
+    childExecutionLeases: 'ExecutionLease',
     childTurnTerminations: 'TurnTermination',
     childTurnExecutorLinks: 'TurnExecutorLink',
     answerBridges: 'AnswerBridge',

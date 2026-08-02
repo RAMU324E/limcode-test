@@ -107,6 +107,7 @@ async function transferFiles(
   observer: CommandRunObserver | undefined,
   context: WorkEnvironmentTransferContext
 ): Promise<WorkEnvironmentTransferResult> {
+  context.signal?.throwIfAborted();
   const items = normalizeTransfers(args);
   if (items.length === 0) throw new Error('transfer: 请提供 transfers 数组，且每项包含 fromEnvironment/fromPath/toEnvironment/toPath。');
   const verify: WorkEnvironmentTransferVerifyMode = args.verify === 'none' ? 'none' : 'size';
@@ -115,6 +116,7 @@ async function transferFiles(
   let failCount = 0;
 
   for (let index = 0; index < items.length; index += 1) {
+    context.signal?.throwIfAborted();
     const item = items[index];
     const started = Date.now();
     try {
@@ -122,6 +124,7 @@ async function transferFiles(
       results.push({ ...result, durationMs: Date.now() - started });
       successCount += 1;
     } catch (error) {
+      if (context.signal?.aborted) throw context.signal.reason ?? error;
       results.push({
         success: false,
         index,
@@ -169,8 +172,9 @@ async function runTransfer(
   context: WorkEnvironmentTransferContext,
   index: number
 ): Promise<WorkEnvironmentTransferResult['results'][number]> {
-  const from = createEndpoint(resolveEnvironment(item.fromEnvironment, context));
-  const to = createEndpoint(resolveEnvironment(item.toEnvironment, context));
+  context.signal?.throwIfAborted();
+  const from = createEndpoint(resolveEnvironment(item.fromEnvironment, context), context.signal);
+  const to = createEndpoint(resolveEnvironment(item.toEnvironment, context), context.signal);
   const pathPolicy: TransferPathPolicy = { allowOutsideProjectPaths: context.allowOutsideProjectPaths !== false };
 
   const sourcePath = from.resolvePath(item.fromPath, pathPolicy);
@@ -185,7 +189,7 @@ async function runTransfer(
   if (kind === 'file') {
     const tracker = createTransferTracker(observer, { files: 1, bytes: sourceStat.size }, true);
     reportTransferProgress(tracker, false, true);
-    const copied = await copyFile({ from, to, sourcePath, targetPath, overwrite: item.overwrite, createDirs: item.createDirs, verify, tracker, knownSize: sourceStat.size });
+    const copied = await copyFile({ from, to, sourcePath, targetPath, overwrite: item.overwrite, createDirs: item.createDirs, verify, tracker, knownSize: sourceStat.size, signal: context.signal });
     reportTransferProgress(tracker, true, true);
     return {
       success: true,
@@ -203,7 +207,7 @@ async function runTransfer(
 
   const tracker = createTransferTracker(observer, { files: 0, bytes: 0 }, false);
   reportTransferProgress(tracker, false, true);
-  const copied = await copyDirectory({ from, to, sourceDir: sourcePath, targetDir: targetPath, overwrite: item.overwrite, createDirs: item.createDirs, verify, tracker, mkdirCache: new Set<string>() });
+  const copied = await copyDirectory({ from, to, sourceDir: sourcePath, targetDir: targetPath, overwrite: item.overwrite, createDirs: item.createDirs, verify, tracker, mkdirCache: new Set<string>(), signal: context.signal });
   reportTransferProgress(tracker, true, true);
   return {
     success: true,
@@ -230,9 +234,9 @@ function resolveEnvironment(selector: string, context: WorkEnvironmentTransferCo
   return found;
 }
 
-function createEndpoint(environment: WorkEnvironmentRecord): Endpoint {
-  if (isLocalFolderWorkEnvironment(environment)) return new LocalEndpoint(environment);
-  if (isRemoteServerWorkEnvironment(environment)) return new RemoteCommandEndpoint(environment);
+function createEndpoint(environment: WorkEnvironmentRecord, signal?: AbortSignal): Endpoint {
+  if (isLocalFolderWorkEnvironment(environment)) return new LocalEndpoint(environment, signal);
+  if (isRemoteServerWorkEnvironment(environment)) return new RemoteCommandEndpoint(environment, signal);
   throw new Error(`工作环境 ${workEnvironmentDisplayName(environment)} (${environment.kind}) 暂未接入文件传输 provider。`);
 }
 
@@ -246,8 +250,10 @@ async function copyDirectory(input: {
   verify: WorkEnvironmentTransferVerifyMode;
   tracker: TransferProgressTracker;
   mkdirCache: Set<string>;
+  signal?: AbortSignal;
 }): Promise<{ files: number; dirs: number; bytes: number; verifyOk: boolean }> {
-  const { from, to, sourceDir, targetDir, overwrite, createDirs, verify, tracker, mkdirCache } = input;
+  const { from, to, sourceDir, targetDir, overwrite, createDirs, verify, tracker, mkdirCache, signal } = input;
+  signal?.throwIfAborted();
   if (createDirs) await mkdirpCached(to, targetDir, mkdirCache);
   const entries = await from.readdir(sourceDir);
   let files = 0;
@@ -256,16 +262,17 @@ async function copyDirectory(input: {
   let verifyOk = true;
 
   for (const entry of entries) {
+    signal?.throwIfAborted();
     const childSource = from.join(sourceDir, entry.name);
     const childTarget = to.join(targetDir, entry.name);
     if (entry.type === 'directory') {
-      const nested = await copyDirectory({ from, to, sourceDir: childSource, targetDir: childTarget, overwrite, createDirs, verify, tracker, mkdirCache });
+      const nested = await copyDirectory({ from, to, sourceDir: childSource, targetDir: childTarget, overwrite, createDirs, verify, tracker, mkdirCache, signal });
       files += nested.files;
       dirs += nested.dirs;
       bytes += nested.bytes;
       verifyOk = verifyOk && nested.verifyOk;
     } else {
-      const copied = await copyFile({ from, to, sourcePath: childSource, targetPath: childTarget, overwrite, createDirs, verify, tracker, knownSize: entry.size, mkdirCache });
+      const copied = await copyFile({ from, to, sourcePath: childSource, targetPath: childTarget, overwrite, createDirs, verify, tracker, knownSize: entry.size, mkdirCache, signal });
       files += 1;
       bytes += copied.bytes;
       verifyOk = verifyOk && copied.verifyOk;
@@ -285,8 +292,10 @@ async function copyFile(input: {
   tracker: TransferProgressTracker;
   knownSize?: number;
   mkdirCache?: Set<string>;
+  signal?: AbortSignal;
 }): Promise<{ bytes: number; verifyOk: boolean }> {
-  const { from, to, sourcePath, targetPath, overwrite, createDirs, verify, tracker, knownSize, mkdirCache } = input;
+  const { from, to, sourcePath, targetPath, overwrite, createDirs, verify, tracker, knownSize, mkdirCache, signal } = input;
+  signal?.throwIfAborted();
   const sourceSize = knownSize !== undefined ? knownSize : (await from.stat(sourcePath)).size;
   if (!overwrite && await to.exists(targetPath)) throw new Error(`目标已存在: ${targetPath}`);
   if (createDirs) {
@@ -298,13 +307,15 @@ async function copyFile(input: {
   tracker.currentSourcePath = sourcePath;
   tracker.currentTargetPath = targetPath;
   try {
-    await copyFileViaStream(from, to, sourcePath, tempPath, tracker);
+    await copyFileViaStream(from, to, sourcePath, tempPath, tracker, signal);
+    signal?.throwIfAborted();
     let verifyOk = true;
     if (verify === 'size') {
       const tempStat = await to.stat(tempPath);
       verifyOk = tempStat.type === 'file' && tempStat.size === sourceSize;
       if (!verifyOk) throw new Error(`size 校验失败: source=${sourceSize}, temp=${tempStat.size}`);
     }
+    signal?.throwIfAborted();
     await to.rename(tempPath, targetPath, overwrite);
     tracker.completedFiles += 1;
     reportTransferProgress(tracker, false, true);
@@ -315,7 +326,14 @@ async function copyFile(input: {
   }
 }
 
-async function copyFileViaStream(from: Endpoint, to: Endpoint, sourcePath: string, tempPath: string, tracker: TransferProgressTracker): Promise<void> {
+async function copyFileViaStream(
+  from: Endpoint,
+  to: Endpoint,
+  sourcePath: string,
+  tempPath: string,
+  tracker: TransferProgressTracker,
+  signal?: AbortSignal
+): Promise<void> {
   const progress = new Transform({
     highWaterMark: STREAM_HIGH_WATER_MARK,
     transform(chunk, _encoding, callback) {
@@ -328,7 +346,7 @@ async function copyFileViaStream(from: Endpoint, to: Endpoint, sourcePath: strin
   const writer = await to.openWrite(tempPath, false);
   const timer = setInterval(() => reportTransferProgress(tracker, false, true), PROGRESS_THROTTLE_MS);
   try {
-    await pipeline(reader.stream, progress, writer.stream);
+    await pipeline(reader.stream, progress, writer.stream, { signal });
     if (reader.done) await reader.done();
     if (writer.done) await writer.done();
   } finally {
@@ -460,7 +478,7 @@ function assertLocalPathInsideRoot(candidate: string, root: string): void {
 
 
 class LocalEndpoint implements Endpoint {
-  public constructor(public environment: WorkEnvironmentRecord) {}
+  public constructor(public environment: WorkEnvironmentRecord, private readonly signal?: AbortSignal) {}
   resolvePath(input: string, policy: TransferPathPolicy): string {
     const text = normalizeString(input);
     if (!text) throw new Error('本地路径不能为空。');
@@ -483,17 +501,20 @@ class LocalEndpoint implements Endpoint {
   basename(p: string): string { return path.basename(p); }
   join(dir: string, child: string): string { return path.join(dir, child); }
   async stat(p: string): Promise<StatInfo> {
+    this.signal?.throwIfAborted();
     const st = await fsp.stat(p);
     if (st.isDirectory()) return { type: 'directory', size: 0 };
     if (st.isFile()) return { type: 'file', size: st.size };
     throw new Error(`不支持的本地路径类型: ${p}`);
   }
-  async exists(p: string): Promise<boolean> { try { await fsp.stat(p); return true; } catch { return false; } }
-  async mkdirp(p: string): Promise<void> { await fsp.mkdir(p, { recursive: true }); }
+  async exists(p: string): Promise<boolean> { this.signal?.throwIfAborted(); try { await fsp.stat(p); return true; } catch { return false; } }
+  async mkdirp(p: string): Promise<void> { this.signal?.throwIfAborted(); await fsp.mkdir(p, { recursive: true }); }
   async readdir(p: string): Promise<DirEntry[]> {
+    this.signal?.throwIfAborted();
     const entries = await fsp.readdir(p, { withFileTypes: true });
     const out: DirEntry[] = [];
     for (const entry of entries) {
+      this.signal?.throwIfAborted();
       const full = path.join(p, entry.name);
       if (entry.isDirectory()) out.push({ name: entry.name, type: 'directory' });
       else if (entry.isFile()) out.push({ name: entry.name, type: 'file', size: (await fsp.stat(full)).size });
@@ -502,19 +523,20 @@ class LocalEndpoint implements Endpoint {
   }
   async unlink(p: string): Promise<void> { await fsp.rm(p, { force: true }); }
   async rename(src: string, dst: string, overwrite: boolean): Promise<void> {
+    this.signal?.throwIfAborted();
     if (overwrite) await fsp.rm(dst, { force: true });
     await fsp.rename(src, dst);
   }
   async openRead(p: string): Promise<StreamHandle & { stream: Readable }> {
-    return { stream: fs.createReadStream(p, { highWaterMark: STREAM_HIGH_WATER_MARK }) };
+    return { stream: fs.createReadStream(p, { highWaterMark: STREAM_HIGH_WATER_MARK, signal: this.signal }) };
   }
   async openWrite(p: string, overwrite: boolean): Promise<StreamHandle & { stream: Writable }> {
-    return { stream: fs.createWriteStream(p, { flags: overwrite ? 'w' : 'wx', highWaterMark: STREAM_HIGH_WATER_MARK }) };
+    return { stream: fs.createWriteStream(p, { flags: overwrite ? 'w' : 'wx', highWaterMark: STREAM_HIGH_WATER_MARK, signal: this.signal }) };
   }
 }
 
 class RemoteCommandEndpoint implements Endpoint {
-  public constructor(public environment: WorkEnvironmentRecord) {}
+  public constructor(public environment: WorkEnvironmentRecord, private readonly signal?: AbortSignal) {}
   resolvePath(input: string, policy: TransferPathPolicy): string {
     const text = normalizeString(input);
     if (!text) throw new Error('远端路径不能为空。');
@@ -531,7 +553,7 @@ class RemoteCommandEndpoint implements Endpoint {
   join(dir: string, child: string): string { return path.posix.join(dir, child); }
   async stat(p: string): Promise<StatInfo> {
     const script = `if [ -d ${shQuote(p)} ]; then printf 'directory\t0'; elif [ -f ${shQuote(p)} ]; then printf 'file\t%s' "$(wc -c < ${shQuote(p)})"; else echo 'path not found' >&2; exit 44; fi`;
-    const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `stat ${p}` });
+    const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `stat ${p}`, signal: this.signal });
     assertExecOk(result, `stat ${p}`);
     const [type, size] = result.stdout.trim().split('\t');
     if (type === 'directory') return { type: 'directory', size: 0 };
@@ -539,16 +561,17 @@ class RemoteCommandEndpoint implements Endpoint {
     throw new Error(`无法识别远端路径类型: ${p}`);
   }
   async exists(p: string): Promise<boolean> {
-    const result = await executeRemoteServerScript(this.environment, `[ -e ${shQuote(p)} ]`, { timeout: 30_000, displayCommand: `exists ${p}` });
+    const result = await executeRemoteServerScript(this.environment, `[ -e ${shQuote(p)} ]`, { timeout: 30_000, displayCommand: `exists ${p}`, signal: this.signal });
+    this.signal?.throwIfAborted();
     return result.exitCode === 0;
   }
   async mkdirp(p: string): Promise<void> {
-    const result = await executeRemoteServerScript(this.environment, `mkdir -p -- ${shQuote(p)}`, { timeout: 30_000, displayCommand: `mkdir -p ${p}` });
+    const result = await executeRemoteServerScript(this.environment, `mkdir -p -- ${shQuote(p)}`, { timeout: 30_000, displayCommand: `mkdir -p ${p}`, signal: this.signal });
     assertExecOk(result, `mkdir -p ${p}`);
   }
   async readdir(p: string): Promise<DirEntry[]> {
     const script = `cd -- ${shQuote(p)} && for x in ./* ./.??* ./.?*; do [ -e "$x" ] || continue; name="\${x#./}"; if [ -d "$x" ]; then printf 'd\t%s\t0\0' "$name"; elif [ -f "$x" ]; then size="$(wc -c < "$x" 2>/dev/null || printf '0')"; printf 'f\t%s\t%s\0' "$name" "$size"; fi; done | base64 | tr -d '\n\r'`;
-    const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `readdir ${p}` });
+    const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `readdir ${p}`, signal: this.signal });
     assertExecOk(result, `readdir ${p}`);
     return decodeNulListFromBase64(result.stdout).map((record) => {
       const [type, name, size] = record.split('\t');
@@ -564,15 +587,15 @@ class RemoteCommandEndpoint implements Endpoint {
     const script = overwrite
       ? `mv -f -- ${shQuote(src)} ${shQuote(dst)}`
       : `if [ -e ${shQuote(dst)} ]; then echo 'target exists' >&2; exit 17; fi; mv -- ${shQuote(src)} ${shQuote(dst)}`;
-    const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `rename ${src}` });
+    const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `rename ${src}`, signal: this.signal });
     assertExecOk(result, `rename ${src} -> ${dst}`);
   }
   async openRead(p: string): Promise<StreamHandle & { stream: Readable }> {
-    const handle = openRemoteServerReadStream(this.environment, p);
+    const handle = openRemoteServerReadStream(this.environment, p, this.signal);
     return { stream: handle.stdout, done: async () => assertExecOk(await handle.done, `cat ${p}`) };
   }
   async openWrite(p: string, _overwrite: boolean): Promise<StreamHandle & { stream: Writable }> {
-    const handle = openRemoteServerWriteStream(this.environment, p);
+    const handle = openRemoteServerWriteStream(this.environment, p, this.signal);
     return { stream: handle.stdin, done: async () => assertExecOk(await handle.done, `write ${p}`) };
   }
 }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
-import { isVisibleTextPart, type MessageContent } from '@shared/protocol';
+import { isVisibleTextPart, type MessageContent, type TurnAuthoritySelection } from '@shared/protocol';
 import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
@@ -21,6 +21,7 @@ const conversationBody = ref<HTMLElement | null>(null);
 const bottomStickyScroller = useBottomStickyScroller(scroller);
 let pendingInitialBottomConversationId = '';
 let initialBottomScrollFrame: number | undefined;
+let pendingEditAuthority: TurnAuthoritySelection = {};
 
 const loadingDetail = computed(() =>
   Boolean(reliableConversation.feed.sessionId)
@@ -106,18 +107,23 @@ function cancelInitialBottomScrollFrame(): void {
   initialBottomScrollFrame = undefined;
 }
 
-function onSubmit(text: string, content?: MessageContent): void {
+function onSubmit(text: string, content: MessageContent | undefined, authority: TurnAuthoritySelection): void {
   if (conversationUi.isEditing) {
     conversationUi.pendingEditText = text;
+    pendingEditAuthority = {
+      ...(authority.agentId?.trim() ? { agentId: authority.agentId.trim() } : {}),
+      ...(authority.model ? { model: { ...authority.model } } : {})
+    };
     conversationUi.editConfirmOpen = true;
     return;
   }
-  sendMessage(text, content);
+  sendMessage(text, content, authority);
 }
 
 function handleEditConfirmAction(action: ConfirmPanelAction): void {
   if (action.key === 'cancel') {
     conversationUi.editConfirmOpen = false;
+    pendingEditAuthority = {};
     return;
   }
   if (action.key === 'direct-confirm') commitEditMessage();
@@ -127,17 +133,29 @@ function commitEditMessage(): void {
   const editing = conversationUi.editingMessage;
   const text = conversationUi.pendingEditText.trim();
   if (!editing || !text) return;
+  const accepted = editMessage(editing.message.conversationId, editing.message.id, text, {
+    expectedRevisionId: editing.message.revisionId ?? '',
+    runAfterEdit: true,
+    deleteFollowing: true,
+    ...pendingEditAuthority
+  });
+  if (!accepted) {
+    // A competing stop-then action remains exact and cannot be silently replaced. Keep the edit
+    // draft and confirmation open so the user can retry after that action has reconciled.
+    conversationUi.editConfirmOpen = true;
+    return;
+  }
   conversationUi.editConfirmOpen = false;
-  const commit = (): void => {
-    editMessage(editing.message.conversationId, editing.message.id, text, { runAfterEdit: true, deleteFollowing: true });
+  const finishAcceptedEdit = (): void => {
+    pendingEditAuthority = {};
     conversationUi.cancelEditMode();
   };
   const nextMessage = nextMessageAfter(editing.message.id);
   if (nextMessage) {
-    conversationUi.playExitFrom(nextMessage.id, commit);
+    conversationUi.playExitFrom(nextMessage.id, finishAcceptedEdit);
     return;
   }
-  commit();
+  finishAcceptedEdit();
 }
 
 function nextMessageAfter(messageId: string) {

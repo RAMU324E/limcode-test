@@ -1,7 +1,17 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { IconFileDiff, IconTool, IconPlayerStop } from '@tabler/icons-vue';
-import { SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
+import {
+  ASK_USER_TOOL_NAME,
+  DELETE_TOOL_NAME,
+  READ_AGENT_ANSWER_TOOL_NAME,
+  SKILLS_TOOL_NAME,
+  SUBMIT_AGENT_ANSWER_TOOL_NAME,
+  SUBMIT_PLAN_TOOL_NAME,
+  SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
+  TASK_LIST_TOOL_NAME,
+  TRANSFER_TOOL_NAME
+} from '@shared/protocol';
 import { submitPlanOutputFromResult } from '@shared/planReview';
 import type {
   FunctionCallPart,
@@ -16,6 +26,8 @@ import {
   interactionViewFromReliableRuntime,
   type InteractionView
 } from '@webview/domain/interactionProjection';
+import { transientToolCallPreviewForMessage } from '@webview/domain/reliableTransientModel';
+import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -28,12 +40,15 @@ import ContentBlockSection from '../ContentBlockSection.vue';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
 import ToolDiffView from '../toolDisplay/ToolDiffView.vue';
 import TextPartView from './TextPartView.vue';
+import StreamingToolCallPreview from './StreamingToolCallPreview.vue';
 import type { ToolDisplayDiff, ToolDisplaySection, ToolHeaderAction } from '../toolDisplay/types';
 
 const props = defineProps<{
   part: FunctionCallPart;
   messageId?: string;
   partIndex?: number;
+  /** Function-call ordinal within the containing message; survives transient/durable call-id replacement. */
+  toolOrdinal?: number;
   markdown?: boolean;
   streaming?: boolean;
   streamingPhase?: 'waiting' | 'thinking' | 'writing';
@@ -58,16 +73,39 @@ const cancelFeedback = ref<{
   phase: 'submitting' | 'committed' | 'failed';
   message: string;
 } | undefined>(undefined);
+const disposeCancelError = bridge.on(BridgeMessageType.Error, (message) => {
+  const current = cancelFeedback.value;
+  if (
+    !current
+    || message.correlationId !== current.requestId
+    || message.payload?.requestType !== BridgeMessageType.ToolExecutionCancel
+  ) return;
+  clearCancelProjectionTimer();
+  cancelFeedback.value = {
+    ...current,
+    phase: 'failed',
+    message: message.payload.message || '中断未能提交，请重试'
+  };
+});
+const observedCancelResult = computed(() => {
+  const pending = cancelFeedback.value;
+  const callId = toolCall.value?.id;
+  return pending && callId ? interactions.resultFor(callId, pending.requestId) : undefined;
+});
 let autoApplyCountdownTimer: ReturnType<typeof setInterval> | undefined;
 let cancelProjectionTimer: ReturnType<typeof setTimeout> | undefined;
 const CANCEL_PROJECTION_DEADLINE_MS = 30_000;
 const toolCall = computed<ToolCallRecord | undefined>(() => {
   const partId = props.part.id;
   if (!props.messageId) return undefined;
-  const calls = reliableConversation.projection.value.toolCalls;
+  const calls = reliableConversation.projection.value.toolCallsByMessageId[props.messageId] ?? [];
+  const exact = partId
+    ? calls.find((call) => call.id === partId || call.functionCallId === partId)
+    : undefined;
+  if (exact) return exact;
   return calls.find((call) =>
-    call.messageId === props.messageId
-    && (partId ? call.id === partId || call.functionCallId === partId : call.name === props.part.functionCall.name)
+    call.name === props.part.functionCall.name
+    && (props.toolOrdinal === undefined || call.schedulingOrdinal === props.toolOrdinal)
   );
 });
 const toolResult = computed(() => {
@@ -75,11 +113,31 @@ const toolResult = computed(() => {
   if (!call) return undefined;
   return reliableConversation.projection.value.toolResultByCallId[call.id];
 });
-const toolEvents = computed<ToolCallEventRecord[]>(() => []);
+const toolEvents = computed<ToolCallEventRecord[]>(() => {
+  const callId = toolCall.value?.id;
+  if (!callId) return [];
+  return reliableConversation.projection.value.toolCallEventsByCallId[callId] ?? [];
+});
+const transientPreview = computed(() => {
+  const partId = props.part.id;
+  if (!partId || !props.messageId) return undefined;
+  return transientToolCallPreviewForMessage(
+    reliableConversation.feed.transientModelRequests,
+    Object.values(reliableConversation.feed.records.ModelRequestMessageLink ?? {}),
+    reliableConversation.conversationId.value,
+    props.messageId,
+    partId
+  );
+});
 const executionInteraction = computed(() => reliableInteractionForKind('exec_approval'));
 const fileChangeInteractionView = computed(() => reliableInteractionForKind('patch_approval'));
 const resultReviewInteraction = computed(() => reliableInteractionForKind('result_review'));
 const askUserInteractionView = computed(() => reliableInteractionForKind('ask_user'));
+const planReviewInteractionView = computed(() => reliableInteractionForKind('plan_review'));
+const reliablePlanProposalId = computed(() => {
+  const call = toolCall.value;
+  return call?.name === SUBMIT_PLAN_TOOL_NAME ? `plan-proposal:${call.id}` : undefined;
+});
 const fileChangeInteraction = computed(() => fileChangeInteractionView.value?.request);
 const finalizing = computed(() => isFinalizingProgress(toolCall.value?.progress));
 const displayProgress = computed(() => {
@@ -100,6 +158,7 @@ const toolDisplay = computed(() => resolveToolDisplay({
   checkpointTimelineAnchors: [],
   shadowRepositories: [],
   currentConversationId: reliableConversation.conversationId.value,
+  planProposalId: reliablePlanProposalId.value,
   stringifyValue
 }));
 const reliableFileDiff = computed<ToolDisplayDiff | undefined>(() => {
@@ -162,8 +221,25 @@ const needsChangeApplyDecision = computed(() => fileChangeInteractionView.value?
 const needsResultSubmitDecision = computed(() => resultReviewInteraction.value?.request.state === 'pending');
 const interactionDecisionPending = computed(() => [executionInteraction.value, fileChangeInteractionView.value, resultReviewInteraction.value]
   .some((target) => !!target && interactions.isPending(target.request.id)));
-const hasDetails = computed(() => hasArgs.value || hasOutput.value || Boolean(toolCall.value?.error) || executionApprovalPending.value);
-const autoExpandDetails = computed(() => toolCall.value?.display?.autoExpand === true);
+const hasMandatoryInteraction = computed(() => Boolean(
+  askUserInteractionView.value?.request.state === 'pending'
+  || planReviewInteractionView.value?.request.state === 'pending'
+));
+const defaultAutoExpandTool = computed(() => [
+  ASK_USER_TOOL_NAME,
+  SUBMIT_PLAN_TOOL_NAME,
+  TASK_LIST_TOOL_NAME,
+  'write',
+  'edit'
+].includes(props.part.functionCall.name));
+const hasDetails = computed(() => hasArgs.value
+  || hasOutput.value
+  || Boolean(toolCall.value?.error)
+  || executionApprovalPending.value
+  || hasMandatoryInteraction.value);
+const autoExpandDetails = computed(() => hasMandatoryInteraction.value
+  || toolCall.value?.display?.autoExpand === true
+  || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value));
 const autoOpenDiffPreview = computed(() => toolCall.value?.display?.autoOpenDiffPreview === true);
 const autoApplyChange = computed(() => {
   const policy = fileChangeInteraction.value?.policySnapshot;
@@ -181,9 +257,16 @@ const autoApplyHint = computed(() => {
   return remaining <= 0 ? '正在等待系统应用更改' : `${remaining} 秒后自动应用更改`;
 });
 const commandRuntimeStatus = computed(() => toolCall.value ? shellRuntimeStatusLabel(toolCall.value, toolResult.value) : undefined);
+const interactionStatusLabel = computed(() => {
+  if (needsChangeApplyDecision.value) return '等待批准应用更改';
+  if (needsExecutionDecision.value) return '等待批准执行';
+  if (needsResultSubmitDecision.value) return '等待确认结果回传';
+  return undefined;
+});
 const statusLabel = computed(() => cancelFeedback.value?.message
   ?? (finalizing.value ? '工具已完成，正在提交结果' : undefined)
   ?? commandRuntimeStatus.value?.label
+  ?? interactionStatusLabel.value
   ?? (toolCall.value ? labelForToolCall(toolCall.value, toolResult.value) : '工具请求已生成'));
 // 可中断：正在推进（排队/执行/应用更改）或已批准待执行；等待用户决策的状态各有专用按钮，不重复给中断入口。
 // 注意：命令工具转后台后是终态 success（已把“成功”返回给 AI），不再算可中断——后台命令的终止在后台命令面板里做。
@@ -213,7 +296,9 @@ const durationLabel = computed(() => {
   if (duration === undefined) return undefined;
   return duration < 1000 ? `${Math.round(duration)}ms` : `${(duration / 1000).toFixed(duration < 10_000 ? 1 : 0)}s`;
 });
-const summaryLabel = computed(() => toolCall.value?.summary?.trim() || undefined);
+const summaryLabel = computed(() => toolCall.value?.summary?.trim() || fallbackToolSummary(props.part.functionCall.name, props.part.functionCall.args));
+const inlineProgressLabel = computed(() => toolCall.value?.error ? undefined : boundedInlineValue(displayProgress.value));
+const inlineErrorLabel = computed(() => boundedInlineValue(toolCall.value?.error));
 const summaryDisplay = computed(() => {
   const summary = summaryLabel.value;
   if (!summary) return undefined;
@@ -276,7 +361,10 @@ watch(
   () => `${autoOpenDiffPreview.value}:${headerActions.value.map((action) => `${action.id}:${action.disabled === true ? 'disabled' : 'enabled'}`).join('|')}`,
   () => {
     if (!autoOpenDiffPreview.value) return;
-    const action = headerActions.value.find((item) => item.id.startsWith('open-live-diff-') && !item.disabled);
+    const action = headerActions.value.find((item) =>
+      (item.id.startsWith('open-live-diff-') || item.id.startsWith('open-reliable-diff-'))
+      && !item.disabled
+    );
     if (!action || autoOpenedActionIds.value.has(action.id)) return;
     autoOpenedActionIds.value.add(action.id);
     action.invoke();
@@ -285,22 +373,32 @@ watch(
 );
 
 watch(
+  () => `${expanded.value ? 'expanded' : 'collapsed'}:${toolCall.value?.id ?? ''}:${toolCall.value?.updatedAt ?? 0}`,
+  () => {
+    const call = toolCall.value;
+    if (!call || (!expanded.value && !hasMandatoryInteraction.value)) return;
+    reliableConversation.ensureDetails({
+      toolCallIds: [call.id],
+      priority: hasMandatoryInteraction.value ? 'critical' : 'expanded'
+    });
+  },
+  { immediate: true }
+);
+
+watch(
   () => `${fileChangeInteraction.value?.id ?? ''}:${fileChangeInteraction.value?.revision ?? 0}:${fileChangeInteraction.value?.state ?? ''}:${fileChangeInteraction.value?.updatedAt ?? 0}:${fileChangeInteraction.value?.policySnapshot.notBeforeAt ?? 0}`,
   scheduleAutoApplyCountdown,
   { immediate: true }
 );
 
-const stopInteractionResult = bridge.on(BridgeMessageType.InteractionResult, (message) => {
-  const pending = cancelFeedback.value;
-  const call = toolCall.value;
-  if (!pending || !call || message.correlationId !== pending.requestId || message.payload?.targetId !== call.id) return;
-  applyInteractionFeedback(message.payload);
+watch(observedCancelResult, (result) => {
+  if (result) applyInteractionFeedback(result.payload);
 });
 
 onBeforeUnmount(() => {
+  disposeCancelError();
   clearAutoApplyTimers();
   clearCancelProjectionTimer();
-  stopInteractionResult();
 });
 
 watch(() => toolCall.value?.id, () => {
@@ -341,6 +439,91 @@ function stringifyValue(value: unknown): string {
   }
 }
 
+function fallbackToolSummary(toolName: string, args: unknown): string | undefined {
+  const source = isRecord(args) ? args : undefined;
+  if (!source) return undefined;
+  if (toolName === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
+    const workEnvironmentId = boundedInlineValue(source.workEnvironmentId);
+    return workEnvironmentId ? `切换工作环境 · ${workEnvironmentId}` : '切换工作环境';
+  }
+  if (toolName === SKILLS_TOOL_NAME) {
+    const name = boundedInlineValue(source.name);
+    if (!name) return undefined;
+    const rawSource = typeof source.source === 'string'
+      ? source.source.trim().replace(/^\./, '').toLowerCase()
+      : '';
+    const skillSource = ['agents', 'claude', 'global'].includes(rawSource) ? rawSource : '';
+    return `载入技能 · ${skillSource ? `${skillSource}:` : ''}${name}`;
+  }
+  if (toolName === SUBMIT_AGENT_ANSWER_TOOL_NAME) {
+    const title = boundedInlineValue(source.title);
+    return title ? `提交 Agent 回答 · ${title}` : '提交 Agent 回答';
+  }
+  if (toolName === READ_AGENT_ANSWER_TOOL_NAME) {
+    const answerBridgeId = boundedInlineValue(source.answerBridgeId);
+    return answerBridgeId ? `读取 Agent 回答 · ${answerBridgeId}` : '读取 Agent 回答';
+  }
+  if (toolName === 'run_agent') {
+    const answerBridgeId = boundedInlineValue(source.answerBridgeId);
+    if (source.mode === 'interrupt') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
+    const agent = isRecord(source.agent) ? source.agent : undefined;
+    const agentType = boundedInlineValue(agent?.type) ?? 'worker';
+    const prompt = boundedInlineValue(source.prompt);
+    return prompt ? `Run ${agentType} · ${prompt}` : `Run ${agentType}`;
+  }
+  if (toolName === TRANSFER_TOOL_NAME) {
+    const transfers = Array.isArray(source.transfers) ? source.transfers.filter(isRecord) : [];
+    const first = transfers[0];
+    if (!first) return '传输文件';
+    const from = [boundedInlineValue(first.fromEnvironment), boundedInlineValue(first.fromPath)].filter(Boolean).join(':');
+    const to = [boundedInlineValue(first.toEnvironment), boundedInlineValue(first.toPath)].filter(Boolean).join(':');
+    const suffix = transfers.length > 1 ? ` +${transfers.length - 1}` : '';
+    return boundedInlineValue(`${from} → ${to}${suffix}`);
+  }
+  if (toolName === DELETE_TOOL_NAME && Array.isArray(source.paths)) {
+    const paths = source.paths.map(boundedInlineValue).filter((path): path is string => Boolean(path));
+    if (paths.length > 0) return `delete ${paths[0]}${paths.length > 1 ? ` +${paths.length - 1}` : ''}`;
+  }
+  if (toolName === TASK_LIST_TOOL_NAME && Array.isArray(source.items)) {
+    const items = source.items.filter(isRecord);
+    const mode = source.mode === 'rewrite' ? '重写任务清单' : '更新任务清单';
+    const active = items.find((item) => item.status === 'in_progress' && item.delete !== true);
+    const activeTitle = boundedInlineValue(active?.title);
+    return `${mode} · ${items.length} 项${activeTitle ? ` · 当前：${activeTitle}` : ''}`;
+  }
+  for (const key of ['explanation', 'summary', 'question', 'title', 'path', 'query', 'skill', 'url', 'instructions', 'researchId']) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim()) return boundedInlineValue(value);
+  }
+  if (Array.isArray(source.urls)) {
+    const urls = source.urls.map(boundedInlineValue).filter((url): url is string => Boolean(url));
+    if (urls.length > 0) return `${urls[0]}${urls.length > 1 ? ` +${urls.length - 1}` : ''}`;
+  }
+  if ((toolName === 'bash' || toolName === 'shell') && typeof source.command === 'string') {
+    return boundedInlineValue(source.command);
+  }
+  if (toolName === SUBMIT_PLAN_TOOL_NAME && typeof source.plan === 'string') return '提交 Plan 等待用户审批';
+  if (toolName === TASK_LIST_TOOL_NAME) return '更新任务清单';
+  return undefined;
+}
+
+function boundedInlineValue(value: unknown): string | undefined {
+  let result: string | undefined;
+  if (typeof value === 'string') result = value;
+  else if (isRecord(value)) {
+    for (const key of ['message', 'label', 'status', 'phase', 'current']) {
+      const candidate = value[key];
+      if (typeof candidate === 'string' && candidate.trim()) {
+        result = candidate;
+        break;
+      }
+    }
+  }
+  const normalized = result?.trim().replace(/\s+/g, ' ');
+  if (!normalized) return undefined;
+  return normalized.length > 140 ? `${normalized.slice(0, 137)}…` : normalized;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -373,7 +556,7 @@ function resolveToolInteraction(kind: DurableInteractionRequestKind, decision: '
 
 function cancelToolExecution(): void {
   const call = toolCall.value;
-  if (!call || (cancelFeedback.value && cancelFeedback.value.phase !== 'failed')) return;
+  if (!call || cancelFeedback.value?.phase === 'committed') return;
   const requestId = bridge.request(BridgeMessageType.ToolExecutionCancel, {
     toolCallId: call.id,
     conversationId: reliableConversation.conversationId.value
@@ -468,6 +651,34 @@ function clearAutoApplyTimers(): void {
 function setExpanded(value: boolean): void {
   userChangedExpanded.value = true;
   expanded.value = value;
+  if (value) retryExpandedDetailErrors();
+}
+
+function retryExpandedDetailErrors(): void {
+  const call = toolCall.value;
+  if (!call) return;
+  for (const kind of ['tool-arguments-content', 'tool-result-content'] as const) {
+    if (reliableConversation.feed.details[reliableKernelDetailKey(kind, call.id)]?.status === 'error') {
+      reliableConversation.feed.retryDetail(kind, call.id, { priority: 'expanded' });
+    }
+  }
+  for (const memberId of reliableConversation.projection.value.fileDiffMemberIdsByToolCallId[call.id] ?? []) {
+    if (reliableConversation.feed.details[reliableKernelDetailKey('file-change-diff', memberId)]?.status === 'error') {
+      reliableConversation.feed.retryDetail('file-change-diff', memberId, { priority: 'expanded' });
+    }
+  }
+  for (const eventId of reliableConversation.projection.value.toolEventIdsByCallId[call.id] ?? []) {
+    if (reliableConversation.feed.details[reliableKernelDetailKey('tool-event-content', eventId)]?.status === 'error') {
+      reliableConversation.feed.retryDetail('tool-event-content', eventId, { priority: 'expanded' });
+    }
+  }
+  const promptId = reliableConversation.projection.value.interactionPromptIdByToolCallId[call.id];
+  if (
+    promptId
+    && reliableConversation.feed.details[reliableKernelDetailKey('interaction-prompt', promptId)]?.status === 'error'
+  ) {
+    reliableConversation.feed.retryDetail('interaction-prompt', promptId, { priority: 'expanded' });
+  }
 }
 
 function planSectionKey(section: ToolDisplaySection): string | undefined {
@@ -598,7 +809,9 @@ function isFinalizingProgress(progress: unknown): boolean {
 </script>
 
 <template>
+  <StreamingToolCallPreview v-if="transientPreview" :preview="transientPreview" />
   <CollapsibleContentBlock
+    v-else
     :expanded="expanded"
     @update:expanded="setExpanded"
     class="tool-call-card"
@@ -636,6 +849,8 @@ function isFinalizingProgress(progress: unknown): boolean {
       </span>
     </template>
     <template #trail>
+      <span v-if="inlineProgressLabel" class="part-card-meta part-card-progress" :title="inlineProgressLabel">{{ inlineProgressLabel }}</span>
+      <span v-if="inlineErrorLabel" class="part-card-meta part-card-inline-error" :title="toolCall?.error">{{ inlineErrorLabel }}</span>
       <span class="part-card-status" :title="statusTitle">{{ statusLabel }}</span>
       <span v-if="durationLabel" class="part-card-meta">{{ durationLabel }}</span>
     </template>
@@ -659,7 +874,7 @@ function isFinalizingProgress(progress: unknown): boolean {
         class="tool-header-action tool-header-action-cancel"
         title="中断此工具调用"
         aria-label="中断此工具调用"
-        :disabled="cancelFeedback?.phase === 'submitting' || cancelFeedback?.phase === 'committed'"
+        :disabled="cancelFeedback?.phase === 'committed'"
         @click.stop="cancelToolExecution"
       >
         <IconPlayerStop class="tool-header-action-icon" stroke="2" aria-hidden="true" />
@@ -705,9 +920,10 @@ function isFinalizingProgress(progress: unknown): boolean {
           v-if="section.planProposal"
           class="tool-display-plan-proposal"
           :request="section.planProposal.request"
-          :proposal-id="section.planProposal.proposalId"
+          :proposal-id="section.planProposal.proposalId ?? reliablePlanProposalId"
           :tool-call="section.planProposal.toolCall"
           :result="toolResult"
+          :interaction-view="planReviewInteractionView"
           @panel-expanded-change="updatePlanSectionExpanded(section, $event)"
         />
       </ContentBlockSection>
@@ -748,9 +964,10 @@ function isFinalizingProgress(progress: unknown): boolean {
           v-if="section.planProposal"
           class="tool-display-plan-proposal"
           :request="section.planProposal.request"
-          :proposal-id="section.planProposal.proposalId"
+          :proposal-id="section.planProposal.proposalId ?? reliablePlanProposalId"
           :tool-call="section.planProposal.toolCall"
           :result="toolResult"
+          :interaction-view="planReviewInteractionView"
           @panel-expanded-change="updatePlanSectionExpanded(section, $event)"
         />
       </ContentBlockSection>
@@ -764,13 +981,13 @@ function isFinalizingProgress(progress: unknown): boolean {
     </div>
   </CollapsibleContentBlock>
 
-  <div v-if="needsExecutionDecision" class="tool-decision-actions is-external">
+  <div v-if="!transientPreview && needsExecutionDecision" class="tool-decision-actions is-external">
     <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'accept')">批准执行</button>
     <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'reject')">拒绝</button>
   </div>
   <div v-else-if="needsChangeApplyDecision" class="tool-decision-actions is-external">
     <span v-if="autoApplyHint" class="tool-decision-hint">{{ autoApplyHint }}</span>
-    <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('patch_approval', 'accept')">应用更改</button>
+    <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('patch_approval', 'accept')">批准并应用更改</button>
     <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('patch_approval', 'reject')">拒绝更改</button>
   </div>
   <div v-else-if="needsResultSubmitDecision" class="tool-decision-actions is-external">
@@ -911,11 +1128,10 @@ function isFinalizingProgress(progress: unknown): boolean {
 .tool-call-card :deep(.lc-collapsible-trail) {
   flex: 0 0 auto;
   width: auto;
-  min-width: max-content;
-  display: grid;
-  grid-template-columns: max-content max-content;
+  min-width: 0;
+  display: flex;
   align-items: center;
-  column-gap: 6px;
+  gap: 6px;
 }
 
 .part-card-status,
@@ -923,6 +1139,18 @@ function isFinalizingProgress(progress: unknown): boolean {
   flex: 0 0 auto;
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-xs);
+}
+
+.part-card-progress,
+.part-card-inline-error {
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.part-card-inline-error {
+  color: var(--vscode-errorForeground);
 }
 
 .part-card-status {

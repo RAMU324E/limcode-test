@@ -1,4 +1,9 @@
 import { createHash } from 'node:crypto';
+import type {
+  CompressionCommandTarget,
+  LlmProviderKind,
+  MessageRetryTarget
+} from '../../shared/protocol';
 import {
   ContentAddressedStore,
   type ContentObjectMetadata,
@@ -13,7 +18,14 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import { canonicalPlainJson, normalizePlainJson } from './plainJson';
+import { sqliteUniqueFailureIncludes, stablePhaseFId } from './phaseFIdentity';
 import { RuntimeDatabase } from './runtimeDatabase';
+import type { ExecutionLeaseFence } from './executionLeaseFence';
+import {
+  childExecutionAcceptsContinuation,
+  requireChildExecutionStatus
+} from './childExecutionState';
 import {
   judgeTurnRecovery,
   type TurnRecoveryFacts,
@@ -30,11 +42,32 @@ const CONTENT_TYPE_INTENT = 'application/vnd.limcode.turn-intent+json';
 const CONTENT_TYPE_PRESET = 'application/vnd.limcode.turn-execution-preset+json';
 const CONTENT_TYPE_AUTHORITY = 'application/vnd.limcode.turn-authority-snapshot+json';
 const CONTENT_TYPE_INTERRUPT = 'application/vnd.limcode.turn-interrupt-request+json';
+const TURN_TERMINATION_INPUT_KINDS = [
+  'interrupt_request',
+  'interrupt_current_turn',
+  'termination_request'
+] as const;
+const TERMINAL_BLOCKING_INPUT_KINDS = ['runtime_delivery', ...TURN_TERMINATION_INPUT_KINDS] as const;
 
 export type TurnCommandSourceKind = 'command' | 'callback' | 'internal' | 'recovery';
 export type TurnCommandOperation = 'input' | 'edit' | 'delete' | 'retry' | 'interrupt' | 'continuation' | 'terminal';
 export type TurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'outcome_unknown';
 export type TurnCommandContent = string | Uint8Array;
+
+/** A history mutation can be retried unchanged once the exact competing Turn/Intent settles. */
+export class ConversationHistoryBusyError extends Error {
+  public readonly code = 'CONVERSATION_HISTORY_BUSY';
+
+  public constructor(public readonly conversationId: string) {
+    super(`Conversation ${conversationId} still has an active Turn or queued TurnIntent; finish it before changing history.`);
+    this.name = 'ConversationHistoryBusyError';
+  }
+}
+
+export function isConversationHistoryBusyError(error: unknown): error is ConversationHistoryBusyError {
+  return error instanceof ConversationHistoryBusyError
+    || (error as { code?: unknown })?.code === 'CONVERSATION_HISTORY_BUSY';
+}
 
 export interface TurnCommandSource {
   kind: TurnCommandSourceKind;
@@ -55,6 +88,14 @@ export interface TurnAuthorityCompilationRequest {
   executorAgentId: string;
   intentKind: 'input' | 'retry' | 'continuation';
   sourceTurnId?: string;
+  /** Explicit next-Turn selection captured by the UI command admission boundary. */
+  modelOverride?: TurnModelOverride;
+}
+
+export interface TurnModelOverride {
+  providerConfigId?: string;
+  provider?: LlmProviderKind;
+  model: string;
 }
 
 export interface CompiledTurnAuthorityContent {
@@ -80,6 +121,16 @@ export interface TurnExecutionCommand {
   leaseOwnerId: string;
   hostBootId: string;
   leaseExpiresAt: string;
+  /** Optional next-Turn authority. Once admitted it is frozen into the Turn snapshot. */
+  executorAgentId?: string;
+  modelOverride?: TurnModelOverride;
+  /** Optional explicit scheduler membership; persisted as independent ChildExecution link facts. */
+  membership?: TurnExecutionMembership;
+}
+
+export interface TurnExecutionMembership {
+  kind: 'child_execution';
+  childExecutionId: string;
 }
 
 export interface TurnInputCommand extends TurnExecutionCommand {
@@ -89,6 +140,8 @@ export interface TurnInputCommand extends TurnExecutionCommand {
 
 export interface TurnRetryCommand extends TurnExecutionCommand {
   sourceTurnId: string;
+  target: MessageRetryTarget;
+  expectedMessageRevisionId?: string;
 }
 
 export interface TurnContinuationCommand extends TurnExecutionCommand {
@@ -97,12 +150,58 @@ export interface TurnContinuationCommand extends TurnExecutionCommand {
   contentType?: string;
 }
 
+/** Internal no-visible-message continuation with authority inherited from one source Turn. */
+export interface TurnRuntimeContinuationCommand extends TurnExecutionCommand {
+  source: TurnInitiatingSource & { kind: 'internal' };
+  sourceTurnId: string;
+  /**
+   * Immutable product-maintenance identity carried by the admitted TurnIntent CAS payload.
+   * This is deliberately not process-local state: startup recovery can classify and replay a
+   * maintenance Turn even when the Host died before its first ModelRequest was created.
+   */
+  maintenance?: TurnRuntimeMaintenanceDescriptor;
+}
+
+export type TurnRuntimeMaintenanceDescriptor =
+  | TurnRuntimeMaintenanceDescriptorV1
+  | TurnRuntimeMaintenanceDescriptorV2;
+
+/** Exact legacy shape retained solely so already-persisted maintenance Turns remain recoverable. */
+export interface TurnRuntimeMaintenanceDescriptorV1 {
+  kind: 'manual_context_compression';
+  version: 1;
+  compressSegmentCount: number;
+  /** Stable initiating source identity, used only to locate an exact command replay. */
+  commandSourceKey: string;
+}
+
+export interface TurnRuntimeMaintenanceDescriptorV2 {
+  kind: 'manual_context_compression';
+  version: 2;
+  compressSegmentCount: number;
+  /** Exact UI boundary frozen before the maintenance Turn is admitted. */
+  target: CompressionCommandTarget;
+  /** Stable initiating source identity, used only to locate an exact command replay. */
+  commandSourceKey: string;
+}
+
 export interface TurnEditCommand {
   source: TurnInitiatingSource;
   conversationId: string;
   messageId: string;
+  expectedRevisionId?: string;
   content: TurnCommandContent;
   contentType?: string;
+  /** When true, the edited revision becomes the final Context segment and later Messages are soft-deleted. */
+  deleteFollowing?: boolean;
+}
+
+export interface TurnEditAndRunCommand extends TurnExecutionCommand {
+  messageId: string;
+  expectedRevisionId?: string;
+  content: TurnCommandContent;
+  contentType?: string;
+  deleteFollowing?: boolean;
 }
 
 export interface TurnDeleteCommand {
@@ -114,6 +213,7 @@ export interface TurnDeleteCommand {
 export interface TurnInterruptCommand {
   source: TurnInitiatingSource;
   turnId: string;
+  expectedLeaseGeneration?: string;
   reason: string;
 }
 
@@ -152,6 +252,17 @@ export interface TurnCommandResult {
   pendingTurnInputPosition?: string;
   terminalRecorded?: boolean;
   ignoredBecauseTerminal?: boolean;
+  coalesced?: boolean;
+}
+
+export interface TurnRecoveryLeaseClaimResult {
+  receiptId: string;
+  conversationId: string;
+  turnId: string;
+  executionLeaseId: string;
+  leaseGeneration: string;
+  deduplicated: boolean;
+  commitSeq?: string;
 }
 
 export interface TurnUnresolvedFileClosure {
@@ -164,15 +275,52 @@ export interface TurnUnresolvedFileClosure {
 export interface TurnControlPlaneOptions {
   authorityCompiler: TurnAuthorityCompiler;
   unresolvedFileClosure?: TurnUnresolvedFileClosure;
+  /** Injects pending next_turn RuntimeDelivery facts into an admitted ordinary Turn atomically. */
+  prepareNextTurnDeliverySteps?: (
+    conversationId: string,
+    turnId: string,
+    now: string
+  ) => Promise<RepositoryTransactionStep[]>;
   now?: () => string;
+}
+
+/**
+ * A terminal writer lost its final input fence. The Turn is deliberately still active: the
+ * executor must absorb the RuntimeDelivery or acknowledge the termination request and retry.
+ */
+export class TurnTerminalInputConflictError extends Error {
+  public readonly code = 'TURN_TERMINAL_INPUT_CONFLICT';
+
+  public constructor(
+    public readonly turnId: string,
+    public readonly pendingTurnInputIds: readonly string[],
+    public readonly pendingTurnInputKinds: readonly string[]
+  ) {
+    super(`Turn ${turnId} gained terminal-blocking input before its terminal commit.`);
+    this.name = 'TurnTerminalInputConflictError';
+  }
+}
+
+export function isTurnTerminalInputConflictError(error: unknown): error is TurnTerminalInputConflictError {
+  return (error as { code?: unknown })?.code === 'TURN_TERMINAL_INPUT_CONFLICT';
 }
 
 interface StartIntentPlan {
   command: TurnExecutionCommand;
   operation: 'input' | 'retry' | 'continuation';
   sourceTurnId?: string;
+  retryTarget?: MessageRetryTarget;
+  expectedMessageRevisionId?: string;
   messageContent?: TurnCommandContent;
   messageContentType?: string;
+  inheritSourceAuthority?: boolean;
+  rewindSourceOutput?: boolean;
+  runtimeMaintenance?: TurnRuntimeMaintenanceDescriptor;
+}
+
+interface ChildAdmissionPlan {
+  outerSteps: RepositoryTransactionStep[];
+  admissionSteps: RepositoryTransactionStep[];
 }
 
 interface StartCommandIds {
@@ -201,11 +349,36 @@ interface CommandCommit {
   allocatedSequences: ReadonlyArray<{ domain: string; id: string; column: string; value: string }>;
 }
 
+interface ConversationMessageEntry {
+  membership: DomainRow;
+  message: DomainRow;
+  messageSeq: bigint;
+}
+
+interface ConversationMessageSnapshot {
+  entries: ConversationMessageEntry[];
+  membershipIds: string[];
+}
+
+interface RetryLineage {
+  sourceTurnId: string;
+  sourceMessageId?: string;
+  sourceMessageRevisionId?: string;
+  sourceModelRequestId?: string;
+  inheritedPlanApprovalToolCallId?: string;
+}
+
+interface RetryRewindPlan {
+  steps: RepositoryTransactionStep[];
+  lineage: RetryLineage;
+}
+
 /** Phase C command facade. SQLite transactions are the only lifecycle serialization authority. */
 export class TurnControlPlane {
   private readonly now: () => string;
   private readonly authorityCompiler: TurnAuthorityCompiler;
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
+  private readonly prepareNextTurnDeliverySteps?: TurnControlPlaneOptions['prepareNextTurnDeliverySteps'];
   private readonly contextSequence: ContextSequenceControlPlane;
 
   public constructor(
@@ -218,6 +391,7 @@ export class TurnControlPlane {
     }
     this.authorityCompiler = options.authorityCompiler;
     this.unresolvedFileClosure = options.unresolvedFileClosure;
+    this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
     this.now = options.now ?? (() => new Date().toISOString());
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
   }
@@ -235,7 +409,12 @@ export class TurnControlPlane {
     return this.startIntent({
       command,
       operation: 'retry',
-      sourceTurnId: command.sourceTurnId
+      sourceTurnId: command.sourceTurnId,
+      retryTarget: normalizeRetryTarget(command.target),
+      ...(command.expectedMessageRevisionId
+        ? { expectedMessageRevisionId: requireId(command.expectedMessageRevisionId, 'expectedMessageRevisionId') }
+        : {}),
+      rewindSourceOutput: true
     });
   }
 
@@ -249,8 +428,27 @@ export class TurnControlPlane {
     });
   }
 
+  public runtimeContinuation(command: TurnRuntimeContinuationCommand): Promise<TurnCommandResult> {
+    if (command.source.kind !== 'internal') {
+      throw new TypeError('Runtime continuation requires an internal source.');
+    }
+    return this.startIntent({
+      command,
+      operation: 'retry',
+      sourceTurnId: command.sourceTurnId,
+      inheritSourceAuthority: true,
+      ...(command.maintenance
+        ? { runtimeMaintenance: normalizeRuntimeMaintenance(command.maintenance) }
+        : {})
+    });
+  }
+
   public edit(command: TurnEditCommand): Promise<TurnCommandResult> {
     return this.editMessage(command);
+  }
+
+  public editAndRun(command: TurnEditAndRunCommand): Promise<TurnCommandResult> {
+    return this.editMessageAndRun(command);
   }
 
   public delete(command: TurnDeleteCommand): Promise<TurnCommandResult> {
@@ -382,6 +580,353 @@ export class TurnControlPlane {
     return { ...facts, judgment: judgeTurnRecovery(facts) };
   }
 
+  /**
+   * Process-local scheduling is only a wake hint. The durable ExecutionLease remains the execution
+   * authority, so every Runner drive must prove both its Host boot and owner id immediately before
+   * entering the Agent loop.
+   */
+  public async ownsExecutionLease(input: {
+    turnId: string;
+    leaseOwnerId: string;
+    hostBootId: string;
+    generation?: bigint;
+  }): Promise<boolean> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const leaseOwnerId = requireId(input.leaseOwnerId, 'leaseOwnerId');
+    const hostBootId = requireId(input.hostBootId, 'hostBootId');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { turn_id: turnId }, limit: 2 })
+    ]);
+    const turn = snapshot.snapshot[0];
+    const leases = rows(snapshot.snapshot[1]);
+    if (!turn || Array.isArray(turn) || turn.status !== TURN_STATUS_ACTIVE || leases.length !== 1) return false;
+    return leases[0].owner_id === leaseOwnerId
+      && leases[0].host_boot_id === hostBootId
+      && Date.parse(requireTimestamp(leases[0].expires_at, 'ExecutionLease.expires_at')) > Date.parse(this.timestamp())
+      && (input.generation === undefined || leases[0].generation === input.generation);
+  }
+
+  /** Captures the immutable tuple an executor must carry for the entire Agent-loop lifetime. */
+  public async executionLeaseFence(input: {
+    turnId: string;
+    leaseOwnerId: string;
+    hostBootId: string;
+  }): Promise<ExecutionLeaseFence | null> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const leaseOwnerId = requireId(input.leaseOwnerId, 'leaseOwnerId');
+    const hostBootId = requireId(input.hostBootId, 'hostBootId');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { turn_id: turnId }, limit: 2 })
+    ]);
+    const turn = snapshot.snapshot[0];
+    const leases = rows(snapshot.snapshot[1]);
+    if (!turn || Array.isArray(turn) || turn.status !== TURN_STATUS_ACTIVE || leases.length !== 1) return null;
+    const lease = leases[0];
+    if (lease.owner_id !== leaseOwnerId || lease.host_boot_id !== hostBootId) return null;
+    if (
+      Date.parse(requireTimestamp(lease.expires_at, 'ExecutionLease.expires_at'))
+      <= Date.parse(this.timestamp())
+    ) return null;
+    return {
+      id: requireId(lease.id, 'ExecutionLease.id'),
+      conversationId: requireId(lease.conversation_id, 'ExecutionLease.conversation_id'),
+      turnId,
+      ownerId: leaseOwnerId,
+      hostBootId,
+      generation: requirePositiveInteger(lease.generation, 'ExecutionLease.generation')
+    };
+  }
+
+  /** Renews only the exact captured generation; a recovered owner makes this a harmless loser. */
+  public async renewExecutionLease(input: {
+    fence: ExecutionLeaseFence;
+    leaseExpiresAt: string;
+  }): Promise<boolean> {
+    const expiresAt = requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt');
+    const now = this.timestamp();
+    if (Date.parse(expiresAt) <= Date.parse(now)) return false;
+    const currentRows = await this.listRows('ExecutionLease', { turn_id: input.fence.turnId }, 2);
+    if (currentRows.length !== 1) return false;
+    const current = currentRows[0];
+    if (
+      current.id !== input.fence.id
+      || current.conversation_id !== input.fence.conversationId
+      || current.turn_id !== input.fence.turnId
+      || current.owner_id !== input.fence.ownerId
+      || current.host_boot_id !== input.fence.hostBootId
+      || current.generation !== input.fence.generation
+    ) return false;
+    const observedExpiry = requireTimestamp(current.expires_at, 'ExecutionLease.expires_at');
+    if (Date.parse(observedExpiry) <= Date.parse(now)) return false;
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Turn').assert(input.fence.turnId, { status: TURN_STATUS_ACTIVE }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(input.fence.id, {
+          conversation_id: input.fence.conversationId,
+          turn_id: input.fence.turnId,
+          owner_id: input.fence.ownerId,
+          host_boot_id: input.fence.hostBootId,
+          generation: input.fence.generation,
+          acquired_at: current.acquired_at,
+          expires_at: observedExpiry
+        }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
+          expires_at: expiresAt
+        })
+      ]);
+      return true;
+    } catch (error) {
+      if (isTransactionAssertionError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Rebinds a resumable Turn's execution ownership to the current Extension Host boot. This is a
+   * recovery command: an existing lease from another boot is fenced by an exact-row
+   * assertion before replacement, while active/no-lease recovery requires the PendingTurnInput
+   * fact mandated by identity.json. It never revives a terminal or finalize-only Turn.
+   */
+  public async claimRecoveryExecution(input: {
+    turnId: string;
+    leaseOwnerId: string;
+    hostBootId: string;
+    leaseExpiresAt: string;
+  }): Promise<TurnRecoveryLeaseClaimResult | null> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const leaseOwnerId = requireId(input.leaseOwnerId, 'leaseOwnerId');
+    const hostBootId = requireId(input.hostBootId, 'hostBootId');
+    const leaseExpiresAt = requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt');
+    const source: TurnCommandSource = {
+      kind: 'recovery',
+      key: `runner-claim-execution:${hostBootId}:${turnId}`
+    };
+    const receiptId = recoveryExecutionEntityId('command_receipt', hostBootId, turnId);
+    const existingReceipt = await this.findReceipt(source);
+    if (existingReceipt) {
+      if (
+        existingReceipt.id !== receiptId
+        || existingReceipt.source_kind !== source.kind
+        || existingReceipt.source_key !== source.key
+        || existingReceipt.turn_id !== turnId
+      ) throw new Error(`Turn ${turnId} recovery ownership receipt has conflicting identity.`);
+      const leaseRows = await this.listRows('ExecutionLease', { turn_id: turnId }, 2);
+      if (leaseRows.length !== 1) {
+        throw new Error(`Recovered Turn ${turnId} lost its claimed ExecutionLease.`);
+      }
+      if (leaseRows[0].owner_id !== leaseOwnerId || leaseRows[0].host_boot_id !== hostBootId) {
+        return null;
+      }
+      const turn = await this.getTurn(turnId);
+      const generation = requirePositiveInteger(leaseRows[0].generation, 'ExecutionLease.generation');
+      const now = this.timestamp();
+      if (
+        Date.parse(requireTimestamp(leaseRows[0].expires_at, 'ExecutionLease.expires_at'))
+        <= Date.parse(now)
+      ) {
+        // The first recovery receipt proves only its original generation. Once that lease expires,
+        // reusing the receipt and merely extending expires_at would let delayed work from the old
+        // lifetime retain write authority. A generation-scoped claim supplies a new receipt and an
+        // exact-row CAS, so concurrent recovery contenders still elect one winner.
+        const nextGeneration = generation + 1n;
+        const reclaimSource: TurnCommandSource = {
+          kind: 'recovery',
+          key: `runner-reclaim-execution:${hostBootId}:${turnId}:${nextGeneration}`
+        };
+        const reclaimReceiptId = recoveryExecutionEntityId(
+          'command_receipt',
+          hostBootId,
+          turnId,
+          nextGeneration.toString()
+        );
+        let reclaimed: CommandCommit;
+        try {
+          reclaimed = await this.commitWithReceipt({
+            source: reclaimSource,
+            receiptId: reclaimReceiptId,
+            conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+            turnId,
+            steps: [
+              DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+              DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(
+                requireId(leaseRows[0].id, 'ExecutionLease.id'),
+                {
+                  conversation_id: leaseRows[0].conversation_id,
+                  turn_id: turnId,
+                  owner_id: leaseOwnerId,
+                  host_boot_id: hostBootId,
+                  generation,
+                  acquired_at: leaseRows[0].acquired_at,
+                  expires_at: leaseRows[0].expires_at
+                }
+              ),
+              DOMAIN_REPOSITORIES.domain('ExecutionLease').update(
+                requireId(leaseRows[0].id, 'ExecutionLease.id'),
+                {
+                  generation: nextGeneration,
+                  acquired_at: now,
+                  expires_at: leaseExpiresAt
+                }
+              )
+            ]
+          });
+        } catch (error) {
+          if (isTransactionAssertionError(error) || isLeaseAdmissionConflict(error)) return null;
+          throw error;
+        }
+        const current = (await this.listRows('ExecutionLease', { turn_id: turnId }, 2))[0];
+        if (
+          !current
+          || current.owner_id !== leaseOwnerId
+          || current.host_boot_id !== hostBootId
+          || current.generation !== nextGeneration
+        ) return null;
+        return {
+          receiptId: requireId(reclaimed.receipt.id, 'CommandReceipt.id'),
+          conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+          turnId,
+          executionLeaseId: requireId(current.id, 'ExecutionLease.id'),
+          leaseGeneration: nextGeneration.toString(),
+          deduplicated: reclaimed.deduplicated,
+          ...(reclaimed.commitSeq ? { commitSeq: reclaimed.commitSeq } : {})
+        };
+      }
+      const renewed = await this.renewExecutionLease({
+        fence: {
+          id: requireId(leaseRows[0].id, 'ExecutionLease.id'),
+          conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+          turnId,
+          ownerId: leaseOwnerId,
+          hostBootId,
+          generation
+        },
+        leaseExpiresAt
+      });
+      if (!renewed) return null;
+      return {
+        receiptId: requireId(existingReceipt.id, 'CommandReceipt.id'),
+        conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+        turnId,
+        executionLeaseId: requireId(leaseRows[0].id, 'ExecutionLease.id'),
+        leaseGeneration: generation.toString(),
+        deduplicated: true
+      };
+    }
+
+    const facts = await this.recoveryFacts(turnId);
+    if (facts.judgment !== 'resume') return null;
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { turn_id: turnId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('PendingTurnInput').list({ where: { turn_id: turnId }, limit: 1 }),
+      DOMAIN_REPOSITORIES.domain('TurnTermination').list({ where: { turn_id: turnId }, limit: 1 })
+    ]);
+    const turn = requireRow(snapshot.snapshot[0], `Turn ${turnId}`);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const leases = rows(snapshot.snapshot[1]);
+    const pendingInputs = rows(snapshot.snapshot[2]);
+    const terminations = rows(snapshot.snapshot[3]);
+    if (turn.status !== TURN_STATUS_ACTIVE || terminations.length !== 0 || leases.length > 1) {
+      throw new Error(`Turn ${turnId} changed while claiming startup recovery ownership.`);
+    }
+    const existingLease = leases[0];
+    const now = this.timestamp();
+    if (!existingLease && pendingInputs.length === 0) {
+      throw new Error(`Turn ${turnId} has no durable fact permitting recovery ownership.`);
+    }
+    const existingLeaseExpired = existingLease
+      ? Date.parse(requireTimestamp(existingLease.expires_at, 'ExecutionLease.expires_at')) <= Date.parse(now)
+      : false;
+    if (
+      existingLease
+      && existingLease.host_boot_id !== hostBootId
+      && !existingLeaseExpired
+      && await this.database.isHostAlive(requireId(existingLease.host_boot_id, 'ExecutionLease.host_boot_id'))
+    ) {
+      // Before expiry, a verifiably live Host is authoritative. After expiry the generation CAS
+      // fences every delayed write, so another Host may safely recover an event-loop-stuck owner.
+      return null;
+    }
+    if (
+      existingLease?.host_boot_id === hostBootId
+      && existingLease.owner_id !== leaseOwnerId
+      && !existingLeaseExpired
+    ) {
+      throw new Error(`Turn ${turnId} is already owned by another runner in the current host boot.`);
+    }
+    const executionLeaseId = existingLease
+      ? requireId(existingLease.id, 'ExecutionLease.id')
+      : recoveryExecutionEntityId('execution_lease', hostBootId, turnId);
+    const nextGeneration = existingLease
+      ? requirePositiveInteger(existingLease.generation, 'ExecutionLease.generation') + 1n
+      : 1n;
+    const leaseSteps: RepositoryTransactionStep[] = existingLease
+      ? [
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(executionLeaseId, {
+            conversation_id: conversationId,
+            turn_id: turnId,
+            owner_id: existingLease.owner_id,
+            host_boot_id: existingLease.host_boot_id,
+            generation: existingLease.generation,
+            acquired_at: existingLease.acquired_at,
+            expires_at: existingLease.expires_at
+          }),
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').update(executionLeaseId, {
+            owner_id: leaseOwnerId,
+            host_boot_id: hostBootId,
+            generation: nextGeneration,
+            acquired_at: now,
+            expires_at: leaseExpiresAt
+          })
+        ]
+      : [
+          DOMAIN_REPOSITORIES.domain('PendingTurnInput').assert(
+            requireId(pendingInputs[0].id, 'PendingTurnInput.id'),
+            { turn_id: turnId }
+          ),
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').insert({
+            id: executionLeaseId,
+            conversation_id: conversationId,
+            turn_id: turnId,
+            owner_id: leaseOwnerId,
+            host_boot_id: hostBootId,
+            generation: nextGeneration,
+            acquired_at: now,
+            expires_at: leaseExpiresAt
+          })
+        ];
+    let committed: CommandCommit;
+    try {
+      committed = await this.commitWithReceipt({
+        source,
+        receiptId,
+        conversationId,
+        turnId,
+        steps: [
+          DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+          DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: turnId }),
+          ...leaseSteps
+        ]
+      });
+    } catch (error) {
+      // Multiple fresh Hosts may observe the same dead owner. Exact-row assertions elect one; the
+      // loser must stand down rather than turning a safe recovery race into a startup failure.
+      if (isTransactionAssertionError(error) || isLeaseAdmissionConflict(error)) return null;
+      throw error;
+    }
+    return {
+      receiptId: requireId(committed.receipt.id, 'CommandReceipt.id'),
+      conversationId,
+      turnId,
+      executionLeaseId,
+      leaseGeneration: nextGeneration.toString(),
+      deduplicated: committed.deduplicated,
+      ...(committed.commitSeq ? { commitSeq: committed.commitSeq } : {})
+    };
+  }
+
   /** Phase C validates stable source facts only; target fork writes belong to Phase E/F. */
   public async validateForkSource(sourceInput: ConversationForkSource): Promise<ValidatedConversationForkSource> {
     const source = normalizeForkSource(sourceInput);
@@ -415,6 +960,49 @@ export class TurnControlPlane {
     }
     if (rows(snapshot.snapshot[4]).length === 0) {
       throw new Error('Fork source Message is not linked to the source Turn.');
+    }
+    const structure = await this.contextSequence.materializeStructure(source.sourceContextRootId);
+    const revisionSources = await listAllDomainRows(this.database, 'ContextSegmentSource', {
+      source_kind: 'message_revision',
+      source_id: source.sourceMessageRevisionId
+    });
+    const revisionSegmentIds = new Set(revisionSources.map((row) =>
+      requireId(row.segment_id, 'ContextSegmentSource.segment_id')
+    ));
+    const segmentIndexes = new Map(structure.records.map((record, index) => [
+      requireId(record.segment.id, 'ContextSegment.id'),
+      index
+    ]));
+    let previousIndex = structure.records.findIndex((record) =>
+      revisionSegmentIds.has(requireId(record.segment.id, 'ContextSegment.id'))
+    );
+    if (previousIndex < 0) {
+      throw new Error('Fork source Context root does not contain the selected MessageRevision.');
+    }
+    if (revision.role === 'model') {
+      const callLinks = (await listAllDomainRows(this.database, 'ToolCallSourceLink', {
+        message_id: source.sourceMessageId
+      })).sort((left, right) => {
+        const leftOrdinal = requireBigInt(left.provider_ordinal, 'ToolCallSourceLink.provider_ordinal');
+        const rightOrdinal = requireBigInt(right.provider_ordinal, 'ToolCallSourceLink.provider_ordinal');
+        return leftOrdinal < rightOrdinal ? -1 : leftOrdinal > rightOrdinal ? 1 : 0;
+      });
+      for (const callLink of callLinks) {
+        const toolCallId = requireId(callLink.tool_call_id, 'ToolCallSourceLink.tool_call_id');
+        const pairSources = await listAllDomainRows(this.database, 'ContextSegmentSource', {
+          source_kind: 'tool_call',
+          source_id: toolCallId
+        });
+        if (pairSources.length !== 1) {
+          throw new Error(`Fork source ToolCall ${toolCallId} is unresolved.`);
+        }
+        const pairSegmentId = requireId(pairSources[0].segment_id, 'ContextSegmentSource.segment_id');
+        const pairIndex = segmentIndexes.get(pairSegmentId) ?? -1;
+        if (pairIndex <= previousIndex) {
+          throw new Error(`Fork source Context root does not contain a canonical ToolCall suffix for ${toolCallId}.`);
+        }
+        previousIndex = pairIndex;
+      }
     }
     return {
       ...source,
@@ -458,9 +1046,13 @@ export class TurnControlPlane {
       ? await this.contextSequence.prepareMessageAppendMutation({
           conversationId,
           messageRevisionId: requireId(ids.messageRevision, 'messageRevisionId'),
-          contentObjectId: decoded.messageContent.metadata.id
+          contentObjectId: decoded.messageContent.metadata.id,
+          contentByteLength: decoded.messageContent.metadata.byte_length
         })
       : null;
+    const nextDeliverySteps = this.prepareNextTurnDeliverySteps
+      ? await this.prepareNextTurnDeliverySteps(conversationId, ids.turn, now)
+      : [];
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
       DOMAIN_REPOSITORIES.domain('TurnIntentAuthorityRevision').assert(
@@ -493,6 +1085,7 @@ export class TurnControlPlane {
         turn_id: ids.turn,
         owner_id: requireText(input.leaseOwnerId, 'leaseOwnerId'),
         host_boot_id: requireText(input.hostBootId, 'hostBootId'),
+        generation: 1n,
         acquired_at: now,
         expires_at: requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt')
       }),
@@ -520,6 +1113,7 @@ export class TurnControlPlane {
         now
       ) : []),
       ...(messageContext?.steps ?? []),
+      ...nextDeliverySteps,
       DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
     ];
     try {
@@ -577,12 +1171,27 @@ export class TurnControlPlane {
   private async startIntent(plan: StartIntentPlan): Promise<TurnCommandResult> {
     const command = normalizeExecutionCommand(plan.command, plan.operation);
     const source = normalizeInitiatingSource(command.source, plan.operation);
-    const commandScope = JSON.stringify([command.conversationId, plan.sourceTurnId ?? null]);
-    const ids = startCommandIds(source, plan.operation, plan.messageContent !== undefined, commandScope);
+    const retryTarget = plan.retryTarget ? normalizeRetryTarget(plan.retryTarget) : undefined;
+    const commandScopeParts: unknown[] = [
+      command.conversationId,
+      plan.sourceTurnId ?? null,
+      retryTarget ?? null,
+      command.membership ?? null
+    ];
+    // The four-field scope is a persisted identity contract used by every pre-v2 command,
+    // including legacy manual-compression Turns. Only target-frozen v2 maintenance commands may
+    // extend it; appending a null (or a v1 descriptor) would make old receipts unreplayable.
+    if (plan.runtimeMaintenance?.version === 2) commandScopeParts.push(plan.runtimeMaintenance);
+    const commandScope = JSON.stringify(commandScopeParts);
+    const baseIds = startCommandIds(source, plan.operation, plan.messageContent !== undefined, commandScope);
+    const ids = command.membership
+      ? childExecutionStartIds(baseIds, command.membership.childExecutionId, plan.messageContent !== undefined)
+      : baseIds;
     const duplicate = await this.findReceipt(source);
     if (duplicate) return this.replayStartResult(duplicate, ids, plan.operation, command.conversationId);
 
     const conversation = await this.getConversation(command.conversationId);
+    if (plan.runtimeMaintenance) await this.requireConversationIdle(command.conversationId);
     if (plan.sourceTurnId) {
       const sourceTurnId = requireId(plan.sourceTurnId, 'sourceTurnId');
       const sourceTurn = await this.getTurn(sourceTurnId);
@@ -590,14 +1199,33 @@ export class TurnControlPlane {
         throw new Error(`Source Turn ${sourceTurnId} does not belong to Conversation ${conversation.id}.`);
       }
     }
-    const defaultAgent = await this.getDefaultAgent(conversation.id as string);
-    const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
-      conversationId: conversation.id as string,
-      turnId: ids.turn,
-      executorAgentId: defaultAgent.agent_id as string,
-      intentKind: plan.operation,
-      ...(plan.sourceTurnId ? { sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId') } : {})
-    }), ids.turn, defaultAgent.agent_id as string);
+    const retryRewind = plan.rewindSourceOutput
+      ? await this.prepareRetryRewindMutation({
+          conversationId: conversation.id as string,
+          sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId'),
+          target: requireRetryTarget(retryTarget),
+          ...(plan.expectedMessageRevisionId
+            ? { expectedMessageRevisionId: plan.expectedMessageRevisionId }
+            : {}),
+          idempotencyKey: ids.intent
+        })
+      : null;
+    let compiled = plan.inheritSourceAuthority
+      ? await this.inheritTurnAuthority(
+          requireId(plan.sourceTurnId, 'sourceTurnId'),
+          ids.turn,
+          conversation.id as string,
+          plan.operation
+        )
+      : await this.compileCurrentAuthority(
+          conversation.id as string,
+          ids.turn,
+          plan.operation,
+          plan.sourceTurnId,
+          command.executorAgentId,
+          command.modelOverride
+        );
+    if (retryRewind) compiled = withRetryLineage(compiled, retryRewind.lineage);
     const now = this.timestamp();
 
     const messageContent = plan.messageContent === undefined
@@ -614,7 +1242,17 @@ export class TurnControlPlane {
         JSON.stringify({
           kind: plan.operation,
           sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId'),
-          ...(messageContent ? { messageContentObjectId: messageContent.metadata.id } : {})
+          ...(retryRewind?.lineage.sourceMessageId
+            ? { sourceMessageId: retryRewind.lineage.sourceMessageId }
+            : {}),
+          ...(retryRewind?.lineage.sourceMessageRevisionId
+            ? { sourceMessageRevisionId: retryRewind.lineage.sourceMessageRevisionId }
+            : {}),
+          ...(retryRewind?.lineage.sourceModelRequestId
+            ? { sourceModelRequestId: retryRewind.lineage.sourceModelRequestId }
+            : {}),
+          ...(messageContent ? { messageContentObjectId: messageContent.metadata.id } : {}),
+          ...(plan.runtimeMaintenance ? { runtimeMaintenance: plan.runtimeMaintenance } : {})
         }),
         CONTENT_TYPE_INTENT
       );
@@ -633,7 +1271,21 @@ export class TurnControlPlane {
       ? await this.contextSequence.prepareMessageAppendMutation({
           conversationId: conversation.id as string,
           messageRevisionId: requireId(ids.messageRevision, 'message revision id'),
-          contentObjectId: messageContent.metadata.id
+          contentObjectId: messageContent.metadata.id,
+          contentByteLength: messageContent.metadata.byte_length
+        })
+      : null;
+    const nextDeliverySteps = this.prepareNextTurnDeliverySteps
+      ? await this.prepareNextTurnDeliverySteps(conversation.id as string, ids.turn, now)
+      : [];
+    const childAdmission = command.membership
+      ? await this.prepareChildAdmission({
+          membership: command.membership,
+          conversationId: conversation.id as string,
+          intentId: ids.intent,
+          turnId: ids.turn,
+          ...(plan.sourceTurnId ? { expectedPreviousTurnId: plan.sourceTurnId } : {}),
+          now
         })
       : null;
 
@@ -652,6 +1304,7 @@ export class TurnControlPlane {
         turn_id: ids.turn,
         owner_id: command.leaseOwnerId,
         host_boot_id: command.hostBootId,
+        generation: 1n,
         acquired_at: now,
         expires_at: command.leaseExpiresAt
       }),
@@ -669,7 +1322,7 @@ export class TurnControlPlane {
       DOMAIN_REPOSITORIES.domain('TurnExecutorLink').insert({
         id: ids.executorLink,
         turn_id: ids.turn,
-        agent_id: defaultAgent.agent_id,
+        agent_id: compiled.executorAgentId,
         created_at: now
       })
     ];
@@ -677,13 +1330,18 @@ export class TurnControlPlane {
       admission.push(...messageAdmissionSteps(ids, messageContent, conversation.id as string, now));
       admission.push(...messageContext!.steps);
     }
+    if (childAdmission) admission.push(...childAdmission.admissionSteps);
+    admission.push(...nextDeliverySteps);
 
     const commit = await this.commitWithReceipt({
       source,
       receiptId: ids.receipt,
       conversationId: conversation.id as string,
       turnId: null,
+      requiresConversationIdle: Boolean(retryRewind || plan.runtimeMaintenance),
       steps: [
+        ...(plan.runtimeMaintenance ? conversationIdleAssertionSteps(conversation.id as string) : []),
+        ...(retryRewind?.steps ?? []),
         ...preparedContentObjectSteps([
           intentContent,
           presetContent,
@@ -725,48 +1383,496 @@ export class TurnControlPlane {
           agent_id: compiled.executorAgentId,
           created_at: now
         }),
+        ...(childAdmission?.outerSteps ?? []),
         DOMAIN_REPOSITORIES.domain('Conversation').update(conversation.id as string, { updated_at: now }),
-        savepoint('admit_turn_intent', admission, {
-          kind: 'rollback-and-continue-on-unique',
-          constraints: [{ domain: 'ExecutionLease', columns: ['conversation_id'] }]
-        })
+        ...(retryRewind || plan.runtimeMaintenance
+          ? admission
+          : [savepoint('admit_turn_intent', admission, {
+              kind: 'rollback-and-continue-on-unique',
+              constraints: [{ domain: 'ExecutionLease', columns: ['conversation_id'] }]
+            })])
       ]
     });
     if (commit.deduplicated) return this.replayStartResult(commit.receipt, ids, plan.operation, command.conversationId);
     return this.readStartResult(commit, ids, command.conversationId);
   }
 
+  private async prepareChildAdmission(input: {
+    membership: TurnExecutionMembership;
+    conversationId: string;
+    intentId: string;
+    turnId: string;
+    expectedPreviousTurnId?: string;
+    now: string;
+  }): Promise<ChildAdmissionPlan> {
+    const childExecutionId = requireId(input.membership.childExecutionId, 'membership.childExecutionId');
+    const child = await this.requireExisting('ChildExecution', childExecutionId);
+    if (child.child_conversation_id !== input.conversationId) {
+      throw new Error(`ChildExecution ${childExecutionId} does not own Conversation ${input.conversationId}.`);
+    }
+    const childStatus = requireChildExecutionStatus(child.status);
+    if (!childExecutionAcceptsContinuation(childStatus)) {
+      throw new Error(`ChildExecution ${childExecutionId} no longer accepts a new Turn.`);
+    }
+    const [bridges, activeLinks, turnLinks, pendingIntentLinks] = await Promise.all([
+      this.listRows('AnswerBridge', { child_execution_id: childExecutionId }, 2),
+      this.listRows('ChildExecutionActiveTurnLink', { child_execution_id: childExecutionId }, 2),
+      listAllDomainRows(this.database, 'ChildExecutionTurnLink', { child_execution_id: childExecutionId }),
+      this.listRows('ChildExecutionIntentLink', { child_execution_id: childExecutionId, state: 'pending' }, 2)
+    ]);
+    if (bridges.length !== 1 || bridges[0].status === 'closed') {
+      throw new Error(`ChildExecution ${childExecutionId} must retain one open AnswerBridge.`);
+    }
+    if (activeLinks.length > 1) throw new Error(`ChildExecution ${childExecutionId} has multiple active Turn links.`);
+    if (pendingIntentLinks.length > 0) {
+      throw new Error(`ChildExecution ${childExecutionId} already has a pending continuation.`);
+    }
+    const latestLink = [...turnLinks].sort((left, right) => {
+      const leftSeq = requireBigInt(left.turn_seq, 'ChildExecutionTurnLink.turn_seq');
+      const rightSeq = requireBigInt(right.turn_seq, 'ChildExecutionTurnLink.turn_seq');
+      return leftSeq < rightSeq ? 1 : leftSeq > rightSeq ? -1 : 0;
+    })[0];
+    if (!latestLink) throw new Error(`ChildExecution ${childExecutionId} has no Turn lineage.`);
+    if (
+      input.expectedPreviousTurnId
+      && !turnLinks.some((link) => link.turn_id === input.expectedPreviousTurnId)
+    ) {
+      throw new Error(`Source Turn ${input.expectedPreviousTurnId} is not a member of ChildExecution ${childExecutionId}.`);
+    }
+    const previousTurnId = requireId(latestLink.turn_id, 'latest ChildExecutionTurnLink.turn_id');
+    const previousTurn = await this.getTurn(previousTurnId);
+    const activeLink = activeLinks[0] ?? null;
+    if (activeLink && activeLink.turn_id !== previousTurnId) {
+      throw new Error(`ChildExecution ${childExecutionId} active pointer is not its latest generation.`);
+    }
+    const bridge = bridges[0];
+    const intentLinkId = childIntentLinkId(childExecutionId, input.intentId);
+    const turnLinkId = childTurnLinkId(childExecutionId, input.intentId);
+    const activeLinkId = stablePhaseFId('child_execution_active_turn_link', childExecutionId);
+    return {
+      outerSteps: [
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').insertWithNextSequence({
+          id: intentLinkId,
+          child_execution_id: childExecutionId,
+          turn_intent_id: input.intentId,
+          state: 'pending',
+          created_at: input.now,
+          updated_at: input.now
+        }, {
+          column: 'intent_seq',
+          scope: { child_execution_id: childExecutionId }
+        })
+      ],
+      admissionSteps: [
+        DOMAIN_REPOSITORIES.domain('ChildExecution').assert(childExecutionId, { status: child.status }),
+        DOMAIN_REPOSITORIES.domain('AnswerBridge').assert(requireId(bridge.id, 'AnswerBridge.id'), {
+          child_execution_id: childExecutionId,
+          status: bridge.status,
+          current_submission_id: bridge.current_submission_id
+        }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertExactIds(
+          { child_execution_id: childExecutionId },
+          turnLinks.map((link) => requireId(link.id, 'ChildExecutionTurnLink.id'))
+        ),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(previousTurnId, { status: TURN_STATUS_TERMINATED }),
+        ...(activeLink
+          ? [
+              DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(
+                requireId(activeLink.id, 'ChildExecutionActiveTurnLink.id'),
+                { child_execution_id: childExecutionId, turn_id: previousTurnId }
+              ),
+              DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').update(
+                requireId(activeLink.id, 'ChildExecutionActiveTurnLink.id'),
+                { turn_id: input.turnId, updated_at: input.now }
+              )
+            ]
+          : [
+              DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assertNone({
+                child_execution_id: childExecutionId
+              }),
+              DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').insert({
+                id: activeLinkId,
+                child_execution_id: childExecutionId,
+                turn_id: input.turnId,
+                updated_at: input.now
+              })
+            ]),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(intentLinkId, {
+          child_execution_id: childExecutionId,
+          turn_intent_id: input.intentId,
+          state: 'pending'
+        }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').update(intentLinkId, {
+          state: 'admitted',
+          updated_at: input.now
+        }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').insertWithNextSequence({
+          id: turnLinkId,
+          child_execution_id: childExecutionId,
+          turn_id: input.turnId,
+          created_at: input.now
+        }, {
+          column: 'turn_seq',
+          scope: { child_execution_id: childExecutionId }
+        }),
+        DOMAIN_REPOSITORIES.domain('AnswerBridge').update(requireId(bridge.id, 'AnswerBridge.id'), {
+          status: 'open',
+          current_submission_id: null,
+          updated_at: input.now
+        }),
+        DOMAIN_REPOSITORIES.domain('ChildExecution').update(childExecutionId, {
+          status: 'active',
+          updated_at: input.now
+        })
+      ]
+    };
+  }
+
+  private async compileCurrentAuthority(
+    conversationId: string,
+    turnId: string,
+    intentKind: StartIntentPlan['operation'],
+    sourceTurnId?: string,
+    requestedExecutorAgentId?: string,
+    modelOverride?: TurnModelOverride
+  ): Promise<ReturnType<typeof normalizeCompiledTurnAuthority>> {
+    const executorAgentId = requestedExecutorAgentId
+      ? requireId(requestedExecutorAgentId, 'TurnExecutionCommand.executorAgentId')
+      : requireId((await this.getDefaultAgent(conversationId)).agent_id, 'AgentConversationLink.agent_id');
+    return normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
+      conversationId,
+      turnId,
+      executorAgentId,
+      intentKind,
+      ...(sourceTurnId ? { sourceTurnId: requireId(sourceTurnId, 'sourceTurnId') } : {}),
+      ...(modelOverride ? { modelOverride } : {})
+    }), turnId, executorAgentId);
+  }
+
+  private async inheritTurnAuthority(
+    sourceTurnId: string,
+    targetTurnId: string,
+    conversationId: string,
+    intentKind: StartIntentPlan['operation']
+  ): Promise<ReturnType<typeof normalizeCompiledTurnAuthority>> {
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').list({ where: { turn_id: sourceTurnId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('TurnExecutorLink').list({ where: { turn_id: sourceTurnId }, limit: 2 })
+    ]);
+    const authorityRows = rows(snapshot.snapshot[0]);
+    const executorRows = rows(snapshot.snapshot[1]);
+    if (authorityRows.length !== 1 || executorRows.length !== 1) {
+      throw new Error(`Source Turn ${sourceTurnId} has incomplete frozen authority facts.`);
+    }
+    const executorAgentId = requireId(executorRows[0].agent_id, 'TurnExecutorLink.agent_id');
+    const metadata = await this.readContentObject(requireId(
+      authorityRows[0].content_object_id,
+      'AuthoritySnapshot.content_object_id'
+    ));
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as unknown;
+    } catch (error) {
+      throw new Error(`Source Turn ${sourceTurnId} authority is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const normalized = normalizePlainJson(parsed, `Source Turn ${sourceTurnId} authority`);
+    if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) {
+      throw new Error(`Source Turn ${sourceTurnId} authority must be a JSON object.`);
+    }
+    const authority = canonicalPlainJson({
+      ...normalized,
+      turnId: targetTurnId,
+      conversationId,
+      executorAgentId,
+      intentKind,
+      sourceTurnId
+    }, 'Inherited Turn authority');
+    return normalizeCompiledTurnAuthority({
+      turnId: targetTurnId,
+      executorAgentId,
+      executionPreset: {
+        content: canonicalPlainJson({
+          kind: 'turn-execution-preset',
+          turnId: targetTurnId,
+          executorAgentId,
+          inheritedFromTurnId: sourceTurnId
+        }),
+        contentType: CONTENT_TYPE_PRESET
+      },
+      authoritySnapshot: {
+        content: authority,
+        contentType: metadata.content_type
+      }
+    }, targetTurnId, executorAgentId);
+  }
+
+  private async prepareRetryRewindMutation(input: {
+    conversationId: string;
+    sourceTurnId: string;
+    target: MessageRetryTarget;
+    expectedMessageRevisionId?: string;
+    idempotencyKey: string;
+  }): Promise<RetryRewindPlan> {
+    const conversationId = requireId(input.conversationId, 'conversationId');
+    const sourceTurnId = requireId(input.sourceTurnId, 'sourceTurnId');
+    const target = normalizeRetryTarget(input.target);
+    await this.requireConversationIdle(conversationId);
+    const sourceTurn = await this.getTurn(sourceTurnId);
+    if (sourceTurn.conversation_id !== conversationId) {
+      throw new Error(`Source Turn ${sourceTurnId} does not belong to Conversation ${conversationId}.`);
+    }
+    if (sourceTurn.status !== TURN_STATUS_TERMINATED) {
+      throw new Error(`Source Turn ${sourceTurnId} is not terminal and cannot be retried safely.`);
+    }
+    const messageSnapshot = await this.conversationMessageSnapshot(conversationId);
+    const entryByMessageId = new Map(messageSnapshot.entries.map((entry) => [
+      requireId(entry.message.id, 'Message.id'),
+      entry
+    ]));
+    const baseSteps: RepositoryTransactionStep[] = [
+      ...conversationIdleAssertionSteps(conversationId),
+      DOMAIN_REPOSITORIES.domain('Turn').assert(sourceTurnId, {
+        conversation_id: conversationId,
+        status: TURN_STATUS_TERMINATED
+      }),
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').assertExactIds(
+        { conversation_id: conversationId },
+        messageSnapshot.membershipIds
+      )
+    ];
+    const heads = await this.listRows('ConversationContextHeadLink', { conversation_id: conversationId }, 2);
+    if (heads.length !== 1) throw new Error(`Conversation ${conversationId} has no unique retryable Context head.`);
+    const head = heads[0];
+    const rootId = requireId(head.root_id, 'ConversationContextHeadLink.root_id');
+
+    if (target.kind === 'model_request') {
+      const modelRequestId = requireId(target.modelRequestId, 'RetryTarget.modelRequestId');
+      const request = await this.requireExisting('ModelRequest', modelRequestId);
+      if (request.turn_id !== sourceTurnId || request.status !== 'terminal') {
+        throw new Error(`ModelRequest ${modelRequestId} is not a terminal output of source Turn ${sourceTurnId}.`);
+      }
+      const projections = await this.listRows('ModelContextProjection', {
+        owner_kind: 'model_request',
+        owner_id: modelRequestId
+      }, 2);
+      if (projections.length !== 1) throw new Error(`ModelRequest ${modelRequestId} has no unique frozen Context root.`);
+      const projection = projections[0];
+      const frozenRootId = requireId(projection.root_id, 'ModelContextProjection.root_id');
+      if (frozenRootId !== rootId) {
+        throw new Error(`Retry target ${modelRequestId} is stale because its frozen Context is no longer current.`);
+      }
+      const inheritedPlanApprovalToolCallId = await this.findInheritedPlanApproval({
+        sourceTurnId,
+        rootId,
+        beforeModelRequestSeq: requireBigInt(request.request_seq, 'ModelRequest.request_seq')
+      });
+      return {
+        lineage: {
+          sourceTurnId,
+          sourceModelRequestId: modelRequestId,
+          ...(inheritedPlanApprovalToolCallId ? { inheritedPlanApprovalToolCallId } : {})
+        },
+        steps: [
+          ...baseSteps,
+          DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            turn_id: sourceTurnId,
+            request_seq: requireBigInt(request.request_seq, 'ModelRequest.request_seq'),
+            status: 'terminal'
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelContextProjection').assert(
+            requireId(projection.id, 'ModelContextProjection.id'),
+            { owner_kind: 'model_request', owner_id: modelRequestId, root_id: frozenRootId }
+          ),
+          DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assert(
+            requireId(head.id, 'ConversationContextHeadLink.id'),
+            { conversation_id: conversationId, root_id: rootId }
+          )
+        ]
+      };
+    }
+
+    const boundaryMessageId = requireId(target.messageId, 'RetryTarget.messageId');
+    const boundary = entryByMessageId.get(boundaryMessageId);
+    if (!boundary) throw new Error(`Retry target Message ${boundaryMessageId} is outside Conversation ${conversationId}.`);
+    const relation = await this.getMessageRelation(conversationId, boundaryMessageId);
+    if (relation.message.deleted_at !== null) throw new Error(`Retry target Message ${boundaryMessageId} is soft-deleted.`);
+    if (relation.currentRevision.role !== 'model') throw new Error('Only a model Message can be retried.');
+    const modelTurnLinks = await this.listRows('MessageTurnLink', {
+      message_id: boundaryMessageId,
+      role: 'model'
+    }, 2);
+    if (modelTurnLinks.length !== 1 || modelTurnLinks[0].turn_id !== sourceTurnId) {
+      throw new Error(`Retry target Message ${boundaryMessageId} is not the model output of source Turn ${sourceTurnId}.`);
+    }
+    const boundaryRevisionId = requireId(relation.currentRevision.id, 'current MessageRevision.id');
+    const expectedRevisionId = requireId(
+      input.expectedMessageRevisionId,
+      'RetryTarget.expectedMessageRevisionId'
+    );
+    if (boundaryRevisionId !== expectedRevisionId) {
+      throw new Error(`Retry target Message ${boundaryMessageId} changed since it was displayed.`);
+    }
+    const contextPlan = await this.contextSequence.prepareMessageTruncateMutation({
+      conversationId,
+      messageRevisionId: boundaryRevisionId,
+      idempotencyKey: requireId(input.idempotencyKey, 'idempotencyKey')
+    });
+    const inheritedPlanApprovalToolCallId = await this.findInheritedPlanApproval({
+      sourceTurnId,
+      rootId,
+      beforeMessageSeq: boundary.messageSeq
+    });
+    const targets = messageSnapshot.entries.filter((entry) => entry.messageSeq >= boundary.messageSeq);
+    const now = this.timestamp();
+    return {
+      lineage: {
+        sourceTurnId,
+        sourceMessageId: boundaryMessageId,
+        sourceMessageRevisionId: boundaryRevisionId,
+        ...(inheritedPlanApprovalToolCallId ? { inheritedPlanApprovalToolCallId } : {})
+      },
+      steps: [
+        ...baseSteps,
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(
+          requireId(relation.currentLink.id, 'MessageCurrentRevisionLink.id'),
+          { revision_id: boundaryRevisionId }
+        ),
+        ...contextPlan.steps,
+        ...softDeleteEntrySteps(targets, now)
+      ]
+    };
+  }
+
+  private async findInheritedPlanApproval(input: {
+    sourceTurnId: string;
+    rootId: string;
+    beforeMessageSeq?: bigint;
+    beforeModelRequestSeq?: bigint;
+  }): Promise<string | undefined> {
+    const calls = (await listAllDomainRows(this.database, 'ToolCall', {
+      turn_id: input.sourceTurnId,
+      tool_name: 'submit_plan'
+    })).sort((left, right) => {
+      const leftSeq = requireBigInt(left.call_seq, 'ToolCall.call_seq');
+      const rightSeq = requireBigInt(right.call_seq, 'ToolCall.call_seq');
+      return leftSeq < rightSeq ? 1 : leftSeq > rightSeq ? -1 : 0;
+    });
+    for (const call of calls) {
+      const toolCallId = requireId(call.id, 'ToolCall.id');
+      const links = await this.listRows('ToolCallSourceLink', { tool_call_id: toolCallId }, 2);
+      if (links.length !== 1) continue;
+      const source = links[0];
+      if (input.beforeMessageSeq !== undefined) {
+        const memberships = await this.listRows('MessagePartOfConversation', {
+          message_id: requireId(source.message_id, 'ToolCallSourceLink.message_id')
+        }, 2);
+        if (
+          memberships.length !== 1
+          || requireBigInt(memberships[0].message_seq, 'MessagePartOfConversation.message_seq') >= input.beforeMessageSeq
+        ) continue;
+      }
+      if (input.beforeModelRequestSeq !== undefined) {
+        const request = await this.requireExisting(
+          'ModelRequest',
+          requireId(source.model_request_id, 'ToolCallSourceLink.model_request_id')
+        );
+        if (requireBigInt(request.request_seq, 'ModelRequest.request_seq') >= input.beforeModelRequestSeq) continue;
+      }
+      if (!await this.isApprovedPlanToolCall(toolCallId)) continue;
+      if (!await contextRootContainsCompleteToolPair(this.database, input.rootId, toolCallId)) continue;
+      return toolCallId;
+    }
+    return undefined;
+  }
+
+  private async isApprovedPlanToolCall(toolCallId: string): Promise<boolean> {
+    const outcomes = await this.listRows('ToolOutcome', { tool_call_id: toolCallId }, 2);
+    if (outcomes.length !== 1 || outcomes[0].status !== 'succeeded') return false;
+    const artifacts = await this.listRows('ToolResultArtifact', {
+      tool_call_id: toolCallId,
+      role: 'no_effect_result'
+    }, 2);
+    if (artifacts.length !== 1) return false;
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requireId(artifacts[0].content_object_id, 'ToolResultArtifact.content_object_id')
+    ) as unknown as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+    const detail = body.detail && typeof body.detail === 'object' && !Array.isArray(body.detail)
+      ? body.detail as Record<string, unknown>
+      : undefined;
+    return body.toolCallId === toolCallId && body.status === 'succeeded' && detail?.status === 'approved';
+  }
+
   private async editMessage(commandInput: TurnEditCommand): Promise<TurnCommandResult> {
     const source = normalizeInitiatingSource(commandInput.source, 'edit');
     const conversationId = requireId(commandInput.conversationId, 'conversationId');
     const messageId = requireId(commandInput.messageId, 'messageId');
-    const commandScope = JSON.stringify([conversationId, messageId]);
+    const expectedRevisionId = commandInput.expectedRevisionId === undefined
+      ? undefined
+      : requireId(commandInput.expectedRevisionId, 'expectedRevisionId');
+    const deleteFollowing = commandInput.deleteFollowing === true;
+    const commandScope = JSON.stringify([conversationId, messageId, expectedRevisionId ?? null]);
     const revisionId = commandEntityId(source, 'edit', 'message_revision', commandScope);
     const receiptId = commandEntityId(source, 'edit', 'command_receipt', commandScope);
     const duplicate = await this.findReceipt(source);
     if (duplicate) return this.replayEditResult(duplicate, receiptId, conversationId, messageId, revisionId);
+    await this.requireConversationIdle(conversationId);
     const relation = await this.getMessageRelation(conversationId, messageId);
     if (relation.message.deleted_at !== null) throw new Error(`Message ${messageId} is soft-deleted.`);
+    if (expectedRevisionId && relation.currentRevision.id !== expectedRevisionId) {
+      throw new Error(`Message ${messageId} revision changed before edit; refresh and retry.`);
+    }
+    const messageSnapshot = deleteFollowing
+      ? await this.conversationMessageSnapshot(conversationId)
+      : null;
+    const sourceMessageSeq = requireBigInt(relation.membership.message_seq, 'MessagePartOfConversation.message_seq');
+    const suffix = messageSnapshot
+      ? messageSnapshot.entries.filter((entry) => entry.messageSeq > sourceMessageSeq)
+      : [];
     const now = this.timestamp();
     const content = await this.contentStore.prepare(
       this.database,
       commandInput.content,
       requireContentType(commandInput.contentType ?? 'text/plain')
     );
-    const contextPlan = await this.contextSequence.prepareMessageEditMutation({
-      conversationId,
-      previousMessageRevisionId: requireId(relation.currentRevision.id, 'current MessageRevision.id'),
-      nextMessageRevisionId: revisionId,
-      contentObjectId: content.metadata.id,
-      contentByteLength: content.metadata.byte_length
-    });
+    const previousRevisionId = requireId(relation.currentRevision.id, 'current MessageRevision.id');
+    const contextPlan = deleteFollowing
+      ? await this.contextSequence.prepareMessageTruncateMutation({
+          conversationId,
+          messageRevisionId: previousRevisionId,
+          idempotencyKey: source.key,
+          replacement: {
+            messageRevisionId: revisionId,
+            contentObjectId: content.metadata.id,
+            contentByteLength: content.metadata.byte_length
+          }
+        })
+      : await this.contextSequence.prepareMessageEditMutation({
+          conversationId,
+          previousMessageRevisionId: previousRevisionId,
+          nextMessageRevisionId: revisionId,
+          contentObjectId: content.metadata.id,
+          contentByteLength: content.metadata.byte_length
+        });
     const commit = await this.commitWithReceipt({
       source,
       receiptId,
       conversationId,
       turnId: null,
+      requiresConversationIdle: true,
       steps: [
+        ...conversationIdleAssertionSteps(conversationId),
+        ...(messageSnapshot ? [DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').assertExactIds(
+          { conversation_id: conversationId },
+          messageSnapshot.membershipIds
+        )] : []),
         DOMAIN_REPOSITORIES.domain('Message').assert(messageId, { deleted_at: null }),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(
+          requireId(relation.currentLink.id, 'MessageCurrentRevisionLink.id'),
+          { revision_id: previousRevisionId }
+        ),
+        ...softDeleteEntrySteps(suffix, now),
         ...preparedContentObjectSteps([content], 'edit_content'),
         DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
           id: revisionId,
@@ -800,6 +1906,237 @@ export class TurnControlPlane {
     };
   }
 
+  private async editMessageAndRun(commandInput: TurnEditAndRunCommand): Promise<TurnCommandResult> {
+    const command = normalizeExecutionCommand(commandInput, 'retry') as TurnEditAndRunCommand;
+    const source = normalizeInitiatingSource(command.source, 'edit');
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const messageId = requireId(command.messageId, 'messageId');
+    const expectedRevisionId = command.expectedRevisionId === undefined
+      ? undefined
+      : requireId(command.expectedRevisionId, 'expectedRevisionId');
+    const commandScope = JSON.stringify([
+      conversationId,
+      messageId,
+      expectedRevisionId ?? null,
+      'edit-and-run',
+      command.membership ?? null
+    ]);
+    const intentId = commandEntityId(source, 'edit', 'turn_intent', commandScope);
+    const baseIds: StartCommandIds = {
+      receipt: commandEntityId(source, 'edit', 'command_receipt', commandScope),
+      intent: intentId,
+      ...dependentStartCommandIds(intentId, false)
+    };
+    const ids = command.membership
+      ? childExecutionStartIds(baseIds, command.membership.childExecutionId, false)
+      : baseIds;
+    const revisionId = commandEntityId(source, 'edit', 'message_revision', commandScope);
+    const duplicate = await this.findReceipt(source);
+    if (duplicate) {
+      return this.replayEditAndRunResult(duplicate, ids, conversationId, messageId, revisionId);
+    }
+
+    await this.requireConversationIdle(conversationId);
+    const relation = await this.getMessageRelation(conversationId, messageId);
+    if (relation.message.deleted_at !== null) throw new Error(`Message ${messageId} is soft-deleted.`);
+    if (expectedRevisionId && relation.currentRevision.id !== expectedRevisionId) {
+      throw new Error(`Message ${messageId} revision changed before edit-and-run; refresh and retry.`);
+    }
+    if (relation.currentRevision.role !== 'user') throw new Error('Edit-and-run requires a user Message.');
+    const sourceLinks = await this.listRows('MessageTurnLink', { message_id: messageId, role: 'input' }, 2);
+    if (sourceLinks.length !== 1) throw new Error(`Message ${messageId} has no unique source Turn.`);
+    const sourceTurnId = requireId(sourceLinks[0].turn_id, 'MessageTurnLink.turn_id');
+    const sourceTurn = await this.getTurn(sourceTurnId);
+    if (sourceTurn.conversation_id !== conversationId || sourceTurn.status !== TURN_STATUS_TERMINATED) {
+      throw new Error(`Edit-and-run source Turn ${sourceTurnId} is not terminal in Conversation ${conversationId}.`);
+    }
+
+    const messageSnapshot = await this.conversationMessageSnapshot(conversationId);
+    const sourceMessageSeq = requireBigInt(relation.membership.message_seq, 'MessagePartOfConversation.message_seq');
+    const suffix = messageSnapshot.entries.filter((entry) => entry.messageSeq > sourceMessageSeq);
+    const content = await this.contentStore.prepare(
+      this.database,
+      command.content,
+      requireContentType(command.contentType ?? 'text/plain')
+    );
+    const previousRevisionId = requireId(relation.currentRevision.id, 'current MessageRevision.id');
+    const contextPlan = await this.contextSequence.prepareMessageTruncateMutation({
+      conversationId,
+      messageRevisionId: previousRevisionId,
+      idempotencyKey: intentId,
+      replacement: {
+        messageRevisionId: revisionId,
+        contentObjectId: content.metadata.id,
+        contentByteLength: content.metadata.byte_length
+      }
+    });
+    const compiled = await this.compileCurrentAuthority(
+      conversationId,
+      ids.turn,
+      'retry',
+      sourceTurnId,
+      command.executorAgentId,
+      command.modelOverride
+    );
+    const intentContent = await this.contentStore.prepare(this.database, JSON.stringify({
+      kind: 'retry',
+      sourceTurnId,
+      sourceMessageId: messageId,
+      editedMessageRevisionId: revisionId
+    }), CONTENT_TYPE_INTENT);
+    const presetContent = await this.contentStore.prepare(
+      this.database,
+      compiled.executionPreset.content,
+      compiled.executionPreset.contentType
+    );
+    const authorityContent = await this.contentStore.prepare(
+      this.database,
+      compiled.authoritySnapshot.content,
+      compiled.authoritySnapshot.contentType
+    );
+    const now = this.timestamp();
+    const childAdmission = command.membership
+      ? await this.prepareChildAdmission({
+          membership: command.membership,
+          conversationId,
+          intentId: ids.intent,
+          turnId: ids.turn,
+          expectedPreviousTurnId: sourceTurnId,
+          now
+        })
+      : null;
+    const nextDeliverySteps = this.prepareNextTurnDeliverySteps
+      ? await this.prepareNextTurnDeliverySteps(conversationId, ids.turn, now)
+      : [];
+    const committed = await this.commitWithReceipt({
+      source,
+      receiptId: ids.receipt,
+      conversationId,
+      turnId: ids.turn,
+      requiresConversationIdle: true,
+      steps: [
+        ...conversationIdleAssertionSteps(conversationId),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(sourceTurnId, {
+          conversation_id: conversationId,
+          status: TURN_STATUS_TERMINATED
+        }),
+        DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').assertExactIds(
+          { conversation_id: conversationId },
+          messageSnapshot.membershipIds
+        ),
+        DOMAIN_REPOSITORIES.domain('Message').assert(messageId, { deleted_at: null }),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(
+          requireId(relation.currentLink.id, 'MessageCurrentRevisionLink.id'),
+          { revision_id: previousRevisionId }
+        ),
+        ...softDeleteEntrySteps(suffix, now),
+        ...preparedContentObjectSteps([
+          content,
+          intentContent,
+          presetContent,
+          authorityContent
+        ], 'edit_and_run_content'),
+        DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+          id: revisionId,
+          message_id: messageId,
+          role: 'user',
+          content_object_id: content.metadata.id,
+          created_at: now
+        }, { column: 'revision_seq', scope: { message_id: messageId } }),
+        ...contextPlan.steps,
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(
+          requireId(relation.currentLink.id, 'MessageCurrentRevisionLink.id'),
+          { revision_id: revisionId, updated_at: now }
+        ),
+        DOMAIN_REPOSITORIES.domain('Message').update(messageId, { updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('Turn').insert({
+          id: ids.turn,
+          conversation_id: conversationId,
+          status: TURN_STATUS_ACTIVE,
+          created_at: now,
+          updated_at: now,
+          terminal_at: null
+        }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').insert({
+          id: ids.lease,
+          conversation_id: conversationId,
+          turn_id: ids.turn,
+          owner_id: command.leaseOwnerId,
+          host_boot_id: command.hostBootId,
+          generation: 1n,
+          acquired_at: now,
+          expires_at: command.leaseExpiresAt
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnIntent').insert({
+          id: ids.intent,
+          conversation_id: conversationId,
+          turn_id: ids.turn,
+          state: TURN_INTENT_STATE_ADMITTED,
+          created_at: now,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnIntentRevision').insert({
+          id: ids.intentRevision,
+          intent_id: ids.intent,
+          revision_seq: '1',
+          content_object_id: intentContent.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnExecutionPresetRevision').insert({
+          id: ids.presetRevision,
+          intent_id: ids.intent,
+          revision_seq: '1',
+          preset_object_id: presetContent.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnIntentAuthorityRevision').insert({
+          id: ids.authorityRevision,
+          intent_id: ids.intent,
+          revision_seq: '1',
+          authority_object_id: authorityContent.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnIntentExecutorLink').insert({
+          id: ids.intentExecutorLink,
+          intent_id: ids.intent,
+          agent_id: compiled.executorAgentId,
+          created_at: now
+        }),
+        ...(childAdmission?.outerSteps ?? []),
+        DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
+          id: ids.authoritySnapshot,
+          turn_id: ids.turn,
+          content_object_id: authorityContent.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('TurnExecutorLink').insert({
+          id: ids.executorLink,
+          turn_id: ids.turn,
+          agent_id: compiled.executorAgentId,
+          created_at: now
+        }),
+        ...(childAdmission?.admissionSteps ?? []),
+        ...nextDeliverySteps,
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+      ]
+    });
+    if (committed.deduplicated) {
+      return this.replayEditAndRunResult(committed.receipt, ids, conversationId, messageId, revisionId);
+    }
+    return {
+      receiptId: committed.receipt.id as string,
+      deduplicated: false,
+      commitSeq: committed.commitSeq,
+      conversationId,
+      intentId: ids.intent,
+      admitted: true,
+      turnId: ids.turn,
+      messageId,
+      messageRevisionId: revisionId,
+      messageRevisionSeq: allocatedValue(committed, 'MessageRevision', revisionId, 'revision_seq')
+    };
+  }
+
   private async softDeleteMessage(commandInput: TurnDeleteCommand): Promise<TurnCommandResult> {
     const source = normalizeInitiatingSource(commandInput.source, 'delete');
     const conversationId = requireId(commandInput.conversationId, 'conversationId');
@@ -810,6 +2147,7 @@ export class TurnControlPlane {
       assertReceiptIdentity(duplicate, receiptId, 'delete');
       return basicDuplicateResult(duplicate, receiptId, 'delete', { conversationId, messageId });
     }
+    await this.requireConversationIdle(conversationId);
     const relation = await this.getMessageRelation(conversationId, messageId);
     const now = this.timestamp();
     if (relation.message.deleted_at !== null) {
@@ -818,43 +2156,54 @@ export class TurnControlPlane {
         ? basicDuplicateResult(committed.receipt, receiptId, 'delete', { conversationId, messageId })
         : basicCommittedResult(committed, { conversationId, messageId });
     }
+    const messageSnapshot = await this.conversationMessageSnapshot(conversationId);
+    const sourceMessageSeq = requireBigInt(relation.membership.message_seq, 'MessagePartOfConversation.message_seq');
+    const targets = messageSnapshot.entries.filter((entry) => entry.messageSeq >= sourceMessageSeq);
     const contextPlan = await this.contextSequence.prepareMessageDeleteMutation({
       conversationId,
       messageRevisionId: requireId(relation.currentRevision.id, 'current MessageRevision.id'),
       idempotencyKey: source.key
     });
-    try {
-      const committed = await this.commitWithReceipt({
-        source,
-        receiptId,
-        conversationId,
-        turnId: null,
-        steps: [
-          DOMAIN_REPOSITORIES.domain('Message').assert(messageId, { deleted_at: null }),
-          ...contextPlan.steps,
-          DOMAIN_REPOSITORIES.domain('Message').update(messageId, { deleted_at: now, updated_at: now }),
-          DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
-        ]
-      });
-      return committed.deduplicated
-        ? basicDuplicateResult(committed.receipt, receiptId, 'delete', { conversationId, messageId })
-        : basicCommittedResult(committed, { conversationId, messageId });
-    } catch (error) {
-      if (!isTransactionAssertionError(error)) throw error;
-      const latest = await this.getMessage(messageId);
-      if (latest.deleted_at === null) throw error;
-      const committed = await this.commitWithReceipt({ source, receiptId, conversationId, turnId: null, steps: [] });
-      return committed.deduplicated
-        ? basicDuplicateResult(committed.receipt, receiptId, 'delete', { conversationId, messageId })
-        : basicCommittedResult(committed, { conversationId, messageId });
-    }
+    const committed = await this.commitWithReceipt({
+      source,
+      receiptId,
+      conversationId,
+      turnId: null,
+      requiresConversationIdle: true,
+      steps: [
+        ...conversationIdleAssertionSteps(conversationId),
+        DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').assertExactIds(
+          { conversation_id: conversationId },
+          messageSnapshot.membershipIds
+        ),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(
+          requireId(relation.currentLink.id, 'MessageCurrentRevisionLink.id'),
+          { revision_id: requireId(relation.currentRevision.id, 'current MessageRevision.id') }
+        ),
+        ...contextPlan.steps,
+        ...softDeleteEntrySteps(targets, now),
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+      ]
+    });
+    return committed.deduplicated
+      ? basicDuplicateResult(committed.receipt, receiptId, 'delete', { conversationId, messageId })
+      : basicCommittedResult(committed, { conversationId, messageId });
   }
 
   private async requestInterrupt(commandInput: TurnInterruptCommand): Promise<TurnCommandResult> {
     const source = normalizeInitiatingSource(commandInput.source, 'interrupt');
     const turnId = requireId(commandInput.turnId, 'turnId');
     const reason = requireText(commandInput.reason, 'reason');
-    const pendingTurnInputId = commandEntityId(source, 'interrupt', 'pending_turn_input', turnId);
+    const expectedLeaseGeneration = commandInput.expectedLeaseGeneration === undefined
+      ? undefined
+      : BigInt(requireDecimalIntegerString(
+          commandInput.expectedLeaseGeneration,
+          'expectedLeaseGeneration'
+        ));
+    if (expectedLeaseGeneration !== undefined && expectedLeaseGeneration <= 0n) {
+      throw new TypeError('expectedLeaseGeneration must be positive.');
+    }
+    const pendingTurnInputId = turnInterruptInputId(turnId);
     const receiptId = commandEntityId(source, 'interrupt', 'command_receipt', turnId);
     const duplicate = await this.findReceipt(source);
     if (duplicate) return this.replayInterruptResult(duplicate, receiptId, turnId, pendingTurnInputId);
@@ -874,6 +2223,38 @@ export class TurnControlPlane {
         };
     }
     requireActiveTurn(turn, turnId);
+    const leaseFenceSteps: RepositoryTransactionStep[] = [];
+    if (expectedLeaseGeneration !== undefined) {
+      const leases = await this.listRows('ExecutionLease', { turn_id: turnId }, 2);
+      if (
+        leases.length !== 1
+        || requireBigInt(leases[0].generation, 'ExecutionLease.generation') !== expectedLeaseGeneration
+      ) {
+        throw new Error('Turn interrupt target ExecutionLease generation was replaced.');
+      }
+      leaseFenceSteps.push(DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(
+        requireId(leases[0].id, 'ExecutionLease.id'),
+        { turn_id: turnId, generation: expectedLeaseGeneration }
+      ));
+    }
+    const existingInterrupts = await this.listRows('PendingTurnInput', {
+      turn_id: turnId,
+      input_kind: 'interrupt_request',
+      state: 'pending'
+    }, 2);
+    if (existingInterrupts.length > 1) {
+      throw new Error(`Turn ${turnId} has multiple open interrupt requests.`);
+    }
+    if (existingInterrupts.length === 1) {
+      return this.commitCoalescedInterrupt({
+        source,
+        receiptId,
+        conversationId,
+        turnId,
+        pending: existingInterrupts[0],
+        leaseFenceSteps
+      });
+    }
     const now = this.timestamp();
     const content = await this.contentStore.prepare(
       this.database,
@@ -888,6 +2269,7 @@ export class TurnControlPlane {
         turnId,
         steps: [
           DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+          ...leaseFenceSteps,
           ...preparedContentObjectSteps([content], 'interrupt_content'),
           DOMAIN_REPOSITORIES.domain('PendingTurnInput').insertWithNextPosition({
             id: pendingTurnInputId,
@@ -919,6 +2301,26 @@ export class TurnControlPlane {
         )
       };
     } catch (error) {
+      if (sqliteUniqueFailureIncludes(error, [
+        'pending_turn_input.id',
+        'pending_turn_input.turn_id, pending_turn_input.input_kind'
+      ])) {
+        const raced = await this.listRows('PendingTurnInput', {
+          turn_id: turnId,
+          input_kind: 'interrupt_request',
+          state: 'pending'
+        }, 2);
+        if (raced.length === 1) {
+          return this.commitCoalescedInterrupt({
+            source,
+            receiptId,
+            conversationId,
+            turnId,
+            pending: raced[0],
+            leaseFenceSteps
+          });
+        }
+      }
       if (!isTransactionAssertionError(error)) throw error;
       const latest = await this.getTurn(turnId);
       if (latest.status !== TURN_STATUS_TERMINATED) throw error;
@@ -934,6 +2336,36 @@ export class TurnControlPlane {
           ignoredBecauseTerminal: true
         };
     }
+  }
+
+  private async commitCoalescedInterrupt(input: {
+    source: TurnInitiatingSource;
+    receiptId: string;
+    conversationId: string;
+    turnId: string;
+    pending: DomainRow;
+    leaseFenceSteps: RepositoryTransactionStep[];
+  }): Promise<TurnCommandResult> {
+    const committed = await this.commitWithReceipt({
+      source: input.source,
+      receiptId: input.receiptId,
+      conversationId: input.conversationId,
+      turnId: input.turnId,
+      steps: input.leaseFenceSteps
+    });
+    return {
+      receiptId: committed.receipt.id as string,
+      deduplicated: committed.deduplicated,
+      ...(committed.commitSeq ? { commitSeq: committed.commitSeq } : {}),
+      conversationId: input.conversationId,
+      turnId: input.turnId,
+      pendingTurnInputId: requireId(input.pending.id, 'PendingTurnInput.id'),
+      pendingTurnInputPosition: requireBigInt(
+        input.pending.position,
+        'PendingTurnInput.position'
+      ).toString(),
+      coalesced: true
+    };
   }
 
   private async recordTerminal(commandInput: TurnTerminalCommand): Promise<TurnCommandResult> {
@@ -966,6 +2398,21 @@ export class TurnControlPlane {
     const unresolvedFileSteps = this.unresolvedFileClosure
       ? await this.unresolvedFileClosure.prepareUnresolvedTurnClosure(turnId)
       : [];
+    // The read builds the expected set; assertExactIds below is the writer-side authority. A
+    // delivery/interrupt committed after this read makes the whole terminal transaction roll back.
+    // queue_next_turn is intentionally absent: it is a legal post-terminal continuation handoff.
+    const terminalInputSnapshot = (await listAllDomainRows(this.database, 'PendingTurnInput', {
+      turn_id: turnId,
+      state: 'pending'
+    })).filter((input) => TERMINAL_BLOCKING_INPUT_KINDS.includes(
+      String(input.input_kind) as typeof TERMINAL_BLOCKING_INPUT_KINDS[number]
+    ));
+    const terminalInputSteps = prepareTerminalInputFence(
+      turnId,
+      commandInput.terminalStatus,
+      terminalInputSnapshot,
+      now
+    );
     try {
       const committed = await this.commitWithReceipt({
         source,
@@ -974,6 +2421,7 @@ export class TurnControlPlane {
         turnId,
         steps: [
           DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+          ...terminalInputSteps,
           ...unresolvedFileSteps,
           // A terminal Turn may not strand a pending or in-flight ToolCall. This assertion runs
           // after the pending-file closure steps in the same writer transaction.
@@ -1008,7 +2456,19 @@ export class TurnControlPlane {
     } catch (error) {
       if (!isTransactionAssertionError(error)) throw error;
       const latest = await this.getTurn(turnId);
-      if (latest.status !== TURN_STATUS_TERMINATED) throw error;
+      if (latest.status !== TURN_STATUS_TERMINATED) {
+        if (isTerminalInputFenceAssertion(error)) {
+          const blockingInputs = await terminalBlockingInputs(this.database, turnId);
+          if (blockingInputs.length > 0) {
+            throw new TurnTerminalInputConflictError(
+              turnId,
+              blockingInputs.map((input) => requireId(input.id, 'PendingTurnInput.id')),
+              blockingInputs.map((input) => requireText(input.input_kind, 'PendingTurnInput.input_kind'))
+            );
+          }
+        }
+        throw error;
+      }
       const committed = await this.commitWithReceipt({ source, receiptId, conversationId, turnId, steps: [] });
       return committed.deduplicated
         ? this.replayTerminalResult(committed.receipt, receiptId, turnId, terminationId)
@@ -1029,6 +2489,7 @@ export class TurnControlPlane {
     receiptId: string;
     conversationId: string;
     turnId: string | null;
+    requiresConversationIdle?: boolean;
     steps: RepositoryTransactionStep[];
   }): Promise<CommandCommit> {
     const existing = await this.findReceipt(options.source);
@@ -1059,6 +2520,13 @@ export class TurnControlPlane {
     } catch (error) {
       const racedReceipt = await this.findReceipt(options.source);
       if (racedReceipt) return deduplicatedCommit(racedReceipt);
+      if (
+        options.requiresConversationIdle
+        && isTransactionAssertionError(error)
+        && await this.conversationHasPendingWork(options.conversationId)
+      ) {
+        throw new ConversationHistoryBusyError(options.conversationId);
+      }
       throw error;
     }
   }
@@ -1137,6 +2605,44 @@ export class TurnControlPlane {
     };
   }
 
+  private async replayEditAndRunResult(
+    receipt: DomainRow,
+    ids: StartCommandIds,
+    conversationId: string,
+    messageId: string,
+    revisionId: string
+  ): Promise<TurnCommandResult> {
+    assertReceiptIdentity(receipt, ids.receipt, 'edit');
+    if (receipt.conversation_id !== conversationId || receipt.turn_id !== ids.turn) {
+      throw sourceOperationMismatch(receipt, 'edit');
+    }
+    const [revision, intent, turn] = await Promise.all([
+      this.maybeGet('MessageRevision', revisionId),
+      this.maybeGet('TurnIntent', ids.intent),
+      this.maybeGet('Turn', ids.turn)
+    ]);
+    if (
+      !revision
+      || revision.message_id !== messageId
+      || !intent
+      || intent.turn_id !== ids.turn
+      || intent.state !== TURN_INTENT_STATE_ADMITTED
+      || !turn
+      || turn.conversation_id !== conversationId
+    ) throw sourceOperationMismatch(receipt, 'edit');
+    return {
+      receiptId: receipt.id as string,
+      deduplicated: true,
+      conversationId,
+      intentId: ids.intent,
+      admitted: true,
+      turnId: ids.turn,
+      messageId,
+      messageRevisionId: revisionId,
+      messageRevisionSeq: requireBigInt(revision.revision_seq, 'MessageRevision.revision_seq').toString()
+    };
+  }
+
   private async replayInterruptResult(
     receipt: DomainRow,
     expectedReceiptId: string,
@@ -1147,7 +2653,7 @@ export class TurnControlPlane {
     if (receipt.turn_id !== turnId) throw sourceOperationMismatch(receipt, 'interrupt');
     const turn = await this.getTurn(turnId);
     const pending = await this.maybeGet('PendingTurnInput', pendingTurnInputId);
-    if (pending) {
+    if (pending?.state === 'pending') {
       return {
         receiptId: receipt.id as string,
         deduplicated: true,
@@ -1157,6 +2663,9 @@ export class TurnControlPlane {
         pendingTurnInputPosition: requireBigInt(pending.position, 'PendingTurnInput.position').toString()
       };
     }
+    // Terminalization consumes the interrupt input and terminates the Turn in one transaction.
+    // A replay must reflect that durable terminal fact instead of treating the retained consumed
+    // input as another accepted stop request.
     if (turn.status !== TURN_STATUS_TERMINATED) throw sourceOperationMismatch(receipt, 'interrupt');
     return {
       receiptId: receipt.id as string,
@@ -1239,6 +2748,64 @@ export class TurnControlPlane {
     return links[0];
   }
 
+  private async requireConversationIdle(conversationIdInput: string): Promise<void> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    if (await this.conversationHasPendingWork(conversationId)) {
+      throw new ConversationHistoryBusyError(conversationId);
+    }
+  }
+
+  private async conversationHasPendingWork(conversationIdInput: string): Promise<boolean> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { conversation_id: conversationId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('Turn').list({
+        where: { conversation_id: conversationId, status: TURN_STATUS_ACTIVE },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('TurnIntent').list({
+        where: { conversation_id: conversationId, state: TURN_INTENT_STATE_QUEUED, turn_id: null },
+        limit: 1
+      })
+    ]);
+    return (
+      rows(snapshot.snapshot[0]).length > 0
+      || rows(snapshot.snapshot[1]).length > 0
+      || rows(snapshot.snapshot[2]).length > 0
+    );
+  }
+
+  private async conversationMessageSnapshot(conversationIdInput: string): Promise<ConversationMessageSnapshot> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const memberships = await listAllDomainRows(
+      this.database,
+      'MessagePartOfConversation',
+      { conversation_id: conversationId }
+    );
+    const ordered = [...memberships].sort((left, right) => {
+      const leftSeq = requireBigInt(left.message_seq, 'MessagePartOfConversation.message_seq');
+      const rightSeq = requireBigInt(right.message_seq, 'MessagePartOfConversation.message_seq');
+      return leftSeq < rightSeq ? -1 : leftSeq > rightSeq ? 1 : 0;
+    });
+    if (ordered.length === 0) return { entries: [], membershipIds: [] };
+    const messageSnapshot = await this.database.snapshot(ordered.map((membership) =>
+      DOMAIN_REPOSITORIES.domain('Message').get(requireId(membership.message_id, 'MessagePartOfConversation.message_id'))
+    ));
+    return {
+      entries: ordered.map((membership, index) => {
+        const messageId = requireId(membership.message_id, 'MessagePartOfConversation.message_id');
+        const message = requireRow(messageSnapshot.snapshot[index], `Message ${messageId}`);
+        if (message.id !== messageId) throw new Error(`Message membership ${String(membership.id)} resolved incorrectly.`);
+        return {
+          membership,
+          message,
+          messageSeq: requireBigInt(membership.message_seq, 'MessagePartOfConversation.message_seq')
+        };
+      }),
+      membershipIds: ordered.map((membership) => requireId(membership.id, 'MessagePartOfConversation.id'))
+    };
+  }
+
   private async getMessageRelation(conversationId: string, messageId: string): Promise<{
     message: DomainRow;
     membership: DomainRow;
@@ -1302,6 +2869,37 @@ function dependentStartCommandIds(intentId: string, hasMessage: boolean): Omit<S
   };
 }
 
+function childExecutionStartIds(
+  ids: StartCommandIds,
+  childExecutionIdInput: string,
+  hasMessage: boolean
+): StartCommandIds {
+  const childExecutionId = requireId(childExecutionIdInput, 'membership.childExecutionId');
+  const scope = [childExecutionId, ids.intent];
+  return {
+    ...ids,
+    turn: stablePhaseFId('turn', 'child-continuation', ...scope),
+    lease: stablePhaseFId('execution_lease', 'child-continuation', ...scope),
+    authoritySnapshot: stablePhaseFId('authority_snapshot', 'child-continuation', ...scope),
+    executorLink: stablePhaseFId('turn_executor_link', 'child-continuation', ...scope),
+    ...(hasMessage ? {
+      message: stablePhaseFId('message', 'child-continuation', ...scope),
+      messageRevision: stablePhaseFId('message_revision', 'child-continuation', ...scope),
+      currentRevisionLink: stablePhaseFId('message_current_revision_link', 'child-continuation', ...scope),
+      membership: stablePhaseFId('message_conversation_link', 'child-continuation', ...scope),
+      messageTurnLink: stablePhaseFId('message_turn_link', 'child-continuation', ...scope)
+    } : {})
+  };
+}
+
+function childIntentLinkId(childExecutionId: string, intentId: string): string {
+  return stablePhaseFId('child_execution_intent_link', 'ui-command', childExecutionId, intentId);
+}
+
+function childTurnLinkId(childExecutionId: string, intentId: string): string {
+  return stablePhaseFId('child_execution_turn_link', 'child-continuation', childExecutionId, intentId);
+}
+
 function intentDependentEntityId(intentId: string, kind: string): string {
   const normalizedKind = requireText(kind, 'intent dependent kind').toLowerCase().replace(/[^a-z0-9_]+/g, '_');
   const digest = createHash('sha256')
@@ -1358,6 +2956,44 @@ function messageAdmissionSteps(
   ];
 }
 
+function conversationIdleAssertionSteps(conversationIdInput: string): RepositoryTransactionStep[] {
+  const conversationId = requireId(conversationIdInput, 'conversationId');
+  return [
+    DOMAIN_REPOSITORIES.domain('ExecutionLease').assertNone({ conversation_id: conversationId }),
+    DOMAIN_REPOSITORIES.domain('Turn').assertNone({
+      conversation_id: conversationId,
+      status: TURN_STATUS_ACTIVE
+    }),
+    DOMAIN_REPOSITORIES.domain('TurnIntent').assertNone({
+      conversation_id: conversationId,
+      state: TURN_INTENT_STATE_QUEUED,
+      turn_id: null
+    })
+  ];
+}
+
+function softDeleteEntrySteps(
+  entries: readonly ConversationMessageEntry[],
+  deletedAtInput: string
+): RepositoryTransactionStep[] {
+  const deletedAt = requireText(deletedAtInput, 'deletedAt');
+  return entries.flatMap((entry) => {
+    const messageId = requireId(entry.message.id, 'Message.id');
+    if (entry.message.deleted_at !== null) {
+      return [DOMAIN_REPOSITORIES.domain('Message').assert(messageId, {
+        deleted_at: requireText(entry.message.deleted_at, 'Message.deleted_at')
+      })];
+    }
+    return [
+      DOMAIN_REPOSITORIES.domain('Message').assert(messageId, { deleted_at: null }),
+      DOMAIN_REPOSITORIES.domain('Message').update(messageId, {
+        deleted_at: deletedAt,
+        updated_at: deletedAt
+      })
+    ];
+  });
+}
+
 function normalizeExecutionCommand(
   command: TurnExecutionCommand,
   operation: StartIntentPlan['operation']
@@ -1368,8 +3004,145 @@ function normalizeExecutionCommand(
     conversationId: requireId(command.conversationId, 'conversationId'),
     leaseOwnerId: requireId(command.leaseOwnerId, 'leaseOwnerId'),
     hostBootId: requireId(command.hostBootId, 'hostBootId'),
-    leaseExpiresAt: requireText(command.leaseExpiresAt, 'leaseExpiresAt')
+    leaseExpiresAt: requireText(command.leaseExpiresAt, 'leaseExpiresAt'),
+    ...(command.executorAgentId
+      ? { executorAgentId: requireId(command.executorAgentId, 'executorAgentId') }
+      : {}),
+    ...(command.modelOverride ? { modelOverride: normalizeTurnModelOverride(command.modelOverride) } : {}),
+    ...(command.membership ? { membership: normalizeTurnExecutionMembership(command.membership) } : {})
   };
+}
+
+function normalizeTurnExecutionMembership(input: TurnExecutionMembership): TurnExecutionMembership {
+  if (!input || input.kind !== 'child_execution') {
+    throw new TypeError('Turn execution membership must identify a ChildExecution.');
+  }
+  return {
+    kind: 'child_execution',
+    childExecutionId: requireId(input.childExecutionId, 'membership.childExecutionId')
+  };
+}
+
+function normalizeTurnModelOverride(input: TurnModelOverride): TurnModelOverride {
+  if (!input || typeof input !== 'object') throw new TypeError('modelOverride must be an object.');
+  return {
+    ...(input.providerConfigId?.trim()
+      ? { providerConfigId: requireId(input.providerConfigId, 'modelOverride.providerConfigId') }
+      : {}),
+    ...(input.provider ? { provider: input.provider } : {}),
+    model: requireText(input.model, 'modelOverride.model')
+  };
+}
+
+function normalizeRetryTarget(input: MessageRetryTarget): MessageRetryTarget {
+  if (!input || typeof input !== 'object') throw new TypeError('RetryTarget must be an object.');
+  if (input.kind === 'message') {
+    return { kind: 'message', messageId: requireId(input.messageId, 'RetryTarget.messageId') };
+  }
+  if (input.kind === 'model_request') {
+    return {
+      kind: 'model_request',
+      modelRequestId: requireId(input.modelRequestId, 'RetryTarget.modelRequestId')
+    };
+  }
+  throw new TypeError('RetryTarget kind must be message or model_request.');
+}
+
+function requireRetryTarget(input: MessageRetryTarget | undefined): MessageRetryTarget {
+  if (!input) throw new TypeError('retry requires an exact RetryTarget.');
+  return input;
+}
+
+function withRetryLineage(
+  compiled: ReturnType<typeof normalizeCompiledTurnAuthority>,
+  lineage: RetryLineage
+): ReturnType<typeof normalizeCompiledTurnAuthority> {
+  const retryLineage = {
+    sourceTurnId: lineage.sourceTurnId,
+    ...(lineage.sourceMessageId ? { sourceMessageId: lineage.sourceMessageId } : {}),
+    ...(lineage.sourceMessageRevisionId
+      ? { sourceMessageRevisionId: lineage.sourceMessageRevisionId }
+      : {}),
+    ...(lineage.sourceModelRequestId ? { sourceModelRequestId: lineage.sourceModelRequestId } : {}),
+    ...(lineage.inheritedPlanApprovalToolCallId
+      ? { inheritedPlanApprovalToolCallId: lineage.inheritedPlanApprovalToolCallId }
+      : {})
+  };
+  const preset = compiledJsonObject(compiled.executionPreset.content, 'execution preset');
+  const authority = compiledJsonObject(compiled.authoritySnapshot.content, 'authority snapshot');
+  return {
+    ...compiled,
+    executionPreset: {
+      ...compiled.executionPreset,
+      content: canonicalPlainJson({ ...preset, retryLineage }, 'Retry execution preset')
+    },
+    authoritySnapshot: {
+      ...compiled.authoritySnapshot,
+      content: canonicalPlainJson({ ...authority, retryLineage }, 'Retry authority snapshot')
+    }
+  };
+}
+
+function compiledJsonObject(content: TurnCommandContent, label: string): Record<string, unknown> {
+  const raw = typeof content === 'string' ? content : Buffer.from(content).toString('utf8');
+  const normalized = normalizePlainJson(JSON.parse(raw), label);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) {
+    throw new TypeError(`${label} must be a JSON object.`);
+  }
+  return normalized;
+}
+
+function normalizeRuntimeMaintenance(
+  input: TurnRuntimeMaintenanceDescriptor
+): TurnRuntimeMaintenanceDescriptor {
+  if (!input || typeof input !== 'object') {
+    throw new TypeError('runtime maintenance descriptor must be an object.');
+  }
+  if (input.kind !== 'manual_context_compression' || (input.version !== 1 && input.version !== 2)) {
+    throw new TypeError('Unsupported runtime maintenance descriptor.');
+  }
+  if (!Number.isSafeInteger(input.compressSegmentCount) || input.compressSegmentCount <= 0) {
+    throw new TypeError('runtime maintenance compressSegmentCount must be a positive safe integer.');
+  }
+  const commandSourceKey = requireText(input.commandSourceKey, 'runtime maintenance commandSourceKey');
+  if (input.version === 1) {
+    return {
+      kind: 'manual_context_compression',
+      version: 1,
+      compressSegmentCount: input.compressSegmentCount,
+      commandSourceKey
+    };
+  }
+  return {
+    kind: 'manual_context_compression',
+    version: 2,
+    compressSegmentCount: input.compressSegmentCount,
+    target: normalizeCompressionTarget(input.target),
+    commandSourceKey
+  };
+}
+
+function normalizeCompressionTarget(input: CompressionCommandTarget): CompressionCommandTarget {
+  if (!input || typeof input !== 'object') {
+    throw new TypeError('runtime maintenance target must be an object.');
+  }
+  if (input.kind === 'current_head') {
+    return {
+      kind: 'current_head',
+      expectedRootId: requireId(input.expectedRootId, 'runtime maintenance target.expectedRootId')
+    };
+  }
+  if (input.kind === 'through_message') {
+    return {
+      kind: 'through_message',
+      messageId: requireId(input.messageId, 'runtime maintenance target.messageId'),
+      expectedRevisionId: requireId(
+        input.expectedRevisionId,
+        'runtime maintenance target.expectedRevisionId'
+      )
+    };
+  }
+  throw new TypeError('Unsupported runtime maintenance target.');
 }
 
 export function normalizeCompiledTurnAuthority(
@@ -1444,6 +3217,29 @@ function commandEntityId(
   const digest = createHash('sha256')
     .update('limcode-turn-command-entity\0')
     .update(JSON.stringify([source.kind, source.key, operation, commandScope, entityKind]))
+    .digest('hex');
+  return `${entityKind}_${digest}`;
+}
+
+function turnInterruptInputId(turnId: string): string {
+  const digest = createHash('sha256')
+    .update('limcode-turn-open-interrupt\0')
+    .update(turnId)
+    .digest('hex');
+  return `pending_turn_input_${digest}`;
+}
+
+function recoveryExecutionEntityId(
+  entityKind: 'command_receipt' | 'execution_lease',
+  hostBootId: string,
+  turnId: string,
+  claimGeneration?: string
+): string {
+  const digest = createHash('sha256')
+    .update('limcode-turn-recovery-execution\0')
+    .update(JSON.stringify(claimGeneration === undefined
+      ? [hostBootId, turnId, entityKind]
+      : [hostBootId, turnId, entityKind, claimGeneration]))
     .digest('hex');
   return `${entityKind}_${digest}`;
 }
@@ -1562,6 +3358,12 @@ function requireBigInt(value: unknown, label: string): bigint {
   return value;
 }
 
+function requirePositiveInteger(value: unknown, label: string): bigint {
+  const integer = requireBigInt(value, label);
+  if (integer <= 0n) throw new TypeError(`${label} must be positive.`);
+  return integer;
+}
+
 function requireDecimalIntegerString(value: unknown, label: string): string {
   if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/.test(value)) {
     throw new TypeError(`${label} must be a decimal integer string on the wire.`);
@@ -1571,6 +3373,115 @@ function requireDecimalIntegerString(value: unknown, label: string): string {
 
 function isTransactionAssertionError(error: unknown): boolean {
   return (error as { code?: unknown })?.code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+}
+
+function isTerminalInputFenceAssertion(error: unknown): boolean {
+  return error instanceof Error
+    && error.message === 'PendingTurnInputRepository transaction assertExactIds failed.';
+}
+
+function prepareTerminalInputFence(
+  turnId: string,
+  terminalStatus: TurnTerminalStatus,
+  snapshot: readonly DomainRow[],
+  now: string
+): RepositoryTransactionStep[] {
+  const inputs = DOMAIN_REPOSITORIES.domain('PendingTurnInput');
+  const steps: RepositoryTransactionStep[] = [
+    // Runtime context must always be appended and ACKed by the executor before any terminal fact.
+    inputs.assertExactIds({ turn_id: turnId, state: 'pending', input_kind: 'runtime_delivery' }, [])
+  ];
+  for (const inputKind of TURN_TERMINATION_INPUT_KINDS) {
+    const observed = terminalStatus === 'interrupted'
+      ? snapshot.filter((input) => input.input_kind === inputKind)
+      : [];
+    steps.push(inputs.assertExactIds(
+      { turn_id: turnId, state: 'pending', input_kind: inputKind },
+      observed.map((input) => requireId(input.id, 'PendingTurnInput.id'))
+    ));
+    // interrupt_current_turn is also the durable lineage token consumed by
+    // ChildExecution.admitQueuedIntent. Keep it pending until that atomic handoff deletes it.
+    if (inputKind === 'interrupt_current_turn') continue;
+    for (const input of observed) {
+      steps.push(inputs.update(requireId(input.id, 'PendingTurnInput.id'), {
+        state: 'consumed',
+        updated_at: now
+      }));
+    }
+  }
+  return steps;
+}
+
+async function terminalBlockingInputs(database: RuntimeDatabase, turnId: string): Promise<DomainRow[]> {
+  return (await listAllDomainRows(database, 'PendingTurnInput', {
+    turn_id: turnId,
+    state: 'pending'
+  })).filter((input) => TERMINAL_BLOCKING_INPUT_KINDS.includes(
+    String(input.input_kind) as typeof TERMINAL_BLOCKING_INPUT_KINDS[number]
+  ));
+}
+
+export async function contextRootContainsCompleteToolPair(
+  database: RuntimeDatabase,
+  rootIdInput: string,
+  toolCallIdInput: string
+): Promise<boolean> {
+  const rootId = requireId(rootIdInput, 'rootId');
+  const toolCallId = requireId(toolCallIdInput, 'toolCallId');
+  const callSources = await listAllDomainRows(database, 'ContextSegmentSource', {
+    source_kind: 'tool_call',
+    source_id: toolCallId
+  });
+  if (callSources.length !== 1) return false;
+  const pairSegmentId = requireId(callSources[0].segment_id, 'ContextSegmentSource.segment_id');
+  const pairSources = await listAllDomainRows(database, 'ContextSegmentSource', {
+    segment_id: pairSegmentId
+  });
+  const resultSource = pairSources.find((source) => source.source_kind === 'tool_model_result');
+  if (!resultSource) return false;
+  const resultSnapshot = await database.snapshot([
+    DOMAIN_REPOSITORIES.domain('ToolModelResult').get(
+      requireId(resultSource.source_id, 'ContextSegmentSource.source_id')
+    )
+  ]);
+  const result = resultSnapshot.snapshot[0] as DomainRow | null;
+  if (!result || result.tool_call_id !== toolCallId) return false;
+
+  const materialized = await database.materializeContext(rootId);
+  const visibleSegmentIds = materialized.snapshot.records.map((record) =>
+    requireId(record.segment.id, 'ContextSegment.id')
+  );
+  if (visibleSegmentIds.includes(pairSegmentId)) return true;
+  for (const segmentId of visibleSegmentIds) {
+    if (await compressionContainsSegment(database, segmentId, pairSegmentId, new Set())) return true;
+  }
+  return false;
+}
+
+async function compressionContainsSegment(
+  database: RuntimeDatabase,
+  summarySegmentId: string,
+  targetSegmentId: string,
+  visited: Set<string>
+): Promise<boolean> {
+  if (summarySegmentId === targetSegmentId) return true;
+  if (visited.has(summarySegmentId)) return false;
+  visited.add(summarySegmentId);
+  const summarySources = await listAllDomainRows(database, 'ContextSegmentSource', {
+    segment_id: summarySegmentId,
+    source_kind: 'compression_block'
+  });
+  if (summarySources.length !== 1) return false;
+  const blockId = requireId(summarySources[0].source_id, 'ContextSegmentSource.source_id');
+  const sources = await listAllDomainRows(database, 'CompressionBlockSource', {
+    compression_block_id: blockId
+  });
+  for (const source of sources) {
+    const segmentId = requireId(source.segment_id, 'CompressionBlockSource.segment_id');
+    if (segmentId === targetSegmentId) return true;
+    if (await compressionContainsSegment(database, segmentId, targetSegmentId, visited)) return true;
+  }
+  return false;
 }
 
 function isLeaseAdmissionConflict(error: unknown): boolean {

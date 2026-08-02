@@ -687,6 +687,47 @@ button {
   flex: 0 0 auto;
 }
 
+.run-badge.is-awaiting-parent .run-badge-dot {
+  background: var(--vscode-testing-iconQueued);
+}
+
+.run-badge.is-delivery-failed .run-badge-dot,
+.run-badge.is-interrupted .run-badge-dot {
+  background: var(--vscode-errorForeground);
+}
+
+.descendant-agent-summary {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
+}
+
+.descendant-agent-count {
+  flex: 0 0 auto;
+  height: 14px;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-sideBar-background) 90%, var(--vscode-foreground) 10%);
+  font-size: 10px;
+  line-height: 12px;
+}
+
+.descendant-agent-count.is-running,
+.descendant-agent-count.is-awaiting {
+  color: var(--vscode-foreground);
+  border-color: color-mix(in srgb, var(--vscode-testing-iconQueued) 54%, var(--line));
+}
+
+.descendant-agent-count.is-interrupted,
+.descendant-agent-count.is-failed {
+  color: var(--vscode-errorForeground);
+  border-color: color-mix(in srgb, var(--vscode-errorForeground) 45%, var(--line));
+}
+
 .history-actions {
   position: absolute;
   top: 50%;

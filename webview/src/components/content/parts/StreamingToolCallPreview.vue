@@ -4,6 +4,7 @@ import { IconBraces, IconPencil, IconTerminal2, IconWriting } from '@tabler/icon
 import type { ToolCallPreviewRecord } from '@shared/protocol';
 import { toolCallPreviewPresentation } from '@shared/toolCallPreview';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import { useBottomStickyScroller } from '@webview/composables/useBottomStickyScroller';
 import TextPartView from './TextPartView.vue';
 
 const props = defineProps<{
@@ -14,6 +15,7 @@ const FRAME_INTERVAL_MS = 50;
 const framedPreview = shallowRef<ToolCallPreviewRecord>({ ...props.preview });
 const pendingPreview = shallowRef<ToolCallPreviewRecord | undefined>();
 const previewScroller = ref<HTMLElement | null>(null);
+useBottomStickyScroller(previewScroller);
 let frameTimer: number | undefined;
 
 const presentation = computed(() => toolCallPreviewPresentation(framedPreview.value));

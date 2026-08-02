@@ -78,7 +78,10 @@ export function createVsCodeFsCapability(): FsCapability {
 
 export async function readWorkspaceTextFile(relPath: string, startLine?: number, endLine?: number, options: WorkEnvironmentCapabilityOptions = {}): Promise<FsReadFileResult> {
   if (isRemoteServerCommandEnvironment(options.workEnvironment)) {
-    return readRemoteServerTextFile(options.workEnvironment, relPath, startLine, endLine, { allowOutsideProjectPaths: options.allowOutsideProjectPaths });
+    return readRemoteServerTextFile(options.workEnvironment, relPath, startLine, endLine, {
+      allowOutsideProjectPaths: options.allowOutsideProjectPaths,
+      signal: options.signal
+    });
   }
   const raw = await readWorkspaceRawTextFile(relPath, MAX_BYTES, options);
   if (!raw.existed) throw new Error(`File not found: ${relPath}`);
@@ -111,12 +114,12 @@ export async function readWorkspaceBinaryFile(relPath: string, mimeType: string,
   if (!normalizedPath) throw new Error('Missing required argument: path');
   const normalizedMimeType = typeof mimeType === 'string' && mimeType.trim() ? mimeType.trim() : 'application/octet-stream';
   const uri = resolveWorkspacePath(normalizedPath, options, 'read');
-  const stat = await workspaceFileStat(uri);
+  const stat = await workspaceFileStat(uri, options.signal);
   if (!stat) throw new Error(`File not found: ${normalizedPath}`);
   if (stat.type !== vscode.FileType.File) throw new Error(`Not a file: ${normalizedPath}`);
   const maxBytes = 200 * 1024 * 1024;
   if (stat.size > maxBytes) throw new Error(`File too large: ${stat.size} bytes (limit ${maxBytes}).`);
-  const data = await vscode.workspace.fs.readFile(uri);
+  const data = await abortableFsCall(vscode.workspace.fs.readFile(uri), options.signal);
   return {
     path: uri.fsPath || normalizedPath,
     name: path.basename(uri.fsPath || normalizedPath),
@@ -542,7 +545,10 @@ function deleteResult(inputPath: string, resolvedPath: string, targetType: FsDel
 async function readWorkspaceRawTextFile(relPath: string, maxBytes: number, options: WorkEnvironmentCapabilityOptions): Promise<RawTextReadResult> {
   if (isRemoteServerCommandEnvironment(options.workEnvironment)) {
     try {
-      const content = await readRemoteServerRawTextFile(options.workEnvironment, relPath, maxBytes, { allowOutsideProjectPaths: options.allowOutsideProjectPaths });
+      const content = await readRemoteServerRawTextFile(options.workEnvironment, relPath, maxBytes, {
+        allowOutsideProjectPaths: options.allowOutsideProjectPaths,
+        signal: options.signal
+      });
       return { path: relPath, existed: true, content };
     } catch (error) {
       if (error instanceof RemoteFileNotFoundError) return { path: relPath, existed: false, content: '' };
@@ -551,20 +557,40 @@ async function readWorkspaceRawTextFile(relPath: string, maxBytes: number, optio
   }
 
   const uri = resolveWorkspacePath(relPath, options, 'read');
-  const stat = await workspaceFileStat(uri);
+  const stat = await workspaceFileStat(uri, options.signal);
   if (!stat) return { path: relPath, existed: false, content: '' };
   if (stat.type !== vscode.FileType.File) throw new Error(`Not a file: ${relPath}`);
   if (stat.size > maxBytes) throw new Error(`File too large: ${stat.size} bytes (limit ${maxBytes}).`);
-  const data = await vscode.workspace.fs.readFile(uri);
+  const data = await abortableFsCall(vscode.workspace.fs.readFile(uri), options.signal);
   return { path: relPath, existed: true, content: Buffer.from(data).toString('utf8') };
 }
 
-async function workspaceFileStat(uri: vscode.Uri): Promise<vscode.FileStat | undefined> {
+async function workspaceFileStat(uri: vscode.Uri, signal?: AbortSignal): Promise<vscode.FileStat | undefined> {
   try {
-    return await vscode.workspace.fs.stat(uri);
-  } catch {
+    return await abortableFsCall(vscode.workspace.fs.stat(uri), signal);
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason ?? error;
     return undefined;
   }
+}
+
+function abortableFsCall<T>(operation: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return Promise.resolve(operation);
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error('File operation cancelled.'));
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(signal.reason ?? new Error('File operation cancelled.'));
+    signal.addEventListener('abort', abort, { once: true });
+    void operation.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      }
+    );
+  });
 }
 
 async function writeWorkspaceRawTextFile(relPath: string, content: string, options: WorkEnvironmentCapabilityOptions): Promise<void> {

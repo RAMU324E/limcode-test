@@ -60,7 +60,11 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
     textBuffer = undefined;
     const text = buffer.parts.map((part) => part.text).join('');
     const normalizedText = nodes.length === 0 && buffer.kind === 'text' ? text.trimStart() : text;
-    if (!normalizedText.trim()) return;
+    const hasThoughtTiming = buffer.kind === 'thought' && buffer.parts.some((part) =>
+      (typeof part.thoughtElapsedMs === 'number' && Number.isFinite(part.thoughtElapsedMs) && part.thoughtElapsedMs > 0)
+      || (typeof part.thoughtDurationMs === 'number' && Number.isFinite(part.thoughtDurationMs) && part.thoughtDurationMs > 0)
+    );
+    if (!normalizedText.trim() && !hasThoughtTiming) return;
 
     if (buffer.kind === 'thought') {
       const durations = buffer.parts

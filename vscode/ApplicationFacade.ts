@@ -2,6 +2,7 @@ import type * as vscode from 'vscode';
 import type { StorageDataResetResult } from '../backend/capabilities/types';
 import type {
   BridgeClientId,
+  ConversationForkPayload,
   ConversationHistoryPageRecord,
   ConversationHistoryScope,
   ProjectFolderCandidateRecord,
@@ -17,18 +18,32 @@ export interface ConversationAbortResult {
   turnId?: string;
 }
 
+export interface ConversationAbortTarget {
+  turnId: string;
+  leaseGeneration: string;
+}
+
+export interface ConversationForkResult {
+  conversationId: string;
+  deduplicated: boolean;
+}
+
 /** VS Code shell 只依赖此门面，不拥有或推断 Runtime 领域关系。 */
 export interface ApplicationFacade {
   readonly onDidChangeConversationHistory: vscode.Event<void>;
 
   createConversation(options?: { projectFolderUri?: string }): Promise<string>;
-  forkConversation(sourceConversationId: string, messageId: string): Promise<string>;
+  forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult>;
   waitUntilHydrated(): Promise<void>;
   getConversationDisplayTitle(conversationId: string | undefined): string;
   prepareConversationForSidebarOpen(conversationId: string, title?: string): boolean;
   renameConversationTitle(conversationId: string, title: string): Promise<boolean>;
   deleteConversation(conversationId: string): Promise<boolean>;
-  abortConversation(conversationId: string, requestId?: string): Promise<ConversationAbortResult>;
+  abortConversation(
+    conversationId: string,
+    requestId: string,
+    target: ConversationAbortTarget
+  ): Promise<ConversationAbortResult>;
 
   getConversationHistoryEntries(): SidebarConversationHistoryEntry[];
   getConversationHistoryPage(input: {

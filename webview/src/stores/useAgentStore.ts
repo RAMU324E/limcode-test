@@ -13,7 +13,10 @@ function isConfigurableAgent(agent: AgentRecord): boolean {
 }
 
 export const useAgentStore = defineStore('agent', {
-  state: () => ({ status: '' }),
+  state: () => ({
+    status: '',
+    pendingSelections: {} as Record<string, { agentId: string; requestId: string }>
+  }),
   getters: {
     agents(): AgentRecord[] {
       const clientState = useClientStateStore();
@@ -37,13 +40,29 @@ export const useAgentStore = defineStore('agent', {
       const link = links.find((candidate) =>
         text(candidate.conversation_id) === conversationId && text(candidate.role) === 'default'
       ) ?? links.find((candidate) => text(candidate.conversation_id) === conversationId);
-      return clientState.agents.find((agent) => agent.id === text(link?.agent_id));
+      const durableAgentId = text(link?.agent_id);
+      const pending = this.pendingSelections[conversationId];
+      if (pending && durableAgentId === pending.agentId) {
+        delete this.pendingSelections[conversationId];
+        this.status = 'Agent 已同步';
+      }
+      return clientState.agents.find((agent) => agent.id === (pending?.agentId ?? durableAgentId));
     },
     selectAgent(conversationId: string, agentId: string): void {
       if (!conversationId || !agentId) return;
       const clientState = useClientStateStore();
       if (!clientState.agents.some((agent) => agent.id === agentId && isConfigurableAgent(agent))) return;
-      bridge.request(BridgeMessageType.ConversationAgentSelect, { conversationId, agentId });
+      const requestId = bridge.request(BridgeMessageType.ConversationAgentSelect, { conversationId, agentId });
+      this.pendingSelections[conversationId] = { agentId, requestId };
+      this.status = '正在切换 Agent...';
+    },
+    rejectPending(correlationId: string | undefined, message: string): void {
+      if (!correlationId) return;
+      for (const [conversationId, pending] of Object.entries(this.pendingSelections)) {
+        if (pending.requestId !== correlationId) continue;
+        delete this.pendingSelections[conversationId];
+        this.status = message;
+      }
     },
     createAgent(name: string): void {
       const normalized = name.trim().replace(/\s+/g, ' ') || '新 Agent';

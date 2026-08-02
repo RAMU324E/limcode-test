@@ -90,7 +90,7 @@ Gate checks 的唯一权威是 `contracts/gate-registry.json`：
 - Conversation fork 三 Link、immutable compression replacement、Attachment/CAS；
 - `mcp_tool_call` Effect crash 语义；
 - detached wrapper recovery 与 per-process output bounds；
-- ChildExecution answer delivery 与 required cancel_subtree；
+- ChildExecution answer delivery 与 required interrupt_subtree；
 - snapshot、change batch、host queue、snapshot/feed barrier 分别有界；
 - candidate 路由不可达 old writer；
 - parentHandling matrix 只读取对应 InputLink.handled_at。
@@ -106,7 +106,7 @@ F:
   recovery.answer-inbox-invariant
   recovery.delivery-pending
   recovery.foreground-answer-wait-expired
-  recovery.cancelled-subtree-incomplete
+  recovery.interrupted-subtree-incomplete
 ```
 
 candidate 仍不得替换日常插件。

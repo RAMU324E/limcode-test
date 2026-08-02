@@ -31,16 +31,24 @@ interface FeedClient {
   clientId: BridgeClientId;
   webview: vscode.Webview;
   meta: WebviewClientMeta;
+  navigationGeneration: number;
   closed: boolean;
   connection: Promise<ClientFeedConnection>;
   detailRequests: Set<string>;
+  recoveryAttempt: number;
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryWake?: (retry: boolean) => void;
   lastDataPost?: {
     sessionId: string;
     messageSeq: string;
     postedAt: number;
     emptyChanges: boolean;
+    ackTimer: NodeJS.Timeout;
   };
 }
+
+const FEED_ACK_TIMEOUT_MS = 30_000;
+const FEED_RECOVERY_MAX_DELAY_MS = 30_000;
 
 export type ReliableKernelFeedBridgeErrorHandler = (
   error: unknown,
@@ -75,14 +83,16 @@ export class ReliableKernelWebviewFeedBridge {
     client.clientId = clientId;
     client.webview = webview;
     client.meta = plainMeta(meta);
+    client.navigationGeneration = 1;
     client.closed = false;
     client.detailRequests = new Set<string>();
-    client.connection = this.connect(client);
+    client.recoveryAttempt = 0;
+    client.connection = this.connect(client, client.navigationGeneration);
     this.clients.set(clientId, client);
     this.post(client, {
       id: randomUUID(),
       type: BridgeMessageType.Hello,
-      clientId,
+      clientId: client.clientId,
       payload: this.helloPayload(client.meta)
     });
     return clientId;
@@ -92,17 +102,29 @@ export class ReliableKernelWebviewFeedBridge {
   public reconnect(clientId: BridgeClientId, activeConversationId?: string | null): void {
     const client = this.clients.get(clientId);
     if (!client || client.closed) return;
+    this.reconnectClient(client, activeConversationId, true);
+  }
+
+  private reconnectClient(
+    client: FeedClient,
+    activeConversationId: string | null | undefined,
+    resetRecoveryBackoff: boolean
+  ): void {
     const previous = client.connection;
+    this.cancelRecoveryTimer(client);
+    if (resetRecoveryBackoff) client.recoveryAttempt = 0;
     if (activeConversationId !== undefined) {
       client.meta = plainMeta({ ...client.meta, conversationId: activeConversationId ?? undefined });
     }
+    this.clearLastDataPost(client);
     client.detailRequests.clear();
-    client.connection = this.connect(client);
+    client.navigationGeneration += 1;
+    client.connection = this.connect(client, client.navigationGeneration);
     void previous.then((connection) => this.feed.disconnect(connection.sessionId), () => undefined);
     this.post(client, {
       id: randomUUID(),
       type: BridgeMessageType.Hello,
-      clientId,
+      clientId: client.clientId,
       payload: this.helloPayload(client.meta)
     });
   }
@@ -118,6 +140,8 @@ export class ReliableKernelWebviewFeedBridge {
     const client = this.clients.get(clientId);
     if (!client) return;
     client.closed = true;
+    this.cancelRecoveryTimer(client);
+    this.clearLastDataPost(client);
     this.clients.delete(clientId);
     void client.connection.then(
       (connection) => this.feed.disconnect(connection.sessionId),
@@ -190,7 +214,12 @@ export class ReliableKernelWebviewFeedBridge {
     }
     client.detailRequests.add(request.requestId);
     try {
-      const detail = await this.details.read(request);
+      const detail = await this.details.read({
+        ...request,
+        // Every Webview detail lookup is scoped to its current navigation generation. Passing
+        // null (rather than omitting the field) makes a navigation-only panel fail closed.
+        conversationId: client.meta.conversationId ?? null
+      });
       if (client.closed) return;
       this.post(client, {
         type: RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE,
@@ -217,18 +246,38 @@ export class ReliableKernelWebviewFeedBridge {
     if (this.closed) return;
     for (const client of this.clients.values()) {
       if (client.closed || client.meta.conversationId !== event.conversationId) continue;
-      void client.connection.then((connection) => {
-        if (client.closed) return;
+      const connectionPromise = client.connection;
+      void connectionPromise.then((connection) => {
+        if (
+          client.closed
+          || client.connection !== connectionPromise
+          || client.meta.conversationId !== event.conversationId
+        ) return;
         this.post(client, {
           type: RELIABLE_KERNEL_TRANSIENT_MESSAGE,
+          sessionId: connection.sessionId,
+          navigationGeneration: String(client.navigationGeneration),
           hostBootId: connection.hostBootId,
           conversationId: event.conversationId,
           turnId: event.turnId,
           modelRequestId: event.modelRequestId,
+          requestSeq: event.requestSeq,
+          providerId: event.providerId,
+          modelId: event.modelId,
+          attemptSeq: event.attemptSeq,
+          socketGeneration: event.socketGeneration,
+          afterCommitSeq: event.afterCommitSeq,
           observedAt: event.observedAt,
           event: event.event
         });
-      }, (error) => this.onError(error, { clientId: client.clientId, operation: 'post' }));
+      }, (error) => {
+        if (
+          error instanceof FeedConnectionSupersededError
+          || client.closed
+          || client.connection !== connectionPromise
+        ) return;
+        this.onError(error, { clientId: client.clientId, operation: 'post' });
+      });
     }
   }
 
@@ -238,9 +287,10 @@ export class ReliableKernelWebviewFeedBridge {
   ): Promise<void> {
     const client = this.clients.get(clientId);
     if (!client || client.closed) return;
-    const connection = await client.connection;
-    if (client.closed) return;
-    this.feed.requestSnapshot(connection.sessionId, activeConversationId);
+    // Navigation is a transport-generation boundary. Reusing the prior session lets an older
+    // snapshot/detail/transient callback race into the newly selected conversation.
+    this.reconnect(clientId, activeConversationId);
+    await client.connection;
   }
 
   public close(): void {
@@ -249,37 +299,73 @@ export class ReliableKernelWebviewFeedBridge {
     for (const clientId of [...this.clients.keys()]) this.detach(clientId);
   }
 
-  private async connect(client: FeedClient): Promise<ClientFeedConnection> {
-    try {
-      const connection = await this.feed.connect({
-        activeConversationId: client.meta.conversationId ?? null,
-        send: (message) => {
-          if (!client.closed) this.post(client, message);
+  private async connect(client: FeedClient, navigationGeneration: number): Promise<ClientFeedConnection> {
+    while (!client.closed && client.navigationGeneration === navigationGeneration) {
+      try {
+        const connection = await this.feed.connect({
+          activeConversationId: client.meta.conversationId ?? null,
+          send: (message) => {
+            if (!client.closed && client.navigationGeneration === navigationGeneration) {
+              this.post(client, { ...message, navigationGeneration: String(navigationGeneration) });
+            }
+          },
+          onFailure: (error) => {
+            if (client.closed || client.navigationGeneration !== navigationGeneration) return;
+            this.onError(error, { clientId: client.clientId, operation: 'connect' });
+            this.scheduleRecovery(client);
+          }
+        });
+        if (client.closed || client.navigationGeneration !== navigationGeneration) {
+          this.feed.disconnect(connection.sessionId);
+          throw new FeedConnectionSupersededError();
         }
-      });
-      if (client.closed) this.feed.disconnect(connection.sessionId);
-      return connection;
-    } catch (error) {
-      this.onError(error, { clientId: client.clientId, operation: 'connect' });
-      throw error;
+        return connection;
+      } catch (error) {
+        if (error instanceof FeedConnectionSupersededError) throw error;
+        this.onError(error, { clientId: client.clientId, operation: 'connect' });
+        if (!await this.waitForConnectRecovery(client, navigationGeneration)) {
+          throw new FeedConnectionSupersededError();
+        }
+      }
     }
+    throw new FeedConnectionSupersededError();
   }
 
   private post(client: FeedClient, message: ReliableKernelDataMessage | Record<string, unknown>): void {
+    const detailMessage = message.type === RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE
+      || message.type === RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE;
     let plain: unknown;
     try {
       plain = toStructuredClonePlainData(message, 'reliable kernel webview message');
     } catch (error) {
       this.onError(error, { clientId: client.clientId, operation: 'post' });
+      if (detailMessage && !client.closed) this.scheduleRecovery(client);
       return;
     }
     const dataMessage = reliableDataDiagnostic(message);
     if (dataMessage) {
+      this.clearLastDataPost(client);
+      const ackTimer = setTimeout(() => {
+        const pending = client.lastDataPost;
+        if (
+          client.closed
+          || !pending
+          || pending.sessionId !== dataMessage.sessionId
+          || pending.messageSeq !== dataMessage.messageSeq
+        ) return;
+        this.onError(new Error(`Reliable feed ACK ${dataMessage.messageSeq} timed out.`), {
+          clientId: client.clientId,
+          operation: 'post'
+        });
+        this.scheduleRecovery(client);
+      }, FEED_ACK_TIMEOUT_MS);
+      ackTimer.unref();
       client.lastDataPost = {
         sessionId: dataMessage.sessionId,
         messageSeq: dataMessage.messageSeq,
         postedAt: Date.now(),
-        emptyChanges: dataMessage.emptyChanges
+        emptyChanges: dataMessage.emptyChanges,
+        ackTimer
       };
       if (!dataMessage.emptyChanges) {
         this.diagnostics?.observe({
@@ -300,7 +386,25 @@ export class ReliableKernelWebviewFeedBridge {
       }
     }
     void client.webview.postMessage(plain).then(
-      undefined,
+      (delivered) => {
+        if (delivered !== false || client.closed) return;
+        if (detailMessage) {
+          this.onError(new Error('VS Code rejected reliable detail postMessage delivery.'), {
+            clientId: client.clientId,
+            operation: 'post'
+          });
+          this.scheduleRecovery(client);
+          return;
+        }
+        if (!dataMessage) return;
+        const pending = client.lastDataPost;
+        if (pending?.sessionId !== dataMessage.sessionId || pending.messageSeq !== dataMessage.messageSeq) return;
+        this.onError(new Error('VS Code rejected reliable feed postMessage delivery.'), {
+          clientId: client.clientId,
+          operation: 'post'
+        });
+        this.scheduleRecovery(client);
+      },
       (error) => {
         if (dataMessage && !dataMessage.emptyChanges) {
           this.diagnostics?.observe({
@@ -317,6 +421,16 @@ export class ReliableKernelWebviewFeedBridge {
           });
         }
         this.onError(error, { clientId: client.clientId, operation: 'post' });
+        if (detailMessage && !client.closed) {
+          this.scheduleRecovery(client);
+          return;
+        }
+        if (dataMessage && !client.closed) {
+          const pending = client.lastDataPost;
+          if (pending?.sessionId === dataMessage.sessionId && pending.messageSeq === dataMessage.messageSeq) {
+            this.scheduleRecovery(client);
+          }
+        }
       }
     );
   }
@@ -349,6 +463,8 @@ export class ReliableKernelWebviewFeedBridge {
         ...(message.conversationId ? { conversationId: message.conversationId } : {}),
         ...(message.turnId ? { turnId: message.turnId } : {}),
         modelRequestId: message.modelRequestId,
+        ...(message.attemptSeq ? { attemptSeq: message.attemptSeq } : {}),
+        ...(message.socketGeneration ? { socketGeneration: message.socketGeneration } : {}),
         ...(message.streamSeq ? { streamSeq: message.streamSeq } : {})
       }
     });
@@ -357,7 +473,9 @@ export class ReliableKernelWebviewFeedBridge {
   private observeAck(client: FeedClient, ack: ReliableKernelAckMessage): void {
     const posted = client.lastDataPost;
     if (!posted || posted.sessionId !== ack.sessionId || posted.messageSeq !== ack.messageSeq) return;
-    client.lastDataPost = undefined;
+    this.clearLastDataPost(client);
+    this.cancelRecoveryTimer(client);
+    client.recoveryAttempt = 0;
     if (posted.emptyChanges) return;
     this.diagnostics?.observe({
       eventKind: 'feed.data.acked',
@@ -371,6 +489,70 @@ export class ReliableKernelWebviewFeedBridge {
         elapsedMs: Math.max(0, Date.now() - posted.postedAt)
       }
     });
+  }
+
+  private clearLastDataPost(client: FeedClient): void {
+    if (client.lastDataPost) clearTimeout(client.lastDataPost.ackTimer);
+    client.lastDataPost = undefined;
+  }
+
+  private scheduleRecovery(client: FeedClient): void {
+    if (client.closed || client.recoveryTimer) return;
+    const delay = this.nextRecoveryDelay(client);
+    client.recoveryTimer = setTimeout(() => {
+      client.recoveryTimer = undefined;
+      if (!client.closed) this.reconnectClient(client, client.meta.conversationId ?? null, false);
+    }, delay);
+    client.recoveryTimer.unref();
+  }
+
+  /**
+   * Initial connect and reconnect attempts use the same bounded backoff as ACK/post recovery. The
+   * active `connection` promise therefore stays pending across a one-shot transport failure instead
+   * of becoming a permanently rejected handle that every later control message would await.
+   */
+  private waitForConnectRecovery(client: FeedClient, navigationGeneration: number): Promise<boolean> {
+    if (client.closed || client.navigationGeneration !== navigationGeneration) return Promise.resolve(false);
+    // A synchronous post failure can schedule recovery while feed.connect() is still unwinding.
+    // Keep the active connection promise as the sole owner of recovery instead of letting that
+    // timer replace it after this attempt rejects.
+    if (client.recoveryTimer) this.cancelRecoveryTimer(client);
+    const delay = this.nextRecoveryDelay(client);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (retry: boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (client.recoveryTimer) clearTimeout(client.recoveryTimer);
+        client.recoveryTimer = undefined;
+        client.recoveryWake = undefined;
+        resolve(retry && !client.closed && client.navigationGeneration === navigationGeneration);
+      };
+      client.recoveryWake = finish;
+      client.recoveryTimer = setTimeout(() => finish(true), delay);
+      client.recoveryTimer.unref();
+    });
+  }
+
+  private nextRecoveryDelay(client: FeedClient): number {
+    const delay = Math.min(FEED_RECOVERY_MAX_DELAY_MS, 1_000 * 2 ** Math.min(client.recoveryAttempt, 5));
+    client.recoveryAttempt += 1;
+    return delay;
+  }
+
+  private cancelRecoveryTimer(client: FeedClient): void {
+    if (client.recoveryTimer) clearTimeout(client.recoveryTimer);
+    client.recoveryTimer = undefined;
+    const wake = client.recoveryWake;
+    client.recoveryWake = undefined;
+    wake?.(false);
+  }
+}
+
+class FeedConnectionSupersededError extends Error {
+  public constructor() {
+    super('Reliable feed connection attempt was superseded.');
+    this.name = 'FeedConnectionSupersededError';
   }
 }
 
@@ -448,7 +630,9 @@ function normalizeClientDiagnostic(message: Record<string, unknown>): ReliableKe
     ...(message.turnId === undefined ? {} : { turnId: requireText(message.turnId, 'client diagnostic.turnId') }),
     ...(message.messageSeq === undefined ? {} : { messageSeq: requireDecimal(message.messageSeq, 'client diagnostic.messageSeq') }),
     ...(message.modelRequestId === undefined ? {} : { modelRequestId: requireText(message.modelRequestId, 'client diagnostic.modelRequestId') }),
-    ...(message.streamSeq === undefined ? {} : { streamSeq: requireDecimal(message.streamSeq, 'client diagnostic.streamSeq') })
+    ...(message.streamSeq === undefined ? {} : { streamSeq: requireDecimal(message.streamSeq, 'client diagnostic.streamSeq') }),
+    ...(message.attemptSeq === undefined ? {} : { attemptSeq: requireDecimal(message.attemptSeq, 'client diagnostic.attemptSeq') }),
+    ...(message.socketGeneration === undefined ? {} : { socketGeneration: requireDecimal(message.socketGeneration, 'client diagnostic.socketGeneration') })
   };
 }
 
@@ -468,11 +652,17 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     'message-content',
     'tool-arguments-content',
     'tool-result-content',
+    'tool-event-content',
+    'interaction-prompt',
     'file-change-base-content',
     'file-change-content',
     'file-change-diff',
     'process-output',
+    'process-stdout',
+    'process-stderr',
     'context-projection-detail',
+    'compression-content',
+    'compression-title',
     'answer-content'
   ].includes(String(kind))) throw new TypeError('detail.kind is invalid.');
   if (!Number.isSafeInteger(message.offset) || (message.offset as number) < 0) {
@@ -481,6 +671,10 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
   if (!Number.isSafeInteger(message.maxBytes) || (message.maxBytes as number) <= 0 || (message.maxBytes as number) > 2_097_152) {
     throw new TypeError('detail.maxBytes must be from 1 to 2097152.');
   }
+  if (
+    message.expectedTotalBytes !== undefined
+    && (!Number.isSafeInteger(message.expectedTotalBytes) || (message.expectedTotalBytes as number) < 0)
+  ) throw new TypeError('detail.expectedTotalBytes must be a non-negative integer.');
   return {
     type: RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
     requestId: requireText(message.requestId, 'detail.requestId'),
@@ -488,7 +682,10 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     kind: kind as ReliableKernelDetailRequestMessage['kind'],
     recordId: requireText(message.recordId, 'detail.recordId'),
     offset: message.offset as number,
-    maxBytes: message.maxBytes as number
+    maxBytes: message.maxBytes as number,
+    ...(message.expectedTotalBytes === undefined
+      ? {}
+      : { expectedTotalBytes: message.expectedTotalBytes as number })
   };
 }
 

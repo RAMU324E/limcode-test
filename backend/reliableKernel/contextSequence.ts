@@ -11,6 +11,7 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export type ContextSegmentKind = 'system' | 'message' | 'tool_pair' | 'compression' | 'runtime_context';
@@ -88,6 +89,7 @@ export interface MessageContextAppendPlanInput {
   conversationId: string;
   messageRevisionId: string;
   contentObjectId: string;
+  contentByteLength: bigint;
 }
 
 export interface MessageContextEditPlanInput {
@@ -104,10 +106,26 @@ export interface MessageContextDeletePlanInput {
   idempotencyKey: string;
 }
 
+export interface MessageContextTruncateReplacement {
+  messageRevisionId: string;
+  contentObjectId: string;
+  contentByteLength: bigint;
+}
+
+export interface MessageContextTruncatePlanInput extends MessageContextDeletePlanInput {
+  replacement?: MessageContextTruncateReplacement;
+}
+
 export interface MaterializedContext {
   root: DomainRow;
   segments: MaterializedContextSegment[];
   snapshotCommitSeq: string;
+}
+
+export interface ContextOrphanToolPairRepairReport {
+  conversationsScanned: number;
+  conversationsRepaired: number;
+  removedToolPairs: number;
 }
 
 interface AppendOccurrencePlan {
@@ -341,6 +359,8 @@ export class ContextSequenceControlPlane {
     const conversationId = requireId(input.conversationId, 'conversationId');
     const revisionId = requireId(input.messageRevisionId, 'messageRevisionId');
     const contentObjectId = requireId(input.contentObjectId, 'contentObjectId');
+    const contentByteLength = requireBigInt(input.contentByteLength, 'contentByteLength');
+    if (contentByteLength < 0n) throw new TypeError('contentByteLength must be non-negative.');
     const head = await this.getHead(conversationId);
     const baseRootId = head ? requireId(head.root_id, 'ConversationContextHeadLink.root_id') : null;
     const base = await this.readBaseShape(conversationId, baseRootId);
@@ -368,7 +388,7 @@ export class ContextSequenceControlPlane {
           tail_node_id: base.compression ? nodeId : null,
           tail_segment_count: base.compression ? base.tailSegmentCount + 1n : 0n,
           segment_count: base.segmentCount + 1n,
-          estimated_tokens: base.estimatedTokens,
+          estimated_tokens: base.estimatedTokens + estimateTokens(contentByteLength),
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
         ...headMutationSteps(conversationId, head, rootId, now)
@@ -385,12 +405,7 @@ export class ContextSequenceControlPlane {
     const state = await this.currentStructuralState(conversationId);
     const sourceRow = await this.findMessageSource(previousRevisionId);
     if (!sourceRow) {
-      return this.prepareAppendEditedMessageAtTail({
-        conversationId,
-        nextRevisionId,
-        contentObjectId,
-        state
-      });
+      throw new Error(`MessageRevision ${previousRevisionId} has no Context occurrence.`);
     }
     const sourceSegmentId = requireId(sourceRow.segment_id, 'ContextSegmentSource.segment_id');
     const targetIndex = state.records.findIndex((record) => record.segment.id === sourceSegmentId);
@@ -409,12 +424,7 @@ export class ContextSequenceControlPlane {
           contentByteLength: input.contentByteLength
         });
       }
-      return this.prepareAppendEditedMessageAtTail({
-        conversationId,
-        nextRevisionId,
-        contentObjectId,
-        state
-      });
+      throw new Error(`MessageRevision ${previousRevisionId} is not part of the current Context head.`);
     }
     const source: ContextSourceOccurrence = {
       sourceKind: 'message_revision', sourceId: nextRevisionId, sourceRevision: 0n
@@ -451,75 +461,280 @@ export class ContextSequenceControlPlane {
     };
   }
 
-  /** Deletion never reinterprets an old projection; only the current head gets a new root. */
-  public async prepareMessageDeleteMutation(input: MessageContextDeletePlanInput): Promise<ContextMutationPlan> {
+  /**
+   * Truncates the current Context at one Message occurrence. The target and every structural
+   * segment after it (including tool pairs and runtime context) disappear from the new head.
+   * An optional replacement is appended at the exact boundary for edit-and-rerun.
+   */
+  public async prepareMessageTruncateMutation(input: MessageContextTruncatePlanInput): Promise<ContextMutationPlan> {
     const conversationId = requireId(input.conversationId, 'conversationId');
     const revisionId = requireId(input.messageRevisionId, 'messageRevisionId');
     const idempotencyKey = requireText(input.idempotencyKey, 'idempotencyKey');
+    const replacement = input.replacement
+      ? {
+          messageRevisionId: requireId(input.replacement.messageRevisionId, 'replacement.messageRevisionId'),
+          contentObjectId: requireId(input.replacement.contentObjectId, 'replacement.contentObjectId'),
+          contentByteLength: requireBigInt(
+            input.replacement.contentByteLength,
+            'replacement.contentByteLength'
+          )
+        }
+      : null;
+    if (replacement && replacement.contentByteLength < 0n) {
+      throw new TypeError('replacement.contentByteLength must be non-negative.');
+    }
     const state = await this.currentStructuralState(conversationId);
     const sourceRow = await this.findMessageSource(revisionId);
-    const sourceSegmentId = sourceRow
-      ? requireId(sourceRow.segment_id, 'ContextSegmentSource.segment_id')
-      : null;
-    const targetIndex = sourceSegmentId
-      ? state.records.findIndex((record) => record.segment.id === sourceSegmentId)
-      : -1;
-    const now = this.timestamp();
-    const rootId = stableId('context_root_delete', conversationId, state.rootId, revisionId, idempotencyKey);
-    if (targetIndex < 0 && sourceSegmentId) {
+    if (!sourceRow) {
+      throw new Error(`MessageRevision ${revisionId} has no Context occurrence.`);
+    }
+    const sourceSegmentId = requireId(sourceRow.segment_id, 'ContextSegmentSource.segment_id');
+    const targetIndex = state.records.findIndex((record) => record.segment.id === sourceSegmentId);
+    let prefix: EditableContextSegment[];
+    let blocks: DomainRow[] = [];
+    if (targetIndex >= 0) {
+      prefix = state.records.slice(0, targetIndex).map((record) => ({
+        segment: record.segment,
+        contentObject: record.contentObject
+      }));
+    } else {
       const expanded = await this.expandCurrentCompressionForTarget(state, sourceSegmentId);
-      if (expanded) {
-        return this.prepareExpandedCompressionMessageMutation({
-          kind: 'delete',
-          conversationId,
-          state,
-          expanded,
-          targetSegmentId: sourceSegmentId,
-          rootId
-        });
+      if (!expanded) {
+        throw new Error(`MessageRevision ${revisionId} is not part of the current Context head.`);
       }
+      const expandedTargetIndex = expanded.segments.findIndex((record) =>
+        record.segment.id === sourceSegmentId
+      );
+      if (expandedTargetIndex < 0) {
+        throw new Error('Expanded compression lineage does not contain the truncation target.');
+      }
+      prefix = expanded.segments.slice(0, expandedTargetIndex);
+      blocks = expanded.blocks;
     }
-    if (targetIndex < 0) {
-      return {
-        steps: [
-          ...headAssertionSteps(conversationId, state.head, state.rootId),
-          DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
-            id: rootId,
-            conversation_id: conversationId,
-            root_node_id: state.root.root_node_id,
-            tail_node_id: state.root.tail_node_id,
-            tail_segment_count: state.root.tail_segment_count,
-            segment_count: state.root.segment_count,
-            estimated_tokens: state.root.estimated_tokens,
-            created_at: now
-          }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
-          ...headMutationSteps(conversationId, state.head, rootId, now)
-        ]
-      };
+
+    const now = this.timestamp();
+    let replacementSegmentId: string | null = null;
+    const occurrenceSteps: RepositoryTransactionStep[] = [];
+    if (replacement) {
+      replacementSegmentId = stableSegmentId([{
+        sourceKind: 'message_revision',
+        sourceId: replacement.messageRevisionId,
+        sourceRevision: 0n
+      }]);
+      occurrenceSteps.push(...messageOccurrenceWithAllocatedRevisionSteps({
+        segmentId: replacementSegmentId,
+        revisionId: replacement.messageRevisionId,
+        contentObjectId: replacement.contentObjectId,
+        now
+      }));
+      prefix.push({
+        segment: { id: replacementSegmentId, segment_kind: 'message' },
+        contentObject: { byte_length: replacement.contentByteLength }
+      });
     }
-    const rebuilt = rebuildSuffix(state.records, targetIndex, { replacementSegmentId: null, now });
-    const compression = state.records[0]?.segment.segment_kind === 'compression';
-    const oldTailCount = requireBigInt(state.root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count');
-    const nextTailCount = compression ? oldTailCount - 1n : 0n;
+
+    const retainedSummary = prefix[0]?.segment.segment_kind === 'compression' ? prefix[0] : null;
+    const tailSegments = retainedSummary ? prefix.slice(1) : prefix;
+    const nodes = buildSequenceNodes(
+      tailSegments.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
+      now
+    );
+    const summaryNodeId = retainedSummary
+      ? contextSequenceNodeId(null, requireId(retainedSummary.segment.id, 'retained compression segment id'))
+      : null;
+    const estimatedTokens = prefix.reduce((total, record) =>
+      total + estimateTokens(requireBigInt(record.contentObject.byte_length, 'ContentObject.byte_length')),
+    0n);
+    const blockSteps = uniqueRows(blocks).flatMap((block) => {
+      if (block.status !== 'enabled') return [];
+      const blockId = requireId(block.id, 'CompressionBlock.id');
+      return [
+        DOMAIN_REPOSITORIES.domain('CompressionBlock').assert(blockId, { status: 'enabled' }),
+        DOMAIN_REPOSITORIES.domain('CompressionBlock').update(blockId, {
+          status: 'disabled', updated_at: now
+        })
+      ];
+    });
+    const rootId = stableId(
+      'context_root_truncate',
+      conversationId,
+      state.rootId,
+      revisionId,
+      replacement?.messageRevisionId ?? '<delete>',
+      idempotencyKey
+    );
     return {
       steps: [
         ...headAssertionSteps(conversationId, state.head, state.rootId),
-        ...nodeInsertSteps(rebuilt.nodes, 'message_delete_nodes'),
+        ...occurrenceSteps,
+        ...nodeInsertSteps(nodes, 'message_truncate_nodes'),
+        ...(retainedSummary ? [DOMAIN_REPOSITORIES.domain('ContextSequenceNode').assert(
+          requireId(summaryNodeId, 'retained compression node id'),
+          {
+            parent_node_id: null,
+            segment_id: requireId(retainedSummary.segment.id, 'retained compression segment id')
+          }
+        )] : []),
+        ...blockSteps,
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: rootId,
-
           conversation_id: conversationId,
-          root_node_id: compression
-            ? requireId(state.root.root_node_id, 'ContextSequenceRoot.root_node_id')
-            : rebuilt.lastNodeId,
-          tail_node_id: compression && nextTailCount > 0n ? rebuilt.lastNodeId : null,
-          tail_segment_count: nextTailCount,
-          segment_count: requireBigInt(state.root.segment_count, 'ContextSequenceRoot.segment_count') - 1n,
-          estimated_tokens: state.root.estimated_tokens,
+          root_node_id: retainedSummary
+            ? summaryNodeId
+            : nodes.length ? nodes[nodes.length - 1].id : null,
+          tail_node_id: retainedSummary && nodes.length ? nodes[nodes.length - 1].id : null,
+          tail_segment_count: retainedSummary ? BigInt(nodes.length) : 0n,
+          segment_count: BigInt(prefix.length),
+          estimated_tokens: estimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
         ...headMutationSteps(conversationId, state.head, rootId, now)
       ]
+    };
+  }
+
+  /** Deletion is a semantic delete-from operation, not removal of one projected Message row. */
+  public async prepareMessageDeleteMutation(input: MessageContextDeletePlanInput): Promise<ContextMutationPlan> {
+    return this.prepareMessageTruncateMutation(input);
+  }
+
+  /**
+   * Startup integrity maintenance for roots produced by the former per-Message delete loop.
+   * It removes only explicit tool-pair segments whose source model Message is soft-deleted,
+   * preserving every later valid segment. Active Conversations are left untouched.
+   */
+  public async repairOrphanToolPairs(signal?: AbortSignal): Promise<ContextOrphanToolPairRepairReport> {
+    signal?.throwIfAborted();
+    const heads = await listAllDomainRows(this.database, 'ConversationContextHeadLink');
+    let conversationsRepaired = 0;
+    let removedToolPairs = 0;
+    for (const observedHead of heads) {
+      signal?.throwIfAborted();
+      const conversationId = requireId(observedHead.conversation_id, 'ConversationContextHeadLink.conversation_id');
+      const activity = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').list({
+          where: { conversation_id: conversationId },
+          limit: 1
+        }),
+        DOMAIN_REPOSITORIES.domain('Turn').list({
+          where: { conversation_id: conversationId, status: 'active' },
+          limit: 1
+        })
+      ]);
+      if (rows(activity.snapshot[0]).length > 0 || rows(activity.snapshot[1]).length > 0) continue;
+      const state = await this.currentStructuralState(conversationId);
+      const removedSegmentIds = new Set<string>();
+      const ownerAssertions: RepositoryTransactionStep[] = [];
+      for (const record of state.records) {
+        signal?.throwIfAborted();
+        if (record.segment.segment_kind !== 'tool_pair') continue;
+        const segmentId = requireId(record.segment.id, 'ContextSegment.id');
+        const sourceSnapshot = await this.database.snapshotAll(
+          DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+            where: { segment_id: segmentId },
+            orderBy: { column: 'id', direction: 'asc' },
+            limit: 1000
+          })
+        );
+        const callSources = sourceSnapshot.snapshot.filter((source) => source.source_kind === 'tool_call');
+        if (callSources.length !== 1) {
+          removedSegmentIds.add(segmentId);
+          continue;
+        }
+        const toolCallId = requireId(callSources[0].source_id, 'ContextSegmentSource.source_id');
+        const linkSnapshot = await this.database.snapshot([
+          DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
+            where: { tool_call_id: toolCallId },
+            limit: 2
+          })
+        ]);
+        const links = rows(linkSnapshot.snapshot[0]);
+        if (links.length !== 1) {
+          removedSegmentIds.add(segmentId);
+          continue;
+        }
+        const ownerMessageId = requireId(links[0].message_id, 'ToolCallSourceLink.message_id');
+        const ownerSnapshot = await this.database.snapshot([
+          DOMAIN_REPOSITORIES.domain('Message').get(ownerMessageId)
+        ]);
+        const owner = ownerSnapshot.snapshot[0] as DomainRow | null;
+        if (!owner || owner.deleted_at === null) continue;
+        const deletedAt = requireText(owner.deleted_at, 'Message.deleted_at');
+        removedSegmentIds.add(segmentId);
+        ownerAssertions.push(DOMAIN_REPOSITORIES.domain('Message').assert(ownerMessageId, {
+          deleted_at: deletedAt
+        }));
+      }
+      if (removedSegmentIds.size === 0) continue;
+
+      const retained = state.records.filter((record) =>
+        !removedSegmentIds.has(requireId(record.segment.id, 'ContextSegment.id'))
+      );
+      const retainedSummary = retained[0]?.segment.segment_kind === 'compression' ? retained[0] : null;
+      const tailRecords = retainedSummary ? retained.slice(1) : retained;
+      const now = this.timestamp();
+      const nodes = buildSequenceNodes(
+        tailRecords.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
+        now
+      );
+      const summaryNodeId = retainedSummary
+        ? contextSequenceNodeId(null, requireId(retainedSummary.segment.id, 'retained compression segment id'))
+        : null;
+      const rootId = stableId(
+        'context_root_repair_orphan_tool_pairs',
+        conversationId,
+        state.rootId,
+        ...[...removedSegmentIds].sort()
+      );
+      const estimatedTokens = retained.reduce((total, record) =>
+        total + estimateTokens(requireBigInt(record.contentObject.byte_length, 'ContentObject.byte_length')),
+      0n);
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').assertNone({ conversation_id: conversationId }),
+          DOMAIN_REPOSITORIES.domain('Turn').assertNone({
+            conversation_id: conversationId,
+            status: 'active'
+          }),
+          ...headAssertionSteps(conversationId, state.head, state.rootId),
+          ...ownerAssertions,
+          ...nodeInsertSteps(nodes, 'repair_orphan_tool_pair_nodes'),
+          ...(retainedSummary ? [DOMAIN_REPOSITORIES.domain('ContextSequenceNode').assert(
+            requireId(summaryNodeId, 'retained compression node id'),
+            {
+              parent_node_id: null,
+              segment_id: requireId(retainedSummary.segment.id, 'retained compression segment id')
+            }
+          )] : []),
+          DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
+            id: rootId,
+            conversation_id: conversationId,
+            root_node_id: retainedSummary
+              ? summaryNodeId
+              : nodes.length ? nodes[nodes.length - 1].id : null,
+            tail_node_id: retainedSummary && nodes.length ? nodes[nodes.length - 1].id : null,
+            tail_segment_count: retainedSummary ? BigInt(nodes.length) : 0n,
+            segment_count: BigInt(retained.length),
+            estimated_tokens: estimatedTokens,
+            created_at: now
+          }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+          ...headMutationSteps(conversationId, state.head, rootId, now),
+          DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+        ]);
+      } catch (error) {
+        // Background startup maintenance may race a real user Turn after the VS Code surface is
+        // already usable. The exact head/activity assertions are the authority: losing that CAS
+        // means this observed root is stale and must be left to the live mutation or next scan.
+        if (!isRecoverableAppendRace(error)) throw error;
+        continue;
+      }
+      conversationsRepaired += 1;
+      removedToolPairs += removedSegmentIds.size;
+    }
+    return {
+      conversationsScanned: heads.length,
+      conversationsRepaired,
+      removedToolPairs
     };
   }
 
@@ -708,51 +923,6 @@ export class ContextSequenceControlPlane {
     const contentObject = await this.getOptional('ContentObject', contentObjectId);
     if (!contentObject) throw new Error(`ContentObject ${contentObjectId} does not exist.`);
     return { segment, contentObject };
-  }
-
-  private async prepareAppendEditedMessageAtTail(input: {
-    conversationId: string;
-    nextRevisionId: string;
-    contentObjectId: string;
-    state: Awaited<ReturnType<ContextSequenceControlPlane['currentStructuralState']>>;
-  }): Promise<ContextMutationPlan> {
-    const { state } = input;
-    const compression = state.records[0]?.segment.segment_kind === 'compression';
-    const parentNodeId = compression
-      ? nullableId(state.root.tail_node_id, 'ContextSequenceRoot.tail_node_id')
-      : nullableId(state.root.root_node_id, 'ContextSequenceRoot.root_node_id');
-    const source: ContextSourceOccurrence = {
-      sourceKind: 'message_revision', sourceId: input.nextRevisionId, sourceRevision: 0n
-    };
-    const segmentId = stableSegmentId([source]);
-    const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
-    const rootId = stableId('context_root_edit_tail', input.conversationId, state.rootId, input.nextRevisionId);
-    const now = this.timestamp();
-    return {
-      steps: [
-        ...headAssertionSteps(input.conversationId, state.head, state.rootId),
-        ...messageOccurrenceWithAllocatedRevisionSteps({
-          segmentId,
-          revisionId: input.nextRevisionId,
-          contentObjectId: input.contentObjectId,
-          now
-        }),
-        ...nodeInsertSteps([{ id: nodeId, parentNodeId, segmentId, now }], 'message_edit_tail_node'),
-        DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
-          id: rootId,
-          conversation_id: input.conversationId,
-          root_node_id: compression ? state.root.root_node_id : nodeId,
-          tail_node_id: compression ? nodeId : null,
-          tail_segment_count: compression
-            ? requireBigInt(state.root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count') + 1n
-            : 0n,
-          segment_count: requireBigInt(state.root.segment_count, 'ContextSequenceRoot.segment_count') + 1n,
-          estimated_tokens: state.root.estimated_tokens,
-          created_at: now
-        }, { column: 'root_seq', scope: { conversation_id: input.conversationId } }),
-        ...headMutationSteps(input.conversationId, state.head, rootId, now)
-      ]
-    };
   }
 
   private async currentStructuralState(conversationId: string): Promise<{

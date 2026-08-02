@@ -32,10 +32,8 @@ export interface ToolCallPreviewData {
   callId: string;
   name?: string;
   streamIndex?: string;
-  argumentsHead: string;
-  argumentsTail: string;
+  argumentsText: string;
   receivedChars: number;
-  truncated: boolean;
   createdAt: number;
   updatedAt: number;
 }

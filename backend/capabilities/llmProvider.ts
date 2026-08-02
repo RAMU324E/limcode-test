@@ -1,5 +1,7 @@
 import { createHash } from 'crypto';
+import { mapWithBoundedConcurrency } from './boundedConcurrency';
 import { createProxyFetch } from './proxyFetch';
+import { createTerminalValidatedFetch } from './terminalValidatedFetch';
 import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
 import {
   LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION,
@@ -96,7 +98,12 @@ interface UnifiedDryRunResult {
 
 interface UnifiedDryRunCapable {
   dryRun(request: unknown, options?: { inputFormat?: string; outputFormat?: string; stream?: boolean; curl?: { includeApiKey?: boolean; prettyBody?: boolean } }): Promise<UnifiedDryRunResult>;
-  compactDryRun?(request: unknown, options?: { inputFormat?: string; outputFormat?: string; curl?: { includeApiKey?: boolean; prettyBody?: boolean } }): Promise<UnifiedDryRunResult>;
+  compactDryRun?(request: unknown, options?: {
+    inputFormat?: string;
+    outputFormat?: string;
+    requestBody?: LlmRequestBodyRecord;
+    curl?: { includeApiKey?: boolean; prettyBody?: boolean };
+  }): Promise<UnifiedDryRunResult>;
 }
 
 export interface LlmProviderOptions {
@@ -265,6 +272,7 @@ export async function startLlmProvider(
     const registry = unified.createBootstrapExtensionRegistry();
     const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
     const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+    const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
     const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
     const requestBody = requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId);
     if (proxy) console.log(`[LimCode] LLM proxy enabled: ${proxy}`);
@@ -278,7 +286,8 @@ export async function startLlmProvider(
       ...(requestBody ? { requestBody } : {}),
       ...unifiedPromptCacheConfigEntry(settings, requestBody),
       ...openAIResponsesWebSocketConfigEntry(settings, request.conversationId),
-      ...(proxy ? { proxy, fetch: proxyFetch } : {})
+      ...(proxy ? { proxy } : {}),
+      fetch: providerFetch
     }, registry.llmProviders);
 
     const retryEnabled = settings.retryOnError !== false;
@@ -381,9 +390,16 @@ async function runLlmAttempt(
     }
     emitRetryRecovered(request.id, emit, retryRecoveryNotice);
     emitUnifiedResponse(request.id, response, emit);
+    const completedAt = Date.now();
     emit({
       type: LlmEventType.Done,
-      payload: { requestId: request.id, createdAt: Date.now(), ...(usageMetadataFromCompact(response.usageMetadata) ? { usageMetadata: usageMetadataFromCompact(response.usageMetadata) } : {}) }
+      payload: {
+        requestId: request.id,
+        createdAt: completedAt,
+        completedAt,
+        streamOutputDurationMs: 0,
+        ...(usageMetadataFromCompact(response.usageMetadata) ? { usageMetadata: usageMetadataFromCompact(response.usageMetadata) } : {})
+      }
     });
     return;
   }
@@ -440,7 +456,21 @@ async function runLlmAttempt(
       ? disposeThoughtBlock(activeThoughtBlock)
       : finishThoughtBlock(request.id, activeThoughtBlock, Date.now(), emit);
     if (aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
-    throw error;
+    const failure = failureFromCaughtError(error);
+    const failureTiming = createDoneTiming(
+      timing.firstStreamChunkAt,
+      Date.now(),
+      timing.firstStreamChunkMark,
+      nowMonotonicMs(),
+      timing.streamTimingChunkCount
+    );
+    throw new LlmAttemptFailureError({
+      ...failure,
+      createdAt: failureTiming.createdAt,
+      ...(failureTiming.streamOutputDurationMs !== undefined
+        ? { streamOutputDurationMs: failureTiming.streamOutputDurationMs }
+        : {})
+    });
   }
 
   if (signal?.aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
@@ -450,7 +480,12 @@ async function runLlmAttempt(
   if (retryRecoveryPending) emitRetryRecovered(request.id, emit, retryRecoveryNotice);
   emit({
     type: LlmEventType.Done,
-    payload: { requestId: request.id, ...createDoneTiming(timing.firstStreamChunkAt, finishedAt, timing.firstStreamChunkMark, finishedMark, timing.streamTimingChunkCount), ...(latestUsageMetadata ? { usageMetadata: latestUsageMetadata } : {}) }
+    payload: {
+      requestId: request.id,
+      ...createDoneTiming(timing.firstStreamChunkAt, finishedAt, timing.firstStreamChunkMark, finishedMark, timing.streamTimingChunkCount),
+      completedAt: finishedAt,
+      ...(latestUsageMetadata ? { usageMetadata: latestUsageMetadata } : {})
+    }
   });
 }
 
@@ -685,10 +720,14 @@ function toPlainJsonLike(value: unknown, seen = new WeakSet<object>()): unknown 
     if (seen.has(value)) return '[Circular]';
     seen.add(value);
     const cause = (value as { cause?: unknown }).cause;
+    const own = Object.fromEntries(Object.entries(value as Error & Record<string, unknown>)
+      .filter(([key]) => key !== 'name' && key !== 'message' && key !== 'stack' && key !== 'cause')
+      .map(([key, child]) => [key, toPlainJsonLike(child, seen)]));
     return {
       name: value.name,
       message: value.message,
       stack: value.stack,
+      ...own,
       ...(cause !== undefined ? { cause: toPlainJsonLike(cause, seen) } : {})
     };
   }
@@ -741,6 +780,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const registry = unified.createBootstrapExtensionRegistry();
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+  const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
   const provider = unified.createLLMFromConfig({
@@ -753,7 +793,8 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     ...(requestBody ? { requestBody } : {}),
     ...unifiedPromptCacheConfigEntry(runtimeSettings, requestBody),
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
-    ...(proxy ? { proxy, fetch: proxyFetch } : {})
+    ...(proxy ? { proxy } : {}),
+    fetch: providerFetch
   }, registry.llmProviders);
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
@@ -855,7 +896,9 @@ async function dryRunOpenAIResponsesCompact(
   const registry = unified.createBootstrapExtensionRegistry();
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+  const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
+  const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
   const provider = unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
@@ -863,9 +906,10 @@ async function dryRunOpenAIResponsesCompact(
     baseUrl: runtimeSettings.baseUrl,
     ...(runtimeSettings.contextWindowTokens ? { contextWindow: runtimeSettings.contextWindowTokens } : {}),
     ...(headers ? { headers } : {}),
-    ...(runtimeSettings.requestBody ? { requestBody: runtimeSettings.requestBody } : {}),
-    ...unifiedPromptCacheConfigEntry(runtimeSettings),
-    ...(proxy ? { proxy, fetch: proxyFetch } : {})
+    ...(requestBody ? { requestBody } : {}),
+    ...unifiedPromptCacheConfigEntry(runtimeSettings, requestBody),
+    ...(proxy ? { proxy } : {}),
+    fetch: providerFetch
   }, registry.llmProviders) as unknown as Partial<UnifiedDryRunCapable>;
   if (typeof provider.compactDryRun !== 'function') {
     throw new Error('当前 unified-llm-provider 版本不支持 provider.compactDryRun。');
@@ -875,6 +919,7 @@ async function dryRunOpenAIResponsesCompact(
     {
       inputFormat: 'unified',
       outputFormat: 'unified',
+      ...(requestBody ? { requestBody } : {}),
       curl: { includeApiKey: dryRunOptions.includeApiKey === true, prettyBody: true }
     }
   );
@@ -1191,7 +1236,9 @@ async function compactWithOpenAIResponses(
   const registry = unified.createBootstrapExtensionRegistry();
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+  const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const requestBody = requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId);
   logCompressionDebug('provider.compact.openaiResponses.settings', {
     ...compactRequestDebugInfo(request),
     providerConfigId: settings.id,
@@ -1203,7 +1250,7 @@ async function compactWithOpenAIResponses(
     methodConfigKind: methodConfig.kind,
     hasProxy: !!proxy,
     headerKeys: headers ? Object.keys(headers) : [],
-    hasRequestBody: !!settings.requestBody
+    hasRequestBody: !!requestBody
   });
   const provider = unified.createLLMFromConfig({
     provider: settings.provider,
@@ -1212,9 +1259,10 @@ async function compactWithOpenAIResponses(
     baseUrl: settings.baseUrl,
     ...(settings.contextWindowTokens ? { contextWindow: settings.contextWindowTokens } : {}),
     ...(headers ? { headers } : {}),
-    ...(settings.requestBody ? { requestBody: settings.requestBody } : {}),
-    ...unifiedPromptCacheConfigEntry(settings),
-    ...(proxy ? { proxy, fetch: proxyFetch } : {})
+    ...(requestBody ? { requestBody } : {}),
+    ...unifiedPromptCacheConfigEntry(settings, requestBody),
+    ...(proxy ? { proxy } : {}),
+    fetch: providerFetch
   }, registry.llmProviders) as unknown as { compact?: (request: unknown, options?: unknown) => Promise<UnifiedLLMCompactResponse> };
 
   if (typeof provider.compact !== 'function') {
@@ -1230,7 +1278,12 @@ async function compactWithOpenAIResponses(
     });
     compacted = await provider.compact(
       { contents: normalizedContext.map(toUnifiedContent) },
-      { inputFormat: 'unified', outputFormat: 'unified', signal }
+      {
+        inputFormat: 'unified',
+        outputFormat: 'unified',
+        signal,
+        ...(requestBody ? { requestBody } : {})
+      }
     );
     if (hasUnifiedError(compacted)) {
       throw new LlmAttemptFailureError(failureFromProviderError(compacted.error, { rawResponse: compacted.rawResponse ?? compacted }));
@@ -1314,8 +1367,9 @@ async function compactWithSummary(
 }
 
 /**
- * 分段总结拼接：按回合分别总结后机械拼接。
- * - 每个回合并行调用 LLM 总结（回合1前情=历史总结，回合N前情=上一回合的最终正式回答原文）；
+ * 分段总结拼接：按有界的连续回合组分别总结后机械拼接。
+ * - 最多生成固定数量的Provider调用，并以有界并发执行；
+ * - 回合组1前情=历史总结，回合组N前情=上一组的最终正式回答原文；
  * - 提取每段 <summary></summary>，无标签则回退原文；
  * - 拼接为 [过去总结逐字?] + ## 回合N，包裹成 [Context Summary]。
  */
@@ -1329,7 +1383,12 @@ async function compactWithSegmentedSummary(
 
   const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
   const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, provider.settings);
-  const roundSummaries = await Promise.all(calls.map((call) => summarizeSingleRound(provider, call, signal)));
+  const roundSummaries = await mapWithBoundedConcurrency(
+    calls,
+    isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
+    (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
+    signal
+  );
 
   const parts: string[] = [];
   if (priorSummaryText) parts.push(`━━━ 早前对话摘要 ━━━\n${priorSummaryText}`);
@@ -1378,6 +1437,10 @@ interface ResolvedSummaryProvider {
   settings: LlmProviderConfigRecord;
   stream: boolean;
   apiKeyAvailable: boolean;
+  unified?: UnifiedModule;
+  proxy?: string;
+  webSocketSessionKey?: string;
+  omitUnsupportedMaxOutputTokens: boolean;
 }
 
 /** 组装总结用 provider（复用运行时渠道解析 + 代理/头合并）；无 API Key 时 provider 为 undefined 表示回退确定性摘要。 */
@@ -1401,14 +1464,22 @@ async function resolveSummaryProvider(
 
   const apiKeyAvailable = !!settings.apiKey;
   if (!apiKeyAvailable && behavior.allowPlaceholderApiKey !== true) {
-    return { provider: undefined, settings, stream: false, apiKeyAvailable: false };
+    return {
+      provider: undefined,
+      settings,
+      stream: false,
+      apiKeyAvailable: false,
+      omitUnsupportedMaxOutputTokens: false
+    };
   }
   const runtimeSettings = apiKeyAvailable ? settings : { ...settings, apiKey: 'limcode-dry-run-placeholder-key' };
   const unified = await importUnifiedLlmProvider();
   const registry = unified.createBootstrapExtensionRegistry();
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
+  const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
   const provider = unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
@@ -1416,11 +1487,29 @@ async function resolveSummaryProvider(
     baseUrl: runtimeSettings.baseUrl,
     ...(runtimeSettings.contextWindowTokens ? { contextWindow: runtimeSettings.contextWindowTokens } : {}),
     ...(headers ? { headers } : {}),
-    ...(runtimeSettings.requestBody ? { requestBody: runtimeSettings.requestBody } : {}),
-    ...unifiedPromptCacheConfigEntry(runtimeSettings),
-    ...(proxy ? { proxy, fetch: proxyFetch } : {})
+    ...(requestBody ? { requestBody } : {}),
+    ...unifiedPromptCacheConfigEntry(runtimeSettings, requestBody),
+    ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
+    ...(proxy ? { proxy } : {}),
+    fetch: providerFetch
   }, registry.llmProviders);
-  return { provider, settings, stream: settings.stream !== false, apiKeyAvailable };
+  return {
+    provider,
+    settings,
+    stream: settings.stream !== false,
+    apiKeyAvailable,
+    unified,
+    ...(proxy ? { proxy } : {}),
+    ...(isOpenAIResponsesWebSocketMode(settings)
+      ? {
+          webSocketSessionKey: createOpenAIResponsesWebSocketSessionKey(
+            settings,
+            `${request.conversationId?.trim() || 'global'}\ncompression-summary\n${request.id}`
+          )
+        }
+      : {}),
+    omitUnsupportedMaxOutputTokens: false
+  };
 }
 
 interface SummaryProviderCall {
@@ -1439,7 +1528,10 @@ function buildSummaryProviderCall(
   settings: LlmProviderConfigRecord
 ): SummaryProviderCall {
   const summarySettings = methodConfig.llmSummary;
-  const systemPrompt = summarySettings?.systemPrompt?.trim() || DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT;
+  const systemPrompt = withSummaryTargetInstruction(
+    summarySettings?.systemPrompt?.trim() || DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT,
+    summarySettings?.targetTokens
+  );
   const userPrompt = summarySettings?.userPrompt?.trim() || DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT;
   const transcript = renderContentsForSummary(request.contents);
   return {
@@ -1448,7 +1540,7 @@ function buildSummaryProviderCall(
     request: {
       contents: [{ role: 'user', parts: [{ text: `${userPrompt}\n\n${transcript}` }] }],
       systemInstruction: { parts: [{ text: systemPrompt }] },
-      generationConfig: summarySettings?.generationConfig ?? settings.generationConfig
+      generationConfig: summaryGenerationConfig(methodConfig, settings)
     }
   };
 }
@@ -1458,7 +1550,19 @@ function buildSegmentedSummaryProviderCalls(
   methodConfig: LlmCompressionConfigRecord,
   settings: LlmProviderConfigRecord
 ): SummaryProviderCall[] {
-  const segments = request.segments && request.segments.length > 0 ? request.segments : [request.contents];
+  // One Provider request per historical turn is an unbounded fan-out for long conversations.
+  // Coalesce adjacent frozen turns while preserving order and tool-pair boundaries. When the user
+  // sets a total visible-summary target, derive the call count from that target so no individual
+  // round is starved by splitting the budget across too many Provider requests.
+  const totalTargetTokens = methodConfig.llmSummary?.targetTokens;
+  const sourceSegments = request.segments && request.segments.length > 0 ? request.segments : [request.contents];
+  const maxCalls = segmentedSummaryCallLimit(totalTargetTokens);
+  const segments = coalesceSummarySegments(sourceSegments, maxCalls);
+  const targetTokensPerCall = typeof totalTargetTokens === 'number'
+    && Number.isFinite(totalTargetTokens)
+    && totalTargetTokens > 0
+    ? Math.max(128, Math.ceil(totalTargetTokens / segments.length))
+    : undefined;
   const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
   const priorContexts = segments.map((segment, index) => index === 0 ? priorSummaryText : finalAnswerTextOf(segments[index - 1]));
   return segments.map((segment, index) => {
@@ -1469,11 +1573,90 @@ function buildSegmentedSummaryProviderCalls(
       sourceContents: segment,
       request: {
         contents: [{ role: 'user', parts: [{ text: userText }] }],
-        systemInstruction: { parts: [{ text: DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT }] },
-        generationConfig: methodConfig.llmSummary?.generationConfig ?? settings.generationConfig
+        systemInstruction: {
+          parts: [{ text: withSummaryTargetInstruction(DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT, targetTokensPerCall) }]
+        },
+        generationConfig: summaryGenerationConfig(methodConfig, settings, targetTokensPerCall)
       }
     };
   });
+}
+
+function withSummaryTargetInstruction(prompt: string, targetTokens: number | undefined): string {
+  if (typeof targetTokens !== 'number' || !Number.isFinite(targetTokens) || targetTokens <= 0) return prompt;
+  return `${prompt}\n\n将可见摘要正文控制在约 ${Math.floor(targetTokens)} tokens；优先保留标识符、数字、文件名、依赖关系、决定和未完成事项。`;
+}
+
+const MAX_SEGMENTED_SUMMARY_CALLS = 16;
+const SEGMENTED_SUMMARY_CONCURRENCY = 3;
+const MIN_SEGMENTED_VISIBLE_TARGET_TOKENS_PER_CALL = 512;
+const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 2_048;
+const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 4;
+
+function segmentedSummaryCallLimit(totalTargetTokens: number | undefined): number {
+  if (typeof totalTargetTokens !== 'number' || !Number.isFinite(totalTargetTokens) || totalTargetTokens <= 0) {
+    return MAX_SEGMENTED_SUMMARY_CALLS;
+  }
+  return Math.max(
+    1,
+    Math.min(MAX_SEGMENTED_SUMMARY_CALLS, Math.floor(totalTargetTokens / MIN_SEGMENTED_VISIBLE_TARGET_TOKENS_PER_CALL))
+  );
+}
+
+function coalesceSummarySegments(segments: readonly MessageContent[][], maxCalls: number): MessageContent[][] {
+  if (segments.length <= maxCalls) return segments.map((segment) => [...segment]);
+  const groupSize = Math.ceil(segments.length / maxCalls);
+  const grouped: MessageContent[][] = [];
+  for (let index = 0; index < segments.length; index += groupSize) {
+    grouped.push(segments.slice(index, index + groupSize).flatMap((segment) => segment));
+  }
+  return grouped;
+}
+
+/**
+ * `targetTokens` is the desired visible summary length, while Provider output accounting also
+ * includes hidden reasoning tokens. Keep those two budgets separate: use the target in the prompt,
+ * default summary reasoning to low, and reserve a bounded hard-output ceiling. An explicit method
+ * `maxOutputTokens`/`thinkingConfig` remains authoritative.
+ */
+function summaryGenerationConfig(
+  methodConfig: LlmCompressionConfigRecord,
+  settings: LlmProviderConfigRecord,
+  targetTokensOverride?: number
+): LlmGenerationConfigRecord | undefined {
+  const targetTokens = targetTokensOverride ?? methodConfig.llmSummary?.targetTokens;
+  const inherited = settings.generationConfig ?? {};
+  const method = methodConfig.llmSummary?.generationConfig ?? {};
+  const {
+    maxOutputTokens: inheritedMaxOutputTokens,
+    thinkingConfig: inheritedThinkingConfig,
+    ...inheritedRest
+  } = inherited;
+  const {
+    maxOutputTokens: methodMaxOutputTokens,
+    thinkingConfig: methodThinkingConfig,
+    ...methodRest
+  } = method;
+  const derivedMaxOutputTokens = typeof targetTokens === 'number'
+    && Number.isFinite(targetTokens)
+    && targetTokens > 0
+    ? Math.max(
+        SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS,
+        Math.ceil(targetTokens * SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER)
+      )
+    : inheritedMaxOutputTokens;
+  const generationConfig = {
+    ...inheritedRest,
+    ...methodRest,
+    ...((methodMaxOutputTokens ?? derivedMaxOutputTokens) !== undefined
+      ? { maxOutputTokens: methodMaxOutputTokens ?? derivedMaxOutputTokens }
+      : {}),
+    thinkingConfig: methodThinkingConfig ?? {
+      ...(inheritedThinkingConfig ?? {}),
+      thinkingLevel: 'low' as const
+    }
+  };
+  return Object.keys(generationConfig).length > 0 ? generationConfig : undefined;
 }
 
 async function summarizeSingleRound(
@@ -1483,26 +1666,9 @@ async function summarizeSingleRound(
 ): Promise<string> {
   const fallback = () => deterministicSummary(call.sourceContents);
   if (!resolved.provider) return fallback();
-  const summaryRequest = call.request;
 
   try {
-    if (resolved.stream) {
-      let text = '';
-      for await (const chunk of resolved.provider.chatStream<UnifiedLLMStreamChunk>(summaryRequest, { inputFormat: 'unified', outputFormat: 'unified', signal })) {
-        if (hasUnifiedError(chunk)) {
-          throw new LlmAttemptFailureError(failureFromProviderError(chunk.error, { rawChunk: (chunk as { rawChunk?: unknown }).rawChunk ?? chunk }));
-        }
-        text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
-      }
-      const trimmed = text.trim();
-      return trimmed ? extractSummaryTag(trimmed) : fallback();
-    }
-
-    const response = await resolved.provider.chat<UnifiedLLMResponse>(summaryRequest, { inputFormat: 'unified', outputFormat: 'unified', signal });
-    if (hasUnifiedError(response)) {
-      throw new LlmAttemptFailureError(failureFromProviderError(response.error, { rawResponse: response.rawResponse ?? response }));
-    }
-    const trimmed = visibleTextFromParts(response.content?.parts ?? []).trim();
+    const trimmed = (await executeSummaryProviderCall(resolved, call.request, signal)).trim();
     return trimmed ? extractSummaryTag(trimmed) : fallback();
   } catch (error) {
     if (isRequestAbort(signal)) throw error;
@@ -1515,6 +1681,151 @@ async function summarizeSingleRound(
     if (!contextLength) throw error;
     return fallback();
   }
+}
+
+async function executeSummaryProviderCall(
+  resolved: ResolvedSummaryProvider,
+  request: SummaryProviderCall['request'],
+  signal?: AbortSignal
+): Promise<string> {
+  if (!resolved.provider) return '';
+  const execute = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
+    if (resolved.stream || isOpenAIResponsesWebSocketMode(resolved.settings)) {
+      let text = '';
+      const stream = isOpenAIResponsesWebSocketMode(resolved.settings)
+        ? createSummaryWebSocketStream(resolved, activeRequest, signal)
+        : resolved.provider!.chatStream<UnifiedLLMStreamChunk>(activeRequest, {
+            inputFormat: 'unified',
+            outputFormat: 'unified',
+            signal
+          });
+      for await (const chunk of stream) {
+        if (hasUnifiedError(chunk)) {
+          throw new LlmAttemptFailureError(failureFromProviderError(chunk.error, {
+            rawChunk: (chunk as { rawChunk?: unknown }).rawChunk ?? chunk
+          }));
+        }
+        text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
+      }
+      return text;
+    }
+
+    const response = await resolved.provider!.chat<UnifiedLLMResponse>(activeRequest, {
+      inputFormat: 'unified',
+      outputFormat: 'unified',
+      signal
+    });
+    if (hasUnifiedError(response)) {
+      throw new LlmAttemptFailureError(failureFromProviderError(response.error, {
+        rawResponse: response.rawResponse ?? response
+      }));
+    }
+    return visibleTextFromParts(response.content?.parts ?? []);
+  };
+
+  const initialRequest = resolved.omitUnsupportedMaxOutputTokens
+    ? withoutMaxOutputTokens(request)
+    : request;
+  try {
+    return await execute(initialRequest);
+  } catch (error) {
+    if (hasMaxOutputTokens(initialRequest) && isUnsupportedMaxOutputTokensError(error)) {
+      resolved.omitUnsupportedMaxOutputTokens = true;
+      logCompressionDebug('provider.compact.summary.compatibilityRetry', {
+        providerConfigId: resolved.settings.id,
+        provider: resolved.settings.provider,
+        transport: resolved.settings.openaiResponsesTransport,
+        removedParameter: 'max_output_tokens'
+      });
+      return execute(withoutMaxOutputTokens(initialRequest));
+    }
+    if (hasMaxOutputTokens(initialRequest) && isMaxOutputTokensIncompleteError(error)) {
+      const previousMaxOutputTokens = initialRequest.generationConfig!.maxOutputTokens!;
+      const nextMaxOutputTokens = Math.min(131_072, Math.max(
+        previousMaxOutputTokens + SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS,
+        previousMaxOutputTokens * 2
+      ));
+      if (nextMaxOutputTokens > previousMaxOutputTokens) {
+        logCompressionDebug('provider.compact.summary.outputBudgetRetry', {
+          providerConfigId: resolved.settings.id,
+          provider: resolved.settings.provider,
+          previousMaxOutputTokens,
+          nextMaxOutputTokens
+        });
+        return execute(withMaxOutputTokens(initialRequest, nextMaxOutputTokens));
+      }
+    }
+    throw error;
+  }
+}
+
+async function* createSummaryWebSocketStream(
+  resolved: ResolvedSummaryProvider,
+  request: SummaryProviderCall['request'],
+  signal?: AbortSignal
+): AsyncGenerator<UnifiedLLMStreamChunk> {
+  const providerDryRun = (resolved.provider as unknown as Partial<UnifiedDryRunCapable> | undefined)?.dryRun;
+  if (!resolved.provider || typeof providerDryRun !== 'function' || !resolved.unified || !resolved.webSocketSessionKey) {
+    throw new Error('OpenAI Responses WebSocket 摘要缺少已解析的 Provider 传输信息。');
+  }
+  const dryRun = await providerDryRun.call(resolved.provider, request, {
+    inputFormat: 'unified',
+    outputFormat: 'unified',
+    stream: true
+  });
+  const format = new resolved.unified.OpenAIResponsesFormat(resolved.settings.model) as OpenAIResponsesFormatAdapter;
+  yield* streamOpenAIResponsesWebSocketSession({
+    sessionKey: resolved.webSocketSessionKey,
+    url: dryRun.url,
+    headers: dryRun.headers,
+    body: dryRun.body,
+    format,
+    signal,
+    proxy: resolved.proxy
+  });
+}
+
+function hasMaxOutputTokens(request: SummaryProviderCall['request']): boolean {
+  return typeof request.generationConfig?.maxOutputTokens === 'number';
+}
+
+function withoutMaxOutputTokens(request: SummaryProviderCall['request']): SummaryProviderCall['request'] {
+  if (!hasMaxOutputTokens(request)) return request;
+  const generationConfig = { ...request.generationConfig };
+  delete generationConfig.maxOutputTokens;
+  const next = { ...request };
+  if (Object.keys(generationConfig).length > 0) next.generationConfig = generationConfig;
+  else delete next.generationConfig;
+  return next;
+}
+
+function withMaxOutputTokens(
+  request: SummaryProviderCall['request'],
+  maxOutputTokens: number
+): SummaryProviderCall['request'] {
+  return {
+    ...request,
+    generationConfig: { ...(request.generationConfig ?? {}), maxOutputTokens }
+  };
+}
+
+function isUnsupportedMaxOutputTokensError(error: unknown): boolean {
+  const text = summaryErrorSearchText(error);
+  return text.includes('max_output_tokens')
+    && (text.includes('unsupported parameter') || text.includes('unknown parameter') || text.includes('not supported'));
+}
+
+function isMaxOutputTokensIncompleteError(error: unknown): boolean {
+  const text = summaryErrorSearchText(error);
+  return text.includes('max_output_tokens')
+    && (text.includes('incomplete') || text.includes('exhaust') || text.includes('limit'));
+}
+
+function summaryErrorSearchText(error: unknown): string {
+  const failure = error instanceof LlmAttemptFailureError
+    ? stringifyJson(toPlainJsonLike(error.failure))
+    : '';
+  return `${errorSearchText(error)}\n${failure}`.toLowerCase();
 }
 
 interface GeneratedSummaryTextResult { text: string; settings?: LlmProviderConfigRecord }
@@ -1533,24 +1844,7 @@ async function generateSummaryText(
   if (!resolved.provider) return { text: deterministicSummary(request.contents), settings: resolved.settings };
 
   const summaryRequest = buildSummaryProviderCall(request, methodConfig, resolved.settings).request;
-
-  if (resolved.stream) {
-    let text = '';
-    for await (const chunk of resolved.provider.chatStream<UnifiedLLMStreamChunk>(summaryRequest, { inputFormat: 'unified', outputFormat: 'unified', signal })) {
-      if (hasUnifiedError(chunk)) {
-        throw new LlmAttemptFailureError(failureFromProviderError(chunk.error, { rawChunk: (chunk as { rawChunk?: unknown }).rawChunk ?? chunk }));
-      }
-      text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
-    }
-    return { text: text.trim() || deterministicSummary(request.contents), settings: resolved.settings };
-  }
-
-  const response = await resolved.provider.chat<UnifiedLLMResponse>(summaryRequest, { inputFormat: 'unified', outputFormat: 'unified', signal });
-  if (hasUnifiedError(response)) {
-    throw new LlmAttemptFailureError(failureFromProviderError(response.error, { rawResponse: response.rawResponse ?? response }));
-  }
-
-  const text = visibleTextFromParts(response.content?.parts ?? []).trim();
+  const text = (await executeSummaryProviderCall(resolved, summaryRequest, signal)).trim();
   return { text: text || deterministicSummary(request.contents), settings: resolved.settings };
 }
 
@@ -2333,7 +2627,7 @@ function createDoneTiming(
   finishedAt = Date.now(),
   firstChunkMark?: number,
   finishedMark?: number,
-  streamChunkCount = 0
+  _streamChunkCount = 0
 ): LlmDoneTiming {
   const rawDurationMs = firstChunkAt === undefined
     ? undefined
@@ -2341,8 +2635,8 @@ function createDoneTiming(
       ? finishedMark - firstChunkMark
       : finishedAt - firstChunkAt;
 
-  const streamOutputDurationMs = streamChunkCount >= 3 && rawDurationMs !== undefined && rawDurationMs >= 2
-    ? Math.round(rawDurationMs)
+  const streamOutputDurationMs = rawDurationMs !== undefined
+    ? Math.max(0, Math.round(rawDurationMs))
     : undefined;
 
   return {
@@ -2389,7 +2683,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function hasStreamTimingChunk(chunk: UnifiedLLMStreamChunk): boolean {
-  return hasStreamOutput(chunk) || hasThoughtOutput(chunk);
+  return hasStreamOutput(chunk)
+    || hasThoughtOutput(chunk)
+    || ((chunk as LimCodeOpenAIResponsesStreamChunk).toolCallArgumentDeltas?.length ?? 0) > 0;
 }
 
 function hasThoughtOutput(chunk: UnifiedLLMStreamChunk): boolean {

@@ -11,6 +11,7 @@ import type {
   GlobalSettingsSection,
   GlobalSettingsSectionValue,
   LlmCompressionConfigsRecord,
+  LlmCompressionConfigRecord,
   LlmCompressionSettingsRecord,
   LlmProviderConfigRecord,
   LlmProviderConfigsRecord,
@@ -34,6 +35,7 @@ import type {
   WorkflowRecord
 } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
+import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
 import {
   loadLlmCompressionConfigsSettings,
@@ -89,6 +91,8 @@ interface ConfigurationRecords {
   conversationWorkEnvironmentLinks: ConversationWorkEnvironmentLinkRecord[];
   providerConfigs: LlmProviderConfigRecord[];
   activeProviderConfigId: string;
+  compressionConfigs: LlmCompressionConfigRecord[];
+  compressionSettings: LlmCompressionSettingsRecord;
 }
 
 /** 每次 operation 重新经 getPaths 解析 settings authority；不读取或写入 Runtime SQLite。 */
@@ -135,11 +139,20 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       (link) => link.modelProfileId
     );
     const builtinModel = builtinWorkflow?.model ?? builtinAgent?.model;
-    const providerConfigId = modelProfile?.providerConfigId?.trim() || records.activeProviderConfigId;
-    const provider = records.providerConfigs.find((config) => config.id === providerConfigId)
-      ?? records.providerConfigs[0];
+    const requestedModel = request.modelOverride;
+    const providerConfigId = requestedModel
+      ? requestedModel.providerConfigId?.trim()
+      : modelProfile?.providerConfigId?.trim() || records.activeProviderConfigId;
+    const provider = resolveRequestedProvider(records.providerConfigs, {
+      providerConfigId,
+      providerKind: requestedModel?.provider,
+      modelId: requestedModel?.model
+    });
     if (!provider) throw new Error('没有可用的 LLM Provider 配置。');
-    const modelId = modelProfile?.model?.trim() || builtinModel?.model?.trim() || provider.model?.trim();
+    const modelId = requestedModel?.model?.trim()
+      || modelProfile?.model?.trim()
+      || builtinModel?.model?.trim()
+      || provider.model?.trim();
     if (!modelId) throw new Error(`Provider ${provider.id} 没有可用模型。`);
     if (!providerContainsModel(provider, modelId)) {
       throw new Error(`Provider ${provider.id} 不包含 ModelProfile 冻结的模型 ${modelId}。`);
@@ -152,13 +165,34 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       (link) => link.planReviewPolicyId
     );
     const builtinPlanReviewPolicy = builtinWorkflow?.planReviewPolicy;
-    const toolPolicy = resolveScopedRecord(
-      records.toolPolicyScopeLinks,
-      records.toolPolicies,
-      scopesHighToLow,
-      (link) => link.toolPolicyId
-    );
-    const builtinToolPolicy = builtinWorkflow?.toolPolicy ?? builtinAgent?.toolPolicy;
+    const toolPolicyLayers: ToolPolicyLayer[] = [];
+    for (const scope of scopesLowToHigh) {
+      const configured = resolveRecordAtScope(
+        records.toolPolicyScopeLinks,
+        records.toolPolicies,
+        scope,
+        (link) => link.toolPolicyId
+      );
+      if (configured) {
+        toolPolicyLayers.push({ scopeKind: scope.scopeKind, policy: configured });
+        continue;
+      }
+      const builtin = scope.scopeKind === 'agent'
+        ? builtinAgent?.toolPolicy
+        : scope.scopeKind === 'workflow'
+          ? builtinWorkflow?.toolPolicy
+          : undefined;
+      if (builtin) {
+        toolPolicyLayers.push({
+          scopeKind: scope.scopeKind,
+          policy: {
+            allowedTools: builtin.allowedTools,
+            toolConfigs: builtin.toolConfigs
+          }
+        });
+      }
+    }
+    const toolPolicy = resolveToolPolicyLayers(toolPolicyLayers);
     const skillPolicy = resolveScopedRecord(
       records.skillPolicyScopeLinks,
       records.skillPolicies,
@@ -216,13 +250,9 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const selectedModelConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId);
     const contextWindow = resolveContextWindow(provider, modelId);
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
-    const compressionThresholdTokens = Math.max(
-      1_000,
-      contextWindow - Math.min(20_000, Math.floor(contextWindow * 0.2))
-    );
-    const allowedTools = [...new Set(
-      toolPolicy?.allowedTools ?? builtinToolPolicy?.allowedTools ?? []
-    )].sort();
+    const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
+    const compressionThresholdTokens = compression.thresholdTokens;
+    const allowedTools = toolPolicy.allowedTools;
     const availableWorkEnvironmentIds = records.workEnvironments
       .filter((environment) => environment.available)
       .map((environment) => environment.id);
@@ -261,7 +291,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       ...(request.sourceTurnId ? { sourceTurnId: request.sourceTurnId } : {}),
       model: {
         providerConfigId: provider.id,
-        provider: modelProfile?.provider ?? builtinModel?.provider ?? provider.provider,
+        provider: provider.provider,
         modelId,
         enableMultimodalTools
       },
@@ -271,6 +301,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         contextWindowTokens: contextWindow,
         tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
       },
+      compression: compression.snapshot,
       planReviewPolicy: {
         id: planReviewPolicy?.id ?? builtinPlanReviewPolicy?.id ?? null,
         mode: planReviewPolicy?.mode ?? builtinPlanReviewPolicy?.mode ?? 'off',
@@ -278,11 +309,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         requireForToolRiskLevels: [...(planReviewPolicy?.requireForToolRiskLevels ?? builtinPlanReviewPolicy?.requireForToolRiskLevels ?? [])]
       },
       toolPolicy: {
-        id: toolPolicy?.id ?? null,
+        id: toolPolicy.id,
         allowedTools,
-        preset: toolPolicy?.preset ?? 'custom',
-        toolConfigs: clonePlainRecord(toolPolicy?.toolConfigs ?? builtinToolPolicy?.toolConfigs),
-        sourceConfigs: clonePlainRecord(toolPolicy?.sourceConfigs)
+        preset: toolPolicy.preset,
+        toolConfigs: toolPolicy.toolConfigs,
+        sourceConfigs: toolPolicy.sourceConfigs
       },
       skillPolicy: {
         id: skillPolicy?.id ?? null,
@@ -403,13 +434,13 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
 
   public async workEnvironment(workEnvironmentId: string): Promise<WorkEnvironmentRecord> {
     const id = requireId(workEnvironmentId, 'workEnvironmentId');
-    const environment = (await this.loadRecords()).workEnvironments.find((candidate) => candidate.id === id);
+    const environment = (await this.loadWorkEnvironments()).find((candidate) => candidate.id === id);
     if (!environment) throw new Error(`工作环境配置不存在：${id}`);
     return { ...environment };
   }
 
   public async workEnvironments(): Promise<WorkEnvironmentRecord[]> {
-    return (await this.loadRecords()).workEnvironments.map((environment) => ({ ...environment }));
+    return (await this.loadWorkEnvironments()).map((environment) => ({ ...environment }));
   }
 
   public async loadGlobalSettings(section: GlobalSettingsSection): Promise<{
@@ -538,6 +569,15 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     return this.context;
   }
 
+  private async loadWorkEnvironments(): Promise<WorkEnvironmentRecord[]> {
+    const paths = this.getPaths();
+    return (await loadRecordStore<WorkEnvironmentRecord, 'workEnvironment'>(
+      paths.workEnvironmentsRootUri,
+      paths.workEnvironmentsIndexUri,
+      'workEnvironment'
+    )) ?? [];
+  }
+
   private async loadRecords(): Promise<ConfigurationRecords> {
     const paths = this.getPaths();
     const [
@@ -563,7 +603,9 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       conversationWorkflowSelections,
       conversationWorkEnvironmentLinks,
       providerConfigs,
-      llmSelection
+      llmSelection,
+      compressionConfigs,
+      compressionSelection
     ] = await Promise.all([
       loadRecordStore<AgentRecord, 'agent'>(paths.agentsRootUri, paths.agentsIndexUri, 'agent'),
       loadRecordStore<WorkflowRecord, 'workflow'>(paths.workflowsRootUri, paths.workflowsIndexUri, 'workflow'),
@@ -659,7 +701,9 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         'link'
       ),
       loadLlmProviderConfigsSettings(paths),
-      loadGlobalSettingsFile(paths.settingsRootUri, 'llm')
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llm'),
+      loadLlmCompressionConfigsSettings(paths),
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llmCompression')
     ]);
     return {
       agents: mergeAgentsWithBuiltins(agents ?? []),
@@ -684,9 +728,106 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       conversationWorkflowSelections: conversationWorkflowSelections ?? [],
       conversationWorkEnvironmentLinks: conversationWorkEnvironmentLinks ?? [],
       providerConfigs: providerConfigs.settings.configs,
-      activeProviderConfigId: (llmSelection.settings as LlmSettingsRecord).activeProviderConfigId
+      activeProviderConfigId: (llmSelection.settings as LlmSettingsRecord).activeProviderConfigId,
+      compressionConfigs: compressionConfigs.settings.configs,
+      compressionSettings: normalizeLlmCompressionSettings(
+        compressionSelection.settings as Partial<LlmCompressionSettingsRecord> | undefined,
+        compressionConfigs.settings.configs
+      )
     };
   }
+}
+
+interface FrozenCompressionResolution {
+  thresholdTokens: number;
+  snapshot: Record<string, unknown>;
+}
+
+/** Resolves the exact model/provider/default binding once and freezes a credential-free replay document. */
+function resolveFrozenCompression(
+  records: ConfigurationRecords,
+  primaryProvider: LlmProviderConfigRecord,
+  primaryModelId: string,
+  contextWindowTokens: number
+): FrozenCompressionResolution {
+  const modelBinding = latestUpdated(records.compressionSettings.modelBindings.filter((binding) =>
+    binding.providerConfigId === primaryProvider.id && binding.modelId === primaryModelId
+  ));
+  const providerBinding = latestUpdated(records.compressionSettings.providerBindings.filter((binding) =>
+    binding.providerConfigId === primaryProvider.id
+  ));
+  const compressionConfigId = modelBinding?.compressionConfigId
+    ?? providerBinding?.compressionConfigId
+    ?? records.compressionSettings.defaultConfigId;
+  const config = records.compressionConfigs.find((candidate) => candidate.id === compressionConfigId)
+    ?? records.compressionConfigs[0];
+  if (!config) throw new Error('没有可用的 LLM 压缩配置。');
+
+  const providerOverride = config.kind === 'openai_responses_compact'
+    ? config.openaiResponsesCompact
+    : config.llmSummary;
+  const compressionProviderId = providerOverride?.providerConfigId?.trim() || primaryProvider.id;
+  const compressionProvider = records.providerConfigs.find((candidate) => candidate.id === compressionProviderId);
+  if (!compressionProvider) {
+    throw new Error(`压缩配置 ${config.id} 引用了不存在的 Provider ${compressionProviderId}。`);
+  }
+  const compressionModelId = providerOverride?.model?.trim()
+    || (compressionProvider.id === primaryProvider.id ? primaryModelId : compressionProvider.model.trim());
+  if (!compressionModelId || !providerContainsModel(compressionProvider, compressionModelId)) {
+    throw new Error(`压缩配置 ${config.id} 的 Provider ${compressionProvider.id} 不包含模型 ${compressionModelId || '(空)'}。`);
+  }
+  const trigger = clonePlain(config.trigger);
+  const rawThreshold = trigger.thresholdUnit === 'tokens'
+    ? trigger.thresholdTokens
+    : trigger.thresholdUnit === 'percent'
+      ? Math.floor(contextWindowTokens * (trigger.thresholdPercent ?? 90) / 100)
+      : undefined;
+  const thresholdTokens = Math.max(1, Math.min(
+    contextWindowTokens,
+    Number.isSafeInteger(rawThreshold) && (rawThreshold ?? 0) > 0
+      ? rawThreshold!
+      : Math.floor(contextWindowTokens * 0.9)
+  ));
+  const frozenConfig: LlmCompressionConfigRecord = clonePlain(config);
+  if (frozenConfig.kind === 'openai_responses_compact') {
+    frozenConfig.openaiResponsesCompact = {
+      ...(frozenConfig.openaiResponsesCompact ?? {}),
+      providerConfigId: compressionProvider.id,
+      model: compressionModelId
+    };
+  } else if (!['disabled', 'deterministic_summary', 'manual_summary'].includes(frozenConfig.kind)) {
+    frozenConfig.llmSummary = {
+      ...(frozenConfig.llmSummary ?? {}),
+      providerConfigId: compressionProvider.id,
+      model: compressionModelId
+    };
+  }
+  return {
+    thresholdTokens,
+    snapshot: {
+      enabled: frozenConfig.kind !== 'disabled',
+      binding: modelBinding
+        ? { kind: 'model', id: modelBinding.id }
+        : providerBinding
+          ? { kind: 'provider', id: providerBinding.id }
+          : { kind: 'default', id: records.compressionSettings.defaultConfigId ?? null },
+      config: frozenConfig,
+      methodKind: frozenConfig.kind,
+      trigger,
+      thresholdTokens,
+      preserveLatestMessages: Math.max(0, Math.floor(trigger.preserveLatestMessages ?? 0)),
+      provider: {
+        providerConfigId: compressionProvider.id,
+        provider: compressionProvider.provider,
+        modelId: compressionModelId
+      }
+    }
+  };
+}
+
+function latestUpdated<T extends { id: string; updatedAt: number; createdAt: number }>(items: readonly T[]): T | undefined {
+  return [...items].sort((left, right) => right.updatedAt - left.updatedAt
+    || right.createdAt - left.createdAt || right.id.localeCompare(left.id))[0];
 }
 
 function mergeAgentsWithBuiltins(configured: AgentRecord[]): AgentRecord[] {
@@ -786,6 +927,34 @@ function latestScopedSelection<T extends { id: string; createdAt: number; update
   return [...records].sort((left, right) => right.updatedAt - left.updatedAt
     || right.createdAt - left.createdAt
     || right.id.localeCompare(left.id))[0];
+}
+
+function resolveRequestedProvider(
+  providers: readonly LlmProviderConfigRecord[],
+  input: { providerConfigId?: string; providerKind?: LlmProviderConfigRecord['provider']; modelId?: string }
+): LlmProviderConfigRecord | undefined {
+  const providerConfigId = input.providerConfigId?.trim();
+  if (providerConfigId) {
+    const provider = providers.find((candidate) => candidate.id === providerConfigId);
+    if (!provider) throw new Error(`LLM Provider 配置不存在：${providerConfigId}`);
+    if (input.providerKind && provider.provider !== input.providerKind) {
+      throw new Error(`LLM Provider ${providerConfigId} 的类型与请求的 ${input.providerKind} 不一致。`);
+    }
+    return provider;
+  }
+
+  const modelId = input.modelId?.trim();
+  const matching = providers.filter((provider) =>
+    (!input.providerKind || provider.provider === input.providerKind)
+    && (!modelId || providerContainsModel(provider, modelId))
+  );
+  if (matching.length > 1 && (input.providerKind || modelId)) {
+    throw new Error('模型选择匹配多个 Provider 配置；TurnStart 必须携带 providerConfigId。');
+  }
+  if (matching.length === 0 && (input.providerKind || modelId)) {
+    throw new Error(`没有 Provider 配置支持请求的模型 ${modelId || '(未指定)'}。`);
+  }
+  return matching[0] ?? providers[0];
 }
 
 function resolveContextWindow(provider: LlmProviderConfigRecord, modelId: string): number {

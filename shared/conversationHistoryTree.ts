@@ -1,4 +1,5 @@
 import type {
+  ConversationHistoryScope,
   ConversationOriginLinkRecord,
   SidebarConversationHistoryEntry
 } from './protocol';
@@ -9,6 +10,24 @@ export interface ConversationHistoryTreeNode {
   parentConversationId?: string;
   children: ConversationHistoryTreeNode[];
   latestUpdatedAt: number;
+}
+
+export function filterConversationHistoryEntriesByScope(
+  entries: readonly SidebarConversationHistoryEntry[],
+  scope: ConversationHistoryScope
+): SidebarConversationHistoryEntry[] {
+  return entries.filter((entry) => {
+    if (scope.kind === 'all') return true;
+    if (scope.kind === 'unbound') return !entry.projectFolderUri;
+    return entry.projectFolderUri === scope.folderUri;
+  });
+}
+
+export interface ConversationHistoryDescendantAgentSummary {
+  running: number;
+  awaitingParent: number;
+  interrupted: number;
+  deliveryFailed: number;
 }
 
 /**
@@ -109,6 +128,29 @@ export function packConversationHistoryForestIntoPages(
   }
   flush();
   return pages;
+}
+
+/** Aggregate descendant Agent lifecycle/delivery facts without rewriting the root Conversation. */
+export function summarizeDescendantAgents(
+  node: ConversationHistoryTreeNode
+): ConversationHistoryDescendantAgentSummary {
+  const summary: ConversationHistoryDescendantAgentSummary = {
+    running: 0,
+    awaitingParent: 0,
+    interrupted: 0,
+    deliveryFailed: 0
+  };
+  const visit = (candidate: ConversationHistoryTreeNode): void => {
+    if (candidate.originLink?.originKind === 'agent') {
+      if (candidate.entry.runState === 'running' || candidate.entry.isRunning) summary.running += 1;
+      else if (candidate.entry.runState === 'awaiting_parent') summary.awaitingParent += 1;
+      else if (candidate.entry.runState === 'interrupted') summary.interrupted += 1;
+      else if (candidate.entry.runState === 'delivery_failed') summary.deliveryFailed += 1;
+    }
+    for (const child of candidate.children) visit(child);
+  };
+  for (const child of node.children) visit(child);
+  return summary;
 }
 
 /** 每个对话只选择最早建立的来源 Link，保持父级关系稳定。 */

@@ -1,7 +1,7 @@
 {
   "contractKind": "subagent",
   "contractRevision": "2026-07-31-r4",
-  "status": "planned",
+  "status": "active",
   "scope": "保留日常多Agent协作能力，用稳定子执行谱系、答案桥和运行时收件箱表达控制与交付。",
   "toolName": "run_agent",
   "operations": [
@@ -9,8 +9,7 @@
     "send",
     "wait",
     "list",
-    "cancel",
-    "cancel_subtree"
+    "interrupt_subtree"
   ],
   "lineage": {
     "domains": [
@@ -18,7 +17,11 @@
       "ChildExecutionParentLink",
       "ChildExecutionTurnLink",
       "ChildExecutionIntentLink",
-      "ChildExecutionActiveTurnLink"
+      "ChildExecutionActiveTurnLink",
+      "ChildInterruptionRequest",
+      "ChildInterruptionLineageLink",
+      "ChildInterruptionTurnLink",
+      "ChildInterruptionIntentLink"
     ],
     "identity": "ChildExecution 是一次稳定子代理谱系；首次 Turn、续接 Turn 和尚未 admit 的 TurnIntent 均通过独立 Link 归属它",
     "treeEdge": "ChildExecutionParentLink 是稳定树边；续接时不改 parent，后代不会因 active Turn 切换而丢失",
@@ -52,7 +55,16 @@
     "rule": "wait_for_answer可以在本地等待到期后转为后台返回控制句柄，子Turn继续运行；background在启动成功后立即返回控制句柄。",
     "failureSettlement": {
       "syncOrDispatchFailure": "同步创建失败或派发失败经EffectReceipt(failed) reconcile为ToolOutcome(failed)，生成唯一ToolModelResult，并终止已准备但未启动的child Turn。",
-      "unknownAfterDispatch": "已派发但无法核验时写outcome_unknown receipt，ChildExecution进入needs_human/terminated，不自动重复spawn。"
+      "unknownAfterDispatch": "已派发但无法核验时写outcome_unknown receipt，ChildExecution进入needs_human，不自动重复spawn。"
+    },
+    "localSchedulerRecovery": {
+      "membership": "ChildExecutionTurnLink 是不可变专属driver membership；普通Conversation Runner不得认领或驱动成员Turn。",
+      "pending": "subagent_spawn仍为pending时，恢复scheduler竞争唯一dispatch claim。",
+      "dispatched": "本地scheduler能力不创建第二个外部对象；dispatched但无receipt时按既有ChildExecution身份写唯一succeeded recovery receipt。",
+      "receiptWritten": "receipt_written只reconcile既有receipt，不重复spawn；随后按ExecutionLease host+generation竞争唯一child driver。",
+      "continuation": "pending ChildExecutionIntentLink在前一成员Turn终态后由同一scheduler以稳定source identity重新准入。",
+      "waitingWake": "等待态保存SQLite external data version；跨Host提交与显式delivery/interaction edge均路由到专属scheduler。若原lease已过期，wake先以generation CAS重领再drive，且提交竞逐waiting-slot发布时保留旧version以保证下一次level-trigger不丢失。",
+      "boundedPolling": "活动子Turn每500ms只做目标Turn取消检查；全历史recovery scan由数据版本变化触发、至少间隔2秒并保留5秒安全扫描，不在每个wake tick重复遍历全部历史。"
     }
   },
   "completionPolicyConsumption": {
@@ -98,19 +110,24 @@
       "AnswerSubmission"
     ],
     "bridgeOwner": "ChildExecution",
+    "continuationWaitOwner": "新 wait 使用 child_turn_answer_wait + 确定性 child Turn id；legacy answer_bridge_wait 只能通过 Operation/CommandReceipt/Intent/preset 精确恢复，不再生成。",
     "oneCurrentSubmissionPerBridge": true,
     "largeContent": "cas",
     "atomicCommit": "AnswerSubmission insert、AnswerBridge.current_submission_id update和RuntimeInboxItem insert在同一事务提交。",
     "dedupeKey": "answer:{answerBridgeId}:{submissionId}",
     "bridgeFlip": "bridge翻转到新submission后，旧submission已生成的pending RuntimeDelivery保留可交付，UI按submission分别展示。",
     "rule": "答案先成为ChildExecution对应AnswerBridge上的持久事实，再创建RuntimeInboxItem；父Turn是否正在运行不影响答案存在。",
-    "interruptedAnswer": "ChildExecution当前Turn被中断时，提取已积累的部分结果作为答案正文入库，submission标interrupted=true；父消费后当弱信号处理。"
+    "generationAuthority": "普通提交必须由AnswerSubmission.turn_id指向当前ActiveTurnLink的精确Child Turn，且ChildExecution=active、Turn无Termination；旧generation的新submission永久拒绝。",
+    "replayRule": "已持久化的完全相同callback可作为历史幂等查询返回，但若Bridge已重开到新generation，historicalReplay不得再次结算wait或创建delivery。",
+    "interruptedAnswer": "内部recovery API只允许最新已中断Turn、ChildExecution=interrupting/interrupted、无ActiveTurnLink且Bridge为空时提取部分结果；不能覆盖final，也不能污染续接generation。"
   },
   "delivery": {
     "domains": [
       "RuntimeInboxItem",
       "RuntimeDelivery",
-      "RuntimeDeliveryInputLink"
+      "RuntimeDeliveryInputLink",
+      "RuntimeDeliveryWake",
+      "TurnFinalOutputFence"
     ],
     "inboxBoundary": "RuntimeInboxItem只保存来源事实；目标Conversation、目标Turn、phase与attempt都属于RuntimeDelivery。",
     "phases": [
@@ -126,9 +143,8 @@
     "deadLetterQueue": false,
     "targetGone": "目标Conversation/Turn不存在时，RuntimeInboxItem保留为事实，RuntimeDelivery置failed(reason=target-gone)。",
     "identity": {
-      "attemptSeq": "每个inbox+destination+phase从1开始",
-      "targetNullUnique": "(inbox_item_id,target_conversation_id,phase,attempt_seq) UNIQUE WHERE target_turn_id IS NULL",
-      "targetPresentUnique": "(inbox_item_id,target_conversation_id,target_turn_id,phase,attempt_seq) UNIQUE WHERE target_turn_id IS NOT NULL",
+      "attemptSeq": "每个inbox+destination从1开始，phase/target不参与attempt身份",
+      "logicalUnique": "(inbox_item_id,target_conversation_id,attempt_seq) UNIQUE；并发路由判定只能产生一个初始attempt=1",
       "redeliver": "用户明确重投时创建attempt_seq+1的新RuntimeDelivery并写retry_of_delivery_id；旧failed行不复活"
     },
     "nextTurnTarget": {
@@ -143,7 +159,7 @@
         {
           "phase": "current_turn",
           "targetTurn": "terminated",
-          "action": "按当前可注入性改投：可注入新Turn则转next_turn(target_turn_id=NULL)，否则转notify_only"
+          "action": "读取精确TurnTermination：completed转next_turn(target_turn_id=NULL)，interrupted/cancelled/failed/outcome_unknown转notify_only"
         },
         {
           "phase": "next_turn",
@@ -158,7 +174,7 @@
         {
           "phase": "next_turn",
           "targetTurn": "terminated",
-          "action": "按当前可注入性改投新Turn(next_turn)或notify_only"
+          "action": "不得按任意当前活动Turn重算来源；沿冻结source authority判定completed续接或非成功终态notify_only"
         },
         {
           "phase": "notify_only",
@@ -168,7 +184,7 @@
       ]
     },
     "parentTurnRecovery": "父Turn重启后的恢复判定以identity.json recoveryJudgment节为唯一权威。",
-    "rule": "当前Turn可以安全接收时注入本轮，否则进入下一轮或只通知；失败保留原因，人工重投创建新attempt。"
+    "rule": "统一自动路由仅允许active source精确current_turn、completed source进入next_turn，interrupted/cancelled/failed/outcome_unknown只通知；TurnFinalOutputFence后不得续写已展示最终回答。Child source还必须是该ChildExecution最新generation且未处于interrupting/interrupted/永久终态。pending或consumed-but-unhandled Delivery由持久RuntimeDeliveryWake跨Host唤醒owner，失败保留原因，人工重投创建新attempt；wake达到有界dead-letter时同步把仍pending的Delivery置failed，若已consumed但未handled则历史投影读取dead-letter事实显示答案交付失败，不得永久显示等待接收。"
   },
   "parentHandling": {
     "source": "RuntimeDelivery.state + RuntimeDeliveryInputLink.handled_at",
@@ -231,12 +247,17 @@
     "consumedSemantics": "consumed是持久化注入ACK；handled_at才是父执行器已吸收对应输入的持久事实。",
     "interruptedSignalRule": "消费interrupted=true答案并写handled_at后仍为handled，但UI必须显示中断态弱信号。"
   },
-  "cancel": {
-    "single": "向ChildExecutionActiveTurnLink指向的目标Turn发出正常终止命令",
-    "subtree": "从目标ChildExecution沿ChildExecutionParentLink递归枚举全部后代；同一事务对所有ActiveTurnLink目标写终止意图，并把所有pending ChildExecutionIntentLink置cancelled",
+  "interrupt": {
+    "subtree": "从目标ChildExecution沿ChildExecutionParentLink递归枚举全部后代；同一事务冻结ChildInterruptionRequest及精确lineage/Turn/Intent target，对这些ActiveTurnLink目标写termination_request，并把这些pending ChildExecutionIntentLink置cancelled。",
+    "replay": "相同命令只读取冻结target集，不能重新扫描并中断后来续接的generation。",
+    "ownedProcessCleanup": "仅ChildInterruptionTurnLink冻结的Turn可沿ProcessCompletionSourceLink生成持久cleanup outbox；普通父ESC和普通interrupt_current_turn不清理detached process。",
+    "parentAbortBeforeSpawn": "统一AbortSignal在durable spawn前只把来源ToolCall结算为cancelled，不创建ChildExecution。",
+    "parentAbortAfterSpawn": "非cascade父Turn取消只关闭foreground waiting_answer；已经建立的ChildExecution/continuation由专属scheduler转后台继续。",
+    "hostHandoff": "ExecutionHandoffError不伪造cancelled ToolOutcome；保留持久spawn/wait/lease事实给下一Host恢复。",
     "requestIsTerminal": false,
     "lateAnswer": "答案仍可保存，但不会重新打开已结束的父Turn；中断时提取部分结果标interrupted入库。",
-    "restartSweep": "重启后续扫已写子树终止意图但仍有active Turn或pending Intent的lineage并补写终止/取消。"
+    "restartSweep": "重启后续扫interrupting lineage并补写终止/取消；最后一个目标Turn终态后lineage进入可恢复interrupted并消费悬空continuation input；若Host在lineage事务与父侧ToolOutcome之间崩溃，依据interrupting/interrupted ChildExecution、AnswerBridge与waiting_answer Operation补结算等待。",
+    "partialAnswer": "取消终态若尚无AnswerSubmission，则以稳定submission identity提取已持久化可见输出或明确空部分结果，写interrupted=true并走同一RuntimeDelivery链。"
   },
   "recoveryOwnership": {
     "stage": "F",
@@ -244,7 +265,7 @@
       "recovery.answer-inbox-invariant",
       "recovery.delivery-pending",
       "recovery.foreground-answer-wait-expired",
-      "recovery.cancelled-subtree-incomplete"
+      "recovery.interrupted-subtree-incomplete"
     ],
     "rule": "D 只提供通用 scanner 框架并实现 D owner 项；以上四项只由 F 注册与实现。"
   },
@@ -262,6 +283,6 @@
     "display-text"
   ],
   "releaseDecisions": {
-    "cancelSubtree": "required-first-release"
+    "interruptSubtree": "required-first-release"
   }
 }

@@ -14,9 +14,10 @@
 - ask_user 复用 Tool/Interaction/OutcomePause/OperationResolution，不建 AskUser table；
 - task list 继续作为 update_task_list Tool facts，F 从事实派生 UI；
 - 允许无冲突只读或 independent effect tools 并行；
-- 建立 detached wrapper、bounded spool、stable nonce/process group/start fingerprint 与 atomic exit receipt；
-- ProcessOutputChunk metadata 入 SQLite、正文入 CAS；reader按manifest稳定前缀合并CAS/spool并核对完整覆盖，terminal counters不得倒退；wrapper按250ms合并flush；
+- 建立 detached wrapper、durable append-only spool、stable nonce/process group/start fingerprint 与 atomic exit receipt；
+- ProcessOutputChunk metadata 入 SQLite、正文入 CAS；登记按 `processId+chunkSeq` keyset与单事务wire bytes持续分批直至完整收敛，不设每进程总量cap；`mode=output` 用opaque handle分页完整遍历，不把全历史一次性 `Buffer.concat`；terminal counters不得倒退；wrapper按250ms合并flush；
 - MCP settings 继续位于 settings root，connection memory-only 重建；风险只取registry权威annotations，明确policy拒绝持久收口，每次获批调用创建 `mcp_tool_call` EffectIntent/Receipt；
+- WorkEnvironment `transfer` 通过 `file_transfer` EffectIntent/Receipt 执行；派发后无回执的恢复结果只能是 `outcome_unknown`，禁止自动重试外部文件写入；Turn authority 关闭环境切换时不暴露 transfer/switch，跨环境 switch 不得伪造当前 Turn 已切换；
 - 建立通用 recovery scanner framework，但只注册 D owner 项。
 
 ## D recovery owner
@@ -33,14 +34,17 @@ AnswerSubmission/Inbox、pending Delivery、foreground answer wait 与 cancelled
 ## 后台进程恢复边界
 
 - Extension Host 不把 Node child pipe 当跨重启 authority；
-- wrapper 必须持续 drain；达到 retained limit 后丢弃后续正文但继续 drain；
+- wrapper 必须持续 drain 并保存全部已发布正文；64KiB只作为单chunk边界，不能作为进程总量截断；
 - valid wrapper exit receipt 才能产生真实 exit code；
 - wrapper 不可达且无 valid receipt → outcome_unknown；
 - stop 只有 nonce/fingerprint/process group 全匹配时才允许；
 - 禁止凭裸 PID stop，禁止把 owner loss 伪造成 abnormal/exitCode=1；
+- detached `process_exit` 的 ProcessReceipt 必须同事务创建 ProcessCompletionDispatch；dispatcher 只扫描 pending/claimed outbox，按 host owner/generation fence、next-attempt 退避与 dead-letter 收敛，不能反复全表扫描历史 Receipt；
+- completion selector 只接受 `tool_call_id IS NULL` 且 Attempt 的 EffectIntent 为 `process_exit` 的 Operation；`stop_process` 附带 Operation 必须忽略；
+- ProcessCompletionSourceLink 与 CAS completion payload 在来源 Turn/ToolCall 删除前冻结路由；RuntimeDeliveryWake 先 claim 后调用幂等 continuation/resume/notification，ACK 响应丢失时读取已提交终态；
 - 不建设 daemon/broker 或全局多租户 quota platform。
 
-精确 limits 与 fields 只在 `contracts/tool.json#processOutput` 定义。
+精确单chunk、事务wire与单页边界只在 `contracts/tool.json#processOutput` 定义；它们均不是历史总量上限。
 
 ## MCP 边界
 
@@ -57,7 +61,7 @@ AnswerSubmission/Inbox、pending Delivery、foreground answer wait 与 cancelled
 - FileChangeSet 不作为最终模型结果；
 - file applied 但 Conversation callback 失败时可凭 receipt reconcile；
 - Attachment ingest/on-demand read/CAS link 通过；
-- wrapper restart、真实 exit code、safe stop 与 output truncation fault tests 通过；
+- wrapper restart、真实 exit code、safe stop、无总量截断的分批登记与output handle完整遍历 fault tests 通过；
 - MCP read/write/unknown outcome 与 no-auto-retry tests 通过；
 - `recovery.effect-intent-hanging`、`recovery.file-change-unresolved` 各有独立 candidate handler；
 - F 的四个 recovery ID 在本阶段没有 handler；

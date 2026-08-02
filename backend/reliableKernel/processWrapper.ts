@@ -4,8 +4,6 @@ import * as path from 'node:path';
 import {
   PROCESS_OUTPUT_MAX_CHUNK_BYTES,
   PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS,
-  PROCESS_OUTPUT_MAX_RETAINED_BYTES,
-  PROCESS_OUTPUT_MAX_RETAINED_CHUNKS,
   PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM,
   PROCESS_WRAPPER_CHUNKS_DIRECTORY,
   PROCESS_WRAPPER_EXIT_RECEIPT_FILE,
@@ -44,11 +42,6 @@ interface WrapperState {
   stdout: StreamState;
   stderr: StreamState;
 }
-
-const REGULAR_BYTES_BUDGET = BigInt(
-  PROCESS_OUTPUT_MAX_RETAINED_BYTES - (2 * PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM)
-);
-const REGULAR_CHUNKS_BUDGET = BigInt(PROCESS_OUTPUT_MAX_RETAINED_CHUNKS - 2);
 
 if (require.main === module) {
   runWrapper(process.argv[2]).catch((error) => {
@@ -183,21 +176,7 @@ function retainOutput(state: WrapperState, streamKind: ProcessStreamKind, bytes:
 function retainRegularBytes(state: WrapperState, streamKind: ProcessStreamKind, bytes: Buffer): void {
   let offset = 0;
   while (offset < bytes.length) {
-    const bytesRemaining = REGULAR_BYTES_BUDGET - state.retainedBytes;
-    const chunksRemaining = REGULAR_CHUNKS_BUDGET - state.retainedChunks;
-    if (bytesRemaining <= 0n || chunksRemaining <= 0n) {
-      const dropped = BigInt(bytes.length - offset);
-      state.droppedBytes += dropped;
-      state.truncated = state.truncated || dropped > 0n;
-      return;
-    }
-    const length = Math.min(
-      PROCESS_OUTPUT_MAX_CHUNK_BYTES,
-      bytes.length - offset,
-      Number(bytesRemaining > BigInt(PROCESS_OUTPUT_MAX_CHUNK_BYTES)
-        ? BigInt(PROCESS_OUTPUT_MAX_CHUNK_BYTES)
-        : bytesRemaining)
-    );
+    const length = Math.min(PROCESS_OUTPUT_MAX_CHUNK_BYTES, bytes.length - offset);
     writeChunk(state, streamKind, bytes.subarray(offset, offset + length));
     offset += length;
   }
@@ -207,21 +186,7 @@ function retainTerminalTail(state: WrapperState, streamKind: ProcessStreamKind):
   const stream = state[streamKind];
   const tail = stream.tail;
   if (tail.length === 0) return;
-  const totalBytesLimit = BigInt(PROCESS_OUTPUT_MAX_RETAINED_BYTES);
-  const totalChunksLimit = BigInt(PROCESS_OUTPUT_MAX_RETAINED_CHUNKS);
-  const availableBytes = totalBytesLimit - state.retainedBytes;
-  if (availableBytes <= 0n || state.retainedChunks >= totalChunksLimit) {
-    state.droppedBytes += BigInt(tail.length);
-    state.truncated = true;
-    stream.tail = Buffer.alloc(0);
-    return;
-  }
-  const length = Math.min(tail.length, Number(availableBytes));
-  writeChunk(state, streamKind, tail.subarray(tail.length - length));
-  if (length < tail.length) {
-    state.droppedBytes += BigInt(tail.length - length);
-    state.truncated = true;
-  }
+  writeChunk(state, streamKind, tail);
   stream.tail = Buffer.alloc(0);
 }
 
@@ -234,10 +199,6 @@ function writeChunk(state: WrapperState, streamKind: ProcessStreamKind, bytes: B
   state.nextChunkSeq += 1n;
   state.retainedBytes += BigInt(bytes.length);
   state.retainedChunks += 1n;
-  if (
-    state.retainedBytes > BigInt(PROCESS_OUTPUT_MAX_RETAINED_BYTES)
-    || state.retainedChunks > BigInt(PROCESS_OUTPUT_MAX_RETAINED_CHUNKS)
-  ) throw new Error('Process wrapper exceeded frozen retention bounds.');
 }
 
 function observeStopRequest(state: WrapperState): void {

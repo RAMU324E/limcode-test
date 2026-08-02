@@ -75,6 +75,7 @@ export const readFileTool: ToolDefinition = {
         return { ok: true, status: 'warning', output: multimodalDisabledMessage(mimeType) };
       }
       const file = await deps.fs.readBinaryFile(args.path, mimeType, {
+        signal: ctx?.signal,
         workEnvironment: ctx?.workEnvironment,
         accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
         allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true)
@@ -97,6 +98,7 @@ export const readFileTool: ToolDefinition = {
       return { ok: false, output: `Cannot read ${mimeType} as UTF-8 text. Use mode="attachment" for ${args.path}.` };
     }
     const text = await deps.fs.readFile(args.path, normalizeLineNumber(args.startLine), normalizeLineNumber(args.endLine), {
+      signal: ctx?.signal,
       workEnvironment: ctx?.workEnvironment,
       accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
       allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true)

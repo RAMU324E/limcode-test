@@ -108,6 +108,7 @@ function streamingPhase(): 'waiting' | 'thinking' | 'writing' {
 function withToolBatchMeta(inputNodes: RichRenderNode[]): RichRenderNode[] {
   const result = inputNodes.map((node) => ({ ...node, props: { ...node.props } }));
   let segment: ToolCallNodeInfo[] = [];
+  let functionOrdinal = 0;
 
   const flushSegment = (): void => {
     if (segment.length === 0) return;
@@ -118,6 +119,8 @@ function withToolBatchMeta(inputNodes: RichRenderNode[]): RichRenderNode[] {
   for (let index = 0; index < result.length; index += 1) {
     const node = result[index]!;
     if (node.kind === 'functionCall') {
+      node.props.toolOrdinal = functionOrdinal;
+      functionOrdinal += 1;
       const call = toolCallForNode(node);
       segment.push({
         nodeIndex: index,
@@ -189,10 +192,15 @@ function toolCallForNode(node: RichRenderNode): ToolCallRecord | undefined {
   if (!isFunctionCallPart(part as ContentPart)) return undefined;
   const functionCallPart = part as FunctionCallPart;
   const partId = functionCallPart.id;
-  const calls = reliableConversation.projection.value.toolCalls;
+  const calls = reliableConversation.projection.value.toolCallsByMessageId[props.messageId] ?? [];
+  const exact = partId
+    ? calls.find((call) => call.id === partId || call.functionCallId === partId)
+    : undefined;
+  if (exact) return exact;
+  const ordinal = typeof node.props.toolOrdinal === 'number' ? node.props.toolOrdinal : undefined;
   return calls.find((call) =>
-    call.messageId === props.messageId
-    && (partId ? call.id === partId || call.functionCallId === partId : call.name === functionCallPart.functionCall.name)
+    call.name === functionCallPart.functionCall.name
+    && (ordinal === undefined || call.schedulingOrdinal === ordinal)
   );
 }
 

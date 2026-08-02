@@ -25,7 +25,11 @@ const { displayedText } = useSmoothStreamingText(
 );
 const preview = computed(() => lastNonEmptyLine(displayedText.value) || '正在思考...');
 const tailText = computed(() => {
-  if (props.streaming) return `思考了 ${formatThoughtDuration(props.elapsedMs ?? 0)}`;
+  if (props.streaming) {
+    return typeof props.elapsedMs === 'number' && props.elapsedMs > 0
+      ? `思考了 ${formatThoughtDuration(props.elapsedMs)}`
+      : '思考中';
+  }
   return props.durationMs !== undefined ? `已思考 ${formatThoughtDuration(props.durationMs)}` : '思考完成';
 });
 

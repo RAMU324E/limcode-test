@@ -162,17 +162,18 @@ function scrollToBottom(): void {
   setScrollTop(maxScroll.value, 'smooth', true);
 }
 
-function findMarkerElement(markerId: string): HTMLElement | undefined {
+function markerElementsById(): Map<string, HTMLElement> {
   const element = props.scroller;
-  if (!element) return undefined;
-  return Array.from(element.querySelectorAll<HTMLElement>('[data-scroll-marker-id]')).find(
-    (candidate) => candidate.dataset.scrollMarkerId === markerId
-  );
+  if (!element) return new Map();
+  return new Map(Array.from(element.querySelectorAll<HTMLElement>('[data-scroll-marker-id]'))
+    .flatMap((candidate) => candidate.dataset.scrollMarkerId
+      ? [[candidate.dataset.scrollMarkerId, candidate] as const]
+      : []));
 }
 
-function targetTopForMarker(markerId: string): number | undefined {
+function targetTopForMarker(markerId: string, targets: ReadonlyMap<string, HTMLElement>): number | undefined {
   const element = props.scroller;
-  const target = findMarkerElement(markerId);
+  const target = targets.get(markerId);
   if (!element || !target) return undefined;
 
   const targetTop = target.getBoundingClientRect().top - element.getBoundingClientRect().top + element.scrollTop;
@@ -193,9 +194,10 @@ function rebuildMarkers(): void {
   }
 
   const nextMarkers: MarkerView[] = [];
+  const targets = markerElementsById();
 
   for (const marker of props.markers) {
-    const targetTop = targetTopForMarker(marker.id);
+    const targetTop = targetTopForMarker(marker.id, targets);
     if (targetTop === undefined) continue;
     const top = maxScroll.value > 0 ? (targetTop / maxScroll.value) * trackHeight.value : 0;
     nextMarkers.push({

@@ -31,7 +31,7 @@ const DEFAULT_THRESHOLD_PX = 24;
 const DEFAULT_INTERACTION_THRESHOLD_PX = 96;
 const DEFAULT_REATTACH_THRESHOLD_PX = 1;
 const DEFAULT_REATTACH_DELAY_MS = 800;
-const DEFAULT_SETTLE_MS = 500;
+const DEFAULT_SETTLE_MS = 0;
 
 /**
  * 统一管理滚动容器的底部粘滞行为。
@@ -133,7 +133,8 @@ export function useBottomStickyScroller(
 
     const element = scroller.value;
     if (element) {
-      element.scrollTop = element.scrollHeight;
+      const target = Math.max(0, element.scrollHeight - element.clientHeight);
+      if (Math.abs(element.scrollTop - target) > 1) element.scrollTop = target;
       rememberScrollMetrics(element);
     }
   }
@@ -240,26 +241,12 @@ export function useBottomStickyScroller(
   function keepStickyDuringContentSettle(): void {
     if (!stickyToBottom) return;
     scrollToBottomNow();
-
-    stickyUntil = Math.max(stickyUntil, performance.now() + settleMs);
     if (stickyFrame !== undefined) return;
-
-    const tick = (): void => {
-      if (!stickyToBottom) {
-        stickyFrame = undefined;
-        return;
-      }
-
-      scrollToBottomNow();
-      if (performance.now() < stickyUntil) {
-        stickyFrame = window.requestAnimationFrame(tick);
-        return;
-      }
-
+    stickyUntil = Math.max(stickyUntil, performance.now() + settleMs);
+    stickyFrame = window.requestAnimationFrame(() => {
       stickyFrame = undefined;
-    };
-
-    stickyFrame = window.requestAnimationFrame(tick);
+      if (stickyToBottom) scrollToBottomNow();
+    });
   }
 
   function onContentMayHaveChanged(): void {
@@ -321,7 +308,10 @@ export function useBottomStickyScroller(
     }
 
     observedScroller = element;
-    stickyToBottom = isNearBottomElement(element);
+    // A newly mounted streaming/output pane may already contain enough buffered text to overflow
+    // before observers attach. Treat that first mount as tail-following; subsequent user scroll
+    // intent still detaches through the normal wheel/keyboard/scroll handlers.
+    stickyToBottom = true;
     userDetachedFromBottom = false;
     reattachLockedUntil = 0;
     rememberScrollMetrics(element);
@@ -340,10 +330,8 @@ export function useBottomStickyScroller(
     mutationObserver = new MutationObserver(scheduleContentCheck);
     mutationObserver.observe(element, {
       childList: true,
-      subtree: true,
       characterData: true,
-      attributes: true,
-      attributeFilter: ['class', 'style', 'hidden', 'aria-hidden']
+      subtree: true
     });
 
     scheduleContentCheck();

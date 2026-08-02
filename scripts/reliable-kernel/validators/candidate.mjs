@@ -43,7 +43,7 @@ const phaseFChecks = new Set([
   'candidate.recovery.answer-inbox-invariant',
   'candidate.recovery.pending-delivery',
   'candidate.recovery.foreground-wait-expired',
-  'candidate.recovery.cancelled-subtree-incomplete',
+  'candidate.recovery.interrupted-subtree-incomplete',
   'candidate.parent-handling-matrix'
 ]);
 
@@ -100,7 +100,7 @@ const implemented = new Map([
   ['candidate.recovery.answer-inbox-invariant', () => runCandidateCheck('candidate.recovery.answer-inbox-invariant')],
   ['candidate.recovery.pending-delivery', () => runCandidateCheck('candidate.recovery.pending-delivery')],
   ['candidate.recovery.foreground-wait-expired', () => runCandidateCheck('candidate.recovery.foreground-wait-expired')],
-  ['candidate.recovery.cancelled-subtree-incomplete', () => runCandidateCheck('candidate.recovery.cancelled-subtree-incomplete')],
+  ['candidate.recovery.interrupted-subtree-incomplete', () => runCandidateCheck('candidate.recovery.interrupted-subtree-incomplete')],
   ['candidate.parent-handling-matrix', () => runCandidateCheck('candidate.parent-handling-matrix')]
 ]);
 

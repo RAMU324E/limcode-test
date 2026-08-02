@@ -6,7 +6,11 @@ import {
   type AttachmentOpenPayload,
   type AttachmentReloadPayload,
   type ConversationAgentSelectPayload,
-  type ConversationLlmSettingsRecord,
+  type ConversationActionResultPayload,
+  type CompressionCommandResultPayload,
+  type CompressionStartPayload,
+  type ConversationForkPayload,
+  type ConversationForkResultPayload,
   type ConversationSettingsGetPayload,
   type ConversationSettingsUpdatePayload,
   type GlobalSettingsGetPayload,
@@ -22,29 +26,46 @@ import {
   type TurnStartPayload,
   type WebviewToExtensionMessage
 } from '../../../shared/protocol';
+import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
+import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
 import { readVscodeSshWorkEnvironments } from './VscodeSshConfigurationReader';
 
 export interface VscodeReliableKernelCommandRouterOptions {
   broadcast?(message: unknown): void;
   createConversation?(options: { projectFolderUri?: string }): Promise<string>;
-  forkConversation?(sourceConversationId: string, messageId: string): Promise<string>;
+  forkConversation?(request: ConversationForkPayload): Promise<{
+    conversationId: string;
+    deduplicated: boolean;
+  }>;
   openPlanProposal?(payload: { conversationId?: string; toolCallId?: string; planProposalId?: string; title?: string }): void;
 }
 
 /** Normal Webview command route for reliable Runtime mutations. Bounded Feed remains the only data route. */
 export class VscodeReliableKernelCommandRouter {
+  private configurationMutationQueue: Promise<void> = Promise.resolve();
+  private readonly clientIdByWebview = new WeakMap<vscode.Webview, string>();
+
   public constructor(
     private readonly product: VscodeReliableKernelProductRuntime,
     private readonly options: VscodeReliableKernelCommandRouterOptions = {}
-  ) {}
+  ) {
+    this.product.toolHost.setStateChangeListener(() => {
+      if (!this.options.broadcast) return;
+      void this.product.ensureCapabilitiesReady()
+        .then(() => this.configurationSnapshot())
+        .then((snapshot) => this.options.broadcast?.(snapshot))
+        .catch((error) => console.warn('[LimCode] Failed to publish refreshed capability catalog.', error));
+    });
+  }
 
   public handle(
     clientId: string,
     webview: vscode.Webview,
     message: WebviewToExtensionMessage
   ): void {
+    this.clientIdByWebview.set(webview, clientId);
     void this.dispatch(clientId, webview, message).catch((error) => {
       const text = error instanceof Error ? error.message : String(error);
       console.error('[LimCode] Reliable Webview command failed.', message.type, error);
@@ -129,8 +150,15 @@ export class VscodeReliableKernelCommandRouter {
       case BridgeMessageType.ConversationFork: {
         if (!this.options.forkConversation) throw new Error('当前 Webview 容器不能创建 Conversation 分支。');
         const payload = requirePayload(message.payload, 'Conversation fork');
-        const conversationId = await this.options.forkConversation(payload.sourceConversationId, payload.messageId);
-        await this.product.application.webviewFeed.setActiveConversation(clientId, conversationId);
+        const result = await this.options.forkConversation(payload);
+        this.postConversationForkResult(webview, message.id, {
+          sourceConversationId: payload.sourceConversationId,
+          messageId: payload.messageId,
+          expectedRevisionId: payload.expectedRevisionId,
+          commandId: payload.command.commandId,
+          conversationId: result.conversationId,
+          status: result.deduplicated ? 'already_applied' : 'accepted'
+        });
         return;
       }
       case BridgeMessageType.AgentCreate:
@@ -329,16 +357,27 @@ export class VscodeReliableKernelCommandRouter {
         await this.handleTurnInput(requirePayload(message.payload, 'Turn input'));
         return;
       case BridgeMessageType.TurnInterrupt:
-        await this.handleInterrupt(requirePayload(message.payload, 'Turn interrupt'));
+        await this.handleInterrupt(
+          webview,
+          message.id,
+          requirePayload(message.payload, 'Turn interrupt')
+        );
         return;
       case BridgeMessageType.MessageEdit:
-        await this.handleMessageEdit(requirePayload(message.payload, 'Message edit'));
+        await this.handleMessageEdit(webview, message.id, requirePayload(message.payload, 'Message edit'));
         return;
       case BridgeMessageType.MessageDeleteFrom:
-        await this.handleMessageDelete(requirePayload(message.payload, 'Message delete'));
+        await this.handleMessageDelete(webview, message.id, requirePayload(message.payload, 'Message delete'));
         return;
       case BridgeMessageType.MessageRetryFrom:
-        await this.handleMessageRetry(requirePayload(message.payload, 'Message retry'));
+        await this.handleMessageRetry(webview, message.id, requirePayload(message.payload, 'Message retry'));
+        return;
+      case BridgeMessageType.CompressionStart:
+        await this.handleCompressionStart(
+          webview,
+          message.id,
+          requirePayload(message.payload, 'Compression start')
+        );
         return;
       case BridgeMessageType.InteractionResolve:
         await this.handleInteractionResolve(webview, message.id, requirePayload(message.payload, 'Interaction resolve'));
@@ -393,7 +432,12 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string | undefined,
     operation: () => Promise<unknown>
   ): Promise<void> {
-    await operation();
+    const queued = this.configurationMutationQueue.then(
+      async () => { await operation(); },
+      async () => { await operation(); }
+    );
+    this.configurationMutationQueue = queued.catch(() => undefined);
+    await queued;
     await this.broadcastConfigurationSnapshot(webview, correlationId);
   }
 
@@ -465,24 +509,18 @@ export class VscodeReliableKernelCommandRouter {
   ): Promise<void> {
     const conversationId = payload.settings.conversationId?.trim();
     if (!conversationId) throw new TypeError('Conversation settings 缺少 conversationId。');
-    if (payload.section === 'common') {
-      const name = 'name' in payload.settings ? payload.settings.name.trim() : '';
-      if (!name) throw new TypeError('Conversation 名称不能为空。');
-      await this.requireRow('Conversation', conversationId);
-      await this.product.application.database.transaction([
-        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
-          title: name,
-          updated_at: new Date().toISOString()
-        })
-      ]);
-    } else {
-      const input = payload.settings as ConversationLlmSettingsRecord;
-      const current = await this.product.configuration.loadGlobalSettings('llm');
-      await this.product.configuration.saveGlobalSettings('llm', {
-        activeProviderConfigId: input.activeProviderConfigId?.trim()
-          || (current.settings as { activeProviderConfigId: string }).activeProviderConfigId
-      });
+    if (payload.section !== 'common') {
+      throw new Error('对话模型选择只由 ModelProfile 控制；ConversationSettings.llm 已停用。');
     }
+    const name = 'name' in payload.settings ? payload.settings.name.trim() : '';
+    if (!name) throw new TypeError('Conversation 名称不能为空。');
+    await this.requireRow('Conversation', conversationId);
+    await this.product.application.database.transaction([
+      DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
+        title: name,
+        updated_at: new Date().toISOString()
+      })
+    ]);
     const stored = await this.readConversationSettings(conversationId, payload.section);
     this.broadcastOrPost(webview, this.conversationSettingsSnapshot(stored, correlationId));
   }
@@ -492,23 +530,14 @@ export class VscodeReliableKernelCommandRouter {
     section: ConversationSettingsGetPayload['section']
   ): Promise<{ conversationId: string; section: ConversationSettingsGetPayload['section']; settings: unknown; filePath: string }> {
     const conversation = await this.requireRow('Conversation', conversationId);
-    if (section === 'common') {
-      return {
-        conversationId,
-        section,
-        settings: { conversationId, name: String(conversation.title) },
-        filePath: ''
-      };
+    if (section !== 'common') {
+      throw new Error('对话模型选择只由 ModelProfile 控制；ConversationSettings.llm 已停用。');
     }
-    const llm = await this.product.configuration.loadGlobalSettings('llm');
     return {
       conversationId,
       section,
-      settings: {
-        conversationId,
-        activeProviderConfigId: (llm.settings as { activeProviderConfigId: string }).activeProviderConfigId
-      },
-      filePath: llm.filePath
+      settings: { conversationId, name: String(conversation.title) },
+      filePath: ''
     };
   }
 
@@ -647,74 +676,442 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   private async handleTurnInput(payload: TurnStartPayload): Promise<void> {
+    await this.product.ensureCapabilitiesReady();
+    const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
+    if (childExecutionId) {
+      const content = serializeMessagePayload(payload.text, payload.content);
+      await this.product.childAgents.inputFromConversation({
+        commandId: payload.command.commandId,
+        childExecutionId,
+        conversationId: payload.conversationId,
+        content: content.value,
+        contentType: content.contentType,
+        ...(payload.agentId?.trim() ? { executorAgentId: payload.agentId.trim() } : {}),
+        ...(payload.model ? { modelOverride: payload.model } : {})
+      });
+      return;
+    }
     await this.product.conversations.input({
       commandId: payload.command.commandId,
       conversationId: payload.conversationId,
       ...(payload.text ? { text: payload.text } : {}),
-      ...(payload.content ? { content: payload.content } : {})
+      ...(payload.content ? { content: payload.content } : {}),
+      ...(payload.agentId?.trim() ? { agentId: payload.agentId.trim() } : {}),
+      ...(payload.model ? { model: payload.model } : {})
     });
   }
 
-  private async handleInterrupt(payload: TurnInterruptPayload): Promise<void> {
-    await this.product.conversations.interrupt({
+  private async handleInterrupt(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: TurnInterruptPayload
+  ): Promise<void> {
+    if (!Number.isSafeInteger(payload.leaseEpoch) || payload.leaseEpoch < 0) {
+      throw new TypeError('Turn interrupt 缺少有效的 ExecutionLease generation。');
+    }
+    const turn = await this.requireRow('Turn', payload.turnId);
+    if (turn.conversation_id !== payload.conversationId) {
+      throw new Error('Turn interrupt 目标不属于当前 Conversation。');
+    }
+    const leases = await this.list('ExecutionLease', { turn_id: payload.turnId }, 2);
+    if (
+      turn.status === 'active'
+      && payload.leaseEpoch > 0
+      && (leases.length !== 1 || leases[0].generation !== BigInt(payload.leaseEpoch))
+    ) {
+      throw new Error('Turn interrupt 目标的 ExecutionLease generation 已被替换，请刷新后重试。');
+    }
+    const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: payload.turnId }, 2);
+    if (childMemberships.length > 1) throw new Error('Turn 存在多个 ChildExecution 调度归属。');
+    const childExecutionId = childMemberships[0]
+      ? requireText(childMemberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id')
+      : undefined;
+    const interruptInput = {
       commandId: payload.command.commandId,
       conversationId: payload.conversationId,
       turnId: payload.turnId,
+      ...(payload.leaseEpoch > 0 ? { expectedLeaseGeneration: String(payload.leaseEpoch) } : {}),
       reason: payload.cascadeChildAgents
         ? '用户请求中断当前 Turn 及其子执行。'
         : '用户请求中断当前 Turn。'
-    });
+    };
+    const result = childExecutionId
+      ? await this.product.childAgents.interruptFromConversation({
+          ...interruptInput,
+          childExecutionId
+        })
+      : await this.product.conversations.interrupt(interruptInput);
     if (payload.cascadeChildAgents) {
-      const children = await this.list('ChildExecutionParentLink', { parent_turn_id: payload.turnId }, 1000);
+      const children = await this.listAll('ChildExecutionParentLink', {
+        parent_turn_id: payload.turnId
+      });
       for (const link of children) {
-        await this.product.application.runtime.children.cancelSubtree({
+        await this.product.application.runtime.children.interruptSubtree({
           sourceKey: `${payload.command.commandId}:child:${String(link.child_execution_id)}`,
           childExecutionId: String(link.child_execution_id),
           reason: 'parent_turn_interrupted'
         });
+        // interruptSubtree is the cross-Host authority. The owning child scheduler observes its
+        // durable PendingTurnInput and is the only process allowed to touch local AbortControllers
+        // under that child Turn's exact ExecutionLease generation.
       }
     }
-  }
-
-  private async handleMessageEdit(payload: MessageEditPayload): Promise<void> {
-    const content = serializeMessagePayload(payload.text, payload.content);
-    await this.product.application.turns.edit({
-      source: { kind: 'command', key: payload.command.commandId },
-      conversationId: payload.conversationId,
-      messageId: payload.messageId,
-      content: content.value,
-      contentType: content.contentType
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.TurnInterruptResult,
+      channel: 'control',
+      correlationId,
+      payload: {
+        conversationId: payload.conversationId,
+        turnId: payload.turnId,
+        status: result.ignoredBecauseTerminal
+          ? 'already_terminal'
+          : result.coalesced ? 'coalesced' : 'accepted',
+        ...(result.pendingTurnInputId ? { pendingTurnInputId: result.pendingTurnInputId } : {}),
+        cascadeChildAgents: payload.cascadeChildAgents === true
+      }
     });
-    if (payload.runAfterEdit) {
-      const sourceTurnId = await this.turnIdForMessage(payload.conversationId, payload.messageId);
-      await this.product.conversations.retry({
-        commandId: `${payload.command.commandId}:retry`,
+  }
+
+  private async handleMessageEdit(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: MessageEditPayload
+  ): Promise<void> {
+    try {
+      let result;
+      if (payload.runAfterEdit) {
+        await this.product.ensureCapabilitiesReady();
+        const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
+        if (childExecutionId) {
+          const content = serializeMessagePayload(payload.text, payload.content);
+          result = await this.product.childAgents.editAndRunFromConversation({
+            commandId: payload.command.commandId,
+            childExecutionId,
+            conversationId: payload.conversationId,
+            messageId: payload.messageId,
+            expectedRevisionId: payload.expectedRevisionId,
+            content: content.value,
+            contentType: content.contentType,
+            deleteFollowing: payload.deleteFollowing === true,
+            ...(payload.agentId?.trim() ? { executorAgentId: payload.agentId.trim() } : {}),
+            ...(payload.model ? { modelOverride: payload.model } : {})
+          });
+        } else {
+          result = await this.product.conversations.editAndRun({
+            commandId: payload.command.commandId,
+            conversationId: payload.conversationId,
+            messageId: payload.messageId,
+            expectedRevisionId: payload.expectedRevisionId,
+            text: payload.text,
+            content: payload.content,
+            deleteFollowing: payload.deleteFollowing === true,
+            ...(payload.agentId ? { agentId: payload.agentId } : {}),
+            ...(payload.model ? { model: payload.model } : {})
+          });
+        }
+      } else {
+        const content = serializeMessagePayload(payload.text, payload.content);
+        result = await this.product.application.turns.edit({
+          source: { kind: 'command', key: payload.command.commandId },
+          conversationId: payload.conversationId,
+          messageId: payload.messageId,
+          expectedRevisionId: payload.expectedRevisionId,
+          content: content.value,
+          contentType: content.contentType,
+          deleteFollowing: payload.deleteFollowing === true
+        });
+      }
+      this.postConversationActionResult(webview, correlationId, {
+        action: 'edit',
         conversationId: payload.conversationId,
-        sourceTurnId
+        commandId: payload.command.commandId,
+        target: { kind: 'message', messageId: payload.messageId },
+        status: result.deduplicated ? 'already_applied' : 'accepted',
+        ...(result.turnId ? { turnId: result.turnId } : {}),
+        ...(result.messageRevisionId ? { messageRevisionId: result.messageRevisionId } : {})
+      });
+    } catch (error) {
+      if (!isConversationHistoryBusyError(error)) throw error;
+      this.postConversationActionResult(webview, correlationId, {
+        action: 'edit',
+        conversationId: payload.conversationId,
+        commandId: payload.command.commandId,
+        target: { kind: 'message', messageId: payload.messageId },
+        status: 'busy'
       });
     }
   }
 
-  private async handleMessageDelete(payload: MessageDeleteFromPayload): Promise<void> {
-    const messages = await this.conversationMessages(payload.conversationId);
-    const source = messages.find((message) => message.id === payload.messageId);
-    if (!source) throw new Error('待删除 Message 不属于当前 Conversation。');
-    const targets = messages.filter((message) => message.messageSeq >= source.messageSeq);
-    for (let index = 0; index < targets.length; index += 1) {
-      await this.product.application.turns.delete({
-        source: { kind: 'command', key: `${payload.command.commandId}:${index + 1}` },
+  private async handleMessageDelete(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: MessageDeleteFromPayload
+  ): Promise<void> {
+    try {
+      const result = await this.product.application.turns.delete({
+        source: { kind: 'command', key: payload.command.commandId },
         conversationId: payload.conversationId,
-        messageId: targets[index].id
+        messageId: payload.messageId
+      });
+      this.postConversationActionResult(webview, correlationId, {
+        action: 'delete',
+        conversationId: payload.conversationId,
+        commandId: payload.command.commandId,
+        target: { kind: 'message', messageId: payload.messageId },
+        status: result.deduplicated ? 'already_applied' : 'accepted'
+      });
+    } catch (error) {
+      if (!isConversationHistoryBusyError(error)) throw error;
+      this.postConversationActionResult(webview, correlationId, {
+        action: 'delete',
+        conversationId: payload.conversationId,
+        commandId: payload.command.commandId,
+        target: { kind: 'message', messageId: payload.messageId },
+        status: 'busy'
       });
     }
   }
 
-  private async handleMessageRetry(payload: MessageRetryFromPayload): Promise<void> {
-    const sourceTurnId = await this.turnIdForMessage(payload.conversationId, payload.messageId);
-    await this.product.conversations.retry({
-      commandId: payload.command.commandId,
-      conversationId: payload.conversationId,
-      sourceTurnId
+  private async handleMessageRetry(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: MessageRetryFromPayload
+  ): Promise<void> {
+    try {
+      await this.product.ensureCapabilitiesReady();
+      const sourceTurnId = await this.turnIdForRetryTarget(payload.conversationId, payload.target);
+      const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
+      const result = childExecutionId
+        ? await this.product.childAgents.retryFromConversation({
+            commandId: payload.command.commandId,
+            childExecutionId,
+            conversationId: payload.conversationId,
+            sourceTurnId,
+            target: payload.target,
+            ...('expectedRevisionId' in payload
+              ? { expectedMessageRevisionId: payload.expectedRevisionId }
+              : {}),
+            ...(payload.agentId?.trim() ? { executorAgentId: payload.agentId.trim() } : {}),
+            ...(payload.model ? { modelOverride: payload.model } : {})
+          })
+        : await this.product.conversations.retry({
+            commandId: payload.command.commandId,
+            conversationId: payload.conversationId,
+            sourceTurnId,
+            target: payload.target,
+            ...('expectedRevisionId' in payload
+              ? { expectedMessageRevisionId: payload.expectedRevisionId }
+              : {}),
+            ...(payload.agentId ? { agentId: payload.agentId } : {}),
+            ...(payload.model ? { model: payload.model } : {})
+          });
+      this.postConversationActionResult(webview, correlationId, {
+        action: 'retry',
+        conversationId: payload.conversationId,
+        commandId: payload.command.commandId,
+        target: payload.target,
+        status: result.deduplicated ? 'already_applied' : 'accepted',
+        ...(result.turnId ? { turnId: result.turnId } : {})
+      });
+    } catch (error) {
+      if (!isConversationHistoryBusyError(error)) throw error;
+      this.postConversationActionResult(webview, correlationId, {
+        action: 'retry',
+        conversationId: payload.conversationId,
+        commandId: payload.command.commandId,
+        target: payload.target,
+        status: 'busy'
+      });
+    }
+  }
+
+  private postConversationActionResult(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: ConversationActionResultPayload
+  ): void {
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.ConversationActionResult,
+      channel: 'state',
+      correlationId,
+      payload
+    });
+  }
+
+  private postConversationForkResult(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: ConversationForkResultPayload
+  ): void {
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.ConversationForkResult,
+      channel: 'state',
+      correlationId,
+      payload
+    });
+  }
+
+  private async handleCompressionStart(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    payload: CompressionStartPayload
+  ): Promise<void> {
+    const conversationId = requireText(payload.conversationId, 'conversationId');
+    const commandId = requireText(payload.command?.commandId, 'compression commandId');
+    await this.requireRow('Conversation', conversationId);
+    const replay = await this.product.conversations.inspectManualCompression?.({
+      commandId,
+      conversationId,
+      target: payload.target
+    });
+    if (replay) {
+      const replayRejected = replay.terminal
+        && (
+          replay.terminal.status !== 'completed'
+          || replay.terminal.reason !== 'manual_context_compression_completed'
+        );
+      this.postCompressionCommandResult(webview, correlationId, {
+        conversationId,
+        commandId,
+        target: payload.target,
+        turnId: replay.turnId,
+        status: replay.inProgress ? 'in_progress' : replayRejected ? 'rejected' : 'already_applied',
+        ...(replayRejected ? { reasonCode: replay.terminal!.reason } : {})
+      });
+      return;
+    }
+    const activeTurns = await this.list('Turn', { conversation_id: conversationId, status: 'active' }, 2);
+    if (activeTurns.length > 0) {
+      this.postCompressionCommandResult(webview, correlationId, {
+        conversationId,
+        commandId,
+        target: payload.target,
+        status: 'busy',
+        reasonCode: 'conversation-active'
+      });
+      return;
+    }
+    const heads = await this.list('ConversationContextHeadLink', { conversation_id: conversationId }, 2);
+    if (heads.length !== 1) throw new Error('Conversation 缺少唯一当前 Context head。');
+    const rootId = requireText(heads[0].root_id, 'ConversationContextHeadLink.root_id');
+    const structure = await this.product.application.context.materializeStructure(rootId);
+    if (structure.records.length === 0) throw new Error('当前上下文为空，无法压缩。');
+
+    let compressSegmentCount: number;
+    if (payload.target.kind === 'current_head') {
+      const frozenRootId = requireText(payload.target.expectedRootId, 'compression target.expectedRootId');
+      const frozenRoot = await this.requireRow('ContextSequenceRoot', frozenRootId);
+      if (frozenRoot.conversation_id !== conversationId) {
+        throw new Error('压缩目标 Context root 不属于当前 Conversation。');
+      }
+      if (frozenRootId === rootId) {
+        compressSegmentCount = structure.records.length;
+      } else {
+        const frozen = await this.product.application.context.materializeStructure(frozenRootId);
+        const prefixMatches = frozen.records.every((record, index) =>
+          String(record.segment.id) === String(structure.records[index]?.segment.id)
+        );
+        if (!prefixMatches || frozen.records.length === 0) {
+          throw new Error('压缩目标 Context root 已不再是当前上下文的完整前缀。');
+        }
+        compressSegmentCount = frozen.records.length;
+      }
+    } else {
+      const messageId = requireText(payload.target.messageId, 'compression target.messageId');
+      const memberships = await this.list('MessagePartOfConversation', {
+        conversation_id: conversationId,
+        message_id: messageId
+      }, 2);
+      if (memberships.length !== 1) throw new Error('压缩目标 Message 不属于当前 Conversation。');
+      const current = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
+      if (current.length !== 1) throw new Error('压缩目标 Message 缺少唯一当前 Revision。');
+      const revisionId = requireText(current[0].revision_id, 'MessageCurrentRevisionLink.revision_id');
+      if (revisionId !== requireText(payload.target.expectedRevisionId, 'compression target.expectedRevisionId')) {
+        throw new Error('压缩目标 MessageRevision 已变化，请重新选择压缩边界。');
+      }
+      const revision = await this.requireRow('MessageRevision', revisionId);
+      const sources = await this.list('ContextSegmentSource', {
+        source_kind: 'message_revision',
+        source_id: revisionId
+      }, 2);
+      if (sources.length !== 1) {
+        throw new Error('压缩目标已不在当前 Context lineage，或其 Context source 不唯一。');
+      }
+      const targetSegmentId = requireText(sources[0].segment_id, 'ContextSegmentSource.segment_id');
+      const targetIndex = structure.records.findIndex((record) => record.segment.id === targetSegmentId);
+      if (targetIndex < 0) throw new Error('压缩目标不在当前 finite Context root 中。');
+      compressSegmentCount = targetIndex + 1;
+      // A model Message may own a completed function-call batch. Keep every immediately following
+      // atomic tool_pair on the same side of the compression boundary.
+      if (revision.role === 'model') {
+        while (
+          compressSegmentCount < structure.records.length
+          && structure.records[compressSegmentCount].segment.segment_kind === 'tool_pair'
+        ) compressSegmentCount += 1;
+      }
+    }
+
+    let result;
+    try {
+      await this.product.ensureCapabilitiesReady();
+      const childExecutionId = await this.childExecutionIdForConversation(conversationId);
+      result = childExecutionId
+        ? await this.product.childAgents.manualCompressionFromConversation({
+            commandId,
+            childExecutionId,
+            conversationId,
+            compressSegmentCount,
+            target: payload.target
+          })
+        : await this.product.conversations.manualCompression({
+            commandId,
+            conversationId,
+            compressSegmentCount,
+            target: payload.target
+          });
+    } catch (error) {
+      if (!isConversationHistoryBusyError(error)) throw error;
+      this.postCompressionCommandResult(webview, correlationId, {
+        conversationId,
+        commandId,
+        target: payload.target,
+        status: 'busy',
+        reasonCode: 'conversation-busy'
+      });
+      return;
+    }
+    const compression = result.compression;
+    this.postCompressionCommandResult(webview, correlationId, {
+      conversationId,
+      commandId,
+      target: payload.target,
+      turnId: result.turnId,
+      status: result.inProgress
+        ? 'in_progress'
+        : result.deduplicated ? 'already_applied'
+        : compression?.status === 'compressed' ? 'accepted' : 'rejected',
+      ...(compression?.status === 'compressed' ? {
+        modelRequestId: compression.modelRequestId,
+        compressionBlockId: compression.result.compressionBlockId
+      } : {}),
+      ...(compression?.status === 'skipped' ? { reasonCode: compression.reason } : {})
+    });
+  }
+
+  private postCompressionCommandResult(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    payload: CompressionCommandResultPayload
+  ): void {
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.CompressionCommandResult,
+      channel: 'state',
+      correlationId,
+      payload
     });
   }
 
@@ -751,10 +1148,28 @@ export class VscodeReliableKernelCommandRouter {
       if (result.preparedEffect) {
         await this.product.application.fileMutations.dispatchRecordAndReconcile(result.preparedEffect.effectIntentId);
       }
+    } else if (request.request_kind === 'plan_review') {
+      const result = await this.product.application.interactions.resolvePlanReview({
+        source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
+        requestId: payload.interactionRequestId,
+        decision: payload.decision,
+        response: payload.response
+      });
+      won = result.won;
+    } else if (request.request_kind === 'exec_approval') {
+      const result = await this.product.application.interactions.resolveExecutionApproval({
+        source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
+        requestId: payload.interactionRequestId,
+        decision: payload.decision === 'accept' || payload.decision === 'submit' ? 'accept' : 'reject',
+        response: payload.response
+      });
+      won = result.won;
     } else {
       throw new Error(`不支持的可靠 Interaction 类型：${String(request.request_kind)}。`);
     }
-    this.product.conversations.resume(payload.conversationId, payload.ownerTurnId);
+    if (!await this.product.childAgents.resume(payload.ownerTurnId)) {
+      this.product.conversations.resume(payload.conversationId, payload.ownerTurnId);
+    }
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
@@ -791,11 +1206,49 @@ export class VscodeReliableKernelCommandRouter {
     }
     const toolCall = await this.requireRow('ToolCall', payload.toolCallId);
     const turn = await this.requireRow('Turn', String(toolCall.turn_id));
-    await this.product.conversations.interrupt({
+    if (toolCall.tool_name === 'run_agent') {
+      const childLinks = await this.list('ChildExecutionParentLink', {
+        source_tool_call_id: payload.toolCallId
+      }, 2);
+      if (childLinks.length !== 1) {
+        throw new Error('run_agent 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。');
+      }
+      const result = await this.product.application.runtime.children.interruptSubtree({
+        sourceKey: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
+        childExecutionId: String(childLinks[0].child_execution_id),
+        reason: payload.reason ?? '用户取消此子 Agent 执行。'
+      });
+      this.post(webview, {
+        id: randomUUID(),
+        type: BridgeMessageType.InteractionResult,
+        correlationId,
+        payload: {
+          requestType: BridgeMessageType.ToolExecutionCancel,
+          conversationId: String(turn.conversation_id),
+          targetId: payload.toolCallId,
+          status: result.deduplicated ? 'already_applied' : 'committed'
+        }
+      });
+      return;
+    }
+    const interrupted = await this.product.conversations.interrupt({
       commandId: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
       conversationId: String(turn.conversation_id),
       turnId: String(turn.id),
       reason: payload.reason ?? '用户取消工具执行。'
+    });
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.InteractionResult,
+      correlationId,
+      payload: {
+        requestType: BridgeMessageType.ToolExecutionCancel,
+        conversationId: String(turn.conversation_id),
+        targetId: payload.toolCallId,
+        status: interrupted.ignoredBecauseTerminal
+          ? 'already_satisfied'
+          : interrupted.coalesced ? 'already_applied' : 'committed'
+      }
     });
   }
 
@@ -808,11 +1261,15 @@ export class VscodeReliableKernelCommandRouter {
     return turnIds[0];
   }
 
-  private async conversationMessages(conversationId: string): Promise<Array<{ id: string; messageSeq: bigint }>> {
-    const memberships = await this.list('MessagePartOfConversation', { conversation_id: conversationId }, 1000);
-    return memberships
-      .map((row) => ({ id: String(row.message_id), messageSeq: requireBigInt(row.message_seq, 'message_seq') }))
-      .sort((left, right) => left.messageSeq < right.messageSeq ? -1 : left.messageSeq > right.messageSeq ? 1 : 0);
+  private async turnIdForRetryTarget(
+    conversationId: string,
+    target: MessageRetryFromPayload['target']
+  ): Promise<string> {
+    if (target.kind === 'message') return this.turnIdForMessage(conversationId, target.messageId);
+    const request = await this.requireRow('ModelRequest', target.modelRequestId);
+    const turn = await this.requireRow('Turn', String(request.turn_id));
+    if (turn.conversation_id !== conversationId) throw new Error('ModelRequest 不属于当前 Conversation。');
+    return String(turn.id);
   }
 
   private async requireRow(domain: string, id: string): Promise<DomainRow> {
@@ -822,6 +1279,14 @@ export class VscodeReliableKernelCommandRouter {
     return row;
   }
 
+  private async childExecutionIdForConversation(conversationId: string): Promise<string | undefined> {
+    const rows = await this.list('ChildExecution', { child_conversation_id: conversationId }, 2);
+    if (rows.length > 1) {
+      throw new Error(`Conversation ${conversationId} belongs to multiple ChildExecutions.`);
+    }
+    return rows[0] ? requireText(rows[0].id, 'ChildExecution.id') : undefined;
+  }
+
   private async list(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {
     const snapshot = await this.product.application.database.snapshot([
       DOMAIN_REPOSITORIES.domain(domain).list({ where, limit })
@@ -829,6 +1294,10 @@ export class VscodeReliableKernelCommandRouter {
     const rows = snapshot.snapshot[0];
     if (!Array.isArray(rows)) throw new TypeError(`${domain} list 未返回数组。`);
     return rows;
+  }
+
+  private listAll(domain: string, where: DomainRow): Promise<DomainRow[]> {
+    return listAllDomainRows(this.product.application.database, domain, where);
   }
 
   private broadcastOrPost(webview: vscode.Webview, message: unknown): void {
@@ -852,7 +1321,18 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   private post(webview: vscode.Webview, message: unknown): void {
-    void webview.postMessage(toStructuredClonePlainData(message, 'reliable command result'));
+    void webview.postMessage(toStructuredClonePlainData(message, 'reliable command result')).then(
+      (delivered) => {
+        if (delivered) return;
+        const clientId = this.clientIdByWebview.get(webview);
+        if (clientId) this.product.application.webviewFeed.reconnect(clientId);
+      },
+      (error) => {
+        console.warn('[LimCode] Reliable command result delivery failed; reconnecting the bounded Feed.', error);
+        const clientId = this.clientIdByWebview.get(webview);
+        if (clientId) this.product.application.webviewFeed.reconnect(clientId);
+      }
+    );
   }
 }
 

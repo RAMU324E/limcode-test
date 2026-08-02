@@ -13,6 +13,7 @@ import {
 import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { currentExecutionLeaseFence, runWithoutExecutionLeaseFence } from './executionLeaseFence';
 
 export type PhaseDSourceKind = 'command' | 'callback' | 'internal' | 'recovery';
 export type PhaseDEffectKind =
@@ -20,6 +21,7 @@ export type PhaseDEffectKind =
   | 'process_start'
   | 'process_exit'
   | 'process_stop_request'
+  | 'file_transfer'
   | 'subagent_spawn'
   | 'subagent_cancel'
   | 'mcp_tool_call';
@@ -43,6 +45,54 @@ export interface CreatedToolCall {
   toolCallId: string;
   toolExecutionId: string;
   callSeq: string;
+  deduplicated: boolean;
+  commitSeq?: string;
+}
+
+export type FrozenToolSchedulingMode = 'parallel' | 'serial';
+export type FrozenToolExecutionGate = 'automatic' | 'approval_required';
+export type FrozenToolChangeApplyMode = 'automatic' | 'manual' | 'unsupported';
+
+/** Immutable per-call policy/presentation decision compiled before a Provider batch is dispatched. */
+export interface FrozenToolCallPolicyDecision {
+  summary?: string;
+  displayAutoExpand: boolean;
+  displayAutoOpenDiff: boolean;
+  executionGate: FrozenToolExecutionGate;
+  changeApplyMode: FrozenToolChangeApplyMode;
+  changeApplyDelaySeconds: number;
+  autoSubmitResult: boolean;
+  schedulingMode: FrozenToolSchedulingMode;
+  schedulingReason?: string;
+}
+
+export interface ToolCallBatchEntry {
+  toolCallId: string;
+  toolName: string;
+  arguments: unknown;
+  providerCallId?: string;
+  providerOrdinal: number;
+  thoughtSignature?: string;
+  policy: FrozenToolCallPolicyDecision;
+}
+
+export interface CreatedToolCallBatch {
+  receiptId: string;
+  batchId: string;
+  calls: Array<{
+    toolCallId: string;
+    toolExecutionId: string;
+    callSeq: string;
+    providerOrdinal: number;
+  }>;
+  deduplicated: boolean;
+  commitSeq?: string;
+}
+
+export interface AppendedToolCallEvent {
+  receiptId: string;
+  eventId: string;
+  eventSeq: string;
   deduplicated: boolean;
   commitSeq?: string;
 }
@@ -130,6 +180,22 @@ interface ToolFacts {
   conversation: DomainRow;
 }
 
+export interface EffectDispatchFence {
+  executionLeaseId: string;
+  conversationId: string;
+  turnId: string;
+  ownerId: string;
+  hostBootId: string;
+  generation: string;
+  expiresAt: string;
+}
+
+interface EffectDispatchRequestEnvelope {
+  kind: 'limcode-effect-dispatch-request';
+  request: unknown;
+  dispatchFence: EffectDispatchFence;
+}
+
 interface CommandCommit {
   receipt: DomainRow;
   deduplicated: boolean;
@@ -144,6 +210,7 @@ const EFFECT_KINDS: readonly PhaseDEffectKind[] = [
   'process_start',
   'process_exit',
   'process_stop_request',
+  'file_transfer',
   'subagent_spawn',
   'subagent_cancel',
   'mcp_tool_call'
@@ -247,6 +314,222 @@ export class EffectControlPlane {
     };
   }
 
+  /**
+   * Persists one completed Provider output as an indivisible call batch. ToolCall is the lifecycle
+   * fact; source/policy are separate one-to-one facts and can never be observed half-populated.
+   */
+  public async createToolCallBatch(input: {
+    source: PhaseDCommandSource;
+    batchId: string;
+    turnId: string;
+    modelRequestId: string;
+    messageId: string;
+    entries: readonly ToolCallBatchEntry[];
+  }): Promise<CreatedToolCallBatch> {
+    const source = normalizeSource(input.source, ['callback', 'internal'], 'tool-call-batch-create');
+    const batchId = requireId(input.batchId, 'batchId');
+    const turnId = requireId(input.turnId, 'turnId');
+    const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
+    const messageId = requireId(input.messageId, 'messageId');
+    if (!Array.isArray(input.entries) || input.entries.length === 0) {
+      throw new TypeError('ToolCall batch requires at least one entry.');
+    }
+    const entries = input.entries.map((entry, index) => normalizeToolCallBatchEntry(entry, index));
+    assertUniqueBatchEntries(entries);
+    const scope = canonicalJson({ batchId, turnId, modelRequestId, messageId, entries });
+    const receiptId = sourceReceiptId(source, 'tool-call-batch-create', scope);
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) {
+      return this.replayToolCallBatch(duplicate, receiptId, batchId, modelRequestId, messageId, entries);
+    }
+
+    const turnContext = await this.requireActiveTurnContext(turnId);
+    const modelRequest = await this.requireExisting('ModelRequest', modelRequestId);
+    if (
+      modelRequest.turn_id !== turnId
+      || modelRequest.status !== 'terminal'
+      || modelRequest.terminal_state !== 'completed'
+    ) throw new Error(`ModelRequest ${modelRequestId} is not the completed Provider source for Turn ${turnId}.`);
+    await this.requireExisting('Message', messageId);
+    const messageLinks = await this.list('ModelRequestMessageLink', { model_request_id: modelRequestId }, 2);
+    if (messageLinks.length !== 1 || messageLinks[0].message_id !== messageId) {
+      throw new Error(`ModelRequest ${modelRequestId} is not linked to assistant Message ${messageId}.`);
+    }
+
+    const preparedEntries = await Promise.all(entries.map(async (entry) => ({
+      entry,
+      executionId: stablePhaseDId('tool_execution', entry.toolCallId),
+      sourceLinkId: stablePhaseDId('tool_call_source_link', entry.toolCallId),
+      policySnapshotId: stablePhaseDId('tool_call_policy_snapshot', entry.toolCallId),
+      argumentsContent: await this.contentStore.prepare(
+        this.database,
+        canonicalJson(entry.arguments),
+        'application/vnd.limcode.tool-arguments+json'
+      )
+    })));
+    const now = this.timestamp();
+    const steps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: ACTIVE_TURN }),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(turnContext.lease.id as string, {
+        conversation_id: turnContext.conversation.id,
+        turn_id: turnId
+      }),
+      DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+        turn_id: turnId,
+        status: 'terminal',
+        terminal_state: 'completed'
+      }),
+      DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').assert(messageLinks[0].id as string, {
+        model_request_id: modelRequestId,
+        message_id: messageId
+      }),
+      ...preparedContentSteps(preparedEntries.map((entry) => entry.argumentsContent), 'tool_batch_args')
+    ];
+    // Lifecycle rows are staged first; relation/snapshot rows are staged only after the complete
+    // Provider call set exists. SQLite commit still publishes the whole batch atomically.
+    for (const prepared of preparedEntries) {
+      const { entry } = prepared;
+      steps.push(
+        DOMAIN_REPOSITORIES.domain('ToolCall').insertWithNextSequence({
+          id: entry.toolCallId,
+          turn_id: turnId,
+          tool_name: entry.toolName,
+          status: 'pending',
+          arguments_object_id: prepared.argumentsContent.metadata.id,
+          created_at: now,
+          updated_at: now
+        }, {
+          column: 'call_seq',
+          scope: { turn_id: turnId }
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').insert({
+          id: prepared.executionId,
+          tool_call_id: entry.toolCallId,
+          status: 'pending',
+          wait_deadline_at: null,
+          started_at: now,
+          updated_at: now,
+          completed_at: null
+        })
+      );
+    }
+    for (const [index, prepared] of preparedEntries.entries()) {
+      const { entry } = prepared;
+      steps.push(
+        DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').insert({
+          id: prepared.sourceLinkId,
+          tool_call_id: entry.toolCallId,
+          model_request_id: modelRequestId,
+          message_id: messageId,
+          provider_call_id: entry.providerCallId ?? null,
+          provider_ordinal: BigInt(entry.providerOrdinal),
+          batch_id: batchId,
+          batch_ordinal: BigInt(index),
+          thought_signature: entry.thoughtSignature ?? null,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCallPolicySnapshot').insert({
+          id: prepared.policySnapshotId,
+          tool_call_id: entry.toolCallId,
+          summary: entry.policy.summary ?? null,
+          display_auto_expand: entry.policy.displayAutoExpand ? 1n : 0n,
+          display_auto_open_diff: entry.policy.displayAutoOpenDiff ? 1n : 0n,
+          execution_gate: entry.policy.executionGate,
+          change_apply_mode: entry.policy.changeApplyMode,
+          change_apply_delay_seconds: BigInt(entry.policy.changeApplyDelaySeconds),
+          auto_submit_result: entry.policy.autoSubmitResult ? 1n : 0n,
+          scheduling_mode: entry.policy.schedulingMode,
+          scheduling_reason: entry.policy.schedulingReason ?? null,
+          created_at: now
+        })
+      );
+    }
+
+    const committed = await this.commitSource({
+      source,
+      receiptId,
+      conversationId: turnContext.conversation.id as string,
+      turnId,
+      steps
+    });
+    if (committed.deduplicated) {
+      return this.replayToolCallBatch(committed.receipt, receiptId, batchId, modelRequestId, messageId, entries);
+    }
+    return {
+      receiptId,
+      batchId,
+      calls: preparedEntries.map((prepared) => ({
+        toolCallId: prepared.entry.toolCallId,
+        toolExecutionId: prepared.executionId,
+        callSeq: allocatedValue(committed, 'ToolCall', prepared.entry.toolCallId, 'call_seq'),
+        providerOrdinal: prepared.entry.providerOrdinal
+      })),
+      deduplicated: false,
+      commitSeq: committed.commitSeq
+    };
+  }
+
+  /** ToolExecutionContext.emit is serialized through this durable, replay-safe event append. */
+  public async appendToolCallEvent(input: {
+    source: PhaseDCommandSource;
+    toolCallId: string;
+    eventKind: 'stdout' | 'stderr' | 'progress';
+    content: unknown;
+  }): Promise<AppendedToolCallEvent> {
+    const source = normalizeSource(input.source, ['callback', 'internal'], 'tool-call-event-append');
+    const toolCallId = requireId(input.toolCallId, 'toolCallId');
+    const eventKind = requireToolCallEventKind(input.eventKind);
+    const eventId = stablePhaseDId('tool_call_event', `${toolCallId}:${source.kind}:${source.key}`);
+    const scope = canonicalJson({ toolCallId, eventKind, content: input.content });
+    const receiptId = sourceReceiptId(source, 'tool-call-event-append', scope);
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) return this.replayToolCallEvent(duplicate, receiptId, eventId, toolCallId, eventKind);
+    const facts = await this.requireToolFacts(toolCallId, true);
+    if (!['pending', 'executing'].includes(String(facts.toolCall.status))) {
+      throw new Error(`ToolCall ${toolCallId} cannot append runtime events from ${String(facts.toolCall.status)}.`);
+    }
+    const content = await this.contentStore.prepare(
+      this.database,
+      canonicalJson(input.content),
+      'application/vnd.limcode.tool-call-event+json'
+    );
+    const committed = await this.commitSource({
+      source,
+      receiptId,
+      conversationId: facts.conversation.id as string,
+      turnId: facts.turn.id as string,
+      steps: [
+        DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: ACTIVE_TURN }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
+          conversation_id: facts.conversation.id,
+          turn_id: facts.turn.id
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: facts.toolCall.status }),
+        ...preparedContentSteps([content], 'tool_call_event'),
+        DOMAIN_REPOSITORIES.domain('ToolCallEvent').insertWithNextSequence({
+          id: eventId,
+          tool_call_id: toolCallId,
+          event_kind: eventKind,
+          content_object_id: content.metadata.id,
+          created_at: this.timestamp()
+        }, {
+          column: 'event_seq',
+          scope: { tool_call_id: toolCallId }
+        })
+      ]
+    });
+    if (committed.deduplicated) {
+      return this.replayToolCallEvent(committed.receipt, receiptId, eventId, toolCallId, eventKind);
+    }
+    return {
+      receiptId,
+      eventId,
+      eventSeq: allocatedValue(committed, 'ToolCallEvent', eventId, 'event_seq'),
+      deduplicated: false,
+      commitSeq: committed.commitSeq
+    };
+  }
+
   /** Operation, Attempt and EffectIntent are inserted in this one SQLite transaction. */
   public async prepareEffectIntent(input: {
     source: PhaseDCommandSource;
@@ -259,9 +542,6 @@ export class EffectControlPlane {
     const toolCallId = requireId(input.toolCallId, 'toolCallId');
     const effectKind = requireEffectKind(input.effectKind);
     const facts = await this.requireToolFacts(toolCallId, true);
-    if (facts.toolCall.status !== 'pending' || facts.execution.status !== 'pending') {
-      throw new Error(`ToolCall ${toolCallId} cannot create an EffectIntent from ${String(facts.toolCall.status)}/${String(facts.execution.status)}.`);
-    }
     const owner = input.owner ?? { kind: 'tool_execution' as const, id: facts.execution.id as string };
     requireId(owner.id, 'effect owner id');
     const ids = effectIds(toolCallId, owner.kind, owner.id, effectKind);
@@ -269,6 +549,9 @@ export class EffectControlPlane {
     const receiptId = sourceReceiptId(source, 'effect-intent-create', scope);
     const duplicate = await this.findSourceReceipt(source);
     if (duplicate) return this.replayPreparedEffect(duplicate, receiptId, ids, toolCallId, effectKind);
+    if (facts.toolCall.status !== 'pending' || facts.execution.status !== 'pending') {
+      throw new Error(`ToolCall ${toolCallId} cannot create an EffectIntent from ${String(facts.toolCall.status)}/${String(facts.execution.status)}.`);
+    }
     const requestContent = await this.contentStore.prepare(
       this.database,
       canonicalJson(input.request),
@@ -360,9 +643,25 @@ export class EffectControlPlane {
     if (toolFacts && (toolFacts.toolCall.status !== 'executing' || toolFacts.execution.status !== 'executing')) {
       throw new Error(`EffectIntent ${effectIntentId} belongs to a ToolCall that is no longer executing.`);
     }
+    const shouldPersistDispatchFence = toolFacts
+      && !['subagent_spawn', 'subagent_cancel'].includes(String(intent.effect_kind));
+    const dispatchEnvelope = shouldPersistDispatchFence
+      ? await this.contentStore.prepare(
+          this.database,
+          canonicalJson({
+            kind: 'limcode-effect-dispatch-request',
+            request: await this.readRawEffectRequest(intent),
+            dispatchFence: effectDispatchFence(toolFacts)
+          } satisfies EffectDispatchRequestEnvelope),
+          'application/vnd.limcode.effect-dispatch-request+json'
+        )
+      : undefined;
     const now = this.timestamp();
     const assertions: RepositoryTransactionStep[] = [
-      DOMAIN_REPOSITORIES.domain('EffectIntent').assert(effectIntentId, { dispatch_state: 'pending' }),
+      DOMAIN_REPOSITORIES.domain('EffectIntent').assert(effectIntentId, {
+        dispatch_state: 'pending',
+        request_object_id: intent.request_object_id
+      }),
       DOMAIN_REPOSITORIES.domain('Attempt').assert(attempt.id as string, { status: 'pending' }),
       DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: 'pending' })
     ];
@@ -371,7 +670,10 @@ export class EffectControlPlane {
         DOMAIN_REPOSITORIES.domain('Turn').assert(toolFacts.turn.id as string, { status: ACTIVE_TURN }),
         DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(toolFacts.lease.id as string, {
           conversation_id: toolFacts.conversation.id,
-          turn_id: toolFacts.turn.id
+          turn_id: toolFacts.turn.id,
+          owner_id: toolFacts.lease.owner_id,
+          host_boot_id: toolFacts.lease.host_boot_id,
+          generation: toolFacts.lease.generation
         }),
         DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolFacts.toolCall.id as string, { status: 'executing' }),
         DOMAIN_REPOSITORIES.domain('ToolExecution').assert(toolFacts.execution.id as string, { status: 'executing' })
@@ -380,8 +682,10 @@ export class EffectControlPlane {
     try {
       await this.database.transaction([
         ...assertions,
+        ...(dispatchEnvelope ? preparedContentSteps([dispatchEnvelope], 'effect_dispatch_request') : []),
         DOMAIN_REPOSITORIES.domain('EffectIntent').update(effectIntentId, {
           dispatch_state: 'dispatched',
+          ...(dispatchEnvelope ? { request_object_id: dispatchEnvelope.metadata.id } : {}),
           updated_at: now
         }),
         DOMAIN_REPOSITORIES.domain('Attempt').update(attempt.id as string, {
@@ -402,10 +706,85 @@ export class EffectControlPlane {
     }
   }
 
+  /**
+   * Cancels an EffectIntent only while dispatch_state is still pending. Once dispatch wins the CAS,
+   * capability-specific code must persist a real Receipt (often outcome_unknown) instead.
+   */
+  public async cancelPendingEffect(input: {
+    source: PhaseDCommandSource;
+    effectIntentId: string;
+    detail: unknown;
+  }): Promise<ToolSettlementResult | null> {
+    const source = normalizeSource(input.source, ['internal'], 'effect-cancel-before-dispatch');
+    const effectIntentId = requireId(input.effectIntentId, 'effectIntentId');
+    const intent = await this.requireExisting('EffectIntent', effectIntentId);
+    const attempt = await this.requireExisting('Attempt', requireId(intent.attempt_id, 'EffectIntent.attempt_id'));
+    const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
+    const toolCallId = requireId(operation.tool_call_id, 'Operation.tool_call_id');
+    const facts = await this.requireToolFacts(toolCallId, true);
+    const receiptId = sourceReceiptId(
+      source,
+      'effect-cancel-before-dispatch',
+      JSON.stringify([effectIntentId, toolCallId])
+    );
+    const duplicate = await this.findSourceReceipt(source);
+    if (intent.dispatch_state !== 'pending' && !duplicate) return null;
+    if (!duplicate) {
+      const now = this.timestamp();
+      try {
+        await this.commitSource({
+          source,
+          receiptId,
+          conversationId: requireId(facts.conversation.id, 'Conversation.id'),
+          turnId: requireId(facts.turn.id, 'Turn.id'),
+          steps: [
+            DOMAIN_REPOSITORIES.domain('EffectIntent').assert(effectIntentId, { dispatch_state: 'pending' }),
+            DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(attempt.id, 'Attempt.id'), { status: 'pending' }),
+            DOMAIN_REPOSITORIES.domain('Operation').assert(requireId(operation.id, 'Operation.id'), { status: 'pending' }),
+            DOMAIN_REPOSITORIES.domain('EffectIntent').update(effectIntentId, {
+              dispatch_state: 'cancelled_before_dispatch',
+              updated_at: now
+            }),
+            DOMAIN_REPOSITORIES.domain('Attempt').update(requireId(attempt.id, 'Attempt.id'), {
+              status: 'cancelled',
+              updated_at: now,
+              completed_at: now
+            }),
+            DOMAIN_REPOSITORIES.domain('Operation').update(requireId(operation.id, 'Operation.id'), {
+              status: 'cancelled',
+              updated_at: now
+            })
+          ]
+        });
+      } catch (error) {
+        if (!isTransactionAssertionError(error)) throw error;
+        const latest = await this.requireExisting('EffectIntent', effectIntentId);
+        if (latest.dispatch_state !== 'pending') return null;
+        throw error;
+      }
+    }
+    const finalized = await this.finalizeReadyInOrder(requireId(facts.turn.id, 'Turn.id'));
+    const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
+      ?? await this.readTerminalResult(toolCallId, true, duplicate?.id as string | undefined);
+    return this.settlementResult(
+      duplicate ? requireId(duplicate.id, 'CommandReceipt.id') : receiptId,
+      toolCallId,
+      'cancelled',
+      duplicate !== undefined,
+      terminal ?? undefined
+    );
+  }
+
   public async readEffectRequest<T = unknown>(effectIntentIdInput: string): Promise<T> {
     const intent = await this.requireExisting('EffectIntent', requireId(effectIntentIdInput, 'effectIntentId'));
-    const metadata = await this.requireContentObject(requireId(intent.request_object_id, 'EffectIntent.request_object_id'));
-    return JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as T;
+    const value = await this.readRawEffectRequest(intent);
+    return isEffectDispatchRequestEnvelope(value) ? value.request as T : value as T;
+  }
+
+  public async readEffectDispatchFence(effectIntentIdInput: string): Promise<EffectDispatchFence | undefined> {
+    const intent = await this.requireExisting('EffectIntent', requireId(effectIntentIdInput, 'effectIntentId'));
+    const value = await this.readRawEffectRequest(intent);
+    return isEffectDispatchRequestEnvelope(value) ? value.dispatchFence : undefined;
   }
 
   /** Receipt writes do not require or assert an ExecutionLease. */
@@ -416,6 +795,9 @@ export class EffectControlPlane {
     outcome: EffectObservedOutcome;
     detail?: unknown;
   }): Promise<RecordedEffectReceipt> {
+    if (currentExecutionLeaseFence()) {
+      return runWithoutExecutionLeaseFence(() => this.recordEffectReceipt(input));
+    }
     const source = normalizeSource(input.source, ['callback', 'recovery'], 'effect-receipt-write');
     const attemptId = requireId(input.attemptId, 'attemptId');
     const effectKind = requireEffectKind(input.effectKind);
@@ -424,7 +806,9 @@ export class EffectControlPlane {
     if (intentRows.length !== 1) throw new Error(`Attempt ${attemptId} must have exactly one EffectIntent.`);
     const intent = intentRows[0];
     if (intent.effect_kind !== effectKind) throw new Error('EffectReceipt kind does not match EffectIntent.');
-    if (intent.dispatch_state === 'pending') throw new Error('EffectReceipt cannot be written before dispatch is committed.');
+    if (!['dispatched', 'receipt_written'].includes(String(intent.dispatch_state))) {
+      throw new Error(`EffectReceipt cannot be written from dispatch_state=${String(intent.dispatch_state)}.`);
+    }
     const attempt = await this.requireExisting('Attempt', attemptId);
     const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
     const toolCallId = operation.tool_call_id === null ? null : requireId(operation.tool_call_id, 'Operation.tool_call_id');
@@ -606,6 +990,9 @@ export class EffectControlPlane {
     outcome: Exclude<ToolOutcomeStatus, 'rejected'>;
     additionalSteps: RepositoryTransactionStep[];
   }): Promise<{ receiptId: string; deduplicated: boolean; commitSeq?: string }> {
+    if (currentExecutionLeaseFence()) {
+      return runWithoutExecutionLeaseFence(() => this.completeDetachedOperation(input));
+    }
     const source = normalizeSource(input.source, ['internal', 'recovery'], 'detached-effect-reconcile');
     const effectReceipt = await this.requireExisting('EffectReceipt', requireId(input.effectReceiptId, 'effectReceiptId'));
     const attempt = await this.requireExisting('Attempt', requireId(effectReceipt.attempt_id, 'EffectReceipt.attempt_id'));
@@ -1232,6 +1619,73 @@ export class EffectControlPlane {
     return { detail: JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) };
   }
 
+  private async replayToolCallBatch(
+    receipt: DomainRow,
+    expectedReceiptId: string,
+    batchId: string,
+    modelRequestId: string,
+    messageId: string,
+    entries: readonly ToolCallBatchEntry[]
+  ): Promise<CreatedToolCallBatch> {
+    assertSourceReceipt(receipt, expectedReceiptId, 'tool-call-batch-create');
+    const calls: CreatedToolCallBatch['calls'] = [];
+    for (const [index, entry] of entries.entries()) {
+      const call = await this.requireExisting('ToolCall', entry.toolCallId);
+      const executions = await this.list('ToolExecution', { tool_call_id: entry.toolCallId }, 2);
+      const links = await this.list('ToolCallSourceLink', { tool_call_id: entry.toolCallId }, 2);
+      const policies = await this.list('ToolCallPolicySnapshot', { tool_call_id: entry.toolCallId }, 2);
+      if (
+        call.tool_name !== entry.toolName
+        || executions.length !== 1
+        || links.length !== 1
+        || policies.length !== 1
+      ) throw new Error(`ToolCall batch replay facts conflict for ${entry.toolCallId}.`);
+      const link = links[0];
+      if (
+        link.model_request_id !== modelRequestId
+        || link.message_id !== messageId
+        || link.provider_call_id !== (entry.providerCallId ?? null)
+        || link.provider_ordinal !== BigInt(entry.providerOrdinal)
+        || link.batch_id !== batchId
+        || link.batch_ordinal !== BigInt(index)
+        || link.thought_signature !== (entry.thoughtSignature ?? null)
+      ) throw new Error(`ToolCallSourceLink replay conflicts for ${entry.toolCallId}.`);
+      assertFrozenPolicyRow(policies[0], entry.policy, entry.toolCallId);
+      calls.push({
+        toolCallId: entry.toolCallId,
+        toolExecutionId: requireId(executions[0].id, 'ToolExecution.id'),
+        callSeq: requireBigInt(call.call_seq, 'ToolCall.call_seq').toString(),
+        providerOrdinal: entry.providerOrdinal
+      });
+    }
+    return {
+      receiptId: requireId(receipt.id, 'CommandReceipt.id'),
+      batchId,
+      calls,
+      deduplicated: true
+    };
+  }
+
+  private async replayToolCallEvent(
+    receipt: DomainRow,
+    expectedReceiptId: string,
+    eventId: string,
+    toolCallId: string,
+    eventKind: string
+  ): Promise<AppendedToolCallEvent> {
+    assertSourceReceipt(receipt, expectedReceiptId, 'tool-call-event-append');
+    const event = await this.requireExisting('ToolCallEvent', eventId);
+    if (event.tool_call_id !== toolCallId || event.event_kind !== eventKind) {
+      throw new Error(`ToolCallEvent ${eventId} conflicts with its replay source.`);
+    }
+    return {
+      receiptId: requireId(receipt.id, 'CommandReceipt.id'),
+      eventId,
+      eventSeq: requireBigInt(event.event_seq, 'ToolCallEvent.event_seq').toString(),
+      deduplicated: true
+    };
+  }
+
   private async commitSource(options: {
     source: PhaseDCommandSource;
     receiptId: string;
@@ -1285,6 +1739,13 @@ export class EffectControlPlane {
       source_kind: source.kind,
       source_key: source.key
     }, 2))[0];
+  }
+
+  private async readRawEffectRequest(intent: DomainRow): Promise<unknown> {
+    const metadata = await this.requireContentObject(
+      requireId(intent.request_object_id, 'EffectIntent.request_object_id')
+    );
+    return JSON.parse((await this.contentStore.read(metadata)).toString('utf8'));
   }
 
   private async requireContentObject(id: string): Promise<ContentObjectMetadata> {
@@ -1384,6 +1845,115 @@ function terminalIds(toolCallId: string): {
     messageConversationLinkId: stablePhaseDId('message_conversation_link', `tool-result:${toolCallId}`),
     messageTurnLinkId: stablePhaseDId('message_turn_link', `tool-result:${toolCallId}`)
   };
+}
+
+function normalizeToolCallBatchEntry(entry: ToolCallBatchEntry, index: number): ToolCallBatchEntry {
+  if (!entry || typeof entry !== 'object') throw new TypeError(`ToolCall batch entry ${index} must be an object.`);
+  return {
+    toolCallId: requireId(entry.toolCallId, `ToolCall batch entry ${index}.toolCallId`),
+    toolName: requireText(entry.toolName, `ToolCall batch entry ${index}.toolName`),
+    arguments: entry.arguments,
+    ...(entry.providerCallId ? {
+      providerCallId: requireId(entry.providerCallId, `ToolCall batch entry ${index}.providerCallId`)
+    } : {}),
+    providerOrdinal: requireNonNegativeSafeInteger(
+      entry.providerOrdinal,
+      `ToolCall batch entry ${index}.providerOrdinal`
+    ),
+    ...(entry.thoughtSignature ? {
+      thoughtSignature: requireText(entry.thoughtSignature, `ToolCall batch entry ${index}.thoughtSignature`)
+    } : {}),
+    policy: normalizeFrozenToolPolicy(entry.policy, index)
+  };
+}
+
+function normalizeFrozenToolPolicy(
+  policy: FrozenToolCallPolicyDecision,
+  index: number
+): FrozenToolCallPolicyDecision {
+  if (!policy || typeof policy !== 'object') throw new TypeError(`ToolCall batch entry ${index}.policy must be an object.`);
+  if (!['automatic', 'approval_required'].includes(policy.executionGate)) {
+    throw new TypeError(`ToolCall batch entry ${index}.policy.executionGate is invalid.`);
+  }
+  if (!['automatic', 'manual', 'unsupported'].includes(policy.changeApplyMode)) {
+    throw new TypeError(`ToolCall batch entry ${index}.policy.changeApplyMode is invalid.`);
+  }
+  if (!['parallel', 'serial'].includes(policy.schedulingMode)) {
+    throw new TypeError(`ToolCall batch entry ${index}.policy.schedulingMode is invalid.`);
+  }
+  const delay = requireNonNegativeSafeInteger(
+    policy.changeApplyDelaySeconds,
+    `ToolCall batch entry ${index}.policy.changeApplyDelaySeconds`
+  );
+  if (delay > 600) throw new TypeError('ToolCall change-apply delay cannot exceed 600 seconds.');
+  if (policy.changeApplyMode !== 'automatic' && delay !== 0) {
+    throw new TypeError('Only automatic change apply may carry a non-zero delay.');
+  }
+  return {
+    ...(policy.summary ? { summary: requireText(policy.summary, `ToolCall batch entry ${index}.policy.summary`) } : {}),
+    displayAutoExpand: policy.displayAutoExpand === true,
+    displayAutoOpenDiff: policy.displayAutoOpenDiff === true,
+    executionGate: policy.executionGate,
+    changeApplyMode: policy.changeApplyMode,
+    changeApplyDelaySeconds: delay,
+    autoSubmitResult: policy.autoSubmitResult === true,
+    schedulingMode: policy.schedulingMode,
+    ...(policy.schedulingReason ? {
+      schedulingReason: requireText(policy.schedulingReason, `ToolCall batch entry ${index}.policy.schedulingReason`)
+    } : {})
+  };
+}
+
+function assertUniqueBatchEntries(entries: readonly ToolCallBatchEntry[]): void {
+  const ids = new Set<string>();
+  const providerIds = new Set<string>();
+  const ordinals = new Set<number>();
+  for (const entry of entries) {
+    if (ids.has(entry.toolCallId)) throw new Error(`ToolCall batch repeats id ${entry.toolCallId}.`);
+    ids.add(entry.toolCallId);
+    if (entry.providerCallId) {
+      if (providerIds.has(entry.providerCallId)) {
+        throw new Error(`ToolCall batch repeats Provider call id ${entry.providerCallId}.`);
+      }
+      providerIds.add(entry.providerCallId);
+    }
+    if (ordinals.has(entry.providerOrdinal)) {
+      throw new Error(`ToolCall batch repeats Provider ordinal ${entry.providerOrdinal}.`);
+    }
+    ordinals.add(entry.providerOrdinal);
+  }
+}
+
+function assertFrozenPolicyRow(
+  row: DomainRow,
+  policy: FrozenToolCallPolicyDecision,
+  toolCallId: string
+): void {
+  if (
+    row.summary !== (policy.summary ?? null)
+    || row.display_auto_expand !== (policy.displayAutoExpand ? 1n : 0n)
+    || row.display_auto_open_diff !== (policy.displayAutoOpenDiff ? 1n : 0n)
+    || row.execution_gate !== policy.executionGate
+    || row.change_apply_mode !== policy.changeApplyMode
+    || row.change_apply_delay_seconds !== BigInt(policy.changeApplyDelaySeconds)
+    || row.auto_submit_result !== (policy.autoSubmitResult ? 1n : 0n)
+    || row.scheduling_mode !== policy.schedulingMode
+    || row.scheduling_reason !== (policy.schedulingReason ?? null)
+  ) throw new Error(`ToolCallPolicySnapshot replay conflicts for ${toolCallId}.`);
+}
+
+function requireToolCallEventKind(value: unknown): 'stdout' | 'stderr' | 'progress' {
+  if (!['stdout', 'stderr', 'progress'].includes(String(value))) {
+    throw new TypeError(`Unsupported ToolCallEvent kind: ${String(value)}.`);
+  }
+  return value as 'stdout' | 'stderr' | 'progress';
+}
+
+function requireNonNegativeSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer.`);
+  }
+  return value;
 }
 
 function aggregateOperationOutcomes(statuses: ToolOutcomeStatus[]): ToolOutcomeStatus {
@@ -1498,6 +2068,37 @@ function compareBigInt(left: unknown, right: unknown): number {
   const leftValue = requireBigInt(left, 'sequence');
   const rightValue = requireBigInt(right, 'sequence');
   return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
+function effectDispatchFence(facts: ToolFacts): EffectDispatchFence {
+  return {
+    executionLeaseId: requireId(facts.lease.id, 'ExecutionLease.id'),
+    conversationId: requireId(facts.conversation.id, 'Conversation.id'),
+    turnId: requireId(facts.turn.id, 'Turn.id'),
+    ownerId: requireId(facts.lease.owner_id, 'ExecutionLease.owner_id'),
+    hostBootId: requireId(facts.lease.host_boot_id, 'ExecutionLease.host_boot_id'),
+    generation: requireBigInt(facts.lease.generation, 'ExecutionLease.generation').toString(),
+    expiresAt: requireText(facts.lease.expires_at, 'ExecutionLease.expires_at')
+  };
+}
+
+function isEffectDispatchRequestEnvelope(value: unknown): value is EffectDispatchRequestEnvelope {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const envelope = value as Record<string, unknown>;
+  if (envelope.kind !== 'limcode-effect-dispatch-request') return false;
+  const fence = envelope.dispatchFence;
+  if (!fence || typeof fence !== 'object' || Array.isArray(fence)) return false;
+  const record = fence as Record<string, unknown>;
+  return [
+    record.executionLeaseId,
+    record.conversationId,
+    record.turnId,
+    record.ownerId,
+    record.hostBootId,
+    record.expiresAt
+  ].every((entry) => typeof entry === 'string' && entry.length > 0)
+    && typeof record.generation === 'string'
+    && /^[1-9]\d*$/.test(record.generation);
 }
 
 function requireBigInt(value: unknown, label: string): bigint {

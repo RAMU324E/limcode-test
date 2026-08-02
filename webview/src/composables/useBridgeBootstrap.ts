@@ -12,6 +12,8 @@ import { useConversationSettingsStore } from '@webview/stores/useConversationSet
 import { useSystemPromptStore } from '@webview/stores/useSystemPromptStore';
 import { useRuntimeContextStore } from '@webview/stores/useRuntimeContextStore';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
+import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
+import { useAgentStore } from '@webview/stores/useAgentStore';
 
 function globalSettingsSectionFromScope(scope: BridgeScope | undefined): GlobalSettingsSection | undefined {
   if (scope?.kind !== 'settings' || scope.level !== 'global') return undefined;
@@ -30,6 +32,8 @@ export function useBridgeBootstrap(): void {
   const systemPrompts = useSystemPromptStore();
   const runtimeContexts = useRuntimeContextStore();
   const interactions = useInteractionStore();
+  const modelProfiles = useModelProfileStore();
+  const agents = useAgentStore();
   const disposers: Array<() => void> = [];
 
   disposers.push(
@@ -51,6 +55,7 @@ export function useBridgeBootstrap(): void {
     bridge.on(BridgeMessageType.ConfigurationSnapshot, (message) => {
       if (!message.payload) return;
       clientState.applyConfigurationSnapshot(message.payload.state);
+      modelProfiles.reconcileSnapshot(message.correlationId);
       systemPrompts.reconcilePendingSave();
       runtimeContexts.reconcilePendingSave();
     }),
@@ -69,6 +74,12 @@ export function useBridgeBootstrap(): void {
     bridge.on(BridgeMessageType.Error, (message) => {
       const payload = message.payload;
       if (!payload) return;
+      if (payload.requestType === BridgeMessageType.ModelProfileScopeSet) {
+        modelProfiles.rejectPending(message.correlationId, payload.message);
+      }
+      if (payload.requestType === BridgeMessageType.ConversationAgentSelect) {
+        agents.rejectPending(message.correlationId, payload.message);
+      }
       if (
         payload.requestType === BridgeMessageType.GlobalSettingsGet
         || payload.requestType === BridgeMessageType.GlobalSettingsUpdate

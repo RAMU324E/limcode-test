@@ -8,9 +8,9 @@
 
 - 固定 Turn、Tool、Context、ChildExecution、Process、MCP 与 Client feed 的行为边界；
 - 保留 r3 已闭合的 Context DAG、RuntimeDelivery partial unique/InputLink 与 ChildExecution lineage；
-- 冻结 `cancel_subtree=required-first-release`；
+- 冻结 `interrupt_subtree=required-first-release`；
 - 冻结 `ProviderContinuation=disabled-full-request`，首发不建表、不发送 suffix；
-- 冻结 detached wrapper、bounded spool、atomic exit receipt 与 per-process output limits；
+- 冻结 detached wrapper、durable append-only spool、atomic exit receipt、分批登记与可续output pages；
 - 冻结 fork/MCP/Compression/Attachment/AskUser/TaskList/skills/rules/checkpoint disposition；
 - 将 D/F recovery 拆成六个稳定 ID 和唯一 owner；
 - 将 71 个 registered roots、registered files、9 个 global settings sections、conversation settings、scope links、skills/rules、Workspace 与 unknown files 纳入 physical manifest；
@@ -24,7 +24,7 @@
 - file proposal/approval/actual mutation；
 - foreground/background command、output/read/wait/stop 与跨宿主准确恢复；
 - independent Tool parallelism；
-- child spawn/send/wait/list/cancel/cancel_subtree 与 answer delivery；
+- child spawn/send/wait/list/cancel/interrupt_subtree 与 answer delivery；
 - Context compression、dry-run、historical replay 与 fork；
 - MCP settings/dynamic Tool；
 - bounded snapshot/changes/pagination；

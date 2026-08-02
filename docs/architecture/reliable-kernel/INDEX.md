@@ -63,4 +63,4 @@
 
 每个出口完成标准包含一次对抗自查：列出「本期最容易说谎的 5 个状态」和「最可能写出巨型文件的 3 个位置」，结论归档在本目录的 `reviews/` 子目录（按出口命名），作为后续出口的核对输入。
 
-当前计划只保留七个实施阶段、三个正式出口和四组直接校验器。r4 机器合同额外冻结 physical migration manifest、六个 recovery ID、detached process wrapper、每进程输出上限、Provider `disabled-full-request`、capability disposition、atomic gate IDs 与 9 个 installed smoke；人读文档只解释边界和实施顺序，不另立权威。
+当前计划只保留七个实施阶段、三个正式出口和四组直接校验器。机器合同额外冻结 physical migration manifest、六个 recovery ID、detached process wrapper、无总量截断的keyset输出登记与可续页面、Provider `disabled-full-request`、capability disposition、atomic gate IDs 与 9 个 installed smoke；人读文档只解释边界和实施顺序，不另立权威。

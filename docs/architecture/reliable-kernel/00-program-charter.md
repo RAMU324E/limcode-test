@@ -44,7 +44,7 @@
 
 这些决定已冻结，后续实现不得自行条件化：
 
-### cancel_subtree
+### interrupt_subtree
 
 首发必选。树遍历依据 `ChildExecutionParentLink`，同时终止活动 Turn 并取消 pending Intent；不得只做逐个 cancel 后仍在 UI 宣称支持子树终止。
 
@@ -54,7 +54,7 @@
 
 ### 后台进程
 
-采用 packaged detached wrapper、bounded spool、stable nonce/process group/start fingerprint 与 atomic exit receipt。无法证明时写 `outcome_unknown`；禁止伪造 exit code 或按裸 PID stop。wrapper 不是 daemon/broker。
+采用 packaged detached wrapper、durable append-only spool、stable nonce/process group/start fingerprint 与 atomic exit receipt。输出按keyset分批登记并用handle分页完整读取；无法证明时写 `outcome_unknown`；禁止伪造 exit code 或按裸 PID stop。wrapper 不是 daemon/broker。
 
 ### 能力去向
 
@@ -93,7 +93,7 @@ Stage F 拥有：
 - `recovery.answer-inbox-invariant`；
 - `recovery.delivery-pending`；
 - `recovery.foreground-answer-wait-expired`；
-- `recovery.cancelled-subtree-incomplete`。
+- `recovery.interrupted-subtree-incomplete`。
 
 同一 scan 不得由 D/F 重复实现；机器 target/action/owner 只在 `tool.json#recoveryScan` 定义。
 
@@ -132,7 +132,7 @@ Stage F 拥有：
 
 D/E 可在 C 稳定后并行；F 依赖 C/D/E 的 frozen interface；G 是唯一日常插件切换点。
 
-本 r4 没有首发可降级项。若未来改变 cancel_subtree 或 ProviderContinuation 决定，必须先修改机器合同、runtime domain exact set、gate ID 与阶段完成标准，不能在实现里静默降级。
+本 r4 没有首发可降级项。若未来改变 interrupt_subtree 或 ProviderContinuation 决定，必须先修改机器合同、runtime domain exact set、gate ID 与阶段完成标准，不能在实现里静默降级。
 
 ## 9. 测试和交付
 

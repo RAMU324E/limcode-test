@@ -38,7 +38,7 @@
 | `recovery.answer-inbox-invariant` | F | Answer/Inbox 原子不变量 |
 | `recovery.delivery-pending` | F | Delivery state machine |
 | `recovery.foreground-answer-wait-expired` | F | wait deadline 收口 |
-| `recovery.cancelled-subtree-incomplete` | F | lineage 终止续扫 |
+| `recovery.interrupted-subtree-incomplete` | F | lineage 终止续扫 |
 
 D 只建立 scanner framework；不得因此声称拥有 F 的四项规则。
 

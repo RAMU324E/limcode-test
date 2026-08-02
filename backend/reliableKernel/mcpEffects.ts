@@ -8,6 +8,7 @@ import {
 import { normalizePlainJson } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { handoffReason } from './executionLeaseFence';
 
 export type McpRiskLevel = 'read' | 'write' | 'command';
 
@@ -34,12 +35,18 @@ export type McpPreparationResult =
 export type McpCallObservation =
   | { outcome: 'succeeded'; result: unknown }
   | { outcome: 'failed'; error: string; result: unknown }
+  | { outcome: 'cancelled'; error: string }
   | { outcome: 'outcome_unknown'; error: string };
 
 /** Connection objects are intentionally memory-only and rebuilt from settings by the host. */
 export interface McpMemoryConnectionRegistry {
   toolAnnotations(serverId: string, toolName: string): Promise<McpToolAnnotations>;
-  callTool(serverId: string, toolName: string, args: Record<string, unknown>): Promise<unknown>;
+  callTool(
+    serverId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<unknown>;
 }
 
 /** Explicit pre/post-dispatch certainty supplied by the existing MCP adapter. */
@@ -115,13 +122,23 @@ export class McpEffectDispatcher {
     return { disposition: 'prepared', ...effect };
   }
 
-  public async dispatch(effectIntentIdInput: string): Promise<{
+  public async dispatch(effectIntentIdInput: string, signal?: AbortSignal): Promise<{
     observation: McpCallObservation | null;
     terminal: ToolTerminalResult | null;
   }> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
+    if (signal?.aborted) {
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      const cancelled = await this.effects.cancelPendingEffect({
+        source: { kind: 'internal', key: `mcp-call:${effectIntentId}:cancel-before-dispatch` },
+        effectIntentId,
+        detail: { reason: 'MCP call cancelled before capability dispatch.' }
+      });
+      if (cancelled) return { observation: null, terminal: cancelled.terminal ?? null };
+    }
     if (!await this.effects.claimEffectDispatch(effectIntentId)) return { observation: null, terminal: null };
-    const observation = await this.executeDispatched(effectIntentId);
+    const observation = await this.executeDispatched(effectIntentId, signal);
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     const recorded = await this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
@@ -137,7 +154,7 @@ export class McpEffectDispatcher {
   }
 
   /** Executes one committed dispatch. The returned observation may be lost and later recovered as unknown. */
-  public async executeDispatched(effectIntentIdInput: string): Promise<McpCallObservation> {
+  public async executeDispatched(effectIntentIdInput: string, signal?: AbortSignal): Promise<McpCallObservation> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     if (intent.effect_kind !== MCP_EFFECT_KIND || intent.dispatch_state !== 'dispatched') {
@@ -147,20 +164,49 @@ export class McpEffectDispatcher {
       throw new Error('mcp_tool_call already has a Receipt and cannot execute again.');
     }
     const request = normalizeRequest(await this.effects.readEffectRequest<McpToolCallRequest>(effectIntentId));
+    if (signal?.aborted) {
+      return { outcome: 'cancelled', error: 'MCP call was cancelled before the connection was invoked.' };
+    }
+    const abortWaiter = createAbortWaiter(signal);
+    if (signal?.aborted) {
+      abortWaiter.dispose();
+      return { outcome: 'cancelled', error: 'MCP call was cancelled before the connection was invoked.' };
+    }
+    let call: Promise<unknown>;
     try {
-      const result = await this.connections.callTool(request.serverId, request.toolName, request.arguments);
+      call = this.connections.callTool(
+        request.serverId,
+        request.toolName,
+        request.arguments,
+        signal
+      );
+    } catch (error) {
+      abortWaiter.dispose();
+      return mcpInvocationFailure(error, signal);
+    }
+    const invocation = Promise.resolve(call).then(
+      (result) => ({ kind: 'result' as const, result }),
+      (error: unknown) => ({ kind: 'error' as const, error })
+    );
+    const settled = abortWaiter.promise
+      ? await Promise.race([invocation, abortWaiter.promise])
+      : await invocation;
+    abortWaiter.dispose();
+    if (settled.kind === 'aborted') {
+      return {
+        outcome: 'outcome_unknown',
+        error: 'MCP call was dispatched, then its foreground observation was cancelled before a result was proved.'
+      };
+    }
+    if (settled.kind === 'error') return mcpInvocationFailure(settled.error, signal);
+    try {
+      const result = settled.result;
       if (isObservedMcpToolFailure(result)) {
         return { outcome: 'failed', error: mcpFailureMessage(result), result };
       }
       return { outcome: 'succeeded', result };
     } catch (error) {
-      if (error instanceof McpInvocationError && error.certainty !== 'ambiguous_after_dispatch') {
-        return { outcome: 'failed', error: error.message, result: null };
-      }
-      return {
-        outcome: 'outcome_unknown',
-        error: `MCP call was dispatched but its result cannot be proved: ${errorMessage(error)}`
-      };
+      return mcpInvocationFailure(error, signal);
     }
   }
 
@@ -301,4 +347,38 @@ function requireMcpReceiptOutcome(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function mcpInvocationFailure(error: unknown, signal: AbortSignal | undefined): McpCallObservation {
+  if (error instanceof McpInvocationError && error.certainty !== 'ambiguous_after_dispatch') {
+    if (signal?.aborted && error.certainty === 'not_dispatched') {
+      return { outcome: 'cancelled', error: error.message };
+    }
+    return { outcome: 'failed', error: error.message, result: null };
+  }
+  return {
+    outcome: 'outcome_unknown',
+    error: `MCP call was dispatched but its result cannot be proved: ${errorMessage(error)}`
+  };
+}
+
+function createAbortWaiter(signal: AbortSignal | undefined): {
+  promise?: Promise<{ kind: 'aborted' }>;
+  dispose(): void;
+} {
+  if (!signal) return { dispose() {} };
+  let listener: (() => void) | undefined;
+  const promise = signal.aborted
+    ? Promise.resolve({ kind: 'aborted' as const })
+    : new Promise<{ kind: 'aborted' }>((resolve) => {
+        listener = () => resolve({ kind: 'aborted' });
+        signal.addEventListener('abort', listener, { once: true });
+      });
+  return {
+    promise,
+    dispose() {
+      if (listener) signal.removeEventListener('abort', listener);
+      listener = undefined;
+    }
+  };
 }

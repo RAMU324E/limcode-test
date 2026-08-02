@@ -21,8 +21,10 @@ export interface McpSettingsAuthority {
 export class McpRuntimeManager implements McpMemoryConnectionRegistry {
   private readonly connections = new Map<string, McpConnection>();
   private readonly disabledSources = new Map<string, McpToolSourceRecord>();
-  private refreshing = Promise.resolve();
+  private refreshGeneration = 0;
+  private activeRefresh: { generation: number; controller: AbortController; task: Promise<void> } | undefined;
   private onStateChange: (() => void) | undefined;
+  private disposed = false;
 
   public constructor(private readonly storage: McpSettingsAuthority) {}
 
@@ -30,14 +32,30 @@ export class McpRuntimeManager implements McpMemoryConnectionRegistry {
     this.onStateChange = listener;
   }
 
-  public async refreshFromSettings(options: { discover: boolean } = { discover: true }): Promise<void> {
-    this.refreshing = this.refreshing.then(() => this.refreshNow(options)).catch((error) => {
-      console.warn('[LimCode] Failed to refresh MCP servers:', error);
-    });
-    return this.refreshing;
+  public refreshFromSettings(options: { discover: boolean } = { discover: true }): Promise<void> {
+    if (this.disposed) return Promise.reject(new Error('MCP Runtime manager is disposed.'));
+    const generation = ++this.refreshGeneration;
+    this.activeRefresh?.controller.abort(new Error('MCP settings refresh was superseded.'));
+    const controller = new AbortController();
+    const task = this.refreshNow(options, generation, controller.signal)
+      .catch((error) => {
+        if (!this.disposed && controller.signal.aborted && generation < this.refreshGeneration) {
+          return this.activeRefresh?.task;
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (this.activeRefresh?.generation === generation) this.activeRefresh = undefined;
+      });
+    this.activeRefresh = { generation, controller, task };
+    return task;
   }
 
   public async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.activeRefresh?.controller.abort(new Error('MCP Runtime manager is disposing.'));
+    await this.activeRefresh?.task.catch(() => undefined);
     await Promise.all([...this.connections.values()].map((connection) => closeConnection(connection)));
     this.connections.clear();
     this.disabledSources.clear();
@@ -55,13 +73,25 @@ export class McpRuntimeManager implements McpMemoryConnectionRegistry {
     return { ...annotations };
   }
 
-  public async callTool(serverId: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {
+  public async callTool(
+    serverId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<unknown> {
     const connection = this.connections.get(serverId);
     if (!connection || !connection.annotations.has(toolName)) {
       throw new McpInvocationError('not_dispatched', `MCP tool is not connected: ${serverId}/${toolName}`);
     }
+    if (signal?.aborted) {
+      throw new McpInvocationError('not_dispatched', `MCP tool was cancelled before dispatch: ${serverId}/${toolName}`);
+    }
     try {
-      return await connection.client.callTool({ name: toolName, arguments: args });
+      return await connection.client.callTool(
+        { name: toolName, arguments: args },
+        undefined,
+        signal ? { signal } : undefined
+      );
     } catch (error) {
       throw new McpInvocationError(
         'ambiguous_after_dispatch',
@@ -77,50 +107,72 @@ export class McpRuntimeManager implements McpMemoryConnectionRegistry {
     ].sort((left, right) => left.name.localeCompare(right.name, 'zh-CN') || left.id.localeCompare(right.id));
   }
 
-  private async refreshNow(options: { discover: boolean }): Promise<void> {
+  private async refreshNow(
+    options: { discover: boolean },
+    generation: number,
+    signal: AbortSignal
+  ): Promise<void> {
     const loaded = await this.storage.loadGlobalSettings('mcpServers');
+    this.requireCurrentRefresh(generation, signal);
     const settings = loaded.settings as McpServersSettingsRecord;
     const wanted = new Map(settings.servers.map((server) => [server.id, server]));
-    this.disabledSources.clear();
-    let changed = false;
-
-    for (const [id, connection] of [...this.connections]) {
+    const obsolete = [...this.connections].filter(([id, connection]) => {
       const next = wanted.get(id);
-      if (!next || !next.enabled || !sameConnectionConfig(connection.config, next)) {
-        await closeConnection(connection);
-        this.connections.delete(id);
-        changed = true;
-      }
+      return !next || !next.enabled || !sameConnectionConfig(connection.config, next);
+    });
+    // Remove obsolete handles before the first await. A superseding generation must never observe
+    // a connection which this generation has already committed to closing.
+    for (const [id, connection] of obsolete) {
+      if (this.connections.get(id) === connection) this.connections.delete(id);
     }
+    if (obsolete.length > 0) this.notifyStateChange();
+    await Promise.all(obsolete.map(([, connection]) => closeConnection(connection)));
+    this.requireCurrentRefresh(generation, signal);
 
+    this.disabledSources.clear();
+    const connectable: McpServerConfigRecord[] = [];
     for (const server of settings.servers) {
       if (!server.enabled) {
         this.disabledSources.set(server.id, disabledSourceRecord(server));
-        changed = true;
         continue;
       }
       if (this.connections.has(server.id)) continue;
       if (!options.discover) {
         this.disabledSources.set(server.id, idleSourceRecord(server));
-        changed = true;
         continue;
       }
       const connecting = connectingSourceRecord(server);
       this.disabledSources.set(server.id, connecting);
-      this.notifyStateChange();
+      connectable.push(server);
+    }
+    this.notifyStateChange();
+    await Promise.all(connectable.map(async (server) => {
+      const connecting = connectingSourceRecord(server);
       try {
-        const connection = await connectServer(server);
+        const connection = await connectServer(server, signal);
+        if (!this.isCurrentRefresh(generation, signal)) {
+          await closeConnection(connection);
+          return;
+        }
         this.disabledSources.delete(server.id);
         this.connections.set(server.id, connection);
-        changed = true;
         this.notifyStateChange();
       } catch (error) {
+        if (!this.isCurrentRefresh(generation, signal)) return;
         this.disabledSources.set(server.id, { ...connecting, status: 'error', lastError: messageFromError(error), updatedAt: Date.now() });
-        changed = true;
         this.notifyStateChange();
       }
-    }
-    if (changed) this.notifyStateChange();
+    }));
+    this.requireCurrentRefresh(generation, signal);
+  }
+
+  private isCurrentRefresh(generation: number, signal: AbortSignal): boolean {
+    return !this.disposed && !signal.aborted && generation === this.refreshGeneration;
+  }
+
+  private requireCurrentRefresh(generation: number, signal: AbortSignal): void {
+    if (this.isCurrentRefresh(generation, signal)) return;
+    throw signal.reason instanceof Error ? signal.reason : new Error('MCP settings refresh was superseded.');
   }
 
   private notifyStateChange(): void {
@@ -128,7 +180,7 @@ export class McpRuntimeManager implements McpMemoryConnectionRegistry {
   }
 }
 
-async function connectServer(config: McpServerConfigRecord): Promise<McpConnection> {
+async function connectServer(config: McpServerConfigRecord, signal: AbortSignal): Promise<McpConnection> {
   validateConnectableConfig(config);
   const { Client, getDefaultEnvironment, StdioClientTransport, StreamableHTTPClientTransport } = await loadMcpSdkRuntime();
   const client = new Client(
@@ -146,29 +198,34 @@ async function connectServer(config: McpServerConfigRecord): Promise<McpConnecti
     : new StreamableHTTPClientTransport(new URL(config.transport.url), {
         requestInit: config.transport.headers ? { headers: config.transport.headers } : undefined
       });
-  await client.connect(transport);
-  const listed = await client.listTools();
-  const tools = listed.tools.map((tool) => mcpToolDeclaration(config, tool));
-  const annotations = new Map(listed.tools.map((tool) => [tool.name, {
-    ...(tool.annotations?.readOnlyHint === undefined ? {} : { readOnlyHint: tool.annotations.readOnlyHint }),
-    ...(tool.annotations?.destructiveHint === undefined ? {} : { destructiveHint: tool.annotations.destructiveHint })
-  }]));
-  return {
-    config,
-    client,
-    transport,
-    tools,
-    annotations,
-    status: {
-      id: config.id,
-      name: config.name,
-      transportKind: config.transport.kind,
-      enabled: true,
-      status: 'connected',
-      toolCount: tools.length,
-      updatedAt: Date.now()
-    }
-  };
+  try {
+    await client.connect(transport, { signal });
+    const listed = await client.listTools(undefined, { signal });
+    const tools = listed.tools.map((tool) => mcpToolDeclaration(config, tool));
+    const annotations = new Map(listed.tools.map((tool) => [tool.name, {
+      ...(tool.annotations?.readOnlyHint === undefined ? {} : { readOnlyHint: tool.annotations.readOnlyHint }),
+      ...(tool.annotations?.destructiveHint === undefined ? {} : { destructiveHint: tool.annotations.destructiveHint })
+    }]));
+    return {
+      config,
+      client,
+      transport,
+      tools,
+      annotations,
+      status: {
+        id: config.id,
+        name: config.name,
+        transportKind: config.transport.kind,
+        enabled: true,
+        status: 'connected',
+        toolCount: tools.length,
+        updatedAt: Date.now()
+      }
+    };
+  } catch (error) {
+    await transport.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 interface McpSdkRuntime {

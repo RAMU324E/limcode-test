@@ -4,6 +4,7 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
+import { conversationProjectLinkInsertStep } from './conversationProject';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface ConversationForkCommand {
@@ -13,6 +14,8 @@ export interface ConversationForkCommand {
   sourceConversationId: string;
   sourceContextRootId: string;
   sourceMessageRevisionId?: string;
+  /** Optional UI CAS: the selected Message must still point at this exact revision at commit. */
+  expectedCurrentMessageRevisionId?: string;
   sourceTurnId?: string;
   sourceToolCallId?: string;
   expectedSourceHeadRootId?: string;
@@ -44,9 +47,9 @@ interface ForkIds {
 }
 
 /**
- * Phase F Conversation fork writer. It creates the target, its Context head and all three relation
- * domains in one SQLite transaction. Context nodes are immutable and therefore referenced, never
- * copied into the target Conversation.
+ * Phase F Conversation fork writer. It creates the target, its Context head, fork relation domains
+ * and optional ProjectContext relationship in one SQLite transaction. Context nodes are immutable
+ * and therefore referenced, never copied into the target Conversation.
  */
 export class ConversationForkControlPlane {
   private readonly now: () => string;
@@ -59,10 +62,37 @@ export class ConversationForkControlPlane {
   }
 
   public async fork(commandInput: ConversationForkCommand): Promise<ConversationForkResult> {
-    const command = normalizeForkCommand(commandInput);
+    let command: ResolvedForkCommand = normalizeForkCommand(commandInput);
     const ids = forkIds(command);
     const replay = await this.findReplay(command, ids);
     if (replay) return replay;
+
+    const sourceProjectSnapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ConversationProjectLink').list({
+        where: { conversation_id: command.sourceConversationId },
+        limit: 2
+      })
+    ]);
+    const sourceProjectLinks = requireRows(
+      sourceProjectSnapshot.snapshot[0],
+      'ConversationProjectLink fork source lookup'
+    );
+    if (sourceProjectLinks.length > 1) {
+      throw new Error('Fork source Conversation has multiple ProjectContext relationships.');
+    }
+    const sourceProjectLink = sourceProjectLinks[0] ?? null;
+    if (sourceProjectLink && sourceProjectLink.role !== 'primary') {
+      throw new Error('Fork source Conversation has a non-primary ProjectContext relationship.');
+    }
+    command = {
+      ...command,
+      ...(sourceProjectLink
+        ? { sourceProjectContextId: requireId(
+            sourceProjectLink.project_context_id,
+            'ConversationProjectLink.project_context_id'
+          ) }
+        : {})
+    };
 
     const sourceSnapshot = await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('Conversation').get(command.sourceConversationId),
@@ -79,6 +109,9 @@ export class ConversationForkControlPlane {
         : []),
       ...(command.sourceToolCallId
         ? [DOMAIN_REPOSITORIES.domain('ToolCall').get(command.sourceToolCallId)]
+        : []),
+      ...(command.sourceProjectContextId
+        ? [DOMAIN_REPOSITORIES.domain('ProjectContext').get(command.sourceProjectContextId)]
         : [])
     ]);
     let cursor = 0;
@@ -108,11 +141,33 @@ export class ConversationForkControlPlane {
     const sourceToolCall = command.sourceToolCallId
       ? requireRow(sourceSnapshot.snapshot[cursor++], `ToolCall ${command.sourceToolCallId}`)
       : null;
+    const sourceProjectContext = command.sourceProjectContextId
+      ? requireRow(sourceSnapshot.snapshot[cursor++], `ProjectContext ${command.sourceProjectContextId}`)
+      : null;
     if (sourceTurn && sourceTurn.conversation_id !== command.sourceConversationId) {
       throw new Error('Fork source Turn does not belong to the source Conversation.');
     }
     if (sourceToolCall && command.sourceTurnId && sourceToolCall.turn_id !== command.sourceTurnId) {
       throw new Error('Fork source ToolCall does not belong to the selected source Turn.');
+    }
+
+    let currentRevisionLink: DomainRow | null = null;
+    if (command.expectedCurrentMessageRevisionId) {
+      if (!sourceRevision || command.expectedCurrentMessageRevisionId !== command.sourceMessageRevisionId) {
+        throw new Error('Fork current-revision CAS requires the selected source MessageRevision.');
+      }
+      const currentSnapshot = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').list({
+          where: { message_id: requireId(sourceRevision.message_id, 'MessageRevision.message_id') },
+          limit: 2
+        })
+      ]);
+      const currentRows = requireRows(currentSnapshot.snapshot[0], 'MessageCurrentRevisionLink fork source lookup');
+      if (
+        currentRows.length !== 1
+        || currentRows[0].revision_id !== command.expectedCurrentMessageRevisionId
+      ) throw new Error('Fork source Message current Revision is stale.');
+      currentRevisionLink = currentRows[0];
     }
 
     let sourceMembership: DomainRow | null = null;
@@ -158,6 +213,15 @@ export class ConversationForkControlPlane {
             revision_seq: sourceRevision.revision_seq
           })]
         : []),
+      ...(currentRevisionLink
+        ? [DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(
+            requireId(currentRevisionLink.id, 'MessageCurrentRevisionLink.id'),
+            {
+              message_id: sourceRevision!.message_id,
+              revision_id: command.expectedCurrentMessageRevisionId
+            }
+          )]
+        : []),
       ...(sourceMembership
         ? [DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').assert(
             requireId(sourceMembership.id, 'MessagePartOfConversation.id'),
@@ -174,6 +238,24 @@ export class ConversationForkControlPlane {
             turn_id: sourceToolCall.turn_id
           })]
         : []),
+      ...(sourceProjectLink && sourceProjectContext
+        ? [
+            DOMAIN_REPOSITORIES.domain('ConversationProjectLink').assert(
+              requireId(sourceProjectLink.id, 'ConversationProjectLink.id'),
+              {
+                conversation_id: command.sourceConversationId,
+                project_context_id: command.sourceProjectContextId,
+                role: 'primary'
+              }
+            ),
+            DOMAIN_REPOSITORIES.domain('ProjectContext').assert(command.sourceProjectContextId!, {
+              kind: sourceProjectContext.kind,
+              uri: sourceProjectContext.uri
+            })
+          ]
+        : [DOMAIN_REPOSITORIES.domain('ConversationProjectLink').assertNone({
+            conversation_id: command.sourceConversationId
+          })]),
       DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: ids.targetConversationId,
         title: command.targetTitle,
@@ -208,6 +290,13 @@ export class ConversationForkControlPlane {
         created_at: now,
         updated_at: now
       }),
+      ...(command.sourceProjectContextId
+        ? [conversationProjectLinkInsertStep({
+            conversationId: ids.targetConversationId,
+            projectContextId: command.sourceProjectContextId,
+            now
+          })]
+        : []),
       DOMAIN_REPOSITORIES.domain('ConversationReuseLink').insert({
         id: ids.reuseLinkId,
         reuse_key: command.reuseKey,
@@ -251,7 +340,7 @@ export class ConversationForkControlPlane {
   }
 
   private async findReplay(
-    command: ReturnType<typeof normalizeForkCommand>,
+    command: ResolvedForkCommand,
     ids: ForkIds
   ): Promise<ConversationForkResult | null> {
     const snapshot = await this.database.snapshot([
@@ -264,7 +353,11 @@ export class ConversationForkControlPlane {
       DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').get(ids.targetHeadLinkId),
       DOMAIN_REPOSITORIES.domain('AgentConversationLink').get(ids.targetAgentLinkId),
       DOMAIN_REPOSITORIES.domain('ConversationBranchLink').get(ids.branchLinkId),
-      DOMAIN_REPOSITORIES.domain('ConversationOriginLink').get(ids.originLinkId)
+      DOMAIN_REPOSITORIES.domain('ConversationOriginLink').get(ids.originLinkId),
+      DOMAIN_REPOSITORIES.domain('ConversationProjectLink').list({
+        where: { conversation_id: ids.targetConversationId },
+        limit: 2
+      })
     ]);
     const reuseRows = requireRows(snapshot.snapshot[0], 'ConversationReuseLink replay lookup');
     if (reuseRows.length === 0) return null;
@@ -276,6 +369,13 @@ export class ConversationForkControlPlane {
     const agentLink = requireRow(snapshot.snapshot[4], `AgentConversationLink ${ids.targetAgentLinkId}`);
     const branch = requireRow(snapshot.snapshot[5], `ConversationBranchLink ${ids.branchLinkId}`);
     const origin = requireRow(snapshot.snapshot[6], `ConversationOriginLink ${ids.originLinkId}`);
+    const targetProjectLinks = requireRows(snapshot.snapshot[7], 'ConversationProjectLink replay lookup');
+    if (targetProjectLinks.length > 1) {
+      throw new Error(`Fork target Conversation ${ids.targetConversationId} has multiple project links.`);
+    }
+    if (targetProjectLinks[0] && targetProjectLinks[0].role !== 'primary') {
+      throw new Error(`Fork target Conversation ${ids.targetConversationId} has a non-primary project link.`);
+    }
     if (
       reuse.id !== ids.reuseLinkId
       || reuse.conversation_id !== ids.targetConversationId
@@ -319,6 +419,10 @@ function normalizeForkCommand(command: ConversationForkCommand) {
   const sourceConversationId = requireId(command.sourceConversationId, 'sourceConversationId');
   const sourceContextRootId = requireId(command.sourceContextRootId, 'sourceContextRootId');
   const sourceMessageRevisionId = optionalId(command.sourceMessageRevisionId, 'sourceMessageRevisionId');
+  const expectedCurrentMessageRevisionId = optionalId(
+    command.expectedCurrentMessageRevisionId,
+    'expectedCurrentMessageRevisionId'
+  );
   const sourceTurnId = optionalId(command.sourceTurnId, 'sourceTurnId');
   const sourceToolCallId = optionalId(command.sourceToolCallId, 'sourceToolCallId');
   const expectedSourceHeadRootId = optionalId(command.expectedSourceHeadRootId, 'expectedSourceHeadRootId');
@@ -328,12 +432,16 @@ function normalizeForkCommand(command: ConversationForkCommand) {
   if (sourceToolCallId && !sourceTurnId) {
     throw new TypeError('sourceToolCallId requires sourceTurnId.');
   }
+  if (expectedCurrentMessageRevisionId && expectedCurrentMessageRevisionId !== sourceMessageRevisionId) {
+    throw new TypeError('expectedCurrentMessageRevisionId must equal sourceMessageRevisionId.');
+  }
   return {
     idempotencyKey,
     reuseKey,
     sourceConversationId,
     sourceContextRootId,
     ...(sourceMessageRevisionId ? { sourceMessageRevisionId } : {}),
+    ...(expectedCurrentMessageRevisionId ? { expectedCurrentMessageRevisionId } : {}),
     ...(sourceTurnId ? { sourceTurnId } : {}),
     ...(sourceToolCallId ? { sourceToolCallId } : {}),
     ...(expectedSourceHeadRootId ? { expectedSourceHeadRootId } : {}),
@@ -343,7 +451,11 @@ function normalizeForkCommand(command: ConversationForkCommand) {
   };
 }
 
-function forkIds(command: ReturnType<typeof normalizeForkCommand>): ForkIds {
+type ResolvedForkCommand = ReturnType<typeof normalizeForkCommand> & {
+  sourceProjectContextId?: string;
+};
+
+function forkIds(command: ResolvedForkCommand): ForkIds {
   const scope = JSON.stringify([
     command.idempotencyKey,
     command.reuseKey,
@@ -396,7 +508,9 @@ function isExpectedForkIdentityConflict(error: unknown): boolean {
     || message.includes('UNIQUE constraint failed: conversation_reuse_link.id')
     || message.includes('UNIQUE constraint failed: conversation.id')
     || message.includes('UNIQUE constraint failed: conversation_branch_link.target_conversation_id')
-    || message.includes('UNIQUE constraint failed: conversation_origin_link.conversation_id');
+    || message.includes('UNIQUE constraint failed: conversation_origin_link.conversation_id')
+    || message.includes('UNIQUE constraint failed: conversation_project_link.conversation_id')
+    || message.includes('UNIQUE constraint failed: conversation_project_link.id');
 }
 
 function requireRow(value: unknown, label: string): DomainRow {

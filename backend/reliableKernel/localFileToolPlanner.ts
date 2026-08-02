@@ -27,15 +27,17 @@ export class LocalFileToolPlanner {
   public async plan(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
+    authority: ReliableToolDispatchAuthority,
+    signal?: AbortSignal
   ): Promise<FileChangeProposalMemberInput[]> {
+    signal?.throwIfAborted();
     switch (definition.declaration.name) {
       case 'write':
-        return [await this.planWrite(input, authority)];
+        return this.planWrite(input, authority, signal);
       case 'edit':
-        return [await this.planEdit(input, authority)];
+        return [await this.planEdit(input, authority, signal)];
       case 'delete':
-        return this.planDelete(input, authority);
+        return this.planDelete(input, authority, signal);
       default:
         throw new Error(`Unsupported local file proposal tool: ${definition.declaration.name}.`);
     }
@@ -43,15 +45,18 @@ export class LocalFileToolPlanner {
 
   private async planWrite(
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
-  ): Promise<FileChangeProposalMemberInput> {
+    authority: ReliableToolDispatchAuthority,
+    signal?: AbortSignal
+  ): Promise<FileChangeProposalMemberInput[]> {
     const args = requireRecord(input.arguments, 'write arguments');
     const inputPath = requireText(args.path, 'write.path');
     const content = requireString(args.content, 'write.content');
     const resolved = await this.resolvePath(inputPath, authority);
+    signal?.throwIfAborted();
     const current = await inspectLocalTarget(resolved.absolutePath);
+    signal?.throwIfAborted();
     if (current.kind === 'directory') throw new Error(`write target is a directory: ${inputPath}`);
-    return {
+    const fileMember: FileChangeProposalMemberInput = {
       operation: current.kind === 'missing' ? 'create_file' : 'replace_file',
       workEnvironmentId: resolved.workEnvironmentId,
       targetPath: normalizedRelativeTarget(resolved),
@@ -63,16 +68,24 @@ export class LocalFileToolPlanner {
       targetContent: content,
       contentType: 'text/plain; charset=utf-8'
     };
+    if (current.kind !== 'missing') return [fileMember];
+    return [
+      ...await planMissingParentDirectories(resolved, signal),
+      fileMember
+    ];
   }
 
   private async planEdit(
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
+    authority: ReliableToolDispatchAuthority,
+    signal?: AbortSignal
   ): Promise<FileChangeProposalMemberInput> {
     const args = requireRecord(input.arguments, 'edit arguments');
     const inputPath = requireText(args.path, 'edit.path');
     const resolved = await this.resolvePath(inputPath, authority);
+    signal?.throwIfAborted();
     const current = await inspectLocalTarget(resolved.absolutePath);
+    signal?.throwIfAborted();
     if (current.kind !== 'file') throw new Error(`edit target must be an existing regular file: ${inputPath}`);
     const source = decodeUtf8Exact(current.bytes, inputPath);
     const target = applyEditArguments(source, args);
@@ -90,7 +103,8 @@ export class LocalFileToolPlanner {
 
   private async planDelete(
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
+    authority: ReliableToolDispatchAuthority,
+    signal?: AbortSignal
   ): Promise<FileChangeProposalMemberInput[]> {
     const args = requireRecord(input.arguments, 'delete arguments');
     if (!Array.isArray(args.paths) || args.paths.length === 0) {
@@ -98,9 +112,12 @@ export class LocalFileToolPlanner {
     }
     const members: FileChangeProposalMemberInput[] = [];
     for (let index = 0; index < args.paths.length; index += 1) {
+      signal?.throwIfAborted();
       const inputPath = requireText(args.paths[index], `delete.paths[${index}]`);
       const resolved = await this.resolvePath(inputPath, authority);
+      signal?.throwIfAborted();
       const current = await inspectLocalTarget(resolved.absolutePath);
+      signal?.throwIfAborted();
       members.push({
         operation: current.kind === 'directory' ? 'delete_directory_tree' : 'delete_file',
         workEnvironmentId: resolved.workEnvironmentId,
@@ -158,6 +175,57 @@ async function inspectLocalTarget(absolutePath: string): Promise<LocalTarget> {
   if (!stat.isFile()) throw new Error(`Unsupported filesystem target type: ${absolutePath}`);
   const bytes = await fs.readFile(absolutePath);
   return { kind: 'file', bytes, digest: createHash('sha256').update(bytes).digest('hex') };
+}
+
+/**
+ * Missing write parents are explicit proposal members, not an untracked dispatcher side effect.
+ * This makes approval, receipts and crash recovery cover every created directory as well as the
+ * final file. Existing path components must be real directories and may not be symbolic links.
+ */
+async function planMissingParentDirectories(
+  resolved: ResolvedLocalToolPath,
+  signal?: AbortSignal
+): Promise<FileChangeProposalMemberInput[]> {
+  signal?.throwIfAborted();
+  const relativeTarget = normalizedRelativeTarget(resolved);
+  const realRoot = await fs.realpath(path.resolve(resolved.rootPath));
+  const realTarget = path.resolve(realRoot, relativeTarget.split('/').join(path.sep));
+  const parent = path.dirname(realTarget);
+  const relativeParent = path.relative(realRoot, parent);
+  if (!relativeParent) return [];
+  if (relativeParent === '..' || relativeParent.startsWith(`..${path.sep}`) || path.isAbsolute(relativeParent)) {
+    throw new Error('Write parent escapes its declared work environment boundary.');
+  }
+
+  const members: FileChangeProposalMemberInput[] = [];
+  let current = realRoot;
+  let missingAncestor = false;
+  for (const component of relativeParent.split(path.sep).filter(Boolean)) {
+    signal?.throwIfAborted();
+    current = path.join(current, component);
+    if (!missingAncestor) {
+      try {
+        const stat = await fs.lstat(current);
+        if (stat.isSymbolicLink()) throw new Error(`Symbolic-link write parents are not allowed: ${current}`);
+        if (!stat.isDirectory()) throw new Error(`Write parent component is not a directory: ${current}`);
+        const canonical = await fs.realpath(current);
+        signal?.throwIfAborted();
+        if (path.resolve(canonical) !== path.resolve(current)) {
+          throw new Error(`Write parent does not resolve to its declared boundary path: ${current}`);
+        }
+        continue;
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+        missingAncestor = true;
+      }
+    }
+    members.push({
+      operation: 'create_directory',
+      workEnvironmentId: resolved.workEnvironmentId,
+      targetPath: path.relative(realRoot, current).split(path.sep).join('/')
+    });
+  }
+  return members;
 }
 
 function applyEditArguments(source: string, args: { [key: string]: unknown }): string {
@@ -252,6 +320,10 @@ function requirePositiveLine(value: unknown, label: string): number {
     throw new TypeError(`${label} must be a positive integer.`);
   }
   return value;
+}
+
+function isNotFound(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
 type PlainJsonValue = import('./plainJson').PlainJsonValue;

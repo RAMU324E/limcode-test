@@ -72,7 +72,7 @@ function createContentSecurityPolicy(
     `default-src 'none';`,
     `img-src ${webview.cspSource} https: data:${devHttpSourceList};`,
     `media-src ${webview.cspSource} data:${devHttpSourceList};`,
-    `font-src ${webview.cspSource}${devHttpSourceList};`,
+    `font-src ${webview.cspSource} data:${devHttpSourceList};`,
     `style-src ${webview.cspSource}${devHttpSourceList} 'unsafe-inline';`,
     `script-src 'nonce-${nonce}' ${webview.cspSource}${devHttpSourceList};`,
     devConnectSourceList ? `connect-src ${webview.cspSource} ${devConnectSourceList};` : ''

@@ -15,6 +15,7 @@ import {
 } from './runtimeServices';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { ContextCompressionControlPlane } from './contextCompression';
+import { ReliableContextCompressionCoordinator } from './contextCompressionCoordinator';
 import { ContextSequenceControlPlane } from './contextSequence';
 import type { RuntimeBuildInfoRecord } from '../../shared/protocol';
 import type { ReliableDiagnosticObserver } from './diagnosticJournal';
@@ -32,6 +33,11 @@ import { ModelProviderControlPlane } from './modelProviderControlPlane';
 import { PhaseDRecoveryScanner, type PhaseDRecoveryResult } from './phaseDRecovery';
 import { type PhaseFRecoveryResult } from './phaseFRecovery';
 import { ProcessControlPlane } from './processEffects';
+import { ChildOwnedProcessCleanupControlPlane } from './childOwnedProcessCleanup';
+import {
+  ProcessCompletionDeliveryControlPlane,
+  type ProcessCompletionWakeHandler
+} from './processCompletionDelivery';
 import { RootAuthority } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { ToolInteractionControlPlane } from './toolInteractions';
@@ -40,6 +46,7 @@ import {
   type TurnAuthorityCompiler
 } from './turnControlPlane';
 import { TurnOutputControlPlane } from './turnOutput';
+import { ExecutionHandoffError } from './executionLeaseFence';
 import { ReliableKernelWebviewFeedBridge } from './webviewFeedBridge';
 
 export interface ReliableKernelToolDispatcherContext {
@@ -81,6 +88,7 @@ export interface ReliableKernelApplicationDependencies {
   lifecycleObserver?: ReliableAgentLifecycleObserver;
   diagnosticObserver?: ReliableDiagnosticObserver;
   runtimeBuildInfo?: () => RuntimeBuildInfoRecord;
+  processCompletionWakeHandler?: ProcessCompletionWakeHandler;
   now?: () => string;
 }
 
@@ -102,10 +110,13 @@ export class ReliableKernelApplication {
   public readonly runtime: ReliableKernelRuntimeServices;
   public readonly context: ContextSequenceControlPlane;
   public readonly compression: ContextCompressionControlPlane;
+  public readonly compressionCoordinator: ReliableContextCompressionCoordinator;
   public readonly modelProvider: ModelProviderControlPlane;
   public readonly files: FileChangeControlPlane;
   public readonly fileMutations: FileMutationDispatcher;
   public readonly processes: ProcessControlPlane;
+  public readonly childOwnedProcessCleanup: ChildOwnedProcessCleanupControlPlane;
+  public readonly processDeliveries: ProcessCompletionDeliveryControlPlane;
   public readonly mcp: McpEffectDispatcher;
   public readonly interactions: ToolInteractionControlPlane;
   public readonly attachments: AttachmentIngestService;
@@ -117,6 +128,7 @@ export class ReliableKernelApplication {
   public readonly webviewFeed: ReliableKernelWebviewFeedBridge;
 
   private closePromise: Promise<void> | undefined;
+  private handoffPromise: Promise<void> | undefined;
   private readonly providers: ReliableAgentProviderRegistry;
   private readonly diagnosticObserver: ReliableDiagnosticObserver | undefined;
 
@@ -139,6 +151,13 @@ export class ReliableKernelApplication {
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
     this.compression = new ContextCompressionControlPlane(database, contentStore, options);
     this.modelProvider = new ModelProviderControlPlane(database, contentStore, options);
+    this.compressionCoordinator = new ReliableContextCompressionCoordinator(
+      database,
+      contentStore,
+      this.modelProvider,
+      dependencies.providers,
+      options
+    );
     this.files = new FileChangeControlPlane(database, contentStore, this.runtime.effects, options);
     this.fileMutations = new FileMutationDispatcher(
       database,
@@ -152,8 +171,54 @@ export class ReliableKernelApplication {
       this.runtime.effects,
       authority,
       database.binding,
-      options
+      {
+        ...options,
+        onExitObserverError: ({ processId, error }) => dependencies.diagnosticObserver?.observe({
+          eventKind: 'process.exit_observer.failed',
+          scopeKind: 'runtime',
+          correlationId: processId,
+          metadata: {
+            kind: 'process-exit-observer',
+            status: 'failed',
+            hostBootId: database.hostBootId,
+            errorName: safeErrorName(error)
+          }
+        })
+      }
     );
+    this.runtime.details.setProcessOutputReconciler((processId) =>
+      this.processes.snapshotOutputForDetail(processId)
+    );
+    this.childOwnedProcessCleanup = new ChildOwnedProcessCleanupControlPlane(
+      database,
+      this.processes,
+      dependencies.now
+    );
+    this.processDeliveries = new ProcessCompletionDeliveryControlPlane(
+      database,
+      contentStore,
+      this.processes,
+      this.runtime.deliveries,
+      {
+        ...options,
+        wakeHandler: dependencies.processCompletionWakeHandler,
+        onError: ({ scope, id, error }) => dependencies.diagnosticObserver?.observe({
+          eventKind: 'process.completion_delivery.failed',
+          scopeKind: 'runtime',
+          correlationId: id,
+          metadata: {
+            kind: 'process-completion-delivery',
+            scope,
+            status: 'failed',
+            hostBootId: database.hostBootId,
+            errorName: safeErrorName(error)
+          }
+        })
+      }
+    );
+    this.processes.setProcessReceiptObserver((processId) => {
+      this.processDeliveries.notifyProcessReceipt(processId);
+    });
     const mcpPolicyGate = dependencies.mcpPolicyGate
       ?? dependencies.createMcpPolicyGate?.({ database, contentStore })
       ?? missingMcpPolicyGate();
@@ -173,6 +238,8 @@ export class ReliableKernelApplication {
     this.turns = new TurnControlPlane(database, contentStore, {
       authorityCompiler: dependencies.authorityCompiler,
       unresolvedFileClosure: this.files,
+      prepareNextTurnDeliverySteps: (conversationId, turnId, now) =>
+        this.runtime.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now),
       ...options
     });
     this.turnOutput = new TurnOutputControlPlane(database, contentStore, options);
@@ -196,7 +263,9 @@ export class ReliableKernelApplication {
       this.turnOutput,
       this.modelProvider,
       this.runtime.effects,
+      this.runtime.deliveries,
       dependencies.providers,
+      this.compressionCoordinator,
       this.toolDispatcher,
       dependencies.transientObserver,
       dependencies.lifecycleObserver,
@@ -239,11 +308,21 @@ export class ReliableKernelApplication {
     await this.authority.validate(this.database.binding);
   }
 
-  /** Runs only registered deterministic recovery scans; it never retries ambiguous external effects. */
-  public async recover(): Promise<ReliableKernelRecoveryReport> {
+  /** Runs deterministic recovery and DB-only Context integrity maintenance; never retries ambiguous effects. */
+  public async recover(signal?: AbortSignal): Promise<ReliableKernelRecoveryReport> {
+    signal?.throwIfAborted();
     await this.validateBinding();
-    const phaseD = await this.phaseDRecovery.runAll();
-    const phaseF = await this.runtime.recovery.runAll();
+    signal?.throwIfAborted();
+    const phaseD = await this.phaseDRecovery.runAll(signal);
+    const phaseF = await this.runtime.recovery.runAll(signal);
+    signal?.throwIfAborted();
+    await this.childOwnedProcessCleanup.start();
+    // Orphan tool-pair cleanup is an explicit cutover/diagnostic maintenance command. Runtime
+    // mutations are transactionally closed now, so rescanning and materializing every Context
+    // lineage on each Host activation only stalls live commands without repairing a new crash edge.
+    signal?.throwIfAborted();
+    await this.processDeliveries.start();
+    await this.processes.startExitObservers();
     for (const result of phaseD) {
       this.diagnosticObserver?.observe({
         eventKind: 'recovery.scan.completed',
@@ -282,11 +361,33 @@ export class ReliableKernelApplication {
     this.closePromise = (async () => {
       this.webviewFeed.close();
       this.runtime.clientFeed.close();
-      await this.modelProvider.abortAllActiveDispatches();
+      await this.beginHandoff();
+      await this.childOwnedProcessCleanup.dispose();
+      await this.processes.dispose();
+      await this.processDeliveries.dispose();
       await this.toolDispatcher.dispose?.();
       await this.providers.dispose?.();
       await this.database.close();
     })();
     return this.closePromise;
   }
+
+  public beginHandoff(
+    reason = new ExecutionHandoffError('Reliable Runtime is closing for Host handoff.')
+  ): Promise<void> {
+    if (this.handoffPromise) return this.handoffPromise;
+    this.handoffPromise = Promise.allSettled([
+      this.modelProvider.quiesceAllActiveDispatches(reason),
+      Promise.resolve(this.toolDispatcher.quiesce?.(reason))
+    ]).then((results) => {
+      const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+      if (rejected) throw rejected.reason;
+    });
+    return this.handoffPromise;
+  }
+}
+
+function safeErrorName(error: unknown): string {
+  const name = error instanceof Error ? error.name : 'Error';
+  return /^[A-Za-z][A-Za-z0-9_.-]{0,80}$/.test(name) ? name : 'Error';
 }

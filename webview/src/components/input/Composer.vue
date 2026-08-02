@@ -2,10 +2,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
-import type { AgentRecord, InlineDataPart, LlmProviderConfigRecord, LlmProviderModelRecord, MessageContent, WorkEnvironmentRecord } from '@shared/protocol';
+import type { AgentRecord, InlineDataPart, LlmProviderConfigRecord, LlmProviderModelRecord, MessageContent, TurnAuthoritySelection, WorkEnvironmentRecord } from '@shared/protocol';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
-import { useConversationSettingsStore } from '@webview/stores/useConversationSettingsStore';
 import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { DEFAULT_WORKFLOW_OPTION_ID, useWorkflowStore } from '@webview/stores/useWorkflowStore';
@@ -21,6 +20,8 @@ import SettingsSelectableList, { type SettingsSelectableListItem } from '@webvie
 import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
+import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
+import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 
 const props = withDefaults(
   defineProps<{
@@ -32,12 +33,11 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
-  (event: 'submit', text: string, content?: MessageContent): void;
+  (event: 'submit', text: string, content: MessageContent | undefined, authority: TurnAuthoritySelection): void;
 }>();
 
 const clientState = useClientStateStore();
 const globalSettings = useGlobalSettingsStore();
-const conversationSettings = useConversationSettingsStore();
 const workflowStore = useWorkflowStore();
 const agentStore = useAgentStore();
 const modelProfileStore = useModelProfileStore();
@@ -45,7 +45,14 @@ const workEnvironmentStore = useWorkEnvironmentStore();
 const ui = useConversationUiStore();
 const session = useSessionStore();
 const reliableConversation = useReliableConversation();
-const { interruptCurrentConversation } = useChat();
+const {
+  interruptCurrentConversation,
+  interruptPending,
+  interruptPhase,
+  compressContext,
+  compressionPending,
+  currentAuthoritySelection
+} = useChat();
 const highlighted = ref(false);
 const editorExpanded = ref(false);
 const editor = ref<{ focus: () => void } | null>(null);
@@ -70,12 +77,23 @@ const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
 const sendTitle = computed(() => {
   if (ui.isEditing) return '提交编辑';
-  return execution.value ? '加入消息队列（不会解除当前审批或等待）' : '发送';
+  return currentExecution.value ? '加入消息队列（不会解除当前审批或等待）' : '发送';
 });
-const execution = computed(() => Object.values(reliableConversation.feed.records.Turn ?? {}).find((turn) =>
+const currentExecution = computed(() => Object.values(reliableConversation.feed.records.Turn ?? {}).find((turn) =>
   turn.conversation_id === reliableConversation.conversationId.value && turn.status === 'active'
 ));
-const interruptPending = ref(false);
+const canCompressCurrentContext = computed(() =>
+  !currentExecution.value
+  && !compressionPending.value
+  && !!reliableConversation.conversationId.value
+  && reliableConversation.projection.value.messages.length >= 2
+);
+
+function compressCurrentContext(): void {
+  const conversationId = reliableConversation.conversationId.value;
+  if (!conversationId || !canCompressCurrentContext.value) return;
+  compressContext(conversationId, { kind: 'current_head' });
+}
 const channelOptions = computed<SettingsDropdownOption[]>(() =>
   globalSettings.llmProviderConfigs.configs.map((config) => {
     const model = selectedModelForConfig(config);
@@ -138,9 +156,8 @@ const activeWorkflowId = computed({
 const activeChannelId = computed({
   get: () => {
     const conversationId = clientState.currentConversationId;
-    const llm = conversationSettings.llm.conversationId === conversationId ? conversationSettings.llm : undefined;
     const profileConfigId = conversationId ? modelProfileStore.localProfileFor('conversation', conversationId).profile?.providerConfigId?.trim() : '';
-    return llm?.activeProviderConfigId || profileConfigId || globalSettings.llm.activeProviderConfigId || globalSettings.activeLlmProviderConfig?.id || '';
+    return profileConfigId || globalSettings.llm.activeProviderConfigId || globalSettings.activeLlmProviderConfig?.id || '';
   },
   set: (configId: string) => selectChannel(configId)
 });
@@ -241,7 +258,7 @@ function submit(): void {
   const text = draft.value.trim();
   if ((!text && selectedAttachments.value.length === 0) || conversationInputDisabled.value) return;
   const content = buildMessageContent(text, selectedAttachments.value);
-  emit('submit', text, content);
+  emit('submit', text, content, currentTurnAuthoritySelection());
   selectedAttachments.value = [];
   if (!ui.isEditing) ui.clearChatDraft();
 }
@@ -331,7 +348,9 @@ function onAttachmentWheel(event: WheelEvent): void {
 }
 
 function interruptConversation(): void {
-  interruptCurrentConversation();
+  // Ordinary Stop closes only the parent-side foreground wait. Child subtree cancellation is a
+  // separate explicit authority and must never be inferred from the generic composer button.
+  interruptCurrentConversation(false);
 }
 
 function toggleEditorExpanded(): void {
@@ -389,13 +408,13 @@ function providerLabel(provider: string): string {
 
 function selectedModelForConfig(config: LlmProviderConfigRecord): string {
   const conversationId = clientState.currentConversationId;
-  const override = conversationId && conversationSettings.llm.conversationId === conversationId
-    ? conversationSettings.llm.modelOverrides?.[config.id]?.trim()
-    : undefined;
-  if (override && modelExistsInConfig(config, override)) return override;
   const profile = conversationId ? modelProfileStore.localProfileFor('conversation', conversationId).profile : undefined;
   const profileModel = profile?.providerConfigId?.trim() === config.id ? profile.model.trim() : '';
   return profileModel && modelExistsInConfig(config, profileModel) ? profileModel : config.model;
+}
+
+function currentTurnAuthoritySelection(): TurnAuthoritySelection {
+  return currentAuthoritySelection();
 }
 
 function modelExistsInConfig(config: LlmProviderConfigRecord, modelId: string): boolean {
@@ -443,7 +462,6 @@ function selectChannelModel(config: LlmProviderConfigRecord, item: SettingsSelec
   if (!config.models.some((model) => model.id === modelId)) return;
   const conversationId = clientState.currentConversationId;
   if (conversationId) {
-    conversationSettings.selectLlmModelForConversation(conversationId, config.id, modelId);
     setConversationModelProfile(conversationId, config, modelId);
   } else {
     globalSettings.selectLlmProviderConfigModel(config.id, modelId);
@@ -455,7 +473,6 @@ function selectChannel(configId: string): void {
   if (!configId) return;
   const conversationId = clientState.currentConversationId;
   if (conversationId) {
-    conversationSettings.selectLlmProviderConfigForConversation(conversationId, configId);
     const config = globalSettings.llmProviderConfigs.configs.find((candidate) => candidate.id === configId);
     if (config) setConversationModelProfile(conversationId, config, selectedModelForConfig(config));
     return;
@@ -562,6 +579,7 @@ function middleEllipsis(value: string, maxLength: number): string {
   <div class="composer" :class="{ 'is-editing': ui.isEditing, 'is-highlighted': highlighted, 'is-editor-expanded': editorExpanded }">
     <div class="composer-zone composer-zone-top" aria-label="输入框上方功能区">
       <div class="composer-top-main">
+        <ReliableAgentStatusPanel />
         <AskUserTopPanel />
         <div v-if="ui.isEditing" class="composer-edit-indicator">
           <span class="composer-edit-indicator-icon" aria-hidden="true">
@@ -673,11 +691,11 @@ function middleEllipsis(value: string, maxLength: number): string {
           <IconPaperclip class="composer-side-action-icon" stroke="2" aria-hidden="true" />
         </button>
         <button
-          v-if="execution"
+          v-if="currentExecution"
           type="button"
           class="composer-side-action composer-side-abort"
-          aria-label="终止当前对话正在执行的任务"
-          :title="interruptPending ? '正在提交身份围栏中断请求' : '中断当前 Turn（后台进程保持独立运行）'"
+          :aria-label="interruptPhase === 'stopping' ? '正在停止当前 Turn' : interruptPhase === 'requesting' ? '正在提交中断请求' : '终止当前对话正在执行的任务'"
+          :title="interruptPhase === 'stopping' ? '正在停止当前 Turn，等待运行租约释放' : interruptPhase === 'requesting' ? '正在提交身份围栏中断请求' : '中断当前 Turn（子 Agent 与后台进程继续独立运行）'"
           :disabled="interruptPending"
           @click="interruptConversation"
         >
@@ -780,6 +798,12 @@ function middleEllipsis(value: string, maxLength: number): string {
           />
         </template>
       </div>
+      <span
+        v-if="interruptPhase"
+        class="composer-interrupt-status"
+        data-testid="turn-interrupt-status"
+        role="status"
+      >{{ interruptPhase === 'stopping' ? '正在停止' : '正在请求停止' }}</span>
       <HoverTooltipPanel
         v-if="session.status === 'ready'"
         class="composer-runtime-tooltip"
@@ -796,6 +820,20 @@ function middleEllipsis(value: string, maxLength: number): string {
           {{ runtimeBadgeLabel }}
         </button>
       </HoverTooltipPanel>
+      <ReliableContextStatus class="composer-token-usage" />
+      <button
+        type="button"
+        class="composer-compact"
+        data-testid="compression-start-current"
+        :disabled="!canCompressCurrentContext"
+        aria-label="压缩当前上下文"
+        title="压缩当前上下文"
+        @click="compressCurrentContext"
+      >
+        <svg class="composer-compact-icon" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+          <path d="M5 5h14l-7 6zM5 19h14l-7-6z" />
+        </svg>
+      </button>
       <button
         type="button"
         class="composer-send"
@@ -1088,6 +1126,13 @@ function middleEllipsis(value: string, maxLength: number): string {
 
 .composer-meta code {
   font-size: inherit;
+}
+
+.composer-interrupt-status {
+  flex: 0 0 auto;
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
 }
 
 .composer-meta-dropdown {

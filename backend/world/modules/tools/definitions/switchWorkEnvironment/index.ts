@@ -13,9 +13,9 @@ export const switchWorkEnvironmentToolModule = defineToolDefinitionModule({
 export const switchWorkEnvironmentTool: ToolDefinition = {
   declaration: {
     name: SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
-    description: `Switch the current work environment. The work environment determines the root directory that tools like read, edit, write, and shell/bash use when resolving relative paths and the default cwd.
+    description: `Validate the work environment frozen for the current reliable Turn. The work environment determines the root directory that tools like read, edit, write, and shell/bash use when resolving relative paths and the default cwd.
 
-Just pass the target work environment id. After switching, subsequent tool arguments stay the same and still use relative paths / relative cwd.`,
+Reliable Turn authority is immutable: passing the already-active work environment id succeeds as an idempotent no-op, while requesting a different id is rejected. Select a different conversation work environment before starting the next Turn.`,
     parameters: {
       type: 'object',
       properties: {

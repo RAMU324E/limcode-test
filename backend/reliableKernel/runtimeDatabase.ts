@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import {
@@ -10,9 +12,13 @@ import {
 import type {
   ClientKeysetPageInput,
   ClientKeysetPageResult,
+  ConversationHistoryProjectionInput,
+  ConversationHistoryProjectionResult,
   ClientProjectionSnapshot,
   ContextContentMaterializationSnapshot,
   ContextMaterializationSnapshot,
+  ChildConversationOriginCandidate,
+  ChildProcessCleanupMaterializationCandidate,
   DatabaseWorkerData,
   DatabaseWorkerDiagnostics,
   DatabaseWorkerRequest,
@@ -20,12 +26,26 @@ import type {
   ModelStreamEventCommitResult,
   ModelRequestCancelInput,
   ModelRequestCancelResult,
+  EffectReceiptReconciliationCandidate,
+  ProcessOutputRegistrationMismatch,
   DatabaseWorkerRequestPayload,
   DatabaseWorkerResponse,
   SerializedWorkerError
 } from './databaseWorkerProtocol';
-import type { DomainRow, RepositoryListRead, RepositoryRead, RepositoryTransactionStep } from './repositories';
+import {
+  DOMAIN_REPOSITORIES,
+  type DomainRow,
+  type RepositoryListRead,
+  type RepositoryRead,
+  type RepositoryTransactionStep
+} from './repositories';
 import { RootAuthority } from './rootAuthority';
+import {
+  currentExecutionLeaseFence,
+  ExecutionHandoffError,
+  executionLeaseFenceAssertion,
+  type ExecutionLeaseFence
+} from './executionLeaseFence';
 
 export interface SnapshotSubscription<T> {
   barrier: SnapshotBarrier<T>;
@@ -42,6 +62,25 @@ export class RuntimeDatabaseWorkerError extends Error {
 }
 
 const OPEN_ROOT_POINTERS = new Set<string>();
+const HOST_LIVENESS_DIRECTORY = 'host-liveness';
+const HOST_HEARTBEAT_INTERVAL_MS = 5_000;
+// This does not shorten ExecutionLease ownership. A verifiably live process remains authoritative
+// regardless of heartbeat age; the grace is only a conservative fallback where the OS cannot
+// determine process identity/liveness.
+const HOST_HEARTBEAT_STALE_MS = 2 * 60_000;
+
+interface RuntimeHostLivenessRecord {
+  kind: 'limcode-runtime-host-liveness';
+  dataSetId: string;
+  rootInstanceId: string;
+  rootGeneration: number;
+  hostBootId: string;
+  livenessId: string;
+  processId: number;
+  processStartIdentity?: string;
+  startedAt: string;
+  heartbeatAt: string;
+}
 
 export class RuntimeDatabase {
   private readonly pending = new Map<number, {
@@ -51,6 +90,12 @@ export class RuntimeDatabase {
   private readonly commitListeners = new Set<(result: RuntimeCommitResult) => void>();
   private nextRequestId = 1;
   private closed = false;
+  private readonly livenessId = randomUUID();
+  private readonly startedAt = new Date().toISOString();
+  private readonly processStartIdentity = readProcessStartIdentity(process.pid);
+  private heartbeatTimer: NodeJS.Timeout | undefined;
+  private heartbeatTask: Promise<void> = Promise.resolve();
+  private heartbeatFailure: unknown;
 
   private constructor(
     private readonly authority: RootAuthority,
@@ -64,6 +109,8 @@ export class RuntimeDatabase {
     worker.on('error', (error) => this.failPending(error));
     worker.on('exit', (code) => {
       OPEN_ROOT_POINTERS.delete(this.registryKey);
+      this.stopHeartbeatTimer();
+      void this.unregisterHostLiveness().catch(() => undefined);
       if (!this.closed && code !== 0) this.failPending(new Error(`SQLite database worker exited with code ${code}.`));
     });
   }
@@ -82,7 +129,9 @@ export class RuntimeDatabase {
     const worker = createWorker({ mode: 'runtime', binding, hostBootId });
     try {
       const ready = await waitForReady(worker, 'runtime');
-      return new RuntimeDatabase(authority, binding, hostBootId, worker, ready.workerThreadId, registryKey);
+      const database = new RuntimeDatabase(authority, binding, hostBootId, worker, ready.workerThreadId, registryKey);
+      await database.registerHostLiveness();
+      return database;
     } catch (error) {
       OPEN_ROOT_POINTERS.delete(registryKey);
       await worker.terminate();
@@ -91,7 +140,20 @@ export class RuntimeDatabase {
   }
 
   public async transaction(steps: RepositoryTransactionStep[]): Promise<RuntimeCommitResult> {
-    return this.request<RuntimeCommitResult>({ kind: 'transaction', steps });
+    const fence = currentExecutionLeaseFence();
+    const fencedSteps = fence
+      ? [
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(
+            fence.id,
+            executionLeaseFenceAssertion(fence)
+          ),
+          ...steps
+        ]
+      : steps;
+    return this.requestWithExecutionFence(
+      fence,
+      { kind: 'transaction', steps: fencedSteps }
+    );
   }
 
   public async snapshot(
@@ -103,6 +165,28 @@ export class RuntimeDatabase {
   /** Reads every page of one repository list inside one SQLite read transaction. */
   public async snapshotAll(read: RepositoryListRead): Promise<SnapshotBarrier<DomainRow[]>> {
     return this.request<SnapshotBarrier<DomainRow[]>>({ kind: 'snapshotAll', read });
+  }
+
+  /** DB-side aggregate: returns only terminal processes whose registered chunk facts are incomplete. */
+  public async processOutputRegistrationMismatches(): Promise<ProcessOutputRegistrationMismatch[]> {
+    return this.request<ProcessOutputRegistrationMismatch[]>({ kind: 'processOutputRegistrationMismatches' });
+  }
+
+  /** DB-side anti-join: only receipt-written effects whose terminal projection is incomplete. */
+  public async effectReceiptReconciliationCandidates(): Promise<EffectReceiptReconciliationCandidate[]> {
+    return this.request<EffectReceiptReconciliationCandidate[]>({ kind: 'effectReceiptReconciliationCandidates' });
+  }
+
+  /** DB-side anti-join: only Child Conversations missing their immutable origin fact. */
+  public async childConversationOriginCandidates(): Promise<ChildConversationOriginCandidate[]> {
+    return this.request<ChildConversationOriginCandidate[]>({ kind: 'childConversationOriginCandidates' });
+  }
+
+  /** DB-side anti-join: only interruption/process pairs missing their cleanup outbox row. */
+  public async childProcessCleanupMaterializationCandidates(): Promise<ChildProcessCleanupMaterializationCandidate[]> {
+    return this.request<ChildProcessCleanupMaterializationCandidate[]>({
+      kind: 'childProcessCleanupMaterializationCandidates'
+    });
   }
 
   /**
@@ -140,6 +224,42 @@ export class RuntimeDatabase {
 
   public async clientKeysetPage(input: ClientKeysetPageInput): Promise<ClientKeysetPageResult> {
     return this.request<ClientKeysetPageResult>({ kind: 'clientKeysetPage', input });
+  }
+
+  public async conversationHistoryProjection(
+    input: ConversationHistoryProjectionInput
+  ): Promise<ConversationHistoryProjectionResult> {
+    return this.request<ConversationHistoryProjectionResult>({ kind: 'conversationHistoryProjection', input });
+  }
+
+  /**
+   * Connection-local SQLite data version observed by this worker's writer connection. It changes
+   * only after another SQLite connection commits, so client feeds can discover commits produced by
+   * a different Extension Host without turning local streaming commits into snapshot churn.
+   */
+  public async externalDataVersion(): Promise<string> {
+    const version = await this.request<string>({ kind: 'externalDataVersion' });
+    if (!/^\d+$/.test(version)) throw new TypeError('SQLite external data version must be decimal.');
+    return version;
+  }
+
+  /**
+   * Cross-Extension-Host liveness used before rebinding an ExecutionLease. The file identity is
+   * bound to this immutable Runtime root and Host boot; a definitely dead/reused pid is rejected
+   * immediately. A verifiably live process is never displaced merely because its event loop was
+   * delayed; heartbeat age is consulted only when the OS process result is inconclusive.
+   */
+  public async isHostAlive(hostBootIdInput: string): Promise<boolean> {
+    const hostBootId = requireNonEmptyText(hostBootIdInput, 'hostBootId');
+    if (hostBootId === this.hostBootId) return !this.closed && this.heartbeatFailure === undefined;
+    await this.authority.validate(this.binding);
+    const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
+    if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
+    const processState = inspectRecordedProcess(record);
+    if (processState === 'dead') return false;
+    if (processState === 'alive') return true;
+    const heartbeatAt = Date.parse(record.heartbeatAt);
+    return Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= HOST_HEARTBEAT_STALE_MS;
   }
 
   public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
@@ -194,13 +314,60 @@ export class RuntimeDatabase {
   public async commitModelStreamEvent(
     input: ModelStreamEventCommitInput
   ): Promise<ModelStreamEventCommitResult> {
-    return this.request<ModelStreamEventCommitResult>({ kind: 'modelStreamEvent', input });
+    const executionFence = currentExecutionLeaseFence();
+    return this.requestWithExecutionFence(executionFence, {
+      kind: 'modelStreamEvent',
+      input: executionFence ? { ...input, executionFence } : input
+    });
   }
 
   public async cancelCurrentModelRequest(
     input: ModelRequestCancelInput
   ): Promise<ModelRequestCancelResult> {
-    return this.request<ModelRequestCancelResult>({ kind: 'cancelCurrentModelRequest', input });
+    const executionFence = currentExecutionLeaseFence();
+    return this.requestWithExecutionFence(executionFence, {
+      kind: 'cancelCurrentModelRequest',
+      input: executionFence ? { ...input, executionFence } : input
+    });
+  }
+
+  /**
+   * An executor CAS and an ownership handoff can race. Ordinary assertion failures retain their
+   * original meaning while the captured lease still exists; once its immutable tuple is gone,
+   * however, the executor must stand down rather than terminalizing the Turn as a tool/model
+   * failure. The verification read is deliberately unfenced and never adopts a newer generation.
+   */
+  private async requestWithExecutionFence<T>(
+    fence: ExecutionLeaseFence | undefined,
+    request: DatabaseWorkerRequestPayload
+  ): Promise<T> {
+    try {
+      return await this.request<T>(request);
+    } catch (error) {
+      if (!fence || !isRuntimeTransactionAssertionError(error)) throw error;
+      const stillCurrent = await this.executionFenceStillCurrent(fence).catch(() => false);
+      if (stillCurrent) throw error;
+      const handoff = new ExecutionHandoffError(
+        `ExecutionLease generation ${fence.generation} no longer authorizes Turn ${fence.turnId}.`
+      );
+      (handoff as ExecutionHandoffError & { cause?: unknown }).cause = error;
+      throw handoff;
+    }
+  }
+
+  private async executionFenceStillCurrent(fence: ExecutionLeaseFence): Promise<boolean> {
+    const result = await this.request<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>>({
+      kind: 'snapshot',
+      reads: [DOMAIN_REPOSITORIES.domain('ExecutionLease').get(fence.id)]
+    });
+    const row = result.snapshot[0];
+    return !!row
+      && !Array.isArray(row)
+      && row.conversation_id === fence.conversationId
+      && row.turn_id === fence.turnId
+      && row.owner_id === fence.ownerId
+      && row.host_boot_id === fence.hostBootId
+      && row.generation === fence.generation;
   }
 
   public async inspect(): Promise<DatabaseWorkerDiagnostics> {
@@ -209,20 +376,90 @@ export class RuntimeDatabase {
 
   public async close(): Promise<void> {
     if (this.closed) return;
+    this.stopHeartbeatTimer();
     try {
+      await this.heartbeatTask.catch(() => undefined);
       await this.sendRequest<null>({ kind: 'close' });
     } finally {
       this.closed = true;
       OPEN_ROOT_POINTERS.delete(this.registryKey);
       this.commitListeners.clear();
       await this.worker.terminate();
+      await this.unregisterHostLiveness().catch(() => undefined);
     }
   }
 
   private async request<T>(request: DatabaseWorkerRequestPayload): Promise<T> {
     if (this.closed) throw new Error('RuntimeDatabase is closed.');
+    if (this.heartbeatFailure !== undefined) {
+      const error = new Error('RuntimeDatabase Host liveness heartbeat failed; requests are fenced until restart.') as Error & {
+        cause?: unknown;
+      };
+      error.cause = this.heartbeatFailure;
+      throw error;
+    }
     await this.authority.validate(this.binding);
     return this.sendRequest<T>(request);
+  }
+
+  private async registerHostLiveness(): Promise<void> {
+    await this.writeHostHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      this.heartbeatTask = this.heartbeatTask
+        .then(() => this.writeHostHeartbeat())
+        .catch((error) => {
+          this.heartbeatFailure = error;
+          this.stopHeartbeatTimer();
+          this.failPending(error);
+          this.closed = true;
+          this.commitListeners.clear();
+          void this.worker.terminate()
+            .finally(() => this.unregisterHostLiveness().catch(() => undefined));
+        });
+    }, HOST_HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref();
+  }
+
+  private async writeHostHeartbeat(): Promise<void> {
+    if (this.closed) return;
+    const record: RuntimeHostLivenessRecord = {
+      kind: 'limcode-runtime-host-liveness',
+      dataSetId: this.binding.dataSetId,
+      rootInstanceId: this.binding.rootInstanceId,
+      rootGeneration: this.binding.rootGeneration,
+      hostBootId: this.hostBootId,
+      livenessId: this.livenessId,
+      processId: process.pid,
+      ...(this.processStartIdentity ? { processStartIdentity: this.processStartIdentity } : {}),
+      startedAt: this.startedAt,
+      heartbeatAt: new Date().toISOString()
+    };
+    const target = this.hostLivenessPath(this.hostBootId);
+    const directory = path.dirname(target);
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const temporary = `${target}.${this.livenessId}.tmp`;
+    await fs.writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await fs.rename(temporary, target);
+  }
+
+  private async unregisterHostLiveness(): Promise<void> {
+    const target = this.hostLivenessPath(this.hostBootId);
+    const record = await readHostLiveness(target);
+    if (record?.livenessId !== this.livenessId) return;
+    await fs.rm(target, { force: true });
+  }
+
+  private stopHeartbeatTimer(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+  }
+
+  private hostLivenessPath(hostBootId: string): string {
+    const digest = createHash('sha256')
+      .update('limcode-runtime-host-liveness\0')
+      .update(hostBootId)
+      .digest('hex');
+    return path.join(this.binding.paths.dataRootPath, HOST_LIVENESS_DIRECTORY, `${digest}.json`);
   }
 
   private sendRequest<T>(request: DatabaseWorkerRequestPayload): Promise<T> {
@@ -333,4 +570,80 @@ function waitForReady(
     worker.on('error', onError);
     worker.on('exit', onExit);
   });
+}
+
+function isRuntimeTransactionAssertionError(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+}
+
+async function readHostLiveness(filePath: string): Promise<RuntimeHostLivenessRecord | undefined> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
+  } catch (error) {
+    if (isNotFoundError(error)) return undefined;
+    // A torn/corrupt liveness record must never be interpreted as proof that another Host is alive.
+    return undefined;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.kind !== 'limcode-runtime-host-liveness'
+    || typeof record.dataSetId !== 'string'
+    || typeof record.rootInstanceId !== 'string'
+    || !Number.isSafeInteger(record.rootGeneration)
+    || typeof record.hostBootId !== 'string'
+    || typeof record.livenessId !== 'string'
+    || !Number.isSafeInteger(record.processId)
+    || typeof record.startedAt !== 'string'
+    || typeof record.heartbeatAt !== 'string'
+    || (record.processStartIdentity !== undefined && typeof record.processStartIdentity !== 'string')
+  ) return undefined;
+  return record as unknown as RuntimeHostLivenessRecord;
+}
+
+function sameLivenessRoot(record: RuntimeHostLivenessRecord, binding: RootBinding): boolean {
+  return record.dataSetId === binding.dataSetId
+    && record.rootInstanceId === binding.rootInstanceId
+    && record.rootGeneration === binding.rootGeneration;
+}
+
+function inspectRecordedProcess(record: RuntimeHostLivenessRecord): 'alive' | 'dead' | 'unknown' {
+  if (!Number.isSafeInteger(record.processId) || record.processId <= 0) return 'unknown';
+  try {
+    process.kill(record.processId, 0);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === 'ESRCH') return 'dead';
+    if (code === 'EPERM') return 'alive';
+    return 'unknown';
+  }
+  if (!record.processStartIdentity) return 'alive';
+  const currentIdentity = readProcessStartIdentity(record.processId);
+  if (currentIdentity === undefined) return 'unknown';
+  return currentIdentity === record.processStartIdentity ? 'alive' : 'dead';
+}
+
+/** Linux start ticks fence pid reuse; other platforms retain heartbeat + kill(0) semantics. */
+function readProcessStartIdentity(processId: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${processId}/stat`, 'utf8');
+    const closeParen = stat.lastIndexOf(')');
+    if (closeParen < 0) return undefined;
+    // Fields after comm begin at proc field 3 (state); starttime is proc field 22 => index 19.
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+    const startTicks = fields[19];
+    return startTicks && /^\d+$/.test(startTicks) ? startTicks : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function requireNonEmptyText(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw new TypeError(`${label} must be non-empty.`);
+  return value;
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException)?.code === 'ENOENT';
 }

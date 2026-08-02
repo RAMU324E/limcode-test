@@ -45,7 +45,11 @@ export function interactionViewFromReliableRuntime(input: {
       revision: 1,
       kind,
       state: reliableInteractionState(interaction.status),
-      choices: kind === 'ask_user' ? ['submit', 'cancel'] : ['accept', 'reject'],
+      choices: kind === 'ask_user'
+        ? ['submit', 'cancel']
+        : kind === 'plan_review'
+          ? ['accept', 'submit', 'reject', 'cancel']
+          : ['accept', 'reject'],
       payload: {},
       payloadDigest: interaction.id,
       policySnapshot: { mode: 'manual', policyVersion: 'reliable-runtime' },

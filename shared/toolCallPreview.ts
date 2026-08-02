@@ -1,12 +1,9 @@
 import {
   EDIT_TOOL_NAME,
   SUBMIT_PLAN_TOOL_NAME,
-  TOOL_CALL_PREVIEW_HEAD_CHARS,
   WRITE_TOOL_NAME,
   type ToolCallPreviewRecord
 } from './protocol';
-
-const DISPLAY_PREVIEW_CHARS = 6_000;
 
 export type ToolCallPreviewKind = 'write' | 'edit' | 'command' | 'plan' | 'generic';
 export type ToolCallPreviewRenderMode = 'markdown' | 'text' | 'json';
@@ -25,35 +22,147 @@ interface PartialJsonStringField {
   closed: boolean;
 }
 
-interface BoundedFieldPreview {
-  text?: string;
-  truncated: boolean;
+export type ToolCallPreviewFieldName = 'path' | 'content' | 'plan' | 'command' | 'explanation';
+
+type PreviewStringRole = 'key' | 'field' | 'other';
+
+/** Lexer state advances only across newly-arrived characters. */
+export interface ToolCallPreviewIncrementalState {
+  scannedChars: number;
+  inString: boolean;
+  stringRole?: PreviewStringRole;
+  keyCandidate: string;
+  keyStillRelevant: boolean;
+  pendingKey?: ToolCallPreviewFieldName;
+  awaitingColon: boolean;
+  awaitingValue: boolean;
+  escapeMode: 'none' | 'escaped' | 'unicode';
+  unicodeDigits: string;
+  fields: NonNullable<ToolCallPreviewRecord['argumentPreviewFields']>;
+}
+
+type ToolCallPreviewArguments = Pick<ToolCallPreviewRecord, 'argumentsText' | 'receivedChars'>;
+
+/** Accumulates the complete current-epoch argument stream; replace discards every prior delta. */
+export function appendToolCallPreviewArguments(
+  current: ToolCallPreviewArguments | undefined,
+  delta: string,
+  replace: boolean
+): ToolCallPreviewArguments {
+  if (replace || !current) return { argumentsText: delta, receivedChars: delta.length };
+  return {
+    argumentsText: current.argumentsText + delta,
+    receivedChars: current.receivedChars + delta.length
+  };
+}
+
+/**
+ * Advances the preview-field lexer over exactly one delta. This keeps total parsing work linear in
+ * the provider stream length even when a UI frame is produced after every delta.
+ */
+export function advanceToolCallPreviewFields(
+  current: ToolCallPreviewIncrementalState | undefined,
+  delta: string,
+  replace: boolean
+): ToolCallPreviewIncrementalState {
+  const state = replace || !current ? emptyIncrementalState() : cloneIncrementalState(current);
+  const decodedByField = new Map<ToolCallPreviewFieldName, string[]>();
+  for (let index = 0; index < delta.length; index += 1) {
+    const char = delta[index]!;
+    state.scannedChars += 1;
+    if (state.inString) {
+      if (state.escapeMode === 'unicode') {
+        if (/^[0-9a-fA-F]$/.test(char)) {
+          state.unicodeDigits += char;
+          if (state.unicodeDigits.length === 4) {
+            appendDecodedCharacter(state, String.fromCharCode(Number.parseInt(state.unicodeDigits, 16)), decodedByField);
+            state.escapeMode = 'none';
+            state.unicodeDigits = '';
+          }
+        } else {
+          appendDecodedCharacter(state, `u${state.unicodeDigits}${char}`, decodedByField);
+          state.escapeMode = 'none';
+          state.unicodeDigits = '';
+        }
+        continue;
+      }
+      if (state.escapeMode === 'escaped') {
+        if (char === 'u') {
+          state.escapeMode = 'unicode';
+          state.unicodeDigits = '';
+        } else {
+          appendDecodedCharacter(state, decodeSimpleEscape(char), decodedByField);
+          state.escapeMode = 'none';
+        }
+        continue;
+      }
+      if (char === '\\') {
+        state.escapeMode = 'escaped';
+        continue;
+      }
+      if (char === '"') {
+        closeIncrementalString(state);
+        continue;
+      }
+      appendDecodedCharacter(state, char, decodedByField);
+      continue;
+    }
+
+    if (state.awaitingColon) {
+      if (/\s/.test(char)) continue;
+      state.awaitingColon = false;
+      if (char === ':') {
+        state.awaitingValue = true;
+        continue;
+      }
+      state.pendingKey = undefined;
+    }
+    if (state.awaitingValue) {
+      if (/\s/.test(char)) continue;
+      state.awaitingValue = false;
+      if (char === '"') {
+        openIncrementalString(state, state.pendingKey ? 'field' : 'other');
+        continue;
+      }
+      state.pendingKey = undefined;
+    }
+    if (char === '"') openIncrementalString(state, 'key');
+  }
+
+  for (const [field, decoded] of decodedByField) {
+    const prior = state.fields[field];
+    const value = decoded.join('');
+    state.fields[field] = {
+      value: (prior?.value ?? '') + value,
+      closed: prior?.closed ?? false
+    };
+  }
+  return state;
 }
 
 export function toolCallPreviewPresentation(preview: ToolCallPreviewRecord): ToolCallPreviewPresentation {
   const name = preview.name?.trim() || '工具';
-  const stableArguments = stableArgumentsPrefix(preview);
-  const path = extractPartialJsonStringField(stableArguments, 'path');
+  const path = previewStringField(preview, 'path');
 
   if (name === SUBMIT_PLAN_TOOL_NAME) {
-    const plan = boundedStringFieldPreview(preview, 'plan');
+    const plan = stringFieldPreview(preview, 'plan');
     return {
       kind: 'plan',
       title: '正在编写计划',
-      detail: previewDetail(preview, plan.truncated),
-      ...(plan.text ? { previewText: plan.text, renderMode: 'markdown' as const } : {})
+      detail: previewDetail(preview),
+      ...(plan ? { previewText: plan, renderMode: 'markdown' as const } : {})
     };
   }
 
   if (name === WRITE_TOOL_NAME) {
-    const content = boundedStringFieldPreview(preview, 'content');
+    const content = stringFieldPreview(preview, 'content');
     return {
       kind: 'write',
       title: '正在生成文件内容',
       ...(path ? { subject: path } : {}),
-      detail: previewDetail(preview, content.truncated),
-      ...(content.text
-        ? { previewText: content.text, renderMode: isMarkdownPath(path) ? 'markdown' as const : 'text' as const }
+      detail: previewDetail(preview),
+      ...(content
+        ? { previewText: content, renderMode: isMarkdownPath(path) ? 'markdown' as const : 'text' as const }
         : {})
     };
   }
@@ -70,14 +179,14 @@ export function toolCallPreviewPresentation(preview: ToolCallPreviewRecord): Too
   }
 
   if (name === 'bash' || name === 'shell') {
-    const command = boundedStringFieldPreview(preview, 'command');
-    const explanation = extractPartialJsonStringField(stableArguments, 'explanation');
+    const command = stringFieldPreview(preview, 'command');
+    const explanation = previewStringField(preview, 'explanation');
     return {
       kind: 'command',
       title: '正在组装命令',
       ...(explanation ? { subject: explanation } : {}),
-      detail: previewDetail(preview, command.truncated),
-      ...(command.text ? { previewText: command.text, renderMode: 'text' as const } : {})
+      detail: previewDetail(preview),
+      ...(command ? { previewText: command, renderMode: 'text' as const } : {})
     };
   }
 
@@ -96,29 +205,106 @@ export function extractPartialJsonStringField(source: string, field: string): st
 }
 
 export function genericArgumentsPreview(preview: ToolCallPreviewRecord): string | undefined {
-  if (!preview.truncated) return tail(preview.argumentsHead.trim(), DISPLAY_PREVIEW_CHARS) || undefined;
-  const joined = `${preview.argumentsHead}\n… 中间参数已省略 …\n${preview.argumentsTail}`;
-  return tail(joined.trim(), DISPLAY_PREVIEW_CHARS) || undefined;
+  return preview.argumentsText.length > 0 ? preview.argumentsText : undefined;
 }
 
-function boundedStringFieldPreview(preview: ToolCallPreviewRecord, field: string): BoundedFieldPreview {
-  const source = stableArgumentsPrefix(preview);
-  const decoded = extractPartialJsonStringFieldState(source, field);
-  if (!decoded?.value) return { truncated: false };
+function stringFieldPreview(preview: ToolCallPreviewRecord, field: string): string | undefined {
+  return previewStringField(preview, field as ToolCallPreviewFieldName);
+}
+
+function previewStringField(
+  preview: ToolCallPreviewRecord,
+  field: ToolCallPreviewFieldName
+): string | undefined {
+  const incremental = preview.argumentPreviewFields?.[field];
+  return (incremental ?? extractPartialJsonStringFieldState(preview.argumentsText, field))?.value || undefined;
+}
+
+const PREVIEW_FIELD_NAMES = new Set<ToolCallPreviewFieldName>([
+  'path', 'content', 'plan', 'command', 'explanation'
+]);
+
+function emptyIncrementalState(): ToolCallPreviewIncrementalState {
   return {
-    text: head(decoded.value, DISPLAY_PREVIEW_CHARS),
-    truncated: decoded.value.length > DISPLAY_PREVIEW_CHARS
-      || (!decoded.closed && preview.receivedChars > source.length)
+    scannedChars: 0,
+    inString: false,
+    keyCandidate: '',
+    keyStillRelevant: true,
+    awaitingColon: false,
+    awaitingValue: false,
+    escapeMode: 'none',
+    unicodeDigits: '',
+    fields: {}
   };
 }
 
-/**
- * The backend preserves this leading raw-argument window after its total preview limit is crossed.
- * Markdown/text field previews must only consume that immutable prefix; a rolling tail would force
- * the incremental Markdown renderer to reset and reparse the whole visible document every frame.
- */
-function stableArgumentsPrefix(preview: ToolCallPreviewRecord): string {
-  return preview.argumentsHead.slice(0, TOOL_CALL_PREVIEW_HEAD_CHARS);
+function cloneIncrementalState(current: ToolCallPreviewIncrementalState): ToolCallPreviewIncrementalState {
+  return {
+    ...current,
+    fields: Object.fromEntries(Object.entries(current.fields).map(([field, value]) => [
+      field,
+      value ? { ...value } : value
+    ]))
+  };
+}
+
+function openIncrementalString(state: ToolCallPreviewIncrementalState, role: PreviewStringRole): void {
+  state.inString = true;
+  state.stringRole = role;
+  state.escapeMode = 'none';
+  state.unicodeDigits = '';
+  if (role === 'key') {
+    state.keyCandidate = '';
+    state.keyStillRelevant = true;
+  } else if (role === 'field' && state.pendingKey) {
+    state.fields[state.pendingKey] = { value: '', closed: false };
+  }
+}
+
+function closeIncrementalString(state: ToolCallPreviewIncrementalState): void {
+  const role = state.stringRole;
+  state.inString = false;
+  state.stringRole = undefined;
+  state.escapeMode = 'none';
+  state.unicodeDigits = '';
+  if (role === 'key') {
+    state.pendingKey = state.keyStillRelevant && PREVIEW_FIELD_NAMES.has(state.keyCandidate as ToolCallPreviewFieldName)
+      ? state.keyCandidate as ToolCallPreviewFieldName
+      : undefined;
+    state.awaitingColon = true;
+    return;
+  }
+  if (role === 'field' && state.pendingKey) {
+    const field = state.fields[state.pendingKey];
+    if (field) field.closed = true;
+  }
+  state.pendingKey = undefined;
+}
+
+function appendDecodedCharacter(
+  state: ToolCallPreviewIncrementalState,
+  value: string,
+  decodedByField: Map<ToolCallPreviewFieldName, string[]>
+): void {
+  if (state.stringRole === 'key') {
+    if (!state.keyStillRelevant) return;
+    state.keyCandidate += value;
+    state.keyStillRelevant = [...PREVIEW_FIELD_NAMES].some((field) => field.startsWith(state.keyCandidate));
+    return;
+  }
+  if (state.stringRole !== 'field' || !state.pendingKey) return;
+  const chunks = decodedByField.get(state.pendingKey) ?? [];
+  chunks.push(value);
+  decodedByField.set(state.pendingKey, chunks);
+}
+
+function decodeSimpleEscape(value: string): string {
+  if (value === 'n') return '\n';
+  if (value === 'r') return '\r';
+  if (value === 't') return '\t';
+  if (value === 'b') return '\b';
+  if (value === 'f') return '\f';
+  return value;
 }
 
 function extractPartialJsonStringFieldState(source: string, field: string): PartialJsonStringField | undefined {
@@ -174,9 +360,8 @@ function decodeJsonStringFragment(source: string): PartialJsonStringField {
   return { value, closed: false };
 }
 
-function previewDetail(preview: ToolCallPreviewRecord, displayTruncated = false): string {
-  const truncation = preview.truncated || displayTruncated ? ' · 预览已截断' : '';
-  return `已接收 ${formatCharacterCount(preview.receivedChars)} 个参数字符${truncation}`;
+function previewDetail(preview: ToolCallPreviewRecord): string {
+  return `已接收 ${formatCharacterCount(preview.receivedChars)} 个参数字符`;
 }
 
 function isMarkdownPath(path: string | undefined): boolean {
@@ -191,12 +376,4 @@ function formatCharacterCount(value: number): string {
   if (value < 1_000) return String(value);
   if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
   return `${(value / 1_000_000).toFixed(1)}m`;
-}
-
-function head(value: string, maxChars: number): string {
-  return value.length <= maxChars ? value : value.slice(0, maxChars);
-}
-
-function tail(value: string, maxChars: number): string {
-  return value.length <= maxChars ? value : value.slice(-maxChars);
 }

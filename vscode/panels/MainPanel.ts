@@ -162,10 +162,6 @@ export class MainPanel {
           this.createConversationFromPanel(message.payload?.projectFolderUri);
           return;
         }
-        if (message.type === BridgeMessageType.ConversationFork && message.payload) {
-          this.forkConversationFromPanel(message.payload.sourceConversationId, message.payload.messageId);
-          return;
-        }
         if (message.type === BridgeMessageType.PlanProposalOpen && message.payload) {
           this.openPlanProposalFromPanel(message.payload);
           return;
@@ -209,19 +205,6 @@ export class MainPanel {
       ...(payload.title?.trim() ? { title: payload.title.trim() } : {}),
       reuse: true
     });
-  }
-
-  private forkConversationFromPanel(sourceConversationId: string, messageId: string): void {
-    void this.backendApp
-      .forkConversation(sourceConversationId, messageId)
-      .then((conversationId) => {
-        MainPanel.createOrShow(this.extensionUri, this.backendApp, { conversationId });
-      })
-      .catch((error) => {
-        console.warn('[LimCode] Failed to fork panel conversation.', error);
-        const message = error instanceof Error ? error.message : '无法创建分支对话。';
-        void vscode.window.showErrorMessage(`${EXTENSION_BRAND}: ${message}`);
-      });
   }
 
   private matches(options: MainPanelOptions): boolean {

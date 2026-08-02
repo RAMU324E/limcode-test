@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { MessageContent } from '../../shared/protocol';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
@@ -36,7 +37,20 @@ export interface CreateCompressionCommand {
   authoritySnapshotId: string;
   compressSegmentCount: number;
   title: string;
-  summary: string;
+  /** Provider-native compression remains structured; summary methods may keep Markdown. */
+  summary: string | MessageContent[];
+  /** Display-only facts frozen beside structured contents; Provider materialization ignores them. */
+  summaryMetadata?: {
+    trigger: 'auto' | 'manual';
+    methodKind: string;
+    nativeBinding?: {
+      providerConfigId: string;
+      provider: string;
+      modelId: string;
+    };
+  };
+  /** Automatic compression enforces the frozen threshold; explicit manual compression may opt out. */
+  enforceThreshold?: boolean;
   idempotencyKey: string;
 }
 
@@ -45,7 +59,7 @@ export interface ReplaceCompressionCommand {
   previousBlockId: string;
   expectedHeadRootId: string;
   title: string;
-  summary: string;
+  summary: string | MessageContent[];
   previousStatus: 'disabled' | 'soft_deleted';
   idempotencyKey: string;
 }
@@ -78,6 +92,7 @@ export interface CompressionCommitResult {
 
 const CONTENT_TYPE_TITLE = 'text/plain';
 const CONTENT_TYPE_SUMMARY = 'text/markdown';
+export const CONTENT_TYPE_COMPRESSION_CONTENTS = 'application/vnd.limcode.compression-contents+json';
 
 /** Immutable compression command boundary. Source rows are O(k); sequence attachment is one node. */
 export class ContextCompressionControlPlane {
@@ -121,11 +136,11 @@ export class ContextCompressionControlPlane {
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
     const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
     const title = requireText(command.title, 'title');
-    const summary = requireText(command.summary, 'summary');
+    const summary = normalizeCompressionSummary(command.summary, command.summaryMetadata);
     const requestedSourceCount = requirePositiveCount(command.compressSegmentCount);
     const titleIdentity = this.contentStore.identity(title, CONTENT_TYPE_TITLE);
-    const summaryIdentity = this.contentStore.identity(summary, CONTENT_TYPE_SUMMARY);
-    const blockId = stableId('compression_block', conversationId, headRootId, idempotencyKey);
+    const summaryIdentity = this.contentStore.identity(summary.content, summary.contentType);
+    const blockId = compressionBlockIdFor(conversationId, headRootId, idempotencyKey);
     const summarySegmentId = stableId('compression_segment', blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
     const rootId = stableId('compression_root', blockId, headRootId);
@@ -155,7 +170,7 @@ export class ContextCompressionControlPlane {
     if (frozen.conversationId !== conversationId) throw new Error('AuthoritySnapshot belongs to another Conversation.');
     const profile = frozen.profile;
     const sourceEstimatedTokens = estimateStructure(materialized.records, profile);
-    if (sourceEstimatedTokens < profile.compressionThresholdTokens) {
+    if (command.enforceThreshold !== false && sourceEstimatedTokens < profile.compressionThresholdTokens) {
       throw new Error(
         `Context root ${headRootId} is below its frozen compression threshold `
           + `(${sourceEstimatedTokens} < ${profile.compressionThresholdTokens}).`
@@ -163,7 +178,7 @@ export class ContextCompressionControlPlane {
     }
     const head = await this.requireHead(conversationId, headRootId);
     const titleContent = await this.contentStore.prepare(this.database, title, CONTENT_TYPE_TITLE);
-    const summaryContent = await this.contentStore.prepare(this.database, summary, CONTENT_TYPE_SUMMARY);
+    const summaryContent = await this.contentStore.prepare(this.database, summary.content, summary.contentType);
     const sourceSegments = materialized.records.slice(0, compressCount);
     const tail = materialized.records.slice(compressCount);
     const now = this.timestamp();
@@ -272,9 +287,9 @@ export class ContextCompressionControlPlane {
     const previousStatus = requireReplacementStatus(command.previousStatus);
     const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
     const title = requireText(command.title, 'title');
-    const summary = requireText(command.summary, 'summary');
+    const summary = normalizeCompressionSummary(command.summary);
     const titleIdentity = this.contentStore.identity(title, CONTENT_TYPE_TITLE);
-    const summaryIdentity = this.contentStore.identity(summary, CONTENT_TYPE_SUMMARY);
+    const summaryIdentity = this.contentStore.identity(summary.content, summary.contentType);
     const blockId = stableId('compression_replacement', previousBlockId, idempotencyKey);
     const summarySegmentId = stableId('compression_segment', blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
@@ -321,7 +336,7 @@ export class ContextCompressionControlPlane {
     const profile = frozen.profile;
     const head = await this.requireHead(conversationId, expectedHeadRootId);
     const titleContent = await this.contentStore.prepare(this.database, title, CONTENT_TYPE_TITLE);
-    const summaryContent = await this.contentStore.prepare(this.database, summary, CONTENT_TYPE_SUMMARY);
+    const summaryContent = await this.contentStore.prepare(this.database, summary.content, summary.contentType);
     const now = this.timestamp();
     const tail = current.records.slice(1);
     const rootEstimatedTokens = estimateBytes(summaryContent.metadata.byte_length, profile)
@@ -662,6 +677,19 @@ function stableId(kind: string, ...parts: string[]): string {
   return `${kind}_${digest}`;
 }
 
+export function compressionBlockIdFor(
+  conversationIdInput: string,
+  headRootIdInput: string,
+  idempotencyKeyInput: string
+): string {
+  return stableId(
+    'compression_block',
+    requireId(conversationIdInput, 'conversationId'),
+    requireId(headRootIdInput, 'headRootId'),
+    requireText(idempotencyKeyInput, 'idempotencyKey')
+  );
+}
+
 function isRecoverableCompressionRace(error: unknown): boolean {
   const code = (error as { code?: unknown })?.code;
   return code === 'SQLITE_CONSTRAINT_UNIQUE'
@@ -684,6 +712,59 @@ function staleHeadError(conversationId: string): Error & { code: string } {
 function rows(value: unknown): DomainRow[] {
   if (!Array.isArray(value)) throw new TypeError('Repository list result must be an array.');
   return value as DomainRow[];
+}
+
+function normalizeCompressionSummary(
+  input: string | MessageContent[],
+  metadata?: CreateCompressionCommand['summaryMetadata']
+): {
+  content: string;
+  contentType: typeof CONTENT_TYPE_SUMMARY | typeof CONTENT_TYPE_COMPRESSION_CONTENTS;
+} {
+  if (typeof input === 'string') {
+    return { content: requireText(input, 'summary'), contentType: CONTENT_TYPE_SUMMARY };
+  }
+  if (!Array.isArray(input) || input.length === 0) {
+    throw new TypeError('Structured compression summary must contain at least one MessageContent.');
+  }
+  const contents = input.map((content, index) => {
+    if (!content || (content.role !== 'user' && content.role !== 'model') || !Array.isArray(content.parts)) {
+      throw new TypeError(`Structured compression summary item ${index} is invalid.`);
+    }
+    return content;
+  });
+  let encoded: string;
+  try {
+    encoded = JSON.stringify({
+      kind: 'compression_contents',
+      version: 1,
+      contents,
+      ...(metadata ? {
+        trigger: requireCompressionTrigger(metadata.trigger),
+        methodKind: requireText(metadata.methodKind, 'summaryMetadata.methodKind'),
+        ...(metadata.nativeBinding ? {
+          nativeBinding: {
+            providerConfigId: requireText(
+              metadata.nativeBinding.providerConfigId,
+              'summaryMetadata.nativeBinding.providerConfigId'
+            ),
+            provider: requireText(metadata.nativeBinding.provider, 'summaryMetadata.nativeBinding.provider'),
+            modelId: requireText(metadata.nativeBinding.modelId, 'summaryMetadata.nativeBinding.modelId')
+          }
+        } : {})
+      } : {})
+    });
+  } catch (error) {
+    throw new TypeError(`Structured compression summary is not JSON serializable: ${String(error)}`);
+  }
+  return { content: encoded, contentType: CONTENT_TYPE_COMPRESSION_CONTENTS };
+}
+
+function requireCompressionTrigger(value: unknown): 'auto' | 'manual' {
+  if (value !== 'auto' && value !== 'manual') {
+    throw new TypeError('summaryMetadata.trigger must be auto or manual.');
+  }
+  return value;
 }
 
 function requireId(value: unknown, label: string): string {

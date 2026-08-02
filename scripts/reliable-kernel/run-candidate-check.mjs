@@ -131,18 +131,24 @@ async function checkTurnSoleExecutionIdentity() {
     assert.ok(terminalCommit);
     assertAtomicTerminalChanges(terminalCommit, input.turnId);
     assert.equal((await list(database, 'ExecutionLease', { turn_id: input.turnId })).length, 0);
+    assert.equal((await get(database, 'PendingTurnInput', interrupt.pendingTurnInputId)).state, 'consumed');
+    const terminalInterruptReplay = await control.interrupt(interruptCommand);
+    assert.equal(terminalInterruptReplay.deduplicated, true);
+    assert.equal(terminalInterruptReplay.ignoredBecauseTerminal, true);
+    assert.equal(terminalInterruptReplay.pendingTurnInputId, undefined);
     const duplicateTerminal = await control.terminal(terminalCommand);
     assert.equal(duplicateTerminal.deduplicated, true);
     assert.equal(duplicateTerminal.terminalRecorded, true);
-    assertions.push('terminal、TurnTermination、实际lease release同commit；duplicate重放terminal结果');
+    assertions.push('interrupted terminal在同一commit确认termination input、写TurnTermination并释放实际lease；consumed interrupt与duplicate terminal均重放终态');
 
     await assertLateTerminalReceiptOnly(control, database, input.turnId);
     await assertSourceKindBoundaries(control, database, sourceConversationId, input.turnId);
     assertions.push('late callback仅写receipt；callback不能admit新Turn，command不能直接写terminal');
 
-    const retry = await control.retry({
+    const retry = await control.continuation({
       ...executionCommand(sourceConversationId, { kind: 'command', key: 'retry:source:1' }),
-      sourceTurnId: input.turnId
+      sourceTurnId: input.turnId,
+      content: 'continue after the interrupted source turn'
     });
     assert.equal(retry.admitted, true);
     assert.ok(retry.turnId && retry.turnId !== input.turnId);
@@ -158,10 +164,7 @@ async function checkTurnSoleExecutionIdentity() {
     });
     assert.equal(continuation.admitted, true);
     assert.ok(continuation.turnId && continuation.turnId !== retry.turnId);
-    assertions.push('retry/continuation创建新Intent/Turn，旧Turn保持终态并冻结当前默认executor');
-
-    await assertLargeEditAndDelete(control, database, store, sourceConversationId, input);
-    assertions.push('edit使用immutable revision并重放>2^53 decimal sequence；delete保持独立facts');
+    assertions.push('continuation创建新Intent/Turn，旧Turn保持终态并冻结当前默认executor');
 
     await assertTerminalLeaseInjectionSafe(database, store, compiler);
     assertions.push('terminal事务前注入lease仍由同一事务释放，不产生terminated+lease');
@@ -170,7 +173,7 @@ async function checkTurnSoleExecutionIdentity() {
     assertions.push('非lease admission UNIQUE向外传播，receipt/intent/lease均不提交');
 
     await assertCrossFacadeConcurrency(database, store, compiler);
-    assertions.push('无commandTail时并发input仅一个lease；并发interrupt事务内分配不同position');
+    assertions.push('无commandTail时并发input仅一个lease；并发interrupt各写独立receipt并合并到同一open PendingTurnInput');
 
     await assertEditDeleteRaceRejected(database, store, compiler);
     assertions.push('delete线性化后竞态edit被事务断言拒绝且不创建revision/receipt');
@@ -178,12 +181,15 @@ async function checkTurnSoleExecutionIdentity() {
     await assertCompetingTerminals(database, store, compiler, continuation.turnId);
     assertions.push('跨facade competing terminal只产生一个终止事实，另一来源receipt-only');
 
+    await assertForkSourceOnly(control, database, sourceConversationId, input);
+    assertions.push('Phase C fork仅验证Turn/MessageRevision/Context root source facts，不写target或ContextHead');
+
+    await assertLargeEditAndDelete(control, database, store, sourceConversationId, input);
+    assertions.push('终态Conversation上的edit使用immutable revision并重放>2^53 decimal sequence；delete保持独立facts');
+
     await assertRecoveryMatrixAgainstContract();
     assert.equal((await control.recoveryFacts(input.turnId)).judgment, 'finalize');
     assertions.push('identity.json derivation覆盖全部16种recovery组合');
-
-    await assertForkSourceOnly(control, database, sourceConversationId, input);
-    assertions.push('Phase C fork仅验证Turn/MessageRevision/Context root source facts，不写target或ContextHead');
 
     assert.equal((await list(database, 'CommandReceipt', {
       source_kind: 'callback', source_key: 'provider-terminal:source:1'
@@ -263,6 +269,11 @@ async function assertSourceKindBoundaries(control, database, conversationId, ter
 async function assertLargeEditAndDelete(control, database, store, conversationId, input) {
   const highContent = await store.ingest(database, 'large sequence base', 'text/plain');
   const currentLink = (await list(database, 'MessageCurrentRevisionLink', { message_id: input.messageId }))[0];
+  const contextHead = (await list(database, 'ConversationContextHeadLink', { conversation_id: conversationId }))[0];
+  const baseRoot = await get(database, 'ContextSequenceRoot', contextHead.root_id);
+  const highSegmentId = 'context-segment-large-base';
+  const highNodeId = 'context-node-large-base';
+  const highRootId = 'context-root-large-base';
   await database.transaction([
     kernel.DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
       id: 'message-revision-large-base', message_id: input.messageId, revision_seq: '9007199254740992',
@@ -270,6 +281,40 @@ async function assertLargeEditAndDelete(control, database, store, conversationId
     }),
     kernel.DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(currentLink.id, {
       revision_id: 'message-revision-large-base', updated_at: '2026-07-31T10:02:00.000Z'
+    }),
+    kernel.DOMAIN_REPOSITORIES.domain('ContextSegment').insert({
+      id: highSegmentId,
+      content_object_id: highContent.id,
+      segment_kind: 'message',
+      created_at: '2026-07-31T10:02:00.000Z'
+    }),
+    kernel.DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
+      id: 'context-source-large-base',
+      segment_id: highSegmentId,
+      source_kind: 'message_revision',
+      source_id: 'message-revision-large-base',
+      source_revision: 9007199254740992n,
+      created_at: '2026-07-31T10:02:00.000Z'
+    }),
+    kernel.DOMAIN_REPOSITORIES.domain('ContextSequenceNode').insert({
+      id: highNodeId,
+      parent_node_id: baseRoot.root_node_id,
+      segment_id: highSegmentId,
+      created_at: '2026-07-31T10:02:00.000Z'
+    }),
+    kernel.DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
+      id: highRootId,
+      conversation_id: conversationId,
+      root_node_id: highNodeId,
+      tail_node_id: null,
+      tail_segment_count: 0n,
+      segment_count: baseRoot.segment_count + 1n,
+      estimated_tokens: baseRoot.estimated_tokens + 5n,
+      created_at: '2026-07-31T10:02:00.000Z'
+    }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+    kernel.DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').update(contextHead.id, {
+      root_id: highRootId,
+      updated_at: '2026-07-31T10:02:00.000Z'
     })
   ]);
   const editCommand = {
@@ -313,7 +358,7 @@ async function assertTerminalLeaseInjectionSafe(database, store, compiler) {
         injected = true;
         await database.transaction([kernel.DOMAIN_REPOSITORIES.domain('ExecutionLease').insert({
           id: 'lease-injected', conversation_id: 'conversation-lease-injection', turn_id: 'turn-lease-injection',
-          owner_id: 'recovery-owner', host_boot_id: 'recovery-host', acquired_at: now,
+          owner_id: 'recovery-owner', host_boot_id: 'recovery-host', generation: 1n, acquired_at: now,
           expires_at: '2026-07-31T11:03:00.000Z'
         })]);
       }
@@ -381,8 +426,12 @@ async function assertCrossFacadeConcurrency(database, store, compiler) {
     left.interrupt({ source: { kind: 'command', key: 'interrupt:concurrent:a' }, turnId: active.turnId, reason: 'A' }),
     right.interrupt({ source: { kind: 'command', key: 'interrupt:concurrent:b' }, turnId: active.turnId, reason: 'B' })
   ]);
-  assert.deepEqual(interrupts.map((entry) => entry.pendingTurnInputPosition).sort(), ['1', '2']);
-  assert.equal((await list(database, 'PendingTurnInput', { turn_id: active.turnId })).length, 2);
+  assert.deepEqual(interrupts.map((entry) => entry.pendingTurnInputPosition).sort(), ['1', '1']);
+  assert.equal(interrupts.filter((entry) => entry.coalesced).length, 1);
+  assert.equal((await list(database, 'PendingTurnInput', { turn_id: active.turnId })).length, 1);
+  assert.equal((await list(database, 'CommandReceipt', { turn_id: active.turnId })).filter((receipt) =>
+    String(receipt.source_key).startsWith('interrupt:concurrent:')
+  ).length, 2);
 }
 
 async function assertEditDeleteRaceRejected(database, store, compiler) {
@@ -391,6 +440,12 @@ async function assertEditDeleteRaceRejected(database, store, compiler) {
   const starter = createControl(database, store, compiler);
   const started = await starter.input({
     ...executionCommand(conversationId, { kind: 'command', key: 'start-edit-delete-race' }), content: 'original'
+  });
+  await starter.terminal({
+    source: { kind: 'callback', key: 'terminal-edit-delete-race' },
+    turnId: started.turnId,
+    terminalStatus: 'completed',
+    reason: 'fixture idle before competing history mutations'
   });
   const deleter = createControl(database, store, compiler);
   let injected = false;

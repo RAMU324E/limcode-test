@@ -12,6 +12,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.MessageEdit:
     case BridgeMessageType.MessageDeleteFrom:
     case BridgeMessageType.MessageRetryFrom:
+    case BridgeMessageType.CompressionStart:
     case BridgeMessageType.WorkflowCreate:
     case BridgeMessageType.WorkflowUpdate:
     case BridgeMessageType.WorkflowDelete:

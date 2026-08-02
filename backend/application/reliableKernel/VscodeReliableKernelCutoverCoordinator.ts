@@ -13,12 +13,17 @@ import {
   readPhysicalCutoverRequest,
   recoverInterruptedPhysicalCutover
 } from '../../reliableKernel/physicalCutover';
+import { migratePreviousRuntimeEpochIfRequired } from '../../reliableKernel/runtimeEpochMigration';
+import { migrateCurrentRuntimeManifestIfRequired } from '../../reliableKernel/runtimeManifestMigration';
 
 export interface VscodeReliableKernelCutoverResult {
   binding: RootBinding;
   initialized: boolean;
   cutoverPerformed: boolean;
+  epochMigrated?: boolean;
+  manifestMigrated?: boolean;
   archiveDirectoryName?: string;
+  migrationBackupDirectoryName?: string;
 }
 
 /**
@@ -49,11 +54,27 @@ export class VscodeReliableKernelCutoverCoordinator {
       };
     }
 
-    try {
+    const epochMigration = await migratePreviousRuntimeEpochIfRequired(this.authority);
+    if (epochMigration) {
       return {
-        binding: await this.authority.current(),
+        binding: epochMigration.binding,
+        initialized: epochMigration.migrated,
+        cutoverPerformed: false,
+        epochMigrated: epochMigration.migrated,
+        ...(epochMigration.backupDirectoryName
+          ? { migrationBackupDirectoryName: epochMigration.backupDirectoryName }
+          : {})
+      };
+    }
+
+    try {
+      const binding = await this.authority.current();
+      const manifestMigration = migrateCurrentRuntimeManifestIfRequired(binding);
+      return {
+        binding,
         initialized: false,
-        cutoverPerformed: false
+        cutoverPerformed: false,
+        ...(manifestMigration.upgraded ? { manifestMigrated: true } : {})
       };
     } catch (error) {
       if (!(error instanceof RootAuthorityError) || error.code !== 'root-binding-missing') throw error;

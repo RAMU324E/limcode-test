@@ -12,12 +12,23 @@ import {
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
   type ModelRequestCancelResult
 } from './databaseWorkerProtocol';
-import { frozenModelIdentity, readFrozenTurnAuthority } from './frozenAuthority';
+import {
+  frozenCompressionPolicy,
+  frozenContextProfile,
+  frozenModelIdentity,
+  readFrozenTurnAuthority
+} from './frozenAuthority';
+import {
+  ExecutionHandoffError,
+  handoffReason,
+  isExecutionHandoffError
+} from './executionLeaseFence';
 
 export interface CreateModelRequestCommand {
   turnId: string;
@@ -59,18 +70,38 @@ export interface FullProviderRequest {
   context: FullProviderContextItem[];
 }
 
-export type ProviderStreamEventKind = 'output_delta' | 'output_item_done' | 'completed';
+export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed';
+export type ProviderTransientTerminalEventKind = 'failed' | 'cancelled';
+export type ProviderStreamEventKind = ProviderOutputStreamEventKind | ProviderTransientTerminalEventKind;
 
 export interface ProviderStreamEvent {
   kind: ProviderStreamEventKind;
   streamSeq: string | bigint;
   content: PlainJsonValue;
   usage?: PlainJsonValue;
+  timing?: ProviderStreamTiming;
+}
+
+export interface ProviderStreamTiming {
+  providerStartedAt?: number;
+  firstOutputAt?: number;
+  completedAt?: number;
+  streamOutputDurationMs?: number;
+}
+
+export interface ProviderOutputStreamEvent extends ProviderStreamEvent {
+  kind: ProviderOutputStreamEventKind;
+}
+
+export interface ProviderTransientTerminalObservation {
+  attemptSeq: string;
+  socketGeneration: string;
+  event: ProviderStreamEvent & { kind: ProviderTransientTerminalEventKind };
 }
 
 export interface ProviderDispatchControls {
   signal?: AbortSignal;
-  onEvent(event: ProviderStreamEvent): Promise<StreamEventResult>;
+  onEvent(event: ProviderOutputStreamEvent): Promise<StreamEventResult>;
 }
 
 export interface FullRequestProviderAdapter {
@@ -82,7 +113,13 @@ export interface FullRequestProviderAdapter {
 export interface ProviderDispatchOptions {
   signal?: AbortSignal;
   reconnect?: boolean;
+  /** Last-resort adapter deadline; transport-specific watchdogs should normally fire first. */
+  timeoutMs?: number;
+  /** Memory-only terminal overlay, emitted only after the matching durable failure/cancel fact. */
+  onTransientTerminal?(observation: ProviderTransientTerminalObservation): void;
 }
+
+const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
 
 export interface ProviderDispatchResult {
   modelRequestId: string;
@@ -99,6 +136,11 @@ export interface StreamEventResult {
   ignoredReason?: 'old-attempt' | 'old-socket-generation' | 'terminal' | 'checkpoint-capacity' | 'duplicate';
 }
 
+export interface CompletedModelRequestEvent {
+  content: PlainJsonValue;
+  usage?: PlainJsonValue;
+}
+
 export type ProviderTransientReason = 'connection_interrupted' | 'rate_limited' | 'temporary_service_error';
 
 export class ProviderTransientError extends Error {
@@ -112,6 +154,10 @@ interface StreamStats {
   attemptSeq: string;
   socketGeneration: string;
   retryReason: ProviderTransientReason | null;
+  providerStartedAt?: number;
+  firstOutputAt?: number;
+  completedAt?: number;
+  streamOutputDurationMs?: number;
 }
 
 interface StreamIdentity {
@@ -123,6 +169,10 @@ interface StreamIdentity {
 interface FrozenAuthority {
   providerId: string;
   modelId: string;
+  contextWindowTokens: number;
+  compressionThresholdTokens: number;
+  compressionProviderId?: string;
+  compressionModelId?: string;
 }
 
 interface RequestBundle {
@@ -139,6 +189,8 @@ interface CreationIdentity {
   authoritySnapshotId: string;
   providerId: string;
   modelId: string;
+  contextWindowTokens: number;
+  compressionThresholdTokens: number;
   settingsSnapshotContentObjectId: string | null;
   recipeIdentity: ContentObjectIdentity;
 }
@@ -152,6 +204,7 @@ export class ModelProviderControlPlane {
   private readonly now: () => string;
   private readonly activeSockets = new Map<string, Set<AbortController>>();
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
+  private handoff: ExecutionHandoffError | undefined;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -183,12 +236,21 @@ export class ModelProviderControlPlane {
       const settingsRow = await this.requireDomain('ContentObject', settingsSnapshotContentObjectId);
       parsePlainJson(await this.contentStore.read(asContentObjectMetadata(settingsRow)), 'ModelRequest settings snapshot');
     }
+    const compressionRequest = isCompressionRecipe(recipe);
+    const frozenProviderId = compressionRequest
+      ? requireText(frozen.compressionProviderId, 'Frozen compression providerId')
+      : frozen.providerId;
+    const frozenModelId = compressionRequest
+      ? requireText(frozen.compressionModelId, 'Frozen compression modelId')
+      : frozen.modelId;
     const identity: CreationIdentity = {
       turnId,
       contextRootId,
       authoritySnapshotId,
-      providerId: frozen.providerId,
-      modelId: frozen.modelId,
+      providerId: frozenProviderId,
+      modelId: frozenModelId,
+      contextWindowTokens: frozen.contextWindowTokens,
+      compressionThresholdTokens: frozen.compressionThresholdTokens,
       settingsSnapshotContentObjectId,
       recipeIdentity
     };
@@ -218,8 +280,14 @@ export class ModelProviderControlPlane {
         turn_id: turnId,
         status: 'prepared',
         terminal_state: null,
-        provider_id: frozen.providerId,
-        model_id: frozen.modelId,
+        provider_id: frozenProviderId,
+        model_id: frozenModelId,
+        context_window_tokens: BigInt(frozen.contextWindowTokens),
+        compression_threshold_tokens: BigInt(frozen.compressionThresholdTokens),
+        estimated_context_tokens: requireBigInt(
+          contextRoot.estimated_tokens,
+          'ContextSequenceRoot.estimated_tokens'
+        ),
         authority_snapshot_id: authoritySnapshotId,
         settings_snapshot_object_id: settingsSnapshotContentObjectId,
         recipe_object_id: recipeContent.metadata.id,
@@ -304,10 +372,24 @@ export class ModelProviderControlPlane {
     const recipe = parsePlainJson(bytes[0], 'ModelRequest recipe');
     const frozenAuthority = frozen.document;
     const settingsSnapshot = settingsContent ? parsePlainJson(bytes[1], 'ModelRequest settings snapshot') : undefined;
-    const frozenModel = frozenModelIdentity(frozenAuthority);
+    const primaryModel = frozenModelIdentity(frozenAuthority);
+    const compressionPolicy = isCompressionRecipe(recipe)
+      ? frozenCompressionPolicy(frozenAuthority)
+      : undefined;
+    const frozenModel = compressionPolicy
+      ? {
+          providerId: compressionPolicy.provider.providerConfigId,
+          modelId: compressionPolicy.provider.modelId
+        }
+      : primaryModel;
     if (frozenModel.providerId !== request.provider_id || frozenModel.modelId !== request.model_id) {
       throw new Error('Persisted ModelRequest provider/model no longer matches its frozen AuthoritySnapshot.');
     }
+    const providerSegments = compressionRequestSegments(
+      recipe,
+      requireId(projection.root_id, 'ModelContextProjection.root_id'),
+      materialized.segments
+    );
     return {
       kind: 'full-model-request',
       modelRequestId,
@@ -318,7 +400,7 @@ export class ModelProviderControlPlane {
       authoritySnapshot: frozenAuthority,
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
-      context: materialized.segments.map((segment) => ({
+      context: providerSegments.map((segment) => ({
         segmentId: segment.segmentId,
         segmentKind: segment.segmentKind,
         messageRole: segment.messageRole,
@@ -336,11 +418,52 @@ export class ModelProviderControlPlane {
     return this.buildFullRequest(modelRequestId, stats.attemptSeq, stats.socketGeneration);
   }
 
+  /** Reads the single fenced terminal checkpoint; callers never reconstruct results from transient deltas. */
+  public async completedEvent(modelRequestIdInput: string): Promise<CompletedModelRequestEvent> {
+    const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
+    const request = await this.requireDomain('ModelRequest', modelRequestId);
+    if (request.status !== 'terminal' || request.terminal_state !== 'completed') {
+      throw new Error(`ModelRequest ${modelRequestId} is not durably completed.`);
+    }
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').list({
+        where: { model_request_id: modelRequestId },
+        limit: MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT + 1
+      })
+    ]);
+    const terminal = rows(snapshot.snapshot[0])
+      .filter((row) => row.checkpoint_kind === 'terminal_summary')
+      .sort((left, right) => {
+        const a = decimalBigInt(left.stream_seq, 'stream_seq');
+        const b = decimalBigInt(right.stream_seq, 'stream_seq');
+        return a < b ? 1 : a > b ? -1 : 0;
+      })[0];
+    if (!terminal) throw new Error(`ModelRequest ${modelRequestId} has no terminal checkpoint.`);
+    const contentObject = await this.requireDomain(
+      'ContentObject',
+      requireId(terminal.content_object_id, 'ModelStreamCheckpoint.content_object_id')
+    );
+    const envelope = parsePlainJson(
+      await this.contentStore.read(asContentObjectMetadata(contentObject)),
+      'Model terminal checkpoint'
+    );
+    if (!isRecord(envelope) || envelope.kind !== 'completed') {
+      throw new Error(`ModelRequest ${modelRequestId} terminal checkpoint is not completed.`);
+    }
+    return {
+      content: normalizePlainJson(envelope.content, 'Model terminal checkpoint content'),
+      ...(envelope.usage === undefined
+        ? {}
+        : { usage: normalizePlainJson(envelope.usage, 'Model terminal checkpoint usage') })
+    };
+  }
+
   public async dispatch(
     modelRequestIdInput: string,
     adapter: FullRequestProviderAdapter,
     options: ProviderDispatchOptions = {}
   ): Promise<ProviderDispatchResult> {
+    if (this.handoff) throw this.handoff;
     const task = this.dispatchRequest(modelRequestIdInput, adapter, options);
     this.activeDispatches.add(task);
     try {
@@ -353,12 +476,8 @@ export class ModelProviderControlPlane {
   /** Cancels only non-terminal ModelRequests owned by one Turn; sibling Turns keep streaming. */
   public async cancelTurnDispatches(turnIdInput: string, reason = 'turn-interrupt-requested'): Promise<number> {
     const turnId = requireId(turnIdInput, 'turnId');
-    const snapshot = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('ModelRequest').list({ where: { turn_id: turnId }, limit: 1000 })
-    ]);
-    const rows = snapshot.snapshot[0];
-    if (!Array.isArray(rows)) throw new TypeError('ModelRequest list did not return rows.');
-    const active = rows.filter((row) => row.status !== 'terminal');
+    const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
+    const active = requests.filter((row) => row.status !== 'terminal');
     await Promise.all(active.map((row) => this.cancel(
       requireId(row.id, 'ModelRequest.id'),
       requireText(reason, 'cancel reason')
@@ -370,6 +489,38 @@ export class ModelProviderControlPlane {
   public async abortAllActiveDispatches(): Promise<void> {
     for (const sockets of this.activeSockets.values()) {
       for (const controller of sockets) controller.abort();
+    }
+    await Promise.allSettled([...this.activeDispatches]);
+  }
+
+  /** Aborts only process-local sockets; the ModelRequest remains resumable for another Host. */
+  public async quiesceTurnDispatches(
+    turnIdInput: string,
+    reason = new ExecutionHandoffError()
+  ): Promise<number> {
+    const turnId = requireId(turnIdInput, 'turnId');
+    const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
+    let aborted = 0;
+    for (const request of requests) {
+      const active = this.activeSockets.get(requireId(request.id, 'ModelRequest.id'));
+      for (const controller of active ?? []) {
+        if (controller.signal.aborted) continue;
+        controller.abort(reason);
+        aborted += 1;
+      }
+    }
+    return aborted;
+  }
+
+  /** Host shutdown uses handoff, never persistent Provider cancellation. */
+  public async quiesceAllActiveDispatches(
+    reason = new ExecutionHandoffError()
+  ): Promise<void> {
+    this.handoff = reason;
+    for (const sockets of this.activeSockets.values()) {
+      for (const controller of sockets) {
+        if (!controller.signal.aborted) controller.abort(reason);
+      }
     }
     await Promise.allSettled([...this.activeDispatches]);
   }
@@ -397,12 +548,14 @@ export class ModelProviderControlPlane {
     let attemptSeq = decimalBigInt(stats.attemptSeq, 'ModelRequest attemptSeq');
     for (;;) {
       if (options.signal?.aborted) {
+        const handoff = handoffReason(options.signal);
+        if (handoff) throw handoff;
         const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-before-provider-dispatch');
         return this.finishCancelledDispatch(modelRequestId, {
           attemptSeq,
           socketGeneration: decimalBigInt(stats.socketGeneration, 'socketGeneration'),
           stats
-        }, cancelled);
+        }, cancelled, options, 0n);
       }
       const currentIdentity: StreamIdentity = {
         attemptSeq,
@@ -414,60 +567,113 @@ export class ModelProviderControlPlane {
       try {
         fullRequest = await this.buildFullRequest(modelRequestId, attemptSeq, expectedGeneration);
       } catch (error) {
-        await this.failRequest(modelRequestId, currentIdentity, error);
+        const applied = await this.failRequest(modelRequestId, currentIdentity, error);
+        if (applied) {
+          this.emitTransientTerminal(options, currentIdentity, 'failed', 1n, providerFailureTerminalState(error));
+        }
         throw error;
       }
       const identity = await this.openSocketGeneration(modelRequestId, attemptSeq, stats);
+      let lastObservedStreamSeq = 0n;
       const controller = new AbortController();
       const detachCallerSignal = relayAbort(options.signal, controller);
       const unregister = this.registerActiveSocket(modelRequestId, controller);
       const abortWaiter = createAbortWaiter(controller.signal);
+      const timeoutWaiter = createProviderTimeoutWaiter(
+        options.timeoutMs ?? DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS
+      );
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
           signal: controller.signal,
-          onEvent: (event) => this.recordStreamEvent(
-            modelRequestId,
-            identity.attemptSeq,
-            identity.socketGeneration,
-            event
-          )
+          onEvent: (event) => {
+            const observedSeq = decimalBigInt(event.streamSeq, 'Provider event streamSeq');
+            if (observedSeq > lastObservedStreamSeq) lastObservedStreamSeq = observedSeq;
+            return this.recordStreamEvent(
+              modelRequestId,
+              identity.attemptSeq,
+              identity.socketGeneration,
+              event
+            );
+          }
         }))
         .then(
           () => ({ kind: 'resolved' as const }),
           (error: unknown) => ({ kind: 'rejected' as const, error })
         );
-      let outcome: Awaited<typeof adapterOutcome> | { kind: 'aborted' };
+      let outcome: Awaited<typeof adapterOutcome>
+        | { kind: 'aborted' }
+        | { kind: 'timed_out'; error: ProviderTransientError };
       try {
-        outcome = await Promise.race([adapterOutcome, abortWaiter.promise]);
+        outcome = await Promise.race([adapterOutcome, abortWaiter.promise, timeoutWaiter.promise]);
       } finally {
         abortWaiter.dispose();
+        timeoutWaiter.dispose();
         detachCallerSignal();
         unregister();
       }
       if (outcome.kind === 'aborted') {
+        const handoff = handoffReason(controller.signal);
+        if (handoff) throw handoff;
         const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-during-provider-dispatch');
-        return this.finishCancelledDispatch(modelRequestId, identity, cancelled);
+        return this.finishCancelledDispatch(modelRequestId, identity, cancelled, options, lastObservedStreamSeq);
       }
+      let error: unknown;
       if (outcome.kind === 'resolved') {
-        return this.finishResolvedDispatch(modelRequestId, identity);
+        const resolved = await this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
+        if (resolved.terminalState || resolved.superseded) return resolved;
+        error = new ProviderTransientError(
+          'connection_interrupted',
+          'Provider adapter resolved before committing a completed terminal checkpoint.'
+        );
+      } else if (outcome.kind === 'timed_out') {
+        error = outcome.error;
+        controller.abort(outcome.error);
+      } else {
+        error = outcome.error;
       }
-      const error = outcome.error;
-      if (controller.signal.aborted || isAbortError(error)) {
+      if (outcome.kind !== 'timed_out' && (controller.signal.aborted || isAbortError(error))) {
+        const handoff = handoffReason(controller.signal)
+          ?? (isExecutionHandoffError(error) ? error : undefined);
+        if (handoff) throw handoff;
         const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-during-provider-dispatch');
-        return this.finishCancelledDispatch(modelRequestId, identity, cancelled);
+        return this.finishCancelledDispatch(modelRequestId, identity, cancelled, options, lastObservedStreamSeq);
       }
       if (!(error instanceof ProviderTransientError)) {
         const applied = await this.failRequest(modelRequestId, identity, error);
-        if (!applied) return this.finishResolvedDispatch(modelRequestId, identity);
+        if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
+        this.emitTransientTerminal(
+          options,
+          identity,
+          'failed',
+          lastObservedStreamSeq + 1n,
+          providerFailureTerminalState(error)
+        );
         throw error;
       }
       if (identity.attemptSeq >= 2n) {
         const applied = await this.failRequest(modelRequestId, identity, error);
-        if (!applied) return this.finishResolvedDispatch(modelRequestId, identity);
+        if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
+        this.emitTransientTerminal(
+          options,
+          identity,
+          'failed',
+          lastObservedStreamSeq + 1n,
+          providerFailureTerminalState(error)
+        );
         throw error;
       }
       const retryAttempt = await this.createTransientRetry(modelRequestId, identity, error.reason);
-      if (retryAttempt === null) return this.finishResolvedDispatch(modelRequestId, identity);
+      if (retryAttempt === null) {
+        return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
+      }
+      this.emitTransientTerminal(
+        options,
+        identity,
+        'failed',
+        lastObservedStreamSeq + 1n,
+        `provider_transient_${error.reason}`,
+        { retrying: true }
+      );
       request = await this.requireDomain('ModelRequest', modelRequestId);
       stats = parseStreamStats(request.stream_stats_json);
       attemptSeq = retryAttempt;
@@ -477,16 +683,25 @@ export class ModelProviderControlPlane {
   /** Persistent request-level cancellation; one writer transaction always targets the latest identity. */
   public async cancel(modelRequestIdInput: string, reason = 'cancelled-by-user'): Promise<boolean> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
-    const result = await this.cancelCurrentRequest(modelRequestId, requireText(reason, 'cancel reason'));
-    this.abortActiveSockets(modelRequestId);
-    return result.cancelled;
+    try {
+      const result = await this.cancelCurrentRequest(modelRequestId, requireText(reason, 'cancel reason'));
+      return result.cancelled;
+    } catch (error) {
+      // A recovery owner may replace the generation between the owning-host check and this CAS.
+      // Its local socket must still be stopped, but the new owner remains solely responsible for
+      // persistent ModelRequest state.
+      this.abortActiveSockets(modelRequestId, isExecutionHandoffError(error) ? error : undefined);
+      throw error;
+    } finally {
+      this.abortActiveSockets(modelRequestId);
+    }
   }
 
   public async recordStreamEvent(
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
     socketGenerationInput: string | bigint,
-    eventInput: ProviderStreamEvent
+    eventInput: ProviderOutputStreamEvent
   ): Promise<StreamEventResult> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
@@ -507,7 +722,8 @@ export class ModelProviderControlPlane {
       kind: event.kind,
       streamSeq: event.streamSeq.toString(),
       content: event.content,
-      ...(event.usage !== undefined ? { usage: event.usage } : {})
+      ...(event.usage !== undefined ? { usage: event.usage } : {}),
+      ...(event.timing !== undefined ? { timing: event.timing } : {})
     });
     const checkpointIdentity = this.contentStore.identity(checkpointBytes, CONTENT_TYPE_CHECKPOINT);
     const preflight = await this.database.snapshot([
@@ -556,7 +772,7 @@ export class ModelProviderControlPlane {
       contentObject: content.metadata,
       ...(content.insert ? { contentInsert: content.insert } : {}),
       usage: completed ? (event.usage ?? null) : null,
-      terminalStats: completed ? { ...stats } : null,
+      terminalStats: completed ? { ...stats, ...(event.timing ?? {}) } : null,
       now: this.timestamp()
     });
     return {
@@ -684,14 +900,30 @@ export class ModelProviderControlPlane {
 
   private async finishResolvedDispatch(
     modelRequestId: string,
-    identity: StreamIdentity
+    identity: StreamIdentity,
+    options: ProviderDispatchOptions,
+    lastObservedStreamSeq: bigint
   ): Promise<ProviderDispatchResult> {
     const request = await this.requireDomain('ModelRequest', modelRequestId);
     const current = parseStreamStats(request.stream_stats_json);
     const terminalState = typeof request.terminal_state === 'string' ? request.terminal_state : undefined;
-    if (terminalState && isCancellationTerminalState(terminalState)) throw abortError();
+    const sameIdentity = sameStats(current, identity.stats);
+    const terminalIdentity = sameIdentity
+      ? identity
+      : {
+          attemptSeq: decimalBigInt(current.attemptSeq, 'stream_stats.attemptSeq'),
+          socketGeneration: decimalBigInt(current.socketGeneration, 'stream_stats.socketGeneration')
+        };
+    const terminalStreamSeq = sameIdentity ? lastObservedStreamSeq + 1n : 1n;
+    if (terminalState && isCancellationTerminalState(terminalState)) {
+      this.emitTransientTerminal(options, terminalIdentity, 'cancelled', terminalStreamSeq, terminalState);
+      throw abortError();
+    }
+    if (terminalState && isProviderFailureTerminalState(terminalState)) {
+      this.emitTransientTerminal(options, terminalIdentity, 'failed', terminalStreamSeq, terminalState);
+    }
     return dispatchResult(modelRequestId, identity, {
-      superseded: !sameStats(current, identity.stats),
+      superseded: !sameIdentity,
       terminalState
     });
   }
@@ -699,9 +931,30 @@ export class ModelProviderControlPlane {
   private finishCancelledDispatch(
     modelRequestId: string,
     identity: StreamIdentity,
-    result: ModelRequestCancelResult
+    result: ModelRequestCancelResult,
+    options: ProviderDispatchOptions,
+    lastObservedStreamSeq: bigint
   ): ProviderDispatchResult {
-    if (result.terminalState && isCancellationTerminalState(result.terminalState)) throw abortError();
+    const sameIdentity = result.attemptSeq === identity.attemptSeq.toString()
+      && result.socketGeneration === identity.socketGeneration.toString();
+    const terminalIdentity = {
+      attemptSeq: decimalBigInt(result.attemptSeq, 'cancel result attemptSeq'),
+      socketGeneration: decimalBigInt(result.socketGeneration, 'cancel result socketGeneration')
+    };
+    const terminalStreamSeq = sameIdentity ? lastObservedStreamSeq + 1n : 1n;
+    if (result.terminalState && isCancellationTerminalState(result.terminalState)) {
+      this.emitTransientTerminal(
+        options,
+        terminalIdentity,
+        'cancelled',
+        terminalStreamSeq,
+        result.terminalState
+      );
+      throw abortError();
+    }
+    if (result.terminalState && isProviderFailureTerminalState(result.terminalState)) {
+      this.emitTransientTerminal(options, terminalIdentity, 'failed', terminalStreamSeq, result.terminalState);
+    }
     return dispatchResult(modelRequestId, identity, {
       superseded: result.attemptSeq !== identity.attemptSeq.toString()
         || result.socketGeneration !== identity.socketGeneration.toString(),
@@ -709,27 +962,57 @@ export class ModelProviderControlPlane {
     });
   }
 
+  private emitTransientTerminal(
+    options: ProviderDispatchOptions,
+    identity: Pick<StreamIdentity, 'attemptSeq' | 'socketGeneration'>,
+    kind: ProviderTransientTerminalEventKind,
+    streamSeq: bigint,
+    terminalState: string,
+    detail: { retrying?: boolean } = {}
+  ): void {
+    if (!options.onTransientTerminal) return;
+    try {
+      options.onTransientTerminal({
+        attemptSeq: identity.attemptSeq.toString(),
+        socketGeneration: identity.socketGeneration.toString(),
+        event: {
+          kind,
+          streamSeq: (streamSeq > 0n ? streamSeq : 1n).toString(),
+          content: {
+            terminalState,
+            ...(detail.retrying ? { retrying: true } : {})
+          }
+        }
+      });
+    } catch {
+      // The transient overlay is observational; durable ModelRequest state remains authoritative.
+    }
+  }
+
   private registerActiveSocket(modelRequestId: string, controller: AbortController): () => void {
     const active = this.activeSockets.get(modelRequestId) ?? new Set<AbortController>();
     active.add(controller);
     this.activeSockets.set(modelRequestId, active);
+    // Closes the window where global handoff starts after dispatch() passed its admission check but
+    // before the socket registered itself in activeSockets.
+    if (this.handoff && !controller.signal.aborted) controller.abort(this.handoff);
     return () => {
       active.delete(controller);
       if (active.size === 0) this.activeSockets.delete(modelRequestId);
     };
   }
 
-  private abortActiveSockets(modelRequestId: string): void {
-    for (const controller of this.activeSockets.get(modelRequestId) ?? []) controller.abort();
+  private abortActiveSockets(modelRequestId: string, reason?: unknown): void {
+    for (const controller of this.activeSockets.get(modelRequestId) ?? []) {
+      if (!controller.signal.aborted) controller.abort(reason);
+    }
   }
 
   private async failRequest(modelRequestId: string, identity: StreamIdentity, error: unknown): Promise<boolean> {
     return this.terminalizeRequest(modelRequestId, identity, {
       attemptStatus: 'failed',
       operationStatus: 'failed',
-      terminalState: error instanceof ProviderTransientError
-        ? `provider_transient_${error.reason}`
-        : 'provider_failed'
+      terminalState: providerFailureTerminalState(error)
     });
   }
 
@@ -798,7 +1081,18 @@ export class ModelProviderControlPlane {
       authoritySnapshotId,
       turnId
     );
-    return frozenModelIdentity(frozen.document);
+    const model = frozenModelIdentity(frozen.document);
+    const context = frozenContextProfile(frozen.document);
+    const compression = frozenCompressionPolicy(frozen.document);
+    return {
+      ...model,
+      contextWindowTokens: context.contextWindowTokens,
+      compressionThresholdTokens: context.compressionThresholdTokens,
+      ...(compression ? {
+        compressionProviderId: compression.provider.providerConfigId,
+        compressionModelId: compression.provider.modelId
+      } : {})
+    };
   }
 
   private async replayCreation(
@@ -821,6 +1115,8 @@ export class ModelProviderControlPlane {
       && request.authority_snapshot_id === expected.authoritySnapshotId
       && request.provider_id === expected.providerId
       && request.model_id === expected.modelId
+      && request.context_window_tokens === BigInt(expected.contextWindowTokens)
+      && request.compression_threshold_tokens === BigInt(expected.compressionThresholdTokens)
       && (request.settings_snapshot_object_id ?? null) === expected.settingsSnapshotContentObjectId
       && request.recipe_object_id === expected.recipeIdentity.id
       && projection.owner_kind === 'model_request'
@@ -859,6 +1155,52 @@ export class ModelProviderControlPlane {
   }
 }
 
+function createProviderTimeoutWaiter(timeoutMsInput: number): {
+  promise: Promise<{ kind: 'timed_out'; error: ProviderTransientError }>;
+  dispose(): void;
+} {
+  if (!Number.isSafeInteger(timeoutMsInput) || timeoutMsInput <= 0) {
+    throw new TypeError('Provider dispatch timeoutMs must be a positive safe integer.');
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const error = new ProviderTransientError(
+    'connection_interrupted',
+    `Provider dispatch timed out after ${timeoutMsInput}ms.`
+  );
+  const promise = new Promise<{ kind: 'timed_out'; error: ProviderTransientError }>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: 'timed_out', error }), timeoutMsInput);
+  });
+  return {
+    promise,
+    dispose() {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+}
+
+function compressionRequestSegments<T>(
+  recipe: PlainJsonValue,
+  projectionRootId: string,
+  segments: readonly T[]
+): readonly T[] {
+  if (!isRecord(recipe) || recipe.kind !== 'reliable-context-compression') return segments;
+  if (recipe.sourceRootId !== projectionRootId) {
+    throw new Error('Compression recipe source root does not match its immutable ModelContextProjection.');
+  }
+  const count = recipe.sourceSegmentCount;
+  if (!Number.isSafeInteger(count) || (count as number) <= 0 || (count as number) > segments.length) {
+    throw new Error('Compression recipe sourceSegmentCount is outside the frozen Context projection.');
+  }
+  // The finite tail is retained verbatim by ContextCompression.create and must never be sent to
+  // the compact Provider as summary source, otherwise the next request duplicates that tail.
+  return segments.slice(0, count as number);
+}
+
+function isCompressionRecipe(recipe: PlainJsonValue): boolean {
+  return isRecord(recipe) && recipe.kind === 'reliable-context-compression';
+}
+
 function dispatchResult(
   modelRequestId: string,
   identity: StreamIdentity,
@@ -875,8 +1217,8 @@ function dispatchResult(
 
 function relayAbort(source: AbortSignal | undefined, target: AbortController): () => void {
   if (!source) return () => undefined;
-  const abort = () => target.abort();
-  if (source.aborted) target.abort();
+  const abort = () => target.abort(source.reason);
+  if (source.aborted) target.abort(source.reason);
   else source.addEventListener('abort', abort, { once: true });
   return () => source.removeEventListener('abort', abort);
 }
@@ -905,6 +1247,16 @@ function isCancellationTerminalState(value: string): boolean {
   return value !== 'completed'
     && value !== 'provider_failed'
     && !value.startsWith('provider_transient_');
+}
+
+function isProviderFailureTerminalState(value: string): boolean {
+  return value === 'provider_failed' || value.startsWith('provider_transient_');
+}
+
+function providerFailureTerminalState(error: unknown): string {
+  return error instanceof ProviderTransientError
+    ? `provider_transient_${error.reason}`
+    : 'provider_failed';
 }
 
 function decodeUtf8Exact(bytes: Buffer, label: string): string {
@@ -943,10 +1295,11 @@ function assertExactStreamCheckpoint(
 }
 
 function normalizeStreamEvent(event: ProviderStreamEvent): {
-  kind: ProviderStreamEventKind;
+  kind: ProviderOutputStreamEventKind;
   streamSeq: bigint;
   content: PlainJsonValue;
   usage?: PlainJsonValue;
+  timing?: ProviderStreamTiming;
 } {
   if (!event || !['output_delta', 'output_item_done', 'completed'].includes(event.kind)) {
     throw new TypeError(`Unsupported Provider stream event: ${String(event?.kind)}`);
@@ -954,10 +1307,11 @@ function normalizeStreamEvent(event: ProviderStreamEvent): {
   const streamSeq = decimalBigInt(event.streamSeq, 'streamSeq');
   if (streamSeq <= 0n) throw new TypeError('streamSeq must be positive.');
   return {
-    kind: event.kind,
+    kind: event.kind as ProviderOutputStreamEventKind,
     streamSeq,
     content: normalizePlainJson(event.content, 'Provider stream event content'),
-    ...(event.usage !== undefined ? { usage: normalizePlainJson(event.usage, 'Provider stream usage') } : {})
+    ...(event.usage !== undefined ? { usage: normalizePlainJson(event.usage, 'Provider stream usage') } : {}),
+    ...(event.timing !== undefined ? { timing: normalizeProviderTiming(event.timing) } : {})
   };
 }
 
@@ -968,7 +1322,38 @@ function parseStreamStats(value: unknown): StreamStats {
   if (value.retryReason !== null && !isTransientReason(value.retryReason)) {
     throw new Error('ModelRequest.stream_stats_json has an invalid retryReason.');
   }
-  return { attemptSeq, socketGeneration, retryReason: value.retryReason as ProviderTransientReason | null };
+  return {
+    attemptSeq,
+    socketGeneration,
+    retryReason: value.retryReason as ProviderTransientReason | null,
+    ...normalizeProviderTiming(value)
+  };
+}
+
+function normalizeProviderTiming(value: unknown): ProviderStreamTiming {
+  if (!isRecord(value)) throw new TypeError('Provider stream timing must be an object.');
+  return {
+    ...(optionalTimestamp(value.providerStartedAt, 'providerStartedAt') !== undefined
+      ? { providerStartedAt: optionalTimestamp(value.providerStartedAt, 'providerStartedAt') }
+      : {}),
+    ...(optionalTimestamp(value.firstOutputAt, 'firstOutputAt') !== undefined
+      ? { firstOutputAt: optionalTimestamp(value.firstOutputAt, 'firstOutputAt') }
+      : {}),
+    ...(optionalTimestamp(value.completedAt, 'completedAt') !== undefined
+      ? { completedAt: optionalTimestamp(value.completedAt, 'completedAt') }
+      : {}),
+    ...(optionalTimestamp(value.streamOutputDurationMs, 'streamOutputDurationMs', true) !== undefined
+      ? { streamOutputDurationMs: optionalTimestamp(value.streamOutputDurationMs, 'streamOutputDurationMs', true) }
+      : {})
+  };
+}
+
+function optionalTimestamp(value: unknown, label: string, allowZero = false): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (allowZero ? (value as number) < 0 : (value as number) <= 0)) {
+    throw new TypeError(`Provider stream timing ${label} must be a ${allowZero ? 'non-negative' : 'positive'} safe integer.`);
+  }
+  return value as number;
 }
 
 function sameStats(left: StreamStats, right: StreamStats): boolean {

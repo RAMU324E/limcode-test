@@ -19,8 +19,6 @@ import {
 } from './effectControlPlane';
 import {
   PROCESS_OUTPUT_MAX_CHUNK_BYTES,
-  PROCESS_OUTPUT_MAX_RETAINED_BYTES,
-  PROCESS_OUTPUT_MAX_RETAINED_CHUNKS,
   PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM,
   PROCESS_WRAPPER_CHUNKS_DIRECTORY,
   PROCESS_WRAPPER_EXIT_RECEIPT_FILE,
@@ -34,6 +32,7 @@ import {
   parseWrapperExitReceipt,
   parseWrapperIdentity,
   parseWrapperManifest,
+  processChunkFileName,
   processSpoolPath,
   processSpoolRoot,
   readLinuxStartFingerprint,
@@ -44,8 +43,15 @@ import {
   type ProcessWrapperManifest
 } from './processProtocol';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { RootAuthority } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
+import {
+  currentExecutionLeaseFence,
+  executionLeaseFenceAssertion,
+  handoffReason,
+  runWithoutExecutionLeaseFence
+} from './executionLeaseFence';
 
 export interface ProcessStartRequest {
   processId: string;
@@ -78,10 +84,14 @@ export interface ProcessStartPreparation {
 export type ProcessLaunchObservation =
   | { outcome: 'succeeded'; identity: ProcessWrapperIdentity }
   | { outcome: 'failed'; error: string }
+  | { outcome: 'cancelled'; error: string }
   | { outcome: 'outcome_unknown'; error: string };
 
 export interface ProcessStartObservation {
   outcome: 'succeeded' | 'failed' | 'cancelled' | 'outcome_unknown';
+  /** Stable protocol result shown to the model/UI; a foreground wait expiry is a successful handoff. */
+  state: 'background_started' | 'completed' | 'launch_failed' | 'launch_cancelled' | 'outcome_unknown';
+  processId: string;
   launch: ProcessLaunchObservation;
   foreground: ProcessWaitObservation | null;
 }
@@ -97,10 +107,51 @@ export interface ProcessOutputReadResult {
   truncated: boolean;
 }
 
+export interface ProcessOutputPageReadResult {
+  processId: string;
+  status: string;
+  stdout: string;
+  stderr: string;
+  liveStdout: string;
+  liveStderr: string;
+  livePreviewBytes: string;
+  pageBytes: string;
+  pageChunks: string;
+  retainedBytes: string;
+  retainedChunks: string;
+  droppedBytes: string;
+  truncated: boolean;
+  hasMore: boolean;
+  complete: boolean;
+  nextOutputHandle: string;
+}
+
+/** One verified process-stream prefix for the on-demand Webview byte pager. */
+export interface ProcessDetailOutputSnapshot {
+  retainedBytes: string;
+  retainedChunks: string;
+  stdout: Buffer;
+  stderr: Buffer;
+}
+
 export type ProcessWaitObservation =
   | { state: 'running'; processId: string }
   | { state: 'exited'; processId: string; receipt: ProcessWrapperExitReceipt }
   | { state: 'outcome_unknown'; processId: string; reason: string };
+
+export type ProcessStopStatus =
+  | 'already_exited'
+  | 'stopped'
+  | 'stop_requested'
+  | 'cancelled'
+  | 'outcome_unknown';
+
+export interface ProcessStopObservation {
+  outcome: 'succeeded' | 'cancelled' | 'outcome_unknown';
+  status: ProcessStopStatus;
+  reason?: string;
+  receipt?: ProcessWrapperExitReceipt;
+}
 
 interface ReconciledOutput {
   retainedBytes: bigint;
@@ -127,14 +178,57 @@ interface ProcessOutputCounters {
   truncated: boolean;
 }
 
+interface PreparedProcessOutputChunk {
+  chunkSeq: bigint;
+  streamKind: 'stdout' | 'stderr';
+  byteLength: bigint;
+  createdAt: string;
+  content: PreparedContentObject;
+}
+
+interface ProcessOutputCursor {
+  processId: string;
+  nextChunkSeq: bigint;
+  reconciledRetainedChunks: bigint | null;
+  stdoutCarry: Buffer;
+  stderrCarry: Buffer;
+}
+
 const PROCESS_START = 'process_start' as const;
 const PROCESS_STOP = 'process_stop_request' as const;
 const WRAPPER_IDENTITY_WAIT_MS = 5_000;
 const WRAPPER_IDENTITY_POLL_MS = 20;
+const PROCESS_EXIT_OBSERVER_POLL_MS = 250;
+const PROCESS_STOP_RECEIPT_WAIT_MS = 1_000;
+const PROCESS_STOP_RECEIPT_POLL_MS = 25;
+/** Per-transaction worker message budget; it bounds one commit, never retained process output. */
+export const PROCESS_OUTPUT_TRANSACTION_MAX_WIRE_BYTES = 1_048_576;
+const PROCESS_OUTPUT_METADATA_READ_ROWS = 32;
+/** A mode=output page is resumable; this bounds one model result, never the traversable history. */
+export const PROCESS_OUTPUT_READ_PAGE_MAX_BYTES = 128 * 1024;
+const PROCESS_OUTPUT_HANDLE_PREFIX = 'rk-process-output:';
+
+export interface ProcessControlPlaneOptions {
+  now?: () => string;
+  onExitObserverError?: (input: { processId: string; error: unknown }) => void;
+}
+
+export interface ProcessExitObserverInspection {
+  enabled: boolean;
+  closing: boolean;
+  activeProcessIds: string[];
+}
 
 /** Process domain orchestration; the detached wrapper remains the external process authority. */
 export class ProcessControlPlane {
   private readonly now: () => string;
+  private readonly onExitObserverError: ProcessControlPlaneOptions['onExitObserverError'];
+  private readonly exitObservers = new Map<string, Promise<void>>();
+  private readonly exitObserverWakeups = new Set<() => void>();
+  private exitObserversEnabled = false;
+  private exitObserversClosing = false;
+  private exitObserversDisposePromise: Promise<void> | undefined;
+  private processReceiptObserver: ((processId: string) => void) | undefined;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -142,9 +236,18 @@ export class ProcessControlPlane {
     private readonly effects: EffectControlPlane,
     private readonly authority: RootAuthority,
     private readonly binding: RootBinding,
-    options: { now?: () => string } = {}
+    options: ProcessControlPlaneOptions = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.onExitObserverError = options.onExitObserverError;
+  }
+
+  /**
+   * Registers an observational level-trigger wake. The observer never owns ProcessReceipt writes;
+   * callers must still scan SQLite on startup because a host may stop between receipt commit and it.
+   */
+  public setProcessReceiptObserver(observer: ((processId: string) => void) | undefined): void {
+    this.processReceiptObserver = observer;
   }
 
   public async prepareStart(input: {
@@ -178,17 +281,33 @@ export class ProcessControlPlane {
     };
   }
 
-  public async dispatchStart(effectIntentIdInput: string, foregroundWaitMs = 0): Promise<{
+  public async dispatchStart(
+    effectIntentIdInput: string,
+    foregroundWaitMs = 0,
+    signal?: AbortSignal
+  ): Promise<{
     observation: ProcessStartObservation | null;
     terminal: ToolTerminalResult | null;
   }> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
     requireWaitDuration(foregroundWaitMs);
+    if (signal?.aborted) {
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      const cancelled = await this.effects.cancelPendingEffect({
+        source: { kind: 'internal', key: `process-start:${effectIntentId}:cancel-before-dispatch` },
+        effectIntentId,
+        detail: { reason: 'Process start cancelled before capability dispatch.' }
+      });
+      if (cancelled) return { observation: null, terminal: cancelled.terminal ?? null };
+    }
     if (!await this.effects.claimEffectDispatch(effectIntentId)) return { observation: null, terminal: null };
-    const launch = await this.launchDispatched(effectIntentId);
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     const request = normalizeStartRequest(await this.effects.readEffectRequest<ProcessStartRequest>(effectIntentId));
-    const observation = await this.observeStart(request, launch, foregroundWaitMs);
+    const launch: ProcessLaunchObservation = signal?.aborted
+      ? { outcome: 'cancelled', error: 'Process start cancelled before wrapper launch.' }
+      : await this.launchDispatched(effectIntentId, signal);
+    const observation = await this.observeStart(request, launch, foregroundWaitMs, signal);
     const recorded = await this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `process-start:${String(intent.attempt_id)}:receipt` },
       attemptId: intent.attempt_id as string,
@@ -203,9 +322,13 @@ export class ProcessControlPlane {
   }
 
   /** Launches only an already-dispatched intent; useful after the durable claim, never for retry. */
-  public async launchDispatched(effectIntentIdInput: string): Promise<ProcessLaunchObservation> {
+  public async launchDispatched(
+    effectIntentIdInput: string,
+    signal?: AbortSignal
+  ): Promise<ProcessLaunchObservation> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
     await this.validateBinding();
+    if (signal?.aborted) return { outcome: 'cancelled', error: 'Process start cancelled before spool creation.' };
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     if (intent.effect_kind !== PROCESS_START || intent.dispatch_state !== 'dispatched') {
       throw new Error('Process launch requires a committed dispatched process_start EffectIntent.');
@@ -224,6 +347,7 @@ export class ProcessControlPlane {
       }
       return { outcome: 'failed', error: errorMessage(error) };
     }
+    if (signal?.aborted) return { outcome: 'cancelled', error: 'Process start cancelled before launch request write.' };
     const launch: ProcessWrapperLaunchRequest = {
       kind: PROCESS_WRAPPER_PROTOCOL,
       ...request,
@@ -231,6 +355,7 @@ export class ProcessControlPlane {
     };
     const launchPath = path.join(spoolPath, 'launch.json');
     await writeAtomicJson(launchPath, launch);
+    if (signal?.aborted) return { outcome: 'cancelled', error: 'Process start cancelled before wrapper spawn.' };
     const spawned = await new Promise<{ ok: true } | { ok: false; error: unknown }>((resolve) => {
       try {
         const wrapper = spawn(process.execPath, [path.join(__dirname, 'processWrapper.js'), launchPath], {
@@ -263,6 +388,10 @@ export class ProcessControlPlane {
     const attempt = await this.requireExisting('Attempt', requireId(receipt.attempt_id, 'EffectReceipt.attempt_id'));
     const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
     const toolCallId = requireId(operation.tool_call_id, 'Operation.tool_call_id');
+    const toolCall = await this.requireExisting('ToolCall', toolCallId);
+    const sourceTurnId = requireId(toolCall.turn_id, 'ToolCall.turn_id');
+    const sourceTurn = await this.requireExisting('Turn', sourceTurnId);
+    const conversationId = requireId(sourceTurn.conversation_id, 'Turn.conversation_id');
     const intentRows = await this.list('EffectIntent', { attempt_id: attempt.id }, 2);
     if (intentRows.length !== 1) throw new Error('process_start Attempt must have one EffectIntent.');
     const request = normalizeStartRequest(await this.effects.readEffectRequest<ProcessStartRequest>(intentRows[0].id as string));
@@ -291,6 +420,8 @@ export class ProcessControlPlane {
         additionalSteps.push(...processStartFactSteps(
           request,
           toolCallId,
+          sourceTurnId,
+          conversationId,
           observation.launch.identity,
           observation.foreground,
           this.timestamp(),
@@ -300,12 +431,17 @@ export class ProcessControlPlane {
     } else if (existingProcess) {
       throw new Error('Failed/unknown process launch cannot already own a Process row.');
     }
-    return this.effects.completeOperation({
+    const terminalResult = await this.effects.completeOperation({
       source,
       effectReceiptId,
       outcome,
       ...(additionalSteps.length > 0 ? { additionalSteps } : {})
     });
+    if (observation.foreground?.state === 'exited') {
+      await this.reconcileOutput(request.processId);
+    }
+    if (observation.foreground?.state === 'running') this.ensureExitObserver(request.processId);
+    return terminalResult;
   }
 
   public async prepareStop(input: {
@@ -331,13 +467,23 @@ export class ProcessControlPlane {
     });
   }
 
-  public async dispatchStop(effectIntentIdInput: string): Promise<{
-    outcome: 'succeeded' | 'outcome_unknown';
+  public async dispatchStop(effectIntentIdInput: string, signal?: AbortSignal): Promise<{
+    outcome: 'succeeded' | 'cancelled' | 'outcome_unknown';
     terminal: ToolTerminalResult | null;
   } | null> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
+    if (signal?.aborted) {
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      await this.effects.cancelPendingEffect({
+        source: { kind: 'internal', key: `process-stop:${effectIntentId}:cancel-before-dispatch` },
+        effectIntentId,
+        detail: { reason: 'Process stop cancelled before capability dispatch.' }
+      });
+      return null;
+    }
     if (!await this.effects.claimEffectDispatch(effectIntentId)) return null;
-    const outcome = await this.executeDispatchedStop(effectIntentId);
+    const outcome = await this.executeDispatchedStop(effectIntentId, signal);
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     const recorded = await this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `process-stop:${String(intent.attempt_id)}:receipt` },
@@ -359,8 +505,18 @@ export class ProcessControlPlane {
   }
 
   /** Writes a request for the wrapper; the Extension Host never signals a bare PID/process group. */
-  public async executeDispatchedStop(effectIntentIdInput: string): Promise<{ outcome: 'succeeded' | 'outcome_unknown'; reason?: string }> {
+  public async executeDispatchedStop(
+    effectIntentIdInput: string,
+    signal?: AbortSignal
+  ): Promise<ProcessStopObservation> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
+    if (signal?.aborted) {
+      return {
+        outcome: 'cancelled',
+        status: 'cancelled',
+        reason: 'Process stop cancelled before the stop request was dispatched.'
+      };
+    }
     await this.validateBinding();
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     if (intent.effect_kind !== PROCESS_STOP || intent.dispatch_state !== 'dispatched') {
@@ -369,33 +525,43 @@ export class ProcessControlPlane {
     const request = normalizeStopRequest(await this.effects.readEffectRequest<ProcessStopEffectRequest>(effectIntentId));
     const processRow = await this.requireExisting('Process', request.processId);
     if (!processEvidenceMatches(processRow, request)) {
-      return { outcome: 'outcome_unknown', reason: 'Persisted Process evidence does not match stop request.' };
+      return {
+        outcome: 'outcome_unknown',
+        status: 'outcome_unknown',
+        reason: 'Persisted Process evidence does not match stop request.'
+      };
     }
-    const spoolPath = processSpoolPath(this.binding, request.spoolLocator);
-    let identity: ProcessWrapperIdentity;
-    try {
-      identity = parseWrapperIdentity(await readJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE)));
-      assertIdentityMatchesStop(identity, request);
-      if (!isLinuxWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
-        return { outcome: 'outcome_unknown', reason: 'Recorded process wrapper is not reachable.' };
-      }
-      if (readLinuxStartFingerprint(identity.childPid) !== identity.startFingerprint) {
-        return { outcome: 'outcome_unknown', reason: 'Live process start fingerprint does not match.' };
-      }
-    } catch (error) {
-      return { outcome: 'outcome_unknown', reason: errorMessage(error) };
+    return this.convergeDispatchedStop(request, processRow, { allowStopWrite: true, signal });
+  }
+
+  /**
+   * Internal resource-owner stop path used by explicit Child subtree interruption. The durable
+   * cleanup outbox owns retries; this method preserves the same wrapper identity/PID-reuse fences
+   * as the user-facing process_stop effect without pretending a second ToolCall exists.
+   */
+  public async stopOwnedProcess(
+    processIdInput: string,
+    signal?: AbortSignal
+  ): Promise<ProcessStopObservation> {
+    const processId = requireId(processIdInput, 'processId');
+    if (signal?.aborted) {
+      return {
+        outcome: 'cancelled',
+        status: 'cancelled',
+        reason: 'Owned process cleanup was cancelled before dispatch.'
+      };
     }
-    const stop: ProcessStopRequest = {
-      kind: PROCESS_WRAPPER_PROTOCOL,
-      processId: request.processId,
-      stableNonce: request.stableNonce,
-      startFingerprint: request.startFingerprint,
-      processGroupId: request.processGroupId,
-      commandDigest: request.commandDigest,
-      requestedAt: this.timestamp()
+    await this.validateBinding();
+    const processRow = await this.requireExisting('Process', processId);
+    const request: ProcessStopEffectRequest = {
+      processId,
+      stableNonce: requireText(processRow.wrapper_nonce, 'Process.wrapper_nonce'),
+      startFingerprint: requireText(processRow.start_fingerprint, 'Process.start_fingerprint'),
+      processGroupId: requireBigInt(processRow.process_group_id, 'Process.process_group_id').toString(),
+      commandDigest: requireSha256(processRow.command_digest, 'Process.command_digest'),
+      spoolLocator: requireText(processRow.spool_locator, 'Process.spool_locator')
     };
-    await writeAtomicJson(path.join(spoolPath, PROCESS_WRAPPER_STOP_REQUEST_FILE), stop);
-    return { outcome: 'succeeded' };
+    return this.convergeDispatchedStop(request, processRow, { allowStopWrite: true, signal });
   }
 
   /** Recovery reads existing stop evidence and never writes or re-dispatches the stop request. */
@@ -420,24 +586,19 @@ export class ProcessControlPlane {
     await this.validateBinding();
     const request = normalizeStopRequest(await this.effects.readEffectRequest<ProcessStopEffectRequest>(intent.id as string));
     const processRow = await this.requireExisting('Process', request.processId);
-    let outcome: 'succeeded' | 'outcome_unknown' = 'outcome_unknown';
-    let reason = 'Persisted stop request evidence could not be proved.';
-    try {
-      if (!processEvidenceMatches(processRow, request)) throw new Error('Persisted Process does not match stop request.');
-      const spoolPath = processSpoolPath(this.binding, request.spoolLocator);
-      const persisted = parseStopRequest(await readJson(path.join(spoolPath, PROCESS_WRAPPER_STOP_REQUEST_FILE)));
-      assertStopRequestMatchesEffect(request, persisted);
-      outcome = 'succeeded';
-      reason = 'Matching atomic process stop request exists.';
-    } catch (error) {
-      reason = errorMessage(error);
-    }
+    const observation = processEvidenceMatches(processRow, request)
+      ? await this.convergeDispatchedStop(request, processRow, { allowStopWrite: false })
+      : {
+          outcome: 'outcome_unknown' as const,
+          status: 'outcome_unknown' as const,
+          reason: 'Persisted Process does not match stop request.'
+        };
     const recorded = await this.effects.recordEffectReceipt({
       source: input.source,
       attemptId: intent.attempt_id as string,
       effectKind: PROCESS_STOP,
-      outcome,
-      detail: { outcome, reason, automaticRetry: false }
+      outcome: observation.outcome,
+      detail: { ...observation, automaticRetry: false }
     });
     const winner = await this.requireExisting('EffectReceipt', recorded.effectReceiptId);
     return this.effects.completeOperation({
@@ -447,203 +608,442 @@ export class ProcessControlPlane {
     });
   }
 
+  /**
+   * Converges the level-triggered ProcessReceipt/atomic exit receipt before relying on liveness.
+   * Recovery shares the same reader but never creates a missing external stop request.
+   */
+  private async convergeDispatchedStop(
+    request: ProcessStopEffectRequest,
+    processRow: DomainRow,
+    options: { allowStopWrite: boolean; signal?: AbortSignal }
+  ): Promise<ProcessStopObservation> {
+    const persistedReceipts = await this.list('ProcessReceipt', { process_id: request.processId }, 2);
+    if (persistedReceipts.length > 1) throw new Error(`Process ${request.processId} has multiple ProcessReceipts.`);
+    if (persistedReceipts.length === 1) {
+      const persisted = persistedProcessObservation(processRow, persistedReceipts[0]);
+      if (persisted.state === 'exited') return terminalStopObservation(persisted, true);
+      if (persisted.state === 'outcome_unknown') return unknownStopObservation(persisted.reason);
+      throw new Error('Persisted ProcessReceipt cannot describe a running Process.');
+    }
+
+    const before = await this.waitForTerminalProcessEvidence(request.processId, 0);
+    if (before.state === 'exited') return terminalStopObservation(before, true);
+
+    const spoolPath = processSpoolPath(this.binding, request.spoolLocator);
+    const stopPath = path.join(spoolPath, PROCESS_WRAPPER_STOP_REQUEST_FILE);
+    let matchingStopExists = false;
+    try {
+      const persistedStop = parseStopRequest(await readJson(stopPath));
+      assertStopRequestMatchesEffect(request, persistedStop);
+      matchingStopExists = true;
+    } catch (error) {
+      if (!isNotFound(error)) return unknownStopObservation(errorMessage(error));
+    }
+
+    if (!matchingStopExists) {
+      if (!options.allowStopWrite) {
+        const terminal = await this.waitForTerminalProcessEvidence(
+          request.processId,
+          PROCESS_STOP_RECEIPT_WAIT_MS
+        );
+        return terminal.state === 'exited'
+          ? terminalStopObservation(terminal, true)
+          : unknownStopObservation(
+              terminal.state === 'outcome_unknown'
+                ? terminal.reason
+                : 'Dispatched process stop has neither an atomic stop request nor a terminal receipt.'
+            );
+      }
+
+      let identity: ProcessWrapperIdentity;
+      try {
+        identity = parseWrapperIdentity(await readJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE)));
+        assertIdentityMatchesStop(identity, request);
+      } catch (error) {
+        const terminal = await this.waitForTerminalProcessEvidence(
+          request.processId,
+          PROCESS_STOP_RECEIPT_WAIT_MS
+        );
+        return terminal.state === 'exited'
+          ? terminalStopObservation(terminal, true)
+          : unknownStopObservation(errorMessage(error));
+      }
+
+      if (!isLinuxWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
+        const terminal = await this.waitForTerminalProcessEvidence(
+          request.processId,
+          PROCESS_STOP_RECEIPT_WAIT_MS
+        );
+        return terminal.state === 'exited'
+          ? terminalStopObservation(terminal, true)
+          : unknownStopObservation('Recorded process wrapper is not reachable and no terminal receipt converged.');
+      }
+      try {
+        if (readLinuxStartFingerprint(identity.childPid) !== identity.startFingerprint) {
+          return unknownStopObservation('Live process start fingerprint does not match.');
+        }
+      } catch (error) {
+        const terminal = await this.waitForTerminalProcessEvidence(
+          request.processId,
+          PROCESS_STOP_RECEIPT_WAIT_MS
+        );
+        return terminal.state === 'exited'
+          ? terminalStopObservation(terminal, true)
+          : unknownStopObservation(errorMessage(error));
+      }
+
+      const terminalBeforeWrite = await this.waitForTerminalProcessEvidence(request.processId, 0);
+      if (terminalBeforeWrite.state === 'exited') return terminalStopObservation(terminalBeforeWrite, true);
+      if (options.signal?.aborted) {
+        return {
+          outcome: 'cancelled',
+          status: 'cancelled',
+          reason: 'Process stop cancelled before the stop request was dispatched.'
+        };
+      }
+      const stop: ProcessStopRequest = {
+        kind: PROCESS_WRAPPER_PROTOCOL,
+        processId: request.processId,
+        stableNonce: request.stableNonce,
+        startFingerprint: request.startFingerprint,
+        processGroupId: request.processGroupId,
+        commandDigest: request.commandDigest,
+        requestedAt: this.timestamp()
+      };
+      try {
+        await writeAtomicJsonOnce(stopPath, stop);
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error;
+        const winner = parseStopRequest(await readJson(stopPath));
+        assertStopRequestMatchesEffect(request, winner);
+      }
+      matchingStopExists = true;
+    }
+
+    const after = await this.waitForTerminalProcessEvidence(
+      request.processId,
+      PROCESS_STOP_RECEIPT_WAIT_MS
+    );
+    if (after.state === 'exited') return terminalStopObservation(after, false);
+    if (!matchingStopExists) {
+      return unknownStopObservation(
+        after.state === 'outcome_unknown' ? after.reason : 'Process stop request was not durably persisted.'
+      );
+    }
+    return {
+      outcome: 'succeeded',
+      status: 'stop_requested',
+      reason: 'Matching atomic stop request is durable; terminal receipt is still pending.'
+    };
+  }
+
+  private async waitForTerminalProcessEvidence(
+    processId: string,
+    timeoutMs: number
+  ): Promise<ProcessWaitObservation> {
+    const deadline = Date.now() + timeoutMs;
+    let latest: ProcessWaitObservation = { state: 'running', processId };
+    for (;;) {
+      const persisted = await this.list('ProcessReceipt', { process_id: processId }, 2);
+      if (persisted.length > 1) throw new Error(`Process ${processId} has multiple ProcessReceipts.`);
+      if (persisted.length === 1) {
+        return persistedProcessObservation(await this.requireExisting('Process', processId), persisted[0]);
+      }
+      latest = await this.observeProcess(processId);
+      if (latest.state === 'exited') return this.reconcileProcessExit(processId);
+      if (Date.now() >= deadline) return latest;
+      await sleep(Math.min(PROCESS_STOP_RECEIPT_POLL_MS, Math.max(1, deadline - Date.now())));
+    }
+  }
+
   /** Imports one immutable wrapper-manifest prefix into CAS+SQLite; it never re-runs the process. */
   public async reconcileOutput(processIdInput: string): Promise<ReconciledOutput> {
     const processId = requireId(processIdInput, 'processId');
     await this.validateBinding();
-    const { processRow, registered } = await this.readProcessOutputSnapshot(processId);
-    const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
-    const { manifest, chunks } = await this.readVerifiedSpoolPrefix(processRow, spoolPath);
-    const counters = outputCounters(manifest);
-    assertProcessOutputProgress(processRow, counters, manifest.status);
-
-    const existingSeq = new Set(registered.map((row) => requireBigInt(
-      row.chunk_seq,
-      'ProcessOutputChunk.chunk_seq'
-    ).toString()));
-    const existingBytes = registered.reduce(
-      (total, row) => total + requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length'),
-      0n
-    );
-    const unregistered = chunks.filter((chunk) => !existingSeq.has(chunk.chunkSeq));
-    const representedChunks = BigInt(registered.length + unregistered.length);
-    const representedBytes = existingBytes + unregistered.reduce(
-      (total, chunk) => total + BigInt(chunk.byteLength),
-      0n
-    );
-    assertOutputCoverage(representedBytes, representedChunks, counters.retainedBytes, counters.retainedChunks);
-
-    const prepared: Array<{
-      chunk: typeof chunks[number];
-      content: Awaited<ReturnType<ContentAddressedStore['prepare']>>;
-      createdAt: string;
-    }> = [];
-    for (const chunk of unregistered) {
-      const bytes = await fs.readFile(chunk.path);
-      if (bytes.byteLength > PROCESS_OUTPUT_MAX_CHUNK_BYTES || String(bytes.byteLength) !== chunk.byteLength) {
-        throw new Error(`Invalid process spool chunk ${chunk.chunkSeq}.`);
-      }
-      const stat = await fs.stat(chunk.path);
-      prepared.push({
-        chunk,
-        content: await this.contentStore.prepare(this.database, bytes, 'application/octet-stream'),
-        createdAt: stat.mtime.toISOString()
-      });
-    }
-
-    const countersChanged = !processCountersEqual(processRow, counters);
-    if (prepared.length > 0 || countersChanged) {
-      const steps: RepositoryTransactionStep[] = [];
-      if (countersChanged) {
-        steps.push(DOMAIN_REPOSITORIES.domain('Process').assert(processId, {
-          status: processRow.status,
-          retained_bytes: processRow.retained_bytes,
-          retained_chunks: processRow.retained_chunks,
-          dropped_bytes: processRow.dropped_bytes,
-          truncated: processRow.truncated
-        }));
-      }
-      for (const entry of prepared) {
-        steps.push(
-          ...preparedContentSteps([entry.content], `process_chunk_${entry.chunk.chunkSeq}`),
-          DOMAIN_REPOSITORIES.domain('ProcessOutputChunk').insert({
-            id: stablePhaseDId('process_output_chunk', `${processId}:${entry.chunk.chunkSeq}`),
-            process_id: processId,
-            chunk_seq: entry.chunk.chunkSeq,
-            stream_kind: entry.chunk.streamKind,
-            content_object_id: entry.content.metadata.id,
-            byte_length: entry.chunk.byteLength,
-            created_at: entry.createdAt
-          })
-        );
-      }
-      if (countersChanged) {
-        steps.push(DOMAIN_REPOSITORIES.domain('Process').update(processId, {
-          retained_bytes: counters.retainedBytes.toString(),
-          retained_chunks: counters.retainedChunks.toString(),
-          dropped_bytes: counters.droppedBytes.toString(),
-          truncated: counters.truncated ? '1' : '0',
-          updated_at: this.timestamp()
-        }));
-      }
+    // A concurrent exit/import may make a selected running manifest stale. Restart only when the
+    // Process assertion proves that durable state advanced; every pass otherwise makes keyset
+    // progress and there is no retry count or retained-output ceiling.
+    for (;;) {
+      const processRow = await this.requireExisting('Process', processId);
+      const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
+      await this.requireMatchingSpoolEvidence(processRow, spoolPath);
+      const manifest = await this.readManifest(spoolPath, processRow);
+      const counters = outputCounters(manifest);
+      assertProcessOutputProgress(processRow, counters, manifest.status);
       try {
-        await this.database.transaction(steps);
+        return await this.reconcileOutputPrefix(processRow, spoolPath, manifest, counters);
       } catch (error) {
-        if (
-          !isTransactionAssertionFailure(error)
-          && !matchesExpectedUnique(error, [
-            ['process_output_chunk', ['id']],
-            ['process_output_chunk', ['process_id', 'chunk_seq']]
-          ])
-        ) throw error;
-        return this.currentReconciledOutput(processId);
+        if (error instanceof ProcessOutputSnapshotAdvancedError) continue;
+        throw error;
       }
     }
-    return {
-      retainedBytes: counters.retainedBytes,
-      retainedChunks: counters.retainedChunks,
-      droppedBytes: counters.droppedBytes,
-      truncated: counters.truncated,
-      insertedChunks: prepared.length
-    };
   }
 
-  /** Pure, repeatable read. SQLite/CAS is authoritative; verified spool only supplies a missing prefix/live tail. */
-  public async readOutput(processIdInput: string): Promise<ProcessOutputReadResult> {
+  /**
+   * Imports the latest immutable chunk prefix and captures the wrapper's matching stable live
+   * tails. The returned retained counters let the detail reader reject a concurrently superseded
+   * pairing before it combines CAS bytes and live bytes into one stream.
+   */
+  public async snapshotOutputForDetail(processIdInput: string): Promise<ProcessDetailOutputSnapshot> {
+    const processId = requireId(processIdInput, 'processId');
+    for (;;) {
+      await this.reconcileOutput(processId);
+      const processRow = await this.requireExisting('Process', processId);
+      const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
+      await this.requireMatchingSpoolEvidence(processRow, spoolPath);
+      const manifest = await this.readManifest(spoolPath, processRow);
+      const observed = outputCounters(manifest);
+      assertProcessOutputProgress(processRow, observed, manifest.status);
+      const retained = processRowOutputCounters(processRow);
+      if (!outputCounterValuesEqual(retained, observed)) continue;
+      if (manifest.status === 'exited') {
+        return {
+          retainedBytes: retained.retainedBytes.toString(),
+          retainedChunks: retained.retainedChunks.toString(),
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.alloc(0)
+        };
+      }
+      const live = await this.readStableLiveTails(spoolPath, processRow, manifest);
+      if (!live) continue;
+      return {
+        retainedBytes: retained.retainedBytes.toString(),
+        retainedChunks: retained.retainedChunks.toString(),
+        stdout: live.stdout,
+        stderr: live.stderr
+      };
+    }
+  }
+
+  /** A terminal continuation handle proves that its immutable retained prefix was already reconciled. */
+  public async reconcileOutputForRead(
+    processIdInput: string,
+    outputHandleInput?: unknown
+  ): Promise<ReconciledOutput> {
     const processId = requireId(processIdInput, 'processId');
     await this.validateBinding();
-    const { processRow, registered } = await this.readProcessOutputSnapshot(processId);
-    const entries: Array<{ chunkSeq: bigint; streamKind: 'stdout' | 'stderr'; bytes: Buffer }> = [];
-    const registeredSeq = new Set<string>();
-    let registeredBytes = 0n;
-    for (const row of registered) {
-      const chunkSeq = requireBigInt(row.chunk_seq, 'ProcessOutputChunk.chunk_seq');
-      const streamKind = requireStreamKind(row.stream_kind);
-      const metadata = await this.requireExisting(
-        'ContentObject',
-        requireId(row.content_object_id, 'ProcessOutputChunk.content_object_id')
-      ) as ContentObjectMetadata;
-      const bytes = await this.contentStore.read(metadata);
-      const byteLength = requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length');
-      if (BigInt(bytes.byteLength) !== byteLength) {
-        throw new Error(`ProcessOutputChunk ${String(row.id)} CAS length mismatch.`);
-      }
-      registeredBytes += byteLength;
-      registeredSeq.add(chunkSeq.toString());
-      entries.push({ chunkSeq, streamKind, bytes });
+    if (outputHandleInput !== undefined && outputHandleInput !== null && outputHandleInput !== '') {
+      const cursor = decodeProcessOutputHandle(outputHandleInput, processId);
+      const processRow = await this.requireExisting('Process', processId);
+      const counters = processRowOutputCounters(processRow);
+      if (
+        processRow.status !== 'running'
+        && cursor.reconciledRetainedChunks === counters.retainedChunks
+      ) return { ...counters, insertedChunks: 0 };
+    }
+    return this.reconcileOutput(processId);
+  }
+
+  /**
+   * Reads one immutable keyset page. The opaque handle carries the next global chunk sequence and
+   * at most three pending UTF-8 bytes per stream, so concatenating page strings is lossless even
+   * when wrapper chunk/page boundaries bisect a code point.
+   */
+  public async readOutputPage(
+    processIdInput: string,
+    outputHandleInput?: unknown
+  ): Promise<ProcessOutputPageReadResult> {
+    const processId = requireId(processIdInput, 'processId');
+    await this.validateBinding();
+    const processRow = await this.requireExisting('Process', processId);
+    const counters = processRowOutputCounters(processRow);
+    const cursor = decodeProcessOutputHandle(outputHandleInput, processId);
+    if (cursor.nextChunkSeq > counters.retainedChunks + 1n) {
+      throw new RangeError('Process output handle is beyond the retained chunk prefix.');
     }
 
-    const persisted = processRowOutputCounters(processRow);
-    if (registeredBytes > persisted.retainedBytes || BigInt(registered.length) > persisted.retainedChunks) {
-      throw new Error('Registered ProcessOutputChunk rows exceed persisted Process counters.');
-    }
-
-    const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
-    let formal = persisted;
-    let stableManifest: ProcessWrapperManifest | undefined;
-    try {
-      const prefix = await this.readVerifiedSpoolPrefix(processRow, spoolPath);
-      const spoolCounters = outputCounters(prefix.manifest);
-      assertProcessOutputProgress(processRow, spoolCounters, prefix.manifest.status);
-      const missing = prefix.chunks.filter((chunk) => !registeredSeq.has(chunk.chunkSeq));
-      let missingBytes = 0n;
-      for (const chunk of missing) {
-        const bytes = await fs.readFile(chunk.path);
-        if (String(bytes.byteLength) !== chunk.byteLength) {
-          throw new Error(`Invalid process spool chunk ${chunk.chunkSeq}.`);
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let pageBytes = 0n;
+    let pageChunks = 0n;
+    let nextChunkSeq = cursor.nextChunkSeq;
+    outputPage: while (nextChunkSeq <= counters.retainedChunks) {
+      const remaining = counters.retainedChunks - nextChunkSeq + 1n;
+      const rowCount = Number(remaining < BigInt(PROCESS_OUTPUT_METADATA_READ_ROWS)
+        ? remaining
+        : BigInt(PROCESS_OUTPUT_METADATA_READ_ROWS));
+      const rows = await this.readOutputChunkRows(processId, nextChunkSeq, rowCount);
+      for (const row of rows) {
+        const byteLength = requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length');
+        if (pageChunks > 0n && pageBytes + byteLength > BigInt(PROCESS_OUTPUT_READ_PAGE_MAX_BYTES)) {
+          nextChunkSeq = requireBigInt(row.chunk_seq, 'ProcessOutputChunk.chunk_seq');
+          break outputPage;
         }
-        missingBytes += BigInt(bytes.byteLength);
-        entries.push({ chunkSeq: BigInt(chunk.chunkSeq), streamKind: chunk.streamKind, bytes });
+        const metadata = await this.requireExisting(
+          'ContentObject',
+          requireId(row.content_object_id, 'ProcessOutputChunk.content_object_id')
+        ) as ContentObjectMetadata;
+        const bytes = await this.contentStore.read(metadata);
+        if (BigInt(bytes.byteLength) !== byteLength) {
+          throw new Error(`ProcessOutputChunk ${String(row.id)} CAS length mismatch.`);
+        }
+        (requireStreamKind(row.stream_kind) === 'stdout' ? stdout : stderr).push(bytes);
+        pageBytes += byteLength;
+        pageChunks += 1n;
+        nextChunkSeq = requireBigInt(row.chunk_seq, 'ProcessOutputChunk.chunk_seq') + 1n;
       }
-      assertOutputCoverage(
-        registeredBytes + missingBytes,
-        BigInt(registered.length + missing.length),
-        spoolCounters.retainedBytes,
-        spoolCounters.retainedChunks
-      );
-      formal = spoolCounters;
-      stableManifest = prefix.manifest;
-    } catch (error) {
-      const casComplete = registeredBytes === persisted.retainedBytes
-        && BigInt(registered.length) === persisted.retainedChunks;
-      if (!casComplete) {
-        throw new Error(`Process output integrity check failed: ${errorMessage(error)}`);
-      }
+      if (pageChunks > 0n && pageBytes >= BigInt(PROCESS_OUTPUT_READ_PAGE_MAX_BYTES)) break;
+      if (rows.length < rowCount || nextChunkSeq > counters.retainedChunks) break;
     }
 
-    entries.sort((left, right) => left.chunkSeq < right.chunkSeq ? -1 : left.chunkSeq > right.chunkSeq ? 1 : 0);
-    const stdout = entries.filter((entry) => entry.streamKind === 'stdout').map((entry) => entry.bytes);
-    const stderr = entries.filter((entry) => entry.streamKind === 'stderr').map((entry) => entry.bytes);
-    let liveBytes = 0n;
-    let liveChunks = 0n;
-    if (stableManifest?.status === 'running') {
-      const live = await this.readStableLiveTails(spoolPath, processRow, stableManifest);
+    const hasMore = nextChunkSeq <= counters.retainedChunks;
+    const complete = processRow.status !== 'running' && !hasMore;
+    const stdoutText = decodeUtf8OutputPage(cursor.stdoutCarry, stdout, complete);
+    const stderrText = decodeUtf8OutputPage(cursor.stderrCarry, stderr, complete);
+    let liveStdout = '';
+    let liveStderr = '';
+    let livePreviewBytes = 0n;
+    if (processRow.status === 'running' && !hasMore) {
+      const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
+      await this.requireMatchingSpoolEvidence(processRow, spoolPath);
+      const manifest = await this.readManifest(spoolPath, processRow);
+      const manifestCounters = outputCounters(manifest);
+      assertProcessOutputProgress(processRow, manifestCounters, manifest.status);
+      const live = outputCounterValuesEqual(counters, manifestCounters)
+        ? await this.readStableLiveTails(spoolPath, processRow, manifest)
+        : undefined;
       if (live) {
-        if (live.stdout.length > 0) {
-          stdout.push(live.stdout);
-          liveBytes += BigInt(live.stdout.length);
-          liveChunks += 1n;
-        }
-        if (live.stderr.length > 0) {
-          stderr.push(live.stderr);
-          liveBytes += BigInt(live.stderr.length);
-          liveChunks += 1n;
-        }
+        liveStdout = decodeUtf8OutputPage(stdoutText.carry, [live.stdout], false).text;
+        liveStderr = decodeUtf8OutputPage(stderrText.carry, [live.stderr], false).text;
+        livePreviewBytes = BigInt(live.stdout.byteLength + live.stderr.byteLength);
       }
     }
-    const effectiveBytes = formal.retainedBytes + liveBytes;
-    const effectiveChunks = formal.retainedChunks + liveChunks;
-    assertOutputBounds(effectiveBytes, effectiveChunks);
+    const nextOutputHandle = encodeProcessOutputHandle({
+      processId,
+      nextChunkSeq,
+      reconciledRetainedChunks: counters.retainedChunks,
+      stdoutCarry: stdoutText.carry,
+      stderrCarry: stderrText.carry
+    });
     return {
       processId,
       status: String(processRow.status),
-      stdout: Buffer.concat(stdout),
-      stderr: Buffer.concat(stderr),
-      retainedBytes: effectiveBytes.toString(),
-      retainedChunks: effectiveChunks.toString(),
-      droppedBytes: formal.droppedBytes.toString(),
-      truncated: formal.truncated
+      stdout: stdoutText.text,
+      stderr: stderrText.text,
+      liveStdout,
+      liveStderr,
+      livePreviewBytes: livePreviewBytes.toString(),
+      pageBytes: pageBytes.toString(),
+      pageChunks: pageChunks.toString(),
+      retainedBytes: counters.retainedBytes.toString(),
+      retainedChunks: counters.retainedChunks.toString(),
+      droppedBytes: counters.droppedBytes.toString(),
+      truncated: counters.truncated,
+      hasMore,
+      complete,
+      nextOutputHandle
     };
+  }
+
+  /** Reads only terminal-notification tails; scans metadata by keyset without materializing history. */
+  public async readOutputTail(
+    processIdInput: string,
+    maxBytesPerStream: number
+  ): Promise<ProcessOutputReadResult> {
+    const processId = requireId(processIdInput, 'processId');
+    if (!Number.isSafeInteger(maxBytesPerStream) || maxBytesPerStream <= 0) {
+      throw new RangeError('Process output tail maxBytesPerStream must be a positive safe integer.');
+    }
+    await this.validateBinding();
+    const processRow = await this.requireExisting('Process', processId);
+    const counters = processRowOutputCounters(processRow);
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let nextChunkSeq = counters.retainedChunks;
+    while (nextChunkSeq > 0n && (stdoutBytes < maxBytesPerStream || stderrBytes < maxBytesPerStream)) {
+      const firstChunkSeq = nextChunkSeq >= BigInt(PROCESS_OUTPUT_METADATA_READ_ROWS)
+        ? nextChunkSeq - BigInt(PROCESS_OUTPUT_METADATA_READ_ROWS) + 1n
+        : 1n;
+      const rows = await this.readOutputChunkRows(
+        processId,
+        firstChunkSeq,
+        Number(nextChunkSeq - firstChunkSeq + 1n)
+      );
+      for (let index = rows.length - 1; index >= 0; index -= 1) {
+        const row = rows[index]!;
+        const streamKind = requireStreamKind(row.stream_kind);
+        const needsBytes = streamKind === 'stdout'
+          ? stdoutBytes < maxBytesPerStream
+          : stderrBytes < maxBytesPerStream;
+        if (needsBytes) {
+          const metadata = await this.requireExisting(
+            'ContentObject',
+            requireId(row.content_object_id, 'ProcessOutputChunk.content_object_id')
+          ) as ContentObjectMetadata;
+          const bytes = await this.contentStore.read(metadata);
+          const byteLength = requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length');
+          if (BigInt(bytes.byteLength) !== byteLength) {
+            throw new Error(`ProcessOutputChunk ${String(row.id)} CAS length mismatch.`);
+          }
+          if (streamKind === 'stdout') {
+            stdout.unshift(bytes);
+            stdoutBytes += bytes.byteLength;
+          } else {
+            stderr.unshift(bytes);
+            stderrBytes += bytes.byteLength;
+          }
+        }
+        if (stdoutBytes >= maxBytesPerStream && stderrBytes >= maxBytesPerStream) break;
+      }
+      nextChunkSeq = firstChunkSeq - 1n;
+    }
+    return {
+      processId,
+      status: String(processRow.status),
+      stdout: boundedBufferTail(stdout, maxBytesPerStream),
+      stderr: boundedBufferTail(stderr, maxBytesPerStream),
+      retainedBytes: counters.retainedBytes.toString(),
+      retainedChunks: counters.retainedChunks.toString(),
+      droppedBytes: counters.droppedBytes.toString(),
+      truncated: counters.truncated
+    };
+  }
+
+  /**
+   * Enables the application-owned exit observer service after deterministic startup recovery.
+   * Existing running Processes are seeded from SQLite; later process_start commits register through
+   * reconcileStartReceipt. One bounded-cadence observer exists per Process and never redispatches it.
+   */
+  public async startExitObservers(): Promise<{ scanned: number; started: number }> {
+    if (this.exitObserversClosing) throw new Error('Process exit observers are closing.');
+    this.exitObserversEnabled = true;
+    const running = await listAllDomainRows(this.database, 'Process', { status: 'running' });
+    let started = 0;
+    for (const processRow of running) {
+      const processId = requireId(processRow.id, 'Process.id');
+      const receipts = await this.list('ProcessReceipt', { process_id: processId }, 2);
+      if (receipts.length > 0) {
+        this.notifyProcessReceipt(processId);
+        continue;
+      }
+      const intent = await this.requireExisting('EffectIntent', processExitIds(processId).effectIntentId);
+      if (intent.effect_kind !== 'process_exit' || !['dispatched', 'receipt_written'].includes(String(intent.dispatch_state))) {
+        throw new Error(`Running Process ${processId} lacks a dispatched process_exit EffectIntent.`);
+      }
+      if (this.ensureExitObserver(processId)) started += 1;
+    }
+    return { scanned: running.length, started };
+  }
+
+  public inspectExitObservers(): ProcessExitObserverInspection {
+    return {
+      enabled: this.exitObserversEnabled,
+      closing: this.exitObserversClosing,
+      activeProcessIds: [...this.exitObservers.keys()].sort()
+    };
+  }
+
+  /** Stops timers and drains in-flight observer transactions before RuntimeDatabase closes. */
+  public dispose(): Promise<void> {
+    if (this.exitObserversDisposePromise) return this.exitObserversDisposePromise;
+    this.exitObserversEnabled = false;
+    this.exitObserversClosing = true;
+    for (const wake of [...this.exitObserverWakeups]) wake();
+    const active = [...this.exitObservers.values()];
+    this.exitObserversDisposePromise = Promise.allSettled(active).then(() => undefined);
+    return this.exitObserversDisposePromise;
   }
 
   /** Observes wrapper evidence only. A local timeout never changes Process state. */
@@ -663,7 +1063,10 @@ export class ProcessControlPlane {
     const observed = await this.observeProcess(processId);
     if (observed.state === 'running') return observed;
     const existing = (await this.list('ProcessReceipt', { process_id: processId }, 2))[0];
-    if (existing) return observed;
+    if (existing) {
+      this.notifyProcessReceipt(processId);
+      return observed;
+    }
     const ids = processExitIds(processId);
     const intent = await this.requireExisting('EffectIntent', ids.effectIntentId);
     if (intent.effect_kind !== 'process_exit') throw new Error('Process exit observation has no process_exit EffectIntent.');
@@ -713,6 +1116,7 @@ export class ProcessControlPlane {
           start_fingerprint: processRow.start_fingerprint,
           received_at: now
         }),
+        processCompletionDispatchInsert(processId, now),
         DOMAIN_REPOSITORIES.domain('Process').update(processId, {
           status: 'outcome_unknown',
           updated_at: now,
@@ -733,6 +1137,7 @@ export class ProcessControlPlane {
           start_fingerprint: exit.startFingerprint,
           received_at: now
         }),
+        processCompletionDispatchInsert(processId, now),
         DOMAIN_REPOSITORIES.domain('Process').update(processId, {
           status: exit.stopRequested ? 'cancelled' : 'exited',
           retained_bytes: exit.retainedBytes,
@@ -750,6 +1155,7 @@ export class ProcessControlPlane {
       outcome: processExitOutcome(observed),
       additionalSteps
     });
+    this.notifyProcessReceipt(processId);
     return this.observeProcess(processId);
   }
 
@@ -832,6 +1238,52 @@ export class ProcessControlPlane {
     return this.reconcileStartReceipt(recorded.effectReceiptId);
   }
 
+  private ensureExitObserver(processIdInput: string): boolean {
+    const processId = requireId(processIdInput, 'processId');
+    if (!this.exitObserversEnabled || this.exitObserversClosing || this.exitObservers.has(processId)) return false;
+    const task = runWithoutExecutionLeaseFence(() => this.runExitObserver(processId));
+    this.exitObservers.set(processId, task);
+    return true;
+  }
+
+  private async runExitObserver(processId: string): Promise<void> {
+    try {
+      while (!this.exitObserversClosing) {
+        const observed = await this.reconcileProcessExit(processId);
+        if (observed.state !== 'running') return;
+        await this.waitForExitObserverPoll();
+      }
+    } catch (error) {
+      if (!this.exitObserversClosing) {
+        try {
+          this.onExitObserverError?.({ processId, error });
+        } catch {
+          // Diagnostics are observational and must never create a second control path.
+        }
+      }
+    } finally {
+      this.exitObservers.delete(processId);
+    }
+  }
+
+  private waitForExitObserverPoll(): Promise<void> {
+    if (this.exitObserversClosing) return Promise.resolve();
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        this.exitObserverWakeups.delete(finish);
+        resolve();
+      };
+      timer = setTimeout(finish, PROCESS_EXIT_OBSERVER_POLL_MS);
+      timer.unref?.();
+      this.exitObserverWakeups.add(finish);
+    });
+  }
+
   private async observeProcess(processId: string): Promise<ProcessWaitObservation> {
     await this.validateBinding();
     const processRow = await this.requireExisting('Process', processId);
@@ -857,10 +1309,21 @@ export class ProcessControlPlane {
   private async observeStart(
     request: ProcessStartRequest,
     launch: ProcessLaunchObservation,
-    foregroundWaitMs: number
+    foregroundWaitMs: number,
+    signal?: AbortSignal
   ): Promise<ProcessStartObservation> {
     if (launch.outcome !== 'succeeded') {
-      return { outcome: launch.outcome, launch, foreground: null };
+      return {
+        outcome: launch.outcome,
+        state: launch.outcome === 'failed'
+          ? 'launch_failed'
+          : launch.outcome === 'cancelled'
+            ? 'launch_cancelled'
+            : 'outcome_unknown',
+        processId: request.processId,
+        launch,
+        foreground: null
+      };
     }
     await this.validateBinding();
     const spoolPath = processSpoolPath(this.binding, request.spoolLocator);
@@ -868,11 +1331,17 @@ export class ProcessControlPlane {
     let foreground: ProcessWaitObservation;
     do {
       foreground = await this.observeVerifiedIdentity(launch.identity, spoolPath);
-      if (foreground.state !== 'running' || Date.now() >= deadline) break;
+      if (foreground.state !== 'running' || Date.now() >= deadline || signal?.aborted) break;
       await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
     } while (true);
     return {
       outcome: processWaitOutcome(foreground),
+      state: foreground.state === 'running'
+        ? 'background_started'
+        : foreground.state === 'exited'
+          ? 'completed'
+          : 'outcome_unknown',
+      processId: request.processId,
       launch,
       foreground
     };
@@ -915,39 +1384,203 @@ export class ProcessControlPlane {
     return { state: 'running', processId };
   }
 
-  private async readProcessOutputSnapshot(processId: string): Promise<ProcessOutputSnapshot> {
-    const snapshot = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('Process').get(processId),
-      DOMAIN_REPOSITORIES.domain('ProcessOutputChunk').list({
-        where: { process_id: processId },
-        orderBy: { column: 'chunk_seq', direction: 'asc' },
-        limit: PROCESS_OUTPUT_MAX_RETAINED_CHUNKS
-      })
-    ]);
-    const processRow = snapshot.snapshot[0];
-    const registered = snapshot.snapshot[1];
-    if (!processRow || Array.isArray(processRow)) throw new Error(`Process ${processId} does not exist.`);
-    if (!Array.isArray(registered)) throw new TypeError('ProcessOutputChunk snapshot did not return rows.');
-    return { processRow, registered };
+  private async reconcileOutputPrefix(
+    selectedProcessRow: DomainRow,
+    spoolPath: string,
+    manifest: ProcessWrapperManifest,
+    counters: ProcessOutputCounters
+  ): Promise<ReconciledOutput> {
+    const processId = requireId(selectedProcessRow.id, 'Process.id');
+    let nextChunkSeq = 1n;
+    let representedBytes = 0n;
+    let representedChunks = 0n;
+    let insertedChunks = 0;
+    let pending: PreparedProcessOutputChunk[] = [];
+    const estimateTimestamp = requireText(selectedProcessRow.updated_at, 'Process.updated_at');
+
+    const flush = async (): Promise<void> => {
+      if (pending.length === 0) return;
+      // Chunk batches become durable first. Publishing the newly observed retained_* counters is
+      // the final fence, so readers never see a running Process claim a prefix whose CAS rows are
+      // still queued in later transactions.
+      insertedChunks += await this.commitProcessOutputBatch(processId, manifest, counters, pending, false);
+      pending = [];
+    };
+
+    while (nextChunkSeq <= counters.retainedChunks) {
+      const remaining = counters.retainedChunks - nextChunkSeq + 1n;
+      const rowCount = Number(remaining < BigInt(PROCESS_OUTPUT_METADATA_READ_ROWS)
+        ? remaining
+        : BigInt(PROCESS_OUTPUT_METADATA_READ_ROWS));
+      const reads = Array.from({ length: rowCount }, (_, index) => {
+        const chunkSeq = nextChunkSeq + BigInt(index);
+        return DOMAIN_REPOSITORIES.domain('ProcessOutputChunk').get(processOutputChunkId(processId, chunkSeq));
+      });
+      const snapshot = await this.database.snapshot(reads);
+      for (let index = 0; index < rowCount; index += 1) {
+        const chunkSeq = nextChunkSeq + BigInt(index);
+        const row = snapshot.snapshot[index];
+        if (Array.isArray(row)) throw new TypeError('ProcessOutputChunk get returned rows.');
+        if (row) {
+          validateRegisteredProcessOutputChunk(row, processId, chunkSeq);
+          representedBytes += requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length');
+          representedChunks += 1n;
+          continue;
+        }
+
+        const prepared = await this.prepareProcessOutputChunk(processId, spoolPath, chunkSeq);
+        representedBytes += prepared.byteLength;
+        representedChunks += 1n;
+        const tentative = [...pending, prepared];
+        const estimated = processOutputTransactionWireBytes(
+          processOutputTransactionSteps(selectedProcessRow, counters, tentative, estimateTimestamp)
+        );
+        if (
+          pending.length > 0
+          && estimated > PROCESS_OUTPUT_TRANSACTION_MAX_WIRE_BYTES
+        ) {
+          await flush();
+        }
+        const singleEstimate = processOutputTransactionWireBytes(
+          processOutputTransactionSteps(selectedProcessRow, counters, [prepared], estimateTimestamp)
+        );
+        if (singleEstimate > PROCESS_OUTPUT_TRANSACTION_MAX_WIRE_BYTES) {
+          throw new Error(`Process output chunk ${chunkSeq} metadata exceeds the transaction wire budget.`);
+        }
+        pending.push(prepared);
+      }
+      nextChunkSeq += BigInt(rowCount);
+    }
+
+    await flush();
+    assertOutputCoverage(
+      representedBytes,
+      representedChunks,
+      counters.retainedBytes,
+      counters.retainedChunks
+    );
+    await this.commitProcessOutputBatch(processId, manifest, counters, [], true);
+    return {
+      retainedBytes: counters.retainedBytes,
+      retainedChunks: counters.retainedChunks,
+      droppedBytes: counters.droppedBytes,
+      truncated: counters.truncated,
+      insertedChunks
+    };
   }
 
-  private async readVerifiedSpoolPrefix(
-    processRow: DomainRow,
-    spoolPath: string
-  ): Promise<VerifiedSpoolPrefix> {
-    await this.requireMatchingSpoolEvidence(processRow, spoolPath);
-    // The wrapper publishes each immutable chunk before advancing the manifest. Reading the
-    // manifest first therefore selects a stable prefix even while the child keeps writing.
-    const manifest = await this.readManifest(spoolPath, processRow);
-    const counters = outputCounters(manifest);
-    const nextChunkSeq = BigInt(manifest.nextChunkSeq);
-    if (nextChunkSeq !== counters.retainedChunks + 1n) {
-      throw new Error('Process wrapper manifest has an invalid nextChunkSeq.');
+  private async prepareProcessOutputChunk(
+    processId: string,
+    spoolPath: string,
+    chunkSeq: bigint
+  ): Promise<PreparedProcessOutputChunk> {
+    const stdoutPath = path.join(
+      spoolPath,
+      PROCESS_WRAPPER_CHUNKS_DIRECTORY,
+      processChunkFileName(chunkSeq, 'stdout')
+    );
+    const stderrPath = path.join(
+      spoolPath,
+      PROCESS_WRAPPER_CHUNKS_DIRECTORY,
+      processChunkFileName(chunkSeq, 'stderr')
+    );
+    const [stdoutStat, stderrStat] = await Promise.all([
+      statRegularFileIfPresent(stdoutPath),
+      statRegularFileIfPresent(stderrPath)
+    ]);
+    if ((stdoutStat ? 1 : 0) + (stderrStat ? 1 : 0) !== 1) {
+      throw new Error(`Process spool chunk ${chunkSeq} must have exactly one stream file.`);
     }
-    const chunks = listProcessSpoolChunks(spoolPath)
-      .filter((chunk) => BigInt(chunk.chunkSeq) < nextChunkSeq);
-    assertChunkBounds(chunks);
-    return { manifest, chunks };
+    const streamKind = stdoutStat ? 'stdout' as const : 'stderr' as const;
+    const chunkPath = stdoutStat ? stdoutPath : stderrPath;
+    const stat = stdoutStat ?? stderrStat!;
+    if (stat.size <= 0 || stat.size > PROCESS_OUTPUT_MAX_CHUNK_BYTES) {
+      throw new Error(`Invalid process spool chunk ${chunkSeq}.`);
+    }
+    const bytes = await fs.readFile(chunkPath);
+    if (bytes.byteLength !== stat.size) throw new Error(`Process spool chunk ${chunkSeq} changed during import.`);
+    return {
+      chunkSeq,
+      streamKind,
+      byteLength: BigInt(bytes.byteLength),
+      createdAt: stat.mtime.toISOString(),
+      content: await this.contentStore.prepare(this.database, bytes, 'application/octet-stream')
+    };
+  }
+
+  private async commitProcessOutputBatch(
+    processId: string,
+    manifest: ProcessWrapperManifest,
+    counters: ProcessOutputCounters,
+    prepared: readonly PreparedProcessOutputChunk[],
+    publishCounters: boolean
+  ): Promise<number> {
+    for (;;) {
+      const currentProcessRow = await this.requireExisting('Process', processId);
+      try {
+        assertProcessOutputProgress(currentProcessRow, counters, manifest.status);
+      } catch {
+        throw new ProcessOutputSnapshotAdvancedError();
+      }
+      const missing: PreparedProcessOutputChunk[] = [];
+      for (let offset = 0; offset < prepared.length; offset += PROCESS_OUTPUT_METADATA_READ_ROWS) {
+        const page = prepared.slice(offset, offset + PROCESS_OUTPUT_METADATA_READ_ROWS);
+        const snapshot = await this.database.snapshot(page.map((entry) => (
+          DOMAIN_REPOSITORIES.domain('ProcessOutputChunk').get(processOutputChunkId(processId, entry.chunkSeq))
+        )));
+        for (let index = 0; index < page.length; index += 1) {
+          const entry = page[index]!;
+          const existing = snapshot.snapshot[index];
+          if (Array.isArray(existing)) throw new TypeError('ProcessOutputChunk get returned rows.');
+          if (!existing) {
+            missing.push(entry);
+            continue;
+          }
+          validateRegisteredProcessOutputChunk(existing, processId, entry.chunkSeq, entry);
+        }
+      }
+      if (
+        missing.length === 0
+        && (!publishCounters || processCountersEqual(currentProcessRow, counters))
+      ) return 0;
+      const targetCounters = publishCounters ? counters : processRowOutputCounters(currentProcessRow);
+      const steps = processOutputTransactionSteps(currentProcessRow, targetCounters, missing, this.timestamp());
+      const wireBytes = processOutputTransactionWireBytes(steps);
+      if (wireBytes > PROCESS_OUTPUT_TRANSACTION_MAX_WIRE_BYTES) {
+        throw new Error(`Process output transaction requires ${wireBytes} wire bytes, exceeding its per-commit budget.`);
+      }
+      try {
+        await this.database.transaction(steps);
+        return missing.length;
+      } catch (error) {
+        if (isTransactionAssertionFailure(error)) continue;
+        if (matchesExpectedUnique(error, [
+          ['process_output_chunk', ['id']],
+          ['process_output_chunk', ['process_id', 'chunk_seq']]
+        ])) continue;
+        throw error;
+      }
+    }
+  }
+
+  private async readOutputChunkRows(
+    processId: string,
+    firstChunkSeq: bigint,
+    count: number
+  ): Promise<DomainRow[]> {
+    const reads = Array.from({ length: count }, (_, index) => {
+      const chunkSeq = firstChunkSeq + BigInt(index);
+      return DOMAIN_REPOSITORIES.domain('ProcessOutputChunk').get(processOutputChunkId(processId, chunkSeq));
+    });
+    const snapshot = await this.database.snapshot(reads);
+    return snapshot.snapshot.map((row, index) => {
+      const chunkSeq = firstChunkSeq + BigInt(index);
+      if (!row || Array.isArray(row)) {
+        throw new Error(`Process output registration has a gap at chunk ${chunkSeq}.`);
+      }
+      validateRegisteredProcessOutputChunk(row, processId, chunkSeq);
+      return row;
+    });
   }
 
   private async readStableLiveTails(
@@ -969,12 +1602,6 @@ export class ProcessControlPlane {
       || BigInt(stderr.length) !== BigInt(manifest.stderrTailBytes)
     ) throw new Error('Process live tail does not match its stable wrapper manifest.');
     return { stdout, stderr };
-  }
-
-  private async currentReconciledOutput(processId: string): Promise<ReconciledOutput> {
-    const { processRow } = await this.readProcessOutputSnapshot(processId);
-    const counters = processRowOutputCounters(processRow);
-    return { ...counters, insertedChunks: 0 };
   }
 
   private async requireMatchingSpoolEvidence(processRow: DomainRow, spoolPath: string): Promise<void> {
@@ -1047,11 +1674,232 @@ export class ProcessControlPlane {
   private timestamp(): string {
     return requireText(this.now(), 'clock result');
   }
+
+  private notifyProcessReceipt(processId: string): void {
+    try {
+      this.processReceiptObserver?.(processId);
+    } catch {
+      // Delivery is level-triggered from SQLite; an observational wake may never fail receipt commit.
+    }
+  }
+}
+
+class ProcessOutputSnapshotAdvancedError extends Error {
+  public constructor() {
+    super('Process output snapshot advanced during reconciliation.');
+    this.name = 'ProcessOutputSnapshotAdvancedError';
+  }
+}
+
+function processOutputChunkId(processId: string, chunkSeq: bigint): string {
+  return stablePhaseDId('process_output_chunk', `${processId}:${chunkSeq}`);
+}
+
+function processOutputTransactionSteps(
+  processRow: DomainRow,
+  counters: ProcessOutputCounters,
+  prepared: readonly PreparedProcessOutputChunk[],
+  now: string
+): RepositoryTransactionStep[] {
+  const processId = requireId(processRow.id, 'Process.id');
+  const steps: RepositoryTransactionStep[] = [
+    DOMAIN_REPOSITORIES.domain('Process').assert(processId, {
+      status: processRow.status,
+      retained_bytes: processRow.retained_bytes,
+      retained_chunks: processRow.retained_chunks,
+      dropped_bytes: processRow.dropped_bytes,
+      truncated: processRow.truncated
+    })
+  ];
+  for (const entry of prepared) {
+    steps.push(
+      ...preparedContentSteps([entry.content], `process_chunk_${entry.chunkSeq}`),
+      DOMAIN_REPOSITORIES.domain('ProcessOutputChunk').insert({
+        id: processOutputChunkId(processId, entry.chunkSeq),
+        process_id: processId,
+        chunk_seq: entry.chunkSeq.toString(),
+        stream_kind: entry.streamKind,
+        content_object_id: entry.content.metadata.id,
+        byte_length: entry.byteLength.toString(),
+        created_at: entry.createdAt
+      })
+    );
+  }
+  if (!processCountersEqual(processRow, counters)) {
+    steps.push(DOMAIN_REPOSITORIES.domain('Process').update(processId, {
+      retained_bytes: counters.retainedBytes.toString(),
+      retained_chunks: counters.retainedChunks.toString(),
+      dropped_bytes: counters.droppedBytes.toString(),
+      truncated: counters.truncated ? '1' : '0',
+      updated_at: now
+    }));
+  }
+  return steps;
+}
+
+function processOutputTransactionWireBytes(steps: readonly RepositoryTransactionStep[]): number {
+  const fence = currentExecutionLeaseFence();
+  const fencedSteps = fence
+    ? [
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(
+          fence.id,
+          executionLeaseFenceAssertion(fence)
+        ),
+        ...steps
+      ]
+    : steps;
+  return Buffer.byteLength(JSON.stringify({ kind: 'transaction', steps: fencedSteps }, (_key, value) => (
+    typeof value === 'bigint' ? value.toString() : value
+  )), 'utf8');
+}
+
+function validateRegisteredProcessOutputChunk(
+  row: DomainRow,
+  processId: string,
+  chunkSeq: bigint,
+  expected?: PreparedProcessOutputChunk
+): void {
+  if (
+    requireId(row.id, 'ProcessOutputChunk.id') !== processOutputChunkId(processId, chunkSeq)
+    || requireId(row.process_id, 'ProcessOutputChunk.process_id') !== processId
+    || requireBigInt(row.chunk_seq, 'ProcessOutputChunk.chunk_seq') !== chunkSeq
+  ) throw new Error(`ProcessOutputChunk ${chunkSeq} identity mismatch.`);
+  const streamKind = requireStreamKind(row.stream_kind);
+  const byteLength = requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length');
+  if (byteLength <= 0n || byteLength > BigInt(PROCESS_OUTPUT_MAX_CHUNK_BYTES)) {
+    throw new Error(`ProcessOutputChunk ${chunkSeq} has an invalid byte length.`);
+  }
+  if (expected && (
+    streamKind !== expected.streamKind
+    || byteLength !== expected.byteLength
+    || requireId(row.content_object_id, 'ProcessOutputChunk.content_object_id') !== expected.content.metadata.id
+  )) throw new Error(`ProcessOutputChunk ${chunkSeq} conflicts with the immutable spool prefix.`);
+}
+
+async function statRegularFileIfPresent(
+  filePath: string
+): Promise<Awaited<ReturnType<typeof fs.stat>> | undefined> {
+  try {
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile()) throw new Error(`Process spool entry is not a regular file: ${filePath}`);
+    return stat;
+  } catch (error) {
+    if (isNotFound(error)) return undefined;
+    throw error;
+  }
+}
+
+function encodeProcessOutputHandle(cursor: ProcessOutputCursor): string {
+  const payload = JSON.stringify({
+    processId: cursor.processId,
+    nextChunkSeq: cursor.nextChunkSeq.toString(),
+    reconciledRetainedChunks: cursor.reconciledRetainedChunks?.toString() ?? null,
+    stdoutCarry: cursor.stdoutCarry.toString('base64'),
+    stderrCarry: cursor.stderrCarry.toString('base64')
+  });
+  return `${PROCESS_OUTPUT_HANDLE_PREFIX}${Buffer.from(payload, 'utf8').toString('base64url')}`;
+}
+
+function decodeProcessOutputHandle(value: unknown, processId: string): ProcessOutputCursor {
+  if (value === undefined || value === null || value === '') {
+    return {
+      processId,
+      nextChunkSeq: 1n,
+      reconciledRetainedChunks: null,
+      stdoutCarry: Buffer.alloc(0),
+      stderrCarry: Buffer.alloc(0)
+    };
+  }
+  if (typeof value !== 'string' || !value.startsWith(PROCESS_OUTPUT_HANDLE_PREFIX)) {
+    throw new TypeError('outputHandle must be an opaque handle returned by mode=output.');
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(value.slice(PROCESS_OUTPUT_HANDLE_PREFIX.length), 'base64url').toString('utf8'));
+  } catch {
+    throw new TypeError('outputHandle is malformed.');
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new TypeError('outputHandle payload is malformed.');
+  }
+  const record = decoded as Record<string, unknown>;
+  if (record.processId !== processId) throw new Error('outputHandle belongs to a different process.');
+  if (typeof record.nextChunkSeq !== 'string' || !/^[1-9]\d*$/.test(record.nextChunkSeq)) {
+    throw new TypeError('outputHandle nextChunkSeq is invalid.');
+  }
+  if (typeof record.reconciledRetainedChunks !== 'string' || !/^(?:0|[1-9]\d*)$/.test(record.reconciledRetainedChunks)) {
+    throw new TypeError('outputHandle reconciledRetainedChunks is invalid.');
+  }
+  const stdoutCarry = decodeOutputHandleCarry(record.stdoutCarry, 'stdoutCarry');
+  const stderrCarry = decodeOutputHandleCarry(record.stderrCarry, 'stderrCarry');
+  return {
+    processId,
+    nextChunkSeq: BigInt(record.nextChunkSeq),
+    reconciledRetainedChunks: BigInt(record.reconciledRetainedChunks),
+    stdoutCarry,
+    stderrCarry
+  };
+}
+
+function decodeOutputHandleCarry(value: unknown, label: string): Buffer {
+  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new TypeError(`outputHandle ${label} is invalid.`);
+  }
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.byteLength > 3) throw new TypeError(`outputHandle ${label} is too long.`);
+  return bytes;
+}
+
+function decodeUtf8OutputPage(
+  carry: Buffer,
+  chunks: readonly Buffer[],
+  flush: boolean
+): { text: string; carry: Buffer } {
+  const bytes = Buffer.concat(carry.byteLength > 0 ? [carry, ...chunks] : [...chunks]);
+  if (flush || bytes.byteLength === 0) return { text: bytes.toString('utf8'), carry: Buffer.alloc(0) };
+  const carryLength = incompleteUtf8TailLength(bytes);
+  if (carryLength === 0) return { text: bytes.toString('utf8'), carry: Buffer.alloc(0) };
+  const split = bytes.byteLength - carryLength;
+  return {
+    text: bytes.subarray(0, split).toString('utf8'),
+    carry: Buffer.from(bytes.subarray(split))
+  };
+}
+
+function boundedBufferTail(chunks: readonly Buffer[], maxBytes: number): Buffer {
+  const totalBytes = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const result = Buffer.allocUnsafe(Math.min(totalBytes, maxBytes));
+  let targetEnd = result.byteLength;
+  for (let index = chunks.length - 1; index >= 0 && targetEnd > 0; index -= 1) {
+    const chunk = chunks[index]!;
+    const length = Math.min(chunk.byteLength, targetEnd);
+    chunk.copy(result, targetEnd - length, chunk.byteLength - length);
+    targetEnd -= length;
+  }
+  return result;
+}
+
+function incompleteUtf8TailLength(bytes: Buffer): number {
+  let leadingIndex = bytes.byteLength - 1;
+  while (leadingIndex >= 0 && (bytes[leadingIndex]! & 0xc0) === 0x80) leadingIndex -= 1;
+  if (leadingIndex < 0) return 0;
+  const leading = bytes[leadingIndex]!;
+  const expectedLength = leading >= 0xc2 && leading <= 0xdf
+    ? 2
+    : leading >= 0xe0 && leading <= 0xef
+      ? 3
+      : leading >= 0xf0 && leading <= 0xf4
+        ? 4
+        : 1;
+  const available = bytes.byteLength - leadingIndex;
+  return expectedLength > available ? available : 0;
 }
 
 function processStartFactSteps(
   request: ProcessStartRequest,
   toolCallId: string,
+  sourceTurnId: string,
+  conversationId: string,
   identity: ProcessWrapperIdentity,
   foreground: ProcessWaitObservation,
   now: string,
@@ -1090,6 +1938,14 @@ function processStartFactSteps(
       id: stablePhaseDId('process_origin_link', request.processId),
       process_id: request.processId,
       tool_call_id: toolCallId,
+      created_at: now
+    }),
+    DOMAIN_REPOSITORIES.domain('ProcessCompletionSourceLink').insert({
+      id: stablePhaseDId('process_completion_source_link', request.processId),
+      process_id: request.processId,
+      conversation_id: conversationId,
+      source_turn_id: sourceTurnId,
+      source_tool_call_id: toolCallId,
       created_at: now
     })
   ];
@@ -1142,6 +1998,25 @@ function processStartFactSteps(
   return steps;
 }
 
+function processCompletionDispatchInsert(processId: string, now: string): RepositoryTransactionStep {
+  const processReceiptId = stablePhaseDId('process_receipt', processId);
+  return DOMAIN_REPOSITORIES.domain('ProcessCompletionDispatch').insert({
+    id: stablePhaseDId('process_completion_dispatch', processReceiptId),
+    process_receipt_id: processReceiptId,
+    state: 'pending',
+    claim_owner_host_boot_id: null,
+    claim_generation: 0n,
+    claim_expires_at: null,
+    attempt_count: 0n,
+    failure_count: 0n,
+    next_attempt_at: null,
+    last_error: null,
+    completed_at: null,
+    created_at: now,
+    updated_at: now
+  });
+}
+
 function processExitRequest(identity: ProcessWrapperIdentity): ProcessExitEffectRequest {
   return {
     processId: identity.processId,
@@ -1174,6 +2049,8 @@ function normalizeProcessStartObservation(
   }
   const record = value as Record<string, unknown>;
   const outcome = requireProcessStartOutcome(record.outcome);
+  const processId = requireId(record.processId, 'process_start.processId');
+  if (processId !== request.processId) throw new Error('process_start result belongs to another Process.');
   const launchValue = record.launch;
   if (!launchValue || typeof launchValue !== 'object' || Array.isArray(launchValue)) {
     throw new TypeError('process_start Receipt lacks launch observation.');
@@ -1184,7 +2061,11 @@ function normalizeProcessStartObservation(
     const identity = parseWrapperIdentity(launchRecord.identity);
     assertIdentityMatchesStart(identity, request);
     launch = { outcome: 'succeeded', identity };
-  } else if (launchRecord.outcome === 'failed' || launchRecord.outcome === 'outcome_unknown') {
+  } else if (
+    launchRecord.outcome === 'failed'
+    || launchRecord.outcome === 'cancelled'
+    || launchRecord.outcome === 'outcome_unknown'
+  ) {
     launch = {
       outcome: launchRecord.outcome,
       error: requireText(launchRecord.error, 'process launch error')
@@ -1225,7 +2106,21 @@ function normalizeProcessStartObservation(
   } else if (foreground !== null || launch.outcome !== outcome) {
     throw new Error('Failed/unknown process launch has inconsistent foreground facts.');
   }
-  return { outcome, launch, foreground };
+  const expectedState = launch.outcome !== 'succeeded'
+    ? launch.outcome === 'failed'
+      ? 'launch_failed'
+      : launch.outcome === 'cancelled'
+        ? 'launch_cancelled'
+        : 'outcome_unknown'
+    : foreground?.state === 'running'
+      ? 'background_started'
+      : foreground?.state === 'exited'
+        ? 'completed'
+        : 'outcome_unknown';
+  if (record.state !== expectedState) {
+    throw new Error(`process_start protocol state must be ${expectedState}.`);
+  }
+  return { outcome, state: expectedState, processId, launch, foreground };
 }
 
 function normalizeProcessExitObservation(
@@ -1307,6 +2202,24 @@ function persistedProcessObservation(processRow: DomainRow, receipt: DomainRow):
   }
 }
 
+function terminalStopObservation(
+  observation: Extract<ProcessWaitObservation, { state: 'exited' }>,
+  alreadyExited: boolean
+): ProcessStopObservation {
+  return {
+    outcome: 'succeeded',
+    status: alreadyExited || !observation.receipt.stopRequested ? 'already_exited' : 'stopped',
+    receipt: observation.receipt,
+    reason: alreadyExited || !observation.receipt.stopRequested
+      ? 'Process terminal receipt was already authoritative before a stop request was needed.'
+      : 'Process acknowledged the stop request with a terminal receipt.'
+  };
+}
+
+function unknownStopObservation(reason: string): ProcessStopObservation {
+  return { outcome: 'outcome_unknown', status: 'outcome_unknown', reason };
+}
+
 function processWaitOutcome(
   observation: ProcessWaitObservation
 ): 'succeeded' | 'failed' | 'cancelled' | 'outcome_unknown' {
@@ -1316,8 +2229,8 @@ function processWaitOutcome(
   return observation.receipt.exitCode === '0' ? 'succeeded' : 'failed';
 }
 
-function requireProcessStopOutcome(value: unknown): 'succeeded' | 'outcome_unknown' {
-  if (value !== 'succeeded' && value !== 'outcome_unknown') {
+function requireProcessStopOutcome(value: unknown): 'succeeded' | 'cancelled' | 'outcome_unknown' {
+  if (value !== 'succeeded' && value !== 'cancelled' && value !== 'outcome_unknown') {
     throw new TypeError(`Invalid process_stop_request outcome: ${String(value)}.`);
   }
   return value;
@@ -1491,10 +2404,7 @@ function assertExitReceiptMatches(identity: ProcessWrapperIdentity, receipt: Pro
     || receipt.startFingerprint !== identity.startFingerprint
     || receipt.commandDigest !== identity.commandDigest
   ) throw new Error('Atomic wrapper exit receipt identity mismatch.');
-  if (
-    BigInt(receipt.retainedBytes) > BigInt(PROCESS_OUTPUT_MAX_RETAINED_BYTES)
-    || BigInt(receipt.retainedChunks) > BigInt(PROCESS_OUTPUT_MAX_RETAINED_CHUNKS)
-  ) throw new Error('Atomic wrapper exit receipt exceeds frozen output limits.');
+  assertNonNegativeOutputCounters(BigInt(receipt.retainedBytes), BigInt(receipt.retainedChunks));
 }
 
 function outputCounters(manifest: ProcessWrapperManifest): ProcessOutputCounters {
@@ -1504,7 +2414,7 @@ function outputCounters(manifest: ProcessWrapperManifest): ProcessOutputCounters
     droppedBytes: BigInt(manifest.droppedBytes),
     truncated: manifest.truncated
   };
-  assertOutputBounds(counters.retainedBytes, counters.retainedChunks);
+  assertNonNegativeOutputCounters(counters.retainedBytes, counters.retainedChunks);
   return counters;
 }
 
@@ -1515,7 +2425,7 @@ function processRowOutputCounters(processRow: DomainRow): ProcessOutputCounters 
     droppedBytes: requireBigInt(processRow.dropped_bytes, 'Process.dropped_bytes'),
     truncated: requireBigInt(processRow.truncated, 'Process.truncated') === 1n
   };
-  assertOutputBounds(counters.retainedBytes, counters.retainedChunks);
+  assertNonNegativeOutputCounters(counters.retainedBytes, counters.retainedChunks);
   return counters;
 }
 
@@ -1561,13 +2471,10 @@ function assertOutputCoverage(
   }
 }
 
-function assertOutputBounds(retainedBytes: bigint, retainedChunks: bigint): void {
-  if (
-    retainedBytes < 0n
-    || retainedChunks < 0n
-    || retainedBytes > BigInt(PROCESS_OUTPUT_MAX_RETAINED_BYTES)
-    || retainedChunks > BigInt(PROCESS_OUTPUT_MAX_RETAINED_CHUNKS)
-  ) throw new Error('Process output exceeds frozen retention bounds.');
+function assertNonNegativeOutputCounters(retainedBytes: bigint, retainedChunks: bigint): void {
+  if (retainedBytes < 0n || retainedChunks < 0n) {
+    throw new Error('Process output counters must be non-negative.');
+  }
 }
 
 function sameManifestSnapshot(left: ProcessWrapperManifest, right: ProcessWrapperManifest): boolean {
@@ -1587,20 +2494,6 @@ function sameManifestSnapshot(left: ProcessWrapperManifest, right: ProcessWrappe
 
 function isTransactionAssertionFailure(error: unknown): boolean {
   return (error as Error & { code?: string }).code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
-}
-
-function assertChunkBounds(chunks: ReturnType<typeof listProcessSpoolChunks>): void {
-  if (chunks.length > PROCESS_OUTPUT_MAX_RETAINED_CHUNKS) throw new Error('Process spool has too many chunks.');
-  let total = 0n;
-  const seen = new Set<string>();
-  for (const chunk of chunks) {
-    if (seen.has(chunk.chunkSeq)) throw new Error(`Duplicate process chunk sequence ${chunk.chunkSeq}.`);
-    seen.add(chunk.chunkSeq);
-    const length = BigInt(chunk.byteLength);
-    if (length <= 0n || length > BigInt(PROCESS_OUTPUT_MAX_CHUNK_BYTES)) throw new Error('Invalid process chunk length.');
-    total += length;
-  }
-  if (total > BigInt(PROCESS_OUTPUT_MAX_RETAINED_BYTES)) throw new Error('Process spool exceeds retained bytes limit.');
 }
 
 async function waitForLaunchEvidence(
@@ -1647,6 +2540,30 @@ async function writeAtomicJson(filePath: string, value: unknown): Promise<void> 
     await handle.close();
   }
   await fs.rename(temporary, filePath);
+  const directory = await fs.open(path.dirname(filePath), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+/** Publishes an immutable request without replacing a winner from another Host/effect. */
+async function writeAtomicJsonOnce(filePath: string, value: unknown): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const handle = await fs.open(temporary, 'wx', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await fs.link(temporary, filePath);
+  } finally {
+    await fs.unlink(temporary).catch(() => undefined);
+  }
   const directory = await fs.open(path.dirname(filePath), 'r');
   try {
     await directory.sync();
@@ -1725,6 +2642,10 @@ function requireText(value: unknown, label: string): string {
 
 function isNotFound(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'EEXIST';
 }
 
 function errorMessage(error: unknown): string {

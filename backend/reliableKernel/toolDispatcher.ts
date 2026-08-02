@@ -1,25 +1,44 @@
-import type { ToolPolicyToolConfigRecord } from '../../shared/protocol';
-import type { ToolDefinition, ToolResultOut } from '../world/modules/tools/registry';
+import {
+  SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
+  TRANSFER_TOOL_NAME,
+  type ToolDefinitionMetadataRecord,
+  type ToolPolicyToolConfigRecord
+} from '../../shared/protocol';
+import type { ToolDefinition, ToolResultOut, ToolRuntimeEvent } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDefinition,
   ReliableAgentToolDispatchInput,
   ReliableAgentToolDispatcher,
-  ReliableAgentToolPause
+  ReliableAgentToolPause,
+  ReliableAgentToolSettled
 } from './agentLoop';
-import type { ContentAddressedStore } from './contentAddressedStore';
-import type { EffectControlPlane, ToolTerminalResult } from './effectControlPlane';
+import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import type {
+  EffectControlPlane,
+  FrozenToolCallPolicyDecision,
+  ToolOutcomeStatus,
+  ToolTerminalResult
+} from './effectControlPlane';
 import type {
   FileChangeControlPlane,
   FileChangeProposalMemberInput,
   FileMutationDispatcher
 } from './fileEffects';
+import { authorizeFrozenPlanReview, type FrozenPlanReviewRiskLevel } from './frozenMcpPolicyGate';
 import { readFrozenTurnAuthority } from './frozenAuthority';
 import type { McpEffectDispatcher } from './mcpEffects';
-import { normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import type { ProcessControlPlane, ProcessWaitObservation } from './processEffects';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import type { ToolInteractionControlPlane } from './toolInteractions';
+import { WorkEnvironmentTransferEffectDispatcher } from './workEnvironmentTransferEffects';
+import {
+  ExecutionHandoffError,
+  handoffReason,
+  isExecutionHandoffError
+} from './executionLeaseFence';
 
 export interface ReliableToolDispatchAuthority {
   snapshotId: string;
@@ -35,13 +54,24 @@ export interface ReliableToolDispatcherHost {
   executeNoEffect?(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
+    authority: ReliableToolDispatchAuthority,
+    emit: (event: ToolRuntimeEvent) => void,
+    signal: AbortSignal
+  ): Promise<ToolResultOut>;
+  /** Executes a transfer only after the dedicated file_transfer EffectIntent is committed/claimed. */
+  executeWorkEnvironmentTransfer?(
+    definition: ToolDefinition,
+    input: ReliableAgentToolDispatchInput,
+    authority: ReliableToolDispatchAuthority,
+    emit: (event: ToolRuntimeEvent) => void,
+    signal: AbortSignal
   ): Promise<ToolResultOut>;
   /** Builds a proposal only. It must not mutate the target filesystem. */
   planFileMutation?(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
+    authority: ReliableToolDispatchAuthority,
+    signal: AbortSignal
   ): Promise<FileChangeProposalMemberInput[]>;
   /** Resolves and validates the process working directory without running the command. */
   resolveProcessCwd?(
@@ -52,8 +82,12 @@ export interface ReliableToolDispatcherHost {
   dispatchSpecial?(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
-  ): Promise<ToolTerminalResult | ReliableAgentToolPause | undefined>;
+    authority: ReliableToolDispatchAuthority,
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled | undefined>;
+  /** Cancels only the parent-side durable wait; child execution is left running unless separately cascaded. */
+  cancelTurnWaits?(input: { turnId: string; reason: string }): Promise<void>;
+  quiesce?(reason: ExecutionHandoffError): Promise<void>;
 }
 
 export interface ReliableToolDispatcherDependencies {
@@ -73,52 +107,340 @@ const PROCESS_TOOLS = new Set(['bash', 'shell']);
 const SPECIAL_TOOLS = new Set([
   'run_agent',
   'submit_agent_answer',
-  'read_agent_answer',
-  'submit_plan',
-  'switch_work_environment'
+  'read_agent_answer'
 ]);
+const WORK_ENVIRONMENT_TOOLS = new Set([SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME]);
+const NO_EFFECT_CAPABILITY_TIMEOUT_MS = 30_000;
+const CANCEL_ACTIVE_GRACE_MS = 1_000;
 
 /** Product Tool dispatcher. Every non-readonly external effect is committed before dispatch. */
 export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
-  public constructor(private readonly dependencies: ReliableToolDispatcherDependencies) {}
+  private readonly workEnvironmentTransfers: WorkEnvironmentTransferEffectDispatcher;
+  private readonly activeHostExecutions = new Map<string, {
+    turnId: string;
+    controller: AbortController;
+    completion: Promise<void>;
+    finish(): void;
+  }>();
+  private readonly activeDispatches = new Set<Promise<
+    ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled
+  >>();
+  private handoff: ExecutionHandoffError | undefined;
 
-  public dispose(): Promise<void> | void {
-    return this.dependencies.host.dispose?.();
+  public constructor(private readonly dependencies: ReliableToolDispatcherDependencies) {
+    this.workEnvironmentTransfers = new WorkEnvironmentTransferEffectDispatcher(
+      dependencies.database,
+      dependencies.effects
+    );
   }
 
-  public async definitions(): Promise<ReliableAgentToolDefinition[]> {
-    const definitions = await this.dependencies.host.definitions();
+  public async dispose(): Promise<void> {
+    await this.quiesce(this.handoff ?? new ExecutionHandoffError());
+    this.activeHostExecutions.clear();
+    await this.dependencies.host.dispose?.();
+  }
+
+  public async quiesce(reason: ExecutionHandoffError): Promise<void> {
+    this.handoff = reason;
+    await this.dependencies.host.quiesce?.(reason);
+    const completions: Promise<void>[] = [];
+    for (const execution of this.activeHostExecutions.values()) {
+      if (!execution.controller.signal.aborted) execution.controller.abort(reason);
+      completions.push(execution.completion);
+    }
+    await Promise.allSettled([...completions, ...this.activeDispatches]);
+  }
+
+  public async definitions(turnId?: string): Promise<ReliableAgentToolDefinition[]> {
+    const available = await this.dependencies.host.definitions();
+    const definitions = turnId
+      ? await this.definitionsForTurn(available, turnId)
+      : available;
     return definitions.map((definition) => ({
       name: requireText(definition.declaration.name, 'Tool declaration.name'),
       description: typeof definition.declaration.description === 'string'
         ? definition.declaration.description
         : '',
-      parameters: normalizePlainJson(definition.declaration.parameters ?? {}, `Tool ${definition.declaration.name} parameters`)
+      parameters: normalizePlainJson(definition.declaration.parameters ?? {}, `Tool ${definition.declaration.name} parameters`),
+      ...(definition.declaration.source
+        ? { source: normalizePlainJson(definition.declaration.source, `Tool ${definition.declaration.name} source`) }
+        : {}),
+      ...(definition.declaration.metadata
+        ? { metadata: normalizePlainJson(definition.declaration.metadata, `Tool ${definition.declaration.name} metadata`) }
+        : {}),
+      ...(definition.declaration.defaultConfig
+        ? { defaultConfig: normalizePlainJson(definition.declaration.defaultConfig, `Tool ${definition.declaration.name} default config`) }
+        : {})
     }));
   }
 
-  public async dispatch(
+  public async freezeCall(
+    input: ReliableAgentToolDispatchInput & { definition: ReliableAgentToolDefinition }
+  ): Promise<FrozenToolCallPolicyDecision> {
+    if (input.definition.name !== input.toolName) throw new Error('Frozen Tool definition name does not match Provider call.');
+    const authority = await this.readAuthority(input.turnId, input.toolName);
+    const policy = authorityPolicy(authority.document);
+    const liveCandidate = (await this.dependencies.host.definitions())
+      .find((candidate) => candidate.declaration.name === input.toolName);
+    const live = liveCandidate && sameToolSource(liveCandidate.declaration.source, input.definition.source)
+      ? liveCandidate
+      : undefined;
+    const metadata = live?.declaration.metadata
+      ?? plainOptionalRecord(input.definition.metadata) as ToolDefinitionMetadataRecord | undefined;
+    const config = authority.toolConfig;
+    const yolo = policy.preset === 'yolo';
+    const supportsChangeApply = FILE_TOOLS.has(input.toolName) || metadata?.supportsChangeApply === true;
+    const automaticChangeApply = supportsChangeApply && (
+      yolo
+      || config?.autoApplyChange
+      || (config?.autoApplyChange === undefined && metadata?.defaultAutoApplyChange === true)
+    );
+    const delay = automaticChangeApply
+      ? yolo ? 0 : normalizeAutoApplyDelay(
+          config?.autoApplyChangeDelaySeconds ?? metadata?.defaultAutoApplyChangeDelaySeconds ?? 0
+        )
+      : 0;
+    const scheduling = live?.scheduling?.(input.arguments, { toolName: input.toolName })
+      ?? frozenSchedulingFallback(input.definition, input.arguments);
+    const commandConfig = commandPolicyConfig(authority.toolConfig);
+    const command = PROCESS_TOOLS.has(input.toolName)
+      ? optionalText(requireRecord(input.arguments, `${input.toolName} arguments`).command)
+      : '';
+    const allowlistedCommand = !!command && firstMatchedCommandRule(command, commandConfig.allowCommands) !== undefined;
+    const autoApproveReadonly = PROCESS_TOOLS.has(input.toolName)
+      && commandConfig.autoApproveReadonly
+      && isReadonlyCommandArguments(input.arguments);
+    const executionAutomatic = yolo
+      || input.toolName === 'ask_user'
+      || input.toolName === 'submit_plan'
+      || allowlistedCommand
+      || autoApproveReadonly
+      || (config?.autoApproveExecution ?? metadata?.defaultAutoApproveExecution ?? true);
+    const summary = live?.summary?.(input.arguments, {
+      toolName: input.toolName,
+      argsJson: canonicalPlainJson(input.arguments, `Tool ${input.toolName} summary arguments`)
+    });
+    return {
+      ...(summary?.trim() ? { summary: summary.trim() } : {}),
+      displayAutoExpand: config?.display?.autoExpand ?? metadata?.defaultAutoExpand ?? false,
+      displayAutoOpenDiff: yolo
+        ? false
+        : config?.display?.autoOpenDiffPreview
+          ?? metadata?.defaultAutoOpenDiffPreview
+          ?? false,
+      executionGate: executionAutomatic ? 'automatic' : 'approval_required',
+      changeApplyMode: supportsChangeApply
+        ? automaticChangeApply ? 'automatic' : 'manual'
+        : 'unsupported',
+      changeApplyDelaySeconds: delay,
+      autoSubmitResult: yolo || (config?.autoSubmitResult ?? metadata?.defaultAutoSubmitResult ?? true),
+      schedulingMode: scheduling.mode,
+      ...(scheduling.reason ? { schedulingReason: scheduling.reason } : {})
+    };
+  }
+
+  public async cancelWaiting(input: { turnId: string; sourceKey: string; reason: string }): Promise<void> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const sourceKey = requireText(input.sourceKey, 'sourceKey');
+    const reason = requireText(input.reason, 'reason');
+    await this.cancelActive({ turnId, reason });
+    const ownerLinks = (await listAllDomainRows(this.dependencies.database, 'InteractionOwnerLink', {
+      turn_id: turnId
+    }))
+      .sort((left, right) => String(left.request_id).localeCompare(String(right.request_id)));
+    for (const owner of ownerLinks) {
+      const requestId = requireId(owner.request_id, 'InteractionOwnerLink.request_id');
+      const requests = await this.list('InteractionRequest', { id: requestId }, 2);
+      if (requests.length !== 1) throw new Error(`InteractionRequest ${requestId} must exist exactly once.`);
+      if (requests[0].status !== 'pending') continue;
+      const toolLinks = await this.list('InteractionToolCallLink', { request_id: requestId }, 2);
+      if (toolLinks.length !== 1) throw new Error(`InteractionRequest ${requestId} must have one ToolCall link.`);
+      const toolCallId = requireId(toolLinks[0].tool_call_id, 'InteractionToolCallLink.tool_call_id');
+      if (requests[0].request_kind === 'ask_user') {
+        await this.dependencies.interactions.resolveAskUser({
+          source: { kind: 'command', key: `${sourceKey}:ask-user:${requestId}` },
+          requestId,
+          response: { reason },
+          cancelled: true
+        });
+        continue;
+      }
+      if (requests[0].request_kind === 'file_change_approval') {
+        const changeSets = await this.list('FileChangeSet', { tool_call_id: toolCallId }, 2);
+        if (changeSets.length !== 1) throw new Error(`File approval ${requestId} must have one FileChangeSet.`);
+        await this.dependencies.files.decide({
+          source: { kind: 'command', key: `${sourceKey}:file-change:${requestId}` },
+          changeSetId: requireId(changeSets[0].id, 'FileChangeSet.id'),
+          decision: 'rejected',
+          response: { reason }
+        });
+        continue;
+      }
+      if (requests[0].request_kind === 'plan_review') {
+        await this.dependencies.interactions.resolvePlanReview({
+          source: { kind: 'command', key: `${sourceKey}:plan-review:${requestId}` },
+          requestId,
+          decision: 'cancel',
+          response: { reason }
+        });
+        continue;
+      }
+      if (requests[0].request_kind === 'exec_approval') {
+        await this.dependencies.interactions.resolveExecutionApproval({
+          source: { kind: 'command', key: `${sourceKey}:execution-approval:${requestId}` },
+          requestId,
+          decision: 'reject',
+          response: { reason }
+        });
+        continue;
+      }
+      throw new Error(`Unsupported pending InteractionRequest kind: ${String(requests[0].request_kind)}.`);
+    }
+  }
+
+  public async cancelActive(input: { turnId: string; reason: string }): Promise<void> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const reason = requireText(input.reason, 'reason');
+    const cancellation = new Error(reason);
+    cancellation.name = 'TurnCancellationError';
+    const completions: Promise<void>[] = [];
+    for (const execution of this.activeHostExecutions.values()) {
+      if (execution.turnId === turnId && !execution.controller.signal.aborted) {
+        execution.controller.abort(cancellation);
+      }
+      if (execution.turnId === turnId) completions.push(execution.completion);
+    }
+    await this.dependencies.host.cancelTurnWaits?.({ turnId, reason });
+    if (completions.length > 0) {
+      await waitForSettlementsOrGrace(completions, CANCEL_ACTIVE_GRACE_MS);
+    }
+  }
+
+  public async quiesceTurn(input: { turnId: string; reason: ExecutionHandoffError }): Promise<void> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const completions: Promise<void>[] = [];
+    for (const execution of this.activeHostExecutions.values()) {
+      if (execution.turnId === turnId && !execution.controller.signal.aborted) {
+        execution.controller.abort(input.reason);
+      }
+      if (execution.turnId === turnId) completions.push(execution.completion);
+    }
+    await Promise.allSettled(completions);
+  }
+
+  public dispatch(
     input: ReliableAgentToolDispatchInput
-  ): Promise<ToolTerminalResult | ReliableAgentToolPause> {
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    if (this.handoff) return Promise.reject(this.handoff);
+    const task = this.dispatchInternal(input);
+    this.activeDispatches.add(task);
+    void task.finally(() => this.activeDispatches.delete(task)).catch(() => undefined);
+    return task;
+  }
+
+  private async dispatchInternal(
+    input: ReliableAgentToolDispatchInput
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    await this.dependencies.effects.finalizeReadyInOrder(input.turnId);
     const replay = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
     if (replay) return replay;
+    // A later member of a parallel Provider batch may have durably settled while an earlier
+    // call still blocks ordered ToolOutcome creation. Recovery must return that settlement fact,
+    // never invoke the capability/effect a second time merely because ToolOutcome is not visible.
+    const readySettlement = await this.readReadySettlement(input.toolCallId);
+    if (readySettlement) return readySettlement;
+    const existingPause = await this.readExistingPause(input.toolCallId);
+    if (existingPause) return existingPause;
     const definitions = await this.dependencies.host.definitions();
     const definition = definitions.find((candidate) => candidate.declaration.name === input.toolName);
     if (!definition) return this.reject(input, `未知工具：${input.toolName}`);
+    const definitionMismatch = await this.providerDefinitionMismatch(input, definition);
+    if (definitionMismatch) return this.reject(input, definitionMismatch);
     const authority = await this.readAuthority(input.turnId, input.toolName);
     const policy = authorityPolicy(authority.document);
-    if (!policy.allowedTools.has(input.toolName)) {
+    if (!definitionAllowedByAuthority(policy, definition)) {
       return this.reject(input, `冻结 ToolPolicy 不允许工具 ${input.toolName}。`);
+    }
+    if (input.toolName !== 'submit_plan' && definition.declaration.source?.kind !== 'mcp') {
+      const calls = await this.list('ToolCall', { id: input.toolCallId }, 2);
+      if (calls.length !== 1) throw new Error(`ToolCall ${input.toolCallId} does not exist exactly once.`);
+      const planReview = await authorizeFrozenPlanReview({
+        database: this.dependencies.database,
+        contentStore: this.dependencies.contentStore,
+        authorityDocument: authority.document,
+        turnId: input.turnId,
+        beforeCallSeq: requireBigInt(calls[0].call_seq, 'ToolCall.call_seq'),
+        riskLevel: frozenPlanReviewRiskLevel(definition, input)
+      });
+      if (!planReview.allowed) {
+        return this.reject(input, planReview.reason ?? '冻结 PlanReviewPolicy 拒绝本次工具调用。');
+      }
+    }
+    if (WORK_ENVIRONMENT_TOOLS.has(input.toolName) && !authorityWorkEnvironmentPolicy(authority.document).enabled) {
+      return this.reject(input, `冻结 WorkEnvironmentPolicy 已关闭，当前 Turn 不允许工具 ${input.toolName}。`);
+    }
+    const frozenDecision = await this.readFrozenDecision(input, definition, authority);
+    if (!frozenDecision.autoSubmitResult) {
+      return this.reject(
+        input,
+        `工具 ${input.toolName} 的冻结 ToolPolicy 禁止自动提交结果；可靠结果确认门禁尚未启用，因此本次调用不会执行。`
+      );
+    }
+    if (this.handoff) throw this.handoff;
+    if (await this.turnTerminationRequested(input.turnId)) {
+      const settled = await this.dependencies.effects.settleWithoutEffect({
+        source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:turn-termination-before-dispatch` },
+        toolCallId: input.toolCallId,
+        status: 'cancelled',
+        detail: { reason: 'Turn termination was committed before capability dispatch.' }
+      });
+      return this.settledResult(input.toolCallId, settled.status, settled.terminal);
+    }
+
+    if (frozenDecision.executionGate === 'approval_required' && !FILE_TOOLS.has(input.toolName)) {
+      const approval = await this.executionApprovalState(input.toolCallId);
+      if (approval === 'rejected') {
+        const settled = await this.dependencies.effects.settleWithoutEffect({
+          source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:execution-approval-rejected` },
+          toolCallId: input.toolCallId,
+          status: 'rejected',
+          detail: { reason: '用户拒绝执行工具。' }
+        });
+        return this.settledResult(input.toolCallId, settled.status, settled.terminal);
+      }
+      if (approval !== 'approved') {
+        const pause = approval === 'pending'
+          ? await this.requirePendingExecutionApproval(input.toolCallId)
+          : await this.dependencies.interactions.pauseForExecutionApproval({
+              source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:execution-approval` },
+              toolCallId: input.toolCallId,
+              prompt: { toolName: input.toolName, arguments: input.arguments }
+            });
+        return {
+          disposition: 'paused',
+          toolCallId: input.toolCallId,
+          reason: 'awaiting_approval',
+          resumeKey: pause.requestId
+        };
+      }
     }
 
     if (definition.declaration.source?.kind === 'mcp') {
-      return this.dispatchMcp(definition, input);
+      return this.captureAbortableExecution(input, (signal) => this.dispatchMcp(definition, input, signal));
     }
     if (FILE_TOOLS.has(input.toolName)) {
-      return this.dispatchFile(definition, input, authority);
+      return this.captureAbortableExecution(input, (signal) =>
+        this.dispatchFile(definition, input, authority, frozenDecision, signal));
     }
     if (PROCESS_TOOLS.has(input.toolName)) {
-      return this.dispatchProcess(input, authority);
+      return this.captureAbortableExecution(input, (signal) => this.dispatchProcess(input, authority, signal));
+    }
+    if (input.toolName === TRANSFER_TOOL_NAME) {
+      return this.captureHostEvents(input, (emit, signal) =>
+        this.dispatchWorkEnvironmentTransfer(definition, input, authority, emit, signal));
+    }
+    if (input.toolName === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
+      return this.dispatchWorkEnvironmentSwitch(input, authority);
     }
     if (input.toolName === 'ask_user') {
       const pause = await this.dependencies.interactions.pauseForAskUser({
@@ -133,6 +455,19 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         resumeKey: pause.requestId
       };
     }
+    if (input.toolName === 'submit_plan') {
+      const pause = await this.dependencies.interactions.pauseForPlanReview({
+        source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:plan-review` },
+        toolCallId: input.toolCallId,
+        request: input.arguments
+      });
+      return {
+        disposition: 'paused',
+        toolCallId: input.toolCallId,
+        reason: 'awaiting_plan_review',
+        resumeKey: pause.requestId
+      };
+    }
     if (input.toolName === 'update_task_list') {
       const args = requireRecord(input.arguments, 'update_task_list arguments');
       const items = Array.isArray(args.items) ? args.items : [];
@@ -141,12 +476,14 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         toolCallId: input.toolCallId,
         items
       });
-      return settled.terminal ?? this.requireTerminal(input.toolCallId);
+      return this.settledResult(input.toolCallId, settled.status, settled.terminal);
     }
     if (SPECIAL_TOOLS.has(input.toolName)) {
-      const special = await this.dependencies.host.dispatchSpecial?.(definition, input, authority);
-      if (special) return special;
-      return this.reject(input, `工具 ${input.toolName} 尚未连接到可靠专用控制面。`);
+      return this.captureAbortableExecution(input, async (signal) => {
+        const special = await this.dependencies.host.dispatchSpecial?.(definition, input, authority, signal);
+        if (special) return special;
+        return this.reject(input, `工具 ${input.toolName} 尚未连接到可靠专用控制面。`);
+      });
     }
     return this.dispatchNoEffect(definition, input, authority);
   }
@@ -155,11 +492,39 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
     authority: ReliableToolDispatchAuthority
-  ): Promise<ToolTerminalResult> {
+  ): Promise<ToolTerminalResult | ReliableAgentToolSettled> {
     if (!this.dependencies.host.executeNoEffect) {
       return this.reject(input, `工具 ${input.toolName} 没有只读 capability adapter。`);
     }
-    const result = await this.dependencies.host.executeNoEffect(definition, input, authority);
+    let result: ToolResultOut;
+    try {
+      result = await this.captureHostEvents(input, (emit, signal) =>
+        executeBoundedNoEffect(signal, (boundedSignal) =>
+          this.dependencies.host.executeNoEffect!(
+            definition,
+            input,
+            authority,
+            (event) => {
+              if (!boundedSignal.aborted) emit(event);
+            },
+            boundedSignal
+          )
+        ));
+    } catch (error) {
+      if (isTurnCancellationError(error)) {
+        return this.settleCancelledCapability(input, 'Readonly capability execution was cancelled.');
+      }
+      if (error instanceof NoEffectCapabilityTimeoutError) {
+        const settled = await this.dependencies.effects.settleWithoutEffect({
+          source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:capability-timeout` },
+          toolCallId: input.toolCallId,
+          status: 'failed',
+          detail: { reason: error.message }
+        });
+        return this.settledResult(input.toolCallId, settled.status, settled.terminal);
+      }
+      throw error;
+    }
     const settled = await this.dependencies.effects.settleWithoutEffect({
       source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:no-effect` },
       toolCallId: input.toolCallId,
@@ -171,33 +536,63 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         ...(result.status ? { status: result.status } : {})
       }, `Tool ${input.toolName} result`)
     });
-    return settled.terminal ?? this.requireTerminal(input.toolCallId);
+    return this.settledResult(input.toolCallId, settled.status, settled.terminal);
   }
 
   private async dispatchFile(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
-  ): Promise<ToolTerminalResult | ReliableAgentToolPause> {
+    authority: ReliableToolDispatchAuthority,
+    frozenDecision: FrozenToolCallPolicyDecision,
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
     if (!this.dependencies.host.planFileMutation) {
       return this.reject(input, `文件工具 ${input.toolName} 没有可靠 proposal planner。`);
     }
     const existing = await this.list('FileChangeSet', { tool_call_id: input.toolCallId }, 2);
-    const proposal = existing.length === 0
-      ? await this.dependencies.files.propose({
-          source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:file-proposal` },
-          toolCallId: input.toolCallId,
-          members: await this.dependencies.host.planFileMutation(definition, input, authority)
-        })
-      : { changeSetId: requireId(existing[0].id, 'FileChangeSet.id') };
-    const policy = authorityPolicy(authority.document);
-    if (!fileAutoApply(policy.preset, authority.toolConfig, definition)) {
+    let proposal: { changeSetId: string };
+    if (existing.length === 0) {
+      let members: FileChangeProposalMemberInput[];
+      try {
+        members = await this.dependencies.host.planFileMutation(definition, input, authority, signal);
+      } catch (error) {
+        if (!signal.aborted) throw error;
+        const handoff = handoffReason(signal);
+        if (handoff) throw handoff;
+        return this.settleCancelledCapability(input, 'File proposal planning was cancelled.');
+      }
+      if (signal.aborted) {
+        const handoff = handoffReason(signal);
+        if (handoff) throw handoff;
+        return this.settleCancelledCapability(input, 'File proposal planning was cancelled.');
+      }
+      proposal = await this.dependencies.files.propose({
+        source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:file-proposal` },
+        toolCallId: input.toolCallId,
+        members
+      });
+    } else {
+      proposal = { changeSetId: requireId(existing[0].id, 'FileChangeSet.id') };
+    }
+    if (
+      frozenDecision.executionGate === 'approval_required'
+      || frozenDecision.changeApplyMode !== 'automatic'
+    ) {
       return {
         disposition: 'paused',
         toolCallId: input.toolCallId,
         reason: 'awaiting_approval',
         resumeKey: proposal.changeSetId
       };
+    }
+    if (frozenDecision.changeApplyDelaySeconds > 0) {
+      const delayed = await this.waitForAutomaticFileDecision(
+        input,
+        proposal.changeSetId,
+        frozenDecision.changeApplyDelaySeconds,
+        signal
+      );
+      if (delayed) return delayed;
     }
     const decision = await this.dependencies.files.decide({
       source: { kind: 'command', key: `tool-policy:auto-apply:${proposal.changeSetId}` },
@@ -209,6 +604,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (!decision.preparedEffect) {
       const terminal = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
       if (terminal) return terminal;
+      const settled = await this.readReadySettlement(input.toolCallId);
+      if (settled) return settled;
       return {
         disposition: 'paused',
         toolCallId: input.toolCallId,
@@ -217,25 +614,91 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       };
     }
     const applied = await this.dependencies.fileMutations.dispatchRecordAndReconcile(
-      decision.preparedEffect.effectIntentId
+      decision.preparedEffect.effectIntentId,
+      signal
     );
-    return applied.terminal ?? this.requireTerminal(input.toolCallId);
+    const handoff = handoffReason(signal);
+    if (handoff) throw handoff;
+    if (applied.terminal) return applied.terminal;
+    const settled = await this.readReadySettlement(input.toolCallId);
+    if (settled) return settled;
+    return {
+      disposition: 'paused',
+      toolCallId: input.toolCallId,
+      reason: 'background_process',
+      resumeKey: decision.preparedEffect.effectIntentId
+    };
+  }
+
+  private async waitForAutomaticFileDecision(
+    input: ReliableAgentToolDispatchInput,
+    changeSetId: string,
+    delaySeconds: number,
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | undefined> {
+    const changeSets = await this.list('FileChangeSet', { id: changeSetId }, 2);
+    if (changeSets.length !== 1) throw new Error(`FileChangeSet ${changeSetId} does not exist.`);
+    const createdAt = Date.parse(requireText(changeSets[0].created_at, 'FileChangeSet.created_at'));
+    if (!Number.isFinite(createdAt)) throw new TypeError('FileChangeSet.created_at must be an ISO timestamp.');
+    const deadline = createdAt + delaySeconds * 1_000;
+    for (;;) {
+      if (signal.aborted) {
+        const handoff = handoffReason(signal);
+        if (handoff) throw handoff;
+        return {
+          disposition: 'paused',
+          toolCallId: input.toolCallId,
+          reason: 'awaiting_approval',
+          resumeKey: changeSetId
+        };
+      }
+      const terminal = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
+      if (terminal) return terminal;
+      const decisions = await this.list('FileChangeDecision', { change_set_id: changeSetId }, 2);
+      if (decisions.length > 0 || Date.now() >= deadline) return undefined;
+      if (await this.turnTerminationRequested(input.turnId)) {
+        return {
+          disposition: 'paused',
+          toolCallId: input.toolCallId,
+          reason: 'awaiting_approval',
+          resumeKey: changeSetId
+        };
+      }
+      await delay(Math.min(100, Math.max(1, deadline - Date.now())));
+    }
   }
 
   private async dispatchProcess(
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
-  ): Promise<ToolTerminalResult | ReliableAgentToolPause> {
+    authority: ReliableToolDispatchAuthority,
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    if (signal.aborted) {
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      return this.settleCancelledCapability(input, 'Process capability execution was cancelled before dispatch.');
+    }
     const args = requireRecord(input.arguments, `${input.toolName} arguments`);
     const mode = args.mode === 'output' || args.mode === 'kill' ? args.mode : 'execute';
-    if (mode === 'output') return this.readProcessOutput(input, args);
-    if (mode === 'kill') return this.stopProcess(input, args);
+    if (mode === 'output') return this.readProcessOutput(input, args, signal);
+    if (mode === 'kill') return this.stopProcess(input, args, signal);
     const command = requireText(args.command, `${input.toolName}.command`);
+    const commandConfig = commandPolicyConfig(authority.toolConfig);
+    const deniedBy = firstMatchedCommandRule(command, commandConfig.denyCommands);
+    if (deniedBy) return this.reject(input, `命令被冻结 ToolPolicy 黑名单拒绝：${deniedBy}`);
+    if (commandConfig.allowCommands.length > 0 && !firstMatchedCommandRule(command, commandConfig.allowCommands)) {
+      return this.reject(input, '命令未匹配冻结 ToolPolicy 白名单；可靠执行批准门禁未启用，因此不会执行。');
+    }
     const foregroundWaitMs = requireWaitMs(args.foregroundWaitMs);
     if (!this.dependencies.host.resolveProcessCwd) {
       return this.reject(input, `${input.toolName} 没有工作目录 resolver。`);
     }
     const cwd = await this.dependencies.host.resolveProcessCwd(input, authority);
+    if (signal.aborted) {
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      return this.settleCancelledCapability(input, 'Process capability execution was cancelled before dispatch.');
+    }
     const prepared = await this.dependencies.processes.prepareStart({
       source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:process-start` },
       toolCallId: input.toolCallId,
@@ -244,10 +707,15 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     });
     const started = await this.dependencies.processes.dispatchStart(
       prepared.effect.effectIntentId,
-      foregroundWaitMs
+      foregroundWaitMs,
+      signal
     );
+    const handoff = handoffReason(signal);
+    if (handoff) throw handoff;
     const terminal = started.terminal ?? await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
     if (terminal) return terminal;
+    const settled = await this.readReadySettlement(input.toolCallId);
+    if (settled) return settled;
     return {
       disposition: 'paused',
       toolCallId: input.toolCallId,
@@ -258,46 +726,66 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
 
   private async readProcessOutput(
     input: ReliableAgentToolDispatchInput,
-    args: { [key: string]: PlainJsonValue }
-  ): Promise<ToolTerminalResult> {
+    args: { [key: string]: PlainJsonValue },
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolSettled> {
     const processId = requireId(args.processId, 'processId');
     const observed = await this.dependencies.processes.wait(processId, 0);
     if (observed.state !== 'running') await this.dependencies.processes.reconcileProcessExit(processId);
-    await this.dependencies.processes.reconcileOutput(processId);
-    const output = await this.dependencies.processes.readOutput(processId);
-    const limits = processOutputLimits(args);
+    await this.dependencies.processes.reconcileOutputForRead(processId, args.outputHandle);
+    const output = await this.dependencies.processes.readOutputPage(processId, args.outputHandle);
     const detail = {
       processId,
       status: processStatus(observed),
       exitCode: processExitCode(observed),
       killed: observed.state === 'exited' ? observed.receipt.stopRequested : false,
-      stdout: limitOutput(output.stdout.toString('utf8'), limits),
-      stderr: limitOutput(output.stderr.toString('utf8'), limits),
+      stdout: output.stdout,
+      stderr: output.stderr,
+      liveStdout: output.liveStdout,
+      liveStderr: output.liveStderr,
+      livePreviewBytes: output.livePreviewBytes,
+      pageBytes: output.pageBytes,
+      pageChunks: output.pageChunks,
+      retainedBytes: output.retainedBytes,
+      retainedChunks: output.retainedChunks,
+      hasMore: output.hasMore,
+      complete: output.complete,
+      nextOutputHandle: output.nextOutputHandle,
       truncated: output.truncated,
       droppedBytes: output.droppedBytes
     };
+    if (signal.aborted) {
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      return this.settleCancelledCapability(input, 'Process output observation was cancelled.');
+    }
     const settled = await this.dependencies.effects.settleWithoutEffect({
       source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:process-output` },
       toolCallId: input.toolCallId,
       status: 'succeeded',
       detail
     });
-    return settled.terminal ?? this.requireTerminal(input.toolCallId);
+    return this.settledResult(input.toolCallId, settled.status, settled.terminal);
   }
 
   private async stopProcess(
     input: ReliableAgentToolDispatchInput,
-    args: { [key: string]: PlainJsonValue }
-  ): Promise<ToolTerminalResult | ReliableAgentToolPause> {
+    args: { [key: string]: PlainJsonValue },
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
     const processId = requireId(args.processId, 'processId');
     const prepared = await this.dependencies.processes.prepareStop({
       source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:process-stop` },
       toolCallId: input.toolCallId,
       processId
     });
-    const stopped = await this.dependencies.processes.dispatchStop(prepared.effectIntentId);
+    const stopped = await this.dependencies.processes.dispatchStop(prepared.effectIntentId, signal);
+    const handoff = handoffReason(signal);
+    if (handoff) throw handoff;
     const terminal = stopped?.terminal ?? await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
     if (terminal) return terminal;
+    const settled = await this.readReadySettlement(input.toolCallId);
+    if (settled) return settled;
     return {
       disposition: 'paused',
       toolCallId: input.toolCallId,
@@ -308,8 +796,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
 
   private async dispatchMcp(
     definition: ToolDefinition,
-    input: ReliableAgentToolDispatchInput
-  ): Promise<ToolTerminalResult | ReliableAgentToolPause> {
+    input: ReliableAgentToolDispatchInput,
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
     const source = definition.declaration.source;
     if (source?.kind !== 'mcp') return this.reject(input, 'MCP 工具缺少冻结 source metadata。');
     const prepared = await this.dependencies.mcp.prepare({
@@ -320,17 +809,113 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       arguments: plainRecord(input.arguments, 'MCP arguments')
     });
     if (prepared.disposition === 'rejected') {
-      return prepared.settlement.terminal ?? this.requireTerminal(input.toolCallId);
+      return this.settledResult(input.toolCallId, prepared.settlement.status, prepared.settlement.terminal);
     }
-    const dispatched = await this.dependencies.mcp.dispatch(prepared.effectIntentId);
+    const dispatched = await this.dependencies.mcp.dispatch(prepared.effectIntentId, signal);
+    const handoff = handoffReason(signal);
+    if (handoff) throw handoff;
     const terminal = dispatched.terminal ?? await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
     if (terminal) return terminal;
+    const settled = await this.readReadySettlement(input.toolCallId);
+    if (settled) return settled;
     return {
       disposition: 'paused',
       toolCallId: input.toolCallId,
       reason: 'background_process',
       resumeKey: prepared.effectIntentId
     };
+  }
+
+  private async dispatchWorkEnvironmentTransfer(
+    definition: ToolDefinition,
+    input: ReliableAgentToolDispatchInput,
+    authority: ReliableToolDispatchAuthority,
+    emit: (event: ToolRuntimeEvent) => void,
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    if (!this.dependencies.host.executeWorkEnvironmentTransfer) {
+      return this.reject(input, 'transfer 没有可靠 file_transfer capability adapter。');
+    }
+    const prepared = await this.workEnvironmentTransfers.prepare({
+      source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:file-transfer-prepare` },
+      toolCallId: input.toolCallId,
+      authoritySnapshotId: authority.snapshotId,
+      arguments: input.arguments
+    });
+    const dispatched = await this.workEnvironmentTransfers.dispatch(prepared.effectIntentId, {
+      execute: (request) => {
+        if (request.authoritySnapshotId !== authority.snapshotId) {
+          throw new Error('file_transfer Effect authority snapshot does not match the dispatching Turn.');
+        }
+        return this.dependencies.host.executeWorkEnvironmentTransfer!(
+          definition,
+          { ...input, arguments: request.arguments },
+          authority,
+          emit,
+          signal
+        );
+      }
+    }, signal);
+    const handoff = handoffReason(signal);
+    if (handoff) throw handoff;
+    const terminal = dispatched.terminal
+      ?? await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
+    if (terminal) return terminal;
+    const settled = await this.readReadySettlement(input.toolCallId);
+    if (settled) return settled;
+    return {
+      disposition: 'paused',
+      toolCallId: input.toolCallId,
+      reason: 'background_process',
+      resumeKey: prepared.effectIntentId
+    };
+  }
+
+  /**
+   * A Turn's WorkEnvironmentPolicy is immutable. Switching to the already-active environment is a
+   * real no-op; changing it mid-Turn is rejected instead of pretending later relative paths moved.
+   */
+  private async dispatchWorkEnvironmentSwitch(
+    input: ReliableAgentToolDispatchInput,
+    authority: ReliableToolDispatchAuthority
+  ): Promise<ToolTerminalResult | ReliableAgentToolSettled> {
+    const policy = authorityWorkEnvironmentPolicy(authority.document);
+    const args = requireRecord(input.arguments, 'switch_work_environment arguments');
+    const requested = requireId(args.workEnvironmentId, 'switch_work_environment.workEnvironmentId');
+    if (!policy.allowedWorkEnvironmentIds.includes(requested)) {
+      return this.reject(input, `目标工作环境 ${requested} 不在当前 Turn 冻结的允许集合中。`);
+    }
+    if (requested !== policy.defaultWorkEnvironmentId) {
+      return this.reject(
+        input,
+        `当前 Turn 的工作环境已冻结为 ${policy.defaultWorkEnvironmentId ?? '未设置'}；不能在同一 Turn 内切换到 ${requested}。请在下一 Turn 前更新对话工作环境。`
+      );
+    }
+    const settled = await this.dependencies.effects.settleWithoutEffect({
+      source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:work-environment-noop` },
+      toolCallId: input.toolCallId,
+      status: 'succeeded',
+      detail: {
+        ok: true,
+        unchanged: true,
+        workEnvironmentId: requested,
+        reason: '请求的工作环境已经是当前 Turn 冻结的默认环境。'
+      }
+    });
+    return this.settledResult(input.toolCallId, settled.status, settled.terminal);
+  }
+
+  private async definitionsForTurn(
+    definitions: ToolDefinition[],
+    turnId: string
+  ): Promise<ToolDefinition[]> {
+    const authority = await this.readAuthority(turnId, 'tool-definitions');
+    const toolPolicy = authorityPolicy(authority.document);
+    const workEnvironmentPolicy = authorityWorkEnvironmentPolicy(authority.document);
+    return definitions.filter((definition) =>
+      definitionAllowedByAuthority(toolPolicy, definition)
+      && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
+    );
   }
 
   private async readAuthority(turnId: string, toolName: string): Promise<ReliableToolDispatchAuthority> {
@@ -351,20 +936,313 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     };
   }
 
-  private async reject(input: ReliableAgentToolDispatchInput, reason: string): Promise<ToolTerminalResult> {
+  private async reject(
+    input: ReliableAgentToolDispatchInput,
+    reason: string
+  ): Promise<ToolTerminalResult | ReliableAgentToolSettled> {
     const settled = await this.dependencies.effects.settleWithoutEffect({
       source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:rejected` },
       toolCallId: input.toolCallId,
       status: 'rejected',
       detail: { reason }
     });
-    return settled.terminal ?? this.requireTerminal(input.toolCallId);
+    return this.settledResult(input.toolCallId, settled.status, settled.terminal);
   }
 
-  private async requireTerminal(toolCallId: string): Promise<ToolTerminalResult> {
-    const terminal = await this.dependencies.effects.readTerminalResult(toolCallId, true);
-    if (!terminal) throw new Error(`ToolCall ${toolCallId} has no terminal ToolModelResult.`);
-    return terminal;
+  private async readFrozenDecision(
+    input: ReliableAgentToolDispatchInput,
+    definition: ToolDefinition,
+    authority: ReliableToolDispatchAuthority
+  ): Promise<FrozenToolCallPolicyDecision> {
+    const links = await this.list('ToolCallSourceLink', { tool_call_id: input.toolCallId }, 2);
+    const snapshots = await this.list('ToolCallPolicySnapshot', { tool_call_id: input.toolCallId }, 2);
+    if (links.length > 1 || snapshots.length > 1) throw new Error(`ToolCall ${input.toolCallId} has duplicate frozen facts.`);
+    if (links.length === 1) {
+      if (snapshots.length !== 1) throw new Error(`Provider ToolCall ${input.toolCallId} has no frozen policy snapshot.`);
+      return frozenPolicyFromRow(snapshots[0]);
+    }
+    if (snapshots.length !== 0) throw new Error(`Internal ToolCall ${input.toolCallId} has an orphan policy snapshot.`);
+    return this.freezeCall({
+      ...input,
+      definition: {
+        name: definition.declaration.name,
+        description: definition.declaration.description,
+        parameters: normalizePlainJson(definition.declaration.parameters ?? {}, 'Tool parameters'),
+        ...(definition.declaration.source ? {
+          source: normalizePlainJson(definition.declaration.source, 'Tool source')
+        } : {}),
+        ...(definition.declaration.metadata ? {
+          metadata: normalizePlainJson(definition.declaration.metadata, 'Tool metadata')
+        } : {}),
+        ...(definition.declaration.defaultConfig ? {
+          defaultConfig: normalizePlainJson(definition.declaration.defaultConfig, 'Tool default config')
+        } : {})
+      }
+    });
+  }
+
+  private async providerDefinitionMismatch(
+    input: ReliableAgentToolDispatchInput,
+    definition: ToolDefinition
+  ): Promise<string | undefined> {
+    const links = await this.list('ToolCallSourceLink', { tool_call_id: input.toolCallId }, 2);
+    if (links.length === 0) return undefined;
+    if (links.length !== 1 || links[0].model_request_id !== input.modelRequestId) {
+      return `Provider ToolCall ${input.toolCallId} 的来源关系与当前 ModelRequest 不一致。`;
+    }
+    const request = await this.list('ModelRequest', { id: input.modelRequestId }, 2);
+    if (request.length !== 1) return `Provider ToolCall ${input.toolCallId} 的 ModelRequest 不存在。`;
+    const contentRows = await this.list('ContentObject', {
+      id: requireId(request[0].recipe_object_id, 'ModelRequest.recipe_object_id')
+    }, 2);
+    if (contentRows.length !== 1) return `Provider ToolCall ${input.toolCallId} 的冻结 recipe 不存在。`;
+    const recipe = requireRecord(
+      normalizePlainJson(
+        JSON.parse((await this.dependencies.contentStore.read(
+          contentRows[0] as unknown as ContentObjectMetadata
+        )).toString('utf8')),
+        'ModelRequest recipe'
+      ),
+      'ModelRequest recipe'
+    );
+    if (!Array.isArray(recipe.tools)) return 'ModelRequest recipe.tools 不是数组。';
+    const matches = recipe.tools
+      .map((value, index) => requireRecord(value, `ModelRequest recipe.tools[${index}]`))
+      .filter((value) => value.name === input.toolName);
+    if (matches.length !== 1) return `ModelRequest recipe 中工具 ${input.toolName} 不是唯一声明。`;
+    const frozenSource = matches[0].source;
+    const liveSource = definition.declaration.source;
+    return sameToolSource(liveSource, frozenSource)
+      ? undefined
+      : `工具 ${input.toolName} 的当前 capability source 与 Provider 请求冻结 source 不一致；拒绝跨源执行。`;
+  }
+
+  private settledResult(
+    toolCallId: string,
+    status: ToolOutcomeStatus,
+    terminal?: ToolTerminalResult
+  ): ToolTerminalResult | ReliableAgentToolSettled {
+    return terminal ?? { disposition: 'settled', toolCallId, status };
+  }
+
+  private async settleCancelledCapability(
+    input: ReliableAgentToolDispatchInput,
+    reason: string
+  ): Promise<ToolTerminalResult | ReliableAgentToolSettled> {
+    const settled = await this.dependencies.effects.settleWithoutEffect({
+      source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:capability-cancelled` },
+      toolCallId: input.toolCallId,
+      status: 'cancelled',
+      detail: { reason }
+    });
+    return this.settledResult(input.toolCallId, settled.status, settled.terminal);
+  }
+
+  private async readReadySettlement(
+    toolCallId: string
+  ): Promise<ToolTerminalResult | ReliableAgentToolSettled | undefined> {
+    const calls = await this.list('ToolCall', { id: toolCallId }, 2);
+    if (calls.length !== 1) throw new Error(`ToolCall ${toolCallId} does not exist.`);
+    const turnId = requireId(calls[0].turn_id, 'ToolCall.turn_id');
+    await this.dependencies.effects.finalizeReadyInOrder(turnId);
+    const terminal = await this.dependencies.effects.readTerminalResult(toolCallId, false);
+    if (terminal) return terminal;
+    const operations = await listAllDomainRows(this.dependencies.database, 'Operation', { tool_call_id: toolCallId });
+    if (operations.length > 0 && operations.every((operation) => isTerminalOperationStatus(operation.status))) {
+      return {
+        disposition: 'settled',
+        toolCallId,
+        status: aggregateToolStatuses(operations.map((operation) => operation.status as ToolOutcomeStatus))
+      };
+    }
+    const changeSets = await this.list('FileChangeSet', { tool_call_id: toolCallId }, 2);
+    if (changeSets.length === 1) {
+      const decisions = await this.list('FileChangeDecision', { change_set_id: changeSets[0].id }, 2);
+      if (decisions.length === 1 && ['rejected', 'expired'].includes(String(decisions[0].decision))) {
+        return {
+          disposition: 'settled',
+          toolCallId,
+          status: decisions[0].decision === 'rejected' ? 'rejected' : 'cancelled'
+        };
+      }
+    }
+    return undefined;
+  }
+
+  private async captureHostEvents<T>(
+    input: ReliableAgentToolDispatchInput,
+    execute: (emit: (event: ToolRuntimeEvent) => void, signal: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    if (this.activeHostExecutions.has(input.toolCallId)) {
+      throw new Error(`ToolCall ${input.toolCallId} already has an active host execution.`);
+    }
+    const active = this.beginActiveExecution(input);
+    const controller = active.controller;
+    let eventOrdinal = 0;
+    let tail = Promise.resolve();
+    const emit = (event: ToolRuntimeEvent): void => {
+      const ordinal = eventOrdinal++;
+      const normalized = normalizeRuntimeToolEvent(event);
+      tail = tail.then(async () => {
+        await this.dependencies.effects.appendToolCallEvent({
+          source: { kind: 'callback', key: `tool-runtime-event:${input.toolCallId}:${ordinal}` },
+          toolCallId: input.toolCallId,
+          eventKind: normalized.kind,
+          content: normalized
+        });
+      });
+    };
+    let result: T;
+    try {
+      await this.abortRegisteredExecutionIfTurnTerminated(active, input.turnId);
+      result = await execute(emit, controller.signal);
+    } catch (error) {
+      try {
+        await tail;
+      } catch (eventError) {
+        const handoff = handoffReason(controller.signal)
+          ?? (isExecutionHandoffError(error) ? error : undefined)
+          ?? (isExecutionHandoffError(eventError) ? eventError : undefined);
+        if (handoff) throw handoff;
+        const combined = new Error(`Tool execution and durable event append both failed: ${errorMessage(error)}; ${errorMessage(eventError)}`);
+        (combined as Error & { cause?: unknown }).cause = error;
+        throw combined;
+      }
+      if (controller.signal.aborted) {
+        const handoff = handoffReason(controller.signal);
+        if (handoff) throw handoff;
+        throw controller.signal.reason ?? error;
+      }
+      throw error;
+    } finally {
+      this.activeHostExecutions.delete(input.toolCallId);
+      active.finish();
+    }
+    await tail;
+    return result;
+  }
+
+  private async captureAbortableExecution<T>(
+    input: ReliableAgentToolDispatchInput,
+    execute: (signal: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    if (this.activeHostExecutions.has(input.toolCallId)) {
+      throw new Error(`ToolCall ${input.toolCallId} already has an active host execution.`);
+    }
+    const active = this.beginActiveExecution(input);
+    const controller = active.controller;
+    try {
+      await this.abortRegisteredExecutionIfTurnTerminated(active, input.turnId);
+      return await execute(controller.signal);
+    } finally {
+      this.activeHostExecutions.delete(input.toolCallId);
+      active.finish();
+    }
+  }
+
+  private beginActiveExecution(input: ReliableAgentToolDispatchInput): {
+    turnId: string;
+    controller: AbortController;
+    completion: Promise<void>;
+    finish(): void;
+  } {
+    let finish!: () => void;
+    const active = {
+      turnId: input.turnId,
+      controller: new AbortController(),
+      completion: new Promise<void>((resolve) => { finish = resolve; }),
+      finish: () => finish()
+    };
+    if (this.handoff) active.controller.abort(this.handoff);
+    this.activeHostExecutions.set(input.toolCallId, active);
+    return active;
+  }
+
+  /**
+   * Closes the durable-interrupt vs AbortController-registration race. The pre-dispatch read in
+   * dispatchInternal handles requests committed first; this second read handles an interrupt whose
+   * owning-host cancellation scan completed immediately before the local execution was registered.
+   * If registration won instead, cancelActive already sees and aborts this same controller.
+   */
+  private async abortRegisteredExecutionIfTurnTerminated(
+    active: { controller: AbortController },
+    turnId: string
+  ): Promise<void> {
+    if (active.controller.signal.aborted || !await this.turnTerminationRequested(turnId)) return;
+    const cancellation = new Error('Turn termination was committed before capability dispatch.');
+    cancellation.name = 'TurnCancellationError';
+    active.controller.abort(cancellation);
+  }
+
+  private async turnTerminationRequested(turnId: string): Promise<boolean> {
+    const groups = await Promise.all(TERMINATION_INPUT_KINDS.map((inputKind) => listAllDomainRows(
+      this.dependencies.database,
+      'PendingTurnInput',
+      { turn_id: turnId, state: 'pending', input_kind: inputKind }
+    )));
+    return groups.some((rows) => rows.length > 0);
+  }
+
+  /** Recovery/re-entry must observe an existing durable wait, never execute the Tool again. */
+  private async readExistingPause(toolCallId: string): Promise<ReliableAgentToolPause | undefined> {
+    const calls = await this.list('ToolCall', { id: toolCallId }, 2);
+    if (calls.length !== 1) return undefined;
+    if (calls[0].status !== 'waiting_answer') return undefined;
+    const executions = await this.list('ToolExecution', { tool_call_id: toolCallId }, 2);
+    if (executions.length !== 1 || executions[0].status !== 'waiting_answer') {
+      throw new Error(`ToolCall ${toolCallId} has an incomplete durable wait.`);
+    }
+    const links = await this.list('InteractionToolCallLink', { tool_call_id: toolCallId }, 2);
+    if (links.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple Interaction links.`);
+    if (links.length === 1) {
+      const requestId = requireId(links[0].request_id, 'InteractionToolCallLink.request_id');
+      const requests = await this.list('InteractionRequest', { id: requestId }, 2);
+      if (requests.length !== 1 || requests[0].status !== 'pending') {
+        throw new Error(`ToolCall ${toolCallId} wait does not have one pending InteractionRequest.`);
+      }
+      const kind = String(requests[0].request_kind);
+      if (kind === 'ask_user') {
+        return { disposition: 'paused', toolCallId, reason: 'awaiting_user', resumeKey: requestId };
+      }
+      if (kind === 'plan_review') {
+        return { disposition: 'paused', toolCallId, reason: 'awaiting_plan_review', resumeKey: requestId };
+      }
+      return { disposition: 'paused', toolCallId, reason: 'awaiting_approval', resumeKey: requestId };
+    }
+    const operations = await this.list('Operation', { tool_call_id: toolCallId, status: 'waiting_answer' }, 2);
+    if (operations.length !== 1) throw new Error(`ToolCall ${toolCallId} wait has no unique Operation.`);
+    return {
+      disposition: 'paused',
+      toolCallId,
+      reason: 'awaiting_child',
+      resumeKey: requireId(operations[0].id, 'Operation.id')
+    };
+  }
+
+  private async executionApprovalState(toolCallId: string): Promise<'missing' | 'pending' | 'approved' | 'rejected'> {
+    const links = await this.list('InteractionToolCallLink', { tool_call_id: toolCallId }, 10);
+    const requests = (await Promise.all(links.map(async (link) => {
+      const rows = await this.list('InteractionRequest', { id: requireId(link.request_id, 'InteractionToolCallLink.request_id') }, 2);
+      if (rows.length !== 1) throw new Error(`InteractionRequest ${String(link.request_id)} does not exist exactly once.`);
+      return rows[0];
+    }))).filter((request) => request.request_kind === 'exec_approval');
+    if (requests.length === 0) return 'missing';
+    if (requests.length !== 1) throw new Error(`ToolCall ${toolCallId} has multiple execution approvals.`);
+    if (requests[0].status === 'pending') return 'pending';
+    if (requests[0].status === 'succeeded') return 'approved';
+    return 'rejected';
+  }
+
+  private async requirePendingExecutionApproval(toolCallId: string): Promise<{ requestId: string }> {
+    const links = await this.list('InteractionToolCallLink', { tool_call_id: toolCallId }, 10);
+    for (const link of links) {
+      const requestId = requireId(link.request_id, 'InteractionToolCallLink.request_id');
+      const requests = await this.list('InteractionRequest', { id: requestId }, 2);
+      if (requests.length === 1 && requests[0].request_kind === 'exec_approval' && requests[0].status === 'pending') {
+        return { requestId };
+      }
+    }
+    throw new Error(`ToolCall ${toolCallId} execution approval state changed while resuming.`);
   }
 
   private async list(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {
@@ -380,6 +1258,7 @@ function authorityPolicy(document: PlainJsonValue): {
   allowedTools: Set<string>;
   preset: string;
   toolConfigs: Record<string, ToolPolicyToolConfigRecord>;
+  sourceConfigs: Record<string, unknown>;
 } {
   const authority = requireRecord(document, 'AuthoritySnapshot');
   const policy = requireRecord(authority.toolPolicy, 'AuthoritySnapshot.toolPolicy');
@@ -391,37 +1270,279 @@ function authorityPolicy(document: PlainJsonValue): {
   const toolConfigsRaw = policy.toolConfigs === undefined
     ? {}
     : plainRecord(policy.toolConfigs, 'AuthoritySnapshot.toolPolicy.toolConfigs');
+  const sourceConfigs = policy.sourceConfigs === undefined
+    ? {}
+    : plainRecord(policy.sourceConfigs, 'AuthoritySnapshot.toolPolicy.sourceConfigs');
   return {
     allowedTools,
     preset: typeof policy.preset === 'string' ? policy.preset : 'custom',
-    toolConfigs: toolConfigsRaw as unknown as Record<string, ToolPolicyToolConfigRecord>
+    toolConfigs: toolConfigsRaw as unknown as Record<string, ToolPolicyToolConfigRecord>,
+    sourceConfigs
   };
 }
 
-function fileAutoApply(
-  preset: string,
-  toolConfig: ToolPolicyToolConfigRecord | undefined,
+function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {
+  enabled: boolean;
+  allowedWorkEnvironmentIds: string[];
+  defaultWorkEnvironmentId: string | null;
+} {
+  const authority = requireRecord(document, 'AuthoritySnapshot');
+  const raw = requireRecord(authority.workEnvironmentPolicy, 'AuthoritySnapshot.workEnvironmentPolicy');
+  if (!Array.isArray(raw.allowedWorkEnvironmentIds)) {
+    throw new TypeError('AuthoritySnapshot.workEnvironmentPolicy.allowedWorkEnvironmentIds must be an array.');
+  }
+  return {
+    enabled: raw.enabled === true,
+    allowedWorkEnvironmentIds: raw.allowedWorkEnvironmentIds.map((value, index) =>
+      requireId(value, `AuthoritySnapshot.workEnvironmentPolicy.allowedWorkEnvironmentIds[${index}]`)),
+    defaultWorkEnvironmentId: raw.defaultWorkEnvironmentId === null || raw.defaultWorkEnvironmentId === undefined
+      ? null
+      : requireId(raw.defaultWorkEnvironmentId, 'AuthoritySnapshot.workEnvironmentPolicy.defaultWorkEnvironmentId')
+  };
+}
+
+function definitionAllowedByAuthority(
+  policy: ReturnType<typeof authorityPolicy>,
   definition: ToolDefinition
 ): boolean {
-  if (preset === 'yolo') return true;
-  return toolConfig?.autoApplyChange
-    ?? definition.declaration.metadata?.defaultAutoApplyChange
-    ?? false;
+  const explicitlyAllowed = policy.allowedTools.has(definition.declaration.name);
+  const source = definition.declaration.source;
+  if (source?.kind !== 'mcp' || !source.sourceId?.trim()) return explicitlyAllowed;
+  const config = policy.sourceConfigs[source.sourceId];
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return explicitlyAllowed;
+  const configRecord = config as Record<string, unknown>;
+  if (configRecord.enabled !== true) return false;
+  const disabled = Array.isArray(configRecord.disabledTools)
+    ? configRecord.disabledTools.filter((name): name is string => typeof name === 'string')
+    : [];
+  return !disabled.includes(definition.declaration.name);
 }
 
-function processOutputLimits(args: { [key: string]: PlainJsonValue }): { maxLines: number; maxChars: number } {
+interface CommandPolicyConfig {
+  denyCommands: string[];
+  allowCommands: string[];
+  autoApproveReadonly: boolean;
+}
+
+function commandPolicyConfig(toolConfig: ToolPolicyToolConfigRecord | undefined): CommandPolicyConfig {
+  const config = toolConfig?.config;
   return {
-    maxLines: positiveBound(args.maxOutputLines, 100, 10_000),
-    maxChars: positiveBound(args.maxOutputChars, 10_000, 1_000_000)
+    denyCommands: normalizeStringList(config?.denyCommands),
+    allowCommands: normalizeStringList(config?.allowCommands),
+    autoApproveReadonly: config?.autoApproveReadonly !== false
   };
 }
 
-function limitOutput(value: string, limits: { maxLines: number; maxChars: number }): string {
-  const lines = value.split(/\r?\n/);
-  const lineBounded = lines.length > limits.maxLines ? lines.slice(lines.length - limits.maxLines).join('\n') : value;
-  return lineBounded.length > limits.maxChars
-    ? lineBounded.slice(lineBounded.length - limits.maxChars)
-    : lineBounded;
+function firstMatchedCommandRule(command: string, rules: readonly string[]): string | undefined {
+  const normalized = command.toLowerCase();
+  return rules.find((rule) => normalized.includes(rule.toLowerCase()));
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const normalized: string[] = [];
+  for (const entry of value) {
+    const text = typeof entry === 'string' ? entry.trim() : '';
+    if (text && !normalized.includes(text)) normalized.push(text);
+  }
+  return normalized;
+}
+
+function isReadonlyCommandArguments(value: PlainJsonValue): boolean {
+  const args = requireRecord(value, 'command arguments');
+  return typeof args.readonly === 'string' && args.readonly.trim().toLowerCase() === 'true';
+}
+
+function frozenSchedulingFallback(
+  definition: ReliableAgentToolDefinition,
+  value: PlainJsonValue
+): { mode: 'parallel' | 'serial'; reason: string } {
+  const args = plainOptionalRecord(value);
+  if (args?.scheduling === 'parallel' || args?.scheduling === 'serial') {
+    return { mode: args.scheduling, reason: `provider_selected_${args.scheduling}` };
+  }
+  const metadata = plainOptionalRecord(definition.metadata);
+  if (metadata?.readonly === true || metadata?.riskLevel === 'read') {
+    return { mode: 'parallel', reason: 'frozen_readonly_metadata' };
+  }
+  return { mode: 'serial', reason: 'frozen_default_serial' };
+}
+
+function frozenPlanReviewRiskLevel(
+  definition: ToolDefinition,
+  input: ReliableAgentToolDispatchInput
+): FrozenPlanReviewRiskLevel {
+  if (FILE_TOOLS.has(input.toolName)) return 'write';
+  if (PROCESS_TOOLS.has(input.toolName)) {
+    return isReadonlyCommandArguments(input.arguments) ? 'read' : 'command';
+  }
+  const risk = definition.declaration.metadata?.riskLevel;
+  if (risk === 'read' || risk === 'write' || risk === 'command' || risk === 'agent') return risk;
+  return 'read';
+}
+
+function normalizeAutoApplyDelay(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(600, Math.max(0, Math.floor(value)))
+    : 0;
+}
+
+function frozenPolicyFromRow(row: DomainRow): FrozenToolCallPolicyDecision {
+  const executionGate = String(row.execution_gate);
+  const changeApplyMode = String(row.change_apply_mode);
+  const schedulingMode = String(row.scheduling_mode);
+  if (!['automatic', 'approval_required'].includes(executionGate)) {
+    throw new TypeError(`Invalid ToolCallPolicySnapshot.execution_gate: ${executionGate}.`);
+  }
+  if (!['automatic', 'manual', 'unsupported'].includes(changeApplyMode)) {
+    throw new TypeError(`Invalid ToolCallPolicySnapshot.change_apply_mode: ${changeApplyMode}.`);
+  }
+  if (!['parallel', 'serial'].includes(schedulingMode)) {
+    throw new TypeError(`Invalid ToolCallPolicySnapshot.scheduling_mode: ${schedulingMode}.`);
+  }
+  return {
+    ...(typeof row.summary === 'string' ? { summary: row.summary } : {}),
+    displayAutoExpand: row.display_auto_expand === 1n,
+    displayAutoOpenDiff: row.display_auto_open_diff === 1n,
+    executionGate: executionGate as FrozenToolCallPolicyDecision['executionGate'],
+    changeApplyMode: changeApplyMode as FrozenToolCallPolicyDecision['changeApplyMode'],
+    changeApplyDelaySeconds: bigintToSafeNumber(
+      row.change_apply_delay_seconds,
+      'ToolCallPolicySnapshot.change_apply_delay_seconds'
+    ),
+    autoSubmitResult: row.auto_submit_result === 1n,
+    schedulingMode: schedulingMode as FrozenToolCallPolicyDecision['schedulingMode'],
+    ...(typeof row.scheduling_reason === 'string' ? { schedulingReason: row.scheduling_reason } : {})
+  };
+}
+
+function normalizeRuntimeToolEvent(event: ToolRuntimeEvent): ToolRuntimeEvent {
+  if (!event || !['stdout', 'stderr', 'progress'].includes(event.kind)) {
+    throw new TypeError(`Unsupported runtime Tool event kind: ${String(event?.kind)}.`);
+  }
+  if (event.delta !== undefined && typeof event.delta !== 'string') {
+    throw new TypeError('Runtime Tool event delta must be text.');
+  }
+  return normalizePlainJson({
+    kind: event.kind,
+    ...(event.delta !== undefined ? { delta: event.delta } : {}),
+    ...(event.progress !== undefined ? { progress: event.progress } : {}),
+    ...(event.payload !== undefined ? { payload: event.payload } : {})
+  }, 'Runtime Tool event') as unknown as ToolRuntimeEvent;
+}
+
+function aggregateToolStatuses(statuses: ToolOutcomeStatus[]): ToolOutcomeStatus {
+  if (statuses.includes('conflict')) return 'conflict';
+  if (statuses.includes('failed')) return 'failed';
+  if (statuses.includes('outcome_unknown')) return 'outcome_unknown';
+  if (statuses.includes('partial')) return 'partial';
+  if (statuses.includes('cancelled')) return 'cancelled';
+  if (statuses.includes('rejected')) return 'rejected';
+  return 'succeeded';
+}
+
+function isTerminalOperationStatus(value: unknown): value is ToolOutcomeStatus {
+  return ['succeeded', 'failed', 'partial', 'rejected', 'cancelled', 'conflict', 'outcome_unknown']
+    .includes(String(value));
+}
+
+function bigintToSafeNumber(value: unknown, label: string): number {
+  if (typeof value !== 'bigint' || value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new TypeError(`${label} must be a non-negative safe integer.`);
+  }
+  return Number(value);
+}
+
+function requireBigInt(value: unknown, label: string): bigint {
+  if (typeof value !== 'bigint' || value < 0n) throw new TypeError(`${label} must be a non-negative bigint.`);
+  return value;
+}
+
+function plainOptionalRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function sameToolSource(left: unknown, right: unknown): boolean {
+  return canonicalPlainJson(left ?? null, 'Tool source') === canonicalPlainJson(right ?? null, 'Frozen Tool source');
+}
+
+function optionalText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isTurnCancellationError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'TurnCancellationError';
+}
+
+class NoEffectCapabilityTimeoutError extends Error {
+  public constructor() {
+    super(`Readonly capability exceeded ${NO_EFFECT_CAPABILITY_TIMEOUT_MS}ms.`);
+    this.name = 'NoEffectCapabilityTimeoutError';
+  }
+}
+
+async function executeBoundedNoEffect<T>(
+  parentSignal: AbortSignal,
+  execute: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const controller = new AbortController();
+  const cancel = (): void => controller.abort(parentSignal.reason ?? new Error('Readonly capability cancelled.'));
+  if (parentSignal.aborted) cancel();
+  else parentSignal.addEventListener('abort', cancel, { once: true });
+  const timer = setTimeout(() => controller.abort(new NoEffectCapabilityTimeoutError()), NO_EFFECT_CAPABILITY_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    if (controller.signal.aborted) throw controller.signal.reason ?? new Error('Readonly capability cancelled.');
+    const operation = execute(controller.signal);
+    return await abortableCapability(operation, controller.signal);
+  } finally {
+    clearTimeout(timer);
+    parentSignal.removeEventListener('abort', cancel);
+  }
+}
+
+function abortableCapability<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error('Readonly capability cancelled.'));
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(signal.reason ?? new Error('Readonly capability cancelled.'));
+    signal.addEventListener('abort', abort, { once: true });
+    void operation.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      }
+    );
+  });
+}
+
+const TERMINATION_INPUT_KINDS = [
+  'interrupt_request',
+  'interrupt_current_turn',
+  'termination_request'
+] as const;
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function waitForSettlementsOrGrace(completions: Promise<void>[], milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    void Promise.allSettled(completions).then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 function processStatus(observed: ProcessWaitObservation): string {
@@ -436,12 +1557,6 @@ function processExitCode(observed: ProcessWaitObservation): number | null {
   if (value === null) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) ? parsed : null;
-}
-
-function positiveBound(value: PlainJsonValue | undefined, fallback: number, maximum: number): number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
-    ? Math.min(value, maximum)
-    : fallback;
 }
 
 function requireWaitMs(value: PlainJsonValue | undefined): number {

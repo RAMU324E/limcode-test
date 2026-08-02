@@ -126,12 +126,12 @@ M package.json
 
 1. r3 合同与旧 plan validator 不一致；
 2. D/F recovery owner、扫描数量和门禁冲突；
-3. cancel_subtree / ProviderContinuation 降级规则未贯通；
+3. interrupt_subtree / ProviderContinuation 降级规则未贯通；
 4. transition ledger 替换阶段与物理删除阶段冲突；
 5. migration 只有逻辑配置域，没有可执行的物理 root manifest；
 6. Client changes、宿主队列和 snapshot→changes 交接仍无界或未定义；
 7. 后台进程跨 Extension Host 重启的 PID/pipe/exit 语义不成立；
-8. ProcessOutputChunk 没有每进程存储上限和 CAS/截断边界；
+8. ProcessOutputChunk 尚未冻结无总量截断、keyset登记与可续读取边界；
 9. 部分现有能力没有明确 keep/rebuild/delete 去向；
 10. `CompressionUpdate` 与摘要不可变合同冲突；
 11. MCP 只处理了设置/重连，没有处理工具调用的 Effect 语义；
@@ -420,7 +420,7 @@ ChildExecutionActiveTurnLink
 - TurnLink 保存首次和续接 Turn membership；
 - IntentLink 保存尚未 admit 的续接意图；
 - ActiveTurnLink 只表达当前活动 Turn；
-- cancel_subtree 沿 ParentLink 递归，不沿 ActiveTurnLink 推导树；
+- interrupt_subtree 沿 ParentLink 递归，不沿 ActiveTurnLink 推导树；
 - AnswerBridge 归属 ChildExecution。
 
 不要重新引入单一 `ChildTurnLink` 或让 active pointer 兼任 lineage。
@@ -651,7 +651,7 @@ terminationState
 - AnswerBridge owner 是 ChildExecution；
 - continuation Turn 复用同一 ChildExecution；
 - pending Intent 属于 IntentLink；
-- cancel_subtree 同时覆盖 active Turn 与 pending Intent。
+- interrupt_subtree 同时覆盖 active Turn 与 pending Intent。
 
 ## 5. 计划检查完成标准
 
@@ -747,7 +747,7 @@ recovery.delivery-pending            ownerStage=F
 
 ```text
 recovery.foreground-answer-wait-expired   ownerStage=F
-recovery.cancelled-subtree-incomplete     ownerStage=F
+recovery.interrupted-subtree-incomplete     ownerStage=F
 ```
 
 建议：
@@ -801,7 +801,7 @@ gate-registry.json:70-75
 
 ---
 
-## 问题 3：cancel_subtree 降级规则冲突
+## 问题 3：interrupt_subtree 降级规则冲突
 
 ### 当前证据
 
@@ -814,11 +814,11 @@ gate-registry.json:70-75
 允许降级：
 
 ```text
-cancel_subtree
+interrupt_subtree
 ProviderContinuation
 ```
 
-但 cancel_subtree 同时被以下位置强制要求：
+但 interrupt_subtree 同时被以下位置强制要求：
 
 ```text
 subagent.json:7-14
@@ -832,13 +832,13 @@ README.md 能力底线
 
 只有两个合法方案。
 
-#### 方案 A：首发必须支持 cancel_subtree
+#### 方案 A：首发必须支持 interrupt_subtree
 
 这是当前 r3 模型最接近的方案，因为稳定 lineage 已经完整设计。
 
 需要：
 
-- 从“可降级项”删除 cancel_subtree；
+- 从“可降级项”删除 interrupt_subtree；
 - 保留 candidate 必选检查；
 - README、章程、subagent、Phase F、gate 保持一致。
 
@@ -849,7 +849,7 @@ README.md 能力底线
 - 增加明确 release decision；
 - disabled 时从实际 operation、Phase F 完成标准和 gate 必选项中条件化移除；
 - 只保留逐个 cancel；
-- UI/协议不得继续宣称支持 cancel_subtree；
+- UI/协议不得继续宣称支持 interrupt_subtree；
 - 不能一边允许降级，一边 exact-set 强制操作存在。
 
 不要新增阶段，只需冻结一个决定。
@@ -860,7 +860,7 @@ README.md 能力底线
 
 ### 当前状态
 
-这项比 cancel_subtree 冲突轻一些。
+这项比 interrupt_subtree 冲突轻一些。
 
 `context.json:154-171` 已经定义：
 
@@ -1474,7 +1474,7 @@ exitedAt = now
 
 ```text
 wrapper 启动真实命令
-stdout/stderr 重定向到有界 spool
+stdout/stderr 重定向到durable append-only spool
 wrapper 原子写 exit receipt
 持久化 stable nonce / process group / start fingerprint
 新宿主读取 spool 和 receipt
@@ -1515,7 +1515,7 @@ targets/gate checks
 
 ---
 
-# 九、ProcessOutputChunk 必须按每进程有界
+# 九、ProcessOutputChunk 必须完整保留、瞬时内存有界
 
 ## 1. 当前缺口
 
@@ -1533,21 +1533,21 @@ insert-only
 (process_id, chunk_seq) UNIQUE
 ```
 
-没有：
+需要明确：
 
 ```text
 正文存 SQLite 还是 CAS
 每个 chunk 最大字节
-每个进程最大 retained bytes
-每个进程最大 chunk count
-截断策略
-dropped bytes
+按 processId+chunkSeq keyset 登记
+单事务 wire bytes
+mode=output 续读 handle
+无总量截断
 flush 上限
 ```
 
-`client-feed` 的按需读取上限只限制单次响应，不限制存储增长。
+`client-feed` 与工具读取的按需上限只限制单次响应，不得截断永久存储。
 
-## 2. 当前代码的 200,000 不是总上限
+## 2. 旧代码的 200,000 字符 buffer 已不属于可靠进程权威
 
 当前：
 
@@ -1555,24 +1555,24 @@ flush 上限
 commandRunner.ts:17-24,157-158
 ```
 
-给 stdout 和 stderr 各一个：
+旧 `commandRunner` 曾给 stdout 和 stderr 各一个：
 
 ```text
 AppendBuffer(200_000 chars)
 ```
 
-所以最大大约是：
+它最多保留：
 
 ```text
 stdout 200,000 UTF-16 chars
 + stderr 200,000 UTF-16 chars
 ```
 
-不是整个进程总共 200,000。
+这既会丢历史，也不能证明跨宿主恢复；可靠 Runtime 不再用它作为 ProcessOutput 权威。
 
 ## 3. 最小目标合同
 
-建议 SQLite 只保存 chunk metadata，正文进入 CAS 或有界 spool：
+SQLite 只保存 chunk metadata，正文进入 CAS 与 durable append-only spool：
 
 ```text
 process_id
@@ -1587,18 +1587,19 @@ created_at
 
 ```text
 maxChunkBytes
-maxRetainedBytesPerProcess
-maxRetainedChunksPerProcess
-droppedBytes
-truncated
+registrationKeyset = processId + chunkSeq
+maxTransactionWireBytes
+outputHandle = processId + nextChunkSeq + UTF-8 carry
+maxPageContentBytes
 ```
 
 持续高输出时：
 
 - 仍要 drain child pipe，避免阻塞 child；
-- 超过 retained 上限后丢弃正文；
-- 累加 dropped bytes；
-- 不继续无限写 CAS 或 SQLite metadata。
+- 所有已发布正文继续进入 spool/CAS，不设总字节或总 chunk cap；
+- 登记按 keyset 与事务 wire bytes 分批，直到稳定 manifest 前缀完整收敛；
+- `mode=output` 每次只读一个可续页面，调用方用 opaque handle 完整遍历；
+- `droppedBytes=0`、`truncated=false`，除非外部权威明确报告真实丢失。
 
 单用户首发不需要：
 
@@ -1607,7 +1608,7 @@ truncated
 - 通用 backpressure 平台；
 - 阻塞式 pipe backpressure。
 
-但**每进程上限必须存在**；CAS 不能替代容量上限。
+单 chunk、单事务和单页边界只控制瞬时内存/传输；它们不能变成永久输出总量上限。
 
 ---
 
@@ -2049,7 +2050,7 @@ candidate.recovery.file-change-unresolved
 candidate.recovery.answer-inbox-invariant
 candidate.recovery.pending-delivery
 candidate.recovery.foreground-wait-expired
-candidate.recovery.cancelled-subtree-incomplete
+candidate.recovery.interrupted-subtree-incomplete
 candidate.parent-handling-matrix
 ```
 
@@ -2120,7 +2121,7 @@ installed 前必须：
 
 在编辑合同前明确：
 
-1. `cancel_subtree` 首发必需还是允许降级；
+1. `interrupt_subtree` 首发必需还是允许降级；
 2. `ProviderContinuation` enabled 还是 disabled-full-request；
 3. 后台进程使用 wrapper 还是诚实降级；
 4. fork/MCP/CompressionUpdate 的 keep/rebuild/delete 选择。
@@ -2299,7 +2300,7 @@ gate 结果数据库
 可执行的物理 migration manifest
 有界 Client feed
 诚实的进程恢复语义
-每进程输出上限
+完整进程输出的keyset登记与可续分页
 独立关系 Link
 原子 gate IDs
 真实 installed smoke
@@ -2322,7 +2323,7 @@ gate 结果数据库
 5. Delivery 部分唯一索引和 InputLink 进入静态检查；
 6. recovery owner 和检查 IDs 明确；
 7. 四类全局 recovery + 两类 F sweep 有明确 owner；
-8. cancel_subtree/ProviderContinuation release decision 已冻结；
+8. interrupt_subtree/ProviderContinuation release decision 已冻结；
 9. transition ledger 分离 replacement/delete stage；
 10. migration physical manifest 覆盖：
     - 配置 roots；
@@ -2338,7 +2339,7 @@ gate 结果数据库
     - snapshot/feed 无缝交接；
     - snapshot-required；
 12. Process recovery 选择 wrapper 或诚实降级；
-13. ProcessOutputChunk 有每进程容量和截断规则；
+13. ProcessOutputChunk 无永久总量截断，并以keyset分批登记、output handle分页完整遍历；
 14. fork/MCP/CompressionUpdate 等能力去向明确；
 15. installed smoke 包含 file mutation 和普通 Turn interrupt；
 16. gate 使用稳定、原子的 ID；

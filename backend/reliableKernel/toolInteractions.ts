@@ -1,3 +1,7 @@
+import {
+  createSubmitPlanToolOutput,
+  normalizeSubmitPlanToolRequest
+} from '../../shared/planReview';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import {
   EffectControlPlane,
@@ -24,6 +28,31 @@ export interface AskUserResolutionResult {
   receiptId: string;
   requestId: string;
   won: boolean;
+  deduplicated: boolean;
+  terminal?: ToolTerminalResult;
+  commitSeq?: string;
+}
+
+export interface PlanReviewPauseResult extends AskUserPauseResult {
+  proposalId: string;
+}
+
+export interface PlanReviewResolutionResult extends AskUserResolutionResult {
+  proposalId: string;
+}
+
+export interface ExecutionApprovalPauseResult {
+  receiptId: string;
+  requestId: string;
+  deduplicated: boolean;
+  commitSeq?: string;
+}
+
+export interface ExecutionApprovalResolutionResult {
+  receiptId: string;
+  requestId: string;
+  won: boolean;
+  approved: boolean;
   deduplicated: boolean;
   terminal?: ToolTerminalResult;
   commitSeq?: string;
@@ -130,6 +159,286 @@ export class ToolInteractionControlPlane {
     });
     if (committed.deduplicated) return this.replayPause(committed.receipt, receiptId, requestId, operationId, pauseId);
     return { receiptId, requestId, operationId, pauseId, deduplicated: false, commitSeq: committed.commitSeq };
+  }
+
+  /** submit_plan uses the same durable pause/first-response-wins protocol as ask_user. */
+  public async pauseForPlanReview(input: {
+    source: PhaseDCommandSource;
+    toolCallId: string;
+    request: unknown;
+    waitDeadlineAt?: string | null;
+  }): Promise<PlanReviewPauseResult> {
+    const source = normalizeSource(input.source, ['internal'], 'plan-review-pause');
+    const toolCallId = requireId(input.toolCallId, 'toolCallId');
+    const facts = await this.requireActiveToolFacts(toolCallId);
+    if (facts.toolCall.status !== 'pending' || facts.execution.status !== 'pending') {
+      throw new Error(`ToolCall ${toolCallId} cannot enter plan review from ${String(facts.toolCall.status)}/${String(facts.execution.status)}.`);
+    }
+    const request = normalizeSubmitPlanToolRequest(input.request);
+    const requestId = stablePhaseDId('interaction_request', `plan-review:${toolCallId}`);
+    const proposalId = planProposalId(toolCallId);
+    const operationId = stablePhaseDId('operation', `plan-review:${toolCallId}`);
+    const pauseId = stablePhaseDId('outcome_pause', operationId);
+    const receiptId = sourceReceiptId(source, 'plan-review-pause', toolCallId);
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) {
+      const replay = this.replayPause(duplicate, receiptId, requestId, operationId, pauseId);
+      return { ...(await replay), proposalId };
+    }
+    const prompt = await this.contentStore.prepare(
+      this.database,
+      canonicalJson({ toolCallId, proposalId, request }),
+      'application/vnd.limcode.plan-review-prompt+json'
+    );
+    const now = this.timestamp();
+    const committed = await this.commitSource({
+      source,
+      receiptId,
+      conversationId: facts.conversation.id as string,
+      turnId: facts.turn.id as string,
+      steps: [
+        DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
+          conversation_id: facts.conversation.id,
+          turn_id: facts.turn.id
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'pending' }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'pending' }),
+        ...preparedContentSteps([prompt], 'plan_review_prompt'),
+        DOMAIN_REPOSITORIES.domain('Operation').insertWithNextSequence({
+          id: operationId,
+          owner_kind: 'tool_execution',
+          owner_id: facts.execution.id,
+          tool_call_id: toolCallId,
+          status: 'waiting_answer',
+          created_at: now,
+          updated_at: now
+        }, {
+          column: 'operation_seq',
+          scope: { owner_kind: 'tool_execution', owner_id: facts.execution.id }
+        }),
+        DOMAIN_REPOSITORIES.domain('OutcomePause').insert({
+          id: pauseId,
+          operation_id: operationId,
+          status: 'waiting',
+          reason: 'plan_review',
+          created_at: now,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').insert({
+          id: requestId,
+          request_kind: 'plan_review',
+          status: 'pending',
+          prompt_object_id: prompt.metadata.id,
+          created_at: now,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').insert({
+          id: stablePhaseDId('interaction_owner_link', requestId),
+          request_id: requestId,
+          turn_id: facts.turn.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').insert({
+          id: stablePhaseDId('interaction_tool_call_link', requestId),
+          request_id: requestId,
+          tool_call_id: toolCallId,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').update(toolCallId, { status: 'waiting_answer', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').update(facts.execution.id as string, {
+          status: 'waiting_answer',
+          wait_deadline_at: input.waitDeadlineAt === undefined ? null : input.waitDeadlineAt,
+          updated_at: now
+        })
+      ]
+    });
+    if (committed.deduplicated) {
+      const replay = await this.replayPause(committed.receipt, receiptId, requestId, operationId, pauseId);
+      return { ...replay, proposalId };
+    }
+    return {
+      receiptId,
+      requestId,
+      proposalId,
+      operationId,
+      pauseId,
+      deduplicated: false,
+      commitSeq: committed.commitSeq
+    };
+  }
+
+  /**
+   * Generic execution approval is a gate in front of the real Tool Operation.  It therefore uses
+   * Interaction facts without creating an Operation/OutcomePause: approving returns ToolCall and
+   * ToolExecution to pending so the frozen call can execute once; rejecting is durably settled by
+   * resolveExecutionApproval.
+   */
+  public async pauseForExecutionApproval(input: {
+    source: PhaseDCommandSource;
+    toolCallId: string;
+    prompt: unknown;
+  }): Promise<ExecutionApprovalPauseResult> {
+    const source = normalizeSource(input.source, ['internal'], 'execution-approval-pause');
+    const toolCallId = requireId(input.toolCallId, 'toolCallId');
+    const facts = await this.requireActiveToolFacts(toolCallId);
+    if (facts.toolCall.status !== 'pending' || facts.execution.status !== 'pending') {
+      throw new Error(`ToolCall ${toolCallId} cannot enter execution approval from ${String(facts.toolCall.status)}/${String(facts.execution.status)}.`);
+    }
+    const requestId = stablePhaseDId('interaction_request', `execution-approval:${toolCallId}`);
+    const receiptId = sourceReceiptId(source, 'execution-approval-pause', toolCallId);
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) return this.replayExecutionApprovalPause(duplicate, receiptId, requestId, toolCallId);
+    const prompt = await this.contentStore.prepare(
+      this.database,
+      canonicalJson({ toolCallId, prompt: input.prompt }),
+      'application/vnd.limcode.execution-approval-prompt+json'
+    );
+    const now = this.timestamp();
+    const committed = await this.commitSource({
+      source,
+      receiptId,
+      conversationId: facts.conversation.id as string,
+      turnId: facts.turn.id as string,
+      steps: [
+        DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
+          conversation_id: facts.conversation.id,
+          turn_id: facts.turn.id
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'pending' }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'pending' }),
+        ...preparedContentSteps([prompt], 'execution_approval_prompt'),
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').insert({
+          id: requestId,
+          request_kind: 'exec_approval',
+          status: 'pending',
+          prompt_object_id: prompt.metadata.id,
+          created_at: now,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').insert({
+          id: stablePhaseDId('interaction_owner_link', requestId),
+          request_id: requestId,
+          turn_id: facts.turn.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').insert({
+          id: stablePhaseDId('interaction_tool_call_link', requestId),
+          request_id: requestId,
+          tool_call_id: toolCallId,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').update(toolCallId, { status: 'waiting_answer', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').update(facts.execution.id as string, {
+          status: 'waiting_answer',
+          wait_deadline_at: null,
+          updated_at: now
+        })
+      ]
+    });
+    if (committed.deduplicated) {
+      return this.replayExecutionApprovalPause(committed.receipt, receiptId, requestId, toolCallId);
+    }
+    return { receiptId, requestId, deduplicated: false, commitSeq: committed.commitSeq };
+  }
+
+  public async resolveExecutionApproval(input: {
+    source: PhaseDCommandSource;
+    requestId: string;
+    decision: 'accept' | 'reject';
+    response: unknown;
+  }): Promise<ExecutionApprovalResolutionResult> {
+    const source = normalizeSource(input.source, ['command'], 'execution-approval-resolve');
+    const requestId = requireId(input.requestId, 'requestId');
+    const request = await this.requireExisting('InteractionRequest', requestId);
+    if (request.request_kind !== 'exec_approval') throw new Error('InteractionRequest is not exec_approval.');
+    const ownerRows = await this.list('InteractionOwnerLink', { request_id: requestId }, 2);
+    const toolLinks = await this.list('InteractionToolCallLink', { request_id: requestId }, 2);
+    if (ownerRows.length !== 1 || toolLinks.length !== 1) {
+      throw new Error('exec_approval InteractionRequest must have one owner and one ToolCall link.');
+    }
+    const turn = await this.requireExisting('Turn', requireId(ownerRows[0].turn_id, 'InteractionOwnerLink.turn_id'));
+    const toolCallId = requireId(toolLinks[0].tool_call_id, 'InteractionToolCallLink.tool_call_id');
+    const receiptId = sourceReceiptId(source, 'execution-approval-resolve', JSON.stringify([requestId, input.decision]));
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) {
+      return this.replayExecutionApprovalResolution(duplicate, receiptId, requestId, toolCallId);
+    }
+    const existingResponse = (await this.list('InteractionResponse', { request_id: requestId }, 2))[0];
+    if (existingResponse) {
+      const committed = await this.commitSource({
+        source,
+        receiptId,
+        conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+        turnId: requireId(turn.id, 'Turn.id'),
+        steps: []
+      });
+      return this.replayExecutionApprovalResolution(committed.receipt, receiptId, requestId, toolCallId);
+    }
+    const facts = await this.requireActiveToolFacts(toolCallId);
+    if (facts.toolCall.status !== 'waiting_answer' || facts.execution.status !== 'waiting_answer') {
+      throw new Error(`ToolCall ${toolCallId} is no longer waiting for execution approval.`);
+    }
+    const approved = input.decision === 'accept';
+    const response = await this.contentStore.prepare(
+      this.database,
+      canonicalJson({
+        requestId,
+        toolCallId,
+        sourceReceiptId: receiptId,
+        decision: input.decision,
+        response: input.response
+      }),
+      'application/vnd.limcode.execution-approval-response+json'
+    );
+    const now = this.timestamp();
+    const committed = await this.commitSource({
+      source,
+      receiptId,
+      conversationId: facts.conversation.id as string,
+      turnId: facts.turn.id as string,
+      firstResponseRequestId: requestId,
+      steps: [
+        ...preparedContentSteps([response], 'execution_approval_response'),
+        DOMAIN_REPOSITORIES.domain('InteractionResponse').insert({
+          id: stablePhaseDId('interaction_response', requestId),
+          request_id: requestId,
+          content_object_id: response.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
+          conversation_id: facts.conversation.id,
+          turn_id: facts.turn.id
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').update(requestId, {
+          status: approved ? 'succeeded' : 'rejected',
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').update(toolCallId, { status: 'pending', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').update(facts.execution.id as string, {
+          status: 'pending',
+          wait_deadline_at: null,
+          updated_at: now
+        })
+      ]
+    });
+    if (committed.deduplicated || committed.firstResponseLost) {
+      return this.replayExecutionApprovalResolution(committed.receipt, receiptId, requestId, toolCallId);
+    }
+    const terminal = approved ? undefined : await this.settleRejectedExecutionApproval(requestId, toolCallId);
+    return {
+      receiptId,
+      requestId,
+      won: true,
+      approved,
+      deduplicated: false,
+      commitSeq: committed.commitSeq,
+      ...(terminal ? { terminal } : {})
+    };
   }
 
   public async resolveAskUser(input: {
@@ -249,6 +558,164 @@ export class ToolInteractionControlPlane {
     };
   }
 
+  public async resolvePlanReview(input: {
+    source: PhaseDCommandSource;
+    requestId: string;
+    decision: 'accept' | 'submit' | 'reject' | 'cancel';
+    response: unknown;
+  }): Promise<PlanReviewResolutionResult> {
+    const source = normalizeSource(input.source, ['command'], 'plan-review-resolve');
+    const requestId = requireId(input.requestId, 'requestId');
+    const request = await this.requireExisting('InteractionRequest', requestId);
+    if (request.request_kind !== 'plan_review') throw new Error('InteractionRequest is not plan_review.');
+    const ownerRows = await this.list('InteractionOwnerLink', { request_id: requestId }, 2);
+    if (ownerRows.length !== 1) throw new Error('plan_review InteractionRequest must have one owner link.');
+    const turn = await this.requireExisting('Turn', requireId(ownerRows[0].turn_id, 'InteractionOwnerLink.turn_id'));
+    const subject = await this.readPlanReviewSubject(requestId);
+    const proposalId = subject.proposalId;
+    const pauseId = stablePhaseDId('outcome_pause', stablePhaseDId('operation', `plan-review:${subject.toolCallId}`));
+    const pause = await this.requireExisting('OutcomePause', pauseId);
+    const operation = await this.requireExisting('Operation', requireId(pause.operation_id, 'OutcomePause.operation_id'));
+    const toolCallId = requireId(operation.tool_call_id, 'Operation.tool_call_id');
+    if (toolCallId !== subject.toolCallId) throw new Error('Plan review Operation does not match its immutable subject.');
+
+    const responseRecord = optionalRecord(input.response);
+    const suppliedProposalId = optionalText(responseRecord?.planProposalId);
+    if (suppliedProposalId && suppliedProposalId !== proposalId) {
+      throw new Error('Plan review response targets another proposal.');
+    }
+    const decisionStatus = input.decision === 'accept'
+      ? 'approved' as const
+      : input.decision === 'submit'
+        ? 'change_requested' as const
+        : 'rejected' as const;
+    const executionTarget = responseRecord?.executionTarget === 'new_conversation'
+      ? 'new_conversation' as const
+      : 'current_conversation' as const;
+    if (decisionStatus === 'approved' && executionTarget === 'new_conversation') {
+      throw new Error('可靠 Plan 控制面尚未连接独立对话委派；请选择在当前对话中执行。');
+    }
+    const userMessage = optionalText(responseRecord?.message) ?? defaultPlanDecisionMessage(decisionStatus);
+    const output = createSubmitPlanToolOutput({
+      proposalId,
+      status: decisionStatus,
+      userMessage,
+      ...(decisionStatus === 'approved' ? { executionTarget } : {})
+    });
+    const operationStatus = input.decision === 'cancel'
+      ? 'cancelled' as const
+      : decisionStatus === 'rejected'
+        ? 'rejected' as const
+        : 'succeeded' as const;
+    const requestStatus = input.decision === 'cancel'
+      ? 'cancelled'
+      : decisionStatus === 'rejected'
+        ? 'rejected'
+        : 'succeeded';
+    const receiptId = sourceReceiptId(source, 'plan-review-resolve', JSON.stringify([requestId, input.decision]));
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) {
+      await this.effects.finalizeReadyInOrder(turn.id as string);
+      return this.replayPlanResolution(duplicate, receiptId, requestId, proposalId);
+    }
+    const existingResponse = (await this.list('InteractionResponse', { request_id: requestId }, 2))[0];
+    if (existingResponse) {
+      const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+      const committed = await this.commitSource({ source, receiptId, conversationId, turnId: turn.id as string, steps: [] });
+      await this.effects.finalizeReadyInOrder(turn.id as string);
+      return this.lostPlanResolution(committed.receipt, requestId, proposalId, committed.deduplicated);
+    }
+    const facts = await this.requireActiveToolFacts(toolCallId);
+    if (
+      facts.toolCall.status !== 'waiting_answer'
+      || facts.execution.status !== 'waiting_answer'
+      || operation.status !== 'waiting_answer'
+    ) throw new Error(`ToolCall ${toolCallId} is no longer waiting for Plan review.`);
+
+    const response = await this.contentStore.prepare(
+      this.database,
+      canonicalJson({
+        requestId,
+        proposalId,
+        sourceReceiptId: receiptId,
+        decision: input.decision,
+        response: input.response,
+        output
+      }),
+      'application/vnd.limcode.plan-review-response+json'
+    );
+    const resultArtifact = await this.contentStore.prepare(
+      this.database,
+      canonicalJson({ toolCallId, status: operationStatus, detail: output }),
+      'application/vnd.limcode.tool-result-artifact+json'
+    );
+    const now = this.timestamp();
+    const committed = await this.commitSource({
+      source,
+      receiptId,
+      conversationId: facts.conversation.id as string,
+      turnId: facts.turn.id as string,
+      firstResponseRequestId: requestId,
+      steps: [
+        ...preparedContentSteps([response, resultArtifact], 'plan_review_response'),
+        DOMAIN_REPOSITORIES.domain('InteractionResponse').insert({
+          id: stablePhaseDId('interaction_response', requestId),
+          request_id: requestId,
+          content_object_id: response.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
+          conversation_id: facts.conversation.id,
+          turn_id: facts.turn.id
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+          id: stablePhaseDId('tool_result_artifact', `plan-review:${toolCallId}`),
+          tool_call_id: toolCallId,
+          role: 'no_effect_result',
+          content_object_id: resultArtifact.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').update(requestId, { status: requestStatus, updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('OperationResolution').insert({
+          id: stablePhaseDId('operation_resolution', pauseId),
+          pause_id: pauseId,
+          resolution_kind: operationStatus,
+          content_object_id: response.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('OutcomePause').update(pauseId, { status: 'resolved', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('Operation').update(operation.id as string, {
+          status: operationStatus,
+          updated_at: now
+        })
+      ]
+    });
+    if (committed.deduplicated) {
+      await this.effects.finalizeReadyInOrder(facts.turn.id as string);
+      return this.replayPlanResolution(committed.receipt, receiptId, requestId, proposalId);
+    }
+    if (committed.firstResponseLost) {
+      await this.effects.finalizeReadyInOrder(facts.turn.id as string);
+      return this.lostPlanResolution(committed.receipt, requestId, proposalId, false);
+    }
+    const finalized = await this.effects.finalizeReadyInOrder(facts.turn.id as string);
+    const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
+      ?? await this.effects.readTerminalResult(toolCallId, false);
+    return {
+      receiptId,
+      requestId,
+      proposalId,
+      won: true,
+      deduplicated: false,
+      commitSeq: committed.commitSeq,
+      ...(terminal ? { terminal: { ...terminal, receiptId } } : {})
+    };
+  }
+
   /** update_task_list remains structured Tool facts; Phase F will derive its client projection. */
   public async settleTaskList(input: {
     source: PhaseDCommandSource;
@@ -290,6 +757,53 @@ export class ToolInteractionControlPlane {
     await this.requireExisting('Operation', operationId);
     await this.requireExisting('OutcomePause', pauseId);
     return { receiptId: receipt.id as string, requestId, operationId, pauseId, deduplicated: true };
+  }
+
+  private async replayExecutionApprovalPause(
+    receipt: DomainRow,
+    expectedReceiptId: string,
+    requestId: string,
+    toolCallId: string
+  ): Promise<ExecutionApprovalPauseResult> {
+    assertSourceReceipt(receipt, expectedReceiptId, 'execution-approval-pause');
+    const request = await this.requireExisting('InteractionRequest', requestId);
+    if (request.request_kind !== 'exec_approval') throw new Error('Stable execution approval has the wrong request kind.');
+    const links = await this.list('InteractionToolCallLink', { request_id: requestId, tool_call_id: toolCallId }, 2);
+    if (links.length !== 1) throw new Error('Stable execution approval is not linked to its ToolCall.');
+    return { receiptId: receipt.id as string, requestId, deduplicated: true };
+  }
+
+  private async replayExecutionApprovalResolution(
+    receipt: DomainRow,
+    expectedReceiptId: string,
+    requestId: string,
+    toolCallId: string
+  ): Promise<ExecutionApprovalResolutionResult> {
+    assertSourceReceipt(receipt, expectedReceiptId, 'execution-approval-resolve');
+    const request = await this.requireExisting('InteractionRequest', requestId);
+    const approved = request.status === 'succeeded';
+    if (!approved && request.status !== 'rejected') {
+      throw new Error(`Execution approval ${requestId} is not resolved.`);
+    }
+    const terminal = approved ? undefined : await this.settleRejectedExecutionApproval(requestId, toolCallId);
+    return {
+      receiptId: receipt.id as string,
+      requestId,
+      won: await this.responseReceiptWon(requestId, receipt.id as string),
+      approved,
+      deduplicated: true,
+      ...(terminal ? { terminal } : {})
+    };
+  }
+
+  private async settleRejectedExecutionApproval(requestId: string, toolCallId: string): Promise<ToolTerminalResult | undefined> {
+    const settled = await this.effects.settleWithoutEffect({
+      source: { kind: 'internal', key: `execution-approval-rejected:${requestId}` },
+      toolCallId,
+      status: 'rejected',
+      detail: { requestId, reason: '用户拒绝执行工具。' }
+    });
+    return settled.terminal;
   }
 
   private async replayResolution(
@@ -340,6 +854,64 @@ export class ToolInteractionControlPlane {
     ) as ContentObjectMetadata;
     const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
     return body.sourceReceiptId === receiptId;
+  }
+
+  private async readPlanReviewSubject(requestId: string): Promise<{
+    toolCallId: string;
+    proposalId: string;
+  }> {
+    const request = await this.requireExisting('InteractionRequest', requestId);
+    if (request.request_kind !== 'plan_review') throw new Error('InteractionRequest is not plan_review.');
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requireId(request.prompt_object_id, 'InteractionRequest.prompt_object_id')
+    ) as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+    const toolCallId = requireId(body.toolCallId, 'plan review prompt toolCallId');
+    const proposalId = requireId(body.proposalId, 'plan review prompt proposalId');
+    if (
+      stablePhaseDId('interaction_request', `plan-review:${toolCallId}`) !== requestId
+      || proposalId !== planProposalId(toolCallId)
+    ) throw new Error('plan_review prompt does not match InteractionRequest identity.');
+    normalizeSubmitPlanToolRequest(body.request);
+    return { toolCallId, proposalId };
+  }
+
+  private async replayPlanResolution(
+    receipt: DomainRow,
+    expectedReceiptId: string,
+    requestId: string,
+    proposalId: string
+  ): Promise<PlanReviewResolutionResult> {
+    assertSourceReceipt(receipt, expectedReceiptId, 'plan-review-resolve');
+    const toolCallId = (await this.readPlanReviewSubject(requestId)).toolCallId;
+    const terminal = await this.effects.readTerminalResult(toolCallId, true);
+    return {
+      receiptId: receipt.id as string,
+      requestId,
+      proposalId,
+      won: await this.responseReceiptWon(requestId, receipt.id as string),
+      deduplicated: true,
+      ...(terminal ? { terminal: { ...terminal, receiptId: receipt.id as string } } : {})
+    };
+  }
+
+  private async lostPlanResolution(
+    receipt: DomainRow,
+    requestId: string,
+    proposalId: string,
+    deduplicated: boolean
+  ): Promise<PlanReviewResolutionResult> {
+    const toolCallId = (await this.readPlanReviewSubject(requestId)).toolCallId;
+    const terminal = await this.effects.readTerminalResult(toolCallId, true);
+    return {
+      receiptId: receipt.id as string,
+      requestId,
+      proposalId,
+      won: false,
+      deduplicated,
+      ...(terminal ? { terminal: { ...terminal, receiptId: receipt.id as string } } : {})
+    };
   }
 
   private async requireActiveToolFacts(toolCallId: string): Promise<{
@@ -507,6 +1079,28 @@ function normalizeTaskListItem(value: unknown, index: number): Record<string, un
     throw new TypeError(`taskList.items[${index}].delete must be boolean when present.`);
   }
   return record;
+}
+
+function planProposalId(toolCallId: string): string {
+  return `plan-proposal:${requireId(toolCallId, 'toolCallId')}`;
+}
+
+function defaultPlanDecisionMessage(status: 'approved' | 'change_requested' | 'rejected'): string {
+  if (status === 'approved') return 'User approved the plan. Continue with the approved plan.';
+  if (status === 'change_requested') return 'User requested changes to the plan. Revise the plan and submit it again.';
+  return 'User rejected the plan.';
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function optionalText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized || undefined;
 }
 
 function requireId(value: unknown, label: string): string {

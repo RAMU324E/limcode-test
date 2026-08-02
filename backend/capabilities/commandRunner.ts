@@ -17,8 +17,8 @@ import { isRemoteServerCommandEnvironment, runRemoteServerCommand } from './work
 const DEFAULT_FOREGROUND_WAIT_MS = 30_000;
 /** 后台进程完整日志 buffer 的上限（远大于给模型的软上限，避免过早丢弃可能被 output 读取的历史）。 */
 const BACKGROUND_MAX_CHARS = 200_000;
-/** 兜底的输出上限（调用方未显式传入 limits 时使用）。 */
-const DEFAULT_OUTPUT_LIMITS: CommandOutputLimits = { maxOutputLines: 100, maxOutputChars: 10_000 };
+/** Legacy capability declarations use zero to mean complete output; reliable mode pages by outputHandle. */
+const DEFAULT_OUTPUT_LIMITS: CommandOutputLimits = { maxOutputLines: 0, maxOutputChars: 0 };
 const STREAM_EVENT_FLUSH_INTERVAL_MS = 100;
 const STREAM_EVENT_FLUSH_CHARS = 8 * 1024;
 const MAX_STREAM_EVENT_DELTA_CHARS = 16 * 1024;
@@ -223,8 +223,8 @@ function executeCommand(profile: CommandProfile, backgroundProcesses: Background
         status: 'running',
         processId,
         running: true,
-        stdout: truncateOutput(out.text, limits),
-        stderr: truncateOutput(err.text, limits)
+        stdout: out.text,
+        stderr: err.text
       });
       return true;
     };
@@ -248,8 +248,8 @@ function executeCommand(profile: CommandProfile, backgroundProcesses: Background
         exitCode,
         killed: aborted,
         status: aborted ? 'killed' : 'completed',
-        stdout: truncateOutput(out.text, limits),
-        stderr: truncateOutput(err.text, limits)
+        stdout: out.text,
+        stderr: err.text
       });
     };
 
@@ -321,26 +321,6 @@ class AppendBuffer {
   public snapshot(): { text: string; dropped: number } {
     return { text: this.buffer, dropped: this.droppedChars };
   }
-}
-
-/**
- * 按上限截断给模型的输出：先保留末尾 maxOutputLines 行，再按 maxOutputChars 保留末尾字符。
- * （命令的结论/错误/进度通常在末尾，故取尾部。）
- */
-function truncateOutput(text: string, limits: CommandOutputLimits): string {
-  if (!text) return text;
-  let out = text;
-  if (limits.maxOutputLines > 0) {
-    const lines = out.split('\n');
-    if (lines.length > limits.maxOutputLines) {
-      const omitted = lines.length - limits.maxOutputLines;
-      out = `... (共 ${lines.length} 行，已省略前 ${omitted} 行) ...\n${lines.slice(-limits.maxOutputLines).join('\n')}`;
-    }
-  }
-  if (limits.maxOutputChars > 0 && out.length > limits.maxOutputChars) {
-    out = `... (已按 ${limits.maxOutputChars} 字符上限截断) ...\n${out.slice(-limits.maxOutputChars)}`;
-  }
-  return out;
 }
 
 type StreamOutputKind = 'stdout' | 'stderr';

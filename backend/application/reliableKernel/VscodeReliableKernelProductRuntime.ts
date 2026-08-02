@@ -37,6 +37,11 @@ export interface VscodeReliableKernelProductRuntimeOptions {
   dispatchSpecial?: VscodeReliableToolHostOptions['dispatchSpecial'];
 }
 
+export type VscodeReliableKernelRecoveryState =
+  | { status: 'not_started' | 'running' }
+  | { status: 'complete'; report: ReliableKernelRecoveryReport }
+  | { status: 'failed'; error: { name: string; message: string } };
+
 /**
  * VS Code product composition for the reliable kernel.
  *
@@ -48,33 +53,39 @@ export class VscodeReliableKernelProductRuntime {
   public readonly application: ReliableKernelApplication;
   public readonly configuration: VscodeConfigurationAuthority;
   public readonly toolHost: VscodeReliableToolHost;
-  public readonly recovery: ReliableKernelRecoveryReport;
   public readonly childAgents: ReliableChildAgentCoordinator;
   public readonly fileDiffs: VscodeReliableFileDiffEditor;
   public readonly conversations: ReliableConversationRunner;
   public readonly providerRegistry: ReliableLlmProviderRegistry;
   public readonly diagnostics: ReliableDiagnosticJournal;
 
+  private recoveryReport: ReliableKernelRecoveryReport | undefined;
+  private recoveryError: unknown;
+  private recoveryTask: Promise<ReliableKernelRecoveryReport> | undefined;
+  private recoveryController: AbortController | undefined;
+  private closing = false;
+  private readonly initializeConfiguration: () => Promise<void>;
+
   private constructor(input: {
     application: ReliableKernelApplication;
     configuration: VscodeConfigurationAuthority;
     toolHost: VscodeReliableToolHost;
-    recovery: ReliableKernelRecoveryReport;
     childAgents: ReliableChildAgentCoordinator;
     fileDiffs: VscodeReliableFileDiffEditor;
     conversations: ReliableConversationRunner;
     providerRegistry: ReliableLlmProviderRegistry;
     diagnostics: ReliableDiagnosticJournal;
+    initializeConfiguration: () => Promise<void>;
   }) {
     this.application = input.application;
     this.configuration = input.configuration;
     this.toolHost = input.toolHost;
-    this.recovery = input.recovery;
     this.childAgents = input.childAgents;
     this.fileDiffs = input.fileDiffs;
     this.conversations = input.conversations;
     this.providerRegistry = input.providerRegistry;
     this.diagnostics = input.diagnostics;
+    this.initializeConfiguration = input.initializeConfiguration;
   }
 
   public static async open(
@@ -83,12 +94,18 @@ export class VscodeReliableKernelProductRuntime {
   ): Promise<VscodeReliableKernelProductRuntime> {
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
     const configuration = new VscodeConfigurationAuthority(getPaths, context);
-    await configuration.synchronizeWorkspaceFolders((vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
-      uri: folder.uri.toString(),
-      name: folder.name,
-      rootPath: folder.uri.fsPath,
-      index
-    })));
+    let configurationInitialization: Promise<void> | undefined;
+    const initializeConfiguration = (): Promise<void> => {
+      configurationInitialization ??= configuration.synchronizeWorkspaceFolders(
+        (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
+          uri: folder.uri.toString(),
+          name: folder.name,
+          rootPath: folder.uri.fsPath,
+          index
+        }))
+      );
+      return configurationInitialization;
+    };
     const authority = options.authority ?? createVscodeRootAuthority(getPaths);
     const diagnostics = new ReliableDiagnosticJournal(authority, await authority.current());
     let application: ReliableKernelApplication | undefined;
@@ -96,10 +113,16 @@ export class VscodeReliableKernelProductRuntime {
     let fileDiffs: VscodeReliableFileDiffEditor | undefined;
     let conversations: ReliableConversationRunner | undefined;
     const toolHost = new VscodeReliableToolHost(context, configuration, {
-      dispatchSpecial: async (definition, input, frozenAuthority) => {
-        const childResult = await childAgents?.dispatch(input);
+      dispatchSpecial: async (definition, input, frozenAuthority, signal) => {
+        const childResult = await childAgents?.dispatch(input, signal);
         if (childResult) return childResult;
-        return options.dispatchSpecial?.(definition, input, frozenAuthority);
+        return options.dispatchSpecial?.(definition, input, frozenAuthority, signal);
+      },
+      cancelTurnWaits: async (input) => {
+        await childAgents?.cancelParentWaits(input);
+      },
+      quiesce: async (reason) => {
+        await childAgents?.quiesce(reason);
       }
     });
     const providers = new ReliableLlmProviderRegistry({
@@ -118,8 +141,9 @@ export class VscodeReliableKernelProductRuntime {
     const transientObserver: ReliableAgentTransientObserver = {
       observe(event) {
         application?.webviewFeed.broadcastTransient(event);
-        if (!observedFirstTransient.has(event.modelRequestId)) {
-          observedFirstTransient.add(event.modelRequestId);
+        const transientGeneration = `${event.modelRequestId}:${event.attemptSeq}:${event.socketGeneration}`;
+        if (!observedFirstTransient.has(transientGeneration)) {
+          observedFirstTransient.add(transientGeneration);
           while (observedFirstTransient.size > 2_048) {
             const oldest = observedFirstTransient.values().next().value as string | undefined;
             if (!oldest) break;
@@ -135,6 +159,8 @@ export class VscodeReliableKernelProductRuntime {
               conversationId: event.conversationId,
               turnId: event.turnId,
               modelRequestId: event.modelRequestId,
+              attemptSeq: event.attemptSeq,
+              socketGeneration: event.socketGeneration,
               streamSeq: String(event.event.streamSeq),
               kind: event.event.kind
             }
@@ -164,7 +190,6 @@ export class VscodeReliableKernelProductRuntime {
       }
     };
     try {
-      await toolHost.initialize();
       application = await ReliableKernelApplication.open(authority, {
         authorityCompiler: configuration,
         resolveWorkEnvironment: async (workEnvironmentId) => {
@@ -207,6 +232,52 @@ export class VscodeReliableKernelProductRuntime {
         application,
         `vscode-product:${application.database.hostBootId}`
       );
+      application.processDeliveries.setWakeHandler(async (request) => {
+        const app = application;
+        const runner = conversations;
+        if (!app || !runner) return { acknowledged: false };
+        if (request.action === 'notify_only') {
+          const acknowledged = await app.runtime.deliveries.acknowledgeNotification(request.deliveryId);
+          // The RuntimeDelivery ACK is the durable notification fence. A host crash after this point
+          // may omit a toast, but can never emit duplicate toasts on wake replay.
+          if (acknowledged.changed) {
+            void vscode.window.showInformationMessage(
+              request.sourceKind === 'answer_submission'
+                ? 'LimCode 子 Agent 已返回部分或最终结果；来源对话已结束，答案已保留在可靠 Runtime 中。'
+                : `LimCode 后台进程 ${request.processId ?? request.sourceId} 已完成；来源对话已取消或关闭，结果已保留在可靠 Runtime 中。`
+            );
+          }
+          return { acknowledged: true };
+        }
+        if (request.action === 'resume_current_turn') {
+          if (!request.targetTurnId) return { acknowledged: false };
+          // Scheduling is only an edge hint. The AgentLoop advances and absorbs the Delivery at a
+          // protocol-safe boundary; the outbox remains pending until markInputHandled is durable.
+          if (!await childAgents?.resume(request.targetTurnId)) {
+            runner.resume(request.conversationId, request.targetTurnId);
+          }
+          const summary = await app.runtime.deliveries.summary(request.deliveryId);
+          return { acknowledged: summary.parentHandlingState === 'handled' };
+        }
+        if (request.childExecutionId) {
+          // A Child Turn requires ChildExecutionIntentLink/TurnLink/ActiveTurnLink admission. The
+          // ordinary Conversation runner deliberately cannot claim child scheduler membership.
+          // Keep the durable wake retryable until the child coordinator has created that exact
+          // internal continuation; never create an orphan ordinary Turn in the child Conversation.
+          if (!childAgents) return { acknowledged: false };
+          return childAgents.runtimeDeliveryContinuation({
+            deliveryId: request.deliveryId,
+            childExecutionId: request.childExecutionId,
+            sourceTurnId: request.sourceTurnId
+          });
+        }
+        const continuation = await runner.runtimeContinuation({
+          commandId: `runtime-delivery:${request.deliveryId}`,
+          conversationId: request.conversationId,
+          sourceTurnId: request.sourceTurnId
+        });
+        return { acknowledged: Boolean(continuation.intentId) };
+      });
       childAgents = new ReliableChildAgentCoordinator({
         database: application.database,
         effects: application.runtime.effects,
@@ -214,26 +285,45 @@ export class VscodeReliableKernelProductRuntime {
         answers: application.runtime.answers,
         deliveries: application.runtime.deliveries,
         modelProvider: application.modelProvider,
+        turns: application.turns,
         agentLoop: application.agentLoop,
-        agents: { resolve: (input) => configuration.resolveAgent(input) }
+        agents: { resolve: (input) => configuration.resolveAgent(input) },
+        deliveryWakeups: application.processDeliveries,
+        ownedProcessCleanup: application.childOwnedProcessCleanup,
+        cancelTurnExecution: async ({ turnId, reason }) => {
+          await Promise.all([
+            application!.modelProvider.cancelTurnDispatches(turnId, reason),
+            Promise.resolve(application!.toolDispatcher.cancelActive?.({ turnId, reason }))
+          ]);
+        },
+        quiesceTurnExecution: async ({ turnId, reason }) => {
+          await Promise.allSettled([
+            application!.modelProvider.quiesceTurnDispatches(turnId, reason),
+            Promise.resolve(application!.toolDispatcher.quiesceTurn?.({ turnId, reason }))
+          ]);
+        },
+        manualCompression: {
+          admit: (input) => conversations!.admitManualCompression(input),
+          inspect: (input) => conversations!.inspectManualCompression(input),
+          driveIfPresent: (input) => conversations!.driveManualCompressionIfPresent(input)
+        }
       });
-      const recovery = await application.recover();
       return new VscodeReliableKernelProductRuntime({
         application,
         configuration,
         toolHost,
-        recovery,
         childAgents,
         fileDiffs,
         conversations,
         providerRegistry: providers,
-        diagnostics
+        diagnostics,
+        initializeConfiguration
       });
     } catch (error) {
       if (application) {
         fileDiffs?.dispose();
         conversations?.dispose();
-        await application.modelProvider.abortAllActiveDispatches().catch(() => undefined);
+        await application.beginHandoff().catch(() => undefined);
         await conversations?.waitForIdle().catch(() => undefined);
         // Child tasks need the live SQLite/CAS composition while they abort and settle.
         await childAgents?.dispose().catch(() => undefined);
@@ -247,11 +337,73 @@ export class VscodeReliableKernelProductRuntime {
     }
   }
 
+  /**
+   * Runs durable crash recovery after the VS Code surface has been registered. Recovery is
+   * level-triggered and protected by the same SQLite CAS/lease fences as live work, so it must not
+   * hold extension activation (and the entire sidebar) hostage while it scans a large data set.
+   */
+  public startRecovery(): Promise<ReliableKernelRecoveryReport> {
+    if (this.recoveryTask) return this.recoveryTask;
+    if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
+    const controller = new AbortController();
+    this.recoveryController = controller;
+    this.recoveryTask = (async () => {
+      const [report] = await Promise.all([
+        this.application.recover(controller.signal),
+        this.toolHost.initialize(),
+        this.initializeConfiguration()
+      ]);
+      controller.signal.throwIfAborted();
+      if (!this.closing) {
+        await this.childAgents.recoverStartup(controller.signal);
+        controller.signal.throwIfAborted();
+        await this.conversations.recoverStartup(controller.signal);
+      }
+      this.recoveryReport = report;
+      return report;
+    })().catch((error) => {
+      if (!this.closing) this.recoveryError = error;
+      throw error;
+    });
+    return this.recoveryTask;
+  }
+
+  /** Commands that freeze a new execution authority wait for the post-activation catalogs. */
+  public ensureCapabilitiesReady(): Promise<void> {
+    if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
+    return Promise.all([
+      this.toolHost.initialize(),
+      this.initializeConfiguration()
+    ]).then(() => undefined);
+  }
+
+  public recoveryState(): VscodeReliableKernelRecoveryState {
+    if (this.recoveryReport) return { status: 'complete', report: this.recoveryReport };
+    if (this.recoveryError) {
+      return {
+        status: 'failed',
+        error: {
+          name: this.recoveryError instanceof Error ? this.recoveryError.name : 'Error',
+          message: this.recoveryError instanceof Error ? this.recoveryError.message : String(this.recoveryError)
+        }
+      };
+    }
+    return { status: this.recoveryTask ? 'running' : 'not_started' };
+  }
+
   public async close(): Promise<void> {
+    this.closing = true;
+    const cancellation = new Error('Reliable Runtime recovery cancelled for Host handoff.');
+    cancellation.name = 'AbortError';
+    this.recoveryController?.abort(cancellation);
     try {
       this.fileDiffs.dispose();
       this.conversations.dispose();
-      await this.application.modelProvider.abortAllActiveDispatches();
+      await this.application.beginHandoff();
+      // MCP discovery has its own AbortSignal generation. Dispose it before awaiting recovery so
+      // an unresponsive external server cannot make Extension Host reload wait forever.
+      await this.toolHost.dispose();
+      await this.recoveryTask?.catch(() => undefined);
       await this.conversations.waitForIdle();
       // Never close the database underneath in-flight child Turn finalization.
       await this.childAgents.dispose();

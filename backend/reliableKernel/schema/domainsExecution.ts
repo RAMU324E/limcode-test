@@ -36,6 +36,48 @@ export const EXECUTION_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     columns: [id(), ref('turn_id', 'turn'), integer('call_seq'), text('tool_name'), text('status'), ref('arguments_object_id', 'content_object'), text('created_at'), text('updated_at')]
   }),
   domain({
+    key: 'ToolCallSourceLink', table: 'tool_call_source_link', repository: 'ToolCallSourceLinkRepository', codec: 'ToolCallSourceLinkRowCodec',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-tool-call',
+    indexes: [
+      'tool_call_id UNIQUE',
+      'model_request_id,provider_ordinal UNIQUE',
+      'model_request_id,provider_call_id UNIQUE WHERE provider_call_id IS NOT NULL',
+      'batch_id,batch_ordinal UNIQUE',
+      'message_id'
+    ],
+    columns: [
+      id(),
+      ref('tool_call_id', 'tool_call'),
+      ref('model_request_id', 'model_request'),
+      ref('message_id', 'message'),
+      text('provider_call_id', { nullable: true }),
+      integer('provider_ordinal'),
+      text('batch_id'),
+      integer('batch_ordinal'),
+      text('thought_signature', { nullable: true }),
+      text('created_at')
+    ]
+  }),
+  domain({
+    key: 'ToolCallPolicySnapshot', table: 'tool_call_policy_snapshot', repository: 'ToolCallPolicySnapshotRepository', codec: 'ToolCallPolicySnapshotRowCodec',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-tool-call',
+    indexes: ['tool_call_id UNIQUE', 'scheduling_mode,created_at'],
+    columns: [
+      id(),
+      ref('tool_call_id', 'tool_call'),
+      text('summary', { nullable: true }),
+      integer('display_auto_expand'),
+      integer('display_auto_open_diff'),
+      text('execution_gate'),
+      text('change_apply_mode'),
+      integer('change_apply_delay_seconds'),
+      integer('auto_submit_result'),
+      text('scheduling_mode'),
+      text('scheduling_reason', { nullable: true }),
+      text('created_at')
+    ]
+  }),
+  domain({
     key: 'ToolCallEvent', table: 'tool_call_event', repository: 'ToolCallEventRepository', codec: 'ToolCallEventRowCodec',
     mutations: ['insert'], client: 'detail', deletePolicy: 'cascade-with-tool-call',
     indexes: ['tool_call_id,event_seq UNIQUE'],
@@ -151,9 +193,15 @@ export const EXECUTION_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   }),
   domain({
     key: 'ProcessOriginLink', table: 'process_origin_link', repository: 'ProcessOriginLinkRepository', codec: 'ProcessOriginLinkRowCodec',
-    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-process',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-process',
     indexes: ['process_id UNIQUE', 'tool_call_id'],
     columns: [id(), ref('process_id', 'process'), text('tool_call_id'), text('created_at')]
+  }),
+  domain({
+    key: 'ProcessCompletionSourceLink', table: 'process_completion_source_link', repository: 'ProcessCompletionSourceLinkRepository', codec: 'ProcessCompletionSourceLinkRowCodec',
+    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-process',
+    indexes: ['process_id UNIQUE', 'conversation_id,created_at', 'source_turn_id', 'source_tool_call_id'],
+    columns: [id(), ref('process_id', 'process'), text('conversation_id'), text('source_turn_id'), text('source_tool_call_id'), text('created_at')]
   }),
   domain({
     key: 'ProcessOutputChunk', table: 'process_output_chunk', repository: 'ProcessOutputChunkRepository', codec: 'ProcessOutputChunkRowCodec',
@@ -166,5 +214,28 @@ export const EXECUTION_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     mutations: ['insert'], client: 'summary', deletePolicy: 'dataset-reset-only',
     indexes: ['process_id UNIQUE'],
     columns: [id(), text('process_id'), text('outcome'), integer('exit_code', { nullable: true }), text('exit_signal', { nullable: true }), text('wrapper_nonce'), text('start_fingerprint'), text('received_at')]
+  }),
+  domain({
+    key: 'ProcessCompletionDispatch', table: 'process_completion_dispatch', repository: 'ProcessCompletionDispatchRepository', codec: 'ProcessCompletionDispatchRowCodec',
+    mutations: ['insert', 'update'], client: 'none', deletePolicy: 'cascade-with-process-receipt',
+    indexes: ['process_receipt_id UNIQUE', 'state,next_attempt_at', 'claim_owner_host_boot_id,claim_expires_at'],
+    columns: [
+      id(), ref('process_receipt_id', 'process_receipt'), text('state'),
+      text('claim_owner_host_boot_id', { nullable: true }), integer('claim_generation', { defaultSql: '0' }),
+      text('claim_expires_at', { nullable: true }), integer('attempt_count', { defaultSql: '0' }),
+      integer('failure_count', { defaultSql: '0' }), text('next_attempt_at', { nullable: true }),
+      text('last_error', { nullable: true }), text('completed_at', { nullable: true }),
+      text('created_at'), text('updated_at')
+    ]
+  }),
+  domain({
+    key: 'ChildInterruptionProcessCleanup', table: 'child_interruption_process_cleanup', repository: 'ChildInterruptionProcessCleanupRepository', codec: 'ChildInterruptionProcessCleanupRowCodec',
+    mutations: ['insert', 'update'], client: 'none', deletePolicy: 'cascade-with-child-interruption',
+    indexes: ['interruption_request_id,process_id UNIQUE', 'state,updated_at', 'process_id'],
+    columns: [
+      id(), ref('interruption_request_id', 'child_interruption_request'), ref('process_id', 'process'),
+      text('state'), text('last_status', { nullable: true }), text('last_error', { nullable: true }),
+      text('created_at'), text('updated_at')
+    ]
   })
 ];

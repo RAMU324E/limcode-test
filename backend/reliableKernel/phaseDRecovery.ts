@@ -10,6 +10,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { TurnControlPlane } from './turnControlPlane';
+import { WorkEnvironmentTransferEffectDispatcher } from './workEnvironmentTransferEffects';
 
 export const PHASE_D_RECOVERY_EFFECT_INTENT_HANGING = 'recovery.effect-intent-hanging';
 export const PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED = 'recovery.file-change-unresolved';
@@ -43,7 +44,8 @@ function requireOperationOutcome(value: unknown): 'succeeded' | 'failed' | 'part
 
 /** Minimal registry: exactly the two Phase D-owned scans, not a general recovery rule engine. */
 export class PhaseDRecoveryScanner {
-  private readonly handlers: ReadonlyMap<PhaseDRecoveryId, () => Promise<PhaseDRecoveryResult>>;
+  private readonly handlers: ReadonlyMap<PhaseDRecoveryId, (signal?: AbortSignal) => Promise<PhaseDRecoveryResult>>;
+  private readonly workEnvironmentTransfers: WorkEnvironmentTransferEffectDispatcher;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -54,9 +56,10 @@ export class PhaseDRecoveryScanner {
     private readonly resolveWorkEnvironment: WorkEnvironmentBoundaryResolver,
     private readonly turns: TurnControlPlane
   ) {
-    this.handlers = new Map<PhaseDRecoveryId, () => Promise<PhaseDRecoveryResult>>([
-      [PHASE_D_RECOVERY_EFFECT_INTENT_HANGING, () => this.scanHangingEffects()],
-      [PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED, () => this.scanUnresolvedFileChanges()]
+    this.workEnvironmentTransfers = new WorkEnvironmentTransferEffectDispatcher(database, effects);
+    this.handlers = new Map<PhaseDRecoveryId, (signal?: AbortSignal) => Promise<PhaseDRecoveryResult>>([
+      [PHASE_D_RECOVERY_EFFECT_INTENT_HANGING, (signal) => this.scanHangingEffects(signal)],
+      [PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED, (signal) => this.scanUnresolvedFileChanges(signal)]
     ]);
   }
 
@@ -64,41 +67,61 @@ export class PhaseDRecoveryScanner {
     return [...this.handlers.keys()];
   }
 
-  public async run(id: PhaseDRecoveryId): Promise<PhaseDRecoveryResult> {
+  public async run(id: PhaseDRecoveryId, signal?: AbortSignal): Promise<PhaseDRecoveryResult> {
+    signal?.throwIfAborted();
     const handler = this.handlers.get(id);
     if (!handler) throw new Error(`Phase D does not own recovery scan ${String(id)}.`);
-    return handler();
+    return handler(signal);
   }
 
-  public async runAll(): Promise<PhaseDRecoveryResult[]> {
-    await this.reconcileCommittedFacts();
+  public async runAll(signal?: AbortSignal): Promise<PhaseDRecoveryResult[]> {
+    signal?.throwIfAborted();
+    // Close receipts already durable at the scan boundary before dispatched-effect recovery can
+    // classify them as missing. A second candidate read below closes receipts racing this pass.
+    await this.reconcileReceiptCandidates(signal);
     const results = [
-      await this.run(PHASE_D_RECOVERY_EFFECT_INTENT_HANGING),
-      await this.run(PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED)
+      await this.run(PHASE_D_RECOVERY_EFFECT_INTENT_HANGING, signal),
+      await this.run(PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED, signal)
     ];
-    await this.reconcileCommittedFacts();
+    await this.reconcileCommittedFacts(signal);
     return results;
   }
 
   /** Deterministic DB-only continuation; it is not a registered recovery stable ID. */
-  public async reconcileCommittedFacts(): Promise<{ receipts: number; toolResults: number }> {
-    let receipts = 0;
+  public async reconcileCommittedFacts(signal?: AbortSignal): Promise<{ receipts: number; toolResults: number }> {
+    signal?.throwIfAborted();
+    const receipts = await this.reconcileReceiptCandidates(signal);
     let toolResults = 0;
-    const receiptWritten = await listAllDomainRows(this.database, 'EffectIntent', { dispatch_state: 'receipt_written' });
-    for (const intent of receiptWritten) {
-      const rows = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
-      if (rows.length !== 1) throw new Error(`receipt_written EffectIntent ${String(intent.id)} must have one EffectReceipt.`);
-      const result = await this.resumePersistedReceipt(intent, rows[0]);
-      if (result !== undefined) receipts += 1;
-    }
+
     const activeTurns = await listAllDomainRows(this.database, 'Turn', { status: 'active' });
     for (const turn of activeTurns) {
+      signal?.throwIfAborted();
       toolResults += (await this.effects.finalizeReadyInOrder(String(turn.id))).length;
     }
     return { receipts, toolResults };
   }
 
-  private async scanHangingEffects(): Promise<PhaseDRecoveryResult> {
+  private async reconcileReceiptCandidates(signal?: AbortSignal): Promise<number> {
+    let receipts = 0;
+    const candidates = await this.database.effectReceiptReconciliationCandidates();
+    for (const candidate of candidates) {
+      signal?.throwIfAborted();
+      const snapshot = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('EffectIntent').get(candidate.effectIntentId),
+        DOMAIN_REPOSITORIES.domain('EffectReceipt').get(candidate.effectReceiptId)
+      ]);
+      const intent = snapshot.snapshot[0];
+      const receipt = snapshot.snapshot[1];
+      if (Array.isArray(intent) || !intent || Array.isArray(receipt) || !receipt) {
+        throw new Error(`Effect receipt recovery candidate ${candidate.effectIntentId} lost its immutable facts.`);
+      }
+      const result = await this.resumePersistedReceipt(intent, receipt);
+      if (result !== undefined) receipts += 1;
+    }
+    return receipts;
+  }
+
+  private async scanHangingEffects(signal?: AbortSignal): Promise<PhaseDRecoveryResult> {
     const terminal = new Set<string>();
     let scanned = 0;
     let reconciled = 0;
@@ -107,6 +130,7 @@ export class PhaseDRecoveryScanner {
     const intents = await listAllDomainRows(this.database, 'EffectIntent', { dispatch_state: 'dispatched' });
     scanned += intents.length;
     for (const intent of intents) {
+      signal?.throwIfAborted();
       const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
       if (receipts.length > 0) {
         if (receipts.length !== 1) throw new Error(`EffectIntent ${String(intent.id)} has multiple EffectReceipts.`);
@@ -122,6 +146,12 @@ export class PhaseDRecoveryScanner {
         }
         continue;
       }
+      // Several code-server browser clients may have independent Extension Hosts over the same
+      // Runtime root. A newly opened Host must not mistake another live Host's in-flight external
+      // effect for crash residue merely because the receipt has not arrived yet. Only the Turn's
+      // durable lease plus the lease Host's process identity is accepted as liveness proof; dead or
+      // missing owners still fall through to the conservative effect-specific recovery below.
+      if (await this.isOwnedByLiveTurnHost(intent)) continue;
       const source = {
         kind: 'recovery' as const,
         key: `recovery:effect-intent-hanging:${intent.id as string}`
@@ -143,6 +173,12 @@ export class PhaseDRecoveryScanner {
           break;
         case 'mcp_tool_call':
           result = await this.mcp.recoverDispatched({
+            source,
+            effectIntentId: intent.id as string
+          });
+          break;
+        case 'file_transfer':
+          result = await this.workEnvironmentTransfers.recoverDispatched({
             source,
             effectIntentId: intent.id as string
           });
@@ -178,22 +214,49 @@ export class PhaseDRecoveryScanner {
     };
   }
 
+  private async isOwnedByLiveTurnHost(intent: DomainRow): Promise<boolean> {
+    const dispatchFence = await this.effects.readEffectDispatchFence(String(intent.id));
+    if (!dispatchFence) return false;
+    const attempts = await this.list('Attempt', { id: intent.attempt_id }, 2);
+    if (attempts.length !== 1) return false;
+    const operations = await this.list('Operation', { id: attempts[0].operation_id }, 2);
+    if (operations.length !== 1 || operations[0].tool_call_id === null) return false;
+    if (isTerminalOperationOutcome(operations[0].status)) return false;
+    const calls = await this.list('ToolCall', { id: operations[0].tool_call_id }, 2);
+    if (calls.length !== 1) return false;
+    const turns = await this.list('Turn', { id: calls[0].turn_id, status: 'active' }, 2);
+    if (turns.length !== 1) return false;
+    const leases = await this.list('ExecutionLease', { turn_id: turns[0].id }, 2);
+    if (leases.length !== 1) return false;
+    const lease = leases[0];
+    if (
+      lease.id !== dispatchFence.executionLeaseId
+      || lease.conversation_id !== dispatchFence.conversationId
+      || lease.turn_id !== dispatchFence.turnId
+      || lease.owner_id !== dispatchFence.ownerId
+      || lease.host_boot_id !== dispatchFence.hostBootId
+      || requirePositiveBigInt(lease.generation, 'ExecutionLease.generation').toString() !== dispatchFence.generation
+      || typeof lease.expires_at !== 'string'
+      || Date.parse(lease.expires_at) <= Date.now()
+    ) return false;
+    return this.database.isHostAlive(dispatchFence.hostBootId);
+  }
+
   private async resumePersistedReceipt(
     intent: DomainRow,
     receipt: DomainRow
   ): Promise<ToolTerminalResult | null | undefined> {
-    const attempts = await this.list('Attempt', { id: intent.attempt_id }, 1);
-    if (attempts.length !== 1) throw new Error(`EffectIntent ${String(intent.id)} has no Attempt.`);
-    const operations = await this.list('Operation', { id: attempts[0].operation_id }, 1);
-    if (operations.length !== 1) throw new Error(`Attempt ${String(attempts[0].id)} has no Operation.`);
-    const operation = operations[0];
+    const attempt = (await this.list('Attempt', { id: intent.attempt_id }, 1))[0];
+    if (!attempt) throw new Error(`EffectIntent ${String(intent.id)} has no Attempt.`);
+    const operation = (await this.list('Operation', { id: attempt.operation_id }, 1))[0];
+    if (!operation) throw new Error(`Attempt ${String(attempt.id)} has no Operation.`);
     if (isTerminalOperationOutcome(operation.status)) {
       if (operation.tool_call_id !== null) {
-        const outcomes = await this.list('ToolOutcome', { tool_call_id: operation.tool_call_id }, 1);
-        if (outcomes.length === 1) return undefined;
+        const outcome = (await this.list('ToolOutcome', { tool_call_id: operation.tool_call_id }, 1))[0];
+        if (outcome) return undefined;
       } else if (intent.effect_kind === 'process_exit') {
-        const processReceipts = await this.list('ProcessReceipt', { process_id: operation.owner_id }, 1);
-        if (processReceipts.length === 1) return undefined;
+        const processReceipt = (await this.list('ProcessReceipt', { process_id: operation.owner_id }, 1))[0];
+        if (processReceipt) return undefined;
       }
     }
     const effectReceiptId = receipt.id as string;
@@ -204,6 +267,8 @@ export class PhaseDRecoveryScanner {
         return this.processes.reconcileStartReceipt(effectReceiptId);
       case 'mcp_tool_call':
         return this.mcp.reconcileEffectReceipt(effectReceiptId, 'recovery');
+      case 'file_transfer':
+        return this.workEnvironmentTransfers.reconcileEffectReceipt(effectReceiptId, 'recovery');
       case 'process_stop_request':
         return this.effects.completeOperation({
           source: { kind: 'recovery', key: `recovery:process-stop-reconcile:${effectReceiptId}` },
@@ -218,10 +283,11 @@ export class PhaseDRecoveryScanner {
     }
   }
 
-  private async scanUnresolvedFileChanges(): Promise<PhaseDRecoveryResult> {
+  private async scanUnresolvedFileChanges(signal?: AbortSignal): Promise<PhaseDRecoveryResult> {
     const pending = await listAllDomainRows(this.database, 'FileChangeSet', { status: 'pending' });
     const ordered: Array<{ changeSet: DomainRow; turnId: string; callSeq: bigint }> = [];
     for (const changeSet of pending) {
+      signal?.throwIfAborted();
       const calls = await this.list('ToolCall', { id: changeSet.tool_call_id }, 1);
       if (calls.length !== 1) throw new Error(`Pending FileChangeSet ${String(changeSet.id)} has no ToolCall.`);
       ordered.push({
@@ -236,6 +302,7 @@ export class PhaseDRecoveryScanner {
     const finalizedRecoveryTurns = new Set<string>();
     let reconciled = 0;
     for (const { changeSet, turnId } of ordered) {
+      signal?.throwIfAborted();
       const decisions = await this.list('FileChangeDecision', { change_set_id: changeSet.id }, 1);
       if (decisions.length > 0) continue;
       const recovery = await this.turns.recoveryFacts(turnId);

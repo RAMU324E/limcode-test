@@ -25,6 +25,11 @@ export interface DatabaseFoundationInspection {
   foreignKeyViolationCount: number;
 }
 
+export interface DatabaseIntegrityAudit {
+  quickCheck: 'ok';
+  foreignKeyViolationCount: 0;
+}
+
 export function configureWriterConnection(database: Database.Database): void {
   database.defaultSafeIntegers(true);
   database.pragma('journal_mode = WAL');
@@ -151,9 +156,23 @@ export function assertCurrentSchema(database: Database.Database, binding: RootBi
       || actual.epoch !== BigInt(RUNTIME_KERNEL_EPOCH)
     ) throw new Error(`schema_manifest mismatch for ${schema.key}.`);
   }
+}
 
+/**
+ * Full-file integrity work is intentionally separate from the startup schema contract check.
+ * Callers use this at explicit audit/migration boundaries; ordinary reader startup must not scan
+ * the complete database again after the writer has already accepted the current contract.
+ */
+export function auditDatabaseIntegrity(database: Database.Database): DatabaseIntegrityAudit {
+  const quickCheck = database.pragma('quick_check') as Array<{ quick_check: string }>;
+  if (quickCheck.length !== 1 || quickCheck[0]?.quick_check !== 'ok') {
+    throw new Error('Runtime database quick_check failed.');
+  }
   const violations = database.pragma('foreign_key_check') as unknown[];
-  if (violations.length > 0) throw new Error(`Runtime schema has ${violations.length} foreign key violations.`);
+  if (violations.length > 0) {
+    throw new Error(`Runtime database has ${violations.length} foreign key violations.`);
+  }
+  return { quickCheck: 'ok', foreignKeyViolationCount: 0 };
 }
 
 export function assertDatabaseBinding(database: Database.Database, binding: RootBinding): void {

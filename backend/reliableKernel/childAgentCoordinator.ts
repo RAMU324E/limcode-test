@@ -1,16 +1,34 @@
 import type {
   ReliableAgentLoop,
   ReliableAgentLoopResult,
-  ReliableAgentToolDispatchInput
+  ReliableAgentToolDispatchInput,
+  ReliableAgentToolPause,
+  ReliableAgentToolSettled
 } from './agentLoop';
 import type { AnswerControlPlane, RuntimeDeliveryControlPlane } from './answerDelivery';
 import type { ChildExecutionControlPlane, ChildExecutionSnapshot } from './childExecution';
 import type { EffectControlPlane, ToolTerminalResult } from './effectControlPlane';
 import type { ModelProviderControlPlane } from './modelProviderControlPlane';
+import type { CoordinateCompressionResult } from './contextCompressionCoordinator';
 import { stablePhaseFId } from './phaseFIdentity';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import { listAllDomainRows } from './repositoryPagination';
+import type {
+  TurnCommandContent,
+  TurnCommandResult,
+  TurnControlPlane,
+  TurnModelOverride
+} from './turnControlPlane';
+import type { CompressionCommandTarget, MessageRetryTarget } from '../../shared/protocol';
+import {
+  ExecutionHandoffError,
+  isExecutionHandoffError,
+  runWithoutExecutionLeaseFence,
+  runWithExecutionLeaseFence,
+  type ExecutionLeaseFence
+} from './executionLeaseFence';
 
 export interface ReliableChildAgentSelection {
   agentId: string;
@@ -29,29 +47,112 @@ export interface ReliableChildAgentCoordinatorDependencies {
   answers: AnswerControlPlane;
   deliveries: RuntimeDeliveryControlPlane;
   modelProvider: ModelProviderControlPlane;
+  turns: TurnControlPlane;
   agentLoop: ReliableAgentLoop;
   agents: ReliableChildAgentSelector;
+  deliveryWakeups?: {
+    notifyRuntimeDelivery(deliveryId: string): void;
+  };
+  ownedProcessCleanup?: {
+    notify(): void;
+  };
+  cancelTurnExecution?: (input: { turnId: string; reason: string }) => Promise<void>;
+  quiesceTurnExecution?: (input: { turnId: string; reason: ExecutionHandoffError }) => Promise<void>;
+  manualCompression?: {
+    admit(input: {
+      commandId: string;
+      conversationId: string;
+      compressSegmentCount: number;
+      target?: CompressionCommandTarget;
+      childExecution: { childExecutionId: string; leaseOwnerId: string };
+    }): Promise<TurnCommandResult>;
+    inspect(input: {
+      commandId: string;
+      conversationId: string;
+      target?: CompressionCommandTarget;
+    }): Promise<ReliableChildManualCompressionResult | null>;
+    driveIfPresent(input: {
+      conversationId: string;
+      turnId: string;
+    }): Promise<ReliableChildMaintenanceDriveResult | null>;
+  };
   now?: () => string;
 }
+
+export interface ReliableChildManualCompressionResult {
+  turnId: string;
+  deduplicated: boolean;
+  inProgress?: boolean;
+  terminal?: {
+    status: 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'outcome_unknown';
+    reason: string;
+  };
+  compression?: CoordinateCompressionResult;
+}
+
+export interface ReliableChildMaintenanceDriveResult {
+  terminalStatus: 'completed' | 'interrupted';
+  compression?: CoordinateCompressionResult;
+}
+
+type ReliableChildDriveResult = ReliableAgentLoopResult & {
+  compression?: CoordinateCompressionResult;
+};
+
+export interface ReliableChildAgentRecoveryReport {
+  spawnIntentsScanned: number;
+  spawnIntentsReconciled: number;
+  activeTurnsScanned: number;
+  resumedTurnIds: string[];
+  deferredTurnIds: string[];
+  continuationsAdmitted: string[];
+  terminalTurnsReconciled: string[];
+}
+
+const CHILD_WAKE_POLL_MS = 500;
+const CHILD_RECOVERY_CHANGE_SCAN_MS = 2_000;
+const CHILD_RECOVERY_SAFETY_SCAN_MS = 5_000;
+type ChildDispatchResult = ToolTerminalResult | ReliableAgentToolSettled | ReliableAgentToolPause;
 
 /**
  * Product orchestration for run_agent and AnswerBridge tools. Durable lifecycle facts stay in their
  * dedicated control planes; this coordinator only orders local dispatch, waiting and re-entry.
  */
 export class ReliableChildAgentCoordinator {
-  private readonly activeTurns = new Map<string, Promise<ReliableAgentLoopResult>>();
+  private readonly activeTurns = new Map<string, Promise<ReliableChildDriveResult>>();
   private readonly now: () => string;
+  private readonly childLeaseOwnerId: string;
   private disposing = false;
   private disposePromise: Promise<void> | undefined;
+  private handoff: ExecutionHandoffError | undefined;
+  private recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private recoveryPass: Promise<ReliableChildAgentRecoveryReport> | undefined;
+  private recoveryRerunRequested = false;
+  private recoveryPollingNeeded = false;
+  private recoveryObservedDataVersion: string | undefined;
+  private recoveryChangeScanAt = 0;
+  private recoverySafetyScanAt = 0;
+  private readonly cancellationSignaled = new Set<string>();
+  private readonly recoveryAfterDrive = new Set<string>();
+  private readonly waitingOwned = new Map<string, { childExecutionId: string; externalDataVersion: string }>();
+  private recoveryPollInFlight = false;
+  private recoveryPollTask: Promise<void> | undefined;
 
   public constructor(private readonly dependencies: ReliableChildAgentCoordinatorDependencies) {
     this.now = dependencies.now ?? (() => new Date().toISOString());
+    this.childLeaseOwnerId = `child-driver:${dependencies.database.hostBootId}`;
   }
 
-  public async dispatch(input: ReliableAgentToolDispatchInput): Promise<ToolTerminalResult | undefined> {
+  public async dispatch(
+    input: ReliableAgentToolDispatchInput,
+    signal?: AbortSignal
+  ): Promise<ChildDispatchResult | undefined> {
+    if (this.handoff) throw this.handoff;
+    const aborted = await this.settleUserAbort(input.toolCallId, signal, 'before-special-dispatch');
+    if (aborted) return aborted;
     switch (input.toolName) {
       case 'run_agent':
-        return this.runAgent(input);
+        return this.runAgent(input, signal);
       case 'submit_agent_answer':
         return this.submitAnswer(input);
       case 'read_agent_answer':
@@ -59,6 +160,283 @@ export class ReliableChildAgentCoordinator {
       default:
         return undefined;
     }
+  }
+
+  /** Parent interruption closes local foreground waits but intentionally leaves children running. */
+  public async cancelParentWaits(input: { turnId: string; reason: string }): Promise<void> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const calls = await listAllDomainRows(this.dependencies.database, 'ToolCall', {
+      turn_id: turnId
+    });
+    for (const call of calls) {
+      const toolCallId = requireId(call.id, 'ToolCall.id');
+      const waiting = await this.list('Operation', { tool_call_id: toolCallId, status: 'waiting_answer' }, 2);
+      if (waiting.length === 0) continue;
+      await this.dependencies.children.cancelForegroundWaitForToolCall({
+        toolCallId,
+        reason: input.reason,
+        sourceIdentity: `parent-turn-interrupt:${turnId}:${toolCallId}`
+      });
+    }
+  }
+
+  /** Replays durable child scheduling facts after Host restart; safe to call repeatedly. */
+  public recoverStartup(signal?: AbortSignal): Promise<ReliableChildAgentRecoveryReport> {
+    signal?.throwIfAborted();
+    if (this.recoveryPass) {
+      // Remember a wake that races an in-flight scan. Returning the same Promise without this
+      // level-trigger would lose facts committed behind the scan cursor.
+      this.recoveryRerunRequested = true;
+      return this.recoveryPass;
+    }
+    this.recoveryPollingNeeded = true;
+    const pass = runWithoutExecutionLeaseFence(async () => {
+      let aggregate: ReliableChildAgentRecoveryReport | undefined;
+      do {
+        signal?.throwIfAborted();
+        this.recoveryRerunRequested = false;
+        aggregate = mergeRecoveryReports(aggregate, await this.runRecoveryPass(signal));
+      } while (this.recoveryRerunRequested && !this.disposing && !this.handoff);
+      return aggregate ?? emptyRecoveryReport();
+    })
+      .finally(() => {
+        const rerun = this.recoveryRerunRequested;
+        if (this.recoveryPass === pass) this.recoveryPass = undefined;
+        if (rerun && !signal?.aborted && !this.disposing && !this.handoff) {
+          this.recoveryRerunRequested = false;
+          void this.recoverStartup().catch((error) => this.reportError(error, 'recovery-rerun'));
+        }
+        if (!signal?.aborted) this.ensureRecoveryPolling();
+      });
+    this.recoveryPass = pass;
+    return pass;
+  }
+
+  /** Routes an interaction/delivery wake only when immutable child scheduler membership exists. */
+  public async resume(turnIdInput: string): Promise<boolean> {
+    if (this.disposing || this.handoff) return false;
+    const turnId = requireId(turnIdInput, 'turnId');
+    const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (memberships.length === 0) return false;
+    if (memberships.length !== 1) throw new Error(`Child Turn ${turnId} has non-unique scheduler membership.`);
+    const childExecutionId = requireId(
+      memberships[0].child_execution_id,
+      'ChildExecutionTurnLink.child_execution_id'
+    );
+    this.waitingOwned.delete(turnId);
+    if (await this.dependencies.turns.ownsExecutionLease({
+      turnId,
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId
+    })) {
+      this.launch(childExecutionId, turnId);
+    } else {
+      this.triggerRecoveryPass();
+    }
+    return true;
+  }
+
+  /** Starts or queues a user-authored Turn without detaching the ChildExecution/AnswerBridge lineage. */
+  public async inputFromConversation(input: {
+    commandId: string;
+    childExecutionId: string;
+    conversationId: string;
+    content: TurnCommandContent;
+    contentType?: string;
+    executorAgentId?: string;
+    modelOverride?: TurnModelOverride;
+  }): Promise<TurnCommandResult> {
+    const childExecutionId = requireId(input.childExecutionId, 'childExecutionId');
+    const result = await this.dependencies.turns.input({
+      source: { kind: 'command', key: requireId(input.commandId, 'commandId') },
+      conversationId: requireId(input.conversationId, 'conversationId'),
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId,
+      leaseExpiresAt: leaseExpiry(this.timestamp(), 0),
+      content: input.content,
+      ...(input.contentType ? { contentType: input.contentType } : {}),
+      ...(input.executorAgentId ? { executorAgentId: input.executorAgentId } : {}),
+      ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
+      membership: { kind: 'child_execution', childExecutionId }
+    });
+    this.scheduleConversationCommand(childExecutionId, result);
+    return result;
+  }
+
+  /** Exact child retry: history rewind stays idle-fenced and the replacement Turn remains a child generation. */
+  public async retryFromConversation(input: {
+    commandId: string;
+    childExecutionId: string;
+    conversationId: string;
+    sourceTurnId: string;
+    target: MessageRetryTarget;
+    expectedMessageRevisionId?: string;
+    executorAgentId?: string;
+    modelOverride?: TurnModelOverride;
+  }): Promise<TurnCommandResult> {
+    const childExecutionId = requireId(input.childExecutionId, 'childExecutionId');
+    const result = await this.dependencies.turns.retry({
+      source: { kind: 'command', key: requireId(input.commandId, 'commandId') },
+      conversationId: requireId(input.conversationId, 'conversationId'),
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId,
+      leaseExpiresAt: leaseExpiry(this.timestamp(), 0),
+      sourceTurnId: requireId(input.sourceTurnId, 'sourceTurnId'),
+      target: input.target,
+      ...(input.expectedMessageRevisionId
+        ? { expectedMessageRevisionId: input.expectedMessageRevisionId }
+        : {}),
+      ...(input.executorAgentId ? { executorAgentId: input.executorAgentId } : {}),
+      ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
+      membership: { kind: 'child_execution', childExecutionId }
+    });
+    this.scheduleConversationCommand(childExecutionId, result);
+    return result;
+  }
+
+  /** Atomic child edit-and-run with the same ChildExecution generation and AnswerBridge. */
+  public async editAndRunFromConversation(input: {
+    commandId: string;
+    childExecutionId: string;
+    conversationId: string;
+    messageId: string;
+    expectedRevisionId?: string;
+    content: TurnCommandContent;
+    contentType?: string;
+    deleteFollowing?: boolean;
+    executorAgentId?: string;
+    modelOverride?: TurnModelOverride;
+  }): Promise<TurnCommandResult> {
+    const childExecutionId = requireId(input.childExecutionId, 'childExecutionId');
+    const result = await this.dependencies.turns.editAndRun({
+      source: { kind: 'command', key: requireId(input.commandId, 'commandId') },
+      conversationId: requireId(input.conversationId, 'conversationId'),
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId,
+      leaseExpiresAt: leaseExpiry(this.timestamp(), 0),
+      messageId: requireId(input.messageId, 'messageId'),
+      ...(input.expectedRevisionId ? { expectedRevisionId: input.expectedRevisionId } : {}),
+      content: input.content,
+      ...(input.contentType ? { contentType: input.contentType } : {}),
+      ...(input.deleteFollowing ? { deleteFollowing: true } : {}),
+      ...(input.executorAgentId ? { executorAgentId: input.executorAgentId } : {}),
+      ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
+      membership: { kind: 'child_execution', childExecutionId }
+    });
+    this.scheduleConversationCommand(childExecutionId, result);
+    return result;
+  }
+
+  /**
+   * Runs manual Context compression as a real generation of the owning ChildExecution. The same
+   * child scheduler therefore owns live drive, restart recovery and subtree interruption.
+   */
+  public async manualCompressionFromConversation(input: {
+    commandId: string;
+    childExecutionId: string;
+    conversationId: string;
+    compressSegmentCount: number;
+    target?: CompressionCommandTarget;
+  }): Promise<ReliableChildManualCompressionResult> {
+    const maintenance = this.dependencies.manualCompression;
+    if (!maintenance) throw new Error('Child scheduler 缺少手动压缩驱动。');
+    const childExecutionId = requireId(input.childExecutionId, 'childExecutionId');
+    const replay = await maintenance.inspect({
+      commandId: input.commandId,
+      conversationId: input.conversationId,
+      target: input.target
+    });
+    if (replay) return replay;
+    const started = await maintenance.admit({
+      commandId: input.commandId,
+      conversationId: input.conversationId,
+      compressSegmentCount: input.compressSegmentCount,
+      target: input.target,
+      childExecution: {
+        childExecutionId,
+        leaseOwnerId: this.childLeaseOwnerId
+      }
+    });
+    const turnId = requireId(started.turnId, 'Child manual compression Turn.id');
+    if (!started.admitted) {
+      const concurrentReplay = await maintenance.inspect({
+        commandId: input.commandId,
+        conversationId: input.conversationId,
+        target: input.target
+      });
+      if (concurrentReplay) return concurrentReplay;
+      throw new Error('Child 手动压缩维护 Turn 未取得执行租约。');
+    }
+    this.launch(childExecutionId, turnId);
+    const task = this.activeTurns.get(turnId);
+    if (!task) throw new Error('Child 手动压缩维护 Turn 未进入子调度器。');
+    const driven = await task;
+    if (driven.compression) {
+      return {
+        turnId,
+        deduplicated: started.deduplicated,
+        compression: driven.compression
+      };
+    }
+    const terminal = await maintenance.inspect({
+      commandId: input.commandId,
+      conversationId: input.conversationId,
+      target: input.target
+    });
+    if (!terminal) throw new Error('Child 手动压缩完成后缺少可回放的终态。');
+    return { ...terminal, deduplicated: started.deduplicated };
+  }
+
+  /** Commits and immediately wakes an interrupt through the scheduler that owns this child Turn. */
+  public async interruptFromConversation(input: {
+    commandId: string;
+    childExecutionId: string;
+    conversationId: string;
+    turnId: string;
+    expectedLeaseGeneration?: string;
+    reason: string;
+  }): Promise<TurnCommandResult> {
+    const childExecutionId = requireId(input.childExecutionId, 'childExecutionId');
+    const turnId = requireId(input.turnId, 'turnId');
+    const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (
+      memberships.length !== 1
+      || requireId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id') !== childExecutionId
+    ) {
+      throw new Error('Turn 不属于当前 ChildExecution 谱系。');
+    }
+    const result = await this.dependencies.turns.interrupt({
+      source: { kind: 'command', key: requireId(input.commandId, 'commandId') },
+      turnId,
+      ...(input.expectedLeaseGeneration
+        ? { expectedLeaseGeneration: input.expectedLeaseGeneration }
+        : {}),
+      reason: input.reason
+    });
+    this.waitingOwned.delete(turnId);
+    await this.cancelLocalChildTurn(turnId, input.reason);
+    if (!result.ignoredBecauseTerminal) this.launch(childExecutionId, turnId);
+    return result;
+  }
+
+  /**
+   * Converts a next-turn delivery for a completed Child Turn into a durable child-owned intent.
+   * The wake may be ACKed once that intent exists because startup recovery owns its admission.
+   */
+  public async runtimeDeliveryContinuation(input: {
+    deliveryId: string;
+    childExecutionId: string;
+    sourceTurnId: string;
+  }): Promise<{ acknowledged: boolean }> {
+    if (this.disposing || this.handoff) return { acknowledged: false };
+    const queued = await this.dependencies.children.queueRuntimeDeliveryContinuation({
+      deliveryId: requireId(input.deliveryId, 'deliveryId'),
+      childExecutionId: requireId(input.childExecutionId, 'childExecutionId'),
+      sourceTurnId: requireId(input.sourceTurnId, 'sourceTurnId')
+    });
+    if (!queued) return { acknowledged: false };
+    this.triggerRecoveryPass();
+    return { acknowledged: true };
   }
 
   /** Waits for currently launched child Turns and any tasks they launch before returning. */
@@ -74,17 +452,520 @@ export class ReliableChildAgentCoordinator {
   public dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
     this.disposing = true;
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = undefined;
+    this.waitingOwned.clear();
     this.disposePromise = (async () => {
-      const activeTurnIds = [...this.activeTurns.keys()];
-      await Promise.allSettled(activeTurnIds.map((turnId) =>
-        this.dependencies.modelProvider.cancelTurnDispatches(turnId, 'child coordinator disposing')
-      ));
+      await this.quiesce(this.handoff ?? new ExecutionHandoffError('Child coordinator is handing off.'));
+      await this.waitForRecoveryIdle();
       await this.waitForIdle();
     })();
     return this.disposePromise;
   }
 
-  private async runAgent(input: ReliableAgentToolDispatchInput): Promise<ToolTerminalResult> {
+  public async quiesce(reason: ExecutionHandoffError): Promise<void> {
+    this.handoff = reason;
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = undefined;
+    this.waitingOwned.clear();
+    await Promise.allSettled([...this.activeTurns.keys()].map((turnId) =>
+      this.dependencies.quiesceTurnExecution
+        ? this.dependencies.quiesceTurnExecution({ turnId, reason })
+        : this.dependencies.modelProvider.quiesceTurnDispatches(turnId, reason)
+    ));
+  }
+
+  private async runRecoveryPass(signal?: AbortSignal): Promise<ReliableChildAgentRecoveryReport> {
+    const report: ReliableChildAgentRecoveryReport = {
+      spawnIntentsScanned: 0,
+      spawnIntentsReconciled: 0,
+      activeTurnsScanned: 0,
+      resumedTurnIds: [],
+      deferredTurnIds: [],
+      continuationsAdmitted: [],
+      terminalTurnsReconciled: []
+    };
+    signal?.throwIfAborted();
+    if (this.disposing || this.handoff) return report;
+
+    // The EffectIntent state and its Attempt state advance monotonically. Read the two live intent
+    // states first, then use only live Attempts to close the receipt_written crash boundary. This
+    // keeps recovery proportional to unsettled work without treating a repository page as a cap.
+    const [
+      pendingSpawnIntents,
+      dispatchedSpawnIntents,
+      pendingAttempts,
+      dispatchedAttempts,
+      activeLinks
+    ] = await Promise.all([
+      listAllDomainRows(this.dependencies.database, 'EffectIntent', {
+        effect_kind: 'subagent_spawn',
+        dispatch_state: 'pending'
+      }),
+      listAllDomainRows(this.dependencies.database, 'EffectIntent', {
+        effect_kind: 'subagent_spawn',
+        dispatch_state: 'dispatched'
+      }),
+      listAllDomainRows(this.dependencies.database, 'Attempt', { status: 'pending' }),
+      listAllDomainRows(this.dependencies.database, 'Attempt', { status: 'dispatched' }),
+      listAllDomainRows(this.dependencies.database, 'ChildExecutionActiveTurnLink')
+    ]);
+    const spawnIntentById = new Map<string, DomainRow>();
+    for (const intent of [...pendingSpawnIntents, ...dispatchedSpawnIntents]) {
+      spawnIntentById.set(requireId(intent.id, 'EffectIntent.id'), intent);
+    }
+    for (const attempt of [...pendingAttempts, ...dispatchedAttempts]) {
+      signal?.throwIfAborted();
+      const attemptId = requireId(attempt.id, 'Attempt.id');
+      const intents = await this.list('EffectIntent', { attempt_id: attemptId }, 2);
+      if (intents.length > 1) throw new Error(`Attempt ${attemptId} has multiple EffectIntents.`);
+      const intent = intents[0];
+      if (
+        intent?.effect_kind === 'subagent_spawn'
+        && ['pending', 'dispatched', 'receipt_written'].includes(String(intent.dispatch_state))
+      ) {
+        spawnIntentById.set(requireId(intent.id, 'EffectIntent.id'), intent);
+      }
+    }
+    // Cancelling a not-yet-dispatched spawn atomically closes the Effect/Attempt before the
+    // ChildExecution is terminalized. Recover only that crash gap by walking current active links
+    // whose child is still `starting`; do not scan historical cancelled intents.
+    for (const link of activeLinks) {
+      signal?.throwIfAborted();
+      const childExecutionId = requireId(
+        link.child_execution_id,
+        'ChildExecutionActiveTurnLink.child_execution_id'
+      );
+      const child = await this.get('ChildExecution', childExecutionId);
+      if (child?.status !== 'starting') continue;
+      const operations = await this.list('Operation', {
+        owner_kind: 'child_execution',
+        owner_id: childExecutionId
+      }, 2);
+      if (operations.length !== 1) {
+        throw new Error(`Starting ChildExecution ${childExecutionId} must retain one spawn Operation.`);
+      }
+      const attempts = await listAllDomainRows(this.dependencies.database, 'Attempt', {
+        operation_id: requireId(operations[0].id, 'Operation.id')
+      });
+      for (const attempt of attempts) {
+        const intents = await this.list('EffectIntent', {
+          attempt_id: requireId(attempt.id, 'Attempt.id')
+        }, 2);
+        if (intents.length > 1) {
+          throw new Error(`Attempt ${String(attempt.id)} has multiple EffectIntents.`);
+        }
+        const intent = intents[0];
+        if (
+          intent?.effect_kind === 'subagent_spawn'
+          && intent.dispatch_state === 'cancelled_before_dispatch'
+        ) {
+          spawnIntentById.set(requireId(intent.id, 'EffectIntent.id'), intent);
+        }
+      }
+    }
+    const spawnIntents = [...spawnIntentById.values()]
+      .sort((left, right) => String(left.id).localeCompare(String(right.id)));
+    report.spawnIntentsScanned = spawnIntents.length;
+    for (const intent of spawnIntents) {
+      signal?.throwIfAborted();
+      const before = String(intent.dispatch_state);
+      const recovered = await this.dependencies.children.recoverSpawnIntent(
+        requireId(intent.id, 'EffectIntent.id')
+      );
+      if (before !== recovered.dispatchState || recovered.shouldDrive) report.spawnIntentsReconciled += 1;
+    }
+
+    const interruptingChildren = await listAllDomainRows(
+      this.dependencies.database,
+      'ChildExecution',
+      { status: 'interrupting' }
+    );
+    const activeLinkByChild = new Map(activeLinks.map((link) => [
+      requireId(link.child_execution_id, 'ChildExecutionActiveTurnLink.child_execution_id'),
+      link
+    ]));
+    const membershipById = new Map<string, DomainRow>();
+    for (const link of activeLinks) {
+      signal?.throwIfAborted();
+      const turnId = requireId(link.turn_id, 'ChildExecutionActiveTurnLink.turn_id');
+      const currentMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+      if (currentMemberships.length > 1) {
+        throw new Error(`Active child Turn ${turnId} has non-unique scheduler membership.`);
+      }
+      for (const membership of currentMemberships) {
+        membershipById.set(requireId(membership.id, 'ChildExecutionTurnLink.id'), membership);
+      }
+    }
+    for (const child of interruptingChildren) {
+      signal?.throwIfAborted();
+      const childExecutionId = requireId(child.id, 'ChildExecution.id');
+      const cancellationMemberships = await listAllDomainRows(
+        this.dependencies.database,
+        'ChildExecutionTurnLink',
+        { child_execution_id: childExecutionId }
+      );
+      for (const membership of cancellationMemberships) {
+        membershipById.set(requireId(membership.id, 'ChildExecutionTurnLink.id'), membership);
+      }
+    }
+    const memberships = [...membershipById.values()]
+      .sort((left, right) => String(left.id).localeCompare(String(right.id)));
+    const childById = new Map(interruptingChildren.map((child) => [
+      requireId(child.id, 'ChildExecution.id'),
+      child
+    ]));
+    const candidateChildIds = new Set(memberships.map((membership) =>
+      requireId(membership.child_execution_id, 'ChildExecutionTurnLink.child_execution_id')
+    ));
+    for (const childExecutionId of [...candidateChildIds].sort()) {
+      signal?.throwIfAborted();
+      if (childById.has(childExecutionId)) continue;
+      const child = await this.get('ChildExecution', childExecutionId);
+      if (child) childById.set(childExecutionId, child);
+    }
+    const turnById = new Map<string, DomainRow>();
+    const candidateTurnIds = new Set(memberships.map((membership) =>
+      requireId(membership.turn_id, 'ChildExecutionTurnLink.turn_id')
+    ));
+    for (const turnId of [...candidateTurnIds].sort()) {
+      signal?.throwIfAborted();
+      const turn = await this.get('Turn', turnId);
+      if (turn) turnById.set(turnId, turn);
+    }
+    for (const membership of memberships) {
+      signal?.throwIfAborted();
+      const childExecutionId = requireId(membership.child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
+      const turnId = requireId(membership.turn_id, 'ChildExecutionTurnLink.turn_id');
+      const child = childById.get(childExecutionId);
+      if (!child) throw new Error(`ChildExecutionTurnLink references missing ChildExecution ${childExecutionId}.`);
+      const cancellationRecovery = child.status === 'interrupting';
+      const isActivePointer = activeLinkByChild.get(childExecutionId)?.turn_id === turnId;
+      // Immutable membership is historical. Only the mutable active pointer or an unfinished
+      // cancellation lineage can require terminal reconciliation; scanning every old child answer
+      // here made recovery cost grow quadratically with long conversations.
+      if (!isActivePointer && !cancellationRecovery) continue;
+      const turn = turnById.get(turnId);
+      if (!turn || turn.status !== 'terminated') continue;
+      const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
+      if (snapshot.activeTurnLink?.turn_id === turnId) {
+        await this.dependencies.children.observeTurnTerminal(childExecutionId, turnId);
+      }
+      if (await this.reconcileTerminalChildTurn(childExecutionId, turnId)) {
+        report.terminalTurnsReconciled.push(turnId);
+      }
+      if (cancellationRecovery) {
+        await this.dependencies.children.reconcileCancelledLineage(
+          childExecutionId,
+          `Startup recovery observed terminal child Turn ${turnId}.`
+        );
+      }
+    }
+
+    for (const link of activeLinks) {
+      signal?.throwIfAborted();
+      const childExecutionId = requireId(link.child_execution_id, 'ChildExecutionActiveTurnLink.child_execution_id');
+      const turnId = requireId(link.turn_id, 'ChildExecutionActiveTurnLink.turn_id');
+      const turn = await this.get('Turn', turnId);
+      if (!turn || turn.status !== 'active') continue;
+      report.activeTurnsScanned += 1;
+      if (this.activeTurns.has(turnId)) {
+        await this.signalDurableChildCancellation(turnId);
+        continue;
+      }
+      const child = await this.get('ChildExecution', childExecutionId);
+      if (!child || child.status === 'starting') {
+        report.deferredTurnIds.push(turnId);
+        continue;
+      }
+      if (await this.dependencies.turns.ownsExecutionLease({
+        turnId,
+        leaseOwnerId: this.childLeaseOwnerId,
+        hostBootId: this.dependencies.database.hostBootId
+      })) {
+        this.launch(childExecutionId, turnId);
+        report.resumedTurnIds.push(turnId);
+        continue;
+      }
+      const facts = await this.dependencies.turns.recoveryFacts(turnId);
+      if (facts.judgment === 'finalize') {
+        await this.dependencies.turns.finalizeRecovery({
+          source: { kind: 'recovery', key: `child-driver-finalize:${turnId}` },
+          turnId,
+          terminalStatus: 'cancelled',
+          reason: 'Child scheduler recovered an active Turn without execution authority.'
+        });
+        await this.dependencies.children.observeTurnTerminal(childExecutionId, turnId);
+        await this.reconcileTerminalChildTurn(childExecutionId, turnId);
+        report.terminalTurnsReconciled.push(turnId);
+        continue;
+      }
+      if (facts.judgment !== 'resume') {
+        report.deferredTurnIds.push(turnId);
+        continue;
+      }
+      const claimed = await this.dependencies.turns.claimRecoveryExecution({
+        turnId,
+        leaseOwnerId: this.childLeaseOwnerId,
+        hostBootId: this.dependencies.database.hostBootId,
+        leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+      });
+      if (!claimed) {
+        report.deferredTurnIds.push(turnId);
+        continue;
+      }
+      this.launch(childExecutionId, turnId);
+      report.resumedTurnIds.push(turnId);
+    }
+
+    const pending = await this.dependencies.children.listPendingContinuations();
+    const firstByChild = new Map<string, typeof pending[number]>();
+    for (const entry of pending) if (!firstByChild.has(entry.childExecutionId)) firstByChild.set(entry.childExecutionId, entry);
+    for (const entry of firstByChild.values()) {
+      signal?.throwIfAborted();
+      const snapshot = await this.dependencies.children.readExecutionSnapshot(entry.childExecutionId);
+      if (['closed', 'needs_human', 'interrupting'].includes(
+        String(snapshot.childExecution.status)
+      )) continue;
+      if (snapshot.activeTurn?.status === 'active') {
+        if (!report.deferredTurnIds.includes(String(snapshot.activeTurn.id))) {
+          report.deferredTurnIds.push(requireId(snapshot.activeTurn.id, 'Turn.id'));
+        }
+        continue;
+      }
+      if (snapshot.activeTurn?.status === 'terminated' && snapshot.activeTurnLink) {
+        await this.dependencies.children.observeTurnTerminal(
+          entry.childExecutionId,
+          requireId(snapshot.activeTurn.id, 'Turn.id')
+        );
+      }
+      try {
+        const admitted = await this.dependencies.children.admitQueuedIntent({
+          sourceKey: `child-continuation-admit:${entry.turnIntentId}`,
+          childExecutionId: entry.childExecutionId,
+          turnIntentId: entry.turnIntentId,
+          leaseOwnerId: this.childLeaseOwnerId,
+          leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+        });
+        report.continuationsAdmitted.push(admitted.turnId);
+        this.launch(admitted.childExecutionId, admitted.turnId);
+      } catch (error) {
+        // Another Host may still be clearing the previous terminal pointer. Exact admission CAS
+        // remains authoritative; the level-triggered pass retries without inventing another Turn.
+        const latest = await this.dependencies.children.listPendingContinuations(entry.childExecutionId);
+        if (latest.some((candidate) => candidate.turnIntentId === entry.turnIntentId)) {
+          report.deferredTurnIds.push(entry.turnIntentId);
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    // Answer submission and parent delivery are intentionally separate commits. Reconcile the
+    // missing edge while this coordinator is online as well as at startup: a failed
+    // submit_agent_answer invocation must not strand its already durable answer behind a live-host
+    // fence that only the owning coordinator is allowed to cross.
+    signal?.throwIfAborted();
+    await this.reconcileCommittedAnswers(
+      activeLinks.map((link) => requireId(
+        link.child_execution_id,
+        'ChildExecutionActiveTurnLink.child_execution_id'
+      )),
+      signal
+    );
+    signal?.throwIfAborted();
+
+    this.recoveryPollingNeeded = report.deferredTurnIds.length > 0
+      || (await this.dependencies.children.listPendingContinuations()).length > 0;
+    if (this.recoveryPollingNeeded) {
+      this.recoveryObservedDataVersion = await this.dependencies.database.externalDataVersion();
+      this.recoveryChangeScanAt = Date.now() + CHILD_RECOVERY_CHANGE_SCAN_MS;
+      this.recoverySafetyScanAt = Date.now() + CHILD_RECOVERY_SAFETY_SCAN_MS;
+    } else {
+      this.recoveryObservedDataVersion = undefined;
+      this.recoveryChangeScanAt = 0;
+      this.recoverySafetyScanAt = 0;
+    }
+    return report;
+  }
+
+  private scheduleConversationCommand(childExecutionId: string, result: TurnCommandResult): void {
+    if (result.admitted && result.turnId) {
+      this.launch(childExecutionId, result.turnId);
+      return;
+    }
+    this.triggerRecoveryPass();
+  }
+
+  private ensureRecoveryPolling(): void {
+    if (
+      this.disposing
+      || this.handoff
+      || (!this.recoveryPollingNeeded && this.activeTurns.size === 0 && this.waitingOwned.size === 0)
+      || this.recoveryTimer
+    ) return;
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = undefined;
+      const task = this.pollChildWakes();
+      this.recoveryPollTask = task;
+      void task.catch((error) => {
+        if (this.disposing || this.handoff) return;
+        this.reportError(error, 'wake-poll');
+        this.triggerRecoveryPass();
+      }).finally(() => {
+        if (this.recoveryPollTask === task) this.recoveryPollTask = undefined;
+      });
+    }, CHILD_WAKE_POLL_MS);
+    this.recoveryTimer.unref?.();
+  }
+
+  private async pollChildWakes(): Promise<void> {
+    if (this.disposing || this.handoff || this.recoveryPollInFlight) return;
+    this.recoveryPollInFlight = true;
+    try {
+      for (const turnId of this.activeTurns.keys()) await this.signalDurableChildCancellation(turnId);
+      if (this.waitingOwned.size > 0) {
+        const version = await this.dependencies.database.externalDataVersion();
+        for (const [turnId, waiting] of [...this.waitingOwned]) {
+          if (waiting.externalDataVersion === version) continue;
+          this.waitingOwned.delete(turnId);
+          // A human interaction can arrive after the 30s execution lease expired. Route the
+          // level-trigger through resume(), which either launches the still-owned generation or
+          // asks recovery to claim a new one. Blindly launching here would reject on the expired
+          // fence and permanently lose the only cross-Host wake edge.
+          await this.resume(turnId);
+        }
+      }
+      if (this.recoveryPollingNeeded) {
+        const version = await this.dependencies.database.externalDataVersion();
+        if (
+          this.recoveryObservedDataVersion === undefined
+          || (version !== this.recoveryObservedDataVersion && Date.now() >= this.recoveryChangeScanAt)
+          || Date.now() >= this.recoverySafetyScanAt
+        ) await this.recoverStartup();
+      }
+    } finally {
+      this.recoveryPollInFlight = false;
+      this.ensureRecoveryPolling();
+    }
+  }
+
+  /** Database shutdown must not overtake a scan that was already admitted by the wake timer. */
+  private async waitForRecoveryIdle(): Promise<void> {
+    for (;;) {
+      const tasks: Promise<unknown>[] = [];
+      if (this.recoveryPollTask) tasks.push(this.recoveryPollTask);
+      if (this.recoveryPass) tasks.push(this.recoveryPass);
+      if (tasks.length === 0) return;
+      await Promise.allSettled(tasks);
+    }
+  }
+
+  private triggerRecoveryPass(): void {
+    if (this.disposing || this.handoff) return;
+    this.recoveryPollingNeeded = true;
+    this.recoveryObservedDataVersion = undefined;
+    this.recoveryChangeScanAt = 0;
+    this.recoverySafetyScanAt = 0;
+    void this.recoverStartup().catch((error) => this.reportError(error, 'recovery-pass'));
+  }
+
+  private async signalDurableChildCancellation(turnId: string): Promise<void> {
+    if (this.cancellationSignaled.has(turnId)) return;
+    const inputs = await listAllDomainRows(this.dependencies.database, 'PendingTurnInput', {
+      turn_id: turnId,
+      state: 'pending'
+    });
+    const request = inputs.find((row) => [
+      'interrupt_request',
+      'interrupt_current_turn',
+      'termination_request'
+    ].includes(String(row.input_kind)));
+    if (!request) return;
+    this.cancellationSignaled.add(turnId);
+    try {
+      await this.cancelLocalChildTurn(
+        turnId,
+        `Durable ${String(request.input_kind)} reached the owning child scheduler.`
+      );
+    } catch (error) {
+      this.cancellationSignaled.delete(turnId);
+      throw error;
+    }
+  }
+
+  private async cancelLocalChildTurn(turnId: string, reason: string): Promise<void> {
+    const fence = await this.dependencies.turns.executionLeaseFence({
+      turnId,
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId
+    });
+    if (!fence) return;
+    await runWithoutExecutionLeaseFence(() => runWithExecutionLeaseFence(fence, async () => {
+      if (this.dependencies.cancelTurnExecution) {
+        await this.dependencies.cancelTurnExecution({ turnId, reason });
+        return;
+      }
+      await this.dependencies.modelProvider.cancelTurnDispatches(turnId, reason);
+    }));
+  }
+
+  private async reconcileTerminalChildTurn(childExecutionId: string, turnId: string): Promise<boolean> {
+    const terminations = await this.list('TurnTermination', { turn_id: turnId }, 2);
+    if (terminations.length !== 1 || !['interrupted', 'cancelled'].includes(String(terminations[0].terminal_status))) {
+      return false;
+    }
+    const inputs = await listAllDomainRows(this.dependencies.database, 'PendingTurnInput', {
+      turn_id: turnId,
+      input_kind: 'termination_request'
+    });
+    // `interrupt_current_turn` is a normal continuation handoff. Only the explicit
+    // run_agent(mode=interrupt) termination_request may publish an interrupted partial answer.
+    const cancellationInput = inputs[0];
+    if (!cancellationInput) return false;
+    const reason = typeof terminations[0].reason === 'string' && terminations[0].reason.trim()
+      ? terminations[0].reason.trim()
+      : `Child Turn ${turnId} was interrupted.`;
+    const submitted = await this.dependencies.answers.ensureInterruptedPartial({
+      childExecutionId,
+      turnId,
+      reason
+    });
+    if (!submitted) return false;
+    const current = await this.dependencies.answers.readCurrent(submitted.answerBridgeId);
+    const detail = current.status === 'submitted'
+      ? {
+          ok: false,
+          status: 'interrupted',
+          partial: true,
+          interrupted: true,
+          answerBridgeId: current.answerBridgeId,
+          submissionId: current.submissionId,
+          title: current.title,
+          content: current.content
+        }
+      : {
+          ok: false,
+          partial: true,
+          interrupted: true,
+          answerBridgeId: submitted.answerBridgeId,
+          submissionId: submitted.submissionId
+        };
+    const continuationSettlements = await this.dependencies.children.settleContinuationWaits({
+      answerBridgeId: submitted.answerBridgeId,
+      sourceTurnId: turnId,
+      detail,
+      status: 'partial',
+      sourceIdentity: `interrupted-answer:${submitted.submissionId}`,
+      observedAt: this.timestamp()
+    });
+    if (!submitted.foregroundSettled && continuationSettlements.length === 0) {
+      await this.deliverBackgroundAnswer(submitted.answerBridgeId, submitted.inboxItemId);
+    }
+    return true;
+  }
+
+  private async runAgent(input: ReliableAgentToolDispatchInput, signal?: AbortSignal): Promise<ChildDispatchResult> {
     const args = requireRecord(input.arguments, 'run_agent arguments');
     const mode = optionalText(args.mode) || 'run';
     if (mode === 'interrupt') return this.interruptChild(input, args);
@@ -93,22 +974,27 @@ export class ReliableChildAgentCoordinator {
     const foregroundWaitMs = requireWaitMs(args.foregroundWaitMs);
     const answerBridgeId = optionalText(args.answerBridgeId);
     return answerBridgeId
-      ? this.continueChild(input, answerBridgeId, prompt, foregroundWaitMs)
-      : this.spawnChild(input, args, prompt, foregroundWaitMs);
+      ? this.continueChild(input, answerBridgeId, prompt, foregroundWaitMs, signal)
+      : this.spawnChild(input, args, prompt, foregroundWaitMs, signal);
   }
 
   private async spawnChild(
     input: ReliableAgentToolDispatchInput,
     args: { [key: string]: PlainJsonValue },
     prompt: string,
-    foregroundWaitMs: number
-  ): Promise<ToolTerminalResult> {
+    foregroundWaitMs: number,
+    signal?: AbortSignal
+  ): Promise<ChildDispatchResult> {
+    const beforeSelection = await this.settleUserAbort(input.toolCallId, signal, 'before-child-selection');
+    if (beforeSelection) return beforeSelection;
     const agentArgs = optionalRecord(args.agent);
     const selection = await this.dependencies.agents.resolve({
       ...(optionalText(agentArgs?.id) ? { agentId: optionalText(agentArgs?.id) } : {}),
       ...(optionalText(agentArgs?.type) ? { agentType: optionalText(agentArgs?.type) } : {})
     });
     const answerBridgeId = stablePhaseFId('answer_bridge', input.toolCallId);
+    const beforeSpawn = await this.settleUserAbort(input.toolCallId, signal, 'before-child-spawn');
+    if (beforeSpawn) return beforeSpawn;
     const completionPolicy = foregroundWaitMs === 0 ? 'background' as const : 'wait_for_answer' as const;
     const deadline = completionPolicy === 'wait_for_answer'
       ? new Date(Date.parse(this.timestamp()) + foregroundWaitMs).toISOString()
@@ -120,7 +1006,7 @@ export class ReliableChildAgentCoordinator {
       completionPolicy,
       ...(deadline ? { waitDeadlineAt: deadline } : {}),
       ...(selection.title ? { title: selection.title } : {}),
-      leaseOwnerId: `child:${input.toolCallId}`,
+      leaseOwnerId: this.childLeaseOwnerId,
       leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
     });
     if (spawned.answerBridgeId !== answerBridgeId) {
@@ -140,16 +1026,19 @@ export class ReliableChildAgentCoordinator {
     });
     await this.dependencies.children.reconcileSpawnReceipt(receipt.effectReceiptId);
     this.launch(spawned.childExecutionId, spawned.childTurnId);
-    if (completionPolicy === 'background') return this.requireTerminal(input.toolCallId);
-    return this.waitInitialForeground(input.toolCallId, spawned.childExecutionId, deadline!);
+    if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
+    return this.waitInitialForeground(input.toolCallId, spawned.childExecutionId, deadline!, signal);
   }
 
   private async continueChild(
     input: ReliableAgentToolDispatchInput,
     answerBridgeId: string,
     prompt: string,
-    foregroundWaitMs: number
-  ): Promise<ToolTerminalResult> {
+    foregroundWaitMs: number,
+    signal?: AbortSignal
+  ): Promise<ChildDispatchResult> {
+    const beforeSend = await this.settleUserAbort(input.toolCallId, signal, 'before-child-continuation', true);
+    if (beforeSend) return beforeSend;
     const snapshot = await this.snapshotForBridge(answerBridgeId);
     const activeTurnId = snapshot.activeTurn?.status === 'active'
       ? requireId(snapshot.activeTurn.id, 'Child active Turn.id')
@@ -168,12 +1057,44 @@ export class ReliableChildAgentCoordinator {
       ...(deadline ? { waitDeadlineAt: deadline } : {})
     });
 
+    const afterSend = await this.settleUserAbort(input.toolCallId, signal, 'after-child-continuation-queued', true);
+    if (afterSend) {
+      // The continuation intent is already durable. Its scheduler must keep progressing even
+      // though the parent stopped waiting for the answer.
+      this.triggerRecoveryPass();
+      return afterSend;
+    }
+
     if (activeTurnId) {
-      await this.dependencies.modelProvider.cancelTurnDispatches(
+      await this.cancelLocalChildTurn(
         activeTurnId,
         'run_agent continuation interrupted current child Turn'
       );
-      await this.awaitTurnTask(activeTurnId);
+      if (completionPolicy === 'background') {
+        this.triggerRecoveryPass();
+        return this.requireWaitSettlement(input.toolCallId);
+      }
+      const waitState = await this.awaitTurnTask(activeTurnId, signal, deadline);
+      if (waitState !== 'terminated') {
+        this.triggerRecoveryPass();
+        if (waitState === 'aborted') {
+          const aborted = await this.settleUserAbort(
+            input.toolCallId,
+            signal,
+            'child-continuation-waiting-for-prior-turn',
+            true
+          );
+          if (aborted) return aborted;
+        }
+        await this.dependencies.children.settleContinuationWaits({
+          answerBridgeId,
+          toolCallId: input.toolCallId,
+          detail: { timeout: true },
+          sourceIdentity: `foreground-timeout:${input.toolCallId}:${deadline}`,
+          observedAt: this.timestamp()
+        });
+        return this.requireWaitSettlement(input.toolCallId);
+      }
       const latest = await this.dependencies.children.readExecutionSnapshot(
         requireId(snapshot.childExecution.id, 'ChildExecution.id')
       );
@@ -186,31 +1107,38 @@ export class ReliableChildAgentCoordinator {
     }
 
     const admitted = await this.dependencies.children.admitQueuedIntent({
-      sourceKey: `run-agent-continuation-admit:${input.toolCallId}`,
+      sourceKey: `child-continuation-admit:${sent.turnIntentId}`,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
       turnIntentId: sent.turnIntentId,
-      leaseOwnerId: `child-continuation:${input.toolCallId}`,
+      leaseOwnerId: this.childLeaseOwnerId,
       leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
     });
     this.launch(admitted.childExecutionId, admitted.turnId);
-    if (completionPolicy === 'background') return this.requireTerminal(input.toolCallId);
-    return this.waitContinuationForeground(input.toolCallId, answerBridgeId, deadline!);
+    if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
+    return this.waitContinuationForeground(
+      input.toolCallId,
+      answerBridgeId,
+      admitted.turnId,
+      deadline!,
+      signal
+    );
   }
 
   private async interruptChild(
     input: ReliableAgentToolDispatchInput,
     args: { [key: string]: PlainJsonValue }
-  ): Promise<ToolTerminalResult> {
+  ): Promise<ChildDispatchResult> {
     const answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
     const snapshot = await this.snapshotForBridge(answerBridgeId);
-    const cancelled = await this.dependencies.children.cancelSubtree({
+    const cancelled = await this.dependencies.children.interruptSubtree({
       sourceKey: `run-agent-interrupt:${input.toolCallId}`,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
       reason: 'run_agent interrupt requested'
     });
     await Promise.all(cancelled.activeTurnIds.map((turnId) =>
-      this.dependencies.modelProvider.cancelTurnDispatches(turnId, 'run_agent interrupt requested')
+      this.cancelLocalChildTurn(turnId, 'run_agent interrupt requested')
     ));
+    this.dependencies.ownedProcessCleanup?.notify();
     return this.settleOwnTool(input.toolCallId, {
       ok: true,
       status: 'interrupt_committed',
@@ -221,57 +1149,73 @@ export class ReliableChildAgentCoordinator {
     }, `run-agent-interrupt:${input.toolCallId}`);
   }
 
-  private async submitAnswer(input: ReliableAgentToolDispatchInput): Promise<ToolTerminalResult> {
+  private async submitAnswer(input: ReliableAgentToolDispatchInput): Promise<ChildDispatchResult> {
     const args = requireRecord(input.arguments, 'submit_agent_answer arguments');
     const explicitBridgeId = optionalText(args.answerBridgeId);
     const answerBridgeId = explicitBridgeId || await this.defaultAnswerBridgeForTurn(input.turnId);
     const title = requireText(args.title, 'submit_agent_answer.title');
     const content = requireText(args.content, 'submit_agent_answer.content');
     const submissionId = stablePhaseFId('answer_submission', input.toolCallId, answerBridgeId);
-    const submitted = await this.dependencies.answers.submit({
-      answerBridgeId,
-      submissionId,
-      sourceTurnId: input.turnId,
-      title,
-      content,
-      contentType: 'text/plain'
-    });
-    const answerDetail = {
-      ok: true,
-      answerBridgeId,
-      title,
-      content,
-      submissionId
-    };
-    const continuationSettlements = await this.dependencies.children.settleContinuationWaits({
-      answerBridgeId,
-      detail: answerDetail,
-      sourceIdentity: `answer:${submissionId}`,
-      observedAt: this.timestamp()
-    });
-    if (!submitted.foregroundSettled && continuationSettlements.length === 0) {
-      await this.deliverBackgroundAnswer(answerBridgeId, submitted.inboxItemId);
+    try {
+      const submitted = await this.dependencies.answers.submit({
+        answerBridgeId,
+        submissionId,
+        sourceTurnId: input.turnId,
+        title,
+        content,
+        contentType: 'text/plain'
+      });
+      const answerDetail = {
+        ok: true,
+        answerBridgeId,
+        title,
+        content,
+        submissionId
+      };
+      if (!submitted.historicalReplay) {
+        const waits = await this.dependencies.answers.reconcileCommittedWaits(submissionId);
+        if (!waits.settledByAnswer) {
+          await this.deliverBackgroundAnswer(answerBridgeId, submitted.inboxItemId);
+        }
+      }
+      return this.settleOwnTool(
+        input.toolCallId,
+        answerDetail,
+        `submit-agent-answer:${submissionId}`
+      );
+    } catch (error) {
+      // The stable submission identity lets recovery distinguish validation failure (no fact) from
+      // a post-commit lost orchestration edge. Keep the original tool failure visible, but always
+      // schedule the idempotent scan so a committed answer never waits for restart/deadline expiry.
+      this.triggerRecoveryPass();
+      throw error;
     }
-    return this.settleOwnTool(
-      input.toolCallId,
-      answerDetail,
-      `submit-agent-answer:${submissionId}`
-    );
   }
 
-  private async readAnswer(input: ReliableAgentToolDispatchInput): Promise<ToolTerminalResult> {
+  private async readAnswer(input: ReliableAgentToolDispatchInput): Promise<ChildDispatchResult> {
     const args = requireRecord(input.arguments, 'read_agent_answer arguments');
     const answerBridgeId = requireText(args.answerBridgeId, 'read_agent_answer.answerBridgeId');
     const answer = await this.dependencies.answers.readCurrent(answerBridgeId);
     const detail = answer.status === 'submitted'
-      ? {
-          ok: true,
-          answerBridgeId,
-          title: answer.title,
-          content: answer.content,
-          submissionId: answer.submissionId,
-          interrupted: answer.interrupted
-        }
+      ? answer.interrupted
+        ? {
+            ok: false,
+            status: 'interrupted',
+            partial: true,
+            answerBridgeId,
+            title: answer.title,
+            content: answer.content,
+            submissionId: answer.submissionId,
+            interrupted: true
+          }
+        : {
+            ok: true,
+            answerBridgeId,
+            title: answer.title,
+            content: answer.content,
+            submissionId: answer.submissionId,
+            interrupted: false
+          }
       : answer.status === 'running'
         ? { ok: false, status: 'running', error: '对应子 Agent 仍在运行，尚未提交回答。', answerBridgeId }
         : answer.status === 'interrupted'
@@ -283,94 +1227,320 @@ export class ReliableChildAgentCoordinator {
   private launch(childExecutionId: string, turnId: string): void {
     if (this.disposing) throw new Error('ReliableChildAgentCoordinator is disposing.');
     if (this.activeTurns.has(turnId)) return;
-    const task = this.driveChild(childExecutionId, turnId);
+    this.waitingOwned.delete(turnId);
+    const task = runWithoutExecutionLeaseFence(() => this.driveChild(childExecutionId, turnId));
+    let failed = false;
     this.activeTurns.set(turnId, task);
-    void task.finally(() => {
+    this.ensureRecoveryPolling();
+    void task.catch((error) => {
+      if (this.disposing || this.handoff) return;
+      if (isExecutionHandoffError(error)) {
+        failed = true;
+        return;
+      }
+      // A failed scheduler edge must remain level-triggered. Otherwise a transient SQLite or
+      // Provider failure can remove the only in-memory task while leaving an active durable Turn.
+      failed = true;
+      this.reportError(error, 'drive-child', turnId);
+    }).finally(() => {
       if (this.activeTurns.get(turnId) === task) this.activeTurns.delete(turnId);
-    }).catch(() => undefined);
+      this.cancellationSignaled.delete(turnId);
+      const recover = failed || this.recoveryAfterDrive.delete(turnId);
+      if (recover && !this.disposing && !this.handoff) this.triggerRecoveryPass();
+      else this.ensureRecoveryPolling();
+    });
   }
 
-  private async driveChild(childExecutionId: string, turnId: string): Promise<ReliableAgentLoopResult> {
-    const result = await this.dependencies.agentLoop.drive(turnId);
-    if (result.terminalStatus !== 'waiting') {
+  private async driveChild(childExecutionId: string, turnId: string): Promise<ReliableChildDriveResult> {
+    const fence = await this.readChildExecutionFence(turnId);
+    const renewal = this.startChildLeaseRenewal(fence);
+    const externalVersionBeforeDrive = await this.dependencies.database.externalDataVersion();
+    let result: ReliableChildDriveResult;
+    try {
+      result = await runWithExecutionLeaseFence(fence, async () => {
+        if (this.dependencies.manualCompression) {
+          const turn = await this.get('Turn', turnId);
+          if (!turn) throw new Error(`Child Turn ${turnId} does not exist.`);
+          const maintenance = await this.dependencies.manualCompression.driveIfPresent({
+            conversationId: requireId(turn.conversation_id, 'Child Turn.conversation_id'),
+            turnId
+          });
+          if (maintenance) {
+            return {
+              turnId,
+              terminalStatus: maintenance.terminalStatus,
+              modelRequestIds: [],
+              assistantMessageIds: [],
+              toolCallIds: [],
+              ...(maintenance.compression ? { compression: maintenance.compression } : {})
+            };
+          }
+        }
+        return this.dependencies.agentLoop.drive(turnId);
+      });
+    } finally {
+      await renewal.stop();
+    }
+    if (result.terminalStatus === 'waiting') {
+      const externalVersionAfterDrive = await this.dependencies.database.externalDataVersion();
+      // Publish the waiting slot even when an external commit raced the drive. Keeping the older
+      // version makes the next targeted poll level-trigger the Turn *after* activeTurns cleanup.
+      // A shared boolean recovery flag could be overwritten by a concurrent recovery pass and
+      // strand the child forever at this exact boundary.
+      this.waitingOwned.set(turnId, {
+        childExecutionId,
+        externalDataVersion: externalVersionAfterDrive === externalVersionBeforeDrive
+          ? externalVersionAfterDrive
+          : externalVersionBeforeDrive
+      });
+    } else {
+      this.waitingOwned.delete(turnId);
       const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
+      const cancellationRecovery = snapshot.childExecution.status === 'interrupting';
       if (snapshot.activeTurn?.id === turnId && snapshot.activeTurn.status === 'terminated') {
         await this.dependencies.children.observeTurnTerminal(childExecutionId, turnId);
       }
+      await this.reconcileTerminalChildTurn(childExecutionId, turnId);
+      if (cancellationRecovery) {
+        await this.dependencies.children.reconcileCancelledLineage(
+          childExecutionId,
+          `Child Turn ${turnId} reached terminal state after cancellation.`
+        );
+      }
+      this.triggerRecoveryPass();
     }
     return result;
   }
 
-  private async awaitTurnTask(turnId: string): Promise<void> {
-    const task = this.activeTurns.get(turnId);
-    if (task) {
-      await task;
-      return;
-    }
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
+  private async readChildExecutionFence(turnId: string): Promise<ExecutionLeaseFence> {
+    const fence = await this.dependencies.turns.executionLeaseFence({
+      turnId,
+      leaseOwnerId: this.childLeaseOwnerId,
+      hostBootId: this.dependencies.database.hostBootId
+    });
+    if (!fence) throw new ExecutionHandoffError(`Child Turn ${turnId} is not owned by this child scheduler.`);
+    return fence;
+  }
+
+  private startChildLeaseRenewal(fence: ExecutionLeaseFence): { stop(): Promise<void> } {
+    let stopped = false;
+    let task = Promise.resolve();
+    const timer = setInterval(() => {
+      task = task.then(async () => {
+        if (stopped || this.handoff) return;
+        try {
+          const renewed = await this.dependencies.turns.renewExecutionLease({
+            fence,
+            leaseExpiresAt: new Date(Date.now() + 30_000).toISOString()
+          });
+          if (!renewed) throw new ExecutionHandoffError(
+            `Child Turn ${fence.turnId} lost its ExecutionLease generation.`
+          );
+        } catch (error) {
+          stopped = true;
+          clearInterval(timer);
+          const handoff = new ExecutionHandoffError(`Child Turn ${fence.turnId} lost its ExecutionLease generation.`);
+          this.recoveryAfterDrive.add(fence.turnId);
+          if (!isExecutionHandoffError(error)) {
+            this.reportError(error, 'renew-child-lease', fence.turnId);
+          }
+          try {
+            if (this.dependencies.quiesceTurnExecution) {
+              await this.dependencies.quiesceTurnExecution({ turnId: fence.turnId, reason: handoff });
+            } else {
+              await this.dependencies.modelProvider.quiesceTurnDispatches(fence.turnId, handoff);
+            }
+          } catch (quiesceError) {
+            this.reportError(quiesceError, 'quiesce-child-after-lease-loss', fence.turnId);
+          }
+        }
+      });
+    }, 10_000);
+    timer.unref();
+    return {
+      stop: async () => {
+        stopped = true;
+        clearInterval(timer);
+        await task;
+      }
+    };
+  }
+
+  private async awaitTurnTask(
+    turnId: string,
+    signal?: AbortSignal,
+    deadline?: string
+  ): Promise<'terminated' | 'aborted' | 'deadline'> {
+    const deadlineMs = deadline === undefined ? undefined : Date.parse(deadline);
+    for (;;) {
+      if (signal?.aborted) return 'aborted';
+      if (deadlineMs !== undefined && Date.now() >= deadlineMs) return 'deadline';
+      const task = this.activeTurns.get(turnId);
+      if (task) {
+        const completed = await Promise.race([
+          task.then(() => true),
+          delay(25).then(() => false)
+        ]);
+        if (completed) return 'terminated';
+        continue;
+      }
       const turn = await this.get('Turn', turnId);
-      if (!turn || turn.status === 'terminated') return;
+      if (!turn || turn.status === 'terminated') return 'terminated';
       await delay(25);
     }
-    throw new Error(`Timed out waiting for child Turn ${turnId} to terminate.`);
   }
 
   private async waitInitialForeground(
     toolCallId: string,
     childExecutionId: string,
-    deadline: string
-  ): Promise<ToolTerminalResult> {
+    deadline: string,
+    signal?: AbortSignal
+  ): Promise<ChildDispatchResult> {
     for (;;) {
-      const terminal = await this.dependencies.effects.readTerminalResult(toolCallId, false);
-      if (terminal) return terminal;
+      if (this.handoff) throw this.handoff;
+      const aborted = await this.settleUserAbort(toolCallId, signal, 'child-foreground-wait', true);
+      if (aborted) return aborted;
+      const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
+      if (settled) return this.childWaitResult(settled);
       const remaining = Date.parse(deadline) - Date.now();
       if (remaining <= 0) break;
-      const snapshot = await this.dependencies.children.wait(childExecutionId, Math.min(remaining, 1_000));
+      const snapshot = await this.dependencies.children.wait(
+        childExecutionId,
+        Math.min(remaining, signal ? 50 : 1_000)
+      );
       if (snapshot.currentSubmission) continue;
       if (!snapshot.activeTurn || snapshot.activeTurn.status === 'terminated') {
         await delay(Math.min(50, remaining));
       }
     }
     await this.dependencies.children.settleForegroundTimeout(childExecutionId, this.timestamp());
-    return this.requireTerminal(toolCallId);
+    return this.requireWaitSettlement(toolCallId);
   }
 
   private async waitContinuationForeground(
     toolCallId: string,
     answerBridgeId: string,
-    deadline: string
-  ): Promise<ToolTerminalResult> {
+    sourceTurnId: string,
+    deadline: string,
+    signal?: AbortSignal
+  ): Promise<ChildDispatchResult> {
     for (;;) {
-      const terminal = await this.dependencies.effects.readTerminalResult(toolCallId, false);
-      if (terminal) return terminal;
+      if (this.handoff) throw this.handoff;
+      const aborted = await this.settleUserAbort(toolCallId, signal, 'child-continuation-foreground-wait', true);
+      if (aborted) return aborted;
+      const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
+      if (settled) return this.childWaitResult(settled);
       const remaining = Date.parse(deadline) - Date.now();
       if (remaining <= 0) break;
       await delay(Math.min(50, remaining));
     }
     await this.dependencies.children.settleContinuationWaits({
       answerBridgeId,
+      sourceTurnId,
+      toolCallId,
       detail: { timeout: true },
       sourceIdentity: `foreground-timeout:${toolCallId}:${deadline}`,
       observedAt: this.timestamp()
     });
-    return this.requireTerminal(toolCallId);
+    return this.requireWaitSettlement(toolCallId);
   }
 
   private async deliverBackgroundAnswer(answerBridgeId: string, inboxItemId: string): Promise<void> {
     const snapshot = await this.snapshotForBridge(answerBridgeId);
     const parentTurnId = requireId(snapshot.parentLink.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id');
     const parentTurn = await this.get('Turn', parentTurnId);
-    if (!parentTurn) return;
+    if (!parentTurn) throw new Error(`Parent Turn ${parentTurnId} no longer exists for answer delivery.`);
     const targetConversationId = requireId(parentTurn.conversation_id, 'Parent Turn.conversation_id');
-    const active = parentTurn.status === 'active';
-    const delivery = await this.dependencies.deliveries.create({
+    const delivery = await this.dependencies.deliveries.createAutomatic({
       inboxItemId,
       targetConversationId,
-      targetTurnId: active ? parentTurnId : null,
-      phase: active ? 'current_turn' : 'notify_only'
+      sourceTurnId: parentTurnId
     });
-    if (active) await this.dependencies.deliveries.advance(requireId(delivery.delivery.id, 'RuntimeDelivery.id'));
+    const deliveryId = requireId(delivery.delivery.id, 'RuntimeDelivery.id');
+    if (this.dependencies.deliveryWakeups) {
+      this.dependencies.deliveryWakeups.notifyRuntimeDelivery(deliveryId);
+      return;
+    }
+    // Isolated control-plane tests may omit the product scheduler. Production always supplies the
+    // durable wake outbox; this direct advancement keeps the domain fixture self-contained.
+    if (delivery.delivery.phase !== 'notify_only') {
+      await this.dependencies.deliveries.advance(deliveryId);
+    }
+    // notify_only remains pending until the product notification scheduler performs the real wake
+    // and explicitly acknowledges it. A control-plane recovery pass is not that consumer.
+  }
+
+  private async reconcileCommittedAnswers(
+    activeChildExecutionIds: readonly string[],
+    signal?: AbortSignal
+  ): Promise<void> {
+    const currentSubmissionById = new Map<string, DomainRow>();
+    for (const childExecutionId of uniqueStrings(activeChildExecutionIds).sort()) {
+      signal?.throwIfAborted();
+      const bridges = await this.list('AnswerBridge', { child_execution_id: childExecutionId }, 2);
+      if (bridges.length > 1) {
+        throw new Error(`ChildExecution ${childExecutionId} has multiple AnswerBridges.`);
+      }
+      const bridge = bridges[0];
+      if (!bridge || bridge.current_submission_id === null) continue;
+      const submissionId = requireId(bridge.current_submission_id, 'AnswerBridge.current_submission_id');
+      const submission = await this.get('AnswerSubmission', submissionId);
+      if (!submission) throw new Error(`AnswerBridge references missing AnswerSubmission ${submissionId}.`);
+      currentSubmissionById.set(submissionId, submission);
+    }
+    const submissions = [...currentSubmissionById.values()]
+      .sort((left, right) => String(left.answer_bridge_id).localeCompare(String(right.answer_bridge_id))
+        || compareCounter(left.submission_seq, right.submission_seq));
+    for (const submission of submissions) {
+      const submissionId = requireId(submission.id, 'AnswerSubmission.id');
+      const sourceTurnId = requireId(submission.turn_id, 'AnswerSubmission.turn_id');
+      let disposition = await this.dependencies.answers.classifyDeliveryRecovery(submissionId);
+      if (disposition.kind === 'existing') {
+        for (const deliveryId of disposition.deliveryIds) this.notifyExistingDelivery(deliveryId);
+        continue;
+      }
+      const liveSourceTurnId = await this.dependencies.answers.liveSourceTurnForRecovery(
+        submissionId
+      );
+      const locallyOwned = liveSourceTurnId !== null && await this.dependencies.turns.ownsExecutionLease({
+        turnId: sourceTurnId,
+        leaseOwnerId: this.childLeaseOwnerId,
+        hostBootId: this.dependencies.database.hostBootId
+      });
+      if (liveSourceTurnId !== null && !locallyOwned) continue;
+      if (disposition.kind === 'settled_by_answer') {
+        await this.dependencies.answers.reconcileCommittedWaits(submissionId);
+        continue;
+      }
+      if (disposition.kind === 'deferred_live_owner' && !locallyOwned) continue;
+
+      const waits = await this.dependencies.answers.reconcileCommittedWaits(submissionId);
+      disposition = await this.dependencies.answers.classifyDeliveryRecovery(submissionId);
+      if (disposition.kind === 'settled_by_answer') continue;
+      if (disposition.kind === 'existing') {
+        for (const deliveryId of disposition.deliveryIds) this.notifyExistingDelivery(deliveryId);
+        continue;
+      }
+      if (disposition.kind === 'delivery_required') {
+        await this.deliverBackgroundAnswer(waits.answerBridgeId, waits.inboxItemId);
+        continue;
+      }
+
+      // classifyDeliveryRecovery deliberately defers every live source owner to avoid a second Host
+      // racing the in-process callback. This exact coordinator proved the current child lease above,
+      // so after replaying all waits it is the one safe writer for the remaining background edge.
+      if (await this.dependencies.turns.ownsExecutionLease({
+        turnId: sourceTurnId,
+        leaseOwnerId: this.childLeaseOwnerId,
+        hostBootId: this.dependencies.database.hostBootId
+      })) {
+        await this.deliverBackgroundAnswer(waits.answerBridgeId, waits.inboxItemId);
+      }
+    }
+  }
+
+  private notifyExistingDelivery(deliveryId: string): void {
+    this.dependencies.deliveryWakeups?.notifyRuntimeDelivery(deliveryId);
   }
 
   private async defaultAnswerBridgeForTurn(turnId: string): Promise<string> {
@@ -393,20 +1563,70 @@ export class ReliableChildAgentCoordinator {
     );
   }
 
-  private async settleOwnTool(toolCallId: string, detail: unknown, sourceKey: string): Promise<ToolTerminalResult> {
+  private async settleOwnTool(toolCallId: string, detail: unknown, sourceKey: string): Promise<ChildDispatchResult> {
     const settled = await this.dependencies.effects.settleWithoutEffect({
       source: { kind: 'internal', key: sourceKey },
       toolCallId,
       status: 'succeeded',
       detail
     });
-    return settled.terminal ?? this.requireTerminal(toolCallId);
+    return settled.terminal ?? {
+      disposition: 'settled',
+      toolCallId,
+      status: settled.status
+    };
   }
 
-  private async requireTerminal(toolCallId: string): Promise<ToolTerminalResult> {
-    const terminal = await this.dependencies.effects.readTerminalResult(toolCallId, true);
-    if (!terminal) throw new Error(`ToolCall ${toolCallId} has no terminal ToolModelResult.`);
-    return terminal;
+  private async settleUserAbort(
+    toolCallIdInput: string,
+    signal: AbortSignal | undefined,
+    scope: string,
+    childContinuesInBackground = false
+  ): Promise<ChildDispatchResult | undefined> {
+    if (!signal?.aborted) return undefined;
+    const toolCallId = requireId(toolCallIdInput, 'toolCallId');
+    if (isExecutionHandoffError(signal.reason)) throw signal.reason;
+    const reason = abortReason(signal.reason);
+    await this.dependencies.children.cancelForegroundWaitForToolCall({
+      toolCallId,
+      reason,
+      sourceIdentity: `user-abort:${toolCallId}`
+    });
+    const existing = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
+    if (existing) return this.childWaitResult(existing);
+    const settled = await this.dependencies.effects.settleWithoutEffect({
+      source: { kind: 'internal', key: `child-parent-abort:${toolCallId}` },
+      toolCallId,
+      status: 'cancelled',
+      detail: {
+        reason,
+        scope,
+        childExecutionContinuesInBackground: childContinuesInBackground
+      }
+    });
+    return settled.terminal ?? {
+      disposition: 'settled',
+      toolCallId,
+      status: settled.status
+    };
+  }
+
+  private async requireWaitSettlement(toolCallId: string): Promise<ChildDispatchResult> {
+    const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
+    if (!settled) throw new Error(`ToolCall ${toolCallId} has no durable child wait settlement.`);
+    return this.childWaitResult(settled);
+  }
+
+  private childWaitResult(settled: {
+    toolCallId: string;
+    status: ReliableAgentToolSettled['status'];
+    terminal?: ToolTerminalResult;
+  }): ChildDispatchResult {
+    return settled.terminal ?? {
+      disposition: 'settled',
+      toolCallId: settled.toolCallId,
+      status: settled.status
+    };
   }
 
   private async get(domain: string, id: string): Promise<DomainRow | null> {
@@ -427,6 +1647,13 @@ export class ReliableChildAgentCoordinator {
     if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw new TypeError('Coordinator clock must return ISO time.');
     return value;
   }
+
+  private reportError(error: unknown, operation: string, turnId?: string): void {
+    console.error('[LimCode] Reliable child Agent coordinator failed.', {
+      operation,
+      ...(turnId ? { turnId } : {})
+    }, error);
+  }
 }
 
 function promptWithAnswerBridge(prompt: string, answerBridgeId: string): string {
@@ -434,7 +1661,8 @@ function promptWithAnswerBridge(prompt: string, answerBridgeId: string): string 
 }
 
 function leaseExpiry(now: string, foregroundWaitMs: number): string {
-  return new Date(Date.parse(now) + Math.max(3_600_000, foregroundWaitMs + 60_000)).toISOString();
+  void foregroundWaitMs;
+  return new Date(Date.parse(now) + 30_000).toISOString();
 }
 
 function requireWaitMs(value: PlainJsonValue | undefined): number {
@@ -465,6 +1693,56 @@ function requireText(value: PlainJsonValue | undefined, label: string): string {
 
 function optionalText(value: PlainJsonValue | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function abortReason(value: unknown): string {
+  if (value instanceof Error && value.message.trim()) return value.message.trim().slice(0, 500);
+  if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 500);
+  return 'Parent Turn was cancelled while waiting for the child Agent.';
+}
+
+function emptyRecoveryReport(): ReliableChildAgentRecoveryReport {
+  return {
+    spawnIntentsScanned: 0,
+    spawnIntentsReconciled: 0,
+    activeTurnsScanned: 0,
+    resumedTurnIds: [],
+    deferredTurnIds: [],
+    continuationsAdmitted: [],
+    terminalTurnsReconciled: []
+  };
+}
+
+function mergeRecoveryReports(
+  aggregate: ReliableChildAgentRecoveryReport | undefined,
+  current: ReliableChildAgentRecoveryReport
+): ReliableChildAgentRecoveryReport {
+  if (!aggregate) return current;
+  return {
+    spawnIntentsScanned: aggregate.spawnIntentsScanned + current.spawnIntentsScanned,
+    spawnIntentsReconciled: aggregate.spawnIntentsReconciled + current.spawnIntentsReconciled,
+    activeTurnsScanned: aggregate.activeTurnsScanned + current.activeTurnsScanned,
+    resumedTurnIds: uniqueStrings([...aggregate.resumedTurnIds, ...current.resumedTurnIds]),
+    deferredTurnIds: uniqueStrings([...aggregate.deferredTurnIds, ...current.deferredTurnIds]),
+    continuationsAdmitted: uniqueStrings([
+      ...aggregate.continuationsAdmitted,
+      ...current.continuationsAdmitted
+    ]),
+    terminalTurnsReconciled: uniqueStrings([
+      ...aggregate.terminalTurnsReconciled,
+      ...current.terminalTurnsReconciled
+    ])
+  };
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)];
+}
+
+function compareCounter(left: unknown, right: unknown): number {
+  const a = typeof left === 'bigint' ? left : BigInt(String(left));
+  const b = typeof right === 'bigint' ? right : BigInt(String(right));
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function delay(ms: number): Promise<void> {

@@ -51,6 +51,12 @@ export const deleteTool: ToolDefinition = {
       readonly: false,
       defaultEnabled: true,
       defaultAutoApproveExecution: false,
+      defaultAutoExpand: true,
+      supportsChangeApply: true,
+      supportsDiffPreview: true,
+      defaultAutoOpenDiffPreview: false,
+      defaultAutoApplyChange: false,
+      defaultAutoApplyChangeDelaySeconds: 3,
       requiresApproval: true,
       checkpoint: { before: true, after: true }
     },

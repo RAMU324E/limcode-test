@@ -13,12 +13,19 @@ import {
   buildConversationHistoryForest,
   flattenConversationHistoryForest,
   selectConversationOriginLinks,
+  summarizeDescendantAgents,
+  type ConversationHistoryDescendantAgentSummary,
   type ConversationHistoryTreeNode
 } from '@shared/conversationHistoryTree';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import InputPanel from '@webview/components/ui/InputPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
-import { onSidebarMessage, postSidebarMessage } from './sidebarHost';
+import {
+  onSidebarMessage,
+  postSidebarMessage,
+  readSidebarHostState,
+  writeSidebarHostState
+} from './sidebarHost';
 import {
   SIDEBAR_MESSAGE,
   type ConversationHistoryScope,
@@ -45,6 +52,7 @@ interface VisibleHistoryTreeNode {
   childCount: number;
   hasChildren: boolean;
   expanded: boolean;
+  descendantAgents: ConversationHistoryDescendantAgentSummary;
 }
 
 const PAGE_SIZE = 50;
@@ -56,8 +64,13 @@ const originLinks = ref<ConversationOriginLinkRecord[]>([]);
 const deletingConversationIds = ref<Set<string>>(new Set());
 const removedConversationIds = ref<Set<string>>(new Set());
 const abortingConversationIds = ref<Set<string>>(new Set());
+const abortRequests = ref<Record<string, {
+  requestId: string;
+  turnId: string;
+  leaseGeneration: string;
+}>>({});
 const operationNotice = ref<{ text: string; kind: 'info' | 'error' }>();
-const expandedConversationIds = ref<Set<string>>(new Set());
+const expandedConversationIds = ref<Set<string>>(new Set(readSidebarHostState().expandedConversationIds));
 const projectFolders = ref<ProjectFolderCandidateRecord[]>([]);
 const activeScopeKind = ref<SidebarHistoryScopeKind>('currentProject');
 const activeProjectFolderUri = ref<string | undefined>();
@@ -161,12 +174,18 @@ const abortConfirmActions: ConfirmPanelAction[] = [
 let disposeMessages: (() => void) | undefined;
 let currentHistoryPageIdentity = '';
 let autoExpandedActiveConversationId: string | undefined;
+let activeAgentConversationIds = new Set<string>();
 let operationNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 
 onMounted(() => {
   disposeMessages = onSidebarMessage((message) => {
     if (message.type === SIDEBAR_MESSAGE.conversationOperationResult) {
+      if (
+        message.operation === 'abort'
+        && (!message.requestId || abortRequests.value[message.conversationId]?.requestId !== message.requestId)
+      ) return;
       setConversationOperationPending(message.operation, message.conversationId, false);
+      if (message.operation === 'abort') clearAbortRequest(message.conversationId);
       if (message.operation === 'delete' && message.ok) {
         const next = new Set(removedConversationIds.value);
         next.add(message.conversationId);
@@ -189,6 +208,12 @@ onMounted(() => {
       autoExpandedActiveConversationId = undefined;
     }
     entries.value = Array.isArray(message.history?.entries) ? message.history.entries : [];
+    for (const entry of entries.value) {
+      if (!entry.isRunning && abortingConversationIds.value.has(entry.id)) {
+        setConversationOperationPending('abort', entry.id, false);
+        clearAbortRequest(entry.id);
+      }
+    }
     originLinks.value = Array.isArray(message.history?.originLinks) ? message.history.originLinks : [];
     pageInfo.value = message.history?.pageInfo;
     activeScopeKind.value = nextScopeKind;
@@ -199,6 +224,7 @@ onMounted(() => {
     openConversations.value = Array.isArray(message.openConversations) ? message.openConversations : [];
     ensureActiveScopeVisible();
     ensureActiveConversationAncestorsExpanded();
+    ensureNewActiveAgentAncestorsExpanded();
   });
   postSidebarMessage({ type: SIDEBAR_MESSAGE.ready });
 });
@@ -316,11 +342,22 @@ function confirmAbortConversation(): void {
   const target = abortTarget.value;
   abortTarget.value = undefined;
   if (!target) return;
+  const existing = abortRequests.value[target.id];
+  if (!existing && (!target.activeTurnId || !target.executionLeaseGeneration)) {
+    showOperationNotice('运行身份已变化，请等待列表刷新后重试。', 'error');
+    return;
+  }
+  const request = existing ?? {
+    requestId: createMessageId(),
+    turnId: target.activeTurnId!,
+    leaseGeneration: target.executionLeaseGeneration!
+  };
   setConversationOperationPending('abort', target.id, true);
+  abortRequests.value = { ...abortRequests.value, [target.id]: request };
   postSidebarMessage({
     type: SIDEBAR_MESSAGE.abortConversation,
     conversationId: target.id,
-    requestId: createMessageId()
+    ...request
   });
 }
 
@@ -334,6 +371,7 @@ function toggleHistoryNode(node: VisibleHistoryTreeNode): void {
   if (next.has(node.entry.id)) next.delete(node.entry.id);
   else next.add(node.entry.id);
   expandedConversationIds.value = next;
+  persistExpandedConversationIds();
 }
 
 function onHistoryItemKeydown(event: KeyboardEvent, node: VisibleHistoryTreeNode): void {
@@ -354,6 +392,9 @@ function onHistoryItemKeydown(event: KeyboardEvent, node: VisibleHistoryTreeNode
 }
 
 function statusClass(entry: SidebarConversationHistoryEntry): string {
+  if (entry.runState === 'awaiting_parent') return 'status-streaming';
+  if (entry.runState === 'delivery_failed' || entry.runState === 'interrupted') return 'status-partial';
+  if (entry.runState === 'completed') return 'status-final';
   if (entry.isRunning) return 'status-running';
   if (entry.status === 'streaming') return 'status-streaming';
   if (entry.status === 'final') return 'status-final';
@@ -364,6 +405,13 @@ function statusClass(entry: SidebarConversationHistoryEntry): string {
 function statusText(entry: SidebarConversationHistoryEntry): string {
   if (abortingConversationIds.value.has(entry.id)) return '正在终止后台任务';
   const childAgentConversation = originLinkByConversationId.value.get(entry.id)?.originKind === 'agent';
+  if (childAgentConversation) {
+    if (entry.runState === 'running') return `子代理：${entry.runStatusLabel || '运行中'}`;
+    if (entry.runState === 'awaiting_parent') return '子代理：等待主 Agent 接收';
+    if (entry.runState === 'delivery_failed') return '子代理：答案交付失败';
+    if (entry.runState === 'interrupted') return '子代理已中断';
+    if (entry.runState === 'completed') return '子代理已完成';
+  }
   if (entry.isRunning) return childAgentConversation
     ? `子代理：${entry.runStatusLabel || '运行中'}`
     : `后台任务：${entry.runStatusLabel || '执行中'}`;
@@ -373,8 +421,35 @@ function statusText(entry: SidebarConversationHistoryEntry): string {
   return childAgentConversation ? '子代理尚未开始' : '暂无消息';
 }
 
+function showRunBadge(entry: SidebarConversationHistoryEntry): boolean {
+  if (entry.isRunning) return true;
+  return entry.runState === 'awaiting_parent'
+    || entry.runState === 'delivery_failed'
+    || entry.runState === 'interrupted';
+}
+
+function runBadgeText(entry: SidebarConversationHistoryEntry): string {
+  if (abortingConversationIds.value.has(entry.id)) return '正在终止';
+  if (entry.runState === 'awaiting_parent') return '等待主 Agent 接收';
+  if (entry.runState === 'delivery_failed') return '答案交付失败';
+  if (entry.runState === 'interrupted') return '已中断';
+  return entry.runStatusLabel || '执行中';
+}
+
+function runBadgeClass(entry: SidebarConversationHistoryEntry): string | undefined {
+  if (entry.runState === 'awaiting_parent') return 'is-awaiting-parent';
+  if (entry.runState === 'delivery_failed') return 'is-delivery-failed';
+  if (entry.runState === 'interrupted') return 'is-interrupted';
+  return undefined;
+}
+
+function historyPreviewText(entry: SidebarConversationHistoryEntry): string {
+  if (entry.preview) return entry.preview;
+  return entry.messageCount > 0 ? '消息内容暂不可用。' : '暂无消息，点击继续对话。';
+}
+
 function isConversationOperationPending(entry: SidebarConversationHistoryEntry): boolean {
-  return deletingConversationIds.value.has(entry.id) || abortingConversationIds.value.has(entry.id);
+  return deletingConversationIds.value.has(entry.id);
 }
 
 function setConversationOperationPending(operation: 'delete' | 'abort', conversationId: string, pending: boolean): void {
@@ -383,6 +458,13 @@ function setConversationOperationPending(operation: 'delete' | 'abort', conversa
   if (pending) next.add(conversationId);
   else next.delete(conversationId);
   source.value = next;
+}
+
+function clearAbortRequest(conversationId: string): void {
+  if (!(conversationId in abortRequests.value)) return;
+  const next = { ...abortRequests.value };
+  delete next[conversationId];
+  abortRequests.value = next;
 }
 
 function showOperationNotice(text: string, kind: 'info' | 'error'): void {
@@ -491,7 +573,8 @@ function flattenVisibleHistoryNodes(
       visualDepth: Math.min(depth, MAX_VISUAL_TREE_DEPTH),
       childCount: node.children.length,
       hasChildren,
-      expanded
+      expanded,
+      descendantAgents: summarizeDescendantAgents(node)
     });
     if (!expanded) return;
     for (const child of node.children) append(child, depth + 1);
@@ -526,7 +609,58 @@ function ensureActiveConversationAncestorsExpanded(): void {
     if (!parent) break;
     node = parent;
   }
-  if (changed) expandedConversationIds.value = next;
+  if (changed) {
+    expandedConversationIds.value = next;
+    persistExpandedConversationIds();
+  }
+}
+
+function ensureNewActiveAgentAncestorsExpanded(): void {
+  const allNodes = flattenConversationHistoryForest(historyForest.value);
+  const nodeById = new Map(allNodes.map((node) => [node.entry.id, node]));
+  const nextActiveAgentIds = new Set(allNodes
+    .filter((node) => node.originLink?.originKind === 'agent')
+    .filter((node) => node.entry.runState === 'running' || node.entry.isRunning)
+    .map((node) => node.entry.id));
+  const newlyActiveIds = [...nextActiveAgentIds].filter((id) => !activeAgentConversationIds.has(id));
+  activeAgentConversationIds = nextActiveAgentIds;
+  if (newlyActiveIds.length === 0) return;
+
+  const nextExpanded = new Set(expandedConversationIds.value);
+  let changed = false;
+  for (const activeId of newlyActiveIds) {
+    let node = nodeById.get(activeId);
+    while (node?.parentConversationId) {
+      if (!nextExpanded.has(node.parentConversationId)) {
+        nextExpanded.add(node.parentConversationId);
+        changed = true;
+      }
+      node = nodeById.get(node.parentConversationId);
+    }
+  }
+  if (!changed) return;
+  expandedConversationIds.value = nextExpanded;
+  persistExpandedConversationIds();
+}
+
+function persistExpandedConversationIds(): void {
+  writeSidebarHostState({
+    expandedConversationIds: [...expandedConversationIds.value].sort((left, right) => left.localeCompare(right))
+  });
+}
+
+function descendantAgentSummaryText(summary: ConversationHistoryDescendantAgentSummary): string {
+  const parts = [
+    summary.running > 0 ? `${summary.running} 运行中` : '',
+    summary.awaitingParent > 0 ? `${summary.awaitingParent} 待接收` : '',
+    summary.interrupted > 0 ? `${summary.interrupted} 已中断` : '',
+    summary.deliveryFailed > 0 ? `${summary.deliveryFailed} 交付失败` : ''
+  ].filter(Boolean);
+  return parts.join('，');
+}
+
+function hasDescendantAgentSummary(summary: ConversationHistoryDescendantAgentSummary): boolean {
+  return summary.running + summary.awaitingParent + summary.interrupted + summary.deliveryFailed > 0;
 }
 
 function historyPageIdentity(history: ConversationHistoryPageRecord): string {
@@ -664,12 +798,30 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
                 <div class="history-title">{{ displayConversationTitle(node.entry) }}</div>
                 <span v-if="originBadgeText(node.entry)" class="origin-badge">{{ originBadgeText(node.entry) }}</span>
               </div>
-              <div class="history-preview" :class="{ 'is-pending': node.entry.previewState === 'pending', 'is-empty': node.entry.previewState === 'empty' }">{{ node.entry.preview || '暂无消息，点击继续对话。' }}</div>
+              <div class="history-preview" :class="{ 'is-pending': node.entry.previewState === 'pending', 'is-empty': node.entry.previewState === 'empty' }">{{ historyPreviewText(node.entry) }}</div>
               <div class="history-meta">
                 <span>{{ historyMeta(node.entry) }}</span>
-                <span v-if="node.entry.isRunning" class="run-badge" :aria-label="statusText(node.entry)">
+                <span v-if="showRunBadge(node.entry)" class="run-badge" :class="runBadgeClass(node.entry)" :aria-label="statusText(node.entry)">
                   <span class="run-badge-dot" aria-hidden="true"></span>
-                  <span>{{ abortingConversationIds.has(node.entry.id) ? '正在终止' : (node.entry.runStatusLabel || '执行中') }}</span>
+                  <span>{{ runBadgeText(node.entry) }}</span>
+                </span>
+                <span
+                  v-if="node.hasChildren && !node.expanded && hasDescendantAgentSummary(node.descendantAgents)"
+                  class="descendant-agent-summary"
+                  :aria-label="`后代 Agent：${descendantAgentSummaryText(node.descendantAgents)}`"
+                >
+                  <span v-if="node.descendantAgents.running" class="descendant-agent-count is-running">
+                    {{ node.descendantAgents.running }} 运行
+                  </span>
+                  <span v-if="node.descendantAgents.awaitingParent" class="descendant-agent-count is-awaiting">
+                    {{ node.descendantAgents.awaitingParent }} 待接收
+                  </span>
+                  <span v-if="node.descendantAgents.interrupted" class="descendant-agent-count is-interrupted">
+                    {{ node.descendantAgents.interrupted }} 中断
+                  </span>
+                  <span v-if="node.descendantAgents.deliveryFailed" class="descendant-agent-count is-failed">
+                    {{ node.descendantAgents.deliveryFailed }} 失败
+                  </span>
                 </span>
               </div>
             </div>
@@ -687,8 +839,8 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
                 :disabled="!node.entry.isRunning || isConversationOperationPending(node.entry)"
                 :aria-hidden="!node.entry.isRunning"
                 :tabindex="node.entry.isRunning && !isConversationOperationPending(node.entry) ? 0 : -1"
-                :title="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务' : '终止后台任务'"
-                :aria-label="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务' : '终止后台任务'"
+                :title="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务，点击可重发' : '终止后台任务'"
+                :aria-label="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务，点击可重发' : '终止后台任务'"
                 @click="node.entry.isRunning && abortConversation(node.entry)"
               >
                 <IconPlayerStop class="history-action-icon" stroke="2" aria-hidden="true" />

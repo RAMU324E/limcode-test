@@ -46,6 +46,24 @@ if (!fs.existsSync(nativeSource)) {
   console.error(`缺少Linux x64 better-sqlite3 native addon：${nativeSource}`);
   process.exit(1);
 }
+const remoteCliProbe = childProcess.spawnSync(remoteCli, ['--list-extensions'], {
+  cwd: root,
+  encoding: 'utf8',
+  env: process.env,
+  maxBuffer: 8 * 1024 * 1024
+});
+const remoteCliProbeOutput = [remoteCliProbe.stdout, remoteCliProbe.stderr, remoteCliProbe.error?.message]
+  .filter(Boolean)
+  .join('\n');
+if (
+  remoteCliProbe.error
+  || remoteCliProbe.status !== 0
+  || /Command is only available in WSL or inside a Visual Studio Code terminal/i.test(remoteCliProbeOutput)
+) {
+  console.error(remoteCliProbeOutput || 'code-server remote CLI不可用。');
+  console.error('未修改已有Extension Host证据。');
+  process.exit(1);
+}
 
 uninstallSmokeExtensions();
 fs.rmSync(smokeRoot, { recursive: true, force: true });
@@ -98,6 +116,14 @@ const install = childProcess.spawnSync(remoteCli, ['--install-extension', artifa
 });
 if (install.error || install.status !== 0) {
   console.error([install.stdout, install.stderr, install.error?.message].filter(Boolean).join('\n'));
+  process.exit(1);
+}
+if (!installedSmokeExtensionIds().includes(extensionId)) {
+  console.error([install.stdout, install.stderr].filter(Boolean).join('\n'));
+  console.error(
+    '当前code-server remote CLI未确认smoke扩展已安装；'
+      + '请在目标VS Code/code-server的集成终端中执行，或使用隔离宿主生成证据。'
+  );
   process.exit(1);
 }
 console.log(install.stdout.trim());

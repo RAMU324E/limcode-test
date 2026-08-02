@@ -30,17 +30,21 @@ export class TurnOutputControlPlane {
 
   public async appendAssistantMessage(input: {
     turnId: string;
+    modelRequestId: string;
     sourceKey: string;
     content: string | Uint8Array;
     contentType?: string;
   }): Promise<AssistantMessageCommit> {
     const turnId = requireId(input.turnId, 'turnId');
+    const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
     const sourceKey = requireText(input.sourceKey, 'sourceKey');
     const contentType = requireText(input.contentType ?? 'application/vnd.limcode.message+json', 'contentType');
     const ids = outputIds(turnId, sourceKey);
     const identity = this.contentStore.identity(input.content, contentType);
+    const modelRequest = await this.requireExisting('ModelRequest', modelRequestId);
+    if (modelRequest.turn_id !== turnId) throw new Error('ModelRequest belongs to another Turn.');
     const existing = await this.maybeGet('Message', ids.messageId);
-    if (existing) return this.replay(ids, identity.id);
+    if (existing) return this.replay(ids, identity.id, modelRequestId);
 
     const turn = await this.requireExisting('Turn', turnId);
     if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
@@ -51,7 +55,8 @@ export class TurnOutputControlPlane {
     const context = await this.context.prepareMessageAppendMutation({
       conversationId,
       messageRevisionId: ids.revisionId,
-      contentObjectId: content.metadata.id
+      contentObjectId: content.metadata.id,
+      contentByteLength: content.metadata.byte_length
     });
     const now = requireText(this.now(), 'clock result');
 
@@ -101,6 +106,12 @@ export class TurnOutputControlPlane {
           role: 'model',
           created_at: now
         }),
+        DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').insert({
+          id: ids.modelRequestLinkId,
+          model_request_id: modelRequestId,
+          message_id: ids.messageId,
+          created_at: now
+        }),
         ...context.steps,
         DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
       ]);
@@ -116,17 +127,26 @@ export class TurnOutputControlPlane {
       };
     } catch (error) {
       if (!isUniqueOrAssertionFailure(error) || !await this.maybeGet('Message', ids.messageId)) throw error;
-      return this.replay(ids, identity.id);
+      return this.replay(ids, identity.id, modelRequestId);
     }
   }
 
-  private async replay(ids: ReturnType<typeof outputIds>, expectedContentObjectId: string): Promise<AssistantMessageCommit> {
+  private async replay(
+    ids: ReturnType<typeof outputIds>,
+    expectedContentObjectId: string,
+    expectedModelRequestId: string
+  ): Promise<AssistantMessageCommit> {
     const revision = await this.requireExisting('MessageRevision', ids.revisionId);
     if (revision.message_id !== ids.messageId || revision.content_object_id !== expectedContentObjectId || revision.role !== 'model') {
       throw new Error(`Assistant output ${ids.messageId} was replayed with different facts.`);
     }
     const membership = (await this.list('MessagePartOfConversation', { message_id: ids.messageId }, 2))[0];
     if (!membership) throw new Error(`Assistant output ${ids.messageId} lacks Conversation membership.`);
+    const requestLink = await this.requireExisting('ModelRequestMessageLink', ids.modelRequestLinkId);
+    if (
+      requestLink.model_request_id !== expectedModelRequestId
+      || requestLink.message_id !== ids.messageId
+    ) throw new Error(`Assistant output ${ids.messageId} has a conflicting ModelRequest link.`);
     const heads = await this.list('ConversationContextHeadLink', {
       conversation_id: requireId(membership.conversation_id, 'MessagePartOfConversation.conversation_id')
     }, 2);
@@ -159,6 +179,10 @@ export class TurnOutputControlPlane {
   }
 }
 
+export function assistantMessageIdFor(turnId: string, sourceKey: string): string {
+  return outputIds(requireId(turnId, 'turnId'), requireText(sourceKey, 'sourceKey')).messageId;
+}
+
 function outputIds(turnId: string, sourceKey: string) {
   const id = (kind: string): string => `rk_${kind}_${createHash('sha256')
     .update(JSON.stringify([turnId, sourceKey, kind]))
@@ -169,7 +193,8 @@ function outputIds(turnId: string, sourceKey: string) {
     revisionId: id('message_revision'),
     currentRevisionLinkId: id('message_current_revision'),
     membershipId: id('message_membership'),
-    turnLinkId: id('message_turn_link')
+    turnLinkId: id('message_turn_link'),
+    modelRequestLinkId: id('model_request_message_link')
   };
 }
 

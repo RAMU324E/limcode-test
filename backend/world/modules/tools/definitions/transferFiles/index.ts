@@ -75,7 +75,8 @@ export const transferFilesTool: ToolDefinition = {
     }, {
       activeWorkEnvironment: ctx?.workEnvironment,
       availableWorkEnvironments: ctx?.workEnvironments,
-      allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true)
+      allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true),
+      signal: ctx?.signal
     });
     return { ok: result.failCount === 0, output: result };
   }

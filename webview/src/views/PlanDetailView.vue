@@ -17,11 +17,15 @@ const toolCall = computed(() => toolCallById(session.toolCallId) ?? toolCallForP
 const toolResult = computed(() => toolCall.value
   ? reliableConversation.projection.value.toolResultByCallId[toolCall.value.id]
   : undefined);
-const planProposalId = computed(() => session.planProposalId || submitPlanOutputFromResult(toolResult.value)?.proposalId || '');
+const planProposalId = computed(() => session.planProposalId
+  || submitPlanOutputFromResult(toolResult.value)?.proposalId
+  || (toolCall.value ? `plan-proposal:${toolCall.value.id}` : ''));
 const request = computed<SubmitPlanToolRequestRecord | undefined>(() => submitPlanRequestFromArgs(toolCall.value?.args));
 const loaded = computed(() => Boolean(reliableConversation.feed.sessionId)
-  && reliableConversation.projection.value.missingToolArgumentIds.length === 0
-  && reliableConversation.projection.value.missingToolResultIds.length === 0);
+    && (!toolCall.value || (
+      !reliableConversation.projection.value.missingToolArgumentIds.includes(toolCall.value.id)
+      && !reliableConversation.projection.value.missingToolResultIds.includes(toolCall.value.id)
+    )));
 const planInteraction = computed(() => {
   const call = toolCall.value;
   if (!call) return undefined;
@@ -48,11 +52,11 @@ const subtitle = computed(() => [
 ].filter(Boolean).join(' · '));
 
 watch(
-  () => [
-    ...reliableConversation.projection.value.missingToolArgumentIds,
-    ...reliableConversation.projection.value.missingToolResultIds
-  ].join('|'),
-  reliableConversation.ensureDetails,
+  () => `${toolCall.value?.id ?? ''}:${toolCall.value?.updatedAt ?? 0}`,
+  () => reliableConversation.ensureDetails({
+    toolCallIds: toolCall.value ? [toolCall.value.id] : [],
+    priority: 'critical'
+  }),
   { immediate: true }
 );
 
@@ -69,7 +73,8 @@ function toolCallForProposal(proposalId: string): ToolCallRecord | undefined {
   if (!normalized) return undefined;
   return reliableConversation.projection.value.toolCalls.find((call) =>
     call.name === SUBMIT_PLAN_TOOL_NAME
-    && submitPlanOutputFromResult(reliableConversation.projection.value.toolResultByCallId[call.id])?.proposalId === normalized
+    && (submitPlanOutputFromResult(reliableConversation.projection.value.toolResultByCallId[call.id])?.proposalId === normalized
+      || `plan-proposal:${call.id}` === normalized)
   );
 }
 </script>
@@ -102,6 +107,7 @@ function toolCallForProposal(proposalId: string): ToolCallRecord | undefined {
           :proposal-id="planProposalId || undefined"
           :tool-call="toolCall"
           :result="toolResult"
+          :interaction-view="planInteraction"
           layout="full"
         />
         <div v-else class="plan-detail-empty">

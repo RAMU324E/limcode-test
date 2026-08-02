@@ -31,7 +31,7 @@ const RECOVERY_IDS = [
   'recovery.answer-inbox-invariant',
   'recovery.delivery-pending',
   'recovery.foreground-answer-wait-expired',
-  'recovery.cancelled-subtree-incomplete'
+  'recovery.interrupted-subtree-incomplete'
 ];
 const RECOVERY_OWNER = new Map([
   ['recovery.effect-intent-hanging', 'D'],
@@ -39,7 +39,7 @@ const RECOVERY_OWNER = new Map([
   ['recovery.answer-inbox-invariant', 'F'],
   ['recovery.delivery-pending', 'F'],
   ['recovery.foreground-answer-wait-expired', 'F'],
-  ['recovery.cancelled-subtree-incomplete', 'F']
+  ['recovery.interrupted-subtree-incomplete', 'F']
 ]);
 const F_RECOVERY_IDS = RECOVERY_IDS.filter((id) => RECOVERY_OWNER.get(id) === 'F');
 
@@ -66,6 +66,8 @@ const PLAN_FILES = [
 const REQUIRED_RUNTIME_DOMAINS = [
   'ContentObject',
   'Conversation',
+  'ProjectContext',
+  'ConversationProjectLink',
   'ConversationReuseLink',
   'ConversationBranchLink',
   'ConversationOriginLink',
@@ -94,6 +96,8 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'InteractionToolCallLink',
   'InteractionResponse',
   'ToolCall',
+  'ToolCallSourceLink',
+  'ToolCallPolicySnapshot',
   'ToolCallEvent',
   'ToolExecution',
   'Operation',
@@ -112,8 +116,11 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'FileMutationReceiptMember',
   'Process',
   'ProcessOriginLink',
+  'ProcessCompletionSourceLink',
   'ProcessOutputChunk',
   'ProcessReceipt',
+  'ProcessCompletionDispatch',
+  'ChildInterruptionProcessCleanup',
   'ContextSegment',
   'ContextSegmentSource',
   'ContextSequenceNode',
@@ -121,21 +128,29 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'ConversationContextHeadLink',
   'ModelContextProjection',
   'ModelRequest',
+  'ModelRequestMessageLink',
   'CompressionBlock',
   'CompressionBlockSource',
   'ModelStreamCheckpoint',
   'ModelStreamFence',
+  'TurnFinalOutputFence',
   'ChildExecution',
   'ChildExecutionParentLink',
   'ChildExecutionTurnLink',
   'ChildExecutionIntentLink',
   'ChildExecutionActiveTurnLink',
+  'ChildInterruptionRequest',
+  'ChildInterruptionLineageLink',
+  'ChildInterruptionTurnLink',
+  'ChildInterruptionIntentLink',
   'AnswerBridge',
   'AnswerSubmission',
   'AnswerPayload',
   'RuntimeInboxItem',
+  'RuntimeInboxPayloadLink',
   'RuntimeDelivery',
-  'RuntimeDeliveryInputLink'
+  'RuntimeDeliveryInputLink',
+  'RuntimeDeliveryWake'
 ];
 
 const CONFIGURATION_DOMAINS = [
@@ -231,7 +246,7 @@ const GATE_CHECK_IDS = {
     'candidate.recovery.answer-inbox-invariant',
     'candidate.recovery.pending-delivery',
     'candidate.recovery.foreground-wait-expired',
-    'candidate.recovery.cancelled-subtree-incomplete',
+    'candidate.recovery.interrupted-subtree-incomplete',
     'candidate.parent-handling-matrix'
   ],
   package: [
@@ -622,13 +637,20 @@ function validateAuthority(authority, migration, failures) {
   requireDomainIndex(domains, 'ContextSequenceRoot', 'root_node_id', failures);
   forbidDomainIndex(domains, 'ContextSequenceRoot', 'root_node_id UNIQUE', failures);
   requireDomainIndex(domains, 'ConversationContextHeadLink', 'conversation_id UNIQUE', failures);
-  requireDomainIndex(domains, 'RuntimeDelivery', 'inbox_item_id,target_conversation_id,phase,attempt_seq UNIQUE WHERE target_turn_id IS NULL', failures);
-  requireDomainIndex(domains, 'RuntimeDelivery', 'inbox_item_id,target_conversation_id,target_turn_id,phase,attempt_seq UNIQUE WHERE target_turn_id IS NOT NULL', failures);
+  requireDomainIndex(domains, 'ModelRequestMessageLink', 'model_request_id UNIQUE', failures);
+  requireDomainIndex(domains, 'ModelRequestMessageLink', 'message_id UNIQUE', failures);
+  requireDomainIndex(domains, 'RuntimeDelivery', 'inbox_item_id,target_conversation_id,attempt_seq UNIQUE', failures);
   requireDomainIndex(domains, 'RuntimeDeliveryInputLink', 'delivery_id UNIQUE', failures);
   requireDomainIndex(domains, 'RuntimeDeliveryInputLink', 'pending_turn_input_id UNIQUE', failures);
+  requireDomainIndex(domains, 'RuntimeInboxPayloadLink', 'inbox_item_id UNIQUE', failures);
+  requireDomainIndex(domains, 'RuntimeDeliveryWake', 'delivery_id UNIQUE', failures);
+  requireDomainIndex(domains, 'ProcessCompletionSourceLink', 'process_id UNIQUE', failures);
+  requireDomainIndex(domains, 'ProcessCompletionDispatch', 'process_receipt_id UNIQUE', failures);
   requireDomainIndex(domains, 'ConversationReuseLink', 'reuse_key UNIQUE', failures);
   requireDomainIndex(domains, 'ConversationBranchLink', 'target_conversation_id UNIQUE', failures);
   requireDomainIndex(domains, 'ConversationOriginLink', 'conversation_id UNIQUE', failures);
+  requireDomainIndex(domains, 'ProjectContext', 'uri UNIQUE', failures);
+  requireDomainIndex(domains, 'ConversationProjectLink', 'conversation_id UNIQUE', failures);
   const originDomain = domains.find((entry) => entry.key === 'ConversationOriginLink');
   if ((originDomain?.indexes ?? []).some((index) => index.includes('source_run'))) failures.push('ConversationOriginLink不得继续引用Run身份');
   for (const key of ['ChildExecution', 'ChildExecutionParentLink', 'ChildExecutionTurnLink', 'ChildExecutionIntentLink', 'ChildExecutionActiveTurnLink']) {
@@ -670,17 +692,28 @@ function validateIdentity(identity, failures) {
   failures.push(...exactSetProblems('identity recovery scan ID', RECOVERY_IDS, identity?.recoveryScan?.scanIds ?? []));
   if (identity?.recoveryScan?.authority !== 'tool.json#recoveryScan') failures.push('recovery scan细节必须由tool.json唯一权威定义');
   const delivery = JSON.stringify(identity?.deliveryIdentity ?? {});
-  for (const marker of ['WHERE target_turn_id IS NULL', 'WHERE target_turn_id IS NOT NULL', 'attempt_seq+1', 'retry_of_delivery_id', 'RuntimeDeliveryInputLink', 'handled_at']) {
+  for (const marker of ['inbox_item_id,target_conversation_id,attempt_seq', 'attempt_seq+1', 'retry_of_delivery_id', 'RuntimeDeliveryInputLink', 'handled_at']) {
     if (!delivery.includes(marker)) failures.push(`Delivery身份合同缺少${marker}`);
   }
 }
 
 function validateTool(tool, failures) {
-  failures.push(...exactSetProblems('工具执行链', ['ToolCall', 'ToolExecution', 'Operation', 'Attempt', 'EffectIntent', 'EffectReceipt', 'ToolOutcome', 'ToolModelResult'], tool?.executionChain ?? []));
+  failures.push(...exactSetProblems('工具执行链', [
+    'ToolCall',
+    'ToolCallSourceLink',
+    'ToolCallPolicySnapshot',
+    'ToolExecution',
+    'Operation',
+    'Attempt',
+    'EffectIntent',
+    'EffectReceipt',
+    'ToolOutcome',
+    'ToolModelResult'
+  ], tool?.executionChain ?? []));
   if (tool?.resultCardinality?.toolExecutionPerCall !== 'exactly-one') failures.push('每个ToolCall必须只有一个ToolExecution');
   if (tool?.resultCardinality?.toolModelResultPerCall !== 'exactly-one-after-terminal') failures.push('每个终态ToolCall必须只有一个ToolModelResult');
   if (tool?.resultCardinality?.proposalMayBeModelResult !== false) failures.push('提案不能冒充模型工具结果');
-  failures.push(...exactSetProblems('Effect kind', ['file_mutation', 'process_start', 'process_exit', 'process_stop_request', 'subagent_spawn', 'subagent_cancel', 'mcp_tool_call'], tool?.effectIntent?.effectKinds ?? []));
+  failures.push(...exactSetProblems('Effect kind', ['file_mutation', 'process_start', 'process_exit', 'process_stop_request', 'file_transfer', 'subagent_spawn', 'subagent_cancel', 'mcp_tool_call'], tool?.effectIntent?.effectKinds ?? []));
   for (const outcome of ['succeeded', 'failed', 'cancelled', 'conflict', 'outcome_unknown']) {
     if (!(tool?.effectReceipt?.outcomes ?? []).includes(outcome)) failures.push(`EffectReceipt缺少${outcome}`);
   }
@@ -699,17 +732,31 @@ function validateTool(tool, failures) {
   for (const marker of ['outcome_unknown', '禁止对裸 PID', 'exit receipt', 'RootBinding', 'getPaths']) if (!processText.includes(marker)) failures.push(`进程恢复合同缺少${marker}`);
 
   const output = tool?.processOutput;
-  for (const field of ['maxChunkBytes', 'maxRetainedBytesPerProcess', 'maxRetainedChunksPerProcess', 'maxTerminalTailBytesPerStream', 'maxFlushDelayMs']) {
+  for (const field of ['maxChunkBytes', 'maxTerminalTailBytesPerStream', 'maxFlushDelayMs']) {
     if (!positiveInteger(output?.[field])) failures.push(`tool.processOutput.${field}必须是正整数`);
   }
   if (output?.contentStorage !== 'cas') failures.push('ProcessOutputChunk正文必须进入CAS');
-  if (!String(output?.overflow ?? '').includes('继续 drain') || !String(output?.overflow ?? '').includes('不再写')) failures.push('进程输出超限后必须继续drain但停止增长CAS/metadata');
+  if ('maxRetainedBytesPerProcess' in (output ?? {}) || 'maxRetainedChunksPerProcess' in (output ?? {})) {
+    failures.push('进程输出合同不得保留每进程总字节或总chunk截断');
+  }
+  if (!String(output?.retention ?? '').includes('没有每进程总字节或总chunk上限')) failures.push('进程输出必须完整保留而非总量截断');
+  if (output?.registration?.keyset !== 'processId+chunkSeq' || !positiveInteger(output?.registration?.maxTransactionWireBytes)) {
+    failures.push('进程输出登记必须按processId+chunkSeq keyset及事务wire bytes分批');
+  }
+  if (!positiveInteger(output?.readPages?.maxPageContentBytes) || !String(output?.readPages?.rule ?? '').includes('完整输出')) {
+    failures.push('进程mode=output必须以可续页面完整遍历');
+  }
   failures.push(...exactSetProblems('进程输出计数', ['retainedBytes', 'retainedChunks', 'droppedBytes', 'truncated'], output?.processCounters ?? []));
 
   if (tool?.mcpCapability?.releaseDecision !== 'keep-settings-rebuild-effect' || tool?.mcpCapability?.effectKind !== 'mcp_tool_call') failures.push('MCP必须保留设置并通过mcp_tool_call Effect执行');
   if (tool?.mcpCapability?.connectionState !== 'memory-only-rebuild-on-extension-host-start') failures.push('MCP连接状态必须只在内存并于宿主启动重建');
   const mcpText = JSON.stringify(tool?.mcpCapability ?? {});
   for (const marker of ['outcome_unknown', '不自动重试', 'ToolModelResult']) if (!mcpText.includes(marker)) failures.push(`MCP Effect合同缺少${marker}`);
+  const transferText = JSON.stringify(tool?.workEnvironmentTransferCapability ?? {});
+  if (tool?.workEnvironmentTransferCapability?.effectKind !== 'file_transfer') failures.push('transfer必须通过file_transfer Effect执行');
+  for (const marker of ['outcome_unknown', '禁止自动重试', 'enabled=false', 'rejected']) {
+    if (!transferText.includes(marker)) failures.push(`transfer Effect合同缺少${marker}`);
+  }
 
   const scans = objectArray(tool?.recoveryScan?.scans, 'tool.recoveryScan.scans', failures);
   failures.push(...exactSetProblems('recovery scan ID', RECOVERY_IDS, scans.map((entry) => entry.id)));
@@ -747,6 +794,7 @@ function validateContext(context, failures) {
     'ConversationContextHeadLink',
     'ModelContextProjection',
     'ModelRequest',
+    'ModelRequestMessageLink',
     'CompressionBlock',
     'CompressionBlockSource',
     'ModelStreamCheckpoint',
@@ -773,7 +821,11 @@ function validateContext(context, failures) {
   }
   if (context?.replay?.mutatesRuntime !== false || context?.replay?.readsCurrentConversationHistory !== false) failures.push('dry-run和历史重放不得修改运行事实或改读当前会话历史');
 
-  failures.push(...exactSetProblems('Conversation fork领域', ['ConversationReuseLink', 'ConversationBranchLink', 'ConversationOriginLink'], context?.conversationFork?.domains ?? []));
+  failures.push(...exactSetProblems(
+    'Conversation fork领域',
+    ['ConversationReuseLink', 'ConversationBranchLink', 'ConversationOriginLink', 'ConversationProjectLink'],
+    context?.conversationFork?.domains ?? []
+  ));
   if (context?.conversationFork?.releaseDecision !== 'keep-relations-and-rebuild') failures.push('Conversation fork必须保留独立关系语义');
   if (context?.conversationFork?.legacyRunReference !== 'forbidden-use-source-turn-id-instead') failures.push('Conversation fork来源不得继续依赖Run');
 
@@ -793,9 +845,19 @@ function validateContext(context, failures) {
 }
 
 function validateSubagent(subagent, failures) {
-  failures.push(...exactSetProblems('子Agent操作', ['spawn', 'send', 'wait', 'list', 'cancel', 'cancel_subtree'], subagent?.operations ?? []));
-  if (subagent?.releaseDecisions?.cancelSubtree !== 'required-first-release') failures.push('cancel_subtree必须是首发必选能力');
-  failures.push(...exactSetProblems('ChildExecution lineage领域', ['ChildExecution', 'ChildExecutionParentLink', 'ChildExecutionTurnLink', 'ChildExecutionIntentLink', 'ChildExecutionActiveTurnLink'], subagent?.lineage?.domains ?? []));
+  failures.push(...exactSetProblems('子Agent操作', ['spawn', 'send', 'wait', 'list', 'interrupt_subtree'], subagent?.operations ?? []));
+  if (subagent?.releaseDecisions?.interruptSubtree !== 'required-first-release') failures.push('interrupt_subtree必须是首发必选能力');
+  failures.push(...exactSetProblems('ChildExecution lineage领域', [
+    'ChildExecution',
+    'ChildExecutionParentLink',
+    'ChildExecutionTurnLink',
+    'ChildExecutionIntentLink',
+    'ChildExecutionActiveTurnLink',
+    'ChildInterruptionRequest',
+    'ChildInterruptionLineageLink',
+    'ChildInterruptionTurnLink',
+    'ChildInterruptionIntentLink'
+  ], subagent?.lineage?.domains ?? []));
   const lineageText = JSON.stringify(subagent?.lineage ?? {});
   for (const marker of ['ChildExecutionParentLink', 'ActiveTurnLink 只表达当前活动 Turn', 'pending IntentLink']) {
     if (!lineageText.includes(marker)) failures.push(`ChildExecution lineage规则缺少${marker}`);
@@ -810,14 +872,14 @@ function validateSubagent(subagent, failures) {
   failures.push(...exactSetProblems('交付状态', ['pending', 'consumed', 'failed'], subagent?.delivery?.states ?? []));
   if (subagent?.delivery?.deadLetterQueue !== false) failures.push('第一版不建设独立死信队列');
   const deliveryText = JSON.stringify(subagent?.delivery ?? {});
-  for (const marker of ['WHERE target_turn_id IS NULL', 'WHERE target_turn_id IS NOT NULL', 'attempt_seq+1', 'retry_of_delivery_id', '旧failed行不复活']) {
+  for (const marker of ['inbox_item_id,target_conversation_id,attempt_seq', 'attempt_seq+1', 'retry_of_delivery_id', '旧failed行不复活']) {
     if (!deliveryText.includes(marker)) failures.push(`subagent Delivery合同缺少${marker}`);
   }
   if (subagent?.parentHandling?.deliveryConsumedMeansParentCompleted !== false) failures.push('答案送达不能冒充父Turn已经处理完成');
   if (subagent?.parentHandling?.source !== 'RuntimeDelivery.state + RuntimeDeliveryInputLink.handled_at') failures.push('parentHandling必须只读取对应InputLink.handled_at');
-  if (subagent?.cancel?.requestIsTerminal !== false) failures.push('发出终止请求不能冒充Turn已经结束');
-  const cancelText = JSON.stringify(subagent?.cancel ?? {});
-  for (const marker of ['ChildExecutionParentLink', 'ActiveTurnLink', 'pending ChildExecutionIntentLink']) if (!cancelText.includes(marker)) failures.push(`cancel_subtree规则缺少${marker}`);
+  if (subagent?.interrupt?.requestIsTerminal !== false) failures.push('发出终止请求不能冒充Turn已经结束');
+  const cancelText = JSON.stringify(subagent?.interrupt ?? {});
+  for (const marker of ['ChildExecutionParentLink', 'ActiveTurnLink', 'pending ChildExecutionIntentLink']) if (!cancelText.includes(marker)) failures.push(`interrupt_subtree规则缺少${marker}`);
   failures.push(...exactSetProblems('子Agent前端事实', ['childExecutionState', 'activeChildTurnState', 'answerSubmissionState', 'runtimeDeliveryState', 'parentHandlingState', 'terminationState'], subagent?.uiFacts ?? []));
   failures.push(...exactSetProblems('F recovery scan ID', F_RECOVERY_IDS, subagent?.recoveryOwnership?.scanIds ?? []));
   if (subagent?.recoveryOwnership?.stage !== 'F') failures.push('子代理recovery owner必须是F');
@@ -937,6 +999,7 @@ function validateCrossContract(documents, failures) {
   failures.push(...exactSetProblems('tool/identity recovery ID', tool.recoveryScan?.scans?.map((entry) => entry.id) ?? [], identity.recoveryScan?.scanIds ?? []));
   const effectKinds = new Set(tool.effectIntent?.effectKinds ?? []);
   if (tool.mcpCapability?.effectKind && !effectKinds.has(tool.mcpCapability.effectKind)) failures.push('MCP effectKind未进入EffectIntent全集');
+  if (tool.workEnvironmentTransferCapability?.effectKind && !effectKinds.has(tool.workEnvironmentTransferCapability.effectKind)) failures.push('transfer effectKind未进入EffectIntent全集');
   const candidateChecks = new Set(documents['gate-registry.json']?.validatorGroups?.find((entry) => entry.id === 'candidate')?.checks?.map((entry) => entry.id) ?? []);
   for (const required of [
     'candidate.context-compression-node-bound',

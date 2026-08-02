@@ -25,3 +25,4 @@ docs/architecture/*
 !docs/architecture/reliable-kernel/
 !docs/architecture/reliable-kernel/**
 /tests/
+/webview/tests/

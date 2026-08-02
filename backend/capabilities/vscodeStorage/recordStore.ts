@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -35,9 +36,21 @@ export interface SaveRecordStoreOptions {
 }
 
 const LOAD_RECORD_BATCH_SIZE = 32;
-const RECORD_STORE_LOCK_STALE_MS = 30 * 60_000;
-const RECORD_STORE_LOCK_WAIT_MS = 5 * 60_000;
+const RECORD_STORE_LOCK_STALE_MS = 30_000;
+// A full-store generation save can legitimately exceed a couple of seconds on remote or busy
+// filesystems. Keep the wait bounded for UI feedback, but do not misclassify an ordinary live
+// writer as a failed configuration mutation merely because its atomic save is still in flight.
+const RECORD_STORE_LOCK_WAIT_MS = 30_000;
+const RECORD_STORE_LOCK_INVALID_WAIT_MS = 100;
+const RECORD_STORE_LOCK_OWNER_FILE = 'owner.json';
 const recordStoreMutationQueues = new Map<string, Promise<void>>();
+
+interface RecordStoreLockMetadata {
+  ownerToken: string;
+  pid: number;
+  createdAt: number;
+  indexPath: string;
+}
 
 export async function loadRecordStore<TRecord extends { id: string }, TKey extends string>(
   root: vscode.Uri,
@@ -259,6 +272,14 @@ async function loadRecordFile<TRecord extends { id: string }, TKey extends strin
 async function listRecordFiles(root: vscode.Uri): Promise<string[]> {
   const recordsRoot = vscode.Uri.joinPath(root, RECORDS_DIR);
   try {
+    if (recordsRoot.scheme === 'file') {
+      const entries = await fs.readdir(recordsRoot.fsPath, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isFile())
+        .map((entry) => `${RECORDS_DIR}/${entry.name}`)
+        .filter((file) => file.toLowerCase().endsWith('.json'))
+        .sort();
+    }
     const entries = await vscode.workspace.fs.readDirectory(recordsRoot);
     return entries
       .filter(([, type]) => type === vscode.FileType.File)
@@ -273,7 +294,9 @@ async function listRecordFiles(root: vscode.Uri): Promise<string[]> {
 
 async function deleteRecordFile(root: vscode.Uri, file: string): Promise<void> {
   try {
-    await vscode.workspace.fs.delete(vscode.Uri.joinPath(root, ...file.split('/')));
+    const uri = vscode.Uri.joinPath(root, ...file.split('/'));
+    if (uri.scheme === 'file') await fs.rm(uri.fsPath, { force: true });
+    else await vscode.workspace.fs.delete(uri);
   } catch (error) {
     if (!isFileNotFound(error)) console.warn(`[LimCode] Failed to prune record file: ${file}`, error);
   }
@@ -303,58 +326,146 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
   const lockPath = `${indexUri.fsPath}.lock`;
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + RECORD_STORE_LOCK_WAIT_MS;
-  let handle: fs.FileHandle | undefined;
+  const metadata: RecordStoreLockMetadata = {
+    ownerToken: randomUUID(),
+    pid: process.pid,
+    createdAt: Date.now(),
+    indexPath: path.resolve(indexUri.fsPath)
+  };
 
-  while (!handle) {
+  for (;;) {
     try {
-      const candidate = await fs.open(lockPath, 'wx');
-      try {
-        await candidate.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now(), indexPath: indexUri.fsPath }), 'utf8');
-        handle = candidate;
-      } catch (error) {
-        await candidate.close().catch(() => undefined);
-        await fs.rm(lockPath, { force: true }).catch(() => undefined);
-        throw error;
-      }
+      await createRecordStoreLockDirectory(lockPath, metadata);
+      break;
     } catch (error) {
       if (!isAlreadyExistsError(error)) throw error;
-      if (await removeStaleRecordStoreLock(lockPath)) continue;
+      if (await removeStaleRecordStoreLock(lockPath, metadata.indexPath)) continue;
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for record store lock: ${indexUri.fsPath}`);
       await delay(25);
     }
   }
 
+  let result: T;
   try {
-    return await action();
-  } finally {
-    await handle.close().catch(() => undefined);
-    await fs.rm(lockPath, { force: true }).catch(() => undefined);
+    result = await action();
+  } catch (error) {
+    try {
+      await releaseRecordStoreLock(lockPath, metadata);
+    } catch (releaseError) {
+      throw Object.assign(
+        new Error(`Record store action and lock release both failed: ${lockPath}`),
+        { actionError: error, releaseError }
+      );
+    }
+    throw error;
   }
+  await releaseRecordStoreLock(lockPath, metadata);
+  return result;
 }
 
-async function removeStaleRecordStoreLock(lockPath: string): Promise<boolean> {
+async function removeStaleRecordStoreLock(lockPath: string, expectedIndexPath: string): Promise<boolean> {
   try {
-    const [raw, stat] = await Promise.all([
-      fs.readFile(lockPath, 'utf8').catch(() => ''),
-      fs.stat(lockPath)
-    ]);
-    const metadata = parseRecordStoreLockMetadata(raw);
-    const pid = typeof metadata?.pid === 'number' && Number.isInteger(metadata.pid) ? metadata.pid : undefined;
-    if (pid !== undefined && processIsAlive(pid)) return false;
-    const createdAt = typeof metadata?.createdAt === 'number' && Number.isFinite(metadata.createdAt) ? metadata.createdAt : stat.mtimeMs;
-    if (Date.now() - createdAt < RECORD_STORE_LOCK_STALE_MS && pid === undefined) return false;
-    await fs.rm(lockPath, { force: true });
+    const stat = await fs.stat(lockPath);
+    const raw = await fs.readFile(
+      stat.isDirectory() ? path.join(lockPath, RECORD_STORE_LOCK_OWNER_FILE) : lockPath,
+      'utf8'
+    ).catch(() => '');
+    const parsed = parseRecordStoreLockMetadata(raw);
+    const metadata = parsed && path.resolve(parsed.indexPath) === expectedIndexPath ? parsed : undefined;
+    const legacy = metadata ? undefined : parseLegacyRecordStoreLockMetadata(raw, expectedIndexPath);
+    const ageMs = Math.max(0, Date.now() - (metadata?.createdAt ?? legacy?.createdAt ?? stat.mtimeMs));
+    const staleAfterMs = metadata || legacy ? RECORD_STORE_LOCK_STALE_MS : RECORD_STORE_LOCK_INVALID_WAIT_MS;
+    if (ageMs < staleAfterMs) return false;
+    if ((metadata || legacy) && processIsAlive((metadata ?? legacy)!.pid)) return false;
+    const generation = metadata?.ownerToken
+      ?? (legacy ? `legacy-${legacy.pid}-${legacy.createdAt}` : `invalid-${Math.floor(stat.ctimeMs)}-${stat.size}`);
+    const quarantinePath = recordStoreLockQuarantinePath(lockPath, `${generation}-${randomUUID()}`);
+    await fs.rename(lockPath, quarantinePath);
+    // The rename is the fencing boundary: a new writer may acquire `lockPath` immediately, while
+    // cleanup only ever targets this detached generation. Failure to remove the quarantine must
+    // not resurrect or block the lock, but leaving every recovered generation behind would leak
+    // one directory per crashed writer forever.
+    await fs.rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
     return true;
   } catch (error) {
     if (isFileNotFound(error)) return true;
+    if (isAlreadyExistsError(error)) return false;
     return false;
   }
 }
 
-function parseRecordStoreLockMetadata(raw: string): { pid?: unknown; createdAt?: unknown } | undefined {
+async function createRecordStoreLockDirectory(
+  lockPath: string,
+  metadata: RecordStoreLockMetadata
+): Promise<void> {
+  const candidatePath = `${lockPath}.candidate-${metadata.ownerToken}`;
+  await fs.rm(candidatePath, { recursive: true, force: true });
+  await fs.mkdir(candidatePath);
+  let acquired = false;
+  try {
+    await fs.writeFile(
+      path.join(candidatePath, RECORD_STORE_LOCK_OWNER_FILE),
+      `${JSON.stringify(metadata)}\n`,
+      { encoding: 'utf8', mode: 0o600, flag: 'wx' }
+    );
+    await fs.rename(candidatePath, lockPath);
+    acquired = true;
+  } finally {
+    if (!acquired) await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function releaseRecordStoreLock(lockPath: string, expected: RecordStoreLockMetadata): Promise<void> {
+  const raw = await fs.readFile(path.join(lockPath, RECORD_STORE_LOCK_OWNER_FILE), 'utf8');
+  const actual = parseRecordStoreLockMetadata(raw);
+  if (
+    !actual
+    || actual.ownerToken !== expected.ownerToken
+    || actual.pid !== expected.pid
+    || actual.createdAt !== expected.createdAt
+    || path.resolve(actual.indexPath) !== expected.indexPath
+  ) {
+    throw new Error(`Record store lock owner changed; refusing to delete another writer's generation: ${lockPath}`);
+  }
+  const quarantinePath = recordStoreLockQuarantinePath(lockPath, `owner-${expected.ownerToken}`);
+  await fs.rename(lockPath, quarantinePath);
+  await fs.rm(quarantinePath, { recursive: true, force: false });
+}
+
+function recordStoreLockQuarantinePath(lockPath: string, generation: string): string {
+  return `${lockPath}.generation-${generation.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+}
+
+function parseRecordStoreLockMetadata(raw: string): RecordStoreLockMetadata | undefined {
   if (!raw) return undefined;
   try {
-    return JSON.parse(raw) as { pid?: unknown; createdAt?: unknown };
+    const value = JSON.parse(raw) as Partial<RecordStoreLockMetadata>;
+    if (
+      typeof value.ownerToken !== 'string' || !value.ownerToken.trim()
+      || typeof value.pid !== 'number' || !Number.isSafeInteger(value.pid) || value.pid <= 0
+      || typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt) || value.createdAt <= 0
+      || typeof value.indexPath !== 'string' || !value.indexPath.trim()
+    ) return undefined;
+    return value as RecordStoreLockMetadata;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseLegacyRecordStoreLockMetadata(
+  raw: string,
+  expectedIndexPath: string
+): Pick<RecordStoreLockMetadata, 'pid' | 'createdAt' | 'indexPath'> | undefined {
+  if (!raw) return undefined;
+  try {
+    const value = JSON.parse(raw) as Partial<RecordStoreLockMetadata>;
+    if (
+      typeof value.pid !== 'number' || !Number.isSafeInteger(value.pid) || value.pid <= 0
+      || typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt) || value.createdAt <= 0
+      || typeof value.indexPath !== 'string'
+      || path.resolve(value.indexPath) !== expectedIndexPath
+    ) return undefined;
+    return { pid: value.pid, createdAt: value.createdAt, indexPath: value.indexPath };
   } catch {
     return undefined;
   }
@@ -370,7 +481,8 @@ function processIsAlive(pid: number): boolean {
 }
 
 function isAlreadyExistsError(error: unknown): boolean {
-  return (error as { code?: unknown }).code === 'EEXIST';
+  const code = (error as { code?: unknown }).code;
+  return code === 'EEXIST' || code === 'ENOTEMPTY';
 }
 
 function delay(milliseconds: number): Promise<void> {

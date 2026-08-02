@@ -29,7 +29,7 @@ const PHASE_F_CHECKS = new Set([
   'candidate.recovery.answer-inbox-invariant',
   'candidate.recovery.pending-delivery',
   'candidate.recovery.foreground-wait-expired',
-  'candidate.recovery.cancelled-subtree-incomplete',
+  'candidate.recovery.interrupted-subtree-incomplete',
   'candidate.parent-handling-matrix'
 ]);
 if (!checkId || !PHASE_F_CHECKS.has(checkId)) {
@@ -66,7 +66,7 @@ const handlers = new Map([
   ['candidate.recovery.answer-inbox-invariant', checkRecoveryAnswerInbox],
   ['candidate.recovery.pending-delivery', checkRecoveryPendingDelivery],
   ['candidate.recovery.foreground-wait-expired', checkRecoveryForegroundWait],
-  ['candidate.recovery.cancelled-subtree-incomplete', checkRecoveryCancelledSubtree],
+  ['candidate.recovery.interrupted-subtree-incomplete', checkRecoveryInterruptedSubtree],
   ['candidate.parent-handling-matrix', checkParentHandlingMatrix]
 ]);
 
@@ -88,6 +88,16 @@ async function checkConversationForkLinks() {
     const faults = [];
     const metrics = {};
     const seeded = await seedParent(ctx, 'fork');
+    const projectUri = 'file:///workspace/fork-project';
+    await ctx.database.transaction(kernel.projectFolderAssignmentSteps({
+      conversationId: seeded.conversationId,
+      folder: { uri: projectUri, name: 'fork-project' },
+      now: new Date().toISOString()
+    }));
+    const sourceProjectLink = (await list(ctx.database, 'ConversationProjectLink', {
+      conversation_id: seeded.conversationId
+    }))[0];
+    assert.ok(sourceProjectLink);
     const context = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
     const sourceRootId = await context.currentHeadRootId(seeded.conversationId);
     const sourceRoot = await get(ctx.database, 'ContextSequenceRoot', sourceRootId);
@@ -121,6 +131,7 @@ async function checkConversationForkLinks() {
     assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: baseCommand.reuseKey })).length, 0);
     assert.equal((await list(ctx.database, 'ConversationBranchLink', { source_conversation_id: seeded.conversationId })).length, 0);
     assert.equal((await list(ctx.database, 'ConversationOriginLink', { source_conversation_id: seeded.conversationId })).length, 0);
+    assert.equal((await list(ctx.database, 'ConversationProjectLink', {})).length, 1);
     assert.equal((await list(ctx.database, 'Conversation', {})).length, 1);
     assertions.push('fork中间故障使target Conversation/root/head/三类Link整笔SQLite事务回滚');
     faults.push('fork writer transaction fault after relation inserts');
@@ -139,7 +150,11 @@ async function checkConversationForkLinks() {
     const origin = (await list(ctx.database, 'ConversationOriginLink', { conversation_id: forked.targetConversationId }))[0];
     assert.equal(origin.source_turn_id, seeded.turnId);
     assert.equal(Object.hasOwn(origin, 'source_run_id'), false);
-    assertions.push('Reuse/Branch/Origin具有独立Repository/Codec/table/mutation，origin只保存source_turn_id且fork root共享immutable node前缀');
+    const targetProjectLink = (await list(ctx.database, 'ConversationProjectLink', {
+      conversation_id: forked.targetConversationId
+    }))[0];
+    assert.equal(targetProjectLink.project_context_id, sourceProjectLink.project_context_id);
+    assertions.push('Reuse/Branch/Origin/ConversationProjectLink保持独立，fork原子继承ProjectContext且root共享immutable node前缀');
 
     const sourceAppend = await context.appendContent({
       conversationId: seeded.conversationId,
@@ -166,6 +181,12 @@ async function checkConversationForkLinks() {
     assert.equal((await list(ctx.database, 'ConversationReuseLink', { reuse_key: 'reuse-fork-stale' })).length, 0);
     faults.push('stale expected source head');
 
+    await seeded.control.terminal({
+      source: { kind: 'callback', key: 'fork-fixture-terminal-before-history-mutation' },
+      turnId: seeded.turnId,
+      terminalStatus: 'completed',
+      reason: 'fork fixture completed before soft-delete history mutation'
+    });
     await seeded.control.delete({
       source: { kind: 'command', key: 'fork-soft-delete-source' },
       conversationId: seeded.conversationId,
@@ -191,6 +212,12 @@ async function checkConversationForkLinks() {
     })));
     assert.equal(new Set(concurrent.map((entry) => entry.targetConversationId)).size, 2);
     assert.ok(concurrent.every((entry) => entry.sharedRootNodeId === sourceRoot.root_node_id));
+    for (const entry of concurrent) {
+      const projectLink = (await list(ctx.database, 'ConversationProjectLink', {
+        conversation_id: entry.targetConversationId
+      }))[0];
+      assert.equal(projectLink.project_context_id, sourceProjectLink.project_context_id);
+    }
     metrics.concurrentForks = concurrent.length;
     metrics.sharedPrefixCopiedNodes = 0;
     assertions.push('同一parent并发fork创建独立target且均引用同一共享前缀，没有复制历史正文或节点');
@@ -204,9 +231,22 @@ async function checkAnswerRestartDelivery() {
     const faults = [];
     const metrics = {};
     const seeded = await seedParent(ctx, 'answer');
+    await ctx.database.transaction(kernel.projectFolderAssignmentSteps({
+      conversationId: seeded.conversationId,
+      folder: { uri: 'file:///workspace/answer-parent', name: 'answer-parent' },
+      now: NOW
+    }));
     const spawned = await spawnStartedChild(ctx, seeded.turnId, 'answer', 'wait_for_answer', {
       deadline: '2026-08-01T02:00:00.000Z'
     });
+    const parentProjectLink = (await list(ctx.database, 'ConversationProjectLink', {
+      conversation_id: seeded.conversationId
+    }))[0];
+    const childProjectLink = (await list(ctx.database, 'ConversationProjectLink', {
+      conversation_id: spawned.childConversationId
+    }))[0];
+    assert.equal(childProjectLink.project_context_id, parentProjectLink.project_context_id);
+    assertions.push('Child Conversation 与 spawn 谱系在同一事务继承 Parent 的独立 ProjectContext 关系');
     const bridgeBefore = await get(ctx.database, 'AnswerBridge', spawned.answerBridgeId);
     const casBefore = await casFileCount(ctx.binding.paths.casRootPath);
     const originalTransaction = ctx.database.transaction.bind(ctx.database);
@@ -249,7 +289,10 @@ async function checkAnswerRestartDelivery() {
     assert.equal((await list(ctx.database, 'AnswerSubmission', { answer_bridge_id: spawned.answerBridgeId })).length, 1);
     assert.equal((await list(ctx.database, 'RuntimeInboxItem', { dedupe_key: `answer:${spawned.answerBridgeId}:${answerCommand.submissionId}` })).length, 1);
     assert.equal((await list(ctx.database, 'ToolModelResult', { tool_call_id: spawned.toolCallId })).length, 1);
+    assert.equal((await ctx.services.answers.classifyDeliveryRecovery(submitted.submissionId)).kind, 'settled_by_answer');
+    assert.equal((await list(ctx.database, 'RuntimeDelivery', { inbox_item_id: submitted.inboxItemId })).length, 0);
     assertions.push('AnswerSubmission insert、Bridge flip、Inbox dedupe与前台ToolCall结算原子提交，重复callback收敛且只有一个ToolModelResult');
+    assertions.push('恢复分类读取精确ToolOutcome答案身份，前台已消费的Submission不会被误投为第二份RuntimeDelivery');
 
     const notify = await ctx.services.deliveries.create({
       inboxItemId: submitted.inboxItemId,
@@ -260,8 +303,7 @@ async function checkAnswerRestartDelivery() {
       answerBridgeId: spawned.answerBridgeId,
       submissionId: 'answer-submission-two',
       sourceTurnId: spawned.childTurnId,
-      content: 'newer bridge answer',
-      interrupted: true
+      content: 'newer bridge answer'
     });
     assert.equal((await get(ctx.database, 'AnswerBridge', spawned.answerBridgeId)).current_submission_id, second.submissionId);
     assert.equal((await get(ctx.database, 'RuntimeDelivery', notify.delivery.id)).state, 'pending');
@@ -269,13 +311,13 @@ async function checkAnswerRestartDelivery() {
     assertions.push('Bridge切换到新submission后历史submission及其旧pending delivery继续保留');
 
     const current = await ctx.services.deliveries.create({
-      inboxItemId: submitted.inboxItemId,
+      inboxItemId: second.inboxItemId,
       targetConversationId: seeded.conversationId,
       targetTurnId: seeded.turnId,
       phase: 'current_turn'
     });
     const currentReplay = await ctx.services.deliveries.create({
-      inboxItemId: submitted.inboxItemId,
+      inboxItemId: second.inboxItemId,
       targetConversationId: seeded.conversationId,
       targetTurnId: seeded.turnId,
       phase: 'current_turn'
@@ -298,15 +340,21 @@ async function checkAnswerRestartDelivery() {
     assert.equal(handled.parentHandlingState, 'handled');
     assertions.push('Delivery注入与InputLink同事务，handled_at只响应精确input，无关PendingTurnInput不能猜测父处理完成');
 
+    const third = await ctx.services.answers.submit({
+      answerBridgeId: spawned.answerBridgeId,
+      submissionId: 'answer-submission-three',
+      sourceTurnId: spawned.childTurnId,
+      content: 'next-turn delivery identity'
+    });
     const nullTarget = await ctx.services.deliveries.create({
-      inboxItemId: second.inboxItemId,
+      inboxItemId: third.inboxItemId,
       targetConversationId: seeded.conversationId,
       phase: 'next_turn'
     });
     await assert.rejects(ctx.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('RuntimeDelivery').insert({
         id: 'duplicate-null-delivery',
-        inbox_item_id: second.inboxItemId,
+        inbox_item_id: third.inboxItemId,
         target_conversation_id: seeded.conversationId,
         target_turn_id: null,
         phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null,
@@ -314,7 +362,7 @@ async function checkAnswerRestartDelivery() {
       })
     ]), /UNIQUE constraint failed/);
     assert.equal((await get(ctx.database, 'RuntimeDelivery', nullTarget.delivery.id)).target_turn_id, null);
-    assertions.push('NULL与非NULL target_turn_id两组真实SQLite partial UNIQUE均按delivery attempt身份去重');
+    assertions.push('Delivery以inbox、目标Conversation和attempt为逻辑身份，phase/target变化不能制造重复首个attempt');
 
     const matrixChild = await spawnStartedChild(ctx, seeded.turnId, 'delivery-matrix', 'background');
     const matrixContinuationTool = await createRunAgentTool(ctx, seeded.turnId, 'delivery-matrix-continuation');
@@ -376,13 +424,12 @@ async function checkAnswerRestartDelivery() {
     assert.equal(waitingNext.delivery.state, 'pending');
     assert.equal(waitingNotify.changed, false);
     assert.equal((await ctx.services.deliveries.acknowledgeNotification(matrixNotify.delivery.id)).parentHandlingState, 'not_applicable');
-    const lateMatrixAnswer = await ctx.services.answers.submit({
+    await assert.rejects(ctx.services.answers.submit({
       answerBridgeId: matrixChild.answerBridgeId,
       submissionId: 'delivery-matrix-late-interrupted',
       sourceTurnId: matrixChild.childTurnId,
-      content: 'late interrupted matrix answer',
-      interrupted: true
-    });
+      content: 'stale terminal generation answer'
+    }), /stale or terminal Child Turn/);
     assert.equal((await get(ctx.database, 'Turn', matrixChild.childTurnId)).status, 'terminated');
     const matrixContinuation = await ctx.services.children.admitQueuedIntent({
       sourceKey: 'delivery-matrix-admit',
@@ -397,15 +444,21 @@ async function checkAnswerRestartDelivery() {
       assert.equal(summary.delivery.target_turn_id, matrixContinuation.turnId);
       assert.ok(summary.inputLink);
     }
+    const continuationAnswer = await ctx.services.answers.submit({
+      answerBridgeId: matrixChild.answerBridgeId,
+      submissionId: 'delivery-matrix-continuation-answer',
+      sourceTurnId: matrixContinuation.turnId,
+      content: 'continuation generation answer'
+    });
     const matrixNextActive = await ctx.services.deliveries.create({
-      inboxItemId: lateMatrixAnswer.inboxItemId,
+      inboxItemId: continuationAnswer.inboxItemId,
       targetConversationId: matrixChild.childConversationId,
       targetTurnId: matrixContinuation.turnId,
       phase: 'next_turn'
     });
     assert.equal((await ctx.services.deliveries.advance(matrixNextActive.delivery.id)).delivery.state, 'consumed');
     assert.equal((await get(ctx.database, 'Turn', matrixChild.childTurnId)).status, 'terminated');
-    assertions.push('current/next/notify advancement matrix逐项走真实Turn状态：terminal改投、NULL等待、新Turn启动事务回写注入、active注入、notify显式确认；late interrupted answer不重开terminal Turn');
+    assertions.push('current/next/notify advancement matrix逐项走真实Turn状态：terminal改投、NULL等待、新Turn启动事务回写注入、active注入、notify显式确认；旧generation提交被拒绝且新generation可提交');
     faults.push('delivery advancement across terminal-to-continuation boundary');
 
     const gone = await ctx.services.deliveries.create({
@@ -449,12 +502,231 @@ async function checkAnswerRestartDelivery() {
     assertions.push('答案提交与deadline sweep并发由SQLite assertion/UNIQUE durable first-wins，原ToolCall严格一个模型结果，败方答案仍入Inbox');
     faults.push('answer arrival concurrent with foreground deadline sweep');
 
+    const generationParent = await seedParent(ctx, 'answer-generation-owner');
+    const generationChild = await spawnStartedChild(
+      ctx,
+      generationParent.turnId,
+      'answer-generation-owner',
+      'wait_for_answer',
+      { deadline: '2026-08-01T02:00:00.000Z' }
+    );
+    await createTurnControl(ctx, 'answer-generation-initial-terminal').terminal({
+      source: { kind: 'callback', key: 'answer-generation-initial-terminal' },
+      turnId: generationChild.childTurnId,
+      terminalStatus: 'completed',
+      reason: 'advance fixture to first continuation generation'
+    });
+    await ctx.services.children.observeTurnTerminal(
+      generationChild.childExecutionId,
+      generationChild.childTurnId
+    );
+    const generationToolA = await createRunAgentTool(
+      ctx,
+      generationParent.turnId,
+      'answer-generation-a'
+    );
+    const generationWaitA = await ctx.services.children.send({
+      sourceKey: 'answer-generation-a',
+      sourceToolCallId: generationToolA.toolCallId,
+      childExecutionId: generationChild.childExecutionId,
+      mode: 'queue_next_turn',
+      content: 'generation A',
+      completionPolicy: 'wait_for_answer',
+      waitDeadlineAt: '2026-08-01T02:00:00.000Z'
+    });
+    const generationA = await ctx.services.children.admitQueuedIntent({
+      sourceKey: 'answer-generation-admit-a',
+      childExecutionId: generationChild.childExecutionId,
+      turnIntentId: generationWaitA.turnIntentId,
+      leaseOwnerId: 'answer-generation-owner-a',
+      leaseExpiresAt: '2026-08-02T00:00:00.000Z'
+    });
+    const generationToolB = await createRunAgentTool(
+      ctx,
+      generationParent.turnId,
+      'answer-generation-b'
+    );
+    const generationWaitB = await ctx.services.children.send({
+      sourceKey: 'answer-generation-b',
+      sourceToolCallId: generationToolB.toolCallId,
+      childExecutionId: generationChild.childExecutionId,
+      mode: 'queue_next_turn',
+      content: 'generation B',
+      completionPolicy: 'wait_for_answer',
+      waitDeadlineAt: '2026-08-01T02:00:00.000Z'
+    });
+    const operationA = await get(ctx.database, 'Operation', generationWaitA.operationId);
+    const operationB = await get(ctx.database, 'Operation', generationWaitB.operationId);
+    assert.equal(operationA.owner_kind, 'child_turn_answer_wait');
+    assert.equal(operationA.owner_id, generationA.turnId);
+    assert.equal(operationA.created_at, operationB.created_at);
+    assert.notEqual(operationA.owner_id, operationB.owner_id);
+    const generationAnswerA = await ctx.services.answers.submit({
+      answerBridgeId: generationChild.answerBridgeId,
+      submissionId: 'answer-generation-submission-a',
+      sourceTurnId: generationA.turnId,
+      content: 'answer from generation A'
+    });
+    const generationSettledA = await ctx.services.answers.reconcileCommittedWaits(
+      generationAnswerA.submissionId
+    );
+    assert.equal(generationAnswerA.foregroundSettled, true);
+    assert.deepEqual(generationSettledA.newlySettledToolCallIds, [generationToolA.toolCallId]);
+    assert.equal((await get(ctx.database, 'Operation', generationWaitA.operationId)).status, 'succeeded');
+    assert.equal((await get(ctx.database, 'Operation', generationWaitB.operationId)).status, 'waiting_answer');
+    await createTurnControl(ctx, 'answer-generation-a-terminal').terminal({
+      source: { kind: 'callback', key: 'answer-generation-a-terminal' },
+      turnId: generationA.turnId,
+      terminalStatus: 'completed',
+      reason: 'advance fixture to second continuation generation'
+    });
+    const generationB = await ctx.services.children.admitQueuedIntent({
+      sourceKey: 'answer-generation-admit-b',
+      childExecutionId: generationChild.childExecutionId,
+      turnIntentId: generationWaitB.turnIntentId,
+      leaseOwnerId: 'answer-generation-owner-b',
+      leaseExpiresAt: '2026-08-02T00:00:00.000Z'
+    });
+    assert.equal((await get(ctx.database, 'Operation', generationWaitB.operationId)).owner_id, generationB.turnId);
+    const generationAnswerB = await ctx.services.answers.submit({
+      answerBridgeId: generationChild.answerBridgeId,
+      submissionId: 'answer-generation-submission-b',
+      sourceTurnId: generationB.turnId,
+      content: 'answer from generation B'
+    });
+    const generationSettledB = await ctx.services.answers.reconcileCommittedWaits(
+      generationAnswerB.submissionId
+    );
+    assert.deepEqual(generationSettledB.newlySettledToolCallIds, [generationToolB.toolCallId]);
+    assert.equal((await get(ctx.database, 'Operation', generationWaitB.operationId)).status, 'succeeded');
+    assertions.push('同毫秒创建的两代continuation wait以未来Turn稳定身份隔离；A答案独立结算初始wait与A wait而不触碰B，B仅由B来源Turn答案结算');
+    faults.push('same-millisecond continuation generations with multiple independently settling waits');
+
+    const legacyParent = await seedParent(ctx, 'answer-legacy-owner');
+    const legacyChild = await spawnStartedChild(
+      ctx,
+      legacyParent.turnId,
+      'answer-legacy-owner',
+      'background'
+    );
+    await createTurnControl(ctx, 'answer-legacy-initial-terminal').terminal({
+      source: { kind: 'callback', key: 'answer-legacy-initial-terminal' },
+      turnId: legacyChild.childTurnId,
+      terminalStatus: 'completed',
+      reason: 'advance fixture to legacy continuation'
+    });
+    await ctx.services.children.observeTurnTerminal(
+      legacyChild.childExecutionId,
+      legacyChild.childTurnId
+    );
+    const legacyTool = await createRunAgentTool(ctx, legacyParent.turnId, 'answer-legacy-wait');
+    const legacyWait = await ctx.services.children.send({
+      sourceKey: 'answer-legacy-wait',
+      sourceToolCallId: legacyTool.toolCallId,
+      childExecutionId: legacyChild.childExecutionId,
+      mode: 'queue_next_turn',
+      content: 'legacy wait',
+      completionPolicy: 'wait_for_answer',
+      waitDeadlineAt: '2026-08-01T02:00:00.000Z'
+    });
+    const legacyGeneration = await ctx.services.children.admitQueuedIntent({
+      sourceKey: 'answer-legacy-admit',
+      childExecutionId: legacyChild.childExecutionId,
+      turnIntentId: legacyWait.turnIntentId,
+      leaseOwnerId: 'answer-legacy-generation-owner',
+      leaseExpiresAt: '2026-08-02T00:00:00.000Z'
+    });
+    for (let offset = 0; offset < 1001; offset += 250) {
+      await ctx.database.transaction(Array.from(
+        { length: Math.min(250, 1001 - offset) },
+        (_unused, index) => {
+          const sequence = offset + index;
+          const padded = String(sequence).padStart(4, '0');
+          return kernel.DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+            id: `000-legacy-noise-${padded}`,
+            source_kind: 'command',
+            source_key: `answer-legacy-noise-${padded}`,
+            conversation_id: legacyParent.conversationId,
+            turn_id: legacyParent.turnId,
+            created_at: NOW
+          });
+        }
+      ));
+    }
     await closeRuntime(ctx);
+    mutateSqlite(ctx.binding.paths.databasePath, (database) => {
+      database.prepare(`
+        UPDATE operation
+        SET owner_kind = 'answer_bridge_wait', owner_id = ?
+        WHERE id = ?
+      `).run(legacyChild.answerBridgeId, legacyWait.operationId);
+    });
+    await reopenRuntime(ctx, 'answer-legacy-owner-restart');
+    const legacyAnswer = await ctx.services.answers.submit({
+      answerBridgeId: legacyChild.answerBridgeId,
+      submissionId: 'answer-legacy-owner-submission',
+      sourceTurnId: legacyGeneration.turnId,
+      content: 'recover exact legacy wait'
+    });
+    const legacySettlement = await ctx.services.answers.reconcileCommittedWaits(
+      legacyAnswer.submissionId
+    );
+    assert.deepEqual(legacySettlement.newlySettledToolCallIds, [legacyTool.toolCallId]);
+    assert.equal((await get(ctx.database, 'Operation', legacyWait.operationId)).status, 'succeeded');
+    assertions.push('持久legacy answer_bridge_wait在同parent Turn的1001条干扰CommandReceipt之后，仍由Operation/Receipt/Intent/immutable mode preset完整稳定身份精确恢复');
+    faults.push('legacy answer_bridge_wait persisted across restart beyond a 1000-row identity boundary');
+
+    const longHistoryParent = await seedParent(ctx, 'answer-long-child-history');
+    const longHistoryChild = await spawnStartedChild(
+      ctx,
+      longHistoryParent.turnId,
+      'answer-long-child-history',
+      'background'
+    );
+    await createTurnControl(ctx, 'answer-long-child-history-terminal').terminal({
+      source: { kind: 'callback', key: 'answer-long-child-history-terminal' },
+      turnId: longHistoryChild.childTurnId,
+      terminalStatus: 'completed',
+      reason: 'prepare uncapped child history fixture'
+    });
+    await ctx.services.children.observeTurnTerminal(
+      longHistoryChild.childExecutionId,
+      longHistoryChild.childTurnId
+    );
+    await closeRuntime(ctx);
+    mutateSqlite(ctx.binding.paths.databasePath, (database) => {
+      const insertTurn = database.prepare(`
+        INSERT INTO turn (id, conversation_id, status, created_at, updated_at, terminal_at)
+        VALUES (?, ?, 'terminated', ?, ?, ?)
+      `);
+      const insertMembership = database.prepare(`
+        INSERT INTO child_execution_turn_link
+          (id, child_execution_id, turn_seq, turn_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (let index = 0; index < 1001; index += 1) {
+        const turnId = `long-history-turn-${String(index).padStart(4, '0')}`;
+        insertTurn.run(turnId, longHistoryChild.childConversationId, NOW, NOW, NOW);
+        insertMembership.run(
+          `long-history-link-${String(index).padStart(4, '0')}`,
+          longHistoryChild.childExecutionId,
+          BigInt(index + 2),
+          turnId,
+          NOW
+        );
+      }
+    });
     await reopenRuntime(ctx, 'answer-delivery-restart');
-    assert.equal((await get(ctx.database, 'AnswerSubmission', second.submissionId)).interrupted, 1n);
+    assert.equal((await get(ctx.database, 'AnswerSubmission', second.submissionId)).interrupted, 0n);
     assert.equal((await ctx.services.deliveries.summary(current.delivery.id)).parentHandlingState, 'handled');
     assert.equal((await list(ctx.database, 'ToolModelResult', { tool_call_id: spawned.toolCallId })).length, 1);
+    const longHistorySnapshot = await ctx.services.children.readExecutionSnapshot(
+      longHistoryChild.childExecutionId
+    );
+    assert.equal(longHistorySnapshot.turnLinks.length, 1002);
+    assert.equal(String(longHistorySnapshot.turnLinks.at(-1).turn_seq), '1002');
     assertions.push('关闭数据库并新建RuntimeDatabase/services后答案、历史delivery、InputLink.handled_at和唯一ToolResult全部由SQLite恢复');
+    assertions.push('ChildExecution精确历史读取跨越1000条Turn membership，保留第1002代而不依赖全局LIMIT或目标行排序');
     faults.push('Extension Host database/service restart');
     metrics.answerSubmissions = (await list(ctx.database, 'AnswerSubmission', { answer_bridge_id: spawned.answerBridgeId })).length;
     metrics.deliveryAttemptsForGoneTarget = (await list(ctx.database, 'RuntimeDelivery', {
@@ -525,11 +797,56 @@ async function checkCancelSubtree() {
     const spawnSettlementTwo = await ctx.services.children.reconcileSpawnReceipt(spawnReceiptOne.effectReceiptId);
     assert.equal(spawnSettlementOne.terminalToolResult, true);
     assert.equal(spawnSettlementTwo.deduplicated, true);
+    const spawnedOrigin = (await list(ctx.database, 'ConversationOriginLink', {
+      conversation_id: preparedSpawn.childConversationId
+    }))[0];
+    assert.ok(spawnedOrigin);
+    assert.equal(spawnedOrigin.source_conversation_id, parent.conversationId);
+    assert.equal(spawnedOrigin.source_turn_id, parent.turnId);
+    assert.equal(spawnedOrigin.source_tool_call_id, atomicTool.toolCallId);
+    assert.equal((await ctx.services.children.ensureConversationOrigin(preparedSpawn.childExecutionId)).created, false);
+
+    const legacyOriginToolCallId = 'run-agent-call-legacy-origin-backfill';
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+        id: 'conversation-legacy-child-origin',
+        title: 'legacy child without origin projection',
+        status: 'active',
+        created_at: NOW,
+        updated_at: NOW
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('ChildExecution').insert({
+        id: 'child-execution-legacy-origin',
+        child_conversation_id: 'conversation-legacy-child-origin',
+        status: 'idle',
+        created_at: NOW,
+        updated_at: NOW
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').insert({
+        id: 'child-parent-link-legacy-origin',
+        child_execution_id: 'child-execution-legacy-origin',
+        source_tool_call_id: legacyOriginToolCallId,
+        parent_child_execution_id: null,
+        parent_turn_id: parent.turnId,
+        created_at: NOW
+      })
+    ]);
+    assert.equal((await list(ctx.database, 'ConversationOriginLink', {
+      conversation_id: 'conversation-legacy-child-origin'
+    })).length, 0);
+    await ctx.services.recovery.runAll();
+    const repairedOrigin = (await list(ctx.database, 'ConversationOriginLink', {
+      conversation_id: 'conversation-legacy-child-origin'
+    }))[0];
+    assert.ok(repairedOrigin);
+    assert.equal(repairedOrigin.source_conversation_id, parent.conversationId);
+    assert.equal(repairedOrigin.source_turn_id, parent.turnId);
+    assert.equal(repairedOrigin.source_tool_call_id, legacyOriginToolCallId);
     await assert.rejects(ctx.services.children.spawn({
       ...atomicSpawnCommand,
       prompt: 'conflicting replay prompt'
     }), /replayed with different facts/);
-    assertions.push('spawn中间fault回滚全部SQLite lineage；并发同源spawn、重复dispatch/callback/reconcile按稳定identity收敛且不同请求不伪装dedupe');
+    assertions.push('spawn原子写入ConversationOriginLink；启动恢复为旧ChildExecution补建稳定父对话lineage；并发同源spawn、重复dispatch/callback/reconcile按稳定identity收敛且不同请求不伪装dedupe');
     faults.push('spawn writer transaction fault after lineage/effect facts');
     faults.push('concurrent identical spawn and duplicate callback');
 
@@ -598,7 +915,7 @@ async function checkCancelSubtree() {
       }
       return originalTransaction(steps);
     };
-    const cancelled = await ctx.services.children.cancelSubtree({
+    const cancelled = await ctx.services.children.interruptSubtree({
       sourceKey: 'cancel-tree-a',
       childExecutionId: childA.childExecutionId,
       reason: 'test subtree cancellation'
@@ -622,20 +939,20 @@ async function checkCancelSubtree() {
     assert.equal((await get(ctx.database, 'TurnIntent', pendingB.turnIntentId)).state, 'cancelled');
     assert.equal((await get(ctx.database, 'Turn', continuedA.turnId)).status, 'active');
     assert.equal((await list(ctx.database, 'TurnTermination', { turn_id: continuedA.turnId })).length, 0);
-    assertions.push('cancel_subtree用writer exact-set封住读写间并发spawn，重读稳定ParentLink后在同一成功事务覆盖全部active targets并取消pending Intent；请求本身不伪造Turn终态');
+    assertions.push('interrupt_subtree用writer exact-set封住读写间并发spawn，重读稳定ParentLink后在同一成功事务覆盖全部active targets并取消pending Intent；请求本身不伪造Turn终态');
 
     assert.equal((await get(ctx.database, 'ChildExecution', sibling.childExecutionId)).status, 'active');
     assert.equal((await list(ctx.database, 'PendingTurnInput', {
       turn_id: sibling.childTurnId,
       input_kind: 'termination_request'
     })).length, 0);
-    const siblingCancel = await ctx.services.children.cancel({
+    const siblingCancel = await ctx.services.children.interruptSubtree({
       sourceKey: 'single-cancel-sibling',
       childExecutionId: sibling.childExecutionId,
       reason: 'single cancel'
     });
-    assert.equal(siblingCancel.activeTurnId, sibling.childTurnId);
-    assertions.push('A子树取消不误伤sibling/其他根树；单cancel只向当前ActiveTurnLink target写正常终止请求');
+    assert.deepEqual(siblingCancel.activeTurnIds, [sibling.childTurnId]);
+    assertions.push('A子树中断不误伤sibling/其他根树；叶节点interrupt_subtree只向该谱系当前ActiveTurnLink target写正常终止请求');
 
     const pendingDescendantTool = await createRunAgentTool(ctx, continuedA.turnId, 'blocked-descendant');
     await assert.rejects(ctx.services.children.spawn({
@@ -649,7 +966,7 @@ async function checkCancelSubtree() {
     assert.equal((await list(ctx.database, 'ChildExecutionParentLink', {
       source_tool_call_id: pendingDescendantTool.toolCallId
     })).length, 0);
-    assertions.push('父树登记cancel_subtree后spawn在写入前拒绝，不留下半创建lineage');
+    assertions.push('父树登记interrupt_subtree后spawn在写入前拒绝，不留下半创建lineage');
     faults.push('continuation after descendant creation');
     faults.push('descendant spawn committed between cancel tree read and writer transaction');
     faults.push('pending intent and active turns cancelled atomically');
@@ -686,7 +1003,31 @@ async function checkClientSnapshotBounds() {
     });
     const currentMemberships = await list(ctx.database, 'MessagePartOfConversation', { conversation_id: seeded.conversationId });
     const maxSeq = currentMemberships.reduce((max, row) => row.message_seq > max ? row.message_seq : max, 0n);
-    await seedMessageRows(ctx, seeded.conversationId, 1000 - currentMemberships.length, Number(maxSeq) + 1, 'snapshot');
+    const targetMessageCount = 10_000;
+    const seedStartedAt = Date.now();
+    await seedMessageRows(
+      ctx,
+      seeded.conversationId,
+      targetMessageCount - currentMemberships.length,
+      Number(maxSeq) + 1,
+      'snapshot'
+    );
+    let targetRawMessageSeq = Number(maxSeq) + targetMessageCount - currentMemberships.length;
+    const preflight = await ctx.database.clientProjectionSnapshot(seeded.conversationId);
+    const visibleSeedCount = Number(preflight.snapshot.activeConversationWindow.visibleMessageCount);
+    assert.ok(visibleSeedCount <= targetMessageCount);
+    if (visibleSeedCount < targetMessageCount) {
+      const visibleGap = targetMessageCount - visibleSeedCount;
+      await seedMessageRows(
+        ctx,
+        seeded.conversationId,
+        visibleGap,
+        targetRawMessageSeq + 1,
+        'snapshot-visible-fill'
+      );
+      targetRawMessageSeq += visibleGap;
+    }
+    metrics.seedTenThousandMs = Date.now() - seedStartedAt;
     const longTitle = '长'.repeat(4000);
     const navSteps = [];
     for (let index = 0; index < 210; index += 1) {
@@ -716,10 +1057,12 @@ async function checkClientSnapshotBounds() {
     ]);
 
     const sent = [];
+    const snapshotStartedAt = Date.now();
     const connection = await ctx.services.clientFeed.connect({
       activeConversationId: seeded.conversationId,
       send: (message) => sent.push(message)
     });
+    metrics.snapshotTenThousandMs = Date.now() - snapshotStartedAt;
     assert.equal(sent.length, 1);
     const snapshot = sent[0];
     assert.equal(snapshot.type, 'reliable-kernel.snapshot');
@@ -728,6 +1071,11 @@ async function checkClientSnapshotBounds() {
     assert.match(snapshot.snapshotCommitSeq, /^(?:0|[1-9]\d*)$/);
     const windowMessages = snapshot.projections.activeConversationWindow.messages;
     assert.equal(windowMessages.length, 200);
+    assert.equal(String(windowMessages[0].message_seq), String(targetRawMessageSeq - 199));
+    assert.equal(String(windowMessages.at(-1).message_seq), String(targetRawMessageSeq));
+    assert.equal(String(windowMessages[0].display_seq), '9801');
+    assert.equal(String(windowMessages.at(-1).display_seq), '10000');
+    assert.equal(String(snapshot.projections.activeConversationWindow.visibleMessageCount), '10000');
     assert.ok(snapshot.projections.navigationSummary.conversations.length <= 200);
     assert.ok(maxArrayLength(snapshot.projections) <= 200);
     assert.ok(maxRecordBytes(snapshot.projections) <= 2048);
@@ -738,23 +1086,193 @@ async function checkClientSnapshotBounds() {
     ]);
     assert.equal(snapshot.projections.activeConversationWindow.taskList[0].detail_on_demand, false);
     assert.equal(JSON.stringify(snapshot).includes('user-input-snapshot'), false);
-    assertions.push('snapshot仅含五类bounded projection，消息窗口/每类型记录/单记录摘要/实际UTF-8总字节均受硬上限；task list从ToolCall/ToolOutcome+CAS事实重建且不含正文/full Context');
+    assert.ok(metrics.snapshotTenThousandMs < 5_000, `10k snapshot took ${metrics.snapshotTenThousandMs}ms`);
+    assertions.push('10,000个可见楼层的snapshot仍只发送最新200条且保留绝对display_seq=9801..10000；五类projection/单记录摘要/实际UTF-8总字节均受硬上限，task list不含正文/full Context');
 
+    const oversizedProjection = emptyClientProjection('bundle-conversation');
+    const nav = oversizedProjection.navigationSummary;
+    const active = oversizedProjection.activeConversationWindow;
+    const activeTurns = oversizedProjection.activeTurnSummary;
+    const activeTools = oversizedProjection.activeToolAndInteractionSummary;
+    const pad = (record, seed) => ({
+      ...record,
+      padding_a: `${seed}:${'a'.repeat(220)}`,
+      padding_b: `${seed}:${'b'.repeat(220)}`,
+      padding_c: `${seed}:${'c'.repeat(220)}`,
+      padding_d: `${seed}:${'d'.repeat(220)}`,
+      padding_e: `${seed}:${'e'.repeat(220)}`
+    });
+    for (let index = 1; index <= 200; index += 1) {
+      const suffix = String(index).padStart(3, '0');
+      const messageId = `bundle-message-${suffix}`;
+      const turnId = `bundle-turn-${suffix}`;
+      const requestId = `bundle-request-${suffix}`;
+      const toolCallId = `bundle-tool-${suffix}`;
+      const processId = `bundle-process-${suffix}`;
+      nav.conversations.push(pad({
+        id: index === 1 ? 'bundle-conversation' : `bundle-navigation-${suffix}`,
+        updated_at: `2026-08-01T00:${String(index % 60).padStart(2, '0')}:00.000Z`
+      }, `navigation-${suffix}`));
+      active.messages.push(pad({
+        id: messageId, conversation_id: 'bundle-conversation', message_seq: String(index),
+        display_seq: String(index), revision_id: `bundle-revision-${suffix}`, role: 'model'
+      }, `message-${suffix}`));
+      activeTurns.turns.push(pad({ id: turnId, conversation_id: 'bundle-conversation' }, `turn-${suffix}`));
+      activeTurns.modelRequests.push(pad({
+        id: requestId, turn_id: turnId, request_seq: String(index), status: 'terminal'
+      }, `request-${suffix}`));
+      activeTurns.modelRequestMessageLinks.push(pad({
+        id: `bundle-request-message-${suffix}`, model_request_id: requestId, message_id: messageId
+      }, `request-message-${suffix}`));
+      activeTools.messageTurnLinks.push(pad({
+        id: `bundle-message-turn-${suffix}`, message_id: messageId, turn_id: turnId, role: 'model'
+      }, `message-turn-${suffix}`));
+      activeTools.toolCalls.push(pad({ id: toolCallId, turn_id: turnId }, `tool-${suffix}`));
+      activeTools.toolCallSourceLinks.push(pad({
+        id: `bundle-tool-source-${suffix}`, tool_call_id: toolCallId,
+        model_request_id: requestId, message_id: messageId
+      }, `tool-source-${suffix}`));
+      activeTools.toolCallPolicySnapshots.push(pad({
+        id: `bundle-policy-${suffix}`, tool_call_id: toolCallId
+      }, `policy-${suffix}`));
+      activeTools.toolCallEvents.push(pad({
+        id: `bundle-event-${suffix}`, tool_call_id: toolCallId
+      }, `event-${suffix}`));
+      activeTools.toolExecutions.push(pad({
+        id: `bundle-execution-${suffix}`, tool_call_id: toolCallId
+      }, `execution-${suffix}`));
+      activeTools.toolOutcomes.push(pad({
+        id: `bundle-outcome-${suffix}`, tool_call_id: toolCallId
+      }, `outcome-${suffix}`));
+      activeTools.toolModelResults.push(pad({
+        id: `bundle-model-result-${suffix}`, tool_call_id: toolCallId
+      }, `model-result-${suffix}`));
+      activeTools.toolResultArtifacts.push(pad({
+        id: `bundle-artifact-${suffix}`, tool_call_id: toolCallId
+      }, `artifact-${suffix}`));
+      activeTools.interactionRequests.push(pad({ id: `bundle-interaction-${suffix}` }, `interaction-${suffix}`));
+      activeTools.interactionOwnerLinks.push(pad({
+        id: `bundle-interaction-owner-${suffix}`, request_id: `bundle-interaction-${suffix}`, turn_id: turnId
+      }, `interaction-owner-${suffix}`));
+      activeTools.interactionToolCallLinks.push(pad({
+        id: `bundle-interaction-tool-${suffix}`, request_id: `bundle-interaction-${suffix}`,
+        tool_call_id: toolCallId
+      }, `interaction-tool-${suffix}`));
+      activeTools.interactionResponses.push(pad({
+        id: `bundle-interaction-response-${suffix}`, request_id: `bundle-interaction-${suffix}`
+      }, `interaction-response-${suffix}`));
+      activeTools.fileChangeSets.push(pad({
+        id: `bundle-change-set-${suffix}`, tool_call_id: toolCallId
+      }, `change-set-${suffix}`));
+      activeTools.fileChangeSetMembers.push(pad({
+        id: `bundle-change-member-${suffix}`, change_set_id: `bundle-change-set-${suffix}`
+      }, `change-member-${suffix}`));
+      activeTools.fileChangeDecisions.push(pad({
+        id: `bundle-change-decision-${suffix}`, change_set_id: `bundle-change-set-${suffix}`
+      }, `change-decision-${suffix}`));
+      activeTools.fileMutationReceipts.push(pad({
+        id: `bundle-mutation-receipt-${suffix}`, change_set_id: `bundle-change-set-${suffix}`
+      }, `mutation-receipt-${suffix}`));
+      activeTools.fileMutationReceiptMembers.push(pad({
+        id: `bundle-mutation-member-${suffix}`, receipt_id: `bundle-mutation-receipt-${suffix}`
+      }, `mutation-member-${suffix}`));
+      activeTools.processes.push(pad({ id: processId }, `process-${suffix}`));
+      activeTools.processOriginLinks.push(pad({
+        id: `bundle-process-origin-${suffix}`, process_id: processId, tool_call_id: toolCallId
+      }, `process-origin-${suffix}`));
+      activeTools.processOutputChunks.push(pad({
+        id: `bundle-process-output-${suffix}`, process_id: processId
+      }, `process-output-${suffix}`));
+      activeTools.processReceipts.push(pad({
+        id: `bundle-process-receipt-${suffix}`, process_id: processId
+      }, `process-receipt-${suffix}`));
+    }
+    for (const values of [
+      nav.conversations,
+      activeTurns.turns,
+      activeTools.toolCalls,
+      activeTools.toolCallSourceLinks,
+      activeTools.toolCallPolicySnapshots,
+      activeTools.toolCallEvents,
+      activeTools.toolExecutions,
+      activeTools.toolOutcomes,
+      activeTools.toolModelResults,
+      activeTools.toolResultArtifacts,
+      activeTools.interactionRequests,
+      activeTools.interactionOwnerLinks,
+      activeTools.interactionToolCallLinks,
+      activeTools.interactionResponses,
+      activeTools.fileChangeSets,
+      activeTools.fileChangeSetMembers,
+      activeTools.fileChangeDecisions,
+      activeTools.fileMutationReceipts,
+      activeTools.fileMutationReceiptMembers,
+      activeTools.processes,
+      activeTools.processOriginLinks,
+      activeTools.processOutputChunks,
+      activeTools.processReceipts
+    ]) values.reverse();
+    active.visibleMessageCount = '200';
+    active.lastMessageSeq = '200';
+    assert.ok(wireBytes(oversizedProjection) > 5_242_880);
+    const boundedMessages = [];
+    const boundedDatabase = {
+      hostBootId: 'bundle-boot',
+      async externalDataVersion() { return '1'; },
+      async clientProjectionSnapshotAndSubscribe(_conversationId, _listener) {
+        return {
+          barrier: { snapshotCommitSeq: '1', snapshot: oversizedProjection },
+          unsubscribe() {}
+        };
+      }
+    };
+    const boundedFeed = new kernel.BoundedClientFeed(boundedDatabase);
+    const boundedConnection = await boundedFeed.connect({
+      activeConversationId: 'bundle-conversation',
+      send: (message) => boundedMessages.push(message)
+    });
+    const boundedSnapshot = boundedMessages[0];
+    assert.ok(wireBytes(boundedSnapshot) <= 5_242_880);
+    const boundedWindow = boundedSnapshot.projections.activeConversationWindow;
+    const boundedTurns = boundedSnapshot.projections.activeTurnSummary;
+    const boundedTools = boundedSnapshot.projections.activeToolAndInteractionSummary;
+    assert.ok(boundedWindow.messages.length < 200);
+    assert.equal(boundedWindow.messages.at(-1).id, 'bundle-message-200');
+    assert.ok(Number(boundedWindow.messages[0].message_seq) > 1);
+    assert.equal(boundedTurns.modelRequests.at(-1).id, 'bundle-request-200');
+    assert.equal(boundedTools.toolCalls[0].id, 'bundle-tool-200');
+    assert.ok(boundedSnapshot.projections.navigationSummary.conversations.some((row) => row.id === 'bundle-conversation'));
+    assertCausalSnapshotBundles(boundedSnapshot.projections);
+    boundedFeed.disconnect(boundedConnection.sessionId);
+    assertions.push('5MiB裁剪按明确oldest-first/newest-first方向保留最新窗口，并按Message→Request→Tool→Process闭包保留request-message/tool-source/message-turn/process-origin bundle');
+    faults.push('5MiB byte pressure across oppositely ordered causal projection arrays');
+
+    const pageLatencies = [];
+    let pageStartedAt = Date.now();
     const pageOne = await ctx.services.history.page({
       query: 'message', sortId: 'message_seq', conversationId: seeded.conversationId, limit: 200
     });
+    pageLatencies.push(Date.now() - pageStartedAt);
     assert.equal(pageOne.rows.length, 200);
     assert.ok(pageOne.responseBytes <= 524_288);
-    await seedMessageRows(ctx, seeded.conversationId, 1, 1001, 'snapshot-mid-page');
+    await seedMessageRows(ctx, seeded.conversationId, 1, targetRawMessageSeq + 1, 'snapshot-mid-page');
     const observed = [...pageOne.rows.map((row) => row.id)];
     let cursor = pageOne;
+    const paginationStartedAt = Date.now();
     while (cursor.hasMore) {
+      pageStartedAt = Date.now();
       cursor = await ctx.services.history.page({
         query: 'message', sortId: 'message_seq', conversationId: seeded.conversationId, limit: 200,
         afterSortKey: cursor.nextSortKey, afterId: cursor.nextId
       });
+      pageLatencies.push(Date.now() - pageStartedAt);
       observed.push(...cursor.rows.map((row) => row.id));
     }
+    metrics.pageTenThousandTotalMs = Date.now() - paginationStartedAt;
+    metrics.pageCount = pageLatencies.length;
+    metrics.pageP95Ms = percentile(pageLatencies, 0.95);
+    metrics.pageMaxMs = Math.max(...pageLatencies);
+    metrics.runtimeDatabaseBytes = (await fs.stat(ctx.binding.paths.databasePath)).size;
     assert.equal(new Set(observed).size, observed.length);
     const existingIds = new Set((await listAll(ctx.database, 'MessagePartOfConversation', {
       conversation_id: seeded.conversationId
@@ -764,7 +1282,9 @@ async function checkClientSnapshotBounds() {
       query: 'message', sortId: 'message_seq', conversationId: seeded.conversationId,
       limit: 20, offset: 20
     }), /Offset pagination is forbidden/);
-    assertions.push('message_seq+id keyset分页中间插入新行仍无重复/漏项，page rows与实际bytes受限且offset被拒绝');
+    assert.ok(metrics.pageP95Ms < 2_000, `10k keyset page p95 took ${metrics.pageP95Ms}ms`);
+    assert.ok(metrics.pageTenThousandTotalMs < 30_000, `10k pagination took ${metrics.pageTenThousandTotalMs}ms`);
+    assertions.push('超过10,000条message_seq+id keyset分页在中间插入新行后仍无重复/漏项，page rows/bytes有界、尾延迟受限且offset被拒绝');
 
     const detailChild = await spawnStartedChild(ctx, seeded.turnId, 'snapshot-detail', 'background');
     const largeAnswer = Buffer.alloc(3 * 1024 * 1024, 0x61);
@@ -800,13 +1320,66 @@ async function checkClientSnapshotBounds() {
     assert.equal(JSON.stringify(structuralContext).includes('user-input-snapshot'), false);
     assertions.push('大型answer正文不进ClientState，details按recordId+offset+maxBytes分块；Context projection按root读取结构事实且不把owner误作CAS或返回正文；每个实际wire response≤2MiB');
 
+    // Reconnect after the preceding intentionally unacknowledged fault sequence, then drive ten
+    // thousand incremental floors through the normal one-inflight feed. This catches reachability
+    // sets that appear row-bounded in the Webview but leak every evicted historical identity in the
+    // Extension Host.
+    ctx.services.clientFeed.disconnect(connection.sessionId);
+    const churnMessages = [];
+    const churnConnection = await ctx.services.clientFeed.connect({
+      activeConversationId: seeded.conversationId,
+      send: (message) => churnMessages.push(message)
+    });
+    const churnInitialView = ctx.services.clientFeed.inspectSession(churnConnection.sessionId);
+    const churnStartRawMessageSeq = Number(churnInitialView.latestMessageSeq) + 1;
+    const churnStartVisibleFloor = Number(churnInitialView.latestVisibleMessageFloor);
+    acknowledge(ctx.services.clientFeed, churnConnection, churnMessages[0]);
+    const churnStartedAt = Date.now();
+    for (let batch = 0; batch < 100; batch += 1) {
+      const before = churnMessages.length;
+      await seedMessageRows(
+        ctx,
+        seeded.conversationId,
+        100,
+        churnStartRawMessageSeq + batch * 100,
+        'snapshot-churn'
+      );
+      assert.equal(churnMessages.length, before + 1);
+      const changeMessage = churnMessages.at(-1);
+      assert.equal(changeMessage.type, 'reliable-kernel.changes');
+      assert.ok(changeMessage.changes.length <= 500);
+      assert.ok(wireBytes(changeMessage) <= 1_048_576);
+      acknowledge(ctx.services.clientFeed, churnConnection, changeMessage);
+    }
+    metrics.incrementalTenThousandMs = Date.now() - churnStartedAt;
+    const churnView = ctx.services.clientFeed.inspectSession(churnConnection.sessionId);
+    metrics.incrementalActiveRecordKeys = churnView.activeRecordKeyCount;
+    metrics.incrementalMaterializedRecords = churnView.materializedRecordCount;
+    metrics.incrementalMaxRecordsPerType = churnView.maxMaterializedRecordsPerType;
+    metrics.incrementalLastMessageSeq = Number(churnView.latestMessageSeq);
+    metrics.incrementalLastVisibleFloor = Number(churnView.latestVisibleMessageFloor);
+    assert.equal(churnMessages.length, 101);
+    assert.equal(churnMessages.filter((message) => message.type === 'reliable-kernel.snapshot').length, 1);
+    assert.ok(churnView.maxMaterializedRecordsPerType <= 200);
+    assert.equal(churnView.latestMessageSeq, String(churnStartRawMessageSeq + 9_999));
+    assert.equal(churnView.latestVisibleMessageFloor, String(churnStartVisibleFloor + 10_000));
+    assert.ok(
+      churnView.activeRecordKeyCount <= churnView.materializedRecordCount * 12 + 50,
+      `active reachability leaked: active=${churnView.activeRecordKeyCount}, materialized=${churnView.materializedRecordCount}`
+    );
+    assert.ok(metrics.incrementalTenThousandMs < 30_000, `10k incremental feed took ${metrics.incrementalTenThousandMs}ms`);
+    assertions.push('连续10,000条增量消息只产生100个有界atomic changes且不退化为snapshot风暴；Webview物化记录和Extension Host可达键均随200条窗口保持常数上限');
+    ctx.services.clientFeed.disconnect(churnConnection.sessionId);
+
     const messageListSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/ReliableMessageList.vue'), 'utf8');
     const segmentSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/segmentedTimeline.ts'), 'utf8');
     assert.match(messageListSource, /v-for="[^"]*visibleTimelineRows"/);
     assert.match(messageListSource, /scroller/);
-    assert.match(segmentSource, /TIMELINE_MOUNT_LIMIT = 80/);
-    assert.match(segmentSource, /PENDING_TIMELINE_MOUNT_LIMIT = 20/);
-    assert.ok(80 + 20 <= 100);
+    assert.match(segmentSource, /TIMELINE_MOUNT_LIMIT = 30/);
+    assert.match(segmentSource, /PENDING_TIMELINE_MOUNT_LIMIT = 8/);
+    assert.match(messageListSource, /absoluteTimelineFloor\(message\.seq/);
+    assert.match(messageListSource, /messages\.value\[messages\.value\.length - 1\]\?\.id/);
+    assert.ok(30 + 8 <= 40);
     const plainData = require(path.join(root, 'dist/extension/shared/plainData.js'));
     const proxy = new Proxy({ nested: [{ value: 'plain' }] }, {});
     const plain = plainData.toStructuredClonePlainData(proxy);
@@ -814,7 +1387,7 @@ async function checkClientSnapshotBounds() {
     assert.notEqual(plain, proxy);
     assert.throws(() => plainData.toStructuredClonePlainData(new Map()), /forbidden class/);
     assert.throws(() => plainData.toStructuredClonePlainData({ callback() {} }), /unsupported function/);
-    assertions.push('可靠时间线使用80+20 segmented挂载上限并复用现有自定义scroller；Bridge payload递归转plain且拒绝Map/function/class');
+    assertions.push('可靠时间线使用30+8 segmented挂载上限、绝对message_seq楼层号，并在窗口长度恒定但末条身份变化时继续跟随最新；Bridge payload递归转plain且拒绝Map/function/class');
     faults.push('keyset insertion between pages');
     faults.push('detail payload larger than maxResponseBytes');
     metrics.snapshotBytes = wireBytes(snapshot);
@@ -822,8 +1395,7 @@ async function checkClientSnapshotBounds() {
     metrics.keysetRows = observed.length;
     metrics.detailChunks = chunks.length;
     metrics.contextDetailBytes = contextDetail.responseBytes;
-    metrics.maxMountedTimelineComponents = 100;
-    ctx.services.clientFeed.disconnect(connection.sessionId);
+    metrics.maxMountedTimelineComponents = 38;
     return { assertions, faults, metrics };
   });
 }
@@ -833,8 +1405,12 @@ async function checkClientChangeBatchBounds() {
     const assertions = [];
     const faults = [];
     const metrics = {};
+    const seeded = await seedParent(ctx, 'client-batch-links');
     const sent = [];
-    const connection = await ctx.services.clientFeed.connect({ send: (message) => sent.push(message) });
+    const connection = await ctx.services.clientFeed.connect({
+      activeConversationId: seeded.conversationId,
+      send: (message) => sent.push(message)
+    });
     acknowledge(ctx.services.clientFeed, connection, sent[0]);
     await ctx.database.transaction(Array.from({ length: 10 }, (_unused, index) =>
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
@@ -850,6 +1426,11 @@ async function checkClientChangeBatchBounds() {
     acknowledge(ctx.services.clientFeed, connection, sent[1]);
     assertions.push('普通SQLite commit只产生一个typed upsert/remove atomic batch，records/实际wire bytes受限且不拆分');
 
+    const sentBeforeInvisibleCommit = sent.length;
+    await ctx.store.ingest(ctx.database, 'feed-invisible-cas-only', 'text/plain');
+    assert.equal(sent.length, sentBeforeInvisibleCommit);
+    assertions.push('不属于当前Client projection的commit不生成空changes、不占用单inflight ACK通道');
+
     await ctx.database.transaction(Array.from({ length: 501 }, (_unused, index) =>
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: `batch-oversized-${String(index).padStart(3, '0')}`, title: `oversized ${index}`,
@@ -862,6 +1443,54 @@ async function checkClientChangeBatchBounds() {
     assert.equal(sent.filter((message) => message.type === 'reliable-kernel.changes' && message.changes.length > 500).length, 0);
     assertions.push('single commit 501 records不形成half-visible拆包，直接coalesce为新bounded snapshot');
     faults.push('single oversized commit by record count');
+
+    acknowledge(ctx.services.clientFeed, connection, sent[2]);
+    const linkCommitStart = sent.length;
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
+        id: 'client-live-message-turn-link',
+        turn_id: seeded.turnId,
+        message_id: seeded.messageId,
+        role: 'projection-test',
+        created_at: NOW
+      })
+    ]);
+    assert.equal(sent.length, linkCommitStart + 1);
+    assert.ok(sent.at(-1).changes.some((change) =>
+      change.type === 'MessageTurnLink' && change.id === 'client-live-message-turn-link'
+    ));
+    acknowledge(ctx.services.clientFeed, connection, sent.at(-1));
+
+    const processTool = await ctx.services.effects.createToolCall({
+      source: { kind: 'callback', key: 'client-process-origin-tool' },
+      toolCallId: 'client-process-origin-tool',
+      turnId: seeded.turnId,
+      toolName: 'run_command',
+      arguments: { command: 'printf live', foregroundWaitMs: 0 }
+    });
+    assert.ok(sent.at(-1).changes.some((change) => change.type === 'ToolCall' && change.id === processTool.toolCallId));
+    acknowledge(ctx.services.clientFeed, connection, sent.at(-1));
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Process').insert({
+        id: 'client-live-process', status: 'running', wrapper_nonce: 'client-wrapper', wrapper_pid: 101n,
+        child_pid: 102n, process_group_id: 102n, start_fingerprint: 'client-start',
+        command_digest: 'client-command', spool_locator: 'client-spool', retained_bytes: 0n,
+        retained_chunks: 0n, dropped_bytes: 0n, truncated: 0n, started_at: NOW,
+        updated_at: NOW, completed_at: null
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('ProcessOriginLink').insert({
+        id: 'client-live-process-origin', process_id: 'client-live-process',
+        tool_call_id: processTool.toolCallId, created_at: NOW
+      })
+    ]);
+    const processChanges = sent.at(-1).changes;
+    assert.ok(processChanges.some((change) => change.type === 'Process' && change.id === 'client-live-process'));
+    assert.ok(processChanges.some((change) =>
+      change.type === 'ProcessOriginLink' && change.id === 'client-live-process-origin'
+    ));
+    acknowledge(ctx.services.clientFeed, connection, sent.at(-1));
+    assertions.push('已连接Conversation无需snapshot即可增量接收MessageTurnLink，以及同commit互相建立可达性的Process+ProcessOriginLink');
+    faults.push('snapshot-only structural link after initial feed connection');
 
     const shared = require(path.join(root, 'dist/extension/shared/reliableKernelClientFeed.js'));
     const initial = shared.applyReliableKernelDataMessage(shared.createEmptyReliableKernelClientState(), {
@@ -887,22 +1516,33 @@ async function checkClientChangeBatchBounds() {
     });
     assert.equal(failedApply.snapshotRequired, true);
     assert.equal(JSON.stringify(failedApply.state.records), beforeFailure);
-    const gap = shared.applyReliableKernelDataMessage(valid.state, {
+    const commitJump = shared.applyReliableKernelDataMessage(valid.state, {
       type: shared.RELIABLE_KERNEL_CHANGES_MESSAGE,
       sessionId: 'client-atomic', hostBootId: 'boot-a', messageSeq: '3', commitSeq: '8', changes: []
+    });
+    const messageGap = shared.applyReliableKernelDataMessage(valid.state, {
+      type: shared.RELIABLE_KERNEL_CHANGES_MESSAGE,
+      sessionId: 'client-atomic', hostBootId: 'boot-a', messageSeq: '4', commitSeq: '9', changes: []
+    });
+    const commitOrder = shared.applyReliableKernelDataMessage(valid.state, {
+      type: shared.RELIABLE_KERNEL_CHANGES_MESSAGE,
+      sessionId: 'client-atomic', hostBootId: 'boot-a', messageSeq: '3', commitSeq: '6', changes: []
     });
     const mismatch = shared.applyReliableKernelDataMessage(valid.state, {
       type: shared.RELIABLE_KERNEL_CHANGES_MESSAGE,
       sessionId: 'client-atomic', hostBootId: 'boot-b', messageSeq: '3', commitSeq: '7', changes: []
     });
-    assert.equal(gap.reason, 'commit-gap');
+    assert.equal(commitJump.snapshotRequired, false);
+    assert.equal(commitJump.state.lastCommitSeq, '8');
+    assert.equal(messageGap.reason, 'message-gap');
+    assert.equal(commitOrder.reason, 'commit-order');
     assert.equal(mismatch.reason, 'host-boot-mismatch');
     assert.equal(mismatch.state.hostBootId, null);
     assert.equal(mismatch.state.sessionId, null);
     assert.deepEqual(mismatch.state.records, {});
-    assertions.push('客户端整批copy-on-write原子应用；unknown type/apply failure/gap/乱序均作废整批并请求snapshot，hostBoot/session变化同时丢弃旧增量状态');
+    assertions.push('客户端整批copy-on-write原子应用；messageSeq保证传输连续，commitSeq允许跨过不可见提交但拒绝回退；unknown type/apply failure/乱序均作废整批并请求snapshot，hostBoot/session变化同时丢弃旧增量状态');
     faults.push('unknown change type after a valid first change');
-    faults.push('commitSeq gap and hostBootId change');
+    faults.push('messageSeq gap, commitSeq regression and hostBootId change');
     metrics.normalBatchRecords = sent[1].changes.length;
     metrics.normalBatchBytes = wireBytes(sent[1]);
     ctx.services.clientFeed.disconnect(connection.sessionId);
@@ -974,6 +1614,9 @@ async function checkClientQueueBounds() {
           terminal_state: null,
           provider_id: 'queue-byte-provider',
           model_id: 'queue-byte-model',
+          context_window_tokens: 128000n,
+          compression_threshold_tokens: 100000n,
+          estimated_context_tokens: 1000n,
           authority_snapshot_id: `queue-byte-authority-${suffix}`,
           settings_snapshot_object_id: null,
           recipe_object_id: shared.id,
@@ -1099,6 +1742,88 @@ async function checkSnapshotFeedBarrier() {
     metrics.snapshotCommitSeq = snapshotSeq;
     metrics.firstChangeCommitSeq = sent[1].commitSeq;
     ctx.services.clientFeed.disconnect(connection.sessionId);
+
+    const refreshSent = [];
+    const refreshFailures = [];
+    const refreshConnection = await ctx.services.clientFeed.connect({
+      send: (message) => refreshSent.push(message),
+      onFailure: (error) => refreshFailures.push(error)
+    });
+    acknowledge(ctx.services.clientFeed, refreshConnection, refreshSent[0]);
+    const refreshSnapshot = ctx.database.clientProjectionSnapshot.bind(ctx.database);
+    ctx.database.clientProjectionSnapshot = async () => {
+      throw new Error('injected snapshot refresh failure');
+    };
+    ctx.services.clientFeed.requestSnapshot(refreshConnection.sessionId);
+    await waitFor(() => refreshFailures.length === 1, 5000, 'snapshot refresh failure notification');
+    ctx.database.clientProjectionSnapshot = refreshSnapshot;
+    assert.match(String(refreshFailures[0]), /injected snapshot refresh failure/);
+    assert.throws(
+      () => ctx.services.clientFeed.inspectSession(refreshConnection.sessionId),
+      /Unknown bounded client feed session/
+    );
+    assertions.push('已连接Feed的snapshot refresh失败会关闭坏session并显式通知Bridge恢复，不再静默删除后永久冻结');
+    faults.push('asynchronous snapshot refresh rejection after connect resolved');
+
+    const bridgeAttempts = [];
+    const bridgeDisconnects = [];
+    const bridgeAcks = [];
+    const bridgeErrors = [];
+    const bridgePosts = [];
+    const successfulInputs = [];
+    const fakeFeed = {
+      async connect(input) {
+        const attempt = bridgeAttempts.length + 1;
+        bridgeAttempts.push(Date.now());
+        if (attempt === 1) throw new Error('injected initial bridge connect failure');
+        successfulInputs.push(input);
+        const sessionId = `bridge-session-${attempt}`;
+        input.send({
+          type: 'reliable-kernel.snapshot', sessionId, hostBootId: 'bridge-boot', messageSeq: '1',
+          snapshotCommitSeq: String(attempt), projections: emptyClientProjection(null)
+        });
+        return { sessionId, hostBootId: 'bridge-boot' };
+      },
+      disconnect(sessionId) { bridgeDisconnects.push(sessionId); },
+      acknowledge(ack) { bridgeAcks.push(ack); },
+      requestSnapshot() {}
+    };
+    const fakeDetails = { async read() { throw new Error('detail not used'); } };
+    const fakeWebview = {
+      postMessage(message) {
+        bridgePosts.push(message);
+        return Promise.resolve(true);
+      }
+    };
+    const bridge = new kernel.ReliableKernelWebviewFeedBridge(
+      fakeFeed,
+      fakeDetails,
+      (error, context) => bridgeErrors.push({ error, context })
+    );
+    const bridgeStartedAt = Date.now();
+    const bridgeClientId = bridge.attach(fakeWebview, { kind: 'panel' });
+    await waitFor(() => bridgeAttempts.length === 2, 3500, 'bridge initial connect backoff recovery');
+    metrics.bridgeInitialRecoveryMs = bridgeAttempts[1] - bridgeStartedAt;
+    assert.ok(metrics.bridgeInitialRecoveryMs >= 900 && metrics.bridgeInitialRecoveryMs < 3500);
+    const firstBridgeSnapshot = bridgePosts.find((message) => message.sessionId === 'bridge-session-2');
+    assert.ok(firstBridgeSnapshot);
+    await bridge.handleControl(bridgeClientId, {
+      type: 'reliable-kernel.ack', sessionId: 'bridge-session-2', hostBootId: 'bridge-boot', messageSeq: '1'
+    });
+    assert.equal(bridgeAcks.length, 1);
+    successfulInputs.at(-1).onFailure(new Error('injected connected feed failure'));
+    await waitFor(() => bridgeAttempts.length === 3, 3500, 'bridge connected-session recovery');
+    const recoveredBridgeSnapshot = bridgePosts.find((message) => message.sessionId === 'bridge-session-3');
+    assert.ok(recoveredBridgeSnapshot);
+    await bridge.handleControl(bridgeClientId, {
+      type: 'reliable-kernel.ack', sessionId: 'bridge-session-3', hostBootId: 'bridge-boot', messageSeq: '1'
+    });
+    bridge.close();
+    assert.equal(bridgeErrors.length, 2);
+    assert.deepEqual(bridgeErrors.map((entry) => entry.context.operation), ['connect', 'connect']);
+    assert.ok(bridgeDisconnects.includes('bridge-session-2'));
+    assertions.push('Bridge首次connect单次失败时connection保持待恢复并沿同一封顶退避成功；已连接session故障通知也复用该恢复路径');
+    faults.push('one-shot initial bridge connect failure and post-connect session failure');
     return { assertions, faults, metrics };
   });
 }
@@ -1149,12 +1874,15 @@ async function checkOldWriterNotRouted() {
   const bridgeSource = await fs.readFile('webview/src/transport/bridge.ts', 'utf8');
   assert.doesNotMatch(bridgeSource.match(/interface BridgePersistedState \{[\s\S]*?\}/)?.[0] ?? '', /clientId/);
   assert.match(bridgeSource, /toStructuredClonePlainData/);
+  const clientFeedSource = await fs.readFile('shared/reliableKernelClientFeed.ts', 'utf8');
+  const snapshotSeedMap = clientFeedSource.match(/const arrayKeyToType:[\s\S]*?\n  \};/)?.[0] ?? '';
+  assert.match(snapshotSeedMap, /\bmessages:\s*['"]Message['"]/);
   const runAgentDisplay = await fs.readFile('webview/src/components/content/toolDisplay/runAgentToolDisplay.ts', 'utf8');
   for (const fact of ['childExecutionState', 'activeChildTurnState', 'answerSubmissionState', 'runtimeDeliveryState', 'parentHandlingState', 'terminationState']) {
     assert.match(runAgentDisplay, new RegExp(fact));
   }
   assert.doesNotMatch(runAgentDisplay, /activityStage|notificationRun|runIdFrom/);
-  assertions.push('F executable transition selectors不进入production graph；shared/protocol中的已擦除类型不按整文件误判；Bridge session只驻内存且UI直接显示六类权威facts');
+  assertions.push('F executable transition selectors不进入production graph；shared/protocol中的已擦除类型不按整文件误判；Bridge session只驻内存、快照messages恢复Message bucket且UI直接显示六类权威facts');
   metrics.productionEntry = path.relative(root, entry).split(path.sep).join('/');
   metrics.emittedClosureFiles = graph.size;
   metrics.phaseFTransitionEntries = phaseFEntries.length;
@@ -1174,10 +1902,23 @@ async function checkRecoveryAnswerInbox() {
       sourceTurnId: child.childTurnId,
       content: 'repair me'
     });
-    await closeRuntime(ctx);
     mutateSqlite(ctx.binding.paths.databasePath, (database) => {
       database.prepare('DELETE FROM runtime_inbox_item WHERE id = ?').run(submitted.inboxItemId);
     });
+    assert.equal((await list(ctx.database, 'RuntimeInboxItem', {
+      source_id: submitted.submissionId
+    })).length, 0);
+    const liveOwnerScan = await ctx.services.recovery.run(
+      kernel.PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT
+    );
+    assert.equal(liveOwnerScan.reconciled, 0);
+    assert.equal((await list(ctx.database, 'RuntimeInboxItem', {
+      source_id: submitted.submissionId
+    })).length, 0);
+    assert.equal((await list(ctx.database, 'RuntimeDelivery', {
+      inbox_item_id: submitted.inboxItemId
+    })).length, 0);
+    await closeRuntime(ctx);
     await reopenRuntime(ctx, 'recovery-answer-restart');
     assert.equal((await list(ctx.database, 'RuntimeInboxItem', { source_id: submitted.submissionId })).length, 0);
     const first = await ctx.services.recovery.run(kernel.PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT);
@@ -1186,11 +1927,68 @@ async function checkRecoveryAnswerInbox() {
     assert.equal(second.reconciled, 0);
     const inbox = (await list(ctx.database, 'RuntimeInboxItem', { source_id: submitted.submissionId }))[0];
     assert.equal(inbox.dedupe_key, `answer:${child.answerBridgeId}:${submitted.submissionId}`);
+    const activeDeliveries = await list(ctx.database, 'RuntimeDelivery', { inbox_item_id: inbox.id });
+    assert.equal(activeDeliveries.length, 1);
+    assert.equal(activeDeliveries[0].phase, 'current_turn');
+    assert.equal(activeDeliveries[0].target_turn_id, parent.turnId);
     assert.equal((await get(ctx.database, 'AnswerBridge', child.answerBridgeId)).current_submission_id, submitted.submissionId);
-    assertions.push('跨真实数据库关闭/重开按bridge+submission稳定身份补建缺失InboxItem且不改AnswerSubmission/Bridge');
-    assertions.push('answer-inbox scanner重复运行幂等，不产生重复Inbox或外部effect');
-    faults.push('committed AnswerSubmission with missing RuntimeInboxItem across restart');
-    return { assertions, faults, metrics: { firstReconciled: first.reconciled, secondReconciled: second.reconciled } };
+    assertions.push('跨真实数据库关闭/重开按bridge+submission稳定身份补建缺失InboxItem与父目标Delivery且不改AnswerSubmission/Bridge');
+    assertions.push('answer-inbox scanner重复运行幂等，不产生重复Inbox、Delivery或外部effect');
+    assertions.push('来源子Turn仍由可验证live Host持有时，即使Inbox缺失，恢复扫描也保持只读；owner退出后才以Turn/Lease authority fence补建');
+
+    const terminalAnswer = await ctx.services.answers.submit({
+      answerBridgeId: child.answerBridgeId,
+      submissionId: 'recovery-answer-terminal-parent',
+      sourceTurnId: child.childTurnId,
+      content: 'parent already terminated before delivery orchestration'
+    });
+    await createTurnControl(ctx, 'recovery-answer-parent-terminal').terminal({
+      source: { kind: 'callback', key: 'recovery-answer-parent-terminal' },
+      turnId: parent.turnId,
+      terminalStatus: 'completed',
+      reason: 'simulate parent completion before answer delivery creation'
+    });
+    await closeRuntime(ctx);
+    await reopenRuntime(ctx, 'recovery-answer-terminal-restart');
+    const concurrent = await Promise.all([
+      ctx.services.recovery.run(kernel.PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT),
+      ctx.services.recovery.run(kernel.PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT)
+    ]);
+    const terminalDeliveries = await list(ctx.database, 'RuntimeDelivery', {
+      inbox_item_id: terminalAnswer.inboxItemId
+    });
+    assert.equal(terminalDeliveries.length, 1);
+    assert.equal(terminalDeliveries[0].phase, 'next_turn');
+    assert.equal(terminalDeliveries[0].target_turn_id, null);
+    assert.equal(terminalDeliveries[0].state, 'pending');
+    assert.equal(
+      (await ctx.services.deliveries.summary(terminalDeliveries[0].id)).parentHandlingState,
+      'unhandled'
+    );
+    const allAfterConcurrent = await ctx.services.recovery.runAll();
+    assert.equal((await list(ctx.database, 'RuntimeDelivery', {
+      inbox_item_id: terminalAnswer.inboxItemId
+    })).length, 1);
+    assert.equal(
+      allAfterConcurrent.find((entry) => entry.id === kernel.PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT).reconciled,
+      0
+    );
+    assertions.push('父Turn以completed终止后的缺失Delivery恢复为next_turn且不续写旧Turn，等待专属调度器启动新Turn');
+    assertions.push('两个并发恢复扫描经稳定Delivery identity与authority CAS收敛为唯一pending next_turn，后续runAll保持幂等');
+    faults.push(
+      'committed AnswerSubmission with missing RuntimeInboxItem and RuntimeDelivery across restart',
+      'parent Turn completed before next-turn delivery creation'
+    );
+    return {
+      assertions,
+      faults,
+      metrics: {
+        firstReconciled: first.reconciled,
+        secondReconciled: second.reconciled,
+        concurrentReconciled: concurrent.reduce((sum, result) => sum + result.reconciled, 0),
+        terminalDeliveries: terminalDeliveries.length
+      }
+    };
   });
 }
 
@@ -1203,6 +2001,7 @@ async function checkRecoveryPendingDelivery() {
     const answer = await ctx.services.answers.submit({
       answerBridgeId: child.answerBridgeId,
       submissionId: 'recovery-delivery-answer',
+      sourceTurnId: child.childTurnId,
       content: 'deliver after restart'
     });
     const delivery = await ctx.services.deliveries.create({
@@ -1210,6 +2009,17 @@ async function checkRecoveryPendingDelivery() {
       targetConversationId: parent.conversationId,
       targetTurnId: parent.turnId,
       phase: 'current_turn'
+    });
+    const notifyAnswer = await ctx.services.answers.submit({
+      answerBridgeId: child.answerBridgeId,
+      submissionId: 'recovery-delivery-notify-answer',
+      sourceTurnId: child.childTurnId,
+      content: 'notify after restart'
+    });
+    const notify = await ctx.services.deliveries.create({
+      inboxItemId: notifyAnswer.inboxItemId,
+      targetConversationId: parent.conversationId,
+      phase: 'notify_only'
     });
     await closeRuntime(ctx);
     await reopenRuntime(ctx, 'recovery-delivery-restart');
@@ -1221,9 +2031,18 @@ async function checkRecoveryPendingDelivery() {
     assert.equal(summary.delivery.state, 'consumed');
     assert.ok(summary.inputLink);
     assert.equal(summary.parentHandlingState, 'unhandled');
+    const pendingNotify = await ctx.services.deliveries.summary(notify.delivery.id);
+    assert.equal(pendingNotify.delivery.state, 'pending');
+    assert.equal(pendingNotify.delivery.phase, 'notify_only');
+    assert.equal(pendingNotify.inputLink, null);
+    assert.equal(
+      (await ctx.services.deliveries.acknowledgeNotification(notify.delivery.id)).delivery.state,
+      'consumed'
+    );
     assertions.push('restart后pending delivery按advancement matrix注入真实PendingTurnInput+InputLink并置consumed');
     assertions.push('delivery recovery重复扫描不重复注入、不重复推进且不消费handled_at');
-    faults.push('pending current_turn delivery across Extension Host restart');
+    assertions.push('notify_only恢复扫描保持pending且不伪造InputLink，直到真实产品通知路径显式ACK');
+    faults.push('pending current_turn and notify_only deliveries across Extension Host restart');
     return { assertions, faults, metrics: { inputLinks: (await list(ctx.database, 'RuntimeDeliveryInputLink', { delivery_id: delivery.delivery.id })).length } };
   });
 }
@@ -1245,6 +2064,141 @@ async function checkRecoveryForegroundWait() {
     assert.equal((await list(ctx.database, 'ToolModelResult', { tool_call_id: child.toolCallId })).length, 1);
     const terminal = await ctx.services.effects.readTerminalResult(child.toolCallId, false);
     assert.equal(terminal.status, 'succeeded');
+
+    const parallel = [];
+    for (const suffix of ['one', 'two', 'three']) {
+      parallel.push(await spawnStartedChild(
+        ctx,
+        parent.turnId,
+        `parallel-foreground-${suffix}`,
+        'wait_for_answer',
+        { deadline: '2026-08-01T00:02:00.000Z' }
+      ));
+    }
+    const reverseSettlements = await Promise.all([...parallel].reverse().map((entry) =>
+      ctx.services.children.settleForegroundTimeout(entry.childExecutionId, '2026-08-01T00:02:00.000Z')
+    ));
+    assert.deepEqual(reverseSettlements, [true, true, true]);
+    const orderedResults = [];
+    for (const entry of parallel) {
+      const call = await get(ctx.database, 'ToolCall', entry.toolCallId);
+      const operation = (await list(ctx.database, 'Operation', { tool_call_id: entry.toolCallId }))[0];
+      const artifact = (await list(ctx.database, 'ToolResultArtifact', {
+        tool_call_id: entry.toolCallId,
+        role: 'no_effect_result'
+      }))[0];
+      const result = (await list(ctx.database, 'ToolModelResult', { tool_call_id: entry.toolCallId }))[0];
+      assert.equal(operation.status, 'succeeded');
+      assert.ok(artifact);
+      assert.ok(result);
+      const revision = await get(ctx.database, 'MessageRevision', result.message_revision_id);
+      const membership = (await list(ctx.database, 'MessagePartOfConversation', {
+        message_id: revision.message_id
+      }))[0];
+      orderedResults.push({ callSeq: call.call_seq, messageSeq: membership.message_seq });
+    }
+    const byCallSeq = [...orderedResults].sort((left, right) => left.callSeq < right.callSeq ? -1 : 1);
+    assert.ok(byCallSeq.every((entry, index) =>
+      index === 0 || byCallSeq[index - 1].messageSeq < entry.messageSeq
+    ));
+    assertions.push('三个并行run_agent按逆call_seq同时超时：Operation/Artifact先独立结算，随后无需reload按call_seq物化全部ToolModelResult');
+    faults.push('three parallel foreground deadlines settle in reverse call_seq');
+
+    const backgroundPrepared = [];
+    for (const suffix of ['one', 'two', 'three']) {
+      const tool = await createRunAgentTool(ctx, parent.turnId, `parallel-background-${suffix}`);
+      const spawned = await ctx.services.children.spawn({
+        sourceToolCallId: tool.toolCallId,
+        childAgentId: `child-agent-parallel-background-${suffix}`,
+        prompt: `parallel background ${suffix}`,
+        completionPolicy: 'background',
+        leaseOwnerId: `child-owner-parallel-background-${suffix}`,
+        leaseExpiresAt: '2026-08-02T00:00:00.000Z'
+      });
+      assert.equal(await ctx.services.children.claimSpawnDispatch(spawned.effectIntentId), true);
+      const receipt = await ctx.services.children.recordSpawnReceipt({
+        sourceKey: `spawn-callback-parallel-background-${suffix}`,
+        attemptId: spawned.attemptId,
+        outcome: 'succeeded'
+      });
+      backgroundPrepared.push({ ...spawned, toolCallId: tool.toolCallId, receiptId: receipt.effectReceiptId });
+    }
+    await Promise.all([...backgroundPrepared].reverse().map((entry) =>
+      ctx.services.children.reconcileSpawnReceipt(entry.receiptId)
+    ));
+    for (const entry of backgroundPrepared) {
+      assert.ok((await list(ctx.database, 'ToolResultArtifact', {
+        tool_call_id: entry.toolCallId,
+        role: 'no_effect_result'
+      }))[0]);
+      assert.ok((await list(ctx.database, 'ToolModelResult', { tool_call_id: entry.toolCallId }))[0]);
+    }
+    assertions.push('三个并行background spawn逆call_seq结算时先写Operation/Artifact，再按序物化且无需reload');
+    faults.push('parallel background spawn settlement behind call-order barrier');
+
+    const continuationPrepared = [];
+    for (const [index, entry] of backgroundPrepared.entries()) {
+      const suffix = `parallel-background-continuation-${index + 1}`;
+      const tool = await createRunAgentTool(ctx, parent.turnId, suffix);
+      continuationPrepared.push({
+        toolCallId: tool.toolCallId,
+        childExecutionId: entry.childExecutionId,
+        suffix
+      });
+    }
+    await Promise.all([...continuationPrepared].reverse().map((entry) =>
+      ctx.services.children.send({
+        sourceKey: `send-${entry.suffix}`,
+        sourceToolCallId: entry.toolCallId,
+        childExecutionId: entry.childExecutionId,
+        mode: 'queue_next_turn',
+        content: entry.suffix,
+        completionPolicy: 'background'
+      })
+    ));
+    for (const entry of continuationPrepared) {
+      const settled = await ctx.services.children.finalizeWaitSettlement(entry.toolCallId);
+      assert.equal(settled?.status, 'succeeded');
+      assert.ok((await list(ctx.database, 'ToolModelResult', { tool_call_id: entry.toolCallId }))[0]);
+    }
+    assertions.push('三个并行background continuation逆call_seq提交时同样通过Operation/Artifact两阶段结算');
+    faults.push('parallel background continuation settlement behind call-order barrier');
+
+    const cancelledFirst = await spawnStartedChild(
+      ctx,
+      parent.turnId,
+      'foreground-cancel-first-wins',
+      'wait_for_answer',
+      { deadline: '2026-08-01T00:02:00.000Z' }
+    );
+    assert.equal(await ctx.services.children.cancelForegroundWaitForToolCall({
+      toolCallId: cancelledFirst.toolCallId,
+      reason: 'fixture parent interrupt',
+      sourceIdentity: 'fixture-parent-interrupt'
+    }), true);
+    assert.equal(
+      await ctx.services.children.settleForegroundTimeout(
+        cancelledFirst.childExecutionId,
+        '2026-08-01T00:02:00.000Z'
+      ),
+      false
+    );
+    const answerAfterCancel = await ctx.services.answers.submit({
+      answerBridgeId: cancelledFirst.answerBridgeId,
+      submissionId: 'answer-after-foreground-cancel',
+      sourceTurnId: cancelledFirst.childTurnId,
+      content: 'answer remains durable after parent wait cancellation'
+    });
+    assert.equal(answerAfterCancel.foregroundSettled, false);
+    assert.equal((await get(ctx.database, 'Operation', cancelledFirst.operationId)).status, 'cancelled');
+    assert.equal((await ctx.services.effects.readTerminalResult(cancelledFirst.toolCallId, false)).status, 'cancelled');
+    assert.equal((await list(ctx.database, 'ToolResultArtifact', {
+      tool_call_id: cancelledFirst.toolCallId,
+      role: 'no_effect_result'
+    })).length, 1);
+    assertions.push('parent cancel先提交后，timeout与late answer均不能覆盖cancelled Operation/Artifact，first-wins保持单一结果');
+    faults.push('cancel wins before foreground timeout and late answer');
+
     await createTurnControl(ctx, 'recovery-foreground-terminal').terminal({
       source: { kind: 'callback', key: 'recovery-foreground-parent-terminal' },
       turnId: parent.turnId,
@@ -1264,50 +2218,126 @@ async function checkRecoveryForegroundWait() {
     assertions.push('过期waiting_answer跨restart转后台控制句柄并只结算原ToolCall一次，deadline持久化事实被真实扫描');
     assertions.push('late answer仅进入AnswerSubmission/Inbox，不产生第二ToolModelResult也不强制启动父模型');
     faults.push('foreground wait deadline elapsed while Extension Host was down');
-    return { assertions, faults, metrics: { firstReconciled: first.reconciled, toolModelResults: 1 } };
+    return {
+      assertions,
+      faults,
+      metrics: {
+        firstReconciled: first.reconciled,
+        parallelToolModelResults: parallel.length,
+        cancelledArtifacts: 1
+      }
+    };
   });
 }
 
-async function checkRecoveryCancelledSubtree() {
-  return withRuntime('recovery-cancel', async (ctx) => {
+async function checkRecoveryInterruptedSubtree() {
+  return withRuntime('recovery-interrupt', async (ctx) => {
     const assertions = [];
     const faults = [];
-    const parent = await seedParent(ctx, 'recovery-cancel');
-    const child = await spawnStartedChild(ctx, parent.turnId, 'recovery-cancel', 'background');
-    const recoveryContinuationTool = await createRunAgentTool(ctx, parent.turnId, 'recovery-cancel-pending-intent');
+    const parent = await seedParent(ctx, 'recovery-interrupt');
+    const child = await spawnStartedChild(ctx, parent.turnId, 'recovery-interrupt', 'background');
+    const terminalPointerChild = await spawnStartedChild(
+      ctx,
+      parent.turnId,
+      'recovery-terminal-active-pointer',
+      'background'
+    );
+    await createTurnControl(ctx, 'recovery-terminal-active-pointer').terminal({
+      source: { kind: 'callback', key: 'recovery-terminal-active-pointer:terminal' },
+      turnId: terminalPointerChild.childTurnId,
+      terminalStatus: 'completed',
+      reason: 'fixture simulates Host loss before observeTurnTerminal'
+    });
+    assert.equal((await list(ctx.database, 'ChildExecutionActiveTurnLink', {
+      child_execution_id: terminalPointerChild.childExecutionId
+    })).length, 1);
+    const recoveryContinuationTool = await createRunAgentTool(ctx, parent.turnId, 'recovery-interrupt-pending-intent');
     const pending = await ctx.services.children.send({
-      sourceKey: 'recovery-cancel-pending-intent',
+      sourceKey: 'recovery-interrupt-pending-intent',
       sourceToolCallId: recoveryContinuationTool.toolCallId,
       childExecutionId: child.childExecutionId,
       mode: 'queue_next_turn',
       content: 'pending continuation',
-      completionPolicy: 'background'
+      completionPolicy: 'wait_for_answer',
+      waitDeadlineAt: '2026-08-02T00:00:00.000Z'
     });
-    await ctx.database.transaction([
-      kernel.DOMAIN_REPOSITORIES.domain('ChildExecution').update(child.childExecutionId, {
-        status: 'cancel_subtree_requested', updated_at: NOW
-      })
-    ]);
     const effectsBefore = (await list(ctx.database, 'EffectIntent', {})).length;
+    const originalTransaction = ctx.database.transaction.bind(ctx.database);
+    let interruptionCommitted = false;
+    let settlementFaultInjected = false;
+    ctx.database.transaction = async (steps) => {
+      if (
+        interruptionCommitted
+        && !settlementFaultInjected
+        && steps.some((step) => step.kind === 'insert' && step.domain === 'ToolOutcome')
+      ) {
+        settlementFaultInjected = true;
+        throw new Error('simulated Host loss before interrupted wait settlement');
+      }
+      const commit = await originalTransaction(steps);
+      if (steps.some((step) => step.kind === 'insert' && step.domain === 'ChildInterruptionRequest')) {
+        interruptionCommitted = true;
+      }
+      return commit;
+    };
+    await assert.rejects(ctx.services.children.interruptSubtree({
+      sourceKey: 'recovery-interrupt-before-wait-settlement',
+      childExecutionId: child.childExecutionId,
+      reason: 'fixture interruption survives Host loss'
+    }), /simulated Host loss before interrupted wait settlement/);
+    ctx.database.transaction = originalTransaction;
+    assert.equal(settlementFaultInjected, true);
+    assert.equal((await get(ctx.database, 'ChildExecution', child.childExecutionId)).status, 'interrupting');
+    assert.equal((await get(ctx.database, 'ChildExecutionIntentLink', pending.intentLinkId)).state, 'cancelled');
+    assert.equal((await list(ctx.database, 'ChildInterruptionRequest', {
+      root_child_execution_id: child.childExecutionId
+    })).length, 1);
+    assert.equal((await list(ctx.database, 'ChildInterruptionLineageLink', {
+      child_execution_id: child.childExecutionId
+    })).length, 1);
+    assert.equal((await list(ctx.database, 'ChildInterruptionTurnLink', {
+      child_execution_id: child.childExecutionId
+    })).length, 1);
+    assert.equal((await list(ctx.database, 'ChildInterruptionIntentLink', {
+      child_execution_id: child.childExecutionId
+    })).length, 1);
+    assert.equal((await list(ctx.database, 'ToolModelResult', {
+      tool_call_id: recoveryContinuationTool.toolCallId
+    })).length, 0);
     await closeRuntime(ctx);
     await reopenRuntime(ctx, 'recovery-cancel-restart');
-    const first = await ctx.services.recovery.run(kernel.PHASE_F_RECOVERY_CANCELLED_SUBTREE_INCOMPLETE);
-    const second = await ctx.services.recovery.run(kernel.PHASE_F_RECOVERY_CANCELLED_SUBTREE_INCOMPLETE);
+    const all = await ctx.services.recovery.runAll();
+    const first = all.find((result) => result.id === kernel.PHASE_F_RECOVERY_INTERRUPTED_SUBTREE_INCOMPLETE);
+    assert.ok(first);
+    const second = await ctx.services.recovery.run(kernel.PHASE_F_RECOVERY_INTERRUPTED_SUBTREE_INCOMPLETE);
     assert.equal(first.reconciled, 1);
+    assert.equal((await list(ctx.database, 'ChildExecutionActiveTurnLink', {
+      child_execution_id: terminalPointerChild.childExecutionId
+    })).length, 0);
+    assert.equal((await get(ctx.database, 'ChildExecution', terminalPointerChild.childExecutionId)).status, 'idle');
+    assert.equal((await get(ctx.database, 'ChildExecution', child.childExecutionId)).status, 'interrupting');
     assert.equal((await get(ctx.database, 'ChildExecutionIntentLink', pending.intentLinkId)).state, 'cancelled');
     assert.equal((await list(ctx.database, 'PendingTurnInput', {
       turn_id: child.childTurnId,
       input_kind: 'termination_request'
     })).length, 1);
     assert.equal((await list(ctx.database, 'EffectIntent', {})).length, effectsBefore);
+    assert.equal((await list(ctx.database, 'ToolModelResult', {
+      tool_call_id: recoveryContinuationTool.toolCallId
+    })).length, 1);
+    assert.equal(
+      (await ctx.services.effects.readTerminalResult(recoveryContinuationTool.toolCallId, false)).status,
+      'cancelled'
+    );
     assert.equal(second.reconciled, 0);
     assert.equal((await list(ctx.database, 'PendingTurnInput', {
       turn_id: child.childTurnId,
       input_kind: 'termination_request'
     })).length, 1);
-    assertions.push('已登记cancel_subtree但缺active终止/pending intent取消的故障状态跨restart被稳定ParentLink续扫补齐');
-    assertions.push('重复扫描不重复termination input、不派发外部effect，active Turn仍等待正常终止回执');
-    faults.push('cancel_subtree marker committed before subtree cancellation facts');
+    assertions.push('interrupt_subtree将Request及lineage/turn/intent目标、终止输入和Intent取消原子提交，Host在父等待结算前退出时恢复扫描只补齐缺失ToolOutcome');
+    assertions.push('子Turn已终止但Host丢失observe回调时，runAll按持久终态清除ActiveTurnLink并恢复idle');
+    assertions.push('重复扫描不重复Interruption目标、termination input或ToolOutcome，不派发外部effect；active中断Turn仍等待正常终止回执');
+    faults.push('interruption transaction committed before parent wait settlement', 'child Turn terminal committed before active pointer cleanup');
     return { assertions, faults, metrics: { firstReconciled: first.reconciled, secondScanned: second.scanned } };
   });
 }
@@ -1333,6 +2363,7 @@ async function checkParentHandlingMatrix() {
     const answer = await ctx.services.answers.submit({
       answerBridgeId: child.answerBridgeId,
       submissionId: 'parent-handling-answer',
+      sourceTurnId: child.childTurnId,
       content: 'answer'
     });
     const pending = await ctx.services.deliveries.create({
@@ -1355,8 +2386,14 @@ async function checkParentHandlingMatrix() {
     const handled = await ctx.services.deliveries.markInputHandled(consumed.inputLink.pending_turn_input_id);
     assert.equal(handled.parentHandlingState, 'handled');
 
+    const notifyAnswer = await ctx.services.answers.submit({
+      answerBridgeId: child.answerBridgeId,
+      submissionId: 'parent-handling-notify-answer',
+      sourceTurnId: child.childTurnId,
+      content: 'notification'
+    });
     const notify = await ctx.services.deliveries.create({
-      inboxItemId: answer.inboxItemId,
+      inboxItemId: notifyAnswer.inboxItemId,
       targetConversationId: parent.conversationId,
       phase: 'notify_only'
     });
@@ -1373,6 +2410,7 @@ async function checkParentHandlingMatrix() {
     const extraAnswer = await ctx.services.answers.submit({
       answerBridgeId: child.answerBridgeId,
       submissionId: 'parent-handling-extra-answer',
+      sourceTurnId: child.childTurnId,
       content: 'extra notification'
     });
     const deliveryChanges = [];
@@ -1523,30 +2561,40 @@ async function spawnStartedChild(ctx, parentTurnId, suffix, completionPolicy, op
 async function seedMessageRows(ctx, conversationId, count, startSeq, suffix) {
   if (count <= 0) return;
   const content = await ctx.store.ingest(ctx.database, `shared-${suffix}`, 'text/plain');
-  const steps = [];
-  for (let index = 0; index < count; index += 1) {
-    const seq = startSeq + index;
-    const id = `message-${suffix}-${String(seq).padStart(6, '0')}`;
-    const revisionId = `revision-${suffix}-${String(seq).padStart(6, '0')}`;
-    steps.push(
-      kernel.DOMAIN_REPOSITORIES.domain('Message').insert({
-        id, created_at: NOW, updated_at: NOW, deleted_at: null
-      }),
-      kernel.DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
-        id: revisionId, message_id: id, revision_seq: 1n, role: seq % 2 ? 'user' : 'assistant',
-        content_object_id: content.id, created_at: NOW
-      }),
-      kernel.DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
-        id: `current-${suffix}-${String(seq).padStart(6, '0')}`,
-        message_id: id, revision_id: revisionId, updated_at: NOW
-      }),
-      kernel.DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insert({
-        id: `membership-${suffix}-${String(seq).padStart(6, '0')}`,
-        conversation_id: conversationId, message_id: id, message_seq: BigInt(seq), created_at: NOW
-      })
-    );
+  const batchSize = 500;
+  for (let batchStart = 0; batchStart < count; batchStart += batchSize) {
+    const steps = [];
+    const batchEnd = Math.min(count, batchStart + batchSize);
+    for (let index = batchStart; index < batchEnd; index += 1) {
+      const seq = startSeq + index;
+      const id = `message-${suffix}-${String(seq).padStart(6, '0')}`;
+      const revisionId = `revision-${suffix}-${String(seq).padStart(6, '0')}`;
+      steps.push(
+        kernel.DOMAIN_REPOSITORIES.domain('Message').insert({
+          id, created_at: NOW, updated_at: NOW, deleted_at: null
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
+          id: revisionId, message_id: id, revision_seq: 1n, role: seq % 2 ? 'user' : 'model',
+          content_object_id: content.id, created_at: NOW
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
+          id: `current-${suffix}-${String(seq).padStart(6, '0')}`,
+          message_id: id, revision_id: revisionId, updated_at: NOW
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insert({
+          id: `membership-${suffix}-${String(seq).padStart(6, '0')}`,
+          conversation_id: conversationId, message_id: id, message_seq: BigInt(seq), created_at: NOW
+        })
+      );
+    }
+    await ctx.database.transaction(steps);
   }
-  await ctx.database.transaction(steps);
+}
+
+function percentile(values, quantile) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * quantile))];
 }
 
 async function list(database, domain, where = {}) {
@@ -1586,6 +2634,77 @@ function acknowledge(feed, connection, message) {
 
 function wireBytes(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function emptyClientProjection(conversationId) {
+  return {
+    navigationSummary: { conversations: [] },
+    activeConversationWindow: {
+      conversationId, messages: [], visibleMessageCount: '0', lastMessageSeq: '0',
+      projectContexts: [], conversationProjectLinks: [], conversationReuseLinks: [],
+      conversationBranchLinks: [], conversationOriginLinks: [], agentConversationLinks: [],
+      compressionBlocks: [], conversationContextStatuses: [], taskList: []
+    },
+    activeTurnSummary: {
+      turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [],
+      modelRequests: [], modelRequestMessageLinks: []
+    },
+    activeToolAndInteractionSummary: {
+      messageTurnLinks: [], toolCalls: [], toolCallSourceLinks: [], toolCallPolicySnapshots: [],
+      toolCallEvents: [], toolExecutions: [], toolOutcomes: [], toolModelResults: [],
+      toolResultArtifacts: [], interactionRequests: [], interactionOwnerLinks: [],
+      interactionToolCallLinks: [], interactionResponses: [], fileChangeSets: [],
+      fileChangeSetMembers: [], fileChangeDecisions: [], fileMutationReceipts: [],
+      fileMutationReceiptMembers: [], processes: [], processOriginLinks: [], processOutputChunks: [],
+      processReceipts: []
+    },
+    subagentDeliverySummary: {
+      childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
+      childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [],
+      childTurnTerminations: [], childTurnExecutorLinks: [], answerBridges: [],
+      answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: []
+    }
+  };
+}
+
+function assertCausalSnapshotBundles(projections) {
+  const window = projections.activeConversationWindow;
+  const turns = projections.activeTurnSummary;
+  const tools = projections.activeToolAndInteractionSummary;
+  const messageIds = new Set(window.messages.map((row) => row.id));
+  const turnIds = new Set(turns.turns.map((row) => row.id));
+  const requestIds = new Set(turns.modelRequests.map((row) => row.id));
+  const toolCallIds = new Set(tools.toolCalls.map((row) => row.id));
+  const processIds = new Set(tools.processes.map((row) => row.id));
+  const requestLinkIds = new Set();
+  for (const link of turns.modelRequestMessageLinks) {
+    assert.ok(requestIds.has(link.model_request_id));
+    assert.ok(messageIds.has(link.message_id));
+    requestLinkIds.add(link.model_request_id);
+  }
+  for (const requestId of requestIds) assert.ok(requestLinkIds.has(requestId));
+  const messageTurnIds = new Set();
+  for (const link of tools.messageTurnLinks) {
+    assert.ok(messageIds.has(link.message_id));
+    assert.ok(turnIds.has(link.turn_id));
+    messageTurnIds.add(link.message_id);
+  }
+  for (const messageId of messageIds) assert.ok(messageTurnIds.has(messageId));
+  const sourceToolIds = new Set();
+  for (const link of tools.toolCallSourceLinks) {
+    assert.ok(toolCallIds.has(link.tool_call_id));
+    assert.ok(requestIds.has(link.model_request_id));
+    assert.ok(messageIds.has(link.message_id));
+    sourceToolIds.add(link.tool_call_id);
+  }
+  for (const toolCallId of toolCallIds) assert.ok(sourceToolIds.has(toolCallId));
+  const originProcessIds = new Set();
+  for (const link of tools.processOriginLinks) {
+    assert.ok(processIds.has(link.process_id));
+    assert.ok(toolCallIds.has(link.tool_call_id));
+    originProcessIds.add(link.process_id);
+  }
+  for (const processId of processIds) assert.ok(originProcessIds.has(processId));
 }
 
 function maxArrayLength(value) {

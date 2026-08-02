@@ -8,18 +8,18 @@ export function isYoloToolPolicy(policy: Pick<ToolPolicyRecord, 'preset'> | unde
 }
 
 export function isToolAllowedByPolicy(policy: ToolPolicyLike, tool: ToolDefinitionLike): boolean {
-  if (isYoloToolPolicy(policy)) return true;
-  if (policy.allowedTools.includes(tool.name)) return true;
-  if (tool.source?.kind !== 'mcp') return false;
+  const explicitlyAllowed = policy.allowedTools.includes(tool.name);
+  if (tool.source?.kind !== 'mcp') return explicitlyAllowed;
   const sourceId = tool.source.sourceId?.trim();
-  if (!sourceId) return false;
+  if (!sourceId) return explicitlyAllowed;
   const sourceConfig = policy.sourceConfigs?.[sourceId];
-  if (!sourceConfig?.enabled) return false;
+  if (!sourceConfig) return explicitlyAllowed;
+  if (!sourceConfig.enabled) return false;
   return !(sourceConfig.disabledTools ?? []).includes(tool.name);
 }
 
 export function isToolNameAllowedByPolicy(policy: ToolPolicyLike, toolName: string, tool?: ToolDefinitionLike): boolean {
   if (tool) return isToolAllowedByPolicy(policy, tool);
   const name = toolName.trim();
-  return !!name && (isYoloToolPolicy(policy) || policy.allowedTools.includes(name));
+  return !!name && policy.allowedTools.includes(name);
 }

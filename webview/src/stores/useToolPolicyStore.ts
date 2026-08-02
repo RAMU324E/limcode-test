@@ -11,6 +11,7 @@ import type {
   ToolPolicyScopeSetPayload,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
+import { resolveToolPolicyLayers, type ToolPolicyLayer } from '@shared/toolPolicyResolution';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 
@@ -146,15 +147,32 @@ export const useToolPolicyStore = defineStore('toolPolicy', {
     },
     effectivePolicyFor(scopeKind: ToolPolicyScopeKind, scopeId?: string): ToolPolicyResolution {
       const local = this.localPolicyFor(scopeKind, scopeId);
-      if (local.policy) return local;
-
       const clientState = useClientStateStore();
-      if (scopeKind !== 'global') {
-        const global = this.localPolicyFor('global');
-        if (global.policy) return { ...global, inheritedFrom: 'global' };
+      const global = this.localPolicyFor('global');
+      const globalPolicy = global.policy ?? defaultToolPolicy(clientState.toolDefinitions, 'global');
+      if (scopeKind === 'global') {
+        return global.policy ? global : { policy: globalPolicy, inheritedFrom: 'global' };
       }
-
-      return { policy: defaultToolPolicy(clientState.toolDefinitions, 'global'), inheritedFrom: 'global' };
+      const layers: ToolPolicyLayer[] = [
+        { scopeKind: 'global', policy: globalPolicy },
+        ...(local.policy ? [{ scopeKind, policy: local.policy }] : [])
+      ];
+      const resolved = resolveToolPolicyLayers(
+        layers,
+        clientState.toolDefinitions.map((tool) => tool.name)
+      );
+      return {
+        policy: {
+          id: resolved.id ?? globalPolicy.id,
+          name: local.policy?.name ?? globalPolicy.name,
+          allowedTools: resolved.allowedTools,
+          preset: resolved.preset,
+          toolConfigs: resolved.toolConfigs,
+          sourceConfigs: resolved.sourceConfigs
+        },
+        ...(local.link ? { link: local.link } : {}),
+        ...(!local.policy ? { inheritedFrom: 'global' as const } : {})
+      };
     },
     setPolicyForScope(scopeKind: ToolPolicyScopeKind, scopeId: string | undefined, allowedTools: string[], name?: string, toolConfigs?: Record<string, ToolPolicyToolConfigRecord>, sourceConfigs?: Record<string, ToolPolicySourceConfigRecord>, preset?: ToolPolicyPresetKind): void {
       const clientState = useClientStateStore();

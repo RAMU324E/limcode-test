@@ -56,10 +56,12 @@ export enum BridgeMessageType {
   TurnStart = 'turn.start',
   TurnEnqueue = 'turn.enqueue',
   TurnInterrupt = 'turn.interrupt',
+  TurnInterruptResult = 'turn.interrupt.result',
   InteractionResolve = 'interaction.resolve',
   ConversationOpen = 'conversation.open',
   ConversationCreate = 'conversation.create',
   ConversationFork = 'conversation.fork',
+  ConversationForkResult = 'conversation.fork.result',
   AgentCreate = 'agent.create',
   AgentUpdate = 'agent.update',
   AgentDelete = 'agent.delete',
@@ -72,6 +74,9 @@ export enum BridgeMessageType {
   MessageEdit = 'message.edit',
   MessageDeleteFrom = 'message.deleteFrom',
   MessageRetryFrom = 'message.retryFrom',
+  ConversationActionResult = 'conversation.action.result',
+  CompressionStart = 'compression.start',
+  CompressionCommandResult = 'compression.command.result',
   ToolPolicyScopeSet = 'toolPolicy.scope.set',
   ToolPolicyScopeClear = 'toolPolicy.scope.clear',
   SkillPolicyScopeSet = 'skillPolicy.scope.set',
@@ -201,6 +206,11 @@ export interface SidebarConversationHistoryEntry {
   updatedAt: number;
   agentName?: string;
   isRunning: boolean;
+  /** Exact active Turn identity used by Sidebar Stop; never resolve a successor at click handling time. */
+  activeTurnId?: string;
+  executionLeaseGeneration?: string;
+  /** Read-only reliable-runtime projection; child states are never inferred from display text. */
+  runState?: 'running' | 'awaiting_parent' | 'completed' | 'delivery_failed' | 'interrupted';
   runStatusLabel?: string;
   projectFolderUri?: string;
   projectName?: string;
@@ -526,6 +536,8 @@ export const DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT = [
   '规则：',
   '- 只总结本回合。“前情”仅用于保持连贯的只读参考，不要重新总结它。',
   '- 文件路径、函数名、标识符、数字等关键细节要按原文保留，不要编造。',
+  '- 用户明确要求核对、记住或稍后复用的事实，以及工具结果中的对应键值，必须逐项写入摘要。',
+  '- 不得用“读取了N个文件”“工具执行成功”等数量或状态概述替代这些具体事实。',
   '- 输出连贯的纯文本段落，不要使用 Markdown 标题(#)，以免与拼接时的分段标题冲突。',
   '- 必须把最终摘要用 <summary></summary> 标签包裹，标签外不要写其它内容。'
 ].join('\n');
@@ -1552,6 +1564,8 @@ export type MessagePresentation = 'visible' | 'internal';
 
 export interface MessageRecord {
   id: string;
+  /** Immutable revision observed when an edit interaction begins. */
+  revisionId?: string;
   conversationId: string;
   role: MsgRole;
   model?: string;
@@ -1561,8 +1575,12 @@ export interface MessageRecord {
   status: MessageMaterializationStatus;
   createdAt: number;
   requestStartedAt?: number;
+  firstChunkAt?: number;
+  completedAt?: number;
   streamOutputDurationMs?: number;
   usageMetadata?: LlmUsageMetadataRecord;
+  /** Exact Runtime fact used when the user retries this projected model output. */
+  retryTarget?: MessageRetryTarget;
   seq: number;
 }
 
@@ -1606,21 +1624,23 @@ export interface ToolCallRecord {
   updatedAt: number;
 }
 
-export const TOOL_CALL_PREVIEW_MAX_CHARS = 64 * 1024;
-export const TOOL_CALL_PREVIEW_HEAD_CHARS = 8 * 1024;
-
 /** Process-local preview of one function call while its JSON arguments are still arriving. */
 export interface ToolCallPreviewRecord {
   id: string;
   callId: string;
   name?: string;
   streamIndex?: string;
-  /** Complete arguments while small, otherwise the immutable leading window. */
-  argumentsHead: string;
-  /** Rolling trailing window after the 64 KiB preview limit is crossed. */
-  argumentsTail: string;
+  /** Complete arguments received for the current stream epoch. */
+  argumentsText: string;
   receivedChars: number;
-  truncated: boolean;
+  /**
+   * Incrementally decoded fields used by the streaming presentation. Their presence means the
+   * producer has already scanned the argument prefix; consumers must not rescan it from byte zero.
+   */
+  argumentPreviewFields?: Partial<Record<
+    'path' | 'content' | 'plan' | 'command' | 'explanation',
+    { value: string; closed: boolean }
+  >>;
   createdAt: number;
   updatedAt: number;
 }
@@ -1780,6 +1800,8 @@ export interface RunTerminationRecord {
   /** Run.phase immediately before the terminal transition. */
   interruptedPhase: Exclude<TurnExecutionPhase, 'terminal'>;
   reasonCode: RunTerminationReasonCode;
+  /** Exact reliable-runtime termination detail for user-visible diagnostics. */
+  detail?: string;
   /** Present when another Run caused this Run to terminate. */
   triggerRunId?: string;
   createdAt: number;
@@ -2226,53 +2248,74 @@ export interface ChatModelOverrideRecord {
   model: string;
 }
 
+/** Next-Turn authority captured atomically with TurnStart/TurnEnqueue. */
+export interface TurnAuthoritySelection {
+  agentId?: string;
+  model?: ChatModelOverrideRecord;
+}
+
 export interface ConversationCommandMetadata {
   commandId: string;
   expectedVersion: number;
   issuedAt: number;
 }
 
-export interface TurnStartPayload {
+export interface TurnStartPayload extends TurnAuthoritySelection {
   conversationId: string;
   command: ConversationCommandMetadata;
   text?: string;
   content?: MessageContent;
-  agentId?: string;
-  model?: ChatModelOverrideRecord;
 }
 
-export interface TurnEnqueuePayload {
+export interface TurnEnqueuePayload extends TurnAuthoritySelection {
   conversationId: string;
   command: ConversationCommandMetadata;
   text?: string;
   content?: MessageContent;
-  agentId?: string;
-  model?: ChatModelOverrideRecord;
 }
 
 export interface TurnInterruptPayload {
   conversationId: string;
   command: ConversationCommandMetadata;
   turnId: string;
+  /** Positive expected ExecutionLease generation; 0 asks the host to resolve this exact Turn. */
   leaseEpoch: number;
   cascadeChildAgents?: boolean;
 }
 
-export interface MessageEditPayload {
+export interface TurnInterruptResultPayload {
+  conversationId: string;
+  turnId: string;
+  status: 'accepted' | 'coalesced' | 'already_terminal';
+  pendingTurnInputId?: string;
+  cascadeChildAgents: boolean;
+}
+
+export interface MessageEditPayload extends TurnAuthoritySelection {
   conversationId: string;
   command: ConversationCommandMetadata;
   messageId: string;
+  expectedRevisionId: string;
   text?: string;
   content?: MessageContent;
   runAfterEdit?: boolean;
   deleteFollowing?: boolean;
-  model?: ChatModelOverrideRecord;
 }
 export interface ConversationOpenPayload { conversationId: string; title?: string }
 export interface ConversationCreatePayload { projectFolderUri?: string }
 export interface ConversationForkPayload {
   sourceConversationId: string;
   messageId: string;
+  expectedRevisionId: string;
+  command: ConversationCommandMetadata;
+}
+export interface ConversationForkResultPayload {
+  sourceConversationId: string;
+  messageId: string;
+  expectedRevisionId: string;
+  commandId: string;
+  conversationId: string;
+  status: 'accepted' | 'already_applied';
 }
 export interface AgentCreatePayload { name: string; description?: string; kind?: string }
 export interface AgentUpdatePayload { agentId: string; name?: string; description?: string; kind?: string }
@@ -2282,11 +2325,52 @@ export interface MessageDeleteFromPayload {
   command: ConversationCommandMetadata;
   messageId: string;
 }
-export interface MessageRetryFromPayload {
+export type MessageRetryTarget =
+  | { kind: 'message'; messageId: string }
+  | { kind: 'model_request'; modelRequestId: string };
+
+interface MessageRetryFromPayloadBase extends TurnAuthoritySelection {
   conversationId: string;
   command: ConversationCommandMetadata;
-  messageId: string;
-  model?: ChatModelOverrideRecord;
+}
+
+export type MessageRetryFromPayload = MessageRetryFromPayloadBase & (
+  | { target: Extract<MessageRetryTarget, { kind: 'message' }>; expectedRevisionId: string }
+  | { target: Extract<MessageRetryTarget, { kind: 'model_request' }> }
+);
+
+export type ConversationActionKind = 'edit' | 'retry' | 'delete';
+
+export interface ConversationActionResultPayload {
+  action: ConversationActionKind;
+  conversationId: string;
+  commandId: string;
+  target: MessageRetryTarget;
+  status: 'accepted' | 'already_applied' | 'busy';
+  turnId?: string;
+  messageRevisionId?: string;
+}
+
+export type CompressionCommandTarget =
+  | { kind: 'current_head'; expectedRootId: string }
+  | { kind: 'through_message'; messageId: string; expectedRevisionId: string };
+
+/** Server-derived compression admission. Webviews never choose a Context root, range or method. */
+export interface CompressionStartPayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  target: CompressionCommandTarget;
+}
+
+export interface CompressionCommandResultPayload {
+  conversationId: string;
+  commandId: string;
+  target: CompressionCommandTarget;
+  status: 'accepted' | 'already_applied' | 'in_progress' | 'busy' | 'rejected';
+  turnId?: string;
+  modelRequestId?: string;
+  compressionBlockId?: string;
+  reasonCode?: string;
 }
 export type InteractionOutcomeStatus =
   | 'committed'
@@ -2649,6 +2733,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.MessageEdit, MessageEditPayload>
   | BridgeEnvelope<BridgeMessageType.MessageDeleteFrom, MessageDeleteFromPayload>
   | BridgeEnvelope<BridgeMessageType.MessageRetryFrom, MessageRetryFromPayload>
+  | BridgeEnvelope<BridgeMessageType.CompressionStart, CompressionStartPayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeSet, ToolPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.ToolPolicyScopeClear, ToolPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.SkillPolicyScopeSet, SkillPolicyScopeSetPayload>
@@ -2697,6 +2782,10 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
   | BridgeEnvelope<BridgeMessageType.Error, { requestType?: string; message: string }>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>
+  | BridgeEnvelope<BridgeMessageType.ConversationActionResult, ConversationActionResultPayload>
+  | BridgeEnvelope<BridgeMessageType.ConversationForkResult, ConversationForkResultPayload>
+  | BridgeEnvelope<BridgeMessageType.CompressionCommandResult, CompressionCommandResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConfigurationSnapshot, ConfigurationSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.LlmProviderModelsSnapshot, LlmProviderModelsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointGitStatusSnapshot, CheckpointGitStatusSnapshotPayload>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import {
   IconArrowFork,
   IconArrowNarrowDown,
@@ -9,11 +9,11 @@ import {
   IconClock,
   IconCopy,
   IconEdit,
-  IconEye,
   IconHourglassEmpty,
   IconHash,
   IconRefresh,
-  IconTrash
+  IconTrash,
+  IconX
 } from '@tabler/icons-vue';
 import { isVisibleTextPart, type LlmUsageMetadataRecord, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
 import RichContentView from '@webview/components/content/RichContentView.vue';
@@ -26,8 +26,8 @@ const props = withDefaults(
     message: MessageRecord;
     runId?: string;
     termination?: RunTerminationRecord;
+    terminationNoticeSuppressed?: boolean;
     runHadCompletedTools?: boolean;
-    runDetailLoading?: boolean;
     deleteCount?: number;
     floorNumber?: number;
     compactCount?: number;
@@ -35,9 +35,13 @@ const props = withDefaults(
     entering?: boolean;
     editingHighlighted?: boolean;
     mutationPending?: boolean;
+    mutationBlocked?: boolean;
+    retryBlocked?: boolean;
+    compactBlocked?: boolean;
+    forkBlocked?: boolean;
     pendingLabel?: string;
   }>(),
-  { runId: undefined, termination: undefined, runHadCompletedTools: false, runDetailLoading: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, mutationPending: false, pendingLabel: '正在提交操作' }
+  { runId: undefined, termination: undefined, terminationNoticeSuppressed: false, runHadCompletedTools: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, mutationPending: false, mutationBlocked: false, retryBlocked: false, compactBlocked: false, forkBlocked: false, pendingLabel: '正在提交操作' }
 );
 
 const emit = defineEmits<{
@@ -46,7 +50,7 @@ const emit = defineEmits<{
   (event: 'delete-from', message: MessageRecord): void;
   (event: 'compact-to', message: MessageRecord): void;
   (event: 'fork-from', message: MessageRecord): void;
-  (event: 'view-run-detail', message: MessageRecord): void;
+  (event: 'dismiss-termination', termination: RunTerminationRecord): void;
 }>();
 
 const roleLabel = computed(() => {
@@ -96,12 +100,29 @@ interface TokenUsageItem {
 const hasOwn = Object.prototype.hasOwnProperty;
 const LOCAL_DAY_MS = 86_400_000;
 const streaming = computed(() => props.message.status === 'streaming');
+const messageMutationBlocked = computed(() => props.mutationPending || props.mutationBlocked);
+const retryMutationBlocked = computed(() => props.mutationPending || props.retryBlocked);
+const compactMutationBlocked = computed(() => props.mutationPending || props.compactBlocked);
+const forkMutationBlocked = computed(() => props.mutationPending || props.forkBlocked);
 const copied = ref(false);
 const terminatedContentExpanded = ref(false);
 const confirmRetryOpen = ref(false);
 const confirmDeleteOpen = ref(false);
 const confirmCompactOpen = ref(false);
 const confirmForkOpen = ref(false);
+watch(messageMutationBlocked, (blocked) => {
+  if (!blocked) return;
+  confirmDeleteOpen.value = false;
+});
+watch(retryMutationBlocked, (blocked) => {
+  if (blocked) confirmRetryOpen.value = false;
+});
+watch(compactMutationBlocked, (blocked) => {
+  if (blocked) confirmCompactOpen.value = false;
+});
+watch(forkMutationBlocked, (blocked) => {
+  if (blocked) confirmForkOpen.value = false;
+});
 const deleteDescriptionHtml = computed(
   () => `将删除这条消息以及它之后的所有共 ${props.deleteCount} 条消息，此操作<strong>无法撤销</strong>。`
 );
@@ -141,7 +162,11 @@ const tokenUsageItems = computed<TokenUsageItem[]>(() => {
 });
 
 const runMetricItems = computed<RunMetricItem[]>(() => {
-  const startedAt = normalizeTimestamp(props.message.createdAt);
+  const startedAt = normalizeTimestamp(
+    props.message.role === 'model'
+      ? props.message.firstChunkAt ?? props.message.createdAt
+      : props.message.createdAt
+  );
   const timeMetric: RunMetricItem | undefined = startedAt !== undefined
     ? {
         key: 'time' as const,
@@ -156,13 +181,22 @@ const runMetricItems = computed<RunMetricItem[]>(() => {
     return [timeMetric].filter((item): item is RunMetricItem => item !== undefined);
   }
 
-  const streamDurationMs = normalizeDurationMs(props.message.streamOutputDurationMs);
+  const explicitStreamDurationMs = normalizeDurationMs(props.message.streamOutputDurationMs);
   const requestStartedAt = normalizeTimestamp(props.message.requestStartedAt);
-  const firstChunkAt = normalizeTimestamp(props.message.createdAt);
+  const firstChunkAt = normalizeTimestamp(props.message.firstChunkAt ?? props.message.createdAt);
+  const completedAt = normalizeTimestamp(props.message.completedAt);
+  const streamDurationMs = explicitStreamDurationMs
+    ?? (firstChunkAt !== undefined && completedAt !== undefined && completedAt >= firstChunkAt
+      ? completedAt - firstChunkAt
+      : undefined);
   const ttftMs = requestStartedAt !== undefined && firstChunkAt !== undefined && firstChunkAt >= requestStartedAt
     ? firstChunkAt - requestStartedAt
     : undefined;
-  const totalMs = ttftMs !== undefined ? ttftMs + (streamDurationMs ?? 0) : undefined;
+  const totalMs = requestStartedAt !== undefined && completedAt !== undefined && completedAt >= requestStartedAt
+    ? completedAt - requestStartedAt
+    : ttftMs !== undefined && streamDurationMs !== undefined
+      ? ttftMs + streamDurationMs
+      : undefined;
   const outputTokens = props.message.usageMetadata
     ? normalizeTokenUsage(props.message.usageMetadata).output
     : undefined;
@@ -263,26 +297,37 @@ const terminatedPartial = computed(() => props.message.role === 'model'
   && props.message.status === 'partial'
   && props.termination !== undefined);
 const hasTerminatedAuditContent = computed(() => terminatedPartial.value && props.message.content.parts.length > 0);
-const showMessageContent = computed(() => !terminatedPartial.value || terminatedContentExpanded.value);
+const showMessageContent = computed(() =>
+  !terminatedPartial.value || props.terminationNoticeSuppressed || terminatedContentExpanded.value
+);
 const terminationNotice = computed(() => {
+  const detail = props.termination?.detail?.trim().replace(/[。.!！?？]+$/, '');
   if (props.termination?.reasonCode === 'empty_model_result') {
     return props.runHadCompletedTools
       ? '工具调用已完成，但模型没有返回可显示的最终说明。本轮已明确失败，工具结果仍会保留。'
       : '模型调用已结束，但没有返回可显示的正文。本轮已明确失败，不会以空回复静默完成。';
   }
   if (props.runHadCompletedTools) {
-    return '本轮在工具调用后被终止，未生成最终说明；工具结果已保留，未完成回复不会计入后续模型上下文。';
+    return detail
+      ? `本轮在工具调用后未正常完成：${detail}。工具结果已保留。`
+      : '本轮在工具调用后被终止，未生成最终说明；工具结果已保留，未完成回复不会计入后续模型上下文。';
   }
+  if (detail) return `本次回复未正常完成：${detail}`;
   return props.termination?.kind === 'failed'
     ? '本次回复未正常完成。未完成的回复正文不会进入后续模型上下文；已完成的工具事实和中断边界仍会保留。'
     : '本次回复已终止。未完成的回复正文不会进入后续模型上下文；已完成的工具事实和中断边界仍会保留。';
 });
 const terminationTooltipRows = computed(() => props.termination ? [
-  { label: '原因', value: props.termination.reasonCode },
+  { label: '原因', value: props.termination.detail?.trim() || props.termination.reasonCode },
+  ...(props.termination.detail?.trim() ? [{ label: '分类', value: props.termination.reasonCode }] : []),
   { label: '上下文', value: '未完成正文不进入后续模型上下文' },
   { label: '保留事实', value: '已执行工具结果与中断边界' }
 ] : []);
-const copyableMessageText = computed(() => terminatedPartial.value && !terminatedContentExpanded.value ? '' : messageText.value);
+const copyableMessageText = computed(() =>
+  terminatedPartial.value && !props.terminationNoticeSuppressed && !terminatedContentExpanded.value
+    ? ''
+    : messageText.value
+);
 
 function toggleTerminatedContent(): void {
   terminatedContentExpanded.value = !terminatedContentExpanded.value;
@@ -625,26 +670,27 @@ function writeClipboardFallback(text: string): boolean {
 }
 
 function openDeleteConfirm(): void {
+  if (messageMutationBlocked.value) return;
   confirmDeleteOpen.value = true;
 }
 
 function openCompactConfirm(): void {
+  if (compactMutationBlocked.value) return;
   confirmCompactOpen.value = true;
 }
 
 function openForkConfirm(): void {
+  if (forkMutationBlocked.value) return;
   confirmForkOpen.value = true;
 }
 
 function editMessage(): void {
+  if (messageMutationBlocked.value) return;
   emit('edit-message', props.message);
 }
 
-function viewRunDetail(): void {
-  emit('view-run-detail', props.message);
-}
-
 function openRetryConfirm(): void {
+  if (retryMutationBlocked.value) return;
   confirmRetryOpen.value = true;
 }
 
@@ -653,6 +699,7 @@ function cancelRetry(): void {
 }
 
 function confirmRetry(): void {
+  if (retryMutationBlocked.value) return cancelRetry();
   emit('retry-from', props.message);
   confirmRetryOpen.value = false;
 }
@@ -662,6 +709,7 @@ function cancelDelete(): void {
 }
 
 function confirmDelete(): void {
+  if (messageMutationBlocked.value) return cancelDelete();
   emit('delete-from', props.message);
   confirmDeleteOpen.value = false;
 }
@@ -671,6 +719,7 @@ function cancelCompact(): void {
 }
 
 function confirmCompact(): void {
+  if (compactMutationBlocked.value) return cancelCompact();
   emit('compact-to', props.message);
   confirmCompactOpen.value = false;
 }
@@ -680,6 +729,7 @@ function cancelFork(): void {
 }
 
 function confirmFork(): void {
+  if (forkMutationBlocked.value) return cancelFork();
   emit('fork-from', props.message);
   confirmForkOpen.value = false;
 }
@@ -696,7 +746,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 </script>
 
 <template>
-  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted, 'is-mutation-pending': mutationPending }]" :data-scroll-marker-id="message.id">
+  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted, 'is-mutation-pending': mutationPending }]" :data-scroll-marker-id="message.id" :data-message-id="message.id">
     <div class="floor-container">
       <div class="floor-content-column">
         <header class="floor-header">
@@ -718,10 +768,18 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
           </HoverTooltipPanel>
         </header>
         <div class="floor-body">
-          <div v-if="terminatedPartial" class="terminated-message-placeholder">
+          <div v-if="termination && !terminationNoticeSuppressed" class="terminated-message-placeholder">
             <p>{{ terminationNotice }}</p>
             <button
-              v-if="hasTerminatedAuditContent"
+              type="button"
+              class="terminated-notice-dismiss"
+              aria-label="关闭本轮终止提示"
+              @click="emit('dismiss-termination', termination)"
+            >
+              <IconX :size="15" stroke="1.9" />
+            </button>
+            <button
+              v-if="terminatedPartial && hasTerminatedAuditContent"
               type="button"
               class="terminated-content-toggle"
               :aria-expanded="terminatedContentExpanded"
@@ -784,22 +842,10 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
     </div>
     <div class="message-actions" aria-label="消息操作">
       <button
-        v-if="message.role !== 'user'"
-        type="button"
-        class="message-action-button"
-        :class="{ 'is-loading': runDetailLoading }"
-        :disabled="runDetailLoading"
-        aria-label="查看本次 LLM 调用详情"
-        title="查看本次 LLM 调用详情"
-        @click="viewRunDetail"
-      >
-        <IconEye class="message-action-icon" stroke="2" aria-hidden="true" />
-      </button>
-      <button
         v-if="message.role === 'user'"
         type="button"
         class="message-action-button"
-        :disabled="mutationPending"
+        :disabled="messageMutationBlocked"
         aria-label="编辑消息"
         title="编辑消息"
         @click="editMessage"
@@ -810,7 +856,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
         v-if="message.role !== 'user'"
         type="button"
         class="message-action-button"
-        :disabled="mutationPending"
+        :disabled="retryMutationBlocked"
         aria-label="重试此消息"
         title="重试此消息"
         @click="openRetryConfirm"
@@ -820,9 +866,10 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
       <button
         type="button"
         class="message-action-button"
-        :disabled="streaming || compactCount < 1"
+        :disabled="compactMutationBlocked || compactCount < 1"
         aria-label="总结到此处"
         title="总结到此处"
+        data-testid="compression-start-to"
         @click="openCompactConfirm"
       >
         <svg class="message-action-icon message-compact-icon" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
@@ -833,7 +880,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
       <button
         type="button"
         class="message-action-button"
-        :disabled="streaming || terminatedPartial || floorNumber < 1"
+        :disabled="forkMutationBlocked || terminatedPartial || floorNumber < 1"
         :aria-label="terminatedPartial ? '已终止的 partial 回复不能作为分支边界' : '复制本对话至此'"
         :title="terminatedPartial ? '请选择上一条完整消息创建分支' : '复制本对话至此'"
         @click="openForkConfirm"
@@ -855,7 +902,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
       <button
         type="button"
         class="message-action-button"
-        :disabled="mutationPending"
+        :disabled="messageMutationBlocked"
         aria-label="删除到此消息"
         title="删除到此消息"
         @click="openDeleteConfirm"
@@ -884,6 +931,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
       title="总结到此处？"
       :description-html="compactDescriptionHtml"
       confirm-label="开始总结"
+      test-id="compression-start-confirm"
       @confirm="confirmCompact"
       @cancel="cancelCompact"
     />
@@ -1094,15 +1142,39 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 }
 
 .terminated-message-placeholder {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 6px;
-  padding: 8px 10px;
+  padding: 8px 38px 8px 10px;
   border-left: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
   color: var(--vscode-descriptionForeground);
   background: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
   font-size: var(--font-size-sm);
+}
+
+.terminated-notice-dismiss {
+  position: absolute;
+  top: 5px;
+  right: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+}
+
+.terminated-notice-dismiss:hover,
+.terminated-notice-dismiss:focus-visible {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-panel-border);
+  outline: none;
 }
 
 .terminated-message-placeholder p {

@@ -190,6 +190,7 @@ export interface FsCapability {
 
 export interface WorkEnvironmentCapabilityOptions {
   workEnvironment?: WorkEnvironmentRecord;
+  signal?: AbortSignal;
   /**
    * 当前运行策略允许访问的工作环境集合。
    * 当 allowOutsideProjectPaths=false 时，本地绝对路径只要落在这些本地环境根目录内也应放行；
@@ -302,6 +303,7 @@ export interface WorkEnvironmentTransferContext {
   activeWorkEnvironment?: WorkEnvironmentRecord;
   availableWorkEnvironments?: WorkEnvironmentRecord[];
   allowOutsideProjectPaths?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface WorkEnvironmentTransferEntryResult {
@@ -342,7 +344,7 @@ export interface CommandCapability {
   /** 将仍在前台等待的本地命令立即转入后台；不存在、已结束或不支持后台化时返回 false。 */
   backgroundForeground(executionId: string): boolean;
   /** 读取某后台进程当前已累积的日志；默认 peek。模型 mode=output 可 claimTerminal，Webview 被动读取不得 claim。 */
-  readOutput(processId: string, limits: CommandOutputLimits, options?: { consume?: boolean; claimTerminal?: boolean }): CommandRunResult;
+  readOutput(processId: string, limits?: CommandOutputLimits, options?: { consume?: boolean; claimTerminal?: boolean }): CommandRunResult;
   /** 终止某后台进程；终止后日志仍保留，直到显式 consume。 */
   kill(processId: string): CommandRunResult;
   /** data-root 切换前把所有前台命令完成 handoff，并终止/持久化本实例拥有的后台进程。 */

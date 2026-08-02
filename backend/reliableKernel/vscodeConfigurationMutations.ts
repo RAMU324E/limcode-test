@@ -223,6 +223,7 @@ export class VscodeConfigurationMutations {
       const byId = new Map(records.map((record) => [record.id, record]));
       const now = Date.now();
       const activeIds = new Set<string>();
+      let environmentsChanged = false;
       for (const folder of folders) {
         const uri = requireText(folder.uri, 'workspace folder uri');
         const id = workEnvironmentIdFromUri(uri);
@@ -237,20 +238,27 @@ export class VscodeConfigurationMutations {
           createdAt: byId.get(id)?.createdAt ?? now,
           updatedAt: now
         }, now);
-        activeIds.add(record.id);
-        byId.set(record.id, record);
+        const existing = byId.get(record.id);
+        const next = existing && sameWorkspaceEnvironment(existing, record)
+          ? existing
+          : record;
+        if (next !== existing) environmentsChanged = true;
+        activeIds.add(next.id);
+        byId.set(next.id, next);
       }
       for (const [id, record] of byId) {
-        if (record.source === 'workspaceFolder' && !activeIds.has(id)) {
+        if (record.source === 'workspaceFolder' && !activeIds.has(id) && record.available) {
           byId.set(id, { ...record, available: false, updatedAt: now });
+          environmentsChanged = true;
         }
       }
-      await saveStore(spec, [...byId.values()]);
+      if (environmentsChanged) await saveStore(spec, [...byId.values()]);
 
       const availableIds = new Set([...byId.values()].filter((record) => record.available).map((record) => record.id));
       const activeWorkspaceIds = [...activeIds];
       const policies = workEnvironmentPolicyStore(paths);
-      await saveStore(policies, (await loadStore(policies)).map((policy) => {
+      let policiesChanged = false;
+      const nextPolicies = (await loadStore(policies)).map((policy) => {
         const availableAllowed = policy.allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
         const allowedWorkEnvironmentIds = availableAllowed.length > 0 || activeWorkspaceIds.length === 0
           ? [...policy.allowedWorkEnvironmentIds]
@@ -264,6 +272,7 @@ export class VscodeConfigurationMutations {
           && allowedWorkEnvironmentIds.every((id, index) => id === policy.allowedWorkEnvironmentIds[index])
           && defaultWorkEnvironmentId === policy.defaultWorkEnvironmentId;
         if (unchanged) return policy;
+        policiesChanged = true;
         const { defaultWorkEnvironmentId: _staleDefault, ...rest } = policy;
         return {
           ...rest,
@@ -271,7 +280,8 @@ export class VscodeConfigurationMutations {
           ...(defaultWorkEnvironmentId ? { defaultWorkEnvironmentId } : {}),
           updatedAt: now
         };
-      }));
+      });
+      if (policiesChanged) await saveStore(policies, nextPolicies);
     });
   }
 
@@ -887,6 +897,18 @@ function latest<T extends { id: string; createdAt: number; updatedAt: number }>(
   return [...records].sort((left, right) =>
     right.updatedAt - left.updatedAt || right.createdAt - left.createdAt || right.id.localeCompare(left.id)
   )[0];
+}
+
+function sameWorkspaceEnvironment(left: WorkEnvironmentRecord, right: WorkEnvironmentRecord): boolean {
+  return left.id === right.id
+    && left.kind === right.kind
+    && left.source === right.source
+    && left.name === right.name
+    && left.uri === right.uri
+    && left.rootPath === right.rootPath
+    && left.displayPath === right.displayPath
+    && left.index === right.index
+    && left.available === right.available;
 }
 
 function builtinAgent(id: string): AgentRecord | undefined {

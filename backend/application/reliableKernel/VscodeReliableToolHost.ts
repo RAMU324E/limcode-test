@@ -18,12 +18,14 @@ import {
   toolDefinitionRecord,
   type ToolDefinition,
   type ToolExecutionContext,
-  type ToolResultOut
+  type ToolResultOut,
+  type ToolRuntimeEvent
 } from '../../world/modules/tools/registry';
 import type { RuleFileRecord, RuleScope, SkillDefinitionRecord, ToolDefinitionRecord, WorkEnvironmentRecord } from '../../../shared/protocol';
 import type {
   ReliableAgentToolDispatchInput,
-  ReliableAgentToolPause
+  ReliableAgentToolPause,
+  ReliableAgentToolSettled
 } from '../../reliableKernel/agentLoop';
 import {
   LocalFileToolPlanner,
@@ -38,13 +40,17 @@ import type {
 import { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
 import type { PlainJsonValue } from '../../reliableKernel/plainJson';
 import { resolveFrozenWorkEnvironmentBoundary } from '../../reliableKernel/workEnvironmentBoundary';
+import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 
 export interface VscodeReliableToolHostOptions {
   dispatchSpecial?: (
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
-  ) => Promise<ToolTerminalResult | ReliableAgentToolPause | undefined>;
+    authority: ReliableToolDispatchAuthority,
+    signal: AbortSignal
+  ) => Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled | undefined>;
+  cancelTurnWaits?: (input: { turnId: string; reason: string }) => Promise<void>;
+  quiesce?: (reason: ExecutionHandoffError) => Promise<void>;
 }
 
 /** VS Code capability adapter only; Runtime lifecycle remains owned by ReliableToolDispatcher. */
@@ -57,6 +63,8 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   private readonly commandDeclaration = commandDeclarationCapability();
   private readonly builtins: ToolDefinition[];
   private readonly filePlanner: LocalFileToolPlanner;
+  private initialization: Promise<void> | undefined;
+  private onStateChange: (() => void) | undefined;
 
   public constructor(
     context: vscode.ExtensionContext,
@@ -66,16 +74,22 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     this.skills = createSkillCatalogCapability(context);
     this.rules = createRulesCatalogCapability(context);
     this.mcp = new McpRuntimeManager(configuration);
+    this.mcp.setStateChangeListener(() => this.notifyStateChange());
     this.builtins = createBuiltinToolDefinitions({ command: this.commandDeclaration });
     this.filePlanner = new LocalFileToolPlanner((inputPath, authority) => this.resolveFilePath(inputPath, authority));
   }
 
-  public async initialize(): Promise<void> {
-    await Promise.all([
+  public initialize(): Promise<void> {
+    this.initialization ??= Promise.all([
       this.skills.refresh(),
       this.rules.refresh(),
       this.mcp.refreshFromSettings({ discover: true })
-    ]);
+    ]).then(() => { this.notifyStateChange(); });
+    return this.initialization;
+  }
+
+  public setStateChangeListener(listener: (() => void) | undefined): void {
+    this.onStateChange = listener;
   }
 
   public async dispose(): Promise<void> {
@@ -103,21 +117,26 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
 
   public async refreshSkillCatalog(): Promise<void> {
     await this.skills.refresh();
+    this.notifyStateChange();
   }
 
   public async refreshRulesCatalog(): Promise<void> {
     await this.rules.refresh();
+    this.notifyStateChange();
   }
 
   public async saveRulesFile(scope: RuleScope, content: string): Promise<void> {
     await this.rules.writeAgents(scope, content);
     await this.rules.refresh();
+    this.notifyStateChange();
   }
 
   public async executeNoEffect(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
+    authority: ReliableToolDispatchAuthority,
+    emit: (event: ToolRuntimeEvent) => void,
+    signal: AbortSignal
   ): Promise<ToolResultOut> {
     if (definition.execution !== 'runtime') throw new Error(`Tool ${definition.declaration.name} is not a runtime definition.`);
     if (!['read', 'skills'].includes(definition.declaration.name)) {
@@ -134,7 +153,42 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       ...(environments.active ? { workEnvironment: environments.active } : {}),
       workEnvironments: environments.allowed,
       accessibleWorkEnvironments: environments.allowed,
-      emit() {}
+      signal,
+      emit
+    };
+    return definition.execute(input.arguments, {
+      fs: this.fs,
+      command: this.commandDeclaration,
+      workEnvironment: this.workEnvironment,
+      skills: this.skills
+    }, context);
+  }
+
+  public async executeWorkEnvironmentTransfer(
+    definition: ToolDefinition,
+    input: ReliableAgentToolDispatchInput,
+    authority: ReliableToolDispatchAuthority,
+    emit: (event: ToolRuntimeEvent) => void,
+    signal: AbortSignal
+  ): Promise<ToolResultOut> {
+    if (definition.execution !== 'runtime' || definition.declaration.name !== 'transfer') {
+      throw new Error(`Tool ${definition.declaration.name} is not the reliable transfer capability.`);
+    }
+    const policy = authorityWorkEnvironmentPolicy(authority.document);
+    if (!policy.enabled) throw new Error('冻结 WorkEnvironmentPolicy 已关闭 transfer。');
+    const environments = await this.resolveEnvironments(authority);
+    const context: ToolExecutionContext = {
+      toolCallId: input.toolCallId,
+      conversationId: authorityConversationId(authority.document),
+      ...(authority.toolConfig?.config ? { config: plainClone(authority.toolConfig.config) } : {}),
+      settingsSnapshot: {
+        enableMultimodalTools: authorityMultimodalEnabled(authority.document)
+      },
+      ...(environments.active ? { workEnvironment: environments.active } : {}),
+      workEnvironments: environments.allowed,
+      accessibleWorkEnvironments: environments.allowed,
+      signal,
+      emit
     };
     return definition.execute(input.arguments, {
       fs: this.fs,
@@ -147,9 +201,10 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   public planFileMutation(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
+    authority: ReliableToolDispatchAuthority,
+    signal: AbortSignal
   ) {
-    return this.filePlanner.plan(definition, input, authority);
+    return this.filePlanner.plan(definition, input, authority, signal);
   }
 
   public async resolveProcessCwd(
@@ -172,11 +227,24 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   public dispatchSpecial(
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
-    authority: ReliableToolDispatchAuthority
-  ): Promise<ToolTerminalResult | ReliableAgentToolPause | undefined> {
+    authority: ReliableToolDispatchAuthority,
+    signal: AbortSignal
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled | undefined> {
     return this.options.dispatchSpecial
-      ? this.options.dispatchSpecial(definition, input, authority)
+      ? this.options.dispatchSpecial(definition, input, authority, signal)
       : Promise.resolve(undefined);
+  }
+
+  public async cancelTurnWaits(input: { turnId: string; reason: string }): Promise<void> {
+    await this.options.cancelTurnWaits?.(input);
+  }
+
+  public async quiesce(reason: ExecutionHandoffError): Promise<void> {
+    await this.options.quiesce?.(reason);
+  }
+
+  private notifyStateChange(): void {
+    this.onStateChange?.();
   }
 
   private async resolveFilePath(
@@ -229,7 +297,7 @@ function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {
     enabled: policy.enabled !== false,
     allowedWorkEnvironmentIds: policy.allowedWorkEnvironmentIds.map((id, index) =>
       requireText(id, `allowedWorkEnvironmentIds[${index}]`)),
-    defaultWorkEnvironmentId: policy.defaultWorkEnvironmentId === null
+    defaultWorkEnvironmentId: policy.defaultWorkEnvironmentId === null || policy.defaultWorkEnvironmentId === undefined
       ? null
       : requireText(policy.defaultWorkEnvironmentId, 'defaultWorkEnvironmentId')
   };

@@ -636,6 +636,72 @@ async function checkFileProposalResultSeparated() {
     assert.equal((await list(ctx.database, 'FileMutationReceipt', { change_set_id: proposal.changeSetId })).length, 1);
     assertions.push('批准后才建Effect并按base/target/actual摘要真实修改，Receipt后生成唯一模型结果');
 
+    const nestedWriteTool = await createTool(ctx, effects, 'file-nested-parent-create', 'write');
+    const planner = new kernel.LocalFileToolPlanner((inputPath) =>
+      kernel.resolvePathInsideBoundary('workspace', workspace, inputPath)
+    );
+    const nestedMembers = await planner.plan(
+      phaseDRuntimeDefinition('write'),
+      {
+        turnId: ctx.turnId,
+        modelRequestId: 'model-file-nested-parent-create',
+        toolCallId: nestedWriteTool.toolCallId,
+        toolName: 'write',
+        arguments: { path: 'nested/level/source.txt', content: 'nested-parent-body' }
+      },
+      { snapshotId: 'authority-file-nested-parent-create', document: {} }
+    );
+    assert.deepEqual(nestedMembers.map((member) => [member.operation, member.targetPath]), [
+      ['create_directory', 'nested'],
+      ['create_directory', 'nested/level'],
+      ['create_file', 'nested/level/source.txt']
+    ]);
+    const nestedProposal = await files.propose({
+      source: source('internal', 'file-nested-parent-create:proposal'),
+      toolCallId: nestedWriteTool.toolCallId,
+      members: nestedMembers
+    });
+    const nestedApproved = await files.decide({
+      source: source('command', 'file-nested-parent-create:approve'),
+      changeSetId: nestedProposal.changeSetId,
+      decision: 'approved'
+    });
+    const nestedRequest = await effects.readEffectRequest(nestedApproved.preparedEffect.effectIntentId);
+    await dispatcher.inspect(nestedRequest);
+    assert.equal(await exists(path.join(workspace, 'nested')), false, 'recovery inspect must remain read-only');
+    const nestedApplied = await dispatcher.dispatchRecordAndReconcile(
+      nestedApproved.preparedEffect.effectIntentId
+    );
+    assert.equal(nestedApplied.observation.outcome, 'succeeded');
+    assert.equal(nestedApplied.terminal.status, 'succeeded');
+    assert.equal(await fs.readFile(path.join(workspace, 'nested/level/source.txt'), 'utf8'), 'nested-parent-body');
+    const nestedDomainReceipt = (await list(ctx.database, 'FileMutationReceipt', {
+      change_set_id: nestedProposal.changeSetId
+    }))[0];
+    const nestedReceiptMembers = await list(ctx.database, 'FileMutationReceiptMember', {
+      receipt_id: nestedDomainReceipt.id
+    });
+    assert.equal(nestedReceiptMembers.length, 3);
+    assert.ok(nestedReceiptMembers.every((member) => member.outcome === 'succeeded'));
+    assertions.push('write缺失多层父目录时先提案显式create_directory成员；inspect不建目录，批准后逐级边界校验并由Receipt覆盖目录与文件');
+
+    const outsideWriteRoot = path.join(ctx.parent, 'outside-write-parent');
+    await fs.mkdir(outsideWriteRoot);
+    await fs.symlink(outsideWriteRoot, path.join(workspace, 'linked-parent'), 'dir');
+    await assert.rejects(planner.plan(
+      phaseDRuntimeDefinition('write'),
+      {
+        turnId: ctx.turnId,
+        modelRequestId: 'model-file-linked-parent',
+        toolCallId: 'tool-call-file-linked-parent',
+        toolName: 'write',
+        arguments: { path: 'linked-parent/escape.txt', content: 'must-not-escape' }
+      },
+      { snapshotId: 'authority-file-linked-parent', document: {} }
+    ), /Symbolic-link write parents are not allowed/);
+    assert.equal(await exists(path.join(outsideWriteRoot, 'escape.txt')), false);
+    assertions.push('缺失父目录规划逐级lstat，符号链接父级在提案前拒绝且不向边界外写入');
+
     const rejectTool = await createTool(ctx, effects, 'file-reject', 'write');
     const rejectProposal = await files.propose({
       source: source('internal', 'file-reject:proposal'),
@@ -1036,6 +1102,8 @@ async function checkFileProposalResultSeparated() {
       assertions,
       faults: [
         'approval-before-mutation',
+        'write missing parent directories',
+        'write parent symlink escape',
         'rejected-no-effect',
         'first-response-wins',
         'first response before ordered model result',
@@ -1125,11 +1193,10 @@ async function checkEffectReceiptReconcile() {
       request: { serverId: 'local', toolName: 'transition', arguments: {}, riskLevel: 'command' }
     });
     await effects.claimEffectDispatch(transitionPrepared.effectIntentId);
-    const originalSnapshotAll = ctx.database.snapshotAll.bind(ctx.database);
+    const originalReceiptCandidates = ctx.database.effectReceiptReconciliationCandidates.bind(ctx.database);
     let transitionInjected = false;
-    ctx.database.snapshotAll = async (read) => {
-      const value = await originalSnapshotAll(read);
-      if (!transitionInjected && read.domain === 'EffectIntent' && read.where?.dispatch_state === 'receipt_written') {
+    ctx.database.effectReceiptReconciliationCandidates = async () => {
+      if (!transitionInjected) {
         transitionInjected = true;
         await effects.recordEffectReceipt({
           source: source('callback', 'receipt-transition-gap:callback'),
@@ -1138,12 +1205,12 @@ async function checkEffectReceiptReconcile() {
           outcome: 'succeeded'
         });
       }
-      return value;
+      return originalReceiptCandidates();
     };
     try {
       await scanner.runAll();
     } finally {
-      ctx.database.snapshotAll = originalSnapshotAll;
+      ctx.database.effectReceiptReconciliationCandidates = originalReceiptCandidates;
     }
     assert.equal(transitionInjected, true);
     assert.equal((await effects.readTerminalResult(transitionTool.toolCallId, true)).status, 'succeeded');
@@ -1453,7 +1520,7 @@ async function checkProcessWrapperRecovery() {
       ctx.database, ctx.store, effects, ctx.authority, ctx.binding
     );
     const tool = await createTool(ctx, effects, 'process-restart', 'bash');
-    const command = `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>{process.stdout.write('restart-output\\n')},300)")}`;
+    const command = `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>{process.stdout.write('restart-output\\n'+'\\0'.repeat(8000))},3000)")}`;
     const prepared = await processes.prepareStart({
       source: source('internal', 'process-restart:prepare'),
       toolCallId: tool.toolCallId,
@@ -1462,8 +1529,197 @@ async function checkProcessWrapperRecovery() {
     });
     const started = await processes.dispatchStart(prepared.effect.effectIntentId);
     assert.equal(started.observation.outcome, 'succeeded');
+    assert.equal(started.observation.state, 'background_started');
+    assert.equal(started.observation.processId, prepared.request.processId);
+    assert.equal(started.terminal.status, 'succeeded');
+    const handoffOutcome = (await list(ctx.database, 'ToolOutcome', { tool_call_id: tool.toolCallId }))[0];
+    const handoffOutcomeMetadata = await get(ctx.database, 'ContentObject', handoffOutcome.content_object_id);
+    const handoffModelResult = JSON.parse((await ctx.store.read(handoffOutcomeMetadata)).toString('utf8'));
+    assert.equal(handoffModelResult.detail.operations[0].detail.state, 'background_started');
+    assert.equal(handoffModelResult.detail.operations[0].detail.processId, prepared.request.processId);
     const processId = prepared.request.processId;
     await ctx.database.close();
+
+    let recoveryApp = await kernel.ReliableKernelApplication.open(
+      ctx.authority,
+      phaseDApplicationDependencies()
+    );
+    let lifecycleProcessId;
+    try {
+      const recovery = await recoveryApp.recover();
+      assert.equal(recovery.phaseD.length, 2);
+      assert.equal((await get(recoveryApp.database, 'Process', processId)).status, 'running');
+      assert.equal((await list(recoveryApp.database, 'ProcessReceipt', { process_id: processId })).length, 0);
+      assert.deepEqual(recoveryApp.processes.inspectExitObservers().activeProcessIds, [processId]);
+
+      const exitedRow = await waitForPersistedProcessStatus(
+        recoveryApp.database,
+        processId,
+        new Set(['exited']),
+        10_000
+      );
+      assert.equal(exitedRow.status, 'exited');
+      await waitForNoExitObservers(recoveryApp.processes, 2_000);
+      const processReceipt = (await list(recoveryApp.database, 'ProcessReceipt', { process_id: processId }))[0];
+      assert.ok(processReceipt);
+      const completionInbox = await waitForSingleRow(
+        recoveryApp.database,
+        'RuntimeInboxItem',
+        { source_kind: 'process_receipt', source_id: processReceipt.id },
+        5_000
+      );
+      const completionPayloadLink = (await list(recoveryApp.database, 'RuntimeInboxPayloadLink', {
+        inbox_item_id: completionInbox.id
+      }))[0];
+      assert.ok(completionPayloadLink);
+      const completionPayloadMetadata = await get(
+        recoveryApp.database,
+        'ContentObject',
+        completionPayloadLink.content_object_id
+      );
+      const completionPayload = JSON.parse((await recoveryApp.contentStore.read(completionPayloadMetadata)).toString('utf8'));
+      assert.equal(completionPayload.kind, 'process_completion');
+      assert.equal(completionPayload.processId, processId);
+      assert.ok(completionPayload.output.stdoutTail.length > 0);
+      assert.ok(completionPayload.output.stdoutTail.length < 8_000, 'escape-heavy output tail must shrink to the payload bound');
+      assert.ok(Buffer.byteLength(JSON.stringify(completionPayload), 'utf8') <= kernel.PROCESS_COMPLETION_MAX_PAYLOAD_BYTES);
+      const completionDelivery = await waitForSingleRow(
+        recoveryApp.database,
+        'RuntimeDelivery',
+        { inbox_item_id: completionInbox.id },
+        5_000
+      );
+      assert.equal(completionDelivery.phase, 'current_turn');
+      assert.equal(completionDelivery.state, 'pending');
+      const completionWake = await waitForSingleRow(
+        recoveryApp.database,
+        'RuntimeDeliveryWake',
+        { delivery_id: completionDelivery.id },
+        5_000
+      );
+      assert.ok(
+        completionWake.state === 'pending' || completionWake.state === 'claimed',
+        `delivery wake may be observed before or after the live dispatcher claim, got ${String(completionWake.state)}`
+      );
+      await Promise.all([
+        recoveryApp.processDeliveries.scanNow(),
+        recoveryApp.processDeliveries.scanNow(),
+        recoveryApp.processDeliveries.scanNow()
+      ]);
+      assert.equal((await list(recoveryApp.database, 'RuntimeInboxItem', {
+        source_kind: 'process_receipt', source_id: processReceipt.id
+      })).length, 1);
+      assert.equal((await list(recoveryApp.database, 'RuntimeDelivery', {
+        inbox_item_id: completionInbox.id
+      })).length, 1);
+      assert.equal((await list(recoveryApp.database, 'RuntimeDeliveryWake', {
+        delivery_id: completionDelivery.id
+      })).length, 1);
+      const firstRead = await recoveryApp.processes.readOutputPage(processId);
+      const secondRead = await recoveryApp.processes.readOutputPage(processId);
+      assert.equal(firstRead.stdout, secondRead.stdout);
+      assert.match(firstRead.stdout, /restart-output/);
+      const processReceiptRace = await Promise.all([
+        recoveryApp.processes.reconcileProcessExit(processId),
+        recoveryApp.processes.reconcileProcessExit(processId)
+      ]);
+      assert.ok(processReceiptRace.every((entry) => entry.state === 'exited'));
+      assert.equal((await list(recoveryApp.database, 'ProcessReceipt', { process_id: processId })).length, 1);
+      const exitOperations = await list(recoveryApp.database, 'Operation', { owner_kind: 'process', owner_id: processId });
+      assert.equal(exitOperations.length, 1);
+      assert.equal(exitOperations[0].tool_call_id, null);
+      const exitAttempts = await list(recoveryApp.database, 'Attempt', { operation_id: exitOperations[0].id });
+      const exitIntents = await list(recoveryApp.database, 'EffectIntent', { attempt_id: exitAttempts[0].id });
+      const exitReceipts = await list(recoveryApp.database, 'EffectReceipt', { attempt_id: exitAttempts[0].id });
+      assert.equal(exitIntents[0].effect_kind, 'process_exit');
+      assert.equal(exitIntents[0].dispatch_state, 'receipt_written');
+      assert.equal(exitReceipts.length, 1);
+      const detachedCommandReceipts = await list(recoveryApp.database, 'CommandReceipt', { conversation_id: null });
+      assert.ok(detachedCommandReceipts.length > 0);
+      assert.ok(detachedCommandReceipts.every((entry) => entry.turn_id === null));
+      assertions.push('foreground wait到期以background_started+processId终态化原ToolCall；ProcessReceipt自动有界reconcile输出并建立通用Inbox payload Link、Delivery和持久wake，竞争扫描保持各一份');
+
+      const lifecycleTool = await createTool(ctx, recoveryApp.runtime.effects, 'process-observer-close', 'bash');
+      const lifecyclePrepared = await recoveryApp.processes.prepareStart({
+        source: source('internal', 'process-observer-close:prepare'),
+        toolCallId: lifecycleTool.toolCallId,
+        command: `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>process.stdout.write('observer-close\\n'),3000)")}`,
+        cwd: parent
+      });
+      await recoveryApp.processes.dispatchStart(lifecyclePrepared.effect.effectIntentId, 0);
+      lifecycleProcessId = lifecyclePrepared.request.processId;
+      const lifecycleRow = await get(recoveryApp.database, 'Process', lifecycleProcessId);
+      const lifecycleExitReceiptPath = path.join(
+        kernel.processSpoolPath(ctx.binding, lifecycleRow.spool_locator),
+        kernel.PROCESS_WRAPPER_EXIT_RECEIPT_FILE
+      );
+      assert.ok(recoveryApp.processes.inspectExitObservers().activeProcessIds.includes(lifecycleProcessId));
+      const closeStarted = Date.now();
+      await recoveryApp.close();
+      assert.ok(Date.now() - closeStarted < 1_500, '关闭应用不得等待外部后台进程退出');
+      assert.equal(await exists(lifecycleExitReceiptPath), false, '关闭完成时外部进程仍应运行且尚无exit receipt');
+      assert.deepEqual(recoveryApp.processes.inspectExitObservers().activeProcessIds, []);
+      recoveryApp = undefined;
+    } finally {
+      if (recoveryApp) await recoveryApp.close().catch(() => undefined);
+    }
+
+    const wakeRequests = [];
+    let wakeRecoveryApp = await kernel.ReliableKernelApplication.open(
+      ctx.authority,
+      phaseDApplicationDependencies({
+        processCompletionWakeHandler: async (request) => {
+          wakeRequests.push(request);
+          return { acknowledged: true };
+        }
+      })
+    );
+    try {
+      await wakeRecoveryApp.recover();
+      const lifecycleExited = await waitForPersistedProcessStatus(
+        wakeRecoveryApp.database,
+        lifecycleProcessId,
+        new Set(['exited']),
+        10_000
+      );
+      assert.equal(lifecycleExited.status, 'exited');
+      const lifecycleReceipt = await waitForSingleRow(
+        wakeRecoveryApp.database,
+        'ProcessReceipt',
+        { process_id: lifecycleProcessId },
+        5_000
+      );
+      const lifecycleInbox = await waitForSingleRow(
+        wakeRecoveryApp.database,
+        'RuntimeInboxItem',
+        { source_kind: 'process_receipt', source_id: lifecycleReceipt.id },
+        5_000
+      );
+      const lifecycleDelivery = await waitForSingleRow(
+        wakeRecoveryApp.database,
+        'RuntimeDelivery',
+        { inbox_item_id: lifecycleInbox.id },
+        5_000
+      );
+      const lifecycleWake = await waitForRowState(
+        wakeRecoveryApp.database,
+        'RuntimeDeliveryWake',
+        { delivery_id: lifecycleDelivery.id },
+        'acknowledged',
+        5_000
+      );
+      assert.ok(lifecycleWake.acknowledged_at);
+      assert.ok(wakeRequests.some((request) =>
+        request.processId === lifecycleProcessId && request.action === 'resume_current_turn'
+      ));
+      assert.ok(wakeRequests.some((request) =>
+        request.processId === processId && request.action === 'resume_current_turn'
+      ));
+      assertions.push('detached wrapper跨完整应用重启后，启动level scan修复已提交但未投递/未唤醒窗口；迟到receipt自动生成唯一Delivery，持久wake由新宿主ACK并携带安全边界resume动作');
+    } finally {
+      await wakeRecoveryApp.close().catch(() => undefined);
+      wakeRecoveryApp = undefined;
+    }
 
     ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId: 'process-restart-host' });
     ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
@@ -1471,33 +1727,102 @@ async function checkProcessWrapperRecovery() {
     processes = new kernel.ProcessControlPlane(
       ctx.database, ctx.store, effects, ctx.authority, ctx.binding
     );
-    const exited = await waitUntilTerminal(processes, processId, 10_000);
-    assert.equal(exited.state, 'exited');
-    assert.equal(exited.receipt.exitCode, '0');
-    await processes.reconcileOutput(processId);
-    const firstRead = await processes.readOutput(processId);
-    const secondRead = await processes.readOutput(processId);
-    assert.equal(firstRead.stdout.toString('utf8'), secondRead.stdout.toString('utf8'));
-    assert.match(firstRead.stdout.toString('utf8'), /restart-output/);
-    const processReceiptRace = await Promise.all([
-      processes.reconcileProcessExit(processId),
-      processes.reconcileProcessExit(processId)
+    assert.equal((await list(ctx.database, 'ProcessReceipt', { process_id: lifecycleProcessId })).length, 1);
+    assertions.push('应用关闭会唤醒并清空观察器而不等待外部进程；process_exit receipt保持nullable关系和first-wins，read_output重复读取不消费');
+
+    const idleContext = await createAdditionalTurn(ctx, 'process-idle-delivery');
+    const idleTool = await createTool({ ...ctx, turnId: idleContext.turnId }, effects, 'process-idle-delivery', 'bash');
+    const idlePrepared = await processes.prepareStart({
+      source: source('internal', 'process-idle-delivery:prepare'),
+      toolCallId: idleTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>process.stdout.write('idle-complete\\n'),250)")}`,
+      cwd: parent
+    });
+    const idleStarted = await processes.dispatchStart(idlePrepared.effect.effectIntentId, 0);
+    assert.equal(idleStarted.observation.state, 'background_started');
+    const idleNow = new Date().toISOString();
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('ExecutionLease').delete(idleContext.leaseId),
+      kernel.DOMAIN_REPOSITORIES.domain('TurnTermination').insert({
+        id: 'termination-process-idle-delivery',
+        turn_id: idleContext.turnId,
+        terminal_status: 'completed',
+        reason: 'fixture became idle after background handoff',
+        created_at: idleNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('Turn').update(idleContext.turnId, {
+        status: 'terminated',
+        updated_at: idleNow,
+        terminal_at: idleNow
+      })
     ]);
-    assert.ok(processReceiptRace.every((entry) => entry.state === 'exited'));
-    assert.equal((await list(ctx.database, 'ProcessReceipt', { process_id: processId })).length, 1);
-    const exitOperations = await list(ctx.database, 'Operation', { owner_kind: 'process', owner_id: processId });
-    assert.equal(exitOperations.length, 1);
-    assert.equal(exitOperations[0].tool_call_id, null);
-    const exitAttempts = await list(ctx.database, 'Attempt', { operation_id: exitOperations[0].id });
-    const exitIntents = await list(ctx.database, 'EffectIntent', { attempt_id: exitAttempts[0].id });
-    const exitReceipts = await list(ctx.database, 'EffectReceipt', { attempt_id: exitAttempts[0].id });
-    assert.equal(exitIntents[0].effect_kind, 'process_exit');
-    assert.equal(exitIntents[0].dispatch_state, 'receipt_written');
-    assert.equal(exitReceipts.length, 1);
-    const detachedCommandReceipts = await list(ctx.database, 'CommandReceipt', { conversation_id: null });
-    assert.ok(detachedCommandReceipts.length > 0);
-    assert.ok(detachedCommandReceipts.every((entry) => entry.turn_id === null));
-    assertions.push('detached wrapper跨数据库/控制对象重启保留spool和真实exitCode；process_exit receipt使用nullable关系而非伪Conversation；并发reconcile只写一个ProcessReceipt；read_output重复读取不消费');
+    const idleWakeRequests = [];
+    const idleDeliveries = new kernel.RuntimeDeliveryControlPlane(ctx.database);
+    const idleDispatcher = new kernel.ProcessCompletionDeliveryControlPlane(
+      ctx.database,
+      ctx.store,
+      processes,
+      idleDeliveries,
+      {
+        scanIntervalMs: 25,
+        wakeHandler: async (request) => {
+          idleWakeRequests.push(request);
+          return { acknowledged: true };
+        }
+      }
+    );
+    processes.setProcessReceiptObserver((completedProcessId) => {
+      idleDispatcher.notifyProcessReceipt(completedProcessId);
+    });
+    await idleDispatcher.start();
+    try {
+      const idleExited = await waitUntilTerminal(processes, idlePrepared.request.processId, 5_000);
+      assert.equal(idleExited.state, 'exited');
+      await processes.reconcileProcessExit(idlePrepared.request.processId);
+      const idleReceipt = await waitForSingleRow(
+        ctx.database,
+        'ProcessReceipt',
+        { process_id: idlePrepared.request.processId },
+        5_000
+      );
+      const idleInbox = await waitForSingleRow(
+        ctx.database,
+        'RuntimeInboxItem',
+        { source_kind: 'process_receipt', source_id: idleReceipt.id },
+        5_000
+      );
+      const idleDelivery = await waitForSingleRow(
+        ctx.database,
+        'RuntimeDelivery',
+        { inbox_item_id: idleInbox.id },
+        5_000
+      );
+      assert.equal(idleDelivery.phase, 'next_turn');
+      assert.equal(idleDelivery.target_turn_id, null);
+      const acknowledgedIdleWake = await waitForRowState(
+        ctx.database,
+        'RuntimeDeliveryWake',
+        { delivery_id: idleDelivery.id },
+        'acknowledged',
+        5_000
+      );
+      await assert.rejects(ctx.database.transaction([
+        kernel.DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').update(acknowledgedIdleWake.id, {
+          state: 'pending',
+          acknowledged_at: null,
+          updated_at: new Date().toISOString()
+        })
+      ]), /cannot transition/);
+      assert.ok(idleWakeRequests.some((request) =>
+        request.processId === idlePrepared.request.processId
+          && request.action === 'start_continuation'
+          && request.sourceTurnId === idleContext.turnId
+      ));
+      assertions.push('后台完成时Conversation空闲则Delivery保持next_turn，持久wake请求继承sourceTurn的内部continuation而不悬挂原ToolCall');
+    } finally {
+      processes.setProcessReceiptObserver(undefined);
+      await idleDispatcher.dispose();
+    }
 
     const quickTool = await createTool(ctx, effects, 'process-quick-failure', 'bash');
     const quickPrepared = await processes.prepareStart({
@@ -1515,7 +1840,61 @@ async function checkProcessWrapperRecovery() {
     }))[0];
     assert.equal(quickProcessReceipt.outcome, 'failed');
     assert.equal(quickProcessReceipt.exit_code, 7n);
-    assertions.push('快速非零退出由wrapper原子receipt决定ToolOutcome=failed，不把仅启动成功伪装为执行成功');
+    const poisonNow = new Date().toISOString();
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('ProcessCompletionDispatch').insert({
+        id: 'process-completion-dispatch-poison-foreground',
+        process_receipt_id: quickProcessReceipt.id,
+        state: 'pending',
+        claim_owner_host_boot_id: null,
+        claim_generation: 0n,
+        claim_expires_at: null,
+        attempt_count: 0n,
+        failure_count: 0n,
+        next_attempt_at: null,
+        last_error: null,
+        completed_at: null,
+        created_at: poisonNow,
+        updated_at: poisonNow
+      })
+    ]);
+    const poisonErrors = [];
+    const poisonDispatcher = new kernel.ProcessCompletionDeliveryControlPlane(
+      ctx.database,
+      ctx.store,
+      processes,
+      new kernel.RuntimeDeliveryControlPlane(ctx.database),
+      {
+        scanIntervalMs: 10,
+        claimTtlMs: 100,
+        retryBaseMs: 10,
+        maxFailureCount: 2,
+        onError: (entry) => poisonErrors.push(entry)
+      }
+    );
+    await poisonDispatcher.start();
+    try {
+      const deadLetter = await waitForRowState(ctx.database, 'ProcessCompletionDispatch', {
+        process_receipt_id: quickProcessReceipt.id
+      }, 'dead_letter', 5_000);
+      assert.equal(deadLetter.failure_count, 2n);
+      assert.match(deadLetter.last_error, /detached process_exit Operation/);
+      // Other legitimate process completions may be pending in this shared fixture. Prove the
+      // poison row itself is excluded from subsequent scans instead of asserting a global count.
+      await poisonDispatcher.scanNow();
+      const stableDeadLetter = await get(
+        ctx.database,
+        'ProcessCompletionDispatch',
+        'process-completion-dispatch-poison-foreground'
+      );
+      assert.equal(stableDeadLetter.state, 'dead_letter');
+      assert.equal(stableDeadLetter.failure_count, 2n);
+      assert.equal(stableDeadLetter.updated_at, deadLetter.updated_at);
+      assert.equal(poisonErrors.length, 2);
+    } finally {
+      await poisonDispatcher.dispose();
+    }
+    assertions.push('快速非零foreground退出不误建完成投递；注入的毒reconcile outbox按持久退避在上限后dead-letter，后续扫描不再遍历该Receipt');
 
     const receiptOnlyTool = await createTool(ctx, effects, 'process-exit-receipt-only', 'bash');
     const receiptOnlyPrepared = await processes.prepareStart({
@@ -1538,6 +1917,37 @@ async function checkProcessWrapperRecovery() {
     assert.equal(receiptOnlyReconciled.state, 'exited');
     assert.equal((await list(ctx.database, 'ProcessReceipt', { process_id: receiptOnlyId }))[0].exit_code, 9n);
     assertions.push('有效atomic exit receipt可直接与SQLite Process证据核对；identity文件缺失不再把真实exitCode降级为unknown');
+
+    const alreadyExitedTool = await createTool(ctx, effects, 'process-stop-already-exited-target', 'bash');
+    const alreadyExitedStart = await processes.prepareStart({
+      source: source('internal', 'process-stop-already-exited-target:prepare'),
+      toolCallId: alreadyExitedTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote('setTimeout(()=>process.exit(0),120)')}`,
+      cwd: parent
+    });
+    await processes.dispatchStart(alreadyExitedStart.effect.effectIntentId, 0);
+    const alreadyExitedId = alreadyExitedStart.request.processId;
+    const atomicAlreadyExited = await waitUntilTerminal(processes, alreadyExitedId, 10_000);
+    assert.equal(atomicAlreadyExited.state, 'exited');
+    assert.equal((await list(ctx.database, 'ProcessReceipt', { process_id: alreadyExitedId })).length, 0);
+    const alreadyExitedStopTool = await createTool(ctx, effects, 'process-stop-already-exited', 'bash');
+    const alreadyExitedStop = await processes.prepareStop({
+      source: source('internal', 'process-stop-already-exited:prepare'),
+      toolCallId: alreadyExitedStopTool.toolCallId,
+      processId: alreadyExitedId
+    });
+    await effects.claimEffectDispatch(alreadyExitedStop.effectIntentId);
+    const alreadyExitedResult = await processes.executeDispatchedStop(alreadyExitedStop.effectIntentId);
+    assert.equal(alreadyExitedResult.outcome, 'succeeded');
+    assert.equal(alreadyExitedResult.status, 'already_exited');
+    assert.equal(alreadyExitedResult.receipt.exitCode, '0');
+    assert.equal((await list(ctx.database, 'ProcessReceipt', { process_id: alreadyExitedId }))[0].outcome, 'succeeded');
+    const alreadyExitedRecovered = await processes.recoverDispatchedStop({
+      source: source('recovery', 'process-stop-already-exited:recover'),
+      effectIntentId: alreadyExitedStop.effectIntentId
+    });
+    assert.equal(alreadyExitedRecovered.status, 'succeeded');
+    assertions.push('stop先收敛SQLite/atomic exit receipt；目标已自然退出时稳定返回already_exited而非outcome_unknown');
 
     const corruptTool = await createTool(ctx, effects, 'process-corrupt', 'bash');
     const corruptPrepared = await processes.prepareStart({
@@ -1607,7 +2017,10 @@ async function checkProcessWrapperRecovery() {
       processId: recoverStopStart.request.processId
     });
     await effects.claimEffectDispatch(recoverStop.effectIntentId);
-    assert.equal((await processes.executeDispatchedStop(recoverStop.effectIntentId)).outcome, 'succeeded');
+    const recoverStopObservation = await processes.executeDispatchedStop(recoverStop.effectIntentId);
+    assert.equal(recoverStopObservation.outcome, 'succeeded');
+    assert.equal(recoverStopObservation.status, 'stopped');
+    assert.equal(recoverStopObservation.receipt.stopRequested, true);
     await waitUntilTerminal(processes, recoverStopStart.request.processId, 10_000);
     const recoveredStop = await processes.recoverDispatchedStop({
       source: source('recovery', 'process-stop-recovery:scan'),
@@ -1630,7 +2043,9 @@ async function checkProcessWrapperRecovery() {
       processId: winnerStopStart.request.processId
     });
     await effects.claimEffectDispatch(winnerStop.effectIntentId);
-    assert.equal((await processes.executeDispatchedStop(winnerStop.effectIntentId)).outcome, 'succeeded');
+    const winnerStopObservation = await processes.executeDispatchedStop(winnerStop.effectIntentId);
+    assert.equal(winnerStopObservation.outcome, 'succeeded');
+    assert.equal(winnerStopObservation.status, 'stopped');
     await waitUntilTerminal(processes, winnerStopStart.request.processId, 10_000);
     const firstStopReceipt = await effects.recordEffectReceipt({
       source: source('callback', 'process-stop-winner:callback'),
@@ -1690,7 +2105,41 @@ async function checkProcessWrapperRecovery() {
     const stopped = await waitUntilTerminal(processes, longId, 10_000);
     assert.equal(stopped.state, 'exited');
     assert.equal(stopped.receipt.stopRequested, true);
-    assertions.push('错误nonce/fingerprint/group证据拒绝stop且进程仍运行；正确证据只经stop EffectIntent请求wrapper停止');
+    await processes.reconcileProcessExit(longId);
+    const stoppedWakeRequests = [];
+    const stoppedDispatcher = new kernel.ProcessCompletionDeliveryControlPlane(
+      ctx.database,
+      ctx.store,
+      processes,
+      new kernel.RuntimeDeliveryControlPlane(ctx.database),
+      {
+        scanIntervalMs: 25,
+        wakeHandler: async (request) => {
+          stoppedWakeRequests.push(request);
+          return { acknowledged: true };
+        }
+      }
+    );
+    await stoppedDispatcher.start();
+    try {
+      const stoppedReceipt = await waitForSingleRow(ctx.database, 'ProcessReceipt', { process_id: longId }, 5_000);
+      const stoppedInbox = await waitForSingleRow(ctx.database, 'RuntimeInboxItem', {
+        source_kind: 'process_receipt', source_id: stoppedReceipt.id
+      }, 5_000);
+      const stoppedDelivery = await waitForSingleRow(ctx.database, 'RuntimeDelivery', {
+        inbox_item_id: stoppedInbox.id
+      }, 5_000);
+      await waitForRowState(ctx.database, 'RuntimeDeliveryWake', {
+        delivery_id: stoppedDelivery.id
+      }, 'acknowledged', 5_000);
+      const stoppedOperations = await list(ctx.database, 'Operation', { owner_kind: 'process', owner_id: longId });
+      assert.equal(stoppedOperations.filter((operation) => operation.tool_call_id === null).length, 1);
+      assert.ok(stoppedOperations.filter((operation) => operation.tool_call_id !== null).length >= 2);
+      assert.ok(stoppedWakeRequests.some((request) => request.processId === longId));
+    } finally {
+      await stoppedDispatcher.dispose();
+    }
+    assertions.push('错误nonce/fingerprint/group证据拒绝stop且进程仍运行；正确stop附带Operation不阻断独立process_exit完成投递和wake ACK');
 
     const wrapperCrashTool = await createTool(ctx, effects, 'process-wrapper-crash', 'bash');
     const wrapperCrashPrepared = await processes.prepareStart({
@@ -1723,13 +2172,18 @@ async function checkProcessWrapperRecovery() {
     epoch.rootGeneration = stalePointer.rootGeneration;
     await fs.writeFile(ctx.binding.paths.rootPointerPath, `${JSON.stringify(stalePointer)}\n`);
     await fs.writeFile(ctx.binding.paths.runtimeEpochPath, `${JSON.stringify(epoch)}\n`);
-    await assert.rejects(processes.readOutput(processId), (error) => error?.code === 'stale-root-binding');
+    await assert.rejects(processes.readOutputPage(processId), (error) => error?.code === 'stale-root-binding');
     assertions.push('每次read/wait/stop重验RootBinding generation，root switch后旧binding fail closed');
 
     return {
       assertions,
       faults: [
         'controller restart',
+        'foreground wait handoff without terminal protocol result',
+        'receipt committed before inbox delivery',
+        'competing completion delivery scans',
+        'wake callback lost across host restart',
+        'background completion while conversation idle',
         'valid atomic exit receipt',
         'process_exit effect chain',
         'detached nullable command receipt relation',
@@ -1770,13 +2224,16 @@ async function checkProcessOutputBounds() {
     });
     await processes.dispatchStart(liveTailPrepared.effect.effectIntentId);
     await delay(350);
-    const liveTailRead = await processes.readOutput(liveTailPrepared.request.processId);
-    assert.equal(liveTailRead.stdout.toString('utf8'), 'abc');
-    assert.equal(liveTailRead.retainedBytes, '3');
-    assert.equal(liveTailRead.retainedChunks, '1');
+    const liveTailRead = await processes.readOutputPage(liveTailPrepared.request.processId);
+    assert.equal(liveTailRead.stdout, '');
+    assert.equal(liveTailRead.liveStdout, 'abc');
+    assert.equal(liveTailRead.livePreviewBytes, '3');
+    assert.equal(liveTailRead.retainedBytes, '0');
+    assert.equal(liveTailRead.retainedChunks, '0');
+    assert.equal(liveTailRead.complete, false);
     await waitUntilTerminal(processes, liveTailPrepared.request.processId, 5_000);
     await processes.reconcileProcessExit(liveTailPrepared.request.processId);
-    assertions.push('运行中live tail正文与有效retained bytes/chunks一致，读取不消费tail');
+    assertions.push('运行中live tail只进入不推进outputHandle的观察字段，正式retained前缀保持可重复遍历且读取不消费tail');
 
     const liveImportTool = await createTool(ctx, effects, 'process-live-import', 'bash');
     const liveImportCode = "let i=0;const t=setInterval(()=>{process.stdout.write('y'.repeat(70000));if(++i===30){clearInterval(t);}},15)";
@@ -1847,11 +2304,12 @@ async function checkProcessOutputBounds() {
     const missingSpoolPath = kernel.processSpoolPath(ctx.binding, missingProcessRow.spool_locator);
     const missingChunkRoot = path.join(missingSpoolPath, kernel.PROCESS_WRAPPER_CHUNKS_DIRECTORY);
     for (const name of await fs.readdir(missingChunkRoot)) await fs.unlink(path.join(missingChunkRoot, name));
-    await assert.rejects(processes.readOutput(missingSpoolPrepared.request.processId), /integrity check failed/);
+    await assert.rejects(processes.reconcileOutput(missingSpoolPrepared.request.processId), /exactly one stream file/);
     assertions.push('CAS尚未登记且spool chunk缺失时read_output明确报完整性错误，不返回空正文配完整计数');
 
     const tool = await createTool(ctx, effects, 'process-output', 'bash');
-    const payloadBytes = kernel.PROCESS_OUTPUT_MAX_RETAINED_BYTES + (1024 * 1024);
+    const payloadBytes = 17 * 1024 * 1024;
+    const terminalMarker = 'TERMINAL-TAIL-MARKER\n';
     const code = `process.stdout.write('x'.repeat(${payloadBytes}));process.stdout.write('TERMINAL-TAIL-MARKER\\n')`;
     const prepared = await processes.prepareStart({
       source: source('internal', 'process-output:prepare'),
@@ -1864,28 +2322,50 @@ async function checkProcessOutputBounds() {
     const processId = prepared.request.processId;
     const exited = await waitUntilTerminal(processes, processId, 20_000);
     assert.equal(exited.state, 'exited', '大量输出必须持续drain并真实退出，不能因停止读取而阻塞');
-    assert.equal(exited.receipt.truncated, true);
-    assert.ok(BigInt(exited.receipt.droppedBytes) > 0n);
-    assert.ok(BigInt(exited.receipt.retainedBytes) <= BigInt(kernel.PROCESS_OUTPUT_MAX_RETAINED_BYTES));
-    assert.ok(BigInt(exited.receipt.retainedChunks) <= BigInt(kernel.PROCESS_OUTPUT_MAX_RETAINED_CHUNKS));
-    assertions.push('超过4MiB/256 chunk后仍持续drain至真实退出，只累计dropped/truncated');
+    assert.equal(exited.receipt.truncated, false);
+    assert.equal(exited.receipt.droppedBytes, '0');
+    assert.equal(BigInt(exited.receipt.retainedBytes), BigInt(payloadBytes + Buffer.byteLength(terminalMarker)));
+    assert.ok(BigInt(exited.receipt.retainedBytes) > 4n * 1024n * 1024n);
+    assert.ok(BigInt(exited.receipt.retainedChunks) > 256n);
+    assertions.push('超过4MiB且超过256 chunk后仍持续按序落spool，原始输出不再被丢弃');
 
-    const concurrentOutput = await Promise.all([
-      processes.reconcileOutput(processId),
-      processes.reconcileOutput(processId)
-    ]);
+    const originalOutputTransaction = ctx.database.transaction.bind(ctx.database);
+    const outputTransactionWireBytes = [];
+    ctx.database.transaction = async (steps) => {
+      if (steps.some((step) => step.kind === 'insert' && step.domain === 'ProcessOutputChunk')) {
+        outputTransactionWireBytes.push(Buffer.byteLength(JSON.stringify({ kind: 'transaction', steps }, (_key, value) => (
+          typeof value === 'bigint' ? value.toString() : value
+        )), 'utf8'));
+      }
+      return originalOutputTransaction(steps);
+    };
+    let concurrentOutput;
+    try {
+      concurrentOutput = await Promise.all([
+        processes.reconcileOutput(processId),
+        processes.reconcileOutput(processId)
+      ]);
+    } finally {
+      ctx.database.transaction = originalOutputTransaction;
+    }
+    assert.ok(outputTransactionWireBytes.length > 0);
+    assert.ok(outputTransactionWireBytes.every((bytes) => bytes <= kernel.PROCESS_OUTPUT_TRANSACTION_MAX_WIRE_BYTES));
     const reconciled = concurrentOutput[0];
-    assert.ok(concurrentOutput.every((entry) => entry.retainedBytes <= BigInt(kernel.PROCESS_OUTPUT_MAX_RETAINED_BYTES)));
-    assert.ok(concurrentOutput.every((entry) => entry.retainedChunks <= BigInt(kernel.PROCESS_OUTPUT_MAX_RETAINED_CHUNKS)));
+    assert.ok(concurrentOutput.every((entry) => entry.retainedBytes === BigInt(exited.receipt.retainedBytes)));
+    assert.ok(concurrentOutput.every((entry) => entry.retainedChunks === BigInt(exited.receipt.retainedChunks)));
     const chunks = await list(ctx.database, 'ProcessOutputChunk', { process_id: processId });
     assert.equal(BigInt(chunks.length), reconciled.retainedChunks);
     assert.ok(chunks.every((row) => row.byte_length <= BigInt(kernel.PROCESS_OUTPUT_MAX_CHUNK_BYTES)));
+    assert.equal(
+      (await ctx.database.processOutputRegistrationMismatches()).some((entry) => entry.processId === processId),
+      false
+    );
     assert.ok(chunks.every((row) => typeof row.chunk_seq === 'bigint'));
     const casBefore = (await list(ctx.database, 'ContentObject', {})).length;
     const secondReconcile = await processes.reconcileOutput(processId);
     assert.equal(secondReconcile.insertedChunks, 0);
     assert.equal((await list(ctx.database, 'ContentObject', {})).length, casBefore);
-    assertions.push('并发ProcessOutput reconcile精确收敛；chunk metadata入SQLite、正文入CAS，达到上限后重复reconcile不再增长');
+    assertions.push('并发ProcessOutput reconcile精确收敛；登记事务逐笔受wire bytes约束并持续到全部chunk metadata入SQLite、正文入CAS，重复reconcile不再增长');
 
     const processRow = await get(ctx.database, 'Process', processId);
     const spoolPath = kernel.processSpoolPath(ctx.binding, processRow.spool_locator);
@@ -1896,18 +2376,62 @@ async function checkProcessOutputBounds() {
     const afterSpoolLoss = await processes.reconcileOutput(processId);
     assert.equal(afterSpoolLoss.retainedChunks, reconciled.retainedChunks);
     assert.equal((await list(ctx.database, 'ProcessOutputChunk', { process_id: processId })).length, chunks.length);
+    await processes.reconcileProcessExit(processId);
 
-    const first = await processes.readOutput(processId);
-    const second = await processes.readOutput(processId);
-    assert.deepEqual(first.stdout, second.stdout);
-    assert.deepEqual(first.stderr, second.stderr);
-    assert.match(first.stdout.subarray(Math.max(0, first.stdout.length - 128)).toString('utf8'), /TERMINAL-TAIL-MARKER/);
-    assert.ok(first.stdout.length <= kernel.PROCESS_OUTPUT_MAX_RETAINED_BYTES);
-    assertions.push('read_output从已登记SQLite/CAS chunk稳定读取；spool chunk丢失后不消费历史、不缩小计数且terminal tail仍保留');
+    const firstPage = await processes.readOutputPage(processId);
+    const replayedFirstPage = await processes.readOutputPage(processId);
+    assert.deepEqual(firstPage, replayedFirstPage);
+    assert.ok(firstPage.hasMore, 'large process output must expose a continuation handle');
+    assert.ok(Number(firstPage.pageBytes) <= kernel.PROCESS_OUTPUT_READ_PAGE_MAX_BYTES);
+    let outputHandle;
+    let totalStdoutBytes = 0;
+    let totalStderrBytes = 0;
+    let pageCount = 0;
+    let stdoutTail = '';
+    const originalReadReconcile = processes.reconcileOutput.bind(processes);
+    let readReconcileCount = 0;
+    processes.reconcileOutput = async (...args) => {
+      readReconcileCount += 1;
+      return originalReadReconcile(...args);
+    };
+    try {
+      for (;;) {
+        await processes.reconcileOutputForRead(processId, outputHandle);
+        const page = await processes.readOutputPage(processId, outputHandle);
+        pageCount += 1;
+        totalStdoutBytes += Buffer.byteLength(page.stdout, 'utf8');
+        totalStderrBytes += Buffer.byteLength(page.stderr, 'utf8');
+        stdoutTail = `${stdoutTail}${page.stdout}`.slice(-128);
+        outputHandle = page.nextOutputHandle;
+        if (!page.hasMore) {
+          assert.equal(page.complete, true);
+          assert.equal(page.truncated, false);
+          assert.equal(page.droppedBytes, '0');
+          break;
+        }
+      }
+    } finally {
+      processes.reconcileOutput = originalReadReconcile;
+    }
+    assert.equal(readReconcileCount, 1, 'terminal continuation handles must not rescan immutable history');
+    assert.ok(pageCount > 1);
+    assert.match(stdoutTail, /TERMINAL-TAIL-MARKER/);
+    assert.equal(totalStdoutBytes, payloadBytes + Buffer.byteLength(terminalMarker));
+    assert.equal(totalStderrBytes, 0);
+    const exhausted = await processes.readOutputPage(processId, outputHandle);
+    assert.equal(exhausted.stdout, '');
+    assert.equal(exhausted.stderr, '');
+    assert.equal(exhausted.hasMore, false);
+    assert.equal(exhausted.complete, true);
+    const completionTail = await processes.readOutputTail(processId, 8_000);
+    assert.ok(completionTail.stdout.byteLength <= 8_000);
+    assert.ok(completionTail.stderr.byteLength <= 8_000);
+    assert.match(completionTail.stdout.toString('utf8'), /TERMINAL-TAIL-MARKER/);
+    assertions.push('read_output以opaque handle从SQLite/CAS分页面完整遍历；spool丢失后不消费历史、不缩小计数，也不一次Buffer.concat全历史；completion tail反向keyset读取且只驻留所需尾部');
 
     return {
       assertions,
-      faults: ['live tail accounting', 'live writer/import race', 'stale output commit after exit', 'spool loss before CAS import', 'sustained output overflow', 'continued drain', 'competing ProcessOutput reconcile', 'CAS/SQLite growth convergence', 'spool loss after CAS import', 'repeatable read_output', 'terminal tail']
+      faults: ['live tail accounting', 'live writer/import race', 'stale output commit after exit', 'spool loss before CAS import', 'sustained output beyond former retention bounds', 'continued drain', 'competing ProcessOutput reconcile', 'CAS/SQLite growth convergence', 'spool loss after CAS import', 'repeatable read_output', 'terminal tail']
     };
   });
 }
@@ -1920,6 +2444,13 @@ async function checkHangingEffectRecovery() {
     const assertions = [];
     const workspace = path.join(parent, 'workspace');
     await fs.mkdir(workspace);
+    // The dispatch fence must capture the actually live Host. Rewriting the lease only after the
+    // dispatch would represent a successor owner and must no longer keep the old effect in-flight.
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('ExecutionLease').update('lease-hanging', {
+        host_boot_id: ctx.database.hostBootId
+      })
+    ]);
     const boundary = (id) => id === 'workspace' ? { id, rootPath: workspace } : undefined;
     let effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
     let files = new kernel.FileChangeControlPlane(ctx.database, ctx.store, effects);
@@ -1954,6 +2485,46 @@ async function checkHangingEffectRecovery() {
     await mcp.executeDispatched(mcpPrepared.effectIntentId);
     assert.equal(mcpCalls, 1);
 
+    const transferTool = await createTool(ctx, effects, 'hanging-transfer', 'transfer');
+    const transfers = new kernel.WorkEnvironmentTransferEffectDispatcher(ctx.database, effects);
+    const transferPrepared = await transfers.prepare({
+      source: source('internal', 'hanging-transfer:prepare'),
+      toolCallId: transferTool.toolCallId,
+      authoritySnapshotId: 'authority-hanging-transfer',
+      arguments: {
+        transfers: [{
+          fromEnvironment: 'workspace', fromPath: 'source.txt',
+          toEnvironment: 'workspace', toPath: 'transfer-recovered.txt'
+        }]
+      }
+    });
+    await effects.claimEffectDispatch(transferPrepared.effectIntentId);
+    await fs.writeFile(path.join(workspace, 'transfer-recovered.txt'), 'already-written-before-crash', 'utf8');
+    assert.equal((await list(ctx.database, 'EffectReceipt', { attempt_id: transferPrepared.attemptId })).length, 0);
+
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('ExecutionLease').update('lease-hanging', {
+        host_boot_id: ctx.database.hostBootId
+      })
+    ]);
+    const liveScanner = new kernel.PhaseDRecoveryScanner(
+      ctx.database, effects, files, processes, mcp, boundary, recoveryTurns(ctx, files)
+    );
+    const liveResult = await liveScanner.run('recovery.effect-intent-hanging');
+    assert.equal(liveResult.scanned, 3);
+    assert.equal(liveResult.reconciled, 0);
+    assert.equal(liveResult.unknown, 0);
+    assert.equal((await list(ctx.database, 'EffectReceipt', { attempt_id: mcpPrepared.attemptId })).length, 0);
+    assert.equal((await list(ctx.database, 'EffectReceipt', { attempt_id: approval.preparedEffect.attemptId })).length, 0);
+    assert.equal((await list(ctx.database, 'EffectReceipt', { attempt_id: transferPrepared.attemptId })).length, 0);
+    assertions.push('并发Host恢复扫描识别存活Turn租约，跳过其三种in-flight外部Effect且不伪造unknown');
+
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('ExecutionLease').update('lease-hanging', {
+        host_boot_id: 'host-hanging-dead'
+      })
+    ]);
+
     await ctx.database.close();
     ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId: 'hanging-reopen' });
     ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
@@ -1973,11 +2544,13 @@ async function checkHangingEffectRecovery() {
       'recovery.file-change-unresolved'
     ]);
     const result = await scanner.run('recovery.effect-intent-hanging');
-    assert.equal(result.reconciled, 2);
+    assert.equal(result.reconciled, 3);
     assert.equal(recoveredMcpCalls, 0);
     assert.equal((await effects.readTerminalResult(fileTool.toolCallId, true)).status, 'succeeded');
     assert.equal((await effects.readTerminalResult(mcpTool.toolCallId, true)).status, 'outcome_unknown');
-    assertions.push('真实重开数据库扫描file摘要可证明成功、MCP不可查询落unknown且不redispatch');
+    assert.equal((await effects.readTerminalResult(transferTool.toolCallId, true)).status, 'outcome_unknown');
+    assert.equal(await fs.readFile(path.join(workspace, 'transfer-recovered.txt'), 'utf8'), 'already-written-before-crash');
+    assertions.push('真实重开数据库扫描file摘要可证明成功；MCP与file_transfer不可查询均落unknown且不redispatch');
 
     const before = await counts(ctx.database, ['EffectReceipt', 'ToolOutcome', 'ToolModelResult']);
     const replay = await scanner.run('recovery.effect-intent-hanging');
@@ -1985,9 +2558,89 @@ async function checkHangingEffectRecovery() {
     assert.deepEqual(await counts(ctx.database, ['EffectReceipt', 'ToolOutcome', 'ToolModelResult']), before);
     assertions.push('重复恢复扫描不产生第二Receipt/Outcome/ModelResult');
 
+    const workEnvironmentDefinitions = [
+      phaseDRuntimeDefinition('transfer'),
+      phaseDRuntimeDefinition('switch_work_environment'),
+      phaseDRuntimeDefinition('read')
+    ];
+    await attachWorkEnvironmentAuthority(ctx, ctx.turnId, 'disabled-work-environment-authority', false);
+    const interactions = new kernel.ToolInteractionControlPlane(ctx.database, ctx.store, effects);
+    const reliableTools = new kernel.ReliableToolDispatcher({
+      database: ctx.database,
+      contentStore: ctx.store,
+      effects,
+      files,
+      fileMutations: new kernel.FileMutationDispatcher(ctx.database, ctx.store, effects, boundary),
+      processes,
+      mcp,
+      interactions,
+      host: {
+        definitions() { return workEnvironmentDefinitions; },
+        async executeNoEffect() { return { ok: true, output: null }; }
+      }
+    });
+    const disabledNames = new Set((await reliableTools.definitions(ctx.turnId)).map((entry) => entry.name));
+    assert.equal(disabledNames.has('read'), true);
+    assert.equal(disabledNames.has('transfer'), false);
+    assert.equal(disabledNames.has('switch_work_environment'), false);
+    const staleTransferCall = await effects.createToolCall({
+      source: source('internal', 'disabled-work-environment:stale-transfer:create'),
+      toolCallId: 'tool-call-disabled-work-environment-transfer',
+      turnId: ctx.turnId,
+      toolName: 'transfer',
+      arguments: {
+        transfers: [{
+          fromEnvironment: 'workspace', fromPath: 'source.txt',
+          toEnvironment: 'workspace', toPath: 'must-not-exist.txt'
+        }]
+      }
+    });
+    const staleTransfer = await reliableTools.dispatch({
+      turnId: ctx.turnId,
+      modelRequestId: 'model-disabled-work-environment',
+      toolCallId: staleTransferCall.toolCallId,
+      toolName: 'transfer',
+      arguments: {
+        transfers: [{
+          fromEnvironment: 'workspace', fromPath: 'source.txt',
+          toEnvironment: 'workspace', toPath: 'must-not-exist.txt'
+        }]
+      }
+    });
+    assert.equal(staleTransfer.status, 'rejected');
+    assert.equal(await exists(path.join(workspace, 'must-not-exist.txt')), false);
+    assertions.push('Turn冻结WorkEnvironmentPolicy.enabled=false时recipe隐藏transfer/switch，旧模型调用也持久rejected且无外部写入');
+
+    const enabledTurn = await createAdditionalTurn(ctx, 'enabled-work-environment-boundary');
+    await attachWorkEnvironmentAuthority(ctx, enabledTurn.turnId, 'enabled-work-environment-authority', true);
+    const enabledNames = new Set((await reliableTools.definitions(enabledTurn.turnId)).map((entry) => entry.name));
+    assert.equal(enabledNames.has('transfer'), true);
+    assert.equal(enabledNames.has('switch_work_environment'), true);
+    const sameSwitch = await createAndDispatchPhaseDTool(
+      effects,
+      reliableTools,
+      enabledTurn.turnId,
+      'switch-same',
+      'switch_work_environment',
+      { workEnvironmentId: 'workspace' }
+    );
+    assert.equal(sameSwitch.status, 'succeeded');
+    const effectCountBeforeCrossSwitch = (await list(ctx.database, 'EffectIntent', {})).length;
+    const crossSwitch = await createAndDispatchPhaseDTool(
+      effects,
+      reliableTools,
+      enabledTurn.turnId,
+      'switch-cross',
+      'switch_work_environment',
+      { workEnvironmentId: 'workspace-alternate' }
+    );
+    assert.equal(crossSwitch.status, 'rejected');
+    assert.equal((await list(ctx.database, 'EffectIntent', {})).length, effectCountBeforeCrossSwitch);
+    assertions.push('enabled Turn中同环境switch幂等成功；跨环境switch因authority不可变而明确rejected，不伪成功、不建外部Effect');
+
     return {
       assertions,
-      faults: ['file action executed callback lost', 'MCP callback lost', 'database reopen', 'no redispatch', 'repeat recovery scan']
+      faults: ['file action executed callback lost', 'MCP callback lost', 'file transfer callback lost', 'database reopen', 'no redispatch', 'repeat recovery scan']
     };
   } finally {
     if (ctx?.database) await ctx.database.close().catch(() => undefined);
@@ -2281,6 +2934,7 @@ async function createRuntime(parent, label) {
       turn_id: turnId,
       owner_id: `owner-${label}`,
       host_boot_id: `host-${label}`,
+      generation: 1n,
       acquired_at: now,
       expires_at: '2099-01-01T00:00:00.000Z'
     })
@@ -2335,6 +2989,7 @@ async function createAdditionalTurn(ctx, label) {
       turn_id: turnId,
       owner_id: `owner-${label}`,
       host_boot_id: `host-${label}`,
+      generation: 1n,
       acquired_at: now,
       expires_at: '2099-01-01T00:00:00.000Z'
     })
@@ -2349,6 +3004,70 @@ async function createTool(ctx, effects, id, toolName) {
     turnId: ctx.turnId,
     toolName,
     arguments: { id }
+  });
+}
+
+async function attachWorkEnvironmentAuthority(ctx, turnId, id, enabled) {
+  const content = await ctx.store.ingest(ctx.database, JSON.stringify({
+    model: { providerConfigId: 'phase-d', provider: 'openai-compatible', modelId: 'phase-d' },
+    toolPolicy: {
+      id: 'phase-d-tools',
+      allowedTools: ['read', 'transfer', 'switch_work_environment'],
+      preset: 'yolo',
+      toolConfigs: {},
+      sourceConfigs: {}
+    },
+    planReviewPolicy: {
+      id: null,
+      mode: 'off',
+      allowReadonlyBeforeApproval: true,
+      requireForToolRiskLevels: []
+    },
+    workEnvironmentPolicy: {
+      id: 'phase-d-work-environments',
+      enabled,
+      allowedWorkEnvironmentIds: ['workspace', 'workspace-alternate'],
+      defaultWorkEnvironmentId: 'workspace'
+    }
+  }), 'application/vnd.limcode.turn-authority-snapshot+json');
+  await ctx.database.transaction([
+    kernel.DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
+      id,
+      turn_id: turnId,
+      content_object_id: content.id,
+      created_at: new Date().toISOString()
+    })
+  ]);
+}
+
+function phaseDRuntimeDefinition(name) {
+  return {
+    execution: 'runtime',
+    declaration: {
+      name,
+      description: `${name} Phase D fixture`,
+      parameters: { type: 'object' },
+      metadata: { defaultEnabled: true }
+    },
+    async execute() { throw new Error(`${name} fixture execution must remain unreachable.`); }
+  };
+}
+
+async function createAndDispatchPhaseDTool(effects, dispatcher, turnId, id, toolName, args) {
+  const toolCallId = `tool-call-${id}`;
+  await effects.createToolCall({
+    source: source('internal', `${id}:create`),
+    toolCallId,
+    turnId,
+    toolName,
+    arguments: args
+  });
+  return dispatcher.dispatch({
+    turnId,
+    modelRequestId: `model-${id}`,
+    toolCallId,
+    toolName,
+    arguments: args
   });
 }
 
@@ -2380,6 +3099,45 @@ async function waitUntilTerminal(processes, processId, timeoutMs) {
   return observed;
 }
 
+async function waitForPersistedProcessStatus(database, processId, terminalStatuses, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const row = await get(database, 'Process', processId);
+    if (row && terminalStatuses.has(row.status)) return row;
+    if (Date.now() >= deadline) throw new Error(`Process ${processId} did not reach a persisted terminal status.`);
+    await delay(25);
+  }
+}
+
+async function waitForSingleRow(database, domain, where, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = await list(database, domain, where);
+    if (rows.length === 1) return rows[0];
+    if (rows.length > 1) throw new Error(`${domain} level-trigger identity produced multiple rows.`);
+    if (Date.now() >= deadline) throw new Error(`${domain} did not produce its level-trigger row.`);
+    await delay(25);
+  }
+}
+
+async function waitForRowState(database, domain, where, expectedState, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const row = await waitForSingleRow(database, domain, where, Math.max(1, deadline - Date.now()));
+    if (row.state === expectedState) return row;
+    if (Date.now() >= deadline) throw new Error(`${domain} did not reach state ${expectedState}.`);
+    await delay(25);
+  }
+}
+
+async function waitForNoExitObservers(processes, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (processes.inspectExitObservers().activeProcessIds.length > 0) {
+    if (Date.now() >= deadline) throw new Error('Process exit observers did not drain after terminal receipt.');
+    await delay(10);
+  }
+}
+
 async function exists(filePath) {
   try {
     await fs.access(filePath);
@@ -2406,6 +3164,37 @@ function allowMcpPolicy() {
     async authorize() {
       return { toolPolicyAllowed: true, planReviewAllowed: true };
     }
+  };
+}
+
+function phaseDApplicationDependencies(overrides = {}) {
+  return {
+    authorityCompiler: {
+      async compile() { throw new Error('Process recovery fixture does not compile Turn authority.'); }
+    },
+    resolveWorkEnvironment: async () => undefined,
+    mcpConnections: {
+      async toolAnnotations() { return {}; },
+      async callTool() { throw new Error('Process recovery fixture does not dispatch MCP.'); }
+    },
+    mcpPolicyGate: allowMcpPolicy(),
+    attachmentSettings: {
+      async loadGlobalSettings() {
+        return {
+          section: 'attachments',
+          settings: { maxStoredInlineFileMb: 25 },
+          filePath: 'settings/attachments.json'
+        };
+      }
+    },
+    providers: {
+      resolve() { throw new Error('Process recovery fixture does not dispatch a provider.'); }
+    },
+    toolDispatcher: {
+      definitions() { return []; },
+      async dispatch() { throw new Error('Process recovery fixture does not dispatch a tool.'); }
+    },
+    ...overrides
   };
 }
 

@@ -35,6 +35,20 @@ export interface CandidateRootActivation {
 }
 
 /**
+ * Structurally valid pointer from an earlier Runtime epoch.  It is intentionally not a
+ * {@link RootBinding}: ordinary Runtime code must never open it.  The offline cutover path may
+ * inspect only its identity/counters before archiving the referenced root.
+ */
+export interface HistoricalRootBinding {
+  paths: RuntimeRootPaths;
+  dataSetId: string;
+  rootInstanceId: string;
+  rootGeneration: number;
+  pointerRevision: number;
+  runtimeKernelEpoch: number;
+}
+
+/**
  * RootAuthority is the only component allowed to resolve and activate Runtime roots. Long-lived
  * services cache one immutable complete RootBinding, never a naked path. Root changes are offline:
  * callers must close the old service before opening one with the returned binding.
@@ -49,6 +63,86 @@ export class RootAuthority {
   /** Reads the active pointer without requiring the referenced root/epoch to remain online. */
   public async readPointer(): Promise<RootBinding | undefined> {
     return readBindingFile(this.expectedPaths().rootPointerPath);
+  }
+
+  /**
+   * Offline-cutover-only reader. It accepts a structurally valid pointer from the current or an
+   * earlier epoch, but never validates or opens the referenced Runtime root.
+   */
+  public async readHistoricalPointerForCutover(): Promise<HistoricalRootBinding | undefined> {
+    return readHistoricalBindingFile(this.expectedPaths().rootPointerPath);
+  }
+
+  /**
+   * Fences every previous-epoch writer before an offline in-place schema migration. The old
+   * pointer remains authoritative until {@link commitInPlaceEpochMigration} atomically publishes
+   * the staged current-epoch binding.
+   */
+  public async stageInPlaceEpochMigration(previous: HistoricalRootBinding): Promise<RootBinding> {
+    const expectedPaths = this.expectedPaths();
+    if (!samePaths(previous.paths, expectedPaths)) {
+      throw new StaleRootBindingError('Historical RootBinding paths do not match the selected data root.');
+    }
+    if (previous.runtimeKernelEpoch >= RUNTIME_KERNEL_EPOCH) {
+      throw new RootAuthorityError('runtime-epoch-migration-invalid', 'Only an earlier Runtime epoch may be staged for migration.');
+    }
+    const next = migratedBinding(previous);
+    const currentPointer = await readHistoricalBindingFile(expectedPaths.rootPointerPath);
+    if (!currentPointer || !sameHistoricalBindingIdentity(currentPointer, previous)) {
+      if (currentPointer?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+        const current = await this.current();
+        if (sameBindingIdentity(current, next)) return current;
+      }
+      throw new StaleRootBindingError('Historical RootBinding changed before epoch migration could be staged.');
+    }
+    const pending = await readBindingFile(expectedPaths.rootPendingPath);
+    if (pending) {
+      if (!sameBindingIdentity(pending, next)) {
+        throw new RootAuthorityError('root-binding-pending', 'A different RootBinding migration is already pending.');
+      }
+      return pending;
+    }
+    await writeDurableJson(expectedPaths.rootPendingPath, next);
+    return next;
+  }
+
+  /** Publishes an already-validated migrated database without changing its data-set identity. */
+  public async commitInPlaceEpochMigration(
+    previous: HistoricalRootBinding,
+    next: RootBinding
+  ): Promise<RootBinding> {
+    const expectedNext = migratedBinding(previous);
+    if (!sameBindingIdentity(next, expectedNext)) {
+      throw new RootAuthorityError('runtime-epoch-migration-invalid', 'Staged epoch migration binding does not match the authority plan.');
+    }
+    const currentPointer = await readHistoricalBindingFile(next.paths.rootPointerPath);
+    if (currentPointer?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+      const current = await this.current();
+      if (sameBindingIdentity(current, next)) return current;
+      throw new StaleRootBindingError('A different current-epoch RootBinding was published.');
+    }
+    if (!currentPointer || !sameHistoricalBindingIdentity(currentPointer, previous)) {
+      throw new StaleRootBindingError('Historical RootBinding changed before epoch migration publication.');
+    }
+    const pending = await readBindingFile(next.paths.rootPendingPath);
+    if (!pending || !sameBindingIdentity(pending, next)) {
+      throw new RootAuthorityError('root-binding-pending', 'The staged epoch migration RootBinding is missing or does not match.');
+    }
+    const epoch: RuntimeEpochManifest = {
+      kind: 'limcode-runtime-kernel-epoch',
+      runtimeKernelEpoch: RUNTIME_KERNEL_EPOCH,
+      dataSetId: next.dataSetId,
+      rootInstanceId: next.rootInstanceId,
+      rootGeneration: next.rootGeneration,
+      initializedAt: new Date().toISOString()
+    };
+    await writeDurableJson(next.paths.runtimeEpochPath, epoch);
+    await syncIfFile(next.paths.databasePath);
+    await syncDirectory(next.paths.casRootPath);
+    await syncDirectory(next.paths.dataRootPath);
+    await fs.rename(next.paths.rootPendingPath, next.paths.rootPointerPath);
+    await syncDirectory(path.dirname(next.paths.rootPointerPath));
+    return this.current();
   }
 
   public async current(): Promise<RootBinding> {
@@ -90,7 +184,7 @@ export class RootAuthority {
     if (await exists(paths.rootPendingPath)) {
       throw new RootAuthorityError('root-binding-pending', `Cannot cut over while pending exists: ${paths.rootPendingPath}`);
     }
-    const previous = await readBindingFile(paths.rootPointerPath);
+    const previous = await readHistoricalBindingFile(paths.rootPointerPath);
     return this.activateOffline(paths, previous, initializer);
   }
 
@@ -143,7 +237,7 @@ export class RootAuthority {
 
   private async activateOffline(
     paths: RuntimeRootPaths,
-    previous: RootBinding | undefined,
+    previous: Pick<HistoricalRootBinding, 'rootGeneration' | 'pointerRevision'> | undefined,
     initializer: RuntimeRootInitializer
   ): Promise<RootBinding> {
     await assertFreshRuntimeRoot(paths);
@@ -187,6 +281,14 @@ export class RootAuthority {
 }
 
 export function parseRootBinding(value: unknown): RootBinding {
+  const binding = parseHistoricalRootBinding(value);
+  return freezeRootBinding({
+    ...binding,
+    runtimeKernelEpoch: requireCurrentEpoch(binding.runtimeKernelEpoch)
+  });
+}
+
+export function parseHistoricalRootBinding(value: unknown): HistoricalRootBinding {
   const record = requireRecord(value, 'RootBinding');
   requireExactKeys(record, [
     'paths',
@@ -197,15 +299,15 @@ export function parseRootBinding(value: unknown): RootBinding {
     'runtimeKernelEpoch'
   ], 'RootBinding');
   const paths = parseRootPaths(record.paths);
-  const binding: RootBinding = {
+  const binding: HistoricalRootBinding = {
     paths,
     dataSetId: requireNonEmptyString(record.dataSetId, 'RootBinding.dataSetId'),
     rootInstanceId: requireNonEmptyString(record.rootInstanceId, 'RootBinding.rootInstanceId'),
     rootGeneration: requirePositiveInteger(record.rootGeneration, 'RootBinding.rootGeneration'),
     pointerRevision: requirePositiveInteger(record.pointerRevision, 'RootBinding.pointerRevision'),
-    runtimeKernelEpoch: requireCurrentEpoch(record.runtimeKernelEpoch)
+    runtimeKernelEpoch: requireHistoricalEpoch(record.runtimeKernelEpoch)
   };
-  return freezeRootBinding(binding);
+  return Object.freeze({ ...binding, paths: Object.freeze({ ...binding.paths }) });
 }
 
 export function sameBindingIdentity(left: RootBinding, right: RootBinding): boolean {
@@ -276,6 +378,21 @@ async function readBindingFile(filePath: string): Promise<RootBinding | undefine
     return parseRootBinding(JSON.parse(text));
   } catch (error) {
     throw new RootAuthorityError('root-binding-invalid', `Invalid RootBinding pointer: ${filePath}`, error);
+  }
+}
+
+async function readHistoricalBindingFile(filePath: string): Promise<HistoricalRootBinding | undefined> {
+  let text: string;
+  try {
+    text = await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    if (isNotFound(error)) return undefined;
+    throw error;
+  }
+  try {
+    return parseHistoricalRootBinding(JSON.parse(text));
+  } catch (error) {
+    throw new RootAuthorityError('root-binding-invalid', `Invalid historical RootBinding pointer: ${filePath}`, error);
   }
 }
 
@@ -350,6 +467,26 @@ function samePaths(left: RuntimeRootPaths, right: RuntimeRootPaths): boolean {
     && left.runtimeEpochPath === right.runtimeEpochPath;
 }
 
+function migratedBinding(previous: HistoricalRootBinding): RootBinding {
+  return freezeRootBinding({
+    paths: previous.paths,
+    dataSetId: previous.dataSetId,
+    rootInstanceId: previous.rootInstanceId,
+    rootGeneration: previous.rootGeneration + 1,
+    pointerRevision: previous.pointerRevision + 1,
+    runtimeKernelEpoch: RUNTIME_KERNEL_EPOCH
+  });
+}
+
+function sameHistoricalBindingIdentity(left: HistoricalRootBinding, right: HistoricalRootBinding): boolean {
+  return left.dataSetId === right.dataSetId
+    && left.rootInstanceId === right.rootInstanceId
+    && left.rootGeneration === right.rootGeneration
+    && left.pointerRevision === right.pointerRevision
+    && left.runtimeKernelEpoch === right.runtimeKernelEpoch
+    && samePaths(left.paths, right.paths);
+}
+
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
   return value as Record<string, unknown>;
@@ -376,6 +513,14 @@ function requirePositiveInteger(value: unknown, label: string): number {
 function requireCurrentEpoch(value: unknown): typeof RUNTIME_KERNEL_EPOCH {
   if (value !== RUNTIME_KERNEL_EPOCH) throw new TypeError('RootBinding.runtimeKernelEpoch is not current.');
   return RUNTIME_KERNEL_EPOCH;
+}
+
+function requireHistoricalEpoch(value: unknown): number {
+  const epoch = requirePositiveInteger(value, 'RootBinding.runtimeKernelEpoch');
+  if (epoch > RUNTIME_KERNEL_EPOCH) {
+    throw new TypeError('RootBinding.runtimeKernelEpoch is newer than this extension.');
+  }
+  return epoch;
 }
 
 function requireAbsolutePath(value: unknown, label: string): string {

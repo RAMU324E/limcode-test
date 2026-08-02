@@ -114,8 +114,11 @@ watch(
 );
 
 watch(
-  () => reliableConversation.projection.value.missingToolArgumentIds.join('|'),
-  reliableConversation.ensureDetails,
+  () => Object.entries(reliableConversation.projection.value.interactionByToolCallId)
+    .filter(([, interaction]) => interaction.kind === 'ask_user' && interaction.status === 'pending')
+    .map(([toolCallId, interaction]) => `${toolCallId}:${interaction.updatedAt}`)
+    .join('|'),
+  () => reliableConversation.ensureDetails({ priority: 'critical' }),
   { immediate: true }
 );
 

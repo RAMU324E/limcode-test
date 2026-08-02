@@ -13,6 +13,7 @@ const MAX_REMOTE_READ_BYTES = 256 * 1024;
 export interface RemotePathPolicyOptions {
   allowOutsideProjectPaths?: boolean;
   rejectProjectRoot?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface RemoteServerStreamHandle {
@@ -105,7 +106,11 @@ bytes="$(wc -c < "$FILE" 2>/dev/null || printf '0')"
 case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
 if [ "$bytes" -gt ${maxBytes} ]; then echo "File too large: ${remotePath} (${maxBytes} bytes limit)" >&2; exit 45; fi
 base64 < "$FILE" | tr -d '\n\r'`;
-  const result = await executeRemoteServerScript(environment, script, { timeout: DEFAULT_REMOTE_TIMEOUT_MS, displayCommand: `read ${remotePath}` });
+  const result = await executeRemoteServerScript(environment, script, {
+    timeout: DEFAULT_REMOTE_TIMEOUT_MS,
+    displayCommand: `read ${remotePath}`,
+    signal: options.signal
+  });
   if (result.exitCode === 44) throw new RemoteFileNotFoundError(result.stderr || `远程文件不存在：${remotePath}`);
   if (result.exitCode !== 0 || result.killed) {
     throw new Error(result.stderr || `远程读取失败：${remotePath}`);
@@ -167,14 +172,33 @@ fi`;
 }
 
 
-export function openRemoteServerReadStream(environment: WorkEnvironmentRecord, remotePath: string): RemoteServerStreamHandle {
+export function openRemoteServerReadStream(
+  environment: WorkEnvironmentRecord,
+  remotePath: string,
+  signal?: AbortSignal
+): RemoteServerStreamHandle {
   assertRemoteServerCommandSupported(environment);
-  return spawnRemoteServerScript(environment, `cat -- ${shQuote(remotePath)}`, { timeout: 0, displayCommand: `cat ${remotePath}`, captureStdout: false });
+  return spawnRemoteServerScript(environment, `cat -- ${shQuote(remotePath)}`, {
+    timeout: 0,
+    displayCommand: `cat ${remotePath}`,
+    captureStdout: false,
+    signal
+  });
 }
 
-export function openRemoteServerWriteStream(environment: WorkEnvironmentRecord, remotePath: string): RemoteServerStreamHandle {
+export function openRemoteServerWriteStream(
+  environment: WorkEnvironmentRecord,
+  remotePath: string,
+  signal?: AbortSignal
+): RemoteServerStreamHandle {
   assertRemoteServerCommandSupported(environment);
-  return spawnRemoteServerScript(environment, `cat > ${shQuote(remotePath)}`, { timeout: 0, displayCommand: `write ${remotePath}`, captureStdout: false, closeStdin: false });
+  return spawnRemoteServerScript(environment, `cat > ${shQuote(remotePath)}`, {
+    timeout: 0,
+    displayCommand: `write ${remotePath}`,
+    captureStdout: false,
+    closeStdin: false,
+    signal
+  });
 }
 
 export function executeRemoteServerScript(

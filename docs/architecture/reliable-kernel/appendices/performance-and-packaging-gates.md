@@ -82,7 +82,7 @@
 - `recovery.answer-inbox-invariant`；
 - `recovery.delivery-pending`；
 - `recovery.foreground-answer-wait-expired`；
-- `recovery.cancelled-subtree-incomplete`；
+- `recovery.interrupted-subtree-incomplete`；
 - snapshot read/feed registration 中间并发 commit；
 - single oversized commit；
 - slow ACK 造成 host queue overflow；
@@ -95,7 +95,7 @@
 - historical replay after Message soft delete；
 - compression tail stop；
 - immutable compression replacement；
-- cancel_subtree after child continuation and pending intent；
+- interrupt_subtree after child continuation and pending intent；
 - late answer/stream/receipt 不重新打开 terminal Turn。
 
 只验证状态真实和结果可继续处理，不要求所有 external effects exactly-once。

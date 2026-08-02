@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import { useBottomStickyScroller } from '@webview/composables/useBottomStickyScroller';
 
 const scroller = ref<HTMLElement | null>(null);
+useBottomStickyScroller(scroller);
 
 withDefaults(
   defineProps<{

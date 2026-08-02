@@ -1,4 +1,4 @@
-import type { CommandCapability, CommandOutputLimits } from '../../../../../capabilities/types';
+import type { CommandCapability } from '../../../../../capabilities/types';
 import type { ToolConfigRecord } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
 import { normalizeSchedulingHint } from '../../schedulingContract';
@@ -10,9 +10,6 @@ export const commandToolModule = defineToolDefinitionModule({
     return createCommandTool(command);
   }
 });
-
-const DEFAULT_MAX_OUTPUT_LINES = 100;
-const DEFAULT_MAX_OUTPUT_CHARS = 10_000;
 
 export function createCommandTool(command: CommandCapability): ToolDefinition {
   return {
@@ -28,7 +25,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           },
           mode: {
             type: 'string',
-            description: 'Operation mode. Defaults to execute. execute starts a new command; output reads accumulated output from a background process; kill terminates a background process. output/kill require a processId returned by an earlier execute result.'
+            description: 'Operation mode. Defaults to execute. execute starts a new command; output reads one resumable page from a background process; kill terminates a background process. output/kill require a processId returned by an earlier execute result.'
           },
           command: {
             type: 'string',
@@ -47,6 +44,10 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           processId: {
             type: 'string',
             description: 'Do not provide this when mode=execute. The runtime generates and returns processId when an execute command is moved to the background. Required only for mode=output or mode=kill; copy it from a previous shell/bash result or background notification.'
+          },
+          outputHandle: {
+            type: 'string',
+            description: 'Only for mode=output. Omit on the first read. When a result returns nextOutputHandle, pass that exact opaque value to continue from the next output chunk. Each stdout/stderr page is bounded for transport, while repeated reads traverse the complete retained history without a total output cap. Running-only liveStdout/liveStderr fields are provisional previews and do not advance this handle.'
           },
           readonly: {
             type: 'string',
@@ -86,7 +87,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             key: 'allowCommands',
             label: '命令白名单',
             type: 'stringList',
-            description: '白名单命令会自动执行；当前阶段未知命令也暂时按白名单处理。',
+            description: '配置非空时，仅命令文本包含白名单片段的命令可以执行；未匹配命令会由后端拒绝。',
             placeholder: '例如：git status\nnpm run compile'
           },
           {
@@ -95,29 +96,13 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             type: 'boolean',
             description: '开启后，即使未开启"自动批准执行"，被模型标记为只读(readonly=true)的命令也会自动批准、无需人工确认。',
             defaultValue: true
-          },
-          {
-            key: 'maxOutputLines',
-            label: '输出最大行数',
-            type: 'number',
-            description: '返回给模型的 stdout/stderr 最多保留的行数（保留末尾若干行）。默认 100。',
-            defaultValue: DEFAULT_MAX_OUTPUT_LINES
-          },
-          {
-            key: 'maxOutputChars',
-            label: '输出最大字符数',
-            type: 'number',
-            description: '返回给模型的 stdout/stderr 最多保留的字符数（保留末尾字符）。默认 10000。',
-            defaultValue: DEFAULT_MAX_OUTPUT_CHARS
           }
         ]
       },
       defaultConfig: {
         denyCommands: [],
         allowCommands: [],
-        autoApproveReadonly: true,
-        maxOutputLines: DEFAULT_MAX_OUTPUT_LINES,
-        maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS
+        autoApproveReadonly: true
       }
     },
     execution: 'runtime',
@@ -126,7 +111,6 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
     async execute(rawArgs, deps, ctx) {
       const args = (rawArgs ?? {}) as CommandToolArgs;
       const config = normalizeCommandToolConfig(ctx?.config);
-      const limits: CommandOutputLimits = { maxOutputLines: config.maxOutputLines, maxOutputChars: config.maxOutputChars };
       const mode = args.mode === 'output' || args.mode === 'kill' ? args.mode : 'execute';
 
       if (mode === 'output') {
@@ -134,7 +118,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
         if (!processId) return { ok: false, output: '缺少 processId：mode=output 需要指定后台进程 id。' };
         return {
           ok: true,
-          output: deps.command.readOutput(processId, limits)
+          output: deps.command.readOutput(processId)
         };
       }
 
@@ -176,7 +160,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             ...(event.payload !== undefined ? { payload: event.payload } : {})
           });
         }
-      }, { workEnvironment: ctx?.workEnvironment, accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments }, limits);
+      }, { workEnvironment: ctx?.workEnvironment, accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments });
       const ok = result.status === 'running' || result.exitCode === 0;
       return {
         ok,
@@ -195,6 +179,7 @@ type CommandToolArgs = {
   foregroundWaitMs?: number;
   mode?: string;
   processId?: string;
+  outputHandle?: string;
   readonly?: string;
   wait?: string;
   scheduling?: string;
@@ -230,23 +215,14 @@ interface NormalizedCommandToolConfig {
   denyCommands: string[];
   allowCommands: string[];
   autoApproveReadonly: boolean;
-  maxOutputLines: number;
-  maxOutputChars: number;
 }
 
 function normalizeCommandToolConfig(config: ToolConfigRecord | undefined): NormalizedCommandToolConfig {
   return {
     denyCommands: normalizeStringList(config?.denyCommands),
     allowCommands: normalizeStringList(config?.allowCommands),
-    autoApproveReadonly: config?.autoApproveReadonly !== false,
-    maxOutputLines: normalizePositiveInt(config?.maxOutputLines, DEFAULT_MAX_OUTPUT_LINES),
-    maxOutputChars: normalizePositiveInt(config?.maxOutputChars, DEFAULT_MAX_OUTPUT_CHARS)
+    autoApproveReadonly: config?.autoApproveReadonly !== false
   };
-}
-
-function normalizePositiveInt(value: unknown, fallback: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
-  return Math.floor(value);
 }
 
 function normalizeStringList(value: unknown): string[] {

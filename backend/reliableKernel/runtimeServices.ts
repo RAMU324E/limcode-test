@@ -92,8 +92,7 @@ export type RunAgentRouteCommand =
   | ({ operation: 'admit' } & ChildContinuationAdmissionCommand)
   | ({ operation: 'wait'; childExecutionId: string; timeoutMs?: number })
   | ({ operation: 'list'; limit?: number })
-  | ({ operation: 'cancel' } & ChildExecutionCancelCommand)
-  | ({ operation: 'cancel_subtree' } & ChildExecutionCancelCommand);
+  | ({ operation: 'interrupt_subtree' } & ChildExecutionCancelCommand);
 
 type RuntimeRouterServices = Omit<ReliableKernelRuntimeServices, 'effects' | 'router'>;
 
@@ -119,13 +118,9 @@ export class ReliableKernelRuntimeRouter {
         return this.services.children.wait(command.childExecutionId, command.timeoutMs ?? 0);
       case 'list':
         return this.services.children.list(command.limit ?? 200);
-      case 'cancel': {
+      case 'interrupt_subtree': {
         const { operation: _operation, ...input } = command;
-        return this.services.children.cancel(input);
-      }
-      case 'cancel_subtree': {
-        const { operation: _operation, ...input } = command;
-        return this.services.children.cancelSubtree(input);
+        return this.services.children.interruptSubtree(input);
       }
       default:
         return Promise.reject(new Error(`Unsupported run_agent operation: ${String((command as { operation?: unknown }).operation)}.`));

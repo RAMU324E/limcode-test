@@ -26,6 +26,12 @@ export interface PendingInteractionResolution {
   startedAt: number;
 }
 
+export interface ObservedInteractionResult {
+  payload: InteractionResultPayload;
+  correlationId?: string;
+  observedAt: number;
+}
+
 const timers = new Map<string, number>();
 
 /**
@@ -34,6 +40,7 @@ const timers = new Map<string, number>();
  */
 export const useInteractionStore = defineStore('interactions', () => {
   const pending = reactive<Record<string, PendingInteractionResolution>>({});
+  const observedResults = reactive<Record<string, ObservedInteractionResult>>({});
   const pendingResolutions = computed(() => Object.values(pending)
     .sort((left, right) => left.startedAt - right.startedAt || left.interactionRequestId.localeCompare(right.interactionRequestId)));
 
@@ -63,6 +70,17 @@ export const useInteractionStore = defineStore('interactions', () => {
   }
 
   function applyResult(payload: InteractionResultPayload, correlationId?: string): void {
+    observedResults[payload.targetId] = {
+      payload,
+      ...(correlationId ? { correlationId } : {}),
+      observedAt: Date.now()
+    };
+    const stale = Object.entries(observedResults)
+      .sort((left, right) => left[1].observedAt - right[1].observedAt || left[0].localeCompare(right[0]));
+    while (stale.length > 256) {
+      const oldest = stale.shift();
+      if (oldest) delete observedResults[oldest[0]];
+    }
     const record = pending[payload.targetId]
       ?? Object.values(pending).find((candidate) => candidate.requestId === correlationId);
     if (!record) return;
@@ -83,6 +101,12 @@ export const useInteractionStore = defineStore('interactions', () => {
     return !!pending[interactionRequestId];
   }
 
+  function resultFor(targetId: string, correlationId?: string): ObservedInteractionResult | undefined {
+    const result = observedResults[targetId];
+    if (!result || (correlationId && result.correlationId !== correlationId)) return undefined;
+    return result;
+  }
+
   function armTimeout(interactionRequestId: string): void {
     const previous = timers.get(interactionRequestId);
     if (previous !== undefined) window.clearTimeout(previous);
@@ -96,7 +120,7 @@ export const useInteractionStore = defineStore('interactions', () => {
     delete pending[interactionRequestId];
   }
 
-  return { pending, pendingResolutions, resolve, applyResult, reconcile, isPending };
+  return { pending, pendingResolutions, observedResults, resolve, applyResult, reconcile, isPending, resultFor };
 });
 
 function cloneJson<T extends JsonValue>(value: T): T {

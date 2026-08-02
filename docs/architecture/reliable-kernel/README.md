@@ -43,7 +43,7 @@
 
 ### 3.1 子树终止
 
-`cancel_subtree` 是首发必选能力，不再属于可降级项。树遍历只依据稳定 `ChildExecutionParentLink`；`ChildExecutionActiveTurnLink` 只是当前活动 Turn 指针。终止事务同时覆盖活动 Turn 与尚未 admit 的 `ChildExecutionIntentLink`。
+`interrupt_subtree` 是首发必选能力，不再属于可降级项。树遍历只依据稳定 `ChildExecutionParentLink`；`ChildExecutionActiveTurnLink` 只是当前活动 Turn 指针。终止事务同时覆盖活动 Turn 与尚未 admit 的 `ChildExecutionIntentLink`。
 
 ### 3.2 ProviderContinuation
 
@@ -61,7 +61,7 @@
 
 后台进程采用小型 packaged `detached wrapper`，不是通用 daemon/broker：
 
-- wrapper 持续 drain stdout/stderr 到有界 spool；
+- wrapper 持续 drain stdout/stderr 到durable append-only spool；
 - stable nonce、process group 与 start fingerprint 防止 PID 复用误判；
 - wrapper 原子写真实 exit receipt；
 - Extension Host 重启后读取 spool/receipt 并核验结果；
@@ -152,7 +152,7 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 通用 scanner 框架由 D 建立，但扫描项使用稳定 ID 分配 owner：
 
 - D：`recovery.effect-intent-hanging`、`recovery.file-change-unresolved`；
-- F：`recovery.answer-inbox-invariant`、`recovery.delivery-pending`、`recovery.foreground-answer-wait-expired`、`recovery.cancelled-subtree-incomplete`。
+- F：`recovery.answer-inbox-invariant`、`recovery.delivery-pending`、`recovery.foreground-answer-wait-expired`、`recovery.interrupted-subtree-incomplete`。
 
 `tool.json#recoveryScan` 是 target/action/owner 唯一权威；identity、阶段文档和 candidate checks 只引用这些 ID。
 
@@ -165,6 +165,8 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 - global/agent/workflow scope links 保留，conversation/run/无 authority 的 agentSystem links 重置；
 - 旧 Runtime 归档，配置按 manifest preserve/filter，Workspace 与未知用户文件不触碰；
 - 激活后只修复新内核，不自动回退旧 writer。
+
+已经实际落盘的 SQLite epoch 2 数据是上述硬切之后的用户运行数据，不属于旧文件 Runtime。为避免丢失对话历史，启动门仅允许一个有界例外：数据库打开前执行精确 `epoch 2 → 3` 离线升级。升级器要求 table/index/trigger/manifest/RootBinding 全量指纹吻合，先用 SQLite Backup API 持久备份，再以 pending pointer、单事务和 journal 向前恢复；任何未知漂移仍 fail closed，且不建立版本协商或通用迁移链。
 
 真实 cutover actor 是最终 VSIX 的 `cutover-only coordinator`：旧宿主先关闭 admission、drain 并持久化 request，然后退出；最终 VSIX 安装并重启后先完成 journaled archive、配置过滤和校验，再创建 SQLite/CAS/epoch 并原子激活 RootBinding。归档失败时 active pointer 不变且可按 journal 恢复。
 
@@ -188,7 +190,7 @@ Gate 的机器身份是稳定 `check.id`，handler 使用 `Map<checkId, handler>
 
 ## 9. 明确不做
 
-- 旧 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；
+- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；精确 `epoch 2 → 3` 离线升级是唯一有界例外；
 - 运行时 schema v1/v2 协商；
 - 在线 Context root/node GC 或 CAS 引用计数；
 - 持久 ClientChangeLog 或跨宿主持久 feed；
@@ -207,9 +209,9 @@ Gate 的机器身份是稳定 `check.id`，handler 使用 `Map<checkId, handler>
 1. Turn 是唯一执行身份；
 2. 每个终态 ToolCall 只有一个 ToolModelResult；
 3. Context DAG 不复制历史前缀；
-4. detached wrapper 与每进程输出上限通过故障测试；
+4. detached wrapper、无总量截断的分批登记与output handle完整遍历通过故障测试；
 5. 六类 recovery scan 各有证据；
-6. cancel_subtree、fork Links、MCP Effect 与 immutable compression replacement 通过 candidate；
+6. interrupt_subtree、fork Links、MCP Effect 与 immutable compression replacement 通过 candidate；
 7. snapshot/changes/queue/barrier 全部有界；
 8. old writer 在 candidate 不可达，在 G 才物理删除；
 9. physical migration manifest 与 cutover journal 真正执行；

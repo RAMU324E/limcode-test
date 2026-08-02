@@ -36,6 +36,8 @@ interface SidebarWebviewMessage {
   cursor?: string;
   limit?: number;
   requestId?: string;
+  turnId?: string;
+  leaseGeneration?: string;
 }
 
 interface SidebarStateMessage {
@@ -60,6 +62,8 @@ export function registerSidebarEntryView(context: vscode.ExtensionContext, backe
   );
   context.subscriptions.push(MainPanel.onDidChangeConversationPanelState(() => provider.refreshOpenConversationPanelStates()));
   context.subscriptions.push(backendApp.onDidChangeConversationHistory(() => provider.refreshConversationHistory()));
+  context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => provider.refreshWorkspaceContext()));
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => provider.refreshWorkspaceContext()));
 }
 
 class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
@@ -138,8 +142,20 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      if (message.type === ABORT_CONVERSATION_MESSAGE && message.conversationId && message.requestId) {
-        this.abortConversationFromSidebar(webviewView.webview, message.conversationId, message.requestId);
+      if (
+        message.type === ABORT_CONVERSATION_MESSAGE
+        && message.conversationId
+        && message.requestId
+        && message.turnId
+        && message.leaseGeneration
+      ) {
+        this.abortConversationFromSidebar(
+          webviewView.webview,
+          message.conversationId,
+          message.requestId,
+          message.turnId,
+          message.leaseGeneration
+        );
         return;
       }
 
@@ -175,6 +191,17 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
     const message = this.withLivePanelState(this.lastStateMessage);
     this.lastStateMessage = message;
     void postSidebarWebviewMessage(target, message);
+  }
+
+  public refreshWorkspaceContext(): void {
+    // A current-project cursor is scoped to the previously active folder. Reset it before resolving
+    // the new active editor/workspace folder so an opaque tree cursor cannot cross project scopes.
+    if (this.lastScopeKind === 'currentProject') {
+      this.lastCursor = undefined;
+      this.lastProjectFolderUri = undefined;
+    }
+    this.historyRequestSeq += 1;
+    this.scheduleConversationHistoryRefresh();
   }
 
   private postSidebarStateWhenReady(webview: vscode.Webview, scopeKind: SidebarHistoryScopeKind = 'currentProject', cursor?: string, limit?: number, projectFolderUri?: string): Promise<void> {
@@ -257,10 +284,19 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
     })();
   }
 
-  private abortConversationFromSidebar(webview: vscode.Webview, conversationId: string, requestId: string): void {
+  private abortConversationFromSidebar(
+    webview: vscode.Webview,
+    conversationId: string,
+    requestId: string,
+    turnId: string,
+    leaseGeneration: string
+  ): void {
     void (async () => {
       try {
-        const outcome = await this.backendApp.abortConversation(conversationId, requestId);
+        const outcome = await this.backendApp.abortConversation(conversationId, requestId, {
+          turnId,
+          leaseGeneration
+        });
         await this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
         const ok = outcome.status !== 'stale';
         const message = outcome.status === 'already_satisfied'

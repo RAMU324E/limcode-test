@@ -16,8 +16,6 @@ import {
 } from '../components';
 import {
   conversationClientStateStreamId,
-  TOOL_CALL_PREVIEW_HEAD_CHARS,
-  TOOL_CALL_PREVIEW_MAX_CHARS,
   type ClientPatchOp,
   type ToolCallPreviewRecord,
   type ToolCallPreviewTargetLinkRecord
@@ -25,8 +23,7 @@ import {
 import { ClientSyncFastPatchStateKey, type ClientSyncFastPatchBatch } from '../../../clientSync/resources';
 import type { TransientStreamEpoch } from '../../../../../shared/conversationReliability';
 import type { AttemptId, RequestId } from '../../../../../shared/stableIds';
-
-const PREVIEW_TAIL_CHARS = TOOL_CALL_PREVIEW_MAX_CHARS - TOOL_CALL_PREVIEW_HEAD_CHARS;
+import { appendToolCallPreviewArguments } from '../../../../../shared/toolCallPreview';
 
 interface WorkingPreview {
   previewEntity: Entity;
@@ -250,10 +247,8 @@ function existingOrNewPreview(
       callId,
       ...(name ? { name } : {}),
       ...(streamIndex ? { streamIndex } : {}),
-      argumentsHead: '',
-      argumentsTail: '',
+      argumentsText: '',
       receivedChars: 0,
-      truncated: false,
       createdAt: now,
       updatedAt: now
     },
@@ -289,10 +284,8 @@ function restartPreview(
       callId,
       ...(name ? { name } : {}),
       ...(streamIndex ? { streamIndex } : {}),
-      argumentsHead: '',
-      argumentsTail: '',
+      argumentsText: '',
       receivedChars: 0,
-      truncated: false,
       createdAt: now,
       updatedAt: now
     },
@@ -318,32 +311,11 @@ function appendPreviewArguments(
   streamIndex?: string
 ): ToolCallPreviewData {
   const now = Date.now();
-  const source = replace
-    ? delta
-    : current.truncated
-      ? current.argumentsHead + current.argumentsTail + delta
-      : current.argumentsHead + delta;
-  const receivedChars = replace ? delta.length : current.receivedChars + delta.length;
-  if (source.length <= TOOL_CALL_PREVIEW_MAX_CHARS && (replace || !current.truncated)) {
-    return {
-      ...current,
-      ...(name ? { name } : {}),
-      ...(streamIndex ? { streamIndex } : {}),
-      argumentsHead: source,
-      argumentsTail: '',
-      receivedChars,
-      truncated: false,
-      updatedAt: now
-    };
-  }
   return {
     ...current,
     ...(name ? { name } : {}),
     ...(streamIndex ? { streamIndex } : {}),
-    argumentsHead: source.slice(0, TOOL_CALL_PREVIEW_HEAD_CHARS),
-    argumentsTail: source.slice(-PREVIEW_TAIL_CHARS),
-    receivedChars,
-    truncated: true,
+    ...appendToolCallPreviewArguments(current, delta, replace),
     updatedAt: now
   };
 }

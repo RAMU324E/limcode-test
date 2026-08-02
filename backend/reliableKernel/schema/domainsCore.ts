@@ -18,6 +18,21 @@ export const CORE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     columns: [id(), text('title'), text('status'), text('created_at'), text('updated_at')]
   }),
   domain({
+    key: 'ProjectContext', table: 'project_context', repository: 'ProjectContextRepository', codec: 'ProjectContextRowCodec',
+    mutations: ['insert', 'update'], client: 'summary', deletePolicy: 'dataset-reset-only',
+    indexes: ['uri UNIQUE', 'updated_at,id'],
+    columns: [id(), text('kind'), text('uri'), text('name'), text('created_at'), text('updated_at')]
+  }),
+  domain({
+    key: 'ConversationProjectLink', table: 'conversation_project_link', repository: 'ConversationProjectLinkRepository', codec: 'ConversationProjectLinkRowCodec',
+    mutations: ['insert', 'delete'], client: 'summary', deletePolicy: 'cascade-with-conversation',
+    indexes: ['conversation_id UNIQUE', 'project_context_id,conversation_id'],
+    columns: [
+      id(), ref('conversation_id', 'conversation'), ref('project_context_id', 'project_context', false, 'RESTRICT'),
+      text('role'), text('created_at'), text('updated_at')
+    ]
+  }),
+  domain({
     key: 'ConversationReuseLink', table: 'conversation_reuse_link', repository: 'ConversationReuseLinkRepository', codec: 'ConversationReuseLinkRowCodec',
     mutations: ['insert', 'update', 'delete'], client: 'summary', deletePolicy: 'cascade-with-conversation',
     indexes: ['reuse_key UNIQUE', 'conversation_id', 'agent_id'],
@@ -80,14 +95,20 @@ export const CORE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   domain({
     key: 'PendingTurnInput', table: 'pending_turn_input', repository: 'PendingTurnInputRepository', codec: 'PendingTurnInputRowCodec',
     mutations: ['insert', 'update', 'delete'], client: 'none', deletePolicy: 'cascade-with-turn',
-    indexes: ['turn_id,position UNIQUE'],
+    indexes: [
+      'turn_id,position UNIQUE',
+      "turn_id,input_kind UNIQUE WHERE state = 'pending' AND input_kind = 'interrupt_request'"
+    ],
     columns: [id(), ref('turn_id', 'turn'), integer('position'), text('input_kind'), ref('content_object_id', 'content_object'), text('state'), text('created_at'), text('updated_at')]
   }),
   domain({
     key: 'ExecutionLease', table: 'execution_lease', repository: 'ExecutionLeaseRepository', codec: 'ExecutionLeaseRowCodec',
     mutations: ['insert', 'update', 'delete'], client: 'summary', deletePolicy: 'release-on-terminal',
     indexes: ['conversation_id UNIQUE', 'turn_id UNIQUE'],
-    columns: [id(), ref('conversation_id', 'conversation'), ref('turn_id', 'turn'), text('owner_id'), text('host_boot_id'), text('acquired_at'), text('expires_at')]
+    columns: [
+      id(), ref('conversation_id', 'conversation'), ref('turn_id', 'turn'), text('owner_id'),
+      text('host_boot_id'), integer('generation'), text('acquired_at'), text('expires_at')
+    ]
   }),
   domain({
     key: 'AuthoritySnapshot', table: 'authority_snapshot', repository: 'AuthoritySnapshotRepository', codec: 'AuthoritySnapshotRowCodec',
@@ -139,7 +160,7 @@ export const CORE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   }),
   domain({
     key: 'MessageTurnLink', table: 'message_turn_link', repository: 'MessageTurnLinkRepository', codec: 'MessageTurnLinkRowCodec',
-    mutations: ['insert', 'delete'], client: 'none', deletePolicy: 'cascade-with-message',
+    mutations: ['insert', 'delete'], client: 'summary', deletePolicy: 'cascade-with-message',
     indexes: ['turn_id,message_id,role UNIQUE', 'message_id'],
     columns: [id(), ref('turn_id', 'turn'), ref('message_id', 'message'), text('role'), text('created_at')]
   }),

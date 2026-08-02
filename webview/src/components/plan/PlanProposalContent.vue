@@ -4,7 +4,7 @@ import { IconArrowsMaximize, IconArrowsMinimize, IconClipboardList, IconCircleCh
 import { renderPlanMarkdown } from '@shared/planMarkdown';
 import { DELEGATED_PLAN_APPROVAL_MESSAGE, submitPlanOutputFromResult } from '@shared/planReview';
 import type { AgentRecord, PlanProposalRecord, PlanProposalStatus, SubmitPlanToolRequestRecord, ToolCallRecord } from '@shared/protocol';
-import { interactionForTool } from '@webview/domain/interactionProjection';
+import { interactionForTool, type InteractionView } from '@webview/domain/interactionProjection';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
@@ -23,6 +23,7 @@ const props = withDefaults(defineProps<{
   proposalId?: string;
   toolCall?: ToolCallRecord;
   result?: unknown;
+  interactionView?: InteractionView;
   layout?: 'embedded' | 'full';
 }>(), {
   layout: 'embedded'
@@ -47,12 +48,15 @@ const changeFeedbackInput = ref<HTMLTextAreaElement | null>(null);
 const planScroller = ref<HTMLElement | null>(null);
 const panelExpanded = ref(false);
 const output = computed(() => submitPlanOutputFromResult(props.result));
+const proposalIdentity = computed(() => props.proposalId
+  ?? output.value?.proposalId
+  ?? (props.toolCall ? `plan-proposal:${props.toolCall.id}` : undefined));
 const proposal = computed<PlanProposalRecord | undefined>(() => {
-  const id = props.proposalId ?? output.value?.proposalId;
+  const id = proposalIdentity.value;
   if (!id) return undefined;
   return clientState.planProposals.find((item) => item.id === id);
 });
-const interaction = computed(() => interactionForTool(clientState, props.toolCall?.id, 'plan_review'));
+const interaction = computed(() => props.interactionView ?? interactionForTool(clientState, props.toolCall?.id, 'plan_review'));
 const interactionStatus = computed<PlanProposalStatus | undefined>(() => {
   const target = interaction.value;
   if (!target) return undefined;
@@ -117,14 +121,14 @@ const dispatchPanelActions = computed<ConfirmPanelAction[]>(() => [
   { key: 'cancel', label: '取消', variant: 'secondary' },
   { key: 'confirm', label: '分派执行', disabled: !selectedDispatchAgent.value }
 ]);
-const feedbackInputId = computed(() => `plan-feedback-input-${props.toolCall?.id ?? props.proposalId ?? 'current'}`);
+const feedbackInputId = computed(() => `plan-feedback-input-${props.toolCall?.id ?? proposalIdentity.value ?? 'current'}`);
 const exportMarkdown = computed(() => renderPlanMarkdown({
   plan: planBody.value,
   ...(taskListOperation.value ? { taskList: taskListOperation.value } : {}),
   statusLabel: statusLabel.value,
   taskListTitle: taskListTitle.value
 }));
-const exportSuggestedFileName = computed(() => `plan-${clientState.currentConversation?.title || props.proposalId || output.value?.proposalId || 'export'}.md`);
+const exportSuggestedFileName = computed(() => `plan-${clientState.currentConversation?.title || proposalIdentity.value || 'export'}.md`);
 
 watch(
   () => props.toolCall?.id ?? '',
@@ -189,7 +193,7 @@ function confirmDispatch(): void {
 
 function submitApproval(target: 'current_conversation' | 'new_conversation', agentType?: string): void {
   const interactionTarget = interaction.value;
-  const planProposalId = props.proposalId ?? output.value?.proposalId;
+  const planProposalId = proposalIdentity.value;
   if (!interactionTarget || !planProposalId || !pending.value || submitting.value) return;
   if (target === 'new_conversation') {
     const normalizedAgentType = agentType?.trim();
@@ -214,7 +218,7 @@ function submitApproval(target: 'current_conversation' | 'new_conversation', age
 
 function decide(kind: 'changes' | 'reject', message = defaultMessageForDecision(kind)): void {
   const interactionTarget = interaction.value;
-  const planProposalId = props.proposalId ?? output.value?.proposalId;
+  const planProposalId = proposalIdentity.value;
   if (!interactionTarget || !planProposalId || !pending.value || submitting.value) return;
   const userMessage = message.trim() || defaultMessageForDecision(kind);
   const accepted = interactions.resolve(interactionTarget, kind === 'changes' ? 'submit' : 'reject', {
@@ -397,7 +401,7 @@ function agentTypeDescription(agent: AgentRecord): string {
         <IconPencilMinus class="plan-action-icon" stroke="2" aria-hidden="true" />
         <span>{{ submitting === 'changes' ? '正在提交…' : changeFeedbackOpen ? '提交修改要求' : '要求修改' }}</span>
       </button>
-      <button type="button" class="plan-action secondary" :disabled="!!submitting || !dispatchAgentOptions.length" @click="openDispatchPanel">
+      <button v-if="!interactionView" type="button" class="plan-action secondary" :disabled="!!submitting || !dispatchAgentOptions.length" @click="openDispatchPanel">
         <IconMessagePlus class="plan-action-icon" stroke="2" aria-hidden="true" />
         <span>{{ submitting === 'approve-new' ? '正在分派…' : '新开对话执行' }}</span>
       </button>
@@ -409,7 +413,7 @@ function agentTypeDescription(agent: AgentRecord): string {
   </section>
 
   <ConfirmPanel
-    :open="dispatchPanelOpen"
+    :open="dispatchPanelOpen && !interactionView"
     title="选择执行 Agent"
     description="将创建所选 Agent 类型的临时镜像和独立对话，并在后台执行已批准的 Plan。"
     :actions="dispatchPanelActions"

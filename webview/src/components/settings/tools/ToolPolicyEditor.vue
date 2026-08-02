@@ -108,7 +108,7 @@ const presetOptions = computed<Array<{ value: ToolPolicyPresetKind; label: strin
   {
     value: 'yolo',
     label: 'YOLO 模式',
-    description: '所有工具（含 MCP）直接运行；write/edit 生成的修改立即自动应用，不打开审批或差异预览标签页。'
+    description: '已启用的工具直接运行；write/edit/delete 生成的修改立即自动应用，不打开审批或差异预览标签页。'
   }
 ]);
 const toolScopeOptions = computed<SettingsDropdownOption[]>(() => [
@@ -147,7 +147,6 @@ function updatePolicyPreset(value: ToolPolicyPresetKind): void {
 }
 
 function isToolEnabled(tool: ToolDefinitionRecord): boolean {
-  if (runtimePreset.value === 'yolo') return true;
   if (allowedSet.value.has(tool.name)) return true;
   if (tool.source?.kind !== 'mcp') return false;
   const sourceId = tool.source.sourceId;
@@ -158,7 +157,6 @@ function isToolEnabled(tool: ToolDefinitionRecord): boolean {
 }
 
 function isMcpSourceEnabled(sourceId: string): boolean {
-  if (runtimePreset.value === 'yolo') return true;
   return effectivePolicy.value?.sourceConfigs?.[sourceId]?.enabled === true;
 }
 

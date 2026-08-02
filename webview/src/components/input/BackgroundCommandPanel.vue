@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconTerminal2, IconX } from '@tabler/icons-vue';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
-import { reliableKernelDetailKey } from '@webview/stores/useReliableKernelClientFeedStore';
+import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import {
   parseShellCallArgs,
@@ -11,8 +11,10 @@ import {
 
 interface CommandEntry {
   processId: string;
+  toolCallId: string;
   shell: string;
   command: string;
+  commandState: 'loading' | 'ready' | 'empty' | 'error';
   cwd?: string;
   foregroundWaitMs?: number;
   mode: string;
@@ -41,6 +43,7 @@ const selectedProcessId = ref<string>();
 const rootRef = ref<HTMLElement | null>(null);
 const listScroller = ref<HTMLElement | null>(null);
 const detailScroller = ref<HTMLElement | null>(null);
+let outputRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
 const entries = computed<CommandEntry[]>(buildCommandEntries);
 const runningCount = computed(() => entries.value.filter((entry) => entry.statusTone === 'running').length);
@@ -72,15 +75,36 @@ watch(open, (isOpen) => {
 });
 
 watch(
-  () => Object.values(reliableConversation.feed.records.ProcessOutputChunk ?? {})
-    .map((chunk) => `${text(chunk.id) ?? ''}:${decimal(chunk.chunk_seq) ?? ''}`)
-    .join('|'),
+  () => open.value && selectedEntry.value?.running === true,
+  (shouldRefresh) => {
+    if (outputRefreshTimer !== undefined) clearInterval(outputRefreshTimer);
+    outputRefreshTimer = undefined;
+    if (!shouldRefresh) return;
+    outputRefreshTimer = setInterval(ensureOutputDetails, 1_000);
+  },
+  { immediate: true }
+);
+
+watch(
+  () => {
+    const process = reliableConversation.feed.records.Process?.[selectedProcessId.value ?? ''];
+    return `${open.value ? 'open' : 'closed'}:${selectedProcessId.value ?? ''}:${decimal(process?.retained_chunks) ?? '0'}:${text(process?.updated_at) ?? ''}`;
+  },
   ensureOutputDetails,
   { immediate: true }
 );
 
+watch(
+  () => `${open.value ? 'open' : 'closed'}:${selectedEntry.value?.toolCallId ?? ''}`,
+  ensureCommandDetail,
+  { immediate: true }
+);
+
 onMounted(() => document.addEventListener('pointerdown', onDocumentPointerDown, true));
-onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocumentPointerDown, true));
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+  if (outputRefreshTimer !== undefined) clearInterval(outputRefreshTimer);
+});
 
 function toggleOpen(): void {
   open.value = !open.value;
@@ -103,10 +127,21 @@ function onDocumentPointerDown(event: PointerEvent): void {
 }
 
 function ensureOutputDetails(): void {
-  for (const chunk of Object.values(reliableConversation.feed.records.ProcessOutputChunk ?? {})) {
-    const id = text(chunk.id);
-    if (id) reliableConversation.feed.requestDetail('process-output', id);
+  if (!open.value || !selectedProcessId.value) return;
+  for (const kind of ['process-stdout', 'process-stderr'] as const) {
+    const key = reliableKernelDetailKey(kind, selectedProcessId.value);
+    if (reliableConversation.feed.details[key]?.status === 'ready') {
+      reliableConversation.feed.refreshDetail(kind, selectedProcessId.value, { priority: 'expanded' });
+    } else {
+      reliableConversation.feed.requestDetail(kind, selectedProcessId.value, { priority: 'expanded' });
+    }
   }
+}
+
+function ensureCommandDetail(): void {
+  if (!open.value) return;
+  const toolCallId = selectedEntry.value?.toolCallId;
+  if (toolCallId) reliableConversation.feed.requestDetail('tool-arguments-content', toolCallId, { priority: 'expanded' });
 }
 
 function buildCommandEntries(): CommandEntry[] {
@@ -120,24 +155,44 @@ function buildCommandEntries(): CommandEntry[] {
     const processId = text(receipt.process_id);
     if (processId) receipts.set(processId, receipt);
   }
-  const chunksByProcess = groupByProcess(Object.values(records.ProcessOutputChunk ?? {}));
-
   return Object.values(records.Process ?? {})
     .flatMap((process): CommandEntry[] => {
       const processId = text(process.id);
       const status = text(process.status);
-      if (!processId || !status) return [];
-      const call = calls.get(origins.get(processId) ?? '');
-      const args = call ? parseShellCallArgs(call.args) : {} as ShellArgs;
-      const output = materializeOutput(chunksByProcess.get(processId) ?? []);
+      const backgroundKind = text(process.background_kind);
+      const toolCallId = origins.get(processId ?? '');
+      if (!processId || !status || !toolCallId || (backgroundKind !== 'requested' && backgroundKind !== 'detached')) return [];
+      const call = calls.get(toolCallId);
+      const argumentDetail = reliableConversation.feed.details[
+        reliableKernelDetailKey('tool-arguments-content', toolCallId)
+      ];
+      const args = argumentDetail?.status === 'ready'
+        ? parseShellCallArgs(argumentDetail.text)
+        : {} as ShellArgs;
+      const command = args.command?.trim();
+      const commandState: CommandEntry['commandState'] = argumentDetail?.status === 'error'
+        || process.command_arguments_state === 'error'
+        ? 'error'
+        : argumentDetail?.status !== 'ready'
+          ? 'loading'
+          : command ? 'ready' : 'empty';
+      const output = processId === selectedProcessId.value
+        ? materializeOutput(processId)
+        : { stdout: '', stderr: '', loading: false };
       const receipt = receipts.get(processId);
       const exitCode = signedInteger(receipt?.exit_code);
       const running = status === 'running';
       const killed = status === 'cancelled' || receipt?.outcome === 'cancelled';
       return [{
         processId,
+        toolCallId,
         shell: call?.name ?? 'shell',
-        command: args.command || '(命令正文未投影)',
+        command: commandState === 'error'
+          ? '(命令正文读取失败)'
+          : commandState === 'loading'
+            ? '(命令正文加载中…)'
+            : command || '(未记录命令正文)',
+        commandState,
         ...(args.cwd ? { cwd: args.cwd } : {}),
         ...(args.foregroundWaitMs !== undefined ? { foregroundWaitMs: args.foregroundWaitMs } : {}),
         mode: args.mode ?? 'execute',
@@ -154,7 +209,7 @@ function buildCommandEntries(): CommandEntry[] {
         ...(exitCode !== undefined ? { exitCode } : {}),
         ...(killed ? { killed: true } : {}),
         running,
-        outputAvailable: output.hasChunks || running,
+        outputAvailable: (nonNegativeInteger(process.retained_bytes) ?? 0) > 0 || running,
         callCount: 1,
         startedAt: timestamp(process.started_at),
         updatedAt: timestamp(process.updated_at)
@@ -163,38 +218,14 @@ function buildCommandEntries(): CommandEntry[] {
     .sort((left, right) => right.updatedAt - left.updatedAt || right.startedAt - left.startedAt || left.processId.localeCompare(right.processId));
 }
 
-function groupByProcess(chunks: ReliableRecord[]): Map<string, ReliableRecord[]> {
-  const grouped = new Map<string, ReliableRecord[]>();
-  for (const chunk of chunks) {
-    const processId = text(chunk.process_id);
-    if (!processId) continue;
-    const group = grouped.get(processId) ?? [];
-    group.push(chunk);
-    grouped.set(processId, group);
-  }
-  for (const group of grouped.values()) {
-    group.sort((left, right) => compareDecimal(decimal(left.chunk_seq), decimal(right.chunk_seq)));
-  }
-  return grouped;
-}
-
-function materializeOutput(chunks: ReliableRecord[]): { stdout: string; stderr: string; loading: boolean; hasChunks: boolean } {
-  let stdout = '';
-  let stderr = '';
-  let loading = false;
-  for (const chunk of chunks) {
-    const id = text(chunk.id);
-    const stream = text(chunk.stream_kind);
-    if (!id || (stream !== 'stdout' && stream !== 'stderr')) continue;
-    const detail = reliableConversation.feed.details[reliableKernelDetailKey('process-output', id)];
-    if (detail?.status !== 'ready') {
-      loading = true;
-      continue;
-    }
-    if (stream === 'stdout') stdout += detail.text;
-    else stderr += detail.text;
-  }
-  return { stdout, stderr, loading, hasChunks: chunks.length > 0 };
+function materializeOutput(processId: string): { stdout: string; stderr: string; loading: boolean } {
+  const stdout = reliableConversation.feed.details[reliableKernelDetailKey('process-stdout', processId)];
+  const stderr = reliableConversation.feed.details[reliableKernelDetailKey('process-stderr', processId)];
+  return {
+    stdout: stdout?.status === 'ready' || stdout?.status === 'loading' ? stdout.text : '',
+    stderr: stderr?.status === 'ready' || stderr?.status === 'loading' ? stderr.text : '',
+    loading: stdout?.status === 'loading' || stderr?.status === 'loading'
+  };
 }
 
 function readonlyLabel(args: ShellArgs): string {
@@ -261,9 +292,6 @@ function timestamp(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function compareDecimal(left: string | undefined, right: string | undefined): number {
-  return Number(BigInt(left ?? '0') - BigInt(right ?? '0'));
-}
 </script>
 
 
