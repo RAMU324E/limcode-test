@@ -650,6 +650,7 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
   const kind = message.kind;
   if (![
     'message-content',
+    'turn-intent-preview',
     'tool-arguments-content',
     'tool-result-content',
     'tool-event-content',

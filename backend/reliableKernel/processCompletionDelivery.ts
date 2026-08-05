@@ -1048,6 +1048,7 @@ function processCompletionPayload(input: {
     sourceTurnId: input.sourceTurnId,
     conversationId: input.conversationId,
     outcome: requirePhaseFText(input.receipt.outcome, 'ProcessReceipt.outcome'),
+    terminationReason: processCompletionTerminationReason(input.receipt.outcome),
     exitCode: input.receipt.exit_code === null ? null : String(input.receipt.exit_code),
     signal: input.receipt.exit_signal === null ? null : requirePhaseFText(
       input.receipt.exit_signal,
@@ -1069,6 +1070,15 @@ function processCompletionPayload(input: {
       arguments: { mode: 'output', processId: input.processId }
     }
   };
+}
+
+function processCompletionTerminationReason(value: unknown): string {
+  const outcome = requirePhaseFText(value, 'ProcessReceipt.outcome');
+  if (outcome === 'cancelled') return 'manual';
+  if (outcome === 'timed_out') return 'timed_out';
+  if (outcome === 'output_limit_exceeded') return 'output_limit_exceeded';
+  if (outcome === 'outcome_unknown') return 'outcome_unknown';
+  return 'natural';
 }
 
 function encodeProcessCompletionPayload(input: Parameters<typeof processCompletionPayload>[0]): Buffer {

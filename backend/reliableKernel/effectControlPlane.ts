@@ -232,6 +232,10 @@ const TERMINAL_OPERATION_STATUSES: readonly ToolOutcomeStatus[] = [
 export class EffectControlPlane {
   private readonly now: () => string;
   private readonly onDiagnostic: (diagnostic: PhaseDDiagnostic) => void;
+  private readonly finalizationFlights = new Map<string, {
+    rerun: boolean;
+    promise: Promise<ToolTerminalResult[]>;
+  }>();
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -899,7 +903,10 @@ export class EffectControlPlane {
    * Converts an observed receipt into Attempt/Operation domain status. Tool finalization is then
    * assembled in stable call_seq order; EffectReceipt itself never decides the ToolOutcome.
    */
-  public async completeOperation(input: OperationCompletion): Promise<ToolTerminalResult | null> {
+  public async completeOperation(
+    input: OperationCompletion,
+    options: { finalize?: boolean } = {}
+  ): Promise<ToolTerminalResult | null> {
     const source = normalizeSource(input.source, ['internal', 'recovery'], 'effect-reconcile');
     const effectReceipt = await this.requireExisting('EffectReceipt', requireId(input.effectReceiptId, 'effectReceiptId'));
     const attempt = await this.requireExisting('Attempt', requireId(effectReceipt.attempt_id, 'EffectReceipt.attempt_id'));
@@ -914,6 +921,7 @@ export class EffectControlPlane {
       assertSourceReceipt(duplicate, sourceReceipt, 'effect-reconcile');
       const replay = await this.readTerminalResult(toolCallId, true, duplicate.id as string);
       if (replay) return replay;
+      if (options.finalize === false) return null;
       const finalized = await this.finalizeReadyInOrder(turnId);
       return finalized.find((entry) => entry.toolCallId === toolCallId)
         ?? await this.readTerminalResult(toolCallId, true, duplicate.id as string);
@@ -978,9 +986,102 @@ export class EffectControlPlane {
         steps: []
       });
     }
+    if (options.finalize === false) return null;
     const finalized = await this.finalizeReadyInOrder(turnId);
     return finalized.find((entry) => entry.toolCallId === toolCallId)
       ?? await this.readTerminalResult(toolCallId, false, sourceReceipt);
+  }
+
+  /** Persists a compact model-facing override after effect facts settle and before ordered finalization. */
+  public async recordToolModelDetail(input: {
+    source: PhaseDCommandSource;
+    toolCallId: string;
+    status: ToolOutcomeStatus;
+    detail: unknown;
+  }): Promise<ToolTerminalResult | null> {
+    const source = normalizeSource(input.source, ['internal', 'recovery'], 'tool-model-detail-record');
+    const toolCallId = requireId(input.toolCallId, 'toolCallId');
+    const status = requireToolOutcome(input.status);
+    const scope = canonicalJson({ toolCallId, status, detail: input.detail });
+    const receiptId = sourceReceiptId(source, 'tool-model-detail-record', scope);
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) {
+      assertSourceReceipt(duplicate, receiptId, 'tool-model-detail-record');
+      const facts = await this.requireToolFacts(toolCallId, false);
+      await this.finalizeReadyInOrder(facts.turn.id as string);
+      return await this.readTerminalResult(toolCallId, true, duplicate.id as string);
+    }
+    const facts = await this.requireToolFacts(toolCallId, true);
+    const existingTerminal = await this.readTerminalResult(toolCallId, true);
+    if (existingTerminal) {
+      const committed = await this.commitSource({
+        source,
+        receiptId,
+        conversationId: facts.conversation.id as string,
+        turnId: facts.turn.id as string,
+        steps: []
+      });
+      return { ...existingTerminal, receiptId: committed.receipt.id as string };
+    }
+    const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
+    if (operations.length === 0 || operations.some((operation) => !isTerminalOperationStatus(operation.status))) {
+      throw new Error(`ToolCall ${toolCallId} cannot record model detail before every Operation settles.`);
+    }
+    const aggregate = aggregateOperationOutcomes(operations.map((operation) => operation.status as ToolOutcomeStatus));
+    if (aggregate !== status) {
+      throw new Error(`ToolCall ${toolCallId} model detail status ${status} does not match Operation status ${aggregate}.`);
+    }
+    const existingArtifacts = await this.list('ToolResultArtifact', { tool_call_id: toolCallId, role: 'model_response' }, 2);
+    if (existingArtifacts.length > 0) {
+      throw new Error(`ToolCall ${toolCallId} already has a model_response artifact without its source receipt.`);
+    }
+    const content = await this.contentStore.prepare(
+      this.database,
+      canonicalJson({ toolCallId, status, detail: input.detail }),
+      'application/vnd.limcode.tool-result-artifact+json'
+    );
+    const now = this.timestamp();
+    let committed: CommandCommit;
+    try {
+      committed = await this.commitSource({
+        source,
+        receiptId,
+        conversationId: facts.conversation.id as string,
+        turnId: facts.turn.id as string,
+        steps: [
+          DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: ACTIVE_TURN }),
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
+            conversation_id: facts.conversation.id,
+            turn_id: facts.turn.id
+          }),
+          ...preparedContentSteps([content], 'tool_model_detail'),
+          DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+            id: stablePhaseDId('tool_result_artifact', `model-response:${toolCallId}`),
+            tool_call_id: toolCallId,
+            role: 'model_response',
+            content_object_id: content.metadata.id,
+            created_at: now
+          })
+        ]
+      });
+    } catch (error) {
+      if (!matchesExpectedUnique(error, [
+        ['tool_result_artifact', ['id']],
+        ['tool_result_artifact', ['tool_call_id', 'role']]
+      ])) throw error;
+      const artifacts = await this.list('ToolResultArtifact', { tool_call_id: toolCallId, role: 'model_response' }, 2);
+      if (artifacts.length !== 1) throw error;
+      committed = await this.commitSource({
+        source,
+        receiptId,
+        conversationId: facts.conversation.id as string,
+        turnId: facts.turn.id as string,
+        steps: []
+      });
+    }
+    const finalized = await this.finalizeReadyInOrder(facts.turn.id as string);
+    return finalized.find((entry) => entry.toolCallId === toolCallId)
+      ?? await this.readTerminalResult(toolCallId, committed.deduplicated, committed.receipt.id as string);
   }
 
   /** Completes a Process-owned observation Operation that intentionally has no ToolCall result. */
@@ -1059,7 +1160,7 @@ export class EffectControlPlane {
     toolCallId: string;
     status: ToolOutcomeStatus;
     detail: unknown;
-  }): Promise<ToolSettlementResult> {
+  }, options: { finalize?: boolean } = {}): Promise<ToolSettlementResult> {
     const source = normalizeSource(input.source, ['internal'], 'tool-settle-without-effect');
     const toolCallId = requireId(input.toolCallId, 'toolCallId');
     const status = requireToolOutcome(input.status);
@@ -1069,13 +1170,15 @@ export class EffectControlPlane {
     if (duplicate) {
       assertSourceReceipt(duplicate, receiptId, 'tool-settle-without-effect');
       const facts = await this.requireToolFacts(toolCallId, false);
-      await this.finalizeReadyInOrder(facts.turn.id as string);
+      if (options.finalize !== false) await this.finalizeReadyInOrder(facts.turn.id as string);
       return this.settlementResult(
         duplicate.id as string,
         toolCallId,
         status,
         true,
-        await this.readTerminalResult(toolCallId, true, duplicate.id as string) ?? undefined
+        options.finalize === false
+          ? undefined
+          : await this.readTerminalResult(toolCallId, true, duplicate.id as string) ?? undefined
       );
     }
 
@@ -1189,9 +1292,13 @@ export class EffectControlPlane {
         steps: []
       });
     }
-    const finalized = await this.finalizeReadyInOrder(facts.turn.id as string);
-    const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
-      ?? await this.readTerminalResult(toolCallId, committed.deduplicated, committed.receipt.id as string);
+    const finalized = options.finalize === false
+      ? []
+      : await this.finalizeReadyInOrder(facts.turn.id as string);
+    const terminal = options.finalize === false
+      ? undefined
+      : finalized.find((entry) => entry.toolCallId === toolCallId)
+        ?? await this.readTerminalResult(toolCallId, committed.deduplicated, committed.receipt.id as string);
     return this.settlementResult(
       committed.receipt.id as string,
       toolCallId,
@@ -1200,6 +1307,155 @@ export class EffectControlPlane {
       terminal ? { ...terminal, receiptId: committed.receipt.id as string } : undefined,
       committed.commitSeq
     );
+  }
+
+  /** Persists a fresh readonly parallel group in one CAS/SQLite transaction. */
+  public async settleWithoutEffectBatch(input: {
+    turnId: string;
+    settlements: ReadonlyArray<{
+      source: PhaseDCommandSource;
+      toolCallId: string;
+      status: ToolOutcomeStatus;
+      detail: unknown;
+    }>;
+  }): Promise<ToolSettlementResult[]> {
+    const turnId = requireId(input.turnId, 'turnId');
+    if (input.settlements.length === 0) return [];
+    if (input.settlements.length === 1) {
+      return [await this.settleWithoutEffect(input.settlements[0], { finalize: false })];
+    }
+    const context = await this.requireActiveTurnContext(turnId);
+    const normalized = input.settlements.map((settlement) => {
+      const source = normalizeSource(settlement.source, ['internal'], 'tool-settle-without-effect');
+      const toolCallId = requireId(settlement.toolCallId, 'toolCallId');
+      const status = requireToolOutcome(settlement.status);
+      const receiptId = sourceReceiptId(
+        source,
+        'tool-settle-without-effect',
+        JSON.stringify([toolCallId, status])
+      );
+      return { ...settlement, source, toolCallId, status, receiptId };
+    });
+    if (new Set(normalized.map((entry) => entry.toolCallId)).size !== normalized.length) {
+      throw new Error('Readonly settlement batch contains duplicate ToolCall ids.');
+    }
+
+    const snapshot = await this.database.snapshot(normalized.flatMap((entry) => [
+      DOMAIN_REPOSITORIES.domain('ToolCall').get(entry.toolCallId),
+      DOMAIN_REPOSITORIES.domain('ToolExecution').list({ where: { tool_call_id: entry.toolCallId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('Operation').list({ where: { tool_call_id: entry.toolCallId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('FileChangeSet').list({ where: { tool_call_id: entry.toolCallId }, limit: 1 }),
+      DOMAIN_REPOSITORIES.domain('CommandReceipt').list({
+        where: { source_kind: entry.source.kind, source_key: entry.source.key },
+        limit: 2
+      })
+    ]));
+    const facts = normalized.map((entry, entryIndex) => {
+      const offset = entryIndex * 5;
+      const toolCall = snapshot.snapshot[offset];
+      const executions = snapshot.snapshot[offset + 1];
+      const operations = snapshot.snapshot[offset + 2];
+      const changeSets = snapshot.snapshot[offset + 3];
+      const receipts = snapshot.snapshot[offset + 4];
+      if (!toolCall || Array.isArray(toolCall)) throw new Error(`ToolCall ${entry.toolCallId} does not exist.`);
+      if (!Array.isArray(executions) || !Array.isArray(operations) || !Array.isArray(changeSets) || !Array.isArray(receipts)) {
+        throw new TypeError('Readonly settlement batch snapshot shape is invalid.');
+      }
+      return { entry, toolCall, executions, operations, changeSets, receipts };
+    });
+    const requiresReplayPath = facts.some(({ toolCall, executions, operations, changeSets, receipts }) =>
+      toolCall.turn_id !== turnId
+      || toolCall.status !== 'pending'
+      || executions.length !== 1
+      || executions[0].status !== 'pending'
+      || operations.length !== 0
+      || changeSets.length !== 0
+      || receipts.length !== 0
+    );
+    if (requiresReplayPath) {
+      return Promise.all(normalized.map((entry) => this.settleWithoutEffect(entry, { finalize: false })));
+    }
+
+    const preparedContents = await this.contentStore.prepareBatch(
+      this.database,
+      facts.map(({ entry }) => ({
+        content: canonicalJson({ toolCallId: entry.toolCallId, status: entry.status, detail: entry.detail }),
+        contentType: 'application/vnd.limcode.tool-result-artifact+json'
+      }))
+    );
+    const prepared = facts.map(({ entry }, index) => ({ entry, content: preparedContents[index] }));
+    const now = this.timestamp();
+    const steps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: ACTIVE_TURN }),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(context.lease.id as string, {
+        conversation_id: context.conversation.id,
+        turn_id: turnId
+      }),
+      ...preparedContentSteps(prepared.map((entry) => entry.content), 'tool_result_artifact_batch')
+    ];
+    for (let index = 0; index < facts.length; index += 1) {
+      const { entry, executions } = facts[index];
+      const execution = executions[0];
+      steps.push(
+        DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+          id: entry.receiptId,
+          source_kind: entry.source.kind,
+          source_key: entry.source.key,
+          conversation_id: context.conversation.id,
+          turn_id: turnId,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(entry.toolCallId, { status: 'pending', turn_id: turnId }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').assert(execution.id as string, { status: 'pending' }),
+        DOMAIN_REPOSITORIES.domain('Operation').insertWithNextSequence({
+          id: stablePhaseDId('operation', `no-effect:${entry.toolCallId}`),
+          owner_kind: 'tool_execution',
+          owner_id: execution.id,
+          tool_call_id: entry.toolCallId,
+          status: entry.status,
+          created_at: now,
+          updated_at: now
+        }, {
+          column: 'operation_seq',
+          scope: { owner_kind: 'tool_execution', owner_id: execution.id }
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+          id: stablePhaseDId('tool_result_artifact', `no-effect:${entry.toolCallId}`),
+          tool_call_id: entry.toolCallId,
+          role: 'no_effect_result',
+          content_object_id: prepared[index].content.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').update(entry.toolCallId, { status: 'executing', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').update(execution.id as string, {
+          status: 'executing',
+          updated_at: now
+        })
+      );
+    }
+    let commitSeq: string;
+    try {
+      const committed = await this.database.transaction(steps);
+      commitSeq = requireDecimalString(committed.commitSeq, 'commitSeq');
+    } catch (error) {
+      if (!isTransactionAssertionError(error) && !matchesExpectedUnique(error, [
+        ['command_receipt', ['id']],
+        ['command_receipt', ['source_kind', 'source_key']],
+        ['operation', ['id']],
+        ['operation', ['owner_kind', 'owner_id', 'operation_seq']],
+        ['tool_result_artifact', ['id']],
+        ['tool_result_artifact', ['tool_call_id', 'role']]
+      ])) throw error;
+      return Promise.all(normalized.map((entry) => this.settleWithoutEffect(entry, { finalize: false })));
+    }
+    return normalized.map((entry) => this.settlementResult(
+      entry.receiptId,
+      entry.toolCallId,
+      entry.status,
+      false,
+      undefined,
+      commitSeq
+    ));
   }
 
   /** Used by File decisions/recovery to commit decision + terminal result atomically. */
@@ -1299,15 +1555,49 @@ export class EffectControlPlane {
     };
   }
 
-  public async finalizeReadyInOrder(turnIdInput: string): Promise<ToolTerminalResult[]> {
+  public finalizeReadyInOrder(turnIdInput: string): Promise<ToolTerminalResult[]> {
     const turnId = requireId(turnIdInput, 'turnId');
+    const existing = this.finalizationFlights.get(turnId);
+    if (existing) {
+      existing.rerun = true;
+      return existing.promise;
+    }
+    const flight: { rerun: boolean; promise: Promise<ToolTerminalResult[]> } = {
+      rerun: false,
+      promise: Promise.resolve([])
+    };
+    flight.promise = (async () => {
+      const finalizedById = new Map<string, ToolTerminalResult>();
+      for (;;) {
+        flight.rerun = false;
+        for (const terminal of await this.finalizeReadyInOrderPass(turnId)) {
+          finalizedById.set(terminal.toolCallId, terminal);
+        }
+        if (flight.rerun) continue;
+        // Delete synchronously with the final rerun check. A later caller now creates a new flight
+        // instead of attaching to an already-resolved promise and losing its requested pass.
+        if (this.finalizationFlights.get(turnId) === flight) this.finalizationFlights.delete(turnId);
+        return [...finalizedById.values()];
+      }
+    })().finally(() => {
+      if (this.finalizationFlights.get(turnId) === flight) this.finalizationFlights.delete(turnId);
+    });
+    this.finalizationFlights.set(turnId, flight);
+    return flight.promise;
+  }
+
+  private async finalizeReadyInOrderPass(turnId: string): Promise<ToolTerminalResult[]> {
     const turn = await this.requireExisting('Turn', turnId);
     if (turn.status !== ACTIVE_TURN) return [];
     const calls = (await listAllDomainRows(this.database, 'ToolCall', { turn_id: turnId }))
       .sort((left, right) => compareBigInt(left.call_seq, right.call_seq));
-    const finalized: ToolTerminalResult[] = [];
+    const batched = await this.finalizeFreshNoEffectPrefix(turnId, calls);
+    const finalized: ToolTerminalResult[] = batched ?? [];
+    const batchedIds = new Set(finalized.map((entry) => entry.toolCallId));
     for (const call of calls) {
+      if (call.status === 'terminal') continue;
       const toolCallId = call.id as string;
+      if (batchedIds.has(toolCallId)) continue;
       const existing = await this.readTerminalResult(toolCallId, true);
       if (existing) continue;
       const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
@@ -1353,6 +1643,198 @@ export class EffectControlPlane {
       }
     }
     return finalized;
+  }
+
+  private async finalizeFreshNoEffectPrefix(
+    turnId: string,
+    calls: readonly DomainRow[]
+  ): Promise<ToolTerminalResult[] | null> {
+    const pending = calls.filter((call) => call.status !== 'terminal');
+    if (pending.length < 2) return null;
+    const snapshot = await this.database.snapshot(pending.flatMap((call) => {
+      const toolCallId = requireId(call.id, 'ToolCall.id');
+      const finalizeSource = { kind: 'internal' as const, key: `tool-finalize:${toolCallId}` };
+      return [
+        DOMAIN_REPOSITORIES.domain('ToolExecution').list({ where: { tool_call_id: toolCallId }, limit: 2 }),
+        DOMAIN_REPOSITORIES.domain('Operation').list({ where: { tool_call_id: toolCallId }, limit: 2 }),
+        DOMAIN_REPOSITORIES.domain('ToolResultArtifact').list({
+          where: { tool_call_id: toolCallId, role: 'no_effect_result' }, limit: 2
+        }),
+        DOMAIN_REPOSITORIES.domain('FileChangeSet').list({ where: { tool_call_id: toolCallId }, limit: 1 }),
+        DOMAIN_REPOSITORIES.domain('ToolOutcome').list({ where: { tool_call_id: toolCallId }, limit: 1 }),
+        DOMAIN_REPOSITORIES.domain('CommandReceipt').list({
+          where: { source_kind: finalizeSource.kind, source_key: finalizeSource.key }, limit: 2
+        })
+      ];
+    }));
+    const readyFacts: Array<{
+      call: DomainRow;
+      execution: DomainRow;
+      operation: DomainRow;
+      artifact: DomainRow;
+    }> = [];
+    for (let index = 0; index < pending.length; index += 1) {
+      const offset = index * 6;
+      const executions = snapshot.snapshot[offset];
+      const operations = snapshot.snapshot[offset + 1];
+      const artifacts = snapshot.snapshot[offset + 2];
+      const changeSets = snapshot.snapshot[offset + 3];
+      const outcomes = snapshot.snapshot[offset + 4];
+      const receipts = snapshot.snapshot[offset + 5];
+      if (
+        !Array.isArray(executions)
+        || !Array.isArray(operations)
+        || !Array.isArray(artifacts)
+        || !Array.isArray(changeSets)
+        || !Array.isArray(outcomes)
+        || !Array.isArray(receipts)
+      ) throw new TypeError('Readonly finalization batch snapshot shape is invalid.');
+      const ready = pending[index].status === 'executing'
+        && executions.length === 1
+        && executions[0].status === 'executing'
+        && operations.length === 1
+        && isTerminalOperationStatus(operations[0].status)
+        && artifacts.length === 1
+        && changeSets.length === 0
+        && outcomes.length === 0
+        && receipts.length === 0;
+      if (!ready) break;
+      readyFacts.push({
+        call: pending[index],
+        execution: executions[0],
+        operation: operations[0],
+        artifact: artifacts[0]
+      });
+    }
+    if (readyFacts.length < 2) return null;
+
+    const metadataSnapshot = await this.database.snapshot(readyFacts.map((facts) =>
+      DOMAIN_REPOSITORIES.domain('ContentObject').get(
+        requireId(facts.artifact.content_object_id, 'ToolResultArtifact.content_object_id')
+      )
+    ));
+    const ready = await Promise.all(readyFacts.map(async (facts, index) => {
+      const metadata = metadataSnapshot.snapshot[index];
+      if (!metadata || Array.isArray(metadata)) throw new Error('Readonly result artifact ContentObject does not exist.');
+      const body = JSON.parse((await this.contentStore.read(metadata as ContentObjectMetadata)).toString('utf8')) as Record<string, unknown>;
+      const toolCallId = requireId(facts.call.id, 'ToolCall.id');
+      const status = requireToolOutcome(body.status);
+      if (body.toolCallId !== toolCallId || status !== facts.operation.status) {
+        throw new Error(`ToolCall ${toolCallId} no-effect result artifact is inconsistent.`);
+      }
+      return { ...facts, toolCallId, status, detail: body.detail };
+    }));
+    const context = await this.requireActiveTurnContext(turnId);
+    const prepared = await this.contentStore.prepareBatch(
+      this.database,
+      ready.map((entry) => ({
+        content: canonicalJson({ toolCallId: entry.toolCallId, status: entry.status, detail: entry.detail }),
+        contentType: 'application/vnd.limcode.tool-model-result+json'
+      }))
+    );
+    const now = this.timestamp();
+    const steps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: ACTIVE_TURN }),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(context.lease.id as string, {
+        conversation_id: context.conversation.id,
+        turn_id: turnId
+      }),
+      ...preparedContentSteps(prepared, 'tool_result_batch')
+    ];
+    const terminals = ready.map((entry, index) => {
+      const ids = terminalIds(entry.toolCallId);
+      const source = { kind: 'internal' as const, key: `tool-finalize:${entry.toolCallId}` };
+      const receiptId = sourceReceiptId(source, 'tool-finalize', entry.toolCallId);
+      steps.push(
+        DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+          id: receiptId,
+          source_kind: source.kind,
+          source_key: source.key,
+          conversation_id: context.conversation.id,
+          turn_id: turnId,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolOutcome').insert({
+          id: ids.toolOutcomeId,
+          tool_call_id: entry.toolCallId,
+          status: entry.status,
+          content_object_id: prepared[index].metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Message').insert({
+          id: ids.messageId, created_at: now, updated_at: now, deleted_at: null
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
+          id: ids.messageRevisionId,
+          message_id: ids.messageId,
+          revision_seq: '1',
+          role: 'tool',
+          content_object_id: prepared[index].metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
+          id: ids.currentRevisionLinkId,
+          message_id: ids.messageId,
+          revision_id: ids.messageRevisionId,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insertWithNextSequence({
+          id: ids.messageConversationLinkId,
+          conversation_id: context.conversation.id,
+          message_id: ids.messageId,
+          created_at: now
+        }, {
+          column: 'message_seq',
+          scope: { conversation_id: context.conversation.id }
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
+          id: ids.messageTurnLinkId,
+          turn_id: turnId,
+          message_id: ids.messageId,
+          role: 'tool_result',
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolModelResult').insert({
+          id: ids.toolModelResultId,
+          tool_call_id: entry.toolCallId,
+          message_revision_id: ids.messageRevisionId,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').update(entry.toolCallId, { status: 'terminal', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').update(entry.execution.id as string, {
+          status: 'completed', updated_at: now, completed_at: now
+        })
+      );
+      return { entry, ids, receiptId };
+    });
+    steps.push(DOMAIN_REPOSITORIES.domain('Conversation').update(
+      context.conversation.id as string,
+      { updated_at: now }
+    ));
+    let commitSeq: string;
+    try {
+      const committed = await this.database.transaction(steps);
+      commitSeq = requireDecimalString(committed.commitSeq, 'commitSeq');
+    } catch (error) {
+      if (!isTransactionAssertionError(error) && !matchesExpectedUnique(error, [
+        ['tool_outcome', ['id']],
+        ['tool_outcome', ['tool_call_id']],
+        ['tool_model_result', ['id']],
+        ['tool_model_result', ['tool_call_id']],
+        ['tool_model_result', ['message_revision_id']],
+        ['command_receipt', ['id']],
+        ['command_receipt', ['source_kind', 'source_key']]
+      ])) throw error;
+      return null;
+    }
+    return terminals.map(({ entry, ids, receiptId }) => ({
+      receiptId,
+      toolCallId: entry.toolCallId,
+      ...ids,
+      status: entry.status,
+      deduplicated: false,
+      commitSeq
+    }));
   }
 
   public async readTerminalResult(
@@ -1543,6 +2025,25 @@ export class EffectControlPlane {
   ): Promise<{ status: ToolOutcomeStatus; detail: unknown } | null> {
     if (operations.length > 0) {
       if (operations.some((operation) => !isTerminalOperationStatus(operation.status))) return null;
+      const modelArtifacts = await this.list('ToolResultArtifact', {
+        tool_call_id: toolCallId,
+        role: 'model_response'
+      }, 2);
+      if (modelArtifacts.length > 0) {
+        if (modelArtifacts.length !== 1) {
+          throw new Error(`ToolCall ${toolCallId} has multiple model_response artifacts.`);
+        }
+        const metadata = await this.requireContentObject(
+          requireId(modelArtifacts[0].content_object_id, 'ToolResultArtifact.content_object_id')
+        );
+        const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+        const status = requireToolOutcome(body.status);
+        const aggregate = aggregateOperationOutcomes(operations.map((operation) => operation.status as ToolOutcomeStatus));
+        if (body.toolCallId !== toolCallId || status !== aggregate) {
+          throw new Error(`ToolCall ${toolCallId} model_response artifact is inconsistent.`);
+        }
+        return { status, detail: body.detail };
+      }
       const artifacts = await this.list('ToolResultArtifact', {
         tool_call_id: toolCallId,
         role: 'no_effect_result'
@@ -1561,6 +2062,7 @@ export class EffectControlPlane {
         }
         return { status, detail: body.detail };
       }
+      if (await this.operationsRequireModelResponse(operations)) return null;
       return {
         status: aggregateOperationOutcomes(operations.map((operation) => operation.status as ToolOutcomeStatus)),
         detail: {
@@ -1585,6 +2087,17 @@ export class EffectControlPlane {
       status: decision === 'rejected' ? 'rejected' : 'cancelled',
       detail: { changeSetId: changeSets[0].id, decision }
     };
+  }
+
+  private async operationsRequireModelResponse(operations: readonly DomainRow[]): Promise<boolean> {
+    for (const operation of operations) {
+      const attempts = await listAllDomainRows(this.database, 'Attempt', { operation_id: operation.id });
+      for (const attempt of attempts) {
+        const intents = await this.list('EffectIntent', { attempt_id: attempt.id }, 2);
+        if (intents.some((intent) => intent.effect_kind === 'process_start')) return true;
+      }
+    }
+    return false;
   }
 
   private async readOperationObservation(operation: DomainRow): Promise<{

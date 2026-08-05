@@ -1,8 +1,7 @@
 import Database from 'better-sqlite3';
-import type { RootBinding } from './contracts';
+import type { RootBinding, RuntimeClientMapping } from './contracts';
 import { RUNTIME_KERNEL_EPOCH } from './contracts';
 import {
-  auditDatabaseIntegrity,
   assertCurrentSchema,
   assertDatabaseBinding,
   configureWriterConnection
@@ -13,19 +12,21 @@ import {
 } from './schema/domainManifest';
 import type { RuntimeDomainSchema } from './schema/types';
 
-const LEGACY_CLIENT_MAPPING_DOMAIN_KEYS = new Set([
-  'MessageTurnLink',
-  'ProcessOriginLink'
-]);
-
 export interface RuntimeManifestMigrationResult {
   upgraded: boolean;
   upgradedDomains: string[];
 }
 
+interface ClientMappingDrift {
+  domainKey: string;
+  previousClientMapping: RuntimeClientMapping;
+  previousSchemaDigest: string;
+}
+
 /**
- * Reconciles the only shipped epoch-3 manifest drift: two relationship domains became summary
- * feed records without changing their physical SQLite tables. Unknown drift still fails closed.
+ * Reconciles client projection metadata without treating it as a physical database migration.
+ * The stored row must match today's complete domain schema after substituting only its historical
+ * client_mapping value. Table, mutation, index, ownership and epoch drift still fail closed.
  */
 export function migrateCurrentRuntimeManifestIfRequired(
   binding: RootBinding
@@ -44,16 +45,12 @@ export function migrateCurrentRuntimeManifestIfRequired(
     database.exec('BEGIN IMMEDIATE');
     try {
       assertDatabaseBinding(database, binding);
-      const upgradedDomains = inspectSupportedManifestDrift(database);
-      if (upgradedDomains.length === 0) {
+      const drifts = inspectClientMappingDrift(database);
+      if (drifts.length === 0) {
         assertCurrentSchema(database, binding);
         database.exec('COMMIT');
         return { upgraded: false, upgradedDomains: [] };
       }
-
-      // Only a positively identified, supported migration pays for the full-file audit. A no-op
-      // activation performs the fast schema/manifest/binding check above and never reaches here.
-      auditDatabaseIntegrity(database);
 
       const update = database.prepare(`
         UPDATE schema_manifest
@@ -64,24 +61,23 @@ export function migrateCurrentRuntimeManifestIfRequired(
            AND schema_digest = @previousSchemaDigest
            AND runtime_kernel_epoch = @runtimeKernelEpoch
       `);
-      for (const domainKey of upgradedDomains) {
-        const schema = requireSchema(domainKey);
-        const previous = previousClientMappingSchema(schema);
+      for (const drift of drifts) {
+        const schema = requireSchema(drift.domainKey);
         const result = update.run({
-          domainKey,
+          domainKey: drift.domainKey,
           clientMapping: schema.client,
           schemaDigest: domainSchemaDigest(schema),
-          previousClientMapping: previous.client,
-          previousSchemaDigest: domainSchemaDigest(previous),
+          previousClientMapping: drift.previousClientMapping,
+          previousSchemaDigest: drift.previousSchemaDigest,
           runtimeKernelEpoch: BigInt(RUNTIME_KERNEL_EPOCH)
         });
         if (result.changes !== 1) {
-          throw new Error(`Runtime manifest changed while upgrading ${domainKey}.`);
+          throw new Error(`Runtime manifest changed while reconciling ${drift.domainKey}.`);
         }
       }
       assertCurrentSchema(database, binding);
       database.exec('COMMIT');
-      return { upgraded: true, upgradedDomains };
+      return { upgraded: true, upgradedDomains: drifts.map((drift) => drift.domainKey) };
     } catch (error) {
       database.exec('ROLLBACK');
       throw error;
@@ -91,28 +87,34 @@ export function migrateCurrentRuntimeManifestIfRequired(
   }
 }
 
-function inspectSupportedManifestDrift(database: Database.Database): string[] {
+function inspectClientMappingDrift(database: Database.Database): ClientMappingDrift[] {
   const rows = database.prepare('SELECT * FROM schema_manifest ORDER BY domain_key').all() as Array<Record<string, unknown>>;
   if (rows.length !== RUNTIME_DOMAIN_SCHEMAS.length) {
     throw new Error(`Runtime manifest drift is unsupported: expected ${RUNTIME_DOMAIN_SCHEMAS.length} domains, found ${rows.length}.`);
   }
   const expectedByKey = new Map(RUNTIME_DOMAIN_SCHEMAS.map((schema) => [schema.key, schema]));
-  const upgradedDomains: string[] = [];
+  const drifts: ClientMappingDrift[] = [];
   for (const row of rows) {
     const domainKey = requireText(row.domain_key, 'schema_manifest.domain_key');
     const schema = expectedByKey.get(domainKey);
     if (!schema) throw new Error(`Runtime manifest drift is unsupported: unknown domain ${domainKey}.`);
     if (manifestMatches(row, schema)) continue;
-    if (
-      LEGACY_CLIENT_MAPPING_DOMAIN_KEYS.has(domainKey)
-      && manifestMatches(row, previousClientMappingSchema(schema))
-    ) {
-      upgradedDomains.push(domainKey);
+    const previousClientMapping = requireClientMapping(
+      row.client_mapping,
+      `schema_manifest.client_mapping for ${domainKey}`
+    );
+    const previous = previousClientMappingSchema(schema, previousClientMapping);
+    if (manifestMatches(row, previous)) {
+      drifts.push({
+        domainKey,
+        previousClientMapping,
+        previousSchemaDigest: domainSchemaDigest(previous)
+      });
       continue;
     }
     throw new Error(`Runtime manifest drift is unsupported for ${domainKey}.`);
   }
-  return upgradedDomains;
+  return drifts;
 }
 
 function manifestMatches(row: Record<string, unknown>, schema: RuntimeDomainSchema): boolean {
@@ -129,8 +131,11 @@ function manifestMatches(row: Record<string, unknown>, schema: RuntimeDomainSche
     && row.runtime_kernel_epoch === BigInt(RUNTIME_KERNEL_EPOCH);
 }
 
-function previousClientMappingSchema(schema: RuntimeDomainSchema): RuntimeDomainSchema {
-  return { ...schema, client: 'none' };
+function previousClientMappingSchema(
+  schema: RuntimeDomainSchema,
+  client: RuntimeClientMapping
+): RuntimeDomainSchema {
+  return { ...schema, client };
 }
 
 function requireSchema(domainKey: string): RuntimeDomainSchema {
@@ -142,4 +147,9 @@ function requireSchema(domainKey: string): RuntimeDomainSchema {
 function requireText(value: unknown, label: string): string {
   if (typeof value !== 'string' || !value) throw new TypeError(`${label} must be non-empty text.`);
   return value;
+}
+
+function requireClientMapping(value: unknown, label: string): RuntimeClientMapping {
+  if (value === 'none' || value === 'summary' || value === 'detail' || value === 'window') return value;
+  throw new TypeError(`${label} is invalid.`);
 }

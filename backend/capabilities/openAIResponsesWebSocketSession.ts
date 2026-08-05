@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { networkInterfaces } from 'os';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import WebSocket, { type RawData } from 'ws';
 import type {
@@ -17,6 +18,11 @@ const DEFAULT_SEND_TIMEOUT_MS = 10_000;
 const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 60_000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 15 * 60 * 1_000;
+const NETWORK_IDENTITY_CHECK_INTERVAL_MS = 2_000;
+// These codes describe a graceful WebSocket closing handshake, not a completed Responses request.
+// This error class is constructed only when the socket closes before a terminal Responses event,
+// so 1000/1001 are retryable transport interruptions at this boundary.
+const RETRYABLE_CLOSE_CODES = new Set([1000, 1001, 1006, 1011, 1012, 1013, 1014]);
 
 export const LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION = 'codex-output-items-v1';
 
@@ -47,6 +53,34 @@ export interface OpenAIResponsesWebSocketDecision {
   previousResponseIdUsed?: string;
 }
 
+export type OpenAIResponsesWebSocketPhaseKind =
+  | 'lock_wait'
+  | 'lock_acquired'
+  | 'socket_opening'
+  | 'socket_reused'
+  | 'socket_opened'
+  | 'send_started'
+  | 'request_sent'
+  | 'first_raw_event'
+  | 'first_semantic_event'
+  | 'terminal'
+  | 'timeout'
+  | 'abort'
+  | 'transport_error';
+
+export interface OpenAIResponsesWebSocketPhase {
+  phase: OpenAIResponsesWebSocketPhaseKind;
+  observedAt: number;
+  sessionKeyHash: string;
+  connectionGeneration: number;
+  elapsedMs?: number;
+  connectionReused?: boolean;
+  connectionReason?: OpenAIResponsesWebSocketDecision['connectionReason'];
+  mode?: OpenAIResponsesWebSocketDecision['mode'];
+  reason?: string;
+  timeoutPhase?: OpenAIResponsesWebSocketTimeoutPhase;
+}
+
 export interface OpenAIResponsesFormatAdapter {
   createStreamState(): StreamDecodeState;
   decodeStreamChunk(raw: unknown, state: StreamDecodeState): LLMStreamChunk;
@@ -63,6 +97,7 @@ export interface OpenAIResponsesWebSocketStreamOptions {
   signal?: AbortSignal;
   proxy?: string;
   onDecision?: (decision: OpenAIResponsesWebSocketDecision) => void;
+  onPhase?: (phase: OpenAIResponsesWebSocketPhase) => void;
   /** Transport deadlines are independently configurable for deterministic tests and slow relays. */
   timeouts?: Partial<OpenAIResponsesWebSocketTimeouts>;
 }
@@ -84,6 +119,9 @@ export type OpenAIResponsesWebSocketTimeoutPhase =
 
 export class OpenAIResponsesWebSocketTimeoutError extends Error {
   public readonly code = 'LLM_TRANSPORT_TIMEOUT';
+  public readonly transport = 'websocket';
+  public readonly retryable = true;
+  public readonly transportAttemptsExhausted = false;
 
   public constructor(
     public readonly phase: OpenAIResponsesWebSocketTimeoutPhase,
@@ -133,6 +171,24 @@ interface WebSocketConnectionConfig {
   identityHash: string;
 }
 
+class OpenAIResponsesWebSocketCloseError extends Error {
+  public readonly transport = 'websocket';
+  public readonly retryable: boolean;
+  public readonly transportAttemptsExhausted = false;
+
+  public constructor(
+    public readonly closeCode: number,
+    public readonly closeReason: string,
+    public readonly phase: 'connecting' | 'awaiting_first_event' | 'streaming',
+    public readonly receivedServerEvent: boolean
+  ) {
+    super(`OpenAI Responses WebSocket closed before terminal event: ${closeCode}${closeReason ? ` ${closeReason}` : ''}`);
+    this.name = 'WebSocketCloseError';
+    this.retryable = RETRYABLE_CLOSE_CODES.has(closeCode)
+      || (closeCode === 1008 && closeReason.toLowerCase().includes('missing first response.create message'));
+  }
+}
+
 interface SocketAdmission {
   reused: boolean;
   reason: OpenAIResponsesWebSocketDecision['connectionReason'];
@@ -143,6 +199,12 @@ interface ToolCallAccumulator {
   name?: string;
   arguments: string;
   streamIndex?: string;
+}
+
+interface StreamedReasoningSignature {
+  itemId?: string;
+  outputIndex?: number;
+  encryptedContent?: string;
 }
 
 const sessions = new Map<string, WebSocketSession>();
@@ -159,7 +221,7 @@ export async function* streamOpenAIResponsesWebSocketSession(
   options: OpenAIResponsesWebSocketStreamOptions
 ): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
   const session = sessionFor(options.sessionKey);
-  yield* withSessionLock(session, options.signal, () => streamLocked(session, options));
+  yield* withSessionLock(session, options, () => streamLocked(session, options));
 }
 
 export function resetOpenAIResponsesWebSocketSessions(): void {
@@ -172,8 +234,16 @@ async function* streamLocked(
   session: WebSocketSession,
   options: OpenAIResponsesWebSocketStreamOptions
 ): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
-  throwIfAborted(options.signal);
-  const connection = await ensureSocket(session, options);
+  let connection: SocketAdmission;
+  try {
+    throwIfAborted(options.signal);
+    connection = await ensureSocket(session, options);
+  } catch (error) {
+    observeTransportFailure(session, options, error);
+    closeAndInvalidate(session, true);
+    if (isAbort(options.signal, error)) throw abortError(options.signal);
+    throw error;
+  }
   const socket = session.socket;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     closeAndInvalidate(session, true);
@@ -188,6 +258,7 @@ async function* streamLocked(
   const completedOutputItems: unknown[] = [];
   const completedOutputKeys = new Map<string, number>();
   const toolCalls = new Map<string, ToolCallAccumulator>();
+  const streamedReasoningSignatures: StreamedReasoningSignature[] = [];
   let responseId: string | undefined;
   let completedResponse: Record<string, unknown> | undefined;
   let sawSemanticOutput = false;
@@ -198,13 +269,24 @@ async function* streamLocked(
       socket,
       prepared.payload,
       resolvedTimeouts(options.timeouts),
-      options.signal
+      options.signal,
+      (phase, detail) => observeTransportPhase(session, options, phase, detail),
+      requireConnectionIdentity(session),
+      () => webSocketConnectionConfig(options).identityHash
     )) {
       const type = eventType(raw);
       responseId = responseIdFromPayload(raw) ?? responseId;
       captureOutputItemDone(raw, completedOutputItems, completedOutputKeys);
+      captureStreamedReasoningSignature(raw, streamedReasoningSignatures);
       const argumentDeltas = captureToolCallArgumentDeltas(raw, toolCalls);
-      if (isSemanticOutputEvent(type) || argumentDeltas.length > 0) sawSemanticOutput = true;
+      const semanticOutput = isSemanticOutputEvent(type) || argumentDeltas.length > 0;
+      if (semanticOutput && !sawSemanticOutput) {
+        observeTransportPhase(session, options, 'first_semantic_event');
+      }
+      if (semanticOutput) sawSemanticOutput = true;
+      if (isTerminalEvent(raw)) {
+        observeTransportPhase(session, options, 'terminal', { reason: type ?? 'terminal' });
+      }
 
       if (type === 'response.completed') {
         completedResponse = responseObject(raw);
@@ -256,7 +338,8 @@ async function* streamLocked(
     const normalizedOutputItems = normalizeCompletedOutputItems(
       options.format,
       completedResponse,
-      completedOutputItems
+      completedOutputItems,
+      streamedReasoningSignatures
     );
     const outputStateReliable = normalizedOutputItems !== undefined
       && (normalizedOutputItems.length > 0 || !sawSemanticOutput);
@@ -277,6 +360,7 @@ async function* streamLocked(
     };
     session.lastUsedAt = Date.now();
   } catch (error) {
+    observeTransportFailure(session, options, error);
     closeAndInvalidate(session, true);
     if (isAbort(options.signal, error)) throw abortError(options.signal);
     throw error;
@@ -287,9 +371,11 @@ async function* streamLocked(
 
 async function* withSessionLock<T>(
   session: WebSocketSession,
-  signal: AbortSignal | undefined,
+  options: OpenAIResponsesWebSocketStreamOptions,
   operation: () => AsyncGenerator<T>
 ): AsyncGenerator<T> {
+  const queuedAt = Date.now();
+  observeTransportPhase(session, options, 'lock_wait');
   const previous = session.lockTail.catch(() => undefined);
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -297,10 +383,14 @@ async function* withSessionLock<T>(
 
   let acquired = false;
   try {
-    await waitForTurn(previous, signal);
+    await waitForTurn(previous, options.signal);
     acquired = true;
     session.activeOperations += 1;
+    observeTransportPhase(session, options, 'lock_acquired', { elapsedMs: Date.now() - queuedAt });
     yield* operation();
+  } catch (error) {
+    if (!acquired) observeTransportFailure(session, options, error);
+    throw error;
   } finally {
     if (acquired) {
       session.activeOperations = Math.max(0, session.activeOperations - 1);
@@ -362,11 +452,54 @@ function evictIdleSessions(now = Date.now()): void {
   for (const [key, session] of sessions) {
     if (session.activeOperations > 0) continue;
     if (now - session.lastUsedAt < IDLE_SESSION_TTL_MS) continue;
-    if (session.socket?.readyState === WebSocket.OPEN && session.connectedAt !== undefined
-      && now - session.connectedAt < MAX_SOCKET_AGE_MS) continue;
+    // Idle means no operation owns the socket. An OPEN readyState does not make a 15-minute-old
+    // connection fresh; keeping it until MAX_SOCKET_AGE_MS defeated this TTL and reused dead relays.
     closeAndInvalidate(session, true);
     sessions.delete(key);
   }
+}
+
+function observeTransportPhase(
+  session: WebSocketSession,
+  options: OpenAIResponsesWebSocketStreamOptions,
+  phase: OpenAIResponsesWebSocketPhaseKind,
+  detail: Partial<OpenAIResponsesWebSocketPhase> = {}
+): void {
+  const observation: OpenAIResponsesWebSocketPhase = {
+    ...detail,
+    phase,
+    observedAt: Date.now(),
+    sessionKeyHash: createHash('sha256').update(session.key).digest('hex').slice(0, 12),
+    connectionGeneration: detail.connectionGeneration ?? session.connectionGeneration
+  };
+  try {
+    options.onPhase?.(observation);
+  } catch {
+    // Diagnostics must never become transport authority or fail a provider request.
+  }
+}
+
+function observeTransportFailure(
+  session: WebSocketSession,
+  options: OpenAIResponsesWebSocketStreamOptions,
+  error: unknown
+): void {
+  const timeout = error instanceof OpenAIResponsesWebSocketTimeoutError ? error : undefined;
+  const aborted = isAbort(options.signal, error);
+  observeTransportPhase(
+    session,
+    options,
+    timeout ? 'timeout' : aborted ? 'abort' : 'transport_error',
+    {
+      ...(timeout ? { timeoutPhase: timeout.phase } : {}),
+      reason: timeout ? `timeout_${timeout.phase}` : aborted ? 'signal_aborted' : errorName(error)
+    }
+  );
+}
+
+function errorName(error: unknown): string {
+  if (error instanceof Error && error.name.trim()) return error.name.trim();
+  return typeof error === 'string' && error.trim() ? 'Error' : 'UnknownError';
 }
 
 function evictOverflowSessions(): void {
@@ -390,7 +523,12 @@ async function ensureSocket(
     && Date.now() - session.connectedAt >= MAX_SOCKET_AGE_MS;
   const identityMatches = session.connectionIdentityHash === connection.identityHash;
   if (socket?.readyState === WebSocket.OPEN && !expired && identityMatches) {
-    return { reused: true, reason: 'reused' };
+    const admission = { reused: true, reason: 'reused' } as const;
+    observeTransportPhase(session, options, 'socket_reused', {
+      connectionReused: true,
+      connectionReason: admission.reason
+    });
+    return admission;
   }
 
   const reason: SocketAdmission['reason'] = socket?.readyState === WebSocket.OPEN && !identityMatches
@@ -400,6 +538,11 @@ async function ensureSocket(
       : 'new_connection';
 
   // previous_response_id is connection-local. Any physical reconnect starts a new chain.
+  observeTransportPhase(session, options, 'socket_opening', {
+    connectionGeneration: session.connectionGeneration + 1,
+    connectionReused: false,
+    connectionReason: reason
+  });
   closeAndInvalidate(session, true);
   session.socket = await openSocket(
     connection,
@@ -410,7 +553,55 @@ async function ensureSocket(
   session.connectionIdentityHash = connection.identityHash;
   session.connectionGeneration += 1;
   session.lastUsedAt = Date.now();
+  observeTransportPhase(session, options, 'socket_opened', {
+    connectionReused: false,
+    connectionReason: reason
+  });
   return { reused: false, reason };
+}
+
+function requireConnectionIdentity(session: WebSocketSession): string {
+  if (!session.connectionIdentityHash) throw new Error('OpenAI Responses WebSocket connection identity is missing.');
+  return session.connectionIdentityHash;
+}
+
+function currentNetworkIdentityFingerprint(): string {
+  let addresses: string[];
+  try {
+    addresses = Object.entries(networkInterfaces())
+      .flatMap(([name, records]) => (records ?? [])
+        .filter((record) => !record.internal)
+        .map((record) => [
+          name,
+          String(record.family),
+          record.address,
+          record.netmask,
+          record.cidr ?? '',
+          String(record.scopeid ?? '')
+        ].join(':')))
+      .sort();
+  } catch {
+    addresses = ['network-interfaces-unavailable'];
+  }
+  return createHash('sha256')
+    .update(addresses.length > 0 ? addresses.join('\n') : 'no-external-network')
+    .digest('hex');
+}
+
+function structuredTransportError(
+  message: string,
+  code: string,
+  phase: 'connecting' | 'awaiting_first_event' | 'streaming',
+  receivedServerEvent: boolean
+): Error {
+  return Object.assign(new Error(message), {
+    code,
+    transport: 'websocket' as const,
+    phase,
+    receivedServerEvent,
+    retryable: true,
+    transportAttemptsExhausted: false
+  });
 }
 
 function webSocketConnectionConfig(options: OpenAIResponsesWebSocketStreamOptions): WebSocketConnectionConfig {
@@ -421,7 +612,12 @@ function webSocketConnectionConfig(options: OpenAIResponsesWebSocketStreamOption
     url,
     headers,
     ...(proxy ? { proxy } : {}),
-    identityHash: canonicalHash({ url, headers, proxy: proxy ?? null })
+    identityHash: canonicalHash({
+      url,
+      headers,
+      proxy: proxy ?? null,
+      networkIdentityFingerprint: currentNetworkIdentityFingerprint()
+    })
   };
 }
 
@@ -535,20 +731,47 @@ function prefixMismatchReason(items: unknown[], prefix: unknown[]): string | und
 function normalizeCompletedOutputItems(
   format: OpenAIResponsesFormatAdapter,
   completedResponse: Record<string, unknown> | undefined,
-  outputItems: unknown[]
+  outputItems: unknown[],
+  streamedReasoningSignatures: readonly StreamedReasoningSignature[]
 ): unknown[] | undefined {
-  const response = {
+  const response = normalizeCompletedResponseForStreamSignatures({
     ...(completedResponse ?? {}),
     output: outputItems.map(cloneJson)
-  };
+  }, streamedReasoningSignatures);
+  const rawOutput = isRecord(response) && Array.isArray(response.output) ? response.output : undefined;
   try {
     const decoded = format.decodeResponse(response);
     const encoded = format.encodeRequest({ contents: [decoded.content] }, false);
-    if (!isRecord(encoded) || !Array.isArray(encoded.input)) return undefined;
-    return encoded.input.map(stripWebSocketOnlyInputFields);
+    if (
+      isRecord(encoded)
+      && Array.isArray(encoded.input)
+      && (encoded.input.length > 0 || rawOutput?.length === 0)
+    ) return encoded.input.map(stripWebSocketOnlyInputFields);
   } catch {
-    return undefined;
+    // 0.1.35 contract: exact response.output_item.done remains the fallback continuation baseline.
   }
+  return rawOutput?.map(stripWebSocketOnlyInputFields);
+}
+
+function normalizeCompletedResponseForStreamSignatures(
+  response: Record<string, unknown>,
+  streamed: readonly StreamedReasoningSignature[]
+): Record<string, unknown> {
+  if (!Array.isArray(response.output)) return response;
+  let reasoningOrdinal = 0;
+  const output = response.output.map((value, outputIndex) => {
+    if (!isRecord(value) || value.type !== 'reasoning') return value;
+    const itemId = normalizedString(value.id);
+    const matched = streamed.find((entry) => itemId !== undefined && entry.itemId === itemId)
+      ?? streamed.find((entry) => entry.outputIndex === outputIndex)
+      ?? streamed[reasoningOrdinal];
+    reasoningOrdinal += 1;
+    const normalized = { ...value };
+    delete normalized.encrypted_content;
+    if (matched?.encryptedContent) normalized.encrypted_content = matched.encryptedContent;
+    return normalized;
+  });
+  return { ...response, output };
 }
 
 async function openSocket(
@@ -586,7 +809,7 @@ async function openSocket(
     const onOpen = () => finish();
     const onError = (error: Error) => finish(error);
     const onClose = (code: number, reason: Buffer) => finish(
-      new Error(`OpenAI Responses WebSocket closed before open: ${code} ${reason.toString('utf8')}`.trim())
+      new OpenAIResponsesWebSocketCloseError(code, reason.toString('utf8').trim(), 'connecting', false)
     );
     signal?.addEventListener('abort', onAbort, { once: true });
     const timeout = setTimeout(
@@ -603,7 +826,13 @@ async function* sendCreateAndReadEvents(
   socket: WebSocket,
   payload: Record<string, unknown>,
   timeouts: OpenAIResponsesWebSocketTimeouts,
-  signal?: AbortSignal
+  signal: AbortSignal | undefined,
+  observe: ((
+    phase: OpenAIResponsesWebSocketPhaseKind,
+    detail?: Partial<OpenAIResponsesWebSocketPhase>
+  ) => void) | undefined,
+  expectedConnectionIdentityHash: string,
+  currentConnectionIdentityHash: () => string
 ): AsyncGenerator<Record<string, unknown>> {
   const queue = new MergeableAsyncQueue<Record<string, unknown>>(mergeDeltaEvents);
   let sawTerminal = false;
@@ -611,13 +840,16 @@ async function* sendCreateAndReadEvents(
   let firstEventTimeout: ReturnType<typeof setTimeout> | undefined;
   let eventIdleTimeout: ReturnType<typeof setTimeout> | undefined;
   let responseTimeout: ReturnType<typeof setTimeout> | undefined;
+  let networkIdentityTimer: ReturnType<typeof setInterval> | undefined;
   const clearResponseTimeouts = () => {
     if (firstEventTimeout !== undefined) clearTimeout(firstEventTimeout);
     if (eventIdleTimeout !== undefined) clearTimeout(eventIdleTimeout);
     if (responseTimeout !== undefined) clearTimeout(responseTimeout);
+    if (networkIdentityTimer !== undefined) clearInterval(networkIdentityTimer);
     firstEventTimeout = undefined;
     eventIdleTimeout = undefined;
     responseTimeout = undefined;
+    networkIdentityTimer = undefined;
   };
   const failAfter = (phase: OpenAIResponsesWebSocketTimeoutPhase, timeoutMs: number) => {
     queue.fail(new OpenAIResponsesWebSocketTimeoutError(phase, timeoutMs));
@@ -643,6 +875,7 @@ async function* sendCreateAndReadEvents(
     const value = parsed.value;
     if (!sawEvent) {
       sawEvent = true;
+      observe?.('first_raw_event');
       if (firstEventTimeout !== undefined) clearTimeout(firstEventTimeout);
       firstEventTimeout = undefined;
     }
@@ -657,8 +890,11 @@ async function* sendCreateAndReadEvents(
   const onError = (error: Error) => queue.fail(error);
   const onClose = (code: number, reason: Buffer) => {
     if (sawTerminal) queue.end();
-    else queue.fail(new Error(
-      `OpenAI Responses WebSocket closed before terminal event: ${code} ${reason.toString('utf8')}`.trim()
+    else queue.fail(new OpenAIResponsesWebSocketCloseError(
+      code,
+      reason.toString('utf8').trim(),
+      sawEvent ? 'streaming' : 'awaiting_first_event',
+      sawEvent
     ));
   };
   signal?.addEventListener('abort', onAbort, { once: true });
@@ -676,7 +912,24 @@ async function* sendCreateAndReadEvents(
       () => failAfter('response', timeouts.responseMs),
       timeouts.responseMs
     );
+    networkIdentityTimer = setInterval(() => {
+      if (sawTerminal) return;
+      try {
+        if (currentConnectionIdentityHash() !== expectedConnectionIdentityHash) {
+          queue.fail(structuredTransportError(
+            'OpenAI Responses WebSocket local network changed.',
+            'network_changed',
+            sawEvent ? 'streaming' : 'awaiting_first_event',
+            sawEvent
+          ));
+        }
+      } catch {
+        // A transient failure to enumerate interfaces is not itself network authority.
+      }
+    }, NETWORK_IDENTITY_CHECK_INTERVAL_MS);
+    observe?.('send_started');
     await sendWithDeadline(socket, JSON.stringify(payload), timeouts.sendMs, signal);
+    observe?.('request_sent');
     yield* queue;
   } finally {
     cleanup();
@@ -833,6 +1086,29 @@ function captureOutputItemDone(
     keys.set(key, output.length);
     output.push(item);
   } else output[existing] = item;
+}
+
+function captureStreamedReasoningSignature(
+  raw: Record<string, unknown>,
+  records: StreamedReasoningSignature[]
+): void {
+  if (eventType(raw) !== 'response.output_item.done' || !isRecord(raw.item) || raw.item.type !== 'reasoning') return;
+  const itemId = normalizedString(raw.item.id);
+  const outputIndex = typeof raw.output_index === 'number' && Number.isInteger(raw.output_index)
+    ? raw.output_index
+    : undefined;
+  const encryptedContent = normalizedString(raw.item.encrypted_content);
+  const next: StreamedReasoningSignature = {
+    ...(itemId ? { itemId } : {}),
+    ...(outputIndex !== undefined ? { outputIndex } : {}),
+    ...(encryptedContent ? { encryptedContent } : {})
+  };
+  const existing = records.findIndex((entry) =>
+    (itemId !== undefined && entry.itemId === itemId)
+    || (outputIndex !== undefined && entry.outputIndex === outputIndex)
+  );
+  if (existing >= 0) records[existing] = next;
+  else records.push(next);
 }
 
 function captureToolCallArgumentDeltas(
@@ -995,17 +1271,51 @@ function errorInfoFromPayload(payload: Record<string, unknown>): Record<string, 
   const status = numericField(payload.status)
     ?? numericField(payload.status_code)
     ?? (isRecord(payload.response) ? numericField(payload.response.status_code) : undefined);
+  const errorRecord = isRecord(payload.error)
+    ? payload.error
+    : isRecord(payload.response) && isRecord(payload.response.error)
+      ? payload.response.error
+      : undefined;
+  const code = normalizedString(errorRecord?.code) ?? normalizedString(payload.code);
+  const retryable = providerErrorRetryable(code, status);
   return {
     kind: 'stream_error',
     rawChunk: cloneJson(payload),
     event: eventType(payload) || undefined,
+    ...(code ? { code } : {}),
     ...(status !== undefined ? { status } : {}),
+    ...(retryable !== undefined ? { retryable } : {}),
+    transportAttemptsExhausted: false,
     ...(payload.headers && isRecord(payload.headers) ? { headers: cloneJson(payload.headers) } : {}),
     ...(nestedMessage(payload)
       ? { message: nestedMessage(payload) }
       : { message: `OpenAI Responses WebSocket received ${eventType(payload) || 'a terminal error'} before response.completed.` }),
     rawBody: cloneJson(payload)
   };
+}
+
+function providerErrorRetryable(code: string | undefined, status: number | undefined): boolean | undefined {
+  if (code && [
+    'invalid_api_key',
+    'authentication_error',
+    'permission_denied',
+    'invalid_request_error',
+    'context_length_exceeded',
+    'insufficient_quota',
+    'billing_hard_limit_reached'
+  ].includes(code)) return false;
+  if (code && [
+    'previous_response_not_found',
+    'websocket_connection_limit_reached',
+    'rate_limit_exceeded',
+    'server_error',
+    'internal_error',
+    'service_unavailable',
+    'timeout'
+  ].includes(code)) return true;
+  if (status === 408 || status === 425 || status === 429 || (status !== undefined && status >= 500)) return true;
+  if (status !== undefined && status >= 400 && status < 500) return false;
+  return undefined;
 }
 
 function createErrorStreamChunk(error: Record<string, unknown>): LimCodeOpenAIResponsesStreamChunk {

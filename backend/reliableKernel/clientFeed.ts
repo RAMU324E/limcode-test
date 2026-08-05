@@ -733,6 +733,8 @@ interface ProcessDetailReconciliation {
 }
 
 const PROCESS_DETAIL_INDEX_CACHE_ENTRIES = 8;
+const TURN_INTENT_PREVIEW_PREFIX_BYTES = 16 * 1024;
+const TURN_INTENT_PREVIEW_TEXT_CHARACTERS = 512;
 
 /** On-demand CAS detail reader with an actual wire-byte response cap. */
 export class ClientDetailReader {
@@ -776,10 +778,16 @@ export class ClientDetailReader {
         input.expectedTotalBytes
       );
     }
-    if (input.kind === 'context-projection-detail' || input.kind === 'file-change-diff') {
+    if (
+      input.kind === 'context-projection-detail'
+      || input.kind === 'file-change-diff'
+      || input.kind === 'turn-intent-preview'
+    ) {
       const bytes = input.kind === 'context-projection-detail'
         ? await this.materializeContextProjectionDetail(recordId)
-        : await this.materializeFileChangeDiff(recordId);
+        : input.kind === 'file-change-diff'
+          ? await this.materializeFileChangeDiff(recordId)
+          : await this.materializeTurnIntentPreview(recordId, input.conversationId);
       if (input.offset > bytes.length) throw new RangeError('Detail offset exceeds structural payload length.');
       const end = Math.min(bytes.length, input.offset + maxRawBytes);
       return buildDetailChunk(recordId, input.offset, bytes.subarray(input.offset, end), bytes.length);
@@ -1060,6 +1068,68 @@ export class ClientDetailReader {
     })), 'utf8');
   }
 
+  private async materializeTurnIntentPreview(
+    recordId: string,
+    conversationId?: string | null
+  ): Promise<Buffer> {
+    const contentObjectId = await this.turnIntentContentObjectId(recordId, conversationId);
+    const metadata = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
+    const totalBytes = runtimeNonNegativeSafeInteger(
+      metadata.byte_length,
+      'TurnIntent ContentObject.byte_length'
+    );
+    const prefix = await this.contentStore.readChunk(
+      metadata,
+      0,
+      Math.min(totalBytes, TURN_INTENT_PREVIEW_PREFIX_BYTES)
+    );
+    const source = prefix.chunk.toString('utf8');
+    let text = '';
+    let hasAttachments = false;
+    if (metadata.content_type === 'application/vnd.limcode.message+json') {
+      hasAttachments = source.includes('"inlineData"') || totalBytes > prefix.chunk.byteLength;
+      if (totalBytes <= prefix.chunk.byteLength) {
+        try {
+          const parsed = JSON.parse(source) as { parts?: unknown };
+          if (Array.isArray(parsed.parts)) {
+            text = parsed.parts.flatMap((part) => {
+              if (!part || typeof part !== 'object' || Array.isArray(part)) return [];
+              const value = (part as { text?: unknown }).text;
+              return typeof value === 'string' ? [value] : [];
+            }).join('');
+            hasAttachments = parsed.parts.some((part) =>
+              Boolean(part && typeof part === 'object' && !Array.isArray(part) && 'inlineData' in part)
+            );
+          }
+        } catch {
+          text = '';
+        }
+      } else {
+        const textLiteral = source.match(/"text"\s*:\s*("(?:\\.|[^"\\])*")/u)?.[1];
+        if (textLiteral) {
+          try {
+            const parsed = JSON.parse(textLiteral) as unknown;
+            if (typeof parsed === 'string') text = parsed;
+          } catch {
+            text = '';
+          }
+        }
+      }
+    } else {
+      text = source;
+    }
+    const characters = Array.from(text.trim());
+    const truncated = totalBytes > prefix.chunk.byteLength
+      || characters.length > TURN_INTENT_PREVIEW_TEXT_CHARACTERS;
+    const visibleText = characters.slice(0, TURN_INTENT_PREVIEW_TEXT_CHARACTERS).join('');
+    return Buffer.from(JSON.stringify({
+      version: 1,
+      text: visibleText,
+      hasAttachments,
+      truncated
+    }), 'utf8');
+  }
+
   private async readOptionalContent(value: unknown, label: string): Promise<Buffer> {
     if (value === null) return Buffer.alloc(0);
     const metadata = await this.requireExisting('ContentObject', requirePhaseFId(value, label)) as ContentObjectMetadata;
@@ -1069,7 +1139,7 @@ export class ClientDetailReader {
   private async resolveContentObjectId(
     kind: Exclude<
       ClientDetailKind,
-      'context-projection-detail' | 'file-change-diff' | 'process-stdout' | 'process-stderr'
+      'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'process-stdout' | 'process-stderr'
     >,
     recordId: string,
     conversationId?: string | null
@@ -1106,6 +1176,43 @@ export class ClientDetailReader {
       case 'compression-title':
         return this.compressionObjectId(recordId, 'title_object_id', conversationId);
     }
+  }
+
+  private async turnIntentContentObjectId(
+    recordId: string,
+    conversationId?: string | null
+  ): Promise<string> {
+    const intent = await this.requireExisting('TurnIntent', recordId);
+    const scopedConversationId = conversationId == null
+      ? null
+      : requirePhaseFId(conversationId, 'detail.conversationId');
+    const childLinks = await this.listRows('ChildExecutionIntentLink', {
+      turn_intent_id: recordId
+    }, 1);
+    if (
+      !scopedConversationId
+      || intent.conversation_id !== scopedConversationId
+      || intent.state !== 'queued'
+      || intent.turn_id !== null
+      || childLinks.length > 0
+    ) {
+      throw new Error(`TurnIntent ${recordId} is not visible in the active Conversation queue.`);
+    }
+    const barrier = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('TurnIntentRevision').list({
+        where: { intent_id: recordId },
+        orderBy: { column: 'revision_seq', direction: 'desc' },
+        limit: 1
+      })
+    ]);
+    const revisions = barrier.snapshot[0];
+    if (!Array.isArray(revisions) || revisions.length !== 1) {
+      throw new Error(`TurnIntent ${recordId} does not have one current content revision.`);
+    }
+    return requirePhaseFId(
+      revisions[0]!.content_object_id,
+      'TurnIntentRevision.content_object_id'
+    );
   }
 
   private async compressionObjectId(
@@ -1212,6 +1319,7 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   conversationBranchLinks: 'ConversationBranchLink',
   conversationOriginLinks: 'ConversationOriginLink',
   agentConversationLinks: 'AgentConversationLink',
+  queuedTurnIntents: 'TurnIntent',
   compressionBlocks: 'CompressionBlock',
   conversationContextStatuses: 'ConversationContextStatus',
   turns: 'Turn',
@@ -1671,6 +1779,8 @@ function snapshotRetentionCandidates(
   add(window, 'conversationBranchLinks', 'newest-first');
   add(window, 'conversationOriginLinks', 'newest-first');
   add(window, 'agentConversationLinks', 'newest-first');
+  // Queue rows are oldest-first admission anchors; shed the newest tail first under byte pressure.
+  add(window, 'queuedTurnIntents', 'newest-first');
   add(window, 'compressionBlocks', 'oldest-first');
   add(window, 'conversationContextStatuses', 'newest-first');
   add(turns, 'turns', 'newest-first');

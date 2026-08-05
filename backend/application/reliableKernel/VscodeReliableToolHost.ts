@@ -63,6 +63,10 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   private readonly commandDeclaration = commandDeclarationCapability();
   private readonly builtins: ToolDefinition[];
   private readonly filePlanner: LocalFileToolPlanner;
+  private readonly environmentBoundaryCache = new Map<string, {
+    expiresAt: number;
+    promise: Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
+  }>();
   private initialization: Promise<void> | undefined;
   private onStateChange: (() => void) | undefined;
 
@@ -93,6 +97,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   }
 
   public async dispose(): Promise<void> {
+    this.environmentBoundaryCache.clear();
     await this.mcp.dispose();
   }
 
@@ -276,11 +281,39 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
   }> {
-    const policy = authorityWorkEnvironmentPolicy(authority.document);
-    const records = await this.configuration.workEnvironments();
-    const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
-    return { ...(boundary.active ? { active: boundary.active } : {}), allowed: boundary.allowed };
+    const cacheKey = authority.snapshotId;
+    const cached = this.environmentBoundaryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cloneEnvironmentBoundary(await cached.promise);
+    const promise = (async () => {
+      const policy = authorityWorkEnvironmentPolicy(authority.document);
+      const records = await this.configuration.workEnvironments();
+      const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
+      return { ...(boundary.active ? { active: boundary.active } : {}), allowed: boundary.allowed };
+    })();
+    this.environmentBoundaryCache.set(cacheKey, { expiresAt: Date.now() + 1_000, promise });
+    if (this.environmentBoundaryCache.size > 64) {
+      const oldest = this.environmentBoundaryCache.keys().next().value as string | undefined;
+      if (oldest && oldest !== cacheKey) this.environmentBoundaryCache.delete(oldest);
+    }
+    try {
+      return cloneEnvironmentBoundary(await promise);
+    } catch (error) {
+      if (this.environmentBoundaryCache.get(cacheKey)?.promise === promise) {
+        this.environmentBoundaryCache.delete(cacheKey);
+      }
+      throw error;
+    }
   }
+}
+
+function cloneEnvironmentBoundary(boundary: {
+  active?: WorkEnvironmentRecord;
+  allowed: WorkEnvironmentRecord[];
+}): { active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] } {
+  return {
+    ...(boundary.active ? { active: { ...boundary.active } } : {}),
+    allowed: boundary.allowed.map((environment) => ({ ...environment }))
+  };
 }
 
 function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {

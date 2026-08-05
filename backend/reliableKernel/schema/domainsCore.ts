@@ -64,7 +64,7 @@ export const CORE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   }),
   domain({
     key: 'TurnIntent', table: 'turn_intent', repository: 'TurnIntentRepository', codec: 'TurnIntentRowCodec',
-    mutations: ['insert', 'update'], client: 'detail', deletePolicy: 'cascade-with-turn',
+    mutations: ['insert', 'update'], client: 'summary', deletePolicy: 'cascade-with-turn',
     indexes: ['turn_id'],
     columns: [id(), ref('conversation_id', 'conversation'), ref('turn_id', 'turn', true, 'SET NULL'), text('state'), text('created_at'), text('updated_at')]
   }),

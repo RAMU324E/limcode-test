@@ -238,6 +238,10 @@ export interface CommandRunArgs {
   cwd?: string;
   /** 前台等待预算（毫秒）：到点仍未结束则转后台；不是命令终止超时。 */
   foregroundWaitMs?: number;
+  /** 硬执行截止时间；可靠 detached wrapper 在前台/后台都会强制执行。 */
+  executionTimeoutMs?: number;
+  /** stdout+stderr 原始字节总安全上限。 */
+  maxOutputBytes?: number;
   /** 内部执行标识（通常为 toolCallId），用于在父 Run 中断前主动把前台命令转入后台。 */
   executionId?: string;
   /** Tool -> ProcessManager handoff 时持久化为独立 OriginLink 的来源关系快照。 */

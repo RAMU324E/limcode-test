@@ -21,7 +21,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
         properties: {
           explanation: {
             type: 'string',
-            description: 'Required. Briefly explain to the user what this command will do and why. This text is shown as the tool-call title.'
+            description: 'Required for mode=execute. Briefly explain what the command will do and why. Optional for mode=output/kill so observation calls stay compact.'
           },
           mode: {
             type: 'string',
@@ -39,7 +39,21 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           },
           foregroundWaitMs: {
             type: 'number',
-            description: 'Required for mode=execute. Foreground wait budget in milliseconds; this is not a command timeout. If the command is still running after this budget, it is moved to the background and the tool returns a generated processId. Use 0 to background immediately.'
+            description: 'Required for mode=execute. Foreground response budget in milliseconds; this only moves a still-running command to the background and never terminates it. Use 0 to background immediately.'
+          },
+          executionTimeoutMs: {
+            type: 'number',
+            minimum: 1000,
+            maximum: 600000,
+            default: 120000,
+            description: 'Optional hard execution deadline in milliseconds, independent of foregroundWaitMs. Defaults to 120000; allowed range 1000-600000. The detached runtime terminates the process group at this deadline and reports timed_out.'
+          },
+          maxOutputBytes: {
+            type: 'number',
+            minimum: 1024,
+            maximum: 1073741824,
+            default: 268435456,
+            description: 'Optional combined stdout+stderr safety limit in bytes. Defaults to 268435456 (256 MiB); allowed range 1024-1073741824. Exceeding it terminates the process and reports output_limit_exceeded.'
           },
           processId: {
             type: 'string',
@@ -47,7 +61,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           },
           outputHandle: {
             type: 'string',
-            description: 'Only for mode=output. Omit on the first read. When a result returns nextOutputHandle, pass that exact opaque value to continue from the next output chunk. Each stdout/stderr page is bounded for transport, while repeated reads traverse the complete retained history without a total output cap. Running-only liveStdout/liveStderr fields are provisional previews and do not advance this handle.'
+            description: 'Only for mode=output. Omit on the first read. When a result returns nextOutputHandle, pass that exact opaque value to continue from the next output chunk. Pages traverse retained history up to maxOutputBytes. Running-only liveStdout/liveStderr fields are provisional and do not advance this handle. Background completion is delivered proactively; do not poll unless the user explicitly requests a progress check.'
           },
           readonly: {
             type: 'string',
@@ -60,10 +74,9 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           scheduling: {
             type: 'string',
             enum: ['parallel', 'serial'],
-            description: 'Tool-call scheduling mode. Defaults to serial. Use parallel only when this command is independent from sibling tool calls.'
+            description: 'Tool-call scheduling mode. Explicit parallel/serial always wins. By default, output reads and conservatively recognized readonly commands may run in parallel; kill and all other execute calls remain serial.'
           }
-        },
-        required: ['explanation', 'foregroundWaitMs']
+        }
       },
       metadata: {
         category: 'command',
@@ -130,8 +143,27 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
 
       const commandText = (args.command ?? '').trim();
       if (!commandText) return { ok: false, output: 'mode=execute 需要提供 command。' };
-      if (typeof args.foregroundWaitMs !== 'number' || !Number.isFinite(args.foregroundWaitMs) || args.foregroundWaitMs < 0) {
-        return { ok: false, output: 'foregroundWaitMs 为必填参数，需为非负的毫秒数（0 表示启动后立即转后台）。' };
+      if (typeof args.explanation !== 'string' || args.explanation.trim().length === 0) {
+        return { ok: false, output: 'mode=execute 需要提供 explanation。' };
+      }
+      if (typeof args.foregroundWaitMs !== 'number' || !Number.isSafeInteger(args.foregroundWaitMs) || args.foregroundWaitMs < 0 || args.foregroundWaitMs > 60_000) {
+        return { ok: false, output: 'foregroundWaitMs 为必填参数，需为 0 到 60000 的整数毫秒数（0 表示启动后立即转后台）。' };
+      }
+      if (args.executionTimeoutMs !== undefined && (
+        typeof args.executionTimeoutMs !== 'number'
+        || !Number.isSafeInteger(args.executionTimeoutMs)
+        || args.executionTimeoutMs < 1_000
+        || args.executionTimeoutMs > 600_000
+      )) {
+        return { ok: false, output: 'executionTimeoutMs 需为 1000 到 600000 的整数毫秒数。' };
+      }
+      if (args.maxOutputBytes !== undefined && (
+        typeof args.maxOutputBytes !== 'number'
+        || !Number.isSafeInteger(args.maxOutputBytes)
+        || args.maxOutputBytes < 1_024
+        || args.maxOutputBytes > 1_073_741_824
+      )) {
+        return { ok: false, output: 'maxOutputBytes 需为 1024 到 1073741824 的整数。' };
       }
       const deniedBy = firstMatchedCommandRule(commandText, config.denyCommands);
       if (deniedBy) return { ok: false, output: `命令已被工具策略黑名单拒绝：${deniedBy}` };
@@ -149,6 +181,8 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
         command: args.command,
         cwd: args.cwd,
         foregroundWaitMs: args.foregroundWaitMs,
+        executionTimeoutMs: args.executionTimeoutMs,
+        maxOutputBytes: args.maxOutputBytes,
         executionId: ctx?.toolCallId,
         ...(origin ? { backgroundProcessOrigin: origin } : {}),
         ...(ctx?.signal ? { signal: ctx.signal } : {})
@@ -177,6 +211,8 @@ type CommandToolArgs = {
   command?: string;
   cwd?: string;
   foregroundWaitMs?: number;
+  executionTimeoutMs?: number;
+  maxOutputBytes?: number;
   mode?: string;
   processId?: string;
   outputHandle?: string;
@@ -193,16 +229,42 @@ function summarizeCommandToolCall(rawArgs: unknown): string | undefined {
   return explanation.replace(/\s+/g, ' ');
 }
 
-/** Canonical LLM scheduling wins; legacy wait remains a compatibility hint; commands default to serial. */
+/** Canonical LLM scheduling wins; observation reads and statically safe readonly commands may overlap. */
 function resolveCommandScheduling(rawArgs: unknown): { mode: 'parallel' | 'serial'; reason: string } {
   const args = (rawArgs ?? {}) as CommandToolArgs;
   const scheduling = normalizeSchedulingHint(args.scheduling);
   if (scheduling !== 'auto') return { mode: scheduling, reason: `llm_selected_${scheduling}` };
 
+  const mode = args.mode === 'output' || args.mode === 'kill' ? args.mode : 'execute';
+  if (mode === 'output') return { mode: 'parallel', reason: 'readonly_process_output' };
+  if (mode === 'kill') return { mode: 'serial', reason: 'process_kill_side_effect' };
   const wait = typeof args.wait === 'string' ? args.wait.trim().toLowerCase() : '';
   if (wait === 'false') return { mode: 'parallel', reason: 'legacy_wait_false' };
   if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true' };
+  if (isReadonlyCommandCall(args) && isStaticallyParallelSafeReadonlyCommand(args.command)) {
+    return { mode: 'parallel', reason: 'statically_safe_readonly_command' };
+  }
   return { mode: 'serial', reason: 'default_serial_command' };
+}
+
+function isStaticallyParallelSafeReadonlyCommand(value: unknown): boolean {
+  const command = typeof value === 'string' ? value.trim() : '';
+  if (!command || /[;&|<>`$\n\r]/.test(command)) return false;
+  const tokens = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  const executable = (tokens[0] ?? '').replace(/^.*[\\/]/, '').toLowerCase();
+  if (['pwd', 'ls', 'rg', 'grep', 'cat', 'head', 'tail', 'wc', 'stat', 'file'].includes(executable)) {
+    return true;
+  }
+  if (executable === 'find') {
+    return !tokens.slice(1).some((token) => [
+      '-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprintf', '-fls'
+    ].some((flag) => token.toLowerCase() === flag || token.toLowerCase().startsWith(`${flag}=`)));
+  }
+  if (executable !== 'git') return false;
+  const lowerTokens = tokens.slice(1).map((token) => token.toLowerCase());
+  if (lowerTokens.some((token) => token === '-o' || token === '--output' || token.startsWith('--output='))) return false;
+  const subcommand = lowerTokens[0] ?? '';
+  return ['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'grep'].includes(subcommand);
 }
 
 /** 判断某次命令工具调用是否被模型标记为只读（供审批放行使用）。 */

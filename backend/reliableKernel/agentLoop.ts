@@ -79,10 +79,16 @@ export interface ReliableAgentToolSettled {
 export interface ReliableAgentToolDispatcher {
   /** turnId selects definitions through that Turn's immutable authority snapshot. */
   definitions(turnId?: string): Promise<ReliableAgentToolDefinition[]> | ReliableAgentToolDefinition[];
+  /** Compiles display/gate/scheduling for a Provider batch from one immutable authority read. */
+  freezeCalls?(inputs: ReadonlyArray<ReliableAgentToolDispatchInput & {
+    definition: ReliableAgentToolDefinition;
+  }>): Promise<FrozenToolCallPolicyDecision[]>;
   /** Compiles display/gate/scheduling from the immutable Turn authority and frozen recipe definition. */
   freezeCall?(input: ReliableAgentToolDispatchInput & {
     definition: ReliableAgentToolDefinition;
   }): Promise<FrozenToolCallPolicyDecision>;
+  /** Dispatches one already-frozen parallel group while sharing read-only preflight/finalization work. */
+  dispatchBatch?(inputs: readonly ReliableAgentToolDispatchInput[]): Promise<Array<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>>;
   dispatch(input: ReliableAgentToolDispatchInput): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>;
   /** Prewired cancellation boundary; Runner may invoke it without knowing capability internals. */
   cancelActive?(input: { turnId: string; reason: string }): Promise<void> | void;
@@ -138,6 +144,9 @@ export interface ReliableAgentLifecycleEvent {
   round?: string;
   modelRequestId?: string;
   toolCallId?: string;
+  /** Present when one dispatcher call owns a Provider parallel group. */
+  toolBatchSize?: number;
+  schedulingMode?: 'parallel' | 'serial';
   errorName?: string;
   errorMessage?: string;
 }
@@ -424,8 +433,26 @@ export class ReliableAgentLoop {
       // Host shutdown / lease replacement is a recoverable transport handoff. Recording a failed
       // Turn here would destroy the exact durable frontier the next Host needs to resume.
       if (isExecutionHandoffError(error)) throw error;
+      let interruptionCheckError: unknown;
+      try {
+        if (await this.terminateIfRequested(turnId, 'drive-interrupted')) {
+          const terminalTurn = await this.requireExisting('Turn', turnId);
+          return {
+            turnId,
+            terminalStatus: await this.readLoopTerminalStatus(turnId, terminalTurn),
+            modelRequestIds,
+            assistantMessageIds,
+            toolCallIds
+          };
+        }
+      } catch (checkError) {
+        interruptionCheckError = checkError;
+      }
+      // A durable interrupt wins over the transport AbortError that it deliberately caused. Only a
+      // genuine unrequested failure is allowed to enter the drive_failed terminal path.
       this.observeLifecycle({ turnId, stage: 'drive_failed', ...errorDiagnostic(error) });
       try {
+        if (interruptionCheckError !== undefined) throw interruptionCheckError;
         this.observeLifecycle({ turnId, stage: 'failure_terminal_started' });
         if (!await this.terminateIfRequested(turnId, 'drive-failed')) {
           await this.failActiveTurn(turnId, error);
@@ -472,11 +499,17 @@ export class ReliableAgentLoop {
       requireNonNegativeSafeNumber(link.provider_ordinal, 'ToolCallSourceLink.provider_ordinal'),
       link
     ]));
-    const calls: FrozenProviderToolCall[] = [];
-    for (const call of input.output.toolCalls) {
+    const calls: Array<FrozenProviderToolCall | undefined> = new Array(input.output.toolCalls.length);
+    const pending: Array<{
+      index: number;
+      call: NormalizedProviderOutput['toolCalls'][number];
+      toolCallId: string;
+      dispatchInput: ReliableAgentToolDispatchInput & { definition: ReliableAgentToolDefinition };
+    }> = [];
+    for (let index = 0; index < input.output.toolCalls.length; index += 1) {
+      const call = input.output.toolCalls[index];
       const toolCallId = providerToolCallId(input.modelRequestId, call);
       const existingLink = existingByOrdinal.get(call.providerOrdinal);
-      let policy: FrozenToolCallPolicyDecision;
       if (existingLink) {
         if (
           existingLink.tool_call_id !== toolCallId
@@ -486,23 +519,45 @@ export class ReliableAgentLoop {
         ) throw new Error(`Provider ToolCall source replay conflicts at ordinal ${call.providerOrdinal}.`);
         const rows = await this.list('ToolCallPolicySnapshot', { tool_call_id: toolCallId }, 2);
         if (rows.length !== 1) throw new Error(`ToolCall ${toolCallId} must have one frozen policy snapshot.`);
-        policy = frozenPolicyFromRow(rows[0]);
-      } else {
-        const definition = definitionsByName.get(call.name) ?? unknownToolDefinition(call.name);
-        const dispatchInput: ReliableAgentToolDispatchInput = {
+        calls[index] = { ...call, toolCallId, policy: frozenPolicyFromRow(rows[0]) };
+        continue;
+      }
+      const definition = definitionsByName.get(call.name) ?? unknownToolDefinition(call.name);
+      pending.push({
+        index,
+        call,
+        toolCallId,
+        dispatchInput: {
           turnId: input.turnId,
           modelRequestId: input.modelRequestId,
           toolCallId,
           ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
           toolName: call.name,
-          arguments: call.arguments
-        };
-        policy = this.tools.freezeCall
-          ? await this.tools.freezeCall({ ...dispatchInput, definition })
-          : fallbackFrozenToolPolicy(definition, call.arguments);
-      }
-      calls.push({ ...call, toolCallId, policy });
+          arguments: call.arguments,
+          definition
+        }
+      });
     }
+    const pendingPolicies = this.tools.freezeCalls
+      ? await this.tools.freezeCalls(pending.map((entry) => entry.dispatchInput))
+      : await Promise.all(pending.map((entry) => this.tools.freezeCall
+          ? this.tools.freezeCall(entry.dispatchInput)
+          : Promise.resolve(fallbackFrozenToolPolicy(entry.dispatchInput.definition, entry.call.arguments))));
+    if (pendingPolicies.length !== pending.length) {
+      throw new Error('Tool dispatcher freezeCalls result length does not match the Provider batch.');
+    }
+    for (let index = 0; index < pending.length; index += 1) {
+      const entry = pending[index];
+      calls[entry.index] = {
+        ...entry.call,
+        toolCallId: entry.toolCallId,
+        policy: pendingPolicies[index]
+      };
+    }
+    const frozenCalls = calls.map((call, index) => {
+      if (!call) throw new Error(`Provider ToolCall ${index} lacks a frozen policy.`);
+      return call;
+    });
     const batchId = stableId('tool_call_batch', input.modelRequestId);
     await this.effects.createToolCallBatch({
       source: { kind: 'callback', key: `agent-loop:${input.modelRequestId}:tool-batch` },
@@ -510,7 +565,7 @@ export class ReliableAgentLoop {
       turnId: input.turnId,
       modelRequestId: input.modelRequestId,
       messageId: input.messageId,
-      entries: calls.map((call) => ({
+      entries: frozenCalls.map((call) => ({
         toolCallId: call.toolCallId,
         toolName: call.name,
         arguments: call.arguments,
@@ -520,7 +575,7 @@ export class ReliableAgentLoop {
         policy: call.policy
       }))
     });
-    return calls;
+    return frozenCalls;
   }
 
   private async dispatchProviderToolBatch(input: {
@@ -543,13 +598,13 @@ export class ReliableAgentLoop {
         while (end < input.calls.length && input.calls[end].policy.schedulingMode === 'parallel') end += 1;
       }
       const group = input.calls.slice(cursor, end);
-      await Promise.all(group.map((call) => this.dispatchProviderToolCall({
+      const batchFinalized = await this.dispatchProviderToolGroup({
         turnId: input.turnId,
         round: input.round,
         modelRequestId: input.modelRequestId,
-        call
-      })));
-      await this.effects.finalizeReadyInOrder(input.turnId);
+        calls: group
+      });
+      if (!batchFinalized) await this.effects.finalizeReadyInOrder(input.turnId);
       await this.appendTerminalToolPairsInOrder(input.conversationId, input.calls);
 
       if (await this.terminateIfRequested(
@@ -566,6 +621,58 @@ export class ReliableAgentLoop {
     }
     await this.appendTerminalToolPairsInOrder(input.conversationId, input.calls);
     return { status: 'completed' };
+  }
+
+  private async dispatchProviderToolGroup(input: {
+    turnId: string;
+    round: string;
+    modelRequestId: string;
+    calls: readonly FrozenProviderToolCall[];
+  }): Promise<boolean> {
+    if (!this.tools.dispatchBatch || input.calls.length <= 1) {
+      await Promise.all(input.calls.map((call) => this.dispatchProviderToolCall({
+        turnId: input.turnId,
+        round: input.round,
+        modelRequestId: input.modelRequestId,
+        call
+      })));
+      return false;
+    }
+    for (const call of input.calls) {
+      this.observeLifecycle({
+        turnId: input.turnId,
+        stage: 'tool_dispatch_started',
+        round: input.round,
+        modelRequestId: input.modelRequestId,
+        toolCallId: call.toolCallId,
+        toolBatchSize: input.calls.length,
+        schedulingMode: 'parallel'
+      });
+    }
+    const dispatched = await this.tools.dispatchBatch(input.calls.map((call) => ({
+      turnId: input.turnId,
+      modelRequestId: input.modelRequestId,
+      toolCallId: call.toolCallId,
+      ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
+      toolName: call.name,
+      arguments: call.arguments
+    })));
+    if (dispatched.length !== input.calls.length) {
+      throw new Error('Tool dispatcher dispatchBatch result length does not match the parallel group.');
+    }
+    for (let index = 0; index < dispatched.length; index += 1) {
+      if (isToolPause(dispatched[index])) continue;
+      this.observeLifecycle({
+        turnId: input.turnId,
+        stage: 'tool_dispatch_completed',
+        round: input.round,
+        modelRequestId: input.modelRequestId,
+        toolCallId: input.calls[index].toolCallId,
+        toolBatchSize: input.calls.length,
+        schedulingMode: 'parallel'
+      });
+    }
+    return true;
   }
 
   private async dispatchProviderToolCall(input: {
@@ -678,7 +785,13 @@ export class ReliableAgentLoop {
             attemptSeq: fullRequest.attemptSeq,
             socketGeneration: fullRequest.socketGeneration,
             afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
-            event,
+            event: {
+              kind: event.kind,
+              streamSeq: event.streamSeq,
+              content: event.content,
+              ...(event.usage !== undefined ? { usage: event.usage } : {}),
+              ...(event.timing !== undefined ? { timing: event.timing } : {})
+            },
             observedAt: this.timestamp()
           });
           return controls.onEvent(event);

@@ -16,6 +16,7 @@ const phaseDChecks = new Set([
   'candidate.attachment-cas-ingest',
   'candidate.mcp-effect-recovery',
   'candidate.process-wrapper-recovery',
+  'candidate.process-watchdog',
   'candidate.process-output-bounds',
   'candidate.recovery.effect-intent-hanging',
   'candidate.recovery.file-change-unresolved'
@@ -47,6 +48,7 @@ const handlers = new Map([
   ['candidate.attachment-cas-ingest', checkAttachmentCasIngest],
   ['candidate.mcp-effect-recovery', checkMcpEffectRecovery],
   ['candidate.process-wrapper-recovery', checkProcessWrapperRecovery],
+  ['candidate.process-watchdog', checkProcessWatchdog],
   ['candidate.process-output-bounds', checkProcessOutputBounds],
   ['candidate.recovery.effect-intent-hanging', checkHangingEffectRecovery],
   ['candidate.recovery.file-change-unresolved', checkUnresolvedFileRecovery]
@@ -557,6 +559,176 @@ async function checkToolModelResultExactlyOnce() {
     assert.equal(await effects.claimEffectDispatch(monotonicEffect.effectIntentId), false);
     assertions.push('Tool/Operation终态单调；no-effect不能旁路已有effect，terminal后不能prepare或重新claim外调');
 
+    const individualTools = [];
+    for (let index = 0; index < 8; index += 1) {
+      individualTools.push(await createTool(ctx, effects, `readonly-individual-${index}`, 'read'));
+    }
+    const individualSettlements = individualTools.map((tool, index) => ({
+      source: source('internal', `readonly-individual-${index}:settle`),
+      toolCallId: tool.toolCallId,
+      status: 'succeeded',
+      detail: { path: `${index}.txt`, content: `content-${index}` }
+    }));
+    const originalBatchTransaction = ctx.database.transaction.bind(ctx.database);
+    const originalBatchSnapshot = ctx.database.snapshot.bind(ctx.database);
+    let individualTransactions = 0;
+    let individualSnapshots = 0;
+    ctx.database.transaction = async (steps) => {
+      individualTransactions += 1;
+      return originalBatchTransaction(steps);
+    };
+    ctx.database.snapshot = async (reads) => {
+      individualSnapshots += 1;
+      return originalBatchSnapshot(reads);
+    };
+    const individualStartedAt = performance.now();
+    try {
+      await Promise.all(individualSettlements.map((settlement) =>
+        effects.settleWithoutEffect(settlement, { finalize: false })
+      ));
+      await effects.finalizeReadyInOrder(ctx.turnId);
+    } finally {
+      ctx.database.transaction = originalBatchTransaction;
+      ctx.database.snapshot = originalBatchSnapshot;
+    }
+    const individualElapsedMs = performance.now() - individualStartedAt;
+    assert.equal(individualTransactions, 9, 'eight individual settlements plus one batch finalizer require nine transactions');
+
+    const batchTools = [];
+    for (let index = 0; index < 8; index += 1) {
+      batchTools.push(await createTool(ctx, effects, `readonly-batch-${index}`, 'read'));
+    }
+    const batchSettlements = batchTools.map((tool, index) => ({
+      source: source('internal', `readonly-batch-${index}:settle`),
+      toolCallId: tool.toolCallId,
+      status: 'succeeded',
+      detail: { path: `${index}.txt`, content: `content-${index}` }
+    }));
+    const originalBatchSnapshotAll = ctx.database.snapshot.bind(ctx.database);
+    let settlementTransactions = 0;
+    let batchSnapshots = 0;
+    ctx.database.transaction = async (steps) => {
+      settlementTransactions += 1;
+      return originalBatchTransaction(steps);
+    };
+    ctx.database.snapshot = async (reads) => {
+      batchSnapshots += 1;
+      return originalBatchSnapshotAll(reads);
+    };
+    let batchResults;
+    const batchStartedAt = performance.now();
+    try {
+      batchResults = await effects.settleWithoutEffectBatch({
+        turnId: ctx.turnId,
+        settlements: batchSettlements
+      });
+    } finally {
+      ctx.database.transaction = originalBatchTransaction;
+      ctx.database.snapshot = originalBatchSnapshotAll;
+    }
+    assert.equal(settlementTransactions, 1, 'fresh readonly batch must settle in one SQLite transaction');
+    assert.equal(batchResults.length, 8);
+    assert.ok(batchResults.every((entry) => entry.terminal === undefined));
+    assert.equal((await list(ctx.database, 'Operation', {})).filter((row) =>
+      batchTools.some((tool) => tool.toolCallId === row.tool_call_id)
+    ).length, 8);
+    let finalizerTransactions = 0;
+    ctx.database.transaction = async (steps) => {
+      finalizerTransactions += 1;
+      return originalBatchTransaction(steps);
+    };
+    ctx.database.snapshot = async (reads) => {
+      batchSnapshots += 1;
+      return originalBatchSnapshotAll(reads);
+    };
+    try {
+      await effects.finalizeReadyInOrder(ctx.turnId);
+    } finally {
+      ctx.database.transaction = originalBatchTransaction;
+      ctx.database.snapshot = originalBatchSnapshotAll;
+    }
+    assert.equal(finalizerTransactions, 1, 'fresh readonly batch must finalize in one SQLite transaction');
+    const batchElapsedMs = performance.now() - batchStartedAt;
+    assert.equal((await list(ctx.database, 'ToolModelResult', {})).filter((row) =>
+      batchTools.some((tool) => tool.toolCallId === row.tool_call_id)
+    ).length, 8);
+    const replayedBatch = await effects.settleWithoutEffectBatch({
+      turnId: ctx.turnId,
+      settlements: batchSettlements
+    });
+    assert.ok(replayedBatch.every((entry) => entry.deduplicated));
+    assertions.push(
+      `8个readonly结果从9个事务降为2个事务，snapshot调用${individualSnapshots}->${batchSnapshots}，`
+      + `本机控制面耗时${individualElapsedMs.toFixed(1)}ms->${batchElapsedMs.toFixed(1)}ms；按call_seq生成唯一结果且整批重放不重复写入`
+    );
+
+    await attachWorkEnvironmentAuthority(ctx, ctx.turnId, 'readonly-dispatch-authority', true);
+    const dispatchDefinition = phaseDRuntimeDefinition('read');
+    let hostDefinitionReads = 0;
+    let activeReadonly = 0;
+    let maxActiveReadonly = 0;
+    const reliableTools = new kernel.ReliableToolDispatcher({
+      database: ctx.database,
+      contentStore: ctx.store,
+      effects,
+      files: {},
+      fileMutations: {},
+      processes: {},
+      mcp: {},
+      interactions: {},
+      host: {
+        definitions() {
+          hostDefinitionReads += 1;
+          return [dispatchDefinition];
+        },
+        async executeNoEffect(_definition, input) {
+          activeReadonly += 1;
+          maxActiveReadonly = Math.max(maxActiveReadonly, activeReadonly);
+          await delay(20);
+          activeReadonly -= 1;
+          return { ok: true, output: { path: input.arguments.path, content: `body:${input.arguments.path}` } };
+        }
+      }
+    });
+    const dispatchedTools = [];
+    for (let index = 0; index < 8; index += 1) {
+      dispatchedTools.push(await createTool(ctx, effects, `readonly-dispatch-${index}`, 'read'));
+    }
+    let dispatchTransactions = 0;
+    let dispatchSnapshots = 0;
+    ctx.database.transaction = async (steps) => {
+      dispatchTransactions += 1;
+      return originalBatchTransaction(steps);
+    };
+    ctx.database.snapshot = async (reads) => {
+      dispatchSnapshots += 1;
+      return originalBatchSnapshot(reads);
+    };
+    let dispatched;
+    const dispatchStartedAt = performance.now();
+    try {
+      dispatched = await reliableTools.dispatchBatch(dispatchedTools.map((tool, index) => ({
+        turnId: ctx.turnId,
+        modelRequestId: 'readonly-dispatch-model',
+        toolCallId: tool.toolCallId,
+        toolName: 'read',
+        arguments: { path: `${index}.txt` }
+      })));
+    } finally {
+      ctx.database.transaction = originalBatchTransaction;
+      ctx.database.snapshot = originalBatchSnapshot;
+      await reliableTools.dispose();
+    }
+    const dispatchElapsedMs = performance.now() - dispatchStartedAt;
+    assert.equal(maxActiveReadonly, 8);
+    assert.equal(hostDefinitionReads, 1);
+    assert.equal(dispatchTransactions, 2);
+    assert.ok(dispatched.every((entry) => entry.toolModelResultId));
+    assertions.push(
+      `ReliableToolDispatcher真实8路read同时执行，definitions只取1次、结果只写2个事务，`
+      + `snapshot=${dispatchSnapshots}，含20ms I/O总耗时${dispatchElapsedMs.toFixed(1)}ms`
+    );
+
     const invalidTaskTool = await createTool(ctx, effects, 'invalid-task-list', 'update_task_list');
     await assert.rejects(interactions.settleTaskList({
       source: source('internal', 'invalid-task-list:settle'),
@@ -578,6 +750,8 @@ async function checkToolModelResultExactlyOnce() {
         'late receipt after terminal',
         'unexpected UNIQUE propagation',
         'automatic recovery after operation completion before tool finalization',
+        'batched readonly settlement and replay',
+        'real dispatcher shared preflight and concurrent readonly execution',
         'ask_user competing responses and loser replay',
         'ask_user response before ordered model result',
         'ask_user response commit before finalizer crash',
@@ -1535,8 +1709,9 @@ async function checkProcessWrapperRecovery() {
     const handoffOutcome = (await list(ctx.database, 'ToolOutcome', { tool_call_id: tool.toolCallId }))[0];
     const handoffOutcomeMetadata = await get(ctx.database, 'ContentObject', handoffOutcome.content_object_id);
     const handoffModelResult = JSON.parse((await ctx.store.read(handoffOutcomeMetadata)).toString('utf8'));
-    assert.equal(handoffModelResult.detail.operations[0].detail.state, 'background_started');
-    assert.equal(handoffModelResult.detail.operations[0].detail.processId, prepared.request.processId);
+    assert.equal(handoffModelResult.detail.status, 'running');
+    assert.equal(handoffModelResult.detail.processId, prepared.request.processId);
+    assert.equal(handoffModelResult.detail.complete, false);
     const processId = prepared.request.processId;
     await ctx.database.close();
 
@@ -2207,6 +2382,271 @@ async function checkProcessWrapperRecovery() {
   }
 }
 
+async function checkProcessWatchdog() {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-phase-d-process-watchdog-'));
+  let ctx;
+  let recoveryApp;
+  try {
+    ctx = await createRuntime(parent, 'process-watchdog');
+    const assertions = [];
+    const effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
+    const processes = new kernel.ProcessControlPlane(
+      ctx.database, ctx.store, effects, ctx.authority, ctx.binding
+    );
+
+    const legacyReceipt = kernel.parseWrapperExitReceipt({
+      kind: kernel.PROCESS_WRAPPER_PROTOCOL,
+      processId: 'legacy-process',
+      stableNonce: '0'.repeat(32),
+      wrapperPid: '1',
+      childPid: '2',
+      processGroupId: '2',
+      startFingerprint: 'legacy-fingerprint',
+      commandDigest: '0'.repeat(64),
+      exitCode: '0',
+      signal: null,
+      exitedAt: '2026-01-01T00:00:00.000Z',
+      retainedBytes: '0',
+      retainedChunks: '0',
+      droppedBytes: '0',
+      truncated: false,
+      stopRequested: false
+    });
+    assert.equal(legacyReceipt.terminationReason, 'natural');
+    assert.equal(legacyReceipt.executionDeadlineAt, null);
+    assert.equal(legacyReceipt.maxOutputBytes, null);
+    assert.throws(() => kernel.parseWrapperExitReceipt({
+      ...legacyReceipt,
+      terminationReason: 'timed_out',
+      executionDeadlineAt: null,
+      maxOutputBytes: 1024
+    }), /requires executionDeadlineAt/);
+    assertions.push('旧exit receipt合同继续可读；新watchdog receipt拒绝不完整或矛盾的终止证据');
+
+    const timeoutTool = await createTool(ctx, effects, 'process-watchdog-timeout', 'bash');
+    const timeoutPrepared = await processes.prepareStart({
+      source: source('internal', 'process-watchdog-timeout:prepare'),
+      toolCallId: timeoutTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote('setInterval(()=>{},1000)')}`,
+      cwd: parent,
+      executionTimeoutMs: 1_000,
+      maxOutputBytes: 64 * 1024
+    });
+    const persistedStartRequest = await effects.readEffectRequest(timeoutPrepared.effect.effectIntentId);
+    assert.equal(persistedStartRequest.executionTimeoutMs, 1_000);
+    assert.equal(persistedStartRequest.maxOutputBytes, 64 * 1024);
+    const timeoutStarted = await processes.dispatchStart(timeoutPrepared.effect.effectIntentId, 5_000);
+    assert.equal(timeoutStarted.observation.state, 'completed');
+    assert.equal(timeoutStarted.observation.foreground.state, 'exited');
+    assert.equal(timeoutStarted.observation.foreground.receipt.terminationReason, 'timed_out');
+    assert.equal(timeoutStarted.observation.foreground.receipt.stopRequested, false);
+    assert.equal(timeoutStarted.terminal.status, 'failed');
+    const timeoutProcess = await get(ctx.database, 'Process', timeoutPrepared.request.processId);
+    assert.equal(timeoutProcess.status, 'timed_out');
+    const timeoutReceipt = (await list(ctx.database, 'ProcessReceipt', {
+      process_id: timeoutPrepared.request.processId
+    }))[0];
+    assert.equal(timeoutReceipt.outcome, 'timed_out');
+    const timeoutOutcome = (await list(ctx.database, 'ToolOutcome', { tool_call_id: timeoutTool.toolCallId }))[0];
+    const timeoutOutcomeMetadata = await get(ctx.database, 'ContentObject', timeoutOutcome.content_object_id);
+    const timeoutModelResult = JSON.parse((await ctx.store.read(timeoutOutcomeMetadata)).toString('utf8'));
+    assert.equal(timeoutModelResult.detail.status, 'timed_out');
+    assert.equal(timeoutModelResult.detail.terminationReason, 'timed_out');
+    const timeoutLaunchPath = path.join(
+      kernel.processSpoolPath(ctx.binding, timeoutPrepared.request.spoolLocator),
+      'launch.json'
+    );
+    const timeoutLaunch = JSON.parse(await fs.readFile(timeoutLaunchPath, 'utf8'));
+    assert.equal(timeoutLaunch.executionTimeoutMs, 1_000);
+    assert.equal(timeoutLaunch.maxOutputBytes, 64 * 1024);
+    assert.equal(Date.parse(timeoutLaunch.executionDeadlineAt) - Date.parse(timeoutLaunch.createdAt), 1_000);
+    assertions.push('foregroundWaitMs仍只控制前台等待；独立execution deadline在前台命令上形成timed_out终态和直接模型结果');
+
+    const outputTool = await createTool(ctx, effects, 'process-watchdog-output', 'bash');
+    const outputPrepared = await processes.prepareStart({
+      source: source('internal', 'process-watchdog-output:prepare'),
+      toolCallId: outputTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write(Buffer.alloc(1024*1024,120));setInterval(()=>{},1000)")}`,
+      cwd: parent,
+      executionTimeoutMs: 10_000,
+      maxOutputBytes: 1_024
+    });
+    const outputStarted = await processes.dispatchStart(outputPrepared.effect.effectIntentId, 5_000);
+    const outputExit = outputStarted.observation.foreground.receipt;
+    assert.equal(outputExit.terminationReason, 'output_limit_exceeded');
+    assert.equal(outputStarted.terminal.status, 'failed');
+    assert.equal((await get(ctx.database, 'Process', outputPrepared.request.processId)).status, 'output_limit_exceeded');
+    assert.equal((await list(ctx.database, 'ProcessReceipt', {
+      process_id: outputPrepared.request.processId
+    }))[0].outcome, 'output_limit_exceeded');
+    assert.ok(BigInt(outputExit.retainedBytes) <= 1_024n);
+    assert.ok(BigInt(outputExit.droppedBytes) > 0n);
+    assert.equal(outputExit.truncated, true);
+    const outputPage = await processes.readOutputPage(outputPrepared.request.processId);
+    assert.ok(BigInt(outputPage.retainedBytes) <= 1_024n);
+    assert.ok(BigInt(outputPage.droppedBytes) > 0n);
+    assertions.push('stdout+stderr达到maxOutputBytes后只保留限额内字节、记录丢弃量并以output_limit_exceeded终止');
+
+    const manualTool = await createTool(ctx, effects, 'process-watchdog-manual', 'bash');
+    const manualPrepared = await processes.prepareStart({
+      source: source('internal', 'process-watchdog-manual:prepare'),
+      toolCallId: manualTool.toolCallId,
+      command: "trap '' TERM; while :; do sleep 1; done",
+      cwd: parent,
+      executionTimeoutMs: 10_000,
+      maxOutputBytes: 64 * 1024
+    });
+    await processes.dispatchStart(manualPrepared.effect.effectIntentId, 0);
+    await delay(100);
+    const manualStop = await processes.stopOwnedProcess(manualPrepared.request.processId);
+    assert.equal(manualStop.state, undefined);
+    assert.equal(manualStop.receipt.terminationReason, 'manual');
+    assert.equal(manualStop.receipt.signal, 'SIGKILL');
+    await processes.reconcileProcessExit(manualPrepared.request.processId);
+    assert.equal((await get(ctx.database, 'Process', manualPrepared.request.processId)).status, 'cancelled');
+    assertions.push('手工kill复用TERM→宽限期→SIGKILL，忽略SIGTERM的进程组也能可靠收敛');
+
+    const descendantPidPath = path.join(parent, 'watchdog-descendant.pid');
+    const descendantCode = [
+      "const fs=require('node:fs')",
+      "const {spawn}=require('node:child_process')",
+      "const child=spawn(process.execPath,['-e',\"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)\"],{stdio:'ignore'})",
+      `fs.writeFileSync(${JSON.stringify(descendantPidPath)},String(child.pid))`,
+      "process.on('SIGTERM',()=>process.exit(0))",
+      'setInterval(()=>{},1000)'
+    ].join(';');
+    const descendantTool = await createTool(ctx, effects, 'process-watchdog-descendant', 'bash');
+    const descendantPrepared = await processes.prepareStart({
+      source: source('internal', 'process-watchdog-descendant:prepare'),
+      toolCallId: descendantTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote(descendantCode)}`,
+      cwd: parent,
+      executionTimeoutMs: 10_000,
+      maxOutputBytes: 64 * 1024
+    });
+    await processes.dispatchStart(descendantPrepared.effect.effectIntentId, 0);
+    const descendantPid = await waitForPidFile(descendantPidPath, 2_000);
+    const descendantFingerprint = kernel.readLinuxStartFingerprint(descendantPid);
+    const descendantStop = await processes.stopOwnedProcess(descendantPrepared.request.processId);
+    assert.equal(descendantStop.receipt.terminationReason, 'manual');
+    await waitForFingerprintGone(descendantPid, descendantFingerprint, 3_000);
+    await processes.reconcileProcessExit(descendantPrepared.request.processId);
+    assertions.push('进程组leader在SIGTERM后先退出时，wrapper仍等待宽限期并以birth-witness围栏SIGKILL残留后代');
+
+    const raceTool = await createTool(ctx, effects, 'process-watchdog-race', 'bash');
+    const racePrepared = await processes.prepareStart({
+      source: source('internal', 'process-watchdog-race:prepare'),
+      toolCallId: raceTool.toolCallId,
+      command: "trap '' TERM; while :; do sleep 1; done",
+      cwd: parent,
+      executionTimeoutMs: 1_000,
+      maxOutputBytes: 64 * 1024
+    });
+    await processes.dispatchStart(racePrepared.effect.effectIntentId, 0);
+    await delay(1_200);
+    const raceStop = await processes.stopOwnedProcess(racePrepared.request.processId);
+    assert.equal(raceStop.receipt.terminationReason, 'timed_out');
+    assert.equal(raceStop.receipt.stopRequested, false);
+    assert.equal(raceStop.receipt.signal, 'SIGKILL');
+    await processes.reconcileProcessExit(racePrepared.request.processId);
+    assert.equal((await list(ctx.database, 'ProcessReceipt', {
+      process_id: racePrepared.request.processId
+    }))[0].outcome, 'timed_out');
+    assertions.push('deadline与迟到手工stop竞争时第一个终止原因first-wins，迟到请求不能把timed_out改写为cancelled');
+
+    const restartTool = await createTool(ctx, effects, 'process-watchdog-restart', 'bash');
+    const restartPrepared = await processes.prepareStart({
+      source: source('internal', 'process-watchdog-restart:prepare'),
+      toolCallId: restartTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote("setInterval(()=>process.stdout.write('still-running\\n'),200)")}`,
+      cwd: parent,
+      executionTimeoutMs: 1_500,
+      maxOutputBytes: 64 * 1024
+    });
+    const restartStarted = await processes.dispatchStart(restartPrepared.effect.effectIntentId, 0);
+    assert.equal(restartStarted.observation.state, 'background_started');
+    const restartProcessId = restartPrepared.request.processId;
+    const restartSpoolPath = kernel.processSpoolPath(ctx.binding, restartPrepared.request.spoolLocator);
+    await processes.dispose();
+    await ctx.database.close();
+    ctx.database = undefined;
+    await delay(2_000);
+    const atomicRestartReceipt = kernel.parseWrapperExitReceipt(JSON.parse(await fs.readFile(
+      path.join(restartSpoolPath, kernel.PROCESS_WRAPPER_EXIT_RECEIPT_FILE),
+      'utf8'
+    )));
+    assert.equal(atomicRestartReceipt.terminationReason, 'timed_out');
+
+    recoveryApp = await kernel.ReliableKernelApplication.open(
+      ctx.authority,
+      phaseDApplicationDependencies()
+    );
+    await recoveryApp.recover();
+    const recoveredProcess = await waitForPersistedProcessStatus(
+      recoveryApp.database,
+      restartProcessId,
+      new Set(['timed_out']),
+      5_000
+    );
+    assert.equal(recoveredProcess.status, 'timed_out');
+    const recoveredReceipt = await waitForSingleRow(
+      recoveryApp.database,
+      'ProcessReceipt',
+      { process_id: restartProcessId },
+      5_000
+    );
+    assert.equal(recoveredReceipt.outcome, 'timed_out');
+    const completionInbox = await waitForSingleRow(
+      recoveryApp.database,
+      'RuntimeInboxItem',
+      { source_kind: 'process_receipt', source_id: recoveredReceipt.id },
+      5_000
+    );
+    const completionLink = (await list(recoveryApp.database, 'RuntimeInboxPayloadLink', {
+      inbox_item_id: completionInbox.id
+    }))[0];
+    const completionMetadata = await get(
+      recoveryApp.database,
+      'ContentObject',
+      completionLink.content_object_id
+    );
+    const completionPayload = JSON.parse((await recoveryApp.contentStore.read(completionMetadata)).toString('utf8'));
+    assert.equal(completionPayload.kind, 'process_completion');
+    assert.equal(completionPayload.outcome, 'timed_out');
+    assert.equal(completionPayload.terminationReason, 'timed_out');
+    assert.equal(completionPayload.processId, restartProcessId);
+    await Promise.all([
+      recoveryApp.processDeliveries.scanNow(),
+      recoveryApp.processDeliveries.scanNow()
+    ]);
+    assert.equal((await list(recoveryApp.database, 'ProcessReceipt', { process_id: restartProcessId })).length, 1);
+    assert.equal((await list(recoveryApp.database, 'RuntimeInboxItem', {
+      source_kind: 'process_receipt', source_id: recoveredReceipt.id
+    })).length, 1);
+    assertions.push('Extension Host和数据库关闭期间wrapper仍按绝对deadline终止；恢复后唯一ProcessReceipt与process_completion主动通知补齐且不重跑命令');
+
+    return {
+      assertions,
+      faults: [
+        'legacy wrapper receipt replay',
+        'foreground wait vs execution deadline',
+        'output flood',
+        'SIGTERM ignored',
+        'manual stop escalation',
+        'process-group leader exits before grace',
+        'deadline vs manual stop race',
+        'extension host restart before deadline',
+        'receipt-before-completion recovery',
+        'competing completion scans'
+      ]
+    };
+  } finally {
+    if (recoveryApp) await recoveryApp.close().catch(() => undefined);
+    if (ctx?.database) await ctx.database.close().catch(() => undefined);
+    await fs.rm(parent, { recursive: true, force: true });
+  }
+}
+
 async function checkProcessOutputBounds() {
   return withRuntime('process-output', async (ctx) => {
     const assertions = [];
@@ -2214,6 +2654,66 @@ async function checkProcessOutputBounds() {
     const processes = new kernel.ProcessControlPlane(
       ctx.database, ctx.store, effects, ctx.authority, ctx.binding
     );
+
+    const inlineTool = await createTool(ctx, effects, 'process-inline-output', 'bash');
+    const inlinePrepared = await processes.prepareStart({
+      source: source('internal', 'process-inline-output:prepare'),
+      toolCallId: inlineTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('inline-stdout');process.stderr.write('inline-stderr')")}`,
+      cwd: ctx.parent
+    });
+    const inlineStarted = await processes.dispatchStart(inlinePrepared.effect.effectIntentId, 5_000);
+    assert.ok(inlineStarted.terminal, 'foreground completion must finalize the originating Bash ToolCall');
+    const inlineOutcome = (await list(ctx.database, 'ToolOutcome', { tool_call_id: inlineTool.toolCallId }))[0];
+    const inlineContent = await get(ctx.database, 'ContentObject', inlineOutcome.content_object_id);
+    const inlineBody = JSON.parse((await ctx.store.read(inlineContent)).toString('utf8'));
+    assert.equal(inlineBody.detail.stdout, 'inline-stdout');
+    assert.equal(inlineBody.detail.stderr, 'inline-stderr');
+    assert.equal(inlineBody.detail.complete, true);
+    assert.equal(Object.hasOwn(inlineBody.detail, 'nextOutputHandle'), false);
+    assert.equal(Object.hasOwn(inlineBody.detail, 'operations'), false);
+    assert.equal((await list(ctx.database, 'ToolResultArtifact', {
+      tool_call_id: inlineTool.toolCallId,
+      role: 'model_response'
+    })).length, 1);
+    assertions.push('前台Bash在原始execute ToolModelResult内直接返回stdout/stderr，无需第二次output调用');
+
+    const modelDetailCrashTool = await createTool(ctx, effects, 'process-model-detail-crash', 'bash');
+    const modelDetailCrashPrepared = await processes.prepareStart({
+      source: source('internal', 'process-model-detail-crash:prepare'),
+      toolCallId: modelDetailCrashTool.toolCallId,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('crash-recovered-output')")}`,
+      cwd: ctx.parent
+    });
+    const originalRecordToolModelDetail = effects.recordToolModelDetail.bind(effects);
+    effects.recordToolModelDetail = async () => { throw new Error('fault-before-process-model-detail'); };
+    try {
+      await assert.rejects(
+        processes.dispatchStart(modelDetailCrashPrepared.effect.effectIntentId, 5_000),
+        /fault-before-process-model-detail/
+      );
+    } finally {
+      effects.recordToolModelDetail = originalRecordToolModelDetail;
+    }
+    const crashAttempts = await list(ctx.database, 'Attempt', {
+      operation_id: modelDetailCrashPrepared.effect.operationId
+    });
+    const crashReceipts = await list(ctx.database, 'EffectReceipt', { attempt_id: crashAttempts[0].id });
+    assert.equal(crashReceipts.length, 1);
+    assert.equal((await get(ctx.database, 'Operation', modelDetailCrashPrepared.effect.operationId)).status, 'succeeded');
+    await effects.finalizeReadyInOrder(ctx.turnId);
+    assert.equal((await list(ctx.database, 'ToolModelResult', {
+      tool_call_id: modelDetailCrashTool.toolCallId
+    })).length, 0, 'process_start without model_response must not be finalized by a competing finalizer');
+    const crashRecoveredTerminal = await processes.reconcileStartReceipt(crashReceipts[0].id);
+    assert.ok(crashRecoveredTerminal);
+    const crashOutcome = (await list(ctx.database, 'ToolOutcome', {
+      tool_call_id: modelDetailCrashTool.toolCallId
+    }))[0];
+    const crashContent = await get(ctx.database, 'ContentObject', crashOutcome.content_object_id);
+    const crashBody = JSON.parse((await ctx.store.read(crashContent)).toString('utf8'));
+    assert.equal(crashBody.detail.stdout, 'crash-recovered-output');
+    assertions.push('process Operation提交后、model_response前崩溃时普通finalizer保持阻塞，reconcile重放补齐内联输出且不重跑命令');
 
     const liveTailTool = await createTool(ctx, effects, 'process-live-tail', 'bash');
     const liveTailPrepared = await processes.prepareStart({
@@ -2294,7 +2794,7 @@ async function checkProcessOutputBounds() {
     const missingSpoolPrepared = await processes.prepareStart({
       source: source('internal', 'process-missing-spool:prepare'),
       toolCallId: missingSpoolTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('retained-body')")}`,
+      command: `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>process.stdout.write('retained-body'),500)")}`,
       cwd: ctx.parent
     });
     await processes.dispatchStart(missingSpoolPrepared.effect.effectIntentId);
@@ -2383,6 +2883,22 @@ async function checkProcessOutputBounds() {
     assert.deepEqual(firstPage, replayedFirstPage);
     assert.ok(firstPage.hasMore, 'large process output must expose a continuation handle');
     assert.ok(Number(firstPage.pageBytes) <= kernel.PROCESS_OUTPUT_READ_PAGE_MAX_BYTES);
+    const strictInlinePage = await processes.readOutputPage(
+      processId,
+      undefined,
+      kernel.PROCESS_START_INLINE_OUTPUT_MAX_BYTES
+    );
+    assert.equal(Number(strictInlinePage.pageBytes), kernel.PROCESS_START_INLINE_OUTPUT_MAX_BYTES);
+    assert.equal(Buffer.byteLength(strictInlinePage.stdout, 'utf8'), kernel.PROCESS_START_INLINE_OUTPUT_MAX_BYTES);
+    assert.equal(strictInlinePage.hasMore, true);
+    const strictInlineContinuation = await processes.readOutputPage(
+      processId,
+      strictInlinePage.nextOutputHandle,
+      kernel.PROCESS_START_INLINE_OUTPUT_MAX_BYTES
+    );
+    assert.equal(Number(strictInlineContinuation.pageBytes), kernel.PROCESS_START_INLINE_OUTPUT_MAX_BYTES);
+    assert.equal(Buffer.byteLength(strictInlineContinuation.stdout, 'utf8'), kernel.PROCESS_START_INLINE_OUTPUT_MAX_BYTES);
+    assertions.push('初始Bash输出严格限制为16KiB且continuation可从chunk内字节偏移无重叠续读');
     let outputHandle;
     let totalStdoutBytes = 0;
     let totalStderrBytes = 0;
@@ -2431,7 +2947,7 @@ async function checkProcessOutputBounds() {
 
     return {
       assertions,
-      faults: ['live tail accounting', 'live writer/import race', 'stale output commit after exit', 'spool loss before CAS import', 'sustained output beyond former retention bounds', 'continued drain', 'competing ProcessOutput reconcile', 'CAS/SQLite growth convergence', 'spool loss after CAS import', 'repeatable read_output', 'terminal tail']
+      faults: ['single-call foreground output', 'model-response crash recovery', 'strict inline pagination', 'live tail accounting', 'live writer/import race', 'stale output commit after exit', 'spool loss before CAS import', 'sustained output beyond former retention bounds', 'continued drain', 'competing ProcessOutput reconcile', 'CAS/SQLite growth convergence', 'spool loss after CAS import', 'repeatable read_output', 'terminal tail']
     };
   });
 }
@@ -3087,6 +3603,34 @@ async function counts(database, domains) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForPidFile(filePath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const value = (await fs.readFile(filePath, 'utf8')).trim();
+      if (/^[1-9]\d*$/.test(value)) return value;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (Date.now() >= deadline) throw new Error(`PID file ${filePath} did not appear.`);
+    await delay(25);
+  }
+}
+
+async function waitForFingerprintGone(pid, fingerprint, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      if (kernel.readLinuxStartFingerprint(pid) !== fingerprint) return;
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return;
+      throw error;
+    }
+    if (Date.now() >= deadline) throw new Error(`Process ${pid} remained alive after process-group escalation.`);
+    await delay(25);
+  }
 }
 
 async function waitUntilTerminal(processes, processId, timeoutMs) {

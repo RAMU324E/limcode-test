@@ -129,6 +129,30 @@ export class VscodeReliableKernelProductRuntime {
       loadProviderConfig: (providerConfigId) => configuration.providerConfig(providerConfigId),
       proxy: () => createGlobalSettingsRecord(context).proxy || undefined,
       headers: { 'User-Agent': `${EXTENSION_PACKAGE_NAME}/${EXTENSION_VERSION}` },
+      onTransportTrace: (trace) => {
+        diagnostics.observe({
+          eventKind: 'provider.transport.phase',
+          scopeKind: 'model_request',
+          scopeId: trace.requestId,
+          correlationId: `${trace.connectionGeneration}:${trace.phase}`,
+          observedAt: new Date(trace.observedAt).toISOString(),
+          metadata: {
+            conversationId: trace.conversationId,
+            modelRequestId: trace.requestId,
+            stage: trace.phase,
+            sessionKeyHash: trace.sessionKeyHash,
+            connectionGeneration: trace.connectionGeneration,
+            ...(trace.elapsedMs !== undefined ? { elapsedMs: trace.elapsedMs } : {}),
+            ...(trace.connectionReused !== undefined ? { connectionReused: trace.connectionReused } : {}),
+            ...(trace.connectionReason ? { connectionReason: trace.connectionReason } : {}),
+            ...(trace.mode ? { mode: trace.mode } : {}),
+            ...(trace.reason ? { reasonCode: trace.reason } : {}),
+            ...(trace.timeoutPhase ? { timeoutPhase: trace.timeoutPhase } : {}),
+            ...(trace.fullInputItemCount !== undefined ? { fullInputItemCount: trace.fullInputItemCount } : {}),
+            ...(trace.sentInputItemCount !== undefined ? { sentInputItemCount: trace.sentInputItemCount } : {})
+          }
+        });
+      },
       resolveAttachment: async (input) => {
         if (!input.attachmentId) {
           throw new Error('可靠 Provider 只接受已进入 Runtime CAS 的 attachmentId。');
@@ -230,7 +254,10 @@ export class VscodeReliableKernelProductRuntime {
       fileDiffs = new VscodeReliableFileDiffEditor(application.files, diagnostics);
       conversations = new ReliableConversationRunner(
         application,
-        `vscode-product:${application.database.hostBootId}`
+        `vscode-product:${application.database.hostBootId}`,
+        undefined,
+        undefined,
+        diagnostics
       );
       application.processDeliveries.setWakeHandler(async (request) => {
         const app = application;

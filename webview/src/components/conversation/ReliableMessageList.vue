@@ -7,6 +7,11 @@ import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useReliableTimelinePresentationStore } from '@webview/stores/useReliableTimelinePresentationStore';
 import { projectReliableCompressionTimeline } from '@webview/domain/reliableCompressionProjection';
+import {
+  reliableKernelDetailDemandSignature,
+  reliableKernelDetailKey
+} from '@webview/domain/reliableDetailKey';
+import { hasVisibleStreamingTransientForTurn } from '@webview/domain/reliableTransientActivity';
 import MessageItem from './MessageItem.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
@@ -126,23 +131,61 @@ const activityModelLabel = computed(() => {
   return override || provider?.model?.trim() || 'AI';
 });
 const activityLabel = computed(() => {
+  const action = conversationAction.value;
+  if (action?.action === 'retry' && action.phase !== 'running') {
+    if (action.phase === 'requesting_stop') return '正在提交停止旧回复的请求';
+    if (action.phase === 'stopping') return '正在停止旧回复，完成后将创建重试回合';
+    if (action.phase === 'submitting') return conversationActionLabel.value ?? '旧回复已停止，正在创建重试回合';
+    return '正在等待旧回复停止后开始重试';
+  }
   const turn = activeTurn.value;
   if (!turn || typeof turn.id !== 'string') return undefined;
-  if (messages.value.some((message) => message.id.startsWith('transient:'))) return undefined;
+  const retryRunning = action?.action === 'retry' && action.phase === 'running';
+  const latest = activeTurnRequests.value[0];
+  if (!latest) return retryRunning ? '正在准备重试上下文' : '正在准备上下文';
+  const retry = modelRequestRetryState(latest);
+  // Durable retry identity must stay visible even when the latest socket has already painted one
+  // transient thought. Otherwise a retry loop looks indistinguishable from one permanently stuck
+  // model response.
+  if (latest.status === 'retrying') {
+    const delaySeconds = Math.max(0, Math.ceil(retry.remainingDelayMs / 1_000));
+    return `${retry.reasonLabel}，${delaySeconds} 秒后自动恢复（第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次）`;
+  }
+  if (latest.status === 'streaming' && retry.retryAttempt > 0) {
+    return `第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次自动恢复已重连，等待有效输出`;
+  }
+  if (hasVisibleStreamingTransientForTurn(feed.transientModelRequests, turn.id)) return undefined;
   const activeTool = Object.values(feed.records.ToolCall ?? {}).find((call) =>
     call.turn_id === turn.id && call.status !== 'terminal'
   );
   if (activeTool) return undefined;
-  const latest = activeTurnRequests.value[0];
-  if (!latest) return '正在准备上下文';
-  if (latest.status === 'pending') return '正在启动模型请求';
-  if (latest.status === 'streaming') return '正在等待模型输出';
-  return '正在衔接下一步';
+  if (latest.status === 'prepared' || latest.status === 'pending') {
+    return retryRunning ? '正在启动重试模型请求' : '正在启动模型请求';
+  }
+  if (latest.status === 'streaming') {
+    return retryRunning ? '正在等待重试模型输出' : '正在等待模型输出';
+  }
+  return '模型结果已提交，正在准备工具或下一轮';
+});
+const retryBoundaryLabel = computed(() => {
+  const action = conversationAction.value;
+  return action?.action === 'retry' && action.phase === 'running'
+    ? conversationActionLabel.value ?? '正在运行新的重试回合'
+    : undefined;
+});
+const visibleRetryBoundaryMessageId = computed(() => {
+  const turnId = conversationAction.value?.action === 'retry'
+    ? conversationAction.value.operationTurnId
+    : undefined;
+  if (!turnId) return undefined;
+  return visibleTimelineRows.value.find((message) =>
+    projection.value.turnIdByMessageId[message.id] === turnId
+  )?.id;
 });
 
 watch(
   () => [
-    ...visibleTimelineRows.value.map((message) => message.id),
+    ...visibleTimelineRows.value.map(messageDetailDemandSignature),
     ...Object.entries(projection.value.interactionByToolCallId)
       .filter(([, interaction]) => interaction.status === 'pending')
       .map(([toolCallId]) => toolCallId)
@@ -192,7 +235,11 @@ function retryFrom(message: MessageRecord): void {
     message.conversationId,
     message.retryTarget,
     currentAuthoritySelection(),
-    projection.value.messageRevisionIdByMessageId[message.id]
+    projection.value.messageRevisionIdByMessageId[message.id],
+    timelineFloor(
+      message,
+      messages.value.findIndex((candidate) => candidate.id === message.id) - segmentStart.value
+    )
   );
 }
 
@@ -247,6 +294,61 @@ function dismissCompression(block: Record<string, unknown>): void {
   timelinePresentation.suppress(conversationId.value, 'compression-block', reliableText(block.id));
 }
 
+function messageDetailDemandSignature(message: MessageRecord): string {
+  const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
+  if (!revisionId) return `message:${message.id}:no-revision`;
+  const status = feed.details[reliableKernelDetailKey('message-content', revisionId)]?.status;
+  return reliableKernelDetailDemandSignature({
+    hydrate: true,
+    callId: message.id,
+    targets: [{ kind: 'message-content', recordId: revisionId, status }]
+  });
+}
+
+function messageDetailLoading(message: MessageRecord): boolean {
+  if (message.content.parts.length > 0) return false;
+  const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
+  if (!revisionId) return false;
+  const status = feed.details[reliableKernelDetailKey('message-content', revisionId)]?.status;
+  return status === undefined || status === 'loading';
+}
+
+function timelineFloor(message: MessageRecord, visibleIndex: number): number {
+  const projected = projection.value.absoluteFloorByMessageId[message.id] ?? message.seq;
+  return absoluteTimelineFloor(projected, segmentStart.value + visibleIndex + 1);
+}
+
+function modelRequestRetryState(request: Record<string, unknown>): {
+  retryAttempt: number;
+  retryMaxAttempts: number;
+  remainingDelayMs: number;
+  reasonLabel: '模型输出停滞' | '模型连接异常' | '上下文压缩超时';
+} {
+  const raw = request.stream_stats_json;
+  let stats: Record<string, unknown> | undefined;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) stats = raw as Record<string, unknown>;
+  else if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) stats = parsed as Record<string, unknown>;
+    } catch { /* malformed durable data is rendered without retry detail */ }
+  }
+  const attemptSeq = Math.max(1, reliableInteger(stats?.attemptSeq));
+  const retryDelayMs = Math.max(0, reliableInteger(stats?.retryDelayMs));
+  const retryNotBeforeAt = Math.max(0, reliableInteger(stats?.retryNotBeforeAt));
+  const retryReason = reliableText(stats?.retryReason);
+  return {
+    retryAttempt: Math.max(0, attemptSeq - 1),
+    retryMaxAttempts: Math.max(attemptSeq - 1, reliableInteger(stats?.retryMaxAttempts)),
+    remainingDelayMs: retryNotBeforeAt > 0 ? Math.max(0, retryNotBeforeAt - Date.now()) : retryDelayMs,
+    reasonLabel: retryReason === 'compression_timeout'
+      ? '上下文压缩超时'
+      : retryReason === 'stream_stalled' || retryReason === 'first_semantic_timeout'
+        ? '模型输出停滞'
+        : '模型连接异常'
+  };
+}
+
 function reliableInteger(value: unknown): number {
   if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
   if (typeof value === 'string' && /^\d+$/.test(value)) return Number(value);
@@ -274,6 +376,13 @@ function reliableText(value: unknown): string {
       class="reliable-message-row"
       :data-timeline-row-key="message.id"
     >
+      <p
+        v-if="retryBoundaryLabel && visibleRetryBoundaryMessageId === message.id"
+        class="reliable-retry-boundary"
+        role="status"
+      >
+        {{ retryBoundaryLabel }}
+      </p>
       <MessageItem
         :message="message"
         :run-id="projection.turnIdByMessageId[message.id]"
@@ -281,14 +390,15 @@ function reliableText(value: unknown): string {
         :termination-notice-suppressed="isMessageTerminationSuppressed(message)"
         :run-had-completed-tools="runHadCompletedTools(message)"
         :delete-count="deleteCount(message)"
-        :compact-count="Math.max(1, absoluteTimelineFloor(message.seq, segmentStart + index + 1))"
+        :compact-count="Math.max(1, timelineFloor(message, index))"
+        :detail-loading="messageDetailLoading(message)"
         :mutation-pending="conversationActionPending && isConversationActionTarget(message)"
         :mutation-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
         :retry-blocked="retryBlocked(message)"
         :compact-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
         :fork-blocked="forkPendingTargetIds.has(message.id) || !projection.messageRevisionIdByMessageId[message.id]"
         :pending-label="conversationActionLabel ?? '正在提交操作'"
-        :floor-number="absoluteTimelineFloor(message.seq, segmentStart + index + 1)"
+        :floor-number="timelineFloor(message, index)"
         @edit-message="emit('edit-message', message, deleteCount(message))"
         @retry-from="retryFrom"
         @delete-from="deleteFrom"
@@ -318,6 +428,13 @@ function reliableText(value: unknown): string {
     >
       显示较新内容
     </button>
+    <p
+      v-if="retryBoundaryLabel && !visibleRetryBoundaryMessageId"
+      class="reliable-retry-boundary"
+      role="status"
+    >
+      {{ retryBoundaryLabel }}
+    </p>
     <TimelineActivityRow
       v-if="activityLabel && !hasLaterSegment"
       activity-kind="preparing"
@@ -334,6 +451,15 @@ function reliableText(value: unknown): string {
 </template>
 
 <style scoped>
+.reliable-retry-boundary {
+  margin: 4px 0 2px;
+  padding: 5px 8px;
+  border-left: 2px solid var(--vscode-focusBorder, #007acc);
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-focusBorder, #007acc) 6%);
+  font-size: var(--font-size-sm);
+}
+
 .reliable-message-list {
   display: flex;
   flex-direction: column;

@@ -57,6 +57,7 @@ export interface ReliableKernelSnapshotRequestMessage {
 
 export type ReliableKernelClientDetailKind =
   | 'message-content'
+  | 'turn-intent-preview'
   | 'tool-arguments-content'
   | 'tool-result-content'
   | 'tool-event-content'
@@ -184,6 +185,7 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'ConversationOriginLink',
   'AgentConversationLink',
   'Turn',
+  'TurnIntent',
   'ExecutionLease',
   'TurnTermination',
   'TurnExecutorLink',
@@ -349,6 +351,7 @@ function seedRecordsFromSnapshot(
     conversationOriginLinks: 'ConversationOriginLink',
     agentConversationLinks: 'AgentConversationLink',
     messages: 'Message',
+    queuedTurnIntents: 'TurnIntent',
     turns: 'Turn',
     executionLeases: 'ExecutionLease',
     turnTerminations: 'TurnTermination',

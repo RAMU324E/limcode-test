@@ -189,14 +189,31 @@
     "automaticKinds": [
       "provider-transient"
     ],
-    "providerMaxAttempts": 2,
+    "providerRetryAuthority": "frozen-turn-authority+sqlite-model-request-attempt",
+    "providerDefaultMaxRetries": 3,
+    "providerMaxRetries": 10,
+    "configuredPerFrozenAuthority": true,
+    "backoffMilliseconds": [
+      1000,
+      2000,
+      4000,
+      8000,
+      10000
+    ],
+    "semanticDeadlinesMilliseconds": {
+      "ordinaryFirst": 40000,
+      "ordinaryIdle": 30000,
+      "compressionCompletion": 180000
+    },
+    "compressionProgressContract": "compact()为terminal-only；只以CompactDone/CompactError满足180秒完成deadline，不等待不存在的thought/text语义事件",
     "visibleToUser": true,
+    "visibleWhenTransientThoughtExists": true,
     "cancelable": true,
-    "automaticAfterExtensionRestart": false,
+    "automaticAfterExtensionRestart": "resume-committed-retry",
     "fileMutationAutomaticRetry": false,
     "commandExecutionAutomaticRetry": false,
     "subagentStartAutomaticRetry": false,
-    "rule": "只有连接中断、限流和明确临时服务错误允许在当前活动请求内重试一次；其他操作由用户明确重新发起。"
+    "rule": "只有语义流停滞、连接中断、限流和明确临时服务错误按冻结配置创建有界SQLite Attempt并退避；永久Provider错误和其他操作不自动重试。"
   },
   "parallelExecution": {
     "supported": true,

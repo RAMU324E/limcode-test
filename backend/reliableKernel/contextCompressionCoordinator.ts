@@ -8,7 +8,12 @@ import {
   type CompressionCommitResult
 } from './contextCompression';
 import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
-import { frozenCompressionPolicy, frozenContextProfile, readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenCompressionPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import {
+  compressionOutputTokens,
+  estimateMaterializedContextTokens,
+  estimateMessageContentsTokens
+} from './contextTokenEstimator';
 import {
   ModelProviderControlPlane,
   modelRequestIdFor,
@@ -80,11 +85,7 @@ export class ReliableContextCompressionCoordinator {
     if (trigger === 'auto' && policy.triggerMode !== 'token_threshold') {
       return { status: 'skipped', reason: 'manual_only' };
     }
-    const [decision, materialized] = await Promise.all([
-      this.compression.evaluate(headRootId, authoritySnapshotId),
-      this.context.materializeStructure(headRootId)
-    ]);
-    if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
     if (trigger === 'auto' && !decision.shouldCompress) {
       return {
         status: 'skipped',
@@ -93,6 +94,13 @@ export class ReliableContextCompressionCoordinator {
         thresholdTokens: decision.thresholdTokens
       };
     }
+    // Materialize source structure/content only after the level-trigger passes. Below-threshold checks
+    // are the common path and should pay for one provider-aligned Context read, not three.
+    const [materialized, semanticMaterialized] = await Promise.all([
+      this.context.materializeStructure(headRootId),
+      this.context.materialize(headRootId)
+    ]);
+    if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
     const requestedSourceSegmentCount = command.compressSegmentCount === undefined
       ? selectCompressionPrefix(materialized.records, policy.preserveLatestMessages)
       : requirePrefixCount(command.compressSegmentCount, materialized.records.length);
@@ -144,18 +152,10 @@ export class ReliableContextCompressionCoordinator {
     }
     const completed = await this.modelProvider.completedEvent(expectedModelRequestId);
     const summary = compressionContents(completed.content);
-    const projectedTokens = estimateCompressedRootTokens(
-      summary,
-      materialized.records.slice(sourceSegmentCount),
-      frozenContextProfile(frozen.document).tokenEstimator.bytesPerToken,
-      {
-        trigger,
-        methodKind: policy.methodKind,
-        ...(policy.methodKind === 'openai_responses_compact'
-          ? { nativeBinding: policy.provider }
-          : {})
-      }
-    );
+    const summaryEstimatedTokens = compressionOutputTokens(completed.usage)
+      ?? estimateMessageContentsTokens(summary);
+    const projectedTokens = summaryEstimatedTokens
+      + estimateMaterializedContextTokens(semanticMaterialized.segments.slice(sourceSegmentCount));
     if (projectedTokens >= decision.estimatedTokens) {
       // A large protected tail can cross the threshold while the currently eligible prefix is
       // already compact.  The durable ModelRequest makes this decision exact-replayable for this
@@ -178,10 +178,12 @@ export class ReliableContextCompressionCoordinator {
       summaryMetadata: {
         trigger,
         methodKind: policy.methodKind,
+        estimatedTokens: summaryEstimatedTokens,
         ...(policy.methodKind === 'openai_responses_compact'
           ? { nativeBinding: policy.provider }
           : {})
       },
+      projectedEstimatedTokens: projectedTokens,
       enforceThreshold: trigger === 'auto',
       idempotencyKey: expectedModelRequestId
     });
@@ -291,34 +293,6 @@ function requirePrefixCount(value: number, total: number): number {
     throw new RangeError(`Compression prefix must be from 1 to ${Math.max(1, total)}.`);
   }
   return value;
-}
-
-function estimateCompressedRootTokens(
-  contents: readonly MessageContent[],
-  tail: readonly StructuralContextRecord[],
-  bytesPerToken: number,
-  metadata: {
-    trigger: CompressionTrigger;
-    methodKind: string;
-    nativeBinding?: { providerConfigId: string; provider: string; modelId: string };
-  }
-): number {
-  const summaryBytes = Buffer.byteLength(JSON.stringify({
-    kind: 'compression_contents',
-    version: 1,
-    contents,
-    trigger: metadata.trigger,
-    methodKind: metadata.methodKind,
-    ...(metadata.nativeBinding ? { nativeBinding: metadata.nativeBinding } : {})
-  }), 'utf8');
-  const tailBytes = tail.reduce((total, record) => {
-    const bytes = record.contentObject.byte_length;
-    if (typeof bytes !== 'bigint' || bytes < 0n || bytes > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new Error('Compression tail ContentObject byte length is invalid.');
-    }
-    return total + Number(bytes);
-  }, 0);
-  return Math.ceil(summaryBytes / bytesPerToken) + Math.ceil(tailBytes / bytesPerToken);
 }
 
 function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {

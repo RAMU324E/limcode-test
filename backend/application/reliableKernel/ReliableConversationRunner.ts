@@ -14,7 +14,8 @@ import type {
   TurnEditAndRunCommand,
   TurnInputCommand,
   TurnRetryCommand,
-  TurnRuntimeContinuationCommand
+  TurnRuntimeContinuationCommand,
+  ExecutionLeaseRenewalResult
 } from '../../reliableKernel/turnControlPlane';
 import {
   ExecutionHandoffError,
@@ -25,6 +26,7 @@ import {
 import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
 import type { CoordinateCompressionResult } from '../../reliableKernel/contextCompressionCoordinator';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
+import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnosticJournal';
 
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 const EXTERNAL_WAKE_POLL_MS = 500;
@@ -36,6 +38,7 @@ interface DriveSlot {
   completedGeneration: bigint;
   terminal: boolean;
   waitingExternalDataVersion?: string;
+  waitingWakeFingerprint?: string;
   maintenanceResult?: CoordinateCompressionResult;
   error?: unknown;
   task: Promise<void>;
@@ -74,6 +77,7 @@ interface WaitingOwnedTurn {
   conversationId: string;
   turnId: string;
   externalDataVersion: string;
+  wakeFingerprint: string;
 }
 
 interface DeferredRecoveryTurn {
@@ -134,7 +138,8 @@ export class ReliableConversationRunner {
     private readonly application: ReliableKernelApplication,
     private readonly leaseOwnerId: string,
     private readonly onError: ReliableConversationRunnerErrorHandler = defaultErrorHandler,
-    private readonly leaseDurationMs = DEFAULT_LEASE_DURATION_MS
+    private readonly leaseDurationMs = DEFAULT_LEASE_DURATION_MS,
+    private readonly diagnostics?: ReliableDiagnosticObserver
   ) {}
 
   public async input(input: {
@@ -654,9 +659,22 @@ export class ReliableConversationRunner {
           }
         }
         this.deferredRecovery.delete(slot.turnId);
-        const externalVersionBeforeDrive = await this.application.database.externalDataVersion();
+        const preflightRenewal = await this.renewExecutionLease(slot, fence, 'before_drive');
+        if (!preflightRenewal.renewed) {
+          // A waiting Turn can resume while its old lease still passes the fence read but has less
+          // lifetime than the first interval tick. Never start Provider/tool work on that stale
+          // authority: retain a level-triggered recovery fact and let the exact-row claim advance
+          // generation before re-drive.
+          this.deferExecutionRecovery(slot);
+          slot.error = new ExecutionHandoffError(
+            `ExecutionLease preflight renewal lost for Turn ${slot.turnId}: ${preflightRenewal.reason}.`
+          );
+          slot.terminal = true;
+          slot.completedGeneration = slot.requestedGeneration;
+          return;
+        }
         const renewal = this.startLeaseRenewal(slot, fence);
-        let result: { terminalStatus: string };
+        let result: { terminalStatus: string; waitingToolCallId?: string };
         try {
           result = await runWithExecutionLeaseFence(fence, async () => {
             const maintenance = await this.readManualCompressionDrive(slot);
@@ -673,18 +691,26 @@ export class ReliableConversationRunner {
         if (result.terminalStatus === 'waiting') {
           if (slot.requestedGeneration > generation) continue;
           if (!await this.ownsExecution(slot.turnId)) {
+            // The Turn is still durably active, but this process no longer owns its generation.
+            // Keep a level-triggered recovery candidate instead of silently abandoning it.
+            this.deferredRecovery.set(slot.turnId, {
+              conversationId: slot.conversationId,
+              turnId: slot.turnId
+            });
+            this.ensureExternalWakePolling();
             slot.terminal = true;
             slot.completedGeneration = slot.requestedGeneration;
             return;
           }
-          const externalVersionAfterDrive = await this.application.database.externalDataVersion();
-          if (externalVersionAfterDrive !== externalVersionBeforeDrive) {
-            // Closes the race where another Host commits the answer after this drive's last read
-            // but before the waiting slot becomes visible to the poller.
+          const observation = await this.observeWaitingWake(slot.turnId, result.waitingToolCallId);
+          if (observation.ready) {
+            // The answer/interrupt raced the Agent loop's final waiting read. Re-drive immediately;
+            // the Turn-scoped observation below proves this is a target-Turn fact, not global noise.
             slot.requestedGeneration += 1n;
             continue;
           }
-          slot.waitingExternalDataVersion = externalVersionAfterDrive;
+          slot.waitingExternalDataVersion = observation.externalDataVersion;
+          slot.waitingWakeFingerprint = observation.fingerprint;
           return;
         }
         // Terminal commits release ExecutionLease. Queue admission is a separate level-triggered
@@ -697,8 +723,10 @@ export class ReliableConversationRunner {
       } catch (error) {
         slot.completedGeneration = generation;
         if (isExecutionHandoffError(error)) {
-          // Ordinary callers observe handoff through durable state. manualCompression also awaits
-          // this concrete slot, so retain the handoff reason for that synchronous command boundary.
+          // A local handoff is not a durable terminal fact. Unless this Host itself is shutting
+          // down, preserve a level-triggered recovery candidate so an expired/replaced generation
+          // cannot orphan an active Turn and streaming ModelRequest until the next user command.
+          if (!this.disposed) this.deferExecutionRecovery(slot);
           slot.error = error;
           slot.terminal = true;
           return;
@@ -949,11 +977,17 @@ export class ReliableConversationRunner {
       this.scheduleDrive(slot.conversationId, slot.turnId);
       return;
     }
-    if (!this.disposed && !slot.terminal && slot.waitingExternalDataVersion !== undefined) {
+    if (
+      !this.disposed
+      && !slot.terminal
+      && slot.waitingExternalDataVersion !== undefined
+      && slot.waitingWakeFingerprint !== undefined
+    ) {
       this.waitingOwned.set(slot.turnId, {
         conversationId: slot.conversationId,
         turnId: slot.turnId,
-        externalDataVersion: slot.waitingExternalDataVersion
+        externalDataVersion: slot.waitingExternalDataVersion,
+        wakeFingerprint: slot.waitingWakeFingerprint
       });
       this.ensureExternalWakePolling();
     }
@@ -989,6 +1023,13 @@ export class ReliableConversationRunner {
         const version = await this.application.database.externalDataVersion();
         for (const waiting of [...this.waitingOwned.values()]) {
           if (waiting.externalDataVersion === version) continue;
+          const observation = await this.observeWaitingWake(waiting.turnId);
+          if (observation.fingerprint === waiting.wakeFingerprint) {
+            // SQLite data_version is database-global. A different Conversation/Turn committed;
+            // acknowledge that edge without replaying this durable human/process wait.
+            waiting.externalDataVersion = observation.externalDataVersion;
+            continue;
+          }
           this.waitingOwned.delete(waiting.turnId);
           this.scheduleDrive(waiting.conversationId, waiting.turnId);
         }
@@ -1020,6 +1061,77 @@ export class ReliableConversationRunner {
       this.externalWakePollInFlight = false;
       this.ensureExternalWakePolling();
     }
+  }
+
+  /**
+   * Turn-scoped level-trigger for a waiting Agent loop. SQLite data_version only tells us that some
+   * other connection committed; this fingerprint proves whether the target Turn's resumable facts
+   * changed. It intentionally excludes ExecutionLease renewals and unrelated Conversation rows.
+   */
+  private async observeWaitingWake(
+    turnId: string,
+    waitingToolCallId?: string
+  ): Promise<{ externalDataVersion: string; fingerprint: string; ready: boolean }> {
+    const before = await this.application.database.externalDataVersion();
+    const observation = await this.waitingWakeFingerprint(turnId, waitingToolCallId);
+    const after = await this.application.database.externalDataVersion();
+    // If another connection committed during the Turn-scoped read, retain the older edge. The next
+    // poll must then re-observe the target facts. This closes the publish race without spinning or
+    // starving behind a different Conversation that is continuously streaming commits.
+    return {
+      externalDataVersion: before === after ? after : before,
+      ...observation
+    };
+  }
+
+  private async waitingWakeFingerprint(
+    turnId: string,
+    waitingToolCallId?: string
+  ): Promise<{ fingerprint: string; ready: boolean }> {
+    const [turns, pendingInputs, toolCalls] = await Promise.all([
+      listAllDomainRows(this.application.database, 'Turn', { id: turnId }),
+      listAllDomainRows(this.application.database, 'PendingTurnInput', { turn_id: turnId }),
+      listAllDomainRows(this.application.database, 'ToolCall', { turn_id: turnId })
+    ]);
+    const waitingToolCalls = toolCalls
+      .filter((row) => row.status !== 'terminal')
+      .sort((left, right) => String(left.id).localeCompare(String(right.id)));
+    const [executionsByCall, operationsByCall] = await Promise.all([
+      Promise.all(waitingToolCalls.map((row) => listAllDomainRows(
+        this.application.database,
+        'ToolExecution',
+        { tool_call_id: requireId(row.id, 'ToolCall.id') }
+      ))),
+      Promise.all(waitingToolCalls.map((row) => listAllDomainRows(
+        this.application.database,
+        'Operation',
+        { tool_call_id: requireId(row.id, 'ToolCall.id') }
+      )))
+    ]);
+    const waitingToolCall = waitingToolCallId
+      ? toolCalls.find((row) => row.id === waitingToolCallId)
+      : undefined;
+    const ready = turns.some((row) => row.status !== 'active')
+      || pendingInputs.some((row) => row.state === 'pending')
+      || Boolean(waitingToolCallId && (!waitingToolCall || waitingToolCall.status === 'terminal'));
+    return {
+      ready,
+      fingerprint: JSON.stringify({
+        turn: turns.map((row) => [String(row.id), String(row.status)]).sort(),
+        pendingInputs: pendingInputs.map((row) => [
+          String(row.id), String(row.position), String(row.input_kind), String(row.state)
+        ]).sort((left, right) => left.join('\u0000').localeCompare(right.join('\u0000'))),
+        waitingToolCalls: waitingToolCalls.map((row) => [
+          String(row.id), String(row.status)
+        ]),
+        waitingToolExecutions: executionsByCall.flat().map((row) => [
+          String(row.id), String(row.tool_call_id), String(row.status)
+        ]).sort((left, right) => left.join('\u0000').localeCompare(right.join('\u0000'))),
+        waitingOperations: operationsByCall.flat().map((row) => [
+          String(row.id), String(row.tool_call_id), String(row.status)
+        ]).sort((left, right) => left.join('\u0000').localeCompare(right.join('\u0000')))
+      })
+    };
   }
 
   /**
@@ -1125,6 +1237,84 @@ export class ReliableConversationRunner {
     if (rejected) this.onError(rejected.reason, { operation: 'drive', conversationId, turnId });
   }
 
+  private deferExecutionRecovery(slot: Pick<DriveSlot, 'conversationId' | 'turnId'>): void {
+    if (this.disposed) return;
+    this.waitingOwned.delete(slot.turnId);
+    this.deferredRecovery.set(slot.turnId, {
+      conversationId: slot.conversationId,
+      turnId: slot.turnId
+    });
+    this.ensureExternalWakePolling();
+  }
+
+  private async renewExecutionLease(
+    slot: Pick<DriveSlot, 'conversationId' | 'turnId'>,
+    fence: ExecutionLeaseFence,
+    stage: 'before_drive' | 'interval'
+  ): Promise<ExecutionLeaseRenewalResult> {
+    const observedAt = Date.now();
+    const requestedExpiresAt = new Date(observedAt + this.leaseDurationMs).toISOString();
+    try {
+      const result = await this.application.turns.renewExecutionLeaseDetailed({
+        fence,
+        leaseExpiresAt: requestedExpiresAt
+      });
+      this.observeLeaseRenewal(slot, fence, stage, observedAt, result);
+      return result;
+    } catch (error) {
+      this.deferExecutionRecovery(slot);
+      this.diagnostics?.observe({
+        eventKind: 'execution_lease_renewal',
+        scopeKind: 'turn',
+        scopeId: slot.turnId,
+        correlationId: fence.id,
+        metadata: {
+          conversationId: slot.conversationId,
+          turnId: slot.turnId,
+          hostBootId: fence.hostBootId,
+          stage,
+          status: 'failed',
+          leaseGeneration: fence.generation.toString(),
+          leaseExpiresAt: requestedExpiresAt,
+          renewalReason: 'exception',
+          errorName: error instanceof Error ? error.name : 'unknown'
+        }
+      });
+      throw error;
+    }
+  }
+
+  private observeLeaseRenewal(
+    slot: Pick<DriveSlot, 'conversationId' | 'turnId'>,
+    fence: ExecutionLeaseFence,
+    stage: 'before_drive' | 'interval',
+    observedAt: number,
+    result: ExecutionLeaseRenewalResult
+  ): void {
+    const leaseExpiresAt = result.renewed
+      ? result.renewedExpiresAt
+      : result.observedExpiresAt;
+    this.diagnostics?.observe({
+      eventKind: 'execution_lease_renewal',
+      scopeKind: 'turn',
+      scopeId: slot.turnId,
+      correlationId: fence.id,
+      metadata: {
+        conversationId: slot.conversationId,
+        turnId: slot.turnId,
+        hostBootId: fence.hostBootId,
+        stage,
+        status: result.renewed ? 'renewed' : 'lost',
+        leaseGeneration: fence.generation.toString(),
+        ...(leaseExpiresAt ? {
+          leaseExpiresAt,
+          remainingMs: Date.parse(leaseExpiresAt) - observedAt
+        } : {}),
+        ...(!result.renewed ? { renewalReason: result.reason } : {})
+      }
+    });
+  }
+
   private startLeaseRenewal(slot: DriveSlot, fence: ExecutionLeaseFence): {
     stop(): Promise<void>;
   } {
@@ -1134,17 +1324,17 @@ export class ReliableConversationRunner {
     const timer = setInterval(() => {
       renewal = renewal.then(async () => {
         if (stopped || this.disposed) return;
-        const renewed = await this.application.turns.renewExecutionLease({
-          fence,
-          leaseExpiresAt: new Date(Date.now() + this.leaseDurationMs).toISOString()
-        });
-        if (renewed) return;
+        const result = await this.renewExecutionLease(slot, fence, 'interval');
+        if (result.renewed) return;
         stopped = true;
         clearInterval(timer);
+        this.deferExecutionRecovery(slot);
         await this.quiesceLocalExecution(
           slot.conversationId,
           slot.turnId,
-          new ExecutionHandoffError(`ExecutionLease generation was replaced for Turn ${slot.turnId}.`)
+          new ExecutionHandoffError(
+            `ExecutionLease renewal lost for Turn ${slot.turnId}: ${result.reason}.`
+          )
         );
       }).catch(async (error) => {
         stopped = true;
@@ -1154,6 +1344,7 @@ export class ReliableConversationRunner {
           conversationId: slot.conversationId,
           turnId: slot.turnId
         });
+        this.deferExecutionRecovery(slot);
         await this.quiesceLocalExecution(
           slot.conversationId,
           slot.turnId,

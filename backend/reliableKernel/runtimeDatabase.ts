@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { Worker } from 'node:worker_threads';
 import {
   ROOT_BINDING_POINTER_FILE,
@@ -12,6 +13,8 @@ import {
 import type {
   ClientKeysetPageInput,
   ClientKeysetPageResult,
+  ClientVisibleMessageHistoryPageInput,
+  ClientVisibleMessageHistoryPageResult,
   ConversationHistoryProjectionInput,
   ConversationHistoryProjectionResult,
   ClientProjectionSnapshot,
@@ -30,7 +33,8 @@ import type {
   ProcessOutputRegistrationMismatch,
   DatabaseWorkerRequestPayload,
   DatabaseWorkerResponse,
-  SerializedWorkerError
+  SerializedWorkerError,
+  ToolFactsSnapshot
 } from './databaseWorkerProtocol';
 import {
   DOMAIN_REPOSITORIES,
@@ -46,6 +50,12 @@ import {
   executionLeaseFenceAssertion,
   type ExecutionLeaseFence
 } from './executionLeaseFence';
+import {
+  recordRuntimePerformanceMetric,
+  type RuntimeDatabaseMetricRequestKind,
+  type RuntimePerformanceMetricEvent,
+  type RuntimePerformanceMetricsSink
+} from './runtimePerformanceMetrics';
 
 export interface SnapshotSubscription<T> {
   barrier: SnapshotBarrier<T>;
@@ -86,8 +96,16 @@ export class RuntimeDatabase {
   private readonly pending = new Map<number, {
     resolve(value: unknown): void;
     reject(error: unknown): void;
+    requestKind: RuntimeDatabaseMetricRequestKind;
+    startedAtMs?: number;
   }>();
   private readonly commitListeners = new Set<(result: RuntimeCommitResult) => void>();
+  private readonly performanceMetricSinks = new Set<RuntimePerformanceMetricsSink>();
+  private readonly performanceMetricFanout: RuntimePerformanceMetricsSink = {
+    record: (event) => {
+      for (const sink of this.performanceMetricSinks) recordRuntimePerformanceMetric(sink, event);
+    }
+  };
   private nextRequestId = 1;
   private closed = false;
   private readonly livenessId = randomUUID();
@@ -103,8 +121,10 @@ export class RuntimeDatabase {
     public readonly hostBootId: string,
     private readonly worker: Worker,
     public readonly workerThreadId: number,
-    private readonly registryKey: string
+    private readonly registryKey: string,
+    initialPerformanceMetrics?: RuntimePerformanceMetricsSink
   ) {
+    if (initialPerformanceMetrics) this.performanceMetricSinks.add(initialPerformanceMetrics);
     worker.on('message', (message: DatabaseWorkerResponse) => this.onMessage(message));
     worker.on('error', (error) => this.failPending(error));
     worker.on('exit', (code) => {
@@ -117,7 +137,7 @@ export class RuntimeDatabase {
 
   public static async open(
     authority: RootAuthority,
-    options: { hostBootId?: string } = {}
+    options: { hostBootId?: string; performanceMetrics?: RuntimePerformanceMetricsSink } = {}
   ): Promise<RuntimeDatabase> {
     const binding = await authority.current();
     const hostBootId = options.hostBootId ?? randomUUID();
@@ -129,7 +149,15 @@ export class RuntimeDatabase {
     const worker = createWorker({ mode: 'runtime', binding, hostBootId });
     try {
       const ready = await waitForReady(worker, 'runtime');
-      const database = new RuntimeDatabase(authority, binding, hostBootId, worker, ready.workerThreadId, registryKey);
+      const database = new RuntimeDatabase(
+        authority,
+        binding,
+        hostBootId,
+        worker,
+        ready.workerThreadId,
+        registryKey,
+        options.performanceMetrics
+      );
       await database.registerHostLiveness();
       return database;
     } catch (error) {
@@ -165,6 +193,14 @@ export class RuntimeDatabase {
   /** Reads every page of one repository list inside one SQLite read transaction. */
   public async snapshotAll(read: RepositoryListRead): Promise<SnapshotBarrier<DomainRow[]>> {
     return this.request<SnapshotBarrier<DomainRow[]>>({ kind: 'snapshotAll', read });
+  }
+
+  /** Fixed dependent Tool facts resolved inside one worker read transaction. */
+  public async toolFactsSnapshot(toolCallId: string): Promise<SnapshotBarrier<ToolFactsSnapshot>> {
+    if (typeof toolCallId !== 'string' || toolCallId.length === 0) {
+      throw new TypeError('toolCallId must be non-empty.');
+    }
+    return this.request<SnapshotBarrier<ToolFactsSnapshot>>({ kind: 'toolFactsSnapshot', toolCallId });
   }
 
   /** DB-side aggregate: returns only terminal processes whose registered chunk facts are incomplete. */
@@ -226,6 +262,15 @@ export class RuntimeDatabase {
     return this.request<ClientKeysetPageResult>({ kind: 'clientKeysetPage', input });
   }
 
+  public async clientVisibleMessageHistoryPage(
+    input: ClientVisibleMessageHistoryPageInput
+  ): Promise<ClientVisibleMessageHistoryPageResult> {
+    return this.request<ClientVisibleMessageHistoryPageResult>({
+      kind: 'clientVisibleMessageHistoryPage',
+      input
+    });
+  }
+
   public async conversationHistoryProjection(
     input: ConversationHistoryProjectionInput
   ): Promise<ConversationHistoryProjectionResult> {
@@ -252,7 +297,7 @@ export class RuntimeDatabase {
   public async isHostAlive(hostBootIdInput: string): Promise<boolean> {
     const hostBootId = requireNonEmptyText(hostBootIdInput, 'hostBootId');
     if (hostBootId === this.hostBootId) return !this.closed && this.heartbeatFailure === undefined;
-    await this.authority.validate(this.binding);
+    await this.validateBinding('host_liveness');
     const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
     if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
     const processState = inspectRecordedProcess(record);
@@ -265,6 +310,22 @@ export class RuntimeDatabase {
   public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
     this.commitListeners.add(listener);
     return () => this.commitListeners.delete(listener);
+  }
+
+  /** Present only while an explicitly attached development observer exists. */
+  public get performanceMetrics(): RuntimePerformanceMetricsSink | undefined {
+    return this.performanceMetricSinks.size > 0 ? this.performanceMetricFanout : undefined;
+  }
+
+  /** Allows a focused benchmark to observe an Application-owned database after it has opened. */
+  public attachPerformanceMetrics(sink: RuntimePerformanceMetricsSink): () => void {
+    this.performanceMetricSinks.add(sink);
+    return () => this.performanceMetricSinks.delete(sink);
+  }
+
+  /** Metadata-only hook shared by control planes that already receive this database instance. */
+  public recordPerformanceMetric(event: RuntimePerformanceMetricEvent): void {
+    recordRuntimePerformanceMetric(this.performanceMetrics, event);
   }
 
   private async barrierAndSubscribe<T>(
@@ -386,6 +447,7 @@ export class RuntimeDatabase {
       this.commitListeners.clear();
       await this.worker.terminate();
       await this.unregisterHostLiveness().catch(() => undefined);
+      this.performanceMetricSinks.clear();
     }
   }
 
@@ -398,8 +460,37 @@ export class RuntimeDatabase {
       error.cause = this.heartbeatFailure;
       throw error;
     }
-    await this.authority.validate(this.binding);
+    await this.validateBinding(databaseMetricRequestKind(request.kind));
     return this.sendRequest<T>(request);
+  }
+
+  private async validateBinding(
+    requestKind: RuntimeDatabaseMetricRequestKind | 'host_liveness'
+  ): Promise<RootBinding> {
+    const metrics = this.performanceMetrics;
+    const startedAtMs = metrics ? performance.now() : undefined;
+    try {
+      const binding = await this.authority.validate(this.binding);
+      if (metrics && startedAtMs !== undefined) {
+        recordRuntimePerformanceMetric(metrics, {
+          kind: 'database.root_validate',
+          requestKind,
+          durationMs: performance.now() - startedAtMs,
+          outcome: 'ok'
+        });
+      }
+      return binding;
+    } catch (error) {
+      if (metrics && startedAtMs !== undefined) {
+        recordRuntimePerformanceMetric(metrics, {
+          kind: 'database.root_validate',
+          requestKind,
+          durationMs: performance.now() - startedAtMs,
+          outcome: 'error'
+        });
+      }
+      throw error;
+    }
   }
 
   private async registerHostLiveness(): Promise<void> {
@@ -465,18 +556,47 @@ export class RuntimeDatabase {
   private sendRequest<T>(request: DatabaseWorkerRequestPayload): Promise<T> {
     if (this.closed) return Promise.reject(new Error('RuntimeDatabase is closed.'));
     const id = this.nextRequestId++;
+    const metrics = this.performanceMetrics;
+    const startedAtMs = metrics ? performance.now() : undefined;
+    const requestKind = databaseMetricRequestKind(request.kind);
+    if (metrics) {
+      recordRuntimePerformanceMetric(metrics, {
+        kind: 'database.request',
+        phase: 'started',
+        requestKind
+      });
+    }
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),
-        reject
+        reject,
+        requestKind,
+        ...(startedAtMs !== undefined ? { startedAtMs } : {})
       });
-      this.worker.postMessage({ ...request, id } as DatabaseWorkerRequest);
+      this.worker.postMessage({
+        ...request,
+        id,
+        ...(startedAtMs !== undefined ? { metricEnqueuedAtMs: performance.now() } : {})
+      } as DatabaseWorkerRequest);
     });
   }
 
   private onMessage(message: DatabaseWorkerResponse): void {
     if (message.type === 'commit') {
-      for (const listener of this.commitListeners) listener(message.result);
+      const metrics = this.performanceMetrics;
+      const startedAtMs = metrics ? performance.now() : undefined;
+      const listenerCount = this.commitListeners.size;
+      try {
+        for (const listener of this.commitListeners) listener(message.result);
+      } finally {
+        if (metrics && startedAtMs !== undefined) {
+          recordRuntimePerformanceMetric(metrics, {
+            kind: 'database.commit_listeners',
+            listenerCount,
+            durationMs: performance.now() - startedAtMs
+          });
+        }
+      }
       return;
     }
     if (message.type === 'fatal') {
@@ -487,12 +607,38 @@ export class RuntimeDatabase {
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
+    const metrics = this.performanceMetrics;
+    if (metrics && pending.startedAtMs !== undefined) {
+      recordRuntimePerformanceMetric(metrics, {
+        kind: 'database.request',
+        phase: 'finished',
+        requestKind: pending.requestKind,
+        outcome: message.ok ? 'ok' : 'error',
+        roundTripDurationMs: performance.now() - pending.startedAtMs,
+        ...(message.timing ? {
+          workerQueueWaitMs: message.timing.queueWaitMs,
+          workerExecuteDurationMs: message.timing.executeDurationMs
+        } : {})
+      });
+    }
     if (message.ok) pending.resolve(message.result);
     else pending.reject(new RuntimeDatabaseWorkerError(message.error));
   }
 
   private failPending(error: unknown): void {
-    for (const pending of this.pending.values()) pending.reject(error);
+    const metrics = this.performanceMetrics;
+    for (const pending of this.pending.values()) {
+      if (metrics && pending.startedAtMs !== undefined) {
+        recordRuntimePerformanceMetric(metrics, {
+          kind: 'database.request',
+          phase: 'finished',
+          requestKind: pending.requestKind,
+          outcome: 'error',
+          roundTripDurationMs: performance.now() - pending.startedAtMs
+        });
+      }
+      pending.reject(error);
+    }
     this.pending.clear();
   }
 }
@@ -574,6 +720,13 @@ function waitForReady(
 
 function isRuntimeTransactionAssertionError(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
+}
+
+function databaseMetricRequestKind(
+  kind: DatabaseWorkerRequestPayload['kind']
+): RuntimeDatabaseMetricRequestKind {
+  // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
+  return kind === 'clientVisibleMessageHistoryPage' ? 'clientKeysetPage' : kind;
 }
 
 async function readHostLiveness(filePath: string): Promise<RuntimeHostLivenessRecord | undefined> {

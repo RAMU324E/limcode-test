@@ -1,9 +1,11 @@
 import {
   ContentAddressedStore,
+  type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import { conversationProjectLinkInsertStep } from './conversationProject';
 import {
   assertChildExecutionTransition,
@@ -315,7 +317,8 @@ export class ChildExecutionControlPlane {
       conversationId: ids.childConversationId,
       messageRevisionId: ids.childMessageRevisionId,
       contentObjectId: promptContent.metadata.id,
-      contentByteLength: promptContent.metadata.byte_length
+      contentByteLength: promptContent.metadata.byte_length,
+      contentEstimatedTokens: estimateStoredMessageContentTokens(command.prompt, 'text/plain')
     });
     const now = this.timestamp();
     const steps: RepositoryTransactionStep[] = [
@@ -1216,13 +1219,20 @@ export class ChildExecutionControlPlane {
     const messageContentObject = await this.requireExisting('ContentObject', messageContentObjectId);
     const invisibleRuntimeDelivery = messageContentObject.content_type
       === RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE;
+    const messageEstimatedTokens = invisibleRuntimeDelivery
+      ? undefined
+      : estimateStoredMessageContentTokens(
+          await this.contentStore.read(messageContentObject as ContentObjectMetadata),
+          requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type')
+        );
     const messageContext = invisibleRuntimeDelivery
       ? null
       : await this.contextSequence.prepareMessageAppendMutation({
           conversationId: requirePhaseFId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
           messageRevisionId: ids.messageRevisionId,
           contentObjectId: messageContentObjectId,
-          contentByteLength: requireBigInt(messageContentObject.byte_length, 'ContentObject.byte_length')
+          contentByteLength: requireBigInt(messageContentObject.byte_length, 'ContentObject.byte_length'),
+          contentEstimatedTokens: messageEstimatedTokens
         });
     const now = this.timestamp();
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps

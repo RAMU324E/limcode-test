@@ -17,7 +17,8 @@ import {
   type MessageEditPayload,
   type MessageRetryFromPayload,
   type MessageRetryTarget,
-  type TurnAuthoritySelection
+  type TurnAuthoritySelection,
+  type TurnInputResultPayload
 } from '@shared/protocol';
 
 let reliableCommandSequence = 0;
@@ -36,7 +37,7 @@ interface InterruptState {
 }
 
 type ConversationActionKind = 'edit' | 'retry' | 'delete' | 'compress';
-type ConversationActionPhase = 'waiting_for_idle' | 'requesting_stop' | 'stopping' | 'submitting';
+type ConversationActionPhase = 'waiting_for_idle' | 'requesting_stop' | 'stopping' | 'submitting' | 'running';
 type ConversationActionPayload =
   | { type: BridgeMessageType.MessageEdit; payload: MessageEditPayload }
   | { type: BridgeMessageType.MessageRetryFrom; payload: MessageRetryFromPayload }
@@ -76,6 +77,23 @@ interface ForkRequestState {
   sentSessionId?: string;
 }
 
+export interface PendingTurnInputSubmission {
+  commandId: string;
+  requestId: string;
+  conversationId: string;
+  requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue;
+  text: string;
+  content?: MessageContent;
+  authority: TurnAuthoritySelection;
+  submittedAt: number;
+  result?: TurnInputResultPayload;
+}
+
+export interface FailedTurnInputSubmission extends PendingTurnInputSubmission {
+  failedAt: number;
+  message: string;
+}
+
 interface PersistedConversationControls {
   interrupt?: InterruptState;
   conversationActions: Record<string, ConversationActionState>;
@@ -87,6 +105,34 @@ const interruptState = ref<InterruptState | undefined>(restored.interrupt);
 const conversationActionStates = ref<Record<string, ConversationActionState>>(restored.conversationActions);
 const forkRequests = ref<Record<string, ForkRequestState>>(restored.forkRequests);
 const actionNotices = ref<Record<string, string>>({});
+const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>({});
+const failedTurnInputSubmissions = ref<Record<string, FailedTurnInputSubmission>>({});
+const turnInputAcknowledgements = ref<Record<string, TurnInputResultPayload>>({});
+
+bridge.on(BridgeMessageType.TurnInputResult, (message) => {
+  const payload = message.payload;
+  if (!payload) return;
+  const pending = pendingTurnInputSubmissions.value[payload.commandId];
+  if (
+    !pending
+    || pending.requestId !== message.correlationId
+    || pending.conversationId !== payload.conversationId
+    || pending.requestType !== payload.requestType
+  ) return;
+  if (payload.status === 'rejected') {
+    failTurnInputSubmission(pending, payload.message || '消息未能可靠入队，请重试。');
+    return;
+  }
+  turnInputAcknowledgements.value = {
+    ...turnInputAcknowledgements.value,
+    [payload.commandId]: payload
+  };
+  pendingTurnInputSubmissions.value = {
+    ...pendingTurnInputSubmissions.value,
+    [payload.commandId]: { ...pending, result: payload }
+  };
+  clearTurnInputFailure(payload.commandId);
+});
 
 bridge.on(BridgeMessageType.TurnInterruptResult, (message) => {
   const payload = message.payload;
@@ -144,6 +190,17 @@ bridge.on(BridgeMessageType.ConversationActionResult, (message) => {
       blockedAtCommitSeq: action.submittedAtCommitSeq
     });
     setActionNotice(payload.conversationId, '检测到排队中的回合；将在其精确停止后继续当前操作。');
+    return;
+  }
+  if (action.action === 'retry' && payload.turnId) {
+    setConversationAction({
+      ...action,
+      phase: 'running',
+      requestId: undefined,
+      interrupt: undefined,
+      operationTurnId: payload.turnId
+    });
+    clearActionNotice(payload.conversationId);
     return;
   }
   clearConversationAction(payload.conversationId);
@@ -206,6 +263,16 @@ bridge.on(BridgeMessageType.ConversationForkResult, (message) => {
 
 bridge.on(BridgeMessageType.Error, (message) => {
   const requestType = message.payload?.requestType;
+  if (requestType === BridgeMessageType.TurnStart || requestType === BridgeMessageType.TurnEnqueue) {
+    const pending = Object.values(pendingTurnInputSubmissions.value).find((candidate) =>
+      candidate.requestId === message.correlationId && candidate.requestType === requestType
+    );
+    if (pending) failTurnInputSubmission(
+      pending,
+      message.payload?.message || '消息提交失败，草稿已恢复。'
+    );
+    return;
+  }
   if (requestType === BridgeMessageType.TurnInterrupt) {
     const pending = interruptState.value;
     if (pending?.requestId && pending.requestId === message.correlationId) setInterruptState(undefined);
@@ -258,6 +325,55 @@ bridge.on(BridgeMessageType.Error, (message) => {
     );
   }
 });
+
+function failTurnInputSubmission(pending: PendingTurnInputSubmission, message: string): void {
+  const nextPending = { ...pendingTurnInputSubmissions.value };
+  delete nextPending[pending.commandId];
+  pendingTurnInputSubmissions.value = nextPending;
+  const nextAcknowledgements = { ...turnInputAcknowledgements.value };
+  delete nextAcknowledgements[pending.commandId];
+  turnInputAcknowledgements.value = nextAcknowledgements;
+  failedTurnInputSubmissions.value = {
+    ...failedTurnInputSubmissions.value,
+    [pending.commandId]: {
+      ...pending,
+      failedAt: Date.now(),
+      message
+    }
+  };
+  setActionNotice(pending.conversationId, message);
+}
+
+function clearTurnInputFailuresForConversation(conversationId: string): void {
+  const next = Object.fromEntries(Object.entries(failedTurnInputSubmissions.value)
+    .filter(([, failure]) => failure.conversationId !== conversationId));
+  if (Object.keys(next).length !== Object.keys(failedTurnInputSubmissions.value).length) {
+    failedTurnInputSubmissions.value = next;
+  }
+}
+
+function clearTurnInputFailure(commandId: string): void {
+  if (!failedTurnInputSubmissions.value[commandId]) return;
+  const next = { ...failedTurnInputSubmissions.value };
+  delete next[commandId];
+  failedTurnInputSubmissions.value = next;
+}
+
+function reconcileTurnInputSubmissions(records: Record<string, Record<string, Record<string, unknown>>>): void {
+  let changed = false;
+  const next = { ...pendingTurnInputSubmissions.value };
+  for (const pending of Object.values(next)) {
+    const result = pending.result;
+    if (!result) continue;
+    const observed = result.admitted
+      ? Boolean(result.turnId && records.Turn?.[result.turnId])
+      : Boolean(result.intentId && records.TurnIntent?.[result.intentId]);
+    if (!observed) continue;
+    delete next[pending.commandId];
+    changed = true;
+  }
+  if (changed) pendingTurnInputSubmissions.value = next;
+}
 
 function setInterruptState(next: InterruptState | undefined): void {
   interruptState.value = next;
@@ -340,6 +456,17 @@ export function useChat() {
   const conversationActionLabel = computed(() => currentConversationAction.value?.label);
   const compressionPending = computed(() => currentConversationAction.value?.action === 'compress');
   const conversationActionNotice = computed(() => actionNotices.value[reliableConversation.conversationId.value]);
+  const currentPendingTurnInputs = computed(() => Object.values(pendingTurnInputSubmissions.value)
+    .filter((submission) => submission.conversationId === reliableConversation.conversationId.value)
+    .sort((left, right) => left.submittedAt - right.submittedAt || left.commandId.localeCompare(right.commandId)));
+  const currentTurnInputAcknowledgements = computed(() => Object.fromEntries(
+    Object.entries(turnInputAcknowledgements.value).filter(([, result]) =>
+      result.conversationId === reliableConversation.conversationId.value
+    )
+  ));
+  const currentTurnInputFailure = computed(() => Object.values(failedTurnInputSubmissions.value)
+    .filter((submission) => submission.conversationId === reliableConversation.conversationId.value)
+    .sort((left, right) => right.failedAt - left.failedAt || right.commandId.localeCompare(left.commandId))[0]);
   const forkPendingTargetIds = computed(() => new Set(Object.values(forkRequests.value)
     .filter((request) => request.sourceConversationId === reliableConversation.conversationId.value && request.requestId)
     .map((request) => request.messageId)));
@@ -349,6 +476,9 @@ export function useChat() {
     if (!sessionId) return;
     reconcileStandaloneInterrupt();
     reconcileConversationAction();
+    reconcileTurnInputSubmissions(
+      reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
+    );
     replayForkRequestsForSession(sessionId);
   });
 
@@ -374,20 +504,56 @@ export function useChat() {
     return Number.isSafeInteger(generation) && generation > 0 ? generation : undefined;
   }
 
-  function sendMessage(text: string, content?: MessageContent, authority: TurnAuthoritySelection = {}): boolean {
+  function sendMessage(
+    text: string,
+    content?: MessageContent,
+    authority: TurnAuthoritySelection = {}
+  ): PendingTurnInputSubmission | undefined {
     const conversationId = activeConversationId();
     const trimmed = text.trim();
-    if ((!trimmed && !content?.parts?.length) || !conversationId) return false;
+    if ((!trimmed && !content?.parts?.length) || !conversationId) return undefined;
+    clearTurnInputFailuresForConversation(conversationId);
+    clearActionNotice(conversationId);
+    const command = nextReliableCommandMetadata();
+    const requestType = activeTurnId(conversationId)
+      ? BridgeMessageType.TurnEnqueue
+      : BridgeMessageType.TurnStart;
+    const frozenContent = content ? structuredClone(content) : undefined;
+    const frozenAuthority = structuredClone(authority);
     const payload = {
       conversationId,
       text: trimmed,
-      ...(content?.parts?.length ? { content } : {}),
-      ...(authority.agentId?.trim() ? { agentId: authority.agentId.trim() } : {}),
-      ...(authority.model ? { model: { ...authority.model } } : {}),
-      command: nextReliableCommandMetadata()
+      ...(frozenContent?.parts?.length ? { content: frozenContent } : {}),
+      ...(frozenAuthority.agentId?.trim() ? { agentId: frozenAuthority.agentId.trim() } : {}),
+      ...(frozenAuthority.model ? { model: { ...frozenAuthority.model } } : {}),
+      command
     };
-    bridge.request(activeTurnId(conversationId) ? BridgeMessageType.TurnEnqueue : BridgeMessageType.TurnStart, payload);
-    return true;
+    const requestId = command.commandId;
+    const submission: PendingTurnInputSubmission = {
+      commandId: command.commandId,
+      requestId,
+      conversationId,
+      requestType,
+      text: trimmed,
+      ...(frozenContent ? { content: frozenContent } : {}),
+      authority: frozenAuthority,
+      submittedAt: Date.now()
+    };
+    // Register the optimistic/restore authority before posting. A synchronous test bridge or a
+    // future in-process transport must not be able to return the ACK before correlation exists.
+    pendingTurnInputSubmissions.value = {
+      ...pendingTurnInputSubmissions.value,
+      [submission.commandId]: submission
+    };
+    try {
+      bridge.request(requestType, payload, { requestId });
+    } catch (error) {
+      failTurnInputSubmission(
+        submission,
+        error instanceof Error ? error.message : '消息提交失败，草稿已保留。'
+      );
+    }
+    return submission;
   }
 
   function editMessage(
@@ -428,7 +594,8 @@ export function useChat() {
     conversationId: string,
     target: MessageRetryTarget,
     authority: TurnAuthoritySelection = currentAuthoritySelection(),
-    expectedRevisionId?: string
+    expectedRevisionId?: string,
+    displayNumber?: number
   ): boolean {
     const targetId = retryTargetId(target);
     const revisionId = expectedRevisionId?.trim();
@@ -448,7 +615,9 @@ export function useChat() {
       conversationId,
       action: 'retry',
       targetId,
-      label: '正在停止后重试',
+      label: Number.isSafeInteger(displayNumber) && displayNumber! > 0
+        ? `正在从 #${displayNumber} 创建重试回合`
+        : '正在创建新的重试回合',
       phase: 'waiting_for_idle',
       commandPayload: { type: BridgeMessageType.MessageRetryFrom, payload }
     });
@@ -589,6 +758,17 @@ export function useChat() {
     const conversationId = reliableConversation.conversationId.value;
     let action = conversationActionStates.value[conversationId];
     if (!action) return;
+
+    if (action.phase === 'running') {
+      if (
+        action.operationTurnId
+        && interruptTargetHasSettled(reliableConversation.feed.records, action.operationTurnId)
+      ) {
+        clearConversationAction(conversationId);
+        clearActionNotice(conversationId);
+      }
+      return;
+    }
 
     if (action.phase === 'submitting') {
       const sessionChanged = action.sentSessionId !== reliableConversation.feed.sessionId;
@@ -762,6 +942,17 @@ export function useChat() {
     }
   }
 
+  function dismissTurnInputAcknowledgement(commandId: string): void {
+    if (!turnInputAcknowledgements.value[commandId]) return;
+    const next = { ...turnInputAcknowledgements.value };
+    delete next[commandId];
+    turnInputAcknowledgements.value = next;
+  }
+
+  function dismissTurnInputFailure(commandId: string): void {
+    clearTurnInputFailure(commandId);
+  }
+
   return {
     sendMessage,
     editMessage,
@@ -778,6 +969,11 @@ export function useChat() {
     conversationActionPending,
     conversationActionLabel,
     conversationActionNotice,
+    currentPendingTurnInputs,
+    currentTurnInputAcknowledgements,
+    currentTurnInputFailure,
+    dismissTurnInputAcknowledgement,
+    dismissTurnInputFailure,
     forkPendingTargetIds
   };
 }

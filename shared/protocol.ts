@@ -55,6 +55,7 @@ export enum BridgeMessageType {
   InteractionResult = 'interaction.result',
   TurnStart = 'turn.start',
   TurnEnqueue = 'turn.enqueue',
+  TurnInputResult = 'turn.input.result',
   TurnInterrupt = 'turn.interrupt',
   TurnInterruptResult = 'turn.interrupt.result',
   InteractionResolve = 'interaction.resolve',
@@ -517,6 +518,8 @@ export type LlmCompressionThresholdUnit = 'percent' | 'tokens';
 export const DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 200_000;
 export const DEFAULT_LLM_RETRY_ON_ERROR = true;
 export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 3;
+/** Reliable Runtime hard ceiling for automatic Provider retries (excluding the original attempt). */
+export const MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS = 10;
 export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
 export const DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT = 90;
 export const DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS = 20_000;
@@ -1638,7 +1641,7 @@ export interface ToolCallPreviewRecord {
    * producer has already scanned the argument prefix; consumers must not rescan it from byte zero.
    */
   argumentPreviewFields?: Partial<Record<
-    'path' | 'content' | 'plan' | 'command' | 'explanation',
+    'path' | 'content' | 'plan' | 'command' | 'explanation' | 'oldContent' | 'newContent',
     { value: string; closed: boolean }
   >>;
   createdAt: number;
@@ -2274,6 +2277,19 @@ export interface TurnEnqueuePayload extends TurnAuthoritySelection {
   content?: MessageContent;
 }
 
+export interface TurnInputResultPayload {
+  commandId: string;
+  conversationId: string;
+  requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue;
+  status: 'accepted' | 'queued' | 'replayed' | 'rejected';
+  admitted: boolean;
+  deduplicated: boolean;
+  intentId?: string;
+  turnId?: string;
+  commitSeq?: string;
+  message?: string;
+}
+
 export interface TurnInterruptPayload {
   conversationId: string;
   command: ConversationCommandMetadata;
@@ -2782,6 +2798,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
   | BridgeEnvelope<BridgeMessageType.Error, { requestType?: string; message: string }>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnInputResult, TurnInputResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationActionResult, ConversationActionResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationForkResult, ConversationForkResultPayload>

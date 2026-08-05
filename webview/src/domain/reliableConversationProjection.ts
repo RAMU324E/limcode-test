@@ -53,6 +53,7 @@ export interface ReliableInteractionProjection {
 
 export interface ReliableConversationProjection {
   messages: MessageRecord[];
+  absoluteFloorByMessageId: Record<string, number>;
   toolCalls: ToolCallRecord[];
   toolCallsByMessageId: Record<string, ToolCallRecord[]>;
   toolCallEvents: ToolCallEventRecord[];
@@ -171,6 +172,7 @@ export function projectReliableConversation(
     lastCommitSeq: input.lastCommitSeq ?? undefined
   });
   parsedMessages.sort(compareParsedMessages);
+  const absoluteFloorByMessageId = projectAbsoluteMessageFloors(parsedMessages);
 
   const callsByTurn = groupBy(values(input.records.ToolCall), (record) => text(record.turn_id));
   const interactionProjection = projectReliableInteractions(input.records, input.details);
@@ -266,6 +268,7 @@ export function projectReliableConversation(
     .map(([toolCallId, events]) => [toolCallId, events.map((event) => event.id)]));
   return {
     messages: parsedMessages.map((entry) => entry.message),
+    absoluteFloorByMessageId,
     toolCalls,
     toolCallsByMessageId,
     toolCallEvents,
@@ -431,13 +434,14 @@ function appendTransientMessages(input: {
     if (durableTarget?.revisionReady) continue;
 
     const content = transientMessageContent(transient);
+    const hasVisibleContent = content.parts.length > 0;
     const model = transient.modelId;
     const usageMetadata = transient.usageMetadata ?? usageMetadataFromRequest(request);
     const projectedStatus = transientProjectionStatus(transient, request);
     if (durableTarget) {
       durableTarget.message = {
         ...durableTarget.message,
-        content,
+        ...(hasVisibleContent ? { content } : {}),
         status: projectedStatus,
         ...(model ? { model } : {}),
         ...(usageMetadata ? { usageMetadata } : {}),
@@ -451,6 +455,7 @@ function appendTransientMessages(input: {
       continue;
     }
 
+    if (!hasVisibleContent) continue;
     const terminalState = text(request?.terminal_state);
     const durableCompleted = request?.status === 'terminal'
       && (terminalState === 'completed' || (!terminalState && transient.status === 'completed'));
@@ -1083,9 +1088,32 @@ function parseJson(value: string): unknown {
   }
 }
 
+function projectAbsoluteMessageFloors(messages: readonly ParsedMessage[]): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const entry of messages) {
+    const durableFloor = positiveSafeInteger(entry.record.display_seq)
+      ?? positiveSafeInteger(entry.record.message_seq);
+    const projectedFloor = durableFloor ?? positiveCeiling(entry.message.seq);
+    if (projectedFloor !== undefined) result[entry.message.id] = projectedFloor;
+  }
+  return result;
+}
+
+function positiveSafeInteger(value: unknown): number | undefined {
+  const parsed = integer(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function positiveCeiling(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined;
+  const result = Math.ceil(value);
+  return Number.isSafeInteger(result) ? result : undefined;
+}
+
 function emptyProjection(): ReliableConversationProjection {
   return {
     messages: [],
+    absoluteFloorByMessageId: {},
     toolCalls: [],
     toolCallsByMessageId: {},
     toolCallEvents: [],

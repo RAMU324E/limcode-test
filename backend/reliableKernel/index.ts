@@ -3,6 +3,7 @@ export * from './contentAddressedStore';
 export * from './contextSequence';
 export * from './contextCompression';
 export * from './contextCompressionCoordinator';
+export * from './contextTokenEstimator';
 export * from './attachmentIngest';
 export * from './agentLoop';
 export * from './answerDelivery';

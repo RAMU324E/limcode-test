@@ -22,12 +22,16 @@ import type {
   ToolSchedulingMode
 } from '@shared/protocol';
 import type { DurableInteractionRequestKind } from '@shared/conversationReliability';
+import type { ReliableKernelClientDetailKind } from '@shared/reliableKernelClientFeed';
 import {
   interactionViewFromReliableRuntime,
   type InteractionView
 } from '@webview/domain/interactionProjection';
 import { transientToolCallPreviewForMessage } from '@webview/domain/reliableTransientModel';
-import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
+import {
+  reliableKernelDetailDemandSignature,
+  reliableKernelDetailKey
+} from '@webview/domain/reliableDetailKey';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -66,6 +70,7 @@ const interactions = useInteractionStore();
 const expanded = ref(false);
 const userChangedExpanded = ref(false);
 const autoOpenedActionIds = ref<Set<string>>(new Set());
+const automaticallyRetriedDetailKeys = new Set<string>();
 const expandedPlanSectionKeys = ref<Set<string>>(new Set());
 const autoApplyCountdown = ref<number | undefined>(undefined);
 const cancelFeedback = ref<{
@@ -126,7 +131,8 @@ const transientPreview = computed(() => {
     Object.values(reliableConversation.feed.records.ModelRequestMessageLink ?? {}),
     reliableConversation.conversationId.value,
     props.messageId,
-    partId
+    partId,
+    { includeFinal: toolCall.value === undefined }
   );
 });
 const executionInteraction = computed(() => reliableInteractionForKind('exec_approval'));
@@ -225,6 +231,22 @@ const hasMandatoryInteraction = computed(() => Boolean(
   askUserInteractionView.value?.request.state === 'pending'
   || planReviewInteractionView.value?.request.state === 'pending'
 ));
+const expandedDetailDemandSignature = computed(() => {
+  const call = toolCall.value;
+  const hydrate = expanded.value || hasMandatoryInteraction.value;
+  const targets = call && hydrate
+    ? fileDiffDetailTargets(call.id).map(({ kind, recordId }) => {
+        const key = reliableKernelDetailKey(kind, recordId);
+        return { kind, recordId, status: reliableConversation.feed.details[key]?.status };
+      })
+    : undefined;
+  return reliableKernelDetailDemandSignature({
+    hydrate,
+    callId: call?.id,
+    updatedAt: call?.updatedAt,
+    targets
+  });
+});
 const defaultAutoExpandTool = computed(() => [
   ASK_USER_TOOL_NAME,
   SUBMIT_PLAN_TOOL_NAME,
@@ -354,6 +376,7 @@ watch(() => toolCall.value?.id, () => {
   userChangedExpanded.value = false;
   expanded.value = autoExpandDetails.value;
   autoOpenedActionIds.value = new Set();
+  automaticallyRetriedDetailKeys.clear();
   clearAutoApplyTimers();
 });
 
@@ -373,7 +396,7 @@ watch(
 );
 
 watch(
-  () => `${expanded.value ? 'expanded' : 'collapsed'}:${toolCall.value?.id ?? ''}:${toolCall.value?.updatedAt ?? 0}`,
+  expandedDetailDemandSignature,
   () => {
     const call = toolCall.value;
     if (!call || (!expanded.value && !hasMandatoryInteraction.value)) return;
@@ -381,6 +404,7 @@ watch(
       toolCallIds: [call.id],
       priority: hasMandatoryInteraction.value ? 'critical' : 'expanded'
     });
+    retryExpandedDetailErrors(true);
   },
   { immediate: true }
 );
@@ -654,30 +678,46 @@ function setExpanded(value: boolean): void {
   if (value) retryExpandedDetailErrors();
 }
 
-function retryExpandedDetailErrors(): void {
+function fileDiffDetailTargets(callId: string): Array<{
+  kind: 'file-change-diff';
+  recordId: string;
+}> {
+  return (reliableConversation.projection.value.fileDiffMemberIdsByToolCallId[callId] ?? [])
+    .map((recordId) => ({ kind: 'file-change-diff', recordId }));
+}
+
+function expandedDetailTargets(callId: string): Array<{
+  kind: ReliableKernelClientDetailKind;
+  recordId: string;
+}> {
+  const projection = reliableConversation.projection.value;
+  const targets: Array<{ kind: ReliableKernelClientDetailKind; recordId: string }> = [
+    { kind: 'tool-arguments-content', recordId: callId },
+    { kind: 'tool-result-content', recordId: callId },
+    ...fileDiffDetailTargets(callId),
+    ...(projection.toolEventIdsByCallId[callId] ?? []).map((recordId) => ({
+      kind: 'tool-event-content' as const,
+      recordId
+    }))
+  ];
+  const promptId = projection.interactionPromptIdByToolCallId[callId];
+  if (promptId) targets.push({ kind: 'interaction-prompt', recordId: promptId });
+  return targets;
+}
+
+function retryExpandedDetailErrors(automatic = false): void {
   const call = toolCall.value;
   if (!call) return;
-  for (const kind of ['tool-arguments-content', 'tool-result-content'] as const) {
-    if (reliableConversation.feed.details[reliableKernelDetailKey(kind, call.id)]?.status === 'error') {
-      reliableConversation.feed.retryDetail(kind, call.id, { priority: 'expanded' });
+  for (const { kind, recordId } of expandedDetailTargets(call.id)) {
+    const key = reliableKernelDetailKey(kind, recordId);
+    const status = reliableConversation.feed.details[key]?.status;
+    if (status === 'ready') {
+      automaticallyRetriedDetailKeys.delete(key);
+      continue;
     }
-  }
-  for (const memberId of reliableConversation.projection.value.fileDiffMemberIdsByToolCallId[call.id] ?? []) {
-    if (reliableConversation.feed.details[reliableKernelDetailKey('file-change-diff', memberId)]?.status === 'error') {
-      reliableConversation.feed.retryDetail('file-change-diff', memberId, { priority: 'expanded' });
-    }
-  }
-  for (const eventId of reliableConversation.projection.value.toolEventIdsByCallId[call.id] ?? []) {
-    if (reliableConversation.feed.details[reliableKernelDetailKey('tool-event-content', eventId)]?.status === 'error') {
-      reliableConversation.feed.retryDetail('tool-event-content', eventId, { priority: 'expanded' });
-    }
-  }
-  const promptId = reliableConversation.projection.value.interactionPromptIdByToolCallId[call.id];
-  if (
-    promptId
-    && reliableConversation.feed.details[reliableKernelDetailKey('interaction-prompt', promptId)]?.status === 'error'
-  ) {
-    reliableConversation.feed.retryDetail('interaction-prompt', promptId, { priority: 'expanded' });
+    if (status !== 'error' || (automatic && automaticallyRetriedDetailKeys.has(key))) continue;
+    automaticallyRetriedDetailKeys.add(key);
+    reliableConversation.feed.retryDetail(kind, recordId, { priority: 'expanded' });
   }
 }
 

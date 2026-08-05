@@ -1373,12 +1373,28 @@ async function checkClientSnapshotBounds() {
 
     const messageListSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/ReliableMessageList.vue'), 'utf8');
     const segmentSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/segmentedTimeline.ts'), 'utf8');
+    const projectionSource = await fs.readFile(path.join(root, 'webview/src/domain/reliableConversationProjection.ts'), 'utf8');
+    const transientModelSource = await fs.readFile(path.join(root, 'webview/src/domain/reliableTransientModel.ts'), 'utf8');
+    const functionCallSource = await fs.readFile(path.join(root, 'webview/src/components/content/parts/FunctionCallPartView.vue'), 'utf8');
+    const messageItemSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/MessageItem.vue'), 'utf8');
     assert.match(messageListSource, /v-for="[^"]*visibleTimelineRows"/);
     assert.match(messageListSource, /scroller/);
     assert.match(segmentSource, /TIMELINE_MOUNT_LIMIT = 30/);
     assert.match(segmentSource, /PENDING_TIMELINE_MOUNT_LIMIT = 8/);
-    assert.match(messageListSource, /absoluteTimelineFloor\(message\.seq/);
+    assert.match(segmentSource, /Math\.ceil\(messageSeq\)/);
+    assert.match(projectionSource, /absoluteFloorByMessageId/);
+    assert.match(messageListSource, /projection\.value\.absoluteFloorByMessageId\[message\.id\]/);
+    assert.match(messageListSource, /messageDetailDemandSignature/);
+    assert.match(messageListSource, /kind:\s*['"]message-content['"]/);
+    assert.match(messageItemSource, /v-if="detailLoading"/);
+    assert.match(transientModelSource, /options\.includeFinal === true/);
+    assert.match(functionCallSource, /includeFinal:\s*toolCall\.value === undefined/);
     assert.match(messageListSource, /messages\.value\[messages\.value\.length - 1\]\?\.id/);
+    const durableRetryVisibility = messageListSource.indexOf("latest.status === 'retrying'");
+    const transientThoughtSuppression = messageListSource.indexOf('if (hasVisibleStreamingTransientForTurn');
+    assert.ok(durableRetryVisibility >= 0 && transientThoughtSuppression > durableRetryVisibility);
+    assert.match(messageListSource, /模型输出停滞/);
+    assert.match(messageListSource, /自动恢复已重连，等待有效输出/);
     assert.ok(30 + 8 <= 40);
     const plainData = require(path.join(root, 'dist/extension/shared/plainData.js'));
     const proxy = new Proxy({ nested: [{ value: 'plain' }] }, {});
@@ -1387,7 +1403,7 @@ async function checkClientSnapshotBounds() {
     assert.notEqual(plain, proxy);
     assert.throws(() => plainData.toStructuredClonePlainData(new Map()), /forbidden class/);
     assert.throws(() => plainData.toStructuredClonePlainData({ callback() {} }), /unsupported function/);
-    assertions.push('可靠时间线使用30+8 segmented挂载上限、绝对message_seq楼层号，并在窗口长度恒定但末条身份变化时继续跟随最新；Bridge payload递归转plain且拒绝Map/function/class');
+    assertions.push('可靠时间线使用30+8 segmented挂载上限、projection绝对楼层和瞬态向上取整；Message+Revision+detail状态驱动正文水合并以中性骨架展示；final工具参数快照持续到durable ToolCall接管；Attempt 2+的持久自动恢复状态优先于transient thought并始终可见；Bridge payload递归转plain且拒绝Map/function/class');
     faults.push('keyset insertion between pages');
     faults.push('detail payload larger than maxResponseBytes');
     metrics.snapshotBytes = wireBytes(snapshot);
@@ -2643,7 +2659,7 @@ function emptyClientProjection(conversationId) {
       conversationId, messages: [], visibleMessageCount: '0', lastMessageSeq: '0',
       projectContexts: [], conversationProjectLinks: [], conversationReuseLinks: [],
       conversationBranchLinks: [], conversationOriginLinks: [], agentConversationLinks: [],
-      compressionBlocks: [], conversationContextStatuses: [], taskList: []
+      queuedTurnIntents: [], compressionBlocks: [], conversationContextStatuses: [], taskList: []
     },
     activeTurnSummary: {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [],

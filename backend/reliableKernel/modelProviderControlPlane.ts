@@ -6,6 +6,10 @@ import {
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import {
+  estimateRequestAuthorityTokens,
+  ReliableContextTokenEstimator
+} from './contextTokenEstimator';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import {
   DOMAIN_REPOSITORIES,
@@ -22,7 +26,9 @@ import {
   frozenCompressionPolicy,
   frozenContextProfile,
   frozenModelIdentity,
-  readFrozenTurnAuthority
+  frozenProviderRetryPolicy,
+  readFrozenTurnAuthority,
+  type FrozenProviderRetryPolicy
 } from './frozenAuthority';
 import {
   ExecutionHandoffError,
@@ -80,6 +86,8 @@ export interface ProviderStreamEvent {
   content: PlainJsonValue;
   usage?: PlainJsonValue;
   timing?: ProviderStreamTiming;
+  /** Process-local signal: false for synthetic clocks such as thought_progress. Never persisted. */
+  semanticProgress?: boolean;
 }
 
 export interface ProviderStreamTiming {
@@ -120,6 +128,25 @@ export interface ProviderDispatchOptions {
 }
 
 const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
+const DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS = 40_000;
+const DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS = 3 * 60 * 1_000;
+const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 10_000] as const;
+const DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS = 1_000;
+
+export interface ProviderSemanticTimeouts {
+  firstSemanticMs: number;
+  semanticIdleMs: number;
+  /** Terminal-only compact() requests emit no semantic delta; this bounds their completed/error event. */
+  compressionCompletionMs: number;
+}
+
+/** Public machine-readable defaults; formal validators keep these aligned with the contracts. */
+export const RELIABLE_PROVIDER_SEMANTIC_DEADLINES_MS = Object.freeze({
+  ordinaryFirst: DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS,
+  ordinaryIdle: DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS,
+  compressionCompletion: DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS
+});
 
 export interface ProviderDispatchResult {
   modelRequestId: string;
@@ -141,7 +168,13 @@ export interface CompletedModelRequestEvent {
   usage?: PlainJsonValue;
 }
 
-export type ProviderTransientReason = 'connection_interrupted' | 'rate_limited' | 'temporary_service_error';
+export type ProviderTransientReason =
+  | 'connection_interrupted'
+  | 'rate_limited'
+  | 'temporary_service_error'
+  | 'first_semantic_timeout'
+  | 'stream_stalled'
+  | 'compression_timeout';
 
 export class ProviderTransientError extends Error {
   public constructor(public readonly reason: ProviderTransientReason, message: string) {
@@ -154,6 +187,9 @@ interface StreamStats {
   attemptSeq: string;
   socketGeneration: string;
   retryReason: ProviderTransientReason | null;
+  retryMaxAttempts?: number;
+  retryDelayMs?: number;
+  retryNotBeforeAt?: number;
   providerStartedAt?: number;
   firstOutputAt?: number;
   completedAt?: number;
@@ -171,8 +207,11 @@ interface FrozenAuthority {
   modelId: string;
   contextWindowTokens: number;
   compressionThresholdTokens: number;
+  document: PlainJsonValue;
   compressionProviderId?: string;
   compressionModelId?: string;
+  retryPolicy: FrozenProviderRetryPolicy;
+  compressionRetryPolicy?: FrozenProviderRetryPolicy;
 }
 
 interface RequestBundle {
@@ -201,7 +240,12 @@ const CONTENT_TYPE_CHECKPOINT = 'application/vnd.limcode.model-stream-checkpoint
 /** First-release provider path: each socket dispatch is rebuilt from one frozen root and immutable recipe. */
 export class ModelProviderControlPlane {
   private readonly context: ContextSequenceControlPlane;
+  private readonly tokenEstimator: ReliableContextTokenEstimator;
   private readonly now: () => string;
+  private readonly epochNow: () => number;
+  private readonly semanticTimeouts: ProviderSemanticTimeouts;
+  private readonly retryDelaysMs: readonly number[];
+  private readonly adapterDrainTimeoutMs: number;
   private readonly activeSockets = new Map<string, Set<AbortController>>();
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private handoff: ExecutionHandoffError | undefined;
@@ -209,10 +253,24 @@ export class ModelProviderControlPlane {
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore,
-    options: { now?: () => string } = {}
+    options: {
+      now?: () => string;
+      epochNow?: () => number;
+      semanticTimeouts?: Partial<ProviderSemanticTimeouts>;
+      retryDelaysMs?: readonly number[];
+      adapterDrainTimeoutMs?: number;
+    } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.epochNow = options.epochNow ?? Date.now;
+    this.semanticTimeouts = normalizeSemanticTimeouts(options.semanticTimeouts);
+    this.retryDelaysMs = normalizeRetryDelays(options.retryDelaysMs);
+    this.adapterDrainTimeoutMs = positiveSafeInteger(
+      options.adapterDrainTimeoutMs ?? DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS,
+      'adapterDrainTimeoutMs'
+    );
     this.context = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
   public async createModelRequest(command: CreateModelRequestCommand): Promise<ModelRequestCreationResult> {
@@ -269,6 +327,16 @@ export class ModelProviderControlPlane {
       throw new Error('ContextSequenceRoot belongs to another Conversation.');
     }
 
+    const contextEstimate = compressionRequest
+      ? await this.tokenEstimator.estimateRootPrefix(
+          contextRootId,
+          compressionSourceSegmentCount(recipe)
+        )
+      : await this.tokenEstimator.estimateRoot(contextRootId).then((estimate) =>
+          estimate.estimatedTokens + (estimate.source === 'provider-observed-delta'
+            ? 0
+            : estimateRequestAuthorityTokens(frozen.document, recipe))
+        );
     const recipeContent = await this.contentStore.prepare(this.database, recipeBytes, CONTENT_TYPE_RECIPE);
     const now = this.timestamp();
     const initialStats: StreamStats = { attemptSeq: '1', socketGeneration: '0', retryReason: null };
@@ -284,10 +352,7 @@ export class ModelProviderControlPlane {
         model_id: frozenModelId,
         context_window_tokens: BigInt(frozen.contextWindowTokens),
         compression_threshold_tokens: BigInt(frozen.compressionThresholdTokens),
-        estimated_context_tokens: requireBigInt(
-          contextRoot.estimated_tokens,
-          'ContextSequenceRoot.estimated_tokens'
-        ),
+        estimated_context_tokens: BigInt(contextEstimate),
         authority_snapshot_id: authoritySnapshotId,
         settings_snapshot_object_id: settingsSnapshotContentObjectId,
         recipe_object_id: recipeContent.metadata.id,
@@ -546,16 +611,48 @@ export class ModelProviderControlPlane {
     }
 
     let attemptSeq = decimalBigInt(stats.attemptSeq, 'ModelRequest attemptSeq');
+    let retryPolicy: FrozenProviderRetryPolicy | undefined;
     for (;;) {
+      const pendingIdentity: StreamIdentity = {
+        attemptSeq,
+        socketGeneration: decimalBigInt(stats.socketGeneration, 'socketGeneration'),
+        stats
+      };
+      if (stats.retryNotBeforeAt !== undefined && stats.retryNotBeforeAt > this.epochNow()) {
+        const delayController = new AbortController();
+        const detachCallerSignal = relayAbort(options.signal, delayController);
+        const unregister = this.registerActiveSocket(modelRequestId, delayController);
+        const abortWaiter = createAbortWaiter(delayController.signal);
+        const delayWaiter = createRetryDelayWaiter(stats.retryNotBeforeAt, this.epochNow);
+        try {
+          await Promise.race([
+            delayWaiter.promise,
+            abortWaiter.promise
+          ]);
+        } finally {
+          delayWaiter.dispose();
+          abortWaiter.dispose();
+          detachCallerSignal();
+          unregister();
+        }
+        if (delayController.signal.aborted) {
+          const handoff = handoffReason(delayController.signal);
+          if (handoff) throw handoff;
+          const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-during-provider-retry-delay');
+          return this.finishCancelledDispatch(modelRequestId, pendingIdentity, cancelled, options, 0n);
+        }
+        request = await this.requireDomain('ModelRequest', modelRequestId);
+        const currentStats = parseStreamStats(request.stream_stats_json);
+        if (request.status === 'terminal' || !sameStats(currentStats, stats)) {
+          return this.finishResolvedDispatch(modelRequestId, pendingIdentity, options, 0n);
+        }
+      }
+
       if (options.signal?.aborted) {
         const handoff = handoffReason(options.signal);
         if (handoff) throw handoff;
         const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-before-provider-dispatch');
-        return this.finishCancelledDispatch(modelRequestId, {
-          attemptSeq,
-          socketGeneration: decimalBigInt(stats.socketGeneration, 'socketGeneration'),
-          stats
-        }, cancelled, options, 0n);
+        return this.finishCancelledDispatch(modelRequestId, pendingIdentity, cancelled, options, 0n);
       }
       const currentIdentity: StreamIdentity = {
         attemptSeq,
@@ -566,6 +663,7 @@ export class ModelProviderControlPlane {
       let fullRequest: FullProviderRequest;
       try {
         fullRequest = await this.buildFullRequest(modelRequestId, attemptSeq, expectedGeneration);
+        retryPolicy ??= retryPolicyForFullRequest(fullRequest);
       } catch (error) {
         const applied = await this.failRequest(modelRequestId, currentIdentity, error);
         if (applied) {
@@ -582,18 +680,30 @@ export class ModelProviderControlPlane {
       const timeoutWaiter = createProviderTimeoutWaiter(
         options.timeoutMs ?? DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS
       );
+      const progressWaiter = isCompressionRecipe(fullRequest.recipe)
+        ? createCompressionCompletionWaiter(this.semanticTimeouts.compressionCompletionMs)
+        : createSemanticProgressWaiter({
+            firstSemanticMs: this.semanticTimeouts.firstSemanticMs,
+            semanticIdleMs: this.semanticTimeouts.semanticIdleMs
+          });
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
           signal: controller.signal,
-          onEvent: (event) => {
+          onEvent: async (event) => {
             const observedSeq = decimalBigInt(event.streamSeq, 'Provider event streamSeq');
             if (observedSeq > lastObservedStreamSeq) lastObservedStreamSeq = observedSeq;
-            return this.recordStreamEvent(
-              modelRequestId,
-              identity.attemptSeq,
-              identity.socketGeneration,
-              event
-            );
+            const semanticProgress = event.semanticProgress !== false;
+            if (semanticProgress) progressWaiter.beginProgress();
+            try {
+              return await this.recordStreamEvent(
+                modelRequestId,
+                identity.attemptSeq,
+                identity.socketGeneration,
+                event
+              );
+            } finally {
+              if (semanticProgress) progressWaiter.commitProgress();
+            }
           }
         }))
         .then(
@@ -602,12 +712,19 @@ export class ModelProviderControlPlane {
         );
       let outcome: Awaited<typeof adapterOutcome>
         | { kind: 'aborted' }
-        | { kind: 'timed_out'; error: ProviderTransientError };
+        | { kind: 'timed_out'; error: ProviderTransientError }
+        | { kind: 'semantic_timed_out'; error: ProviderTransientError };
       try {
-        outcome = await Promise.race([adapterOutcome, abortWaiter.promise, timeoutWaiter.promise]);
+        outcome = await Promise.race([
+          adapterOutcome,
+          abortWaiter.promise,
+          timeoutWaiter.promise,
+          progressWaiter.promise
+        ]);
       } finally {
         abortWaiter.dispose();
         timeoutWaiter.dispose();
+        progressWaiter.dispose();
         detachCallerSignal();
         unregister();
       }
@@ -625,13 +742,18 @@ export class ModelProviderControlPlane {
           'connection_interrupted',
           'Provider adapter resolved before committing a completed terminal checkpoint.'
         );
-      } else if (outcome.kind === 'timed_out') {
+      } else if (outcome.kind === 'timed_out' || outcome.kind === 'semantic_timed_out') {
         error = outcome.error;
         controller.abort(outcome.error);
+        await settleWithin(adapterOutcome, this.adapterDrainTimeoutMs);
       } else {
         error = outcome.error;
       }
-      if (outcome.kind !== 'timed_out' && (controller.signal.aborted || isAbortError(error))) {
+      if (
+        outcome.kind !== 'timed_out'
+        && outcome.kind !== 'semantic_timed_out'
+        && (controller.signal.aborted || isAbortError(error))
+      ) {
         const handoff = handoffReason(controller.signal)
           ?? (isExecutionHandoffError(error) ? error : undefined);
         if (handoff) throw handoff;
@@ -650,7 +772,8 @@ export class ModelProviderControlPlane {
         );
         throw error;
       }
-      if (identity.attemptSeq >= 2n) {
+      const maxRetries = retryPolicy?.enabled ? retryPolicy.maxRetries : 0;
+      if (identity.attemptSeq >= BigInt(maxRetries + 1)) {
         const applied = await this.failRequest(modelRequestId, identity, error);
         if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
         this.emitTransientTerminal(
@@ -658,11 +781,17 @@ export class ModelProviderControlPlane {
           identity,
           'failed',
           lastObservedStreamSeq + 1n,
-          providerFailureTerminalState(error)
+          providerFailureTerminalState(error),
+          { retryAttempt: maxRetries, retryMaxAttempts: maxRetries }
         );
         throw error;
       }
-      const retryAttempt = await this.createTransientRetry(modelRequestId, identity, error.reason);
+      const retryAttempt = await this.createTransientRetry(
+        modelRequestId,
+        identity,
+        error.reason,
+        maxRetries
+      );
       if (retryAttempt === null) {
         return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
       }
@@ -672,11 +801,17 @@ export class ModelProviderControlPlane {
         'failed',
         lastObservedStreamSeq + 1n,
         `provider_transient_${error.reason}`,
-        { retrying: true }
+        {
+          retrying: true,
+          retryAttempt: Number(retryAttempt.attemptSeq - 1n),
+          retryMaxAttempts: maxRetries,
+          retryDelayMs: retryAttempt.delayMs,
+          retryNotBeforeAt: retryAttempt.retryNotBeforeAt
+        }
       );
       request = await this.requireDomain('ModelRequest', modelRequestId);
       stats = parseStreamStats(request.stream_stats_json);
-      attemptSeq = retryAttempt;
+      attemptSeq = retryAttempt.attemptSeq;
     }
   }
 
@@ -800,6 +935,8 @@ export class ModelProviderControlPlane {
     }
     const socketGeneration = decimalBigInt(currentStats.socketGeneration, 'socketGeneration') + 1n;
     const nextStats: StreamStats = { ...currentStats, socketGeneration: socketGeneration.toString() };
+    delete nextStats.retryNotBeforeAt;
+    delete nextStats.retryDelayMs;
     const now = this.timestamp();
     try {
       await this.database.transaction([
@@ -838,9 +975,14 @@ export class ModelProviderControlPlane {
   private async createTransientRetry(
     modelRequestId: string,
     failed: StreamIdentity,
-    reason: ProviderTransientReason
-  ): Promise<bigint | null> {
-    if (failed.attemptSeq !== 1n) throw new Error('Provider transient retry is limited to attempt 2.');
+    reason: ProviderTransientReason,
+    maxRetries: number
+  ): Promise<{ attemptSeq: bigint; delayMs: number; retryNotBeforeAt: number } | null> {
+    if (!Number.isSafeInteger(maxRetries) || maxRetries <= 0 || maxRetries > 10) {
+      throw new Error('Provider retry policy must allow between 1 and 10 retries.');
+    }
+    const retryOrdinal = Number(failed.attemptSeq);
+    if (retryOrdinal > maxRetries) throw new Error('Provider transient retry budget is exhausted.');
     const bundle = await this.readRequestBundle(modelRequestId, failed.attemptSeq);
     const currentStats = parseStreamStats(bundle.request.stream_stats_json);
     if (
@@ -849,9 +991,19 @@ export class ModelProviderControlPlane {
       || bundle.turn.status !== 'active'
       || !sameStats(currentStats, failed.stats)
     ) return null;
-    const attemptId = stableId('model_request_attempt', modelRequestId, '2');
+    const nextAttemptSeq = failed.attemptSeq + 1n;
+    const attemptId = stableId('model_request_attempt', modelRequestId, nextAttemptSeq.toString());
+    const delayMs = retryDelayMs(retryOrdinal, this.retryDelaysMs);
+    const retryNotBeforeAt = this.epochNow() + delayMs;
     const now = this.timestamp();
-    const nextStats: StreamStats = { attemptSeq: '2', socketGeneration: '0', retryReason: reason };
+    const nextStats: StreamStats = {
+      attemptSeq: nextAttemptSeq.toString(),
+      socketGeneration: '0',
+      retryReason: reason,
+      retryMaxAttempts: maxRetries,
+      retryDelayMs: delayMs,
+      retryNotBeforeAt
+    };
     try {
       await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('Turn').assert(requireId(bundle.turn.id, 'Turn.id'), { status: 'active' }),
@@ -873,12 +1025,12 @@ export class ModelProviderControlPlane {
           updated_at: now,
           completed_at: null
         }, { column: 'attempt_seq', scope: { operation_id: requireId(bundle.operation.id, 'Operation.id') } }),
-        DOMAIN_REPOSITORIES.domain('Attempt').assert(attemptId, { attempt_seq: 2n }),
+        DOMAIN_REPOSITORIES.domain('Attempt').assert(attemptId, { attempt_seq: nextAttemptSeq }),
         DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
           status: 'retrying', stream_stats_json: nextStats, updated_at: now
         })
       ]);
-      return 2n;
+      return { attemptSeq: nextAttemptSeq, delayMs, retryNotBeforeAt };
     } catch (error) {
       if (!isRecoverableProviderRace(error)) throw error;
       return null;
@@ -968,7 +1120,13 @@ export class ModelProviderControlPlane {
     kind: ProviderTransientTerminalEventKind,
     streamSeq: bigint,
     terminalState: string,
-    detail: { retrying?: boolean } = {}
+    detail: {
+      retrying?: boolean;
+      retryAttempt?: number;
+      retryMaxAttempts?: number;
+      retryDelayMs?: number;
+      retryNotBeforeAt?: number;
+    } = {}
   ): void {
     if (!options.onTransientTerminal) return;
     try {
@@ -980,7 +1138,11 @@ export class ModelProviderControlPlane {
           streamSeq: (streamSeq > 0n ? streamSeq : 1n).toString(),
           content: {
             terminalState,
-            ...(detail.retrying ? { retrying: true } : {})
+            ...(detail.retrying ? { retrying: true } : {}),
+            ...(detail.retryAttempt !== undefined ? { retryAttempt: detail.retryAttempt } : {}),
+            ...(detail.retryMaxAttempts !== undefined ? { retryMaxAttempts: detail.retryMaxAttempts } : {}),
+            ...(detail.retryDelayMs !== undefined ? { retryDelayMs: detail.retryDelayMs } : {}),
+            ...(detail.retryNotBeforeAt !== undefined ? { retryNotBeforeAt: detail.retryNotBeforeAt } : {})
           }
         }
       });
@@ -1084,13 +1246,17 @@ export class ModelProviderControlPlane {
     const model = frozenModelIdentity(frozen.document);
     const context = frozenContextProfile(frozen.document);
     const compression = frozenCompressionPolicy(frozen.document);
+    const retryPolicy = frozenProviderRetryPolicy(frozen.document);
     return {
       ...model,
+      document: frozen.document,
       contextWindowTokens: context.contextWindowTokens,
       compressionThresholdTokens: context.compressionThresholdTokens,
+      retryPolicy,
       ...(compression ? {
         compressionProviderId: compression.provider.providerConfigId,
-        compressionModelId: compression.provider.modelId
+        compressionModelId: compression.provider.modelId,
+        compressionRetryPolicy: compression.provider.retryPolicy
       } : {})
     };
   }
@@ -1155,6 +1321,178 @@ export class ModelProviderControlPlane {
   }
 }
 
+function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; semanticIdleMs: number }): {
+  promise: Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>;
+  beginProgress(): void;
+  commitProgress(): void;
+  dispose(): void;
+} {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let sawProgress = false;
+  let settled = false;
+  let resolveTimeout!: (outcome: { kind: 'semantic_timed_out'; error: ProviderTransientError }) => void;
+  const promise = new Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>((resolve) => {
+    resolveTimeout = resolve;
+  });
+  const arm = (timeoutMs: number) => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const reason: ProviderTransientReason = sawProgress ? 'stream_stalled' : 'first_semantic_timeout';
+      resolveTimeout({
+        kind: 'semantic_timed_out',
+        error: new ProviderTransientError(
+          reason,
+          sawProgress
+            ? `Provider stream made no semantic progress for ${timeoutMs}ms.`
+            : `Provider produced no semantic event within ${timeoutMs}ms.`
+        )
+      });
+    }, timeoutMs);
+  };
+  arm(timeouts.firstSemanticMs);
+  return {
+    promise,
+    beginProgress() {
+      if (settled) return;
+      sawProgress = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    },
+    commitProgress() {
+      if (settled) return;
+      sawProgress = true;
+      arm(timeouts.semanticIdleMs);
+    },
+    dispose() {
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+}
+
+function createCompressionCompletionWaiter(timeoutMs: number): {
+  promise: Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>;
+  beginProgress(): void;
+  commitProgress(): void;
+  dispose(): void;
+} {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  let resolveTimeout!: (outcome: { kind: 'semantic_timed_out'; error: ProviderTransientError }) => void;
+  const promise = new Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>((resolve) => {
+    resolveTimeout = resolve;
+  });
+  timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    resolveTimeout({
+      kind: 'semantic_timed_out',
+      error: new ProviderTransientError(
+        'compression_timeout',
+        `Provider compression produced no terminal event within ${timeoutMs}ms.`
+      )
+    });
+  }, timeoutMs);
+  return {
+    promise,
+    // compact() is terminal-only. It emits no text/thought progress, so only CompactDone or
+    // CompactError may satisfy this deadline; these no-ops keep the dispatch event path uniform.
+    beginProgress() {},
+    commitProgress() {},
+    dispose() {
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+}
+
+function normalizeSemanticTimeouts(
+  value: Partial<ProviderSemanticTimeouts> | undefined
+): ProviderSemanticTimeouts {
+  return {
+    firstSemanticMs: positiveSafeInteger(
+      value?.firstSemanticMs ?? DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS,
+      'semanticTimeouts.firstSemanticMs'
+    ),
+    semanticIdleMs: positiveSafeInteger(
+      value?.semanticIdleMs ?? DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS,
+      'semanticTimeouts.semanticIdleMs'
+    ),
+    compressionCompletionMs: positiveSafeInteger(
+      value?.compressionCompletionMs ?? DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS,
+      'semanticTimeouts.compressionCompletionMs'
+    )
+  };
+}
+
+function normalizeRetryDelays(value: readonly number[] | undefined): readonly number[] {
+  const delays = value ?? DEFAULT_PROVIDER_RETRY_DELAYS_MS;
+  if (delays.length === 0 || delays.length > 10) {
+    throw new TypeError('retryDelaysMs must contain between 1 and 10 delays.');
+  }
+  return delays.map((delay, index) => {
+    if (!Number.isSafeInteger(delay) || delay < 0 || delay > 10_000) {
+      throw new TypeError(`retryDelaysMs[${index}] must be an integer in [0, 10000].`);
+    }
+    return delay;
+  });
+}
+
+function retryDelayMs(retryOrdinal: number, delays: readonly number[]): number {
+  if (!Number.isSafeInteger(retryOrdinal) || retryOrdinal <= 0) {
+    throw new TypeError('retryOrdinal must be a positive safe integer.');
+  }
+  return delays[Math.min(delays.length - 1, retryOrdinal - 1)]!;
+}
+
+function retryPolicyForFullRequest(request: FullProviderRequest): FrozenProviderRetryPolicy {
+  if (isCompressionRecipe(request.recipe)) {
+    const compression = frozenCompressionPolicy(request.authoritySnapshot);
+    if (!compression) throw new Error('Compression ModelRequest has no frozen compression retry policy.');
+    return compression.provider.retryPolicy;
+  }
+  return frozenProviderRetryPolicy(request.authoritySnapshot);
+}
+
+function createRetryDelayWaiter(targetEpochMs: number, epochNow: () => number): {
+  promise: Promise<{ kind: 'elapsed' }>;
+  dispose(): void;
+} {
+  const delay = Math.max(0, targetEpochMs - epochNow());
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const promise = new Promise<{ kind: 'elapsed' }>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: 'elapsed' }), delay);
+  });
+  return {
+    promise,
+    dispose() {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+}
+
+async function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise.then(() => undefined, () => undefined),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); })
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function positiveSafeInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${label} must be a positive safe integer.`);
+  return value;
+}
+
 function createProviderTimeoutWaiter(timeoutMsInput: number): {
   promise: Promise<{ kind: 'timed_out'; error: ProviderTransientError }>;
   dispose(): void;
@@ -1199,6 +1537,17 @@ function compressionRequestSegments<T>(
 
 function isCompressionRecipe(recipe: PlainJsonValue): boolean {
   return isRecord(recipe) && recipe.kind === 'reliable-context-compression';
+}
+
+function compressionSourceSegmentCount(recipe: PlainJsonValue): number {
+  if (!isRecord(recipe) || recipe.kind !== 'reliable-context-compression') {
+    throw new TypeError('ModelRequest recipe is not a compression request.');
+  }
+  const count = recipe.sourceSegmentCount;
+  if (!Number.isSafeInteger(count) || (count as number) <= 0) {
+    throw new RangeError('Compression recipe sourceSegmentCount must be a positive safe integer.');
+  }
+  return count as number;
 }
 
 function dispatchResult(
@@ -1326,6 +1675,15 @@ function parseStreamStats(value: unknown): StreamStats {
     attemptSeq,
     socketGeneration,
     retryReason: value.retryReason as ProviderTransientReason | null,
+    ...(optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) !== undefined
+      ? { retryMaxAttempts: optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) }
+      : {}),
+    ...(optionalBoundedInteger(value.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER) !== undefined
+      ? { retryDelayMs: optionalBoundedInteger(value.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER) }
+      : {}),
+    ...(optionalBoundedInteger(value.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER) !== undefined
+      ? { retryNotBeforeAt: optionalBoundedInteger(value.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER) }
+      : {}),
     ...normalizeProviderTiming(value)
   };
 }
@@ -1348,6 +1706,19 @@ function normalizeProviderTiming(value: unknown): ProviderStreamTiming {
   };
 }
 
+function optionalBoundedInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw new TypeError(`Provider stream ${label} must be an integer in [${minimum}, ${maximum}].`);
+  }
+  return value as number;
+}
+
 function optionalTimestamp(value: unknown, label: string, allowZero = false): number | undefined {
   if (value === undefined) return undefined;
   if (!Number.isSafeInteger(value) || (allowZero ? (value as number) < 0 : (value as number) <= 0)) {
@@ -1359,7 +1730,10 @@ function optionalTimestamp(value: unknown, label: string, allowZero = false): nu
 function sameStats(left: StreamStats, right: StreamStats): boolean {
   return left.attemptSeq === right.attemptSeq
     && left.socketGeneration === right.socketGeneration
-    && left.retryReason === right.retryReason;
+    && left.retryReason === right.retryReason
+    && left.retryMaxAttempts === right.retryMaxAttempts
+    && left.retryDelayMs === right.retryDelayMs
+    && left.retryNotBeforeAt === right.retryNotBeforeAt;
 }
 
 function parsePlainJson(bytes: Buffer, label: string): PlainJsonValue {
@@ -1408,7 +1782,10 @@ function asContentObjectMetadata(row: DomainRow): ContentObjectMetadata {
 function isTransientReason(value: unknown): value is ProviderTransientReason {
   return value === 'connection_interrupted'
     || value === 'rate_limited'
-    || value === 'temporary_service_error';
+    || value === 'temporary_service_error'
+    || value === 'first_semantic_timeout'
+    || value === 'stream_stalled'
+    || value === 'compression_timeout';
 }
 
 function isRecoverableProviderRace(error: unknown): boolean {

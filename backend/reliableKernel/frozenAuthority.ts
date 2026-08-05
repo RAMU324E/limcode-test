@@ -21,6 +21,12 @@ export interface FrozenTurnAuthority {
   conversationId: string;
 }
 
+export interface FrozenProviderRetryPolicy {
+  enabled: boolean;
+  /** Number of retries after the original Provider attempt. */
+  maxRetries: number;
+}
+
 export interface FrozenCompressionPolicy {
   enabled: boolean;
   methodKind: LlmCompressionConfigRecord['kind'];
@@ -32,6 +38,7 @@ export interface FrozenCompressionPolicy {
     providerConfigId: string;
     provider: LlmProviderKind;
     modelId: string;
+    retryPolicy: FrozenProviderRetryPolicy;
   };
 }
 
@@ -84,6 +91,17 @@ export function frozenModelIdentity(document: PlainJsonValue): { providerId: str
     providerId: requireText(document.model.providerConfigId, 'AuthoritySnapshot.model.providerConfigId'),
     modelId: requireText(document.model.modelId, 'AuthoritySnapshot.model.modelId')
   };
+}
+
+/**
+ * Retry authority is frozen with the Turn. Legacy snapshots predate this field and retain their
+ * original one-retry contract instead of inheriting mutable live settings.
+ */
+export function frozenProviderRetryPolicy(document: PlainJsonValue): FrozenProviderRetryPolicy {
+  if (!isRecord(document) || !isRecord(document.model)) {
+    throw new Error('AuthoritySnapshot is missing frozen model retry authority.');
+  }
+  return normalizeFrozenRetryPolicy(document.model.retryPolicy, 'model.retryPolicy', { enabled: true, maxRetries: 1 });
 }
 
 export function frozenContextProfile(document: PlainJsonValue): FrozenContextProfile {
@@ -151,9 +169,31 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
     provider: {
       providerConfigId: requireText(provider.providerConfigId, 'AuthoritySnapshot.compression.provider.providerConfigId'),
       provider: providerKind,
-      modelId: requireText(provider.modelId, 'AuthoritySnapshot.compression.provider.modelId')
+      modelId: requireText(provider.modelId, 'AuthoritySnapshot.compression.provider.modelId'),
+      retryPolicy: normalizeFrozenRetryPolicy(
+        provider.retryPolicy,
+        'compression.provider.retryPolicy',
+        { enabled: true, maxRetries: 1 }
+      )
     }
   };
+}
+
+function normalizeFrozenRetryPolicy(
+  value: unknown,
+  label: string,
+  legacy: FrozenProviderRetryPolicy
+): FrozenProviderRetryPolicy {
+  if (value === undefined) return legacy;
+  if (!isRecord(value) || typeof value.enabled !== 'boolean') {
+    throw new Error(`Frozen ${label} must contain enabled and maxRetries.`);
+  }
+  const maxRetries = nonNegativeSafeInteger(value.maxRetries, `${label}.maxRetries`);
+  if (maxRetries > 10) throw new Error(`Frozen ${label}.maxRetries exceeds the reliable limit.`);
+  if (value.enabled !== (maxRetries > 0)) {
+    throw new Error(`Frozen ${label}.enabled must exactly match whether maxRetries is non-zero.`);
+  }
+  return { enabled: value.enabled, maxRetries };
 }
 
 function requireCompressionKind(value: unknown): LlmCompressionConfigRecord['kind'] {

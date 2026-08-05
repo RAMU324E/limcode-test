@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import {
+  estimateStoredMessageContentTokens,
+  providerPromptTokens,
+  providerTotalTokens
+} from './contextTokenEstimator';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -52,11 +57,24 @@ export class TurnOutputControlPlane {
     const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
     const content = await this.contentStore.prepare(this.database, input.content, contentType);
+    const contentEstimatedTokens = estimateStoredMessageContentTokens(input.content, contentType);
+    const projections = await this.list('ModelContextProjection', {
+      owner_kind: 'model_request', owner_id: modelRequestId
+    }, 2);
+    const currentHeadRootId = await this.context.currentHeadRootId(conversationId);
+    const providerAligned = projections.length === 1
+      && projections[0].root_id === currentHeadRootId;
+    const observedInputTokens = providerAligned ? providerPromptTokens(modelRequest.usage_json) : undefined;
+    const observedTotalTokens = providerAligned ? providerTotalTokens(modelRequest.usage_json) : undefined;
+    const resultingEstimatedTokens = observedTotalTokens
+      ?? (observedInputTokens === undefined ? undefined : observedInputTokens + contentEstimatedTokens);
     const context = await this.context.prepareMessageAppendMutation({
       conversationId,
       messageRevisionId: ids.revisionId,
       contentObjectId: content.metadata.id,
-      contentByteLength: content.metadata.byte_length
+      contentByteLength: content.metadata.byte_length,
+      contentEstimatedTokens,
+      ...(resultingEstimatedTokens === undefined ? {} : { resultingEstimatedTokens })
     });
     const now = requireText(this.now(), 'clock result');
 

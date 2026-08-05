@@ -40,51 +40,69 @@ export interface PreparedContentObject {
   insert?: RepositoryInsertMutation;
 }
 
+export type ContentAddressedStoreMetric =
+  | 'lookup-hit'
+  | 'lookup-miss'
+  | 'publish'
+  | 'temp-write'
+  | 'file-fsync'
+  | 'directory-fsync';
+
+export interface ContentAddressedStoreMetricEvent {
+  metric: ContentAddressedStoreMetric;
+  count: number;
+}
+
+/** Optional development-only observer. Events contain counts only, never content or paths. */
+export type ContentAddressedStoreMetricObserver = (event: ContentAddressedStoreMetricEvent) => void;
+
+interface IdentifiedContent {
+  bytes: Buffer;
+  published: PublishedContent;
+}
+
 export class ContentAddressedStore {
   public constructor(
     private readonly authority: RootAuthority,
-    public readonly binding: RootBinding
+    public readonly binding: RootBinding,
+    private readonly observeMetric?: ContentAddressedStoreMetricObserver
   ) {}
 
   public identity(content: Uint8Array | string, contentType: string): ContentObjectIdentity {
-    const normalizedType = requireContentType(contentType);
-    const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const published: PublishedContent = {
-      contentType: normalizedType,
-      sha256,
-      byteLength: BigInt(bytes.length),
-      storageKey: storageKeyForDigest(sha256),
-      absolutePath: ''
-    };
+    const { published } = identifyContent(this.binding, content, contentType);
     return {
       id: contentObjectId(published),
-      content_type: normalizedType,
-      sha256,
+      content_type: published.contentType,
+      sha256: published.sha256,
       byte_length: published.byteLength,
       storage_key: published.storageKey
     };
   }
 
   public async publish(content: Uint8Array | string, contentType: string): Promise<PublishedContent> {
+    return await this.publishIdentified(identifyContent(this.binding, content, contentType));
+  }
+
+  private async publishIdentified(content: IdentifiedContent): Promise<PublishedContent> {
     await this.authority.validate(this.binding);
-    const normalizedType = requireContentType(contentType);
-    const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const storageKey = storageKeyForDigest(sha256);
-    const absolutePath = absoluteCasPath(this.binding, storageKey);
+    this.recordMetric('publish');
+    const { bytes, published } = content;
+    const { sha256, absolutePath } = published;
     const casRoot = this.binding.paths.casRootPath;
     const temporaryRoot = path.join(casRoot, 'tmp');
     const digestRoot = path.join(casRoot, 'sha256');
     const digestPrefix = path.dirname(absolutePath);
-    await ensureDurableChildDirectory(casRoot, temporaryRoot);
-    await ensureDurableChildDirectory(casRoot, digestRoot);
-    await ensureDurableChildDirectory(digestRoot, digestPrefix);
+    const recordDirectoryFsync = () => this.recordMetric('directory-fsync');
+    await ensureDurableChildDirectory(casRoot, temporaryRoot, recordDirectoryFsync);
+    await ensureDurableChildDirectory(casRoot, digestRoot, recordDirectoryFsync);
+    await ensureDurableChildDirectory(digestRoot, digestPrefix, recordDirectoryFsync);
     const temporaryPath = path.join(temporaryRoot, `${process.pid}-${randomUUID()}.tmp`);
     const handle = await fs.open(temporaryPath, 'wx', 0o600);
     try {
       await handle.writeFile(bytes);
+      this.recordMetric('temp-write');
       await handle.sync();
+      this.recordMetric('file-fsync');
     } finally {
       await handle.close();
     }
@@ -98,41 +116,80 @@ export class ContentAddressedStore {
       }
       // Both the publisher and an EEXIST observer must durably publish the directory entry before
       // either is allowed to commit a SQLite reference.
-      await syncDirectory(digestPrefix);
+      await syncDirectory(digestPrefix, recordDirectoryFsync);
     } finally {
       await fs.rm(temporaryPath, { force: true });
-      await syncDirectory(temporaryRoot);
+      await syncDirectory(temporaryRoot, recordDirectoryFsync);
     }
 
-    return {
-      contentType: normalizedType,
-      sha256,
-      byteLength: BigInt(bytes.length),
-      storageKey,
-      absolutePath
-    };
+    return published;
   }
 
   /**
-   * Publishes bytes first, then prepares (but does not commit) the ContentObject mutation. This lets
-   * a domain command commit its receipt, ContentObject reference and state transition atomically.
+   * Looks up committed metadata first, then publishes only a miss before preparing the uncommitted
+   * ContentObject mutation. A domain command can still commit its receipt, reference and transition
+   * atomically after the CAS bytes are durable.
    */
   public async prepare(
     database: RuntimeDatabase,
     content: Uint8Array | string,
     contentType: string
   ): Promise<PreparedContentObject> {
+    const prepared = await this.prepareBatch(database, [{ content, contentType }]);
+    if (!prepared[0]) throw new Error('CAS single prepare lost its input.');
+    return prepared[0];
+  }
+
+  public async prepareBatch(
+    database: RuntimeDatabase,
+    inputs: ReadonlyArray<{ content: Uint8Array | string; contentType: string }>
+  ): Promise<PreparedContentObject[]> {
+    if (inputs.length === 0) return [];
     if (!sameBindingIdentity(database.binding, this.binding)) {
       throw new Error('CAS and RuntimeDatabase must use the same RootBinding.');
     }
-    const published = await this.publish(content, contentType);
+    // Copy mutable Uint8Array inputs before the first await so identity and later publish always refer
+    // to exactly the same bytes.
+    const identified = inputs.map((input) => identifyContent(this.binding, input.content, input.contentType));
+    const unique = [...new Map(identified.map((entry) => [contentObjectId(entry.published), entry])).values()];
     const repository = DOMAIN_REPOSITORIES.domain('ContentObject');
-    const where = contentObjectIdentity(published);
-    const existing = await database.snapshot([repository.list({ where, limit: 1 })]);
-    const row = (existing.snapshot[0] as DomainRow[])[0];
-    if (row) return { metadata: asContentObjectMetadata(row) };
-    const metadata = contentObjectMetadata(published);
-    return { metadata, insert: repository.insert(metadata) };
+    // One snapshot is one worker request even when it carries several unique identity lookups.
+    const existing = await database.snapshot(unique.map((entry) =>
+      repository.list({ where: contentObjectIdentity(entry.published), limit: 1 })
+    ));
+    if (existing.snapshot.length !== unique.length) {
+      throw new Error('ContentObject batch lookup returned the wrong result count.');
+    }
+
+    const preparedById = new Map<string, PreparedContentObject>();
+    const missing: IdentifiedContent[] = [];
+    let lookupHits = 0;
+    unique.forEach((entry, index) => {
+      const rows = existing.snapshot[index];
+      if (!Array.isArray(rows)) throw new TypeError('ContentObject batch lookup did not return rows.');
+      const row = rows[0];
+      const id = contentObjectId(entry.published);
+      if (row) {
+        lookupHits += 1;
+        preparedById.set(id, { metadata: requireMatchingContentObject(row, entry.published) });
+      } else {
+        missing.push(entry);
+      }
+    });
+    this.recordMetric('lookup-hit', lookupHits);
+    this.recordMetric('lookup-miss', missing.length);
+
+    const publishedMisses = await Promise.all(missing.map((entry) => this.publishIdentified(entry)));
+    for (const published of publishedMisses) {
+      const metadata = contentObjectMetadata(published);
+      preparedById.set(metadata.id, { metadata, insert: repository.insert(metadata) });
+    }
+
+    return identified.map((entry) => {
+      const prepared = preparedById.get(contentObjectId(entry.published));
+      if (!prepared) throw new Error('ContentObject batch prepare lost an identified input.');
+      return prepared;
+    });
   }
 
   /** CAS publish completes before the ContentObject Repository transaction starts. */
@@ -214,6 +271,15 @@ export class ContentAddressedStore {
       return bytes;
     });
   }
+
+  private recordMetric(metric: ContentAddressedStoreMetric, count = 1): void {
+    if (!this.observeMetric || count === 0) return;
+    try {
+      this.observeMetric({ metric, count });
+    } catch {
+      // Development metrics must never alter CAS correctness or availability.
+    }
+  }
 }
 
 export function storageKeyForDigest(sha256: string): string {
@@ -260,6 +326,41 @@ function contentObjectMetadata(content: PublishedContent): ContentObjectMetadata
   };
 }
 
+function identifyContent(
+  binding: RootBinding,
+  content: Uint8Array | string,
+  contentType: string
+): IdentifiedContent {
+  const normalizedType = requireContentType(contentType);
+  const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const storageKey = storageKeyForDigest(sha256);
+  return {
+    bytes,
+    published: {
+      contentType: normalizedType,
+      sha256,
+      byteLength: BigInt(bytes.length),
+      storageKey,
+      absolutePath: absoluteCasPath(binding, storageKey)
+    }
+  };
+}
+
+function requireMatchingContentObject(row: DomainRow, expected: PublishedContent): ContentObjectMetadata {
+  const metadata = asContentObjectMetadata(row);
+  if (
+    metadata.id !== contentObjectId(expected)
+    || metadata.content_type !== expected.contentType
+    || metadata.sha256 !== expected.sha256
+    || metadata.byte_length !== expected.byteLength
+    || metadata.storage_key !== expected.storageKey
+  ) {
+    throw new Error('Existing ContentObject does not match the requested content identity.');
+  }
+  return metadata;
+}
+
 function absoluteCasPath(binding: RootBinding, storageKey: string): string {
   const root = path.resolve(binding.paths.casRootPath);
   const candidate = path.resolve(root, ...storageKey.split('/'));
@@ -287,7 +388,11 @@ async function assertExistingObject(filePath: string, digest: string, byteLength
   if (createHash('sha256').update(bytes).digest('hex') !== digest) throw new Error('Existing CAS object has the wrong digest.');
 }
 
-async function ensureDurableChildDirectory(parentPath: string, childPath: string): Promise<void> {
+async function ensureDurableChildDirectory(
+  parentPath: string,
+  childPath: string,
+  onFsync: () => void
+): Promise<void> {
   if (path.dirname(childPath) !== parentPath) {
     throw new Error(`CAS durable directory ${childPath} is not a direct child of ${parentPath}.`);
   }
@@ -299,14 +404,15 @@ async function ensureDurableChildDirectory(parentPath: string, childPath: string
     if (!stat.isDirectory()) throw new Error(`CAS path ${childPath} exists but is not a directory.`);
   }
   // Sync both sides even after EEXIST: a competing creator may not yet have synced the parent.
-  await syncDirectory(childPath);
-  await syncDirectory(parentPath);
+  await syncDirectory(childPath, onFsync);
+  await syncDirectory(parentPath, onFsync);
 }
 
-async function syncDirectory(directoryPath: string): Promise<void> {
+async function syncDirectory(directoryPath: string, onFsync: () => void): Promise<void> {
   const handle = await fs.open(directoryPath, 'r');
   try {
     await handle.sync();
+    onFsync();
   } finally {
     await handle.close();
   }

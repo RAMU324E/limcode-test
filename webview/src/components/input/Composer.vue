@@ -22,6 +22,7 @@ import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
+import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
 
 const props = withDefaults(
   defineProps<{
@@ -47,11 +48,16 @@ const session = useSessionStore();
 const reliableConversation = useReliableConversation();
 const {
   interruptCurrentConversation,
+  sendMessage,
   interruptPending,
   interruptPhase,
   compressContext,
   compressionPending,
-  currentAuthoritySelection
+  currentAuthoritySelection,
+  currentTurnInputAcknowledgements,
+  currentTurnInputFailure,
+  dismissTurnInputAcknowledgement,
+  dismissTurnInputFailure
 } = useChat();
 const highlighted = ref(false);
 const editorExpanded = ref(false);
@@ -66,16 +72,18 @@ const workEnvironmentDropdownCloseSignal = ref(0);
 const fileInput = ref<HTMLInputElement | null>(null);
 const attachmentScroller = ref<HTMLElement | null>(null);
 const channelModelPanel = ref<{ configId: string; style: Record<string, string> } | null>(null);
+const currentSubmissionCommandId = ref<string>();
 
 const draft = computed({
   get: () => ui.composerDraft,
   set: (next: string) => ui.setComposerDraft(next)
 });
 // Interaction 与普通输入是独立控制面：等待 AskUser/Plan 时，用户仍可创建排队 TurnIntent。
-const conversationInputDisabled = computed(() => props.disabled);
+const conversationInputDisabled = computed(() => props.disabled || Boolean(currentSubmissionCommandId.value));
 const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
 const sendTitle = computed(() => {
+  if (currentSubmissionCommandId.value) return '正在确认消息已持久化';
   if (ui.isEditing) return '提交编辑';
   return currentExecution.value ? '加入消息队列（不会解除当前审批或等待）' : '发送';
 });
@@ -219,6 +227,46 @@ const attachmentRefreshKey = computed(() => selectedAttachments.value.map((part,
 const hasDraftContent = computed(() => draft.value.trim().length > 0 || selectedAttachments.value.length > 0);
 const attachmentLimitBytes = computed(() => Math.max(1, globalSettings.attachments.maxStoredInlineFileMb || 20) * 1024 * 1024);
 
+watch(
+  () => currentSubmissionCommandId.value
+    ? currentTurnInputAcknowledgements.value[currentSubmissionCommandId.value]
+    : undefined,
+  (acknowledgement) => {
+    const commandId = currentSubmissionCommandId.value;
+    if (!commandId || !acknowledgement) return;
+    selectedAttachments.value = [];
+    ui.clearChatDraft();
+    currentSubmissionCommandId.value = undefined;
+    dismissTurnInputAcknowledgement(commandId);
+  }
+);
+
+watch(
+  [
+    () => currentTurnInputFailure.value?.commandId,
+    () => draft.value,
+    () => selectedAttachments.value.length
+  ],
+  () => {
+    const failure = currentTurnInputFailure.value;
+    if (!failure) return;
+    if (failure.commandId === currentSubmissionCommandId.value) {
+      currentSubmissionCommandId.value = undefined;
+      dismissTurnInputFailure(failure.commandId);
+      void nextTick(() => editor.value?.focus());
+      return;
+    }
+    if (draft.value.trim() || selectedAttachments.value.length > 0) return;
+    draft.value = failure.text;
+    selectedAttachments.value = (failure.content?.parts ?? []).flatMap((part) =>
+      'inlineData' in part ? [structuredClone(part as InlineDataPart)] : []
+    );
+    dismissTurnInputFailure(failure.commandId);
+    void nextTick(() => editor.value?.focus());
+  },
+  { immediate: true }
+);
+
 let highlightTimer: number | undefined;
 
 watch(
@@ -258,9 +306,14 @@ function submit(): void {
   const text = draft.value.trim();
   if ((!text && selectedAttachments.value.length === 0) || conversationInputDisabled.value) return;
   const content = buildMessageContent(text, selectedAttachments.value);
-  emit('submit', text, content, currentTurnAuthoritySelection());
-  selectedAttachments.value = [];
-  if (!ui.isEditing) ui.clearChatDraft();
+  if (ui.isEditing) {
+    emit('submit', text, content, currentTurnAuthoritySelection());
+    selectedAttachments.value = [];
+    return;
+  }
+  const submission = sendMessage(text, content, currentTurnAuthoritySelection());
+  if (!submission) return;
+  currentSubmissionCommandId.value = submission.commandId;
 }
 
 function openFilePicker(): void { fileInput.value?.click(); }
@@ -579,6 +632,7 @@ function middleEllipsis(value: string, maxLength: number): string {
   <div class="composer" :class="{ 'is-editing': ui.isEditing, 'is-highlighted': highlighted, 'is-editor-expanded': editorExpanded }">
     <div class="composer-zone composer-zone-top" aria-label="输入框上方功能区">
       <div class="composer-top-main">
+        <ReliableQueuePanel />
         <ReliableAgentStatusPanel />
         <AskUserTopPanel />
         <div v-if="ui.isEditing" class="composer-edit-indicator">

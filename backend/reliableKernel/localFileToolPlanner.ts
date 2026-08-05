@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { selectEditToolMode } from '../../shared/editToolArguments';
 import type { ToolDefinition } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDispatchInput
@@ -229,24 +230,25 @@ async function planMissingParentDirectories(
 }
 
 function applyEditArguments(source: string, args: { [key: string]: unknown }): string {
-  if (Array.isArray(args.hunks)) return applyHunks(source, args.hunks);
-  if (args.insert !== undefined) {
+  const mode = selectEditToolMode(args);
+  if (mode === 'hunk') {
+    if (!Array.isArray(args.hunks)) throw new Error('edit.hunks must be an array.');
+    return applyHunks(source, args.hunks);
+  }
+  if (mode === 'insert') {
     const insert = requireUnknownRecord(args.insert, 'edit.insert');
     const line = requirePositiveLine(insert.line, 'edit.insert.line');
     const content = requireString(insert.content, 'edit.insert.content');
     const offset = lineStartOffset(source, line, true);
     return `${source.slice(0, offset)}${content}${source.slice(offset)}`;
   }
-  if (args.delete !== undefined) {
-    const deletion = requireUnknownRecord(args.delete, 'edit.delete');
-    const startLine = requirePositiveLine(deletion.startLine, 'edit.delete.startLine');
-    const endLine = requirePositiveLine(deletion.endLine, 'edit.delete.endLine');
-    if (endLine < startLine) throw new Error('edit.delete.endLine must be >= startLine.');
-    const start = lineStartOffset(source, startLine, false);
-    const end = lineStartOffset(source, endLine + 1, true);
-    return `${source.slice(0, start)}${source.slice(end)}`;
-  }
-  throw new Error('edit requires hunks, insert, or delete.');
+  const deletion = requireUnknownRecord(args.delete, 'edit.delete');
+  const startLine = requirePositiveLine(deletion.startLine, 'edit.delete.startLine');
+  const endLine = requirePositiveLine(deletion.endLine, 'edit.delete.endLine');
+  if (endLine < startLine) throw new Error('edit.delete.endLine must be >= startLine.');
+  const start = lineStartOffset(source, startLine, false);
+  const end = lineStartOffset(source, endLine + 1, true);
+  return `${source.slice(0, start)}${source.slice(end)}`;
 }
 
 function applyHunks(source: string, hunks: unknown[]): string {

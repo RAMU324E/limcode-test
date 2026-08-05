@@ -3,7 +3,10 @@ import type {
   LlmProviderConfigRecord,
   LlmProviderKind
 } from '../../shared/protocol';
-import { createLlmProviderCapability } from '../capabilities/llmProvider';
+import {
+  createLlmProviderCapability,
+  type LlmProviderTransportTrace
+} from '../capabilities/llmProvider';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { LlmCapabilityFullRequestAdapter } from './llmCapabilityProviderAdapter';
 import type { FullRequestProviderAdapter } from './modelProviderControlPlane';
@@ -12,6 +15,7 @@ export interface ReliableLlmProviderRegistryOptions {
   loadProviderConfig(providerConfigId: string): Promise<LlmProviderConfigRecord>;
   proxy?: () => string | undefined | Promise<string | undefined>;
   headers?: Record<string, string>;
+  onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
   resolveAttachment?: (input: {
     attachmentId?: string;
     sourcePath?: string;
@@ -24,7 +28,7 @@ export interface ReliableLlmProviderRegistryOptions {
  * Product Provider registry backed by the existing stateless LLM capability.
  *
  * Provider/model identity always comes from the frozen ModelRequest. Capability-local retries are
- * disabled because ModelProviderControlPlane owns the visible, durable two-attempt retry contract.
+ * disabled because ModelProviderControlPlane owns the visible, durable, frozen-policy retry contract.
  */
 export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistry {
   private readonly adapters = new Map<string, FullRequestProviderAdapter>();
@@ -49,6 +53,7 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
       },
       ...(this.options.proxy ? { proxy: this.options.proxy } : {}),
       ...(this.options.headers ? { headers: { ...this.options.headers } } : {}),
+      ...(this.options.onTransportTrace ? { onTransportTrace: this.options.onTransportTrace } : {}),
       ...(this.options.resolveAttachment ? { resolveAttachment: this.options.resolveAttachment } : {})
     });
   }

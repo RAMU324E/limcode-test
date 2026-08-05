@@ -8,7 +8,11 @@ import {
   resetOpenAIResponsesWebSocketSessions,
   streamOpenAIResponsesWebSocketSession,
   type LimCodeOpenAIResponsesStreamChunk,
-  type OpenAIResponsesFormatAdapter
+  type OpenAIResponsesFormatAdapter,
+  type OpenAIResponsesWebSocketDecision,
+  type OpenAIResponsesWebSocketPhase,
+  type OpenAIResponsesWebSocketPhaseKind,
+  type OpenAIResponsesWebSocketTimeoutPhase
 } from './openAIResponsesWebSocketSession';
 import { LlmEventType } from '../world/modules/llm/events';
 import type {
@@ -106,6 +110,23 @@ interface UnifiedDryRunCapable {
   }): Promise<UnifiedDryRunResult>;
 }
 
+export interface LlmProviderTransportTrace {
+  requestId: string;
+  conversationId: string;
+  phase: OpenAIResponsesWebSocketPhaseKind | 'continuation_decision';
+  observedAt: number;
+  sessionKeyHash: string;
+  connectionGeneration: number;
+  elapsedMs?: number;
+  connectionReused?: boolean;
+  connectionReason?: OpenAIResponsesWebSocketDecision['connectionReason'];
+  mode?: OpenAIResponsesWebSocketDecision['mode'];
+  reason?: string;
+  timeoutPhase?: OpenAIResponsesWebSocketTimeoutPhase;
+  fullInputItemCount?: number;
+  sentInputItemCount?: number;
+}
+
 export interface LlmProviderOptions {
   settings: MaybeProvider<LlmProviderConfigRecord, LlmSettingsRequest>;
   proxy?: MaybeProvider<string>;
@@ -114,6 +135,7 @@ export interface LlmProviderOptions {
 
   headers?: MaybeProvider<Record<string, string>>;
   resolveAttachment?: (input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }) => Promise<InlineDataPart | undefined>;
+  onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
 }
 interface RetryControl {
   cancelRequested: boolean;
@@ -417,7 +439,8 @@ async function runLlmAttempt(
           unified,
           unifiedRequest,
           signal,
-          proxy
+          proxy,
+          onTransportTrace: options.onTransportTrace
         })
       : provider.chatStream<UnifiedLLMStreamChunk>(unifiedRequest, {
           inputFormat: 'unified',
@@ -499,6 +522,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   unifiedRequest: UnifiedLLMRequest;
   signal?: AbortSignal;
   proxy?: string;
+  onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
 }): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
   const dryRun = await input.provider.dryRun(input.unifiedRequest, {
     inputFormat: 'unified',
@@ -515,10 +539,24 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
     signal: input.signal,
     proxy: input.proxy,
     onDecision: (decision) => {
+      reportTransportTrace(input, {
+        requestId: input.request.id,
+        conversationId: input.request.conversationId ?? '',
+        phase: 'continuation_decision',
+        observedAt: Date.now(),
+        sessionKeyHash: decision.sessionKeyHash,
+        connectionGeneration: decision.connectionGeneration,
+        connectionReused: decision.connectionReused,
+        connectionReason: decision.connectionReason,
+        mode: decision.mode,
+        reason: decision.reason,
+        fullInputItemCount: decision.fullInputItemCount,
+        sentInputItemCount: decision.sentInputItemCount
+      });
       console.log('[LimCode][OpenAIResponsesWS]', JSON.stringify({
         implementation: LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION,
         requestId: input.request.id,
-        conversationId: input.request.conversationId,
+        conversationId: input.request.conversationId ?? '',
         sessionKeyHash: decision.sessionKeyHash,
         connectionGeneration: decision.connectionGeneration,
         connectionReused: decision.connectionReused,
@@ -531,8 +569,40 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
         sentInputFingerprint: decision.sentInputFingerprint,
         baselineFingerprint: decision.baselineFingerprint
       }));
-    }
+    },
+    onPhase: (phase) => reportTransportTrace(input, traceFromWebSocketPhase(input, phase))
   });
+}
+
+function traceFromWebSocketPhase(
+  input: { request: LlmStartRequest },
+  phase: OpenAIResponsesWebSocketPhase
+): LlmProviderTransportTrace {
+  return {
+    requestId: input.request.id,
+    conversationId: input.request.conversationId ?? '',
+    phase: phase.phase,
+    observedAt: phase.observedAt,
+    sessionKeyHash: phase.sessionKeyHash,
+    connectionGeneration: phase.connectionGeneration,
+    ...(phase.elapsedMs !== undefined ? { elapsedMs: phase.elapsedMs } : {}),
+    ...(phase.connectionReused !== undefined ? { connectionReused: phase.connectionReused } : {}),
+    ...(phase.connectionReason ? { connectionReason: phase.connectionReason } : {}),
+    ...(phase.mode ? { mode: phase.mode } : {}),
+    ...(phase.reason ? { reason: phase.reason } : {}),
+    ...(phase.timeoutPhase ? { timeoutPhase: phase.timeoutPhase } : {})
+  };
+}
+
+function reportTransportTrace(
+  input: { onTransportTrace?: (trace: LlmProviderTransportTrace) => void },
+  trace: LlmProviderTransportTrace
+): void {
+  try {
+    input.onTransportTrace?.(trace);
+  } catch {
+    // Observability is best-effort and must not become Provider authority.
+  }
 }
 
 function emitRetryRecovered(requestId: string, emit: Emit, notice: LlmAttemptRetryRecoveryNotice | undefined): void {

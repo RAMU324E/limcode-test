@@ -12,8 +12,16 @@ export const PROCESS_WRAPPER_EXIT_RECEIPT_FILE = 'exit-receipt.json';
 export const PROCESS_WRAPPER_STOP_REQUEST_FILE = 'stop-request.json';
 export const PROCESS_WRAPPER_CHUNKS_DIRECTORY = 'chunks';
 export const PROCESS_WRAPPER_PROTOCOL = 'limcode-process-wrapper';
+export const DEFAULT_PROCESS_EXECUTION_TIMEOUT_MS = 120_000;
+export const MIN_PROCESS_EXECUTION_TIMEOUT_MS = 1_000;
+export const MAX_PROCESS_EXECUTION_TIMEOUT_MS = 600_000;
+export const DEFAULT_PROCESS_MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
+export const MIN_PROCESS_MAX_OUTPUT_BYTES = 1024;
+export const MAX_PROCESS_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;
+export const PROCESS_TERMINATION_GRACE_MS = 2_000;
 
 export type ProcessStreamKind = 'stdout' | 'stderr';
+export type ProcessTerminationReason = 'natural' | 'manual' | 'timed_out' | 'output_limit_exceeded';
 
 export interface ProcessWrapperLaunchRequest {
   kind: typeof PROCESS_WRAPPER_PROTOCOL;
@@ -23,6 +31,10 @@ export interface ProcessWrapperLaunchRequest {
   cwd: string;
   commandDigest: string;
   spoolLocator: string;
+  /** Null is accepted only for launch contracts written by an older runtime. */
+  executionTimeoutMs: number | null;
+  executionDeadlineAt: string | null;
+  maxOutputBytes: number | null;
   createdAt: string;
 }
 
@@ -71,6 +83,10 @@ export interface ProcessWrapperExitReceipt {
   droppedBytes: string;
   truncated: boolean;
   stopRequested: boolean;
+  terminationReason: ProcessTerminationReason;
+  /** Null denotes a legacy wrapper that started before watchdog contracts existed. */
+  executionDeadlineAt: string | null;
+  maxOutputBytes: number | null;
 }
 
 export interface ProcessStopRequest {
@@ -187,11 +203,16 @@ export function parseWrapperManifest(value: unknown): ProcessWrapperManifest {
 }
 
 export function parseWrapperExitReceipt(value: unknown): ProcessWrapperExitReceipt {
-  const record = exactRecord(value, [
+  const legacyKeys = [
     'kind', 'processId', 'stableNonce', 'wrapperPid', 'childPid', 'processGroupId',
     'startFingerprint', 'commandDigest', 'exitCode', 'signal', 'exitedAt', 'retainedBytes',
     'retainedChunks', 'droppedBytes', 'truncated', 'stopRequested'
-  ], 'ProcessWrapperExitReceipt');
+  ] as const;
+  const currentKeys = [
+    ...legacyKeys,
+    'terminationReason', 'executionDeadlineAt', 'maxOutputBytes'
+  ] as const;
+  const { record, variant } = exactRecordVariant(value, [legacyKeys, currentKeys], 'ProcessWrapperExitReceipt');
   if (record.kind !== PROCESS_WRAPPER_PROTOCOL) throw new TypeError('Invalid ProcessWrapperExitReceipt.kind.');
   const hasExitCode = record.exitCode !== null;
   const hasSignal = record.signal !== null;
@@ -202,6 +223,24 @@ export function parseWrapperExitReceipt(value: unknown): ProcessWrapperExitRecei
   if (hasSignal) requireText(record.signal, 'signal');
   if (typeof record.truncated !== 'boolean' || typeof record.stopRequested !== 'boolean') {
     throw new TypeError('Invalid ProcessWrapperExitReceipt flags.');
+  }
+  const terminationReason = variant === 0
+    ? (record.stopRequested ? 'manual' : 'natural')
+    : requireTerminationReason(record.terminationReason);
+  const executionDeadlineAt = variant === 0
+    ? null
+    : requireNullableIsoTimestamp(record.executionDeadlineAt, 'executionDeadlineAt');
+  const maxOutputBytes = variant === 0
+    ? null
+    : requireNullablePositiveSafeInteger(record.maxOutputBytes, 'maxOutputBytes');
+  if ((terminationReason === 'manual') !== record.stopRequested) {
+    throw new TypeError('stopRequested must exactly match terminationReason=manual.');
+  }
+  if (terminationReason === 'timed_out' && executionDeadlineAt === null) {
+    throw new TypeError('timed_out receipt requires executionDeadlineAt.');
+  }
+  if (terminationReason === 'output_limit_exceeded' && maxOutputBytes === null) {
+    throw new TypeError('output_limit_exceeded receipt requires maxOutputBytes.');
   }
   return {
     kind: PROCESS_WRAPPER_PROTOCOL,
@@ -219,7 +258,10 @@ export function parseWrapperExitReceipt(value: unknown): ProcessWrapperExitRecei
     retainedChunks: requireDecimalString(record.retainedChunks, 'retainedChunks'),
     droppedBytes: requireDecimalString(record.droppedBytes, 'droppedBytes'),
     truncated: record.truncated,
-    stopRequested: record.stopRequested
+    stopRequested: record.stopRequested,
+    terminationReason,
+    executionDeadlineAt,
+    maxOutputBytes
   };
 }
 
@@ -281,14 +323,47 @@ export function requireSignedDecimalString(value: unknown, label: string): strin
 }
 
 function exactRecord(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {
+  return exactRecordVariant(value, [keys], label).record;
+}
+
+function exactRecordVariant(
+  value: unknown,
+  variants: readonly (readonly string[])[],
+  label: string
+): { record: Record<string, unknown>; variant: number } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
   const record = value as Record<string, unknown>;
   const actual = Object.keys(record).sort();
-  const expected = [...keys].sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new TypeError(`${label} fields do not match the current wrapper contract.`);
+  for (let variant = 0; variant < variants.length; variant += 1) {
+    const expected = [...variants[variant]!].sort();
+    if (actual.length === expected.length && actual.every((key, index) => key === expected[index])) {
+      return { record, variant };
+    }
   }
-  return record;
+  throw new TypeError(`${label} fields do not match the current wrapper contract.`);
+}
+
+function requireTerminationReason(value: unknown): ProcessTerminationReason {
+  if (!['natural', 'manual', 'timed_out', 'output_limit_exceeded'].includes(String(value))) {
+    throw new TypeError('Invalid ProcessWrapperExitReceipt.terminationReason.');
+  }
+  return value as ProcessTerminationReason;
+}
+
+function requireNullableIsoTimestamp(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+    throw new TypeError(`${label} must be an ISO timestamp or null.`);
+  }
+  return value;
+}
+
+function requireNullablePositiveSafeInteger(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer or null.`);
+  }
+  return value;
 }
 
 function requireLocator(value: unknown): string {

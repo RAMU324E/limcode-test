@@ -470,14 +470,15 @@
         "insert",
         "update"
       ],
-      "client": "detail",
+      "client": "summary",
       "deletePolicy": "cascade-with-turn",
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "turn_id"
       ],
       "notes": [
-        "turn_id 可空（admit 前为空），普通索引非 UNIQUE"
+        "turn_id 可空（admit 前为空），普通索引非 UNIQUE",
+        "仅普通 queued Intent 进入 bounded activeConversationWindow；正文通过 conversation-scoped bounded preview 按需读取"
       ]
     },
     {

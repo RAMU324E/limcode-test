@@ -4,9 +4,14 @@ import { ContentAddressedStore } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   ContextSequenceControlPlane,
-  contextSequenceNodeId,
-  type StructuralContextRecord
+  contextSequenceNodeId
 } from './contextSequence';
+import {
+  canonicalizeCompressionContents,
+  estimateMaterializedContextTokens,
+  estimateMessageContentsTokens,
+  ReliableContextTokenEstimator
+} from './contextTokenEstimator';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -43,12 +48,16 @@ export interface CreateCompressionCommand {
   summaryMetadata?: {
     trigger: 'auto' | 'manual';
     methodKind: string;
+    /** Provider-observed output tokens for the structured compact state. */
+    estimatedTokens?: number;
     nativeBinding?: {
       providerConfigId: string;
       provider: string;
       modelId: string;
     };
   };
+  /** Provider-aligned estimate for summary plus finite tail. */
+  projectedEstimatedTokens?: number;
   /** Automatic compression enforces the frozen threshold; explicit manual compression may opt out. */
   enforceThreshold?: boolean;
   idempotencyKey: string;
@@ -97,6 +106,7 @@ export const CONTENT_TYPE_COMPRESSION_CONTENTS = 'application/vnd.limcode.compre
 /** Immutable compression command boundary. Source rows are O(k); sequence attachment is one node. */
 export class ContextCompressionControlPlane {
   private readonly context: ContextSequenceControlPlane;
+  private readonly tokenEstimator: ReliableContextTokenEstimator;
   private readonly now: () => string;
 
   public constructor(
@@ -106,21 +116,21 @@ export class ContextCompressionControlPlane {
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.context = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
   public async evaluate(rootIdInput: string, authoritySnapshotIdInput: string): Promise<CompressionDecision> {
     const rootId = requireId(rootIdInput, 'rootId');
     const authoritySnapshotId = requireId(authoritySnapshotIdInput, 'authoritySnapshotId');
-    const [materialized, frozen] = await Promise.all([
-      this.context.materializeStructure(rootId),
-      this.readFrozenProfile(authoritySnapshotId)
+    const [frozen, estimate] = await Promise.all([
+      this.readFrozenProfile(authoritySnapshotId),
+      this.tokenEstimator.estimateRoot(rootId)
     ]);
-    if (frozen.conversationId !== requireId(
-      materialized.root.conversation_id,
-      'ContextSequenceRoot.conversation_id'
-    )) throw new Error('AuthoritySnapshot belongs to another Conversation.');
+    if (frozen.conversationId !== estimate.conversationId) {
+      throw new Error('AuthoritySnapshot belongs to another Conversation.');
+    }
     const profile = frozen.profile;
-    const estimatedTokens = estimateStructure(materialized.records, profile);
+    const estimatedTokens = estimate.estimatedTokens;
     return {
       rootId,
       authoritySnapshotId,
@@ -161,7 +171,11 @@ export class ContextCompressionControlPlane {
         sourceCount: requestedSourceCount
       });
     }
-    const materialized = await this.context.materializeStructure(headRootId);
+    const [materialized, semanticMaterialized, sourceEstimate] = await Promise.all([
+      this.context.materializeStructure(headRootId),
+      this.context.materialize(headRootId),
+      this.tokenEstimator.estimateRoot(headRootId)
+    ]);
     if (materialized.root.conversation_id !== conversationId) {
       throw new Error(`ContextSequenceRoot ${headRootId} belongs to another Conversation.`);
     }
@@ -169,7 +183,7 @@ export class ContextCompressionControlPlane {
     const frozen = await this.readFrozenProfile(authoritySnapshotId);
     if (frozen.conversationId !== conversationId) throw new Error('AuthoritySnapshot belongs to another Conversation.');
     const profile = frozen.profile;
-    const sourceEstimatedTokens = estimateStructure(materialized.records, profile);
+    const sourceEstimatedTokens = sourceEstimate.estimatedTokens;
     if (command.enforceThreshold !== false && sourceEstimatedTokens < profile.compressionThresholdTokens) {
       throw new Error(
         `Context root ${headRootId} is below its frozen compression threshold `
@@ -182,8 +196,10 @@ export class ContextCompressionControlPlane {
     const sourceSegments = materialized.records.slice(0, compressCount);
     const tail = materialized.records.slice(compressCount);
     const now = this.timestamp();
-    const rootEstimatedTokens = estimateBytes(summaryContent.metadata.byte_length, profile)
-      + estimateStructure(tail, profile);
+    const rootEstimatedTokens = command.projectedEstimatedTokens === undefined
+      ? estimateCompressionSummaryInput(command.summary, command.summaryMetadata)
+        + estimateMaterializedContextTokens(semanticMaterialized.segments.slice(compressCount))
+      : requireEstimatedTokens(command.projectedEstimatedTokens, 'projectedEstimatedTokens');
     const steps: RepositoryTransactionStep[] = [
       headAssertion(head, conversationId, headRootId),
       ...preparedContentObjectSteps([titleContent, summaryContent], 'compression_content'),
@@ -322,7 +338,10 @@ export class ContextCompressionControlPlane {
       });
     }
     if (previousBlock.status !== 'enabled') throw new Error('Only an enabled CompressionBlock can be replaced.');
-    const current = await this.context.materializeStructure(expectedHeadRootId);
+    const [current, semanticCurrent] = await Promise.all([
+      this.context.materializeStructure(expectedHeadRootId),
+      this.context.materialize(expectedHeadRootId)
+    ]);
     if (current.root.conversation_id !== conversationId) throw new Error('Expected Context head belongs to another Conversation.');
     if (current.records[0]?.segment.segment_kind !== 'compression') {
       throw new Error('Current Context root is not a compression root.');
@@ -333,14 +352,12 @@ export class ContextCompressionControlPlane {
     }
     const frozen = await this.readFrozenProfile(authoritySnapshotId);
     if (frozen.conversationId !== conversationId) throw new Error('AuthoritySnapshot belongs to another Conversation.');
-    const profile = frozen.profile;
     const head = await this.requireHead(conversationId, expectedHeadRootId);
     const titleContent = await this.contentStore.prepare(this.database, title, CONTENT_TYPE_TITLE);
     const summaryContent = await this.contentStore.prepare(this.database, summary.content, summary.contentType);
     const now = this.timestamp();
-    const tail = current.records.slice(1);
-    const rootEstimatedTokens = estimateBytes(summaryContent.metadata.byte_length, profile)
-      + estimateStructure(tail, profile);
+    const rootEstimatedTokens = estimateCompressionSummaryInput(command.summary)
+      + estimateMaterializedContextTokens(semanticCurrent.segments.slice(1));
     const steps: RepositoryTransactionStep[] = [
       headAssertion(head, conversationId, expectedHeadRootId),
       DOMAIN_REPOSITORIES.domain('CompressionBlock').assert(previousBlockId, { status: 'enabled' }),
@@ -608,23 +625,22 @@ function headAssertion(head: DomainRow, conversationId: string, rootId: string):
   );
 }
 
-function estimateStructure(
-  records: readonly StructuralContextRecord[],
-  profile: FrozenContextProfileDocument['modelProfile']
+function estimateCompressionSummaryInput(
+  input: string | MessageContent[],
+  metadata?: CreateCompressionCommand['summaryMetadata']
 ): number {
-  return records.reduce((total, record) =>
-    total + estimateBytes(requireBigInt(record.contentObject.byte_length, 'ContentObject.byte_length'), profile),
-  0);
+  const observed = metadata?.estimatedTokens;
+  if (observed !== undefined) return requireEstimatedTokens(observed, 'summaryMetadata.estimatedTokens');
+  return typeof input === 'string'
+    ? estimateMessageContentsTokens([{ role: 'model', parts: [{ text: input }] }])
+    : estimateMessageContentsTokens(input);
 }
 
-function estimateBytes(
-  byteLength: bigint,
-  profile: FrozenContextProfileDocument['modelProfile']
-): number {
-  const divisor = BigInt(profile.tokenEstimator.bytesPerToken);
-  const value = (byteLength + divisor - 1n) / divisor;
-  if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError('Estimated token count exceeds the safe integer range.');
-  return Number(value);
+function requireEstimatedTokens(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer.`);
+  }
+  return value;
 }
 
 function allocatedValue(
@@ -727,12 +743,12 @@ function normalizeCompressionSummary(
   if (!Array.isArray(input) || input.length === 0) {
     throw new TypeError('Structured compression summary must contain at least one MessageContent.');
   }
-  const contents = input.map((content, index) => {
+  const contents = canonicalizeCompressionContents(input.map((content, index) => {
     if (!content || (content.role !== 'user' && content.role !== 'model') || !Array.isArray(content.parts)) {
       throw new TypeError(`Structured compression summary item ${index} is invalid.`);
     }
     return content;
-  });
+  }));
   let encoded: string;
   try {
     encoded = JSON.stringify({
@@ -742,6 +758,9 @@ function normalizeCompressionSummary(
       ...(metadata ? {
         trigger: requireCompressionTrigger(metadata.trigger),
         methodKind: requireText(metadata.methodKind, 'summaryMetadata.methodKind'),
+        ...(metadata.estimatedTokens === undefined ? {} : {
+          estimatedTokens: requireEstimatedTokens(metadata.estimatedTokens, 'summaryMetadata.estimatedTokens')
+        }),
         ...(metadata.nativeBinding ? {
           nativeBinding: {
             providerConfigId: requireText(

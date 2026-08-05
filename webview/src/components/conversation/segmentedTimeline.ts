@@ -22,7 +22,10 @@ export function mountedTimelineRowCount(totalRows: number, pendingRows = 0): num
  * array index therefore stops being the transcript floor once a conversation exceeds that window.
  */
 export function absoluteTimelineFloor(messageSeq: number, fallbackFloor: number): number {
-  if (Number.isSafeInteger(messageSeq) && messageSeq > 0) return messageSeq;
+  if (Number.isFinite(messageSeq) && messageSeq > 0) {
+    const projectedFloor = Math.ceil(messageSeq);
+    if (Number.isSafeInteger(projectedFloor)) return projectedFloor;
+  }
   if (!Number.isSafeInteger(fallbackFloor) || fallbackFloor <= 0) {
     throw new RangeError('fallbackFloor must be a positive integer.');
   }

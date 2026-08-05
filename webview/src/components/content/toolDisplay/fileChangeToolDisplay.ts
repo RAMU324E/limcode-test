@@ -1,5 +1,11 @@
 import { IconFileDiff, IconPencil, IconTrash, IconWriting } from '@tabler/icons-vue';
 import { DELETE_TOOL_NAME, EDIT_TOOL_NAME, WRITE_TOOL_NAME } from '@shared/protocol';
+import {
+  hasRequestedEditDelete,
+  hasRequestedEditHunks,
+  hasRequestedEditInsert,
+  selectEditToolMode
+} from '@shared/editToolArguments';
 import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useCheckpointPolicyStore } from '@webview/stores/useCheckpointPolicyStore';
@@ -122,14 +128,28 @@ function writeInputSections(args: WriteArgs, context: ToolDisplayContext): ToolD
 function editInputSections(args: EditArgs, context: ToolDisplayContext): ToolDisplaySection[] {
   const path = normalizePath(args.path);
   if (!path) return [{ kind: 'input', title: '输入', text: context.stringifyValue(context.args) }];
+  const mode = selectEditToolMode(args);
   return [{
     kind: 'input',
     title: '修改参数',
     rows: parameterRows([
       { label: 'path', value: path },
-      { label: 'hunks', value: Array.isArray(args.hunks) ? `${args.hunks.length} 个` : undefined },
-      { label: 'insert', value: args.insert ? `第 ${args.insert.line} 行，${args.insert.content?.length ?? 0} 字符` : undefined },
-      { label: 'delete', value: args.delete ? `第 ${args.delete.startLine}-${args.delete.endLine} 行` : undefined }
+      {
+        label: 'hunks',
+        value: mode === 'hunk' && hasRequestedEditHunks(args.hunks) ? `${args.hunks.length} 个` : undefined
+      },
+      {
+        label: 'insert',
+        value: mode === 'insert' && hasRequestedEditInsert(args.insert)
+          ? `第 ${args.insert?.line} 行，${args.insert?.content?.length ?? 0} 字符`
+          : undefined
+      },
+      {
+        label: 'delete',
+        value: mode === 'delete' && hasRequestedEditDelete(args.delete)
+          ? `第 ${args.delete?.startLine}-${args.delete?.endLine} 行`
+          : undefined
+      }
     ]),
     rowStyle: 'keyValue'
   }];

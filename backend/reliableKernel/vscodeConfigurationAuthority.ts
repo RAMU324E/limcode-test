@@ -34,6 +34,7 @@ import type {
   WorkEnvironmentRecord,
   WorkflowRecord
 } from '../../shared/protocol';
+import { MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
 import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
@@ -293,7 +294,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         providerConfigId: provider.id,
         provider: provider.provider,
         modelId,
-        enableMultimodalTools
+        enableMultimodalTools,
+        retryPolicy: frozenProviderRetryPolicy(provider, modelId)
       },
       modelProfile: {
         id: modelProfile?.id ?? null,
@@ -819,9 +821,28 @@ function resolveFrozenCompression(
       provider: {
         providerConfigId: compressionProvider.id,
         provider: compressionProvider.provider,
-        modelId: compressionModelId
+        modelId: compressionModelId,
+        retryPolicy: frozenProviderRetryPolicy(compressionProvider, compressionModelId)
       }
     }
+  };
+}
+
+function frozenProviderRetryPolicy(
+  provider: LlmProviderConfigRecord,
+  modelId: string
+): { enabled: boolean; maxRetries: number } {
+  const model = provider.modelConfigs.find((candidate) => candidate.modelId.trim() === modelId.trim());
+  const enabled = model?.retryOnError ?? provider.retryOnError;
+  const configured = model?.retryMaxAttempts ?? provider.retryMaxAttempts;
+  const normalized = configured === -1
+    ? MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS
+    : Number.isSafeInteger(configured) && configured >= 0
+      ? Math.min(configured, MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS)
+      : 0;
+  return {
+    enabled: enabled === true && normalized > 0,
+    maxRetries: enabled === true ? normalized : 0
   };
 }
 

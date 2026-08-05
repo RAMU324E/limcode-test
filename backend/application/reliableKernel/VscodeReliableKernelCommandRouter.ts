@@ -23,6 +23,7 @@ import {
   type PlanProposalExportPayload,
   type ToolDecisionPayload,
   type TurnInterruptPayload,
+  type TurnInputResultPayload,
   type TurnStartPayload,
   type WebviewToExtensionMessage
 } from '../../../shared/protocol';
@@ -69,7 +70,23 @@ export class VscodeReliableKernelCommandRouter {
     void this.dispatch(clientId, webview, message).catch((error) => {
       const text = error instanceof Error ? error.message : String(error);
       console.error('[LimCode] Reliable Webview command failed.', message.type, error);
-      this.postRequestError(webview, message.type, text, message.id);
+      if (
+        (message.type === BridgeMessageType.TurnStart || message.type === BridgeMessageType.TurnEnqueue)
+        && message.payload?.command?.commandId
+        && message.payload.conversationId
+      ) {
+        this.postTurnInputResult(webview, message.id, {
+          commandId: message.payload.command.commandId,
+          conversationId: message.payload.conversationId,
+          requestType: message.type,
+          status: 'rejected',
+          admitted: false,
+          deduplicated: false,
+          message: text
+        });
+      } else {
+        this.postRequestError(webview, message.type, text, message.id);
+      }
       if (isConfigurationMutationType(message.type)) {
         void this.postConfigurationSnapshot(webview).catch((snapshotError) =>
           console.warn('[LimCode] Failed to reconcile configuration snapshot after mutation error.', snapshotError)
@@ -354,7 +371,12 @@ export class VscodeReliableKernelCommandRouter {
         throw new Error('Checkpoint 功能当前未启用。');
       case BridgeMessageType.TurnStart:
       case BridgeMessageType.TurnEnqueue:
-        await this.handleTurnInput(requirePayload(message.payload, 'Turn input'));
+        await this.handleTurnInput(
+          webview,
+          message.id,
+          message.type,
+          requirePayload(message.payload, 'Turn input')
+        );
         return;
       case BridgeMessageType.TurnInterrupt:
         await this.handleInterrupt(
@@ -675,29 +697,59 @@ export class VscodeReliableKernelCommandRouter {
     });
   }
 
-  private async handleTurnInput(payload: TurnStartPayload): Promise<void> {
+  private async handleTurnInput(
+    webview: vscode.Webview,
+    correlationId: string,
+    requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue,
+    payload: TurnStartPayload
+  ): Promise<void> {
     await this.product.ensureCapabilitiesReady();
     const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
-    if (childExecutionId) {
-      const content = serializeMessagePayload(payload.text, payload.content);
-      await this.product.childAgents.inputFromConversation({
-        commandId: payload.command.commandId,
-        childExecutionId,
-        conversationId: payload.conversationId,
-        content: content.value,
-        contentType: content.contentType,
-        ...(payload.agentId?.trim() ? { executorAgentId: payload.agentId.trim() } : {}),
-        ...(payload.model ? { modelOverride: payload.model } : {})
-      });
-      return;
-    }
-    await this.product.conversations.input({
+    const childContent = childExecutionId
+      ? serializeMessagePayload(payload.text, payload.content)
+      : undefined;
+    const result = childExecutionId
+      ? await this.product.childAgents.inputFromConversation({
+          commandId: payload.command.commandId,
+          childExecutionId,
+          conversationId: payload.conversationId,
+          content: childContent!.value,
+          contentType: childContent!.contentType,
+          ...(payload.agentId?.trim() ? { executorAgentId: payload.agentId.trim() } : {}),
+          ...(payload.model ? { modelOverride: payload.model } : {})
+        })
+      : await this.product.conversations.input({
+          commandId: payload.command.commandId,
+          conversationId: payload.conversationId,
+          ...(payload.text ? { text: payload.text } : {}),
+          ...(payload.content ? { content: payload.content } : {}),
+          ...(payload.agentId?.trim() ? { agentId: payload.agentId.trim() } : {}),
+          ...(payload.model ? { model: payload.model } : {})
+        });
+    this.postTurnInputResult(webview, correlationId, {
       commandId: payload.command.commandId,
       conversationId: payload.conversationId,
-      ...(payload.text ? { text: payload.text } : {}),
-      ...(payload.content ? { content: payload.content } : {}),
-      ...(payload.agentId?.trim() ? { agentId: payload.agentId.trim() } : {}),
-      ...(payload.model ? { model: payload.model } : {})
+      requestType,
+      status: result.deduplicated ? 'replayed' : result.admitted ? 'accepted' : 'queued',
+      admitted: result.admitted === true,
+      deduplicated: result.deduplicated,
+      ...(result.intentId ? { intentId: result.intentId } : {}),
+      ...(result.turnId ? { turnId: result.turnId } : {}),
+      ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
+    });
+  }
+
+  private postTurnInputResult(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: TurnInputResultPayload
+  ): void {
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.TurnInputResult,
+      channel: 'control',
+      correlationId,
+      payload
     });
   }
 

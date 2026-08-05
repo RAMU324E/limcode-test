@@ -93,7 +93,9 @@ function detectCommandProfile(): CommandProfile {
       toolName: 'shell',
       commandPrefix: PS_UTF8_PREFIX,
       description: `Run a non-interactive PowerShell command in the project workspace. Returns stdout, stderr, and exitCode.
-Foreground wait behavior: foregroundWaitMs is the tool-response wait budget, not a command timeout. If the command is still running after foregroundWaitMs, it is moved to the background and the tool returns a generated processId with status=running and exitCode=null; foregroundWaitMs=0 backgrounds immediately. Use mode=output with that processId to peek accumulated output, or mode=kill to terminate it. When a background process exits naturally, the current Agent is notified automatically; logs remain available until an explicit mode=output call uses consume=true.
+Foreground/background behavior: foregroundWaitMs is only the tool-response budget. Reaching it moves the command to the background and returns processId; it does not terminate the command. foregroundWaitMs=0 backgrounds immediately.
+Execution watchdog: executionTimeoutMs is the independent hard runtime deadline (default 120000ms, maximum 600000ms). maxOutputBytes limits combined stdout+stderr (default 256MiB). Either watchdog remains active after background handoff and reports timed_out or output_limit_exceeded.
+Completion delivery: background completion and watchdog termination are reported proactively. Do not poll mode=output merely to wait; use it only for an explicit progress check or to follow a returned output handle. Use mode=kill to terminate manually.
 Safety: built-in protection only blocks disk/filesystem formatting and direct root deletion; additional commands can be denied by the tool policy deny list.
 Command syntax: separate multiple commands with semicolons ; quote paths that contain spaces; for long output, prefer piping to Select-Object -First N.
 Encoding: the tool configures PowerShell input/output as UTF-8 by default. When reading non-UTF-8 files, specify the encoding explicitly in the command.`
@@ -105,7 +107,9 @@ Encoding: the tool configures PowerShell input/output as UTF-8 by default. When 
     toolName: 'bash',
     executable: process.env.SHELL || '/bin/bash',
     description: `Run a non-interactive Bash/Shell command in the project workspace. Returns stdout, stderr, and exitCode.
-Foreground wait behavior: foregroundWaitMs is the tool-response wait budget, not a command timeout. If the command is still running after foregroundWaitMs, it is moved to the background and the tool returns a generated processId with status=running and exitCode=null; foregroundWaitMs=0 backgrounds immediately. Use mode=output with that processId to peek accumulated output, or mode=kill to terminate it. When a background process exits naturally, the current Agent is notified automatically; logs remain available until an explicit mode=output call uses consume=true.
+Foreground/background behavior: foregroundWaitMs is only the tool-response budget. Reaching it moves the command to the background and returns processId; it does not terminate the command. foregroundWaitMs=0 backgrounds immediately.
+Execution watchdog: executionTimeoutMs is the independent hard runtime deadline (default 120000ms, maximum 600000ms). maxOutputBytes limits combined stdout+stderr (default 256MiB). Either watchdog remains active after background handoff and reports timed_out or output_limit_exceeded.
+Completion delivery: background completion and watchdog termination are reported proactively. Do not poll mode=output merely to wait; use it only for an explicit progress check or to follow a returned output handle. Use mode=kill to terminate manually.
 Safety: built-in protection only blocks disk/filesystem formatting and direct root deletion; additional commands can be denied by the tool policy deny list.
 Command syntax: prefer joining multiple commands with &&; quote paths that contain spaces; for long output, prefer piping to head -n N.`
   };

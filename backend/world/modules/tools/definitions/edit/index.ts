@@ -1,4 +1,5 @@
 import { EDIT_TOOL_NAME, type EditToolMode } from '../../../../../../shared/protocol';
+import { selectEditToolMode } from '../../../../../../shared/editToolArguments';
 import type { FsDeleteEditRequest, FsEditFileRequest, FsHunkEditRequest, FsInsertEditRequest } from '../../../../../capabilities/types';
 import type { ToolDefinition } from '../../registry';
 import { staticToolScheduling } from '../../schedulingContract';
@@ -50,7 +51,7 @@ export const editTool: ToolDefinition = {
   summary: summarizeEditToolCall,
   async execute(rawArgs, deps, ctx) {
     const args = (rawArgs ?? {}) as EditArgs;
-    const runtimeMode = detectEditMode(args);
+    const runtimeMode = selectEditToolMode(args);
     const path = normalizeDisplayPath(args.path);
     if (!path) return { ok: false, output: failedOutput(runtimeMode, path, 'Missing required argument: path') };
 
@@ -81,6 +82,7 @@ export function editToolParameters(): unknown {
   const base = hunkModeParameters() as { type: string; properties: Record<string, unknown>; required: string[] };
   return {
     ...base,
+    description: 'Provide exactly one edit branch: non-empty hunks, insert, or delete. Do not combine branches.',
     properties: {
       ...base.properties,
       insert: insertModeParameters(),
@@ -107,14 +109,16 @@ export function hunkModeParameters(): unknown {
       path: { type: 'string', description: 'File path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
       hunks: {
         type: 'array',
-        description: 'Ordered hunk blocks. Each hunk performs exact search/replace in this same file. Use multiple hunks to modify multiple locations in one call.',
+        minItems: 1,
+        description: 'Ordered hunk blocks. This branch is mutually exclusive with insert and delete. Each hunk performs exact search/replace in this same file.',
         items: {
           type: 'object',
           properties: {
-            oldContent: { type: 'string', description: 'Existing file text to find. Must be an exact substring of the current file at the time this hunk runs.' },
+            oldContent: { type: 'string', description: 'Existing file text to find. Must be an exact non-empty substring of the current file at the time this hunk runs.' },
             newContent: { type: 'string', description: 'Replacement text exactly as it should appear in the final file. Use an empty string to remove the matched text.' },
             replaceAll: { type: 'boolean', description: 'Whether this hunk replaces every non-overlapping oldContent match. Defaults to false, replacing only the first match.' }
-          }
+          },
+          required: ['oldContent', 'newContent']
         }
       }
     },
@@ -128,37 +132,32 @@ export function insertDeleteDescription(): string {
     'Line-based modes remain available:',
     '- insert: provide insert={ line, content } to insert text before the given 1-based line number. Use line N+1 to append after the last line.',
     '- delete: provide delete={ startLine, endLine } to remove lines in the inclusive range [startLine, endLine].',
-    'When using insert or delete, hunks is not required.'
+    'Provide exactly one of hunks, insert, or delete. When using insert or delete, hunks is not required.'
   ].join('\n');
 }
 
 export function insertModeParameters(): unknown {
   return {
     type: 'object',
+    description: 'Line insertion branch. Do not provide it together with hunks or delete.',
     properties: {
-      line: { type: 'number', description: '1-based line number before which to insert content. Use line N+1 to append after the last line of the file.' },
-      content: { type: 'string', description: 'Text to insert at the specified line position. May contain multiple lines separated by newlines.' }
-    }
+      line: { type: 'number', minimum: 1, description: '1-based line number before which to insert content. Use line N+1 to append after the last line.' },
+      content: { type: 'string', description: 'Non-empty text to insert at the specified line position. May contain multiple lines separated by newlines.' }
+    },
+    required: ['line', 'content']
   };
 }
 
 export function deleteModeParameters(): unknown {
   return {
     type: 'object',
+    description: 'Line deletion branch. Do not provide it together with hunks or insert.',
     properties: {
-      startLine: { type: 'number', description: '1-based first line to delete (inclusive).' },
-      endLine: { type: 'number', description: '1-based last line to delete (inclusive).' }
-    }
+      startLine: { type: 'number', minimum: 1, description: '1-based first line to delete (inclusive).' },
+      endLine: { type: 'number', minimum: 1, description: '1-based last line to delete (inclusive).' }
+    },
+    required: ['startLine', 'endLine']
   };
-}
-
-function detectEditMode(args: EditArgs): EditToolMode {
-  if (hasRequestedHunks(args.hunks)) return 'hunk';
-  if (hasRequestedInsert(args.insert)) return 'insert';
-  if (hasRequestedDelete(args.delete)) return 'delete';
-  if (args.insert !== undefined) return 'insert';
-  if (args.delete !== undefined) return 'delete';
-  return 'hunk';
 }
 
 function buildEditRequest(path: string, args: EditArgs, mode: EditToolMode): FsEditFileRequest {
@@ -224,16 +223,4 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
-}
-
-function hasRequestedHunks(value: unknown): boolean {
-  return Array.isArray(value) && value.length > 0;
-}
-
-function hasRequestedInsert(value: EditArgs['insert']): boolean {
-  return Boolean(value && typeof value.line === 'number' && value.line >= 1 && typeof value.content === 'string' && value.content.length > 0);
-}
-
-function hasRequestedDelete(value: EditArgs['delete']): boolean {
-  return Boolean(value && typeof value.startLine === 'number' && value.startLine >= 1 && typeof value.endLine === 'number' && value.endLine >= 1);
 }

@@ -21,7 +21,28 @@ const conversationTurns = computed(() => new Map(Object.values(reliableConversat
 const conversationRequests = computed(() => Object.values(reliableConversation.feed.records.ModelRequest ?? {})
   .filter((request) => conversationTurns.value.has(String(request.turn_id)))
   .sort((left, right) => requestOrder(right) - requestOrder(left) || integer(right.request_seq) - integer(left.request_seq)));
-const latestRequest = computed(() => conversationRequests.value[0]);
+const ordinaryRequestIds = computed(() => new Set(
+  Object.values(reliableConversation.feed.records.ModelRequestMessageLink ?? {})
+    .map((link) => text(link.model_request_id))
+    .filter(Boolean)
+));
+// Compression calls are ModelRequests too, but their usage describes the compaction operation rather
+// than the ordinary model prompt. Only requests that own an assistant Message are context baselines.
+const ordinaryRequests = computed(() => conversationRequests.value
+  .filter((request) => ordinaryRequestIds.value.has(text(request.id))));
+const latestOrdinaryRequest = computed(() => ordinaryRequests.value[0]);
+const latestCompressionChange = computed(() => Object.values(
+  reliableConversation.feed.records.CompressionBlock ?? {}
+).filter((block) => block.conversation_id === reliableConversation.conversationId.value)
+  .reduce((latest, block) => Math.max(latest, timestamp(block.updated_at), timestamp(block.created_at)), 0));
+const ordinaryUsageStale = computed(() => {
+  const request = latestOrdinaryRequest.value;
+  if (!request || latestCompressionChange.value <= 0) return false;
+  return latestCompressionChange.value >= Math.max(timestamp(request.updated_at), timestamp(request.created_at));
+});
+// Configuration may fall back to a compression request before an ordinary response is linked, but
+// usage below must never use that compaction call as the conversation-context baseline.
+const latestRequest = computed(() => latestOrdinaryRequest.value ?? conversationRequests.value[0]);
 const currentContextStatus = computed(() => Object.values(reliableConversation.feed.records.ConversationContextStatus ?? {})
   .find((status) => status.conversation_id === reliableConversation.conversationId.value));
 const providerConfig = computed(() => activeProviderConfig());
@@ -35,11 +56,12 @@ const contextWindowTokens = computed(() =>
   ?? positiveInteger(providerConfig.value?.contextWindowTokens)
 );
 const exactUsage = computed(() => {
-  const requestId = text(latestRequest.value?.id);
+  if (ordinaryUsageStale.value) return undefined;
+  const requestId = text(latestOrdinaryRequest.value?.id);
   const transient = requestId
     ? reliableConversation.feed.transientModelRequests[requestId]?.usageMetadata
     : undefined;
-  return transient ?? usageFromRequest(latestRequest.value);
+  return transient ?? usageFromRequest(latestOrdinaryRequest.value);
 });
 const exactContextTokens = computed(() => tokenCount(exactUsage.value));
 const estimatedContextTokens = computed(() =>
@@ -47,19 +69,20 @@ const estimatedContextTokens = computed(() =>
   ?? positiveInteger(latestRequest.value?.estimated_context_tokens)
 );
 const previousExactContextTokens = computed(() => {
-  for (const request of conversationRequests.value) {
+  if (ordinaryUsageStale.value) return undefined;
+  for (const request of ordinaryRequests.value) {
     const tokens = tokenCount(usageFromRequest(request));
     if (tokens !== undefined) return tokens;
   }
   return undefined;
 });
 const actualContextTokens = computed(() =>
-  estimatedContextTokens.value ?? exactContextTokens.value ?? previousExactContextTokens.value
+  exactContextTokens.value ?? previousExactContextTokens.value ?? estimatedContextTokens.value
 );
 const usageQuality = computed<'exact' | 'estimated' | 'previous_exact' | 'unknown'>(() => {
-  if (estimatedContextTokens.value !== undefined) return 'estimated';
   if (exactContextTokens.value !== undefined) return 'exact';
   if (previousExactContextTokens.value !== undefined) return 'previous_exact';
+  if (estimatedContextTokens.value !== undefined) return 'estimated';
   return 'unknown';
 });
 const thresholdTokens = computed(() =>
@@ -153,7 +176,7 @@ function usageFromRequest(request: Record<string, unknown> | undefined): LlmUsag
 
 function tokenCount(usage: LlmUsageMetadataRecord | undefined): number | undefined {
   const normalized = usage ? normalizeTokenUsage(usage) : undefined;
-  return normalized?.total ?? normalized?.input;
+  return normalized?.input ?? normalized?.total;
 }
 
 function contextUsageLabel(): string {
@@ -168,9 +191,9 @@ function contextUsageLabel(): string {
 }
 
 function usageSourceLabel(): string {
-  if (usageQuality.value === 'exact') return '当前 ModelRequest usage';
-  if (usageQuality.value === 'estimated') return '当前 ContextSequenceRoot 可靠估算';
-  if (usageQuality.value === 'previous_exact') return '上一条已完成 ModelRequest usage';
+  if (usageQuality.value === 'exact') return '最近一轮普通 ModelRequest 输入 usage';
+  if (usageQuality.value === 'estimated') return '当前 ContextSequenceRoot provider 语义估算';
+  if (usageQuality.value === 'previous_exact') return '上一条已完成普通 ModelRequest 输入 usage';
   return latestRequest.value ? 'ModelRequest / 当前模型配置' : '当前模型配置';
 }
 

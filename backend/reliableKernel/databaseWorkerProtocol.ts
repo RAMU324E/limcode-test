@@ -9,6 +9,7 @@ import type {
 import type { DatabaseFoundationInspection } from './databaseSchema';
 
 export const MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT = 33;
+export const MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT = 1;
 export const MODEL_STREAM_TERMINAL_TAIL = 32;
 
 /** Structured-clone-safe immutable execution token supplied by the Extension Host. */
@@ -107,6 +108,22 @@ export interface ClientKeysetPageResult {
   responseBytes: number;
 }
 
+export interface ClientVisibleMessageHistoryPageInput {
+  conversationId: string;
+  limit: number;
+  /** Exclusive backward keyset cursor. Both cursor fields are always required. */
+  beforeMessageSeq: string;
+  beforeId: string;
+}
+
+export interface ClientVisibleMessageHistoryPageResult {
+  records: Record<string, DomainRow[]>;
+  nextBeforeMessageSeq?: string;
+  nextBeforeId?: string;
+  hasMore: boolean;
+  responseBytes: number;
+}
+
 export interface ConversationHistoryProjectionInput {
   scopeKind: 'all' | 'unbound' | 'project';
   projectFolderUri?: string;
@@ -127,6 +144,7 @@ export interface ConversationHistoryProjectionResult {
   agentLinks: DomainRow[];
   messageSummaries: DomainRow[];
   previewTargets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>;
+  titleTargets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>;
   childExecutions: DomainRow[];
   activeChildTurnLinks: DomainRow[];
   answerBridges: DomainRow[];
@@ -165,6 +183,15 @@ export interface ChildProcessCleanupMaterializationCandidate {
   processId: string;
 }
 
+/** Fixed dependent facts resolved by the worker inside one SQLite read transaction. */
+export interface ToolFactsSnapshot {
+  toolCall: DomainRow | null;
+  executions: DomainRow[];
+  turn: DomainRow | null;
+  leases: DomainRow[];
+  conversation: DomainRow | null;
+}
+
 export interface DatabaseWorkerData {
   mode: 'initialize' | 'runtime';
   binding: RootBinding;
@@ -175,6 +202,7 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'transaction'; steps: RepositoryTransactionStep[] }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'snapshotAll'; read: RepositoryListRead }
+  | { kind: 'toolFactsSnapshot'; toolCallId: string }
   | { kind: 'processOutputRegistrationMismatches' }
   | { kind: 'effectReceiptReconciliationCandidates' }
   | { kind: 'childConversationOriginCandidates' }
@@ -185,12 +213,22 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'cancelCurrentModelRequest'; input: ModelRequestCancelInput }
   | { kind: 'clientProjectionSnapshot'; activeConversationId: string | null }
   | { kind: 'clientKeysetPage'; input: ClientKeysetPageInput }
+  | { kind: 'clientVisibleMessageHistoryPage'; input: ClientVisibleMessageHistoryPageInput }
   | { kind: 'conversationHistoryProjection'; input: ConversationHistoryProjectionInput }
   | { kind: 'externalDataVersion' }
   | { kind: 'inspect' }
   | { kind: 'close' };
 
-export type DatabaseWorkerRequest = DatabaseWorkerRequestPayload & { id: number };
+export interface DatabaseWorkerTiming {
+  queueWaitMs: number;
+  executeDurationMs: number;
+}
+
+export type DatabaseWorkerRequest = DatabaseWorkerRequestPayload & {
+  id: number;
+  /** Host monotonic timestamp; present only while development metrics are attached. */
+  metricEnqueuedAtMs?: number;
+};
 
 export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection {
   workerThreadId: number;
@@ -215,8 +253,8 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | { type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelRequestCancelResult | ClientKeysetPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | string | null }
-  | { type: 'response'; id: number; ok: false; error: SerializedWorkerError }
+  | ({ type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | string | null; timing?: DatabaseWorkerTiming })
+  | ({ type: 'response'; id: number; ok: false; error: SerializedWorkerError; timing?: DatabaseWorkerTiming })
   | { type: 'commit'; result: RuntimeCommitResult }
   | { type: 'fatal'; error: SerializedWorkerError };
 

@@ -100,6 +100,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             if (thoughtElapsedMs !== undefined) {
               enqueue({
                 kind: 'output_delta',
+                semanticProgress: false,
                 content: {
                   type: 'thought_progress',
                   thoughtElapsedMs,
@@ -179,6 +180,14 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             finish();
             return;
           }
+          case LlmEventType.RetryScheduled:
+          case LlmEventType.RetryStarted:
+            // Reliable ModelRequest/Attempt owns the only retry loop. If a misconfigured capability
+            // still announces an internal retry, stop it and surface the transient failure now.
+            this.capability.cancelRetry(request.modelRequestId);
+            if (event.type === LlmEventType.RetryStarted) this.capability.abort(request.modelRequestId);
+            finish(capabilityRetryError(payload));
+            return;
           case LlmEventType.Error:
             finish(capabilityProviderError(payload));
             return;
@@ -203,7 +212,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       try {
         this.capability.start(llmRequest, emit);
       } catch (error) {
-        finish(error);
+        finish(capabilityThrownProviderError(error));
       }
     });
   }
@@ -250,6 +259,12 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             finish();
             return;
           }
+          if (event.type === LlmEventType.RetryScheduled || event.type === LlmEventType.RetryStarted) {
+            this.capability.cancelRetry(request.modelRequestId);
+            if (event.type === LlmEventType.RetryStarted) this.capability.abort(request.modelRequestId);
+            finish(capabilityRetryError(payload));
+            return;
+          }
           if (event.type === LlmEventType.CompactError) {
             finish(compactProviderError(payload));
           }
@@ -270,7 +285,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       try {
         this.capability.compact(compactRequest, emit);
       } catch (error) {
-        finish(error);
+        finish(capabilityThrownProviderError(error));
       }
     });
   }
@@ -779,28 +794,99 @@ function requireText(value: unknown, label: string): string {
 
 function capabilityProviderError(payload: Record<string, unknown> | undefined): Error {
   const message = optionalText(payload?.message) || 'Provider 调用失败。';
-  const raw = asRecord(payload?.rawError);
+  return classifyProviderFailure(message, asRecord(payload?.rawError));
+}
+
+function capabilityThrownProviderError(error: unknown): Error {
+  if (error instanceof ProviderTransientError || (error instanceof Error && error.name === 'AbortError')) return error;
+  const record = asRecord(error);
+  const raw: Record<string, unknown> = record ? { ...record } : {};
+  if (error instanceof Error) {
+    raw.name ??= error.name;
+    raw.message ??= error.message;
+    const structured = error as Error & {
+      code?: unknown;
+      status?: unknown;
+      retryable?: unknown;
+      transportAttemptsExhausted?: unknown;
+      cause?: unknown;
+    };
+    if (structured.code !== undefined) raw.code ??= structured.code;
+    if (structured.status !== undefined) raw.status ??= structured.status;
+    if (structured.retryable !== undefined) raw.retryable ??= structured.retryable;
+    if (structured.transportAttemptsExhausted !== undefined) {
+      raw.transportAttemptsExhausted ??= structured.transportAttemptsExhausted;
+    }
+    if (structured.cause !== undefined) raw.cause ??= structured.cause;
+  }
+  const message = error instanceof Error && error.message.trim()
+    ? error.message
+    : optionalText(raw.message) || 'Provider 调用失败。';
+  return classifyProviderFailure(message, raw);
+}
+
+function classifyProviderFailure(message: string, raw: Record<string, unknown> | undefined): Error {
   const status = findNumericStatus(raw);
+  const signature = collectErrorSignature(raw, message).toLowerCase();
+  const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
+  const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
+  const incompleteNormalWebSocketClose = /websocket closed before (?:terminal event|response\.completed|open)(?::|\s)+(?:1000|1001)\b/.test(signature);
+  if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
+    return new Error(message);
+  }
+  // 1000/1001 only describe a graceful WebSocket closing handshake. If no Responses terminal
+  // event arrived, the provider response is incomplete and must outrank stale retryable=false
+  // metadata from older transport adapters.
+  if (incompleteNormalWebSocketClose && transportAttemptsExhausted !== true) {
+    return new ProviderTransientError('connection_interrupted', message);
+  }
+  if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
   if (status === 429) return new ProviderTransientError('rate_limited', message);
   if (status === 408 || status === 425 || (status !== undefined && status >= 500 && status <= 599)) {
     return new ProviderTransientError('temporary_service_error', message);
   }
-  const signature = collectErrorSignature(raw, message).toLowerCase();
-  if (/\b(econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|websocket closed before (?:terminal event|response\.completed|open)|timed? out/.test(signature)) {
+  if (/\b(econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|websocket closed before (?:terminal event|response\.completed|open)|timed? out/.test(signature)) {
     return new ProviderTransientError('connection_interrupted', message);
   }
-  // OpenAI-compatible gateways commonly collapse an upstream 5xx into this text-only error and
-  // omit the HTTP status from their normalized payload.  Treat the narrow gateway/service phrases
-  // as transient so the reliable ModelRequest creates its one durable retry Attempt; do not turn
-  // arbitrary provider validation messages into retries.
-  if (/\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b/.test(signature)) {
+  if (/\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b/.test(signature)) {
     return new ProviderTransientError('temporary_service_error', message);
+  }
+  if (explicitlyRetryable === true) {
+    return new ProviderTransientError('connection_interrupted', message);
   }
   return new Error(message);
 }
 
 function compactProviderError(payload: Record<string, unknown> | undefined): Error {
   return capabilityProviderError(payload);
+}
+
+function capabilityRetryError(payload: Record<string, unknown> | undefined): ProviderTransientError {
+  const mapped = capabilityProviderError(payload);
+  return mapped instanceof ProviderTransientError
+    ? mapped
+    : new ProviderTransientError('temporary_service_error', mapped.message);
+}
+
+function findBooleanMetadata(value: unknown, key: string, depth = 0, seen = new Set<object>()): boolean | undefined {
+  if (depth > 6 || value === null || value === undefined || typeof value !== 'object' || seen.has(value)) {
+    return undefined;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 32)) {
+      const nested = findBooleanMetadata(entry, key, depth + 1, seen);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record[key] === 'boolean') return record[key] as boolean;
+  for (const nested of Object.values(record).slice(0, 32)) {
+    const result = findBooleanMetadata(nested, key, depth + 1, seen);
+    if (result !== undefined) return result;
+  }
+  return undefined;
 }
 
 function findNumericStatus(value: unknown, depth = 0): number | undefined {

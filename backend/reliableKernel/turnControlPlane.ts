@@ -10,6 +10,7 @@ import {
   type PreparedContentObject
 } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   DOMAIN_REPOSITORIES,
@@ -53,6 +54,26 @@ export type TurnCommandSourceKind = 'command' | 'callback' | 'internal' | 'recov
 export type TurnCommandOperation = 'input' | 'edit' | 'delete' | 'retry' | 'interrupt' | 'continuation' | 'terminal';
 export type TurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'outcome_unknown';
 export type TurnCommandContent = string | Uint8Array;
+
+export type ExecutionLeaseRenewalFailureReason =
+  | 'requested_expiry_not_future'
+  | 'lease_missing'
+  | 'fence_replaced'
+  | 'lease_expired'
+  | 'transaction_conflict';
+
+export type ExecutionLeaseRenewalResult =
+  | {
+      renewed: true;
+      observedExpiresAt: string;
+      renewedExpiresAt: string;
+    }
+  | {
+      renewed: false;
+      reason: ExecutionLeaseRenewalFailureReason;
+      observedExpiresAt?: string;
+      observedGeneration?: string;
+    };
 
 /** A history mutation can be retried unchanged once the exact competing Turn/Intent settles. */
 export class ConversationHistoryBusyError extends Error {
@@ -644,12 +665,27 @@ export class TurnControlPlane {
     fence: ExecutionLeaseFence;
     leaseExpiresAt: string;
   }): Promise<boolean> {
+    return (await this.renewExecutionLeaseDetailed(input)).renewed;
+  }
+
+  /** Same fenced renewal with metadata-only failure classification for recovery and diagnostics. */
+  public async renewExecutionLeaseDetailed(input: {
+    fence: ExecutionLeaseFence;
+    leaseExpiresAt: string;
+  }): Promise<ExecutionLeaseRenewalResult> {
     const expiresAt = requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt');
     const now = this.timestamp();
-    if (Date.parse(expiresAt) <= Date.parse(now)) return false;
+    if (Date.parse(expiresAt) <= Date.parse(now)) {
+      return { renewed: false, reason: 'requested_expiry_not_future' };
+    }
     const currentRows = await this.listRows('ExecutionLease', { turn_id: input.fence.turnId }, 2);
-    if (currentRows.length !== 1) return false;
+    if (currentRows.length !== 1) return { renewed: false, reason: 'lease_missing' };
     const current = currentRows[0];
+    const observedExpiresAt = requireTimestamp(current.expires_at, 'ExecutionLease.expires_at');
+    const observedGeneration = requirePositiveInteger(
+      current.generation,
+      'ExecutionLease.generation'
+    ).toString();
     if (
       current.id !== input.fence.id
       || current.conversation_id !== input.fence.conversationId
@@ -657,9 +693,22 @@ export class TurnControlPlane {
       || current.owner_id !== input.fence.ownerId
       || current.host_boot_id !== input.fence.hostBootId
       || current.generation !== input.fence.generation
-    ) return false;
-    const observedExpiry = requireTimestamp(current.expires_at, 'ExecutionLease.expires_at');
-    if (Date.parse(observedExpiry) <= Date.parse(now)) return false;
+    ) {
+      return {
+        renewed: false,
+        reason: 'fence_replaced',
+        observedExpiresAt,
+        observedGeneration
+      };
+    }
+    if (Date.parse(observedExpiresAt) <= Date.parse(now)) {
+      return {
+        renewed: false,
+        reason: 'lease_expired',
+        observedExpiresAt,
+        observedGeneration
+      };
+    }
     try {
       await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('Turn').assert(input.fence.turnId, { status: TURN_STATUS_ACTIVE }),
@@ -670,15 +719,26 @@ export class TurnControlPlane {
           host_boot_id: input.fence.hostBootId,
           generation: input.fence.generation,
           acquired_at: current.acquired_at,
-          expires_at: observedExpiry
+          expires_at: observedExpiresAt
         }),
         DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
           expires_at: expiresAt
         })
       ]);
-      return true;
+      return {
+        renewed: true,
+        observedExpiresAt,
+        renewedExpiresAt: expiresAt
+      };
     } catch (error) {
-      if (isTransactionAssertionError(error)) return false;
+      if (isTransactionAssertionError(error)) {
+        return {
+          renewed: false,
+          reason: 'transaction_conflict',
+          observedExpiresAt,
+          observedGeneration
+        };
+      }
       throw error;
     }
   }
@@ -716,102 +776,110 @@ export class TurnControlPlane {
       if (leaseRows.length !== 1) {
         throw new Error(`Recovered Turn ${turnId} lost its claimed ExecutionLease.`);
       }
-      if (leaseRows[0].owner_id !== leaseOwnerId || leaseRows[0].host_boot_id !== hostBootId) {
-        return null;
-      }
+      const lease = leaseRows[0];
       const turn = await this.getTurn(turnId);
-      const generation = requirePositiveInteger(leaseRows[0].generation, 'ExecutionLease.generation');
+      const generation = requirePositiveInteger(lease.generation, 'ExecutionLease.generation');
       const now = this.timestamp();
-      if (
-        Date.parse(requireTimestamp(leaseRows[0].expires_at, 'ExecutionLease.expires_at'))
-        <= Date.parse(now)
-      ) {
-        // The first recovery receipt proves only its original generation. Once that lease expires,
-        // reusing the receipt and merely extending expires_at would let delayed work from the old
-        // lifetime retain write authority. A generation-scoped claim supplies a new receipt and an
-        // exact-row CAS, so concurrent recovery contenders still elect one winner.
-        const nextGeneration = generation + 1n;
-        const reclaimSource: TurnCommandSource = {
-          kind: 'recovery',
-          key: `runner-reclaim-execution:${hostBootId}:${turnId}:${nextGeneration}`
-        };
-        const reclaimReceiptId = recoveryExecutionEntityId(
-          'command_receipt',
-          hostBootId,
-          turnId,
-          nextGeneration.toString()
-        );
-        let reclaimed: CommandCommit;
-        try {
-          reclaimed = await this.commitWithReceipt({
-            source: reclaimSource,
-            receiptId: reclaimReceiptId,
+      const expired = Date.parse(requireTimestamp(lease.expires_at, 'ExecutionLease.expires_at')) <= Date.parse(now);
+      const ownedByRequester = lease.owner_id === leaseOwnerId && lease.host_boot_id === hostBootId;
+      if (ownedByRequester && !expired) {
+        const renewed = await this.renewExecutionLease({
+          fence: {
+            id: requireId(lease.id, 'ExecutionLease.id'),
             conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
             turnId,
-            steps: [
-              DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
-              DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(
-                requireId(leaseRows[0].id, 'ExecutionLease.id'),
-                {
-                  conversation_id: leaseRows[0].conversation_id,
-                  turn_id: turnId,
-                  owner_id: leaseOwnerId,
-                  host_boot_id: hostBootId,
-                  generation,
-                  acquired_at: leaseRows[0].acquired_at,
-                  expires_at: leaseRows[0].expires_at
-                }
-              ),
-              DOMAIN_REPOSITORIES.domain('ExecutionLease').update(
-                requireId(leaseRows[0].id, 'ExecutionLease.id'),
-                {
-                  generation: nextGeneration,
-                  acquired_at: now,
-                  expires_at: leaseExpiresAt
-                }
-              )
-            ]
-          });
-        } catch (error) {
-          if (isTransactionAssertionError(error) || isLeaseAdmissionConflict(error)) return null;
-          throw error;
-        }
-        const current = (await this.listRows('ExecutionLease', { turn_id: turnId }, 2))[0];
-        if (
-          !current
-          || current.owner_id !== leaseOwnerId
-          || current.host_boot_id !== hostBootId
-          || current.generation !== nextGeneration
-        ) return null;
+            ownerId: leaseOwnerId,
+            hostBootId,
+            generation
+          },
+          leaseExpiresAt
+        });
+        if (!renewed) return null;
         return {
-          receiptId: requireId(reclaimed.receipt.id, 'CommandReceipt.id'),
+          receiptId: requireId(existingReceipt.id, 'CommandReceipt.id'),
           conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
           turnId,
-          executionLeaseId: requireId(current.id, 'ExecutionLease.id'),
-          leaseGeneration: nextGeneration.toString(),
-          deduplicated: reclaimed.deduplicated,
-          ...(reclaimed.commitSeq ? { commitSeq: reclaimed.commitSeq } : {})
+          executionLeaseId: requireId(lease.id, 'ExecutionLease.id'),
+          leaseGeneration: generation.toString(),
+          deduplicated: true
         };
       }
-      const renewed = await this.renewExecutionLease({
-        fence: {
-          id: requireId(leaseRows[0].id, 'ExecutionLease.id'),
+      if (!expired && lease.host_boot_id === hostBootId && lease.owner_id !== leaseOwnerId) {
+        throw new Error(`Turn ${turnId} is already owned by another runner in the current host boot.`);
+      }
+      if (
+        !expired
+        && lease.host_boot_id !== hostBootId
+        && await this.database.isHostAlive(requireId(lease.host_boot_id, 'ExecutionLease.host_boot_id'))
+      ) return null;
+
+      // The initial recovery receipt identifies only the first generation claimed by this Host.
+      // Ownership may subsequently move A→B→A. Once the observed lease is expired (or its Host is
+      // definitely dead), create a generation-scoped receipt and CAS the exact current owner row;
+      // an old per-Host receipt must never permanently block that return path.
+      const nextGeneration = generation + 1n;
+      const reclaimSource: TurnCommandSource = {
+        kind: 'recovery',
+        key: `runner-reclaim-execution:${hostBootId}:${turnId}:${nextGeneration}`
+      };
+      const reclaimReceiptId = recoveryExecutionEntityId(
+        'command_receipt',
+        hostBootId,
+        turnId,
+        nextGeneration.toString()
+      );
+      let reclaimed: CommandCommit;
+      try {
+        reclaimed = await this.commitWithReceipt({
+          source: reclaimSource,
+          receiptId: reclaimReceiptId,
           conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
           turnId,
-          ownerId: leaseOwnerId,
-          hostBootId,
-          generation
-        },
-        leaseExpiresAt
-      });
-      if (!renewed) return null;
+          steps: [
+            DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+            DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(
+              requireId(lease.id, 'ExecutionLease.id'),
+              {
+                conversation_id: lease.conversation_id,
+                turn_id: turnId,
+                owner_id: lease.owner_id,
+                host_boot_id: lease.host_boot_id,
+                generation,
+                acquired_at: lease.acquired_at,
+                expires_at: lease.expires_at
+              }
+            ),
+            DOMAIN_REPOSITORIES.domain('ExecutionLease').update(
+              requireId(lease.id, 'ExecutionLease.id'),
+              {
+                owner_id: leaseOwnerId,
+                host_boot_id: hostBootId,
+                generation: nextGeneration,
+                acquired_at: now,
+                expires_at: leaseExpiresAt
+              }
+            )
+          ]
+        });
+      } catch (error) {
+        if (isTransactionAssertionError(error) || isLeaseAdmissionConflict(error)) return null;
+        throw error;
+      }
+      const current = (await this.listRows('ExecutionLease', { turn_id: turnId }, 2))[0];
+      if (
+        !current
+        || current.owner_id !== leaseOwnerId
+        || current.host_boot_id !== hostBootId
+        || current.generation !== nextGeneration
+      ) return null;
       return {
-        receiptId: requireId(existingReceipt.id, 'CommandReceipt.id'),
+        receiptId: requireId(reclaimed.receipt.id, 'CommandReceipt.id'),
         conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
         turnId,
-        executionLeaseId: requireId(leaseRows[0].id, 'ExecutionLease.id'),
-        leaseGeneration: generation.toString(),
-        deduplicated: true
+        executionLeaseId: requireId(current.id, 'ExecutionLease.id'),
+        leaseGeneration: nextGeneration.toString(),
+        deduplicated: reclaimed.deduplicated,
+        ...(reclaimed.commitSeq ? { commitSeq: reclaimed.commitSeq } : {})
       };
     }
 
@@ -1042,12 +1110,19 @@ export class TurnControlPlane {
     const ids = dependentStartCommandIds(intentId, decoded.messageContent !== null);
     const admissionReceiptId = intentDependentEntityId(intentId, 'admission_command_receipt');
     const now = this.timestamp();
+    const decodedMessageEstimatedTokens = decoded.messageContent
+      ? estimateStoredMessageContentTokens(
+          await this.contentStore.read(decoded.messageContent.metadata),
+          decoded.messageContent.metadata.content_type
+        )
+      : undefined;
     const messageContext = decoded.messageContent
       ? await this.contextSequence.prepareMessageAppendMutation({
           conversationId,
           messageRevisionId: requireId(ids.messageRevision, 'messageRevisionId'),
           contentObjectId: decoded.messageContent.metadata.id,
-          contentByteLength: decoded.messageContent.metadata.byte_length
+          contentByteLength: decoded.messageContent.metadata.byte_length,
+          contentEstimatedTokens: decodedMessageEstimatedTokens
         })
       : null;
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps
@@ -1235,6 +1310,12 @@ export class TurnControlPlane {
         plan.messageContent,
         requireContentType(plan.messageContentType ?? 'text/plain')
       );
+    const messageContentEstimatedTokens = plan.messageContent === undefined
+      ? undefined
+      : estimateStoredMessageContentTokens(
+          plan.messageContent,
+          requireContentType(plan.messageContentType ?? 'text/plain')
+        );
     const intentContent = plan.operation === 'input'
       ? requirePrepared(messageContent, 'input message content')
       : await this.contentStore.prepare(
@@ -1272,7 +1353,8 @@ export class TurnControlPlane {
           conversationId: conversation.id as string,
           messageRevisionId: requireId(ids.messageRevision, 'message revision id'),
           contentObjectId: messageContent.metadata.id,
-          contentByteLength: messageContent.metadata.byte_length
+          contentByteLength: messageContent.metadata.byte_length,
+          contentEstimatedTokens: messageContentEstimatedTokens
         })
       : null;
     const nextDeliverySteps = this.prepareNextTurnDeliverySteps

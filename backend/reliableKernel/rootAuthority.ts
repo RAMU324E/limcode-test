@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
@@ -48,13 +49,58 @@ export interface HistoricalRootBinding {
   runtimeKernelEpoch: number;
 }
 
+export type RootAuthorityValidationEvent =
+  | { kind: 'validate-requested' }
+  | { kind: 'validate-execution-started' }
+  | { kind: 'validate-single-flight-joined' }
+  | {
+    kind: 'validate-execution-completed';
+    outcome: 'success' | 'failure';
+    durationMs: number;
+    hostFileOperationCount: number;
+    hostFileAccessCheckCount: number;
+    hostFileReadCount: number;
+    jsonParseCount: number;
+  };
+
+/** Optional development-only metrics sink. Events never contain binding paths or file contents. */
+export interface RootAuthorityValidationObserver {
+  observe(event: RootAuthorityValidationEvent): void;
+}
+
+interface RootAuthorityValidationMeasurement {
+  startedAt: bigint;
+  hostFileOperationCount: number;
+  hostFileAccessCheckCount: number;
+  hostFileReadCount: number;
+  jsonParseCount: number;
+}
+
+interface RootAuthorityValidationFlight {
+  binding: RootBinding;
+  promise: Promise<RootBinding>;
+}
+
+const ROOT_BINDING_VALIDATION_CACHE_MS = 25;
+
+interface RootAuthorityValidationCache {
+  binding: RootBinding;
+  expiresAtMs: number;
+}
+
 /**
  * RootAuthority is the only component allowed to resolve and activate Runtime roots. Long-lived
  * services cache one immutable complete RootBinding, never a naked path. Root changes are offline:
  * callers must close the old service before opening one with the returned binding.
  */
 export class RootAuthority {
-  public constructor(private readonly getDataRootPath: () => string) {}
+  private readonly validationFlights = new Set<RootAuthorityValidationFlight>();
+  private validationCache: RootAuthorityValidationCache | undefined;
+
+  public constructor(
+    private readonly getDataRootPath: () => string,
+    private readonly validationObserver?: RootAuthorityValidationObserver
+  ) {}
 
   public expectedPaths(): RuntimeRootPaths {
     return createRuntimeRootPaths(this.getDataRootPath());
@@ -146,33 +192,149 @@ export class RootAuthority {
   }
 
   public async current(): Promise<RootBinding> {
-    const expected = this.expectedPaths();
-    if (await exists(expected.rootPendingPath)) {
+    return this.readCurrent(this.expectedPaths());
+  }
+
+  /** Revalidates the pointer and epoch, reusing a recent successful check across a hot request burst. */
+  public validate(binding: RootBinding): Promise<RootBinding> {
+    if (this.validationObserver) this.observeValidation({ kind: 'validate-requested' });
+    try {
+      const expectedPaths = this.expectedPaths();
+      const shareable = samePaths(binding.paths, expectedPaths);
+      if (shareable && !this.validationObserver) {
+        const cached = this.validationCache;
+        if (
+          cached
+          && cached.expiresAtMs >= performance.now()
+          && sameBindingIdentity(binding, cached.binding)
+        ) return Promise.resolve(cached.binding);
+      }
+      if (shareable) {
+        for (const flight of this.validationFlights) {
+          if (!sameBindingIdentity(binding, flight.binding)) continue;
+          if (this.validationObserver) this.observeValidation({ kind: 'validate-single-flight-joined' });
+          return flight.promise;
+        }
+      }
+      return this.startValidationExecution(
+        binding,
+        shareable,
+        (measurement) => this.validateAgainstExpectedPaths(binding, expectedPaths, measurement)
+      );
+    } catch (error) {
+      return this.startValidationExecution(binding, false, async () => { throw error; });
+    }
+  }
+
+  public async withValidatedBinding<T>(binding: RootBinding, operation: (current: RootBinding) => Promise<T>): Promise<T> {
+    return operation(await this.validate(binding));
+  }
+
+  private async readCurrent(
+    expected: RuntimeRootPaths,
+    measurement?: RootAuthorityValidationMeasurement
+  ): Promise<RootBinding> {
+    if (await exists(expected.rootPendingPath, measurement)) {
       throw new RootAuthorityError(
         'root-binding-pending',
         `RootBinding pending marker exists; Runtime open is refused: ${expected.rootPendingPath}`
       );
     }
-    const binding = await readBindingFile(expected.rootPointerPath);
+    const binding = await readBindingFile(expected.rootPointerPath, measurement);
     if (!binding) {
       throw new RootAuthorityError('root-binding-missing', `RootBinding pointer is missing: ${expected.rootPointerPath}`);
     }
     if (!samePaths(binding.paths, expected)) {
       throw new StaleRootBindingError('The active RootBinding does not match the data root selected by getPaths(); restart is required.');
     }
-    await validateEpoch(binding);
+    await validateEpoch(binding, measurement);
     return binding;
   }
 
-  /** Revalidates the pointer and epoch at the beginning of every request or transaction. */
-  public async validate(binding: RootBinding): Promise<RootBinding> {
-    const current = await this.current();
+  private async validateAgainstExpectedPaths(
+    binding: RootBinding,
+    expectedPaths: RuntimeRootPaths,
+    measurement?: RootAuthorityValidationMeasurement
+  ): Promise<RootBinding> {
+    const current = await this.readCurrent(expectedPaths, measurement);
     if (!sameBindingIdentity(binding, current)) throw new StaleRootBindingError();
     return current;
   }
 
-  public async withValidatedBinding<T>(binding: RootBinding, operation: (current: RootBinding) => Promise<T>): Promise<T> {
-    return operation(await this.validate(binding));
+  private startValidationExecution(
+    binding: RootBinding,
+    shareable: boolean,
+    action: (measurement?: RootAuthorityValidationMeasurement) => Promise<RootBinding>
+  ): Promise<RootBinding> {
+    const measurement = this.validationObserver
+      ? {
+        startedAt: process.hrtime.bigint(),
+        hostFileOperationCount: 0,
+        hostFileAccessCheckCount: 0,
+        hostFileReadCount: 0,
+        jsonParseCount: 0
+      }
+      : undefined;
+    if (this.validationObserver) this.observeValidation({ kind: 'validate-execution-started' });
+    let execution: Promise<RootBinding>;
+    try {
+      execution = action(measurement);
+    } catch (error) {
+      execution = Promise.reject(error);
+    }
+
+    let flight: RootAuthorityValidationFlight | undefined;
+    const promise = execution.then(
+      (current) => {
+        if (flight) this.validationFlights.delete(flight);
+        if (shareable && !this.validationObserver) {
+          this.validationCache = {
+            binding: current,
+            expiresAtMs: performance.now() + ROOT_BINDING_VALIDATION_CACHE_MS
+          };
+        }
+        this.completeValidation(measurement, 'success');
+        return current;
+      },
+      (error: unknown) => {
+        if (flight) this.validationFlights.delete(flight);
+        if (this.validationCache && sameBindingIdentity(binding, this.validationCache.binding)) {
+          this.validationCache = undefined;
+        }
+        this.completeValidation(measurement, 'failure');
+        throw error;
+      }
+    );
+    if (shareable) {
+      flight = { binding, promise };
+      this.validationFlights.add(flight);
+    }
+    return promise;
+  }
+
+  private completeValidation(
+    measurement: RootAuthorityValidationMeasurement | undefined,
+    outcome: 'success' | 'failure'
+  ): void {
+    if (!measurement) return;
+    this.observeValidation({
+      kind: 'validate-execution-completed',
+      outcome,
+      durationMs: Number(process.hrtime.bigint() - measurement.startedAt) / 1_000_000,
+      hostFileOperationCount: measurement.hostFileOperationCount,
+      hostFileAccessCheckCount: measurement.hostFileAccessCheckCount,
+      hostFileReadCount: measurement.hostFileReadCount,
+      jsonParseCount: measurement.jsonParseCount
+    });
+  }
+
+  private observeValidation(event: RootAuthorityValidationEvent): void {
+    if (!this.validationObserver) return;
+    try {
+      this.validationObserver.observe(event);
+    } catch {
+      // Development metrics must never change RootAuthority fencing behavior.
+    }
   }
 
   /**
@@ -319,10 +481,15 @@ export function sameBindingIdentity(left: RootBinding, right: RootBinding): bool
     && samePaths(left.paths, right.paths);
 }
 
-async function validateEpoch(binding: RootBinding): Promise<void> {
+async function validateEpoch(
+  binding: RootBinding,
+  measurement?: RootAuthorityValidationMeasurement
+): Promise<void> {
   let value: unknown;
   try {
-    value = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
+    recordHostFileRead(measurement);
+    const text = await fs.readFile(binding.paths.runtimeEpochPath, 'utf8');
+    value = parseJson(text, measurement);
   } catch (error) {
     throw new RootAuthorityError(
       'runtime-epoch-missing-or-invalid',
@@ -366,16 +533,20 @@ async function assertFreshRuntimeRoot(paths: RuntimeRootPaths): Promise<void> {
   }
 }
 
-async function readBindingFile(filePath: string): Promise<RootBinding | undefined> {
+async function readBindingFile(
+  filePath: string,
+  measurement?: RootAuthorityValidationMeasurement
+): Promise<RootBinding | undefined> {
   let text: string;
   try {
+    recordHostFileRead(measurement);
     text = await fs.readFile(filePath, 'utf8');
   } catch (error) {
     if (isNotFound(error)) return undefined;
     throw error;
   }
   try {
-    return parseRootBinding(JSON.parse(text));
+    return parseRootBinding(parseJson(text, measurement));
   } catch (error) {
     throw new RootAuthorityError('root-binding-invalid', `Invalid RootBinding pointer: ${filePath}`, error);
   }
@@ -428,14 +599,35 @@ async function syncDirectory(directoryPath: string): Promise<void> {
   }
 }
 
-async function exists(filePath: string): Promise<boolean> {
+async function exists(
+  filePath: string,
+  measurement?: RootAuthorityValidationMeasurement
+): Promise<boolean> {
   try {
+    recordHostFileAccessCheck(measurement);
     await fs.access(filePath);
     return true;
   } catch (error) {
     if (isNotFound(error)) return false;
     throw error;
   }
+}
+
+function recordHostFileAccessCheck(measurement: RootAuthorityValidationMeasurement | undefined): void {
+  if (!measurement) return;
+  measurement.hostFileOperationCount += 1;
+  measurement.hostFileAccessCheckCount += 1;
+}
+
+function recordHostFileRead(measurement: RootAuthorityValidationMeasurement | undefined): void {
+  if (!measurement) return;
+  measurement.hostFileOperationCount += 1;
+  measurement.hostFileReadCount += 1;
+}
+
+function parseJson(text: string, measurement: RootAuthorityValidationMeasurement | undefined): unknown {
+  if (measurement) measurement.jsonParseCount += 1;
+  return JSON.parse(text);
 }
 
 function parseRootPaths(value: unknown): RuntimeRootPaths {

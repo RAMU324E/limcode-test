@@ -191,6 +191,9 @@
   },
   "streamCheckpoint": {
     "retention": "Completed 终态围栏与摘要写入的同一 writer 事务内，由 ModelStreamCheckpointRepository 固定 pruneAfterTerminalFence mutation 仅保留当前 attempt/socket generation 尾部 32 条与终态摘要",
+    "ordinaryDeltaRetention": "每个ModelRequest只持久化首个output_delta进度marker；其余delta走transient fanout，不作为可重建输出快照",
+    "activeCheckpointCapacity": "最多1个output_delta加32个output_item_done；Completed不受该容量限制",
+    "semanticOverflow": "第33个output_item_done必须明确失败ModelRequest，不得accepted-drop",
     "maintenanceMutation": "fixed-writer-prune-after-terminal-fence-only",
     "genericInsertDelete": false,
     "eventIdempotency": "同一(modelRequestId,attemptSeq,socketGeneration,streamSeq)仅checkpoint kind与canonical content identity完全相同时可重放；不同事件必须明确冲突，不得吞掉Completed",
@@ -198,11 +201,28 @@
   },
   "providerRetry": {
     "automaticTransientRetry": true,
-    "maxAttempts": 2,
+    "authority": "frozen-turn-authority+sqlite-model-request-attempt",
+    "defaultMaxRetries": 3,
+    "maxRetries": 10,
+    "configuredPerFrozenAuthority": true,
+    "backoffMilliseconds": [
+      1000,
+      2000,
+      4000,
+      8000,
+      10000
+    ],
+    "semanticDeadlinesMilliseconds": {
+      "ordinaryFirst": 80000,
+      "ordinaryIdle": 60000,
+      "compressionCompletion": 270000
+    },
+    "compressionProgressContract": "compact()为terminal-only；只以CompactDone/CompactError满足270秒完成deadline，不等待不存在的thought/text语义事件",
     "visible": true,
+    "visibleWhenTransientThoughtExists": true,
     "visibilityAuthority": "只读取已提交ModelRequest/Attempt事实或commit feed；不得建立瞬时retry observer第二authority",
     "cancelable": true,
-    "afterExtensionRestart": "no-automatic-retry",
+    "afterExtensionRestart": "resume-committed-retry-with-not-before-deadline",
     "newAttemptKeepsSameModelRequest": true
   },
   "performance": {

@@ -719,8 +719,19 @@ function validateTool(tool, failures) {
   }
   const retry = tool?.retryPolicy;
   failures.push(...exactSetProblems('自动重试类型', ['provider-transient'], retry?.automaticKinds ?? []));
-  if (retry?.providerMaxAttempts !== 2 || retry?.visibleToUser !== true || retry?.cancelable !== true) failures.push('提供方临时故障必须最多尝试两次，并且用户可见、可取消');
-  for (const field of ['automaticAfterExtensionRestart', 'fileMutationAutomaticRetry', 'commandExecutionAutomaticRetry', 'subagentStartAutomaticRetry']) {
+  if (
+    retry?.providerRetryAuthority !== 'frozen-turn-authority+sqlite-model-request-attempt'
+    || retry?.providerDefaultMaxRetries !== 3
+    || retry?.providerMaxRetries !== 10
+    || retry?.configuredPerFrozenAuthority !== true
+    || retry?.visibleToUser !== true
+    || retry?.visibleWhenTransientThoughtExists !== true
+    || retry?.cancelable !== true
+  ) failures.push('提供方临时故障必须由冻结Authority驱动最多10次可见、可取消的SQLite重试');
+  if (JSON.stringify(retry?.backoffMilliseconds) !== JSON.stringify([1000, 2000, 4000, 8000, 10000])) failures.push('提供方重试退避必须为1/2/4/8/10秒');
+  if (JSON.stringify(retry?.semanticDeadlinesMilliseconds) !== JSON.stringify({ ordinaryFirst: 40000, ordinaryIdle: 30000, compressionCompletion: 180000 })) failures.push('提供方deadline必须为普通首语义40s/idle30s、压缩终态180s');
+  if (retry?.automaticAfterExtensionRestart !== 'resume-committed-retry') failures.push('已提交Provider retry必须在Extension重启后恢复');
+  for (const field of ['fileMutationAutomaticRetry', 'commandExecutionAutomaticRetry', 'subagentStartAutomaticRetry']) {
     if (retry?.[field] !== false) failures.push(`tool.retryPolicy.${field}必须为false`);
   }
   if (tool?.parallelExecution?.supported !== true) failures.push('必须保留互不冲突工具的并行执行');
@@ -838,7 +849,20 @@ function validateContext(context, failures) {
   if (continuation?.futureEnabledContract?.requiresContractRevision !== true) failures.push('未来启用ProviderContinuation必须修改机器合同');
 
   const retry = context?.providerRetry;
-  if (retry?.automaticTransientRetry !== true || retry?.maxAttempts !== 2 || retry?.visible !== true || retry?.cancelable !== true) failures.push('模型提供方必须保留一次可见、可取消的临时故障重试');
+  if (
+    retry?.automaticTransientRetry !== true
+    || retry?.authority !== 'frozen-turn-authority+sqlite-model-request-attempt'
+    || retry?.defaultMaxRetries !== 3
+    || retry?.maxRetries !== 10
+    || retry?.configuredPerFrozenAuthority !== true
+    || retry?.visible !== true
+    || retry?.visibleWhenTransientThoughtExists !== true
+    || retry?.cancelable !== true
+    || retry?.afterExtensionRestart !== 'resume-committed-retry-with-not-before-deadline'
+    || retry?.newAttemptKeepsSameModelRequest !== true
+  ) failures.push('模型提供方必须使用冻结Authority下有界、可见、可取消、可重启恢复的持久重试');
+  if (JSON.stringify(retry?.backoffMilliseconds) !== JSON.stringify([1000, 2000, 4000, 8000, 10000])) failures.push('模型提供方重试退避合同不匹配');
+  if (JSON.stringify(retry?.semanticDeadlinesMilliseconds) !== JSON.stringify({ ordinaryFirst: 40000, ordinaryIdle: 30000, compressionCompletion: 180000 })) failures.push('模型提供方普通语义/压缩终态deadline合同不匹配');
   for (const field of ['ordinaryTransactionMayHashFullHistory', 'ordinaryTransactionMayRewriteFullHistory', 'clientMayDeepCloneFullHistory']) {
     if (context?.performance?.[field] !== false) failures.push(`context.performance.${field}必须为false`);
   }

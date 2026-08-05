@@ -34,6 +34,7 @@ const props = withDefaults(
     deleting?: boolean;
     entering?: boolean;
     editingHighlighted?: boolean;
+    detailLoading?: boolean;
     mutationPending?: boolean;
     mutationBlocked?: boolean;
     retryBlocked?: boolean;
@@ -41,7 +42,7 @@ const props = withDefaults(
     forkBlocked?: boolean;
     pendingLabel?: string;
   }>(),
-  { runId: undefined, termination: undefined, terminationNoticeSuppressed: false, runHadCompletedTools: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, mutationPending: false, mutationBlocked: false, retryBlocked: false, compactBlocked: false, forkBlocked: false, pendingLabel: '正在提交操作' }
+  { runId: undefined, termination: undefined, terminationNoticeSuppressed: false, runHadCompletedTools: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, detailLoading: false, mutationPending: false, mutationBlocked: false, retryBlocked: false, compactBlocked: false, forkBlocked: false, pendingLabel: '正在提交操作' }
 );
 
 const emit = defineEmits<{
@@ -99,7 +100,7 @@ interface TokenUsageItem {
 
 const hasOwn = Object.prototype.hasOwnProperty;
 const LOCAL_DAY_MS = 86_400_000;
-const streaming = computed(() => props.message.status === 'streaming');
+const streaming = computed(() => props.message.status === 'streaming' && !props.detailLoading);
 const messageMutationBlocked = computed(() => props.mutationPending || props.mutationBlocked);
 const retryMutationBlocked = computed(() => props.mutationPending || props.retryBlocked);
 const compactMutationBlocked = computed(() => props.mutationPending || props.compactBlocked);
@@ -788,8 +789,12 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
               {{ terminatedContentExpanded ? '收起已终止内容' : '展开已终止内容' }}
             </button>
           </div>
+          <div v-if="detailLoading" class="message-detail-loading" role="status" aria-live="polite">
+            <span class="message-detail-loading-bar" aria-hidden="true"></span>
+            <span>内容加载中</span>
+          </div>
           <RichContentView
-            v-if="showMessageContent"
+            v-else-if="showMessageContent"
             :parts="message.content.parts"
             :markdown="message.role !== 'user'"
             :streaming="streaming"
@@ -1139,6 +1144,23 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 
 .message-floor.streaming .floor-body {
   min-height: 1.6em;
+}
+
+.message-detail-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 1.6em;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--font-size-sm);
+  font-style: italic;
+}
+
+.message-detail-loading-bar {
+  width: 42px;
+  height: 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 34%, transparent);
 }
 
 .terminated-message-placeholder {

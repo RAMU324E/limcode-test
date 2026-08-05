@@ -22,7 +22,14 @@ interface PartialJsonStringField {
   closed: boolean;
 }
 
-export type ToolCallPreviewFieldName = 'path' | 'content' | 'plan' | 'command' | 'explanation';
+export type ToolCallPreviewFieldName =
+  | 'path'
+  | 'content'
+  | 'plan'
+  | 'command'
+  | 'explanation'
+  | 'oldContent'
+  | 'newContent';
 
 type PreviewStringRole = 'key' | 'field' | 'other';
 
@@ -168,13 +175,13 @@ export function toolCallPreviewPresentation(preview: ToolCallPreviewRecord): Too
   }
 
   if (name === EDIT_TOOL_NAME) {
-    const argumentsPreview = genericArgumentsPreview(preview);
+    const editPreview = editArgumentsPreview(preview);
     return {
       kind: 'edit',
       title: '正在准备文件修改',
       ...(path ? { subject: path } : {}),
       detail: previewDetail(preview),
-      ...(argumentsPreview ? { previewText: argumentsPreview, renderMode: 'json' as const } : {})
+      ...(editPreview ? { previewText: editPreview, renderMode: 'text' as const } : {})
     };
   }
 
@@ -216,12 +223,37 @@ function previewStringField(
   preview: ToolCallPreviewRecord,
   field: ToolCallPreviewFieldName
 ): string | undefined {
-  const incremental = preview.argumentPreviewFields?.[field];
-  return (incremental ?? extractPartialJsonStringFieldState(preview.argumentsText, field))?.value || undefined;
+  return previewStringFieldState(preview, field)?.value || undefined;
+}
+
+function previewStringFieldState(
+  preview: ToolCallPreviewRecord,
+  field: ToolCallPreviewFieldName
+): PartialJsonStringField | undefined {
+  return preview.argumentPreviewFields?.[field]
+    ?? extractPartialJsonStringFieldState(preview.argumentsText, field);
+}
+
+function editArgumentsPreview(preview: ToolCallPreviewRecord): string | undefined {
+  const oldContent = previewStringFieldState(preview, 'oldContent');
+  const newContent = previewStringFieldState(preview, 'newContent');
+  if (!oldContent && !newContent) return undefined;
+
+  const sections: string[] = [];
+  if (oldContent) sections.push(`--- 旧内容 ---\n${oldContent.value}`);
+  if (newContent) {
+    const replacement = newContent.value.length > 0
+      ? newContent.value
+      : newContent.closed
+        ? '（空，将删除匹配内容）'
+        : '';
+    sections.push(`+++ 新内容 +++\n${replacement}`);
+  }
+  return sections.join('\n\n');
 }
 
 const PREVIEW_FIELD_NAMES = new Set<ToolCallPreviewFieldName>([
-  'path', 'content', 'plan', 'command', 'explanation'
+  'path', 'content', 'plan', 'command', 'explanation', 'oldContent', 'newContent'
 ]);
 
 function emptyIncrementalState(): ToolCallPreviewIncrementalState {

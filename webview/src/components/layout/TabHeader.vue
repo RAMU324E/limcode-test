@@ -51,8 +51,9 @@ const statusLabel = computed(() => {
   if (!activeTurn.value) return '空闲';
   if (pendingInteractions.value.length > 0) return '等待用户';
   if (activeToolCalls.value.length > 0) return '执行工具';
+  if (latestModelRequest.value?.status === 'retrying') return '模型自动重试';
   if (latestModelRequest.value?.status === 'streaming') return '模型响应中';
-  if (latestModelRequest.value?.status === 'pending') return '启动模型';
+  if (latestModelRequest.value?.status === 'prepared' || latestModelRequest.value?.status === 'pending') return '启动模型';
   return '处理中';
 });
 const statusClass = computed(() => activeTurn.value ? 'is-active' : 'is-idle');

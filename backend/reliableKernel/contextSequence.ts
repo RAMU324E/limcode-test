@@ -9,6 +9,7 @@ import {
   DOMAIN_REPOSITORIES,
   savepoint,
   type DomainRow,
+  type RepositoryRead,
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -50,6 +51,47 @@ export interface ContextToolPairAppendCommand {
   activate?: boolean;
 }
 
+export interface ContextToolPairBatchAppendCommand {
+  conversationId: string;
+  pairs: ReadonlyArray<{
+    toolCallId: string;
+    toolModelResultId: string;
+    providerCallId?: string;
+  }>;
+}
+
+export interface ContextToolPairBatchAppendResult {
+  segmentIds: string[];
+  rootId: string | null;
+  commitSeq?: string;
+  appendedCount: number;
+  deduplicatedCount: number;
+  transactionCount: 0 | 1;
+}
+
+export type ContextSequenceMetricsEvent =
+  | {
+      kind: 'materialize';
+      mode: 'structure' | 'content';
+      count: 1;
+      observedAt: string;
+    }
+  | {
+      kind: 'transaction';
+      operation: 'append' | 'activate' | 'repair' | 'tool_pair_batch';
+      count: 1;
+      toolPairCount?: number;
+      observedAt: string;
+    };
+
+type ContextSequenceMetricsEventInput =
+  | Omit<Extract<ContextSequenceMetricsEvent, { kind: 'materialize' }>, 'observedAt'>
+  | Omit<Extract<ContextSequenceMetricsEvent, { kind: 'transaction' }>, 'observedAt'>;
+
+export interface ContextSequenceMetricsObserver {
+  observe(event: ContextSequenceMetricsEvent): void;
+}
+
 export interface ContextAppendResult {
   segmentId: string;
   nodeId: string;
@@ -83,6 +125,8 @@ export interface FreshConversationMessageContextPlanInput {
   messageRevisionId: string;
   contentObjectId: string;
   contentByteLength: bigint;
+  /** Provider-semantic estimate for this Message; defaults to the legacy byte fallback. */
+  contentEstimatedTokens?: number;
 }
 
 export interface MessageContextAppendPlanInput {
@@ -90,6 +134,10 @@ export interface MessageContextAppendPlanInput {
   messageRevisionId: string;
   contentObjectId: string;
   contentByteLength: bigint;
+  /** Provider-semantic estimate for the appended Message. */
+  contentEstimatedTokens?: number;
+  /** Provider-observed estimate for the complete resulting root (for example input + model output). */
+  resultingEstimatedTokens?: number;
 }
 
 export interface MessageContextEditPlanInput {
@@ -149,6 +197,24 @@ interface BaseShape {
   compression: boolean;
 }
 
+interface ToolPairBatchFact {
+  toolCallId: string;
+  toolModelResultId: string;
+  providerCallId?: string;
+  toolCall: DomainRow;
+  modelResult: DomainRow;
+  turnId: string;
+  resultRevisionId: string;
+  argumentObjectId: string;
+  callSeq: bigint;
+  sources: [ContextSourceOccurrence, ContextSourceOccurrence];
+  segmentId: string;
+  existing: boolean;
+  argumentMetadata?: ContentObjectMetadata;
+  resultContentId?: string;
+  resultMetadata?: ContentObjectMetadata;
+}
+
 const CONTENT_TYPE_TOOL_PAIR = 'application/vnd.limcode.context-tool-pair+json';
 const EXPECTED_OCCURRENCE_CONSTRAINTS = [
   { domain: 'ContextSegment', columns: ['id'] },
@@ -163,13 +229,15 @@ const EXPECTED_NODE_CONSTRAINTS = [
 /** Stage E Context authority. It never reads current Message state while materializing a frozen root. */
 export class ContextSequenceControlPlane {
   private readonly now: () => string;
+  private readonly metricsObserver: ContextSequenceMetricsObserver | undefined;
 
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore,
-    options: { now?: () => string } = {}
+    options: { now?: () => string; metricsObserver?: ContextSequenceMetricsObserver } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.metricsObserver = options.metricsObserver;
   }
 
   public async appendContent(command: ContextAppendCommand): Promise<ContextAppendResult> {
@@ -271,8 +339,362 @@ export class ContextSequenceControlPlane {
     });
   }
 
+  /**
+   * Appends one provider-ordered terminal prefix with a constant number of compound reads and one
+   * writer transaction. Existing occurrences must form a prefix; accepting a later occurrence
+   * across a missing earlier pair would make the model-visible call/result order ambiguous.
+   */
+  public async appendToolPairsInOrderBatch(
+    command: ContextToolPairBatchAppendCommand
+  ): Promise<ContextToolPairBatchAppendResult> {
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const pairs = command.pairs.map((pair, index) => ({
+      toolCallId: requireId(pair.toolCallId, `pairs[${index}].toolCallId`),
+      toolModelResultId: requireId(pair.toolModelResultId, `pairs[${index}].toolModelResultId`),
+      ...(pair.providerCallId === undefined
+        ? {}
+        : { providerCallId: requireId(pair.providerCallId, `pairs[${index}].providerCallId`) })
+    }));
+    if (pairs.length === 0) {
+      return {
+        segmentIds: [],
+        rootId: null,
+        appendedCount: 0,
+        deduplicatedCount: 0,
+        transactionCount: 0
+      };
+    }
+    if (new Set(pairs.map((pair) => pair.toolCallId)).size !== pairs.length) {
+      throw new Error('Context tool-pair batch contains duplicate ToolCall identities.');
+    }
+    if (new Set(pairs.map((pair) => pair.toolModelResultId)).size !== pairs.length) {
+      throw new Error('Context tool-pair batch contains duplicate ToolModelResult identities.');
+    }
+
+    const factReads = pairs.flatMap((pair): RepositoryRead[] => [
+      DOMAIN_REPOSITORIES.domain('ToolCall').get(pair.toolCallId),
+      DOMAIN_REPOSITORIES.domain('ToolModelResult').get(pair.toolModelResultId),
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'tool_call', source_id: pair.toolCallId },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'tool_model_result', source_id: pair.toolModelResultId },
+        limit: 2
+      })
+    ]);
+    const factSnapshot = await this.database.snapshot(factReads);
+    const facts: ToolPairBatchFact[] = [];
+    let sawMissingOccurrence = false;
+    for (let index = 0; index < pairs.length; index += 1) {
+      const pair = pairs[index];
+      const offset = index * 4;
+      const toolCall = requireRow(factSnapshot.snapshot[offset], `ToolCall ${pair.toolCallId}`);
+      const modelResult = requireRow(
+        factSnapshot.snapshot[offset + 1],
+        `ToolModelResult ${pair.toolModelResultId}`
+      );
+      if (modelResult.tool_call_id !== pair.toolCallId) {
+        throw new Error(`ToolModelResult ${pair.toolModelResultId} does not belong to ToolCall ${pair.toolCallId}.`);
+      }
+      const callSeq = requireBigInt(toolCall.call_seq, 'ToolCall.call_seq');
+      const sources: [ContextSourceOccurrence, ContextSourceOccurrence] = [
+        { sourceKind: 'tool_call', sourceId: pair.toolCallId, sourceRevision: callSeq },
+        { sourceKind: 'tool_model_result', sourceId: pair.toolModelResultId, sourceRevision: callSeq }
+      ];
+      const callSources = rows(factSnapshot.snapshot[offset + 2]);
+      const resultSources = rows(factSnapshot.snapshot[offset + 3]);
+      if (callSources.length > 1) {
+        throw new Error(`ToolCall ${pair.toolCallId} has multiple Context occurrences.`);
+      }
+      if (resultSources.length > 1) {
+        throw new Error(`ToolModelResult ${pair.toolModelResultId} has multiple Context occurrences.`);
+      }
+      const existing = callSources.length === 1 && resultSources.length === 1;
+      if ((callSources.length === 1) !== (resultSources.length === 1)) {
+        throw new Error(`Context tool pair ${pair.toolCallId}/${pair.toolModelResultId} is partially registered.`);
+      }
+      const segmentId = stableSegmentId(sources);
+      if (existing) {
+        if (sawMissingOccurrence) {
+          throw new Error('Existing Context tool-pair occurrences must form a provider-ordered prefix.');
+        }
+        const callSource = callSources[0];
+        const resultSource = resultSources[0];
+        if (
+          requireBigInt(callSource.source_revision, 'ContextSegmentSource.source_revision') !== callSeq
+          || requireBigInt(resultSource.source_revision, 'ContextSegmentSource.source_revision') !== callSeq
+          || callSource.segment_id !== resultSource.segment_id
+          || callSource.segment_id !== segmentId
+        ) {
+          throw new Error(`Context tool pair ${pair.toolCallId}/${pair.toolModelResultId} has conflicting source identity.`);
+        }
+      } else {
+        sawMissingOccurrence = true;
+      }
+      facts.push({
+        ...pair,
+        toolCall,
+        modelResult,
+        turnId: requireId(toolCall.turn_id, 'ToolCall.turn_id'),
+        resultRevisionId: requireId(modelResult.message_revision_id, 'ToolModelResult.message_revision_id'),
+        argumentObjectId: requireId(toolCall.arguments_object_id, 'ToolCall.arguments_object_id'),
+        callSeq,
+        sources,
+        segmentId,
+        existing
+      });
+    }
+    for (let index = 1; index < facts.length; index += 1) {
+      if (facts[index].turnId !== facts[0].turnId) {
+        throw new Error('Context tool-pair batch must belong to one Turn.');
+      }
+      if (facts[index].callSeq <= facts[index - 1].callSeq) {
+        throw new Error('Context tool-pair batch is not in provider call order.');
+      }
+    }
+
+    const relatedReads: RepositoryRead[] = [];
+    const relatedIndexes = new Map<string, number>();
+    const addRelatedRead = (key: string, read: RepositoryRead): void => {
+      if (relatedIndexes.has(key)) return;
+      relatedIndexes.set(key, relatedReads.length);
+      relatedReads.push(read);
+    };
+    addRelatedRead('conversation', DOMAIN_REPOSITORIES.domain('Conversation').get(conversationId));
+    addRelatedRead('head', DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').list({
+      where: { conversation_id: conversationId },
+      limit: 2
+    }));
+    for (const fact of facts) {
+      addRelatedRead(`turn:${fact.turnId}`, DOMAIN_REPOSITORIES.domain('Turn').get(fact.turnId));
+      if (fact.existing) {
+        addRelatedRead(`segment:${fact.segmentId}`, DOMAIN_REPOSITORIES.domain('ContextSegment').get(fact.segmentId));
+      } else {
+        addRelatedRead(
+          `revision:${fact.resultRevisionId}`,
+          DOMAIN_REPOSITORIES.domain('MessageRevision').get(fact.resultRevisionId)
+        );
+        addRelatedRead(
+          `content:${fact.argumentObjectId}`,
+          DOMAIN_REPOSITORIES.domain('ContentObject').get(fact.argumentObjectId)
+        );
+      }
+    }
+    const relatedSnapshot = await this.database.snapshot(relatedReads);
+    const related = (key: string): unknown => {
+      const index = relatedIndexes.get(key);
+      if (index === undefined) throw new Error(`Missing Context batch read ${key}.`);
+      return relatedSnapshot.snapshot[index];
+    };
+    requireRow(related('conversation'), `Conversation ${conversationId}`);
+    const headRows = rows(related('head'));
+    if (headRows.length > 1) throw new Error(`Conversation ${conversationId} has multiple Context heads.`);
+    const head = headRows[0] ?? null;
+    const currentHeadRootId = head
+      ? requireId(head.root_id, 'ConversationContextHeadLink.root_id')
+      : null;
+    const expectedHeadRootId = currentHeadRootId;
+    const baseRootId = currentHeadRootId;
+    for (const fact of facts) {
+      const turn = requireRow(related(`turn:${fact.turnId}`), `Turn ${fact.turnId}`);
+      if (turn.conversation_id !== conversationId) {
+        throw new Error(`ToolCall ${fact.toolCallId} belongs to another Conversation.`);
+      }
+      if (fact.existing) {
+        const segment = requireRow(
+          related(`segment:${fact.segmentId}`),
+          `ContextSegment ${fact.segmentId}`
+        );
+        if (segment.id !== fact.segmentId || segment.segment_kind !== 'tool_pair') {
+          throw new Error(`Context tool pair ${fact.toolCallId}/${fact.toolModelResultId} points to a conflicting segment.`);
+        }
+        continue;
+      }
+      const resultRevision = requireRow(
+        related(`revision:${fact.resultRevisionId}`),
+        `MessageRevision ${fact.resultRevisionId}`
+      );
+      const resultContentId = requireId(
+        resultRevision.content_object_id,
+        'MessageRevision.content_object_id'
+      );
+      fact.argumentMetadata = asContentObjectMetadata(requireRow(
+        related(`content:${fact.argumentObjectId}`),
+        `ContentObject ${fact.argumentObjectId}`
+      ));
+      fact.resultContentId = resultContentId;
+    }
+
+    const missingFacts = facts.filter((fact) => !fact.existing);
+    if (missingFacts.length === 0) {
+      return {
+        segmentIds: facts.map((fact) => fact.segmentId),
+        rootId: currentHeadRootId,
+        appendedCount: 0,
+        deduplicatedCount: facts.length,
+        transactionCount: 0
+      };
+    }
+    const finalReads: RepositoryRead[] = missingFacts.map((fact) => DOMAIN_REPOSITORIES.domain('ContentObject').get(
+      requireId(fact.resultContentId, 'ToolModelResult ContentObject.id')
+    ));
+    if (baseRootId) finalReads.push(DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').get(baseRootId));
+    const finalSnapshot = await this.database.snapshot(finalReads);
+    for (let index = 0; index < missingFacts.length; index += 1) {
+      const fact = missingFacts[index];
+      fact.resultMetadata = asContentObjectMetadata(requireRow(
+        finalSnapshot.snapshot[index],
+        `ContentObject ${String(fact.resultContentId)}`
+      ));
+    }
+    const baseRoot = baseRootId
+      ? requireRow(finalSnapshot.snapshot[missingFacts.length], `ContextSequenceRoot ${baseRootId}`)
+      : null;
+    if (baseRoot && baseRoot.conversation_id !== conversationId) {
+      throw new Error(`ContextSequenceRoot ${baseRootId} belongs to another Conversation.`);
+    }
+
+    let compression = false;
+    const baseRootNodeId = baseRoot
+      ? nullableId(baseRoot.root_node_id, 'ContextSequenceRoot.root_node_id')
+      : null;
+    if (baseRootNodeId) {
+      const nodeSnapshot = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('ContextSequenceNode').get(baseRootNodeId)
+      ]);
+      const node = requireRow(nodeSnapshot.snapshot[0], `ContextSequenceNode ${baseRootNodeId}`);
+      const segmentId = requireId(node.segment_id, 'ContextSequenceNode.segment_id');
+      const segmentSnapshot = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)
+      ]);
+      const segment = requireRow(segmentSnapshot.snapshot[0], `ContextSegment ${segmentId}`);
+      compression = segment.segment_kind === 'compression';
+    }
+
+    const metadataToRead = missingFacts.flatMap((fact) => [
+      requireContentMetadata(fact.argumentMetadata, `ToolCall ${fact.toolCallId} arguments`),
+      requireContentMetadata(fact.resultMetadata, `ToolModelResult ${fact.toolModelResultId} result`)
+    ]);
+    const content = await this.contentStore.readMany(metadataToRead);
+    const pairBodies = missingFacts.map((fact, index) => toolPairContent(
+      fact,
+      content[index * 2],
+      content[index * 2 + 1]
+    ));
+    const prepared = await this.contentStore.prepareBatch(
+      this.database,
+      pairBodies.map((body) => ({ content: body, contentType: CONTENT_TYPE_TOOL_PAIR }))
+    );
+    if (prepared.length !== missingFacts.length) {
+      throw new Error('CAS tool-pair batch result length does not match the terminal prefix.');
+    }
+
+    const now = this.timestamp();
+    let parentNodeId = baseRoot
+      ? compression
+        ? nullableId(baseRoot.tail_node_id, 'ContextSequenceRoot.tail_node_id')
+        : baseRootNodeId
+      : null;
+    let previousRootId = baseRootId;
+    let segmentCount = baseRoot
+      ? requireBigInt(baseRoot.segment_count, 'ContextSequenceRoot.segment_count')
+      : 0n;
+    let estimatedTokens = baseRoot
+      ? requireBigInt(baseRoot.estimated_tokens, 'ContextSequenceRoot.estimated_tokens')
+      : 0n;
+    let tailSegmentCount = baseRoot
+      ? requireBigInt(baseRoot.tail_segment_count, 'ContextSequenceRoot.tail_segment_count')
+      : 0n;
+    const plans = missingFacts.map((fact, index) => {
+      const nodeId = contextSequenceNodeId(parentNodeId, fact.segmentId);
+      const rootId = stableId('context_root_append', conversationId, previousRootId ?? '<null>', nodeId);
+      segmentCount += 1n;
+      estimatedTokens += estimateTokens(prepared[index].metadata.byte_length);
+      if (compression) tailSegmentCount += 1n;
+      const plan = {
+        fact,
+        content: prepared[index],
+        nodeId,
+        parentNodeId,
+        rootId,
+        previousRootId,
+        segmentCount,
+        estimatedTokens,
+        tailSegmentCount
+      };
+      parentNodeId = nodeId;
+      previousRootId = rootId;
+      return plan;
+    });
+    const finalRootId = plans[plans.length - 1].rootId;
+    const steps: RepositoryTransactionStep[] = [
+      ...headAssertionSteps(conversationId, head, expectedHeadRootId),
+      ...preparedContentObjectSteps(prepared, 'context_tool_pair_content'),
+      ...plans.flatMap((plan, index): RepositoryTransactionStep[] => [
+        ...occurrenceInsertSteps({
+          segmentId: plan.fact.segmentId,
+          segmentKind: 'tool_pair',
+          contentObjectId: plan.content.metadata.id,
+          sources: plan.fact.sources,
+          now
+        }),
+        ...nodeInsertSteps([{
+          id: plan.nodeId,
+          parentNodeId: plan.parentNodeId,
+          segmentId: plan.fact.segmentId,
+          now
+        }], `context_tool_pair_node_${index}`),
+        DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
+          id: plan.rootId,
+          conversation_id: conversationId,
+          root_node_id: compression ? baseRootNodeId : plan.nodeId,
+          tail_node_id: compression ? plan.nodeId : null,
+          tail_segment_count: compression ? plan.tailSegmentCount : 0n,
+          segment_count: plan.segmentCount,
+          estimated_tokens: plan.estimatedTokens,
+          created_at: now
+        }, { column: 'root_seq', scope: { conversation_id: conversationId } })
+      ]),
+      ...headMutationSteps(conversationId, head, finalRootId, now)
+    ];
+    try {
+      const commit = await this.database.transaction(steps);
+      this.observeMetrics({
+        kind: 'transaction',
+        operation: 'tool_pair_batch',
+        count: 1,
+        toolPairCount: missingFacts.length
+      });
+      return {
+        segmentIds: facts.map((fact) => fact.segmentId),
+        rootId: finalRootId,
+        commitSeq: commit.commitSeq,
+        appendedCount: missingFacts.length,
+        deduplicatedCount: facts.length - missingFacts.length,
+        transactionCount: 1
+      };
+    } catch (error) {
+      if (!isRecoverableAppendRace(error)) throw error;
+      const raced = await this.database.snapshot(missingFacts.flatMap((fact): RepositoryRead[] => [
+        DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+          where: { source_kind: 'tool_call', source_id: fact.toolCallId },
+          limit: 1
+        }),
+        DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+          where: { source_kind: 'tool_model_result', source_id: fact.toolModelResultId },
+          limit: 1
+        })
+      ]));
+      const anyRacedOccurrence = raced.snapshot.some((value) => rows(value).length > 0);
+      if (!anyRacedOccurrence) throw error;
+      return this.appendToolPairsInOrderBatch(command);
+    }
+  }
+
   public async materializeStructure(rootId: string): Promise<MaterializedContextStructure> {
     const barrier = await this.database.materializeContext(requireId(rootId, 'rootId'));
+    this.observeMetrics({ kind: 'materialize', mode: 'structure', count: 1 });
     return {
       root: barrier.snapshot.root,
       records: barrier.snapshot.records,
@@ -282,6 +704,7 @@ export class ContextSequenceControlPlane {
 
   public async materialize(rootId: string): Promise<MaterializedContext> {
     const barrier = await this.database.materializeContextContent(requireId(rootId, 'rootId'));
+    this.observeMetrics({ kind: 'materialize', mode: 'content', count: 1 });
     return {
       root: barrier.snapshot.root,
       segments: barrier.snapshot.records.map((record) => ({
@@ -315,6 +738,8 @@ export class ContextSequenceControlPlane {
     const contentObjectId = requireId(input.contentObjectId, 'contentObjectId');
     const contentByteLength = requireBigInt(input.contentByteLength, 'contentByteLength');
     if (contentByteLength < 0n) throw new TypeError('contentByteLength must be non-negative.');
+    const contentEstimatedTokens = optionalEstimatedTokens(input.contentEstimatedTokens)
+      ?? estimateTokens(contentByteLength);
     const segmentId = stableSegmentId([{
       sourceKind: 'message_revision', sourceId: revisionId, sourceRevision: 0n
     }]);
@@ -341,7 +766,7 @@ export class ContextSequenceControlPlane {
           tail_node_id: null,
           tail_segment_count: 0n,
           segment_count: 1n,
-          estimated_tokens: estimateTokens(contentByteLength),
+          estimated_tokens: contentEstimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
         DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').insert({
@@ -361,6 +786,9 @@ export class ContextSequenceControlPlane {
     const contentObjectId = requireId(input.contentObjectId, 'contentObjectId');
     const contentByteLength = requireBigInt(input.contentByteLength, 'contentByteLength');
     if (contentByteLength < 0n) throw new TypeError('contentByteLength must be non-negative.');
+    const contentEstimatedTokens = optionalEstimatedTokens(input.contentEstimatedTokens)
+      ?? estimateTokens(contentByteLength);
+    const resultingEstimatedTokens = optionalEstimatedTokens(input.resultingEstimatedTokens);
     const head = await this.getHead(conversationId);
     const baseRootId = head ? requireId(head.root_id, 'ConversationContextHeadLink.root_id') : null;
     const base = await this.readBaseShape(conversationId, baseRootId);
@@ -388,7 +816,7 @@ export class ContextSequenceControlPlane {
           tail_node_id: base.compression ? nodeId : null,
           tail_segment_count: base.compression ? base.tailSegmentCount + 1n : 0n,
           segment_count: base.segmentCount + 1n,
-          estimated_tokens: base.estimatedTokens + estimateTokens(contentByteLength),
+          estimated_tokens: resultingEstimatedTokens ?? (base.estimatedTokens + contentEstimatedTokens),
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
         ...headMutationSteps(conversationId, head, rootId, now)
@@ -721,6 +1149,7 @@ export class ContextSequenceControlPlane {
           ...headMutationSteps(conversationId, state.head, rootId, now),
           DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
         ]);
+        this.observeMetrics({ kind: 'transaction', operation: 'repair', count: 1 });
       } catch (error) {
         // Background startup maintenance may race a real user Turn after the VS Code surface is
         // already usable. The exact head/activity assertions are the authority: losing that CAS
@@ -980,7 +1409,6 @@ export class ContextSequenceControlPlane {
     const expectedHeadRootId = planInput.expectedHeadRootId === undefined
       ? currentHeadRootId
       : nullableId(planInput.expectedHeadRootId, 'expectedHeadRootId');
-    if (activate && currentHeadRootId !== expectedHeadRootId) throw staleHeadError(conversationId);
     const baseRootId = planInput.baseRootId === undefined
       ? expectedHeadRootId
       : nullableId(planInput.baseRootId, 'baseRootId');
@@ -1016,6 +1444,10 @@ export class ContextSequenceControlPlane {
       }
       throw sourceParentConflictError(sources, baseRootId);
     }
+    // An identical concurrent append may have advanced the head to this command's deterministic
+    // root while its CAS prepare was still in flight. Let the replay path above recognize that
+    // committed result before rejecting genuinely stale, different work.
+    if (activate && currentHeadRootId !== expectedHeadRootId) throw staleHeadError(conversationId);
     const now = this.timestamp();
     const estimated = estimateTokens(planInput.content.metadata.byte_length);
     const rootShape = base.compression
@@ -1054,6 +1486,7 @@ export class ContextSequenceControlPlane {
     ];
     try {
       const commit = await this.database.transaction(steps);
+      this.observeMetrics({ kind: 'transaction', operation: 'append', count: 1 });
       return {
         segmentId,
         nodeId,
@@ -1096,6 +1529,7 @@ export class ContextSequenceControlPlane {
       ...headAssertionSteps(input.conversationId, latestHead, input.expectedHeadRootId),
       ...headMutationSteps(input.conversationId, latestHead, input.rootId, this.timestamp())
     ]);
+    this.observeMetrics({ kind: 'transaction', operation: 'activate', count: 1 });
     return {
       ...this.replayAppend(input.root, input.segmentId, input.nodeId, input.rootId),
       commitSeq: commit.commitSeq
@@ -1186,6 +1620,15 @@ export class ContextSequenceControlPlane {
       rootSeq: requireBigInt(root.root_seq, 'ContextSequenceRoot.root_seq').toString(),
       deduplicated: true
     };
+  }
+
+  private observeMetrics(event: ContextSequenceMetricsEventInput): void {
+    if (!this.metricsObserver) return;
+    try {
+      this.metricsObserver.observe({ ...event, observedAt: this.timestamp() } as ContextSequenceMetricsEvent);
+    } catch {
+      // Development diagnostics must never become a Context mutation control path.
+    }
   }
 
   private timestamp(): string {
@@ -1446,6 +1889,42 @@ function normalizeSource(source: ContextSourceOccurrence): ContextSourceOccurren
   return { sourceKind, sourceId, sourceRevision };
 }
 
+function toolPairContent(fact: ToolPairBatchFact, argumentsBytes: Buffer, resultBytes: Buffer): string {
+  const argumentMetadata = requireContentMetadata(
+    fact.argumentMetadata,
+    `ToolCall ${fact.toolCallId} arguments`
+  );
+  const resultMetadata = requireContentMetadata(
+    fact.resultMetadata,
+    `ToolModelResult ${fact.toolModelResultId} result`
+  );
+  return JSON.stringify({
+    kind: 'tool_pair',
+    toolCall: {
+      id: fact.toolCallId,
+      ...(fact.providerCallId ? { providerCallId: fact.providerCallId } : {}),
+      callSeq: fact.callSeq.toString(),
+      toolName: requireText(fact.toolCall.tool_name, 'ToolCall.tool_name'),
+      argumentsContentType: argumentMetadata.content_type,
+      arguments: argumentsBytes.toString('utf8')
+    },
+    toolModelResult: {
+      id: fact.toolModelResultId,
+      messageRevisionId: fact.resultRevisionId,
+      resultContentType: resultMetadata.content_type,
+      result: resultBytes.toString('utf8')
+    }
+  });
+}
+
+function requireContentMetadata(
+  value: ContentObjectMetadata | undefined,
+  label: string
+): ContentObjectMetadata {
+  if (!value) throw new Error(`${label} metadata does not exist.`);
+  return value;
+}
+
 function stableSegmentId(sources: readonly ContextSourceOccurrence[]): string {
   return stableId(
     'context_segment',
@@ -1520,6 +1999,14 @@ function allocatedValue(
   );
   if (!entry) throw new Error(`Missing writer allocation ${domain}.${column} for ${id}.`);
   return entry.value;
+}
+
+function optionalEstimatedTokens(value: number | undefined): bigint | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError('estimated token count must be a non-negative safe integer.');
+  }
+  return BigInt(value);
 }
 
 function estimateTokens(byteLength: bigint): bigint {

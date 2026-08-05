@@ -2,9 +2,14 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
+  MAX_PROCESS_EXECUTION_TIMEOUT_MS,
+  MAX_PROCESS_MAX_OUTPUT_BYTES,
+  MIN_PROCESS_EXECUTION_TIMEOUT_MS,
+  MIN_PROCESS_MAX_OUTPUT_BYTES,
   PROCESS_OUTPUT_MAX_CHUNK_BYTES,
   PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS,
   PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM,
+  PROCESS_TERMINATION_GRACE_MS,
   PROCESS_WRAPPER_CHUNKS_DIRECTORY,
   PROCESS_WRAPPER_EXIT_RECEIPT_FILE,
   PROCESS_WRAPPER_IDENTITY_FILE,
@@ -16,6 +21,7 @@ import {
   readLinuxStartFingerprint,
   type ProcessStopRequest,
   type ProcessStreamKind,
+  type ProcessTerminationReason,
   type ProcessWrapperExitReceipt,
   type ProcessWrapperIdentity,
   type ProcessWrapperLaunchRequest,
@@ -35,8 +41,14 @@ interface WrapperState {
   retainedBytes: bigint;
   retainedChunks: bigint;
   droppedBytes: bigint;
+  observedOutputBytes: bigint;
   truncated: boolean;
   stopRequested: boolean;
+  terminationReason: Exclude<ProcessTerminationReason, 'natural'> | null;
+  terminationWitnesses: Set<string>;
+  forceKillTimer: NodeJS.Timeout | null;
+  forceKillDueAt: number | null;
+  deadlineTimer: NodeJS.Timeout | null;
   flushTimer: NodeJS.Timeout | null;
   flushError: Error | null;
   stdout: StreamState;
@@ -105,8 +117,14 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
     retainedBytes: 0n,
     retainedChunks: 0n,
     droppedBytes: 0n,
+    observedOutputBytes: 0n,
     truncated: false,
     stopRequested: false,
+    terminationReason: null,
+    terminationWitnesses: new Set(),
+    forceKillTimer: null,
+    forceKillDueAt: null,
+    deadlineTimer: null,
     flushTimer: null,
     flushError: null,
     stdout: { tail: Buffer.alloc(0) },
@@ -123,15 +141,23 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
   child.stdout?.on('data', (chunk: Buffer | string) => retainOutput(state, 'stdout', Buffer.from(chunk)));
   child.stderr?.on('data', (chunk: Buffer | string) => retainOutput(state, 'stderr', Buffer.from(chunk)));
   const stopPoll = setInterval(() => observeStopRequest(state), Math.min(100, PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS));
+  state.deadlineTimer = scheduleExecutionDeadline(state);
   const bootstrapGate = child.stdio[3];
   if (!bootstrapGate || typeof (bootstrapGate as NodeJS.WritableStream).end !== 'function') {
     clearInterval(stopPoll);
+    clearWatchdogTimers(state);
     await abortBlockedChild(childPid, exitPromise);
     throw new Error('Detached wrapper bootstrap pipe is unavailable.');
   }
   (bootstrapGate as NodeJS.WritableStream).end('\n');
 
   const exit = await exitPromise.finally(() => clearInterval(stopPoll));
+  if (state.deadlineTimer) {
+    clearTimeout(state.deadlineTimer);
+    state.deadlineTimer = null;
+  }
+  await awaitTerminationEscalation(state);
+  clearWatchdogTimers(state);
 
   cancelScheduledFlush(state);
   if (state.flushError) throw state.flushError;
@@ -156,7 +182,10 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
     retainedChunks: state.retainedChunks.toString(),
     droppedBytes: state.droppedBytes.toString(),
     truncated: state.truncated,
-    stopRequested: state.stopRequested
+    stopRequested: state.stopRequested,
+    terminationReason: state.terminationReason ?? 'natural',
+    executionDeadlineAt: request.executionDeadlineAt,
+    maxOutputBytes: request.maxOutputBytes
   };
   // The atomic exit receipt is the only cross-host terminal authority.
   writeAtomicJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE), receipt);
@@ -164,6 +193,30 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
 
 function retainOutput(state: WrapperState, streamKind: ProcessStreamKind, bytes: Buffer): void {
   if (bytes.length === 0) return;
+  const previousObserved = state.observedOutputBytes;
+  state.observedOutputBytes += BigInt(bytes.length);
+  let accepted = bytes;
+  if (state.request.maxOutputBytes !== null) {
+    const remaining = BigInt(state.request.maxOutputBytes) - previousObserved;
+    const acceptedLength = remaining <= 0n
+      ? 0
+      : Number(remaining < BigInt(bytes.length) ? remaining : BigInt(bytes.length));
+    if (acceptedLength < bytes.length) {
+      accepted = bytes.subarray(0, acceptedLength);
+      state.droppedBytes += BigInt(bytes.length - acceptedLength);
+      state.truncated = true;
+    }
+  }
+  if (accepted.length > 0) retainAcceptedOutput(state, streamKind, accepted);
+  if (
+    state.request.maxOutputBytes !== null
+    && state.observedOutputBytes >= BigInt(state.request.maxOutputBytes)
+  ) {
+    requestTermination(state, 'output_limit_exceeded');
+  }
+}
+
+function retainAcceptedOutput(state: WrapperState, streamKind: ProcessStreamKind, bytes: Buffer): void {
   const stream = state[streamKind];
   const combined = Buffer.concat([stream.tail, bytes]);
   const tailBudget = PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM;
@@ -202,7 +255,7 @@ function writeChunk(state: WrapperState, streamKind: ProcessStreamKind, bytes: B
 }
 
 function observeStopRequest(state: WrapperState): void {
-  if (state.stopRequested) return;
+  if (state.terminationReason !== null) return;
   const requestPath = path.join(state.spoolPath, PROCESS_WRAPPER_STOP_REQUEST_FILE);
   let parsed: ProcessStopRequest;
   try {
@@ -228,12 +281,106 @@ function observeStopRequest(state: WrapperState): void {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
-  state.stopRequested = true;
+  requestTermination(state, 'manual');
+}
+
+function scheduleExecutionDeadline(state: WrapperState): NodeJS.Timeout | null {
+  const deadlineAt = state.request.executionDeadlineAt;
+  if (deadlineAt === null) return null;
+  const delay = Math.max(0, Date.parse(deadlineAt) - Date.now());
+  const timer = setTimeout(() => requestTermination(state, 'timed_out'), delay);
+  timer.unref();
+  return timer;
+}
+
+function requestTermination(
+  state: WrapperState,
+  reason: Exclude<ProcessTerminationReason, 'natural'>
+): boolean {
+  if (state.terminationReason !== null) return false;
+  const identity = state.identity;
+  // Capture process-group birth witnesses before the first signal. A later escalation only targets
+  // the group while at least one original member remains, preventing PGID reuse from hitting an
+  // unrelated process while still covering descendants whose group leader exits on SIGTERM.
+  const witnesses = readLinuxProcessGroupFingerprints(identity.processGroupId);
+  if (!witnesses.has(identity.startFingerprint)) return false;
+  state.terminationWitnesses = witnesses;
+  state.terminationReason = reason;
+  state.stopRequested = reason === 'manual';
+  signalProcessGroup(identity.processGroupId, 'SIGTERM');
+  for (const witness of readLinuxProcessGroupFingerprints(identity.processGroupId)) {
+    state.terminationWitnesses.add(witness);
+  }
+  state.forceKillDueAt = Date.now() + PROCESS_TERMINATION_GRACE_MS;
+  state.forceKillTimer = setTimeout(() => {
+    try {
+      const current = readLinuxProcessGroupFingerprints(identity.processGroupId);
+      if (![...current].some((fingerprint) => state.terminationWitnesses.has(fingerprint))) return;
+      signalProcessGroup(identity.processGroupId, 'SIGKILL');
+    } finally {
+      state.forceKillTimer = null;
+      state.forceKillDueAt = null;
+    }
+  }, PROCESS_TERMINATION_GRACE_MS);
+  state.forceKillTimer.unref();
+  return true;
+}
+
+function signalProcessGroup(processGroupId: string, signal: NodeJS.Signals): void {
   try {
-    process.kill(-Number(identity.processGroupId), 'SIGTERM');
+    process.kill(-Number(processGroupId), signal);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
   }
+}
+
+function clearWatchdogTimers(state: WrapperState): void {
+  if (state.deadlineTimer) clearTimeout(state.deadlineTimer);
+  if (state.forceKillTimer) clearTimeout(state.forceKillTimer);
+  state.deadlineTimer = null;
+  state.forceKillTimer = null;
+  state.forceKillDueAt = null;
+}
+
+async function awaitTerminationEscalation(state: WrapperState): Promise<void> {
+  if (!state.forceKillTimer || state.forceKillDueAt === null) return;
+  const current = readLinuxProcessGroupFingerprints(state.identity.processGroupId);
+  const originalGroupStillExists = [...current]
+    .some((fingerprint) => state.terminationWitnesses.has(fingerprint));
+  if (!originalGroupStillExists) {
+    clearTimeout(state.forceKillTimer);
+    state.forceKillTimer = null;
+    state.forceKillDueAt = null;
+    return;
+  }
+  // An original witness proves this is still the same process group, so descendants discovered now
+  // may safely witness the delayed group-wide SIGKILL even if the original leader exits meanwhile.
+  for (const fingerprint of current) state.terminationWitnesses.add(fingerprint);
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, state.forceKillDueAt! - Date.now()) + 25));
+}
+
+function readLinuxProcessGroupFingerprints(processGroupId: string): Set<string> {
+  const expectedGroup = BigInt(processGroupId);
+  const fingerprints = new Set<string>();
+  for (const entry of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const stat = fs.readFileSync(`/proc/${entry}/stat`, 'utf8');
+      const close = stat.lastIndexOf(')');
+      if (close < 0) continue;
+      const fieldsFromState = stat.slice(close + 2).trim().split(/\s+/);
+      const group = fieldsFromState[2];
+      const startTicks = fieldsFromState[19];
+      if (!group || !startTicks || BigInt(group) !== expectedGroup || !/^\d+$/.test(startTicks)) continue;
+      fingerprints.add(`linux-proc:${BigInt(entry).toString()}:${BigInt(startTicks).toString()}`);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ESRCH' && code !== 'EACCES' && code !== 'EPERM') {
+        throw error;
+      }
+    }
+  }
+  return fingerprints;
 }
 
 function scheduleRunningFlush(state: WrapperState): void {
@@ -282,11 +429,16 @@ function writeManifest(state: WrapperState, status: ProcessWrapperManifest['stat
 function parseLaunchRequest(value: unknown): ProcessWrapperLaunchRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid process launch request.');
   const record = value as Record<string, unknown>;
-  const keys = [
+  const legacyKeys = [
     'kind', 'processId', 'stableNonce', 'command', 'cwd', 'commandDigest', 'spoolLocator', 'createdAt'
   ].sort();
+  const currentKeys = [
+    ...legacyKeys,
+    'executionTimeoutMs', 'executionDeadlineAt', 'maxOutputBytes'
+  ].sort();
   const actual = Object.keys(record).sort();
-  if (actual.length !== keys.length || actual.some((key, index) => key !== keys[index])) {
+  const legacy = sameKeys(actual, legacyKeys);
+  if (!legacy && !sameKeys(actual, currentKeys)) {
     throw new TypeError('Process launch request fields do not match wrapper contract.');
   }
   if (record.kind !== PROCESS_WRAPPER_PROTOCOL) throw new TypeError('Invalid process launch request kind.');
@@ -299,6 +451,36 @@ function parseLaunchRequest(value: unknown): ProcessWrapperLaunchRequest {
   if (!/^[a-f0-9]{64}$/.test(digest)) throw new TypeError('Invalid launch request commandDigest.');
   const locator = text('spoolLocator');
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(locator)) throw new TypeError('Invalid launch request spoolLocator.');
+  const createdAt = text('createdAt');
+  if (!Number.isFinite(Date.parse(createdAt))) throw new TypeError('Invalid launch request createdAt.');
+
+  let executionTimeoutMs: number | null = null;
+  let executionDeadlineAt: string | null = null;
+  let maxOutputBytes: number | null = null;
+  if (!legacy) {
+    executionTimeoutMs = nullableBoundedInteger(
+      record.executionTimeoutMs,
+      'executionTimeoutMs',
+      MIN_PROCESS_EXECUTION_TIMEOUT_MS,
+      MAX_PROCESS_EXECUTION_TIMEOUT_MS
+    );
+    executionDeadlineAt = nullableTimestamp(record.executionDeadlineAt, 'executionDeadlineAt');
+    maxOutputBytes = nullableBoundedInteger(
+      record.maxOutputBytes,
+      'maxOutputBytes',
+      MIN_PROCESS_MAX_OUTPUT_BYTES,
+      MAX_PROCESS_MAX_OUTPUT_BYTES
+    );
+    const allNull = executionTimeoutMs === null && executionDeadlineAt === null && maxOutputBytes === null;
+    const allPresent = executionTimeoutMs !== null && executionDeadlineAt !== null && maxOutputBytes !== null;
+    if (!allNull && !allPresent) throw new TypeError('Process launch watchdog fields must be all present or all null.');
+    if (allPresent) {
+      const expectedDeadline = Date.parse(createdAt) + executionTimeoutMs!;
+      if (Date.parse(executionDeadlineAt!) !== expectedDeadline) {
+        throw new TypeError('Process launch executionDeadlineAt does not match createdAt + executionTimeoutMs.');
+      }
+    }
+  }
   return {
     kind: PROCESS_WRAPPER_PROTOCOL,
     processId: text('processId'),
@@ -307,8 +489,36 @@ function parseLaunchRequest(value: unknown): ProcessWrapperLaunchRequest {
     cwd: text('cwd'),
     commandDigest: digest,
     spoolLocator: locator,
-    createdAt: text('createdAt')
+    executionTimeoutMs,
+    executionDeadlineAt,
+    maxOutputBytes,
+    createdAt
   };
+}
+
+function sameKeys(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function nullableBoundedInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number
+): number | null {
+  if (value === null) return null;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new TypeError(`Invalid launch request ${label}.`);
+  }
+  return value;
+}
+
+function nullableTimestamp(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+    throw new TypeError(`Invalid launch request ${label}.`);
+  }
+  return value;
 }
 
 async function abortBlockedChild(

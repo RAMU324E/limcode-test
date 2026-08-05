@@ -318,7 +318,7 @@ async function copyFile(input: {
     signal?.throwIfAborted();
     await to.rename(tempPath, targetPath, overwrite);
     tracker.completedFiles += 1;
-    reportTransferProgress(tracker, false, true);
+    reportTransferProgress(tracker, false, false);
     return { bytes: sourceSize, verifyOk };
   } catch (error) {
     await safeUnlink(to, tempPath);
@@ -344,7 +344,7 @@ async function copyFileViaStream(
   });
   const reader = await from.openRead(sourcePath);
   const writer = await to.openWrite(tempPath, false);
-  const timer = setInterval(() => reportTransferProgress(tracker, false, true), PROGRESS_THROTTLE_MS);
+  const timer = setInterval(() => reportTransferProgress(tracker, false, false), PROGRESS_THROTTLE_MS);
   try {
     await pipeline(reader.stream, progress, writer.stream, { signal });
     if (reader.done) await reader.done();

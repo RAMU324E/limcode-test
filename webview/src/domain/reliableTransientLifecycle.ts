@@ -3,6 +3,7 @@ import type {
   ReliableKernelDetailState,
   ReliableKernelTransientState
 } from '@webview/stores/useReliableKernelClientFeedStore';
+import { hasVisibleReliableTransientOutput } from '@webview/domain/reliableTransientActivity';
 
 const MAX_TRANSIENT_MODEL_REQUESTS = 512;
 
@@ -34,6 +35,12 @@ export function reconcileReliableTransientRequests(
   }
 
   for (const entry of Object.values(requests)) {
+    if (entry.status !== 'streaming' && !hasVisibleReliableTransientOutput(entry)) {
+      // Empty failed/cancelled/completed overlays are lifecycle markers, not transcript content.
+      // Retiring them here prevents an interrupted request from poisoning every later Turn.
+      delete requests[entry.modelRequestId];
+      continue;
+    }
     const request = records.ModelRequest?.[entry.modelRequestId];
     const entrySeq = BigInt(entry.requestSeq);
     if (!request) {

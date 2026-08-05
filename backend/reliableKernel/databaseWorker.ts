@@ -2,10 +2,16 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
+import {
+  applyTaskListOperationToSnapshot,
+  emptyTaskListSnapshot,
+  taskListOperationFromArgs
+} from '../../shared/taskListProjection';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   assertCurrentSchema,
@@ -17,9 +23,12 @@ import {
 } from './databaseSchema';
 import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
+  MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT,
   MODEL_STREAM_TERMINAL_TAIL,
   type ClientKeysetPageInput,
   type ClientKeysetPageResult,
+  type ClientVisibleMessageHistoryPageInput,
+  type ClientVisibleMessageHistoryPageResult,
   type ChildConversationOriginCandidate,
   type ChildProcessCleanupMaterializationCandidate,
   type ClientProjectionSnapshot,
@@ -39,15 +48,21 @@ import {
   type ModelRequestCancelInput,
   type ModelRequestCancelResult,
   type ProcessOutputRegistrationMismatch,
-  type SerializedWorkerError
+  type SerializedWorkerError,
+  type ToolFactsSnapshot
 } from './databaseWorkerProtocol';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
   CLIENT_MESSAGE_WINDOW_LIMIT,
   CLIENT_PAGE_MAX_BYTES,
   CLIENT_PAGE_MAX_ROWS,
+  CLIENT_TOOL_EVENT_SUMMARY_LIMIT_PER_CALL,
   CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES
 } from './clientFeedBounds';
+import {
+  boundClientRecordSummary,
+  settleClientWireResponseBytes
+} from './clientWireData';
 import {
   DOMAIN_REPOSITORIES,
   assertRuntimeDomainUpdatePatch,
@@ -65,6 +80,7 @@ import {
 
 const CONTEXT_CAS_CACHE_MAX_ENTRIES = 4_096;
 const CONTEXT_CAS_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const TURN_INTENT_CONTENT_TYPE = 'application/vnd.limcode.turn-intent+json';
 
 interface VerifiedContextCasCacheEntry {
   id: string;
@@ -167,59 +183,72 @@ async function start(): Promise<void> {
   post({ type: 'ready', workerThreadId: threadId, mode: data.mode });
   port.on('message', (request: DatabaseWorkerRequest) => {
     if (closed) return;
+    const receivedAtMs = Number.isFinite(request.metricEnqueuedAtMs)
+      ? performance.now()
+      : undefined;
+    const respond = (
+      response: Extract<DatabaseWorkerResponse, { type: 'response' }>,
+      transferList: readonly ArrayBuffer[] = []
+    ) => postMeasuredResponse(response, request.metricEnqueuedAtMs, receivedAtMs, transferList);
     try {
       if (request.kind === 'transaction') {
         assertDatabaseBinding(writer, data.binding);
         const result = executeTransaction(writer, request.steps, commitSeq + 1n);
         commitSeq += 1n;
         post({ type: 'commit', result });
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'snapshot') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeSnapshot(reader, request.reads, commitSeq);
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'snapshotAll') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeSnapshotAll(reader, request.read, commitSeq);
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'toolFactsSnapshot') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeToolFactsSnapshot(reader, request.toolCallId, commitSeq);
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'processOutputRegistrationMismatches') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeProcessOutputRegistrationMismatches(reader);
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'effectReceiptReconciliationCandidates') {
         assertDatabaseBinding(reader, data.binding);
-        post({ type: 'response', id: request.id, ok: true, result: executeEffectReceiptReconciliationCandidates(reader) });
+        respond({ type: 'response', id: request.id, ok: true, result: executeEffectReceiptReconciliationCandidates(reader) });
         return;
       }
       if (request.kind === 'childConversationOriginCandidates') {
         assertDatabaseBinding(reader, data.binding);
-        post({ type: 'response', id: request.id, ok: true, result: executeChildConversationOriginCandidates(reader) });
+        respond({ type: 'response', id: request.id, ok: true, result: executeChildConversationOriginCandidates(reader) });
         return;
       }
       if (request.kind === 'childProcessCleanupMaterializationCandidates') {
         assertDatabaseBinding(reader, data.binding);
-        post({ type: 'response', id: request.id, ok: true, result: executeChildProcessCleanupMaterializationCandidates(reader) });
+        respond({ type: 'response', id: request.id, ok: true, result: executeChildProcessCleanupMaterializationCandidates(reader) });
         return;
       }
       if (request.kind === 'contextMaterialization') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeContextMaterialization(reader, request.rootId, commitSeq);
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'contextContentMaterialization') {
         assertDatabaseBinding(reader, data.binding);
         const structure = executeContextMaterialization(reader, request.rootId, commitSeq);
         const attached = attachContextContent(structure, data.binding.paths.casRootPath, contextCasCache);
-        post({ type: 'response', id: request.id, ok: true, result: attached.result }, attached.transferList);
+        respond({ type: 'response', id: request.id, ok: true, result: attached.result }, attached.transferList);
         return;
       }
       if (request.kind === 'modelStreamEvent') {
@@ -229,7 +258,7 @@ async function start(): Promise<void> {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
         }
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'cancelCurrentModelRequest') {
@@ -239,7 +268,7 @@ async function start(): Promise<void> {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
         }
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'clientProjectionSnapshot') {
@@ -249,19 +278,25 @@ async function start(): Promise<void> {
           request.activeConversationId,
           commitSeq
         );
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'clientKeysetPage') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeClientKeysetPage(reader, request.input);
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'clientVisibleMessageHistoryPage') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeClientVisibleMessageHistoryPage(reader, request.input);
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'conversationHistoryProjection') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeConversationHistoryProjection(reader, request.input, commitSeq);
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'externalDataVersion') {
@@ -270,7 +305,7 @@ async function start(): Promise<void> {
         // Reading it from the writer (rather than the separate reader) therefore excludes every
         // commit made by this RuntimeDatabase worker while still detecting other Extension Hosts.
         const result = BigInt(writer.pragma('data_version', { simple: true }) as number | bigint).toString();
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'inspect') {
@@ -287,17 +322,17 @@ async function start(): Promise<void> {
           currentCommitSeq: commitSeq.toString(),
           contextCasCache: contextCasCache.inspect()
         };
-        post({ type: 'response', id: request.id, ok: true, result });
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       assertDatabaseBinding(writer, data.binding);
       closed = true;
       reader.close();
       writer.close();
-      post({ type: 'response', id: request.id, ok: true, result: null });
+      respond({ type: 'response', id: request.id, ok: true, result: null });
       port.close();
     } catch (error) {
-      post({ type: 'response', id: request.id, ok: false, error: serializeError(error) });
+      respond({ type: 'response', id: request.id, ok: false, error: serializeError(error) });
     }
   });
 }
@@ -402,6 +437,14 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       const raw = database.prepare(`SELECT * FROM ${quote(repository.schema.table)} WHERE id = ?`).get(row.id);
       if (!raw) throw new Error(`Committed upsert projection ${row.domain}/${row.id} is missing.`);
       let record = repository.codec.decode(raw as Record<string, unknown>);
+      if (row.domain === 'TurnIntent') {
+        const projected = projectQueuedTurnIntentRecord(database, row.id);
+        if (!projected) return { ...row, kind: 'remove' as const };
+        record = projected;
+      }
+      if (row.domain === 'Turn') {
+        record = projectTurnClientRecord(database, row.id);
+      }
       if (row.domain === 'Message') {
         const projected = projectMessageWindowRecord(database, row.id);
         if (!projected) return { ...row, kind: 'remove' as const };
@@ -438,6 +481,23 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0;
     })
     .map(({ sequence: _sequence, ...change }) => change);
+}
+
+function projectQueuedTurnIntentRecord(database: Database.Database, intentId: string): DomainRow | null {
+  const rows = queryPlainRows(database, `
+    SELECT intent.*
+      FROM turn_intent AS intent
+     WHERE intent.id = @intentId
+       AND intent.state = 'queued'
+       AND intent.turn_id IS NULL
+       AND NOT EXISTS (
+         SELECT 1
+           FROM child_execution_intent_link AS child_link
+          WHERE child_link.turn_intent_id = intent.id
+       )
+     LIMIT 1
+  `, { intentId });
+  return rows[0] ?? null;
 }
 
 function projectConversationContextStatusRecord(database: Database.Database, headId: string): DomainRow {
@@ -510,6 +570,71 @@ function projectMessageWindowRecord(database: Database.Database, messageId: stri
   return rows[0] ?? null;
 }
 
+/**
+ * A retry/edit-and-run Turn deliberately reuses the source Message instead of creating a second
+ * input MessageTurnLink. Surface that already-durable TurnIntent relation in the bounded client
+ * projection so process-local provider output has an exact timeline anchor before its final model
+ * Message exists. Historical/terminal Turns do not need the enrichment.
+ */
+function projectTurnClientRecord(database: Database.Database, turnId: string): DomainRow {
+  const raw = database.prepare('SELECT * FROM turn WHERE id = ?').get(turnId);
+  if (!raw) throw new Error(`Turn ${turnId} does not exist.`);
+  const record = DOMAIN_REPOSITORIES.codec('Turn').decode(raw as Record<string, unknown>);
+  if (record.status !== 'active') return record;
+
+  const sources = database.prepare(`
+    SELECT content.*
+      FROM turn_intent AS intent
+      JOIN turn_intent_revision AS revision ON revision.intent_id = intent.id
+      JOIN content_object AS content ON content.id = revision.content_object_id
+     WHERE intent.turn_id = ?
+       AND revision.revision_seq = (
+         SELECT MAX(latest.revision_seq)
+           FROM turn_intent_revision AS latest
+          WHERE latest.intent_id = intent.id
+       )
+     LIMIT 2
+  `).all(turnId) as Array<Record<string, unknown>>;
+  if (sources.length > 1) throw new Error(`Turn ${turnId} has multiple admitted TurnIntents.`);
+  if (sources.length === 0) return record;
+  const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(sources[0]);
+  if (metadata.content_type !== TURN_INTENT_CONTENT_TYPE) return record;
+
+  const parsed = JSON.parse(
+    readVerifiedCasBytes(metadata, path.resolve(data.binding.paths.casRootPath)).toString('utf8')
+  ) as unknown;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Turn ${turnId} has an invalid TurnIntent payload.`);
+  }
+  const intent = parsed as Record<string, unknown>;
+  if (intent.kind !== 'retry') return record;
+  const sourceMessageId = typeof intent.sourceMessageId === 'string'
+    ? intent.sourceMessageId.trim()
+    : '';
+  // A retry of a synthetic partial ModelRequest can legitimately have only sourceModelRequestId.
+  // It has no visible Message to anchor, so leave that Turn unchanged instead of inventing one.
+  if (!sourceMessageId) return record;
+  const sourceRevisionId = typeof intent.sourceMessageRevisionId === 'string'
+    ? intent.sourceMessageRevisionId.trim()
+    : typeof intent.editedMessageRevisionId === 'string'
+      ? intent.editedMessageRevisionId.trim()
+      : '';
+  const membership = database.prepare(`
+    SELECT membership.conversation_id
+      FROM message_part_of_conversation AS membership
+     WHERE membership.message_id = ?
+     LIMIT 2
+  `).all(sourceMessageId) as Array<{ conversation_id: string }>;
+  if (membership.length !== 1 || membership[0]?.conversation_id !== record.conversation_id) {
+    throw new Error(`Retry Turn ${turnId} source Message does not belong to its Conversation.`);
+  }
+  return {
+    ...record,
+    source_message_id: sourceMessageId,
+    ...(sourceRevisionId ? { source_message_revision_id: sourceRevisionId } : {})
+  };
+}
+
 function projectAnswerBridgeRecord(database: Database.Database, answerBridgeId: string): DomainRow {
   const rows = queryPlainRows(database, `
     SELECT bridge.*,
@@ -544,17 +669,21 @@ function projectProcessRecord(database: Database.Database, processId: string): D
   `).all(processId) as Array<Record<string, unknown>>;
   if (source.length > 1) throw new Error(`Process ${processId} has multiple argument sources.`);
   let requestedBackground = false;
+  let commandPreview: string | null = null;
   let argumentsProjectionState: 'ready' | 'missing' | 'error' = source.length === 1 ? 'ready' : 'missing';
   if (source.length === 1) {
     try {
       const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(source[0]);
       const parsed = JSON.parse(readVerifiedCasBytes(metadata, path.resolve(data.binding.paths.casRootPath)).toString('utf8')) as unknown;
-      requestedBackground = Boolean(
-        parsed
-        && typeof parsed === 'object'
-        && !Array.isArray(parsed)
-        && (parsed as Record<string, unknown>).foregroundWaitMs === 0
-      );
+      const argumentsRecord = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : undefined;
+      requestedBackground = argumentsRecord?.foregroundWaitMs === 0;
+      if (typeof argumentsRecord?.command === 'string' && argumentsRecord.command.length > 0) {
+        commandPreview = argumentsRecord.command.length <= 240
+          ? argumentsRecord.command
+          : `${argumentsRecord.command.slice(0, 239)}…`;
+      }
     } catch {
       argumentsProjectionState = 'error';
     }
@@ -572,7 +701,8 @@ function projectProcessRecord(database: Database.Database, processId: string): D
   return {
     ...record,
     background_kind: requestedBackground ? 'requested' : detached ? 'detached' : null,
-    command_arguments_state: argumentsProjectionState
+    command_arguments_state: argumentsProjectionState,
+    command_preview: commandPreview
   };
 }
 
@@ -686,13 +816,19 @@ function executeModelStreamEvent(
       database.exec('ROLLBACK');
       return { accepted: false, checkpointed: false, terminal: false, ignoredReason: 'old-socket-generation' };
     }
-    const checkpointCountRow = database.prepare(
-      'SELECT COUNT(*) AS count FROM model_stream_checkpoint WHERE model_request_id = ?'
-    ).get(modelRequestId) as { count: bigint };
-    if (typeof checkpointCountRow.count !== 'bigint') throw new Error('ModelStream checkpoint count was not an INTEGER.');
+    const checkpointCountRow = database.prepare(`
+      SELECT COUNT(*) AS count,
+             COALESCE(SUM(CASE WHEN checkpoint_kind = 'output_delta' THEN 1 ELSE 0 END), 0) AS output_delta_count
+        FROM model_stream_checkpoint
+       WHERE model_request_id = ?
+    `).get(modelRequestId) as { count: bigint; output_delta_count: bigint };
     if (
-      input.checkpointKind !== 'terminal_summary'
-      && checkpointCountRow.count >= BigInt(MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT)
+      typeof checkpointCountRow.count !== 'bigint'
+      || typeof checkpointCountRow.output_delta_count !== 'bigint'
+    ) throw new Error('ModelStream checkpoint counts were not INTEGER values.');
+    if (
+      input.checkpointKind === 'output_delta'
+      && checkpointCountRow.output_delta_count >= BigInt(MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT)
     ) {
       database.exec('ROLLBACK');
       return {
@@ -701,6 +837,14 @@ function executeModelStreamEvent(
         terminal: false,
         ignoredReason: 'checkpoint-capacity'
       };
+    }
+    if (
+      input.checkpointKind === 'output_item_done'
+      && checkpointCountRow.count >= BigInt(MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT)
+    ) {
+      throw new Error(
+        `ModelRequest ${modelRequestId} exceeded the durable semantic item checkpoint limit.`
+      );
     }
     const contentId = requireRuntimeId(input.contentObject.id);
     assertPreparedContentInsert(input.contentObject, input.contentInsert);
@@ -892,7 +1036,13 @@ function assertExecutionLeaseFence(
   throw error;
 }
 
-function decodeModelStreamIdentity(value: unknown): { attemptSeq: bigint; socketGeneration: bigint } {
+function decodeModelStreamIdentity(value: unknown): {
+  attemptSeq: bigint;
+  socketGeneration: bigint;
+  retryMaxAttempts?: number;
+  retryDelayMs?: number;
+  retryNotBeforeAt?: number;
+} {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('ModelRequest.stream_stats_json must be an object.');
   }
@@ -902,6 +1052,9 @@ function decodeModelStreamIdentity(value: unknown): { attemptSeq: bigint; socket
     'attemptSeq',
     'socketGeneration',
     'retryReason',
+    'retryMaxAttempts',
+    'retryDelayMs',
+    'retryNotBeforeAt',
     'providerStartedAt',
     'firstOutputAt',
     'completedAt',
@@ -917,16 +1070,43 @@ function decodeModelStreamIdentity(value: unknown): { attemptSeq: bigint; socket
       && record.retryReason !== 'connection_interrupted'
       && record.retryReason !== 'rate_limited'
       && record.retryReason !== 'temporary_service_error'
+      && record.retryReason !== 'first_semantic_timeout'
+      && record.retryReason !== 'stream_stalled'
+      && record.retryReason !== 'compression_timeout'
     )
   ) throw new TypeError('ModelRequest.stream_stats_json has an invalid shape.');
+  assertOptionalBoundedInteger(record.retryMaxAttempts, 'retryMaxAttempts', 1, 10);
+  assertOptionalBoundedInteger(record.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER);
+  assertOptionalBoundedInteger(record.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER);
+  const attemptSeq = decimalRuntimeInteger(record.attemptSeq, 'stream_stats.attemptSeq');
+  const retryMaxAttempts = typeof record.retryMaxAttempts === 'number'
+    ? record.retryMaxAttempts
+    : attemptSeq === 2n ? 1 : undefined;
+  const retryDelayMs = typeof record.retryDelayMs === 'number' ? record.retryDelayMs : undefined;
+  const retryNotBeforeAt = typeof record.retryNotBeforeAt === 'number' ? record.retryNotBeforeAt : undefined;
   assertOptionalStreamTiming(record.providerStartedAt, 'providerStartedAt');
   assertOptionalStreamTiming(record.firstOutputAt, 'firstOutputAt');
   assertOptionalStreamTiming(record.completedAt, 'completedAt');
   assertOptionalStreamTiming(record.streamOutputDurationMs, 'streamOutputDurationMs', true);
   return {
-    attemptSeq: decimalRuntimeInteger(record.attemptSeq, 'stream_stats.attemptSeq'),
-    socketGeneration: decimalRuntimeInteger(record.socketGeneration, 'stream_stats.socketGeneration')
+    attemptSeq,
+    socketGeneration: decimalRuntimeInteger(record.socketGeneration, 'stream_stats.socketGeneration'),
+    ...(retryMaxAttempts !== undefined ? { retryMaxAttempts } : {}),
+    ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
+    ...(retryNotBeforeAt !== undefined ? { retryNotBeforeAt } : {})
   };
+}
+
+function assertOptionalBoundedInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number
+): void {
+  if (value === undefined) return;
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw new TypeError(`ModelRequest.stream_stats_json.${label} must be an integer in [${minimum}, ${maximum}].`);
+  }
 }
 
 function assertOptionalStreamTiming(value: unknown, label: string, allowZero = false): void {
@@ -1136,8 +1316,8 @@ function executeMutation(
       } | undefined;
       if (operation?.owner_kind === 'model_request') {
         if (row.status !== 'pending') throw new Error('ModelRequest Attempt must start pending.');
-        if (row.attempt_seq !== 1n && row.attempt_seq !== 2n) {
-          throw new Error('ModelRequest permits only attempt_seq 1 or 2.');
+        if (typeof row.attempt_seq !== 'bigint' || row.attempt_seq < 1n || row.attempt_seq > 11n) {
+          throw new Error('ModelRequest permits only attempt_seq 1 through 11.');
         }
       }
     }
@@ -1380,8 +1560,8 @@ function assertModelRequestAggregate(database: Database.Database, modelRequestId
   const attempts = database.prepare(
     'SELECT id, attempt_seq, status, completed_at FROM attempt WHERE operation_id = ? ORDER BY attempt_seq'
   ).all(operation.id) as Array<{ id: string; attempt_seq: bigint; status: string; completed_at: string | null }>;
-  if (attempts.length < 1 || attempts.length > 2) {
-    throw new Error(`ModelRequest ${modelRequestId} must have one or two Attempts.`);
+  if (attempts.length < 1 || attempts.length > 11) {
+    throw new Error(`ModelRequest ${modelRequestId} must have between one and eleven Attempts.`);
   }
   attempts.forEach((attempt, index) => {
     if (attempt.attempt_seq !== BigInt(index + 1)) {
@@ -1390,6 +1570,13 @@ function assertModelRequestAggregate(database: Database.Database, modelRequestId
   });
   const currentAttempt = attempts.find((attempt) => attempt.attempt_seq === identity.attemptSeq);
   if (!currentAttempt) throw new Error(`ModelRequest ${modelRequestId} stream identity has no matching Attempt.`);
+  if (identity.attemptSeq !== BigInt(attempts.length)) {
+    throw new Error(`ModelRequest ${modelRequestId} current Attempt must be the contiguous tail.`);
+  }
+  const priorAttempts = attempts.slice(0, -1);
+  if (priorAttempts.some((attempt) => attempt.status !== 'transient_failed' || attempt.completed_at === null)) {
+    throw new Error(`ModelRequest ${modelRequestId} prior Attempts must be durably transient_failed.`);
+  }
   const fence = database.prepare('SELECT * FROM model_stream_fence WHERE model_request_id = ?').get(modelRequestId) as {
     attempt_seq?: unknown;
     socket_generation?: unknown;
@@ -1399,6 +1586,12 @@ function assertModelRequestAggregate(database: Database.Database, modelRequestId
   const terminalState = request.terminal_state;
   if (status !== 'terminal' && terminalState !== null) {
     throw new Error(`Non-terminal ModelRequest ${modelRequestId} cannot carry terminal_state.`);
+  }
+  if (identity.attemptSeq > 1n && (
+    identity.retryMaxAttempts === undefined
+    || identity.attemptSeq - 1n > BigInt(identity.retryMaxAttempts)
+  )) {
+    throw new Error(`ModelRequest ${modelRequestId} current Attempt exceeds its frozen retry budget.`);
   }
   if (status === 'prepared') {
     if (
@@ -1421,11 +1614,14 @@ function assertModelRequestAggregate(database: Database.Database, modelRequestId
   }
   if (status === 'retrying') {
     if (
-      identity.attemptSeq !== 2n
+      identity.attemptSeq < 2n
+      || identity.attemptSeq > 11n
       || identity.socketGeneration !== 0n
+      || identity.retryDelayMs === undefined
+      || identity.retryNotBeforeAt === undefined
       || operation.status !== 'running'
       || currentAttempt.status !== 'pending'
-      || attempts[0]?.status !== 'transient_failed'
+      || priorAttempts.length !== Number(identity.attemptSeq - 1n)
       || fence
     ) throw new Error(`Retrying ModelRequest ${modelRequestId} aggregate is inconsistent.`);
     return;
@@ -1520,14 +1716,18 @@ function assertRuntimeStateTransition(
       const currentIdentity = decodeModelStreamIdentity(current.stream_stats_json);
       const nextIdentity = decodeModelStreamIdentity(patch.stream_stats_json);
       const sameAttempt = nextIdentity.attemptSeq === currentIdentity.attemptSeq;
-      const oneRetry = currentIdentity.attemptSeq === 1n
-        && nextIdentity.attemptSeq === 2n
-        && nextIdentity.socketGeneration === 0n;
+      const sameRetryBudget = currentIdentity.retryMaxAttempts === nextIdentity.retryMaxAttempts;
+      const oneRetry = nextIdentity.attemptSeq === currentIdentity.attemptSeq + 1n
+        && nextIdentity.attemptSeq <= 11n
+        && nextIdentity.socketGeneration === 0n
+        && nextIdentity.retryMaxAttempts !== undefined
+        && nextIdentity.attemptSeq - 1n <= BigInt(nextIdentity.retryMaxAttempts)
+        && (currentIdentity.retryMaxAttempts === undefined || sameRetryBudget);
       if (
         (!sameAttempt && !oneRetry)
-        || (sameAttempt && nextIdentity.socketGeneration < currentIdentity.socketGeneration)
+        || (sameAttempt && (!sameRetryBudget || nextIdentity.socketGeneration < currentIdentity.socketGeneration))
       ) {
-        throw new Error('ModelRequest stream identity cannot move backwards or skip the single retry transition.');
+        throw new Error('ModelRequest stream identity cannot move backwards or skip a bounded retry transition.');
       }
     }
     return;
@@ -2009,9 +2209,11 @@ function executeClientProjectionSnapshot(
       conversationBranchLinks: [],
       conversationOriginLinks: [],
       agentConversationLinks: [],
+      queuedTurnIntents: [],
       compressionBlocks: [],
       conversationContextStatuses: [],
-      taskList: []
+      taskList: [],
+      currentTaskList: null
     };
     const emptyTurns = {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [], modelRequests: [],
@@ -2048,6 +2250,20 @@ function executeClientProjectionSnapshot(
     }
 
     const params = { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) };
+    const queuedTurnIntents = queryPlainRows(database, `
+      SELECT intent.*
+        FROM turn_intent AS intent
+       WHERE intent.conversation_id = @conversationId
+         AND intent.state = 'queued'
+         AND intent.turn_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+             FROM child_execution_intent_link AS child_link
+            WHERE child_link.turn_intent_id = intent.id
+         )
+       ORDER BY intent.created_at ASC, intent.id ASC
+       LIMIT @limit
+    `, params);
     const conversationProjectLinks = queryPlainRows(database, `
       SELECT * FROM conversation_project_link
        WHERE conversation_id = @conversationId
@@ -2079,6 +2295,7 @@ function executeClientProjectionSnapshot(
         JOIN content_object AS content ON content.id = revision.content_object_id
        WHERE membership.conversation_id = @conversationId
          AND m.deleted_at IS NULL
+         AND revision.role IN ('user', 'model')
        ORDER BY membership.message_seq DESC, m.id DESC
        LIMIT @messageLimit
     `, { conversationId, messageLimit: BigInt(CLIENT_MESSAGE_WINDOW_LIMIT) }).reverse();
@@ -2092,12 +2309,10 @@ function executeClientProjectionSnapshot(
        WHERE membership.conversation_id = ?
     `).get(conversationId) as { visible_message_count: bigint; last_message_seq: bigint };
     const visibleMessageCount = messageSummary.visible_message_count;
-    const visibleRowsInWindow = rawMessageRows.filter((row) => row.role === 'user' || row.role === 'model').length;
-    let visibleFloor = visibleMessageCount - BigInt(visibleRowsInWindow);
-    const messageRows: Array<Record<string, unknown>> = rawMessageRows.map((row) => {
-      const visible = row.role === 'user' || row.role === 'model';
-      if (visible) visibleFloor += 1n;
-      return { ...row, display_seq: visible ? visibleFloor : 0n };
+    let visibleFloor = visibleMessageCount - BigInt(rawMessageRows.length);
+    let messageRows: Array<Record<string, unknown>> = rawMessageRows.map((row) => {
+      visibleFloor += 1n;
+      return { ...row, display_seq: visibleFloor };
     });
     const reuseLinks = queryPlainRows(database, `
       SELECT * FROM conversation_reuse_link
@@ -2157,56 +2372,173 @@ function executeClientProjectionSnapshot(
        ORDER BY head.updated_at DESC, head.id DESC
        LIMIT 1
     `, params);
-    const turns = queryPlainRows(database, `
-      SELECT * FROM turn
-       WHERE conversation_id = @conversationId
-       ORDER BY created_at DESC, id DESC LIMIT @limit
-    `, params);
-    const turnIds = turns.map((row) => String(row.id));
-    const leases = queryByIds(database, 'execution_lease', 'turn_id', turnIds);
-    const terminations = queryByIds(database, 'turn_termination', 'turn_id', turnIds);
-    const executorLinks = queryByIds(database, 'turn_executor_link', 'turn_id', turnIds);
-    const modelRequests = queryConversationModelRequests(
+    const currentTaskList = projectCurrentTaskList(database, conversationId);
+    let turns = queryClientRootTurns(database, conversationId)
+      .map((turn) => turn.status === 'active'
+        ? projectTurnClientRecord(database, String(turn.id))
+        : turn);
+
+    // Processes and child executions are independently visible summaries. Their active rows are
+    // pinned even after their source Message leaves the normal 200-message suffix. The source
+    // ToolCall bundle is added below so these roots never point at a clipped owner.
+    let processRows = queryClientProcesses(database, conversationId)
+      .map((row) => projectProcessRecord(database, String(row.id)));
+    let processIds = processRows.map((row) => String(row.id));
+    let processOriginLinks = queryAllByIds(database, 'process_origin_link', 'process_id', processIds);
+
+    let childExecutions = queryClientChildExecutions(database, conversationId);
+    let childIds = childExecutions.map((row) => String(row.id));
+    let childParentLinks = queryAllByIds(database, 'child_execution_parent_link', 'child_execution_id', childIds);
+    const childIdsSourcedFromActiveConversation = new Set(childExecutions
+      .filter((row) => row.child_conversation_id !== conversationId)
+      .map((row) => String(row.id)));
+
+    const visibleSourceLinks = queryAllByIds(
       database,
-      conversationId,
+      'tool_call_source_link',
+      'message_id',
       messageRows.map((row) => String(row.id))
     );
-    const modelRequestMessageLinks = queryByIds(
-      database,
-      'model_request_message_link',
-      'model_request_id',
-      modelRequests.map((row) => String(row.id))
-    );
-    const messageTurnLinks = queryByIds(
+    const pendingInteractionToolLinks = queryPlainRows(database, `
+      SELECT tool_link.*
+        FROM interaction_tool_call_link AS tool_link
+        JOIN interaction_request AS request ON request.id = tool_link.request_id
+        JOIN interaction_owner_link AS owner ON owner.request_id = request.id
+        JOIN turn ON turn.id = owner.turn_id
+       WHERE turn.conversation_id = @conversationId
+         AND request.status = 'pending'
+       ORDER BY request.created_at ASC, request.id ASC
+    `, { conversationId });
+    const nonterminalToolCalls = queryPlainRows(database, `
+      SELECT call.*
+        FROM tool_call AS call
+        JOIN turn ON turn.id = call.turn_id
+       WHERE turn.conversation_id = @conversationId
+         AND call.status <> 'terminal'
+       ORDER BY turn.created_at ASC, call.call_seq ASC, call.id ASC
+    `, { conversationId });
+    const toolCalls = mergeRowsById([
+      ...nonterminalToolCalls,
+      ...queryAllByIds(database, 'tool_call', 'id', [
+        ...visibleSourceLinks.map((row) => String(row.tool_call_id)),
+        ...processOriginLinks.map((row) => String(row.tool_call_id)),
+        ...childParentLinks
+          .filter((row) => childIdsSourcedFromActiveConversation.has(String(row.child_execution_id)))
+          .map((row) => String(row.source_tool_call_id)),
+        ...pendingInteractionToolLinks.map((row) => String(row.tool_call_id)),
+        ...(currentTaskList ? [String(currentTaskList.sourceToolCallId)] : [])
+      ])
+    ]).sort(compareToolCallRows);
+    const toolCallIds = toolCalls.map((row) => String(row.id));
+
+    // Historical Process/Child summaries are retained only while their source ToolCall is in the
+    // visible closure. Running/active roots were already included above and therefore remain pinned
+    // even if their source Message is older than the ordinary suffix.
+    processOriginLinks = mergeRowsById([
+      ...processOriginLinks,
+      ...queryAllByIds(database, 'process_origin_link', 'tool_call_id', toolCallIds)
+    ]);
+    processIds = [...new Set(processOriginLinks.map((row) => String(row.process_id)))];
+    processRows = queryAllByIds(database, 'process', 'id', processIds)
+      .map((row) => projectProcessRecord(database, String(row.id)))
+      .sort((left, right) => String(right.started_at).localeCompare(String(left.started_at)) || String(right.id).localeCompare(String(left.id)));
+    const processReceipts = queryAllByIds(database, 'process_receipt', 'process_id', processIds);
+
+    childParentLinks = mergeRowsById([
+      ...childParentLinks,
+      ...queryAllByIds(database, 'child_execution_parent_link', 'source_tool_call_id', toolCallIds)
+    ]);
+    childIds = [...new Set(childParentLinks.map((row) => String(row.child_execution_id)))];
+    childExecutions = mergeRowsById([
+      ...childExecutions,
+      ...queryAllByIds(database, 'child_execution', 'id', childIds)
+    ]).sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)) || String(right.id).localeCompare(String(left.id)));
+    const childConversationIds = childExecutions.map((row) => String(row.child_conversation_id));
+    const toolCallSourceLinks = queryAllByIds(database, 'tool_call_source_link', 'tool_call_id', toolCallIds);
+
+    // Nonterminal/background/child roots may originate before the ordinary Message suffix. Pin
+    // their exact visible source Message and recompute its absolute visible display rank.
+    messageRows = mergeRowsById([
+      ...messageRows,
+      ...queryVisibleMessageRowsByIds(
+        database,
+        conversationId,
+        toolCallSourceLinks.map((row) => String(row.message_id))
+      )
+    ]).sort(compareMessageWindowRows);
+
+    const messageTurnLinks = queryAllByIds(
       database,
       'message_turn_link',
       'message_id',
       messageRows.map((row) => String(row.id))
     );
-    const toolCalls = queryByIds(database, 'tool_call', 'turn_id', turnIds);
-    const toolCallIds = toolCalls.map((row) => String(row.id));
-    const toolCallSourceLinks = queryByIds(database, 'tool_call_source_link', 'tool_call_id', toolCallIds);
-    const toolCallPolicySnapshots = queryByIds(database, 'tool_call_policy_snapshot', 'tool_call_id', toolCallIds);
-    const toolCallEvents = queryByIds(database, 'tool_call_event', 'tool_call_id', toolCallIds);
-    const toolExecutions = queryByIds(database, 'tool_execution', 'tool_call_id', toolCallIds);
-    const toolOutcomes = queryByIds(database, 'tool_outcome', 'tool_call_id', toolCallIds);
-    const toolModelResults = queryByIds(database, 'tool_model_result', 'tool_call_id', toolCallIds);
-    const toolResultArtifacts = queryByIds(database, 'tool_result_artifact', 'tool_call_id', toolCallIds);
-    const fileChangeSets = queryByIds(database, 'file_change_set', 'tool_call_id', toolCallIds);
+    const modelRequests = mergeRowsById([
+      ...queryConversationModelRequests(database, conversationId, messageRows.map((row) => String(row.id))),
+      ...queryAllByIds(
+        database,
+        'model_request',
+        'id',
+        toolCallSourceLinks.map((row) => String(row.model_request_id))
+      )
+    ]).sort(compareModelRequestRows);
+    const modelRequestMessageLinks = queryAllByIds(
+      database,
+      'model_request_message_link',
+      'model_request_id',
+      modelRequests.map((row) => String(row.id))
+    ).filter((row) => messageRows.some((message) => message.id === row.message_id));
+
+    // A retained source bundle owns its Turn even when that Turn is older than the normal Turn
+    // summary. This is the reverse closure missing from the old per-type query.
+    turns = mergeRowsById([
+      ...turns,
+      ...queryAllByIds(database, 'turn', 'id', [
+        ...toolCalls.map((row) => String(row.turn_id)),
+        ...modelRequests.map((row) => String(row.turn_id)),
+        ...messageTurnLinks.map((row) => String(row.turn_id))
+      ])
+    ]).sort(compareTurnRows);
+    const turnIds = turns.map((row) => String(row.id));
+    const leases = queryAllByIds(database, 'execution_lease', 'turn_id', turnIds);
+    const terminations = queryAllByIds(database, 'turn_termination', 'turn_id', turnIds);
+    const executorLinks = queryAllByIds(database, 'turn_executor_link', 'turn_id', turnIds);
+
+    const toolCallPolicySnapshots = queryAllByIds(database, 'tool_call_policy_snapshot', 'tool_call_id', toolCallIds);
+    const toolCallEvents = queryLatestToolCallEvents(database, toolCallIds);
+    const toolExecutions = queryAllByIds(database, 'tool_execution', 'tool_call_id', toolCallIds);
+    const toolOutcomes = queryAllByIds(database, 'tool_outcome', 'tool_call_id', toolCallIds);
+    const toolModelResults = queryAllByIds(database, 'tool_model_result', 'tool_call_id', toolCallIds);
+    const toolResultArtifacts = queryAllByIds(database, 'tool_result_artifact', 'tool_call_id', toolCallIds);
+    const fileChangeSets = queryAllByIds(database, 'file_change_set', 'tool_call_id', toolCallIds);
     const fileChangeSetIds = fileChangeSets.map((row) => String(row.id));
-    const fileChangeSetMembers = queryByIds(database, 'file_change_set_member', 'change_set_id', fileChangeSetIds);
-    const fileChangeDecisions = queryByIds(database, 'file_change_decision', 'change_set_id', fileChangeSetIds);
-    const fileMutationReceipts = queryByIds(database, 'file_mutation_receipt', 'change_set_id', fileChangeSetIds);
-    const fileMutationReceiptMembers = queryByIds(
+    const fileChangeSetMembers = queryAllByIds(database, 'file_change_set_member', 'change_set_id', fileChangeSetIds);
+    const fileChangeDecisions = queryAllByIds(database, 'file_change_decision', 'change_set_id', fileChangeSetIds);
+    const fileMutationReceipts = queryAllByIds(database, 'file_mutation_receipt', 'change_set_id', fileChangeSetIds);
+    const fileMutationReceiptMembers = queryAllByIds(
       database,
       'file_mutation_receipt_member',
       'receipt_id',
       fileMutationReceipts.map((row) => String(row.id))
     );
-    const taskList = toolCalls
-      .filter((row) => row.tool_name === 'update_task_list')
+    const taskListCalls = queryPlainRows(database, `
+      SELECT call.*
+        FROM tool_call AS call
+        JOIN turn ON turn.id = call.turn_id
+       WHERE turn.conversation_id = @conversationId
+         AND call.tool_name = 'update_task_list'
+       ORDER BY turn.created_at DESC, call.call_seq DESC, call.id DESC
+       LIMIT @limit
+    `, params).reverse();
+    const taskListOutcomes = queryAllByIds(
+      database,
+      'tool_outcome',
+      'tool_call_id',
+      taskListCalls.map((row) => String(row.id))
+    );
+    const taskList = taskListCalls
       .map((row) => {
-        const outcome = toolOutcomes.find((candidate) => candidate.tool_call_id === row.id) ?? null;
+        const outcome = taskListOutcomes.find((candidate) => candidate.tool_call_id === row.id) ?? null;
         return {
           tool_call_id: row.id,
           turn_id: row.turn_id,
@@ -2216,60 +2548,58 @@ function executeClientProjectionSnapshot(
           ...taskListProjectionFromOutcome(database, outcome, String(row.id))
         };
       });
-    const interactionOwnerLinks = queryByIds(database, 'interaction_owner_link', 'turn_id', turnIds);
-    const interactionRequestIds = interactionOwnerLinks.map((row) => String(row.request_id));
-    const interactionRequests = queryByIds(database, 'interaction_request', 'id', interactionRequestIds);
-    const interactionToolCallLinks = queryByIds(database, 'interaction_tool_call_link', 'request_id', interactionRequestIds);
-    const interactionResponses = queryByIds(database, 'interaction_response', 'request_id', interactionRequestIds);
-    const processRows = queryPlainRows(database, `
-      SELECT process.*
-        FROM process
-        JOIN process_origin_link AS origin ON origin.process_id = process.id
-        JOIN tool_call ON tool_call.id = origin.tool_call_id
-        JOIN turn ON turn.id = tool_call.turn_id
+    const selectedInteractionToolCallLinks = mergeRowsById([
+      ...pendingInteractionToolLinks,
+      ...queryAllByIds(database, 'interaction_tool_call_link', 'tool_call_id', toolCallIds)
+    ]);
+    const pendingInteractionRequests = queryPlainRows(database, `
+      SELECT request.*
+        FROM interaction_request AS request
+        JOIN interaction_owner_link AS owner ON owner.request_id = request.id
+        JOIN turn ON turn.id = owner.turn_id
        WHERE turn.conversation_id = @conversationId
-       ORDER BY process.started_at DESC, process.id DESC LIMIT @limit
-    `, params).map((row) => projectProcessRecord(database, String(row.id)));
-    const processIds = processRows.map((row) => String(row.id));
-    const processOriginLinks = queryByIds(database, 'process_origin_link', 'process_id', processIds);
-    const processReceipts = queryByIds(database, 'process_receipt', 'process_id', processIds);
+         AND request.status = 'pending'
+       ORDER BY request.created_at ASC, request.id ASC
+    `, { conversationId });
+    const interactionRequestIds = [...new Set([
+      ...selectedInteractionToolCallLinks.map((row) => String(row.request_id)),
+      ...pendingInteractionRequests.map((row) => String(row.id))
+    ])];
+    const interactionRequests = mergeRowsById([
+      ...pendingInteractionRequests,
+      ...queryAllByIds(database, 'interaction_request', 'id', interactionRequestIds)
+    ]);
+    const interactionOwnerLinks = queryAllByIds(database, 'interaction_owner_link', 'request_id', interactionRequestIds);
+    const allInteractionToolCallLinks = queryAllByIds(database, 'interaction_tool_call_link', 'request_id', interactionRequestIds)
+      .filter((row) => toolCallIds.includes(String(row.tool_call_id)));
+    const interactionResponses = queryAllByIds(database, 'interaction_response', 'request_id', interactionRequestIds);
 
-    const childExecutions = queryPlainRows(database, `
-      SELECT DISTINCT child.*
-        FROM child_execution AS child
-        JOIN child_execution_parent_link AS parent_link
-          ON parent_link.child_execution_id = child.id
-        LEFT JOIN tool_call AS source_call ON source_call.id = parent_link.source_tool_call_id
-        LEFT JOIN turn AS source_turn ON source_turn.id = source_call.turn_id
-       WHERE child.child_conversation_id = @conversationId
-          OR source_turn.conversation_id = @conversationId
-       ORDER BY child.created_at DESC, child.id DESC LIMIT @limit
-    `, params);
-    const childIds = childExecutions.map((row) => String(row.id));
-    const childConversationIds = childExecutions.map((row) => String(row.child_conversation_id));
     const projectedAgentConversationLinks = [
       ...agentConversationLinks,
-      ...queryByIds(database, 'agent_conversation_link', 'conversation_id', childConversationIds)
+      ...queryAllByIds(database, 'agent_conversation_link', 'conversation_id', childConversationIds)
     ].filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index);
-    const childParentLinks = queryByIds(database, 'child_execution_parent_link', 'child_execution_id', childIds);
-    const childTurnLinks = queryByIds(database, 'child_execution_turn_link', 'child_execution_id', childIds);
-    const childActiveLinks = queryByIds(database, 'child_execution_active_turn_link', 'child_execution_id', childIds);
-    const childTurnIds = childTurnLinks.map((row) => String(row.turn_id));
-    const childTurns = queryByIds(database, 'turn', 'id', childTurnIds);
-    const childExecutionLeases = queryByIds(database, 'execution_lease', 'turn_id', childTurnIds);
-    const childTurnTerminations = queryByIds(database, 'turn_termination', 'turn_id', childTurnIds);
-    const childTurnExecutorLinks = queryByIds(database, 'turn_executor_link', 'turn_id', childTurnIds);
-    const answerBridges = queryByIds(database, 'answer_bridge', 'child_execution_id', childIds)
+    const childActiveLinks = queryAllByIds(database, 'child_execution_active_turn_link', 'child_execution_id', childIds);
+    const childTurnLinks = queryLatestChildExecutionTurnLinks(database, childIds);
+    const childTurnIds = [...new Set([
+      ...childTurnLinks.map((row) => String(row.turn_id)),
+      ...childActiveLinks.map((row) => String(row.turn_id))
+    ])];
+    const childTurns = queryAllByIds(database, 'turn', 'id', childTurnIds);
+    const childExecutionLeases = queryAllByIds(database, 'execution_lease', 'turn_id', childTurnIds);
+    const childTurnTerminations = queryAllByIds(database, 'turn_termination', 'turn_id', childTurnIds);
+    const childTurnExecutorLinks = queryAllByIds(database, 'turn_executor_link', 'turn_id', childTurnIds);
+    const answerBridges = queryAllByIds(database, 'answer_bridge', 'child_execution_id', childIds)
       .map((bridge) => projectAnswerBridgeRecord(database, String(bridge.id)));
     const bridgeIds = answerBridges.map((row) => String(row.id));
-    const answerSubmissions = queryByIds(database, 'answer_submission', 'answer_bridge_id', bridgeIds);
-    const deliveries = queryPlainRows(database, `
-      SELECT * FROM runtime_delivery
-       WHERE target_conversation_id = @conversationId
-       ORDER BY created_at DESC, id DESC LIMIT @limit
-    `, params);
+    const answerSubmissions = queryAllByIds(
+      database,
+      'answer_submission',
+      'id',
+      answerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : [])
+    );
+    const deliveries = queryClientRuntimeDeliveries(database, conversationId);
     const deliveryIds = deliveries.map((row) => String(row.id));
-    const deliveryInputLinks = queryByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
+    const deliveryInputLinks = queryAllByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
     const projectedDeliveries = deliveries.map((delivery) => {
       const matching = deliveryInputLinks.filter((link) => link.delivery_id === delivery.id);
       if (matching.length > 1) throw new Error(`RuntimeDelivery ${String(delivery.id)} has multiple input links.`);
@@ -2282,7 +2612,7 @@ function executeClientProjectionSnapshot(
       };
     });
     const inboxIds = deliveries.map((row) => String(row.inbox_item_id));
-    const inboxItems = queryByIds(database, 'runtime_inbox_item', 'id', inboxIds);
+    const inboxItems = queryAllByIds(database, 'runtime_inbox_item', 'id', inboxIds);
 
     const snapshot: ClientProjectionSnapshot = {
       navigationSummary: { conversations },
@@ -2297,9 +2627,11 @@ function executeClientProjectionSnapshot(
         conversationBranchLinks: branchLinks,
         conversationOriginLinks: originLinks,
         agentConversationLinks: projectedAgentConversationLinks,
+        queuedTurnIntents,
         compressionBlocks,
         conversationContextStatuses,
-        taskList
+        taskList,
+        currentTaskList
       },
       activeTurnSummary: {
         turns,
@@ -2321,7 +2653,7 @@ function executeClientProjectionSnapshot(
         toolResultArtifacts,
         interactionRequests,
         interactionOwnerLinks,
-        interactionToolCallLinks,
+        interactionToolCallLinks: allInteractionToolCallLinks,
         interactionResponses,
         fileChangeSets,
         fileChangeSetMembers,
@@ -2402,6 +2734,84 @@ function taskListProjectionFromOutcome(
   };
 }
 
+function projectCurrentTaskList(
+  database: Database.Database,
+  conversationId: string
+): Record<string, unknown> | null {
+  const calls = queryPlainRows(database, `
+    SELECT call.id,
+           call.turn_id,
+           call.call_seq,
+           call.tool_name,
+           call.arguments_object_id,
+           outcome.status AS outcome_status,
+           source.message_id,
+           source.provider_ordinal,
+           membership.message_seq
+      FROM tool_call AS call
+      JOIN turn ON turn.id = call.turn_id
+      JOIN tool_outcome AS outcome ON outcome.tool_call_id = call.id
+      JOIN tool_call_source_link AS source ON source.tool_call_id = call.id
+      JOIN message_part_of_conversation AS membership
+        ON membership.message_id = source.message_id
+       AND membership.conversation_id = turn.conversation_id
+     WHERE turn.conversation_id = @conversationId
+       AND call.tool_name IN ('update_task_list', 'submit_plan')
+       AND outcome.status IN ('succeeded', 'partial')
+     ORDER BY membership.message_seq ASC,
+              source.provider_ordinal ASC,
+              call.call_seq ASC,
+              call.id ASC
+  `, { conversationId });
+  if (calls.length === 0) return null;
+
+  let snapshot = emptyTaskListSnapshot();
+  let appliedCount = 0;
+  let source: Record<string, unknown> | undefined;
+  for (const call of calls) {
+    const operation = taskListOperationFromCallArguments(database, call);
+    if (!operation) continue;
+    snapshot = applyTaskListOperationToSnapshot(snapshot, operation, {
+      operationIndex: appliedCount,
+      toolCallId: String(call.id)
+    });
+    appliedCount += 1;
+    source = call;
+  }
+  if (!source) return null;
+  return {
+    conversationId,
+    revision: [source.message_seq, source.provider_ordinal, source.call_seq].map(String).join(':'),
+    operationCount: appliedCount,
+    sourceToolCallId: source.id,
+    sourceTurnId: source.turn_id,
+    sourceMessageId: source.message_id,
+    items: snapshot.items,
+    stats: snapshot.stats,
+    ...(snapshot.activeItem ? { activeItem: snapshot.activeItem } : {})
+  };
+}
+
+function taskListOperationFromCallArguments(
+  database: Database.Database,
+  call: Record<string, unknown>
+): ReturnType<typeof taskListOperationFromArgs> {
+  const contentObjectId = requireRuntimeId(call.arguments_object_id);
+  const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
+  if (!raw) throw new Error(`Task-list ToolCall ${String(call.id)} references missing arguments ContentObject ${contentObjectId}.`);
+  const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
+  const bytes = readVerifiedCasBytes(metadata, path.resolve(data.binding.paths.casRootPath));
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.toString('utf8'));
+  } catch (error) {
+    throw new Error(`Task-list ToolCall ${String(call.id)} arguments are not JSON: ${String(error)}`);
+  }
+  if (call.tool_name === 'update_task_list') return taskListOperationFromArgs(value);
+  if (call.tool_name !== 'submit_plan' || !value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return taskListOperationFromArgs((value as Record<string, unknown>).taskList);
+}
+
 function executeConversationHistoryProjection(
   database: Database.Database,
   input: ConversationHistoryProjectionInput,
@@ -2452,7 +2862,7 @@ function executeConversationHistoryProjection(
         snapshotCommitSeq,
         cursorReset,
         seedRows: [], conversations: [], origins: [], turns: [], leases: [], agentLinks: [],
-        messageSummaries: [], previewTargets: [], childExecutions: [], activeChildTurnLinks: [],
+        messageSummaries: [], previewTargets: [], titleTargets: [], childExecutions: [], activeChildTurnLinks: [],
         answerBridges: [], inboxItems: [], deliveries: [], deliveryWakes: [], deliveryInputLinks: [],
         projectContexts: [], conversationProjectLinks: [], total: Number(totalRow.total), hasMore: false
       };
@@ -2492,16 +2902,23 @@ function executeConversationHistoryProjection(
     );
     const messageSummaries = queryConversationMessageSummaries(database, conversationIds);
     const latestVisible = queryLatestVisibleRevisions(database, conversationIds);
-    const revisions = queryAllByIds(database, 'message_revision', 'id', latestVisible.map((row) => String(row.revision_id)));
+    const firstUser = queryFirstUserRevisions(database, conversationIds);
+    const targetRevisionIds = [...new Set([
+      ...latestVisible.map((row) => String(row.revision_id)),
+      ...firstUser.map((row) => String(row.revision_id))
+    ])];
+    const revisions = queryAllByIds(database, 'message_revision', 'id', targetRevisionIds);
     const revisionById = new Map(revisions.map((row) => [String(row.id), row]));
     const contents = queryAllByIds(database, 'content_object', 'id', revisions.map((row) => String(row.content_object_id)));
     const contentById = new Map(contents.map((row) => [String(row.id), row]));
-    const previewTargets = latestVisible.flatMap((row) => {
+    const projectionTargets = (rows: Array<Record<string, unknown>>) => rows.flatMap((row) => {
       const revisionId = String(row.revision_id);
       const revision = revisionById.get(revisionId);
       const content = revision ? contentById.get(String(revision.content_object_id)) : undefined;
       return content ? [{ conversationId: String(row.conversation_id), revisionId, content }] : [];
     });
+    const previewTargets = projectionTargets(latestVisible);
+    const titleTargets = projectionTargets(firstUser);
     const childExecutions = queryAllByIds(database, 'child_execution', 'child_conversation_id', conversationIds);
     const childIds = childExecutions.map((row) => String(row.id));
     const activeChildTurnLinks = queryAllByIds(database, 'child_execution_active_turn_link', 'child_execution_id', childIds);
@@ -2527,6 +2944,7 @@ function executeConversationHistoryProjection(
       agentLinks,
       messageSummaries,
       previewTargets,
+      titleTargets,
       childExecutions,
       activeChildTurnLinks,
       answerBridges,
@@ -2677,12 +3095,482 @@ function executeClientKeysetPage(
   }
 }
 
+/**
+ * Reads the visible timeline strictly before one durable Message membership cursor. The page is
+ * self-contained for rendering: Message bodies remain in CAS detail authority, while the bounded
+ * causal summaries needed to associate Turns, model requests, tools, interactions and effects are
+ * returned beside the Message anchors.
+ */
+function executeClientVisibleMessageHistoryPage(
+  database: Database.Database,
+  input: ClientVisibleMessageHistoryPageInput
+): ClientVisibleMessageHistoryPageResult {
+  if (!Number.isSafeInteger(input.limit) || input.limit <= 0 || input.limit > CLIENT_PAGE_MAX_ROWS) {
+    throw new RangeError(`Visible Message history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
+  }
+  const conversationId = requireRuntimeId(input.conversationId);
+  const beforeMessageSeq = requireNonNegativeIntegerString(input.beforeMessageSeq, 'beforeMessageSeq');
+  if (beforeMessageSeq === '0') throw new RangeError('beforeMessageSeq must be positive.');
+  const beforeId = requireRuntimeId(input.beforeId);
+
+  database.exec('BEGIN');
+  try {
+    const candidates = queryPlainRows(database, `
+      WITH visible_messages AS (
+        SELECT message.id,
+               membership.conversation_id,
+               membership.message_seq,
+               message.created_at,
+               message.updated_at,
+               message.deleted_at,
+               revision.id AS revision_id,
+               revision.revision_seq,
+               revision.role,
+               revision.content_object_id,
+               content.content_type,
+               content.byte_length,
+               ROW_NUMBER() OVER (
+                 ORDER BY membership.message_seq ASC, message.id ASC
+               ) AS display_seq
+          FROM message_part_of_conversation AS membership
+          JOIN message ON message.id = membership.message_id
+          JOIN message_current_revision_link AS current_revision
+            ON current_revision.message_id = message.id
+          JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+          JOIN content_object AS content ON content.id = revision.content_object_id
+         WHERE membership.conversation_id = @conversationId
+           AND message.deleted_at IS NULL
+           AND revision.role IN ('user', 'model')
+      )
+      SELECT *
+        FROM visible_messages
+       WHERE message_seq < @beforeMessageSeq
+          OR (message_seq = @beforeMessageSeq AND id < @beforeId)
+       ORDER BY message_seq DESC, id DESC
+       LIMIT @limit
+    `, {
+      conversationId,
+      beforeMessageSeq: BigInt(beforeMessageSeq),
+      beforeId,
+      limit: BigInt(input.limit + 1)
+    });
+
+    if (candidates.length === 0) {
+      const empty: ClientVisibleMessageHistoryPageResult = {
+        records: {},
+        hasMore: false,
+        responseBytes: 0
+      };
+      settleClientWireResponseBytes(empty);
+      database.exec('COMMIT');
+      return empty;
+    }
+
+    const maximumCount = Math.min(input.limit, candidates.length);
+    const materialize = (count: number): ClientVisibleMessageHistoryPageResult => {
+      const messages = candidates.slice(0, count).reverse();
+      const oldest = messages[0];
+      const rawRecords = buildClientVisibleMessageHistoryRecords(database, messages);
+      const result: ClientVisibleMessageHistoryPageResult = {
+        records: Object.fromEntries(Object.entries(rawRecords).map(([domain, rows]) => [
+          domain,
+          rows.map((row) => boundClientRecordSummary(row))
+        ])),
+        nextBeforeMessageSeq: String(oldest.message_seq),
+        nextBeforeId: String(oldest.id),
+        hasMore: candidates.length > count,
+        responseBytes: 0
+      };
+      settleClientWireResponseBytes(result);
+      return result;
+    };
+
+    // Causal closure size varies by Message, so choose the largest anchor prefix that still fits
+    // one bounded response. Reducing count drops the oldest/farthest anchors, preserving keyset
+    // continuity from the caller's cursor.
+    let lower = 1;
+    let upper = maximumCount;
+    let selected: ClientVisibleMessageHistoryPageResult | undefined;
+    while (lower <= upper) {
+      const count = Math.floor((lower + upper) / 2);
+      const candidate = materialize(count);
+      if (candidate.responseBytes <= CLIENT_PAGE_MAX_BYTES) {
+        selected = candidate;
+        lower = count + 1;
+      } else {
+        upper = count - 1;
+      }
+    }
+    if (!selected) throw new Error('A single visible Message history summary exceeds maxPageBytes.');
+    if (selected.responseBytes > CLIENT_PAGE_MAX_BYTES) {
+      throw new Error('Visible Message history response exceeds maxPageBytes.');
+    }
+    database.exec('COMMIT');
+    return selected;
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function buildClientVisibleMessageHistoryRecords(
+  database: Database.Database,
+  messages: readonly Record<string, unknown>[]
+): Record<string, DomainRow[]> {
+  const records: Record<string, DomainRow[]> = {};
+  const include = (domain: string, rows: readonly Record<string, unknown>[]): void => {
+    const unique = mergeRowsById(rows);
+    if (unique.length > 0) records[domain] = unique;
+  };
+  const messageIds = messages.map((row) => String(row.id));
+  include('Message', messages);
+
+  const messageTurnLinks = queryAllByIds(database, 'message_turn_link', 'message_id', messageIds);
+  const requestMessageLinks = queryAllByIds(database, 'model_request_message_link', 'message_id', messageIds);
+  const sourceLinks = queryAllByIds(database, 'tool_call_source_link', 'message_id', messageIds);
+  include('MessageTurnLink', messageTurnLinks);
+  include('ModelRequestMessageLink', requestMessageLinks);
+  include('ToolCallSourceLink', sourceLinks);
+
+  const requestIds = [...new Set([
+    ...requestMessageLinks.map((row) => String(row.model_request_id)),
+    ...sourceLinks.map((row) => String(row.model_request_id))
+  ])];
+  const modelRequests = queryAllByIds(database, 'model_request', 'id', requestIds)
+    .sort(compareModelRequestRows);
+  include('ModelRequest', modelRequests);
+
+  const toolCallIds = [...new Set(sourceLinks.map((row) => String(row.tool_call_id)))];
+  const toolCalls = queryAllByIds(database, 'tool_call', 'id', toolCallIds)
+    .sort(compareToolCallRows);
+  include('ToolCall', toolCalls);
+  include('ToolCallPolicySnapshot', queryAllByIds(database, 'tool_call_policy_snapshot', 'tool_call_id', toolCallIds));
+  include('ToolCallEvent', queryLatestToolCallEvents(database, toolCallIds));
+  include('ToolExecution', queryAllByIds(database, 'tool_execution', 'tool_call_id', toolCallIds));
+  include('ToolOutcome', queryAllByIds(database, 'tool_outcome', 'tool_call_id', toolCallIds));
+  include('ToolModelResult', queryAllByIds(database, 'tool_model_result', 'tool_call_id', toolCallIds));
+  include('ToolResultArtifact', queryAllByIds(database, 'tool_result_artifact', 'tool_call_id', toolCallIds));
+
+  const interactionToolLinks = queryAllByIds(database, 'interaction_tool_call_link', 'tool_call_id', toolCallIds);
+  const interactionRequestIds = [...new Set(interactionToolLinks.map((row) => String(row.request_id)))];
+  const interactionRequests = queryAllByIds(database, 'interaction_request', 'id', interactionRequestIds);
+  const interactionOwnerLinks = queryAllByIds(database, 'interaction_owner_link', 'request_id', interactionRequestIds);
+  include('InteractionToolCallLink', interactionToolLinks);
+  include('InteractionRequest', interactionRequests);
+  include('InteractionOwnerLink', interactionOwnerLinks);
+  include('InteractionResponse', queryAllByIds(database, 'interaction_response', 'request_id', interactionRequestIds));
+
+  const fileChangeSets = queryAllByIds(database, 'file_change_set', 'tool_call_id', toolCallIds);
+  const fileChangeSetIds = fileChangeSets.map((row) => String(row.id));
+  const fileMutationReceipts = queryAllByIds(database, 'file_mutation_receipt', 'change_set_id', fileChangeSetIds);
+  include('FileChangeSet', fileChangeSets);
+  include('FileChangeSetMember', queryAllByIds(database, 'file_change_set_member', 'change_set_id', fileChangeSetIds));
+  include('FileChangeDecision', queryAllByIds(database, 'file_change_decision', 'change_set_id', fileChangeSetIds));
+  include('FileMutationReceipt', fileMutationReceipts);
+  include('FileMutationReceiptMember', queryAllByIds(
+    database,
+    'file_mutation_receipt_member',
+    'receipt_id',
+    fileMutationReceipts.map((row) => String(row.id))
+  ));
+
+  const processOriginLinks = queryAllByIds(database, 'process_origin_link', 'tool_call_id', toolCallIds);
+  const processIds = [...new Set(processOriginLinks.map((row) => String(row.process_id)))];
+  const processes = queryAllByIds(database, 'process', 'id', processIds)
+    .map((row) => projectProcessRecord(database, String(row.id)));
+  include('ProcessOriginLink', processOriginLinks);
+  include('Process', processes);
+  include('ProcessReceipt', queryAllByIds(database, 'process_receipt', 'process_id', processIds));
+
+  const childParentLinks = queryAllByIds(database, 'child_execution_parent_link', 'source_tool_call_id', toolCallIds);
+  const childExecutionIds = [...new Set(childParentLinks.map((row) => String(row.child_execution_id)))];
+  const childExecutions = queryAllByIds(database, 'child_execution', 'id', childExecutionIds);
+  const childActiveLinks = queryAllByIds(database, 'child_execution_active_turn_link', 'child_execution_id', childExecutionIds);
+  const childTurnLinks = queryLatestChildExecutionTurnLinks(database, childExecutionIds);
+  const childTurnIds = [...new Set([
+    ...childActiveLinks.map((row) => String(row.turn_id)),
+    ...childTurnLinks.map((row) => String(row.turn_id))
+  ])];
+  include('ChildExecutionParentLink', childParentLinks);
+  include('ChildExecution', childExecutions);
+  include('ChildExecutionActiveTurnLink', childActiveLinks);
+  include('ChildExecutionTurnLink', childTurnLinks);
+  include('AgentConversationLink', queryAllByIds(
+    database,
+    'agent_conversation_link',
+    'conversation_id',
+    childExecutions.map((row) => String(row.child_conversation_id))
+  ));
+
+  const answerBridges = queryAllByIds(database, 'answer_bridge', 'child_execution_id', childExecutionIds)
+    .map((row) => projectAnswerBridgeRecord(database, String(row.id)));
+  include('AnswerBridge', answerBridges);
+  include('AnswerSubmission', queryAllByIds(
+    database,
+    'answer_submission',
+    'id',
+    answerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : [])
+  ));
+
+  const rootTurnIds = [
+    ...messageTurnLinks.map((row) => String(row.turn_id)),
+    ...modelRequests.map((row) => String(row.turn_id)),
+    ...toolCalls.map((row) => String(row.turn_id)),
+    ...interactionOwnerLinks.map((row) => String(row.turn_id)),
+    ...childParentLinks.flatMap((row) => row.parent_turn_id ? [String(row.parent_turn_id)] : [])
+  ];
+  const turnIds = [...new Set([...rootTurnIds, ...childTurnIds])];
+  const turns = queryAllByIds(database, 'turn', 'id', turnIds)
+    .map((row) => row.status === 'active' ? projectTurnClientRecord(database, String(row.id)) : row)
+    .sort(compareTurnRows);
+  include('Turn', turns);
+  include('ExecutionLease', queryAllByIds(database, 'execution_lease', 'turn_id', turnIds));
+  include('TurnTermination', queryAllByIds(database, 'turn_termination', 'turn_id', turnIds));
+  include('TurnExecutorLink', queryAllByIds(database, 'turn_executor_link', 'turn_id', turnIds));
+  return records;
+}
+
 function queryPlainRows(
   database: Database.Database,
   sql: string,
   parameters: Record<string, string | bigint> = {}
 ): Array<Record<string, unknown>> {
   return database.prepare(sql).all(parameters) as Array<Record<string, unknown>>;
+}
+
+function mergeRowsById(rows: readonly Record<string, unknown>[]): Array<Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const row of rows) byId.set(String(row.id), row);
+  return [...byId.values()];
+}
+
+function compareRuntimeRowInteger(left: unknown, right: unknown): number {
+  const leftValue = typeof left === 'bigint' ? left : BigInt(String(left ?? 0));
+  const rightValue = typeof right === 'bigint' ? right : BigInt(String(right ?? 0));
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
+function compareMessageWindowRows(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  return compareRuntimeRowInteger(left.message_seq, right.message_seq)
+    || String(left.id).localeCompare(String(right.id));
+}
+
+function compareTurnRows(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  return String(left.created_at).localeCompare(String(right.created_at))
+    || String(left.id).localeCompare(String(right.id));
+}
+
+function compareModelRequestRows(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  return String(left.created_at).localeCompare(String(right.created_at))
+    || compareRuntimeRowInteger(left.request_seq, right.request_seq)
+    || String(left.id).localeCompare(String(right.id));
+}
+
+function compareToolCallRows(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  return String(left.created_at).localeCompare(String(right.created_at))
+    || compareRuntimeRowInteger(left.call_seq, right.call_seq)
+    || String(left.id).localeCompare(String(right.id));
+}
+
+function queryClientRootTurns(
+  database: Database.Database,
+  conversationId: string
+): Array<Record<string, unknown>> {
+  return queryPlainRows(database, `
+    WITH recent_turns AS (
+      SELECT id
+        FROM turn
+       WHERE conversation_id = @conversationId
+       ORDER BY created_at DESC, id DESC
+       LIMIT @limit
+    )
+    SELECT turn.*
+      FROM turn
+     WHERE turn.conversation_id = @conversationId
+       AND (turn.status = 'active' OR turn.id IN (SELECT id FROM recent_turns))
+     ORDER BY turn.created_at ASC, turn.id ASC
+  `, { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) });
+}
+
+function queryClientProcesses(
+  database: Database.Database,
+  conversationId: string
+): Array<Record<string, unknown>> {
+  return queryPlainRows(database, `
+    SELECT process.*
+      FROM process
+      JOIN process_origin_link AS origin ON origin.process_id = process.id
+      JOIN tool_call ON tool_call.id = origin.tool_call_id
+      JOIN turn ON turn.id = tool_call.turn_id
+     WHERE turn.conversation_id = @conversationId
+       AND process.status = 'running'
+     ORDER BY process.started_at DESC, process.id DESC
+  `, { conversationId });
+}
+
+function queryClientChildExecutions(
+  database: Database.Database,
+  conversationId: string
+): Array<Record<string, unknown>> {
+  return queryPlainRows(database, `
+    SELECT DISTINCT child.*
+      FROM child_execution AS child
+      JOIN child_execution_parent_link AS parent_link
+        ON parent_link.child_execution_id = child.id
+      LEFT JOIN tool_call AS source_call ON source_call.id = parent_link.source_tool_call_id
+      LEFT JOIN turn AS source_turn ON source_turn.id = source_call.turn_id
+     WHERE child.child_conversation_id = @conversationId
+        OR (
+          source_turn.conversation_id = @conversationId
+          AND child.status NOT IN ('closed', 'needs_human')
+        )
+     ORDER BY child.created_at DESC, child.id DESC
+  `, { conversationId });
+}
+
+function queryClientRuntimeDeliveries(
+  database: Database.Database,
+  conversationId: string
+): Array<Record<string, unknown>> {
+  return queryPlainRows(database, `
+    WITH recent_deliveries AS (
+      SELECT id
+        FROM runtime_delivery
+       WHERE target_conversation_id = @conversationId
+       ORDER BY created_at DESC, id DESC
+       LIMIT @limit
+    )
+    SELECT delivery.*
+      FROM runtime_delivery AS delivery
+     WHERE delivery.target_conversation_id = @conversationId
+       AND (
+         delivery.state IN ('pending', 'failed')
+         OR EXISTS (
+           SELECT 1
+             FROM runtime_delivery_input_link AS input_link
+            WHERE input_link.delivery_id = delivery.id
+              AND input_link.handled_at IS NULL
+         )
+         OR delivery.id IN (SELECT id FROM recent_deliveries)
+       )
+     ORDER BY delivery.created_at DESC, delivery.id DESC
+  `, { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) });
+}
+
+function queryVisibleMessageRowsByIds(
+  database: Database.Database,
+  conversationId: string,
+  messageIds: readonly string[]
+): Array<Record<string, unknown>> {
+  const unique = [...new Set(messageIds)];
+  const rows: Array<Record<string, unknown>> = [];
+  for (let offset = 0; offset < unique.length; offset += 350) {
+    const chunk = unique.slice(offset, offset + 350);
+    if (chunk.length === 0) continue;
+    const parameters: Record<string, string | bigint> = { conversationId };
+    const placeholders = chunk.map((id, index) => {
+      parameters[`message${index}`] = id;
+      return `@message${index}`;
+    });
+    rows.push(...queryPlainRows(database, `
+      WITH visible_messages AS (
+        SELECT message.id,
+               membership.conversation_id,
+               membership.message_seq,
+               message.created_at,
+               message.updated_at,
+               message.deleted_at,
+               revision.id AS revision_id,
+               revision.revision_seq,
+               revision.role,
+               revision.content_object_id,
+               content.content_type,
+               content.byte_length,
+               ROW_NUMBER() OVER (
+                 ORDER BY membership.message_seq ASC, message.id ASC
+               ) AS display_seq
+          FROM message_part_of_conversation AS membership
+          JOIN message ON message.id = membership.message_id
+          JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
+          JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+          JOIN content_object AS content ON content.id = revision.content_object_id
+         WHERE membership.conversation_id = @conversationId
+           AND message.deleted_at IS NULL
+           AND revision.role IN ('user', 'model')
+      )
+      SELECT *
+        FROM visible_messages
+       WHERE id IN (${placeholders.join(',')})
+       ORDER BY message_seq ASC, id ASC
+    `, parameters));
+  }
+  return mergeRowsById(rows);
+}
+
+function queryLatestToolCallEvents(
+  database: Database.Database,
+  toolCallIds: readonly string[]
+): Array<Record<string, unknown>> {
+  const unique = [...new Set(toolCallIds)];
+  const rows: Array<Record<string, unknown>> = [];
+  for (let offset = 0; offset < unique.length; offset += 350) {
+    const chunk = unique.slice(offset, offset + 350);
+    if (chunk.length === 0) continue;
+    const parameters: Record<string, string | bigint> = {
+      eventLimit: BigInt(CLIENT_TOOL_EVENT_SUMMARY_LIMIT_PER_CALL)
+    };
+    const placeholders = chunk.map((id, index) => {
+      parameters[`tool${index}`] = id;
+      return `@tool${index}`;
+    });
+    rows.push(...queryPlainRows(database, `
+      SELECT *
+        FROM (
+          SELECT event.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY event.tool_call_id
+                   ORDER BY event.event_seq DESC, event.id DESC
+                 ) AS client_tail_ordinal
+            FROM tool_call_event AS event
+           WHERE event.tool_call_id IN (${placeholders.join(',')})
+        )
+       WHERE client_tail_ordinal <= @eventLimit
+       ORDER BY tool_call_id ASC, event_seq ASC, id ASC
+    `, parameters).map(({ client_tail_ordinal: _ordinal, ...row }) => row));
+  }
+  return rows;
+}
+
+function queryLatestChildExecutionTurnLinks(
+  database: Database.Database,
+  childExecutionIds: readonly string[]
+): Array<Record<string, unknown>> {
+  const unique = [...new Set(childExecutionIds)];
+  const rows: Array<Record<string, unknown>> = [];
+  for (let offset = 0; offset < unique.length; offset += 350) {
+    const chunk = unique.slice(offset, offset + 350);
+    if (chunk.length === 0) continue;
+    const parameters: Record<string, string | bigint> = {};
+    const placeholders = chunk.map((id, index) => {
+      parameters[`child${index}`] = id;
+      return `@child${index}`;
+    });
+    rows.push(...queryPlainRows(database, `
+      SELECT id, child_execution_id, turn_seq, turn_id, created_at
+        FROM (
+          SELECT link.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY link.child_execution_id
+                   ORDER BY link.turn_seq DESC, link.id DESC
+                 ) AS client_ordinal
+            FROM child_execution_turn_link AS link
+           WHERE link.child_execution_id IN (${placeholders.join(',')})
+        )
+       WHERE client_ordinal = 1
+       ORDER BY child_execution_id ASC, turn_seq ASC, id ASC
+    `, parameters));
+  }
+  return rows;
 }
 
 function queryByIds(
@@ -2767,6 +3655,31 @@ function queryConversationMessageSummaries(
   `);
 }
 
+function queryFirstUserRevisions(
+  database: Database.Database,
+  conversationIds: readonly string[]
+): Array<Record<string, unknown>> {
+  return queryConversationIdChunks(database, conversationIds, (placeholders) => `
+    SELECT conversation_id, revision_id
+      FROM (
+        SELECT membership.conversation_id,
+               revision.id AS revision_id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY membership.conversation_id
+                 ORDER BY membership.message_seq ASC, membership.message_id ASC
+               ) AS ordinal
+          FROM message_part_of_conversation AS membership
+          JOIN message ON message.id = membership.message_id
+          JOIN message_current_revision_link AS current ON current.message_id = message.id
+          JOIN message_revision AS revision ON revision.id = current.revision_id
+         WHERE membership.conversation_id IN (${placeholders})
+           AND message.deleted_at IS NULL
+           AND revision.role = 'user'
+      )
+     WHERE ordinal = 1
+  `);
+}
+
 function queryLatestVisibleRevisions(
   database: Database.Database,
   conversationIds: readonly string[]
@@ -2817,8 +3730,7 @@ function queryConversationModelRequests(
   visibleMessageIds: readonly string[]
 ): Array<Record<string, unknown>> {
   const parameters: Record<string, string | bigint> = {
-    conversationId,
-    limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE)
+    conversationId
   };
   const visiblePlaceholders = [...new Set(visibleMessageIds)].map((messageId, index) => {
     parameters[`visibleMessage${index}`] = messageId;
@@ -2833,21 +3745,31 @@ function queryConversationModelRequests(
        )`
     : '';
   return queryPlainRows(database, `
+    WITH independent_request_tail AS (
+      SELECT request.id
+        FROM model_request AS request
+        JOIN turn AS owner_turn ON owner_turn.id = request.turn_id
+       WHERE owner_turn.conversation_id = @conversationId
+         AND (
+           request.status <> 'terminal'
+           OR NOT EXISTS (
+             SELECT 1
+               FROM model_request_message_link AS any_link
+              WHERE any_link.model_request_id = request.id
+           )
+         )
+       ORDER BY owner_turn.created_at DESC, request.request_seq DESC, request.id DESC
+       LIMIT ${CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE}
+    )
     SELECT request.*
       FROM model_request AS request
       JOIN turn AS owner_turn ON owner_turn.id = request.turn_id
      WHERE owner_turn.conversation_id = @conversationId
        AND (
-         request.status <> 'terminal'
-         OR NOT EXISTS (
-           SELECT 1
-             FROM model_request_message_link AS any_link
-            WHERE any_link.model_request_id = request.id
-         )
+         request.id IN (SELECT id FROM independent_request_tail)
          ${visibleLinkClause}
        )
      ORDER BY owner_turn.created_at DESC, request.request_seq DESC, request.id DESC
-     LIMIT @limit
   `, parameters).reverse();
 }
 
@@ -2912,6 +3834,72 @@ function executeSnapshotAll(
   }
 }
 
+function executeToolFactsSnapshot(
+  database: Database.Database,
+  toolCallIdInput: string,
+  commitSeq: bigint
+): SnapshotBarrier<ToolFactsSnapshot> {
+  const toolCallId = requireRuntimeId(toolCallIdInput);
+  database.exec('BEGIN');
+  try {
+    const toolCallRead = executeRead(
+      database,
+      DOMAIN_REPOSITORIES.domain('ToolCall').get(toolCallId)
+    );
+    if (Array.isArray(toolCallRead)) throw new TypeError('ToolCall fixed read returned a list.');
+    const executionsRead = executeRead(
+      database,
+      DOMAIN_REPOSITORIES.domain('ToolExecution').list({
+        where: { tool_call_id: toolCallId },
+        limit: 2
+      })
+    );
+    if (!Array.isArray(executionsRead)) throw new TypeError('ToolExecution fixed read did not return a list.');
+
+    let turn: DomainRow | null = null;
+    let leases: DomainRow[] = [];
+    let conversation: DomainRow | null = null;
+    if (toolCallRead) {
+      const turnId = requireRuntimeId(toolCallRead.turn_id);
+      const turnRead = executeRead(database, DOMAIN_REPOSITORIES.domain('Turn').get(turnId));
+      if (Array.isArray(turnRead)) throw new TypeError('Turn fixed read returned a list.');
+      turn = turnRead;
+      const leasesRead = executeRead(
+        database,
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').list({
+          where: { turn_id: turnId },
+          limit: 2
+        })
+      );
+      if (!Array.isArray(leasesRead)) throw new TypeError('ExecutionLease fixed read did not return a list.');
+      leases = leasesRead;
+      if (turn) {
+        const conversationId = requireRuntimeId(turn.conversation_id);
+        const conversationRead = executeRead(
+          database,
+          DOMAIN_REPOSITORIES.domain('Conversation').get(conversationId)
+        );
+        if (Array.isArray(conversationRead)) throw new TypeError('Conversation fixed read returned a list.');
+        conversation = conversationRead;
+      }
+    }
+    database.exec('COMMIT');
+    return {
+      snapshotCommitSeq: commitSeq.toString(),
+      snapshot: {
+        toolCall: toolCallRead,
+        executions: executionsRead,
+        turn,
+        leases,
+        conversation
+      }
+    };
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 function executeProcessOutputRegistrationMismatches(
   database: Database.Database
 ): ProcessOutputRegistrationMismatch[] {
@@ -2923,7 +3911,7 @@ function executeProcessOutputRegistrationMismatches(
            CAST(COALESCE(SUM(chunk.byte_length), 0) AS TEXT) AS registered_bytes
       FROM process
       LEFT JOIN process_output_chunk AS chunk ON chunk.process_id = process.id
-     WHERE process.status IN ('exited', 'cancelled')
+     WHERE process.status IN ('exited', 'cancelled', 'timed_out', 'output_limit_exceeded')
      GROUP BY process.id, process.retained_chunks, process.retained_bytes
     HAVING COUNT(chunk.id) <> process.retained_chunks
         OR COALESCE(SUM(chunk.byte_length), 0) <> process.retained_bytes
@@ -3078,6 +4066,25 @@ function assertPublishedContentObject(row: EncodedRow, casRootPath: string): voi
   if (!absolutePath.startsWith(`${path.resolve(casRootPath)}${path.sep}`)) throw new Error('ContentObject CAS path escapes the active root.');
   const stat = fs.statSync(absolutePath);
   if (!stat.isFile() || BigInt(stat.size) !== byteLength) throw new Error('ContentObject CAS file is missing or has the wrong length.');
+}
+
+function postMeasuredResponse(
+  response: Extract<DatabaseWorkerResponse, { type: 'response' }>,
+  enqueuedAtMs: number | undefined,
+  receivedAtMs: number | undefined,
+  transferList: readonly ArrayBuffer[] = []
+): void {
+  if (receivedAtMs === undefined || enqueuedAtMs === undefined || !Number.isFinite(enqueuedAtMs)) {
+    post(response, transferList);
+    return;
+  }
+  post({
+    ...response,
+    timing: {
+      queueWaitMs: Math.max(0, receivedAtMs - enqueuedAtMs),
+      executeDurationMs: Math.max(0, performance.now() - receivedAtMs)
+    }
+  }, transferList);
 }
 
 function post(message: DatabaseWorkerResponse, transferList: readonly ArrayBuffer[] = []): void {

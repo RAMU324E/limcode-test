@@ -150,13 +150,21 @@ export function transientFunctionCallParts(
   });
 }
 
+export interface ToolCallPreviewLookupOptions {
+  /** Keep the completed transient snapshot visible until its durable ToolCall is available. */
+  includeFinal?: boolean;
+}
+
 export function toolCallPreviewByCallId(
   calls: readonly ReliableTransientToolCallState[],
-  callId: string | undefined
+  callId: string | undefined,
+  options: ToolCallPreviewLookupOptions = {}
 ): ToolCallPreviewRecord | undefined {
   const id = callId?.trim();
   if (!id) return undefined;
-  const call = calls.find((candidate) => candidate.callId === id && !candidate.final);
+  const call = calls.find((candidate) =>
+    candidate.callId === id && (options.includeFinal === true || !candidate.final)
+  );
   return call ? { ...call } : undefined;
 }
 
@@ -165,7 +173,8 @@ export function transientToolCallPreviewForMessage(
   links: Array<Record<string, unknown>>,
   conversationId: string,
   messageId: string,
-  callId: string
+  callId: string,
+  options: ToolCallPreviewLookupOptions = {}
 ): ToolCallPreviewRecord | undefined {
   const linkedRequestId = messageId.startsWith('transient:')
     ? messageId.slice('transient:'.length)
@@ -173,7 +182,7 @@ export function transientToolCallPreviewForMessage(
   if (typeof linkedRequestId !== 'string' || !linkedRequestId) return undefined;
   const request = requests[linkedRequestId];
   if (!request || request.conversationId !== conversationId) return undefined;
-  return toolCallPreviewByCallId(request.toolCalls, callId);
+  return toolCallPreviewByCallId(request.toolCalls, callId, options);
 }
 
 function appendArgumentsPreview(

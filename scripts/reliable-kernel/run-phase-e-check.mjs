@@ -111,10 +111,30 @@ async function checkContextStorageGrowth() {
       expectedHeadRootId: baseRootId,
       activate: true
     };
-    const sameResults = await Promise.all([
-      context.appendContent(sameCommand),
-      context.appendContent(sameCommand)
-    ]);
+    let slowPrepareStartedResolve;
+    const slowPrepareStarted = new Promise((resolve) => { slowPrepareStartedResolve = resolve; });
+    let releaseSlowPrepareResolve;
+    const releaseSlowPrepare = new Promise((resolve) => { releaseSlowPrepareResolve = resolve; });
+    const slowContext = new kernel.ContextSequenceControlPlane(ctx.database, storeFacade(ctx.store, {
+      async prepare(...args) {
+        slowPrepareStartedResolve();
+        await releaseSlowPrepare;
+        return ctx.store.prepare(...args);
+      }
+    }));
+    const slowAppend = slowContext.appendContent(sameCommand);
+    await slowPrepareStarted;
+    const fastAppend = context.appendContent(sameCommand).then(
+      (result) => {
+        releaseSlowPrepareResolve();
+        return result;
+      },
+      (error) => {
+        releaseSlowPrepareResolve();
+        throw error;
+      }
+    );
+    const sameResults = await Promise.all([slowAppend, fastAppend]);
     assert.equal(new Set(sameResults.map((entry) => entry.segmentId)).size, 1);
     assert.equal(new Set(sameResults.map((entry) => entry.rootId)).size, 1);
     assert.equal(await count(ctx.database, 'ContextSegmentSource', {
@@ -550,16 +570,17 @@ async function checkCompressionNodeBound() {
     assertions.push('tool call与唯一ToolModelResult形成一个tool_pair segment并登记两条同call_seq source，压缩只能按整个segment选取');
 
     const rootBefore = await get(ctx.database, 'ContextSequenceRoot', sourceRootId);
-    assert.equal(
-      Number(rootBefore.estimated_tokens),
-      sourceMaterialized.segments.reduce(
-        (sum, segment) => sum + Number((segment.contentObject.byte_length + 3n) / 4n),
-        0
-      ),
-      'root token estimate must include every message and non-message segment exactly once'
+    const durableByteEstimate = sourceMaterialized.segments.reduce(
+      (sum, segment) => sum + Number((segment.contentObject.byte_length + 3n) / 4n),
+      0
     );
+    assert.ok(Number(rootBefore.estimated_tokens) > 0);
+    const tokenEstimator = new kernel.ReliableContextTokenEstimator(ctx.database, ctx.store);
+    const providerAligned = await tokenEstimator.estimateRoot(sourceRootId);
     const compression = new kernel.ContextCompressionControlPlane(ctx.database, ctx.store);
     const decision = await compression.evaluate(sourceRootId, seeded.authoritySnapshotId);
+    assert.equal(decision.estimatedTokens, providerAligned.estimatedTokens);
+    assert.ok(Math.abs(decision.estimatedTokens - durableByteEstimate) < 1_000);
     assert.equal(decision.shouldCompress, true);
     assert.ok(decision.estimatedTokens >= decision.thresholdTokens);
     const belowThreshold = await seedTurn(ctx, 'compression-below-threshold', {
@@ -583,7 +604,28 @@ async function checkCompressionNodeBound() {
     }), /below its frozen compression threshold/);
     assert.equal(await countAll(ctx.database, 'ContentObject'), contentRowsBeforeRejectedCompression);
     assert.equal(await context.currentHeadRootId(belowThreshold.conversationId), belowThresholdRootId);
-    assertions.push('压缩判定按AuthoritySnapshot冻结estimator/threshold重算，未采用root.estimated_tokens参考缓存；低于冻结阈值时在CAS发布和SQLite写入前拒绝');
+
+    const multimodal = await seedTurn(ctx, 'compression-multimodal-token-estimate', {
+      thresholdTokens: 100_000
+    });
+    await context.appendContent({
+      conversationId: multimodal.conversationId,
+      segmentKind: 'runtime_context',
+      source: { sourceKind: 'runtime_context', sourceId: 'large-inline-image', sourceRevision: '0' },
+      content: JSON.stringify({
+        role: 'user',
+        parts: [{ inlineData: { mimeType: 'image/png', data: 'A'.repeat(700_000) } }]
+      }),
+      contentType: 'application/vnd.limcode.message+json'
+    });
+    const multimodalRootId = await context.currentHeadRootId(multimodal.conversationId);
+    const multimodalRoot = await get(ctx.database, 'ContextSequenceRoot', multimodalRootId);
+    assert.ok(Number(multimodalRoot.estimated_tokens) > 100_000, 'legacy durable byte cache should reproduce the false threshold crossing');
+    const multimodalDecision = await compression.evaluate(multimodalRootId, multimodal.authoritySnapshotId);
+    assert.equal(multimodalDecision.shouldCompress, false);
+    assert.ok(multimodalDecision.estimatedTokens < 10_000);
+    assertions.push('700k base64图片即使令旧root字节缓存超过100k，也按多模态语义保持低于阈值，不会触发自动压缩');
+    assertions.push('压缩判定按provider语义估算重新物化Context，root旧字节缓存不再驱动阈值；低于冻结阈值时在CAS发布和SQLite写入前拒绝');
 
     const nodeBefore = await countAll(ctx.database, 'ContextSequenceNode');
     const compressCount = 4;
@@ -1023,6 +1065,7 @@ async function checkProviderFullRequest() {
     assert.deepEqual(payloads[0], {
       kind: 'full-model-request',
       modelRequestId: created.modelRequestId,
+      conversationId: seeded.conversationId,
       attemptSeq: '1',
       socketGeneration: '1',
       providerId: 'fake-local',
@@ -1201,6 +1244,7 @@ async function checkProviderFullRequest() {
     }, { reconnect: true });
     assert.equal(retryDispatchCalls, 2);
     assert.equal(payloads.at(-1).attemptSeq, '2');
+    assert.equal(payloads.at(-1).conversationId, seeded.conversationId);
     assert.deepEqual(payloads.at(-1).context, expectedOriginalContext);
     assert.deepEqual(payloads.at(-1).recipe, payloads[0].recipe);
     assert.deepEqual(payloads.at(-1).authoritySnapshot, expectedOriginalAuthority);
@@ -1210,7 +1254,7 @@ async function checkProviderFullRequest() {
     assert.equal((await list(ctx.database, 'Attempt', {
       operation_id: retriedOperation.id
     })).length, 2);
-    assertions.push('仅明确连接中断持久创建attempt 2，两个attempt都发送同一完整上下文且总attempt数不超过2；无第二条瞬时observer authority');
+    assertions.push('旧AuthoritySnapshot兼容原有单次持久retry：明确连接中断创建attempt 2，完整上下文不变且无第二条瞬时observer authority');
     faults.push('typed provider transient disconnect after full request dispatch');
 
     const ordinaryFailure = await provider.createModelRequest({
@@ -1252,6 +1296,348 @@ async function checkProviderFullRequest() {
     }))[0];
     assert.equal((await list(ctx.database, 'Attempt', { operation_id: doubleTransientOperation.id })).length, 2);
     assert.equal((await get(ctx.database, 'ModelRequest', doubleTransient.modelRequestId)).status, 'terminal');
+
+    assert.deepEqual(kernel.RELIABLE_PROVIDER_SEMANTIC_DEADLINES_MS, {
+      ordinaryFirst: 80_000,
+      ordinaryIdle: 60_000,
+      compressionCompletion: 270_000
+    });
+
+    const boundedRetrySeed = await seedTurn(ctx, 'bounded-provider-retry', {
+      retryPolicy: { enabled: true, maxRetries: 3 },
+      provider: 'openai-responses',
+      toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} }
+    });
+    const boundedContext = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
+    const boundedProvider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store, {
+      semanticTimeouts: {
+        firstSemanticMs: 50,
+        semanticIdleMs: 35,
+        compressionCompletionMs: 100
+      },
+      retryDelaysMs: [0],
+      adapterDrainTimeoutMs: 20
+    });
+    const boundedRequest = await boundedProvider.createModelRequest({
+      turnId: boundedRetrySeed.turnId,
+      contextRootId: await boundedContext.currentHeadRootId(boundedRetrySeed.conversationId),
+      authoritySnapshotId: boundedRetrySeed.authoritySnapshotId,
+      recipe: { kind: 'reliable-agent-turn', round: '3', previousTool: 'update_task_list', tools: [] },
+      idempotencyKey: 'bounded-provider-retry-fourth-attempt'
+    });
+    let boundedCalls = 0;
+    await boundedProvider.dispatch(boundedRequest.modelRequestId, {
+      providerId: 'fake-local',
+      async sendFullRequest(_request, controls) {
+        boundedCalls += 1;
+        if (boundedCalls <= 3) {
+          throw new kernel.ProviderTransientError('temporary_service_error', `bounded-transient-${boundedCalls}`);
+        }
+        await controls.onEvent({
+          kind: 'completed', streamSeq: '1', content: { text: 'bounded retry recovered' }
+        });
+      }
+    });
+    assert.equal(boundedCalls, 4);
+    const boundedOperation = (await list(ctx.database, 'Operation', {
+      owner_kind: 'model_request', owner_id: boundedRequest.modelRequestId
+    }))[0];
+    assert.equal((await list(ctx.database, 'Attempt', { operation_id: boundedOperation.id })).length, 4);
+
+    const preTerminalCloseRequest = await boundedProvider.createModelRequest({
+      turnId: boundedRetrySeed.turnId,
+      contextRootId: await boundedContext.currentHeadRootId(boundedRetrySeed.conversationId),
+      authoritySnapshotId: boundedRetrySeed.authoritySnapshotId,
+      recipe: { kind: 'reliable-agent-turn', round: '4', transportFixture: 'close-1000-before-terminal' },
+      idempotencyKey: 'provider-close-1000-before-terminal'
+    });
+    let preTerminalCloseCalls = 0;
+    const preTerminalCloseAdapter = new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
+      start(request, emit) {
+        preTerminalCloseCalls += 1;
+        if (preTerminalCloseCalls === 1) {
+          emit({
+            type: 'llm:error',
+            payload: {
+              requestId: request.id,
+              message: 'OpenAI Responses WebSocket closed before terminal event: 1000',
+              rawError: {
+                name: 'WebSocketCloseError',
+                message: 'OpenAI Responses WebSocket closed before terminal event: 1000',
+                closeCode: 1000,
+                phase: 'streaming',
+                receivedServerEvent: true,
+                retryable: false,
+                transportAttemptsExhausted: false
+              }
+            }
+          });
+          return;
+        }
+        emit({ type: 'llm:done', payload: { requestId: request.id, completedAt: Date.now() } });
+      },
+      compact() { throw new Error('unused'); },
+      abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
+    });
+    await boundedProvider.dispatch(preTerminalCloseRequest.modelRequestId, preTerminalCloseAdapter);
+    assert.equal(preTerminalCloseCalls, 2);
+    const preTerminalCloseOperation = (await list(ctx.database, 'Operation', {
+      owner_kind: 'model_request', owner_id: preTerminalCloseRequest.modelRequestId
+    }))[0];
+    const preTerminalCloseAttempts = await list(ctx.database, 'Attempt', {
+      operation_id: preTerminalCloseOperation.id
+    });
+    assert.deepEqual(
+      preTerminalCloseAttempts
+        .slice()
+        .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq))
+        .map((entry) => entry.status),
+      ['transient_failed', 'completed']
+    );
+
+    const policyCloseRequest = await boundedProvider.createModelRequest({
+      turnId: boundedRetrySeed.turnId,
+      contextRootId: await boundedContext.currentHeadRootId(boundedRetrySeed.conversationId),
+      authoritySnapshotId: boundedRetrySeed.authoritySnapshotId,
+      recipe: { kind: 'reliable-agent-turn', round: '4', transportFixture: 'close-1008-before-terminal' },
+      idempotencyKey: 'provider-close-1008-before-terminal'
+    });
+    let policyCloseCalls = 0;
+    const policyCloseAdapter = new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
+      start(request, emit) {
+        policyCloseCalls += 1;
+        emit({
+          type: 'llm:error',
+          payload: {
+            requestId: request.id,
+            message: 'OpenAI Responses WebSocket closed before terminal event: 1008 policy violation',
+            rawError: {
+              name: 'WebSocketCloseError',
+              message: 'OpenAI Responses WebSocket closed before terminal event: 1008 policy violation',
+              closeCode: 1008,
+              phase: 'streaming',
+              receivedServerEvent: true,
+              retryable: false,
+              transportAttemptsExhausted: false
+            }
+          }
+        });
+      },
+      compact() { throw new Error('unused'); },
+      abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
+    });
+    await assert.rejects(
+      boundedProvider.dispatch(policyCloseRequest.modelRequestId, policyCloseAdapter),
+      /WebSocket closed before terminal event: 1008/
+    );
+    assert.equal(policyCloseCalls, 1);
+    const policyCloseOperation = (await list(ctx.database, 'Operation', {
+      owner_kind: 'model_request', owner_id: policyCloseRequest.modelRequestId
+    }))[0];
+    assert.equal((await list(ctx.database, 'Attempt', { operation_id: policyCloseOperation.id })).length, 1);
+    assertions.push('WS 1000/1001正常关闭码在Responses终态前仍按不完整传输创建durable Attempt并恢复；1008策略关闭保持永久错误');
+    faults.push('WebSocket close code 1000 after semantic output but before response.completed');
+    metrics.preTerminalNormalCloseAttempts = preTerminalCloseCalls;
+
+    const semanticStallRequest = await boundedProvider.createModelRequest({
+      turnId: boundedRetrySeed.turnId,
+      contextRootId: await boundedContext.currentHeadRootId(boundedRetrySeed.conversationId),
+      authoritySnapshotId: boundedRetrySeed.authoritySnapshotId,
+      recipe: { kind: 'reliable-agent-turn', round: '4', previousTool: 'update_task_list', tools: [] },
+      idempotencyKey: 'semantic-stall-after-task-list'
+    });
+    let semanticCalls = 0;
+    const semanticTerminals = [];
+    await boundedProvider.dispatch(semanticStallRequest.modelRequestId, {
+      providerId: 'fake-local',
+      async sendFullRequest(request, controls) {
+        semanticCalls += 1;
+        if (request.attemptSeq === '1') {
+          await controls.onEvent({
+            kind: 'output_delta', streamSeq: '1', content: { type: 'thought_delta', text: 'planning' }
+          });
+          for (let seq = 2; seq <= 5; seq += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            await controls.onEvent({
+              kind: 'output_delta', streamSeq: String(seq), semanticProgress: false,
+              content: { type: 'thought_progress', thoughtElapsedMs: seq * 500 }
+            });
+          }
+          await new Promise((resolve) => controls.signal.addEventListener('abort', resolve, { once: true }));
+          const aborted = new Error('semantic watchdog aborted fixture socket');
+          aborted.name = 'AbortError';
+          throw aborted;
+        }
+        await controls.onEvent({
+          kind: 'completed', streamSeq: '1', content: { text: 'semantic retry recovered' }
+        });
+      }
+    }, { onTransientTerminal: (event) => semanticTerminals.push(event) });
+    assert.equal(semanticCalls, 2);
+    assert.ok(semanticTerminals.some((entry) =>
+      entry.event.content.terminalState === 'provider_transient_stream_stalled'
+      && entry.event.content.retrying === true
+    ));
+    assertions.push('普通Provider语义deadline冻结为首语义80秒/后续idle60秒；terminal-only压缩只等待270秒CompactDone/CompactError终态；明确传输错误仍走即时重试');
+    assertions.push('冻结retryMaxAttempts=3允许三个持久transient_failed Attempt后第四次恢复；每次仍复用同一ModelRequest与完整请求');
+    assertions.push('submit_plan→update_task_list后的真实thought delta仅由语义事件续租；伪thought_progress不能续命，35ms stall自动Attempt恢复而无需用户继续');
+    faults.push('three consecutive retryable Provider failures before recovery');
+    faults.push('semantic stream stalls after task-list tool result while raw/local progress remains');
+    metrics.boundedProviderAttempts = boundedCalls;
+    metrics.semanticStallAttempts = semanticCalls;
+
+    const compressionTrigger = {
+      mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 1,
+      preserveLatestMessages: 0, reserveLatestUserMessageTokens: 0
+    };
+    const compressionPolicy = {
+      enabled: true,
+      binding: { kind: 'provider', id: 'compression-deadline-provider' },
+      methodKind: 'segmented_summary',
+      thresholdTokens: 1,
+      preserveLatestMessages: 0,
+      trigger: compressionTrigger,
+      provider: {
+        providerConfigId: 'fake-local', provider: 'openai-responses', modelId: 'fake-model',
+        retryPolicy: { enabled: true, maxRetries: 3 }
+      },
+      config: {
+        id: 'compression-deadline-config', name: 'compression deadline fixture',
+        kind: 'segmented_summary', trigger: compressionTrigger,
+        llmSummary: { providerConfigId: 'fake-local', model: 'fake-model', targetTokens: 256 },
+        createdAt: 1, updatedAt: 1
+      }
+    };
+    const compressionSeed = await seedTurn(ctx, 'compression-terminal-deadline', {
+      thresholdTokens: 1,
+      compressionPolicy,
+      includeConversationId: true
+    });
+    const compressionHead = await boundedContext.currentHeadRootId(compressionSeed.conversationId);
+    const compressionRecipe = (suffix) => ({
+      kind: 'reliable-context-compression',
+      requestKind: 'context_compression_pre',
+      trigger: 'auto',
+      sourceRootId: compressionHead,
+      sourceSegmentCount: 1,
+      sourceHash: `compression-source-${suffix}`,
+      blockId: `compression-block-${suffix}`,
+      compressionConfigId: compressionPolicy.config.id,
+      compressionMethodKind: compressionPolicy.methodKind
+    });
+    const compressionCapability = (compact) => new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
+      compact,
+      start() { throw new Error('compression fixture must not use start'); },
+      abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
+    });
+    const emitCompressionDone = (request, emit, text) => emit({
+      type: 'llm:compactDone',
+      payload: {
+        requestId: request.id,
+        blockId: request.blockId,
+        conversationId: request.conversationId,
+        result: { contents: [{ role: 'model', parts: [{ text }] }] },
+        completedAt: Date.now()
+      }
+    });
+
+    const slowCompressionProvider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store, {
+      semanticTimeouts: {
+        firstSemanticMs: 50,
+        semanticIdleMs: 35,
+        compressionCompletionMs: 100
+      },
+      retryDelaysMs: [0],
+      adapterDrainTimeoutMs: 20
+    });
+    const slowCompression = await slowCompressionProvider.createModelRequest({
+      turnId: compressionSeed.turnId,
+      contextRootId: compressionHead,
+      authoritySnapshotId: compressionSeed.authoritySnapshotId,
+      recipe: compressionRecipe('slow-valid'),
+      idempotencyKey: 'compression-slow-valid-before-terminal-deadline'
+    });
+    let slowCompressionCalls = 0;
+    await slowCompressionProvider.dispatch(slowCompression.modelRequestId, compressionCapability((request, emit) => {
+      slowCompressionCalls += 1;
+      setTimeout(() => emitCompressionDone(request, emit, 'slow compression completed'), 70);
+    }));
+    assert.equal(slowCompressionCalls, 1);
+    const slowCompressionOperation = (await list(ctx.database, 'Operation', {
+      owner_kind: 'model_request', owner_id: slowCompression.modelRequestId
+    }))[0];
+    assert.equal((await list(ctx.database, 'Attempt', {
+      operation_id: slowCompressionOperation.id
+    })).length, 1);
+
+    const timeoutCompressionProvider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store, {
+      semanticTimeouts: {
+        firstSemanticMs: 50,
+        semanticIdleMs: 35,
+        compressionCompletionMs: 40
+      },
+      retryDelaysMs: [0],
+      adapterDrainTimeoutMs: 20
+    });
+    const timeoutCompression = await timeoutCompressionProvider.createModelRequest({
+      turnId: compressionSeed.turnId,
+      contextRootId: compressionHead,
+      authoritySnapshotId: compressionSeed.authoritySnapshotId,
+      recipe: compressionRecipe('terminal-timeout'),
+      idempotencyKey: 'compression-terminal-timeout-recovery'
+    });
+    let timeoutCompressionCalls = 0;
+    const compressionTerminals = [];
+    await timeoutCompressionProvider.dispatch(timeoutCompression.modelRequestId, compressionCapability((request, emit) => {
+      timeoutCompressionCalls += 1;
+      if (timeoutCompressionCalls === 1) return;
+      emitCompressionDone(request, emit, 'compression timeout recovered');
+    }), { onTransientTerminal: (event) => compressionTerminals.push(event) });
+    assert.equal(timeoutCompressionCalls, 2);
+    assert.ok(compressionTerminals.some((entry) =>
+      entry.event.content.terminalState === 'provider_transient_compression_timeout'
+      && entry.event.content.retrying === true
+    ));
+    const timeoutCompressionOperation = (await list(ctx.database, 'Operation', {
+      owner_kind: 'model_request', owner_id: timeoutCompression.modelRequestId
+    }))[0];
+    const timeoutCompressionAttempts = await list(ctx.database, 'Attempt', {
+      operation_id: timeoutCompressionOperation.id
+    });
+    assert.equal(timeoutCompressionAttempts.length, 2);
+    assert.equal(timeoutCompressionAttempts.filter((entry) => entry.status === 'transient_failed').length, 1);
+
+    const transportCompression = await timeoutCompressionProvider.createModelRequest({
+      turnId: compressionSeed.turnId,
+      contextRootId: compressionHead,
+      authoritySnapshotId: compressionSeed.authoritySnapshotId,
+      recipe: compressionRecipe('transport-recovery'),
+      idempotencyKey: 'compression-explicit-transport-recovery'
+    });
+    let transportCompressionCalls = 0;
+    await timeoutCompressionProvider.dispatch(transportCompression.modelRequestId, compressionCapability((request, emit) => {
+      transportCompressionCalls += 1;
+      if (transportCompressionCalls === 1) {
+        emit({
+          type: 'llm:compactError',
+          payload: {
+            requestId: request.id,
+            blockId: request.blockId,
+            conversationId: request.conversationId,
+            message: 'compression websocket interrupted',
+            rawError: { transport: 'websocket', retryable: true },
+            completedAt: Date.now()
+          }
+        });
+        return;
+      }
+      emitCompressionDone(request, emit, 'compression transport recovered');
+    }));
+    assert.equal(transportCompressionCalls, 2);
+    assertions.push('terminal-only压缩超过旧60秒等比阈值但早于270秒等比deadline时仅有一个Attempt；超过完成deadline以compression_timeout创建Attempt 2；明确transport错误仍立即恢复');
+    faults.push('terminal-only compression emits no semantic delta before a valid long-running CompactDone');
+    metrics.compressionCompletionDeadlineAttempts = timeoutCompressionCalls;
+
     const buildFailure = await provider.createModelRequest({
       turnId: seeded.turnId,
       contextRootId: originalRootId,
@@ -1269,7 +1655,7 @@ async function checkProviderFullRequest() {
     }), /ENOENT|no such file/i);
     assert.equal(buildFailureExternalCalls, 0);
     assert.equal((await get(ctx.database, 'ModelRequest', buildFailure.modelRequestId)).status, 'terminal');
-    assertions.push('普通Error只外调一次且不retry；attempt 2再次临时失败后严格停在总attempt=2；冻结请求本地CAS构造失败在外调前收口terminal而不留下running');
+    assertions.push('永久普通Error只外调一次；旧Authority attempt 2再次临时失败后终止；冻结请求本地CAS构造失败在外调前收口terminal而不留下running');
 
     assert.equal(outputItemHadNoFence, true);
     assert.equal((await list(ctx.database, 'ModelStreamFence', {
@@ -1342,6 +1728,7 @@ async function checkProviderFullRequest() {
       }
     ];
     assert.deepEqual(compressionPayload.context, expectedCompressionContext);
+    assert.equal(compressionPayload.conversationId, seeded.conversationId);
     assert.equal(compressionPayload.context[0].content, 'PROVIDER-SUMMARY');
     assert.ok(!compressionPayload.context.some((item) => item.content === seeded.inputContent));
     assertions.push('compression后的新ModelRequest仍发送summary+finite tail完整请求，不发送suffix或已替换原文');
@@ -1464,8 +1851,26 @@ async function checkProviderFullRequest() {
     );
     assert.equal(await count(ctx.database, 'ModelStreamCheckpoint', {
       model_request_id: capacityRequest.modelRequestId
+    }), 1);
+    assert.equal(capacityDrops, 69);
+    for (let seq = 71; seq <= 102; seq += 1) {
+      const semantic = await provider.recordStreamEvent(
+        capacityRequest.modelRequestId,
+        capacitySocket.attemptSeq,
+        capacitySocket.socketGeneration,
+        { kind: 'output_item_done', streamSeq: String(seq), content: { item: seq - 70 } }
+      );
+      assert.equal(semantic.checkpointed, true);
+    }
+    await assert.rejects(provider.recordStreamEvent(
+      capacityRequest.modelRequestId,
+      capacitySocket.attemptSeq,
+      capacitySocket.socketGeneration,
+      { kind: 'output_item_done', streamSeq: '103', content: { item: 33 } }
+    ), /semantic item checkpoint limit/);
+    assert.equal(await count(ctx.database, 'ModelStreamCheckpoint', {
+      model_request_id: capacityRequest.modelRequestId
     }), 33);
-    assert.equal(capacityDrops, 37);
     const allRequestsBeforeCancel = await listAll(ctx.database, 'ModelRequest', {});
     const activeRequestsBeforeCancel = allRequestsBeforeCancel.filter((request) => request.status !== 'terminal').length;
     const terminalRequestsBeforeCancel = allRequestsBeforeCancel.filter((request) => request.status === 'terminal').length;
@@ -1494,7 +1899,9 @@ async function checkProviderFullRequest() {
         concurrentTerminalRequest.modelRequestId,
         concurrentSocket.attemptSeq,
         concurrentSocket.socketGeneration,
-        { kind: 'output_delta', streamSeq: String(seq), content: `race-${seq}` }
+        seq === 1
+          ? { kind: 'output_delta', streamSeq: String(seq), content: `race-${seq}` }
+          : { kind: 'output_item_done', streamSeq: String(seq), content: { item: seq } }
       );
       assert.equal(checkpoint.checkpointed, true);
     }
@@ -1517,7 +1924,7 @@ async function checkProviderFullRequest() {
       concurrentTerminalRequest.modelRequestId,
       concurrentSocket.attemptSeq,
       concurrentSocket.socketGeneration,
-      { kind: 'output_delta', streamSeq: '33', content: 'late-after-completed' }
+      { kind: 'output_item_done', streamSeq: '33', content: { item: 'late-after-completed' } }
     );
     await latePrepared;
     const completedResult = await provider.recordStreamEvent(
@@ -1544,12 +1951,12 @@ async function checkProviderFullRequest() {
     assert.ok(concurrentFence);
     assert.equal(concurrentRows.length, 33);
     assert.equal(concurrentRows.filter((row) => row.checkpoint_kind === 'terminal_summary').length, 1);
-    const expectedRetainedDeltaSeqs = Array.from({ length: 32 }, (_unused, index) => BigInt(index + 1));
-    const actualRetainedDeltaSeqs = concurrentRows
+    const expectedRetainedCheckpointSeqs = Array.from({ length: 32 }, (_unused, index) => BigInt(index + 1));
+    const actualRetainedCheckpointSeqs = concurrentRows
       .filter((row) => row.checkpoint_kind !== 'terminal_summary')
       .map((row) => row.stream_seq)
       .sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
-    assert.deepEqual(actualRetainedDeltaSeqs, expectedRetainedDeltaSeqs);
+    assert.deepEqual(actualRetainedCheckpointSeqs, expectedRetainedCheckpointSeqs);
     assert.ok(!concurrentRows.some((row) => row.stream_seq === 33n));
     for (const row of concurrentRows) {
       assert.equal(row.attempt_seq, concurrentFence.attempt_seq);
@@ -1598,7 +2005,7 @@ async function checkProviderFullRequest() {
       })
     ]), /cannot transition from terminal/);
     assert.ok(await get(ctx.database, 'ModelStreamCheckpoint', protectedCheckpoint.id));
-    assertions.push('writer事务内Promise.all并发仍限制活跃checkpoint≤33；受控late-delta在CAS发布后由Completed fence阻断且不留SQLite引用；终态精确保留当前attempt/socket固定32+summary；generic checkpoint/fence insert/delete、错误prune身份和terminal复活均被writer拒绝');
+    assertions.push('writer事务内Promise.all并发只保留首个delta；1 delta+32 item边界后semantic overflow明确失败且终态≤33；受控late-item在CAS发布后由Completed fence阻断且不留SQLite引用；终态精确保留当前attempt/socket固定32+summary；generic checkpoint/fence insert/delete、错误prune身份和terminal复活均被writer拒绝');
 
     const ignoredSignalRequest = await provider.createModelRequest({
       turnId: seeded.turnId,
@@ -1871,6 +2278,50 @@ async function checkProviderFullRequest() {
     assertions.push('Turn终止后，压缩来源Message edit/delete会在同事务结构化截断并重建current root；writer revision_seq与Context source一致；既有terminal projection仍字节级不变');
     assertions.push('Provider request-level cancel由writer原子命中最新reconnect/attempt2 identity；adapter永不settle也会立即收口；Completed与cancel durable first-wins一致；dispatch前Abort不外调；非UTF-8 frozen Context在外调前明确失败；全部终态checkpoint≤33后Turn才可终止，不扩展通用外部自动重试');
 
+    const websocketSource = await fs.readFile(
+      path.join(root, 'backend/capabilities/openAIResponsesWebSocketSession.ts'),
+      'utf8'
+    );
+    const providerSource = await fs.readFile(path.join(root, 'backend/capabilities/llmProvider.ts'), 'utf8');
+    const providerCapability = require(path.join(root, 'dist/extension/backend/capabilities/llmProvider.js'));
+    const productRuntimeSource = await fs.readFile(
+      path.join(root, 'backend/application/reliableKernel/VscodeReliableKernelProductRuntime.ts'),
+      'utf8'
+    );
+    for (const phase of [
+      'lock_wait', 'lock_acquired', 'socket_opening', 'socket_reused', 'socket_opened',
+      'send_started', 'request_sent', 'first_raw_event', 'first_semantic_event', 'terminal', 'timeout'
+    ]) {
+      assert.match(websocketSource, new RegExp(`['"]${phase}['"]`));
+    }
+    assert.match(providerSource, /phase:\s*['"]continuation_decision['"]/);
+    assert.match(productRuntimeSource, /eventKind:\s*['"]provider\.transport\.phase['"]/);
+    assert.match(productRuntimeSource, /sessionKeyHash/);
+    assert.doesNotMatch(productRuntimeSource.match(/onTransportTrace:[\s\S]*?resolveAttachment:/)?.[0] ?? '', /headers|prompt|arguments|toolResult/);
+    const websocketSettings = {
+      id: 'provider-session-scope',
+      baseUrl: 'https://provider.example/v1',
+      model: 'model-session-scope'
+    };
+    const conversationAKey = providerCapability.createOpenAIResponsesWebSocketSessionKey(
+      websocketSettings,
+      'conversation-a'
+    );
+    assert.equal(
+      conversationAKey,
+      providerCapability.createOpenAIResponsesWebSocketSessionKey(websocketSettings, ' conversation-a ')
+    );
+    assert.notEqual(
+      conversationAKey,
+      providerCapability.createOpenAIResponsesWebSocketSessionKey(websocketSettings, 'conversation-b')
+    );
+    assert.throws(
+      () => providerCapability.createOpenAIResponsesWebSocketSessionKey(websocketSettings, ''),
+      /require a non-empty conversationId/
+    );
+    assertions.push('OpenAI Responses WS把lock/socket/send/first raw/first semantic/terminal/timeout及continuation decision以无正文元数据写入滚动诊断；下一次无首事件可区分本地排队、发送与Relay等待');
+    assertions.push('OpenAI Responses WS session key按Conversation稳定隔离，并拒绝缺失conversationId时回退为全局共享锁');
+
     return { assertions, faults, metrics };
   });
 }
@@ -2140,11 +2591,17 @@ async function checkImmutableReplacement() {
     const coordinatedBlock = await get(ctx.database, 'CompressionBlock', coordinated.result.compressionBlockId);
     const structuredMetadata = await get(ctx.database, 'ContentObject', coordinatedBlock.summary_object_id);
     assert.equal(structuredMetadata.content_type, kernel.CONTENT_TYPE_COMPRESSION_CONTENTS);
-    assert.deepEqual(JSON.parse((await ctx.store.read(structuredMetadata)).toString('utf8')), {
+    const structuredCompression = JSON.parse((await ctx.store.read(structuredMetadata)).toString('utf8'));
+    assert.equal(
+      structuredCompression.estimatedTokens,
+      kernel.estimateMessageContentsTokens(structuredCompression.contents)
+    );
+    assert.deepEqual(structuredCompression, {
       kind: 'compression_contents', version: 1,
       contents: [{ role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] }],
       trigger: 'auto',
-      methodKind: 'deterministic_summary'
+      methodKind: 'deterministic_summary',
+      estimatedTokens: structuredCompression.estimatedTokens
     });
     const coordinatedMaterialized = await context.materialize(coordinated.result.rootId);
     assert.equal(coordinatedMaterialized.segments.length, 3);
@@ -2196,7 +2653,8 @@ async function checkImmutableReplacement() {
     });
     const compactEvents = [];
     await capabilityAdapter.sendFullRequest({
-      kind: 'full-model-request', modelRequestId: 'adapter-compact', attemptSeq: '1', socketGeneration: '1',
+      kind: 'full-model-request', modelRequestId: 'adapter-compact',
+      conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
       recipe: {
         kind: 'reliable-context-compression', sourceSegmentCount: 2,
@@ -2224,13 +2682,15 @@ async function checkImmutableReplacement() {
       { role: 'model', parts: [{ text: 'PRIOR-STRUCTURED' }] },
       { role: 'user', parts: [{ text: 'TAIL-USER' }] }
     ]);
+    assert.equal(adapterCompactRequest.conversationId, coordinatorSeed.conversationId);
     assert.equal(adapterCompactRequest.priorSummaryContents[0].parts[0].text, 'PRIOR-STRUCTURED');
     assert.equal(compactEvents.length, 1);
     assert.equal(compactEvents[0].kind, 'completed');
     assert.equal(compactEvents[0].content.type, 'compression_result');
     const ordinaryEvents = [];
     await capabilityAdapter.sendFullRequest({
-      kind: 'full-model-request', modelRequestId: 'adapter-ordinary', attemptSeq: '1', socketGeneration: '1',
+      kind: 'full-model-request', modelRequestId: 'adapter-ordinary',
+      conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
       recipe: { kind: 'reliable-agent-turn', round: '1', tools: [] },
       context: [{
@@ -2243,6 +2703,7 @@ async function checkImmutableReplacement() {
     assert.deepEqual(adapterStartRequest.contents, [
       { role: 'model', parts: [{ text: 'PRIOR-STRUCTURED' }] }
     ]);
+    assert.equal(adapterStartRequest.conversationId, coordinatorSeed.conversationId);
     assert.equal(ordinaryEvents.at(-1).kind, 'completed');
     const manualPolicy = {
       ...coordinatorPolicy,
@@ -2575,12 +3036,19 @@ function createTurnControl(ctx, suffix, options = {}) {
               kind: 'effective-turn-authority',
               turnId: request.turnId,
               executorAgentId: request.executorAgentId,
+              ...(options.includeConversationId ? { conversationId: request.conversationId } : {}),
               modelProfile: {
                 compressionThresholdTokens: thresholdTokens,
                 contextWindowTokens: thresholdTokens * 2,
                 tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
               },
-              model: { providerConfigId: 'fake-local', modelId: 'fake-model' },
+              model: {
+                providerConfigId: 'fake-local',
+                modelId: 'fake-model',
+                ...(options.provider ? { provider: options.provider } : {}),
+                ...(options.retryPolicy ? { retryPolicy: options.retryPolicy } : {})
+              },
+              ...(options.toolPolicy ? { toolPolicy: options.toolPolicy } : {}),
               ...(options.compressionPolicy ? { compression: options.compressionPolicy } : {}),
               policies: { toolPolicyId: 'tools-default', systemPromptId: 'prompt-default' }
             })
@@ -2791,9 +3259,11 @@ function deterministicBytes(seed, length) {
 
 function assertNoContinuationPayload(request) {
   assert.equal(request.kind, 'full-model-request');
+  assert.equal(typeof request.conversationId, 'string');
+  assert.ok(request.conversationId.trim().length > 0);
   assert.ok(Array.isArray(request.context) && request.context.length > 0);
   const required = [
-    'kind', 'modelRequestId', 'attemptSeq', 'socketGeneration', 'providerId', 'modelId',
+    'kind', 'modelRequestId', 'conversationId', 'attemptSeq', 'socketGeneration', 'providerId', 'modelId',
     'authoritySnapshot', 'recipe', 'context'
   ];
   const expected = Object.prototype.hasOwnProperty.call(request, 'settingsSnapshot')
