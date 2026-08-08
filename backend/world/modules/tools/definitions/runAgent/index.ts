@@ -18,6 +18,16 @@ export function maxChildAgentDepthFromConfig(
     : defaultValue;
 }
 
+export function runAgentToolAvailableAtDepth(
+  currentDepth: number,
+  config: ToolConfigRecord | undefined
+): boolean {
+  if (!Number.isSafeInteger(currentDepth) || currentDepth < 0) {
+    throw new TypeError('currentDepth must be a non-negative safe integer.');
+  }
+  return currentDepth < maxChildAgentDepthFromConfig(config);
+}
+
 export const runAgentToolModule = defineToolDefinitionModule({
   id: RUN_AGENT_TOOL_NAME,
   create() {
@@ -112,7 +122,7 @@ Do NOT poll read_agent_answer in a loop in the same response. Do NOT use tools t
         key: MAX_CHILD_AGENT_DEPTH_CONFIG_KEY,
         label: '最大子 Agent 层级',
         type: 'number',
-        description: '限制新建子 Agent 的嵌套深度。根对话为 0；设为 1 时只允许根对话创建第一层子 Agent；设为 0 时禁止新建子 Agent。继续现有子 Agent 和中断操作不受限制。',
+        description: '限制子 Agent 的嵌套深度。根对话为 0；设为 1 时只允许根对话创建第一层子 Agent；设为 0 时根对话也看不到 run_agent。当前层级达到上限后，后续模型请求不再提供 run_agent；已经发出的调用仍可完成或中断。',
         defaultValue: DEFAULT_MAX_CHILD_AGENT_DEPTH
       }]
     },

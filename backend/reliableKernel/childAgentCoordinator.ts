@@ -31,6 +31,7 @@ import {
   type ExecutionLeaseFence
 } from './executionLeaseFence';
 import { maxChildAgentDepthFromConfig } from '../world/modules/tools/definitions/runAgent';
+import { childAgentDepthForTurn } from './childAgentDepth';
 
 export interface ReliableChildAgentSelection {
   agentId: string;
@@ -1083,49 +1084,13 @@ export class ReliableChildAgentCoordinator {
     if (existingChildren.length === 1) return;
 
     const maxDepth = maxChildAgentDepthFromConfig(authority?.toolConfig?.config);
-    const currentDepth = await this.childDepthForTurn(input.turnId);
+    const currentDepth = await childAgentDepthForTurn(this.dependencies.database, input.turnId);
     const requestedDepth = currentDepth + 1;
     if (requestedDepth <= maxDepth) return;
     throw new Error(
       `run_agent 已达到最大子 Agent 层级：当前对话是第 ${currentDepth} 层，`
       + `新建子 Agent 会进入第 ${requestedDepth} 层，但当前上限是 ${maxDepth}。`
     );
-  }
-
-  private async childDepthForTurn(turnIdInput: string): Promise<number> {
-    const turnId = requireId(turnIdInput, 'turnId');
-    const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
-    if (memberships.length > 1) {
-      throw new Error(`Turn ${turnId} has multiple ChildExecution memberships.`);
-    }
-    if (memberships.length === 0) return 0;
-
-    let depth = 0;
-    let childExecutionId: string | null = requireId(
-      memberships[0].child_execution_id,
-      'ChildExecutionTurnLink.child_execution_id'
-    );
-    const visited = new Set<string>();
-    while (childExecutionId !== null) {
-      if (visited.has(childExecutionId)) {
-        throw new Error('ChildExecution parent lineage contains a cycle.');
-      }
-      visited.add(childExecutionId);
-      depth += 1;
-      const parentLinks = await this.list('ChildExecutionParentLink', {
-        child_execution_id: childExecutionId
-      }, 2);
-      if (parentLinks.length !== 1) {
-        throw new Error(`ChildExecution ${childExecutionId} must retain exactly one parent link.`);
-      }
-      childExecutionId = parentLinks[0].parent_child_execution_id === null
-        ? null
-        : requireId(
-            parentLinks[0].parent_child_execution_id,
-            'ChildExecutionParentLink.parent_child_execution_id'
-          );
-    }
-    return depth;
   }
 
   private async continueChild(

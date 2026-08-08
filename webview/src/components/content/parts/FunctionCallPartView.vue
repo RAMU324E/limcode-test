@@ -933,6 +933,7 @@ function isFinalizingProgress(progress: unknown): boolean {
     ]"
     kind="input"
     :collapsible="hasDetails"
+    lazy
     :aria-label="toggleLabel"
     :title="batchTitle"
   >

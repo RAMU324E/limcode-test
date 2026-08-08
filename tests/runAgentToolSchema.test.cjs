@@ -12,11 +12,13 @@ function fromDist(relativePath) {
 }
 
 const { ReliableChildAgentCoordinator } = fromDist('backend/reliableKernel/childAgentCoordinator.js');
+const { ReliableToolDispatcher } = fromDist('backend/reliableKernel/toolDispatcher.js');
 const { stablePhaseFId } = fromDist('backend/reliableKernel/phaseFIdentity.js');
 const {
   DEFAULT_MAX_CHILD_AGENT_DEPTH,
   MAX_CHILD_AGENT_DEPTH_CONFIG_KEY,
   maxChildAgentDepthFromConfig,
+  runAgentToolAvailableAtDepth,
   runAgentTool
 } = fromDist('backend/world/modules/tools/definitions/runAgent/index.js');
 const { readAgentAnswerTool } = fromDist('backend/world/modules/tools/definitions/agentAnswer/index.js');
@@ -49,6 +51,12 @@ test('Agent 工具声明说明异步用法，并只标记无条件必填参数',
   assert.equal(maxChildAgentDepthFromConfig({ [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 2.9 }), 2);
   assert.equal(maxChildAgentDepthFromConfig({ [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: -3 }), 0);
   assert.equal(maxChildAgentDepthFromConfig({ [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 'invalid' }), 1);
+  assert.equal(runAgentToolAvailableAtDepth(0, { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 3 }), true);
+  assert.equal(runAgentToolAvailableAtDepth(1, { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 3 }), true);
+  assert.equal(runAgentToolAvailableAtDepth(2, { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 3 }), true);
+  assert.equal(runAgentToolAvailableAtDepth(3, { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 3 }), false);
+  assert.equal(runAgentToolAvailableAtDepth(4, { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 3 }), false);
+  assert.equal(runAgentToolAvailableAtDepth(0, { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 0 }), false);
 });
 
 test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 interrupt 的 prompt 校验保持分开', async () => {
@@ -192,6 +200,15 @@ test('可靠 run_agent 按冻结策略和持久父链限制新建子 Agent 的�
   assert.equal(firstLevelAllowed.spawnCount(), 1);
 });
 
+test('run_agent 按设置上限和当前持久层级动态出现在模型工具列表中', async () => {
+  assert.deepEqual(await visibleToolNames(3, []), ['read', 'run_agent']);
+  assert.deepEqual(await visibleToolNames(3, ['child-1']), ['read', 'run_agent']);
+  assert.deepEqual(await visibleToolNames(3, ['child-2', 'child-1']), ['read', 'run_agent']);
+  assert.deepEqual(await visibleToolNames(3, ['child-3', 'child-2', 'child-1']), ['read']);
+  assert.deepEqual(await visibleToolNames(3, ['child-4', 'child-3', 'child-2', 'child-1']), ['read']);
+  assert.deepEqual(await visibleToolNames(0, []), ['read']);
+});
+
 function frozenRunAgentAuthority(maxDepth) {
   return {
     snapshotId: `authority-depth-${maxDepth}`,
@@ -283,4 +300,78 @@ function createDepthCoordinator(lineageFromCurrentToRoot) {
     spawnCount: () => spawns,
     resolveCount: () => resolutions
   };
+}
+
+async function visibleToolNames(maxDepth, lineageFromCurrentToRoot) {
+  const database = {
+    async snapshot(reads) {
+      return {
+        snapshot: reads.map((read) => {
+          if (read.kind !== 'list') return null;
+          if (read.domain === 'ChildExecutionTurnLink') {
+            return lineageFromCurrentToRoot.length === 0
+              ? []
+              : [{
+                  id: `visibility-turn-link-${lineageFromCurrentToRoot[0]}`,
+                  turn_id: read.where.turn_id,
+                  child_execution_id: lineageFromCurrentToRoot[0]
+                }];
+          }
+          if (read.domain === 'ChildExecutionParentLink') {
+            const index = lineageFromCurrentToRoot.indexOf(read.where.child_execution_id);
+            assert.notEqual(index, -1, '工具可见性测试父链必须连续');
+            return [{
+              id: `visibility-parent-link-${lineageFromCurrentToRoot[index]}`,
+              child_execution_id: lineageFromCurrentToRoot[index],
+              parent_child_execution_id: lineageFromCurrentToRoot[index + 1] ?? null
+            }];
+          }
+          return [];
+        })
+      };
+    }
+  };
+  const dispatcher = new ReliableToolDispatcher({
+    database,
+    contentStore: {},
+    effects: {},
+    files: {},
+    fileMutations: {},
+    processes: {},
+    mcp: {},
+    interactions: {},
+    host: {
+      definitions() {
+        return [runAgentTool, {
+          execution: 'runtime',
+          declaration: {
+            name: 'read',
+            description: 'read fixture',
+            parameters: {},
+            metadata: { defaultEnabled: true }
+          },
+          async execute() { return { ok: true }; }
+        }];
+      }
+    }
+  });
+  dispatcher.readAuthority = async () => ({
+    snapshotId: `visibility-authority-${maxDepth}`,
+    document: {
+      toolPolicy: {
+        allowedTools: ['read', 'run_agent'],
+        preset: 'custom',
+        toolConfigs: {
+          run_agent: { config: { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: maxDepth } }
+        },
+        sourceConfigs: {}
+      },
+      workEnvironmentPolicy: {
+        enabled: true,
+        allowedWorkEnvironmentIds: [],
+        defaultWorkEnvironmentId: null
+      }
+    }
+  });
+  return (await dispatcher.definitions('visibility-turn')).map((definition) => definition.name).sort();
 }

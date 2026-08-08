@@ -176,6 +176,7 @@ function formatBytes(bytes: number | undefined): string {
     class="attachment-card"
     :expanded="expanded"
     kind="input"
+    lazy
     :aria-label="expanded ? '收起附件内容' : '展开附件内容'"
     @update:expanded="setExpanded"
   >

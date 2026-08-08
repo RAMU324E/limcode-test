@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import { IconChevronRight } from '@tabler/icons-vue';
+
+const COLLAPSE_UNMOUNT_DELAY_MS = 220;
 
 const props = withDefaults(
   defineProps<{
@@ -9,12 +11,14 @@ const props = withDefaults(
     ariaLabel?: string;
     kind?: 'input' | 'output';
     iconActive?: boolean;
+    lazy?: boolean;
   }>(),
   {
     expanded: false,
     collapsible: true,
     kind: 'input',
-    iconActive: false
+    iconActive: false,
+    lazy: true
   }
 );
 
@@ -23,6 +27,58 @@ const emit = defineEmits<{
 }>();
 
 const isExpanded = computed(() => props.expanded === true);
+const contentMounted = ref(!props.lazy || isExpanded.value);
+const contentExpanded = ref(isExpanded.value);
+let expandFrame: number | undefined;
+let collapseUnmountTimer: number | undefined;
+let transitionRevision = 0;
+
+watch(
+  [isExpanded, () => props.lazy],
+  ([expanded, lazy]) => {
+    clearTransitionTimers();
+    const revision = transitionRevision;
+
+    if (!lazy) {
+      contentMounted.value = true;
+      contentExpanded.value = expanded;
+      return;
+    }
+
+    if (!expanded) {
+      contentExpanded.value = false;
+      if (!contentMounted.value) return;
+      collapseUnmountTimer = window.setTimeout(() => {
+        collapseUnmountTimer = undefined;
+        if (revision === transitionRevision && props.lazy && !isExpanded.value) contentMounted.value = false;
+      }, COLLAPSE_UNMOUNT_DELAY_MS);
+      return;
+    }
+
+    contentMounted.value = true;
+    contentExpanded.value = false;
+    void nextTick(() => {
+      if (revision !== transitionRevision || !props.lazy || !isExpanded.value) return;
+      expandFrame = window.requestAnimationFrame(() => {
+        expandFrame = undefined;
+        if (revision === transitionRevision && props.lazy && isExpanded.value) contentExpanded.value = true;
+      });
+    });
+  },
+  { immediate: true }
+);
+
+onBeforeUnmount(() => {
+  clearTransitionTimers();
+});
+
+function clearTransitionTimers(): void {
+  transitionRevision += 1;
+  if (expandFrame !== undefined) window.cancelAnimationFrame(expandFrame);
+  if (collapseUnmountTimer !== undefined) window.clearTimeout(collapseUnmountTimer);
+  expandFrame = undefined;
+  collapseUnmountTimer = undefined;
+}
 
 function toggleExpanded(): void {
   if (!props.collapsible) return;
@@ -72,12 +128,12 @@ function toggleExpanded(): void {
     </div>
 
     <div
-      v-if="$slots.default && collapsible"
+      v-if="$slots.default && collapsible && contentMounted"
       class="lc-collapsible-content-shell lc-collapse-shell"
-      :class="{ 'is-expanded': isExpanded }"
+      :class="{ 'is-expanded': contentExpanded }"
       :aria-hidden="!isExpanded"
     >
-      <div v-if="isExpanded" class="lc-collapsible-content-frame lc-collapse-frame">
+      <div class="lc-collapsible-content-frame lc-collapse-frame">
         <slot />
       </div>
     </div>

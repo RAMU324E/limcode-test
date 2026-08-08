@@ -20,6 +20,10 @@ import {
   isReadonlyCommandCall,
   type TrustedCommandClassification
 } from '../world/modules/tools/definitions/command';
+import {
+  RUN_AGENT_TOOL_NAME,
+  runAgentToolAvailableAtDepth
+} from '../world/modules/tools/definitions/runAgent';
 import type { ToolDefinition, ToolResultOut, ToolRuntimeEvent } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDefinition,
@@ -29,6 +33,7 @@ import type {
   ReliableAgentToolSettled
 } from './agentLoop';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import { childAgentDepthForTurn } from './childAgentDepth';
 import type {
   EffectControlPlane,
   FrozenToolCallPolicyDecision,
@@ -135,7 +140,7 @@ export interface ReliableToolDispatcherDependencies {
 const FILE_TOOLS = new Set(['write', 'edit', 'delete']);
 const PROCESS_TOOLS = new Set(['bash', 'shell']);
 const SPECIAL_TOOLS = new Set([
-  'run_agent',
+  RUN_AGENT_TOOL_NAME,
   'submit_agent_answer',
   'read_agent_answer'
 ]);
@@ -1385,9 +1390,18 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const authority = await this.readAuthority(turnId, 'tool-definitions');
     const toolPolicy = authorityPolicy(authority.document);
     const workEnvironmentPolicy = authorityWorkEnvironmentPolicy(authority.document);
+    const runAgentDefinition = definitions.find((definition) =>
+      definition.declaration.name === RUN_AGENT_TOOL_NAME
+      && definitionAllowedByAuthority(toolPolicy, definition)
+    );
+    const exposeRunAgent = !runAgentDefinition || runAgentToolAvailableAtDepth(
+      await childAgentDepthForTurn(this.dependencies.database, turnId),
+      toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
+    );
     return definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
+      && (definition.declaration.name !== RUN_AGENT_TOOL_NAME || exposeRunAgent)
     );
   }
 

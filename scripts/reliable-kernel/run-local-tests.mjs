@@ -5,6 +5,7 @@ import childProcess from 'node:child_process';
 
 const root = process.cwd();
 const CI_TEST_FILES = Object.freeze([
+  'tests/bottomStickyScrollerScheduler.test.cjs',
   'tests/commandRelaxedPolicy.test.cjs',
   'tests/llmErrorRedaction.test.cjs',
   'tests/localFileResources.test.cjs',

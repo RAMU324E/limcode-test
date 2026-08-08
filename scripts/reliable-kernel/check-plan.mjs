@@ -50,6 +50,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'scripts/reliable-kernel/benchmark-model-independent-hotpaths.mjs',
   'scripts/reliable-kernel/benchmark-phase0-milestones.mjs',
   'scripts/reliable-kernel/benchmark-tool-scheduler.mjs',
+  'tests/bottomStickyScrollerScheduler.test.cjs',
   'tests/commandRelaxedPolicy.test.cjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',

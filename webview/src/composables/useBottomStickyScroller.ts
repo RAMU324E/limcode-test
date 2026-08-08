@@ -62,8 +62,8 @@ export function useBottomStickyScroller(
   let resizeObserver: ResizeObserver | undefined;
   let mutationObserver: MutationObserver | undefined;
   let stickyToBottom = true;
-  let stickyFrame: number | undefined;
-  let contentCheckFrame: number | undefined;
+  let scrollFrame: number | undefined;
+  let contentCheckPending = false;
   let stickyUntil = 0;
   let userDetachedFromBottom = false;
   let reattachLockedUntil = 0;
@@ -107,10 +107,10 @@ export function useBottomStickyScroller(
     return stickyToBottom;
   }
 
-  function cancelStickyFrame(): void {
-    if (stickyFrame === undefined) return;
-    window.cancelAnimationFrame(stickyFrame);
-    stickyFrame = undefined;
+  function cancelScrollFrame(): void {
+    if (scrollFrame !== undefined) window.cancelAnimationFrame(scrollFrame);
+    scrollFrame = undefined;
+    contentCheckPending = false;
   }
 
   function canAutoReattach(): boolean {
@@ -122,7 +122,7 @@ export function useBottomStickyScroller(
     userDetachedFromBottom = true;
     stickyUntil = 0;
     reattachLockedUntil = performance.now() + reattachDelayMs;
-    cancelStickyFrame();
+    cancelScrollFrame();
     rememberScrollMetrics();
   }
 
@@ -241,12 +241,24 @@ export function useBottomStickyScroller(
   function keepStickyDuringContentSettle(): void {
     if (!stickyToBottom) return;
     scrollToBottomNow();
-    if (stickyFrame !== undefined) return;
     stickyUntil = Math.max(stickyUntil, performance.now() + settleMs);
-    stickyFrame = window.requestAnimationFrame(() => {
-      stickyFrame = undefined;
-      if (stickyToBottom) scrollToBottomNow();
-    });
+    scheduleScrollFrame();
+  }
+
+  function scheduleScrollFrame(): void {
+    if (scrollFrame !== undefined) return;
+    scrollFrame = window.requestAnimationFrame(runScrollFrame);
+  }
+
+  function runScrollFrame(): void {
+    scrollFrame = undefined;
+    if (contentCheckPending) {
+      contentCheckPending = false;
+      refreshObservedContentRoot();
+      onContentMayHaveChanged();
+    }
+
+    if (stickyToBottom) scrollToBottomNow();
   }
 
   function onContentMayHaveChanged(): void {
@@ -277,13 +289,8 @@ export function useBottomStickyScroller(
   }
 
   function scheduleContentCheck(): void {
-    if (contentCheckFrame !== undefined) return;
-
-    contentCheckFrame = window.requestAnimationFrame(() => {
-      contentCheckFrame = undefined;
-      refreshObservedContentRoot();
-      onContentMayHaveChanged();
-    });
+    contentCheckPending = true;
+    scheduleScrollFrame();
   }
 
   function refreshObservedContentRoot(): void {
@@ -354,9 +361,7 @@ export function useBottomStickyScroller(
     mutationObserver?.disconnect();
     mutationObserver = undefined;
 
-    cancelStickyFrame();
-    if (contentCheckFrame !== undefined) window.cancelAnimationFrame(contentCheckFrame);
-    contentCheckFrame = undefined;
+    cancelScrollFrame();
   }
 
   watch(scroller, attachScroller, { immediate: true, flush: 'post' });

@@ -27,6 +27,7 @@ docs/architecture/*
 /tests/
 !/tests/
 /tests/*
+!/tests/bottomStickyScrollerScheduler.test.cjs
 !/tests/commandRelaxedPolicy.test.cjs
 !/tests/llmErrorRedaction.test.cjs
 !/tests/localFileResources.test.cjs
