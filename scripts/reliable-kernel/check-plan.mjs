@@ -45,6 +45,37 @@ function isTestArtifactPath(file) {
     || /\.(?:test|spec|benchmark)\.[^/]+$/i.test(base);
 }
 
+const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
+  'scripts/reliable-kernel/benchmark-concurrency-tuning.mjs',
+  'scripts/reliable-kernel/benchmark-model-independent-hotpaths.mjs',
+  'scripts/reliable-kernel/benchmark-phase0-milestones.mjs',
+  'scripts/reliable-kernel/benchmark-tool-scheduler.mjs',
+  'tests/reliable-kernel/configuration-authority.test.mjs',
+  'tests/reliable-kernel/diagnostic-journal.test.mjs',
+  'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',
+  'tests/reliable-kernel/model-system-prompt-prefix.test.mjs',
+  'tests/reliable-kernel/product-composition.test.mjs',
+  'tests/llmErrorRedaction.test.cjs',
+  'tests/runAgentToolSchema.test.cjs',
+  'tests/settingsRevisionConflict.test.cjs',
+  'tests/vscodeStorageJsonDurability.test.cjs'
+]);
+
+const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([
+  'scripts/reliable-kernel/concurrency-read-after-repeat.json',
+  'scripts/reliable-kernel/concurrency-read-after.json',
+  'scripts/reliable-kernel/concurrency-read-before.json',
+  'scripts/reliable-kernel/concurrency-tuning-after-repeat.json',
+  'scripts/reliable-kernel/concurrency-tuning-after.json',
+  'scripts/reliable-kernel/concurrency-tuning-before.json',
+  'scripts/reliable-kernel/concurrency-tuning-comparison.json',
+  'scripts/reliable-kernel/model-independent-hotpaths-after.json',
+  'scripts/reliable-kernel/tool-scheduler-model-independent-after.json',
+  'scripts/reliable-kernel/tool-scheduler-phase0-before.json',
+  'scripts/reliable-kernel/tool-scheduler-phase1-after.json',
+  'scripts/reliable-kernel/tool-scheduler-phase2-after.json'
+]);
+
 function checkTrackedInputs() {
   let tracked = [];
   try {
@@ -53,7 +84,10 @@ function checkTrackedInputs() {
     failures.push('无法读取Git跟踪文件清单');
   }
   const trackedTests = tracked.filter(isTestArtifactPath);
-  if (trackedTests.length) failures.push(`测试、夹具或基准不得进入版本库：${trackedTests.join(', ')}`);
+  const unexpectedTrackedTests = trackedTests.filter((file) => !TRACKED_VERIFICATION_SOURCE_ALLOWLIST.has(file));
+  if (unexpectedTrackedTests.length) {
+    failures.push(`仅允许明确审查过的关键测试与基准脚本进入版本库：${unexpectedTrackedTests.join(', ')}`);
+  }
   if (!read('.gitignore').split(/\r?\n/).includes('/tests/')) failures.push('.gitignore必须忽略根目录/tests/');
 
   if (!requireTracked) {
@@ -68,7 +102,7 @@ function checkTrackedInputs() {
     'AGENTS.md',
     'package.json',
     'package-lock.json'
-  ];
+  ].filter((relative) => !LOCAL_GENERATED_BENCHMARK_OUTPUTS.has(relative));
   for (const relative of formalInputs) {
     try {
       git(['ls-files', '--error-unmatch', '--', relative]);

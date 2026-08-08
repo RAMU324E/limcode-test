@@ -10,7 +10,7 @@
     "url": "https://github.com/lurenxing628/limcode2.git"
   },
   "engines": {
-    "vscode": "^1.89.0"
+    "vscode": "^1.101.0"
   },
   "extensionKind": [
     "workspace"
@@ -94,6 +94,7 @@
     "build": "npm run compile && npm run build:webview && node scripts/reliable-kernel/write-build-provenance.mjs",
     "typecheck:webview": "vue-tsc -p tsconfig.webview.json --noEmit",
     "check": "npm run check:plan",
+    "test:ci:linux": "npm run compile && node scripts/reliable-kernel/run-local-tests.mjs --ci",
     "check:contracts:plan": "node scripts/reliable-kernel/check-plan.mjs",
     "check:package:surface": "node scripts/reliable-kernel/check-package-surface.mjs",
     "check:plan": "npm run build && npm run typecheck:webview && npm run check:contracts:plan",
@@ -107,6 +108,7 @@
     "test:phase-f": "npm run compile && node --test tests/reliable-kernel/phase-f-subagent-client.test.mjs",
     "check:phase-d": "npm run compile && node --test tests/reliable-kernel/phase-c-turn-control-plane.test.mjs tests/reliable-kernel/phase-d-effects-tools-files-processes.test.mjs",
     "check:candidate": "npm run compile && node scripts/reliable-kernel/validators/candidate.mjs",
+    "benchmark:concurrency": "node scripts/reliable-kernel/benchmark-concurrency-tuning.mjs",
     "smoke:sqlite:host": "node scripts/reliable-kernel/sqlite-extension-host-smoke.mjs",
     "rebuild:sqlite:electron": "node scripts/reliable-kernel/rebuild-sqlite-electron.mjs",
     "check:local": "npm run check:plan && node scripts/reliable-kernel/run-local-tests.mjs",

@@ -8,7 +8,7 @@
 
 ## 0. 2026-08-06～07 独立核对与实施记录
 
-本节是当前工作树的实施证据；后续章节保留研究背景和原始建议。修改前代码来自任务开始时冻结的完整工作树，不以 `HEAD` 冒充用户现状。可重复证据为：
+本节是任务实施时的测量记录；后续章节保留研究背景和原始建议。修改前代码来自任务开始时冻结的完整工作树，不以 `HEAD` 冒充用户现状。以下 JSON 名称是基准脚本在本机生成的临时输出，不进入版本库；可重复执行的脚本本身才是正式输入：
 
 - `scripts/reliable-kernel/tool-scheduler-phase0-before.json`：冻结前，5 次；
 - `scripts/reliable-kernel/tool-scheduler-phase1-after.json`：Phase 1 第一轮后，5 次；

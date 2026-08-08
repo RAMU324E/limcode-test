@@ -2347,8 +2347,11 @@ async function checkProcessWrapperRecovery() {
     epoch.rootGeneration = stalePointer.rootGeneration;
     await fs.writeFile(ctx.binding.paths.rootPointerPath, `${JSON.stringify(stalePointer)}\n`);
     await fs.writeFile(ctx.binding.paths.runtimeEpochPath, `${JSON.stringify(epoch)}\n`);
+    // RootAuthority deliberately reuses a successful validation for one 25ms hot burst. Let that
+    // bounded window expire before asserting that the next operation observes the offline switch.
+    await delay(50);
     await assert.rejects(processes.readOutputPage(processId), (error) => error?.code === 'stale-root-binding');
-    assertions.push('每次read/wait/stop重验RootBinding generation，root switch后旧binding fail closed');
+    assertions.push('read/wait/stop在25ms热验证窗口过期后重验RootBinding generation，root switch后旧binding fail closed');
 
     return {
       assertions,
