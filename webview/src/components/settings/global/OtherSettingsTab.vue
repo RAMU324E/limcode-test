@@ -35,7 +35,7 @@ function inputNumber(event: Event): number {
     </label>
 
     <label class="global-settings-field">
-      <span>单条消息附件总大小上限（MB，默认 20；最多 8 个附件）</span>
+      <span>单条消息附件总大小上限（MB，默认 20；不限制附件数量）</span>
       <input :value="settings.attachments.maxStoredInlineFileMb" type="number" min="1" max="200" step="1" @change="settings.setAttachmentSettings({ maxStoredInlineFileMb: inputNumber($event) })" />
     </label>
 

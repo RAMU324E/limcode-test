@@ -17,6 +17,7 @@ import {
 } from '../capabilities/boundedConcurrency';
 import {
   classifyCommandCall,
+  isReadonlyCommandCall,
   type TrustedCommandClassification
 } from '../world/modules/tools/definitions/command';
 import type { ToolDefinition, ToolResultOut, ToolRuntimeEvent } from '../world/modules/tools/registry';
@@ -300,7 +301,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const allowlistedCommand = !!command && firstMatchedCommandRule(command, commandConfig.allowCommands) !== undefined;
     const autoApproveReadonly = PROCESS_TOOLS.has(input.toolName)
       && commandConfig.autoApproveReadonly
-      && commandClassification?.readonly === true;
+      && isReadonlyCommandCall(input.arguments);
     const executionAutomatic = yolo
       || input.toolName === 'ask_user'
       || input.toolName === 'submit_plan'
@@ -2001,7 +2002,7 @@ function frozenPlanReviewRiskLevel(
 ): FrozenPlanReviewRiskLevel {
   if (FILE_TOOLS.has(input.toolName)) return 'write';
   if (PROCESS_TOOLS.has(input.toolName)) {
-    return classifyCommandCall(input.arguments).readonly ? 'read' : 'command';
+    return isReadonlyCommandCall(input.arguments) ? 'read' : 'command';
   }
   const risk = definition.declaration.metadata?.riskLevel;
   if (risk === 'read' || risk === 'write' || risk === 'command' || risk === 'agent') return risk;
@@ -2013,16 +2014,13 @@ function frozenCommandScheduling(
   value: PlainJsonValue
 ): { mode: 'parallel' | 'serial'; reason: string } {
   const args = plainOptionalRecord(value);
-  if (args?.scheduling === 'serial') return { mode: 'serial', reason: 'model_serial_tightening' };
+  if (args?.scheduling === 'parallel' || args?.scheduling === 'serial') {
+    return { mode: args.scheduling, reason: `model_selected_${args.scheduling}` };
+  }
   const wait = typeof args?.wait === 'string' ? args.wait.trim().toLowerCase() : '';
-  if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true_tightening' };
+  if (wait === 'false') return { mode: 'parallel', reason: 'legacy_wait_false' };
+  if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true' };
   if (classification.parallelSafe) return { mode: 'parallel', reason: classification.reason };
-  if (args?.scheduling === 'parallel') {
-    return { mode: 'serial', reason: `model_parallel_rejected_${classification.reason}` };
-  }
-  if (wait === 'false') {
-    return { mode: 'serial', reason: `legacy_wait_false_rejected_${classification.reason}` };
-  }
   return { mode: 'serial', reason: classification.reason };
 }
 

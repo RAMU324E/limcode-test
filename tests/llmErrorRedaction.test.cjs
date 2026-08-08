@@ -5,7 +5,7 @@ const {
   rawErrorFromUnknown
 } = require('../dist/extension/backend/capabilities/llmProvider.js');
 
-test('Error 转成可靠内核事件时只保留安全诊断字段', () => {
+test('Error 转成可靠内核事件时保留非秘密诊断字段', () => {
   const error = Object.assign(new Error('OpenAI Responses WebSocket closed'), {
     transport: 'websocket',
     phase: 'awaiting_first_event',
@@ -20,6 +20,8 @@ test('Error 转成可靠内核事件时只保留安全诊断字段', () => {
     code: 'network_changed',
     statusCode: 503,
     timeoutMs: 30_000,
+    requestId: 'provider-request-123',
+    providerDetails: { region: 'local-dev', continuationTokenCount: 2 },
     apiKey: 'top-level-api-key-must-not-leak',
     Authorization: 'Bearer top-level-auth-must-not-leak',
     headers: { authorization: 'Bearer header-auth-must-not-leak' },
@@ -49,10 +51,12 @@ test('Error 转成可靠内核事件时只保留安全诊断字段', () => {
   assert.equal(raw.code, 'network_changed');
   assert.equal(raw.statusCode, 503);
   assert.equal(raw.timeoutMs, 30_000);
+  assert.equal(raw.requestId, 'provider-request-123');
+  assert.deepEqual(raw.providerDetails, { region: 'local-dev', continuationTokenCount: 2 });
   assert.equal(raw.apiKey, undefined);
   assert.equal(raw.Authorization, undefined);
-  assert.equal(raw.headers, undefined);
-  assert.equal(raw.debugContext, undefined);
+  assert.deepEqual(raw.headers, {});
+  assert.deepEqual(raw.debugContext, {});
   assert.deepEqual(raw.cause, {
     message: 'socket closed by peer',
     headers: { 'x-request-id': 'request-from-cause' }

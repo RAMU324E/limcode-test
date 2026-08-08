@@ -50,15 +50,18 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'scripts/reliable-kernel/benchmark-model-independent-hotpaths.mjs',
   'scripts/reliable-kernel/benchmark-phase0-milestones.mjs',
   'scripts/reliable-kernel/benchmark-tool-scheduler.mjs',
+  'tests/commandRelaxedPolicy.test.cjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',
   'tests/reliable-kernel/model-system-prompt-prefix.test.mjs',
   'tests/reliable-kernel/product-composition.test.mjs',
   'tests/llmErrorRedaction.test.cjs',
+  'tests/localFileResources.test.cjs',
   'tests/runAgentToolSchema.test.cjs',
   'tests/settingsRevisionConflict.test.cjs',
-  'tests/vscodeStorageJsonDurability.test.cjs'
+  'tests/vscodeStorageJsonDurability.test.cjs',
+  'tests/webviewLocalResources.test.cjs'
 ]);
 
 const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([

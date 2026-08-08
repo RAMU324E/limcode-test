@@ -5,7 +5,9 @@ import childProcess from 'node:child_process';
 
 const root = process.cwd();
 const CI_TEST_FILES = Object.freeze([
+  'tests/commandRelaxedPolicy.test.cjs',
   'tests/llmErrorRedaction.test.cjs',
+  'tests/localFileResources.test.cjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',
@@ -13,7 +15,8 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/product-composition.test.mjs',
   'tests/runAgentToolSchema.test.cjs',
   'tests/settingsRevisionConflict.test.cjs',
-  'tests/vscodeStorageJsonDurability.test.cjs'
+  'tests/vscodeStorageJsonDurability.test.cjs',
+  'tests/webviewLocalResources.test.cjs'
 ]);
 // The full local scan stays inside tests/reliable-kernel so retired world/file
 // tests cannot pull deleted modules back into the compiled closure. CI uses the

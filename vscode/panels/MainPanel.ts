@@ -10,7 +10,13 @@ import {
 } from '../../shared/protocol';
 import { displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { EXTENSION_AGENT_NAME, EXTENSION_BRAND, MAIN_PANEL_VIEW_TYPE, WEBVIEW_DEV_PORT } from '../../shared/extensionIdentity';
-import { getUnavailableWebviewHtml, getWebviewHtml } from '../webview/getWebviewHtml';
+import {
+  getUnavailableWebviewHtml,
+  getWebviewHtml,
+  getWebviewLocalResourceRoots,
+  getWebviewStaticResourceRoots,
+  resolveLocalFileSourceUri
+} from '../webview/getWebviewHtml';
 import {
   RELIABLE_KERNEL_ACK_MESSAGE,
   RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
@@ -105,7 +111,7 @@ export class MainPanel {
       MainPanel.viewType,
       panelTitle(options, backendApp),
       column,
-      MainPanel.webviewPanelOptions(extensionUri)
+      MainPanel.webviewPanelOptions(extensionUri, panelKind(options))
     );
 
     MainPanel.revive(panel, extensionUri, backendApp, options);
@@ -122,11 +128,16 @@ export class MainPanel {
     MainPanel.notifyConversationPanelStateChanged();
   }
 
-  private static webviewPanelOptions(extensionUri: vscode.Uri): vscode.WebviewPanelOptions & vscode.WebviewOptions {
+  private static webviewPanelOptions(
+    extensionUri: vscode.Uri,
+    kind: MainPanelKind
+  ): vscode.WebviewPanelOptions & vscode.WebviewOptions {
     return {
       enableScripts: true,
       retainContextWhenHidden: true,
-      localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'dist', 'webview')],
+      localResourceRoots: supportsLocalFileResources(kind)
+        ? getWebviewLocalResourceRoots(extensionUri)
+        : getWebviewStaticResourceRoots(extensionUri),
       portMapping: [{ webviewPort: WEBVIEW_DEV_PORT, extensionHostPort: WEBVIEW_DEV_PORT }]
     };
   }
@@ -152,10 +163,12 @@ export class MainPanel {
     this.planProposalId = options.planProposalId;
 
     this.refreshTitle(options.title);
-    this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri);
+    this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri, this.kind);
     this.clientId = this.backendApp.attachWebview(panel.webview, this.panelWebviewMeta());
 
-    this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri);
+    this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri, {
+      enableLocalFileResources: supportsLocalFileResources(this.kind)
+    });
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.onDidChangeViewState(() => MainPanel.notifyConversationPanelStateChanged(), null, this.disposables);
@@ -185,6 +198,10 @@ export class MainPanel {
           this.openPlanProposalFromPanel(message.payload);
           return;
         }
+        if (message.type === BridgeMessageType.LocalFileOpen && message.payload?.source) {
+          this.openLocalFileFromPanel(message.payload.source);
+          return;
+        }
         this.backendApp.handleWebviewMessage(this.clientId, message);
         this.refreshTitleFromOutgoingMessage(message);
       },
@@ -202,6 +219,19 @@ export class MainPanel {
       const disposable = this.disposables.pop();
       disposable?.dispose();
     }
+  }
+
+  private openLocalFileFromPanel(source: string): void {
+    if (!supportsLocalFileResources(this.kind)) return;
+    const uri = resolveLocalFileSourceUri(source, this.extensionUri);
+    if (!uri) {
+      void vscode.window.showWarningMessage(`无法解析本地文件路径：${source}`);
+      return;
+    }
+    void vscode.commands.executeCommand('vscode.open', uri).then(undefined, (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showWarningMessage(`无法打开本地文件：${message}`);
+    });
   }
 
   private createConversationFromPanel(projectFolderUri?: string): void {
@@ -347,6 +377,10 @@ async function resolveRestoredPanelOptions(
 
 function isDefaultConversationTitle(title: string): boolean {
   return title === '新对话' || title === '默认对话' || title === EXTENSION_BRAND || title.startsWith(`${EXTENSION_BRAND}: `);
+}
+
+function supportsLocalFileResources(kind: MainPanelKind): boolean {
+  return kind === 'chat' || kind === 'planDetail';
 }
 
 function optionsFromSerializedState(state: unknown, fallbackTitle: string): MainPanelOptions {

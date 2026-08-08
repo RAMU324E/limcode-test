@@ -3,7 +3,6 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import {
-  MAX_MESSAGE_ATTACHMENT_COUNT,
   type AgentRecord,
   type InlineDataPart,
   type LlmProviderConfigRecord,
@@ -386,10 +385,6 @@ async function addFilesAsAttachments(files: File[]): Promise<void> {
   const limitMb = globalSettings.attachments.maxStoredInlineFileMb || 20;
   for (const file of files) {
     let targetAttachments = attachmentSnapshots.value[targetMode];
-    if (targetAttachments.length >= MAX_MESSAGE_ATTACHMENT_COUNT) {
-      globalSettings.status = `每条消息最多添加 ${MAX_MESSAGE_ATTACHMENT_COUNT} 个附件。`;
-      break;
-    }
     const mimeType = attachmentMimeTypeForFile(file);
     if (!SUPPORTED_COMPOSER_MIME_TYPES.has(mimeType)) {
       globalSettings.status = `当前模型附件仅支持 PNG、JPEG、WebP、PDF 和纯文本；未添加 ${file.name}。`;
@@ -407,10 +402,6 @@ async function addFilesAsAttachments(files: File[]): Promise<void> {
     // FileReader can finish after the user switches between chat and edit. Commit to the bucket
     // selected when reading started, never whichever mode happens to be current after the await.
     targetAttachments = attachmentSnapshots.value[targetMode];
-    if (targetAttachments.length >= MAX_MESSAGE_ATTACHMENT_COUNT) {
-      globalSettings.status = `每条消息最多添加 ${MAX_MESSAGE_ATTACHMENT_COUNT} 个附件。`;
-      break;
-    }
     if (attachmentBytes(targetAttachments) + file.size > limitBytes) {
       globalSettings.status = `本条消息的附件总大小超过 ${limitMb}MB，未添加 ${file.name}。`;
       continue;

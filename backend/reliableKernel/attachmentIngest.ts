@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import {
-  MAX_MESSAGE_ATTACHMENT_COUNT,
   type AttachmentSettingsRecord,
   type InlineDataPart
 } from '../../shared/protocol';
@@ -20,7 +19,6 @@ import {
 import { RuntimeDatabase } from './runtimeDatabase';
 
 const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
-export const MAX_ATTACHMENTS_PER_MESSAGE = MAX_MESSAGE_ATTACHMENT_COUNT;
 
 export interface AttachmentSettingsAuthority {
   loadGlobalSettings(section: 'attachments'): Promise<{
@@ -168,11 +166,6 @@ export class AttachmentIngestService {
     if (enforceCurrentSettings) {
       const settings = await this.loadSettings();
       maxBytes = BigInt(settings.maxStoredInlineFileMb) * 1024n * 1024n;
-      if (context.references.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-        throw new AttachmentSizeLimitError(
-          `A message can contain at most ${MAX_ATTACHMENTS_PER_MESSAGE} attachments.`
-        );
-      }
     }
 
     const existingById = new Map<string, DomainRow>();

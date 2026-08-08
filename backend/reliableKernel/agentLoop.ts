@@ -1627,7 +1627,7 @@ function fallbackFrozenToolPolicy(
     : metadata?.readonly === true || metadata?.riskLevel === 'read';
   const schedulingMode = requestedScheduling === 'serial'
     ? 'serial'
-    : backendParallel ? 'parallel' : 'serial';
+    : requestedScheduling === 'parallel' || backendParallel ? 'parallel' : 'serial';
   const supportsChangeApply = metadata?.supportsChangeApply === true;
   const automaticChangeApply = supportsChangeApply && metadata?.defaultAutoApplyChange === true;
   const configuredDelay = optionalNonNegativeInteger(metadata?.defaultAutoApplyChangeDelaySeconds) ?? 0;
@@ -1645,12 +1645,12 @@ function fallbackFrozenToolPolicy(
     autoSubmitResult: metadata?.defaultAutoSubmitResult !== false,
     schedulingMode,
     schedulingReason: requestedScheduling === 'serial'
-      ? 'model_serial_tightening'
+      ? 'model_selected_serial'
+      : requestedScheduling === 'parallel'
+        ? 'model_selected_parallel'
       : backendParallel
         ? trustedCommand?.reason ?? 'frozen_readonly_metadata'
-        : requestedScheduling === 'parallel'
-          ? `model_parallel_rejected_${trustedCommand?.reason ?? 'frozen_default_serial'}`
-          : trustedCommand?.reason ?? 'frozen_default_serial'
+        : trustedCommand?.reason ?? 'frozen_default_serial'
   };
 }
 

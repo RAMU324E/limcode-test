@@ -1,6 +1,8 @@
 import MarkdownIt from 'markdown-it';
 import * as katex from 'katex';
 import texmath from 'markdown-it-texmath';
+import { LOCAL_FILE_LINK_DATA_ATTRIBUTE, normalizeLocalFileSource } from '@shared/localFileResources';
+import { toWebviewImageSrc } from './localImageSource';
 
 type MarkdownToken = {
   attrs: Array<[string, string]> | null;
@@ -30,6 +32,7 @@ type MarkdownParser = {
   render(text: string): string;
   parse(text: string, env: unknown): MarkdownToken[];
   use(plugin: unknown, options?: unknown): MarkdownParser;
+  validateLink(url: string): boolean;
   linkify?: {
     set(options: { fuzzyLink?: boolean; fuzzyIP?: boolean }): void;
   };
@@ -310,15 +313,32 @@ function createParser(MarkdownItCtor: MarkdownItConstructor): MarkdownParser {
   // 显式 Markdown 链接（[text](url)）仍由 markdown-it 正常处理。
   parser.linkify?.set({ fuzzyLink: false, fuzzyIP: false });
 
+  // markdown-it 默认拒绝 file:。本地图片会转换成 Webview 资源 URI，本地文件链接
+  // 则由点击事件交给 Extension Host 使用 vscode.open；脚本协议仍由默认校验拦截。
+  const defaultValidateLink = parser.validateLink.bind(parser);
+  parser.validateLink = (url: string) => /^file:/i.test(url.trim()) || defaultValidateLink(url);
+
   const defaultLinkOpen = parser.renderer.rules.link_open;
   parser.renderer.rules.link_open = (tokens, index, options, env, self) => {
-    setTokenAttr(tokens[index], 'target', '_blank');
-    setTokenAttr(tokens[index], 'rel', 'noreferrer noopener');
+    const hrefIndex = tokens[index].attrIndex('href');
+    const currentHref = hrefIndex >= 0 ? tokens[index].attrs?.[hrefIndex]?.[1] : undefined;
+    if (typeof currentHref === 'string' && normalizeLocalFileSource(currentHref)) {
+      setTokenAttr(tokens[index], LOCAL_FILE_LINK_DATA_ATTRIBUTE, currentHref);
+      setTokenAttr(tokens[index], 'href', '#');
+    } else {
+      setTokenAttr(tokens[index], 'target', '_blank');
+      setTokenAttr(tokens[index], 'rel', 'noreferrer noopener');
+    }
     return defaultLinkOpen ? defaultLinkOpen(tokens, index, options, env, self) : self.renderToken(tokens, index, options);
   };
 
   const defaultImage = parser.renderer.rules.image;
   parser.renderer.rules.image = (tokens, index, options, env, self) => {
+    const srcIndex = tokens[index].attrIndex('src');
+    const currentSrc = srcIndex >= 0 ? tokens[index].attrs?.[srcIndex]?.[1] : undefined;
+    if (typeof currentSrc === 'string') {
+      setTokenAttr(tokens[index], 'src', toWebviewImageSrc(currentSrc));
+    }
     setTokenAttr(tokens[index], 'loading', 'lazy');
     setTokenAttr(tokens[index], 'referrerpolicy', 'no-referrer');
     return defaultImage ? defaultImage(tokens, index, options, env, self) : self.renderToken(tokens, index, options);

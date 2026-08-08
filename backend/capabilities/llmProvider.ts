@@ -71,24 +71,6 @@ import type {
 
 export const DEFAULT_LLM_BASE_URL = 'https://api.openai.com/v1';
 const COMPRESSION_DEBUG_PREFIX = '[LimCode][CompressionDebug]';
-const SAFE_LLM_ERROR_METADATA_FIELDS = [
-  'transport',
-  'phase',
-  'closeCode',
-  'closeReason',
-  'closeWasClean',
-  'wasClean',
-  'receivedServerEvent',
-  'attempt',
-  'maxAttempts',
-  'transportAttemptsExhausted',
-  'retryable',
-  'code',
-  'status',
-  'statusCode',
-  'timeoutMs'
-] as const;
-
 type MaybeProvider<T, TArg = void> = T | undefined | ((arg: TArg) => T | undefined | Promise<T | undefined>);
 type LlmSettingsRequest = LlmStartRequest | LlmCompactRequest | LlmResolveInvocationRequest | undefined;
 type LlmCompressionSettingsProvider = (request: LlmCompactRequest) => LlmCompressionConfigRecord | undefined | Promise<LlmCompressionConfigRecord | undefined>;
@@ -814,9 +796,10 @@ function toPlainJsonLike(value: unknown, seen = new WeakSet<object>()): unknown 
       stack: value.stack
     };
     if (source.cause !== undefined) result.cause = toPlainJsonLike(source.cause, seen);
-    for (const key of SAFE_LLM_ERROR_METADATA_FIELDS) {
-      const child = source[key];
-      if (child !== undefined) result[key] = toPlainJsonLike(child, seen);
+    for (const [key, child] of Object.entries(source)) {
+      if (key === 'name' || key === 'message' || key === 'stack' || key === 'cause') continue;
+      if (isSensitiveLlmErrorField(key)) continue;
+      result[key] = toPlainJsonLike(child, seen);
     }
     return result;
   }
@@ -875,7 +858,12 @@ function isSensitiveLlmErrorField(key: string): boolean {
     || normalized.endsWith('apikey')
     || normalized === 'xapikey'
     || normalized === 'token'
-    || normalized.endsWith('token');
+    || normalized.endsWith('authtoken')
+    || normalized.endsWith('accesstoken')
+    || normalized.endsWith('refreshtoken')
+    || normalized.endsWith('sessiontoken')
+    || normalized.endsWith('bearertoken')
+    || normalized.endsWith('idtoken');
 }
 
 

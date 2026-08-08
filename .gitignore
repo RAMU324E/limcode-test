@@ -27,9 +27,12 @@ docs/architecture/*
 /tests/
 !/tests/
 /tests/*
+!/tests/commandRelaxedPolicy.test.cjs
 !/tests/llmErrorRedaction.test.cjs
+!/tests/localFileResources.test.cjs
 !/tests/runAgentToolSchema.test.cjs
 !/tests/settingsRevisionConflict.test.cjs
+!/tests/webviewLocalResources.test.cjs
 !/tests/reliable-kernel/
 /tests/reliable-kernel/*
 !/tests/reliable-kernel/configuration-authority.test.mjs

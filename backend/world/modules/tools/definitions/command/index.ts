@@ -65,16 +65,16 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           },
           readonly: {
             type: 'string',
-            description: 'Advisory hint that the command is read-only. The backend independently classifies the parsed command; this hint cannot make a command auto-approved or parallel-safe.'
+            description: 'Whether this command is read-only and does not modify files, system state, or network state. Use "true" for read-only commands; read-only commands may be auto-approved when the policy allows it.'
           },
           wait: {
             type: 'string',
-            description: 'Legacy scheduling hint. Prefer the scheduling field. "true" requests serial execution; "false" cannot make a backend-unsafe command parallel.'
+            description: 'Legacy scheduling hint. Prefer the scheduling field. "true" means serial and "false" means parallel when scheduling is omitted.'
           },
           scheduling: {
             type: 'string',
             enum: ['parallel', 'serial'],
-            description: 'Tool-call scheduling hint. serial always tightens execution; parallel is accepted only when the backend independently classifies the parsed command as parallel-safe.'
+            description: 'Tool-call scheduling mode. Explicit parallel/serial wins. Without a hint, output reads and recognized read-only commands may run in parallel; other commands remain serial.'
           }
         }
       },
@@ -85,7 +85,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
         readonly: false,
         defaultEnabled: true,
         requiresApproval: true,
-        defaultAutoApproveExecution: false,
+        defaultAutoApproveExecution: true,
         checkpoint: { before: true, after: true }
       },
       configSchema: {
@@ -108,7 +108,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             key: 'autoApproveReadonly',
             label: '只读命令自动跳过审批',
             type: 'boolean',
-            description: '开启后，即使未开启"自动批准执行"，仅由后端可信分类器确认的只读命令会自动批准；模型 readonly 提示不能触发自动批准。',
+            description: '开启后，即使未开启"自动批准执行"，被模型标记为只读(readonly=true)或被后端识别为只读的命令也会自动批准。',
             defaultValue: true
           }
         ]
@@ -230,23 +230,16 @@ function summarizeCommandToolCall(rawArgs: unknown): string | undefined {
   return explanation.replace(/\s+/g, ' ');
 }
 
-/** Backend classification is authoritative; model hints may only preserve or tighten it. */
+/** 显式调度提示优先；无提示时仍使用本地分类避免把所有命令盲目并行。 */
 function resolveCommandScheduling(rawArgs: unknown): { mode: 'parallel' | 'serial'; reason: string } {
   const args = isCommandArgsRecord(rawArgs) ? rawArgs : {};
   const classification = classifyCommandCall(rawArgs);
   const scheduling = normalizeSchedulingHint(args.scheduling);
+  if (scheduling !== 'auto') return { mode: scheduling, reason: `model_selected_${scheduling}` };
   const wait = typeof args.wait === 'string' ? args.wait.trim().toLowerCase() : '';
-  if (scheduling === 'serial') return { mode: 'serial', reason: 'model_serial_tightening' };
-  if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true_tightening' };
-  if (classification.parallelSafe) {
-    return { mode: 'parallel', reason: classification.reason };
-  }
-  if (scheduling === 'parallel') {
-    return { mode: 'serial', reason: `model_parallel_rejected_${classification.reason}` };
-  }
-  if (wait === 'false') {
-    return { mode: 'serial', reason: `legacy_wait_false_rejected_${classification.reason}` };
-  }
+  if (wait === 'false') return { mode: 'parallel', reason: 'legacy_wait_false' };
+  if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true' };
+  if (classification.parallelSafe) return { mode: 'parallel', reason: classification.reason };
   return { mode: 'serial', reason: classification.reason };
 }
 
@@ -258,8 +251,7 @@ export interface TrustedCommandClassification {
 }
 
 /**
- * Deterministic authority shared by command permission and scheduling decisions.
- * Model-provided readonly/parallel/wait=false values never widen this result.
+ * 本地分类用于没有显式提示时给出合理默认值，也保留给诊断和展示使用。
  */
 export function classifyCommandCall(rawArgs: unknown): TrustedCommandClassification {
   if (!isCommandArgsRecord(rawArgs)) {
@@ -290,9 +282,12 @@ export function classifyCommandCall(rawArgs: unknown): TrustedCommandClassificat
   };
 }
 
-/** True only when the backend classifier, rather than the model hint, proves readonly. */
+/** 接受模型的只读声明，同时保留后端对常见只读命令的自动识别。 */
 export function isReadonlyCommandCall(rawArgs: unknown): boolean {
-  return classifyCommandCall(rawArgs).readonly;
+  const args = isCommandArgsRecord(rawArgs) ? rawArgs : undefined;
+  const hintedReadonly = typeof args?.readonly === 'string'
+    && args.readonly.trim().toLowerCase() === 'true';
+  return hintedReadonly || classifyCommandCall(rawArgs).readonly;
 }
 
 const SHELL_CONTROL_PATTERN = /[;&|<>`$\n\r\0]/;

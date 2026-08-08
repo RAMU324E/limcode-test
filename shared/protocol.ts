@@ -91,6 +91,7 @@ export enum BridgeMessageType {
   PlanProposalOpen = 'planProposal.open',
   PlanProposalExport = 'planProposal.export',
   CheckpointDiffOpen = 'checkpoint.diff.open',
+  LocalFileOpen = 'localFile.open',
   AttachmentOpen = 'attachment.open',
   AttachmentOpenResult = 'attachment.open.result',
   AttachmentReload = 'attachment.reload',
@@ -1508,7 +1509,6 @@ export interface FunctionResponsePart {
   durationMs?: number;
 }
 
-export const MAX_MESSAGE_ATTACHMENT_COUNT = 8;
 export type AttachmentStorageMode = 'embedded' | 'managed' | 'localPath';
 export type AttachmentAvailabilityStatus = 'available' | 'loading' | 'missing' | 'tooLarge' | 'unsupported' | 'failed';
 
@@ -2732,6 +2732,10 @@ export interface WorkEnvironmentPolicyScopeClearPayload {
   scopeId?: string;
 }
 
+export interface LocalFileOpenPayload {
+  source: string;
+}
+
 export interface AttachmentOpenPayload {
   attachmentId?: string;
   sourcePath?: string;
@@ -2799,6 +2803,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.PlanProposalOpen, PlanProposalOpenPayload>
   | BridgeEnvelope<BridgeMessageType.PlanProposalExport, PlanProposalExportPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpen, CheckpointDiffOpenPayload>
+  | BridgeEnvelope<BridgeMessageType.LocalFileOpen, LocalFileOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentOpen, AttachmentOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReload, AttachmentReloadPayload>
   | BridgeEnvelope<BridgeMessageType.ClientResync, ClientResyncPayload>
