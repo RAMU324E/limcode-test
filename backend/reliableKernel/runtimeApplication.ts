@@ -344,6 +344,8 @@ export class ReliableKernelApplication {
     const phaseD = await this.phaseDRecovery.runAll(signal);
     const phaseF = await this.runtime.recovery.runAll(signal);
     signal?.throwIfAborted();
+    await this.processes.cleanupArchivedSpools(signal);
+    signal?.throwIfAborted();
     await this.childOwnedProcessCleanup.start();
     // Orphan tool-pair cleanup is an explicit cutover/diagnostic maintenance command. Runtime
     // mutations are transactionally closed now, so rescanning and materializing every Context

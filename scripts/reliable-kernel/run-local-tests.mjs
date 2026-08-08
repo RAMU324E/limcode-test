@@ -7,8 +7,10 @@ const root = process.cwd();
 const CI_TEST_FILES = Object.freeze([
   'tests/bottomStickyScrollerScheduler.test.cjs',
   'tests/commandRelaxedPolicy.test.cjs',
+  'tests/fileWatcherScope.test.cjs',
   'tests/llmErrorRedaction.test.cjs',
   'tests/localFileResources.test.cjs',
+  'tests/processSpoolCleanup.test.cjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',

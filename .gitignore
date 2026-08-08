@@ -29,8 +29,10 @@ docs/architecture/*
 /tests/*
 !/tests/bottomStickyScrollerScheduler.test.cjs
 !/tests/commandRelaxedPolicy.test.cjs
+!/tests/fileWatcherScope.test.cjs
 !/tests/llmErrorRedaction.test.cjs
 !/tests/localFileResources.test.cjs
+!/tests/processSpoolCleanup.test.cjs
 !/tests/runAgentToolSchema.test.cjs
 !/tests/settingsRevisionConflict.test.cjs
 !/tests/webviewLocalResources.test.cjs

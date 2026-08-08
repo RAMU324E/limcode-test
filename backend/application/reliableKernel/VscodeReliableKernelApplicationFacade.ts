@@ -414,10 +414,6 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return page;
   }
 
-  public getConversationHistoryRootUri(): vscode.Uri {
-    return vscode.Uri.file(path.dirname(this.product.application.database.binding.paths.rootPointerPath));
-  }
-
   public getCurrentProjectHistoryScope(): ConversationHistoryScope {
     const folder = this.currentWorkspaceFolder();
     return folder ? { kind: 'project', folderUri: folder.uri.toString() } : { kind: 'unbound' };

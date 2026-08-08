@@ -1,14 +1,15 @@
 import * as vscode from 'vscode';
 import type { ApplicationFacade } from '../ApplicationFacade';
 import type { GlobalSettingsSection } from '../../shared/protocol';
+import { SETTINGS_ROOT_DIR } from '../../backend/capabilities/vscodeStorage/constants';
 import { LIMCODE_GLOBAL_STATUS_FILE } from '../../backend/capabilities/vscodeStorage/globalStatus';
 
-/** 只监听全局设置白名单，避免把会话文件变化误当成设置变化。 */
-const GLOBAL_SETTINGS_WATCH_PATTERNS = [
-  'settings/{llm,llm-compression,appearance,attachments,checkpoint-maintenance}.json',
-  'settings/llm-provider-configs/**/*.json',
-  'settings/llm-compression-configs/**/*.json',
-  'settings/mcp-servers/**/*.json'
+/** 每个递归监听都从自己的小目录开始，避免扫描整个插件数据目录。 */
+const GLOBAL_SETTINGS_WATCH_SPECS = [
+  { baseSegments: [], pattern: '{llm,llm-compression,appearance,attachments,checkpoint-maintenance}.json' },
+  { baseSegments: ['llm-provider-configs'], pattern: '**/*.json' },
+  { baseSegments: ['llm-compression-configs'], pattern: '**/*.json' },
+  { baseSegments: ['mcp-servers'], pattern: '**/*.json' }
 ] as const;
 
 const FILE_NAME_SECTIONS: Record<string, GlobalSettingsSection> = {
@@ -47,9 +48,10 @@ class GlobalSettingsWatcher implements vscode.Disposable {
   ) {}
 
   public start(): void {
-    const root = this.application.getStorageRootUri();
-    for (const pattern of GLOBAL_SETTINGS_WATCH_PATTERNS) {
-      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, pattern));
+    const settingsRoot = vscode.Uri.joinPath(this.application.getStorageRootUri(), SETTINGS_ROOT_DIR);
+    for (const spec of GLOBAL_SETTINGS_WATCH_SPECS) {
+      const base = vscode.Uri.joinPath(settingsRoot, ...spec.baseSegments);
+      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(base, spec.pattern));
       const schedule = (uri: vscode.Uri) => this.schedule(uri);
       watcher.onDidCreate(schedule);
       watcher.onDidChange(schedule);

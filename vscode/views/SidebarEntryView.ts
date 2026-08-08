@@ -85,8 +85,6 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
   private lastProjectFolderUri: string | undefined;
   private lastCursor: string | undefined;
   private activeWebview: vscode.Webview | undefined;
-  private historyWatcher: vscode.FileSystemWatcher | undefined;
-  private historyWatcherRoot: string | undefined;
   private historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private historyRequestSeq = 0;
   private lastStateMessage: SidebarStateMessage | undefined;
@@ -108,8 +106,6 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
         vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview')
       ]
     };
-
-    this.ensureConversationHistoryWatcher();
 
     webviewView.webview.onDidReceiveMessage((message: SidebarWebviewMessage) => {
       if (message.type === OPEN_CONVERSATION_MESSAGE && message.conversationId) {
@@ -220,29 +216,9 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
 
   private postSidebarStateWhenReady(webview: vscode.Webview, scopeKind: SidebarHistoryScopeKind = 'currentProject', cursor?: string, limit?: number, projectFolderUri?: string): Promise<void> {
     this.activeWebview = webview;
-    this.ensureConversationHistoryWatcher();
     const requestSeq = ++this.historyRequestSeq;
     return this.postSidebarState(webview, scopeKind, cursor, limit, projectFolderUri, requestSeq)
       .catch((error) => console.warn('[LimCode] Failed to read sidebar state.', error));
-  }
-
-  private ensureConversationHistoryWatcher(): void {
-    const root = this.backendApp.getConversationHistoryRootUri();
-    const rootKey = root.toString();
-    if (this.historyWatcher && this.historyWatcherRoot === rootKey) return;
-
-    this.historyWatcher?.dispose();
-    this.historyWatcherRoot = rootKey;
-    void Promise.resolve(vscode.workspace.fs.createDirectory(root)).catch((error: unknown) => {
-      console.warn('[LimCode] Failed to ensure conversation history watcher root.', error);
-    });
-
-    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, '**/*.json'));
-    const schedule = () => this.scheduleConversationHistoryRefresh();
-    watcher.onDidCreate(schedule);
-    watcher.onDidChange(schedule);
-    watcher.onDidDelete(schedule);
-    this.historyWatcher = watcher;
   }
 
   private scheduleConversationHistoryRefresh(): void {

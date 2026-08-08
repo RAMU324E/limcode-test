@@ -3915,6 +3915,8 @@ function executeProcessOutputRegistrationMismatches(
      GROUP BY process.id, process.retained_chunks, process.retained_bytes
     HAVING COUNT(chunk.id) <> process.retained_chunks
         OR COALESCE(SUM(chunk.byte_length), 0) <> process.retained_bytes
+        OR (process.retained_chunks > 0 AND MIN(chunk.chunk_seq) <> 1)
+        OR (process.retained_chunks > 0 AND MAX(chunk.chunk_seq) <> process.retained_chunks)
      ORDER BY process.id ASC
   `).all() as Array<{
     process_id: string;

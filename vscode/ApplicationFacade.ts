@@ -53,7 +53,6 @@ export interface ApplicationFacade {
     cursor?: string;
     limit?: number;
   }): Promise<ConversationHistoryPageRecord>;
-  getConversationHistoryRootUri(): vscode.Uri;
   getCurrentProjectHistoryScope(): ConversationHistoryScope;
   getProjectFolderCandidates(): ProjectFolderCandidateRecord[];
 

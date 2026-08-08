@@ -371,6 +371,12 @@ export class ProcessCompletionDeliveryControlPlane {
       conversationId,
       sourceLink: source
     });
+    await this.processes.cleanupArchivedSpool(processId).catch((error) => {
+      console.warn(
+        `[reliable-kernel] failed to clean delivered process spool ${processId}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    });
     const delivery = await this.ensureDeliveryFacts(completion.inboxItem, {
       conversationId,
       sourceTurnId

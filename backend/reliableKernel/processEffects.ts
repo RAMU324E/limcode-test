@@ -225,6 +225,13 @@ export const PROCESS_START_INLINE_OUTPUT_MAX_BYTES = 16 * 1024;
 const PROCESS_OUTPUT_HANDLE_PREFIX = 'rk-process-output:';
 const PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS = 4;
 const PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL = 4;
+const PROCESS_SPOOL_CLEANUP_BATCH_SIZE = 24;
+const ARCHIVABLE_PROCESS_STATUSES = new Set([
+  'exited',
+  'cancelled',
+  'timed_out',
+  'output_limit_exceeded'
+]);
 
 export interface ProcessControlPlaneOptions {
   now?: () => string;
@@ -235,6 +242,14 @@ export interface ProcessExitObserverInspection {
   enabled: boolean;
   closing: boolean;
   activeProcessIds: string[];
+}
+
+export interface ProcessSpoolCleanupReport {
+  scanned: number;
+  removed: number;
+  alreadyAbsent: number;
+  retained: number;
+  failed: number;
 }
 
 /** Process domain orchestration; the detached wrapper remains the external process authority. */
@@ -530,12 +545,21 @@ export class ProcessControlPlane {
     } else {
       detail = processStartFailureModelDetail(observation);
     }
-    return this.effects.recordToolModelDetail({
+    const terminal = await this.effects.recordToolModelDetail({
       source: { kind: 'internal', key: `process-start-model-detail:${effectReceiptId}` },
       toolCallId,
       status: outcome,
       detail
     });
+    if (observation.foreground?.state === 'exited') {
+      await this.cleanupArchivedSpool(request.processId).catch((error) => {
+        console.warn(
+          `[reliable-kernel] failed to clean completed foreground process spool ${request.processId}:`,
+          errorMessage(error)
+        );
+      });
+    }
+    return terminal;
   }
 
   public async prepareStop(input: {
@@ -856,6 +880,78 @@ export class ProcessControlPlane {
     return this.reconcileOutputBounded(processId, Number.POSITIVE_INFINITY);
   }
 
+  /** Removes one terminal spool only after its receipt and complete durable output prefix exist. */
+  public async cleanupArchivedSpool(
+    processIdInput: string
+  ): Promise<'removed' | 'already_absent' | 'retained'> {
+    const processId = requireId(processIdInput, 'processId');
+    await this.validateBinding();
+    const processRow = await this.requireExisting('Process', processId);
+    if (!ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))) return 'retained';
+    const receipts = await this.list('ProcessReceipt', { process_id: processId }, 2);
+    if (receipts.length !== 1 || !processReceiptMatchesProcess(processRow, receipts[0]!)) return 'retained';
+    if (!await this.terminalOutputIsFullyRegistered(processRow)) return 'retained';
+    return this.removeArchivedSpool(processRow);
+  }
+
+  /**
+   * Startup sweep for spools left behind by a previous Host. Incomplete output is first imported
+   * from the spool; ambiguous and unreadable entries stay in place for a later recovery pass.
+   */
+  public async cleanupArchivedSpools(signal?: AbortSignal): Promise<ProcessSpoolCleanupReport> {
+    signal?.throwIfAborted();
+    await this.validateBinding();
+    const [processRows, receiptRows, mismatches] = await Promise.all([
+      listAllDomainRows(this.database, 'Process'),
+      listAllDomainRows(this.database, 'ProcessReceipt'),
+      this.database.processOutputRegistrationMismatches()
+    ]);
+    const receiptsByProcess = new Map<string, DomainRow[]>();
+    for (const receipt of receiptRows) {
+      const processId = requireId(receipt.process_id, 'ProcessReceipt.process_id');
+      const current = receiptsByProcess.get(processId) ?? [];
+      current.push(receipt);
+      receiptsByProcess.set(processId, current);
+    }
+    const mismatchIds = new Set(mismatches.map((entry) => entry.processId));
+    const candidates = processRows.filter((row) => ARCHIVABLE_PROCESS_STATUSES.has(String(row.status)));
+    const report: ProcessSpoolCleanupReport = {
+      scanned: candidates.length,
+      removed: 0,
+      alreadyAbsent: 0,
+      retained: 0,
+      failed: 0
+    };
+
+    for (let offset = 0; offset < candidates.length; offset += PROCESS_SPOOL_CLEANUP_BATCH_SIZE) {
+      signal?.throwIfAborted();
+      await this.validateBinding();
+      const batch = candidates.slice(offset, offset + PROCESS_SPOOL_CLEANUP_BATCH_SIZE);
+      const outcomes = await Promise.all(batch.map(async (processRow): Promise<keyof Omit<ProcessSpoolCleanupReport, 'scanned'>> => {
+        const processId = requireId(processRow.id, 'Process.id');
+        const receipts = receiptsByProcess.get(processId) ?? [];
+        if (receipts.length !== 1 || !processReceiptMatchesProcess(processRow, receipts[0]!)) return 'retained';
+        if (mismatchIds.has(processId)) {
+          try {
+            await this.reconcileOutput(processId);
+          } catch (error) {
+            console.warn(`[reliable-kernel] retained incomplete process spool ${processId}:`, errorMessage(error));
+            return 'failed';
+          }
+        }
+        try {
+          const outcome = await this.removeArchivedSpool(processRow);
+          return outcome === 'removed' ? 'removed' : 'alreadyAbsent';
+        } catch (error) {
+          console.warn(`[reliable-kernel] failed to clean archived process spool ${processId}:`, errorMessage(error));
+          return 'failed';
+        }
+      }));
+      for (const outcome of outcomes) report[outcome] += 1;
+    }
+    return report;
+  }
+
   private async reconcileOutputBounded(processId: string, maxAttempts: number): Promise<ReconciledOutput> {
     await this.validateBinding();
     // A concurrent exit/import may make a selected running manifest stale. Restart only when the
@@ -863,6 +959,12 @@ export class ProcessControlPlane {
     // progress and there is no retry count or retained-output ceiling.
     for (let attempt = 1; ; attempt += 1) {
       const processRow = await this.requireExisting('Process', processId);
+      if (
+        ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))
+        && await this.terminalOutputIsFullyRegistered(processRow)
+      ) {
+        return { ...processRowOutputCounters(processRow), insertedChunks: 0 };
+      }
       const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
       await this.requireMatchingSpoolEvidence(processRow, spoolPath);
       const manifest = await this.readManifest(spoolPath, processRow);
@@ -893,6 +995,10 @@ export class ProcessControlPlane {
         return processDetailDurablePrefix(processRowOutputCounters(current));
       }
       const processRow = await this.requireExisting('Process', processId);
+      if (
+        ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))
+        && await this.terminalOutputIsFullyRegistered(processRow)
+      ) return processDetailDurablePrefix(processRowOutputCounters(processRow));
       const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
       await this.requireMatchingSpoolEvidence(processRow, spoolPath);
       const manifest = await this.readManifest(spoolPath, processRow);
@@ -1762,6 +1868,44 @@ export class ProcessControlPlane {
     }
   }
 
+  private async terminalOutputIsFullyRegistered(processRow: DomainRow): Promise<boolean> {
+    const processId = requireId(processRow.id, 'Process.id');
+    const counters = processRowOutputCounters(processRow);
+    const rows = await listAllDomainRows(this.database, 'ProcessOutputChunk', { process_id: processId });
+    if (BigInt(rows.length) !== counters.retainedChunks) return false;
+    const sequences = new Set<string>();
+    let registeredBytes = 0n;
+    for (const row of rows) {
+      const chunkSeq = requireBigInt(row.chunk_seq, 'ProcessOutputChunk.chunk_seq');
+      if (chunkSeq <= 0n || chunkSeq > counters.retainedChunks) return false;
+      validateRegisteredProcessOutputChunk(row, processId, chunkSeq);
+      sequences.add(chunkSeq.toString());
+      registeredBytes += requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length');
+    }
+    return BigInt(sequences.size) === counters.retainedChunks
+      && registeredBytes === counters.retainedBytes;
+  }
+
+  private async removeArchivedSpool(
+    processRow: DomainRow
+  ): Promise<'removed' | 'already_absent'> {
+    const spoolPath = processSpoolPath(
+      this.binding,
+      requireText(processRow.spool_locator, 'Process.spool_locator')
+    );
+    try {
+      const stat = await fs.lstat(spoolPath);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error(`Archived process spool is not a plain directory: ${spoolPath}`);
+      }
+      await fs.rm(spoolPath, { recursive: true, force: false, maxRetries: 2, retryDelay: 20 });
+      return 'removed';
+    } catch (error) {
+      if (isNotFound(error)) return 'already_absent';
+      throw error;
+    }
+  }
+
   private async requireMatchingSpoolEvidence(processRow: DomainRow, spoolPath: string): Promise<void> {
     try {
       const receipt = parseWrapperExitReceipt(await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)));
@@ -2445,6 +2589,18 @@ function processTerminalStatus(receipt: ProcessWrapperExitReceipt): string {
   if (receipt.terminationReason === 'timed_out') return 'timed_out';
   if (receipt.terminationReason === 'output_limit_exceeded') return 'output_limit_exceeded';
   return 'exited';
+}
+
+function processReceiptMatchesProcess(processRow: DomainRow, receipt: DomainRow): boolean {
+  if (
+    receipt.process_id !== processRow.id
+    || receipt.wrapper_nonce !== processRow.wrapper_nonce
+    || receipt.start_fingerprint !== processRow.start_fingerprint
+  ) return false;
+  if (processRow.status === 'cancelled') return receipt.outcome === 'cancelled';
+  if (processRow.status === 'timed_out') return receipt.outcome === 'timed_out';
+  if (processRow.status === 'output_limit_exceeded') return receipt.outcome === 'output_limit_exceeded';
+  return processRow.status === 'exited' && (receipt.outcome === 'succeeded' || receipt.outcome === 'failed');
 }
 
 function persistedTerminationReason(outcome: ProcessReceiptTerminalOutcome): ProcessTerminationReason {
