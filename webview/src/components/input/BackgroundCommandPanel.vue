@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { IconTerminal2, IconX } from '@tabler/icons-vue';
+import { IconPlayerStop, IconTerminal2, IconX } from '@tabler/icons-vue';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
+import { bridge, BridgeMessageType } from '@webview/transport';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import {
   parseShellCallArgs,
@@ -14,7 +16,7 @@ interface CommandEntry {
   toolCallId: string;
   shell: string;
   command: string;
-  commandState: 'loading' | 'ready' | 'empty' | 'error';
+  commandState: 'loading' | 'ready' | 'preview' | 'empty' | 'unavailable' | 'error';
   cwd?: string;
   foregroundWaitMs?: number;
   mode: string;
@@ -38,16 +40,36 @@ interface CommandEntry {
 type ReliableRecord = Record<string, unknown>;
 
 const reliableConversation = useReliableConversation();
+const interactions = useInteractionStore();
 const open = ref(false);
 const selectedProcessId = ref<string>();
 const rootRef = ref<HTMLElement | null>(null);
 const listScroller = ref<HTMLElement | null>(null);
 const detailScroller = ref<HTMLElement | null>(null);
 let outputRefreshTimer: ReturnType<typeof setInterval> | undefined;
+const stopFeedback = ref<Record<string, {
+  requestId: string;
+  phase: 'submitting' | 'committed' | 'failed';
+  message: string;
+}>>({});
+const disposeStopError = bridge.on(BridgeMessageType.Error, (message) => {
+  if (message.payload?.requestType !== BridgeMessageType.ProcessStop) return;
+  const entry = Object.entries(stopFeedback.value)
+    .find(([, feedback]) => feedback.requestId === message.correlationId);
+  if (!entry) return;
+  const [processId, feedback] = entry;
+  stopFeedback.value = {
+    ...stopFeedback.value,
+    [processId]: { ...feedback, phase: 'failed', message: message.payload.message || '停止进程失败' }
+  };
+});
 
 const entries = computed<CommandEntry[]>(buildCommandEntries);
 const runningCount = computed(() => entries.value.filter((entry) => entry.statusTone === 'running').length);
 const selectedEntry = computed(() => entries.value.find((entry) => entry.processId === selectedProcessId.value) ?? entries.value[0]);
+const selectedStopFeedback = computed(() => selectedEntry.value
+  ? stopFeedback.value[selectedEntry.value.processId]
+  : undefined);
 const panelSummary = computed(() => {
   if (entries.value.length === 0) return '暂无后台命令';
   return runningCount.value > 0
@@ -86,6 +108,44 @@ watch(
 );
 
 watch(
+  () => Object.entries(stopFeedback.value).map(([processId, feedback]) => {
+    const result = interactions.resultFor(processId, feedback.requestId);
+    return `${processId}:${feedback.requestId}:${result?.observedAt ?? 0}`;
+  }).join('|'),
+  () => {
+    for (const [processId, feedback] of Object.entries(stopFeedback.value)) {
+      const result = interactions.resultFor(processId, feedback.requestId)?.payload;
+      if (!result) continue;
+      const committed = result.status === 'committed'
+        || result.status === 'already_applied'
+        || result.status === 'already_satisfied';
+      stopFeedback.value = {
+        ...stopFeedback.value,
+        [processId]: {
+          ...feedback,
+          phase: committed ? 'committed' : 'failed',
+          message: committed
+            ? result.status === 'already_satisfied' ? '进程已经结束' : '停止请求已提交'
+            : result.reason?.trim() || '停止进程未能完成'
+        }
+      };
+    }
+  }
+);
+
+watch(entries, (current) => {
+  const next = { ...stopFeedback.value };
+  let changed = false;
+  for (const [processId, feedback] of Object.entries(next)) {
+    const entry = current.find((candidate) => candidate.processId === processId);
+    if (entry?.running || feedback.phase === 'failed') continue;
+    delete next[processId];
+    changed = true;
+  }
+  if (changed) stopFeedback.value = next;
+});
+
+watch(
   () => {
     const process = reliableConversation.feed.records.Process?.[selectedProcessId.value ?? ''];
     return `${open.value ? 'open' : 'closed'}:${selectedProcessId.value ?? ''}:${decimal(process?.retained_chunks) ?? '0'}:${text(process?.updated_at) ?? ''}`;
@@ -102,9 +162,26 @@ watch(
 
 onMounted(() => document.addEventListener('pointerdown', onDocumentPointerDown, true));
 onBeforeUnmount(() => {
+  disposeStopError();
   document.removeEventListener('pointerdown', onDocumentPointerDown, true);
   if (outputRefreshTimer !== undefined) clearInterval(outputRefreshTimer);
 });
+
+function stopSelectedProcess(): void {
+  const entry = selectedEntry.value;
+  if (!entry?.running || stopFeedback.value[entry.processId]?.phase === 'submitting') return;
+  const requestId = bridge.request(BridgeMessageType.ProcessStop, {
+    processId: entry.processId,
+    ...(reliableConversation.conversationId.value
+      ? { conversationId: reliableConversation.conversationId.value }
+      : {}),
+    reason: '用户从后台命令面板停止进程。'
+  });
+  stopFeedback.value = {
+    ...stopFeedback.value,
+    [entry.processId]: { requestId, phase: 'submitting', message: '正在停止进程' }
+  };
+}
 
 function toggleOpen(): void {
   open.value = !open.value;
@@ -132,6 +209,8 @@ function ensureOutputDetails(): void {
     const key = reliableKernelDetailKey(kind, selectedProcessId.value);
     if (reliableConversation.feed.details[key]?.status === 'ready') {
       reliableConversation.feed.refreshDetail(kind, selectedProcessId.value, { priority: 'expanded' });
+    } else if (reliableConversation.feed.details[key]?.status === 'error') {
+      reliableConversation.feed.retryDetail(kind, selectedProcessId.value, { priority: 'expanded' });
     } else {
       reliableConversation.feed.requestDetail(kind, selectedProcessId.value, { priority: 'expanded' });
     }
@@ -141,7 +220,15 @@ function ensureOutputDetails(): void {
 function ensureCommandDetail(): void {
   if (!open.value) return;
   const toolCallId = selectedEntry.value?.toolCallId;
-  if (toolCallId) reliableConversation.feed.requestDetail('tool-arguments-content', toolCallId, { priority: 'expanded' });
+  if (!toolCallId) return;
+  const detail = reliableConversation.feed.details[
+    reliableKernelDetailKey('tool-arguments-content', toolCallId)
+  ];
+  if (detail?.status === 'error') {
+    reliableConversation.feed.retryDetail('tool-arguments-content', toolCallId, { priority: 'expanded' });
+  } else {
+    reliableConversation.feed.requestDetail('tool-arguments-content', toolCallId, { priority: 'expanded' });
+  }
 }
 
 function buildCommandEntries(): CommandEntry[] {
@@ -166,16 +253,21 @@ function buildCommandEntries(): CommandEntry[] {
       const argumentDetail = reliableConversation.feed.details[
         reliableKernelDetailKey('tool-arguments-content', toolCallId)
       ];
-      const args = argumentDetail?.status === 'ready'
+      const detailArgs = argumentDetail?.status === 'ready'
         ? parseShellCallArgs(argumentDetail.text)
         : {} as ShellArgs;
-      const command = args.command?.trim();
-      const commandState: CommandEntry['commandState'] = argumentDetail?.status === 'error'
-        || process.command_arguments_state === 'error'
-        ? 'error'
-        : argumentDetail?.status !== 'ready'
-          ? 'loading'
-          : command ? 'ready' : 'empty';
+      const fallbackArgs = call ? parseShellCallArgs(call.args) : {} as ShellArgs;
+      const args = argumentDetail?.status === 'ready' ? detailArgs : fallbackArgs;
+      const command = args.command?.trim() || text(process.command_preview)?.trim();
+      const commandState: CommandEntry['commandState'] = argumentDetail?.status === 'ready'
+        ? command ? 'ready' : 'empty'
+        : command
+          ? 'preview'
+          : argumentDetail?.status === 'error' || process.command_arguments_state === 'error'
+            ? 'error'
+            : argumentDetail?.status === 'loading' && processId === selectedProcessId.value
+              ? 'loading'
+              : 'unavailable';
       const output = processId === selectedProcessId.value
         ? materializeOutput(processId)
         : { stdout: '', stderr: '', loading: false };
@@ -190,8 +282,10 @@ function buildCommandEntries(): CommandEntry[] {
         command: commandState === 'error'
           ? '(命令正文读取失败)'
           : commandState === 'loading'
-            ? '(命令正文加载中…)'
-            : command || '(未记录命令正文)',
+            ? '(正在读取命令正文…)'
+            : commandState === 'unavailable'
+              ? '(命令正文暂不可用，选择后读取)'
+              : command || '(未记录命令正文)',
         commandState,
         ...(args.cwd ? { cwd: args.cwd } : {}),
         ...(args.foregroundWaitMs !== undefined ? { foregroundWaitMs: args.foregroundWaitMs } : {}),
@@ -221,10 +315,13 @@ function buildCommandEntries(): CommandEntry[] {
 function materializeOutput(processId: string): { stdout: string; stderr: string; loading: boolean } {
   const stdout = reliableConversation.feed.details[reliableKernelDetailKey('process-stdout', processId)];
   const stderr = reliableConversation.feed.details[reliableKernelDetailKey('process-stderr', processId)];
+  const stdoutText = stdout?.status === 'ready' || stdout?.status === 'loading' ? stdout.text : '';
+  const stderrText = stderr?.status === 'ready' || stderr?.status === 'loading' ? stderr.text : '';
+  const initialLoading = stdout?.status === 'loading' || stderr?.status === 'loading';
   return {
-    stdout: stdout?.status === 'ready' || stdout?.status === 'loading' ? stdout.text : '',
-    stderr: stderr?.status === 'ready' || stderr?.status === 'loading' ? stderr.text : '',
-    loading: stdout?.status === 'loading' || stderr?.status === 'loading'
+    stdout: stdoutText,
+    stderr: stderrText,
+    loading: initialLoading && !stdoutText && !stderrText
   };
 }
 
@@ -347,7 +444,21 @@ function timestamp(value: unknown): number {
           <header class="command-detail-header">
             <span class="command-status" :class="`is-${selectedEntry.statusTone}`">{{ selectedEntry.statusLabel }}</span>
             <span class="command-detail-id">{{ selectedEntry.processId }}</span>
+            <button
+              v-if="selectedEntry.running"
+              type="button"
+              class="command-process-stop"
+              :disabled="selectedStopFeedback?.phase === 'submitting' || selectedStopFeedback?.phase === 'committed'"
+              :aria-label="selectedStopFeedback?.message || '停止这个后台进程，不中断整个对话'"
+              @click="stopSelectedProcess"
+            >
+              <IconPlayerStop stroke="2" aria-hidden="true" />
+              <span>{{ selectedStopFeedback?.phase === 'submitting' ? '停止中' : selectedStopFeedback?.phase === 'committed' ? '已提交' : '停止进程' }}</span>
+            </button>
           </header>
+          <p v-if="selectedStopFeedback?.phase === 'failed'" class="command-stop-error">
+            {{ selectedStopFeedback.message }}
+          </p>
           <div class="command-detail-scroll-shell">
             <div ref="detailScroller" class="command-detail-scroll">
               <section class="command-detail-section">
@@ -662,7 +773,7 @@ function timestamp(value: unknown): number {
   font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Consolas, monospace);
 }
 
-.command-log-consume {
+.command-process-stop {
   flex: 0 0 auto;
   margin-left: auto;
   padding: 2px 7px;
@@ -671,14 +782,35 @@ function timestamp(value: unknown): number {
   color: var(--vscode-descriptionForeground);
   background: transparent;
   font-size: var(--font-size-xs);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
-.command-log-consume:hover,
-.command-log-consume:focus-visible {
+.command-process-stop:hover,
+.command-process-stop:focus-visible {
   color: var(--vscode-errorForeground);
   border-color: color-mix(in srgb, var(--vscode-errorForeground) 55%, var(--vscode-panel-border) 45%);
   background: color-mix(in srgb, var(--vscode-errorForeground) 8%, transparent);
   outline: none;
+}
+
+.command-process-stop:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.command-process-stop svg {
+  width: 14px;
+  height: 14px;
+}
+
+.command-stop-error {
+  margin: 0;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.22));
+  color: var(--vscode-errorForeground);
+  font-size: var(--font-size-xs);
 }
 
 .command-detail-scroll-shell {

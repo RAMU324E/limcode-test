@@ -6,12 +6,19 @@ import { useReliableConversation } from '@webview/composables/useReliableConvers
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useReliableTimelinePresentationStore } from '@webview/stores/useReliableTimelinePresentationStore';
-import { projectReliableCompressionTimeline } from '@webview/domain/reliableCompressionProjection';
+import {
+  parseReliableCompressionRequestPurpose,
+  projectReliableCompressionTimeline
+} from '@webview/domain/reliableCompressionProjection';
 import {
   reliableKernelDetailDemandSignature,
   reliableKernelDetailKey
 } from '@webview/domain/reliableDetailKey';
-import { hasVisibleStreamingTransientForTurn } from '@webview/domain/reliableTransientActivity';
+import {
+  hasVisibleStreamingTransientForRequestAttempt,
+  hasVisibleStreamingTransientForTurn,
+  reliableRetryStreamingActivityLabel
+} from '@webview/domain/reliableTransientActivity';
 import MessageItem from './MessageItem.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
@@ -48,6 +55,11 @@ const globalSettings = useGlobalSettingsStore();
 const modelProfiles = useModelProfileStore();
 const timelinePresentation = useReliableTimelinePresentationStore();
 const messages = computed(() => projection.value.messages);
+const mountedTransientRequestIds = computed(() => new Set(messages.value.flatMap((message) =>
+  message.id.startsWith('transient:')
+    ? [message.id.slice('transient:'.length)]
+    : []
+)));
 const compressionBlocks = computed(() => Object.values(feed.records.CompressionBlock ?? {})
   .filter((block) => block.conversation_id === conversationId.value && block.status !== 'soft_deleted')
   .filter((block) => !timelinePresentation.isSuppressed(
@@ -58,15 +70,42 @@ const compressionBlocks = computed(() => Object.values(feed.records.CompressionB
   .sort((left, right) => String(left.created_at ?? '').localeCompare(String(right.created_at ?? ''))));
 const segmentStart = ref(0);
 const followLatestSegment = ref(true);
+const pendingHistoryAnchorId = ref<string | null>(null);
 const visibleTimelineRows = computed(() => messages.value.slice(
   segmentStart.value,
   segmentStart.value + TIMELINE_MOUNT_LIMIT
 ));
-const hasEarlierSegment = computed(() => segmentStart.value > 0);
+const earliestLoadedFloor = computed(() => {
+  const first = messages.value[0];
+  if (!first) return 0;
+  return projection.value.absoluteFloorByMessageId[first.id] ?? first.seq;
+});
+const hasLoadedFloorGap = computed(() => {
+  let previous = 0;
+  for (const message of messages.value) {
+    const floor = projection.value.absoluteFloorByMessageId[message.id];
+    if (!floor) continue;
+    if (previous > 0 && floor > previous + 1) return true;
+    previous = Math.max(previous, floor);
+  }
+  return false;
+});
+const canRequestEarlierHistory = computed(() =>
+  feed.historyConversationId === conversationId.value
+  && feed.historyHasMore
+  && (earliestLoadedFloor.value > 1 || hasLoadedFloorGap.value)
+);
+const hasEarlierSegment = computed(() => segmentStart.value > 0 || canRequestEarlierHistory.value);
 const hasLaterSegment = computed(() => segmentStart.value + TIMELINE_MOUNT_LIMIT < messages.value.length);
+const earlierSegmentLabel = computed(() => feed.historyLoading
+  ? '正在加载更早内容'
+  : feed.historyError && segmentStart.value === 0
+    ? '重试加载更早内容'
+    : '显示更早内容'
+);
 const compressionTimeline = computed(() => projectReliableCompressionTimeline(
   compressionBlocks.value,
-  messages.value.map((message) => message.id)
+  messages.value.map((message) => ({ id: message.id, createdAt: message.createdAt }))
 ));
 const compressionBlocksByAnchor = computed(() => compressionTimeline.value.byAnchor);
 const terminationRowsByAnchor = computed(() => {
@@ -91,9 +130,27 @@ watch(
 );
 
 watch(conversationId, () => {
+  pendingHistoryAnchorId.value = null;
   followLatestSegment.value = true;
   segmentStart.value = latestTimelineSegmentStart(messages.value.length);
 });
+
+watch(
+  () => feed.historyLoadedPages,
+  (loadedPages, previousLoadedPages) => {
+    if (loadedPages <= previousLoadedPages) return;
+    const anchorId = pendingHistoryAnchorId.value;
+    pendingHistoryAnchorId.value = null;
+    if (!anchorId) return;
+    const anchorIndex = messages.value.findIndex((message) => message.id === anchorId);
+    if (anchorIndex < 0) return;
+    followLatestSegment.value = false;
+    segmentStart.value = clampTimelineSegmentStart(
+      messages.value.length,
+      Math.max(0, anchorIndex - TIMELINE_SEGMENT_STEP)
+    );
+  }
+);
 
 const activeTurn = computed(() => {
   if (!conversationId.value) return undefined;
@@ -107,6 +164,68 @@ const activeTurnRequests = computed(() => {
     .filter((request) => request.turn_id === activeTurn.value?.id)
     .sort((left, right) => reliableInteger(right.request_seq) - reliableInteger(left.request_seq));
 });
+const latestActiveTurnRequest = computed(() => activeTurnRequests.value[0]);
+const latestRequestPurposeDetail = computed(() => {
+  const requestId = reliableText(latestActiveTurnRequest.value?.id);
+  return requestId
+    ? feed.details[reliableKernelDetailKey('model-request-purpose', requestId)]
+    : undefined;
+});
+const latestCompressionPurpose = computed(() => {
+  const detail = latestRequestPurposeDetail.value;
+  return detail?.status === 'ready'
+    ? parseReliableCompressionRequestPurpose(detail.text)
+    : undefined;
+});
+const activeCompressionCard = computed<Record<string, unknown> | undefined>(() => {
+  const request = latestActiveTurnRequest.value;
+  const purpose = latestCompressionPurpose.value;
+  if (!request || !purpose || compressionBlocks.value.some((block) => reliableText(block.id) === purpose.blockId)) {
+    return undefined;
+  }
+  const requestStatus = reliableText(request.status);
+  const terminalState = reliableText(request.terminal_state);
+  if (requestStatus === 'terminal' && terminalState !== 'completed') return undefined;
+  const retry = modelRequestRetryState(request);
+  const status = requestStatus === 'retrying'
+    ? 'retrying'
+    : requestStatus === 'streaming'
+      ? 'running'
+      : requestStatus === 'terminal'
+        ? 'committing'
+        : 'pending';
+  return {
+    id: purpose.blockId,
+    conversation_id: conversationId.value,
+    status,
+    title: purpose.trigger === 'auto' ? '自动上下文压缩' : '上下文压缩',
+    trigger: purpose.trigger,
+    method_kind: purpose.methodKind,
+    source_count: purpose.sourceSegmentCount,
+    model_request_id: reliableText(request.id),
+    created_at: request.created_at,
+    retry_reason_label: retry.reasonLabel,
+    retry_delay_seconds: Math.max(0, Math.ceil(retry.remainingDelayMs / 1_000)),
+    retry_attempt: retry.retryAttempt,
+    retry_max_attempts: retry.retryMaxAttempts
+  };
+});
+
+watch(
+  () => {
+    const requestId = reliableText(latestActiveTurnRequest.value?.id);
+    if (!requestId) return '';
+    const status = feed.details[reliableKernelDetailKey('model-request-purpose', requestId)]?.status;
+    return `${requestId}:${status ?? 'missing'}`;
+  },
+  () => {
+    const requestId = reliableText(latestActiveTurnRequest.value?.id);
+    if (!requestId) return;
+    const detail = feed.details[reliableKernelDetailKey('model-request-purpose', requestId)];
+    if (!detail) feed.requestDetail('model-request-purpose', requestId, { priority: 'visible' });
+  },
+  { immediate: true }
+);
 const activityModelLabel = computed(() => {
   const request = activeTurnRequests.value[0];
   const frozenModel = reliableText(request?.model_id);
@@ -140,30 +259,49 @@ const activityLabel = computed(() => {
   }
   const turn = activeTurn.value;
   if (!turn || typeof turn.id !== 'string') return undefined;
-  const retryRunning = action?.action === 'retry' && action.phase === 'running';
-  const latest = activeTurnRequests.value[0];
-  if (!latest) return retryRunning ? '正在准备重试上下文' : '正在准备上下文';
+  const pendingPlanReview = Object.values(projection.value.interactionByToolCallId).some((interaction) =>
+    interaction.turnId === turn.id
+    && interaction.kind === 'plan_review'
+    && interaction.status === 'pending'
+  );
+  if (pendingPlanReview) return '等待你审批 Plan';
+  const latest = latestActiveTurnRequest.value;
+  if (!latest) return '正在准备上下文';
+  if (activeCompressionCard.value) return undefined;
   const retry = modelRequestRetryState(latest);
-  // Durable retry identity must stay visible even when the latest socket has already painted one
-  // transient thought. Otherwise a retry loop looks indistinguishable from one permanently stuck
-  // model response.
+  // Keep the durable retry identity visible throughout this Attempt. Its exact transient decides
+  // whether the row describes connection/output waiting or output currently being received.
   if (latest.status === 'retrying') {
     const delaySeconds = Math.max(0, Math.ceil(retry.remainingDelayMs / 1_000));
     return `${retry.reasonLabel}，${delaySeconds} 秒后自动恢复（第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次）`;
   }
   if (latest.status === 'streaming' && retry.retryAttempt > 0) {
-    return `第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次自动恢复已重连，等待有效输出`;
+    const modelRequestId = reliableText(latest.id);
+    return reliableRetryStreamingActivityLabel({
+      retryAttempt: retry.retryAttempt,
+      retryMaxAttempts: retry.retryMaxAttempts,
+      hasVisibleOutput: Boolean(modelRequestId) && hasVisibleStreamingTransientForRequestAttempt(
+        feed.transientModelRequests,
+        modelRequestId,
+        String(retry.retryAttempt + 1),
+        mountedTransientRequestIds.value
+      )
+    });
   }
-  if (hasVisibleStreamingTransientForTurn(feed.transientModelRequests, turn.id)) return undefined;
+  if (hasVisibleStreamingTransientForTurn(
+    feed.transientModelRequests,
+    turn.id,
+    mountedTransientRequestIds.value
+  )) return undefined;
   const activeTool = Object.values(feed.records.ToolCall ?? {}).find((call) =>
     call.turn_id === turn.id && call.status !== 'terminal'
   );
   if (activeTool) return undefined;
   if (latest.status === 'prepared' || latest.status === 'pending') {
-    return retryRunning ? '正在启动重试模型请求' : '正在启动模型请求';
+    return '正在启动模型请求';
   }
   if (latest.status === 'streaming') {
-    return retryRunning ? '正在等待重试模型输出' : '正在等待模型输出';
+    return '正在等待模型输出';
   }
   return '模型结果已提交，正在准备工具或下一轮';
 });
@@ -212,11 +350,19 @@ function runHadCompletedTools(message: MessageRecord): boolean {
 }
 
 function showEarlierSegment(): void {
-  followLatestSegment.value = false;
-  segmentStart.value = clampTimelineSegmentStart(
-    messages.value.length,
-    segmentStart.value - TIMELINE_SEGMENT_STEP
-  );
+  if (segmentStart.value > 0) {
+    followLatestSegment.value = false;
+    segmentStart.value = clampTimelineSegmentStart(
+      messages.value.length,
+      segmentStart.value - TIMELINE_SEGMENT_STEP
+    );
+  } else if (canRequestEarlierHistory.value) {
+    followLatestSegment.value = false;
+    const anchorId = visibleTimelineRows.value[0]?.id ?? null;
+    if (feed.requestEarlierHistory(conversationId.value)) {
+      pendingHistoryAnchorId.value = anchorId;
+    }
+  }
   props.scroller?.scrollTo({ top: 0 });
 }
 
@@ -305,6 +451,12 @@ function messageDetailDemandSignature(message: MessageRecord): string {
   });
 }
 
+function messageDetailReady(message: MessageRecord): boolean {
+  const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
+  if (!revisionId) return false;
+  return feed.details[reliableKernelDetailKey('message-content', revisionId)]?.status === 'ready';
+}
+
 function messageDetailLoading(message: MessageRecord): boolean {
   if (message.content.parts.length > 0) return false;
   const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
@@ -358,6 +510,15 @@ function reliableInteger(value: unknown): number {
 function reliableText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
+
+function messageRenderKey(message: MessageRecord): string {
+  const transientRequestId = message.id.startsWith('transient:')
+    ? message.id.slice('transient:'.length)
+    : undefined;
+  const modelRequestId = transientRequestId
+    || projection.value.modelRequestIdByMessageId[message.id];
+  return modelRequestId ? `model-request:${modelRequestId}` : `message:${message.id}`;
+}
 </script>
 
 <template>
@@ -366,13 +527,21 @@ function reliableText(value: unknown): string {
       v-if="hasEarlierSegment"
       type="button"
       class="reliable-segment-control"
+      :disabled="feed.historyLoading"
       @click="showEarlierSegment"
     >
-      显示更早内容
+      {{ earlierSegmentLabel }}
     </button>
+    <p
+      v-if="feed.historyError && segmentStart === 0"
+      class="reliable-history-error"
+      role="alert"
+    >
+      {{ feed.historyError }}
+    </p>
     <div
       v-for="(message, index) in visibleTimelineRows"
-      :key="message.id"
+      :key="messageRenderKey(message)"
       class="reliable-message-row"
       :data-timeline-row-key="message.id"
     >
@@ -392,6 +561,7 @@ function reliableText(value: unknown): string {
         :delete-count="deleteCount(message)"
         :compact-count="Math.max(1, timelineFloor(message, index))"
         :detail-loading="messageDetailLoading(message)"
+        :detail-ready="messageDetailReady(message)"
         :mutation-pending="conversationActionPending && isConversationActionTarget(message)"
         :mutation-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
         :retry-blocked="retryBlocked(message)"
@@ -435,6 +605,12 @@ function reliableText(value: unknown): string {
     >
       {{ retryBoundaryLabel }}
     </p>
+    <ReliableCompressionCard
+      v-if="activeCompressionCard && !hasLaterSegment"
+      :key="`compression:${String(activeCompressionCard.id)}`"
+      :block="activeCompressionCard"
+      data-timeline-row-key="active-compression"
+    />
     <TimelineActivityRow
       v-if="activityLabel && !hasLaterSegment"
       activity-kind="preparing"
@@ -444,7 +620,7 @@ function reliableText(value: unknown): string {
     <p v-if="conversationActionNotice" class="reliable-action-notice" role="status">
       {{ conversationActionNotice }}
     </p>
-    <div v-if="messages.length === 0 && !activityLabel" class="reliable-message-empty-container">
+    <div v-if="messages.length === 0 && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
       <p class="reliable-message-empty">{{ emptyHint }}</p>
     </div>
   </div>
@@ -487,6 +663,19 @@ function reliableText(value: unknown): string {
   color: var(--vscode-foreground);
   background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%));
   outline: none;
+}
+
+.reliable-segment-control:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.reliable-history-error {
+  align-self: center;
+  margin: 0 var(--space-3) var(--space-2);
+  color: var(--vscode-errorForeground);
+  font-size: var(--font-size-sm);
+  text-align: center;
 }
 
 .reliable-action-notice {

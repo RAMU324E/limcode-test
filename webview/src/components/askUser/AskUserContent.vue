@@ -50,14 +50,26 @@ const statusLabel = computed(() => {
   if (pending.value) return props.placement === 'tool-detail' ? '等待你的回答 · 与输入框上方同步' : '等待你的回答';
   if (output.value) return '已回答';
   if (props.toolCall.status === 'error') return '问题已取消';
+  if (!interaction.value) return '正在准备问题';
+  if (interaction.value.request.state === 'resolved') return '回答已提交，正在归档';
+  if (interaction.value.request.state === 'cancelled' || interaction.value.request.state === 'expired') return '问题已取消';
   return '问题已结束';
 });
 
 watch(
-  () => `${props.toolCall?.id ?? ''}:${interaction.value?.request.id ?? ''}:${interaction.value?.request.revision ?? 0}:${interaction.value?.request.state ?? 'missing'}`,
+  () => `${props.toolCall?.id ?? ''}:${props.toolCall?.status ?? 'missing'}:${interaction.value?.request.id ?? ''}:${interaction.value?.request.revision ?? 0}:${interaction.value?.request.state ?? 'missing'}:${output.value ? 'output' : 'no-output'}`,
   () => {
     const call = props.toolCall;
-    if (call && !pending.value) askUser.clearDraft(call.id);
+    const interactionState = interaction.value?.request.state;
+    if (
+      call
+      && (
+        output.value
+        || call.status === 'error'
+        || interactionState === 'cancelled'
+        || interactionState === 'expired'
+      )
+    ) askUser.clearDraft(call.id);
   },
   { immediate: true }
 );

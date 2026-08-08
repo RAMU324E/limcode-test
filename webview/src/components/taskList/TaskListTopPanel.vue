@@ -5,6 +5,7 @@ import { useReliableConversation } from '@webview/composables/useReliableConvers
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import TaskListDisplay from './TaskListDisplay.vue';
 import {
+  applyTaskListOperationToSnapshot,
   buildTaskListTimeline,
   emptyTaskListSnapshot,
   formatTaskListProgress,
@@ -20,7 +21,39 @@ const timeline = computed(() => buildTaskListTimeline({
   toolCalls: reliableConversation.projection.value.toolCalls,
   conversationId: reliableConversation.conversationId.value
 }));
-const snapshot = computed<TaskListSnapshotView>(() => timeline.value.snapshot ?? emptyTaskListSnapshot());
+const projectedSnapshot = computed(() => currentTaskListSnapshot(
+  reliableConversation.feed.projections.activeConversationWindow,
+  reliableConversation.conversationId.value
+));
+const snapshot = computed<TaskListSnapshotView>(() => {
+  const projected = projectedSnapshot.value;
+  if (!projected) return timeline.value.snapshot ?? emptyTaskListSnapshot();
+  const sourceIndex = timeline.value.entries.findIndex((entry) =>
+    entry.toolCall.id === projected.sourceToolCallId
+  );
+  let laterEntries = sourceIndex >= 0 ? timeline.value.entries.slice(sourceIndex + 1) : [];
+  if (sourceIndex < 0 && projected.sourceMessageId) {
+    const sourceSeq = reliableConversation.projection.value.messages
+      .find((message) => message.id === projected.sourceMessageId)?.seq;
+    if (sourceSeq !== undefined) {
+      const messageById = new Map(reliableConversation.projection.value.messages
+        .map((message) => [message.id, message] as const));
+      laterEntries = timeline.value.entries.filter((entry) =>
+        (messageById.get(entry.toolCall.messageId)?.seq ?? -1) > sourceSeq
+      );
+    }
+  }
+  let current = projected.snapshot;
+  let operationIndex = projected.operationCount;
+  for (const entry of laterEntries) {
+    current = applyTaskListOperationToSnapshot(current, entry.operation, {
+      operationIndex,
+      toolCallId: entry.toolCall.id
+    });
+    operationIndex += 1;
+  }
+  return current;
+});
 const visible = computed(() => snapshot.value.items.length > 0);
 const progressLabel = computed(() => formatTaskListProgress(snapshot.value));
 const activeLabel = computed(() => {
@@ -39,6 +72,80 @@ watch(reliableConversation.conversationId, () => {
 
 function toggleExpanded(): void {
   expanded.value = !expanded.value;
+}
+
+function currentTaskListSnapshot(value: unknown, conversationId: string): {
+  snapshot: TaskListSnapshotView;
+  sourceToolCallId: string;
+  sourceMessageId?: string;
+  operationCount: number;
+} | undefined {
+  const window = plainRecord(value);
+  const current = plainRecord(window?.currentTaskList);
+  if (!current || (current.conversationId ?? current.conversation_id) !== conversationId || !Array.isArray(current.items)) {
+    return undefined;
+  }
+  const items = current.items.flatMap((value, index) => {
+    const item = plainRecord(value);
+    const key = stringValue(item?.key);
+    const title = stringValue(item?.title);
+    const status = taskStatus(item?.status);
+    if (!key || !title || !status) return [];
+    const description = stringValue(item?.description);
+    const sourceToolCallId = stringValue(item?.sourceToolCallId);
+    return [{
+      key,
+      title,
+      ...(description ? { description } : {}),
+      status,
+      createdOrder: safeInteger(item?.createdOrder) ?? index,
+      updatedOrder: safeInteger(item?.updatedOrder) ?? index,
+      ...(sourceToolCallId ? { sourceToolCallId } : {})
+    }];
+  });
+  if (items.length !== current.items.length || new Set(items.map((item) => item.key)).size !== items.length) {
+    return undefined;
+  }
+  const stats = {
+    total: items.length,
+    pending: items.filter((item) => item.status === 'pending').length,
+    inProgress: items.filter((item) => item.status === 'in_progress').length,
+    completed: items.filter((item) => item.status === 'completed').length,
+    blocked: items.filter((item) => item.status === 'blocked').length,
+    cancelled: items.filter((item) => item.status === 'cancelled').length,
+    open: items.filter((item) => item.status !== 'completed' && item.status !== 'cancelled').length
+  };
+  const activeItem = items.find((item) => item.status === 'in_progress');
+  const sourceToolCallId = stringValue(current.sourceToolCallId ?? current.source_tool_call_id);
+  if (!sourceToolCallId) return undefined;
+  const sourceMessageId = stringValue(current.sourceMessageId ?? current.source_message_id);
+  return {
+    snapshot: { items, stats, ...(activeItem ? { activeItem } : {}) },
+    sourceToolCallId,
+    ...(sourceMessageId ? { sourceMessageId } : {}),
+    operationCount: safeInteger(current.operationCount ?? current.operation_count) ?? 0
+  };
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function safeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
+}
+
+function taskStatus(value: unknown): 'pending' | 'in_progress' | 'completed' | 'blocked' | 'cancelled' | undefined {
+  return value === 'pending' || value === 'in_progress' || value === 'completed'
+    || value === 'blocked' || value === 'cancelled'
+    ? value
+    : undefined;
 }
 </script>
 

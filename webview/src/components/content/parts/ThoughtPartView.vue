@@ -1,10 +1,15 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { IconBulb } from '@tabler/icons-vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import StreamingIndicatorTail from '../StreamingIndicatorTail.vue';
 import { useSmoothStreamingText } from '../useSmoothStreamingText';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
+import {
+  THOUGHT_TIMER_REFRESH_INTERVAL_MS,
+  formatThoughtDuration,
+  liveThoughtDurationMs
+} from '../thoughtTiming';
 
 const props = withDefaults(
   defineProps<{
@@ -12,26 +17,60 @@ const props = withDefaults(
     streaming?: boolean;
     streamingPhase?: 'waiting' | 'thinking' | 'writing';
     durationMs?: number;
+    completedDurationMs?: number;
     elapsedMs?: number;
+    startedAt?: number;
   }>(),
   { streaming: false, streamingPhase: 'thinking' }
 );
 
 const globalSettings = useGlobalSettingsStore();
 const expanded = ref(false);
+const clockNow = ref(Date.now());
+let refreshTimer: ReturnType<typeof setInterval> | undefined;
 const { displayedText } = useSmoothStreamingText(
   () => props.text,
   () => props.streaming
 );
 const preview = computed(() => lastNonEmptyLine(displayedText.value) || '正在思考...');
+const liveDurationMs = computed(() => liveThoughtDurationMs({
+  completedDurationMs: props.completedDurationMs,
+  elapsedMs: props.elapsedMs,
+  startedAt: props.startedAt
+}, clockNow.value));
 const tailText = computed(() => {
   if (props.streaming) {
-    return typeof props.elapsedMs === 'number' && props.elapsedMs > 0
-      ? `思考了 ${formatThoughtDuration(props.elapsedMs)}`
+    const hasTiming = typeof props.startedAt === 'number'
+      || typeof props.elapsedMs === 'number'
+      || typeof props.completedDurationMs === 'number';
+    return hasTiming
+      ? `思考了 ${formatThoughtDuration(liveDurationMs.value)}`
       : '思考中';
   }
   return props.durationMs !== undefined ? `已思考 ${formatThoughtDuration(props.durationMs)}` : '思考完成';
 });
+
+watch(
+  () => [props.streaming, props.startedAt] as const,
+  () => syncRefreshTimer(),
+  { immediate: true }
+);
+onBeforeUnmount(() => stopRefreshTimer());
+
+function syncRefreshTimer(): void {
+  stopRefreshTimer();
+  clockNow.value = Date.now();
+  if (!props.streaming || typeof props.startedAt !== 'number' || !Number.isFinite(props.startedAt)) return;
+  refreshTimer = setInterval(() => {
+    clockNow.value = Date.now();
+  }, THOUGHT_TIMER_REFRESH_INTERVAL_MS);
+}
+
+function stopRefreshTimer(): void {
+  if (refreshTimer === undefined) return;
+  clearInterval(refreshTimer);
+  refreshTimer = undefined;
+}
 
 function lastNonEmptyLine(text: string): string {
   let end = text.length;
@@ -50,24 +89,6 @@ function lastNonEmptyLine(text: string): string {
   return '';
 }
 
-function formatThoughtDuration(durationMs: number): string {
-  if (durationMs < 1000) return `${Math.max(0, Math.round(durationMs))}ms`;
-  const seconds = durationMs / 1000;
-  if (seconds < 60) {
-    const digits = seconds < 10 ? 1 : 0;
-    return `${seconds.toFixed(digits)}秒`;
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  const restSeconds = Math.round(seconds % 60);
-  if (minutes < 60) {
-    return restSeconds > 0 ? `${minutes}分${restSeconds}秒` : `${minutes}分`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  const restMinutes = minutes % 60;
-  return restMinutes > 0 ? `${hours}小时${restMinutes}分` : `${hours}小时`;
-}
 </script>
 
 <template>

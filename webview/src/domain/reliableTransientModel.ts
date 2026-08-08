@@ -159,7 +159,7 @@ export function toolCallPreviewByCallId(
   calls: readonly ReliableTransientToolCallState[],
   callId: string | undefined,
   options: ToolCallPreviewLookupOptions = {}
-): ToolCallPreviewRecord | undefined {
+): ReliableTransientToolCallState | undefined {
   const id = callId?.trim();
   if (!id) return undefined;
   const call = calls.find((candidate) =>
@@ -175,7 +175,7 @@ export function transientToolCallPreviewForMessage(
   messageId: string,
   callId: string,
   options: ToolCallPreviewLookupOptions = {}
-): ToolCallPreviewRecord | undefined {
+): ReliableTransientToolCallState | undefined {
   const linkedRequestId = messageId.startsWith('transient:')
     ? messageId.slice('transient:'.length)
     : links.find((link) => link.message_id === messageId)?.model_request_id;

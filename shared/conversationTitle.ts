@@ -19,6 +19,8 @@ export interface DisplayConversationTitleInput {
   id?: string;
   title?: string;
   messages?: readonly ConversationTitleMessage[];
+  /** Host-projected title used when this client only has a bounded message window. */
+  fallbackTitle?: string;
   maxLength?: number;
 }
 
@@ -32,6 +34,13 @@ export function displayConversationTitle(input: DisplayConversationTitleInput): 
   const firstUserMessage = input.messages?.find((message) => message.role === 'user' && !isInternalMessage(message));
   const titleFromMessage = firstUserMessage ? normalizeConversationTitleText(conversationTitleTextPreview(firstUserMessage.content)) : '';
   if (titleFromMessage) return truncateConversationTitle(titleFromMessage, maxLength);
+
+  const fallbackTitle = normalizeConversationTitleText(input.fallbackTitle ?? '');
+  if (
+    fallbackTitle
+    && !isPlaceholderConversationTitle(fallbackTitle)
+    && !isGeneratedConversationId(fallbackTitle, input.id)
+  ) return truncateConversationTitle(fallbackTitle, maxLength);
 
   if (input.id === DEFAULT_CONVERSATION_ID) return DEFAULT_CONVERSATION_DISPLAY_TITLE;
   return explicitTitle && !generatedIdTitle ? truncateConversationTitle(explicitTitle, maxLength) : DEFAULT_CONVERSATION_TITLE;

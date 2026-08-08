@@ -58,6 +58,58 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
   return html.replace('<head>', `<head>\n    ${cspMeta}`);
 }
 
+export function getUnavailableWebviewHtml(message: string): string {
+  return /* html */ `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(EXTENSION_BRAND)} 无法启动</title>
+  <style>
+    html, body {
+      min-height: 100%;
+      margin: 0;
+      color: var(--vscode-foreground, #d4d4d4);
+      background: var(--vscode-editor-background, var(--vscode-sideBar-background, #1e1e1e));
+      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+    }
+    main { box-sizing: border-box; max-width: 720px; margin: 0 auto; padding: 28px 22px; }
+    .eyebrow {
+      color: var(--vscode-errorForeground, #f48771);
+      font-size: 11px;
+      font-weight: 650;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 8px 0 10px; font-size: 19px; line-height: 1.35; }
+    p { color: var(--vscode-descriptionForeground, #a0a0a0); line-height: 1.55; }
+    pre {
+      margin: 18px 0 0;
+      padding: 12px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      color: var(--vscode-foreground, #d4d4d4);
+      background: var(--vscode-textCodeBlock-background, #181818);
+      border: 1px solid var(--vscode-panel-border, #454545);
+      border-radius: 5px;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <main role="alert">
+    <div class="eyebrow">${escapeHtml(EXTENSION_BRAND)}</div>
+    <h1>运行时无法启动</h1>
+    <p>扩展已停止写入。修复下面的问题后重新加载窗口；无需反复等待当前页面。</p>
+    <pre>${escapeHtml(message)}</pre>
+  </main>
+</body>
+</html>`;
+}
+
 function createContentSecurityPolicy(
   webview: vscode.Webview,
   nonce: string,
@@ -72,6 +124,7 @@ function createContentSecurityPolicy(
     `default-src 'none';`,
     `img-src ${webview.cspSource} https: data:${devHttpSourceList};`,
     `media-src ${webview.cspSource} data:${devHttpSourceList};`,
+    `object-src ${webview.cspSource} data:;`,
     `font-src ${webview.cspSource} data:${devHttpSourceList};`,
     `style-src ${webview.cspSource}${devHttpSourceList} 'unsafe-inline';`,
     `script-src 'nonce-${nonce}' ${webview.cspSource}${devHttpSourceList};`,

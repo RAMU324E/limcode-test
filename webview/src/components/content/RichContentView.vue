@@ -54,6 +54,11 @@ const showStandaloneStreamingTail = computed(() => {
   const last = nodes.value[lastIndex];
   return !!last && !nodeStreaming(last, lastIndex);
 });
+const standaloneStreamingPhase = computed(() => streamingPhase());
+const standaloneStreamingText = computed(() => standaloneStreamingPhase.value === 'thinking'
+  ? globalSettings.appearance.streamingTextThinking
+  : globalSettings.appearance.streamingTextWriting
+);
 
 function nodeStreaming(node: RichRenderNode, index: number): boolean {
   if (!props.streaming || index !== nodes.value.length - 1) return false;
@@ -82,7 +87,8 @@ function nodeComponentProps(node: RichRenderNode, index: number): Record<string,
   if (node.kind === 'functionCall') {
     return {
       ...node.props,
-      messageId: props.messageId
+      messageId: props.messageId,
+      streaming: props.streaming === true
     };
   }
   if (node.kind === 'functionResponse' || node.kind === 'inlineData' || node.kind === 'fileData') {
@@ -94,14 +100,14 @@ function nodeComponentProps(node: RichRenderNode, index: number): Record<string,
 /**
  * 判断当前流式阶段：
  *   - 'waiting'：流式中但还没有任何内容块
- *   - 'thinking'：最后一个内容块是正在输出的思考
+ *   - 'thinking'：最后一个内容块仍是思考；块间签名边界不能抢先宣告正文输出
  *   - 'writing'：最后一个内容块是正在输出的正文
  */
 function streamingPhase(): 'waiting' | 'thinking' | 'writing' {
   if (!props.streaming) return 'writing';
   if (nodes.value.length === 0) return 'waiting';
   const last = nodes.value[nodes.value.length - 1]!;
-  if (last.kind === 'thought' && last.props.thoughtOpen === true) return 'thinking';
+  if (last.kind === 'thought') return 'thinking';
   return 'writing';
 }
 
@@ -209,6 +215,7 @@ function isBlockingToolCall(call: ToolCallRecord): boolean {
     || call.status === 'queued'
     || call.status === 'awaiting_approval'
     || call.status === 'awaiting_user_input'
+    || call.status === 'awaiting_child'
     || call.status === 'executing'
     || call.status === 'awaiting_change_apply'
     || call.status === 'applying_change'
@@ -218,7 +225,7 @@ function isBlockingToolCall(call: ToolCallRecord): boolean {
 }
 
 function isToolExecutingStatus(status: ToolCallStatus, progress: unknown): boolean {
-  if (status === 'queued' || status === 'executing' || status === 'applying_change') return true;
+  if (status === 'queued' || status === 'awaiting_child' || status === 'executing' || status === 'applying_change') return true;
   return status === 'awaiting_approval' && isExecutionApprovedProgress(progress);
 }
 
@@ -240,7 +247,7 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
         v-bind="nodeComponentProps(node, index)"
       />
       <div v-if="showStandaloneStreamingTail" class="rich-streaming-tail-row">
-        <StreamingIndicatorTail :text="globalSettings.appearance.streamingTextWriting" variant="writing" />
+        <StreamingIndicatorTail :text="standaloneStreamingText" :variant="standaloneStreamingPhase" />
       </div>
       <div v-if="showToolExecutingTail" class="rich-streaming-tail-row">
         <StreamingIndicatorTail :text="globalSettings.appearance.streamingTextToolExecuting" variant="executing" />

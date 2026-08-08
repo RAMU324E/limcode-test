@@ -22,6 +22,7 @@ const bottomStickyScroller = useBottomStickyScroller(scroller);
 let pendingInitialBottomConversationId = '';
 let initialBottomScrollFrame: number | undefined;
 let pendingEditAuthority: TurnAuthoritySelection = {};
+let pendingEditContent: MessageContent | undefined;
 
 const loadingDetail = computed(() =>
   Boolean(reliableConversation.feed.sessionId)
@@ -110,6 +111,7 @@ function cancelInitialBottomScrollFrame(): void {
 function onSubmit(text: string, content: MessageContent | undefined, authority: TurnAuthoritySelection): void {
   if (conversationUi.isEditing) {
     conversationUi.pendingEditText = text;
+    pendingEditContent = content ? structuredClone(content) : undefined;
     pendingEditAuthority = {
       ...(authority.agentId?.trim() ? { agentId: authority.agentId.trim() } : {}),
       ...(authority.model ? { model: { ...authority.model } } : {})
@@ -132,9 +134,11 @@ function handleEditConfirmAction(action: ConfirmPanelAction): void {
 function commitEditMessage(): void {
   const editing = conversationUi.editingMessage;
   const text = conversationUi.pendingEditText.trim();
-  if (!editing || !text) return;
+  const content = pendingEditContent;
+  if (!editing || (!text && !content?.parts.length)) return;
   const accepted = editMessage(editing.message.conversationId, editing.message.id, text, {
     expectedRevisionId: editing.message.revisionId ?? '',
+    ...(content?.parts.length ? { content } : {}),
     runAfterEdit: true,
     deleteFollowing: true,
     ...pendingEditAuthority
@@ -148,6 +152,7 @@ function commitEditMessage(): void {
   conversationUi.editConfirmOpen = false;
   const finishAcceptedEdit = (): void => {
     pendingEditAuthority = {};
+    pendingEditContent = undefined;
     conversationUi.cancelEditMode();
   };
   const nextMessage = nextMessageAfter(editing.message.id);
@@ -164,6 +169,7 @@ function nextMessageAfter(messageId: string) {
 }
 
 function startReliableMessageEdit(message: (typeof currentDisplayMessages.value)[number], deleteCount: number): void {
+  pendingEditContent = undefined;
   conversationUi.startEditMessage(message, deleteCount);
 }
 

@@ -61,7 +61,9 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
     const text = buffer.parts.map((part) => part.text).join('');
     const normalizedText = nodes.length === 0 && buffer.kind === 'text' ? text.trimStart() : text;
     const hasThoughtTiming = buffer.kind === 'thought' && buffer.parts.some((part) =>
-      (typeof part.thoughtElapsedMs === 'number' && Number.isFinite(part.thoughtElapsedMs) && part.thoughtElapsedMs > 0)
+      (typeof part.thoughtStartedAt === 'number' && Number.isFinite(part.thoughtStartedAt) && part.thoughtStartedAt > 0)
+      || (typeof part.thoughtCompletedDurationMs === 'number' && Number.isFinite(part.thoughtCompletedDurationMs) && part.thoughtCompletedDurationMs > 0)
+      || (typeof part.thoughtElapsedMs === 'number' && Number.isFinite(part.thoughtElapsedMs) && part.thoughtElapsedMs > 0)
       || (typeof part.thoughtDurationMs === 'number' && Number.isFinite(part.thoughtDurationMs) && part.thoughtDurationMs > 0)
     );
     if (!normalizedText.trim() && !hasThoughtTiming) return;
@@ -70,7 +72,16 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
       const durations = buffer.parts
         .map((part) => part.thoughtDurationMs)
         .filter((duration): duration is number => typeof duration === 'number' && Number.isFinite(duration));
-      const durationMs = durations.length > 0 ? durations.reduce((sum, duration) => sum + duration, 0) : undefined;
+      const summedCompletedDurationMs = durations.reduce((sum, duration) => sum + duration, 0);
+      const carriedCompletedDurations = buffer.parts
+        .map((part) => part.thoughtCompletedDurationMs)
+        .filter((duration): duration is number => typeof duration === 'number' && Number.isFinite(duration));
+      const carriedCompletedDurationMs = carriedCompletedDurations.length > 0
+        ? carriedCompletedDurations.reduce((max, duration) => Math.max(max, duration), 0)
+        : undefined;
+      const completedDurationMs = durations.length > 0 || carriedCompletedDurationMs !== undefined
+        ? Math.max(summedCompletedDurationMs, carriedCompletedDurationMs ?? 0)
+        : undefined;
       const thoughtOpen = buffer.parts.some((part) => part.thoughtDurationMs === undefined);
       const elapsedMs = thoughtOpen
         ? buffer.parts
@@ -78,13 +89,25 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
           .filter((duration): duration is number => typeof duration === 'number' && Number.isFinite(duration))
           .reduce((max, duration) => Math.max(max, duration), 0)
         : undefined;
+      let startedAt: number | undefined;
+      if (thoughtOpen) {
+        for (let index = buffer.parts.length - 1; index >= 0; index -= 1) {
+          const candidate = buffer.parts[index]?.thoughtStartedAt;
+          if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
+            startedAt = candidate;
+            break;
+          }
+        }
+      }
       nodes.push({
         key: `thought:${buffer.startIndex}:${buffer.endIndex}`,
         kind: 'thought',
         props: {
           text: normalizedText.trimEnd(),
-          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(!thoughtOpen && completedDurationMs !== undefined ? { durationMs: completedDurationMs } : {}),
+          ...(thoughtOpen && completedDurationMs !== undefined ? { completedDurationMs } : {}),
           ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+          ...(startedAt !== undefined ? { startedAt } : {}),
           thoughtOpen
         }
       });
@@ -118,15 +141,28 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
 
     flushTextBuffer();
     if (isFunctionCallPart(part)) {
-      nodes.push({ key: `functionCall:${index}:${part.id ?? part.functionCall.name}`, kind: 'functionCall', props: { part, partIndex: index } });
+      nodes.push({
+        key: part.id ? `functionCall:${part.id}` : `functionCall:${index}:${part.functionCall.name}`,
+        kind: 'functionCall',
+        props: { part, partIndex: index }
+      });
       return;
     }
     if (isFunctionResponsePart(part)) {
-      nodes.push({ key: `functionResponse:${index}:${part.id ?? part.functionResponse.name}`, kind: 'functionResponse', props: { part, partIndex: index } });
+      nodes.push({
+        key: part.id ? `functionResponse:${part.id}` : `functionResponse:${index}:${part.functionResponse.name}`,
+        kind: 'functionResponse',
+        props: { part, partIndex: index }
+      });
       return;
     }
     if (isInlineDataPart(part)) {
-      nodes.push({ key: `inlineData:${index}:${part.inlineData.mimeType}`, kind: 'inlineData', props: { part, partIndex: index } });
+      const identity = part.inlineData.attachmentId
+        ?? part.inlineData.sourcePath
+        ?? part.inlineData.sha256
+        ?? part.inlineData.name
+        ?? part.inlineData.mimeType;
+      nodes.push({ key: `inlineData:${index}:${identity}`, kind: 'inlineData', props: { part, partIndex: index } });
       return;
     }
     if (isFileDataPart(part)) {

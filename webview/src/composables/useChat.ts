@@ -560,11 +560,17 @@ export function useChat() {
     conversationId: string,
     messageId: string,
     text: string,
-    options: { expectedRevisionId: string; runAfterEdit?: boolean; deleteFollowing?: boolean } & TurnAuthoritySelection
+    options: {
+      expectedRevisionId: string;
+      content?: MessageContent;
+      runAfterEdit?: boolean;
+      deleteFollowing?: boolean;
+    } & TurnAuthoritySelection
   ): boolean {
     const trimmed = text.trim();
+    const content = options.content ? structuredClone(options.content) : undefined;
     const expectedRevisionId = options.expectedRevisionId.trim();
-    if (!conversationId || !messageId || !trimmed || !expectedRevisionId) return false;
+    if (!conversationId || !messageId || (!trimmed && !content?.parts.length) || !expectedRevisionId) return false;
     const command = nextReliableCommandMetadata();
     return requestConversationAction({
       actionId: command.commandId,
@@ -580,6 +586,7 @@ export function useChat() {
           messageId,
           expectedRevisionId,
           text: trimmed,
+          ...(content?.parts.length ? { content } : {}),
           ...(options.runAfterEdit ? { runAfterEdit: true } : {}),
           ...(options.deleteFollowing ? { deleteFollowing: true } : {}),
           ...(options.agentId?.trim() ? { agentId: options.agentId.trim() } : {}),

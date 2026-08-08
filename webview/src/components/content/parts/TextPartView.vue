@@ -63,8 +63,9 @@ function renderCurrentMarkdown(): void {
 }
 
 function markdownPartKey(part: MarkdownRenderedPart, index: number): string {
-  const content = part.kind === 'html' ? part.html : `${part.language}\n${part.code}`;
-  return `${part.kind}-${index}-${content.length}`;
+  // Content growth is a prop update, not a new logical Markdown block. Keeping this key stable
+  // preserves code-block selection, copy feedback and scroll state while deltas append.
+  return `${part.kind}-${index}`;
 }
 </script>
 
@@ -241,7 +242,11 @@ function markdownPartKey(part: MarkdownRenderedPart, index: number): string {
 }
 
 .rc-markdown :deep(img) {
-  max-width: 100%;
+  display: block;
+  width: auto;
+  max-width: min(100%, 50vw);
+  max-height: 50vh;
   height: auto;
+  object-fit: contain;
 }
 </style>

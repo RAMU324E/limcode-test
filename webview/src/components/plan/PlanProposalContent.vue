@@ -92,6 +92,12 @@ const statusLabel = computed(() => {
   if (submitting.value === 'changes') return '正在提交修改要求';
   if (submitting.value === 'reject') return '正在拒绝 Plan';
   if (props.toolCall?.status === 'error' && status.value === 'pending') return 'Plan 已取消';
+  if (!interaction.value && status.value === 'pending') return '正在准备 Plan 审批';
+  if (
+    interaction.value?.request.state === 'resolved'
+    && !output.value
+    && status.value === 'pending'
+  ) return '审批决定已提交，正在归档';
   switch (status.value) {
     case 'pending': return '等待你审批';
     case 'approved': return 'Plan 已批准';

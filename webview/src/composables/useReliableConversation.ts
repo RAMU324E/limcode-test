@@ -39,9 +39,15 @@ export function useReliableConversation(): SharedReliableConversation {
   if (cached) return cached;
 
   const conversationId = computed(() => reliableActiveConversationId(feed.projections));
+  const records = computed(() => mergeReliableRecordBuckets(
+    feed.historyConversationId === conversationId.value
+      ? feed.historyRecords as unknown as ReliableClientRecordBuckets
+      : {},
+    feed.records as unknown as ReliableClientRecordBuckets
+  ));
   const projection = computed(() => projectReliableConversation({
     conversationId: conversationId.value,
-    records: feed.records as unknown as ReliableClientRecordBuckets,
+    records: records.value,
     details: feed.details,
     transientModelRequests: feed.transientModelRequests,
     lastCommitSeq: feed.lastCommitSeq
@@ -99,4 +105,17 @@ export function useReliableConversation(): SharedReliableConversation {
   const shared = { feed, conversationId, projection, ensureDetails };
   sharedByFeed.set(feed, shared);
   return shared;
+}
+
+/** Historical pages are immutable prefixes; the bounded live feed remains authoritative on overlap. */
+function mergeReliableRecordBuckets(
+  history: ReliableClientRecordBuckets,
+  live: ReliableClientRecordBuckets
+): ReliableClientRecordBuckets {
+  const merged: ReliableClientRecordBuckets = {};
+  for (const [type, bucket] of Object.entries(history)) merged[type] = { ...bucket };
+  for (const [type, bucket] of Object.entries(live)) {
+    merged[type] = { ...(merged[type] ?? {}), ...bucket };
+  }
+  return merged;
 }

@@ -42,6 +42,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.CheckpointDismiss:
     case BridgeMessageType.CheckpointRestore:
     case BridgeMessageType.ToolExecutionCancel:
+    case BridgeMessageType.ProcessStop:
     case BridgeMessageType.ToolDiffOpen:
     case BridgeMessageType.PlanProposalOpen:
     case BridgeMessageType.PlanProposalExport:

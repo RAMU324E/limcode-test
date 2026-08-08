@@ -35,7 +35,7 @@ function inputNumber(event: Event): number {
     </label>
 
     <label class="global-settings-field">
-      <span>聊天多模态附件保存阈值（MB，默认 20；超过阈值的本地路径附件仅保留路径并在发送时动态读取）</span>
+      <span>单条消息附件总大小上限（MB，默认 20；最多 8 个附件）</span>
       <input :value="settings.attachments.maxStoredInlineFileMb" type="number" min="1" max="200" step="1" @change="settings.setAttachmentSettings({ maxStoredInlineFileMb: inputNumber($event) })" />
     </label>
 

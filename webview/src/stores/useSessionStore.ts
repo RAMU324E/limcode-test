@@ -9,6 +9,8 @@ interface SessionState {
   viewKind: SessionViewKind;
   /** 本 webview 绑定的对话 id（chat 视图）。 */
   conversationId: string;
+  /** Host 投影出的完整展示标题，供消息窗口不含首条用户消息时兜底。 */
+  conversationTitle: string;
   /** Plan 详情页绑定的工具调用 id。 */
   toolCallId: string;
   /** Plan 详情页绑定的 PlanProposal id。 */
@@ -29,6 +31,7 @@ export const useSessionStore = defineStore('session', {
   state: (): SessionState => ({
     viewKind: 'unknown',
     conversationId: '',
+    conversationTitle: '',
     toolCallId: '',
     planProposalId: '',
     runtime: null,
@@ -53,6 +56,7 @@ export const useSessionStore = defineStore('session', {
               ? 'planDetail'
               : 'chat';
       if (meta?.conversationId) this.conversationId = meta.conversationId;
+      this.conversationTitle = meta?.title ?? '';
       this.toolCallId = meta?.toolCallId ?? '';
       this.planProposalId = meta?.planProposalId ?? '';
       this.runtime = runtime ? { ...runtime } : null;

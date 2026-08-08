@@ -35,6 +35,7 @@ const props = withDefaults(
     entering?: boolean;
     editingHighlighted?: boolean;
     detailLoading?: boolean;
+    detailReady?: boolean;
     mutationPending?: boolean;
     mutationBlocked?: boolean;
     retryBlocked?: boolean;
@@ -42,7 +43,7 @@ const props = withDefaults(
     forkBlocked?: boolean;
     pendingLabel?: string;
   }>(),
-  { runId: undefined, termination: undefined, terminationNoticeSuppressed: false, runHadCompletedTools: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, detailLoading: false, mutationPending: false, mutationBlocked: false, retryBlocked: false, compactBlocked: false, forkBlocked: false, pendingLabel: '正在提交操作' }
+  { runId: undefined, termination: undefined, terminationNoticeSuppressed: false, runHadCompletedTools: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, detailLoading: false, detailReady: true, mutationPending: false, mutationBlocked: false, retryBlocked: false, compactBlocked: false, forkBlocked: false, pendingLabel: '正在提交操作' }
 );
 
 const emit = defineEmits<{
@@ -102,6 +103,7 @@ const hasOwn = Object.prototype.hasOwnProperty;
 const LOCAL_DAY_MS = 86_400_000;
 const streaming = computed(() => props.message.status === 'streaming' && !props.detailLoading);
 const messageMutationBlocked = computed(() => props.mutationPending || props.mutationBlocked);
+const editMutationBlocked = computed(() => messageMutationBlocked.value || !props.detailReady);
 const retryMutationBlocked = computed(() => props.mutationPending || props.retryBlocked);
 const compactMutationBlocked = computed(() => props.mutationPending || props.compactBlocked);
 const forkMutationBlocked = computed(() => props.mutationPending || props.forkBlocked);
@@ -686,7 +688,7 @@ function openForkConfirm(): void {
 }
 
 function editMessage(): void {
-  if (messageMutationBlocked.value) return;
+  if (editMutationBlocked.value) return;
   emit('edit-message', props.message);
 }
 
@@ -850,9 +852,9 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
         v-if="message.role === 'user'"
         type="button"
         class="message-action-button"
-        :disabled="messageMutationBlocked"
+        :disabled="editMutationBlocked"
         aria-label="编辑消息"
-        title="编辑消息"
+        :title="!detailReady ? '消息附件仍在加载，请稍候' : '编辑消息'"
         @click="editMessage"
       >
         <IconEdit class="message-action-icon" stroke="2" aria-hidden="true" />

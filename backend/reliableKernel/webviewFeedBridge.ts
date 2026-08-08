@@ -7,13 +7,18 @@ import {
   RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE,
   RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
   RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE,
+  RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE,
+  RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE,
   RELIABLE_KERNEL_SNAPSHOT_MESSAGE,
   RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE,
   RELIABLE_KERNEL_TRANSIENT_MESSAGE,
   type ReliableKernelAckMessage,
   type ReliableKernelClientDiagnosticMessage,
   type ReliableKernelDataMessage,
   type ReliableKernelDetailRequestMessage,
+  type ReliableKernelHistoryPageRequestMessage,
   type ReliableKernelSnapshotRequestMessage
 } from '../../shared/reliableKernelClientFeed';
 import { toStructuredClonePlainData } from '../../shared/plainData';
@@ -24,7 +29,12 @@ import {
   type WebviewClientMeta
 } from '../../shared/protocol';
 import type { ReliableAgentTransientEvent } from './agentLoop';
-import type { BoundedClientFeed, ClientDetailReader, ClientFeedConnection } from './clientFeed';
+import type {
+  BoundedClientFeed,
+  ClientDetailReader,
+  ClientFeedConnection,
+  ClientHistoryReader
+} from './clientFeed';
 import type { ReliableDiagnosticObserver } from './diagnosticJournal';
 
 interface FeedClient {
@@ -35,6 +45,7 @@ interface FeedClient {
   closed: boolean;
   connection: Promise<ClientFeedConnection>;
   detailRequests: Set<string>;
+  historyRequests: Set<string>;
   recoveryAttempt: number;
   recoveryTimer?: NodeJS.Timeout;
   recoveryWake?: (retry: boolean) => void;
@@ -45,10 +56,14 @@ interface FeedClient {
     emptyChanges: boolean;
     ackTimer: NodeJS.Timeout;
   };
+  pendingTransientEvents: ReliableAgentTransientEvent[];
+  transientFlushTimer?: NodeJS.Timeout;
 }
 
 const FEED_ACK_TIMEOUT_MS = 30_000;
 const FEED_RECOVERY_MAX_DELAY_MS = 30_000;
+const TRANSIENT_BATCH_INTERVAL_MS = 32;
+const TRANSIENT_BATCH_MAX_EVENTS = 128;
 
 export type ReliableKernelFeedBridgeErrorHandler = (
   error: unknown,
@@ -58,8 +73,8 @@ export type ReliableKernelFeedBridgeErrorHandler = (
 /**
  * VS Code Webview 与 bounded Client Feed 之间的唯一数据通道。
  *
- * 每个 Webview 对应一个内存 Feed session；detach 后立即断开订阅。Bridge 只接受 ACK 与
- * snapshot-request 两类控制消息，不转发或合成旧 ClientState patch。
+ * 每个 Webview 对应一个内存 Feed session；detach 后立即断开订阅。Bridge 接受有界 Feed
+ * 控制、按需详情和绑定当前 Conversation 的历史分页请求，不转发或合成旧 ClientState patch。
  */
 export class ReliableKernelWebviewFeedBridge {
   private readonly clients = new Map<BridgeClientId, FeedClient>();
@@ -70,7 +85,8 @@ export class ReliableKernelWebviewFeedBridge {
     private readonly details: ClientDetailReader,
     private readonly onError: ReliableKernelFeedBridgeErrorHandler = defaultErrorHandler,
     private readonly diagnostics?: ReliableDiagnosticObserver,
-    private readonly runtimeBuildInfo?: () => RuntimeBuildInfoRecord
+    private readonly runtimeBuildInfo?: () => RuntimeBuildInfoRecord,
+    private readonly history?: ClientHistoryReader
   ) {}
 
   public attach(
@@ -86,6 +102,8 @@ export class ReliableKernelWebviewFeedBridge {
     client.navigationGeneration = 1;
     client.closed = false;
     client.detailRequests = new Set<string>();
+    client.historyRequests = new Set<string>();
+    client.pendingTransientEvents = [];
     client.recoveryAttempt = 0;
     client.connection = this.connect(client, client.navigationGeneration);
     this.clients.set(clientId, client);
@@ -117,7 +135,9 @@ export class ReliableKernelWebviewFeedBridge {
       client.meta = plainMeta({ ...client.meta, conversationId: activeConversationId ?? undefined });
     }
     this.clearLastDataPost(client);
+    this.clearTransientQueue(client);
     client.detailRequests.clear();
+    client.historyRequests.clear();
     client.navigationGeneration += 1;
     client.connection = this.connect(client, client.navigationGeneration);
     void previous.then((connection) => this.feed.disconnect(connection.sessionId), () => undefined);
@@ -142,6 +162,9 @@ export class ReliableKernelWebviewFeedBridge {
     client.closed = true;
     this.cancelRecoveryTimer(client);
     this.clearLastDataPost(client);
+    this.clearTransientQueue(client);
+    client.detailRequests.clear();
+    client.historyRequests.clear();
     this.clients.delete(clientId);
     void client.connection.then(
       (connection) => this.feed.disconnect(connection.sessionId),
@@ -156,6 +179,7 @@ export class ReliableKernelWebviewFeedBridge {
       message.type !== RELIABLE_KERNEL_ACK_MESSAGE
       && message.type !== RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE
+      && message.type !== RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE
     ) {
       return false;
@@ -168,8 +192,9 @@ export class ReliableKernelWebviewFeedBridge {
       if (message.type === RELIABLE_KERNEL_ACK_MESSAGE) {
         const ack = normalizeAck(message);
         if (ack.sessionId !== connection.sessionId || ack.hostBootId !== connection.hostBootId) return true;
+        const posted = client.lastDataPost;
         this.feed.acknowledge(ack);
-        this.observeAck(client, ack);
+        this.observeAck(client, ack, posted);
         return true;
       }
       if (message.type === RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE) {
@@ -187,6 +212,12 @@ export class ReliableKernelWebviewFeedBridge {
         this.observeClientDiagnostic(diagnostic);
         return true;
       }
+      if (message.type === RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE) {
+        const request = normalizeHistoryPageRequest(message);
+        if (request.sessionId && request.sessionId !== connection.sessionId) return true;
+        await this.readHistoryPage(client, connection, request);
+        return true;
+      }
       const request = normalizeDetailRequest(message);
       if (request.sessionId && request.sessionId !== connection.sessionId) return true;
       await this.readDetail(client, connection, request);
@@ -194,6 +225,65 @@ export class ReliableKernelWebviewFeedBridge {
     } catch (error) {
       this.onError(error, { clientId, operation: 'control' });
       return true;
+    }
+  }
+
+  private async readHistoryPage(
+    client: FeedClient,
+    connection: ClientFeedConnection,
+    request: ReliableKernelHistoryPageRequestMessage
+  ): Promise<void> {
+    if (client.historyRequests.has(request.requestId)) return;
+    if (client.historyRequests.size >= 2) {
+      this.post(client, {
+        type: RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE,
+        requestId: request.requestId,
+        sessionId: connection.sessionId,
+        conversationId: request.conversationId,
+        message: '更早消息请求过多，请稍后重试。'
+      });
+      return;
+    }
+    if (client.meta.conversationId !== request.conversationId) {
+      this.post(client, {
+        type: RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE,
+        requestId: request.requestId,
+        sessionId: connection.sessionId,
+        conversationId: request.conversationId,
+        message: '历史分页请求不属于当前对话。'
+      });
+      return;
+    }
+    const navigationGeneration = client.navigationGeneration;
+    client.historyRequests.add(request.requestId);
+    try {
+      if (!this.history) throw new Error('当前 Runtime 未配置历史消息读取器。');
+      const page = await this.history.backwardVisibleMessages({
+        conversationId: request.conversationId,
+        beforeMessageSeq: request.beforeMessageSeq,
+        beforeId: request.beforeId,
+        limit: request.limit
+      });
+      if (client.closed || client.navigationGeneration !== navigationGeneration) return;
+      this.post(client, {
+        type: RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE,
+        requestId: request.requestId,
+        sessionId: connection.sessionId,
+        conversationId: request.conversationId,
+        page
+      });
+    } catch (error) {
+      if (!client.closed && client.navigationGeneration === navigationGeneration) {
+        this.post(client, {
+          type: RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE,
+          requestId: request.requestId,
+          sessionId: connection.sessionId,
+          conversationId: request.conversationId,
+          message: error instanceof Error ? error.message : '读取更早消息失败。'
+        });
+      }
+    } finally {
+      client.historyRequests.delete(request.requestId);
     }
   }
 
@@ -246,39 +336,83 @@ export class ReliableKernelWebviewFeedBridge {
     if (this.closed) return;
     for (const client of this.clients.values()) {
       if (client.closed || client.meta.conversationId !== event.conversationId) continue;
-      const connectionPromise = client.connection;
-      void connectionPromise.then((connection) => {
-        if (
-          client.closed
-          || client.connection !== connectionPromise
-          || client.meta.conversationId !== event.conversationId
-        ) return;
+      client.pendingTransientEvents.push(event);
+      const terminal = ['completed', 'failed', 'cancelled'].includes(event.event.kind);
+      if (terminal || client.pendingTransientEvents.length >= TRANSIENT_BATCH_MAX_EVENTS) {
+        this.flushTransientQueue(client);
+        continue;
+      }
+      if (client.transientFlushTimer !== undefined) continue;
+      client.transientFlushTimer = setTimeout(() => {
+        client.transientFlushTimer = undefined;
+        this.flushTransientQueue(client);
+      }, TRANSIENT_BATCH_INTERVAL_MS);
+      client.transientFlushTimer.unref();
+    }
+  }
+
+  private flushTransientQueue(client: FeedClient): void {
+    if (client.transientFlushTimer !== undefined) {
+      clearTimeout(client.transientFlushTimer);
+      client.transientFlushTimer = undefined;
+    }
+    if (client.closed || client.pendingTransientEvents.length === 0) return;
+    const events = client.pendingTransientEvents.splice(0, TRANSIENT_BATCH_MAX_EVENTS);
+    const conversationId = client.meta.conversationId;
+    if (!conversationId || events.some((event) => event.conversationId !== conversationId)) return;
+    const connectionPromise = client.connection;
+    void connectionPromise.then((connection) => {
+      if (
+        client.closed
+        || client.connection !== connectionPromise
+        || client.meta.conversationId !== conversationId
+      ) return;
+      const common = {
+        sessionId: connection.sessionId,
+        navigationGeneration: String(client.navigationGeneration),
+        hostBootId: connection.hostBootId,
+        conversationId
+      };
+      const payloads = events.map((event) => ({
+        turnId: event.turnId,
+        modelRequestId: event.modelRequestId,
+        requestSeq: event.requestSeq,
+        providerId: event.providerId,
+        modelId: event.modelId,
+        attemptSeq: event.attemptSeq,
+        socketGeneration: event.socketGeneration,
+        afterCommitSeq: event.afterCommitSeq,
+        observedAt: event.observedAt,
+        event: event.event
+      }));
+      if (payloads.length === 1) {
         this.post(client, {
           type: RELIABLE_KERNEL_TRANSIENT_MESSAGE,
-          sessionId: connection.sessionId,
-          navigationGeneration: String(client.navigationGeneration),
-          hostBootId: connection.hostBootId,
-          conversationId: event.conversationId,
-          turnId: event.turnId,
-          modelRequestId: event.modelRequestId,
-          requestSeq: event.requestSeq,
-          providerId: event.providerId,
-          modelId: event.modelId,
-          attemptSeq: event.attemptSeq,
-          socketGeneration: event.socketGeneration,
-          afterCommitSeq: event.afterCommitSeq,
-          observedAt: event.observedAt,
-          event: event.event
+          ...common,
+          ...payloads[0]
         });
-      }, (error) => {
-        if (
-          error instanceof FeedConnectionSupersededError
-          || client.closed
-          || client.connection !== connectionPromise
-        ) return;
-        this.onError(error, { clientId: client.clientId, operation: 'post' });
-      });
-    }
+      } else {
+        this.post(client, {
+          type: RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE,
+          ...common,
+          events: payloads
+        });
+      }
+      if (client.pendingTransientEvents.length > 0) this.flushTransientQueue(client);
+    }, (error) => {
+      if (
+        error instanceof FeedConnectionSupersededError
+        || client.closed
+        || client.connection !== connectionPromise
+      ) return;
+      this.onError(error, { clientId: client.clientId, operation: 'post' });
+    });
+  }
+
+  private clearTransientQueue(client: FeedClient): void {
+    if (client.transientFlushTimer !== undefined) clearTimeout(client.transientFlushTimer);
+    client.transientFlushTimer = undefined;
+    client.pendingTransientEvents.length = 0;
   }
 
   public async setActiveConversation(
@@ -332,14 +466,16 @@ export class ReliableKernelWebviewFeedBridge {
   }
 
   private post(client: FeedClient, message: ReliableKernelDataMessage | Record<string, unknown>): void {
-    const detailMessage = message.type === RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE
-      || message.type === RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE;
+    const requestResponseMessage = message.type === RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE
+      || message.type === RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE
+      || message.type === RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE
+      || message.type === RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE;
     let plain: unknown;
     try {
       plain = toStructuredClonePlainData(message, 'reliable kernel webview message');
     } catch (error) {
       this.onError(error, { clientId: client.clientId, operation: 'post' });
-      if (detailMessage && !client.closed) this.scheduleRecovery(client);
+      if (requestResponseMessage && !client.closed) this.scheduleRecovery(client);
       return;
     }
     const dataMessage = reliableDataDiagnostic(message);
@@ -388,8 +524,8 @@ export class ReliableKernelWebviewFeedBridge {
     void client.webview.postMessage(plain).then(
       (delivered) => {
         if (delivered !== false || client.closed) return;
-        if (detailMessage) {
-          this.onError(new Error('VS Code rejected reliable detail postMessage delivery.'), {
+        if (requestResponseMessage) {
+          this.onError(new Error('VS Code rejected reliable request-response postMessage delivery.'), {
             clientId: client.clientId,
             operation: 'post'
           });
@@ -421,7 +557,7 @@ export class ReliableKernelWebviewFeedBridge {
           });
         }
         this.onError(error, { clientId: client.clientId, operation: 'post' });
-        if (detailMessage && !client.closed) {
+        if (requestResponseMessage && !client.closed) {
           this.scheduleRecovery(client);
           return;
         }
@@ -470,10 +606,16 @@ export class ReliableKernelWebviewFeedBridge {
     });
   }
 
-  private observeAck(client: FeedClient, ack: ReliableKernelAckMessage): void {
-    const posted = client.lastDataPost;
+  private observeAck(
+    client: FeedClient,
+    ack: ReliableKernelAckMessage,
+    posted: FeedClient['lastDataPost'] = client.lastDataPost
+  ): void {
     if (!posted || posted.sessionId !== ack.sessionId || posted.messageSeq !== ack.messageSeq) return;
-    this.clearLastDataPost(client);
+    // acknowledge() may synchronously flush the next durable frame and replace lastDataPost. Clear
+    // only the acknowledged timer so diagnostics never erase the newly posted frame's ACK watchdog.
+    if (client.lastDataPost === posted) this.clearLastDataPost(client);
+    else clearTimeout(posted.ackTimer);
     this.cancelRecoveryTimer(client);
     client.recoveryAttempt = 0;
     if (posted.emptyChanges) return;
@@ -662,6 +804,8 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     'process-stdout',
     'process-stderr',
     'context-projection-detail',
+    'model-request-purpose',
+    'compression-presentation',
     'compression-content',
     'compression-title',
     'answer-content'
@@ -687,6 +831,36 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     ...(message.expectedTotalBytes === undefined
       ? {}
       : { expectedTotalBytes: message.expectedTotalBytes as number })
+  };
+}
+
+function normalizeHistoryPageRequest(
+  message: Record<string, unknown>
+): ReliableKernelHistoryPageRequestMessage {
+  const beforeMessageSeq = requireDecimal(
+    message.beforeMessageSeq,
+    'historyPage.beforeMessageSeq'
+  );
+  if (beforeMessageSeq === '0') {
+    throw new TypeError('historyPage.beforeMessageSeq must be positive.');
+  }
+  if (
+    !Number.isSafeInteger(message.limit)
+    || (message.limit as number) <= 0
+    || (message.limit as number) > 200
+  ) {
+    throw new TypeError('historyPage.limit must be from 1 to 200.');
+  }
+  return {
+    type: RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE,
+    requestId: requireText(message.requestId, 'historyPage.requestId'),
+    ...(message.sessionId === undefined
+      ? {}
+      : { sessionId: requireText(message.sessionId, 'historyPage.sessionId') }),
+    conversationId: requireText(message.conversationId, 'historyPage.conversationId'),
+    beforeMessageSeq,
+    beforeId: requireText(message.beforeId, 'historyPage.beforeId'),
+    limit: message.limit as number
   };
 }
 

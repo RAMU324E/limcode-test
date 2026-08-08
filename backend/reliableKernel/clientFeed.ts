@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import {
   RELIABLE_KERNEL_CHANGES_MESSAGE,
   RELIABLE_KERNEL_CLIENT_CHANGE_TYPES,
@@ -7,6 +8,7 @@ import {
   type ReliableKernelClientChange,
   type ReliableKernelClientDetailKind,
   type ReliableKernelDataMessage,
+  type ReliableKernelHistoryPage,
   type ReliableKernelSnapshotMessage
 } from '../../shared/reliableKernelClientFeed';
 import type { PlainData } from '../../shared/plainData';
@@ -19,16 +21,21 @@ import {
   CLIENT_MAX_INFLIGHT_DATA_MESSAGES,
   CLIENT_MAX_QUEUED_BATCHES,
   CLIENT_MAX_QUEUED_BYTES,
-  CLIENT_MESSAGE_WINDOW_LIMIT,
   CLIENT_PAGE_MAX_BYTES,
   CLIENT_PAGE_MAX_ROWS,
-  CLIENT_SNAPSHOT_MAX_BYTES,
-  CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES
+  CLIENT_SNAPSHOT_MAX_BYTES
 } from './clientFeedBounds';
+import {
+  boundClientRecordSummary as boundRecord,
+  clientWireBytes as wireBytes,
+  settleClientWireResponseBytes,
+  toClientWirePlain as toWirePlain
+} from './clientWireData';
 import type {
   ClientKeysetPageInput,
   ClientKeysetPageResult,
-  ClientProjectionSnapshot
+  ClientProjectionSnapshot,
+  ClientVisibleMessageHistoryPageInput
 } from './databaseWorkerProtocol';
 import {
   ContentAddressedStore,
@@ -99,6 +106,10 @@ interface ClientFeedSession {
   latestVisibleMessageFloor: bigint;
   messageDisplayFloors: Map<string, bigint>;
   navigationConversationIds: Set<string>;
+  /** Primary active-conversation rows, kept distinct from child-summary rows of the same domain. */
+  primaryTurnIds: Set<string>;
+  visibleMessageIds: Set<string>;
+  projectedToolCallIds: Set<string>;
   closed: boolean;
 }
 
@@ -164,6 +175,9 @@ export class BoundedClientFeed {
       latestVisibleMessageFloor: 0n,
       messageDisplayFloors: new Map<string, bigint>(),
       navigationConversationIds: new Set<string>(),
+      primaryTurnIds: new Set<string>(),
+      visibleMessageIds: new Set<string>(),
+      projectedToolCallIds: new Set<string>(),
       closed: false
     };
     this.sessions.set(session.sessionId, session);
@@ -256,13 +270,25 @@ export class BoundedClientFeed {
   }
 
   private onCommit(session: ClientFeedSession, commit: RuntimeCommitResult): void {
-    if (session.closed) return;
-    if (session.initializing || session.collectingRefresh) {
-      session.handoffCommits.push(commit);
-      return;
+    const metricStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
+    try {
+      if (session.closed) return;
+      if (session.initializing || session.collectingRefresh) {
+        session.handoffCommits.push(commit);
+        return;
+      }
+      if (session.snapshotRequired) return;
+      this.enqueueCommit(session, commit);
+    } finally {
+      if (metricStartedAt !== undefined) {
+        this.database.recordPerformanceMetric({
+          kind: 'client_feed.sync_listener',
+          listenerKind: 'feed_projection',
+          listenerCount: 1,
+          durationMs: performance.now() - metricStartedAt
+        });
+      }
     }
-    if (session.snapshotRequired) return;
-    this.enqueueCommit(session, commit);
   }
 
   private enqueueCommit(session: ClientFeedSession, commit: RuntimeCommitResult): void {
@@ -452,6 +478,9 @@ export class BoundedClientFeed {
         forgetMessageDisplayFloor(session, key);
         session.materializedRecordKeys.delete(key);
         session.materializedRecordTemporal.delete(key);
+        // Structural owner/link removal is replayed from one fresh causal snapshot. Ephemeral
+        // leaves such as an ExecutionLease can still be removed in the atomic live batch.
+        if (SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS.has(change.domain)) requiresSnapshot = true;
         continue;
       }
       pending.push(change);
@@ -487,23 +516,34 @@ export class BoundedClientFeed {
         session.materializedRecordKeys.add(ownKey);
         session.materializedRecordTemporal.set(ownKey, recordTemporalKey(change.domain, record, change.id));
         retainMaterializedRecordReferences(session, change.domain, change.id, record);
+        rememberScopedProjectionIdentity(session, change.domain, change.id, record);
         if (!wasKnown) {
           const count = incrementRecordCount(session.activeRecordCounts, change.domain);
-          if (count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) {
-            if (change.domain === 'ModelRequest' || change.domain === 'ModelRequestMessageLink') {
-              // Their bounded window is a causal request↔message bundle. Re-read it atomically
-              // instead of independently evicting one side by an opaque id.
+          if (
+            count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE
+            && LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(change.domain)
+          ) {
+            if (change.domain === 'Message') {
+              const victim = oldestMaterializedRecord(session, 'Message');
+              if (victim && !hasMaterializedReferenceFrom(session, victim, [
+                'MessageTurnLink',
+                'ModelRequestMessageLink',
+                'ToolCallSourceLink'
+              ])) {
+                releaseMaterializedRecordReferences(session, victim);
+                forgetMessageDisplayFloor(session, victim);
+                session.visibleMessageIds.delete(recordIdFromKey(victim));
+                session.materializedRecordKeys.delete(victim);
+                session.materializedRecordTemporal.delete(victim);
+                decrementRecordCount(session.activeRecordCounts, 'Message');
+                evictions.push({ domain: 'Message', kind: 'remove', id: recordIdFromKey(victim) });
+              } else {
+                requiresSnapshot = true;
+              }
+            } else {
+              // Never evict a relationship-bearing root type independently. The snapshot builder
+              // chooses temporal roots and returns their complete normalized dependency closure.
               requiresSnapshot = true;
-            }
-            const victim = oldestMaterializedRecord(session, change.domain);
-            if (!victim) requiresSnapshot = true;
-            else {
-              releaseMaterializedRecordReferences(session, victim);
-              forgetMessageDisplayFloor(session, victim);
-              session.materializedRecordKeys.delete(victim);
-              session.materializedRecordTemporal.delete(victim);
-              decrementRecordCount(session.activeRecordCounts, change.domain);
-              evictions.push({ domain: change.domain, kind: 'remove', id: recordIdFromKey(victim) });
             }
           }
         }
@@ -533,16 +573,146 @@ export class BoundedClientFeed {
     id: string,
     record: Record<string, unknown>
   ): boolean {
-    if (session.activeRecordKeys.has(recordKey(domain, id))) return true;
+    const ownKey = recordKey(domain, id);
+    if (session.materializedRecordKeys.has(ownKey)) return true;
     const activeConversationId = session.activeConversationId;
     if (!activeConversationId) return false;
-    for (const [key, value] of Object.entries(record)) {
-      if (typeof value !== 'string') continue;
-      if (CONVERSATION_REFERENCE_FIELDS.has(key) && value === activeConversationId) return true;
-      const targetDomain = referenceDomain(domain, key);
-      if (targetDomain && session.activeRecordKeys.has(recordKey(targetDomain, value))) return true;
+    const field = (key: string): string | undefined => {
+      const value = record[key];
+      return typeof value === 'string' && value ? value : undefined;
+    };
+    const materialized = (targetDomain: string, targetId: string | undefined): boolean =>
+      Boolean(targetId && session.materializedRecordKeys.has(recordKey(targetDomain, targetId)));
+    const referencedBy = (...sourceDomains: string[]): boolean =>
+      hasMaterializedReferenceFrom(session, ownKey, sourceDomains);
+
+    switch (domain) {
+      case 'ProjectContext':
+        return referencedBy('ConversationProjectLink');
+      case 'ConversationProjectLink':
+      case 'ConversationReuseLink':
+      case 'TurnIntent':
+      case 'CompressionBlock':
+      case 'ConversationContextStatus':
+        return field('conversation_id') === activeConversationId;
+      case 'ConversationBranchLink':
+        return field('target_conversation_id') === activeConversationId
+          || field('source_conversation_id') === activeConversationId;
+      case 'ConversationOriginLink':
+        return field('conversation_id') === activeConversationId
+          || field('source_conversation_id') === activeConversationId;
+      case 'AgentConversationLink': {
+        const conversationId = field('conversation_id');
+        return conversationId === activeConversationId
+          || Boolean(conversationId && hasMaterializedReferenceFrom(
+            session,
+            recordKey('Conversation', conversationId),
+            ['ChildExecution']
+          ));
+      }
+      case 'Turn':
+        return field('conversation_id') === activeConversationId
+          || referencedBy('ChildExecutionTurnLink', 'ChildExecutionActiveTurnLink');
+      case 'ExecutionLease':
+      case 'TurnTermination':
+      case 'TurnExecutorLink':
+        return materialized('Turn', field('turn_id'));
+      case 'Message':
+        return field('conversation_id') === activeConversationId
+          && record.deleted_at === null
+          && (record.role === 'user' || record.role === 'model');
+      // Message window rows already carry the exact current revision identity/metadata. Raw
+      // revisions are detail authority and would otherwise accumulate beside evicted roots.
+      case 'MessageRevision':
+        return false;
+      case 'MessageTurnLink': {
+        const messageId = field('message_id');
+        const turnId = field('turn_id');
+        return Boolean(messageId && turnId
+          && session.visibleMessageIds.has(messageId)
+          && session.primaryTurnIds.has(turnId));
+      }
+      case 'ModelRequest': {
+        const turnId = field('turn_id');
+        return Boolean(turnId && session.primaryTurnIds.has(turnId));
+      }
+      case 'ModelRequestMessageLink': {
+        const messageId = field('message_id');
+        return materialized('ModelRequest', field('model_request_id'))
+          && Boolean(messageId && session.visibleMessageIds.has(messageId));
+      }
+      case 'ToolCall': {
+        const turnId = field('turn_id');
+        return Boolean(turnId && session.primaryTurnIds.has(turnId));
+      }
+      case 'ToolCallSourceLink': {
+        const toolCallId = field('tool_call_id');
+        const messageId = field('message_id');
+        return Boolean(toolCallId && messageId
+          && session.projectedToolCallIds.has(toolCallId)
+          && session.visibleMessageIds.has(messageId)
+          && materialized('ModelRequest', field('model_request_id')));
+      }
+      case 'ToolCallPolicySnapshot':
+      case 'ToolCallEvent':
+      case 'ToolExecution':
+      case 'ToolOutcome':
+      case 'ToolModelResult':
+      case 'ToolResultArtifact':
+      case 'FileChangeSet': {
+        const toolCallId = field('tool_call_id');
+        return Boolean(toolCallId && session.projectedToolCallIds.has(toolCallId));
+      }
+      case 'FileChangeSetMember':
+      case 'FileChangeDecision':
+      case 'FileMutationReceipt':
+        return materialized('FileChangeSet', field('change_set_id'));
+      case 'FileMutationReceiptMember':
+        return materialized('FileMutationReceipt', field('receipt_id'));
+      case 'InteractionOwnerLink': {
+        const turnId = field('turn_id');
+        return Boolean(turnId && session.primaryTurnIds.has(turnId));
+      }
+      case 'InteractionToolCallLink': {
+        const toolCallId = field('tool_call_id');
+        return Boolean(toolCallId && session.projectedToolCallIds.has(toolCallId));
+      }
+      case 'InteractionRequest':
+        return referencedBy('InteractionOwnerLink', 'InteractionToolCallLink');
+      case 'InteractionResponse':
+        return materialized('InteractionRequest', field('request_id'));
+      case 'ProcessOriginLink': {
+        const toolCallId = field('tool_call_id');
+        return Boolean(toolCallId && session.projectedToolCallIds.has(toolCallId));
+      }
+      case 'Process':
+        return referencedBy('ProcessOriginLink');
+      case 'ProcessReceipt':
+        return materialized('Process', field('process_id'));
+      case 'ChildExecutionParentLink': {
+        const toolCallId = field('source_tool_call_id');
+        return Boolean(
+          (toolCallId && session.projectedToolCallIds.has(toolCallId))
+          || materialized('ChildExecution', field('child_execution_id'))
+        );
+      }
+      case 'ChildExecution':
+        return field('child_conversation_id') === activeConversationId
+          || referencedBy('ChildExecutionParentLink');
+      case 'ChildExecutionTurnLink':
+      case 'ChildExecutionActiveTurnLink':
+        return materialized('ChildExecution', field('child_execution_id'));
+      case 'AnswerBridge':
+        return materialized('ChildExecution', field('child_execution_id'));
+      case 'AnswerSubmission':
+        return materialized('AnswerBridge', field('answer_bridge_id'));
+      case 'RuntimeDelivery':
+        return field('target_conversation_id') === activeConversationId;
+      case 'RuntimeInboxItem':
+        return referencedBy('RuntimeDelivery');
+      default:
+        return false;
     }
-    return false;
   }
 
   private resetVisibleIdentities(
@@ -559,6 +729,9 @@ export class BoundedClientFeed {
     session.latestVisibleMessageFloor = 0n;
     session.messageDisplayFloors.clear();
     session.navigationConversationIds.clear();
+    session.primaryTurnIds.clear();
+    session.visibleMessageIds.clear();
+    session.projectedToolCallIds.clear();
     const navigation = projections.navigationSummary;
     if (isPlainRecord(navigation) && Array.isArray(navigation.conversations)) {
       for (const conversation of navigation.conversations) {
@@ -588,11 +761,13 @@ export class BoundedClientFeed {
       if (Array.isArray(activeWindow.messages)) {
         for (const message of activeWindow.messages) {
           if (!isPlainRecord(message) || typeof message.id !== 'string') continue;
+          session.visibleMessageIds.add(message.id);
           const displayFloor = plainNonNegativeBigInt(message.display_seq);
           if (displayFloor > 0n) session.messageDisplayFloors.set(message.id, displayFloor);
         }
       }
     }
+    seedScopedProjectionIdentities(session, projections);
   }
 
   private allocateMessageSeq(session: ClientFeedSession): string {
@@ -694,6 +869,41 @@ export class ClientHistoryReader {
     }
     return toWirePlain(result) as unknown as ClientKeysetPageResult;
   }
+
+  public async backwardVisibleMessages(
+    input: ClientVisibleMessageHistoryPageInput
+  ): Promise<ReliableKernelHistoryPage> {
+    if ('offset' in (input as unknown as Record<string, unknown>)) {
+      throw new TypeError('Offset pagination is forbidden.');
+    }
+    const result = await this.database.clientVisibleMessageHistoryPage(input);
+    if (
+      (result.records.Message?.length ?? 0) > CLIENT_PAGE_MAX_ROWS
+      || result.responseBytes > CLIENT_PAGE_MAX_BYTES
+    ) {
+      throw new Error('Database worker returned an out-of-bounds visible Message history page.');
+    }
+    const records: ReliableKernelHistoryPage['records'] = {};
+    for (const [domain, rows] of Object.entries(result.records)) {
+      records[domain] = rows.map((row) => boundRecord(
+        toWirePlain(row) as Record<string, PlainData>
+      ));
+    }
+    const page: ReliableKernelHistoryPage = {
+      records,
+      ...(result.nextBeforeMessageSeq === undefined
+        ? {}
+        : { nextBeforeMessageSeq: result.nextBeforeMessageSeq }),
+      ...(result.nextBeforeId === undefined ? {} : { nextBeforeId: result.nextBeforeId }),
+      hasMore: result.hasMore,
+      responseBytes: 0
+    };
+    settleClientWireResponseBytes(page);
+    if (page.responseBytes > CLIENT_PAGE_MAX_BYTES) {
+      throw new Error('Visible Message history page exceeds maxPageBytes after wire encoding.');
+    }
+    return page;
+  }
 }
 
 export type ClientDetailKind = ReliableKernelClientDetailKind;
@@ -782,12 +992,18 @@ export class ClientDetailReader {
       input.kind === 'context-projection-detail'
       || input.kind === 'file-change-diff'
       || input.kind === 'turn-intent-preview'
+      || input.kind === 'model-request-purpose'
+      || input.kind === 'compression-presentation'
     ) {
       const bytes = input.kind === 'context-projection-detail'
         ? await this.materializeContextProjectionDetail(recordId)
         : input.kind === 'file-change-diff'
           ? await this.materializeFileChangeDiff(recordId)
-          : await this.materializeTurnIntentPreview(recordId, input.conversationId);
+          : input.kind === 'turn-intent-preview'
+            ? await this.materializeTurnIntentPreview(recordId, input.conversationId)
+            : input.kind === 'model-request-purpose'
+              ? await this.materializeModelRequestPurpose(recordId, input.conversationId)
+              : await this.materializeCompressionPresentation(recordId, input.conversationId);
       if (input.offset > bytes.length) throw new RangeError('Detail offset exceeds structural payload length.');
       const end = Math.min(bytes.length, input.offset + maxRawBytes);
       return buildDetailChunk(recordId, input.offset, bytes.subarray(input.offset, end), bytes.length);
@@ -1042,6 +1258,112 @@ export class ClientDetailReader {
     return Buffer.from(JSON.stringify(structural), 'utf8');
   }
 
+  /**
+   * Exposes only the small, non-secret request purpose needed by the timeline. The immutable
+   * recipe may contain prompts and tool definitions, so it must never be returned to the Webview.
+   */
+  private async materializeModelRequestPurpose(
+    recordId: string,
+    conversationId?: string | null
+  ): Promise<Buffer> {
+    const request = await this.requireExisting('ModelRequest', recordId);
+    if (conversationId !== undefined) {
+      const scopedConversationId = conversationId === null
+        ? null
+        : requirePhaseFId(conversationId, 'detail.conversationId');
+      const turn = await this.requireExisting(
+        'Turn',
+        requirePhaseFId(request.turn_id, 'ModelRequest.turn_id')
+      );
+      if (!scopedConversationId || turn.conversation_id !== scopedConversationId) {
+        throw new Error(`ModelRequest ${recordId} is not visible in the active Conversation.`);
+      }
+    }
+    const recipeObject = await this.requireExisting(
+      'ContentObject',
+      requirePhaseFId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
+    ) as ContentObjectMetadata;
+    const recipeBytes = await this.contentStore.read(recipeObject);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(recipeBytes.toString('utf8')) as unknown;
+    } catch {
+      throw new Error(`ModelRequest ${recordId} recipe is not valid JSON.`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`ModelRequest ${recordId} recipe must be a JSON object.`);
+    }
+    const recipe = parsed as Record<string, unknown>;
+    if (recipe.kind !== 'reliable-context-compression') {
+      return Buffer.from(JSON.stringify({ kind: 'model' }), 'utf8');
+    }
+    const trigger = recipe.trigger;
+    const requestKind = recipe.requestKind;
+    if (
+      (trigger !== 'auto' && trigger !== 'manual')
+      || (requestKind !== 'context_compression_pre' && requestKind !== 'context_compression_manual')
+      || (trigger === 'auto') !== (requestKind === 'context_compression_pre')
+    ) {
+      throw new Error(`Compression ModelRequest ${recordId} has inconsistent trigger metadata.`);
+    }
+    const methodKind = requireCompressionMethodKind(recipe.compressionMethodKind);
+    const sourceSegmentCount = runtimeNonNegativeSafeInteger(
+      recipe.sourceSegmentCount as PlainData | undefined,
+      'compression recipe.sourceSegmentCount'
+    );
+    if (sourceSegmentCount === 0) {
+      throw new Error(`Compression ModelRequest ${recordId} has no source segments.`);
+    }
+    return Buffer.from(JSON.stringify(toWirePlain({
+      kind: 'context_compression',
+      trigger,
+      requestKind,
+      blockId: requirePhaseFId(recipe.blockId, 'compression recipe.blockId'),
+      methodKind,
+      sourceSegmentCount
+    })), 'utf8');
+  }
+
+  /** Small collapsed-card metadata; summary contents remain in the pageable detail authority. */
+  private async materializeCompressionPresentation(
+    recordId: string,
+    conversationId?: string | null
+  ): Promise<Buffer> {
+    const [titleObjectId, summaryObjectId] = await Promise.all([
+      this.compressionObjectId(recordId, 'title_object_id', conversationId),
+      this.compressionObjectId(recordId, 'summary_object_id', conversationId)
+    ]);
+    const [titleObject, summaryObject] = await Promise.all([
+      this.requireExisting('ContentObject', titleObjectId),
+      this.requireExisting('ContentObject', summaryObjectId)
+    ]) as [ContentObjectMetadata, ContentObjectMetadata];
+    const [titleBytes, summaryBytes] = await Promise.all([
+      this.contentStore.read(titleObject),
+      this.contentStore.read(summaryObject)
+    ]);
+    const title = decodeUtf8DiffContent(titleBytes, 'compression title').trim();
+    if (!title) throw new Error(`CompressionBlock ${recordId} has an empty title.`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(summaryBytes.toString('utf8')) as unknown;
+    } catch {
+      throw new Error(`CompressionBlock ${recordId} summary is not valid JSON.`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`CompressionBlock ${recordId} summary must be a JSON object.`);
+    }
+    const summary = parsed as Record<string, unknown>;
+    const trigger = summary.trigger;
+    if (trigger !== 'auto' && trigger !== 'manual') {
+      throw new TypeError(`CompressionBlock ${recordId} has an invalid trigger.`);
+    }
+    return Buffer.from(JSON.stringify(toWirePlain({
+      title,
+      trigger,
+      methodKind: requireCompressionMethodKind(summary.methodKind)
+    })), 'utf8');
+  }
+
   private async materializeFileChangeDiff(recordId: string): Promise<Buffer> {
     const member = await this.requireExisting('FileChangeSetMember', recordId);
     const operation = requireFileChangeOperation(member.operation);
@@ -1139,7 +1461,7 @@ export class ClientDetailReader {
   private async resolveContentObjectId(
     kind: Exclude<
       ClientDetailKind,
-      'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'process-stdout' | 'process-stderr'
+      'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'model-request-purpose' | 'compression-presentation' | 'process-stdout' | 'process-stderr'
     >,
     recordId: string,
     conversationId?: string | null
@@ -1265,6 +1587,20 @@ function requireFileChangeOperation(value: unknown): 'create_file' | 'replace_fi
   return value as 'create_file' | 'replace_file' | 'delete_file' | 'create_directory' | 'delete_directory_tree';
 }
 
+function requireCompressionMethodKind(value: unknown): string {
+  const allowed = [
+    'openai_responses_compact',
+    'llm_summary',
+    'segmented_summary',
+    'deterministic_summary',
+    'manual_summary'
+  ];
+  if (!allowed.includes(String(value))) {
+    throw new TypeError(`Unsupported compression method: ${String(value)}.`);
+  }
+  return String(value);
+}
+
 function decodeUtf8DiffContent(bytes: Buffer, role: string): string {
   const text = bytes.toString('utf8');
   if (!Buffer.from(text, 'utf8').equals(bytes)) {
@@ -1273,10 +1609,39 @@ function decodeUtf8DiffContent(bytes: Buffer, role: string): string {
   return text;
 }
 
-const CONVERSATION_REFERENCE_FIELDS = new Set([
-  'conversation_id',
-  'target_conversation_id',
-  'child_conversation_id'
+const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
+  'Message',
+  'Turn',
+  'ConversationProjectLink',
+  'ConversationReuseLink',
+  'ConversationBranchLink',
+  'ConversationOriginLink',
+  'AgentConversationLink',
+  'TurnIntent',
+  'CompressionBlock',
+  'Process',
+  'ChildExecution',
+  'AnswerSubmission',
+  'RuntimeDelivery'
+]);
+
+const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
+  'Message',
+  'MessageTurnLink',
+  'ModelRequest',
+  'ModelRequestMessageLink',
+  'ToolCall',
+  'ToolCallSourceLink',
+  'FileChangeSet',
+  'FileChangeSetMember',
+  'Process',
+  'ProcessOriginLink',
+  'ChildExecution',
+  'ChildExecutionParentLink',
+  'ChildExecutionTurnLink',
+  'ChildExecutionActiveTurnLink',
+  'AnswerBridge',
+  'RuntimeDelivery'
 ]);
 
 /** Text links which are intentionally not SQLite foreign keys still need an explicit type. */
@@ -1421,6 +1786,61 @@ function releaseActiveRecordKey(session: ClientFeedSession, key: string): void {
     session.activeRecordKeys.delete(key);
   } else {
     session.activeRecordKeyRefCounts.set(key, next);
+  }
+}
+
+function hasMaterializedReferenceFrom(
+  session: ClientFeedSession,
+  targetKey: string,
+  sourceDomains: readonly string[]
+): boolean {
+  for (const [sourceKey, references] of session.materializedRecordReferences) {
+    if (!sourceDomains.some((domain) => sourceKey.startsWith(`${domain}\0`))) continue;
+    if (references.has(targetKey)) return true;
+  }
+  return false;
+}
+
+function rememberScopedProjectionIdentity(
+  session: ClientFeedSession,
+  domain: string,
+  id: string,
+  record: Record<string, unknown>
+): void {
+  if (domain === 'Turn' && record.conversation_id === session.activeConversationId) {
+    session.primaryTurnIds.add(id);
+    return;
+  }
+  if (
+    domain === 'Message'
+    && record.conversation_id === session.activeConversationId
+    && record.deleted_at === null
+    && (record.role === 'user' || record.role === 'model')
+  ) {
+    session.visibleMessageIds.add(id);
+    return;
+  }
+  if (domain === 'ToolCall') {
+    session.projectedToolCallIds.add(id);
+    return;
+  }
+}
+
+function seedScopedProjectionIdentities(
+  session: ClientFeedSession,
+  projections: Record<string, PlainData>
+): void {
+  const activeTurns = projections.activeTurnSummary;
+  if (isPlainRecord(activeTurns) && Array.isArray(activeTurns.turns)) {
+    for (const turn of activeTurns.turns) {
+      if (isPlainRecord(turn) && typeof turn.id === 'string') session.primaryTurnIds.add(turn.id);
+    }
+  }
+  const tools = projections.activeToolAndInteractionSummary;
+  if (isPlainRecord(tools) && Array.isArray(tools.toolCalls)) {
+    for (const toolCall of tools.toolCalls) {
+      if (isPlainRecord(toolCall) && typeof toolCall.id === 'string') session.projectedToolCallIds.add(toolCall.id);
+    }
   }
 }
 
@@ -1660,45 +2080,17 @@ function buildDetailChunk(
 }
 
 function boundProjectionRecords(projections: Record<string, PlainData>): Record<string, PlainData> {
-  const visit = (value: PlainData, key = ''): PlainData => {
+  const visit = (value: PlainData): PlainData => {
     if (Array.isArray(value)) {
-      const limit = key === 'messages' ? CLIENT_MESSAGE_WINDOW_LIMIT : CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE;
-      const retained = OLDEST_FIRST_SNAPSHOT_ARRAYS.has(key)
-        ? value.slice(Math.max(0, value.length - limit))
-        : value.slice(0, limit);
-      return retained.map((entry) => {
+      return value.map((entry) => {
         if (entry && typeof entry === 'object' && !Array.isArray(entry)) return boundRecord(entry);
         return visit(entry);
       });
     }
     if (!value || typeof value !== 'object') return value;
-    return Object.fromEntries(Object.entries(value).map(([nestedKey, nested]) => [nestedKey, visit(nested, nestedKey)]));
+    return Object.fromEntries(Object.entries(value).map(([nestedKey, nested]) => [nestedKey, visit(nested)]));
   };
   return visit(projections) as Record<string, PlainData>;
-}
-
-const OLDEST_FIRST_SNAPSHOT_ARRAYS = new Set([
-  'messages',
-  'compressionBlocks',
-  'modelRequests',
-  'modelRequestMessageLinks',
-  'messageTurnLinks'
-]);
-
-function boundRecord(recordInput: Record<string, PlainData>): Record<string, PlainData> {
-  let record = structuredClone(recordInput);
-  if (wireBytes(record) <= CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES) return record;
-  record = truncateStrings(record, 256) as Record<string, PlainData>;
-  if (wireBytes(record) <= CLIENT_WINDOW_RECORD_SUMMARY_MAX_BYTES) return record;
-  const essential = new Set(['id', 'status', 'state', 'phase', 'parent_handling_state']);
-  const compact: Record<string, PlainData> = { summary_truncated: true };
-  for (const [key, value] of Object.entries(record)) {
-    if (essential.has(key) || key.endsWith('_id') || key.endsWith('_seq')) compact[key] = value;
-  }
-  // Identity fields are exact protocol keys, not display text. A long provider_call_id may make
-  // this one summary exceed the display target; the enclosing message/snapshot byte bounds still
-  // paginate or refresh transport, while replacement identity remains lossless.
-  return compact;
 }
 
 function enforceSnapshotBounds(message: ReliableKernelSnapshotMessage): void {
@@ -1730,7 +2122,7 @@ interface SnapshotRetentionCandidate {
   key: string;
   values: PlainData[];
   direction: 'oldest-first' | 'newest-first';
-  protectedId?: string;
+  protectedIds?: ReadonlySet<string>;
   eligibleCount: number;
   weight: number;
 }
@@ -1750,47 +2142,40 @@ function snapshotRetentionCandidates(
   const turns = requireSnapshotSection(projections, 'activeTurnSummary');
   const tools = requireSnapshotSection(projections, 'activeToolAndInteractionSummary');
   const subagents = requireSnapshotSection(projections, 'subagentDeliverySummary');
+  const protectedMessageIds = snapshotProtectedMessageIds(window, turns, tools, subagents);
   const candidates: SnapshotRetentionCandidate[] = [];
   const add = (
     section: Record<string, PlainData>,
     key: string,
     direction: SnapshotRetentionCandidate['direction'],
-    protectedId?: string
+    protectedIds?: ReadonlySet<string>
   ): void => {
     const values = snapshotArray(section, key);
-    const eligibleCount = protectedId
-      ? values.filter((value) => snapshotRecordId(value) !== protectedId).length
+    const eligibleCount = protectedIds
+      ? values.filter((value) => !protectedIds.has(snapshotRecordId(value) ?? '')).length
       : values.length;
     if (eligibleCount === 0) return;
     candidates.push({
       key,
       values,
       direction,
-      ...(protectedId ? { protectedId } : {}),
+      ...(protectedIds ? { protectedIds } : {}),
       eligibleCount,
       weight: wireBytes(values)
     });
   };
 
-  add(navigation, 'conversations', 'newest-first', activeConversationId);
-  add(window, 'messages', 'oldest-first');
-  add(window, 'conversationProjectLinks', 'newest-first');
+  add(
+    navigation,
+    'conversations',
+    'newest-first',
+    activeConversationId ? new Set([activeConversationId]) : undefined
+  );
+  add(window, 'messages', 'oldest-first', protectedMessageIds);
   add(window, 'conversationReuseLinks', 'newest-first');
   add(window, 'conversationBranchLinks', 'newest-first');
   add(window, 'conversationOriginLinks', 'newest-first');
-  add(window, 'agentConversationLinks', 'newest-first');
-  // Queue rows are oldest-first admission anchors; shed the newest tail first under byte pressure.
-  add(window, 'queuedTurnIntents', 'newest-first');
   add(window, 'compressionBlocks', 'oldest-first');
-  add(window, 'conversationContextStatuses', 'newest-first');
-  add(turns, 'turns', 'newest-first');
-  add(turns, 'modelRequests', 'oldest-first');
-  add(tools, 'toolCalls', 'newest-first');
-  add(tools, 'interactionRequests', 'newest-first');
-  add(tools, 'fileChangeSets', 'newest-first');
-  add(tools, 'processes', 'newest-first');
-  add(subagents, 'childExecutions', 'newest-first');
-  add(subagents, 'runtimeDeliveries', 'newest-first');
   return candidates;
 }
 
@@ -1798,11 +2183,11 @@ function dropOldestSnapshotRecords(target: SnapshotRetentionCandidate, count: nu
   let remaining = count;
   while (remaining > 0 && target.values.length > 0) {
     let index = target.direction === 'oldest-first' ? 0 : target.values.length - 1;
-    if (target.protectedId) {
+    if (target.protectedIds) {
       while (
         index >= 0
         && index < target.values.length
-        && snapshotRecordId(target.values[index]) === target.protectedId
+        && target.protectedIds.has(snapshotRecordId(target.values[index]) ?? '')
       ) {
         index += target.direction === 'oldest-first' ? 1 : -1;
       }
@@ -1813,73 +2198,175 @@ function dropOldestSnapshotRecords(target: SnapshotRetentionCandidate, count: nu
   }
 }
 
+function snapshotProtectedMessageIds(
+  window: Record<string, PlainData>,
+  turns: Record<string, PlainData>,
+  tools: Record<string, PlainData>,
+  subagents: Record<string, PlainData>
+): Set<string> {
+  const protectedToolIds = new Set(snapshotArray(tools, 'toolCalls').flatMap((toolCall) => {
+    const status = snapshotField(toolCall, 'status');
+    return status && status !== 'terminal' ? [snapshotRecordId(toolCall) ?? ''] : [];
+  }).filter(Boolean));
+  const processOriginById = new Map(snapshotArray(tools, 'processOriginLinks').flatMap((link) => {
+    const processId = snapshotField(link, 'process_id');
+    const toolCallId = snapshotField(link, 'tool_call_id');
+    return processId && toolCallId ? [[processId, toolCallId] as const] : [];
+  }));
+  for (const process of snapshotArray(tools, 'processes')) {
+    if (snapshotField(process, 'status') !== 'running') continue;
+    const toolCallId = processOriginById.get(snapshotRecordId(process) ?? '');
+    if (toolCallId) protectedToolIds.add(toolCallId);
+  }
+  const interactionToolByRequest = new Map(snapshotArray(tools, 'interactionToolCallLinks').flatMap((link) => {
+    const requestId = snapshotField(link, 'request_id');
+    const toolCallId = snapshotField(link, 'tool_call_id');
+    return requestId && toolCallId ? [[requestId, toolCallId] as const] : [];
+  }));
+  for (const request of snapshotArray(tools, 'interactionRequests')) {
+    if (snapshotField(request, 'status') !== 'pending') continue;
+    const toolCallId = interactionToolByRequest.get(snapshotRecordId(request) ?? '');
+    if (toolCallId) protectedToolIds.add(toolCallId);
+  }
+  const activeChildIds = new Set(snapshotArray(subagents, 'childExecutions').flatMap((child) => {
+    const status = snapshotField(child, 'status');
+    return status && status !== 'closed' && status !== 'needs_human'
+      ? [snapshotRecordId(child) ?? '']
+      : [];
+  }).filter(Boolean));
+  for (const link of snapshotArray(subagents, 'childExecutionParentLinks')) {
+    if (!activeChildIds.has(snapshotField(link, 'child_execution_id') ?? '')) continue;
+    const toolCallId = snapshotField(link, 'source_tool_call_id');
+    if (toolCallId) protectedToolIds.add(toolCallId);
+  }
+  const protectedRequestIds = new Set(snapshotArray(turns, 'modelRequests').flatMap((request) => {
+    const status = snapshotField(request, 'status');
+    return status && status !== 'terminal' ? [snapshotRecordId(request) ?? ''] : [];
+  }).filter(Boolean));
+  const protectedMessageIds = new Set<string>();
+  for (const link of snapshotArray(tools, 'toolCallSourceLinks')) {
+    if (!protectedToolIds.has(snapshotField(link, 'tool_call_id') ?? '')) continue;
+    const messageId = snapshotField(link, 'message_id');
+    if (messageId) protectedMessageIds.add(messageId);
+  }
+  for (const link of snapshotArray(turns, 'modelRequestMessageLinks')) {
+    if (!protectedRequestIds.has(snapshotField(link, 'model_request_id') ?? '')) continue;
+    const messageId = snapshotField(link, 'message_id');
+    if (messageId) protectedMessageIds.add(messageId);
+  }
+  const currentTaskList = window.currentTaskList;
+  if (isPlainRecord(currentTaskList)) {
+    const sourceMessageId = snapshotField(currentTaskList, 'sourceMessageId');
+    if (sourceMessageId) protectedMessageIds.add(sourceMessageId);
+  }
+  return protectedMessageIds;
+}
+
 function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>): void {
   const window = requireSnapshotSection(projections, 'activeConversationWindow');
   const turns = requireSnapshotSection(projections, 'activeTurnSummary');
   const tools = requireSnapshotSection(projections, 'activeToolAndInteractionSummary');
   const subagents = requireSnapshotSection(projections, 'subagentDeliverySummary');
 
-  let turnIds = snapshotIds(turns, 'turns');
-  const messageTurnLinks = snapshotArray(tools, 'messageTurnLinks');
-  const messagesWithoutTurn = new Set<string>();
-  for (const link of messageTurnLinks) {
-    const messageId = snapshotField(link, 'message_id');
-    const turnId = snapshotField(link, 'turn_id');
-    if (messageId && turnId && !turnIds.has(turnId)) messagesWithoutTurn.add(messageId);
-  }
-  removeSnapshotIds(window, 'messages', messagesWithoutTurn);
   let messageIds = snapshotIds(window, 'messages');
-
   const requestMessageLinks = snapshotArray(turns, 'modelRequestMessageLinks');
-  const requestIdsWithMissingMessages = new Set<string>();
-  for (const link of requestMessageLinks) {
-    const requestId = snapshotField(link, 'model_request_id');
-    const messageId = snapshotField(link, 'message_id');
-    if (requestId && messageId && !messageIds.has(messageId)) requestIdsWithMissingMessages.add(requestId);
-  }
+  const linkedRequestIds = new Set(requestMessageLinks.flatMap((link) => {
+    const id = snapshotField(link, 'model_request_id');
+    return id ? [id] : [];
+  }));
   filterSnapshotArray(turns, 'modelRequests', (request) => {
     const id = snapshotRecordId(request);
-    const turnId = snapshotField(request, 'turn_id');
-    return Boolean(id && turnId && turnIds.has(turnId) && !requestIdsWithMissingMessages.has(id));
+    if (!id) return false;
+    if (snapshotField(request, 'status') !== 'terminal') return true;
+    if (!linkedRequestIds.has(id)) return true;
+    return requestMessageLinks.some((link) =>
+      snapshotField(link, 'model_request_id') === id
+      && messageIds.has(snapshotField(link, 'message_id') ?? '')
+    );
   });
   let requestIds = snapshotIds(turns, 'modelRequests');
 
   const sourceLinks = snapshotArray(tools, 'toolCallSourceLinks');
-  const toolIdsWithMissingSources = new Set<string>();
-  for (const link of sourceLinks) {
-    const toolCallId = snapshotField(link, 'tool_call_id');
-    const requestId = snapshotField(link, 'model_request_id');
-    const messageId = snapshotField(link, 'message_id');
-    if (
-      toolCallId
-      && ((requestId && !requestIds.has(requestId)) || (messageId && !messageIds.has(messageId)))
-    ) toolIdsWithMissingSources.add(toolCallId);
-  }
   filterSnapshotArray(tools, 'toolCalls', (toolCall) => {
     const id = snapshotRecordId(toolCall);
-    const turnId = snapshotField(toolCall, 'turn_id');
-    return Boolean(id && turnId && turnIds.has(turnId) && !toolIdsWithMissingSources.has(id));
+    if (!id) return false;
+    return sourceLinks.some((link) =>
+      snapshotField(link, 'tool_call_id') === id
+      && messageIds.has(snapshotField(link, 'message_id') ?? '')
+      && requestIds.has(snapshotField(link, 'model_request_id') ?? '')
+    );
   });
   let toolCallIds = snapshotIds(tools, 'toolCalls');
 
-  const processOriginLinks = snapshotArray(tools, 'processOriginLinks');
-  const processIdsWithMissingOrigins = new Set<string>();
-  for (const link of processOriginLinks) {
-    const processId = snapshotField(link, 'process_id');
-    const toolCallId = snapshotField(link, 'tool_call_id');
-    if (processId && toolCallId && !toolCallIds.has(toolCallId)) processIdsWithMissingOrigins.add(processId);
-  }
-  filterSnapshotArray(tools, 'processes', (process) => {
-    const id = snapshotRecordId(process);
-    return Boolean(id && !processIdsWithMissingOrigins.has(id));
+  const interactionToolLinks = snapshotArray(tools, 'interactionToolCallLinks');
+  const interactionOwnerLinks = snapshotArray(tools, 'interactionOwnerLinks');
+  filterSnapshotArray(tools, 'interactionRequests', (request) => {
+    const requestId = snapshotRecordId(request);
+    return Boolean(
+      requestId
+      && interactionOwnerLinks.some((link) => snapshotField(link, 'request_id') === requestId)
+      && interactionToolLinks.some((link) =>
+        snapshotField(link, 'request_id') === requestId
+        && toolCallIds.has(snapshotField(link, 'tool_call_id') ?? '')
+      )
+    );
   });
-  const processIds = snapshotIds(tools, 'processes');
+  const interactionIdsBeforeTurnPrune = snapshotIds(tools, 'interactionRequests');
+
+  const processOriginLinks = snapshotArray(tools, 'processOriginLinks');
+  filterSnapshotArray(tools, 'processes', (process) => {
+    const processId = snapshotRecordId(process);
+    return Boolean(processId && processOriginLinks.some((link) =>
+      snapshotField(link, 'process_id') === processId
+      && toolCallIds.has(snapshotField(link, 'tool_call_id') ?? '')
+    ));
+  });
+  let processIds = snapshotIds(tools, 'processes');
+
+  const childParentLinks = snapshotArray(subagents, 'childExecutionParentLinks');
+  const activeConversationId = snapshotField(window, 'conversationId')
+    ?? (typeof window.conversationId === 'string' ? window.conversationId : undefined);
+  filterSnapshotArray(subagents, 'childExecutions', (child) => {
+    const childId = snapshotRecordId(child);
+    if (!childId) return false;
+    if (activeConversationId && snapshotField(child, 'child_conversation_id') === activeConversationId) return true;
+    return childParentLinks.some((link) =>
+      snapshotField(link, 'child_execution_id') === childId
+      && toolCallIds.has(snapshotField(link, 'source_tool_call_id') ?? '')
+    );
+  });
+  const childIdsBeforeTurnPrune = snapshotIds(subagents, 'childExecutions');
+
+  const retainedTurnIds = new Set(snapshotArray(turns, 'turns').flatMap((turn) =>
+    snapshotField(turn, 'status') === 'active' ? [snapshotRecordId(turn) ?? ''] : []
+  ).filter(Boolean));
+  const messageTurnLinks = snapshotArray(tools, 'messageTurnLinks');
+  for (const link of messageTurnLinks) {
+    const messageId = snapshotField(link, 'message_id');
+    const turnId = snapshotField(link, 'turn_id');
+    if (messageId && turnId && messageIds.has(messageId)) retainedTurnIds.add(turnId);
+  }
+  for (const request of snapshotArray(turns, 'modelRequests')) {
+    const turnId = snapshotField(request, 'turn_id');
+    if (turnId) retainedTurnIds.add(turnId);
+  }
+  for (const toolCall of snapshotArray(tools, 'toolCalls')) {
+    const turnId = snapshotField(toolCall, 'turn_id');
+    if (turnId) retainedTurnIds.add(turnId);
+  }
+  for (const link of interactionOwnerLinks) {
+    if (!interactionIdsBeforeTurnPrune.has(snapshotField(link, 'request_id') ?? '')) continue;
+    const turnId = snapshotField(link, 'turn_id');
+    if (turnId) retainedTurnIds.add(turnId);
+  }
+  filterSnapshotArray(turns, 'turns', (turn) => retainedTurnIds.has(snapshotRecordId(turn) ?? ''));
 
   // Re-read anchor sets after cascades, then retain every dependent fact only with its owner.
-  turnIds = snapshotIds(turns, 'turns');
+  let turnIds = snapshotIds(turns, 'turns');
   messageIds = snapshotIds(window, 'messages');
   requestIds = snapshotIds(turns, 'modelRequests');
   toolCallIds = snapshotIds(tools, 'toolCalls');
+  processIds = snapshotIds(tools, 'processes');
   filterSnapshotReference(turns, 'executionLeases', 'turn_id', turnIds);
   filterSnapshotReference(turns, 'turnTerminations', 'turn_id', turnIds);
   filterSnapshotReference(turns, 'turnExecutorLinks', 'turn_id', turnIds);
@@ -1949,6 +2436,17 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   filterSnapshotArray(window, 'projectContexts', (context) => projectContextIds.has(snapshotRecordId(context) ?? ''));
 
   const childIds = snapshotIds(subagents, 'childExecutions');
+  const retainedChildConversationIds = new Set(snapshotArray(subagents, 'childExecutions').flatMap((child) => {
+    const id = snapshotField(child, 'child_conversation_id');
+    return id ? [id] : [];
+  }));
+  filterSnapshotArray(window, 'agentConversationLinks', (link) => {
+    const conversationId = snapshotField(link, 'conversation_id');
+    return Boolean(conversationId && (
+      conversationId === activeConversationId
+      || retainedChildConversationIds.has(conversationId)
+    ));
+  });
   for (const key of [
     'childExecutionParentLinks',
     'childExecutionTurnLinks',
@@ -2030,53 +2528,6 @@ function filterSnapshotArray(
   retain: (value: PlainData) => boolean
 ): void {
   section[key] = snapshotArray(section, key).filter(retain);
-}
-
-function truncateStrings(value: PlainData, maxLength: number, field = ''): PlainData {
-  if (typeof value === 'string') {
-    if (field === 'id' || field.endsWith('_id') || field.endsWith('_seq')) return value;
-    return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
-  }
-  if (Array.isArray(value)) return value.map((entry) => truncateStrings(entry, maxLength, field));
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, truncateStrings(nested, maxLength, key)]));
-}
-
-function toWirePlain(value: unknown, ancestors = new WeakSet<object>()): PlainData {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError('Client wire data contains a non-finite number.');
-    return value;
-  }
-  if (typeof value === 'bigint') return value.toString();
-  if (!value || typeof value !== 'object') throw new TypeError('Client wire data contains an unsupported value.');
-  if (
-    Buffer.isBuffer(value)
-    || value instanceof Map
-    || value instanceof Set
-    || value instanceof Date
-    || value instanceof RegExp
-  ) throw new TypeError('Client wire data contains a forbidden non-plain value.');
-  if (ancestors.has(value)) throw new TypeError('Client wire data contains a cycle.');
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) return value.map((entry) => toWirePlain(entry, ancestors));
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new TypeError('Client wire data contains a class instance.');
-    }
-    const result: Record<string, PlainData> = {};
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      if (nested !== undefined) result[key] = toWirePlain(nested, ancestors);
-    }
-    return result;
-  } finally {
-    ancestors.delete(value);
-  }
-}
-
-function wireBytes(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
 function requireDecimal(value: unknown, label: string): string {

@@ -2,7 +2,16 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
-import type { AgentRecord, InlineDataPart, LlmProviderConfigRecord, LlmProviderModelRecord, MessageContent, TurnAuthoritySelection, WorkEnvironmentRecord } from '@shared/protocol';
+import {
+  MAX_MESSAGE_ATTACHMENT_COUNT,
+  type AgentRecord,
+  type InlineDataPart,
+  type LlmProviderConfigRecord,
+  type LlmProviderModelRecord,
+  type MessageContent,
+  type TurnAuthoritySelection,
+  type WorkEnvironmentRecord
+} from '@shared/protocol';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
@@ -222,10 +231,35 @@ const editorShellStyle = computed(() => {
     '--composer-expanded-editor-height': `${expandedEditorHeight.value}px`
   };
 });
-const selectedAttachments = ref<InlineDataPart[]>([]);
+const SUPPORTED_COMPOSER_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'application/pdf',
+  'text/plain'
+]);
+const COMPOSER_EXTENSION_MIME_TYPES: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain'
+};
+const attachmentSnapshots = ref<Record<'chat' | 'edit', InlineDataPart[]>>({ chat: [], edit: [] });
+const selectedAttachments = computed<InlineDataPart[]>({
+  get: () => attachmentSnapshots.value[ui.composerMode],
+  set: (value) => {
+    attachmentSnapshots.value = { ...attachmentSnapshots.value, [ui.composerMode]: value };
+  }
+});
 const attachmentRefreshKey = computed(() => selectedAttachments.value.map((part, index) => index + ':' + (part.inlineData.name ?? '') + ':' + (part.inlineData.sizeBytes ?? 0)).join('|'));
 const hasDraftContent = computed(() => draft.value.trim().length > 0 || selectedAttachments.value.length > 0);
 const attachmentLimitBytes = computed(() => Math.max(1, globalSettings.attachments.maxStoredInlineFileMb || 20) * 1024 * 1024);
+const attachmentTotalBytes = computed(() => selectedAttachments.value.reduce(
+  (total, part) => total + Math.max(0, part.inlineData.sizeBytes ?? 0),
+  0
+));
 
 watch(
   () => currentSubmissionCommandId.value
@@ -234,7 +268,7 @@ watch(
   (acknowledgement) => {
     const commandId = currentSubmissionCommandId.value;
     if (!commandId || !acknowledgement) return;
-    selectedAttachments.value = [];
+    attachmentSnapshots.value = { ...attachmentSnapshots.value, chat: [] };
     ui.clearChatDraft();
     currentSubmissionCommandId.value = undefined;
     dismissTurnInputAcknowledgement(commandId);
@@ -256,11 +290,14 @@ watch(
       void nextTick(() => editor.value?.focus());
       return;
     }
-    if (draft.value.trim() || selectedAttachments.value.length > 0) return;
+    if (draft.value.trim() || attachmentSnapshots.value.chat.length > 0) return;
     draft.value = failure.text;
-    selectedAttachments.value = (failure.content?.parts ?? []).flatMap((part) =>
-      'inlineData' in part ? [structuredClone(part as InlineDataPart)] : []
-    );
+    attachmentSnapshots.value = {
+      ...attachmentSnapshots.value,
+      chat: (failure.content?.parts ?? []).flatMap((part) =>
+        'inlineData' in part ? [structuredClone(part as InlineDataPart)] : []
+      )
+    };
     dismissTurnInputFailure(failure.commandId);
     void nextTick(() => editor.value?.focus());
   },
@@ -273,8 +310,23 @@ watch(
   () => ui.composerHighlightKey,
   () => {
     if (!ui.isEditing) return;
+    attachmentSnapshots.value = {
+      ...attachmentSnapshots.value,
+      edit: (ui.editingMessage?.message.content.parts ?? []).flatMap((part) =>
+        'inlineData' in part ? [structuredClone(part as InlineDataPart)] : []
+      )
+    };
     pulseHighlight();
     void nextTick(() => editor.value?.focus());
+  }
+);
+
+watch(
+  () => ui.composerMode,
+  (mode, previous) => {
+    if (mode === 'chat' && previous === 'edit') {
+      attachmentSnapshots.value = { ...attachmentSnapshots.value, edit: [] };
+    }
   }
 );
 
@@ -308,7 +360,6 @@ function submit(): void {
   const content = buildMessageContent(text, selectedAttachments.value);
   if (ui.isEditing) {
     emit('submit', text, content, currentTurnAuthoritySelection());
-    selectedAttachments.value = [];
     return;
   }
   const submission = sendMessage(text, content, currentTurnAuthoritySelection());
@@ -330,15 +381,52 @@ async function onAttachmentFilesChange(event: Event): Promise<void> {
 }
 
 async function addFilesAsAttachments(files: File[]): Promise<void> {
+  const targetMode = ui.composerMode;
+  const limitBytes = attachmentLimitBytes.value;
+  const limitMb = globalSettings.attachments.maxStoredInlineFileMb || 20;
   for (const file of files) {
-    if (file.size > attachmentLimitBytes.value) {
-      globalSettings.status = `附件 ${file.name} 超过 ${globalSettings.attachments.maxStoredInlineFileMb || 20}MB，未添加。`;
+    let targetAttachments = attachmentSnapshots.value[targetMode];
+    if (targetAttachments.length >= MAX_MESSAGE_ATTACHMENT_COUNT) {
+      globalSettings.status = `每条消息最多添加 ${MAX_MESSAGE_ATTACHMENT_COUNT} 个附件。`;
+      break;
+    }
+    const mimeType = attachmentMimeTypeForFile(file);
+    if (!SUPPORTED_COMPOSER_MIME_TYPES.has(mimeType)) {
+      globalSettings.status = `当前模型附件仅支持 PNG、JPEG、WebP、PDF 和纯文本；未添加 ${file.name}。`;
       continue;
     }
-    const mimeType = file.type || 'application/octet-stream';
+    if (file.size > limitBytes) {
+      globalSettings.status = `附件 ${file.name} 超过 ${limitMb}MB，未添加。`;
+      continue;
+    }
+    if (attachmentBytes(targetAttachments) + file.size > limitBytes) {
+      globalSettings.status = `本条消息的附件总大小超过 ${limitMb}MB，未添加 ${file.name}。`;
+      continue;
+    }
     const data = await readFileAsBase64(file);
-    selectedAttachments.value.push({ inlineData: { mimeType, data, name: file.name, storage: 'embedded', status: 'available', sizeBytes: file.size } });
+    // FileReader can finish after the user switches between chat and edit. Commit to the bucket
+    // selected when reading started, never whichever mode happens to be current after the await.
+    targetAttachments = attachmentSnapshots.value[targetMode];
+    if (targetAttachments.length >= MAX_MESSAGE_ATTACHMENT_COUNT) {
+      globalSettings.status = `每条消息最多添加 ${MAX_MESSAGE_ATTACHMENT_COUNT} 个附件。`;
+      break;
+    }
+    if (attachmentBytes(targetAttachments) + file.size > limitBytes) {
+      globalSettings.status = `本条消息的附件总大小超过 ${limitMb}MB，未添加 ${file.name}。`;
+      continue;
+    }
+    attachmentSnapshots.value = {
+      ...attachmentSnapshots.value,
+      [targetMode]: [
+        ...targetAttachments,
+        { inlineData: { mimeType, data, name: file.name, storage: 'embedded', status: 'available', sizeBytes: file.size } }
+      ]
+    };
   }
+}
+
+function attachmentBytes(attachments: InlineDataPart[]): number {
+  return attachments.reduce((total, part) => total + Math.max(0, part.inlineData.sizeBytes ?? 0), 0);
 }
 
 function removeAttachment(index: number): void {
@@ -354,6 +442,14 @@ function buildMessageContent(text: string, attachments: InlineDataPart[]): Messa
       ...attachments.map((part) => ({ inlineData: { ...part.inlineData } }))
     ]
   };
+}
+
+function attachmentMimeTypeForFile(file: File): string {
+  if (file.type) return file.type.toLowerCase();
+  const normalizedName = file.name.toLowerCase();
+  const extension = Object.keys(COMPOSER_EXTENSION_MIME_TYPES)
+    .find((candidate) => normalizedName.endsWith(candidate));
+  return extension ? COMPOSER_EXTENSION_MIME_TYPES[extension] : 'application/octet-stream';
 }
 
 function readFileAsBase64(file: File): Promise<string> {
@@ -686,7 +782,7 @@ function middleEllipsis(value: string, maxLength: number): string {
           type="file"
           class="composer-file-input"
           multiple
-          accept="image/png,image/jpeg,image/webp,application/pdf,text/plain,audio/*,video/*"
+          accept="image/png,image/jpeg,image/webp,application/pdf,text/plain"
           @change="onAttachmentFilesChange"
         />
         <button

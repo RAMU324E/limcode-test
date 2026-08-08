@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { MainPanel } from '../panels/MainPanel';
-import { getWebviewHtml } from '../webview/getWebviewHtml';
+import { getUnavailableWebviewHtml, getWebviewHtml } from '../webview/getWebviewHtml';
 import type { ApplicationFacade } from '../ApplicationFacade';
 import { EXTENSION_BRAND, SIDEBAR_ENTRY_VIEW_ID } from '../../shared/extensionIdentity';
 import { toStructuredClonePlainData } from '../../shared/plainData';
@@ -64,6 +64,20 @@ export function registerSidebarEntryView(context: vscode.ExtensionContext, backe
   context.subscriptions.push(backendApp.onDidChangeConversationHistory(() => provider.refreshConversationHistory()));
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => provider.refreshWorkspaceContext()));
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => provider.refreshWorkspaceContext()));
+}
+
+export function registerUnavailableSidebarEntryView(
+  context: vscode.ExtensionContext,
+  message: string
+): void {
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(SIDEBAR_ENTRY_VIEW_ID, {
+      resolveWebviewView(webviewView) {
+        webviewView.webview.options = { enableScripts: false };
+        webviewView.webview.html = getUnavailableWebviewHtml(message);
+      }
+    })
+  );
 }
 
 class SidebarEntryViewProvider implements vscode.WebviewViewProvider {

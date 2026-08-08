@@ -12,6 +12,7 @@ import {
   TASK_LIST_TOOL_NAME,
   TRANSFER_TOOL_NAME
 } from '@shared/protocol';
+import { MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } from '@shared/agentScheduling';
 import { submitPlanOutputFromResult } from '@shared/planReview';
 import type {
   FunctionCallPart,
@@ -28,6 +29,7 @@ import {
   type InteractionView
 } from '@webview/domain/interactionProjection';
 import { transientToolCallPreviewForMessage } from '@webview/domain/reliableTransientModel';
+import type { ReliableToolOutcomeProjectionStatus } from '@webview/domain/reliableConversationProjection';
 import {
   reliableKernelDetailDemandSignature,
   reliableKernelDetailKey
@@ -43,6 +45,7 @@ import { parseShellArgs, parseShellResultOutput } from '../toolDisplay/shellTool
 import ContentBlockSection from '../ContentBlockSection.vue';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
 import ToolDiffView from '../toolDisplay/ToolDiffView.vue';
+import InlineDataPartView from './InlineDataPartView.vue';
 import TextPartView from './TextPartView.vue';
 import StreamingToolCallPreview from './StreamingToolCallPreview.vue';
 import type { ToolDisplayDiff, ToolDisplaySection, ToolHeaderAction } from '../toolDisplay/types';
@@ -118,6 +121,11 @@ const toolResult = computed(() => {
   if (!call) return undefined;
   return reliableConversation.projection.value.toolResultByCallId[call.id];
 });
+const toolResponseParts = computed(() => toolCall.value?.responseParts ?? []);
+const toolOutcomeStatus = computed<ReliableToolOutcomeProjectionStatus | undefined>(() => {
+  const callId = toolCall.value?.id;
+  return callId ? reliableConversation.projection.value.toolOutcomeStatusByCallId[callId] : undefined;
+});
 const toolEvents = computed<ToolCallEventRecord[]>(() => {
   const callId = toolCall.value?.id;
   if (!callId) return [];
@@ -125,14 +133,14 @@ const toolEvents = computed<ToolCallEventRecord[]>(() => {
 });
 const transientPreview = computed(() => {
   const partId = props.part.id;
-  if (!partId || !props.messageId) return undefined;
+  if (!partId || !props.messageId || toolCall.value) return undefined;
   return transientToolCallPreviewForMessage(
     reliableConversation.feed.transientModelRequests,
     Object.values(reliableConversation.feed.records.ModelRequestMessageLink ?? {}),
     reliableConversation.conversationId.value,
     props.messageId,
     partId,
-    { includeFinal: toolCall.value === undefined }
+    { includeFinal: true }
   );
 });
 const executionInteraction = computed(() => reliableInteractionForKind('exec_approval'));
@@ -225,17 +233,31 @@ const executionApprovalPending = computed(() => toolCall.value?.status === 'awai
 const needsExecutionDecision = computed(() => executionInteraction.value?.request.state === 'pending');
 const needsChangeApplyDecision = computed(() => fileChangeInteractionView.value?.request.state === 'pending');
 const needsResultSubmitDecision = computed(() => resultReviewInteraction.value?.request.state === 'pending');
+const settledControlInteractionAwaitingOutcome = computed(() => {
+  const status = toolCall.value?.status;
+  if (!status || !['queued', 'awaiting_approval', 'awaiting_change_apply', 'awaiting_result_submit'].includes(status)) {
+    return false;
+  }
+  return [executionInteraction.value, fileChangeInteractionView.value, resultReviewInteraction.value]
+    .some((target) => !!target && target.request.state !== 'pending');
+});
 const interactionDecisionPending = computed(() => [executionInteraction.value, fileChangeInteractionView.value, resultReviewInteraction.value]
   .some((target) => !!target && interactions.isPending(target.request.id)));
 const hasMandatoryInteraction = computed(() => Boolean(
   askUserInteractionView.value?.request.state === 'pending'
   || planReviewInteractionView.value?.request.state === 'pending'
 ));
+const terminalResultDetailUnavailable = computed(() => {
+  const call = toolCall.value;
+  if (!call || !['success', 'warning', 'error'].includes(call.status)) return false;
+  const key = reliableKernelDetailKey('tool-result-content', call.id);
+  return reliableConversation.feed.details[key]?.status !== 'ready';
+});
 const expandedDetailDemandSignature = computed(() => {
   const call = toolCall.value;
   const hydrate = expanded.value || hasMandatoryInteraction.value;
   const targets = call && hydrate
-    ? fileDiffDetailTargets(call.id).map(({ kind, recordId }) => {
+    ? expandedDetailTargets(call.id).map(({ kind, recordId }) => {
         const key = reliableKernelDetailKey(kind, recordId);
         return { kind, recordId, status: reliableConversation.feed.details[key]?.status };
       })
@@ -256,6 +278,8 @@ const defaultAutoExpandTool = computed(() => [
 ].includes(props.part.functionCall.name));
 const hasDetails = computed(() => hasArgs.value
   || hasOutput.value
+  || toolResponseParts.value.length > 0
+  || terminalResultDetailUnavailable.value
   || Boolean(toolCall.value?.error)
   || executionApprovalPending.value
   || hasMandatoryInteraction.value);
@@ -283,13 +307,16 @@ const interactionStatusLabel = computed(() => {
   if (needsChangeApplyDecision.value) return '等待批准应用更改';
   if (needsExecutionDecision.value) return '等待批准执行';
   if (needsResultSubmitDecision.value) return '等待确认结果回传';
+  if (settledControlInteractionAwaitingOutcome.value) return '决定已提交，正在归档';
   return undefined;
 });
 const statusLabel = computed(() => cancelFeedback.value?.message
   ?? (finalizing.value ? '工具已完成，正在提交结果' : undefined)
   ?? commandRuntimeStatus.value?.label
   ?? interactionStatusLabel.value
-  ?? (toolCall.value ? labelForToolCall(toolCall.value, toolResult.value) : '工具请求已生成'));
+  ?? (toolCall.value
+    ? labelForToolCall(toolCall.value, toolResult.value, toolOutcomeStatus.value)
+    : props.streaming ? '正在生成工具调用' : '工具状态不完整'));
 // 可中断：正在推进（排队/执行/应用更改）或已批准待执行；等待用户决策的状态各有专用按钮，不重复给中断入口。
 // 注意：命令工具转后台后是终态 success（已把“成功”返回给 AI），不再算可中断——后台命令的终止在后台命令面板里做。
 const canCancel = computed(() => {
@@ -298,6 +325,7 @@ const canCancel = computed(() => {
   switch (call.status) {
     case 'queued':
     case 'awaiting_user_input':
+    case 'awaiting_child':
     case 'executing':
     case 'applying_change':
       return true;
@@ -308,7 +336,12 @@ const canCancel = computed(() => {
   }
 });
 const statusTitle = computed(() => {
-  if (!toolCall.value) return '等待后端创建工具调用记录';
+  if (!toolCall.value) {
+    return props.streaming
+      ? 'Provider 正在生成工具调用'
+      : '消息中已有工具调用，但当前快照缺少对应的可靠 ToolCall 关系';
+  }
+  if (toolOutcomeStatus.value === 'missing') return 'ToolCall 已终态，但当前快照缺少 ToolOutcome';
   if (finalizing.value) return '外部工具执行已结束，正在提交可靠终态';
   const runtimeStatus = commandRuntimeStatus.value?.status;
   return runtimeStatus ? '工具状态：' + toolCall.value.status + ' · shell ' + runtimeStatus : '工具状态：' + toolCall.value.status;
@@ -757,7 +790,14 @@ function shellRuntimeStatusLabel(call: ToolCallRecord, result: unknown): { label
   if (output.status === 'exited') return { label: '已退出', status: 'exited' };
   return undefined;
 }
-function labelForToolCall(call: ToolCallRecord, result: unknown): string {
+function labelForToolCall(
+  call: ToolCallRecord,
+  result: unknown,
+  outcomeStatus: ReliableToolOutcomeProjectionStatus | undefined
+): string {
+  if (call.status === 'queued' && isRunAgentStartupCall(call)) {
+    return `等待子 Agent 启动槽（每轮上限 ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN}）`;
+  }
   if (call.status === 'awaiting_approval' && isExecutionApprovedProgress(call.progress)) {
     return isWaitingForPreviousProgress(call.progress) ? '已批准，等待前序批次' : '已批准，等待执行';
   }
@@ -774,6 +814,12 @@ function labelForToolCall(call: ToolCallRecord, result: unknown): string {
   if (call.status === 'error' && isDeniedResult(result)) {
     return deniedStatusLabel(result, call.error);
   }
+  if (outcomeStatus === 'missing') return '工具状态不完整';
+  if (outcomeStatus === 'outcome_unknown') return '执行结果未知';
+  if (outcomeStatus === 'conflict') return '工具结果冲突';
+  if (outcomeStatus === 'cancelled') return '工具执行已取消';
+  if (outcomeStatus === 'partial') return '工具部分完成';
+  if (call.status === 'success' && call.name === 'run_agent' && isBackgroundAgentRunResult(result)) return '子任务已转后台';
   if (call.status === 'success' && isAsyncAgentRunResult(result)) return '子任务已启动';
   if (call.status === 'warning' && isPartialEditResult(result)) return '部分成功';
   return labelForStatus(call.status);
@@ -785,6 +831,7 @@ function labelForStatus(status: ToolCallStatus): string {
     queued: '等待调度执行',
     awaiting_approval: '等待批准执行',
     awaiting_user_input: '等待用户回答',
+    awaiting_child: '等待子 Agent 回答',
     executing: '工具执行中',
     awaiting_change_apply: '等待应用更改',
     applying_change: '正在应用更改',
@@ -796,6 +843,16 @@ function labelForStatus(status: ToolCallStatus): string {
     error: '工具执行失败'
   };
   return labels[status];
+}
+
+function isRunAgentStartupCall(call: ToolCallRecord): boolean {
+  if (call.name !== 'run_agent') return false;
+  try {
+    const args = JSON.parse(call.args) as unknown;
+    return !isRecord(args) || args.mode !== 'interrupt';
+  } catch {
+    return true;
+  }
 }
 
 function isDeniedResult(result: unknown): boolean {
@@ -813,6 +870,14 @@ function deniedStatusLabel(result: unknown, error: string | undefined): string {
   if (reason.includes('结果') || reason.includes('使用')) return '已拒绝结果';
   if (reason.includes('执行')) return '已拒绝执行';
   return '已拒绝工具调用';
+}
+
+function isBackgroundAgentRunResult(result: unknown): boolean {
+  const output = toolOutput(result);
+  if (!isRecord(output)) return false;
+  return (output.state === 'active' || output.state === 'starting')
+    && typeof output.childExecutionId === 'string'
+    && typeof output.answerBridgeId === 'string';
 }
 
 function isAsyncAgentRunResult(result: unknown): boolean {
@@ -849,14 +914,18 @@ function isFinalizingProgress(progress: unknown): boolean {
 </script>
 
 <template>
-  <StreamingToolCallPreview v-if="transientPreview" :preview="transientPreview" />
+  <StreamingToolCallPreview
+    v-if="transientPreview"
+    :preview="transientPreview"
+    :active="props.streaming === true"
+  />
   <CollapsibleContentBlock
     v-else
     :expanded="expanded"
     @update:expanded="setExpanded"
     class="tool-call-card"
     :class="[
-      toolCall ? `status-${toolCall.status}` : undefined,
+      toolCall ? `status-${toolCall.status}` : props.streaming ? 'status-streaming' : 'status-incomplete',
       hasBatchMeta ? `batch-${batchState}` : undefined,
       hasBatchMeta ? `batch-pos-${batchPosition}` : undefined,
       hasBatchMeta ? `batch-mode-${batchMode}` : undefined,
@@ -1011,6 +1080,13 @@ function isFinalizingProgress(progress: unknown): boolean {
           @panel-expanded-change="updatePlanSectionExpanded(section, $event)"
         />
       </ContentBlockSection>
+      <div v-if="toolResponseParts.length > 0" class="tool-response-attachments" aria-label="工具返回附件">
+        <InlineDataPartView
+          v-for="(attachment, index) in toolResponseParts"
+          :key="`${attachment.inlineData.attachmentId ?? attachment.inlineData.sourcePath ?? attachment.inlineData.name ?? attachment.inlineData.mimeType}-${index}`"
+          :part="attachment"
+        />
+      </div>
       <p v-if="toolCall?.error" class="part-card-error">{{ toolCall.error }}</p>
       <p v-else-if="executionApprovalPending && isWaitingForPreviousProgress(toolCall?.progress)" class="part-card-note">
         已批准执行，将在前序批次完成后按原始顺序自动继续。
@@ -1037,6 +1113,11 @@ function isFinalizingProgress(progress: unknown): boolean {
 </template>
 
 <style scoped>
+.tool-response-attachments {
+  display: grid;
+  gap: var(--space-2, 8px);
+}
+
 .tool-call-card {
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-sm);
@@ -1375,7 +1456,8 @@ function isFinalizingProgress(progress: unknown): boolean {
   color: var(--vscode-testing-iconPassed, #4caf50);
 }
 
-.status-warning .part-card-status {
+.status-warning .part-card-status,
+.status-incomplete .part-card-status {
   color: var(--vscode-editorWarning-foreground, #cca700);
 }
 

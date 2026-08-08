@@ -10,11 +10,12 @@ import {
 } from '../../shared/protocol';
 import { displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { EXTENSION_AGENT_NAME, EXTENSION_BRAND, MAIN_PANEL_VIEW_TYPE, WEBVIEW_DEV_PORT } from '../../shared/extensionIdentity';
-import { getWebviewHtml } from '../webview/getWebviewHtml';
+import { getUnavailableWebviewHtml, getWebviewHtml } from '../webview/getWebviewHtml';
 import {
   RELIABLE_KERNEL_ACK_MESSAGE,
   RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
   RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE,
   RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
 } from '../../shared/reliableKernelClientFeed';
 import type { ApplicationFacade } from '../ApplicationFacade';
@@ -61,6 +62,26 @@ export class MainPanel {
         }
       })
     );
+  }
+
+  public static registerUnavailableSerializer(context: vscode.ExtensionContext, message: string): void {
+    context.subscriptions.push(
+      vscode.window.registerWebviewPanelSerializer(MainPanel.viewType, {
+        async deserializeWebviewPanel(webviewPanel) {
+          MainPanel.renderUnavailable(webviewPanel, message);
+        }
+      })
+    );
+  }
+
+  public static createUnavailable(message: string): void {
+    const panel = vscode.window.createWebviewPanel(
+      MainPanel.viewType,
+      `${EXTENSION_BRAND} 无法启动`,
+      vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One,
+      { enableScripts: false, retainContextWhenHidden: true }
+    );
+    MainPanel.renderUnavailable(panel, message);
   }
 
   public static createOrShow(
@@ -110,6 +131,11 @@ export class MainPanel {
     };
   }
 
+  private static renderUnavailable(panel: vscode.WebviewPanel, message: string): void {
+    panel.webview.options = { enableScripts: false };
+    panel.webview.html = getUnavailableWebviewHtml(message);
+  }
+
   private constructor(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
@@ -127,14 +153,7 @@ export class MainPanel {
 
     this.refreshTitle(options.title);
     this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri);
-    this.clientId = this.backendApp.attachWebview(panel.webview, {
-      kind: this.kind === 'globalSettings' ? 'globalSettings' : this.kind === 'workflowSettings' ? 'workflowSettings' : this.kind === 'agentSettings' ? 'agentSettings' : this.kind === 'planDetail' ? 'planDetail' : 'mainPanel',
-      panelId: this.panelId,
-      title: this.panel.title,
-      conversationId: this.conversationId,
-      ...(this.toolCallId ? { toolCallId: this.toolCallId } : {}),
-      ...(this.planProposalId ? { planProposalId: this.planProposalId } : {})
-    });
+    this.clientId = this.backendApp.attachWebview(panel.webview, this.panelWebviewMeta());
 
     this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri);
 
@@ -227,7 +246,9 @@ export class MainPanel {
     return {
       kind: this.kind === 'globalSettings' ? 'globalSettings' : this.kind === 'workflowSettings' ? 'workflowSettings' : this.kind === 'agentSettings' ? 'agentSettings' : this.kind === 'planDetail' ? 'planDetail' : 'mainPanel',
       panelId: this.panelId,
-      title: this.panel.title,
+      title: this.kind === 'chat' && this.conversationId
+        ? this.backendApp.getConversationDisplayTitle(this.conversationId)
+        : this.panel.title,
       conversationId: this.conversationId,
       ...(this.toolCallId ? { toolCallId: this.toolCallId } : {}),
       ...(this.planProposalId ? { planProposalId: this.planProposalId } : {})
@@ -298,6 +319,7 @@ function isReliableKernelControlMessage(value: unknown): boolean {
   return type === RELIABLE_KERNEL_ACK_MESSAGE
     || type === RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
     || type === RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE
+    || type === RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE
     || type === RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE;
 }
 
@@ -305,7 +327,14 @@ async function resolveRestoredPanelOptions(
   backendApp: ApplicationFacade,
   options: MainPanelOptions
 ): Promise<MainPanelOptions> {
-  if (panelKind(options) !== 'chat' || options.conversationId) return options;
+  if (panelKind(options) !== 'chat') return options;
+  await backendApp.waitUntilHydrated();
+  if (options.conversationId) {
+    return {
+      ...options,
+      title: backendApp.getConversationDisplayTitle(options.conversationId)
+    };
+  }
   const existing = backendApp.getConversationHistoryEntries()[0];
   const conversationId = existing?.id ?? await backendApp.createConversation();
   return {

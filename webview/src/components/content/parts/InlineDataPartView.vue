@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { IconFile, IconRefresh, IconExternalLink } from '@tabler/icons-vue';
-import type { AttachmentReloadResultPayload, InlineDataPart } from '@shared/protocol';
+import type { AttachmentOpenResultPayload, AttachmentReloadResultPayload, InlineDataPart } from '@shared/protocol';
 import { BridgeMessageType } from '@shared/protocol';
 import { bridge } from '@webview/transport';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
@@ -14,13 +14,23 @@ const expanded = ref(false);
 const localPart = ref<InlineDataPart>(cloneInlineDataPart(props.part));
 const loading = ref(false);
 const pendingRequestId = ref<string>('');
+const opening = ref(false);
+const pendingOpenRequestId = ref<string>('');
+const openError = ref('');
 
 const stopReloadListener = bridge.on(BridgeMessageType.AttachmentReloadResult, (message) => {
   if (!message.payload || message.correlationId !== pendingRequestId.value) return;
   applyReloadResult(message.payload);
 });
+const stopOpenListener = bridge.on(BridgeMessageType.AttachmentOpenResult, (message) => {
+  if (!message.payload || message.correlationId !== pendingOpenRequestId.value) return;
+  applyOpenResult(message.payload);
+});
 
-onBeforeUnmount(() => stopReloadListener());
+onBeforeUnmount(() => {
+  stopReloadListener();
+  stopOpenListener();
+});
 
 watch(() => props.part, (next) => {
   localPart.value = mergeIncomingPart(localPart.value, next);
@@ -52,6 +62,7 @@ const statusText = computed(() => {
   return inlineData.value.data ? '已加载' : inlineData.value.sourcePath ? '本地文件引用' : inlineData.value.attachmentId ? '未加载' : '附件';
 });
 const canReload = computed(() => !!inlineData.value.attachmentId || !!inlineData.value.sourcePath);
+const canOpen = computed(() => canReload.value || !!inlineData.value.data);
 const decodedText = computed(() => {
   if (kind.value !== 'text' || !inlineData.value.data) return '';
   try {
@@ -86,12 +97,24 @@ function reload(): void {
 }
 
 function openInVscode(): void {
-  bridge.request(BridgeMessageType.AttachmentOpen, {
+  if (!canOpen.value || opening.value) return;
+  opening.value = true;
+  openError.value = '';
+  pendingOpenRequestId.value = bridge.request(BridgeMessageType.AttachmentOpen, {
     attachmentId: inlineData.value.attachmentId,
     sourcePath: inlineData.value.sourcePath,
+    data: inlineData.value.attachmentId || inlineData.value.sourcePath ? undefined : inlineData.value.data,
     mimeType: inlineData.value.mimeType,
     name: inlineData.value.name
   });
+}
+
+function applyOpenResult(payload: AttachmentOpenResultPayload): void {
+  opening.value = false;
+  pendingOpenRequestId.value = '';
+  openError.value = payload.status === 'failed'
+    ? payload.error || '无法打开附件。'
+    : '';
 }
 
 function applyReloadResult(payload: AttachmentReloadResultPayload): void {
@@ -101,9 +124,10 @@ function applyReloadResult(payload: AttachmentReloadResultPayload): void {
     localPart.value = cloneInlineDataPart(payload.part);
     return;
   }
+  const { data: _staleData, ...currentReference } = inlineData.value;
   localPart.value = {
     inlineData: {
-      ...inlineData.value,
+      ...currentReference,
       status: payload.status,
       ...(payload.error ? { error: payload.error } : {})
     }
@@ -115,10 +139,20 @@ function cloneInlineDataPart(part: InlineDataPart): InlineDataPart {
 }
 
 function mergeIncomingPart(current: InlineDataPart, incoming: InlineDataPart): InlineDataPart {
-  if (incoming.inlineData.data || current.inlineData.data) {
+  const sameAttachment = attachmentIdentity(current) === attachmentIdentity(incoming);
+  if (sameAttachment && (incoming.inlineData.data || current.inlineData.data)) {
     return { inlineData: { ...incoming.inlineData, data: incoming.inlineData.data ?? current.inlineData.data, status: incoming.inlineData.status ?? current.inlineData.status } };
   }
   return cloneInlineDataPart(incoming);
+}
+
+function attachmentIdentity(part: InlineDataPart): string {
+  const value = part.inlineData;
+  return value.attachmentId
+    ? `managed:${value.attachmentId}`
+    : value.sourcePath
+      ? `path:${value.sourcePath}`
+      : `embedded:${value.sha256 ?? ''}:${value.name ?? ''}:${value.mimeType}:${value.sizeBytes ?? ''}`;
 }
 
 function fileNameFromPath(path: string | undefined): string {
@@ -156,7 +190,14 @@ function formatBytes(bytes: number | undefined): string {
       <button v-if="canReload" type="button" class="attachment-action" :disabled="loading" title="重新加载附件" @click.stop="reload">
         <IconRefresh class="attachment-action-icon" stroke="2" aria-hidden="true" />
       </button>
-      <button type="button" class="attachment-action" title="在 VS Code 标签页打开附件" @click.stop="openInVscode">
+      <button
+        v-if="canOpen"
+        type="button"
+        class="attachment-action"
+        :disabled="opening"
+        :title="opening ? '正在打开附件' : '在 VS Code 标签页打开附件'"
+        @click.stop="openInVscode"
+      >
         <IconExternalLink class="attachment-action-icon" stroke="2" aria-hidden="true" />
       </button>
     </template>
@@ -164,18 +205,26 @@ function formatBytes(bytes: number | undefined): string {
     <div class="attachment-body" :class="`kind-${kind}`">
       <p v-if="loading || inlineData.status === 'loading'" class="attachment-state">附件加载中...</p>
       <template v-else-if="dataUri">
-        <img v-if="kind === 'image'" class="attachment-image" :src="dataUri" :alt="displayName" @click="openInVscode" />
+        <img
+          v-if="kind === 'image'"
+          class="attachment-image"
+          :class="{ 'is-openable': canOpen }"
+          :src="dataUri"
+          :alt="displayName"
+          @click="openInVscode"
+        />
         <audio v-else-if="kind === 'audio'" class="attachment-media" :src="dataUri" controls></audio>
         <video v-else-if="kind === 'video'" class="attachment-video" :src="dataUri" controls></video>
         <object v-else-if="kind === 'pdf'" class="attachment-pdf" :data="dataUri" type="application/pdf">
-          <p class="attachment-state">无法内嵌预览 PDF，可点击右上角在 VS Code 中打开。</p>
+          <p class="attachment-state">无法内嵌预览 PDF<template v-if="canOpen">，可点击右上角在 VS Code 中打开</template>。</p>
         </object>
         <pre v-else-if="kind === 'text'" class="attachment-text">{{ decodedText }}</pre>
-        <p v-else class="attachment-state">该附件类型暂无内嵌预览，可点击右上角在 VS Code 中打开。</p>
+        <p v-else class="attachment-state">该附件类型暂无内嵌预览<template v-if="canOpen">，可点击右上角在 VS Code 中打开</template>。</p>
       </template>
       <p v-else class="attachment-state is-error">
         {{ inlineData.error || (inlineData.status === 'missing' ? '附件文件不存在，可在文件恢复后重新加载。' : '附件尚未加载。') }}
       </p>
+      <p v-if="openError" class="attachment-state is-error attachment-open-error">{{ openError }}</p>
     </div>
   </CollapsibleContentBlock>
 </template>
@@ -248,12 +297,12 @@ function formatBytes(bytes: number | undefined): string {
   background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
 }
 
-.attachment-image {
+.attachment-image.is-openable {
   cursor: zoom-in;
   transition: filter 0.15s ease;
 }
 
-.attachment-image:hover {
+.attachment-image.is-openable:hover {
   filter: brightness(1.08);
 }
 
@@ -298,6 +347,10 @@ function formatBytes(bytes: number | undefined): string {
   margin: 0;
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-sm);
+}
+
+.attachment-open-error {
+  margin-top: var(--space-2, 8px);
 }
 
 .attachment-state.is-error {

@@ -69,6 +69,21 @@ export function registerCommands(context: vscode.ExtensionContext, backendApp: A
   context.subscriptions.push(openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand);
 }
 
+export function registerUnavailableCommands(context: vscode.ExtensionContext, message: string): void {
+  const displayMessage = `${EXTENSION_BRAND} 运行时无法启动：${message}`;
+  const openPanelCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.openPanel, () => {
+    MainPanel.createUnavailable(message);
+  });
+  const unavailableCommands = [
+    EXTENSION_COMMAND_IDS.revealGlobalStorage,
+    EXTENSION_COMMAND_IDS.resetDevelopmentData,
+    EXTENSION_COMMAND_IDS.inspectReliability
+  ].map((commandId) => vscode.commands.registerCommand(commandId, async () => {
+    await vscode.window.showErrorMessage(displayMessage);
+  }));
+  context.subscriptions.push(openPanelCommand, ...unavailableCommands);
+}
+
 function requestedConversationId(value: unknown): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const conversationId = (value as { conversationId?: unknown }).conversationId;
@@ -78,7 +93,13 @@ function requestedConversationId(value: unknown): string | undefined {
 async function resolveOpenPanelOptions(backendApp: ApplicationFacade, value: unknown): Promise<MainPanelOptions> {
   const options = openPanelOptions(value);
   if (options.kind !== undefined && options.kind !== 'chat') return options;
-  if (options.conversationId) return options;
+  await backendApp.waitUntilHydrated();
+  if (options.conversationId) {
+    return {
+      ...options,
+      title: options.title ?? backendApp.getConversationDisplayTitle(options.conversationId)
+    };
+  }
   const existing = backendApp.getConversationHistoryEntries()[0];
   const conversationId = existing?.id ?? await backendApp.createConversation();
   return {

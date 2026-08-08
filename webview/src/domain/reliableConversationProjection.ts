@@ -1,5 +1,6 @@
 import type {
   FunctionCallPart,
+  InlineDataPart,
   LlmUsageMetadataRecord,
   MessageContent,
   MessageRecord,
@@ -51,6 +52,16 @@ export interface ReliableInteractionProjection {
   prompt?: unknown;
 }
 
+export type ReliableToolOutcomeProjectionStatus =
+  | 'succeeded'
+  | 'failed'
+  | 'partial'
+  | 'rejected'
+  | 'cancelled'
+  | 'conflict'
+  | 'outcome_unknown'
+  | 'missing';
+
 export interface ReliableConversationProjection {
   messages: MessageRecord[];
   absoluteFloorByMessageId: Record<string, number>;
@@ -60,9 +71,11 @@ export interface ReliableConversationProjection {
   toolCallEventsByCallId: Record<string, ToolCallEventRecord[]>;
   toolEventIdsByCallId: Record<string, string[]>;
   turnIdByMessageId: Record<string, string>;
+  modelRequestIdByMessageId: Record<string, string>;
   messageRevisionIdByMessageId: Record<string, string>;
   terminationByMessageId: Record<string, RunTerminationRecord>;
   toolResultByCallId: Record<string, unknown>;
+  toolOutcomeStatusByCallId: Record<string, ReliableToolOutcomeProjectionStatus>;
   interactionByToolCallId: Record<string, ReliableInteractionProjection>;
   interactionPromptIdByToolCallId: Record<string, string>;
   fileDiffByToolCallId: Record<string, ReliableFileDiffProjection>;
@@ -141,7 +154,9 @@ export function projectReliableConversation(
         conversationId,
         role,
         content,
-        status: detail?.status === 'ready' ? 'final' : detail?.status === 'error' ? 'partial' : 'streaming',
+        // Detail hydration controls only whether the body is available. Durable request facts below
+        // decide the model Message lifecycle; a cache miss/read failure must never rewrite it.
+        status: role === 'user' ? 'final' : 'partial',
         createdAt: timestamp(record.created_at),
         ...(role === 'model' ? { retryTarget: { kind: 'message' as const, messageId: id } } : {}),
         seq: integer(record.display_seq) || integer(record.message_seq)
@@ -153,6 +168,14 @@ export function projectReliableConversation(
 
   const modelRequestsByTurn = groupBy(values(input.records.ModelRequest), (record) => text(record.turn_id));
   const modelRequestMessageLinks = values(input.records.ModelRequestMessageLink);
+  const modelRequestIdByMessageId: Record<string, string> = {};
+  for (const link of modelRequestMessageLinks) {
+    const requestId = text(link.model_request_id);
+    const messageId = text(link.message_id);
+    if (requestId && messageId && modelRequestIdByMessageId[messageId] === undefined) {
+      modelRequestIdByMessageId[messageId] = requestId;
+    }
+  }
   enrichModelMessages(
     parsedMessages,
     modelRequestsByTurn,
@@ -163,6 +186,11 @@ export function projectReliableConversation(
     transientByRequest: input.transientModelRequests ?? {},
     conversationId,
     modelRequestById: firstBy(values(input.records.ModelRequest), (record) => text(record.id)),
+    sourceMessageIdByTurnId: new Map(values(input.records.Turn).flatMap((turn) => {
+      const turnId = text(turn.id);
+      const sourceMessageId = text(turn.source_message_id);
+      return turnId && sourceMessageId ? [[turnId, sourceMessageId] as const] : [];
+    })),
     messageIdByModelRequestId: new Map(modelRequestMessageLinks.flatMap((link) => {
       const requestId = text(link.model_request_id);
       const messageId = text(link.message_id);
@@ -184,24 +212,18 @@ export function projectReliableConversation(
   const eventsByCall = groupBy(toolCallEvents, (event) => event.toolCallId);
   const toolCalls: ToolCallRecord[] = [];
   const toolResultByCallId: Record<string, unknown> = {};
+  const toolOutcomeStatusByCallId: Record<string, ReliableToolOutcomeProjectionStatus> = {};
   const missingToolArgumentIds: string[] = [];
   const missingToolResultIds: string[] = [];
 
   const messagesByTurn = groupBy(parsedMessages, (entry) => entry.turnId);
-  const requestMessageIdByRequestId = new Map(modelRequestMessageLinks.flatMap((link) => {
-    const requestId = text(link.model_request_id);
-    const messageId = text(link.message_id);
-    return requestId && messageId ? [[requestId, messageId] as const] : [];
-  }));
   const sourceByToolCallId = firstBy(values(input.records.ToolCallSourceLink), (link) => text(link.tool_call_id));
   const policyByToolCallId = firstBy(values(input.records.ToolCallPolicySnapshot), (snapshot) => text(snapshot.tool_call_id));
-  const assignedOrdinals = new Map<string, number>();
   for (const [turnId, rawCalls] of callsByTurn) {
     if (!turnId) continue;
     const functionTargets = functionCallTargets(messagesByTurn.get(turnId) ?? []);
     const orderedCalls = [...rawCalls].sort(compareSequence('call_seq'));
-    for (let index = 0; index < orderedCalls.length; index += 1) {
-      const raw = orderedCalls[index]!;
+    for (const raw of orderedCalls) {
       const id = text(raw.id);
       const name = text(raw.tool_name);
       if (!id || !name) continue;
@@ -209,12 +231,9 @@ export function projectReliableConversation(
       const policy = policyByToolCallId.get(id);
       const target = resolveFunctionCallTarget({
         raw,
-        fallbackIndex: index,
         functionTargets,
         messages: messagesByTurn.get(turnId) ?? [],
-        sourceLink,
-        requestMessageIdByRequestId,
-        assignedOrdinals
+        sourceLink
       });
       if (!target) continue;
       const argumentsDetail = input.details[reliableKernelDetailKey('tool-arguments-content', id)];
@@ -226,7 +245,11 @@ export function projectReliableConversation(
         : JSON.stringify(interactionArguments(interactionByToolCallId[id]?.prompt) ?? target.part.functionCall.args ?? {});
       const execution = executionsByCall.get(id);
       const outcome = outcomesByCall.get(id);
+      if (raw.status === 'terminal') {
+        toolOutcomeStatusByCallId[id] = toolOutcomeProjectionStatus(outcome);
+      }
       const parsedResult = resultDetail?.status === 'ready' ? parseJson(resultDetail.text) : undefined;
+      const responseParts = toolResponseParts(parsedResult);
       if (parsedResult !== undefined) toolResultByCallId[id] = toolResultDetail(parsedResult);
       const events = eventsByCall.get(id) ?? [];
       const status = toolStatus(raw, execution, outcome);
@@ -242,6 +265,7 @@ export function projectReliableConversation(
         ...(toolSummary(policy) ? { summary: toolSummary(policy) } : {}),
         ...(progress !== undefined ? { progress } : {}),
         ...(error ? { error } : {}),
+        ...(responseParts.length > 0 ? { responseParts } : {}),
         schedulingOrdinal: sourceLink ? integer(sourceLink.provider_ordinal) : target.ordinal,
         schedulingMode: toolSchedulingMode(policy),
         ...(toolSchedulingReason(policy) ? { schedulingReason: toolSchedulingReason(policy) } : {}),
@@ -275,9 +299,11 @@ export function projectReliableConversation(
     toolCallEventsByCallId,
     toolEventIdsByCallId,
     turnIdByMessageId,
+    modelRequestIdByMessageId,
     messageRevisionIdByMessageId,
     terminationByMessageId,
     toolResultByCallId,
+    toolOutcomeStatusByCallId,
     interactionByToolCallId,
     interactionPromptIdByToolCallId: interactionProjection.promptIdByToolCallId,
     fileDiffByToolCallId: fileChanges.diffByToolCallId,
@@ -401,6 +427,7 @@ function appendTransientMessages(input: {
   transientByRequest: Record<string, ReliableKernelTransientState>;
   conversationId: string;
   modelRequestById: Map<string, ReliableClientRecord>;
+  sourceMessageIdByTurnId: Map<string, string>;
   messageIdByModelRequestId: Map<string, string>;
   toolCallFacts: ReliableClientRecord[];
   lastCommitSeq?: string;
@@ -466,6 +493,7 @@ function appendTransientMessages(input: {
       transient,
       requestSeq,
       modelRequestById: input.modelRequestById,
+      sourceMessageIdByTurnId: input.sourceMessageIdByTurnId,
       messageIdByModelRequestId: input.messageIdByModelRequestId
     });
     if (anchoredSequence === undefined) continue;
@@ -508,7 +536,9 @@ function transientProjectionStatus(
       ? 'final'
       : 'partial';
   }
-  if (transient.status === 'completed') return 'final';
+  // Provider completion is still process-local until the terminal ModelRequest commit is visible.
+  // Keep the exact output mounted, but do not publish a durable-looking final state early.
+  if (transient.status === 'completed') return 'streaming';
   if (transient.status === 'failed' || transient.status === 'cancelled') return 'partial';
   return 'streaming';
 }
@@ -530,6 +560,7 @@ function transientSequenceAnchor(input: {
   transient: ReliableKernelTransientState;
   requestSeq: bigint;
   modelRequestById: Map<string, ReliableClientRecord>;
+  sourceMessageIdByTurnId: Map<string, string>;
   messageIdByModelRequestId: Map<string, string>;
 }): number | undefined {
   let lower: ParsedMessage | undefined;
@@ -572,6 +603,12 @@ function transientSequenceAnchor(input: {
       lower = candidate;
     }
   }
+  if (!lower) {
+    const sourceMessageId = input.sourceMessageIdByTurnId.get(input.transient.turnId);
+    lower = sourceMessageId
+      ? input.messages.find((candidate) => candidate.message.id === sourceMessageId)
+      : undefined;
+  }
   if (!lower) return undefined;
   if (!upper) {
     upper = input.messages
@@ -585,18 +622,28 @@ function transientSequenceAnchor(input: {
 
 function transientMessageContent(transient: ReliableKernelTransientState): MessageContent {
   const parts: MessageContent['parts'] = [];
-  const meaningfulThoughtTiming = (transient.thoughtElapsedMs ?? 0) > 0
+  const thoughtActive = transient.thoughtActive === true;
+  const meaningfulThoughtTiming = thoughtActive
+    || (transient.thoughtElapsedMs ?? 0) > 0
+    || (transient.thoughtCompletedDurationMs ?? 0) > 0
     || (transient.thoughtDurationMs ?? 0) > 0;
   if (transient.thought.trim() || meaningfulThoughtTiming) {
     parts.push({
       text: transient.thought,
       thought: true,
       ...(transient.thoughtSignature ? { thoughtSignature: transient.thoughtSignature } : {}),
-      ...(transient.thoughtDurationMs !== undefined
+      ...(thoughtActive && transient.thoughtStartedAt !== undefined
+        ? { thoughtStartedAt: transient.thoughtStartedAt }
+        : {}),
+      ...(thoughtActive && transient.thoughtCompletedDurationMs !== undefined
+        ? { thoughtCompletedDurationMs: transient.thoughtCompletedDurationMs }
+        : {}),
+      ...(thoughtActive && transient.thoughtElapsedMs !== undefined
+        ? { thoughtElapsedMs: transient.thoughtElapsedMs }
+        : {}),
+      ...(!thoughtActive && transient.thoughtDurationMs !== undefined
         ? { thoughtDurationMs: transient.thoughtDurationMs }
-        : transient.thoughtElapsedMs !== undefined
-          ? { thoughtElapsedMs: transient.thoughtElapsedMs }
-          : {})
+        : {})
     });
   }
   if (transient.text) parts.push({ text: transient.text });
@@ -658,12 +705,16 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
   const firstChunkAt = timestamp(streamStats?.firstOutputAt);
   const completedAt = timestamp(streamStats?.completedAt);
   const streamOutputDurationMs = finiteNumber(streamStats?.streamOutputDurationMs);
+  const materializationStatus: MessageRecord['status'] = request.status === 'terminal'
+    ? request.terminal_state === 'completed' ? 'final' : 'partial'
+    : 'streaming';
   // ModelRequestMessageLink is an additional authoritative live association. Keep using its Turn
   // identity even though MessageTurnLink now also arrives incrementally: commits may expose the
   // request/message fact first, and projection must remain correct at every atomic feed frontier.
   if (turnId) entry.turnId = turnId;
   entry.message = {
     ...entry.message,
+    status: materializationStatus,
     ...(model ? { model } : {}),
     ...(usageMetadata ? { usageMetadata } : {}),
     ...((providerStartedAt || timestamp(request.created_at)) > 0
@@ -704,81 +755,31 @@ function functionCallTargets(messages: ParsedMessage[]): FunctionCallTarget[] {
 
 function resolveFunctionCallTarget(input: {
   raw: ReliableClientRecord;
-  fallbackIndex: number;
   functionTargets: FunctionCallTarget[];
   messages: ParsedMessage[];
   sourceLink?: ReliableClientRecord;
-  requestMessageIdByRequestId: Map<string, string>;
-  assignedOrdinals: Map<string, number>;
 }): FunctionCallTarget | undefined {
-  const providerCallId = text(
-    input.raw.provider_call_id
-    ?? input.raw.providerCallId
-    ?? input.raw.upstream_call_id
-    ?? input.sourceLink?.provider_call_id
-  );
-  if (providerCallId) {
-    const exact = input.functionTargets.find((target) => text(target.part.id) === providerCallId);
-    if (exact) return exact;
-  }
-
-  const sourceRequestId = text(
-    input.raw.model_request_id
-    ?? input.raw.source_model_request_id
-    ?? input.sourceLink?.model_request_id
-  );
-  const sourceMessageId = text(
-    input.raw.source_message_id
-    ?? input.raw.message_id
-    ?? input.sourceLink?.message_id
-  ) ?? (sourceRequestId ? input.requestMessageIdByRequestId.get(sourceRequestId) : undefined);
+  // ToolCallSourceLink is the only authoritative owner relation. Guessing by Turn index, name,
+  // timestamp or nearest Message can attach an outcome/diff to a different provider call when a
+  // bounded feed is incomplete, which is worse than rendering the card as incomplete.
+  if (!input.sourceLink) return undefined;
+  const providerCallId = text(input.sourceLink.provider_call_id);
   const linkedOwnerMessageId = text(input.sourceLink?.message_id);
-  if (linkedOwnerMessageId) {
-    const owner = input.messages.find((entry) => entry.message.id === linkedOwnerMessageId);
-    // ToolCallSourceLink is authoritative. If its owner was soft-deleted or lies outside the
-    // visible Message window, the historical card must not be reattached to another live row.
-    if (!owner) return undefined;
-    const ownerTargets = input.functionTargets.filter((target) => target.messageId === linkedOwnerMessageId);
-    const exact = providerCallId
-      ? ownerTargets.find((candidate) => text(candidate.part.id) === providerCallId)
-      : ownerTargets[input.fallbackIndex];
-    if (exact) return exact;
-    const ordinal = owner.message.content.parts.filter((part) => 'functionCall' in part).length;
-    return {
-      messageId: linkedOwnerMessageId,
-      ordinal,
-      part: {
-        ...(providerCallId ? { id: providerCallId } : {}),
-        functionCall: { name: text(input.raw.tool_name) ?? 'tool', args: {} }
-      }
-    };
-  }
-  if (sourceMessageId) {
-    const sourceTargets = input.functionTargets.filter((target) => target.messageId === sourceMessageId);
-    const target = providerCallId
-      ? sourceTargets.find((candidate) => text(candidate.part.id) === providerCallId)
-      : sourceTargets[input.fallbackIndex];
-    if (target) return target;
-  }
-
-  const ordinalFallback = input.functionTargets[input.fallbackIndex];
-  if (ordinalFallback) return ordinalFallback;
-
-  const orderedMessages = [...input.messages]
-    .filter((entry) => entry.message.role === 'model')
-    .sort(compareParsedMessages);
-  const callCreatedAt = timestamp(input.raw.created_at);
-  const sourceMessage = sourceMessageId
-    ? orderedMessages.find((entry) => entry.message.id === sourceMessageId)
-    : [...orderedMessages].reverse().find((entry) => !callCreatedAt || entry.message.createdAt <= callCreatedAt)
-      ?? orderedMessages[orderedMessages.length - 1];
-  const messageId = sourceMessage?.message.id ?? `tool-host:${text(input.raw.turn_id) ?? text(input.raw.id) ?? 'unknown'}`;
-  const existingCount = sourceMessage?.message.content.parts.filter((part) => 'functionCall' in part).length ?? 0;
-  const ordinal = input.assignedOrdinals.get(messageId) ?? existingCount;
-  input.assignedOrdinals.set(messageId, ordinal + 1);
+  if (!linkedOwnerMessageId) return undefined;
+  const owner = input.messages.find((entry) => entry.message.id === linkedOwnerMessageId);
+  if (!owner) return undefined;
+  const ownerTargets = input.functionTargets.filter((target) => target.messageId === linkedOwnerMessageId);
+  const providerOrdinal = integer(input.sourceLink.provider_ordinal);
+  const exact = providerCallId
+    ? ownerTargets.find((candidate) => text(candidate.part.id) === providerCallId)
+    : ownerTargets.find((candidate) => candidate.ordinal === providerOrdinal);
+  if (exact) return exact;
+  // While the Message body is still hydrating, the authoritative link is sufficient to create a
+  // temporary target. Once that body is ready, a mismatch is an integrity failure and stays hidden.
+  if (owner.revisionReady) return undefined;
   return {
-    messageId,
-    ordinal,
+    messageId: linkedOwnerMessageId,
+    ordinal: providerOrdinal,
     part: {
       ...(providerCallId ? { id: providerCallId } : {}),
       functionCall: {
@@ -838,11 +839,28 @@ function toolStatus(
   outcome: ReliableClientRecord | undefined
 ): ToolCallStatus {
   if (call.status === 'terminal') {
-    return outcome?.status === 'succeeded' ? 'success' : outcome?.status === 'rejected' ? 'warning' : 'error';
+    const status = toolOutcomeProjectionStatus(outcome);
+    if (status === 'succeeded') return 'success';
+    if (status === 'partial' || status === 'rejected' || status === 'cancelled'
+      || status === 'outcome_unknown' || status === 'missing') return 'warning';
+    return 'error';
   }
-  if (execution?.status === 'waiting_answer') return 'awaiting_user_input';
+  if (execution?.status === 'waiting_answer') {
+    return call.tool_name === 'run_agent' ? 'awaiting_child' : 'awaiting_user_input';
+  }
   if (call.status === 'executing' || execution?.status === 'executing') return 'executing';
   return 'queued';
+}
+
+function toolOutcomeProjectionStatus(
+  outcome: ReliableClientRecord | undefined
+): ReliableToolOutcomeProjectionStatus {
+  const status = text(outcome?.status);
+  return status === 'succeeded' || status === 'failed' || status === 'partial'
+    || status === 'rejected' || status === 'cancelled' || status === 'conflict'
+    || status === 'outcome_unknown'
+    ? status
+    : 'missing';
 }
 
 function projectToolCallEvents(
@@ -891,7 +909,7 @@ function toolCallEventKind(value: unknown): ToolCallEventKind | undefined {
 
 function toolCallStatusValue(value: unknown): ToolCallStatus | undefined {
   return value === 'streaming' || value === 'queued' || value === 'awaiting_approval'
-    || value === 'awaiting_user_input' || value === 'executing' || value === 'awaiting_change_apply'
+    || value === 'awaiting_user_input' || value === 'awaiting_child' || value === 'executing' || value === 'awaiting_change_apply'
     || value === 'applying_change' || value === 'change_applied' || value === 'change_rejected'
     || value === 'awaiting_result_submit' || value === 'success' || value === 'warning' || value === 'error'
     ? value
@@ -1055,6 +1073,23 @@ function inferredInterruptedPhase(
   return 'delivering';
 }
 
+function toolResponseParts(value: unknown): InlineDataPart[] {
+  const envelope = record(value);
+  const detail = record(envelope?.detail);
+  if (!detail || !Array.isArray(detail.parts)) return [];
+  return detail.parts.filter((part): part is InlineDataPart => {
+    const wrapper = record(part);
+    const inlineData = record(wrapper?.inlineData);
+    return !!inlineData
+      && typeof inlineData.mimeType === 'string'
+      && (
+        typeof inlineData.attachmentId === 'string'
+        || typeof inlineData.data === 'string'
+        || typeof inlineData.sourcePath === 'string'
+      );
+  });
+}
+
 function toolResultDetail(value: unknown): unknown {
   const envelope = record(value);
   return envelope && 'detail' in envelope ? envelope.detail : value;
@@ -1120,9 +1155,11 @@ function emptyProjection(): ReliableConversationProjection {
     toolCallEventsByCallId: {},
     toolEventIdsByCallId: {},
     turnIdByMessageId: {},
+    modelRequestIdByMessageId: {},
     messageRevisionIdByMessageId: {},
     terminationByMessageId: {},
     toolResultByCallId: {},
+    toolOutcomeStatusByCallId: {},
     interactionByToolCallId: {},
     interactionPromptIdByToolCallId: {},
     fileDiffByToolCallId: {},

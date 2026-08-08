@@ -230,6 +230,18 @@ export function conversationHistoryPreviewFromBytes(bytes: Buffer, contentType: 
   }
 }
 
+/** Decode the canonical first-user content used by the shared conversation title formatter. */
+export function conversationHistoryTitleContentFromBytes(
+  bytes: Buffer,
+  contentType: string
+): MessageContent | undefined {
+  const source = bytes.toString('utf8');
+  if (contentType.toLowerCase().startsWith('text/plain')) {
+    return { role: 'user', parts: source ? [{ text: source }] : [] };
+  }
+  return decodeConversationHistoryContent(source);
+}
+
 function latestDelivery(rows: readonly DomainRow[]): DomainRow | undefined {
   return [...rows].sort((left, right) =>
     compareInteger(right.attempt_seq, left.attempt_seq)

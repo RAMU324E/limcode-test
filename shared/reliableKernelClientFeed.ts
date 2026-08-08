@@ -10,7 +10,11 @@ export const RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE = 'reliable-kernel.snapsho
 export const RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE = 'reliable-kernel.detail-request';
 export const RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE = 'reliable-kernel.detail-result';
 export const RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE = 'reliable-kernel.detail-error';
+export const RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE = 'reliable-kernel.history-page-request';
+export const RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE = 'reliable-kernel.history-page-result';
+export const RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE = 'reliable-kernel.history-page-error';
 export const RELIABLE_KERNEL_TRANSIENT_MESSAGE = 'reliable-kernel.transient';
+export const RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE = 'reliable-kernel.transient-batch';
 export const RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE = 'reliable-kernel.client-diagnostic';
 
 export interface ReliableKernelClientChange {
@@ -69,6 +73,8 @@ export type ReliableKernelClientDetailKind =
   | 'process-stdout'
   | 'process-stderr'
   | 'context-projection-detail'
+  | 'model-request-purpose'
+  | 'compression-presentation'
   | 'compression-content'
   | 'compression-title'
   | 'answer-content';
@@ -108,6 +114,41 @@ export interface ReliableKernelDetailErrorMessage {
   message: string;
 }
 
+export interface ReliableKernelHistoryPageRequestMessage {
+  type: typeof RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE;
+  requestId: string;
+  sessionId?: string;
+  conversationId: string;
+  /** Exclusive backward keyset cursor in durable Message membership order. */
+  beforeMessageSeq: string;
+  beforeId: string;
+  limit: number;
+}
+
+export interface ReliableKernelHistoryPage {
+  records: Record<string, Array<Record<string, PlainData>>>;
+  nextBeforeMessageSeq?: string;
+  nextBeforeId?: string;
+  hasMore: boolean;
+  responseBytes: number;
+}
+
+export interface ReliableKernelHistoryPageResultMessage {
+  type: typeof RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  conversationId: string;
+  page: ReliableKernelHistoryPage;
+}
+
+export interface ReliableKernelHistoryPageErrorMessage {
+  type: typeof RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  conversationId: string;
+  message: string;
+}
+
 /** Memory-only low-latency stream overlay. Durable final authority remains Message/ModelRequest. */
 export interface ReliableKernelTransientMessage {
   type: typeof RELIABLE_KERNEL_TRANSIENT_MESSAGE;
@@ -140,6 +181,21 @@ export interface ReliableKernelTransientMessage {
       streamOutputDurationMs?: number;
     };
   };
+}
+
+export type ReliableKernelTransientBatchItem = Omit<
+  ReliableKernelTransientMessage,
+  'type' | 'sessionId' | 'navigationGeneration' | 'hostBootId' | 'conversationId'
+>;
+
+/** One bounded IPC envelope for an ordered burst of memory-only stream events. */
+export interface ReliableKernelTransientBatchMessage {
+  type: typeof RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE;
+  sessionId: string;
+  navigationGeneration?: string;
+  hostBootId: string;
+  conversationId: string;
+  events: ReliableKernelTransientBatchItem[];
 }
 
 /** Client-reported paint markers contain identities/timestamps only; arbitrary metadata is forbidden. */

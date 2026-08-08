@@ -1,30 +1,65 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue';
-import { IconBraces, IconPencil, IconTerminal2, IconWriting } from '@tabler/icons-vue';
-import type { ToolCallPreviewRecord } from '@shared/protocol';
-import { toolCallPreviewPresentation } from '@shared/toolCallPreview';
+import { IconBraces, IconMessageForward, IconPencil, IconTerminal2, IconWriting } from '@tabler/icons-vue';
+import { toolCallPreviewPresentation, type ToolCallPreviewRenderMode } from '@shared/toolCallPreview';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import { useBottomStickyScroller } from '@webview/composables/useBottomStickyScroller';
+import type { ReliableTransientToolCallState } from '@webview/domain/reliableTransientModel';
 import TextPartView from './TextPartView.vue';
 
 const props = defineProps<{
-  preview: ToolCallPreviewRecord;
+  preview: ReliableTransientToolCallState;
+  active: boolean;
 }>();
 
 const FRAME_INTERVAL_MS = 50;
-const framedPreview = shallowRef<ToolCallPreviewRecord>({ ...props.preview });
-const pendingPreview = shallowRef<ToolCallPreviewRecord | undefined>();
+const framedPreview = shallowRef<ReliableTransientToolCallState>({ ...props.preview });
+const pendingPreview = shallowRef<ReliableTransientToolCallState | undefined>();
 const previewScroller = ref<HTMLElement | null>(null);
 useBottomStickyScroller(previewScroller);
 let frameTimer: number | undefined;
+let renderModeCallId = framedPreview.value.callId;
+const frozenRenderMode = ref<ToolCallPreviewRenderMode | undefined>();
 
 const presentation = computed(() => toolCallPreviewPresentation(framedPreview.value));
+const previewFinal = computed(() => props.preview.final === true);
+const previewStreaming = computed(() => props.active && !previewFinal.value);
+const displayTitle = computed(() => {
+  if (previewStreaming.value) return presentation.value.title;
+  if (!previewFinal.value) return stoppedPreviewTitle(presentation.value.kind);
+  switch (presentation.value.kind) {
+    case 'plan': return 'Plan 已生成';
+    case 'agent_answer': return 'Agent 回答已生成';
+    case 'write': return '文件内容已生成';
+    case 'edit': return '文件修改参数已生成';
+    case 'command': return '命令已生成';
+    case 'generic': return `${framedPreview.value.name?.trim() || '工具'} 参数已生成`;
+  }
+});
+const displayRenderMode = computed(() => frozenRenderMode.value ?? presentation.value.renderMode);
 const icon = computed(() => {
   if (presentation.value.kind === 'write' || presentation.value.kind === 'plan') return IconWriting;
+  if (presentation.value.kind === 'agent_answer') return IconMessageForward;
   if (presentation.value.kind === 'edit') return IconPencil;
   if (presentation.value.kind === 'command') return IconTerminal2;
   return IconBraces;
 });
+
+watch(
+  presentation,
+  (next) => {
+    if (renderModeCallId !== framedPreview.value.callId) {
+      renderModeCallId = framedPreview.value.callId;
+      frozenRenderMode.value = undefined;
+    }
+    // A write delta may expose content before path. Once visible, keep one renderer mounted for
+    // this call so a late `.md` suffix cannot replay the accumulated text from character zero.
+    if (!frozenRenderMode.value && next.previewText && next.renderMode) {
+      frozenRenderMode.value = next.renderMode;
+    }
+  },
+  { immediate: true }
+);
 
 watch(
   () => props.preview,
@@ -48,30 +83,41 @@ function flushPreviewFrame(): void {
   pendingPreview.value = undefined;
   if (next) framedPreview.value = next;
 }
+
+function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation>['kind']): string {
+  switch (kind) {
+    case 'plan': return 'Plan 生成已停止';
+    case 'agent_answer': return 'Agent 回答生成已停止';
+    case 'write': return '文件内容生成已停止';
+    case 'edit': return '文件修改准备已停止';
+    case 'command': return '命令生成已停止';
+    case 'generic': return '工具参数生成已停止';
+  }
+}
 </script>
 
 <template>
-  <section class="tool-preview-card" aria-live="polite" :aria-label="presentation.title">
+  <section class="tool-preview-card" aria-live="polite" :aria-label="displayTitle">
     <header class="tool-preview-header">
       <span class="tool-preview-icon" aria-hidden="true"><component :is="icon" :size="15" stroke="1.8" /></span>
       <span class="tool-preview-heading">
-        <strong>{{ presentation.title }}</strong>
+        <strong>{{ displayTitle }}</strong>
         <span v-if="presentation.subject" class="tool-preview-subject">{{ presentation.subject }}</span>
       </span>
-      <span class="tool-preview-pulse" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span v-if="previewStreaming" class="tool-preview-pulse" aria-hidden="true"><i></i><i></i><i></i></span>
     </header>
     <div class="tool-preview-detail">{{ presentation.detail }}</div>
     <div v-if="presentation.previewText" class="tool-preview-code-shell">
       <div ref="previewScroller" class="tool-preview-code-scroll">
         <TextPartView
-          v-if="presentation.renderMode === 'markdown'"
+          v-if="displayRenderMode === 'markdown'"
           class="tool-preview-markdown"
           :text="presentation.previewText"
-          streaming
+          :streaming="previewStreaming"
           markdown
           :show-streaming-indicator="false"
         />
-        <pre v-else><code>{{ presentation.previewText }}</code><span class="tool-preview-caret" aria-hidden="true"></span></pre>
+        <pre v-else><code>{{ presentation.previewText }}</code><span v-if="previewStreaming" class="tool-preview-caret" aria-hidden="true"></span></pre>
       </div>
       <AdvancedScrollbar :scroller="previewScroller" variant="minimal" />
     </div>
