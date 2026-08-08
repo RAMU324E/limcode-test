@@ -13,7 +13,12 @@ function fromDist(relativePath) {
 
 const { ReliableChildAgentCoordinator } = fromDist('backend/reliableKernel/childAgentCoordinator.js');
 const { stablePhaseFId } = fromDist('backend/reliableKernel/phaseFIdentity.js');
-const { runAgentTool } = fromDist('backend/world/modules/tools/definitions/runAgent/index.js');
+const {
+  DEFAULT_MAX_CHILD_AGENT_DEPTH,
+  MAX_CHILD_AGENT_DEPTH_CONFIG_KEY,
+  maxChildAgentDepthFromConfig,
+  runAgentTool
+} = fromDist('backend/world/modules/tools/definitions/runAgent/index.js');
 const { readAgentAnswerTool } = fromDist('backend/world/modules/tools/definitions/agentAnswer/index.js');
 const { deleteTool } = fromDist('backend/world/modules/tools/definitions/delete/index.js');
 
@@ -30,6 +35,20 @@ test('Agent 工具声明说明异步用法，并只标记无条件必填参数',
     'prompt 只在 run 模式必填，不能让 interrupt 模式也被 JSON schema 拒绝');
   assert.deepEqual(readAgentAnswerTool.declaration.parameters.required, ['answerBridgeId']);
   assert.deepEqual(deleteTool.declaration.parameters.required, ['paths']);
+
+  const depthField = runAgentTool.declaration.configSchema.fields.find(
+    (field) => field.key === MAX_CHILD_AGENT_DEPTH_CONFIG_KEY
+  );
+  assert.ok(depthField);
+  assert.equal(depthField.type, 'number');
+  assert.equal(depthField.defaultValue, 1);
+  assert.equal(DEFAULT_MAX_CHILD_AGENT_DEPTH, 1);
+  assert.equal(runAgentTool.declaration.defaultConfig[MAX_CHILD_AGENT_DEPTH_CONFIG_KEY], 1);
+  assert.equal(runAgentTool.declaration.parameters.properties[MAX_CHILD_AGENT_DEPTH_CONFIG_KEY], undefined,
+    '嵌套层级是工具策略，不应暴露给模型当调用参数');
+  assert.equal(maxChildAgentDepthFromConfig({ [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 2.9 }), 2);
+  assert.equal(maxChildAgentDepthFromConfig({ [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: -3 }), 0);
+  assert.equal(maxChildAgentDepthFromConfig({ [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: 'invalid' }), 1);
 });
 
 test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 interrupt 的 prompt 校验保持分开', async () => {
@@ -40,8 +59,12 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
   const coordinator = new ReliableChildAgentCoordinator({
     database: {
       hostBootId: 'optional-wait-host',
-      async snapshot() {
-        return { snapshot: [{ id: 'interrupt-bridge', child_execution_id: 'interrupt-child' }] };
+      async snapshot(reads) {
+        return {
+          snapshot: reads.map((read) => read.kind === 'list'
+            ? []
+            : { id: read.id, child_execution_id: 'interrupt-child' })
+        };
       }
     },
     effects: {
@@ -66,8 +89,14 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
       async finalizeWaitSettlement(requestedToolCallId) {
         return { toolCallId: requestedToolCallId, status: 'succeeded' };
       },
-      async readExecutionSnapshot() {
-        return { childExecution: { id: 'interrupt-child' } };
+      async readExecutionSnapshot(childExecutionId) {
+        return { childExecution: { id: childExecutionId, status: 'active' } };
+      },
+      async send() {
+        return { turnIntentId: 'continuation-intent' };
+      },
+      async admitQueuedIntent() {
+        return { childExecutionId: 'interrupt-child', turnId: 'continuation-turn' };
       },
       async interruptSubtree() {
         return {
@@ -112,12 +141,146 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     arguments: { mode: 'run' }
   }), /run_agent\.prompt must be non-empty/);
 
+  const maxZeroAuthority = frozenRunAgentAuthority(0);
+  const continued = await coordinator.dispatch({
+    turnId: 'parent-turn',
+    modelRequestId: 'continuation-request',
+    toolCallId: 'continuation-tool-call',
+    toolName: 'run_agent',
+    arguments: {
+      mode: 'run',
+      prompt: 'continue the same child',
+      answerBridgeId: 'continuation-bridge'
+    }
+  }, undefined, maxZeroAuthority);
+  assert.equal(continued.disposition, 'settled',
+    'answerBridgeId 续发不创建子 Agent，即使上限为 0 也应允许');
+
   const interrupted = await coordinator.dispatch({
     turnId: 'parent-turn',
     modelRequestId: 'interrupt-request',
     toolCallId: 'interrupt-tool-call',
     toolName: 'run_agent',
     arguments: { mode: 'interrupt', answerBridgeId: 'interrupt-bridge' }
-  });
+  }, undefined, maxZeroAuthority);
   assert.equal(interrupted.disposition, 'settled');
 });
+
+test('可靠 run_agent 按冻结策略和持久父链限制新建子 Agent 的层级', async () => {
+  const rootBlocked = createDepthCoordinator([]);
+  await assert.rejects(() => rootBlocked.coordinator.dispatch(
+    runAgentInput('root-blocked'),
+    undefined,
+    frozenRunAgentAuthority(0)
+  ), /当前对话是第 0 层.*第 1 层.*上限是 0/);
+  assert.equal(rootBlocked.spawnCount(), 0);
+  assert.equal(rootBlocked.resolveCount(), 0, '超限时不应先创建或解析子 Agent');
+
+  const firstLevelBlocked = createDepthCoordinator(['child-level-1']);
+  await assert.rejects(() => firstLevelBlocked.coordinator.dispatch(
+    runAgentInput('nested-blocked')
+  ), /当前对话是第 1 层.*第 2 层.*上限是 1/);
+  assert.equal(firstLevelBlocked.spawnCount(), 0);
+
+  const firstLevelAllowed = createDepthCoordinator(['child-level-1']);
+  const allowed = await firstLevelAllowed.coordinator.dispatch(
+    runAgentInput('nested-allowed'),
+    undefined,
+    frozenRunAgentAuthority(2)
+  );
+  assert.equal(allowed.disposition, 'settled');
+  assert.equal(firstLevelAllowed.spawnCount(), 1);
+});
+
+function frozenRunAgentAuthority(maxDepth) {
+  return {
+    snapshotId: `authority-depth-${maxDepth}`,
+    document: {},
+    toolConfig: {
+      config: { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: maxDepth }
+    }
+  };
+}
+
+function runAgentInput(suffix) {
+  return {
+    turnId: `parent-turn-${suffix}`,
+    modelRequestId: `parent-request-${suffix}`,
+    toolCallId: `tool-call-${suffix}`,
+    toolName: 'run_agent',
+    arguments: { mode: 'run', prompt: `task-${suffix}`, agent: { type: 'worker' } }
+  };
+}
+
+function createDepthCoordinator(lineageFromCurrentToRoot) {
+  let spawns = 0;
+  let resolutions = 0;
+  const coordinator = new ReliableChildAgentCoordinator({
+    database: {
+      hostBootId: 'depth-host',
+      async snapshot(reads) {
+        return {
+          snapshot: reads.map((read) => {
+            if (read.kind !== 'list') return null;
+            if (read.domain === 'ChildExecutionTurnLink') {
+              return lineageFromCurrentToRoot.length === 0
+                ? []
+                : [{
+                    id: `turn-link-${lineageFromCurrentToRoot[0]}`,
+                    turn_id: read.where.turn_id,
+                    child_execution_id: lineageFromCurrentToRoot[0]
+                  }];
+            }
+            if (read.domain === 'ChildExecutionParentLink' && read.where.child_execution_id) {
+              const index = lineageFromCurrentToRoot.indexOf(read.where.child_execution_id);
+              assert.notEqual(index, -1, '测试父链必须是连续的');
+              return [{
+                id: `parent-link-${lineageFromCurrentToRoot[index]}`,
+                child_execution_id: lineageFromCurrentToRoot[index],
+                parent_child_execution_id: lineageFromCurrentToRoot[index + 1] ?? null
+              }];
+            }
+            if (read.domain === 'ChildExecutionParentLink' && read.where.source_tool_call_id) return [];
+            return [];
+          })
+        };
+      }
+    },
+    effects: {},
+    children: {
+      async spawn(command) {
+        spawns += 1;
+        return {
+          answerBridgeId: stablePhaseFId('answer_bridge', command.sourceToolCallId),
+          effectIntentId: 'depth-spawn-effect',
+          attemptId: 'depth-spawn-attempt',
+          childExecutionId: 'depth-spawn-child',
+          childTurnId: 'depth-spawn-turn'
+        };
+      },
+      async claimSpawnDispatch() { return true; },
+      async recordSpawnReceipt() { return { effectReceiptId: 'depth-spawn-receipt' }; },
+      async reconcileSpawnReceipt() {},
+      async finalizeWaitSettlement(toolCallId) {
+        return { toolCallId, status: 'succeeded' };
+      }
+    },
+    answers: {},
+    deliveries: {},
+    modelProvider: {},
+    turns: {},
+    agentLoop: {},
+    agents: {
+      async resolve() {
+        resolutions += 1;
+        return { agentId: 'depth-agent', agentType: 'worker' };
+      }
+    }
+  });
+  coordinator.launch = () => {};
+  return {
+    coordinator,
+    spawnCount: () => spawns,
+    resolveCount: () => resolutions
+  };
+}

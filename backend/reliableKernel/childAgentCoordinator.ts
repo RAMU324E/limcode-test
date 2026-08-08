@@ -14,7 +14,7 @@ import { stablePhaseFId } from './phaseFIdentity';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
-import type { ReliableSpecialToolAdmission } from './toolDispatcher';
+import type { ReliableSpecialToolAdmission, ReliableToolDispatchAuthority } from './toolDispatcher';
 import { listAllDomainRows } from './repositoryPagination';
 import type {
   TurnCommandContent,
@@ -30,6 +30,7 @@ import {
   runWithExecutionLeaseFence,
   type ExecutionLeaseFence
 } from './executionLeaseFence';
+import { maxChildAgentDepthFromConfig } from '../world/modules/tools/definitions/runAgent';
 
 export interface ReliableChildAgentSelection {
   agentId: string;
@@ -147,6 +148,7 @@ export class ReliableChildAgentCoordinator {
   public async dispatch(
     input: ReliableAgentToolDispatchInput,
     signal?: AbortSignal,
+    authority?: ReliableToolDispatchAuthority,
     admission?: ReliableSpecialToolAdmission
   ): Promise<ChildDispatchResult | undefined> {
     if (this.handoff) throw this.handoff;
@@ -154,7 +156,7 @@ export class ReliableChildAgentCoordinator {
     if (aborted) return aborted;
     switch (input.toolName) {
       case 'run_agent':
-        return this.runAgent(input, signal, admission);
+        return this.runAgent(input, signal, authority, admission);
       case 'submit_agent_answer':
         return this.submitAnswer(input);
       case 'read_agent_answer':
@@ -993,6 +995,7 @@ export class ReliableChildAgentCoordinator {
   private async runAgent(
     input: ReliableAgentToolDispatchInput,
     signal?: AbortSignal,
+    authority?: ReliableToolDispatchAuthority,
     admission?: ReliableSpecialToolAdmission
   ): Promise<ChildDispatchResult> {
     const args = requireRecord(input.arguments, 'run_agent arguments');
@@ -1004,7 +1007,7 @@ export class ReliableChildAgentCoordinator {
     const answerBridgeId = optionalText(args.answerBridgeId);
     return answerBridgeId
       ? this.continueChild(input, answerBridgeId, prompt, foregroundWaitMs, signal, admission)
-      : this.spawnChild(input, args, prompt, foregroundWaitMs, signal, admission);
+      : this.spawnChild(input, args, prompt, foregroundWaitMs, authority, signal, admission);
   }
 
   private async spawnChild(
@@ -1012,11 +1015,13 @@ export class ReliableChildAgentCoordinator {
     args: { [key: string]: PlainJsonValue },
     prompt: string,
     foregroundWaitMs: number,
+    authority?: ReliableToolDispatchAuthority,
     signal?: AbortSignal,
     admission?: ReliableSpecialToolAdmission
   ): Promise<ChildDispatchResult> {
     const beforeSelection = await this.settleUserAbort(input.toolCallId, signal, 'before-child-selection');
     if (beforeSelection) return beforeSelection;
+    await this.authorizeNewChildDepth(input, authority);
     const agentArgs = optionalRecord(args.agent);
     const selection = await this.dependencies.agents.resolve({
       ...(optionalText(agentArgs?.id) ? { agentId: optionalText(agentArgs?.id) } : {}),
@@ -1061,6 +1066,66 @@ export class ReliableChildAgentCoordinator {
     this.launch(spawned.childExecutionId, spawned.childTurnId);
     if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
     return this.waitInitialForeground(input.toolCallId, spawned.childExecutionId, deadline!, signal);
+  }
+
+  private async authorizeNewChildDepth(
+    input: ReliableAgentToolDispatchInput,
+    authority: ReliableToolDispatchAuthority | undefined
+  ): Promise<void> {
+    const existingChildren = await this.list('ChildExecutionParentLink', {
+      source_tool_call_id: requireId(input.toolCallId, 'toolCallId')
+    }, 2);
+    if (existingChildren.length > 1) {
+      throw new Error(`run_agent ToolCall ${input.toolCallId} has multiple child lineages.`);
+    }
+    // Re-entering the same durable ToolCall only replays its existing ChildExecution; it does not
+    // create another nesting level and therefore must not be rejected by a newly lowered limit.
+    if (existingChildren.length === 1) return;
+
+    const maxDepth = maxChildAgentDepthFromConfig(authority?.toolConfig?.config);
+    const currentDepth = await this.childDepthForTurn(input.turnId);
+    const requestedDepth = currentDepth + 1;
+    if (requestedDepth <= maxDepth) return;
+    throw new Error(
+      `run_agent 已达到最大子 Agent 层级：当前对话是第 ${currentDepth} 层，`
+      + `新建子 Agent 会进入第 ${requestedDepth} 层，但当前上限是 ${maxDepth}。`
+    );
+  }
+
+  private async childDepthForTurn(turnIdInput: string): Promise<number> {
+    const turnId = requireId(turnIdInput, 'turnId');
+    const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (memberships.length > 1) {
+      throw new Error(`Turn ${turnId} has multiple ChildExecution memberships.`);
+    }
+    if (memberships.length === 0) return 0;
+
+    let depth = 0;
+    let childExecutionId: string | null = requireId(
+      memberships[0].child_execution_id,
+      'ChildExecutionTurnLink.child_execution_id'
+    );
+    const visited = new Set<string>();
+    while (childExecutionId !== null) {
+      if (visited.has(childExecutionId)) {
+        throw new Error('ChildExecution parent lineage contains a cycle.');
+      }
+      visited.add(childExecutionId);
+      depth += 1;
+      const parentLinks = await this.list('ChildExecutionParentLink', {
+        child_execution_id: childExecutionId
+      }, 2);
+      if (parentLinks.length !== 1) {
+        throw new Error(`ChildExecution ${childExecutionId} must retain exactly one parent link.`);
+      }
+      childExecutionId = parentLinks[0].parent_child_execution_id === null
+        ? null
+        : requireId(
+            parentLinks[0].parent_child_execution_id,
+            'ChildExecutionParentLink.parent_child_execution_id'
+          );
+    }
+    return depth;
   }
 
   private async continueChild(

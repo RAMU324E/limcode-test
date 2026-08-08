@@ -1,9 +1,22 @@
 import { MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } from '../../../../../../shared/agentScheduling';
+import type { ToolConfigRecord } from '../../../../../../shared/protocol';
 import type { ToolCallSummaryContext, ToolDefinition } from '../../registry';
 import { defineToolDefinitionModule } from '../types';
 
 export const RUN_AGENT_TOOL_NAME = 'run_agent';
 export const DEFAULT_RUN_AGENT_TYPE = 'worker';
+export const MAX_CHILD_AGENT_DEPTH_CONFIG_KEY = 'maxChildAgentDepth';
+export const DEFAULT_MAX_CHILD_AGENT_DEPTH = 1;
+
+export function maxChildAgentDepthFromConfig(
+  config: ToolConfigRecord | undefined,
+  defaultValue = DEFAULT_MAX_CHILD_AGENT_DEPTH
+): number {
+  const value = config?.[MAX_CHILD_AGENT_DEPTH_CONFIG_KEY];
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : defaultValue;
+}
 
 export const runAgentToolModule = defineToolDefinitionModule({
   id: RUN_AGENT_TOOL_NAME,
@@ -93,6 +106,18 @@ Do NOT poll read_agent_answer in a loop in the same response. Do NOT use tools t
       readonly: false,
       defaultEnabled: true,
       checkpoint: { before: true, after: true }
+    },
+    configSchema: {
+      fields: [{
+        key: MAX_CHILD_AGENT_DEPTH_CONFIG_KEY,
+        label: '最大子 Agent 层级',
+        type: 'number',
+        description: '限制新建子 Agent 的嵌套深度。根对话为 0；设为 1 时只允许根对话创建第一层子 Agent；设为 0 时禁止新建子 Agent。继续现有子 Agent 和中断操作不受限制。',
+        defaultValue: DEFAULT_MAX_CHILD_AGENT_DEPTH
+      }]
+    },
+    defaultConfig: {
+      [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: DEFAULT_MAX_CHILD_AGENT_DEPTH
     }
   },
   scheduling: resolveRunAgentScheduling,

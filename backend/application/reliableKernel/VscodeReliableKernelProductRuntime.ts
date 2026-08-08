@@ -114,7 +114,7 @@ export class VscodeReliableKernelProductRuntime {
     let conversations: ReliableConversationRunner | undefined;
     const toolHost = new VscodeReliableToolHost(context, configuration, {
       dispatchSpecial: async (definition, input, frozenAuthority, signal, admission) => {
-        const childResult = await childAgents?.dispatch(input, signal, admission);
+        const childResult = await childAgents?.dispatch(input, signal, frozenAuthority, admission);
         if (childResult) return childResult;
         return options.dispatchSpecial?.(definition, input, frozenAuthority, signal, admission);
       },
