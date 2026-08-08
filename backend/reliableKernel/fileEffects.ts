@@ -17,7 +17,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { handoffReason } from './executionLeaseFence';
+import { handoffReason, isExecutionHandoffError } from './executionLeaseFence';
 
 export type FileChangeOperation =
   | 'create_file'
@@ -1063,11 +1063,14 @@ export class FileChangeControlPlane {
 
 /** Dedicated file capability dispatcher; it has no ToolOutcome policy. */
 export class FileMutationDispatcher {
+  private readonly activeDispatches = new Set<string>();
+
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore,
     private readonly effects: EffectControlPlane,
-    private readonly resolveBoundary: WorkEnvironmentBoundaryResolver
+    private readonly resolveBoundary: WorkEnvironmentBoundaryResolver,
+    private readonly onConvergenceNeeded?: () => void
   ) {}
 
   public async dispatch(
@@ -1109,12 +1112,75 @@ export class FileMutationDispatcher {
     terminal: ToolTerminalResult | null;
   }> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
-    const observation = await this.dispatch(effectIntentId, signal);
+    const ownsActiveMarker = !this.activeDispatches.has(effectIntentId);
+    if (ownsActiveMarker) this.activeDispatches.add(effectIntentId);
+    try {
+      return await this.dispatchRecordAndReconcileActive(effectIntentId, signal);
+    } finally {
+      if (ownsActiveMarker) this.activeDispatches.delete(effectIntentId);
+    }
+  }
+
+  public isDispatchActive(effectIntentIdInput: string): boolean {
+    return this.activeDispatches.has(requireId(effectIntentIdInput, 'effectIntentId'));
+  }
+
+  public async recoverDispatchedAndReconcile(effectIntentIdInput: string): Promise<ToolTerminalResult | null> {
+    const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
+    if (this.activeDispatches.has(effectIntentId)) return null;
+    this.activeDispatches.add(effectIntentId);
+    try {
+      const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
+      return await control.recoverDispatchedEffect({
+        source: { kind: 'recovery', key: `file-mutation:${effectIntentId}:same-host-convergence` },
+        effectIntentId,
+        resolver: this.resolveBoundary
+      });
+    } finally {
+      this.activeDispatches.delete(effectIntentId);
+    }
+  }
+
+  private async dispatchRecordAndReconcileActive(effectIntentId: string, signal?: AbortSignal): Promise<{
+    observation: FileMutationObservation | null;
+    terminal: ToolTerminalResult | null;
+  }> {
+    let observation: FileMutationObservation | null;
+    try {
+      observation = await this.dispatch(effectIntentId, signal);
+    } catch (error) {
+      if (isExecutionHandoffError(error)) throw error;
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      if (intent.effect_kind !== FILE_EFFECT_KIND || intent.dispatch_state !== 'dispatched') throw error;
+      const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
+      try {
+        return {
+          observation: null,
+          terminal: await control.recoverDispatchedEffect({
+            source: { kind: 'recovery', key: `file-mutation:${effectIntentId}:same-host-recovery` },
+            effectIntentId,
+            resolver: this.resolveBoundary
+          })
+        };
+      } catch (recoveryError) {
+        this.onConvergenceNeeded?.();
+        throw recoveryError;
+      }
+    }
     if (!observation) {
       const intent = await this.requireExisting('EffectIntent', effectIntentId);
       const attempt = await this.requireExisting('Attempt', requireId(intent.attempt_id, 'EffectIntent.attempt_id'));
       const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
       const toolCallId = requireId(operation.tool_call_id, 'Operation.tool_call_id');
+      const receipts = await this.list('EffectReceipt', { attempt_id: attempt.id }, 2);
+      if (receipts.length > 1) throw new Error(`File mutation EffectIntent ${effectIntentId} has multiple receipts.`);
+      if (receipts.length === 1) {
+        const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
+        return {
+          observation: null,
+          terminal: await control.reconcileEffectReceipt(requireId(receipts[0].id, 'EffectReceipt.id'))
+        };
+      }
       return {
         observation: null,
         terminal: await this.effects.readTerminalResult(toolCallId, false)

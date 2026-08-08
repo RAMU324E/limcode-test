@@ -11,14 +11,25 @@ import type {
 import { createDefaultLlmCompressionSettings } from '../../../shared/protocol';
 import { ATTACHMENT_SETTINGS_FILE, CHECKPOINT_MAINTENANCE_SETTINGS_FILE, LLM_COMPRESSION_SETTINGS_FILE, LLM_SETTINGS_FILE, STORAGE_VERSION } from './constants';
 import { APPEARANCE_SETTINGS_FILE } from './constants';
+import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { readJson, writeJson } from './json';
 import { createDefaultLlmSettings, normalizeLlmSettings } from './llmSettings';
 import { normalizeLlmCompressionSettings } from './llmCompressionConfigs';
+import { withRecordStoreTransaction } from './recordStore';
+import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
 
 interface GlobalSettingsFile<T> {
   schemaVersion: typeof STORAGE_VERSION;
   savedAt: string;
   settings: T;
+}
+
+export interface GlobalSettingsFileResult {
+  section: GlobalSettingsSection;
+  settings: GlobalSettingsSectionValue;
+  filePath: string;
+  revision: string;
+  previousSettings?: GlobalSettingsSectionValue;
 }
 
 type FileBackedGlobalSettingsSection = Exclude<GlobalSettingsSection, 'common' | 'llmProviderConfigs' | 'llmCompressionConfigs' | 'mcpServers'>;
@@ -128,53 +139,158 @@ export function normalizeAttachmentSettings(input: Partial<AttachmentSettingsRec
 }
 
 export async function ensureGlobalSettingsFile(root: vscode.Uri, section: GlobalSettingsSection): Promise<void> {
-  const spec = getFileBackedSpec(section);
-  const uri = globalSettingsFileUri(root, section);
-  const file = await readJson<GlobalSettingsFile<GlobalSettingsSectionValue>>(uri);
-  if (file?.schemaVersion === STORAGE_VERSION) return;
-  await writeGlobalSettingsFile(root, section, spec.createDefault());
+  await loadGlobalSettingsFile(root, section);
 }
 
 export async function loadGlobalSettingsFile(
   root: vscode.Uri,
   section: GlobalSettingsSection
-): Promise<{ section: GlobalSettingsSection; settings: GlobalSettingsSectionValue; filePath: string }> {
+): Promise<GlobalSettingsFileResult> {
   const uri = globalSettingsFileUri(root, section);
-  const spec = getFileBackedSpec(section);
-  const file = await readJson<GlobalSettingsFile<GlobalSettingsSectionValue>>(uri);
-  if (!file || file.schemaVersion !== STORAGE_VERSION) {
-    const defaults = spec.createDefault();
-    await writeGlobalSettingsFile(root, section, defaults);
-    return { section, settings: defaults, filePath: uri.fsPath };
-  }
-
-  const settings = spec.normalize(file.settings as Partial<GlobalSettingsSectionValue> | undefined);
-  if (!sameSettings(section, settings, file.settings)) {
-    await writeGlobalSettingsFile(root, section, settings);
-  }
-  return { section, settings, filePath: uri.fsPath };
+  const file = await readJson<unknown>(uri, { throwOnError: true });
+  if (file === undefined) return initializeMissingGlobalSettingsFile(root, section);
+  return materializeGlobalSettingsFile(root, section, file);
 }
 
 export async function writeGlobalSettingsFile(
   root: vscode.Uri,
   section: GlobalSettingsSection,
-  settings: GlobalSettingsSectionValue
-): Promise<void> {
-  const spec = getFileBackedSpec(section);
-  await writeJson(globalSettingsFileUri(root, section), {
-    schemaVersion: STORAGE_VERSION,
-    savedAt: new Date().toISOString(),
-    settings: spec.normalize(settings as Partial<GlobalSettingsSectionValue> | undefined)
-  } satisfies GlobalSettingsFile<GlobalSettingsSectionValue>);
+  settings: GlobalSettingsSectionValue,
+  expectedRevision: string
+): Promise<GlobalSettingsFileResult> {
+  const uri = globalSettingsFileUri(root, section);
+  return withRecordStoreTransaction(uri, async () => {
+    const current = await readJson<unknown>(uri, { throwOnError: true });
+    const previous = current === undefined
+      ? undefined
+      : materializeGlobalSettingsFile(root, section, current);
+    const actualRevision = previous?.revision ?? missingGlobalSettingsRevision(uri, section);
+    if (actualRevision !== expectedRevision) {
+      throw new SettingsRevisionConflictError(section, expectedRevision, actualRevision);
+    }
+    const committed = await writeGlobalSettingsFileUnlocked(uri, section, settings);
+    return {
+      ...committed,
+      ...(previous ? { previousSettings: previous.settings } : {})
+    };
+  });
 }
 
 export function globalSettingsFileUri(root: vscode.Uri, section: GlobalSettingsSection): vscode.Uri {
   return vscode.Uri.joinPath(root, getFileBackedSpec(section).fileName);
 }
 
-function sameSettings(section: GlobalSettingsSection, a: GlobalSettingsSectionValue, b: Partial<GlobalSettingsSectionValue>): boolean {
+async function initializeMissingGlobalSettingsFile(
+  root: vscode.Uri,
+  section: GlobalSettingsSection
+): Promise<GlobalSettingsFileResult> {
+  const uri = globalSettingsFileUri(root, section);
+  return withRecordStoreTransaction(uri, async () => {
+    const current = await readJson<unknown>(uri, { throwOnError: true });
+    if (current !== undefined) return materializeGlobalSettingsFile(root, section, current);
+    return writeGlobalSettingsFileUnlocked(uri, section, getFileBackedSpec(section).createDefault());
+  });
+}
+
+function materializeGlobalSettingsFile(
+  root: vscode.Uri,
+  section: GlobalSettingsSection,
+  value: unknown
+): GlobalSettingsFileResult {
+  const uri = globalSettingsFileUri(root, section);
+  const file = parseGlobalSettingsFile(section, uri, value);
+  const settings = getFileBackedSpec(section).normalize(
+    file.settings as Partial<GlobalSettingsSectionValue> | undefined
+  );
+  return {
+    section,
+    settings,
+    filePath: uri.fsPath,
+    revision: createStorageRevision(settings)
+  };
+}
+
+async function writeGlobalSettingsFileUnlocked(
+  uri: vscode.Uri,
+  section: GlobalSettingsSection,
+  settings: GlobalSettingsSectionValue
+): Promise<GlobalSettingsFileResult> {
   const spec = getFileBackedSpec(section);
-  return JSON.stringify(a) === JSON.stringify(spec.normalize(b));
+  const normalized = spec.normalize(settings as Partial<GlobalSettingsSectionValue> | undefined);
+  await writeJson(uri, {
+    schemaVersion: STORAGE_VERSION,
+    savedAt: new Date().toISOString(),
+    settings: normalized
+  } satisfies GlobalSettingsFile<GlobalSettingsSectionValue>);
+  return {
+    section,
+    settings: normalized,
+    filePath: uri.fsPath,
+    revision: createStorageRevision(normalized)
+  };
+}
+
+function missingGlobalSettingsRevision(uri: vscode.Uri, section: GlobalSettingsSection): string {
+  return createMissingStorageRevision(`global-settings:${section}:${uri.toString()}`);
+}
+
+function parseGlobalSettingsFile(
+  section: GlobalSettingsSection,
+  uri: vscode.Uri,
+  value: unknown
+): GlobalSettingsFile<GlobalSettingsSectionValue> {
+  const file = asPlainObject(value);
+  if (!file) throw new Error(`全局设置文件结构无效：${uri.fsPath}`);
+  if (file.schemaVersion !== STORAGE_VERSION) throw new Error(`全局设置文件版本无效：${uri.fsPath}`);
+  if (typeof file.savedAt !== 'string' || !file.savedAt.trim()) {
+    throw new Error(`全局设置文件缺少有效保存时间：${uri.fsPath}`);
+  }
+  if (!isValidGlobalSettingsSectionValue(section, file.settings)) {
+    throw new Error(`全局设置「${section}」内容损坏：${uri.fsPath}`);
+  }
+  return {
+    schemaVersion: STORAGE_VERSION,
+    savedAt: file.savedAt,
+    settings: file.settings
+  };
+}
+
+function isValidGlobalSettingsSectionValue(section: GlobalSettingsSection, value: unknown): value is GlobalSettingsSectionValue {
+  const record = asPlainObject(value);
+  if (!record) return false;
+  if (section === 'llm') return typeof record.activeProviderConfigId === 'string';
+  if (section === 'llmCompression') {
+    return Array.isArray(record.providerBindings) && Array.isArray(record.modelBindings)
+      && (record.defaultConfigId === undefined || typeof record.defaultConfigId === 'string');
+  }
+  if (section === 'checkpointMaintenance') {
+    return typeof record.autoCleanupEnabled === 'boolean'
+      && typeof record.autoCleanupDays === 'number'
+      && Number.isFinite(record.autoCleanupDays)
+      && typeof record.autoDismissEnabled === 'boolean'
+      && typeof record.autoDismissSeconds === 'number'
+      && Number.isFinite(record.autoDismissSeconds);
+  }
+  if (section === 'appearance') {
+    return [
+      record.streamingTextPreparing,
+      record.streamingTextWaiting,
+      record.streamingTextThinking,
+      record.streamingTextWriting,
+      record.streamingTextToolExecuting
+    ].every((item) => typeof item === 'string');
+  }
+  if (section === 'attachments') {
+    return typeof record.maxStoredInlineFileMb === 'number'
+      && Number.isFinite(record.maxStoredInlineFileMb);
+  }
+  return false;
+}
+
+function asPlainObject(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function getFileBackedSpec(section: GlobalSettingsSection): (typeof GLOBAL_SETTINGS_SECTION_SPECS)[FileBackedGlobalSettingsSection] {

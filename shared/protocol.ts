@@ -86,11 +86,13 @@ export enum BridgeMessageType {
   RulesFileSave = 'rules.file.save',
   RulesCatalogRefresh = 'rules.catalog.refresh',
   ToolExecutionCancel = 'tool.execution.cancel',
+  ProcessStop = 'process.stop',
   ToolDiffOpen = 'tool.diff.open',
   PlanProposalOpen = 'planProposal.open',
   PlanProposalExport = 'planProposal.export',
   CheckpointDiffOpen = 'checkpoint.diff.open',
   AttachmentOpen = 'attachment.open',
+  AttachmentOpenResult = 'attachment.open.result',
   AttachmentReload = 'attachment.reload',
   AttachmentReloadResult = 'attachment.reload.result',
   CheckpointDiffOpenResult = 'checkpoint.diff.open.result',
@@ -270,6 +272,7 @@ export const TOOL_CALL_STATUSES = [
   'queued',
   'awaiting_approval',
   'awaiting_user_input',
+  'awaiting_child',
   'executing',
   'awaiting_change_apply',
   'applying_change',
@@ -676,6 +679,8 @@ export interface LlmProviderModelConfigRecord {
   retryMaxAttempts: number;
   enableMultimodalTools: boolean;
   contextWindowTokens?: number;
+  /** 不添加标题，直接放在本次请求最终系统提示词的最前面；空字符串表示不注入。 */
+  systemPromptPrefix: string;
   promptCache?: LlmPromptCacheConfigRecord;
   headers?: LlmProviderHeadersRecord;
   generationConfig?: LlmGenerationConfigRecord;
@@ -701,6 +706,8 @@ export interface LlmProviderConfigRecord {
   retryMaxAttempts: number;
   enableMultimodalTools: boolean;
   contextWindowTokens?: number;
+  /** 不添加标题，直接放在本次请求最终系统提示词的最前面；空字符串表示不注入。 */
+  systemPromptPrefix: string;
   promptCache?: LlmPromptCacheConfigRecord;
   headers?: LlmProviderHeadersRecord;
   generationConfig?: LlmGenerationConfigRecord;
@@ -732,6 +739,8 @@ export interface LlmInvocationSettingsSnapshotRecord {
   retryMaxAttempts?: number;
   enableMultimodalTools?: boolean;
   contextWindowTokens?: number;
+  /** 本次调用已经冻结的渠道或模型前置系统提示词。 */
+  systemPromptPrefix?: string;
   promptCache?: LlmPromptCacheConfigRecord;
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
@@ -1470,8 +1479,13 @@ export interface TextPart {
   text: string;
   thought?: boolean;
   thoughtSignature?: string;
-  /** 思考块仍在流式输出时，由后端持续回传的已思考耗时。完成后改用 thoughtDurationMs。 */
+  /** 当前活动思考块的权威开始时间；只用于本地显示插值，不替代最终耗时。 */
+  thoughtStartedAt?: number;
+  /** 当前活动块之前已经完成的思考块累计耗时。 */
+  thoughtCompletedDurationMs?: number;
+  /** 当前思考块仍在流式输出时，由后端低频校准的块内耗时。 */
   thoughtElapsedMs?: number;
+  /** 所有思考块完成后的权威累计耗时。 */
   thoughtDurationMs?: number;
 }
 
@@ -1494,6 +1508,7 @@ export interface FunctionResponsePart {
   durationMs?: number;
 }
 
+export const MAX_MESSAGE_ATTACHMENT_COUNT = 8;
 export type AttachmentStorageMode = 'embedded' | 'managed' | 'localPath';
 export type AttachmentAvailabilityStatus = 'available' | 'loading' | 'missing' | 'tooLarge' | 'unsupported' | 'failed';
 
@@ -1641,7 +1656,7 @@ export interface ToolCallPreviewRecord {
    * producer has already scanned the argument prefix; consumers must not rescan it from byte zero.
    */
   argumentPreviewFields?: Partial<Record<
-    'path' | 'content' | 'plan' | 'command' | 'explanation' | 'oldContent' | 'newContent',
+    'path' | 'title' | 'content' | 'plan' | 'command' | 'explanation' | 'oldContent' | 'newContent',
     { value: string; closed: boolean }
   >>;
   createdAt: number;
@@ -2427,6 +2442,12 @@ export interface ToolDecisionPayload {
   reason?: string;
 }
 
+export interface ProcessStopPayload {
+  processId: string;
+  conversationId?: string;
+  reason?: string;
+}
+
 export interface PlanProposalOpenPayload {
   conversationId?: string;
   toolCallId?: string;
@@ -2620,11 +2641,15 @@ export interface GlobalSettingsSnapshotPayload {
   section: GlobalSettingsSection;
   settings: GlobalSettingsSectionValue;
   filePath: string;
+  /** 该 section 一致内容的指纹；保存时必须原样回传。 */
+  revision: string;
 }
 export interface GlobalSettingsUpdatePayload {
   section: GlobalSettingsSection;
   settings: GlobalSettingsSectionValue;
   refreshMcpTools?: boolean;
+  /** 本次编辑所基于的设置指纹，防止旧窗口覆盖新内容。 */
+  expectedRevision: string;
 }
 export interface ConversationSettingsRecord {
   conversationId: string;
@@ -2710,11 +2735,18 @@ export interface WorkEnvironmentPolicyScopeClearPayload {
 export interface AttachmentOpenPayload {
   attachmentId?: string;
   sourcePath?: string;
+  data?: string;
   mimeType?: string;
   name?: string;
 }
 
-export type AttachmentReloadPayload = AttachmentOpenPayload;
+export type AttachmentReloadPayload = Omit<AttachmentOpenPayload, 'data'>;
+
+export interface AttachmentOpenResultPayload {
+  request: Omit<AttachmentOpenPayload, 'data'>;
+  status: 'opened' | 'failed';
+  error?: string;
+}
 
 export interface AttachmentReloadResultPayload {
   request: AttachmentReloadPayload;
@@ -2762,6 +2794,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.CheckpointPolicyScopeSet, CheckpointPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointPolicyScopeClear, CheckpointPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.ToolExecutionCancel, ToolDecisionPayload>
+  | BridgeEnvelope<BridgeMessageType.ProcessStop, ProcessStopPayload>
   | BridgeEnvelope<BridgeMessageType.ToolDiffOpen, ToolDiffOpenPayload>
   | BridgeEnvelope<BridgeMessageType.PlanProposalOpen, PlanProposalOpenPayload>
   | BridgeEnvelope<BridgeMessageType.PlanProposalExport, PlanProposalExportPayload>
@@ -2796,7 +2829,12 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>
   | BridgeEnvelope<BridgeMessageType.Pong, { text: string; receivedAt: number }>
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
-  | BridgeEnvelope<BridgeMessageType.Error, { requestType?: string; message: string }>
+  | BridgeEnvelope<BridgeMessageType.Error, {
+      requestType?: string;
+      message: string;
+      code?: 'settings_revision_conflict';
+      actualRevision?: string;
+    }>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInputResult, TurnInputResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>
@@ -2809,6 +2847,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.CheckpointShadowStatsSnapshot, CheckpointShadowStatsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointRestoreResult, CheckpointRestoreResultPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpenResult, CheckpointDiffOpenResultPayload>
+  | BridgeEnvelope<BridgeMessageType.AttachmentOpenResult, AttachmentOpenResultPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReloadResult, AttachmentReloadResultPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsSnapshot, GlobalSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsSnapshot, ConversationSettingsSnapshotPayload>

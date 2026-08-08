@@ -709,6 +709,7 @@ function appendThoughtDeltaWithPatch(message: MessageData, thought: LlmThoughtDe
     parts[index] = {
       ...last,
       text: last.text + thought.text,
+      ...(thought.thoughtStartedAt !== undefined ? { thoughtStartedAt: thought.thoughtStartedAt } : {}),
       ...(thought.thoughtElapsedMs !== undefined ? { thoughtElapsedMs: thought.thoughtElapsedMs } : {}),
       ...(thought.thoughtSignature ? { thoughtSignature: thought.thoughtSignature } : {})
     };
@@ -722,6 +723,7 @@ function appendThoughtDeltaWithPatch(message: MessageData, thought: LlmThoughtDe
   const part: ContentPart = {
     text: thought.text,
     thought: true,
+    ...(thought.thoughtStartedAt !== undefined ? { thoughtStartedAt: thought.thoughtStartedAt } : {}),
     ...(thought.thoughtElapsedMs !== undefined ? { thoughtElapsedMs: thought.thoughtElapsedMs } : {}),
     ...(thought.thoughtSignature ? { thoughtSignature: thought.thoughtSignature } : {})
   };
@@ -738,6 +740,7 @@ function updateThoughtProgressWithPatch(message: MessageData, progress: LlmThoug
     if (!part || !isTextPart(part) || part.thought !== true || part.thoughtDurationMs !== undefined) continue;
     parts[index] = {
       ...part,
+      ...(progress.thoughtStartedAt !== undefined ? { thoughtStartedAt: progress.thoughtStartedAt } : {}),
       thoughtElapsedMs: progress.thoughtElapsedMs,
       ...(progress.thoughtSignature ? { thoughtSignature: progress.thoughtSignature } : {})
     };
@@ -753,7 +756,14 @@ function finishThoughtPart(message: MessageData, thought: LlmThoughtDonePayload)
   for (let index = parts.length - 1; index >= 0; index -= 1) {
     const part = parts[index];
     if (!part || !isTextPart(part) || part.thought !== true || part.thoughtDurationMs !== undefined) continue;
-    const { thoughtElapsedMs: _thoughtElapsedMs, ...rest } = part;
+    const {
+      thoughtStartedAt: _thoughtStartedAt,
+      thoughtCompletedDurationMs: _thoughtCompletedDurationMs,
+      thoughtElapsedMs: _thoughtElapsedMs,
+      ...rest
+    } = part;
+    void _thoughtStartedAt;
+    void _thoughtCompletedDurationMs;
     void _thoughtElapsedMs;
     parts[index] = {
       ...rest,

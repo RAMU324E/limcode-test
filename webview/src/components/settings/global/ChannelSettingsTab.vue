@@ -54,7 +54,7 @@ const providerOptions: SettingsDropdownOption[] = [
 
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
-  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'enableMultimodalTools'
+  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'enableMultimodalTools' | 'systemPromptPrefix'
 >>;
 
 const activeConfig = computed(() => settings.activeLlmProviderConfig);
@@ -209,6 +209,7 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
     retryMaxAttempts: modelConfig.retryMaxAttempts,
     enableMultimodalTools: modelConfig.enableMultimodalTools,
     contextWindowTokens: modelConfig.contextWindowTokens,
+    systemPromptPrefix: modelConfig.systemPromptPrefix,
     promptCache: modelConfig.promptCache,
     headers: modelConfig.headers ?? {},
     generationConfig: modelConfig.generationConfig ?? {},
@@ -571,7 +572,7 @@ function cancelDelete(): void {
             </div>
 
             <p class="model-specific-note">
-              模型专属配置是完整配置副本：Header、Body、重试、多模态、上下文窗口、Prompt Cache 与上下文压缩都会替代默认配置；空 Header / Body 表示不使用默认 Header / Body。
+              模型专属配置是完整配置副本：前置系统提示词、Header、Body、重试、多模态、上下文窗口、Prompt Cache 与上下文压缩都会替代默认配置；空前置提示词表示不注入，空 Header / Body 表示不使用默认 Header / Body。
             </p>
 
             <div v-if="!activeModelConfigs.length" class="model-specific-empty">暂无模型专属配置。</div>

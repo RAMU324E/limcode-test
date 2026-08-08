@@ -1,3 +1,4 @@
+import type { AttachmentIngestService } from './attachmentIngest';
 import {
   AnswerControlPlane,
   RuntimeDeliveryControlPlane,
@@ -47,7 +48,11 @@ export interface ReliableKernelRuntimeServices {
 export function createReliableKernelRuntimeServices(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
-  options: { now?: () => string; authorityCompiler: TurnAuthorityCompiler }
+  options: {
+    now?: () => string;
+    authorityCompiler: TurnAuthorityCompiler;
+    attachments?: AttachmentIngestService;
+  }
 ): ReliableKernelRuntimeServices {
   const effects = new EffectControlPlane(database, contentStore, options);
   const deliveries = new RuntimeDeliveryControlPlane(database, options);

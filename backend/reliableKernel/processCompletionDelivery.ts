@@ -32,7 +32,7 @@ export interface ProcessCompletionWakeRequest {
   wakeId: string;
   deliveryId: string;
   inboxItemId: string;
-  sourceKind: 'process_receipt' | 'answer_submission';
+  sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure';
   sourceId: string;
   processId?: string;
   processReceiptId?: string;
@@ -707,7 +707,7 @@ export class ProcessCompletionDeliveryControlPlane {
     delivery: DomainRow,
     contentObjectId: string
   ): Promise<{
-    sourceKind: 'process_receipt' | 'answer_submission';
+    sourceKind: 'process_receipt' | 'answer_submission' | 'child_failure';
     sourceId: string;
     conversationId: string;
     sourceTurnId: string;
@@ -741,8 +741,12 @@ export class ProcessCompletionDeliveryControlPlane {
       'AnswerBridge',
       requirePhaseFId(submission.answer_bridge_id, 'AnswerSubmission.answer_bridge_id')
     );
+    const childExecutionId = requirePhaseFId(
+      bridge.child_execution_id,
+      'AnswerBridge.child_execution_id'
+    );
     const parentLinks = await this.listRows('ChildExecutionParentLink', {
-      child_execution_id: requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id')
+      child_execution_id: childExecutionId
     }, 2);
     if (parentLinks.length !== 1) throw new Error('Answer wake requires one stable ChildExecutionParentLink.');
     const sourceTurnId = requirePhaseFId(parentLinks[0].parent_turn_id, 'ChildExecutionParentLink.parent_turn_id');
@@ -751,8 +755,20 @@ export class ProcessCompletionDeliveryControlPlane {
     if (conversationId !== targetConversationId) {
       throw new Error('Answer wake targets a different parent Conversation.');
     }
+    const interrupted = submission.interrupted;
+    if (interrupted !== 0n && interrupted !== 1n) {
+      throw new Error(`AnswerSubmission has unsupported interrupted flag ${String(interrupted)}.`);
+    }
+    const failedSubmissionId = stablePhaseFId(
+      'answer_submission',
+      'child-drive-failed',
+      childExecutionId,
+      requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id')
+    );
     return {
-      sourceKind: 'answer_submission',
+      sourceKind: interrupted === 0n && sourceId === failedSubmissionId
+        ? 'child_failure'
+        : 'answer_submission',
       sourceId,
       conversationId,
       sourceTurnId

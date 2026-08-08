@@ -6,6 +6,7 @@ import type {
   ConversationHistoryPageRecord,
   ConversationHistoryScope,
   ProjectFolderCandidateRecord,
+  GlobalSettingsSection,
   SidebarConversationHistoryEntry,
   SidebarHistoryScopeKind,
   WebviewClientMeta,
@@ -57,6 +58,7 @@ export interface ApplicationFacade {
   getProjectFolderCandidates(): ProjectFolderCandidateRecord[];
 
   getStorageRootUri(): vscode.Uri;
+  refreshGlobalSettings(section: GlobalSettingsSection): Promise<void>;
   resetDevelopmentData(): Promise<StorageDataResetResult>;
   inspectReliability(conversationId?: string): Promise<unknown>;
 

@@ -51,6 +51,9 @@ import {
 import { Conversation, Message, MessageCurrentRevisionLink, MessageRevision, PartOf } from './components';
 import { textContent, type MessageContent } from '../../../../shared/protocol';
 import type { ModelContextProjection } from '../../../modelContext/types';
+import { composeSystemInstruction, prependSystemPromptPrefix } from './systemPromptText';
+
+export { composeSystemInstruction, prependSystemPromptPrefix } from './systemPromptText';
 
 /**
  * 已提交 Run/Turn 投影到不可变 LLM effect payload 的唯一只读组装边界。
@@ -152,7 +155,7 @@ export function buildLlmStartRequestForRun(
   const contents = input.contextProjection?.contents
     ?? input.contextContents
     ?? projectRunModelContext(world, { ...context, policy: contextPolicy, settingsSnapshot }).contents;
-  const systemText = systemPrompt.trim();
+  const systemText = prependSystemPromptPrefix(systemPrompt, settingsSnapshot?.systemPromptPrefix);
 
   return {
     id: input.requestId ?? `dryrun-${input.run}-${Date.now()}`,
@@ -184,16 +187,4 @@ function latestModelMessageForRun(world: WorldReader, run: Entity): Entity | und
     .filter((link): link is NonNullable<typeof link> => !!link && link.turn === run && link.role === 'model')
     .sort((left, right) => (world.get(right.message, Message)?.seq ?? 0)
       - (world.get(left.message, Message)?.seq ?? 0))[0]?.message;
-}
-
-function composeSystemInstruction(prompts: Array<{ name: string; text: string }>): string {
-  return prompts
-    .map((prompt) => {
-      const text = prompt.text.trim();
-      if (!text) return '';
-      const name = prompt.name.trim();
-      return name ? `[${name}]\n${text}` : text;
-    })
-    .filter(Boolean)
-    .join('\n\n');
 }

@@ -1,3 +1,4 @@
+import type { AttachmentIngestService, PreparedMessageAttachmentAdmission } from './attachmentIngest';
 import {
   ContentAddressedStore,
   type ContentObjectMetadata,
@@ -191,6 +192,7 @@ export interface ChildWaitSettlement {
 export interface ChildExecutionControlPlaneOptions {
   now?: () => string;
   authorityCompiler: TurnAuthorityCompiler;
+  attachments?: AttachmentIngestService;
   /** Allows Turn admission to attach pending next_turn deliveries in the very same writer transaction. */
   prepareNextTurnDeliverySteps?: (
     conversationId: string,
@@ -251,6 +253,7 @@ export class ChildExecutionControlPlane {
   private readonly now: () => string;
   private readonly authorityCompiler: TurnAuthorityCompiler;
   private readonly contextSequence: ContextSequenceControlPlane;
+  private readonly attachments: AttachmentIngestService | undefined;
   private readonly prepareNextTurnDeliverySteps?: ChildExecutionControlPlaneOptions['prepareNextTurnDeliverySteps'];
 
   public constructor(
@@ -265,6 +268,7 @@ export class ChildExecutionControlPlane {
     this.now = options.now ?? (() => new Date().toISOString());
     this.authorityCompiler = options.authorityCompiler;
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.attachments = options.attachments;
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
   }
 
@@ -1217,21 +1221,45 @@ export class ChildExecutionControlPlane {
       'TurnIntentRevision.content_object_id'
     );
     const messageContentObject = await this.requireExisting('ContentObject', messageContentObjectId);
-    const invisibleRuntimeDelivery = messageContentObject.content_type
-      === RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE;
+    const messageContentType = requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type');
+    const invisibleRuntimeDelivery = messageContentType === RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE;
+    const messageContentBytes = invisibleRuntimeDelivery
+      ? undefined
+      : await this.contentStore.read(messageContentObject as ContentObjectMetadata);
+    const attachmentAdmission: PreparedMessageAttachmentAdmission | null = invisibleRuntimeDelivery
+      ? null
+      : this.attachments
+        ? await this.attachments.prepareFrozenMessageContent({
+            content: messageContentBytes!,
+            contentType: messageContentType
+          })
+        : {
+            value: messageContentBytes!,
+            contentType: messageContentType,
+            attachments: [],
+            storageSteps: [],
+            totalBytes: 0
+          };
+    const admittedMessageContent = attachmentAdmission
+      ? await this.contentStore.prepare(
+          this.database,
+          attachmentAdmission.value,
+          attachmentAdmission.contentType
+        )
+      : null;
     const messageEstimatedTokens = invisibleRuntimeDelivery
       ? undefined
       : estimateStoredMessageContentTokens(
-          await this.contentStore.read(messageContentObject as ContentObjectMetadata),
-          requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type')
+          attachmentAdmission!.value,
+          attachmentAdmission!.contentType
         );
     const messageContext = invisibleRuntimeDelivery
       ? null
       : await this.contextSequence.prepareMessageAppendMutation({
           conversationId: requirePhaseFId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
           messageRevisionId: ids.messageRevisionId,
-          contentObjectId: messageContentObjectId,
-          contentByteLength: requireBigInt(messageContentObject.byte_length, 'ContentObject.byte_length'),
+          contentObjectId: admittedMessageContent!.metadata.id,
+          contentByteLength: admittedMessageContent!.metadata.byte_length,
           contentEstimatedTokens: messageEstimatedTokens
         });
     const now = this.timestamp();
@@ -1316,6 +1344,8 @@ export class ChildExecutionControlPlane {
         created_at: now
       }),
       ...(!messageContext ? [] : [
+        ...attachmentAdmission!.storageSteps,
+        ...preparedContentObjectSteps([admittedMessageContent!], 'child_continuation_message'),
         DOMAIN_REPOSITORIES.domain('Message').insert({
           id: ids.messageId,
           created_at: now,
@@ -1326,12 +1356,15 @@ export class ChildExecutionControlPlane {
           id: ids.messageRevisionId,
           message_id: ids.messageId,
           role: 'user',
-          content_object_id: revisions[0].content_object_id,
+          content_object_id: admittedMessageContent!.metadata.id,
           created_at: now
         }, {
           column: 'revision_seq',
           scope: { message_id: ids.messageId }
         }),
+        ...(this.attachments
+          ? this.attachments.linkSteps(attachmentAdmission!, ids.messageRevisionId, now)
+          : []),
         DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
           id: ids.messageCurrentLinkId,
           message_id: ids.messageId,
@@ -2559,6 +2592,58 @@ export class ChildExecutionControlPlane {
       const settled = await this.finalizeWaitSettlement(toolCallId);
       if (!settled) throw error;
       return settled;
+    }
+  }
+
+  /** A child drive failure is terminal; settle an active parent wait immediately instead of timing out. */
+  public async settleForegroundFailure(
+    childExecutionIdInput: string,
+    turnIdInput: string,
+    reasonInput: string
+  ): Promise<boolean> {
+    const childExecutionId = requirePhaseFId(childExecutionIdInput, 'childExecutionId');
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const reason = requirePhaseFText(reasonInput, 'reason');
+    const snapshot = await this.readExecutionSnapshot(childExecutionId);
+    const sourceIdentity = `child-drive-failed:${childExecutionId}:${turnId}`;
+    const answerSubmissionId = stablePhaseFId(
+      'answer_submission',
+      'child-drive-failed',
+      childExecutionId,
+      turnId
+    );
+    const settlement = await this.prepareForegroundSettlement({
+      childExecutionId,
+      status: 'failed',
+      detail: {
+        ...childControlHandle(snapshot.childExecution, snapshot.answerBridge),
+        answerSubmissionId,
+        failed: true,
+        reason
+      },
+      sourceIdentity
+    });
+    if (!settlement) return false;
+    const toolCall = await this.requireExisting('ToolCall', settlement.toolCallId);
+    const parentTurn = await this.requireExisting('Turn', requirePhaseFId(toolCall.turn_id, 'ToolCall.turn_id'));
+    const now = this.timestamp();
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+          id: settlement.receiptId,
+          source_kind: 'internal',
+          source_key: sourceIdentity,
+          conversation_id: parentTurn.conversation_id,
+          turn_id: parentTurn.id,
+          created_at: now
+        }),
+        ...settlement.steps
+      ]);
+      await this.finalizeWaitSettlement(settlement.toolCallId);
+      return true;
+    } catch (error) {
+      if (!isExpectedSettlementRace(error)) throw error;
+      return (await this.finalizeWaitSettlement(settlement.toolCallId)) !== null;
     }
   }
 

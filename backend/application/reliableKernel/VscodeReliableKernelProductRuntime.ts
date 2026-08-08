@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { EXTENSION_PACKAGE_NAME, EXTENSION_VERSION } from '../../../shared/extensionIdentity';
-import { createGlobalSettingsRecord, resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
+import { resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
 import {
   createVscodeStoragePaths,
   type StoragePaths
@@ -113,10 +113,10 @@ export class VscodeReliableKernelProductRuntime {
     let fileDiffs: VscodeReliableFileDiffEditor | undefined;
     let conversations: ReliableConversationRunner | undefined;
     const toolHost = new VscodeReliableToolHost(context, configuration, {
-      dispatchSpecial: async (definition, input, frozenAuthority, signal) => {
-        const childResult = await childAgents?.dispatch(input, signal);
+      dispatchSpecial: async (definition, input, frozenAuthority, signal, admission) => {
+        const childResult = await childAgents?.dispatch(input, signal, admission);
         if (childResult) return childResult;
-        return options.dispatchSpecial?.(definition, input, frozenAuthority, signal);
+        return options.dispatchSpecial?.(definition, input, frozenAuthority, signal, admission);
       },
       cancelTurnWaits: async (input) => {
         await childAgents?.cancelParentWaits(input);
@@ -127,7 +127,11 @@ export class VscodeReliableKernelProductRuntime {
     });
     const providers = new ReliableLlmProviderRegistry({
       loadProviderConfig: (providerConfigId) => configuration.providerConfig(providerConfigId),
-      proxy: () => createGlobalSettingsRecord(context).proxy || undefined,
+      proxy: async () => {
+        const common = await configuration.loadGlobalSettings('common');
+        const proxy = (common.settings as import('../../../shared/protocol').GlobalSettingsRecord).proxy;
+        return proxy || undefined;
+      },
       headers: { 'User-Agent': `${EXTENSION_PACKAGE_NAME}/${EXTENSION_VERSION}` },
       onTransportTrace: (trace) => {
         diagnostics.observe({
@@ -268,11 +272,17 @@ export class VscodeReliableKernelProductRuntime {
           // The RuntimeDelivery ACK is the durable notification fence. A host crash after this point
           // may omit a toast, but can never emit duplicate toasts on wake replay.
           if (acknowledged.changed) {
-            void vscode.window.showInformationMessage(
-              request.sourceKind === 'answer_submission'
-                ? 'LimCode 子 Agent 已返回部分或最终结果；来源对话已结束，答案已保留在可靠 Runtime 中。'
-                : `LimCode 后台进程 ${request.processId ?? request.sourceId} 已完成；来源对话已取消或关闭，结果已保留在可靠 Runtime 中。`
-            );
+            if (request.sourceKind === 'child_failure') {
+              void vscode.window.showErrorMessage(
+                'LimCode 子 Agent 执行失败；失败详情已保留在可靠 Runtime 中。'
+              );
+            } else {
+              void vscode.window.showInformationMessage(
+                request.sourceKind === 'answer_submission'
+                  ? 'LimCode 子 Agent 已返回部分或最终结果；来源对话已结束，答案已保留在可靠 Runtime 中。'
+                  : `LimCode 后台进程 ${request.processId ?? request.sourceId} 已完成；来源对话已取消或关闭，结果已保留在可靠 Runtime 中。`
+              );
+            }
           }
           return { acknowledged: true };
         }

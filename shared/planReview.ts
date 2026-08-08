@@ -12,6 +12,7 @@ import type {
 
 export const SUBMIT_PLAN_MAX_BODY_LENGTH = 40_000;
 export const DELEGATED_PLAN_APPROVAL_MESSAGE = 'Plan 已下发给 Agent 执行，请耐心等待。';
+export const CHILD_PLAN_AUTO_APPROVAL_MESSAGE = '子 Agent 的 Plan 已按父任务授权自动批准，请继续执行。';
 
 export function normalizeSubmitPlanToolRequest(value: unknown): SubmitPlanToolRequestRecord {
   const record = asRecord(parseJsonValue(value));

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import {
   ContentAddressedStore,
   type ContentObjectIdentity,
@@ -20,6 +21,7 @@ import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
+  MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT,
   type ModelRequestCancelResult
 } from './databaseWorkerProtocol';
 import {
@@ -66,6 +68,7 @@ export interface FullProviderContextItem {
 export interface FullProviderRequest {
   kind: 'full-model-request';
   modelRequestId: string;
+  conversationId: string;
   attemptSeq: string;
   socketGeneration: string;
   providerId: string;
@@ -128,9 +131,9 @@ export interface ProviderDispatchOptions {
 }
 
 const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
-const DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS = 40_000;
-const DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS = 30_000;
-const DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS = 3 * 60 * 1_000;
+const DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS = 80_000;
+const DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS = 4.5 * 60 * 1_000;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 10_000] as const;
 const DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS = 1_000;
 
@@ -160,7 +163,7 @@ export interface StreamEventResult {
   accepted: boolean;
   checkpointed: boolean;
   terminal: boolean;
-  ignoredReason?: 'old-attempt' | 'old-socket-generation' | 'terminal' | 'checkpoint-capacity' | 'duplicate';
+  ignoredReason?: 'old-attempt' | 'old-socket-generation' | 'terminal' | 'checkpoint-capacity' | 'duplicate' | 'coalesced';
 }
 
 export interface CompletedModelRequestEvent {
@@ -200,6 +203,10 @@ interface StreamIdentity {
   attemptSeq: bigint;
   socketGeneration: bigint;
   stats: StreamStats;
+}
+
+interface StreamDurabilityState {
+  outputDeltaCheckpointed: boolean;
 }
 
 interface FrozenAuthority {
@@ -431,12 +438,28 @@ export class ModelProviderControlPlane {
     );
     const settingsId = optionalId(request.settings_snapshot_object_id, 'ModelRequest.settings_snapshot_object_id');
     const settingsContent = settingsId ? await this.requireDomain('ContentObject', settingsId) : null;
+    const materializeStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
     const materialized = await this.context.materialize(requireId(projection.root_id, 'ModelContextProjection.root_id'));
+    if (materializeStartedAt !== undefined) {
+      this.database.recordPerformanceMetric({
+        kind: 'context.materialize',
+        mode: 'content',
+        segmentCount: materialized.segments.length,
+        durationMs: performance.now() - materializeStartedAt
+      });
+    }
     const contentRows = [recipeContent, ...(settingsContent ? [settingsContent] : [])];
     const bytes = await this.contentStore.readMany(contentRows.map(asContentObjectMetadata));
     const recipe = parsePlainJson(bytes[0], 'ModelRequest recipe');
     const frozenAuthority = frozen.document;
     const settingsSnapshot = settingsContent ? parsePlainJson(bytes[1], 'ModelRequest settings snapshot') : undefined;
+    const contextConversationId = requireId(
+      materialized.root.conversation_id,
+      'ContextSequenceRoot.conversation_id'
+    );
+    if (contextConversationId !== frozen.conversationId) {
+      throw new Error('Frozen Context projection belongs to another Conversation.');
+    }
     const primaryModel = frozenModelIdentity(frozenAuthority);
     const compressionPolicy = isCompressionRecipe(recipe)
       ? frozenCompressionPolicy(frozenAuthority)
@@ -458,6 +481,7 @@ export class ModelProviderControlPlane {
     return {
       kind: 'full-model-request',
       modelRequestId,
+      conversationId: frozen.conversationId,
       attemptSeq: attemptSeq.toString(),
       socketGeneration: socketGeneration.toString(),
       providerId: frozenModel.providerId,
@@ -686,6 +710,9 @@ export class ModelProviderControlPlane {
             firstSemanticMs: this.semanticTimeouts.firstSemanticMs,
             semanticIdleMs: this.semanticTimeouts.semanticIdleMs
           });
+      const streamDurability: StreamDurabilityState = {
+        outputDeltaCheckpointed: false
+      };
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
           signal: controller.signal,
@@ -695,11 +722,12 @@ export class ModelProviderControlPlane {
             const semanticProgress = event.semanticProgress !== false;
             if (semanticProgress) progressWaiter.beginProgress();
             try {
-              return await this.recordStreamEvent(
+              return await this.recordDispatchStreamEvent(
                 modelRequestId,
                 identity.attemptSeq,
                 identity.socketGeneration,
-                event
+                event,
+                streamDurability
               );
             } finally {
               if (semanticProgress) progressWaiter.commitProgress();
@@ -832,6 +860,48 @@ export class ModelProviderControlPlane {
     }
   }
 
+  /**
+   * Provider deltas already fan out through the process-local transient observer. Persist only the
+   * first ordinary delta as a bounded progress marker; no production recovery reader reconstructs
+   * output from later delta samples. Semantic item boundaries and the terminal fence continue to
+   * await their own durable transaction.
+   */
+  private async recordDispatchStreamEvent(
+    modelRequestId: string,
+    attemptSeq: bigint,
+    socketGeneration: bigint,
+    event: ProviderOutputStreamEvent,
+    state: StreamDurabilityState
+  ): Promise<StreamEventResult> {
+    if (event.kind === 'output_delta' && state.outputDeltaCheckpointed) {
+      return this.recordUndurableDispatchEvent('coalesced');
+    }
+
+    const result = await this.recordStreamEvent(modelRequestId, attemptSeq, socketGeneration, event);
+    if (
+      event.kind === 'output_delta'
+      && (result.checkpointed
+        || result.ignoredReason === 'duplicate'
+        || result.ignoredReason === 'checkpoint-capacity')
+    ) {
+      state.outputDeltaCheckpointed = true;
+    }
+    return result;
+  }
+
+  private recordUndurableDispatchEvent(ignoredReason: 'coalesced'): StreamEventResult {
+    if (this.database.performanceMetrics) {
+      this.database.recordPerformanceMetric({
+        kind: 'provider.stream_event',
+        eventKind: 'output_delta',
+        checkpointed: false,
+        transactionCount: 0,
+        durationMs: 0
+      });
+    }
+    return { accepted: true, checkpointed: false, terminal: false, ignoredReason };
+  }
+
   public async recordStreamEvent(
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
@@ -842,6 +912,20 @@ export class ModelProviderControlPlane {
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
     const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
     const event = normalizeStreamEvent(eventInput);
+    const metricStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
+    let transactionCount = 0;
+    const finish = (result: StreamEventResult): StreamEventResult => {
+      if (metricStartedAt !== undefined) {
+        this.database.recordPerformanceMetric({
+          kind: 'provider.stream_event',
+          eventKind: event.kind === 'completed' ? 'terminal_summary' : event.kind,
+          checkpointed: result.checkpointed,
+          transactionCount,
+          durationMs: performance.now() - metricStartedAt
+        });
+      }
+      return result;
+    };
     const checkpointId = stableId(
       'model_stream_checkpoint',
       modelRequestId,
@@ -866,7 +950,8 @@ export class ModelProviderControlPlane {
       DOMAIN_REPOSITORIES.domain('ModelStreamFence').list({ where: { model_request_id: modelRequestId }, limit: 1 }),
       DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').get(checkpointId),
       DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').list({
-        where: { model_request_id: modelRequestId }, limit: MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT + 1
+        where: { model_request_id: modelRequestId },
+        limit: MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT + 1
       })
     ]);
     const request = requireRow(preflight.snapshot[0], `ModelRequest ${modelRequestId}`);
@@ -881,19 +966,47 @@ export class ModelProviderControlPlane {
         checkpointKind,
         contentObjectId: checkpointIdentity.id
       });
-      return { accepted: false, checkpointed: false, terminal: request.status === 'terminal', ignoredReason: 'duplicate' };
+      return finish({
+        accepted: false,
+        checkpointed: false,
+        terminal: request.status === 'terminal',
+        ignoredReason: 'duplicate'
+      });
     }
     if (request.status === 'terminal' || rows(preflight.snapshot[1]).length > 0) {
-      return { accepted: false, checkpointed: false, terminal: true, ignoredReason: 'terminal' };
+      return finish({ accepted: false, checkpointed: false, terminal: true, ignoredReason: 'terminal' });
     }
     if (stats.attemptSeq !== attemptSeq.toString()) {
-      return { accepted: false, checkpointed: false, terminal: false, ignoredReason: 'old-attempt' };
+      return finish({ accepted: false, checkpointed: false, terminal: false, ignoredReason: 'old-attempt' });
     }
     if (stats.socketGeneration !== socketGeneration.toString()) {
-      return { accepted: false, checkpointed: false, terminal: false, ignoredReason: 'old-socket-generation' };
+      return finish({
+        accepted: false,
+        checkpointed: false,
+        terminal: false,
+        ignoredReason: 'old-socket-generation'
+      });
     }
-    if (!completed && rows(preflight.snapshot[3]).length >= MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT) {
-      return { accepted: true, checkpointed: false, terminal: false, ignoredReason: 'checkpoint-capacity' };
+    const activeCheckpoints = rows(preflight.snapshot[3]);
+    if (
+      checkpointKind === 'output_delta'
+      && activeCheckpoints.filter((row) => row.checkpoint_kind === 'output_delta').length
+        >= MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT
+    ) {
+      return finish({
+        accepted: true,
+        checkpointed: false,
+        terminal: false,
+        ignoredReason: 'checkpoint-capacity'
+      });
+    }
+    if (
+      checkpointKind === 'output_item_done'
+      && activeCheckpoints.length >= MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT
+    ) {
+      throw new Error(
+        `ModelRequest ${modelRequestId} exceeded the durable semantic item checkpoint limit.`
+      );
     }
     const content = await this.contentStore.prepare(this.database, checkpointBytes, CONTENT_TYPE_CHECKPOINT);
     const result = await this.database.commitModelStreamEvent({
@@ -910,12 +1023,13 @@ export class ModelProviderControlPlane {
       terminalStats: completed ? { ...stats, ...(event.timing ?? {}) } : null,
       now: this.timestamp()
     });
-    return {
+    transactionCount = result.commit ? 1 : 0;
+    return finish({
       accepted: result.accepted,
       checkpointed: result.checkpointed,
       terminal: result.terminal,
       ...(result.ignoredReason ? { ignoredReason: result.ignoredReason } : {})
-    };
+    });
   }
 
   private async openSocketGeneration(

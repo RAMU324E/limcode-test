@@ -437,10 +437,11 @@ export function planReliableChildAgentRun(
 }
 
 function normalizeRunAgentForegroundWaitMs(value: unknown): { ok: true; value: number } | { ok: false; reason: string } {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    return { ok: false, reason: 'run_agent.foregroundWaitMs 为必填参数，需为非负毫秒数；0 表示启动后立即转后台。' };
+  if (value === undefined) return { ok: true, value: 0 };
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > 86_400_000) {
+    return { ok: false, reason: 'run_agent.foregroundWaitMs 省略时默认为 0；传入时必须是 0 到 86400000 的整数毫秒数。' };
   }
-  return { ok: true, value: Math.floor(value) };
+  return { ok: true, value };
 }
 
 function defaultConversationForAgent(world: WorldReader, agent: Entity): Entity | undefined {

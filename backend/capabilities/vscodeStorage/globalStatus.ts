@@ -1,10 +1,15 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { GlobalSettingsRecord } from '../../../shared/protocol';
+import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { STORAGE_VERSION } from './constants';
+import { readJsonStrict, writeJson } from './json';
+import { withRecordStoreTransaction } from './recordStore';
+import { createStorageRevision } from './storageRevision';
 
 export const LIMCODE_GLOBAL_STATUS_KEY = 'limcode.globalStatus';
-export const LIMCODE_GLOBAL_STATUS_LABEL = `VS Code globalState: ${LIMCODE_GLOBAL_STATUS_KEY}`;
+export const LIMCODE_GLOBAL_STATUS_FILE = '.limcode-global-status.json';
+export const LIMCODE_GLOBAL_STATUS_LABEL = LIMCODE_GLOBAL_STATUS_FILE;
 
 export interface StorageRootMigrationStatus {
   fromPath: string;
@@ -20,43 +25,80 @@ export interface LimCodeGlobalStatus {
   lastMigration?: StorageRootMigrationStatus;
 }
 
-export function loadGlobalStatus(context: vscode.ExtensionContext): LimCodeGlobalStatus {
-  const stored = context.globalState.get<Partial<LimCodeGlobalStatus>>(LIMCODE_GLOBAL_STATUS_KEY);
-  const dataRootPath = normalizeDataRootPath(stored?.dataRootPath, { fallbackToDefault: true });
-  const proxy = typeof stored?.proxy === 'string' ? stored.proxy.trim() : '';
-  const lastMigration = normalizeLastMigration(stored?.lastMigration);
+const committedStatusByContext = new WeakMap<vscode.ExtensionContext, LimCodeGlobalStatus>();
 
-  return {
-    schemaVersion: STORAGE_VERSION,
-    dataRootPath: sameFsPath(dataRootPath, context.globalStorageUri.fsPath) ? '' : dataRootPath,
-    proxy,
-    updatedAt: typeof stored?.updatedAt === 'string' ? stored.updatedAt : '',
-    ...(lastMigration ? { lastMigration } : {})
-  };
+/** 启动完成后返回当前进程已确认的 canonical 状态。 */
+export function loadGlobalStatus(context: vscode.ExtensionContext): LimCodeGlobalStatus {
+  return cloneStatus(committedStatusByContext.get(context) ?? statusFromGlobalState(context));
 }
 
+/** 每次从 canonical 文件读取，供跨 Extension Host 刷新和设置 revision 使用。 */
+export async function loadCommittedGlobalStatus(context: vscode.ExtensionContext): Promise<LimCodeGlobalStatus> {
+  const uri = globalStatusFileUri(context);
+  const initial = await readJsonStrict<unknown>(uri);
+  if (initial.status === 'ok') return remember(context, parseGlobalStatus(uri, initial.value));
+  if (initial.status !== 'missing') throw strictStatusReadError(initial);
+
+  return withRecordStoreTransaction(uri, async () => {
+    const current = await readJsonStrict<unknown>(uri);
+    if (current.status === 'ok') return remember(context, parseGlobalStatus(uri, current.value));
+    if (current.status !== 'missing') throw strictStatusReadError(current);
+    const bootstrap = statusFromGlobalState(context);
+    await writeJson(uri, bootstrap);
+    return remember(context, bootstrap);
+  });
+}
+
+/** 内部迁移路径使用的无条件提交；普通设置保存必须使用 saveGlobalStatusExpected。 */
 export async function saveGlobalStatus(
   context: vscode.ExtensionContext,
   dataRootPath: string,
   proxy: string,
   lastMigration?: StorageRootMigrationStatus
 ): Promise<LimCodeGlobalStatus> {
-  const previous = loadGlobalStatus(context);
-  const normalizedDataRootPath = normalizeStatusDataRootPath(context, dataRootPath);
-  const normalizedProxy = typeof proxy === 'string' ? proxy.trim() : '';
-  const status: LimCodeGlobalStatus = {
-    schemaVersion: STORAGE_VERSION,
-    dataRootPath: normalizedDataRootPath,
-    proxy: normalizedProxy,
-    updatedAt: new Date().toISOString(),
-    ...(lastMigration ? { lastMigration } : previous.lastMigration ? { lastMigration: previous.lastMigration } : {})
-  };
-  await context.globalState.update(LIMCODE_GLOBAL_STATUS_KEY, status);
-  return status;
+  const uri = globalStatusFileUri(context);
+  return withRecordStoreTransaction(uri, async () => {
+    const previous = await loadStatusInsideLock(context, uri);
+    return commitStatus(context, uri, previous, dataRootPath, proxy, lastMigration);
+  });
 }
 
-export function createGlobalSettingsRecord(context: vscode.ExtensionContext): GlobalSettingsRecord {
-  const status = loadGlobalStatus(context);
+/** 在同一把跨进程锁内比对旧 revision 并提交 common 设置。 */
+export async function saveGlobalStatusExpected(
+  context: vscode.ExtensionContext,
+  dataRootPath: string,
+  proxy: string,
+  expectedRevision: string
+): Promise<{ current: LimCodeGlobalStatus; previous: LimCodeGlobalStatus }> {
+  const uri = globalStatusFileUri(context);
+  return withRecordStoreTransaction(uri, async () => {
+    const previous = await loadStatusInsideLock(context, uri);
+    const actualRevision = globalStatusRevision(previous);
+    if (actualRevision !== expectedRevision) {
+      throw new SettingsRevisionConflictError('common', expectedRevision, actualRevision);
+    }
+    const current = await commitStatus(context, uri, previous, dataRootPath, proxy);
+    return { current, previous };
+  });
+}
+
+export function globalStatusRevision(status: LimCodeGlobalStatus): string {
+  return createStorageRevision({
+    schemaVersion: status.schemaVersion,
+    dataRootPath: status.dataRootPath,
+    proxy: status.proxy,
+    ...(status.lastMigration ? { lastMigration: status.lastMigration } : {})
+  });
+}
+
+export function globalStatusFileUri(context: vscode.ExtensionContext): vscode.Uri {
+  return vscode.Uri.joinPath(context.globalStorageUri, LIMCODE_GLOBAL_STATUS_FILE);
+}
+
+export function createGlobalSettingsRecord(
+  context: vscode.ExtensionContext,
+  status: LimCodeGlobalStatus = loadGlobalStatus(context)
+): GlobalSettingsRecord {
   return {
     dataFilePath: status.dataRootPath,
     proxy: status.proxy,
@@ -65,7 +107,10 @@ export function createGlobalSettingsRecord(context: vscode.ExtensionContext): Gl
   };
 }
 
-export function resolveDataRootUri(context: vscode.ExtensionContext, dataRootPath = loadGlobalStatus(context).dataRootPath): vscode.Uri {
+export function resolveDataRootUri(
+  context: vscode.ExtensionContext,
+  dataRootPath = loadGlobalStatus(context).dataRootPath
+): vscode.Uri {
   const normalizedDataRootPath = normalizeStatusDataRootPath(context, dataRootPath);
   return normalizedDataRootPath ? vscode.Uri.file(normalizedDataRootPath) : context.globalStorageUri;
 }
@@ -96,16 +141,106 @@ export function comparableFsPath(value: string): string {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
+async function loadStatusInsideLock(
+  context: vscode.ExtensionContext,
+  uri: vscode.Uri
+): Promise<LimCodeGlobalStatus> {
+  const result = await readJsonStrict<unknown>(uri);
+  if (result.status === 'ok') return parseGlobalStatus(uri, result.value);
+  if (result.status !== 'missing') throw strictStatusReadError(result);
+  const bootstrap = statusFromGlobalState(context);
+  await writeJson(uri, bootstrap);
+  return bootstrap;
+}
+
+async function commitStatus(
+  context: vscode.ExtensionContext,
+  uri: vscode.Uri,
+  previous: LimCodeGlobalStatus,
+  dataRootPath: string,
+  proxy: string,
+  lastMigration?: StorageRootMigrationStatus
+): Promise<LimCodeGlobalStatus> {
+  const status: LimCodeGlobalStatus = {
+    schemaVersion: STORAGE_VERSION,
+    dataRootPath: normalizeStatusDataRootPath(context, dataRootPath),
+    proxy: typeof proxy === 'string' ? proxy.trim() : '',
+    updatedAt: new Date().toISOString(),
+    ...(lastMigration ? { lastMigration: requireMigration(lastMigration) }
+      : previous.lastMigration ? { lastMigration: { ...previous.lastMigration } } : {})
+  };
+  await writeJson(uri, status);
+  remember(context, status);
+  try {
+    await context.globalState.update(LIMCODE_GLOBAL_STATUS_KEY, status);
+  } catch (error) {
+    console.warn('[LimCode] Canonical global status committed, but globalState projection update failed.', error);
+  }
+  return cloneStatus(status);
+}
+
+function statusFromGlobalState(context: vscode.ExtensionContext): LimCodeGlobalStatus {
+  const stored = context.globalState.get<Partial<LimCodeGlobalStatus>>(LIMCODE_GLOBAL_STATUS_KEY);
+  const dataRootPath = normalizeDataRootPath(stored?.dataRootPath, { fallbackToDefault: true });
+  const lastMigration = normalizeLastMigration(stored?.lastMigration);
+  return {
+    schemaVersion: STORAGE_VERSION,
+    dataRootPath: sameFsPath(dataRootPath, context.globalStorageUri.fsPath) ? '' : dataRootPath,
+    proxy: typeof stored?.proxy === 'string' ? stored.proxy.trim() : '',
+    updatedAt: typeof stored?.updatedAt === 'string' && stored.updatedAt.trim()
+      ? stored.updatedAt
+      : new Date(0).toISOString(),
+    ...(lastMigration ? { lastMigration } : {})
+  };
+}
+
+function parseGlobalStatus(uri: vscode.Uri, value: unknown): LimCodeGlobalStatus {
+  const record = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+  if (!record || record.schemaVersion !== STORAGE_VERSION) throw new Error(`全局状态文件版本无效：${uri.fsPath}`);
+  if (typeof record.dataRootPath !== 'string' || typeof record.proxy !== 'string') {
+    throw new Error(`全局状态文件内容损坏：${uri.fsPath}`);
+  }
+  if (typeof record.updatedAt !== 'string' || !record.updatedAt.trim()) {
+    throw new Error(`全局状态文件缺少保存时间：${uri.fsPath}`);
+  }
+  const lastMigration = record.lastMigration === undefined ? undefined : normalizeLastMigration(record.lastMigration);
+  if (record.lastMigration !== undefined && !lastMigration) throw new Error(`全局状态迁移信息损坏：${uri.fsPath}`);
+  return {
+    schemaVersion: STORAGE_VERSION,
+    dataRootPath: normalizeDataRootPath(record.dataRootPath),
+    proxy: record.proxy.trim(),
+    updatedAt: record.updatedAt,
+    ...(lastMigration ? { lastMigration } : {})
+  };
+}
+
+function remember(context: vscode.ExtensionContext, status: LimCodeGlobalStatus): LimCodeGlobalStatus {
+  const snapshot = cloneStatus(status);
+  committedStatusByContext.set(context, snapshot);
+  return cloneStatus(snapshot);
+}
+
+function cloneStatus(status: LimCodeGlobalStatus): LimCodeGlobalStatus {
+  return { ...status, ...(status.lastMigration ? { lastMigration: { ...status.lastMigration } } : {}) };
+}
+
+function requireMigration(value: StorageRootMigrationStatus): StorageRootMigrationStatus {
+  const normalized = normalizeLastMigration(value);
+  if (!normalized) throw new TypeError('Storage root migration metadata is invalid.');
+  return normalized;
+}
+
 function normalizeLastMigration(input: unknown): StorageRootMigrationStatus | undefined {
   const candidate = input as Partial<StorageRootMigrationStatus> | undefined;
-  if (
-    typeof candidate?.fromPath !== 'string'
+  if (typeof candidate?.fromPath !== 'string'
     || typeof candidate.toPath !== 'string'
-    || typeof candidate.migratedAt !== 'string'
-  ) return undefined;
-  return {
-    fromPath: candidate.fromPath,
-    toPath: candidate.toPath,
-    migratedAt: candidate.migratedAt
-  };
+    || typeof candidate.migratedAt !== 'string') return undefined;
+  return { fromPath: candidate.fromPath, toPath: candidate.toPath, migratedAt: candidate.migratedAt };
+}
+
+function strictStatusReadError(result: Exclude<Awaited<ReturnType<typeof readJsonStrict<unknown>>>, { status: 'ok' | 'missing' }>): Error {
+  const detail = result.error instanceof Error ? result.error.message : String(result.error);
+  return new Error(`无法读取全局状态文件（${result.status}）：${result.uri.fsPath}。${detail}`);
 }

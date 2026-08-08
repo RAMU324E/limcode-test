@@ -15,8 +15,8 @@ const MAX_RETAINED_SESSIONS = 32;
 const IDLE_SESSION_TTL_MS = 15 * 60 * 1_000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
 const DEFAULT_SEND_TIMEOUT_MS = 10_000;
-const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 60_000;
-const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 120_000;
+const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 15 * 60 * 1_000;
 const NETWORK_IDENTITY_CHECK_INTERVAL_MS = 2_000;
 // These codes describe a graceful WebSocket closing handshake, not a completed Responses request.
@@ -42,7 +42,11 @@ export interface OpenAIResponsesWebSocketDecision {
   sessionKeyHash: string;
   connectionGeneration: number;
   connectionReused: boolean;
-  connectionReason: 'reused' | 'new_connection' | 'socket_expired' | 'handshake_identity_changed';
+  connectionReason:
+    | 'reused'
+    | 'new_connection'
+    | 'socket_expired'
+    | 'handshake_identity_changed';
   mode: 'full' | 'incremental';
   reason: string;
   fullInputItemCount: number;
@@ -344,6 +348,8 @@ async function* streamLocked(
     const outputStateReliable = normalizedOutputItems !== undefined
       && (normalizedOutputItems.length > 0 || !sawSemanticOutput);
 
+    session.lastUsedAt = Date.now();
+
     if (!resolvedResponseId || !outputStateReliable || session.socket !== socket || socket.readyState !== WebSocket.OPEN) {
       invalidateContinuation(session);
       return;
@@ -358,7 +364,6 @@ async function* streamLocked(
       responseId: resolvedResponseId,
       outputItems: normalizedOutputItems.map(cloneJson)
     };
-    session.lastUsedAt = Date.now();
   } catch (error) {
     observeTransportFailure(session, options, error);
     closeAndInvalidate(session, true);

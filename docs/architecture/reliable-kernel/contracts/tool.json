@@ -201,11 +201,11 @@
       10000
     ],
     "semanticDeadlinesMilliseconds": {
-      "ordinaryFirst": 40000,
-      "ordinaryIdle": 30000,
-      "compressionCompletion": 180000
+      "ordinaryFirst": 80000,
+      "ordinaryIdle": 60000,
+      "compressionCompletion": 270000
     },
-    "compressionProgressContract": "compact()为terminal-only；只以CompactDone/CompactError满足180秒完成deadline，不等待不存在的thought/text语义事件",
+    "compressionProgressContract": "compact()为terminal-only；只以CompactDone/CompactError满足270秒完成deadline，不等待不存在的thought/text语义事件",
     "visibleToUser": true,
     "visibleWhenTransientThoughtExists": true,
     "cancelable": true,

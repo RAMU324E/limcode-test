@@ -255,7 +255,7 @@ ProviderContinuation 首发为 `disabled-full-request`：
 - queue 与 interrupt 是不同输入语义；
 - wait/list 为单次短 SQLite snapshot read，不改变 delivery；
 - interrupt_subtree 首发必选，沿 ParentLink 递归，并在同一事务覆盖 active Turn 与 pending Intent；
-- 终止请求不是终态，partial interrupted answer 可保存但不得重开父 Turn。
+- 显式 interrupt_subtree 的 partial interrupted answer 可保存但不得重开或自动续接父 Turn；非 cascade 父 Turn 中断后仍正常运行的 ChildExecution 提交答案时，可创建新的父侧 continuation Turn，但绝不复活旧 Turn。
 
 UI 直接显示 childExecution、activeChildTurn、answerSubmission、runtimeDelivery、parentHandling 与 termination facts，不通过旧 activityStage、notificationRun 或 display text 猜测。
 

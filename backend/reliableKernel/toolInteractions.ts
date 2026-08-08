@@ -564,13 +564,22 @@ export class ToolInteractionControlPlane {
     decision: 'accept' | 'submit' | 'reject' | 'cancel';
     response: unknown;
   }): Promise<PlanReviewResolutionResult> {
-    const source = normalizeSource(input.source, ['command'], 'plan-review-resolve');
+    const source = normalizeSource(input.source, ['command', 'internal'], 'plan-review-resolve');
     const requestId = requireId(input.requestId, 'requestId');
     const request = await this.requireExisting('InteractionRequest', requestId);
     if (request.request_kind !== 'plan_review') throw new Error('InteractionRequest is not plan_review.');
     const ownerRows = await this.list('InteractionOwnerLink', { request_id: requestId }, 2);
     if (ownerRows.length !== 1) throw new Error('plan_review InteractionRequest must have one owner link.');
     const turn = await this.requireExisting('Turn', requireId(ownerRows[0].turn_id, 'InteractionOwnerLink.turn_id'));
+    if (source.kind === 'internal') {
+      if (input.decision !== 'accept') {
+        throw new Error('内部 Plan 决策只允许自动批准子 Agent Plan。');
+      }
+      const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turn.id }, 2);
+      if (childMemberships.length !== 1) {
+        throw new Error('只有属于唯一 ChildExecution 的子 Agent Turn 才能内部自动批准 Plan。');
+      }
+    }
     const subject = await this.readPlanReviewSubject(requestId);
     const proposalId = subject.proposalId;
     const pauseId = stablePhaseDId('outcome_pause', stablePhaseDId('operation', `plan-review:${subject.toolCallId}`));

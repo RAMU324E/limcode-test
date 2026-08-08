@@ -35,6 +35,7 @@ import {
 import type { ToolTerminalResult } from '../../reliableKernel/effectControlPlane';
 import type {
   ReliableToolDispatchAuthority,
+  ReliableSpecialToolAdmission,
   ReliableToolDispatcherHost
 } from '../../reliableKernel/toolDispatcher';
 import { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
@@ -47,7 +48,8 @@ export interface VscodeReliableToolHostOptions {
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
     authority: ReliableToolDispatchAuthority,
-    signal: AbortSignal
+    signal: AbortSignal,
+    admission?: ReliableSpecialToolAdmission
   ) => Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled | undefined>;
   cancelTurnWaits?: (input: { turnId: string; reason: string }) => Promise<void>;
   quiesce?: (reason: ExecutionHandoffError) => Promise<void>;
@@ -68,6 +70,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     promise: Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
   }>();
   private initialization: Promise<void> | undefined;
+  private mcpInitialization: Promise<void> | undefined;
   private onStateChange: (() => void) | undefined;
 
   public constructor(
@@ -86,9 +89,16 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   public initialize(): Promise<void> {
     this.initialization ??= Promise.all([
       this.skills.refresh(),
-      this.rules.refresh(),
-      this.mcp.refreshFromSettings({ discover: true })
+      this.rules.refresh()
     ]).then(() => { this.notifyStateChange(); });
+    // Start discovery alongside the core catalogs, but do not make builtin Turn admission wait for
+    // a remote MCP initialize/listTools round trip. A completed refresh naturally changes the tool
+    // definitions frozen by the next ModelRequest.
+    this.mcpInitialization ??= this.mcp.refreshFromSettings({ discover: true })
+      .then(() => { this.notifyStateChange(); })
+      .catch((error) => {
+        console.warn('[LimCode] MCP background discovery failed.', error);
+      });
     return this.initialization;
   }
 
@@ -158,6 +168,9 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       ...(environments.active ? { workEnvironment: environments.active } : {}),
       workEnvironments: environments.allowed,
       accessibleWorkEnvironments: environments.allowed,
+      ...(definition.declaration.name === 'read'
+        ? { attachmentMaxBytes: await this.loadAttachmentMaxBytes() }
+        : {}),
       signal,
       emit
     };
@@ -233,10 +246,11 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     definition: ToolDefinition,
     input: ReliableAgentToolDispatchInput,
     authority: ReliableToolDispatchAuthority,
-    signal: AbortSignal
+    signal: AbortSignal,
+    admission?: ReliableSpecialToolAdmission
   ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled | undefined> {
     return this.options.dispatchSpecial
-      ? this.options.dispatchSpecial(definition, input, authority, signal)
+      ? this.options.dispatchSpecial(definition, input, authority, signal, admission)
       : Promise.resolve(undefined);
   }
 
@@ -303,6 +317,16 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       }
       throw error;
     }
+  }
+
+  private async loadAttachmentMaxBytes(): Promise<number> {
+    const loaded = await this.configuration.loadGlobalSettings('attachments');
+    const settings = asRecord(loaded.settings);
+    const maxMb = Number(settings?.maxStoredInlineFileMb);
+    if (!Number.isSafeInteger(maxMb) || maxMb < 1 || maxMb > 200) {
+      throw new Error('附件大小设置无效。');
+    }
+    return maxMb * 1024 * 1024;
   }
 }
 

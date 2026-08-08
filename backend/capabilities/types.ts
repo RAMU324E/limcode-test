@@ -198,6 +198,8 @@ export interface WorkEnvironmentCapabilityOptions {
    */
   accessibleWorkEnvironments?: WorkEnvironmentRecord[];
   allowOutsideProjectPaths?: boolean;
+  /** Optional caller-provided byte ceiling for binary attachment reads. */
+  maxBytes?: number;
 }
 
 /**
@@ -688,8 +690,8 @@ export interface StorageCapability {
   collectShadowWorktreeStats(): Promise<ShadowRepositoryDiskStatRecord[]>;
   deleteShadowWorktrees(storageKeys: string[]): Promise<{ deletedStorageKeys: string[] }>;
   cleanupUnusedShadowWorktrees(maxAgeDays: number): Promise<{ deletedStorageKeys: string[] }>;
-  loadGlobalSettings(section: GlobalSettingsSection): Promise<{ section: GlobalSettingsSection; settings: GlobalSettingsSectionValue; filePath: string }>;
-  saveGlobalSettings(section: GlobalSettingsSection, settings: GlobalSettingsSectionValue): Promise<{ section: GlobalSettingsSection; settings: GlobalSettingsSectionValue; filePath: string }>;
+  loadGlobalSettings(section: GlobalSettingsSection): Promise<{ section: GlobalSettingsSection; settings: GlobalSettingsSectionValue; filePath: string; revision: string }>;
+  saveGlobalSettings(section: GlobalSettingsSection, settings: GlobalSettingsSectionValue, expectedRevision: string): Promise<{ section: GlobalSettingsSection; settings: GlobalSettingsSectionValue; filePath: string; revision: string; previousSettings?: GlobalSettingsSectionValue }>;
   loadActiveLlmProviderConfig(conversationId?: string): Promise<LlmProviderConfigRecord>;
   loadLlmProviderConfigById(configId: string): Promise<LlmProviderConfigRecord | undefined>;
   loadActiveLlmCompressionConfig(providerConfigId?: string, modelId?: string): Promise<LlmCompressionConfigRecord | undefined>;

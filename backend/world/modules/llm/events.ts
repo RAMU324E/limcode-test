@@ -54,15 +54,21 @@ export interface LlmThoughtDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
   text: string;
   thoughtSignature?: string;
+  /** 当前思考块开始的权威墙钟时间；前端据此本地插值，不依赖高频后端 tick。 */
+  thoughtStartedAt?: number;
   thoughtElapsedMs?: number;
 }
 export interface LlmThoughtProgressPayload extends LlmStreamEpochPayload {
   requestId: string;
+  /** 当前思考块开始的权威墙钟时间。 */
+  thoughtStartedAt?: number;
   thoughtElapsedMs: number;
   thoughtSignature?: string;
 }
 export interface LlmThoughtDonePayload extends LlmStreamEpochPayload {
   requestId: string;
+  /** 本次完成的思考块开始时间，用于可靠层区分并累计多个块。 */
+  thoughtStartedAt?: number;
   thoughtDurationMs: number;
   thoughtSignature?: string;
 }

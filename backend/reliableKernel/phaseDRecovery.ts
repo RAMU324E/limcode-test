@@ -88,37 +88,61 @@ export class PhaseDRecoveryScanner {
   }
 
   /** Deterministic DB-only continuation; it is not a registered recovery stable ID. */
-  public async reconcileCommittedFacts(signal?: AbortSignal): Promise<{ receipts: number; toolResults: number }> {
+  public async reconcileCommittedFacts(signal?: AbortSignal): Promise<{
+    receipts: number;
+    toolResults: number;
+    failed: number;
+  }> {
     signal?.throwIfAborted();
-    const receipts = await this.reconcileReceiptCandidates(signal);
+    const receiptResult = await this.reconcileReceiptCandidates(signal);
     let toolResults = 0;
+    let failed = receiptResult.failed;
 
     const activeTurns = await listAllDomainRows(this.database, 'Turn', { status: 'active' });
     for (const turn of activeTurns) {
       signal?.throwIfAborted();
-      toolResults += (await this.effects.finalizeReadyInOrder(String(turn.id))).length;
+      try {
+        toolResults += (await this.effects.finalizeReadyInOrder(String(turn.id))).length;
+      } catch (error) {
+        // One malformed/incomplete Turn must not prevent unrelated committed effects from
+        // converging. The next local commit or startup pass retries this exact durable frontier.
+        console.warn('[reliable-kernel] Turn finalization convergence failed.', String(turn.id), error);
+        failed += 1;
+      }
     }
-    return { receipts, toolResults };
+    return { receipts: receiptResult.receipts, toolResults, failed };
   }
 
-  private async reconcileReceiptCandidates(signal?: AbortSignal): Promise<number> {
+  private async reconcileReceiptCandidates(signal?: AbortSignal): Promise<{ receipts: number; failed: number }> {
     let receipts = 0;
+    let failed = 0;
     const candidates = await this.database.effectReceiptReconciliationCandidates();
     for (const candidate of candidates) {
       signal?.throwIfAborted();
-      const snapshot = await this.database.snapshot([
-        DOMAIN_REPOSITORIES.domain('EffectIntent').get(candidate.effectIntentId),
-        DOMAIN_REPOSITORIES.domain('EffectReceipt').get(candidate.effectReceiptId)
-      ]);
-      const intent = snapshot.snapshot[0];
-      const receipt = snapshot.snapshot[1];
-      if (Array.isArray(intent) || !intent || Array.isArray(receipt) || !receipt) {
-        throw new Error(`Effect receipt recovery candidate ${candidate.effectIntentId} lost its immutable facts.`);
+      try {
+        const snapshot = await this.database.snapshot([
+          DOMAIN_REPOSITORIES.domain('EffectIntent').get(candidate.effectIntentId),
+          DOMAIN_REPOSITORIES.domain('EffectReceipt').get(candidate.effectReceiptId)
+        ]);
+        const intent = snapshot.snapshot[0];
+        const receipt = snapshot.snapshot[1];
+        if (Array.isArray(intent) || !intent || Array.isArray(receipt) || !receipt) {
+          throw new Error(`Effect receipt recovery candidate ${candidate.effectIntentId} lost its immutable facts.`);
+        }
+        const result = await this.resumePersistedReceipt(intent, receipt);
+        if (result !== undefined) receipts += 1;
+      } catch (error) {
+        // Recovery is a set of independent durable candidates. Continue so one bad process/tool
+        // cannot hold every Conversation behind it hostage.
+        console.warn(
+          '[reliable-kernel] Effect receipt convergence failed.',
+          candidate.effectIntentId,
+          error
+        );
+        failed += 1;
       }
-      const result = await this.resumePersistedReceipt(intent, receipt);
-      if (result !== undefined) receipts += 1;
     }
-    return receipts;
+    return { receipts, failed };
   }
 
   private async scanHangingEffects(signal?: AbortSignal): Promise<PhaseDRecoveryResult> {
@@ -131,6 +155,7 @@ export class PhaseDRecoveryScanner {
     scanned += intents.length;
     for (const intent of intents) {
       signal?.throwIfAborted();
+      try {
       const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
       if (receipts.length > 0) {
         if (receipts.length !== 1) throw new Error(`EffectIntent ${String(intent.id)} has multiple EffectReceipts.`);
@@ -203,6 +228,10 @@ export class PhaseDRecoveryScanner {
       reconciled += 1;
       if (result?.status === 'outcome_unknown') unknown += 1;
       if (result) terminal.add(result.toolCallId);
+      } catch (error) {
+        signal?.throwIfAborted();
+        console.warn('[reliable-kernel] Hanging effect recovery failed.', String(intent.id), error);
+      }
     }
 
     return {
@@ -288,13 +317,18 @@ export class PhaseDRecoveryScanner {
     const ordered: Array<{ changeSet: DomainRow; turnId: string; callSeq: bigint }> = [];
     for (const changeSet of pending) {
       signal?.throwIfAborted();
-      const calls = await this.list('ToolCall', { id: changeSet.tool_call_id }, 1);
-      if (calls.length !== 1) throw new Error(`Pending FileChangeSet ${String(changeSet.id)} has no ToolCall.`);
-      ordered.push({
-        changeSet,
-        turnId: String(calls[0].turn_id),
-        callSeq: requirePositiveBigInt(calls[0].call_seq, 'ToolCall.call_seq')
-      });
+      try {
+        const calls = await this.list('ToolCall', { id: changeSet.tool_call_id }, 1);
+        if (calls.length !== 1) throw new Error(`Pending FileChangeSet ${String(changeSet.id)} has no ToolCall.`);
+        ordered.push({
+          changeSet,
+          turnId: String(calls[0].turn_id),
+          callSeq: requirePositiveBigInt(calls[0].call_seq, 'ToolCall.call_seq')
+        });
+      } catch (error) {
+        signal?.throwIfAborted();
+        console.warn('[reliable-kernel] Unresolved file change ordering failed.', String(changeSet.id), error);
+      }
     }
     ordered.sort((left, right) => left.turnId.localeCompare(right.turnId)
       || (left.callSeq < right.callSeq ? -1 : left.callSeq > right.callSeq ? 1 : 0));
@@ -303,6 +337,7 @@ export class PhaseDRecoveryScanner {
     let reconciled = 0;
     for (const { changeSet, turnId } of ordered) {
       signal?.throwIfAborted();
+      try {
       const decisions = await this.list('FileChangeDecision', { change_set_id: changeSet.id }, 1);
       if (decisions.length > 0) continue;
       const recovery = await this.turns.recoveryFacts(turnId);
@@ -340,6 +375,10 @@ export class PhaseDRecoveryScanner {
         if (result.terminal) terminal.add(result.terminal.toolCallId);
       } catch (error) {
         if (!(error instanceof ToolCallOrderBlockedError)) throw error;
+      }
+      } catch (error) {
+        signal?.throwIfAborted();
+        console.warn('[reliable-kernel] Unresolved file change recovery failed.', String(changeSet.id), error);
       }
     }
     return {

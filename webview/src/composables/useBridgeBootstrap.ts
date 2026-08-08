@@ -87,7 +87,10 @@ export function useBridgeBootstrap(): void {
       ) {
         globalSettings.setError(payload.message, {
           requestType: payload.requestType,
-          section: globalSettingsSectionFromScope(message.scope)
+          section: globalSettingsSectionFromScope(message.scope),
+          correlationId: message.correlationId,
+          code: payload.code,
+          actualRevision: payload.actualRevision
         });
       }
     })

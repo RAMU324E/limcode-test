@@ -120,7 +120,8 @@ export const readFileTool: ToolDefinition = {
         signal: ctx?.signal,
         workEnvironment: ctx?.workEnvironment,
         accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
-        allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true)
+        allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true),
+        ...(ctx?.attachmentMaxBytes ? { maxBytes: ctx.attachmentMaxBytes } : {})
       });
       const part: InlineDataPart = {
         inlineData: {

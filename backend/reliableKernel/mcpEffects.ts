@@ -1,7 +1,10 @@
+import { AttachmentAdmissionError } from './attachmentIngest';
+import type { InlineDataPart } from '../../shared/protocol';
 import {
   EffectControlPlane,
   type PhaseDCommandSource,
   type PreparedEffectIntent,
+  type RecordedEffectReceipt,
   type ToolSettlementResult,
   type ToolTerminalResult
 } from './effectControlPlane';
@@ -33,8 +36,8 @@ export type McpPreparationResult =
   | { disposition: 'rejected'; settlement: ToolSettlementResult };
 
 export type McpCallObservation =
-  | { outcome: 'succeeded'; result: unknown }
-  | { outcome: 'failed'; error: string; result: unknown }
+  | { outcome: 'succeeded'; result: unknown; parts?: InlineDataPart[] }
+  | { outcome: 'failed'; error: string; result: unknown; parts?: InlineDataPart[] }
   | { outcome: 'cancelled'; error: string }
   | { outcome: 'outcome_unknown'; error: string };
 
@@ -140,15 +143,33 @@ export class McpEffectDispatcher {
     if (!await this.effects.claimEffectDispatch(effectIntentId)) return { observation: null, terminal: null };
     const observation = await this.executeDispatched(effectIntentId, signal);
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    const recorded = await this.effects.recordEffectReceipt({
-      source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
-      attemptId: intent.attempt_id as string,
-      effectKind: MCP_EFFECT_KIND,
-      outcome: observation.outcome,
-      detail: observation
-    });
+    let recorded: RecordedEffectReceipt;
+    let durableObservation = observation;
+    try {
+      recorded = await this.effects.recordEffectReceipt({
+        source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
+        attemptId: intent.attempt_id as string,
+        effectKind: MCP_EFFECT_KIND,
+        outcome: observation.outcome,
+        detail: observation
+      });
+    } catch (error) {
+      if (!(error instanceof AttachmentAdmissionError)) throw error;
+      durableObservation = {
+        outcome: 'failed',
+        error: `MCP attachment result could not be stored: ${boundedErrorMessage(error)}`,
+        result: null
+      };
+      recorded = await this.effects.recordEffectReceipt({
+        source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
+        attemptId: intent.attempt_id as string,
+        effectKind: MCP_EFFECT_KIND,
+        outcome: 'failed',
+        detail: durableObservation
+      });
+    }
     return {
-      observation,
+      observation: durableObservation,
       terminal: await this.reconcileEffectReceipt(recorded.effectReceiptId, 'internal')
     };
   }
@@ -201,10 +222,20 @@ export class McpEffectDispatcher {
     if (settled.kind === 'error') return mcpInvocationFailure(settled.error, signal);
     try {
       const result = settled.result;
+      const normalized = normalizeMcpBinaryResult(result);
       if (isObservedMcpToolFailure(result)) {
-        return { outcome: 'failed', error: mcpFailureMessage(result), result };
+        return {
+          outcome: 'failed',
+          error: mcpFailureMessage(result),
+          result: normalized.result,
+          ...(normalized.parts.length > 0 ? { parts: normalized.parts } : {})
+        };
       }
-      return { outcome: 'succeeded', result };
+      return {
+        outcome: 'succeeded',
+        result: normalized.result,
+        ...(normalized.parts.length > 0 ? { parts: normalized.parts } : {})
+      };
     } catch (error) {
       return mcpInvocationFailure(error, signal);
     }
@@ -316,6 +347,63 @@ function normalizeAnnotations(value: McpToolAnnotations): McpToolAnnotations {
   };
 }
 
+function normalizeMcpBinaryResult(result: unknown): { result: unknown; parts: InlineDataPart[] } {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return { result, parts: [] };
+  const record = result as Record<string, unknown>;
+  if (!Array.isArray(record.content)) return { result, parts: [] };
+  const parts: InlineDataPart[] = [];
+  const content = record.content.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+    const item = entry as Record<string, unknown>;
+    if ((item.type === 'image' || item.type === 'audio') && typeof item.data === 'string') {
+      const mimeType = optionalMcpText(item.mimeType) ?? (item.type === 'image' ? 'image/png' : 'audio/mpeg');
+      const name = optionalMcpText(item.name) ?? `mcp-${item.type}-${index + 1}${mcpExtension(mimeType)}`;
+      const { data, ...metadata } = item;
+      const sizeBytes = Buffer.from(data, 'base64').byteLength;
+      parts.push({ inlineData: { mimeType, name, data, storage: 'embedded', status: 'available', sizeBytes } });
+      return { ...metadata, name, sizeBytes, attachment: true };
+    }
+    if (item.type === 'resource' && item.resource && typeof item.resource === 'object' && !Array.isArray(item.resource)) {
+      const resource = item.resource as Record<string, unknown>;
+      if (typeof resource.blob !== 'string') return entry;
+      const mimeType = optionalMcpText(resource.mimeType) ?? 'application/octet-stream';
+      const name = optionalMcpText(resource.name)
+        ?? mcpResourceName(optionalMcpText(resource.uri), index, mimeType);
+      const { blob, ...resourceMetadata } = resource;
+      const sizeBytes = Buffer.from(blob, 'base64').byteLength;
+      parts.push({ inlineData: { mimeType, name, data: blob, storage: 'embedded', status: 'available', sizeBytes } });
+      return {
+        ...item,
+        resource: { ...resourceMetadata, name, sizeBytes, attachment: true }
+      };
+    }
+    return entry;
+  });
+  return { result: { ...record, content }, parts };
+}
+
+function optionalMcpText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function mcpResourceName(uri: string | undefined, index: number, mimeType: string): string {
+  const fromUri = uri?.split(/[\\/]/).filter(Boolean).at(-1)?.split(/[?#]/, 1)[0];
+  return fromUri || `mcp-resource-${index + 1}${mcpExtension(mimeType)}`;
+}
+
+function mcpExtension(mimeType: string): string {
+  switch (mimeType.toLowerCase()) {
+    case 'image/png': return '.png';
+    case 'image/jpeg': return '.jpg';
+    case 'image/webp': return '.webp';
+    case 'application/pdf': return '.pdf';
+    case 'audio/mpeg': return '.mp3';
+    case 'audio/wav': return '.wav';
+    case 'text/plain': return '.txt';
+    default: return '';
+  }
+}
+
 function requireId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
   return value;
@@ -343,6 +431,10 @@ function requireMcpReceiptOutcome(
     throw new TypeError(`Invalid MCP EffectReceipt outcome: ${String(value)}.`);
   }
   return value as 'succeeded' | 'failed' | 'cancelled' | 'conflict' | 'outcome_unknown';
+}
+
+function boundedErrorMessage(error: unknown): string {
+  return errorMessage(error).slice(0, 1000);
 }
 
 function errorMessage(error: unknown): string {

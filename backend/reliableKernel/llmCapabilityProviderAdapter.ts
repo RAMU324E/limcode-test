@@ -2,7 +2,8 @@ import type { LlmCapability } from '../capabilities/types';
 import type { LlmCompactRequest, LlmStartRequest, ToolSchema } from '../world/modules/llm/contracts';
 import { LlmEventType } from '../world/modules/llm/events';
 import type { WorldEvent } from '../ecs/types';
-import type { LlmProviderKind, MessageContent } from '../../shared/protocol';
+import type { InlineDataPart, LlmProviderKind, MessageContent } from '../../shared/protocol';
+import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import { ProviderTransientError } from './modelProviderControlPlane';
 import type {
   FullProviderRequest,
@@ -42,7 +43,9 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       let thought = '';
       let thoughtSignature: string | undefined;
       let thoughtElapsedMs: number | undefined;
-      let thoughtDurationMs: number | undefined;
+      let thoughtStartedAt: number | undefined;
+      let completedThoughtDurationMs = 0;
+      let thoughtTimingObserved = false;
       let providerStartedAt: number | undefined;
       const toolCalls = new CapabilityToolCallAccumulator();
       let terminal = false;
@@ -80,7 +83,16 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             const delta = optionalText(payload?.text);
             thought += delta;
             thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
-            thoughtElapsedMs = optionalNonNegativeNumber(payload?.thoughtElapsedMs) ?? thoughtElapsedMs;
+            const blockStartedAt = optionalPositiveNumber(payload?.thoughtStartedAt);
+            const blockElapsedMs = optionalNonNegativeNumber(payload?.thoughtElapsedMs);
+            if (blockStartedAt !== undefined && blockStartedAt !== thoughtStartedAt) {
+              thoughtStartedAt = blockStartedAt;
+              thoughtElapsedMs = blockElapsedMs;
+            } else {
+              thoughtStartedAt = blockStartedAt ?? thoughtStartedAt;
+              thoughtElapsedMs = blockElapsedMs ?? thoughtElapsedMs;
+            }
+            thoughtTimingObserved = true;
             if (delta) {
               enqueue({
                 kind: 'output_delta',
@@ -88,6 +100,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
                   type: 'thought_delta',
                   text: delta,
                   ...(thoughtSignature ? { thoughtSignature } : {}),
+                  ...(thoughtStartedAt !== undefined ? { thoughtStartedAt } : {}),
+                  thoughtCompletedDurationMs: completedThoughtDurationMs,
                   ...(thoughtElapsedMs !== undefined ? { thoughtElapsedMs } : {})
                 }
               });
@@ -95,8 +109,17 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           case LlmEventType.ThoughtProgress: {
-            thoughtElapsedMs = optionalNonNegativeNumber(payload?.thoughtElapsedMs) ?? thoughtElapsedMs;
+            const blockStartedAt = optionalPositiveNumber(payload?.thoughtStartedAt);
+            const blockElapsedMs = optionalNonNegativeNumber(payload?.thoughtElapsedMs);
+            if (blockStartedAt !== undefined && blockStartedAt !== thoughtStartedAt) {
+              thoughtStartedAt = blockStartedAt;
+              thoughtElapsedMs = blockElapsedMs;
+            } else {
+              thoughtStartedAt = blockStartedAt ?? thoughtStartedAt;
+              thoughtElapsedMs = blockElapsedMs ?? thoughtElapsedMs;
+            }
             thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
+            thoughtTimingObserved = true;
             if (thoughtElapsedMs !== undefined) {
               enqueue({
                 kind: 'output_delta',
@@ -104,6 +127,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
                 content: {
                   type: 'thought_progress',
                   thoughtElapsedMs,
+                  ...(thoughtStartedAt !== undefined ? { thoughtStartedAt } : {}),
+                  thoughtCompletedDurationMs: completedThoughtDurationMs,
                   ...(thoughtSignature ? { thoughtSignature } : {})
                 }
               });
@@ -111,17 +136,24 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           case LlmEventType.ThoughtDone: {
-            thoughtDurationMs = optionalNonNegativeNumber(payload?.thoughtDurationMs)
-              ?? thoughtElapsedMs;
+            const blockStartedAt = optionalPositiveNumber(payload?.thoughtStartedAt) ?? thoughtStartedAt;
+            const blockDurationMs = optionalNonNegativeNumber(payload?.thoughtDurationMs)
+              ?? currentThoughtBlockDurationMs(blockStartedAt, thoughtElapsedMs, Date.now());
+            completedThoughtDurationMs += blockDurationMs;
+            thoughtTimingObserved = true;
             thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
             enqueue({
               kind: 'output_item_done',
               content: {
                 type: 'thought_done',
-                ...(thoughtDurationMs !== undefined ? { thoughtDurationMs } : {}),
+                ...(blockStartedAt !== undefined ? { thoughtStartedAt: blockStartedAt } : {}),
+                thoughtCompletedDurationMs: completedThoughtDurationMs,
+                thoughtDurationMs: completedThoughtDurationMs,
                 ...(thoughtSignature ? { thoughtSignature } : {})
               }
             });
+            thoughtStartedAt = undefined;
+            thoughtElapsedMs = undefined;
             return;
           }
           case LlmEventType.ToolCallDelta: {
@@ -149,7 +181,16 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           case LlmEventType.Done: {
-            thoughtDurationMs ??= thoughtElapsedMs;
+            if (thoughtStartedAt !== undefined) {
+              completedThoughtDurationMs += currentThoughtBlockDurationMs(
+                thoughtStartedAt,
+                thoughtElapsedMs,
+                Date.now()
+              );
+              thoughtStartedAt = undefined;
+              thoughtElapsedMs = undefined;
+              thoughtTimingObserved = true;
+            }
             const usage = payload?.usageMetadata === undefined
               ? undefined
               : normalizePlainJson(payload.usageMetadata, 'LLM usage metadata');
@@ -159,7 +200,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
                 text,
                 thought,
                 ...(thoughtSignature ? { thoughtSignature } : {}),
-                ...(thoughtDurationMs !== undefined ? { thoughtDurationMs } : {}),
+                ...(thoughtTimingObserved ? { thoughtDurationMs: completedThoughtDurationMs } : {}),
                 toolCallsSemantics: 'snapshot',
                 toolCalls: normalizePlainJson(toolCalls.snapshot(), 'LLM terminal tool calls')
               },
@@ -300,6 +341,9 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     .map((tool) => tool.schema);
   const authorityModel = requireRecord(authority.model, 'Provider authority model');
   const provider = requireProviderKind(authorityModel.provider);
+  const systemPromptPrefix = typeof authorityModel.systemPromptPrefix === 'string'
+    ? authorityModel.systemPromptPrefix
+    : '';
   const systemParts: string[] = [];
   const systemPrompt = asRecord(authority.systemPrompt);
   if (typeof systemPrompt?.text === 'string' && systemPrompt.text.trim()) systemParts.push(systemPrompt.text.trim());
@@ -335,15 +379,22 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     const role = item.messageRole === 'model' ? 'model' : 'user';
     contents.push({ role, parts: [{ text: item.content }] });
   }
-  const systemText = systemParts.filter(Boolean).join('\n\n');
+  const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
   return {
     id: request.modelRequestId,
+    conversationId: requireText(request.conversationId, 'Provider request conversationId'),
     contents,
     tools,
     model: {
       providerConfigId: request.providerId,
       provider,
       model: request.modelId
+    },
+    settingsSnapshot: {
+      providerConfigId: request.providerId,
+      provider,
+      modelId: request.modelId,
+      systemPromptPrefix
     },
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
   };
@@ -360,7 +411,11 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
   const compression = requireRecord(authority.compression, 'Compression authority policy');
   const methodConfig = requireRecord(compression.config, 'Compression authority config');
   const methodKind = requireText(methodConfig.kind, 'Compression method kind') as LlmCompactRequest['methodKind'];
-  const conversationId = requireText(authority.conversationId, 'Compression authority conversationId');
+  const conversationId = requireText(request.conversationId, 'Provider request conversationId');
+  const authorityConversationId = optionalText(authority.conversationId);
+  if (authorityConversationId && authorityConversationId !== conversationId) {
+    throw new Error('Compression AuthoritySnapshot belongs to another Conversation.');
+  }
   const provider = requireRecord(compression.provider, 'Compression authority provider');
   const compressionProvider = {
     providerConfigId: requireText(provider.providerConfigId, 'Compression providerConfigId'),
@@ -523,14 +578,44 @@ function toolPairContents(content: string): MessageContent[] {
   requireText(call.id, 'Context tool pair.toolCall.id');
   const providerCallId = optionalText(call.providerCallId);
   const name = requireText(call.toolName, 'Context tool pair.toolCall.toolName');
-  const response = parseNestedJson(result.result, 'Context tool result');
+  const decoded = parseNestedJson(result.result, 'Context tool result');
+  const response = splitToolResponseAttachments(decoded);
   return [{
     role: 'user',
     parts: [{
       ...(providerCallId ? { id: providerCallId } : {}),
-      functionResponse: { name, response }
+      functionResponse: {
+        name,
+        response: response.value,
+        ...(response.parts.length > 0 ? { parts: response.parts } : {})
+      }
     }]
   }];
+}
+
+function splitToolResponseAttachments(value: unknown): { value: unknown; parts: InlineDataPart[] } {
+  const envelope = asRecord(value);
+  const detail = asRecord(envelope?.detail);
+  if (!envelope || !detail || !Array.isArray(detail.parts)) return { value, parts: [] };
+  const parts = detail.parts.filter(isInlineDataPartValue);
+  if (parts.length === 0) return { value, parts: [] };
+  const { parts: _parts, ...detailWithoutParts } = detail;
+  return {
+    value: { ...envelope, detail: detailWithoutParts },
+    parts
+  };
+}
+
+function isInlineDataPartValue(value: unknown): value is InlineDataPart {
+  const record = asRecord(value);
+  const inlineData = asRecord(record?.inlineData);
+  return !!inlineData
+    && typeof inlineData.mimeType === 'string'
+    && (
+      typeof inlineData.attachmentId === 'string'
+      || typeof inlineData.data === 'string'
+      || typeof inlineData.sourcePath === 'string'
+    );
 }
 
 function contextText(content: string, contentType: string): string {
@@ -785,6 +870,16 @@ function optionalPositiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
     ? value
     : undefined;
+}
+
+function currentThoughtBlockDurationMs(
+  startedAt: number | undefined,
+  authoritativeElapsedMs: number | undefined,
+  observedAt: number
+): number {
+  const elapsedMs = authoritativeElapsedMs ?? 0;
+  if (startedAt === undefined || !Number.isFinite(observedAt)) return elapsedMs;
+  return Math.max(elapsedMs, Math.max(0, Math.round(observedAt - startedAt)));
 }
 
 function requireText(value: unknown, label: string): string {

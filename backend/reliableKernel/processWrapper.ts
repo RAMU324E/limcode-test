@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
@@ -50,7 +51,6 @@ interface WrapperState {
   forceKillDueAt: number | null;
   deadlineTimer: NodeJS.Timeout | null;
   flushTimer: NodeJS.Timeout | null;
-  flushError: Error | null;
   stdout: StreamState;
   stderr: StreamState;
 }
@@ -82,7 +82,11 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
   });
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal }));
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+  const closePromise = new Promise<void>((resolve) => {
+    child.once('close', () => resolve());
+    child.once('error', () => resolve());
   });
   if (!child.pid) {
     await exitPromise;
@@ -126,7 +130,6 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
     forceKillDueAt: null,
     deadlineTimer: null,
     flushTimer: null,
-    flushError: null,
     stdout: { tail: Buffer.alloc(0) },
     stderr: { tail: Buffer.alloc(0) }
   };
@@ -140,7 +143,10 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
 
   child.stdout?.on('data', (chunk: Buffer | string) => retainOutput(state, 'stdout', Buffer.from(chunk)));
   child.stderr?.on('data', (chunk: Buffer | string) => retainOutput(state, 'stderr', Buffer.from(chunk)));
-  const stopPoll = setInterval(() => observeStopRequest(state), Math.min(100, PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS));
+  const stopPoll = setInterval(() => {
+    observeProcessGroup(state);
+    observeStopRequest(state);
+  }, Math.min(100, PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS));
   state.deadlineTimer = scheduleExecutionDeadline(state);
   const bootstrapGate = child.stdio[3];
   if (!bootstrapGate || typeof (bootstrapGate as NodeJS.WritableStream).end !== 'function') {
@@ -157,14 +163,13 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
     state.deadlineTimer = null;
   }
   await awaitTerminationEscalation(state);
+  if (state.terminationReason === null) await terminateNaturalExitDescendants(state);
   clearWatchdogTimers(state);
+  await drainChildOutputStreams(child, closePromise);
 
   cancelScheduledFlush(state);
-  if (state.flushError) throw state.flushError;
   retainTerminalTail(state, 'stdout');
   retainTerminalTail(state, 'stderr');
-  removeIfExists(path.join(spoolPath, 'live-tail-stdout.bin'));
-  removeIfExists(path.join(spoolPath, 'live-tail-stderr.bin'));
   writeManifest(state, 'exited');
   const receipt: ProcessWrapperExitReceipt = {
     kind: PROCESS_WRAPPER_PROTOCOL,
@@ -189,6 +194,22 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
   };
   // The atomic exit receipt is the only cross-host terminal authority.
   writeAtomicJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE), receipt);
+}
+
+async function drainChildOutputStreams(
+  child: ReturnType<typeof spawn>,
+  closePromise: Promise<void>
+): Promise<void> {
+  let closed = false;
+  await Promise.race([
+    closePromise.then(() => { closed = true; }),
+    new Promise((resolve) => setTimeout(resolve, PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS))
+  ]);
+  if (closed) return;
+  // A descendant that escaped the ordinary process group may still own the inherited pipes. It
+  // must not keep the wrapper alive or delay the leader's exit receipt indefinitely.
+  child.stdout?.destroy();
+  child.stderr?.destroy();
 }
 
 function retainOutput(state: WrapperState, streamKind: ProcessStreamKind, bytes: Buffer): void {
@@ -326,6 +347,39 @@ function requestTermination(
   return true;
 }
 
+function observeProcessGroup(state: WrapperState): void {
+  const current = readLinuxProcessGroupFingerprints(state.identity.processGroupId);
+  if (
+    state.terminationWitnesses.size === 0
+    || [...current].some((fingerprint) => state.terminationWitnesses.has(fingerprint))
+    || current.has(state.identity.startFingerprint)
+  ) {
+    state.terminationWitnesses.add(state.identity.startFingerprint);
+    for (const fingerprint of current) state.terminationWitnesses.add(fingerprint);
+  }
+}
+
+/** A shell leader may exit after spawning ordinary background descendants in the same group. */
+async function terminateNaturalExitDescendants(state: WrapperState): Promise<void> {
+  const identity = state.identity;
+  const current = readLinuxProcessGroupFingerprints(identity.processGroupId);
+  if (current.size === 0) return;
+  // This runs immediately after the recorded group leader exits. A still-populated PGID is the
+  // command's surviving process group; the kernel cannot recycle it while those members remain.
+  for (const fingerprint of current) state.terminationWitnesses.add(fingerprint);
+  signalProcessGroup(identity.processGroupId, 'SIGTERM');
+  const deadline = Date.now() + PROCESS_TERMINATION_GRACE_MS;
+  let remaining = current;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+    remaining = readLinuxProcessGroupFingerprints(identity.processGroupId);
+    if (![...remaining].some((fingerprint) => state.terminationWitnesses.has(fingerprint))) return;
+  }
+  if ([...remaining].some((fingerprint) => state.terminationWitnesses.has(fingerprint))) {
+    signalProcessGroup(identity.processGroupId, 'SIGKILL');
+  }
+}
+
 function signalProcessGroup(processGroupId: string, signal: NodeJS.Signals): void {
   try {
     process.kill(-Number(processGroupId), signal);
@@ -384,13 +438,15 @@ function readLinuxProcessGroupFingerprints(processGroupId: string): Set<string> 
 }
 
 function scheduleRunningFlush(state: WrapperState): void {
-  if (state.flushTimer || state.flushError) return;
+  if (state.flushTimer) return;
   state.flushTimer = setTimeout(() => {
     state.flushTimer = null;
     try {
       flushRunningState(state);
     } catch (error) {
-      state.flushError = error instanceof Error ? error : new Error(String(error));
+      // A live preview is observational. The final manifest and exit receipt still get their own
+      // write attempt after the child exits, so a transient preview write cannot lose termination.
+      console.warn(`[limcode-process-wrapper] live preview flush failed: ${boundedErrorMessage(error)}`);
     }
   }, PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS);
   state.flushTimer.unref();
@@ -403,12 +459,12 @@ function cancelScheduledFlush(state: WrapperState): void {
 }
 
 function flushRunningState(state: WrapperState): void {
-  writeAtomicBytes(path.join(state.spoolPath, 'live-tail-stdout.bin'), state.stdout.tail);
-  writeAtomicBytes(path.join(state.spoolPath, 'live-tail-stderr.bin'), state.stderr.tail);
   writeManifest(state, 'running');
 }
 
 function writeManifest(state: WrapperState, status: ProcessWrapperManifest['status']): void {
+  const stdoutTailBase64 = state.stdout.tail.toString('base64');
+  const stderrTailBase64 = state.stderr.tail.toString('base64');
   const manifest: ProcessWrapperManifest = {
     kind: PROCESS_WRAPPER_PROTOCOL,
     processId: state.identity.processId,
@@ -420,7 +476,11 @@ function writeManifest(state: WrapperState, status: ProcessWrapperManifest['stat
     droppedBytes: state.droppedBytes.toString(),
     truncated: state.truncated,
     stdoutTailBytes: String(state.stdout.tail.length),
+    stdoutTailSha256: createHash('sha256').update(state.stdout.tail).digest('hex'),
+    stdoutTailBase64,
     stderrTailBytes: String(state.stderr.tail.length),
+    stderrTailSha256: createHash('sha256').update(state.stderr.tail).digest('hex'),
+    stderrTailBase64,
     updatedAt: new Date().toISOString()
   };
   writeAtomicJson(path.join(state.spoolPath, PROCESS_WRAPPER_MANIFEST_FILE), manifest);
@@ -563,12 +623,4 @@ function writeAtomicBytes(filePath: string, bytes: Buffer): void {
 function boundedErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.slice(0, 2_048);
-}
-
-function removeIfExists(filePath: string): void {
-  try {
-    fs.unlinkSync(filePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
 }

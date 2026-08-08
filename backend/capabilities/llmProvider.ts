@@ -71,6 +71,23 @@ import type {
 
 export const DEFAULT_LLM_BASE_URL = 'https://api.openai.com/v1';
 const COMPRESSION_DEBUG_PREFIX = '[LimCode][CompressionDebug]';
+const SAFE_LLM_ERROR_METADATA_FIELDS = [
+  'transport',
+  'phase',
+  'closeCode',
+  'closeReason',
+  'closeWasClean',
+  'wasClean',
+  'receivedServerEvent',
+  'attempt',
+  'maxAttempts',
+  'transportAttemptsExhausted',
+  'retryable',
+  'code',
+  'status',
+  'statusCode',
+  'timeoutMs'
+] as const;
 
 type MaybeProvider<T, TArg = void> = T | undefined | ((arg: TArg) => T | undefined | Promise<T | undefined>);
 type LlmSettingsRequest = LlmStartRequest | LlmCompactRequest | LlmResolveInvocationRequest | undefined;
@@ -524,6 +541,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   proxy?: string;
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
 }): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
+  const conversationId = requireOpenAIResponsesWebSocketConversationId(input.request.conversationId);
   const dryRun = await input.provider.dryRun(input.unifiedRequest, {
     inputFormat: 'unified',
     outputFormat: 'unified',
@@ -531,7 +549,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   });
   const format = new input.unified.OpenAIResponsesFormat(input.settings.model) as OpenAIResponsesFormatAdapter;
   yield* streamOpenAIResponsesWebSocketSession({
-    sessionKey: createOpenAIResponsesWebSocketSessionKey(input.settings, input.request.conversationId),
+    sessionKey: createOpenAIResponsesWebSocketSessionKey(input.settings, conversationId),
     url: dryRun.url,
     headers: dryRun.headers,
     body: dryRun.body,
@@ -541,7 +559,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
     onDecision: (decision) => {
       reportTransportTrace(input, {
         requestId: input.request.id,
-        conversationId: input.request.conversationId ?? '',
+        conversationId,
         phase: 'continuation_decision',
         observedAt: Date.now(),
         sessionKeyHash: decision.sessionKeyHash,
@@ -630,12 +648,12 @@ function failureFromProviderError(error: unknown, extras: Record<string, unknown
   };
 }
 
-function rawErrorFromUnknown(error: unknown, extras: Record<string, unknown> = {}): LlmRawErrorInfoRecord {
+export function rawErrorFromUnknown(error: unknown, extras: Record<string, unknown> = {}): LlmRawErrorInfoRecord {
   const base = toPlainJsonLike(error);
   const baseRecord = isRecord(base) ? base : { data: base };
   const merged: LlmRawErrorInfoRecord = { ...baseRecord };
   for (const [key, value] of Object.entries(extras)) {
-    if (value !== undefined) merged[key] = toPlainJsonLike(value);
+    if (value !== undefined && !isSensitiveLlmErrorField(key)) merged[key] = toPlainJsonLike(value);
   }
   if (typeof merged.message !== 'string') {
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : undefined;
@@ -789,20 +807,21 @@ function toPlainJsonLike(value: unknown, seen = new WeakSet<object>()): unknown 
   if (value instanceof Error) {
     if (seen.has(value)) return '[Circular]';
     seen.add(value);
-    const cause = (value as { cause?: unknown }).cause;
-    const own = Object.fromEntries(Object.entries(value as Error & Record<string, unknown>)
-      .filter(([key]) => key !== 'name' && key !== 'message' && key !== 'stack' && key !== 'cause')
-      .map(([key, child]) => [key, toPlainJsonLike(child, seen)]));
-    return {
+    const source = value as Error & Record<string, unknown> & { cause?: unknown };
+    const result: Record<string, unknown> = {
       name: value.name,
       message: value.message,
-      stack: value.stack,
-      ...own,
-      ...(cause !== undefined ? { cause: toPlainJsonLike(cause, seen) } : {})
+      stack: value.stack
     };
+    if (source.cause !== undefined) result.cause = toPlainJsonLike(source.cause, seen);
+    for (const key of SAFE_LLM_ERROR_METADATA_FIELDS) {
+      const child = source[key];
+      if (child !== undefined) result[key] = toPlainJsonLike(child, seen);
+    }
+    return result;
   }
   if (typeof Headers !== 'undefined' && value instanceof Headers) {
-    return Object.fromEntries(value.entries());
+    return plainRecordFromEntries(value.entries(), seen);
   }
   if (typeof value !== 'object') return value;
   if (seen.has(value)) return '[Circular]';
@@ -810,16 +829,53 @@ function toPlainJsonLike(value: unknown, seen = new WeakSet<object>()): unknown 
   if (Array.isArray(value)) return value.map((item) => toPlainJsonLike(item, seen));
   if (typeof (value as { entries?: unknown }).entries === 'function' && typeof (value as { forEach?: unknown }).forEach === 'function') {
     try {
-      return Object.fromEntries((value as { entries(): Iterable<[string, unknown]> }).entries());
+      return plainRecordFromEntries((value as { entries(): Iterable<[string, unknown]> }).entries(), seen);
     } catch {
       // fall through
     }
   }
   const result: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (isSensitiveLlmErrorField(key)) continue;
     result[key] = toPlainJsonLike(child, seen);
   }
   return result;
+}
+
+function plainRecordFromEntries(entries: Iterable<[string, unknown]>, seen: WeakSet<object>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of entries) {
+    if (isSensitiveLlmErrorField(key)) continue;
+    result[key] = toPlainJsonLike(child, seen);
+  }
+  return result;
+}
+
+function isSensitiveLlmErrorField(key: string): boolean {
+  const normalized = key.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!normalized) return false;
+  return normalized === 'authorization'
+    || normalized.endsWith('authorization')
+    || normalized === 'cookie'
+    || normalized.endsWith('cookie')
+    || normalized === 'auth'
+    || normalized === 'credentials'
+    || normalized === 'credential'
+    || normalized === 'password'
+    || normalized.endsWith('password')
+    || normalized === 'passwd'
+    || normalized === 'secret'
+    || normalized.endsWith('secret')
+    || normalized.endsWith('secretkey')
+    || normalized === 'privatekey'
+    || normalized.endsWith('privatekey')
+    || normalized === 'accesskey'
+    || normalized.endsWith('accesskey')
+    || normalized === 'apikey'
+    || normalized.endsWith('apikey')
+    || normalized === 'xapikey'
+    || normalized === 'token'
+    || normalized.endsWith('token');
 }
 
 
@@ -1574,7 +1630,7 @@ async function resolveSummaryProvider(
       ? {
           webSocketSessionKey: createOpenAIResponsesWebSocketSessionKey(
             settings,
-            `${request.conversationId?.trim() || 'global'}\ncompression-summary\n${request.id}`
+            `${requireOpenAIResponsesWebSocketConversationId(request.conversationId)}\ncompression-summary\n${request.id}`
           )
         }
       : {}),
@@ -2037,6 +2093,7 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
     retryMaxAttempts,
     enableMultimodalTools: settings?.enableMultimodalTools !== false,
     ...(contextWindowTokens ? { contextWindowTokens } : {}),
+    systemPromptPrefix: typeof settings?.systemPromptPrefix === 'string' ? settings.systemPromptPrefix : '',
     ...(headers ? { headers } : {}),
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {}),
     ...(nonEmptyRecord(requestBody) ? { requestBody } : {}),
@@ -2074,6 +2131,7 @@ function snapshotFromSettings(settings: LlmProviderConfigRecord, compressionConf
     retryMaxAttempts: normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: settings.enableMultimodalTools !== false,
     ...(settings.contextWindowTokens ? { contextWindowTokens: settings.contextWindowTokens } : {}),
+    ...(settings.systemPromptPrefix.trim() ? { systemPromptPrefix: settings.systemPromptPrefix } : {}),
     ...(settings.generationConfig ? { generationConfig: settings.generationConfig } : {}),
     ...(settings.requestBody ? { requestBody: settings.requestBody } : {}),
     ...(settings.promptCache ? { promptCache: settings.promptCache } : {}),
@@ -2207,7 +2265,10 @@ function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, 
   if (!isOpenAIResponsesWebSocketMode(settings)) return {};
   return {
     transport: 'websocket',
-    webSocketSessionKey: createOpenAIResponsesWebSocketSessionKey(settings, conversationId)
+    webSocketSessionKey: createOpenAIResponsesWebSocketSessionKey(
+      settings,
+      requireOpenAIResponsesWebSocketConversationId(conversationId)
+    )
   };
 }
 
@@ -2272,17 +2333,28 @@ function isOpenAIResponsesWebSocketMode(settings: LlmProviderConfigRecord): bool
   return settings.provider === 'openai-responses' && settings.openaiResponsesTransport === 'websocket';
 }
 
-function createOpenAIResponsesWebSocketSessionKey(settings: LlmProviderConfigRecord, conversationId?: string): string {
+export function createOpenAIResponsesWebSocketSessionKey(
+  settings: LlmProviderConfigRecord,
+  conversationId: string
+): string {
   return createHash('sha256')
     .update([
       'openai-responses-websocket',
       settings.id,
       settings.baseUrl,
       settings.model,
-      conversationId?.trim() || 'global'
+      requireOpenAIResponsesWebSocketConversationId(conversationId)
     ].join('\n'))
     .digest('hex')
     .slice(0, 32);
+}
+
+function requireOpenAIResponsesWebSocketConversationId(conversationId: string | undefined): string {
+  const normalized = conversationId?.trim();
+  if (!normalized) {
+    throw new TypeError('OpenAI Responses WebSocket requests require a non-empty conversationId.');
+  }
+  return normalized;
 }
 
 function normalizeHeaders(headers: unknown): LlmProviderHeadersRecord | undefined {
@@ -2328,6 +2400,8 @@ function nonEmptyRecord(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && Object.keys(value).length > 0;
 }
 
+// 产品能力边界：附件存储/预览不受此集合限制；送模只使用各 Provider 的共同稳定类型。
+// 其他 MIME 会转为显式文本占位，避免静默丢失，也不伪装模型已经读取过该附件。
 const TOOL_RESPONSE_MULTIMODAL_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'application/pdf', 'text/plain']);
 const TOOL_RESPONSE_CONTEXT_FALLBACK_MESSAGE = '工具调用在本次 LLM 请求上下文中没有对应响应，已自动补充兜底响应。原工具执行结果不可用；如仍需要结果，请重新执行相关操作。';
 
@@ -2671,8 +2745,9 @@ function emitUnifiedResponse(requestId: string, response: UnifiedLLMResponse, em
   for (const part of thoughtParts) {
     const text = typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : '';
     const signature = thoughtSignatureFromPart(part);
-    if (text) emit({ type: LlmEventType.ThoughtDelta, payload: { requestId, text, thoughtElapsedMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
-    if (text || signature) emit({ type: LlmEventType.ThoughtDone, payload: { requestId, thoughtDurationMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
+    const thoughtStartedAt = Date.now();
+    if (text) emit({ type: LlmEventType.ThoughtDelta, payload: { requestId, text, thoughtStartedAt, thoughtElapsedMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
+    if (text || signature) emit({ type: LlmEventType.ThoughtDone, payload: { requestId, thoughtStartedAt, thoughtDurationMs: 0, ...(signature ? { thoughtSignature: signature } : {}) } });
   }
 
   const calls = parts.filter(isUnifiedFunctionCallPart).map((part, index) => {
@@ -2797,6 +2872,7 @@ function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock | unde
       payload: {
         requestId,
         text,
+        thoughtStartedAt: block.startedAt,
         thoughtElapsedMs: Math.max(0, at - block.startedAt),
         ...(signature ? { thoughtSignature: signature } : {})
       }
@@ -2812,6 +2888,7 @@ function createActiveThoughtBlock(requestId: string, startedAt: number, emit: Em
       type: LlmEventType.ThoughtProgress,
       payload: {
         requestId,
+        thoughtStartedAt: block.startedAt,
         thoughtElapsedMs: Math.max(0, Date.now() - block.startedAt),
         ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {})
       }
@@ -2835,6 +2912,7 @@ function finishThoughtBlock(requestId: string, block: ActiveThoughtBlock, finish
     type: LlmEventType.ThoughtDone,
     payload: {
       requestId,
+      thoughtStartedAt: block.startedAt,
       thoughtDurationMs: Math.max(0, finishedAt - block.startedAt),
       ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {})
     }

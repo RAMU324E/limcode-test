@@ -2570,10 +2570,9 @@ async function checkProcessWatchdog() {
     await processes.dispose();
     await ctx.database.close();
     ctx.database = undefined;
-    await delay(2_000);
-    const atomicRestartReceipt = kernel.parseWrapperExitReceipt(JSON.parse(await fs.readFile(
+    const atomicRestartReceipt = kernel.parseWrapperExitReceipt(JSON.parse(await waitForTextFile(
       path.join(restartSpoolPath, kernel.PROCESS_WRAPPER_EXIT_RECEIPT_FILE),
-      'utf8'
+      5_000
     )));
     assert.equal(atomicRestartReceipt.terminationReason, 'timed_out');
 
@@ -3615,6 +3614,19 @@ async function waitForPidFile(filePath, timeoutMs) {
       if (error?.code !== 'ENOENT') throw error;
     }
     if (Date.now() >= deadline) throw new Error(`PID file ${filePath} did not appear.`);
+    await delay(25);
+  }
+}
+
+async function waitForTextFile(filePath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return await fs.readFile(filePath, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (Date.now() >= deadline) throw new Error(`File ${filePath} did not appear.`);
     await delay(25);
   }
 }

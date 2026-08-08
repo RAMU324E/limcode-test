@@ -729,7 +729,7 @@ function validateTool(tool, failures) {
     || retry?.cancelable !== true
   ) failures.push('提供方临时故障必须由冻结Authority驱动最多10次可见、可取消的SQLite重试');
   if (JSON.stringify(retry?.backoffMilliseconds) !== JSON.stringify([1000, 2000, 4000, 8000, 10000])) failures.push('提供方重试退避必须为1/2/4/8/10秒');
-  if (JSON.stringify(retry?.semanticDeadlinesMilliseconds) !== JSON.stringify({ ordinaryFirst: 40000, ordinaryIdle: 30000, compressionCompletion: 180000 })) failures.push('提供方deadline必须为普通首语义40s/idle30s、压缩终态180s');
+  if (JSON.stringify(retry?.semanticDeadlinesMilliseconds) !== JSON.stringify({ ordinaryFirst: 80000, ordinaryIdle: 60000, compressionCompletion: 270000 })) failures.push('提供方deadline必须为普通首语义80s/idle60s、压缩终态270s');
   if (retry?.automaticAfterExtensionRestart !== 'resume-committed-retry') failures.push('已提交Provider retry必须在Extension重启后恢复');
   for (const field of ['fileMutationAutomaticRetry', 'commandExecutionAutomaticRetry', 'subagentStartAutomaticRetry']) {
     if (retry?.[field] !== false) failures.push(`tool.retryPolicy.${field}必须为false`);
@@ -862,7 +862,7 @@ function validateContext(context, failures) {
     || retry?.newAttemptKeepsSameModelRequest !== true
   ) failures.push('模型提供方必须使用冻结Authority下有界、可见、可取消、可重启恢复的持久重试');
   if (JSON.stringify(retry?.backoffMilliseconds) !== JSON.stringify([1000, 2000, 4000, 8000, 10000])) failures.push('模型提供方重试退避合同不匹配');
-  if (JSON.stringify(retry?.semanticDeadlinesMilliseconds) !== JSON.stringify({ ordinaryFirst: 40000, ordinaryIdle: 30000, compressionCompletion: 180000 })) failures.push('模型提供方普通语义/压缩终态deadline合同不匹配');
+  if (JSON.stringify(retry?.semanticDeadlinesMilliseconds) !== JSON.stringify({ ordinaryFirst: 80000, ordinaryIdle: 60000, compressionCompletion: 270000 })) failures.push('模型提供方普通语义/压缩终态deadline合同不匹配');
   for (const field of ['ordinaryTransactionMayHashFullHistory', 'ordinaryTransactionMayRewriteFullHistory', 'clientMayDeepCloneFullHistory']) {
     if (context?.performance?.[field] !== false) failures.push(`context.performance.${field}必须为false`);
   }

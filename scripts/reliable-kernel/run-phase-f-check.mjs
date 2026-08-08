@@ -46,9 +46,24 @@ if (requestedCommit && requestedCommit !== headCommit) {
 const require = createRequire(import.meta.url);
 let kernel;
 let Database;
+let ReliableConversationRunner;
+let mapSettledWithBoundedAdmissionConcurrency;
+let MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN;
 try {
   kernel = require(path.join(root, 'dist/extension/backend/reliableKernel/index.js'));
+  ({ ReliableConversationRunner } = require(path.join(
+    root,
+    'dist/extension/backend/application/reliableKernel/ReliableConversationRunner.js'
+  )));
   Database = require('better-sqlite3');
+  ({ mapSettledWithBoundedAdmissionConcurrency } = require(path.join(
+    root,
+    'dist/extension/backend/capabilities/boundedConcurrency.js'
+  )));
+  ({ MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } = require(path.join(
+    root,
+    'dist/extension/shared/agentScheduling.js'
+  )));
 } catch (error) {
   console.error(`无法加载已编译Phase F内核；请先运行npm run compile：${error.message}`);
   process.exit(1);
@@ -1375,6 +1390,8 @@ async function checkClientSnapshotBounds() {
     const segmentSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/segmentedTimeline.ts'), 'utf8');
     const projectionSource = await fs.readFile(path.join(root, 'webview/src/domain/reliableConversationProjection.ts'), 'utf8');
     const transientModelSource = await fs.readFile(path.join(root, 'webview/src/domain/reliableTransientModel.ts'), 'utf8');
+    const transientLifecycleSource = await fs.readFile(path.join(root, 'webview/src/domain/reliableTransientLifecycle.ts'), 'utf8');
+    const transientActivitySource = await fs.readFile(path.join(root, 'webview/src/domain/reliableTransientActivity.ts'), 'utf8');
     const functionCallSource = await fs.readFile(path.join(root, 'webview/src/components/content/parts/FunctionCallPartView.vue'), 'utf8');
     const messageItemSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/MessageItem.vue'), 'utf8');
     assert.match(messageListSource, /v-for="[^"]*visibleTimelineRows"/);
@@ -1388,13 +1405,16 @@ async function checkClientSnapshotBounds() {
     assert.match(messageListSource, /kind:\s*['"]message-content['"]/);
     assert.match(messageItemSource, /v-if="detailLoading"/);
     assert.match(transientModelSource, /options\.includeFinal === true/);
-    assert.match(functionCallSource, /includeFinal:\s*toolCall\.value === undefined/);
+    assert.match(functionCallSource, /!partId \|\| !props\.messageId \|\| toolCall\.value/);
+    assert.match(functionCallSource, /includeFinal:\s*true/);
+    assert.match(transientLifecycleSource, /detailReady && toolFactsReady/);
     assert.match(messageListSource, /messages\.value\[messages\.value\.length - 1\]\?\.id/);
     const durableRetryVisibility = messageListSource.indexOf("latest.status === 'retrying'");
     const transientThoughtSuppression = messageListSource.indexOf('if (hasVisibleStreamingTransientForTurn');
     assert.ok(durableRetryVisibility >= 0 && transientThoughtSuppression > durableRetryVisibility);
     assert.match(messageListSource, /模型输出停滞/);
-    assert.match(messageListSource, /自动恢复已重连，等待有效输出/);
+    assert.match(messageListSource, /reliableRetryStreamingActivityLabel/);
+    assert.match(transientActivitySource, /已启动，正在连接并等待模型输出/);
     assert.ok(30 + 8 <= 40);
     const plainData = require(path.join(root, 'dist/extension/shared/plainData.js'));
     const proxy = new Proxy({ nested: [{ value: 'plain' }] }, {});
@@ -1784,9 +1804,11 @@ async function checkSnapshotFeedBarrier() {
     const bridgeAttempts = [];
     const bridgeDisconnects = [];
     const bridgeAcks = [];
+    const bridgeDiagnostics = [];
     const bridgeErrors = [];
     const bridgePosts = [];
     const successfulInputs = [];
+    let bridgeAckFlush;
     const fakeFeed = {
       async connect(input) {
         const attempt = bridgeAttempts.length + 1;
@@ -1801,7 +1823,12 @@ async function checkSnapshotFeedBarrier() {
         return { sessionId, hostBootId: 'bridge-boot' };
       },
       disconnect(sessionId) { bridgeDisconnects.push(sessionId); },
-      acknowledge(ack) { bridgeAcks.push(ack); },
+      acknowledge(ack) {
+        bridgeAcks.push(ack);
+        const flush = bridgeAckFlush;
+        bridgeAckFlush = undefined;
+        flush?.(ack);
+      },
       requestSnapshot() {}
     };
     const fakeDetails = { async read() { throw new Error('detail not used'); } };
@@ -1814,10 +1841,14 @@ async function checkSnapshotFeedBarrier() {
     const bridge = new kernel.ReliableKernelWebviewFeedBridge(
       fakeFeed,
       fakeDetails,
-      (error, context) => bridgeErrors.push({ error, context })
+      (error, context) => bridgeErrors.push({ error, context }),
+      { observe(event) { bridgeDiagnostics.push(event); } }
     );
     const bridgeStartedAt = Date.now();
-    const bridgeClientId = bridge.attach(fakeWebview, { kind: 'panel' });
+    const bridgeClientId = bridge.attach(fakeWebview, {
+      kind: 'mainPanel',
+      conversationId: 'bridge-conversation'
+    });
     await waitFor(() => bridgeAttempts.length === 2, 3500, 'bridge initial connect backoff recovery');
     metrics.bridgeInitialRecoveryMs = bridgeAttempts[1] - bridgeStartedAt;
     assert.ok(metrics.bridgeInitialRecoveryMs >= 900 && metrics.bridgeInitialRecoveryMs < 3500);
@@ -1834,12 +1865,71 @@ async function checkSnapshotFeedBarrier() {
     await bridge.handleControl(bridgeClientId, {
       type: 'reliable-kernel.ack', sessionId: 'bridge-session-3', hostBootId: 'bridge-boot', messageSeq: '1'
     });
+
+    const activeBridgeInput = successfulInputs.at(-1);
+    const bridgeChanges = (messageSeq, commitSeq, id) => ({
+      type: 'reliable-kernel.changes',
+      sessionId: 'bridge-session-3',
+      hostBootId: 'bridge-boot',
+      messageSeq,
+      commitSeq,
+      changes: [{ type: 'Conversation', operation: 'remove', id }]
+    });
+    activeBridgeInput.send(bridgeChanges('2', '4', 'bridge-ack-one'));
+    bridgeAckFlush = () => activeBridgeInput.send(bridgeChanges('3', '5', 'bridge-ack-two'));
+    await bridge.handleControl(bridgeClientId, {
+      type: 'reliable-kernel.ack', sessionId: 'bridge-session-3', hostBootId: 'bridge-boot', messageSeq: '2'
+    });
+    await bridge.handleControl(bridgeClientId, {
+      type: 'reliable-kernel.ack', sessionId: 'bridge-session-3', hostBootId: 'bridge-boot', messageSeq: '3'
+    });
+    assert.ok(bridgeDiagnostics.some((event) =>
+      event.eventKind === 'feed.data.acked' && event.correlationId === '2'
+    ));
+    assert.ok(bridgeDiagnostics.some((event) =>
+      event.eventKind === 'feed.data.acked' && event.correlationId === '3'
+    ));
+
+    for (let streamSeq = 1; streamSeq <= 9; streamSeq += 1) {
+      bridge.broadcastTransient({
+        conversationId: 'bridge-conversation',
+        turnId: 'bridge-turn',
+        modelRequestId: 'bridge-model-request',
+        requestSeq: '1',
+        providerId: 'bridge-provider',
+        modelId: 'bridge-model',
+        attemptSeq: '1',
+        socketGeneration: '1',
+        afterCommitSeq: '5',
+        observedAt: NOW,
+        event: {
+          kind: 'output_delta',
+          streamSeq: String(streamSeq),
+          content: { type: 'text_delta', text: String(streamSeq) }
+        }
+      });
+    }
+    await waitFor(
+      () => bridgePosts.some((message) => message.type === 'reliable-kernel.transient-batch'),
+      1_000,
+      'transient batch flush'
+    );
+    const transientBatch = bridgePosts.find((message) =>
+      message.type === 'reliable-kernel.transient-batch'
+    );
+    assert.equal(transientBatch.events.length, 9);
+    assert.deepEqual(
+      transientBatch.events.map((event) => event.event.streamSeq),
+      Array.from({ length: 9 }, (_, index) => String(index + 1))
+    );
     bridge.close();
     assert.equal(bridgeErrors.length, 2);
     assert.deepEqual(bridgeErrors.map((entry) => entry.context.operation), ['connect', 'connect']);
     assert.ok(bridgeDisconnects.includes('bridge-session-2'));
     assertions.push('Bridge首次connect单次失败时connection保持待恢复并沿同一封顶退避成功；已连接session故障通知也复用该恢复路径');
+    assertions.push('ACK同步flush下一帧时旧帧诊断不丢且不清除新watchdog；同ModelRequest突发transient按32ms窗口合并为一条有序batch');
     faults.push('one-shot initial bridge connect failure and post-connect session failure');
+    faults.push('queued ACK synchronous refill and nine-event transient IPC burst');
     return { assertions, faults, metrics };
   });
 }
@@ -1898,7 +1988,29 @@ async function checkOldWriterNotRouted() {
     assert.match(runAgentDisplay, new RegExp(fact));
   }
   assert.doesNotMatch(runAgentDisplay, /activityStage|notificationRun|runIdFrom/);
-  assertions.push('F executable transition selectors不进入production graph；shared/protocol中的已擦除类型不按整文件误判；Bridge session只驻内存、快照messages恢复Message bucket且UI直接显示六类权威facts');
+  const conversationProjection = await fs.readFile('webview/src/domain/reliableConversationProjection.ts', 'utf8');
+  assert.match(conversationProjection, /call\.tool_name === 'run_agent' \? 'awaiting_child' : 'awaiting_user_input'/);
+  const functionCallView = await fs.readFile('webview/src/components/content/parts/FunctionCallPartView.vue', 'utf8');
+  assert.match(functionCallView, /awaiting_child: '等待子 Agent 回答'/);
+  assert.match(functionCallView, /子任务已转后台/);
+  const conversationRunner = await fs.readFile('backend/application/reliableKernel/ReliableConversationRunner.ts', 'utf8');
+  assert.match(conversationRunner, /if \(intents\.length === 0\) return null;/);
+  assert.doesNotMatch(conversationRunner, /must have exactly one admitted TurnIntent/);
+  const childCoordinator = await fs.readFile('backend/reliableKernel/childAgentCoordinator.ts', 'utf8');
+  assert.match(childCoordinator, /reconcileFailedTurn/);
+  assert.doesNotMatch(childCoordinator, /const recover = failed \|\|/);
+  const answerDelivery = await fs.readFile('backend/reliableKernel/answerDelivery.ts', 'utf8');
+  assert.match(answerDelivery, /settleForegroundFailure/);
+  assert.match(answerDelivery, /ensureFailed/);
+  const completionDelivery = await fs.readFile('backend/reliableKernel/processCompletionDelivery.ts', 'utf8');
+  assert.match(completionDelivery, /child_failure/);
+  const productRuntime = await fs.readFile(
+    'backend/application/reliableKernel/VscodeReliableKernelProductRuntime.ts',
+    'utf8'
+  );
+  assert.match(productRuntime, /sourceKind === 'child_failure'/);
+  assert.match(productRuntime, /showErrorMessage/);
+  assertions.push('F executable transition selectors不进入production graph；shared\/protocol中的已擦除类型不按整文件误判；Bridge session只驻内存、快照messages恢复Message bucket，run_agent等待子Agent\/转后台语义明确，初始Child无TurnIntent直接进入AgentLoop且后台失败走failed AnswerSubmission\/RuntimeDeliveryWake');
   metrics.productionEntry = path.relative(root, entry).split(path.sep).join('/');
   metrics.emittedClosureFiles = graph.size;
   metrics.phaseFTransitionEntries = phaseFEntries.length;
@@ -2067,6 +2179,59 @@ async function checkRecoveryForegroundWait() {
   return withRuntime('recovery-foreground', async (ctx) => {
     const assertions = [];
     const faults = [];
+
+    assert.equal(MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN, 8);
+    const admissionValues = Array.from({ length: 9 }, (_, index) => index);
+    const admissionStarts = [];
+    const admissionControls = new Map();
+    const admissionCompletions = new Map();
+    const admissionOperation = mapSettledWithBoundedAdmissionConcurrency(
+      admissionValues,
+      MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN,
+      async (value, _index, _signal, admission) => {
+        admissionStarts.push(value);
+        admissionControls.set(value, admission);
+        await new Promise((resolve) => admissionCompletions.set(value, resolve));
+        return value;
+      }
+    );
+    await waitFor(() => admissionStarts.length === 8, 1_000, 'first eight child admissions');
+    assert.deepEqual(admissionStarts, admissionValues.slice(0, 8));
+    admissionControls.get(0).release();
+    await waitFor(() => admissionStarts.length === 9, 1_000, 'ninth child admission');
+    assert.deepEqual(admissionStarts, admissionValues);
+    for (const resolve of admissionCompletions.values()) resolve();
+    assert.deepEqual(
+      await admissionOperation,
+      admissionValues.map((value) => ({ status: 'fulfilled', value }))
+    );
+
+    const admissionAbort = new AbortController();
+    const admissionAbortReason = new Error('phase-f parent cancellation after durable child spawn');
+    const admissionAbortSignals = [];
+    const admissionAbortStarts = [];
+    const admissionAbortOperation = mapSettledWithBoundedAdmissionConcurrency(
+      [0, 1, 2],
+      2,
+      (value, _index, signal, admission) => {
+        admissionAbortStarts.push(value);
+        admissionAbortSignals.push(signal);
+        if (value === 0) admission.release();
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      },
+      admissionAbort.signal
+    );
+    await waitFor(() => admissionAbortStarts.length === 3, 1_000, 'released admission cancellation');
+    admissionAbort.abort(admissionAbortReason);
+    await assert.rejects(admissionAbortOperation, (error) => error === admissionAbortReason);
+    assert.ok(admissionAbortSignals.every((signal) =>
+      signal.aborted && signal.reason === admissionAbortReason
+    ));
+    assertions.push('run_agent启动槽固定为8；第9个在durable admission release后立即启动而不等待foreground结果，已释放槽的worker仍接收父取消');
+    faults.push('nine long foreground child starts with parent cancellation after durable admission release');
+
     const parent = await seedParent(ctx, 'recovery-foreground');
     const child = await spawnStartedChild(ctx, parent.turnId, 'recovery-foreground', 'wait_for_answer', {
       deadline: '2026-08-01T00:01:00.000Z'
@@ -2119,6 +2284,287 @@ async function checkRecoveryForegroundWait() {
     ));
     assertions.push('三个并行run_agent按逆call_seq同时超时：Operation/Artifact先独立结算，随后无需reload按call_seq物化全部ToolModelResult');
     faults.push('three parallel foreground deadlines settle in reverse call_seq');
+
+    const liveParallel = [];
+    const answerByTurn = new Map();
+    const coordinatorLeaseOwner = `child-driver:${ctx.database.hostBootId}`;
+    for (const suffix of ['one', 'two', 'three']) {
+      const entry = await spawnStartedChild(
+        ctx,
+        parent.turnId,
+        `parallel-initial-child-${suffix}`,
+        'wait_for_answer',
+        {
+          deadline: '2026-08-01T00:05:00.000Z',
+          leaseOwnerId: coordinatorLeaseOwner
+        }
+      );
+      liveParallel.push(entry);
+      answerByTurn.set(entry.childTurnId, entry.answerBridgeId);
+      assert.equal((await list(ctx.database, 'TurnIntent', { turn_id: entry.childTurnId })).length, 0);
+    }
+    const conversations = new ReliableConversationRunner(
+      { database: ctx.database },
+      `phase-f-initial-child:${ctx.database.hostBootId}`
+    );
+    let coordinator;
+    let liveDriveCount = 0;
+    try {
+      coordinator = new kernel.ReliableChildAgentCoordinator({
+        database: ctx.database,
+        effects: ctx.services.effects,
+        children: ctx.services.children,
+        answers: ctx.services.answers,
+        deliveries: ctx.services.deliveries,
+        modelProvider: {},
+        now: ctx.now,
+        turns: createTurnControl(ctx, 'parallel-initial-child'),
+        agentLoop: {
+          async drive(turnId) {
+            liveDriveCount += 1;
+            const answerBridgeId = answerByTurn.get(turnId);
+            assert.ok(answerBridgeId);
+            const submitted = await ctx.services.answers.submit({
+              answerBridgeId,
+              submissionId: `parallel-initial-child-answer-${turnId}`,
+              sourceTurnId: turnId,
+              content: `completed ${turnId}`
+            });
+            assert.equal(submitted.foregroundSettled, true);
+            await createTurnControl(ctx, `parallel-initial-child-${turnId}`).terminal({
+              source: { kind: 'callback', key: `parallel-initial-child-terminal-${turnId}` },
+              turnId,
+              terminalStatus: 'completed',
+              reason: 'phase-f initial child completed'
+            });
+            return {
+              turnId,
+              terminalStatus: 'completed',
+              modelRequestIds: [`model-request-${turnId}`],
+              assistantMessageIds: [],
+              toolCallIds: []
+            };
+          }
+        },
+        agents: {
+          async resolve() {
+            return { agentId: 'phase-f-child-agent', agentType: 'worker' };
+          }
+        },
+        manualCompression: {
+          async admit() { throw new Error('unused'); },
+          async inspect() { return null; },
+          driveIfPresent: (input) => conversations.driveManualCompressionIfPresent(input)
+        }
+      });
+      coordinator.disposing = true;
+      const liveResults = await Promise.all(liveParallel.map((entry) =>
+        coordinator.driveChild(entry.childExecutionId, entry.childTurnId)
+      ));
+      assert.ok(liveResults.every((result) => result.terminalStatus === 'completed'));
+      assert.equal(liveDriveCount, 3);
+      for (const entry of liveParallel) {
+        assert.equal((await list(ctx.database, 'ModelRequest', { turn_id: entry.childTurnId })).length, 0);
+        assert.equal((await list(ctx.database, 'TurnTermination', { turn_id: entry.childTurnId }))[0].terminal_status, 'completed');
+        assert.equal((await list(ctx.database, 'ToolOutcome', { tool_call_id: entry.toolCallId }))[0].status, 'succeeded');
+        assert.equal((await list(ctx.database, 'ChildExecutionActiveTurnLink', {
+          child_execution_id: entry.childExecutionId
+        })).length, 0);
+      }
+    } finally {
+      await coordinator?.dispose();
+      conversations.dispose();
+      await conversations.waitForIdle();
+    }
+    assertions.push('三个并发初始Child均无TurnIntent，production维护分类返回null并全部进入AgentLoop完成，而非卡在准备上下文');
+    faults.push('three parallel initial child turns have no TurnIntent when maintenance dispatch runs');
+
+    const failedChild = await spawnStartedChild(
+      ctx,
+      parent.turnId,
+      'child-drive-terminal-failure',
+      'wait_for_answer',
+      {
+        deadline: '2026-08-01T00:05:00.000Z',
+        leaseOwnerId: coordinatorLeaseOwner
+      }
+    );
+    let failedCoordinator;
+    try {
+      failedCoordinator = new kernel.ReliableChildAgentCoordinator({
+        database: ctx.database,
+        effects: ctx.services.effects,
+        children: ctx.services.children,
+        answers: ctx.services.answers,
+        deliveries: ctx.services.deliveries,
+        modelProvider: {},
+        now: ctx.now,
+        turns: createTurnControl(ctx, 'child-drive-terminal-failure'),
+        agentLoop: {
+          async drive() {
+            assert.fail('maintenance failure must not fall through to AgentLoop');
+          }
+        },
+        agents: {
+          async resolve() {
+            return { agentId: 'phase-f-failing-child', agentType: 'worker' };
+          }
+        },
+        manualCompression: {
+          async admit() { throw new Error('unused'); },
+          async inspect() { return null; },
+          async driveIfPresent() { throw new Error('phase-f deterministic child drive failure'); }
+        }
+      });
+      failedCoordinator.disposing = true;
+      const failedResult = await failedCoordinator.driveChild(
+        failedChild.childExecutionId,
+        failedChild.childTurnId
+      );
+      assert.equal(failedResult.terminalStatus, 'failed');
+      const failedTerminations = await list(ctx.database, 'TurnTermination', {
+        turn_id: failedChild.childTurnId
+      });
+      const failedOutcomes = await list(ctx.database, 'ToolOutcome', {
+        tool_call_id: failedChild.toolCallId
+      });
+      const failedExecutions = await list(ctx.database, 'ToolExecution', {
+        tool_call_id: failedChild.toolCallId
+      });
+      assert.equal(failedTerminations.length, 1);
+      assert.equal(failedTerminations[0].terminal_status, 'failed');
+      assert.equal(failedOutcomes.length, 1);
+      assert.equal(failedOutcomes[0].status, 'failed');
+      assert.equal(failedExecutions[0].status, 'completed');
+      assert.equal((await list(ctx.database, 'ChildExecutionActiveTurnLink', {
+        child_execution_id: failedChild.childExecutionId
+      })).length, 0);
+      assert.equal((await list(ctx.database, 'ExecutionLease', {
+        turn_id: failedChild.childTurnId
+      })).length, 0);
+      const failedSubmissions = await list(ctx.database, 'AnswerSubmission', {
+        turn_id: failedChild.childTurnId
+      });
+      assert.equal(failedSubmissions.length, 1);
+      assert.equal(failedSubmissions[0].interrupted, 0n);
+      const failedInbox = (await list(ctx.database, 'RuntimeInboxItem', {
+        source_id: failedSubmissions[0].id
+      }))[0];
+      assert.equal(failedInbox.state, 'settled');
+      assert.equal((await list(ctx.database, 'RuntimeDelivery', {
+        inbox_item_id: failedInbox.id
+      })).length, 0);
+      assert.equal((await ctx.services.answers.readCurrent(failedChild.answerBridgeId)).status, 'failed');
+
+      const backgroundFailedChild = await spawnStartedChild(
+        ctx,
+        parent.turnId,
+        'child-drive-background-failure',
+        'background',
+        { leaseOwnerId: coordinatorLeaseOwner }
+      );
+      const backgroundFailedResult = await failedCoordinator.driveChild(
+        backgroundFailedChild.childExecutionId,
+        backgroundFailedChild.childTurnId
+      );
+      assert.equal(backgroundFailedResult.terminalStatus, 'failed');
+      assert.equal((await list(ctx.database, 'ToolOutcome', {
+        tool_call_id: backgroundFailedChild.toolCallId
+      }))[0].status, 'succeeded');
+      const backgroundFailedSubmissions = await list(ctx.database, 'AnswerSubmission', {
+        turn_id: backgroundFailedChild.childTurnId
+      });
+      assert.equal(backgroundFailedSubmissions.length, 1);
+      assert.equal(backgroundFailedSubmissions[0].interrupted, 0n);
+      const backgroundFailedInbox = (await list(ctx.database, 'RuntimeInboxItem', {
+        source_id: backgroundFailedSubmissions[0].id
+      }))[0];
+      const backgroundFailedDeliveries = await list(ctx.database, 'RuntimeDelivery', {
+        inbox_item_id: backgroundFailedInbox.id
+      });
+      assert.equal(backgroundFailedDeliveries.length, 1);
+      const backgroundFailedInputLinks = await list(ctx.database, 'RuntimeDeliveryInputLink', {
+        delivery_id: backgroundFailedDeliveries[0].id
+      });
+      const wakeRequests = [];
+      const wakeScheduler = new kernel.ProcessCompletionDeliveryControlPlane(
+        ctx.database,
+        ctx.store,
+        {},
+        ctx.services.deliveries,
+        {
+          now: ctx.now,
+          scanIntervalMs: 60_000,
+          async wakeHandler(request) {
+            wakeRequests.push(request);
+            return { acknowledged: true };
+          }
+        }
+      );
+      try {
+        await wakeScheduler.start();
+        assert.equal(wakeRequests.length, 1);
+        assert.equal(wakeRequests[0].sourceKind, 'child_failure');
+        assert.equal(wakeRequests[0].sourceTurnId, parent.turnId);
+      } finally {
+        await wakeScheduler.dispose();
+      }
+      if (backgroundFailedInputLinks.length === 1) {
+        await ctx.services.deliveries.markInputHandled(
+          backgroundFailedInputLinks[0].pending_turn_input_id
+        );
+      }
+      assert.equal((await ctx.services.answers.readCurrent(
+        backgroundFailedChild.answerBridgeId
+      )).status, 'failed');
+    } finally {
+      await failedCoordinator?.dispose();
+    }
+
+    const restartFailedChild = await spawnStartedChild(
+      ctx,
+      parent.turnId,
+      'child-drive-failure-restart-boundary',
+      'background'
+    );
+    await createTurnControl(ctx, 'child-drive-failure-restart-boundary').terminal({
+      source: { kind: 'callback', key: 'child-drive-failure-restart-boundary' },
+      turnId: restartFailedChild.childTurnId,
+      terminalStatus: 'failed',
+      reason: 'phase-f failure committed before coordinator reconciliation'
+    });
+    assert.equal((await list(ctx.database, 'ChildExecutionActiveTurnLink', {
+      child_execution_id: restartFailedChild.childExecutionId
+    })).length, 1);
+    await closeRuntime(ctx);
+    await reopenRuntime(ctx, 'recovery-foreground-failed-child-restart', () => '2026-08-01T00:02:00.000Z');
+    await ctx.services.recovery.runAll();
+    assert.equal((await list(ctx.database, 'ChildExecutionActiveTurnLink', {
+      child_execution_id: restartFailedChild.childExecutionId
+    })).length, 0);
+    const restartFailedSubmissions = await list(ctx.database, 'AnswerSubmission', {
+      turn_id: restartFailedChild.childTurnId
+    });
+    assert.equal(restartFailedSubmissions.length, 1);
+    assert.equal(restartFailedSubmissions[0].interrupted, 0n);
+    const restartFailedInbox = (await list(ctx.database, 'RuntimeInboxItem', {
+      source_id: restartFailedSubmissions[0].id
+    }))[0];
+    const restartFailedDeliveries = await list(ctx.database, 'RuntimeDelivery', {
+      inbox_item_id: restartFailedInbox.id
+    });
+    assert.equal(restartFailedDeliveries.length, 1);
+    const restartFailedInputLinks = await list(ctx.database, 'RuntimeDeliveryInputLink', {
+      delivery_id: restartFailedDeliveries[0].id
+    });
+    if (restartFailedInputLinks.length === 1) {
+      await ctx.services.deliveries.markInputHandled(restartFailedInputLinks[0].pending_turn_input_id);
+    }
+    assertions.push('Extension Host在failed TurnTermination后崩溃时，startup recovery先补failed AnswerSubmission/RuntimeDelivery再清active pointer');
+    faults.push('host restart after failed TurnTermination commit and before child reconciliation');
+
+    assertions.push('非handoff child drive异常立即失败前台ToolCall并释放active link/lease；后台模式提交failed AnswerSubmission与RuntimeDelivery，不等待deadline');
+    faults.push('non-handoff child drive throws before AgentLoop in foreground and background');
 
     const backgroundPrepared = [];
     for (const suffix of ['one', 'two', 'three']) {
@@ -2519,7 +2965,8 @@ async function seedParent(ctx, suffix) {
 
 function createTurnControl(ctx, suffix) {
   return new kernel.TurnControlPlane(ctx.database, ctx.store, {
-    authorityCompiler: phaseFAuthorityCompiler(suffix)
+    authorityCompiler: phaseFAuthorityCompiler(suffix),
+    now: ctx.now
   });
 }
 
@@ -2560,7 +3007,7 @@ async function spawnStartedChild(ctx, parentTurnId, suffix, completionPolicy, op
     ...(completionPolicy === 'wait_for_answer'
       ? { waitDeadlineAt: options.deadline ?? '2026-08-01T01:00:00.000Z' }
       : {}),
-    leaseOwnerId: `child-owner-${suffix}`,
+    leaseOwnerId: options.leaseOwnerId ?? `child-owner-${suffix}`,
     leaseExpiresAt: '2026-08-02T00:00:00.000Z'
   });
   assert.equal(await ctx.services.children.claimSpawnDispatch(spawned.effectIntentId), true);

@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
+import { mapSettledWithBoundedConcurrency } from '../capabilities/boundedConcurrency';
+import { classifyCommandCall } from '../world/modules/tools/definitions/command';
 import type { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
@@ -65,7 +67,7 @@ export interface ReliableAgentToolDispatchInput {
 export interface ReliableAgentToolPause {
   disposition: 'paused';
   toolCallId: string;
-  reason: 'awaiting_user' | 'awaiting_approval' | 'awaiting_plan_review' | 'awaiting_child' | 'background_process';
+  reason: 'awaiting_user' | 'awaiting_approval' | 'awaiting_plan_review' | 'awaiting_child' | 'background_process' | 'converging';
   resumeKey?: string;
 }
 
@@ -128,6 +130,9 @@ export type ReliableAgentLifecycleStage =
   | 'assistant_commit_completed'
   | 'tool_dispatch_started'
   | 'tool_dispatch_completed'
+  | 'tool_model_result_committed'
+  | 'terminal_prefix_scanned'
+  | 'context_tool_pair_committed'
   | 'turn_terminal_started'
   | 'turn_terminal_completed'
   | 'drive_failed'
@@ -147,6 +152,10 @@ export interface ReliableAgentLifecycleEvent {
   /** Present when one dispatcher call owns a Provider parallel group. */
   toolBatchSize?: number;
   schedulingMode?: 'parallel' | 'serial';
+  terminalCallsScanned?: number;
+  terminalPrefixCursor?: number;
+  contextPairCount?: number;
+  contextTransactionCount?: number;
   errorName?: string;
   errorMessage?: string;
 }
@@ -196,6 +205,9 @@ export class ReliableAgentLoop {
   private readonly context: ContextSequenceControlPlane;
   private readonly automaticDeliveries: AutomaticRuntimeDeliveryRouter;
   private readonly now: () => string;
+  private readonly reconcileCommittedToolCall:
+    | ((toolCallId: string) => Promise<ToolTerminalResult | null>)
+    | undefined;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -210,9 +222,13 @@ export class ReliableAgentLoop {
     private readonly tools: ReliableAgentToolDispatcher,
     private readonly transientObserver?: ReliableAgentTransientObserver,
     private readonly lifecycleObserver?: ReliableAgentLifecycleObserver,
-    options: { now?: () => string } = {}
+    options: {
+      now?: () => string;
+      reconcileCommittedToolCall?: (toolCallId: string) => Promise<ToolTerminalResult | null>;
+    } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.reconcileCommittedToolCall = options.reconcileCommittedToolCall;
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
     this.automaticDeliveries = new AutomaticRuntimeDeliveryRouter(database);
   }
@@ -292,7 +308,11 @@ export class ReliableAgentLoop {
           }
           request = await this.requireExisting('ModelRequest', expectedModelRequestId);
         }
-        await this.assertModelRequestRound(request, requestSequence, expectedModelRequestId);
+        const modelRequestRecipe = await this.assertModelRequestRound(
+          request,
+          requestSequence,
+          expectedModelRequestId
+        );
         const modelRequestId = expectedModelRequestId;
         modelRequestIds.push(modelRequestId);
         if (await this.terminateIfRequested(turnId, `round:${round}:model-request:${modelRequestId}`)) {
@@ -397,7 +417,8 @@ export class ReliableAgentLoop {
           turnId,
           modelRequestId,
           messageId: message.messageId,
-          output
+          output,
+          recipe: modelRequestRecipe
         });
         toolCallIds.push(...batch.map((call) => call.toolCallId));
         if (await this.terminateIfRequested(
@@ -484,8 +505,9 @@ export class ReliableAgentLoop {
     modelRequestId: string;
     messageId: string;
     output: NormalizedProviderOutput;
+    recipe?: { [key: string]: PlainJsonValue };
   }): Promise<FrozenProviderToolCall[]> {
-    const definitions = await this.readModelRequestToolDefinitions(input.modelRequestId);
+    const definitions = await this.readModelRequestToolDefinitions(input.modelRequestId, input.recipe);
     const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
     const existingLinks = await listAllDomainRows(
       this.database,
@@ -586,6 +608,7 @@ export class ReliableAgentLoop {
     calls: readonly FrozenProviderToolCall[];
   }): Promise<{ status: 'completed' } | { status: 'waiting' | 'interrupted'; toolCallId: string }> {
     let cursor = 0;
+    let terminalPrefixCursor = 0;
     while (cursor < input.calls.length) {
       const first = input.calls[cursor];
       if (await this.terminateIfRequested(
@@ -605,21 +628,26 @@ export class ReliableAgentLoop {
         calls: group
       });
       if (!batchFinalized) await this.effects.finalizeReadyInOrder(input.turnId);
-      await this.appendTerminalToolPairsInOrder(input.conversationId, input.calls);
+      terminalPrefixCursor = await this.appendTerminalToolPairsInOrder({
+        conversationId: input.conversationId,
+        turnId: input.turnId,
+        round: input.round,
+        modelRequestId: input.modelRequestId,
+        calls: input.calls,
+        terminalPrefixCursor,
+        terminalPrefixLimit: end
+      });
 
       if (await this.terminateIfRequested(
         input.turnId,
         `round:${input.round}:after-tool-batch:${end}`,
         group[group.length - 1].toolCallId
       )) return { status: 'interrupted', toolCallId: group[group.length - 1].toolCallId };
-      for (const call of group) {
-        if (!await this.effects.readTerminalResult(call.toolCallId, false)) {
-          return { status: 'waiting', toolCallId: call.toolCallId };
-        }
+      if (terminalPrefixCursor < end) {
+        return { status: 'waiting', toolCallId: input.calls[terminalPrefixCursor].toolCallId };
       }
       cursor = end;
     }
-    await this.appendTerminalToolPairsInOrder(input.conversationId, input.calls);
     return { status: 'completed' };
   }
 
@@ -629,15 +657,24 @@ export class ReliableAgentLoop {
     modelRequestId: string;
     calls: readonly FrozenProviderToolCall[];
   }): Promise<boolean> {
-    if (!this.tools.dispatchBatch || input.calls.length <= 1) {
-      await Promise.all(input.calls.map((call) => this.dispatchProviderToolCall({
-        turnId: input.turnId,
-        round: input.round,
-        modelRequestId: input.modelRequestId,
-        call
-      })));
+    if (!this.tools.dispatchBatch) {
+      const outcomes = await mapSettledWithBoundedConcurrency(
+        input.calls,
+        4,
+        async (call) => this.dispatchProviderToolCall({
+          turnId: input.turnId,
+          round: input.round,
+          modelRequestId: input.modelRequestId,
+          call
+        })
+      );
+      const rejected = outcomes.find(
+        (outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected'
+      );
+      if (rejected) throw rejected.reason;
       return false;
     }
+    const schedulingMode = input.calls[0]?.policy.schedulingMode ?? 'serial';
     for (const call of input.calls) {
       this.observeLifecycle({
         turnId: input.turnId,
@@ -646,7 +683,7 @@ export class ReliableAgentLoop {
         modelRequestId: input.modelRequestId,
         toolCallId: call.toolCallId,
         toolBatchSize: input.calls.length,
-        schedulingMode: 'parallel'
+        schedulingMode
       });
     }
     const dispatched = await this.tools.dispatchBatch(input.calls.map((call) => ({
@@ -658,7 +695,7 @@ export class ReliableAgentLoop {
       arguments: call.arguments
     })));
     if (dispatched.length !== input.calls.length) {
-      throw new Error('Tool dispatcher dispatchBatch result length does not match the parallel group.');
+      throw new Error('Tool dispatcher dispatchBatch result length does not match the provider group.');
     }
     for (let index = 0; index < dispatched.length; index += 1) {
       if (isToolPause(dispatched[index])) continue;
@@ -669,7 +706,7 @@ export class ReliableAgentLoop {
         modelRequestId: input.modelRequestId,
         toolCallId: input.calls[index].toolCallId,
         toolBatchSize: input.calls.length,
-        schedulingMode: 'parallel'
+        schedulingMode
       });
     }
     return true;
@@ -714,6 +751,20 @@ export class ReliableAgentLoop {
       // remains incomplete so the next lease generation can recover it; materializing a failed
       // ToolOutcome here would both lie to the model and race a still-running detached process.
       if (isExecutionHandoffError(error)) throw error;
+      await this.effects.finalizeReadyInOrder(input.turnId);
+      const terminal = await this.effects.readTerminalResult(input.call.toolCallId, false);
+      if (terminal) return terminal;
+      const operations = await listAllDomainRows(this.database, 'Operation', {
+        tool_call_id: input.call.toolCallId
+      });
+      if (operations.length > 0) {
+        return {
+          disposition: 'paused',
+          toolCallId: input.call.toolCallId,
+          reason: 'background_process',
+          resumeKey: input.call.toolCallId
+        };
+      }
       const failed = await this.effects.settleWithoutEffect({
         source: { kind: 'internal', key: `agent-loop:${input.call.toolCallId}:dispatcher-failed` },
         toolCallId: input.call.toolCallId,
@@ -728,32 +779,84 @@ export class ReliableAgentLoop {
     }
   }
 
-  private async appendTerminalToolPairsInOrder(
-    conversationId: string,
-    calls: readonly FrozenProviderToolCall[]
-  ): Promise<void> {
-    for (const call of calls) {
-      const terminal = await this.effects.readTerminalResult(call.toolCallId, false);
-      if (!terminal) return;
-      await this.appendTerminalToolPairOnce({
-        conversationId,
+  private async appendTerminalToolPairsInOrder(input: {
+    conversationId: string;
+    turnId: string;
+    round: string;
+    modelRequestId: string;
+    calls: readonly FrozenProviderToolCall[];
+    terminalPrefixCursor: number;
+    terminalPrefixLimit: number;
+  }): Promise<number> {
+    if (
+      !Number.isSafeInteger(input.terminalPrefixCursor)
+      || input.terminalPrefixCursor < 0
+      || input.terminalPrefixCursor > input.calls.length
+    ) throw new RangeError('terminalPrefixCursor is outside the Provider ToolCall batch.');
+    if (
+      !Number.isSafeInteger(input.terminalPrefixLimit)
+      || input.terminalPrefixLimit < input.terminalPrefixCursor
+      || input.terminalPrefixLimit > input.calls.length
+    ) throw new RangeError('terminalPrefixLimit is outside the dispatched Provider ToolCall prefix.');
+    let cursor = input.terminalPrefixCursor;
+    let scanned = 0;
+    const pairs: Array<{
+      toolCallId: string;
+      toolModelResultId: string;
+      providerCallId?: string;
+    }> = [];
+    const terminalResults = await this.effects.readTerminalResults(
+      input.calls.slice(cursor, input.terminalPrefixLimit).map((call) => call.toolCallId),
+      false
+    );
+    for (const terminal of terminalResults) {
+      const call = input.calls[cursor];
+      scanned += 1;
+      if (!terminal) break;
+      this.observeLifecycle({
+        turnId: input.turnId,
+        stage: 'tool_model_result_committed',
+        round: input.round,
+        modelRequestId: input.modelRequestId,
+        toolCallId: call.toolCallId
+      });
+      pairs.push({
         toolCallId: call.toolCallId,
         toolModelResultId: terminal.toolModelResultId,
         ...(call.providerCallId ? { providerCallId: call.providerCallId } : {})
       });
+      cursor += 1;
     }
+    this.observeLifecycle({
+      turnId: input.turnId,
+      stage: 'terminal_prefix_scanned',
+      round: input.round,
+      modelRequestId: input.modelRequestId,
+      terminalCallsScanned: scanned,
+      terminalPrefixCursor: cursor
+    });
+    if (pairs.length === 0) return cursor;
+    const appended = await this.context.appendToolPairsInOrderBatch({
+      conversationId: input.conversationId,
+      pairs
+    });
+    this.observeLifecycle({
+      turnId: input.turnId,
+      stage: 'context_tool_pair_committed',
+      round: input.round,
+      modelRequestId: input.modelRequestId,
+      toolCallId: pairs[pairs.length - 1].toolCallId,
+      contextPairCount: pairs.length,
+      contextTransactionCount: appended.transactionCount
+    });
+    return cursor;
   }
 
-  private async readModelRequestToolDefinitions(modelRequestId: string): Promise<ReliableAgentToolDefinition[]> {
-    const request = await this.requireExisting('ModelRequest', modelRequestId);
-    const metadata = await this.requireExisting(
-      'ContentObject',
-      requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
-    ) as unknown as ContentObjectMetadata;
-    const recipe = requireRecord(
-      normalizePlainJson(JSON.parse((await this.contentStore.read(metadata)).toString('utf8')), 'ModelRequest recipe'),
-      'ModelRequest recipe'
-    );
+  private async readModelRequestToolDefinitions(
+    modelRequestId: string,
+    frozenRecipe?: { [key: string]: PlainJsonValue }
+  ): Promise<ReliableAgentToolDefinition[]> {
+    const recipe = frozenRecipe ?? await this.readModelRequestRecipe(modelRequestId);
     if (!Array.isArray(recipe.tools)) throw new TypeError('ModelRequest recipe.tools must be an array.');
     return recipe.tools.map((value, index) => normalizeFrozenToolDefinition(value, index));
   }
@@ -775,7 +878,7 @@ export class ReliableAgentLoop {
       sendFullRequest: (fullRequest, controls) => adapter.sendFullRequest(fullRequest, {
         signal: controls.signal,
         onEvent: async (event): Promise<StreamEventResult> => {
-          this.observeTransientEvent({
+          const observe = (): void => this.observeTransientEvent({
             conversationId,
             turnId,
             modelRequestId,
@@ -794,6 +897,14 @@ export class ReliableAgentLoop {
             },
             observedAt: this.timestamp()
           });
+          // Streaming deltas are intentionally low-latency. A terminal visual state, however,
+          // must never outrun the durable terminal checkpoint it claims to represent.
+          if (event.kind === 'completed') {
+            const result = await controls.onEvent(event);
+            observe();
+            return result;
+          }
+          observe();
           return controls.onEvent(event);
         }
       })
@@ -871,6 +982,7 @@ export class ReliableAgentLoop {
   private async resumeRequestSequence(turnId: string): Promise<bigint> {
     const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
       .sort((left, right) => compareInteger(left.request_seq, right.request_seq));
+    const recipes = await this.readModelRequestRecipes(requests);
     let expectedPhysicalSequence = 1n;
     let normalRound = 0n;
     for (const request of requests) {
@@ -878,7 +990,9 @@ export class ReliableAgentLoop {
       if (actual !== expectedPhysicalSequence) {
         throw new Error(`Turn ${turnId} ModelRequest sequence is not contiguous at ${expectedPhysicalSequence.toString()}.`);
       }
-      const recipe = await this.readModelRequestRecipe(requireId(request.id, 'ModelRequest.id'));
+      const requestId = requireId(request.id, 'ModelRequest.id');
+      const recipe = recipes.get(requestId);
+      if (!recipe) throw new Error(`ModelRequest ${requestId} recipe batch lost its request.`);
       if (recipe.kind === 'reliable-agent-turn') {
         normalRound += 1n;
         const round = requirePositiveInteger(recipe.round, 'ModelRequest recipe.round');
@@ -899,10 +1013,12 @@ export class ReliableAgentLoop {
 
   private async cancelSupersededCompressionRequests(turnId: string, currentHeadRootId: string): Promise<void> {
     const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
-    for (const request of requests) {
-      if (request.status === 'terminal') continue;
+    const activeRequests = requests.filter((request) => request.status !== 'terminal');
+    const recipes = await this.readModelRequestRecipes(activeRequests);
+    for (const request of activeRequests) {
       const requestId = requireId(request.id, 'ModelRequest.id');
-      const recipe = await this.readModelRequestRecipe(requestId);
+      const recipe = recipes.get(requestId);
+      if (!recipe) throw new Error(`ModelRequest ${requestId} recipe batch lost its request.`);
       if (recipe.kind !== 'reliable-context-compression') continue;
       const sourceRootId = requireId(recipe.sourceRootId, 'Compression recipe.sourceRootId');
       if (sourceRootId === currentHeadRootId) continue;
@@ -910,26 +1026,68 @@ export class ReliableAgentLoop {
     }
   }
 
-  private async assertModelRequestRound(request: DomainRow, expected: bigint, expectedId: string): Promise<void> {
+  private async assertModelRequestRound(
+    request: DomainRow,
+    expected: bigint,
+    expectedId: string
+  ): Promise<{ [key: string]: PlainJsonValue }> {
     if (request.id !== expectedId) throw new Error('ModelProvider returned an unexpected stable ModelRequest identity.');
-    const recipe = await this.readModelRequestRecipe(expectedId);
+    const recipe = (await this.readModelRequestRecipes([request])).get(expectedId);
+    if (!recipe) throw new Error(`ModelRequest ${expectedId} recipe batch lost its request.`);
     const actual = requirePositiveInteger(recipe.round, 'ModelRequest recipe.round');
     if (recipe.kind !== 'reliable-agent-turn' || actual !== expected) {
       throw new Error(
         `ModelRequest ${expectedId} recipe round ${actual.toString()} does not match durable round ${expected.toString()}.`
       );
     }
+    return recipe;
   }
 
   private async readModelRequestRecipe(modelRequestId: string): Promise<{ [key: string]: PlainJsonValue }> {
     const request = await this.requireExisting('ModelRequest', modelRequestId);
-    const metadata = await this.requireExisting(
-      'ContentObject', requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
-    ) as unknown as ContentObjectMetadata;
-    return requireRecord(
-      normalizePlainJson(JSON.parse((await this.contentStore.read(metadata)).toString('utf8')), 'ModelRequest recipe'),
-      'ModelRequest recipe'
-    );
+    const recipe = (await this.readModelRequestRecipes([request])).get(modelRequestId);
+    if (!recipe) throw new Error(`ModelRequest ${modelRequestId} recipe batch lost its request.`);
+    return recipe;
+  }
+
+  /** Preserves the full-history recipe audit while collapsing its SQLite and CAS round trips. */
+  private async readModelRequestRecipes(
+    requests: readonly DomainRow[]
+  ): Promise<Map<string, { [key: string]: PlainJsonValue }>> {
+    if (requests.length === 0) return new Map();
+    const indexed = requests.map((request) => ({
+      requestId: requireId(request.id, 'ModelRequest.id'),
+      recipeObjectId: requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
+    }));
+    const recipeObjectIds = [...new Set(indexed.map((entry) => entry.recipeObjectId))];
+    const snapshot = await this.database.snapshot(recipeObjectIds.map((id) =>
+      DOMAIN_REPOSITORIES.domain('ContentObject').get(id)
+    ));
+    if (snapshot.snapshot.length !== recipeObjectIds.length) {
+      throw new Error('ModelRequest recipe metadata batch returned the wrong result count.');
+    }
+    const metadata = snapshot.snapshot.map((value, index) => {
+      if (!value || Array.isArray(value)) {
+        throw new Error(`ContentObject ${recipeObjectIds[index]} does not exist.`);
+      }
+      return value as unknown as ContentObjectMetadata;
+    });
+    const bytes = await this.contentStore.readMany(metadata);
+    if (bytes.length !== recipeObjectIds.length) {
+      throw new Error('ModelRequest recipe CAS batch returned the wrong result count.');
+    }
+    const recipeByObjectId = new Map(recipeObjectIds.map((id, index) => [
+      id,
+      requireRecord(
+        normalizePlainJson(JSON.parse(bytes[index].toString('utf8')), 'ModelRequest recipe'),
+        'ModelRequest recipe'
+      )
+    ]));
+    return new Map(indexed.map(({ requestId, recipeObjectId }) => {
+      const recipe = recipeByObjectId.get(recipeObjectId);
+      if (!recipe) throw new Error(`ContentObject ${recipeObjectId} recipe batch lost its content.`);
+      return [requestId, recipe];
+    }));
   }
 
   private async requireTerminalToolResult(toolCallId: string): Promise<ToolTerminalResult> {
@@ -989,9 +1147,10 @@ export class ReliableAgentLoop {
     pendingToolCallId?: string
   ): Promise<boolean> {
     for (;;) {
-      const turn = await this.requireExisting('Turn', turnId);
+      const terminationFacts = await this.readTurnTerminationFacts(turnId);
+      const turn = terminationFacts.turn;
       if (turn.status !== 'active') return turn.status === 'terminated';
-      const request = (await this.listPendingTerminationInputs(turnId))
+      const request = terminationFacts.pending
         .sort((left, right) => compareInteger(left.position, right.position))[0];
       if (!request) return false;
 
@@ -1063,16 +1222,32 @@ export class ReliableAgentLoop {
             toolCallId,
             `agent-loop:${turnId}:termination-request:${terminationRequestId}`
           );
-          const settled = await this.effects.settleWithoutEffect({
-            source: {
-              kind: 'internal',
-              key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:cancel-tool:${toolCallId}`
-            },
-            toolCallId,
-            status: 'cancelled',
-            detail: { reason: 'turn_termination_requested' }
-          });
-          terminal = settled.terminal ?? await this.requireTerminalToolResult(toolCallId);
+          const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
+          if (operations.length === 0) {
+            const settled = await this.effects.settleWithoutEffect({
+              source: {
+                kind: 'internal',
+                key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:cancel-tool:${toolCallId}`
+              },
+              toolCallId,
+              status: 'cancelled',
+              detail: { reason: 'turn_termination_requested' }
+            });
+            terminal = settled.terminal ?? null;
+          } else {
+            await this.effects.finalizeReadyInOrder(turnId);
+            terminal = await this.effects.readTerminalResult(toolCallId, false)
+              ?? await this.reconcileCommittedToolCall?.(toolCallId)
+              ?? await this.effects.finalizeTerminalOperationsWithFallback({
+                source: {
+                  kind: 'internal',
+                  key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:close-effect:${toolCallId}`
+                },
+                toolCallId,
+                detail: { reason: 'turn_termination_requested_after_effect_terminal' }
+              });
+          }
+          terminal ??= await this.requireTerminalToolResult(toolCallId);
         }
         await this.appendTerminalToolPairOnce({
           conversationId,
@@ -1089,15 +1264,31 @@ export class ReliableAgentLoop {
         pendingToolCallId,
         `agent-loop:${turnId}:termination-request:${terminationRequestId}`
       );
-      await this.effects.settleWithoutEffect({
-        source: {
-          kind: 'internal',
-          key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:cancel-unrepresented-tool:${pendingToolCallId}`
-        },
-        toolCallId: pendingToolCallId,
-        status: 'cancelled',
-        detail: { reason: 'turn_termination_requested' }
-      });
+      const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: pendingToolCallId });
+      if (operations.length === 0) {
+        await this.effects.settleWithoutEffect({
+          source: {
+            kind: 'internal',
+            key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:cancel-unrepresented-tool:${pendingToolCallId}`
+          },
+          toolCallId: pendingToolCallId,
+          status: 'cancelled',
+          detail: { reason: 'turn_termination_requested' }
+        });
+      } else {
+        await this.effects.finalizeReadyInOrder(turnId);
+        const terminal = await this.effects.readTerminalResult(pendingToolCallId, false)
+          ?? await this.reconcileCommittedToolCall?.(pendingToolCallId)
+          ?? await this.effects.finalizeTerminalOperationsWithFallback({
+            source: {
+              kind: 'internal',
+              key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:close-effect:${pendingToolCallId}`
+            },
+            toolCallId: pendingToolCallId,
+            detail: { reason: 'turn_termination_requested_after_effect_terminal' }
+          });
+        if (!terminal) await this.requireTerminalToolResult(pendingToolCallId);
+      }
     }
   }
 
@@ -1199,13 +1390,24 @@ export class ReliableAgentLoop {
     return rows(snapshot.snapshot[0]);
   }
 
-  private async listPendingTerminationInputs(turnId: string): Promise<DomainRow[]> {
-    const groups = await Promise.all(TERMINATION_INPUT_KINDS.map((inputKind) => listAllDomainRows(
-      this.database,
-      'PendingTurnInput',
-      { turn_id: turnId, state: 'pending', input_kind: inputKind }
-    )));
-    return groups.flat();
+  private async readTurnTerminationFacts(
+    turnId: string
+  ): Promise<{ turn: DomainRow; pending: DomainRow[] }> {
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      ...TERMINATION_INPUT_KINDS.map((inputKind) =>
+        DOMAIN_REPOSITORIES.domain('PendingTurnInput').list({
+          where: { turn_id: turnId, state: 'pending', input_kind: inputKind },
+          orderBy: { column: 'position', direction: 'asc' },
+          limit: 1
+        }))
+    ]);
+    const turn = snapshot.snapshot[0];
+    if (!turn || Array.isArray(turn)) throw new Error(`Turn ${turnId} does not exist.`);
+    return {
+      turn,
+      pending: snapshot.snapshot.slice(1).flatMap((value) => rows(value))
+    };
   }
 
   private observeLifecycle(event: Omit<ReliableAgentLifecycleEvent, 'observedAt'>): void {
@@ -1414,11 +1616,18 @@ function fallbackFrozenToolPolicy(
 ): FrozenToolCallPolicyDecision {
   const metadata = asRecord(definition.metadata);
   const args = asRecord(argumentsValue);
-  const explicitScheduling = args?.scheduling === 'parallel' || args?.scheduling === 'serial'
+  const requestedScheduling = args?.scheduling === 'parallel' || args?.scheduling === 'serial'
     ? args.scheduling
     : undefined;
-  const schedulingMode = explicitScheduling
-    ?? (metadata?.readonly === true || metadata?.riskLevel === 'read' ? 'parallel' : 'serial');
+  const trustedCommand = definition.name === 'bash' || definition.name === 'shell'
+    ? classifyCommandCall(argumentsValue)
+    : undefined;
+  const backendParallel = trustedCommand
+    ? trustedCommand.parallelSafe
+    : metadata?.readonly === true || metadata?.riskLevel === 'read';
+  const schedulingMode = requestedScheduling === 'serial'
+    ? 'serial'
+    : backendParallel ? 'parallel' : 'serial';
   const supportsChangeApply = metadata?.supportsChangeApply === true;
   const automaticChangeApply = supportsChangeApply && metadata?.defaultAutoApplyChange === true;
   const configuredDelay = optionalNonNegativeInteger(metadata?.defaultAutoApplyChangeDelaySeconds) ?? 0;
@@ -1435,9 +1644,13 @@ function fallbackFrozenToolPolicy(
     changeApplyDelaySeconds: automaticChangeApply ? Math.min(configuredDelay, 600) : 0,
     autoSubmitResult: metadata?.defaultAutoSubmitResult !== false,
     schedulingMode,
-    schedulingReason: explicitScheduling
-      ? `provider_selected_${explicitScheduling}`
-      : schedulingMode === 'parallel' ? 'frozen_readonly_metadata' : 'frozen_default_serial'
+    schedulingReason: requestedScheduling === 'serial'
+      ? 'model_serial_tightening'
+      : backendParallel
+        ? trustedCommand?.reason ?? 'frozen_readonly_metadata'
+        : requestedScheduling === 'parallel'
+          ? `model_parallel_rejected_${trustedCommand?.reason ?? 'frozen_default_serial'}`
+          : trustedCommand?.reason ?? 'frozen_default_serial'
   };
 }
 

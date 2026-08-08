@@ -21,6 +21,7 @@ export type AutomaticRuntimeDeliveryReason =
   | 'source_turn_active'
   | 'source_turn_final_output_fenced'
   | 'source_turn_completed'
+  | 'source_turn_stopped_with_deliverable_answer'
   | 'source_turn_not_successful'
   | 'source_turn_missing'
   | 'source_turn_conversation_mismatch'
@@ -46,13 +47,19 @@ interface ChildGenerationAuthority {
   steps: RepositoryTransactionStep[];
 }
 
+interface DeliverySourceAuthority {
+  continueAfterStoppedSource: boolean;
+  steps: RepositoryTransactionStep[];
+}
+
 const TERMINAL_FAILURES = new Set(['interrupted', 'cancelled', 'failed', 'outcome_unknown']);
 /**
  * One fail-closed policy for automatic Process/Child answer delivery.
  *
- * It deliberately routes from the immutable source Turn, never from whichever Turn happens to be
- * active when a delayed callback arrives. Callers must include `authoritySteps` in the transaction
- * that injects/retargets the delivery; a read-only decision is only a scheduling hint.
+ * It deliberately routes from the immutable source Turn and durable Inbox source facts, never from
+ * whichever Turn happens to be active when a delayed callback arrives. Callers must include
+ * `authoritySteps` in the transaction that injects/retargets the delivery; a read-only decision is
+ * only a scheduling hint.
  */
 export class AutomaticRuntimeDeliveryRouter {
   public constructor(private readonly database: RuntimeDatabase) {}
@@ -125,9 +132,11 @@ export class AutomaticRuntimeDeliveryRouter {
   }
 
   public async resolve(input: {
+    inboxItemId: string;
     targetConversationId: string;
     sourceTurnId: string;
   }): Promise<AutomaticRuntimeDeliveryDecision> {
+    const inboxItemId = requireId(input.inboxItemId, 'inboxItemId');
     const targetConversationId = requireId(input.targetConversationId, 'targetConversationId');
     const sourceTurnId = requireId(input.sourceTurnId, 'sourceTurnId');
     const [conversation, sourceTurn] = await Promise.all([
@@ -270,6 +279,36 @@ export class AutomaticRuntimeDeliveryRouter {
         authoritySteps: terminalSteps
       });
     }
+    if (terminalStatus === 'interrupted' || terminalStatus === 'cancelled') {
+      const sourceAuthority = await this.deliverySourceAuthority(inboxItemId, sourceTurnId);
+      const stoppedSourceSteps = [...terminalSteps, ...sourceAuthority.steps];
+      if (sourceAuthority.continueAfterStoppedSource) {
+        if (!childAuthority.continuationAllowed) {
+          return decision({
+            targetConversationId,
+            sourceTurnId,
+            reason: 'child_generation_stale_or_terminal',
+            childExecutionId: childAuthority.childExecutionId,
+            authoritySteps: stoppedSourceSteps
+          });
+        }
+        return decision({
+          phase: 'next_turn',
+          targetConversationId,
+          sourceTurnId,
+          reason: 'source_turn_stopped_with_deliverable_answer',
+          childExecutionId: childAuthority.childExecutionId,
+          authoritySteps: stoppedSourceSteps
+        });
+      }
+      return decision({
+        targetConversationId,
+        sourceTurnId,
+        reason: 'source_turn_not_successful',
+        childExecutionId: childAuthority.childExecutionId,
+        authoritySteps: stoppedSourceSteps
+      });
+    }
     if (!TERMINAL_FAILURES.has(terminalStatus)) {
       throw new Error(`Turn ${sourceTurnId} has unsupported terminal status ${terminalStatus}.`);
     }
@@ -290,7 +329,10 @@ export class AutomaticRuntimeDeliveryRouter {
   }): Promise<{ delivery: DomainRow; decision: AutomaticRuntimeDeliveryDecision; changed: boolean }> {
     const deliveryId = requireId(input.deliveryId, 'deliveryId');
     const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
-    const decision = await this.resolve(input);
+    const decision = await this.resolve({
+      ...input,
+      inboxItemId: requireId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
+    });
     if (delivery.state !== 'pending') return { delivery, decision, changed: false };
     if (delivery.target_conversation_id !== decision.targetConversationId) {
       throw new Error('RuntimeDelivery target Conversation conflicts with automatic delivery authority.');
@@ -316,6 +358,78 @@ export class AutomaticRuntimeDeliveryRouter {
       delivery: await this.requireExisting('RuntimeDelivery', deliveryId),
       decision,
       changed
+    };
+  }
+
+  private async deliverySourceAuthority(
+    inboxItemId: string,
+    sourceTurnId: string
+  ): Promise<DeliverySourceAuthority> {
+    const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+    const sourceKind = requireId(inbox.source_kind, 'RuntimeInboxItem.source_kind');
+    const sourceId = requireId(inbox.source_id, 'RuntimeInboxItem.source_id');
+    const steps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(inboxItemId, {
+        source_kind: sourceKind,
+        source_id: sourceId
+      })
+    ];
+    if (sourceKind !== 'answer_submission') {
+      return { continueAfterStoppedSource: false, steps };
+    }
+
+    const submission = await this.requireExisting('AnswerSubmission', sourceId);
+    const interrupted = requireBigInt(submission.interrupted, 'AnswerSubmission.interrupted');
+    if (interrupted !== 0n && interrupted !== 1n) {
+      throw new Error(`AnswerSubmission has unsupported interrupted flag ${String(interrupted)}.`);
+    }
+    const answerBridgeId = requireId(submission.answer_bridge_id, 'AnswerSubmission.answer_bridge_id');
+    steps.push(DOMAIN_REPOSITORIES.domain('AnswerSubmission').assert(sourceId, {
+      answer_bridge_id: answerBridgeId,
+      turn_id: submission.turn_id,
+      interrupted
+    }));
+    const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
+    const childExecutionId = requireId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+    steps.push(DOMAIN_REPOSITORIES.domain('AnswerBridge').assert(answerBridgeId, {
+      child_execution_id: childExecutionId,
+      current_submission_id: sourceId
+    }));
+    const parentLinks = await this.list('ChildExecutionParentLink', {
+      child_execution_id: childExecutionId
+    }, 2);
+    if (parentLinks.length !== 1) {
+      throw new Error(`Answer delivery requires exactly one parent link for ChildExecution ${childExecutionId}.`);
+    }
+    const parentLink = parentLinks[0];
+    const parentLinkId = requireId(parentLink.id, 'ChildExecutionParentLink.id');
+    const answerParentTurnId = requireId(parentLink.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id');
+    steps.push(
+      DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assertExactIds(
+        { child_execution_id: childExecutionId },
+        [parentLinkId]
+      ),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assert(parentLinkId, {
+        child_execution_id: childExecutionId,
+        parent_turn_id: answerParentTurnId
+      })
+    );
+    const answerSourceTurnId = requireId(submission.turn_id, 'AnswerSubmission.turn_id');
+    // The current schema stores interrupted as a bit; child-drive failure uses this reserved stable ID
+    // so it cannot acquire the stronger "normal answer may continue a stopped parent" authority.
+    const failedSubmissionId = stablePhaseFId(
+      'answer_submission',
+      'child-drive-failed',
+      childExecutionId,
+      answerSourceTurnId
+    );
+    return {
+      continueAfterStoppedSource: (
+        answerParentTurnId === sourceTurnId
+        && interrupted === 0n
+        && sourceId !== failedSubmissionId
+      ),
+      steps
     };
   }
 

@@ -117,7 +117,10 @@ export async function readWorkspaceBinaryFile(relPath: string, mimeType: string,
   const stat = await workspaceFileStat(uri, options.signal);
   if (!stat) throw new Error(`File not found: ${normalizedPath}`);
   if (stat.type !== vscode.FileType.File) throw new Error(`Not a file: ${normalizedPath}`);
-  const maxBytes = 200 * 1024 * 1024;
+  const configuredMaxBytes = Number(options.maxBytes);
+  const maxBytes = Number.isSafeInteger(configuredMaxBytes) && configuredMaxBytes > 0
+    ? configuredMaxBytes
+    : 20 * 1024 * 1024;
   if (stat.size > maxBytes) throw new Error(`File too large: ${stat.size} bytes (limit ${maxBytes}).`);
   const data = await abortableFsCall(vscode.workspace.fs.readFile(uri), options.signal);
   return {

@@ -65,16 +65,16 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           },
           readonly: {
             type: 'string',
-            description: 'Whether this command is read-only and does not modify files, system state, or network state. Use "true" for read-only commands; read-only commands may be auto-approved when the policy allows it.'
+            description: 'Advisory hint that the command is read-only. The backend independently classifies the parsed command; this hint cannot make a command auto-approved or parallel-safe.'
           },
           wait: {
             type: 'string',
-            description: 'Legacy scheduling hint. Prefer the scheduling field. "true" means serial and "false" means parallel when scheduling is omitted.'
+            description: 'Legacy scheduling hint. Prefer the scheduling field. "true" requests serial execution; "false" cannot make a backend-unsafe command parallel.'
           },
           scheduling: {
             type: 'string',
             enum: ['parallel', 'serial'],
-            description: 'Tool-call scheduling mode. Explicit parallel/serial always wins. By default, output reads and conservatively recognized readonly commands may run in parallel; kill and all other execute calls remain serial.'
+            description: 'Tool-call scheduling hint. serial always tightens execution; parallel is accepted only when the backend independently classifies the parsed command as parallel-safe.'
           }
         }
       },
@@ -85,6 +85,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
         readonly: false,
         defaultEnabled: true,
         requiresApproval: true,
+        defaultAutoApproveExecution: false,
         checkpoint: { before: true, after: true }
       },
       configSchema: {
@@ -107,7 +108,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             key: 'autoApproveReadonly',
             label: '只读命令自动跳过审批',
             type: 'boolean',
-            description: '开启后，即使未开启"自动批准执行"，被模型标记为只读(readonly=true)的命令也会自动批准、无需人工确认。',
+            description: '开启后，即使未开启"自动批准执行"，仅由后端可信分类器确认的只读命令会自动批准；模型 readonly 提示不能触发自动批准。',
             defaultValue: true
           }
         ]
@@ -229,48 +230,180 @@ function summarizeCommandToolCall(rawArgs: unknown): string | undefined {
   return explanation.replace(/\s+/g, ' ');
 }
 
-/** Canonical LLM scheduling wins; observation reads and statically safe readonly commands may overlap. */
+/** Backend classification is authoritative; model hints may only preserve or tighten it. */
 function resolveCommandScheduling(rawArgs: unknown): { mode: 'parallel' | 'serial'; reason: string } {
-  const args = (rawArgs ?? {}) as CommandToolArgs;
+  const args = isCommandArgsRecord(rawArgs) ? rawArgs : {};
+  const classification = classifyCommandCall(rawArgs);
   const scheduling = normalizeSchedulingHint(args.scheduling);
-  if (scheduling !== 'auto') return { mode: scheduling, reason: `llm_selected_${scheduling}` };
-
-  const mode = args.mode === 'output' || args.mode === 'kill' ? args.mode : 'execute';
-  if (mode === 'output') return { mode: 'parallel', reason: 'readonly_process_output' };
-  if (mode === 'kill') return { mode: 'serial', reason: 'process_kill_side_effect' };
   const wait = typeof args.wait === 'string' ? args.wait.trim().toLowerCase() : '';
-  if (wait === 'false') return { mode: 'parallel', reason: 'legacy_wait_false' };
-  if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true' };
-  if (isReadonlyCommandCall(args) && isStaticallyParallelSafeReadonlyCommand(args.command)) {
-    return { mode: 'parallel', reason: 'statically_safe_readonly_command' };
+  if (scheduling === 'serial') return { mode: 'serial', reason: 'model_serial_tightening' };
+  if (wait === 'true') return { mode: 'serial', reason: 'legacy_wait_true_tightening' };
+  if (classification.parallelSafe) {
+    return { mode: 'parallel', reason: classification.reason };
   }
-  return { mode: 'serial', reason: 'default_serial_command' };
+  if (scheduling === 'parallel') {
+    return { mode: 'serial', reason: `model_parallel_rejected_${classification.reason}` };
+  }
+  if (wait === 'false') {
+    return { mode: 'serial', reason: `legacy_wait_false_rejected_${classification.reason}` };
+  }
+  return { mode: 'serial', reason: classification.reason };
 }
 
-function isStaticallyParallelSafeReadonlyCommand(value: unknown): boolean {
-  const command = typeof value === 'string' ? value.trim() : '';
-  if (!command || /[;&|<>`$\n\r]/.test(command)) return false;
-  const tokens = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
-  const executable = (tokens[0] ?? '').replace(/^.*[\\/]/, '').toLowerCase();
-  if (['pwd', 'ls', 'rg', 'grep', 'cat', 'head', 'tail', 'wc', 'stat', 'file'].includes(executable)) {
-    return true;
+export interface TrustedCommandClassification {
+  mode: 'execute' | 'output' | 'kill';
+  readonly: boolean;
+  parallelSafe: boolean;
+  reason: string;
+}
+
+/**
+ * Deterministic authority shared by command permission and scheduling decisions.
+ * Model-provided readonly/parallel/wait=false values never widen this result.
+ */
+export function classifyCommandCall(rawArgs: unknown): TrustedCommandClassification {
+  if (!isCommandArgsRecord(rawArgs)) {
+    return untrustedExecuteClassification('invalid_arguments');
+  }
+  const mode = rawArgs.mode === 'output' || rawArgs.mode === 'kill' ? rawArgs.mode : 'execute';
+  if (mode === 'output') {
+    return { mode, readonly: true, parallelSafe: true, reason: 'trusted_process_output' };
+  }
+  if (mode === 'kill') {
+    return { mode, readonly: false, parallelSafe: false, reason: 'process_kill_side_effect' };
+  }
+
+  const command = typeof rawArgs.command === 'string' ? rawArgs.command.trim() : '';
+  if (!command) return untrustedExecuteClassification('missing_command');
+  if (SHELL_CONTROL_PATTERN.test(command)) return untrustedExecuteClassification('shell_composition');
+  const tokens = tokenizeSimpleCommand(command);
+  if (!tokens || tokens.length === 0) return untrustedExecuteClassification('parse_failure');
+  const executable = executableBasename(tokens[0]!);
+  if (!isTrustedReadonlyInvocation(executable, tokens.slice(1))) {
+    return untrustedExecuteClassification('untrusted_execute_command');
+  }
+  return {
+    mode,
+    readonly: true,
+    parallelSafe: true,
+    reason: `trusted_readonly_${executable}`
+  };
+}
+
+/** True only when the backend classifier, rather than the model hint, proves readonly. */
+export function isReadonlyCommandCall(rawArgs: unknown): boolean {
+  return classifyCommandCall(rawArgs).readonly;
+}
+
+const SHELL_CONTROL_PATTERN = /[;&|<>`$\n\r\0]/;
+const SIMPLE_READONLY_EXECUTABLES = new Set(['pwd', 'ls', 'grep', 'cat', 'head', 'tail', 'wc', 'stat']);
+const READONLY_GIT_SUBCOMMANDS = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'grep']);
+
+function isCommandArgsRecord(value: unknown): value is CommandToolArgs {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function untrustedExecuteClassification(reason: string): TrustedCommandClassification {
+  return { mode: 'execute', readonly: false, parallelSafe: false, reason };
+}
+
+function executableBasename(value: string): string {
+  const basename = value.replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
+  return basename.endsWith('.exe') ? basename.slice(0, -4) : basename;
+}
+
+function isTrustedReadonlyInvocation(executable: string, args: readonly string[]): boolean {
+  if (SIMPLE_READONLY_EXECUTABLES.has(executable)) return true;
+  if (executable === 'rg') {
+    return !args.some((arg) => {
+      const lower = arg.toLowerCase();
+      return lower === '--pre'
+        || lower.startsWith('--pre=')
+        || lower === '--hostname-bin'
+        || lower.startsWith('--hostname-bin=');
+    });
+  }
+  if (executable === 'file') {
+    return !args.some((arg) => (
+      (arg.startsWith('-') && !arg.startsWith('--') && arg.slice(1).includes('C'))
+      || arg.toLowerCase().startsWith('--compile')
+    ));
   }
   if (executable === 'find') {
-    return !tokens.slice(1).some((token) => [
-      '-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprintf', '-fls'
-    ].some((flag) => token.toLowerCase() === flag || token.toLowerCase().startsWith(`${flag}=`)));
+    return !args.some((arg) => {
+      const lower = arg.toLowerCase();
+      return [
+        '-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0', '-fprintf', '-fls'
+      ].some((flag) => lower === flag || lower.startsWith(`${flag}=`));
+    });
   }
   if (executable !== 'git') return false;
-  const lowerTokens = tokens.slice(1).map((token) => token.toLowerCase());
-  if (lowerTokens.some((token) => token === '-o' || token === '--output' || token.startsWith('--output='))) return false;
-  const subcommand = lowerTokens[0] ?? '';
-  return ['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'grep'].includes(subcommand);
+  const subcommand = args[0]?.toLowerCase() ?? '';
+  if (!READONLY_GIT_SUBCOMMANDS.has(subcommand)) return false;
+  return !args.slice(1).some((arg) => {
+    const lower = arg.toLowerCase();
+    const abbreviatedDangerousLongOption = lower.startsWith('--') && [
+      '--output', '--ext-diff', '--textconv', '--open-files-in-pager'
+    ].some((option) => option.startsWith(lower.split('=')[0]!));
+    return arg.startsWith('-O')
+      || (lower.startsWith('-o') && !lower.startsWith('--'))
+      || abbreviatedDangerousLongOption;
+  });
 }
 
-/** 判断某次命令工具调用是否被模型标记为只读（供审批放行使用）。 */
-export function isReadonlyCommandCall(rawArgs: unknown): boolean {
-  const args = (rawArgs ?? {}) as CommandToolArgs;
-  return typeof args.readonly === 'string' && args.readonly.trim().toLowerCase() === 'true';
+/** Tokenizes one command only. Shell operators are rejected before this parser runs. */
+function tokenizeSimpleCommand(command: string): string[] | undefined {
+  const tokens: string[] = [];
+  let token = '';
+  let tokenStarted = false;
+  let quote: '"' | "'" | undefined;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+        tokenStarted = true;
+        continue;
+      }
+      if (char === '\\' && quote === '"') {
+        const next = command[index + 1];
+        if (next === undefined) return undefined;
+        token += next;
+        tokenStarted = true;
+        index += 1;
+        continue;
+      }
+      token += char;
+      tokenStarted = true;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (tokenStarted) {
+        tokens.push(token);
+        token = '';
+        tokenStarted = false;
+      }
+      continue;
+    }
+    if (char === '\\') {
+      const next = command[index + 1];
+      if (next === undefined) return undefined;
+      token += next;
+      tokenStarted = true;
+      index += 1;
+      continue;
+    }
+    token += char;
+    tokenStarted = true;
+  }
+  if (quote) return undefined;
+  if (tokenStarted) tokens.push(token);
+  return tokens;
 }
 
 interface NormalizedCommandToolConfig {

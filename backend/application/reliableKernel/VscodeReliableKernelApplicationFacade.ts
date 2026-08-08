@@ -3,7 +3,8 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { StorageDataResetResult } from '../../capabilities/types';
-import { resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
+import { mapSettledWithBoundedConcurrency } from '../../capabilities/boundedConcurrency';
+import { loadCommittedGlobalStatus, resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/vscodeStorage/paths';
 import { RUNTIME_KERNEL_EPOCH } from '../../reliableKernel/contracts';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
@@ -22,6 +23,7 @@ import type {
   ConversationHistoryPageRecord,
   ConversationHistoryScope,
   ConversationOriginLinkRecord,
+  GlobalSettingsSection,
   ProjectFolderCandidateRecord,
   SidebarConversationHistoryEntry,
   SidebarHistoryScopeKind,
@@ -40,10 +42,12 @@ import { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProduc
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
   conversationHistoryPreviewFromBytes,
+  conversationHistoryTitleContentFromBytes,
   projectChildConversationHistory
 } from './conversationHistoryProjection';
 
 const HISTORY_CACHE_LIMIT = 512;
+const HISTORY_CONTENT_READ_CONCURRENCY = 4;
 const DEFAULT_HISTORY_PAGE_SIZE = 50;
 
 /** VS Code shell facade backed only by the reliable SQLite/CAS Runtime and independent settings authority. */
@@ -57,6 +61,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private historyEntries: SidebarConversationHistoryEntry[] = [];
   private originLinks: ConversationOriginLinkRecord[] = [];
   private readonly historyPreviewByRevisionId = new Map<string, string>();
+  private readonly historyTitleByRevisionId = new Map<string, string>();
   private historyRefresh: Promise<void> | undefined;
   private historyRefreshPending = false;
   private historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -88,6 +93,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   public static async open(context: vscode.ExtensionContext): Promise<VscodeReliableKernelApplicationFacade> {
+    await loadCommittedGlobalStatus(context);
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
     const authority = createVscodeRootAuthority(getPaths);
     await new VscodeReliableKernelCutoverCoordinator(authority, getPaths().globalStoragePath).ensureCurrentRoot();
@@ -178,7 +184,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       return { conversationId, deduplicated: true };
     }
 
-    const sourceConversation = await this.requireRow('Conversation', sourceConversationId);
+    await this.requireRow('Conversation', sourceConversationId);
     const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
     if (currentLinks.length !== 1) throw new Error('Fork 源 Message 缺少唯一当前 Revision。');
     const revisionId = requireText(currentLinks[0].revision_id, 'MessageCurrentRevisionLink.revision_id');
@@ -271,7 +277,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       sourceMessageRevisionId: revisionId,
       expectedCurrentMessageRevisionId: revisionId,
       ...(sourceTurnIds.length === 1 ? { sourceTurnId: sourceTurnIds[0] } : {}),
-      targetTitle: `${String(sourceConversation.title)} 分支`,
+      targetTitle: `${this.getConversationDisplayTitle(sourceConversationId)} 分支`,
       targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
     });
     await this.refreshConversationHistory();
@@ -427,6 +433,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public getStorageRootUri(): vscode.Uri {
     return resolveDataRootUri(this.context);
+  }
+
+  public refreshGlobalSettings(section: GlobalSettingsSection): Promise<void> {
+    this.requireOpen();
+    return this.commandRouter.refreshGlobalSettings(section);
   }
 
   public async resetDevelopmentData(): Promise<StorageDataResetResult> {
@@ -596,6 +607,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       String(row.conversation_id),
       Number(row.message_count)
     ]));
+    const projectedTitles = await this.readConversationHistoryProjectionTitles(projection.titleTargets);
     const previews = await this.readConversationHistoryProjectionPreviews(projection.previewTargets);
     const activeTurnByConversation = new Map(
       projection.turns.filter((row) => row.status === 'active').map((row) => [String(row.conversation_id), row])
@@ -631,10 +643,20 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       const running = childProjection?.isRunning ?? activeTurn !== undefined;
       const agentId = defaultAgentByConversation.get(id);
       const preview = previews.get(id);
+      const projectedTitle = projectedTitles.get(id);
       const project = projectByConversation.get(id);
       return {
         id,
-        title: String(row.title),
+        title: displayConversationTitle({
+          id,
+          title: String(row.title),
+          ...(projectedTitle ? {
+            messages: [{
+              role: 'user',
+              content: { role: 'user', parts: [{ text: projectedTitle }] }
+            }]
+          } : {})
+        }),
         preview: messageCount === 0 ? '' : preview ?? '消息内容暂不可用',
         ...(messageCount === 0
           ? { previewState: 'empty' as const }
@@ -710,9 +732,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       previews.set(target.conversationId, cached);
       return false;
     });
-    const settled = await Promise.allSettled(unresolved.map((target) =>
-      this.product.application.contentStore.read(target.content as unknown as ContentObjectMetadata)
-    ));
+    const settled = await mapSettledWithBoundedConcurrency(
+      unresolved,
+      HISTORY_CONTENT_READ_CONCURRENCY,
+      (target) => this.product.application.contentStore.read(target.content as unknown as ContentObjectMetadata)
+    );
     settled.forEach((result, index) => {
       if (result.status !== 'fulfilled') return;
       const target = unresolved[index];
@@ -728,6 +752,45 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       this.historyPreviewByRevisionId.delete(oldestRevisionId);
     }
     return previews;
+  }
+
+  private async readConversationHistoryProjectionTitles(
+    targets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>
+  ): Promise<Map<string, string>> {
+    const titles = new Map<string, string>();
+    const unresolved = targets.filter((target) => {
+      const cached = this.historyTitleByRevisionId.get(target.revisionId);
+      if (cached === undefined) return true;
+      titles.set(target.conversationId, cached);
+      return false;
+    });
+    const settled = await mapSettledWithBoundedConcurrency(
+      unresolved,
+      HISTORY_CONTENT_READ_CONCURRENCY,
+      (target) => this.product.application.contentStore.read(target.content as unknown as ContentObjectMetadata)
+    );
+    settled.forEach((result, index) => {
+      if (result.status !== 'fulfilled') return;
+      const target = unresolved[index];
+      if (!target) return;
+      const content = conversationHistoryTitleContentFromBytes(
+        result.value,
+        String(target.content.content_type)
+      );
+      if (!content) return;
+      const title = displayConversationTitle({
+        id: target.conversationId,
+        messages: [{ role: 'user', content }]
+      });
+      titles.set(target.conversationId, title);
+      this.historyTitleByRevisionId.set(target.revisionId, title);
+    });
+    while (this.historyTitleByRevisionId.size > HISTORY_CACHE_LIMIT * 2) {
+      const oldestRevisionId = this.historyTitleByRevisionId.keys().next().value as string | undefined;
+      if (!oldestRevisionId) break;
+      this.historyTitleByRevisionId.delete(oldestRevisionId);
+    }
+    return titles;
   }
 
   private mergeHistoryCache(

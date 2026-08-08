@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import type { RootBinding } from './contracts';
 import {
   ContentAddressedStore,
@@ -26,7 +27,6 @@ import {
   MIN_PROCESS_MAX_OUTPUT_BYTES,
   PROCESS_OUTPUT_MAX_CHUNK_BYTES,
   PROCESS_TERMINATION_GRACE_MS,
-  PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM,
   PROCESS_WRAPPER_CHUNKS_DIRECTORY,
   PROCESS_WRAPPER_EXIT_RECEIPT_FILE,
   PROCESS_WRAPPER_IDENTITY_FILE,
@@ -39,6 +39,7 @@ import {
   parseWrapperExitReceipt,
   parseWrapperIdentity,
   parseWrapperManifest,
+  processWrapperManifestLiveTails,
   processChunkFileName,
   processSpoolPath,
   processSpoolRoot,
@@ -210,6 +211,7 @@ const PROCESS_START = 'process_start' as const;
 const PROCESS_STOP = 'process_stop_request' as const;
 const WRAPPER_IDENTITY_WAIT_MS = 5_000;
 const WRAPPER_IDENTITY_POLL_MS = 20;
+const WRAPPER_EXIT_RECEIPT_SETTLE_MS = 500;
 const PROCESS_EXIT_OBSERVER_POLL_MS = 250;
 const PROCESS_STOP_RECEIPT_WAIT_MS = PROCESS_TERMINATION_GRACE_MS + 1_000;
 const PROCESS_STOP_RECEIPT_POLL_MS = 25;
@@ -221,6 +223,8 @@ export const PROCESS_OUTPUT_READ_PAGE_MAX_BYTES = 128 * 1024;
 /** Initial execute responses stay small; the opaque handle resumes exactly at the byte boundary. */
 export const PROCESS_START_INLINE_OUTPUT_MAX_BYTES = 16 * 1024;
 const PROCESS_OUTPUT_HANDLE_PREFIX = 'rk-process-output:';
+const PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS = 4;
+const PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL = 4;
 
 export interface ProcessControlPlaneOptions {
   now?: () => string;
@@ -239,6 +243,7 @@ export class ProcessControlPlane {
   private readonly onExitObserverError: ProcessControlPlaneOptions['onExitObserverError'];
   private readonly exitObservers = new Map<string, Promise<void>>();
   private readonly exitObserverWakeups = new Set<() => void>();
+  private readonly processIdentityReadyAt = new Map<string, number>();
   private exitObserversEnabled = false;
   private exitObserversClosing = false;
   private exitObserversDisposePromise: Promise<void> | undefined;
@@ -394,6 +399,7 @@ export class ProcessControlPlane {
     const launchPath = path.join(spoolPath, 'launch.json');
     await writeAtomicJson(launchPath, launch);
     if (signal?.aborted) return { outcome: 'cancelled', error: 'Process start cancelled before wrapper spawn.' };
+    const spawnStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
     const spawned = await new Promise<{ ok: true } | { ok: false; error: unknown }>((resolve) => {
       try {
         const wrapper = spawn(process.execPath, [path.join(__dirname, 'processWrapper.js'), launchPath], {
@@ -415,8 +421,26 @@ export class ProcessControlPlane {
         resolve({ ok: false, error });
       }
     });
+    if (spawnStartedAt !== undefined) {
+      this.database.recordPerformanceMetric({
+        kind: 'process.phase',
+        phase: 'spawn',
+        durationMs: performance.now() - spawnStartedAt
+      });
+    }
     if (!spawned.ok) return { outcome: 'failed', error: errorMessage(spawned.error) };
-    return waitForLaunchEvidence(request, spoolPath, launch.createdAt, WRAPPER_IDENTITY_WAIT_MS);
+    const identityStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
+    const evidence = await waitForLaunchEvidence(request, spoolPath, launch.createdAt, WRAPPER_IDENTITY_WAIT_MS);
+    if (identityStartedAt !== undefined && evidence.outcome === 'succeeded') {
+      const readyAt = performance.now();
+      this.processIdentityReadyAt.set(request.processId, readyAt);
+      this.database.recordPerformanceMetric({
+        kind: 'process.phase',
+        phase: 'identity_ready',
+        durationMs: readyAt - identityStartedAt
+      });
+    }
+    return evidence;
   }
 
   public async reconcileStartReceipt(effectReceiptIdInput: string): Promise<ToolTerminalResult | null> {
@@ -475,18 +499,34 @@ export class ProcessControlPlane {
       outcome,
       ...(additionalSteps.length > 0 ? { additionalSteps } : {})
     }, { finalize: false });
+    if (observation.foreground?.state === 'running') this.ensureExitObserver(request.processId);
     if (existingTerminal) return existingTerminal;
 
     let detail: unknown;
     if (observation.launch.outcome === 'succeeded') {
-      await this.reconcileOutput(request.processId);
-      const output = await this.readOutputPage(
-        request.processId,
-        undefined,
-        PROCESS_START_INLINE_OUTPUT_MAX_BYTES
-      );
-      detail = processStartModelDetail(observation, output);
-      if (observation.foreground?.state === 'running') this.ensureExitObserver(request.processId);
+      const existingModelResponse = await this.readExistingModelResponseDetail(toolCallId, outcome);
+      if (existingModelResponse.found) {
+        // The first committed model response is immutable. Reusing its exact detail also reuses the
+        // original source receipt identity when a host stopped between artifact and final outcome.
+        detail = existingModelResponse.detail;
+      } else {
+        try {
+          await this.reconcileOutputBounded(
+            request.processId,
+            PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL
+          );
+          const output = await this.readOutputPage(
+            request.processId,
+            undefined,
+            PROCESS_START_INLINE_OUTPUT_MAX_BYTES
+          );
+          detail = processStartModelDetail(observation, output);
+        } catch {
+          // Inline output is a convenience, not execution authority. The durable processId remains
+          // sufficient to page output later, so preview I/O must never strand a successful ToolCall.
+          detail = processStartModelDetailWithoutPreview(observation);
+        }
+      }
     } else {
       detail = processStartFailureModelDetail(observation);
     }
@@ -813,11 +853,15 @@ export class ProcessControlPlane {
   /** Imports one immutable wrapper-manifest prefix into CAS+SQLite; it never re-runs the process. */
   public async reconcileOutput(processIdInput: string): Promise<ReconciledOutput> {
     const processId = requireId(processIdInput, 'processId');
+    return this.reconcileOutputBounded(processId, Number.POSITIVE_INFINITY);
+  }
+
+  private async reconcileOutputBounded(processId: string, maxAttempts: number): Promise<ReconciledOutput> {
     await this.validateBinding();
     // A concurrent exit/import may make a selected running manifest stale. Restart only when the
     // Process assertion proves that durable state advanced; every pass otherwise makes keyset
     // progress and there is no retry count or retained-output ceiling.
-    for (;;) {
+    for (let attempt = 1; ; attempt += 1) {
       const processRow = await this.requireExisting('Process', processId);
       const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
       await this.requireMatchingSpoolEvidence(processRow, spoolPath);
@@ -827,7 +871,7 @@ export class ProcessControlPlane {
       try {
         return await this.reconcileOutputPrefix(processRow, spoolPath, manifest, counters);
       } catch (error) {
-        if (error instanceof ProcessOutputSnapshotAdvancedError) continue;
+        if (error instanceof ProcessOutputSnapshotAdvancedError && attempt < maxAttempts) continue;
         throw error;
       }
     }
@@ -840,8 +884,14 @@ export class ProcessControlPlane {
    */
   public async snapshotOutputForDetail(processIdInput: string): Promise<ProcessDetailOutputSnapshot> {
     const processId = requireId(processIdInput, 'processId');
-    for (;;) {
-      await this.reconcileOutput(processId);
+    for (let attempt = 1; attempt <= PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        await this.reconcileOutputBounded(processId, PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL);
+      } catch (error) {
+        if (!(error instanceof ProcessOutputSnapshotAdvancedError)) throw error;
+        const current = await this.requireExisting('Process', processId);
+        return processDetailDurablePrefix(processRowOutputCounters(current));
+      }
       const processRow = await this.requireExisting('Process', processId);
       const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
       await this.requireMatchingSpoolEvidence(processRow, spoolPath);
@@ -849,7 +899,10 @@ export class ProcessControlPlane {
       const observed = outputCounters(manifest);
       assertProcessOutputProgress(processRow, observed, manifest.status);
       const retained = processRowOutputCounters(processRow);
-      if (!outputCounterValuesEqual(retained, observed)) continue;
+      if (!outputCounterValuesEqual(retained, observed)) {
+        if (attempt < PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS) continue;
+        return processDetailDurablePrefix(retained);
+      }
       if (manifest.status === 'exited') {
         return {
           retainedBytes: retained.retainedBytes.toString(),
@@ -859,7 +912,10 @@ export class ProcessControlPlane {
         };
       }
       const live = await this.readStableLiveTails(spoolPath, processRow, manifest);
-      if (!live) continue;
+      if (!live) {
+        if (attempt < PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS) continue;
+        return processDetailDurablePrefix(retained);
+      }
       return {
         retainedBytes: retained.retainedBytes.toString(),
         retainedChunks: retained.retainedChunks.toString(),
@@ -867,6 +923,7 @@ export class ProcessControlPlane {
         stderr: live.stderr
       };
     }
+    throw new Error('Unreachable process detail snapshot retry state.');
   }
 
   /** A terminal continuation handle proves that its immutable retained prefix was already reconciled. */
@@ -1324,17 +1381,18 @@ export class ProcessControlPlane {
   private async runExitObserver(processId: string): Promise<void> {
     try {
       while (!this.exitObserversClosing) {
-        const observed = await this.reconcileProcessExit(processId);
-        if (observed.state !== 'running') return;
-        await this.waitForExitObserverPoll();
-      }
-    } catch (error) {
-      if (!this.exitObserversClosing) {
         try {
-          this.onExitObserverError?.({ processId, error });
-        } catch {
-          // Diagnostics are observational and must never create a second control path.
+          const observed = await this.reconcileProcessExit(processId);
+          if (observed.state !== 'running') return;
+        } catch (error) {
+          if (this.exitObserversClosing) return;
+          try {
+            this.onExitObserverError?.({ processId, error });
+          } catch {
+            // Diagnostics are observational and must never create a second control path.
+          }
         }
+        await this.waitForExitObserverPoll();
       }
     } finally {
       this.exitObservers.delete(processId);
@@ -1368,6 +1426,7 @@ export class ProcessControlPlane {
     try {
       const receipt = parseWrapperExitReceipt(await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)));
       assertExitReceiptMatchesProcess(processRow, receipt);
+      this.recordTerminalReceiptMetric(processId);
       return { state: 'exited', processId, receipt };
     } catch (error) {
       if (!isNotFound(error)) return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
@@ -1431,11 +1490,31 @@ export class ProcessControlPlane {
       const raw = await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE));
       const receipt = parseWrapperExitReceipt(raw);
       assertExitReceiptMatches(identity, receipt);
+      this.recordTerminalReceiptMetric(processId);
       return { state: 'exited', processId, receipt };
     } catch (error) {
       if (!isNotFound(error)) return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
     }
     if (!isLinuxWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
+      // The wrapper can atomically publish its receipt and exit between the first receipt read and
+      // this liveness check. Re-read the terminal authority before classifying that normal race as
+      // outcome_unknown.
+      const deadline = Date.now() + WRAPPER_EXIT_RECEIPT_SETTLE_MS;
+      do {
+        try {
+          const receipt = parseWrapperExitReceipt(
+            await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE))
+          );
+          assertExitReceiptMatches(identity, receipt);
+          this.recordTerminalReceiptMetric(processId);
+          return { state: 'exited', processId, receipt };
+        } catch (error) {
+          if (!isNotFound(error)) {
+            return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
+          }
+        }
+        if (Date.now() < deadline) await sleep(Math.min(WRAPPER_IDENTITY_POLL_MS, deadline - Date.now()));
+      } while (Date.now() < deadline);
       return {
         state: 'outcome_unknown',
         processId,
@@ -1466,6 +1545,7 @@ export class ProcessControlPlane {
     counters: ProcessOutputCounters
   ): Promise<ReconciledOutput> {
     const processId = requireId(selectedProcessRow.id, 'Process.id');
+    const outputImportStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
     let nextChunkSeq = 1n;
     let representedBytes = 0n;
     let representedChunks = 0n;
@@ -1535,6 +1615,14 @@ export class ProcessControlPlane {
       counters.retainedChunks
     );
     await this.commitProcessOutputBatch(processId, manifest, counters, [], true);
+    if (outputImportStartedAt !== undefined) {
+      this.database.recordPerformanceMetric({
+        kind: 'process.phase',
+        phase: 'output_import',
+        durationMs: performance.now() - outputImportStartedAt,
+        byteCount: Number(counters.retainedBytes)
+      });
+    }
     return {
       retainedBytes: counters.retainedBytes,
       retainedChunks: counters.retainedChunks,
@@ -1660,23 +1748,18 @@ export class ProcessControlPlane {
 
   private async readStableLiveTails(
     spoolPath: string,
-    processRow: DomainRow,
+    _processRow: DomainRow,
     manifest: ProcessWrapperManifest
   ): Promise<{ stdout: Buffer; stderr: Buffer } | undefined> {
-    const stdout = await readOptionalBytes(path.join(spoolPath, 'live-tail-stdout.bin')) ?? Buffer.alloc(0);
-    const stderr = await readOptionalBytes(path.join(spoolPath, 'live-tail-stderr.bin')) ?? Buffer.alloc(0);
-    if (stdout.length > PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM
-      || stderr.length > PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM) {
-      throw new Error('Process live tail exceeds the per-stream frozen bound.');
-    }
     if (await fileExists(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE))) return undefined;
-    const after = await this.readManifest(spoolPath, processRow);
-    if (!sameManifestSnapshot(manifest, after)) return undefined;
-    if (
-      BigInt(stdout.length) !== BigInt(manifest.stdoutTailBytes)
-      || BigInt(stderr.length) !== BigInt(manifest.stderrTailBytes)
-    ) throw new Error('Process live tail does not match its stable wrapper manifest.');
-    return { stdout, stderr };
+    if (manifest.status !== 'running') return undefined;
+    try {
+      return processWrapperManifestLiveTails(manifest);
+    } catch {
+      // The immutable chunk prefix remains authoritative. A malformed preview is omitted rather
+      // than promoted into a Tool/Process failure.
+      return undefined;
+    }
   }
 
   private async requireMatchingSpoolEvidence(processRow: DomainRow, spoolPath: string): Promise<void> {
@@ -1711,6 +1794,29 @@ export class ProcessControlPlane {
       throw new Error('Process wrapper manifest identity mismatch.');
     }
     return manifest;
+  }
+
+  private async readExistingModelResponseDetail(
+    toolCallId: string,
+    expectedStatus: ProcessStartObservation['outcome']
+  ): Promise<{ found: false } | { found: true; detail: unknown }> {
+    const artifacts = await this.list('ToolResultArtifact', {
+      tool_call_id: toolCallId,
+      role: 'model_response'
+    }, 2);
+    if (artifacts.length === 0) return { found: false };
+    if (artifacts.length !== 1) throw new Error(`ToolCall ${toolCallId} has multiple model_response artifacts.`);
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requireId(artifacts[0].content_object_id, 'ToolResultArtifact.content_object_id')
+    ) as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+    if (
+      body.toolCallId !== toolCallId
+      || body.status !== expectedStatus
+      || !Object.prototype.hasOwnProperty.call(body, 'detail')
+    ) throw new Error(`ToolCall ${toolCallId} model_response artifact is inconsistent.`);
+    return { found: true, detail: body.detail };
   }
 
   private async readReceiptDetail<T>(receipt: DomainRow): Promise<T | undefined> {
@@ -1748,6 +1854,18 @@ export class ProcessControlPlane {
 
   private timestamp(): string {
     return requireText(this.now(), 'clock result');
+  }
+
+  private recordTerminalReceiptMetric(processId: string): void {
+    const identityReadyAt = this.processIdentityReadyAt.get(processId);
+    if (identityReadyAt === undefined) return;
+    this.processIdentityReadyAt.delete(processId);
+    if (!this.database.performanceMetrics) return;
+    this.database.recordPerformanceMetric({
+      kind: 'process.phase',
+      phase: 'terminal_receipt',
+      durationMs: performance.now() - identityReadyAt
+    });
   }
 
   private notifyProcessReceipt(processId: string): void {
@@ -2117,9 +2235,27 @@ function processStartModelDetail(
     stdout,
     stderr,
     ...(provisional ? { outputProvisional: true } : {}),
-    complete: output.complete,
+    complete: foreground?.state === 'running' ? false : output.complete,
     ...(output.hasMore ? { nextOutputHandle: output.nextOutputHandle } : {}),
     ...(output.truncated ? { truncated: true, droppedBytes: output.droppedBytes } : {})
+  };
+}
+
+function processStartModelDetailWithoutPreview(
+  observation: ProcessStartObservation
+): Record<string, unknown> {
+  const foreground = observation.foreground;
+  const exited = foreground?.state === 'exited' ? foreground.receipt : undefined;
+  return {
+    processId: observation.processId,
+    status: exited ? processTerminalStatus(exited) : (foreground?.state ?? observation.state),
+    exitCode: exited?.exitCode === null || exited?.exitCode === undefined ? null : Number(exited.exitCode),
+    ...(exited ? { terminationReason: exited.terminationReason } : {}),
+    ...(exited?.stopRequested ? { killed: true } : {}),
+    stdout: '',
+    stderr: '',
+    outputPreviewUnavailable: true,
+    complete: foreground?.state !== 'running'
   };
 }
 
@@ -2131,6 +2267,15 @@ function processStartFailureModelDetail(observation: ProcessStartObservation): R
     stdout: '',
     stderr: observation.launch.outcome === 'succeeded' ? '' : observation.launch.error,
     complete: true
+  };
+}
+
+function processDetailDurablePrefix(counters: ProcessOutputCounters): ProcessDetailOutputSnapshot {
+  return {
+    retainedBytes: counters.retainedBytes.toString(),
+    retainedChunks: counters.retainedChunks.toString(),
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0)
   };
 }
 
@@ -2673,21 +2818,6 @@ function assertNonNegativeOutputCounters(retainedBytes: bigint, retainedChunks: 
   }
 }
 
-function sameManifestSnapshot(left: ProcessWrapperManifest, right: ProcessWrapperManifest): boolean {
-  return left.kind === right.kind
-    && left.processId === right.processId
-    && left.stableNonce === right.stableNonce
-    && left.status === right.status
-    && left.nextChunkSeq === right.nextChunkSeq
-    && left.retainedBytes === right.retainedBytes
-    && left.retainedChunks === right.retainedChunks
-    && left.droppedBytes === right.droppedBytes
-    && left.truncated === right.truncated
-    && left.stdoutTailBytes === right.stdoutTailBytes
-    && left.stderrTailBytes === right.stderrTailBytes
-    && left.updatedAt === right.updatedAt;
-}
-
 function isTransactionAssertionFailure(error: unknown): boolean {
   return (error as Error & { code?: string }).code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
 }
@@ -2770,15 +2900,6 @@ async function writeAtomicJsonOnce(filePath: string, value: unknown): Promise<vo
 
 async function readJson(filePath: string): Promise<unknown> {
   return JSON.parse(await fs.readFile(filePath, 'utf8'));
-}
-
-async function readOptionalBytes(filePath: string): Promise<Buffer | undefined> {
-  try {
-    return await fs.readFile(filePath);
-  } catch (error) {
-    if (isNotFound(error)) return undefined;
-    throw error;
-  }
 }
 
 async function fileExists(filePath: string): Promise<boolean> {

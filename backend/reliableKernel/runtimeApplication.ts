@@ -40,6 +40,7 @@ import {
 } from './processCompletionDelivery';
 import { RootAuthority } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { listAllDomainRows } from './repositoryPagination';
 import { ToolInteractionControlPlane } from './toolInteractions';
 import {
   TurnControlPlane,
@@ -129,6 +130,12 @@ export class ReliableKernelApplication {
 
   private closePromise: Promise<void> | undefined;
   private handoffPromise: Promise<void> | undefined;
+  private convergenceTimer: NodeJS.Timeout | undefined;
+  private convergenceTask: Promise<void> | undefined;
+  private convergenceRequested = false;
+  private convergenceClosed = false;
+  private convergenceRetryDelayMs = 0;
+  private unsubscribeConvergence: (() => void) | undefined;
   private readonly providers: ReliableAgentProviderRegistry;
   private readonly diagnosticObserver: ReliableDiagnosticObserver | undefined;
 
@@ -144,9 +151,16 @@ export class ReliableKernelApplication {
     this.contentStore = contentStore;
 
     const options = dependencies.now ? { now: dependencies.now } : {};
+    this.attachments = new AttachmentIngestService(
+      database,
+      contentStore,
+      dependencies.attachmentSettings,
+      options
+    );
     this.runtime = createReliableKernelRuntimeServices(database, contentStore, {
       ...options,
-      authorityCompiler: dependencies.authorityCompiler
+      authorityCompiler: dependencies.authorityCompiler,
+      attachments: this.attachments
     });
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
     this.compression = new ContextCompressionControlPlane(database, contentStore, options);
@@ -163,7 +177,8 @@ export class ReliableKernelApplication {
       database,
       contentStore,
       this.runtime.effects,
-      dependencies.resolveWorkEnvironment
+      dependencies.resolveWorkEnvironment,
+      () => this.scheduleRuntimeConvergence()
     );
     this.processes = new ProcessControlPlane(
       database,
@@ -229,14 +244,9 @@ export class ReliableKernelApplication {
       mcpPolicyGate
     );
     this.interactions = new ToolInteractionControlPlane(database, contentStore, this.runtime.effects, options);
-    this.attachments = new AttachmentIngestService(
-      database,
-      contentStore,
-      dependencies.attachmentSettings,
-      options
-    );
     this.turns = new TurnControlPlane(database, contentStore, {
       authorityCompiler: dependencies.authorityCompiler,
+      attachments: this.attachments,
       unresolvedFileClosure: this.files,
       prepareNextTurnDeliverySteps: (conversationId, turnId, now) =>
         this.runtime.deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now),
@@ -256,6 +266,15 @@ export class ReliableKernelApplication {
       turns: this.turns,
       turnOutput: this.turnOutput
     }) ?? missingToolDispatcher();
+    this.phaseDRecovery = new PhaseDRecoveryScanner(
+      database,
+      this.runtime.effects,
+      this.files,
+      this.processes,
+      this.mcp,
+      dependencies.resolveWorkEnvironment,
+      this.turns
+    );
     this.agentLoop = new ReliableAgentLoop(
       database,
       contentStore,
@@ -269,23 +288,32 @@ export class ReliableKernelApplication {
       this.toolDispatcher,
       dependencies.transientObserver,
       dependencies.lifecycleObserver,
-      options
+      {
+        ...options,
+        reconcileCommittedToolCall: async (toolCallId) => {
+          await this.phaseDRecovery.reconcileCommittedFacts();
+          return this.runtime.effects.readTerminalResult(toolCallId, false);
+        }
+      }
     );
-    this.phaseDRecovery = new PhaseDRecoveryScanner(
-      database,
-      this.runtime.effects,
-      this.files,
-      this.processes,
-      this.mcp,
-      dependencies.resolveWorkEnvironment,
-      this.turns
-    );
+    this.unsubscribeConvergence = database.onCommit((commit) => {
+      if (!commit.changes.some((change) => [
+        'EffectIntent',
+        'EffectReceipt',
+        'Operation',
+        'ToolResultArtifact',
+        'InteractionResponse',
+        'FileChangeDecision'
+      ].includes(change.domain))) return;
+      this.scheduleRuntimeConvergence();
+    });
     this.webviewFeed = new ReliableKernelWebviewFeedBridge(
       this.runtime.clientFeed,
       this.runtime.details,
       undefined,
       dependencies.diagnosticObserver,
-      dependencies.runtimeBuildInfo
+      dependencies.runtimeBuildInfo,
+      this.runtime.history
     );
   }
 
@@ -359,6 +387,12 @@ export class ReliableKernelApplication {
   public close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closePromise = (async () => {
+      this.convergenceClosed = true;
+      this.unsubscribeConvergence?.();
+      this.unsubscribeConvergence = undefined;
+      if (this.convergenceTimer) clearTimeout(this.convergenceTimer);
+      this.convergenceTimer = undefined;
+      await this.convergenceTask?.catch(() => undefined);
       this.webviewFeed.close();
       this.runtime.clientFeed.close();
       await this.beginHandoff();
@@ -370,6 +404,106 @@ export class ReliableKernelApplication {
       await this.database.close();
     })();
     return this.closePromise;
+  }
+
+  /**
+   * Durable effect facts are level-triggered locally as well as at startup. A committed receipt,
+   * terminal Operation or model artifact must not depend on the original dispatcher Promise
+   * reaching its next line of code.
+   */
+  private scheduleRuntimeConvergence(): void {
+    if (this.convergenceClosed) return;
+    this.convergenceRequested = true;
+    if (this.convergenceTimer || this.convergenceTask) return;
+    this.convergenceTimer = setTimeout(() => {
+      this.convergenceTimer = undefined;
+      const task = this.runRuntimeConvergence();
+      this.convergenceTask = task;
+      void task.finally(() => {
+        if (this.convergenceTask === task) this.convergenceTask = undefined;
+        if (this.convergenceRequested) this.scheduleRuntimeConvergence();
+      }).catch(() => undefined);
+    }, this.convergenceRetryDelayMs || 100);
+    this.convergenceTimer.unref();
+  }
+
+  private async runRuntimeConvergence(): Promise<void> {
+    this.convergenceRequested = false;
+    let failed = 0;
+    try {
+      const pendingFileMutations = await listAllDomainRows(this.database, 'EffectIntent', {
+        effect_kind: 'file_mutation',
+        dispatch_state: 'pending'
+      });
+      for (const intent of pendingFileMutations) {
+        try {
+          await this.fileMutations.dispatchRecordAndReconcile(String(intent.id));
+        } catch (error) {
+          failed += 1;
+          this.diagnosticObserver?.observe({
+            eventKind: 'recovery.scan.failed',
+            scopeKind: 'runtime',
+            correlationId: String(intent.id),
+            metadata: {
+              kind: 'runtime-file-mutation-convergence',
+              status: 'failed',
+              hostBootId: this.database.hostBootId,
+              errorName: safeErrorName(error)
+            }
+          });
+        }
+      }
+      const dispatchedFileMutations = await listAllDomainRows(this.database, 'EffectIntent', {
+        effect_kind: 'file_mutation',
+        dispatch_state: 'dispatched'
+      });
+      for (const intent of dispatchedFileMutations) {
+        const effectIntentId = String(intent.id);
+        if (this.fileMutations.isDispatchActive(effectIntentId)) continue;
+        const fence = await this.runtime.effects.readEffectDispatchFence(effectIntentId);
+        if (fence?.hostBootId !== this.database.hostBootId) continue;
+        try {
+          await this.fileMutations.recoverDispatchedAndReconcile(effectIntentId);
+        } catch (error) {
+          failed += 1;
+          this.diagnosticObserver?.observe({
+            eventKind: 'recovery.scan.failed',
+            scopeKind: 'runtime',
+            correlationId: effectIntentId,
+            metadata: {
+              kind: 'runtime-dispatched-file-mutation-convergence',
+              status: 'failed',
+              hostBootId: this.database.hostBootId,
+              errorName: safeErrorName(error)
+            }
+          });
+        }
+      }
+      const convergence = await this.phaseDRecovery.reconcileCommittedFacts();
+      failed += convergence.failed;
+    } catch (error) {
+      failed += 1;
+      this.diagnosticObserver?.observe({
+        eventKind: 'recovery.scan.failed',
+        scopeKind: 'runtime',
+        correlationId: this.database.hostBootId,
+        metadata: {
+          kind: 'runtime-convergence',
+          status: 'failed',
+          hostBootId: this.database.hostBootId,
+          errorName: safeErrorName(error)
+        }
+      });
+    }
+    if (failed > 0 && !this.convergenceClosed) {
+      this.convergenceRetryDelayMs = Math.min(
+        this.convergenceRetryDelayMs > 0 ? this.convergenceRetryDelayMs * 2 : 100,
+        2_000
+      );
+      this.convergenceRequested = true;
+    } else {
+      this.convergenceRetryDelayMs = 0;
+    }
   }
 
   public beginHandoff(

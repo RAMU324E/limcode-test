@@ -1,3 +1,9 @@
+import type { InlineDataPart } from '../../shared/protocol';
+import {
+  AttachmentAdmissionError,
+  type AttachmentIngestService,
+  type PreparedAttachmentAdmission
+} from './attachmentIngest';
 import { createHash } from 'node:crypto';
 import {
   ContentAddressedStore,
@@ -13,7 +19,11 @@ import {
 import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { currentExecutionLeaseFence, runWithoutExecutionLeaseFence } from './executionLeaseFence';
+import {
+  currentExecutionLeaseFence,
+  runWithoutExecutionLeaseFence,
+  type ExecutionLeaseFence
+} from './executionLeaseFence';
 
 export type PhaseDSourceKind = 'command' | 'callback' | 'internal' | 'recovery';
 export type PhaseDEffectKind =
@@ -203,6 +213,11 @@ interface CommandCommit {
   allocatedSequences: ReadonlyArray<{ domain: string; id: string; column: string; value: string }>;
 }
 
+/** Proof that the caller already performed the source-key duplicate read for this command. */
+interface CommandReceiptPreflight {
+  receipt: DomainRow | null;
+}
+
 const ACTIVE_TURN = 'active';
 const TERMINAL_TURN = 'terminated';
 const EFFECT_KINDS: readonly PhaseDEffectKind[] = [
@@ -232,6 +247,7 @@ const TERMINAL_OPERATION_STATUSES: readonly ToolOutcomeStatus[] = [
 export class EffectControlPlane {
   private readonly now: () => string;
   private readonly onDiagnostic: (diagnostic: PhaseDDiagnostic) => void;
+  private readonly attachments?: AttachmentIngestService;
   private readonly finalizationFlights = new Map<string, {
     rerun: boolean;
     promise: Promise<ToolTerminalResult[]>;
@@ -240,9 +256,14 @@ export class EffectControlPlane {
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore,
-    options: { now?: () => string; onDiagnostic?: (diagnostic: PhaseDDiagnostic) => void } = {}
+    options: {
+      now?: () => string;
+      onDiagnostic?: (diagnostic: PhaseDDiagnostic) => void;
+      attachments?: AttachmentIngestService;
+    } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.attachments = options.attachments;
     this.onDiagnostic = options.onDiagnostic ?? ((diagnostic) => {
       console.warn('[reliable-kernel]', JSON.stringify(diagnostic));
     });
@@ -277,6 +298,7 @@ export class EffectControlPlane {
       receiptId,
       conversationId: turnContext.conversation.id as string,
       turnId,
+      receiptPreflight: { receipt: duplicate ?? null },
       steps: [
         DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: ACTIVE_TURN }),
         DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(turnContext.lease.id as string, {
@@ -360,17 +382,23 @@ export class EffectControlPlane {
       throw new Error(`ModelRequest ${modelRequestId} is not linked to assistant Message ${messageId}.`);
     }
 
-    const preparedEntries = await Promise.all(entries.map(async (entry) => ({
+    const argumentContents = await this.contentStore.prepareBatch(
+      this.database,
+      entries.map((entry) => ({
+        content: canonicalJson(entry.arguments),
+        contentType: 'application/vnd.limcode.tool-arguments+json'
+      }))
+    );
+    if (argumentContents.length !== entries.length) {
+      throw new Error('ToolCall batch argument prepare returned the wrong result count.');
+    }
+    const preparedEntries = entries.map((entry, index) => ({
       entry,
       executionId: stablePhaseDId('tool_execution', entry.toolCallId),
       sourceLinkId: stablePhaseDId('tool_call_source_link', entry.toolCallId),
       policySnapshotId: stablePhaseDId('tool_call_policy_snapshot', entry.toolCallId),
-      argumentsContent: await this.contentStore.prepare(
-        this.database,
-        canonicalJson(entry.arguments),
-        'application/vnd.limcode.tool-arguments+json'
-      )
-    })));
+      argumentsContent: argumentContents[index]
+    }));
     const now = this.timestamp();
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: ACTIVE_TURN }),
@@ -454,6 +482,7 @@ export class EffectControlPlane {
       receiptId,
       conversationId: turnContext.conversation.id as string,
       turnId,
+      receiptPreflight: { receipt: duplicate ?? null },
       steps
     });
     if (committed.deduplicated) {
@@ -502,6 +531,7 @@ export class EffectControlPlane {
       receiptId,
       conversationId: facts.conversation.id as string,
       turnId: facts.turn.id as string,
+      receiptPreflight: { receipt: duplicate ?? null },
       steps: [
         DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: ACTIVE_TURN }),
         DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
@@ -567,6 +597,7 @@ export class EffectControlPlane {
       receiptId,
       conversationId: facts.conversation.id as string,
       turnId: facts.turn.id as string,
+      receiptPreflight: { receipt: duplicate ?? null },
       steps: [
         DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: ACTIVE_TURN }),
         DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
@@ -735,13 +766,29 @@ export class EffectControlPlane {
     if (intent.dispatch_state !== 'pending' && !duplicate) return null;
     if (!duplicate) {
       const now = this.timestamp();
+      const resultContent = await this.contentStore.prepare(
+        this.database,
+        canonicalJson({ toolCallId, status: 'cancelled', detail: input.detail }),
+        'application/vnd.limcode.tool-result-artifact+json'
+      );
+      const ownerCancellationSteps: RepositoryTransactionStep[] = [];
+      if (intent.effect_kind === 'file_mutation' && operation.owner_kind === 'file_change_set') {
+        ownerCancellationSteps.push(
+          DOMAIN_REPOSITORIES.domain('FileChangeSet').update(requireId(operation.owner_id, 'Operation.owner_id'), {
+            status: 'cancelled',
+            updated_at: now
+          })
+        );
+      }
       try {
         await this.commitSource({
           source,
           receiptId,
           conversationId: requireId(facts.conversation.id, 'Conversation.id'),
           turnId: requireId(facts.turn.id, 'Turn.id'),
+          receiptPreflight: { receipt: duplicate ?? null },
           steps: [
+            ...preparedContentSteps([resultContent], 'effect_cancel_before_dispatch'),
             DOMAIN_REPOSITORIES.domain('EffectIntent').assert(effectIntentId, { dispatch_state: 'pending' }),
             DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(attempt.id, 'Attempt.id'), { status: 'pending' }),
             DOMAIN_REPOSITORIES.domain('Operation').assert(requireId(operation.id, 'Operation.id'), { status: 'pending' }),
@@ -757,7 +804,15 @@ export class EffectControlPlane {
             DOMAIN_REPOSITORIES.domain('Operation').update(requireId(operation.id, 'Operation.id'), {
               status: 'cancelled',
               updated_at: now
-            })
+            }),
+            DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+              id: stablePhaseDId('tool_result_artifact', `cancel-before-dispatch:${toolCallId}`),
+              tool_call_id: toolCallId,
+              role: 'no_effect_result',
+              content_object_id: resultContent.metadata.id,
+              created_at: now
+            }),
+            ...ownerCancellationSteps
           ]
         });
       } catch (error) {
@@ -834,16 +889,25 @@ export class EffectControlPlane {
         receiptId: sourceReceipt,
         conversationId: turn ? requireId(turn.conversation_id, 'Turn.conversation_id') : null,
         turnId: turn?.id as string ?? null,
+        receiptPreflight: { receipt: duplicateSource ?? null },
         steps: []
       });
       this.logDeduplicatedReceipt(existingRows[0], outcome, source);
       return this.effectReceiptResult(existingRows[0], committed.receipt, true, toolCall);
     }
-    const detail = input.detail === undefined
+    const detailAdmission = input.detail === undefined
+      ? undefined
+      : this.attachments
+        ? await this.attachments.prepareValueAttachments(
+            input.detail,
+            `EffectReceipt ${effectKind}/${attemptId}`
+          )
+        : { value: input.detail, attachments: [], storageSteps: [], totalBytes: 0 };
+    const detail = detailAdmission === undefined
       ? undefined
       : await this.contentStore.prepare(
           this.database,
-          canonicalJson(input.detail),
+          canonicalJson(detailAdmission.value),
           `application/vnd.limcode.effect-${effectKind}-receipt+json`
         );
     const now = this.timestamp();
@@ -853,7 +917,9 @@ export class EffectControlPlane {
         receiptId: sourceReceipt,
         conversationId: turn ? requireId(turn.conversation_id, 'Turn.conversation_id') : null,
         turnId: turn?.id as string ?? null,
+        receiptPreflight: { receipt: duplicateSource ?? null },
         steps: [
+          ...(detailAdmission?.storageSteps ?? []),
           ...(detail ? preparedContentSteps([detail], 'effect_receipt') : []),
           DOMAIN_REPOSITORIES.domain('EffectReceipt').insert({
             id: receiptId,
@@ -892,6 +958,7 @@ export class EffectControlPlane {
         receiptId: sourceReceipt,
         conversationId: turn ? requireId(turn.conversation_id, 'Turn.conversation_id') : null,
         turnId: turn?.id as string ?? null,
+        receiptPreflight: { receipt: duplicateSource ?? null },
         steps: []
       });
       this.logDeduplicatedReceipt(raced, outcome, source);
@@ -933,6 +1000,7 @@ export class EffectControlPlane {
         receiptId: sourceReceipt,
         conversationId: turn.conversation_id as string,
         turnId,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
       return existingOutcome
@@ -972,6 +1040,7 @@ export class EffectControlPlane {
         receiptId: sourceReceipt,
         conversationId: facts.conversation.id as string,
         turnId,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps
       });
     } catch (error) {
@@ -983,6 +1052,7 @@ export class EffectControlPlane {
         receiptId: sourceReceipt,
         conversationId: facts.conversation.id as string,
         turnId,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
     }
@@ -1002,14 +1072,20 @@ export class EffectControlPlane {
     const source = normalizeSource(input.source, ['internal', 'recovery'], 'tool-model-detail-record');
     const toolCallId = requireId(input.toolCallId, 'toolCallId');
     const status = requireToolOutcome(input.status);
-    const scope = canonicalJson({ toolCallId, status, detail: input.detail });
+    // The source identity represents the one model response slot, not a mutable observation of
+    // live output. Recovery must be able to reuse the first committed artifact after output grows.
+    const scope = canonicalJson({ toolCallId, status });
     const receiptId = sourceReceiptId(source, 'tool-model-detail-record', scope);
     const duplicate = await this.findSourceReceipt(source);
     if (duplicate) {
       assertSourceReceipt(duplicate, receiptId, 'tool-model-detail-record');
       const facts = await this.requireToolFacts(toolCallId, false);
       await this.finalizeReadyInOrder(facts.turn.id as string);
-      return await this.readTerminalResult(toolCallId, true, duplicate.id as string);
+      const terminal = await this.readTerminalResult(toolCallId, true, duplicate.id as string);
+      if (!terminal) {
+        throw new Error(`ToolCall ${toolCallId} model detail source receipt has no terminal result.`);
+      }
+      return terminal;
     }
     const facts = await this.requireToolFacts(toolCallId, true);
     const existingTerminal = await this.readTerminalResult(toolCallId, true);
@@ -1019,6 +1095,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: facts.conversation.id as string,
         turnId: facts.turn.id as string,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
       return { ...existingTerminal, receiptId: committed.receipt.id as string };
@@ -1032,8 +1109,25 @@ export class EffectControlPlane {
       throw new Error(`ToolCall ${toolCallId} model detail status ${status} does not match Operation status ${aggregate}.`);
     }
     const existingArtifacts = await this.list('ToolResultArtifact', { tool_call_id: toolCallId, role: 'model_response' }, 2);
-    if (existingArtifacts.length > 0) {
-      throw new Error(`ToolCall ${toolCallId} already has a model_response artifact without its source receipt.`);
+    if (existingArtifacts.length > 1) {
+      throw new Error(`ToolCall ${toolCallId} has multiple model_response artifacts.`);
+    }
+    if (existingArtifacts.length === 1) {
+      const ready = await this.readReadyToolOutcome(toolCallId, operations);
+      if (!ready || ready.status !== status) {
+        throw new Error(`ToolCall ${toolCallId} existing model_response artifact is inconsistent.`);
+      }
+      const committed = await this.commitSource({
+        source,
+        receiptId,
+        conversationId: facts.conversation.id as string,
+        turnId: facts.turn.id as string,
+        receiptPreflight: { receipt: duplicate ?? null },
+        steps: []
+      });
+      const finalized = await this.finalizeReadyInOrder(facts.turn.id as string);
+      return finalized.find((entry) => entry.toolCallId === toolCallId)
+        ?? await this.readTerminalResult(toolCallId, true, committed.receipt.id as string);
     }
     const content = await this.contentStore.prepare(
       this.database,
@@ -1048,6 +1142,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: facts.conversation.id as string,
         turnId: facts.turn.id as string,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: [
           DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: ACTIVE_TURN }),
           DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
@@ -1076,12 +1171,41 @@ export class EffectControlPlane {
         receiptId,
         conversationId: facts.conversation.id as string,
         turnId: facts.turn.id as string,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
     }
     const finalized = await this.finalizeReadyInOrder(facts.turn.id as string);
     return finalized.find((entry) => entry.toolCallId === toolCallId)
       ?? await this.readTerminalResult(toolCallId, committed.deduplicated, committed.receipt.id as string);
+  }
+
+  /**
+   * Last-mile closure for interruption/recovery after every effect Operation is already durable.
+   * It preserves the aggregate observed status and supplies only a bounded missing-detail marker;
+   * it never reclassifies a successful external effect as failed or cancelled.
+   */
+  public async finalizeTerminalOperationsWithFallback(input: {
+    source: PhaseDCommandSource;
+    toolCallId: string;
+    detail: unknown;
+  }): Promise<ToolTerminalResult | null> {
+    const toolCallId = requireId(input.toolCallId, 'toolCallId');
+    const existing = await this.readTerminalResult(toolCallId, false);
+    if (existing) return existing;
+    const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
+    if (operations.length === 0 || operations.some((operation) => !isTerminalOperationStatus(operation.status))) {
+      return null;
+    }
+    // process_start requires its effect-specific stable handoff detail (especially processId).
+    // A generic interruption marker must never win the immutable model_response slot.
+    if (await this.operationsRequireModelResponse(operations)) return null;
+    return this.recordToolModelDetail({
+      source: input.source,
+      toolCallId,
+      status: aggregateOperationOutcomes(operations.map((operation) => operation.status as ToolOutcomeStatus)),
+      detail: input.detail
+    });
   }
 
   /** Completes a Process-owned observation Operation that intentionally has no ToolCall result. */
@@ -1112,6 +1236,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: null,
         turnId: null,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
       return { receiptId: committed.receipt.id as string, deduplicated: committed.deduplicated, commitSeq: committed.commitSeq };
@@ -1123,6 +1248,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: null,
         turnId: null,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: [
           DOMAIN_REPOSITORIES.domain('Attempt').assert(attempt.id as string, { status: attempt.status }),
           DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: operation.status }),
@@ -1148,6 +1274,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: null,
         turnId: null,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
       return { receiptId: committed.receipt.id as string, deduplicated: true, commitSeq: committed.commitSeq };
@@ -1171,14 +1298,17 @@ export class EffectControlPlane {
       assertSourceReceipt(duplicate, receiptId, 'tool-settle-without-effect');
       const facts = await this.requireToolFacts(toolCallId, false);
       if (options.finalize !== false) await this.finalizeReadyInOrder(facts.turn.id as string);
+      const replayTerminal = options.finalize === false
+        ? undefined
+        : await this.readTerminalResult(toolCallId, true, duplicate.id as string) ?? undefined;
+      const replayStatus = replayTerminal?.status
+        ?? await this.persistedToolOperationStatus(toolCallId, status);
       return this.settlementResult(
         duplicate.id as string,
         toolCallId,
-        status,
+        replayStatus,
         true,
-        options.finalize === false
-          ? undefined
-          : await this.readTerminalResult(toolCallId, true, duplicate.id as string) ?? undefined
+        replayTerminal
       );
     }
 
@@ -1190,6 +1320,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: facts.conversation.id as string,
         turnId: facts.turn.id as string,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
       return this.settlementResult(
@@ -1206,6 +1337,7 @@ export class EffectControlPlane {
       throw new Error(`ToolCall ${toolCallId} has a non-terminal Operation and cannot use no-effect settlement.`);
     }
     const now = this.timestamp();
+    let settledStatus = status;
     let steps: RepositoryTransactionStep[] = [];
     if (operations.length === 0) {
       if (facts.toolCall.status !== 'pending' || facts.execution.status !== 'pending') {
@@ -1214,9 +1346,15 @@ export class EffectControlPlane {
       if ((await this.list('FileChangeSet', { tool_call_id: toolCallId }, 1)).length > 0) {
         throw new Error(`ToolCall ${toolCallId} has a FileChangeSet and cannot bypass its decision path.`);
       }
+      const preparedAttachment = await this.prepareToolResultAdmission(
+        input.detail,
+        `Tool ${toolCallId} result`
+      );
+      const attachmentAdmission = preparedAttachment.admission;
+      settledStatus = preparedAttachment.statusOverride ?? status;
       const content = await this.contentStore.prepare(
         this.database,
-        canonicalJson({ toolCallId, status, detail: input.detail }),
+        canonicalJson({ toolCallId, status: settledStatus, detail: attachmentAdmission.value }),
         'application/vnd.limcode.tool-result-artifact+json'
       );
       const operationId = stablePhaseDId('operation', `no-effect:${toolCallId}`);
@@ -1229,13 +1367,14 @@ export class EffectControlPlane {
         }),
         DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'pending' }),
         DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'pending' }),
+        ...attachmentAdmission.storageSteps,
         ...preparedContentSteps([content], 'tool_result_artifact'),
         DOMAIN_REPOSITORIES.domain('Operation').insertWithNextSequence({
           id: operationId,
           owner_kind: 'tool_execution',
           owner_id: facts.execution.id,
           tool_call_id: toolCallId,
-          status,
+          status: settledStatus,
           created_at: now,
           updated_at: now
         }, {
@@ -1264,6 +1403,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: facts.conversation.id as string,
         turnId: facts.turn.id as string,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps
       });
     } catch (error) {
@@ -1289,6 +1429,7 @@ export class EffectControlPlane {
         receiptId,
         conversationId: facts.conversation.id as string,
         turnId: facts.turn.id as string,
+        receiptPreflight: { receipt: duplicate ?? null },
         steps: []
       });
     }
@@ -1299,10 +1440,12 @@ export class EffectControlPlane {
       ? undefined
       : finalized.find((entry) => entry.toolCallId === toolCallId)
         ?? await this.readTerminalResult(toolCallId, committed.deduplicated, committed.receipt.id as string);
+    const persistedStatus = terminal?.status
+      ?? await this.persistedToolOperationStatus(toolCallId, settledStatus);
     return this.settlementResult(
       committed.receipt.id as string,
       toolCallId,
-      terminal?.status ?? status,
+      persistedStatus,
       committed.deduplicated,
       terminal ? { ...terminal, receiptId: committed.receipt.id as string } : undefined,
       committed.commitSeq
@@ -1376,14 +1519,29 @@ export class EffectControlPlane {
       return Promise.all(normalized.map((entry) => this.settleWithoutEffect(entry, { finalize: false })));
     }
 
+    const preparedAttachments = await Promise.all(facts.map(({ entry }) =>
+      this.prepareToolResultAdmission(entry.detail, `Tool ${entry.toolCallId} result`)
+    ));
+    const effectiveFacts = facts.map((fact, index) => ({
+      ...fact,
+      entry: {
+        ...fact.entry,
+        status: preparedAttachments[index].statusOverride ?? fact.entry.status
+      }
+    }));
+    const attachmentAdmissions = preparedAttachments.map((prepared) => prepared.admission);
     const preparedContents = await this.contentStore.prepareBatch(
       this.database,
-      facts.map(({ entry }) => ({
-        content: canonicalJson({ toolCallId: entry.toolCallId, status: entry.status, detail: entry.detail }),
+      effectiveFacts.map(({ entry }, index) => ({
+        content: canonicalJson({
+          toolCallId: entry.toolCallId,
+          status: entry.status,
+          detail: attachmentAdmissions[index].value
+        }),
         contentType: 'application/vnd.limcode.tool-result-artifact+json'
       }))
     );
-    const prepared = facts.map(({ entry }, index) => ({ entry, content: preparedContents[index] }));
+    const prepared = effectiveFacts.map(({ entry }, index) => ({ entry, content: preparedContents[index] }));
     const now = this.timestamp();
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: ACTIVE_TURN }),
@@ -1391,10 +1549,11 @@ export class EffectControlPlane {
         conversation_id: context.conversation.id,
         turn_id: turnId
       }),
+      ...attachmentAdmissions.flatMap((entry) => entry.storageSteps),
       ...preparedContentSteps(prepared.map((entry) => entry.content), 'tool_result_artifact_batch')
     ];
-    for (let index = 0; index < facts.length; index += 1) {
-      const { entry, executions } = facts[index];
+    for (let index = 0; index < effectiveFacts.length; index += 1) {
+      const { entry, executions } = effectiveFacts[index];
       const execution = executions[0];
       steps.push(
         DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
@@ -1448,7 +1607,7 @@ export class EffectControlPlane {
       ])) throw error;
       return Promise.all(normalized.map((entry) => this.settleWithoutEffect(entry, { finalize: false })));
     }
-    return normalized.map((entry) => this.settlementResult(
+    return effectiveFacts.map(({ entry }) => this.settlementResult(
       entry.receiptId,
       entry.toolCallId,
       entry.status,
@@ -1465,7 +1624,7 @@ export class EffectControlPlane {
     detail: unknown,
     receiptId = stablePhaseDId('command_receipt', `tool-finalize:${toolCallIdInput}`),
     plannedPredecessors: ReadonlySet<string> = new Set(),
-    options: { requireLease?: boolean } = {}
+    options: { requireLease?: boolean; attachmentsFrozen?: boolean } = {}
   ): Promise<ToolTerminalPlan> {
     const toolCallId = requireId(toolCallIdInput, 'toolCallId');
     const status = requireToolOutcome(statusInput);
@@ -1475,18 +1634,24 @@ export class EffectControlPlane {
     const facts = await this.requireToolFacts(toolCallId, requireLease);
     await this.assertCallIsNextForModelResult(facts.toolCall, plannedPredecessors);
     const now = this.timestamp();
+    const ids = terminalIds(toolCallId);
+    const attachmentAdmission = this.attachments
+      ? options.attachmentsFrozen
+        ? await this.attachments.prepareFrozenValueAttachments(detail, `Tool ${toolCallId} terminal result`)
+        : await this.attachments.prepareValueAttachments(detail, `Tool ${toolCallId} terminal result`)
+      : { value: detail, attachments: [], storageSteps: [], totalBytes: 0 };
     const content = await this.contentStore.prepare(
       this.database,
-      canonicalJson({ toolCallId, status, detail }),
+      canonicalJson({ toolCallId, status, detail: attachmentAdmission.value }),
       'application/vnd.limcode.tool-model-result+json'
     );
-    const ids = terminalIds(toolCallId);
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: ACTIVE_TURN }),
       ...(requireLease ? [DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
         conversation_id: facts.conversation.id,
         turn_id: facts.turn.id
       })] : []),
+      ...attachmentAdmission.storageSteps,
       ...preparedContentSteps([content], 'tool_result'),
       DOMAIN_REPOSITORIES.domain('ToolOutcome').insert({
         id: ids.toolOutcomeId,
@@ -1509,6 +1674,9 @@ export class EffectControlPlane {
         content_object_id: content.metadata.id,
         created_at: now
       }),
+      ...(this.attachments
+        ? this.attachments.linkSteps(attachmentAdmission, ids.messageRevisionId, now)
+        : []),
       DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
         id: ids.currentRevisionLinkId,
         message_id: ids.messageId,
@@ -1606,7 +1774,14 @@ export class EffectControlPlane {
       const { status, detail } = ready;
       const source: PhaseDCommandSource = { kind: 'internal', key: `tool-finalize:${toolCallId}` };
       const receiptId = sourceReceiptId(source, 'tool-finalize', toolCallId);
-      const plan = await this.prepareTerminalPlan(toolCallId, status, detail, receiptId);
+      const plan = await this.prepareTerminalPlan(
+        toolCallId,
+        status,
+        detail,
+        receiptId,
+        new Set(),
+        { attachmentsFrozen: true }
+      );
       const facts = await this.requireToolFacts(toolCallId, true);
       try {
         const committed = await this.commitSource({
@@ -1725,10 +1900,17 @@ export class EffectControlPlane {
       return { ...facts, toolCallId, status, detail: body.detail };
     }));
     const context = await this.requireActiveTurnContext(turnId);
+    const attachmentAdmissions = await Promise.all(ready.map((entry) => this.attachments
+      ? this.attachments.prepareFrozenValueAttachments(entry.detail, `Tool ${entry.toolCallId} terminal result`)
+      : Promise.resolve({ value: entry.detail, attachments: [], storageSteps: [], totalBytes: 0 })));
     const prepared = await this.contentStore.prepareBatch(
       this.database,
-      ready.map((entry) => ({
-        content: canonicalJson({ toolCallId: entry.toolCallId, status: entry.status, detail: entry.detail }),
+      ready.map((entry, index) => ({
+        content: canonicalJson({
+          toolCallId: entry.toolCallId,
+          status: entry.status,
+          detail: attachmentAdmissions[index].value
+        }),
         contentType: 'application/vnd.limcode.tool-model-result+json'
       }))
     );
@@ -1739,6 +1921,7 @@ export class EffectControlPlane {
         conversation_id: context.conversation.id,
         turn_id: turnId
       }),
+      ...attachmentAdmissions.flatMap((entry) => entry.storageSteps),
       ...preparedContentSteps(prepared, 'tool_result_batch')
     ];
     const terminals = ready.map((entry, index) => {
@@ -1772,6 +1955,9 @@ export class EffectControlPlane {
           content_object_id: prepared[index].metadata.id,
           created_at: now
         }),
+        ...(this.attachments
+          ? this.attachments.linkSteps(attachmentAdmissions[index], ids.messageRevisionId, now)
+          : []),
         DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
           id: ids.currentRevisionLinkId,
           message_id: ids.messageId,
@@ -1843,26 +2029,110 @@ export class EffectControlPlane {
     receiptId?: string
   ): Promise<ToolTerminalResult | null> {
     const toolCallId = requireId(toolCallIdInput, 'toolCallId');
-    const outcome = await this.findToolOutcome(toolCallId);
-    if (!outcome) return null;
-    const modelRows = await this.list('ToolModelResult', { tool_call_id: toolCallId }, 2);
+    const terminal = (await this.readTerminalResults([toolCallId], deduplicated))[0] ?? null;
+    return terminal && receiptId
+      ? { ...terminal, receiptId: requireId(receiptId, 'CommandReceipt.id') }
+      : terminal;
+  }
+
+  /** Reads an ordered ToolCall slice through one SQLite snapshot barrier. */
+  public async readTerminalResults(
+    toolCallIdInputs: readonly string[],
+    deduplicated: boolean
+  ): Promise<Array<ToolTerminalResult | null>> {
+    const toolCallIds = toolCallIdInputs.map((value) => requireId(value, 'toolCallId'));
+    if (toolCallIds.length === 0) return [];
+    const identities = toolCallIds.map((toolCallId) => terminalIds(toolCallId));
+    const terminalSnapshot = await this.database.snapshot(toolCallIds.flatMap((toolCallId, index) => [
+      DOMAIN_REPOSITORIES.domain('ToolOutcome').list({ where: { tool_call_id: toolCallId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('ToolModelResult').list({ where: { tool_call_id: toolCallId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('MessageRevision').get(identities[index].messageRevisionId)
+    ]));
+    if (terminalSnapshot.snapshot.length !== toolCallIds.length * 3) {
+      throw new Error('Terminal ToolCall batch snapshot returned the wrong result count.');
+    }
+    return toolCallIds.map((toolCallId, index) => this.terminalResultFromSnapshot(
+      toolCallId,
+      identities[index],
+      deduplicated,
+      terminalSnapshot.snapshot[index * 3],
+      terminalSnapshot.snapshot[index * 3 + 1],
+      terminalSnapshot.snapshot[index * 3 + 2]
+    ));
+  }
+
+  private terminalResultFromSnapshot(
+    toolCallId: string,
+    ids: ReturnType<typeof terminalIds>,
+    deduplicated: boolean,
+    outcomeRows: DomainRow | DomainRow[] | null,
+    modelRows: DomainRow | DomainRow[] | null,
+    revision: DomainRow | DomainRow[] | null
+  ): ToolTerminalResult | null {
+    if (!Array.isArray(outcomeRows) || !Array.isArray(modelRows)) {
+      throw new TypeError('Terminal ToolCall snapshot shape is invalid.');
+    }
+    if (outcomeRows.length === 0) return null;
+    if (outcomeRows.length !== 1) {
+      throw new Error(`Terminal ToolCall ${toolCallId} must have exactly one ToolOutcome.`);
+    }
+    const outcome = outcomeRows[0];
     if (modelRows.length !== 1) throw new Error(`Terminal ToolCall ${toolCallId} must have exactly one ToolModelResult.`);
     const model = modelRows[0];
-    const revision = await this.requireExisting('MessageRevision', requireId(model.message_revision_id, 'ToolModelResult.message_revision_id'));
-    const ids = terminalIds(toolCallId);
     if (
       outcome.id !== ids.toolOutcomeId
+      || outcome.tool_call_id !== toolCallId
       || model.id !== ids.toolModelResultId
+      || model.tool_call_id !== toolCallId
+      || model.message_revision_id !== ids.messageRevisionId
+      || !revision
+      || Array.isArray(revision)
       || revision.id !== ids.messageRevisionId
       || revision.message_id !== ids.messageId
     ) throw new Error(`ToolCall ${toolCallId} terminal identity is inconsistent.`);
     return {
-      ...(receiptId ? { receiptId: requireId(receiptId, 'CommandReceipt.id') } : {}),
       toolCallId,
       ...ids,
       status: requireToolOutcome(outcome.status),
       deduplicated
     };
+  }
+
+  private async persistedToolOperationStatus(
+    toolCallId: string,
+    fallback: ToolOutcomeStatus
+  ): Promise<ToolOutcomeStatus> {
+    const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
+    if (operations.length === 1 && isTerminalOperationStatus(operations[0].status)) {
+      return requireToolOutcome(operations[0].status);
+    }
+    return fallback;
+  }
+
+  private async prepareToolResultAdmission(
+    detail: unknown,
+    label: string
+  ): Promise<{
+    admission: PreparedAttachmentAdmission;
+    statusOverride?: Extract<ToolOutcomeStatus, 'failed'>;
+  }> {
+    if (!this.attachments) {
+      return { admission: { value: detail, attachments: [], storageSteps: [], totalBytes: 0 } };
+    }
+    try {
+      return { admission: await this.attachments.prepareValueAttachments(detail, label) };
+    } catch (error) {
+      if (!(error instanceof AttachmentAdmissionError)) throw error;
+      const failure = {
+        ok: false,
+        kind: 'attachment-admission-failed',
+        error: (error instanceof Error ? error.message : String(error)).slice(0, 1000)
+      };
+      return {
+        admission: await this.attachments.prepareValueAttachments(failure, `${label} failure`),
+        statusOverride: 'failed'
+      };
+    }
   }
 
   private settlementResult(
@@ -1970,30 +2240,75 @@ export class EffectControlPlane {
   }
 
   private async requireToolFacts(toolCallId: string, requireLease: boolean): Promise<ToolFacts> {
-    const toolCall = await this.requireExisting('ToolCall', toolCallId);
-    const executions = await this.list('ToolExecution', { tool_call_id: toolCallId }, 2);
-    if (executions.length !== 1) throw new Error(`ToolCall ${toolCallId} must have exactly one ToolExecution.`);
-    const turn = await this.requireExisting('Turn', requireId(toolCall.turn_id, 'ToolCall.turn_id'));
-    const conversation = await this.requireExisting('Conversation', requireId(turn.conversation_id, 'Turn.conversation_id'));
-    const leases = await this.list('ExecutionLease', { turn_id: turn.id }, 2);
+    const compound = await this.database.toolFactsSnapshot(toolCallId);
+    const toolCall = requireSnapshotRow(compound.snapshot.toolCall, 'ToolCall', toolCallId);
+    const executions = requireSnapshotRows(compound.snapshot.executions, 'ToolExecution');
+    assertSingleToolExecution(toolCallId, executions);
+    const turnId = requireId(toolCall.turn_id, 'ToolCall.turn_id');
+    const turn = requireSnapshotRow(compound.snapshot.turn, 'Turn', turnId);
+    const leases = requireSnapshotRows(compound.snapshot.leases, 'ExecutionLease');
+    if (leases.length > 1) throw new Error(`Turn ${turnId} must not have multiple ExecutionLeases.`);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const conversation = requireSnapshotRow(compound.snapshot.conversation, 'Conversation', conversationId);
+    const lease = leases[0];
+    if (lease && (lease.turn_id !== turnId || lease.conversation_id !== conversationId)) {
+      throw new Error(`Turn ${turnId} ExecutionLease relationship is inconsistent.`);
+    }
+    const fence = currentExecutionLeaseFence();
+    // A same-Turn capability must match every captured generation fact. Coordinators may legally
+    // finalize a Child Turn while running under their own parent fence; those transactions retain
+    // both the automatic owning-fence assertion and the explicit target-lease assertions in the
+    // terminal plan, matching the pre-compound control-plane semantics.
+    if (fence?.turnId === turnId) {
+      if (conversationId !== fence.conversationId || !lease || lease.id !== fence.id) {
+        throw new Error(`ToolCall ${toolCallId} does not belong to its captured ExecutionLease scope.`);
+      }
+      assertExecutionLeaseIdentity(lease, fence);
+    }
     if (requireLease && (turn.status !== ACTIVE_TURN || leases.length !== 1)) {
       throw new Error(`ToolCall ${toolCallId} cannot write terminal facts without its active Turn ExecutionLease.`);
     }
-    return {
-      toolCall,
-      execution: executions[0],
-      turn,
-      lease: leases[0] ?? {},
-      conversation
-    };
+    return { toolCall, execution: executions[0], turn, lease: lease ?? {}, conversation };
   }
 
   private async requireActiveTurnContext(turnId: string): Promise<{ turn: DomainRow; lease: DomainRow; conversation: DomainRow }> {
-    const turn = await this.requireExisting('Turn', turnId);
+    const fence = currentExecutionLeaseFence();
+    if (fence) {
+      if (fence.turnId !== turnId) {
+        throw new Error(`Turn ${turnId} does not match captured ExecutionLease Turn ${fence.turnId}.`);
+      }
+      const snapshot = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').get(fence.id),
+        DOMAIN_REPOSITORIES.domain('Conversation').get(fence.conversationId)
+      ]);
+      const turn = requireSnapshotRow(snapshot.snapshot[0], 'Turn', turnId);
+      const lease = requireSnapshotRow(snapshot.snapshot[1], 'ExecutionLease', fence.id);
+      const conversation = requireSnapshotRow(snapshot.snapshot[2], 'Conversation', fence.conversationId);
+      if (turn.status !== ACTIVE_TURN) throw new Error(`Turn ${turnId} is not active.`);
+      if (turn.conversation_id !== fence.conversationId || conversation.id !== fence.conversationId) {
+        throw new Error(`Turn ${turnId} does not belong to its captured ExecutionLease Conversation.`);
+      }
+      assertExecutionLeaseIdentity(lease, fence);
+      return { turn, lease, conversation };
+    }
+
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { turn_id: turnId }, limit: 2 })
+    ]);
+    const turn = requireSnapshotRow(snapshot.snapshot[0], 'Turn', turnId);
+    const leases = requireSnapshotRows(snapshot.snapshot[1], 'ExecutionLease');
     if (turn.status !== ACTIVE_TURN) throw new Error(`Turn ${turnId} is not active.`);
-    const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leases.length !== 1) throw new Error(`Turn ${turnId} must have exactly one ExecutionLease.`);
-    const conversation = await this.requireExisting('Conversation', requireId(turn.conversation_id, 'Turn.conversation_id'));
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const conversationSnapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Conversation').get(conversationId)
+    ]);
+    const conversation = requireSnapshotRow(conversationSnapshot.snapshot[0], 'Conversation', conversationId);
+    if (leases[0].conversation_id !== conversationId || leases[0].turn_id !== turnId) {
+      throw new Error(`Turn ${turnId} ExecutionLease relationship is inconsistent.`);
+    }
     return { turn, lease: leases[0], conversation };
   }
 
@@ -2063,18 +2378,17 @@ export class EffectControlPlane {
         return { status, detail: body.detail };
       }
       if (await this.operationsRequireModelResponse(operations)) return null;
+      const operationDetails = await Promise.all(operations
+        .sort((left, right) => compareBigInt(left.operation_seq, right.operation_seq))
+        .map(async (operation) => ({
+          operationId: operation.id,
+          operationSeq: requireBigInt(operation.operation_seq, 'Operation.operation_seq').toString(),
+          status: operation.status,
+          ...(await this.readOperationObservation(operation))
+        })));
       return {
         status: aggregateOperationOutcomes(operations.map((operation) => operation.status as ToolOutcomeStatus)),
-        detail: {
-          operations: await Promise.all(operations
-            .sort((left, right) => compareBigInt(left.operation_seq, right.operation_seq))
-            .map(async (operation) => ({
-              operationId: operation.id,
-              operationSeq: requireBigInt(operation.operation_seq, 'Operation.operation_seq').toString(),
-              status: operation.status,
-              ...(await this.readOperationObservation(operation))
-            })))
-        }
+        detail: hoistOperationAttachmentParts(operationDetails)
       };
     }
     const changeSets = await this.list('FileChangeSet', { tool_call_id: toolCallId }, 2);
@@ -2205,8 +2519,11 @@ export class EffectControlPlane {
     conversationId: string | null;
     turnId: string | null;
     steps: RepositoryTransactionStep[];
+    receiptPreflight?: CommandReceiptPreflight;
   }): Promise<CommandCommit> {
-    const existing = await this.findSourceReceipt(options.source);
+    const existing = options.receiptPreflight
+      ? options.receiptPreflight.receipt ?? undefined
+      : await this.findSourceReceipt(options.source);
     if (existing) {
       assertSourceReceipt(existing, options.receiptId, 'Phase D command');
       return { receipt: existing, deduplicated: true, allocatedSequences: [] };
@@ -2283,6 +2600,47 @@ export class EffectControlPlane {
 
   private timestamp(): string {
     return requireText(this.now(), 'clock result');
+  }
+}
+
+function requireSnapshotRow(
+  value: DomainRow | DomainRow[] | null | undefined,
+  domain: string,
+  id: string
+): DomainRow {
+  if (!value || Array.isArray(value) || value.id !== id) {
+    throw new Error(`${domain} ${id} does not exist.`);
+  }
+  return value;
+}
+
+function requireSnapshotRows(
+  value: DomainRow | DomainRow[] | null | undefined,
+  domain: string
+): DomainRow[] {
+  if (!Array.isArray(value)) throw new TypeError(`${domain} list did not return rows.`);
+  return value;
+}
+
+function assertSingleToolExecution(toolCallId: string, executions: readonly DomainRow[]): void {
+  if (executions.length !== 1) {
+    throw new Error(`ToolCall ${toolCallId} must have exactly one ToolExecution.`);
+  }
+  if (executions[0].tool_call_id !== toolCallId) {
+    throw new Error(`ToolCall ${toolCallId} ToolExecution relationship is inconsistent.`);
+  }
+}
+
+function assertExecutionLeaseIdentity(lease: DomainRow, fence: ExecutionLeaseFence): void {
+  if (
+    lease.id !== fence.id
+    || lease.conversation_id !== fence.conversationId
+    || lease.turn_id !== fence.turnId
+    || lease.owner_id !== fence.ownerId
+    || lease.host_boot_id !== fence.hostBootId
+    || lease.generation !== fence.generation
+  ) {
+    throw new Error(`ExecutionLease ${fence.id} no longer matches its captured generation identity.`);
   }
 }
 
@@ -2575,6 +2933,49 @@ export function matchesExpectedUnique(
 function safeSavepointPrefix(value: string): string {
   const normalized = value.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^[^a-z]+/, '').slice(0, 40);
   return normalized || 'content';
+}
+
+function hoistOperationAttachmentParts(
+  operations: Array<Record<string, unknown>>
+): { operations: Array<Record<string, unknown>>; parts?: InlineDataPart[] } {
+  const parts: InlineDataPart[] = [];
+  const normalized = operations.map((operation) => {
+    const detail = plainRecord(operation.detail);
+    if (!detail || !Array.isArray(detail.parts)) return operation;
+    const attachmentParts = detail.parts.filter(isInlineDataPart);
+    if (attachmentParts.length === 0) return operation;
+    parts.push(...attachmentParts);
+    const remaining = detail.parts.filter((part) => !isInlineDataPart(part));
+    const { parts: _parts, ...detailWithoutParts } = detail;
+    return {
+      ...operation,
+      detail: remaining.length > 0
+        ? { ...detailWithoutParts, parts: remaining }
+        : detailWithoutParts
+    };
+  });
+  return {
+    operations: normalized,
+    ...(parts.length > 0 ? { parts } : {})
+  };
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function isInlineDataPart(value: unknown): value is InlineDataPart {
+  const record = plainRecord(value);
+  const inlineData = plainRecord(record?.inlineData);
+  return !!inlineData
+    && typeof inlineData.mimeType === 'string'
+    && (
+      typeof inlineData.attachmentId === 'string'
+      || typeof inlineData.data === 'string'
+      || typeof inlineData.sourcePath === 'string'
+    );
 }
 
 function compareBigInt(left: unknown, right: unknown): number {

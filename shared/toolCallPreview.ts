@@ -1,11 +1,12 @@
 import {
   EDIT_TOOL_NAME,
+  SUBMIT_AGENT_ANSWER_TOOL_NAME,
   SUBMIT_PLAN_TOOL_NAME,
   WRITE_TOOL_NAME,
   type ToolCallPreviewRecord
 } from './protocol';
 
-export type ToolCallPreviewKind = 'write' | 'edit' | 'command' | 'plan' | 'generic';
+export type ToolCallPreviewKind = 'write' | 'edit' | 'command' | 'plan' | 'agent_answer' | 'generic';
 export type ToolCallPreviewRenderMode = 'markdown' | 'text' | 'json';
 
 export interface ToolCallPreviewPresentation {
@@ -24,6 +25,7 @@ interface PartialJsonStringField {
 
 export type ToolCallPreviewFieldName =
   | 'path'
+  | 'title'
   | 'content'
   | 'plan'
   | 'command'
@@ -161,6 +163,18 @@ export function toolCallPreviewPresentation(preview: ToolCallPreviewRecord): Too
     };
   }
 
+  if (name === SUBMIT_AGENT_ANSWER_TOOL_NAME) {
+    const title = previewStringField(preview, 'title');
+    const content = stringFieldPreview(preview, 'content');
+    return {
+      kind: 'agent_answer',
+      title: '正在生成 Agent 回答',
+      ...(title ? { subject: title } : {}),
+      detail: previewDetail(preview),
+      ...(content ? { previewText: content, renderMode: 'markdown' as const } : {})
+    };
+  }
+
   if (name === WRITE_TOOL_NAME) {
     const content = stringFieldPreview(preview, 'content');
     return {
@@ -253,7 +267,7 @@ function editArgumentsPreview(preview: ToolCallPreviewRecord): string | undefine
 }
 
 const PREVIEW_FIELD_NAMES = new Set<ToolCallPreviewFieldName>([
-  'path', 'content', 'plan', 'command', 'explanation', 'oldContent', 'newContent'
+  'path', 'title', 'content', 'plan', 'command', 'explanation', 'oldContent', 'newContent'
 ]);
 
 function emptyIncrementalState(): ToolCallPreviewIncrementalState {

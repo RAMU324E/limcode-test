@@ -27,44 +27,73 @@ import {
   defaultLlmPromptCacheTtlForProvider
 } from '../../../shared/protocol';
 import { DEFAULT_LLM_BASE_URL } from '../llmProvider';
+import { isSettingsRevisionConflictError } from '../settingsRevisionConflict';
 import type { StoragePaths } from './paths';
 import { INDEX_FILE } from './constants';
-import { loadRecordStore, removeRecordStoreRecord, saveRecordStore } from './recordStore';
+import {
+  commitRecordStoreSnapshot,
+  loadRecordStoreSnapshot,
+  missingRecordStoreRevision,
+  type RecordStoreSnapshot
+} from './recordStore';
 
 const RECORD_KEY = 'config';
 const CONFIGS_DIR = 'llm-provider-configs';
 const DEFAULT_CONFIG_NAME = '默认渠道';
+const REVISION_SECTION = 'llmProviderConfigs';
 
-export async function loadLlmProviderConfigsSettings(paths: StoragePaths): Promise<{ settings: LlmProviderConfigsRecord; filePath: string }> {
-  const records = await loadRawLlmProviderConfigRecords(paths);
-  if (records.length > 0) {
-    return { settings: { configs: sortConfigs(records.map((record) => normalizeLlmProviderConfig(record))) }, filePath: configsIndexUri(paths).fsPath };
-  }
+export interface LlmProviderConfigsSettingsResult {
+  settings: LlmProviderConfigsRecord;
+  filePath: string;
+  revision: string;
+  previousSettings?: LlmProviderConfigsRecord;
+}
+
+export async function loadLlmProviderConfigsSettings(paths: StoragePaths): Promise<LlmProviderConfigsSettingsResult> {
+  const root = configsRootUri(paths);
+  const indexUri = configsIndexUri(paths);
+  const snapshot = await loadRecordStoreSnapshot<LlmProviderConfigRecord, typeof RECORD_KEY>(root, indexUri, RECORD_KEY);
+  if (snapshot && snapshot.records.length > 0) return providerSettingsFromSnapshot(indexUri, snapshot);
 
   const config = createDefaultLlmProviderConfig({ name: DEFAULT_CONFIG_NAME });
-  await writeLlmProviderConfigRecords(paths, [config]);
-  return { settings: { configs: [config] }, filePath: configsIndexUri(paths).fsPath };
+  try {
+    const initialized = await commitRecordStoreSnapshot(root, indexUri, [config], RECORD_KEY, (record) => record.name, {
+      expectedRevision: snapshot?.revision ?? missingRecordStoreRevision(indexUri),
+      section: REVISION_SECTION,
+      pruneMissing: true
+    });
+    return providerSettingsFromSnapshot(indexUri, initialized);
+  } catch (error) {
+    if (!isSettingsRevisionConflictError(error)) throw error;
+    const current = await loadRecordStoreSnapshot<LlmProviderConfigRecord, typeof RECORD_KEY>(root, indexUri, RECORD_KEY);
+    if (!current || current.records.length === 0) throw error;
+    return providerSettingsFromSnapshot(indexUri, current);
+  }
 }
 
 export async function saveLlmProviderConfigsSettings(
   paths: StoragePaths,
-  settings: Partial<LlmProviderConfigsRecord> | undefined
-): Promise<{ settings: LlmProviderConfigsRecord; filePath: string }> {
-  const previous = await loadLlmProviderConfigsSettings(paths);
+  settings: Partial<LlmProviderConfigsRecord> | undefined,
+  expectedRevision: string
+): Promise<LlmProviderConfigsSettingsResult> {
   const configs = normalizeConfigList(settings?.configs);
   if (configs.length === 0) {
     throw new Error('至少需要保留一个渠道配置。');
   }
 
-  const nextIds = new Set(configs.map((config) => config.id));
-  for (const previousConfig of previous.settings.configs) {
-    if (!nextIds.has(previousConfig.id)) {
-      await removeRecordStoreRecord(configsRootUri(paths), configsIndexUri(paths), previousConfig.id, RECORD_KEY);
-    }
-  }
-
-  await writeLlmProviderConfigRecords(paths, configs);
-  return loadLlmProviderConfigsSettings(paths);
+  const indexUri = configsIndexUri(paths);
+  const committed = await commitRecordStoreSnapshot(
+    configsRootUri(paths),
+    indexUri,
+    configs,
+    RECORD_KEY,
+    (record) => record.name,
+    { expectedRevision, section: REVISION_SECTION, pruneMissing: true }
+  );
+  return {
+    ...providerSettingsFromSnapshot(indexUri, committed),
+    previousSettings: providerSettingsFromRecords(committed.previousRecords)
+  };
 }
 
 export function createDefaultLlmProviderConfig(input: { name?: string } = {}): LlmProviderConfigRecord {
@@ -84,6 +113,7 @@ export function createDefaultLlmProviderConfig(input: { name?: string } = {}): L
     retryMaxAttempts: DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: true,
     contextWindowTokens: DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
+    systemPromptPrefix: '',
     promptCache: createDefaultLlmPromptCacheConfig('openai-compatible'),
     modelConfigs: [],
     createdAt: now,
@@ -119,6 +149,7 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
     retryMaxAttempts: finiteRetryMaxAttempts(input?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: typeof input?.enableMultimodalTools === 'boolean' ? input.enableMultimodalTools : true,
     contextWindowTokens,
+    systemPromptPrefix: normalizeSystemPromptPrefix(input?.systemPromptPrefix),
     promptCache,
     ...(headers ? { headers } : {}),
     ...(generationConfig ? { generationConfig } : {}),
@@ -138,23 +169,19 @@ function normalizeConfigList(input: LlmProviderConfigRecord[] | undefined): LlmP
   return sortConfigs([...byId.values()]);
 }
 
-async function loadRawLlmProviderConfigRecords(paths: StoragePaths): Promise<LlmProviderConfigRecord[]> {
-  const records = await loadRecordStore<LlmProviderConfigRecord, typeof RECORD_KEY>(
-    configsRootUri(paths),
-    configsIndexUri(paths),
-    RECORD_KEY
-  );
-  return records ?? [];
+function providerSettingsFromSnapshot(
+  indexUri: vscode.Uri,
+  snapshot: RecordStoreSnapshot<LlmProviderConfigRecord>
+): LlmProviderConfigsSettingsResult {
+  return {
+    settings: providerSettingsFromRecords(snapshot.records),
+    filePath: indexUri.fsPath,
+    revision: snapshot.revision
+  };
 }
 
-async function writeLlmProviderConfigRecords(paths: StoragePaths, records: LlmProviderConfigRecord[]): Promise<void> {
-  await saveRecordStore(
-    configsRootUri(paths),
-    configsIndexUri(paths),
-    sortConfigs(records.map((record) => normalizeLlmProviderConfig(record))),
-    RECORD_KEY,
-    (record) => record.name
-  );
+function providerSettingsFromRecords(records: LlmProviderConfigRecord[]): LlmProviderConfigsRecord {
+  return { configs: sortConfigs(records.map((record) => normalizeLlmProviderConfig(record))) };
 }
 
 function configsRootUri(paths: StoragePaths): vscode.Uri {
@@ -219,6 +246,7 @@ function normalizeModelConfigs(
       retryMaxAttempts: finiteRetryMaxAttempts(item.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
       enableMultimodalTools: typeof item.enableMultimodalTools === 'boolean' ? item.enableMultimodalTools : true,
       contextWindowTokens: finitePositiveInteger(item.contextWindowTokens) ?? providerDefaultContextWindow(provider),
+      systemPromptPrefix: normalizeSystemPromptPrefix(item.systemPromptPrefix),
       promptCache,
       ...(headers ? { headers } : {}),
       ...(generationConfig ? { generationConfig } : {}),
@@ -253,6 +281,11 @@ function normalizeOpenAIResponsesTransport(value: unknown): LlmOpenAIResponsesTr
 function stringOrDefault(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
+
+function normalizeSystemPromptPrefix(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
 function finiteTimestamp(value: unknown, fallback: number): number {
   const timestamp = Number(value);
   return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : fallback;

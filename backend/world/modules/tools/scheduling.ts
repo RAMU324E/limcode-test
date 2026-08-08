@@ -87,6 +87,7 @@ function isExecutionBlockingToolCall(world: WorldReader, entity: Entity): boolea
     || state.status === 'queued'
     || state.status === 'awaiting_approval'
     || state.status === 'awaiting_user_input'
+    || state.status === 'awaiting_child'
     || state.status === 'executing'
     || state.status === 'awaiting_change_apply'
     || state.status === 'applying_change'

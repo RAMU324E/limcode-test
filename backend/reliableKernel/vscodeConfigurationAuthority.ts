@@ -50,12 +50,18 @@ import {
 import { loadMcpServersSettings, saveMcpServersSettings } from '../capabilities/vscodeStorage/mcpServers';
 import {
   createGlobalSettingsRecord,
+  globalStatusFileUri,
+  globalStatusRevision,
   LIMCODE_GLOBAL_STATUS_LABEL,
-  saveGlobalStatus
+  loadCommittedGlobalStatus,
+  saveGlobalStatusExpected
 } from '../capabilities/vscodeStorage/globalStatus';
 import type { StoragePaths } from '../capabilities/vscodeStorage/paths';
 import { loadRecordStore } from '../capabilities/vscodeStorage/recordStore';
-import { createDefaultAgentBlueprints } from '../world/modules/agent/blueprints';
+import {
+  createDefaultAgentBlueprints
+} from '../world/modules/agent/blueprints';
+import { composeSystemInstruction, type SystemPromptTextPart } from '../world/modules/chat/systemPromptText';
 import { VscodeConfigurationMutations } from './vscodeConfigurationMutations';
 import type { AttachmentSettingsAuthority } from './attachmentIngest';
 import type {
@@ -218,10 +224,6 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       { scopeKind: 'workflow', scopeId: workflowId },
       (link) => link.systemPromptId
     ) : undefined;
-    const promptParts = systemPrompts
-      .filter((prompt) => prompt !== agentPrompt && prompt !== workflowPrompt)
-      .map((prompt) => prompt.text.trim())
-      .filter(Boolean);
     const globalPrompt = resolveRecordAtScope(
       records.systemPromptScopeLinks,
       records.systemPrompts,
@@ -229,11 +231,13 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       (link) => link.systemPromptId
     );
     const orderedPromptParts = [
-      globalPrompt?.text,
-      agentPrompt?.text ?? builtinAgent?.systemPrompt,
-      workflowPrompt?.text ?? builtinWorkflow?.systemPrompt,
-      ...promptParts.filter((part) => part !== globalPrompt?.text?.trim())
-    ].map((part) => part?.trim()).filter((part): part is string => !!part);
+      globalPrompt,
+      agentPrompt ?? builtinSystemPromptPart(builtinAgent?.systemPrompt),
+      workflowPrompt ?? builtinSystemPromptPart(builtinWorkflow?.systemPrompt),
+      ...systemPrompts.filter((prompt) =>
+        prompt !== globalPrompt && prompt !== agentPrompt && prompt !== workflowPrompt
+      )
+    ].filter((part): part is SystemPromptTextPart => !!part?.text.trim());
     const systemPrompt = systemPrompts[systemPrompts.length - 1];
     const runtimeContexts = resolveScopedRecords(
       records.runtimeContextScopeLinks,
@@ -249,6 +253,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       (link) => link.workEnvironmentPolicyId
     );
     const selectedModelConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId);
+    const systemPromptPrefix = selectedModelConfig?.systemPromptPrefix ?? provider.systemPromptPrefix;
     const contextWindow = resolveContextWindow(provider, modelId);
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
@@ -295,6 +300,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         provider: provider.provider,
         modelId,
         enableMultimodalTools,
+        systemPromptPrefix,
         retryPolicy: frozenProviderRetryPolicy(provider, modelId)
       },
       modelProfile: {
@@ -323,7 +329,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       },
       systemPrompt: {
         id: systemPrompt?.id ?? (builtinWorkflow ? `builtin-system-prompt:${workflow?.id}` : builtinAgent ? `builtin-system-prompt:${agentId}` : null),
-        text: orderedPromptParts.join('\n\n')
+        text: composeSystemInstruction(orderedPromptParts)
       },
       runtimeContext: {
         id: runtimeContext?.id ?? null,
@@ -449,24 +455,28 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     section: GlobalSettingsSection;
     settings: GlobalSettingsSectionValue;
     filePath: string;
+    revision: string;
   }> {
     if (section === 'common') {
       const context = this.requireContext();
+      const status = await loadCommittedGlobalStatus(context);
+      const settings = createGlobalSettingsRecord(context, status);
       return {
         section,
-        settings: createGlobalSettingsRecord(context),
-        filePath: LIMCODE_GLOBAL_STATUS_LABEL
+        settings,
+        filePath: globalStatusFileUri(context).fsPath || LIMCODE_GLOBAL_STATUS_LABEL,
+        revision: globalStatusRevision(status)
       };
     }
     const paths = this.getPaths();
     if (section === 'llm') return this.loadNormalizedLlmSettings(paths);
     if (section === 'llmProviderConfigs') {
       const stored = await loadLlmProviderConfigsSettings(paths);
-      return { section, settings: stored.settings, filePath: stored.filePath };
+      return { section, settings: stored.settings, filePath: stored.filePath, revision: stored.revision };
     }
     if (section === 'llmCompressionConfigs') {
       const stored = await loadLlmCompressionConfigsSettings(paths);
-      return { section, settings: stored.settings, filePath: stored.filePath };
+      return { section, settings: stored.settings, filePath: stored.filePath, revision: stored.revision };
     }
     if (section === 'llmCompression') {
       const configs = (await loadLlmCompressionConfigsSettings(paths)).settings.configs;
@@ -475,35 +485,48 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         stored.settings as Partial<LlmCompressionSettingsRecord> | undefined,
         configs
       );
-      if (JSON.stringify(settings) !== JSON.stringify(stored.settings)) {
-        await writeGlobalSettingsFile(paths.settingsRootUri, section, settings);
-      }
-      return { section, settings, filePath: stored.filePath };
+      return { section, settings, filePath: stored.filePath, revision: stored.revision };
     }
     if (section === 'mcpServers') {
       const stored = await loadMcpServersSettings(paths);
-      return { section, settings: stored.settings, filePath: stored.filePath };
+      return { section, settings: stored.settings, filePath: stored.filePath, revision: stored.revision };
     }
     return loadGlobalSettingsFile(paths.settingsRootUri, section);
   }
 
   public async saveGlobalSettings(
     section: GlobalSettingsSection,
-    settings: GlobalSettingsSectionValue
-  ): Promise<{ section: GlobalSettingsSection; settings: GlobalSettingsSectionValue; filePath: string }> {
+    settings: GlobalSettingsSectionValue,
+    expectedRevision: string
+  ): Promise<{
+    section: GlobalSettingsSection;
+    settings: GlobalSettingsSectionValue;
+    filePath: string;
+    revision: string;
+    previousSettings?: GlobalSettingsSectionValue;
+  }> {
     if (section === 'common') {
       const context = this.requireContext();
-      const current = createGlobalSettingsRecord(context);
+      const currentStatus = await loadCommittedGlobalStatus(context);
+      const current = createGlobalSettingsRecord(context, currentStatus);
       const input = settings as Partial<GlobalSettingsRecord>;
       const requestedDataRootPath = input.dataFilePath?.trim() ?? current.dataFilePath;
       if (requestedDataRootPath !== current.dataFilePath) {
         throw new Error('可靠 Runtime 运行期间不能切换 data root；请通过受控重置/切换命令并重载窗口。');
       }
-      await saveGlobalStatus(context, current.dataFilePath, input.proxy ?? current.proxy);
+      const committedStatus = await saveGlobalStatusExpected(
+        context,
+        current.dataFilePath,
+        input.proxy ?? current.proxy,
+        expectedRevision
+      );
+      const committed = createGlobalSettingsRecord(context, committedStatus.current);
       return {
         section,
-        settings: createGlobalSettingsRecord(context),
-        filePath: LIMCODE_GLOBAL_STATUS_LABEL
+        settings: committed,
+        filePath: globalStatusFileUri(context).fsPath || LIMCODE_GLOBAL_STATUS_LABEL,
+        revision: globalStatusRevision(committedStatus.current),
+        previousSettings: createGlobalSettingsRecord(context, committedStatus.previous)
       };
     }
     const paths = this.getPaths();
@@ -512,23 +535,24 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       const input = settings as Partial<LlmSettingsRecord>;
       const active = configs.find((config) => config.id === input.activeProviderConfigId) ?? configs[0];
       const normalized: LlmSettingsRecord = { activeProviderConfigId: active?.id ?? '' };
-      await writeGlobalSettingsFile(paths.settingsRootUri, section, normalized);
-      return this.loadNormalizedLlmSettings(paths);
+      return writeGlobalSettingsFile(paths.settingsRootUri, section, normalized, expectedRevision);
     }
     if (section === 'llmProviderConfigs') {
       const stored = await saveLlmProviderConfigsSettings(
         paths,
-        settings as Partial<LlmProviderConfigsRecord> | undefined
+        settings as Partial<LlmProviderConfigsRecord> | undefined,
+        expectedRevision
       );
       await this.loadNormalizedLlmSettings(paths);
-      return { section, settings: stored.settings, filePath: stored.filePath };
+      return { section, ...stored };
     }
     if (section === 'llmCompressionConfigs') {
       const stored = await saveLlmCompressionConfigsSettings(
         paths,
-        settings as Partial<LlmCompressionConfigsRecord> | undefined
+        settings as Partial<LlmCompressionConfigsRecord> | undefined,
+        expectedRevision
       );
-      return { section, settings: stored.settings, filePath: stored.filePath };
+      return { section, ...stored };
     }
     if (section === 'llmCompression') {
       const configs = (await loadLlmCompressionConfigsSettings(paths)).settings.configs;
@@ -536,34 +560,31 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         settings as Partial<LlmCompressionSettingsRecord> | undefined,
         configs
       );
-      await writeGlobalSettingsFile(paths.settingsRootUri, section, normalized);
-      return this.loadGlobalSettings(section);
+      return writeGlobalSettingsFile(paths.settingsRootUri, section, normalized, expectedRevision);
     }
     if (section === 'mcpServers') {
       const stored = await saveMcpServersSettings(
         paths,
-        settings as Partial<McpServersSettingsRecord> | undefined
+        settings as Partial<McpServersSettingsRecord> | undefined,
+        expectedRevision
       );
-      return { section, settings: stored.settings, filePath: stored.filePath };
+      return stored;
     }
-    await writeGlobalSettingsFile(paths.settingsRootUri, section, settings);
-    return this.loadGlobalSettings(section);
+    return writeGlobalSettingsFile(paths.settingsRootUri, section, settings, expectedRevision);
   }
 
   private async loadNormalizedLlmSettings(paths: StoragePaths): Promise<{
     section: 'llm';
     settings: LlmSettingsRecord;
     filePath: string;
+    revision: string;
   }> {
     const configs = (await loadLlmProviderConfigsSettings(paths)).settings.configs;
     const stored = await loadGlobalSettingsFile(paths.settingsRootUri, 'llm');
     const input = stored.settings as Partial<LlmSettingsRecord>;
     const active = configs.find((config) => config.id === input.activeProviderConfigId) ?? configs[0];
     const settings: LlmSettingsRecord = { activeProviderConfigId: active?.id ?? '' };
-    if (JSON.stringify(settings) !== JSON.stringify(stored.settings)) {
-      await writeGlobalSettingsFile(paths.settingsRootUri, 'llm', settings);
-    }
-    return { section: 'llm', settings, filePath: stored.filePath };
+    return { section: 'llm', settings, filePath: stored.filePath, revision: stored.revision };
   }
 
   private requireContext(): vscode.ExtensionContext {
@@ -988,6 +1009,10 @@ function providerContainsModel(provider: LlmProviderConfigRecord, modelId: strin
   return provider.model.trim() === modelId
     || provider.models.some((candidate) => candidate.id.trim() === modelId)
     || provider.modelConfigs.some((candidate) => candidate.modelId.trim() === modelId);
+}
+
+function builtinSystemPromptPart(text: string | undefined): SystemPromptTextPart | undefined {
+  return text?.trim() ? { text } : undefined;
 }
 
 function clonePlainRecord<T>(value: Record<string, T> | undefined): Record<string, T> {

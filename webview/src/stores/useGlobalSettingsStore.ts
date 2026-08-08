@@ -15,7 +15,9 @@ import {
   type CheckpointMaintenanceSettingsRecord,
   type GlobalSettingsRecord,
   type GlobalSettingsSection,
+  type GlobalSettingsSectionValue,
   type GlobalSettingsSnapshotPayload,
+  type GlobalSettingsUpdatePayload,
   type LlmGenerationConfigRecord,
   type LlmCompressionConfigRecord,
   type LlmCompressionConfigsRecord,
@@ -72,6 +74,13 @@ interface GlobalSettingsState {
   mcpServers: McpServersSettingsRecord;
   /** 各 section 的来源文件路径，用于在 UI 展示。 */
   filePaths: Partial<Record<GlobalSettingsSection, string>>;
+  /** 各 section 最近一次已确认内容的指纹。 */
+  revisions: Partial<Record<GlobalSettingsSection, string>>;
+  /** 已确认内容，用来判断本地表单是否还有未保存修改。 */
+  baselines: Partial<Record<GlobalSettingsSection, GlobalSettingsSectionValue>>;
+  /** 本窗口有未保存修改时，暂存其他窗口发来的新内容。 */
+  pendingExternalSnapshots: Partial<Record<GlobalSettingsSection, GlobalSettingsSnapshotPayload>>;
+  externalChangedSections: Partial<Record<GlobalSettingsSection, boolean>>;
   /** 等待 llmProviderConfigs 保存完成后再持久化的 active provider id，避免 active id 先于新配置到达后端。 */
   pendingActiveProviderConfigIdAfterConfigsSave: string;
   /** 克隆压缩配置后待 llmCompressionConfigs 保存确认再持久化压缩绑定，避免绑定先于新配置到达后端被丢弃。 */
@@ -91,6 +100,9 @@ interface GlobalSettingsState {
 interface GlobalSettingsErrorOptions {
   requestType?: string;
   section?: GlobalSettingsSection;
+  correlationId?: string;
+  code?: 'settings_revision_conflict';
+  actualRevision?: string;
 }
 
 function hasOutstandingSettingsWork(state: GlobalSettingsState): boolean {
@@ -189,6 +201,7 @@ function createDefaultProviderConfig(name = '新渠道配置', provider: LlmProv
     retryMaxAttempts: DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: true,
     contextWindowTokens: providerDefaultContextWindow(provider),
+    systemPromptPrefix: '',
     promptCache: providerDefaultPromptCache(provider),
     headers: {},
     generationConfig: {},
@@ -211,6 +224,7 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(config.provider),
+    systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, config.provider),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
@@ -260,6 +274,7 @@ function normalizeProviderConfigForUi(config: LlmProviderConfigRecord): LlmProvi
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider),
+    systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
@@ -312,6 +327,7 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider),
+    systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
@@ -351,6 +367,10 @@ function normalizeRetryMaxAttempts(value: unknown): number | undefined {
   const attempts = Math.floor(number);
   if (attempts < -1) return -1;
   return attempts;
+}
+
+function normalizeSystemPromptPrefix(value: unknown): string {
+  return typeof value === 'string' ? value : '';
 }
 
 
@@ -607,6 +627,7 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) } : {}),
+    systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: sanitizePromptCache(config.promptCache, config.provider),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
@@ -628,6 +649,7 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider) } : { contextWindowTokens: providerDefaultContextWindow(provider) }),
+    systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: sanitizePromptCache(config.promptCache, provider),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
@@ -742,27 +764,179 @@ function messageFromError(error: unknown): string {
 }
 
 function sameSerializableValue(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return JSON.stringify(canonicalSerializableValue(left)) === JSON.stringify(canonicalSerializableValue(right));
+}
+
+function canonicalSerializableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalSerializableValue);
+  if (isPlainJsonObject(value)) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalSerializableValue(value[key])])
+    );
+  }
+  return value;
+}
+
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function plainSettingsFromState(state: GlobalSettingsState, section: GlobalSettingsSection): GlobalSettingsSectionValue {
+  switch (section) {
+    case 'common':
+      return {
+        dataFilePath: state.common.dataFilePath,
+        proxy: state.common.proxy,
+        activeDataRootPath: state.common.activeDataRootPath,
+        defaultDataRootPath: state.common.defaultDataRootPath
+      };
+    case 'llm': return { activeProviderConfigId: state.llm.activeProviderConfigId };
+    case 'llmProviderConfigs': return { configs: state.llmProviderConfigs.configs.map(toPlainProviderConfig) };
+    case 'llmCompression': return toPlainCompressionSettings(state.llmCompression);
+    case 'llmCompressionConfigs': return { configs: state.llmCompressionConfigs.configs.map(toPlainCompressionConfig) };
+    case 'checkpointMaintenance': return { ...state.checkpointMaintenance };
+    case 'appearance': return { ...state.appearance };
+    case 'attachments': return { maxStoredInlineFileMb: state.attachments.maxStoredInlineFileMb };
+    case 'mcpServers': return { servers: state.mcpServers.servers.map(toPlainMcpServer) };
+  }
+}
+
+function cloneSettingsValue<T extends GlobalSettingsSectionValue>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+const MERGE_MISSING = Symbol('merge-missing');
+type MergeNodeValue = unknown | typeof MERGE_MISSING;
+
+function mergeSettingsThreeWay(
+  base: GlobalSettingsSectionValue,
+  local: GlobalSettingsSectionValue,
+  remote: GlobalSettingsSectionValue,
+  localWinsConflicts = false
+): { value: GlobalSettingsSectionValue; conflicts: string[] } {
+  const merged = mergeNode(base, local, remote, '$', localWinsConflicts);
+  return {
+    value: cloneSettingsValue(merged.value as GlobalSettingsSectionValue),
+    conflicts: merged.conflicts
+  };
+}
+
+function mergeNode(
+  base: MergeNodeValue,
+  local: MergeNodeValue,
+  remote: MergeNodeValue,
+  path: string,
+  localWinsConflicts: boolean
+): { value: MergeNodeValue; conflicts: string[] } {
+  if (sameMergeValue(local, remote)) return { value: cloneMergeValue(local), conflicts: [] };
+  if (sameMergeValue(local, base)) return { value: cloneMergeValue(remote), conflicts: [] };
+  if (sameMergeValue(remote, base)) return { value: cloneMergeValue(local), conflicts: [] };
+
+  if (Array.isArray(base) && Array.isArray(local) && Array.isArray(remote)) {
+    const keyed = mergeKeyedArrays(base, local, remote, path, localWinsConflicts);
+    if (keyed) return keyed;
+  }
+  if (isPlainJsonObject(base) && isPlainJsonObject(local) && isPlainJsonObject(remote)) {
+    const output: Record<string, unknown> = {};
+    const conflicts: string[] = [];
+    const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)]);
+    for (const key of [...keys].sort()) {
+      const child = mergeNode(
+        Object.prototype.hasOwnProperty.call(base, key) ? base[key] : MERGE_MISSING,
+        Object.prototype.hasOwnProperty.call(local, key) ? local[key] : MERGE_MISSING,
+        Object.prototype.hasOwnProperty.call(remote, key) ? remote[key] : MERGE_MISSING,
+        `${path}.${key}`,
+        localWinsConflicts
+      );
+      conflicts.push(...child.conflicts);
+      if (child.value !== MERGE_MISSING) output[key] = child.value;
+    }
+    return { value: output, conflicts };
+  }
+  return { value: cloneMergeValue(local), conflicts: localWinsConflicts ? [] : [path] };
+}
+
+function mergeKeyedArrays(
+  base: unknown[],
+  local: unknown[],
+  remote: unknown[],
+  path: string,
+  localWinsConflicts: boolean
+): { value: MergeNodeValue; conflicts: string[] } | undefined {
+  const baseMap = keyedArrayMap(base);
+  const localMap = keyedArrayMap(local);
+  const remoteMap = keyedArrayMap(remote);
+  if (!baseMap || !localMap || !remoteMap) return undefined;
+  const order = [...remoteMap.keys(), ...[...localMap.keys()].filter((key) => !remoteMap.has(key))];
+  const output: unknown[] = [];
+  const conflicts: string[] = [];
+  for (const key of order) {
+    const child = mergeNode(
+      baseMap.get(key) ?? MERGE_MISSING,
+      localMap.get(key) ?? MERGE_MISSING,
+      remoteMap.get(key) ?? MERGE_MISSING,
+      `${path}[${JSON.stringify(key)}]`,
+      localWinsConflicts
+    );
+    conflicts.push(...child.conflicts);
+    if (child.value !== MERGE_MISSING) output.push(child.value);
+  }
+  return { value: output, conflicts };
+}
+
+function keyedArrayMap(values: unknown[]): Map<string, unknown> | undefined {
+  if (values.length === 0) return new Map();
+  const result = new Map<string, unknown>();
+  for (const value of values) {
+    const key = mergeRecordKey(value);
+    if (!key || result.has(key)) return undefined;
+    result.set(key, value);
+  }
+  return result;
+}
+
+function mergeRecordKey(value: unknown): string | undefined {
+  if (!isPlainJsonObject(value)) return undefined;
+  if (typeof value.id === 'string' && value.id) return `id:${value.id}`;
+  if (typeof value.providerConfigId === 'string' && typeof value.modelId === 'string') {
+    return `provider-model:${value.providerConfigId}:${value.modelId}`;
+  }
+  if (typeof value.providerConfigId === 'string' && value.providerConfigId) return `provider:${value.providerConfigId}`;
+  return undefined;
+}
+
+function sameMergeValue(left: MergeNodeValue, right: MergeNodeValue): boolean {
+  if (left === MERGE_MISSING || right === MERGE_MISSING) return left === right;
+  return sameSerializableValue(left, right);
+}
+
+function cloneMergeValue(value: MergeNodeValue): MergeNodeValue {
+  if (value === MERGE_MISSING) return MERGE_MISSING;
+  return JSON.parse(JSON.stringify(value)) as unknown;
 }
 
 let modelFetchTimeout: number | undefined;
 const LLM_PROVIDER_CONFIGS_AUTOSAVE_DELAY_MS = 400;
 const LLM_COMPRESSION_CONFIGS_AUTOSAVE_DELAY_MS = 400;
 let llmProviderConfigsAutoSaveTimer: number | undefined;
-let llmProviderConfigsEditRevision = 0;
-const llmProviderConfigsSaveRequestRevisions = new Map<string, number>();
 let llmCompressionConfigsAutoSaveTimer: number | undefined;
-let llmCompressionConfigsEditRevision = 0;
-const llmCompressionConfigsSaveRequestRevisions = new Map<string, number>();
 
-function touchLlmProviderConfigsRevision(): number {
-  llmProviderConfigsEditRevision += 1;
-  return llmProviderConfigsEditRevision;
+type PendingGlobalSettingsUpdate = Omit<GlobalSettingsUpdatePayload, 'expectedRevision'>;
+interface SectionSaveAttempt { requestId: string; payload: PendingGlobalSettingsUpdate }
+interface SectionSaveCoordinator {
+  inFlight?: SectionSaveAttempt;
+  queued?: PendingGlobalSettingsUpdate;
+  awaitingConflictSnapshot?: boolean;
 }
+const sectionSaveCoordinators = new Map<GlobalSettingsSection, SectionSaveCoordinator>();
 
-function touchLlmCompressionConfigsRevision(): number {
-  llmCompressionConfigsEditRevision += 1;
-  return llmCompressionConfigsEditRevision;
+function coordinatorFor(section: GlobalSettingsSection): SectionSaveCoordinator {
+  let coordinator = sectionSaveCoordinators.get(section);
+  if (!coordinator) {
+    coordinator = {};
+    sectionSaveCoordinators.set(section, coordinator);
+  }
+  return coordinator;
 }
 
 function clearLlmProviderConfigsAutoSaveTimer(): void {
@@ -778,11 +952,28 @@ function clearLlmCompressionConfigsAutoSaveTimer(): void {
 }
 
 function hasPendingLlmProviderConfigsSave(): boolean {
-  return llmProviderConfigsAutoSaveTimer !== undefined || llmProviderConfigsSaveRequestRevisions.size > 0;
+  const coordinator = sectionSaveCoordinators.get('llmProviderConfigs');
+  return llmProviderConfigsAutoSaveTimer !== undefined || !!coordinator?.inFlight || !!coordinator?.queued;
 }
 
 function hasPendingLlmCompressionConfigsSave(): boolean {
-  return llmCompressionConfigsAutoSaveTimer !== undefined || llmCompressionConfigsSaveRequestRevisions.size > 0;
+  const coordinator = sectionSaveCoordinators.get('llmCompressionConfigs');
+  return llmCompressionConfigsAutoSaveTimer !== undefined || !!coordinator?.inFlight || !!coordinator?.queued;
+}
+
+function hasPendingSectionSave(section: GlobalSettingsSection): boolean {
+  const coordinator = sectionSaveCoordinators.get(section);
+  const timerPending = section === 'llmProviderConfigs'
+    ? llmProviderConfigsAutoSaveTimer !== undefined
+    : section === 'llmCompressionConfigs' && llmCompressionConfigsAutoSaveTimer !== undefined;
+  return !!coordinator?.inFlight || !!coordinator?.queued || timerPending;
+}
+
+function isSectionDirty(state: GlobalSettingsState, section: GlobalSettingsSection): boolean {
+  const baseline = state.baselines[section];
+  const contentDirty = baseline !== undefined
+    && !sameSerializableValue(plainSettingsFromState(state, section), baseline);
+  return contentDirty || state.pendingSettingsSections[section] === true || hasPendingSectionSave(section);
 }
 
 function clearModelFetchTimeout(): void {
@@ -809,6 +1000,10 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     attachments: emptyAttachments(),
     mcpServers: emptyMcpServers(),
     filePaths: {},
+    revisions: {},
+    baselines: {},
+    pendingExternalSnapshots: {},
+    externalChangedSections: {},
     pendingActiveProviderConfigIdAfterConfigsSave: '',
     flushCompressionBindingAfterConfigsSave: false,
     loadedSections: {},
@@ -819,6 +1014,9 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     status: ''
   }),
   getters: {
+    hasExternalSettingsChange(state): boolean {
+      return Object.keys(state.externalChangedSections).length > 0;
+    },
     activeLlmProviderConfig(state): LlmProviderConfigRecord | undefined {
       return state.llmProviderConfigs.configs.find((config) => config.id === state.llm.activeProviderConfigId)
         ?? state.llmProviderConfigs.configs[0];
@@ -843,6 +1041,36 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     }
   },
   actions: {
+    enqueueSettingsUpdate(payload: PendingGlobalSettingsUpdate): void {
+      const coordinator = coordinatorFor(payload.section);
+      coordinator.queued = { ...payload, settings: cloneSettingsValue(payload.settings) };
+      this.markPendingSettingSection(payload.section);
+      this.pumpSettingsUpdate(payload.section);
+    },
+    pumpSettingsUpdate(section: GlobalSettingsSection): void {
+      const coordinator = coordinatorFor(section);
+      if (coordinator.inFlight || coordinator.awaitingConflictSnapshot || this.externalChangedSections[section] || !coordinator.queued) return;
+      const expectedRevision = this.revisions[section];
+      if (!expectedRevision) {
+        if (!this.loadingSettingsSections[section]) {
+          this.markLoadingSettingSection(section);
+          bridge.request(BridgeMessageType.GlobalSettingsGet, { section });
+        }
+        this.failedSettingsSections[section] = '尚未取得最新设置，已暂停保存并重新读取。';
+        return;
+      }
+      const payload = coordinator.queued;
+      coordinator.queued = undefined;
+      try {
+        const requestId = bridge.request(BridgeMessageType.GlobalSettingsUpdate, { ...payload, expectedRevision });
+        coordinator.inFlight = { requestId, payload };
+      } catch (error) {
+        coordinator.queued = payload;
+        const message = `设置保存请求发送失败：${messageFromError(error)}`;
+        this.failedSettingsSections[section] = message;
+        this.status = `设置保存失败：${message}`;
+      }
+    },
     markLoadingSettingSection(section: GlobalSettingsSection): void {
       this.loadingSettingsSections[section] = true;
       delete this.failedSettingsSections[section];
@@ -860,9 +1088,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     requestAll(): void {
       clearLlmProviderConfigsAutoSaveTimer();
       clearLlmCompressionConfigsAutoSaveTimer();
-      llmProviderConfigsSaveRequestRevisions.clear();
-      llmCompressionConfigsSaveRequestRevisions.clear();
+      sectionSaveCoordinators.clear();
       this.status = '正在读取设置...';
+      this.revisions = {};
+      this.baselines = {};
+      this.pendingExternalSnapshots = {};
+      this.externalChangedSections = {};
       this.loadedSections = {};
       this.loadingSettingsSections = {};
       this.pendingSettingsSections = {};
@@ -880,9 +1111,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       }
     },
     saveCommon(): void {
-      this.markPendingSettingSection('common');
       this.status = '正在保存设置，并按需迁移、删除旧数据目录中的插件数据...';
-      bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+      this.enqueueSettingsUpdate({
         section: 'common',
         settings: {
           dataFilePath: this.common.dataFilePath,
@@ -893,9 +1123,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       });
     },
     saveLlm(): void {
-      this.markPendingSettingSection('llm');
       this.status = '正在保存当前渠道选择...';
-      bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+      this.enqueueSettingsUpdate({
         section: 'llm',
         settings: {
           activeProviderConfigId: this.llm.activeProviderConfigId
@@ -915,9 +1144,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.saveCheckpointMaintenance();
     },
     saveCheckpointMaintenance(): void {
-      this.markPendingSettingSection('checkpointMaintenance');
       this.status = '正在保存存档点维护设置...';
-      bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+      this.enqueueSettingsUpdate({
         section: 'checkpointMaintenance',
         settings: {
           autoCleanupEnabled: this.checkpointMaintenance.autoCleanupEnabled,
@@ -933,9 +1161,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       bridge.request(BridgeMessageType.GlobalSettingsGet, { section: 'appearance' });
     },
     saveAppearance(): void {
-      this.markPendingSettingSection('appearance');
       this.status = '正在保存外观设置...';
-      bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+      this.enqueueSettingsUpdate({
         section: 'appearance',
         settings: {
           streamingTextPreparing: this.appearance.streamingTextPreparing,
@@ -958,9 +1185,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.saveAttachments();
     },
     saveAttachments(): void {
-      this.markPendingSettingSection('attachments');
       this.status = '正在保存附件设置...';
-      bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+      this.enqueueSettingsUpdate({
         section: 'attachments',
         settings: {
           maxStoredInlineFileMb: this.attachments.maxStoredInlineFileMb
@@ -973,9 +1199,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       bridge.request(BridgeMessageType.GlobalSettingsGet, { section: 'mcpServers' });
     },
     saveMcpServers(refreshMcpTools = false): void {
-      this.markPendingSettingSection('mcpServers');
       this.status = refreshMcpTools ? '正在尝试获取 MCP 工具...' : '正在保存 MCP 服务...';
-      bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+      this.enqueueSettingsUpdate({
         section: 'mcpServers',
         settings: {
           servers: this.mcpServers.servers.map(toPlainMcpServer)
@@ -1010,7 +1235,6 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.saveMcpServers(true);
     },
     queueLlmProviderConfigsAutoSave(): void {
-      touchLlmProviderConfigsRevision();
       clearLlmProviderConfigsAutoSaveTimer();
       this.markPendingSettingSection('llmProviderConfigs');
       this.status = '正在自动保存渠道配置...';
@@ -1021,10 +1245,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     },
     saveLlmProviderConfigs(): void {
       clearLlmProviderConfigsAutoSaveTimer();
-      const requestRevision = touchLlmProviderConfigsRevision();
-      this.markPendingSettingSection('llmProviderConfigs');
       this.status = '正在自动保存渠道配置...';
-      const requestId = bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+      this.enqueueSettingsUpdate({
         section: 'llmProviderConfigs',
         settings: {
           configs: this.llmProviderConfigs.configs.map((config) => {
@@ -1040,10 +1262,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
           })
         }
       });
-      llmProviderConfigsSaveRequestRevisions.set(requestId, requestRevision);
     },
     queueLlmCompressionConfigsAutoSave(): void {
-      touchLlmCompressionConfigsRevision();
       clearLlmCompressionConfigsAutoSaveTimer();
       this.markPendingSettingSection('llmCompressionConfigs');
       this.status = '正在自动保存压缩配置...';
@@ -1053,10 +1273,9 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       }, LLM_COMPRESSION_CONFIGS_AUTOSAVE_DELAY_MS);
     },
     saveLlmCompression(): void {
-      this.markPendingSettingSection('llmCompression');
       this.status = '正在保存压缩绑定...';
       try {
-        bridge.request(BridgeMessageType.GlobalSettingsUpdate, { section: 'llmCompression', settings: toPlainCompressionSettings(this.llmCompression) });
+        this.enqueueSettingsUpdate({ section: 'llmCompression', settings: toPlainCompressionSettings(this.llmCompression) });
       } catch (error) {
         const message = `压缩绑定保存请求发送失败：${messageFromError(error)}`;
         this.clearPendingSettingSection('llmCompression');
@@ -1066,17 +1285,14 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     },
     saveLlmCompressionConfigs(): void {
       clearLlmCompressionConfigsAutoSaveTimer();
-      const requestRevision = touchLlmCompressionConfigsRevision();
-      this.markPendingSettingSection('llmCompressionConfigs');
       this.status = '正在保存压缩配置...';
       try {
-        const requestId = bridge.request(BridgeMessageType.GlobalSettingsUpdate, {
+        this.enqueueSettingsUpdate({
           section: 'llmCompressionConfigs',
           settings: {
             configs: this.llmCompressionConfigs.configs.map(toPlainCompressionConfig)
           }
         });
-        llmCompressionConfigsSaveRequestRevisions.set(requestId, requestRevision);
       } catch (error) {
         const message = `压缩配置保存请求发送失败：${messageFromError(error)}`;
         if (!hasPendingLlmCompressionConfigsSave()) this.clearPendingSettingSection('llmCompressionConfigs');
@@ -1627,87 +1843,192 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       }
       this.saveLlmCompressionConfigs();
     },
-    applySnapshot(payload: GlobalSettingsSnapshotPayload, correlationId?: string): void {
-      const isLlmProviderConfigsSnapshot = payload.section === 'llmProviderConfigs';
-      const providerConfigsRequestRevision = isLlmProviderConfigsSnapshot && correlationId
-        ? llmProviderConfigsSaveRequestRevisions.get(correlationId)
-        : undefined;
-      const isLlmCompressionConfigsSnapshot = payload.section === 'llmCompressionConfigs';
-      const compressionConfigsRequestRevision = isLlmCompressionConfigsSnapshot && correlationId
-        ? llmCompressionConfigsSaveRequestRevisions.get(correlationId)
-        : undefined;
-      if (providerConfigsRequestRevision !== undefined && correlationId) {
-        llmProviderConfigsSaveRequestRevisions.delete(correlationId);
+    /** 外部修改冲突时，保留当前表单并基于最新版本重新保存。 */
+    dismissExternalSettingsChange(section?: GlobalSettingsSection): void {
+      const sections = section ? [section] : Object.keys(this.pendingExternalSnapshots) as GlobalSettingsSection[];
+      for (const item of sections) {
+        const payload = this.pendingExternalSnapshots[item];
+        if (!payload || coordinatorFor(item).inFlight) continue;
+        const baseline = this.baselines[item];
+        const local = plainSettingsFromState(this, item);
+        const merged = baseline
+          ? mergeSettingsThreeWay(baseline, local, payload.settings, true).value
+          : local;
+        this.applyCommittedMetadata(payload);
+        this.applySectionSettings(item, merged);
+        delete this.pendingExternalSnapshots[item];
+        delete this.externalChangedSections[item];
+        const coordinator = coordinatorFor(item);
+        coordinator.awaitingConflictSnapshot = false;
+        coordinator.queued = undefined;
+        if (!sameSerializableValue(merged, payload.settings)) {
+          this.enqueueSettingsUpdate({ section: item, settings: plainSettingsFromState(this, item) });
+        }
       }
-      if (compressionConfigsRequestRevision !== undefined && correlationId) {
-        llmCompressionConfigsSaveRequestRevisions.delete(correlationId);
+    },
+    /** 外部修改冲突时，丢弃本地未确认内容并载入磁盘版本。 */
+    applyExternalSettingsChange(section?: GlobalSettingsSection): void {
+      const sections = section ? [section] : Object.keys(this.pendingExternalSnapshots) as GlobalSettingsSection[];
+      for (const item of sections) {
+        const payload = this.pendingExternalSnapshots[item];
+        if (!payload || coordinatorFor(item).inFlight) continue;
+        const coordinator = coordinatorFor(item);
+        coordinator.queued = undefined;
+        coordinator.awaitingConflictSnapshot = false;
+        if (item === 'llmProviderConfigs') {
+          clearLlmProviderConfigsAutoSaveTimer();
+          this.pendingActiveProviderConfigIdAfterConfigsSave = '';
+        }
+        if (item === 'llmCompressionConfigs') {
+          clearLlmCompressionConfigsAutoSaveTimer();
+          this.flushCompressionBindingAfterConfigsSave = false;
+        }
+        this.applyCommittedMetadata(payload);
+        this.applySectionSettings(item, payload.settings);
+        delete this.pendingExternalSnapshots[item];
+        delete this.externalChangedSections[item];
+        this.clearPendingSettingSection(item);
+      }
+      if (!hasOutstandingSettingsWork(this)) this.status = '已载入外部设置';
+    },
+    applySnapshot(payload: GlobalSettingsSnapshotPayload, correlationId?: string): void {
+      const section = payload.section;
+      const coordinator = coordinatorFor(section);
+      const localAttempt = correlationId && coordinator.inFlight?.requestId === correlationId
+        ? coordinator.inFlight
+        : undefined;
+
+      if (localAttempt) {
+        coordinator.inFlight = undefined;
+        coordinator.awaitingConflictSnapshot = false;
+        const current = plainSettingsFromState(this, section);
+        const merged = mergeSettingsThreeWay(localAttempt.payload.settings, current, payload.settings, true);
+        this.applyCommittedMetadata(payload);
+        this.applySectionSettings(section, merged.value);
+        this.flushDependentSettingsAfterCommittedSnapshot(payload);
+        if (coordinator.queued) {
+          coordinator.queued.settings = plainSettingsFromState(this, section);
+        } else if (!sameSerializableValue(merged.value, payload.settings)) {
+          coordinator.queued = { section, settings: plainSettingsFromState(this, section) };
+        }
+        const pendingExternal = this.pendingExternalSnapshots[section];
+        if (pendingExternal && pendingExternal.revision !== payload.revision) {
+          this.resolveExternalSnapshot(pendingExternal);
+        } else {
+          delete this.pendingExternalSnapshots[section];
+          delete this.externalChangedSections[section];
+        }
+        this.pumpSettingsUpdate(section);
+        this.refreshPendingSettingSection(section);
+        if (!hasOutstandingSettingsWork(this)) this.status = '设置已同步';
+        return;
       }
 
+      this.clearLoadingSettingSection(section);
+      if (this.loadedSections[section] && this.revisions[section] === payload.revision) {
+        this.pumpSettingsUpdate(section);
+        return;
+      }
+      if (!this.loadedSections[section]) {
+        this.applyCommittedMetadata(payload);
+        this.applySectionSettings(section, payload.settings);
+        this.pumpSettingsUpdate(section);
+        this.refreshPendingSettingSection(section);
+        return;
+      }
+      if (coordinator.inFlight) {
+        this.stageExternalSnapshot(payload);
+        return;
+      }
+      if (isSectionDirty(this, section) || coordinator.awaitingConflictSnapshot) {
+        this.resolveExternalSnapshot(payload);
+        return;
+      }
+      this.applyCommittedMetadata(payload);
+      this.applySectionSettings(section, payload.settings);
+      this.pumpSettingsUpdate(section);
+      this.refreshPendingSettingSection(section);
+      if (!hasOutstandingSettingsWork(this)) this.status = '设置已同步';
+    },
+    resolveExternalSnapshot(payload: GlobalSettingsSnapshotPayload): boolean {
+      const section = payload.section;
+      const baseline = this.baselines[section];
+      if (!baseline) {
+        this.applyCommittedMetadata(payload);
+        this.applySectionSettings(section, payload.settings);
+        return true;
+      }
+      const local = plainSettingsFromState(this, section);
+      const merged = mergeSettingsThreeWay(baseline, local, payload.settings);
+      if (merged.conflicts.length > 0) {
+        this.stageExternalSnapshot(payload);
+        coordinatorFor(section).awaitingConflictSnapshot = false;
+        this.status = `其他窗口也修改了这项设置，本地内容已保留，请选择保留当前或载入外部。`;
+        return false;
+      }
+      this.applyCommittedMetadata(payload);
+      this.applySectionSettings(section, merged.value);
+      delete this.pendingExternalSnapshots[section];
+      delete this.externalChangedSections[section];
+      coordinatorFor(section).awaitingConflictSnapshot = false;
+      this.pumpSettingsUpdate(section);
+      this.refreshPendingSettingSection(section);
+      return true;
+    },
+    stageExternalSnapshot(payload: GlobalSettingsSnapshotPayload): void {
+      this.pendingExternalSnapshots[payload.section] = {
+        ...payload,
+        settings: cloneSettingsValue(payload.settings)
+      };
+      this.externalChangedSections[payload.section] = true;
+    },
+    applyCommittedMetadata(payload: GlobalSettingsSnapshotPayload): void {
       this.loadedSections[payload.section] = true;
       this.filePaths[payload.section] = payload.filePath;
+      this.revisions[payload.section] = payload.revision;
+      this.baselines[payload.section] = cloneSettingsValue(payload.settings);
       this.clearLoadingSettingSection(payload.section);
       delete this.failedSettingsSections[payload.section];
-
-      if (providerConfigsRequestRevision !== undefined && providerConfigsRequestRevision < llmProviderConfigsEditRevision) {
-        if (!hasPendingLlmProviderConfigsSave()) this.clearPendingSettingSection(payload.section);
-        if (!hasOutstandingSettingsWork(this)) this.status = '设置已同步';
-        return;
-      }
-
-      if (compressionConfigsRequestRevision !== undefined && compressionConfigsRequestRevision < llmCompressionConfigsEditRevision) {
-        if (!hasPendingLlmCompressionConfigsSave()) this.clearPendingSettingSection(payload.section);
-        if (!hasOutstandingSettingsWork(this)) this.status = '设置已同步';
-        return;
-      }
-
-      if (isLlmCompressionConfigsSnapshot && compressionConfigsRequestRevision === undefined && hasPendingLlmCompressionConfigsSave()) {
-        return;
-      }
-
-      if (payload.section === 'llm') {
-        this.llm = { ...emptyLlm(), ...(payload.settings as LlmSettingsRecord) };
-      } else if (payload.section === 'llmProviderConfigs') {
-        const settings = payload.settings as LlmProviderConfigsRecord;
-        this.llmProviderConfigs = {
-          configs: settings.configs.map(normalizeProviderConfigForUi)
-        };
-        if (this.pendingActiveProviderConfigIdAfterConfigsSave) {
-          const pendingId = this.pendingActiveProviderConfigIdAfterConfigsSave;
-          this.pendingActiveProviderConfigIdAfterConfigsSave = '';
-          const nextActiveId = this.llmProviderConfigs.configs.some((config) => config.id === pendingId)
-            ? pendingId
-            : this.llmProviderConfigs.configs[0]?.id ?? '';
-          this.llm.activeProviderConfigId = nextActiveId;
-          this.saveLlm();
-        }
-      } else if (payload.section === 'llmCompression') {
-        this.llmCompression = { ...emptyLlmCompression(), ...(payload.settings as LlmCompressionSettingsRecord) };
-      } else if (payload.section === 'llmCompressionConfigs') {
-        const settings = payload.settings as LlmCompressionConfigsRecord;
-        this.llmCompressionConfigs = { configs: settings.configs.map((config) => normalizeCompressionConfigForUi(config)) };
-        // 克隆/新建的压缩配置已确认落盘，此时再持久化压缩绑定，后端归一化不会因“配置不存在”丢弃绑定。
-        if (this.flushCompressionBindingAfterConfigsSave) {
-          this.flushCompressionBindingAfterConfigsSave = false;
-          this.saveLlmCompression();
-        }
-      } else if (payload.section === 'checkpointMaintenance') {
-        this.checkpointMaintenance = { ...emptyCheckpointMaintenance(), ...(payload.settings as CheckpointMaintenanceSettingsRecord) };
-      } else if (payload.section === 'appearance') {
-        this.appearance = { ...emptyAppearance(), ...(payload.settings as AppearanceSettingsRecord) };
-      } else if (payload.section === 'attachments') {
-        this.attachments = { ...emptyAttachments(), ...(payload.settings as AttachmentSettingsRecord) };
-      } else if (payload.section === 'mcpServers') {
-        const settings = payload.settings as McpServersSettingsRecord;
+    },
+    applySectionSettings(section: GlobalSettingsSection, value: GlobalSettingsSectionValue): void {
+      if (section === 'llm') this.llm = { ...emptyLlm(), ...(value as LlmSettingsRecord) };
+      else if (section === 'llmProviderConfigs') {
+        const settings = value as LlmProviderConfigsRecord;
+        this.llmProviderConfigs = { configs: settings.configs.map(normalizeProviderConfigForUi) };
+      } else if (section === 'llmCompression') {
+        this.llmCompression = { ...emptyLlmCompression(), ...(value as LlmCompressionSettingsRecord) };
+      } else if (section === 'llmCompressionConfigs') {
+        const settings = value as LlmCompressionConfigsRecord;
+        this.llmCompressionConfigs = { configs: settings.configs.map(normalizeCompressionConfigForUi) };
+      } else if (section === 'checkpointMaintenance') {
+        this.checkpointMaintenance = { ...emptyCheckpointMaintenance(), ...(value as CheckpointMaintenanceSettingsRecord) };
+      } else if (section === 'appearance') {
+        this.appearance = { ...emptyAppearance(), ...(value as AppearanceSettingsRecord) };
+      } else if (section === 'attachments') {
+        this.attachments = { ...emptyAttachments(), ...(value as AttachmentSettingsRecord) };
+      } else if (section === 'mcpServers') {
+        const settings = value as McpServersSettingsRecord;
         this.mcpServers = { servers: [...(settings.servers ?? [])].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id)) };
-      } else {
-        this.common = payload.settings as GlobalSettingsRecord;
+      } else this.common = value as GlobalSettingsRecord;
+    },
+    flushDependentSettingsAfterCommittedSnapshot(payload: GlobalSettingsSnapshotPayload): void {
+      if (payload.section === 'llmProviderConfigs' && this.pendingActiveProviderConfigIdAfterConfigsSave) {
+        const pendingId = this.pendingActiveProviderConfigIdAfterConfigsSave;
+        this.pendingActiveProviderConfigIdAfterConfigsSave = '';
+        const configs = (payload.settings as LlmProviderConfigsRecord).configs;
+        this.llm.activeProviderConfigId = configs.some((config) => config.id === pendingId)
+          ? pendingId
+          : configs[0]?.id ?? '';
+        this.saveLlm();
       }
-      const shouldClearPending = (!isLlmProviderConfigsSnapshot || !hasPendingLlmProviderConfigsSave())
-        && (!isLlmCompressionConfigsSnapshot || !hasPendingLlmCompressionConfigsSave());
-      if (shouldClearPending) {
-        this.clearPendingSettingSection(payload.section);
+      if (payload.section === 'llmCompressionConfigs' && this.flushCompressionBindingAfterConfigsSave) {
+        this.flushCompressionBindingAfterConfigsSave = false;
+        this.saveLlmCompression();
       }
-      if (!hasOutstandingSettingsWork(this)) this.status = '设置已同步';
+    },
+    refreshPendingSettingSection(section: GlobalSettingsSection): void {
+      if (hasPendingSectionSave(section)) this.markPendingSettingSection(section);
+      else this.clearPendingSettingSection(section);
     },
     applyLlmProviderModelsSnapshot(payload: LlmProviderModelsSnapshotPayload): void {
       clearModelFetchTimeout();
@@ -1725,14 +2046,23 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         return;
       }
 
-      clearLlmProviderConfigsAutoSaveTimer();
-      clearLlmCompressionConfigsAutoSaveTimer();
-      llmProviderConfigsSaveRequestRevisions.clear();
-      llmCompressionConfigsSaveRequestRevisions.clear();
       this.closeFetchedModelsDialog();
       if (options.section) {
+        const coordinator = coordinatorFor(options.section);
+        if (options.correlationId && coordinator.inFlight?.requestId === options.correlationId) {
+          const failed = coordinator.inFlight;
+          coordinator.inFlight = undefined;
+          coordinator.queued = coordinator.queued ?? failed.payload;
+        }
+        if (options.code === 'settings_revision_conflict') {
+          coordinator.awaitingConflictSnapshot = true;
+          if (!this.pendingExternalSnapshots[options.section]) {
+            this.markLoadingSettingSection(options.section);
+            bridge.request(BridgeMessageType.GlobalSettingsGet, { section: options.section });
+          }
+        }
         this.clearLoadingSettingSection(options.section);
-        this.clearPendingSettingSection(options.section);
+        this.refreshPendingSettingSection(options.section);
         this.failedSettingsSections[options.section] = message;
       } else {
         this.loadingSettingsSections = {};

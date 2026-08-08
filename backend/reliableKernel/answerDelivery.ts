@@ -71,6 +71,16 @@ export type AnswerReadResult =
   | { status: 'running'; answerBridgeId: string; childExecutionId: string }
   | { status: 'interrupted'; answerBridgeId: string; childExecutionId: string }
   | {
+      status: 'failed';
+      answerBridgeId: string;
+      childExecutionId: string;
+      submissionId: string;
+      sourceTurnId: string;
+      title: string | null;
+      content: string;
+      contentType: string;
+    }
+  | {
       status: 'submitted';
       answerBridgeId: string;
       childExecutionId: string;
@@ -125,6 +135,8 @@ export type AnswerDeliveryRecoveryDisposition =
       command: RuntimeDeliveryCreateCommand;
       automaticSourceTurnId: string;
     };
+
+type AnswerSubmissionOutcome = 'submitted' | 'interrupted' | 'failed';
 
 interface AnswerSubmissionAuthority {
   bridge: DomainRow;
@@ -188,7 +200,7 @@ export class AnswerControlPlane {
     try {
       const commit = await this.database.transaction([
         ...answerAuthoritySteps(command, authority),
-        ...answerFactSteps(command, ids, bridge, payloadContent, now, false),
+        ...answerFactSteps(command, ids, bridge, payloadContent, now, 'submitted'),
         ...(eligibleForeground ? eligibleForeground.steps : [])
       ]);
       if (eligibleForeground) {
@@ -278,7 +290,7 @@ export class AnswerControlPlane {
       contentType: 'text/markdown'
     });
     const ids = answerIds(command.answerBridgeId, submissionId);
-    const replay = await this.findReplay(command, ids, undefined, true);
+    const replay = await this.findReplay(command, ids, undefined, 'interrupted');
     if (replay) return replay.historicalReplay ? null : replay;
     const payloadContent = await this.contentStore.prepare(this.database, content, command.contentType);
     const now = this.timestamp();
@@ -313,7 +325,7 @@ export class AnswerControlPlane {
     try {
       const commit = await this.database.transaction([
         ...authoritySteps,
-        ...answerFactSteps(command, ids, bridge, payloadContent, now, true),
+        ...answerFactSteps(command, ids, bridge, payloadContent, now, 'interrupted'),
         ...(eligibleForeground ? eligibleForeground.steps : [])
       ]);
       if (eligibleForeground) {
@@ -330,7 +342,7 @@ export class AnswerControlPlane {
         try {
           const commit = await this.database.transaction([
             ...authoritySteps,
-            ...answerFactSteps(command, ids, bridge, payloadContent, now, true)
+            ...answerFactSteps(command, ids, bridge, payloadContent, now, 'interrupted')
           ]);
           return answerResult(command, ids, false, false, false, commit.commitSeq);
         } catch (retryError) {
@@ -339,12 +351,116 @@ export class AnswerControlPlane {
       }
       if (isTransactionAssertionFailure(error)) return null;
       if (!isExpectedAnswerIdentityConflict(error)) throw error;
-      const raced = await this.findReplay(command, ids, payloadContent, true);
+      const raced = await this.findReplay(command, ids, payloadContent, 'interrupted');
       if (raced) return raced.historicalReplay ? null : raced;
       const latest = await this.children.readExecutionSnapshot(childExecutionId);
       if (latest.currentSubmission) return null;
       throw error;
     }
+  }
+
+  /** Publishes one deterministic failed answer for a terminal child drive with no submitted answer. */
+  public async ensureFailed(input: {
+    childExecutionId: string;
+    turnId: string;
+    reason: string;
+  }): Promise<AnswerSubmitResult | null> {
+    const childExecutionId = requirePhaseFId(input.childExecutionId, 'childExecutionId');
+    const turnId = requirePhaseFId(input.turnId, 'turnId');
+    const reason = requirePhaseFText(input.reason, 'reason');
+    const snapshot = await this.children.readExecutionSnapshot(childExecutionId);
+    if (snapshot.currentSubmission) return null;
+    const allTurnLinks = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
+      child_execution_id: childExecutionId
+    });
+    const sourceTurnLink = allTurnLinks.find((link) => link.turn_id === turnId);
+    if (!sourceTurnLink) {
+      throw new Error(`Turn ${turnId} is not a member of ChildExecution ${childExecutionId}.`);
+    }
+    const latestTurnLink = [...allTurnLinks].sort((left, right) => {
+      const a = BigInt(String(left.turn_seq));
+      const b = BigInt(String(right.turn_seq));
+      return a < b ? 1 : a > b ? -1 : 0;
+    })[0];
+    if (!latestTurnLink || latestTurnLink.id !== sourceTurnLink.id) return null;
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== TERMINATED_TURN) return null;
+    const terminations = await this.listRows('TurnTermination', { turn_id: turnId }, 2);
+    if (terminations.length !== 1 || terminations[0].terminal_status !== 'failed') return null;
+    const bridge = snapshot.answerBridge;
+    if (!['open', 'submitted'].includes(String(bridge.status))) return null;
+    const submissionId = stablePhaseFId('answer_submission', 'child-drive-failed', childExecutionId, turnId);
+    const content = `> 子 Agent 执行失败。\n\n失败原因：${reason}`;
+    const command = normalizeAnswerCommand({
+      answerBridgeId: requirePhaseFId(bridge.id, 'AnswerBridge.id'),
+      submissionId,
+      sourceTurnId: turnId,
+      title: '子 Agent 执行失败',
+      content,
+      contentType: 'text/markdown'
+    });
+    const ids = answerIds(command.answerBridgeId, submissionId);
+    const replay = await this.findReplay(command, ids, undefined, 'failed');
+    if (replay) return replay.historicalReplay ? null : replay;
+    const payloadContent = await this.contentStore.prepare(this.database, content, command.contentType);
+    const authority: AnswerSubmissionAuthority = {
+      bridge,
+      childExecution: snapshot.childExecution,
+      turnLink: sourceTurnLink,
+      turn,
+      activeTurnLink: snapshot.activeTurnLink,
+      termination: terminations[0],
+      currentSubmission: null
+    };
+    const now = this.timestamp();
+    try {
+      const commit = await this.database.transaction([
+        ...failedAnswerAuthoritySteps(
+          command,
+          authority,
+          allTurnLinks.map((link) => requirePhaseFId(link.id, 'ChildExecutionTurnLink.id'))
+        ),
+        ...answerFactSteps(command, ids, bridge, payloadContent, now, 'failed')
+      ]);
+      return answerResult(command, ids, false, false, false, commit.commitSeq);
+    } catch (error) {
+      if (isTransactionAssertionFailure(error)) return null;
+      if (!isExpectedAnswerIdentityConflict(error)) throw error;
+      const raced = await this.findReplay(command, ids, payloadContent, 'failed');
+      if (raced) return raced.historicalReplay ? null : raced;
+      const latest = await this.children.readExecutionSnapshot(childExecutionId);
+      if (latest.currentSubmission) return null;
+      throw error;
+    }
+  }
+
+  /** Reconciles one failed child Turn into direct wait failure or a durable background delivery source. */
+  public async reconcileFailedTurn(input: {
+    childExecutionId: string;
+    turnId: string;
+    reason: string;
+  }): Promise<{
+    answerBridgeId: string;
+    submissionId: string;
+    inboxItemId: string;
+    disposition: AnswerDeliveryRecoveryDisposition;
+  } | null> {
+    const childExecutionId = requirePhaseFId(input.childExecutionId, 'childExecutionId');
+    const turnId = requirePhaseFId(input.turnId, 'turnId');
+    const reason = requirePhaseFText(input.reason, 'reason');
+    await this.children.settleForegroundFailure(childExecutionId, turnId, reason);
+    await this.ensureFailed({ childExecutionId, turnId, reason });
+    const snapshot = await this.children.readExecutionSnapshot(childExecutionId);
+    const answerBridgeId = requirePhaseFId(snapshot.answerBridge.id, 'AnswerBridge.id');
+    const current = await this.readCurrent(answerBridgeId);
+    if (current.status !== 'failed' || current.sourceTurnId !== turnId) return null;
+    const waits = await this.reconcileCommittedWaits(current.submissionId);
+    return {
+      answerBridgeId,
+      submissionId: current.submissionId,
+      inboxItemId: waits.inboxItemId,
+      disposition: await this.classifyDeliveryRecovery(current.submissionId)
+    };
   }
 
   private async markInboxSettled(inboxItemId: string): Promise<void> {
@@ -392,16 +508,31 @@ export class AnswerControlPlane {
       requirePhaseFId(payload.content_object_id, 'AnswerPayload.content_object_id')
     ) as ContentObjectMetadata;
     const content = (await this.contentStore.read(contentRow)).toString('utf8');
+    const sourceTurnId = requirePhaseFId(snapshot.currentSubmission.turn_id, 'AnswerSubmission.turn_id');
+    const title = payload.title === null ? null : requirePhaseFText(payload.title, 'AnswerPayload.title');
+    const outcome = answerSubmissionOutcome(snapshot.currentSubmission, childExecutionId);
+    if (outcome === 'failed') {
+      return {
+        status: 'failed',
+        answerBridgeId,
+        childExecutionId,
+        submissionId,
+        sourceTurnId,
+        title,
+        content,
+        contentType: contentRow.content_type
+      };
+    }
     return {
       status: 'submitted',
       answerBridgeId,
       childExecutionId,
       submissionId,
-      sourceTurnId: requirePhaseFId(snapshot.currentSubmission.turn_id, 'AnswerSubmission.turn_id'),
-      title: payload.title === null ? null : requirePhaseFText(payload.title, 'AnswerPayload.title'),
+      sourceTurnId,
+      title,
       content,
       contentType: contentRow.content_type,
-      interrupted: snapshot.currentSubmission.interrupted === 1n
+      interrupted: outcome === 'interrupted'
     };
   }
 
@@ -536,25 +667,36 @@ export class AnswerControlPlane {
     const title = payload.title === null
       ? null
       : requirePhaseFText(payload.title, 'AnswerPayload.title');
-    const interrupted = submission.interrupted === 1n;
-    const detail = interrupted
+    const outcome = answerSubmissionOutcome(submission, childExecutionId);
+    const detail = outcome === 'failed'
       ? {
           ok: false,
-          status: 'interrupted',
-          partial: true,
-          interrupted: true,
+          status: 'failed',
+          failed: true,
+          reason: content,
           answerBridgeId,
           submissionId,
           title,
           content
         }
-      : {
-          ok: true,
-          answerBridgeId,
-          submissionId,
-          title,
-          content
-        };
+      : outcome === 'interrupted'
+        ? {
+            ok: false,
+            status: 'interrupted',
+            partial: true,
+            interrupted: true,
+            answerBridgeId,
+            submissionId,
+            title,
+            content
+          }
+        : {
+            ok: true,
+            answerBridgeId,
+            submissionId,
+            title,
+            content
+          };
     const continuationSettlements: ChildWaitSettlement[] = [];
     const waitingOperations = (await this.children.listContinuationWaitOperations({
       answerBridgeId,
@@ -571,8 +713,8 @@ export class AnswerControlPlane {
         sourceTurnId,
         toolCallId,
         detail,
-        status: interrupted ? 'partial' : 'succeeded',
-        sourceIdentity: `${interrupted ? 'interrupted-answer' : 'answer'}:${submissionId}`,
+        status: outcome === 'failed' ? 'failed' : outcome === 'interrupted' ? 'partial' : 'succeeded',
+        sourceIdentity: `${outcome === 'failed' ? 'failed-answer' : outcome === 'interrupted' ? 'interrupted-answer' : 'answer'}:${submissionId}`,
         observedAt
       }));
     }
@@ -605,18 +747,20 @@ export class AnswerControlPlane {
       throw new Error('Answer wait recovery requires exactly one RuntimeInboxItem.');
     }
     const inboxItemId = requirePhaseFId(inboxRows[0].id, 'RuntimeInboxItem.id');
+    const settledByAnswer = await this.wasSubmissionUsedToSettleAnyWait(
+      submissionId,
+      answerBridgeId,
+      parentLinks[0],
+      sourceTurnId
+    );
+    if (settledByAnswer) await this.markInboxSettled(inboxItemId);
     return {
       answerBridgeId,
       submissionId,
       inboxItemId,
       sourceTurnId,
       newlySettledToolCallIds: continuationSettlements.map((settlement) => settlement.toolCallId),
-      settledByAnswer: await this.wasSubmissionUsedToSettleAnyWait(
-        submissionId,
-        answerBridgeId,
-        parentLinks[0],
-        sourceTurnId
-      )
+      settledByAnswer
     };
   }
 
@@ -700,6 +844,7 @@ export class AnswerControlPlane {
       'Parent Turn.conversation_id'
     );
     const decision = await this.automaticDeliveryRouter.resolve({
+      inboxItemId,
       targetConversationId,
       sourceTurnId: parentTurnId
     });
@@ -1009,7 +1154,7 @@ export class AnswerControlPlane {
     try {
       const commit = await this.database.transaction([
         ...answerAuthoritySteps(command, authority),
-        ...answerFactSteps(command, ids, bridge, payloadContent, now, false)
+        ...answerFactSteps(command, ids, bridge, payloadContent, now, 'submitted')
       ]);
       return { deduplicated: false, historicalReplay: false, commitSeq: commit.commitSeq };
     } catch (error) {
@@ -1024,7 +1169,7 @@ export class AnswerControlPlane {
     command: ReturnType<typeof normalizeAnswerCommand>,
     ids: ReturnType<typeof answerIds>,
     prepared?: PreparedContentObject,
-    interrupted = false
+    outcome: AnswerSubmissionOutcome = 'submitted'
   ): Promise<AnswerSubmitResult | null> {
     const submission = await this.maybeGet('AnswerSubmission', command.submissionId);
     if (!submission) return null;
@@ -1058,7 +1203,7 @@ export class AnswerControlPlane {
     if (
       submission.answer_bridge_id !== command.answerBridgeId
       || submission.turn_id !== command.sourceTurnId
-      || submission.interrupted !== BigInt(interrupted ? 1 : 0)
+      || submission.interrupted !== answerSubmissionOutcomeCode(outcome)
       || payload.id !== ids.answerPayloadId
       || payload.title !== (command.title ?? null)
       || payload.content_object_id !== expectedContentObjectId
@@ -1211,6 +1356,7 @@ export class RuntimeDeliveryControlPlane {
     const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
     const sourceTurnId = requirePhaseFId(input.sourceTurnId, 'sourceTurnId');
     const decision = await this.automaticDeliveryRouter.resolve({
+      inboxItemId,
       targetConversationId,
       sourceTurnId
     });
@@ -1297,6 +1443,7 @@ export class RuntimeDeliveryControlPlane {
     if (!targetTurn) throw new Error('current_turn delivery requires a target Turn.');
     if (targetTurn.conversation_id !== conversation.id) return this.failTargetGone(delivery);
     const decision = await this.automaticDeliveryRouter.resolve({
+      inboxItemId: requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id'),
       targetConversationId: requirePhaseFId(conversation.id, 'Conversation.id'),
       sourceTurnId: requirePhaseFId(targetTurn.id, 'Turn.id')
     });
@@ -1601,6 +1748,28 @@ function answerDedupeKey(answerBridgeId: string, submissionId: string): string {
   return `answer:${answerBridgeId}:${submissionId}`;
 }
 
+function answerSubmissionOutcomeCode(outcome: AnswerSubmissionOutcome): bigint {
+  return outcome === 'interrupted' ? 1n : 0n;
+}
+
+function answerSubmissionOutcome(
+  submission: DomainRow,
+  childExecutionId: string
+): AnswerSubmissionOutcome {
+  if (submission.interrupted === 1n) return 'interrupted';
+  if (submission.interrupted !== 0n) {
+    throw new Error(`AnswerSubmission has unsupported interrupted flag ${String(submission.interrupted)}.`);
+  }
+  const sourceTurnId = requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id');
+  const expectedFailureId = stablePhaseFId(
+    'answer_submission',
+    'child-drive-failed',
+    childExecutionId,
+    sourceTurnId
+  );
+  return submission.id === expectedFailureId ? 'failed' : 'submitted';
+}
+
 function answerAuthoritySteps(
   command: ReturnType<typeof normalizeAnswerCommand>,
   authority: AnswerSubmissionAuthority
@@ -1679,14 +1848,59 @@ function interruptedAnswerAuthoritySteps(
   ];
 }
 
+function failedAnswerAuthoritySteps(
+  command: ReturnType<typeof normalizeAnswerCommand>,
+  authority: AnswerSubmissionAuthority,
+  exactTurnLinkIds: string[]
+): RepositoryTransactionStep[] {
+  if (!authority.termination || authority.termination.terminal_status !== 'failed') {
+    throw new Error('Failed answer authority requires a failed TurnTermination.');
+  }
+  const childExecutionId = requirePhaseFId(authority.childExecution.id, 'ChildExecution.id');
+  const activeTurnSteps = authority.activeTurnLink
+    ? [DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assert(
+        requirePhaseFId(authority.activeTurnLink.id, 'ChildExecutionActiveTurnLink.id'),
+        { child_execution_id: childExecutionId, turn_id: command.sourceTurnId }
+      )]
+    : [DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').assertNone({
+        child_execution_id: childExecutionId
+      })];
+  return [
+    DOMAIN_REPOSITORIES.domain('ChildExecution').assert(childExecutionId, {
+      status: authority.childExecution.status
+    }),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertExactIds(
+      { child_execution_id: childExecutionId },
+      exactTurnLinkIds
+    ),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(
+      requirePhaseFId(authority.turnLink.id, 'ChildExecutionTurnLink.id'),
+      {
+        child_execution_id: childExecutionId,
+        turn_id: command.sourceTurnId,
+        turn_seq: authority.turnLink.turn_seq
+      }
+    ),
+    ...activeTurnSteps,
+    DOMAIN_REPOSITORIES.domain('Turn').assert(command.sourceTurnId, {
+      status: TERMINATED_TURN
+    }),
+    DOMAIN_REPOSITORIES.domain('TurnTermination').assert(
+      requirePhaseFId(authority.termination.id, 'TurnTermination.id'),
+      { turn_id: command.sourceTurnId, terminal_status: 'failed' }
+    )
+  ];
+}
+
 function answerFactSteps(
   command: ReturnType<typeof normalizeAnswerCommand>,
   ids: ReturnType<typeof answerIds>,
   bridge: DomainRow,
   payloadContent: PreparedContentObject,
   now: string,
-  interrupted: boolean
+  outcome: AnswerSubmissionOutcome
 ): RepositoryTransactionStep[] {
+  const interrupted = outcome === 'interrupted';
   return [
     DOMAIN_REPOSITORIES.domain('AnswerBridge').assert(command.answerBridgeId, {
       child_execution_id: bridge.child_execution_id,
@@ -1698,7 +1912,7 @@ function answerFactSteps(
       id: command.submissionId,
       answer_bridge_id: command.answerBridgeId,
       turn_id: command.sourceTurnId,
-      interrupted: interrupted ? '1' : '0',
+      interrupted: answerSubmissionOutcomeCode(outcome).toString(),
       created_at: now
     }, {
       column: 'submission_seq',

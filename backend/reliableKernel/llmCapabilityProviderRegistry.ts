@@ -49,7 +49,12 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
         if (config.id !== providerConfigId) {
           throw new Error(`Provider settings authority returned ${config.id} for frozen id ${providerConfigId}.`);
         }
-        return applyFrozenModelProviderConfig(config, modelId, frozen?.provider ?? snapshot?.provider);
+        return applyFrozenModelProviderConfig(
+          config,
+          modelId,
+          frozen?.provider ?? snapshot?.provider,
+          snapshot?.systemPromptPrefix
+        );
       },
       ...(this.options.proxy ? { proxy: this.options.proxy } : {}),
       ...(this.options.headers ? { headers: { ...this.options.headers } } : {}),
@@ -89,7 +94,8 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
 export function applyFrozenModelProviderConfig(
   config: LlmProviderConfigRecord,
   modelIdInput: string,
-  providerOverride?: LlmProviderKind
+  providerOverride?: LlmProviderKind,
+  frozenSystemPromptPrefix?: string
 ): LlmProviderConfigRecord {
   const modelId = requireId(modelIdInput, 'modelId');
   const known = config.model.trim() === modelId
@@ -102,6 +108,9 @@ export function applyFrozenModelProviderConfig(
     ...config,
     ...(providerOverride ? { provider: providerOverride } : {}),
     model: modelId,
+    systemPromptPrefix: frozenSystemPromptPrefix
+      ?? modelConfig?.systemPromptPrefix
+      ?? config.systemPromptPrefix,
     ...(modelConfig ? {
       toolCallFormat: modelConfig.toolCallFormat,
       openaiResponsesTransport: modelConfig.openaiResponsesTransport,

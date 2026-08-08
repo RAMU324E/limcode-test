@@ -159,7 +159,7 @@
         {
           "phase": "current_turn",
           "targetTurn": "terminated",
-          "action": "读取精确TurnTermination：completed转next_turn(target_turn_id=NULL)，interrupted/cancelled/failed/outcome_unknown转notify_only"
+          "action": "读取精确TurnTermination：completed转next_turn(target_turn_id=NULL)；interrupted/cancelled时，正常AnswerSubmission同样转next_turn并创建新Turn，中断部分结果、子执行失败和后台进程结果转notify_only；failed/outcome_unknown转notify_only"
         },
         {
           "phase": "next_turn",
@@ -174,7 +174,7 @@
         {
           "phase": "next_turn",
           "targetTurn": "terminated",
-          "action": "不得按任意当前活动Turn重算来源；沿冻结source authority判定completed续接或非成功终态notify_only"
+          "action": "不得按任意当前活动Turn重算来源；沿冻结source authority判定：completed或父Turn停止后的正常AnswerSubmission续接，其余非成功终态notify_only"
         },
         {
           "phase": "notify_only",
@@ -184,7 +184,7 @@
       ]
     },
     "parentTurnRecovery": "父Turn重启后的恢复判定以identity.json recoveryJudgment节为唯一权威。",
-    "rule": "统一自动路由仅允许active source精确current_turn、completed source进入next_turn，interrupted/cancelled/failed/outcome_unknown只通知；TurnFinalOutputFence后不得续写已展示最终回答。Child source还必须是该ChildExecution最新generation且未处于interrupting/interrupted/永久终态。pending或consumed-but-unhandled Delivery由持久RuntimeDeliveryWake跨Host唤醒owner，失败保留原因，人工重投创建新attempt；wake达到有界dead-letter时同步把仍pending的Delivery置failed，若已consumed但未handled则历史投影读取dead-letter事实显示答案交付失败，不得永久显示等待接收。"
+    "rule": "统一自动路由只允许active source精确current_turn、completed source进入next_turn；interrupted/cancelled source仅允许由持久RuntimeInboxItem+AnswerSubmission证明的正常子Agent答案进入next_turn并创建新Turn，绝不复活旧Turn；中断部分结果、子执行失败、后台进程结果以及failed/outcome_unknown只通知；TurnFinalOutputFence后仍不得续写已展示最终回答。Child source还必须是该ChildExecution最新generation且未处于interrupting/interrupted/永久终态。pending或consumed-but-unhandled Delivery由持久RuntimeDeliveryWake跨Host唤醒owner，失败保留原因，人工重投创建新attempt；wake达到有界dead-letter时同步把仍pending的Delivery置failed，若已consumed但未handled则历史投影读取dead-letter事实显示答案交付失败，不得永久显示等待接收。"
   },
   "parentHandling": {
     "source": "RuntimeDelivery.state + RuntimeDeliveryInputLink.handled_at",
@@ -252,10 +252,10 @@
     "replay": "相同命令只读取冻结target集，不能重新扫描并中断后来续接的generation。",
     "ownedProcessCleanup": "仅ChildInterruptionTurnLink冻结的Turn可沿ProcessCompletionSourceLink生成持久cleanup outbox；普通父ESC和普通interrupt_current_turn不清理detached process。",
     "parentAbortBeforeSpawn": "统一AbortSignal在durable spawn前只把来源ToolCall结算为cancelled，不创建ChildExecution。",
-    "parentAbortAfterSpawn": "非cascade父Turn取消只关闭foreground waiting_answer；已经建立的ChildExecution/continuation由专属scheduler转后台继续。",
+    "parentAbortAfterSpawn": "非cascade父Turn取消只关闭foreground waiting_answer；已经建立的ChildExecution/continuation由专属scheduler转后台继续，其后正常AnswerSubmission可创建新的父侧continuation Turn，但不得复活已结束的旧父Turn。",
     "hostHandoff": "ExecutionHandoffError不伪造cancelled ToolOutcome；保留持久spawn/wait/lease事实给下一Host恢复。",
     "requestIsTerminal": false,
-    "lateAnswer": "答案仍可保存，但不会重新打开已结束的父Turn；中断时提取部分结果标interrupted入库。",
+    "lateAnswer": "显式中断子树产生的部分答案仍可保存，但不会重新打开或自动续接已结束的父Turn；非cascade父Turn取消后仍在正常运行的子Agent提交最终答案时，允许创建新的父侧continuation Turn，绝不复活旧父Turn。",
     "restartSweep": "重启后续扫interrupting lineage并补写终止/取消；最后一个目标Turn终态后lineage进入可恢复interrupted并消费悬空continuation input；若Host在lineage事务与父侧ToolOutcome之间崩溃，依据interrupting/interrupted ChildExecution、AnswerBridge与waiting_answer Operation补结算等待。",
     "partialAnswer": "取消终态若尚无AnswerSubmission，则以稳定submission identity提取已持久化可见输出或明确空部分结果，写interrupted=true并走同一RuntimeDelivery链。"
   },

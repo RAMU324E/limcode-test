@@ -30,6 +30,19 @@ import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnostic
 
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 const EXTERNAL_WAKE_POLL_MS = 500;
+const LOCAL_TURN_WAKE_DOMAINS = new Set([
+  'EffectIntent',
+  'EffectReceipt',
+  'Operation',
+  'ToolResultArtifact',
+  'ToolOutcome',
+  'ToolModelResult',
+  'InteractionResponse',
+  'FileChangeDecision',
+  'ProcessReceipt',
+  'PendingTurnInput',
+  'RuntimeDelivery'
+]);
 
 interface DriveSlot {
   conversationId: string;
@@ -132,6 +145,8 @@ export class ReliableConversationRunner {
   private externalWakeTimer: NodeJS.Timeout | undefined;
   private externalWakePollInFlight = false;
   private externalWakeTask: Promise<void> | undefined;
+  private localWakeRequested = false;
+  private readonly unsubscribeCommit: () => void;
   private disposed = false;
 
   public constructor(
@@ -140,7 +155,13 @@ export class ReliableConversationRunner {
     private readonly onError: ReliableConversationRunnerErrorHandler = defaultErrorHandler,
     private readonly leaseDurationMs = DEFAULT_LEASE_DURATION_MS,
     private readonly diagnostics?: ReliableDiagnosticObserver
-  ) {}
+  ) {
+    this.unsubscribeCommit = application.database.onCommit((commit) => {
+      if (!commit.changes.some((change) => LOCAL_TURN_WAKE_DOMAINS.has(change.domain))) return;
+      this.localWakeRequested = true;
+      this.ensureExternalWakePolling();
+    });
+  }
 
   public async input(input: {
     commandId: string;
@@ -593,6 +614,7 @@ export class ReliableConversationRunner {
 
   public dispose(): void {
     this.disposed = true;
+    this.unsubscribeCommit();
     if (this.externalWakeTimer) clearTimeout(this.externalWakeTimer);
     this.externalWakeTimer = undefined;
     this.waitingOwned.clear();
@@ -815,9 +837,7 @@ export class ReliableConversationRunner {
     const intents = await listAllDomainRows(this.application.database, 'TurnIntent', {
       turn_id: slot.turnId
     });
-    if (intents.length !== 1) {
-      throw new Error(`Active Turn ${slot.turnId} must have exactly one admitted TurnIntent.`);
-    }
+    if (intents.length === 0) return null;
     const intent = intents[0];
     if (intent.conversation_id !== slot.conversationId) {
       throw new Error(`TurnIntent for ${slot.turnId} belongs to another Conversation.`);
@@ -1020,9 +1040,11 @@ export class ReliableConversationRunner {
     try {
       await this.cancelDurablyInterruptedLocalTurns();
       if (this.waitingOwned.size > 0) {
+        const localWake = this.localWakeRequested;
+        this.localWakeRequested = false;
         const version = await this.application.database.externalDataVersion();
         for (const waiting of [...this.waitingOwned.values()]) {
-          if (waiting.externalDataVersion === version) continue;
+          if (!localWake && waiting.externalDataVersion === version) continue;
           const observation = await this.observeWaitingWake(waiting.turnId);
           if (observation.fingerprint === waiting.wakeFingerprint) {
             // SQLite data_version is database-global. A different Conversation/Turn committed;

@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
 import {
@@ -21,6 +23,7 @@ import {
   type MessageEditPayload,
   type MessageRetryFromPayload,
   type PlanProposalExportPayload,
+  type ProcessStopPayload,
   type ToolDecisionPayload,
   type TurnInterruptPayload,
   type TurnInputResultPayload,
@@ -28,6 +31,7 @@ import {
   type WebviewToExtensionMessage
 } from '../../../shared/protocol';
 import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
+import { isSettingsRevisionConflictError } from '../../capabilities/settingsRevisionConflict';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
@@ -94,6 +98,13 @@ export class VscodeReliableKernelCommandRouter {
       }
       void vscode.window.showWarningMessage(`LimCode：${text}`);
     });
+  }
+
+  /** 文件监听器发现其他 Extension Host 已提交设置后，重新读盘并广播。 */
+  public async refreshGlobalSettings(section: GlobalSettingsGetPayload['section']): Promise<void> {
+    const stored = await this.product.configuration.loadGlobalSettings(section);
+    const snapshot = this.globalSettingsSnapshot(stored);
+    this.options.broadcast?.(snapshot);
   }
 
   private async dispatch(
@@ -317,7 +328,11 @@ export class VscodeReliableKernelCommandRouter {
         this.options.openPlanProposal(requirePayload(message.payload, 'Plan Proposal open'));
         return;
       case BridgeMessageType.AttachmentOpen:
-        await this.openAttachment(requirePayload(message.payload, 'Attachment open'));
+        await this.openAttachment(
+          webview,
+          message.id,
+          requirePayload(message.payload, 'Attachment open')
+        );
         return;
       case BridgeMessageType.AttachmentReload:
         await this.reloadAttachment(webview, message.id, requirePayload(message.payload, 'Attachment reload'));
@@ -407,6 +422,9 @@ export class VscodeReliableKernelCommandRouter {
       case BridgeMessageType.ToolExecutionCancel:
         await this.handleToolCancel(webview, message.id, requirePayload(message.payload, 'Tool cancel'));
         return;
+      case BridgeMessageType.ProcessStop:
+        await this.handleProcessStop(webview, message.id, requirePayload(message.payload, 'Process stop'));
+        return;
       case BridgeMessageType.ToolDiffOpen: {
         const payload = requirePayload(message.payload, 'Tool Diff');
         const result = await this.product.fileDiffs.openToolCallDiff(payload.toolCallId);
@@ -493,7 +511,26 @@ export class VscodeReliableKernelCommandRouter {
     payload: GlobalSettingsUpdatePayload,
     correlationId?: string
   ): Promise<void> {
-    const stored = await this.product.configuration.saveGlobalSettings(payload.section, payload.settings);
+    let stored: Awaited<ReturnType<VscodeReliableKernelProductRuntime['configuration']['loadGlobalSettings']>>;
+    try {
+      stored = await this.product.configuration.saveGlobalSettings(
+        payload.section,
+        payload.settings,
+        payload.expectedRevision
+      );
+    } catch (error) {
+      if (!isSettingsRevisionConflictError(error)) throw error;
+      const latest = await this.product.configuration.loadGlobalSettings(payload.section);
+      this.broadcastOrPost(webview, this.globalSettingsSnapshot(latest));
+      this.postRequestError(
+        webview,
+        BridgeMessageType.GlobalSettingsUpdate,
+        error.message,
+        correlationId,
+        { section: payload.section, code: 'settings_revision_conflict', actualRevision: error.actualRevision }
+      );
+      return;
+    }
     const snapshot = this.globalSettingsSnapshot(stored, correlationId);
     this.broadcastOrPost(webview, snapshot);
     if (payload.section === 'mcpServers') {
@@ -649,22 +686,70 @@ export class VscodeReliableKernelCommandRouter {
     await vscode.workspace.fs.writeFile(target, Buffer.from(markdown, 'utf8'));
   }
 
-  private async openAttachment(payload: AttachmentOpenPayload): Promise<void> {
-    if (payload.sourcePath?.trim()) {
-      await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(payload.sourcePath.trim()));
-      return;
+  private async openAttachment(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    payload: AttachmentOpenPayload
+  ): Promise<void> {
+    try {
+      let uri: vscode.Uri;
+      if (payload.sourcePath?.trim()) {
+        uri = vscode.Uri.file(payload.sourcePath.trim());
+      } else {
+        const attachmentId = payload.attachmentId?.trim();
+        let data: string;
+        let attachmentKey: string;
+        let attachmentName: string | undefined;
+        let attachmentMimeType: string;
+        if (attachmentId) {
+          const part = await this.product.application.attachments.resolveInlineData(attachmentId);
+          if (typeof part.inlineData.data !== 'string') throw new Error('CAS 附件没有可读取的正文。');
+          data = part.inlineData.data;
+          attachmentKey = attachmentId;
+          attachmentName = part.inlineData.name ?? payload.name;
+          attachmentMimeType = part.inlineData.mimeType || payload.mimeType || 'application/octet-stream';
+        } else if (payload.data) {
+          const bytes = decodeInlineAttachmentBase64(payload.data);
+          data = bytes.toString('base64');
+          attachmentKey = `embedded-${createHash('sha256').update(bytes).digest('hex').slice(0, 24)}`;
+          attachmentName = payload.name;
+          attachmentMimeType = payload.mimeType?.trim() || 'application/octet-stream';
+        } else {
+          throw new TypeError('Attachment open 缺少 attachmentId、sourcePath 或内联数据。');
+        }
+        const fileName = safeAttachmentFileName(
+          attachmentKey,
+          attachmentName,
+          attachmentMimeType
+        );
+        const openedRoot = path.join(
+          this.product.application.database.binding.paths.dataRootPath,
+          'opened-attachments'
+        );
+        await fs.mkdir(openedRoot, { recursive: true });
+        const targetPath = path.join(openedRoot, fileName);
+        await fs.writeFile(targetPath, Buffer.from(data, 'base64'));
+        uri = vscode.Uri.file(targetPath);
+      }
+      await vscode.commands.executeCommand('vscode.open', uri, { preview: true });
+      this.post(webview, {
+        id: randomUUID(),
+        type: BridgeMessageType.AttachmentOpenResult,
+        channel: 'command',
+        correlationId,
+        payload: { request: attachmentOpenRequest(payload), status: 'opened' }
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      this.post(webview, {
+        id: randomUUID(),
+        type: BridgeMessageType.AttachmentOpenResult,
+        channel: 'command',
+        correlationId,
+        payload: { request: attachmentOpenRequest(payload), status: 'failed', error: message }
+      });
+      void vscode.window.showWarningMessage(`LimCode：${message}`);
     }
-    if (!payload.attachmentId?.trim()) throw new TypeError('Attachment open 缺少 attachmentId 或 sourcePath。');
-    const part = await this.product.application.attachments.resolveInlineData(payload.attachmentId.trim());
-    const mimeType = part.inlineData.mimeType.toLowerCase();
-    if (!isTextMimeType(mimeType)) {
-      throw new Error('二进制 CAS 附件请在内联预览中查看；当前只将文本附件打开为只读文档。');
-    }
-    const data = part.inlineData.data;
-    if (typeof data !== 'string') throw new Error('CAS 附件没有可读取的内联正文。');
-    const content = Buffer.from(data, 'base64').toString('utf8');
-    const document = await vscode.workspace.openTextDocument({ content, language: languageForMimeType(mimeType) });
-    await vscode.window.showTextDocument(document, { preview: true });
   }
 
   private async reloadAttachment(
@@ -672,29 +757,47 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string | undefined,
     payload: AttachmentReloadPayload
   ): Promise<void> {
-    let part;
-    if (payload.attachmentId?.trim()) {
-      part = await this.product.application.attachments.resolveInlineData(payload.attachmentId.trim());
-    } else if (payload.sourcePath?.trim()) {
-      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(payload.sourcePath.trim()));
-      part = {
-        inlineData: {
-          data: Buffer.from(bytes).toString('base64'),
-          mimeType: payload.mimeType?.trim() || 'application/octet-stream',
-          ...(payload.name?.trim() ? { name: payload.name.trim() } : {}),
-          sourcePath: payload.sourcePath.trim()
+    try {
+      let part;
+      if (payload.attachmentId?.trim()) {
+        part = await this.product.application.attachments.resolveInlineData(payload.attachmentId.trim());
+      } else if (payload.sourcePath?.trim()) {
+        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(payload.sourcePath.trim()));
+        part = {
+          inlineData: {
+            data: Buffer.from(bytes).toString('base64'),
+            mimeType: payload.mimeType?.trim() || 'application/octet-stream',
+            ...(payload.name?.trim() ? { name: payload.name.trim() } : {}),
+            sourcePath: payload.sourcePath.trim(),
+            storage: 'localPath' as const,
+            status: 'available' as const,
+            sizeBytes: bytes.byteLength
+          }
+        };
+      } else {
+        throw new TypeError('Attachment reload 缺少 attachmentId 或 sourcePath。');
+      }
+      this.post(webview, {
+        id: randomUUID(),
+        type: BridgeMessageType.AttachmentReloadResult,
+        channel: 'state',
+        correlationId,
+        payload: { request: payload, part, status: 'available' }
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      this.post(webview, {
+        id: randomUUID(),
+        type: BridgeMessageType.AttachmentReloadResult,
+        channel: 'state',
+        correlationId,
+        payload: {
+          request: payload,
+          status: isFileNotFoundError(error) ? 'missing' : 'failed',
+          error: message
         }
-      };
-    } else {
-      throw new TypeError('Attachment reload 缺少 attachmentId 或 sourcePath。');
+      });
     }
-    this.post(webview, {
-      id: randomUUID(),
-      type: BridgeMessageType.AttachmentReloadResult,
-      channel: 'state',
-      correlationId,
-      payload: { request: payload, part, status: 'available' }
-    });
   }
 
   private async handleTurnInput(
@@ -1304,6 +1407,43 @@ export class VscodeReliableKernelCommandRouter {
     });
   }
 
+  private async handleProcessStop(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    payload: ProcessStopPayload
+  ): Promise<void> {
+    const process = await this.requireRow('Process', payload.processId);
+    const origins = await this.list('ProcessOriginLink', { process_id: process.id }, 2);
+    if (origins.length !== 1) throw new Error('后台进程缺少唯一来源工具关系。');
+    const origin = origins[0];
+    const toolCall = await this.requireRow('ToolCall', String(origin.tool_call_id));
+    const turn = await this.requireRow('Turn', String(toolCall.turn_id));
+    const conversationId = String(turn.conversation_id);
+    if (payload.conversationId !== undefined && payload.conversationId !== conversationId) {
+      throw new Error('后台进程不属于当前 Conversation。');
+    }
+    const observation = await this.product.application.processes.stopOwnedProcess(payload.processId);
+    if (observation.receipt) {
+      await this.product.application.processes.reconcileProcessExit(payload.processId);
+    }
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.InteractionResult,
+      correlationId,
+      payload: {
+        requestType: BridgeMessageType.ProcessStop,
+        conversationId,
+        targetId: payload.processId,
+        status: observation.outcome === 'outcome_unknown'
+          ? 'outcome_unknown'
+          : observation.outcome === 'cancelled'
+            ? 'blocked'
+            : observation.status === 'already_exited' ? 'already_satisfied' : 'committed',
+        ...(observation.reason ? { reason: observation.reason } : {})
+      }
+    });
+  }
+
   private async turnIdForMessage(conversationId: string, messageId: string): Promise<string> {
     const memberships = await this.list('MessagePartOfConversation', { conversation_id: conversationId, message_id: messageId }, 2);
     if (memberships.length !== 1) throw new Error('Message 不属于当前 Conversation。');
@@ -1361,14 +1501,21 @@ export class VscodeReliableKernelCommandRouter {
     webview: vscode.Webview,
     requestType: BridgeMessageType,
     message: string,
-    correlationId?: string
+    correlationId?: string,
+    details: {
+      section?: GlobalSettingsGetPayload['section'];
+      code?: 'settings_revision_conflict';
+      actualRevision?: string;
+    } = {}
   ): void {
+    const { section, ...payloadDetails } = details;
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.Error,
       channel: 'diagnostics',
+      ...(section ? { scope: { kind: 'settings' as const, level: 'global' as const, id: section } } : {}),
       correlationId,
-      payload: { requestType, message }
+      payload: { requestType, message, ...payloadDetails }
     });
   }
 
@@ -1420,19 +1567,59 @@ function sanitizeFileName(value: string): string {
   return name || 'plan.md';
 }
 
-function isTextMimeType(mimeType: string): boolean {
-  return mimeType.startsWith('text/')
-    || mimeType === 'application/json'
-    || mimeType.endsWith('+json')
-    || mimeType === 'application/xml'
-    || mimeType.endsWith('+xml');
+function decodeInlineAttachmentBase64(value: string): Buffer {
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.toString('base64') !== value) throw new TypeError('附件内联数据不是有效的 base64。');
+  return bytes;
 }
 
-function languageForMimeType(mimeType: string): string {
-  if (mimeType === 'application/json' || mimeType.endsWith('+json')) return 'json';
-  if (mimeType === 'application/xml' || mimeType.endsWith('+xml')) return 'xml';
-  if (mimeType.includes('markdown')) return 'markdown';
-  return 'plaintext';
+function attachmentOpenRequest(payload: AttachmentOpenPayload): Omit<AttachmentOpenPayload, 'data'> {
+  return {
+    ...(payload.attachmentId ? { attachmentId: payload.attachmentId } : {}),
+    ...(payload.sourcePath ? { sourcePath: payload.sourcePath } : {}),
+    ...(payload.mimeType ? { mimeType: payload.mimeType } : {}),
+    ...(payload.name ? { name: payload.name } : {})
+  };
+}
+
+function safeAttachmentFileName(id: string, name: string | undefined, mimeType: string): string {
+  const extension = attachmentExtension(mimeType);
+  const requested = name?.trim() || `attachment${extension}`;
+  let safe = requested
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .replace(/^\.+/, '')
+    .trim()
+    .slice(0, 120) || `attachment${extension}`;
+  if (extension && !path.extname(safe)) safe += extension;
+  const prefix = id.replace(/[^a-zA-Z0-9_.-]+/g, '-').slice(0, 48) || 'attachment';
+  return `${prefix}-${safe}`;
+}
+
+function attachmentExtension(mimeType: string): string {
+  switch (mimeType.toLowerCase()) {
+    case 'image/png': return '.png';
+    case 'image/jpeg': return '.jpg';
+    case 'image/webp': return '.webp';
+    case 'image/gif': return '.gif';
+    case 'application/pdf': return '.pdf';
+    case 'text/plain': return '.txt';
+    case 'application/json': return '.json';
+    case 'audio/mpeg': return '.mp3';
+    case 'video/mp4': return '.mp4';
+    default: return '';
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+  const value = error as { code?: unknown; message?: unknown };
+  return value.code === 'ENOENT'
+    || value.code === 'FileNotFound'
+    || typeof value.message === 'string' && /not found|不存在|ENOENT/i.test(value.message);
 }
 
 function isConfigurationMutationType(type: BridgeMessageType): boolean {

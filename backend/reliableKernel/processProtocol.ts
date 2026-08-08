@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
@@ -62,7 +63,11 @@ export interface ProcessWrapperManifest {
   droppedBytes: string;
   truncated: boolean;
   stdoutTailBytes: string;
+  stdoutTailSha256: string;
+  stdoutTailBase64: string;
   stderrTailBytes: string;
+  stderrTailSha256: string;
+  stderrTailBase64: string;
   updatedAt: string;
 }
 
@@ -181,12 +186,14 @@ export function parseWrapperIdentity(value: unknown): ProcessWrapperIdentity {
 export function parseWrapperManifest(value: unknown): ProcessWrapperManifest {
   const record = exactRecord(value, [
     'kind', 'processId', 'stableNonce', 'status', 'nextChunkSeq', 'retainedBytes',
-    'retainedChunks', 'droppedBytes', 'truncated', 'stdoutTailBytes', 'stderrTailBytes', 'updatedAt'
+    'retainedChunks', 'droppedBytes', 'truncated',
+    'stdoutTailBytes', 'stdoutTailSha256', 'stdoutTailBase64',
+    'stderrTailBytes', 'stderrTailSha256', 'stderrTailBase64', 'updatedAt'
   ], 'ProcessWrapperManifest');
   if (record.kind !== PROCESS_WRAPPER_PROTOCOL) throw new TypeError('Invalid ProcessWrapperManifest.kind.');
   if (record.status !== 'running' && record.status !== 'exited') throw new TypeError('Invalid ProcessWrapperManifest.status.');
   if (typeof record.truncated !== 'boolean') throw new TypeError('Invalid ProcessWrapperManifest.truncated.');
-  return {
+  const manifest: ProcessWrapperManifest = {
     kind: PROCESS_WRAPPER_PROTOCOL,
     processId: requireText(record.processId, 'processId'),
     stableNonce: requireText(record.stableNonce, 'stableNonce'),
@@ -197,8 +204,44 @@ export function parseWrapperManifest(value: unknown): ProcessWrapperManifest {
     droppedBytes: requireDecimalString(record.droppedBytes, 'droppedBytes'),
     truncated: record.truncated,
     stdoutTailBytes: requireDecimalString(record.stdoutTailBytes, 'stdoutTailBytes'),
+    stdoutTailSha256: requireSha256(record.stdoutTailSha256, 'stdoutTailSha256'),
+    stdoutTailBase64: requireCanonicalBase64(record.stdoutTailBase64, 'stdoutTailBase64'),
     stderrTailBytes: requireDecimalString(record.stderrTailBytes, 'stderrTailBytes'),
+    stderrTailSha256: requireSha256(record.stderrTailSha256, 'stderrTailSha256'),
+    stderrTailBase64: requireCanonicalBase64(record.stderrTailBase64, 'stderrTailBase64'),
     updatedAt: requireText(record.updatedAt, 'updatedAt')
+  };
+  if (manifest.status === 'exited' && (
+    manifest.stdoutTailBytes !== '0'
+    || manifest.stdoutTailBase64 !== ''
+    || manifest.stderrTailBytes !== '0'
+    || manifest.stderrTailBase64 !== ''
+  )) {
+    throw new TypeError('Exited ProcessWrapperManifest must not retain live tails.');
+  }
+  return manifest;
+}
+
+/**
+ * Decodes the live preview embedded in the manifest itself. Because manifest.json is replaced
+ * atomically, counters, both streams and their digests always describe one filesystem snapshot.
+ */
+export function processWrapperManifestLiveTails(
+  manifest: ProcessWrapperManifest
+): { stdout: Buffer; stderr: Buffer } {
+  return {
+    stdout: decodeManifestTail(
+      manifest.stdoutTailBase64,
+      manifest.stdoutTailBytes,
+      manifest.stdoutTailSha256,
+      'stdout'
+    ),
+    stderr: decodeManifestTail(
+      manifest.stderrTailBase64,
+      manifest.stderrTailBytes,
+      manifest.stderrTailSha256,
+      'stderr'
+    )
   };
 }
 
@@ -364,6 +407,37 @@ function requireNullablePositiveSafeInteger(value: unknown, label: string): numb
     throw new TypeError(`${label} must be a positive safe integer or null.`);
   }
   return value;
+}
+
+function requireCanonicalBase64(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new TypeError(`${label} must be canonical base64.`);
+  }
+  if (Buffer.from(value, 'base64').toString('base64') !== value) {
+    throw new TypeError(`${label} must be canonical base64.`);
+  }
+  return value;
+}
+
+function decodeManifestTail(
+  encoded: string,
+  byteLengthInput: string,
+  expectedSha256: string,
+  streamKind: ProcessStreamKind
+): Buffer {
+  const bytes = Buffer.from(encoded, 'base64');
+  const byteLength = BigInt(byteLengthInput);
+  if (byteLength > BigInt(PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM)) {
+    throw new TypeError(`ProcessWrapperManifest ${streamKind} tail exceeds the frozen bound.`);
+  }
+  if (BigInt(bytes.byteLength) !== byteLength) {
+    throw new TypeError(`ProcessWrapperManifest ${streamKind} tail length mismatch.`);
+  }
+  const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+  if (actualSha256 !== expectedSha256) {
+    throw new TypeError(`ProcessWrapperManifest ${streamKind} tail digest mismatch.`);
+  }
+  return bytes;
 }
 
 function requireLocator(value: unknown): string {

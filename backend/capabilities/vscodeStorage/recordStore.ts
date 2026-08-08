@@ -3,8 +3,11 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { RECORDS_DIR, STORAGE_VERSION } from './constants';
+import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { readJson, writeJson } from './json';
 import { sortableName } from './naming';
+import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
+import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
 
 interface RecordsIndexFile {
   schemaVersion: typeof STORAGE_VERSION;
@@ -33,6 +36,20 @@ type RecordFile<TKey extends string, TRecord> = {
 
 export interface SaveRecordStoreOptions {
   pruneMissing?: boolean;
+}
+
+export interface RecordStoreSnapshot<TRecord> {
+  records: TRecord[];
+  revision: string;
+}
+
+export interface RecordStoreCommitResult<TRecord> extends RecordStoreSnapshot<TRecord> {
+  previousRecords: TRecord[];
+}
+
+export interface CommitRecordStoreSnapshotOptions extends SaveRecordStoreOptions {
+  expectedRevision: string;
+  section: string;
 }
 
 const LOAD_RECORD_BATCH_SIZE = 32;
@@ -130,6 +147,68 @@ export async function loadRecordStoreByIds<TRecord extends { id: string }, TKey 
 
 export async function withRecordStoreTransaction<T>(lockUri: vscode.Uri, action: () => Promise<T>): Promise<T> {
   return withRecordStoreMutationLock(lockUri, action);
+}
+
+/** 在同一把资源锁中读取完整记录集合及其内容指纹。 */
+export async function loadRecordStoreSnapshot<TRecord extends { id: string }, TKey extends string>(
+  root: vscode.Uri,
+  indexUri: vscode.Uri,
+  recordKey: TKey
+): Promise<RecordStoreSnapshot<TRecord> | undefined> {
+  return withRecordStoreMutationLock(
+    indexUri,
+    () => loadRecordStoreSnapshotUnlocked<TRecord, TKey>(root, indexUri, recordKey)
+  );
+}
+
+export function missingRecordStoreRevision(indexUri: vscode.Uri): string {
+  return createMissingStorageRevision(`record-store:${indexUri.toString()}`);
+}
+
+/**
+ * 在同一把锁内完成“读取当前版本、拒绝旧版本、发布新索引”，避免多窗口静默覆盖。
+ */
+export async function commitRecordStoreSnapshot<TRecord extends { id: string }, TKey extends string>(
+  root: vscode.Uri,
+  indexUri: vscode.Uri,
+  records: TRecord[],
+  recordKey: TKey,
+  labelForRecord: (record: TRecord) => string,
+  options: CommitRecordStoreSnapshotOptions
+): Promise<RecordStoreCommitResult<TRecord>> {
+  return withRecordStoreMutationLock(indexUri, async () => {
+    const current = await loadRecordStoreSnapshotUnlocked<TRecord, TKey>(root, indexUri, recordKey);
+    const actualRevision = current?.revision ?? missingRecordStoreRevision(indexUri);
+    if (actualRevision !== options.expectedRevision) {
+      throw new SettingsRevisionConflictError(options.section, options.expectedRevision, actualRevision);
+    }
+
+    await saveRecordStoreUnlocked(root, indexUri, records, recordKey, labelForRecord, options);
+    return {
+      records: [...records],
+      revision: createStorageRevision(records),
+      previousRecords: current?.records ?? []
+    };
+  });
+}
+
+async function loadRecordStoreSnapshotUnlocked<TRecord extends { id: string }, TKey extends string>(
+  root: vscode.Uri,
+  indexUri: vscode.Uri,
+  recordKey: TKey
+): Promise<RecordStoreSnapshot<TRecord> | undefined> {
+  const index = await loadRecordsIndex(indexUri, true);
+  if (!index) {
+    const orphanFiles = await listRecordFiles(root);
+    if (orphanFiles.length > 0) {
+      throw new Error(`Record store index is missing while record files still exist: ${indexUri.fsPath}`);
+    }
+    return undefined;
+  }
+
+  const files = await loadRecordFilesInBatches<TRecord, TKey>(root, index.records, recordKey, true);
+  const records = files.filter((record): record is TRecord => record !== undefined);
+  return { records, revision: createStorageRevision(records) };
 }
 
 export async function saveRecordStore<TRecord extends { id: string }, TKey extends string>(
@@ -272,8 +351,8 @@ async function loadRecordFile<TRecord extends { id: string }, TKey extends strin
 async function listRecordFiles(root: vscode.Uri): Promise<string[]> {
   const recordsRoot = vscode.Uri.joinPath(root, RECORDS_DIR);
   try {
-    if (recordsRoot.scheme === 'file') {
-      const entries = await fs.readdir(recordsRoot.fsPath, { withFileTypes: true });
+    if (isNodeFsStorageUri(recordsRoot)) {
+      const entries = await fs.readdir(nodeFsStoragePath(recordsRoot), { withFileTypes: true });
       return entries
         .filter((entry) => entry.isFile())
         .map((entry) => `${RECORDS_DIR}/${entry.name}`)
@@ -295,7 +374,7 @@ async function listRecordFiles(root: vscode.Uri): Promise<string[]> {
 async function deleteRecordFile(root: vscode.Uri, file: string): Promise<void> {
   try {
     const uri = vscode.Uri.joinPath(root, ...file.split('/'));
-    if (uri.scheme === 'file') await fs.rm(uri.fsPath, { force: true });
+    if (isNodeFsStorageUri(uri)) await fs.rm(nodeFsStoragePath(uri), { force: true });
     else await vscode.workspace.fs.delete(uri);
   } catch (error) {
     if (!isFileNotFound(error)) console.warn(`[LimCode] Failed to prune record file: ${file}`, error);
@@ -321,16 +400,17 @@ async function withRecordStoreMutationLock<T>(indexUri: vscode.Uri, action: () =
 }
 
 async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: () => Promise<T>): Promise<T> {
-  if (indexUri.scheme !== 'file') return action();
+  if (!isNodeFsStorageUri(indexUri)) return action();
 
-  const lockPath = `${indexUri.fsPath}.lock`;
+  const indexPath = nodeFsStoragePath(indexUri);
+  const lockPath = `${indexPath}.lock`;
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + RECORD_STORE_LOCK_WAIT_MS;
   const metadata: RecordStoreLockMetadata = {
     ownerToken: randomUUID(),
     pid: process.pid,
     createdAt: Date.now(),
-    indexPath: path.resolve(indexUri.fsPath)
+    indexPath: path.resolve(indexPath)
   };
 
   for (;;) {
@@ -340,7 +420,7 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
     } catch (error) {
       if (!isAlreadyExistsError(error)) throw error;
       if (await removeStaleRecordStoreLock(lockPath, metadata.indexPath)) continue;
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for record store lock: ${indexUri.fsPath}`);
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for record store lock: ${indexPath}`);
       await delay(25);
     }
   }

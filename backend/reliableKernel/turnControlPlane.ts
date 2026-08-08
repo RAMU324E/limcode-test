@@ -4,6 +4,10 @@ import type {
   LlmProviderKind,
   MessageRetryTarget
 } from '../../shared/protocol';
+import type {
+  AttachmentIngestService,
+  PreparedMessageAttachmentAdmission
+} from './attachmentIngest';
 import {
   ContentAddressedStore,
   type ContentObjectMetadata,
@@ -295,6 +299,7 @@ export interface TurnUnresolvedFileClosure {
 
 export interface TurnControlPlaneOptions {
   authorityCompiler: TurnAuthorityCompiler;
+  attachments?: AttachmentIngestService;
   unresolvedFileClosure?: TurnUnresolvedFileClosure;
   /** Injects pending next_turn RuntimeDelivery facts into an admitted ordinary Turn atomically. */
   prepareNextTurnDeliverySteps?: (
@@ -398,6 +403,7 @@ interface RetryRewindPlan {
 export class TurnControlPlane {
   private readonly now: () => string;
   private readonly authorityCompiler: TurnAuthorityCompiler;
+  private readonly attachments?: AttachmentIngestService;
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
   private readonly prepareNextTurnDeliverySteps?: TurnControlPlaneOptions['prepareNextTurnDeliverySteps'];
   private readonly contextSequence: ContextSequenceControlPlane;
@@ -411,6 +417,7 @@ export class TurnControlPlane {
       throw new TypeError('TurnControlPlane requires a server-side TurnAuthorityCompiler.');
     }
     this.authorityCompiler = options.authorityCompiler;
+    this.attachments = options.attachments;
     this.unresolvedFileClosure = options.unresolvedFileClosure;
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
     this.now = options.now ?? (() => new Date().toISOString());
@@ -1110,18 +1117,34 @@ export class TurnControlPlane {
     const ids = dependentStartCommandIds(intentId, decoded.messageContent !== null);
     const admissionReceiptId = intentDependentEntityId(intentId, 'admission_command_receipt');
     const now = this.timestamp();
-    const decodedMessageEstimatedTokens = decoded.messageContent
-      ? estimateStoredMessageContentTokens(
-          await this.contentStore.read(decoded.messageContent.metadata),
-          decoded.messageContent.metadata.content_type
-        )
+    const decodedMessageBytes = decoded.messageContent
+      ? await this.contentStore.read(decoded.messageContent.metadata)
       : undefined;
-    const messageContext = decoded.messageContent
+    const decodedAttachmentAdmission = decoded.messageContent && decodedMessageBytes
+      ? await this.prepareFrozenMessageAttachments(
+        decodedMessageBytes,
+        decoded.messageContent.metadata.content_type
+      )
+      : undefined;
+    const admittedMessageContent = decoded.messageContent && decodedAttachmentAdmission
+      ? await this.contentStore.prepare(
+        this.database,
+        decodedAttachmentAdmission.value,
+        decodedAttachmentAdmission.contentType
+      )
+      : decoded.messageContent;
+    const decodedMessageEstimatedTokens = admittedMessageContent && decodedAttachmentAdmission
+      ? estimateStoredMessageContentTokens(
+        decodedAttachmentAdmission.value,
+        decodedAttachmentAdmission.contentType
+      )
+      : undefined;
+    const messageContext = admittedMessageContent
       ? await this.contextSequence.prepareMessageAppendMutation({
           conversationId,
           messageRevisionId: requireId(ids.messageRevision, 'messageRevisionId'),
-          contentObjectId: decoded.messageContent.metadata.id,
-          contentByteLength: decoded.messageContent.metadata.byte_length,
+          contentObjectId: admittedMessageContent.metadata.id,
+          contentByteLength: admittedMessageContent.metadata.byte_length,
           contentEstimatedTokens: decodedMessageEstimatedTokens
         })
       : null;
@@ -1181,12 +1204,19 @@ export class TurnControlPlane {
         agent_id: executorAgentId,
         created_at: now
       }),
-      ...(decoded.messageContent ? messageAdmissionSteps(
+      ...(decodedAttachmentAdmission?.storageSteps ?? []),
+      ...(admittedMessageContent
+        ? preparedContentObjectSteps([admittedMessageContent], 'queued_message_content')
+        : []),
+      ...(admittedMessageContent ? messageAdmissionSteps(
         { receipt: admissionReceiptId, intent: intentId, ...ids },
-        decoded.messageContent,
+        admittedMessageContent,
         conversationId,
         now
       ) : []),
+      ...(decodedAttachmentAdmission && ids.messageRevision && this.attachments
+        ? this.attachments.linkSteps(decodedAttachmentAdmission, ids.messageRevision, now)
+        : []),
       ...(messageContext?.steps ?? []),
       ...nextDeliverySteps,
       DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
@@ -1201,7 +1231,7 @@ export class TurnControlPlane {
         intentId,
         admitted: true,
         turnId: ids.turn,
-        ...(decoded.messageContent ? {
+        ...(admittedMessageContent ? {
           messageId: ids.message,
           messageRevisionId: ids.messageRevision,
           messageRevisionSeq: allocatedRuntimeValue(
@@ -1230,6 +1260,34 @@ export class TurnControlPlane {
     if (value.kind !== 'continuation') throw new Error('Queued TurnIntent has an unsupported intent envelope.');
     const objectId = requireId(value.messageContentObjectId, 'TurnIntent continuation.messageContentObjectId');
     return { operation: 'continuation', messageContent: { metadata: await this.readContentObject(objectId) } };
+  }
+
+  private async prepareMessageAttachments(
+    content: TurnCommandContent,
+    contentType: string
+  ): Promise<PreparedMessageAttachmentAdmission> {
+    if (this.attachments) return this.attachments.prepareMessageContent({ content, contentType });
+    return {
+      value: content,
+      contentType,
+      attachments: [],
+      storageSteps: [],
+      totalBytes: 0
+    };
+  }
+
+  private async prepareFrozenMessageAttachments(
+    content: TurnCommandContent,
+    contentType: string
+  ): Promise<PreparedMessageAttachmentAdmission> {
+    if (this.attachments) return this.attachments.prepareFrozenMessageContent({ content, contentType });
+    return {
+      value: content,
+      contentType,
+      attachments: [],
+      storageSteps: [],
+      totalBytes: 0
+    };
   }
 
   private async readContentObject(id: string): Promise<ContentObjectMetadata> {
@@ -1303,19 +1361,25 @@ export class TurnControlPlane {
     if (retryRewind) compiled = withRetryLineage(compiled, retryRewind.lineage);
     const now = this.timestamp();
 
-    const messageContent = plan.messageContent === undefined
+    const messageAttachmentAdmission = plan.messageContent === undefined
       ? undefined
-      : await this.contentStore.prepare(
-        this.database,
+      : await this.prepareMessageAttachments(
         plan.messageContent,
         requireContentType(plan.messageContentType ?? 'text/plain')
       );
-    const messageContentEstimatedTokens = plan.messageContent === undefined
+    const messageContent = messageAttachmentAdmission === undefined
+      ? undefined
+      : await this.contentStore.prepare(
+        this.database,
+        messageAttachmentAdmission.value,
+        messageAttachmentAdmission.contentType
+      );
+    const messageContentEstimatedTokens = messageAttachmentAdmission === undefined
       ? undefined
       : estimateStoredMessageContentTokens(
-          plan.messageContent,
-          requireContentType(plan.messageContentType ?? 'text/plain')
-        );
+        messageAttachmentAdmission.value,
+        messageAttachmentAdmission.contentType
+      );
     const intentContent = plan.operation === 'input'
       ? requirePrepared(messageContent, 'input message content')
       : await this.contentStore.prepare(
@@ -1410,6 +1474,13 @@ export class TurnControlPlane {
     ];
     if (messageContent) {
       admission.push(...messageAdmissionSteps(ids, messageContent, conversation.id as string, now));
+      if (messageAttachmentAdmission && this.attachments) {
+        admission.push(...this.attachments.linkSteps(
+          messageAttachmentAdmission,
+          requireId(ids.messageRevision, 'message revision id'),
+          now
+        ));
+      }
       admission.push(...messageContext!.steps);
     }
     if (childAdmission) admission.push(...childAdmission.admissionSteps);
@@ -1424,6 +1495,7 @@ export class TurnControlPlane {
       steps: [
         ...(plan.runtimeMaintenance ? conversationIdleAssertionSteps(conversation.id as string) : []),
         ...(retryRewind?.steps ?? []),
+        ...(messageAttachmentAdmission?.storageSteps ?? []),
         ...preparedContentObjectSteps([
           intentContent,
           presetContent,
@@ -1913,10 +1985,12 @@ export class TurnControlPlane {
       ? messageSnapshot.entries.filter((entry) => entry.messageSeq > sourceMessageSeq)
       : [];
     const now = this.timestamp();
+    const contentType = requireContentType(commandInput.contentType ?? 'text/plain');
+    const attachmentAdmission = await this.prepareMessageAttachments(commandInput.content, contentType);
     const content = await this.contentStore.prepare(
       this.database,
-      commandInput.content,
-      requireContentType(commandInput.contentType ?? 'text/plain')
+      attachmentAdmission.value,
+      attachmentAdmission.contentType
     );
     const previousRevisionId = requireId(relation.currentRevision.id, 'current MessageRevision.id');
     const contextPlan = deleteFollowing
@@ -1955,6 +2029,7 @@ export class TurnControlPlane {
           { revision_id: previousRevisionId }
         ),
         ...softDeleteEntrySteps(suffix, now),
+        ...attachmentAdmission.storageSteps,
         ...preparedContentObjectSteps([content], 'edit_content'),
         DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
           id: revisionId,
@@ -1966,6 +2041,7 @@ export class TurnControlPlane {
           column: 'revision_seq',
           scope: { message_id: messageId }
         }),
+        ...(this.attachments ? this.attachments.linkSteps(attachmentAdmission, revisionId, now) : []),
         ...contextPlan.steps,
         DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(relation.currentLink.id as string, {
           revision_id: revisionId,
@@ -2036,10 +2112,12 @@ export class TurnControlPlane {
     const messageSnapshot = await this.conversationMessageSnapshot(conversationId);
     const sourceMessageSeq = requireBigInt(relation.membership.message_seq, 'MessagePartOfConversation.message_seq');
     const suffix = messageSnapshot.entries.filter((entry) => entry.messageSeq > sourceMessageSeq);
+    const contentType = requireContentType(command.contentType ?? 'text/plain');
+    const attachmentAdmission = await this.prepareMessageAttachments(command.content, contentType);
     const content = await this.contentStore.prepare(
       this.database,
-      command.content,
-      requireContentType(command.contentType ?? 'text/plain')
+      attachmentAdmission.value,
+      attachmentAdmission.contentType
     );
     const previousRevisionId = requireId(relation.currentRevision.id, 'current MessageRevision.id');
     const contextPlan = await this.contextSequence.prepareMessageTruncateMutation({
@@ -2112,6 +2190,7 @@ export class TurnControlPlane {
           { revision_id: previousRevisionId }
         ),
         ...softDeleteEntrySteps(suffix, now),
+        ...attachmentAdmission.storageSteps,
         ...preparedContentObjectSteps([
           content,
           intentContent,
@@ -2125,6 +2204,7 @@ export class TurnControlPlane {
           content_object_id: content.metadata.id,
           created_at: now
         }, { column: 'revision_seq', scope: { message_id: messageId } }),
+        ...(this.attachments ? this.attachments.linkSteps(attachmentAdmission, revisionId, now) : []),
         ...contextPlan.steps,
         DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(
           requireId(relation.currentLink.id, 'MessageCurrentRevisionLink.id'),

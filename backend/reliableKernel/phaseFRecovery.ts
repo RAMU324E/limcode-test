@@ -106,6 +106,27 @@ export class PhaseFRecoveryScanner {
       const turnId = String(link.turn_id);
       const turn = requireRow(turns[index], `Turn ${turnId}`);
       if (turn.status !== 'terminated') continue;
+      const terminations = await listAllDomainRows(this.database, 'TurnTermination', { turn_id: turnId });
+      if (terminations.length !== 1) {
+        throw new Error(`Terminal child Turn ${turnId} must have exactly one TurnTermination.`);
+      }
+      if (terminations[0].terminal_status === 'failed') {
+        const reason = typeof terminations[0].reason === 'string' && terminations[0].reason.trim()
+          ? terminations[0].reason.trim()
+          : `Child Turn ${turnId} failed.`;
+        const failed = await this.answers.reconcileFailedTurn({
+          childExecutionId: String(link.child_execution_id),
+          turnId,
+          reason
+        });
+        if (failed?.disposition.kind === 'delivery_required') {
+          await this.deliveries.createAutomatic({
+            inboxItemId: failed.disposition.command.inboxItemId,
+            targetConversationId: failed.disposition.command.targetConversationId,
+            sourceTurnId: failed.disposition.automaticSourceTurnId
+          });
+        }
+      }
       await this.children.observeTurnTerminal(String(link.child_execution_id), turnId);
     }
   }
