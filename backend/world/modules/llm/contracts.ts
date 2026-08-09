@@ -23,6 +23,12 @@ export interface LlmStartRequest {
   conversationId?: string;
   model?: LlmModelSettings;
   settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
+  /** Process-local reliable dispatch metadata; never persisted as Provider settings. */
+  reliableProviderAttempt?: {
+    attemptSeq: number;
+    maxAttempts: number;
+    requestCreatedAt?: number;
+  };
 }
 
 export interface LlmResolveInvocationRequest {

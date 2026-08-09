@@ -12,12 +12,16 @@ import type {
 
 const MAX_SOCKET_AGE_MS = 55 * 60 * 1_000;
 const MAX_RETAINED_SESSIONS = 32;
-const IDLE_SESSION_TTL_MS = 15 * 60 * 1_000;
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+const IDLE_SESSION_TTL_MS = MAX_SOCKET_AGE_MS;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const DEFAULT_SEND_TIMEOUT_MS = 10_000;
 const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 120_000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 15 * 60 * 1_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 20_000;
+const DEFAULT_PONG_TIMEOUT_MS = 60_000;
+const DEFAULT_PRE_SEND_PROBE_STALE_MS = 45_000;
+const DEFAULT_PRE_SEND_PROBE_TIMEOUT_MS = 2_000;
 const NETWORK_IDENTITY_CHECK_INTERVAL_MS = 2_000;
 // These codes describe a graceful WebSocket closing handshake, not a completed Responses request.
 // This error class is constructed only when the socket closes before a terminal Responses event,
@@ -46,6 +50,7 @@ export interface OpenAIResponsesWebSocketDecision {
     | 'reused'
     | 'new_connection'
     | 'socket_expired'
+    | 'socket_unhealthy'
     | 'handshake_identity_changed';
   mode: 'full' | 'incremental';
   reason: string;
@@ -63,6 +68,8 @@ export type OpenAIResponsesWebSocketPhaseKind =
   | 'socket_opening'
   | 'socket_reused'
   | 'socket_opened'
+  | 'socket_probe_started'
+  | 'socket_probe_succeeded'
   | 'send_started'
   | 'request_sent'
   | 'first_raw_event'
@@ -112,11 +119,16 @@ export interface OpenAIResponsesWebSocketTimeouts {
   firstEventMs: number;
   eventIdleMs: number;
   responseMs: number;
+  heartbeatIntervalMs: number;
+  pongTimeoutMs: number;
+  preSendProbeStaleMs: number;
+  preSendProbeTimeoutMs: number;
 }
 
 export type OpenAIResponsesWebSocketTimeoutPhase =
   | 'handshake'
   | 'send'
+  | 'health_probe'
   | 'first_event'
   | 'event_idle'
   | 'response';
@@ -126,13 +138,16 @@ export class OpenAIResponsesWebSocketTimeoutError extends Error {
   public readonly transport = 'websocket';
   public readonly retryable = true;
   public readonly transportAttemptsExhausted = false;
+  public readonly receivedServerEvent: boolean;
 
   public constructor(
     public readonly phase: OpenAIResponsesWebSocketTimeoutPhase,
-    public readonly timeoutMs: number
+    public readonly timeoutMs: number,
+    receivedServerEvent = false
   ) {
     super(`OpenAI Responses WebSocket ${phase} timed out after ${timeoutMs}ms.`);
     this.name = 'OpenAIResponsesWebSocketTimeoutError';
+    this.receivedServerEvent = receivedServerEvent;
   }
 }
 
@@ -151,6 +166,8 @@ interface WebSocketSession {
   key: string;
   socket?: WebSocket;
   connectedAt?: number;
+  lastPongAt?: number;
+  heartbeatTimer?: NodeJS.Timeout;
   connectionIdentityHash?: string;
   connectionGeneration: number;
   lastUsedAt: number;
@@ -241,7 +258,7 @@ async function* streamLocked(
   let connection: SocketAdmission;
   try {
     throwIfAborted(options.signal);
-    connection = await ensureSocket(session, options);
+    connection = await ensureSocket(session, options, resolvedTimeouts(options.timeouts));
   } catch (error) {
     observeTransportFailure(session, options, error);
     closeAndInvalidate(session, true);
@@ -457,8 +474,8 @@ function evictIdleSessions(now = Date.now()): void {
   for (const [key, session] of sessions) {
     if (session.activeOperations > 0) continue;
     if (now - session.lastUsedAt < IDLE_SESSION_TTL_MS) continue;
-    // Idle means no operation owns the socket. An OPEN readyState does not make a 15-minute-old
-    // connection fresh; keeping it until MAX_SOCKET_AGE_MS defeated this TTL and reused dead relays.
+    // Heartbeats now evict dead relays proactively, so a healthy idle socket remains warm until
+    // the same 55-minute age cap used by admission instead of being discarded after 15 minutes.
     closeAndInvalidate(session, true);
     sessions.delete(key);
   }
@@ -520,27 +537,49 @@ function evictOverflowSessions(): void {
 
 async function ensureSocket(
   session: WebSocketSession,
-  options: OpenAIResponsesWebSocketStreamOptions
+  options: OpenAIResponsesWebSocketStreamOptions,
+  timeouts: OpenAIResponsesWebSocketTimeouts
 ): Promise<SocketAdmission> {
   const connection = webSocketConnectionConfig(options);
   const socket = session.socket;
   const expired = session.connectedAt !== undefined
     && Date.now() - session.connectedAt >= MAX_SOCKET_AGE_MS;
   const identityMatches = session.connectionIdentityHash === connection.identityHash;
+  let socketUnhealthy = false;
   if (socket?.readyState === WebSocket.OPEN && !expired && identityMatches) {
-    const admission = { reused: true, reason: 'reused' } as const;
-    observeTransportPhase(session, options, 'socket_reused', {
-      connectionReused: true,
-      connectionReason: admission.reason
-    });
-    return admission;
+    const lastHealthAt = session.lastPongAt ?? session.connectedAt ?? 0;
+    if (Date.now() - lastHealthAt >= timeouts.preSendProbeStaleMs) {
+      const startedAt = Date.now();
+      observeTransportPhase(session, options, 'socket_probe_started');
+      try {
+        await probeSocket(socket, timeouts.preSendProbeTimeoutMs, options.signal);
+        session.lastPongAt = Date.now();
+        observeTransportPhase(session, options, 'socket_probe_succeeded', {
+          elapsedMs: Date.now() - startedAt
+        });
+      } catch (error) {
+        if (isAbort(options.signal, error)) throw error;
+        socketUnhealthy = true;
+        closeAndInvalidate(session, true);
+      }
+    }
+    if (!socketUnhealthy && session.socket === socket && socket.readyState === WebSocket.OPEN) {
+      const admission = { reused: true, reason: 'reused' } as const;
+      observeTransportPhase(session, options, 'socket_reused', {
+        connectionReused: true,
+        connectionReason: admission.reason
+      });
+      return admission;
+    }
   }
 
-  const reason: SocketAdmission['reason'] = socket?.readyState === WebSocket.OPEN && !identityMatches
-    ? 'handshake_identity_changed'
-    : expired
-      ? 'socket_expired'
-      : 'new_connection';
+  const reason: SocketAdmission['reason'] = socketUnhealthy
+    ? 'socket_unhealthy'
+    : socket?.readyState === WebSocket.OPEN && !identityMatches
+      ? 'handshake_identity_changed'
+      : expired
+        ? 'socket_expired'
+        : 'new_connection';
 
   // previous_response_id is connection-local. Any physical reconnect starts a new chain.
   observeTransportPhase(session, options, 'socket_opening', {
@@ -551,13 +590,14 @@ async function ensureSocket(
   closeAndInvalidate(session, true);
   session.socket = await openSocket(
     connection,
-    resolvedTimeouts(options.timeouts).handshakeMs,
+    timeouts.handshakeMs,
     options.signal
   );
   session.connectedAt = Date.now();
   session.connectionIdentityHash = connection.identityHash;
   session.connectionGeneration += 1;
   session.lastUsedAt = Date.now();
+  startHeartbeat(session, session.socket, timeouts);
   observeTransportPhase(session, options, 'socket_opened', {
     connectionReused: false,
     connectionReason: reason
@@ -827,6 +867,92 @@ async function openSocket(
   });
 }
 
+function startHeartbeat(
+  session: WebSocketSession,
+  socket: WebSocket,
+  timeouts: OpenAIResponsesWebSocketTimeouts
+): void {
+  if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
+  session.lastPongAt = Date.now();
+
+  const invalidateOwnedSocket = () => {
+    if (session.socket !== socket) return;
+    closeAndInvalidate(session, true);
+  };
+  socket.on('pong', () => {
+    if (session.socket === socket) session.lastPongAt = Date.now();
+  });
+  socket.on('error', invalidateOwnedSocket);
+  socket.on('close', invalidateOwnedSocket);
+
+  const heartbeat = setInterval(() => {
+    if (session.socket !== socket) {
+      clearInterval(heartbeat);
+      return;
+    }
+    if (socket.readyState !== WebSocket.OPEN) {
+      invalidateOwnedSocket();
+      return;
+    }
+    const lastPongAt = session.lastPongAt ?? session.connectedAt ?? 0;
+    if (Date.now() - lastPongAt >= timeouts.pongTimeoutMs) {
+      invalidateOwnedSocket();
+      return;
+    }
+    try {
+      socket.ping((error?: Error) => {
+        if (error) invalidateOwnedSocket();
+      });
+    } catch {
+      invalidateOwnedSocket();
+    }
+  }, timeouts.heartbeatIntervalMs);
+  heartbeat.unref?.();
+  session.heartbeatTimer = heartbeat;
+}
+
+function probeSocket(socket: WebSocket, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+      socket.off('pong', onPong);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+    };
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => finish(abortError(signal));
+    const onPong = () => finish();
+    const onError = (error: Error) => finish(error);
+    const onClose = (code: number, reason: Buffer) => finish(
+      new OpenAIResponsesWebSocketCloseError(code, reason.toString('utf8').trim(), 'connecting', false)
+    );
+    const timeout = setTimeout(
+      () => finish(new OpenAIResponsesWebSocketTimeoutError('health_probe', timeoutMs)),
+      timeoutMs
+    );
+    signal?.addEventListener('abort', onAbort, { once: true });
+    socket.once('pong', onPong);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+    try {
+      socket.ping((error?: Error) => {
+        if (error) finish(error);
+      });
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
 async function* sendCreateAndReadEvents(
   socket: WebSocket,
   payload: Record<string, unknown>,
@@ -857,7 +983,7 @@ async function* sendCreateAndReadEvents(
     networkIdentityTimer = undefined;
   };
   const failAfter = (phase: OpenAIResponsesWebSocketTimeoutPhase, timeoutMs: number) => {
-    queue.fail(new OpenAIResponsesWebSocketTimeoutError(phase, timeoutMs));
+    queue.fail(new OpenAIResponsesWebSocketTimeoutError(phase, timeoutMs, sawEvent));
   };
   const armEventIdleTimeout = () => {
     if (eventIdleTimeout !== undefined) clearTimeout(eventIdleTimeout);
@@ -892,7 +1018,18 @@ async function* sendCreateAndReadEvents(
       queue.end();
     }
   };
-  const onError = (error: Error) => queue.fail(error);
+  const onError = (error: Error) => {
+    const wrapped = structuredTransportError(
+      error.message || 'OpenAI Responses WebSocket transport error.',
+      typeof (error as Error & { code?: unknown }).code === 'string'
+        ? (error as Error & { code: string }).code
+        : 'websocket_error',
+      sawEvent ? 'streaming' : 'awaiting_first_event',
+      sawEvent
+    );
+    (wrapped as Error & { cause?: unknown }).cause = error;
+    queue.fail(wrapped);
+  };
   const onClose = (code: number, reason: Buffer) => {
     if (sawTerminal) queue.end();
     else queue.fail(new OpenAIResponsesWebSocketCloseError(
@@ -979,7 +1116,23 @@ function resolvedTimeouts(
     sendMs: positiveTimeout(overrides?.sendMs, DEFAULT_SEND_TIMEOUT_MS, 'sendMs'),
     firstEventMs: positiveTimeout(overrides?.firstEventMs, DEFAULT_FIRST_EVENT_TIMEOUT_MS, 'firstEventMs'),
     eventIdleMs: positiveTimeout(overrides?.eventIdleMs, DEFAULT_EVENT_IDLE_TIMEOUT_MS, 'eventIdleMs'),
-    responseMs: positiveTimeout(overrides?.responseMs, DEFAULT_RESPONSE_TIMEOUT_MS, 'responseMs')
+    responseMs: positiveTimeout(overrides?.responseMs, DEFAULT_RESPONSE_TIMEOUT_MS, 'responseMs'),
+    heartbeatIntervalMs: positiveTimeout(
+      overrides?.heartbeatIntervalMs,
+      DEFAULT_HEARTBEAT_INTERVAL_MS,
+      'heartbeatIntervalMs'
+    ),
+    pongTimeoutMs: positiveTimeout(overrides?.pongTimeoutMs, DEFAULT_PONG_TIMEOUT_MS, 'pongTimeoutMs'),
+    preSendProbeStaleMs: positiveTimeout(
+      overrides?.preSendProbeStaleMs,
+      DEFAULT_PRE_SEND_PROBE_STALE_MS,
+      'preSendProbeStaleMs'
+    ),
+    preSendProbeTimeoutMs: positiveTimeout(
+      overrides?.preSendProbeTimeoutMs,
+      DEFAULT_PRE_SEND_PROBE_TIMEOUT_MS,
+      'preSendProbeTimeoutMs'
+    )
   };
 }
 
@@ -1346,6 +1499,9 @@ function closeAndInvalidate(session: WebSocketSession, terminate: boolean): void
   const socket = session.socket;
   session.socket = undefined;
   session.connectedAt = undefined;
+  session.lastPongAt = undefined;
+  if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
+  session.heartbeatTimer = undefined;
   session.connectionIdentityHash = undefined;
   invalidateContinuation(session);
   if (!socket) return;

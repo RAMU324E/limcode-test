@@ -521,7 +521,7 @@ export type LlmCompressionThresholdUnit = 'percent' | 'tokens';
 
 export const DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 200_000;
 export const DEFAULT_LLM_RETRY_ON_ERROR = true;
-export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 3;
+export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 4;
 /** Reliable Runtime hard ceiling for automatic Provider retries (excluding the original attempt). */
 export const MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS = 10;
 export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
@@ -676,7 +676,7 @@ export interface LlmProviderModelConfigRecord {
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
-  /** 最大重试次数，不包含原始请求；3 表示最多 1 + 3 次请求，-1 表示无限重试。 */
+  /** 最大重试次数，不包含原始请求；4 表示最多 1 + 4 次请求，-1 表示无限重试。 */
   retryMaxAttempts: number;
   enableMultimodalTools: boolean;
   contextWindowTokens?: number;
@@ -703,7 +703,7 @@ export interface LlmProviderConfigRecord {
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
-  /** 最大重试次数，不包含原始请求；3 表示最多 1 + 3 次请求，-1 表示无限重试。 */
+  /** 最大重试次数，不包含原始请求；4 表示最多 1 + 4 次请求，-1 表示无限重试。 */
   retryMaxAttempts: number;
   enableMultimodalTools: boolean;
   contextWindowTokens?: number;

@@ -71,6 +71,7 @@ export interface FullProviderRequest {
   conversationId: string;
   attemptSeq: string;
   socketGeneration: string;
+  requestCreatedAt?: number;
   providerId: string;
   modelId: string;
   authoritySnapshot: PlainJsonValue;
@@ -134,7 +135,7 @@ const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
 const DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS = 80_000;
 const DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS = 4.5 * 60 * 1_000;
-const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 10_000] as const;
+const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000] as const;
 const DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS = 1_000;
 
 export interface ProviderSemanticTimeouts {
@@ -478,12 +479,14 @@ export class ModelProviderControlPlane {
       requireId(projection.root_id, 'ModelContextProjection.root_id'),
       materialized.segments
     );
+    const requestCreatedAt = domainTimestampMs(request.created_at);
     return {
       kind: 'full-model-request',
       modelRequestId,
       conversationId: frozen.conversationId,
       attemptSeq: attemptSeq.toString(),
       socketGeneration: socketGeneration.toString(),
+      ...(requestCreatedAt === undefined ? {} : { requestCreatedAt }),
       providerId: frozenModel.providerId,
       modelId: frozenModel.modelId,
       authoritySnapshot: frozenAuthority,
@@ -697,6 +700,7 @@ export class ModelProviderControlPlane {
       }
       const identity = await this.openSocketGeneration(modelRequestId, attemptSeq, stats);
       let lastObservedStreamSeq = 0n;
+      let sawReplayUnsafeProviderEvent = false;
       const controller = new AbortController();
       const detachCallerSignal = relayAbort(options.signal, controller);
       const unregister = this.registerActiveSocket(modelRequestId, controller);
@@ -720,7 +724,10 @@ export class ModelProviderControlPlane {
             const observedSeq = decimalBigInt(event.streamSeq, 'Provider event streamSeq');
             if (observedSeq > lastObservedStreamSeq) lastObservedStreamSeq = observedSeq;
             const semanticProgress = event.semanticProgress !== false;
-            if (semanticProgress) progressWaiter.beginProgress();
+            if (semanticProgress) {
+              sawReplayUnsafeProviderEvent = true;
+              progressWaiter.beginProgress();
+            }
             try {
               return await this.recordDispatchStreamEvent(
                 modelRequestId,
@@ -799,6 +806,22 @@ export class ModelProviderControlPlane {
           providerFailureTerminalState(error)
         );
         throw error;
+      }
+      if (sawReplayUnsafeProviderEvent) {
+        const replayUnsafe = Object.assign(
+          new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`),
+          { cause: error }
+        );
+        const applied = await this.failRequest(modelRequestId, identity, replayUnsafe);
+        if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
+        this.emitTransientTerminal(
+          options,
+          identity,
+          'failed',
+          lastObservedStreamSeq + 1n,
+          providerFailureTerminalState(replayUnsafe)
+        );
+        throw replayUnsafe;
       }
       const maxRetries = retryPolicy?.enabled ? retryPolicy.maxRetries : 0;
       if (identity.attemptSeq >= BigInt(maxRetries + 1)) {
@@ -1107,7 +1130,11 @@ export class ModelProviderControlPlane {
     ) return null;
     const nextAttemptSeq = failed.attemptSeq + 1n;
     const attemptId = stableId('model_request_attempt', modelRequestId, nextAttemptSeq.toString());
-    const delayMs = retryDelayMs(retryOrdinal, this.retryDelaysMs);
+    const delayMs = retryDelayMs(
+      retryOrdinal,
+      this.retryDelaysMs,
+      `${modelRequestId}:${retryOrdinal}`
+    );
     const retryNotBeforeAt = this.epochNow() + delayMs;
     const now = this.timestamp();
     const nextStats: StreamStats = {
@@ -1556,11 +1583,15 @@ function normalizeRetryDelays(value: readonly number[] | undefined): readonly nu
   });
 }
 
-function retryDelayMs(retryOrdinal: number, delays: readonly number[]): number {
+function retryDelayMs(retryOrdinal: number, delays: readonly number[], jitterKey?: string): number {
   if (!Number.isSafeInteger(retryOrdinal) || retryOrdinal <= 0) {
     throw new TypeError('retryOrdinal must be a positive safe integer.');
   }
-  return delays[Math.min(delays.length - 1, retryOrdinal - 1)]!;
+  const base = delays[Math.min(delays.length - 1, retryOrdinal - 1)]!;
+  if (!jitterKey || base === 0) return base;
+  const byte = createHash('sha256').update(jitterKey).digest()[0] ?? 0;
+  const factor = 0.75 + (byte / 255) * 0.25;
+  return Math.max(0, Math.round(base * factor));
 }
 
 function retryPolicyForFullRequest(request: FullProviderRequest): FrozenProviderRetryPolicy {
@@ -1831,6 +1862,13 @@ function optionalBoundedInteger(
     throw new TypeError(`Provider stream ${label} must be an integer in [${minimum}, ${maximum}].`);
   }
   return value as number;
+}
+
+function domainTimestampMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value;
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function optionalTimestamp(value: unknown, label: string, allowZero = false): number | undefined {

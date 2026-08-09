@@ -109,10 +109,26 @@ interface UnifiedDryRunCapable {
   }): Promise<UnifiedDryRunResult>;
 }
 
+interface UnifiedChatProvider extends UnifiedDryRunCapable {
+  chat<T>(request: unknown, options: {
+    inputFormat: 'unified';
+    outputFormat: 'unified';
+    signal?: AbortSignal;
+  }): Promise<T>;
+  chatStream<T>(request: unknown, options: {
+    inputFormat: 'unified';
+    outputFormat: 'unified';
+    signal?: AbortSignal;
+  }): AsyncIterable<T>;
+}
+
 export interface LlmProviderTransportTrace {
   requestId: string;
   conversationId: string;
-  phase: OpenAIResponsesWebSocketPhaseKind | 'continuation_decision';
+  phase: OpenAIResponsesWebSocketPhaseKind
+    | 'continuation_decision'
+    | 'http_fallback'
+    | 'http_cooldown';
   observedAt: number;
   sessionKeyHash: string;
   connectionGeneration: number;
@@ -160,6 +176,9 @@ interface LlmAttemptTimingState {
 }
 
 const THOUGHT_PROGRESS_INTERVAL_MS = 500;
+const OPENAI_RESPONSES_WS_RETRY_BUDGET_MS = 120_000;
+const OPENAI_RESPONSES_HTTP_COOLDOWN_MS = 60_000;
+const openAIResponsesHttpCooldowns = new Map<string, number>();
 
 class LlmAttemptFailureError extends Error {
   public constructor(public readonly failure: LlmAttemptFailure) {
@@ -262,6 +281,7 @@ export function createLlmProviderCapability(options: LlmProviderOptions): LlmCap
       controllers.clear();
       resolvedRuntimeSettingsByInvocationId.clear();
       resetOpenAIResponsesWebSocketSessions();
+      openAIResponsesHttpCooldowns.clear();
     }
   };
 }
@@ -297,7 +317,7 @@ export async function startLlmProvider(
     const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
     const requestBody = requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId);
     if (proxy) console.log(`[LimCode] LLM proxy enabled: ${proxy}`);
-    const provider = unified.createLLMFromConfig({
+    const providerConfig = {
       provider: settings.provider,
       model: settings.model,
       apiKey: settings.apiKey,
@@ -309,7 +329,15 @@ export async function startLlmProvider(
       ...openAIResponsesWebSocketConfigEntry(settings, request.conversationId),
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
-    }, registry.llmProviders);
+    };
+    const provider = unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider;
+    const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
+      ? unified.createLLMFromConfig({
+          ...providerConfig,
+          transport: undefined,
+          webSocketSessionKey: undefined
+        }, registry.llmProviders) as UnifiedChatProvider
+      : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
     const maxRetries = normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
@@ -323,6 +351,7 @@ export async function startLlmProvider(
           streamEmit,
           settings,
           provider,
+          httpFallbackProvider,
           unified,
           options,
           signal,
@@ -385,11 +414,8 @@ async function runLlmAttempt(
   request: LlmStartRequest,
   emit: Emit,
   settings: LlmProviderConfigRecord,
-  provider: {
-    chat<T>(request: unknown, options: { inputFormat: 'unified'; outputFormat: 'unified'; signal?: AbortSignal }): Promise<T>;
-    chatStream<T>(request: unknown, options: { inputFormat: 'unified'; outputFormat: 'unified'; signal?: AbortSignal }): AsyncIterable<T>;
-    dryRun(request: unknown, options?: { inputFormat?: string; outputFormat?: string; stream?: boolean }): Promise<UnifiedDryRunResult>;
-  },
+  provider: UnifiedChatProvider,
+  httpFallbackProvider: UnifiedChatProvider | undefined,
   unified: UnifiedModule,
   options: LlmProviderOptions,
   signal?: AbortSignal,
@@ -435,9 +461,11 @@ async function runLlmAttempt(
           request,
           settings,
           provider,
+          httpFallbackProvider,
           unified,
           unifiedRequest,
           signal,
+          retryRecoveryNotice,
           proxy,
           onTransportTrace: options.onTransportTrace
         })
@@ -514,64 +542,189 @@ async function runLlmAttempt(
 async function* streamOpenAIResponsesWithLimCodeSession(input: {
   request: LlmStartRequest;
   settings: LlmProviderConfigRecord;
-  provider: {
-    dryRun(request: unknown, options?: { inputFormat?: string; outputFormat?: string; stream?: boolean }): Promise<UnifiedDryRunResult>;
-  };
+  provider: UnifiedChatProvider;
+  httpFallbackProvider?: UnifiedChatProvider;
   unified: UnifiedModule;
   unifiedRequest: UnifiedLLMRequest;
   signal?: AbortSignal;
+  retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice;
   proxy?: string;
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
 }): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
   const conversationId = requireOpenAIResponsesWebSocketConversationId(input.request.conversationId);
+  const sessionKey = createOpenAIResponsesWebSocketSessionKey(input.settings, conversationId);
+  const now = Date.now();
+  for (const [key, expiresAt] of openAIResponsesHttpCooldowns) {
+    if (expiresAt <= now) openAIResponsesHttpCooldowns.delete(key);
+  }
+  const cooldownUntil = openAIResponsesHttpCooldowns.get(sessionKey) ?? 0;
+  if (input.httpFallbackProvider && cooldownUntil > now) {
+    reportTransportPolicyTrace(input, sessionKey, 'http_cooldown', 'temporary_ws_cooldown');
+    yield* input.httpFallbackProvider.chatStream<LimCodeOpenAIResponsesStreamChunk>(input.unifiedRequest, {
+      inputFormat: 'unified',
+      outputFormat: 'unified',
+      signal: input.signal
+    });
+    return;
+  }
+  const reliableAttempt = input.request.reliableProviderAttempt;
+  const retryTimeBudgetExhausted = reliableAttempt?.requestCreatedAt !== undefined
+    && reliableAttempt.attemptSeq > 1
+    && now - reliableAttempt.requestCreatedAt >= OPENAI_RESPONSES_WS_RETRY_BUDGET_MS;
+  if (input.httpFallbackProvider && retryTimeBudgetExhausted) {
+    openAIResponsesHttpCooldowns.set(sessionKey, now + OPENAI_RESPONSES_HTTP_COOLDOWN_MS);
+    reportTransportPolicyTrace(input, sessionKey, 'http_fallback', 'ws_retry_time_budget_exhausted');
+    yield* input.httpFallbackProvider.chatStream<LimCodeOpenAIResponsesStreamChunk>(input.unifiedRequest, {
+      inputFormat: 'unified',
+      outputFormat: 'unified',
+      signal: input.signal
+    });
+    return;
+  }
+  if (cooldownUntil > 0) openAIResponsesHttpCooldowns.delete(sessionKey);
+
   const dryRun = await input.provider.dryRun(input.unifiedRequest, {
     inputFormat: 'unified',
     outputFormat: 'unified',
     stream: true
   });
   const format = new input.unified.OpenAIResponsesFormat(input.settings.model) as OpenAIResponsesFormatAdapter;
-  yield* streamOpenAIResponsesWebSocketSession({
-    sessionKey: createOpenAIResponsesWebSocketSessionKey(input.settings, conversationId),
-    url: dryRun.url,
-    headers: dryRun.headers,
-    body: dryRun.body,
-    format,
-    signal: input.signal,
-    proxy: input.proxy,
-    onDecision: (decision) => {
-      reportTransportTrace(input, {
-        requestId: input.request.id,
-        conversationId,
-        phase: 'continuation_decision',
-        observedAt: Date.now(),
-        sessionKeyHash: decision.sessionKeyHash,
-        connectionGeneration: decision.connectionGeneration,
-        connectionReused: decision.connectionReused,
-        connectionReason: decision.connectionReason,
-        mode: decision.mode,
-        reason: decision.reason,
-        fullInputItemCount: decision.fullInputItemCount,
-        sentInputItemCount: decision.sentInputItemCount
-      });
-      console.log('[LimCode][OpenAIResponsesWS]', JSON.stringify({
-        implementation: LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION,
-        requestId: input.request.id,
-        conversationId: input.request.conversationId ?? '',
-        sessionKeyHash: decision.sessionKeyHash,
-        connectionGeneration: decision.connectionGeneration,
-        connectionReused: decision.connectionReused,
-        connectionReason: decision.connectionReason,
-        mode: decision.mode,
-        reason: decision.reason,
-        fullInputItemCount: decision.fullInputItemCount,
-        sentInputItemCount: decision.sentInputItemCount,
-        fullInputFingerprint: decision.fullInputFingerprint,
-        sentInputFingerprint: decision.sentInputFingerprint,
-        baselineFingerprint: decision.baselineFingerprint
-      }));
-    },
-    onPhase: (phase) => reportTransportTrace(input, traceFromWebSocketPhase(input, phase))
+  try {
+    yield* streamOpenAIResponsesWebSocketSession({
+      sessionKey,
+      url: dryRun.url,
+      headers: dryRun.headers,
+      body: dryRun.body,
+      format,
+      signal: input.signal,
+      proxy: input.proxy,
+      onDecision: (decision) => {
+        reportTransportTrace(input, {
+          requestId: input.request.id,
+          conversationId,
+          phase: 'continuation_decision',
+          observedAt: Date.now(),
+          sessionKeyHash: decision.sessionKeyHash,
+          connectionGeneration: decision.connectionGeneration,
+          connectionReused: decision.connectionReused,
+          connectionReason: decision.connectionReason,
+          mode: decision.mode,
+          reason: decision.reason,
+          fullInputItemCount: decision.fullInputItemCount,
+          sentInputItemCount: decision.sentInputItemCount
+        });
+        console.log('[LimCode][OpenAIResponsesWS]', JSON.stringify({
+          implementation: LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION,
+          requestId: input.request.id,
+          conversationId: input.request.conversationId ?? '',
+          sessionKeyHash: decision.sessionKeyHash,
+          connectionGeneration: decision.connectionGeneration,
+          connectionReused: decision.connectionReused,
+          connectionReason: decision.connectionReason,
+          mode: decision.mode,
+          reason: decision.reason,
+          fullInputItemCount: decision.fullInputItemCount,
+          sentInputItemCount: decision.sentInputItemCount,
+          fullInputFingerprint: decision.fullInputFingerprint,
+          sentInputFingerprint: decision.sentInputFingerprint,
+          baselineFingerprint: decision.baselineFingerprint
+        }));
+      },
+      onPhase: (phase) => reportTransportTrace(input, traceFromWebSocketPhase(input, phase))
+    });
+    openAIResponsesHttpCooldowns.delete(sessionKey);
+  } catch (error) {
+    if (!input.httpFallbackProvider || !shouldFallbackOpenAIResponsesToHttp(input, error)) throw error;
+    openAIResponsesHttpCooldowns.set(sessionKey, Date.now() + OPENAI_RESPONSES_HTTP_COOLDOWN_MS);
+    reportTransportPolicyTrace(input, sessionKey, 'http_fallback', 'ws_retry_budget_exhausted');
+    yield* input.httpFallbackProvider.chatStream<LimCodeOpenAIResponsesStreamChunk>(input.unifiedRequest, {
+      inputFormat: 'unified',
+      outputFormat: 'unified',
+      signal: input.signal
+    });
+  }
+}
+
+function shouldFallbackOpenAIResponsesToHttp(
+  input: {
+    request: LlmStartRequest;
+    retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice;
+  },
+  error: unknown
+): boolean {
+  const raw = rawErrorFromUnknown(error);
+  if (findNestedMetadata(raw, 'receivedServerEvent') === true) return false;
+  if (findNestedMetadata(raw, 'retryable') === false) return false;
+
+  const status = findNestedNumber(raw, 'status');
+  const signature = JSON.stringify(raw).toLowerCase();
+  const recoverable = findNestedMetadata(raw, 'retryable') === true
+    || status === 408
+    || status === 425
+    || status === 429
+    || (status !== undefined && status >= 500 && status <= 599)
+    || /econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed|socket hang up|network error|fetch failed|websocket closed before|timed? out|unexpected server response:\s*(?:408|425|429|5\d\d)\b/.test(signature);
+  if (!recoverable) return false;
+
+  const attempt = input.request.reliableProviderAttempt;
+  const attemptLimitReached = attempt !== undefined && attempt.attemptSeq >= attempt.maxAttempts;
+  const elapsedBudgetReached = attempt?.requestCreatedAt !== undefined
+    && Date.now() - attempt.requestCreatedAt >= OPENAI_RESPONSES_WS_RETRY_BUDGET_MS;
+  const legacyLimitReached = input.retryRecoveryNotice !== undefined
+    && input.retryRecoveryNotice.retryAttempt >= input.retryRecoveryNotice.retryMaxAttempts;
+  return attemptLimitReached || elapsedBudgetReached || legacyLimitReached;
+}
+
+function reportTransportPolicyTrace(
+  input: {
+    request: LlmStartRequest;
+    onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
+  },
+  sessionKey: string,
+  phase: 'http_fallback' | 'http_cooldown',
+  reason: string
+): void {
+  reportTransportTrace(input, {
+    requestId: input.request.id,
+    conversationId: input.request.conversationId ?? '',
+    phase,
+    observedAt: Date.now(),
+    sessionKeyHash: createHash('sha256').update(sessionKey).digest('hex').slice(0, 12),
+    connectionGeneration: 0,
+    reason
   });
+}
+
+function findNestedMetadata(
+  value: unknown,
+  key: string,
+  depth = 0,
+  seen = new Set<object>()
+): boolean | undefined {
+  if (depth > 8 || value === null || typeof value !== 'object' || seen.has(value)) return undefined;
+  seen.add(value);
+  if (isRecord(value) && typeof value[key] === 'boolean') return value[key] as boolean;
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    const nested = findNestedMetadata(child, key, depth + 1, seen);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
+function findNestedNumber(
+  value: unknown,
+  key: string,
+  depth = 0,
+  seen = new Set<object>()
+): number | undefined {
+  if (depth > 8 || value === null || typeof value !== 'object' || seen.has(value)) return undefined;
+  seen.add(value);
+  if (isRecord(value) && typeof value[key] === 'number' && Number.isFinite(value[key])) return value[key] as number;
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    const nested = findNestedNumber(child, key, depth + 1, seen);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
 }
 
 function traceFromWebSocketPhase(
@@ -744,8 +897,8 @@ function truncateForSummary(value: string): string {
 }
 
 function retryDelayForAttempt(retryAttempt: number): number {
-  const base = 1000 * (2 ** Math.max(0, retryAttempt - 1));
-  return Math.min(10_000, base);
+  const base = Math.min(8_000, 500 * (2 ** Math.max(0, retryAttempt - 1)));
+  return Math.max(0, Math.round(base * (0.75 + Math.random() * 0.25)));
 }
 
 function waitForRetryDelay(delayMs: number, control: RetryControl, signal?: AbortSignal): Promise<boolean> {

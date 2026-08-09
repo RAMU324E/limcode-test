@@ -49,10 +49,12 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       let providerStartedAt: number | undefined;
       const toolCalls = new CapabilityToolCallAccumulator();
       let terminal = false;
+      let sawReplayUnsafeProviderOutput = false;
       let tail = Promise.resolve();
 
       const enqueue = (event: Omit<ProviderOutputStreamEvent, 'streamSeq'>): void => {
         sequence += 1n;
+        if (event.semanticProgress !== false) sawReplayUnsafeProviderOutput = true;
         const completeEvent: ProviderOutputStreamEvent = { ...event, streamSeq: sequence.toString() };
         tail = tail.then(() => controls.onEvent(completeEvent)).then(() => undefined);
       };
@@ -60,8 +62,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         if (terminal) return;
         terminal = true;
         detachAbort();
+        const terminalError = error instanceof ProviderTransientError && sawReplayUnsafeProviderOutput
+          ? new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`)
+          : error;
         void tail.then(
-          () => error === undefined ? resolve() : reject(error),
+          () => terminalError === undefined ? resolve() : reject(terminalError),
           reject
         );
       };
@@ -396,7 +401,33 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       modelId: request.modelId,
       systemPromptPrefix
     },
+    reliableProviderAttempt: reliableProviderAttempt(request, authorityModel),
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
+  };
+}
+
+function reliableProviderAttempt(
+  request: FullProviderRequest,
+  authorityModel: Record<string, unknown>
+): NonNullable<LlmStartRequest['reliableProviderAttempt']> {
+  const attemptBigInt = BigInt(request.attemptSeq);
+  const attemptSeq = attemptBigInt > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Math.max(1, Number(attemptBigInt));
+  const retryPolicy = asRecord(authorityModel.retryPolicy);
+  const retryEnabled = retryPolicy?.enabled !== false;
+  const configuredRetries = typeof retryPolicy?.maxRetries === 'number'
+    && Number.isSafeInteger(retryPolicy.maxRetries)
+    && retryPolicy.maxRetries >= 0
+      ? retryPolicy.maxRetries
+      : 1;
+  const maxAttempts = retryEnabled
+    ? Math.min(10, configuredRetries + 1)
+    : 1;
+  return {
+    attemptSeq,
+    maxAttempts,
+    ...(request.requestCreatedAt === undefined ? {} : { requestCreatedAt: request.requestCreatedAt })
   };
 }
 
@@ -904,6 +935,9 @@ function capabilityThrownProviderError(error: unknown): Error {
       status?: unknown;
       retryable?: unknown;
       transportAttemptsExhausted?: unknown;
+      receivedServerEvent?: unknown;
+      phase?: unknown;
+      closeCode?: unknown;
       cause?: unknown;
     };
     if (structured.code !== undefined) raw.code ??= structured.code;
@@ -912,6 +946,9 @@ function capabilityThrownProviderError(error: unknown): Error {
     if (structured.transportAttemptsExhausted !== undefined) {
       raw.transportAttemptsExhausted ??= structured.transportAttemptsExhausted;
     }
+    if (structured.receivedServerEvent !== undefined) raw.receivedServerEvent ??= structured.receivedServerEvent;
+    if (structured.phase !== undefined) raw.phase ??= structured.phase;
+    if (structured.closeCode !== undefined) raw.closeCode ??= structured.closeCode;
     if (structured.cause !== undefined) raw.cause ??= structured.cause;
   }
   const message = error instanceof Error && error.message.trim()
@@ -925,9 +962,13 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const signature = collectErrorSignature(raw, message).toLowerCase();
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
+  const receivedServerEvent = findBooleanMetadata(raw, 'receivedServerEvent');
   const incompleteNormalWebSocketClose = /websocket closed before (?:terminal event|response\.completed|open)(?::|\s)+(?:1000|1001)\b/.test(signature);
   if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
     return new Error(message);
+  }
+  if (receivedServerEvent === true) {
+    return new Error(`${message}（已收到 Provider 事件，不自动重放请求。）`);
   }
   // 1000/1001 only describe a graceful WebSocket closing handshake. If no Responses terminal
   // event arrived, the provider response is incomplete and must outrank stale retryable=false
@@ -936,8 +977,15 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
     return new ProviderTransientError('connection_interrupted', message);
   }
   if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
-  if (status === 429) return new ProviderTransientError('rate_limited', message);
-  if (status === 408 || status === 425 || (status !== undefined && status >= 500 && status <= 599)) {
+  if (status === 429 || /unexpected server response:\s*429\b/.test(signature)) {
+    return new ProviderTransientError('rate_limited', message);
+  }
+  if (
+    status === 408
+    || status === 425
+    || (status !== undefined && status >= 500 && status <= 599)
+    || /unexpected server response:\s*(?:408|425|5\d\d)\b/.test(signature)
+  ) {
     return new ProviderTransientError('temporary_service_error', message);
   }
   if (/\b(econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|websocket closed before (?:terminal event|response\.completed|open)|timed? out/.test(signature)) {

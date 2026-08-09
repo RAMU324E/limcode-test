@@ -484,6 +484,55 @@ test('LLM capability adapter 将 429/网络/文本网关错误映射为可靠 Pr
   }
 });
 
+test('LLM capability adapter 在首个 Provider 事件或语义输出后拒绝盲重放', async () => {
+  const afterRawEvent = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      emit({
+        type: 'llm:error',
+        payload: {
+          requestId: llmRequest.id,
+          message: 'WebSocket closed after response.created',
+          rawError: {
+            transport: 'websocket',
+            receivedServerEvent: true,
+            retryable: true
+          }
+        }
+      });
+    })
+  );
+  await assert.rejects(
+    afterRawEvent.sendFullRequest(request(), {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }),
+    (error) => !(error instanceof kernel.ProviderTransientError)
+      && /不自动重放请求/.test(error.message)
+  );
+
+  const afterSemanticOutput = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:delta', payload: { requestId: llmRequest.id, text: 'partial' } });
+      emit({
+        type: 'llm:error',
+        payload: {
+          requestId: llmRequest.id,
+          message: 'socket hang up',
+          rawError: { code: 'ECONNRESET', retryable: true }
+        }
+      });
+    })
+  );
+  await assert.rejects(
+    afterSemanticOutput.sendFullRequest(request(), {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }),
+    (error) => !(error instanceof kernel.ProviderTransientError)
+      && /不自动重放请求/.test(error.message)
+  );
+});
+
 test('LLM capability adapter 把内部 retry 事件立即上交 durable Attempt 而不隐式等待', async () => {
   let cancelledRetries = 0;
   let aborted = 0;

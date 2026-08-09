@@ -303,7 +303,7 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
         type="number"
         min="-1"
         step="1"
-        placeholder="3"
+        placeholder="4"
         @change="updateRetryMaxAttempts"
       />
     </label>
