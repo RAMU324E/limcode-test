@@ -175,6 +175,17 @@ button {
   border-color: var(--vscode-button-hoverBackground);
 }
 
+.primary-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+  transform: none;
+}
+
+.primary-button:disabled:hover {
+  background: var(--vscode-button-background);
+  border-color: var(--vscode-button-background);
+}
+
 .secondary-button {
   min-height: 30px;
   padding: 0 9px;
@@ -266,9 +277,14 @@ button {
   text-align: center;
 }
 
-.scope-tab:hover {
+.scope-tab:hover:not(:disabled) {
   color: var(--vscode-foreground);
   background: var(--vscode-list-hoverBackground, transparent);
+}
+
+.scope-tab:disabled {
+  cursor: default;
+  opacity: 0.62;
 }
 
 .scope-tab.active {
@@ -338,6 +354,40 @@ button {
   min-height: 0;
   overflow: hidden;
 }
+
+.history-initializing {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  color: var(--vscode-descriptionForeground);
+  text-align: center;
+  font-size: 11px;
+}
+
+.history-initializing-mark {
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--vscode-foreground);
+}
+
+.history-initializing-mark i {
+  width: 3px;
+  height: 11px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.32;
+  animation: history-initializing-bar 0.86s ease-in-out infinite;
+}
+
+.history-initializing-mark i:nth-child(2) { animation-delay: 0.12s; }
+.history-initializing-mark i:nth-child(3) { animation-delay: 0.24s; }
 
 .history-list {
   position: absolute;
@@ -1019,4 +1069,16 @@ button {
   0% { opacity: 0.45; }
   50% { opacity: 1; }
   100% { opacity: 0.45; }
+}
+
+@keyframes history-initializing-bar {
+  0%, 100% { transform: scaleY(0.55); opacity: 0.28; }
+  50% { transform: scaleY(1); opacity: 0.82; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .history-initializing-mark i {
+    animation: none;
+    opacity: 0.55;
+  }
 }

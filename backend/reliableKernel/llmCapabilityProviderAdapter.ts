@@ -11,7 +11,17 @@ import type {
   ProviderDispatchControls,
   ProviderOutputStreamEvent
 } from './modelProviderControlPlane';
+import {
+  estimateProjectedModelInput,
+  projectOrdinaryModelWindow,
+  projectSummaryModelWindow,
+  type ProjectedRequestTokenBreakdown
+} from './modelFacingContextProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import {
+  decodeRuntimeDeliveryModelEnvelope,
+  renderRuntimeDeliveryModelEnvelope
+} from './runtimeDeliveryProjection';
 
 interface ToolCallOutput {
   id?: string;
@@ -22,6 +32,9 @@ interface ToolCallOutput {
   thoughtSignature?: string;
 }
 
+const CURRENT_TURN_INPUT_REINJECTION_LABEL =
+  '[当前 Turn 原始用户要求/数据，不是新用户输入；以下各 part 为冻结原文。]';
+
 /** 把现有无状态 LLM capability 适配为可靠内核 full-request Provider 边界。 */
 export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapter {
   public constructor(
@@ -29,6 +42,49 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     private readonly capability: LlmCapability
   ) {
     if (!providerId.trim()) throw new TypeError('providerId must be non-empty.');
+  }
+
+  public estimateFullRequestInput(request: FullProviderRequest): ProjectedRequestTokenBreakdown {
+    if (request.providerId !== this.providerId) {
+      throw new Error(`Provider request ${request.providerId} cannot use adapter ${this.providerId}.`);
+    }
+    if (isCompressionRequest(request.recipe)) {
+      return estimateCompactProjection(toLlmCompactRequest(request));
+    }
+    const projected = toLlmStartRequest(request);
+    const frozenCurrent = request.requestAddenda?.currentTurnInput;
+    const currentInputCount = frozenCurrent?.reinject ? 1 : 0;
+    const reminderCount = request.requestAddenda?.turnReminder ? 1 : 0;
+    const contextEnd = projected.contents.length - currentInputCount - reminderCount;
+    const currentEnd = contextEnd + currentInputCount;
+    const projectedContext = projected.contents.slice(0, contextEnd);
+    let currentInputContents = currentInputCount
+      ? projected.contents.slice(contextEnd, currentEnd)
+      : [];
+    if (frozenCurrent && !frozenCurrent.reinject) {
+      const decodedCurrent = decodeFrozenCurrentTurnInput(frozenCurrent.content, frozenCurrent.contentType);
+      if (!decodedCurrent || decodedCurrent.role !== 'user') {
+        throw new TypeError('Frozen current Turn input must be a user MessageContent.');
+      }
+      const identity = canonicalPlainJson(decodedCurrent, 'Frozen current Turn input');
+      let index = -1;
+      for (let candidate = projectedContext.length - 1; candidate >= 0; candidate -= 1) {
+        if (canonicalPlainJson(projectedContext[candidate], 'Projected model content') !== identity) continue;
+        index = candidate;
+        break;
+      }
+      if (index < 0) throw new Error('Frozen current Turn input is absent from its projected Context window.');
+      currentInputContents = [projectedContext[index]];
+      projectedContext.splice(index, 1);
+    }
+    return estimateProjectedModelInput({
+      ...(projected.systemInstruction ? { systemInstruction: projected.systemInstruction } : {}),
+      tools: projected.tools,
+      contextContents: projectedContext,
+      ...(currentInputContents.length ? { currentInputContents } : {}),
+      ...(reminderCount ? { turnReminderContents: projected.contents.slice(currentEnd) } : {}),
+      providerFramingTokens: 64
+    });
   }
 
   public sendFullRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void> {
@@ -280,26 +336,34 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         try {
           const payload = asRecord(event.payload);
           if (event.type === LlmEventType.CompactDone) {
-            const result = requireRecord(
-              normalizePlainJson(payload?.result, 'LLM compact result'),
-              'LLM compact result'
-            );
-            if (!Array.isArray(result.contents) || result.contents.length === 0) {
+            const result = asRecord(payload?.result);
+            if (!result) throw new TypeError('LLM compact result must be an object.');
+            const contents = normalizeProviderPlainJson(result.contents, 'LLM compact result.contents');
+            if (!Array.isArray(contents) || contents.length === 0) {
               throw new TypeError('LLM compact result must contain structured MessageContent[].');
             }
+            // Only these fields cross into the reliable kernel. Provider SDK response objects are
+            // diagnostic implementation details and may contain handles or explicit `undefined`.
+            const settingsSnapshot = result.settingsSnapshot === undefined
+              ? undefined
+              : normalizePlainJson(result.settingsSnapshot, 'LLM compact result.settingsSnapshot');
+            const methodConfig = result.methodConfig === undefined
+              ? undefined
+              : normalizePlainJson(result.methodConfig, 'LLM compact result.methodConfig');
+            const usage = result.usageMetadata === undefined
+              ? undefined
+              : normalizeProviderPlainJson(result.usageMetadata, 'LLM compact result.usageMetadata');
             sequence += 1n;
             const completeEvent: ProviderOutputStreamEvent = {
               kind: 'completed',
               streamSeq: sequence.toString(),
               content: normalizePlainJson({
                 type: 'compression_result',
-                contents: result.contents,
-                ...(result.settingsSnapshot !== undefined ? { settingsSnapshot: result.settingsSnapshot } : {}),
-                ...(result.methodConfig !== undefined ? { methodConfig: result.methodConfig } : {})
+                contents,
+                ...(settingsSnapshot !== undefined ? { settingsSnapshot } : {}),
+                ...(methodConfig !== undefined ? { methodConfig } : {})
               }, 'LLM compression terminal content'),
-              ...(result.usageMetadata !== undefined
-                ? { usage: normalizePlainJson(result.usageMetadata, 'LLM compression usage') }
-                : {})
+              ...(usage !== undefined ? { usage } : {})
             };
             tail = tail.then(() => controls.onEvent(completeEvent)).then(() => undefined);
             finish();
@@ -357,6 +421,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     systemParts.push(runtimeContext.template.trim());
   }
   const contents: MessageContent[] = [];
+  const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
   for (const item of request.context) {
     if (item.segmentKind === 'system') {
       systemParts.push(contextText(item.content, item.contentType));
@@ -373,7 +438,13 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
         provider,
         modelId: request.modelId
       });
+      const start = contents.length;
       contents.push(...compressed.contents);
+      canonicalCompressionRanges.push({ start, end: contents.length });
+      continue;
+    }
+    if (item.segmentKind === 'runtime_context') {
+      contents.push(runtimeContextContent(item.content, item.contentType));
       continue;
     }
     const decoded = decodeMessageContent(item.content, item.contentType);
@@ -384,11 +455,24 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     const role = item.messageRole === 'model' ? 'model' : 'user';
     contents.push({ role, parts: [{ text: item.content }] });
   }
+  const currentTurnInput = request.requestAddenda?.currentTurnInput;
+  if (currentTurnInput?.reinject) {
+    const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
+    if (!current || current.role !== 'user') {
+      throw new TypeError('Frozen current Turn input must be a user MessageContent.');
+    }
+    contents.push(reinjectedCurrentTurnInput(current));
+  }
+  const turnReminder = request.requestAddenda?.turnReminder;
+  if (turnReminder) {
+    contents.push({ role: 'user', parts: [{ text: turnReminder.content }] });
+  }
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
+  const projectedContents = projectOrdinaryContentsPreservingRanges(contents, canonicalCompressionRanges);
   return {
     id: request.modelRequestId,
     conversationId: requireText(request.conversationId, 'Provider request conversationId'),
-    contents,
+    contents: projectedContents,
     tools,
     model: {
       providerConfigId: request.providerId,
@@ -403,6 +487,15 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     },
     reliableProviderAttempt: reliableProviderAttempt(request, authorityModel),
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
+  };
+}
+
+function reinjectedCurrentTurnInput(current: MessageContent): MessageContent {
+  return {
+    role: 'user',
+    // Keep the label as its own part. Original text and multimodal parts remain individually
+    // addressable and byte-stable across retries instead of being flattened into one synthetic text.
+    parts: [{ text: CURRENT_TURN_INPUT_REINJECTION_LABEL }, ...current.parts]
   };
 }
 
@@ -440,8 +533,9 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
   if (recipe.kind !== 'reliable-context-compression') throw new TypeError('ModelRequest is not a compression request.');
   const authority = requireRecord(request.authoritySnapshot, 'Compression authority');
   const compression = requireRecord(authority.compression, 'Compression authority policy');
-  const methodConfig = requireRecord(compression.config, 'Compression authority config');
-  const methodKind = requireText(methodConfig.kind, 'Compression method kind') as LlmCompactRequest['methodKind'];
+  const authorityMethodConfig = requireRecord(compression.config, 'Compression authority config');
+  const methodKind = requireText(authorityMethodConfig.kind, 'Compression method kind') as LlmCompactRequest['methodKind'];
+  const methodConfig = frozenEffectiveCompressionConfig(authorityMethodConfig, recipe, methodKind);
   const conversationId = requireText(request.conversationId, 'Provider request conversationId');
   const authorityConversationId = optionalText(authority.conversationId);
   if (authorityConversationId && authorityConversationId !== conversationId) {
@@ -453,7 +547,7 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     provider: requireProviderKind(provider.provider),
     modelId: requireText(provider.modelId, 'Compression modelId')
   };
-  const context = compressionContext(request, compressionProvider);
+  const context = compressionContext(request, compressionProvider, methodKind);
   const settingsSnapshot = normalizePlainJson({
     providerConfigId: compressionProvider.providerConfigId,
     provider: compressionProvider.provider,
@@ -473,17 +567,58 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     settingsSnapshot,
     contents: context.contents,
     ...(methodKind === 'segmented_summary' && context.segments.length > 0
-      ? { segments: context.segments, ...(context.priorSummaryContents.length > 0
-        ? { priorSummaryContents: context.priorSummaryContents }
-        : {}) }
+      ? { segments: context.segments }
+      : {}),
+    ...(methodKind !== 'openai_responses_compact' && context.priorSummaryContents.length > 0
+      ? { priorSummaryContents: context.priorSummaryContents }
       : {}),
     ...(optionalText(recipe.sourceHash) ? { sourceHash: optionalText(recipe.sourceHash) } : {})
   };
 }
 
+function frozenEffectiveCompressionConfig(
+  authorityConfig: { [key: string]: PlainJsonValue },
+  recipe: { [key: string]: PlainJsonValue },
+  methodKind: LlmCompactRequest['methodKind']
+): { [key: string]: PlainJsonValue } {
+  if (methodKind === 'openai_responses_compact') {
+    if (recipe.effectiveSummaryMaxTokens !== undefined) {
+      throw new TypeError('Provider-native Compact recipe cannot carry a text summary target.');
+    }
+    return authorityConfig;
+  }
+  const effective = recipe.effectiveSummaryMaxTokens;
+  if (!Number.isSafeInteger(effective) || (effective as number) <= 0 || (effective as number) > 8_000) {
+    throw new RangeError('Text compression recipe requires effectiveSummaryMaxTokens in [1, 8000].');
+  }
+  const summary = asRecord(authorityConfig.llmSummary) ?? {};
+  return normalizePlainJson({
+    ...authorityConfig,
+    llmSummary: { ...summary, targetTokens: effective as number }
+  }, 'Effective frozen compression config') as { [key: string]: PlainJsonValue };
+}
+
+function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
+  const prior = request.priorSummaryContents ?? [];
+  if (request.methodKind === 'segmented_summary' && request.segments?.length) {
+    const candidates = request.segments.map((segment, index) => estimateProjectedModelInput({
+      contextContents: index === 0 ? [...prior, ...segment] : segment,
+      providerFramingTokens: 512
+    }));
+    return candidates.reduce((largest, candidate) =>
+      candidate.fullTokens > largest.fullTokens ? candidate : largest
+    );
+  }
+  return estimateProjectedModelInput({
+    contextContents: [...prior, ...request.contents],
+    providerFramingTokens: request.methodKind === 'openai_responses_compact' ? 64 : 512
+  });
+}
+
 function compressionContext(
   request: FullProviderRequest,
-  provider: CompressionProviderBinding
+  provider: CompressionProviderBinding,
+  methodKind: LlmCompactRequest['methodKind']
 ): {
   contents: MessageContent[];
   segments: MessageContent[][];
@@ -492,6 +627,7 @@ function compressionContext(
   const contents: MessageContent[] = [];
   const priorSummaryContents: MessageContent[] = [];
   const segments: MessageContent[][] = [];
+  const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
   let current: MessageContent[] = [];
   const flush = () => {
     if (current.length > 0) segments.push(current);
@@ -503,12 +639,18 @@ function compressionContext(
     || (requestedCount as number) > request.context.length) {
     throw new RangeError('Compression recipe sourceSegmentCount is outside its frozen Context projection.');
   }
+  if (methodKind === 'openai_responses_compact' && requestedCount !== request.context.length) {
+    throw new Error('Provider-native compression requires the complete frozen model-visible window.');
+  }
   if (request.context[requestedCount as number]?.segmentKind === 'tool_pair') {
     throw new Error('Compression recipe splits an assistant function call from its tool_pair response.');
   }
   for (const item of request.context.slice(0, requestedCount as number)) {
     let decoded: MessageContent[];
     if (item.segmentKind === 'tool_pair') decoded = toolPairContents(item.content);
+    else if (item.segmentKind === 'runtime_context') {
+      decoded = [runtimeContextContent(item.content, item.contentType)];
+    }
     else {
       const structured = decodeCompressionContents(item.content, item.contentType);
       if (structured) {
@@ -523,21 +665,77 @@ function compressionContext(
         }];
       }
     }
-    if (item.segmentKind === 'compression' && contents.length === 0) {
+    if (item.segmentKind === 'compression' && contents.length === 0
+      && methodKind !== 'openai_responses_compact') {
       priorSummaryContents.push(...decoded);
+      continue;
     }
+    const protectedStart = contents.length;
     for (const content of decoded) {
-      if (content.role === 'user' && hasOrdinaryUserPart(content) && current.length > 0) flush();
+      if (item.segmentKind !== 'runtime_context'
+        && content.role === 'user'
+        && hasOrdinaryUserPart(content)
+        && current.length > 0) flush();
       current.push(content);
       contents.push(content);
     }
+    if (item.segmentKind === 'compression' && methodKind === 'openai_responses_compact') {
+      canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
+    }
   }
   flush();
-  return { contents, segments, priorSummaryContents };
+  if (methodKind === 'openai_responses_compact') {
+    return {
+      contents: projectOrdinaryContentsPreservingRanges(contents, canonicalCompressionRanges),
+      segments: [],
+      priorSummaryContents: []
+    };
+  }
+  return {
+    contents: projectSummaryModelWindow(contents).contents,
+    segments: segments.map((segment) => projectSummaryModelWindow(segment).contents),
+    priorSummaryContents
+  };
 }
 
 function hasOrdinaryUserPart(content: MessageContent): boolean {
   return content.parts.some((part) => 'text' in part && typeof part.text === 'string' && !('functionResponse' in part));
+}
+
+function runtimeContextContent(
+  content: string,
+  contentType: string
+): MessageContent {
+  const envelope = decodeRuntimeDeliveryModelEnvelope(content, contentType);
+  return {
+    // The shared Provider contract currently has only user/model roles. The explicit envelope is
+    // therefore the authority boundary: runtime data never masquerades as naked user prose, and
+    // its body cannot elevate a fake "System" heading into an instruction.
+    role: 'user',
+    parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope) }]
+  };
+}
+
+function projectOrdinaryContentsPreservingRanges(
+  contents: readonly MessageContent[],
+  canonicalRanges: readonly { start: number; end: number }[]
+): MessageContent[] {
+  if (canonicalRanges.length === 0) return projectOrdinaryModelWindow(contents).contents;
+  const projected: MessageContent[] = [];
+  let cursor = 0;
+  for (const range of canonicalRanges) {
+    if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
+      || range.start < cursor || range.end < range.start || range.end > contents.length) {
+      throw new RangeError('Canonical compression ranges are invalid or overlapping.');
+    }
+    projected.push(...projectOrdinaryModelWindow(contents.slice(cursor, range.start)).contents);
+    // Provider-native Compact output is the canonical next window. It is deliberately not passed
+    // through the 4K/16K ordinary-history projection a second time.
+    projected.push(...contents.slice(range.start, range.end));
+    cursor = range.end;
+  }
+  projected.push(...projectOrdinaryModelWindow(contents.slice(cursor)).contents);
+  return projected;
 }
 
 interface CompressionProviderBinding {
@@ -600,6 +798,15 @@ function decodeMessageContent(content: string, contentType: string): MessageCont
   if (!record || !Array.isArray(record.parts)) throw new TypeError('Frozen MessageContent is invalid.');
   const role = record.role === 'model' ? 'model' : 'user';
   return { role, parts: record.parts as MessageContent['parts'] };
+}
+
+/** Plain-text Turn input is a current storage format, not a legacy envelope. Project it through
+ * the same user MessageContent shape used by ordinary Context messages before identity/reinjection. */
+function decodeFrozenCurrentTurnInput(content: string, contentType: string): MessageContent | undefined {
+  const decoded = decodeMessageContent(content, contentType);
+  if (decoded) return decoded;
+  if (contentType.split(';', 1)[0].trim().toLowerCase() !== 'text/plain') return undefined;
+  return { role: 'user', parts: [{ text: content }] };
 }
 
 function toolPairContents(content: string): MessageContent[] {
@@ -856,6 +1063,69 @@ function mergeThoughtSignature(
     );
   }
   return incoming || existing;
+}
+
+/**
+ * Provider SDKs commonly materialize absent optional JSON fields as `undefined`.
+ * Omit only those object properties while retaining the reliable kernel's strict
+ * JSON boundary for arrays, prototypes, cycles, and non-finite numbers.
+ */
+function normalizeProviderPlainJson(value: unknown, label: string): PlainJsonValue {
+  return normalizeProviderPlainJsonValue(value, label, new Set<object>());
+}
+
+function normalizeProviderPlainJsonValue(
+  value: unknown,
+  label: string,
+  ancestors: Set<object>
+): PlainJsonValue {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`${label} cannot contain non-finite numbers.`);
+    return value;
+  }
+  if (typeof value === 'bigint') return value.toString();
+  if (Array.isArray(value)) {
+    return withProviderJsonAncestor(value, label, ancestors, () => Array.from(
+      { length: value.length },
+      (_, index) => {
+        if (!Object.prototype.hasOwnProperty.call(value, index)) {
+          throw new TypeError(`${label}[${index}] must contain JSON-compatible plain data.`);
+        }
+        return normalizeProviderPlainJsonValue(value[index], `${label}[${index}]`, ancestors);
+      }
+    ));
+  }
+  if (value && typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError(`${label} must contain only plain objects and arrays.`);
+    }
+    return withProviderJsonAncestor(value, label, ancestors, () => {
+      const normalized: Record<string, PlainJsonValue> = {};
+      for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+        if (nested === undefined) continue;
+        normalized[key] = normalizeProviderPlainJsonValue(nested, `${label}.${key}`, ancestors);
+      }
+      return normalized;
+    });
+  }
+  throw new TypeError(`${label} must contain JSON-compatible plain data.`);
+}
+
+function withProviderJsonAncestor<T>(
+  value: object,
+  label: string,
+  ancestors: Set<object>,
+  action: () => T
+): T {
+  if (ancestors.has(value)) throw new TypeError(`${label} cannot contain cycles.`);
+  ancestors.add(value);
+  try {
+    return action();
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function optionalOrdinal(value: unknown): number | undefined {

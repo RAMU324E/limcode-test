@@ -214,6 +214,13 @@ export function estimateMessageContentsTokens(contents: readonly MessageContent[
     total + estimateMessageContentTokens(content), 0), 'MessageContent token estimate');
 }
 
+/** Informational media subtotal. It is already included in estimateMessageContentsTokens(). */
+export function estimateMessageContentsMediaTokens(contents: readonly MessageContent[]): number {
+  return safeTokenCount(contents.reduce((total, content) => total + content.parts.reduce(
+    (partTotal, part) => partTotal + estimateContentPartMediaTokens(part), 0
+  ), 0), 'MessageContent media token estimate');
+}
+
 export function estimateMessageContentTokens(content: MessageContent): number {
   const wholeContext = asRecord(content as unknown)?.providerContext;
   if (wholeContext) return estimateProviderContextTokens(wholeContext);
@@ -292,6 +299,35 @@ function estimateContentPartTokens(part: ContentPart): number {
   }
   if ('inlineData' in part) return estimateInlineDataTokens(part);
   if ('fileData' in part) return FILE_REFERENCE_TOKENS;
+  return 0;
+}
+
+function estimateContentPartMediaTokens(part: ContentPart): number {
+  if ('inlineData' in part) return estimateInlineDataTokens(part);
+  if ('fileData' in part) return FILE_REFERENCE_TOKENS;
+  if ('functionResponse' in part) {
+    return part.functionResponse.parts?.reduce((total, nested) =>
+      total + estimateInlineDataTokens(nested), 0) ?? 0;
+  }
+  if ('providerContext' in part) {
+    const context = asRecord(part.providerContext);
+    const raw = asRecord(context?.rawItem);
+    if (raw?.type !== 'message' || !Array.isArray(raw.content)) return 0;
+    return raw.content.reduce((total, value) => {
+      const block = asRecord(value);
+      if (block?.type === 'input_image' && typeof block.image_url === 'string') {
+        return total + estimateInlineDataTokens({ inlineData: {
+          mimeType: 'image/unknown', data: dataUrlBase64(block.image_url)
+        } });
+      }
+      if (block?.type === 'input_file' && typeof block.file_data === 'string') {
+        return total + estimateInlineDataTokens({ inlineData: {
+          mimeType: 'application/octet-stream', data: dataUrlBase64(block.file_data)
+        } });
+      }
+      return total;
+    }, 0);
+  }
   return 0;
 }
 
@@ -501,13 +537,13 @@ function firstTokenCount(value: Record<string, unknown> | undefined, keys: reado
   return undefined;
 }
 
-function estimateTextTokens(text: string): number {
+export function estimateTextTokens(text: string): number {
   if (!text) return 0;
   const estimated = estimateTokenCount(text);
   return Number.isFinite(estimated) && estimated > 0 ? Math.ceil(estimated) : 0;
 }
 
-function estimateJsonTokens(value: unknown): number {
+export function estimateJsonTokens(value: unknown): number {
   return estimateTextTokens(safeJsonString(value));
 }
 

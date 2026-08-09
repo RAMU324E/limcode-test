@@ -1005,7 +1005,7 @@ async function checkClientSnapshotBounds() {
       toolCallId: 'snapshot-task-list-call',
       turnId: seeded.turnId,
       toolName: 'update_task_list',
-      arguments: { items: [{ title: 'bounded projection', status: 'in_progress' }] }
+      arguments: { mode: 'rewrite', items: [{ title: 'bounded projection', status: 'in_progress' }] }
     });
     await ctx.services.effects.settleWithoutEffect({
       source: { kind: 'internal', key: 'snapshot-task-settle' },
@@ -1013,7 +1013,27 @@ async function checkClientSnapshotBounds() {
       status: 'succeeded',
       detail: {
         kind: 'task-list',
-        items: [{ title: 'bounded projection', status: 'in_progress', delete: false }]
+        operation: {
+          kind: 'task_list.operation',
+          mode: 'rewrite',
+          items: [{ title: 'bounded projection', status: 'in_progress' }]
+        }
+      }
+    });
+    const failedTaskTool = await ctx.services.effects.createToolCall({
+      source: { kind: 'callback', key: 'snapshot-failed-task-tool' },
+      toolCallId: 'snapshot-failed-task-list-call',
+      turnId: seeded.turnId,
+      toolName: 'update_task_list',
+      arguments: { mode: 'update', items: [{ title: 'must not apply', status: 'pending' }] }
+    });
+    await ctx.services.effects.settleWithoutEffect({
+      source: { kind: 'internal', key: 'snapshot-failed-task-settle' },
+      toolCallId: failedTaskTool.toolCallId,
+      status: 'failed',
+      detail: {
+        kind: 'task-list',
+        operation: { deliberately: 'not canonical' }
       }
     });
     const currentMemberships = await list(ctx.database, 'MessagePartOfConversation', { conversation_id: seeded.conversationId });
@@ -1095,14 +1115,17 @@ async function checkClientSnapshotBounds() {
     assert.ok(maxArrayLength(snapshot.projections) <= 200);
     assert.ok(maxRecordBytes(snapshot.projections) <= 2048);
     assert.ok(wireBytes(snapshot) <= 5_242_880);
-    assert.equal(snapshot.projections.activeConversationWindow.taskList.length, 1);
+    assert.equal(snapshot.projections.activeConversationWindow.taskList.length, 2);
     assert.deepEqual(snapshot.projections.activeConversationWindow.taskList[0].items, [
-      { title: 'bounded projection', status: 'in_progress', delete: false }
+      { title: 'bounded projection', status: 'in_progress' }
     ]);
     assert.equal(snapshot.projections.activeConversationWindow.taskList[0].detail_on_demand, false);
+    assert.equal(snapshot.projections.activeConversationWindow.taskList[1].outcome, 'failed');
+    assert.equal(snapshot.projections.activeConversationWindow.taskList[1].items, null);
+    assert.equal(snapshot.projections.activeConversationWindow.taskList[1].detail_on_demand, false);
     assert.equal(JSON.stringify(snapshot).includes('user-input-snapshot'), false);
     assert.ok(metrics.snapshotTenThousandMs < 5_000, `10k snapshot took ${metrics.snapshotTenThousandMs}ms`);
-    assertions.push('10,000个可见楼层的snapshot仍只发送最新200条且保留绝对display_seq=9801..10000；五类projection/单记录摘要/实际UTF-8总字节均受硬上限，task list不含正文/full Context');
+    assertions.push('10,000个可见楼层的snapshot仍只发送最新200条且保留绝对display_seq=9801..10000；五类projection/单记录摘要/实际UTF-8总字节均受硬上限，task list不含正文/full Context；failed task artifact不做canonical解析且不阻断snapshot');
 
     const oversizedProjection = emptyClientProjection('bundle-conversation');
     const nav = oversizedProjection.navigationSummary;
@@ -1432,6 +1455,19 @@ async function checkClientSnapshotBounds() {
     metrics.detailChunks = chunks.length;
     metrics.contextDetailBytes = contextDetail.responseBytes;
     metrics.maxMountedTimelineComponents = 38;
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Turn').insert({
+        id: 'client-snapshot-newer-turn-without-task-rewrite',
+        conversation_id: seeded.conversationId,
+        status: 'terminal',
+        created_at: '9999-12-31T23:59:59.999Z',
+        updated_at: '9999-12-31T23:59:59.999Z',
+        terminal_at: '9999-12-31T23:59:59.999Z'
+      })
+    ]);
+    const newerTurnSnapshot = await ctx.database.clientProjectionSnapshot(seeded.conversationId);
+    assert.equal(newerTurnSnapshot.snapshot.activeConversationWindow.currentTaskList, null);
+    assertions.push('currentTaskList只投影latest Turn；新Turn无rewrite基线时返回null且不继承旧Turn任务');
     return { assertions, faults, metrics };
   });
 }

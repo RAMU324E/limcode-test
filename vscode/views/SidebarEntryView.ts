@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
-import { MainPanel } from '../panels/MainPanel';
+import { MainPanel, type MainPanelOptions } from '../panels/MainPanel';
 import { getUnavailableWebviewHtml, getWebviewHtml } from '../webview/getWebviewHtml';
 import type { ApplicationFacade } from '../ApplicationFacade';
+import type { ApplicationStartup } from '../ApplicationStartup';
 import { EXTENSION_BRAND, SIDEBAR_ENTRY_VIEW_ID } from '../../shared/extensionIdentity';
 import { toStructuredClonePlainData } from '../../shared/plainData';
 import type {
@@ -50,10 +51,11 @@ interface SidebarStateMessage {
   openConversations: OpenConversationPanelRecord[];
 }
 
-export function registerSidebarEntryView(context: vscode.ExtensionContext, backendApp: ApplicationFacade): void {
-  const provider = new SidebarEntryViewProvider(context.extensionUri, backendApp);
+export function registerSidebarEntryView(context: vscode.ExtensionContext, startup: ApplicationStartup): void {
+  const provider = new SidebarEntryViewProvider(context.extensionUri, startup);
 
   context.subscriptions.push(
+    provider,
     vscode.window.registerWebviewViewProvider(SIDEBAR_ENTRY_VIEW_ID, provider, {
       webviewOptions: {
         retainContextWhenHidden: true
@@ -61,7 +63,6 @@ export function registerSidebarEntryView(context: vscode.ExtensionContext, backe
     })
   );
   context.subscriptions.push(MainPanel.onDidChangeConversationPanelState(() => provider.refreshOpenConversationPanelStates()));
-  context.subscriptions.push(backendApp.onDidChangeConversationHistory(() => provider.refreshConversationHistory()));
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => provider.refreshWorkspaceContext()));
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => provider.refreshWorkspaceContext()));
 }
@@ -80,7 +81,7 @@ export function registerUnavailableSidebarEntryView(
   );
 }
 
-class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
+class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private lastScopeKind: SidebarHistoryScopeKind = 'currentProject';
   private lastProjectFolderUri: string | undefined;
   private lastCursor: string | undefined;
@@ -88,17 +89,62 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
   private historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private historyRequestSeq = 0;
   private lastStateMessage: SidebarStateMessage | undefined;
+  private backendApp: ApplicationFacade | undefined;
+  private historySubscription: vscode.Disposable | undefined;
+  private unavailableMessage: string | undefined;
+  private disposed = false;
 
   public constructor(
     private readonly extensionUri: vscode.Uri,
-    private readonly backendApp: ApplicationFacade
+    private readonly startup: ApplicationStartup
   ) {}
+
+  public attachApplication(backendApp: ApplicationFacade): void {
+    if (this.disposed) return;
+    this.backendApp = backendApp;
+    this.historySubscription?.dispose();
+    this.historySubscription = backendApp.onDidChangeConversationHistory(() => this.refreshConversationHistory());
+  }
+
+  private async application(): Promise<ApplicationFacade> {
+    try {
+      const backendApp = await this.startup.wait();
+      if (this.backendApp !== backendApp) this.attachApplication(backendApp);
+      return backendApp;
+    } catch (error) {
+      this.renderUnavailable(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  public renderUnavailable(message: string): void {
+    this.unavailableMessage = message;
+    const target = this.activeWebview;
+    if (!target) return;
+    target.options = { enableScripts: false };
+    target.html = getUnavailableWebviewHtml(message);
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
+    this.historyRefreshTimer = undefined;
+    this.historySubscription?.dispose();
+    this.historySubscription = undefined;
+    this.activeWebview = undefined;
+  }
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.activeWebview = webviewView.webview;
     webviewView.onDidDispose(() => {
       if (this.activeWebview === webviewView.webview) this.activeWebview = undefined;
     });
+
+    if (this.unavailableMessage) {
+      webviewView.webview.options = { enableScripts: false };
+      webviewView.webview.html = getUnavailableWebviewHtml(this.unavailableMessage);
+      return;
+    }
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -109,16 +155,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage((message: SidebarWebviewMessage) => {
       if (message.type === OPEN_CONVERSATION_MESSAGE && message.conversationId) {
-        if (!this.backendApp.prepareConversationForSidebarOpen(message.conversationId, message.title)) {
-          this.postSidebarStateWhenReady(webviewView.webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
-          void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: 该对话已被删除或不再存在。`);
-          return;
-        }
-        MainPanel.createOrShow(this.extensionUri, this.backendApp, {
-          conversationId: message.conversationId,
-          title: message.title,
-          reuse: true
-        });
+        this.openConversationFromSidebar(webviewView.webview, message.conversationId, message.title);
         return;
       }
 
@@ -128,17 +165,17 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
       }
 
       if (message.type === OPEN_GLOBAL_SETTINGS_MESSAGE) {
-        MainPanel.createOrShow(this.extensionUri, this.backendApp, { kind: 'globalSettings', reuse: true });
+        this.openPanelFromSidebar({ kind: 'globalSettings', reuse: true });
         return;
       }
 
       if (message.type === OPEN_WORKFLOW_SETTINGS_MESSAGE) {
-        MainPanel.createOrShow(this.extensionUri, this.backendApp, { kind: 'workflowSettings', reuse: true });
+        this.openPanelFromSidebar({ kind: 'workflowSettings', reuse: true });
         return;
       }
 
       if (message.type === OPEN_AGENT_SETTINGS_MESSAGE) {
-        MainPanel.createOrShow(this.extensionUri, this.backendApp, { kind: 'agentSettings', reuse: true });
+        this.openPanelFromSidebar({ kind: 'agentSettings', reuse: true });
         return;
       }
 
@@ -231,11 +268,33 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
     }, 180);
   }
 
+  private openConversationFromSidebar(webview: vscode.Webview, conversationId: string, title?: string): void {
+    void this.application().then((backendApp) => {
+      if (!backendApp.prepareConversationForSidebarOpen(conversationId, title)) {
+        this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
+        void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: 该对话已被删除或不再存在。`);
+        return;
+      }
+      MainPanel.createOrShow(this.extensionUri, backendApp, {
+        conversationId,
+        title,
+        reuse: true
+      });
+    }).catch((error) => console.warn('[LimCode] Failed to open sidebar conversation.', error));
+  }
+
+  private openPanelFromSidebar(options: MainPanelOptions): void {
+    void this.application().then(
+      (backendApp) => MainPanel.createOrShow(this.extensionUri, backendApp, options),
+      (error) => console.warn('[LimCode] Failed to open sidebar panel.', error)
+    );
+  }
+
   private createConversationFromSidebar(webview: vscode.Webview, projectFolderUri?: string): void {
-    void this.backendApp
-      .createConversation({ projectFolderUri })
-      .then((conversationId) => {
-        MainPanel.createOrShow(this.extensionUri, this.backendApp, { conversationId });
+    void this.application()
+      .then((backendApp) => backendApp.createConversation({ projectFolderUri }).then((conversationId) => ({ backendApp, conversationId })))
+      .then(({ backendApp, conversationId }) => {
+        MainPanel.createOrShow(this.extensionUri, backendApp, { conversationId });
         this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
       })
       .catch((error) => console.warn('[LimCode] Failed to create sidebar conversation.', error));
@@ -245,10 +304,10 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
     const nextTitle = title.trim();
     if (!nextTitle) return;
 
-    void this.backendApp
-      .waitUntilHydrated()
-      .then(async () => {
-        const renamed = await this.backendApp.renameConversationTitle(conversationId, nextTitle);
+    void this.application()
+      .then(async (backendApp) => {
+        await backendApp.waitUntilHydrated();
+        const renamed = await backendApp.renameConversationTitle(conversationId, nextTitle);
         if (!renamed) console.warn(`[LimCode] Sidebar rename target not found: ${conversationId}`);
         else MainPanel.refreshConversationTitle(conversationId);
         this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
@@ -257,10 +316,10 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
   }
 
   private deleteConversationFromSidebar(webview: vscode.Webview, conversationId: string): void {
-    const deletion = this.backendApp.deleteConversation(conversationId);
     void (async () => {
       try {
-        const deleted = await deletion;
+        const backendApp = await this.application();
+        const deleted = await backendApp.deleteConversation(conversationId);
         if (deleted) MainPanel.closePanelsByConversationId(conversationId);
         await this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
         await this.postConversationOperationResult(webview, 'delete', conversationId, deleted, deleted ? undefined : '该对话不存在。');
@@ -283,7 +342,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
   ): void {
     void (async () => {
       try {
-        const outcome = await this.backendApp.abortConversation(conversationId, requestId, {
+        const backendApp = await this.application();
+        const outcome = await backendApp.abortConversation(conversationId, requestId, {
           turnId,
           leaseGeneration
         });
@@ -341,7 +401,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
     this.lastScopeKind = scopeKind;
     this.lastProjectFolderUri = projectFolderUri;
     this.lastCursor = cursor;
-    const history = await this.backendApp.getConversationHistoryPage({ scopeKind, projectFolderUri, cursor, limit });
+    const backendApp = await this.application();
+    const history = await backendApp.getConversationHistoryPage({ scopeKind, projectFolderUri, cursor, limit });
     if (requestSeq !== this.historyRequestSeq) {
       return;
     }
@@ -352,19 +413,20 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider {
       history,
       activeScopeKind: scopeKind,
       ...(activeProjectFolderUri ? { activeProjectFolderUri } : {}),
-      currentProjectScope: this.backendApp.getCurrentProjectHistoryScope(),
-      projectFolders: this.backendApp.getProjectFolderCandidates(),
+      currentProjectScope: backendApp.getCurrentProjectHistoryScope(),
+      projectFolders: backendApp.getProjectFolderCandidates(),
       openConversations: []
-    });
+    }, backendApp);
     this.lastStateMessage = message;
     await postSidebarWebviewMessage(webview, message);
   }
 
-  private withLivePanelState(message: SidebarStateMessage): SidebarStateMessage {
+  private withLivePanelState(message: SidebarStateMessage, backendApp = this.backendApp): SidebarStateMessage {
+    if (!backendApp) return message;
     return {
       ...message,
-      currentProjectScope: this.backendApp.getCurrentProjectHistoryScope(),
-      projectFolders: this.backendApp.getProjectFolderCandidates(),
+      currentProjectScope: backendApp.getCurrentProjectHistoryScope(),
+      projectFolders: backendApp.getProjectFolderCandidates(),
       openConversations: MainPanel.getOpenConversationPanelStates()
     };
   }

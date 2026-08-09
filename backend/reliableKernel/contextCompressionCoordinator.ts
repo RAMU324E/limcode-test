@@ -8,13 +8,23 @@ import {
   type CompressionCommitResult
 } from './contextCompression';
 import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
-import { frozenCompressionPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenCompressionPolicy, frozenContextProfile, readFrozenTurnAuthority } from './frozenAuthority';
 import {
   compressionOutputTokens,
-  estimateMaterializedContextTokens,
   estimateMessageContentsTokens
 } from './contextTokenEstimator';
 import {
+  MODEL_BODY_TARGET_TOKENS,
+  calculateEffectiveSummaryMaxTokens,
+  calculateFullRequestBudget,
+  projectStoredModelFacingWindow,
+  selectContinuousAtomicTail,
+  type AtomicContextGroup,
+  type ContextPlanningFailureCode,
+  type FullRequestBudget
+} from './modelFacingContextProjection';
+import {
+  ModelRequestPreflightError,
   ModelProviderControlPlane,
   modelRequestIdFor,
   type FullRequestProviderAdapter
@@ -30,7 +40,11 @@ export interface CoordinateCompressionCommand {
   authoritySnapshotId: string;
   headRootId: string;
   trigger: CompressionTrigger;
-  /** Manual callers may freeze an explicit prefix. Automatic selection always uses preserveLatestMessages. */
+  /** Exact frozen ordinary request budget. Required for automatic compression; optional for manual. */
+  requestBudget?: FullRequestBudget;
+  /** Exact active-Turn input that may need request-level reinjection after this compression. */
+  protectedCurrentInputTokens?: number;
+  /** Manual callers may freeze an explicit prefix. Automatic text selection uses a continuous token tail. */
   compressSegmentCount?: number;
   title?: string;
 }
@@ -38,9 +52,23 @@ export interface CoordinateCompressionCommand {
 export type CoordinateCompressionResult =
   | {
       status: 'skipped';
-      reason: 'disabled' | 'manual_only' | 'below_threshold' | 'finite_tail' | 'empty_context' | 'non_reducing';
+      reason:
+        | 'disabled'
+        | 'manual_only'
+        | 'below_threshold'
+        | 'fixed_over_policy'
+        | 'finite_tail'
+        | 'empty_context'
+        | 'non_reducing';
       estimatedTokens?: number;
       thresholdTokens?: number;
+    }
+  | {
+      status: 'error';
+      code: ContextPlanningFailureCode;
+      message: string;
+      estimatedTokens: number;
+      limitTokens: number;
     }
   | {
       status: 'compressed';
@@ -48,6 +76,7 @@ export type CoordinateCompressionResult =
       modelRequestId: string;
       sourceRootId: string;
       sourceSegmentCount: number;
+      diagnostics?: Array<'native_over_target'>;
       result: CompressionCommitResult;
     };
 
@@ -85,15 +114,63 @@ export class ReliableContextCompressionCoordinator {
     if (trigger === 'auto' && policy.triggerMode !== 'token_threshold') {
       return { status: 'skipped', reason: 'manual_only' };
     }
-    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
-    if (trigger === 'auto' && !decision.shouldCompress) {
+    if (trigger === 'auto' && !command.requestBudget) {
+      throw new TypeError('Automatic compression requires the exact frozen ordinary request budget.');
+    }
+    const requestBudget = command.requestBudget
+      ? requireFullRequestBudget(command.requestBudget, policy.thresholdTokens)
+      : manualRequestBudget(frozen.document, policy.thresholdTokens);
+    if (requestBudget.fixedTokens > requestBudget.estimatedInputLimitTokens) {
+      return compressionError(
+        'fixed_overhead_infeasible',
+        'System instructions, tool schemas and provider framing exceed the safe input limit.',
+        requestBudget.fixedTokens,
+        requestBudget.estimatedInputLimitTokens
+      );
+    }
+    if (trigger === 'auto' && requestBudget.fixedOverPolicy && !requestBudget.sendingTrigger) {
+      return {
+        status: 'skipped',
+        reason: 'fixed_over_policy',
+        estimatedTokens: requestBudget.estimatedFullInputTokens,
+        thresholdTokens: requestBudget.compressionThresholdTokens
+      };
+    }
+    if (trigger === 'auto' && !requestBudget.policyTrigger && !requestBudget.sendingTrigger) {
       return {
         status: 'skipped',
         reason: 'below_threshold',
-        estimatedTokens: decision.estimatedTokens,
-        thresholdTokens: decision.thresholdTokens
+        estimatedTokens: requestBudget.estimatedFullInputTokens,
+        thresholdTokens: requestBudget.compressionThresholdTokens
       };
     }
+    const protectedCurrentInputTokens = command.protectedCurrentInputTokens === undefined
+      ? 0
+      : requireNonNegativeTokenCount(command.protectedCurrentInputTokens, 'protectedCurrentInputTokens');
+    const currentInputAddendumTokens = Math.max(
+      requestBudget.breakdown.currentInputTokens,
+      protectedCurrentInputTokens
+    );
+    const irreducibleAddendaTokens = currentInputAddendumTokens
+      + requestBudget.breakdown.runtimeDeliveryTokens
+      + requestBudget.breakdown.turnReminderTokens;
+    if (currentInputAddendumTokens > requestBudget.safeBodyRoomTokens) {
+      return compressionError(
+        'current_input_too_large',
+        'The exact current Turn input cannot fit in the safe model body room.',
+        currentInputAddendumTokens,
+        requestBudget.safeBodyRoomTokens
+      );
+    }
+    if (irreducibleAddendaTokens > requestBudget.safeBodyRoomTokens) {
+      return compressionError(
+        'request_still_too_large',
+        'Current input, runtime deliveries and the Turn reminder cannot fit even with empty history.',
+        irreducibleAddendaTokens,
+        requestBudget.safeBodyRoomTokens
+      );
+    }
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
     // Materialize source structure/content only after the level-trigger passes. Below-threshold checks
     // are the common path and should pay for one provider-aligned Context read, not three.
     const [materialized, semanticMaterialized] = await Promise.all([
@@ -101,10 +178,45 @@ export class ReliableContextCompressionCoordinator {
       this.context.materialize(headRootId)
     ]);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
-    const requestedSourceSegmentCount = command.compressSegmentCount === undefined
-      ? selectCompressionPrefix(materialized.records, policy.preserveLatestMessages)
-      : requirePrefixCount(command.compressSegmentCount, materialized.records.length);
-    const sourceSegmentCount = closeToolExchangeBoundary(materialized.records, requestedSourceSegmentCount);
+    if (
+      policy.methodKind === 'openai_responses_compact'
+      && command.compressSegmentCount !== undefined
+      && command.compressSegmentCount !== materialized.records.length
+    ) {
+      throw new RangeError('OpenAI native Compact must receive the complete frozen model-visible Context window.');
+    }
+    const effectiveSummaryMaxTokens = policy.methodKind === 'openai_responses_compact'
+      ? undefined
+      : calculateEffectiveSummaryMaxTokens(
+          policy.config.llmSummary?.targetTokens,
+          requestBudget.effectiveBodyTargetTokens
+        );
+    const textTailPlan = policy.methodKind === 'openai_responses_compact' || command.compressSegmentCount !== undefined
+      ? undefined
+      : selectCompressionPrefixByTokens(
+            materialized.records,
+            semanticMaterialized.segments,
+            Math.max(0, requestBudget.effectiveBodyTargetTokens
+              - irreducibleAddendaTokens
+              - (effectiveSummaryMaxTokens ?? 0))
+          );
+    const hardContextRoomTokens = Math.max(0, requestBudget.safeBodyRoomTokens - irreducibleAddendaTokens);
+    if (textTailPlan?.newestGroupTokens !== undefined && textTailPlan.newestGroupTokens > hardContextRoomTokens) {
+      return compressionError(
+        textTailPlan.newestGroupKind === 'tool_exchange' ? 'atomic_group_too_large' : 'finite_tail_too_large',
+        'The newest indivisible Context group cannot fit with the frozen request addenda.',
+        textTailPlan.newestGroupTokens,
+        hardContextRoomTokens
+      );
+    }
+    const requestedSourceSegmentCount = policy.methodKind === 'openai_responses_compact'
+      ? materialized.records.length
+      : command.compressSegmentCount === undefined
+        ? textTailPlan?.sourceSegmentCount ?? 0
+        : requirePrefixCount(command.compressSegmentCount, materialized.records.length);
+    const sourceSegmentCount = policy.methodKind === 'openai_responses_compact'
+      ? requestedSourceSegmentCount
+      : closeToolExchangeBoundary(materialized.records, requestedSourceSegmentCount);
     if (sourceSegmentCount <= 0 || sourceSegmentCount > materialized.records.length) {
       return {
         status: 'skipped',
@@ -132,7 +244,8 @@ export class ReliableContextCompressionCoordinator {
         sourceHash,
         blockId: compressionBlockIdFor(frozen.conversationId, headRootId, expectedModelRequestId),
         compressionConfigId: policy.config.id,
-        compressionMethodKind: policy.methodKind
+        compressionMethodKind: policy.methodKind,
+        ...(effectiveSummaryMaxTokens === undefined ? {} : { effectiveSummaryMaxTokens })
       }, 'Reliable compression recipe'),
       idempotencyKey
     });
@@ -144,7 +257,14 @@ export class ReliableContextCompressionCoordinator {
       const providerId = requireText(request.provider_id, 'ModelRequest.provider_id');
       const adapter = await this.providers.resolve(providerId);
       assertProviderAdapter(adapter, providerId);
-      await this.modelProvider.dispatch(expectedModelRequestId, adapter, { reconnect: true });
+      try {
+        await this.modelProvider.dispatch(expectedModelRequestId, adapter, { reconnect: true });
+      } catch (error) {
+        if (error instanceof ModelRequestPreflightError) {
+          return compressionError(error.code, error.message, error.estimatedTokens, error.limitTokens);
+        }
+        throw error;
+      }
       request = await this.requireDomain('ModelRequest', expectedModelRequestId);
     }
     if (request.terminal_state !== 'completed') {
@@ -155,8 +275,17 @@ export class ReliableContextCompressionCoordinator {
     const summaryEstimatedTokens = compressionOutputTokens(completed.usage)
       ?? estimateMessageContentsTokens(summary);
     const projectedTokens = summaryEstimatedTokens
-      + estimateMaterializedContextTokens(semanticMaterialized.segments.slice(sourceSegmentCount));
-    if (projectedTokens >= decision.estimatedTokens) {
+      + projectMaterializedSegmentsTokens(semanticMaterialized.segments.slice(sourceSegmentCount));
+    const projectedBodyTokens = projectedTokens + irreducibleAddendaTokens;
+    if (projectedBodyTokens > requestBudget.safeBodyRoomTokens) {
+      return compressionError(
+        'request_still_too_large',
+        'The candidate compressed history plus frozen request addenda still exceeds the safe body room.',
+        projectedBodyTokens,
+        requestBudget.safeBodyRoomTokens
+      );
+    }
+    if (policy.methodKind !== 'openai_responses_compact' && projectedTokens >= decision.estimatedTokens) {
       // A large protected tail can cross the threshold while the currently eligible prefix is
       // already compact.  The durable ModelRequest makes this decision exact-replayable for this
       // frozen head; treating it as a level-triggered skip keeps the primary Agent Turn alive and
@@ -184,7 +313,6 @@ export class ReliableContextCompressionCoordinator {
           : {})
       },
       projectedEstimatedTokens: projectedTokens,
-      enforceThreshold: trigger === 'auto',
       idempotencyKey: expectedModelRequestId
     });
     return {
@@ -193,6 +321,9 @@ export class ReliableContextCompressionCoordinator {
       modelRequestId: expectedModelRequestId,
       sourceRootId: headRootId,
       sourceSegmentCount,
+      ...(policy.methodKind === 'openai_responses_compact' && projectedTokens > MODEL_BODY_TARGET_TOKENS
+        ? { diagnostics: ['native_over_target' as const] }
+        : {}),
       result: committed
     };
   }
@@ -238,18 +369,143 @@ export class ReliableContextCompressionCoordinator {
   }
 }
 
-function selectCompressionPrefix(records: readonly StructuralContextRecord[], preserveLatestMessages: number): number {
-  const preserve = Math.max(0, Math.floor(preserveLatestMessages));
-  if (records.length < 2) return 0;
-  const messageIndexes = records.flatMap((record, index) =>
-    record.segment.segment_kind === 'message' ? [index] : []
-  );
-  if (messageIndexes.length === 0) return records.length - 1;
-  // A finite tail is mandatory. With preserve=0 retain the latest message and every following
-  // tool_pair/runtime segment; with preserve=N retain the N latest message boundaries.
-  const retainedMessages = Math.max(1, preserve);
-  if (messageIndexes.length <= retainedMessages) return 0;
-  return messageIndexes[messageIndexes.length - retainedMessages];
+function selectCompressionPrefixByTokens(
+  records: readonly StructuralContextRecord[],
+  segments: ReadonlyArray<{
+    segmentKind: string;
+    messageRole: string | null;
+    contentObject: { content_type: string };
+    content: Buffer;
+  }>,
+  tailBudgetTokens: number
+): {
+  sourceSegmentCount: number;
+  newestGroupTokens?: number;
+  newestGroupKind?: AtomicContextGroup<number>['kind'];
+} {
+  if (records.length !== segments.length) {
+    throw new Error('Structural and semantic Context materializations disagree on segment count.');
+  }
+  const groups: AtomicContextGroup<number>[] = [];
+  for (let index = 0; index < records.length;) {
+    const start = index;
+    const items = [index];
+    index += 1;
+    if (records[start].segment.segment_kind === 'message') {
+      while (index < records.length && records[index].segment.segment_kind === 'tool_pair') {
+        items.push(index);
+        index += 1;
+      }
+    }
+    const functionResponseCount = items.filter((position) =>
+      records[position].segment.segment_kind === 'tool_pair'
+    ).length;
+    groups.push({
+      kind: functionResponseCount > 0 ? 'tool_exchange' : 'message',
+      items,
+      startIndex: start,
+      endIndexExclusive: index,
+      estimatedTokens: projectStoredModelFacingWindow(items.map((position) => ({
+        segmentKind: segments[position].segmentKind,
+        messageRole: segments[position].messageRole,
+        contentType: segments[position].contentObject.content_type,
+        content: segments[position].content.toString('utf8')
+      }))).tokenCount,
+      functionCallCount: functionResponseCount > 0 ? 1 : 0,
+      functionResponseCount,
+      complete: true
+    });
+  }
+  const selected = selectContinuousAtomicTail(groups, tailBudgetTokens);
+  const newest = selected.tailGroups[selected.tailGroups.length - 1];
+  return {
+    sourceSegmentCount: selected.prefixItems.length,
+    ...(newest ? { newestGroupTokens: newest.estimatedTokens, newestGroupKind: newest.kind } : {})
+  };
+}
+
+function projectMaterializedSegmentsTokens(segments: ReadonlyArray<{
+  segmentKind: string;
+  messageRole: string | null;
+  contentObject: { content_type: string };
+  content: Buffer;
+}>): number {
+  return projectStoredModelFacingWindow(segments.map((segment) => ({
+    segmentKind: segment.segmentKind,
+    messageRole: segment.messageRole,
+    contentType: segment.contentObject.content_type,
+    content: segment.content.toString('utf8')
+  }))).tokenCount;
+}
+
+function manualRequestBudget(document: PlainJsonValue, thresholdTokens: number): FullRequestBudget {
+  const profile = frozenContextProfile(document);
+  return calculateFullRequestBudget({
+    contextWindowTokens: profile.contextWindowTokens,
+    compressionThresholdTokens: thresholdTokens,
+    breakdown: emptyRequestBreakdown()
+  });
+}
+
+function emptyRequestBreakdown(): FullRequestBudget['breakdown'] {
+  return {
+    systemTokens: 0,
+    toolSchemaTokens: 0,
+    providerFramingTokens: 0,
+    contextTokens: 0,
+    currentInputTokens: 0,
+    runtimeDeliveryTokens: 0,
+    turnReminderTokens: 0,
+    mediaTokens: 0,
+    fixedTokens: 0,
+    bodyTokens: 0,
+    fullTokens: 0
+  };
+}
+
+function requireFullRequestBudget(value: FullRequestBudget, expectedThresholdTokens: number): FullRequestBudget {
+  if (!value || typeof value !== 'object') throw new TypeError('requestBudget must be an object.');
+  const integerFields: Array<keyof FullRequestBudget> = [
+    'contextWindowTokens',
+    'compressionThresholdTokens',
+    'outputReserveTokens',
+    'estimatorSlackTokens',
+    'estimatedInputLimitTokens',
+    'fixedTokens',
+    'bodyTokens',
+    'estimatedFullInputTokens',
+    'safeBodyRoomTokens',
+    'policyBodyRoomTokens',
+    'effectiveBodyTargetTokens'
+  ];
+  for (const field of integerFields) {
+    const candidate = value[field];
+    if (!Number.isSafeInteger(candidate) || (candidate as number) < 0) {
+      throw new TypeError(`requestBudget.${field} must be a non-negative safe integer.`);
+    }
+  }
+  if (value.compressionThresholdTokens !== expectedThresholdTokens) {
+    throw new Error('requestBudget compression threshold does not match frozen compression authority.');
+  }
+  if (value.estimatedFullInputTokens !== value.fixedTokens + value.bodyTokens) {
+    throw new Error('requestBudget full input total is inconsistent.');
+  }
+  if (typeof value.policyTrigger !== 'boolean'
+    || typeof value.sendingTrigger !== 'boolean'
+    || typeof value.fixedOverPolicy !== 'boolean'
+    || typeof value.canSend !== 'boolean') {
+    throw new TypeError('requestBudget trigger/send flags must be booleans.');
+  }
+  return value;
+}
+
+function compressionError(
+  code: ContextPlanningFailureCode,
+  message: string,
+  estimatedTokens: number,
+  limitTokens: number
+): Extract<CoordinateCompressionResult, { status: 'error' }> {
+  return { status: 'error', code, message, estimatedTokens, limitTokens };
 }
 
 function closeToolExchangeBoundary(records: readonly StructuralContextRecord[], requestedCount: number): number {
@@ -291,6 +547,13 @@ function assertProviderAdapter(adapter: FullRequestProviderAdapter, providerId: 
 function requirePrefixCount(value: number, total: number): number {
   if (!Number.isSafeInteger(value) || value <= 0 || value > total) {
     throw new RangeError(`Compression prefix must be from 1 to ${Math.max(1, total)}.`);
+  }
+  return value;
+}
+
+function requireNonNegativeTokenCount(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${label} must be a non-negative safe integer.`);
   }
   return value;
 }

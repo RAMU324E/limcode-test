@@ -9,6 +9,7 @@ import type {
   LLMStreamChunk,
   StreamDecodeState
 } from 'unified-llm-provider';
+export { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 
 const MAX_SOCKET_AGE_MS = 55 * 60 * 1_000;
 const MAX_RETAINED_SESSIONS = 32;
@@ -27,8 +28,6 @@ const NETWORK_IDENTITY_CHECK_INTERVAL_MS = 2_000;
 // This error class is constructed only when the socket closes before a terminal Responses event,
 // so 1000/1001 are retryable transport interruptions at this boundary.
 const RETRYABLE_CLOSE_CODES = new Set([1000, 1001, 1006, 1011, 1012, 1013, 1014]);
-
-export const LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION = 'codex-output-items-v1';
 
 export interface OpenAIResponsesToolCallArgumentDelta {
   callId: string;

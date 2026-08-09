@@ -56,10 +56,8 @@ export interface CreateCompressionCommand {
       modelId: string;
     };
   };
-  /** Provider-aligned estimate for summary plus finite tail. */
+  /** Provider-aligned estimate for the replacement Context only (summary/native output plus local tail). */
   projectedEstimatedTokens?: number;
-  /** Automatic compression enforces the frozen threshold; explicit manual compression may opt out. */
-  enforceThreshold?: boolean;
   idempotencyKey: string;
 }
 
@@ -171,10 +169,9 @@ export class ContextCompressionControlPlane {
         sourceCount: requestedSourceCount
       });
     }
-    const [materialized, semanticMaterialized, sourceEstimate] = await Promise.all([
+    const [materialized, semanticMaterialized] = await Promise.all([
       this.context.materializeStructure(headRootId),
-      this.context.materialize(headRootId),
-      this.tokenEstimator.estimateRoot(headRootId)
+      this.context.materialize(headRootId)
     ]);
     if (materialized.root.conversation_id !== conversationId) {
       throw new Error(`ContextSequenceRoot ${headRootId} belongs to another Conversation.`);
@@ -182,14 +179,6 @@ export class ContextCompressionControlPlane {
     const compressCount = requireRangeCount(requestedSourceCount, materialized.records.length);
     const frozen = await this.readFrozenProfile(authoritySnapshotId);
     if (frozen.conversationId !== conversationId) throw new Error('AuthoritySnapshot belongs to another Conversation.');
-    const profile = frozen.profile;
-    const sourceEstimatedTokens = sourceEstimate.estimatedTokens;
-    if (command.enforceThreshold !== false && sourceEstimatedTokens < profile.compressionThresholdTokens) {
-      throw new Error(
-        `Context root ${headRootId} is below its frozen compression threshold `
-          + `(${sourceEstimatedTokens} < ${profile.compressionThresholdTokens}).`
-      );
-    }
     const head = await this.requireHead(conversationId, headRootId);
     const titleContent = await this.contentStore.prepare(this.database, title, CONTENT_TYPE_TITLE);
     const summaryContent = await this.contentStore.prepare(this.database, summary.content, summary.contentType);

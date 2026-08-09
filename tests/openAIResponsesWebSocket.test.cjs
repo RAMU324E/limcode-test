@@ -145,7 +145,7 @@ async function runTransportFallbackRequest(
     reliableProviderAttempt: {
       attemptSeq: 5,
       maxAttempts: 5,
-      requestCreatedAt: Date.now() - 120_000
+      requestCreatedAt: Date.now()
     }
   }, (event) => events.push(event), {
     settings: async () => providerConfig({

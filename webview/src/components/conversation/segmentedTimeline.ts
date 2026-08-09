@@ -2,6 +2,30 @@
 export const TIMELINE_MOUNT_LIMIT = 30;
 export const TIMELINE_SEGMENT_STEP = 20;
 export const PENDING_TIMELINE_MOUNT_LIMIT = 8;
+/** The newest rows hydrate ahead of the rest of the mounted segment. */
+export const TIMELINE_FOREGROUND_DETAIL_LIMIT = 8;
+
+export interface TimelineDetailDemand {
+  critical: string[];
+  visible: string[];
+  background: string[];
+}
+
+/**
+ * Detail requests are emitted newest-first. In particular, the last row gets its own critical
+ * request before any other mounted body can occupy one of the four transport slots.
+ */
+export function prioritizedTimelineDetailDemand(messageIds: readonly string[]): TimelineDetailDemand {
+  const ids = messageIds.filter((id) => id.length > 0);
+  const latest = ids[ids.length - 1];
+  if (!latest) return { critical: [], visible: [], background: [] };
+  const foregroundStart = Math.max(0, ids.length - TIMELINE_FOREGROUND_DETAIL_LIMIT);
+  return {
+    critical: [latest],
+    visible: ids.slice(foregroundStart, -1).reverse(),
+    background: ids.slice(0, foregroundStart).reverse()
+  };
+}
 
 export function clampTimelineSegmentStart(totalRows: number, requestedStart: number): number {
   if (!Number.isSafeInteger(totalRows) || totalRows < 0) throw new RangeError('totalRows must be non-negative.');

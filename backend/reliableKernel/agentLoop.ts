@@ -6,6 +6,7 @@ import type { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   EffectControlPlane,
   type FrozenToolCallPolicyDecision,
@@ -13,12 +14,16 @@ import {
   type ToolTerminalResult
 } from './effectControlPlane';
 import {
+  ModelRequestPreflightError,
   ModelProviderControlPlane,
   modelRequestIdFor,
   type FullRequestProviderAdapter,
   type ProviderStreamEvent,
   type StreamEventResult
 } from './modelProviderControlPlane';
+import {
+  readCurrentTurnTaskCard
+} from './currentTurnTaskProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -135,6 +140,7 @@ export type ReliableAgentLifecycleStage =
   | 'context_tool_pair_committed'
   | 'turn_terminal_started'
   | 'turn_terminal_completed'
+  | 'open_tasks_at_final'
   | 'drive_failed'
   | 'failure_terminal_started'
   | 'failure_terminal_completed'
@@ -156,6 +162,10 @@ export interface ReliableAgentLifecycleEvent {
   terminalPrefixCursor?: number;
   contextPairCount?: number;
   contextTransactionCount?: number;
+  openTaskCount?: number;
+  taskCardSha256?: string;
+  activeChildCount?: number;
+  runningProcessCount?: number;
   errorName?: string;
   errorMessage?: string;
 }
@@ -195,7 +205,27 @@ interface FrozenProviderToolCall extends NormalizedToolCall {
   policy: FrozenToolCallPolicyDecision;
 }
 
+interface FrozenCurrentTurnInputReference {
+  kind: 'current_turn_input';
+  messageId: string;
+  messageRevisionId: string;
+  contentObjectId: string;
+  estimatedTokens: number;
+  reinject: boolean;
+}
+
+interface FrozenRuntimeStatusCard {
+  kind: 'runtime_status_card';
+  activeChildCount: number;
+  runningProcessCount: number;
+  children: Array<{ childExecutionId: string; answerBridgeId?: string; status: string }>;
+  processes: Array<{ processId: string; status: 'running' }>;
+  card: string;
+}
+
 const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
+const RUNTIME_STATUS_RECIPE_LIMIT = 32;
+const RUNTIME_STATUS_CARD_LIMIT = 4;
 
 /**
  * 单 Turn 的可靠 Agent loop。每轮都冻结 Context root/authority，Provider 完成摘要先落 SQLite/CAS，
@@ -284,23 +314,84 @@ export class ReliableAgentLoop {
           if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
             facts = await this.readRoundFacts(turnId);
           }
-          const compression = await this.compressionCoordinator.coordinate({
-            turnId,
-            authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
-            headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
-            trigger: 'auto'
-          });
-          if (compression.status === 'compressed') facts = await this.readRoundFacts(turnId);
           const toolDefinitions = await this.tools.definitions(turnId);
+          let frozenRecipe = await this.freezeOrdinaryRequestRecipe({
+            turnId,
+            round,
+            headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+            tools: toolDefinitions
+          });
+          let preview = await this.modelProvider.previewOrdinaryRequest({
+            turnId,
+            contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+            authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
+            recipe: frozenRecipe,
+            idempotencyKey
+          });
+          let previewAdapter = await this.providers.resolve(preview.providerId);
+          if (previewAdapter.providerId !== preview.providerId) {
+            throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
+          }
+          let budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);
+          if (budget.policyTrigger || budget.sendingTrigger) {
+            const compression = await this.compressionCoordinator.coordinate({
+              turnId,
+              authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
+              headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+              trigger: 'auto',
+              requestBudget: budget,
+              protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe)
+            });
+            if (compression.status === 'error') {
+              throw new ModelRequestPreflightError(
+                compression.code,
+                `${compression.code}: ${compression.message}`,
+                compression.estimatedTokens,
+                compression.limitTokens
+              );
+            }
+            if (compression.status === 'compressed') {
+              facts = await this.readRoundFacts(turnId);
+              // Delivery that became model-visible while Compact was running belongs after the
+              // canonical output. It is absorbed only after the new head CAS has succeeded.
+              if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
+                facts = await this.readRoundFacts(turnId);
+              }
+            }
+            frozenRecipe = await this.freezeOrdinaryRequestRecipe({
+              turnId,
+              round,
+              headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+              tools: toolDefinitions
+            });
+            preview = await this.modelProvider.previewOrdinaryRequest({
+              turnId,
+              contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+              authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
+              recipe: frozenRecipe,
+              idempotencyKey
+            });
+            previewAdapter = await this.providers.resolve(preview.providerId);
+            if (previewAdapter.providerId !== preview.providerId) {
+              throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
+            }
+            budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);
+          }
+          if (!budget.canSend) {
+            throw new ModelRequestPreflightError(
+              'request_still_too_large',
+              `request_still_too_large: rebuilt request is ${budget.estimatedFullInputTokens} tokens, `
+                + `safe limit is ${budget.estimatedInputLimitTokens}.`,
+              budget.estimatedFullInputTokens,
+              budget.estimatedInputLimitTokens
+            );
+          }
           const created = await this.modelProvider.createModelRequest({
             turnId,
             contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
-            recipe: normalizePlainJson({
-              kind: 'reliable-agent-turn',
-              round,
-              tools: toolDefinitions
-            }, 'Reliable Agent recipe'),
+            recipe: frozenRecipe,
+            projectedEstimatedTokens: budget.estimatedFullInputTokens,
             idempotencyKey
           });
           if (created.modelRequestId !== expectedModelRequestId) {
@@ -375,13 +466,6 @@ export class ReliableAgentLoop {
             if (await this.terminateIfRequested(turnId, `round:${round}:before-complete:${modelRequestId}`)) {
               return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
             }
-            const terminalFacts = await this.readRoundFacts(turnId);
-            await this.compressionCoordinator.coordinate({
-              turnId,
-              authoritySnapshotId: requireId(terminalFacts.authority.id, 'AuthoritySnapshot.id'),
-              headRootId: requireId(terminalFacts.head.root_id, 'ConversationContextHeadLink.root_id'),
-              trigger: 'auto'
-            });
             this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
             try {
               await this.turns.terminal({
@@ -402,6 +486,7 @@ export class ReliableAgentLoop {
               throw error;
             }
             this.observeLifecycle({ turnId, stage: 'turn_terminal_completed', round, modelRequestId });
+            this.observeOpenTasksAtFinal(turnId, round, modelRequestId, modelRequestRecipe);
             const terminalTurn = await this.requireExisting('Turn', turnId);
             return {
               turnId,
@@ -498,6 +583,183 @@ export class ReliableAgentLoop {
         toolCallIds
       };
     }
+  }
+
+  private async freezeOrdinaryRequestRecipe(input: {
+    turnId: string;
+    round: string;
+    headRootId: string;
+    tools: readonly ReliableAgentToolDefinition[];
+  }): Promise<PlainJsonValue> {
+    const [currentTurnInput, runtimeStatusCard] = await Promise.all([
+      this.readCurrentTurnInputReference(input.turnId, input.headRootId),
+      this.readRuntimeStatusCard(input.turnId)
+    ]);
+    const turnTaskCard = await readCurrentTurnTaskCard(
+      this.database,
+      this.contentStore,
+      input.turnId,
+      { maxTokens: runtimeStatusCard ? 1_536 : 2_048 }
+    );
+    return normalizePlainJson({
+      kind: 'reliable-agent-turn',
+      projectionRevision: '2026-08-09',
+      round: input.round,
+      tools: input.tools,
+      ...(currentTurnInput ? { currentTurnInput } : {}),
+      ...(turnTaskCard ? { turnTaskCard } : {}),
+      ...(runtimeStatusCard ? { runtimeStatusCard } : {})
+    }, 'Reliable Agent recipe');
+  }
+
+  private async readCurrentTurnInputReference(
+    turnId: string,
+    headRootId: string
+  ): Promise<FrozenCurrentTurnInputReference | undefined> {
+    const inputLinks = await this.list('MessageTurnLink', { turn_id: turnId, role: 'input' }, 2);
+    if (inputLinks.length === 0) return undefined;
+    if (inputLinks.length !== 1) throw new Error(`Turn ${turnId} must have at most one input Message.`);
+    const messageId = requireId(inputLinks[0].message_id, 'MessageTurnLink.message_id');
+    const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
+    if (currentLinks.length !== 1) throw new Error(`Input Message ${messageId} must have one current revision.`);
+    const messageRevisionId = requireId(
+      currentLinks[0].revision_id,
+      'MessageCurrentRevisionLink.revision_id'
+    );
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('MessageRevision').get(messageRevisionId),
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'message_revision', source_id: messageRevisionId }, limit: 8
+      })
+    ]);
+    const revision = requireRow(snapshot.snapshot[0], `MessageRevision ${messageRevisionId}`);
+    if (revision.message_id !== messageId || revision.role !== 'user') {
+      throw new Error(`Current input revision ${messageRevisionId} conflicts with Turn ${turnId}.`);
+    }
+    const sources = rows(snapshot.snapshot[1]);
+    const current = await this.context.materializeStructure(requireId(headRootId, 'headRootId'));
+    const currentSegmentIds = new Set(current.records.map((record) =>
+      requireId(record.segment.id, 'ContextSegment.id')
+    ));
+    const presentInCurrentWindow = sources.some((source) =>
+      currentSegmentIds.has(requireId(source.segment_id, 'ContextSegmentSource.segment_id'))
+    );
+    const contentObjectId = requireId(revision.content_object_id, 'MessageRevision.content_object_id');
+    const contentObject = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
+    const content = await this.contentStore.read(contentObject);
+    return {
+      kind: 'current_turn_input',
+      messageId,
+      messageRevisionId,
+      contentObjectId,
+      estimatedTokens: estimateStoredMessageContentTokens(content, contentObject.content_type),
+      reinject: !presentInCurrentWindow
+    };
+  }
+
+  private async readRuntimeStatusCard(turnId: string): Promise<FrozenRuntimeStatusCard | undefined> {
+    const [childLinks, processLinks] = await Promise.all([
+      listAllDomainRows(this.database, 'ChildExecutionParentLink', { parent_turn_id: turnId }),
+      listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId })
+    ]);
+    const orderedChildLinks = childLinks
+      .sort((left, right) => String(left.child_execution_id).localeCompare(String(right.child_execution_id)));
+    const orderedProcessLinks = processLinks
+      .sort((left, right) => String(left.process_id).localeCompare(String(right.process_id)));
+    const factReads = [
+      ...orderedChildLinks.map((link) =>
+        DOMAIN_REPOSITORIES.domain('ChildExecution').get(
+          requireId(link.child_execution_id, 'ChildExecutionParentLink.child_execution_id')
+        )
+      ),
+      ...orderedProcessLinks.map((link) =>
+        DOMAIN_REPOSITORIES.domain('Process').get(
+          requireId(link.process_id, 'ProcessCompletionSourceLink.process_id')
+        )
+      )
+    ];
+    const facts = factReads.length === 0 ? null : await this.database.snapshot(factReads);
+    const activeChildren: Array<{ childExecutionId: string; status: string }> = [];
+    for (let index = 0; index < orderedChildLinks.length; index += 1) {
+      const childValue = facts?.snapshot[index];
+      if (!childValue || Array.isArray(childValue)) continue;
+      const status = String(childValue.status);
+      if (!['starting', 'active', 'interrupting'].includes(status)) continue;
+      activeChildren.push({
+        childExecutionId: requireId(childValue.id, 'ChildExecution.id'),
+        status
+      });
+    }
+    const processOffset = orderedChildLinks.length;
+    const runningProcesses: FrozenRuntimeStatusCard['processes'] = [];
+    for (let index = 0; index < orderedProcessLinks.length; index += 1) {
+      const processValue = facts?.snapshot[processOffset + index];
+      if (!processValue || Array.isArray(processValue) || processValue.status !== 'running') continue;
+      runningProcesses.push({ processId: requireId(processValue.id, 'Process.id'), status: 'running' });
+    }
+    if (activeChildren.length === 0 && runningProcesses.length === 0) return undefined;
+
+    // Counts describe every linked live fact. Only the frozen recipe detail is bounded; filtering
+    // before this cut prevents many old terminal ids from hiding a later active child/process.
+    const selectedChildren = activeChildren.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
+    const selectedProcesses = runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
+    const bridgeReads = selectedChildren.map((child) => DOMAIN_REPOSITORIES.domain('AnswerBridge').list({
+      where: { child_execution_id: child.childExecutionId },
+      limit: 2
+    }));
+    const bridgeFacts = bridgeReads.length === 0 ? null : await this.database.snapshot(bridgeReads);
+    const children: FrozenRuntimeStatusCard['children'] = selectedChildren.map((child, index) => {
+      const bridges = rows(bridgeFacts?.snapshot[index] ?? []);
+      if (bridges.length > 1) throw new Error(`ChildExecution ${child.childExecutionId} has multiple AnswerBridges.`);
+      return {
+        ...child,
+        ...(bridges[0] ? { answerBridgeId: requireId(bridges[0].id, 'AnswerBridge.id') } : {})
+      };
+    });
+    const visibleChildren = children.slice(0, RUNTIME_STATUS_CARD_LIMIT);
+    const visibleProcesses = selectedProcesses.slice(0, RUNTIME_STATUS_CARD_LIMIT);
+    const lines = [
+      '[Current Turn Runtime Status — live data, not a new user instruction]',
+      `activeChildren=${activeChildren.length}; runningProcesses=${runningProcesses.length}`,
+      ...visibleChildren.map((child) =>
+        `- child ${compactRuntimeId(child.answerBridgeId ?? child.childExecutionId)} = ${child.status}`
+      ),
+      ...visibleProcesses.map((process) =>
+        `- process ${compactRuntimeId(process.processId)} = running`
+      ),
+      'This status is informational. Do not poll background work.'
+    ];
+    return {
+      kind: 'runtime_status_card',
+      activeChildCount: activeChildren.length,
+      runningProcessCount: runningProcesses.length,
+      children,
+      processes: selectedProcesses,
+      card: lines.join('\n')
+    };
+  }
+
+  private observeOpenTasksAtFinal(
+    turnId: string,
+    round: string,
+    modelRequestId: string,
+    recipe: { [key: string]: PlainJsonValue }
+  ): void {
+    const task = asRecord(recipe.turnTaskCard);
+    const counts = asRecord(task?.counts);
+    const unfinished = optionalNonNegativeInteger(counts?.unfinished) ?? 0;
+    if (unfinished <= 0) return;
+    const runtime = asRecord(recipe.runtimeStatusCard);
+    this.observeLifecycle({
+      turnId,
+      stage: 'open_tasks_at_final',
+      round,
+      modelRequestId,
+      openTaskCount: unfinished,
+      ...(typeof task?.cardSha256 === 'string' ? { taskCardSha256: task.cardSha256 } : {}),
+      activeChildCount: optionalNonNegativeInteger(runtime?.activeChildCount) ?? 0,
+      runningProcessCount: optionalNonNegativeInteger(runtime?.runningProcessCount) ?? 0
+    });
   }
 
   private async prepareProviderToolBatch(input: {
@@ -875,6 +1137,9 @@ export class ReliableAgentLoop {
     const dispatchBarrier = await this.database.snapshot([]);
     const wrapped: FullRequestProviderAdapter = {
       providerId,
+      ...(adapter.estimateFullRequestInput
+        ? { estimateFullRequestInput: (fullRequest) => adapter.estimateFullRequestInput!(fullRequest) }
+        : {}),
       sendFullRequest: (fullRequest, controls) => adapter.sendFullRequest(fullRequest, {
         signal: controls.signal,
         onEvent: async (event): Promise<StreamEventResult> => {
@@ -1121,6 +1386,17 @@ export class ReliableAgentLoop {
       const contentObjectId = requireId(input.content_object_id, 'PendingTurnInput.content_object_id');
       const metadata = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
       const content = await this.contentStore.read(metadata);
+      const projection = await this.runtimeDeliveries.projectInputForModel({
+        pendingTurnInputId: inputId,
+        contentObjectId,
+        content,
+        contentType: requireText(metadata.content_type, 'ContentObject.content_type')
+      });
+      if (!projection) {
+        await this.runtimeDeliveries.markInputHandled(inputId);
+        absorbed += 1;
+        continue;
+      }
       await this.context.appendContent({
         conversationId,
         segmentKind: 'runtime_context',
@@ -1132,8 +1408,8 @@ export class ReliableAgentLoop {
           // source contract therefore requires the sentinel revision 0.
           sourceRevision: 0n
         },
-        content,
-        contentType: requireText(metadata.content_type, 'ContentObject.content_type')
+        content: projection.content,
+        contentType: projection.contentType
       });
       await this.runtimeDeliveries.markInputHandled(inputId);
       absorbed += 1;
@@ -1700,6 +1976,11 @@ function rows(value: DomainRow | DomainRow[] | null): DomainRow[] {
   return value;
 }
 
+function requireRow(value: DomainRow | DomainRow[] | null, label: string): DomainRow {
+  if (!value || Array.isArray(value)) throw new Error(`${label} does not exist.`);
+  return value;
+}
+
 function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
   return value;
@@ -1732,6 +2013,17 @@ function optionalNonNegativeInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
     ? value
     : undefined;
+}
+
+function currentInputReferenceTokens(recipe: PlainJsonValue): number {
+  const record = asRecord(recipe);
+  const currentInput = asRecord(record?.currentTurnInput);
+  return optionalNonNegativeInteger(currentInput?.estimatedTokens) ?? 0;
+}
+
+function compactRuntimeId(value: string): string {
+  const normalized = requireId(value, 'runtime status id');
+  return normalized.length <= 160 ? normalized : `${normalized.slice(0, 159)}…`;
 }
 
 function compareInteger(left: unknown, right: unknown): number {

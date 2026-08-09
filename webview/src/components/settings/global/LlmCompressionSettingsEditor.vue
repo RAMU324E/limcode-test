@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import {
-  DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS,
+  DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
   type LlmCompressionConfigRecord,
   type LlmCompressionMethodKind,
   type LlmProviderConfigRecord,
@@ -85,11 +86,14 @@ const methodOptions = computed<SettingsDropdownOption[]>(() => {
 
 const trigger = computed(() => props.config?.trigger);
 const compressionAutoEnabled = computed(() => (trigger.value?.mode ?? 'token_threshold') === 'token_threshold');
-const compressionReserveTokens = computed(() => normalizeTokenCount(trigger.value?.reserveLatestUserMessageTokens) ?? DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS);
-const configuredThresholdPercent = computed(() => clampPercent(trigger.value?.thresholdPercent ?? 80));
+const configuredThresholdPercent = computed(() => clampPercent(
+  trigger.value?.thresholdPercent ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT
+));
 const compressionThresholdTokens = computed(() => {
   const contextWindow = props.contextWindowTokens;
-  const tokenValue = normalizeTokenCount(trigger.value?.thresholdTokens);
+  const tokenValue = trigger.value?.thresholdUnit === 'tokens'
+    ? normalizeTokenCount(trigger.value.thresholdTokens)
+    : undefined;
   if (tokenValue !== undefined) return contextWindow > 0 ? Math.min(tokenValue, contextWindow) : tokenValue;
   if (contextWindow <= 0) return 0;
   return clampTokenToContext((contextWindow * configuredThresholdPercent.value) / 100, contextWindow);
@@ -103,9 +107,13 @@ const compressionThresholdPercent = computed(() => {
 const recommendedThresholdTokens = computed(() => {
   const contextWindow = props.contextWindowTokens;
   if (contextWindow <= 0) return 0;
-  return clampTokenToContext(contextWindow - compressionReserveTokens.value, contextWindow);
+  return clampTokenToContext(
+    (contextWindow * DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT) / 100,
+    contextWindow
+  );
 });
 const compressionThresholdInputValue = computed(() => String(compressionThresholdTokens.value || ''));
+const compressionBodyTargetLabel = formatTokenLabel(MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS);
 
 function providerLabel(provider: LlmProviderKind | undefined): string {
   return providerOptions.find((option) => option.value === provider)?.label ?? '未知渠道';
@@ -191,7 +199,7 @@ function updateMethodKind(value: string): void {
     <header class="compression-settings-header">
       <div>
         <label>上下文压缩</label>
-        <p>当前压缩方法：{{ compressionKindLabel(config?.kind) }}。OpenAI 原生压缩必须使用 OpenAI Responses 渠道。</p>
+        <p>当前压缩方法：{{ compressionKindLabel(config?.kind) }}。文字压缩后的对话主体会按可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} token；OpenAI 原生压缩必须使用 OpenAI Responses 渠道。</p>
       </div>
     </header>
     <div class="global-settings-grid compression-settings-grid">
@@ -219,24 +227,24 @@ function updateMethodKind(value: string): void {
         <span>自动触发</span>
         <LcCheckbox
           :model-value="compressionAutoEnabled"
-          aria-label="启用自动触发上下文压缩"
+          aria-label="启用完整输入阈值自动压缩"
           @update:model-value="updateCompressionAutoEnabled"
         >
-          <span class="compression-auto-text">启用后，当上下文达到阈值时自动准备压缩。默认建议开启。</span>
+          <span class="compression-auto-text">启用后，当实际发送的完整输入达到阈值时自动准备压缩。默认建议开启。</span>
         </LcCheckbox>
       </label>
 
       <div v-if="compressionAutoEnabled" class="compression-trigger-panel global-settings-field-wide">
         <div class="compression-trigger-head">
           <div>
-            <span class="compression-trigger-title">触发上下文 token 数阈值</span>
-            <p>直接填写触发压缩的上下文 token 数；建议至少预留 {{ formatTokenLabel(compressionReserveTokens) }} 窗口给最后一轮用户消息。</p>
+            <span class="compression-trigger-title">完整输入 token 触发阈值</span>
+            <p>完整输入包含系统要求、工具定义、运行提醒和对话。这个数值只决定何时压缩；压缩后的对话主体会按模型可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} token。</p>
           </div>
         </div>
 
         <div class="compression-threshold-control">
           <label class="global-settings-field compression-threshold-input-field">
-            <span>上下文 token 数</span>
+            <span>完整输入 token 数</span>
             <span class="threshold-input-shell">
               <input
                 class="token-number-input"

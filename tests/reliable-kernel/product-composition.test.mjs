@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { createRequire } from 'node:module';
 
 const distRoot = path.resolve('dist/extension');
+const require = createRequire(import.meta.url);
 
 function emittedRequireClosure(entry) {
   const seen = new Set();
@@ -56,15 +58,34 @@ test('VS Code 可靠产品组合根只装配新 SQLite/CAS Runtime 且不可达�
   assert.ok(graph.includes('/backend/application/reliableKernel/VscodeReliableFileDiffEditor.js'));
 });
 
-test('扩展先注册可见界面再启动后台恢复，激活不等待全库扫描', () => {
+test('扩展先注册可见界面再动态打开 Runtime，激活不等待模块图、历史或恢复扫描', () => {
   const extensionSource = fs.readFileSync(path.resolve('vscode/extension.ts'), 'utf8');
-  const sidebarRegistration = extensionSource.indexOf('registerSidebarEntryView(context, application)');
-  const hydrationStart = extensionSource.indexOf('application.startHydration()');
+  const serializerRegistration = extensionSource.indexOf('MainPanel.registerSerializer(context, startup)');
+  const commandRegistration = extensionSource.indexOf('registerCommands(context, startup)');
+  const sidebarRegistration = extensionSource.indexOf('registerSidebarEntryView(context, startup)');
+  const applicationStart = extensionSource.indexOf('void startApplication(context, startup, activationStartedAt)');
   const recoveryStart = extensionSource.indexOf('application.startRuntimeRecovery()');
+  assert.ok(serializerRegistration >= 0, 'extension activation must register the restored-panel serializer');
+  assert.ok(commandRegistration > serializerRegistration, 'commands must register on the lightweight startup barrier');
   assert.ok(sidebarRegistration >= 0, 'extension activation must register the sidebar');
-  assert.ok(hydrationStart > sidebarRegistration, 'history hydration must start only after the visible surface');
+  assert.ok(applicationStart > sidebarRegistration, 'Runtime loading must start only after every visible surface is registered');
   assert.ok(recoveryStart > sidebarRegistration, 'durable recovery must start only after the VS Code surface is registered');
-  assert.equal(/await\s+application\.startHydration\(\)/.test(extensionSource), false);
+  assert.match(
+    extensionSource,
+    /await import\(\s*'\.\.\/backend\/application\/reliableKernel\/VscodeReliableKernelApplicationFacade'/,
+    'the reliable Runtime composition must be loaded dynamically after surface registration'
+  );
+  assert.doesNotMatch(
+    extensionSource,
+    /^import\s+\{\s*VscodeReliableKernelApplicationFacade\s*\}\s+from/m,
+    'the extension entrypoint must not synchronously require the reliable Runtime graph'
+  );
+  assert.doesNotMatch(
+    extensionSource,
+    /application\.startHydration\(\)/,
+    'global history hydration must be demand-driven instead of competing with the first visible read'
+  );
+  assert.match(extensionSource, /setImmediate\(\(\) => \{/);
   assert.equal(
     /await\s+application\.startRuntimeRecovery\(\)/.test(extensionSource),
     false,
@@ -93,6 +114,63 @@ test('扩展先注册可见界面再启动后台恢复，激活不等待全库�
     false,
     'workspace configuration synchronization must be lazy until post-activation startup'
   );
+});
+
+test('侧栏首屏与已知对话恢复不串行等待全局历史 hydration', () => {
+  const facadeSource = fs.readFileSync(
+    path.resolve('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.ts'),
+    'utf8'
+  );
+  const pageStart = facadeSource.indexOf('public async getConversationHistoryPage(');
+  const pageEnd = facadeSource.indexOf('public getCurrentProjectHistoryScope()', pageStart);
+  assert.ok(pageStart >= 0 && pageEnd > pageStart);
+  const pageSource = facadeSource.slice(pageStart, pageEnd);
+  assert.match(pageSource, /void this\.startHydration\(\)\.catch/);
+  assert.doesNotMatch(pageSource, /await this\.(?:waitUntilHydrated|startHydration)\(\)/);
+
+  const panelSource = fs.readFileSync(path.resolve('vscode/panels/MainPanel.ts'), 'utf8');
+  const restoreStart = panelSource.indexOf('async function resolveRestoredPanelOptions(');
+  const restoreEnd = panelSource.indexOf('function isDefaultConversationTitle(', restoreStart);
+  assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
+  const restoreSource = panelSource.slice(restoreStart, restoreEnd);
+  assert.ok(
+    restoreSource.indexOf('if (options.conversationId) return options;')
+      < restoreSource.indexOf('await backendApp.waitUntilHydrated();'),
+    'a serialized conversation identity must restore before lazy title/history hydration'
+  );
+});
+
+test('ApplicationStartup keeps backend evaluation demand-driven and single-flight', async () => {
+  const { ApplicationStartup } = require(path.join(distRoot, 'vscode/ApplicationStartup.js'));
+  const startup = new ApplicationStartup();
+  const application = { marker: 'ready' };
+  let starts = 0;
+  startup.setStarter(() => {
+    starts += 1;
+    startup.resolve(application);
+  });
+
+  assert.equal(starts, 0, 'surface registration alone must not evaluate the backend');
+  assert.equal(startup.pending(), undefined, 'an unused activation has no pending backend to close');
+  const first = startup.wait();
+  const second = startup.wait();
+  assert.equal(starts, 1);
+  assert.equal(first, second);
+  assert.equal(startup.pending(), first);
+  assert.equal(await first, application);
+});
+
+test('loading the LLM capability does not initialize the WebSocket transport stack', () => {
+  const capabilityPath = path.join(distRoot, 'backend/capabilities/llmProvider.js');
+  const sessionPath = path.join(distRoot, 'backend/capabilities/openAIResponsesWebSocketSession.js');
+  const wsPath = require.resolve('ws');
+  delete require.cache[capabilityPath];
+  delete require.cache[sessionPath];
+  delete require.cache[wsPath];
+
+  require(capabilityPath);
+  assert.equal(require.cache[sessionPath], undefined);
+  assert.equal(require.cache[wsPath], undefined);
 });
 
 test('MCP discovery starts in background and does not hold builtin capability readiness', () => {

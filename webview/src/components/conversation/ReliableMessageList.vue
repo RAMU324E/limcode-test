@@ -28,7 +28,8 @@ import {
   TIMELINE_SEGMENT_STEP,
   absoluteTimelineFloor,
   clampTimelineSegmentStart,
-  latestTimelineSegmentStart
+  latestTimelineSegmentStart,
+  prioritizedTimelineDetailDemand
 } from './segmentedTimeline';
 
 const props = withDefaults(defineProps<{ emptyHint?: string; scroller?: HTMLElement | null }>(), {
@@ -328,10 +329,18 @@ watch(
       .filter(([, interaction]) => interaction.status === 'pending')
       .map(([toolCallId]) => toolCallId)
   ].join('|'),
-  () => ensureDetails({
-    messageIds: visibleTimelineRows.value.map((message) => message.id),
-    priority: 'visible'
-  }),
+  () => {
+    const demand = prioritizedTimelineDetailDemand(
+      visibleTimelineRows.value.map((message) => message.id)
+    );
+    // The body nearest the composer must win the first transport slot. Pending interactions remain
+    // critical, but are admitted only after that body so an old Conversation never paints its tail
+    // last merely because the mounted segment is ordered chronologically.
+    ensureDetails({ messageIds: demand.critical, priority: 'critical', includePendingInteractions: false });
+    ensureDetails({ priority: 'critical', includePendingInteractions: true });
+    ensureDetails({ messageIds: demand.visible, priority: 'visible', includePendingInteractions: false });
+    ensureDetails({ messageIds: demand.background, priority: 'background', includePendingInteractions: false });
+  },
   { immediate: true }
 );
 

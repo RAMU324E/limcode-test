@@ -7,7 +7,11 @@ import type {
   LlmCompressionThresholdUnit,
   LlmCompressionTriggerMode
 } from '../../../shared/protocol';
-import { DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS, DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT, createDefaultLlmCompressionConfig } from '../../../shared/protocol';
+import {
+  DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+  DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  createDefaultLlmCompressionConfig
+} from '../../../shared/protocol';
 import { isSettingsRevisionConflictError } from '../settingsRevisionConflict';
 import type { StoragePaths } from './paths';
 import { INDEX_FILE } from './constants';
@@ -122,13 +126,15 @@ export function normalizeLlmCompressionConfig(input: Partial<LlmCompressionConfi
   const createdAt = finiteTimestamp(input?.createdAt, fallback.createdAt);
   const kind = isKnownKind(input?.kind) ? input.kind : fallback.kind;
   const trigger = normalizeTrigger(input?.trigger);
+  const llmSummary = normalizeLlmSummary(input?.llmSummary)
+    ?? (isTextSummaryKind(kind) ? { targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS } : undefined);
   return {
     id: stringOrDefault(input?.id, fallback.id),
     name: stringOrDefault(input?.name, fallback.name),
     kind,
     trigger,
     ...(normalizeOpenAICompact(input?.openaiResponsesCompact) ? { openaiResponsesCompact: normalizeOpenAICompact(input?.openaiResponsesCompact) } : {}),
-    ...(normalizeLlmSummary(input?.llmSummary) ? { llmSummary: normalizeLlmSummary(input?.llmSummary) } : {}),
+    ...(llmSummary ? { llmSummary } : {}),
     createdAt,
     updatedAt: finiteTimestamp(input?.updatedAt, createdAt)
   };
@@ -169,22 +175,24 @@ function sortConfigs(records: LlmCompressionConfigRecord[]): LlmCompressionConfi
 
 function normalizeTrigger(input: unknown): LlmCompressionConfigRecord['trigger'] {
   const record = isPlainObject(input) ? input : {};
+  if (
+    Object.prototype.hasOwnProperty.call(record, 'preserveLatestMessages')
+    || Object.prototype.hasOwnProperty.call(record, 'reserveLatestUserMessageTokens')
+  ) {
+    throw new TypeError(
+      'Compression trigger uses removed message-count/user-reserve fields; recreate it with the current schema.'
+    );
+  }
   const thresholdUnit: LlmCompressionThresholdUnit = isKnownThresholdUnit(record.thresholdUnit) ? record.thresholdUnit : 'percent';
   const thresholdTokens = finitePositiveNumber(record.thresholdTokens);
   const inputThresholdPercent = finitePercent(record.thresholdPercent);
-  const preserveLatestMessages = finitePositiveNumber(record.preserveLatestMessages);
-  const inputReserveLatestUserMessageTokens = finitePositiveNumber(record.reserveLatestUserMessageTokens);
-  const hasExplicitTriggerChoice = isKnownThresholdUnit(record.thresholdUnit) || inputThresholdPercent !== undefined || thresholdTokens !== undefined || inputReserveLatestUserMessageTokens !== undefined;
-  const mode: LlmCompressionTriggerMode = record.mode === 'manual' && hasExplicitTriggerChoice ? 'manual' : 'token_threshold';
+  const mode: LlmCompressionTriggerMode = record.mode === 'manual' ? 'manual' : 'token_threshold';
   const thresholdPercent = inputThresholdPercent ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT;
-  const reserveLatestUserMessageTokens = inputReserveLatestUserMessageTokens ?? DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS;
   return {
     mode,
     thresholdUnit,
     thresholdPercent,
-    ...(thresholdTokens !== undefined ? { thresholdTokens } : {}),
-    ...(preserveLatestMessages !== undefined ? { preserveLatestMessages } : {}),
-    reserveLatestUserMessageTokens
+    ...(thresholdTokens !== undefined ? { thresholdTokens } : {})
   };
 }
 
@@ -203,9 +211,16 @@ function normalizeLlmSummary(input: unknown): LlmCompressionConfigRecord['llmSum
     ...(optionalString(input.model) ? { model: optionalString(input.model) } : {}),
     ...(optionalString(input.systemPrompt) ? { systemPrompt: optionalString(input.systemPrompt) } : {}),
     ...(optionalString(input.userPrompt) ? { userPrompt: optionalString(input.userPrompt) } : {}),
-    ...(finitePositiveNumber(input.targetTokens) ? { targetTokens: finitePositiveNumber(input.targetTokens) } : {}),
+    targetTokens: finitePositiveNumber(input.targetTokens) ?? DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
     ...(isPlainObject(input.generationConfig) ? { generationConfig: input.generationConfig } : {})
   };
+}
+
+function isTextSummaryKind(kind: LlmCompressionMethodKind): boolean {
+  return kind === 'llm_summary'
+    || kind === 'segmented_summary'
+    || kind === 'deterministic_summary'
+    || kind === 'manual_summary';
 }
 
 function isKnownKind(value: unknown): value is LlmCompressionMethodKind {

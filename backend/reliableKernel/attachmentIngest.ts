@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import {
   type AttachmentSettingsRecord,
   type InlineDataPart
@@ -156,16 +158,22 @@ export class AttachmentIngestService {
     label: string,
     enforceCurrentSettings: boolean
   ): Promise<PreparedAttachmentAdmission<T>> {
-    const context: AttachmentTransformContext = { position: 0, embedded: [], references: [], outputs: [] };
-    const transformed = this.transformValue(value, context, label) as T;
-    if (context.references.length === 0) {
-      return { value, attachments: [], storageSteps: [], totalBytes: 0 };
-    }
-
+    const hasAttachmentValues = containsInlineDataWrapper(value);
     let maxBytes: bigint | undefined;
-    if (enforceCurrentSettings) {
+    if (enforceCurrentSettings && hasAttachmentValues) {
       const settings = await this.loadSettings();
       maxBytes = BigInt(settings.maxStoredInlineFileMb) * 1024n * 1024n;
+    }
+    const materialized = await this.materializeLocalPathAttachments(
+      value,
+      label,
+      maxBytes,
+      new Map<string, Buffer>()
+    );
+    const context: AttachmentTransformContext = { position: 0, embedded: [], references: [], outputs: [] };
+    const transformed = this.transformValue(materialized, context, label) as T;
+    if (context.references.length === 0) {
+      return { value: transformed, attachments: [], storageSteps: [], totalBytes: 0 };
     }
 
     const existingById = new Map<string, DomainRow>();
@@ -258,6 +266,101 @@ export class AttachmentIngestService {
       storageSteps,
       totalBytes: safeByteLength(totalBytes, 'attachment total')
     };
+  }
+
+  /**
+   * Resolves the exact attachment bytes used at a Provider boundary. A local-path reference is
+   * admitted into Runtime CAS first, so subsequent retries/compact calls no longer depend on a
+   * mutable file path and always carry verified size/digest metadata.
+   */
+  public async resolveProviderInlineData(input: {
+    attachmentId?: string;
+    sourcePath?: string;
+    mimeType?: string;
+    name?: string;
+  }): Promise<InlineDataPart> {
+    const attachmentId = optionalText(input.attachmentId);
+    const sourcePath = optionalText(input.sourcePath);
+    if (attachmentId && sourcePath) {
+      throw new AttachmentContentError('Provider attachment reference cannot contain both attachmentId and sourcePath.');
+    }
+    if (attachmentId) return this.resolveInlineData(attachmentId);
+    if (!sourcePath) {
+      throw new AttachmentMediaSizeUnknownError('Provider attachment is missing attachmentId and sourcePath.');
+    }
+
+    const admission = await this.prepareValueAttachments<InlineDataPart>({
+      inlineData: {
+        mimeType: optionalText(input.mimeType) ?? 'application/octet-stream',
+        name: optionalText(input.name) ?? path.basename(sourcePath),
+        sourcePath,
+        storage: 'localPath',
+        status: 'available'
+      }
+    }, 'Provider attachment');
+    if (admission.storageSteps.length === 0) {
+      throw new AttachmentMediaSizeUnknownError(`Provider attachment ${sourcePath} was not materialized into Runtime CAS.`);
+    }
+    await this.database.transaction(admission.storageSteps);
+    const managedId = admission.value.inlineData.attachmentId;
+    if (!managedId) {
+      throw new AttachmentMediaSizeUnknownError(`Provider attachment ${sourcePath} has no managed attachment id.`);
+    }
+    return this.resolveInlineData(managedId);
+  }
+
+  private async materializeLocalPathAttachments(
+    value: unknown,
+    label: string,
+    maxBytes: bigint | undefined,
+    cache: Map<string, Buffer>
+  ): Promise<unknown> {
+    if (Array.isArray(value)) {
+      return Promise.all(value.map((entry, index) =>
+        this.materializeLocalPathAttachments(entry, `${label}[${index}]`, maxBytes, cache)));
+    }
+    if (ArrayBuffer.isView(value)) return value;
+    if (!value || typeof value !== 'object') return value;
+    const record = value as Record<string, unknown>;
+    if (isInlineDataWrapper(record)) {
+      const raw = record.inlineData;
+      const attachmentId = optionalText(raw.attachmentId);
+      const sourcePath = optionalText(raw.sourcePath);
+      if (attachmentId && sourcePath) {
+        throw new AttachmentContentError(`${label}.inlineData cannot contain both attachmentId and sourcePath.`);
+      }
+      if (typeof raw.data === 'string' || attachmentId) return value;
+      if (!sourcePath) {
+        if (raw.storage === 'localPath') {
+          throw new AttachmentMediaSizeUnknownError(`${label}.inlineData localPath reference has no sourcePath.`);
+        }
+        return value;
+      }
+      const absolutePath = requireAbsoluteSourcePath(sourcePath, `${label}.inlineData.sourcePath`);
+      let bytes = cache.get(absolutePath);
+      if (!bytes) {
+        bytes = await readLocalAttachmentBytes(absolutePath, maxBytes, `${label}.inlineData`);
+        cache.set(absolutePath, bytes);
+      }
+      return {
+        ...record,
+        inlineData: {
+          ...raw,
+          mimeType: optionalText(raw.mimeType) ?? 'application/octet-stream',
+          name: optionalText(raw.name) ?? path.basename(absolutePath),
+          sourcePath: absolutePath,
+          storage: 'localPath',
+          status: 'available',
+          sizeBytes: bytes.byteLength,
+          data: bytes.toString('base64')
+        }
+      };
+    }
+    const entries = await Promise.all(Object.entries(record).map(async ([key, entry]) => [
+      key,
+      await this.materializeLocalPathAttachments(entry, `${label}.${key}`, maxBytes, cache)
+    ] as const));
+    return Object.fromEntries(entries);
   }
 
   /** Creates the immutable AttachmentLink rows in the same transaction as the target revision. */
@@ -518,6 +621,16 @@ export class AttachmentContentError extends AttachmentAdmissionError {
   }
 }
 
+/** Stable admission failure used when a local/provider media reference cannot be sized exactly. */
+export class AttachmentMediaSizeUnknownError extends AttachmentAdmissionError {
+  public readonly code = 'media_size_unknown';
+
+  public constructor(message: string) {
+    super(`media_size_unknown: ${message}`);
+    this.name = 'AttachmentMediaSizeUnknownError';
+  }
+}
+
 function managedReference(reference: PreparedAttachmentReference): InlineDataPart['inlineData'] {
   return {
     mimeType: reference.mimeType,
@@ -532,6 +645,64 @@ function managedReference(reference: PreparedAttachmentReference): InlineDataPar
 
 function isInlineDataWrapper(value: Record<string, unknown>): value is { inlineData: Record<string, unknown> } {
   return !!value.inlineData && typeof value.inlineData === 'object' && !Array.isArray(value.inlineData);
+}
+
+function containsInlineDataWrapper(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsInlineDataWrapper);
+  if (ArrayBuffer.isView(value)) return false;
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (isInlineDataWrapper(record)) return true;
+  return Object.values(record).some(containsInlineDataWrapper);
+}
+
+function requireAbsoluteSourcePath(value: string, label: string): string {
+  if (!path.isAbsolute(value)) {
+    throw new AttachmentMediaSizeUnknownError(`${label} must be an absolute path: ${value}`);
+  }
+  return path.normalize(value);
+}
+
+async function readLocalAttachmentBytes(
+  sourcePath: string,
+  maxBytes: bigint | undefined,
+  label: string
+): Promise<Buffer> {
+  let metadata;
+  try {
+    metadata = await fs.stat(sourcePath, { bigint: true });
+  } catch (error) {
+    throw new AttachmentMediaSizeUnknownError(`${label} cannot stat ${sourcePath}: ${errorText(error)}`);
+  }
+  if (!metadata.isFile()) {
+    throw new AttachmentMediaSizeUnknownError(`${label} is not a regular file: ${sourcePath}`);
+  }
+  if (metadata.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new AttachmentMediaSizeUnknownError(`${label} exceeds the supported byte range: ${sourcePath}`);
+  }
+  if (maxBytes !== undefined && metadata.size > maxBytes) {
+    throw new AttachmentSizeLimitError(
+      `Attachment ${path.basename(sourcePath)} is ${metadata.size.toString()} bytes; settings allow at most ${maxBytes.toString()} bytes.`
+    );
+  }
+
+  let bytes: Buffer;
+  try {
+    bytes = await fs.readFile(sourcePath);
+  } catch (error) {
+    throw new AttachmentMediaSizeUnknownError(`${label} cannot read ${sourcePath}: ${errorText(error)}`);
+  }
+  if (maxBytes !== undefined && BigInt(bytes.byteLength) > maxBytes) {
+    throw new AttachmentSizeLimitError(
+      `Attachment ${path.basename(sourcePath)} is ${bytes.byteLength} bytes; settings allow at most ${maxBytes.toString()} bytes.`
+    );
+  }
+  return bytes;
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  return String(error);
 }
 
 function decodeCanonicalBase64(value: string, label: string): Buffer {

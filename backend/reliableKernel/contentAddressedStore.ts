@@ -61,7 +61,43 @@ interface IdentifiedContent {
   published: PublishedContent;
 }
 
+interface VerifiedContentReadCacheEntry {
+  id: string;
+  sha256: string;
+  byteLength: bigint;
+  storageKey: string;
+  bytes: Buffer;
+}
+
+interface VerifiedContentReadFlight {
+  identity: Omit<VerifiedContentReadCacheEntry, 'bytes'>;
+  promise: Promise<Buffer>;
+}
+
+export interface ContentAddressedStoreReadCacheInspection {
+  entries: number;
+  bytes: number;
+  inflight: number;
+  hits: number;
+  misses: number;
+  evictions: number;
+  maxEntries: number;
+  maxBytes: number;
+}
+
+const VERIFIED_READ_CACHE_MAX_ENTRIES = 128;
+const VERIFIED_READ_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const VERIFIED_READ_CACHE_MAX_SINGLE_BYTES = 64 * 1024 * 1024;
+
 export class ContentAddressedStore {
+  /** Only fully length/digest-verified immutable bytes enter this cache. Callers receive copies. */
+  private readonly verifiedReadCache = new Map<string, VerifiedContentReadCacheEntry>();
+  private readonly verifiedReadFlights = new Map<string, VerifiedContentReadFlight>();
+  private verifiedReadCacheBytes = 0;
+  private verifiedReadCacheHits = 0;
+  private verifiedReadCacheMisses = 0;
+  private verifiedReadCacheEvictions = 0;
+
   public constructor(
     private readonly authority: RootAuthority,
     public readonly binding: RootBinding,
@@ -217,7 +253,7 @@ export class ContentAddressedStore {
 
   public async read(metadata: ContentObjectMetadata): Promise<Buffer> {
     await this.authority.validate(this.binding);
-    return readPublishedObject(this.binding, metadata);
+    return Buffer.from(await this.readVerifiedObject(metadata));
   }
 
   /** Fenced on-demand chunk read; callers still enforce their wire response budget. */
@@ -235,10 +271,10 @@ export class ContentAddressedStore {
     if (!Number.isSafeInteger(totalBytes)) throw new RangeError('CAS object is too large for chunk addressing.');
     if (offset > totalBytes) throw new RangeError('CAS chunk offset exceeds object length.');
     const length = Math.min(maxBytes, totalBytes - offset);
-    // The whole object is verified against its committed digest before exposing any range. This is an
-    // on-demand wire chunk, not a second unverified content authority.
-    const verified = await readPublishedObject(this.binding, metadata);
-    const chunk = verified.subarray(offset, offset + length);
+    // The first range verifies the complete immutable object. Later ranges reuse those exact
+    // verified bytes, rather than reading and hashing the complete file once per 256 KiB page.
+    const verified = await this.readVerifiedObject(metadata);
+    const chunk = Buffer.from(verified.subarray(offset, offset + length));
     const nextOffset = offset + length;
     const hasMore = nextOffset < totalBytes;
     return {
@@ -262,14 +298,86 @@ export class ContentAddressedStore {
         nextIndex += 1;
         if (index >= unique.length) return;
         const entry = unique[index];
-        contents.set(entry.id, await readPublishedObject(this.binding, entry));
+        contents.set(entry.id, await this.readVerifiedObject(entry));
       }
     }));
     return metadata.map((entry) => {
       const bytes = contents.get(entry.id);
       if (!bytes) throw new Error(`CAS batch read lost ContentObject ${entry.id}.`);
-      return bytes;
+      return Buffer.from(bytes);
     });
+  }
+
+  /** Metadata-only diagnostics used by focused tests and development inspection. */
+  public inspectReadCache(): ContentAddressedStoreReadCacheInspection {
+    return {
+      entries: this.verifiedReadCache.size,
+      bytes: this.verifiedReadCacheBytes,
+      inflight: this.verifiedReadFlights.size,
+      hits: this.verifiedReadCacheHits,
+      misses: this.verifiedReadCacheMisses,
+      evictions: this.verifiedReadCacheEvictions,
+      maxEntries: VERIFIED_READ_CACHE_MAX_ENTRIES,
+      maxBytes: VERIFIED_READ_CACHE_MAX_BYTES
+    };
+  }
+
+  private async readVerifiedObject(metadata: ContentObjectMetadata): Promise<Buffer> {
+    const cached = this.verifiedReadCache.get(metadata.id);
+    if (cached) {
+      assertSameVerifiedContentIdentity(cached, metadata);
+      this.verifiedReadCache.delete(metadata.id);
+      this.verifiedReadCache.set(metadata.id, cached);
+      this.verifiedReadCacheHits += 1;
+      return cached.bytes;
+    }
+    const active = this.verifiedReadFlights.get(metadata.id);
+    if (active) {
+      assertSameVerifiedContentIdentity(active.identity, metadata);
+      this.verifiedReadCacheHits += 1;
+      return active.promise;
+    }
+
+    this.verifiedReadCacheMisses += 1;
+    const identity = verifiedContentIdentity(metadata);
+    const promise = readPublishedObject(this.binding, metadata)
+      .then((bytes) => {
+        this.rememberVerifiedRead({ ...identity, bytes });
+        return bytes;
+      })
+      .finally(() => {
+        if (this.verifiedReadFlights.get(metadata.id)?.promise === promise) {
+          this.verifiedReadFlights.delete(metadata.id);
+        }
+      });
+    this.verifiedReadFlights.set(metadata.id, { identity, promise });
+    return promise;
+  }
+
+  private rememberVerifiedRead(entry: VerifiedContentReadCacheEntry): void {
+    if (entry.bytes.byteLength > VERIFIED_READ_CACHE_MAX_SINGLE_BYTES) return;
+    const existing = this.verifiedReadCache.get(entry.id);
+    if (existing) {
+      assertSameVerifiedContentIdentity(existing, entry);
+      this.verifiedReadCacheBytes -= existing.bytes.byteLength;
+      this.verifiedReadCache.delete(entry.id);
+    }
+    this.verifiedReadCache.set(entry.id, entry);
+    this.verifiedReadCacheBytes += entry.bytes.byteLength;
+    while (
+      this.verifiedReadCache.size > VERIFIED_READ_CACHE_MAX_ENTRIES
+      || this.verifiedReadCacheBytes > VERIFIED_READ_CACHE_MAX_BYTES
+    ) {
+      // Retain one newly verified oversized object so its continuation pages do not regress to an
+      // O(page-count * object-size) read/hash loop. The next different object can evict it.
+      if (this.verifiedReadCache.size <= 1) break;
+      const oldestId = this.verifiedReadCache.keys().next().value as string | undefined;
+      if (!oldestId) break;
+      const oldest = this.verifiedReadCache.get(oldestId);
+      this.verifiedReadCache.delete(oldestId);
+      if (oldest) this.verifiedReadCacheBytes -= oldest.bytes.byteLength;
+      this.verifiedReadCacheEvictions += 1;
+    }
   }
 
   private recordMetric(metric: ContentAddressedStoreMetric, count = 1): void {
@@ -366,6 +474,33 @@ function absoluteCasPath(binding: RootBinding, storageKey: string): string {
   const candidate = path.resolve(root, ...storageKey.split('/'));
   if (!candidate.startsWith(`${root}${path.sep}`)) throw new Error('CAS storage key escapes its active root.');
   return candidate;
+}
+
+function verifiedContentIdentity(
+  metadata: ContentObjectMetadata
+): Omit<VerifiedContentReadCacheEntry, 'bytes'> {
+  return {
+    id: metadata.id,
+    sha256: metadata.sha256,
+    byteLength: metadata.byte_length,
+    storageKey: metadata.storage_key
+  };
+}
+
+function assertSameVerifiedContentIdentity(
+  cached: Omit<VerifiedContentReadCacheEntry, 'bytes'>,
+  metadata: ContentObjectMetadata | Omit<VerifiedContentReadCacheEntry, 'bytes'>
+): void {
+  const byteLength = 'byte_length' in metadata ? metadata.byte_length : metadata.byteLength;
+  const storageKey = 'storage_key' in metadata ? metadata.storage_key : metadata.storageKey;
+  if (
+    cached.id !== metadata.id
+    || cached.sha256 !== metadata.sha256
+    || cached.byteLength !== byteLength
+    || cached.storageKey !== storageKey
+  ) {
+    throw new Error(`Verified CAS cache identity mismatch for ContentObject ${metadata.id}.`);
+  }
 }
 
 function validatePublishedBytes(metadata: ContentObjectMetadata, bytes: Buffer): Buffer {

@@ -59,6 +59,7 @@ const PAGE_SIZE = 50;
 const MAX_VISUAL_TREE_DEPTH = 8;
 const SCOPE_PAGE_SIZE = 3;
 const view = ref<SidebarView>('history');
+const historyReady = ref(false);
 const entries = ref<SidebarConversationHistoryEntry[]>([]);
 const originLinks = ref<ConversationOriginLinkRecord[]>([]);
 const deletingConversationIds = ref<Set<string>>(new Set());
@@ -90,6 +91,7 @@ const originLinkByConversationId = computed(() => selectConversationOriginLinks(
 const visibleHistoryNodes = computed(() => flattenVisibleHistoryNodes(historyForest.value, expandedConversationIds.value));
 const historyScrollbarRefreshKey = computed(() => `${visibleEntries.value.length}:${visibleHistoryNodes.value.length}`);
 const historyCountText = computed(() => {
+  if (!historyReady.value) return '正在加载对话…';
   const hiddenPendingDeletes = entries.value.length - visibleEntries.value.length;
   const total = Math.max(0, (pageInfo.value?.total ?? entries.value.length) - hiddenPendingDeletes);
   const page = pageInfo.value ? `第 ${pageInfo.value.pageIndex + 1} 页` : '当前页';
@@ -201,6 +203,7 @@ onMounted(() => {
       return;
     }
     if (message.type !== SIDEBAR_MESSAGE.state) return;
+    historyReady.value = true;
     const nextScopeKind = message.activeScopeKind ?? activeScopeKind.value;
     const nextPageIdentity = historyPageIdentity(message.history);
     if (nextPageIdentity !== currentHistoryPageIdentity) {
@@ -676,7 +679,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
 </script>
 
 <template>
-  <main class="sidebar-shell">
+  <main class="sidebar-shell" :aria-busy="!historyReady">
     <section v-if="view === 'history'" class="view history-view" aria-label="对话历史">
       <div class="section-head">
         <div class="section-title-row">
@@ -689,7 +692,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
           </button>
         </div>
         <div class="toolbar">
-          <button type="button" class="primary-button" title="新建对话" @click="startNewConversation">
+          <button type="button" class="primary-button" title="新建对话" :disabled="!historyReady" @click="startNewConversation">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" aria-hidden="true">
               <line x1="12" y1="5" x2="12" y2="19"></line>
               <line x1="5" y1="12" x2="19" y2="12"></line>
@@ -701,7 +704,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
           <button
             type="button"
             class="scope-page-button"
-            :disabled="!canPreviousScopePage"
+            :disabled="!historyReady || !canPreviousScopePage"
             aria-label="上一组范围"
             title="上一组范围"
             @click="previousScopePage"
@@ -717,6 +720,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
                   type="button"
                   class="scope-tab"
                   :class="{ active: activeScopeKey === option.key }"
+                  :disabled="!historyReady"
                   :title="option.description || option.label"
                   @click="switchScope(option)"
                 >
@@ -730,7 +734,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
           <button
             type="button"
             class="scope-page-button"
-            :disabled="!canNextScopePage"
+            :disabled="!historyReady || !canNextScopePage"
             aria-label="下一组范围"
             title="下一组范围"
             @click="nextScopePage"
@@ -745,7 +749,11 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
       </div>
 
       <div class="history-list-shell">
-        <div ref="historyList" class="history-list" role="tree" aria-label="分级对话历史">
+        <div v-if="!historyReady" class="history-initializing" role="status" aria-live="polite">
+          <span class="history-initializing-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>正在连接本地运行时并读取当前项目…</span>
+        </div>
+        <div v-else ref="historyList" class="history-list" role="tree" aria-label="分级对话历史">
           <div
             v-for="node in visibleHistoryNodes"
             :key="node.entry.id"
@@ -849,18 +857,19 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
           </div>
         </div>
         <AdvancedScrollbar
+          v-if="historyReady"
           class="history-edge-scrollbar"
           :scroller="historyList"
           :refresh-key="historyScrollbarRefreshKey"
         />
       </div>
 
-      <div v-if="!visibleEntries.length" class="empty-state">
+      <div v-if="historyReady && !visibleEntries.length" class="empty-state">
         <p class="empty-state-title">暂无对话历史</p>
         <p class="empty-state-desc">点击“新对话”创建一个独立会话空间。</p>
       </div>
 
-      <div class="history-pagination" aria-label="对话历史分页">
+      <div v-if="historyReady" class="history-pagination" aria-label="对话历史分页">
         <button type="button" class="secondary-button" :disabled="!pageInfo?.hasPrevious" @click="previousPage">上一页</button>
         <span>第 {{ (pageInfo?.pageIndex ?? 0) + 1 }} 页</span>
         <button type="button" class="secondary-button" :disabled="!pageInfo?.hasNext" @click="nextPage">下一页</button>

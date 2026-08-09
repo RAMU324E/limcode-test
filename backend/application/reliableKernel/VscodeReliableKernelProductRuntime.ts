@@ -158,11 +158,8 @@ export class VscodeReliableKernelProductRuntime {
         });
       },
       resolveAttachment: async (input) => {
-        if (!input.attachmentId) {
-          throw new Error('可靠 Provider 只接受已进入 Runtime CAS 的 attachmentId。');
-        }
         if (!application) throw new Error('可靠 Runtime 尚未完成组合，无法解析附件。');
-        return application.attachments.resolveInlineData(input.attachmentId);
+        return application.attachments.resolveProviderInlineData(input);
       }
     });
     const observedFirstTransient = new Set<string>();
@@ -211,6 +208,10 @@ export class VscodeReliableKernelProductRuntime {
             ...(event.round !== undefined ? { round: event.round } : {}),
             ...(event.modelRequestId ? { modelRequestId: event.modelRequestId } : {}),
             ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
+            ...(event.openTaskCount !== undefined ? { openTaskCount: event.openTaskCount } : {}),
+            ...(event.taskCardSha256 ? { taskCardSha256: event.taskCardSha256 } : {}),
+            ...(event.activeChildCount !== undefined ? { activeChildCount: event.activeChildCount } : {}),
+            ...(event.runningProcessCount !== undefined ? { runningProcessCount: event.runningProcessCount } : {}),
             ...(event.errorName ? { errorName: event.errorName } : {})
           }
         });

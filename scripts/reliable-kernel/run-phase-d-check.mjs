@@ -461,15 +461,19 @@ async function checkToolModelResultExactlyOnce() {
     const taskResult = await interactions.settleTaskList({
       source: source('internal', 'task-list:settle'),
       toolCallId: taskTool.toolCallId,
-      items: [{ title: 'Phase D', status: 'in_progress', delete: false }]
+      operation: { mode: 'rewrite', items: [{ title: 'Phase D', status: 'in_progress', delete: false }] }
     });
     const taskOutcome = await get(ctx.database, 'ToolOutcome', taskResult.toolOutcomeId);
     const taskContent = await get(ctx.database, 'ContentObject', taskOutcome.content_object_id);
     const taskDetail = JSON.parse((await ctx.store.read(taskContent)).toString('utf8'));
     assert.deepEqual(taskDetail, {
       detail: {
-        items: [{ delete: false, status: 'in_progress', title: 'Phase D' }],
-        kind: 'task-list'
+        kind: 'task-list',
+        operation: {
+          items: [{ status: 'in_progress', title: 'Phase D' }],
+          kind: 'task_list.operation',
+          mode: 'rewrite'
+        }
       },
       status: 'succeeded',
       toolCallId: taskTool.toolCallId
@@ -478,7 +482,7 @@ async function checkToolModelResultExactlyOnce() {
     const taskReplay = await interactions.settleTaskList({
       source: source('internal', 'task-list:settle'),
       toolCallId: taskTool.toolCallId,
-      items: [{ title: 'Phase D', status: 'in_progress', delete: false }]
+      operation: { mode: 'rewrite', items: [{ title: 'Phase D', status: 'in_progress', delete: false }] }
     });
     assert.equal(taskReplay.receiptId, taskResult.receiptId);
     assert.ok(await get(ctx.database, 'CommandReceipt', taskReplay.receiptId));
@@ -489,7 +493,7 @@ async function checkToolModelResultExactlyOnce() {
     const deferredTask = await interactions.settleTaskList({
       source: source('internal', 'task-order-later:settle'),
       toolCallId: laterTask.toolCallId,
-      items: [{ title: 'Durable later result', status: 'completed', delete: false }]
+      operation: { mode: 'update', items: [{ title: 'Durable later result', status: 'completed', delete: false }] }
     });
     assert.equal(deferredTask.terminal, undefined);
     const deferredOperations = await list(ctx.database, 'Operation', { tool_call_id: laterTask.toolCallId });
@@ -733,7 +737,7 @@ async function checkToolModelResultExactlyOnce() {
     await assert.rejects(interactions.settleTaskList({
       source: source('internal', 'invalid-task-list:settle'),
       toolCallId: invalidTaskTool.toolCallId,
-      items: [{ title: 'bad', status: 'done', delete: false }]
+      operation: { mode: 'rewrite', items: [{ title: 'bad', status: 'done', delete: false }] }
     }), /status is invalid/);
     assert.throws(() => kernel.normalizePlainJson(new Date(), 'test date'), /plain objects/);
     assert.throws(() => kernel.normalizePlainJson({ value: undefined }, 'test undefined'), /JSON-compatible/);
@@ -2455,14 +2459,14 @@ async function checkProcessWatchdog() {
     const timeoutModelResult = JSON.parse((await ctx.store.read(timeoutOutcomeMetadata)).toString('utf8'));
     assert.equal(timeoutModelResult.detail.status, 'timed_out');
     assert.equal(timeoutModelResult.detail.terminationReason, 'timed_out');
-    const timeoutLaunchPath = path.join(
-      kernel.processSpoolPath(ctx.binding, timeoutPrepared.request.spoolLocator),
-      'launch.json'
+    const timeoutExit = timeoutStarted.observation.foreground.receipt;
+    assert.equal(timeoutExit.maxOutputBytes, 64 * 1024);
+    assert.equal(typeof timeoutExit.executionDeadlineAt, 'string');
+    assert.ok(Date.parse(timeoutExit.exitedAt) >= Date.parse(timeoutExit.executionDeadlineAt));
+    await assert.rejects(
+      fs.access(kernel.processSpoolPath(ctx.binding, timeoutPrepared.request.spoolLocator)),
+      (error) => error?.code === 'ENOENT'
     );
-    const timeoutLaunch = JSON.parse(await fs.readFile(timeoutLaunchPath, 'utf8'));
-    assert.equal(timeoutLaunch.executionTimeoutMs, 1_000);
-    assert.equal(timeoutLaunch.maxOutputBytes, 64 * 1024);
-    assert.equal(Date.parse(timeoutLaunch.executionDeadlineAt) - Date.parse(timeoutLaunch.createdAt), 1_000);
     assertions.push('foregroundWaitMs仍只控制前台等待；独立execution deadline在前台命令上形成timed_out终态和直接模型结果');
 
     const outputTool = await createTool(ctx, effects, 'process-watchdog-output', 'bash');
@@ -2474,7 +2478,7 @@ async function checkProcessWatchdog() {
       executionTimeoutMs: 10_000,
       maxOutputBytes: 1_024
     });
-    const outputStarted = await processes.dispatchStart(outputPrepared.effect.effectIntentId, 5_000);
+    const outputStarted = await processes.dispatchStart(outputPrepared.effect.effectIntentId, 15_000);
     const outputExit = outputStarted.observation.foreground.receipt;
     assert.equal(outputExit.terminationReason, 'output_limit_exceeded');
     assert.equal(outputStarted.terminal.status, 'failed');

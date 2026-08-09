@@ -34,7 +34,11 @@ import type {
   WorkEnvironmentRecord,
   WorkflowRecord
 } from '../../shared/protocol';
-import { MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS } from '../../shared/protocol';
+import {
+  DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+  DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+  MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS
+} from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
 import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
@@ -255,6 +259,9 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const selectedModelConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId);
     const systemPromptPrefix = selectedModelConfig?.systemPromptPrefix ?? provider.systemPromptPrefix;
     const contextWindow = resolveContextWindow(provider, modelId);
+    const primaryGenerationConfig = selectedModelConfig?.generationConfig ?? provider.generationConfig;
+    const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
+      ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
     const compressionThresholdTokens = compression.thresholdTokens;
@@ -301,6 +308,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         modelId,
         enableMultimodalTools,
         systemPromptPrefix,
+        maxOutputTokens,
         retryPolicy: frozenProviderRetryPolicy(provider, modelId)
       },
       modelProfile: {
@@ -812,6 +820,12 @@ function resolveFrozenCompression(
       : Math.floor(contextWindowTokens * 0.9)
   ));
   const frozenConfig: LlmCompressionConfigRecord = clonePlain(config);
+  const compressionContextWindowTokens = resolveContextWindow(compressionProvider, compressionModelId);
+  const compressionMaxOutputTokens = resolveCompressionMaxOutputTokens(
+    frozenConfig,
+    compressionProvider,
+    compressionModelId
+  );
   if (frozenConfig.kind === 'openai_responses_compact') {
     frozenConfig.openaiResponsesCompact = {
       ...(frozenConfig.openaiResponsesCompact ?? {}),
@@ -838,15 +852,43 @@ function resolveFrozenCompression(
       methodKind: frozenConfig.kind,
       trigger,
       thresholdTokens,
-      preserveLatestMessages: Math.max(0, Math.floor(trigger.preserveLatestMessages ?? 0)),
       provider: {
         providerConfigId: compressionProvider.id,
         provider: compressionProvider.provider,
         modelId: compressionModelId,
+        contextWindowTokens: compressionContextWindowTokens,
+        maxOutputTokens: compressionMaxOutputTokens,
         retryPolicy: frozenProviderRetryPolicy(compressionProvider, compressionModelId)
       }
     }
   };
+}
+
+function resolveCompressionMaxOutputTokens(
+  config: LlmCompressionConfigRecord,
+  provider: LlmProviderConfigRecord,
+  modelId: string
+): number {
+  const providerGenerationConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId)?.generationConfig
+    ?? provider.generationConfig;
+  const providerMaximum = positiveSafeIntegerOrUndefined(providerGenerationConfig?.maxOutputTokens);
+  if (config.kind !== 'llm_summary' && config.kind !== 'segmented_summary') {
+    return providerMaximum ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
+  }
+
+  const methodMaximum = positiveSafeIntegerOrUndefined(config.llmSummary?.generationConfig?.maxOutputTokens);
+  if (methodMaximum !== undefined) return methodMaximum;
+  const configuredTarget = positiveSafeIntegerOrUndefined(config.llmSummary?.targetTokens)
+    ?? DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS;
+  const visibleTarget = Math.min(DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS, configuredTarget);
+  return Math.max(2_048, Math.min(
+    DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+    Math.ceil(visibleTarget * 2)
+  ));
+}
+
+function positiveSafeIntegerOrUndefined(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : undefined;
 }
 
 function frozenProviderRetryPolicy(

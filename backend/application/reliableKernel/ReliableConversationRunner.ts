@@ -901,6 +901,12 @@ export class ReliableConversationRunner {
         await this.settleManualCompressionInterrupted(slot, 'manual_context_compression_interrupted_after_provider');
         return { terminalStatus: 'interrupted', compression };
       }
+      if (compression.status === 'error') {
+        throw new Error(
+          `${compression.code}: ${compression.message} `
+          + `(${compression.estimatedTokens}/${compression.limitTokens} tokens)`
+        );
+      }
       await this.application.turns.terminal({
         source: { kind: 'internal', key: `manual-compression-maintenance:${slot.turnId}:terminal` },
         turnId: slot.turnId,

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
 import type { RuntimeBuildInfoRecord } from '../../shared/protocol';
 import { EXTENSION_PACKAGE_NAME, EXTENSION_VERSION } from '../../shared/extensionIdentity';
-import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from '../capabilities/openAIResponsesWebSocketSession';
+import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from '../capabilities/openAIResponsesWebSocketIdentity';
 
 const activatedAt = Date.now();
 const runtimeInstanceId = randomUUID();

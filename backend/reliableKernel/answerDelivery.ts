@@ -30,6 +30,11 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import {
+  projectRuntimeDeliveryForModel,
+  runtimeDeliveryPhaseAllowsModelInput,
+  type RuntimeDeliveryModelProjection
+} from './runtimeDeliveryProjection';
 
 export type RuntimeDeliveryPhase = 'current_turn' | 'next_turn' | 'notify_only';
 export type RuntimeDeliveryState = 'pending' | 'consumed' | 'failed';
@@ -110,6 +115,13 @@ export interface RuntimeDeliveryAdvanceResult extends RuntimeDeliveryResult {
   commitSeq?: string;
 }
 
+export interface RuntimeDeliveryModelProjectionCommand {
+  pendingTurnInputId: string;
+  contentObjectId: string;
+  content: string | Uint8Array;
+  contentType: string;
+}
+
 export type AnswerDeliveryRecoveryDisposition =
   | {
       kind: 'existing';
@@ -152,6 +164,8 @@ const DELIVERY_PHASES = new Set<RuntimeDeliveryPhase>(['current_turn', 'next_tur
 const DELIVERY_STATES = new Set<RuntimeDeliveryState>(['pending', 'consumed', 'failed']);
 const ACTIVE_TURN = 'active';
 const TERMINATED_TURN = 'terminated';
+const PROCESS_COMPLETION_MODEL_SOURCE_CONTENT_TYPE =
+  'application/vnd.limcode.process-completion+json';
 
 /** AnswerSubmission + AnswerBridge flip + RuntimeInboxItem atomic writer. */
 export class AnswerControlPlane {
@@ -1580,6 +1594,172 @@ export class RuntimeDeliveryControlPlane {
     return this.summaryFromRow(delivery, links[0] ?? null);
   }
 
+  /**
+   * Read-only Runtime Delivery -> model envelope projection.
+   *
+   * The caller supplies bytes already read through the verified CAS path. This method only joins
+   * immutable delivery/source identities and never consumes Inbox, Delivery, or PendingTurnInput.
+   */
+  public async projectInputForModel(
+    commandInput: RuntimeDeliveryModelProjectionCommand
+  ): Promise<RuntimeDeliveryModelProjection | null> {
+    const pendingTurnInputId = requirePhaseFId(
+      commandInput.pendingTurnInputId,
+      'pendingTurnInputId'
+    );
+    const contentObjectId = requirePhaseFId(commandInput.contentObjectId, 'contentObjectId');
+    const contentType = requirePhaseFText(commandInput.contentType, 'contentType');
+    const contentBytes = typeof commandInput.content === 'string'
+      ? Buffer.from(commandInput.content, 'utf8')
+      : Buffer.from(commandInput.content);
+    const input = await this.requireExisting('PendingTurnInput', pendingTurnInputId);
+    if (input.input_kind !== 'runtime_delivery') {
+      throw new Error('Only a runtime_delivery PendingTurnInput has a Runtime Delivery model projection.');
+    }
+    if (input.content_object_id !== contentObjectId) {
+      throw new Error('Runtime Delivery projection content conflicts with PendingTurnInput.');
+    }
+    const inputLinks = await this.listRows('RuntimeDeliveryInputLink', {
+      pending_turn_input_id: pendingTurnInputId
+    }, 2);
+    if (inputLinks.length !== 1) {
+      throw new Error('Runtime Delivery model projection requires exactly one input link.');
+    }
+    const inputLink = inputLinks[0];
+    const deliveryId = requirePhaseFId(
+      inputLink.delivery_id,
+      'RuntimeDeliveryInputLink.delivery_id'
+    );
+    const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
+    const phase = requireDeliveryPhase(delivery.phase);
+    if (!runtimeDeliveryPhaseAllowsModelInput(phase)) return null;
+    if (delivery.state !== 'consumed') {
+      throw new Error('Runtime Delivery must be consumed by an input before model projection.');
+    }
+    const targetTurnId = requirePhaseFId(input.turn_id, 'PendingTurnInput.turn_id');
+    if (delivery.target_turn_id !== targetTurnId) {
+      throw new Error('Runtime Delivery target conflicts with its PendingTurnInput.');
+    }
+    const inboxItemId = requirePhaseFId(
+      delivery.inbox_item_id,
+      'RuntimeDelivery.inbox_item_id'
+    );
+    const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+    const payloadLinks = await this.listRows('RuntimeInboxPayloadLink', {
+      inbox_item_id: inboxItemId
+    }, 2);
+    if (payloadLinks.length !== 1 || payloadLinks[0].content_object_id !== contentObjectId) {
+      throw new Error('Runtime Delivery model projection requires its exact Inbox payload.');
+    }
+    const metadata = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
+    if (metadata.content_type !== contentType || metadata.byte_length !== BigInt(contentBytes.byteLength)) {
+      throw new Error('Runtime Delivery projection bytes conflict with ContentObject metadata.');
+    }
+    const deliveredAt = requireIsoTimestamp(
+      input.created_at,
+      'PendingTurnInput.created_at'
+    );
+    if (inbox.source_kind === 'process_receipt') {
+      if (contentType !== PROCESS_COMPLETION_MODEL_SOURCE_CONTENT_TYPE) {
+        throw new Error('Process completion Runtime Delivery has an unexpected content type.');
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(contentBytes.toString('utf8'));
+      } catch {
+        throw new TypeError('Process completion Runtime Delivery payload must be valid JSON.');
+      }
+      const processReceiptId = requirePhaseFId(
+        inbox.source_id,
+        'Process completion RuntimeInboxItem.source_id'
+      );
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        throw new TypeError('Process completion Runtime Delivery payload must be an object.');
+      }
+      const processId = requirePhaseFId(
+        (payload as Record<string, unknown>).processId,
+        'Process completion payload.processId'
+      );
+      return projectRuntimeDeliveryForModel({
+        kind: 'process_completion',
+        phase,
+        deliveryId,
+        inboxItemId,
+        targetTurnId,
+        deliveredAt,
+        processId,
+        processReceiptId,
+        content: payload
+      });
+    }
+    if (inbox.source_kind !== 'answer_submission') {
+      throw new Error(`Unsupported Runtime Delivery model source ${String(inbox.source_kind)}.`);
+    }
+    const submissionId = requirePhaseFId(
+      inbox.source_id,
+      'Answer RuntimeInboxItem.source_id'
+    );
+    const submission = await this.requireExisting('AnswerSubmission', submissionId);
+    const answerBridgeId = requirePhaseFId(
+      submission.answer_bridge_id,
+      'AnswerSubmission.answer_bridge_id'
+    );
+    const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
+    const childExecutionId = requirePhaseFId(
+      bridge.child_execution_id,
+      'AnswerBridge.child_execution_id'
+    );
+    const payloads = await this.listRows('AnswerPayload', { submission_id: submissionId }, 2);
+    if (payloads.length !== 1 || payloads[0].content_object_id !== contentObjectId) {
+      throw new Error('Answer Runtime Delivery model projection requires its exact AnswerPayload.');
+    }
+    const rawContent = contentBytes.toString('utf8');
+    const isMessageContent = contentType === 'application/vnd.limcode.message+json';
+    const content = isMessageContent
+      ? requireVisibleAssistantTextForProjection(rawContent)
+      : rawContent;
+    const projectedContentType = isMessageContent ? 'text/plain' : contentType;
+    const sourceTurnId = requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id');
+    const title = payloads[0].title === null
+      ? null
+      : requirePhaseFText(payloads[0].title, 'AnswerPayload.title');
+    const outcome = answerSubmissionOutcome(submission, childExecutionId);
+    if (outcome === 'failed') {
+      return projectRuntimeDeliveryForModel({
+        kind: 'child_failure',
+        status: 'failed',
+        phase,
+        deliveryId,
+        inboxItemId,
+        targetTurnId,
+        deliveredAt,
+        childExecutionId,
+        answerBridgeId,
+        submissionId,
+        sourceTurnId,
+        title,
+        contentType: projectedContentType,
+        content
+      });
+    }
+    return projectRuntimeDeliveryForModel({
+      kind: 'child_answer',
+      status: outcome,
+      phase,
+      deliveryId,
+      inboxItemId,
+      targetTurnId,
+      deliveredAt,
+      childExecutionId,
+      answerBridgeId,
+      submissionId,
+      sourceTurnId,
+      title,
+      contentType: projectedContentType,
+      content
+    });
+  }
+
   private async inject(
     delivery: DomainRow,
     targetTurn: DomainRow,
@@ -2104,6 +2284,29 @@ function extractVisibleAssistantText(raw: string, contentType: string): string {
   if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return '';
   const parts = (decoded as Record<string, unknown>).parts;
   if (!Array.isArray(parts)) return '';
+  return parts
+    .filter((part): part is Record<string, unknown> => Boolean(part) && typeof part === 'object' && !Array.isArray(part))
+    .filter((part) => part.thought !== true && typeof part.text === 'string')
+    .map((part) => String(part.text).trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function requireVisibleAssistantTextForProjection(raw: string): string {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    throw new TypeError('Answer Runtime Delivery MessageContent must be valid JSON.');
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new TypeError('Answer Runtime Delivery MessageContent must be an object.');
+  }
+  const parts = (decoded as Record<string, unknown>).parts;
+  if (!Array.isArray(parts)) {
+    throw new TypeError('Answer Runtime Delivery MessageContent must contain parts.');
+  }
   return parts
     .filter((part): part is Record<string, unknown> => Boolean(part) && typeof part === 'object' && !Array.isArray(part))
     .filter((part) => part.thought !== true && typeof part.text === 'string')

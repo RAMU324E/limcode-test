@@ -33,11 +33,12 @@ export interface FrozenCompressionPolicy {
   config: LlmCompressionConfigRecord;
   triggerMode: LlmCompressionConfigRecord['trigger']['mode'];
   thresholdTokens: number;
-  preserveLatestMessages: number;
   provider: {
     providerConfigId: string;
     provider: LlmProviderKind;
     modelId: string;
+    contextWindowTokens: number;
+    maxOutputTokens: number;
     retryPolicy: FrozenProviderRetryPolicy;
   };
 }
@@ -153,10 +154,6 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
     throw new Error('Frozen compression trigger is invalid.');
   }
   const thresholdTokens = positiveSafeInteger(compression.thresholdTokens, 'compression.thresholdTokens');
-  const preserveLatestMessages = nonNegativeSafeInteger(
-    compression.preserveLatestMessages,
-    'compression.preserveLatestMessages'
-  );
   const providerKind = provider.provider;
   if (!isProviderKind(providerKind)) throw new Error('Frozen compression provider kind is invalid.');
   return {
@@ -165,11 +162,18 @@ export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompres
     config: normalizePlainJson(config, 'AuthoritySnapshot.compression.config') as unknown as LlmCompressionConfigRecord,
     triggerMode: trigger.mode,
     thresholdTokens,
-    preserveLatestMessages,
     provider: {
       providerConfigId: requireText(provider.providerConfigId, 'AuthoritySnapshot.compression.provider.providerConfigId'),
       provider: providerKind,
       modelId: requireText(provider.modelId, 'AuthoritySnapshot.compression.provider.modelId'),
+      contextWindowTokens: positiveSafeInteger(
+        provider.contextWindowTokens,
+        'compression.provider.contextWindowTokens'
+      ),
+      maxOutputTokens: positiveSafeInteger(
+        provider.maxOutputTokens,
+        'compression.provider.maxOutputTokens'
+      ),
       retryPolicy: normalizeFrozenRetryPolicy(
         provider.retryPolicy,
         'compression.provider.retryPolicy',

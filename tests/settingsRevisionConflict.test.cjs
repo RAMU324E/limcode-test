@@ -123,6 +123,58 @@ test('旧窗口不能覆盖 record 设置集合的新提交', async () => {
   }
 });
 
+test('Windows rename 返回 EPERM 时会按已有锁竞争等待并重试', async () => {
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-win-contention-'));
+  const transactionPath = path.join(tempRoot, 'authority');
+  const lockPath = `${transactionPath}.lock`;
+  const originalRename = fsp.rename;
+  let injectedContentionErrors = 0;
+  try {
+    await fsp.mkdir(lockPath, { recursive: true });
+    await fsp.writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({
+      ownerToken: 'competing-owner',
+      pid: process.pid,
+      createdAt: Date.now(),
+      indexPath: transactionPath
+    }));
+
+    fsp.rename = async (source, destination) => {
+      const isCandidatePublication = destination === lockPath
+        && String(source).startsWith(`${lockPath}.candidate-`);
+      const lockExists = isCandidatePublication
+        ? await fsp.stat(lockPath).then(() => true, () => false)
+        : false;
+      if (lockExists) {
+        injectedContentionErrors += 1;
+        throw Object.assign(new Error(`EPERM: operation not permitted, rename '${source}' -> '${destination}'`), {
+          code: 'EPERM',
+          syscall: 'rename',
+          path: source,
+          dest: destination
+        });
+      }
+      return originalRename(source, destination);
+    };
+
+    let actionRuns = 0;
+    await Promise.all([
+      recordStore.withRecordStoreTransaction(MockUri.file(transactionPath), async () => { actionRuns += 1; }),
+      new Promise((resolve) => setTimeout(resolve, 100))
+        .then(() => fsp.rm(lockPath, { recursive: true, force: true }))
+    ]);
+
+    assert.ok(injectedContentionErrors > 0);
+    assert.equal(actionRuns, 1);
+    assert.deepEqual(
+      (await fsp.readdir(tempRoot)).filter((entry) => entry.startsWith('authority.lock')),
+      []
+    );
+  } finally {
+    fsp.rename = originalRename;
+    await fsp.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('旧窗口不能覆盖普通设置文件的新提交', async () => {
   const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-settings-cas-file-'));
   const root = MockUri.file(tempRoot);

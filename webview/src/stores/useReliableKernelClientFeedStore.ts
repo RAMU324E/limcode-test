@@ -120,7 +120,9 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
 const DETAIL_CHUNK_MAX_BYTES = 262_144;
 const DETAIL_MAX_INFLIGHT_REQUESTS = 4;
 const DETAIL_REQUEST_DEADLINE_MS = 20_000;
-const DETAIL_CACHE_MAX_ENTRIES = 256;
+// The byte budget remains authoritative. A 256-entry cap evicted many small historical messages
+// after roughly eight conversations while leaving most of the 16 MiB budget unused.
+const DETAIL_CACHE_MAX_ENTRIES = 1_024;
 const DETAIL_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 const HISTORY_PAGE_LIMIT = 200;
 const MAX_REPORTED_TRANSIENT_PAINTS = 512;

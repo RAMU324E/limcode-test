@@ -526,7 +526,12 @@ export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 4;
 export const MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS = 10;
 export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
 export const DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT = 90;
-export const DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS = 20_000;
+/** Decimal token cap for the model-visible conversation body after text compaction. */
+export const MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS = 48_000;
+/** Default and hard cap for the visible text produced by summary-based compaction. */
+export const DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS = 8_000;
+/** Default frozen output allowance when a compression Provider has no explicit maximum. */
+export const DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS = 16_000;
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT = 'You have written a partial transcript for the initial task above. Please write a summary of the transcript. The purpose of this summary is to provide continuity so you can continue to make progress towards solving the task in a future context, where the raw history above may not be accessible and will be replaced with this summary. Write down anything that would be helpful, including the state, next steps, learnings etc. You must wrap your summary in a <summary></summary> block.';
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT = 'Transcript:';
 export const DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT = [
@@ -588,8 +593,6 @@ export interface LlmCompressionConfigRecord {
     thresholdTokens?: number;
     thresholdPercent?: number;
     thresholdUnit?: LlmCompressionThresholdUnit;
-    preserveLatestMessages?: number;
-    reserveLatestUserMessageTokens?: number;
   };
   openaiResponsesCompact?: {
     providerConfigId?: string;
@@ -620,12 +623,10 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
     trigger: {
       mode: 'token_threshold',
       thresholdUnit: 'percent',
-      thresholdPercent: DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
-      preserveLatestMessages: 8,
-      reserveLatestUserMessageTokens: DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS
+      thresholdPercent: DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT
     },
     llmSummary: {
-      targetTokens: 2000
+      targetTokens: DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS
     },
     createdAt: now,
     updatedAt: now

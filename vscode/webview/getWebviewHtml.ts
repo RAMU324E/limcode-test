@@ -125,6 +125,26 @@ export function getUnavailableWebviewHtml(message: string): string {
 </html>`;
 }
 
+/** Inline-only shell used while the Extension Host opens the reliable Runtime in the background. */
+export function getInitializingWebviewHtml(
+  title = `正在打开 ${EXTENSION_BRAND}`,
+  description = '正在连接本地运行时与数据存储。'
+): string {
+  return /* html */ `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(EXTENSION_BRAND)}</title>
+${createLoadingTransitionStyle()}
+</head>
+<body>
+  ${createLoadingTransitionMarkup({ title, description })}
+</body>
+</html>`;
+}
+
 function createContentSecurityPolicy(
   webview: vscode.Webview,
   nonce: string,

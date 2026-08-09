@@ -943,7 +943,13 @@ interface ProcessDetailReconciliation {
   stderr: Buffer;
 }
 
+interface MessageContentMetadataWaiter {
+  resolve(metadata: ContentObjectMetadata): void;
+  reject(error: unknown): void;
+}
+
 const PROCESS_DETAIL_INDEX_CACHE_ENTRIES = 8;
+const MESSAGE_CONTENT_METADATA_CACHE_ENTRIES = 1_024;
 const TURN_INTENT_PREVIEW_PREFIX_BYTES = 16 * 1024;
 const TURN_INTENT_PREVIEW_TEXT_CHARACTERS = 512;
 
@@ -952,6 +958,10 @@ export class ClientDetailReader {
   /** Rebuildable chunk metadata only; output bytes remain in CAS and are read one requested page at a time. */
   private readonly processOutputIndexes = new Map<string, ProcessOutputDetailIndex>();
   private readonly processOutputReconciliations = new Map<string, Promise<ProcessDetailReconciliation>>();
+  /** MessageRevision and ContentObject are immutable, so continuation pages and revisits can reuse them. */
+  private readonly messageContentMetadata = new Map<string, ContentObjectMetadata>();
+  private readonly pendingMessageContentMetadata = new Map<string, MessageContentMetadataWaiter[]>();
+  private messageContentMetadataFlushScheduled = false;
   private reconcileProcessOutput: ((processId: string) => Promise<ProcessDetailReconciliation>) | undefined;
 
   public constructor(
@@ -1009,14 +1019,115 @@ export class ClientDetailReader {
       const end = Math.min(bytes.length, input.offset + maxRawBytes);
       return buildDetailChunk(recordId, input.offset, bytes.subarray(input.offset, end), bytes.length);
     }
-    const contentObjectId = await this.resolveContentObjectId(
-      input.kind,
-      recordId,
-      input.conversationId
-    );
-    const contentRow = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
+    const contentRow = input.kind === 'message-content'
+      ? await this.loadMessageContentMetadata(recordId)
+      : await this.resolveContentMetadata(input.kind, recordId, input.conversationId);
     const range = await this.contentStore.readChunk(contentRow, input.offset, maxRawBytes);
     return buildDetailChunk(recordId, input.offset, range.chunk, range.totalBytes);
+  }
+
+  private async resolveContentMetadata(
+    kind: Exclude<
+      ClientDetailKind,
+      'message-content' | 'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'model-request-purpose' | 'compression-presentation' | 'process-stdout' | 'process-stderr'
+    >,
+    recordId: string,
+    conversationId?: string | null
+  ): Promise<ContentObjectMetadata> {
+    const contentObjectId = await this.resolveContentObjectId(kind, recordId, conversationId);
+    return await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
+  }
+
+  private loadMessageContentMetadata(revisionId: string): Promise<ContentObjectMetadata> {
+    const cached = this.messageContentMetadata.get(revisionId);
+    if (cached) {
+      this.messageContentMetadata.delete(revisionId);
+      this.messageContentMetadata.set(revisionId, cached);
+      return Promise.resolve(cached);
+    }
+    return new Promise<ContentObjectMetadata>((resolve, reject) => {
+      const waiters = this.pendingMessageContentMetadata.get(revisionId) ?? [];
+      waiters.push({ resolve, reject });
+      this.pendingMessageContentMetadata.set(revisionId, waiters);
+      if (this.messageContentMetadataFlushScheduled) return;
+      this.messageContentMetadataFlushScheduled = true;
+      // Webview postMessage deliveries and the four CAS completions are separate callbacks. Waiting
+      // until the next timer phase lets one transport wave join one immutable metadata batch.
+      setTimeout(() => void this.flushMessageContentMetadata(), 0);
+    });
+  }
+
+  /**
+   * Four Webview detail reads normally arrive in one turn. Resolve all revisions in one worker
+   * snapshot and all distinct ContentObjects in a second snapshot, instead of two worker round
+   * trips per message.
+   */
+  private async flushMessageContentMetadata(): Promise<void> {
+    this.messageContentMetadataFlushScheduled = false;
+    const batch = [...this.pendingMessageContentMetadata.entries()];
+    this.pendingMessageContentMetadata.clear();
+    if (batch.length === 0) return;
+    const revisions = DOMAIN_REPOSITORIES.domain('MessageRevision');
+    const contents = DOMAIN_REPOSITORIES.domain('ContentObject');
+    try {
+      const revisionBarrier = await this.database.snapshot(
+        batch.map(([revisionId]) => revisions.get(revisionId))
+      );
+      if (revisionBarrier.snapshot.length !== batch.length) {
+        throw new Error('Message detail metadata batch returned the wrong revision count.');
+      }
+      const contentIdByRevision = new Map<string, string>();
+      batch.forEach(([revisionId], index) => {
+        const row = revisionBarrier.snapshot[index];
+        if (!row || Array.isArray(row)) return;
+        contentIdByRevision.set(
+          revisionId,
+          requirePhaseFId(row.content_object_id, 'MessageRevision.content_object_id')
+        );
+      });
+      const contentIds = [...new Set(contentIdByRevision.values())];
+      const contentBarrier = contentIds.length > 0
+        ? await this.database.snapshot(contentIds.map((contentId) => contents.get(contentId)))
+        : { snapshot: [] as Array<DomainRow | DomainRow[] | null> };
+      if (contentBarrier.snapshot.length !== contentIds.length) {
+        throw new Error('Message detail metadata batch returned the wrong ContentObject count.');
+      }
+      const contentById = new Map<string, ContentObjectMetadata>();
+      contentIds.forEach((contentId, index) => {
+        const row = contentBarrier.snapshot[index];
+        if (row && !Array.isArray(row)) contentById.set(contentId, row as ContentObjectMetadata);
+      });
+      for (const [revisionId, waiters] of batch) {
+        const contentId = contentIdByRevision.get(revisionId);
+        const metadata = contentId ? contentById.get(contentId) : undefined;
+        if (!contentId) {
+          const error = new Error(`MessageRevision ${revisionId} does not exist.`);
+          for (const waiter of waiters) waiter.reject(error);
+          continue;
+        }
+        if (!metadata) {
+          const error = new Error(`ContentObject ${contentId} does not exist.`);
+          for (const waiter of waiters) waiter.reject(error);
+          continue;
+        }
+        this.rememberMessageContentMetadata(revisionId, metadata);
+        for (const waiter of waiters) waiter.resolve(metadata);
+      }
+    } catch (error) {
+      for (const [, waiters] of batch) {
+        for (const waiter of waiters) waiter.reject(error);
+      }
+    }
+  }
+
+  private rememberMessageContentMetadata(revisionId: string, metadata: ContentObjectMetadata): void {
+    this.messageContentMetadata.delete(revisionId);
+    this.messageContentMetadata.set(revisionId, metadata);
+    while (this.messageContentMetadata.size > MESSAGE_CONTENT_METADATA_CACHE_ENTRIES) {
+      const oldest = this.messageContentMetadata.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.messageContentMetadata.delete(oldest);
+    }
   }
 
   private async readProcessStreamDetail(

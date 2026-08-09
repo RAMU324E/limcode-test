@@ -122,6 +122,10 @@ const ALLOWED_METADATA_KEYS = new Set([
   'cacheHits',
   'cacheMisses',
   'cacheEvictions',
+  'openTaskCount',
+  'taskCardSha256',
+  'activeChildCount',
+  'runningProcessCount',
   'droppedEvents'
 ]);
 

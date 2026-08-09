@@ -391,14 +391,7 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
   let changed = false;
   const next = { ...pendingTurnInputSubmissions.value };
   for (const pending of Object.values(next)) {
-    const result = pending.result;
-    const durableReceiptObserved = Object.values(records.ConversationCommandReceipt ?? {}).some((receipt) =>
-      receipt.command_id === pending.commandId
-      && receipt.conversation_id === pending.conversationId
-    );
-    const observed = durableReceiptObserved || Boolean(result && (result.admitted
-      ? result.turnId && records.Turn?.[result.turnId]
-      : result.intentId && records.TurnIntent?.[result.intentId]));
+    const { observed, durableReceiptObserved } = turnInputDurableObservation(records, pending);
     if (!observed) continue;
     if (durableReceiptObserved) confirmTurnInputFromDurableReceipt(pending);
     clearTurnInputRetry(pending.commandId);
@@ -412,6 +405,24 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
     // ACK here can race Vue's batched watcher and leave the input permanently disabled.
     persistControls();
   }
+}
+
+function turnInputDurableObservation(
+  records: Record<string, Record<string, Record<string, unknown>>>,
+  pending: PendingTurnInputSubmission
+): { observed: boolean; durableReceiptObserved: boolean } {
+  const result = pending.result;
+  const durableReceiptObserved = Object.values(records.ConversationCommandReceipt ?? {}).some((receipt) =>
+    receipt.command_id === pending.commandId
+    && receipt.conversation_id === pending.conversationId
+  );
+  const resultProjectionObserved = Boolean(result && (result.admitted
+    ? result.turnId && records.Turn?.[result.turnId]
+    : result.intentId && records.TurnIntent?.[result.intentId]));
+  return {
+    observed: durableReceiptObserved || resultProjectionObserved,
+    durableReceiptObserved
+  };
 }
 
 function replayTurnInputSubmissions(clientId: string, sessionId?: string): void {
@@ -580,14 +591,33 @@ export function useChat() {
   const conversationActionLabel = computed(() => currentConversationAction.value?.label);
   const compressionPending = computed(() => currentConversationAction.value?.action === 'compress');
   const conversationActionNotice = computed(() => actionNotices.value[reliableConversation.conversationId.value]);
+  const reliableRecords = computed(() =>
+    reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
+  );
   const currentPendingTurnInputs = computed(() => Object.values(pendingTurnInputSubmissions.value)
-    .filter((submission) => submission.conversationId === reliableConversation.conversationId.value)
-    .sort((left, right) => left.submittedAt - right.submittedAt || left.commandId.localeCompare(right.commandId)));
-  const currentTurnInputAcknowledgements = computed(() => Object.fromEntries(
-    Object.entries(turnInputAcknowledgements.value).filter(([, result]) =>
-      result.conversationId === reliableConversation.conversationId.value
+    .filter((submission) =>
+      submission.conversationId === reliableConversation.conversationId.value
+      && !turnInputDurableObservation(reliableRecords.value, submission).observed
     )
-  ));
+    .sort((left, right) => left.submittedAt - right.submittedAt || left.commandId.localeCompare(right.commandId)));
+  const currentTurnInputAcknowledgements = computed(() => {
+    const conversationId = reliableConversation.conversationId.value;
+    const acknowledgements: Record<string, TurnInputAcknowledgement> = Object.fromEntries(
+      Object.entries(turnInputAcknowledgements.value).filter(([, result]) =>
+        result.conversationId === conversationId
+      )
+    );
+    // The direct control ACK may be lost during a Webview/Extension Host reconnect. Durable Feed
+    // facts are equally authoritative and must release the composer without waiting for a later
+    // side-effect watcher pass.
+    for (const pending of Object.values(pendingTurnInputSubmissions.value)) {
+      if (
+        pending.conversationId === conversationId
+        && turnInputDurableObservation(reliableRecords.value, pending).observed
+      ) acknowledgements[pending.commandId] = { conversationId };
+    }
+    return acknowledgements;
+  });
   const currentTurnInputFailure = computed(() => Object.values(failedTurnInputSubmissions.value)
     .filter((submission) => submission.conversationId === reliableConversation.conversationId.value)
     .sort((left, right) => right.failedAt - left.failedAt || right.commandId.localeCompare(left.commandId))[0]);

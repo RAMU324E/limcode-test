@@ -4,7 +4,6 @@ import {
   type AttachmentSettingsRecord,
   type AppearanceSettingsRecord,
   createMessageId,
-  DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -535,7 +534,7 @@ function tokensFromPercent(percent: number | undefined, contextWindowTokens: num
 }
 
 function resolveThresholdTokens(trigger: LlmCompressionConfigRecord['trigger'] | undefined, contextWindowTokens: number | undefined): number | undefined {
-  const thresholdTokens = normalizeTokenCount(trigger?.thresholdTokens);
+  const thresholdTokens = trigger?.thresholdUnit === 'tokens' ? normalizeTokenCount(trigger.thresholdTokens) : undefined;
   if (thresholdTokens !== undefined) return contextWindowTokens ? Math.min(thresholdTokens, contextWindowTokens) : thresholdTokens;
   return tokensFromPercent(clampPercent(trigger?.thresholdPercent) ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT, contextWindowTokens);
 }
@@ -544,28 +543,20 @@ function normalizeCompressionTriggerForUi(
   input: LlmCompressionConfigRecord['trigger'] | undefined,
   contextWindowTokens?: number
 ): LlmCompressionConfigRecord['trigger'] {
-  const hasExplicitTriggerChoice = input?.thresholdUnit !== undefined
-    || input?.thresholdPercent !== undefined
-    || input?.thresholdTokens !== undefined
-    || input?.reserveLatestUserMessageTokens !== undefined;
-  const mode = input?.mode === 'manual' && hasExplicitTriggerChoice ? 'manual' : 'token_threshold';
+  const mode = input?.mode === 'manual' ? 'manual' : 'token_threshold';
   const thresholdUnit: LlmCompressionThresholdUnit = input?.thresholdUnit === 'tokens' ? 'tokens' : 'percent';
   const normalizedWindow = normalizeTokenCount(contextWindowTokens);
   const inputPercent = clampPercent(input?.thresholdPercent) ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT;
-  const inputTokens = normalizeTokenCount(input?.thresholdTokens);
+  const inputTokens = thresholdUnit === 'tokens' ? normalizeTokenCount(input?.thresholdTokens) : undefined;
   const thresholdTokens = inputTokens !== undefined
     ? clampTokenCount(inputTokens, normalizedWindow)
     : tokensFromPercent(inputPercent, normalizedWindow);
   const thresholdPercent = percentFromTokens(thresholdTokens, normalizedWindow) ?? inputPercent;
-  const preserveLatestMessages = normalizeTokenCount(input?.preserveLatestMessages) ?? 8;
-  const reserveLatestUserMessageTokens = normalizeTokenCount(input?.reserveLatestUserMessageTokens) ?? DEFAULT_LLM_COMPRESSION_RESERVE_TOKENS;
   return {
     mode,
     thresholdUnit,
     thresholdPercent,
-    ...(thresholdTokens !== undefined ? { thresholdTokens } : {}),
-    preserveLatestMessages,
-    reserveLatestUserMessageTokens
+    ...(thresholdTokens !== undefined ? { thresholdTokens } : {})
   };
 }
 
@@ -597,11 +588,17 @@ function thresholdAfterContextWindowChange(
   previousWindowTokens: number | undefined,
   nextWindowTokens: number | undefined
 ): LlmCompressionConfigRecord['trigger'] {
-  if (!previousWindowTokens || !nextWindowTokens) return normalizeCompressionTriggerForUi(trigger, nextWindowTokens);
+  if (!nextWindowTokens) return normalizeCompressionTriggerForUi(trigger, nextWindowTokens);
+  if (trigger.thresholdUnit !== 'tokens') {
+    return normalizeCompressionTriggerForUi({
+      ...trigger,
+      thresholdPercent: clampPercent(trigger.thresholdPercent) ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+      thresholdTokens: undefined
+    }, nextWindowTokens);
+  }
   const previousThresholdTokens = resolveThresholdTokens(trigger, previousWindowTokens);
   if (!previousThresholdTokens) return normalizeCompressionTriggerForUi(trigger, nextWindowTokens);
-  const previousReservedTokens = Math.max(0, previousWindowTokens - previousThresholdTokens);
-  const nextThresholdTokens = clampTokenCount(nextWindowTokens - previousReservedTokens, nextWindowTokens);
+  const nextThresholdTokens = clampTokenCount(previousThresholdTokens, nextWindowTokens);
   return normalizeCompressionTriggerForUi({
     ...trigger,
     thresholdTokens: nextThresholdTokens,
@@ -710,9 +707,7 @@ function toPlainCompressionConfig(config: LlmCompressionConfigRecord): LlmCompre
       mode: normalized.trigger.mode,
       ...(normalized.trigger.thresholdTokens !== undefined ? { thresholdTokens: normalized.trigger.thresholdTokens } : {}),
       ...(normalized.trigger.thresholdPercent !== undefined ? { thresholdPercent: normalized.trigger.thresholdPercent } : {}),
-      ...(normalized.trigger.thresholdUnit !== undefined ? { thresholdUnit: normalized.trigger.thresholdUnit } : {}),
-      ...(normalized.trigger.preserveLatestMessages !== undefined ? { preserveLatestMessages: normalized.trigger.preserveLatestMessages } : {}),
-      ...(normalized.trigger.reserveLatestUserMessageTokens !== undefined ? { reserveLatestUserMessageTokens: normalized.trigger.reserveLatestUserMessageTokens } : {})
+      ...(normalized.trigger.thresholdUnit !== undefined ? { thresholdUnit: normalized.trigger.thresholdUnit } : {})
     },
     ...(openaiResponsesCompact ? {
       openaiResponsesCompact: {

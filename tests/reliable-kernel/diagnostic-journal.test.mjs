@@ -42,6 +42,36 @@ test('ReliableDiagnosticJournal 只持久化脱敏 metadata 并保持文件/内�
     assert.equal(initial.spans[0].kind, 'provider-first-paint');
     assert.equal(initial.spans[0].correlationId, 'model-request-1');
 
+    journal.observe({
+      eventKind: 'agent.lifecycle',
+      scopeKind: 'turn',
+      scopeId: 'turn-open-tasks',
+      correlationId: 'model-request-open-tasks',
+      metadata: {
+        turnId: 'turn-open-tasks',
+        modelRequestId: 'model-request-open-tasks',
+        stage: 'open_tasks_at_final',
+        openTaskCount: 3,
+        taskCardSha256: 'a'.repeat(64),
+        activeChildCount: 1,
+        runningProcessCount: 2,
+        taskTitle: '禁止持久化的任务正文'
+      }
+    });
+    await journal.flush();
+    const openTasks = await journal.inspect({ scopeId: 'turn-open-tasks', limit: 10 });
+    assert.equal(openTasks.events.length, 1);
+    assert.deepEqual(openTasks.events[0].metadata, {
+      turnId: 'turn-open-tasks',
+      modelRequestId: 'model-request-open-tasks',
+      stage: 'open_tasks_at_final',
+      openTaskCount: 3,
+      taskCardSha256: 'a'.repeat(64),
+      activeChildCount: 1,
+      runningProcessCount: 2
+    });
+    assert.doesNotMatch(JSON.stringify(openTasks), /禁止持久化的任务正文|taskTitle/);
+
     for (let index = 0; index < 5_000; index += 1) {
       journal.observe({
         eventKind: 'feed.data.acked',

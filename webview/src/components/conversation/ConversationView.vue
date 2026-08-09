@@ -52,16 +52,11 @@ const scrollMarkers = computed(() =>
     .filter((message) => message.role === 'user')
     .map((message, index) => {
       const editing = conversationUi.editingMessage?.message.id === message.id;
-      const text = message.content.parts
-        .filter(isVisibleTextPart)
-        .map((part) => part.text)
-        .join('')
-        .trim()
-        .replace(/\s+/g, ' ');
+      const text = compactMessagePreview(message.content.parts);
       return {
         id: message.id,
         label: `用户消息 · ${index + 1}`,
-        preview: text ? truncatePreview(text) : '',
+        preview: text,
         kind: editing ? 'user editing' : 'user'
       };
     })
@@ -173,8 +168,29 @@ function startReliableMessageEdit(message: (typeof currentDisplayMessages.value)
   conversationUi.startEditMessage(message, deleteCount);
 }
 
-function truncatePreview(text: string): string {
-  return text.length > 180 ? `${text.slice(0, 180)}...` : text;
+function compactMessagePreview(parts: MessageContent['parts']): string {
+  const maxPreviewCharacters = 180;
+  const maxScannedCharacters = 4_096;
+  let preview = '';
+  let scanned = 0;
+  let pendingSpace = false;
+  for (const part of parts) {
+    if (!isVisibleTextPart(part)) continue;
+    for (let index = 0; index < part.text.length && scanned < maxScannedCharacters; index += 1) {
+      scanned += 1;
+      const character = part.text.charAt(index);
+      if (/\s/.test(character)) {
+        pendingSpace = preview.length > 0;
+        continue;
+      }
+      if (pendingSpace) preview += ' ';
+      pendingSpace = false;
+      preview += character;
+      if (preview.length > maxPreviewCharacters) return `${preview.slice(0, maxPreviewCharacters)}...`;
+    }
+    if (scanned >= maxScannedCharacters) break;
+  }
+  return preview;
 }
 </script>
 

@@ -20,11 +20,6 @@
   ],
   "main": "./dist/extension/vscode/extension.js",
   "activationEvents": [
-    "onCommand:limcode-test.openPanel",
-    "onCommand:limcode-test.revealGlobalStorage",
-    "onCommand:limcode-test.inspectReliability",
-    "onCommand:limcode-test.resetDevelopmentData",
-    "onView:limcode-test-entry-view",
     "onWebviewPanel:limcode-test.mainPanel"
   ],
   "contributes": {

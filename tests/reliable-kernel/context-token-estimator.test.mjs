@@ -1,0 +1,402 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import * as kernel from '../../dist/extension/backend/reliableKernel/index.js';
+
+const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
+const TOOL_PAIR_TYPE = 'application/vnd.limcode.context-tool-pair+json';
+const COMPRESSION_TYPE = 'application/vnd.limcode.compression-contents+json';
+
+function segment(segmentKind, contentType, content, messageRole = null) {
+  return {
+    segmentKind,
+    messageRole,
+    contentObject: { content_type: contentType },
+    content: Buffer.from(content, 'utf8')
+  };
+}
+
+function emptyBreakdown(overrides = {}) {
+  const value = {
+    systemTokens: 0,
+    toolSchemaTokens: 0,
+    providerFramingTokens: 0,
+    contextTokens: 0,
+    currentInputTokens: 0,
+    runtimeDeliveryTokens: 0,
+    turnReminderTokens: 0,
+    mediaTokens: 0,
+    fixedTokens: 0,
+    bodyTokens: 0,
+    fullTokens: 0,
+    ...overrides
+  };
+  value.fullTokens = value.fixedTokens + value.bodyTokens;
+  return value;
+}
+
+test('provider语义估算不会把base64图片字符当普通文本token', () => {
+  const first = 'A'.repeat(339_032);
+  const second = 'B'.repeat(392_052);
+  const message = {
+    role: 'user',
+    parts: [
+      { inlineData: { mimeType: 'image/png', data: first } },
+      { inlineData: { mimeType: 'image/png', data: second } }
+    ]
+  };
+  const serialized = JSON.stringify(message);
+  const estimated = kernel.estimateContextSegmentTokens(
+    segment('message', MESSAGE_TYPE, serialized, 'user')
+  );
+  assert.ok(Buffer.byteLength(serialized) / 4 > 180_000, 'legacy byte estimate must reproduce the false 100k+ spike');
+  assert.ok(estimated > 0 && estimated < 2_000, `multimodal estimate should stay bounded, got ${estimated}`);
+});
+
+test('provider compaction ciphertext只保留rawItem权威副本且不按密文字符收费', () => {
+  const ciphertext = 'cipher'.repeat(20_000);
+  const contents = [{
+    role: 'model',
+    parts: [{
+      providerContext: {
+        provider: 'openai',
+        format: 'openai-responses',
+        itemType: 'compaction',
+        encryptedContent: ciphertext,
+        rawItem: { type: 'compaction', encrypted_content: ciphertext }
+      }
+    }]
+  }];
+  const canonical = kernel.canonicalizeCompressionContents(contents);
+  assert.equal(canonical[0].parts[0].providerContext.encryptedContent, undefined);
+  assert.equal(canonical[0].parts[0].providerContext.rawItem.encrypted_content, ciphertext);
+  assert.ok(kernel.estimateMessageContentsTokens(contents) < 20);
+});
+
+test('tool_pair只估算实际重传的functionResponse，不重复计算历史工具参数', () => {
+  const hugeArguments = JSON.stringify({ content: 'x'.repeat(500_000) });
+  const pair = JSON.stringify({
+    kind: 'tool_pair',
+    toolCall: {
+      id: 'call-one',
+      toolName: 'read',
+      argumentsContentType: 'application/json',
+      arguments: hugeArguments
+    },
+    toolModelResult: {
+      id: 'result-one',
+      messageRevisionId: 'revision-one',
+      resultContentType: 'application/json',
+      result: JSON.stringify({ ok: true, text: 'tiny result' })
+    }
+  });
+  const estimated = kernel.estimateContextSegmentTokens(segment('tool_pair', TOOL_PAIR_TYPE, pair));
+  assert.ok(Buffer.byteLength(pair) / 4 > 100_000);
+  assert.ok(estimated < 100, `tool response estimate should exclude stored arguments, got ${estimated}`);
+});
+
+test('压缩envelope使用provider输出token估算而非其持久化JSON大小', () => {
+  const envelope = JSON.stringify({
+    kind: 'compression_contents',
+    version: 1,
+    estimatedTokens: 3_320,
+    contents: [{
+      role: 'user',
+      parts: [{ inlineData: { mimeType: 'image/png', data: 'A'.repeat(700_000) } }]
+    }]
+  });
+  const estimated = kernel.estimateContextSegmentTokens(segment('compression', COMPRESSION_TYPE, envelope));
+  assert.equal(estimated, 3_320);
+  assert.ok(Buffer.byteLength(envelope) / 4 > 170_000);
+});
+
+test('provider usage上下文口径优先prompt/input，而不是input+output total', () => {
+  const usage = { promptTokenCount: 47_100, candidatesTokenCount: 900, totalTokenCount: 48_000 };
+  assert.equal(kernel.providerPromptTokens(usage), 47_100);
+  assert.equal(kernel.providerTotalTokens(usage), 48_000);
+  assert.equal(kernel.compressionOutputTokens(usage), 900);
+});
+
+test('实用版完整请求预算使用48K主体、8K摘要、16K输出和8K误差预留', () => {
+  assert.equal(kernel.MODEL_BODY_TARGET_TOKENS, 48_000);
+  assert.equal(kernel.SUMMARY_TARGET_TOKENS, 8_000);
+  assert.equal(kernel.DEFAULT_OUTPUT_RESERVE_TOKENS, 16_000);
+  assert.equal(kernel.ESTIMATOR_SLACK_TOKENS, 8_000);
+  assert.equal(kernel.TOOL_RESULT_MAX_TOKENS, 4_000);
+  assert.equal(kernel.TOOL_RESULT_BATCH_MAX_TOKENS, 16_000);
+  assert.equal(kernel.calculateEffectiveSummaryMaxTokens(undefined, 48_000), 8_000);
+  assert.equal(kernel.calculateEffectiveSummaryMaxTokens(12_000, 48_000), 8_000);
+  assert.equal(kernel.calculateEffectiveSummaryMaxTokens(8_000, 3_000), 3_000);
+
+  const projected = kernel.estimateProjectedModelInput({
+    systemInstruction: 'system instruction',
+    systemPromptPrefix: 'prefix',
+    tools: [{ name: 'read', description: 'read a file', parameters: { type: 'object' } }],
+    contextContents: [{ role: 'user', parts: [{ text: 'history' }] }],
+    currentInputContents: [{ role: 'user', parts: [{ text: 'current request' }] }],
+    runtimeDeliveryContents: [{ role: 'user', parts: [{ text: 'process completed' }] }],
+    turnReminderContents: [{ role: 'user', parts: [{ text: 'one open task' }] }],
+    providerFramingTokens: 17
+  });
+  const budget = kernel.calculateFullRequestBudget({
+    contextWindowTokens: 200_000,
+    providerInputLimitTokens: 100_000,
+    maxOutputTokens: 2_000,
+    compressionThresholdTokens: 150_000,
+    breakdown: projected
+  });
+  assert.equal(projected.fullTokens, projected.fixedTokens + projected.bodyTokens);
+  assert.equal(budget.outputReserveTokens, 16_000);
+  assert.equal(budget.estimatedInputLimitTokens, 92_000);
+  assert.equal(budget.effectiveBodyTargetTokens, 48_000);
+  assert.equal(budget.canSend, true);
+});
+
+test('完整请求preflight区分固定开销、压缩后过大和fixedOverPolicy', () => {
+  const fixed = kernel.preflightFullRequest({
+    contextWindowTokens: 40_000,
+    compressionThresholdTokens: 30_000,
+    breakdown: emptyBreakdown({ fixedTokens: 17_000 })
+  });
+  assert.equal(fixed.status, 'error');
+  assert.equal(fixed.code, 'fixed_overhead_infeasible');
+
+  const body = kernel.preflightFullRequest({
+    contextWindowTokens: 100_000,
+    compressionThresholdTokens: 90_000,
+    breakdown: emptyBreakdown({ fixedTokens: 1_000, bodyTokens: 80_000 })
+  });
+  assert.equal(body.status, 'error');
+  assert.equal(body.code, 'request_still_too_large');
+
+  const fixedOverPolicy = kernel.calculateFullRequestBudget({
+    contextWindowTokens: 200_000,
+    compressionThresholdTokens: 40_000,
+    breakdown: emptyBreakdown({ fixedTokens: 45_000, bodyTokens: 1_000 })
+  });
+  assert.equal(fixedOverPolicy.fixedOverPolicy, true);
+  assert.equal(fixedOverPolicy.sendingTrigger, false);
+  assert.equal(fixedOverPolicy.policyBodyRoomTokens, 0);
+  assert.equal(fixedOverPolicy.effectiveBodyTargetTokens, 48_000);
+});
+
+test('工具调用和同批全部结果原子分组，文字tail不跳过中间大组', () => {
+  const contents = [
+    { role: 'user', parts: [{ text: 'old request '.repeat(100) }] },
+    {
+      role: 'model',
+      parts: [
+        { id: 'call-a', functionCall: { name: 'read', args: { path: '/a' } } },
+        { id: 'call-b', functionCall: { name: 'search', args: { query: 'needle' } } }
+      ]
+    },
+    { role: 'user', parts: [{ id: 'call-a', functionResponse: { name: 'read', response: { text: 'a'.repeat(20_000) } } }] },
+    { role: 'user', parts: [{ id: 'call-b', functionResponse: { name: 'search', response: { text: 'b'.repeat(20_000) } } }] },
+    { role: 'user', parts: [{ text: 'newest request' }] }
+  ];
+  const groups = kernel.groupAtomicMessageContents(contents);
+  assert.equal(groups.length, 3);
+  assert.equal(groups[1].kind, 'tool_exchange');
+  assert.equal(groups[1].items.length, 3);
+  assert.equal(groups[1].functionCallCount, 2);
+  assert.equal(groups[1].functionResponseCount, 2);
+  const plan = kernel.selectContinuousAtomicTail(groups, groups.at(-1).estimatedTokens);
+  assert.equal(plan.tailItems.length, 1);
+  assert.equal(plan.prefixGroups.at(-1).kind, 'tool_exchange');
+  assert.equal(kernel.selectContinuousAtomicTail(groups, 1).protectedTailOverTarget, true);
+});
+
+test('Reliable Context信封解码后同批结果共用16K且原CAS派生对象不变', () => {
+  const stored = [{
+    segmentKind: 'message',
+    messageRole: 'model',
+    contentType: MESSAGE_TYPE,
+    content: JSON.stringify({
+      role: 'model',
+      parts: [
+        { id: 'call-a', functionCall: { name: 'read', args: { path: '/a' } } },
+        { id: 'call-b', functionCall: { name: 'read', args: { path: '/b' } } }
+      ]
+    })
+  }, ...['a', 'b'].map((name) => ({
+    segmentKind: 'tool_pair',
+    messageRole: null,
+    contentType: TOOL_PAIR_TYPE,
+    content: JSON.stringify({
+      kind: 'tool_pair',
+      toolCall: { id: `tool-${name}`, providerCallId: `call-${name}`, toolName: 'read' },
+      toolModelResult: { id: `result-${name}`, result: JSON.stringify({ text: name.repeat(100_000) }) }
+    })
+  }))];
+  const projectedStored = kernel.projectStoredModelFacingWindow(stored);
+  assert.equal(projectedStored.contents.length, 3);
+  assert.equal(projectedStored.toolResultBatches.length, 1);
+  assert.ok(projectedStored.toolResultBatches[0].projectedTokens <= 16_000);
+
+  const source = [
+    { toolName: 'read', callId: 'a', resultId: 'ra', response: { path: '/a', text: 'BEGIN-A' + 'a'.repeat(80_000) + 'END-A' } },
+    { toolName: 'shell', callId: 'b', resultId: 'rb', response: { processId: 'p1', exitCode: 1, text: 'BEGIN-B' + 'b'.repeat(80_000) + 'END-B' }, priority: 'error_or_receipt', reread: { kind: 'process_output', processId: 'p1' } },
+    { toolName: 'tiny', callId: 'c', resultId: 'rc', response: { ok: true, value: 7 } }
+  ];
+  const before = structuredClone(source);
+  const first = kernel.projectToolResultBatch(source);
+  assert.deepEqual(source, before);
+  assert.deepEqual(first, kernel.projectToolResultBatch(source));
+  assert.equal(first.items.length, source.length);
+  assert.equal(first.items[2].truncated, false);
+  assert.deepEqual(first.items[2].response, source[2].response);
+  assert.ok(first.projectedTokens <= 16_000);
+  assert.equal(first.items[1].response.processId, 'p1');
+  assert.equal(first.items[1].response.rereadHint.processId, 'p1');
+  assert.match(first.items[1].response.preview, /BEGIN-B/);
+  assert.match(first.items[1].response.preview, /END-B/);
+});
+
+test('water-fill使用priority且必要骨架软超时不丢配对身份', () => {
+  const response = { text: 'same-long-evidence-'.repeat(20_000) };
+  const priority = kernel.projectToolResultBatch([
+    { toolName: 'search', callId: 'ordinary', response, priority: 'ordinary' },
+    { toolName: 'shell', callId: 'failure', response, priority: 'error_or_receipt' }
+  ], { perResultTokens: 4_000, batchTokens: 2_000 });
+  assert.ok(priority.items[1].allocatedTokens > priority.items[0].allocatedTokens);
+  assert.ok(priority.items[1].projectedTokens > priority.items[0].projectedTokens);
+
+  const shortFirst = kernel.projectToolResultBatch([
+    { toolName: 'short', callId: 'short', response: { text: 'small-result-'.repeat(30) } },
+    { toolName: 'long-a', callId: 'long-a', response },
+    { toolName: 'long-b', callId: 'long-b', response }
+  ], { perResultTokens: 1_000, batchTokens: 1_000 });
+  assert.equal(shortFirst.items[0].truncated, false, 'naturally short result must be satisfied before long previews');
+
+  const source = Array.from({ length: 12 }, (_, index) => ({
+    toolName: 'tool',
+    callId: `call-${index}-${'x'.repeat(80)}`,
+    resultId: `result-${index}`,
+    response: { status: 'completed', text: 'z'.repeat(10_000) }
+  }));
+  const skeletons = kernel.projectToolResultBatch(source, { perResultTokens: 100, batchTokens: 100 });
+  assert.equal(skeletons.mandatoryBatchOverTarget, true);
+  assert.deepEqual(skeletons.items.map((item) => item.resultId), source.map((item) => item.resultId));
+});
+
+test('摘要投影移除历史媒体字节并把长工具参数改为digest描述', () => {
+  const base64 = Buffer.from('SECRET-MEDIA-CONTENT'.repeat(2_000)).toString('base64');
+  const projected = kernel.projectSummaryModelWindow([
+    { role: 'model', parts: [{ id: 'call-write', functionCall: { name: 'write', args: { path: '/tmp/a', content: 'x'.repeat(80_000) } } }] },
+    { role: 'user', parts: [{
+      id: 'call-write',
+      functionResponse: {
+        name: 'write',
+        response: { ok: true },
+        parts: [{ inlineData: { mimeType: 'image/png', name: 'evidence.png', data: base64 } }]
+      }
+    }] }
+  ]);
+  const encoded = JSON.stringify(projected.contents);
+  assert.equal(encoded.includes(base64), false);
+  assert.equal(projected.mediaTokens, 0);
+  assert.equal(projected.contents.some((content) => content.parts.some((part) => 'functionCall' in part)), false);
+  assert.equal(projected.contents.some((content) => content.parts.some((part) => 'inlineData' in part)), false);
+  assert.match(encoded, /sha256/);
+  assert.match(encoded, /historical_media/);
+});
+
+test('native compact使用完整窗口且拒绝未固化sourcePath媒体', () => {
+  const contents = [
+    { role: 'user', parts: [{ text: 'first' }] },
+    { role: 'model', parts: [{ text: 'second' }] },
+    { role: 'user', parts: [{ text: 'third' }] }
+  ];
+  const ready = kernel.planNativeCompactWindow({ contents, estimatedInputLimitTokens: 100_000 });
+  assert.equal(ready.status, 'ready');
+  assert.equal(ready.contents.length, contents.length);
+  assert.equal(ready.retainedLocalTailCount, 0);
+  const oversized = kernel.planNativeCompactWindow({
+    contents: [{ role: 'user', parts: [{ text: 'large '.repeat(10_000) }] }],
+    estimatedInputLimitTokens: 10
+  });
+  assert.equal(oversized.status, 'error');
+  assert.equal(oversized.code, 'compression_request_too_large');
+  const unresolved = kernel.planNativeCompactWindow({
+    contents: [{ role: 'user', parts: [{ inlineData: {
+      mimeType: 'image/png', sourcePath: '/tmp/not-admitted.png', sizeBytes: 123
+    } }] }],
+    estimatedInputLimitTokens: 100_000
+  });
+  assert.equal(unresolved.status, 'error');
+  assert.equal(unresolved.code, 'media_size_unknown');
+  const managed = kernel.planNativeCompactWindow({
+    contents: [{ role: 'user', parts: [{ inlineData: {
+      mimeType: 'image/png', attachmentId: 'attachment-one', sizeBytes: 123,
+      sha256: 'a'.repeat(64), storage: 'managed'
+    } }] }],
+    estimatedInputLimitTokens: 100_000
+  });
+  assert.equal(managed.status, 'ready');
+});
+
+test('stored runtime_context规划与Adapter共用typed envelope和4K渲染', () => {
+  const projectedDelivery = kernel.projectRuntimeDeliveryForModel({
+    kind: 'child_answer',
+    status: 'submitted',
+    phase: 'current_turn',
+    deliveryId: 'delivery-planner-runtime',
+    inboxItemId: 'inbox-planner-runtime',
+    targetTurnId: 'turn-parent-planner-runtime',
+    deliveredAt: '2026-08-09T12:00:00.000Z',
+    childExecutionId: 'child-planner-runtime',
+    answerBridgeId: 'bridge-planner-runtime',
+    submissionId: 'submission-planner-runtime',
+    sourceTurnId: 'turn-child-planner-runtime',
+    title: 'large child result',
+    contentType: 'text/plain',
+    content: `HEAD-${'x'.repeat(1_000_000)}-TAIL`
+  });
+  assert.ok(projectedDelivery);
+  assert.ok(kernel.estimateTextTokens(projectedDelivery.content) > 100_000);
+  const stored = {
+    segmentKind: 'runtime_context',
+    messageRole: null,
+    contentType: projectedDelivery.contentType,
+    content: projectedDelivery.content
+  };
+  const planned = kernel.projectStoredModelFacingWindow([stored]);
+  const fullRequest = {
+    kind: 'full-model-request',
+    modelRequestId: 'runtime-planner-request',
+    conversationId: 'runtime-planner-conversation',
+    attemptSeq: '1',
+    socketGeneration: '1',
+    providerId: 'runtime-planner-provider',
+    modelId: 'runtime-planner-model',
+    authoritySnapshot: {
+      model: {
+        providerConfigId: 'runtime-planner-provider',
+        provider: 'openai-compatible',
+        modelId: 'runtime-planner-model'
+      },
+      toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} },
+      systemPrompt: { text: '' }
+    },
+    recipe: { kind: 'reliable-agent-turn', tools: [] },
+    context: [{ segmentId: 'runtime-planner-segment', ...stored }]
+  };
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('runtime-planner-provider', {});
+  const sent = adapter.estimateFullRequestInput(fullRequest);
+  assert.equal(planned.tokenCount, sent.contextTokens);
+  assert.ok(planned.tokenCount <= kernel.RUNTIME_DELIVERY_MODEL_MAX_TOKENS + 4);
+  assert.match(planned.contents[0].parts[0].text, /truncated runtime result/);
+  assert.match(planned.contents[0].parts[0].text, /HEAD-/);
+  assert.match(planned.contents[0].parts[0].text, /-TAIL/);
+});
+
+test('stored runtime_context hard-cut旧裸文本而不按普通user消息估算', () => {
+  assert.throws(
+    () => kernel.projectStoredModelFacingWindow([{
+      segmentKind: 'runtime_context',
+      messageRole: null,
+      contentType: 'text/plain',
+      content: 'legacy naked runtime result'
+    }]),
+    /must use application\/vnd\.limcode\.runtime-delivery-model\+json/
+  );
+});

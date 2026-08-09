@@ -1,20 +1,27 @@
 import * as vscode from 'vscode';
 import { MainPanel, type MainPanelOptions } from '../panels/MainPanel';
 import type { ApplicationFacade } from '../ApplicationFacade';
+import type { ApplicationStartup } from '../ApplicationStartup';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 
-export function registerCommands(context: vscode.ExtensionContext, backendApp: ApplicationFacade): void {
+export function registerCommands(context: vscode.ExtensionContext, startup: ApplicationStartup): void {
   const openPanelCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.openPanel, async (options?: unknown) => {
+    const backendApp = await readyApplication(startup);
+    if (!backendApp) return;
     MainPanel.createOrShow(context.extensionUri, backendApp, await resolveOpenPanelOptions(backendApp, options));
   });
 
   const revealGlobalStorageCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.revealGlobalStorage, async () => {
+    const backendApp = await readyApplication(startup);
+    if (!backendApp) return;
     const storageRootUri = backendApp.getStorageRootUri();
     await vscode.workspace.fs.createDirectory(storageRootUri);
     await vscode.commands.executeCommand('revealFileInOS', storageRootUri);
   });
 
   const resetDevelopmentDataCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.resetDevelopmentData, async () => {
+    const backendApp = await readyApplication(startup);
+    if (!backendApp) return;
     const dataRoot = backendApp.getStorageRootUri().fsPath;
     const confirmed = await vscode.window.showWarningMessage(
       `归档并重置 ${EXTENSION_BRAND} 开发数据？`,
@@ -40,6 +47,8 @@ export function registerCommands(context: vscode.ExtensionContext, backendApp: A
   });
 
   const inspectReliabilityCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.inspectReliability, async (options?: unknown) => {
+    const backendApp = await readyApplication(startup);
+    if (!backendApp) return;
     if (context.extensionMode !== vscode.ExtensionMode.Development) {
       await vscode.window.showInformationMessage('可靠性 inspector 仅在 Extension Development Host 中开放。');
       return;
@@ -67,6 +76,16 @@ export function registerCommands(context: vscode.ExtensionContext, backendApp: A
   });
 
   context.subscriptions.push(openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand);
+}
+
+async function readyApplication(startup: ApplicationStartup): Promise<ApplicationFacade | undefined> {
+  try {
+    return await startup.wait();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await vscode.window.showErrorMessage(`${EXTENSION_BRAND} 运行时无法启动：${message}`);
+    return undefined;
+  }
 }
 
 export function registerUnavailableCommands(context: vscode.ExtensionContext, message: string): void {

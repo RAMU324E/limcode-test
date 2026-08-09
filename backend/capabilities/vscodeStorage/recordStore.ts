@@ -8,6 +8,7 @@ import { readJson, writeJson } from './json';
 import { sortableName } from './naming';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
 import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
+import { isTransientFileBusyError } from './durableWrite';
 
 interface RecordsIndexFile {
   schemaVersion: typeof STORAGE_VERSION;
@@ -418,7 +419,7 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
       await createRecordStoreLockDirectory(lockPath, metadata);
       break;
     } catch (error) {
-      if (!isAlreadyExistsError(error)) throw error;
+      if (!(await isRecordStoreLockContentionError(error, lockPath))) throw error;
       if (await removeStaleRecordStoreLock(lockPath, metadata.indexPath)) continue;
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for record store lock: ${indexPath}`);
       await delay(25);
@@ -563,6 +564,25 @@ function processIsAlive(pid: number): boolean {
 function isAlreadyExistsError(error: unknown): boolean {
   const code = (error as { code?: unknown }).code;
   return code === 'EEXIST' || code === 'ENOTEMPTY';
+}
+
+async function isRecordStoreLockContentionError(error: unknown, lockPath: string): Promise<boolean> {
+  if (isAlreadyExistsError(error)) return true;
+  if (!isTransientFileBusyError(error)) return false;
+
+  const renameError = error as { syscall?: unknown; dest?: unknown };
+  if (renameError.syscall !== 'rename') return false;
+  if (typeof renameError.dest === 'string' && path.resolve(renameError.dest) !== path.resolve(lockPath)) return false;
+
+  // On Windows, renaming a candidate directory over an existing directory can report EPERM
+  // instead of EEXIST/ENOTEMPTY. Only reinterpret busy-style errors when the canonical lock
+  // actually exists, so unrelated permission failures remain visible to the caller.
+  try {
+    await fs.stat(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function delay(milliseconds: number): Promise<void> {

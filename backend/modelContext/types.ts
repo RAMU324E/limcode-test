@@ -80,7 +80,6 @@ export type ModelContextPurpose =
       includeSourceTurnMessage?: boolean;
       startMessageId?: string;
       endMessageId?: string;
-      preserveLatestMessages?: number;
       methodKind: CompressionBlockRecord['methodKind'];
     };
 

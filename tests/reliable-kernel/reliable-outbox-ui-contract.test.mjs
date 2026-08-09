@@ -34,6 +34,9 @@ test('Turn 输入 outbox 先持久化完整命令，再用同 command/request id
   assert.match(chat, /records\.ConversationCommandReceipt/);
   assert.match(chat, /receipt\.command_id\s*===\s*pending\.commandId/);
   assert.match(chat, /confirmTurnInputFromDurableReceipt\(pending\)/);
+  assert.match(chat, /function turnInputDurableObservation/);
+  assert.match(chat, /currentPendingTurnInputs[\s\S]*?!turnInputDurableObservation\(reliableRecords\.value, submission\)\.observed/);
+  assert.match(chat, /currentTurnInputAcknowledgements[\s\S]*?turnInputDurableObservation\(reliableRecords\.value, pending\)\.observed/);
   const turnInputReconciliation = chat.slice(
     chat.indexOf('function reconcileTurnInputSubmissions'),
     chat.indexOf('function replayTurnInputSubmissions')
@@ -99,4 +102,33 @@ test('MainPanel 将 Ready/可见性作为 Reliable Feed 生命周期边界', () 
   assert.match(feed, /client\.closed \|\| !client\.ready \|\| !client\.visible \|\| client\.recoveryTimer/);
   assert.match(panel, /setWebviewVisible\(this\.clientId, panel\.visible\)/);
   assert.match(panel, /onDidChangeViewState[\s\S]*?setWebviewVisible\(this\.clientId, this\.panel\.visible\)/);
+});
+
+test('保留的 Webview 在 Extension Host 换代后只补发一次 Ready', () => {
+  const bootstrap = read('webview/src/composables/useBridgeBootstrap.ts');
+  const helloHandler = bootstrap.slice(
+    bootstrap.indexOf('bridge.on(BridgeMessageType.Hello'),
+    bootstrap.indexOf('bridge.on(BridgeMessageType.ConfigurationSnapshot')
+  );
+
+  assert.match(bootstrap, /let announcedClientId:\s*string \| undefined/);
+  assert.match(helloHandler, /const previousClientId = announcedClientId/);
+  assert.match(helloHandler, /if \(message\.clientId\) announcedClientId = message\.clientId/);
+  assert.match(
+    helloHandler,
+    /previousClientId && message\.clientId && previousClientId !== message\.clientId[\s\S]*?bridge\.ready\(\)/
+  );
+  assert.equal((helloHandler.match(/bridge\.ready\(\)/g) ?? []).length, 1);
+});
+
+test('旧任务 artifact 只省略可选任务卡，不阻断整个 Conversation Feed', () => {
+  const worker = read('backend/reliableKernel/databaseWorker.ts');
+  const projection = worker.slice(
+    worker.indexOf('function projectCurrentTaskList('),
+    worker.indexOf('function readTaskProjectionJson(')
+  );
+
+  assert.match(projection, /try \{[\s\S]*?taskListOperationFromSettledArtifact/);
+  assert.match(projection, /catch \{\s*return null;\s*\}/);
+  assert.doesNotMatch(projection, /detail\.items|preserveLatestMessages|reserveLatestUserMessageTokens/);
 });

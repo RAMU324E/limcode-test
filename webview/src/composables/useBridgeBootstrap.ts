@@ -37,9 +37,18 @@ export function useBridgeBootstrap(): void {
   const modelProfiles = useModelProfileStore();
   const agents = useAgentStore();
   const disposers: Array<() => void> = [];
+  // A retained Webview survives Extension Host restarts. Its one-time bootstrap Ready belonged to
+  // the previous Feed client, so remember the Hello client identity and re-declare readiness once
+  // when a replacement Host attaches. The reconnect Hello keeps the same id and cannot loop.
+  let announcedClientId: string | undefined;
 
   disposers.push(
     bridge.on(BridgeMessageType.Hello, (message) => {
+      const previousClientId = announcedClientId;
+      if (message.clientId) announcedClientId = message.clientId;
+      if (previousClientId && message.clientId && previousClientId !== message.clientId) {
+        bridge.ready();
+      }
       session.applyHello(message.payload?.meta, message.payload?.runtime);
       interactions.replayForClient(message.clientId ?? bridge.currentClientId(), message.id);
       if (message.payload?.runtime) console.info('[LimCode][Runtime]', { ...message.payload.runtime });

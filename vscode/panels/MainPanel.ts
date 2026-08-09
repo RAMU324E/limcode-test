@@ -11,6 +11,7 @@ import {
 import { displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
 import { EXTENSION_AGENT_NAME, EXTENSION_BRAND, MAIN_PANEL_VIEW_TYPE, WEBVIEW_DEV_PORT } from '../../shared/extensionIdentity';
 import {
+  getInitializingWebviewHtml,
   getUnavailableWebviewHtml,
   getWebviewHtml,
   getWebviewLocalResourceRoots,
@@ -25,6 +26,7 @@ import {
   RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
 } from '../../shared/reliableKernelClientFeed';
 import type { ApplicationFacade } from '../ApplicationFacade';
+import type { ApplicationStartup } from '../ApplicationStartup';
 
 export interface MainPanelOptions {
   conversationId?: string;
@@ -58,13 +60,42 @@ export class MainPanel {
   private readonly planProposalId?: string;
   private readonly disposables: vscode.Disposable[] = [];
 
-  public static registerSerializer(context: vscode.ExtensionContext, backendApp: ApplicationFacade): void {
+  public static registerSerializer(context: vscode.ExtensionContext, startup: ApplicationStartup): void {
     context.subscriptions.push(
       vscode.window.registerWebviewPanelSerializer(MainPanel.viewType, {
         async deserializeWebviewPanel(webviewPanel, state) {
           const serialized = optionsFromSerializedState(state, webviewPanel.title);
-          const options = await resolveRestoredPanelOptions(backendApp, serialized);
-          MainPanel.revive(webviewPanel, context.extensionUri, backendApp, options);
+          let disposed = false;
+          const startupDispose = webviewPanel.onDidDispose(() => { disposed = true; });
+          MainPanel.renderInitializing(webviewPanel, serialized);
+          try {
+            const backendApp = await startup.wait();
+            const options = await resolveRestoredPanelOptions(backendApp, serialized);
+            if (disposed) {
+              startupDispose.dispose();
+              return;
+            }
+            startupDispose.dispose();
+            MainPanel.revive(webviewPanel, context.extensionUri, backendApp, options);
+            if (options.conversationId) {
+              // A serialized conversation identity is sufficient to restore and handshake. Refresh
+              // its display title after lazy history hydration instead of blocking the whole view.
+              void backendApp.waitUntilHydrated().then(
+                () => MainPanel.refreshConversationTitle(options.conversationId!),
+                () => undefined
+              );
+            }
+          } catch (error) {
+            if (disposed) {
+              startupDispose.dispose();
+              return;
+            }
+            startupDispose.dispose();
+            MainPanel.renderUnavailable(
+              webviewPanel,
+              error instanceof Error ? error.message : String(error)
+            );
+          }
         }
       })
     );
@@ -145,6 +176,24 @@ export class MainPanel {
   private static renderUnavailable(panel: vscode.WebviewPanel, message: string): void {
     panel.webview.options = { enableScripts: false };
     panel.webview.html = getUnavailableWebviewHtml(message);
+  }
+
+  private static renderInitializing(panel: vscode.WebviewPanel, options: MainPanelOptions): void {
+    panel.webview.options = { enableScripts: false };
+    const kind = panelKind(options);
+    const target = kind === 'globalSettings'
+      ? '设置'
+      : kind === 'workflowSettings'
+        ? '工作流编辑器'
+        : kind === 'agentSettings'
+          ? 'Agent 设置'
+          : kind === 'planDetail'
+            ? 'Plan 详情'
+            : '对话标签页';
+    panel.webview.html = getInitializingWebviewHtml(
+      `正在恢复${target}`,
+      '界面已就绪，正在连接本地运行时。'
+    );
   }
 
   private constructor(
@@ -362,13 +411,8 @@ async function resolveRestoredPanelOptions(
   options: MainPanelOptions
 ): Promise<MainPanelOptions> {
   if (panelKind(options) !== 'chat') return options;
+  if (options.conversationId) return options;
   await backendApp.waitUntilHydrated();
-  if (options.conversationId) {
-    return {
-      ...options,
-      title: backendApp.getConversationDisplayTitle(options.conversationId)
-    };
-  }
   const existing = backendApp.getConversationHistoryEntries()[0];
   const conversationId = existing?.id ?? await backendApp.createConversation();
   return {

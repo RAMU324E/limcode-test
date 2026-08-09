@@ -114,6 +114,12 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (this.disposed) return;
       if (this.historyEntries.length === 0) await this.createConversation();
     })();
+    // Lazy callers may only need a scoped page and intentionally do not await the global cache
+    // hydration. Keep a failure observed while preserving the rejecting Promise for commands that
+    // require the complete history cache.
+    void this.hydration.catch((error) => {
+      if (!this.disposed) console.error('[LimCode] Conversation history hydration failed.', error);
+    });
     return this.hydration;
   }
 
@@ -406,7 +412,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     cursor?: string;
     limit?: number;
   }): Promise<ConversationHistoryPageRecord> {
-    await this.waitUntilHydrated();
+    // Start global cache/watcher hydration, but let the requested visible page take its own bounded
+    // read path immediately. Waiting for the all-conversation page here serialized two projections
+    // (and up to two batches of CAS preview reads) before the sidebar could paint its first page.
+    void this.startHydration().catch(() => undefined);
     const scope = this.resolveHistoryScope(input.scopeKind, input.projectFolderUri);
     const limit = normalizePageSize(input.limit);
     const page = await this.queryConversationHistoryPage(scope, input.cursor, limit);

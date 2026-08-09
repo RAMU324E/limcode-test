@@ -2,6 +2,7 @@ import {
   createSubmitPlanToolOutput,
   normalizeSubmitPlanToolRequest
 } from '../../shared/planReview';
+import { requireTaskListOperation } from '../../shared/taskListProjection';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import {
   EffectControlPlane,
@@ -729,14 +730,14 @@ export class ToolInteractionControlPlane {
   public async settleTaskList(input: {
     source: PhaseDCommandSource;
     toolCallId: string;
-    items: unknown[];
+    operation: unknown;
   }): Promise<ToolSettlementResult> {
-    if (!Array.isArray(input.items)) throw new TypeError('Task list items must be an array.');
+    const operation = requireTaskListOperation(normalizePlainJson(input.operation, 'taskList'));
     return this.effects.settleWithoutEffect({
       source: input.source,
       toolCallId: input.toolCallId,
       status: 'succeeded',
-      detail: { kind: 'task-list', items: input.items.map((item, index) => normalizeTaskListItem(item, index)) }
+      detail: { kind: 'task-list', operation }
     });
   }
 
@@ -1063,31 +1064,6 @@ function matchesExpectedUnique(
     const wanted = columns.map((column) => `${table}.${column}`).sort();
     return wanted.length === actual.length && wanted.every((column, ordinal) => column === actual[ordinal]);
   });
-}
-
-function normalizeTaskListItem(value: unknown, index: number): Record<string, unknown> {
-  const normalized = normalizePlainJson(value, `taskList.items[${index}]`);
-  if (!normalized || Array.isArray(normalized) || typeof normalized !== 'object') {
-    throw new TypeError(`taskList.items[${index}] must be a plain object.`);
-  }
-  const record = normalized as Record<string, unknown>;
-  const allowed = new Set(['title', 'description', 'status', 'delete']);
-  const unknown = Object.keys(record).filter((key) => !allowed.has(key));
-  if (unknown.length > 0) throw new TypeError(`taskList.items[${index}] has unsupported fields: ${unknown.join(', ')}.`);
-  if (typeof record.title !== 'string' || record.title.trim().length === 0) {
-    throw new TypeError(`taskList.items[${index}].title must be non-empty text.`);
-  }
-  if (record.description !== undefined && typeof record.description !== 'string') {
-    throw new TypeError(`taskList.items[${index}].description must be text when present.`);
-  }
-  if (
-    record.status !== undefined
-    && !['pending', 'in_progress', 'completed', 'blocked', 'cancelled'].includes(String(record.status))
-  ) throw new TypeError(`taskList.items[${index}].status is invalid.`);
-  if (record.delete !== undefined && typeof record.delete !== 'boolean') {
-    throw new TypeError(`taskList.items[${index}].delete must be boolean when present.`);
-  }
-  return record;
 }
 
 function planProposalId(toolCallId: string): string {

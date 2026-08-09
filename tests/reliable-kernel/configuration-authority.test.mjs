@@ -18,6 +18,7 @@ after(() => { Module._load = originalLoad; });
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
+const { frozenCompressionPolicy } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
 const { resolveToolPolicyLayers } = require('../../dist/extension/shared/toolPolicyResolution.js');
 const { workEnvironmentIdFromUri } = require('../../dist/extension/shared/workEnvironmentCatalog.js');
 
@@ -109,6 +110,7 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
         retryMaxAttempts: 3,
         enableMultimodalTools: true,
         contextWindowTokens: 180_000,
+        generationConfig: { maxOutputTokens: 24_000 },
         systemPromptPrefix: '模型专属前置要求',
         createdAt: 1,
         updatedAt: 1
@@ -195,6 +197,10 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     assert.equal(frozen.model.providerConfigId, provider.id);
     assert.equal(frozen.model.modelId, 'model:test');
     assert.equal(frozen.model.systemPromptPrefix, '模型专属前置要求');
+    assert.equal(frozen.model.maxOutputTokens, 24_000);
+    assert.equal(frozen.compression.config.llmSummary.targetTokens, 8_000);
+    assert.equal(frozen.compression.provider.contextWindowTokens, 180_000);
+    assert.equal(frozen.compression.provider.maxOutputTokens, 16_000);
     assert.deepEqual(frozen.toolPolicy.allowedTools, ['read']);
     assert.deepEqual(frozen.toolPolicy.sourceConfigs, {
       'mcp-exa': { enabled: true, disabledTools: ['exa_hidden'] }
@@ -350,6 +356,110 @@ test('Workspace同步修复悬空WorkEnvironmentPolicy默认项并保留disabled
     assert.equal(policy.defaultWorkEnvironmentId, secondId);
     assert.equal(snapshot.workEnvironments.find((record) => record.id === firstId)?.available, false);
     assert.equal(snapshot.workEnvironments.find((record) => record.id === secondId)?.available, true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('压缩配置 hard-cut 旧保留字段并冻结压缩 Provider 自己的窗口与输出上限', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-compression-config-cutover-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const primary = {
+      ...createDefaultLlmProviderConfig({ name: '主模型渠道' }),
+      id: 'provider:primary-compression-cutover',
+      model: 'model:primary-372k',
+      models: [{ id: 'model:primary-372k', name: 'Primary 372K' }],
+      contextWindowTokens: 372_000,
+      generationConfig: { maxOutputTokens: 20_000 },
+      modelConfigs: []
+    };
+    const summary = {
+      ...createDefaultLlmProviderConfig({ name: '摘要渠道' }),
+      id: 'provider:summary-compression-cutover',
+      model: 'model:summary-64k',
+      models: [{ id: 'model:summary-64k', name: 'Summary 64K' }],
+      contextWindowTokens: 64_000,
+      generationConfig: { maxOutputTokens: 6_000 },
+      modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [primary, summary] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: primary.id });
+
+    const legacyCompressionConfig = {
+      id: 'compression-config:cutover',
+      name: 'Hard cut compression',
+      kind: 'llm_summary',
+      trigger: {
+        mode: 'token_threshold',
+        thresholdUnit: 'tokens',
+        thresholdTokens: 300_000,
+        thresholdPercent: 80,
+        preserveLatestMessages: 99,
+        reserveLatestUserMessageTokens: 123_000
+      },
+      llmSummary: {
+        providerConfigId: summary.id,
+        model: summary.model,
+        generationConfig: { maxOutputTokens: 12_000 }
+      },
+      createdAt: 1,
+      updatedAt: 1
+    };
+    await assert.rejects(
+      saveLatestGlobalSettings(authority, 'llmCompressionConfigs', {
+        configs: [legacyCompressionConfig]
+      }),
+      /removed message-count\/user-reserve fields/
+    );
+    const compressionConfig = {
+      ...legacyCompressionConfig,
+      trigger: {
+        mode: 'token_threshold',
+        thresholdUnit: 'tokens',
+        thresholdTokens: 300_000,
+        thresholdPercent: 80
+      }
+    };
+    const saved = await saveLatestGlobalSettings(authority, 'llmCompressionConfigs', {
+      configs: [compressionConfig]
+    });
+    const normalizedConfig = saved.settings.configs[0];
+    assert.equal(normalizedConfig.llmSummary.targetTokens, 8_000);
+    assert.deepEqual(Object.keys(normalizedConfig.trigger).sort(), [
+      'mode', 'thresholdPercent', 'thresholdTokens', 'thresholdUnit'
+    ]);
+    await saveLatestGlobalSettings(authority, 'llmCompression', {
+      defaultConfigId: normalizedConfig.id,
+      providerBindings: [],
+      modelBindings: []
+    });
+
+    const frozen = JSON.parse((await authority.compile({
+      conversationId: 'conversation:compression-cutover',
+      turnId: 'turn:compression-cutover',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.equal(frozen.modelProfile.contextWindowTokens, 372_000);
+    assert.equal(frozen.model.maxOutputTokens, 20_000);
+    assert.equal(frozen.compression.config.llmSummary.targetTokens, 8_000);
+    assert.equal(frozen.compression.provider.providerConfigId, summary.id);
+    assert.equal(frozen.compression.provider.modelId, summary.model);
+    assert.equal(frozen.compression.provider.contextWindowTokens, 64_000);
+    assert.equal(frozen.compression.provider.maxOutputTokens, 12_000);
+    assert.equal(Object.hasOwn(frozen.compression, 'preserveLatestMessages'), false);
+    assert.equal(Object.hasOwn(frozen.compression.config.trigger, 'preserveLatestMessages'), false);
+    assert.equal(Object.hasOwn(frozen.compression.config.trigger, 'reserveLatestUserMessageTokens'), false);
+    assert.equal(frozenCompressionPolicy(frozen).provider.contextWindowTokens, 64_000);
+
+    const incomplete = structuredClone(frozen);
+    delete incomplete.compression.provider.contextWindowTokens;
+    assert.throws(
+      () => frozenCompressionPolicy(incomplete),
+      /compression\.provider\.contextWindowTokens/
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

@@ -8,10 +8,11 @@ import Database from 'better-sqlite3';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
 import {
-  applyTaskListOperationToSnapshot,
-  emptyTaskListSnapshot,
-  taskListOperationFromArgs
-} from '../../shared/taskListProjection';
+  approvedSubmitPlanTaskOperation,
+  buildCurrentTurnTaskProjection,
+  taskListOperationFromSettledArtifact,
+  type CurrentTurnTaskOperationFact
+} from './currentTurnTaskProjection';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   assertCurrentSchema,
@@ -2742,8 +2743,9 @@ function taskListProjectionFromOutcome(
   database: Database.Database,
   outcome: Record<string, unknown> | null,
   toolCallId: string
-): { items: unknown[] | null; detail_on_demand: boolean } {
+): { mode?: string; items: unknown[] | null; detail_on_demand: boolean } {
   if (!outcome || outcome.content_object_id === null) return { items: null, detail_on_demand: false };
+  if (outcome.status !== 'succeeded') return { items: null, detail_on_demand: false };
   const contentObjectId = requireRuntimeId(outcome.content_object_id);
   const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
   if (!raw) throw new Error(`Task-list ToolOutcome ${toolCallId} references missing ContentObject ${contentObjectId}.`);
@@ -2764,20 +2766,16 @@ function taskListProjectionFromOutcome(
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`Task-list ToolOutcome ${toolCallId} content is not an object.`);
   }
-  const record = value as Record<string, unknown>;
-  const detail = record.detail;
-  if (
-    record.toolCallId !== toolCallId
-    || !detail
-    || typeof detail !== 'object'
-    || Array.isArray(detail)
-    || (detail as Record<string, unknown>).kind !== 'task-list'
-    || !Array.isArray((detail as Record<string, unknown>).items)
-  ) {
+  let operation;
+  try {
+    operation = taskListOperationFromSettledArtifact(value, toolCallId);
+  } catch {
     return { items: null, detail_on_demand: true };
   }
+  if (!operation) return { items: null, detail_on_demand: false };
   return {
-    items: (detail as Record<string, unknown>).items as unknown[],
+    mode: operation.mode,
+    items: operation.items,
     detail_on_demand: false
   };
 }
@@ -2786,78 +2784,117 @@ function projectCurrentTaskList(
   database: Database.Database,
   conversationId: string
 ): Record<string, unknown> | null {
+  const latestTurn = queryPlainRows(database, `
+    SELECT turn.id
+      FROM turn
+     WHERE turn.conversation_id = @conversationId
+     ORDER BY turn.created_at DESC, turn.id DESC
+     LIMIT 1
+  `, { conversationId })[0];
+  if (!latestTurn) return null;
+  const turnId = String(latestTurn.id);
   const calls = queryPlainRows(database, `
     SELECT call.id,
            call.turn_id,
            call.call_seq,
            call.tool_name,
            call.arguments_object_id,
-           outcome.status AS outcome_status,
+           artifact.content_object_id AS artifact_content_object_id,
            source.message_id,
-           source.provider_ordinal,
-           membership.message_seq
+           source.provider_ordinal
       FROM tool_call AS call
-      JOIN turn ON turn.id = call.turn_id
-      JOIN tool_outcome AS outcome ON outcome.tool_call_id = call.id
+      JOIN tool_result_artifact AS artifact
+        ON artifact.tool_call_id = call.id
+       AND artifact.role = 'no_effect_result'
+      JOIN operation AS task_operation
+        ON task_operation.tool_call_id = call.id
+       AND task_operation.status = 'succeeded'
       JOIN tool_call_source_link AS source ON source.tool_call_id = call.id
-      JOIN message_part_of_conversation AS membership
-        ON membership.message_id = source.message_id
-       AND membership.conversation_id = turn.conversation_id
-     WHERE turn.conversation_id = @conversationId
+     WHERE call.turn_id = @turnId
        AND call.tool_name IN ('update_task_list', 'submit_plan')
-       AND outcome.status IN ('succeeded', 'partial')
-     ORDER BY membership.message_seq ASC,
-              source.provider_ordinal ASC,
-              call.call_seq ASC,
+     ORDER BY call.call_seq ASC,
               call.id ASC
-  `, { conversationId });
+  `, { turnId });
   if (calls.length === 0) return null;
 
-  let snapshot = emptyTaskListSnapshot();
-  let appliedCount = 0;
-  let source: Record<string, unknown> | undefined;
-  for (const call of calls) {
-    const operation = taskListOperationFromCallArguments(database, call);
-    if (!operation) continue;
-    snapshot = applyTaskListOperationToSnapshot(snapshot, operation, {
-      operationIndex: appliedCount,
-      toolCallId: String(call.id)
-    });
-    appliedCount += 1;
-    source = call;
+  // The task panel is an optional client projection. A pre-hard-cut or malformed artifact must
+  // never prevent the bounded Conversation Feed from opening; omit the card without interpreting
+  // the old shape. ModelRequest recipe reads remain strict in readCurrentTurnTaskCard().
+  try {
+    const operations: CurrentTurnTaskOperationFact[] = [];
+    for (const call of calls) {
+      const toolCallId = String(call.id);
+      const artifact = readTaskProjectionJson(
+        database,
+        call.artifact_content_object_id,
+        `Task-list ToolResultArtifact ${toolCallId}`
+      );
+      if (call.tool_name === 'update_task_list') {
+        const operation = taskListOperationFromSettledArtifact(artifact, toolCallId);
+        if (!operation) continue;
+        operations.push({
+          toolCallId,
+          callSeq: String(call.call_seq),
+          toolName: 'update_task_list',
+          operation,
+          sourceMessageId: String(call.message_id)
+        });
+        continue;
+      }
+      const argumentsValue = readTaskProjectionJson(
+        database,
+        call.arguments_object_id,
+        `submit_plan ToolCall ${toolCallId} arguments`
+      );
+      const operation = approvedSubmitPlanTaskOperation({
+        argumentsValue,
+        resultArtifactValue: artifact,
+        toolCallId
+      });
+      if (!operation) continue;
+      operations.push({
+        toolCallId,
+        callSeq: String(call.call_seq),
+        toolName: 'submit_plan',
+        operation,
+        planApproved: true,
+        sourceMessageId: String(call.message_id)
+      });
+    }
+    const projection = buildCurrentTurnTaskProjection({ turnId, operations });
+    if (!projection) return null;
+    return {
+      conversationId,
+      revision: projection.revision,
+      operationCount: projection.operationCount,
+      sourceToolCallId: projection.sourceToolCallId,
+      sourceTurnId: projection.turnId,
+      ...(projection.sourceMessageId ? { sourceMessageId: projection.sourceMessageId } : {}),
+      baselineToolCallId: projection.baselineToolCallId,
+      items: projection.snapshot.items,
+      stats: projection.snapshot.stats,
+      ...(projection.snapshot.activeItem ? { activeItem: projection.snapshot.activeItem } : {})
+    };
+  } catch {
+    return null;
   }
-  if (!source) return null;
-  return {
-    conversationId,
-    revision: [source.message_seq, source.provider_ordinal, source.call_seq].map(String).join(':'),
-    operationCount: appliedCount,
-    sourceToolCallId: source.id,
-    sourceTurnId: source.turn_id,
-    sourceMessageId: source.message_id,
-    items: snapshot.items,
-    stats: snapshot.stats,
-    ...(snapshot.activeItem ? { activeItem: snapshot.activeItem } : {})
-  };
 }
 
-function taskListOperationFromCallArguments(
+function readTaskProjectionJson(
   database: Database.Database,
-  call: Record<string, unknown>
-): ReturnType<typeof taskListOperationFromArgs> {
-  const contentObjectId = requireRuntimeId(call.arguments_object_id);
+  contentObjectIdValue: unknown,
+  label: string
+): unknown {
+  const contentObjectId = requireRuntimeId(contentObjectIdValue);
   const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
-  if (!raw) throw new Error(`Task-list ToolCall ${String(call.id)} references missing arguments ContentObject ${contentObjectId}.`);
+  if (!raw) throw new Error(`${label} references missing ContentObject ${contentObjectId}.`);
   const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
   const bytes = readVerifiedCasBytes(metadata, path.resolve(data.binding.paths.casRootPath));
-  let value: unknown;
   try {
-    value = JSON.parse(bytes.toString('utf8'));
+    return JSON.parse(bytes.toString('utf8')) as unknown;
   } catch (error) {
-    throw new Error(`Task-list ToolCall ${String(call.id)} arguments are not JSON: ${String(error)}`);
+    throw new Error(`${label} content is not JSON: ${String(error)}`);
   }
-  if (call.tool_name === 'update_task_list') return taskListOperationFromArgs(value);
-  if (call.tool_name !== 'submit_plan' || !value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  return taskListOperationFromArgs((value as Record<string, unknown>).taskList);
 }
 
 function executeConversationHistoryProjection(

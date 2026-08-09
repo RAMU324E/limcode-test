@@ -102,6 +102,17 @@ interface FunctionCallTarget {
   ordinal: number;
 }
 
+interface ParsedMessageContentCacheEntry {
+  role: 'user' | 'model';
+  source: string;
+  content: MessageContent;
+}
+
+const PARSED_MESSAGE_CONTENT_CACHE_MAX_ENTRIES = 256;
+const PARSED_MESSAGE_CONTENT_CACHE_MAX_SOURCE_CHARACTERS = 8 * 1024 * 1024;
+const parsedMessageContentCache = new Map<string, ParsedMessageContentCacheEntry>();
+let parsedMessageContentCacheSourceCharacters = 0;
+
 /**
  * Pure UI projection over independent Runtime objects and Link facts. It never mutates or persists a
  * coupled aggregate: Message↔Turn and Tool↔Turn relationships are interpreted only for rendering.
@@ -139,7 +150,7 @@ export function projectReliableConversation(
     const detail = input.details[reliableKernelDetailKey('message-content', revisionId)];
     if (!detail || detail.status === 'loading') loadingMessageRevisionIds.push(revisionId);
     const content = detail?.status === 'ready'
-      ? parseMessageContent(detail.text, role)
+      ? parseMessageContent(revisionId, detail.text, role)
       : detail?.status === 'error'
         ? {
             role,
@@ -822,15 +833,51 @@ function ensureProjectedFunctionCall(
   };
 }
 
-function parseMessageContent(source: string, role: 'user' | 'model'): MessageContent {
+function parseMessageContent(
+  revisionId: string,
+  source: string,
+  role: 'user' | 'model'
+): MessageContent {
+  const cached = parsedMessageContentCache.get(revisionId);
+  if (cached && cached.role === role && cached.source === source) {
+    parsedMessageContentCache.delete(revisionId);
+    parsedMessageContentCache.set(revisionId, cached);
+    return cached.content;
+  }
   const parsed = parseJson(source);
+  let content: MessageContent;
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     const candidate = parsed as Record<string, unknown>;
     if ((candidate.role === 'user' || candidate.role === 'model') && Array.isArray(candidate.parts)) {
-      return candidate as unknown as MessageContent;
+      content = candidate as unknown as MessageContent;
+    } else {
+      content = { role, parts: source ? [{ text: source }] : [] };
     }
+  } else {
+    content = { role, parts: source ? [{ text: source }] : [] };
   }
-  return { role, parts: source ? [{ text: source }] : [] };
+  rememberParsedMessageContent(revisionId, { role, source, content });
+  return content;
+}
+
+function rememberParsedMessageContent(revisionId: string, entry: ParsedMessageContentCacheEntry): void {
+  const existing = parsedMessageContentCache.get(revisionId);
+  if (existing) parsedMessageContentCacheSourceCharacters -= existing.source.length;
+  parsedMessageContentCache.delete(revisionId);
+  // A single pathological body remains renderable but must not pin the complete parser cache.
+  if (entry.source.length > PARSED_MESSAGE_CONTENT_CACHE_MAX_SOURCE_CHARACTERS) return;
+  parsedMessageContentCache.set(revisionId, entry);
+  parsedMessageContentCacheSourceCharacters += entry.source.length;
+  while (
+    parsedMessageContentCache.size > PARSED_MESSAGE_CONTENT_CACHE_MAX_ENTRIES
+    || parsedMessageContentCacheSourceCharacters > PARSED_MESSAGE_CONTENT_CACHE_MAX_SOURCE_CHARACTERS
+  ) {
+    const oldestRevisionId = parsedMessageContentCache.keys().next().value as string | undefined;
+    if (!oldestRevisionId) break;
+    const oldest = parsedMessageContentCache.get(oldestRevisionId);
+    parsedMessageContentCache.delete(oldestRevisionId);
+    if (oldest) parsedMessageContentCacheSourceCharacters -= oldest.source.length;
+  }
 }
 
 function toolStatus(

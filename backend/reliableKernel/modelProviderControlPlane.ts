@@ -11,6 +11,14 @@ import {
   estimateRequestAuthorityTokens,
   ReliableContextTokenEstimator
 } from './contextTokenEstimator';
+import {
+  calculateFullRequestBudget,
+  DEFAULT_OUTPUT_RESERVE_TOKENS,
+  preflightFullRequest,
+  type ContextPlanningFailureCode,
+  type FullRequestBudget,
+  type ProjectedRequestTokenBreakdown
+} from './modelFacingContextProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import {
   DOMAIN_REPOSITORIES,
@@ -44,6 +52,8 @@ export interface CreateModelRequestCommand {
   authoritySnapshotId: string;
   recipe: PlainJsonValue;
   settingsSnapshotContentObjectId?: string;
+  /** Exact adapter projection estimate frozen by the ordinary request planner. */
+  projectedEstimatedTokens?: number;
   idempotencyKey: string;
 }
 
@@ -78,6 +88,23 @@ export interface FullProviderRequest {
   settingsSnapshot?: PlainJsonValue;
   recipe: PlainJsonValue;
   context: FullProviderContextItem[];
+  requestAddenda?: {
+    currentTurnInput?: {
+      messageId: string;
+      messageRevisionId: string;
+      contentObjectId: string;
+      reinject: boolean;
+      contentType: string;
+      content: string;
+    };
+    turnReminder?: {
+      content: string;
+      taskCardSha256?: string;
+      unfinishedTaskCount: number;
+      activeChildCount: number;
+      runningProcessCount: number;
+    };
+  };
 }
 
 export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed';
@@ -119,7 +146,21 @@ export interface ProviderDispatchControls {
 export interface FullRequestProviderAdapter {
   /** Identifies the frozen provider configuration this adapter serves. */
   providerId: string;
+  /** Optional exact projection hook. Production adapters use the same projected input for this and send. */
+  estimateFullRequestInput?(request: FullProviderRequest): ProjectedRequestTokenBreakdown;
   sendFullRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
+}
+
+export class ModelRequestPreflightError extends Error {
+  public constructor(
+    public readonly code: ContextPlanningFailureCode,
+    message: string,
+    public readonly estimatedTokens: number,
+    public readonly limitTokens: number
+  ) {
+    super(message);
+    this.name = 'ModelRequestPreflightError';
+  }
 }
 
 export interface ProviderDispatchOptions {
@@ -238,6 +279,7 @@ interface CreationIdentity {
   modelId: string;
   contextWindowTokens: number;
   compressionThresholdTokens: number;
+  estimatedContextTokens: number;
   settingsSnapshotContentObjectId: string | null;
   recipeIdentity: ContentObjectIdentity;
 }
@@ -303,28 +345,28 @@ export class ModelProviderControlPlane {
       parsePlainJson(await this.contentStore.read(asContentObjectMetadata(settingsRow)), 'ModelRequest settings snapshot');
     }
     const compressionRequest = isCompressionRecipe(recipe);
+    const compressionPolicy = compressionRequest ? frozenCompressionPolicy(frozen.document) : undefined;
+    if (compressionRequest && !compressionPolicy) {
+      throw new Error('Compression ModelRequest requires a frozen compression policy.');
+    }
     const frozenProviderId = compressionRequest
       ? requireText(frozen.compressionProviderId, 'Frozen compression providerId')
       : frozen.providerId;
     const frozenModelId = compressionRequest
       ? requireText(frozen.compressionModelId, 'Frozen compression modelId')
       : frozen.modelId;
-    const identity: CreationIdentity = {
+    const projectedEstimatedTokens = command.projectedEstimatedTokens === undefined
+      ? undefined
+      : requireNonNegativeSafeNumber(command.projectedEstimatedTokens, 'projectedEstimatedTokens');
+    const identityBase = {
       turnId,
       contextRootId,
       authoritySnapshotId,
       providerId: frozenProviderId,
       modelId: frozenModelId,
-      contextWindowTokens: frozen.contextWindowTokens,
-      compressionThresholdTokens: frozen.compressionThresholdTokens,
-      settingsSnapshotContentObjectId,
-      recipeIdentity
+      contextWindowTokens: compressionPolicy?.provider.contextWindowTokens ?? frozen.contextWindowTokens,
+      compressionThresholdTokens: frozen.compressionThresholdTokens
     };
-    const existing = await this.getOptional('ModelRequest', modelRequestId);
-    if (existing) {
-      return this.replayCreation(existing, modelRequestId, projectionId, operationId, attemptId, identity);
-    }
-
     const snapshot = await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').get(contextRootId)
@@ -335,7 +377,7 @@ export class ModelProviderControlPlane {
       throw new Error('ContextSequenceRoot belongs to another Conversation.');
     }
 
-    const contextEstimate = compressionRequest
+    const contextEstimate: number = projectedEstimatedTokens ?? (compressionRequest
       ? await this.tokenEstimator.estimateRootPrefix(
           contextRootId,
           compressionSourceSegmentCount(recipe)
@@ -344,7 +386,17 @@ export class ModelProviderControlPlane {
           estimate.estimatedTokens + (estimate.source === 'provider-observed-delta'
             ? 0
             : estimateRequestAuthorityTokens(frozen.document, recipe))
-        );
+        ));
+    const identity: CreationIdentity = {
+      ...identityBase,
+      estimatedContextTokens: contextEstimate,
+      settingsSnapshotContentObjectId,
+      recipeIdentity
+    };
+    const existing = await this.getOptional('ModelRequest', modelRequestId);
+    if (existing) {
+      return this.replayCreation(existing, modelRequestId, projectionId, operationId, attemptId, identity);
+    }
     const recipeContent = await this.contentStore.prepare(this.database, recipeBytes, CONTENT_TYPE_RECIPE);
     const now = this.timestamp();
     const initialStats: StreamStats = { attemptSeq: '1', socketGeneration: '0', retryReason: null };
@@ -358,7 +410,7 @@ export class ModelProviderControlPlane {
         terminal_state: null,
         provider_id: frozenProviderId,
         model_id: frozenModelId,
-        context_window_tokens: BigInt(frozen.contextWindowTokens),
+        context_window_tokens: BigInt(identity.contextWindowTokens),
         compression_threshold_tokens: BigInt(frozen.compressionThresholdTokens),
         estimated_context_tokens: BigInt(contextEstimate),
         authority_snapshot_id: authoritySnapshotId,
@@ -498,7 +550,8 @@ export class ModelProviderControlPlane {
         messageRole: segment.messageRole,
         contentType: segment.contentObject.content_type,
         content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
-      }))
+      })),
+      ...await this.materializeRequestAddenda(recipe, requireId(request.turn_id, 'ModelRequest.turn_id'))
     };
   }
 
@@ -508,6 +561,66 @@ export class ModelProviderControlPlane {
     const request = await this.requireDomain('ModelRequest', modelRequestId);
     const stats = parseStreamStats(request.stream_stats_json);
     return this.buildFullRequest(modelRequestId, stats.attemptSeq, stats.socketGeneration);
+  }
+
+  /** Builds a deterministic ordinary request preview without allocating a ModelRequest sequence. */
+  public async previewOrdinaryRequest(command: CreateModelRequestCommand): Promise<FullProviderRequest> {
+    const turnId = requireId(command.turnId, 'turnId');
+    const contextRootId = requireId(command.contextRootId, 'contextRootId');
+    const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
+    const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
+    const recipe = normalizePlainJson(command.recipe, 'ModelRequest preview recipe');
+    if (isCompressionRecipe(recipe)) throw new TypeError('Ordinary request preview cannot use a compression recipe.');
+    const [frozen, materialized] = await Promise.all([
+      readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId),
+      this.context.materialize(contextRootId)
+    ]);
+    if (requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id') !== frozen.conversationId) {
+      throw new Error('Preview Context projection belongs to another Conversation.');
+    }
+    const model = frozenModelIdentity(frozen.document);
+    return {
+      kind: 'full-model-request',
+      modelRequestId: modelRequestIdFor(turnId, idempotencyKey),
+      conversationId: frozen.conversationId,
+      attemptSeq: '1',
+      socketGeneration: '1',
+      providerId: model.providerId,
+      modelId: model.modelId,
+      authoritySnapshot: frozen.document,
+      recipe,
+      context: materialized.segments.map((segment) => ({
+        segmentId: segment.segmentId,
+        segmentKind: segment.segmentKind,
+        messageRole: segment.messageRole,
+        contentType: segment.contentObject.content_type,
+        content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
+      })),
+      ...await this.materializeRequestAddenda(recipe, turnId)
+    };
+  }
+
+  /** Planning and dispatch both invoke the adapter's exact projection hook. */
+  public budgetFullRequest(
+    fullRequest: FullProviderRequest,
+    adapter: FullRequestProviderAdapter
+  ): FullRequestBudget {
+    if (adapter.providerId !== fullRequest.providerId) {
+      throw providerConflict('Request preview adapter does not match its frozen provider.');
+    }
+    const compression = isCompressionRecipe(fullRequest.recipe)
+      ? frozenCompressionPolicy(fullRequest.authoritySnapshot)
+      : undefined;
+    const context = frozenContextProfile(fullRequest.authoritySnapshot);
+    const breakdown = adapter.estimateFullRequestInput?.(fullRequest)
+      ?? fallbackRequestBreakdown(estimateFullProviderContextFallback(fullRequest));
+    return calculateFullRequestBudget({
+      contextWindowTokens: compression?.provider.contextWindowTokens ?? context.contextWindowTokens,
+      maxOutputTokens: compression?.provider.maxOutputTokens
+        ?? frozenPrimaryMaxOutputTokens(fullRequest.authoritySnapshot),
+      compressionThresholdTokens: compression ? context.contextWindowTokens : context.compressionThresholdTokens,
+      breakdown
+    });
   }
 
   /** Reads the single fenced terminal checkpoint; callers never reconstruct results from transient deltas. */
@@ -690,6 +803,7 @@ export class ModelProviderControlPlane {
       let fullRequest: FullProviderRequest;
       try {
         fullRequest = await this.buildFullRequest(modelRequestId, attemptSeq, expectedGeneration);
+        this.assertRequestPreflight(request, fullRequest, adapter);
         retryPolicy ??= retryPolicyForFullRequest(fullRequest);
       } catch (error) {
         const applied = await this.failRequest(modelRequestId, currentIdentity, error);
@@ -1402,6 +1516,114 @@ export class ModelProviderControlPlane {
     };
   }
 
+  private assertRequestPreflight(
+    request: DomainRow,
+    fullRequest: FullProviderRequest,
+    adapter: FullRequestProviderAdapter
+  ): void {
+    const compression = isCompressionRecipe(fullRequest.recipe)
+      ? frozenCompressionPolicy(fullRequest.authoritySnapshot)
+      : undefined;
+    const context = frozenContextProfile(fullRequest.authoritySnapshot);
+    const contextWindowTokens = compression?.provider.contextWindowTokens
+      ?? requirePositiveSafeNumber(request.context_window_tokens, 'ModelRequest.context_window_tokens');
+    const maxOutputTokens = compression?.provider.maxOutputTokens
+      ?? frozenPrimaryMaxOutputTokens(fullRequest.authoritySnapshot);
+    const persistedEstimate = requireNonNegativeSafeNumber(
+      request.estimated_context_tokens,
+      'ModelRequest.estimated_context_tokens'
+    );
+    const breakdown = adapter.estimateFullRequestInput?.(fullRequest)
+      ?? fallbackRequestBreakdown(persistedEstimate);
+    const result = preflightFullRequest({
+      contextWindowTokens,
+      maxOutputTokens,
+      compressionThresholdTokens: compression ? contextWindowTokens : context.compressionThresholdTokens,
+      breakdown
+    }, compression ? 'compression_request_too_large' : 'request_still_too_large');
+    if (result.status === 'ready') return;
+    throw new ModelRequestPreflightError(
+      result.code,
+      `${result.code}: ${result.message} (estimated=${result.estimatedTokens}, limit=${result.limitTokens})`,
+      result.estimatedTokens,
+      result.limitTokens
+    );
+  }
+
+  private async materializeRequestAddenda(
+    recipe: PlainJsonValue,
+    expectedTurnId: string
+  ): Promise<Pick<FullProviderRequest, 'requestAddenda'>> {
+    if (!isRecord(recipe) || recipe.kind !== 'reliable-agent-turn') return {};
+    const currentRef = isRecord(recipe.currentTurnInput) ? recipe.currentTurnInput : undefined;
+    const hasCurrentReference = currentRef !== undefined;
+    const reinjectCurrent = currentRef?.reinject === true;
+    let currentTurnInput: NonNullable<FullProviderRequest['requestAddenda']>['currentTurnInput'];
+    if (hasCurrentReference) {
+      const messageId = requireId(currentRef.messageId, 'ModelRequest recipe.currentTurnInput.messageId');
+      const messageRevisionId = requireId(
+        currentRef.messageRevisionId,
+        'ModelRequest recipe.currentTurnInput.messageRevisionId'
+      );
+      const contentObjectId = requireId(
+        currentRef.contentObjectId,
+        'ModelRequest recipe.currentTurnInput.contentObjectId'
+      );
+      const snapshot = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('MessageRevision').get(messageRevisionId),
+        DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({
+          where: { turn_id: expectedTurnId, message_id: messageId, role: 'input' }, limit: 2
+        }),
+        DOMAIN_REPOSITORIES.domain('ContentObject').get(contentObjectId)
+      ]);
+      const revision = requireRow(snapshot.snapshot[0], `MessageRevision ${messageRevisionId}`);
+      const links = rows(snapshot.snapshot[1]);
+      const metadata = requireRow(snapshot.snapshot[2], `ContentObject ${contentObjectId}`);
+      if (
+        revision.message_id !== messageId
+        || revision.content_object_id !== contentObjectId
+        || revision.role !== 'user'
+        || links.length !== 1
+      ) {
+        throw new Error('Frozen current Turn input reference conflicts with durable Message facts.');
+      }
+      currentTurnInput = {
+        messageId,
+        messageRevisionId,
+        contentObjectId,
+        reinject: reinjectCurrent,
+        contentType: requireText(metadata.content_type, 'Current Turn input ContentObject.content_type'),
+        content: decodeUtf8Exact(
+          await this.contentStore.read(asContentObjectMetadata(metadata)),
+          `Current Turn input ${messageRevisionId}`
+        )
+      };
+    }
+    const task = isRecord(recipe.turnTaskCard) ? recipe.turnTaskCard : undefined;
+    const runtime = isRecord(recipe.runtimeStatusCard) ? recipe.runtimeStatusCard : undefined;
+    const reminderParts = [
+      typeof task?.card === 'string' && task.card.trim() ? task.card.trim() : '',
+      typeof runtime?.card === 'string' && runtime.card.trim() ? runtime.card.trim() : ''
+    ].filter(Boolean);
+    const unfinishedTaskCount = nonNegativeRecipeInteger(task?.counts, 'unfinished');
+    const activeChildCount = nonNegativeRecipeInteger(runtime, 'activeChildCount');
+    const runningProcessCount = nonNegativeRecipeInteger(runtime, 'runningProcessCount');
+    const turnReminder = reminderParts.length === 0 ? undefined : {
+      content: reminderParts.join('\n\n'),
+      ...(typeof task?.cardSha256 === 'string' && task.cardSha256.trim()
+        ? { taskCardSha256: task.cardSha256.trim() }
+        : {}),
+      unfinishedTaskCount,
+      activeChildCount,
+      runningProcessCount
+    };
+    if (!currentTurnInput && !turnReminder) return {};
+    return { requestAddenda: {
+      ...(currentTurnInput ? { currentTurnInput } : {}),
+      ...(turnReminder ? { turnReminder } : {})
+    } };
+  }
+
   private async replayCreation(
     request: DomainRow,
     modelRequestId: string,
@@ -1424,6 +1646,7 @@ export class ModelProviderControlPlane {
       && request.model_id === expected.modelId
       && request.context_window_tokens === BigInt(expected.contextWindowTokens)
       && request.compression_threshold_tokens === BigInt(expected.compressionThresholdTokens)
+      && request.estimated_context_tokens === BigInt(expected.estimatedContextTokens)
       && (request.settings_snapshot_object_id ?? null) === expected.settingsSnapshotContentObjectId
       && request.recipe_object_id === expected.recipeIdentity.id
       && projection.owner_kind === 'model_request'
@@ -1638,6 +1861,22 @@ function positiveSafeInteger(value: number, label: string): number {
   return value;
 }
 
+function requirePositiveSafeNumber(value: unknown, label: string): number {
+  const parsed = typeof value === 'bigint' ? Number(value) : value;
+  if (!Number.isSafeInteger(parsed) || (parsed as number) <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer.`);
+  }
+  return parsed as number;
+}
+
+function requireNonNegativeSafeNumber(value: unknown, label: string): number {
+  const parsed = typeof value === 'bigint' ? Number(value) : value;
+  if (!Number.isSafeInteger(parsed) || (parsed as number) < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer.`);
+  }
+  return parsed as number;
+}
+
 function createProviderTimeoutWaiter(timeoutMsInput: number): {
   promise: Promise<{ kind: 'timed_out'; error: ProviderTransientError }>;
   dispose(): void;
@@ -1675,6 +1914,12 @@ function compressionRequestSegments<T>(
   if (!Number.isSafeInteger(count) || (count as number) <= 0 || (count as number) > segments.length) {
     throw new Error('Compression recipe sourceSegmentCount is outside the frozen Context projection.');
   }
+  if (recipe.compressionMethodKind === 'openai_responses_compact') {
+    if (count !== segments.length) {
+      throw new Error('Provider-native compression must freeze the complete model-visible Context projection.');
+    }
+    return segments;
+  }
   // The finite tail is retained verbatim by ContextCompression.create and must never be sent to
   // the compact Provider as summary source, otherwise the next request duplicates that tail.
   return segments.slice(0, count as number);
@@ -1693,6 +1938,45 @@ function compressionSourceSegmentCount(recipe: PlainJsonValue): number {
     throw new RangeError('Compression recipe sourceSegmentCount must be a positive safe integer.');
   }
   return count as number;
+}
+
+function frozenPrimaryMaxOutputTokens(authority: PlainJsonValue): number {
+  const document = isRecord(authority) ? authority : undefined;
+  const model = document && isRecord(document.model) ? document.model : undefined;
+  const value = model?.maxOutputTokens;
+  return Number.isSafeInteger(value) && (value as number) > 0
+    ? value as number
+    : DEFAULT_OUTPUT_RESERVE_TOKENS;
+}
+
+function fallbackRequestBreakdown(estimatedTokens: number): ProjectedRequestTokenBreakdown {
+  return {
+    systemTokens: 0,
+    toolSchemaTokens: 0,
+    providerFramingTokens: 0,
+    contextTokens: estimatedTokens,
+    currentInputTokens: 0,
+    runtimeDeliveryTokens: 0,
+    turnReminderTokens: 0,
+    mediaTokens: 0,
+    fixedTokens: 0,
+    bodyTokens: estimatedTokens,
+    fullTokens: estimatedTokens
+  };
+}
+
+function estimateFullProviderContextFallback(request: FullProviderRequest): number {
+  return request.context.reduce((total, item) => {
+    const next = total + Math.ceil(Buffer.byteLength(item.content, 'utf8') / 4);
+    if (!Number.isSafeInteger(next)) throw new RangeError('Fallback Provider Context estimate is too large.');
+    return next;
+  }, 0);
+}
+
+function nonNegativeRecipeInteger(container: PlainJsonValue | undefined, key: string): number {
+  const record = isRecord(container) ? container : undefined;
+  const value = record?.[key];
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : 0;
 }
 
 function dispatchResult(

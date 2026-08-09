@@ -870,12 +870,10 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       return await this.autoApproveChildPlan(input, waiting) ?? waiting;
     }
     if (input.toolName === 'update_task_list') {
-      const args = requireRecord(input.arguments, 'update_task_list arguments');
-      const items = Array.isArray(args.items) ? args.items : [];
       const settled = await this.dependencies.interactions.settleTaskList({
         source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:task-list` },
         toolCallId: input.toolCallId,
-        items
+        operation: input.arguments
       });
       return this.settledResult(input.toolCallId, settled.status, settled.terminal);
     }

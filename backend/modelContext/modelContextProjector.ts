@@ -295,12 +295,10 @@ function projectCompression(
     resumeMode,
     diagnostics
   ));
-  const preserve = Math.max(0, Math.floor(purpose.preserveLatestMessages ?? 0));
-  const compressible = preserve > 0 ? eligible.slice(0, Math.max(0, eligible.length - preserve)) : eligible;
-  const closedIndex = lastClosedBoundaryIndex(indexes, compressible);
+  const closedIndex = lastClosedBoundaryIndex(indexes, eligible);
   const selectedMessages = purpose.methodKind === 'segmented_summary'
-    ? closedIndex >= 0 ? compressible.slice(0, closedIndex + 1) : []
-    : compressible;
+    ? closedIndex >= 0 ? eligible.slice(0, closedIndex + 1) : []
+    : eligible;
 
   const predecessor = !purpose.startMessageId && selectedMessages.length > 0
     ? selectCompressionPredecessor(facts, purpose, selectedMessages[selectedMessages.length - 1].seq)

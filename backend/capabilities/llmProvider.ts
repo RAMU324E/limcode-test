@@ -1,18 +1,17 @@
 import { createHash } from 'crypto';
+import { estimateTokenCount, sliceByTokens } from 'tokenx';
 import { mapWithBoundedConcurrency } from './boundedConcurrency';
 import { createProxyFetch } from './proxyFetch';
 import { createTerminalValidatedFetch } from './terminalValidatedFetch';
 import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
-import {
-  LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION,
-  resetOpenAIResponsesWebSocketSessions,
-  streamOpenAIResponsesWebSocketSession,
-  type LimCodeOpenAIResponsesStreamChunk,
-  type OpenAIResponsesFormatAdapter,
-  type OpenAIResponsesWebSocketDecision,
-  type OpenAIResponsesWebSocketPhase,
-  type OpenAIResponsesWebSocketPhaseKind,
-  type OpenAIResponsesWebSocketTimeoutPhase
+import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
+import type {
+  LimCodeOpenAIResponsesStreamChunk,
+  OpenAIResponsesFormatAdapter,
+  OpenAIResponsesWebSocketDecision,
+  OpenAIResponsesWebSocketPhase,
+  OpenAIResponsesWebSocketPhaseKind,
+  OpenAIResponsesWebSocketTimeoutPhase
 } from './openAIResponsesWebSocketSession';
 import { LlmEventType } from '../world/modules/llm/events';
 import type {
@@ -33,6 +32,9 @@ import {
   isFunctionResponsePart,
   DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT,
   DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT,
+  DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+  DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+  DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT,
   DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT,
   isInlineDataPart,
@@ -179,6 +181,20 @@ const THOUGHT_PROGRESS_INTERVAL_MS = 500;
 const OPENAI_RESPONSES_WS_RETRY_BUDGET_MS = 120_000;
 const OPENAI_RESPONSES_HTTP_COOLDOWN_MS = 60_000;
 const openAIResponsesHttpCooldowns = new Map<string, number>();
+type OpenAIResponsesWebSocketSessionModule = typeof import('./openAIResponsesWebSocketSession');
+let loadedOpenAIResponsesWebSocketSession: OpenAIResponsesWebSocketSessionModule | undefined;
+let loadingOpenAIResponsesWebSocketSession: Promise<OpenAIResponsesWebSocketSessionModule> | undefined;
+
+async function openAIResponsesWebSocketSession(): Promise<OpenAIResponsesWebSocketSessionModule> {
+  if (loadedOpenAIResponsesWebSocketSession) return loadedOpenAIResponsesWebSocketSession;
+  loadingOpenAIResponsesWebSocketSession ??= import('./openAIResponsesWebSocketSession');
+  loadedOpenAIResponsesWebSocketSession = await loadingOpenAIResponsesWebSocketSession;
+  return loadedOpenAIResponsesWebSocketSession;
+}
+
+function resetLoadedOpenAIResponsesWebSocketSessions(): void {
+  loadedOpenAIResponsesWebSocketSession?.resetOpenAIResponsesWebSocketSessions();
+}
 
 class LlmAttemptFailureError extends Error {
   public constructor(public readonly failure: LlmAttemptFailure) {
@@ -280,7 +296,7 @@ export function createLlmProviderCapability(options: LlmProviderOptions): LlmCap
       }
       controllers.clear();
       resolvedRuntimeSettingsByInvocationId.clear();
-      resetOpenAIResponsesWebSocketSessions();
+      resetLoadedOpenAIResponsesWebSocketSessions();
       openAIResponsesHttpCooldowns.clear();
     }
   };
@@ -590,6 +606,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   });
   const format = new input.unified.OpenAIResponsesFormat(input.settings.model) as OpenAIResponsesFormatAdapter;
   try {
+    const { streamOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
     yield* streamOpenAIResponsesWebSocketSession({
       sessionKey,
       url: dryRun.url,
@@ -1116,12 +1133,40 @@ export async function dryRunCompactLlmProvider(
       generatedAt
     };
   }
+  if (summaryDeltaContents(request).length === 0) {
+    return {
+      kind: 'no_provider_call',
+      methodKind: methodConfig.kind,
+      calls: [],
+      note: '没有新的摘要源；沿用并收口现有 replacement summary，不调用 Provider。',
+      generatedAt
+    };
+  }
 
   const resolved = await resolveSummaryProvider(request, methodConfig, options, { allowPlaceholderApiKey: true });
   if (!resolved.provider) throw new Error('无法构造压缩 dry-run Provider。');
-  const calls = methodConfig.kind === 'segmented_summary'
+  const calls: SummaryProviderCall[] = methodConfig.kind === 'segmented_summary'
     ? buildSegmentedSummaryProviderCalls(request, methodConfig, resolved.settings)
     : [buildSummaryProviderCall(request, methodConfig, resolved.settings)];
+  if (methodConfig.kind === 'llm_summary' && !isSummaryProviderCallWithinWindow(calls[0]!, resolved.settings)) {
+    throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
+  }
+  if (methodConfig.kind === 'segmented_summary') {
+    const priorSummaryText = request.priorSummaryContents?.length
+      ? plainTextOfContents(request.priorSummaryContents)
+      : '';
+    if ((priorSummaryText || calls.length > 1) && calls.length < MAX_SEGMENTED_SUMMARY_CALLS) {
+      const merge = buildSummaryReplacementMergeCall(
+        priorSummaryText,
+        calls.map((_call, index) => `目标\n- delta ${index + 1}\n\n重要约束、决定和准确标识\n- 无\n\n工作状态\n  - 已完成\n    - delta ${index + 1}\n  - 正在做\n    - 无\n  - 受阻\n    - 无\n\n下一步\n- 无\n\n相关文件\n- 无`),
+        summaryDeltaContents(request),
+        methodConfig,
+        resolved.settings,
+        effectiveSummaryTargetTokens(methodConfig)
+      );
+      if (isSummaryProviderCallWithinWindow(merge, resolved.settings)) calls.push(merge);
+    }
+  }
   const unified = await importUnifiedLlmProvider();
   const providerDryRun = (resolved.provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof providerDryRun !== 'function') throw new Error('当前 unified-llm-provider 版本不支持 provider.dryRun。');
@@ -1154,7 +1199,8 @@ async function dryRunOpenAIResponsesCompact(
   options: LlmProviderOptions,
   dryRunOptions: LlmDryRunOptions
 ): Promise<LlmDryRunResult> {
-  const normalizedContext = assertCanonicalProviderToolContext(request.contents);
+  const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
+  const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
   const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
   if (settings.provider !== 'openai-responses') throw new Error('OpenAI 原生压缩仅支持 openai-responses 渠道格式。');
   const apiKeyAvailable = !!settings.apiKey;
@@ -1286,6 +1332,12 @@ export async function compactLlmProvider(
     const handler = compressionMethodHandlers.get(methodConfig.kind);
     if (!handler) throw new Error(`未注册的压缩方法：${methodConfig.kind}`);
 
+    // Freeze resolved media once for the whole native compact operation. Capability retries must
+    // replay identical bytes even when the original reference was a mutable local sourcePath.
+    const handlerRequest = methodConfig.kind === 'openai_responses_compact'
+      ? { ...request, contents: await prepareNativeCompactContentsMultimodal(request.contents, options) }
+      : request;
+
     const retrySettings = await resolveCompactRetrySettings(request, methodConfig, options);
     const retryEnabled = retrySettings?.retryOnError !== false && isRetryCapableCompressionMethod(methodConfig.kind);
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
@@ -1294,7 +1346,7 @@ export async function compactLlmProvider(
 
     while (true) {
       try {
-        const result = await handler(request, methodConfig, options, signal);
+        const result = await handler(handlerRequest, methodConfig, options, signal);
         logCompressionDebug('provider.compact.done', {
           ...compactRequestDebugInfo(request),
           resultId: result.id,
@@ -1457,6 +1509,7 @@ function isRetryableCompactFailure(error: unknown, failure: LlmAttemptFailure): 
     || text.includes('未注册的压缩方法')
     || text.includes('缺少 llm api key')
     || text.includes('openai 原生压缩仅支持')
+    || text.includes('media_size_unknown')
   );
 }
 
@@ -1489,7 +1542,8 @@ async function compactWithOpenAIResponses(
   options: LlmProviderOptions,
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
-  const normalizedContext = assertCanonicalProviderToolContext(request.contents);
+  const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
+  const normalizedContext = assertCanonicalProviderToolContext(preparedContext);
   const settings = await resolveCompactProviderSettings(request, methodConfig, normalizedContext, options);
 
   if (settings.provider !== 'openai-responses') {
@@ -1577,7 +1631,10 @@ async function compactWithOpenAIResponses(
     id: compacted.id,
     object: compacted.object,
     createdAt: compacted.createdAt,
-    contents: (compacted.contents ?? []).map(fromUnifiedContent),
+    // The compact endpoint returns the canonical next context window. Keep every unified item and
+    // its top-level providerContext metadata intact; rebuilding known part variants here used to
+    // discard raw retained-message ids/status and made the supposedly opaque result lossy.
+    contents: (compacted.contents ?? []) as unknown as MessageContent[],
     usageMetadata: usageMetadataFromCompact(compacted.usageMetadata),
     settingsSnapshot: snapshotFromSettings(settings, methodConfig),
     rawResponse: compacted.rawResponse,
@@ -1622,7 +1679,7 @@ async function compactWithSummary(
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
   const summary = await generateSummaryText(request, methodConfig, options, signal);
-  const contents: MessageContent[] = [{ role: 'user', parts: [{ text: `[Context Summary]\n\n${summary.text}` }] }];
+  const contents = summaryContents(summary.text, effectiveSummaryTargetTokens(methodConfig));
   return {
     id: `summary-${request.blockId}`,
     object: 'limcode.context_summary',
@@ -1633,13 +1690,7 @@ async function compactWithSummary(
   };
 }
 
-/**
- * 分段总结拼接：按有界的连续回合组分别总结后机械拼接。
- * - 最多生成固定数量的Provider调用，并以有界并发执行；
- * - 回合组1前情=历史总结，回合组N前情=上一组的最终正式回答原文；
- * - 提取每段 <summary></summary>，无标签则回退原文；
- * - 拼接为 [过去总结逐字?] + ## 回合N，包裹成 [Context Summary]。
- */
+/** Generates bounded deltas, then replaces prior+delta state with one structured rolling summary. */
 async function compactWithSegmentedSummary(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
@@ -1647,22 +1698,56 @@ async function compactWithSegmentedSummary(
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
   const provider = await resolveSummaryProvider(request, methodConfig, options);
-
+  const targetTokens = effectiveSummaryTargetTokens(methodConfig);
   const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
-  const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, provider.settings);
-  const roundSummaries = await mapWithBoundedConcurrency(
-    calls,
-    isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
-    (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
-    signal
-  );
+  const sourceContents = summaryDeltaContents(request);
+  const deterministic = deterministicReplacementSummary(priorSummaryText, sourceContents, targetTokens);
+  let finalSummary = deterministic;
 
-  const parts: string[] = [];
-  if (priorSummaryText) parts.push(`━━━ 早前对话摘要 ━━━\n${priorSummaryText}`);
-  roundSummaries.forEach((summary, index) => parts.push(`━━━ 回合 ${index + 1} ━━━\n${summary}`));
-  const joined = parts.join('\n\n');
+  if (sourceContents.length > 0 && provider.provider) {
+    const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, provider.settings);
+    const deltaSummaries = await mapWithBoundedConcurrency(
+      calls,
+      isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
+      (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
+      signal
+    );
+    const directCandidate = deltaSummaries.length === 1
+      ? extractSummaryTag(deltaSummaries[0] ?? '')
+      : '';
+    const requiresMerge = !!priorSummaryText
+      || deltaSummaries.length !== 1
+      || !isStructuredSummaryText(directCandidate)
+      || estimateTokenCount(directCandidate) > targetTokens;
 
-  const contents: MessageContent[] = [{ role: 'user', parts: [{ text: `[Context Summary]\n\n${joined}` }] }];
+    if (!requiresMerge) {
+      finalSummary = finalizeStructuredSummary(directCandidate, deterministic, targetTokens);
+    } else if (calls.length < MAX_SEGMENTED_SUMMARY_CALLS) {
+      const mergeCall = buildSummaryReplacementMergeCall(
+        priorSummaryText,
+        deltaSummaries,
+        sourceContents,
+        methodConfig,
+        provider.settings,
+        targetTokens
+      );
+      if (isSummaryProviderCallWithinWindow(mergeCall, provider.settings)) {
+        try {
+          const merged = extractSummaryTag((await executeSummaryProviderCall(provider, mergeCall.request, signal)).trim());
+          finalSummary = finalizeStructuredSummary(merged, deterministic, targetTokens);
+        } catch (error) {
+          if (isRequestAbort(signal)) throw error;
+          if (!isContextLengthExceededError(error)) throw error;
+          logCompressionDebug('provider.compact.segmentedSummary.mergeFallback', {
+            error: errorDebugInfo(error),
+            deltaCount: deltaSummaries.length
+          });
+        }
+      }
+    }
+  }
+
+  const contents = summaryContents(finalSummary, targetTokens);
   return {
     id: `summary-${request.blockId}`,
     object: 'limcode.context_summary',
@@ -1673,13 +1758,18 @@ async function compactWithSegmentedSummary(
   };
 }
 
-/** 提取内容里的可见文本（用于逐字保留历史总结，不加 role 前缀）；剥离外层 [Context Summary] 标签避免嵌套。 */
+/** Extracts a prior summary as merge input; it is never mechanically prefixed to the replacement. */
 function plainTextOfContents(contents: MessageContent[]): string {
   const text = contents
     .flatMap((content) => content.parts.filter(isVisibleTextPart).map((part) => part.text))
     .join('\n')
     .trim();
   return text.replace(/^\[Context Summary\]\s*/, '').trim();
+}
+
+function summaryDeltaContents(request: LlmCompactRequest): MessageContent[] {
+  if (request.segments && request.segments.length > 0) return request.segments.flatMap((segment) => segment);
+  return request.contents;
 }
 
 /** 取一个回合中最后一条“正式回答”(model + 可见文本) 的可见文本，用作下一回合前情。 */
@@ -1782,6 +1872,7 @@ async function resolveSummaryProvider(
 interface SummaryProviderCall {
   label: string;
   sourceContents: MessageContent[];
+  targetTokens: number;
   request: {
     contents: Array<{ role: 'user'; parts: Array<{ text: string }> }>;
     systemInstruction: { parts: Array<{ text: string }> };
@@ -1789,25 +1880,53 @@ interface SummaryProviderCall {
   };
 }
 
+const ROLLING_SUMMARY_STRUCTURE_INSTRUCTION = [
+  '输出必须是一份替代全部旧摘要与新增记录的最新摘要，不要逐字拼接旧摘要。',
+  '删除已被新事实替代的旧决定；同一事实只保留一次。',
+  '必须严格使用以下标题，缺少内容时写“无”：',
+  '目标',
+  '重要约束、决定和准确标识',
+  '工作状态',
+  '  - 已完成',
+  '  - 正在做',
+  '  - 受阻',
+  '下一步',
+  '相关文件',
+  '必须保留准确的路径、符号名、命令、报错、URL、版本号和业务 ID。'
+].join('\n');
+
 function buildSummaryProviderCall(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
   settings: LlmProviderConfigRecord
 ): SummaryProviderCall {
   const summarySettings = methodConfig.llmSummary;
+  const targetTokens = effectiveSummaryTargetTokens(methodConfig);
   const systemPrompt = withSummaryTargetInstruction(
-    summarySettings?.systemPrompt?.trim() || DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT,
-    summarySettings?.targetTokens
+    `${summarySettings?.systemPrompt?.trim() || DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT}\n\n${ROLLING_SUMMARY_STRUCTURE_INSTRUCTION}`,
+    targetTokens
   );
   const userPrompt = summarySettings?.userPrompt?.trim() || DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT;
   const transcript = renderContentsForSummary(request.contents);
+  const priorSummary = request.priorSummaryContents?.length
+    ? plainTextOfContents(request.priorSummaryContents)
+    : '';
   return {
     label: 'Context Summary',
     sourceContents: request.contents,
+    targetTokens,
     request: {
-      contents: [{ role: 'user', parts: [{ text: `${userPrompt}\n\n${transcript}` }] }],
+      contents: [{ role: 'user', parts: [{ text: [
+        userPrompt,
+        '',
+        '【旧摘要（只作为待更新的前情，不要原样附加）】',
+        priorSummary || '无',
+        '',
+        '【新增历史】',
+        transcript || '无'
+      ].join('\n') }] }],
       systemInstruction: { parts: [{ text: systemPrompt }] },
-      generationConfig: summaryGenerationConfig(methodConfig, settings)
+      generationConfig: summaryGenerationConfig(methodConfig, settings, targetTokens)
     }
   };
 }
@@ -1817,36 +1936,131 @@ function buildSegmentedSummaryProviderCalls(
   methodConfig: LlmCompressionConfigRecord,
   settings: LlmProviderConfigRecord
 ): SummaryProviderCall[] {
-  // One Provider request per historical turn is an unbounded fan-out for long conversations.
-  // Coalesce adjacent frozen turns while preserving order and tool-pair boundaries. When the user
-  // sets a total visible-summary target, derive the call count from that target so no individual
-  // round is starved by splitting the budget across too many Provider requests.
-  const totalTargetTokens = methodConfig.llmSummary?.targetTokens;
-  const sourceSegments = request.segments && request.segments.length > 0 ? request.segments : [request.contents];
-  const maxCalls = segmentedSummaryCallLimit(totalTargetTokens);
-  const segments = coalesceSummarySegments(sourceSegments, maxCalls);
-  const targetTokensPerCall = typeof totalTargetTokens === 'number'
-    && Number.isFinite(totalTargetTokens)
-    && totalTargetTokens > 0
-    ? Math.max(128, Math.ceil(totalTargetTokens / segments.length))
-    : undefined;
+  const totalTargetTokens = effectiveSummaryTargetTokens(methodConfig);
+  const sourceSegments = (request.segments && request.segments.length > 0
+    ? request.segments
+    : request.contents.length > 0 ? [request.contents] : [])
+    .filter((segment) => segment.length > 0);
+  if (sourceSegments.length === 0) return [];
   const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
-  const priorContexts = segments.map((segment, index) => index === 0 ? priorSummaryText : finalAnswerTextOf(segments[index - 1]));
-  return segments.map((segment, index) => {
-    const transcript = renderContentsForSummary(segment);
-    const userText = `${DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT}\n\n【前情(只读，不要重新总结)】\n${priorContexts[index] || '无'}\n\n【本回合记录】\n${transcript}`;
-    return {
-      label: `Segment ${index + 1}`,
-      sourceContents: segment,
-      request: {
-        contents: [{ role: 'user', parts: [{ text: userText }] }],
-        systemInstruction: {
-          parts: [{ text: withSummaryTargetInstruction(DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT, targetTokensPerCall) }]
-        },
-        generationConfig: summaryGenerationConfig(methodConfig, settings, targetTokensPerCall)
-      }
-    };
+  const groups: MessageContent[][] = [];
+  let current: MessageContent[] = [];
+  for (const segment of sourceSegments) {
+    const candidate = [...current, ...segment];
+    const priorContext = groups.length === 0
+      ? priorSummaryText
+      : finalAnswerTextOf(groups[groups.length - 1] ?? []);
+    const candidateCall = buildSegmentDeltaCall(
+      candidate,
+      groups.length,
+      priorContext,
+      methodConfig,
+      settings,
+      totalTargetTokens
+    );
+    if (isSummaryProviderCallWithinWindow(candidateCall, settings)) {
+      current = candidate;
+      continue;
+    }
+    if (current.length === 0) {
+      throw new Error(`compression_source_too_large: segment ${groups.length + 1} cannot fit the frozen summary Provider window.`);
+    }
+    groups.push(current);
+    current = [...segment];
+    const nextPrior = finalAnswerTextOf(groups[groups.length - 1] ?? []);
+    const singleCall = buildSegmentDeltaCall(
+      current,
+      groups.length,
+      nextPrior,
+      methodConfig,
+      settings,
+      totalTargetTokens
+    );
+    if (!isSummaryProviderCallWithinWindow(singleCall, settings)) {
+      throw new Error(`compression_source_too_large: segment ${groups.length + 1} cannot fit the frozen summary Provider window.`);
+    }
+  }
+  if (current.length > 0) groups.push(current);
+  if (groups.length > MAX_SEGMENTED_DELTA_CALLS) {
+    throw new Error(`compression_source_too_large: ${groups.length} safe chunks exceed the ${MAX_SEGMENTED_DELTA_CALLS} delta-call limit.`);
+  }
+
+  const targetTokensPerCall = Math.max(128, Math.ceil(totalTargetTokens / groups.length));
+  return groups.map((group, index) => {
+    const priorContext = index === 0 ? priorSummaryText : finalAnswerTextOf(groups[index - 1] ?? []);
+    const call = buildSegmentDeltaCall(
+      group,
+      index,
+      priorContext,
+      methodConfig,
+      settings,
+      targetTokensPerCall
+    );
+    if (!isSummaryProviderCallWithinWindow(call, settings)) {
+      throw new Error(`compression_request_too_large: summary chunk ${index + 1} exceeds the frozen Provider input limit.`);
+    }
+    return call;
   });
+}
+
+function buildSegmentDeltaCall(
+  segment: MessageContent[],
+  index: number,
+  priorContext: string,
+  methodConfig: LlmCompressionConfigRecord,
+  settings: LlmProviderConfigRecord,
+  targetTokens: number
+): SummaryProviderCall {
+  const boundedPrior = headTailTextByTokens(
+    priorContext,
+    Math.min(SEGMENTED_PRIOR_CONTEXT_TOKENS, targetTokens)
+  );
+  const transcript = renderContentsForSummary(segment);
+  const userText = `${DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT}\n\n【前情(只读，不要重新总结)】\n${boundedPrior || '无'}\n\n【本回合记录】\n${transcript}`;
+  return {
+    label: `Segment ${index + 1}`,
+    sourceContents: segment,
+    targetTokens,
+    request: {
+      contents: [{ role: 'user', parts: [{ text: userText }] }],
+      systemInstruction: {
+        parts: [{ text: withSummaryTargetInstruction(
+          `${DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT}\n\n${ROLLING_SUMMARY_STRUCTURE_INSTRUCTION}`,
+          targetTokens
+        ) }]
+      },
+      generationConfig: summaryGenerationConfig(methodConfig, settings, targetTokens)
+    }
+  };
+}
+
+function buildSummaryReplacementMergeCall(
+  priorSummaryText: string,
+  deltaSummaries: readonly string[],
+  sourceContents: MessageContent[],
+  methodConfig: LlmCompressionConfigRecord,
+  settings: LlmProviderConfigRecord,
+  targetTokens: number
+): SummaryProviderCall {
+  return {
+    label: 'Summary replacement merge',
+    sourceContents,
+    targetTokens,
+    request: {
+      contents: [{ role: 'user', parts: [{ text: [
+        '【旧摘要】',
+        priorSummaryText || '无',
+        '',
+        '【新增分段摘要】',
+        ...deltaSummaries.map((summary, index) => `--- delta ${index + 1} ---\n${extractSummaryTag(summary) || '无'}`)
+      ].join('\n') }] }],
+      systemInstruction: { parts: [{ text: withSummaryTargetInstruction(
+        `把旧摘要与全部 delta 合并为一份新的 replacement summary。\n\n${ROLLING_SUMMARY_STRUCTURE_INSTRUCTION}`,
+        targetTokens
+      ) }] },
+      generationConfig: summaryGenerationConfig(methodConfig, settings, targetTokens)
+    }
+  };
 }
 
 function withSummaryTargetInstruction(prompt: string, targetTokens: number | undefined): string {
@@ -1855,30 +2069,12 @@ function withSummaryTargetInstruction(prompt: string, targetTokens: number | und
 }
 
 const MAX_SEGMENTED_SUMMARY_CALLS = 16;
+const MAX_SEGMENTED_DELTA_CALLS = MAX_SEGMENTED_SUMMARY_CALLS - 1;
 const SEGMENTED_SUMMARY_CONCURRENCY = 3;
-const MIN_SEGMENTED_VISIBLE_TARGET_TOKENS_PER_CALL = 512;
+const SEGMENTED_PRIOR_CONTEXT_TOKENS = 1_024;
 const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 2_048;
-const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 4;
-
-function segmentedSummaryCallLimit(totalTargetTokens: number | undefined): number {
-  if (typeof totalTargetTokens !== 'number' || !Number.isFinite(totalTargetTokens) || totalTargetTokens <= 0) {
-    return MAX_SEGMENTED_SUMMARY_CALLS;
-  }
-  return Math.max(
-    1,
-    Math.min(MAX_SEGMENTED_SUMMARY_CALLS, Math.floor(totalTargetTokens / MIN_SEGMENTED_VISIBLE_TARGET_TOKENS_PER_CALL))
-  );
-}
-
-function coalesceSummarySegments(segments: readonly MessageContent[][], maxCalls: number): MessageContent[][] {
-  if (segments.length <= maxCalls) return segments.map((segment) => [...segment]);
-  const groupSize = Math.ceil(segments.length / maxCalls);
-  const grouped: MessageContent[][] = [];
-  for (let index = 0; index < segments.length; index += groupSize) {
-    grouped.push(segments.slice(index, index + groupSize).flatMap((segment) => segment));
-  }
-  return grouped;
-}
+const SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER = 2;
+const SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS = 8_000;
 
 /**
  * `targetTokens` is the desired visible summary length, while Provider output accounting also
@@ -1909,7 +2105,10 @@ function summaryGenerationConfig(
     && targetTokens > 0
     ? Math.max(
         SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS,
-        Math.ceil(targetTokens * SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER)
+        Math.min(
+          DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+          Math.ceil(targetTokens * SUMMARY_PROVIDER_REASONING_HEADROOM_MULTIPLIER)
+        )
       )
     : inheritedMaxOutputTokens;
   const generationConfig = {
@@ -1931,12 +2130,12 @@ async function summarizeSingleRound(
   call: SummaryProviderCall,
   signal?: AbortSignal
 ): Promise<string> {
-  const fallback = () => deterministicSummary(call.sourceContents);
-  if (!resolved.provider) return fallback();
+  const fallback = deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
+  if (!resolved.provider) return fallback;
 
   try {
     const trimmed = (await executeSummaryProviderCall(resolved, call.request, signal)).trim();
-    return trimmed ? extractSummaryTag(trimmed) : fallback();
+    return finalizeStructuredSummary(extractSummaryTag(trimmed), fallback, call.targetTokens);
   } catch (error) {
     if (isRequestAbort(signal)) throw error;
     const contextLength = isContextLengthExceededError(error);
@@ -1946,7 +2145,7 @@ async function summarizeSingleRound(
       contextLength
     });
     if (!contextLength) throw error;
-    return fallback();
+    return fallback;
   }
 }
 
@@ -2008,7 +2207,7 @@ async function executeSummaryProviderCall(
     }
     if (hasMaxOutputTokens(initialRequest) && isMaxOutputTokensIncompleteError(error)) {
       const previousMaxOutputTokens = initialRequest.generationConfig!.maxOutputTokens!;
-      const nextMaxOutputTokens = Math.min(131_072, Math.max(
+      const nextMaxOutputTokens = Math.min(DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, Math.max(
         previousMaxOutputTokens + SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS,
         previousMaxOutputTokens * 2
       ));
@@ -2041,6 +2240,7 @@ async function* createSummaryWebSocketStream(
     stream: true
   });
   const format = new resolved.unified.OpenAIResponsesFormat(resolved.settings.model) as OpenAIResponsesFormatAdapter;
+  const { streamOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
   yield* streamOpenAIResponsesWebSocketSession({
     sessionKey: resolved.webSocketSessionKey,
     url: dryRun.url,
@@ -2103,16 +2303,29 @@ async function generateSummaryText(
   options: LlmProviderOptions,
   signal?: AbortSignal
 ): Promise<GeneratedSummaryTextResult> {
+  const targetTokens = effectiveSummaryTargetTokens(methodConfig);
+  const priorSummaryText = request.priorSummaryContents?.length
+    ? plainTextOfContents(request.priorSummaryContents)
+    : '';
+  const fallback = deterministicReplacementSummary(priorSummaryText, request.contents, targetTokens);
   if (methodConfig.kind === 'deterministic_summary' || methodConfig.kind === 'manual_summary') {
-    return { text: deterministicSummary(request.contents) };
+    return { text: fallback };
   }
 
-  const resolved = await resolveSummaryProvider(request, methodConfig, options);
-  if (!resolved.provider) return { text: deterministicSummary(request.contents), settings: resolved.settings };
+  if (request.contents.length === 0) return { text: fallback };
 
-  const summaryRequest = buildSummaryProviderCall(request, methodConfig, resolved.settings).request;
-  const text = (await executeSummaryProviderCall(resolved, summaryRequest, signal)).trim();
-  return { text: text || deterministicSummary(request.contents), settings: resolved.settings };
+  const resolved = await resolveSummaryProvider(request, methodConfig, options);
+  if (!resolved.provider) return { text: fallback, settings: resolved.settings };
+
+  const call = buildSummaryProviderCall(request, methodConfig, resolved.settings);
+  if (!isSummaryProviderCallWithinWindow(call, resolved.settings)) {
+    throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
+  }
+  const text = extractSummaryTag((await executeSummaryProviderCall(resolved, call.request, signal)).trim());
+  return {
+    text: finalizeStructuredSummary(text, fallback, targetTokens),
+    settings: resolved.settings
+  };
 }
 
 function normalizeCompressionConfig(input: LlmCompressionConfigRecord | undefined, fallbackKind?: LlmCompressionConfigRecord['kind']): LlmCompressionConfigRecord {
@@ -2122,61 +2335,12 @@ function normalizeCompressionConfig(input: LlmCompressionConfigRecord | undefine
     id: input?.id ?? 'inline-compression-config',
     name: input?.name ?? '临时压缩方法',
     kind,
-    trigger: input?.trigger ?? { mode: 'manual', preserveLatestMessages: 8 },
+    trigger: input?.trigger ?? { mode: 'manual' },
     ...(input?.openaiResponsesCompact ? { openaiResponsesCompact: input.openaiResponsesCompact } : {}),
     ...(input?.llmSummary ? { llmSummary: input.llmSummary } : {}),
     createdAt: input?.createdAt ?? now,
     updatedAt: input?.updatedAt ?? now
   };
-}
-
-function fromUnifiedContent(content: UnifiedContent): MessageContent {
-  return {
-    role: content.role === 'model' ? 'model' : 'user',
-    parts: (content.parts ?? []).map(fromUnifiedPart).filter((part): part is ContentPart => part !== undefined)
-  };
-}
-
-function fromUnifiedPart(part: UnifiedPart): ContentPart | undefined {
-  const record = part as Record<string, unknown>;
-  if (isRecord(record.providerContext)) return { providerContext: record.providerContext as never };
-  const thoughtSignature = thoughtSignatureFromPart(part);
-  const call = record.functionCall;
-  if (isRecord(call) && typeof call.name === 'string') {
-    return {
-      id: typeof call.callId === 'string' ? call.callId : undefined,
-      functionCall: { name: call.name, args: call.args ?? {} },
-      ...(thoughtSignature ? { thoughtSignature } : {})
-    };
-  }
-  if (typeof record.text === 'string' || typeof record.thought === 'boolean' || thoughtSignature) {
-    return {
-      text: typeof record.text === 'string' ? record.text : '',
-      ...(typeof record.thought === 'boolean' ? { thought: record.thought } : thoughtSignature && typeof record.text !== 'string' ? { thought: true } : {}),
-      ...(thoughtSignature ? { thoughtSignature } : {}),
-      ...(typeof record.thoughtElapsedMs === 'number' ? { thoughtElapsedMs: record.thoughtElapsedMs } : {}),
-      ...(typeof record.thoughtDurationMs === 'number' ? { thoughtDurationMs: record.thoughtDurationMs } : {})
-    };
-  }
-  const response = record.functionResponse;
-  if (isRecord(response) && typeof response.name === 'string') {
-    const parts = Array.isArray(response.parts)
-      ? response.parts.map(fromUnifiedPart).filter((part): part is InlineDataPart => !!part && isInlineDataPart(part))
-      : [];
-    return {
-      id: typeof response.callId === 'string' ? response.callId : undefined,
-      functionResponse: {
-        name: response.name,
-        response: response.response ?? {},
-        ...(parts.length > 0 ? { parts } : {})
-      }
-    };
-  }
-  const inlineData = record.inlineData;
-  if (isRecord(inlineData) && typeof inlineData.mimeType === 'string' && typeof inlineData.data === 'string') {
-    return { inlineData: { mimeType: inlineData.mimeType, data: inlineData.data, ...(typeof inlineData.name === 'string' ? { name: inlineData.name } : {}) } };
-  }
-  return undefined;
 }
 
 function usageMetadataFromCompact(value: unknown): LlmUsageMetadataRecord | undefined {
@@ -2198,11 +2362,326 @@ function renderSummaryPart(part: ContentPart): string {
   return '';
 }
 
-function deterministicSummary(contents: MessageContent[]): string {
-  const rendered = renderContentsForSummary(contents).trim();
-  if (!rendered) return '暂无可压缩的上下文。';
-  const limit = 12_000;
-  return rendered.length > limit ? `${rendered.slice(0, limit)}\n\n[已截断]` : rendered;
+type StructuredSummaryField = 'goals' | 'constraints' | 'completed' | 'active' | 'blocked' | 'next' | 'files';
+
+interface StructuredSummary {
+  goals: string[];
+  constraints: string[];
+  completed: string[];
+  active: string[];
+  blocked: string[];
+  next: string[];
+  files: string[];
+}
+
+function emptyStructuredSummary(): StructuredSummary {
+  return { goals: [], constraints: [], completed: [], active: [], blocked: [], next: [], files: [] };
+}
+
+function effectiveSummaryTargetTokens(methodConfig: LlmCompressionConfigRecord): number {
+  const configured = methodConfig.llmSummary?.targetTokens;
+  if (typeof configured !== 'number' || !Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS;
+  }
+  return Math.max(1, Math.min(DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS, Math.floor(configured)));
+}
+
+function deterministicReplacementSummary(
+  priorSummaryText: string,
+  contents: MessageContent[],
+  targetTokens: number
+): string {
+  const prior = parseStructuredSummary(priorSummaryText)
+    ?? structuredSummaryFromLooseText(priorSummaryText, 'active');
+  const delta = structuredSummaryFromContents(contents);
+  return fitStructuredSummary(mergeStructuredSummaries(prior, delta), targetTokens);
+}
+
+function structuredSummaryFromContents(contents: MessageContent[]): StructuredSummary {
+  const summary = emptyStructuredSummary();
+  for (const content of contents) {
+    for (const part of content.parts) {
+      const rendered = renderSummaryPart(part).trim();
+      if (!rendered) continue;
+      const facts = splitSummaryFacts(rendered);
+      const textField: StructuredSummaryField = content.role === 'user' ? 'goals' : 'completed';
+      for (const fact of facts) {
+        appendSummaryFact(summary, textField, fact);
+        if (looksLikeConstraint(fact)) appendSummaryFact(summary, 'constraints', fact);
+        if (looksBlocked(fact)) appendSummaryFact(summary, 'blocked', fact);
+        if (looksLikeNextStep(fact)) appendSummaryFact(summary, 'next', fact);
+        for (const file of extractFileReferences(fact)) appendSummaryFact(summary, 'files', file);
+      }
+    }
+  }
+  if (contents.length > 0 && summary.active.length === 0) {
+    const latest = [...contents].reverse().find((content) => content.role === 'model');
+    const latestText = latest?.parts.map(renderSummaryPart).filter(Boolean).join('\n').trim();
+    if (latestText) appendSummaryFact(summary, 'active', `最近状态：${headTailTextByTokens(latestText, 256)}`);
+  }
+  return summary;
+}
+
+function structuredSummaryFromLooseText(text: string, fallbackField: StructuredSummaryField): StructuredSummary {
+  const summary = emptyStructuredSummary();
+  for (const fact of splitSummaryFacts(stripSummaryEnvelope(text))) {
+    let field = fallbackField;
+    if (looksLikeConstraint(fact)) field = 'constraints';
+    else if (looksBlocked(fact)) field = 'blocked';
+    else if (looksLikeNextStep(fact)) field = 'next';
+    appendSummaryFact(summary, field, fact);
+    for (const file of extractFileReferences(fact)) appendSummaryFact(summary, 'files', file);
+  }
+  return summary;
+}
+
+function parseStructuredSummary(text: string): StructuredSummary | undefined {
+  const source = stripSummaryEnvelope(text);
+  if (!isStructuredSummaryText(source)) return undefined;
+  const summary = emptyStructuredSummary();
+  let field: StructuredSummaryField | undefined;
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = rawLine.trim().replace(/^#{1,6}\s*/, '');
+    if (!line) continue;
+    const heading = summaryHeading(line);
+    if (heading) {
+      field = heading.field;
+      if (heading.rest && heading.rest !== '无') appendSummaryFact(summary, field, heading.rest);
+      continue;
+    }
+    if (line === '工作状态' || line === '工作状态：') {
+      field = undefined;
+      continue;
+    }
+    if (!field) continue;
+    const fact = line.replace(/^[-*•]\s*/, '').trim();
+    if (fact && fact !== '无') appendSummaryFact(summary, field, fact);
+  }
+  return summary;
+}
+
+function summaryHeading(line: string): { field: StructuredSummaryField; rest: string } | undefined {
+  const normalized = line.replace(/[：:]\s*/, ':');
+  const headings: Array<[string, StructuredSummaryField]> = [
+    ['重要约束、决定和准确标识', 'constraints'],
+    ['重要约束、决定和标识', 'constraints'],
+    ['- 已完成', 'completed'],
+    ['已完成', 'completed'],
+    ['- 正在做', 'active'],
+    ['正在做', 'active'],
+    ['- 受阻', 'blocked'],
+    ['受阻', 'blocked'],
+    ['下一步', 'next'],
+    ['相关文件', 'files'],
+    ['目标', 'goals']
+  ];
+  for (const [heading, field] of headings) {
+    if (normalized === heading || normalized === `${heading}:`) return { field, rest: '' };
+    if (normalized.startsWith(`${heading}:`)) return { field, rest: normalized.slice(heading.length + 1).trim() };
+  }
+  return undefined;
+}
+
+function isStructuredSummaryText(text: string): boolean {
+  const source = stripSummaryEnvelope(text);
+  return ['目标', '重要约束、决定', '工作状态', '已完成', '正在做', '受阻', '下一步', '相关文件']
+    .every((heading) => source.includes(heading));
+}
+
+function finalizeStructuredSummary(candidate: string, fallback: string, targetTokens: number): string {
+  const parsed = parseStructuredSummary(candidate);
+  if (!parsed) return fitTextToTokenLimit(fallback, targetTokens);
+  return fitStructuredSummary(parsed, targetTokens);
+}
+
+function mergeStructuredSummaries(prior: StructuredSummary, delta: StructuredSummary): StructuredSummary {
+  const merged = emptyStructuredSummary();
+  for (const field of Object.keys(merged) as StructuredSummaryField[]) {
+    merged[field] = replacementMergeFacts(prior[field], delta[field]);
+  }
+  return merged;
+}
+
+function replacementMergeFacts(prior: readonly string[], delta: readonly string[]): string[] {
+  const facts = new Map<string, string>();
+  for (const fact of [...prior, ...delta]) {
+    const normalized = normalizeSummaryFact(fact);
+    if (!normalized || normalized === '无') continue;
+    const key = summaryReplacementKey(normalized);
+    facts.delete(key);
+    facts.set(key, normalized);
+  }
+  return [...facts.values()].slice(-80);
+}
+
+function summaryReplacementKey(fact: string): string {
+  const keyValue = /^(.{1,96}?)[：:=]\s*/.exec(fact)?.[1]
+    ?.trim()
+    .replace(/^(?:必须|不得|不要|只能|需要|require|must|never|only)\s*/i, '')
+    .toLowerCase();
+  if (keyValue) return `key:${keyValue}`;
+  const file = extractFileReferences(fact)[0];
+  if (file && fact.length < 180) return `file:${file.toLowerCase()}`;
+  return `fact:${fact.toLowerCase()}`;
+}
+
+function appendSummaryFact(summary: StructuredSummary, field: StructuredSummaryField, fact: string): void {
+  const normalized = normalizeSummaryFact(fact);
+  if (!normalized || normalized === '无') return;
+  summary[field] = replacementMergeFacts(summary[field], [headTailTextByTokens(normalized, 512)]);
+}
+
+function normalizeSummaryFact(value: string): string {
+  return value.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').replace(/\s+/g, ' ').trim();
+}
+
+function splitSummaryFacts(text: string): string[] {
+  const lines = text.split(/\r?\n+/).map(normalizeSummaryFact).filter(Boolean);
+  if (lines.length > 1) return lines;
+  return text.split(/(?<=[。！？.!?])\s+/).map(normalizeSummaryFact).filter(Boolean);
+}
+
+function looksLikeConstraint(text: string): boolean {
+  return /(?:必须|不得|不要|只能|需要|限制|约束|require|must|never|only)/i.test(text);
+}
+
+function looksBlocked(text: string): boolean {
+  return /(?:受阻|失败|错误|报错|无法|缺少|blocked|failed|error|cannot|missing)/i.test(text);
+}
+
+function looksLikeNextStep(text: string): boolean {
+  return /(?:下一步|待办|随后|接下来|尚未|todo|next|remaining)/i.test(text);
+}
+
+function extractFileReferences(text: string): string[] {
+  const matches = text.match(/(?:[A-Za-z]:\\[^\s"'`]+|\/(?:[^\s"'`]+\/)*[^\s"'`]+|(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9_-]+)/g) ?? [];
+  return [...new Set(matches.map((entry) => entry.replace(/[),.;，。；]+$/, '')))];
+}
+
+function formatStructuredSummary(summary: StructuredSummary): string {
+  const list = (facts: readonly string[]) => facts.length > 0
+    ? facts.map((fact) => `- ${fact}`).join('\n')
+    : '- 无';
+  return [
+    '目标',
+    list(summary.goals),
+    '',
+    '重要约束、决定和准确标识',
+    list(summary.constraints),
+    '',
+    '工作状态',
+    '  - 已完成',
+    indentSummaryFacts(summary.completed),
+    '  - 正在做',
+    indentSummaryFacts(summary.active),
+    '  - 受阻',
+    indentSummaryFacts(summary.blocked),
+    '',
+    '下一步',
+    list(summary.next),
+    '',
+    '相关文件',
+    list(summary.files)
+  ].join('\n');
+}
+
+function indentSummaryFacts(facts: readonly string[]): string {
+  return facts.length > 0
+    ? facts.map((fact) => `    - ${fact}`).join('\n')
+    : '    - 无';
+}
+
+function fitStructuredSummary(input: StructuredSummary, targetTokens: number): string {
+  const summary = Object.fromEntries((Object.keys(input) as StructuredSummaryField[]).map((field) => [
+    field,
+    replacementMergeFacts([], input[field])
+  ])) as unknown as StructuredSummary;
+  let rendered = formatStructuredSummary(summary);
+  if (estimateTokenCount(rendered) <= targetTokens) return rendered;
+
+  const dropOrder: StructuredSummaryField[] = ['completed', 'files', 'goals', 'constraints', 'next', 'blocked', 'active'];
+  let changed = true;
+  while (estimateTokenCount(rendered) > targetTokens && changed) {
+    changed = false;
+    for (const field of dropOrder) {
+      if (summary[field].length <= 1) continue;
+      summary[field].shift();
+      changed = true;
+      rendered = formatStructuredSummary(summary);
+      if (estimateTokenCount(rendered) <= targetTokens) return rendered;
+    }
+  }
+
+  for (const perFactLimit of [256, 128, 64, 32, 16, 8]) {
+    for (const field of Object.keys(summary) as StructuredSummaryField[]) {
+      summary[field] = summary[field].map((fact) => headTailTextByTokens(fact, perFactLimit));
+    }
+    rendered = formatStructuredSummary(summary);
+    if (estimateTokenCount(rendered) <= targetTokens) return rendered;
+  }
+  return fitTextToTokenLimit(rendered, targetTokens);
+}
+
+function summaryContents(summary: string, targetTokens: number): MessageContent[] {
+  const prefix = '[Context Summary]\n\n';
+  const prefixTokens = estimateTokenCount(prefix);
+  const bodyBudget = Math.max(1, targetTokens - prefixTokens);
+  const structured = parseStructuredSummary(summary);
+  const boundedBody = structured
+    ? fitStructuredSummary(structured, bodyBudget)
+    : fitTextToTokenLimit(summary, bodyBudget);
+  const text = targetTokens > prefixTokens
+    ? `${prefix}${boundedBody}`
+    : fitTextToTokenLimit(boundedBody, targetTokens);
+  return [{ role: 'user', parts: [{ text: fitTextToTokenLimit(text, targetTokens) }] }];
+}
+
+function stripSummaryEnvelope(text: string): string {
+  return extractSummaryTag(text.replace(/^\s*\[Context Summary\]\s*/i, '')).trim();
+}
+
+function headTailTextByTokens(text: string, limit: number): string {
+  const normalizedLimit = Math.max(1, Math.floor(limit));
+  if (estimateTokenCount(text) <= normalizedLimit) return text;
+  const marker = ' … [缩短] … ';
+  const markerTokens = estimateTokenCount(marker);
+  if (normalizedLimit <= markerTokens + 1) return fitTextToTokenLimit(text, normalizedLimit);
+  const available = normalizedLimit - markerTokens;
+  const headTokens = Math.max(1, Math.floor(available * 0.6));
+  const tailTokens = Math.max(1, available - headTokens);
+  return fitTextToTokenLimit(
+    `${sliceByTokens(text, 0, headTokens)}${marker}${sliceByTokens(text, -tailTokens)}`,
+    normalizedLimit
+  );
+}
+
+function fitTextToTokenLimit(text: string, limit: number): string {
+  const normalizedLimit = Math.max(1, Math.floor(limit));
+  if (estimateTokenCount(text) <= normalizedLimit) return text;
+  let end = normalizedLimit;
+  let sliced = sliceByTokens(text, 0, end);
+  while (end > 0 && estimateTokenCount(sliced) > normalizedLimit) {
+    end -= 1;
+    sliced = sliceByTokens(text, 0, end);
+  }
+  return sliced;
+}
+
+function isSummaryProviderCallWithinWindow(
+  call: SummaryProviderCall,
+  settings: LlmProviderConfigRecord
+): boolean {
+  const contextWindowTokens = settings.contextWindowTokens ?? DEFAULT_LLM_CONTEXT_WINDOW_TOKENS;
+  const outputTokens = call.request.generationConfig?.maxOutputTokens
+    ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
+  const inputLimit = contextWindowTokens
+    - Math.max(DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, outputTokens)
+    - SUMMARY_PROVIDER_ESTIMATOR_SLACK_TOKENS;
+  if (inputLimit <= 0) return false;
+  return estimateTokenCount(JSON.stringify({
+    contents: call.request.contents,
+    systemInstruction: call.request.systemInstruction
+  })) <= inputLimit;
 }
 
 function modelCatalogEntryToRecord(model: UnifiedModelCatalogEntry): LlmProviderModelRecord {
@@ -2571,6 +3050,14 @@ async function prepareLlmStartRequestMultimodal(request: LlmStartRequest, option
   };
 }
 
+async function prepareNativeCompactContentsMultimodal(
+  contents: MessageContent[],
+  options: LlmProviderOptions
+): Promise<MessageContent[]> {
+  return Promise.all(contents.map((content) =>
+    prepareLlmContentMultimodal(content, options, false, 'native_compact')));
+}
+
 function assertCanonicalProviderToolContext(contents: MessageContent[]): MessageContent[] {
   const normalized = normalizeToolCallResponseContext(contents);
   if (normalized.orphanResponseCount > 0 || normalized.fallbackResponseCount > 0) {
@@ -2698,15 +3185,29 @@ function normalizeToolCallId(value: string | undefined): string | undefined {
   return trimmed || undefined;
 }
 
-async function prepareLlmContentMultimodal(content: MessageContent, options: LlmProviderOptions, toolResponse: boolean): Promise<MessageContent> {
-  const parts = await Promise.all(content.parts.map((part) => prepareLlmPartMultimodal(part, options, toolResponse)));
+type MultimodalPreparationMode = 'ordinary' | 'native_compact';
+
+async function prepareLlmContentMultimodal(
+  content: MessageContent,
+  options: LlmProviderOptions,
+  toolResponse: boolean,
+  mode: MultimodalPreparationMode = 'ordinary'
+): Promise<MessageContent> {
+  const parts = await Promise.all(content.parts.map((part) =>
+    prepareLlmPartMultimodal(part, options, toolResponse, mode)));
   return { ...content, parts: parts.flat() };
 }
 
-async function prepareLlmPartMultimodal(part: ContentPart, options: LlmProviderOptions, toolResponse: boolean): Promise<ContentPart[]> {
-  if (isInlineDataPart(part)) return [await prepareInlineDataForLlm(part, options, toolResponse)];
+async function prepareLlmPartMultimodal(
+  part: ContentPart,
+  options: LlmProviderOptions,
+  toolResponse: boolean,
+  mode: MultimodalPreparationMode
+): Promise<ContentPart[]> {
+  if (isInlineDataPart(part)) return [await prepareInlineDataForLlm(part, options, toolResponse, mode)];
   if (isFunctionResponsePart(part) && part.functionResponse.parts?.length) {
-    const prepared = await Promise.all(part.functionResponse.parts.map((inlinePart) => prepareInlineDataForLlm(inlinePart, options, true)));
+    const prepared = await Promise.all(part.functionResponse.parts.map((inlinePart) =>
+      prepareInlineDataForLlm(inlinePart, options, true, mode)));
     const inlineParts = prepared.filter(isInlineDataPart).filter((inlinePart) => isSupportedToolResponseInlineData(inlinePart));
     const placeholders = prepared.filter(isTextPart).map((textPart) => textPart.text).filter(Boolean);
     return [{
@@ -2721,19 +3222,85 @@ async function prepareLlmPartMultimodal(part: ContentPart, options: LlmProviderO
   return [part];
 }
 
-async function prepareInlineDataForLlm(part: InlineDataPart, options: LlmProviderOptions, toolResponse: boolean): Promise<ContentPart> {
-  if (toolResponse && !isSupportedToolResponseInlineData(part)) return attachmentPlaceholderPart(part, '附件类型不在工具响应白名单中');
-  if (part.inlineData.data) return part;
-  const resolved = options.resolveAttachment
-    ? await options.resolveAttachment({
-      attachmentId: part.inlineData.attachmentId,
-      sourcePath: part.inlineData.sourcePath,
-      mimeType: part.inlineData.mimeType,
-      name: part.inlineData.name
-    })
-    : undefined;
-  if (resolved?.inlineData.data) return resolved;
+async function prepareInlineDataForLlm(
+  part: InlineDataPart,
+  options: LlmProviderOptions,
+  toolResponse: boolean,
+  mode: MultimodalPreparationMode
+): Promise<ContentPart> {
+  if (mode === 'ordinary' && toolResponse && !isSupportedToolResponseInlineData(part)) {
+    return attachmentPlaceholderPart(part, '附件类型不在工具响应白名单中');
+  }
+  if (part.inlineData.data) {
+    if (mode === 'native_compact') requireCanonicalInlineDataSize(part, 'Native Compact media');
+    return toolResponse && !isSupportedToolResponseInlineData(part)
+      ? attachmentPlaceholderPart(part, '附件类型不在工具响应白名单中')
+      : part;
+  }
+
+  let resolved: InlineDataPart | undefined;
+  try {
+    resolved = options.resolveAttachment
+      ? await options.resolveAttachment({
+        attachmentId: part.inlineData.attachmentId,
+        sourcePath: part.inlineData.sourcePath,
+        mimeType: part.inlineData.mimeType,
+        name: part.inlineData.name
+      })
+      : undefined;
+  } catch (error) {
+    if (mode === 'native_compact') {
+      throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), errorSearchText(error));
+    }
+    resolved = undefined;
+  }
+  if (resolved?.inlineData.data) {
+    if (mode === 'native_compact') requireCanonicalInlineDataSize(resolved, 'Resolved Native Compact media');
+    return toolResponse && !isSupportedToolResponseInlineData(resolved)
+      ? attachmentPlaceholderPart(resolved, '附件类型不在工具响应白名单中')
+      : resolved;
+  }
+  if (mode === 'native_compact') {
+    throw new LlmNativeCompactMediaError(
+      mediaReferenceLabel(part),
+      resolved?.inlineData.error ?? (options.resolveAttachment ? 'attachment resolver returned no bytes' : 'attachment resolver is unavailable')
+    );
+  }
   return attachmentPlaceholderPart(part, resolved?.inlineData.error ?? '附件读取失败');
+}
+
+export class LlmNativeCompactMediaError extends Error {
+  public readonly code = 'media_size_unknown';
+
+  public constructor(reference: string, reason: string) {
+    super(`media_size_unknown: Native Compact cannot resolve exact media bytes for ${reference}: ${reason}`);
+    this.name = 'LlmNativeCompactMediaError';
+  }
+}
+
+function requireCanonicalInlineDataSize(part: InlineDataPart, label: string): number {
+  const data = part.inlineData.data;
+  if (!data || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) {
+    throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), `${label} is not canonical base64`);
+  }
+  const bytes = Buffer.from(data, 'base64');
+  if (bytes.toString('base64') !== data) {
+    throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), `${label} is not canonical base64`);
+  }
+  if (part.inlineData.sizeBytes !== undefined && part.inlineData.sizeBytes !== bytes.byteLength) {
+    throw new LlmNativeCompactMediaError(
+      mediaReferenceLabel(part),
+      `${label} declared ${part.inlineData.sizeBytes} bytes but resolved ${bytes.byteLength}`
+    );
+  }
+  return bytes.byteLength;
+}
+
+function mediaReferenceLabel(part: InlineDataPart): string {
+  return part.inlineData.attachmentId
+    ?? part.inlineData.sourcePath
+    ?? part.inlineData.name
+    ?? part.inlineData.mimeType;
 }
 
 function isSupportedToolResponseInlineData(part: InlineDataPart): boolean {
@@ -2766,10 +3333,12 @@ function toUnifiedRequest(request: LlmStartRequest, generationConfig?: LlmGenera
 }
 
 function toUnifiedContent(content: MessageContent): UnifiedContent {
+  const providerContext = (content as MessageContent & { providerContext?: unknown }).providerContext;
   return {
     role: content.role === 'model' ? 'model' : 'user',
-    parts: content.parts.map(toUnifiedPart)
-  };
+    parts: content.parts.map(toUnifiedPart),
+    ...(providerContext ? { providerContext } : {})
+  } as UnifiedContent;
 }
 
 function toUnifiedPart(part: ContentPart): UnifiedPart {

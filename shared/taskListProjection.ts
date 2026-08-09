@@ -162,14 +162,46 @@ export function taskListOperationFromToolCall(
   }
 
   if (toolCall.name === SUBMIT_PLAN_TOOL_NAME) {
-    return taskListOperationFromSubmitPlanToolCall(toolCall);
+    // A ToolCallRecord alone cannot prove the Plan was approved. Reliable projections seed an
+    // approved Plan from its durable result artifact; guessing from arguments would also activate
+    // change_requested/rejected/cancelled proposals.
+    return undefined;
   }
 
   return undefined;
 }
 
 export function taskListOperationFromArgs(args: unknown): TaskListToolOperationRecord | undefined {
-  return normalizeOperation(args);
+  try {
+    return requireTaskListOperation(args);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Canonical validation boundary shared by reliable settlement and read-side projections.
+ *
+ * Callers that own a durable write must use this throwing form.  Read-only presentation code may
+ * use taskListOperationFromArgs when malformed, non-authoritative input should simply be ignored.
+ */
+export function requireTaskListOperation(value: unknown): TaskListToolOperationRecord {
+  const record = asRecord(value);
+  if (!record) throw new TypeError('Task list operation must be a plain object.');
+  const unknownOperationFields = Object.keys(record).filter((key) =>
+    key !== 'kind' && key !== 'mode' && key !== 'items');
+  if (unknownOperationFields.length > 0) {
+    throw new TypeError(`Task list operation has unsupported fields: ${unknownOperationFields.join(', ')}.`);
+  }
+  if (record.kind !== undefined && record.kind !== 'task_list.operation') {
+    throw new TypeError('Task list operation kind must be task_list.operation when present.');
+  }
+  const mode = normalizeMode(record.mode);
+  if (!mode) throw new TypeError('Task list operation mode must be rewrite or update.');
+  if (!Array.isArray(record.items)) throw new TypeError('Task list operation items must be an array.');
+
+  const items = record.items.map((rawItem, index) => requireOperationItem(rawItem, index, mode));
+  return { kind: 'task_list.operation', mode, items };
 }
 
 export function taskListDisplayItemsFromOperation(operation: TaskListToolOperationRecord): TaskListChangeItemView[] {
@@ -247,7 +279,7 @@ function compareTaskListToolCalls(
   return (leftMessage?.seq ?? 0) - (rightMessage?.seq ?? 0)
     || functionCallPartIndex(leftMessage, left) - functionCallPartIndex(rightMessage, right)
     || left.createdAt - right.createdAt
-    || left.id.localeCompare(right.id);
+    || compareText(left.id, right.id);
 }
 
 function functionCallPartIndex(message: MessageRecord | undefined, toolCall: ToolCallRecord): number {
@@ -267,45 +299,46 @@ function functionCallPartIndex(message: MessageRecord | undefined, toolCall: Too
 
 function isAppliedTaskListToolCall(toolCall: ToolCallRecord): boolean {
   if (toolCall.status !== 'success' && toolCall.status !== 'warning') return false;
-  if (toolCall.name === SUBMIT_PLAN_TOOL_NAME) return !!taskListOperationFromSubmitPlanToolCall(toolCall);
-  return true;
-}
-
-function taskListOperationFromSubmitPlanToolCall(toolCall: ToolCallRecord): TaskListToolOperationRecord | undefined {
-  const args = asRecord(parseJson(toolCall.args));
-  return normalizeOperation(args?.taskList);
+  return toolCall.name === TASK_LIST_TOOL_NAME;
 }
 
 function taskListOperationFromArgsJson(argsJson: string): TaskListToolOperationRecord | undefined {
-  return normalizeOperation(parseJson(argsJson));
-}
-
-function normalizeOperation(value: unknown): TaskListToolOperationRecord | undefined {
-  const record = asRecord(value);
-  if (!record) return undefined;
-  const mode = normalizeMode(record.mode);
-  if (!mode || !Array.isArray(record.items)) return undefined;
-
-  const items: TaskListToolItemRecord[] = [];
-  for (const rawItem of record.items) {
-    const item = normalizeOperationItem(rawItem);
-    if (item) items.push(item);
-  }
-  return { kind: 'task_list.operation', mode, items };
+  return taskListOperationFromArgs(parseJson(argsJson));
 }
 
 function normalizeMode(value: unknown): TaskListToolMode | undefined {
   return value === 'rewrite' || value === 'update' ? value : undefined;
 }
 
-function normalizeOperationItem(value: unknown): TaskListToolItemRecord | undefined {
+function requireOperationItem(
+  value: unknown,
+  index: number,
+  mode: TaskListToolMode
+): TaskListToolItemRecord {
   const record = asRecord(value);
-  if (!record) return undefined;
+  if (!record) throw new TypeError(`Task list items[${index}] must be a plain object.`);
+  const unknownItemFields = Object.keys(record).filter((key) =>
+    key !== 'title' && key !== 'description' && key !== 'status' && key !== 'delete');
+  if (unknownItemFields.length > 0) {
+    throw new TypeError(`Task list items[${index}] has unsupported fields: ${unknownItemFields.join(', ')}.`);
+  }
   const title = stringValue(record.title);
-  if (!title) return undefined;
+  if (!title) throw new TypeError(`Task list items[${index}].title must be non-empty text.`);
+  if (record.description !== undefined && typeof record.description !== 'string') {
+    throw new TypeError(`Task list items[${index}].description must be text when present.`);
+  }
   const description = stringValue(record.description);
-  const status = taskStatusValue(record.status);
+  if (record.status !== undefined && !taskStatusValue(record.status)) {
+    throw new TypeError(`Task list items[${index}].status is invalid.`);
+  }
+  if (record.delete !== undefined && typeof record.delete !== 'boolean') {
+    throw new TypeError(`Task list items[${index}].delete must be boolean when present.`);
+  }
   const deletion = record.delete === true;
+  if (mode === 'rewrite' && deletion) {
+    throw new TypeError(`Task list items[${index}].delete can only be used in update mode.`);
+  }
+  const status = taskStatusValue(record.status);
   return {
     title,
     ...(description ? { description } : {}),
@@ -427,7 +460,7 @@ export function emptyTaskListSnapshot(): TaskListSnapshotView {
 const applyTaskListOperation = applyTaskListOperationToSnapshot;
 
 function snapshotFromItems(items: TaskListItemView[]): TaskListSnapshotView {
-  const sorted = [...items].sort((left, right) => left.createdOrder - right.createdOrder || left.title.localeCompare(right.title));
+  const sorted = [...items].sort((left, right) => left.createdOrder - right.createdOrder || compareText(left.title, right.title));
   const stats = computeStats(sorted);
   const activeItem = sorted.find((item) => item.status === 'in_progress');
   return { items: sorted, stats, ...(activeItem ? { activeItem } : {}) };
@@ -483,7 +516,11 @@ function nextOperationIndex(snapshot: TaskListSnapshotView): number {
 }
 
 function titleKey(title: string): string {
-  return title.replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+  return title.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -523,4 +560,3 @@ function stableJson(value: unknown): string {
     return '';
   }
 }
-

@@ -151,15 +151,18 @@ function checkVsixFileListing() {
   const required = ['package.json', readVsixMainEntry(absolute)];
   for (const file of required) if (!files.includes(file)) problems.push(`缺少必需文件：${file}`);
   const activationEvents = new Set(Array.isArray(manifest.activationEvents) ? manifest.activationEvents : []);
-  for (const command of manifest.contributes?.commands ?? []) {
-    if (typeof command?.command === 'string' && !activationEvents.has(`onCommand:${command.command}`)) {
-      problems.push(`命令缺少首次安装激活事件：${command.command}`);
+  const implicitContributionActivation = supportsImplicitContributionActivation(manifest.engines?.vscode);
+  if (!implicitContributionActivation) {
+    for (const command of manifest.contributes?.commands ?? []) {
+      if (typeof command?.command === 'string' && !activationEvents.has(`onCommand:${command.command}`)) {
+        problems.push(`命令缺少首次安装激活事件：${command.command}`);
+      }
     }
-  }
-  for (const entries of Object.values(manifest.contributes?.views ?? {})) {
-    if (!Array.isArray(entries)) continue;
-    for (const view of entries) {
-      if (typeof view?.id === 'string' && !activationEvents.has(`onView:${view.id}`)) problems.push(`视图缺少首次安装激活事件：${view.id}`);
+    for (const entries of Object.values(manifest.contributes?.views ?? {})) {
+      if (!Array.isArray(entries)) continue;
+      for (const view of entries) {
+        if (typeof view?.id === 'string' && !activationEvents.has(`onView:${view.id}`)) problems.push(`视图缺少首次安装激活事件：${view.id}`);
+      }
     }
   }
   if (!files.some((file) => file.toLowerCase() === 'readme.md')) problems.push('缺少README');
@@ -168,6 +171,15 @@ function checkVsixFileListing() {
   if (!files.some((file) => file.startsWith('dist/webview/') && file.endsWith('.html'))) problems.push('缺少编译后的网页视图HTML');
   if (!files.some((file) => file.startsWith('dist/webview/') && file.endsWith('.css'))) problems.push('缺少编译后的网页视图CSS');
   return problems.length ? `${files.length}个文件中发现问题：${problems.join('；')}` : null;
+}
+
+function supportsImplicitContributionActivation(engineRange) {
+  if (typeof engineRange !== 'string') return false;
+  const match = /^\s*\^?(\d+)\.(\d+)(?:\.\d+)?/.exec(engineRange);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 1 || (major === 1 && minor >= 74);
 }
 
 function readBuildProvenance(absolute) {

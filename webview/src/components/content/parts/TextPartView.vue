@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, shallowRef, watch } from 'vue';
+import { computed, onBeforeUnmount, shallowRef, watch } from 'vue';
 import { LOCAL_FILE_LINK_DATA_ATTRIBUTE } from '@shared/localFileResources';
 import { BridgeMessageType } from '@shared/protocol';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
@@ -37,7 +37,12 @@ const { displayedText, replacing: replaceAnimating } = useSmoothStreamingText(
 );
 const renderedParts = shallowRef<MarkdownRenderedPart[]>([]);
 const streamingMarkdownRenderer = createStreamingMarkdownPartsRenderer();
-// displayedText 已经由平滑输出逻辑控制更新频率；Markdown 紧跟它同步解析，不再额外等待下一帧。
+const DEFERRED_FINAL_MARKDOWN_CHARACTERS = 16 * 1024;
+let deferredMarkdownFirstFrame: number | undefined;
+let deferredMarkdownSecondFrame: number | undefined;
+let markdownRenderGeneration = 0;
+// Streaming Markdown follows displayedText synchronously; only a large, already-final historical
+// body yields one paint so its readable plain-text fallback appears before rich parsing.
 const markdownReady = computed(() => props.markdown);
 
 watch(
@@ -45,24 +50,59 @@ watch(
   () => renderCurrentMarkdown(),
   { immediate: true }
 );
+onBeforeUnmount(() => cancelDeferredMarkdownRender());
 
 function renderCurrentMarkdown(): void {
+  const generation = cancelDeferredMarkdownRender();
   if (!markdownReady.value) {
     streamingMarkdownRenderer.reset();
     renderedParts.value = [];
     return;
   }
 
+  // A historical body arrives atomically. Paint its plain text first so a long final Markdown parse
+  // cannot keep the tail row blank for another frame; rich formatting replaces it after that paint.
+  const effectivelyStreaming = props.streaming || displayedText.value !== props.text;
+  if (!effectivelyStreaming && displayedText.value.length >= DEFERRED_FINAL_MARKDOWN_CHARACTERS) {
+    streamingMarkdownRenderer.reset();
+    renderedParts.value = [];
+    deferredMarkdownFirstFrame = window.requestAnimationFrame(() => {
+      deferredMarkdownFirstFrame = undefined;
+      deferredMarkdownSecondFrame = window.requestAnimationFrame(() => {
+        deferredMarkdownSecondFrame = undefined;
+        if (generation !== markdownRenderGeneration) return;
+        renderMarkdownNow(false);
+      });
+    });
+    return;
+  }
+
+  renderMarkdownNow(effectivelyStreaming);
+}
+
+function renderMarkdownNow(effectivelyStreaming: boolean): void {
   try {
     // Provider 已结束后，平滑输出可能仍在追赶 backlog；此时仍按流式尾块处理，
     // 直到 displayedText 真正追上最终文本，才做一次权威的整文解析并写入最终缓存。
-    const effectivelyStreaming = props.streaming || displayedText.value !== props.text;
     renderedParts.value = streamingMarkdownRenderer.render(displayedText.value, { streaming: effectivelyStreaming });
   } catch (error) {
     streamingMarkdownRenderer.reset();
     console.warn('[LimCode] Failed to render markdown.', error);
     renderedParts.value = [];
   }
+}
+
+function cancelDeferredMarkdownRender(): number {
+  markdownRenderGeneration += 1;
+  if (deferredMarkdownFirstFrame !== undefined) {
+    window.cancelAnimationFrame(deferredMarkdownFirstFrame);
+    deferredMarkdownFirstFrame = undefined;
+  }
+  if (deferredMarkdownSecondFrame !== undefined) {
+    window.cancelAnimationFrame(deferredMarkdownSecondFrame);
+    deferredMarkdownSecondFrame = undefined;
+  }
+  return markdownRenderGeneration;
 }
 
 function markdownPartKey(part: MarkdownRenderedPart, index: number): string {

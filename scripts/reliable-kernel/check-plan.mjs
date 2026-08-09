@@ -53,18 +53,31 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/bottomStickyScrollerScheduler.test.cjs',
   'tests/commandRelaxedPolicy.test.cjs',
   'tests/fileWatcherScope.test.cjs',
+  'tests/openAIResponsesWebSocket.test.cjs',
+  'tests/openAIResponsesWebSocketSession.test.cjs',
+  'tests/reliable-kernel/command-router-interaction.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
+  'tests/reliable-kernel/context-token-estimator.test.mjs',
+  'tests/reliable-kernel/current-turn-task-projection.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',
   'tests/reliable-kernel/model-system-prompt-prefix.test.mjs',
+  'tests/reliable-kernel/phase-b-foundation.test.mjs',
   'tests/reliable-kernel/product-composition.test.mjs',
+  'tests/reliable-kernel/provider-semantic-watchdog.test.mjs',
+  'tests/reliable-kernel/provider-websocket-policy.test.mjs',
+  'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',
+  'tests/reliable-kernel/streaming-output-regressions.test.mjs',
+  'tests/reliable-kernel/webview-feed-lifecycle.test.mjs',
   'tests/llmErrorRedaction.test.cjs',
   'tests/localFileResources.test.cjs',
   'tests/processSpoolCleanup.test.cjs',
   'tests/runAgentToolSchema.test.cjs',
   'tests/settingsRevisionConflict.test.cjs',
   'tests/vscodeStorageJsonDurability.test.cjs',
-  'tests/webviewLocalResources.test.cjs'
+  'tests/webviewLocalResources.test.cjs',
+  'webview/tests/reliableConversationProjection.test.ts',
+  'webview/tests/segmentedTimeline.test.ts'
 ]);
 
 const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([
