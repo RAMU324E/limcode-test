@@ -57,10 +57,20 @@ const proposal = computed<PlanProposalRecord | undefined>(() => {
   return clientState.planProposals.find((item) => item.id === id);
 });
 const interaction = computed(() => props.interactionView ?? interactionForTool(clientState, props.toolCall?.id, 'plan_review'));
+const directInteractionResult = computed(() => {
+  const requestId = interaction.value?.request.id;
+  return requestId ? interactions.resultFor(requestId) : undefined;
+});
+const directInteractionDecision = computed(() => directInteractionResult.value?.decision);
 const interactionStatus = computed<PlanProposalStatus | undefined>(() => {
   const target = interaction.value;
   if (!target) return undefined;
-  if (target.request.state === 'pending') return 'pending';
+  if (target.request.state === 'pending') {
+    if (directInteractionDecision.value === 'accept') return 'approved';
+    if (directInteractionDecision.value === 'submit') return 'change_requested';
+    if (directInteractionDecision.value === 'reject' || directInteractionDecision.value === 'cancel') return 'rejected';
+    return 'pending';
+  }
   const response = clientState.interactionResponses.find((candidate) =>
     candidate.interactionRequestId === target.request.id
     && candidate.interactionRevision === target.request.revision);
@@ -70,7 +80,16 @@ const interactionStatus = computed<PlanProposalStatus | undefined>(() => {
   return 'rejected';
 });
 const status = computed<PlanProposalStatus>(() => output.value?.status ?? interactionStatus.value ?? proposal.value?.status ?? 'pending');
-const pending = computed(() => interaction.value?.request.state === 'pending');
+const pending = computed(() =>
+  interaction.value?.request.state === 'pending' && directInteractionResult.value === undefined
+);
+const awaitingConfirmation = computed(() => {
+  const requestId = interaction.value?.request.id;
+  return pending.value
+    && !!requestId
+    && interactions.hasPendingResolution(requestId)
+    && !interactions.isPending(requestId);
+});
 const planBody = computed(() => props.request.plan || proposal.value?.body || '');
 const taskListOperation = computed(() => props.request.taskList ?? proposal.value?.taskList);
 const taskListItems = computed(() => taskListOperation.value ? taskListDisplayItemsFromOperation(taskListOperation.value) : []);
@@ -91,6 +110,8 @@ const statusLabel = computed(() => {
   if (submitting.value === 'approve-new') return '正在分派 Plan';
   if (submitting.value === 'changes') return '正在提交修改要求';
   if (submitting.value === 'reject') return '正在拒绝 Plan';
+  if (awaitingConfirmation.value) return '提交暂未确认，可点击原操作重试';
+  if (directInteractionResult.value && status.value === 'pending') return '审批决定已提交，正在同步';
   if (props.toolCall?.status === 'error' && status.value === 'pending') return 'Plan 已取消';
   if (!interaction.value && status.value === 'pending') return '正在准备 Plan 审批';
   if (

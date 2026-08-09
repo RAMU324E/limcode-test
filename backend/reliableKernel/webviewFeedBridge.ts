@@ -37,30 +37,38 @@ import type {
 } from './clientFeed';
 import type { ReliableDiagnosticObserver } from './diagnosticJournal';
 
+interface FeedDataPost {
+  sessionId: string;
+  messageSeq: string;
+  postedAt: number;
+  emptyChanges: boolean;
+  ackTimer: NodeJS.Timeout;
+  plain: unknown;
+  resendCount: number;
+  diagnostic: ReliableDataDiagnostic;
+}
+
 interface FeedClient {
   clientId: BridgeClientId;
   webview: vscode.Webview;
   meta: WebviewClientMeta;
   navigationGeneration: number;
+  ready: boolean;
+  visible: boolean;
   closed: boolean;
-  connection: Promise<ClientFeedConnection>;
+  connection?: Promise<ClientFeedConnection>;
   detailRequests: Set<string>;
   historyRequests: Set<string>;
   recoveryAttempt: number;
   recoveryTimer?: NodeJS.Timeout;
   recoveryWake?: (retry: boolean) => void;
-  lastDataPost?: {
-    sessionId: string;
-    messageSeq: string;
-    postedAt: number;
-    emptyChanges: boolean;
-    ackTimer: NodeJS.Timeout;
-  };
+  lastDataPost?: FeedDataPost;
   pendingTransientEvents: ReliableAgentTransientEvent[];
   transientFlushTimer?: NodeJS.Timeout;
 }
 
 const FEED_ACK_TIMEOUT_MS = 30_000;
+const FEED_MAX_FRAME_RESENDS = 1;
 const FEED_RECOVERY_MAX_DELAY_MS = 30_000;
 const TRANSIENT_BATCH_INTERVAL_MS = 32;
 const TRANSIENT_BATCH_MAX_EVENTS = 128;
@@ -76,8 +84,15 @@ export type ReliableKernelFeedBridgeErrorHandler = (
  * 每个 Webview 对应一个内存 Feed session；detach 后立即断开订阅。Bridge 接受有界 Feed
  * 控制、按需详情和绑定当前 Conversation 的历史分页请求，不转发或合成旧 ClientState patch。
  */
+export interface ReliableKernelWebviewFeedBridgeOptions {
+  ackTimeoutMs?: number;
+  maxFrameResends?: number;
+}
+
 export class ReliableKernelWebviewFeedBridge {
   private readonly clients = new Map<BridgeClientId, FeedClient>();
+  private readonly ackTimeoutMs: number;
+  private readonly maxFrameResends: number;
   private closed = false;
 
   public constructor(
@@ -86,8 +101,16 @@ export class ReliableKernelWebviewFeedBridge {
     private readonly onError: ReliableKernelFeedBridgeErrorHandler = defaultErrorHandler,
     private readonly diagnostics?: ReliableDiagnosticObserver,
     private readonly runtimeBuildInfo?: () => RuntimeBuildInfoRecord,
-    private readonly history?: ClientHistoryReader
-  ) {}
+    private readonly history?: ClientHistoryReader,
+    options: ReliableKernelWebviewFeedBridgeOptions = {}
+  ) {
+    this.ackTimeoutMs = positiveInteger(options.ackTimeoutMs, FEED_ACK_TIMEOUT_MS, 'ackTimeoutMs');
+    this.maxFrameResends = nonNegativeInteger(
+      options.maxFrameResends,
+      FEED_MAX_FRAME_RESENDS,
+      'maxFrameResends'
+    );
+  }
 
   public attach(
     webview: vscode.Webview,
@@ -100,12 +123,13 @@ export class ReliableKernelWebviewFeedBridge {
     client.webview = webview;
     client.meta = plainMeta(meta);
     client.navigationGeneration = 1;
+    client.ready = false;
+    client.visible = true;
     client.closed = false;
     client.detailRequests = new Set<string>();
     client.historyRequests = new Set<string>();
     client.pendingTransientEvents = [];
     client.recoveryAttempt = 0;
-    client.connection = this.connect(client, client.navigationGeneration);
     this.clients.set(clientId, client);
     this.post(client, {
       id: randomUUID(),
@@ -116,11 +140,32 @@ export class ReliableKernelWebviewFeedBridge {
     return clientId;
   }
 
-  /** Reconnects after Webview Ready so a snapshot posted before its script boot cannot strand ACK flow. */
+  /** Starts or refreshes the bounded Feed only after the Webview script has declared itself ready. */
   public reconnect(clientId: BridgeClientId, activeConversationId?: string | null): void {
     const client = this.clients.get(clientId);
     if (!client || client.closed) return;
+    client.ready = true;
+    if (activeConversationId !== undefined) {
+      client.meta = plainMeta({ ...client.meta, conversationId: activeConversationId ?? undefined });
+    }
+    if (!client.visible) return;
     this.reconnectClient(client, activeConversationId, true);
+  }
+
+  /**
+   * A retained but hidden Webview may be browser-frozen and cannot ACK. Disconnecting it prevents
+   * the 30-second watchdog from creating an unbounded snapshot/reconnect loop. Revealing the panel
+   * establishes one fresh generation whose snapshot is the sole rendering authority.
+   */
+  public setVisible(clientId: BridgeClientId, visible: boolean): void {
+    const client = this.clients.get(clientId);
+    if (!client || client.closed || client.visible === visible) return;
+    client.visible = visible;
+    if (!visible) {
+      this.pauseClient(client);
+      return;
+    }
+    if (client.ready) this.reconnectClient(client, client.meta.conversationId ?? null, true);
   }
 
   private reconnectClient(
@@ -128,6 +173,7 @@ export class ReliableKernelWebviewFeedBridge {
     activeConversationId: string | null | undefined,
     resetRecoveryBackoff: boolean
   ): void {
+    if (client.closed || !client.ready || !client.visible) return;
     const previous = client.connection;
     this.cancelRecoveryTimer(client);
     if (resetRecoveryBackoff) client.recoveryAttempt = 0;
@@ -140,13 +186,25 @@ export class ReliableKernelWebviewFeedBridge {
     client.historyRequests.clear();
     client.navigationGeneration += 1;
     client.connection = this.connect(client, client.navigationGeneration);
-    void previous.then((connection) => this.feed.disconnect(connection.sessionId), () => undefined);
+    void previous?.then((connection) => this.feed.disconnect(connection.sessionId), () => undefined);
     this.post(client, {
       id: randomUUID(),
       type: BridgeMessageType.Hello,
       clientId: client.clientId,
       payload: this.helloPayload(client.meta)
     });
+  }
+
+  private pauseClient(client: FeedClient): void {
+    const previous = client.connection;
+    this.cancelRecoveryTimer(client);
+    this.clearLastDataPost(client);
+    this.clearTransientQueue(client);
+    client.detailRequests.clear();
+    client.historyRequests.clear();
+    client.navigationGeneration += 1;
+    client.connection = undefined;
+    void previous?.then((connection) => this.feed.disconnect(connection.sessionId), () => undefined);
   }
 
   private helloPayload(meta: WebviewClientMeta): { meta: WebviewClientMeta; runtime?: RuntimeBuildInfoRecord } {
@@ -166,10 +224,13 @@ export class ReliableKernelWebviewFeedBridge {
     client.detailRequests.clear();
     client.historyRequests.clear();
     this.clients.delete(clientId);
-    void client.connection.then(
-      (connection) => this.feed.disconnect(connection.sessionId),
-      () => undefined
-    );
+    const connection = client.connection;
+    if (connection) {
+      void connection.then(
+        (active) => this.feed.disconnect(active.sessionId),
+        () => undefined
+      );
+    }
   }
 
   /** Returns true only when the message belongs to the reliable feed control protocol. */
@@ -185,10 +246,16 @@ export class ReliableKernelWebviewFeedBridge {
       return false;
     }
     const client = this.clients.get(clientId);
-    if (!client || client.closed) return true;
+    const connectionPromise = client?.connection;
+    if (!client || client.closed || !client.ready || !client.visible || !connectionPromise) return true;
     try {
-      const connection = await client.connection;
-      if (client.closed) return true;
+      const connection = await connectionPromise;
+      if (
+        client.closed
+        || !client.ready
+        || !client.visible
+        || client.connection !== connectionPromise
+      ) return true;
       if (message.type === RELIABLE_KERNEL_ACK_MESSAGE) {
         const ack = normalizeAck(message);
         if (ack.sessionId !== connection.sessionId || ack.hostBootId !== connection.hostBootId) return true;
@@ -273,7 +340,12 @@ export class ReliableKernelWebviewFeedBridge {
         page
       });
     } catch (error) {
-      if (!client.closed && client.navigationGeneration === navigationGeneration) {
+      if (
+        !client.closed
+        && client.ready
+        && client.visible
+        && client.navigationGeneration === navigationGeneration
+      ) {
         this.post(client, {
           type: RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE,
           requestId: request.requestId,
@@ -302,6 +374,7 @@ export class ReliableKernelWebviewFeedBridge {
       });
       return;
     }
+    const navigationGeneration = client.navigationGeneration;
     client.detailRequests.add(request.requestId);
     try {
       const detail = await this.details.read({
@@ -310,7 +383,12 @@ export class ReliableKernelWebviewFeedBridge {
         // null (rather than omitting the field) makes a navigation-only panel fail closed.
         conversationId: client.meta.conversationId ?? null
       });
-      if (client.closed) return;
+      if (
+        client.closed
+        || !client.ready
+        || !client.visible
+        || client.navigationGeneration !== navigationGeneration
+      ) return;
       this.post(client, {
         type: RELIABLE_KERNEL_DETAIL_RESULT_MESSAGE,
         requestId: request.requestId,
@@ -318,7 +396,12 @@ export class ReliableKernelWebviewFeedBridge {
         detail
       });
     } catch (error) {
-      if (!client.closed) {
+      if (
+        !client.closed
+        && client.ready
+        && client.visible
+        && client.navigationGeneration === navigationGeneration
+      ) {
         this.post(client, {
           type: RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE,
           requestId: request.requestId,
@@ -335,7 +418,13 @@ export class ReliableKernelWebviewFeedBridge {
   public broadcastTransient(event: ReliableAgentTransientEvent): void {
     if (this.closed) return;
     for (const client of this.clients.values()) {
-      if (client.closed || client.meta.conversationId !== event.conversationId) continue;
+      if (
+        client.closed
+        || !client.ready
+        || !client.visible
+        || !client.connection
+        || client.meta.conversationId !== event.conversationId
+      ) continue;
       client.pendingTransientEvents.push(event);
       const terminal = ['completed', 'failed', 'cancelled'].includes(event.event.kind);
       if (terminal || client.pendingTransientEvents.length >= TRANSIENT_BATCH_MAX_EVENTS) {
@@ -361,9 +450,11 @@ export class ReliableKernelWebviewFeedBridge {
     const conversationId = client.meta.conversationId;
     if (!conversationId || events.some((event) => event.conversationId !== conversationId)) return;
     const connectionPromise = client.connection;
+    if (!connectionPromise || !client.ready || !client.visible) return;
     void connectionPromise.then((connection) => {
       if (
         client.closed
+        || !client.visible
         || client.connection !== connectionPromise
         || client.meta.conversationId !== conversationId
       ) return;
@@ -424,7 +515,8 @@ export class ReliableKernelWebviewFeedBridge {
     // Navigation is a transport-generation boundary. Reusing the prior session lets an older
     // snapshot/detail/transient callback race into the newly selected conversation.
     this.reconnect(clientId, activeConversationId);
-    await client.connection;
+    const connection = client.connection;
+    if (connection) await connection;
   }
 
   public close(): void {
@@ -434,7 +526,12 @@ export class ReliableKernelWebviewFeedBridge {
   }
 
   private async connect(client: FeedClient, navigationGeneration: number): Promise<ClientFeedConnection> {
-    while (!client.closed && client.navigationGeneration === navigationGeneration) {
+    while (
+      !client.closed
+      && client.ready
+      && client.visible
+      && client.navigationGeneration === navigationGeneration
+    ) {
       try {
         const connection = await this.feed.connect({
           activeConversationId: client.meta.conversationId ?? null,
@@ -449,7 +546,12 @@ export class ReliableKernelWebviewFeedBridge {
             this.scheduleRecovery(client);
           }
         });
-        if (client.closed || client.navigationGeneration !== navigationGeneration) {
+        if (
+          client.closed
+          || !client.ready
+          || !client.visible
+          || client.navigationGeneration !== navigationGeneration
+        ) {
           this.feed.disconnect(connection.sessionId);
           throw new FeedConnectionSupersededError();
         }
@@ -479,48 +581,78 @@ export class ReliableKernelWebviewFeedBridge {
       return;
     }
     const dataMessage = reliableDataDiagnostic(message);
-    if (dataMessage) {
-      this.clearLastDataPost(client);
-      const ackTimer = setTimeout(() => {
-        const pending = client.lastDataPost;
-        if (
-          client.closed
-          || !pending
-          || pending.sessionId !== dataMessage.sessionId
-          || pending.messageSeq !== dataMessage.messageSeq
-        ) return;
-        this.onError(new Error(`Reliable feed ACK ${dataMessage.messageSeq} timed out.`), {
-          clientId: client.clientId,
-          operation: 'post'
-        });
-        this.scheduleRecovery(client);
-      }, FEED_ACK_TIMEOUT_MS);
-      ackTimer.unref();
-      client.lastDataPost = {
-        sessionId: dataMessage.sessionId,
-        messageSeq: dataMessage.messageSeq,
-        postedAt: Date.now(),
-        emptyChanges: dataMessage.emptyChanges,
-        ackTimer
-      };
-      if (!dataMessage.emptyChanges) {
-        this.diagnostics?.observe({
-          eventKind: 'feed.data.posted',
-          scopeKind: 'feed_session',
-          scopeId: dataMessage.sessionId,
-          correlationId: dataMessage.messageSeq,
-          metadata: {
-            ...(client.meta.conversationId ? { conversationId: client.meta.conversationId } : {}),
-            sessionId: dataMessage.sessionId,
-            messageSeq: dataMessage.messageSeq,
-            commitSeq: dataMessage.commitSeq,
-            kind: dataMessage.kind,
-            bytes: wireBytes(plain),
-            changeCount: dataMessage.changeCount
-          }
-        });
-      }
+    if (dataMessage) this.beginDataPost(client, plain, dataMessage);
+    this.deliverPostedMessage(client, plain, requestResponseMessage, dataMessage);
+  }
+
+  private beginDataPost(
+    client: FeedClient,
+    plain: unknown,
+    dataMessage: ReliableDataDiagnostic
+  ): void {
+    this.clearLastDataPost(client);
+    client.lastDataPost = {
+      sessionId: dataMessage.sessionId,
+      messageSeq: dataMessage.messageSeq,
+      postedAt: Date.now(),
+      emptyChanges: dataMessage.emptyChanges,
+      ackTimer: this.armDataPostAckTimer(client, dataMessage.sessionId, dataMessage.messageSeq),
+      plain,
+      resendCount: 0,
+      diagnostic: dataMessage
+    };
+    this.observeDataPost(client, dataMessage, plain, false);
+  }
+
+  private armDataPostAckTimer(
+    client: FeedClient,
+    sessionId: string,
+    messageSeq: string
+  ): NodeJS.Timeout {
+    const timer = setTimeout(() => {
+      const pending = client.lastDataPost;
+      if (
+        client.closed
+        || !pending
+        || pending.sessionId !== sessionId
+        || pending.messageSeq !== messageSeq
+      ) return;
+      this.onError(new Error(`Reliable feed ACK ${messageSeq} timed out.`), {
+        clientId: client.clientId,
+        operation: 'post'
+      });
+      this.retryOrSuspendDataPost(client, pending);
+    }, this.ackTimeoutMs);
+    timer.unref();
+    return timer;
+  }
+
+  /**
+   * A missing ACK is evidence about this Webview renderer, not the durable Feed. Re-send the exact
+   * same frame at most once, then suspend until a new Ready generation instead of manufacturing an
+   * unbounded sequence of snapshots and sessions for a zombie renderer.
+   */
+  private retryOrSuspendDataPost(client: FeedClient, pending: FeedDataPost): void {
+    if (client.lastDataPost !== pending || client.closed || !client.ready || !client.visible) return;
+    if (pending.resendCount >= this.maxFrameResends) {
+      client.ready = false;
+      this.pauseClient(client);
+      return;
     }
+    clearTimeout(pending.ackTimer);
+    pending.resendCount += 1;
+    pending.postedAt = Date.now();
+    pending.ackTimer = this.armDataPostAckTimer(client, pending.sessionId, pending.messageSeq);
+    this.observeDataPost(client, pending.diagnostic, pending.plain, true);
+    this.deliverPostedMessage(client, pending.plain, false, pending.diagnostic);
+  }
+
+  private deliverPostedMessage(
+    client: FeedClient,
+    plain: unknown,
+    requestResponseMessage: boolean,
+    dataMessage?: ReliableDataDiagnostic
+  ): void {
     void client.webview.postMessage(plain).then(
       (delivered) => {
         if (delivered !== false || client.closed) return;
@@ -539,7 +671,7 @@ export class ReliableKernelWebviewFeedBridge {
           clientId: client.clientId,
           operation: 'post'
         });
-        this.scheduleRecovery(client);
+        this.retryOrSuspendDataPost(client, pending);
       },
       (error) => {
         if (dataMessage && !dataMessage.emptyChanges) {
@@ -564,11 +696,35 @@ export class ReliableKernelWebviewFeedBridge {
         if (dataMessage && !client.closed) {
           const pending = client.lastDataPost;
           if (pending?.sessionId === dataMessage.sessionId && pending.messageSeq === dataMessage.messageSeq) {
-            this.scheduleRecovery(client);
+            this.retryOrSuspendDataPost(client, pending);
           }
         }
       }
     );
+  }
+
+  private observeDataPost(
+    client: FeedClient,
+    dataMessage: ReliableDataDiagnostic,
+    plain: unknown,
+    resent: boolean
+  ): void {
+    if (dataMessage.emptyChanges) return;
+    this.diagnostics?.observe({
+      eventKind: resent ? 'feed.data.reposted' : 'feed.data.posted',
+      scopeKind: 'feed_session',
+      scopeId: dataMessage.sessionId,
+      correlationId: dataMessage.messageSeq,
+      metadata: {
+        ...(client.meta.conversationId ? { conversationId: client.meta.conversationId } : {}),
+        sessionId: dataMessage.sessionId,
+        messageSeq: dataMessage.messageSeq,
+        commitSeq: dataMessage.commitSeq,
+        kind: dataMessage.kind,
+        bytes: wireBytes(plain),
+        changeCount: dataMessage.changeCount
+      }
+    });
   }
 
   private observeClientDiagnostic(message: ReliableKernelClientDiagnosticMessage): void {
@@ -639,11 +795,13 @@ export class ReliableKernelWebviewFeedBridge {
   }
 
   private scheduleRecovery(client: FeedClient): void {
-    if (client.closed || client.recoveryTimer) return;
+    if (client.closed || !client.ready || !client.visible || client.recoveryTimer) return;
     const delay = this.nextRecoveryDelay(client);
     client.recoveryTimer = setTimeout(() => {
       client.recoveryTimer = undefined;
-      if (!client.closed) this.reconnectClient(client, client.meta.conversationId ?? null, false);
+      if (!client.closed && client.ready && client.visible) {
+        this.reconnectClient(client, client.meta.conversationId ?? null, false);
+      }
     }, delay);
     client.recoveryTimer.unref();
   }
@@ -654,7 +812,12 @@ export class ReliableKernelWebviewFeedBridge {
    * of becoming a permanently rejected handle that every later control message would await.
    */
   private waitForConnectRecovery(client: FeedClient, navigationGeneration: number): Promise<boolean> {
-    if (client.closed || client.navigationGeneration !== navigationGeneration) return Promise.resolve(false);
+    if (
+      client.closed
+      || !client.ready
+      || !client.visible
+      || client.navigationGeneration !== navigationGeneration
+    ) return Promise.resolve(false);
     // A synchronous post failure can schedule recovery while feed.connect() is still unwinding.
     // Keep the active connection promise as the sole owner of recovery instead of letting that
     // timer replace it after this attempt rejects.
@@ -668,7 +831,13 @@ export class ReliableKernelWebviewFeedBridge {
         if (client.recoveryTimer) clearTimeout(client.recoveryTimer);
         client.recoveryTimer = undefined;
         client.recoveryWake = undefined;
-        resolve(retry && !client.closed && client.navigationGeneration === navigationGeneration);
+        resolve(
+          retry
+          && !client.closed
+          && client.ready
+          && client.visible
+          && client.navigationGeneration === navigationGeneration
+        );
       };
       client.recoveryWake = finish;
       client.recoveryTimer = setTimeout(() => finish(true), delay);
@@ -698,14 +867,16 @@ class FeedConnectionSupersededError extends Error {
   }
 }
 
-function reliableDataDiagnostic(message: unknown): {
+interface ReliableDataDiagnostic {
   kind: 'snapshot' | 'changes';
   sessionId: string;
   messageSeq: string;
   commitSeq: string;
   changeCount: number;
   emptyChanges: boolean;
-} | undefined {
+}
+
+function reliableDataDiagnostic(message: unknown): ReliableDataDiagnostic | undefined {
   if (!isRecord(message)) return undefined;
   if (message.type === RELIABLE_KERNEL_SNAPSHOT_MESSAGE) {
     if (
@@ -888,6 +1059,18 @@ function requireDecimal(value: unknown, label: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function positiveInteger(value: number | undefined, fallback: number, label: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${label} must be a positive integer.`);
+  return value;
+}
+
+function nonNegativeInteger(value: number | undefined, fallback: number, label: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be a non-negative integer.`);
+  return value;
 }
 
 function defaultErrorHandler(error: unknown, context: { clientId: BridgeClientId; operation: string }): void {

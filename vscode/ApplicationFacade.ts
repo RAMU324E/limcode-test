@@ -62,6 +62,7 @@ export interface ApplicationFacade {
   inspectReliability(conversationId?: string): Promise<unknown>;
 
   attachWebview(webview: vscode.Webview, meta?: WebviewClientMeta): BridgeClientId;
+  setWebviewVisible(clientId: BridgeClientId, visible: boolean): void;
   detachWebview(clientId: BridgeClientId): void;
   handleWebviewMessage(clientId: BridgeClientId, message: WebviewToExtensionMessage): void;
   handleReliableKernelControl?(clientId: BridgeClientId, message: unknown): Promise<boolean> | boolean;

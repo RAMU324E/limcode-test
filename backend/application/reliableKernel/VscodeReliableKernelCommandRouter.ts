@@ -1322,9 +1322,6 @@ export class VscodeReliableKernelCommandRouter {
     } else {
       throw new Error(`不支持的可靠 Interaction 类型：${String(request.request_kind)}。`);
     }
-    if (!await this.product.childAgents.resume(payload.ownerTurnId)) {
-      this.product.conversations.resume(payload.conversationId, payload.ownerTurnId);
-    }
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
@@ -1336,6 +1333,20 @@ export class VscodeReliableKernelCommandRouter {
         status: won ? 'committed' : 'already_resolved'
       }
     });
+    // Durable first-response-wins resolution is already committed. A slow child lookup or Agent
+    // resume must not hold the Webview button receipt hostage; startup recovery/local DB wake remains
+    // the execution safety net if this best-effort nudge fails.
+    setImmediate(() => {
+      void this.resumeInteractionOwner(payload.ownerTurnId, payload.conversationId).catch((error) =>
+        console.warn('[LimCode] Durable Interaction committed, but owner resume failed.', error)
+      );
+    });
+  }
+
+  private async resumeInteractionOwner(ownerTurnId: string, conversationId: string): Promise<void> {
+    if (!await this.product.childAgents.resume(ownerTurnId)) {
+      this.product.conversations.resume(conversationId, ownerTurnId);
+    }
   }
 
   private async handleToolCancel(

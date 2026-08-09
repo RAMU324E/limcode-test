@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, watchEffect } from 'vue';
-import { IconAlertCircle, IconClock } from '@tabler/icons-vue';
+import { IconAlertCircle, IconClock, IconRefresh } from '@tabler/icons-vue';
 import { BridgeMessageType } from '@shared/protocol';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
@@ -9,13 +9,15 @@ import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 interface QueueItem {
   id: string;
   text: string;
-  state: 'submitting' | 'accepted' | 'acknowledged' | 'queued' | 'failed';
+  state: 'submitting' | 'unconfirmed' | 'accepted' | 'acknowledged' | 'queued' | 'failed';
   createdAt: number;
+  commandId?: string;
+  retryable?: boolean;
   error?: string;
 }
 
 const reliableConversation = useReliableConversation();
-const { currentPendingTurnInputs, currentTurnInputFailure } = useChat();
+const { currentPendingTurnInputs, currentTurnInputFailure, retryTurnInputSubmission } = useChat();
 
 const committedQueue = computed(() => Object.values(
   reliableConversation.feed.records.TurnIntent ?? {}
@@ -59,6 +61,8 @@ const queueItems = computed<QueueItem[]>(() => {
       ? Boolean(result.turnId && reliableConversation.feed.records.Turn?.[result.turnId])
       : Boolean(result?.intentId && committedIds.has(result.intentId));
     if (observed) return [];
+    const retryable = !result
+      && (submission.automaticRetryCount ?? 0) >= 1;
     return [{
       id: `pending:${submission.commandId}`,
       text: submissionText(submission.text, submission.content),
@@ -66,8 +70,12 @@ const queueItems = computed<QueueItem[]>(() => {
         ? 'accepted'
         : result && belongsInQueue
           ? 'acknowledged'
-          : 'submitting',
-      createdAt: submission.submittedAt
+          : retryable
+            ? 'unconfirmed'
+            : 'submitting',
+      createdAt: submission.submittedAt,
+      commandId: submission.commandId,
+      retryable
     }];
   });
   const failure = currentTurnInputFailure.value;
@@ -91,6 +99,7 @@ const hasQueuedItems = computed(() => queueItems.value.some((item) =>
 const waitReason = computed(() => {
   if (queueItems.value.every((item) => item.state === 'failed')) return '提交失败，草稿已保留';
   if (queueItems.value.some((item) => item.state === 'accepted')) return '持久化已确认，等待时间线同步';
+  if (queueItems.value.some((item) => item.state === 'unconfirmed')) return '消息尚未确认，可手动重试';
   if (!hasQueuedItems.value) return '等待可靠 Runtime 确认';
   const pendingInteraction = Object.values(
     reliableConversation.feed.records.InteractionRequest ?? {}
@@ -136,6 +145,7 @@ function submissionText(text: string, content?: { parts?: readonly unknown[] }):
 
 function stateLabel(state: QueueItem['state']): string {
   if (state === 'submitting') return '正在提交';
+  if (state === 'unconfirmed') return '尚未确认';
   if (state === 'accepted') return '已持久化';
   if (state === 'acknowledged') return '已确认入队';
   if (state === 'failed') return '发送失败';
@@ -169,6 +179,16 @@ function timestamp(value: unknown): number {
         <span v-else class="reliable-queue-index">{{ index + 1 }}</span>
         <span class="reliable-queue-state">{{ stateLabel(item.state) }}</span>
         <span class="reliable-queue-text" :title="item.text">{{ item.text }}</span>
+        <button
+          v-if="item.retryable && item.commandId"
+          type="button"
+          class="reliable-queue-retry"
+          title="使用同一请求 ID 重试"
+          @click="retryTurnInputSubmission(item.commandId)"
+        >
+          <IconRefresh :size="13" stroke="2" aria-hidden="true" />
+          重试
+        </button>
         <span v-if="item.error" class="reliable-queue-error" :title="item.error">草稿已保留，可直接重试</span>
       </li>
     </ol>
@@ -239,6 +259,7 @@ function timestamp(value: unknown): number {
 }
 
 .reliable-queue-item.is-submitting,
+.reliable-queue-item.is-unconfirmed,
 .reliable-queue-item.is-accepted,
 .reliable-queue-item.is-acknowledged {
   opacity: 0.72;
@@ -268,6 +289,23 @@ function timestamp(value: unknown): number {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.reliable-queue-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 3px;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  cursor: pointer;
+}
+
+.reliable-queue-retry:hover {
+  background: var(--vscode-button-hoverBackground);
 }
 
 .reliable-queue-error {

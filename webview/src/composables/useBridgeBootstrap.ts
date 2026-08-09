@@ -12,6 +12,7 @@ import { useConversationSettingsStore } from '@webview/stores/useConversationSet
 import { useSystemPromptStore } from '@webview/stores/useSystemPromptStore';
 import { useRuntimeContextStore } from '@webview/stores/useRuntimeContextStore';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
+import { useReliableKernelClientFeedStore } from '@webview/stores/useReliableKernelClientFeedStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 
@@ -32,6 +33,7 @@ export function useBridgeBootstrap(): void {
   const systemPrompts = useSystemPromptStore();
   const runtimeContexts = useRuntimeContextStore();
   const interactions = useInteractionStore();
+  const reliableFeed = useReliableKernelClientFeedStore();
   const modelProfiles = useModelProfileStore();
   const agents = useAgentStore();
   const disposers: Array<() => void> = [];
@@ -39,6 +41,7 @@ export function useBridgeBootstrap(): void {
   disposers.push(
     bridge.on(BridgeMessageType.Hello, (message) => {
       session.applyHello(message.payload?.meta, message.payload?.runtime);
+      interactions.replayForClient(message.clientId ?? bridge.currentClientId(), message.id);
       if (message.payload?.runtime) console.info('[LimCode][Runtime]', { ...message.payload.runtime });
       const conversationId = message.payload?.meta?.conversationId;
       if (conversationId) clientState.setCurrentConversation(conversationId);
@@ -74,6 +77,9 @@ export function useBridgeBootstrap(): void {
     bridge.on(BridgeMessageType.Error, (message) => {
       const payload = message.payload;
       if (!payload) return;
+      if (payload.requestType === BridgeMessageType.InteractionResolve) {
+        interactions.observeTransportError(message.correlationId);
+      }
       if (payload.requestType === BridgeMessageType.ModelProfileScopeSet) {
         modelProfiles.rejectPending(message.correlationId, payload.message);
       }
@@ -98,10 +104,27 @@ export function useBridgeBootstrap(): void {
 
   disposers.push(
     watch(
+      () => Object.values(reliableFeed.records.InteractionRequest ?? {})
+        .map((request) => `${String(request.id ?? '')}:${String(request.status ?? '')}:${String(request.updated_at ?? '')}`)
+        .sort()
+        .join('|'),
+      () => interactions.reconcileReliableFacts(
+        Object.values(reliableFeed.records.InteractionRequest ?? {})
+      ),
+      { immediate: true }
+    )
+  );
+
+  disposers.push(
+    watch(
       () => clientState.currentConversationId,
       (conversationId) => {
         if ((session.viewKind !== 'chat' && session.viewKind !== 'planDetail') || !conversationId) return;
-        bridge.request(BridgeMessageType.ConversationOpen, { conversationId });
+        // Hello already carries the Feed's scoped Conversation. Reopening that same id would create
+        // a second startup generation; only an actual in-panel navigation needs ConversationOpen.
+        if (conversationId !== session.conversationId) {
+          bridge.request(BridgeMessageType.ConversationOpen, { conversationId });
+        }
         conversationSettings.request(conversationId);
       },
       { immediate: true }

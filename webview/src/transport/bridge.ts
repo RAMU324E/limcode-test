@@ -67,6 +67,10 @@ export class WebviewBridge {
     return id;
   }
 
+  public currentClientId(): BridgeClientId | undefined {
+    return this.sessionId;
+  }
+
   public readPersistedState<T>(key: string): T | undefined {
     const state = this.host.getState<Record<string, unknown>>() ?? {};
     return state[key] as T | undefined;

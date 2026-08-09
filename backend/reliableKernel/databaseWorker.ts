@@ -409,8 +409,21 @@ function configureTransactionChangeCapture(database: Database.Database): void {
         INSERT INTO runtime_transaction_change (domain, id, kind)
         VALUES ('ConversationContextStatus', ${row}.id, '${kind}');
       END
-    `);
+      `);
   }
+
+  // CommandReceipt remains an internal epoch domain. The Webview receives only this narrow,
+  // conversation-scoped derived fact so a lost one-shot TurnInputResult can still converge from
+  // the durable Feed. Internal/callback/recovery source keys are never projected.
+  database.exec(`
+    CREATE TEMP TRIGGER capture_conversation_command_receipt_insert
+    AFTER INSERT ON command_receipt
+    WHEN NEW.source_kind = 'command' AND NEW.conversation_id IS NOT NULL
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      VALUES ('ConversationCommandReceipt', NEW.id, 'upsert');
+    END
+  `);
 }
 
 function readTransactionChanges(database: Database.Database): RuntimeChange[] {
@@ -427,11 +440,15 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
   `).all() as Array<{ sequence: bigint; domain: string; id: string; kind: 'upsert' | 'remove' }>;
   const topology = new Map(DOMAIN_REPOSITORIES.all().map((repository, index) => [repository.schema.key, index]));
   topology.set('ConversationContextStatus', topology.size);
+  topology.set('ConversationCommandReceipt', topology.size);
   return rows
     .map((row) => {
       if (row.kind === 'remove') return { ...row };
       if (row.domain === 'ConversationContextStatus') {
         return { ...row, record: projectConversationContextStatusRecord(database, row.id) };
+      }
+      if (row.domain === 'ConversationCommandReceipt') {
+        return { ...row, record: projectConversationCommandReceiptRecord(database, row.id) };
       }
       const repository = DOMAIN_REPOSITORIES.domain(row.domain);
       const raw = database.prepare(`SELECT * FROM ${quote(repository.schema.table)} WHERE id = ?`).get(row.id);
@@ -516,6 +533,24 @@ function projectConversationContextStatusRecord(database: Database.Database, hea
      LIMIT 1
   `, { headId })[0];
   if (!record) throw new Error(`ConversationContextStatus ${headId} cannot resolve its current root.`);
+  return record;
+}
+
+function projectConversationCommandReceiptRecord(database: Database.Database, receiptId: string): DomainRow {
+  const record = queryPlainRows(database, `
+    SELECT id,
+           conversation_id,
+           source_key AS command_id,
+           created_at
+      FROM command_receipt
+     WHERE id = @receiptId
+       AND source_kind = 'command'
+       AND conversation_id IS NOT NULL
+     LIMIT 1
+  `, { receiptId })[0];
+  if (!record) {
+    throw new Error(`ConversationCommandReceipt ${receiptId} cannot resolve its durable command receipt.`);
+  }
   return record;
 }
 
@@ -2209,6 +2244,7 @@ function executeClientProjectionSnapshot(
       conversationBranchLinks: [],
       conversationOriginLinks: [],
       agentConversationLinks: [],
+      commandReceipts: [],
       queuedTurnIntents: [],
       compressionBlocks: [],
       conversationContextStatuses: [],
@@ -2250,6 +2286,17 @@ function executeClientProjectionSnapshot(
     }
 
     const params = { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) };
+    const commandReceipts = queryPlainRows(database, `
+      SELECT id,
+             conversation_id,
+             source_key AS command_id,
+             created_at
+        FROM command_receipt
+       WHERE conversation_id = @conversationId
+         AND source_kind = 'command'
+       ORDER BY created_at DESC, id DESC
+       LIMIT @limit
+    `, params);
     const queuedTurnIntents = queryPlainRows(database, `
       SELECT intent.*
         FROM turn_intent AS intent
@@ -2627,6 +2674,7 @@ function executeClientProjectionSnapshot(
         conversationBranchLinks: branchLinks,
         conversationOriginLinks: originLinks,
         agentConversationLinks: projectedAgentConversationLinks,
+        commandReceipts,
         queuedTurnIntents,
         compressionBlocks,
         conversationContextStatuses,

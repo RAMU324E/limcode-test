@@ -1849,6 +1849,7 @@ async function checkSnapshotFeedBarrier() {
       kind: 'mainPanel',
       conversationId: 'bridge-conversation'
     });
+    bridge.reconnect(bridgeClientId);
     await waitFor(() => bridgeAttempts.length === 2, 3500, 'bridge initial connect backoff recovery');
     metrics.bridgeInitialRecoveryMs = bridgeAttempts[1] - bridgeStartedAt;
     assert.ok(metrics.bridgeInitialRecoveryMs >= 900 && metrics.bridgeInitialRecoveryMs < 3500);
@@ -3106,7 +3107,7 @@ function emptyClientProjection(conversationId) {
       conversationId, messages: [], visibleMessageCount: '0', lastMessageSeq: '0',
       projectContexts: [], conversationProjectLinks: [], conversationReuseLinks: [],
       conversationBranchLinks: [], conversationOriginLinks: [], agentConversationLinks: [],
-      queuedTurnIntents: [], compressionBlocks: [], conversationContextStatuses: [], taskList: []
+      commandReceipts: [], queuedTurnIntents: [], compressionBlocks: [], conversationContextStatuses: [], taskList: []
     },
     activeTurnSummary: {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [],

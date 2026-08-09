@@ -494,6 +494,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return clientId;
   }
 
+  public setWebviewVisible(clientId: BridgeClientId, visible: boolean): void {
+    this.product.application.webviewFeed.setVisible(clientId, visible);
+  }
+
   public detachWebview(clientId: BridgeClientId): void {
     this.webviews.delete(clientId);
     this.product.application.webviewFeed.detach(clientId);

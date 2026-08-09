@@ -24,6 +24,9 @@ import {
 let reliableCommandSequence = 0;
 const reliableCommandSessionId = globalThis.crypto.randomUUID();
 const PERSISTED_CONTROL_KEY = 'reliableConversationControls';
+const TURN_INPUT_RETRY_MS = 30_000;
+const TURN_INPUT_MAX_AUTOMATIC_RETRIES_PER_GENERATION = 1;
+const turnInputRetryTimers = new Map<string, number>();
 
 type InterruptPhase = 'requesting' | 'stopping';
 interface InterruptState {
@@ -79,6 +82,7 @@ interface ForkRequestState {
 
 export interface PendingTurnInputSubmission {
   commandId: string;
+  command: ConversationCommandMetadata;
   requestId: string;
   conversationId: string;
   requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue;
@@ -86,6 +90,10 @@ export interface PendingTurnInputSubmission {
   content?: MessageContent;
   authority: TurnAuthoritySelection;
   submittedAt: number;
+  lastSentAt?: number;
+  sentClientId?: string;
+  sentSessionId?: string;
+  automaticRetryCount?: number;
   result?: TurnInputResultPayload;
 }
 
@@ -98,6 +106,12 @@ interface PersistedConversationControls {
   interrupt?: InterruptState;
   conversationActions: Record<string, ConversationActionState>;
   forkRequests: Record<string, ForkRequestState>;
+  pendingTurnInputs: Record<string, PendingTurnInputSubmission>;
+  failedTurnInputs: Record<string, FailedTurnInputSubmission>;
+}
+
+interface TurnInputAcknowledgement {
+  conversationId: string;
 }
 
 const restored = readPersistedControls();
@@ -105,9 +119,9 @@ const interruptState = ref<InterruptState | undefined>(restored.interrupt);
 const conversationActionStates = ref<Record<string, ConversationActionState>>(restored.conversationActions);
 const forkRequests = ref<Record<string, ForkRequestState>>(restored.forkRequests);
 const actionNotices = ref<Record<string, string>>({});
-const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>({});
-const failedTurnInputSubmissions = ref<Record<string, FailedTurnInputSubmission>>({});
-const turnInputAcknowledgements = ref<Record<string, TurnInputResultPayload>>({});
+const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>(restored.pendingTurnInputs);
+const failedTurnInputSubmissions = ref<Record<string, FailedTurnInputSubmission>>(restored.failedTurnInputs);
+const turnInputAcknowledgements = ref<Record<string, TurnInputAcknowledgement>>({});
 
 bridge.on(BridgeMessageType.TurnInputResult, (message) => {
   const payload = message.payload;
@@ -119,6 +133,7 @@ bridge.on(BridgeMessageType.TurnInputResult, (message) => {
     || pending.conversationId !== payload.conversationId
     || pending.requestType !== payload.requestType
   ) return;
+  clearTurnInputRetry(payload.commandId);
   if (payload.status === 'rejected') {
     failTurnInputSubmission(pending, payload.message || '消息未能可靠入队，请重试。');
     return;
@@ -131,6 +146,7 @@ bridge.on(BridgeMessageType.TurnInputResult, (message) => {
     ...pendingTurnInputSubmissions.value,
     [payload.commandId]: { ...pending, result: payload }
   };
+  persistControls();
   clearTurnInputFailure(payload.commandId);
 });
 
@@ -327,6 +343,7 @@ bridge.on(BridgeMessageType.Error, (message) => {
 });
 
 function failTurnInputSubmission(pending: PendingTurnInputSubmission, message: string): void {
+  clearTurnInputRetry(pending.commandId);
   const nextPending = { ...pendingTurnInputSubmissions.value };
   delete nextPending[pending.commandId];
   pendingTurnInputSubmissions.value = nextPending;
@@ -341,6 +358,7 @@ function failTurnInputSubmission(pending: PendingTurnInputSubmission, message: s
       message
     }
   };
+  persistControls();
   setActionNotice(pending.conversationId, message);
 }
 
@@ -349,6 +367,7 @@ function clearTurnInputFailuresForConversation(conversationId: string): void {
     .filter(([, failure]) => failure.conversationId !== conversationId));
   if (Object.keys(next).length !== Object.keys(failedTurnInputSubmissions.value).length) {
     failedTurnInputSubmissions.value = next;
+    persistControls();
   }
 }
 
@@ -357,6 +376,15 @@ function clearTurnInputFailure(commandId: string): void {
   const next = { ...failedTurnInputSubmissions.value };
   delete next[commandId];
   failedTurnInputSubmissions.value = next;
+  persistControls();
+}
+
+function confirmTurnInputFromDurableReceipt(pending: PendingTurnInputSubmission): void {
+  turnInputAcknowledgements.value = {
+    ...turnInputAcknowledgements.value,
+    [pending.commandId]: { conversationId: pending.conversationId }
+  };
+  clearTurnInputFailure(pending.commandId);
 }
 
 function reconcileTurnInputSubmissions(records: Record<string, Record<string, Record<string, unknown>>>): void {
@@ -364,15 +392,111 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
   const next = { ...pendingTurnInputSubmissions.value };
   for (const pending of Object.values(next)) {
     const result = pending.result;
-    if (!result) continue;
-    const observed = result.admitted
-      ? Boolean(result.turnId && records.Turn?.[result.turnId])
-      : Boolean(result.intentId && records.TurnIntent?.[result.intentId]);
+    const durableReceiptObserved = Object.values(records.ConversationCommandReceipt ?? {}).some((receipt) =>
+      receipt.command_id === pending.commandId
+      && receipt.conversation_id === pending.conversationId
+    );
+    const observed = durableReceiptObserved || Boolean(result && (result.admitted
+      ? result.turnId && records.Turn?.[result.turnId]
+      : result.intentId && records.TurnIntent?.[result.intentId]));
     if (!observed) continue;
+    if (durableReceiptObserved) confirmTurnInputFromDurableReceipt(pending);
+    clearTurnInputRetry(pending.commandId);
     delete next[pending.commandId];
     changed = true;
   }
-  if (changed) pendingTurnInputSubmissions.value = next;
+  if (changed) {
+    pendingTurnInputSubmissions.value = next;
+    // Durable Feed observation retires only the retransmission record. The direct ACK remains a
+    // one-shot UI handoff until Composer clears its draft and explicitly dismisses it; deleting the
+    // ACK here can race Vue's batched watcher and leave the input permanently disabled.
+    persistControls();
+  }
+}
+
+function replayTurnInputSubmissions(clientId: string, sessionId?: string): void {
+  for (const submission of Object.values(pendingTurnInputSubmissions.value)) {
+    if (submission.result) continue;
+    if (
+      submission.sentClientId === clientId
+      && (sessionId === undefined || submission.sentSessionId === sessionId)
+    ) continue;
+    postTurnInputSubmission(submission, clientId, sessionId);
+  }
+}
+
+function postTurnInputSubmission(
+  submission: PendingTurnInputSubmission,
+  clientId = bridge.currentClientId(),
+  sessionId?: string,
+  options: { automaticRetry?: boolean; resetRetryBudget?: boolean } = {}
+): void {
+  const current = pendingTurnInputSubmissions.value[submission.commandId];
+  if (!current || current.result) return;
+  const sameGeneration = current.sentClientId === clientId
+    && current.sentSessionId === sessionId;
+  const automaticRetryCount = options.automaticRetry
+    ? (current.automaticRetryCount ?? 0) + 1
+    : options.resetRetryBudget || !sameGeneration
+      ? 0
+      : current.automaticRetryCount ?? 0;
+  const base: PendingTurnInputSubmission = { ...current };
+  delete base.sentClientId;
+  delete base.sentSessionId;
+  const next: PendingTurnInputSubmission = {
+    ...base,
+    lastSentAt: Date.now(),
+    ...(clientId ? { sentClientId: clientId } : {}),
+    ...(sessionId ? { sentSessionId: sessionId } : {}),
+    automaticRetryCount
+  };
+  pendingTurnInputSubmissions.value = {
+    ...pendingTurnInputSubmissions.value,
+    [next.commandId]: next
+  };
+  persistControls();
+  if (automaticRetryCount < TURN_INPUT_MAX_AUTOMATIC_RETRIES_PER_GENERATION) {
+    armTurnInputRetry(next.commandId);
+  } else {
+    clearTurnInputRetry(next.commandId);
+  }
+  try {
+    bridge.request(next.requestType, {
+      conversationId: next.conversationId,
+      text: next.text,
+      ...(next.content?.parts?.length ? { content: next.content } : {}),
+      ...(next.authority.agentId?.trim() ? { agentId: next.authority.agentId.trim() } : {}),
+      ...(next.authority.model ? { model: next.authority.model } : {}),
+      command: { ...next.command }
+    }, { requestId: next.requestId });
+  } catch (error) {
+    failTurnInputSubmission(
+      next,
+      error instanceof Error ? error.message : '消息提交失败，草稿已保留。'
+    );
+  }
+}
+
+function armTurnInputRetry(commandId: string): void {
+  clearTurnInputRetry(commandId);
+  turnInputRetryTimers.set(commandId, window.setTimeout(() => {
+    turnInputRetryTimers.delete(commandId);
+    const pending = pendingTurnInputSubmissions.value[commandId];
+    if (pending && !pending.result) {
+      postTurnInputSubmission(
+        pending,
+        pending.sentClientId,
+        pending.sentSessionId,
+        { automaticRetry: true }
+      );
+    }
+  }, TURN_INPUT_RETRY_MS));
+}
+
+function clearTurnInputRetry(commandId: string): void {
+  const timer = turnInputRetryTimers.get(commandId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  turnInputRetryTimers.delete(commandId);
 }
 
 function setInterruptState(next: InterruptState | undefined): void {
@@ -473,12 +597,16 @@ export function useChat() {
 
   watchEffect(() => {
     const sessionId = reliableConversation.feed.sessionId;
+    const clientId = bridge.currentClientId();
+    if (sessionId) {
+      reconcileTurnInputSubmissions(
+        reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
+      );
+    }
+    if (clientId) replayTurnInputSubmissions(clientId, sessionId ?? undefined);
     if (!sessionId) return;
     reconcileStandaloneInterrupt();
     reconcileConversationAction();
-    reconcileTurnInputSubmissions(
-      reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
-    );
     replayForkRequestsForSession(sessionId);
   });
 
@@ -518,19 +646,17 @@ export function useChat() {
     const requestType = activeTurnId(conversationId)
       ? BridgeMessageType.TurnEnqueue
       : BridgeMessageType.TurnStart;
-    const frozenContent = content ? structuredClone(content) : undefined;
-    const frozenAuthority = structuredClone(authority);
-    const payload = {
-      conversationId,
-      text: trimmed,
-      ...(frozenContent?.parts?.length ? { content: frozenContent } : {}),
-      ...(frozenAuthority.agentId?.trim() ? { agentId: frozenAuthority.agentId.trim() } : {}),
-      ...(frozenAuthority.model ? { model: { ...frozenAuthority.model } } : {}),
-      command
-    };
+    const frozenContent = content
+      ? toStructuredClonePlainData(content, 'turn input content') as unknown as MessageContent
+      : undefined;
+    const frozenAuthority = toStructuredClonePlainData(
+      authority,
+      'turn input authority'
+    ) as unknown as TurnAuthoritySelection;
     const requestId = command.commandId;
     const submission: PendingTurnInputSubmission = {
       commandId: command.commandId,
+      command,
       requestId,
       conversationId,
       requestType,
@@ -545,15 +671,25 @@ export function useChat() {
       ...pendingTurnInputSubmissions.value,
       [submission.commandId]: submission
     };
-    try {
-      bridge.request(requestType, payload, { requestId });
-    } catch (error) {
-      failTurnInputSubmission(
-        submission,
-        error instanceof Error ? error.message : '消息提交失败，草稿已保留。'
-      );
-    }
+    persistControls();
+    postTurnInputSubmission(
+      submission,
+      bridge.currentClientId(),
+      reliableConversation.feed.sessionId ?? undefined
+    );
     return submission;
+  }
+
+  function retryTurnInputSubmission(commandId: string): boolean {
+    const pending = pendingTurnInputSubmissions.value[commandId];
+    if (!pending || pending.result) return false;
+    postTurnInputSubmission(
+      pending,
+      bridge.currentClientId(),
+      reliableConversation.feed.sessionId ?? undefined,
+      { resetRetryBudget: true }
+    );
+    return true;
   }
 
   function editMessage(
@@ -981,6 +1117,7 @@ export function useChat() {
     currentTurnInputFailure,
     dismissTurnInputAcknowledgement,
     dismissTurnInputFailure,
+    retryTurnInputSubmission,
     forkPendingTargetIds
   };
 }
@@ -991,16 +1128,47 @@ function readPersistedControls(): PersistedConversationControls {
   return {
     ...(value.interrupt ? { interrupt: value.interrupt } : {}),
     conversationActions: plainRecord(value.conversationActions),
-    forkRequests: plainRecord(value.forkRequests)
+    forkRequests: plainRecord(value.forkRequests),
+    pendingTurnInputs: validTurnInputRecords(value.pendingTurnInputs),
+    failedTurnInputs: validFailedTurnInputRecords(value.failedTurnInputs)
   };
 }
 
 function emptyPersistedControls(): PersistedConversationControls {
-  return { conversationActions: {}, forkRequests: {} };
+  return {
+    conversationActions: {},
+    forkRequests: {},
+    pendingTurnInputs: {},
+    failedTurnInputs: {}
+  };
 }
 
 function plainRecord<T>(value: Record<string, T> | undefined): Record<string, T> {
   return value && typeof value === 'object' && !Array.isArray(value) ? { ...value } : {};
+}
+
+function validTurnInputRecords(
+  value: Record<string, PendingTurnInputSubmission> | undefined
+): Record<string, PendingTurnInputSubmission> {
+  return Object.fromEntries(Object.entries(plainRecord(value)).filter(([, submission]) =>
+    typeof submission?.commandId === 'string'
+    && typeof submission?.requestId === 'string'
+    && typeof submission?.conversationId === 'string'
+    && typeof submission?.text === 'string'
+    && typeof submission?.submittedAt === 'number'
+    && (submission?.requestType === BridgeMessageType.TurnStart || submission?.requestType === BridgeMessageType.TurnEnqueue)
+    && typeof submission?.command?.commandId === 'string'
+    && submission.command.commandId === submission.commandId
+  ));
+}
+
+function validFailedTurnInputRecords(
+  value: Record<string, FailedTurnInputSubmission> | undefined
+): Record<string, FailedTurnInputSubmission> {
+  return Object.fromEntries(Object.entries(validTurnInputRecords(value)).filter(([, submission]) =>
+    typeof (submission as FailedTurnInputSubmission).failedAt === 'number'
+    && typeof (submission as FailedTurnInputSubmission).message === 'string'
+  )) as Record<string, FailedTurnInputSubmission>;
 }
 
 function persistControls(): void {
@@ -1009,7 +1177,9 @@ function persistControls(): void {
     toStructuredClonePlainData({
       ...(interruptState.value ? { interrupt: interruptState.value } : {}),
       conversationActions: conversationActionStates.value,
-      forkRequests: forkRequests.value
+      forkRequests: forkRequests.value,
+      pendingTurnInputs: pendingTurnInputSubmissions.value,
+      failedTurnInputs: failedTurnInputSubmissions.value
     }, 'reliable conversation controls') as unknown as PersistedConversationControls
   );
 }

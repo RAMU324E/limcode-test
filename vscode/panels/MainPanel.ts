@@ -165,13 +165,17 @@ export class MainPanel {
     this.refreshTitle(options.title);
     this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri, this.kind);
     this.clientId = this.backendApp.attachWebview(panel.webview, this.panelWebviewMeta());
+    this.backendApp.setWebviewVisible(this.clientId, panel.visible);
 
     this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri, {
       enableLocalFileResources: supportsLocalFileResources(this.kind)
     });
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    this.panel.onDidChangeViewState(() => MainPanel.notifyConversationPanelStateChanged(), null, this.disposables);
+    this.panel.onDidChangeViewState(() => {
+      this.backendApp.setWebviewVisible(this.clientId, this.panel.visible);
+      MainPanel.notifyConversationPanelStateChanged();
+    }, null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
       (raw: unknown) => {
         if (isReliableKernelControlMessage(raw)) {

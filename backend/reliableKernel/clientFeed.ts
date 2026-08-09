@@ -591,6 +591,7 @@ export class BoundedClientFeed {
         return referencedBy('ConversationProjectLink');
       case 'ConversationProjectLink':
       case 'ConversationReuseLink':
+      case 'ConversationCommandReceipt':
       case 'TurnIntent':
       case 'CompressionBlock':
       case 'ConversationContextStatus':
@@ -1617,6 +1618,7 @@ const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
   'ConversationBranchLink',
   'ConversationOriginLink',
   'AgentConversationLink',
+  'ConversationCommandReceipt',
   'TurnIntent',
   'CompressionBlock',
   'Process',
@@ -1684,6 +1686,7 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   conversationBranchLinks: 'ConversationBranchLink',
   conversationOriginLinks: 'ConversationOriginLink',
   agentConversationLinks: 'AgentConversationLink',
+  commandReceipts: 'ConversationCommandReceipt',
   queuedTurnIntents: 'TurnIntent',
   compressionBlocks: 'CompressionBlock',
   conversationContextStatuses: 'ConversationContextStatus',
@@ -2175,6 +2178,7 @@ function snapshotRetentionCandidates(
   add(window, 'conversationReuseLinks', 'newest-first');
   add(window, 'conversationBranchLinks', 'newest-first');
   add(window, 'conversationOriginLinks', 'newest-first');
+  add(window, 'commandReceipts', 'newest-first');
   add(window, 'compressionBlocks', 'oldest-first');
   return candidates;
 }

@@ -274,6 +274,8 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'CompressionBlock',
   /** Derived bounded view; not a persisted Runtime domain or schema-manifest entry. */
   'ConversationContextStatus',
+  /** Conversation-scoped durable acknowledgement; CommandReceipt itself remains client=none. */
+  'ConversationCommandReceipt',
   'ChildExecution',
   'ChildExecutionParentLink',
   'ChildExecutionTurnLink',
@@ -406,6 +408,7 @@ function seedRecordsFromSnapshot(
     conversationBranchLinks: 'ConversationBranchLink',
     conversationOriginLinks: 'ConversationOriginLink',
     agentConversationLinks: 'AgentConversationLink',
+    commandReceipts: 'ConversationCommandReceipt',
     messages: 'Message',
     queuedTurnIntents: 'TurnIntent',
     turns: 'Turn',

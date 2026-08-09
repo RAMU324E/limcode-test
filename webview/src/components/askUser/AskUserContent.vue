@@ -32,7 +32,14 @@ const answeredOptionKeys = computed(() => new Set((output.value?.selectedOptions
 const interaction = computed(() => props.interactionView?.request.kind === 'ask_user'
   ? props.interactionView
   : interactionForTool(clientState, toolCallId.value, 'ask_user'));
-const pending = computed(() => interaction.value?.request.state === 'pending');
+const directInteractionResult = computed(() => {
+  const requestId = interaction.value?.request.id;
+  return requestId ? interactions.resultFor(requestId) : undefined;
+});
+const directInteractionDecision = computed(() => directInteractionResult.value?.decision);
+const pending = computed(() =>
+  interaction.value?.request.state === 'pending' && directInteractionResult.value === undefined
+);
 const submitting = computed(() => pending.value && !!interaction.value
   && (draft.value.submitting || interactions.isPending(interaction.value.request.id)));
 const interactive = computed(() => pending.value && !submitting.value && !!toolCallId.value && !!interaction.value);
@@ -50,6 +57,12 @@ const statusLabel = computed(() => {
   if (pending.value) return props.placement === 'tool-detail' ? '等待你的回答 · 与输入框上方同步' : '等待你的回答';
   if (output.value) return '已回答';
   if (props.toolCall.status === 'error') return '问题已取消';
+  if (directInteractionResult.value) {
+    if (directInteractionDecision.value === 'cancel' || directInteractionDecision.value === 'reject') {
+      return '问题已取消，正在同步';
+    }
+    return directInteractionDecision.value ? '回答已提交，正在同步' : '回答决定已提交，正在同步';
+  }
   if (!interaction.value) return '正在准备问题';
   if (interaction.value.request.state === 'resolved') return '回答已提交，正在归档';
   if (interaction.value.request.state === 'cancelled' || interaction.value.request.state === 'expired') return '问题已取消';
@@ -57,7 +70,7 @@ const statusLabel = computed(() => {
 });
 
 watch(
-  () => `${props.toolCall?.id ?? ''}:${props.toolCall?.status ?? 'missing'}:${interaction.value?.request.id ?? ''}:${interaction.value?.request.revision ?? 0}:${interaction.value?.request.state ?? 'missing'}:${output.value ? 'output' : 'no-output'}`,
+  () => `${props.toolCall?.id ?? ''}:${props.toolCall?.status ?? 'missing'}:${interaction.value?.request.id ?? ''}:${interaction.value?.request.revision ?? 0}:${interaction.value?.request.state ?? 'missing'}:${directInteractionResult.value?.observedAt ?? 'no-direct-result'}:${output.value ? 'output' : 'no-output'}`,
   () => {
     const call = props.toolCall;
     const interactionState = interaction.value?.request.state;
@@ -65,6 +78,7 @@ watch(
       call
       && (
         output.value
+        || directInteractionResult.value !== undefined
         || call.status === 'error'
         || interactionState === 'cancelled'
         || interactionState === 'expired'
