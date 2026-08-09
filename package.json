@@ -1,13 +1,13 @@
 {
   "name": "limcode-test",
-  "displayName": "Limcode test",
+  "displayName": "Limcode Test",
   "description": "VS Code extension with a TypeScript ECS backend, Vue webview frontend, and a basic AI chat flow.",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "publisher": "your-publisher",
   "private": true,
   "repository": {
     "type": "git",
-    "url": "https://github.com/lurenxing628/limcode2.git"
+    "url": "https://github.com/odysseiaDev/limcode-test.git"
   },
   "engines": {
     "vscode": "^1.101.0"
@@ -26,23 +26,23 @@
     "commands": [
       {
         "command": "limcode-test.openPanel",
-        "title": "Limcode test: Open AI Chat",
-        "category": "Limcode test"
+        "title": "Limcode Test: Open AI Chat",
+        "category": "Limcode Test"
       },
       {
         "command": "limcode-test.revealGlobalStorage",
-        "title": "Limcode test: Reveal Data Storage Folder",
-        "category": "Limcode test"
+        "title": "Limcode Test: Reveal Data Storage Folder",
+        "category": "Limcode Test"
       },
       {
         "command": "limcode-test.inspectReliability",
-        "title": "Limcode test: Inspect Reliability State (Development)",
-        "category": "Limcode test"
+        "title": "Limcode Test: Inspect Reliability State (Development)",
+        "category": "Limcode Test"
       },
       {
         "command": "limcode-test.resetDevelopmentData",
-        "title": "Limcode test: Archive and Reset Development Data",
-        "category": "Limcode test"
+        "title": "Limcode Test: Archive and Reset Development Data",
+        "category": "Limcode Test"
       }
     ],
     "keybindings": [

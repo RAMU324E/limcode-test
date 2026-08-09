@@ -1,8 +1,9 @@
-# AGENT.md
+# AGENTS.md
 
-本文件是本项目后续开发时 AI Agent / 开发者需要遵守的架构准则。重点是：**ECS 数据、协议、effect、存储都要保持领域对象解耦**。当前准则来自 Agent 与 Conversation 解耦改造经验。
+本文件是 Limcode Test 项目后续开发时 AI Agent / 开发者需要遵守的架构准则。项目由 [奥德赛（odysseiaDev）](https://github.com/odysseiaDev) 共同维护，仓库地址为 <https://github.com/odysseiaDev/limcode-test>。重点是：**ECS 数据、协议、effect、存储都要保持领域对象解耦**。当前准则来自 Agent 与 Conversation 解耦改造经验。
 
-commit 内容用中文填写，例如：feat: 添加xx功能
+提交消息只写简明中文标题，不添加 `feat:`、`fix:` 等类型前缀，不使用晦涩说法，也不写正文。每个提交只表达一个完整改动。
+
 ## 1. 总原则
 
 ### 1.0 兼容原则

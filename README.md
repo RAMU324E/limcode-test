@@ -1,8 +1,8 @@
-# Limcode test
+# Limcode Test
 
-Limcode test 是基于 [LimCode](https://github.com/Lianues/limcode2) 演进、由 [lurenxing628](https://github.com/lurenxing628) 独立维护的衍生项目。当前仓库独立管理发布与开发历史，并使用独立的扩展、命令、视图及数据命名空间，可与原版同时安装。
+Limcode Test 是基于 [LimCode](https://github.com/Lianues/limcode2) 演进、由 [奥德赛（odysseiaDev）](https://github.com/odysseiaDev) 共同维护的衍生项目。当前仓库独立管理发布与开发历史，并使用独立的扩展、命令、视图及数据命名空间，可与原版同时安装。
 
-- 当前仓库：[lurenxing628/limcode2](https://github.com/lurenxing628/limcode2)
+- 当前仓库：[odysseiaDev/limcode-test](https://github.com/odysseiaDev/limcode-test)
 - 上游来源：[Lianues/limcode2](https://github.com/Lianues/limcode2)
 - 开源许可：[GNU GPL v3](LICENSE)
 
@@ -37,9 +37,16 @@ npm run build
 常用命令：
 
 ```text
-Limcode test: Open AI Chat
-Limcode test: Reveal Data Storage Folder
+Limcode Test: Open AI Chat
+Limcode Test: Reveal Data Storage Folder
 ```
+
+## 协作开发
+
+- 从 `main` 创建独立分支进行开发。
+- 通过 Pull Request 合并改动，不直接改写已经共享的历史。
+- 提交消息只写简明中文标题，不添加类型前缀，也不写正文。
+- 提交前运行 `npm run check:plan:tracked`，确保构建、类型检查和测试通过。
 
 ## 常用脚本
 
@@ -65,7 +72,7 @@ docs/                    # 架构与开发约束说明
 
 ## 架构文档
 
-- [可靠运行内核目标计划](docs/architecture/reliable-kernel/README.md)：未来目标和实施门禁，当前尚未完成。
+- [新运行系统架构](docs/architecture/reliable-kernel/README.md)：当前运行架构、约束合同和检查规则。
 - [Conversation 可靠存储权威模型](docs/conversation-storage-authority.md)：当前文件后端实现说明；对应能力切换后转为历史记录。
 - [模型上下文投影、中断与压缩一致性](docs/model-context-projection.md)：当前实现说明；Provider/Context 能力切换后转为历史记录。
 - [后台进程 completion 可靠注入语义](docs/background-process-reliability.md)：当前实现说明；Runtime/Tool/File 能力切换后转为历史记录。
