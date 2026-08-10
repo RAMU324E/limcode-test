@@ -6,7 +6,7 @@ const test = require('node:test');
 
 const kernel = require('../dist/extension/backend/reliableKernel/index.js');
 
-test('进程输出完整保存前保留临时目录，启动补扫后删除且历史输出仍可读', { timeout: 30_000 }, async () => {
+test('Bash 专属语法的进程输出完整保存，启动补扫后删除临时目录且历史输出仍可读', { timeout: 30_000 }, async () => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-process-spool-cleanup-'));
   const candidate = await kernel.resetCandidateRuntimeRoot(parent);
   const database = await kernel.RuntimeDatabase.open(candidate.authority, {
@@ -52,7 +52,7 @@ test('进程输出完整保存前保留临时目录，启动补扫后删除且�
     const prepared = await processes.prepareStart({
       source: { kind: 'internal', key: 'process:spool-cleanup' },
       toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('durable-output');setTimeout(()=>process.exit(0),350)")}`,
+      command: "values=(durable output); for ((i=0; i<${#values[@]}; i++)); do ((i > 0)) && printf '-'; printf '%s' \"${values[$i]}\"; done; cat <(printf '%s' '-process-substitution'); sleep 0.35",
       cwd: parent
     });
     const started = await processes.dispatchStart(prepared.effect.effectIntentId);
@@ -79,7 +79,7 @@ test('进程输出完整保存前保留临时目录，启动补扫后删除且�
     const reconciled = await processes.reconcileOutput(processId);
     assert.equal(reconciled.retainedChunks > 0n, true);
     const output = await processes.readOutputPage(processId);
-    assert.equal(output.stdout, 'durable-output');
+    assert.equal(output.stdout, 'durable-output-process-substitution');
     assert.equal(output.complete, true);
   } finally {
     await processes.dispose().catch(() => undefined);

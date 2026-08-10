@@ -72,10 +72,11 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
   const chunksPath = path.join(spoolPath, PROCESS_WRAPPER_CHUNKS_DIRECTORY);
   fs.mkdirSync(chunksPath, { recursive: true });
 
-  const bootstrapCommand = `IFS= read -r _ <&3 || exit 125; exec /bin/sh -c ${shellQuote(request.command)}`;
+  const bashExecutable = '/bin/bash';
+  const bootstrapCommand = `IFS= read -r _ <&3 || exit 125; exec ${bashExecutable} -c ${shellQuote(request.command)}`;
   const child = spawn(bootstrapCommand, {
     cwd: request.cwd,
-    shell: '/bin/sh',
+    shell: bashExecutable,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
     windowsHide: true
