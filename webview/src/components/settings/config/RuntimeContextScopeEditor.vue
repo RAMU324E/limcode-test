@@ -7,12 +7,12 @@ import { useRuntimeContextStore } from '@webview/stores/useRuntimeContextStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
 const props = withDefaults(defineProps<{ scopeKind: ConfigScopeKind; scopeId?: string; title?: string; description?: string }>(), {
-  title: '运行时上下文',
+  title: '初始上下文',
   description: ''
 });
 
 const store = useRuntimeContextStore();
-const { loading: runtimeLoading, text: runtimeLoadingText } = useSettingsLoadingText('运行时上下文配置', () => props.scopeKind, () => props.scopeId);
+const { loading: runtimeLoading, text: runtimeLoadingText } = useSettingsLoadingText('初始上下文配置', () => props.scopeKind, () => props.scopeId);
 const scroller = ref<HTMLTextAreaElement | null>(null);
 const draft = ref('');
 const local = computed(() => store.localContextFor(props.scopeKind, props.scopeId));
@@ -51,21 +51,21 @@ function insertPlaceholder(token: string): void {
         </h3>
         <p v-if="description">{{ description }}</p>
       </div>
-      <span>{{ local.runtimeContext ? '当前作用域已配置' : scopeKind === 'global' ? '等待默认模板' : '继承上级模板' }}</span>
+      <span>{{ local.runtimeContext ? '当前范围已配置' : scopeKind === 'global' ? '等待默认模板' : '继承上级模板' }}</span>
     </header>
 
     <div class="runtime-hint">
-      这里编辑的是 Turn authority 模板。每个新 Turn 会从当前配置重新编译并冻结独立快照；已经开始的 Turn 不会被后续设置修改。
+      这里编辑的是新任务使用的初始上下文模板。每次开始新任务时都会生成独立内容；已开始的任务不会受后续设置修改影响。
     </div>
 
     <div class="runtime-shell">
-      <div v-if="placeholders.length > 0" class="placeholder-bar" aria-label="可插入运行时变量占位符">
+      <div v-if="placeholders.length > 0" class="placeholder-bar" aria-label="可插入的初始变量">
         <button v-for="placeholder in placeholders" :key="placeholder.id" type="button" class="placeholder-chip" @click="insertPlaceholder(placeholder.token)">
           <span>{{ placeholder.token }}</span>
           <small>{{ placeholder.label }}</small>
         </button>
       </div>
-      <textarea ref="scroller" v-model="draft" rows="8" placeholder="输入运行时快照模板，例如 Initial time: {{$runtime.timestamp}}"></textarea>
+      <textarea ref="scroller" v-model="draft" rows="8" placeholder="输入初始上下文模板，例如 Initial time: {{$runtime.timestamp}}"></textarea>
       <AdvancedScrollbar :scroller="scroller" variant="minimal" />
     </div>
 

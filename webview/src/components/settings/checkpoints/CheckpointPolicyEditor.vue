@@ -32,7 +32,7 @@ const maxMb = computed(() => Math.max(1, Math.round((policy.value?.initialSnapsh
 const skipPatternText = computed(() => (policy.value?.skipPatterns ?? []).join('\n'));
 const sourceLabel = computed(() => {
   if (props.scopeKind === 'global') return '全局默认策略';
-  if (hasLocalOverride.value) return '当前作用域覆盖';
+  if (hasLocalOverride.value) return '当前范围的单独设置';
   return '继承全局默认策略';
 });
 
@@ -40,8 +40,8 @@ const triggerOptions: Array<{ key: keyof CheckpointTriggerConfigRecord; label: s
   { key: 'conversationInitial', label: '首次用户消息前', description: '用户发送第一条消息时，先捕获对话开始前的项目状态。' },
   { key: 'userMessageBefore', label: '用户发消息前', description: '每次用户消息写入对话前创建存档点。' },
   { key: 'userMessageAfter', label: '用户发消息后', description: '用户消息实际写入对话后创建存档点。' },
-  { key: 'llmResponseBefore', label: '每次调用 AI 前', description: '每次模型调用开始前创建存档点，默认关闭以避免重复。' },
-  { key: 'llmResponseAfter', label: '每次调用 AI 后', description: '每次模型调用流式回复结束后触发，默认关闭以避免重复。' },
+  { key: 'llmResponseBefore', label: '每次调用 LLM 前', description: '每次 LLM 调用开始前创建存档点，默认关闭以避免重复。' },
+  { key: 'llmResponseAfter', label: '每次调用 LLM 后', description: '每次 LLM 调用的流式回复结束后触发，默认关闭以避免重复。' },
   { key: 'agentRunCompletedBefore', label: '整回合回复完成前', description: '整回合回复进入最终完成阶段前触发，默认关闭以避免重复。' },
   { key: 'agentRunCompletedAfter', label: '整回合回复完成后', description: '整回合回复完成交付后触发。' },
   { key: 'manual', label: '手动触发', description: '保留后续手动创建存档点入口。' }
@@ -116,21 +116,21 @@ function restoreInheritance(): void {
       <LcCheckbox :model-value="policy?.enabled" :readonly="readonly" @update:model-value="updateEnabled">
         <span class="checkbox-text">
           <strong>启用存档点</strong>
-          <small>关闭后此作用域不会创建新的 shadow git 存档。</small>
+          <small>关闭后，当前范围不会创建新的内部 Git 存档。</small>
         </span>
       </LcCheckbox>
 
       <LcCheckbox :model-value="policy?.preserveEmptyDirectories" :readonly="readonly" @update:model-value="updatePreserveEmptyDirectories">
         <span class="checkbox-text">
           <strong>保留空目录层级</strong>
-          <small>在 shadow 仓库写入内部 manifest，不修改真实项目。</small>
+          <small>在内部存档仓库中记录空目录信息，不修改真实项目。</small>
         </span>
       </LcCheckbox>
 
       <LcCheckbox :model-value="policy?.useGitignore" :readonly="readonly" @update:model-value="updateUseGitignore">
         <span class="checkbox-text">
           <strong>使用项目 .gitignore</strong>
-          <small>使用系统 Git 的 ignore 语义；已进入 shadow 仓库跟踪的文件不会因后续 ignore 规则自动移除。</small>
+          <small>遵循项目的 .gitignore 规则；已经存入内部仓库的文件不会因后续规则变化而自动移除。</small>
         </span>
       </LcCheckbox>
     </div>
@@ -141,7 +141,7 @@ function restoreInheritance(): void {
     </label>
 
     <label class="global-settings-field global-settings-field-wide">
-      <span>额外 Git ignore 规则（每行一条）</span>
+      <span>额外忽略规则（每行一条）</span>
       <textarea :value="skipPatternText" :readonly="readonly" rows="5" spellcheck="false" placeholder="node_modules/&#10;dist/**&#10;*.log&#10;!dist/keep.log" @change="updateSkipPatterns"></textarea>
     </label>
 
@@ -177,7 +177,7 @@ function restoreInheritance(): void {
           <span>执行前</span>
           <span>执行后</span>
         </div>
-        <div v-if="tools.length === 0" class="tool-trigger-empty">等待后端返回工具定义...</div>
+        <div v-if="tools.length === 0" class="tool-trigger-empty">正在获取工具列表…</div>
         <div
           v-for="tool in tools"
           :key="tool.name"

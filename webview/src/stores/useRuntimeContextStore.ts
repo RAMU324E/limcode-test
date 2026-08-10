@@ -43,14 +43,14 @@ export const useRuntimeContextStore = defineStore('runtimeContext', {
     setContextForScope(scopeKind: ConfigScopeKind, scopeId: string | undefined, template: string, name?: string): void {
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
       if (scopeKind !== 'global' && !normalizedScopeId) {
-        this.status = '缺少运行时模板作用域，无法保存。';
+        this.status = '缺少初始上下文配置范围，无法保存。';
         return;
       }
 
       const normalizedTemplate = template.trim();
       if (!normalizedTemplate) {
         this.status = scopeKind === 'global'
-          ? '全局运行时模板不能为空。'
+          ? '全局初始上下文模板不能为空。'
           : '模板内容为空；若要继承上级配置，请点击“恢复继承”。';
         return;
       }

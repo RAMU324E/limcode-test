@@ -64,7 +64,7 @@ const statusLabel = computed(() => {
     return directInteractionDecision.value ? '回答已提交，正在同步' : '回答决定已提交，正在同步';
   }
   if (!interaction.value) return '正在准备问题';
-  if (interaction.value.request.state === 'resolved') return '回答已提交，正在归档';
+  if (interaction.value.request.state === 'resolved') return '回答已提交，正在完成';
   if (interaction.value.request.state === 'cancelled' || interaction.value.request.state === 'expired') return '问题已取消';
   return '问题已结束';
 });

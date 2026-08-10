@@ -7,7 +7,7 @@ import { useSystemPromptStore } from '@webview/stores/useSystemPromptStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
 const props = withDefaults(defineProps<{ scopeKind: ConfigScopeKind; scopeId?: string; title?: string; description?: string }>(), {
-  title: 'System Prompt',
+  title: '系统提示词',
   description: ''
 });
 
@@ -30,16 +30,16 @@ const statusLabel = computed(() => {
     if (local.value.link || local.value.prompt) return '全局覆盖为空';
     return '等待内置默认';
   }
-  if (local.value.prompt) return '当前作用域已配置';
+  if (local.value.prompt) return '当前范围已配置';
   return resolution.value.inheritedText ? '继承上级 / 内置' : '继承中（上级未配置）';
 });
 const inheritedStatusText = computed(() => resolution.value.inheritedText
-  ? '当前显示继承得到的 Prompt；不会写入本作用域。'
-  : '当前继承上级配置；上级暂未提供 Prompt。'
+  ? '当前显示继承得到的提示词；不会保存到当前范围。'
+  : '当前继承上级配置；上级暂未提供提示词。'
 );
 const promptPlaceholder = computed(() => isInherited.value
-  ? '上级或内置 Prompt 暂未配置；点击“自定义 Prompt”可为当前作用域追加内容。'
-  : '输入这个作用域要追加的 system prompt...'
+  ? '上级或内置提示词暂未配置；点击“自定义提示词”可为当前范围追加内容。'
+  : '输入当前范围要追加的系统提示词…'
 );
 
 watch(() => [props.scopeKind, props.scopeId, local.value.prompt?.id, local.value.prompt?.text, resolution.value.inheritedText], () => {
@@ -121,7 +121,7 @@ function insertPlaceholder(token: string): void {
       <span>{{ statusLabel }}</span>
     </header>
     <div class="prompt-shell" :class="{ 'is-inherited': isInherited }">
-      <div v-if="placeholders.length > 0" class="placeholder-bar" aria-label="可插入系统提示词占位符">
+      <div v-if="placeholders.length > 0" class="placeholder-bar" aria-label="可插入的系统提示词变量">
         <button v-for="placeholder in placeholders" :key="placeholder.id" type="button" class="placeholder-chip" :disabled="isInherited" @click="insertPlaceholder(placeholder.token)">
           <span>{{ placeholder.token }}</span>
           <small>{{ placeholder.label }}</small>
@@ -131,8 +131,8 @@ function insertPlaceholder(token: string): void {
       <AdvancedScrollbar :scroller="scroller" variant="minimal" />
     </div>
     <div class="scope-editor-actions">
-      <button v-if="isInherited" type="button" @click="startCustom">自定义 Prompt</button>
-      <button v-else type="button" :disabled="!canSave" @click="save">保存 Prompt</button>
+      <button v-if="isInherited" type="button" @click="startCustom">自定义提示词</button>
+      <button v-else type="button" :disabled="!canSave" @click="save">保存提示词</button>
       <button type="button" class="secondary" :disabled="!canRestoreScope" @click="clear">{{ restoreButtonLabel }}</button>
       <span v-if="isInherited">{{ inheritedStatusText }}</span>
       <span v-else>{{ store.status }}</span>

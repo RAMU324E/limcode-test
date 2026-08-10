@@ -33,8 +33,8 @@ const typeOptions: SettingsDropdownOption[] = [
   { value: 'array', label: '数组' }
 ];
 const booleanOptions: SettingsDropdownOption[] = [
-  { value: 'true', label: 'True' },
-  { value: 'false', label: 'False' }
+  { value: 'true', label: '是' },
+  { value: 'false', label: '否' }
 ];
 
 const currentType = computed<JsonValueType>(() => props.rootObject ? 'object' : valueType(props.modelValue));
@@ -204,7 +204,7 @@ function isJsonObject(value: unknown): value is LlmRequestBodyRecord {
         <SettingsDropdown
           :model-value="valueAsBoolean(modelValue)"
           :options="booleanOptions"
-          title="选择布尔值"
+          title="选择是否启用"
           @update:model-value="updateBoolean"
         />
       </div>
@@ -213,7 +213,7 @@ function isJsonObject(value: unknown): value is LlmRequestBodyRecord {
 
     <div v-if="currentType === 'object'" class="json-container json-object-container">
       <header class="json-container-header">
-        <span>{{ rootObject ? '自定义参数 · requestBody' : '对象字段' }}</span>
+        <span>{{ rootObject ? '自定义参数 · 底层请求体' : '对象字段' }}</span>
         <button type="button" class="json-container-add" @click="addObjectField">
           <IconPlus stroke="2" aria-hidden="true" />
           <span>添加字段</span>

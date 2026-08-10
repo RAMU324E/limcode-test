@@ -34,7 +34,7 @@ const latestModelRequest = computed(() => Object.values(records.value.ModelReque
   .sort((left, right) => integer(right.request_seq) - integer(left.request_seq))[0]);
 const title = computed(() => {
   const id = conversationId.value;
-  if (!id) return '可靠 Runtime 初始化中...';
+  if (!id) return '正在初始化对话…';
   const messages = reliableConversation.projection.value.messages;
   // The client feed keeps only a bounded tail. A tail-local "first" user message is not the
   // conversation's canonical first user message, so defer to the Host projection unless seq=1 is present.
@@ -56,30 +56,29 @@ const agentName = computed(() => {
 });
 const statusLabel = computed(() => {
   if (!activeTurn.value) return '空闲';
-  if (pendingInteractions.value.length > 0) return '等待用户';
-  if (activeToolCalls.value.length > 0) return '执行工具';
-  if (latestModelRequest.value?.status === 'retrying') return '模型自动重试';
-  if (latestModelRequest.value?.status === 'streaming') return '模型响应中';
-  if (latestModelRequest.value?.status === 'prepared' || latestModelRequest.value?.status === 'pending') return '启动模型';
-  return '处理中';
+  if (pendingInteractions.value.length > 0) return '等待你的操作';
+  if (activeToolCalls.value.length > 0) return '正在执行工具';
+  if (latestModelRequest.value?.status === 'retrying') return 'LLM 正在重试';
+  if (latestModelRequest.value?.status === 'streaming') return 'LLM 正在回复';
+  if (latestModelRequest.value?.status === 'prepared' || latestModelRequest.value?.status === 'pending') return '正在连接 LLM';
+  return '正在处理';
 });
 const statusClass = computed(() => activeTurn.value ? 'is-active' : 'is-idle');
 const statusRows = computed(() => {
-  if (!activeTurn.value) return [{ label: '状态', value: '当前无活动 Turn' }];
+  if (!activeTurn.value) return [{ label: '状态', value: '当前没有正在执行的任务' }];
   const rows: Array<{ label: string; value: string; nested?: boolean }> = [
-    { label: '当前阶段', value: statusLabel.value },
-    { label: '执行者', value: agentName.value },
-    { label: 'Turn', value: activeTurnId.value }
+    { label: '状态', value: statusLabel.value },
+    { label: 'Agent', value: agentName.value }
   ];
   for (const [index, tool] of activeToolCalls.value.slice(0, 2).entries()) {
     rows.push({
-      label: activeToolCalls.value.length > 1 ? `工具 ${index + 1}` : '工具',
+      label: activeToolCalls.value.length > 1 ? `正在执行 ${index + 1}` : '正在执行',
       value: typeof tool.tool_name === 'string' ? tool.tool_name : String(tool.id),
       nested: true
     });
   }
   if (pendingInteractions.value.length > 0) {
-    rows.push({ label: '待处理', value: `${pendingInteractions.value.length} 个用户交互`, nested: true });
+    rows.push({ label: '待处理', value: `${pendingInteractions.value.length} 项`, nested: true });
   }
   return rows;
 });
@@ -107,7 +106,7 @@ function integer(value: unknown): number {
     <span class="tab-title">{{ title }}</span>
     <HoverTooltipPanel
       class="turn-status-tooltip"
-      panel-title="可靠 Turn 状态"
+      panel-title="当前任务"
       :rows="statusRows"
       :delay-ms="180"
     >

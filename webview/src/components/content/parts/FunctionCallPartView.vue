@@ -210,7 +210,7 @@ const headerActions = computed<ToolHeaderAction[]>(() => {
     return [{
       id: `open-reliable-diff-${call.id}`,
       label: '查看差异',
-      title: '从可靠内核保存的原始与目标内容重新打开 Diff，不依赖当前 Workspace 或瞬态预览',
+      title: '使用执行记录中的修改前后内容查看差异，不依赖工作区当前文件',
       icon: IconFileDiff,
       disabled: false,
       invoke: () => {
@@ -306,8 +306,8 @@ const commandRuntimeStatus = computed(() => toolCall.value ? shellRuntimeStatusL
 const interactionStatusLabel = computed(() => {
   if (needsChangeApplyDecision.value) return '等待批准应用更改';
   if (needsExecutionDecision.value) return '等待批准执行';
-  if (needsResultSubmitDecision.value) return '等待确认结果回传';
-  if (settledControlInteractionAwaitingOutcome.value) return '决定已提交，正在归档';
+  if (needsResultSubmitDecision.value) return '等待确认是否把结果发送给 LLM';
+  if (settledControlInteractionAwaitingOutcome.value) return '决定已提交，正在完成处理';
   return undefined;
 });
 const statusLabel = computed(() => cancelFeedback.value?.message
@@ -318,7 +318,7 @@ const statusLabel = computed(() => cancelFeedback.value?.message
     ? labelForToolCall(toolCall.value, toolResult.value, toolOutcomeStatus.value)
     : props.streaming ? '正在生成工具调用' : '工具状态不完整'));
 // 可中断：正在推进（排队/执行/应用更改）或已批准待执行；等待用户决策的状态各有专用按钮，不重复给中断入口。
-// 注意：命令工具转后台后是终态 success（已把“成功”返回给 AI），不再算可中断——后台命令的终止在后台命令面板里做。
+// 注意：命令工具转后台后是终态 success（已把“成功”返回给 LLM），不再算可中断——后台命令的终止在后台命令面板里做。
 const canCancel = computed(() => {
   const call = toolCall.value;
   if (!call || finalizing.value) return false;
@@ -338,18 +338,18 @@ const canCancel = computed(() => {
 const statusTitle = computed(() => {
   if (!toolCall.value) {
     return props.streaming
-      ? 'Provider 正在生成工具调用'
-      : '消息中已有工具调用，但当前快照缺少对应的可靠 ToolCall 关系';
+      ? 'LLM 正在生成工具调用'
+      : '工具调用信息尚未同步完整';
   }
-  if (toolOutcomeStatus.value === 'missing') return 'ToolCall 已终态，但当前快照缺少 ToolOutcome';
-  if (finalizing.value) return '外部工具执行已结束，正在提交可靠终态';
+  if (toolOutcomeStatus.value === 'missing') return '工具结果尚未同步完整';
+  if (finalizing.value) return '工具已执行，正在保存结果';
   const runtimeStatus = commandRuntimeStatus.value?.status;
-  return runtimeStatus ? '工具状态：' + toolCall.value.status + ' · shell ' + runtimeStatus : '工具状态：' + toolCall.value.status;
+  return runtimeStatus ? '工具状态：' + statusLabel.value + ' · 命令 ' + runtimeStatus : '工具状态：' + statusLabel.value;
 });
 const durationLabel = computed(() => {
   const duration = toolCall.value?.durationMs;
   if (duration === undefined) return undefined;
-  return duration < 1000 ? `${Math.round(duration)}ms` : `${(duration / 1000).toFixed(duration < 10_000 ? 1 : 0)}s`;
+  return duration < 1000 ? `${Math.round(duration)} 毫秒` : `${(duration / 1000).toFixed(duration < 10_000 ? 1 : 0)} 秒`;
 });
 const summaryLabel = computed(() => toolCall.value?.summary?.trim() || fallbackToolSummary(props.part.functionCall.name, props.part.functionCall.args));
 const inlineProgressLabel = computed(() => toolCall.value?.error ? undefined : boundedInlineValue(displayProgress.value));
@@ -382,7 +382,7 @@ const commandSummaryPrefix = computed(() => {
 const hasCommandSummaryMeta = computed(() => Boolean(commandAccessLabel.value || commandForegroundWaitLabel.value));
 const summaryTitle = computed(() => [commandAccessLabel.value, commandForegroundWaitLabel.value, summaryLabel.value].filter(Boolean).join(' · ') || undefined);
 const hasBatchMeta = computed(() => props.batchIndex !== undefined && props.batchMode !== undefined && props.batchState !== undefined);
-const batchModeLabel = computed(() => props.batchMode === 'parallel' ? '并行批次' : '串行批次');
+const batchModeLabel = computed(() => props.batchMode === 'parallel' ? '并行执行' : '依次执行');
 const batchStateLabel = computed(() => {
   switch (props.batchState) {
     case 'active': return '当前执行';
@@ -393,8 +393,8 @@ const batchStateLabel = computed(() => {
 });
 const batchTitle = computed(() => {
   if (!hasBatchMeta.value) return undefined;
-  const active = props.activeBatchIndex ? `当前批次：B${props.activeBatchIndex}` : '当前批次：无';
-  return `B${props.batchIndex} · ${batchModeLabel.value} · ${batchStateLabel.value} · ${active}`;
+  const active = props.activeBatchIndex ? `当前执行组：${props.activeBatchIndex}` : '当前执行组：无';
+  return `执行组 ${props.batchIndex} · ${batchModeLabel.value} · ${batchStateLabel.value} · ${active}`;
 });
 const toggleLabel = computed(() => {
   if (!hasDetails.value) return `工具调用 ${props.part.functionCall.name}`;
@@ -625,7 +625,7 @@ function cancelToolExecution(): void {
 function rejectionReason(kind: DurableInteractionRequestKind): string {
   if (kind === 'exec_approval') return '用户拒绝执行工具。';
   if (kind === 'patch_approval') return '用户拒绝应用更改。';
-  return '用户拒绝将工具结果回传给 AI。';
+  return '用户拒绝将工具结果发送给 LLM。';
 }
 
 function applyInteractionFeedback(result: InteractionResultPayload): void {
@@ -796,10 +796,10 @@ function labelForToolCall(
   outcomeStatus: ReliableToolOutcomeProjectionStatus | undefined
 ): string {
   if (call.status === 'queued' && isRunAgentStartupCall(call)) {
-    return `等待子 Agent 启动槽（每轮上限 ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN}）`;
+    return `正在等待启动子 Agent（本轮最多同时启动 ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} 个）`;
   }
   if (call.status === 'awaiting_approval' && isExecutionApprovedProgress(call.progress)) {
-    return isWaitingForPreviousProgress(call.progress) ? '已批准，等待前序批次' : '已批准，等待执行';
+    return isWaitingForPreviousProgress(call.progress) ? '已批准，等待前面的工具完成' : '已批准，等待执行';
   }
   if (call.name === SUBMIT_PLAN_TOOL_NAME) {
     const planOutput = submitPlanOutputFromResult(result);
@@ -819,8 +819,8 @@ function labelForToolCall(
   if (outcomeStatus === 'conflict') return '工具结果冲突';
   if (outcomeStatus === 'cancelled') return '工具执行已取消';
   if (outcomeStatus === 'partial') return '工具部分完成';
-  if (call.status === 'success' && call.name === 'run_agent' && isBackgroundAgentRunResult(result)) return '子任务已转后台';
-  if (call.status === 'success' && isAsyncAgentRunResult(result)) return '子任务已启动';
+  if (call.status === 'success' && call.name === 'run_agent' && isBackgroundAgentRunResult(result)) return '子 Agent 已在后台运行';
+  if (call.status === 'success' && isAsyncAgentRunResult(result)) return '子 Agent 已启动';
   if (call.status === 'warning' && isPartialEditResult(result)) return '部分成功';
   return labelForStatus(call.status);
 }
@@ -828,7 +828,7 @@ function labelForToolCall(
 function labelForStatus(status: ToolCallStatus): string {
   const labels: Record<ToolCallStatus, string> = {
     streaming: '正在生成工具调用',
-    queued: '等待调度执行',
+    queued: '等待执行',
     awaiting_approval: '等待批准执行',
     awaiting_user_input: '等待用户回答',
     awaiting_child: '等待子 Agent 回答',
@@ -837,7 +837,7 @@ function labelForStatus(status: ToolCallStatus): string {
     applying_change: '正在应用更改',
     change_applied: '更改已应用',
     change_rejected: '更改已拒绝',
-    awaiting_result_submit: '等待确认结果回传',
+    awaiting_result_submit: '等待确认是否把结果发送给 LLM',
     success: '工具执行成功',
     warning: '执行完成（有警告）',
     error: '工具执行失败'
@@ -1090,7 +1090,7 @@ function isFinalizingProgress(progress: unknown): boolean {
       </div>
       <p v-if="toolCall?.error" class="part-card-error">{{ toolCall.error }}</p>
       <p v-else-if="executionApprovalPending && isWaitingForPreviousProgress(toolCall?.progress)" class="part-card-note">
-        已批准执行，将在前序批次完成后按原始顺序自动继续。
+        已批准执行，前面的工具完成后将按顺序继续。
       </p>
       <p v-else-if="executionApprovalPending" class="part-card-note">
         已批准执行，将在存档点完成后自动继续。
@@ -1108,8 +1108,8 @@ function isFinalizingProgress(progress: unknown): boolean {
     <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('patch_approval', 'reject')">拒绝更改</button>
   </div>
   <div v-else-if="needsResultSubmitDecision" class="tool-decision-actions is-external">
-    <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('result_review', 'accept')">回传结果给 AI</button>
-    <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('result_review', 'reject')">拒绝结果并告知 AI</button>
+    <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('result_review', 'accept')">将结果发送给 LLM</button>
+    <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('result_review', 'reject')">拒绝发送并告知 LLM</button>
   </div>
 </template>
 

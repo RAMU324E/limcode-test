@@ -100,7 +100,7 @@ const selectedNewModelSpecificModelId = computed({
 });
 const canCreateModelSpecificConfig = computed(() => !!activeConfig.value && !!selectedNewModelSpecificModelId.value);
 const deletingModelConfig = computed(() => activeModelConfigs.value.find((config) => config.id === deletingModelConfigId.value));
-const deletingModelConfigLabel = computed(() => deletingModelConfig.value ? modelLabel(deletingModelConfig.value.modelId) : '该模型');
+const deletingModelConfigLabel = computed(() => deletingModelConfig.value ? modelLabel(deletingModelConfig.value.modelId) : '该 LLM');
 
 /** 获取模型弹窗对应配置中已存在的模型 ID，用于在弹窗中标记「已添加」状态。 */
 const fetchedDialogExistingModelIds = computed<string[]>(() => {
@@ -188,7 +188,7 @@ function modelLabel(modelId: string): string {
 }
 
 function modelConfigDescription(modelConfig: LlmProviderModelConfigRecord): string {
-  return `模型 ID：${modelConfig.modelId} · 命中该模型时完整替代渠道默认配置与上下文压缩`;
+  return `LLM ID：${modelConfig.modelId} · 使用该 LLM 时完整替代渠道默认配置与上下文压缩`;
 }
 
 function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord): LlmProviderConfigRecord {
@@ -409,7 +409,7 @@ function cancelDelete(): void {
           title="切换配置页"
           empty-text="暂无渠道配置。"
           searchable
-          search-placeholder="筛选配置页..."
+          search-placeholder="筛选配置页…"
         />
       </label>
 
@@ -433,26 +433,26 @@ function cancelDelete(): void {
       </label>
 
       <label class="global-settings-field global-settings-field-wide">
-        <span>Base URL</span>
+        <span>接口地址（Base URL）</span>
         <input :value="activeConfig.baseUrl" type="text" placeholder="https://api.openai.com/v1" @input="updateActiveConfigField('baseUrl', inputValue($event))" />
       </label>
 
       <label class="global-settings-field global-settings-api-key-field global-settings-field-wide">
-        <span>API Key</span>
+        <span>API 密钥</span>
         <input :value="activeConfig.apiKey" type="text" placeholder="sk-..." autocomplete="off" spellcheck="false" @input="updateActiveConfigField('apiKey', inputValue($event))" />
       </label>
 
-      <section class="model-manager global-settings-field-wide" aria-label="模型列表">
+      <section class="model-manager global-settings-field-wide" aria-label="LLM 列表">
         <header class="model-manager-header">
-          <label>模型列表</label>
+          <label>LLM 列表</label>
           <div class="model-manager-actions">
             <button type="button" class="model-manager-button" @click="openNewModel">
               <IconPlus stroke="2" aria-hidden="true" />
-              <span>新建模型</span>
+              <span>新建 LLM</span>
             </button>
             <button type="button" class="model-manager-button" @click="settings.requestModelsForActiveConfig()">
               <IconCloudDown stroke="2" aria-hidden="true" />
-              <span>获取模型</span>
+              <span>获取 LLM</span>
             </button>
             <button type="button" class="model-manager-button" :disabled="!canClearModels" @click="openClearModelsConfirm">
               <IconTrash stroke="2" aria-hidden="true" />
@@ -462,16 +462,16 @@ function cancelDelete(): void {
         </header>
 
         <div class="model-list-container">
-          <label class="model-filter-box" aria-label="筛选模型">
+          <label class="model-filter-box" aria-label="筛选 LLM">
             <IconSearch stroke="2" aria-hidden="true" />
-            <input v-model="modelFilter" type="text" placeholder="筛选模型..." />
+            <input v-model="modelFilter" type="text" placeholder="筛选 LLM…" />
           </label>
 
           <div class="model-list-shell">
             <div ref="modelListScroller" class="model-list-scroll">
               <div class="model-list">
-                <div v-if="!hasModels" class="model-list-empty">暂无模型，请新建模型。</div>
-                <div v-else-if="!filteredModels.length" class="model-list-empty">没有匹配的模型。</div>
+                <div v-if="!hasModels" class="model-list-empty">暂无 LLM，请新建 LLM。</div>
+                <div v-else-if="!filteredModels.length" class="model-list-empty">没有匹配的 LLM。</div>
                 <div
                   v-for="model in filteredModels"
                   :key="model.id"
@@ -487,13 +487,13 @@ function cancelDelete(): void {
                   <span class="model-info">
                     <span class="model-name">{{ model.name }}</span>
                     <span class="model-id">ID: {{ model.id }}</span>
-                    <span v-if="model.createdAt" class="model-time">时间: {{ formatModelTime(model.createdAt) }}</span>
-                    <span v-if="activeModelConfigs.some((config) => config.modelId === model.id)" class="model-time">已设置模型专属配置</span>
+                    <span v-if="model.createdAt" class="model-time">时间：{{ formatModelTime(model.createdAt) }}</span>
+                    <span v-if="activeModelConfigs.some((config) => config.modelId === model.id)" class="model-time">已设置 LLM 专属配置</span>
                   </span>
                   <button
                     type="button"
                     class="model-remove-btn"
-                    aria-label="移除模型"
+                    aria-label="移除 LLM"
                     @click.stop="removeModel(model.id)"
                     @keydown.enter.stop.prevent="removeModel(model.id)"
                     @keydown.space.stop.prevent="removeModel(model.id)"
@@ -506,14 +506,14 @@ function cancelDelete(): void {
         </div>
       </section>
 
-      <section class="channel-config-groups global-settings-field-wide" aria-label="模型配置分组">
+      <section class="channel-config-groups global-settings-field-wide" aria-label="LLM 配置分组">
         <article class="settings-collapse-panel">
           <header class="settings-collapse-head">
             <button type="button" class="settings-collapse-toggle" :aria-expanded="defaultConfigOpen" @click="defaultConfigOpen = !defaultConfigOpen">
               <IconChevronDown class="settings-collapse-caret" :class="{ collapsed: !defaultConfigOpen }" stroke="2" aria-hidden="true" />
               <span class="settings-collapse-title-wrap">
                 <span class="settings-collapse-title">渠道默认配置</span>
-                <span class="settings-collapse-desc">当前渠道的默认高级配置与上下文压缩；未设置模型专属配置时使用这里。</span>
+                <span class="settings-collapse-desc">当前渠道的默认高级配置与上下文压缩；未设置 LLM 专属配置时使用这里。</span>
               </span>
             </button>
           </header>
@@ -545,8 +545,8 @@ function cancelDelete(): void {
             <button type="button" class="settings-collapse-toggle" :aria-expanded="modelSpecificGroupOpen" @click="modelSpecificGroupOpen = !modelSpecificGroupOpen">
               <IconChevronDown class="settings-collapse-caret" :class="{ collapsed: !modelSpecificGroupOpen }" stroke="2" aria-hidden="true" />
               <span class="settings-collapse-title-wrap">
-                <span class="settings-collapse-title">模型专属配置</span>
-                <span class="settings-collapse-desc">为某个模型创建独立折叠面板；命中该模型时整体替代渠道默认配置与上下文压缩。</span>
+                <span class="settings-collapse-title">LLM 专属配置</span>
+                <span class="settings-collapse-desc">为某个 LLM 创建独立配置；使用该 LLM 时会完整替代渠道默认配置和上下文压缩设置。</span>
               </span>
             </button>
           </header>
@@ -554,28 +554,28 @@ function cancelDelete(): void {
           <div v-if="modelSpecificGroupOpen" class="settings-collapse-body model-specific-body">
             <div class="model-specific-create-row">
               <label class="global-settings-field model-specific-select-field">
-                <span>选择模型</span>
+                <span>选择 LLM</span>
                 <SettingsDropdown
                   v-model="selectedNewModelSpecificModelId"
                   :options="modelSpecificOptions"
-                  title="选择要创建专属配置的模型"
-                  empty-text="当前模型列表没有可创建专属配置的模型。"
+                  title="选择要创建专属配置的 LLM"
+                  empty-text="当前 LLM 列表没有可创建专属配置的 LLM。"
                   searchable
-                  search-placeholder="筛选模型..."
+                  search-placeholder="筛选 LLM…"
                   placement="top"
                 />
               </label>
               <button type="button" class="model-manager-button model-specific-create-button" :disabled="!canCreateModelSpecificConfig" @click="createModelSpecificConfig">
                 <IconPlus stroke="2" aria-hidden="true" />
-                <span>创建模型配置</span>
+                <span>创建 LLM 配置</span>
               </button>
             </div>
 
             <p class="model-specific-note">
-              模型专属配置是完整配置副本：前置系统提示词、Header、Body、重试、多模态、上下文窗口、Prompt Cache 与上下文压缩都会替代默认配置；空前置提示词表示不注入，空 Header / Body 表示不使用默认 Header / Body。
+              LLM 专属配置是完整配置副本：前置系统提示词、请求头、请求体、重试、多模态、上下文窗口、提示词缓存与上下文压缩都会替代默认配置；空前置提示词表示不注入，空请求头或请求体表示不使用默认值。
             </p>
 
-            <div v-if="!activeModelConfigs.length" class="model-specific-empty">暂无模型专属配置。</div>
+            <div v-if="!activeModelConfigs.length" class="model-specific-empty">暂无 LLM 专属配置。</div>
 
             <article v-for="modelConfig in activeModelConfigs" :key="modelConfig.id" class="settings-collapse-panel model-config-panel">
               <header class="settings-collapse-head model-config-head">
@@ -586,7 +586,7 @@ function cancelDelete(): void {
                     <span class="settings-collapse-desc">{{ modelConfigDescription(modelConfig) }}</span>
                   </span>
                 </button>
-                <button type="button" class="icon-action model-config-delete" aria-label="删除模型专属配置" @click="openDeleteModelConfigConfirm(modelConfig.id)">
+                <button type="button" class="icon-action model-config-delete" aria-label="删除 LLM 专属配置" @click="openDeleteModelConfigConfirm(modelConfig.id)">
                   <IconTrash stroke="2" aria-hidden="true" />
                 </button>
               </header>
@@ -629,10 +629,10 @@ function cancelDelete(): void {
 
     <div class="global-settings-path-list" aria-label="渠道配置路径信息">
       <p class="global-settings-path">
-        当前配置选择：<code>{{ settings.filePaths.llm || '等待后端返回 settings/llm.json 路径...' }}</code>
+        当前配置选择：<code>{{ settings.filePaths.llm || '正在获取当前渠道配置路径…' }}</code>
       </p>
       <p class="global-settings-path">
-        渠道配置页：<code>{{ settings.filePaths.llmProviderConfigs || '等待后端返回 settings/llm-provider-configs/index.json 路径...' }}</code>
+        渠道配置页：<code>{{ settings.filePaths.llmProviderConfigs || '正在获取模型渠道配置路径…' }}</code>
       </p>
     </div>
       </div>
@@ -656,17 +656,17 @@ function cancelDelete(): void {
 
     <InputPanel
       :open="newModelOpen"
-      title="新建模型"
-      label="模型 ID"
+      title="新建 LLM"
+      label="LLM ID"
       initial-value=""
-      placeholder="输入模型 ID"
-      confirm-label="添加模型"
+      placeholder="输入 LLM ID"
+      confirm-label="添加 LLM"
       @confirm="confirmNewModel"
       @cancel="cancelNewModel"
     >
       <label class="global-settings-field create-model-name-field">
-        <span>模型名称（可选）</span>
-        <input :value="newModelName" type="text" placeholder="不填则与模型 ID 相同" @input="updateNewModelName" />
+        <span>LLM 名称（可选）</span>
+        <input :value="newModelName" type="text" placeholder="不填则与 LLM ID 相同" @input="updateNewModelName" />
       </label>
     </InputPanel>
 
@@ -684,8 +684,8 @@ function cancelDelete(): void {
 
     <ConfirmPanel
       :open="clearModelsConfirmOpen"
-      title="清除全部模型？"
-      description-html="将清除当前配置页下的所有模型，并取消当前使用模型，此操作<strong>无法撤销</strong>。"
+      title="清除全部 LLM？"
+      description-html="将清除当前配置页下的所有 LLM，并取消当前使用的 LLM，此操作<strong>无法撤销</strong>。"
       confirm-label="清除全部"
       cancel-label="取消"
       @confirm="confirmClearModels"
@@ -705,8 +705,8 @@ function cancelDelete(): void {
 
     <ConfirmPanel
       :open="deleteModelConfigConfirmOpen"
-      title="删除模型专属配置？"
-      :description-html="`将删除「${deletingModelConfigLabel}」的模型专属配置。删除后该模型会重新使用渠道默认配置，此操作<strong>无法撤销</strong>。`"
+      title="删除 LLM 专属配置？"
+      :description-html="`将删除「${deletingModelConfigLabel}」的 LLM 专属配置。删除后该 LLM 会重新使用渠道默认配置，此操作<strong>无法撤销</strong>。`"
       confirm-label="删除"
       cancel-label="取消"
       @confirm="confirmDeleteModelConfig"

@@ -118,7 +118,7 @@ const statusLabel = computed(() => {
     interaction.value?.request.state === 'resolved'
     && !output.value
     && status.value === 'pending'
-  ) return '审批决定已提交，正在归档';
+  ) return '审批决定已提交，正在完成';
   switch (status.value) {
     case 'pending': return '等待你审批';
     case 'approved': return 'Plan 已批准';
@@ -363,15 +363,15 @@ function agentTypeDescription(agent: AgentRecord): string {
 
         <p v-if="userMessage && !pending" class="plan-proposal-message">{{ userMessage }}</p>
 
-        <section v-if="delegatedExecution && !pending" class="plan-delegation-result" aria-label="Plan 分派信息">
+        <section v-if="delegatedExecution && !pending" class="plan-delegation-result" aria-label="Plan 执行信息">
           <header class="plan-delegation-heading">
             <IconRobot stroke="2" aria-hidden="true" />
-            <span>已分派给 {{ delegatedExecution.agentType || delegatedExecution.agentId || 'Agent' }}</span>
+            <span>已交给 {{ delegatedExecution.agentType || delegatedExecution.agentId || 'Agent' }} 执行</span>
           </header>
           <dl class="plan-delegation-metadata">
-            <div v-if="delegatedExecution.runId"><dt>Run ID</dt><dd>{{ delegatedExecution.runId }}</dd></div>
-            <div v-if="delegatedExecution.conversationId"><dt>Conversation ID</dt><dd>{{ delegatedExecution.conversationId }}</dd></div>
-            <div v-if="delegatedExecution.answerBridgeId"><dt>Answer Bridge ID</dt><dd>{{ delegatedExecution.answerBridgeId }}</dd></div>
+            <div v-if="delegatedExecution.runId"><dt>运行 ID</dt><dd>{{ delegatedExecution.runId }}</dd></div>
+            <div v-if="delegatedExecution.conversationId"><dt>对话 ID</dt><dd>{{ delegatedExecution.conversationId }}</dd></div>
+            <div v-if="delegatedExecution.answerBridgeId"><dt>回答通道 ID</dt><dd>{{ delegatedExecution.answerBridgeId }}</dd></div>
           </dl>
           <button
             v-if="delegatedExecution.conversationId"
@@ -395,7 +395,7 @@ function agentTypeDescription(agent: AgentRecord): string {
               :disabled="!!submitting"
               rows="3"
               :maxlength="MAX_PLAN_FEEDBACK_LENGTH"
-              placeholder="说明希望 AI 如何修改 Plan；留空则仅告知 AI 需要重新调整。Ctrl/Cmd + Enter 提交"
+              placeholder="说明希望 LLM 如何修改 Plan；留空则仅告知 LLM 需要重新调整。Ctrl/Cmd + Enter 提交"
               aria-label="Plan 修改要求"
               @input="updateChangeFeedback"
               @keydown.ctrl.enter.prevent="submitChangeFeedback"
@@ -408,7 +408,7 @@ function agentTypeDescription(agent: AgentRecord): string {
               variant="minimal"
             />
           </div>
-          <p class="plan-feedback-hint">反馈会作为工具结果回传给 AI，AI 应根据反馈重新提交 Plan。</p>
+          <p class="plan-feedback-hint">修改要求会发送给 LLM，LLM 应根据要求重新提交 Plan。</p>
         </div>
       </div>
       <AdvancedScrollbar
@@ -442,7 +442,7 @@ function agentTypeDescription(agent: AgentRecord): string {
   <ConfirmPanel
     :open="dispatchPanelOpen && !interactionView"
     title="选择执行 Agent"
-    description="将创建所选 Agent 类型的临时镜像和独立对话，并在后台执行已批准的 Plan。"
+    description="将创建一个独立的子 Agent 对话，并在后台执行已批准的 Plan。"
     :actions="dispatchPanelActions"
     @cancel="closeDispatchPanel"
     @confirm="confirmDispatch"

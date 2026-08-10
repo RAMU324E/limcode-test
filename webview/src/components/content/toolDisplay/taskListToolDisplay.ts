@@ -28,8 +28,8 @@ function inputSections(operation: TaskListToolOperationRecord): ToolDisplaySecti
     kind: 'input',
     title: '任务清单操作',
     rows: [
-      { label: 'mode', value: operation.mode === 'rewrite' ? 'rewrite · 重写完整清单' : 'update · 增量更新' },
-      { label: 'items', value: `${operation.items.length} 项` }
+      { label: '操作方式', value: operation.mode === 'rewrite' ? '重建完整任务清单' : '更新现有任务清单' },
+      { label: '任务数', value: `${operation.items.length} 项` }
     ],
     rowStyle: 'keyValue'
   }];

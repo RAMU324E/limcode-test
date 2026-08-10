@@ -10,13 +10,13 @@ import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading'
 const INHERIT_GLOBAL_MODEL_ID = '__inherit_global_model__';
 
 const props = withDefaults(defineProps<{ scopeKind: ConfigScopeKind; scopeId?: string; title?: string; description?: string }>(), {
-  title: '模型配置',
+  title: 'LLM 配置',
   description: ''
 });
 
 const globalSettings = useGlobalSettingsStore();
 const store = useModelProfileStore();
-const { loading: modelLoading, text: modelLoadingText } = useSettingsLoadingText('模型配置', () => props.scopeKind, () => props.scopeId, {
+const { loading: modelLoading, text: modelLoadingText } = useSettingsLoadingText('LLM 配置', () => props.scopeKind, () => props.scopeId, {
   globalSettingsSections: ['llm', 'llmProviderConfigs'] as const
 });
 const providerConfigId = ref(INHERIT_GLOBAL_MODEL_ID);
@@ -25,7 +25,7 @@ const local = computed(() => store.localProfileFor(props.scopeKind, props.scopeI
 const isInheritSelected = computed(() => providerConfigId.value === INHERIT_GLOBAL_MODEL_ID);
 const inheritedModelText = computed(() => {
   const config = globalSettings.activeLlmProviderConfig;
-  return config?.model ? `${config.name} · ${config.model}` : '使用全局/对话当前渠道与模型';
+  return config?.model ? `${config.name} · ${config.model}` : '使用全局/对话当前渠道与 LLM';
 });
 const options = computed<SettingsDropdownOption[]>(() => [
   {
@@ -85,21 +85,21 @@ function save(): void {
         </h3>
         <p v-if="description">{{ description }}</p>
       </div>
-      <span>{{ local.profile ? '当前作用域已配置' : '继承全局' }}</span>
+       <span>{{ local.profile ? '当前范围已配置' : '继承全局' }}</span>
     </header>
     <div class="model-profile-grid">
       <label>
-        <span>模型来源</span>
-        <SettingsDropdown v-model="selectedProviderConfigId" :options="options" title="选择模型来源" searchable search-placeholder="筛选模型来源..." />
+        <span>LLM 来源</span>
+        <SettingsDropdown v-model="selectedProviderConfigId" :options="options" title="选择 LLM 来源" searchable search-placeholder="筛选 LLM 来源…" />
       </label>
       <label>
-        <span>模型</span>
+        <span>LLM</span>
         <input v-model="model" type="text" :disabled="isInheritSelected" :placeholder="isInheritSelected ? inheritedModelText : '例如 deepseek-v4-flash'" />
       </label>
     </div>
     <div class="model-profile-actions">
-      <button v-if="!isInheritSelected" type="button" :disabled="!model.trim()" @click="save">保存模型配置</button>
-      <span v-else>当前将继承全局/对话的模型配置。</span>
+      <button v-if="!isInheritSelected" type="button" :disabled="!model.trim()" @click="save">保存 LLM 配置</button>
+      <span v-else>当前将继承全局/对话的 LLM 配置。</span>
       <span>{{ store.status }}</span>
     </div>
   </section>

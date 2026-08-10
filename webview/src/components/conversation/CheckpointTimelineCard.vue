@@ -49,8 +49,8 @@ const shadowRepositoryStatusLabel = computed(() => {
   return undefined;
 });
 const shadowRepositoryStatusTitle = computed(() => {
-  if (shadowChecking.value) return '正在确认此存档点的 shadow 仓库状态。';
-  if (shadowMissing.value) return '该存档点的 shadow 仓库已被删除，无法回档。';
+  if (shadowChecking.value) return '正在确认此存档点的内部仓库状态。';
+  if (shadowMissing.value) return '该存档点的内部仓库已被删除，无法恢复。';
   return undefined;
 });
 
@@ -66,11 +66,11 @@ const timeLabel = computed(() => formatCheckpointTime(props.checkpoint.createdAt
 const timeTitle = computed(() => formatFullDateTime(props.checkpoint.createdAt));
 
 const restoreButtonTitle = computed(() => {
-  if (props.checkpoint.status !== 'created') return '只有已创建的存档点可以回档。';
-  if (!props.checkpoint.commitSha) return '该存档点没有可回档的快照。';
-  if (!shadowRepository.value) return '未找到此存档点关联的 shadow 仓库。';
-  if (shadowChecking.value) return '正在确认 shadow 仓库状态，请稍候。';
-  if (shadowMissing.value) return 'shadow 仓库已删除，无法回档。';
+  if (props.checkpoint.status !== 'created') return '只有已创建的存档点可以恢复。';
+  if (!props.checkpoint.commitSha) return '该存档点没有可恢复的数据。';
+  if (!shadowRepository.value) return '未找到此存档点关联的内部仓库。';
+  if (shadowChecking.value) return '正在确认内部仓库状态，请稍候。';
+  if (shadowMissing.value) return '内部仓库已删除，无法恢复。';
   return '将当前工作区恢复到此存档点';
 });
 const restoreConfirmDescription = computed(() => {
@@ -84,7 +84,7 @@ let dismissTimer: ReturnType<typeof setInterval> | undefined;
 
 const restoreConfirmActions: ConfirmPanelAction[] = [
   { key: 'cancel', label: '取消', variant: 'secondary' },
-  { key: 'confirm', label: '回档', variant: 'danger' }
+  { key: 'confirm', label: '恢复', variant: 'danger' }
 ];
 
 function beginRestore(): void {
@@ -179,8 +179,8 @@ const triggerLabel = computed(() => {
     case 'conversation_initial': return '初始存档';
     case 'user_message_before': return '用户消息前';
     case 'user_message_after': return '用户消息后';
-    case 'llm_response_before': return '每次调用 AI 前';
-    case 'llm_response_after': return '每次调用 AI 后';
+    case 'llm_response_before': return '每次调用 LLM 前';
+    case 'llm_response_after': return '每次调用 LLM 后';
     case 'tool_execution_before': return '工具执行前';
     case 'tool_execution_after': return '工具执行后';
     case 'agent_run_completed_before': return '整回合回复完成前';
@@ -257,7 +257,7 @@ function pad2(value: number): string {
       <IconGitCommit class="checkpoint-leading-icon" stroke="2" aria-hidden="true" />
       <span class="checkpoint-project" :title="projectLabel">{{ projectLabel }}</span>
       <template v-if="isPending">
-        <span class="checkpoint-pending-text">创建中...</span>
+        <span class="checkpoint-pending-text">创建中…</span>
       </template>
       <template v-else>
         <span v-if="commitLabel" class="checkpoint-commit checkpoint-result-field">{{ commitLabel }}</span>
@@ -276,18 +276,18 @@ function pad2(value: number): string {
         v-if="dismissCountdown > 0"
         class="checkpoint-dismiss-countdown"
         :title="`${dismissCountdown} 秒后自动移除`"
-      >{{ dismissCountdown }}s</span>
+      >{{ dismissCountdown }} 秒</span>
       <div v-if="!isPending" class="checkpoint-actions" aria-label="存档点操作">
         <button
           type="button"
           class="checkpoint-action-button"
           :disabled="!canRestore"
           :title="restoreButtonTitle"
-          aria-label="回档到此存档点"
+          aria-label="恢复到此存档点"
           @click="beginRestore"
         >
           <IconArrowBackUp class="checkpoint-action-icon" stroke="2" aria-hidden="true" />
-          <span>回档</span>
+          <span>恢复</span>
         </button>
         <button
           v-if="canDismiss"
@@ -303,7 +303,7 @@ function pad2(value: number): string {
     </div>
     <ConfirmPanel
       :open="restoreConfirmOpen"
-      title="回档到此存档点？"
+      title="恢复到此存档点？"
       :description="restoreConfirmDescription"
       :actions="restoreConfirmActions"
       danger

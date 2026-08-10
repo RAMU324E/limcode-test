@@ -61,7 +61,7 @@ const enabledCount = computed(() => skills.value.filter((skill) => isSkillEnable
 const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
 const sourceLabel = computed(() => {
   if (props.scopeKind === 'global') return '全局默认策略';
-  if (hasLocalOverride.value) return '当前作用域覆盖';
+  if (hasLocalOverride.value) return '当前范围的单独设置';
   return '继承全局默认策略';
 });
 

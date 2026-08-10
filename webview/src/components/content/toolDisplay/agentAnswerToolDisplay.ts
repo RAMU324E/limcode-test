@@ -23,8 +23,8 @@ export const submitAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
       kind: 'input',
       title: '提交信息',
       rows: [
-        ...(args.answerBridgeId ? [{ label: 'answerBridgeId', value: args.answerBridgeId }] : []),
-        ...(args.title ? [{ label: 'title', value: args.title }] : [])
+        ...(args.answerBridgeId ? [{ label: '回答通道 ID', value: args.answerBridgeId }] : []),
+        ...(args.title ? [{ label: '标题', value: args.title }] : [])
       ],
       rowStyle: 'keyValue'
     });
@@ -39,9 +39,9 @@ export const submitAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
         kind: 'output',
         title: '提交结果',
         rows: [
-          { label: 'ok', value: String(result.ok) },
-          ...(result.answerBridgeId ? [{ label: 'answerBridgeId', value: result.answerBridgeId }] : []),
-          ...(result.updated !== undefined ? [{ label: 'updated', value: String(result.updated) }] : [])
+          { label: '是否成功', value: result.ok === undefined ? '未知' : result.ok ? '是' : '否' },
+          ...(result.answerBridgeId ? [{ label: '回答通道 ID', value: result.answerBridgeId }] : []),
+          ...(result.updated !== undefined ? [{ label: '是否更新', value: result.updated ? '是' : '否' }] : [])
         ],
         rowStyle: 'keyValue'
       }]

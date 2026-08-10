@@ -110,11 +110,11 @@ const compactLabel = computed(() => {
 });
 const percentLabel = computed(() => usageRatio.value === undefined ? '未知' : `${(usageRatio.value * 100).toFixed(usageRatio.value < 0.1 ? 1 : 0)}%`);
 const tooltipRows = computed(() => [
-  { label: '模型', value: modelId.value || '尚未产生模型请求' },
+  { label: 'LLM', value: modelId.value || '尚未发起 LLM 请求' },
   { label: '当前上下文', value: contextUsageLabel() },
-  { label: '上下文窗口', value: contextWindowTokens.value === undefined ? '未知（后端未投影且配置未设置）' : `${formatTokenNumber(contextWindowTokens.value)} token` },
+  { label: '上下文窗口', value: contextWindowTokens.value === undefined ? '未知（暂未获取，且配置中未设置）' : `${formatTokenNumber(contextWindowTokens.value)} Token` },
   { label: '窗口占用', value: percentLabel.value },
-  { label: '压缩阈值', value: thresholdTokens.value === undefined ? '未知' : `${formatTokenNumber(thresholdTokens.value)} token` },
+  { label: '压缩阈值', value: thresholdTokens.value === undefined ? '未知' : `${formatTokenNumber(thresholdTokens.value)} Token` },
   { label: '数据来源', value: usageSourceLabel() }
 ]);
 const overThreshold = computed(() => actualContextTokens.value !== undefined
@@ -183,18 +183,18 @@ function contextUsageLabel(): string {
   const tokens = actualContextTokens.value;
   if (tokens === undefined) return '未知（尚未建立上下文）';
   const suffix = usageQuality.value === 'estimated'
-    ? ' token（当前可靠估算）'
+    ? ' Token（当前估算）'
     : usageQuality.value === 'previous_exact'
-      ? ' token（上一轮精确值）'
-      : ' token（精确）';
+      ? ' Token（上一轮精确值）'
+      : ' Token（精确）';
   return `${formatTokenNumber(tokens)}${suffix}`;
 }
 
 function usageSourceLabel(): string {
-  if (usageQuality.value === 'exact') return '最近一轮普通 ModelRequest 输入 usage';
-  if (usageQuality.value === 'estimated') return '当前 ContextSequenceRoot provider 语义估算';
-  if (usageQuality.value === 'previous_exact') return '上一条已完成普通 ModelRequest 输入 usage';
-  return latestRequest.value ? 'ModelRequest / 当前模型配置' : '当前模型配置';
+  if (usageQuality.value === 'exact') return '最近一次 LLM 请求的实际输入用量';
+  if (usageQuality.value === 'estimated') return '根据当前模型渠道的上下文规则估算';
+  if (usageQuality.value === 'previous_exact') return '上一次已完成 LLM 请求的实际输入用量';
+  return latestRequest.value ? 'LLM 请求 / 当前 LLM 配置' : '当前 LLM 配置';
 }
 
 function nestedToken(value: unknown, ...keys: string[]): number | undefined {
@@ -257,11 +257,11 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   <HoverTooltipPanel
     class="reliable-context-status"
     :class="{ 'is-over-threshold': overThreshold, 'is-unknown': actualContextTokens === undefined }"
-    panel-title="模型上下文"
+    panel-title="LLM 上下文"
     :rows="tooltipRows"
     :delay-ms="180"
   >
-    <button type="button" class="reliable-context-button" :aria-label="`模型上下文 ${compactLabel}`">
+    <button type="button" class="reliable-context-button" :aria-label="`LLM 上下文 ${compactLabel}`">
       <span class="reliable-context-track" aria-hidden="true">
         <span class="reliable-context-fill" :style="fillStyle"></span>
         <span v-if="thresholdTokens && contextWindowTokens" class="reliable-context-threshold" :style="thresholdStyle"></span>

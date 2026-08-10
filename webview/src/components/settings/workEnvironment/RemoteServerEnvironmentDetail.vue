@@ -76,19 +76,19 @@ function normalizePositiveInteger(value: string): number | undefined {
 <template>
   <div class="work-env-form-grid">
     <label class="global-settings-field">
-      <span>Name</span>
-      <input :value="environment.name ?? ''" :readonly="readonly" type="text" placeholder="必填，环境显示名称，方便自己和 AI 识别" @change="updateRemoteField('name', inputValue($event))" />
+      <span>名称</span>
+      <input :value="environment.name ?? ''" :readonly="readonly" type="text" placeholder="必填，便于你和 LLM 识别此环境" @change="updateRemoteField('name', inputValue($event))" />
     </label>
     <label class="global-settings-field">
-      <span>Host</span>
+      <span>主机地址</span>
       <input :value="environment.host ?? environment.name" :readonly="readonly" type="text" @change="updateRemoteField('host', inputValue($event))" />
     </label>
     <label class="global-settings-field">
-      <span>User</span>
+      <span>用户名</span>
       <input :value="environment.user ?? ''" :readonly="readonly" type="text" placeholder="必填，例如：root" @change="updateRemoteField('user', inputValue($event))" />
     </label>
     <label class="global-settings-field">
-      <span>Port（可选）</span>
+      <span>端口（可选）</span>
       <input :value="environment.port ?? ''" :readonly="readonly" type="number" placeholder="默认 22" @change="updateRemoteField('port', inputOptionalNumber($event))" />
     </label>
     <label class="global-settings-field global-settings-field-wide">
@@ -102,20 +102,20 @@ function normalizePositiveInteger(value: string): number | undefined {
       />
     </label>
     <label v-if="sshAuthMethod(environment) === 'identityFile'" class="global-settings-field global-settings-field-wide">
-      <span>IdentityFile</span>
+      <span>SSH 私钥文件</span>
       <input :value="environment.identityFile ?? ''" :readonly="readonly" type="text" placeholder="必填，例如：C:\Users\you\.ssh\id_rsa" @change="updateRemoteField('identityFile', inputValue($event))" />
-      <small>如果同时配置了 IdentityFile 和 Password，会优先使用 IdentityFile。</small>
+      <small>如果同时配置了私钥文件和密码，将优先使用私钥文件。</small>
     </label>
     <label v-else class="global-settings-field global-settings-field-wide">
-      <span>Password</span>
+      <span>密码</span>
       <input :value="environment.password ?? ''" :readonly="readonly" type="password" autocomplete="off" placeholder="必填，输入 SSH 登录密码" @change="updateRemoteField('password', inputValue($event))" />
     </label>
     <label class="global-settings-field">
-      <span>Workdir（可选）</span>
+      <span>工作目录（可选）</span>
       <input :value="environment.workdir ?? ''" :readonly="readonly" type="text" placeholder="例如：/root" @change="updateRemoteField('workdir', inputValue($event))" />
     </label>
     <label class="global-settings-field">
-      <span>OS（可选）</span>
+      <span>操作系统（可选）</span>
       <SettingsDropdown
         :model-value="environment.os ?? ''"
         :options="osOptions"
@@ -125,7 +125,7 @@ function normalizePositiveInteger(value: string): number | undefined {
       />
     </label>
     <label class="global-settings-field global-settings-field-wide">
-      <span>Description（可选）</span>
+      <span>说明（可选）</span>
       <div class="work-env-description-shell">
         <div
           :key="environment.id"

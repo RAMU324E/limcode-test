@@ -30,46 +30,46 @@ interface ProviderParameterDisplay {
 const ALL_PROVIDERS = ['openai-compatible', 'openai-responses', 'claude', 'gemini', 'deepseek'] as const satisfies readonly LlmProviderKind[];
 const GEMINI_CLAUDE = ['gemini', 'claude'] as const satisfies readonly LlmProviderKind[];
 const REASONING_MODE_OPTIONS = [
-  { value: 'standard', label: 'Standard' },
-  { value: 'pro', label: 'Pro' }
+  { value: 'standard', label: '标准' },
+  { value: 'pro', label: '专业' }
 ] as const satisfies readonly { value: LlmReasoningMode; label: string }[];
 const THINKING_LEVEL_OPTIONS: Record<LlmProviderKind, readonly { value: LlmThinkingLevel; label: string; description?: string }[]> = {
   gemini: [
-    { value: 'minimal', label: 'Minimal' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' }
+    { value: 'minimal', label: '最低' },
+    { value: 'low', label: '低' },
+    { value: 'medium', label: '中' },
+    { value: 'high', label: '高' }
   ],
   claude: [
-    { value: 'none', label: 'None', description: '关闭思考' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'XHigh' },
-    { value: 'max', label: 'Max' }
+    { value: 'none', label: '关闭', description: '关闭思考' },
+    { value: 'low', label: '低' },
+    { value: 'medium', label: '中' },
+    { value: 'high', label: '高' },
+    { value: 'xhigh', label: '极高' },
+    { value: 'max', label: '最高' }
   ],
   'openai-compatible': [
-    { value: 'none', label: 'None', description: '关闭推理强度' },
-    { value: 'minimal', label: 'Minimal' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'XHigh' },
-    { value: 'max', label: 'Max' }
+    { value: 'none', label: '关闭', description: '关闭推理强度' },
+    { value: 'minimal', label: '最低' },
+    { value: 'low', label: '低' },
+    { value: 'medium', label: '中' },
+    { value: 'high', label: '高' },
+    { value: 'xhigh', label: '极高' },
+    { value: 'max', label: '最高' }
   ],
   'openai-responses': [
-    { value: 'none', label: 'None', description: '关闭推理强度' },
-    { value: 'minimal', label: 'Minimal' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'XHigh' },
-    { value: 'max', label: 'Max' }
+    { value: 'none', label: '关闭', description: '关闭推理强度' },
+    { value: 'minimal', label: '最低' },
+    { value: 'low', label: '低' },
+    { value: 'medium', label: '中' },
+    { value: 'high', label: '高' },
+    { value: 'xhigh', label: '极高' },
+    { value: 'max', label: '最高' }
   ],
   deepseek: [
-    { value: 'none', label: 'None', description: '关闭思考' },
-    { value: 'high', label: 'High', description: '启用思考' },
-    { value: 'max', label: 'Max', description: '最大思考强度' }
+    { value: 'none', label: '关闭', description: '关闭思考' },
+    { value: 'high', label: '高', description: '启用思考' },
+    { value: 'max', label: '最高', description: '最大思考强度' }
   ]
 };
 
@@ -90,13 +90,13 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
     thinkingBudget: {
       path: 'thinking.budget_tokens',
-      label: 'Thinking Budget',
-      description: 'Claude 原生思考 token 预算；如果同时设置有效 Thinking Level，unified 会优先使用等级映射。'
+      label: '思考预算',
+      description: 'Claude 原生思考 Token 预算；如果同时设置思考强度，系统会优先使用强度等级。'
     },
     thinkingLevel: {
       path: 'thinking.type / output_config.effort',
-      label: 'Thinking Effort',
-      description: 'Claude：none 映射为 thinking.type=disabled；low/high 等映射为 thinking.type=adaptive + output_config.effort。'
+      label: '思考强度',
+      description: 'Claude：关闭时禁用思考；低、高等等级会转换为对应的自适应思考强度。'
     }
   },
   'openai-compatible': {
@@ -115,13 +115,13 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     maxOutputTokens: { path: 'max_output_tokens', label: 'Max Output Tokens' },
     reasoningMode: {
       path: 'reasoning.mode',
-      label: 'Reasoning Workflow',
+      label: '推理模式',
       description: 'OpenAI Responses 推理模式：standard 为标准模式，pro 为专业模式。'
     },
     thinkingLevel: {
       path: 'reasoning.effort',
-      label: 'Reasoning Effort',
-      description: "OpenAI Responses 原生推理字段：reasoning.effort；unified 会补 reasoning.summary='detailed'。"
+      label: '推理强度',
+      description: 'OpenAI Responses 的推理强度设置。'
     }
   },
   deepseek: {
@@ -130,8 +130,8 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
     thinkingLevel: {
       path: 'thinking.type / reasoning_effort',
-      label: 'DeepSeek Thinking',
-      description: 'DeepSeek 原生思考控制：none 关闭；high/max 映射为 thinking.type=enabled 并设置 reasoning_effort。'
+      label: '思考强度',
+      description: 'DeepSeek 思考控制：关闭时禁用思考；高和最高会启用对应强度。'
     }
   }
 };
@@ -159,7 +159,7 @@ export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = 
     key: 'topK',
     path: ['topK'],
     label: 'Top K',
-    description: '候选 token 数量限制；当前 unified 默认映射到 Gemini / Claude。',
+    description: '候选 Token 数量上限，仅 Gemini 和 Claude 支持。',
     valueType: 'number',
     defaultValue: 40,
     providers: GEMINI_CLAUDE
@@ -167,8 +167,8 @@ export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = 
   {
     key: 'maxOutputTokens',
     path: ['maxOutputTokens'],
-    label: 'Max Output Tokens',
-    description: '限制单次响应输出 token 数。',
+    label: '最大输出 Token',
+    description: '限制单次回复输出的 Token 数。',
     valueType: 'number',
     defaultValue: 1024,
     providers: ALL_PROVIDERS
@@ -176,8 +176,8 @@ export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = 
   {
     key: 'includeThoughts',
     path: ['thinkingConfig', 'includeThoughts'],
-    label: 'Include Thoughts',
-    description: 'Gemini 原生思考输出开关；其他 provider 会忽略该统一字段。',
+    label: '输出思考内容',
+    description: '是否让 Gemini 返回思考内容；其他 LLM 服务会忽略此设置。',
     valueType: 'boolean',
     defaultValue: true,
     providers: ['gemini']
@@ -185,8 +185,8 @@ export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = 
   {
     key: 'thinkingBudget',
     path: ['thinkingConfig', 'thinkingBudget'],
-    label: 'Thinking Budget',
-    description: '思考 token 预算；Gemini / Claude 会按 unified 规则映射。',
+    label: '思考预算',
+    description: '思考 Token 预算，Gemini 和 Claude 支持此设置。',
     valueType: 'number',
     defaultValue: 10000,
     providers: GEMINI_CLAUDE
@@ -194,7 +194,7 @@ export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = 
   {
     key: 'reasoningMode',
     path: ['thinkingConfig', 'reasoningMode'],
-    label: 'Reasoning Workflow',
+    label: '推理模式',
     description: 'OpenAI Responses 推理模式。',
     valueType: 'enum',
     defaultValue: 'standard',
@@ -208,8 +208,8 @@ export function thinkingLevelDefinition(provider: LlmProviderKind): LlmParameter
   return withProviderDisplay({
     key: 'thinkingLevel',
     path: ['thinkingConfig', 'thinkingLevel'],
-    label: 'Thinking Level',
-    description: '思考 / 推理强度等级；实际请求体映射交给 unified-llm-provider。',
+    label: '思考强度',
+    description: 'LLM 的思考或推理强度；系统会按当前渠道转换为对应请求参数。',
     valueType: 'enum',
     defaultValue: options[0]?.value ?? 'low',
     providers: [provider],

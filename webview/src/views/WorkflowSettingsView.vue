@@ -7,7 +7,7 @@ import { EXTENSION_BRAND } from '@shared/extensionIdentity';
   <div class="workflow-settings-view">
     <header class="view-header">
       <span class="view-title">{{ EXTENSION_BRAND }} 工作流编辑</span>
-      <span class="view-hint">查看和编辑内置工作流、用户工作流的原始数据。</span>
+      <span class="view-hint">查看和编辑内置及自定义工作流的高级 JSON 配置。</span>
     </header>
     <div class="view-body">
       <WorkflowSettingsPanel />

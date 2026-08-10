@@ -135,7 +135,7 @@ bridge.on(BridgeMessageType.TurnInputResult, (message) => {
   ) return;
   clearTurnInputRetry(payload.commandId);
   if (payload.status === 'rejected') {
-    failTurnInputSubmission(pending, payload.message || '消息未能可靠入队，请重试。');
+    failTurnInputSubmission(pending, payload.message || '消息发送失败，请重试。');
     return;
   }
   turnInputAcknowledgements.value = {
@@ -205,7 +205,7 @@ bridge.on(BridgeMessageType.ConversationActionResult, (message) => {
       interrupt: undefined,
       blockedAtCommitSeq: action.submittedAtCommitSeq
     });
-    setActionNotice(payload.conversationId, '检测到排队中的回合；将在其精确停止后继续当前操作。');
+    setActionNotice(payload.conversationId, '已有回复正在排队；当前回复停止后将继续此操作。');
     return;
   }
   if (action.action === 'retry' && payload.turnId) {
@@ -241,7 +241,7 @@ bridge.on(BridgeMessageType.CompressionCommandResult, (message) => {
       interrupt: undefined,
       blockedAtCommitSeq: action.submittedAtCommitSeq
     });
-    setActionNotice(payload.conversationId, '检测到排队中的回合；将在其精确停止后继续总结。');
+    setActionNotice(payload.conversationId, '已有回复正在排队；当前回复停止后将继续总结。');
     return;
   }
   if (payload.status === 'in_progress') {
@@ -789,8 +789,8 @@ export function useChat() {
       action: 'retry',
       targetId,
       label: Number.isSafeInteger(displayNumber) && displayNumber! > 0
-        ? `正在从 #${displayNumber} 创建重试回合`
-        : '正在创建新的重试回合',
+        ? `正在从第 ${displayNumber} 条消息重新生成回复`
+        : '正在重新生成回复',
       phase: 'waiting_for_idle',
       commandPayload: { type: BridgeMessageType.MessageRetryFrom, payload }
     });
@@ -848,7 +848,7 @@ export function useChat() {
     );
     if (existing) {
       if (existing.payload.expectedRevisionId !== revisionId) {
-        setActionNotice(sourceConversationId, '该消息已有另一 Revision 的分支请求正在提交。');
+        setActionNotice(sourceConversationId, '该消息的其他版本正在创建分支。');
         return false;
       }
       clearActionNotice(sourceConversationId);

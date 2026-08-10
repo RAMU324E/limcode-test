@@ -5,9 +5,9 @@
  * 在流式输出时追加到文本末尾，显示自定义状态文字 + 波浪渐变动画 + 闪烁光标。
  * 五种状态使用不同颜色区分：
  *   - preparing：应用内部整理/调度中
- *   - waiting：等待 AI 响应
- *   - thinking：AI 思考中
- *   - writing：AI 输出正文中
+ *   - waiting：等待 LLM 响应
+ *   - thinking：LLM 思考中
+ *   - writing：LLM 输出正文中
  *   - executing：工具排队/执行中
  */
 const props = withDefaults(

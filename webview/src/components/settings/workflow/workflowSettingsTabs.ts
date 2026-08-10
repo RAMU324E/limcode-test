@@ -16,7 +16,7 @@ export const WORKFLOW_SETTINGS_TABS: readonly WorkflowSettingsTabDefinition[] = 
   {
     key: 'workflow-editor',
     label: '工作流编辑',
-    description: '查看并编辑工作流原始数据',
+    description: '查看并编辑工作流的高级 JSON 配置',
     icon: IconListDetails,
     component: WorkflowEditorTab
   }

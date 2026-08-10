@@ -33,7 +33,7 @@ const items = computed<SettingsSelectableListItem[]>(() => [
   {
     id: 'custom:requestBody',
     title: '自定义参数',
-    description: '写入 provider 原生 requestBody 补丁，可深覆盖最终请求体。',
+    description: '写入底层请求体（requestBody），可覆盖渠道自动生成的同名字段。',
     meta: 'requestBody.*'
   }
 ]);
@@ -66,7 +66,7 @@ function select(item: SettingsSelectableListItem): void {
         <p class="parameter-add-desc">当前渠道：{{ providerLabel }}。列表会按渠道类型过滤可添加参数。</p>
         <SettingsSelectableList
           :items="items"
-          search-placeholder="筛选参数..."
+          search-placeholder="筛选参数…"
           empty-text="当前渠道暂无可添加参数。"
           no-match-text="没有匹配的参数。"
           :max-height="320"

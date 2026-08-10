@@ -13,7 +13,7 @@ export interface AgentSettingsTabDefinition {
 }
 
 export const AGENT_SETTINGS_TABS: readonly AgentSettingsTabDefinition[] = [
-  { key: 'agent-editor', label: 'Agent 编辑', description: '角色、Prompt、工具与模型', icon: IconRobot, component: AgentEditorTab }
+  { key: 'agent-editor', label: 'Agent 编辑', description: '角色、提示词、工具与 LLM', icon: IconRobot, component: AgentEditorTab }
 ];
 
 export const DEFAULT_AGENT_SETTINGS_TAB: AgentSettingsTabKey = 'agent-editor';

@@ -118,8 +118,8 @@ function writeInputSections(args: WriteArgs, context: ToolDisplayContext): ToolD
     kind: 'input',
     title: '写入参数',
     rows: parameterRows([
-      { label: 'path', value: path },
-      { label: 'content', value: typeof args.content === 'string' ? `${args.content.length} 字符` : undefined }
+      { label: '路径', value: path },
+      { label: '内容', value: typeof args.content === 'string' ? `${args.content.length} 字符` : undefined }
     ]),
     rowStyle: 'keyValue'
   }];
@@ -133,19 +133,19 @@ function editInputSections(args: EditArgs, context: ToolDisplayContext): ToolDis
     kind: 'input',
     title: '修改参数',
     rows: parameterRows([
-      { label: 'path', value: path },
+      { label: '路径', value: path },
       {
-        label: 'hunks',
+        label: '修改片段',
         value: mode === 'hunk' && hasRequestedEditHunks(args.hunks) ? `${args.hunks.length} 个` : undefined
       },
       {
-        label: 'insert',
+        label: '插入',
         value: mode === 'insert' && hasRequestedEditInsert(args.insert)
           ? `第 ${args.insert?.line} 行，${args.insert?.content?.length ?? 0} 字符`
           : undefined
       },
       {
-        label: 'delete',
+        label: '删除',
         value: mode === 'delete' && hasRequestedEditDelete(args.delete)
           ? `第 ${args.delete?.startLine}-${args.delete?.endLine} 行`
           : undefined
@@ -170,11 +170,11 @@ function deleteOutputSections(output: FileChangeOutput | string | undefined, con
   if (typeof output === 'string') return output ? [{ kind: 'output', title: '删除结果', text: output }] : undefined;
 
   const rows = parameterRows([
-    { label: 'summary', value: stringValue(output.summary) },
-    { label: 'error', value: stringValue(output.error) },
-    { label: 'total', value: numberValue(output.totalCount)?.toString() },
-    { label: 'success', value: numberValue(output.successCount)?.toString() },
-    { label: 'failed', value: numberValue(output.failCount)?.toString() }
+    { label: '摘要', value: stringValue(output.summary) },
+    { label: '错误', value: stringValue(output.error) },
+    { label: '总数', value: numberValue(output.totalCount)?.toString() },
+    { label: '成功', value: numberValue(output.successCount)?.toString() },
+    { label: '失败', value: numberValue(output.failCount)?.toString() }
   ]);
   const sections: ToolDisplaySection[] = rows.length > 0
     ? [{ kind: 'output', title: '删除结果', rows, rowStyle: 'keyValue' }]
@@ -199,22 +199,22 @@ function fileChangeOutputSections(title: string, output: FileChangeOutput | stri
   if (typeof output === 'string') return output ? [{ kind: 'output', title, text: output }] : undefined;
 
   const rows = parameterRows([
-    { label: 'summary', value: stringValue(output.summary) },
-    { label: 'status', value: output.pending === true ? '等待应用' : undefined },
-    { label: 'error', value: stringValue(output.error) },
-    { label: 'path', value: normalizePath(output.path) || undefined },
-    { label: 'mode', value: stringValue(output.mode) },
-    { label: 'action', value: actionLabel(stringValue(output.action)) },
-    { label: 'edits', value: editCountText(output) },
-    { label: 'fallback', value: stringValue(output.fallbackMode) },
-    { label: 'changedFiles', value: changedFilesText(output.changedFiles) }
+    { label: '摘要', value: stringValue(output.summary) },
+    { label: '状态', value: output.pending === true ? '等待应用' : undefined },
+    { label: '错误', value: stringValue(output.error) },
+    { label: '路径', value: normalizePath(output.path) || undefined },
+    { label: '修改方式', value: stringValue(output.mode) },
+    { label: '操作', value: actionLabel(stringValue(output.action)) },
+    { label: '修改数', value: editCountText(output) },
+    { label: '备用方式', value: stringValue(output.fallbackMode) },
+    { label: '已修改文件', value: changedFilesText(output.changedFiles) }
   ]);
   const sections: ToolDisplaySection[] = rows.length > 0
     ? [{ kind: 'output', title, rows, rowStyle: 'keyValue' }]
     : [{ kind: 'output', title, text: context.stringifyValue(output) }];
 
   const diff = diffFromOutput(output);
-  if (diff) sections.push({ kind: 'output', title: 'Diff 预览', diff });
+  if (diff) sections.push({ kind: 'output', title: '差异预览', diff });
   return sections;
 }
 
@@ -351,11 +351,11 @@ function checkpointDiffAvailability(
   if (checkpoint.status === 'pending') return { title: '存档点正在创建，稍后可查看差异' };
   if (checkpoint.status !== 'created' || !checkpoint.commitSha) return { title: checkpoint.message ?? '存档点创建失败，无法查看差异' };
   const shadowRepository = context.shadowRepositories?.find((item) => item.id === checkpoint.shadowRepositoryId);
-  if (!shadowRepository) return { title: '未找到此存档点关联的 shadow 仓库，无法查看差异' };
+  if (!shadowRepository) return { title: '未找到此存档点关联的内部仓库，无法查看差异' };
   const shadowStat = checkpointStore.shadowStats.find((item) => item.storageKey === shadowRepository.storageKey);
-  if (shadowStat && !shadowStat.exists) return { title: 'shadow 仓库已删除，无法查看差异' };
-  if (!shadowStat && checkpointStore.shadowStatsLoaded) return { title: 'shadow 仓库不存在，无法查看差异' };
-  if (!shadowStat && checkpointStore.shadowStatsLoading) return { title: '正在确认 shadow 仓库状态，请稍候' };
+  if (shadowStat && !shadowStat.exists) return { title: '内部仓库已删除，无法查看差异' };
+  if (!shadowStat && checkpointStore.shadowStatsLoaded) return { title: '内部仓库不存在，无法查看差异' };
+  if (!shadowStat && checkpointStore.shadowStatsLoading) return { title: '正在确认内部仓库状态，请稍候' };
   return { checkpoint, title: '在 VS Code Diff 编辑器中查看应用后的存档点差异' };
 }
 

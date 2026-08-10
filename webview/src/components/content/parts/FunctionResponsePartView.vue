@@ -23,7 +23,7 @@ function stringifyValue(value: unknown): string {
 <template>
   <section class="part-card function-response-card">
     <header class="part-card-header">
-      <span class="part-card-title">工具响应</span>
+      <span class="part-card-title">工具结果</span>
       <span class="part-card-name">{{ part.functionResponse.name }}</span>
     </header>
     <ContentBlockSection v-if="responseText" kind="output" title="输出" :text="responseText" />

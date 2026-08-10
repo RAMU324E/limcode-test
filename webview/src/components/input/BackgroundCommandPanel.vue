@@ -471,23 +471,23 @@ function timestamp(value: unknown): number {
                 <pre v-if="selectedEntry.stdout" class="command-log is-stdout">{{ selectedEntry.stdout }}</pre>
                 <pre v-if="selectedEntry.stderr" class="command-log is-stderr">{{ selectedEntry.stderr }}</pre>
                 <pre v-if="selectedEntry.progress" class="command-log is-progress">{{ selectedEntry.progress }}</pre>
-                <p v-if="!selectedEntry.stdout && !selectedEntry.stderr && !selectedEntry.progress" class="command-empty-text">暂无已同步输出。</p>
+                <p v-if="!selectedEntry.stdout && !selectedEntry.stderr && !selectedEntry.progress" class="command-empty-text">暂无输出。</p>
               </section>
 
               <section class="command-detail-section">
                 <h3>参数</h3>
                 <dl class="command-param-grid">
-                  <dt>Shell</dt><dd>{{ selectedEntry.shell }}</dd>
+                  <dt>命令解释器</dt><dd>{{ selectedEntry.shell }}</dd>
                   <dt>模式</dt><dd>{{ selectedEntry.mode }}</dd>
                   <dt>权限</dt><dd>{{ selectedEntry.accessLabel }}</dd>
                   <dt>工作目录</dt><dd>{{ selectedEntry.cwd || '-' }}</dd>
-                  <dt>前台等待</dt><dd>{{ selectedEntry.foregroundWaitMs === undefined ? '-' : `${selectedEntry.foregroundWaitMs}ms` }}</dd>
+                  <dt>前台等待</dt><dd>{{ selectedEntry.foregroundWaitMs === undefined ? '-' : `${selectedEntry.foregroundWaitMs} 毫秒` }}</dd>
                   <dt>调用次数</dt><dd>{{ selectedEntry.callCount }}</dd>
                   <dt>开始</dt><dd>{{ formatTime(selectedEntry.startedAt) }}</dd>
                   <dt>更新</dt><dd>{{ formatTime(selectedEntry.updatedAt) }}</dd>
-                  <dt>Exit Code</dt><dd>{{ selectedEntry.exitCode === undefined ? '-' : selectedEntry.exitCode }}</dd>
-                  <dt>Killed</dt><dd>{{ selectedEntry.killed === undefined ? '-' : selectedEntry.killed }}</dd>
-                  <dt>Dropped</dt><dd>{{ selectedEntry.droppedChars === undefined ? '-' : selectedEntry.droppedChars }}</dd>
+                  <dt>退出码</dt><dd>{{ selectedEntry.exitCode === undefined ? '-' : selectedEntry.exitCode }}</dd>
+                  <dt>已终止</dt><dd>{{ selectedEntry.killed === undefined ? '-' : selectedEntry.killed ? '是' : '否' }}</dd>
+                  <dt>已省略字符数</dt><dd>{{ selectedEntry.droppedChars === undefined ? '-' : selectedEntry.droppedChars }}</dd>
                 </dl>
               </section>
             </div>

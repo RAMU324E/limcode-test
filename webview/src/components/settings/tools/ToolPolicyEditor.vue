@@ -83,9 +83,9 @@ const isUsingToolDefaults = computed(() => {
   return Object.keys(configs).length === 0;
 });
 const sourceLabel = computed(() => {
-  if (props.scopeKind === 'global' && runtimePreset.value === 'yolo') return '全局 YOLO 预设';
+  if (props.scopeKind === 'global' && runtimePreset.value === 'yolo') return '全局自动执行预设';
   if (props.scopeKind === 'global') return '全局默认策略';
-  if (hasLocalOverride.value) return '当前作用域覆盖';
+  if (hasLocalOverride.value) return '当前范围的单独设置';
   const inheritedFrom = effectiveResolution.value.inheritedFrom;
   void inheritedFrom;
   return '继承全局默认策略';
@@ -96,19 +96,19 @@ const presetOptions = computed<Array<{ value: ToolPolicyPresetKind; label: strin
     : [{
       value: 'inherit' as const,
       label: '继承全局预设',
-      description: `当前全局为${globalPreset.value === 'yolo' ? ' YOLO 模式' : '自定义策略'}；本作用域仍可保留下方逐工具配置。`
+      description: `当前全局为${globalPreset.value === 'yolo' ? '自动执行模式' : '自定义策略'}；当前范围仍可保留下方逐项工具配置。`
     }]),
   {
     value: 'custom',
     label: '自定义策略',
     description: props.scopeKind === 'global'
       ? '沿用下方已有启用、审批、自动应用和 MCP 来源配置。'
-      : '本作用域显式使用自定义策略，不再继承全局 YOLO 预设。'
+      : '当前范围使用自定义策略，不再继承全局自动执行预设。'
   },
   {
     value: 'yolo',
-    label: 'YOLO 模式',
-    description: '已启用的工具直接运行；write/edit/delete 生成的修改立即自动应用，不打开审批或差异预览标签页。'
+    label: '自动执行模式（YOLO）',
+    description: '已启用的工具会直接运行；写入、编辑和删除文件产生的更改会立即应用，不再打开确认或差异预览页。'
   }
 ]);
 const toolScopeOptions = computed<SettingsDropdownOption[]>(() => [
@@ -261,16 +261,16 @@ function scopeLabel(scope: ToolDomainScope): string {
 }
 
 function executionLabel(tool: ToolDefinitionRecord): string {
-  return tool.execution === 'agentRun' ? 'AgentRun' : 'Runtime';
+  return tool.execution === 'agentRun' ? '由 Agent 执行' : '由系统执行';
 }
 
 function toolDescription(tool: ToolDefinitionRecord): string {
-  return tool.description || '后端未提供描述。';
+  return tool.description || '暂无说明。';
 }
 
 function editModeShortLabel(tool: ToolDefinitionRecord): string | undefined {
   if (tool.name !== EDIT_TOOL_NAME) return undefined;
-  return '当前模式：Hunk 查找替换 · path + hunks[]；每个 hunk 含 oldContent / newContent / replaceAll，insert/delete 仍可用';
+  return '当前编辑方式：按内容片段查找并替换；也支持按行插入和删除。';
 }
 
 function toolIcon(tool: ToolDefinitionRecord) {
@@ -471,7 +471,7 @@ function inputNumber(event: Event): number {
     <section class="tool-policy-preset-section" aria-label="工具策略预设">
       <div class="tool-policy-preset-heading">
         <span>工具策略预设</span>
-        <small>预设只改变运行时解释方式，不会覆盖下方已有的逐工具配置；非全局作用域可选择继承全局预设。</small>
+        <small>预设只改变工具的执行方式，不会覆盖下方已有的逐工具配置；非全局层级可选择继承全局预设。</small>
       </div>
       <div class="tool-policy-preset-options" role="radiogroup" aria-label="选择工具策略预设">
         <button
@@ -496,11 +496,11 @@ function inputNumber(event: Event): number {
 
     <div class="tool-policy-actions">
       <div class="tool-policy-filter">
-        <span>工具领域</span>
+        <span>工具分类</span>
         <SettingsDropdown
           :model-value="selectedToolScope"
           :options="toolScopeOptions"
-          title="筛选工具领域"
+          title="筛选工具分类"
           @update:model-value="updateSelectedToolScope"
         />
       </div>
@@ -512,8 +512,8 @@ function inputNumber(event: Event): number {
 
     <section v-if="mcpSourceGroups.length > 0" class="mcp-source-section" aria-label="MCP 工具来源">
       <div class="mcp-source-heading">
-        <span>MCP 来源</span>
-        <small>来源开关控制整组 MCP 工具；展开单工具后仍可调整执行确认与显示。</small>
+        <span>MCP 服务</span>
+        <small>关闭某个 MCP 服务会停用它提供的全部工具；展开单个工具后仍可调整执行确认与显示。</small>
       </div>
       <div class="mcp-source-list">
         <article v-for="group in mcpSourceGroups" :key="group.source.id" class="mcp-source-item">
@@ -549,8 +549,8 @@ function inputNumber(event: Event): number {
 
     <div class="tool-list-shell">
       <div ref="scroller" class="tool-list-scroll">
-        <div v-if="tools.length === 0" class="tool-list-empty">等待后端返回工具定义...</div>
-        <div v-else-if="visibleTools.length === 0" class="tool-list-empty">当前工具领域没有可配置工具。</div>
+        <div v-if="tools.length === 0" class="tool-list-empty">正在加载工具定义…</div>
+        <div v-else-if="visibleTools.length === 0" class="tool-list-empty">当前分类没有可配置的工具。</div>
         <template v-else>
           <article v-for="tool in visibleTools" :key="tool.name" class="tool-item" :class="{ 'is-enabled': isToolEnabled(tool) }">
             <div class="tool-item-header">
@@ -600,7 +600,7 @@ function inputNumber(event: Event): number {
                   <div class="tool-config-group tool-definition-details">
                     <div class="tool-config-group-heading">
                       <span class="tool-config-group-title">工具说明</span>
-                      <small>来自后端工具定义，展开后查看完整说明。</small>
+                      <small>由工具定义提供，展开后查看完整说明。</small>
                     </div>
                     <p class="tool-definition-description">{{ toolDescription(tool) }}</p>
                     <p v-if="editModeShortLabel(tool)" class="tool-definition-mode-note">{{ editModeShortLabel(tool) }}</p>
@@ -660,7 +660,7 @@ function inputNumber(event: Event): number {
                         >
                           <span class="permission-copy">
                             <span class="permission-title">自动回传结果</span>
-                            <span class="permission-desc">开启时工具结果自动发给 AI；关闭时先确认是否回传。</span>
+                            <span class="permission-desc">开启时工具结果自动发送给 LLM；关闭时先询问是否发送。</span>
                           </span>
                         </LcCheckbox>
                         <LcCheckbox
@@ -702,7 +702,7 @@ function inputNumber(event: Event): number {
                   <div v-if="tool.configSchema?.fields?.length" class="tool-config-group tool-specific-config">
                     <div class="tool-config-group-heading">
                       <span class="tool-config-group-title">工具配置</span>
-                      <small>这些配置由后端工具定义提供，会随当前策略作用域保存。</small>
+                      <small>这些配置由工具定义提供，并随当前层级的策略保存。</small>
                     </div>
                     <div class="tool-config-fields">
                       <label v-for="field in tool.configSchema.fields.filter(supportsInlineField)" :key="field.key" class="tool-config-field">

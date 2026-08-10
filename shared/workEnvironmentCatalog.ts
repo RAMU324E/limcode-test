@@ -121,7 +121,7 @@ export function getWorkEnvironmentKindDefinition(kind: WorkEnvironmentKind | str
     kind: normalized,
     label: normalized === 'custom' ? '自定义' : normalized,
     defaultName: normalized === 'custom' ? '自定义工作环境' : `${normalized} 工作环境`,
-    description: '由扩展 provider 提供的自定义工作环境。',
+    description: '由扩展提供的自定义工作环境。',
     category: 'custom',
     sortOrder: 100,
     systemManaged: false,

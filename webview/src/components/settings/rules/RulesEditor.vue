@@ -86,12 +86,12 @@ function reset(scope: RuleScope): void {
           规则文件
           <SettingsLoadingInline :show="rulesLoading" :text="rulesLoadingText" />
         </h3>
-        <p>规则在对话开始时冻结注入到 runtime 提示词，对所有 Agent 生效；对话进行中修改需新开对话才生效。AGENTS.md 由此处维护，CLAUDE.md 仅作兼容只读预览。</p>
+        <p>规则会在对话开始时载入系统提示词，并对所有 Agent 生效；对话开始后修改规则，需要新建对话才会生效。AGENTS.md 可在此编辑，CLAUDE.md 仅供兼容预览。</p>
       </div>
       <button type="button" class="secondary" @click="store.refresh()">刷新</button>
     </header>
 
-    <section v-for="item in scopes" :key="item.scope" class="rules-scope" aria-label="规则作用域">
+    <section v-for="item in scopes" :key="item.scope" class="rules-scope" aria-label="规则范围">
       <div class="rules-scope-heading">
         <h4>{{ item.label }}</h4>
       </div>

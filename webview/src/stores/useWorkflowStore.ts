@@ -112,7 +112,7 @@ export const useWorkflowStore = defineStore('workflow', {
       if (nextDescription) workflow.description = nextDescription;
       else delete workflow.description;
       workflow.updatedAt = Date.now();
-      this.status = '正在更新工作流描述...';
+      this.status = '正在更新工作流说明…';
       bridge.request(BridgeMessageType.WorkflowUpdate, { workflowId, description: nextDescription ?? '' });
     },
     saveWorkflowRaw(record: WorkflowRecord): void {
@@ -127,7 +127,7 @@ export const useWorkflowStore = defineStore('workflow', {
       if (record.icon) workflow.icon = record.icon;
       else delete workflow.icon;
       workflow.updatedAt = Date.now();
-      this.status = '正在保存工作流原始数据...';
+      this.status = '正在保存工作流高级配置…';
       bridge.request(BridgeMessageType.WorkflowUpdate, {
         workflowId: workflow.id,
         name: nextName,
@@ -141,7 +141,7 @@ export const useWorkflowStore = defineStore('workflow', {
       if (!workflow || workflow.source === 'builtin') return;
       clientState.workflows = clientState.workflows.filter((candidate) => candidate.id !== workflowId);
       clientState.conversationWorkflowSelections = clientState.conversationWorkflowSelections.filter((selection) => selection.workflowId !== workflowId);
-      this.status = '正在删除工作流...';
+      this.status = '正在删除工作流…';
       bridge.request(BridgeMessageType.WorkflowDelete, { workflowId });
     },
     applyOptimisticSelection(payload: { conversationId: string; scopeKind: 'global' } | { conversationId: string; scopeKind: 'workflow'; workflowId: string }): void {

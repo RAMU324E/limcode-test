@@ -18,8 +18,8 @@ const numberValue = computed(() => typeof props.modelValue === 'number' && Numbe
 const booleanValue = computed(() => props.modelValue === false ? 'false' : 'true');
 const enumValue = computed(() => typeof props.modelValue === 'string' ? props.modelValue : String(props.definition.defaultValue ?? ''));
 const booleanOptions: SettingsDropdownOption[] = [
-  { value: 'true', label: 'True', description: '发送 true' },
-  { value: 'false', label: 'False', description: '发送 false' }
+  { value: 'true', label: '是', description: '发送 true' },
+  { value: 'false', label: '否', description: '发送 false' }
 ];
 const enumOptions = computed<SettingsDropdownOption[]>(() => (props.definition.options ?? []).map((option) => ({
   value: option.value,
@@ -67,7 +67,7 @@ function updateEnum(value: string): void {
         v-else-if="definition.valueType === 'boolean'"
         :model-value="booleanValue"
         :options="booleanOptions"
-        title="选择布尔值"
+        title="选择是否启用"
         @update:model-value="updateBoolean"
       />
       <SettingsDropdown

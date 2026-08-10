@@ -199,7 +199,7 @@ function updateMethodKind(value: string): void {
     <header class="compression-settings-header">
       <div>
         <label>上下文压缩</label>
-        <p>当前压缩方法：{{ compressionKindLabel(config?.kind) }}。文字压缩后的对话主体会按可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} token；OpenAI 原生压缩必须使用 OpenAI Responses 渠道。</p>
+        <p>当前压缩方法：{{ compressionKindLabel(config?.kind) }}。文字压缩后的对话主体会按可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} Token；OpenAI 原生压缩必须使用 OpenAI Responses 渠道。</p>
       </div>
     </header>
     <div class="global-settings-grid compression-settings-grid">
@@ -237,14 +237,14 @@ function updateMethodKind(value: string): void {
       <div v-if="compressionAutoEnabled" class="compression-trigger-panel global-settings-field-wide">
         <div class="compression-trigger-head">
           <div>
-            <span class="compression-trigger-title">完整输入 token 触发阈值</span>
-            <p>完整输入包含系统要求、工具定义、运行提醒和对话。这个数值只决定何时压缩；压缩后的对话主体会按模型可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} token。</p>
+            <span class="compression-trigger-title">完整输入 Token 触发阈值</span>
+            <p>完整输入包含系统要求、工具定义、运行提醒和对话。这个数值只决定何时压缩；压缩后的对话主体会按 LLM 可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} Token。</p>
           </div>
         </div>
 
         <div class="compression-threshold-control">
           <label class="global-settings-field compression-threshold-input-field">
-            <span>完整输入 token 数</span>
+            <span>完整输入 Token 数</span>
             <span class="threshold-input-shell">
               <input
                 class="token-number-input"
@@ -256,7 +256,7 @@ function updateMethodKind(value: string): void {
                 :disabled="contextWindowTokens <= 0"
                 @change="updateCompressionThresholdTokens"
               />
-              <span>token</span>
+              <span>Token</span>
             </span>
           </label>
 

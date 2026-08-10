@@ -14,14 +14,14 @@ const { loading: toolLoading, text: toolLoadingText } = useSettingsLoadingText('
           工具
           <SettingsLoadingInline :show="toolLoading" :text="toolLoadingText" />
         </h2>
-        <p>工具定义由后端注册表只读提供；这里配置全局默认工具策略，聊天、Agent、Workflow、Run 等作用域可在后续面板中继承或覆盖。</p>
+        <p>工具列表由系统提供；这里设置全局默认工具权限。对话、Agent 和工作流可以继承或单独覆盖。</p>
       </div>
     </header>
 
     <ToolPolicyEditor
       scope-kind="global"
       title="全局默认工具策略"
-      description="新对话或未单独设置工具策略的作用域会继承这里的启用状态。MCP 工具注册与连接状态在 MCP 工具页签中集中管理。"
+      description="新对话或未单独设置权限的 Agent 和工作流会继承这里的启用状态。MCP 工具的注册与连接状态在 MCP 页集中管理。"
     />
   </section>
 </template>

@@ -138,11 +138,11 @@ function formatTime(timestamp?: number): string {
 </script>
 
 <template>
-  <section class="shadow-manager" aria-label="shadow 仓库管理">
+  <section class="shadow-manager" aria-label="内部存档仓库管理">
     <header class="shadow-manager-head">
       <div>
-        <h3>shadow 仓库管理</h3>
-        <p>每个 shadow 仓库是某个对话在某个项目下的存档点物理数据。删除只清理磁盘上的 git 仓库，不影响对话历史；被删除仓库的存档点将无法回档。</p>
+        <h3>内部存档仓库</h3>
+        <p>每个仓库保存一个对话在对应项目中的存档数据。删除仓库只会清理磁盘文件，不影响对话历史；相关存档点将无法再恢复。</p>
       </div>
       <button type="button" class="shadow-icon-button" title="刷新统计" @click="refresh">
         <IconRefresh stroke="2" aria-hidden="true" />
@@ -152,8 +152,8 @@ function formatTime(timestamp?: number): string {
     <div class="shadow-auto-clean">
       <LcCheckbox :model-value="autoCleanupEnabled" @update:model-value="setAutoCleanupEnabled">
         <span class="checkbox-text">
-          <strong>自动清理长期未使用的 shadow 仓库</strong>
-          <small>插件启动时，自动删除最近一段时间内没有活动的 shadow 仓库。</small>
+          <strong>自动清理长期未使用的存档仓库</strong>
+          <small>插件启动时，自动删除长期没有活动的内部存档仓库。</small>
         </span>
       </LcCheckbox>
       <span class="shadow-auto-clean-days" :class="{ 'is-disabled': !autoCleanupEnabled }">
@@ -192,8 +192,8 @@ function formatTime(timestamp?: number): string {
 
     <div class="shadow-list-shell">
       <div ref="scroller" class="shadow-list-scroll">
-        <div v-if="checkpointStore.shadowStatsLoading && rows.length === 0" class="shadow-empty">正在统计 shadow 仓库…</div>
-        <div v-else-if="rows.length === 0" class="shadow-empty">暂无 shadow 仓库，创建存档点后会在此显示。</div>
+        <div v-if="checkpointStore.shadowStatsLoading && rows.length === 0" class="shadow-empty">正在统计内部存档仓库…</div>
+        <div v-else-if="rows.length === 0" class="shadow-empty">暂无内部存档仓库，创建存档点后会在此显示。</div>
         <div v-else class="shadow-rows">
           <div
             v-for="row in rows"
@@ -224,8 +224,8 @@ function formatTime(timestamp?: number): string {
 
     <ConfirmPanel
       :open="confirmOpen"
-      title="删除选中的 shadow 仓库？"
-      :description="`将删除 ${selectedKeys.length} 个 shadow 仓库的物理 git 数据，无法恢复。对话历史与存档点记录会保留，但这些存档点将无法回档。`"
+      title="删除选中的内部存档仓库？"
+      :description="`将删除 ${selectedKeys.length} 个内部存档仓库的磁盘数据，且无法恢复。对话历史与存档点记录会保留，但这些存档点将无法再恢复。`"
       confirm-label="删除"
       @cancel="confirmOpen = false"
       @confirm="confirmDelete"

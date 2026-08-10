@@ -98,7 +98,7 @@ export const useSystemPromptStore = defineStore('systemPrompt', {
     setPromptForScope(scopeKind: ConfigScopeKind, scopeId: string | undefined, text: string, name?: string): void {
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
       if (scopeKind !== 'global' && !normalizedScopeId) {
-        this.status = '缺少 Prompt 作用域，无法保存。';
+        this.status = '缺少系统提示词配置范围，无法保存。';
         return;
       }
 
@@ -108,7 +108,7 @@ export const useSystemPromptStore = defineStore('systemPrompt', {
           this.clearPromptScope(scopeKind, normalizedScopeId);
           return;
         }
-        this.status = 'Prompt 内容为空；若要继承上级配置，请点击“恢复继承”。';
+        this.status = '提示词内容为空；若要继承上级配置，请点击“恢复继承”。';
         return;
       }
 

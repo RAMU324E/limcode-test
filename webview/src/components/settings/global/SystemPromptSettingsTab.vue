@@ -15,20 +15,20 @@ const { loading: promptLoading, text: promptLoadingText } = useSettingsLoadingTe
           提示词
           <SettingsLoadingInline :show="promptLoading" :text="promptLoadingText" />
         </h2>
-        <p>系统提示词用于稳定行为规则；运行时上下文用于初始变量快照，默认不会在每次请求时自动刷新。</p>
+        <p>系统提示词用于保持行为一致；初始上下文用于载入时间、工作环境等变量，默认不会在每次请求时自动刷新。</p>
       </div>
     </header>
 
     <SystemPromptScopeEditor
       scope-kind="global"
       title="全局系统提示词"
-      description="所有 Agent / Workflow / Conversation 都会继承这里的稳定规则。可插入 Agent / Workflow 这类稳定占位符。"
+      description="所有 Agent、工作流和对话都会继承这里的规则。可插入 Agent、工作流等稳定占位符。"
     />
 
     <RuntimeContextScopeEditor
       scope-kind="global"
-      title="全局运行时上下文模板"
-      description="用于生成对话运行时快照的默认模板。时间、工作环境等变量只在快照生成或刷新时替换一次。"
+      title="全局初始上下文模板"
+      description="用于生成新对话初始上下文的默认模板。时间、工作环境等变量只在创建或手动刷新时更新。"
     />
   </section>
 </template>

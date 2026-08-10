@@ -110,7 +110,7 @@ function hasOutstandingSettingsWork(state: GlobalSettingsState): boolean {
 
 function settingsErrorStatus(requestType: string | undefined, message: string): string {
   if (requestType === BridgeMessageType.GlobalSettingsGet) return `设置读取失败：${message}`;
-  if (requestType === BridgeMessageType.LlmProviderModelsGet) return `获取模型列表失败：${message}`;
+  if (requestType === BridgeMessageType.LlmProviderModelsGet) return `获取 LLM 列表失败：${message}`;
   return `设置保存失败：${message}`;
 }
 
@@ -1708,16 +1708,16 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       const config = this.activeLlmProviderConfig;
       if (!config) return;
       const requestConfig = toPlainProviderConfig(config);
-      this.status = '正在获取模型列表...';
+      this.status = '正在获取 LLM 列表…';
       this.fetchedModelsDialog = { open: true, loading: true, configId: requestConfig.id, models: [] };
       try {
         bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig });
         startModelFetchTimeout(() => {
-          this.status = '获取模型列表超时，请检查 Base URL、API Key 或网络代理设置。';
+          this.status = '获取 LLM 列表超时，请检查 Base URL、API Key 或网络代理设置。';
           this.fetchedModelsDialog = { open: true, loading: false, configId: requestConfig.id, models: [] };
         });
       } catch (error) {
-        this.status = `获取模型列表请求发送失败：${error instanceof Error ? error.message : String(error)}`;
+        this.status = `获取 LLM 列表请求发送失败：${error instanceof Error ? error.message : String(error)}`;
         this.closeFetchedModelsDialog();
       }
     },
@@ -1739,7 +1739,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       ]);
       if (!config.model) config.model = selected[0]?.id ?? '';
       config.updatedAt = Date.now();
-      this.status = `已添加 ${selected.length} 个模型`;
+      this.status = `已添加 ${selected.length} 个 LLM`;
       this.closeFetchedModelsDialog();
       this.saveLlmProviderConfigs();
     },
@@ -2031,7 +2031,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       if (!config) return;
       const models = sanitizeModels(payload.models);
       this.fetchedModelsDialog = { open: true, loading: false, configId: payload.configId, models };
-      this.status = models.length ? `已获取 ${models.length} 个模型，请选择要添加的模型` : '没有获取到模型';
+      this.status = models.length ? `已获取 ${models.length} 个 LLM，请选择要添加的 LLM` : '没有获取到 LLM';
     },
     setError(message: string, options: GlobalSettingsErrorOptions = {}): void {
       clearModelFetchTimeout();

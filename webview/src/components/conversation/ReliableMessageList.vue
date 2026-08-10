@@ -248,7 +248,7 @@ const activityModelLabel = computed(() => {
   const override = profile && provider && profileProviderConfigId && profileProviderConfigId === provider.id
     ? profile.model.trim()
     : '';
-  return override || provider?.model?.trim() || 'AI';
+  return override || provider?.model?.trim() || 'LLM';
 });
 const activityLabel = computed(() => {
   const action = conversationAction.value;
@@ -299,17 +299,17 @@ const activityLabel = computed(() => {
   );
   if (activeTool) return undefined;
   if (latest.status === 'prepared' || latest.status === 'pending') {
-    return '正在启动模型请求';
+    return '正在启动 LLM 请求';
   }
   if (latest.status === 'streaming') {
-    return '正在等待模型输出';
+    return '正在等待 LLM 输出';
   }
-  return '模型结果已提交，正在准备工具或下一轮';
+  return 'LLM 结果已提交，正在准备工具或下一轮';
 });
 const retryBoundaryLabel = computed(() => {
   const action = conversationAction.value;
   return action?.action === 'retry' && action.phase === 'running'
-    ? conversationActionLabel.value ?? '正在运行新的重试回合'
+    ? conversationActionLabel.value ?? '正在重新生成回复'
     : undefined;
 });
 const visibleRetryBoundaryMessageId = computed(() => {
@@ -483,7 +483,7 @@ function modelRequestRetryState(request: Record<string, unknown>): {
   retryAttempt: number;
   retryMaxAttempts: number;
   remainingDelayMs: number;
-  reasonLabel: '模型输出停滞' | '模型连接异常' | '上下文压缩超时';
+  reasonLabel: 'LLM 输出停滞' | 'LLM 连接异常' | '上下文压缩超时';
 } {
   const raw = request.stream_stats_json;
   let stats: Record<string, unknown> | undefined;
@@ -505,8 +505,8 @@ function modelRequestRetryState(request: Record<string, unknown>): {
     reasonLabel: retryReason === 'compression_timeout'
       ? '上下文压缩超时'
       : retryReason === 'stream_stalled' || retryReason === 'first_semantic_timeout'
-        ? '模型输出停滞'
-        : '模型连接异常'
+        ? 'LLM 输出停滞'
+        : 'LLM 连接异常'
   };
 }
 

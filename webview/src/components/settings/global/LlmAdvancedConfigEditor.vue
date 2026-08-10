@@ -69,19 +69,19 @@ const promptCacheModeOptions: SettingsDropdownOption[] = [
   {
     value: 'key',
     label: '缓存 Key',
-    description: '仅发送按渠道、模型和对话自动生成的 prompt_cache_key；兼容不支持显式断点的模型。'
+    description: '仅发送按渠道、LLM 和对话自动生成的 prompt_cache_key；兼容不支持显式断点的 LLM。'
   },
   {
     value: 'explicit',
     label: '显式断点',
-    description: '发送 prompt_cache_options，并在聊天记录末尾写入 prompt_cache_breakpoint；需模型支持。'
+    description: '发送 prompt_cache_options，并在聊天记录末尾写入 prompt_cache_breakpoint；需 LLM 支持。'
   }
 ];
 const promptCacheDescription = computed(() => {
   if (props.config.provider === 'openai-responses') {
     return promptCache.value.mode === 'explicit'
-      ? '显式断点模式会发送 prompt_cache_options，并在聊天记录末尾添加断点；部分模型或兼容渠道不支持该参数。'
-      : '缓存 Key 模式会为同一渠道、模型和对话自动生成稳定的 prompt_cache_key；不发送显式断点或缓存时间参数。';
+      ? '显式断点模式会发送 prompt_cache_options，并在聊天记录末尾添加断点；部分 LLM 或兼容渠道不支持该参数。'
+      : '缓存 Key 模式会为同一渠道、LLM 和对话自动生成稳定的 prompt_cache_key；不发送显式断点或缓存时间参数。';
   }
   if (props.config.provider === 'claude') {
     return 'Claude 会在系统提示词、工具定义结束和聊天记录末尾写入缓存断点，并支持缓存时间档位。';
@@ -196,11 +196,11 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
         title="选择 OpenAI Responses 连接模式"
         @update:model-value="updateOpenAIResponsesTransport"
       />
-      <span class="stream-checkbox-text">WebSocket 模式仍保持 store=false，本地聊天记录是断线、CRUD 和 cache miss 后重建上下文的依据。</span>
+      <span class="stream-checkbox-text">WebSocket 模式不会在服务端保存对话；断线或重新加载后，会使用本地聊天记录恢复上下文。</span>
     </label>
 
     <label class="global-settings-field context-window-field">
-      <span>上下文窗口 token 数</span>
+      <span>上下文窗口 Token 数</span>
       <input
         class="token-number-input"
         :value="config.contextWindowTokens ?? ''"
@@ -243,16 +243,16 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
     </div>
 
     <div class="global-settings-field stream-field prompt-cache-field">
-      <span>Prompt Cache</span>
+      <span>提示词缓存</span>
       <div class="stream-checkbox-row">
         <LcCheckbox
           :model-value="promptCache.enabled && promptCacheSupported"
           :disabled="!promptCacheSupported"
           size="sm"
-          aria-label="启用 Prompt Cache"
+          aria-label="启用提示词缓存"
           @update:model-value="updatePromptCacheEnabled"
         >
-          <span class="stream-checkbox-enable">启用 Prompt Cache</span>
+          <span class="stream-checkbox-enable">启用提示词缓存</span>
         </LcCheckbox>
       </div>
       <span class="stream-checkbox-text">{{ promptCacheDescription }}</span>
@@ -264,7 +264,7 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
         :model-value="promptCache.mode"
         :options="promptCacheModeOptions"
         :disabled="!promptCacheSupported || !promptCache.enabled"
-        title="选择 OpenAI Responses Prompt Cache 模式"
+        title="选择 OpenAI Responses 提示词缓存模式"
         @update:model-value="updatePromptCacheMode"
       />
     </label>
@@ -275,7 +275,7 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
         :model-value="promptCache.ttl"
         :options="promptCacheTtlOptions"
         :disabled="!promptCacheSupported || !promptCache.enabled"
-        title="选择 Prompt Cache 时间档位"
+        title="选择提示词缓存时间"
         @update:model-value="updatePromptCacheTtl"
       />
     </label>
@@ -317,7 +317,7 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
           :value="config.systemPromptPrefix"
           rows="5"
           aria-label="前置系统提示词"
-          placeholder="默认为空；填写仅供当前渠道或模型使用的额外要求..."
+          placeholder="默认为空；填写仅供当前渠道或 LLM 使用的额外要求…"
           spellcheck="false"
           @input="updateSystemPromptPrefix"
         ></textarea>

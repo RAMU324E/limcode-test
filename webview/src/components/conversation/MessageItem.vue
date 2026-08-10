@@ -58,7 +58,7 @@ const emit = defineEmits<{
 const roleLabel = computed(() => {
   if (props.message.role === 'user') return '你';
   const model = props.message.model?.trim();
-  return model || 'AI';
+  return model || 'LLM';
 });
 type RunMetricKey = 'time' | 'ttft' | 'total' | 'speed';
 interface RunMetricDetailItem {
@@ -130,15 +130,15 @@ const deleteDescriptionHtml = computed(
   () => `将删除这条消息以及它之后的所有共 ${props.deleteCount} 条消息，此操作<strong>无法撤销</strong>。`
 );
 const compactDescriptionHtml = computed(() => terminatedPartial.value
-  ? `确定总结到此处吗？共 <strong>${props.compactCount}</strong> 条消息。已终止回复的 partial 原文不会进入摘要，只保留终止边界与已完成工具事实。`
+  ? `确定总结到此处吗？共 <strong>${props.compactCount}</strong> 条消息。已终止回复的未完成原文不会进入摘要，只保留终止位置与已完成的工具结果。`
   : `确定从此处开始往前进行总结吗？共 <strong>${props.compactCount}</strong> 条消息（前面的总结块本身额外算一条）。总结块会追加到这条消息后面。`
 );
 const forkDescriptionHtml = computed(
   () => `将从对话开头复制到此处，共 <strong>${Math.max(1, props.floorNumber)}</strong> 条消息。确认后会创建并自动打开新的分支对话。`
 );
 const retryDescriptionHtml = computed(() => terminatedPartial.value
-  ? `确定重试这次已终止回复吗？将删除其审计 partial 内容及后续共 ${props.deleteCount} 条消息，并从冻结的用户输入重新请求 AI。此操作<strong>不可撤销</strong>。`
-  : `确定要重试此消息吗？这将删除此消息及后续共 ${props.deleteCount} 条消息，然后重新请求 AI 响应。此操作<strong>不可撤销</strong>。`
+  ? `确定重试这次已终止回复吗？将删除已保留的未完成回复及后续共 ${props.deleteCount} 条消息，并从原用户输入重新请求 LLM。此操作<strong>不可撤销</strong>。`
+  : `确定要重试此消息吗？这将删除此消息及后续共 ${props.deleteCount} 条消息，然后重新请求 LLM。此操作<strong>不可撤销</strong>。`
 );
 const messageText = computed(() =>
   props.message.content.parts
@@ -235,12 +235,12 @@ const runMetricItems = computed<RunMetricItem[]>(() => {
       ? {
           key: 'speed' as const,
           label: '速度',
-          value: formatTokenSpeed(tokenSpeed),
-          tooltipTitle: '输出 token 速度（含思考）',
+          value: formattokenSpeed(tokenSpeed),
+          tooltipTitle: '输出 Token 速度（含思考）',
           details: [
-            { label: '输出 token（含思考）', value: formatExactNumber(outputTokens!) },
+            { label: '输出 Token（含思考）', value: formatExactNumber(outputTokens!) },
             { label: '输出耗时', value: formatDurationMs(streamDurationMs!) },
-            { label: '速度', value: formatTokenSpeedExact(tokenSpeed) }
+            { label: '速度', value: formattokenSpeedExact(tokenSpeed) }
           ]
         }
       : undefined
@@ -307,23 +307,23 @@ const terminationNotice = computed(() => {
   const detail = props.termination?.detail?.trim().replace(/[。.!！?？]+$/, '');
   if (props.termination?.reasonCode === 'empty_model_result') {
     return props.runHadCompletedTools
-      ? '工具调用已完成，但模型没有返回可显示的最终说明。本轮已明确失败，工具结果仍会保留。'
-      : '模型调用已结束，但没有返回可显示的正文。本轮已明确失败，不会以空回复静默完成。';
+      ? '工具调用已完成，但 LLM 没有返回可显示的最终说明。本轮已明确失败，工具结果仍会保留。'
+      : 'LLM 调用已结束，但没有返回可显示的正文。本轮已明确失败，不会以空回复静默完成。';
   }
   if (props.runHadCompletedTools) {
     return detail
       ? `本轮在工具调用后未正常完成：${detail}。工具结果已保留。`
-      : '本轮在工具调用后被终止，未生成最终说明；工具结果已保留，未完成回复不会计入后续模型上下文。';
+      : '本轮在工具调用后被终止，未生成最终说明；工具结果已保留，未完成回复不会计入后续 LLM 上下文。';
   }
   if (detail) return `本次回复未正常完成：${detail}`;
   return props.termination?.kind === 'failed'
-    ? '本次回复未正常完成。未完成的回复正文不会进入后续模型上下文；已完成的工具事实和中断边界仍会保留。'
-    : '本次回复已终止。未完成的回复正文不会进入后续模型上下文；已完成的工具事实和中断边界仍会保留。';
+    ? '本次回复未正常完成。未完成的回复正文不会进入后续 LLM 上下文；已完成的工具结果和中断位置仍会保留。'
+    : '本次回复已终止。未完成的回复正文不会进入后续 LLM 上下文；已完成的工具结果和中断位置仍会保留。';
 });
 const terminationTooltipRows = computed(() => props.termination ? [
   { label: '原因', value: props.termination.detail?.trim() || props.termination.reasonCode },
   ...(props.termination.detail?.trim() ? [{ label: '分类', value: props.termination.reasonCode }] : []),
-  { label: '上下文', value: '未完成正文不进入后续模型上下文' },
+  { label: '上下文', value: '未完成正文不进入后续 LLM 上下文' },
   { label: '保留事实', value: '已执行工具结果与中断边界' }
 ] : []);
 const copyableMessageText = computed(() =>
@@ -418,25 +418,25 @@ function pad2(value: number): string {
 
 function formatDurationMs(durationMs: number): string {
   const safeDuration = Math.max(0, durationMs);
-  if (safeDuration < 1000) return `${Math.round(safeDuration)}ms`;
+  if (safeDuration < 1000) return `${Math.round(safeDuration)} 毫秒`;
   const seconds = safeDuration / 1000;
   if (seconds < 60) {
     const digits = seconds < 10 ? 1 : 0;
-    return `${trimFixed(seconds, digits)}s`;
+    return `${trimFixed(seconds, digits)} 秒`;
   }
   const minutes = Math.floor(seconds / 60);
   const restSeconds = Math.round(seconds % 60);
-  return `${minutes}m${restSeconds.toString().padStart(2, '0')}s`;
+  return `${minutes} 分 ${restSeconds.toString().padStart(2, '0')} 秒`;
 }
 
-function formatTokenSpeed(speed: number): string {
+function formattokenSpeed(speed: number): string {
   const abs = Math.abs(speed);
-  if (abs >= 1000) return `${(speed / 1000).toFixed(1)}k tok/s`;
-  return `${speed.toFixed(1)} tok/s`;
+  if (abs >= 1000) return `${(speed / 1000).toFixed(1)}k Token/秒`;
+  return `${speed.toFixed(1)} Token/秒`;
 }
 
-function formatTokenSpeedExact(speed: number): string {
-  return `${speed.toFixed(1)} tok/s`;
+function formattokenSpeedExact(speed: number): string {
+  return `${speed.toFixed(1)} Token/秒`;
 }
 
 function trimFixed(value: number, digits: number): string {
@@ -510,7 +510,7 @@ function outputTokenDetails(usage: LlmUsageMetadataRecord): TokenUsageDetailItem
 
   const bodyTokens = normalized.output !== undefined ? Math.max(0, normalized.output - thoughts) : undefined;
   return [
-    ...(bodyTokens !== undefined ? [{ label: '正文 token', value: formatExactNumber(bodyTokens) }] : []),
+    ...(bodyTokens !== undefined ? [{ label: '正文 Token', value: formatExactNumber(bodyTokens) }] : []),
     ...usageDetailItems(usage, ['thoughtsTokenCount', 'reasoning_tokens'])
   ];
 }
@@ -547,30 +547,30 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
 
 function usageLabel(key: string): string {
   const labels: Record<string, string> = {
-    promptTokenCount: '输入 token',
-    prompt_tokens: '输入 token',
-    input_tokens: '输入 token',
-    inputTokens: '输入 token',
-    cachedContentTokenCount: '缓存命中 token',
-    cached_content_token_count: '缓存命中 token',
-    cached_tokens: '缓存命中 token',
-    cache_read_input_tokens: '缓存读取输入 token',
-    cacheCreationInputTokenCount: '缓存创建输入 token',
-    cache_creation_input_tokens: '缓存创建输入 token',
+    promptTokenCount: '输入 Token',
+    prompt_tokens: '输入 Token',
+    input_tokens: '输入 Token',
+    inputTokens: '输入 Token',
+    cachedContentTokenCount: '缓存命中 Token',
+    cached_content_token_count: '缓存命中 Token',
+    cached_tokens: '缓存命中 Token',
+    cache_read_input_tokens: '缓存读取输入 Token',
+    cacheCreationInputTokenCount: '缓存创建输入 Token',
+    cache_creation_input_tokens: '缓存创建输入 Token',
     cacheCreationInputTokensDetails: '缓存创建输入明细',
-    ephemeral5mInputTokenCount: '5 分钟缓存创建输入 token',
-    ephemeral_5m_input_tokens: '5 分钟缓存创建输入 token',
-    ephemeral1hInputTokenCount: '1 小时缓存创建输入 token',
-    ephemeral_1h_input_tokens: '1 小时缓存创建输入 token',
-    candidatesTokenCount: '输出 token',
-    completion_tokens: '输出 token',
-    output_tokens: '输出 token',
-    outputTokens: '输出 token',
-    thoughtsTokenCount: '思考 token',
-    reasoning_tokens: '推理 token',
-    totalTokenCount: '总 token',
-    total_tokens: '总 token',
-    totalTokens: '总 token'
+    ephemeral5mInputTokenCount: '5 分钟缓存创建输入 Token',
+    ephemeral_5m_input_tokens: '5 分钟缓存创建输入 Token',
+    ephemeral1hInputTokenCount: '1 小时缓存创建输入 Token',
+    ephemeral_1h_input_tokens: '1 小时缓存创建输入 Token',
+    candidatesTokenCount: '输出 Token',
+    completion_tokens: '输出 Token',
+    output_tokens: '输出 Token',
+    outputTokens: '输出 Token',
+    thoughtsTokenCount: '思考 Token',
+    reasoning_tokens: '推理 Token',
+    totalTokenCount: '总 Token',
+    total_tokens: '总 Token',
+    totalTokens: '总 Token'
   };
   return labels[key] ?? humanizeUsageKey(key);
 }
@@ -594,8 +594,8 @@ function usageWordLabel(word: string): string {
     candidate: '候选输出',
     candidates: '输出',
     total: '总',
-    token: 'token',
-    tokens: 'token',
+    token: 'Token',
+    tokens: 'Token',
     cached: '缓存命中',
     cache: '缓存',
     creation: '创建',
@@ -827,8 +827,8 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
               v-for="item in tokenUsageItems"
               :key="item.key"
               class="token-usage-item"
-              :aria-label="`${item.label} token ${item.exact}`"
-              :panel-title="`${item.label} token`"
+              :aria-label="`${item.label} Token ${item.exact}`"
+              :panel-title="`${item.label} Token`"
               :rows="tokenUsageTooltipRows(item)"
               tabindex="0"
             >
@@ -888,7 +888,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
         type="button"
         class="message-action-button"
         :disabled="forkMutationBlocked || terminatedPartial || floorNumber < 1"
-        :aria-label="terminatedPartial ? '已终止的 partial 回复不能作为分支边界' : '复制本对话至此'"
+        :aria-label="terminatedPartial ? '已终止的未完成回复不能作为分支位置' : '复制本对话至此'"
         :title="terminatedPartial ? '请选择上一条完整消息创建分支' : '复制本对话至此'"
         @click="openForkConfirm"
       >

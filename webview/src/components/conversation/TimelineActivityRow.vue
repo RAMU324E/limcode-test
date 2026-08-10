@@ -18,7 +18,7 @@ const settings = useGlobalSettingsStore();
         <header class="activity-header">
           <span class="role-chip assistant">
             <span class="role-dot" aria-hidden="true"></span>
-            <span class="activity-role-name">{{ props.modelLabel || 'AI' }}</span>
+            <span class="activity-role-name">{{ props.modelLabel || 'LLM' }}</span>
           </span>
         </header>
         <div class="activity-body">

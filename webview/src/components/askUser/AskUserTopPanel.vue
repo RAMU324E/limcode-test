@@ -168,7 +168,7 @@ function selectQuestion(batch: PendingAskUserBatchView, index: number): void {
         <IconMessageQuestion stroke="2" aria-hidden="true" />
       </template>
       <template #summary>
-        <span class="ask-user-top-title">回答 AI 的问题</span>
+        <span class="ask-user-top-title">回答 LLM 的问题</span>
         <span class="ask-user-top-summary">{{ panelSummary }}</span>
       </template>
 

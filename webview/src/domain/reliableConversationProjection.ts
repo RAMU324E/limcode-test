@@ -154,7 +154,7 @@ export function projectReliableConversation(
       : detail?.status === 'error'
         ? {
             role,
-            parts: [{ text: `[正文未在页面中物化：${detail.error?.trim() || '详情读取失败'}]` }]
+            parts: [{ text: `[正文暂未加载：${detail.error?.trim() || '读取详情失败'}]` }]
           } satisfies MessageContent
       : { role, parts: [] } satisfies MessageContent;
     parsedMessages.push({

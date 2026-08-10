@@ -20,7 +20,7 @@ export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
     headerActions: conversationId ? [{
         id: 'open-agent-run-conversation',
         label: '打开对话',
-        title: '打开这个 ChildExecution 对应的聊天标签页',
+        title: '打开这个子 Agent 的对话',
         icon: IconMessage2,
         invoke: () => {
           bridge.request(BridgeMessageType.ConversationOpen, { conversationId });
@@ -35,17 +35,45 @@ function runAgentMetadataSections(context: ToolDisplayContext): ToolDisplaySecti
   if (!record) return [];
   const answer = asRecord(record.answer);
   const rows = [
-    ...row('childExecutionState', record.childExecutionState),
-    ...row('activeChildTurnState', record.activeChildTurnState),
-    ...row('answerSubmissionState', record.answerSubmissionState),
-    ...row('runtimeDeliveryState', record.runtimeDeliveryState),
-    ...row('parentHandlingState', record.parentHandlingState),
-    ...row('terminationState', record.terminationState),
-    ...row('answerBridgeId', record.answerBridgeId ?? answer?.answerBridgeId)
+    ...stateRow('子 Agent 状态', record.childExecutionState),
+    ...stateRow('当前任务状态', record.activeChildTurnState),
+    ...stateRow('回答提交状态', record.answerSubmissionState),
+    ...stateRow('回答发送状态', record.runtimeDeliveryState),
+    ...stateRow('主 Agent 处理状态', record.parentHandlingState),
+    ...stateRow('结束状态', record.terminationState),
+    ...row('回答通道 ID', record.answerBridgeId ?? answer?.answerBridgeId)
   ];
   return rows.length > 0
-    ? [{ kind: 'output', title: '运行结果', rows, rowStyle: 'keyValue' }]
+    ? [{ kind: 'output', title: '子 Agent 运行结果', rows, rowStyle: 'keyValue' }]
     : [];
+}
+
+function stateRow(label: string, value: unknown): Array<{ label: string; value: string }> {
+  if (typeof value !== 'string') return row(label, value);
+  const text = value.trim();
+  if (!text) return [];
+  const labels: Record<string, string> = {
+    starting: '启动中',
+    active: '运行中',
+    running: '运行中',
+    idle: '等待继续',
+    interrupting: '正在终止',
+    interrupted: '已终止',
+    closed: '已结束',
+    pending: '等待中',
+    submitted: '已提交',
+    delivered: '已发送',
+    consumed: '已接收',
+    handled: '已处理',
+    failed: '失败',
+    complete: '已完成',
+    completed: '已完成',
+    cancelled: '已取消',
+    awaiting_parent: '等待主 Agent 处理',
+    delivery_failed: '回答发送失败',
+    success: '成功'
+  };
+  return [{ label, value: labels[text] ?? text }];
 }
 
 function row(label: string, value: unknown): Array<{ label: string; value: string }> {

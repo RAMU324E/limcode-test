@@ -26,7 +26,7 @@ const expandedServerIds = ref<string[]>([]);
 
 const transportOptions: SettingsDropdownOption[] = [
   { value: 'stdio', label: 'stdio', description: '启动本地命令并通过标准输入输出通信' },
-  { value: 'http', label: 'HTTP', description: '连接 Streamable HTTP MCP endpoint' }
+  { value: 'http', label: 'HTTP', description: '通过 Streamable HTTP 接口连接 MCP 服务' }
 ];
 
 const sourcesById = computed(() => new Map(clientState.mcpToolSources.map((source) => [source.id, source])));
@@ -184,13 +184,23 @@ function isServerConnected(serverId: string): boolean {
   return sourceForServer(serverId)?.status === 'connected';
 }
 
-function sourceStatusLabel(server: McpServerConfigRecord): string {
+function sourceStatus(server: McpServerConfigRecord): string {
   if (settings.pendingSettingsSections.mcpServers && server.enabled) return 'connecting';
   return sourceForServer(server.id)?.status ?? (server.enabled ? 'idle' : 'disabled');
 }
 
+function sourceStatusLabel(server: McpServerConfigRecord): string {
+  switch (sourceStatus(server)) {
+    case 'connected': return '已连接';
+    case 'connecting': return '连接中';
+    case 'error': return '连接失败';
+    case 'disabled': return '已停用';
+    default: return '等待连接';
+  }
+}
+
 function sourceStatusClass(server: McpServerConfigRecord): string {
-  const status = sourceStatusLabel(server);
+  const status = sourceStatus(server);
   if (status === 'connected') return 'connected';
   if (status === 'connecting') return 'connecting';
   if (status === 'error') return 'error';
@@ -224,7 +234,7 @@ function toolParametersText(tool: ToolDefinitionRecord): string {
           MCP 工具
           <SettingsLoadingInline :show="mcpBusy" :text="mcpBusyText" />
         </h2>
-        <p>注册 MCP server，检查连接状态，并管理发现到的 MCP 工具是否进入全局默认工具策略。</p>
+        <p>添加 MCP 服务、检查连接状态，并设置发现的工具是否加入全局默认工具权限。</p>
       </div>
     </header>
 
@@ -312,7 +322,7 @@ function toolParametersText(tool: ToolDefinitionRecord): string {
                   <input :value="server.transport.url" type="text" placeholder="https://example.com/mcp" @change="updateHttpField(server, { url: ($event.target as HTMLInputElement).value })" />
                 </label>
                 <label class="mcp-field wide">
-                  <span>Headers</span>
+                  <span>请求头</span>
                   <textarea :value="keyValueText(server.transport.headers)" rows="3" placeholder="Authorization=Bearer ..." @change="updateHttpField(server, { headers: parseKeyValueLines(($event.target as HTMLTextAreaElement).value) })"></textarea>
                 </label>
               </template>
@@ -349,7 +359,7 @@ function toolParametersText(tool: ToolDefinitionRecord): string {
                 <div v-if="isToolExpanded(tool.name)" class="mcp-tool-detail">
                   <dl>
                     <div>
-                      <dt>Canonical Name</dt>
+                      <dt>标准名称</dt>
                       <dd>{{ tool.name }}</dd>
                     </div>
                     <div>
@@ -358,7 +368,7 @@ function toolParametersText(tool: ToolDefinitionRecord): string {
                     </div>
                     <div>
                       <dt>执行类型</dt>
-                      <dd>{{ tool.execution }}</dd>
+                      <dd>{{ tool.execution === 'agentRun' ? '由 Agent 执行' : '由系统执行' }}</dd>
                     </div>
                   </dl>
                   <section>

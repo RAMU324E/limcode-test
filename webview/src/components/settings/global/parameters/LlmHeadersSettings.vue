@@ -64,7 +64,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
     <header class="llm-headers-header">
       <div>
         <label>自定义请求头</label>
-        <p>请求头值固定为字符串；同名 header 可能覆盖默认认证、版本或 User-Agent，请谨慎配置。</p>
+        <p>请求头值必须是文本；同名请求头可能覆盖默认认证信息、版本或 User-Agent，请谨慎配置。</p>
       </div>
       <button type="button" class="llm-headers-add" @click="addHeader">
         <IconPlus stroke="2" aria-hidden="true" />
@@ -81,7 +81,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
           :value="key"
           type="text"
           spellcheck="false"
-          placeholder="Header 名称"
+          placeholder="请求头名称"
           @change="renameHeader(key, $event)"
         />
         <input
@@ -89,7 +89,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
           :value="value"
           type="text"
           spellcheck="false"
-          placeholder="Header 值"
+          placeholder="请求头值"
           @input="updateHeaderValue(key, $event)"
         />
         <button type="button" class="llm-header-remove" aria-label="移除请求头" @click="removeHeader(key)">

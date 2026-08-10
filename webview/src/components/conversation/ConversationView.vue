@@ -34,10 +34,10 @@ const ready = computed(() => Boolean(reliableConversation.feed.sessionId && curr
 const placeholder = computed(() =>
   ready.value
     ? '输入消息，Enter 发送，Shift+Enter 换行'
-    : loadingDetail.value ? '对话内容加载中...' : '可靠 Runtime 初始化中...'
+    : loadingDetail.value ? '对话内容加载中…' : '对话正在初始化…'
 );
 const emptyHint = computed(() =>
-  ready.value ? '还没有消息，发一条试试。' : loadingDetail.value ? '正在加载对话内容，请稍候。' : '可靠 Runtime 初始化中，请稍候。'
+  ready.value ? '还没有消息，发一条试试。' : loadingDetail.value ? '正在加载对话内容，请稍候。' : '对话正在初始化，请稍候。'
 );
 const editFollowupCount = computed(() => Math.max(0, (conversationUi.editingMessage?.deleteCount ?? 1) - 1));
 const editConfirmDescriptionHtml = computed(

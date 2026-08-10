@@ -70,7 +70,7 @@ const rangeLabel = computed(() => {
 
 const tokenSavedLabel = computed(() => {
   if (props.block.tokenSaved === undefined) return undefined;
-  return `节省约 ${formatCompactNumber(props.block.tokenSaved)} tokens`;
+  return `节省约 ${formatCompactNumber(props.block.tokenSaved)} Token`;
 });
 
 const compressionInvocation = computed<LlmInvocationRecord | undefined>(() => {
@@ -178,7 +178,7 @@ function renderPart(part: ContentPart): string {
   if (isFunctionResponsePart(part)) return `[tool result] ${part.functionResponse.name}: ${safeJson(part.functionResponse.response)}`;
   if (isInlineDataPart(part)) return `[inline data] ${part.inlineData.mimeType}`;
   if (isFileDataPart(part)) return `[file] ${part.fileData.uri}`;
-  if (isProviderContextPart(part)) return `[provider context] ${part.providerContext.format}:${part.providerContext.itemType ?? 'context'}`;
+  if (isProviderContextPart(part)) return `[渠道专用上下文] ${part.providerContext.format}:${part.providerContext.itemType ?? 'context'}`;
   return '';
 }
 
@@ -278,11 +278,11 @@ function formatRetryAttempt(attempt: number | undefined, max: number | undefined
       <div class="detail-row"><span>压缩前</span><strong>{{ block.tokenCountBefore ?? '—' }}</strong></div>
       <div class="detail-row"><span>压缩后</span><strong>{{ block.tokenCountAfter ?? '—' }}</strong></div>
       <div v-if="compressionInvocation?.retryAttempt" class="detail-row"><span>自动重试</span><strong>{{ formatRetryAttempt(compressionInvocation.retryAttempt, compressionInvocation.retryMaxAttempts) || '—' }}</strong></div>
-      <div class="detail-row"><span>source hash</span><code>{{ block.sourceHash || '—' }}</code></div>
+      <div class="detail-row"><span>来源校验值</span><code>{{ block.sourceHash || '—' }}</code></div>
       <p v-if="block.summaryPreview" class="summary-preview">{{ block.summaryPreview }}</p>
       <p v-if="block.error" class="detail-error">{{ block.error }}</p>
       <p v-if="block.staleReason" class="detail-muted">{{ block.staleReason }}</p>
-      <p v-if="block.methodKind === 'openai_responses_compact'" class="detail-muted">OpenAI 原生压缩块仅在当前模型格式为 openai-responses 且压缩策略仍选中 OpenAI 原生压缩时使用；调用失败会保留失败状态。</p>
+      <p v-if="block.methodKind === 'openai_responses_compact'" class="detail-muted">OpenAI 原生压缩块仅在当前 LLM 格式为 openai-responses 且压缩策略仍选中 OpenAI 原生压缩时使用；调用失败会保留失败状态。</p>
     </div>
 
     <ConfirmPanel

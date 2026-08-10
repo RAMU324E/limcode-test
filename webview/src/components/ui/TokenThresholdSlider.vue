@@ -20,7 +20,7 @@ const props = withDefaults(defineProps<{
   minTokens: 1_000,
   stepTokens: 1_000,
   disabled: false,
-  ariaLabel: '拖拽调整 token 阈值',
+  ariaLabel: '拖拽调整 Token 阈值',
   recommendedLabel: '建议',
   labelVariant: 'plain',
   showTopLabel: true,

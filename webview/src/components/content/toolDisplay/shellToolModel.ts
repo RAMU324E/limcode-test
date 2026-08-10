@@ -68,10 +68,10 @@ export function shellInputSections(args: ShellArgs, context: ToolDisplayContext)
   if (command) sections.push({ kind: 'input', title: '命令', text: command });
 
   const optionLines = [
-    args.cwd?.trim() ? `cwd ${args.cwd.trim()}` : undefined,
-    typeof args.foregroundWaitMs === 'number' && Number.isFinite(args.foregroundWaitMs) ? `前台等待预算 ${args.foregroundWaitMs}ms` : undefined,
-    typeof args.force === 'boolean' ? `force ${args.force}` : undefined,
-    args.scheduling?.trim() ? `scheduling ${args.scheduling.trim()}` : undefined
+    args.cwd?.trim() ? `工作目录 ${args.cwd.trim()}` : undefined,
+    typeof args.foregroundWaitMs === 'number' && Number.isFinite(args.foregroundWaitMs) ? `前台等待 ${args.foregroundWaitMs} 毫秒` : undefined,
+    typeof args.force === 'boolean' ? `强制执行 ${args.force ? '是' : '否'}` : undefined,
+    args.scheduling?.trim() ? `执行方式 ${args.scheduling === 'parallel' ? '并行' : args.scheduling === 'serial' ? '依次' : args.scheduling.trim()}` : undefined
   ].filter((line): line is string => Boolean(line));
   if (optionLines.length > 0) sections.push({ kind: 'input', title: '参数', text: optionLines.join('\n') });
 
@@ -86,8 +86,8 @@ export function shellOutputSections(context: ToolDisplayContext): ToolDisplaySec
   const progress = shellProgressText(context.events, context.stringifyValue);
   const sections: ToolDisplaySection[] = [];
 
-  if (stdout) sections.push({ kind: 'output', title: 'stdout', text: stdout });
-  if (stderr) sections.push({ kind: 'output', title: 'stderr', text: stderr });
+  if (stdout) sections.push({ kind: 'output', title: '标准输出', text: stdout });
+  if (stderr) sections.push({ kind: 'output', title: '标准错误', text: stderr });
   if (progress) sections.push({ kind: 'output', title: '过程', text: progress });
 
   const exitInfo = shellExitInfo(output);

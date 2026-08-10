@@ -98,13 +98,13 @@ const hasQueuedItems = computed(() => queueItems.value.some((item) =>
 
 const waitReason = computed(() => {
   if (queueItems.value.every((item) => item.state === 'failed')) return '提交失败，草稿已保留';
-  if (queueItems.value.some((item) => item.state === 'accepted')) return '持久化已确认，等待时间线同步';
+  if (queueItems.value.some((item) => item.state === 'accepted')) return '消息已保存，正在显示';
   if (queueItems.value.some((item) => item.state === 'unconfirmed')) return '消息尚未确认，可手动重试';
-  if (!hasQueuedItems.value) return '等待可靠 Runtime 确认';
+  if (!hasQueuedItems.value) return '等待系统确认';
   const pendingInteraction = Object.values(
     reliableConversation.feed.records.InteractionRequest ?? {}
   ).some((request) => request.status === 'pending');
-  return pendingInteraction ? '等待当前审批或交互完成' : '等待当前回复完成';
+  return pendingInteraction ? '等待当前操作完成' : '等待当前回复完成';
 });
 
 function turnIntentText(intentId: string): string {
@@ -146,7 +146,7 @@ function submissionText(text: string, content?: { parts?: readonly unknown[] }):
 function stateLabel(state: QueueItem['state']): string {
   if (state === 'submitting') return '正在提交';
   if (state === 'unconfirmed') return '尚未确认';
-  if (state === 'accepted') return '已持久化';
+  if (state === 'accepted') return '已保存';
   if (state === 'acknowledged') return '已确认入队';
   if (state === 'failed') return '发送失败';
   return '排队中';
@@ -164,7 +164,7 @@ function timestamp(value: unknown): number {
     <div class="reliable-queue-header">
       <span class="reliable-queue-title">
         <IconClock :size="14" stroke="2" aria-hidden="true" />
-        消息提交 / 队列 · {{ queueItems.length }}
+        待发送消息 · {{ queueItems.length }}
       </span>
       <span class="reliable-queue-reason">{{ waitReason }}</span>
     </div>
@@ -183,7 +183,7 @@ function timestamp(value: unknown): number {
           v-if="item.retryable && item.commandId"
           type="button"
           class="reliable-queue-retry"
-          title="使用同一请求 ID 重试"
+          title="重新发送此消息"
           @click="retryTurnInputSubmission(item.commandId)"
         >
           <IconRefresh :size="13" stroke="2" aria-hidden="true" />

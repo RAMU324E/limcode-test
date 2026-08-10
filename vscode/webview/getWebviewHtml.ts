@@ -415,7 +415,7 @@ function getLoadingCopy(options: LoadingTransitionOptions): LoadingCopy {
   if (options.title.includes('设置')) {
     return {
       title: `正在打开 ${EXTENSION_BRAND} 设置`,
-      description: '正在读取模型、工具和数据目录配置。'
+      description: '正在读取 LLM、工具和数据目录配置。'
     };
   }
 

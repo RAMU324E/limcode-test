@@ -43,9 +43,9 @@ function readFileInputSections(args: ReadFileArgs, context: ToolDisplayContext):
   if (!path) return undefined;
 
   const rows = parameterRows([
-    { label: 'path', value: path },
-    { label: 'mode', value: args.mode ?? 'text' },
-    { label: 'lines', value: args.mode === 'attachment' ? undefined : lineRangeText(args.startLine, args.endLine) }
+    { label: '路径', value: path },
+    { label: '读取方式', value: args.mode === 'attachment' ? '附件' : '文本' },
+    { label: '行范围', value: args.mode === 'attachment' ? undefined : lineRangeText(args.startLine, args.endLine) }
   ]);
 
   return rows.length > 0
@@ -101,8 +101,8 @@ function readFileOutputSection(title: string, output: unknown): ToolDisplaySecti
 
   if (attachmentOutput(record)) {
     const rows = parameterRows([
-      { label: 'mimeType', value: stringValue(record.mimeType) },
-      { label: 'size', value: attachmentSizeText(record.sizeBytes) }
+      { label: '文件类型', value: stringValue(record.mimeType) },
+      { label: '大小', value: attachmentSizeText(record.sizeBytes) }
     ]);
     return rows.length > 0 ? { kind: 'output', title, rows, rowStyle: 'keyValue' } : undefined;
   }

@@ -7,7 +7,7 @@ import { EXTENSION_BRAND } from '@shared/extensionIdentity';
   <div class="global-settings-view">
     <header class="view-header">
       <span class="view-title">{{ EXTENSION_BRAND }} 全局设置</span>
-      <span class="view-hint">渠道配置会作为后端默认 LLM 连接配置同步给全局设置订阅者。</span>
+      <span class="view-hint">设置默认模型渠道、LLM 连接和其他全局选项。</span>
     </header>
     <div class="view-body">
       <GlobalSettingsPanel />

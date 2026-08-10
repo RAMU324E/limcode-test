@@ -54,7 +54,7 @@ export const GLOBAL_SETTINGS_TABS: readonly GlobalSettingsTabDefinition[] = [
   {
     key: 'prompts',
     label: '提示词',
-    description: '系统提示词与运行时快照',
+    description: '系统提示词与初始上下文',
     icon: IconMessage,
     component: SystemPromptSettingsTab
   },
@@ -92,7 +92,7 @@ export const GLOBAL_SETTINGS_TABS: readonly GlobalSettingsTabDefinition[] = [
     ? [{
         key: 'checkpoints' as const,
         label: '存档点',
-        description: '内部 shadow git 存档策略',
+        description: '内部 Git 存档策略',
         icon: IconArchive,
         component: CheckpointSettingsTab
       }]

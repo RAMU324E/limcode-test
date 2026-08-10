@@ -11,7 +11,7 @@ const mimeType = computed(() => props.part.fileData.mimeType || '未知类型');
 
 <template>
   <section class="file-card">
-    <div class="file-title">文件附件</div>
+    <span class="file-title">附件</span>
     <div class="file-meta">{{ mimeType }}</div>
     <div class="file-uri">{{ part.fileData.uri }}</div>
   </section>

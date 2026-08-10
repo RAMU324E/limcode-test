@@ -25,7 +25,7 @@ export const skillsToolDisplay: ToolDisplayResolver = (context) => {
 function skillsInputSections(args: SkillsArgs): ToolDisplaySection[] | undefined {
   const name = args.name?.trim();
   if (!name) return undefined;
-  return [{ kind: 'input', title: '载入技能', rows: [{ label: 'name', value: name }], rowStyle: 'keyValue' }];
+  return [{ kind: 'input', title: '载入技能', rows: [{ label: '名称', value: name }], rowStyle: 'keyValue' }];
 }
 
 function skillsOutputSections(context: ToolDisplayContext): ToolDisplaySection[] | undefined {

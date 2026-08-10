@@ -729,7 +729,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       ) {
         this.failDetailRequest(
           message.requestId,
-          '详情分块边界与持久化长度不一致。',
+          '对话详情数据不完整，请重新加载。',
           message.detail.totalBytes
         );
         return;

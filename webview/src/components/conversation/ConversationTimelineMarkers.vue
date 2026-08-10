@@ -190,8 +190,8 @@ function triggerLabel(marker: CheckpointMarkerView): string {
     case 'conversation_initial': return '初始存档';
     case 'user_message_before': return '用户消息前';
     case 'user_message_after': return '用户消息后';
-    case 'llm_response_before': return '调用 AI 前';
-    case 'llm_response_after': return '调用 AI 后';
+    case 'llm_response_before': return '调用 LLM 前';
+    case 'llm_response_after': return '调用 LLM 后';
     case 'tool_execution_before': return '工具执行前';
     case 'tool_execution_after': return '工具执行后';
     case 'agent_run_completed_before': return '回合完成前';

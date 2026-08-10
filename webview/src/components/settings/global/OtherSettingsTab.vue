@@ -47,19 +47,19 @@ function inputNumber(event: Event): number {
 
     <div class="global-settings-path-list" aria-label="全局设置路径信息">
       <p class="global-settings-path">
-        当前数据目录：<code>{{ settings.common.activeDataRootPath || '等待后端返回当前数据目录...' }}</code>
+        当前数据目录：<code>{{ settings.common.activeDataRootPath || '正在获取当前数据目录…' }}</code>
       </p>
       <p class="global-settings-path">
-        默认数据目录：<code>{{ settings.common.defaultDataRootPath || '等待后端返回默认数据目录...' }}</code>
+        默认数据目录：<code>{{ settings.common.defaultDataRootPath || '正在获取默认数据目录…' }}</code>
       </p>
       <p class="global-settings-path">
-        路径配置保存位置：<code>{{ settings.filePaths.common || '等待后端返回 VS Code globalState 位置...' }}</code>
+        路径配置保存位置：<code>{{ settings.filePaths.common || '正在获取 VS Code 配置存储位置…' }}</code>
       </p>
       <p class="global-settings-path">
-        当前渠道选择：<code>{{ settings.filePaths.llm || '等待后端返回 settings/llm.json 路径...' }}</code>
+        当前渠道选择：<code>{{ settings.filePaths.llm || '正在获取当前渠道配置路径…' }}</code>
       </p>
       <p class="global-settings-path">
-        渠道配置页：<code>{{ settings.filePaths.llmProviderConfigs || '等待后端返回 settings/llm-provider-configs/index.json 路径...' }}</code>
+        渠道配置页：<code>{{ settings.filePaths.llmProviderConfigs || '正在获取模型渠道配置路径…' }}</code>
       </p>
     </div>
   </section>

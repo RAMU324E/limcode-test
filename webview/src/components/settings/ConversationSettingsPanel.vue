@@ -39,7 +39,7 @@ function reload(): void {
       <span class="settings-status">{{ settings.status }}</span>
     </div>
     <p class="settings-note">
-      对话名称直接保存在可靠 Runtime 的 Conversation 记录中；模型选择由独立的 ModelProfile 管理。
+      对话名称会直接保存；LLM 设置由单独的配置管理。
     </p>
 
     <SystemPromptScopeEditor
@@ -47,15 +47,15 @@ function reload(): void {
       scope-kind="conversation"
       :scope-id="settings.common.conversationId"
       title="对话系统提示词"
-      description="仅影响当前对话，会在 global / agent / workflow 之后拼接。"
+      description="仅影响当前对话，会在全局、Agent 和工作流的系统提示词之后追加。"
     />
 
     <RuntimeContextScopeEditor
       v-if="hasConversation"
       scope-kind="conversation"
       :scope-id="settings.common.conversationId"
-      title="对话运行时上下文模板"
-      description="用于生成当前对话的运行时快照；可手动刷新快照，刷新不会写入聊天记录。"
+      title="对话初始上下文模板"
+      description="用于生成当前对话的初始上下文；可以手动刷新，刷新内容不会写入聊天记录。"
     />
 
     <WorkEnvironmentPolicyEditor

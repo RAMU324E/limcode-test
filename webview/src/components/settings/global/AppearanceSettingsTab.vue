@@ -23,12 +23,12 @@ onMounted(() => {
           外观
           <SettingsLoadingInline :show="appearanceLoading" :text="appearanceLoadingText" />
         </h2>
-        <p>自定义 AI 流式输出时的状态提示文字。文字会以波浪动画追加到内容末尾。</p>
+        <p>自定义 LLM 流式输出时的状态提示文字。文字会以波浪动画追加到内容末尾。</p>
       </div>
     </header>
 
     <div class="appearance-group">
-      <h3 class="appearance-group-title">自定义 AI 响应文字</h3>
+      <h3 class="appearance-group-title">自定义 LLM 响应文字</h3>
 
       <label class="global-settings-field">
         <span>整理上下文时</span>
@@ -47,7 +47,7 @@ onMounted(() => {
           type="text"
           placeholder="...少女等待中"
         />
-        <small class="appearance-field-hint">AI 收到请求后、尚未输出任何内容时显示</small>
+        <small class="appearance-field-hint">LLM 收到请求后、尚未输出任何内容时显示</small>
       </label>
 
       <label class="global-settings-field">
@@ -57,7 +57,7 @@ onMounted(() => {
           type="text"
           placeholder="...少女思考中"
         />
-        <small class="appearance-field-hint">AI 正在输出思考内容时显示</small>
+        <small class="appearance-field-hint">LLM 正在输出思考内容时显示</small>
       </label>
 
       <label class="global-settings-field">
@@ -67,7 +67,7 @@ onMounted(() => {
           type="text"
           placeholder="...少女编写中"
         />
-        <small class="appearance-field-hint">AI 正在输出正文回复时显示</small>
+        <small class="appearance-field-hint">LLM 正在输出正文回复时显示</small>
       </label>
 
       <label class="global-settings-field">
@@ -77,7 +77,7 @@ onMounted(() => {
           type="text"
           placeholder="...少女执行中"
         />
-        <small class="appearance-field-hint">AI 已输出工具调用、工具正在排队或执行时显示</small>
+        <small class="appearance-field-hint">LLM 已输出工具调用、工具正在等待或执行时显示</small>
       </label>
     </div>
 

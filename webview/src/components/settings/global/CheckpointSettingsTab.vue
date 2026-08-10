@@ -25,14 +25,14 @@ onMounted(() => {
           存档点
           <SettingsLoadingInline :show="checkpointLoading" :text="checkpointLoadingText" />
         </h2>
-        <p>配置插件内部 shadow git 存档点。存档点绑定对话归属文件夹，不直接绑定当前工作环境。</p>
+        <p>配置插件内部的 Git 存档点。存档点关联对话所属文件夹，不受当前工作环境切换影响。</p>
       </div>
     </header>
 
     <div class="checkpoint-git-status" :class="gitStatus?.available ? 'is-available' : gitStatus ? 'is-unavailable' : 'is-pending'">
       <div>
         <strong>系统 Git 检测</strong>
-        <p>存档点依赖系统 <code>git</code> 命令；创建前会先检测，不依赖 VS Code Git 扩展。</p>
+        <p>存档点依赖系统 <code>Git</code> 命令；创建前会先检测，不依赖 VS Code Git 扩展。</p>
       </div>
       <span v-if="!gitStatus">检测中…</span>
       <span v-else-if="gitStatus.available">可用 · {{ gitStatus.version || 'git' }}</span>
@@ -42,7 +42,7 @@ onMounted(() => {
     <CheckpointPolicyEditor
       scope-kind="global"
       title="全局默认存档点策略"
-      description="未配置对话、Agent 或工作流覆盖时使用。shadow 仓库保存在插件数据目录中，不修改真实项目。"
+      description="未单独配置对话、Agent 或工作流时使用。内部存档仓库保存在插件数据目录中，不修改真实项目。"
     />
 
     <ShadowRepositoryManager />

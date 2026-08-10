@@ -135,7 +135,7 @@ function parseWorkflowJson(): WorkflowRawData | undefined {
   }
 
   if (!isRecord(value)) {
-    rawError.value = '工作流原始数据必须是 JSON object。';
+    rawError.value = '工作流高级配置必须是 JSON 对象。';
     return undefined;
   }
 
@@ -186,32 +186,32 @@ function resetRawWorkflow(): void {
 
 function parseWorkflowRecord(value: unknown, current: WorkflowRecord): WorkflowRecord | undefined {
   if (!isRecord(value)) {
-    rawError.value = 'workflow 必须是 JSON object。';
+    rawError.value = '工作流（workflow）必须是 JSON 对象。';
     return undefined;
   }
   const record = value as Partial<WorkflowRecord>;
   if (record.id !== current.id) {
-    rawError.value = '暂不支持通过原始数据修改 workflow.id。';
+    rawError.value = '暂不支持修改工作流 ID（workflow.id）。';
     return undefined;
   }
   if (record.source !== current.source) {
-    rawError.value = '暂不支持通过原始数据修改 workflow.source。';
+    rawError.value = '暂不支持修改工作流来源（workflow.source）。';
     return undefined;
   }
   if (typeof record.name !== 'string' || !record.name.trim()) {
-    rawError.value = 'workflow.name 必须是非空字符串。';
+    rawError.value = '工作流名称（workflow.name）不能为空。';
     return undefined;
   }
   if (record.description !== undefined && typeof record.description !== 'string') {
-    rawError.value = 'workflow.description 必须是字符串或省略。';
+    rawError.value = '工作流说明（workflow.description）必须是文本或省略。';
     return undefined;
   }
   if (record.icon !== undefined && record.icon !== 'list-details') {
-    rawError.value = 'workflow.icon 当前只支持 "list-details"。';
+    rawError.value = '工作流图标（workflow.icon）当前只支持 "list-details"。';
     return undefined;
   }
   if (typeof record.createdAt !== 'number' || typeof record.updatedAt !== 'number') {
-    rawError.value = 'workflow.createdAt / workflow.updatedAt 必须是 number。';
+    rawError.value = '工作流的创建和更新时间必须是数字。';
     return undefined;
   }
   return {
@@ -355,9 +355,9 @@ function confirmDeleteWorkflow(): void {
   <section class="workflow-editor-tab settings-tab-content">
     <header class="workflow-editor-head">
       <div>
-        <p class="settings-kicker">Workflow</p>
+        <p class="settings-kicker">工作流</p>
         <h2>工作流编辑</h2>
-        <p>暂时不做可视化表单；这里直接显示工作流及其 Prompt / ToolPolicy / PlanReviewPolicy 关联原始数据，方便后续扩展 Plan / Review / Read Only 等工作流。</p>
+        <p>当前提供高级 JSON 编辑，可配置工作流及其提示词、工具权限和 Plan 审查策略。</p>
       </div>
       <button type="button" class="workflow-action-button" @click="openCreatePanel">
         <IconPlus :size="15" stroke="2.2" />
@@ -415,11 +415,11 @@ function confirmDeleteWorkflow(): void {
             v-model="rawText"
             class="workflow-json-editor"
             spellcheck="false"
-            aria-label="工作流原始 JSON 数据"
+            aria-label="工作流高级 JSON 配置"
           ></textarea>
           <p v-if="rawError" class="workflow-error">{{ rawError }}</p>
           <p v-else-if="rawStatus || workflowStore.status" class="workflow-status">{{ rawStatus || workflowStore.status }}</p>
-          <p v-else class="workflow-help">可编辑 workflow.name / description / icon，以及首个 planReviewPolicies / toolPolicies / systemPrompts 记录；各类 id、scope link 与时间字段由系统维护。</p>
+          <p v-else class="workflow-help">可编辑工作流的名称、说明和图标，以及首组 Plan 审查策略、工具权限和系统提示词；ID、关联信息和时间由系统维护。</p>
         </template>
         <div v-else class="workflow-empty">暂无工作流。</div>
       </main>
@@ -428,7 +428,7 @@ function confirmDeleteWorkflow(): void {
     <InputPanel
       :open="createPanelOpen"
       title="新建工作流"
-      description="创建后会出现在工作流列表中，可继续编辑原始数据。"
+      description="创建后会出现在工作流列表中，可继续编辑高级 JSON 配置。"
       label="工作流名称"
       placeholder="例如：Plan"
       confirm-label="创建"

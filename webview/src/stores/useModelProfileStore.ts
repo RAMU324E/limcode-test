@@ -41,7 +41,7 @@ export const useModelProfileStore = defineStore('modelProfile', {
       const scopeSuffix = `${scopeKind}:${normalizedScopeId ?? 'global'}`;
       const profile: ModelProfileRecord = {
         id: `model-profile:${scopeSuffix}`,
-        name: input.name?.trim() || '模型配置',
+        name: input.name?.trim() || 'LLM 配置',
         ...(input.providerConfigId?.trim() ? { providerConfigId: input.providerConfigId.trim() } : {}),
         ...(input.provider ? { provider: input.provider } : {}),
         model: input.model.trim()
@@ -59,7 +59,7 @@ export const useModelProfileStore = defineStore('modelProfile', {
           updatedAt: now
         }
       };
-      this.status = '正在保存模型配置...';
+      this.status = '正在保存 LLM 配置…';
     },
     reconcileSnapshot(correlationId?: string): void {
       if (!correlationId) return;
@@ -69,7 +69,7 @@ export const useModelProfileStore = defineStore('modelProfile', {
         delete this.pendingSelections[key];
         reconciled = true;
       }
-      if (reconciled) this.status = '模型配置已同步';
+      if (reconciled) this.status = 'LLM 配置已同步';
     },
     rejectPending(correlationId: string | undefined, message: string): void {
       if (!correlationId) return;

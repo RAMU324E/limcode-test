@@ -14,7 +14,7 @@ const { loading: rulesLoading, text: rulesLoadingText } = useSettingsLoadingText
           规则
           <SettingsLoadingInline :show="rulesLoading" :text="rulesLoadingText" />
         </h2>
-        <p>规则来自项目根与数据根的 AGENTS.md / CLAUDE.md，在对话开始时冻结注入 runtime 提示词，对所有 Agent 生效。AGENTS.md 由此处维护，CLAUDE.md 仅作兼容只读读取（用户自行修改文件）。</p>
+        <p>规则来自项目根目录和数据目录中的 AGENTS.md / CLAUDE.md，会在对话开始时载入系统提示词，并对所有 Agent 生效。AGENTS.md 可在此编辑；CLAUDE.md 仅供兼容读取，需要自行修改文件。</p>
       </div>
     </header>
 

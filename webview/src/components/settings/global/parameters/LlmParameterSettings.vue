@@ -141,7 +141,7 @@ function parseRequestBodyJson(text: string): { ok: true; value: LlmRequestBodyRe
   try {
     const parsed = JSON.parse(text.trim() || '{}') as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return { ok: false, error: 'requestBody 顶层必须是 JSON 对象。' };
+      return { ok: false, error: '底层请求体（requestBody）必须是一个 JSON 对象。' };
     }
     return { ok: true, value: parsed as LlmRequestBodyRecord };
   } catch (error) {
@@ -220,8 +220,8 @@ function uniqueKey(base: string, existingKeys: string[]): string {
   <section class="llm-parameter-settings" aria-label="渠道参数配置">
     <header class="llm-parameter-header">
       <div>
-        <label>自定义请求体/参数配置</label>
-        <p>参数视图用于管理常用统一参数和自定义覆盖参数；JSON 视图直接编辑 requestBody 原生覆盖补丁。</p>
+        <label>自定义请求参数</label>
+        <p>参数视图用于管理常用参数和自定义覆盖；JSON 视图可直接编辑底层请求体（requestBody）。</p>
       </div>
       <div class="llm-parameter-header-actions">
         <button v-if="viewMode === 'parameter'" type="button" class="llm-parameter-add" @click="addPanelOpen = true">
@@ -238,7 +238,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
     <div v-if="viewMode === 'parameter'" class="llm-parameter-list">
       <div class="llm-parameter-list-meta">
         <strong>{{ providerLabel }}</strong>
-        <span>自定义参数会写入 requestBody，并按 unified 规则深覆盖最终 provider 请求体。</span>
+        <span>自定义参数会写入底层请求体，并覆盖渠道自动生成的同名字段。</span>
       </div>
 
       <div v-if="!hasAnyParameter" class="llm-parameter-empty">暂无参数，点击“添加参数”选择。</div>
@@ -258,8 +258,8 @@ function uniqueKey(base: string, existingKeys: string[]): string {
     <div v-else class="llm-json-view">
       <div class="llm-json-toolbar">
         <div>
-          <strong>requestBody JSON</strong>
-          <p>这里编辑的是当前渠道原生请求体覆盖补丁，会在统一参数转换后深合并，不包含 messages / tools / system。</p>
+          <strong>底层请求体 JSON（requestBody）</strong>
+          <p>这里设置当前渠道额外发送的请求字段。它们会覆盖同名默认字段，但不包含消息、工具和系统提示词。</p>
         </div>
         <div class="llm-json-actions">
           <button type="button" @click="formatJson">格式化</button>
@@ -275,7 +275,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
         @blur="onJsonBlur"
       ></textarea>
       <p v-if="jsonError" class="llm-json-error">{{ jsonError }}</p>
-      <p v-else class="llm-json-hint">JSON 有效时会同步保存到当前配置的 requestBody。</p>
+      <p v-else class="llm-json-hint">JSON 有效时会保存到当前配置的底层请求体（requestBody）。</p>
     </div>
 
     <LlmParameterAddPanel

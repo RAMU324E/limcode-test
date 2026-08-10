@@ -18,6 +18,6 @@ export function checkpointBeforeMessageFloor(
 
 export function rollbackConfirmActionTitle(checkpoint: CheckpointRecord | undefined): string {
   return checkpoint
-    ? '先回档到此消息楼层前的存档点，再执行确认操作。'
-    : '此消息楼层前没有可回档的存档点。';
+    ? '先恢复到此消息之前的存档点，再执行确认操作。'
+    : '此消息之前没有可恢复的存档点。';
 }

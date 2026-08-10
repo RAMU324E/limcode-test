@@ -59,7 +59,7 @@ const methodLabel = computed(() => {
     case 'segmented_summary': return '分段总结';
     case 'deterministic_summary': return '确定性摘要';
     case 'manual_summary': return '手动摘要';
-    default: return '可靠压缩';
+    default: return '上下文压缩';
   }
 });
 const sourceCount = computed(() => nonNegativeInteger(props.block.source_count) ?? nonNegativeInteger(props.block.sourceCount));
@@ -98,7 +98,7 @@ const subtitle = computed(() => {
   }
   const facts = [methodLabel.value];
   if (sourceCount.value !== undefined) facts.push(`${sourceCount.value} 个上下文段`);
-  if (savedTokens.value !== undefined) facts.push(`节省约 ${savedTokens.value} tokens`);
+  if (savedTokens.value !== undefined) facts.push(`节省约 ${savedTokens.value} Token`);
   return facts.join(' · ');
 });
 
@@ -194,7 +194,7 @@ function renderPart(part: ContentPart): string {
   if (isTextPart(part)) return part.thought === true ? '' : part.text;
   if (isFunctionCallPart(part)) return `[工具调用] ${part.functionCall.name}: ${safeJson(part.functionCall.args)}`;
   if (isFunctionResponsePart(part)) return `[工具结果] ${part.functionResponse.name}: ${safeJson(part.functionResponse.response)}`;
-  if (isProviderContextPart(part)) return `[Provider 原生上下文] ${part.providerContext.format}:${part.providerContext.itemType ?? 'context'}`;
+  if (isProviderContextPart(part)) return `[渠道专用上下文] ${part.providerContext.format}:${part.providerContext.itemType ?? 'context'}`;
   if (isInlineDataPart(part)) return `[内联数据] ${part.inlineData.mimeType}`;
   if (isFileDataPart(part)) return `[文件] ${part.fileData.uri}`;
   return '';
@@ -262,9 +262,9 @@ function nonNegativeInteger(value: unknown): number | undefined {
       <p v-if="contentDetail?.status === 'loading' || !contentDetail">正在读取压缩结果…</p>
       <p v-else-if="contentDetail.status === 'error'" data-testid="compression-detail-error">{{ contentDetail.error || '压缩详情读取失败' }}</p>
       <template v-else>
-        <p v-if="providerNative" class="compression-provider-note">该块保留 OpenAI Responses 原生上下文；下一请求会按原始结构复用，不会转换成 Markdown。</p>
+        <p v-if="providerNative" class="compression-provider-note">该块保留 OpenAI Responses 专用上下文；下一次请求会按原有结构复用，不会转换成 Markdown。</p>
         <pre v-if="summaryText" data-testid="compression-detail-summary">{{ summaryText }}</pre>
-        <p v-else>压缩结果没有可见文本，但可能包含 Provider 原生上下文。</p>
+        <p v-else>压缩结果没有可见文本，但可能包含渠道专用上下文。</p>
         <button v-if="summaryText" type="button" class="compression-copy" @click="copySummary">
           <IconCheck v-if="copied" size="15" />
           <IconCopy v-else size="15" />

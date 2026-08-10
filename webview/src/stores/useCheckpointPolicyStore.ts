@@ -133,10 +133,10 @@ export const useCheckpointPolicyStore = defineStore('checkpointPolicy', {
     },
     restoreCheckpoint(checkpoint: CheckpointRecord): Promise<ShadowCheckpointRestoreResult> {
       const commitSha = checkpoint.commitSha;
-      if (!commitSha) return Promise.resolve({ status: 'failed', message: '该存档点没有可回档的快照。' });
+      if (!commitSha) return Promise.resolve({ status: 'failed', message: '该存档点没有可恢复的数据。' });
       const clientState = useClientStateStore();
       const repository = clientState.shadowRepositories.find((item) => item.id === checkpoint.shadowRepositoryId);
-      if (!repository) return Promise.resolve({ status: 'failed', message: '未找到此存档点关联的 shadow 仓库。' });
+      if (!repository) return Promise.resolve({ status: 'failed', message: '未找到此存档点关联的内部仓库。' });
       const policy = this.effectivePolicyFor('conversation', checkpoint.conversationId).policy ?? defaultPolicy('conversation', checkpoint.conversationId);
       return new Promise((resolve) => {
         let requestId = '';
@@ -155,12 +155,12 @@ export const useCheckpointPolicyStore = defineStore('checkpointPolicy', {
         unsubscribe = bridge.on(BridgeMessageType.CheckpointRestoreResult, (message: Extract<ExtensionToWebviewMessage, { type: BridgeMessageType.CheckpointRestoreResult }>) => {
           if (message.correlationId !== requestId) return;
           cleanup();
-          resolve((message.payload as CheckpointRestoreResultPayload | undefined)?.result ?? { status: 'failed', message: '回档失败：未收到结果。' });
+          resolve((message.payload as CheckpointRestoreResultPayload | undefined)?.result ?? { status: 'failed', message: '恢复失败：未收到结果。' });
         });
 
         timeoutId = window.setTimeout(() => {
           cleanup();
-          resolve({ status: 'failed', message: '回档请求超时。' });
+          resolve({ status: 'failed', message: '恢复请求超时。' });
         }, CHECKPOINT_RESTORE_TIMEOUT_MS);
 
         requestId = bridge.request(BridgeMessageType.CheckpointRestore, {

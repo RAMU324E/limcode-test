@@ -100,11 +100,11 @@ function formatModelTime(value: string | undefined): string {
 <template>
   <Teleport to="body">
     <div v-if="open" class="model-fetch-backdrop" @click.self="close">
-      <section class="model-fetch-dialog" role="dialog" aria-modal="true" aria-label="选择要添加的模型">
+      <section class="model-fetch-dialog" role="dialog" aria-modal="true" aria-label="选择要添加的 LLM">
         <header class="model-fetch-header">
           <h4 class="model-fetch-title">
             <IconFilter2Question stroke="2" aria-hidden="true" />
-            <span>选择要添加的模型</span>
+            <span>选择要添加的 LLM</span>
           </h4>
           <div class="model-fetch-header-actions">
             <button type="button" class="model-fetch-header-button" :disabled="loading || !selectableFilteredModels.length" @click="toggleAllFiltered">
@@ -115,16 +115,16 @@ function formatModelTime(value: string | undefined): string {
         </header>
 
         <div class="model-fetch-body" :class="{ 'is-loading': loading }">
-          <label class="model-filter-box" aria-label="筛选模型">
+          <label class="model-filter-box" aria-label="筛选 LLM">
             <IconSearch stroke="2" aria-hidden="true" />
-            <input v-model="filterText" type="text" placeholder="筛选模型..." :disabled="loading" />
+            <input v-model="filterText" type="text" placeholder="筛选 LLM…" :disabled="loading" />
           </label>
 
           <div class="model-fetch-list-shell">
             <div ref="scroller" class="model-fetch-list-scroll">
               <div class="model-fetch-list">
-                <div v-if="!models.length" class="model-fetch-empty">没有获取到模型。</div>
-                <div v-else-if="!filteredModels.length" class="model-fetch-empty">没有匹配的模型。</div>
+                <div v-if="!models.length" class="model-fetch-empty">没有获取到 LLM。</div>
+                <div v-else-if="!filteredModels.length" class="model-fetch-empty">没有匹配的 LLM。</div>
                 <div
                   v-for="model in filteredModels"
                   :key="model.id"
@@ -152,7 +152,7 @@ function formatModelTime(value: string | undefined): string {
                       <span v-if="existingSet.has(model.id)" class="model-fetch-badge">已添加</span>
                     </span>
                     <span class="model-fetch-id">ID: {{ model.id }}</span>
-                    <span v-if="model.createdAt" class="model-fetch-time">时间: {{ formatModelTime(model.createdAt) }}</span>
+                    <span v-if="model.createdAt" class="model-fetch-time">时间：{{ formatModelTime(model.createdAt) }}</span>
                   </span>
                 </div>
               </div>
@@ -165,8 +165,8 @@ function formatModelTime(value: string | undefined): string {
               <div class="model-fetch-loading-card">
                 <div class="model-fetch-loading-spinner" aria-hidden="true"></div>
                 <div class="model-fetch-loading-text">
-                  <strong>正在获取模型列表...</strong>
-                  <span>请稍候，模型列表加载完成后会自动显示。</span>
+                  <strong>正在获取 LLM 列表…</strong>
+                  <span>请稍候，LLM 列表加载完成后会自动显示。</span>
                 </div>
               </div>
             </div>
@@ -174,11 +174,11 @@ function formatModelTime(value: string | undefined): string {
         </div>
 
         <footer class="model-fetch-footer">
-          <span class="model-fetch-selection-count">已选择 {{ selectedModels.length }} 个模型</span>
+          <span class="model-fetch-selection-count">已选择 {{ selectedModels.length }} 个 LLM</span>
           <div class="model-fetch-actions">
             <button type="button" class="model-fetch-button secondary" @click="close">取消</button>
             <button type="button" class="model-fetch-button primary" :disabled="loading || selectedModels.length === 0" @click="addSelected">
-              添加 ({{ selectedModels.length }})
+              添加（{{ selectedModels.length }}）
             </button>
           </div>
         </footer>

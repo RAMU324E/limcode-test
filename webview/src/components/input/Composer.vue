@@ -91,7 +91,7 @@ const conversationInputDisabled = computed(() => props.disabled || Boolean(curre
 const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
 const sendTitle = computed(() => {
-  if (currentSubmissionCommandId.value) return '正在确认消息已持久化';
+  if (currentSubmissionCommandId.value) return '正在确认消息已保存';
   if (ui.isEditing) return '提交编辑';
   return currentExecution.value ? '加入消息队列（不会解除当前审批或等待）' : '发送';
 });
@@ -185,40 +185,26 @@ const activeTransport = computed<'http' | 'websocket'>(() => {
   const modelConfig = config.modelConfigs.find((candidate) => candidate.modelId === modelId);
   return modelConfig?.openaiResponsesTransport ?? config.openaiResponsesTransport ?? 'http';
 });
-const runtimeTransportLabel = computed(() => activeTransport.value === 'websocket' ? 'WS' : 'HTTP');
+const runtimeTransportLabel = computed(() => activeTransport.value === 'websocket' ? 'WebSocket' : 'HTTP');
 const runtimeReloadRequired = computed(() => session.status === 'ready' && (!session.runtime || session.runtime.reloadRequired));
-const runtimeBadgeLabel = computed(() => runtimeReloadRequired.value ? '重载' : runtimeTransportLabel.value);
+const runtimeBadgeLabel = computed(() => runtimeReloadRequired.value ? '需重载' : '正常');
 const runtimeDiagnosticRows = computed(() => {
-  const runtime = session.runtime;
   const config = activeChannelConfig.value;
-  if (!runtime) {
-    return [
-      { label: '状态', value: '当前 Extension Host 未提供构建指纹，请执行 Developer: Reload Window' },
-      { label: '传输配置', value: `${runtimeTransportLabel.value} · ${config ? providerLabel(config.provider) : '未选择渠道'}` }
-    ];
-  }
   return [
-    ...(runtime.reloadRequired
-      ? [{ label: '状态', value: '磁盘编译产物已变化，请执行 Developer: Reload Window' }]
-      : [{ label: '状态', value: '运行时代码与磁盘编译产物一致' }]),
-    { label: '传输配置', value: `${runtimeTransportLabel.value} · ${config ? providerLabel(config.provider) : '未选择渠道'}` },
-    { label: '模型', value: config ? selectedModelForConfig(config) || config.model : '—' },
-    { label: '扩展', value: `${runtime.extensionName} ${runtime.extensionVersion}` },
-    { label: 'Provider', value: runtime.providerVersion },
-    { label: 'WS 运行库', value: runtime.webSocketVersion },
-    { label: '代理运行库', value: runtime.proxyAgentVersion },
-    { label: 'WS 实现', value: runtime.wsImplementation },
-    { label: '已加载指纹', value: runtime.buildFingerprint },
-    ...(runtime.currentBuildFingerprint !== runtime.buildFingerprint
-      ? [{ label: '磁盘指纹', value: runtime.currentBuildFingerprint }]
-      : []),
-    { label: '进程实例', value: `${runtime.runtimeInstanceId.slice(0, 8)} · PID ${runtime.processId}` },
-    { label: '激活时间', value: new Date(runtime.activatedAt).toLocaleString() }
+    {
+      label: '状态',
+      value: runtimeReloadRequired.value
+        ? session.runtime ? '扩展已更新，需要重新加载窗口' : '扩展信息暂不可用，请重新加载窗口'
+        : '正常'
+    },
+    { label: '模型渠道', value: config?.name || (config ? providerLabel(config.provider) : '未选择') },
+    { label: 'LLM', value: config ? selectedModelForConfig(config) || config.model || '未选择' : '未选择' },
+    { label: '连接方式', value: runtimeTransportLabel.value }
   ];
 });
 const runtimeDiagnosticAriaLabel = computed(() => runtimeReloadRequired.value
-  ? 'Extension Host 代码已过期，需要重载；查看诊断'
-  : `当前传输 ${runtimeTransportLabel.value}，查看运行时诊断`);
+  ? '扩展需要重新加载；查看连接状态'
+  : '连接正常；查看连接状态');
 
 const activeWorkEnvironmentId = computed({
   get: () => workEnvironmentStore.activeEnvironmentForConversation(clientState.currentConversationId)?.id ?? workEnvironmentOptions.value[0]?.value ?? '',
@@ -387,7 +373,7 @@ async function addFilesAsAttachments(files: File[]): Promise<void> {
     let targetAttachments = attachmentSnapshots.value[targetMode];
     const mimeType = attachmentMimeTypeForFile(file);
     if (!SUPPORTED_COMPOSER_MIME_TYPES.has(mimeType)) {
-      globalSettings.status = `当前模型附件仅支持 PNG、JPEG、WebP、PDF 和纯文本；未添加 ${file.name}。`;
+      globalSettings.status = `当前 LLM 仅支持 PNG、JPEG、WebP、PDF 和纯文本附件；未添加 ${file.name}。`;
       continue;
     }
     if (file.size > limitBytes) {
@@ -624,7 +610,7 @@ function setConversationModelProfile(conversationId: string, config: LlmProvider
   const model = modelId.trim();
   if (!conversationId || !config.id || !model) return;
   modelProfileStore.setProfileForScope('conversation', conversationId, {
-    name: '对话临时模型',
+    name: '对话临时 LLM',
     providerConfigId: config.id,
     provider: config.provider,
     model
@@ -711,7 +697,7 @@ function middleEllipsis(value: string, maxLength: number): string {
   const keep = Math.max(4, Math.floor((maxLength - 3) / 2));
   const head = value.slice(0, keep);
   const tail = value.slice(value.length - keep);
-  return `${head}...${tail}`;
+  return `${head}…${tail}`;
 }
 </script>
 
@@ -726,7 +712,7 @@ function middleEllipsis(value: string, maxLength: number): string {
           <span class="composer-edit-indicator-icon" aria-hidden="true">
             <IconPencilExclamation stroke="2" />
           </span>
-          <span class="composer-edit-text">{{ ui.editingTurnIntent ? '正在编辑排队消息，发送后创建新的不可变 Revision。' : '正在编辑消息，发送前需要确认。' }}</span>
+          <span class="composer-edit-text">{{ ui.editingTurnIntent ? '正在编辑排队消息，发送后会创建一个新的消息版本。' : '正在编辑消息，发送前需要确认。' }}</span>
           <button type="button" class="composer-edit-cancel" @click="ui.cancelEditMode">取消编辑</button>
         </div>
         <div v-if="selectedAttachments.length" class="composer-attachments-shell">
@@ -835,8 +821,8 @@ function middleEllipsis(value: string, maxLength: number): string {
           v-if="currentExecution"
           type="button"
           class="composer-side-action composer-side-abort"
-          :aria-label="interruptPhase === 'stopping' ? '正在停止当前 Turn' : interruptPhase === 'requesting' ? '正在提交中断请求' : '终止当前对话正在执行的任务'"
-          :title="interruptPhase === 'stopping' ? '正在停止当前 Turn，等待运行租约释放' : interruptPhase === 'requesting' ? '正在提交身份围栏中断请求' : '中断当前 Turn（子 Agent 与后台进程继续独立运行）'"
+          :aria-label="interruptPhase === 'stopping' ? '正在停止当前回复' : interruptPhase === 'requesting' ? '正在提交停止请求' : '停止当前回复'"
+          :title="interruptPhase === 'stopping' ? '正在停止当前回复' : interruptPhase === 'requesting' ? '正在提交停止请求' : '停止当前回复（子 Agent 与后台进程继续运行）'"
           :disabled="interruptPending"
           @click="interruptConversation"
         >
@@ -854,7 +840,7 @@ function middleEllipsis(value: string, maxLength: number): string {
             :options="agentOptions"
             title="切换当前 Agent"
             searchable
-            search-placeholder="筛选 Agent..."
+            search-placeholder="筛选 Agent…"
             :close-signal="agentDropdownCloseSignal"
             :max-height="220"
             @open="onAgentDropdownOpen"
@@ -867,7 +853,7 @@ function middleEllipsis(value: string, maxLength: number): string {
             :options="workflowOptions"
             title="切换工作流"
             searchable
-            search-placeholder="筛选工作流..."
+            search-placeholder="筛选工作流…"
             :close-signal="modeDropdownCloseSignal"
             :max-height="220"
             @open="onModeDropdownOpen"
@@ -881,7 +867,7 @@ function middleEllipsis(value: string, maxLength: number): string {
             title="切换渠道配置页"
             empty-text="暂无渠道配置"
             searchable
-            search-placeholder="筛选渠道..."
+            search-placeholder="筛选渠道…"
             :close-signal="channelDropdownCloseSignal"
             :max-height="220"
             @open="onChannelDropdownOpen"
@@ -892,7 +878,7 @@ function middleEllipsis(value: string, maxLength: number): string {
                 class="channel-model-toggle"
                 :class="{ 'is-open': channelModelPanel?.configId === option.value }"
                 :disabled="!globalSettings.llmProviderConfigs.configs.find((config) => config.id === option.value)?.models.length"
-                aria-label="切换该渠道的模型"
+                aria-label="切换该渠道的 LLM"
                 @click.stop="openChannelModelPanel(option.value, $event)"
               >
                 <span class="channel-model-toggle-caret" aria-hidden="true"></span>
@@ -903,7 +889,7 @@ function middleEllipsis(value: string, maxLength: number): string {
                 v-if="open && channelModelPanel && channelModelPanelConfig"
                 class="channel-model-panel lc-dropdown-panel"
                 :style="channelModelPanel.style"
-                aria-label="切换模型"
+                aria-label="切换 LLM"
                 @click.stop
               >
                 <div class="channel-model-panel-title">
@@ -914,9 +900,9 @@ function middleEllipsis(value: string, maxLength: number): string {
                   class="channel-model-list"
                   :items="channelModelPanelItems"
                   :selected-id="selectedModelForConfig(channelModelPanelConfig)"
-                  search-placeholder="筛选模型..."
-                  empty-text="该渠道暂无模型列表。"
-                  no-match-text="没有匹配的模型。"
+                  search-placeholder="筛选 LLM…"
+                  empty-text="该渠道暂无 LLM 列表。"
+                  no-match-text="没有匹配的 LLM。"
                   :max-height="124"
                   @select="selectChannelModel(channelModelPanelConfig, $event)"
                 />
@@ -948,7 +934,7 @@ function middleEllipsis(value: string, maxLength: number): string {
       <HoverTooltipPanel
         v-if="session.status === 'ready'"
         class="composer-runtime-tooltip"
-        panel-title="运行时与传输"
+        panel-title="连接状态"
         :rows="runtimeDiagnosticRows"
         :delay-ms="180"
       >
