@@ -116,7 +116,7 @@ test('扩展先注册可见界面再动态打开 Runtime，激活不等待模块
   );
 });
 
-test('侧栏首屏与已知对话恢复不串行等待全局历史 hydration', () => {
+test('侧栏首屏保持懒加载，恢复面板在 hydration 后校验序列化 Conversation', () => {
   const facadeSource = fs.readFileSync(
     path.resolve('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.ts'),
     'utf8'
@@ -133,11 +133,11 @@ test('侧栏首屏与已知对话恢复不串行等待全局历史 hydration', (
   const restoreEnd = panelSource.indexOf('function isDefaultConversationTitle(', restoreStart);
   assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
   const restoreSource = panelSource.slice(restoreStart, restoreEnd);
-  assert.ok(
-    restoreSource.indexOf('if (options.conversationId) return options;')
-      < restoreSource.indexOf('await backendApp.waitUntilHydrated();'),
-    'a serialized conversation identity must restore before lazy title/history hydration'
-  );
+  const hydration = restoreSource.indexOf('await backendApp.waitUntilHydrated();');
+  const validation = restoreSource.indexOf('await backendApp.conversationExists(options.conversationId)');
+  assert.ok(hydration >= 0 && validation > hydration,
+    'a serialized conversation identity must be validated after history hydration');
+  assert.match(restoreSource, /existing\?\.id \?\? await backendApp\.createConversation\(\)/);
 });
 
 test('ApplicationStartup keeps backend evaluation demand-driven and single-flight', async () => {

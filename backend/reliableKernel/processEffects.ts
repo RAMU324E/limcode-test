@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { RootBinding } from './contracts';
+import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import {
   ContentAddressedStore,
   type ContentObjectMetadata,
@@ -33,7 +34,7 @@ import {
   PROCESS_WRAPPER_MANIFEST_FILE,
   PROCESS_WRAPPER_PROTOCOL,
   PROCESS_WRAPPER_STOP_REQUEST_FILE,
-  isLinuxWrapperProcessReachable,
+  isWrapperProcessReachable,
   listProcessSpoolChunks,
   parseStopRequest,
   parseWrapperExitReceipt,
@@ -43,7 +44,7 @@ import {
   processChunkFileName,
   processSpoolPath,
   processSpoolRoot,
-  readLinuxStartFingerprint,
+  readProcessStartFingerprint,
   type ProcessStopRequest,
   type ProcessTerminationReason,
   type ProcessWrapperExitReceipt,
@@ -787,7 +788,7 @@ export class ProcessControlPlane {
           : unknownStopObservation(errorMessage(error));
       }
 
-      if (!isLinuxWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
+      if (!isWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
         const terminal = await this.waitForTerminalProcessEvidence(
           request.processId,
           PROCESS_STOP_RECEIPT_WAIT_MS
@@ -797,7 +798,7 @@ export class ProcessControlPlane {
           : unknownStopObservation('Recorded process wrapper is not reachable and no terminal receipt converged.');
       }
       try {
-        if (readLinuxStartFingerprint(identity.childPid) !== identity.startFingerprint) {
+        if (readProcessStartFingerprint(identity.childPid) !== identity.startFingerprint) {
           return unknownStopObservation('Live process start fingerprint does not match.');
         }
       } catch (error) {
@@ -1601,7 +1602,7 @@ export class ProcessControlPlane {
     } catch (error) {
       if (!isNotFound(error)) return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
     }
-    if (!isLinuxWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
+    if (!isWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
       // The wrapper can atomically publish its receipt and exit between the first receipt read and
       // this liveness check. Re-read the terminal authority before classifying that normal race as
       // outcome_unknown.
@@ -1628,7 +1629,7 @@ export class ProcessControlPlane {
       };
     }
     try {
-      if (readLinuxStartFingerprint(identity.childPid) !== identity.startFingerprint) {
+      if (readProcessStartFingerprint(identity.childPid) !== identity.startFingerprint) {
         return {
           state: 'outcome_unknown',
           processId,
@@ -3022,12 +3023,7 @@ async function writeAtomicJson(filePath: string, value: unknown): Promise<void> 
     await handle.close();
   }
   await fs.rename(temporary, filePath);
-  const directory = await fs.open(path.dirname(filePath), 'r');
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
+  await syncDirectoryDurably(path.dirname(filePath));
 }
 
 /** Publishes an immutable request without replacing a winner from another Host/effect. */
@@ -3046,12 +3042,7 @@ async function writeAtomicJsonOnce(filePath: string, value: unknown): Promise<vo
   } finally {
     await fs.unlink(temporary).catch(() => undefined);
   }
-  const directory = await fs.open(path.dirname(filePath), 'r');
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
+  await syncDirectoryDurably(path.dirname(filePath));
 }
 
 async function readJson(filePath: string): Promise<unknown> {

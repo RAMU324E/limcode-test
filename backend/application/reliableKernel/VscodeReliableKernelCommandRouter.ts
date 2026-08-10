@@ -88,6 +88,13 @@ export class VscodeReliableKernelCommandRouter {
           deduplicated: false,
           message: text
         });
+      } else if (
+        (message.type === BridgeMessageType.GlobalSettingsGet || message.type === BridgeMessageType.GlobalSettingsUpdate)
+        && message.payload?.section
+      ) {
+        // The Webview tracks loading/failure independently per section. Preserve that scope on generic
+        // read/write failures so one invalid settings store does not leave the whole channel page pending.
+        this.postRequestError(webview, message.type, text, message.id, { section: message.payload.section });
       } else {
         this.postRequestError(webview, message.type, text, message.id);
       }
@@ -557,7 +564,18 @@ export class VscodeReliableKernelCommandRouter {
     payload: ConversationSettingsGetPayload,
     correlationId?: string
   ): Promise<void> {
-    const stored = await this.readConversationSettings(payload.conversationId, payload.section);
+    const stored = await this.readConversationSettings(payload.conversationId, payload.section, true);
+    if (!stored) {
+      console.info(`[LimCode] Ignored stale Conversation settings request: ${payload.conversationId}`);
+      this.postRequestError(
+        webview,
+        BridgeMessageType.ConversationSettingsGet,
+        '该对话已被删除或不再存在。',
+        correlationId,
+        { code: 'stale_conversation', conversationId: payload.conversationId }
+      );
+      return;
+    }
     this.post(webview, this.conversationSettingsSnapshot(stored, correlationId));
   }
 
@@ -581,14 +599,24 @@ export class VscodeReliableKernelCommandRouter {
       })
     ]);
     const stored = await this.readConversationSettings(conversationId, payload.section);
+    if (!stored) throw new Error(`Conversation ${conversationId} 不存在。`);
     this.broadcastOrPost(webview, this.conversationSettingsSnapshot(stored, correlationId));
   }
 
   private async readConversationSettings(
     conversationId: string,
-    section: ConversationSettingsGetPayload['section']
-  ): Promise<{ conversationId: string; section: ConversationSettingsGetPayload['section']; settings: unknown; filePath: string }> {
-    const conversation = await this.requireRow('Conversation', conversationId);
+    section: ConversationSettingsGetPayload['section'],
+    allowMissing = false
+  ): Promise<{
+    conversationId: string;
+    section: ConversationSettingsGetPayload['section'];
+    settings: unknown;
+    filePath: string;
+  } | undefined> {
+    const conversation = allowMissing
+      ? await this.maybeRow('Conversation', conversationId)
+      : await this.requireRow('Conversation', conversationId);
+    if (!conversation) return undefined;
     if (section !== 'common') {
       throw new Error('对话模型选择只由 ModelProfile 控制；ConversationSettings.llm 已停用。');
     }
@@ -864,7 +892,23 @@ export class VscodeReliableKernelCommandRouter {
     if (!Number.isSafeInteger(payload.leaseEpoch) || payload.leaseEpoch < 0) {
       throw new TypeError('Turn interrupt 缺少有效的 ExecutionLease generation。');
     }
-    const turn = await this.requireRow('Turn', payload.turnId);
+    const turn = await this.maybeRow('Turn', payload.turnId);
+    if (!turn) {
+      console.info(`[LimCode] Treated stale Turn interrupt as already terminal: ${payload.turnId}`);
+      this.post(webview, {
+        id: randomUUID(),
+        type: BridgeMessageType.TurnInterruptResult,
+        channel: 'control',
+        correlationId,
+        payload: {
+          conversationId: payload.conversationId,
+          turnId: payload.turnId,
+          status: 'already_terminal',
+          cascadeChildAgents: payload.cascadeChildAgents === true
+        }
+      });
+      return;
+    }
     if (turn.conversation_id !== payload.conversationId) {
       throw new Error('Turn interrupt 目标不属于当前 Conversation。');
     }
@@ -1476,10 +1520,15 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   private async requireRow(domain: string, id: string): Promise<DomainRow> {
+    const row = await this.maybeRow(domain, id);
+    if (!row) throw new Error(`${domain} ${id} 不存在。`);
+    return row;
+  }
+
+  private async maybeRow(domain: string, id: string): Promise<DomainRow | undefined> {
     const snapshot = await this.product.application.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)]);
     const row = snapshot.snapshot[0];
-    if (!row || Array.isArray(row)) throw new Error(`${domain} ${id} 不存在。`);
-    return row;
+    return row && !Array.isArray(row) ? row : undefined;
   }
 
   private async childExecutionIdForConversation(conversationId: string): Promise<string | undefined> {
@@ -1515,8 +1564,9 @@ export class VscodeReliableKernelCommandRouter {
     correlationId?: string,
     details: {
       section?: GlobalSettingsGetPayload['section'];
-      code?: 'settings_revision_conflict';
+      code?: 'settings_revision_conflict' | 'stale_conversation';
       actualRevision?: string;
+      conversationId?: string;
     } = {}
   ): void {
     const { section, ...payloadDetails } = details;

@@ -36,6 +36,7 @@ export interface ApplicationFacade {
   createConversation(options?: { projectFolderUri?: string }): Promise<string>;
   forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult>;
   waitUntilHydrated(): Promise<void>;
+  conversationExists(conversationId: string): Promise<boolean>;
   getConversationDisplayTitle(conversationId: string | undefined): string;
   prepareConversationForSidebarOpen(conversationId: string, title?: string): boolean;
   renameConversationTitle(conversationId: string, title: string): Promise<boolean>;

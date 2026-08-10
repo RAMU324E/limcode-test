@@ -411,8 +411,16 @@ async function resolveRestoredPanelOptions(
   options: MainPanelOptions
 ): Promise<MainPanelOptions> {
   if (panelKind(options) !== 'chat') return options;
-  if (options.conversationId) return options;
   await backendApp.waitUntilHydrated();
+  if (options.conversationId && await backendApp.conversationExists(options.conversationId)) {
+    return {
+      ...options,
+      title: backendApp.getConversationDisplayTitle(options.conversationId)
+    };
+  }
+  if (options.conversationId) {
+    console.info(`[LimCode] Replacing stale restored Conversation panel: ${options.conversationId}`);
+  }
   const existing = backendApp.getConversationHistoryEntries()[0];
   const conversationId = existing?.id ?? await backendApp.createConversation();
   return {

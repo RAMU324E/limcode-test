@@ -10,9 +10,23 @@
     "arch": "x64",
     "extensionHostKind": "local"
   },
+  "artifactTargets": [
+    {
+      "id": "local-linux-x64",
+      "platform": "linux",
+      "arch": "x64",
+      "extensionHostKind": "local"
+    },
+    {
+      "id": "local-win32-x64",
+      "platform": "win32",
+      "arch": "x64",
+      "extensionHostKind": "local"
+    }
+  ],
   "sqliteDriver": {
     "choice": "better-sqlite3",
-    "packaging": "打包期用 @electron/rebuild 对齐本机 VS Code Electron ABI",
+    "packaging": "Linux/Windows x64 VSIX必须包含对应better-sqlite3 native addon；需要Electron ABI重建时在目标平台运行 @electron/rebuild",
     "foundationGate": "foundation 出口必须在真实 Extension Host 验证驱动加载",
     "fallback": {
       "choice": "node:sqlite",
@@ -173,7 +187,6 @@
     "github-release",
     "continuous-integration-artifact",
     "remote-extension-host",
-    "windows",
     "multi-user-installation"
   ]
 }

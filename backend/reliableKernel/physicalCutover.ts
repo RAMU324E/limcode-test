@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
+import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
@@ -727,7 +728,7 @@ export async function treeDigest(rootPathInput: string): Promise<string> {
 async function syncTree(rootPath: string): Promise<void> {
   const stat = await fs.lstat(rootPath);
   if (stat.isFile()) {
-    const handle = await fs.open(rootPath, 'r');
+    const handle = await fs.open(rootPath, process.platform === 'win32' ? 'r+' : 'r');
     try { await handle.sync(); } finally { await handle.close(); }
     return;
   }
@@ -884,8 +885,7 @@ async function readJsonIfExists(filePath: string): Promise<unknown | undefined> 
 }
 
 async function syncDirectory(directoryPath: string): Promise<void> {
-  const handle = await fs.open(directoryPath, 'r');
-  try { await handle.sync(); } finally { await handle.close(); }
+  await syncDirectoryDurably(directoryPath);
 }
 
 async function exists(filePath: string): Promise<boolean> {

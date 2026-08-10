@@ -8,7 +8,6 @@ import { readJson, writeJson } from './json';
 import { sortableName } from './naming';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
 import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
-import { isTransientFileBusyError } from './durableWrite';
 
 interface RecordsIndexFile {
   schemaVersion: typeof STORAGE_VERSION;
@@ -61,6 +60,8 @@ const RECORD_STORE_LOCK_STALE_MS = 30_000;
 const RECORD_STORE_LOCK_WAIT_MS = 30_000;
 const RECORD_STORE_LOCK_INVALID_WAIT_MS = 100;
 const RECORD_STORE_LOCK_OWNER_FILE = 'owner.json';
+const WINDOWS_LOCK_RELEASE_RENAME_ATTEMPTS = 100;
+const WINDOWS_LOCK_RELEASE_RENAME_DELAY_MS = 10;
 const recordStoreMutationQueues = new Map<string, Promise<void>>();
 
 interface RecordStoreLockMetadata {
@@ -509,7 +510,7 @@ async function releaseRecordStoreLock(lockPath: string, expected: RecordStoreLoc
     throw new Error(`Record store lock owner changed; refusing to delete another writer's generation: ${lockPath}`);
   }
   const quarantinePath = recordStoreLockQuarantinePath(lockPath, `owner-${expected.ownerToken}`);
-  await fs.rename(lockPath, quarantinePath);
+  await renameRecordStoreLockGeneration(lockPath, quarantinePath);
   await fs.rm(quarantinePath, { recursive: true, force: false });
 }
 
@@ -568,21 +569,53 @@ function isAlreadyExistsError(error: unknown): boolean {
 
 async function isRecordStoreLockContentionError(error: unknown, lockPath: string): Promise<boolean> {
   if (isAlreadyExistsError(error)) return true;
-  if (!isTransientFileBusyError(error)) return false;
+  if (process.platform !== 'win32') return false;
 
-  const renameError = error as { syscall?: unknown; dest?: unknown };
-  if (renameError.syscall !== 'rename') return false;
-  if (typeof renameError.dest === 'string' && path.resolve(renameError.dest) !== path.resolve(lockPath)) return false;
+  const renameError = error as { code?: unknown; syscall?: unknown; dest?: unknown };
+  if (
+    renameError.code !== 'EPERM'
+    || renameError.syscall !== 'rename'
+    || typeof renameError.dest !== 'string'
+    || path.resolve(renameError.dest) !== path.resolve(lockPath)
+  ) return false;
 
-  // On Windows, renaming a candidate directory over an existing directory can report EPERM
-  // instead of EEXIST/ENOTEMPTY. Only reinterpret busy-style errors when the canonical lock
-  // actually exists, so unrelated permission failures remain visible to the caller.
+  // Windows reports EPERM rather than EEXIST/ENOTEMPTY when a candidate directory loses the
+  // atomic publication race. Reinterpret only that exact destination and only while it exists.
   try {
-    await fs.stat(lockPath);
-    return true;
+    return (await fs.stat(lockPath)).isDirectory();
   } catch {
     return false;
   }
+}
+
+async function renameRecordStoreLockGeneration(sourcePath: string, destinationPath: string): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await fs.rename(sourcePath, destinationPath);
+      return;
+    } catch (error) {
+      if (
+        attempt >= WINDOWS_LOCK_RELEASE_RENAME_ATTEMPTS
+        || !isExpectedWindowsLockReleaseRenameError(error, sourcePath, destinationPath)
+      ) throw error;
+      await delay(WINDOWS_LOCK_RELEASE_RENAME_DELAY_MS);
+    }
+  }
+}
+
+function isExpectedWindowsLockReleaseRenameError(
+  error: unknown,
+  sourcePath: string,
+  destinationPath: string
+): boolean {
+  if (process.platform !== 'win32') return false;
+  const candidate = error as { code?: unknown; syscall?: unknown; path?: unknown; dest?: unknown };
+  return (candidate.code === 'EPERM' || candidate.code === 'EACCES' || candidate.code === 'EBUSY')
+    && candidate.syscall === 'rename'
+    && typeof candidate.path === 'string'
+    && path.resolve(candidate.path) === path.resolve(sourcePath)
+    && typeof candidate.dest === 'string'
+    && path.resolve(candidate.dest) === path.resolve(destinationPath);
 }
 
 function delay(milliseconds: number): Promise<void> {

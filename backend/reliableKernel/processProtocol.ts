@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
@@ -323,6 +324,51 @@ export function parseStopRequest(value: unknown): ProcessStopRequest {
     commandDigest: requireSha256(record.commandDigest, 'commandDigest'),
     requestedAt: requireText(record.requestedAt, 'requestedAt')
   };
+}
+
+export function readProcessStartFingerprint(pidInput: string | number): string {
+  return process.platform === 'win32'
+    ? readWindowsStartFingerprint(pidInput)
+    : readLinuxStartFingerprint(pidInput);
+}
+
+export function isWrapperProcessReachable(wrapperPidInput: string, launchPathInput: string): boolean {
+  if (process.platform !== 'win32') {
+    return isLinuxWrapperProcessReachable(wrapperPidInput, launchPathInput);
+  }
+  const wrapperPid = requireDecimalString(wrapperPidInput, 'wrapperPid');
+  try {
+    process.kill(Number(wrapperPid), 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function readWindowsStartFingerprint(pidInput: string | number): string {
+  const pid = typeof pidInput === 'number'
+    ? BigInt(pidInput).toString()
+    : requireDecimalString(pidInput, 'pid');
+  try {
+    process.kill(Number(pid), 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EPERM') {
+      throw Object.assign(new Error(`Cannot read start time for process ${pid}.`), {
+        code: 'ENOENT',
+        cause: error
+      });
+    }
+  }
+  const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString())`;
+  const result = spawnSync('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
+  ], { encoding: 'utf8', windowsHide: true, timeout: 3_000 });
+  if (result.error) throw result.error;
+  const ticks = result.stdout?.trim();
+  if (result.status !== 0 || !ticks || !/^\d+$/.test(ticks)) {
+    throw Object.assign(new Error(`Cannot read start time for process ${pid}.`), { code: 'ENOENT' });
+  }
+  return `win32-process:${pid}:${BigInt(ticks).toString()}`;
 }
 
 export function readLinuxStartFingerprint(pidInput: string | number): string {
