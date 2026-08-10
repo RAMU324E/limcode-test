@@ -54,6 +54,8 @@ docs/architecture/*
 !/tests/reliable-kernel/webview-feed-lifecycle.test.mjs
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs
 !/tests/reliable-kernel/provider-semantic-watchdog.test.mjs
+!/tests/reliable-kernel/child-agent-status-controls.test.cjs
+!/tests/reliable-kernel/frontend-copy-guardrails.test.cjs
 !/tests/vscodeStorageJsonDurability.test.cjs
 !/webview/tests/
 /webview/tests/*
