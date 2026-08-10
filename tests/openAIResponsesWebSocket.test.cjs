@@ -59,7 +59,10 @@ function chatRequest(id = 'request-websocket') {
   };
 }
 
-async function createTransportFallbackServer({ sendCreatedBeforeClose = false } = {}) {
+async function createTransportFallbackServer({
+  sendCreatedBeforeClose = false,
+  sendSemanticBeforeClose = false
+} = {}) {
   let httpCalls = 0;
   let webSocketCalls = 0;
   const server = http.createServer((request, response) => {
@@ -115,7 +118,20 @@ async function createTransportFallbackServer({ sendCreatedBeforeClose = false } 
           webSocket.send(JSON.stringify({
             type: 'response.created',
             response: { id: `resp_ws_${webSocketCalls}` }
-          }), () => webSocket.terminate());
+          }), () => {
+            if (!sendSemanticBeforeClose) {
+              webSocket.terminate();
+              return;
+            }
+            webSocket.send(JSON.stringify({
+              type: 'response.output_text.delta',
+              response_id: `resp_ws_${webSocketCalls}`,
+              item_id: `msg_ws_${webSocketCalls}`,
+              output_index: 0,
+              content_index: 0,
+              delta: 'partial semantic output'
+            }), () => webSocket.terminate());
+          });
         } else webSocket.terminate();
       });
     });
@@ -259,7 +275,10 @@ test('OpenAI Responses WebSocket dry-run is streaming, store=false, incremental-
     }
   });
 
-  const result = await dryRunLlmProvider(chatRequest(), { settings: async () => config });
+  const request = chatRequest();
+  request.contents.push({ role: 'user', parts: [{ text: '[Current Turn Task Card] keep working' }] });
+  request.openAIResponsesContinuation = { volatileTailContentKinds: ['turn_reminder'] };
+  const result = await dryRunLlmProvider(request, { settings: async () => config });
 
   assert.match(result.url, /^wss:\/\//);
   assert.match(result.providerName, /WebSocket$/);
@@ -270,6 +289,8 @@ test('OpenAI Responses WebSocket dry-run is streaming, store=false, incremental-
   assert.equal('background' in result.body, false);
   assert.equal('previous_response_id' in result.body, false);
   assert.equal('prompt_cache_options' in result.body, false);
+  assert.doesNotMatch(JSON.stringify(result.body), /openAIResponsesContinuation|volatileTailContentKinds/);
+  assert.match(JSON.stringify(result.body.input.at(-1)), /Current Turn Task Card/);
   assert.equal(result.body.metadata?.nested?.prompt_cache_breakpoint, undefined);
   assert.equal(result.body.metadata?.nested?.keep, 'yes');
   assert.match(result.curl, /^# WebSocket mode/m);
@@ -312,7 +333,7 @@ test('final recoverable WS failure falls back to HTTP once and applies a short c
   }
 });
 
-test('WS failure after the first Provider event never falls back to HTTP or replays the request', async () => {
+test('response.created before EOF remains replay-safe and falls back to HTTP after exhaustion', async () => {
   const server = await createTransportFallbackServer({ sendCreatedBeforeClose: true });
   try {
     const traces = [];
@@ -321,6 +342,28 @@ test('WS failure after the first Provider event never falls back to HTTP or repl
       'request-no-rescue-after-event',
       traces,
       'conversation-no-rescue-after-event'
+    );
+    assert.equal(events.some((event) => event.type === LlmEventType.Error), false);
+    assert.equal(events.some((event) => event.type === LlmEventType.Done), true);
+    assert.deepEqual(server.counts(), { httpCalls: 1, webSocketCalls: 1 });
+    assert.equal(traces.some((trace) => trace.phase === 'http_fallback'), true);
+  } finally {
+    await server.close();
+  }
+});
+
+test('WS failure after semantic output never falls back to HTTP or replays the request', async () => {
+  const server = await createTransportFallbackServer({
+    sendCreatedBeforeClose: true,
+    sendSemanticBeforeClose: true
+  });
+  try {
+    const traces = [];
+    const events = await runTransportFallbackRequest(
+      server,
+      'request-no-rescue-after-semantic-output',
+      traces,
+      'conversation-no-rescue-after-semantic-output'
     );
     assert.equal(events.some((event) => event.type === LlmEventType.Error), true);
     assert.equal(events.some((event) => event.type === LlmEventType.Done), false);

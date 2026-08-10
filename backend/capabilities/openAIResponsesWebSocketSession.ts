@@ -5,10 +5,13 @@ import WebSocket, { type RawData } from 'ws';
 import type {
   Content,
   LLMRequest,
-  LLMResponse,
   LLMStreamChunk,
   StreamDecodeState
 } from 'unified-llm-provider';
+import {
+  OpenAIResponsesContinuationProjection,
+  hasSemanticChunkOutput
+} from './openAIResponsesContinuationProjection';
 export { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 
 const MAX_SOCKET_AGE_MS = 55 * 60 * 1_000;
@@ -24,6 +27,7 @@ const DEFAULT_PONG_TIMEOUT_MS = 60_000;
 const DEFAULT_PRE_SEND_PROBE_STALE_MS = 45_000;
 const DEFAULT_PRE_SEND_PROBE_TIMEOUT_MS = 2_000;
 const NETWORK_IDENTITY_CHECK_INTERVAL_MS = 2_000;
+const MAX_SUCCESSFUL_INCREMENTAL_REQUESTS = 16;
 // These codes describe a graceful WebSocket closing handshake, not a completed Responses request.
 // This error class is constructed only when the socket closes before a terminal Responses event,
 // so 1000/1001 are retryable transport interruptions at this boundary.
@@ -48,6 +52,7 @@ export interface OpenAIResponsesWebSocketDecision {
   connectionReason:
     | 'reused'
     | 'new_connection'
+    | 'retry_forced_reconnect'
     | 'socket_expired'
     | 'socket_unhealthy'
     | 'handshake_identity_changed';
@@ -89,12 +94,14 @@ export interface OpenAIResponsesWebSocketPhase {
   mode?: OpenAIResponsesWebSocketDecision['mode'];
   reason?: string;
   timeoutPhase?: OpenAIResponsesWebSocketTimeoutPhase;
+  responseCreateFrameSha256?: string;
+  responseCreateFrameBytes?: number;
+  responseCreateSeq?: number;
 }
 
 export interface OpenAIResponsesFormatAdapter {
   createStreamState(): StreamDecodeState;
   decodeStreamChunk(raw: unknown, state: StreamDecodeState): LLMStreamChunk;
-  decodeResponse(raw: unknown): LLMResponse;
   encodeRequest(request: LLMRequest, stream?: boolean): unknown;
 }
 
@@ -104,6 +111,14 @@ export interface OpenAIResponsesWebSocketStreamOptions {
   headers: Record<string, string>;
   body: unknown;
   format: OpenAIResponsesFormatAdapter;
+  /** Provider-local only. Nothing in this object is placed on the WebSocket wire. */
+  continuation?: {
+    volatileTailContents: Content[];
+    volatileTailContentKinds: Array<'current_turn_input' | 'turn_reminder'>;
+    forceFullReason?: string;
+  };
+  /** Reliable retries must never reuse the physical socket that owned the failed attempt. */
+  forceNewConnection?: boolean;
   signal?: AbortSignal;
   proxy?: string;
   onDecision?: (decision: OpenAIResponsesWebSocketDecision) => void;
@@ -138,6 +153,7 @@ export class OpenAIResponsesWebSocketTimeoutError extends Error {
   public readonly retryable = true;
   public readonly transportAttemptsExhausted = false;
   public readonly receivedServerEvent: boolean;
+  public receivedSemanticOutput = false;
 
   public constructor(
     public readonly phase: OpenAIResponsesWebSocketTimeoutPhase,
@@ -152,8 +168,9 @@ export class OpenAIResponsesWebSocketTimeoutError extends Error {
 
 interface LastRequestState {
   body: Record<string, unknown>;
-  inputItems: unknown[];
+  durableInputItems: unknown[];
   baseSignature: string;
+  volatileTailLayout?: string;
 }
 
 interface LastResponseState {
@@ -169,9 +186,11 @@ interface WebSocketSession {
   heartbeatTimer?: NodeJS.Timeout;
   connectionIdentityHash?: string;
   connectionGeneration: number;
+  responseCreateSeq: number;
   lastUsedAt: number;
   lastRequest?: LastRequestState;
   lastResponse?: LastResponseState;
+  successfulIncrementalRequests: number;
   lockTail: Promise<void>;
   activeOperations: number;
 }
@@ -180,8 +199,17 @@ interface PreparedCreatePayload {
   payload: Record<string, unknown>;
   fullBody: Record<string, unknown>;
   fullInputItems: unknown[];
+  durableInputItems: unknown[];
   baseSignature: string;
+  volatileTailLayout?: string;
   decision: OpenAIResponsesWebSocketDecision;
+}
+
+interface LocalContinuationBoundary {
+  durableInputItems: unknown[];
+  volatileInputItems: unknown[];
+  volatileTailLayout?: string;
+  forceFullReason?: string;
 }
 
 interface WebSocketConnectionConfig {
@@ -195,6 +223,7 @@ class OpenAIResponsesWebSocketCloseError extends Error {
   public readonly transport = 'websocket';
   public readonly retryable: boolean;
   public readonly transportAttemptsExhausted = false;
+  public receivedSemanticOutput = false;
 
   public constructor(
     public readonly closeCode: number,
@@ -221,19 +250,13 @@ interface ToolCallAccumulator {
   streamIndex?: string;
 }
 
-interface StreamedReasoningSignature {
-  itemId?: string;
-  outputIndex?: number;
-  encryptedContent?: string;
-}
-
 const sessions = new Map<string, WebSocketSession>();
 const proxyAgents = new Map<string, HttpsProxyAgent<string>>();
 
 /**
  * Codex-style Responses WebSocket session:
  * - continuation is tied to one physical socket generation;
- * - the baseline uses exact response.output_item.done items;
+ * - the baseline uses the same canonical semantic projection yielded to the reliable kernel;
  * - only response.completed commits continuation state;
  * - every uncertainty falls back to a full request.
  */
@@ -259,10 +282,11 @@ async function* streamLocked(
     throwIfAborted(options.signal);
     connection = await ensureSocket(session, options, resolvedTimeouts(options.timeouts));
   } catch (error) {
-    observeTransportFailure(session, options, error);
+    const annotated = markReceivedSemanticOutput(error, false);
+    observeTransportFailure(session, options, annotated);
     closeAndInvalidate(session, true);
-    if (isAbort(options.signal, error)) throw abortError(options.signal);
-    throw error;
+    if (isAbort(options.signal, annotated)) throw abortError(options.signal);
+    throw annotated;
   }
   const socket = session.socket;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -271,16 +295,13 @@ async function* streamLocked(
   }
 
   const fullBody = sanitizeResponsesCreateBody(options.body);
-  const prepared = prepareCreatePayload(session, fullBody, connection);
+  const prepared = prepareCreatePayload(session, fullBody, connection, options.format, options.continuation);
   options.onDecision?.(prepared.decision);
 
   const decodeState = options.format.createStreamState();
-  const completedOutputItems: unknown[] = [];
-  const completedOutputKeys = new Map<string, number>();
+  const continuationProjection = new OpenAIResponsesContinuationProjection();
   const toolCalls = new Map<string, ToolCallAccumulator>();
-  const streamedReasoningSignatures: StreamedReasoningSignature[] = [];
   let responseId: string | undefined;
-  let completedResponse: Record<string, unknown> | undefined;
   let sawSemanticOutput = false;
   let completed = false;
 
@@ -292,33 +313,22 @@ async function* streamLocked(
       options.signal,
       (phase, detail) => observeTransportPhase(session, options, phase, detail),
       requireConnectionIdentity(session),
-      () => webSocketConnectionConfig(options).identityHash
+      () => webSocketConnectionConfig(options).identityHash,
+      () => {
+        session.responseCreateSeq += 1;
+        return session.responseCreateSeq;
+      }
     )) {
       const type = eventType(raw);
       responseId = responseIdFromPayload(raw) ?? responseId;
-      captureOutputItemDone(raw, completedOutputItems, completedOutputKeys);
-      captureStreamedReasoningSignature(raw, streamedReasoningSignatures);
       const argumentDeltas = captureToolCallArgumentDeltas(raw, toolCalls);
-      const semanticOutput = isSemanticOutputEvent(type) || argumentDeltas.length > 0;
-      if (semanticOutput && !sawSemanticOutput) {
-        observeTransportPhase(session, options, 'first_semantic_event');
-      }
-      if (semanticOutput) sawSemanticOutput = true;
       if (isTerminalEvent(raw)) {
         observeTransportPhase(session, options, 'terminal', { reason: type ?? 'terminal' });
       }
 
-      if (type === 'response.completed') {
-        completedResponse = responseObject(raw);
-        const completedItems = completedResponse?.output;
-        if (completedOutputItems.length === 0 && Array.isArray(completedItems)) {
-          for (const item of completedItems) completedOutputItems.push(cloneJson(item));
-        }
-      }
-
       if (isProviderErrorPayload(raw)) {
         closeAndInvalidate(session, true);
-        yield createErrorStreamChunk(errorInfoFromPayload(raw));
+        yield createErrorStreamChunk(errorInfoFromPayload(raw, sawSemanticOutput));
         return;
       }
 
@@ -332,10 +342,22 @@ async function* streamLocked(
         throw wrapped;
       }
 
-      const chunk: LimCodeOpenAIResponsesStreamChunk = {
+      const decodedChunk: LimCodeOpenAIResponsesStreamChunk = {
         ...decoded,
         ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {})
       };
+      const projected = continuationProjection.observe(raw, decodedChunk);
+      const chunk: LimCodeOpenAIResponsesStreamChunk = {
+        ...projected.chunk,
+        ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {})
+      };
+      const semanticOutput = projected.semanticOutput
+        || hasSemanticChunkOutput(chunk)
+        || argumentDeltas.length > 0;
+      if (semanticOutput && !sawSemanticOutput) {
+        observeTransportPhase(session, options, 'first_semantic_event');
+      }
+      if (semanticOutput) sawSemanticOutput = true;
       if (hasMeaningfulChunk(chunk)) yield chunk;
 
       if (type === 'response.completed') {
@@ -353,14 +375,9 @@ async function* streamLocked(
       throw new Error('OpenAI Responses WebSocket closed before response.completed.');
     }
 
-    const resolvedResponseId = responseId
-      ?? (completedResponse ? normalizedString(completedResponse.id) : undefined);
-    const normalizedOutputItems = normalizeCompletedOutputItems(
-      options.format,
-      completedResponse,
-      completedOutputItems,
-      streamedReasoningSignatures
-    );
+    const resolvedResponseId = responseId;
+    const normalizedOutputItems = continuationProjection.completedOutputItems(options.format)
+      ?.map(stripWebSocketOnlyInputFields);
     const outputStateReliable = normalizedOutputItems !== undefined
       && (normalizedOutputItems.length > 0 || !sawSemanticOutput);
 
@@ -373,18 +390,23 @@ async function* streamLocked(
 
     session.lastRequest = {
       body: cloneJson(prepared.fullBody),
-      inputItems: prepared.fullInputItems.map(cloneJson),
-      baseSignature: prepared.baseSignature
+      durableInputItems: prepared.durableInputItems.map(cloneJson),
+      baseSignature: prepared.baseSignature,
+      ...(prepared.volatileTailLayout ? { volatileTailLayout: prepared.volatileTailLayout } : {})
     };
     session.lastResponse = {
       responseId: resolvedResponseId,
       outputItems: normalizedOutputItems.map(cloneJson)
     };
+    session.successfulIncrementalRequests = prepared.decision.mode === 'incremental'
+      ? session.successfulIncrementalRequests + 1
+      : 0;
   } catch (error) {
-    observeTransportFailure(session, options, error);
+    const annotated = markReceivedSemanticOutput(error, sawSemanticOutput);
+    observeTransportFailure(session, options, annotated);
     closeAndInvalidate(session, true);
-    if (isAbort(options.signal, error)) throw abortError(options.signal);
-    throw error;
+    if (isAbort(options.signal, annotated)) throw abortError(options.signal);
+    throw annotated;
   } finally {
     if (!completed) closeAndInvalidate(session, true);
   }
@@ -460,7 +482,9 @@ function sessionFor(key: string): WebSocketSession {
   const session: WebSocketSession = {
     key,
     connectionGeneration: 0,
+    responseCreateSeq: 0,
     lastUsedAt: Date.now(),
+    successfulIncrementalRequests: 0,
     lockTail: Promise.resolve(),
     activeOperations: 0
   };
@@ -540,6 +564,8 @@ async function ensureSocket(
   timeouts: OpenAIResponsesWebSocketTimeouts
 ): Promise<SocketAdmission> {
   const connection = webSocketConnectionConfig(options);
+  const forceNewConnection = options.forceNewConnection === true;
+  if (forceNewConnection) closeAndInvalidate(session, true);
   const socket = session.socket;
   const expired = session.connectedAt !== undefined
     && Date.now() - session.connectedAt >= MAX_SOCKET_AGE_MS;
@@ -572,13 +598,15 @@ async function ensureSocket(
     }
   }
 
-  const reason: SocketAdmission['reason'] = socketUnhealthy
-    ? 'socket_unhealthy'
-    : socket?.readyState === WebSocket.OPEN && !identityMatches
-      ? 'handshake_identity_changed'
-      : expired
-        ? 'socket_expired'
-        : 'new_connection';
+  const reason: SocketAdmission['reason'] = forceNewConnection
+    ? 'retry_forced_reconnect'
+    : socketUnhealthy
+      ? 'socket_unhealthy'
+      : socket?.readyState === WebSocket.OPEN && !identityMatches
+        ? 'handshake_identity_changed'
+        : expired
+          ? 'socket_expired'
+          : 'new_connection';
 
   // previous_response_id is connection-local. Any physical reconnect starts a new chain.
   observeTransportPhase(session, options, 'socket_opening', {
@@ -595,6 +623,7 @@ async function ensureSocket(
   session.connectedAt = Date.now();
   session.connectionIdentityHash = connection.identityHash;
   session.connectionGeneration += 1;
+  session.responseCreateSeq = 0;
   session.lastUsedAt = Date.now();
   startHeartbeat(session, session.socket, timeouts);
   observeTransportPhase(session, options, 'socket_opened', {
@@ -643,6 +672,7 @@ function structuredTransportError(
     transport: 'websocket' as const,
     phase,
     receivedServerEvent,
+    receivedSemanticOutput: false,
     retryable: true,
     transportAttemptsExhausted: false
   });
@@ -668,24 +698,35 @@ function webSocketConnectionConfig(options: OpenAIResponsesWebSocketStreamOption
 function prepareCreatePayload(
   session: WebSocketSession,
   fullBody: Record<string, unknown>,
-  connection: SocketAdmission
+  connection: SocketAdmission,
+  format: OpenAIResponsesFormatAdapter,
+  continuation: OpenAIResponsesWebSocketStreamOptions['continuation']
 ): PreparedCreatePayload {
   const connectionReused = connection.reused;
   const fullInputItems = Array.isArray(fullBody.input) ? fullBody.input.map(cloneJson) : [];
+  const boundary = localContinuationBoundary(fullInputItems, format, continuation);
   const baseSignature = canonicalHash(requestBase(fullBody));
   const baseline = session.lastRequest && session.lastResponse
-    ? [...session.lastRequest.inputItems, ...session.lastResponse.outputItems]
+    ? [...session.lastRequest.durableInputItems, ...session.lastResponse.outputItems]
     : undefined;
 
   let reason = 'no_completed_baseline';
   let canIncrement = false;
   if (!connectionReused) reason = 'new_socket_generation';
   else if (!session.lastRequest || !session.lastResponse || !baseline) reason = 'no_completed_baseline';
+  else if (boundary.forceFullReason) reason = boundary.forceFullReason;
   else if (session.lastRequest.baseSignature !== baseSignature) reason = 'request_properties_changed';
-  else {
-    const mismatch = prefixMismatchReason(fullInputItems, baseline);
+  else if (session.lastRequest.volatileTailLayout !== boundary.volatileTailLayout) {
+    reason = 'volatile_tail_layout_changed';
+  } else if (session.successfulIncrementalRequests >= MAX_SUCCESSFUL_INCREMENTAL_REQUESTS) {
+    reason = 'periodic_rebase';
+  } else {
+    const mismatch = prefixMismatchReason(boundary.durableInputItems, baseline);
     if (mismatch) reason = mismatch;
-    else if (fullInputItems.length <= baseline.length) reason = 'no_strict_input_suffix';
+    else if (
+      boundary.durableInputItems.length === baseline.length
+      && boundary.volatileInputItems.length === 0
+    ) reason = 'no_strict_input_suffix';
     else {
       reason = 'matched_exact_prefix';
       canIncrement = true;
@@ -693,7 +734,10 @@ function prepareCreatePayload(
   }
 
   const sentInput = canIncrement && baseline
-    ? fullInputItems.slice(baseline.length)
+    ? [
+        ...boundary.durableInputItems.slice(baseline.length),
+        ...boundary.volatileInputItems
+      ]
     : fullInputItems;
   const payload: Record<string, unknown> = {
     type: 'response.create',
@@ -708,7 +752,9 @@ function prepareCreatePayload(
     payload,
     fullBody,
     fullInputItems,
+    durableInputItems: boundary.durableInputItems,
     baseSignature,
+    ...(boundary.volatileTailLayout ? { volatileTailLayout: boundary.volatileTailLayout } : {}),
     decision: {
       sessionKeyHash: createHash('sha256').update(session.key).digest('hex').slice(0, 12),
       connectionGeneration: session.connectionGeneration,
@@ -725,6 +771,87 @@ function prepareCreatePayload(
         ? { previousResponseIdUsed: session.lastResponse.responseId }
         : {})
     }
+  };
+}
+
+function localContinuationBoundary(
+  fullInputItems: unknown[],
+  format: OpenAIResponsesFormatAdapter,
+  continuation: OpenAIResponsesWebSocketStreamOptions['continuation']
+): LocalContinuationBoundary {
+  if (!continuation) {
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: []
+    };
+  }
+  const volatileTailLayout = `managed:${continuation.volatileTailContentKinds.join(',')}`;
+  if (continuation.forceFullReason) {
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: [],
+      volatileTailLayout,
+      forceFullReason: continuation.forceFullReason
+    };
+  }
+  if (continuation.volatileTailContents.length !== continuation.volatileTailContentKinds.length) {
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: [],
+      volatileTailLayout,
+      forceFullReason: 'invalid_volatile_tail_boundary'
+    };
+  }
+  if (continuation.volatileTailContents.length === 0) {
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: [],
+      volatileTailLayout
+    };
+  }
+
+  let encoded: unknown;
+  try {
+    encoded = format.encodeRequest({ contents: continuation.volatileTailContents }, false);
+  } catch {
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: [],
+      volatileTailLayout,
+      forceFullReason: 'volatile_tail_encode_failed'
+    };
+  }
+  if (!isRecord(encoded) || !Array.isArray(encoded.input) || encoded.input.length === 0) {
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: [],
+      volatileTailLayout,
+      forceFullReason: 'volatile_tail_encode_failed'
+    };
+  }
+  const volatileInputItems = encoded.input.map(stripWebSocketOnlyInputFields);
+  const offset = fullInputItems.length - volatileInputItems.length;
+  if (offset < 0) {
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: [],
+      volatileTailLayout,
+      forceFullReason: 'volatile_tail_boundary_mismatch'
+    };
+  }
+  for (let index = 0; index < volatileInputItems.length; index += 1) {
+    if (canonicalString(fullInputItems[offset + index]) === canonicalString(volatileInputItems[index])) continue;
+    return {
+      durableInputItems: fullInputItems,
+      volatileInputItems: [],
+      volatileTailLayout,
+      forceFullReason: 'volatile_tail_boundary_mismatch'
+    };
+  }
+  return {
+    durableInputItems: fullInputItems.slice(0, offset),
+    volatileInputItems,
+    volatileTailLayout
   };
 }
 
@@ -770,52 +897,6 @@ function prefixMismatchReason(items: unknown[], prefix: unknown[]): string | und
     }
   }
   return undefined;
-}
-
-function normalizeCompletedOutputItems(
-  format: OpenAIResponsesFormatAdapter,
-  completedResponse: Record<string, unknown> | undefined,
-  outputItems: unknown[],
-  streamedReasoningSignatures: readonly StreamedReasoningSignature[]
-): unknown[] | undefined {
-  const response = normalizeCompletedResponseForStreamSignatures({
-    ...(completedResponse ?? {}),
-    output: outputItems.map(cloneJson)
-  }, streamedReasoningSignatures);
-  const rawOutput = isRecord(response) && Array.isArray(response.output) ? response.output : undefined;
-  try {
-    const decoded = format.decodeResponse(response);
-    const encoded = format.encodeRequest({ contents: [decoded.content] }, false);
-    if (
-      isRecord(encoded)
-      && Array.isArray(encoded.input)
-      && (encoded.input.length > 0 || rawOutput?.length === 0)
-    ) return encoded.input.map(stripWebSocketOnlyInputFields);
-  } catch {
-    // 0.1.35 contract: exact response.output_item.done remains the fallback continuation baseline.
-  }
-  return rawOutput?.map(stripWebSocketOnlyInputFields);
-}
-
-function normalizeCompletedResponseForStreamSignatures(
-  response: Record<string, unknown>,
-  streamed: readonly StreamedReasoningSignature[]
-): Record<string, unknown> {
-  if (!Array.isArray(response.output)) return response;
-  let reasoningOrdinal = 0;
-  const output = response.output.map((value, outputIndex) => {
-    if (!isRecord(value) || value.type !== 'reasoning') return value;
-    const itemId = normalizedString(value.id);
-    const matched = streamed.find((entry) => itemId !== undefined && entry.itemId === itemId)
-      ?? streamed.find((entry) => entry.outputIndex === outputIndex)
-      ?? streamed[reasoningOrdinal];
-    reasoningOrdinal += 1;
-    const normalized = { ...value };
-    delete normalized.encrypted_content;
-    if (matched?.encryptedContent) normalized.encrypted_content = matched.encryptedContent;
-    return normalized;
-  });
-  return { ...response, output };
 }
 
 async function openSocket(
@@ -962,7 +1043,8 @@ async function* sendCreateAndReadEvents(
     detail?: Partial<OpenAIResponsesWebSocketPhase>
   ) => void) | undefined,
   expectedConnectionIdentityHash: string,
-  currentConnectionIdentityHash: () => string
+  currentConnectionIdentityHash: () => string,
+  nextResponseCreateSeq: () => number
 ): AsyncGenerator<Record<string, unknown>> {
   const queue = new MergeableAsyncQueue<Record<string, unknown>>(mergeDeltaEvents);
   let sawTerminal = false;
@@ -1068,9 +1150,17 @@ async function* sendCreateAndReadEvents(
         // A transient failure to enumerate interfaces is not itself network authority.
       }
     }, NETWORK_IDENTITY_CHECK_INTERVAL_MS);
+    const payloadText = JSON.stringify(payload);
+    const responseCreateFrameSha256 = createHash('sha256').update(payloadText, 'utf8').digest('hex');
+    const responseCreateFrameBytes = Buffer.byteLength(payloadText, 'utf8');
+    const responseCreateSeq = nextResponseCreateSeq();
     observe?.('send_started');
-    await sendWithDeadline(socket, JSON.stringify(payload), timeouts.sendMs, signal);
-    observe?.('request_sent');
+    await sendWithDeadline(socket, payloadText, timeouts.sendMs, signal);
+    observe?.('request_sent', {
+      responseCreateFrameSha256,
+      responseCreateFrameBytes,
+      responseCreateSeq
+    });
     yield* queue;
   } finally {
     cleanup();
@@ -1228,46 +1318,6 @@ function mergeDeltaEvents(
   return { ...previous, ...next, delta: previous.delta + next.delta };
 }
 
-function captureOutputItemDone(
-  raw: Record<string, unknown>,
-  output: unknown[],
-  keys: Map<string, number>
-): void {
-  if (eventType(raw) !== 'response.output_item.done' || !isRecord(raw.item)) return;
-  const item = cloneJson(raw.item);
-  const key = normalizedString(raw.item.id)
-    ?? (typeof raw.output_index === 'number' ? `output:${raw.output_index}` : undefined)
-    ?? `ordinal:${output.length}`;
-  const existing = keys.get(key);
-  if (existing === undefined) {
-    keys.set(key, output.length);
-    output.push(item);
-  } else output[existing] = item;
-}
-
-function captureStreamedReasoningSignature(
-  raw: Record<string, unknown>,
-  records: StreamedReasoningSignature[]
-): void {
-  if (eventType(raw) !== 'response.output_item.done' || !isRecord(raw.item) || raw.item.type !== 'reasoning') return;
-  const itemId = normalizedString(raw.item.id);
-  const outputIndex = typeof raw.output_index === 'number' && Number.isInteger(raw.output_index)
-    ? raw.output_index
-    : undefined;
-  const encryptedContent = normalizedString(raw.item.encrypted_content);
-  const next: StreamedReasoningSignature = {
-    ...(itemId ? { itemId } : {}),
-    ...(outputIndex !== undefined ? { outputIndex } : {}),
-    ...(encryptedContent ? { encryptedContent } : {})
-  };
-  const existing = records.findIndex((entry) =>
-    (itemId !== undefined && entry.itemId === itemId)
-    || (outputIndex !== undefined && entry.outputIndex === outputIndex)
-  );
-  if (existing >= 0) records[existing] = next;
-  else records.push(next);
-}
-
 function captureToolCallArgumentDeltas(
   raw: Record<string, unknown>,
   accumulators: Map<string, ToolCallAccumulator>
@@ -1386,21 +1436,10 @@ function streamIndex(item: Record<string, unknown>, event: Record<string, unknow
     ?? (typeof event.output_index === 'number' ? `output:${event.output_index}` : undefined);
 }
 
-function responseObject(raw: Record<string, unknown>): Record<string, unknown> | undefined {
-  return isRecord(raw.response) ? raw.response : undefined;
-}
-
 function responseIdFromPayload(raw: Record<string, unknown>): string | undefined {
   return normalizedString(raw.response_id)
     ?? (isRecord(raw.response) ? normalizedString(raw.response.id) : undefined)
     ?? (eventType(raw) === 'response.created' ? normalizedString(raw.id) : undefined);
-}
-
-function isSemanticOutputEvent(type: string): boolean {
-  return type.includes('output_text')
-    || type.includes('reasoning')
-    || type.includes('function_call')
-    || type.includes('custom_tool_call');
 }
 
 function isTerminalEvent(value: Record<string, unknown>): boolean {
@@ -1424,7 +1463,10 @@ function isProviderErrorPayload(value: Record<string, unknown>): boolean {
   return status === 'failed' || status === 'incomplete' || status === 'cancelled';
 }
 
-function errorInfoFromPayload(payload: Record<string, unknown>): Record<string, unknown> {
+function errorInfoFromPayload(
+  payload: Record<string, unknown>,
+  receivedSemanticOutput: boolean
+): Record<string, unknown> {
   const status = numericField(payload.status)
     ?? numericField(payload.status_code)
     ?? (isRecord(payload.response) ? numericField(payload.response.status_code) : undefined);
@@ -1443,12 +1485,24 @@ function errorInfoFromPayload(payload: Record<string, unknown>): Record<string, 
     ...(status !== undefined ? { status } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
     transportAttemptsExhausted: false,
+    receivedServerEvent: true,
+    receivedSemanticOutput,
     ...(payload.headers && isRecord(payload.headers) ? { headers: cloneJson(payload.headers) } : {}),
     ...(nestedMessage(payload)
       ? { message: nestedMessage(payload) }
       : { message: `OpenAI Responses WebSocket received ${eventType(payload) || 'a terminal error'} before response.completed.` }),
     rawBody: cloneJson(payload)
   };
+}
+
+function markReceivedSemanticOutput(error: unknown, receivedSemanticOutput: boolean): unknown {
+  if ((typeof error !== 'object' && typeof error !== 'function') || error === null) return error;
+  try {
+    (error as { receivedSemanticOutput?: boolean }).receivedSemanticOutput = receivedSemanticOutput;
+  } catch {
+    // Best-effort diagnostic metadata; the adapter also fences replay from emitted semantic output.
+  }
+  return error;
 }
 
 function providerErrorRetryable(code: string | undefined, status: number | undefined): boolean | undefined {
@@ -1499,6 +1553,7 @@ function closeAndInvalidate(session: WebSocketSession, terminate: boolean): void
   session.socket = undefined;
   session.connectedAt = undefined;
   session.lastPongAt = undefined;
+  session.responseCreateSeq = 0;
   if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
   session.heartbeatTimer = undefined;
   session.connectionIdentityHash = undefined;
@@ -1513,6 +1568,7 @@ function closeAndInvalidate(session: WebSocketSession, terminate: boolean): void
 function invalidateContinuation(session: WebSocketSession): void {
   session.lastRequest = undefined;
   session.lastResponse = undefined;
+  session.successfulIncrementalRequests = 0;
 }
 
 function webSocketHeaders(headers: Record<string, string>): Record<string, string> {

@@ -467,6 +467,12 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   if (turnReminder) {
     contents.push({ role: 'user', parts: [{ text: turnReminder.content }] });
   }
+  const volatileTailContentKinds: NonNullable<
+    LlmStartRequest['openAIResponsesContinuation']
+  >['volatileTailContentKinds'] = [
+    ...(currentTurnInput?.reinject ? ['current_turn_input' as const] : []),
+    ...(turnReminder ? ['turn_reminder' as const] : [])
+  ];
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
   const projectedContents = projectOrdinaryContentsPreservingRanges(contents, canonicalCompressionRanges);
   return {
@@ -486,6 +492,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       systemPromptPrefix
     },
     reliableProviderAttempt: reliableProviderAttempt(request, authorityModel),
+    openAIResponsesContinuation: { volatileTailContentKinds },
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
   };
 }
@@ -1206,6 +1213,7 @@ function capabilityThrownProviderError(error: unknown): Error {
       retryable?: unknown;
       transportAttemptsExhausted?: unknown;
       receivedServerEvent?: unknown;
+      receivedSemanticOutput?: unknown;
       phase?: unknown;
       closeCode?: unknown;
       cause?: unknown;
@@ -1217,6 +1225,9 @@ function capabilityThrownProviderError(error: unknown): Error {
       raw.transportAttemptsExhausted ??= structured.transportAttemptsExhausted;
     }
     if (structured.receivedServerEvent !== undefined) raw.receivedServerEvent ??= structured.receivedServerEvent;
+    if (structured.receivedSemanticOutput !== undefined) {
+      raw.receivedSemanticOutput ??= structured.receivedSemanticOutput;
+    }
     if (structured.phase !== undefined) raw.phase ??= structured.phase;
     if (structured.closeCode !== undefined) raw.closeCode ??= structured.closeCode;
     if (structured.cause !== undefined) raw.cause ??= structured.cause;
@@ -1232,13 +1243,13 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const signature = collectErrorSignature(raw, message).toLowerCase();
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
-  const receivedServerEvent = findBooleanMetadata(raw, 'receivedServerEvent');
+  const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
   const incompleteNormalWebSocketClose = /websocket closed before (?:terminal event|response\.completed|open)(?::|\s)+(?:1000|1001)\b/.test(signature);
   if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
     return new Error(message);
   }
-  if (receivedServerEvent === true) {
-    return new Error(`${message}（已收到 Provider 事件，不自动重放请求。）`);
+  if (receivedSemanticOutput === true) {
+    return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
   }
   // 1000/1001 only describe a graceful WebSocket closing handshake. If no Responses terminal
   // event arrived, the provider response is incomplete and must outrank stale retryable=false

@@ -29,6 +29,14 @@ export interface LlmStartRequest {
     maxAttempts: number;
     requestCreatedAt?: number;
   };
+  /**
+   * Process-local boundary for Responses WebSocket continuation. These contents remain in the
+   * ordinary request and are never encoded as transport metadata; the boundary only lets the
+   * provider keep append-only continuation state when rebuilt Turn addenda move to the tail.
+   */
+  openAIResponsesContinuation?: {
+    volatileTailContentKinds: Array<'current_turn_input' | 'turn_reminder'>;
+  };
 }
 
 export interface LlmResolveInvocationRequest {

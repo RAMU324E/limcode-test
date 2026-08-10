@@ -717,6 +717,9 @@ test('普通请求的当前原文与 Turn 提醒按冻结 addenda 发送且计�
     content.parts.some((part) => part.text === 'hello')
   ).length, 1, '原输入仍在 Context 时不得重复回注');
   assert.equal(captures[0].contents.at(-1).parts[0].text, '[Current Turn Task Card]\nunfinished=2');
+  assert.deepEqual(captures[0].openAIResponsesContinuation, {
+    volatileTailContentKinds: ['turn_reminder']
+  });
   assert.deepEqual(captures[1], captures[0], 'retry/reconnect 必须复用字节相同的冻结 addenda');
   assert.ok(estimate.currentInputTokens > 0);
   assert.ok(estimate.turnReminderTokens > 0);
@@ -808,6 +811,9 @@ test('纯文字当前 Turn 输入与 Context 同源投影，且被压缩移除�
     '[当前 Turn 原始用户要求/数据，不是新用户输入；以下各 part 为冻结原文。]',
     'plain current input'
   ]);
+  assert.deepEqual(captures[0].openAIResponsesContinuation, {
+    volatileTailContentKinds: ['current_turn_input']
+  });
   assert.ok(reinjectedEstimate.currentInputTokens > 0);
 
   const unsupported = structuredClone(reinjected);
@@ -1220,7 +1226,7 @@ test('LLM capability adapter 将 429/网络/文本网关错误映射为可靠 Pr
   }
 });
 
-test('LLM capability adapter 在首个 Provider 事件或语义输出后拒绝盲重放', async () => {
+test('LLM capability adapter 允许 response.created 后重试，但在语义输出后拒绝盲重放', async () => {
   const afterRawEvent = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
     fakeCapability((llmRequest, emit) => {
@@ -1232,6 +1238,7 @@ test('LLM capability adapter 在首个 Provider 事件或语义输出后拒绝�
           rawError: {
             transport: 'websocket',
             receivedServerEvent: true,
+            receivedSemanticOutput: false,
             retryable: true
           }
         }
@@ -1242,8 +1249,34 @@ test('LLM capability adapter 在首个 Provider 事件或语义输出后拒绝�
     afterRawEvent.sendFullRequest(request(), {
       onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
     }),
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'connection_interrupted'
+  );
+
+  const rawSemanticOutput = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      emit({
+        type: 'llm:error',
+        payload: {
+          requestId: llmRequest.id,
+          message: 'WebSocket closed after semantic output',
+          rawError: {
+            transport: 'websocket',
+            receivedServerEvent: true,
+            receivedSemanticOutput: true,
+            retryable: true
+          }
+        }
+      });
+    })
+  );
+  await assert.rejects(
+    rawSemanticOutput.sendFullRequest(request(), {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }),
     (error) => !(error instanceof kernel.ProviderTransientError)
-      && /不自动重放请求/.test(error.message)
+      && /语义输出.*不自动重放请求/.test(error.message)
   );
 
   const afterSemanticOutput = new kernel.LlmCapabilityFullRequestAdapter(
@@ -1267,6 +1300,51 @@ test('LLM capability adapter 在首个 Provider 事件或语义输出后拒绝�
     (error) => !(error instanceof kernel.ProviderTransientError)
       && /不自动重放请求/.test(error.message)
   );
+});
+
+test('signature-only reasoning 后的 EOF 在可靠 adapter 边界不可重放', async () => {
+  const observed = [];
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      emit({
+        type: 'llm:thoughtDone',
+        payload: {
+          requestId: llmRequest.id,
+          thoughtDurationMs: 1,
+          thoughtSignature: 'openai-responses:opaque-signature-only'
+        }
+      });
+      emit({
+        type: 'llm:error',
+        payload: {
+          requestId: llmRequest.id,
+          message: 'WebSocket closed after signature-only reasoning',
+          rawError: {
+            transport: 'websocket',
+            receivedServerEvent: true,
+            receivedSemanticOutput: true,
+            retryable: true
+          }
+        }
+      });
+    })
+  );
+
+  await assert.rejects(
+    adapter.sendFullRequest(request(), {
+      onEvent: async (event) => {
+        observed.push(event);
+        return { accepted: true, checkpointed: true, terminal: false };
+      }
+    }),
+    (error) => !(error instanceof kernel.ProviderTransientError)
+      && /已收到 Provider (?:语义)?输出.*不自动重放请求/.test(error.message)
+  );
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].kind, 'output_item_done');
+  assert.equal(observed[0].content.type, 'thought_done');
+  assert.equal(observed[0].content.thoughtSignature, 'openai-responses:opaque-signature-only');
 });
 
 test('LLM capability adapter 把内部 retry 事件立即上交 durable Attempt 而不隐式等待', async () => {

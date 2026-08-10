@@ -652,6 +652,52 @@ test('WS 1000 在任何 Responses 事件前关闭会创建 durable Attempt 2 并
   });
 });
 
+test('response.created 后首语义前 EOF 仍会创建 durable Attempt 2 并自动恢复', async () => {
+  await withApp('provider-created-before-eof', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'created-before-eof');
+    let calls = 0;
+    const capability = {
+      start(llmRequest, emit) {
+        calls += 1;
+        if (calls === 1) {
+          emit({
+            type: 'llm:error',
+            payload: {
+              requestId: llmRequest.id,
+              message: 'OpenAI Responses WebSocket closed after response.created',
+              rawError: {
+                name: 'WebSocketCloseError',
+                message: 'OpenAI Responses WebSocket closed before terminal event: 1000',
+                closeCode: 1000,
+                phase: 'streaming',
+                receivedServerEvent: true,
+                receivedSemanticOutput: false,
+                retryable: true,
+                transportAttemptsExhausted: false
+              }
+            }
+          });
+          return;
+        }
+        emit({ type: 'llm:done', payload: { requestId: llmRequest.id, completedAt: Date.now() } });
+      },
+      compact() { throw new Error('unused'); },
+      abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
+    };
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability);
+    await controlPlane(app).dispatch(request.modelRequestId, adapter);
+
+    assert.equal(calls, 2);
+    assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, 'completed');
+    const operation = (await list(app, 'Operation', {
+      owner_kind: 'model_request', owner_id: request.modelRequestId
+    }))[0];
+    const attempts = await list(app, 'Attempt', { operation_id: operation.id });
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts.filter((entry) => entry.status === 'transient_failed').length, 1);
+  });
+});
+
 test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted 与永久错误保持终态', async () => {
   async function runRawError(rawError) {
     const capability = {
@@ -693,6 +739,7 @@ test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted
       closeCode: 1000,
       phase: 'awaiting_first_event',
       receivedServerEvent: false,
+      receivedSemanticOutput: false,
       retryable: false,
       transportAttemptsExhausted: false
     }),
@@ -704,11 +751,12 @@ test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted
       closeCode: 1000,
       phase: 'streaming',
       receivedServerEvent: true,
+      receivedSemanticOutput: false,
       retryable: true,
       transportAttemptsExhausted: false
     }),
-    (error) => !(error instanceof kernel.ProviderTransientError)
-      && /不自动重放请求/.test(error.message)
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'connection_interrupted'
   );
   await assert.rejects(
     runRawError({
@@ -716,6 +764,7 @@ test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted
       closeCode: 1008,
       phase: 'streaming',
       receivedServerEvent: true,
+      receivedSemanticOutput: true,
       retryable: false,
       transportAttemptsExhausted: false
     }),

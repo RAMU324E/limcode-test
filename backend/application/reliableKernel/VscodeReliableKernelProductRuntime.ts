@@ -153,7 +153,16 @@ export class VscodeReliableKernelProductRuntime {
             ...(trace.reason ? { reasonCode: trace.reason } : {}),
             ...(trace.timeoutPhase ? { timeoutPhase: trace.timeoutPhase } : {}),
             ...(trace.fullInputItemCount !== undefined ? { fullInputItemCount: trace.fullInputItemCount } : {}),
-            ...(trace.sentInputItemCount !== undefined ? { sentInputItemCount: trace.sentInputItemCount } : {})
+            ...(trace.sentInputItemCount !== undefined ? { sentInputItemCount: trace.sentInputItemCount } : {}),
+            ...(trace.responseCreateFrameSha256
+              ? { responseCreateFrameSha256: trace.responseCreateFrameSha256 }
+              : {}),
+            ...(trace.responseCreateFrameBytes !== undefined
+              ? { responseCreateFrameBytes: trace.responseCreateFrameBytes }
+              : {}),
+            ...(trace.responseCreateSeq !== undefined
+              ? { responseCreateSeq: trace.responseCreateSeq }
+              : {})
           }
         });
       },

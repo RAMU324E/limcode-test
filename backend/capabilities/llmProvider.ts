@@ -11,6 +11,7 @@ import type {
   OpenAIResponsesWebSocketDecision,
   OpenAIResponsesWebSocketPhase,
   OpenAIResponsesWebSocketPhaseKind,
+  OpenAIResponsesWebSocketStreamOptions,
   OpenAIResponsesWebSocketTimeoutPhase
 } from './openAIResponsesWebSocketSession';
 import { LlmEventType } from '../world/modules/llm/events';
@@ -142,6 +143,9 @@ export interface LlmProviderTransportTrace {
   timeoutPhase?: OpenAIResponsesWebSocketTimeoutPhase;
   fullInputItemCount?: number;
   sentInputItemCount?: number;
+  responseCreateFrameSha256?: string;
+  responseCreateFrameBytes?: number;
+  responseCreateSeq?: number;
 }
 
 export interface LlmProviderOptions {
@@ -605,6 +609,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
     stream: true
   });
   const format = new input.unified.OpenAIResponsesFormat(input.settings.model) as OpenAIResponsesFormatAdapter;
+  const continuation = openAIResponsesContinuationHint(input.request, input.unifiedRequest);
   try {
     const { streamOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
     yield* streamOpenAIResponsesWebSocketSession({
@@ -613,6 +618,9 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
       headers: dryRun.headers,
       body: dryRun.body,
       format,
+      ...(continuation ? { continuation } : {}),
+      forceNewConnection: reliableAttempt?.attemptSeq !== undefined
+        && reliableAttempt.attemptSeq > 1,
       signal: input.signal,
       proxy: input.proxy,
       onDecision: (decision) => {
@@ -662,6 +670,26 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   }
 }
 
+function openAIResponsesContinuationHint(
+  request: LlmStartRequest,
+  unifiedRequest: UnifiedLLMRequest
+): OpenAIResponsesWebSocketStreamOptions['continuation'] | undefined {
+  const metadata = request.openAIResponsesContinuation;
+  if (!metadata) return undefined;
+  const kinds = metadata.volatileTailContentKinds;
+  if (!Array.isArray(kinds) || kinds.length > unifiedRequest.contents.length) {
+    return {
+      volatileTailContents: [],
+      volatileTailContentKinds: [],
+      forceFullReason: 'invalid_volatile_tail_boundary'
+    };
+  }
+  return {
+    volatileTailContents: unifiedRequest.contents.slice(unifiedRequest.contents.length - kinds.length),
+    volatileTailContentKinds: [...kinds]
+  };
+}
+
 function shouldFallbackOpenAIResponsesToHttp(
   input: {
     request: LlmStartRequest;
@@ -670,7 +698,7 @@ function shouldFallbackOpenAIResponsesToHttp(
   error: unknown
 ): boolean {
   const raw = rawErrorFromUnknown(error);
-  if (findNestedMetadata(raw, 'receivedServerEvent') === true) return false;
+  if (findNestedMetadata(raw, 'receivedSemanticOutput') === true) return false;
   if (findNestedMetadata(raw, 'retryable') === false) return false;
 
   const status = findNestedNumber(raw, 'status');
@@ -760,7 +788,16 @@ function traceFromWebSocketPhase(
     ...(phase.connectionReason ? { connectionReason: phase.connectionReason } : {}),
     ...(phase.mode ? { mode: phase.mode } : {}),
     ...(phase.reason ? { reason: phase.reason } : {}),
-    ...(phase.timeoutPhase ? { timeoutPhase: phase.timeoutPhase } : {})
+    ...(phase.timeoutPhase ? { timeoutPhase: phase.timeoutPhase } : {}),
+    ...(phase.responseCreateFrameSha256
+      ? { responseCreateFrameSha256: phase.responseCreateFrameSha256 }
+      : {}),
+    ...(phase.responseCreateFrameBytes !== undefined
+      ? { responseCreateFrameBytes: phase.responseCreateFrameBytes }
+      : {}),
+    ...(phase.responseCreateSeq !== undefined
+      ? { responseCreateSeq: phase.responseCreateSeq }
+      : {})
   };
 }
 

@@ -43,6 +43,32 @@ test('ReliableDiagnosticJournal 只持久化脱敏 metadata 并保持文件/内�
     assert.equal(initial.spans[0].correlationId, 'model-request-1');
 
     journal.observe({
+      eventKind: 'provider.transport.phase',
+      scopeKind: 'model_request',
+      scopeId: 'model-request-frame',
+      correlationId: '1:request_sent',
+      metadata: {
+        modelRequestId: 'model-request-frame',
+        stage: 'request_sent',
+        responseCreateFrameSha256: 'b'.repeat(64),
+        responseCreateFrameBytes: 37,
+        responseCreateSeq: 2,
+        requestBody: '禁止持久化的请求体'
+      }
+    });
+    await journal.flush();
+    const frameTrace = await journal.inspect({ scopeId: 'model-request-frame', limit: 10 });
+    assert.equal(frameTrace.events.length, 1);
+    assert.deepEqual(frameTrace.events[0].metadata, {
+      modelRequestId: 'model-request-frame',
+      stage: 'request_sent',
+      responseCreateFrameSha256: 'b'.repeat(64),
+      responseCreateFrameBytes: 37,
+      responseCreateSeq: 2
+    });
+    assert.doesNotMatch(JSON.stringify(frameTrace), /禁止持久化的请求体|requestBody/);
+
+    journal.observe({
       eventKind: 'agent.lifecycle',
       scopeKind: 'turn',
       scopeId: 'turn-open-tasks',

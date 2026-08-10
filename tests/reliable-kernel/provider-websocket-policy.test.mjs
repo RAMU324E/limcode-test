@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { createRequire } from 'node:module';
 
@@ -50,9 +51,15 @@ function reliableRequest(id, conversationId, attemptOverrides = {}) {
   };
 }
 
-async function createFallbackServer({ sendCreatedBeforeClose = false } = {}) {
+async function createFallbackServer({
+  sendCreatedBeforeClose = false,
+  sendSemanticBeforeClose = false,
+  sendSignatureOnlyReasoningBeforeClose = false,
+  completeWebSocket = false
+} = {}) {
   let httpCalls = 0;
   let webSocketCalls = 0;
+  const webSocketRequests = [];
   const server = http.createServer((request, response) => {
     request.resume();
     request.once('end', () => {
@@ -100,15 +107,67 @@ async function createFallbackServer({ sendCreatedBeforeClose = false } = {}) {
   server.on('upgrade', (request, socket, head) => {
     webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
       webSocketCalls += 1;
-      webSocket.once('message', () => {
+      const connection = webSocketCalls;
+      webSocket.once('message', (raw) => {
+        const payloadText = raw.toString();
+        const requestBody = JSON.parse(payloadText);
+        webSocketRequests.push({ connection, request: requestBody, payloadText });
+        if (completeWebSocket) {
+          const responseId = `resp_ws_${connection}`;
+          const text = `WS success ${connection}`;
+          webSocket.send(JSON.stringify({ type: 'response.created', response: { id: responseId } }));
+          webSocket.send(JSON.stringify({
+            type: 'response.output_text.delta', response_id: responseId,
+            item_id: `msg_ws_${connection}`, output_index: 0, content_index: 0, delta: text
+          }));
+          webSocket.send(JSON.stringify({
+            type: 'response.output_item.done', response_id: responseId, output_index: 0,
+            item: {
+              id: `msg_ws_${connection}`, type: 'message', role: 'assistant',
+              content: [{ type: 'output_text', text, annotations: [] }]
+            }
+          }));
+          webSocket.send(JSON.stringify({
+            type: 'response.completed',
+            response: { id: responseId, status: 'completed', output: [] }
+          }));
+          return;
+        }
         if (!sendCreatedBeforeClose) {
           webSocket.terminate();
           return;
         }
         webSocket.send(JSON.stringify({
           type: 'response.created',
-          response: { id: `resp_ws_${webSocketCalls}` }
-        }), () => webSocket.terminate());
+          response: { id: `resp_ws_${connection}` }
+        }), () => {
+          if (sendSignatureOnlyReasoningBeforeClose) {
+            webSocket.send(JSON.stringify({
+              type: 'response.output_item.done',
+              response_id: `resp_ws_${connection}`,
+              output_index: 0,
+              item: {
+                id: `reasoning_ws_${connection}`,
+                type: 'reasoning',
+                summary: [],
+                encrypted_content: `opaque_reasoning_${connection}`
+              }
+            }), () => webSocket.terminate());
+            return;
+          }
+          if (!sendSemanticBeforeClose) {
+            webSocket.terminate();
+            return;
+          }
+          webSocket.send(JSON.stringify({
+            type: 'response.output_text.delta',
+            response_id: `resp_ws_${connection}`,
+            item_id: `msg_ws_${connection}`,
+            output_index: 0,
+            content_index: 0,
+            delta: 'partial semantic output'
+          }), () => webSocket.terminate());
+        });
       });
     });
   });
@@ -116,6 +175,7 @@ async function createFallbackServer({ sendCreatedBeforeClose = false } = {}) {
   return {
     baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
     counts: () => ({ httpCalls, webSocketCalls }),
+    webSocketRequests: () => [...webSocketRequests],
     async close() {
       for (const client of webSocketServer.clients) client.terminate();
       await new Promise((resolve) => webSocketServer.close(resolve));
@@ -135,6 +195,25 @@ async function runFallbackRequest(server, id, conversationId, traces, attemptOve
     }
   );
   return events;
+}
+
+async function responsesFormat() {
+  const unified = await import('unified-llm-provider');
+  return new unified.OpenAIResponsesFormat('gpt-test');
+}
+
+function responseRequestBody(format, contents) {
+  return format.encodeRequest({ contents }, true);
+}
+
+function userContent(text) {
+  return { role: 'user', parts: [{ text }] };
+}
+
+async function collectWebSocketStream(options) {
+  const chunks = [];
+  for await (const chunk of streamOpenAIResponsesWebSocketSession(options)) chunks.push(chunk);
+  return chunks;
 }
 
 test('WS budget exhaustion falls back once to HTTP and applies a short conversation cooldown', async () => {
@@ -180,7 +259,7 @@ test('an exhausted 120s retry budget goes directly to HTTP instead of opening an
   }
 });
 
-test('a WS failure after the first Provider event never falls back or replays', async () => {
+test('response.created before EOF remains replay-safe and falls back after retry exhaustion', async () => {
   const server = await createFallbackServer({ sendCreatedBeforeClose: true });
   try {
     const traces = [];
@@ -190,12 +269,238 @@ test('a WS failure after the first Provider event never falls back or replays', 
       'conversation-no-fallback-after-event',
       traces
     );
+    assert.equal(events.some((event) => event.type === 'llm:error'), false);
+    assert.equal(events.some((event) => event.type === 'llm:done'), true);
+    assert.deepEqual(server.counts(), { httpCalls: 1, webSocketCalls: 1 });
+    assert.equal(traces.some((trace) => trace.phase === 'http_fallback'), true);
+  } finally {
+    await server.close();
+  }
+});
+
+test('a WS failure after semantic output never falls back or replays', async () => {
+  const server = await createFallbackServer({
+    sendCreatedBeforeClose: true,
+    sendSemanticBeforeClose: true
+  });
+  try {
+    const traces = [];
+    const events = await runFallbackRequest(
+      server,
+      'no-fallback-after-semantic-output',
+      'conversation-no-fallback-after-semantic-output',
+      traces
+    );
     assert.equal(events.some((event) => event.type === 'llm:error'), true);
     assert.equal(events.some((event) => event.type === 'llm:done'), false);
     assert.deepEqual(server.counts(), { httpCalls: 0, webSocketCalls: 1 });
     assert.equal(traces.some((trace) => trace.phase === 'http_fallback'), false);
   } finally {
     await server.close();
+  }
+});
+
+test('signature-only reasoning before EOF is semantic and never falls back or replays', async () => {
+  const server = await createFallbackServer({
+    sendCreatedBeforeClose: true,
+    sendSignatureOnlyReasoningBeforeClose: true
+  });
+  try {
+    const traces = [];
+    const events = await runFallbackRequest(
+      server,
+      'no-fallback-after-signature-only-reasoning',
+      'conversation-no-fallback-after-signature-only-reasoning',
+      traces
+    );
+    assert.equal(events.some((event) => event.type === 'llm:thoughtDone'), true);
+    assert.equal(events.some((event) => event.type === 'llm:error'), true);
+    assert.equal(events.some((event) => event.type === 'llm:done'), false);
+    assert.deepEqual(server.counts(), { httpCalls: 0, webSocketCalls: 1 });
+    assert.equal(traces.some((trace) => trace.phase === 'http_fallback'), false);
+    const error = events.find((event) => event.type === 'llm:error');
+    assert.equal(error?.payload?.rawError?.receivedServerEvent, true);
+    assert.equal(error?.payload?.rawError?.receivedSemanticOutput, true);
+  } finally {
+    await server.close();
+  }
+});
+
+test('reliable Attempt 2 forces a fresh physical WS and full request', async () => {
+  const server = await createFallbackServer({ completeWebSocket: true });
+  try {
+    const conversationId = 'conversation-force-fresh-retry';
+    await runFallbackRequest(
+      server,
+      'force-fresh-retry',
+      conversationId,
+      [],
+      { attemptSeq: 1, maxAttempts: 5 }
+    );
+    const retryTraces = [];
+    await runFallbackRequest(
+      server,
+      'force-fresh-retry',
+      conversationId,
+      retryTraces,
+      { attemptSeq: 2, maxAttempts: 5 }
+    );
+
+    assert.deepEqual(server.counts(), { httpCalls: 0, webSocketCalls: 2 });
+    const requests = server.webSocketRequests();
+    assert.deepEqual(requests.map((entry) => entry.connection), [1, 2]);
+    assert.equal('previous_response_id' in requests[1].request, false);
+    assert.ok(retryTraces.some((trace) =>
+      trace.phase === 'continuation_decision'
+      && trace.connectionReason === 'retry_forced_reconnect'
+      && trace.connectionReused === false
+      && trace.mode === 'full'
+    ));
+    const requestSent = retryTraces.find((trace) => trace.phase === 'request_sent');
+    assert.ok(requestSent);
+    assert.equal(requestSent.responseCreateSeq, 1);
+    assert.equal(requestSent.responseCreateFrameBytes, Buffer.byteLength(requests[1].payloadText, 'utf8'));
+    assert.equal(
+      requestSent.responseCreateFrameSha256,
+      createHash('sha256').update(requests[1].payloadText, 'utf8').digest('hex')
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('abort and event-idle timeout never leak a reasoning signature into the next continuation ledger', async () => {
+  for (const fixture of [
+    { name: 'abort', abort: true },
+    { name: 'event-idle-timeout', abort: false }
+  ]) {
+    resetOpenAIResponsesWebSocketSessions();
+    const requests = [];
+    let connectionCount = 0;
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0, perMessageDeflate: false });
+    await new Promise((resolve) => server.once('listening', resolve));
+    server.on('connection', (socket) => {
+      const connection = connectionCount++;
+      socket.on('message', (raw) => {
+        const request = JSON.parse(raw.toString());
+        const ordinal = requests.length;
+        requests.push({ connection, request });
+        if (ordinal === 0) {
+          socket.send(JSON.stringify({
+            type: 'response.created', response: { id: `resp_stale_${fixture.name}` }
+          }));
+          socket.send(JSON.stringify({
+            type: 'response.output_item.done',
+            response_id: `resp_stale_${fixture.name}`,
+            output_index: 0,
+            item: {
+              id: `reasoning_stale_${fixture.name}`,
+              type: 'reasoning',
+              summary: [],
+              encrypted_content: `opaque_stale_${fixture.name}`
+            }
+          }));
+          return;
+        }
+        if (ordinal === 1) {
+          const responseId = `resp_fresh_${fixture.name}`;
+          const reasoning = {
+            id: `reasoning_fresh_${fixture.name}`,
+            type: 'reasoning',
+            summary: [],
+            encrypted_content: `opaque_fresh_${fixture.name}`
+          };
+          socket.send(JSON.stringify({ type: 'response.created', response: { id: responseId } }));
+          socket.send(JSON.stringify({
+            type: 'response.output_item.done', response_id: responseId, output_index: 0, item: reasoning
+          }));
+          socket.send(JSON.stringify({
+            type: 'response.completed',
+            response: {
+              id: responseId,
+              status: 'completed',
+              output: [{ ...reasoning, encrypted_content: `completed_signature_${fixture.name}` }]
+            }
+          }));
+          return;
+        }
+        socket.send(JSON.stringify({
+          type: 'response.created', response: { id: `resp_suffix_${fixture.name}` }
+        }));
+        socket.send(JSON.stringify({
+          type: 'response.completed',
+          response: { id: `resp_suffix_${fixture.name}`, status: 'completed', output: [] }
+        }));
+      });
+    });
+
+    const address = server.address();
+    const format = await responsesFormat();
+    const sessionKey = `reasoning-ledger-${fixture.name}`;
+    const common = {
+      sessionKey,
+      url: `http://127.0.0.1:${address.port}/v1/responses`,
+      headers: { Authorization: 'Bearer test' },
+      format,
+      timeouts: {
+        handshakeMs: 100,
+        sendMs: 100,
+        firstEventMs: 100,
+        eventIdleMs: 30,
+        responseMs: 500
+      }
+    };
+    try {
+      const controller = new AbortController();
+      const interrupted = streamOpenAIResponsesWebSocketSession({
+        ...common,
+        body: responseRequestBody(format, [userContent('stale attempt')]),
+        signal: controller.signal
+      });
+      const signatureChunk = await interrupted.next();
+      assert.equal(signatureChunk.done, false);
+      assert.match(JSON.stringify(signatureChunk.value), new RegExp(`opaque_stale_${fixture.name}`));
+      if (fixture.abort) controller.abort(new Error(`fixture-${fixture.name}`));
+      await assert.rejects(
+        async () => {
+          while (!(await interrupted.next()).done) { /* drain */ }
+        },
+        fixture.abort
+          ? new RegExp(`fixture-${fixture.name}`)
+          : (error) => error?.code === 'LLM_TRANSPORT_TIMEOUT' && error?.phase === 'event_idle'
+      );
+
+      const freshSignature = `opaque_fresh_${fixture.name}`;
+      await collectWebSocketStream({
+        ...common,
+        body: responseRequestBody(format, [userContent('fresh attempt')])
+      });
+      await collectWebSocketStream({
+        ...common,
+        body: responseRequestBody(format, [
+          userContent('fresh attempt'),
+          {
+            role: 'model',
+            parts: [{
+              thought: true,
+              thoughtSignatures: { 'openai-responses': freshSignature }
+            }]
+          },
+          userContent('suffix')
+        ])
+      });
+
+      assert.equal(requests.length, 3);
+      assert.deepEqual(requests.map((entry) => entry.connection), [0, 1, 1]);
+      assert.equal(requests[2].request.previous_response_id, `resp_fresh_${fixture.name}`);
+      assert.equal(requests[2].request.input.length, 1);
+      assert.match(JSON.stringify(requests[2].request.input), /suffix/);
+      assert.doesNotMatch(JSON.stringify(requests[2].request), new RegExp(`opaque_stale_${fixture.name}`));
+    } finally {
+      resetOpenAIResponsesWebSocketSessions();
+      for (const client of server.clients) client.terminate();
+      await new Promise((resolve) => server.close(resolve));
+    }
   }
 });
 
