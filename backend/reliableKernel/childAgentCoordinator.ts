@@ -6,7 +6,12 @@ import type {
   ReliableAgentToolSettled
 } from './agentLoop';
 import type { AnswerControlPlane, RuntimeDeliveryControlPlane } from './answerDelivery';
-import type { ChildExecutionControlPlane, ChildExecutionSnapshot } from './childExecution';
+import type {
+  ChildExecutionCancelCommand,
+  ChildExecutionCancelSubtreeResult,
+  ChildExecutionControlPlane,
+  ChildExecutionSnapshot
+} from './childExecution';
 import type { EffectControlPlane, ToolTerminalResult } from './effectControlPlane';
 import type { ModelProviderControlPlane } from './modelProviderControlPlane';
 import type { CoordinateCompressionResult } from './contextCompressionCoordinator';
@@ -422,6 +427,26 @@ export class ReliableChildAgentCoordinator {
     await this.cancelLocalChildTurn(turnId, input.reason);
     if (!result.ignoredBecauseTerminal) this.launch(childExecutionId, turnId);
     return result;
+  }
+
+  /**
+   * Commits one durable recursive ChildExecution interruption and immediately signals every
+   * locally-owned Turn in that subtree. The control plane remains the cross-Host authority; the
+   * local cancellation step only removes the avoidable wake-poll delay for product/UI commands.
+   */
+  public async interruptSubtree(
+    input: ChildExecutionCancelCommand
+  ): Promise<ChildExecutionCancelSubtreeResult> {
+    const cancelled = await this.dependencies.children.interruptSubtree({
+      sourceKey: requireId(input.sourceKey, 'sourceKey'),
+      childExecutionId: requireId(input.childExecutionId, 'childExecutionId'),
+      reason: requireText(input.reason, 'reason')
+    });
+    await Promise.all(cancelled.activeTurnIds.map((turnId) =>
+      this.cancelLocalChildTurn(turnId, input.reason)
+    ));
+    this.dependencies.ownedProcessCleanup?.notify();
+    return cancelled;
   }
 
   /**
@@ -1197,15 +1222,11 @@ export class ReliableChildAgentCoordinator {
   ): Promise<ChildDispatchResult> {
     const answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
     const snapshot = await this.snapshotForBridge(answerBridgeId);
-    const cancelled = await this.dependencies.children.interruptSubtree({
+    const cancelled = await this.interruptSubtree({
       sourceKey: `run-agent-interrupt:${input.toolCallId}`,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
       reason: 'run_agent interrupt requested'
     });
-    await Promise.all(cancelled.activeTurnIds.map((turnId) =>
-      this.cancelLocalChildTurn(turnId, 'run_agent interrupt requested')
-    ));
-    this.dependencies.ownedProcessCleanup?.notify();
     return this.settleOwnTool(input.toolCallId, {
       ok: true,
       status: 'interrupt_committed',

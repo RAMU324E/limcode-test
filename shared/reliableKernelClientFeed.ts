@@ -280,6 +280,8 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'ChildExecutionParentLink',
   'ChildExecutionTurnLink',
   'ChildExecutionActiveTurnLink',
+  /** Derived bounded view; child transcript and raw ToolCall rows remain isolated. */
+  'ChildExecutionActivity',
   'AnswerBridge',
   'AnswerSubmission',
   'RuntimeInboxItem',
@@ -449,6 +451,7 @@ function seedRecordsFromSnapshot(
     childExecutionLeases: 'ExecutionLease',
     childTurnTerminations: 'TurnTermination',
     childTurnExecutorLinks: 'TurnExecutorLink',
+    childExecutionActivities: 'ChildExecutionActivity',
     answerBridges: 'AnswerBridge',
     answerSubmissions: 'AnswerSubmission',
     runtimeInboxItems: 'RuntimeInboxItem',

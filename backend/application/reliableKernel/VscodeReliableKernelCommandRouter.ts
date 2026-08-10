@@ -901,7 +901,7 @@ export class VscodeReliableKernelCommandRouter {
         parent_turn_id: payload.turnId
       });
       for (const link of children) {
-        await this.product.application.runtime.children.interruptSubtree({
+        await this.product.childAgents.interruptSubtree({
           sourceKey: `${payload.command.commandId}:child:${String(link.child_execution_id)}`,
           childExecutionId: String(link.child_execution_id),
           reason: 'parent_turn_interrupted'
@@ -1379,7 +1379,7 @@ export class VscodeReliableKernelCommandRouter {
       if (childLinks.length !== 1) {
         throw new Error('run_agent 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。');
       }
-      const result = await this.product.application.runtime.children.interruptSubtree({
+      const result = await this.product.childAgents.interruptSubtree({
         sourceKey: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
         childExecutionId: String(childLinks[0].child_execution_id),
         reason: payload.reason ?? '用户取消此子 Agent 执行。'

@@ -162,6 +162,12 @@ const deleteDialogDescriptionHtml = computed(() => {
 const abortDialogDescriptionHtml = computed(() => {
   const title = displayConversationTitle(abortTarget.value);
   const target = title ? `「${escapeHtml(middleEllipsis(title, 48))}」` : '这个对话';
+  const childAgent = abortTarget.value
+    ? originLinkByConversationId.value.get(abortTarget.value.id)?.originKind === 'agent'
+    : false;
+  if (childAgent) {
+    return `确定终止${target}吗？将同时终止此子 Agent 及其启动的所有子 Agent，<strong>不会删除对话记录</strong>。`;
+  }
   return `确定终止${target}的后台任务吗？只终止当前后台运行任务，<strong>不会删除对话记录</strong>。`;
 });
 const deleteConfirmActions: ConfirmPanelAction[] = [
@@ -409,19 +415,19 @@ function statusText(entry: SidebarConversationHistoryEntry): string {
   if (abortingConversationIds.value.has(entry.id)) return '正在终止后台任务';
   const childAgentConversation = originLinkByConversationId.value.get(entry.id)?.originKind === 'agent';
   if (childAgentConversation) {
-    if (entry.runState === 'running') return `子代理：${entry.runStatusLabel || '运行中'}`;
-    if (entry.runState === 'awaiting_parent') return '子代理：等待主 Agent 接收';
-    if (entry.runState === 'delivery_failed') return '子代理：答案交付失败';
-    if (entry.runState === 'interrupted') return '子代理已中断';
-    if (entry.runState === 'completed') return '子代理已完成';
+    if (entry.runState === 'running') return `子 Agent：${entry.runStatusLabel || '运行中'}`;
+    if (entry.runState === 'awaiting_parent') return '子 Agent：等待主 Agent 处理';
+    if (entry.runState === 'delivery_failed') return '子 Agent：回答发送失败';
+    if (entry.runState === 'interrupted') return '子 Agent 已中断';
+    if (entry.runState === 'completed') return '子 Agent 已完成';
   }
   if (entry.isRunning) return childAgentConversation
-    ? `子代理：${entry.runStatusLabel || '运行中'}`
+    ? `子 Agent：${entry.runStatusLabel || '运行中'}`
     : `后台任务：${entry.runStatusLabel || '执行中'}`;
-  if (entry.status === 'streaming') return childAgentConversation ? '子代理正在响应' : '正在响应';
-  if (entry.status === 'final') return childAgentConversation ? '子代理已完成' : '已完成';
-  if (entry.status === 'partial') return childAgentConversation ? '子代理回复未完成' : '回复未完成';
-  return childAgentConversation ? '子代理尚未开始' : '暂无消息';
+  if (entry.status === 'streaming') return childAgentConversation ? '子 Agent 正在回复' : '正在回复';
+  if (entry.status === 'final') return childAgentConversation ? '子 Agent 已完成' : '已完成';
+  if (entry.status === 'partial') return childAgentConversation ? '子 Agent 的回复未完成' : '回复未完成';
+  return childAgentConversation ? '子 Agent 尚未开始' : '暂无消息';
 }
 
 function showRunBadge(entry: SidebarConversationHistoryEntry): boolean {
@@ -433,8 +439,8 @@ function showRunBadge(entry: SidebarConversationHistoryEntry): boolean {
 
 function runBadgeText(entry: SidebarConversationHistoryEntry): string {
   if (abortingConversationIds.value.has(entry.id)) return '正在终止';
-  if (entry.runState === 'awaiting_parent') return '等待主 Agent 接收';
-  if (entry.runState === 'delivery_failed') return '答案交付失败';
+  if (entry.runState === 'awaiting_parent') return '等待主 Agent 处理';
+  if (entry.runState === 'delivery_failed') return '回答发送失败';
   if (entry.runState === 'interrupted') return '已中断';
   return entry.runStatusLabel || '执行中';
 }
@@ -444,6 +450,13 @@ function runBadgeClass(entry: SidebarConversationHistoryEntry): string | undefin
   if (entry.runState === 'delivery_failed') return 'is-delivery-failed';
   if (entry.runState === 'interrupted') return 'is-interrupted';
   return undefined;
+}
+
+function abortActionLabel(entry: SidebarConversationHistoryEntry): string {
+  if (abortingConversationIds.value.has(entry.id)) return '正在终止后台任务，点击可重发';
+  return originLinkByConversationId.value.get(entry.id)?.originKind === 'agent'
+    ? '终止此子 Agent 及其启动的所有子 Agent'
+    : '终止后台任务';
 }
 
 function historyPreviewText(entry: SidebarConversationHistoryEntry): string {
@@ -486,7 +499,7 @@ function historyMeta(entry: SidebarConversationHistoryEntry): string {
 
 function originBadgeText(entry: SidebarConversationHistoryEntry): string | undefined {
   const origin = originLinkByConversationId.value.get(entry.id);
-  if (origin?.originKind === 'agent') return origin.sourceKind === 'toolCall' ? 'AI 触发' : 'Agent 创建';
+  if (origin?.originKind === 'agent') return origin.sourceKind === 'toolCall' ? 'LLM 触发' : 'Agent 创建';
   if (origin?.originKind === 'system') return '系统创建';
   return undefined;
 }
@@ -655,9 +668,9 @@ function persistExpandedConversationIds(): void {
 function descendantAgentSummaryText(summary: ConversationHistoryDescendantAgentSummary): string {
   const parts = [
     summary.running > 0 ? `${summary.running} 运行中` : '',
-    summary.awaitingParent > 0 ? `${summary.awaitingParent} 待接收` : '',
+    summary.awaitingParent > 0 ? `${summary.awaitingParent} 待主 Agent 处理` : '',
     summary.interrupted > 0 ? `${summary.interrupted} 已中断` : '',
-    summary.deliveryFailed > 0 ? `${summary.deliveryFailed} 交付失败` : ''
+    summary.deliveryFailed > 0 ? `${summary.deliveryFailed} 回答发送失败` : ''
   ].filter(Boolean);
   return parts.join('，');
 }
@@ -816,7 +829,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
                 <span
                   v-if="node.hasChildren && !node.expanded && hasDescendantAgentSummary(node.descendantAgents)"
                   class="descendant-agent-summary"
-                  :aria-label="`后代 Agent：${descendantAgentSummaryText(node.descendantAgents)}`"
+                  :aria-label="`下级子 Agent：${descendantAgentSummaryText(node.descendantAgents)}`"
                 >
                   <span v-if="node.descendantAgents.running" class="descendant-agent-count is-running">
                     {{ node.descendantAgents.running }} 运行
@@ -847,8 +860,8 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
                 :disabled="!node.entry.isRunning || isConversationOperationPending(node.entry)"
                 :aria-hidden="!node.entry.isRunning"
                 :tabindex="node.entry.isRunning && !isConversationOperationPending(node.entry) ? 0 : -1"
-                :title="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务，点击可重发' : '终止后台任务'"
-                :aria-label="abortingConversationIds.has(node.entry.id) ? '正在终止后台任务，点击可重发' : '终止后台任务'"
+                :title="abortActionLabel(node.entry)"
+                :aria-label="abortActionLabel(node.entry)"
                 @click="node.entry.isRunning && abortConversation(node.entry)"
               >
                 <IconPlayerStop class="history-action-icon" stroke="2" aria-hidden="true" />
@@ -950,7 +963,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
             </span>
             <span class="settings-nav-main">
               <span class="settings-nav-title">Agent 设置</span>
-              <span class="settings-nav-desc">角色、人格 Prompt、能力上限与默认模型。</span>
+              <span class="settings-nav-desc">角色、角色提示词、能力上限与默认 LLM。</span>
             </span>
             <span class="settings-nav-trail">
               打开
@@ -966,7 +979,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
             </span>
             <span class="settings-nav-main">
               <span class="settings-nav-title">工作流编辑</span>
-              <span class="settings-nav-desc">查看和编辑内置工作流、用户工作流的原始数据。</span>
+              <span class="settings-nav-desc">查看和编辑内置及自定义工作流的高级 JSON 配置。</span>
             </span>
             <span class="settings-nav-trail">
               打开
@@ -982,7 +995,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
             </span>
             <span class="settings-nav-main">
               <span class="settings-nav-title">对话设置</span>
-              <span class="settings-nav-desc">单个对话的名称、模型选择、工具策略与上下文配置。</span>
+              <span class="settings-nav-desc">单个对话的名称、LLM 选择、工具策略与上下文配置。</span>
             </span>
             <span class="settings-nav-badge">即将支持</span>
           </button>

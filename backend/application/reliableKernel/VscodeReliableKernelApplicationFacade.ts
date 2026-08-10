@@ -385,13 +385,26 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       return { status: 'stale', reason: 'lease_generation_replaced', turnId };
     }
     try {
-      await this.product.conversations.interrupt({
-        commandId: requestId,
-        conversationId,
-        turnId,
-        expectedLeaseGeneration,
-        reason: '用户从侧栏请求终止当前 Conversation。'
-      });
+      const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+      if (childMemberships.length > 1) throw new Error('Turn 存在多个 ChildExecution 调度归属。');
+      if (childMemberships[0]) {
+        await this.product.childAgents.interruptSubtree({
+          sourceKey: `sidebar-child-interrupt:${requestId}`,
+          childExecutionId: requireText(
+            childMemberships[0].child_execution_id,
+            'ChildExecutionTurnLink.child_execution_id'
+          ),
+          reason: '用户从侧栏请求递归终止当前子 Agent。'
+        });
+      } else {
+        await this.product.conversations.interrupt({
+          commandId: requestId,
+          conversationId,
+          turnId,
+          expectedLeaseGeneration,
+          reason: '用户从侧栏请求终止当前 Conversation。'
+        });
+      }
       return { status: 'committed', turnId };
     } catch (error) {
       const turn = await this.maybeRow('Turn', turnId);

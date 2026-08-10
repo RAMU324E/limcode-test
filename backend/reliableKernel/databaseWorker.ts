@@ -82,6 +82,8 @@ import {
 const CONTEXT_CAS_CACHE_MAX_ENTRIES = 4_096;
 const CONTEXT_CAS_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const TURN_INTENT_CONTENT_TYPE = 'application/vnd.limcode.turn-intent+json';
+const CHILD_ACTIVITY_ARGUMENTS_MAX_BYTES = 64 * 1024;
+const CHILD_ACTIVITY_SUMMARY_MAX_CHARACTERS = 180;
 
 interface VerifiedContextCasCacheEntry {
   id: string;
@@ -425,6 +427,53 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       VALUES ('ConversationCommandReceipt', NEW.id, 'upsert');
     END
   `);
+
+  // Child ToolCall/ModelRequest rows stay isolated from the parent Conversation feed. Instead,
+  // changes to the active child generation re-project one bounded, non-authoritative activity row
+  // keyed by ChildExecution. This gives the parent UI live progress without merging transcripts.
+  for (const table of ['tool_call', 'model_request'] as const) {
+    for (const operation of ['insert', 'update'] as const) {
+      database.exec(`
+        CREATE TEMP TRIGGER ${quote(`capture_child_activity_from_${table}_${operation}`)}
+        AFTER ${operation.toUpperCase()} ON ${quote(table)}
+        BEGIN
+          INSERT INTO runtime_transaction_change (domain, id, kind)
+          SELECT 'ChildExecutionActivity', membership.child_execution_id, 'upsert'
+            FROM child_execution_turn_link AS membership
+           WHERE membership.turn_id = NEW.turn_id;
+        END
+      `);
+    }
+  }
+  for (const operation of ['insert', 'update'] as const) {
+    database.exec(`
+      CREATE TEMP TRIGGER ${quote(`capture_child_activity_from_execution_${operation}`)}
+      AFTER ${operation.toUpperCase()} ON child_execution
+      BEGIN
+        INSERT INTO runtime_transaction_change (domain, id, kind)
+        VALUES ('ChildExecutionActivity', NEW.id, 'upsert');
+      END
+    `);
+  }
+  database.exec(`
+    CREATE TEMP TRIGGER capture_child_activity_from_execution_delete
+    AFTER DELETE ON child_execution
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      VALUES ('ChildExecutionActivity', OLD.id, 'remove');
+    END
+  `);
+  for (const operation of ['insert', 'update', 'delete'] as const) {
+    const row = operation === 'delete' ? 'OLD' : 'NEW';
+    database.exec(`
+      CREATE TEMP TRIGGER ${quote(`capture_child_activity_from_active_turn_${operation}`)}
+      AFTER ${operation.toUpperCase()} ON child_execution_active_turn_link
+      BEGIN
+        INSERT INTO runtime_transaction_change (domain, id, kind)
+        VALUES ('ChildExecutionActivity', ${row}.child_execution_id, 'upsert');
+      END
+    `);
+  }
 }
 
 function readTransactionChanges(database: Database.Database): RuntimeChange[] {
@@ -442,8 +491,16 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
   const topology = new Map(DOMAIN_REPOSITORIES.all().map((repository, index) => [repository.schema.key, index]));
   topology.set('ConversationContextStatus', topology.size);
   topology.set('ConversationCommandReceipt', topology.size);
+  topology.set('ChildExecutionActivity', topology.size);
   return rows
     .map((row) => {
+      if (row.domain === 'ChildExecutionActivity') {
+        if (row.kind === 'remove') return { ...row };
+        const record = projectChildExecutionActivityRecord(database, row.id);
+        return record
+          ? { ...row, kind: 'upsert' as const, record }
+          : { ...row, kind: 'remove' as const };
+      }
       if (row.kind === 'remove') return { ...row };
       if (row.domain === 'ConversationContextStatus') {
         return { ...row, record: projectConversationContextStatusRecord(database, row.id) };
@@ -689,6 +746,178 @@ function projectAnswerBridgeRecord(database: Database.Database, answerBridgeId: 
   `, { answerBridgeId });
   if (rows.length !== 1) throw new Error(`AnswerBridge ${answerBridgeId} does not exist.`);
   return rows[0];
+}
+
+/**
+ * Small parent-facing view of what one child is doing right now. Child Message/ToolCall rows remain
+ * outside the parent feed; this record deliberately contains only a bounded activity sentence.
+ */
+function projectChildExecutionActivityRecord(
+  database: Database.Database,
+  childExecutionId: string
+): DomainRow | null {
+  const owner = queryPlainRows(database, `
+    SELECT child.id,
+           child.status AS child_status,
+           child.updated_at AS child_updated_at,
+           active.turn_id,
+           turn.status AS turn_status,
+           turn.updated_at AS turn_updated_at
+      FROM child_execution AS child
+      LEFT JOIN child_execution_active_turn_link AS active
+        ON active.child_execution_id = child.id
+      LEFT JOIN turn ON turn.id = active.turn_id
+     WHERE child.id = @childExecutionId
+     LIMIT 1
+  `, { childExecutionId })[0];
+  if (!owner) return null;
+
+  const turnId = typeof owner.turn_id === 'string' && owner.turn_status === 'active'
+    ? owner.turn_id
+    : undefined;
+  const childStatus = String(owner.child_status);
+  const base: DomainRow = {
+    id: childExecutionId,
+    child_execution_id: childExecutionId,
+    ...(turnId ? { turn_id: turnId } : {}),
+    updated_at: String(owner.turn_updated_at ?? owner.child_updated_at)
+  };
+  if (childStatus === 'interrupting') {
+    return { ...base, kind: 'stopping', summary: '正在终止当前子树' };
+  }
+  if (!turnId) {
+    return {
+      ...base,
+      kind: childStatus === 'starting' ? 'starting' : 'idle',
+      summary: childStatus === 'starting' ? '正在启动' : '当前没有活动回合'
+    };
+  }
+
+  const tool = queryPlainRows(database, `
+    SELECT *
+      FROM tool_call
+     WHERE turn_id = @turnId
+       AND status <> 'terminal'
+     ORDER BY call_seq DESC, updated_at DESC, id DESC
+     LIMIT 1
+  `, { turnId })[0];
+  if (tool) {
+    return {
+      ...base,
+      kind: 'tool',
+      tool_call_id: String(tool.id),
+      tool_name: String(tool.tool_name),
+      tool_status: String(tool.status),
+      summary: childToolActivitySummary(database, tool),
+      updated_at: String(tool.updated_at)
+    };
+  }
+
+  const request = queryPlainRows(database, `
+    SELECT *
+      FROM model_request
+     WHERE turn_id = @turnId
+       AND status <> 'terminal'
+     ORDER BY request_seq DESC, updated_at DESC, id DESC
+     LIMIT 1
+  `, { turnId })[0];
+  if (request) {
+    const status = String(request.status);
+    return {
+      ...base,
+      kind: 'model',
+      model_request_id: String(request.id),
+      model_request_status: status,
+      summary: status === 'pending' ? '正在准备模型请求' : '正在思考并生成下一步',
+      updated_at: String(request.updated_at)
+    };
+  }
+  return { ...base, kind: 'preparing', summary: '正在整理结果并准备下一步' };
+}
+
+function childToolActivitySummary(
+  database: Database.Database,
+  tool: Record<string, unknown>
+): string {
+  const toolName = String(tool.tool_name);
+  const action = childToolAction(toolName);
+  const prefix = tool.status === 'pending' ? `等待${action}` : `正在${action}`;
+  const detail = childToolArgumentPreview(database, tool);
+  return compactChildActivitySummary(detail ? `${prefix} · ${detail}` : prefix);
+}
+
+function childToolAction(toolName: string): string {
+  switch (toolName) {
+    case 'bash':
+    case 'shell': return '运行命令';
+    case 'read':
+    case 'read_file': return '读取文件';
+    case 'edit': return '编辑文件';
+    case 'write': return '写入文件';
+    case 'delete': return '删除文件';
+    case 'run_agent': return '调度子 Agent';
+    case 'submit_agent_answer': return '提交 Agent 回答';
+    case 'read_agent_answer': return '读取 Agent 回答';
+    case 'ask_user': return '请求用户输入';
+    case 'skills': return '载入技能';
+    case 'transfer': return '传输文件';
+    case 'switch_work_environment': return '切换工作环境';
+    case 'update_task_list': return '更新任务清单';
+    default: return `调用 ${toolName}`;
+  }
+}
+
+function childToolArgumentPreview(
+  database: Database.Database,
+  tool: Record<string, unknown>
+): string | undefined {
+  try {
+    const contentObjectId = String(tool.arguments_object_id);
+    const raw = database.prepare('SELECT * FROM content_object WHERE id = ?').get(contentObjectId);
+    if (!raw) return undefined;
+    const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(raw as Record<string, unknown>);
+    if (
+      typeof metadata.byte_length !== 'bigint'
+      || metadata.byte_length > BigInt(CHILD_ACTIVITY_ARGUMENTS_MAX_BYTES)
+    ) return undefined;
+    const parsed = JSON.parse(readVerifiedCasBytes(
+      metadata,
+      path.resolve(data.binding.paths.casRootPath)
+    ).toString('utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const args = parsed as Record<string, unknown>;
+    const toolName = String(tool.tool_name);
+    if ((toolName === 'bash' || toolName === 'shell') && typeof args.command === 'string') {
+      return compactChildActivitySummary(args.command);
+    }
+    if (toolName === 'run_agent' && typeof args.prompt === 'string') {
+      return compactChildActivitySummary(args.prompt);
+    }
+    if (toolName === 'skills' && typeof args.name === 'string') {
+      return compactChildActivitySummary(args.name);
+    }
+    if (Array.isArray(args.paths)) {
+      const paths = args.paths.filter((value): value is string => typeof value === 'string' && Boolean(value.trim()));
+      if (paths.length > 0) {
+        return compactChildActivitySummary(`${paths[0]}${paths.length > 1 ? ` +${paths.length - 1}` : ''}`);
+      }
+    }
+    for (const key of ['path', 'query', 'pattern', 'title', 'question', 'explanation', 'summary']) {
+      const value = args[key];
+      if (typeof value === 'string' && value.trim()) return compactChildActivitySummary(value);
+    }
+  } catch {
+    // Activity is a best-effort bounded view. Malformed/large arguments remain available only in
+    // the child Conversation and must never make a Runtime transaction or parent feed fail.
+  }
+  return undefined;
+}
+
+function compactChildActivitySummary(value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized.length > CHILD_ACTIVITY_SUMMARY_MAX_CHARACTERS
+    ? `${normalized.slice(0, CHILD_ACTIVITY_SUMMARY_MAX_CHARACTERS - 1)}…`
+    : normalized;
 }
 
 function projectProcessRecord(database: Database.Database, processId: string): DomainRow {
@@ -2269,6 +2498,7 @@ function executeClientProjectionSnapshot(
     const emptySubagents = {
       childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [], childTurnTerminations: [], childTurnExecutorLinks: [],
+      childExecutionActivities: [],
       answerBridges: [], answerSubmissions: [],
       runtimeInboxItems: [], runtimeDeliveries: []
     };
@@ -2636,6 +2866,10 @@ function executeClientProjectionSnapshot(
     const childExecutionLeases = queryAllByIds(database, 'execution_lease', 'turn_id', childTurnIds);
     const childTurnTerminations = queryAllByIds(database, 'turn_termination', 'turn_id', childTurnIds);
     const childTurnExecutorLinks = queryAllByIds(database, 'turn_executor_link', 'turn_id', childTurnIds);
+    const childExecutionActivities = childExecutions.flatMap((child) => {
+      const activity = projectChildExecutionActivityRecord(database, String(child.id));
+      return activity ? [activity] : [];
+    });
     const answerBridges = queryAllByIds(database, 'answer_bridge', 'child_execution_id', childIds)
       .map((bridge) => projectAnswerBridgeRecord(database, String(bridge.id)));
     const bridgeIds = answerBridges.map((row) => String(row.id));
@@ -2725,6 +2959,7 @@ function executeClientProjectionSnapshot(
         childExecutionLeases,
         childTurnTerminations,
         childTurnExecutorLinks,
+        childExecutionActivities,
         answerBridges,
         answerSubmissions,
         runtimeInboxItems: inboxItems,

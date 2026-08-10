@@ -703,6 +703,8 @@ export class BoundedClientFeed {
       case 'ChildExecutionTurnLink':
       case 'ChildExecutionActiveTurnLink':
         return materialized('ChildExecution', field('child_execution_id'));
+      case 'ChildExecutionActivity':
+        return materialized('ChildExecution', field('child_execution_id'));
       case 'AnswerBridge':
         return materialized('ChildExecution', field('child_execution_id'));
       case 'AnswerSubmission':
@@ -1837,6 +1839,7 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   childExecutionLeases: 'ExecutionLease',
   childTurnTerminations: 'TurnTermination',
   childTurnExecutorLinks: 'TurnExecutorLink',
+  childExecutionActivities: 'ChildExecutionActivity',
   answerBridges: 'AnswerBridge',
   answerSubmissions: 'AnswerSubmission',
   runtimeInboxItems: 'RuntimeInboxItem',
@@ -2578,6 +2581,7 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   filterSnapshotReference(subagents, 'childExecutionLeases', 'turn_id', childTurnIds);
   filterSnapshotReference(subagents, 'childTurnTerminations', 'turn_id', childTurnIds);
   filterSnapshotReference(subagents, 'childTurnExecutorLinks', 'turn_id', childTurnIds);
+  filterSnapshotReference(subagents, 'childExecutionActivities', 'child_execution_id', childIds);
   filterSnapshotReference(subagents, 'answerBridges', 'child_execution_id', childIds);
   const answerBridgeIds = snapshotIds(subagents, 'answerBridges');
   filterSnapshotReference(subagents, 'answerSubmissions', 'answer_bridge_id', answerBridgeIds);

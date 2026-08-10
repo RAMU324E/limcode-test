@@ -12,6 +12,9 @@ export interface ReliableChildAgentStatus {
   lifecycle: string;
   lifecycleLabel: string;
   group: ReliableChildAgentGroup;
+  activityKind?: string;
+  activitySummary?: string;
+  interruptible: boolean;
   deliveryBadge?: 'awaiting_parent' | 'delivery_failed';
 }
 
@@ -44,6 +47,10 @@ export function projectReliableAgentStatus(input: {
     .filter((inbox) => inbox.source_kind === 'answer_submission')
     .flatMap((inbox) => stringValue(inbox.source_id) ? [[stringValue(inbox.source_id)!, inbox] as const] : []));
   const deliveries = Object.values(records.RuntimeDelivery ?? {});
+  const activitiesByChild = new Map(Object.values(records.ChildExecutionActivity ?? {})
+    .flatMap((activity) => stringValue(activity.child_execution_id)
+      ? [[stringValue(activity.child_execution_id)!, activity] as const]
+      : []));
 
   const children = Object.values(records.ChildExecutionParentLink ?? {}).flatMap((link) => {
     const parentTurnId = stringValue(link.parent_turn_id);
@@ -54,7 +61,10 @@ export function projectReliableAgentStatus(input: {
     const childConversationId = stringValue(child?.child_conversation_id);
     const lifecycle = stringValue(child?.status);
     if (!child || !childConversationId || !lifecycle) return [];
-    const projectedLifecycle = lifecycleProjection(lifecycle);
+    const activity = activitiesByChild.get(childId);
+    const activityKind = stringValue(activity?.kind);
+    const activitySummary = stringValue(activity?.summary);
+    const projectedLifecycle = lifecycleProjection(lifecycle, activityKind);
     const bridge = bridgesByChild.get(childId);
     const submissionId = stringValue(bridge?.current_submission_id);
     const inboxId = submissionId ? stringValue(inboxBySubmission.get(submissionId)?.id) : undefined;
@@ -68,9 +78,12 @@ export function projectReliableAgentStatus(input: {
       id: childId,
       conversationId: childConversationId,
       sourceToolCallId,
-      agentName: agentNameForConversation(childConversationId, agentLinks, input.agentNames) ?? 'Child Agent',
+      agentName: agentNameForConversation(childConversationId, agentLinks, input.agentNames) ?? '子 Agent',
       lifecycle,
+      interruptible: ['starting', 'active', 'idle'].includes(lifecycle),
       ...projectedLifecycle,
+      ...(activityKind ? { activityKind } : {}),
+      ...(activitySummary ? { activitySummary } : {}),
       ...(deliveryBadge ? { deliveryBadge } : {})
     } satisfies ReliableChildAgentStatus];
   }).sort((left, right) => left.agentName.localeCompare(right.agentName, 'zh-CN') || left.id.localeCompare(right.id));
@@ -78,7 +91,13 @@ export function projectReliableAgentStatus(input: {
   return { currentAgentName, children };
 }
 
-function lifecycleProjection(lifecycle: string): Pick<ReliableChildAgentStatus, 'group' | 'lifecycleLabel'> {
+function lifecycleProjection(
+  lifecycle: string,
+  activityKind?: string
+): Pick<ReliableChildAgentStatus, 'group' | 'lifecycleLabel'> {
+  if (lifecycle === 'idle' && activityKind && !['idle', 'stopping'].includes(activityKind)) {
+    return { group: 'executing', lifecycleLabel: '下级子 Agent 仍在运行' };
+  }
   switch (lifecycle) {
     case 'starting': return { group: 'executing', lifecycleLabel: '启动中' };
     case 'active': return { group: 'executing', lifecycleLabel: '执行中' };
