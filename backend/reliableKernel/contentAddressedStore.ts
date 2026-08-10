@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
+import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -544,13 +545,7 @@ async function ensureDurableChildDirectory(
 }
 
 async function syncDirectory(directoryPath: string, onFsync: () => void): Promise<void> {
-  const handle = await fs.open(directoryPath, 'r');
-  try {
-    await handle.sync();
-    onFsync();
-  } finally {
-    await handle.close();
-  }
+  await syncDirectoryDurably(directoryPath, onFsync);
 }
 
 function asContentObjectMetadata(row: DomainRow): ContentObjectMetadata {

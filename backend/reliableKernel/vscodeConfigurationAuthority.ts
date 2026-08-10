@@ -106,6 +106,9 @@ interface ConfigurationRecords {
   compressionSettings: LlmCompressionSettingsRecord;
 }
 
+type ConfigurationClientRecords = Omit<ConfigurationRecords,
+  'providerConfigs' | 'activeProviderConfigId' | 'compressionConfigs' | 'compressionSettings'>;
+
 /** 每次 operation 重新经 getPaths 解析 settings authority；不读取或写入 Runtime SQLite。 */
 export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, AttachmentSettingsAuthority {
   public readonly mutations: VscodeConfigurationMutations;
@@ -366,12 +369,26 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   }
 
   public async agents(): Promise<AgentRecord[]> {
-    return (await this.loadRecords()).agents.map((agent) => ({ ...agent }));
+    // Sidebar/history labels need only Agent records. Do not make that projection depend on every
+    // unrelated settings section (for example a deliberately hard-cut compression schema).
+    const paths = this.getPaths();
+    const agents = await loadRecordStore<AgentRecord, 'agent'>(
+      paths.agentsRootUri,
+      paths.agentsIndexUri,
+      'agent'
+    );
+    return mergeAgentsWithBuiltins(agents ?? []).map((agent) => ({ ...agent }));
   }
 
   public async workflow(workflowIdInput: string): Promise<WorkflowRecord> {
     const workflowId = requireId(workflowIdInput, 'workflowId');
-    const workflow = (await this.loadRecords()).workflows.find((candidate) => candidate.id === workflowId);
+    const paths = this.getPaths();
+    const stored = await loadRecordStore<WorkflowRecord, 'workflow'>(
+      paths.workflowsRootUri,
+      paths.workflowsIndexUri,
+      'workflow'
+    );
+    const workflow = mergeWorkflowsWithBuiltins(stored ?? []).find((candidate) => candidate.id === workflowId);
     if (!workflow) throw new Error(`Workflow 不存在：${workflowId}`);
     return { ...workflow };
   }
@@ -384,7 +401,9 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
 
   /** Configuration-only projection. Runtime facts remain exclusively on the bounded reliable Feed. */
   public async configurationClientState(): Promise<ClientState> {
-    const records = await this.loadRecords();
+    // The client-state tables do not contain provider or compression settings. Keep those independently
+    // versioned settings stores out of bridge bootstrap so one invalid section cannot strand every tab.
+    const records = await this.loadConfigurationClientRecords();
     return Object.assign(createEmptyClientState(), {
       agents: records.agents.map(clonePlain),
       workflows: records.workflows.map(clonePlain),
@@ -415,15 +434,15 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     agentType: string;
     title: string;
   }> {
-    const records = await this.loadRecords();
+    const agents = await this.agents();
     const requestedId = input.agentId?.trim();
     const requestedType = input.agentType?.trim() || 'worker';
     const selected = requestedId
-      ? records.agents.find((agent) => agent.id === requestedId)
-      : records.agents.find((agent) => agent.id === requestedType)
-        ?? records.agents.find((agent) => agent.kind === requestedType);
+      ? agents.find((agent) => agent.id === requestedId)
+      : agents.find((agent) => agent.id === requestedType)
+        ?? agents.find((agent) => agent.kind === requestedType);
     if (!selected) {
-      throw new Error(`未知 Agent：${requestedId || requestedType}。可用类型：${records.agents.map((agent) => agent.kind).join(', ')}`);
+      throw new Error(`未知 Agent：${requestedId || requestedType}。可用类型：${agents.map((agent) => agent.kind).join(', ')}`);
     }
     return {
       agentId: selected.id,
@@ -433,17 +452,22 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   }
 
   public async providerConfig(providerConfigId: string): Promise<LlmProviderConfigRecord> {
-    const records = await this.loadRecords();
+    const configs = (await loadLlmProviderConfigsSettings(this.getPaths())).settings.configs;
     const id = requireId(providerConfigId, 'providerConfigId');
-    const config = records.providerConfigs.find((candidate) => candidate.id === id);
+    const config = configs.find((candidate) => candidate.id === id);
     if (!config) throw new Error(`LLM Provider 配置不存在：${id}`);
     return config;
   }
 
   public async activeProviderConfig(): Promise<LlmProviderConfigRecord> {
-    const records = await this.loadRecords();
-    const config = records.providerConfigs.find((candidate) => candidate.id === records.activeProviderConfigId)
-      ?? records.providerConfigs[0];
+    const paths = this.getPaths();
+    const [providerConfigs, llmSelection] = await Promise.all([
+      loadLlmProviderConfigsSettings(paths),
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llm')
+    ]);
+    const configs = providerConfigs.settings.configs;
+    const activeProviderConfigId = (llmSelection.settings as LlmSettingsRecord).activeProviderConfigId;
+    const config = configs.find((candidate) => candidate.id === activeProviderConfigId) ?? configs[0];
     if (!config) throw new Error('没有可用的 LLM Provider 配置。');
     return config;
   }
@@ -609,7 +633,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     )) ?? [];
   }
 
-  private async loadRecords(): Promise<ConfigurationRecords> {
+  private async loadConfigurationClientRecords(): Promise<ConfigurationClientRecords> {
     const paths = this.getPaths();
     const [
       agents,
@@ -632,11 +656,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       checkpointPolicies,
       checkpointPolicyScopeLinks,
       conversationWorkflowSelections,
-      conversationWorkEnvironmentLinks,
-      providerConfigs,
-      llmSelection,
-      compressionConfigs,
-      compressionSelection
+      conversationWorkEnvironmentLinks
     ] = await Promise.all([
       loadRecordStore<AgentRecord, 'agent'>(paths.agentsRootUri, paths.agentsIndexUri, 'agent'),
       loadRecordStore<WorkflowRecord, 'workflow'>(paths.workflowsRootUri, paths.workflowsIndexUri, 'workflow'),
@@ -730,11 +750,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         paths.conversationWorkEnvironmentLinksRootUri,
         paths.conversationWorkEnvironmentLinksIndexUri,
         'link'
-      ),
-      loadLlmProviderConfigsSettings(paths),
-      loadGlobalSettingsFile(paths.settingsRootUri, 'llm'),
-      loadLlmCompressionConfigsSettings(paths),
-      loadGlobalSettingsFile(paths.settingsRootUri, 'llmCompression')
+      )
     ]);
     return {
       agents: mergeAgentsWithBuiltins(agents ?? []),
@@ -757,7 +773,27 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       checkpointPolicies: checkpointPolicies ?? [],
       checkpointPolicyScopeLinks: checkpointPolicyScopeLinks ?? [],
       conversationWorkflowSelections: conversationWorkflowSelections ?? [],
-      conversationWorkEnvironmentLinks: conversationWorkEnvironmentLinks ?? [],
+      conversationWorkEnvironmentLinks: conversationWorkEnvironmentLinks ?? []
+    };
+  }
+
+  private async loadRecords(): Promise<ConfigurationRecords> {
+    const paths = this.getPaths();
+    const [
+      clientRecords,
+      providerConfigs,
+      llmSelection,
+      compressionConfigs,
+      compressionSelection
+    ] = await Promise.all([
+      this.loadConfigurationClientRecords(),
+      loadLlmProviderConfigsSettings(paths),
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llm'),
+      loadLlmCompressionConfigsSettings(paths),
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llmCompression')
+    ]);
+    return {
+      ...clientRecords,
       providerConfigs: providerConfigs.settings.configs,
       activeProviderConfigId: (llmSelection.settings as LlmSettingsRecord).activeProviderConfigId,
       compressionConfigs: compressionConfigs.settings.configs,
@@ -767,6 +803,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       )
     };
   }
+
 }
 
 interface FrozenCompressionResolution {

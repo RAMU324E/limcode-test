@@ -29,7 +29,7 @@ tests/**
 **/spec-*
 **/benchmark-*
 
-# Linux x64是当前唯一制品目标；better-sqlite3只携带运行时JS和对应native addon。
+# Linux/Windows x64是当前制品目标；只携带better-sqlite3运行时JS和受支持的native addons。
 node_modules/better-sqlite3/binding.gyp
 node_modules/better-sqlite3/build/**
 node_modules/better-sqlite3/deps/**
@@ -37,6 +37,7 @@ node_modules/better-sqlite3/src/**
 node_modules/better-sqlite3/node_modules/**
 node_modules/better-sqlite3/prebuilds/**
 !node_modules/better-sqlite3/prebuilds/linux-x64.node
+!node_modules/better-sqlite3/prebuilds/win32-x64.node
 
 src/**
 src copy/**

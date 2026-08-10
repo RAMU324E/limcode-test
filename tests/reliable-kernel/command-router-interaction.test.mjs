@@ -19,6 +19,86 @@ const { VscodeReliableKernelCommandRouter } = require(path.join(
   'dist/extension/backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js'
 ));
 
+test('stale Turn interrupt is idempotently reported as already_terminal', async () => {
+  const posted = [];
+  const router = new VscodeReliableKernelCommandRouter({
+    toolHost: { setStateChangeListener() {} }
+  });
+  router.maybeRow = async (domain, id) => {
+    assert.equal(domain, 'Turn');
+    assert.equal(id, 'turn-deleted');
+    return undefined;
+  };
+
+  await router.dispatch('stale-turn-client', webview(posted), {
+    id: 'interrupt-stale-turn',
+    type: protocol.BridgeMessageType.TurnInterrupt,
+    channel: 'command',
+    payload: {
+      conversationId: 'conversation-deleted',
+      command: { commandId: 'interrupt-stale-turn' },
+      turnId: 'turn-deleted',
+      leaseEpoch: 0,
+      cascadeChildAgents: true
+    }
+  });
+
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].type, protocol.BridgeMessageType.TurnInterruptResult);
+  assert.equal(posted[0].payload.status, 'already_terminal');
+  assert.equal(posted[0].payload.cascadeChildAgents, true);
+});
+
+test('stale Conversation settings request returns scoped error without throwing', async () => {
+  const posted = [];
+  const router = new VscodeReliableKernelCommandRouter({
+    toolHost: { setStateChangeListener() {} }
+  });
+  router.readConversationSettings = async () => undefined;
+
+  await router.dispatch('stale-conversation-client', webview(posted), {
+    id: 'get-stale-conversation-settings',
+    type: protocol.BridgeMessageType.ConversationSettingsGet,
+    channel: 'command',
+    payload: { conversationId: 'conversation-deleted', section: 'common' }
+  });
+
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].type, protocol.BridgeMessageType.Error);
+  assert.equal(posted[0].payload.code, 'stale_conversation');
+  assert.equal(posted[0].payload.conversationId, 'conversation-deleted');
+});
+
+test('failed global settings read preserves section scope for Webview loading state', async () => {
+  const posted = [];
+  const router = new VscodeReliableKernelCommandRouter({
+    toolHost: { setStateChangeListener() {} },
+    configuration: {
+      async loadGlobalSettings(section) {
+        assert.equal(section, 'llmCompressionConfigs');
+        throw new TypeError('Compression trigger uses removed fields.');
+      }
+    }
+  });
+
+  router.handle('settings-client', webview(posted), {
+    id: 'get-invalid-compression-settings',
+    type: protocol.BridgeMessageType.GlobalSettingsGet,
+    channel: 'command',
+    payload: { section: 'llmCompressionConfigs' }
+  });
+
+  await eventually(() => posted.length === 1);
+  assert.equal(posted[0].type, protocol.BridgeMessageType.Error);
+  assert.deepEqual(posted[0].scope, {
+    kind: 'settings',
+    level: 'global',
+    id: 'llmCompressionConfigs'
+  });
+  assert.equal(posted[0].payload.requestType, protocol.BridgeMessageType.GlobalSettingsGet);
+});
+
+
 test('durable Interaction result is posted before a stalled Agent resume completes', async () => {
   const posted = [];
   const resume = deferred();

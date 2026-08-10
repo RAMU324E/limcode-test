@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
+import { syncDirectoryDurablySync } from '../capabilities/filesystem/durableDirectorySync';
 import * as path from 'node:path';
 import {
   MAX_PROCESS_EXECUTION_TIMEOUT_MS,
@@ -19,7 +20,7 @@ import {
   PROCESS_WRAPPER_STOP_REQUEST_FILE,
   parseStopRequest,
   processChunkFileName,
-  readLinuxStartFingerprint,
+  readProcessStartFingerprint,
   type ProcessStopRequest,
   type ProcessStreamKind,
   type ProcessTerminationReason,
@@ -28,6 +29,9 @@ import {
   type ProcessWrapperLaunchRequest,
   type ProcessWrapperManifest
 } from './processProtocol';
+
+const windowsProcessFingerprints = new Map<string, string>();
+const PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE = 'bootstrap.ready';
 
 interface StreamState {
   tail: Buffer;
@@ -72,15 +76,19 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
   const chunksPath = path.join(spoolPath, PROCESS_WRAPPER_CHUNKS_DIRECTORY);
   fs.mkdirSync(chunksPath, { recursive: true });
 
-  const bashExecutable = '/bin/bash';
-  const bootstrapCommand = `IFS= read -r _ <&3 || exit 125; exec ${bashExecutable} -c ${shellQuote(request.command)}`;
-  const child = spawn(bootstrapCommand, {
-    cwd: request.cwd,
-    shell: bashExecutable,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-    windowsHide: true
-  });
+  const child = process.platform === 'win32'
+    ? spawnWindowsPowerShellCommand(request, spoolPath)
+    : (() => {
+        const bashExecutable = '/bin/bash';
+        const bootstrapCommand = `IFS= read -r _ <&3 || exit 125; exec ${bashExecutable} -c ${shellQuote(request.command)}`;
+        return spawn(bootstrapCommand, {
+          cwd: request.cwd,
+          shell: bashExecutable,
+          detached: true,
+          stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+          windowsHide: true
+        });
+      })();
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => resolve({ code, signal }));
@@ -96,11 +104,12 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
   const childPid = String(child.pid);
   let startFingerprint: string;
   try {
-    startFingerprint = readLinuxStartFingerprint(childPid);
+    startFingerprint = readProcessStartFingerprint(childPid);
   } catch (error) {
     await abortBlockedChild(childPid, exitPromise);
     throw error;
   }
+  if (process.platform === 'win32') windowsProcessFingerprints.set(childPid, startFingerprint);
   const identity: ProcessWrapperIdentity = {
     kind: PROCESS_WRAPPER_PROTOCOL,
     processId: request.processId,
@@ -149,14 +158,21 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
     observeStopRequest(state);
   }, Math.min(100, PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS));
   state.deadlineTimer = scheduleExecutionDeadline(state);
-  const bootstrapGate = child.stdio[3];
-  if (!bootstrapGate || typeof (bootstrapGate as NodeJS.WritableStream).end !== 'function') {
-    clearInterval(stopPoll);
-    clearWatchdogTimers(state);
-    await abortBlockedChild(childPid, exitPromise);
-    throw new Error('Detached wrapper bootstrap pipe is unavailable.');
+  if (process.platform === 'win32') {
+    writeAtomicBytes(
+      path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE),
+      Buffer.from('ready\n', 'utf8')
+    );
+  } else {
+    const bootstrapGate = child.stdio[3];
+    if (!bootstrapGate || typeof (bootstrapGate as NodeJS.WritableStream).end !== 'function') {
+      clearInterval(stopPoll);
+      clearWatchdogTimers(state);
+      await abortBlockedChild(childPid, exitPromise);
+      throw new Error('Detached wrapper bootstrap pipe is unavailable.');
+    }
+    (bootstrapGate as NodeJS.WritableStream).end('\n');
   }
-  (bootstrapGate as NodeJS.WritableStream).end('\n');
 
   const exit = await exitPromise.finally(() => clearInterval(stopPoll));
   if (state.deadlineTimer) {
@@ -298,7 +314,7 @@ function observeStopRequest(state: WrapperState): void {
   // Re-check the live child start fingerprint immediately before signaling its process group.
   // If the child just exited, leave the wrapper alive so its close path can publish the exit receipt.
   try {
-    if (readLinuxStartFingerprint(identity.childPid) !== identity.startFingerprint) return;
+    if (readProcessStartFingerprint(identity.childPid) !== identity.startFingerprint) return;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
@@ -324,19 +340,19 @@ function requestTermination(
   // Capture process-group birth witnesses before the first signal. A later escalation only targets
   // the group while at least one original member remains, preventing PGID reuse from hitting an
   // unrelated process while still covering descendants whose group leader exits on SIGTERM.
-  const witnesses = readLinuxProcessGroupFingerprints(identity.processGroupId);
+  const witnesses = readProcessGroupFingerprints(identity.processGroupId);
   if (!witnesses.has(identity.startFingerprint)) return false;
   state.terminationWitnesses = witnesses;
   state.terminationReason = reason;
   state.stopRequested = reason === 'manual';
   signalProcessGroup(identity.processGroupId, 'SIGTERM');
-  for (const witness of readLinuxProcessGroupFingerprints(identity.processGroupId)) {
+  for (const witness of readProcessGroupFingerprints(identity.processGroupId)) {
     state.terminationWitnesses.add(witness);
   }
   state.forceKillDueAt = Date.now() + PROCESS_TERMINATION_GRACE_MS;
   state.forceKillTimer = setTimeout(() => {
     try {
-      const current = readLinuxProcessGroupFingerprints(identity.processGroupId);
+      const current = readProcessGroupFingerprints(identity.processGroupId);
       if (![...current].some((fingerprint) => state.terminationWitnesses.has(fingerprint))) return;
       signalProcessGroup(identity.processGroupId, 'SIGKILL');
     } finally {
@@ -349,7 +365,7 @@ function requestTermination(
 }
 
 function observeProcessGroup(state: WrapperState): void {
-  const current = readLinuxProcessGroupFingerprints(state.identity.processGroupId);
+  const current = readProcessGroupFingerprints(state.identity.processGroupId);
   if (
     state.terminationWitnesses.size === 0
     || [...current].some((fingerprint) => state.terminationWitnesses.has(fingerprint))
@@ -362,8 +378,9 @@ function observeProcessGroup(state: WrapperState): void {
 
 /** A shell leader may exit after spawning ordinary background descendants in the same group. */
 async function terminateNaturalExitDescendants(state: WrapperState): Promise<void> {
+  if (process.platform === 'win32') return;
   const identity = state.identity;
-  const current = readLinuxProcessGroupFingerprints(identity.processGroupId);
+  const current = readProcessGroupFingerprints(identity.processGroupId);
   if (current.size === 0) return;
   // This runs immediately after the recorded group leader exits. A still-populated PGID is the
   // command's surviving process group; the kernel cannot recycle it while those members remain.
@@ -373,7 +390,7 @@ async function terminateNaturalExitDescendants(state: WrapperState): Promise<voi
   let remaining = current;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
-    remaining = readLinuxProcessGroupFingerprints(identity.processGroupId);
+    remaining = readProcessGroupFingerprints(identity.processGroupId);
     if (![...remaining].some((fingerprint) => state.terminationWitnesses.has(fingerprint))) return;
   }
   if ([...remaining].some((fingerprint) => state.terminationWitnesses.has(fingerprint))) {
@@ -382,6 +399,23 @@ async function terminateNaturalExitDescendants(state: WrapperState): Promise<voi
 }
 
 function signalProcessGroup(processGroupId: string, signal: NodeJS.Signals): void {
+  if (process.platform === 'win32') {
+    const pid = Number(processGroupId);
+    const result = spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+      encoding: 'utf8',
+      windowsHide: true
+    });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EPERM') return;
+      }
+      throw new Error(`taskkill failed for process tree ${pid}: ${(result.stderr || result.stdout || '').trim()}`);
+    }
+    return;
+  }
   try {
     process.kill(-Number(processGroupId), signal);
   } catch (error) {
@@ -399,7 +433,7 @@ function clearWatchdogTimers(state: WrapperState): void {
 
 async function awaitTerminationEscalation(state: WrapperState): Promise<void> {
   if (!state.forceKillTimer || state.forceKillDueAt === null) return;
-  const current = readLinuxProcessGroupFingerprints(state.identity.processGroupId);
+  const current = readProcessGroupFingerprints(state.identity.processGroupId);
   const originalGroupStillExists = [...current]
     .some((fingerprint) => state.terminationWitnesses.has(fingerprint));
   if (!originalGroupStillExists) {
@@ -414,7 +448,22 @@ async function awaitTerminationEscalation(state: WrapperState): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, Math.max(0, state.forceKillDueAt! - Date.now()) + 25));
 }
 
-function readLinuxProcessGroupFingerprints(processGroupId: string): Set<string> {
+function readProcessGroupFingerprints(processGroupId: string): Set<string> {
+  if (process.platform === 'win32') {
+    const fingerprints = new Set<string>();
+    try {
+      process.kill(Number(processGroupId), 0);
+      const fingerprint = windowsProcessFingerprints.get(processGroupId)
+        ?? readProcessStartFingerprint(processGroupId);
+      fingerprints.add(fingerprint);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ESRCH' && code !== 'EACCES' && code !== 'EPERM') {
+        throw error;
+      }
+    }
+    return fingerprints;
+  }
   const expectedGroup = BigInt(processGroupId);
   const fingerprints = new Set<string>();
   for (const entry of fs.readdirSync('/proc')) {
@@ -587,7 +636,8 @@ async function abortBlockedChild(
   exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 ): Promise<void> {
   try {
-    process.kill(-Number(childPid), 'SIGKILL');
+    if (process.platform === 'win32') signalProcessGroup(childPid, 'SIGKILL');
+    else process.kill(-Number(childPid), 'SIGKILL');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
   }
@@ -596,6 +646,34 @@ async function abortBlockedChild(
 
 function shellQuote(value: string): string {
   return `'${value.split("'").join("'\\''")}'`;
+}
+
+function spawnWindowsPowerShellCommand(
+  request: ProcessWrapperLaunchRequest,
+  spoolPath: string
+): ReturnType<typeof spawn> {
+  const gatePath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE);
+  const quotedGatePath = `'${gatePath.split("'").join("''")}'`;
+  const script = `$ProgressPreference = 'SilentlyContinue'; $gatePath = ${quotedGatePath}; while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }; Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ${request.command}`;
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return spawn('powershell.exe', [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-OutputFormat',
+    'Text',
+    '-EncodedCommand',
+    encoded
+  ], {
+    cwd: request.cwd,
+    // The Wrapper process itself is detached. A second detached PowerShell with piped output exits
+    // before the bootstrap gate on Windows, so it remains attached to the durable Wrapper.
+    detached: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true
+  });
 }
 
 function writeAtomicJson(filePath: string, value: unknown): void {
@@ -613,12 +691,7 @@ function writeAtomicBytes(filePath: string, bytes: Buffer): void {
     fs.closeSync(descriptor);
   }
   fs.renameSync(temporary, filePath);
-  const directory = fs.openSync(path.dirname(filePath), 'r');
-  try {
-    fs.fsyncSync(directory);
-  } finally {
-    fs.closeSync(directory);
-  }
+  syncDirectoryDurablySync(path.dirname(filePath));
 }
 
 function boundedErrorMessage(error: unknown): string {

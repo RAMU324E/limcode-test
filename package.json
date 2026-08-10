@@ -108,7 +108,9 @@
     "rebuild:sqlite:electron": "node scripts/reliable-kernel/rebuild-sqlite-electron.mjs",
     "check:local": "npm run check:plan && node scripts/reliable-kernel/run-local-tests.mjs",
     "vscode:prepublish": "npm run build && node scripts/reliable-kernel/prune-package-dist.mjs",
-    "package:local": "vsce package --allow-missing-repository"
+    "package:local": "vsce package --allow-missing-repository",
+    "package:linux": "vsce package --target linux-x64 --allow-missing-repository",
+    "package:win32": "vsce package --target win32-x64 --allow-missing-repository"
   },
   "devDependencies": {
     "@electron/rebuild": "4.2.0",

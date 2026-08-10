@@ -948,7 +948,20 @@ function validateClient(client, failures) {
 function validateTargets(targets, registry, failures) {
   if (targets?.usage !== 'single-user-local' || targets?.distribution !== 'manual-vsix') failures.push('目标只允许单用户本机手动VSIX');
   failures.push(...exactSetProblems('安装包要求出口', ['installed'], targets?.validation?.requiredAt ?? []));
-  if (targets?.localTarget?.platform !== 'linux' || targets?.localTarget?.arch !== 'x64') failures.push('当前正式目标必须是本机Linux x64');
+  if (targets?.localTarget?.platform !== 'linux' || targets?.localTarget?.arch !== 'x64') failures.push('本机性能基线目标必须保持Linux x64');
+  const artifactTargets = objectArray(targets?.artifactTargets, 'targets.artifactTargets', failures);
+  failures.push(...exactSetProblems(
+    'VSIX制品目标',
+    ['local-linux-x64', 'local-win32-x64'],
+    artifactTargets.map((entry) => entry.id)
+  ));
+  for (const target of artifactTargets) {
+    if (!['linux', 'win32'].includes(target.platform) || target.arch !== 'x64') {
+      failures.push(`VSIX制品目标无效：${target.id ?? '<missing>'}`);
+    }
+    if (target.extensionHostKind !== 'local') failures.push(`VSIX制品目标必须是本地Extension Host：${target.id ?? '<missing>'}`);
+  }
+  if ((targets?.unsupported ?? []).includes('windows')) failures.push('Windows已是正式VSIX目标，不能继续列为unsupported');
   const buildProvenance = targets?.validation?.buildProvenance;
   for (const field of ['commitSha', 'mainEntrySha256', 'worktreeClean']) if (!(buildProvenance?.fields ?? []).includes(field)) failures.push(`构建来源缺少${field}`);
   if (buildProvenance?.mainEntrySource !== 'VSIX内package.json.main') failures.push('制品校验必须从VSIX内package.json.main解析真实入口');

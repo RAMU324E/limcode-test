@@ -90,7 +90,9 @@ export const PHYSICAL_CUTOVER_MANIFEST: PhysicalCutoverManifest = Object.freeze(
 
 if (process.argv.includes('--check')) {
   const current = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
-  if (current !== generated) {
+  // Git may materialize tracked text as CRLF on Windows; compare semantic generated text rather
+  // than forcing every Windows checkout to rewrite an otherwise identical tracked file.
+  if (current.replace(/\r\n/g, '\n') !== generated) {
     console.error('generatedPhysicalCutoverManifest.ts与migration.json不一致；请运行 npm run generate:cutover-manifest。');
     process.exit(1);
   }

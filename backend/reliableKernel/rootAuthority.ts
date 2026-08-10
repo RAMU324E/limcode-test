@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
@@ -186,8 +187,7 @@ export class RootAuthority {
     await syncIfFile(next.paths.databasePath);
     await syncDirectory(next.paths.casRootPath);
     await syncDirectory(next.paths.dataRootPath);
-    await fs.rename(next.paths.rootPendingPath, next.paths.rootPointerPath);
-    await syncDirectory(path.dirname(next.paths.rootPointerPath));
+    await commitPendingBinding(next);
     return this.current();
   }
 
@@ -235,9 +235,11 @@ export class RootAuthority {
     measurement?: RootAuthorityValidationMeasurement
   ): Promise<RootBinding> {
     if (await exists(expected.rootPendingPath, measurement)) {
+      const recovered = await this.recoverCompletedPendingBinding(expected, measurement);
+      if (recovered) return recovered;
       throw new RootAuthorityError(
         'root-binding-pending',
-        `RootBinding pending marker exists; Runtime open is refused: ${expected.rootPendingPath}`
+        `RootBinding pending marker exists but its completed Runtime root cannot be verified: ${expected.rootPendingPath}`
       );
     }
     const binding = await readBindingFile(expected.rootPointerPath, measurement);
@@ -249,6 +251,33 @@ export class RootAuthority {
     }
     await validateEpoch(binding, measurement);
     return binding;
+  }
+
+  /**
+   * Recovers the narrow activation crash window after the database/CAS/epoch became durable but
+   * before root-binding.pending.json was renamed to root-binding.json. A pending binding is never
+   * guessed: the pointer must still be absent and the durable epoch identity must match exactly.
+   */
+  private async recoverCompletedPendingBinding(
+    expected: RuntimeRootPaths,
+    measurement?: RootAuthorityValidationMeasurement
+  ): Promise<RootBinding | undefined> {
+    if (await readBindingFile(expected.rootPointerPath, measurement)) return undefined;
+    const pending = await readBindingFile(expected.rootPendingPath, measurement);
+    if (!pending || !samePaths(pending.paths, expected)) return undefined;
+    if (!await isRegularFile(expected.databasePath) || !await isDirectory(expected.casRootPath)) {
+      return undefined;
+    }
+    try {
+      await validateEpoch(pending, measurement);
+    } catch {
+      return undefined;
+    }
+
+    await syncIfFile(expected.databasePath);
+    await syncDirectory(expected.casRootPath);
+    await syncDirectory(expected.dataRootPath);
+    return commitPendingBinding(pending, measurement);
   }
 
   private async validateAgainstExpectedPaths(
@@ -428,8 +457,7 @@ export class RootAuthority {
       await syncIfFile(paths.databasePath);
       await syncDirectory(paths.casRootPath);
       await syncDirectory(paths.dataRootPath);
-      await fs.rename(paths.rootPendingPath, paths.rootPointerPath);
-      await syncDirectory(path.dirname(paths.rootPointerPath));
+      await commitPendingBinding(binding);
     } catch (error) {
       // Pending intentionally remains. Startup must fail closed until an explicit candidate reset.
       throw new RootAuthorityError(
@@ -567,6 +595,24 @@ async function readHistoricalBindingFile(filePath: string): Promise<HistoricalRo
   }
 }
 
+async function commitPendingBinding(
+  expected: RootBinding,
+  measurement?: RootAuthorityValidationMeasurement
+): Promise<RootBinding> {
+  try {
+    await fs.rename(expected.paths.rootPendingPath, expected.paths.rootPointerPath);
+    await syncDirectory(path.dirname(expected.paths.rootPointerPath));
+  } catch (error) {
+    // A verified recovery in another Host may publish this exact generation first.
+    if (!isNotFound(error)) throw error;
+  }
+  const committed = await readBindingFile(expected.paths.rootPointerPath, measurement);
+  if (!committed || !sameBindingIdentity(committed, expected)) {
+    throw new StaleRootBindingError('A different RootBinding won pending activation publication.');
+  }
+  return committed;
+}
+
 async function writeDurableJson(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -582,7 +628,9 @@ async function writeDurableJson(filePath: string, value: unknown): Promise<void>
 }
 
 async function syncIfFile(filePath: string): Promise<void> {
-  const handle = await fs.open(filePath, 'r');
+  // Windows requires a writable file handle for FlushFileBuffers; opening the ordinary database
+  // read-only makes FileHandle.sync() report EPERM even though directory sync compatibility is fine.
+  const handle = await fs.open(filePath, 'r+');
   try {
     await handle.sync();
   } finally {
@@ -591,11 +639,24 @@ async function syncIfFile(filePath: string): Promise<void> {
 }
 
 async function syncDirectory(directoryPath: string): Promise<void> {
-  const handle = await fs.open(directoryPath, 'r');
+  await syncDirectoryDurably(directoryPath);
+}
+
+async function isRegularFile(filePath: string): Promise<boolean> {
   try {
-    await handle.sync();
-  } finally {
-    await handle.close();
+    return (await fs.stat(filePath)).isFile();
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
+}
+
+async function isDirectory(directoryPath: string): Promise<boolean> {
+  try {
+    return (await fs.stat(directoryPath)).isDirectory();
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
   }
 }
 

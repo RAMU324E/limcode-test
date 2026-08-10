@@ -2,6 +2,7 @@ import childProcess from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import zlib from 'node:zlib';
 
 const root = process.cwd();
 const artifact = option('artifact');
@@ -48,7 +49,12 @@ for (const rule of forbidden) {
   if (matches.length) failures.push(`${rule.id}: ${matches.slice(0, 8).join(', ')}${matches.length > 8 ? ` (+${matches.length - 8})` : ''}`);
 }
 
-const required = ['package.json', String(manifest.main ?? '').replace(/^\.\//, '')];
+const required = [
+  'package.json',
+  String(manifest.main ?? '').replace(/^\.\//, ''),
+  'node_modules/better-sqlite3/prebuilds/linux-x64.node',
+  'node_modules/better-sqlite3/prebuilds/win32-x64.node'
+];
 for (const file of required) if (!files.includes(file)) failures.push(`安装包缺少必需文件：${file}`);
 if (!files.some((file) => file.toLowerCase() === 'readme.md')) failures.push('安装包缺少README');
 if (!files.some((file) => /^license(?:\.[^/]+)?$/i.test(file))) failures.push('安装包缺少LICENSE');
@@ -88,27 +94,66 @@ function listArtifactFiles(relativeArtifactPath) {
     console.error(`VSIX内容检查失败：artifact不存在：${relativeArtifactPath}`);
     process.exit(1);
   }
-  const listed = childProcess.spawnSync('unzip', ['-Z1', absolute], {
-    cwd: root,
-    encoding: 'utf8',
-    maxBuffer: 32 * 1024 * 1024
-  });
-  const manifestResult = childProcess.spawnSync('unzip', ['-p', absolute, 'extension/package.json'], {
-    cwd: root,
-    encoding: 'utf8',
-    maxBuffer: 2 * 1024 * 1024
-  });
-  if (listed.error || listed.status !== 0 || manifestResult.error || manifestResult.status !== 0) {
-    console.error('VSIX内容检查失败：无法读取artifact ZIP清单或package.json。');
-    if (listed.stderr) console.error(listed.stderr.trim());
-    if (manifestResult.stderr) console.error(manifestResult.stderr.trim());
+  try {
+    const archive = readZipArchive(fs.readFileSync(absolute));
+    const manifestBytes = archive.read('extension/package.json');
+    if (!manifestBytes) throw new Error('extension/package.json不存在');
+    return {
+      files: archive.names
+        .map((file) => file.replace(/^extension\//, ''))
+        .filter((file) => file && file !== '[Content_Types].xml' && file !== 'extension.vsixmanifest'),
+      manifest: JSON.parse(manifestBytes.toString('utf8'))
+    };
+  } catch (error) {
+    console.error(`VSIX内容检查失败：无法读取artifact ZIP清单或package.json：${error.message}`);
     process.exit(1);
   }
+}
+
+/** Minimal ZIP central-directory reader; avoids a platform dependency on the external unzip CLI. */
+function readZipArchive(bytes) {
+  const endSignature = 0x06054b50;
+  const centralSignature = 0x02014b50;
+  const localSignature = 0x04034b50;
+  const minimumEndOffset = Math.max(0, bytes.length - 65_557);
+  let endOffset = -1;
+  for (let offset = bytes.length - 22; offset >= minimumEndOffset; offset -= 1) {
+    if (bytes.readUInt32LE(offset) === endSignature) {
+      endOffset = offset;
+      break;
+    }
+  }
+  if (endOffset < 0) throw new Error('ZIP end-of-central-directory记录缺失');
+  const entryCount = bytes.readUInt16LE(endOffset + 10);
+  let offset = bytes.readUInt32LE(endOffset + 16);
+  const entries = new Map();
+  for (let index = 0; index < entryCount; index += 1) {
+    if (bytes.readUInt32LE(offset) !== centralSignature) throw new Error('ZIP central-directory记录损坏');
+    const compressionMethod = bytes.readUInt16LE(offset + 10);
+    const compressedSize = bytes.readUInt32LE(offset + 20);
+    const fileNameLength = bytes.readUInt16LE(offset + 28);
+    const extraLength = bytes.readUInt16LE(offset + 30);
+    const commentLength = bytes.readUInt16LE(offset + 32);
+    const localHeaderOffset = bytes.readUInt32LE(offset + 42);
+    const name = bytes.subarray(offset + 46, offset + 46 + fileNameLength).toString('utf8');
+    entries.set(name, { compressionMethod, compressedSize, localHeaderOffset });
+    offset += 46 + fileNameLength + extraLength + commentLength;
+  }
   return {
-    files: lines(listed.stdout)
-      .map((file) => file.replace(/^extension\//, ''))
-      .filter((file) => file && file !== '[Content_Types].xml' && file !== 'extension.vsixmanifest'),
-    manifest: JSON.parse(manifestResult.stdout)
+    names: [...entries.keys()].sort(),
+    read(name) {
+      const entry = entries.get(name);
+      if (!entry) return undefined;
+      const localOffset = entry.localHeaderOffset;
+      if (bytes.readUInt32LE(localOffset) !== localSignature) throw new Error(`ZIP local header损坏：${name}`);
+      const localNameLength = bytes.readUInt16LE(localOffset + 26);
+      const localExtraLength = bytes.readUInt16LE(localOffset + 28);
+      const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+      const compressed = bytes.subarray(dataOffset, dataOffset + entry.compressedSize);
+      if (entry.compressionMethod === 0) return Buffer.from(compressed);
+      if (entry.compressionMethod === 8) return zlib.inflateRawSync(compressed);
+      throw new Error(`ZIP compression method不支持：${entry.compressionMethod}`);
+    }
   };
 }
 

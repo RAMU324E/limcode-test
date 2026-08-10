@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { createReadStream, rmSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -802,8 +803,7 @@ async function sha256File(file: string): Promise<string> {
 }
 
 async function syncDirectory(directory: string): Promise<void> {
-  const handle = await fs.open(directory, 'r');
-  try { await handle.sync(); } finally { await handle.close(); }
+  await syncDirectoryDurably(directory);
 }
 
 async function exists(file: string): Promise<boolean> {

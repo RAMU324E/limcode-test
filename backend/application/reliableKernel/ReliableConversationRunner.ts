@@ -1608,4 +1608,19 @@ function defaultErrorHandler(
   }
 ): void {
   console.error('[LimCode] Reliable conversation runner failed.', context, error);
+  if (!error || typeof error !== 'object') return;
+  if ('originalError' in error) {
+    console.error(
+      '[LimCode] Reliable conversation runner original error.',
+      context,
+      (error as { originalError?: unknown }).originalError
+    );
+  }
+  if ('terminalError' in error) {
+    console.error(
+      '[LimCode] Reliable conversation runner terminal-state error.',
+      context,
+      (error as { terminalError?: unknown }).terminalError
+    );
+  }
 }

@@ -255,7 +255,10 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.activeWebview = webview;
     const requestSeq = ++this.historyRequestSeq;
     return this.postSidebarState(webview, scopeKind, cursor, limit, projectFolderUri, requestSeq)
-      .catch((error) => console.warn('[LimCode] Failed to read sidebar state.', error));
+      .catch((error) => {
+        console.warn('[LimCode] Failed to read sidebar state.', error);
+        this.renderUnavailable(error instanceof Error ? error.message : String(error));
+      });
   }
 
   private scheduleConversationHistoryRefresh(): void {

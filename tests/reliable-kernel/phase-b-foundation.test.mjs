@@ -145,6 +145,8 @@ test('进程在SQLite commit前退出不会留下半事务', async () => {
   }
 });
 
+const CAS_DIRECTORY_FSYNC_PER_PUBLISH = process.platform === 'win32' ? 0 : 8;
+
 const CAS_METRICS = [
   'lookup-hit',
   'lookup-miss',
@@ -170,7 +172,7 @@ test('CAS duplicate prepare命中SQLite fast path且不publish/fsync', async () 
       publish: 1,
       'temp-write': 1,
       'file-fsync': 1,
-      'directory-fsync': 8
+      'directory-fsync': CAS_DIRECTORY_FSYNC_PER_PUBLISH
     });
     assert.equal(snapshots.read() - coldSnapshots, 1);
 
@@ -216,7 +218,7 @@ test('CAS prepareBatch一次worker snapshot并在publish前去重mixed identitie
       publish: 2,
       'temp-write': 2,
       'file-fsync': 2,
-      'directory-fsync': 16
+      'directory-fsync': CAS_DIRECTORY_FSYNC_PER_PUBLISH * 2
     });
     assert.equal(prepared.length, inputs.length);
     assert.equal(prepared[0].insert, undefined);
@@ -262,7 +264,7 @@ test('CAS concurrent first ingest保留唯一ContentObject并清理所有temp', 
     assert.equal(measured.publish, measured['lookup-miss']);
     assert.equal(measured['temp-write'], measured.publish);
     assert.equal(measured['file-fsync'], measured.publish);
-    assert.equal(measured['directory-fsync'], measured.publish * 8);
+    assert.equal(measured['directory-fsync'], measured.publish * CAS_DIRECTORY_FSYNC_PER_PUBLISH);
     const rows = await database.snapshot([
       kernel.DOMAIN_REPOSITORIES.domain('ContentObject').list({
         where: { id: results[0].id },
@@ -322,7 +324,7 @@ test('CAS orphan EEXIST继续校验且错误digest不产生SQLite引用', async 
       publish: 1,
       'temp-write': 1,
       'file-fsync': 1,
-      'directory-fsync': 8
+      'directory-fsync': CAS_DIRECTORY_FSYNC_PER_PUBLISH
     });
     await database.transaction([prepared.insert]);
 
@@ -345,7 +347,8 @@ test('CAS orphan EEXIST继续校验且错误digest不产生SQLite引用', async 
     assert.equal(corruptMetrics.publish, 1);
     assert.equal(corruptMetrics['temp-write'], 1);
     assert.equal(corruptMetrics['file-fsync'], 1);
-    assert.ok(corruptMetrics['directory-fsync'] > 0);
+    if (process.platform === 'win32') assert.equal(corruptMetrics['directory-fsync'], 0);
+    else assert.ok(corruptMetrics['directory-fsync'] > 0);
     const absent = await database.snapshot([repository.get(identity.id)]);
     assert.equal(absent.snapshot[0], null);
     assert.deepEqual(await fs.readdir(path.join(binding.paths.casRootPath, 'tmp')), []);

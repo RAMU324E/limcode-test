@@ -66,6 +66,7 @@ Module._load = function loadWithVscodeMock(request, parent, isMain) {
 
 const revision = require('../backend/capabilities/vscodeStorage/storageRevision.ts');
 const recordStore = require('../backend/capabilities/vscodeStorage/recordStore.ts');
+const syncStorageResourceLock = require('../backend/capabilities/vscodeStorage/syncStorageResourceLock.ts');
 const globalSettings = require('../backend/capabilities/vscodeStorage/globalSettings.ts');
 const globalStatus = require('../backend/capabilities/vscodeStorage/globalStatus.ts');
 
@@ -123,7 +124,9 @@ test('旧窗口不能覆盖 record 设置集合的新提交', async () => {
   }
 });
 
-test('Windows rename 返回 EPERM 时会按已有锁竞争等待并重试', async () => {
+test('Windows rename 返回 EPERM 时会按已有锁竞争等待并重试', {
+  skip: process.platform !== 'win32'
+}, async () => {
   const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-win-contention-'));
   const transactionPath = path.join(tempRoot, 'authority');
   const lockPath = `${transactionPath}.lock`;
@@ -171,6 +174,106 @@ test('Windows rename 返回 EPERM 时会按已有锁竞争等待并重试', asyn
     );
   } finally {
     fsp.rename = originalRename;
+    await fsp.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Windows 释放锁目录遇到精确的瞬态 rename busy 会有界重试', {
+  skip: process.platform !== 'win32'
+}, async () => {
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-win-release-'));
+  const transactionPath = path.join(tempRoot, 'authority');
+  const lockPath = `${transactionPath}.lock`;
+  const originalRename = fsp.rename;
+  let injectedReleaseErrors = 0;
+  try {
+    fsp.rename = async (source, destination) => {
+      const isRelease = source === lockPath
+        && String(destination).startsWith(`${lockPath}.generation-owner-`);
+      if (isRelease && injectedReleaseErrors < 3) {
+        injectedReleaseErrors += 1;
+        throw Object.assign(new Error(`EPERM: operation not permitted, rename '${source}' -> '${destination}'`), {
+          code: 'EPERM',
+          syscall: 'rename',
+          path: source,
+          dest: destination
+        });
+      }
+      return originalRename(source, destination);
+    };
+
+    let actionRuns = 0;
+    await recordStore.withRecordStoreTransaction(MockUri.file(transactionPath), async () => {
+      actionRuns += 1;
+    });
+    assert.equal(actionRuns, 1);
+    assert.equal(injectedReleaseErrors, 3);
+    assert.deepEqual(
+      (await fsp.readdir(tempRoot)).filter((entry) => entry.startsWith('authority.lock')),
+      []
+    );
+  } finally {
+    fsp.rename = originalRename;
+    await fsp.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Windows 同步资源锁同样精确识别获取竞争并重试释放 rename', {
+  skip: process.platform !== 'win32'
+}, async () => {
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-sync-lock-win-'));
+  const resourcePath = path.join(tempRoot, 'authority.json');
+  const lockPath = `${resourcePath}.lock`;
+  const originalRenameSync = fs.renameSync;
+  let publicationErrors = 0;
+  let releaseErrors = 0;
+  try {
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
+      ownerToken: 'competing-owner',
+      pid: process.pid,
+      createdAt: Date.now(),
+      resource: path.resolve(resourcePath)
+    })}\n`);
+
+    fs.renameSync = function injectedRenameSync(source, destination) {
+      const sourceText = String(source);
+      const destinationText = String(destination);
+      const isPublication = destinationText === lockPath
+        && sourceText.startsWith(`${lockPath}.candidate-`);
+      if (isPublication && publicationErrors < 2) {
+        publicationErrors += 1;
+        throw Object.assign(new Error('EPERM: injected sync lock contention'), {
+          code: 'EPERM', syscall: 'rename', path: sourceText, dest: destinationText
+        });
+      }
+      if (isPublication && fs.existsSync(lockPath)) {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+      }
+      const isRelease = sourceText === lockPath
+        && destinationText.startsWith(`${lockPath}.generation-owner-`);
+      if (isRelease && releaseErrors < 3) {
+        releaseErrors += 1;
+        throw Object.assign(new Error('EACCES: injected sync lock release contention'), {
+          code: 'EACCES', syscall: 'rename', path: sourceText, dest: destinationText
+        });
+      }
+      return originalRenameSync.call(this, source, destination);
+    };
+
+    let actionRuns = 0;
+    syncStorageResourceLock.withSyncStorageResourceLock(resourcePath, () => {
+      actionRuns += 1;
+    }, { waitMs: 1_000, pollIntervalMs: 1, maxRetries: 6, retryDelayMs: 1 });
+    assert.equal(actionRuns, 1);
+    assert.equal(publicationErrors, 2);
+    assert.equal(releaseErrors, 3);
+    assert.deepEqual(
+      (await fsp.readdir(tempRoot)).filter((entry) => entry.startsWith('authority.json.lock')),
+      []
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
     await fsp.rm(tempRoot, { recursive: true, force: true });
   }
 });

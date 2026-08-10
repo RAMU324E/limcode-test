@@ -166,12 +166,12 @@ test('同步 JSON 同样在替换目标文件前先确认临时文件', async ()
   }
 });
 
-test('只有明确不支持 fsync 时才降级并继续原子替换', async () => {
+test('普通文件 fsync 即使报告不支持也会保持严格并阻止替换', async () => {
   const tempRoot = await makeTempDir();
   const originalOpen = fsp.open;
-  const originalWarn = console.warn;
   try {
     const target = path.join(tempRoot, 'settings.json');
+    await fsp.writeFile(target, JSON.stringify({ previous: true }));
     fsp.open = async function unsupportedOpen(openTarget, ...rest) {
       const handle = await originalOpen.call(this, openTarget, ...rest);
       if (String(openTarget).endsWith('.tmp')) {
@@ -183,13 +183,13 @@ test('只有明确不支持 fsync 时才降级并继续原子替换', async () =
       }
       return handle;
     };
-    console.warn = () => undefined;
-
-    await durableWrite.writeFileAtomicDurable(target, JSON.stringify({ replacement: true }));
-    assert.deepEqual(JSON.parse(await fsp.readFile(target, 'utf8')), { replacement: true });
+    await assert.rejects(
+      durableWrite.writeFileAtomicDurable(target, JSON.stringify({ replacement: true })),
+      (error) => error.code === 'ENOTSUP'
+    );
+    assert.deepEqual(JSON.parse(await fsp.readFile(target, 'utf8')), { previous: true });
   } finally {
     fsp.open = originalOpen;
-    console.warn = originalWarn;
     await removeTempDir(tempRoot);
   }
 });

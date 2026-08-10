@@ -66,8 +66,31 @@ jobs:
       - name: Run tracked critical tests
         run: npm run test:ci:linux
 
+  windows-runtime-tests:
+    name: Windows runtime compatibility tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.15.1
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile extension
+        run: npm run compile
+
+      - name: Run Windows storage and Wrapper regressions
+        run: node --test --test-concurrency=1 tests/settingsRevisionConflict.test.cjs tests/reliable-kernel/windows-runtime-compatibility.test.mjs
+
   linux-vsix-surface:
-    name: Linux VSIX package surface
+    name: Linux and Windows VSIX package surfaces
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -83,8 +106,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build VSIX
-        run: npm run package:local -- --out limcode-test-ci.vsix
+      - name: Build Linux VSIX
+        run: npm run package:linux -- --out limcode-test-linux-x64-ci.vsix
 
-      - name: Check packaged files
-        run: npm run check:package:surface -- --artifact limcode-test-ci.vsix
+      - name: Check Linux packaged files
+        run: npm run check:package:surface -- --artifact limcode-test-linux-x64-ci.vsix
+
+      - name: Build Windows VSIX
+        run: npm run package:win32 -- --out limcode-test-win32-x64-ci.vsix
+
+      - name: Check Windows packaged files
+        run: npm run check:package:surface -- --artifact limcode-test-win32-x64-ci.vsix

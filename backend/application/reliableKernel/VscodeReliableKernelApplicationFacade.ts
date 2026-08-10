@@ -294,6 +294,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return this.startHydration();
   }
 
+  public async conversationExists(conversationId: string): Promise<boolean> {
+    this.requireOpen();
+    return !!await this.maybeRow('Conversation', conversationId);
+  }
+
   public getConversationDisplayTitle(conversationId: string | undefined): string {
     if (!conversationId) return DEFAULT_CONVERSATION_TITLE;
     const entry = this.historyEntries.find((candidate) => candidate.id === conversationId);

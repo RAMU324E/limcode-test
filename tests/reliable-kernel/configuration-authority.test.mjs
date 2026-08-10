@@ -361,6 +361,59 @@ test('Workspace同步修复悬空WorkEnvironmentPolicy默认项并保留disabled
   }
 });
 
+test('不相关的旧压缩配置不会阻塞 Agent、Workflow 与 ConfigurationSnapshot 投影', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-agent-projection-isolation-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const compressionRoot = path.join(paths.settingsRootUri.fsPath, 'llm-compression-configs');
+    const recordsRoot = path.join(compressionRoot, 'records');
+    const recordFile = 'records/legacy-compression.json';
+    const savedAt = new Date().toISOString();
+    await fs.mkdir(recordsRoot, { recursive: true });
+    await fs.writeFile(path.join(compressionRoot, 'index.json'), `${JSON.stringify({
+      schemaVersion: 1,
+      savedAt,
+      records: [{ id: 'legacy-compression', file: recordFile, updatedAt: savedAt }]
+    }, null, 2)}\n`);
+    await fs.writeFile(path.join(compressionRoot, ...recordFile.split('/')), `${JSON.stringify({
+      schemaVersion: 1,
+      savedAt,
+      config: {
+        id: 'legacy-compression',
+        name: 'Legacy compression',
+        kind: 'segmented_summary',
+        trigger: {
+          mode: 'token_threshold',
+          thresholdUnit: 'percent',
+          thresholdPercent: 90,
+          preserveLatestMessages: 8,
+          reserveLatestUserMessageTokens: 20_000
+        },
+        llmSummary: { targetTokens: 2_000 },
+        createdAt: 1,
+        updatedAt: 1
+      }
+    }, null, 2)}\n`);
+
+    const agents = await authority.agents();
+    assert.ok(agents.some((agent) => agent.id === 'main'));
+    const resolvedAgent = await authority.resolveAgent({ agentType: 'main' });
+    assert.equal(resolvedAgent.agentId, 'main');
+    const workflow = await authority.workflow('builtin:plan');
+    assert.equal(workflow.id, 'builtin:plan');
+    const snapshot = await authority.configurationClientState();
+    assert.ok(snapshot.agents.some((agent) => agent.id === 'main'));
+    assert.ok(snapshot.workflows.some((candidate) => candidate.id === 'builtin:plan'));
+    await assert.rejects(
+      authority.loadGlobalSettings('llmCompressionConfigs'),
+      /removed message-count\/user-reserve fields/
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('压缩配置 hard-cut 旧保留字段并冻结压缩 Provider 自己的窗口与输出上限', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-compression-config-cutover-'));
   try {

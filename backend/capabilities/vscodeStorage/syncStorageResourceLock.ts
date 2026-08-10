@@ -105,7 +105,7 @@ function acquireSyncStorageResourceLock(resourcePath: string, options: Normalize
       createLockDirectory(lockPath, metadata, options);
       return { lockPath, metadata };
     } catch (error) {
-      if (!isLockContentionError(error)) throw error;
+      if (!isLockContentionError(error, lockPath)) throw error;
       if (recoverExistingLockDirectory(lockPath, options)) continue;
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for sync storage resource lock: ${lockPath}`);
       sleepSync(Math.min(options.pollIntervalMs, Math.max(1, deadline - Date.now())));
@@ -123,7 +123,7 @@ function releaseSyncStorageResourceLock(lock: AcquiredSyncLockDirectory, options
 
   const quarantinePath = generationQuarantinePath(lock.lockPath, `owner-${lock.metadata.ownerToken}`);
   try {
-    fs.renameSync(lock.lockPath, quarantinePath);
+    renameLockGenerationSync(lock.lockPath, quarantinePath, options);
   } catch (error) {
     if (isFileNotFoundError(error) || isAlreadyExistsError(error)) {
       throw new Error(`Sync storage resource lock generation changed before release; newer owner is preserved: ${lock.lockPath}`);
@@ -294,8 +294,55 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function isLockContentionError(error: unknown): boolean {
-  return isAlreadyExistsError(error) || isTransientFileBusyError(error);
+function isLockContentionError(error: unknown, lockPath: string): boolean {
+  if (isAlreadyExistsError(error)) return true;
+  if (process.platform !== 'win32') return false;
+  const candidate = error as { code?: unknown; syscall?: unknown; dest?: unknown };
+  if (
+    candidate.code !== 'EPERM'
+    || candidate.syscall !== 'rename'
+    || typeof candidate.dest !== 'string'
+    || path.resolve(candidate.dest) !== path.resolve(lockPath)
+  ) return false;
+  try {
+    return fs.statSync(lockPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function renameLockGenerationSync(
+  sourcePath: string,
+  destinationPath: string,
+  options: NormalizedSyncStorageResourceLockOptions
+): void {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.renameSync(sourcePath, destinationPath);
+      return;
+    } catch (error) {
+      if (
+        attempt >= options.maxRetries
+        || !isExpectedWindowsLockReleaseRenameError(error, sourcePath, destinationPath)
+      ) throw error;
+      sleepSync(options.retryDelayMs);
+    }
+  }
+}
+
+function isExpectedWindowsLockReleaseRenameError(
+  error: unknown,
+  sourcePath: string,
+  destinationPath: string
+): boolean {
+  if (process.platform !== 'win32') return false;
+  const candidate = error as { code?: unknown; syscall?: unknown; path?: unknown; dest?: unknown };
+  return (candidate.code === 'EPERM' || candidate.code === 'EACCES' || candidate.code === 'EBUSY')
+    && candidate.syscall === 'rename'
+    && typeof candidate.path === 'string'
+    && path.resolve(candidate.path) === path.resolve(sourcePath)
+    && typeof candidate.dest === 'string'
+    && path.resolve(candidate.dest) === path.resolve(destinationPath);
 }
 
 function isAlreadyExistsError(error: unknown): boolean {
