@@ -14,6 +14,11 @@ import {
 import type { PlainData } from '../../shared/plainData';
 import { buildFileDiffRecord } from '../capabilities/fileDiff';
 import {
+  initialGuidancePosition,
+  parseInputTurnIntentEnvelopeText,
+  TURN_INTENT_ENVELOPE_CONTENT_TYPE
+} from './guidanceIntent';
+import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
   CLIENT_CHANGE_BATCH_MAX_BYTES,
   CLIENT_CHANGE_BATCH_MAX_RECORDS,
@@ -952,7 +957,6 @@ interface MessageContentMetadataWaiter {
 
 const PROCESS_DETAIL_INDEX_CACHE_ENTRIES = 8;
 const MESSAGE_CONTENT_METADATA_CACHE_ENTRIES = 1_024;
-const TURN_INTENT_PREVIEW_PREFIX_BYTES = 16 * 1024;
 const TURN_INTENT_PREVIEW_TEXT_CHARACTERS = 512;
 
 /** On-demand CAS detail reader with an actual wire-byte response cap. */
@@ -1508,61 +1512,65 @@ export class ClientDetailReader {
     recordId: string,
     conversationId?: string | null
   ): Promise<Buffer> {
-    const contentObjectId = await this.turnIntentContentObjectId(recordId, conversationId);
-    const metadata = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
-    const totalBytes = runtimeNonNegativeSafeInteger(
-      metadata.byte_length,
-      'TurnIntent ContentObject.byte_length'
-    );
-    const prefix = await this.contentStore.readChunk(
-      metadata,
-      0,
-      Math.min(totalBytes, TURN_INTENT_PREVIEW_PREFIX_BYTES)
-    );
-    const source = prefix.chunk.toString('utf8');
+    const current = await this.turnIntentCurrentContent(recordId, conversationId);
+    let metadata = await this.requireExisting(
+      'ContentObject',
+      current.contentObjectId
+    ) as ContentObjectMetadata;
+    let position = initialGuidancePosition(requirePhaseFText(current.intent.created_at, 'TurnIntent.created_at'));
+    let hold: 'none' | 'paused' = 'none';
+    if (metadata.content_type === TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
+      const envelope = parseInputTurnIntentEnvelopeText(
+        (await this.contentStore.read(metadata)).toString('utf8')
+      );
+      if (!envelope) throw new Error(`TurnIntent ${recordId} is not an ordinary guidance message.`);
+      metadata = await this.requireExisting(
+        'ContentObject',
+        envelope.messageContentObjectId
+      ) as ContentObjectMetadata;
+      position = envelope.guidance.position;
+      hold = envelope.guidance.hold;
+    }
+    const source = (await this.contentStore.read(metadata)).toString('utf8');
     let text = '';
     let hasAttachments = false;
     if (metadata.content_type === 'application/vnd.limcode.message+json') {
-      hasAttachments = source.includes('"inlineData"') || totalBytes > prefix.chunk.byteLength;
-      if (totalBytes <= prefix.chunk.byteLength) {
-        try {
-          const parsed = JSON.parse(source) as { parts?: unknown };
-          if (Array.isArray(parsed.parts)) {
-            text = parsed.parts.flatMap((part) => {
-              if (!part || typeof part !== 'object' || Array.isArray(part)) return [];
-              const value = (part as { text?: unknown }).text;
-              return typeof value === 'string' ? [value] : [];
-            }).join('');
-            hasAttachments = parsed.parts.some((part) =>
-              Boolean(part && typeof part === 'object' && !Array.isArray(part) && 'inlineData' in part)
-            );
-          }
-        } catch {
-          text = '';
+      try {
+        const parsed = JSON.parse(source) as { parts?: unknown };
+        if (Array.isArray(parsed.parts)) {
+          text = parsed.parts.flatMap((part) => {
+            if (!part || typeof part !== 'object' || Array.isArray(part)) return [];
+            const value = part as { text?: unknown; thought?: unknown };
+            return typeof value.text === 'string' && value.thought !== true ? [value.text] : [];
+          }).join('');
+          hasAttachments = parsed.parts.some((part) =>
+            Boolean(
+              part
+              && typeof part === 'object'
+              && !Array.isArray(part)
+              && ('inlineData' in part || 'fileData' in part)
+            )
+          );
         }
-      } else {
-        const textLiteral = source.match(/"text"\s*:\s*("(?:\\.|[^"\\])*")/u)?.[1];
-        if (textLiteral) {
-          try {
-            const parsed = JSON.parse(textLiteral) as unknown;
-            if (typeof parsed === 'string') text = parsed;
-          } catch {
-            text = '';
-          }
-        }
+      } catch {
+        text = '';
       }
     } else {
       text = source;
     }
-    const characters = Array.from(text.trim());
-    const truncated = totalBytes > prefix.chunk.byteLength
-      || characters.length > TURN_INTENT_PREVIEW_TEXT_CHARACTERS;
+    const editorText = text.trim();
+    const characters = Array.from(editorText);
+    const truncated = characters.length > TURN_INTENT_PREVIEW_TEXT_CHARACTERS;
     const visibleText = characters.slice(0, TURN_INTENT_PREVIEW_TEXT_CHARACTERS).join('');
     return Buffer.from(JSON.stringify({
-      version: 1,
+      version: 2,
       text: visibleText,
+      editorText,
       hasAttachments,
-      truncated
+      truncated,
+      revisionSeq: current.revisionSeq,
+      position,
+      hold
     }), 'utf8');
   }
 
@@ -1614,10 +1622,10 @@ export class ClientDetailReader {
     }
   }
 
-  private async turnIntentContentObjectId(
+  private async turnIntentCurrentContent(
     recordId: string,
     conversationId?: string | null
-  ): Promise<string> {
+  ): Promise<{ contentObjectId: string; revisionSeq: string; intent: DomainRow }> {
     const intent = await this.requireExisting('TurnIntent', recordId);
     const scopedConversationId = conversationId == null
       ? null
@@ -1645,10 +1653,17 @@ export class ClientDetailReader {
     if (!Array.isArray(revisions) || revisions.length !== 1) {
       throw new Error(`TurnIntent ${recordId} does not have one current content revision.`);
     }
-    return requirePhaseFId(
-      revisions[0]!.content_object_id,
-      'TurnIntentRevision.content_object_id'
-    );
+    return {
+      contentObjectId: requirePhaseFId(
+        revisions[0]!.content_object_id,
+        'TurnIntentRevision.content_object_id'
+      ),
+      revisionSeq: requireRuntimeNonNegativeBigInt(
+        revisions[0]!.revision_seq,
+        'TurnIntentRevision.revision_seq'
+      ).toString(),
+      intent
+    };
   }
 
   private async compressionObjectId(

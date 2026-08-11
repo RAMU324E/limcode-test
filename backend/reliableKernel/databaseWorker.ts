@@ -560,7 +560,14 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
 
 function projectQueuedTurnIntentRecord(database: Database.Database, intentId: string): DomainRow | null {
   const rows = queryPlainRows(database, `
-    SELECT intent.*
+    SELECT intent.*,
+           (
+             SELECT CAST(revision.revision_seq AS TEXT)
+               FROM turn_intent_revision AS revision
+              WHERE revision.intent_id = intent.id
+              ORDER BY revision.revision_seq DESC
+              LIMIT 1
+           ) AS current_revision_seq
       FROM turn_intent AS intent
      WHERE intent.id = @intentId
        AND intent.state = 'queued'
@@ -2529,7 +2536,14 @@ function executeClientProjectionSnapshot(
        LIMIT @limit
     `, params);
     const queuedTurnIntents = queryPlainRows(database, `
-      SELECT intent.*
+      SELECT intent.*,
+             (
+               SELECT CAST(revision.revision_seq AS TEXT)
+                 FROM turn_intent_revision AS revision
+                WHERE revision.intent_id = intent.id
+                ORDER BY revision.revision_seq DESC
+                LIMIT 1
+             ) AS current_revision_seq
         FROM turn_intent AS intent
        WHERE intent.conversation_id = @conversationId
          AND intent.state = 'queued'

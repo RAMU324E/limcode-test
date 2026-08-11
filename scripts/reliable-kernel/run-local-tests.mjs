@@ -16,6 +16,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/command-router-interaction.test.mjs',
   'tests/reliable-kernel/child-agent-status-controls.test.cjs',
   'tests/reliable-kernel/frontend-copy-guardrails.test.cjs',
+  'tests/reliable-kernel/guidance-queue.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',

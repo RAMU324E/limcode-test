@@ -8,6 +8,12 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
+  compareGuidancePositions,
+  initialGuidancePosition,
+  parseInputTurnIntentEnvelopeText,
+  TURN_INTENT_ENVELOPE_CONTENT_TYPE
+} from './guidanceIntent';
+import {
   EffectControlPlane,
   type FrozenToolCallPolicyDecision,
   type ToolOutcomeStatus,
@@ -29,6 +35,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
+  isTurnTerminalGuidanceConflictError,
   isTurnTerminalInputConflictError,
   TurnControlPlane,
   type TurnInputCommand
@@ -532,6 +539,21 @@ export class ReliableAgentLoop {
             assistantMessageIds,
             toolCallIds,
             waitingToolCallId: batchDispatch.toolCallId
+          };
+        }
+        if (await this.completeForQueuedGuidance({
+          turnId,
+          conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+          round,
+          modelRequestId
+        })) {
+          const terminalTurn = await this.requireExisting('Turn', turnId);
+          return {
+            turnId,
+            terminalStatus: await this.readLoopTerminalStatus(turnId, terminalTurn),
+            modelRequestIds,
+            assistantMessageIds,
+            toolCallIds
           };
         }
         requestSequence += 1n;
@@ -1360,6 +1382,118 @@ export class ReliableAgentLoop {
     const terminal = await this.effects.readTerminalResult(toolCallId, true);
     if (!terminal) throw new Error(`ToolCall ${toolCallId} has no terminal model result.`);
     return terminal;
+  }
+
+  private async completeForQueuedGuidance(input: {
+    turnId: string;
+    conversationId: string;
+    round: string;
+    modelRequestId: string;
+  }): Promise<boolean> {
+    for (;;) {
+      const guidance = await this.oldestQueuedGuidanceIntent(input.conversationId);
+      if (!guidance) return false;
+      const guidanceIntentId = requireId(guidance.intent.id, 'Queued guidance TurnIntent.id');
+      if (await this.terminateIfRequested(
+        input.turnId,
+        `round:${input.round}:before-guidance-handoff:${guidanceIntentId}`
+      )) return true;
+      this.observeLifecycle({
+        turnId: input.turnId,
+        stage: 'turn_terminal_started',
+        round: input.round,
+        modelRequestId: input.modelRequestId
+      });
+      try {
+        await this.turns.terminal({
+          source: {
+            kind: 'internal',
+            key: `agent-loop:${input.turnId}:guidance-handoff:${guidanceIntentId}:${input.modelRequestId}`
+          },
+          turnId: input.turnId,
+          terminalStatus: 'completed',
+          reason: 'queued_guidance_after_tool_batch',
+          handoffQueuedIntentId: guidanceIntentId,
+          handoffQueuedIntentRevisionIds: guidance.revisionIds
+        });
+        this.observeLifecycle({
+          turnId: input.turnId,
+          stage: 'turn_terminal_completed',
+          round: input.round,
+          modelRequestId: input.modelRequestId
+        });
+        return true;
+      } catch (error) {
+        if (isTurnTerminalGuidanceConflictError(error)) continue;
+        if (isTurnTerminalInputConflictError(error)) {
+          if (await this.terminateIfRequested(
+            input.turnId,
+            `round:${input.round}:guidance-handoff-conflict:${guidanceIntentId}`
+          )) return true;
+          if (await this.absorbRuntimeDeliveryInputs(input.turnId) > 0) continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  private async oldestQueuedGuidanceIntent(conversationId: string): Promise<{
+    intent: DomainRow;
+    revisionIds: string[];
+  } | null> {
+    const [queued, childIntentLinks] = await Promise.all([
+      listAllDomainRows(this.database, 'TurnIntent', { conversation_id: conversationId }),
+      listAllDomainRows(this.database, 'ChildExecutionIntentLink', { state: 'pending' })
+    ]);
+    const childIntentIds = new Set(childIntentLinks.map((link) =>
+      requireId(link.turn_intent_id, 'ChildExecutionIntentLink.turn_intent_id')
+    ));
+    const candidates = queued
+      .filter((intent) => intent.state === 'queued' && intent.turn_id === null)
+      .filter((intent) => !childIntentIds.has(requireId(intent.id, 'TurnIntent.id')));
+    const guidance: Array<{
+      intent: DomainRow;
+      position: string;
+      hold: 'none' | 'paused';
+      revisionIds: string[];
+    }> = [];
+    for (const candidate of candidates) {
+      const intentId = requireId(candidate.id, 'TurnIntent.id');
+      const revisions = await listAllDomainRows(this.database, 'TurnIntentRevision', { intent_id: intentId });
+      if (revisions.length === 0) throw new Error(`Queued TurnIntent ${intentId} has no frozen revision.`);
+      const current = [...revisions].sort((left, right) =>
+        compareInteger(right.revision_seq, left.revision_seq)
+      )[0]!;
+      const contentObject = await this.requireExisting(
+        'ContentObject',
+        requireId(current.content_object_id, 'TurnIntentRevision.content_object_id')
+      );
+      if (contentObject.content_type !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
+        guidance.push({
+          intent: candidate,
+          position: initialGuidancePosition(requireText(candidate.created_at, 'TurnIntent.created_at')),
+          hold: 'none',
+          revisionIds: revisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
+        });
+        continue;
+      }
+      const metadata = contentObject as unknown as ContentObjectMetadata;
+      const envelope = parseInputTurnIntentEnvelopeText(
+        (await this.contentStore.read(metadata)).toString('utf8')
+      );
+      if (!envelope) continue;
+      guidance.push({
+        intent: candidate,
+        position: envelope.guidance.position,
+        hold: envelope.guidance.hold,
+        revisionIds: revisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
+      });
+    }
+    return guidance
+      .filter((entry) => entry.hold === 'none')
+      .sort((left, right) => compareGuidancePositions(left.position, right.position)
+        || String(left.intent.created_at).localeCompare(String(right.intent.created_at))
+        || String(left.intent.id).localeCompare(String(right.intent.id)))[0] ?? null;
   }
 
   private async absorbRuntimeDeliveryInputs(turnId: string): Promise<number> {

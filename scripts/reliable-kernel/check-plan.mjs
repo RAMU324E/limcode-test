@@ -62,6 +62,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/current-turn-task-projection.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/frontend-copy-guardrails.test.cjs',
+  'tests/reliable-kernel/guidance-queue.test.mjs',
   'tests/reliable-kernel/llm-capability-provider-adapter.test.mjs',
   'tests/reliable-kernel/model-system-prompt-prefix.test.mjs',
   'tests/reliable-kernel/phase-b-foundation.test.mjs',

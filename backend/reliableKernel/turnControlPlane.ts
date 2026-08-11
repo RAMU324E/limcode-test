@@ -15,6 +15,14 @@ import {
 } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
+import {
+  compareGuidancePositions,
+  initialGuidancePosition,
+  inputTurnIntentEnvelope,
+  parseInputTurnIntentEnvelope,
+  reorderedGuidancePosition,
+  TURN_INTENT_ENVELOPE_CONTENT_TYPE
+} from './guidanceIntent';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   DOMAIN_REPOSITORIES,
@@ -43,7 +51,7 @@ const TURN_STATUS_ACTIVE = 'active';
 const TURN_STATUS_TERMINATED = 'terminated';
 const TURN_INTENT_STATE_QUEUED = 'queued';
 const TURN_INTENT_STATE_ADMITTED = 'admitted';
-const CONTENT_TYPE_INTENT = 'application/vnd.limcode.turn-intent+json';
+const TURN_INTENT_STATE_CANCELLED = 'cancelled';
 const CONTENT_TYPE_PRESET = 'application/vnd.limcode.turn-execution-preset+json';
 const CONTENT_TYPE_AUTHORITY = 'application/vnd.limcode.turn-authority-snapshot+json';
 const CONTENT_TYPE_INTERRUPT = 'application/vnd.limcode.turn-interrupt-request+json';
@@ -55,7 +63,7 @@ const TURN_TERMINATION_INPUT_KINDS = [
 const TERMINAL_BLOCKING_INPUT_KINDS = ['runtime_delivery', ...TURN_TERMINATION_INPUT_KINDS] as const;
 
 export type TurnCommandSourceKind = 'command' | 'callback' | 'internal' | 'recovery';
-export type TurnCommandOperation = 'input' | 'edit' | 'delete' | 'retry' | 'interrupt' | 'continuation' | 'terminal';
+export type TurnCommandOperation = 'input' | 'edit' | 'delete' | 'retry' | 'interrupt' | 'continuation' | 'terminal' | 'guidance';
 export type TurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'outcome_unknown';
 export type TurnCommandContent = string | Uint8Array;
 
@@ -235,6 +243,34 @@ export interface TurnDeleteCommand {
   messageId: string;
 }
 
+export interface TurnGuidanceTarget {
+  intentId: string;
+  expectedRevisionSeq: string;
+}
+
+export interface TurnGuidanceEditCommand extends TurnGuidanceTarget {
+  source: TurnInitiatingSource;
+  conversationId: string;
+  text: string;
+}
+
+export interface TurnGuidanceCancelCommand extends TurnGuidanceTarget {
+  source: TurnInitiatingSource;
+  conversationId: string;
+}
+
+export interface TurnGuidanceHoldCommand extends TurnGuidanceTarget {
+  source: TurnInitiatingSource;
+  conversationId: string;
+  hold: 'none' | 'paused';
+}
+
+export interface TurnGuidanceReorderCommand {
+  source: TurnInitiatingSource;
+  conversationId: string;
+  items: TurnGuidanceTarget[];
+}
+
 export interface TurnInterruptCommand {
   source: TurnInitiatingSource;
   turnId: string;
@@ -247,6 +283,13 @@ export interface TurnTerminalCommand {
   turnId: string;
   terminalStatus: TurnTerminalStatus;
   reason: string;
+  /**
+   * Optional ordinary queued Intent that must still be waiting when this Turn releases execution.
+   * Used by the Agent loop to hand off at a completed model/tool boundary without interrupting work.
+   */
+  handoffQueuedIntentId?: string;
+  /** Exact append-only revision set observed while selecting the handoff candidate. */
+  handoffQueuedIntentRevisionIds?: readonly string[];
 }
 
 export interface ConversationForkSource {
@@ -268,6 +311,7 @@ export interface TurnCommandResult {
   commitSeq?: string;
   conversationId?: string;
   intentId?: string;
+  intentRevisionSeq?: string;
   turnId?: string;
   admitted?: boolean;
   messageId?: string;
@@ -329,6 +373,54 @@ export class TurnTerminalInputConflictError extends Error {
 
 export function isTurnTerminalInputConflictError(error: unknown): error is TurnTerminalInputConflictError {
   return (error as { code?: unknown })?.code === 'TURN_TERMINAL_INPUT_CONFLICT';
+}
+
+/** The queued guidance selected for a safe handoff changed before the terminal commit. */
+export class TurnTerminalGuidanceConflictError extends Error {
+  public readonly code = 'TURN_TERMINAL_GUIDANCE_CONFLICT';
+
+  public constructor(
+    public readonly turnId: string,
+    public readonly queuedIntentId: string
+  ) {
+    super(`Turn ${turnId} lost queued guidance ${queuedIntentId} before its terminal commit.`);
+    this.name = 'TurnTerminalGuidanceConflictError';
+  }
+}
+
+export function isTurnTerminalGuidanceConflictError(
+  error: unknown
+): error is TurnTerminalGuidanceConflictError {
+  return (error as { code?: unknown })?.code === 'TURN_TERMINAL_GUIDANCE_CONFLICT';
+}
+
+/** A queue control raced admission or another control and must be retried from the refreshed Feed. */
+export class GuidanceControlConflictError extends Error {
+  public readonly code = 'GUIDANCE_CONTROL_CONFLICT';
+
+  public constructor(
+    public readonly conversationId: string,
+    public readonly intentId?: string
+  ) {
+    super(intentId
+      ? `引导消息 ${intentId} 已发生变化，请刷新后重试。`
+      : `引导消息队列已发生变化，请刷新后重试。`);
+    this.name = 'GuidanceControlConflictError';
+  }
+}
+
+export function isGuidanceControlConflictError(error: unknown): error is GuidanceControlConflictError {
+  return (error as { code?: unknown })?.code === 'GUIDANCE_CONTROL_CONFLICT';
+}
+
+interface CurrentGuidanceIntent {
+  intent: DomainRow;
+  revisions: DomainRow[];
+  currentRevision: DomainRow;
+  currentRevisionSeq: string;
+  messageContent: ContentObjectMetadata;
+  position: string;
+  hold: 'none' | 'paused';
 }
 
 interface StartIntentPlan {
@@ -483,12 +575,375 @@ export class TurnControlPlane {
     return this.softDeleteMessage(command);
   }
 
+  public editGuidance(command: TurnGuidanceEditCommand): Promise<TurnCommandResult> {
+    return this.reviseGuidanceText(command);
+  }
+
+  public cancelGuidance(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
+    return this.cancelQueuedGuidance(command);
+  }
+
+  public setGuidanceHold(command: TurnGuidanceHoldCommand): Promise<TurnCommandResult> {
+    return this.reviseGuidanceHold(command);
+  }
+
+  public reorderGuidance(command: TurnGuidanceReorderCommand): Promise<TurnCommandResult> {
+    return this.reorderQueuedGuidance(command);
+  }
+
   public interrupt(command: TurnInterruptCommand): Promise<TurnCommandResult> {
     return this.requestInterrupt(command);
   }
 
   public terminal(command: TurnTerminalCommand): Promise<TurnCommandResult> {
     return this.recordTerminal(command);
+  }
+
+  private async reviseGuidanceText(command: TurnGuidanceEditCommand): Promise<TurnCommandResult> {
+    const source = normalizeInitiatingSource(command.source, 'guidance');
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const intentId = requireId(command.intentId, 'intentId');
+    const expectedRevisionSeq = requireDecimalIntegerString(command.expectedRevisionSeq, 'expectedRevisionSeq');
+    const text = typeof command.text === 'string' ? command.text.trim() : '';
+    const commandScope = JSON.stringify(['edit', conversationId, intentId, expectedRevisionSeq, text]);
+    const receiptId = commandEntityId(source, 'guidance', 'command_receipt', commandScope);
+    const duplicate = await this.findReceipt(source);
+    if (duplicate) return guidanceDuplicateResult(duplicate, receiptId, conversationId, intentId);
+
+    const current = await this.currentGuidanceIntent(conversationId, intentId);
+    this.requireExpectedGuidanceRevision(current, expectedRevisionSeq);
+    const messageBytes = await this.contentStore.read(current.messageContent);
+    const editedMessage = await this.contentStore.prepare(
+      this.database,
+      editGuidanceMessageContent(messageBytes, current.messageContent.content_type, text),
+      current.messageContent.content_type
+    );
+    const now = this.timestamp();
+    const envelopeContent = await this.contentStore.prepare(
+      this.database,
+      JSON.stringify(inputTurnIntentEnvelope({
+        messageContentObjectId: editedMessage.metadata.id,
+        position: current.position,
+        hold: current.hold
+      })),
+      TURN_INTENT_ENVELOPE_CONTENT_TYPE
+    );
+    const revisionId = commandEntityId(source, 'guidance', 'turn_intent_revision', commandScope);
+    try {
+      const commit = await this.commitWithReceipt({
+        source,
+        receiptId,
+        conversationId,
+        turnId: null,
+        steps: [
+          ...preparedContentObjectSteps([editedMessage, envelopeContent], 'guidance_edit_content'),
+          ...this.guidanceRevisionFenceSteps(current),
+          DOMAIN_REPOSITORIES.domain('TurnIntentRevision').insertWithNextSequence({
+            id: revisionId,
+            intent_id: intentId,
+            content_object_id: envelopeContent.metadata.id,
+            created_at: now
+          }, { column: 'revision_seq', scope: { intent_id: intentId } }),
+          DOMAIN_REPOSITORIES.domain('TurnIntent').update(intentId, { updated_at: now }),
+          DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+        ]
+      });
+      if (commit.deduplicated) return guidanceDuplicateResult(commit.receipt, receiptId, conversationId, intentId);
+      return {
+        receiptId,
+        deduplicated: false,
+        commitSeq: commit.commitSeq,
+        conversationId,
+        intentId,
+        intentRevisionSeq: allocatedValue(commit, 'TurnIntentRevision', revisionId, 'revision_seq')
+      };
+    } catch (error) {
+      if (isTransactionAssertionError(error)) throw new GuidanceControlConflictError(conversationId, intentId);
+      throw error;
+    }
+  }
+
+  private async cancelQueuedGuidance(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
+    const source = normalizeInitiatingSource(command.source, 'guidance');
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const intentId = requireId(command.intentId, 'intentId');
+    const expectedRevisionSeq = requireDecimalIntegerString(command.expectedRevisionSeq, 'expectedRevisionSeq');
+    const commandScope = JSON.stringify(['cancel', conversationId, intentId, expectedRevisionSeq]);
+    const receiptId = commandEntityId(source, 'guidance', 'command_receipt', commandScope);
+    const duplicate = await this.findReceipt(source);
+    if (duplicate) return guidanceDuplicateResult(duplicate, receiptId, conversationId, intentId);
+    const current = await this.currentGuidanceIntent(conversationId, intentId);
+    this.requireExpectedGuidanceRevision(current, expectedRevisionSeq);
+    const now = this.timestamp();
+    try {
+      const commit = await this.commitWithReceipt({
+        source,
+        receiptId,
+        conversationId,
+        turnId: null,
+        steps: [
+          ...this.guidanceRevisionFenceSteps(current),
+          DOMAIN_REPOSITORIES.domain('TurnIntent').update(intentId, {
+            state: TURN_INTENT_STATE_CANCELLED,
+            updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+        ]
+      });
+      if (commit.deduplicated) return guidanceDuplicateResult(commit.receipt, receiptId, conversationId, intentId);
+      return {
+        receiptId,
+        deduplicated: false,
+        commitSeq: commit.commitSeq,
+        conversationId,
+        intentId
+      };
+    } catch (error) {
+      if (isTransactionAssertionError(error)) throw new GuidanceControlConflictError(conversationId, intentId);
+      throw error;
+    }
+  }
+
+  private async reviseGuidanceHold(command: TurnGuidanceHoldCommand): Promise<TurnCommandResult> {
+    const source = normalizeInitiatingSource(command.source, 'guidance');
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const intentId = requireId(command.intentId, 'intentId');
+    const expectedRevisionSeq = requireDecimalIntegerString(command.expectedRevisionSeq, 'expectedRevisionSeq');
+    const hold = command.hold === 'none' || command.hold === 'paused'
+      ? command.hold
+      : (() => { throw new TypeError('Guidance hold must be none or paused.'); })();
+    const commandScope = JSON.stringify(['hold', conversationId, intentId, expectedRevisionSeq, hold]);
+    const receiptId = commandEntityId(source, 'guidance', 'command_receipt', commandScope);
+    const duplicate = await this.findReceipt(source);
+    if (duplicate) return guidanceDuplicateResult(duplicate, receiptId, conversationId, intentId);
+    const current = await this.currentGuidanceIntent(conversationId, intentId);
+    this.requireExpectedGuidanceRevision(current, expectedRevisionSeq);
+    const now = this.timestamp();
+    const envelopeContent = await this.contentStore.prepare(
+      this.database,
+      JSON.stringify(inputTurnIntentEnvelope({
+        messageContentObjectId: current.messageContent.id,
+        position: current.position,
+        hold
+      })),
+      TURN_INTENT_ENVELOPE_CONTENT_TYPE
+    );
+    const revisionId = commandEntityId(source, 'guidance', 'turn_intent_revision', commandScope);
+    try {
+      const commit = await this.commitWithReceipt({
+        source,
+        receiptId,
+        conversationId,
+        turnId: null,
+        steps: [
+          ...preparedContentObjectSteps([envelopeContent], 'guidance_hold_content'),
+          ...this.guidanceRevisionFenceSteps(current),
+          DOMAIN_REPOSITORIES.domain('TurnIntentRevision').insertWithNextSequence({
+            id: revisionId,
+            intent_id: intentId,
+            content_object_id: envelopeContent.metadata.id,
+            created_at: now
+          }, { column: 'revision_seq', scope: { intent_id: intentId } }),
+          DOMAIN_REPOSITORIES.domain('TurnIntent').update(intentId, { updated_at: now }),
+          DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+        ]
+      });
+      if (commit.deduplicated) return guidanceDuplicateResult(commit.receipt, receiptId, conversationId, intentId);
+      return {
+        receiptId,
+        deduplicated: false,
+        commitSeq: commit.commitSeq,
+        conversationId,
+        intentId,
+        intentRevisionSeq: allocatedValue(commit, 'TurnIntentRevision', revisionId, 'revision_seq')
+      };
+    } catch (error) {
+      if (isTransactionAssertionError(error)) throw new GuidanceControlConflictError(conversationId, intentId);
+      throw error;
+    }
+  }
+
+  private async reorderQueuedGuidance(command: TurnGuidanceReorderCommand): Promise<TurnCommandResult> {
+    const source = normalizeInitiatingSource(command.source, 'guidance');
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    if (!Array.isArray(command.items) || command.items.length === 0) {
+      throw new TypeError('Guidance reorder requires at least one item.');
+    }
+    const items = command.items.map((item) => ({
+      intentId: requireId(item.intentId, 'items.intentId'),
+      expectedRevisionSeq: requireDecimalIntegerString(item.expectedRevisionSeq, 'items.expectedRevisionSeq')
+    }));
+    if (new Set(items.map((item) => item.intentId)).size !== items.length) {
+      throw new TypeError('Guidance reorder contains duplicate intents.');
+    }
+    const commandScope = JSON.stringify(['reorder', conversationId, items]);
+    const receiptId = commandEntityId(source, 'guidance', 'command_receipt', commandScope);
+    const duplicate = await this.findReceipt(source);
+    if (duplicate) return guidanceDuplicateResult(duplicate, receiptId, conversationId);
+
+    const [queuedIntents, pendingChildLinks] = await Promise.all([
+      listAllDomainRows(this.database, 'TurnIntent', {
+        conversation_id: conversationId,
+        state: TURN_INTENT_STATE_QUEUED,
+        turn_id: null
+      }),
+      listAllDomainRows(this.database, 'ChildExecutionIntentLink', { state: 'pending' })
+    ]);
+    const childIds = new Set(pendingChildLinks.map((link) => requireId(
+      link.turn_intent_id,
+      'ChildExecutionIntentLink.turn_intent_id'
+    )));
+    const currentItems: CurrentGuidanceIntent[] = [];
+    for (const intent of queuedIntents) {
+      const intentId = requireId(intent.id, 'TurnIntent.id');
+      if (childIds.has(intentId)) continue;
+      const current = await this.maybeCurrentGuidanceIntent(conversationId, intentId);
+      if (current) currentItems.push(current);
+    }
+    const currentIds = new Set(currentItems.map((current) => requireId(current.intent.id, 'TurnIntent.id')));
+    if (items.length !== currentIds.size || items.some((item) => !currentIds.has(item.intentId))) {
+      throw new GuidanceControlConflictError(conversationId);
+    }
+    const byId = new Map(currentItems.map((current) => [requireId(current.intent.id, 'TurnIntent.id'), current]));
+    for (const item of items) this.requireExpectedGuidanceRevision(byId.get(item.intentId)!, item.expectedRevisionSeq);
+
+    const now = this.timestamp();
+    const prepared = await Promise.all(items.map(async (item, index) => {
+      const current = byId.get(item.intentId)!;
+      const envelopeContent = await this.contentStore.prepare(
+        this.database,
+        JSON.stringify(inputTurnIntentEnvelope({
+          messageContentObjectId: current.messageContent.id,
+          position: reorderedGuidancePosition(index),
+          hold: current.hold
+        })),
+        TURN_INTENT_ENVELOPE_CONTENT_TYPE
+      );
+      return {
+        current,
+        envelopeContent,
+        revisionId: commandEntityId(source, 'guidance', 'turn_intent_revision', `${commandScope}:${item.intentId}`)
+      };
+    }));
+    try {
+      const commit = await this.commitWithReceipt({
+        source,
+        receiptId,
+        conversationId,
+        turnId: null,
+        steps: [
+          ...preparedContentObjectSteps(prepared.map((entry) => entry.envelopeContent), 'guidance_reorder_content'),
+          DOMAIN_REPOSITORIES.domain('TurnIntent').assertExactIds(
+            { conversation_id: conversationId, state: TURN_INTENT_STATE_QUEUED, turn_id: null },
+            queuedIntents.map((intent) => requireId(intent.id, 'TurnIntent.id'))
+          ),
+          ...prepared.flatMap((entry) => [
+            ...this.guidanceRevisionFenceSteps(entry.current),
+            DOMAIN_REPOSITORIES.domain('TurnIntentRevision').insertWithNextSequence({
+              id: entry.revisionId,
+              intent_id: requireId(entry.current.intent.id, 'TurnIntent.id'),
+              content_object_id: entry.envelopeContent.metadata.id,
+              created_at: now
+            }, {
+              column: 'revision_seq',
+              scope: { intent_id: requireId(entry.current.intent.id, 'TurnIntent.id') }
+            }),
+            DOMAIN_REPOSITORIES.domain('TurnIntent').update(
+              requireId(entry.current.intent.id, 'TurnIntent.id'),
+              { updated_at: now }
+            )
+          ]),
+          DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+        ]
+      });
+      if (commit.deduplicated) return guidanceDuplicateResult(commit.receipt, receiptId, conversationId);
+      return {
+        receiptId,
+        deduplicated: false,
+        commitSeq: commit.commitSeq,
+        conversationId
+      };
+    } catch (error) {
+      if (isTransactionAssertionError(error)) throw new GuidanceControlConflictError(conversationId);
+      throw error;
+    }
+  }
+
+  private async currentGuidanceIntent(conversationId: string, intentId: string): Promise<CurrentGuidanceIntent> {
+    const current = await this.maybeCurrentGuidanceIntent(conversationId, intentId);
+    if (!current) throw new Error(`TurnIntent ${intentId} is not an ordinary queued guidance message.`);
+    return current;
+  }
+
+  private async maybeCurrentGuidanceIntent(
+    conversationId: string,
+    intentId: string
+  ): Promise<CurrentGuidanceIntent | null> {
+    const intent = await this.requireExisting('TurnIntent', intentId);
+    if (
+      intent.conversation_id !== conversationId
+      || intent.state !== TURN_INTENT_STATE_QUEUED
+      || intent.turn_id !== null
+    ) return null;
+    const childLinks = await this.listRows('ChildExecutionIntentLink', { turn_intent_id: intentId }, 1);
+    if (childLinks.length > 0) return null;
+    const revisions = await listAllDomainRows(this.database, 'TurnIntentRevision', { intent_id: intentId });
+    if (revisions.length === 0) throw new Error(`TurnIntent ${intentId} has no content revision.`);
+    const currentRevision = [...revisions].sort((left, right) => {
+      const leftSeq = requireBigInt(left.revision_seq, 'TurnIntentRevision.revision_seq');
+      const rightSeq = requireBigInt(right.revision_seq, 'TurnIntentRevision.revision_seq');
+      return leftSeq < rightSeq ? 1 : leftSeq > rightSeq ? -1 : 0;
+    })[0]!;
+    const intentContent = await this.readContentObject(
+      requireId(currentRevision.content_object_id, 'TurnIntentRevision.content_object_id')
+    );
+    let messageContent = intentContent;
+    let position = initialGuidancePosition(requireTimestamp(intent.created_at, 'TurnIntent.created_at'));
+    let hold: 'none' | 'paused' = 'none';
+    if (intentContent.content_type === TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
+      const value = JSON.parse((await this.contentStore.read(intentContent)).toString('utf8')) as unknown;
+      const envelope = parseInputTurnIntentEnvelope(value);
+      if (!envelope) return null;
+      messageContent = await this.readContentObject(envelope.messageContentObjectId);
+      position = envelope.guidance.position;
+      hold = envelope.guidance.hold;
+    }
+    return {
+      intent,
+      revisions,
+      currentRevision,
+      currentRevisionSeq: requireBigInt(
+        currentRevision.revision_seq,
+        'TurnIntentRevision.revision_seq'
+      ).toString(),
+      messageContent,
+      position,
+      hold
+    };
+  }
+
+  private requireExpectedGuidanceRevision(current: CurrentGuidanceIntent, expectedRevisionSeq: string): void {
+    if (current.currentRevisionSeq !== expectedRevisionSeq) {
+      throw new GuidanceControlConflictError(
+        requireId(current.intent.conversation_id, 'TurnIntent.conversation_id'),
+        requireId(current.intent.id, 'TurnIntent.id')
+      );
+    }
+  }
+
+  private guidanceRevisionFenceSteps(current: CurrentGuidanceIntent): RepositoryTransactionStep[] {
+    const intentId = requireId(current.intent.id, 'TurnIntent.id');
+    return [
+      DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, {
+        conversation_id: requireId(current.intent.conversation_id, 'TurnIntent.conversation_id'),
+        state: TURN_INTENT_STATE_QUEUED,
+        turn_id: null
+      }),
+      DOMAIN_REPOSITORIES.domain('TurnIntentRevision').assertExactIds(
+        { intent_id: intentId },
+        current.revisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
+      )
+    ];
   }
 
   /** Admits the oldest ordinary queued Intent after the prior lease is released. Child intents use their lineage control plane. */
@@ -500,13 +955,27 @@ export class TurnControlPlane {
   }): Promise<TurnCommandResult | null> {
     const conversationId = requireId(input.conversationId, 'conversationId');
     const queued = (await listAllDomainRows(this.database, 'TurnIntent', { conversation_id: conversationId }))
-      .filter((intent) => intent.state === TURN_INTENT_STATE_QUEUED && intent.turn_id === null)
-      .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at))
-        || String(left.id).localeCompare(String(right.id)));
+      .filter((intent) => intent.state === TURN_INTENT_STATE_QUEUED && intent.turn_id === null);
     if (queued.length === 0) return null;
     const childIntentLinks = await listAllDomainRows(this.database, 'ChildExecutionIntentLink', { state: 'pending' });
     const childIntentIds = new Set(childIntentLinks.map((link) => String(link.turn_intent_id)));
-    const intent = queued.find((candidate) => !childIntentIds.has(String(candidate.id)));
+    const ranked: Array<{ intent: DomainRow; position: string }> = [];
+    for (const candidate of queued) {
+      const intentId = requireId(candidate.id, 'TurnIntent.id');
+      if (childIntentIds.has(intentId)) continue;
+      const guidance = await this.maybeCurrentGuidanceIntent(conversationId, intentId);
+      if (guidance?.hold === 'paused') continue;
+      ranked.push({
+        intent: candidate,
+        position: guidance?.position
+          ?? initialGuidancePosition(requireTimestamp(candidate.created_at, 'TurnIntent.created_at'))
+      });
+    }
+    const intent = ranked.sort((left, right) =>
+      compareGuidancePositions(left.position, right.position)
+      || String(left.intent.created_at).localeCompare(String(right.intent.created_at))
+      || String(left.intent.id).localeCompare(String(right.intent.id))
+    )[0]?.intent;
     if (!intent) return null;
     return this.admitQueuedIntent(intent, input);
   }
@@ -1094,16 +1563,21 @@ export class TurnControlPlane {
     const conversationId = requireId(intent.conversation_id, 'TurnIntent.conversation_id');
     if (conversationId !== input.conversationId) throw new Error('Queued TurnIntent belongs to another Conversation.');
     const [intentRevisions, presetRevisions, authorityRevisions, executorLinks] = await Promise.all([
-      this.listRows('TurnIntentRevision', { intent_id: intentId }, 2),
+      listAllDomainRows(this.database, 'TurnIntentRevision', { intent_id: intentId }),
       this.listRows('TurnExecutionPresetRevision', { intent_id: intentId }, 2),
       this.listRows('TurnIntentAuthorityRevision', { intent_id: intentId }, 2),
       this.listRows('TurnIntentExecutorLink', { intent_id: intentId }, 2)
     ]);
-    if (intentRevisions.length !== 1 || presetRevisions.length !== 1 || authorityRevisions.length !== 1 || executorLinks.length !== 1) {
+    if (intentRevisions.length < 1 || presetRevisions.length !== 1 || authorityRevisions.length !== 1 || executorLinks.length !== 1) {
       throw new Error(`Queued TurnIntent ${intentId} has incomplete frozen admission facts.`);
     }
+    const currentIntentRevision = [...intentRevisions].sort((left, right) => {
+      const leftSeq = requireBigInt(left.revision_seq, 'TurnIntentRevision.revision_seq');
+      const rightSeq = requireBigInt(right.revision_seq, 'TurnIntentRevision.revision_seq');
+      return leftSeq < rightSeq ? 1 : leftSeq > rightSeq ? -1 : 0;
+    })[0]!;
     const intentContent = await this.readContentObject(
-      requireId(intentRevisions[0].content_object_id, 'TurnIntentRevision.content_object_id')
+      requireId(currentIntentRevision.content_object_id, 'TurnIntentRevision.content_object_id')
     );
     // Ensure the frozen preset still exists even though admission needs only its independent authority/executor facts.
     await this.requireExisting('ContentObject', requireId(presetRevisions[0].preset_object_id, 'TurnExecutionPresetRevision.preset_object_id'));
@@ -1153,6 +1627,10 @@ export class TurnControlPlane {
       : [];
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
+      DOMAIN_REPOSITORIES.domain('TurnIntentRevision').assertExactIds(
+        { intent_id: intentId },
+        intentRevisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
+      ),
       DOMAIN_REPOSITORIES.domain('TurnIntentAuthorityRevision').assert(
         requireId(authorityRevisions[0].id, 'TurnIntentAuthorityRevision.id'),
         { intent_id: intentId, authority_object_id: authorityObjectId }
@@ -1252,10 +1730,19 @@ export class TurnControlPlane {
     operation: 'input' | 'retry' | 'continuation';
     messageContent: PreparedContentObject | null;
   }> {
-    if (intentContent.content_type !== CONTENT_TYPE_INTENT) {
+    if (intentContent.content_type !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
       return { operation: 'input', messageContent: { metadata: intentContent } };
     }
     const value = JSON.parse((await this.contentStore.read(intentContent)).toString('utf8')) as Record<string, unknown>;
+    const inputEnvelope = parseInputTurnIntentEnvelope(value);
+    if (inputEnvelope) {
+      return {
+        operation: 'input',
+        messageContent: {
+          metadata: await this.readContentObject(inputEnvelope.messageContentObjectId)
+        }
+      };
+    }
     if (value.kind === 'retry') return { operation: 'retry', messageContent: null };
     if (value.kind !== 'continuation') throw new Error('Queued TurnIntent has an unsupported intent envelope.');
     const objectId = requireId(value.messageContentObjectId, 'TurnIntent continuation.messageContentObjectId');
@@ -1381,7 +1868,14 @@ export class TurnControlPlane {
         messageAttachmentAdmission.contentType
       );
     const intentContent = plan.operation === 'input'
-      ? requirePrepared(messageContent, 'input message content')
+      ? await this.contentStore.prepare(
+          this.database,
+          JSON.stringify(inputTurnIntentEnvelope({
+            messageContentObjectId: requirePrepared(messageContent, 'input message content').metadata.id,
+            position: initialGuidancePosition(now)
+          })),
+          TURN_INTENT_ENVELOPE_CONTENT_TYPE
+        )
       : await this.contentStore.prepare(
         this.database,
         JSON.stringify({
@@ -1399,7 +1893,7 @@ export class TurnControlPlane {
           ...(messageContent ? { messageContentObjectId: messageContent.metadata.id } : {}),
           ...(plan.runtimeMaintenance ? { runtimeMaintenance: plan.runtimeMaintenance } : {})
         }),
-        CONTENT_TYPE_INTENT
+        TURN_INTENT_ENVELOPE_CONTENT_TYPE
       );
     const presetContent = await this.contentStore.prepare(
       this.database,
@@ -2143,7 +2637,7 @@ export class TurnControlPlane {
       sourceTurnId,
       sourceMessageId: messageId,
       editedMessageRevisionId: revisionId
-    }), CONTENT_TYPE_INTENT);
+    }), TURN_INTENT_ENVELOPE_CONTENT_TYPE);
     const presetContent = await this.contentStore.prepare(
       this.database,
       compiled.executionPreset.content,
@@ -2556,6 +3050,26 @@ export class TurnControlPlane {
         };
     }
     requireActiveTurn(turn, turnId);
+    const handoffQueuedIntentId = commandInput.handoffQueuedIntentId
+      ? requireId(commandInput.handoffQueuedIntentId, 'handoffQueuedIntentId')
+      : undefined;
+    const handoffQueuedIntentRevisionIds = commandInput.handoffQueuedIntentRevisionIds === undefined
+      ? undefined
+      : commandInput.handoffQueuedIntentRevisionIds.map((id) =>
+          requireId(id, 'handoffQueuedIntentRevisionIds[]')
+        );
+    if (handoffQueuedIntentRevisionIds && !handoffQueuedIntentId) {
+      throw new TypeError('handoffQueuedIntentRevisionIds requires handoffQueuedIntentId.');
+    }
+    if (
+      handoffQueuedIntentRevisionIds
+      && (
+        handoffQueuedIntentRevisionIds.length === 0
+        || new Set(handoffQueuedIntentRevisionIds).size !== handoffQueuedIntentRevisionIds.length
+      )
+    ) {
+      throw new TypeError('handoffQueuedIntentRevisionIds must be a non-empty unique id set.');
+    }
     const now = this.timestamp();
     const unresolvedFileSteps = this.unresolvedFileClosure
       ? await this.unresolvedFileClosure.prepareUnresolvedTurnClosure(turnId)
@@ -2583,6 +3097,22 @@ export class TurnControlPlane {
         turnId,
         steps: [
           DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TURN_STATUS_ACTIVE }),
+          ...(handoffQueuedIntentId ? [
+            DOMAIN_REPOSITORIES.domain('TurnIntent').assert(handoffQueuedIntentId, {
+              conversation_id: conversationId,
+              state: TURN_INTENT_STATE_QUEUED,
+              turn_id: null
+            }),
+            DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assertNone({
+              turn_intent_id: handoffQueuedIntentId
+            }),
+            ...(handoffQueuedIntentRevisionIds ? [
+              DOMAIN_REPOSITORIES.domain('TurnIntentRevision').assertExactIds(
+                { intent_id: handoffQueuedIntentId },
+                handoffQueuedIntentRevisionIds
+              )
+            ] : [])
+          ] : []),
           ...terminalInputSteps,
           ...unresolvedFileSteps,
           // A terminal Turn may not strand a pending or in-flight ToolCall. This assertion runs
@@ -2619,6 +3149,28 @@ export class TurnControlPlane {
       if (!isTransactionAssertionError(error)) throw error;
       const latest = await this.getTurn(turnId);
       if (latest.status !== TURN_STATUS_TERMINATED) {
+        if (handoffQueuedIntentId) {
+          const [handoffIntent, childLinks, handoffRevisions] = await Promise.all([
+            this.maybeGet('TurnIntent', handoffQueuedIntentId),
+            this.listRows('ChildExecutionIntentLink', { turn_intent_id: handoffQueuedIntentId }, 1),
+            listAllDomainRows(this.database, 'TurnIntentRevision', { intent_id: handoffQueuedIntentId })
+          ]);
+          const handoffRevisionChanged = Boolean(handoffQueuedIntentRevisionIds)
+            && !sameIdSet(
+              handoffQueuedIntentRevisionIds!,
+              handoffRevisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
+            );
+          if (
+            !handoffIntent
+            || handoffIntent.conversation_id !== conversationId
+            || handoffIntent.state !== TURN_INTENT_STATE_QUEUED
+            || handoffIntent.turn_id !== null
+            || childLinks.length > 0
+            || handoffRevisionChanged
+          ) {
+            throw new TurnTerminalGuidanceConflictError(turnId, handoffQueuedIntentId);
+          }
+        }
         if (isTerminalInputFenceAssertion(error)) {
           const blockingInputs = await terminalBlockingInputs(this.database, turnId);
           if (blockingInputs.length > 0) {
@@ -3432,6 +3984,56 @@ function deduplicatedCommit(receipt: DomainRow): CommandCommit {
   return { receipt, deduplicated: true, changes: [], allocatedSequences: [] };
 }
 
+function guidanceDuplicateResult(
+  receipt: DomainRow,
+  expectedReceiptId: string,
+  conversationId: string,
+  intentId?: string
+): TurnCommandResult {
+  assertReceiptIdentity(receipt, expectedReceiptId, 'guidance');
+  if (receipt.conversation_id !== conversationId || receipt.turn_id !== null) {
+    throw sourceOperationMismatch(receipt, 'guidance');
+  }
+  return {
+    receiptId: requireId(receipt.id, 'CommandReceipt.id'),
+    deduplicated: true,
+    conversationId,
+    ...(intentId ? { intentId } : {})
+  };
+}
+
+function editGuidanceMessageContent(
+  bytes: Uint8Array,
+  contentType: string,
+  text: string
+): string {
+  if (contentType !== 'application/vnd.limcode.message+json') {
+    if (!text) throw new TypeError('没有附件的引导消息不能为空。');
+    return text;
+  }
+  const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { role?: unknown; parts?: unknown };
+  if (!Array.isArray(parsed.parts)) throw new TypeError('引导消息内容格式无效。');
+  let replaced = false;
+  const parts: Record<string, unknown>[] = [];
+  for (const value of parsed.parts) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new TypeError('引导消息包含无效内容片段。');
+    }
+    const part = value as Record<string, unknown>;
+    if (typeof part.text === 'string' && part.thought !== true) {
+      if (!replaced && text) {
+        parts.push({ ...part, text });
+        replaced = true;
+      }
+      continue;
+    }
+    parts.push(part);
+  }
+  if (!replaced && text) parts.unshift({ text });
+  if (parts.length === 0) throw new TypeError('没有附件的引导消息不能为空。');
+  return JSON.stringify({ role: 'user', parts });
+}
+
 function basicDuplicateResult(
   receipt: DomainRow,
   expectedReceiptId: string,
@@ -3467,6 +4069,12 @@ function sourceOperationMismatch(receipt: DomainRow, operation: TurnCommandOpera
   return new Error(
     `CommandReceipt (${String(receipt.source_kind)},${String(receipt.source_key)}) does not contain ${operation} result facts.`
   );
+}
+
+function sameIdSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const expected = new Set(left);
+  return expected.size === left.length && right.every((id) => expected.has(id));
 }
 
 function rows(value: DomainRow | DomainRow[] | null): DomainRow[] {

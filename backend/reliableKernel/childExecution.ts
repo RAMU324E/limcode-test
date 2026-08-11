@@ -7,6 +7,10 @@ import {
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
+import {
+  parseInputTurnIntentEnvelopeText,
+  TURN_INTENT_ENVELOPE_CONTENT_TYPE
+} from './guidanceIntent';
 import { conversationProjectLinkInsertStep } from './conversationProject';
 import {
   assertChildExecutionTransition,
@@ -1216,11 +1220,26 @@ export class ChildExecutionControlPlane {
       compiled.authoritySnapshot.content,
       compiled.authoritySnapshot.contentType
     );
-    const messageContentObjectId = requirePhaseFId(
+    const intentContentObjectId = requirePhaseFId(
       revisions[0].content_object_id,
       'TurnIntentRevision.content_object_id'
     );
-    const messageContentObject = await this.requireExisting('ContentObject', messageContentObjectId);
+    let messageContentObject = await this.requireExisting('ContentObject', intentContentObjectId);
+    if (messageContentObject.content_type === TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
+      const envelope = parseInputTurnIntentEnvelopeText(
+        (await this.contentStore.read(messageContentObject as ContentObjectMetadata)).toString('utf8')
+      );
+      if (envelope) {
+        messageContentObject = await this.requireExisting(
+          'ContentObject',
+          envelope.messageContentObjectId
+        );
+      }
+    }
+    const messageContentObjectId = requirePhaseFId(
+      messageContentObject.id,
+      'queued child message ContentObject.id'
+    );
     const messageContentType = requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type');
     const invisibleRuntimeDelivery = messageContentType === RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE;
     const messageContentBytes = invisibleRuntimeDelivery
