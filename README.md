@@ -44,6 +44,17 @@ Limcode Test 不是简单改名。它仍然是在 VS Code 中使用的对话助�
 
 > 当前开发阶段按需求把 LLM API Key 明文保存到 `settings/llm-api.json`，不使用环境变量，也不使用 VS Code SecretStorage。
 
+## 支持平台
+
+Release 提供以下本地 VS Code Extension Host 制品：
+
+- Windows x64
+- Linux x64
+- macOS x64（Intel）
+- macOS arm64（Apple Silicon）
+
+各平台 VSIX 均包含对应的 `better-sqlite3` 原生模块；请按操作系统和 CPU 架构选择安装包。
+
 ## 快速开始
 
 ```bash
@@ -74,9 +85,13 @@ npm run compile          # 编译扩展后端 TS
 npm run watch            # 监听并编译扩展后端 TS
 npm run dev:webview      # 启动 Vue Webview Vite dev server
 npm run build:webview    # 构建 Webview 静态资源
-npm run build            # 编译后端 + 构建 Webview
-npm run check            # 构建、类型检查和可靠内核计划合同校验
-npm run check:local      # 在上述校验后，再运行仅本机存在且被Git忽略的tests/
+npm run build                  # 编译后端 + 构建 Webview
+npm run check                  # 构建、类型检查和可靠内核计划合同校验
+npm run check:local            # 在上述校验后，再运行本地测试
+npm run package:linux          # 打包 Linux x64 VSIX
+npm run package:win32          # 打包 Windows x64 VSIX
+npm run package:darwin-x64     # 打包 macOS Intel VSIX
+npm run package:darwin-arm64   # 打包 macOS Apple Silicon VSIX
 ```
 
 ## 目录概览

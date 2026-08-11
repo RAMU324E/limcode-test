@@ -20,6 +20,7 @@ import {
   PROCESS_WRAPPER_STOP_REQUEST_FILE,
   parseStopRequest,
   processChunkFileName,
+  readDarwinProcessGroupFingerprints,
   readProcessStartFingerprint,
   type ProcessStopRequest,
   type ProcessStreamKind,
@@ -463,6 +464,13 @@ function readProcessGroupFingerprints(processGroupId: string): Set<string> {
       }
     }
     return fingerprints;
+  }
+  if (process.platform === 'darwin') return readDarwinProcessGroupFingerprints(processGroupId);
+  if (process.platform !== 'linux') {
+    throw Object.assign(
+      new Error(`Process-group inspection is not supported on ${process.platform}/${process.arch}.`),
+      { code: 'ENOSYS' }
+    );
   }
   const expectedGroup = BigInt(processGroupId);
   const fingerprints = new Set<string>();

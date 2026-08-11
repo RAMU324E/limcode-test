@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -56,6 +55,7 @@ import {
   type RuntimePerformanceMetricEvent,
   type RuntimePerformanceMetricsSink
 } from './runtimePerformanceMetrics';
+import { readProcessStartFingerprint } from './processProtocol';
 
 export interface SnapshotSubscription<T> {
   barrier: SnapshotBarrier<T>;
@@ -777,16 +777,10 @@ function inspectRecordedProcess(record: RuntimeHostLivenessRecord): 'alive' | 'd
   return currentIdentity === record.processStartIdentity ? 'alive' : 'dead';
 }
 
-/** Linux start ticks fence pid reuse; other platforms retain heartbeat + kill(0) semantics. */
+/** Supported hosts fence PID reuse with the same platform-specific identity as process wrappers. */
 function readProcessStartIdentity(processId: number): string | undefined {
   try {
-    const stat = readFileSync(`/proc/${processId}/stat`, 'utf8');
-    const closeParen = stat.lastIndexOf(')');
-    if (closeParen < 0) return undefined;
-    // Fields after comm begin at proc field 3 (state); starttime is proc field 22 => index 19.
-    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
-    const startTicks = fields[19];
-    return startTicks && /^\d+$/.test(startTicks) ? startTicks : undefined;
+    return readProcessStartFingerprint(processId);
   } catch {
     return undefined;
   }

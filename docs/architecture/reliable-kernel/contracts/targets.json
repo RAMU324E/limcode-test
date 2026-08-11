@@ -22,11 +22,23 @@
       "platform": "win32",
       "arch": "x64",
       "extensionHostKind": "local"
+    },
+    {
+      "id": "local-darwin-x64",
+      "platform": "darwin",
+      "arch": "x64",
+      "extensionHostKind": "local"
+    },
+    {
+      "id": "local-darwin-arm64",
+      "platform": "darwin",
+      "arch": "arm64",
+      "extensionHostKind": "local"
     }
   ],
   "sqliteDriver": {
     "choice": "better-sqlite3",
-    "packaging": "Linux/Windows x64 VSIX必须包含对应better-sqlite3 native addon；需要Electron ABI重建时在目标平台运行 @electron/rebuild",
+    "packaging": "Linux/Windows x64与macOS x64/arm64 VSIX必须包含对应better-sqlite3 native addon；需要Electron ABI重建时在目标平台运行 @electron/rebuild",
     "foundationGate": "foundation 出口必须在真实 Extension Host 验证驱动加载",
     "fallback": {
       "choice": "node:sqlite",

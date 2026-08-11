@@ -110,7 +110,9 @@
     "vscode:prepublish": "npm run build && node scripts/reliable-kernel/prune-package-dist.mjs",
     "package:local": "vsce package --allow-missing-repository",
     "package:linux": "vsce package --target linux-x64 --allow-missing-repository",
-    "package:win32": "vsce package --target win32-x64 --allow-missing-repository"
+    "package:win32": "vsce package --target win32-x64 --allow-missing-repository",
+    "package:darwin-x64": "vsce package --target darwin-x64 --allow-missing-repository",
+    "package:darwin-arm64": "vsce package --target darwin-arm64 --allow-missing-repository"
   },
   "devDependencies": {
     "@electron/rebuild": "4.2.0",

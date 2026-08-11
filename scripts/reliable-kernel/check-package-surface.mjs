@@ -53,7 +53,9 @@ const required = [
   'package.json',
   String(manifest.main ?? '').replace(/^\.\//, ''),
   'node_modules/better-sqlite3/prebuilds/linux-x64.node',
-  'node_modules/better-sqlite3/prebuilds/win32-x64.node'
+  'node_modules/better-sqlite3/prebuilds/win32-x64.node',
+  'node_modules/better-sqlite3/prebuilds/darwin-x64.node',
+  'node_modules/better-sqlite3/prebuilds/darwin-arm64.node'
 ];
 for (const file of required) if (!files.includes(file)) failures.push(`安装包缺少必需文件：${file}`);
 if (!files.some((file) => file.toLowerCase() === 'readme.md')) failures.push('安装包缺少README');

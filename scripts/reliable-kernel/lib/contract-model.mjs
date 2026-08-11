@@ -952,11 +952,17 @@ function validateTargets(targets, registry, failures) {
   const artifactTargets = objectArray(targets?.artifactTargets, 'targets.artifactTargets', failures);
   failures.push(...exactSetProblems(
     'VSIX制品目标',
-    ['local-linux-x64', 'local-win32-x64'],
+    ['local-linux-x64', 'local-win32-x64', 'local-darwin-x64', 'local-darwin-arm64'],
     artifactTargets.map((entry) => entry.id)
   ));
+  const supportedArtifactTargets = new Set([
+    'linux/x64',
+    'win32/x64',
+    'darwin/x64',
+    'darwin/arm64'
+  ]);
   for (const target of artifactTargets) {
-    if (!['linux', 'win32'].includes(target.platform) || target.arch !== 'x64') {
+    if (!supportedArtifactTargets.has(`${target.platform}/${target.arch}`)) {
       failures.push(`VSIX制品目标无效：${target.id ?? '<missing>'}`);
     }
     if (target.extensionHostKind !== 'local') failures.push(`VSIX制品目标必须是本地Extension Host：${target.id ?? '<missing>'}`);

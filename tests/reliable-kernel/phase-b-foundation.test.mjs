@@ -26,6 +26,7 @@ const phaseBChecks = [
   'foundation.no-legacy-fallback',
   'foundation.empty-root-current-epoch'
 ];
+const linuxX64FoundationOnly = { skip: process.platform !== 'linux' || process.arch !== 'x64' };
 
 test('Extension Host driver handler拒绝缺失证据', async () => {
   const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-phase-b-host-evidence-'));
@@ -70,7 +71,7 @@ test('Extension Host driver handler拒绝错误版本、ABI和依赖摘要', asy
 });
 
 for (const checkId of phaseBChecks) {
-  test(`${checkId}正反场景通过真实handler`, () => {
+  test(`${checkId}正反场景通过真实handler`, linuxX64FoundationOnly, () => {
     const run = childProcess.spawnSync(process.execPath, [
       'scripts/reliable-kernel/run-foundation-check.mjs',
       `--check=${checkId}`

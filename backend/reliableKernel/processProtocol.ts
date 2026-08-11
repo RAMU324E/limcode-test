@@ -327,21 +327,28 @@ export function parseStopRequest(value: unknown): ProcessStopRequest {
 }
 
 export function readProcessStartFingerprint(pidInput: string | number): string {
-  return process.platform === 'win32'
-    ? readWindowsStartFingerprint(pidInput)
-    : readLinuxStartFingerprint(pidInput);
+  switch (process.platform) {
+    case 'win32': return readWindowsStartFingerprint(pidInput);
+    case 'linux': return readLinuxStartFingerprint(pidInput);
+    case 'darwin': return readDarwinStartFingerprint(pidInput);
+    default: throw unsupportedProcessInspectionPlatform();
+  }
 }
 
 export function isWrapperProcessReachable(wrapperPidInput: string, launchPathInput: string): boolean {
-  if (process.platform !== 'win32') {
-    return isLinuxWrapperProcessReachable(wrapperPidInput, launchPathInput);
-  }
-  const wrapperPid = requireDecimalString(wrapperPidInput, 'wrapperPid');
-  try {
-    process.kill(Number(wrapperPid), 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  switch (process.platform) {
+    case 'linux': return isLinuxWrapperProcessReachable(wrapperPidInput, launchPathInput);
+    case 'darwin': return isDarwinWrapperProcessReachable(wrapperPidInput, launchPathInput);
+    case 'win32': {
+      const wrapperPid = requireDecimalString(wrapperPidInput, 'wrapperPid');
+      try {
+        process.kill(Number(wrapperPid), 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+      }
+    }
+    default: throw unsupportedProcessInspectionPlatform();
   }
 }
 
@@ -372,9 +379,7 @@ function readWindowsStartFingerprint(pidInput: string | number): string {
 }
 
 export function readLinuxStartFingerprint(pidInput: string | number): string {
-  const pid = typeof pidInput === 'number'
-    ? BigInt(pidInput).toString()
-    : requireDecimalString(pidInput, 'pid');
+  const pid = normalizePid(pidInput);
   const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
   const close = stat.lastIndexOf(')');
   if (close < 0) throw new Error(`Cannot parse /proc/${pid}/stat.`);
@@ -382,6 +387,31 @@ export function readLinuxStartFingerprint(pidInput: string | number): string {
   const startTicks = fieldsFromState[19];
   if (!startTicks || !/^\d+$/.test(startTicks)) throw new Error(`Cannot read start time for process ${pid}.`);
   return `linux-proc:${pid}:${BigInt(startTicks).toString()}`;
+}
+
+export function readDarwinStartFingerprint(pidInput: string | number): string {
+  const pid = normalizePid(pidInput);
+  assertProcessReachable(pid);
+  const result = runDarwinPs(['-p', pid, '-o', 'pid=,pgid=,lstart=']);
+  if (result.status !== 0) throw processInspectionMissing(pid);
+  const row = parseDarwinProcessRows(result.stdout).find((entry) => entry.pid === pid);
+  if (!row) throw processInspectionMissing(pid);
+  return row.startFingerprint;
+}
+
+/** Reads one coherent Darwin process table so process-group witnesses share the same observation. */
+export function readDarwinProcessGroupFingerprints(processGroupIdInput: string): Set<string> {
+  if (process.platform !== 'darwin') throw unsupportedProcessInspectionPlatform();
+  const processGroupId = requireDecimalString(processGroupIdInput, 'processGroupId');
+  const result = runDarwinPs(['-axo', 'pid=,pgid=,lstart=']);
+  if (result.status !== 0) {
+    throw Object.assign(new Error('Cannot inspect the Darwin process table.'), { code: 'EIO' });
+  }
+  return new Set(
+    parseDarwinProcessRows(result.stdout)
+      .filter((entry) => entry.processGroupId === processGroupId)
+      .map((entry) => entry.startFingerprint)
+  );
 }
 
 /** Verifies that the recorded wrapper PID still runs the exact launch request path. */
@@ -395,6 +425,78 @@ export function isLinuxWrapperProcessReachable(wrapperPidInput: string, launchPa
   } catch {
     return false;
   }
+}
+
+function isDarwinWrapperProcessReachable(wrapperPidInput: string, launchPathInput: string): boolean {
+  const wrapperPid = requireDecimalString(wrapperPidInput, 'wrapperPid');
+  const launchPath = path.resolve(launchPathInput);
+  try {
+    assertProcessReachable(wrapperPid);
+    const result = runDarwinPs(['-ww', '-p', wrapperPid, '-o', 'command=']);
+    if (result.status !== 0) return false;
+    const commandLine = result.stdout.trim();
+    return commandLine === launchPath || commandLine.endsWith(` ${launchPath}`);
+  } catch {
+    return false;
+  }
+}
+
+interface DarwinProcessRow {
+  pid: string;
+  processGroupId: string;
+  startFingerprint: string;
+}
+
+function parseDarwinProcessRows(output: string): DarwinProcessRow[] {
+  const rows: DarwinProcessRow[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
+    if (!match) continue;
+    const pid = BigInt(match[1]!).toString();
+    const processGroupId = BigInt(match[2]!).toString();
+    const startedAt = match[3]!.trim().replace(/\s+/g, ' ');
+    if (!startedAt) continue;
+    const digest = createHash('sha256').update(startedAt, 'utf8').digest('hex');
+    rows.push({ pid, processGroupId, startFingerprint: `darwin-ps:${pid}:${digest}` });
+  }
+  return rows;
+}
+
+function runDarwinPs(arguments_: string[]): { status: number | null; stdout: string } {
+  const result = spawnSync('/bin/ps', arguments_, {
+    encoding: 'utf8',
+    env: { ...process.env, LANG: 'C', LC_ALL: 'C', TZ: 'UTC' },
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 3_000,
+    windowsHide: true
+  });
+  if (result.error) throw result.error;
+  return { status: result.status, stdout: result.stdout ?? '' };
+}
+
+function assertProcessReachable(pid: string): void {
+  try {
+    process.kill(Number(pid), 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw processInspectionMissing(pid, error);
+  }
+}
+
+function normalizePid(pidInput: string | number): string {
+  return typeof pidInput === 'number'
+    ? BigInt(pidInput).toString()
+    : requireDecimalString(pidInput, 'pid');
+}
+
+function processInspectionMissing(pid: string, cause?: unknown): Error {
+  return Object.assign(new Error(`Cannot read start time for process ${pid}.`), { code: 'ENOENT', cause });
+}
+
+function unsupportedProcessInspectionPlatform(): Error {
+  return Object.assign(
+    new Error(`Process inspection is not supported on ${process.platform}/${process.arch}.`),
+    { code: 'ENOSYS' }
+  );
 }
 
 export function requireDecimalString(value: unknown, label: string): string {

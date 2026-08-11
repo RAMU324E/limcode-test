@@ -24,6 +24,7 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
+          - macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -87,10 +88,33 @@ jobs:
         run: npm run compile
 
       - name: Run Windows storage and Wrapper regressions
-        run: node --test --test-concurrency=1 tests/settingsRevisionConflict.test.cjs tests/reliable-kernel/windows-runtime-compatibility.test.mjs
+        run: node --test --test-concurrency=1 tests/settingsRevisionConflict.test.cjs tests/reliable-kernel/platform-runtime-compatibility.test.mjs
 
-  linux-vsix-surface:
-    name: Linux and Windows VSIX package surfaces
+  macos-runtime-tests:
+    name: macOS runtime compatibility tests
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.15.1
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile extension
+        run: npm run compile
+
+      - name: Run macOS Runtime and Wrapper regressions
+        run: node --test --test-concurrency=1 tests/reliable-kernel/platform-runtime-compatibility.test.mjs
+
+  cross-platform-vsix-surface:
+    name: Windows, macOS and Linux VSIX package surfaces
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -117,3 +141,15 @@ jobs:
 
       - name: Check Windows packaged files
         run: npm run check:package:surface -- --artifact limcode-test-win32-x64-ci.vsix
+
+      - name: Build macOS x64 VSIX
+        run: npm run package:darwin-x64 -- --out limcode-test-darwin-x64-ci.vsix
+
+      - name: Check macOS x64 packaged files
+        run: npm run check:package:surface -- --artifact limcode-test-darwin-x64-ci.vsix
+
+      - name: Build macOS arm64 VSIX
+        run: npm run package:darwin-arm64 -- --out limcode-test-darwin-arm64-ci.vsix
+
+      - name: Check macOS arm64 packaged files
+        run: npm run check:package:surface -- --artifact limcode-test-darwin-arm64-ci.vsix
