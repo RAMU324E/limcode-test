@@ -514,7 +514,11 @@ function alignTokenCountToK(value: number): number {
 
 function clampTokenCount(value: number, contextWindowTokens?: number): number {
   const aligned = alignTokenCountToK(value);
-  return contextWindowTokens !== undefined ? Math.min(contextWindowTokens, aligned) : aligned;
+  const normalizedWindow = normalizeTokenCount(contextWindowTokens);
+  const alignedWindow = normalizedWindow !== undefined && normalizedWindow >= TOKEN_STEP
+    ? Math.floor(normalizedWindow / TOKEN_STEP) * TOKEN_STEP
+    : undefined;
+  return alignedWindow === undefined ? aligned : Math.min(alignedWindow, aligned);
 }
 
 function clampPercent(value: unknown): number | undefined {
@@ -535,7 +539,7 @@ function tokensFromPercent(percent: number | undefined, contextWindowTokens: num
 
 function resolveThresholdTokens(trigger: LlmCompressionConfigRecord['trigger'] | undefined, contextWindowTokens: number | undefined): number | undefined {
   const thresholdTokens = trigger?.thresholdUnit === 'tokens' ? normalizeTokenCount(trigger.thresholdTokens) : undefined;
-  if (thresholdTokens !== undefined) return contextWindowTokens ? Math.min(thresholdTokens, contextWindowTokens) : thresholdTokens;
+  if (thresholdTokens !== undefined) return clampTokenCount(thresholdTokens, contextWindowTokens);
   return tokensFromPercent(clampPercent(trigger?.thresholdPercent) ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT, contextWindowTokens);
 }
 

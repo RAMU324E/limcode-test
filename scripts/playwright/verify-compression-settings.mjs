@@ -238,6 +238,10 @@ async function verifyViewport(browser, viewport, outputDirectory) {
     deviceScaleFactor: 1
   });
   const page = await context.newPage();
+  await page.route('**/favicon.ico', (route) => route.fulfill({
+    status: 204,
+    body: ''
+  }));
   const pageErrors = [];
   const consoleErrors = [];
   const consoleWarnings = [];
@@ -294,11 +298,37 @@ async function verifyViewport(browser, viewport, outputDirectory) {
     await page.waitForTimeout(100);
 
     await compressionSection.getByText('当前压缩方法：OpenAI 原生压缩', { exact: false }).waitFor({ state: 'visible' });
-    await compressionSection.getByText('完整输入 token 触发阈值', { exact: true }).waitFor({ state: 'visible' });
-    await compressionSection.getByText('最多 48k token', { exact: false }).first().waitFor({ state: 'visible' });
+    await compressionSection.getByText('完整输入 Token 触发阈值', { exact: true }).waitFor({ state: 'visible' });
+    await compressionSection.getByText('最多 48k Token', { exact: false }).first().waitFor({ state: 'visible' });
     const thresholdInput = compressionSection.locator('input.token-number-input');
     assert(await thresholdInput.inputValue() === '330000', '压缩阈值没有显示 mock snapshot 中的 330000 token');
-    await compressionSection.getByLabel('拖拽调整自动压缩触发阈值').waitFor({ state: 'visible' });
+    const thresholdSlider = compressionSection.getByLabel('拖拽调整自动压缩触发阈值');
+    await thresholdSlider.waitFor({ state: 'visible' });
+    const sliderAttributes = await thresholdSlider.evaluate((element) => ({
+      min: element.min,
+      max: element.max,
+      step: element.step
+    }));
+    assert(sliderAttributes.min === '0', `滑块没有使用从 0 开始的离散位置：${sliderAttributes.min}`);
+    assert(sliderAttributes.step === '1', `滑块没有使用整数位置步长：${sliderAttributes.step}`);
+    assert(Number(sliderAttributes.max) < fixtureProvider.contextWindowTokens, '滑块仍直接把大 Token 数交给原生 range');
+
+    await thresholdSlider.scrollIntoViewIfNeeded();
+    const sliderBox = await thresholdSlider.boundingBox();
+    assert(sliderBox, '无法读取压缩阈值滑块的位置');
+    await page.mouse.click(
+      sliderBox.x + sliderBox.width * 0.6,
+      sliderBox.y + sliderBox.height / 2
+    );
+    await page.waitForFunction(
+      () => Number(document.querySelector('input.token-number-input')?.value) > 1_000,
+      undefined,
+      { timeout: 5_000 }
+    );
+    const adjustedThreshold = Number(await thresholdInput.inputValue());
+    assert(Number.isSafeInteger(adjustedThreshold), `滑块调整后不是安全整数：${adjustedThreshold}`);
+    assert(adjustedThreshold >= 1_000, `滑块调整后错误回落到 ${adjustedThreshold} token`);
+    assert(adjustedThreshold % 1_000 === 0, `滑块调整后没有保持 1k 对齐：${adjustedThreshold}`);
 
     const layout = await compressionSection.evaluate((element) => {
       const rect = element.getBoundingClientRect();

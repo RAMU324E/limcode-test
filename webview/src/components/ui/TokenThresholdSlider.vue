@@ -36,12 +36,20 @@ const emit = defineEmits<{
 const safeStepTokens = computed(() => normalizePositiveInteger(props.stepTokens) ?? 1_000);
 const safeMinTokens = computed(() => normalizePositiveInteger(props.minTokens) ?? safeStepTokens.value);
 const rawMaxTokens = computed(() => normalizePositiveInteger(props.maxTokens) ?? 0);
-const enabled = computed(() => props.disabled !== true && rawMaxTokens.value > 0);
+const enabled = computed(() => props.disabled !== true && rawMaxTokens.value >= safeMinTokens.value);
 const rangeMaxTokens = computed(() => enabled.value ? Math.max(safeMinTokens.value, rawMaxTokens.value) : safeMinTokens.value);
+const rangeStepCount = computed(() => enabled.value
+  ? Math.max(0, Math.floor((rangeMaxTokens.value - safeMinTokens.value) / safeStepTokens.value))
+  : 0
+);
+const selectableMaxTokens = computed(() => safeMinTokens.value + rangeStepCount.value * safeStepTokens.value);
 const currentTokens = computed(() => enabled.value
   ? clampTokenCount(normalizePositiveInteger(props.modelValue) ?? safeMinTokens.value)
   : safeMinTokens.value
 );
+const currentStepIndex = computed(() => Math.round(
+  (currentTokens.value - safeMinTokens.value) / safeStepTokens.value
+));
 const recommendedValue = computed(() => {
   if (!enabled.value) return undefined;
   const value = normalizePositiveInteger(props.recommendedTokens);
@@ -63,11 +71,12 @@ function normalizePositiveInteger(value: unknown): number | undefined {
 }
 
 function alignTokenCount(value: number): number {
-  return Math.max(safeMinTokens.value, Math.round(value / safeStepTokens.value) * safeStepTokens.value);
+  const stepIndex = Math.max(0, Math.round((value - safeMinTokens.value) / safeStepTokens.value));
+  return safeMinTokens.value + stepIndex * safeStepTokens.value;
 }
 
 function clampTokenCount(value: number): number {
-  return Math.min(rangeMaxTokens.value, alignTokenCount(value));
+  return Math.min(selectableMaxTokens.value, alignTokenCount(value));
 }
 
 function percentForTokens(tokens: number): number {
@@ -91,9 +100,12 @@ function formatPercentLabel(value: number | undefined): string {
 
 function updateFromRange(event: Event): void {
   if (!enabled.value) return;
-  const value = Number((event.target as HTMLInputElement).value);
-  if (!Number.isFinite(value)) return;
-  const nextValue = clampTokenCount(value);
+  const input = event.currentTarget as HTMLInputElement;
+  const stepIndex = input.valueAsNumber;
+  if (!Number.isFinite(stepIndex)) return;
+  const nextValue = clampTokenCount(
+    safeMinTokens.value + Math.round(stepIndex) * safeStepTokens.value
+  );
   if (nextValue !== currentTokens.value) emit('update:modelValue', nextValue);
 }
 
@@ -128,13 +140,14 @@ function applyRecommended(): void {
     <input
       class="token-threshold-range-input"
       type="range"
-      :min="safeMinTokens"
-      :max="rangeMaxTokens"
-      :step="safeStepTokens"
-      :value="currentTokens"
+      :min="0"
+      :max="rangeStepCount"
+      :step="1"
+      :value="currentStepIndex"
       :disabled="!enabled"
       :style="rangeStyle"
       :aria-label="ariaLabel"
+      :aria-valuetext="`${currentTokens} Token`"
       @input="updateFromRange"
     />
     <button

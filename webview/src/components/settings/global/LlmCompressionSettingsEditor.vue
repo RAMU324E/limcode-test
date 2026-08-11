@@ -94,7 +94,7 @@ const compressionThresholdTokens = computed(() => {
   const tokenValue = trigger.value?.thresholdUnit === 'tokens'
     ? normalizeTokenCount(trigger.value.thresholdTokens)
     : undefined;
-  if (tokenValue !== undefined) return contextWindow > 0 ? Math.min(tokenValue, contextWindow) : tokenValue;
+  if (tokenValue !== undefined) return clampTokenToContext(tokenValue, contextWindow);
   if (contextWindow <= 0) return 0;
   return clampTokenToContext((contextWindow * configuredThresholdPercent.value) / 100, contextWindow);
 });
@@ -142,7 +142,10 @@ function alignTokenCountToK(value: number): number {
 
 function clampTokenToContext(value: number, contextWindow = props.contextWindowTokens): number {
   const aligned = alignTokenCountToK(value);
-  return contextWindow > 0 ? Math.min(contextWindow, aligned) : aligned;
+  const alignedContextWindow = contextWindow >= TOKEN_STEP
+    ? Math.floor(contextWindow / TOKEN_STEP) * TOKEN_STEP
+    : undefined;
+  return alignedContextWindow === undefined ? aligned : Math.min(alignedContextWindow, aligned);
 }
 
 function clampPercent(value: unknown): number {
