@@ -1,3 +1,4 @@
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type {
@@ -122,7 +123,7 @@ export async function readWorkspaceBinaryFile(relPath: string, mimeType: string,
     ? configuredMaxBytes
     : 20 * 1024 * 1024;
   if (stat.size > maxBytes) throw new Error(`File too large: ${stat.size} bytes (limit ${maxBytes}).`);
-  const data = await abortableFsCall(vscode.workspace.fs.readFile(uri), options.signal);
+  const data = await readWorkspaceFileBytes(uri, options.signal);
   return {
     path: uri.fsPath || normalizedPath,
     name: path.basename(uri.fsPath || normalizedPath),
@@ -564,17 +565,44 @@ async function readWorkspaceRawTextFile(relPath: string, maxBytes: number, optio
   if (!stat) return { path: relPath, existed: false, content: '' };
   if (stat.type !== vscode.FileType.File) throw new Error(`Not a file: ${relPath}`);
   if (stat.size > maxBytes) throw new Error(`File too large: ${stat.size} bytes (limit ${maxBytes}).`);
-  const data = await abortableFsCall(vscode.workspace.fs.readFile(uri), options.signal);
+  const data = await readWorkspaceFileBytes(uri, options.signal);
   return { path: relPath, existed: true, content: Buffer.from(data).toString('utf8') };
 }
 
 async function workspaceFileStat(uri: vscode.Uri, signal?: AbortSignal): Promise<vscode.FileStat | undefined> {
   try {
+    if (isNodeFsWorkspaceUri(uri)) {
+      const stat = await abortableFsCall(fs.stat(uri.fsPath), signal);
+      return {
+        type: stat.isFile()
+          ? vscode.FileType.File
+          : stat.isDirectory()
+            ? vscode.FileType.Directory
+            : vscode.FileType.Unknown,
+        ctime: stat.ctimeMs,
+        mtime: stat.mtimeMs,
+        size: stat.size
+      };
+    }
     return await abortableFsCall(vscode.workspace.fs.stat(uri), signal);
   } catch (error) {
     if (signal?.aborted) throw signal.reason ?? error;
     return undefined;
   }
+}
+
+function readWorkspaceFileBytes(uri: vscode.Uri, signal?: AbortSignal): Promise<Uint8Array> {
+  // Reliable turns intentionally keep running while a renderer reconnects. Local workspace reads
+  // therefore cannot depend on vscode.workspace.fs RPC, which may remain pending on the detached
+  // Extension Host even though its Node process and execution lease are still healthy.
+  if (isNodeFsWorkspaceUri(uri)) {
+    return abortableFsCall(fs.readFile(uri.fsPath), signal);
+  }
+  return abortableFsCall(vscode.workspace.fs.readFile(uri), signal);
+}
+
+function isNodeFsWorkspaceUri(uri: vscode.Uri): boolean {
+  return uri.scheme === 'file' && !!uri.fsPath && path.isAbsolute(uri.fsPath);
 }
 
 function abortableFsCall<T>(operation: PromiseLike<T>, signal?: AbortSignal): Promise<T> {

@@ -70,6 +70,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/provider-websocket-policy.test.mjs',
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',
   'tests/reliable-kernel/streaming-output-regressions.test.mjs',
+  'tests/reliable-kernel/vscode-fs-local-read.test.cjs',
   'tests/reliable-kernel/webview-feed-lifecycle.test.mjs',
   'tests/reliable-kernel/windows-runtime-compatibility.test.mjs',
   'tests/llmErrorRedaction.test.cjs',

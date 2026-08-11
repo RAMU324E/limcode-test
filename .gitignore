@@ -57,6 +57,7 @@ docs/architecture/*
 !/tests/reliable-kernel/child-agent-status-controls.test.cjs
 !/tests/reliable-kernel/frontend-copy-guardrails.test.cjs
 !/tests/reliable-kernel/windows-runtime-compatibility.test.mjs
+!/tests/reliable-kernel/vscode-fs-local-read.test.cjs
 !/tests/vscodeStorageJsonDurability.test.cjs
 !/webview/tests/
 /webview/tests/*
