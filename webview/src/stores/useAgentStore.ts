@@ -12,6 +12,8 @@ function isConfigurableAgent(agent: AgentRecord): boolean {
   return agent.runtimeRole !== 'mirror';
 }
 
+export const AGENT_DELETE_UNAVAILABLE_MESSAGE = '工作区隔离模式下，共享 Agent 暂不支持删除；仍可重命名或修改配置。';
+
 export const useAgentStore = defineStore('agent', {
   state: () => ({
     status: '',
@@ -92,9 +94,7 @@ export const useAgentStore = defineStore('agent', {
       const clientState = useClientStateStore();
       const agent = clientState.agents.find((item) => item.id === agentId);
       if (!agent || agent.source === 'builtin') return;
-      clientState.agents = clientState.agents.filter((item) => item.id !== agentId);
-      this.status = '正在删除 Agent...';
-      bridge.request(BridgeMessageType.AgentDelete, { agentId });
+      this.status = AGENT_DELETE_UNAVAILABLE_MESSAGE;
     }
   }
 });

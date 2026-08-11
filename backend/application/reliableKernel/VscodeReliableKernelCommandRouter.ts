@@ -230,8 +230,6 @@ export class VscodeReliableKernelCommandRouter {
         return;
       case BridgeMessageType.AgentDelete: {
         const payload = requirePayload(message.payload, 'Agent delete');
-        const links = await this.list('AgentConversationLink', { agent_id: payload.agentId }, 1);
-        if (links.length > 0) throw new Error('该 Agent 仍被 Conversation 引用，不能删除。');
         await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.deleteAgent(payload));
         return;
       }

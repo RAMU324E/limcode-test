@@ -142,16 +142,10 @@ export class VscodeConfigurationMutations {
     });
   }
 
-  public deleteAgent(payload: AgentDeletePayload): Promise<void> {
-    return this.mutate(async (paths) => {
-      const id = requireId(payload.agentId, 'agentId');
-      if (builtinAgent(id)) throw new Error('内置 Agent 不能删除。');
-      const spec = agentStore(paths);
-      const configured = await loadStore(spec);
-      if (!configured.some((record) => record.id === id)) return;
-      await saveStore(spec, configured.filter((record) => record.id !== id));
-      await this.clearOwnerScopes(paths, 'agent', id);
-    });
+  public async deleteAgent(payload: AgentDeletePayload): Promise<void> {
+    const id = requireId(payload.agentId, 'agentId');
+    if (builtinAgent(id)) throw new Error('内置 Agent 不能删除。');
+    throw new Error('工作区隔离模式下，共享 Agent 暂不支持删除；仍可重命名或修改配置。');
   }
 
   public createWorkflow(payload: WorkflowCreatePayload): Promise<WorkflowRecord> {
@@ -218,11 +212,12 @@ export class VscodeConfigurationMutations {
 
   public synchronizeWorkspaceFolders(folders: readonly { uri: string; name: string; rootPath: string; index: number }[]): Promise<void> {
     return this.mutate(async (paths) => {
+      // The store is shared by Extension Hosts. Only publish folders observed by this Host; absence
+      // here must not mark a folder used by another Host unavailable or rewrite shared policy defaults.
       const spec = workEnvironmentStore(paths);
       const records = await loadStore(spec);
       const byId = new Map(records.map((record) => [record.id, record]));
       const now = Date.now();
-      const activeIds = new Set<string>();
       let environmentsChanged = false;
       for (const folder of folders) {
         const uri = requireText(folder.uri, 'workspace folder uri');
@@ -243,45 +238,9 @@ export class VscodeConfigurationMutations {
           ? existing
           : record;
         if (next !== existing) environmentsChanged = true;
-        activeIds.add(next.id);
         byId.set(next.id, next);
       }
-      for (const [id, record] of byId) {
-        if (record.source === 'workspaceFolder' && !activeIds.has(id) && record.available) {
-          byId.set(id, { ...record, available: false, updatedAt: now });
-          environmentsChanged = true;
-        }
-      }
       if (environmentsChanged) await saveStore(spec, [...byId.values()]);
-
-      const availableIds = new Set([...byId.values()].filter((record) => record.available).map((record) => record.id));
-      const activeWorkspaceIds = [...activeIds];
-      const policies = workEnvironmentPolicyStore(paths);
-      let policiesChanged = false;
-      const nextPolicies = (await loadStore(policies)).map((policy) => {
-        const availableAllowed = policy.allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
-        const allowedWorkEnvironmentIds = availableAllowed.length > 0 || activeWorkspaceIds.length === 0
-          ? [...policy.allowedWorkEnvironmentIds]
-          : [...new Set([...policy.allowedWorkEnvironmentIds, ...activeWorkspaceIds])];
-        const eligibleDefaults = allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
-        const defaultWorkEnvironmentId = policy.defaultWorkEnvironmentId
-          && eligibleDefaults.includes(policy.defaultWorkEnvironmentId)
-          ? policy.defaultWorkEnvironmentId
-          : eligibleDefaults[0];
-        const unchanged = allowedWorkEnvironmentIds.length === policy.allowedWorkEnvironmentIds.length
-          && allowedWorkEnvironmentIds.every((id, index) => id === policy.allowedWorkEnvironmentIds[index])
-          && defaultWorkEnvironmentId === policy.defaultWorkEnvironmentId;
-        if (unchanged) return policy;
-        policiesChanged = true;
-        const { defaultWorkEnvironmentId: _staleDefault, ...rest } = policy;
-        return {
-          ...rest,
-          allowedWorkEnvironmentIds,
-          ...(defaultWorkEnvironmentId ? { defaultWorkEnvironmentId } : {}),
-          updatedAt: now
-        };
-      });
-      if (policiesChanged) await saveStore(policies, nextPolicies);
     });
   }
 

@@ -412,14 +412,14 @@ async function resolveRestoredPanelOptions(
 ): Promise<MainPanelOptions> {
   if (panelKind(options) !== 'chat') return options;
   await backendApp.waitUntilHydrated();
-  if (options.conversationId && await backendApp.conversationExists(options.conversationId)) {
+  if (options.conversationId && !await backendApp.conversationExists(options.conversationId)) {
+    throw new Error('当前工作区中找不到这个对话。它可能属于其他工作区，或已被删除；请打开原工作区后重试。');
+  }
+  if (options.conversationId) {
     return {
       ...options,
       title: backendApp.getConversationDisplayTitle(options.conversationId)
     };
-  }
-  if (options.conversationId) {
-    console.info(`[LimCode] Replacing stale restored Conversation panel: ${options.conversationId}`);
   }
   const existing = backendApp.getConversationHistoryEntries()[0];
   const conversationId = existing?.id ?? await backendApp.createConversation();

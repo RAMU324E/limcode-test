@@ -12,9 +12,8 @@ import CheckpointPolicyEditor from '@webview/components/settings/checkpoints/Che
 import SystemPromptScopeEditor from '@webview/components/settings/config/SystemPromptScopeEditor.vue';
 import RuntimeContextScopeEditor from '@webview/components/settings/config/RuntimeContextScopeEditor.vue';
 import ModelProfileScopeEditor from '@webview/components/settings/config/ModelProfileScopeEditor.vue';
-import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import InputPanel from '@webview/components/ui/InputPanel.vue';
-import { useAgentStore } from '@webview/stores/useAgentStore';
+import { AGENT_DELETE_UNAVAILABLE_MESSAGE, useAgentStore } from '@webview/stores/useAgentStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
 const agentStore = useAgentStore();
@@ -22,12 +21,11 @@ const { loading: agentLoading, text: agentLoadingText } = useSettingsLoadingText
 const activeAgentId = ref('');
 const createOpen = ref(false);
 const renameOpen = ref(false);
-const deleteOpen = ref(false);
 const settingsAgents = computed(() => agentStore.configurableAgents);
 const options = computed<SettingsDropdownOption[]>(() => settingsAgents.value.map((agent) => ({ value: agent.id, label: agent.name, description: agent.description || (agent.source === 'builtin' ? `内置 Agent · ${agent.kind}` : `用户 Agent · ${agent.kind}`), icon: IconRobot })));
 const activeAgent = computed<AgentRecord | undefined>(() => settingsAgents.value.find((agent) => agent.id === activeAgentId.value));
 const canDelete = computed(() => activeAgent.value?.source === 'user');
-const deleteActions: ConfirmPanelAction[] = [{ key: 'cancel', label: '取消', variant: 'secondary' }, { key: 'confirm', label: '删除' }];
+const deleteTitle = computed(() => canDelete.value ? AGENT_DELETE_UNAVAILABLE_MESSAGE : '内置 Agent 不能删除。');
 
 watch(() => settingsAgents.value.map((agent) => agent.id).join('|'), () => {
   if (activeAgentId.value && settingsAgents.value.some((agent) => agent.id === activeAgentId.value)) return;
@@ -37,7 +35,7 @@ watch(() => settingsAgents.value.map((agent) => agent.id).join('|'), () => {
 function updateDescription(event: Event): void { if (activeAgent.value) agentStore.updateDescription(activeAgent.value.id, (event.currentTarget as HTMLElement).textContent ?? ''); }
 function confirmCreate(name: string): void { createOpen.value = false; agentStore.createAgent(name); }
 function confirmRename(name: string): void { const agent = activeAgent.value; renameOpen.value = false; if (agent) agentStore.renameAgent(agent.id, name); }
-function confirmDelete(): void { const agent = activeAgent.value; deleteOpen.value = false; if (agent) agentStore.deleteAgent(agent.id); }
+function explainDeleteRestriction(): void { const agent = activeAgent.value; if (agent) agentStore.deleteAgent(agent.id); }
 </script>
 
 <template>
@@ -60,7 +58,7 @@ function confirmDelete(): void { const agent = activeAgent.value; deleteOpen.val
       <div class="agent-actions">
         <button type="button" class="icon-action" aria-label="新建 Agent" @click="createOpen = true"><IconPlus stroke="2" /></button>
         <button type="button" class="icon-action" aria-label="重命名 Agent" :disabled="!activeAgent" @click="renameOpen = true"><IconPencil stroke="2" /></button>
-        <button type="button" class="icon-action" aria-label="删除 Agent" :disabled="!canDelete" @click="deleteOpen = true"><IconTrash stroke="2" /></button>
+        <button type="button" class="icon-action" :aria-label="deleteTitle" :title="deleteTitle" :disabled="!canDelete" @click="explainDeleteRestriction"><IconTrash stroke="2" /></button>
       </div>
     </div>
 
@@ -90,7 +88,6 @@ function confirmDelete(): void { const agent = activeAgent.value; deleteOpen.val
 
     <InputPanel :open="createOpen" title="新建 Agent" description="输入 Agent 名称。创建后可配置提示词、LLM 和工具能力。" label="Agent 名称" placeholder="例如：Docs Agent" confirm-label="创建" @confirm="confirmCreate" @cancel="createOpen = false" />
     <InputPanel :open="renameOpen" title="重命名 Agent" label="Agent 名称" :initial-value="activeAgent?.name ?? ''" confirm-label="保存" @confirm="confirmRename" @cancel="renameOpen = false" />
-    <ConfirmPanel :open="deleteOpen" title="删除 Agent？" description-html="确定删除这个用户 Agent 及其单独配置吗？此操作无法撤销。" :actions="deleteActions" @confirm="confirmDelete" @cancel="deleteOpen = false" />
   </section>
 </template>
 

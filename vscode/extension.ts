@@ -4,9 +4,11 @@ import { MainPanel } from './panels/MainPanel';
 import { registerSidebarEntryView } from './views/SidebarEntryView';
 import { ApplicationStartup } from './ApplicationStartup';
 import type { VscodeReliableKernelApplicationFacade } from '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade';
+import type { WorkspaceRuntimeOwnerClaim } from './WorkspaceRuntimeOwnerClaim';
 import { EXTENSION_BRAND } from '../shared/extensionIdentity';
 
 let backendApp: VscodeReliableKernelApplicationFacade | undefined;
+let activeRuntimeOwnerClaim: WorkspaceRuntimeOwnerClaim | undefined;
 let activeStartup: ApplicationStartup | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -34,24 +36,59 @@ async function startApplication(
   startup: ApplicationStartup,
   activationStartedAt: number
 ): Promise<void> {
+  let openingClaim: WorkspaceRuntimeOwnerClaim | undefined;
   try {
     const moduleStartedAt = Date.now();
+    const [
+      { loadCommittedGlobalStatus, resolveDataRootUri },
+      { createVscodeStoragePaths },
+      {
+        resolveVscodeWorkspaceRuntimeOwnerClaimPath,
+        resolveVscodeWorkspaceRuntimePlacement,
+        resolveVscodeWorkspaceRuntimeScope
+      },
+      { acquireWorkspaceRuntimeOwnerClaim }
+    ] = await Promise.all([
+      import('../backend/capabilities/vscodeStorage/globalStatus'),
+      import('../backend/capabilities/vscodeStorage/paths'),
+      import('../backend/reliableKernel/vscodeRootAuthority'),
+      import('./WorkspaceRuntimeOwnerClaim')
+    ]);
+    await loadCommittedGlobalStatus(context);
+    const paths = createVscodeStoragePaths(resolveDataRootUri(context));
+    const runtimeScope = resolveVscodeWorkspaceRuntimeScope({
+      workspaceFileUri: vscode.workspace.workspaceFile?.toString(),
+      workspaceFolderUris: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString())
+    });
+    const runtimePlacement = await resolveVscodeWorkspaceRuntimePlacement(paths, runtimeScope);
+    openingClaim = await acquireWorkspaceRuntimeOwnerClaim({
+      claimPath: resolveVscodeWorkspaceRuntimeOwnerClaimPath(runtimePlacement),
+      workspaceKey: runtimeScope.key
+    });
+
     const { VscodeReliableKernelApplicationFacade } = await import(
       '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade'
     );
     const moduleLoadedAt = Date.now();
-    const application = await VscodeReliableKernelApplicationFacade.open(context);
+    const application = await VscodeReliableKernelApplicationFacade.open(context, { runtimePlacement });
     const applicationOpenedAt = Date.now();
 
     // Deactivation may race a slow filesystem/SQLite open. Publish the result so deactivate() can
     // close it, but never attach late watchers or recovery work to an obsolete activation.
     if (activeStartup !== startup) {
       startup.resolve(application);
-      await application.dispose();
+      try {
+        await application.dispose();
+      } finally {
+        await openingClaim.release();
+        openingClaim = undefined;
+      }
       return;
     }
 
     backendApp = application;
+    activeRuntimeOwnerClaim = openingClaim;
+    openingClaim = undefined;
     startup.resolve(application);
 
     console.log(
@@ -95,9 +132,21 @@ async function startApplication(
       );
     });
   } catch (error) {
-    startup.reject(error);
+    if (openingClaim) {
+      try {
+        await openingClaim.release();
+      } catch (releaseError) {
+        console.error(`${EXTENSION_BRAND} workspace Runtime owner claim failed to release.`, releaseError);
+      }
+    }
+    const startupError = workspaceRuntimeStartupError(error);
+    startup.reject(startupError);
     if (activeStartup !== startup) return;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = startupError instanceof Error ? startupError.message : String(startupError);
+    if (isWorkspaceRuntimeOwnerBusyError(error)) {
+      console.info(`${EXTENSION_BRAND} workspace Runtime is owned by another Extension Host.`, error);
+      return;
+    }
     console.error(`${EXTENSION_BRAND} reliable Runtime failed to open.`, error);
     void vscode.window.showErrorMessage(`${EXTENSION_BRAND} 运行时无法启动：${message}`);
   }
@@ -108,16 +157,40 @@ export async function deactivate(): Promise<void> {
   activeStartup = undefined;
   const app = backendApp;
   backendApp = undefined;
-  if (app) {
-    await app.dispose();
-    return;
-  }
-  if (!startup) return;
-  const pending = startup.pending();
-  if (!pending) return;
+  const ownerClaim = activeRuntimeOwnerClaim;
+  activeRuntimeOwnerClaim = undefined;
   try {
-    await (await pending).dispose();
-  } catch {
-    // Failed startup has no live application to close.
+    if (app) {
+      await app.dispose();
+      return;
+    }
+    if (!startup) return;
+    const pending = startup.pending();
+    if (!pending) return;
+    try {
+      await (await pending).dispose();
+    } catch {
+      // Failed startup has no live application to close.
+    }
+  } finally {
+    await ownerClaim?.release();
   }
+}
+
+function isWorkspaceRuntimeOwnerBusyError(error: unknown): error is {
+  code: 'workspace-runtime-owner-busy';
+  owner?: { pid?: unknown };
+} {
+  return Boolean(error && typeof error === 'object'
+    && (error as { code?: unknown }).code === 'workspace-runtime-owner-busy');
+}
+
+function workspaceRuntimeStartupError(error: unknown): unknown {
+  if (!isWorkspaceRuntimeOwnerBusyError(error)) return error;
+  const pid = typeof error.owner?.pid === 'number' ? `（Extension Host PID ${error.owner.pid}）` : '';
+  return new Error(
+    `当前工作区的 ${EXTENSION_BRAND} 已在另一个 VS Code 窗口运行${pid}。`
+    + '本窗口保持待机，不会再启动数据库或后台任务。'
+    + '关闭另一个窗口后重新加载本窗口即可接管；其他工作区不受影响。'
+  );
 }

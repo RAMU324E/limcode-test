@@ -17,6 +17,7 @@ after(() => { Module._load = originalLoad; });
 
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
+const { loadRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { frozenCompressionPolicy } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
 const { resolveToolPolicyLayers } = require('../../dist/extension/shared/toolPolicyResolution.js');
@@ -324,11 +325,12 @@ test('VscodeConfigurationAuthority 让 Agent 缺省 preset 继承全局 YOLO，�
   }
 });
 
-test('Workspace同步修复悬空WorkEnvironmentPolicy默认项并保留disabled本地边界模式', async () => {
+test('多个Host共享WorkEnvironment存储时只在本地投影当前Workspace可用性与有效策略', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-work-environment-rebind-'));
   try {
     const paths = createVscodeStoragePaths(vscode.Uri.file(root));
-    const authority = new VscodeConfigurationAuthority(() => paths);
+    const firstAuthority = new VscodeConfigurationAuthority(() => paths);
+    const secondAuthority = new VscodeConfigurationAuthority(() => paths);
     const firstPath = path.join(root, 'workspace-first');
     const secondPath = path.join(root, 'workspace-second');
     await fs.mkdir(firstPath, { recursive: true });
@@ -338,24 +340,106 @@ test('Workspace同步修复悬空WorkEnvironmentPolicy默认项并保留disabled
     const firstId = workEnvironmentIdFromUri(firstUri);
     const secondId = workEnvironmentIdFromUri(secondUri);
 
-    await authority.synchronizeWorkspaceFolders([{ uri: firstUri, name: 'First', rootPath: firstPath, index: 0 }]);
-    await authority.mutations.setWorkEnvironmentPolicy({
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Workspace Provider' }),
+      id: 'provider:workspace-isolation',
+      model: 'model:workspace-isolation',
+      models: [{ id: 'model:workspace-isolation', name: 'Workspace Model' }],
+      modelConfigs: []
+    };
+    await saveLatestGlobalSettings(firstAuthority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(firstAuthority, 'llm', { activeProviderConfigId: provider.id });
+
+    const eagerFirstAuthority = new VscodeConfigurationAuthority(() => paths, undefined, [{
+      uri: firstUri,
+      name: 'First',
+      rootPath: firstPath,
+      index: 0
+    }]);
+    const eagerFirstSnapshot = await eagerFirstAuthority.configurationClientState();
+    assert.equal(eagerFirstSnapshot.workEnvironments.find((record) => record.id === firstId)?.available, true);
+    assert.equal(eagerFirstSnapshot.workEnvironments.find((record) => record.id === secondId), undefined);
+
+    await firstAuthority.synchronizeWorkspaceFolders([{ uri: firstUri, name: 'First', rootPath: firstPath, index: 0 }]);
+    await firstAuthority.mutations.setWorkEnvironmentPolicy({
       scopeKind: 'global',
       enabled: false,
       allowedWorkEnvironmentIds: [firstId],
       defaultWorkEnvironmentId: firstId
     });
-    await authority.synchronizeWorkspaceFolders([{ uri: secondUri, name: 'Second', rootPath: secondPath, index: 0 }]);
+    await secondAuthority.synchronizeWorkspaceFolders([{ uri: secondUri, name: 'Second', rootPath: secondPath, index: 0 }]);
 
-    const snapshot = await authority.configurationClientState();
-    const policy = snapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
-    assert.ok(policy);
-    assert.equal(policy.enabled, false);
-    assert.equal(policy.allowedWorkEnvironmentIds.includes(firstId), true);
-    assert.equal(policy.allowedWorkEnvironmentIds.includes(secondId), true);
-    assert.equal(policy.defaultWorkEnvironmentId, secondId);
-    assert.equal(snapshot.workEnvironments.find((record) => record.id === firstId)?.available, false);
-    assert.equal(snapshot.workEnvironments.find((record) => record.id === secondId)?.available, true);
+    const storedEnvironments = await loadRecordStore(
+      paths.workEnvironmentsRootUri,
+      paths.workEnvironmentsIndexUri,
+      'workEnvironment'
+    );
+    assert.equal(storedEnvironments.find((record) => record.id === firstId)?.available, true);
+    assert.equal(storedEnvironments.find((record) => record.id === secondId)?.available, true);
+    const storedPolicies = await loadRecordStore(
+      paths.workEnvironmentPoliciesRootUri,
+      paths.workEnvironmentPoliciesIndexUri,
+      'policy'
+    );
+    const storedPolicy = storedPolicies.find((record) => record.id === 'work-environment-policy:global:global');
+    assert.deepEqual(storedPolicy?.allowedWorkEnvironmentIds, [firstId]);
+    assert.equal(storedPolicy?.defaultWorkEnvironmentId, firstId);
+
+    const firstSnapshot = await firstAuthority.configurationClientState();
+    const firstPolicy = firstSnapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
+    assert.deepEqual(firstPolicy?.allowedWorkEnvironmentIds, [firstId]);
+    assert.equal(firstPolicy?.defaultWorkEnvironmentId, firstId);
+    assert.equal(firstSnapshot.workEnvironments.find((record) => record.id === firstId)?.available, true);
+    assert.equal(firstSnapshot.workEnvironments.find((record) => record.id === secondId)?.available, false);
+
+    const secondSnapshot = await secondAuthority.configurationClientState();
+    const secondPolicy = secondSnapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
+    assert.equal(secondPolicy?.enabled, false);
+    assert.deepEqual(secondPolicy?.allowedWorkEnvironmentIds, [firstId, secondId]);
+    assert.equal(secondPolicy?.defaultWorkEnvironmentId, secondId);
+    assert.equal(secondSnapshot.workEnvironments.find((record) => record.id === firstId)?.available, false);
+    assert.equal(secondSnapshot.workEnvironments.find((record) => record.id === secondId)?.available, true);
+
+    const secondFrozen = JSON.parse((await secondAuthority.compile({
+      conversationId: 'conversation:second-workspace',
+      turnId: 'turn:second-workspace',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.deepEqual(secondFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [secondId]);
+    assert.equal(secondFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, secondId);
+
+    const manualId = 'work-environment:shared-remote';
+    await firstAuthority.mutations.upsertWorkEnvironment({
+      id: manualId,
+      kind: 'remoteServer',
+      source: 'manual',
+      name: 'Shared Remote',
+      host: 'example.test',
+      available: true,
+      createdAt: 1,
+      updatedAt: 1
+    });
+    await firstAuthority.mutations.setWorkEnvironmentPolicy({
+      scopeKind: 'global',
+      enabled: true,
+      allowedWorkEnvironmentIds: [manualId],
+      defaultWorkEnvironmentId: manualId
+    });
+    const manualSnapshot = await secondAuthority.configurationClientState();
+    const manualPolicy = manualSnapshot.workEnvironmentPolicies.find((record) => record.id === 'work-environment-policy:global:global');
+    assert.deepEqual(manualPolicy?.allowedWorkEnvironmentIds, [manualId]);
+    assert.equal(manualPolicy?.defaultWorkEnvironmentId, manualId);
+    assert.equal(manualSnapshot.workEnvironments.find((record) => record.id === manualId)?.available, true);
+
+    const manualFrozen = JSON.parse((await secondAuthority.compile({
+      conversationId: 'conversation:shared-remote',
+      turnId: 'turn:shared-remote',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.deepEqual(manualFrozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [manualId]);
+    assert.equal(manualFrozen.workEnvironmentPolicy.defaultWorkEnvironmentId, manualId);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

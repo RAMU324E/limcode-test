@@ -41,6 +41,10 @@ import {
 } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
 import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
+import {
+  createLocalFolderWorkEnvironmentRecord,
+  workEnvironmentIdFromUri
+} from '../../shared/workEnvironmentCatalog';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
 import {
   loadLlmCompressionConfigsSettings,
@@ -109,15 +113,27 @@ interface ConfigurationRecords {
 type ConfigurationClientRecords = Omit<ConfigurationRecords,
   'providerConfigs' | 'activeProviderConfigId' | 'compressionConfigs' | 'compressionSettings'>;
 
+interface CurrentWorkspaceFolder {
+  uri: string;
+  name: string;
+  rootPath: string;
+  index: number;
+}
+
 /** 每次 operation 重新经 getPaths 解析 settings authority；不读取或写入 Runtime SQLite。 */
 export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, AttachmentSettingsAuthority {
   public readonly mutations: VscodeConfigurationMutations;
+  /** Host-local workspace presence; shared WorkEnvironment records must not encode another Host's view. */
+  private currentWorkspaceFolderIds = new Set<string>();
+  private currentWorkspaceFolderRecords = new Map<string, WorkEnvironmentRecord>();
 
   public constructor(
     private readonly getPaths: () => StoragePaths,
-    private readonly context?: vscode.ExtensionContext
+    private readonly context?: vscode.ExtensionContext,
+    currentWorkspaceFolders: readonly CurrentWorkspaceFolder[] = []
   ) {
     this.mutations = new VscodeConfigurationMutations(getPaths);
+    this.setCurrentWorkspaceFolders(currentWorkspaceFolders);
   }
 
   public async compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority> {
@@ -393,10 +409,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     return { ...workflow };
   }
 
-  public synchronizeWorkspaceFolders(
-    folders: readonly { uri: string; name: string; rootPath: string; index: number }[]
+  public async synchronizeWorkspaceFolders(
+    folders: readonly CurrentWorkspaceFolder[]
   ): Promise<void> {
-    return this.mutations.synchronizeWorkspaceFolders(folders);
+    this.setCurrentWorkspaceFolders(folders);
+    await this.mutations.synchronizeWorkspaceFolders(folders);
   }
 
   /** Configuration-only projection. Runtime facts remain exclusively on the bounded reliable Feed. */
@@ -626,11 +643,41 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
 
   private async loadWorkEnvironments(): Promise<WorkEnvironmentRecord[]> {
     const paths = this.getPaths();
-    return (await loadRecordStore<WorkEnvironmentRecord, 'workEnvironment'>(
+    const records = (await loadRecordStore<WorkEnvironmentRecord, 'workEnvironment'>(
       paths.workEnvironmentsRootUri,
       paths.workEnvironmentsIndexUri,
       'workEnvironment'
     )) ?? [];
+    const projected = new Map(records.map((record) => [
+      record.id,
+      record.source === 'workspaceFolder'
+        ? { ...record, available: this.currentWorkspaceFolderIds.has(record.id) }
+        : record
+    ]));
+    for (const [id, current] of this.currentWorkspaceFolderRecords) {
+      const persisted = projected.get(id);
+      projected.set(id, persisted
+        ? { ...current, createdAt: persisted.createdAt, updatedAt: persisted.updatedAt }
+        : current);
+    }
+    return [...projected.values()];
+  }
+
+  private setCurrentWorkspaceFolders(folders: readonly CurrentWorkspaceFolder[]): void {
+    const observedAt = Date.now();
+    const records = folders.map((folder) => createLocalFolderWorkEnvironmentRecord({
+      id: workEnvironmentIdFromUri(folder.uri),
+      name: folder.name || folder.rootPath,
+      uri: folder.uri,
+      rootPath: folder.rootPath,
+      displayPath: folder.rootPath,
+      index: folder.index,
+      available: true,
+      createdAt: observedAt,
+      updatedAt: observedAt
+    }, observedAt));
+    this.currentWorkspaceFolderRecords = new Map(records.map((record) => [record.id, record]));
+    this.currentWorkspaceFolderIds = new Set(this.currentWorkspaceFolderRecords.keys());
   }
 
   private async loadConfigurationClientRecords(): Promise<ConfigurationClientRecords> {
@@ -716,11 +763,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         paths.runtimeContextScopeLinksIndexUri,
         'link'
       ),
-      loadRecordStore<WorkEnvironmentRecord, 'workEnvironment'>(
-        paths.workEnvironmentsRootUri,
-        paths.workEnvironmentsIndexUri,
-        'workEnvironment'
-      ),
+      this.loadWorkEnvironments(),
       loadRecordStore<WorkEnvironmentPolicyRecord, 'policy'>(
         paths.workEnvironmentPoliciesRootUri,
         paths.workEnvironmentPoliciesIndexUri,
@@ -752,6 +795,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         'link'
       )
     ]);
+    const effectiveWorkEnvironmentPolicies = projectWorkEnvironmentPolicies(
+      workEnvironmentPolicies ?? [],
+      workEnvironments ?? [],
+      this.currentWorkspaceFolderIds
+    );
     return {
       agents: mergeAgentsWithBuiltins(agents ?? []),
       workflows: mergeWorkflowsWithBuiltins(workflows ?? []),
@@ -768,7 +816,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       runtimeContexts: runtimeContexts ?? [],
       runtimeContextScopeLinks: runtimeContextScopeLinks ?? [],
       workEnvironments: workEnvironments ?? [],
-      workEnvironmentPolicies: workEnvironmentPolicies ?? [],
+      workEnvironmentPolicies: effectiveWorkEnvironmentPolicies,
       workEnvironmentPolicyScopeLinks: workEnvironmentPolicyScopeLinks ?? [],
       checkpointPolicies: checkpointPolicies ?? [],
       checkpointPolicyScopeLinks: checkpointPolicyScopeLinks ?? [],
@@ -804,6 +852,36 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     };
   }
 
+}
+
+function projectWorkEnvironmentPolicies(
+  policies: readonly WorkEnvironmentPolicyRecord[],
+  environments: readonly WorkEnvironmentRecord[],
+  currentWorkspaceFolderIds: ReadonlySet<string>
+): WorkEnvironmentPolicyRecord[] {
+  const availableIds = new Set(
+    environments.filter((environment) => environment.available).map((environment) => environment.id)
+  );
+  const workspaceIds = [...currentWorkspaceFolderIds].filter((id) => availableIds.has(id));
+  return policies.map((policy) => {
+    const configuredAvailableIds = policy.allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
+    // Preserve the former automatic local-folder fallback without publishing this Host's default
+    // into the shared policy store. Any configured environment that is usable here still wins.
+    const allowedWorkEnvironmentIds = configuredAvailableIds.length > 0 || workspaceIds.length === 0
+      ? [...policy.allowedWorkEnvironmentIds]
+      : [...new Set([...policy.allowedWorkEnvironmentIds, ...workspaceIds])];
+    const eligibleDefaultIds = allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
+    const defaultWorkEnvironmentId = policy.defaultWorkEnvironmentId
+      && eligibleDefaultIds.includes(policy.defaultWorkEnvironmentId)
+      ? policy.defaultWorkEnvironmentId
+      : eligibleDefaultIds[0];
+    const { defaultWorkEnvironmentId: _storedDefault, ...rest } = policy;
+    return {
+      ...rest,
+      allowedWorkEnvironmentIds,
+      ...(defaultWorkEnvironmentId ? { defaultWorkEnvironmentId } : {})
+    };
+  });
 }
 
 interface FrozenCompressionResolution {

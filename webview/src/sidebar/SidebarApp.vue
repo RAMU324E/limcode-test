@@ -102,7 +102,7 @@ const activeScopeKey = computed(() => scopeOptionKey(activeScopeKind.value, acti
 const scopeOptions = computed<ScopeOption[]>(() => {
   const options: ScopeOption[] = [
     { key: 'currentProject', label: currentScopeLabel.value, scopeKind: 'currentProject' },
-    { key: 'all', label: '全部', scopeKind: 'all' },
+    { key: 'all', label: '工作区全部', scopeKind: 'all' },
     { key: 'unbound', label: '未绑定', scopeKind: 'unbound' }
   ];
 
@@ -764,7 +764,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
       <div class="history-list-shell">
         <div v-if="!historyReady" class="history-initializing" role="status" aria-live="polite">
           <span class="history-initializing-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-          <span>正在连接本地运行时并读取当前项目…</span>
+          <span>正在连接本地运行时并读取当前工作区…</span>
         </div>
         <div v-else ref="historyList" class="history-list" role="tree" aria-label="分级对话历史">
           <div

@@ -10,7 +10,12 @@ import { RUNTIME_KERNEL_EPOCH } from '../../reliableKernel/contracts';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
-import { createVscodeRootAuthority } from '../../reliableKernel/vscodeRootAuthority';
+import {
+  createVscodeRootAuthority,
+  resolveVscodeWorkspaceRuntimePlacement,
+  resolveVscodeWorkspaceRuntimeScope,
+  type VscodeWorkspaceRuntimePlacement
+} from '../../reliableKernel/vscodeRootAuthority';
 import type { RuntimeCommitResult } from '../../reliableKernel/contracts';
 import {
   DEFAULT_CONVERSATION_TITLE,
@@ -50,6 +55,11 @@ const HISTORY_CACHE_LIMIT = 512;
 const HISTORY_CONTENT_READ_CONCURRENCY = 4;
 const DEFAULT_HISTORY_PAGE_SIZE = 50;
 
+export interface VscodeReliableKernelApplicationFacadeOpenOptions {
+  /** Startup may pre-resolve and claim this immutable placement before importing the full backend. */
+  runtimePlacement?: VscodeWorkspaceRuntimePlacement;
+}
+
 /** VS Code shell facade backed only by the reliable SQLite/CAS Runtime and independent settings authority. */
 export class VscodeReliableKernelApplicationFacade implements ApplicationFacade {
   private readonly historyEmitter = new vscode.EventEmitter<void>();
@@ -73,7 +83,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private constructor(
     private readonly context: vscode.ExtensionContext,
     public readonly product: VscodeReliableKernelProductRuntime,
-    private readonly getPaths: () => StoragePaths
+    private readonly getPaths: () => StoragePaths,
+    private readonly runtimePlacement: VscodeWorkspaceRuntimePlacement
   ) {
     this.commandRouter = new VscodeReliableKernelCommandRouter(product, {
       broadcast: (message) => this.broadcast(message),
@@ -92,13 +103,26 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.unsubscribeCommit = product.application.database.onCommit((commit) => this.onRuntimeCommit(commit));
   }
 
-  public static async open(context: vscode.ExtensionContext): Promise<VscodeReliableKernelApplicationFacade> {
+  public static async open(
+    context: vscode.ExtensionContext,
+    options: VscodeReliableKernelApplicationFacadeOpenOptions = {}
+  ): Promise<VscodeReliableKernelApplicationFacade> {
     await loadCommittedGlobalStatus(context);
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
-    const authority = createVscodeRootAuthority(getPaths);
-    await new VscodeReliableKernelCutoverCoordinator(authority, getPaths().globalStoragePath).ensureCurrentRoot();
-    const product = await VscodeReliableKernelProductRuntime.open(context, { authority });
-    return new VscodeReliableKernelApplicationFacade(context, product, getPaths);
+    const runtimePlacement = options.runtimePlacement ?? await resolveVscodeWorkspaceRuntimePlacement(
+      getPaths(),
+      resolveVscodeWorkspaceRuntimeScope({
+        workspaceFileUri: vscode.workspace.workspaceFile?.toString(),
+        workspaceFolderUris: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString())
+      })
+    );
+    const authority = createVscodeRootAuthority(runtimePlacement);
+    await new VscodeReliableKernelCutoverCoordinator(
+      authority,
+      runtimePlacement.runtimeScopeRootPath
+    ).ensureCurrentRoot();
+    const product = await VscodeReliableKernelProductRuntime.open(context, { authority, runtimePlacement });
+    return new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
   }
 
   /** Starts the history/watcher hydration after VS Code surfaces have been registered. */
@@ -467,7 +491,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.requireOpen();
     const binding = this.product.application.database.binding;
     const controlRoot = path.dirname(binding.paths.rootPointerPath);
-    const storageRoot = this.getPaths().globalStoragePath;
+    const storageRoot = this.runtimePlacement.runtimeScopeRootPath;
     const backupRoot = path.join(storageRoot, '.limcode-runtime-backups');
     const backupPath = path.join(backupRoot, timestampSlug());
     this.unsubscribeCommit?.();
@@ -482,8 +506,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     } catch (error) {
       if (!isMissingPathError(error)) throw error;
     }
-    const authority = createVscodeRootAuthority(this.getPaths);
-    await new VscodeReliableKernelCutoverCoordinator(authority, this.getPaths().globalStoragePath).ensureCurrentRoot();
+    const authority = createVscodeRootAuthority(this.runtimePlacement);
+    await new VscodeReliableKernelCutoverCoordinator(authority, storageRoot).ensureCurrentRoot();
     return {
       dataRootPath: storageRoot,
       epoch: RUNTIME_KERNEL_EPOCH,

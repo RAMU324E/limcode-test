@@ -19,7 +19,12 @@ import {
 } from '../../reliableKernel/runtimeApplication';
 import { RootAuthority } from '../../reliableKernel/rootAuthority';
 import { ReliableToolDispatcher } from '../../reliableKernel/toolDispatcher';
-import { createVscodeRootAuthority } from '../../reliableKernel/vscodeRootAuthority';
+import {
+  createVscodeRootAuthority,
+  resolveVscodeWorkspaceRuntimePlacement,
+  resolveVscodeWorkspaceRuntimeScope,
+  type VscodeWorkspaceRuntimePlacement
+} from '../../reliableKernel/vscodeRootAuthority';
 import { VscodeConfigurationAuthority } from '../../reliableKernel/vscodeConfigurationAuthority';
 import {
   VscodeReliableToolHost,
@@ -32,6 +37,8 @@ import { ReliableConversationRunner } from './ReliableConversationRunner';
 export interface VscodeReliableKernelProductRuntimeOptions {
   /** Tests/candidate validation may supply an isolated authority. Production resolves it through getPaths(). */
   authority?: RootAuthority;
+  /** Facade startup passes the immutable workspace placement used to construct authority. */
+  runtimePlacement?: VscodeWorkspaceRuntimePlacement;
   transientObserver?: ReliableAgentTransientObserver;
   lifecycleObserver?: ReliableAgentLifecycleObserver;
   dispatchSpecial?: VscodeReliableToolHostOptions['dispatchSpecial'];
@@ -93,20 +100,33 @@ export class VscodeReliableKernelProductRuntime {
     options: VscodeReliableKernelProductRuntimeOptions = {}
   ): Promise<VscodeReliableKernelProductRuntime> {
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
-    const configuration = new VscodeConfigurationAuthority(getPaths, context);
+    const workspaceFolders = (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
+      uri: folder.uri.toString(),
+      name: folder.name,
+      rootPath: folder.uri.fsPath,
+      index
+    }));
+    const configuration = new VscodeConfigurationAuthority(
+      getPaths,
+      context,
+      workspaceFolders
+    );
     let configurationInitialization: Promise<void> | undefined;
     const initializeConfiguration = (): Promise<void> => {
-      configurationInitialization ??= configuration.synchronizeWorkspaceFolders(
-        (vscode.workspace.workspaceFolders ?? []).map((folder, index) => ({
-          uri: folder.uri.toString(),
-          name: folder.name,
-          rootPath: folder.uri.fsPath,
-          index
-        }))
-      );
+      configurationInitialization ??= configuration.synchronizeWorkspaceFolders(workspaceFolders);
       return configurationInitialization;
     };
-    const authority = options.authority ?? createVscodeRootAuthority(getPaths);
+    let authority = options.authority;
+    if (!authority) {
+      const runtimePlacement = options.runtimePlacement ?? await resolveVscodeWorkspaceRuntimePlacement(
+        getPaths(),
+        resolveVscodeWorkspaceRuntimeScope({
+          workspaceFileUri: vscode.workspace.workspaceFile?.toString(),
+          workspaceFolderUris: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString())
+        })
+      );
+      authority = createVscodeRootAuthority(runtimePlacement);
+    }
     const diagnostics = new ReliableDiagnosticJournal(authority, await authority.current());
     let application: ReliableKernelApplication | undefined;
     let childAgents: ReliableChildAgentCoordinator | undefined;
