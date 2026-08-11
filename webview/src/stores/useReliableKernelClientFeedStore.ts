@@ -255,8 +255,8 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         this.historyRecords = reconcileHistoryRecordsWithLiveChanges(
           this.historyRecords,
           envelope,
-          result.state.records,
-          rolledMessageIds
+          this.records,
+          result.state.records
         );
       }
       let replayDetails: Array<{
@@ -295,6 +295,12 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       this.projections = result.state.projections;
       this.records = result.state.records;
       this.snapshotRequired = result.state.snapshotRequired;
+      if (result.ack && incomingType === RELIABLE_KERNEL_CHANGES_MESSAGE) {
+        this.transientModelRequests = removeTransientModelRequests(
+          this.transientModelRequests,
+          removedModelRequestIds(envelope)
+        );
+      }
       if (incomingGeneration) this.navigationGeneration = incomingGeneration;
       if (result.ack) {
         if (historyInvalidated) {
@@ -1287,22 +1293,55 @@ function rolledMessageCausalRecordIds(
 function reconcileHistoryRecordsWithLiveChanges(
   history: ReliableKernelBoundedClientState['records'],
   envelope: Record<string, unknown> | undefined,
-  nextLive: ReliableKernelBoundedClientState['records'],
-  rolledMessageIds: ReadonlySet<string>
+  previousLive: ReliableKernelBoundedClientState['records'],
+  nextLive: ReliableKernelBoundedClientState['records']
 ): ReliableKernelBoundedClientState['records'] {
   const changes = Array.isArray(envelope?.changes) ? envelope.changes : [];
+  const finalEvictedRecords = new Map<
+    string,
+    ReliableKernelBoundedClientState['records'][string][string]
+  >();
+  const windowEvictionKeys = new Set(changes.flatMap((value) => {
+    const change = plainRecord(value);
+    const type = nonEmptyString(change?.type);
+    const id = nonEmptyString(change?.id);
+    return type && id && change?.operation === 'remove' && change.removalCause === 'window-eviction'
+      ? [`${type}\0${id}`]
+      : [];
+  }));
+  for (const value of changes) {
+    const change = plainRecord(value);
+    const type = nonEmptyString(change?.type);
+    const id = nonEmptyString(change?.id);
+    const record = plainRecord(change?.record);
+    if (type && id && record && change?.operation === 'upsert' && windowEvictionKeys.has(`${type}\0${id}`)) {
+      finalEvictedRecords.set(
+        `${type}\0${id}`,
+        record as ReliableKernelBoundedClientState['records'][string][string]
+      );
+    }
+  }
   let next = history;
   const copiedTypes = new Set<string>();
   for (const value of changes) {
     const change = plainRecord(value);
     const type = nonEmptyString(change?.type);
     const id = nonEmptyString(change?.id);
-    if (!type || !id || !history[type]?.[id]) continue;
-    if (type === 'Message' && change?.operation === 'remove' && rolledMessageIds.has(id)) continue;
+    if (!type || !id) continue;
+    const windowEviction = change?.operation === 'remove'
+      && change.removalCause === 'window-eviction';
+    const previousRecord = previousLive[type]?.[id];
+    const finalEvictedRecord = finalEvictedRecords.get(`${type}\0${id}`) ?? previousRecord;
+    if (windowEviction && !finalEvictedRecord) continue;
+    if (!windowEviction && !history[type]?.[id] && !next[type]?.[id]) continue;
     if (next === history) next = { ...history };
     if (!copiedTypes.has(type)) {
       next[type] = { ...(history[type] ?? {}) };
       copiedTypes.add(type);
+    }
+    if (windowEviction) {
+      next[type][id] = finalEvictedRecord!;
+      continue;
     }
     const liveRecord = nextLive[type]?.[id];
     if (change?.operation === 'remove' || !liveRecord) {
@@ -1311,6 +1350,30 @@ function reconcileHistoryRecordsWithLiveChanges(
       next[type][id] = liveRecord;
     }
   }
+  return next;
+}
+
+function removedModelRequestIds(
+  envelope: Record<string, unknown> | undefined
+): Set<string> {
+  const removed = new Set<string>();
+  const changes = Array.isArray(envelope?.changes) ? envelope.changes : [];
+  for (const value of changes) {
+    const change = plainRecord(value);
+    if (change?.type !== 'ModelRequest' || change.operation !== 'remove') continue;
+    const id = nonEmptyString(change.id);
+    if (id) removed.add(id);
+  }
+  return removed;
+}
+
+function removeTransientModelRequests(
+  current: Record<string, ReliableKernelTransientState>,
+  removedIds: ReadonlySet<string>
+): Record<string, ReliableKernelTransientState> {
+  if (![...removedIds].some((id) => current[id])) return current;
+  const next = { ...current };
+  for (const id of removedIds) delete next[id];
   return next;
 }
 

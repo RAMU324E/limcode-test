@@ -22,6 +22,8 @@ export interface ReliableKernelClientChange {
   operation: 'upsert' | 'remove';
   id: string;
   record?: { [key: string]: PlainData };
+  /** The durable record still exists; only the bounded live projection is releasing it. */
+  removalCause?: 'window-eviction';
 }
 
 export interface ReliableKernelSnapshotMessage {

@@ -26,6 +26,7 @@ import {
   CLIENT_MAX_INFLIGHT_DATA_MESSAGES,
   CLIENT_MAX_QUEUED_BATCHES,
   CLIENT_MAX_QUEUED_BYTES,
+  CLIENT_MESSAGE_WINDOW_LIMIT,
   CLIENT_PAGE_MAX_BYTES,
   CLIENT_PAGE_MAX_ROWS,
   CLIENT_SNAPSHOT_MAX_BYTES
@@ -82,6 +83,10 @@ interface QueuedDataMessage {
   commitSeq: string;
 }
 
+type ClientScopedRuntimeChange = RuntimeChange & {
+  removalCause?: 'window-eviction';
+};
+
 interface ClientFeedSession {
   sessionId: string;
   hostBootId: string;
@@ -104,6 +109,7 @@ interface ClientFeedSession {
   activeRecordKeys: Set<string>;
   activeRecordKeyRefCounts: Map<string, number>;
   materializedRecordKeys: Set<string>;
+  materializedRecords: Map<string, Record<string, unknown>>;
   materializedRecordReferences: Map<string, Set<string>>;
   materializedRecordTemporal: Map<string, string>;
   activeRecordCounts: Map<string, number>;
@@ -115,6 +121,7 @@ interface ClientFeedSession {
   primaryTurnIds: Set<string>;
   visibleMessageIds: Set<string>;
   projectedToolCallIds: Set<string>;
+  currentTaskSourceMessageId: string | null;
   closed: boolean;
 }
 
@@ -173,6 +180,7 @@ export class BoundedClientFeed {
       activeRecordKeys: new Set<string>(),
       activeRecordKeyRefCounts: new Map<string, number>(),
       materializedRecordKeys: new Set<string>(),
+      materializedRecords: new Map<string, Record<string, unknown>>(),
       materializedRecordReferences: new Map<string, Set<string>>(),
       materializedRecordTemporal: new Map<string, string>(),
       activeRecordCounts: new Map<string, number>(),
@@ -183,6 +191,7 @@ export class BoundedClientFeed {
       primaryTurnIds: new Set<string>(),
       visibleMessageIds: new Set<string>(),
       projectedToolCallIds: new Set<string>(),
+      currentTaskSourceMessageId: null,
       closed: false
     };
     this.sessions.set(session.sessionId, session);
@@ -414,13 +423,18 @@ export class BoundedClientFeed {
 
   private createChangesMessage(
     session: ClientFeedSession,
-    commit: RuntimeCommitResult
+    commit: Omit<RuntimeCommitResult, 'changes'> & { changes: ClientScopedRuntimeChange[] }
   ): ReliableKernelChangesMessage {
     const changes: ReliableKernelClientChange[] = [];
     for (const change of commit.changes) {
       if (!RELIABLE_KERNEL_CLIENT_CHANGE_TYPES.has(change.domain as never)) continue;
       if (change.kind === 'remove') {
-        changes.push({ type: change.domain, operation: 'remove', id: change.id });
+        changes.push({
+          type: change.domain,
+          operation: 'remove',
+          id: change.id,
+          ...(change.removalCause ? { removalCause: change.removalCause } : {})
+        });
         continue;
       }
       if (!change.record) throw new Error(`Committed client upsert ${change.domain}/${change.id} has no record projection.`);
@@ -441,11 +455,13 @@ export class BoundedClientFeed {
   private scopeCommit(
     session: ClientFeedSession,
     commit: RuntimeCommitResult
-  ): { changes: RuntimeChange[]; requiresSnapshot: boolean } {
-    const accepted: RuntimeChange[] = [];
-    const evictions: RuntimeChange[] = [];
+  ): { changes: ClientScopedRuntimeChange[]; requiresSnapshot: boolean } {
+    const accepted: ClientScopedRuntimeChange[] = [];
+    const evictions: ClientScopedRuntimeChange[] = [];
     const pending: RuntimeChange[] = [];
     let requiresSnapshot = false;
+    let messageWindowAdvanced = false;
+    let taskProjectionRefreshRequired = false;
 
     for (const change of commit.changes) {
       // These persisted facts retain their current-epoch detail/none client mappings. The database
@@ -477,12 +493,8 @@ export class BoundedClientFeed {
         }
         if (session.materializedRecordKeys.has(key)) {
           accepted.push(change);
-          decrementRecordCount(session.activeRecordCounts, change.domain);
-          releaseMaterializedRecordReferences(session, key);
+          removeMaterializedRecord(session, key);
         }
-        forgetMessageDisplayFloor(session, key);
-        session.materializedRecordKeys.delete(key);
-        session.materializedRecordTemporal.delete(key);
         // Structural owner/link removal is replayed from one fresh causal snapshot. Ephemeral
         // leaves such as an ExecutionLease can still be removed in the atomic live batch.
         if (SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS.has(change.domain)) requiresSnapshot = true;
@@ -517,43 +529,63 @@ export class BoundedClientFeed {
         const wasKnown = session.materializedRecordKeys.has(ownKey);
         accepted.push(acceptedChange);
         pending.splice(index, 1);
-        if (wasKnown) releaseMaterializedRecordReferences(session, ownKey);
+        if (wasKnown) {
+          forgetScopedProjectionIdentity(
+            session,
+            change.domain,
+            change.id,
+            session.materializedRecords.get(ownKey)
+          );
+          releaseMaterializedRecordReferences(session, ownKey);
+        }
         session.materializedRecordKeys.add(ownKey);
+        session.materializedRecords.set(ownKey, record);
         session.materializedRecordTemporal.set(ownKey, recordTemporalKey(change.domain, record, change.id));
         retainMaterializedRecordReferences(session, change.domain, change.id, record);
         rememberScopedProjectionIdentity(session, change.domain, change.id, record);
+        if (
+          !wasKnown
+          && change.domain === 'Turn'
+          && record.conversation_id === session.activeConversationId
+          && session.currentTaskSourceMessageId
+        ) {
+          taskProjectionRefreshRequired = true;
+        }
+        if (
+          change.domain === 'ToolOutcome'
+          && record.status === 'succeeded'
+          && !session.currentTaskSourceMessageId
+        ) {
+          const toolCallId = recordStringField(record, 'tool_call_id');
+          const toolCall = toolCallId
+            ? session.materializedRecords.get(recordKey('ToolCall', toolCallId))
+            : undefined;
+          if (toolCall?.tool_name === 'update_task_list' || toolCall?.tool_name === 'submit_plan') {
+            taskProjectionRefreshRequired = true;
+          }
+        }
         if (!wasKnown) {
+          if (change.domain === 'Message') messageWindowAdvanced = true;
           const count = incrementRecordCount(session.activeRecordCounts, change.domain);
           if (
             count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE
             && LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(change.domain)
+            && change.domain !== 'Message'
           ) {
-            if (change.domain === 'Message') {
-              const victim = oldestMaterializedRecord(session, 'Message');
-              if (victim && !hasMaterializedReferenceFrom(session, victim, [
-                'MessageTurnLink',
-                'ModelRequestMessageLink',
-                'ToolCallSourceLink'
-              ])) {
-                releaseMaterializedRecordReferences(session, victim);
-                forgetMessageDisplayFloor(session, victim);
-                session.visibleMessageIds.delete(recordIdFromKey(victim));
-                session.materializedRecordKeys.delete(victim);
-                session.materializedRecordTemporal.delete(victim);
-                decrementRecordCount(session.activeRecordCounts, 'Message');
-                evictions.push({ domain: 'Message', kind: 'remove', id: recordIdFromKey(victim) });
-              } else {
-                requiresSnapshot = true;
-              }
-            } else {
-              // Never evict a relationship-bearing root type independently. The snapshot builder
-              // chooses temporal roots and returns their complete normalized dependency closure.
-              requiresSnapshot = true;
-            }
+            // Never evict a relationship-bearing root type independently. The snapshot builder
+            // chooses temporal roots and returns their complete normalized dependency closure.
+            requiresSnapshot = true;
           }
         }
         changed = true;
       }
+    }
+
+    if (taskProjectionRefreshRequired) requiresSnapshot = true;
+    if (!requiresSnapshot && messageWindowAdvanced) {
+      const rollover = evictMessagesOutsideLiveWindow(session);
+      evictions.push(...rollover.changes);
+      requiresSnapshot = rollover.requiresSnapshot;
     }
 
     const acceptedById = new Map(accepted.map((change) => [
@@ -730,6 +762,7 @@ export class BoundedClientFeed {
     session.activeRecordKeys.clear();
     session.activeRecordKeyRefCounts.clear();
     session.materializedRecordKeys.clear();
+    session.materializedRecords.clear();
     session.materializedRecordReferences.clear();
     session.materializedRecordTemporal.clear();
     session.activeRecordCounts.clear();
@@ -740,6 +773,7 @@ export class BoundedClientFeed {
     session.primaryTurnIds.clear();
     session.visibleMessageIds.clear();
     session.projectedToolCallIds.clear();
+    session.currentTaskSourceMessageId = null;
     const navigation = projections.navigationSummary;
     if (isPlainRecord(navigation) && Array.isArray(navigation.conversations)) {
       for (const conversation of navigation.conversations) {
@@ -755,6 +789,7 @@ export class BoundedClientFeed {
         value,
         session.activeRecordKeys,
         session.activeRecordKeyRefCounts,
+        session.materializedRecords,
         session.materializedRecordReferences,
         session.activeRecordCounts,
         countedRecords,
@@ -772,6 +807,12 @@ export class BoundedClientFeed {
           session.visibleMessageIds.add(message.id);
           const displayFloor = plainNonNegativeBigInt(message.display_seq);
           if (displayFloor > 0n) session.messageDisplayFloors.set(message.id, displayFloor);
+        }
+      }
+      if (isPlainRecord(activeWindow.currentTaskList)) {
+        const sourceMessageId = activeWindow.currentTaskList.sourceMessageId;
+        if (typeof sourceMessageId === 'string' && sourceMessageId) {
+          session.currentTaskSourceMessageId = sourceMessageId;
         }
       }
     }
@@ -1905,6 +1946,22 @@ function releaseMaterializedRecordReferences(session: ClientFeedSession, ownKey:
   for (const reference of references) releaseActiveRecordKey(session, reference);
 }
 
+function removeMaterializedRecord(session: ClientFeedSession, ownKey: string): void {
+  if (!session.materializedRecordKeys.has(ownKey)) return;
+  const domain = recordDomainFromKey(ownKey);
+  const id = recordIdFromKey(ownKey);
+  if (domain === 'Message' && session.currentTaskSourceMessageId === id) {
+    session.currentTaskSourceMessageId = null;
+  }
+  forgetScopedProjectionIdentity(session, domain, id, session.materializedRecords.get(ownKey));
+  releaseMaterializedRecordReferences(session, ownKey);
+  forgetMessageDisplayFloor(session, ownKey);
+  session.materializedRecordKeys.delete(ownKey);
+  session.materializedRecords.delete(ownKey);
+  session.materializedRecordTemporal.delete(ownKey);
+  decrementRecordCount(session.activeRecordCounts, domain);
+}
+
 function retainActiveRecordKey(session: ClientFeedSession, key: string): void {
   const next = (session.activeRecordKeyRefCounts.get(key) ?? 0) + 1;
   session.activeRecordKeyRefCounts.set(key, next);
@@ -1956,6 +2013,23 @@ function rememberScopedProjectionIdentity(
     session.projectedToolCallIds.add(id);
     return;
   }
+}
+
+function forgetScopedProjectionIdentity(
+  session: ClientFeedSession,
+  domain: string,
+  id: string,
+  record?: Record<string, unknown>
+): void {
+  if (domain === 'Turn' && record?.conversation_id === session.activeConversationId) {
+    session.primaryTurnIds.delete(id);
+    return;
+  }
+  if (domain === 'Message') {
+    session.visibleMessageIds.delete(id);
+    return;
+  }
+  if (domain === 'ToolCall') session.projectedToolCallIds.delete(id);
 }
 
 function seedScopedProjectionIdentities(
@@ -2024,6 +2098,7 @@ function collectProjectionRecordKeys(
   value: PlainData,
   target: Set<string>,
   refCounts: Map<string, number>,
+  records: Map<string, Record<string, unknown>>,
   referencesByRecord: Map<string, Set<string>>,
   counts: Map<string, number>,
   countedRecords: Set<string>,
@@ -2031,7 +2106,7 @@ function collectProjectionRecordKeys(
 ): void {
   if (Array.isArray(value)) {
     for (const entry of value) {
-      collectProjectionRecordKeys(entry, target, refCounts, referencesByRecord, counts, countedRecords, temporal);
+      collectProjectionRecordKeys(entry, target, refCounts, records, referencesByRecord, counts, countedRecords, temporal);
     }
     return;
   }
@@ -2046,6 +2121,7 @@ function collectProjectionRecordKeys(
         const ownKey = recordKey(domain, id);
         if (!countedRecords.has(ownKey)) {
           countedRecords.add(ownKey);
+          records.set(ownKey, entry);
           incrementRecordCount(counts, domain);
           const references = typedRecordReferenceKeys(domain, entry);
           references.add(ownKey);
@@ -2059,7 +2135,7 @@ function collectProjectionRecordKeys(
         temporal.set(ownKey, recordTemporalKey(domain, entry, id));
       }
     }
-    collectProjectionRecordKeys(nested, target, refCounts, referencesByRecord, counts, countedRecords, temporal);
+    collectProjectionRecordKeys(nested, target, refCounts, records, referencesByRecord, counts, countedRecords, temporal);
   }
 }
 
@@ -2075,15 +2151,262 @@ function decrementRecordCount(counts: Map<string, number>, domain: string): void
   else counts.set(domain, next);
 }
 
-function oldestMaterializedRecord(session: ClientFeedSession, domain: string): string | undefined {
+type MessageWindowEvictionPlan =
+  | { kind: 'evict'; keys: string[] }
+  | { kind: 'pinned' }
+  | { kind: 'snapshot' };
+
+const TERMINAL_TOOL_OWNED_DOMAINS = [
+  'ToolCallPolicySnapshot',
+  'ToolCallEvent',
+  'ToolExecution',
+  'ToolOutcome',
+  'ToolModelResult',
+  'ToolResultArtifact'
+] as const;
+
+function evictMessagesOutsideLiveWindow(
+  session: ClientFeedSession
+): { changes: ClientScopedRuntimeChange[]; requiresSnapshot: boolean } {
+  const limit = BigInt(CLIENT_MESSAGE_WINDOW_LIMIT);
+  if (session.latestVisibleMessageFloor <= limit) return { changes: [], requiresSnapshot: false };
+  const cutoff = session.latestVisibleMessageFloor - limit;
+  const candidates = [...session.messageDisplayFloors.entries()]
+    .filter(([messageId, floor]) =>
+      floor <= cutoff && session.materializedRecordKeys.has(recordKey('Message', messageId)))
+    .sort((left, right) => left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : left[0].localeCompare(right[0]));
+  const changes: ClientScopedRuntimeChange[] = [];
+  for (const [messageId] of candidates) {
+    const plan = planMessageWindowEviction(session, messageId);
+    if (plan.kind === 'pinned') continue;
+    if (plan.kind === 'snapshot') return { changes, requiresSnapshot: true };
+    for (const key of plan.keys) {
+      if (!session.materializedRecordKeys.has(key)) continue;
+      const domain = recordDomainFromKey(key);
+      const id = recordIdFromKey(key);
+      removeMaterializedRecord(session, key);
+      changes.push({ domain, kind: 'remove', id, removalCause: 'window-eviction' });
+    }
+  }
+  return { changes, requiresSnapshot: false };
+}
+
+function planMessageWindowEviction(
+  session: ClientFeedSession,
+  messageId: string
+): MessageWindowEvictionPlan {
+  if (session.currentTaskSourceMessageId === messageId) return { kind: 'pinned' };
+  const messageKey = recordKey('Message', messageId);
+  if (!session.materializedRecordKeys.has(messageKey)) return { kind: 'evict', keys: [] };
+
+  const bundle = new Set<string>([messageKey]);
+  const requestIds = new Set<string>();
+  const toolCallIds = new Set<string>();
+  for (const [key] of materializedRecordsMatching(session, 'MessageTurnLink', 'message_id', messageId)) {
+    bundle.add(key);
+  }
+  for (const [key, link] of materializedRecordsMatching(
+    session,
+    'ModelRequestMessageLink',
+    'message_id',
+    messageId
+  )) {
+    const requestId = recordStringField(link, 'model_request_id');
+    if (!requestId) return { kind: 'snapshot' };
+    requestIds.add(requestId);
+    bundle.add(key);
+  }
+  for (const [key, link] of materializedRecordsMatching(
+    session,
+    'ToolCallSourceLink',
+    'message_id',
+    messageId
+  )) {
+    const requestId = recordStringField(link, 'model_request_id');
+    const toolCallId = recordStringField(link, 'tool_call_id');
+    if (!requestId || !toolCallId) return { kind: 'snapshot' };
+    requestIds.add(requestId);
+    toolCallIds.add(toolCallId);
+    bundle.add(key);
+  }
+
+  for (const requestId of requestIds) {
+    const requestKey = recordKey('ModelRequest', requestId);
+    const request = session.materializedRecords.get(requestKey);
+    if (!request) return { kind: 'snapshot' };
+    if (request.status !== 'terminal') return { kind: 'pinned' };
+    bundle.add(requestKey);
+    for (const [key, link] of materializedRecordsMatching(
+      session,
+      'ModelRequestMessageLink',
+      'model_request_id',
+      requestId
+    )) {
+      if (recordStringField(link, 'message_id') !== messageId) return { kind: 'snapshot' };
+      bundle.add(key);
+    }
+    for (const [key, link] of materializedRecordsMatching(
+      session,
+      'ToolCallSourceLink',
+      'model_request_id',
+      requestId
+    )) {
+      const toolCallId = recordStringField(link, 'tool_call_id');
+      if (recordStringField(link, 'message_id') !== messageId || !toolCallId) return { kind: 'snapshot' };
+      toolCallIds.add(toolCallId);
+      bundle.add(key);
+    }
+  }
+
+  for (const toolCallId of toolCallIds) {
+    const toolCallKey = recordKey('ToolCall', toolCallId);
+    const toolCall = session.materializedRecords.get(toolCallKey);
+    if (!toolCall) return { kind: 'snapshot' };
+    if (toolCall.status !== 'terminal') return { kind: 'pinned' };
+    if (toolCall.tool_name === 'update_task_list' || toolCall.tool_name === 'submit_plan') {
+      return { kind: 'snapshot' };
+    }
+    bundle.add(toolCallKey);
+    for (const [key, link] of materializedRecordsMatching(
+      session,
+      'ToolCallSourceLink',
+      'tool_call_id',
+      toolCallId
+    )) {
+      const requestId = recordStringField(link, 'model_request_id');
+      if (
+        recordStringField(link, 'message_id') !== messageId
+        || !requestId
+        || !requestIds.has(requestId)
+      ) return { kind: 'snapshot' };
+      bundle.add(key);
+    }
+    for (const domain of TERMINAL_TOOL_OWNED_DOMAINS) {
+      for (const [key, record] of materializedRecordsMatching(session, domain, 'tool_call_id', toolCallId)) {
+        if (domain === 'ToolExecution' && record.status !== 'completed') return { kind: 'pinned' };
+        bundle.add(key);
+      }
+    }
+
+    const childLinks = materializedRecordsMatching(
+      session,
+      'ChildExecutionParentLink',
+      'source_tool_call_id',
+      toolCallId
+    );
+    if (childLinks.length > 0) {
+      for (const [, link] of childLinks) {
+        const childId = recordStringField(link, 'child_execution_id');
+        const child = childId
+          ? session.materializedRecords.get(recordKey('ChildExecution', childId))
+          : undefined;
+        if (!child) return { kind: 'snapshot' };
+        if (child.status !== 'closed' && child.status !== 'needs_human') return { kind: 'pinned' };
+      }
+      return { kind: 'snapshot' };
+    }
+
+    for (const [originKey, origin] of materializedRecordsMatching(
+      session,
+      'ProcessOriginLink',
+      'tool_call_id',
+      toolCallId
+    )) {
+      const processId = recordStringField(origin, 'process_id');
+      const processKey = processId ? recordKey('Process', processId) : '';
+      const process = processKey ? session.materializedRecords.get(processKey) : undefined;
+      if (!processId || !process) return { kind: 'snapshot' };
+      if (process.status === 'running') return { kind: 'pinned' };
+      bundle.add(originKey);
+      bundle.add(processKey);
+      for (const domain of ['ProcessOutputChunk', 'ProcessReceipt'] as const) {
+        for (const [key] of materializedRecordsMatching(session, domain, 'process_id', processId)) bundle.add(key);
+      }
+    }
+
+    for (const [toolLinkKey, toolLink] of materializedRecordsMatching(
+      session,
+      'InteractionToolCallLink',
+      'tool_call_id',
+      toolCallId
+    )) {
+      const requestId = recordStringField(toolLink, 'request_id');
+      const requestKey = requestId ? recordKey('InteractionRequest', requestId) : '';
+      const request = requestKey ? session.materializedRecords.get(requestKey) : undefined;
+      if (!requestId || !request) return { kind: 'snapshot' };
+      if (request.status === 'pending') return { kind: 'pinned' };
+      bundle.add(toolLinkKey);
+      bundle.add(requestKey);
+      for (const domain of ['InteractionOwnerLink', 'InteractionToolCallLink', 'InteractionResponse'] as const) {
+        for (const [key, record] of materializedRecordsMatching(session, domain, 'request_id', requestId)) {
+          if (
+            domain === 'InteractionToolCallLink'
+            && !toolCallIds.has(recordStringField(record, 'tool_call_id') ?? '')
+          ) return { kind: 'snapshot' };
+          bundle.add(key);
+        }
+      }
+    }
+
+    for (const [changeSetKey, changeSet] of materializedRecordsMatching(
+      session,
+      'FileChangeSet',
+      'tool_call_id',
+      toolCallId
+    )) {
+      if (changeSet.status === 'pending') return { kind: 'pinned' };
+      const changeSetId = recordIdFromKey(changeSetKey);
+      bundle.add(changeSetKey);
+      for (const domain of ['FileChangeSetMember', 'FileChangeDecision'] as const) {
+        for (const [key] of materializedRecordsMatching(session, domain, 'change_set_id', changeSetId)) bundle.add(key);
+      }
+      for (const [receiptKey] of materializedRecordsMatching(
+        session,
+        'FileMutationReceipt',
+        'change_set_id',
+        changeSetId
+      )) {
+        bundle.add(receiptKey);
+        const receiptId = recordIdFromKey(receiptKey);
+        for (const [key] of materializedRecordsMatching(
+          session,
+          'FileMutationReceiptMember',
+          'receipt_id',
+          receiptId
+        )) bundle.add(key);
+      }
+    }
+  }
+
+  for (const [sourceKey, references] of session.materializedRecordReferences) {
+    if (bundle.has(sourceKey)) continue;
+    for (const targetKey of bundle) {
+      if (references.has(targetKey)) return { kind: 'snapshot' };
+    }
+  }
+  const keys = [...bundle].sort((left, right) => {
+    if (left === messageKey) return 1;
+    if (right === messageKey) return -1;
+    return left.localeCompare(right);
+  });
+  return { kind: 'evict', keys };
+}
+
+function materializedRecordsMatching(
+  session: ClientFeedSession,
+  domain: string,
+  field: string,
+  value: string
+): Array<[string, Record<string, unknown>]> {
   const prefix = `${domain}\0`;
-  return [...session.materializedRecordKeys]
-    .filter((key) => key.startsWith(prefix))
-    .sort((left, right) => {
-      const leftTemporal = session.materializedRecordTemporal.get(left) ?? '';
-      const rightTemporal = session.materializedRecordTemporal.get(right) ?? '';
-      return leftTemporal.localeCompare(rightTemporal) || left.localeCompare(right);
-    })[0];
+  return [...session.materializedRecords.entries()].filter(([key, record]) =>
+    key.startsWith(prefix) && record[field] === value
+  );
+}
+
+function recordStringField(record: Record<string, unknown>, field: string): string | undefined {
+  const value = record[field];
+  return typeof value === 'string' && value ? value : undefined;
 }
 
 function recordTemporalKey(domain: string, record: Record<string, unknown>, id: string): string {
@@ -2116,6 +2439,12 @@ function recordIdFromKey(key: string): string {
   const separator = key.indexOf('\0');
   if (separator < 0 || separator === key.length - 1) throw new Error(`Invalid typed client record key: ${key}`);
   return key.slice(separator + 1);
+}
+
+function recordDomainFromKey(key: string): string {
+  const separator = key.indexOf('\0');
+  if (separator <= 0) throw new Error(`Invalid typed client record key: ${key}`);
+  return key.slice(0, separator);
 }
 
 function isPlainRecord(value: PlainData | undefined): value is { [key: string]: PlainData } {

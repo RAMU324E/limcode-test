@@ -56,6 +56,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/openAIResponsesWebSocket.test.cjs',
   'tests/openAIResponsesWebSocketSession.test.cjs',
   'tests/reliable-kernel/child-agent-status-controls.test.cjs',
+  'tests/reliable-kernel/client-feed-window-rollover.test.mjs',
   'tests/reliable-kernel/command-router-interaction.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/context-token-estimator.test.mjs',

@@ -55,6 +55,7 @@ docs/architecture/*
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs
 !/tests/reliable-kernel/provider-semantic-watchdog.test.mjs
 !/tests/reliable-kernel/child-agent-status-controls.test.cjs
+!/tests/reliable-kernel/client-feed-window-rollover.test.mjs
 !/tests/reliable-kernel/frontend-copy-guardrails.test.cjs
 !/tests/reliable-kernel/windows-runtime-compatibility.test.mjs
 !/tests/reliable-kernel/guidance-queue.test.mjs
