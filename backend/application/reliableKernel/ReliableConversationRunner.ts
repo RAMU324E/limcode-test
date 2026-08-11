@@ -12,6 +12,10 @@ import type {
   TurnCommandResult,
   TurnContinuationCommand,
   TurnEditAndRunCommand,
+  TurnGuidanceCancelCommand,
+  TurnGuidanceEditCommand,
+  TurnGuidanceHoldCommand,
+  TurnGuidanceReorderCommand,
   TurnInputCommand,
   TurnRetryCommand,
   TurnRuntimeContinuationCommand,
@@ -182,6 +186,80 @@ export class ReliableConversationRunner {
       contentType: content.contentType
     };
     const result = await this.application.turns.input(command);
+    this.wake(result);
+    return result;
+  }
+
+  public async editGuidance(input: {
+    commandId: string;
+    conversationId: string;
+    intentId: string;
+    expectedRevisionSeq: string;
+    text: string;
+  }): Promise<TurnCommandResult> {
+    this.requireOpen();
+    const command: TurnGuidanceEditCommand = {
+      source: { kind: 'command', key: input.commandId },
+      conversationId: input.conversationId,
+      intentId: input.intentId,
+      expectedRevisionSeq: input.expectedRevisionSeq,
+      text: input.text
+    };
+    const result = await this.application.turns.editGuidance(command);
+    this.wake(result);
+    return result;
+  }
+
+  public async cancelGuidance(input: {
+    commandId: string;
+    conversationId: string;
+    intentId: string;
+    expectedRevisionSeq: string;
+  }): Promise<TurnCommandResult> {
+    this.requireOpen();
+    const command: TurnGuidanceCancelCommand = {
+      source: { kind: 'command', key: input.commandId },
+      conversationId: input.conversationId,
+      intentId: input.intentId,
+      expectedRevisionSeq: input.expectedRevisionSeq
+    };
+    const result = await this.application.turns.cancelGuidance(command);
+    this.wake(result);
+    return result;
+  }
+
+  public async setGuidanceHold(input: {
+    commandId: string;
+    conversationId: string;
+    intentId: string;
+    expectedRevisionSeq: string;
+    hold: 'none' | 'paused';
+  }): Promise<TurnCommandResult> {
+    this.requireOpen();
+    const command: TurnGuidanceHoldCommand = {
+      source: { kind: 'command', key: input.commandId },
+      conversationId: input.conversationId,
+      intentId: input.intentId,
+      expectedRevisionSeq: input.expectedRevisionSeq,
+      hold: input.hold
+    };
+    const result = await this.application.turns.setGuidanceHold(command);
+    this.wake(result);
+    return result;
+  }
+
+  public async reorderGuidance(input: {
+    commandId: string;
+    conversationId: string;
+    items: Array<{ intentId: string; expectedRevisionSeq: string }>;
+  }): Promise<TurnCommandResult> {
+    this.requireOpen();
+    const command: TurnGuidanceReorderCommand = {
+      source: { kind: 'command', key: input.commandId },
+      conversationId: input.conversationId,
+      items: input.items
+    };
+    const result = await this.application.turns.reorderGuidance(command);
     this.wake(result);
     return result;
   }

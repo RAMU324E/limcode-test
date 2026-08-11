@@ -12,6 +12,7 @@ import {
   type CompressionStartPayload,
   type ConversationCommandMetadata,
   type ConversationForkPayload,
+  type GuidanceControlResultPayload,
   type MessageContent,
   type MessageDeleteFromPayload,
   type MessageEditPayload,
@@ -114,6 +115,21 @@ interface TurnInputAcknowledgement {
   conversationId: string;
 }
 
+export interface PendingGuidanceControl {
+  commandId: string;
+  requestId: string;
+  conversationId: string;
+  action: GuidanceControlResultPayload['action'];
+  intentIds: string[];
+  submittedAt: number;
+}
+
+interface GuidanceControlFailure {
+  conversationId: string;
+  message: string;
+  failedAt: number;
+}
+
 const restored = readPersistedControls();
 const interruptState = ref<InterruptState | undefined>(restored.interrupt);
 const conversationActionStates = ref<Record<string, ConversationActionState>>(restored.conversationActions);
@@ -122,6 +138,8 @@ const actionNotices = ref<Record<string, string>>({});
 const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>(restored.pendingTurnInputs);
 const failedTurnInputSubmissions = ref<Record<string, FailedTurnInputSubmission>>(restored.failedTurnInputs);
 const turnInputAcknowledgements = ref<Record<string, TurnInputAcknowledgement>>({});
+const pendingGuidanceControls = ref<Record<string, PendingGuidanceControl>>({});
+const guidanceControlFailures = ref<Record<string, GuidanceControlFailure>>({});
 
 bridge.on(BridgeMessageType.TurnInputResult, (message) => {
   const payload = message.payload;
@@ -148,6 +166,37 @@ bridge.on(BridgeMessageType.TurnInputResult, (message) => {
   };
   persistControls();
   clearTurnInputFailure(payload.commandId);
+});
+
+bridge.on(BridgeMessageType.GuidanceControlResult, (message) => {
+  const payload = message.payload;
+  if (!payload) return;
+  const pending = pendingGuidanceControls.value[payload.commandId];
+  if (
+    !pending
+    || pending.requestId !== message.correlationId
+    || pending.conversationId !== payload.conversationId
+    || pending.action !== payload.action
+  ) return;
+  const next = { ...pendingGuidanceControls.value };
+  delete next[payload.commandId];
+  pendingGuidanceControls.value = next;
+  if (payload.status === 'rejected') {
+    guidanceControlFailures.value = {
+      ...guidanceControlFailures.value,
+      [payload.conversationId]: {
+        conversationId: payload.conversationId,
+        message: payload.message || '引导消息操作失败，请刷新后重试。',
+        failedAt: Date.now()
+      }
+    };
+    return;
+  }
+  if (guidanceControlFailures.value[payload.conversationId]) {
+    const failures = { ...guidanceControlFailures.value };
+    delete failures[payload.conversationId];
+    guidanceControlFailures.value = failures;
+  }
 });
 
 bridge.on(BridgeMessageType.TurnInterruptResult, (message) => {
@@ -407,6 +456,21 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
   }
 }
 
+function reconcileGuidanceControls(
+  records: Record<string, Record<string, Record<string, unknown>>>
+): void {
+  const durableCommandIds = new Set(Object.values(records.ConversationCommandReceipt ?? {})
+    .flatMap((receipt) => typeof receipt.command_id === 'string' ? [receipt.command_id] : []));
+  const next = { ...pendingGuidanceControls.value };
+  let changed = false;
+  for (const control of Object.values(next)) {
+    if (!durableCommandIds.has(control.commandId)) continue;
+    delete next[control.commandId];
+    changed = true;
+  }
+  if (changed) pendingGuidanceControls.value = next;
+}
+
 function turnInputDurableObservation(
   records: Record<string, Record<string, Record<string, unknown>>>,
   pending: PendingTurnInputSubmission
@@ -555,6 +619,32 @@ function clearActionNotice(conversationId: string): void {
   actionNotices.value = next;
 }
 
+function beginGuidanceControl(control: PendingGuidanceControl): void {
+  pendingGuidanceControls.value = {
+    ...pendingGuidanceControls.value,
+    [control.commandId]: control
+  };
+  if (guidanceControlFailures.value[control.conversationId]) {
+    const failures = { ...guidanceControlFailures.value };
+    delete failures[control.conversationId];
+    guidanceControlFailures.value = failures;
+  }
+}
+
+function failGuidanceControl(commandId: string, conversationId: string, error: unknown): void {
+  const pending = { ...pendingGuidanceControls.value };
+  delete pending[commandId];
+  pendingGuidanceControls.value = pending;
+  guidanceControlFailures.value = {
+    ...guidanceControlFailures.value,
+    [conversationId]: {
+      conversationId,
+      message: error instanceof Error ? error.message : '引导消息操作失败，请重试。',
+      failedAt: Date.now()
+    }
+  };
+}
+
 function nextReliableCommandMetadata(): ConversationCommandMetadata {
   reliableCommandSequence += 1;
   const issuedAt = Date.now();
@@ -621,6 +711,11 @@ export function useChat() {
   const currentTurnInputFailure = computed(() => Object.values(failedTurnInputSubmissions.value)
     .filter((submission) => submission.conversationId === reliableConversation.conversationId.value)
     .sort((left, right) => right.failedAt - left.failedAt || right.commandId.localeCompare(left.commandId))[0]);
+  const currentPendingGuidanceControls = computed(() => Object.values(pendingGuidanceControls.value)
+    .filter((control) => control.conversationId === reliableConversation.conversationId.value));
+  const currentGuidanceControlFailure = computed(() =>
+    guidanceControlFailures.value[reliableConversation.conversationId.value]
+  );
   const forkPendingTargetIds = computed(() => new Set(Object.values(forkRequests.value)
     .filter((request) => request.sourceConversationId === reliableConversation.conversationId.value && request.requestId)
     .map((request) => request.messageId)));
@@ -629,9 +724,12 @@ export function useChat() {
     const sessionId = reliableConversation.feed.sessionId;
     const clientId = bridge.currentClientId();
     if (sessionId) {
-      reconcileTurnInputSubmissions(
-        reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
-      );
+      const records = reliableConversation.feed.records as unknown as Record<
+        string,
+        Record<string, Record<string, unknown>>
+      >;
+      reconcileTurnInputSubmissions(records);
+      reconcileGuidanceControls(records);
     }
     if (clientId) replayTurnInputSubmissions(clientId, sessionId ?? undefined);
     if (!sessionId) return;
@@ -1115,6 +1213,123 @@ export function useChat() {
     }
   }
 
+  function editGuidance(intentId: string, expectedRevisionSeq: string, text: string): boolean {
+    const conversationId = activeConversationId();
+    if (!conversationId || !intentId || !expectedRevisionSeq) return false;
+    const command = nextReliableCommandMetadata();
+    const requestId = command.commandId;
+    beginGuidanceControl({
+      commandId: command.commandId,
+      requestId,
+      conversationId,
+      action: 'edit',
+      intentIds: [intentId],
+      submittedAt: Date.now()
+    });
+    try {
+      bridge.request(BridgeMessageType.GuidanceEdit, {
+        conversationId,
+        intentId,
+        expectedRevisionSeq,
+        text,
+        command
+      }, { requestId });
+      return true;
+    } catch (error) {
+      failGuidanceControl(command.commandId, conversationId, error);
+      return false;
+    }
+  }
+
+  function cancelGuidance(intentId: string, expectedRevisionSeq: string): boolean {
+    const conversationId = activeConversationId();
+    if (!conversationId || !intentId || !expectedRevisionSeq) return false;
+    const command = nextReliableCommandMetadata();
+    const requestId = command.commandId;
+    beginGuidanceControl({
+      commandId: command.commandId,
+      requestId,
+      conversationId,
+      action: 'cancel',
+      intentIds: [intentId],
+      submittedAt: Date.now()
+    });
+    try {
+      bridge.request(BridgeMessageType.GuidanceCancel, {
+        conversationId,
+        intentId,
+        expectedRevisionSeq,
+        command
+      }, { requestId });
+      return true;
+    } catch (error) {
+      failGuidanceControl(command.commandId, conversationId, error);
+      return false;
+    }
+  }
+
+  function setGuidancePaused(intentId: string, expectedRevisionSeq: string, paused: boolean): boolean {
+    const conversationId = activeConversationId();
+    if (!conversationId || !intentId || !expectedRevisionSeq) return false;
+    const command = nextReliableCommandMetadata();
+    const requestId = command.commandId;
+    beginGuidanceControl({
+      commandId: command.commandId,
+      requestId,
+      conversationId,
+      action: 'hold',
+      intentIds: [intentId],
+      submittedAt: Date.now()
+    });
+    try {
+      bridge.request(BridgeMessageType.GuidanceHold, {
+        conversationId,
+        intentId,
+        expectedRevisionSeq,
+        hold: paused ? 'paused' : 'none',
+        command
+      }, { requestId });
+      return true;
+    } catch (error) {
+      failGuidanceControl(command.commandId, conversationId, error);
+      return false;
+    }
+  }
+
+  function reorderGuidance(items: Array<{ intentId: string; expectedRevisionSeq: string }>): boolean {
+    const conversationId = activeConversationId();
+    if (!conversationId || items.length === 0) return false;
+    const command = nextReliableCommandMetadata();
+    const requestId = command.commandId;
+    beginGuidanceControl({
+      commandId: command.commandId,
+      requestId,
+      conversationId,
+      action: 'reorder',
+      intentIds: items.map((item) => item.intentId),
+      submittedAt: Date.now()
+    });
+    try {
+      bridge.request(BridgeMessageType.GuidanceReorder, {
+        conversationId,
+        items,
+        command
+      }, { requestId });
+      return true;
+    } catch (error) {
+      failGuidanceControl(command.commandId, conversationId, error);
+      return false;
+    }
+  }
+
+  function dismissGuidanceControlFailure(): void {
+    const conversationId = activeConversationId();
+    if (!guidanceControlFailures.value[conversationId]) return;
+    const next = { ...guidanceControlFailures.value };
+    delete next[conversationId];
+    guidanceControlFailures.value = next;
+  }
+
   function dismissTurnInputAcknowledgement(commandId: string): void {
     if (!turnInputAcknowledgements.value[commandId]) return;
     const next = { ...turnInputAcknowledgements.value };
@@ -1148,6 +1363,13 @@ export function useChat() {
     dismissTurnInputAcknowledgement,
     dismissTurnInputFailure,
     retryTurnInputSubmission,
+    editGuidance,
+    cancelGuidance,
+    setGuidancePaused,
+    reorderGuidance,
+    currentPendingGuidanceControls,
+    currentGuidanceControlFailure,
+    dismissGuidanceControlFailure,
     forkPendingTargetIds
   };
 }

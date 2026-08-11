@@ -6,6 +6,10 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.TurnStart:
     case BridgeMessageType.TurnEnqueue:
     case BridgeMessageType.TurnInterrupt:
+    case BridgeMessageType.GuidanceEdit:
+    case BridgeMessageType.GuidanceCancel:
+    case BridgeMessageType.GuidanceReorder:
+    case BridgeMessageType.GuidanceHold:
     case BridgeMessageType.InteractionResolve:
     case BridgeMessageType.ConversationCreate:
     case BridgeMessageType.ConversationFork:

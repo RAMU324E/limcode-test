@@ -58,6 +58,11 @@ export enum BridgeMessageType {
   TurnInputResult = 'turn.input.result',
   TurnInterrupt = 'turn.interrupt',
   TurnInterruptResult = 'turn.interrupt.result',
+  GuidanceEdit = 'guidance.edit',
+  GuidanceCancel = 'guidance.cancel',
+  GuidanceReorder = 'guidance.reorder',
+  GuidanceHold = 'guidance.hold',
+  GuidanceControlResult = 'guidance.control.result',
   InteractionResolve = 'interaction.resolve',
   ConversationOpen = 'conversation.open',
   ConversationCreate = 'conversation.create',
@@ -2323,6 +2328,44 @@ export interface TurnInterruptResultPayload {
   cascadeChildAgents: boolean;
 }
 
+export interface GuidanceControlTarget {
+  intentId: string;
+  expectedRevisionSeq: string;
+}
+
+export interface GuidanceEditPayload extends GuidanceControlTarget {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  text: string;
+}
+
+export interface GuidanceCancelPayload extends GuidanceControlTarget {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+}
+
+export interface GuidanceHoldPayload extends GuidanceControlTarget {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  hold: 'none' | 'paused';
+}
+
+export interface GuidanceReorderPayload {
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  items: GuidanceControlTarget[];
+}
+
+export interface GuidanceControlResultPayload {
+  commandId: string;
+  conversationId: string;
+  action: 'edit' | 'cancel' | 'reorder' | 'hold';
+  status: 'accepted' | 'replayed' | 'rejected';
+  intentId?: string;
+  commitSeq?: string;
+  message?: string;
+}
+
 export interface MessageEditPayload extends TurnAuthoritySelection {
   conversationId: string;
   command: ConversationCommandMetadata;
@@ -2769,6 +2812,10 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.TurnStart, TurnStartPayload>
   | BridgeEnvelope<BridgeMessageType.TurnEnqueue, TurnEnqueuePayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterrupt, TurnInterruptPayload>
+  | BridgeEnvelope<BridgeMessageType.GuidanceEdit, GuidanceEditPayload>
+  | BridgeEnvelope<BridgeMessageType.GuidanceCancel, GuidanceCancelPayload>
+  | BridgeEnvelope<BridgeMessageType.GuidanceReorder, GuidanceReorderPayload>
+  | BridgeEnvelope<BridgeMessageType.GuidanceHold, GuidanceHoldPayload>
   | BridgeEnvelope<BridgeMessageType.InteractionResolve, InteractionResolvePayload>
   | BridgeEnvelope<BridgeMessageType.ConversationOpen, ConversationOpenPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationCreate, ConversationCreatePayload>
@@ -2844,6 +2891,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInputResult, TurnInputResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>
+  | BridgeEnvelope<BridgeMessageType.GuidanceControlResult, GuidanceControlResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationActionResult, ConversationActionResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationForkResult, ConversationForkResultPayload>
   | BridgeEnvelope<BridgeMessageType.CompressionCommandResult, CompressionCommandResultPayload>

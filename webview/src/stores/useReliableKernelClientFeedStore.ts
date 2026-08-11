@@ -643,6 +643,37 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       return key;
     },
 
+    reloadDetail(
+      kind: ReliableKernelClientDetailKind,
+      recordId: string,
+      options: { priority?: ReliableKernelDetailPriority } = {}
+    ): string | undefined {
+      const id = recordId.trim();
+      if (!id) return undefined;
+      const key = detailKey(kind, id);
+      const cancelledRequestIds = Object.entries(this.pendingDetails)
+        .filter(([, pending]) => pending.key === key)
+        .map(([requestId]) => requestId);
+      for (const requestId of cancelledRequestIds) {
+        const timeout = detailRequestTimeouts.get(requestId);
+        if (timeout !== undefined) clearTimeout(timeout);
+        detailRequestTimeouts.delete(requestId);
+        detailDecoders.delete(requestId);
+        detailTextChunks.delete(requestId);
+        delete this.pendingDetails[requestId];
+      }
+      if (cancelledRequestIds.length > 0) {
+        const cancelled = new Set(cancelledRequestIds);
+        this.detailQueue = this.detailQueue.filter((requestId) => !cancelled.has(requestId));
+        this.activeDetailRequestIds = this.activeDetailRequestIds.filter((requestId) => !cancelled.has(requestId));
+      }
+      delete this.details[key];
+      delete this.detailCacheMeta[key];
+      const requested = this.requestDetail(kind, id, options);
+      this.pumpDetailQueue();
+      return requested;
+    },
+
     retryDetail(
       kind: ReliableKernelClientDetailKind,
       recordId: string,

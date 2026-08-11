@@ -65,6 +65,23 @@ test('front-end copy uses natural Agent and status wording', () => {
   }
 });
 
+test('guidance queue uses a passive bolt and waits for the current response and tools', () => {
+  const queue = source('webview/src/components/input/ReliableQueuePanel.vue');
+
+  assert.match(queue, /IconBolt class="reliable-queue-guide-icon"/);
+  assert.match(queue, /引导消息/);
+  assert.match(queue, /等待当前回复和工具完成/);
+  assert.match(queue, /IconPencil/);
+  assert.match(queue, /IconTrash/);
+  assert.match(queue, /IconGripVertical/);
+  assert.match(queue, /IconPlayerPause/);
+  assert.match(queue, /editGuidance/);
+  assert.match(queue, /cancelGuidance/);
+  assert.match(queue, /reorderGuidance/);
+  assert.match(queue, /setGuidancePaused/);
+  assert.doesNotMatch(queue, /force-send|promoteTurnIntent|立即执行/);
+});
+
 test('Vue templates call LLMs LLM while preserving OpenAI and 模型渠道', () => {
   for (const { file, template } of vueTemplates()) {
     const normalized = template.replaceAll('OpenAI', '').replaceAll('模型渠道', '');

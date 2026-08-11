@@ -17,6 +17,11 @@ import {
   type ConversationSettingsUpdatePayload,
   type GlobalSettingsGetPayload,
   type GlobalSettingsUpdatePayload,
+  type GuidanceCancelPayload,
+  type GuidanceControlResultPayload,
+  type GuidanceEditPayload,
+  type GuidanceHoldPayload,
+  type GuidanceReorderPayload,
   type InteractionResolvePayload,
   type LlmProviderModelsGetPayload,
   type MessageDeleteFromPayload,
@@ -95,6 +100,27 @@ export class VscodeReliableKernelCommandRouter {
         // The Webview tracks loading/failure independently per section. Preserve that scope on generic
         // read/write failures so one invalid settings store does not leave the whole channel page pending.
         this.postRequestError(webview, message.type, text, message.id, { section: message.payload.section });
+      } else if (isGuidanceControlType(message.type)) {
+        const payload = message.payload as
+          | GuidanceEditPayload
+          | GuidanceCancelPayload
+          | GuidanceReorderPayload
+          | GuidanceHoldPayload
+          | undefined;
+        if (payload) {
+          this.postGuidanceControlResult(webview, message.id, {
+            commandId: payload.command.commandId,
+            conversationId: payload.conversationId,
+            action: guidanceControlAction(message.type),
+            status: 'rejected',
+            ...('intentId' in payload && typeof payload.intentId === 'string'
+              ? { intentId: payload.intentId }
+              : {}),
+            message: text
+          });
+        } else {
+          this.postRequestError(webview, message.type, text, message.id);
+        }
       } else {
         this.postRequestError(webview, message.type, text, message.id);
       }
@@ -406,6 +432,18 @@ export class VscodeReliableKernelCommandRouter {
           message.id,
           requirePayload(message.payload, 'Turn interrupt')
         );
+        return;
+      case BridgeMessageType.GuidanceEdit:
+        await this.handleGuidanceEdit(webview, message.id, requirePayload(message.payload, 'Guidance edit'));
+        return;
+      case BridgeMessageType.GuidanceCancel:
+        await this.handleGuidanceCancel(webview, message.id, requirePayload(message.payload, 'Guidance cancel'));
+        return;
+      case BridgeMessageType.GuidanceHold:
+        await this.handleGuidanceHold(webview, message.id, requirePayload(message.payload, 'Guidance hold'));
+        return;
+      case BridgeMessageType.GuidanceReorder:
+        await this.handleGuidanceReorder(webview, message.id, requirePayload(message.payload, 'Guidance reorder'));
         return;
       case BridgeMessageType.MessageEdit:
         await this.handleMessageEdit(webview, message.id, requirePayload(message.payload, 'Message edit'));
@@ -878,6 +916,104 @@ export class VscodeReliableKernelCommandRouter {
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.TurnInputResult,
+      channel: 'control',
+      correlationId,
+      payload
+    });
+  }
+
+  private async handleGuidanceEdit(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: GuidanceEditPayload
+  ): Promise<void> {
+    const result = await this.product.conversations.editGuidance({
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      intentId: payload.intentId,
+      expectedRevisionSeq: payload.expectedRevisionSeq,
+      text: payload.text
+    });
+    this.postGuidanceControlResult(webview, correlationId, {
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      action: 'edit',
+      status: result.deduplicated ? 'replayed' : 'accepted',
+      intentId: payload.intentId,
+      ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
+    });
+  }
+
+  private async handleGuidanceCancel(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: GuidanceCancelPayload
+  ): Promise<void> {
+    const result = await this.product.conversations.cancelGuidance({
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      intentId: payload.intentId,
+      expectedRevisionSeq: payload.expectedRevisionSeq
+    });
+    this.postGuidanceControlResult(webview, correlationId, {
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      action: 'cancel',
+      status: result.deduplicated ? 'replayed' : 'accepted',
+      intentId: payload.intentId,
+      ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
+    });
+  }
+
+  private async handleGuidanceHold(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: GuidanceHoldPayload
+  ): Promise<void> {
+    const result = await this.product.conversations.setGuidanceHold({
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      intentId: payload.intentId,
+      expectedRevisionSeq: payload.expectedRevisionSeq,
+      hold: payload.hold
+    });
+    this.postGuidanceControlResult(webview, correlationId, {
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      action: 'hold',
+      status: result.deduplicated ? 'replayed' : 'accepted',
+      intentId: payload.intentId,
+      ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
+    });
+  }
+
+  private async handleGuidanceReorder(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: GuidanceReorderPayload
+  ): Promise<void> {
+    const result = await this.product.conversations.reorderGuidance({
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      items: payload.items
+    });
+    this.postGuidanceControlResult(webview, correlationId, {
+      commandId: payload.command.commandId,
+      conversationId: payload.conversationId,
+      action: 'reorder',
+      status: result.deduplicated ? 'replayed' : 'accepted',
+      ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
+    });
+  }
+
+  private postGuidanceControlResult(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: GuidanceControlResultPayload
+  ): void {
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.GuidanceControlResult,
       channel: 'control',
       correlationId,
       payload
@@ -1681,6 +1817,30 @@ function isFileNotFoundError(error: unknown): boolean {
   return value.code === 'ENOENT'
     || value.code === 'FileNotFound'
     || typeof value.message === 'string' && /not found|不存在|ENOENT/i.test(value.message);
+}
+
+type GuidanceControlMessageType =
+  | BridgeMessageType.GuidanceEdit
+  | BridgeMessageType.GuidanceCancel
+  | BridgeMessageType.GuidanceReorder
+  | BridgeMessageType.GuidanceHold;
+
+function isGuidanceControlType(type: BridgeMessageType): type is GuidanceControlMessageType {
+  return type === BridgeMessageType.GuidanceEdit
+    || type === BridgeMessageType.GuidanceCancel
+    || type === BridgeMessageType.GuidanceReorder
+    || type === BridgeMessageType.GuidanceHold;
+}
+
+function guidanceControlAction(
+  type: GuidanceControlMessageType
+): GuidanceControlResultPayload['action'] {
+  switch (type) {
+    case BridgeMessageType.GuidanceEdit: return 'edit';
+    case BridgeMessageType.GuidanceCancel: return 'cancel';
+    case BridgeMessageType.GuidanceReorder: return 'reorder';
+    case BridgeMessageType.GuidanceHold: return 'hold';
+  }
 }
 
 function isConfigurationMutationType(type: BridgeMessageType): boolean {
