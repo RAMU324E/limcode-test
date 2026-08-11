@@ -136,11 +136,17 @@ export class ReliableContextCompressionCoordinator {
         thresholdTokens: requestBudget.compressionThresholdTokens
       };
     }
-    if (trigger === 'auto' && !requestBudget.policyTrigger && !requestBudget.sendingTrigger) {
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
+    if (
+      trigger === 'auto'
+      && !requestBudget.policyTrigger
+      && !requestBudget.sendingTrigger
+      && !decision.shouldCompress
+    ) {
       return {
         status: 'skipped',
         reason: 'below_threshold',
-        estimatedTokens: requestBudget.estimatedFullInputTokens,
+        estimatedTokens: Math.max(requestBudget.estimatedFullInputTokens, decision.estimatedTokens),
         thresholdTokens: requestBudget.compressionThresholdTokens
       };
     }
@@ -170,7 +176,6 @@ export class ReliableContextCompressionCoordinator {
         requestBudget.safeBodyRoomTokens
       );
     }
-    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
     // Materialize source structure/content only after the level-trigger passes. Below-threshold checks
     // are the common path and should pay for one provider-aligned Context read, not three.
     const [materialized, semanticMaterialized] = await Promise.all([

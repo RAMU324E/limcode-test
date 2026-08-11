@@ -2567,11 +2567,16 @@ async function checkImmutableReplacement() {
       compressionThresholdTokens: 2,
       breakdown: {
         systemTokens: 0, toolSchemaTokens: 0, providerFramingTokens: 0,
-        contextTokens: 2_000, currentInputTokens: 0, runtimeDeliveryTokens: 0,
+        contextTokens: 1, currentInputTokens: 0, runtimeDeliveryTokens: 0,
         turnReminderTokens: 0, mediaTokens: 0, fixedTokens: 0,
-        bodyTokens: 2_000, fullTokens: 2_000
+        bodyTokens: 1, fullTokens: 1
       }
     });
+    assert.equal(
+      coordinatorRequestBudget.policyTrigger,
+      false,
+      'fixture must reproduce an underestimated ordinary-request budget'
+    );
     const coordinated = await coordinator.coordinate({
       turnId: coordinatorSeed.turnId,
       authoritySnapshotId: coordinatorSeed.authoritySnapshotId,
@@ -2867,6 +2872,7 @@ async function checkImmutableReplacement() {
     assert.equal(nonReducingReplay.reason, 'non_reducing');
     assert.equal(nonReducingDispatches, 1);
     assertions.push('自动压缩协调器把request kind/source prefix冻结进recipe，复用ModelRequest/Operation/Attempt/fence；exact replay零外调；provider-native MessageContent[]按版本化codec持久化并按token预算保留连续finite tail');
+    assertions.push('Provider实测校准的Context越过阈值时，即使普通请求启发式预算仍低于阈值也必须触发自动压缩');
     assertions.push('LLM capability adapter只发送冻结prefix，识别prior structured summary，并把CompactDone映射为单一durable completed事件；后续普通请求会展开版本化MessageContent[]而不是把JSON当Markdown');
     assertions.push('manual-only配置不会被自动调度；manualCurrentTurn在远低于冻结阈值时可显式压缩closed prefix，同时保留finite tail并冻结manual request kind');
     assertions.push('受保护tail使上下文越阈值但eligible prefix已不可缩小时，协调器按同head durable request精确跳过而不失败主Turn或重复外调');

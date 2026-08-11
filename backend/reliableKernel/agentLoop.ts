@@ -333,30 +333,31 @@ export class ReliableAgentLoop {
             throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
           }
           let budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);
-          if (budget.policyTrigger || budget.sendingTrigger) {
-            const compression = await this.compressionCoordinator.coordinate({
-              turnId,
-              authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
-              headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
-              trigger: 'auto',
-              requestBudget: budget,
-              protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe)
-            });
-            if (compression.status === 'error') {
-              throw new ModelRequestPreflightError(
-                compression.code,
-                `${compression.code}: ${compression.message}`,
-                compression.estimatedTokens,
-                compression.limitTokens
-              );
-            }
-            if (compression.status === 'compressed') {
+          // The adapter estimate protects the physical request limit, but it is only heuristic.
+          // Always let the coordinator compare the same frozen head with Provider-observed usage;
+          // otherwise an underestimated budget can suppress the only authoritative level trigger.
+          const compression = await this.compressionCoordinator.coordinate({
+            turnId,
+            authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
+            headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+            trigger: 'auto',
+            requestBudget: budget,
+            protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe)
+          });
+          if (compression.status === 'error') {
+            throw new ModelRequestPreflightError(
+              compression.code,
+              `${compression.code}: ${compression.message}`,
+              compression.estimatedTokens,
+              compression.limitTokens
+            );
+          }
+          if (compression.status === 'compressed') {
+            facts = await this.readRoundFacts(turnId);
+            // Delivery that became model-visible while Compact was running belongs after the
+            // canonical output. It is absorbed only after the new head CAS has succeeded.
+            if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
               facts = await this.readRoundFacts(turnId);
-              // Delivery that became model-visible while Compact was running belongs after the
-              // canonical output. It is absorbed only after the new head CAS has succeeded.
-              if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
-                facts = await this.readRoundFacts(turnId);
-              }
             }
             frozenRecipe = await this.freezeOrdinaryRequestRecipe({
               turnId,

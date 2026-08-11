@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 import * as kernel from '../../dist/extension/backend/reliableKernel/index.js';
 
@@ -33,6 +34,22 @@ function emptyBreakdown(overrides = {}) {
   value.fullTokens = value.fixedTokens + value.bodyTokens;
   return value;
 }
+
+test('Agent loop不以启发式预算预先屏蔽Provider实测压缩准入', () => {
+  const source = fs.readFileSync('backend/reliableKernel/agentLoop.ts', 'utf8');
+  const budgetStart = source.indexOf('let budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);');
+  const compressionStart = source.indexOf('this.compressionCoordinator.coordinate({', budgetStart);
+  const sendGate = source.indexOf('if (!budget.canSend)', compressionStart);
+  assert.ok(budgetStart >= 0 && compressionStart > budgetStart && sendGate > compressionStart);
+
+  const admission = source.slice(budgetStart, sendGate);
+  assert.doesNotMatch(
+    admission,
+    /if\s*\(\s*budget\.policyTrigger\s*\|\|\s*budget\.sendingTrigger\s*\)\s*\{[\s\S]*compressionCoordinator\.coordinate/,
+    'Provider实测判断必须能在本地预算低估时进入协调器'
+  );
+  assert.match(admission, /if \(compression\.status === 'compressed'\)/);
+});
 
 test('provider语义估算不会把base64图片字符当普通文本token', () => {
   const first = 'A'.repeat(339_032);
