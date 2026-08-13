@@ -1,4 +1,5 @@
 import {
+  MAX_CONCURRENT_ATTACHMENT_READS_PER_TURN,
   MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN,
   MAX_CONCURRENT_ORDINARY_TOOLS_PER_TURN,
   MAX_CONCURRENT_PROCESS_OR_MCP_TOOLS_PER_TURN
@@ -568,6 +569,11 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       !requiresChildAdmission(input)
       && !PROCESS_TOOLS.has(input.toolName)
       && definitionsByName.get(input.toolName)?.declaration.source?.kind !== 'mcp');
+    const attachmentInputs = ordinaryInputs.filter(({ input }) => isAttachmentReadInput(input));
+    // Attachment reads settle inside their own two-slot lane as soon as each file is materialized.
+    // Keep large base64 payloads out of the ordinary batch accumulator and bound simultaneous
+    // file/base64/CAS copies independently from cheap text reads.
+    const batchableOrdinaryInputs = ordinaryInputs.filter(({ input }) => !isAttachmentReadInput(input));
     const dispatchOutcomes = new Array<PromiseSettledResult<InternalDispatchResult>>(inputs.length);
     const dispatchOne = async (
       input: ReliableAgentToolDispatchInput,
@@ -584,7 +590,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
           toolCall: toolCallsById.get(input.toolCallId),
           frozenDecision: frozenDecisionsById.get(input.toolCallId),
           skipProviderDefinitionCheck: true,
-          deferNoEffectSettlement: true,
+          deferNoEffectSettlement: !isAttachmentReadInput(input),
           definitions,
           authority: {
             snapshotId: baseAuthority.snapshotId,
@@ -653,12 +659,18 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       }
     };
     await Promise.all([
-      collect(ordinaryInputs, mapSettledWithBoundedConcurrency(
-        ordinaryInputs,
+      collect(batchableOrdinaryInputs, mapSettledWithBoundedConcurrency(
+        batchableOrdinaryInputs,
         MAX_CONCURRENT_ORDINARY_TOOLS_PER_TURN,
         ({ input }, _index, signal) => dispatchOne(input, signal),
         parentSignal
       ), true),
+      collect(attachmentInputs, mapSettledWithBoundedConcurrency(
+        attachmentInputs,
+        MAX_CONCURRENT_ATTACHMENT_READS_PER_TURN,
+        ({ input }, _index, signal) => dispatchOne(input, signal),
+        parentSignal
+      )),
       collect(processOrMcpInputs, mapSettledWithBoundedConcurrency(
         processOrMcpInputs,
         MAX_CONCURRENT_PROCESS_OR_MCP_TOOLS_PER_TURN,
@@ -2224,6 +2236,10 @@ function reliableDefinitionFromTool(definition: ToolDefinition): ReliableAgentTo
 
 function isDeferredNoEffectSettlement(result: InternalDispatchResult): result is DeferredNoEffectSettlement {
   return 'disposition' in result && result.disposition === 'deferred_no_effect';
+}
+
+function isAttachmentReadInput(input: ReliableAgentToolDispatchInput): boolean {
+  return input.toolName === 'read' && optionalText(plainOptionalRecord(input.arguments)?.mode) === 'attachment';
 }
 
 function noEffectModelDetail(toolName: string, result: ToolResultOut): PlainJsonValue {

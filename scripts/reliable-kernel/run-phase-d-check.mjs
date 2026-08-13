@@ -728,9 +728,59 @@ async function checkToolModelResultExactlyOnce() {
     assert.equal(hostDefinitionReads, 1);
     assert.equal(dispatchTransactions, 2);
     assert.ok(dispatched.every((entry) => entry.toolModelResultId));
+
+    const attachmentTools = [];
+    for (let index = 0; index < 4; index += 1) {
+      attachmentTools.push(await createTool(ctx, effects, `attachment-dispatch-${index}`, 'read'));
+    }
+    let activeAttachments = 0;
+    let maxActiveAttachments = 0;
+    let completedAttachments = 0;
+    const settledAttachmentCounts = [];
+    const originalAttachmentSettlement = effects.settleWithoutEffect.bind(effects);
+    effects.settleWithoutEffect = async (...args) => {
+      settledAttachmentCounts.push(completedAttachments);
+      return originalAttachmentSettlement(...args);
+    };
+    const attachmentDispatcher = new kernel.ReliableToolDispatcher({
+      database: ctx.database,
+      contentStore: ctx.store,
+      effects,
+      files: {},
+      fileMutations: {},
+      processes: {},
+      mcp: {},
+      interactions: {},
+      host: {
+        definitions() { return [dispatchDefinition]; },
+        async executeNoEffect(_definition, input) {
+          activeAttachments += 1;
+          maxActiveAttachments = Math.max(maxActiveAttachments, activeAttachments);
+          await delay(20);
+          activeAttachments -= 1;
+          completedAttachments += 1;
+          return { ok: true, output: { mimeType: 'image/png', sizeBytes: 1, path: input.arguments.path } };
+        }
+      }
+    });
+    try {
+      const attachmentResults = await attachmentDispatcher.dispatchBatch(attachmentTools.map((tool, index) => ({
+        turnId: ctx.turnId,
+        modelRequestId: 'attachment-dispatch-model',
+        toolCallId: tool.toolCallId,
+        toolName: 'read',
+        arguments: { path: `${index}.png`, mode: 'attachment' }
+      })));
+      assert.ok(attachmentResults.every((entry) => entry.toolModelResultId));
+    } finally {
+      effects.settleWithoutEffect = originalAttachmentSettlement;
+      await attachmentDispatcher.dispose();
+    }
+    assert.equal(maxActiveAttachments, 2, 'attachment reads must use their dedicated two-slot lane');
+    assert.deepEqual(settledAttachmentCounts, [1, 2, 3, 4], 'each attachment must settle before the next slot refill completes');
     assertions.push(
-      `ReliableToolDispatcher真实8路read同时执行，definitions只取1次、结果只写2个事务，`
-      + `snapshot=${dispatchSnapshots}，含20ms I/O总耗时${dispatchElapsedMs.toFixed(1)}ms`
+      `ReliableToolDispatcher保持普通文本read 8路并发/2事务，并将attachment read限制为${maxActiveAttachments}路且逐个结算；`
+      + `text snapshot=${dispatchSnapshots}，含20ms I/O总耗时${dispatchElapsedMs.toFixed(1)}ms`
     );
 
     const invalidTaskTool = await createTool(ctx, effects, 'invalid-task-list', 'update_task_list');

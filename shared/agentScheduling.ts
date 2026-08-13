@@ -1,3 +1,6 @@
+/** Maximum number of attachment reads materialized concurrently for one parent Turn. */
+export const MAX_CONCURRENT_ATTACHMENT_READS_PER_TURN = 2;
+
 /** Maximum number of ordinary ToolCalls executing concurrently for one parent Turn. */
 export const MAX_CONCURRENT_ORDINARY_TOOLS_PER_TURN = 8;
 
