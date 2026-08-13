@@ -40,12 +40,15 @@ docs/architecture/*
 !/tests/webviewLocalResources.test.cjs
 !/tests/reliable-kernel/
 /tests/reliable-kernel/*
+!/tests/reliable-kernel/attachment-ingest-boundary.test.mjs
+!/tests/reliable-kernel/canonical-base64.test.mjs
 !/tests/reliable-kernel/configuration-authority.test.mjs
 !/tests/reliable-kernel/context-token-estimator.test.mjs
 !/tests/reliable-kernel/current-turn-task-projection.test.mjs
 !/tests/reliable-kernel/diagnostic-journal.test.mjs
 !/tests/reliable-kernel/llm-capability-provider-adapter.test.mjs
 !/tests/reliable-kernel/model-system-prompt-prefix.test.mjs
+!/tests/reliable-kernel/native-compact-media.test.mjs
 !/tests/reliable-kernel/product-composition.test.mjs
 !/tests/reliable-kernel/phase-b-foundation.test.mjs
 !/tests/reliable-kernel/streaming-output-regressions.test.mjs
@@ -56,6 +59,7 @@ docs/architecture/*
 !/tests/reliable-kernel/provider-semantic-watchdog.test.mjs
 !/tests/reliable-kernel/child-agent-status-controls.test.cjs
 !/tests/reliable-kernel/client-feed-window-rollover.test.mjs
+!/tests/reliable-kernel/conversation-deletion-recovery.test.mjs
 !/tests/reliable-kernel/frontend-copy-guardrails.test.cjs
 !/tests/reliable-kernel/platform-runtime-compatibility.test.mjs
 !/tests/reliable-kernel/guidance-queue.test.mjs
