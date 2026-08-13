@@ -322,10 +322,22 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     void (async () => {
       try {
         const backendApp = await this.application();
-        const deleted = await backendApp.deleteConversation(conversationId);
-        if (deleted) MainPanel.closePanelsByConversationId(conversationId);
+        const deletedConversationIds = await backendApp.deleteConversation(conversationId);
+        const deleted = deletedConversationIds !== null;
+        if (deletedConversationIds) {
+          for (const deletedConversationId of deletedConversationIds) {
+            MainPanel.closePanelsByConversationId(deletedConversationId);
+          }
+        }
         await this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
-        await this.postConversationOperationResult(webview, 'delete', conversationId, deleted, deleted ? undefined : '该对话不存在。');
+        await this.postConversationOperationResult(
+          webview,
+          'delete',
+          conversationId,
+          deleted,
+          deleted ? undefined : '该对话不存在。',
+          deletedConversationIds ? { deletedConversationIds } : undefined
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : '删除对话失败。';
         console.warn('[LimCode] Failed to delete sidebar conversation.', error);
@@ -384,6 +396,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
       requestId?: string;
       status?: 'committed' | 'already_applied' | 'already_satisfied' | 'stale';
       runId?: string;
+      deletedConversationIds?: string[];
     } = {}
   ): Promise<void> {
     try {

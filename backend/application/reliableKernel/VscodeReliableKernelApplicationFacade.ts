@@ -352,45 +352,12 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return true;
   }
 
-  public async deleteConversation(conversationId: string): Promise<boolean> {
+  public async deleteConversation(conversationId: string): Promise<string[] | null> {
     this.requireOpen();
-    if (!await this.maybeRow('Conversation', conversationId)) return false;
-    const activeLease = (await this.list('ExecutionLease', { conversation_id: conversationId }, 2))[0];
-    if (activeLease) throw new Error('Conversation 仍有活动 Turn；请先终止后再删除。');
-    const activeTurn = (await this.list('Turn', { conversation_id: conversationId, status: 'active' }, 2))[0];
-    if (activeTurn) throw new Error('Conversation 仍有活动 Turn；请先终止后再删除。');
-    const pendingDelivery = (await this.list('RuntimeDelivery', {
-      target_conversation_id: conversationId,
-      state: 'pending'
-    }, 2))[0];
-    if (pendingDelivery) throw new Error('Conversation 仍有待接收的后台结果；结果收敛后才能删除。');
-    const processSources = (await this.product.application.database.snapshotAll(
-      DOMAIN_REPOSITORIES.domain('ProcessCompletionSourceLink').list({
-        where: { conversation_id: conversationId },
-        orderBy: { column: 'id', direction: 'asc' },
-        limit: 1000
-      })
-    )).snapshot;
-    for (const source of processSources) {
-      const processId = requireText(source.process_id, 'ProcessCompletionSourceLink.process_id');
-      const process = await this.maybeRow('Process', processId);
-      if (process?.status === 'running') {
-        throw new Error('Conversation 仍有后台进程运行；请先等待完成或终止进程后再删除。');
-      }
-      const receipts = await this.list('ProcessReceipt', { process_id: processId }, 2);
-      if (receipts.length === 0) continue;
-      const dispatch = (await this.list('ProcessCompletionDispatch', {
-        process_receipt_id: receipts[0].id
-      }, 2))[0];
-      if (dispatch && (dispatch.state === 'pending' || dispatch.state === 'claimed')) {
-        throw new Error('Conversation 的后台进程完成结果仍在投递；请等待投递收敛后再删除。');
-      }
-    }
-    await this.product.application.database.transaction([
-      DOMAIN_REPOSITORIES.domain('Conversation').delete(conversationId)
-    ]);
+    const deleted = await this.product.application.conversationDeletion.delete(conversationId);
+    if (!deleted) return null;
     await this.refreshConversationHistory();
-    return true;
+    return deleted.deletedConversationIds;
   }
 
   public async abortConversation(

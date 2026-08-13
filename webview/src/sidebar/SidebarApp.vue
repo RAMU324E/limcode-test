@@ -157,7 +157,7 @@ const renameDialogDescription = computed(() => {
 const deleteDialogDescriptionHtml = computed(() => {
   const title = displayConversationTitle(deleteTarget.value);
   const target = title ? `「${escapeHtml(middleEllipsis(title, 48))}」` : '这个对话';
-  return `将删除${target}以及关联消息、工具记录和运行记录，此操作<strong>无法撤销</strong>。`;
+  return `将删除${target}、其启动的所有子 Agent 对话，以及关联消息、工具记录和运行记录。此操作<strong>无法撤销</strong>。`;
 });
 const abortDialogDescriptionHtml = computed(() => {
   const title = displayConversationTitle(abortTarget.value);
@@ -196,7 +196,10 @@ onMounted(() => {
       if (message.operation === 'abort') clearAbortRequest(message.conversationId);
       if (message.operation === 'delete' && message.ok) {
         const next = new Set(removedConversationIds.value);
-        next.add(message.conversationId);
+        const deletedConversationIds = Array.isArray(message.deletedConversationIds)
+          ? message.deletedConversationIds
+          : [message.conversationId];
+        for (const deletedConversationId of deletedConversationIds) next.add(deletedConversationId);
         removedConversationIds.value = next;
       }
       const text = message.message

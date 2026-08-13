@@ -15,6 +15,7 @@ import {
 } from './runtimeServices';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { ContextCompressionControlPlane } from './contextCompression';
+import { ConversationDeletionControlPlane } from './conversationDeletion';
 import { ReliableContextCompressionCoordinator } from './contextCompressionCoordinator';
 import { ContextSequenceControlPlane } from './contextSequence';
 import type { RuntimeBuildInfoRecord } from '../../shared/protocol';
@@ -109,6 +110,7 @@ export class ReliableKernelApplication {
   public readonly database: RuntimeDatabase;
   public readonly contentStore: ContentAddressedStore;
   public readonly runtime: ReliableKernelRuntimeServices;
+  public readonly conversationDeletion: ConversationDeletionControlPlane;
   public readonly context: ContextSequenceControlPlane;
   public readonly compression: ContextCompressionControlPlane;
   public readonly compressionCoordinator: ReliableContextCompressionCoordinator;
@@ -162,6 +164,7 @@ export class ReliableKernelApplication {
       authorityCompiler: dependencies.authorityCompiler,
       attachments: this.attachments
     });
+    this.conversationDeletion = new ConversationDeletionControlPlane(database);
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
     this.compression = new ContextCompressionControlPlane(database, contentStore, options);
     this.modelProvider = new ModelProviderControlPlane(database, contentStore, options);

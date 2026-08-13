@@ -18,6 +18,7 @@ export * from './childOwnedProcessCleanup';
 export * from './clientFeed';
 export * from './clientFeedBounds';
 export * from './conversationFork';
+export * from './conversationDeletion';
 export * from './conversationProject';
 export * from './databaseSchema';
 export * from './diagnosticJournal';

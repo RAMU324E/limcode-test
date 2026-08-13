@@ -60,6 +60,7 @@ export type ExtensionToSidebarMessage =
       requestId?: string;
       status?: 'committed' | 'already_applied' | 'already_satisfied' | 'stale';
       runId?: string;
+      deletedConversationIds?: string[];
       message?: string;
     };
 

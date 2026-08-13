@@ -40,7 +40,7 @@ export interface ApplicationFacade {
   getConversationDisplayTitle(conversationId: string | undefined): string;
   prepareConversationForSidebarOpen(conversationId: string, title?: string): boolean;
   renameConversationTitle(conversationId: string, title: string): Promise<boolean>;
-  deleteConversation(conversationId: string): Promise<boolean>;
+  deleteConversation(conversationId: string): Promise<string[] | null>;
   abortConversation(
     conversationId: string,
     requestId: string,
