@@ -175,6 +175,7 @@ export interface ProviderDispatchOptions {
 const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
 const DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS = 80_000;
 const DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS = 5_000;
 const DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS = 4.5 * 60 * 1_000;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000] as const;
 const DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS = 1_000;
@@ -239,6 +240,9 @@ interface StreamStats {
   firstOutputAt?: number;
   completedAt?: number;
   streamOutputDurationMs?: number;
+  /** Low-frequency metadata-only liveness marker; never contains Provider output bytes. */
+  lastStreamSeq?: string;
+  lastStreamEventAt?: number;
 }
 
 interface StreamIdentity {
@@ -249,6 +253,7 @@ interface StreamIdentity {
 
 interface StreamDurabilityState {
   outputDeltaCheckpointed: boolean;
+  lastActivityPersistedAt: number;
 }
 
 interface FrozenAuthority {
@@ -829,7 +834,8 @@ export class ModelProviderControlPlane {
             semanticIdleMs: this.semanticTimeouts.semanticIdleMs
           });
       const streamDurability: StreamDurabilityState = {
-        outputDeltaCheckpointed: false
+        outputDeltaCheckpointed: false,
+        lastActivityPersistedAt: this.epochNow()
       };
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
@@ -840,19 +846,16 @@ export class ModelProviderControlPlane {
             const semanticProgress = event.semanticProgress !== false;
             if (semanticProgress) {
               sawReplayUnsafeProviderEvent = true;
-              progressWaiter.beginProgress();
+              progressWaiter.observeProgress();
             }
-            try {
-              return await this.recordDispatchStreamEvent(
-                modelRequestId,
-                identity.attemptSeq,
-                identity.socketGeneration,
-                event,
-                streamDurability
-              );
-            } finally {
-              if (semanticProgress) progressWaiter.commitProgress();
-            }
+            return this.recordDispatchStreamEvent(
+              modelRequestId,
+              identity.attemptSeq,
+              identity.socketGeneration,
+              event,
+              semanticProgress,
+              streamDurability
+            );
           }
         }))
         .then(
@@ -1008,9 +1011,21 @@ export class ModelProviderControlPlane {
     attemptSeq: bigint,
     socketGeneration: bigint,
     event: ProviderOutputStreamEvent,
+    semanticProgress: boolean,
     state: StreamDurabilityState
   ): Promise<StreamEventResult> {
+    const observedAt = this.epochNow();
     if (event.kind === 'output_delta' && state.outputDeltaCheckpointed) {
+      if (semanticProgress && await this.persistStreamActivityIfDue(
+        modelRequestId,
+        attemptSeq,
+        socketGeneration,
+        event.streamSeq,
+        observedAt,
+        state
+      )) {
+        return { accepted: false, checkpointed: false, terminal: true, ignoredReason: 'terminal' };
+      }
       return this.recordUndurableDispatchEvent('coalesced');
     }
 
@@ -1023,7 +1038,43 @@ export class ModelProviderControlPlane {
     ) {
       state.outputDeltaCheckpointed = true;
     }
+    if (
+      !result.terminal
+      && result.accepted
+      && semanticProgress
+      && await this.persistStreamActivityIfDue(
+        modelRequestId,
+        attemptSeq,
+        socketGeneration,
+        event.streamSeq,
+        observedAt,
+        state
+      )
+    ) {
+      return { accepted: false, checkpointed: false, terminal: true, ignoredReason: 'terminal' };
+    }
     return result;
+  }
+
+  private async persistStreamActivityIfDue(
+    modelRequestId: string,
+    attemptSeq: bigint,
+    socketGeneration: bigint,
+    streamSeqInput: string | bigint,
+    observedAt: number,
+    state: StreamDurabilityState
+  ): Promise<boolean> {
+    if (observedAt - state.lastActivityPersistedAt < DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS) return false;
+    const activity = await this.database.recordModelStreamActivity({
+      modelRequestId,
+      attemptSeq,
+      socketGeneration,
+      streamSeq: decimalBigInt(streamSeqInput, 'Provider activity streamSeq'),
+      observedAt,
+      now: this.timestamp()
+    });
+    if (activity.accepted) state.lastActivityPersistedAt = observedAt;
+    return activity.terminal;
   }
 
   private recordUndurableDispatchEvent(ignoredReason: 'coalesced'): StreamEventResult {
@@ -1141,9 +1192,12 @@ export class ModelProviderControlPlane {
       checkpointKind === 'output_item_done'
       && activeCheckpoints.length >= MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT
     ) {
-      throw new Error(
-        `ModelRequest ${modelRequestId} exceeded the durable semantic item checkpoint limit.`
-      );
+      return finish({
+        accepted: true,
+        checkpointed: false,
+        terminal: false,
+        ignoredReason: 'checkpoint-capacity'
+      });
     }
     const content = await this.contentStore.prepare(this.database, checkpointBytes, CONTENT_TYPE_CHECKPOINT);
     const result = await this.database.commitModelStreamEvent({
@@ -1157,7 +1211,7 @@ export class ModelProviderControlPlane {
       contentObject: content.metadata,
       ...(content.insert ? { contentInsert: content.insert } : {}),
       usage: completed ? (event.usage ?? null) : null,
-      terminalStats: completed ? { ...stats, ...(event.timing ?? {}) } : null,
+      terminalStats: completed ? terminalStreamStats(stats, event.timing) : null,
       now: this.timestamp()
     });
     transactionCount = result.commit ? 1 : 0;
@@ -1188,6 +1242,8 @@ export class ModelProviderControlPlane {
     const nextStats: StreamStats = { ...currentStats, socketGeneration: socketGeneration.toString() };
     delete nextStats.retryNotBeforeAt;
     delete nextStats.retryDelayMs;
+    delete nextStats.lastStreamSeq;
+    delete nextStats.lastStreamEventAt;
     const now = this.timestamp();
     try {
       await this.database.transaction([
@@ -1263,7 +1319,7 @@ export class ModelProviderControlPlane {
       await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('Turn').assert(requireId(bundle.turn.id, 'Turn.id'), { status: 'active' }),
         DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
-          status: 'streaming', stream_stats_json: failed.stats
+          status: 'streaming', stream_stats_json: currentStats
         }),
         DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
         DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
@@ -1446,7 +1502,7 @@ export class ModelProviderControlPlane {
     try {
       await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
-          status: bundle.request.status, stream_stats_json: identity.stats
+          status: bundle.request.status, stream_stats_json: currentStats
         }),
         DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
         DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
@@ -1687,8 +1743,7 @@ export class ModelProviderControlPlane {
 
 function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; semanticIdleMs: number }): {
   promise: Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>;
-  beginProgress(): void;
-  commitProgress(): void;
+  observeProgress(): void;
   dispose(): void;
 } {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1718,15 +1773,13 @@ function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; seman
   arm(timeouts.firstSemanticMs);
   return {
     promise,
-    beginProgress() {
+    observeProgress() {
       if (settled) return;
       sawProgress = true;
-      if (timer !== undefined) clearTimeout(timer);
-      timer = undefined;
-    },
-    commitProgress() {
-      if (settled) return;
-      sawProgress = true;
+      // Re-arm immediately when the Provider event is observed. The durable checkpoint Promise may
+      // itself block behind SQLite/CAS work; clearing the old timer until that Promise settles leaves
+      // this dispatch with no semantic watchdog and lets one stuck event survive to the 20-minute
+      // adapter deadline.
       arm(timeouts.semanticIdleMs);
     },
     dispose() {
@@ -1739,8 +1792,7 @@ function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; seman
 
 function createCompressionCompletionWaiter(timeoutMs: number): {
   promise: Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>;
-  beginProgress(): void;
-  commitProgress(): void;
+  observeProgress(): void;
   dispose(): void;
 } {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1763,9 +1815,8 @@ function createCompressionCompletionWaiter(timeoutMs: number): {
   return {
     promise,
     // compact() is terminal-only. It emits no text/thought progress, so only CompactDone or
-    // CompactError may satisfy this deadline; these no-ops keep the dispatch event path uniform.
-    beginProgress() {},
-    commitProgress() {},
+    // CompactError may satisfy this deadline; this no-op keeps the dispatch event path uniform.
+    observeProgress() {},
     dispose() {
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
@@ -2113,8 +2164,21 @@ function parseStreamStats(value: unknown): StreamStats {
     ...(optionalBoundedInteger(value.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER) !== undefined
       ? { retryNotBeforeAt: optionalBoundedInteger(value.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER) }
       : {}),
-    ...normalizeProviderTiming(value)
+    ...normalizeProviderTiming(value),
+    ...(optionalDecimalString(value.lastStreamSeq, 'lastStreamSeq') !== undefined
+      ? { lastStreamSeq: optionalDecimalString(value.lastStreamSeq, 'lastStreamSeq') }
+      : {}),
+    ...(optionalTimestamp(value.lastStreamEventAt, 'lastStreamEventAt') !== undefined
+      ? { lastStreamEventAt: optionalTimestamp(value.lastStreamEventAt, 'lastStreamEventAt') }
+      : {})
   };
+}
+
+function terminalStreamStats(stats: StreamStats, timing?: ProviderStreamTiming): DomainRow {
+  const terminal: DomainRow = { ...stats, ...(timing ?? {}) };
+  delete terminal.lastStreamSeq;
+  delete terminal.lastStreamEventAt;
+  return terminal;
 }
 
 function normalizeProviderTiming(value: unknown): ProviderStreamTiming {
@@ -2153,6 +2217,11 @@ function domainTimestampMs(value: unknown): number | undefined {
   if (typeof value !== 'string' || !value.trim()) return undefined;
   const parsed = Date.parse(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function optionalDecimalString(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  return decimalString(value, label);
 }
 
 function optionalTimestamp(value: unknown, label: string, allowZero = false): number | undefined {

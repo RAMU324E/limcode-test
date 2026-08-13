@@ -250,6 +250,15 @@ const activityModelLabel = computed(() => {
     : '';
   return override || provider?.model?.trim() || 'LLM';
 });
+const activityHeartbeat = computed(() => {
+  const request = latestActiveTurnRequest.value;
+  if (!request || reliableText(request.status) !== 'streaming') return undefined;
+  const stats = modelRequestStreamStats(request);
+  const observedAt = reliableInteger(stats?.lastStreamEventAt);
+  const streamSeq = reliableText(stats?.lastStreamSeq);
+  if (observedAt <= 0 || !streamSeq) return undefined;
+  return { observedAt, streamSeq };
+});
 const activityLabel = computed(() => {
   const action = conversationAction.value;
   if (action?.action === 'retry' && action.phase !== 'running') {
@@ -302,7 +311,10 @@ const activityLabel = computed(() => {
     return '正在启动 LLM 请求';
   }
   if (latest.status === 'streaming') {
-    return '正在等待 LLM 输出';
+    const heartbeat = activityHeartbeat.value;
+    return heartbeat
+      ? `正在等待 LLM 终态 · 最近流活动 ${formatActivityTime(heartbeat.observedAt)} · #${heartbeat.streamSeq}`
+      : '正在等待 LLM 输出';
   }
   return 'LLM 结果已提交，正在准备工具或下一轮';
 });
@@ -479,21 +491,34 @@ function timelineFloor(message: MessageRecord, visibleIndex: number): number {
   return absoluteTimelineFloor(projected, segmentStart.value + visibleIndex + 1);
 }
 
+function modelRequestStreamStats(request: Record<string, unknown>): Record<string, unknown> | undefined {
+  const raw = request.stream_stats_json;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  if (typeof raw !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function formatActivityTime(value: number): string {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : '未知';
+}
+
 function modelRequestRetryState(request: Record<string, unknown>): {
   retryAttempt: number;
   retryMaxAttempts: number;
   remainingDelayMs: number;
   reasonLabel: 'LLM 输出停滞' | 'LLM 连接异常' | '上下文压缩超时';
 } {
-  const raw = request.stream_stats_json;
-  let stats: Record<string, unknown> | undefined;
-  if (raw && typeof raw === 'object' && !Array.isArray(raw)) stats = raw as Record<string, unknown>;
-  else if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) stats = parsed as Record<string, unknown>;
-    } catch { /* malformed durable data is rendered without retry detail */ }
-  }
+  const stats = modelRequestStreamStats(request);
   const attemptSeq = Math.max(1, reliableInteger(stats?.attemptSeq));
   const retryDelayMs = Math.max(0, reliableInteger(stats?.retryDelayMs));
   const retryNotBeforeAt = Math.max(0, reliableInteger(stats?.retryNotBeforeAt));

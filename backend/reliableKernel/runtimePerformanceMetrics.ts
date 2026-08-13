@@ -21,6 +21,7 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'contextMaterialization'
   | 'contextContentMaterialization'
   | 'modelStreamEvent'
+  | 'modelStreamActivity'
   | 'cancelCurrentModelRequest'
   | 'clientProjectionSnapshot'
   | 'clientKeysetPage'

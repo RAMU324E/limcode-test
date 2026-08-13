@@ -24,6 +24,8 @@ import type {
   DatabaseWorkerData,
   DatabaseWorkerDiagnostics,
   DatabaseWorkerRequest,
+  ModelStreamActivityInput,
+  ModelStreamActivityResult,
   ModelStreamEventCommitInput,
   ModelStreamEventCommitResult,
   ModelRequestCancelInput,
@@ -378,6 +380,16 @@ export class RuntimeDatabase {
     const executionFence = currentExecutionLeaseFence();
     return this.requestWithExecutionFence(executionFence, {
       kind: 'modelStreamEvent',
+      input: executionFence ? { ...input, executionFence } : input
+    });
+  }
+
+  public async recordModelStreamActivity(
+    input: ModelStreamActivityInput
+  ): Promise<ModelStreamActivityResult> {
+    const executionFence = currentExecutionLeaseFence();
+    return this.requestWithExecutionFence(executionFence, {
+      kind: 'modelStreamActivity',
       input: executionFence ? { ...input, executionFence } : input
     });
   }

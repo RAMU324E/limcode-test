@@ -44,6 +44,8 @@ import {
   type DatabaseWorkerResponse,
   type ExecutionLeaseFencePayload,
   type EffectReceiptReconciliationCandidate,
+  type ModelStreamActivityInput,
+  type ModelStreamActivityResult,
   type ModelStreamEventCommitInput,
   type ModelStreamEventCommitResult,
   type ModelRequestCancelInput,
@@ -257,6 +259,16 @@ async function start(): Promise<void> {
       if (request.kind === 'modelStreamEvent') {
         assertDatabaseBinding(writer, data.binding);
         const result = executeModelStreamEvent(writer, request.input, commitSeq + 1n);
+        if (result.commit) {
+          commitSeq += 1n;
+          post({ type: 'commit', result: result.commit });
+        }
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'modelStreamActivity') {
+        assertDatabaseBinding(writer, data.binding);
+        const result = executeModelStreamActivity(writer, request.input, commitSeq + 1n);
         if (result.commit) {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
@@ -1114,9 +1126,13 @@ function executeModelStreamEvent(
       input.checkpointKind === 'output_item_done'
       && checkpointCountRow.count >= BigInt(MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT)
     ) {
-      throw new Error(
-        `ModelRequest ${modelRequestId} exceeded the durable semantic item checkpoint limit.`
-      );
+      database.exec('ROLLBACK');
+      return {
+        accepted: true,
+        checkpointed: false,
+        terminal: false,
+        ignoredReason: 'checkpoint-capacity'
+      };
     }
     const contentId = requireRuntimeId(input.contentObject.id);
     assertPreparedContentInsert(input.contentObject, input.contentInsert);
@@ -1202,6 +1218,78 @@ function executeModelStreamEvent(
       checkpointed: true,
       terminal: input.checkpointKind === 'terminal_summary',
       commit
+    };
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function executeModelStreamActivity(
+  database: Database.Database,
+  input: ModelStreamActivityInput,
+  nextCommitSeq: bigint
+): ModelStreamActivityResult {
+  const modelRequestId = requireRuntimeId(input.modelRequestId);
+  const attemptSeq = requirePositiveInteger(input.attemptSeq, 'ModelStreamActivity.attemptSeq');
+  const socketGeneration = requirePositiveInteger(input.socketGeneration, 'ModelStreamActivity.socketGeneration');
+  const streamSeq = requirePositiveInteger(input.streamSeq, 'ModelStreamActivity.streamSeq');
+  if (!Number.isSafeInteger(input.observedAt) || input.observedAt <= 0) {
+    throw new TypeError('ModelStreamActivity.observedAt must be a positive safe integer.');
+  }
+  if (typeof input.now !== 'string' || input.now.length === 0) {
+    throw new TypeError('ModelStreamActivity.now must be non-empty.');
+  }
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec('DELETE FROM temp.runtime_transaction_change');
+    assertExecutionLeaseFence(database, input.executionFence);
+    const requestRaw = database.prepare('SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
+    if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
+    const request = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(requestRaw as Record<string, unknown>);
+    const fence = database.prepare(
+      'SELECT id FROM model_stream_fence WHERE model_request_id = ? LIMIT 1'
+    ).get(modelRequestId);
+    const turn = database.prepare('SELECT status FROM turn WHERE id = ?').get(request.turn_id) as { status?: unknown } | undefined;
+    if (fence || request.status === 'terminal' || turn?.status !== 'active') {
+      database.exec('ROLLBACK');
+      return { accepted: false, terminal: true };
+    }
+    if (request.status !== 'streaming') {
+      database.exec('ROLLBACK');
+      return { accepted: false, terminal: false };
+    }
+    const identity = decodeModelStreamIdentity(request.stream_stats_json);
+    if (identity.attemptSeq !== attemptSeq || identity.socketGeneration !== socketGeneration) {
+      database.exec('ROLLBACK');
+      return { accepted: false, terminal: false };
+    }
+    const stats = request.stream_stats_json as Record<string, unknown>;
+    const previousSeq = optionalDecimalInteger(stats.lastStreamSeq, 'lastStreamSeq') ?? 0n;
+    const previousAt = optionalPositiveInteger(stats.lastStreamEventAt, 'lastStreamEventAt') ?? 0;
+    const nextSeq = streamSeq > previousSeq ? streamSeq : previousSeq;
+    const nextAt = input.observedAt > previousAt ? input.observedAt : previousAt;
+    if (nextSeq === previousSeq && nextAt === previousAt) {
+      database.exec('ROLLBACK');
+      return { accepted: false, terminal: false };
+    }
+    executeSteps(database, [
+      DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+        status: 'streaming',
+        stream_stats_json: {
+          ...stats,
+          lastStreamSeq: nextSeq.toString(),
+          lastStreamEventAt: nextAt
+        },
+        updated_at: input.now
+      })
+    ], []);
+    const changes = readTransactionChanges(database);
+    database.exec('COMMIT');
+    return {
+      accepted: true,
+      terminal: false,
+      commit: { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences: [] }
     };
   } catch (error) {
     database.exec('ROLLBACK');
@@ -1330,7 +1418,9 @@ function decodeModelStreamIdentity(value: unknown): {
     'providerStartedAt',
     'firstOutputAt',
     'completedAt',
-    'streamOutputDurationMs'
+    'streamOutputDurationMs',
+    'lastStreamSeq',
+    'lastStreamEventAt'
   ]);
   if (
     !keys.includes('attemptSeq')
@@ -1360,6 +1450,8 @@ function decodeModelStreamIdentity(value: unknown): {
   assertOptionalStreamTiming(record.firstOutputAt, 'firstOutputAt');
   assertOptionalStreamTiming(record.completedAt, 'completedAt');
   assertOptionalStreamTiming(record.streamOutputDurationMs, 'streamOutputDurationMs', true);
+  optionalDecimalInteger(record.lastStreamSeq, 'lastStreamSeq');
+  optionalPositiveInteger(record.lastStreamEventAt, 'lastStreamEventAt');
   return {
     attemptSeq,
     socketGeneration: decimalRuntimeInteger(record.socketGeneration, 'stream_stats.socketGeneration'),
@@ -1367,6 +1459,31 @@ function decodeModelStreamIdentity(value: unknown): {
     ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
     ...(retryNotBeforeAt !== undefined ? { retryNotBeforeAt } : {})
   };
+}
+
+function optionalDecimalInteger(value: unknown, label: string): bigint | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/.test(value)) {
+    throw new TypeError(`ModelRequest.stream_stats_json.${label} must be a decimal integer string.`);
+  }
+  return BigInt(value);
+}
+
+function optionalNonNegativeInteger(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value)) {
+    const parsed = Number(value);
+    if (Number.isSafeInteger(parsed)) return parsed;
+  }
+  if (Number.isSafeInteger(value) && (value as number) >= 0) return value as number;
+  throw new TypeError(`ModelRequest.stream_stats_json.${label} must be a non-negative safe integer.`);
+}
+
+function optionalPositiveInteger(value: unknown, label: string): number | undefined {
+  const parsed = optionalNonNegativeInteger(value, label);
+  if (parsed === undefined) return undefined;
+  if (parsed <= 0) throw new TypeError(`ModelRequest.stream_stats_json.${label} must be positive.`);
+  return parsed;
 }
 
 function assertOptionalBoundedInteger(

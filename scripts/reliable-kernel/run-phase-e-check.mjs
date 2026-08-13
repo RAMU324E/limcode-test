@@ -1866,12 +1866,14 @@ async function checkProviderFullRequest() {
       );
       assert.equal(semantic.checkpointed, true);
     }
-    await assert.rejects(provider.recordStreamEvent(
+    const overflowSemantic = await provider.recordStreamEvent(
       capacityRequest.modelRequestId,
       capacitySocket.attemptSeq,
       capacitySocket.socketGeneration,
       { kind: 'output_item_done', streamSeq: '103', content: { item: 33 } }
-    ), /semantic item checkpoint limit/);
+    );
+    assert.equal(overflowSemantic.checkpointed, false);
+    assert.equal(overflowSemantic.ignoredReason, 'checkpoint-capacity');
     assert.equal(await count(ctx.database, 'ModelStreamCheckpoint', {
       model_request_id: capacityRequest.modelRequestId
     }), 33);
@@ -2009,7 +2011,7 @@ async function checkProviderFullRequest() {
       })
     ]), /cannot transition from terminal/);
     assert.ok(await get(ctx.database, 'ModelStreamCheckpoint', protectedCheckpoint.id));
-    assertions.push('writer事务内Promise.all并发只保留首个delta；1 delta+32 item边界后semantic overflow明确失败且终态≤33；受控late-item在CAS发布后由Completed fence阻断且不留SQLite引用；终态精确保留当前attempt/socket固定32+summary；generic checkpoint/fence insert/delete、错误prune身份和terminal复活均被writer拒绝');
+    assertions.push('writer事务内Promise.all并发只保留首个delta；1 delta+32 item边界后semantic overflow有界合并且终态≤33；受控late-item在CAS发布后由Completed fence阻断且不留SQLite引用；终态精确保留当前attempt/socket固定32+summary；generic checkpoint/fence insert/delete、错误prune身份和terminal复活均被writer拒绝');
 
     const ignoredSignalRequest = await provider.createModelRequest({
       turnId: seeded.turnId,

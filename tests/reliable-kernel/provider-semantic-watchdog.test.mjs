@@ -192,6 +192,10 @@ test('plan→update_task_list 后只有伪 thought progress 不会续命，seman
   await withApp('provider-semantic-stall', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'task-list-stall');
     const provider = controlPlane(app);
+    let pseudoProgressStats;
+    const originalEpochNow = provider.epochNow;
+    let epoch = 10_000;
+    provider.epochNow = () => epoch;
     const transient = [];
     let calls = 0;
     const startedAt = Date.now();
@@ -206,6 +210,7 @@ test('plan→update_task_list 后只有伪 thought progress 不会续命，seman
           });
           for (let seq = 2; seq <= 5; seq += 1) {
             await sleep(5);
+            epoch += 5_000;
             await controls.onEvent({
               kind: 'output_delta',
               streamSeq: String(seq),
@@ -213,6 +218,7 @@ test('plan→update_task_list 后只有伪 thought progress 不会续命，seman
               content: { type: 'thought_progress', thoughtElapsedMs: seq * 500 }
             });
           }
+          pseudoProgressStats = (await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json;
           await new Promise((resolve) => controls.signal.addEventListener('abort', resolve, { once: true }));
           const aborted = new Error('watchdog aborted stalled socket');
           aborted.name = 'AbortError';
@@ -226,6 +232,10 @@ test('plan→update_task_list 后只有伪 thought progress 不会续命，seman
     }, { onTransientTerminal: (event) => transient.push(event) });
 
     assert.equal(result.terminalState, 'completed');
+    provider.epochNow = originalEpochNow;
+    assert.equal(pseudoProgressStats.lastStreamEventAt, undefined,
+      '本地 thought_progress 不能伪装成 durable Provider 活动心跳');
+    assert.equal(pseudoProgressStats.lastStreamSeq, undefined);
     assert.equal(calls, 2);
     assert.ok(Date.now() - startedAt < 500, 'fixture must detect the stall promptly');
     assert.ok(transient.some((entry) =>
@@ -411,32 +421,43 @@ test('Provider persists only the first delta while item_done and terminal remain
   await withApp('provider-recovery-checkpoint-policy', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'recovery-checkpoint-policy');
     const results = [];
-    await controlPlane(app, {
+    let liveHeartbeat;
+    const provider = controlPlane(app, {
       semanticTimeouts: { firstSemanticMs: 1_000, semanticIdleMs: 1_000 }
-    }).dispatch(request.modelRequestId, {
-      providerId: 'provider-watchdog',
-      async sendFullRequest(_request, controls) {
-        results.push(await controls.onEvent({
-          kind: 'output_delta', streamSeq: '1', content: { type: 'text_delta', text: 'first' }
-        }));
-        results.push(await controls.onEvent({
-          kind: 'output_delta', streamSeq: '2', content: { type: 'text_delta', text: 'x'.repeat(9_000) }
-        }));
-        results.push(await controls.onEvent({
-          kind: 'output_delta', streamSeq: '3', content: { type: 'text_delta', text: 'y'.repeat(9_000) }
-        }));
-        await sleep(270);
-        results.push(await controls.onEvent({
-          kind: 'output_delta', streamSeq: '4', content: { type: 'text_delta', text: 'after-time-window' }
-        }));
-        results.push(await controls.onEvent({
-          kind: 'output_item_done', streamSeq: '5', content: { type: 'thought_done' }
-        }));
-        results.push(await controls.onEvent({
-          kind: 'completed', streamSeq: '6', content: { text: 'done', thought: '', toolCalls: [] }
-        }));
-      }
     });
+    const originalEpochNow = provider.epochNow;
+    let epoch = 10_000;
+    provider.epochNow = () => epoch;
+    try {
+      await provider.dispatch(request.modelRequestId, {
+        providerId: 'provider-watchdog',
+        async sendFullRequest(_request, controls) {
+          results.push(await controls.onEvent({
+            kind: 'output_delta', streamSeq: '1', content: { type: 'text_delta', text: 'first' }
+          }));
+          results.push(await controls.onEvent({
+            kind: 'output_delta', streamSeq: '2', content: { type: 'text_delta', text: 'x'.repeat(9_000) }
+          }));
+          results.push(await controls.onEvent({
+            kind: 'output_delta', streamSeq: '3', content: { type: 'text_delta', text: 'y'.repeat(9_000) }
+          }));
+          await sleep(270);
+          epoch += 5_000;
+          results.push(await controls.onEvent({
+            kind: 'output_delta', streamSeq: '4', content: { type: 'text_delta', text: 'after-time-window' }
+          }));
+          liveHeartbeat = (await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json;
+          results.push(await controls.onEvent({
+            kind: 'output_item_done', streamSeq: '5', content: { type: 'thought_done' }
+          }));
+          results.push(await controls.onEvent({
+            kind: 'completed', streamSeq: '6', content: { text: 'done', thought: '', toolCalls: [] }
+          }));
+        }
+      });
+    } finally {
+      provider.epochNow = originalEpochNow;
+    }
     assert.deepEqual(results.map((result) => [result.checkpointed, result.ignoredReason ?? null]), [
       [true, null],
       [false, 'coalesced'],
@@ -445,35 +466,54 @@ test('Provider persists only the first delta while item_done and terminal remain
       [true, null],
       [true, null]
     ]);
+    assert.equal(liveHeartbeat.lastStreamSeq, '4');
+    assert.equal(liveHeartbeat.lastStreamEventAt, 15_000);
+    const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
+    assert.equal(durableRequest.stream_stats_json.lastStreamSeq, undefined,
+      'terminal summary replaces live heartbeat fields with authoritative terminal timing');
     const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
     assert.equal(checkpoints.filter((row) => row.checkpoint_kind === 'output_item_done').length, 1);
   });
 });
 
-test('Provider semantic checkpoint overflow explicitly fails the request within the 33-row bound', async () => {
+test('Provider semantic checkpoint overflow 有界合并且 terminal summary 仍可提交', async () => {
   await withApp('provider-semantic-checkpoint-overflow', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'semantic-checkpoint-overflow');
-    await assert.rejects(controlPlane(app).dispatch(request.modelRequestId, {
+    const results = [];
+    await controlPlane(app, {
+      // This fixture intentionally performs 41 sequential SQLite transactions. Keep the semantic
+      // deadline above test-runner/worker scheduling jitter; the dedicated commit-stall case below
+      // owns the short watchdog boundary.
+      semanticTimeouts: { firstSemanticMs: 500, semanticIdleMs: 500 }
+    }).dispatch(request.modelRequestId, {
       providerId: 'provider-watchdog',
       async sendFullRequest(_request, controls) {
         await controls.onEvent({
           kind: 'output_delta', streamSeq: '1', content: { type: 'text_delta', text: 'first' }
         });
-        for (let item = 1; item <= 33; item += 1) {
-          await controls.onEvent({
+        for (let item = 1; item <= 40; item += 1) {
+          results.push(await controls.onEvent({
             kind: 'output_item_done',
             streamSeq: String(item + 1),
             content: { type: 'synthetic_item', item }
-          });
+          }));
         }
+        results.push(await controls.onEvent({
+          kind: 'completed', streamSeq: '42',
+          content: { text: 'terminal survives capacity', thought: '', toolCalls: [] }
+        }));
       }
-    }), /semantic item checkpoint limit/);
+    });
     const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
     assert.equal(durableRequest.status, 'terminal');
-    assert.equal(durableRequest.terminal_state, 'provider_failed');
-    assert.equal((await list(app, 'ModelStreamCheckpoint', {
+    assert.equal(durableRequest.terminal_state, 'completed');
+    assert.ok(results.some((result) => result.ignoredReason === 'checkpoint-capacity'));
+    assert.equal(results.at(-1).terminal, true);
+    const checkpoints = await list(app, 'ModelStreamCheckpoint', {
       model_request_id: request.modelRequestId
-    })).length, 33);
+    });
+    assert.equal(checkpoints.length, 33);
+    assert.equal(checkpoints.filter((row) => row.checkpoint_kind === 'terminal_summary').length, 1);
   });
 });
 
@@ -513,7 +553,11 @@ test('单条 thought 后的合法静默在 idle 边界内完成且不创建重�
 
 test('正常 semantic progress 会刷新 idle watchdog，首语义 black-hole 会自动 retry', async () => {
   await withApp('provider-semantic-progress', async (app, conversationId, turnId) => {
-    const provider = controlPlane(app);
+    const provider = controlPlane(app, {
+      // Repeated progress must outlive the first-event deadline, while the idle deadline allows
+      // ordinary SQLite scheduling jitter now that it intentionally stays armed during each commit.
+      semanticTimeouts: { firstSemanticMs: 50, semanticIdleMs: 150 }
+    });
     const progressing = await createRequest(app, conversationId, turnId, 'normal-semantic-progress');
     let progressCalls = 0;
     await provider.dispatch(progressing.modelRequestId, {
@@ -556,6 +600,44 @@ test('正常 semantic progress 会刷新 idle watchdog，首语义 black-hole �
     assert.ok(terminals.some((entry) =>
       entry.event.content.terminalState === 'provider_transient_first_semantic_timeout'
     ));
+  });
+});
+
+test('Provider 在 durable stream event 提交阻塞时仍保持 semantic idle watchdog', async () => {
+  await withApp('provider-semantic-commit-stall', async (app, conversationId, turnId) => {
+    const provider = controlPlane(app, {
+      semanticTimeouts: { firstSemanticMs: 120, semanticIdleMs: 35 }
+    });
+    const request = await createRequest(app, conversationId, turnId, 'semantic-commit-stall');
+    const originalCommit = app.database.commitModelStreamEvent.bind(app.database);
+    let releaseCommit;
+    let commitStarted;
+    const commitStartedPromise = new Promise((resolve) => { commitStarted = resolve; });
+    const releaseCommitPromise = new Promise((resolve) => { releaseCommit = resolve; });
+    app.database.commitModelStreamEvent = async (input) => {
+      if (input.modelRequestId !== request.modelRequestId) return originalCommit(input);
+      commitStarted();
+      await releaseCommitPromise;
+      return originalCommit(input);
+    };
+    const startedAt = Date.now();
+    const dispatch = provider.dispatch(request.modelRequestId, {
+      providerId: 'provider-watchdog',
+      async sendFullRequest(_request, controls) {
+        await controls.onEvent({
+          kind: 'output_delta', streamSeq: '1',
+          content: { type: 'thought_delta', text: 'checkpoint blocks' }
+        });
+      }
+    }, { timeoutMs: 500 });
+    try {
+      await commitStartedPromise;
+      await assert.rejects(dispatch, /no semantic progress for 35ms/);
+    } finally {
+      releaseCommit();
+      app.database.commitModelStreamEvent = originalCommit;
+    }
+    assert.ok(Date.now() - startedAt < 300, 'semantic watchdog must win before the outer dispatch deadline');
   });
 });
 
@@ -604,52 +686,65 @@ test('transient failures 达到冻结上限后才终止，408/425/429/5xx 均可
   }
 });
 
-test('WS 1000 在任何 Responses 事件前关闭会创建 durable Attempt 2 并自动恢复', async () => {
-  await withApp('provider-pre-terminal-normal-close', async (app, conversationId, turnId) => {
-    const request = await createRequest(app, conversationId, turnId, 'pre-terminal-normal-close');
-    let calls = 0;
-    const capability = {
-      start(llmRequest, emit) {
-        calls += 1;
-        if (calls === 1) {
-          emit({
-            type: 'llm:error',
-            payload: {
-              requestId: llmRequest.id,
-              message: 'OpenAI Responses WebSocket closed before terminal event: 1000',
-              rawError: {
-                name: 'WebSocketCloseError',
-                message: 'OpenAI Responses WebSocket closed before terminal event: 1000',
-                closeCode: 1000,
-                phase: 'awaiting_first_event',
-                receivedServerEvent: false,
-                retryable: false,
-                transportAttemptsExhausted: false
+test('所有可恢复的 Responses 终态前关闭都会创建 durable Attempt 2 并自动恢复', async () => {
+  for (const fixture of [
+    { closeCode: 1000, reason: '' },
+    { closeCode: 1001, reason: ' Going Away' },
+    { closeCode: 1005, reason: ' No Status Received' },
+    { closeCode: 1006, reason: ' Abnormal Closure' },
+    { closeCode: 1011, reason: ' Internal Error' },
+    { closeCode: 1012, reason: ' Service Restart' },
+    { closeCode: 1013, reason: ' Try Again Later' },
+    { closeCode: 1014, reason: ' Bad Gateway' },
+    { closeCode: 1015, reason: ' TLS Handshake' }
+  ]) {
+    await withApp(`provider-pre-terminal-close-${fixture.closeCode}`, async (app, conversationId, turnId) => {
+      const request = await createRequest(app, conversationId, turnId, `pre-terminal-close-${fixture.closeCode}`);
+      const message = `OpenAI Responses WebSocket closed before terminal event: ${fixture.closeCode}${fixture.reason}`;
+      let calls = 0;
+      const capability = {
+        start(llmRequest, emit) {
+          calls += 1;
+          if (calls === 1) {
+            emit({
+              type: 'llm:error',
+              payload: {
+                requestId: llmRequest.id,
+                message,
+                rawError: {
+                  name: 'WebSocketCloseError',
+                  message,
+                  closeCode: fixture.closeCode,
+                  phase: 'awaiting_first_event',
+                  receivedServerEvent: false,
+                  retryable: false,
+                  transportAttemptsExhausted: false
+                }
               }
-            }
-          });
-          return;
-        }
-        emit({ type: 'llm:done', payload: { requestId: llmRequest.id, completedAt: Date.now() } });
-      },
-      compact() { throw new Error('unused'); },
-      abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
-    };
-    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability);
-    await controlPlane(app).dispatch(request.modelRequestId, adapter);
+            });
+            return;
+          }
+          emit({ type: 'llm:done', payload: { requestId: llmRequest.id, completedAt: Date.now() } });
+        },
+        compact() { throw new Error('unused'); },
+        abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
+      };
+      const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability);
+      await controlPlane(app).dispatch(request.modelRequestId, adapter);
 
-    assert.equal(calls, 2);
-    assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, 'completed');
-    const operation = (await list(app, 'Operation', {
-      owner_kind: 'model_request', owner_id: request.modelRequestId
-    }))[0];
-    const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
-      .slice()
-      .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
-    assert.equal(attempts.length, 2);
-    assert.equal(attempts[0].status, 'transient_failed');
-    assert.equal(attempts[1].status, 'completed');
-  });
+      assert.equal(calls, 2);
+      assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, 'completed');
+      const operation = (await list(app, 'Operation', {
+        owner_kind: 'model_request', owner_id: request.modelRequestId
+      }))[0];
+      const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
+        .slice()
+        .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+      assert.equal(attempts.length, 2);
+      assert.equal(attempts[0].status, 'transient_failed');
+      assert.equal(attempts[1].status, 'completed');
+    });
+  }
 });
 
 test('response.created 后首语义前 EOF 仍会创建 durable Attempt 2 并自动恢复', async () => {
@@ -732,6 +827,18 @@ test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted
   await assert.rejects(
     runRawError({ message: 'Unexpected server response: 429', transport: 'websocket' }),
     (error) => error instanceof kernel.ProviderTransientError && error.reason === 'rate_limited'
+  );
+  await assert.rejects(
+    runRawError({
+      message: 'OpenAI Responses WebSocket closed before terminal event: 1006 Abnormal Closure',
+      closeCode: 1006,
+      phase: 'awaiting_first_event',
+      receivedServerEvent: false,
+      receivedSemanticOutput: false,
+      retryable: false,
+      transportAttemptsExhausted: false
+    }),
+    (error) => error instanceof kernel.ProviderTransientError && error.reason === 'connection_interrupted'
   );
   await assert.rejects(
     runRawError({
