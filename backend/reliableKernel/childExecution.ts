@@ -49,6 +49,10 @@ import {
   type TurnAuthorityCompiler
 } from './turnControlPlane';
 
+export const CHILD_INTERRUPTION_RECOVERY_SOURCE_PREFIX = 'recovery:interrupt-subtree:';
+export const CHILD_INTERRUPTION_RECOVERY_REASON =
+  'Extension Host restart resumed an incomplete subtree interruption.';
+
 export type ChildCompletionPolicy = 'wait_for_answer' | 'background';
 export type ChildSendMode = 'queue_next_turn' | 'interrupt_current_turn';
 
@@ -203,6 +207,12 @@ export interface ChildExecutionControlPlaneOptions {
     turnId: string,
     now: string
   ) => Promise<RepositoryTransactionStep[]>;
+}
+
+interface InterruptionReplayFacts {
+  result: ChildExecutionCancelSubtreeResult;
+  /** The immutable reason committed by the first invocation; recovery replay must reuse it. */
+  reason: string;
 }
 
 interface SpawnIds {
@@ -1479,15 +1489,15 @@ export class ChildExecutionControlPlane {
     const replay = await this.findInterruptionReplay(command);
     if (replay) {
       let waitsSettled = 0;
-      for (const childExecutionId of replay.lineageIds) {
+      for (const childExecutionId of replay.result.lineageIds) {
         const settled = await this.settleCancelledExecutionWaits({
           childExecutionId,
-          reason: command.reason,
+          reason: replay.reason,
           sourceIdentity: `interrupt-replay:${command.sourceKey}`
         });
         waitsSettled += Number(settled.foregroundSettled) + settled.continuationSettlements;
       }
-      return { ...replay, waitsSettled };
+      return { ...replay.result, waitsSettled };
     }
     return this.interruptSubtreeAttempt(command);
   }
@@ -1495,7 +1505,7 @@ export class ChildExecutionControlPlane {
   /** Re-enters a durable subtree interruption from any descendant after one child Turn stops. */
   public async reconcileCancelledLineage(
     childExecutionIdInput: string,
-    reason = 'Child Turn reached a cancellation boundary.'
+    _observedReason?: string
   ): Promise<ChildExecutionCancelSubtreeResult | null> {
     const childExecutionId = requirePhaseFId(childExecutionIdInput, 'childExecutionId');
     const seen = new Set<string>();
@@ -1506,9 +1516,9 @@ export class ChildExecutionControlPlane {
       const child = await this.requireExisting('ChildExecution', cursor);
       if (isChildExecutionInterrupting(requireChildExecutionStatus(child.status))) {
         return this.interruptSubtree({
-          sourceKey: `recovery:interrupt-subtree:${cursor}`,
+          sourceKey: childInterruptionRecoverySourceKey(cursor),
           childExecutionId: cursor,
-          reason
+          reason: CHILD_INTERRUPTION_RECOVERY_REASON
         });
       }
       const parentLinks = await this.listRows('ChildExecutionParentLink', {
@@ -3368,8 +3378,12 @@ export class ChildExecutionControlPlane {
 
   private async findInterruptionReplay(
     command: ReturnType<typeof normalizeCancelCommand>
-  ): Promise<ChildExecutionCancelSubtreeResult | null> {
+  ): Promise<InterruptionReplayFacts | null> {
     const sourceKind = command.sourceKey.startsWith('recovery:') ? 'recovery' : 'command';
+    const recoveryReplay = isChildInterruptionRecoverySourceKey(command.sourceKey);
+    if (recoveryReplay && command.sourceKey !== childInterruptionRecoverySourceKey(command.childExecutionId)) {
+      throw new Error('Child interruption recovery source identity does not match its root execution.');
+    }
     const requests = await this.listRows('ChildInterruptionRequest', {
       source_kind: sourceKind,
       source_key: command.sourceKey
@@ -3386,7 +3400,7 @@ export class ChildExecutionControlPlane {
     if (
       requestId !== expectedRequestId
       || request.root_child_execution_id !== command.childExecutionId
-      || request.reason !== command.reason
+      || (!recoveryReplay && request.reason !== command.reason)
     ) throw new Error('Child interruption command was replayed with different facts.');
     const [lineageLinks, turnLinks, intentLinks, receipts] = await Promise.all([
       listAllDomainRows(this.database, 'ChildInterruptionLineageLink', { interruption_request_id: requestId }),
@@ -3413,21 +3427,24 @@ export class ChildExecutionControlPlane {
       requireChildExecutionStatus(row.status) === 'interrupted'
     ) ? lineageIds : [];
     return {
-      rootChildExecutionId: command.childExecutionId,
-      lineageIds,
-      activeTurnIds: turnLinks
-        .map((link) => requirePhaseFId(link.turn_id, 'ChildInterruptionTurnLink.turn_id'))
-        .sort(),
-      cancelledIntentIds: intentRows
-        .map((link) => requirePhaseFId(link.turn_intent_id, 'ChildExecutionIntentLink.turn_intent_id'))
-        .sort(),
-      // These fields report mutations performed by this invocation. A replay exposes the
-      // immutable target snapshot above, but must not masquerade as fresh reconciliation work.
-      terminationRequestsWritten: 0,
-      intentsCancelled: 0,
-      waitsSettled: 0,
-      terminalizedLineageIds,
-      deduplicated: true
+      reason: requirePhaseFText(request.reason, 'ChildInterruptionRequest.reason'),
+      result: {
+        rootChildExecutionId: command.childExecutionId,
+        lineageIds,
+        activeTurnIds: turnLinks
+          .map((link) => requirePhaseFId(link.turn_id, 'ChildInterruptionTurnLink.turn_id'))
+          .sort(),
+        cancelledIntentIds: intentRows
+          .map((link) => requirePhaseFId(link.turn_intent_id, 'ChildExecutionIntentLink.turn_intent_id'))
+          .sort(),
+        // These fields report mutations performed by this invocation. A replay exposes the
+        // immutable target snapshot above, but must not masquerade as fresh reconciliation work.
+        terminationRequestsWritten: 0,
+        intentsCancelled: 0,
+        waitsSettled: 0,
+        terminalizedLineageIds,
+        deduplicated: true
+      }
     };
   }
 
@@ -3534,6 +3551,18 @@ function normalizeAdmissionCommand(command: ChildContinuationAdmissionCommand) {
     leaseOwnerId: requirePhaseFId(command.leaseOwnerId, 'leaseOwnerId'),
     leaseExpiresAt: requireIsoTimestamp(command.leaseExpiresAt, 'leaseExpiresAt')
   };
+}
+
+export function childInterruptionRecoverySourceKey(childExecutionIdInput: string): string {
+  return `${CHILD_INTERRUPTION_RECOVERY_SOURCE_PREFIX}${requirePhaseFId(
+    childExecutionIdInput,
+    'childExecutionId'
+  )}`;
+}
+
+function isChildInterruptionRecoverySourceKey(sourceKey: string): boolean {
+  return sourceKey.startsWith(CHILD_INTERRUPTION_RECOVERY_SOURCE_PREFIX)
+    && sourceKey.length > CHILD_INTERRUPTION_RECOVERY_SOURCE_PREFIX.length;
 }
 
 function normalizeCancelCommand(command: ChildExecutionCancelCommand) {

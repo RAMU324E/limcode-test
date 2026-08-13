@@ -1,8 +1,10 @@
 import { AnswerControlPlane, RuntimeDeliveryControlPlane } from './answerDelivery';
 import {
-  CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
+  CHILD_INTERRUPTION_RECOVERY_REASON,
   childContinuationTurnId,
+  childInterruptionRecoverySourceKey,
   ChildExecutionControlPlane,
+  CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
   LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND
 } from './childExecution';
 import { isTransactionAssertionFailure, requireIsoTimestamp } from './phaseFIdentity';
@@ -389,9 +391,9 @@ export class PhaseFRecoveryScanner {
     for (const root of roots) {
       signal?.throwIfAborted();
       const result = await this.children.interruptSubtree({
-        sourceKey: `recovery:interrupt-subtree:${String(root.id)}`,
+        sourceKey: childInterruptionRecoverySourceKey(String(root.id)),
         childExecutionId: String(root.id),
-        reason: 'Extension Host restart resumed an incomplete subtree interruption.'
+        reason: CHILD_INTERRUPTION_RECOVERY_REASON
       });
       if (
         result.terminationRequestsWritten > 0
