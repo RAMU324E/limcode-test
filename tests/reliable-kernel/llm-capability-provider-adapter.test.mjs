@@ -1205,11 +1205,37 @@ test('LLM capability adapter 用显式ordinal稳定合并无Provider id调用并
   );
 });
 
-test('LLM capability adapter 将 429/网络/文本网关错误映射为可靠 Provider transient reason', async () => {
+test('LLM capability adapter 将 429、网络错误和所有可恢复的终态前关闭映射为可靠 Provider transient reason', async () => {
+  const retryablePreTerminalCloses = [
+    [1000, ''],
+    [1001, ' Going Away'],
+    [1005, ' No Status Received'],
+    [1006, ' Abnormal Closure'],
+    [1011, ' Internal Error'],
+    [1012, ' Service Restart'],
+    [1013, ' Try Again Later'],
+    [1014, ' Bad Gateway'],
+    [1015, ' TLS Handshake']
+  ];
   for (const [message, rawError, reason] of [
     ['temporary failure', { status: 429 }, 'rate_limited'],
     ['temporary failure', { code: 'ECONNRESET', message: 'socket hang up' }, 'connection_interrupted'],
-    ['OpenAI Responses WebSocket closed before terminal event: 1000', undefined, 'connection_interrupted'],
+    ...retryablePreTerminalCloses.map(([closeCode, closeReason]) => [
+      `OpenAI Responses WebSocket closed before terminal event: ${closeCode}${closeReason}`,
+      {
+        name: 'WebSocketCloseError',
+        closeCode,
+        retryable: false,
+        transportAttemptsExhausted: false
+      },
+      'connection_interrupted'
+    ]),
+    ['OpenAI Responses WebSocket closed before terminal event: 1008 Missing first response.create message', {
+      name: 'WebSocketCloseError',
+      closeCode: 1008,
+      retryable: false,
+      transportAttemptsExhausted: false
+    }, 'connection_interrupted'],
     ['OpenAI Responses WebSocket first_event timed out after 60000ms.', {
       code: 'LLM_TRANSPORT_TIMEOUT', phase: 'first_event'
     }, 'connection_interrupted'],
@@ -1222,6 +1248,34 @@ test('LLM capability adapter 将 429/网络/文本网关错误映射为可靠 Pr
     await assert.rejects(
       adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
       (error) => error instanceof kernel.ProviderTransientError && error.reason === reason
+    );
+  }
+});
+
+test('LLM capability adapter 不重试协议、数据、策略及未知的终态前关闭', async () => {
+  for (const closeCode of [1002, 1003, 1004, 1007, 1008, 1009, 1010, 1016, 3000]) {
+    const message = `OpenAI Responses WebSocket closed before terminal event: ${closeCode} permanent close`;
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      emit({
+        type: 'llm:error',
+        payload: {
+          requestId: llmRequest.id,
+          message,
+          rawError: {
+            name: 'WebSocketCloseError',
+            closeCode,
+            receivedSemanticOutput: false,
+            retryable: true,
+            transportAttemptsExhausted: false
+          }
+        }
+      });
+    }));
+    await assert.rejects(
+      adapter.sendFullRequest(request(), {
+        onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+      }),
+      (error) => !(error instanceof kernel.ProviderTransientError) && error.message === message
     );
   }
 });

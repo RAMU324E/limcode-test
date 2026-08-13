@@ -12,6 +12,11 @@ const {
 const {
   OpenAIResponsesContinuationProjection
 } = require('../dist/extension/backend/capabilities/openAIResponsesContinuationProjection.js');
+const {
+  OPENAI_RESPONSES_RETRYABLE_PRE_TERMINAL_CLOSE_CODES,
+  classifyOpenAIResponsesPreTerminalWebSocketClose,
+  isRetryableOpenAIResponsesWebSocketClose
+} = require('../dist/extension/backend/capabilities/openAIResponsesWebSocketRetryPolicy.js');
 
 async function formatForTest() {
   const unified = await import('unified-llm-provider');
@@ -205,6 +210,34 @@ function streamOptions(server, format, sessionKey, body, overrides = {}) {
     ...overrides
   };
 }
+
+test('Responses WebSocket pre-terminal retry policy covers transport/service closes but not protocol or policy failures', () => {
+  const retryableCodes = [1000, 1001, 1005, 1006, 1011, 1012, 1013, 1014, 1015];
+  assert.deepEqual([...OPENAI_RESPONSES_RETRYABLE_PRE_TERMINAL_CLOSE_CODES], retryableCodes);
+  for (const closeCode of retryableCodes) {
+    assert.equal(isRetryableOpenAIResponsesWebSocketClose(closeCode), true, `close ${closeCode}`);
+    assert.deepEqual(
+      classifyOpenAIResponsesPreTerminalWebSocketClose(
+        `OpenAI Responses WebSocket closed before terminal event: ${closeCode}`
+      ),
+      { closeCode, retryable: true }
+    );
+  }
+  for (const closeCode of [1002, 1003, 1007, 1008, 1009, 1010]) {
+    assert.equal(isRetryableOpenAIResponsesWebSocketClose(closeCode), false, `close ${closeCode}`);
+    assert.deepEqual(
+      classifyOpenAIResponsesPreTerminalWebSocketClose(
+        `OpenAI Responses WebSocket closed before terminal event: ${closeCode}`
+      ),
+      { closeCode, retryable: false }
+    );
+  }
+  assert.equal(
+    isRetryableOpenAIResponsesWebSocketClose(1008, 'Missing first response.create message'),
+    true,
+    'OpenAI compatibility handshake rejection remains recoverable'
+  );
+});
 
 test('continuation projection avoids cloning unchanged chunks and never mutates rewritten chunks', () => {
   const projection = new OpenAIResponsesContinuationProjection();
@@ -1626,9 +1659,16 @@ test('heartbeat invalidates an OPEN socket that stops answering pong before the 
   }
 });
 
-test('a 1000 close before response terminal is retryable, while a policy close remains permanent', { concurrency: false }, async () => {
+test('transport/service closes before response terminal are retryable, while a policy close remains permanent', { concurrency: false }, async () => {
   for (const fixture of [
     { closeCode: 1000, reason: 'normal transport close', retryable: true },
+    { closeCode: 1001, reason: 'going away', retryable: true },
+    { closeCode: 1005, reason: '', retryable: true, closeWithoutStatus: true },
+    { closeCode: 1006, reason: '', retryable: true, terminate: true },
+    { closeCode: 1011, reason: 'internal error', retryable: true },
+    { closeCode: 1012, reason: 'service restart', retryable: true },
+    { closeCode: 1013, reason: 'Try Again Later', retryable: true },
+    { closeCode: 1014, reason: 'bad gateway', retryable: true },
     { closeCode: 1008, reason: 'policy violation', retryable: false }
   ]) {
     resetOpenAIResponsesWebSocketSessions();
@@ -1641,8 +1681,11 @@ test('a 1000 close before response terminal is retryable, while a policy close r
         output_index: 0,
         content_index: 0,
         delta: 'partial output'
-      }));
-      socket.close(fixture.closeCode, fixture.reason);
+      }), () => {
+        if (fixture.terminate) socket.terminate();
+        else if (fixture.closeWithoutStatus) socket.close();
+        else socket.close(fixture.closeCode, fixture.reason);
+      });
     });
     try {
       const format = await formatForTest();

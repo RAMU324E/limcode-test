@@ -4,6 +4,7 @@ import { LlmEventType } from '../world/modules/llm/events';
 import type { WorldEvent } from '../ecs/types';
 import type { InlineDataPart, LlmProviderKind, MessageContent } from '../../shared/protocol';
 import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
+import { classifyOpenAIResponsesPreTerminalWebSocketClose } from '../capabilities/openAIResponsesWebSocketRetryPolicy';
 import { ProviderTransientError } from './modelProviderControlPlane';
 import type {
   FullProviderRequest,
@@ -1244,19 +1245,23 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
-  const incompleteNormalWebSocketClose = /websocket closed before (?:terminal event|response\.completed|open)(?::|\s)+(?:1000|1001)\b/.test(signature);
+  const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
+    signature,
+    findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
+  );
   if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
     return new Error(message);
   }
   if (receivedSemanticOutput === true) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
   }
-  // 1000/1001 only describe a graceful WebSocket closing handshake. If no Responses terminal
-  // event arrived, the provider response is incomplete and must outrank stale retryable=false
-  // metadata from older transport adapters.
-  if (incompleteNormalWebSocketClose && transportAttemptsExhausted !== true) {
+  // A close handshake is not a Responses terminal event. Retry all shared transport/service close
+  // kinds even if an older capability serialized stale retryable=false metadata. Known protocol,
+  // data and policy close codes remain permanent and cannot fall through to the generic text rule.
+  if (preTerminalWebSocketClose?.retryable === true && transportAttemptsExhausted !== true) {
     return new ProviderTransientError('connection_interrupted', message);
   }
+  if (preTerminalWebSocketClose?.retryable === false) return new Error(message);
   if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
   if (status === 429 || /unexpected server response:\s*429\b/.test(signature)) {
     return new ProviderTransientError('rate_limited', message);
@@ -1308,6 +1313,40 @@ function findBooleanMetadata(value: unknown, key: string, depth = 0, seen = new 
   if (typeof record[key] === 'boolean') return record[key] as boolean;
   for (const nested of Object.values(record).slice(0, 32)) {
     const result = findBooleanMetadata(nested, key, depth + 1, seen);
+    if (result !== undefined) return result;
+  }
+  return undefined;
+}
+
+function findNumericMetadata(
+  value: unknown,
+  key: string,
+  minimum: number,
+  maximum: number,
+  depth = 0,
+  seen = new Set<object>()
+): number | undefined {
+  if (depth > 6 || value === null || value === undefined || typeof value !== 'object' || seen.has(value)) {
+    return undefined;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 32)) {
+      const nested = findNumericMetadata(entry, key, minimum, maximum, depth + 1, seen);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const direct = record[key];
+  const numeric = typeof direct === 'number'
+    ? direct
+    : typeof direct === 'string' && /^\d+$/.test(direct.trim())
+      ? Number(direct.trim())
+      : NaN;
+  if (Number.isInteger(numeric) && numeric >= minimum && numeric <= maximum) return numeric;
+  for (const nested of Object.values(record).slice(0, 32)) {
+    const result = findNumericMetadata(nested, key, minimum, maximum, depth + 1, seen);
     if (result !== undefined) return result;
   }
   return undefined;

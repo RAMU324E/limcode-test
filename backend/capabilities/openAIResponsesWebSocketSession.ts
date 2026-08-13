@@ -12,6 +12,7 @@ import {
   OpenAIResponsesContinuationProjection,
   hasSemanticChunkOutput
 } from './openAIResponsesContinuationProjection';
+import { isRetryableOpenAIResponsesWebSocketClose } from './openAIResponsesWebSocketRetryPolicy';
 export { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 
 const MAX_SOCKET_AGE_MS = 55 * 60 * 1_000;
@@ -28,10 +29,6 @@ const DEFAULT_PRE_SEND_PROBE_STALE_MS = 45_000;
 const DEFAULT_PRE_SEND_PROBE_TIMEOUT_MS = 2_000;
 const NETWORK_IDENTITY_CHECK_INTERVAL_MS = 2_000;
 const MAX_SUCCESSFUL_INCREMENTAL_REQUESTS = 16;
-// These codes describe a graceful WebSocket closing handshake, not a completed Responses request.
-// This error class is constructed only when the socket closes before a terminal Responses event,
-// so 1000/1001 are retryable transport interruptions at this boundary.
-const RETRYABLE_CLOSE_CODES = new Set([1000, 1001, 1006, 1011, 1012, 1013, 1014]);
 
 export interface OpenAIResponsesToolCallArgumentDelta {
   callId: string;
@@ -233,8 +230,7 @@ class OpenAIResponsesWebSocketCloseError extends Error {
   ) {
     super(`OpenAI Responses WebSocket closed before terminal event: ${closeCode}${closeReason ? ` ${closeReason}` : ''}`);
     this.name = 'WebSocketCloseError';
-    this.retryable = RETRYABLE_CLOSE_CODES.has(closeCode)
-      || (closeCode === 1008 && closeReason.toLowerCase().includes('missing first response.create message'));
+    this.retryable = isRetryableOpenAIResponsesWebSocketClose(closeCode, closeReason);
   }
 }
 
