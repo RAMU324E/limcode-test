@@ -209,6 +209,98 @@ test('run_agent 按设置上限和当前持久层级动态出现在模型工具�
   assert.deepEqual(await visibleToolNames(0, []), ['read']);
 });
 
+test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后的重驱动', async () => {
+  const hostBootId = 'wake-race-host';
+  const childExecutionId = 'wake-race-child';
+  const turnId = 'wake-race-turn';
+  let driveCalls = 0;
+  let releaseFirstDrive;
+  let signalFirstDriveStarted;
+  let signalSecondDriveStarted;
+  const firstDriveGate = new Promise((resolve) => { releaseFirstDrive = resolve; });
+  const firstDriveStarted = new Promise((resolve) => { signalFirstDriveStarted = resolve; });
+  const secondDriveStarted = new Promise((resolve) => { signalSecondDriveStarted = resolve; });
+  const coordinator = new ReliableChildAgentCoordinator({
+    database: {
+      hostBootId,
+      async snapshot(reads) {
+        return {
+          snapshot: reads.map((read) =>
+            read.kind === 'list' && read.domain === 'ChildExecutionTurnLink'
+              ? [{
+                  id: 'wake-race-membership',
+                  turn_id: turnId,
+                  child_execution_id: childExecutionId
+                }]
+              : null
+          )
+        };
+      },
+      async externalDataVersion() { return '1'; }
+    },
+    effects: {},
+    children: {},
+    answers: {},
+    deliveries: {},
+    modelProvider: {
+      async quiesceTurnDispatches() {}
+    },
+    turns: {
+      async ownsExecutionLease() { return true; },
+      async executionLeaseFence() {
+        return {
+          id: 'wake-race-lease',
+          conversationId: 'wake-race-conversation',
+          turnId,
+          ownerId: `child-driver:${hostBootId}`,
+          hostBootId,
+          generation: 1n
+        };
+      },
+      async renewExecutionLease() { return true; }
+    },
+    agentLoop: {
+      async drive(requestedTurnId) {
+        driveCalls += 1;
+        if (driveCalls === 1) {
+          signalFirstDriveStarted();
+          await firstDriveGate;
+        } else {
+          signalSecondDriveStarted();
+        }
+        return {
+          turnId: requestedTurnId,
+          terminalStatus: 'waiting',
+          modelRequestIds: [],
+          assistantMessageIds: [],
+          toolCallIds: []
+        };
+      }
+    },
+    agents: {}
+  });
+
+  coordinator.launch(childExecutionId, turnId);
+  await firstDriveStarted;
+  assert.equal(await coordinator.resume(turnId), true);
+  releaseFirstDrive();
+
+  let timeout;
+  try {
+    await Promise.race([
+      secondDriveStarted,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('active drive 期间的 Child 唤醒被丢失')), 1_000);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+  await coordinator.waitForIdle();
+  assert.equal(driveCalls, 2);
+  await coordinator.dispose();
+});
+
 function frozenRunAgentAuthority(maxDepth) {
   return {
     snapshotId: `authority-depth-${maxDepth}`,

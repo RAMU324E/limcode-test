@@ -142,6 +142,8 @@ export class ReliableChildAgentCoordinator {
   private recoverySafetyScanAt = 0;
   private readonly cancellationSignaled = new Set<string>();
   private readonly recoveryAfterDrive = new Set<string>();
+  /** Level-triggered wakes that arrive while the same Turn is still inside driveChild(). */
+  private readonly pendingDriveWakes = new Set<string>();
   private readonly waitingOwned = new Map<string, { childExecutionId: string; externalDataVersion: string }>();
   private recoveryPollInFlight = false;
   private recoveryPollTask: Promise<void> | undefined;
@@ -485,6 +487,7 @@ export class ReliableChildAgentCoordinator {
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = undefined;
     this.waitingOwned.clear();
+    this.pendingDriveWakes.clear();
     this.disposePromise = (async () => {
       await this.quiesce(this.handoff ?? new ExecutionHandoffError('Child coordinator is handing off.'));
       await this.waitForRecoveryIdle();
@@ -498,6 +501,7 @@ export class ReliableChildAgentCoordinator {
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = undefined;
     this.waitingOwned.clear();
+    this.pendingDriveWakes.clear();
     await Promise.allSettled([...this.activeTurns.keys()].map((turnId) =>
       this.dependencies.quiesceTurnExecution
         ? this.dependencies.quiesceTurnExecution({ turnId, reason })
@@ -1324,13 +1328,23 @@ export class ReliableChildAgentCoordinator {
 
   private launch(childExecutionId: string, turnId: string): void {
     if (this.disposing) throw new Error('ReliableChildAgentCoordinator is disposing.');
-    if (this.activeTurns.has(turnId)) return;
+    if (this.activeTurns.has(turnId)) {
+      // Do not collapse an edge-triggered interaction/delivery wake into the currently executing
+      // drive. The active drive may already have passed the corresponding durable read and be about
+      // to publish `waiting`; consume this level-trigger immediately after its cleanup instead.
+      this.pendingDriveWakes.add(turnId);
+      return;
+    }
+    this.pendingDriveWakes.delete(turnId);
     this.waitingOwned.delete(turnId);
     const task = runWithoutExecutionLeaseFence(() => this.driveChild(childExecutionId, turnId));
     let handoff = false;
+    let terminalStatus: ReliableChildDriveResult['terminalStatus'] | undefined;
     this.activeTurns.set(turnId, task);
     this.ensureRecoveryPolling();
-    void task.catch((error) => {
+    void task.then((result) => {
+      terminalStatus = result.terminalStatus;
+    }, (error) => {
       if (this.disposing || this.handoff) return;
       if (isExecutionHandoffError(error)) {
         handoff = true;
@@ -1340,9 +1354,22 @@ export class ReliableChildAgentCoordinator {
     }).finally(() => {
       if (this.activeTurns.get(turnId) === task) this.activeTurns.delete(turnId);
       this.cancellationSignaled.delete(turnId);
+      const pendingWake = this.pendingDriveWakes.delete(turnId);
       const recover = handoff || this.recoveryAfterDrive.delete(turnId);
-      if (recover && !this.disposing && !this.handoff) this.triggerRecoveryPass();
-      else this.ensureRecoveryPolling();
+      if (recover && !this.disposing && !this.handoff) {
+        // Lease loss/handoff has priority over a local wake. Recovery must establish the next
+        // immutable execution fence before any replacement drive starts.
+        this.triggerRecoveryPass();
+      } else if (
+        pendingWake
+        && terminalStatus === 'waiting'
+        && !this.disposing
+        && !this.handoff
+      ) {
+        this.launch(childExecutionId, turnId);
+      } else {
+        this.ensureRecoveryPolling();
+      }
     });
   }
 
