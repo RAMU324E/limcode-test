@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { decodeCanonicalBase64 } from '../capabilities/canonicalBase64';
 import type { RootBinding } from './contracts';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import {
@@ -2187,11 +2188,13 @@ function decodeProcessOutputHandle(value: unknown, processId: string): ProcessOu
 }
 
 function decodeOutputHandleCarry(value: unknown, label: string): Buffer {
-  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+  if (typeof value !== 'string') throw new TypeError(`outputHandle ${label} is invalid.`);
+  let bytes: Buffer;
+  try {
+    bytes = decodeCanonicalBase64(value, { maxBytes: 3 });
+  } catch {
     throw new TypeError(`outputHandle ${label} is invalid.`);
   }
-  const bytes = Buffer.from(value, 'base64');
-  if (bytes.byteLength > 3) throw new TypeError(`outputHandle ${label} is too long.`);
   return bytes;
 }
 

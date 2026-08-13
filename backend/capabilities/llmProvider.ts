@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { decodeCanonicalBase64 } from './canonicalBase64';
 import { estimateTokenCount, sliceByTokens } from 'tokenx';
 import { mapWithBoundedConcurrency } from './boundedConcurrency';
 import { createProxyFetch } from './proxyFetch';
@@ -3087,7 +3088,7 @@ async function prepareLlmStartRequestMultimodal(request: LlmStartRequest, option
   };
 }
 
-async function prepareNativeCompactContentsMultimodal(
+export async function prepareNativeCompactContentsMultimodal(
   contents: MessageContent[],
   options: LlmProviderOptions
 ): Promise<MessageContent[]> {
@@ -3317,11 +3318,13 @@ export class LlmNativeCompactMediaError extends Error {
 
 function requireCanonicalInlineDataSize(part: InlineDataPart, label: string): number {
   const data = part.inlineData.data;
-  if (!data || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) {
+  if (!data) {
     throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), `${label} is not canonical base64`);
   }
-  const bytes = Buffer.from(data, 'base64');
-  if (bytes.toString('base64') !== data) {
+  let bytes: Buffer;
+  try {
+    bytes = decodeCanonicalBase64(data);
+  } catch {
     throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), `${label} is not canonical base64`);
   }
   if (part.inlineData.sizeBytes !== undefined && part.inlineData.sizeBytes !== bytes.byteLength) {

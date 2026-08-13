@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { decodeCanonicalBase64 as decodeCanonicalBase64Value } from '../capabilities/canonicalBase64';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -171,7 +172,7 @@ export class AttachmentIngestService {
       new Map<string, Buffer>()
     );
     const context: AttachmentTransformContext = { position: 0, embedded: [], references: [], outputs: [] };
-    const transformed = this.transformValue(materialized, context, label) as T;
+    const transformed = this.transformValue(materialized, context, label, maxBytes) as T;
     if (context.references.length === 0) {
       return { value: transformed, attachments: [], storageSteps: [], totalBytes: 0 };
     }
@@ -497,29 +498,35 @@ export class AttachmentIngestService {
     };
   }
 
-  private transformValue(value: unknown, context: AttachmentTransformContext, label: string): unknown {
+  private transformValue(
+    value: unknown,
+    context: AttachmentTransformContext,
+    label: string,
+    maxBytes: bigint | undefined
+  ): unknown {
     if (Array.isArray(value)) {
-      return value.map((entry, index) => this.transformValue(entry, context, `${label}[${index}]`));
+      return value.map((entry, index) => this.transformValue(entry, context, `${label}[${index}]`, maxBytes));
     }
     if (!value || typeof value !== 'object') return value;
     const record = value as Record<string, unknown>;
-    if (isInlineDataWrapper(record)) return this.transformInlineData(record.inlineData, context, label);
+    if (isInlineDataWrapper(record)) return this.transformInlineData(record.inlineData, context, label, maxBytes);
     return Object.fromEntries(Object.entries(record).map(([key, entry]) => [
       key,
-      this.transformValue(entry, context, `${label}.${key}`)
+      this.transformValue(entry, context, `${label}.${key}`, maxBytes)
     ]));
   }
 
   private transformInlineData(
     raw: Record<string, unknown>,
     context: AttachmentTransformContext,
-    label: string
+    label: string,
+    maxBytes: bigint | undefined
   ): InlineDataPart {
     const position = String(context.position++);
     const mimeType = optionalText(raw.mimeType) ?? 'application/octet-stream';
     const name = optionalText(raw.name) ?? `attachment-${Number(position) + 1}${extensionForMimeType(mimeType)}`;
     if (typeof raw.data === 'string') {
-      const bytes = decodeCanonicalBase64(raw.data, `${label}.inlineData.data`);
+      const bytes = decodeAttachmentBase64(raw.data, `${label}.inlineData.data`, maxBytes);
       const sha256 = createHash('sha256').update(bytes).digest('hex');
       const attachmentId = stablePhaseDId('attachment', JSON.stringify([sha256, mimeType, name]));
       const reference: EmbeddedAttachmentCandidate = {
@@ -705,13 +712,18 @@ function errorText(error: unknown): string {
   return String(error);
 }
 
-function decodeCanonicalBase64(value: string, label: string): Buffer {
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+function decodeAttachmentBase64(value: string, label: string, maxBytes: bigint | undefined): Buffer {
+  const byteLimit = maxBytes === undefined ? undefined : safeByteLength(maxBytes, `${label} limit`);
+  try {
+    return decodeCanonicalBase64Value(value, byteLimit === undefined ? {} : { maxBytes: byteLimit });
+  } catch (error) {
+    if (error instanceof RangeError && byteLimit !== undefined) {
+      throw new AttachmentSizeLimitError(
+        `Attachment data exceeds the configured ${byteLimit} byte limit.`
+      );
+    }
     throw new AttachmentContentError(`${label} must be canonical base64.`);
   }
-  const bytes = Buffer.from(value, 'base64');
-  if (bytes.toString('base64') !== value) throw new AttachmentContentError(`${label} must be canonical base64.`);
-  return bytes;
 }
 
 function extensionForMimeType(mimeType: string): string {

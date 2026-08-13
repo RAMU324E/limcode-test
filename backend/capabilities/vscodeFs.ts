@@ -124,6 +124,7 @@ export async function readWorkspaceBinaryFile(relPath: string, mimeType: string,
     : 20 * 1024 * 1024;
   if (stat.size > maxBytes) throw new Error(`File too large: ${stat.size} bytes (limit ${maxBytes}).`);
   const data = await readWorkspaceFileBytes(uri, options.signal);
+  if (data.byteLength > maxBytes) throw new Error(`File too large: ${data.byteLength} bytes (limit ${maxBytes}).`);
   return {
     path: uri.fsPath || normalizedPath,
     name: path.basename(uri.fsPath || normalizedPath),

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { decodeCanonicalBase64 } from '../capabilities/canonicalBase64';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -558,10 +559,12 @@ function requireNullablePositiveSafeInteger(value: unknown, label: string): numb
 }
 
 function requireCanonicalBase64(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+  if (typeof value !== 'string') {
     throw new TypeError(`${label} must be canonical base64.`);
   }
-  if (Buffer.from(value, 'base64').toString('base64') !== value) {
+  try {
+    decodeCanonicalBase64(value);
+  } catch {
     throw new TypeError(`${label} must be canonical base64.`);
   }
   return value;
