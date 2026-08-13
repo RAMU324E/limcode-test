@@ -1481,12 +1481,15 @@ export class RuntimeDeliveryControlPlane {
     const conversationId = requirePhaseFId(conversationIdInput, 'conversationId');
     const turnId = requirePhaseFId(turnIdInput, 'turnId');
     const now = requireIsoTimestamp(nowInput, 'now');
-    const deliveries = await listAllDomainRows(this.database, 'RuntimeDelivery', {
+    const deliveries = (await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_conversation_id: conversationId,
       target_turn_id: null,
       phase: 'next_turn',
       state: 'pending'
-    });
+    })).sort((left, right) =>
+      String(left.created_at).localeCompare(String(right.created_at))
+      || String(left.id).localeCompare(String(right.id))
+    );
     const steps: RepositoryTransactionStep[] = [];
     for (const delivery of deliveries) {
       const contentObjectId = await this.contentObjectIdForInbox(delivery.inbox_item_id as string);

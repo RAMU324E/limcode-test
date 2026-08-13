@@ -237,6 +237,203 @@ test('引导消息等待当前回复和工具全部完成后按发送顺序自�
   }
 });
 
+test('Subagent RuntimeDelivery continuation 在当前回复和工具批次结束后立即接续', async () => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-runtime-delivery-handoff-'));
+  const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
+  await kernel.initializeEmptyRuntimeRoot(authority);
+
+  let app;
+  let releaseTool = () => {};
+  let markToolStarted = () => {};
+  const toolStarted = new Promise((resolve) => { markToolStarted = resolve; });
+  const toolGate = new Promise((resolve) => { releaseTool = resolve; });
+  let providerCalls = 0;
+  const providerContexts = [];
+  const provider = {
+    providerId: 'provider-local',
+    async sendFullRequest(request, controls) {
+      providerCalls += 1;
+      providerContexts.push(request.context.map((item) => item.content).join('\n'));
+      assert.ok(providerCalls <= 3, 'RuntimeDelivery continuation 不得产生额外模型调用');
+      await controls.onEvent({
+        kind: 'completed',
+        streamSeq: '1',
+        content: providerCalls === 1
+          ? {
+              text: '先完成当前工具。',
+              thought: '',
+              toolCalls: [{ id: 'runtime-delivery-tool-provider-call', name: 'runtime_delivery_tool', arguments: {} }]
+            }
+          : {
+              text: 'Subagent 通知已处理。',
+              thought: '',
+              toolCalls: []
+            }
+      });
+    }
+  };
+  const errors = [];
+  const conversationId = 'runtime-delivery-handoff-conversation';
+  app = await kernel.ReliableKernelApplication.open(authority, dependencies({
+    providers: { resolve: () => provider },
+    toolDispatcher: {
+      definitions() {
+        return [{ name: 'runtime_delivery_tool', description: '等待测试放行', parameters: { type: 'object' } }];
+      },
+      async dispatch(input) {
+        markToolStarted();
+        await toolGate;
+        const settled = await app.runtime.effects.settleWithoutEffect({
+          source: { kind: 'internal', key: `runtime-delivery-tool:${input.toolCallId}` },
+          toolCallId: input.toolCallId,
+          status: 'succeeded',
+          detail: { completed: true }
+        });
+        return settled.terminal ?? app.runtime.effects.readTerminalResult(input.toolCallId, true);
+      }
+    }
+  }));
+  const runner = new ReliableConversationRunner(
+    app,
+    `runtime-delivery-handoff:${app.database.hostBootId}`,
+    (error, context) => errors.push({ error, context })
+  );
+
+  try {
+    await createConversation(app, conversationId, 'runtime-delivery-handoff-agent-link');
+    const first = await runner.input({
+      commandId: 'runtime-delivery-handoff-first',
+      conversationId,
+      text: '执行当前任务'
+    });
+    await withTimeout(toolStarted, 5_000, '当前回复未进入工具执行');
+
+    const answerPayload = await app.contentStore.ingest(
+      app.database,
+      'INTERRUPTED-SUBAGENT-HANDOFF-PAYLOAD',
+      'text/plain'
+    );
+    const deliveryNow = new Date().toISOString();
+    await app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+        id: 'runtime-handoff-child-conversation',
+        title: 'Interrupted Subagent fixture',
+        status: 'active',
+        created_at: deliveryNow,
+        updated_at: deliveryNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('Turn').insert({
+        id: 'runtime-handoff-child-turn',
+        conversation_id: 'runtime-handoff-child-conversation',
+        status: 'terminated',
+        created_at: deliveryNow,
+        updated_at: deliveryNow,
+        terminal_at: deliveryNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('ChildExecution').insert({
+        id: 'runtime-handoff-child-execution',
+        child_conversation_id: 'runtime-handoff-child-conversation',
+        status: 'interrupted',
+        created_at: deliveryNow,
+        updated_at: deliveryNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('AnswerBridge').insert({
+        id: 'runtime-handoff-answer-bridge',
+        child_execution_id: 'runtime-handoff-child-execution',
+        current_submission_id: 'runtime-handoff-answer-submission',
+        status: 'interrupted',
+        created_at: deliveryNow,
+        updated_at: deliveryNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('AnswerSubmission').insert({
+        id: 'runtime-handoff-answer-submission',
+        answer_bridge_id: 'runtime-handoff-answer-bridge',
+        submission_seq: '1',
+        turn_id: 'runtime-handoff-child-turn',
+        interrupted: '1',
+        created_at: deliveryNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('AnswerPayload').insert({
+        id: 'runtime-handoff-answer-payload',
+        submission_id: 'runtime-handoff-answer-submission',
+        title: 'Interrupted Subagent result',
+        content_object_id: answerPayload.id,
+        byte_length: answerPayload.byte_length,
+        created_at: deliveryNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').insert({
+        id: 'runtime-handoff-inbox',
+        dedupe_key: 'answer:runtime-handoff-answer-bridge:runtime-handoff-answer-submission',
+        source_kind: 'answer_submission',
+        source_id: 'runtime-handoff-answer-submission',
+        state: 'available',
+        created_at: deliveryNow,
+        updated_at: deliveryNow
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('RuntimeInboxPayloadLink').insert({
+        id: 'runtime-handoff-payload-link',
+        inbox_item_id: 'runtime-handoff-inbox',
+        content_object_id: answerPayload.id,
+        created_at: deliveryNow
+      })
+    ]);
+    const runtimeDelivery = await app.runtime.deliveries.create({
+      inboxItemId: 'runtime-handoff-inbox',
+      targetConversationId: conversationId,
+      phase: 'next_turn'
+    });
+
+    // This is the exact no-visible-message TurnIntent created by the RuntimeDelivery wake handler
+    // after a background/interrupted/timed-out Subagent result is routed to next_turn.
+    const continuation = await runner.runtimeContinuation({
+      commandId: 'runtime-delivery:subagent-timeout-answer',
+      conversationId,
+      sourceTurnId: first.turnId
+    });
+    assert.equal(first.admitted, true);
+    assert.equal(continuation.admitted, false);
+    assert.equal(providerCalls, 1, '当前回复和工具尚未结束时不得抢占');
+
+    releaseTool();
+    await withTimeout(runner.waitForIdle(), 10_000, 'RuntimeDelivery continuation 未在响应边界立即接续');
+
+    assert.equal(errors.length, 0);
+    assert.equal(providerCalls, 2, '不得等原 Turn 自行跑完下一轮后才处理 Subagent 通知');
+    assert.match(
+      providerContexts[1],
+      /INTERRUPTED-SUBAGENT-HANDOFF-PAYLOAD/,
+      '下一次模型请求必须实际携带排队的 RuntimeDelivery payload'
+    );
+    assert.equal(
+      (await listRows(app.database, 'ModelRequest', { turn_id: first.turnId })).length,
+      1,
+      '当前工具批次完成后必须交接，原 Turn 不得再发起模型请求'
+    );
+    const [admittedContinuation] = await listRows(app.database, 'TurnIntent', { id: continuation.intentId });
+    assert.ok(admittedContinuation.turn_id, 'RuntimeDelivery continuation 应已取得一个新 Turn');
+    assert.equal(
+      (await listRows(app.database, 'ModelRequest', { turn_id: admittedContinuation.turn_id })).length,
+      1,
+      '排队的 RuntimeDelivery continuation 必须立即取得下一次模型请求'
+    );
+    const [consumedDelivery] = await listRows(app.database, 'RuntimeDelivery', {
+      id: runtimeDelivery.delivery.id
+    });
+    assert.equal(consumedDelivery.state, 'consumed');
+    const [inputLink] = await listRows(app.database, 'RuntimeDeliveryInputLink', {
+      delivery_id: runtimeDelivery.delivery.id
+    });
+    assert.ok(inputLink.handled_at, '模型读取后必须 ACK 精确 RuntimeDelivery input link');
+    assert.equal((await listRows(app.database, 'TurnIntent', { state: 'queued' })).length, 0);
+  } finally {
+    releaseTool();
+    runner.dispose();
+    await runner.waitForIdle();
+    await app.close();
+    await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
 test('没有工具时在当前模型输出结束后立即接续引导消息', async () => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-guidance-no-tool-'));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));

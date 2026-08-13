@@ -10,7 +10,7 @@ import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   compareGuidancePositions,
   initialGuidancePosition,
-  parseInputTurnIntentEnvelopeText,
+  parseInputTurnIntentEnvelope,
   TURN_INTENT_ENVELOPE_CONTENT_TYPE
 } from './guidanceIntent';
 import {
@@ -541,7 +541,7 @@ export class ReliableAgentLoop {
             waitingToolCallId: batchDispatch.toolCallId
           };
         }
-        if (await this.completeForQueuedGuidance({
+        if (await this.completeForQueuedBoundaryInput({
           turnId,
           conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
           round,
@@ -1384,19 +1384,26 @@ export class ReliableAgentLoop {
     return terminal;
   }
 
-  private async completeForQueuedGuidance(input: {
+  /**
+   * A Provider round containing tools owns the whole tool batch. Once that response boundary is
+   * durably complete, hand off before issuing another Provider request when either ordinary user
+   * guidance or an internal RuntimeDelivery continuation is already queued. RuntimeDelivery used
+   * to be skipped here because its no-message TurnIntent is encoded as kind=retry; consequently a
+   * late Subagent answer could wait through every subsequent round of the active Turn.
+   */
+  private async completeForQueuedBoundaryInput(input: {
     turnId: string;
     conversationId: string;
     round: string;
     modelRequestId: string;
   }): Promise<boolean> {
     for (;;) {
-      const guidance = await this.oldestQueuedGuidanceIntent(input.conversationId);
-      if (!guidance) return false;
-      const guidanceIntentId = requireId(guidance.intent.id, 'Queued guidance TurnIntent.id');
+      const queuedInput = await this.oldestQueuedBoundaryIntent(input.conversationId);
+      if (!queuedInput) return false;
+      const queuedIntentId = requireId(queuedInput.intent.id, 'Queued boundary TurnIntent.id');
       if (await this.terminateIfRequested(
         input.turnId,
-        `round:${input.round}:before-guidance-handoff:${guidanceIntentId}`
+        `round:${input.round}:before-queued-input-handoff:${queuedIntentId}`
       )) return true;
       this.observeLifecycle({
         turnId: input.turnId,
@@ -1408,13 +1415,15 @@ export class ReliableAgentLoop {
         await this.turns.terminal({
           source: {
             kind: 'internal',
-            key: `agent-loop:${input.turnId}:guidance-handoff:${guidanceIntentId}:${input.modelRequestId}`
+            key: `agent-loop:${input.turnId}:queued-input-handoff:${queuedIntentId}:${input.modelRequestId}`
           },
           turnId: input.turnId,
           terminalStatus: 'completed',
-          reason: 'queued_guidance_after_tool_batch',
-          handoffQueuedIntentId: guidanceIntentId,
-          handoffQueuedIntentRevisionIds: guidance.revisionIds
+          reason: queuedInput.kind === 'runtime_continuation'
+            ? 'queued_runtime_delivery_after_response_boundary'
+            : 'queued_guidance_after_tool_batch',
+          handoffQueuedIntentId: queuedIntentId,
+          handoffQueuedIntentRevisionIds: queuedInput.revisionIds
         });
         this.observeLifecycle({
           turnId: input.turnId,
@@ -1428,7 +1437,7 @@ export class ReliableAgentLoop {
         if (isTurnTerminalInputConflictError(error)) {
           if (await this.terminateIfRequested(
             input.turnId,
-            `round:${input.round}:guidance-handoff-conflict:${guidanceIntentId}`
+            `round:${input.round}:queued-input-handoff-conflict:${queuedIntentId}`
           )) return true;
           if (await this.absorbRuntimeDeliveryInputs(input.turnId) > 0) continue;
         }
@@ -1437,8 +1446,9 @@ export class ReliableAgentLoop {
     }
   }
 
-  private async oldestQueuedGuidanceIntent(conversationId: string): Promise<{
+  private async oldestQueuedBoundaryIntent(conversationId: string): Promise<{
     intent: DomainRow;
+    kind: 'guidance' | 'runtime_continuation';
     revisionIds: string[];
   } | null> {
     const [queued, childIntentLinks] = await Promise.all([
@@ -1451,8 +1461,9 @@ export class ReliableAgentLoop {
     const candidates = queued
       .filter((intent) => intent.state === 'queued' && intent.turn_id === null)
       .filter((intent) => !childIntentIds.has(requireId(intent.id, 'TurnIntent.id')));
-    const guidance: Array<{
+    const boundaryInputs: Array<{
       intent: DomainRow;
+      kind: 'guidance' | 'runtime_continuation';
       position: string;
       hold: 'none' | 'paused';
       revisionIds: string[];
@@ -1469,8 +1480,9 @@ export class ReliableAgentLoop {
         requireId(current.content_object_id, 'TurnIntentRevision.content_object_id')
       );
       if (contentObject.content_type !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
-        guidance.push({
+        boundaryInputs.push({
           intent: candidate,
+          kind: 'guidance',
           position: initialGuidancePosition(requireText(candidate.created_at, 'TurnIntent.created_at')),
           hold: 'none',
           revisionIds: revisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
@@ -1478,18 +1490,30 @@ export class ReliableAgentLoop {
         continue;
       }
       const metadata = contentObject as unknown as ContentObjectMetadata;
-      const envelope = parseInputTurnIntentEnvelopeText(
+      const envelopeValue = JSON.parse(
         (await this.contentStore.read(metadata)).toString('utf8')
-      );
-      if (!envelope) continue;
-      guidance.push({
+      ) as unknown;
+      const envelope = parseInputTurnIntentEnvelope(envelopeValue);
+      if (envelope) {
+        boundaryInputs.push({
+          intent: candidate,
+          kind: 'guidance',
+          position: envelope.guidance.position,
+          hold: envelope.guidance.hold,
+          revisionIds: revisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
+        });
+        continue;
+      }
+      if (!isQueuedRuntimeContinuationEnvelope(envelopeValue)) continue;
+      boundaryInputs.push({
         intent: candidate,
-        position: envelope.guidance.position,
-        hold: envelope.guidance.hold,
+        kind: 'runtime_continuation',
+        position: initialGuidancePosition(requireText(candidate.created_at, 'TurnIntent.created_at')),
+        hold: 'none',
         revisionIds: revisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
       });
     }
-    return guidance
+    return boundaryInputs
       .filter((entry) => entry.hold === 'none')
       .sort((left, right) => compareGuidancePositions(left.position, right.position)
         || String(left.intent.created_at).localeCompare(String(right.intent.created_at))
@@ -1501,7 +1525,10 @@ export class ReliableAgentLoop {
       target_turn_id: turnId,
       phase: 'current_turn',
       state: 'pending'
-    })).sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+    })).sort((left, right) =>
+      String(left.created_at).localeCompare(String(right.created_at))
+      || String(left.id).localeCompare(String(right.id))
+    );
     for (const delivery of deliveries) {
       await this.runtimeDeliveries.advance(requireId(delivery.id, 'RuntimeDelivery.id'));
     }
@@ -2125,6 +2152,24 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+/**
+ * RuntimeDelivery continuations are frozen as no-message retry envelopes so they can inherit the
+ * source Turn authority without fabricating a user message. Explicit user retries always carry
+ * rewind lineage, while maintenance retries carry runtimeMaintenance; neither may be treated as a
+ * response-boundary notification handoff.
+ */
+function isQueuedRuntimeContinuationEnvelope(value: unknown): boolean {
+  const record = asRecord(value);
+  return record?.kind === 'retry'
+    && typeof record.sourceTurnId === 'string'
+    && record.sourceTurnId.trim().length > 0
+    && record.runtimeMaintenance === undefined
+    && record.sourceMessageId === undefined
+    && record.sourceMessageRevisionId === undefined
+    && record.sourceModelRequestId === undefined
+    && record.messageContentObjectId === undefined;
 }
 
 function optionalText(value: unknown): string {
