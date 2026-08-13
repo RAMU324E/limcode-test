@@ -108,6 +108,11 @@ function hasOutstandingSettingsWork(state: GlobalSettingsState): boolean {
   return Object.keys(state.loadingSettingsSections).length > 0 || Object.keys(state.pendingSettingsSections).length > 0;
 }
 
+function settleSettingsStatus(state: GlobalSettingsState, status: string): void {
+  if (hasOutstandingSettingsWork(state) || Object.keys(state.failedSettingsSections).length > 0) return;
+  state.status = status;
+}
+
 function settingsErrorStatus(requestType: string | undefined, message: string): string {
   if (requestType === BridgeMessageType.GlobalSettingsGet) return `设置读取失败：${message}`;
   if (requestType === BridgeMessageType.LlmProviderModelsGet) return `获取 LLM 列表失败：${message}`;
@@ -1888,7 +1893,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         delete this.externalChangedSections[item];
         this.clearPendingSettingSection(item);
       }
-      if (!hasOutstandingSettingsWork(this)) this.status = '已载入外部设置';
+      settleSettingsStatus(this, '已载入外部设置');
     },
     applySnapshot(payload: GlobalSettingsSnapshotPayload, correlationId?: string): void {
       const section = payload.section;
@@ -1919,13 +1924,14 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         }
         this.pumpSettingsUpdate(section);
         this.refreshPendingSettingSection(section);
-        if (!hasOutstandingSettingsWork(this)) this.status = '设置已同步';
+        settleSettingsStatus(this, '设置已同步');
         return;
       }
 
       this.clearLoadingSettingSection(section);
       if (this.loadedSections[section] && this.revisions[section] === payload.revision) {
         this.pumpSettingsUpdate(section);
+        settleSettingsStatus(this, '设置已同步');
         return;
       }
       if (!this.loadedSections[section]) {
@@ -1933,6 +1939,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         this.applySectionSettings(section, payload.settings);
         this.pumpSettingsUpdate(section);
         this.refreshPendingSettingSection(section);
+        settleSettingsStatus(this, '设置已同步');
         return;
       }
       if (coordinator.inFlight) {
@@ -1947,7 +1954,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.applySectionSettings(section, payload.settings);
       this.pumpSettingsUpdate(section);
       this.refreshPendingSettingSection(section);
-      if (!hasOutstandingSettingsWork(this)) this.status = '设置已同步';
+      settleSettingsStatus(this, '设置已同步');
     },
     resolveExternalSnapshot(payload: GlobalSettingsSnapshotPayload): boolean {
       const section = payload.section;

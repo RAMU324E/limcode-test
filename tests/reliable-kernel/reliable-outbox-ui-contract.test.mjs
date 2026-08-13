@@ -132,3 +132,33 @@ test('旧任务 artifact 只省略可选任务卡，不阻断整个 Conversation
   assert.match(projection, /catch \{\s*return null;\s*\}/);
   assert.doesNotMatch(projection, /detail\.items|preserveLatestMessages|reserveLatestUserMessageTokens/);
 });
+
+test('全局设置首轮和重复快照都收敛读取状态，失败 section 不被成功状态覆盖', () => {
+  const store = read('webview/src/stores/useGlobalSettingsStore.ts');
+  const settle = store.slice(
+    store.indexOf('function settleSettingsStatus('),
+    store.indexOf('function settingsErrorStatus(')
+  );
+  const requestAll = store.slice(
+    store.indexOf('requestAll(): void'),
+    store.indexOf('requestChannelSettings(): void')
+  );
+  const applySnapshot = store.slice(
+    store.indexOf('applySnapshot(payload:'),
+    store.indexOf('resolveExternalSnapshot(payload:')
+  );
+  const repeatedSnapshot = applySnapshot.slice(
+    applySnapshot.indexOf('if (this.loadedSections[section] && this.revisions[section] === payload.revision)'),
+    applySnapshot.indexOf('if (!this.loadedSections[section])')
+  );
+  const initialSnapshot = applySnapshot.slice(
+    applySnapshot.indexOf('if (!this.loadedSections[section])'),
+    applySnapshot.indexOf('if (coordinator.inFlight)')
+  );
+
+  assert.match(requestAll, /this\.status = '正在读取设置\.\.\.'/);
+  assert.match(settle, /hasOutstandingSettingsWork\(state\)/);
+  assert.match(settle, /Object\.keys\(state\.failedSettingsSections\)\.length > 0/);
+  assert.match(repeatedSnapshot, /settleSettingsStatus\(this, '设置已同步'\);\s*return;/);
+  assert.match(initialSnapshot, /this\.refreshPendingSettingSection\(section\);\s*settleSettingsStatus\(this, '设置已同步'\);\s*return;/);
+});
