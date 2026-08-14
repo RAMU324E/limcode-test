@@ -13,11 +13,17 @@ import type {
 } from '../../../../shared/protocol';
 import type { ToolSchedulingResolver } from './schedulingContract';
 
+export interface ToolAttachmentCapability {
+  /** Returns a metadata-only managed reference. Provider preparation resolves bytes on demand. */
+  reference(attachmentId: string): Promise<InlineDataPart>;
+}
+
 export interface ToolDeps {
   fs: FsCapability;
   command: CommandCapability;
   workEnvironment: WorkEnvironmentRuntimeCapability;
   skills: SkillCatalogCapability;
+  attachments?: ToolAttachmentCapability;
 }
 
 export interface ToolBackgroundProcessHandoff {

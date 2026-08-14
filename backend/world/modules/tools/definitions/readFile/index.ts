@@ -14,6 +14,7 @@ interface ReadFileItem {
 
 interface ReadFileArgs {
   path?: string;
+  attachmentId?: string;
   mode?: ReadFileMode;
   startLine?: number;
   endLine?: number;
@@ -37,14 +38,15 @@ export const readFileTool: ToolDefinition = {
   declaration: {
     name: READ_TOOL_NAME,
     description: [
-      'Read one file or a batch of up to 8 text files from the current work environment. For one file, path is required and mode defaults to "text"; use mode="attachment" for supported images/PDF. For independent text files, prefer one items batch over multiple read calls: batch items are read concurrently while results preserve input order. Exactly one of path or items must be provided.',
+      'Read one text file, a batch of up to 8 text files, or a managed attachment by its attachmentId. For one file, path is required and mode defaults to "text"; use mode="attachment" for supported images/PDF. A managed attachment must use { attachmentId, mode: "attachment" }. For independent text files, prefer one items batch over multiple read calls: batch items run concurrently while preserving order. Exactly one of path, attachmentId, or items must be provided.',
       filePathPolicyDescription(true)
     ].join(' '),
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
-        mode: { type: 'string', enum: ['text', 'attachment'], description: 'Optional read mode. Defaults to "text" when omitted; use "attachment" for a multimodal file inferred from its extension.' },
+        attachmentId: { type: 'string', description: 'Managed attachment id from the LimCode attachment catalog. Use this instead of path together with mode="attachment" to materialize that exact immutable attachment.' },
+        mode: { type: 'string', enum: ['text', 'attachment'], description: 'Optional read mode. Defaults to "text" for path reads. Managed attachment ids require "attachment".' },
         startLine: { type: 'number', description: 'Text mode only. Optional 1-based start line (inclusive); non-positive values are treated as omitted.' },
         endLine: { type: 'number', description: 'Text mode only. Optional 1-based end line (inclusive); non-positive values are treated as omitted.' },
         items: {
@@ -80,12 +82,13 @@ export const readFileTool: ToolDefinition = {
   async execute(rawArgs, deps, ctx) {
     const args = (rawArgs ?? {}) as ReadFileArgs;
     const path = normalizeDisplayPath(args.path);
+    const attachmentId = normalizeAttachmentId(args.attachmentId);
     // Some tool transports materialize optional schema fields as empty placeholders. Do not let an
     // empty items array (or minItems-shaped blank objects) turn a valid single-file call into a
     // false path/items conflict.
-    const items = path && isSyntheticEmptyReadItems(args.items) ? undefined : args.items;
+    const items = (path || attachmentId) && isSyntheticEmptyReadItems(args.items) ? undefined : args.items;
     if (items !== undefined) {
-      if (path) return { ok: false, output: 'Provide either path or items, not both.' };
+      if (path || attachmentId) return { ok: false, output: 'Provide exactly one of path, attachmentId, or items.' };
       const explicitMode = normalizeReadMode(args.mode);
       if (args.mode !== undefined && !explicitMode) {
         return { ok: false, output: 'Invalid argument: mode. Expected "text" or "attachment".' };
@@ -98,12 +101,41 @@ export const readFileTool: ToolDefinition = {
       const files = await Promise.all(normalizedItems.map((item) => readTextFile(item, deps, ctx)));
       return { ok: true, output: { files: boundBatchReadOutput(files) } };
     }
-    if (!path) {
-      return { ok: false, output: 'Missing required argument: path or items' };
-    }
     const explicitMode = normalizeReadMode(args.mode);
     if (args.mode !== undefined && !explicitMode) {
       return { ok: false, output: 'Invalid argument: mode. Expected "text" or "attachment".' };
+    }
+    if (attachmentId) {
+      if (path) return { ok: false, output: 'Provide exactly one of path, attachmentId, or items.' };
+      if (explicitMode !== 'attachment') {
+        return { ok: false, output: 'Managed attachmentId reads require mode="attachment".' };
+      }
+      if (normalizeLineNumber(args.startLine) !== undefined || normalizeLineNumber(args.endLine) !== undefined) {
+        return { ok: false, output: 'startLine and endLine are not supported for managed attachments.' };
+      }
+      if (ctx?.settingsSnapshot?.enableMultimodalTools === false) {
+        return { ok: true, status: 'warning', output: '当前渠道未启用多模态工具，无法读取托管附件内容。' };
+      }
+      if (!deps.attachments) {
+        return { ok: false, output: 'Managed attachment resolver is unavailable.' };
+      }
+      const part = await deps.attachments.reference(attachmentId);
+      if (!READ_MULTIMODAL_MIME_TYPES.has(part.inlineData.mimeType)) {
+        return { ok: false, output: `Managed attachment MIME type is not supported by read: ${part.inlineData.mimeType}` };
+      }
+      return {
+        ok: true,
+        output: {
+          attachmentId,
+          name: part.inlineData.name ?? attachmentId,
+          mimeType: part.inlineData.mimeType,
+          sizeBytes: part.inlineData.sizeBytes ?? 0
+        },
+        parts: [part]
+      };
+    }
+    if (!path) {
+      return { ok: false, output: 'Missing required argument: path, attachmentId, or items' };
     }
     const mode: ReadFileMode = explicitMode ?? 'text';
 
@@ -147,8 +179,10 @@ export const readFileTool: ToolDefinition = {
 
 function summarizeReadFileToolCall(rawArgs: unknown): string | undefined {
   const args = (rawArgs ?? {}) as ReadFileArgs;
+  const attachmentId = normalizeAttachmentId(args.attachmentId);
+  if (attachmentId) return `${attachmentId}[attachment]`;
   const path = normalizeDisplayPath(args.path);
-  const items = Array.isArray(args.items) && !(path && isSyntheticEmptyReadItems(args.items))
+  const items = Array.isArray(args.items) && !((path || attachmentId) && isSyntheticEmptyReadItems(args.items))
     ? args.items
     : undefined;
   if (items) return `${items.length} text files`;
@@ -232,6 +266,10 @@ function boundBatchReadOutput<T extends { content: string }>(files: T[]): Array<
     remaining = 0;
     return { ...file, content, contentTruncated: true, omittedChars };
   });
+}
+
+function normalizeAttachmentId(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 function normalizeDisplayPath(path: string | undefined): string {

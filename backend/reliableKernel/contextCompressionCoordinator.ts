@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
+import {
+  collectAttachmentCatalogFromStoredItems,
+  mergeAttachmentCatalog,
+  renderAttachmentCatalog
+} from './attachmentCatalog';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore } from './contentAddressedStore';
 import {
@@ -293,10 +298,42 @@ export class ReliableContextCompressionCoordinator {
     }
     const completed = await this.modelProvider.completedEvent(expectedModelRequestId);
     const summary = compressionContents(completed.content);
-    const summaryEstimatedTokens = compressionOutputTokens(completed.usage)
+    const sourceAttachmentCatalog = collectAttachmentCatalogFromStoredItems(
+      semanticMaterialized.segments.slice(0, sourceSegmentCount).map((segment) => ({
+        content: segment.content.toString('utf8'),
+        contentType: segment.contentObject.content_type
+      }))
+    );
+    const tailSegments = semanticMaterialized.segments.slice(sourceSegmentCount);
+    const tailAttachmentCatalog = collectAttachmentCatalogFromStoredItems(
+      tailSegments.map((segment) => ({
+        content: segment.content.toString('utf8'),
+        contentType: segment.contentObject.content_type
+      }))
+    );
+    const combinedAttachmentCatalog = mergeAttachmentCatalog(
+      sourceAttachmentCatalog,
+      tailAttachmentCatalog
+    );
+    const sourceCatalogContent = renderAttachmentCatalog(sourceAttachmentCatalog);
+    const tailCatalogContent = renderAttachmentCatalog(tailAttachmentCatalog);
+    const combinedCatalogContent = renderAttachmentCatalog(combinedAttachmentCatalog);
+    const sourceCatalogTokens = sourceCatalogContent
+      ? estimateMessageContentsTokens([sourceCatalogContent])
+      : 0;
+    const tailCatalogTokens = tailCatalogContent
+      ? estimateMessageContentsTokens([tailCatalogContent])
+      : 0;
+    const combinedCatalogTokens = combinedCatalogContent
+      ? estimateMessageContentsTokens([combinedCatalogContent])
+      : 0;
+    const providerSummaryTokens = compressionOutputTokens(completed.usage)
       ?? estimateMessageContentsTokens(summary);
-    const projectedTokens = summaryEstimatedTokens
-      + projectMaterializedSegmentsTokens(semanticMaterialized.segments.slice(sourceSegmentCount));
+    const summaryEstimatedTokens = providerSummaryTokens + sourceCatalogTokens;
+    const tailProjectedTokens = projectMaterializedSegmentsTokens(tailSegments);
+    const projectedTokens = providerSummaryTokens
+      + Math.max(0, tailProjectedTokens - tailCatalogTokens)
+      + combinedCatalogTokens;
     const projectedBodyTokens = projectedTokens + irreducibleAddendaTokens;
     if (projectedBodyTokens > requestBudget.safeBodyRoomTokens) {
       return compressionError(
@@ -327,6 +364,7 @@ export class ReliableContextCompressionCoordinator {
       summary,
       summaryMetadata: {
         trigger,
+        ...(sourceAttachmentCatalog.length > 0 ? { attachmentCatalog: sourceAttachmentCatalog } : {}),
         methodKind: policy.methodKind,
         estimatedTokens: summaryEstimatedTokens,
         ...(policy.methodKind === 'openai_responses_compact'

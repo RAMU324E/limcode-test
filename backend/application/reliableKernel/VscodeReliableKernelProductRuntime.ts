@@ -143,6 +143,10 @@ export class VscodeReliableKernelProductRuntime {
       },
       quiesce: async (reason) => {
         await childAgents?.quiesce(reason);
+      },
+      resolveAttachmentReference: async (attachmentId) => {
+        if (!application) throw new Error('可靠 Runtime 尚未完成组合，无法读取附件。');
+        return application.attachments.managedReference(attachmentId);
       }
     });
     const providers = new ReliableLlmProviderRegistry({

@@ -1532,6 +1532,13 @@ export interface AttachmentRecord {
   updatedAt: number;
 }
 
+export interface AttachmentCatalogEntry {
+  attachmentId: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+}
+
 export interface InlineDataPart {
   inlineData: {
     mimeType: string;

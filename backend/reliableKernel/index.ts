@@ -7,6 +7,7 @@ export * from './contextTokenEstimator';
 export * from './modelFacingContextProjection';
 export * from './currentTurnTaskProjection';
 export * from './attachmentIngest';
+export * from './attachmentCatalog';
 export * from './agentLoop';
 export * from './answerDelivery';
 export * from './runtimeDeliveryProjection';

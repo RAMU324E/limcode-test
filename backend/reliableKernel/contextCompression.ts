@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import type { MessageContent } from '../../shared/protocol';
+import type { AttachmentCatalogEntry, MessageContent } from '../../shared/protocol';
+import { normalizeAttachmentCatalog } from './attachmentCatalog';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
@@ -47,6 +48,8 @@ export interface CreateCompressionCommand {
   /** Display-only facts frozen beside structured contents; Provider materialization ignores them. */
   summaryMetadata?: {
     trigger: 'auto' | 'manual';
+    /** Lightweight managed attachment directory; never includes bytes, SHA values or local paths. */
+    attachmentCatalog?: AttachmentCatalogEntry[];
     methodKind: string;
     /** Provider-observed output tokens for the structured compact state. */
     estimatedTokens?: number;
@@ -746,6 +749,9 @@ function normalizeCompressionSummary(
       contents,
       ...(metadata ? {
         trigger: requireCompressionTrigger(metadata.trigger),
+        ...(metadata.attachmentCatalog?.length ? {
+          attachmentCatalog: normalizeAttachmentCatalog(metadata.attachmentCatalog, 'summaryMetadata.attachmentCatalog')
+        } : {}),
         methodKind: requireText(metadata.methodKind, 'summaryMetadata.methodKind'),
         ...(metadata.estimatedTokens === undefined ? {} : {
           estimatedTokens: requireEstimatedTokens(metadata.estimatedTokens, 'summaryMetadata.estimatedTokens')

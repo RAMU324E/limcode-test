@@ -159,9 +159,9 @@ export class AttachmentIngestService {
     label: string,
     enforceCurrentSettings: boolean
   ): Promise<PreparedAttachmentAdmission<T>> {
-    const hasAttachmentValues = containsInlineDataWrapper(value);
+    const hasNewAttachmentMaterial = containsNewAttachmentMaterial(value);
     let maxBytes: bigint | undefined;
-    if (enforceCurrentSettings && hasAttachmentValues) {
+    if (enforceCurrentSettings && hasNewAttachmentMaterial) {
       const settings = await this.loadSettings();
       maxBytes = BigInt(settings.maxStoredInlineFileMb) * 1024n * 1024n;
     }
@@ -193,18 +193,23 @@ export class AttachmentIngestService {
     });
 
     let totalBytes = 0n;
+    let newlyAdmittedBytes = 0n;
+    const embeddedIds = new Set(context.embedded.map((candidate) => candidate.attachmentId));
     for (const reference of context.references) {
       const size = BigInt(reference.sizeBytes);
-      if (maxBytes !== undefined && size > maxBytes) {
-        throw new AttachmentSizeLimitError(
-          `Attachment ${reference.name} is ${size.toString()} bytes; settings allow at most ${maxBytes.toString()} bytes.`
-        );
+      if (embeddedIds.has(reference.attachmentId)) {
+        if (maxBytes !== undefined && size > maxBytes) {
+          throw new AttachmentSizeLimitError(
+            `Attachment ${reference.name} is ${size.toString()} bytes; settings allow at most ${maxBytes.toString()} bytes.`
+          );
+        }
+        newlyAdmittedBytes += size;
       }
       totalBytes += size;
     }
-    if (maxBytes !== undefined && totalBytes > maxBytes) {
+    if (maxBytes !== undefined && newlyAdmittedBytes > maxBytes) {
       throw new AttachmentSizeLimitError(
-        `Attachments total ${totalBytes.toString()} bytes; one message allows at most ${maxBytes.toString()} bytes.`
+        `New attachments total ${newlyAdmittedBytes.toString()} bytes; one message allows at most ${maxBytes.toString()} bytes.`
       );
     }
 
@@ -480,10 +485,10 @@ export class AttachmentIngestService {
     return bytes;
   }
 
-  public async resolveInlineData(attachmentIdInput: string): Promise<InlineDataPart> {
+  public async managedReference(attachmentIdInput: string): Promise<InlineDataPart> {
     const attachmentId = requireId(attachmentIdInput, 'attachmentId');
     const attachment = await this.requireExisting('Attachment', attachmentId);
-    const bytes = await this.read(attachmentId);
+    if (attachment.storage_mode !== 'cas') throw new Error(`Attachment ${attachmentId} is not CAS-backed.`);
     return {
       inlineData: {
         attachmentId,
@@ -492,7 +497,21 @@ export class AttachmentIngestService {
         sha256: requireText(attachment.sha256, 'Attachment.sha256'),
         storage: 'managed',
         status: 'available',
-        sizeBytes: safeByteLength(requireBigInt(attachment.byte_length, 'Attachment.byte_length'), 'Attachment.byte_length'),
+        sizeBytes: safeByteLength(
+          requireBigInt(attachment.byte_length, 'Attachment.byte_length'),
+          'Attachment.byte_length'
+        )
+      }
+    };
+  }
+
+  public async resolveInlineData(attachmentIdInput: string): Promise<InlineDataPart> {
+    const reference = await this.managedReference(attachmentIdInput);
+    const attachmentId = requireId(reference.inlineData.attachmentId, 'InlineDataPart.attachmentId');
+    const bytes = await this.read(attachmentId);
+    return {
+      inlineData: {
+        ...reference.inlineData,
         data: bytes.toString('base64')
       }
     };
@@ -654,14 +673,18 @@ function isInlineDataWrapper(value: Record<string, unknown>): value is { inlineD
   return !!value.inlineData && typeof value.inlineData === 'object' && !Array.isArray(value.inlineData);
 }
 
-function containsInlineDataWrapper(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(containsInlineDataWrapper);
+function containsNewAttachmentMaterial(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsNewAttachmentMaterial);
   if (ArrayBuffer.isView(value)) return false;
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
-  if (isInlineDataWrapper(record)) return true;
-  return Object.values(record).some(containsInlineDataWrapper);
+  if (isInlineDataWrapper(record)) {
+    return typeof record.inlineData.data === 'string'
+      || typeof record.inlineData.sourcePath === 'string';
+  }
+  return Object.values(record).some(containsNewAttachmentMaterial);
 }
+
 
 function requireAbsoluteSourcePath(value: string, label: string): string {
   if (!path.isAbsolute(value)) {

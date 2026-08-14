@@ -1,3 +1,7 @@
+import {
+  collectAttachmentCatalogFromStoredItems,
+  renderAttachmentCatalog
+} from './attachmentCatalog';
 import { createHash } from 'node:crypto';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
@@ -510,6 +514,8 @@ export function projectStoredModelFacingWindow(
   items: readonly StoredModelFacingContextItem[]
 ): ModelWindowProjection {
   const contents = items.flatMap(storedContextItemContents);
+  const catalogContent = renderAttachmentCatalog(collectAttachmentCatalogFromStoredItems(items));
+  if (catalogContent) contents.push(catalogContent);
   return projectOrdinaryModelWindow(contents);
 }
 
@@ -761,17 +767,12 @@ function mediaDescriptor(part: InlineDataPart): Record<string, unknown> {
     : typeof value.data === 'string'
       ? decodedBase64Size(value.data)
       : undefined;
-  const sha256 = value.sha256 ?? (typeof value.data === 'string'
-    ? createHash('sha256').update(Buffer.from(value.data, 'base64')).digest('hex')
-    : undefined);
   return {
     kind: 'historical_media',
     ...(value.attachmentId ? { attachmentId: value.attachmentId } : {}),
     ...(value.name ? { name: value.name } : {}),
     mimeType: value.mimeType,
-    ...(rawBytes === undefined ? {} : { sizeBytes: rawBytes }),
-    ...(sha256 ? { sha256 } : {}),
-    ...(value.sourcePath ? { sourcePath: value.sourcePath } : {})
+    ...(rawBytes === undefined ? {} : { sizeBytes: rawBytes })
   };
 }
 

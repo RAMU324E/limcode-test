@@ -754,11 +754,18 @@ test('普通请求的当前原文与 Turn 提醒按冻结 addenda 发送且计�
   await adapter.sendFullRequest(reinjected, {
     onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
   });
+  const reinjectedCurrent = captures[0].contents.at(-2);
   assert.equal(
-    captures[0].contents[0].parts[0].text,
+    reinjectedCurrent.parts[0].text,
     '[当前 Turn 原始用户要求/数据，不是新用户输入；以下各 part 为冻结原文。]'
   );
-  assert.deepEqual(captures[0].contents[0].parts.slice(1), frozenOriginalParts);
+  assert.deepEqual(reinjectedCurrent.parts.slice(1), frozenOriginalParts);
+  const currentCatalog = captures[0].contents.find((content) =>
+    content.parts.some((part) => part.text?.includes('LimCode 托管附件目录'))
+  );
+  assert.ok(currentCatalog, '回注多模态当前输入前必须提供轻量附件目录');
+  assert.match(currentCatalog.parts[0].text, /attachment-current-turn/);
+  assert.doesNotMatch(currentCatalog.parts[0].text, /sha256|sourcePath|inlineData/);
   assert.equal(captures[0].contents.at(-1).parts[0].text, '[Current Turn Task Card]\nunfinished=2');
   assert.deepEqual(captures[1], captures[0], '回注标签、原始文本和多模态 parts 在 retry 时必须字节稳定');
   assert.ok(reinjectedEstimate.currentInputTokens > 0);
@@ -1502,3 +1509,86 @@ test('冻结模型配置完整覆盖模型级字段并关闭 capability 内部�
   assert.equal(base.retryOnError, true);
   assert.throws(() => kernel.applyFrozenModelProviderConfig(base, 'unknown-model'), /does not contain/);
 });
+
+test('LLM capability adapter renders one body-free attachment catalog for ordinary and native compact requests', async () => {
+  const sourceAttachment = {
+    attachmentId: 'attachment-source-pdf',
+    name: 'source.pdf',
+    mimeType: 'application/pdf',
+    sizeBytes: 45_678
+  };
+  const tailAttachment = {
+    attachmentId: 'attachment-tail-image',
+    name: 'tail.png',
+    mimeType: 'image/png',
+    sizeBytes: 12_345
+  };
+  const compressed = {
+    segmentId: 'catalog-compression',
+    segmentKind: 'compression',
+    messageRole: null,
+    contentType: 'application/vnd.limcode.compression-contents+json',
+    content: JSON.stringify({
+      kind: 'compression_contents',
+      version: 1,
+      contents: [{ role: 'model', parts: [{ text: 'canonical compact state' }] }],
+      attachmentCatalog: [sourceAttachment]
+    })
+  };
+  const tail = {
+    segmentId: 'catalog-tail',
+    segmentKind: 'message',
+    messageRole: 'user',
+    contentType: 'application/vnd.limcode.message+json',
+    content: JSON.stringify({
+      role: 'user',
+      parts: [{ inlineData: {
+        ...tailAttachment,
+        sha256: 'd'.repeat(64),
+        sourcePath: '/private/tail.png',
+        storage: 'managed',
+        status: 'available'
+      } }]
+    })
+  };
+
+  let ordinary;
+  const ordinaryRequest = request();
+  ordinaryRequest.context = [compressed, tail];
+  const ordinaryAdapter = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      ordinary = llmRequest;
+      emit({ type: 'llm:done', payload: { requestId: llmRequest.id } });
+    })
+  );
+  await ordinaryAdapter.sendFullRequest(ordinaryRequest, {
+    onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
+  });
+  assertCatalog(ordinary.contents, sourceAttachment, tailAttachment);
+
+  let native;
+  const nativeRequest = compressionRequest('openai_responses_compact', [compressed, tail]);
+  const nativeAdapter = new kernel.LlmCapabilityFullRequestAdapter(
+    'compression-provider',
+    compressionCapability((compactRequest) => { native = compactRequest; })
+  );
+  await nativeAdapter.sendFullRequest(nativeRequest, {
+    onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
+  });
+  assertCatalog(native.contents, sourceAttachment, tailAttachment);
+});
+
+function assertCatalog(contents, ...entries) {
+  const catalogContents = contents.filter((content) =>
+    content.parts.some((part) => typeof part.text === 'string' && part.text.includes('LimCode 托管附件目录'))
+  );
+  assert.equal(catalogContents.length, 1);
+  const catalogText = catalogContents[0].parts.map((part) => part.text ?? '').join('\n');
+  for (const entry of entries) {
+    assert.match(catalogText, new RegExp(entry.attachmentId));
+    assert.match(catalogText, new RegExp(entry.name.replace('.', '\\.')));
+  }
+  assert.match(catalogText, /\{"attachmentId":"attachment-source-pdf","name":"source\.pdf","mimeType":"application\/pdf","sizeBytes":45678\}/);
+  assert.doesNotMatch(catalogText, /sha256|sourcePath|private|inlineData|data/);
+}

@@ -3,6 +3,13 @@ import type { LlmCompactRequest, LlmStartRequest, ToolSchema } from '../world/mo
 import { LlmEventType } from '../world/modules/llm/events';
 import type { WorldEvent } from '../ecs/types';
 import type { InlineDataPart, LlmProviderKind, MessageContent } from '../../shared/protocol';
+import {
+  collectAttachmentCatalogFromStoredItems,
+  mergeAttachmentCatalog,
+  normalizeAttachmentCatalog,
+  renderAttachmentCatalog,
+  type AttachmentCatalogStoredItem
+} from './attachmentCatalog';
 import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import { classifyOpenAIResponsesPreTerminalWebSocketClose } from '../capabilities/openAIResponsesWebSocketRetryPolicy';
 import { ProviderTransientError } from './modelProviderControlPlane';
@@ -428,6 +435,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       : '';
   if (runtimeContextText) systemParts.push(runtimeContextText);
   const contents: MessageContent[] = [];
+  const attachmentCatalogs = [collectAttachmentCatalogFromStoredItems(request.context)];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
   for (const item of request.context) {
     if (item.segmentKind === 'system') {
@@ -448,6 +456,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       const start = contents.length;
       contents.push(...compressed.contents);
       canonicalCompressionRanges.push({ start, end: contents.length });
+      attachmentCatalogs.push(compressed.attachmentCatalog);
       continue;
     }
     if (item.segmentKind === 'runtime_context') {
@@ -463,6 +472,15 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     contents.push({ role, parts: [{ text: item.content }] });
   }
   const currentTurnInput = request.requestAddenda?.currentTurnInput;
+  const currentAttachmentItem: AttachmentCatalogStoredItem[] = currentTurnInput
+    ? [{ content: currentTurnInput.content, contentType: currentTurnInput.contentType }]
+    : [];
+  const attachmentCatalog = mergeAttachmentCatalog(
+    ...attachmentCatalogs,
+    collectAttachmentCatalogFromStoredItems(currentAttachmentItem)
+  );
+  const attachmentCatalogContent = renderAttachmentCatalog(attachmentCatalog);
+  if (attachmentCatalogContent) contents.push(attachmentCatalogContent);
   if (currentTurnInput?.reinject) {
     const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
     if (!current || current.role !== 'user') {
@@ -648,6 +666,10 @@ function compressionContext(
     current = [];
   };
   const recipe = requireRecord(request.recipe, 'Compression recipe');
+  const attachmentCatalog = collectAttachmentCatalogFromStoredItems(request.context.slice(
+    0,
+    typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length
+  ));
   const requestedCount = recipe.sourceSegmentCount;
   if (!Number.isSafeInteger(requestedCount) || (requestedCount as number) <= 0
     || (requestedCount as number) > request.context.length) {
@@ -696,6 +718,11 @@ function compressionContext(
     if (item.segmentKind === 'compression' && methodKind === 'openai_responses_compact') {
       canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
     }
+  }
+  const attachmentCatalogContent = renderAttachmentCatalog(attachmentCatalog);
+  if (attachmentCatalogContent) {
+    contents.push(attachmentCatalogContent);
+    current.push(attachmentCatalogContent);
   }
   flush();
   if (methodKind === 'openai_responses_compact') {
@@ -760,6 +787,7 @@ interface CompressionProviderBinding {
 
 interface DecodedCompressionContents {
   contents: MessageContent[];
+  attachmentCatalog: ReturnType<typeof normalizeAttachmentCatalog>;
   nativeBinding?: CompressionProviderBinding;
 }
 
@@ -779,13 +807,14 @@ function decodeCompressionContents(content: string, contentType: string): Decode
     }
     return item as unknown as MessageContent;
   });
+  const attachmentCatalog = normalizeAttachmentCatalog(envelope.attachmentCatalog);
   const rawBinding = asRecord(envelope.nativeBinding);
   const nativeBinding = rawBinding ? {
     providerConfigId: requireText(rawBinding.providerConfigId, 'Compression native providerConfigId'),
     provider: requireProviderKind(normalizePlainJson(rawBinding.provider, 'Compression native provider')),
     modelId: requireText(rawBinding.modelId, 'Compression native modelId')
   } : undefined;
-  return { contents, ...(nativeBinding ? { nativeBinding } : {}) };
+  return { contents, attachmentCatalog, ...(nativeBinding ? { nativeBinding } : {}) };
 }
 
 function assertCompressionBinding(

@@ -53,6 +53,7 @@ export interface VscodeReliableToolHostOptions {
   ) => Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled | undefined>;
   cancelTurnWaits?: (input: { turnId: string; reason: string }) => Promise<void>;
   quiesce?: (reason: ExecutionHandoffError) => Promise<void>;
+  resolveAttachmentReference?: (attachmentId: string) => Promise<import('../../../shared/protocol').InlineDataPart>;
 }
 
 /** VS Code capability adapter only; Runtime lifecycle remains owned by ReliableToolDispatcher. */
@@ -168,7 +169,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       ...(environments.active ? { workEnvironment: environments.active } : {}),
       workEnvironments: environments.allowed,
       accessibleWorkEnvironments: environments.allowed,
-      ...(definition.declaration.name === 'read'
+      ...(definition.declaration.name === 'read' && !reliableReadAttachmentId(input.arguments)
         ? { attachmentMaxBytes: await this.loadAttachmentMaxBytes() }
         : {}),
       signal,
@@ -178,7 +179,10 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       fs: this.fs,
       command: this.commandDeclaration,
       workEnvironment: this.workEnvironment,
-      skills: this.skills
+      skills: this.skills,
+      ...(this.options.resolveAttachmentReference ? {
+        attachments: { reference: this.options.resolveAttachmentReference }
+      } : {})
     }, context);
   }
 
@@ -414,6 +418,12 @@ function assertInsideRoot(root: string, target: string, label: string): void {
 function isInsideRoot(root: string, target: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+function reliableReadAttachmentId(value: unknown): string | undefined {
+  return typeof asRecord(value)?.attachmentId === 'string' && String(asRecord(value)?.attachmentId).trim()
+    ? String(asRecord(value)?.attachmentId).trim()
+    : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
