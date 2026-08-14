@@ -38,6 +38,11 @@ import {
   withTransferEnvironmentParameterHints,
   withWorkEnvironmentIdParameterHints
 } from '../world/modules/workEnvironment/toolDescription';
+import {
+  augmentRunAgentToolSchema,
+  formatAgentTypeList,
+  type AgentTypeListEntry
+} from '../world/modules/tools/runAgentTypeDescription';
 import type { ToolDefinition, ToolResultOut, ToolRuntimeEvent } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDefinition,
@@ -104,6 +109,8 @@ export interface ReliableToolDispatcherHost {
   workEnvironmentsForAuthority?(
     authority: ReliableToolDispatchAuthority
   ): Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
+  /** 可指派的 agent.type 列表（含内置与自定义，已排除运行时镜像）；用于拼进 runAgent 工具描述。 */
+  agentTypeEntries?(): Promise<AgentTypeListEntry[]> | AgentTypeListEntry[];
   /** Pure/repeatable capability call. The dispatcher persists its returned result before finalization. */
   executeNoEffect?(
     definition: ToolDefinition,
@@ -1433,7 +1440,42 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       && (definition.declaration.name !== RUN_AGENT_TOOL_NAME || exposeRunAgent)
     );
     const withSkills = this.augmentSkillsDefinition(allowed, authority.document);
-    return this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
+    const withEnvironments = await this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
+    return this.augmentRunAgentDefinition(withEnvironments);
+  }
+
+  /**
+   * 把可指派的 agent.type 列表拼进 runAgent 工具描述与 agent.type 参数提示。
+   * 列表读取失败时保持原声明（降级为静态描述），不拖垮整个 Turn 的 schema 构建。
+   */
+  private async augmentRunAgentDefinition(definitions: ToolDefinition[]): Promise<ToolDefinition[]> {
+    const host = this.dependencies.host;
+    if (!host.agentTypeEntries) return definitions;
+    const index = definitions.findIndex((definition) => definition.declaration.name === RUN_AGENT_TOOL_NAME);
+    if (index === -1) return definitions;
+    let typeList: string;
+    try {
+      typeList = formatAgentTypeList(await host.agentTypeEntries());
+    } catch {
+      return definitions;
+    }
+    if (!typeList) return definitions;
+    const target = definitions[index];
+    const baseDescription = typeof target.declaration.description === 'string' ? target.declaration.description : '';
+    const augmented = augmentRunAgentToolSchema(
+      { description: baseDescription, parameters: target.declaration.parameters },
+      typeList
+    );
+    const next = [...definitions];
+    next[index] = {
+      ...target,
+      declaration: {
+        ...target.declaration,
+        description: augmented.description,
+        parameters: augmented.parameters as typeof target.declaration.parameters
+      }
+    };
+    return next;
   }
 
   /**

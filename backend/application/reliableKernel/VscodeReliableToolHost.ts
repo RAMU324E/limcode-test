@@ -291,6 +291,14 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     return resolvePathInsideBoundary(active.id, active.rootPath, inputPath);
   }
 
+  /** 供 toolDispatcher 构建模型可见的 agent.type 列表；排除运行时镜像（mirror id 不是合法 agent.type）。 */
+  public async agentTypeEntries(): Promise<{ id: string; label?: string }[]> {
+    const agents = await this.configuration.agents();
+    return agents
+      .filter((agent) => agent.runtimeRole !== 'mirror')
+      .map((agent) => ({ id: agent.id, label: agent.description?.trim() || agent.name.trim() }));
+  }
+
   /** 供 toolDispatcher 构建模型可见的工作环境列表；与执行时路径边界共用同一份解析与缓存。 */
   public async workEnvironmentsForAuthority(authority: ReliableToolDispatchAuthority): Promise<{
     active?: WorkEnvironmentRecord;
