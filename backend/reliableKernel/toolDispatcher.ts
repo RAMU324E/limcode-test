@@ -5,8 +5,11 @@ import {
   MAX_CONCURRENT_PROCESS_OR_MCP_TOOLS_PER_TURN
 } from '../../shared/agentScheduling';
 import {
+  SKILLS_TOOL_NAME,
   SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
   TRANSFER_TOOL_NAME,
+  type SkillDefinitionRecord,
+  type SkillPolicyRecord,
   type ToolDefinitionMetadataRecord,
   type ToolPolicyToolConfigRecord
 } from '../../shared/protocol';
@@ -25,6 +28,8 @@ import {
   RUN_AGENT_TOOL_NAME,
   runAgentToolAvailableAtDepth
 } from '../world/modules/tools/definitions/runAgent';
+import { isSkillEnabledByPolicy } from '../world/modules/skill/policy';
+import { composeSkillsToolDescription } from '../world/modules/skill/skillDescription';
 import type { ToolDefinition, ToolResultOut, ToolRuntimeEvent } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDefinition,
@@ -85,6 +90,8 @@ export interface ReliableToolDispatcherHost {
   dispose?(): Promise<void> | void;
   /** Current immutable declarations, including memory-only MCP discovery results. */
   definitions(): Promise<ToolDefinition[]> | ToolDefinition[];
+  /** 磁盘扫描出的技能目录快照；用于把可用技能列表拼进 skills 工具描述。 */
+  skillDefinitions?(): SkillDefinitionRecord[];
   /** Pure/repeatable capability call. The dispatcher persists its returned result before finalization. */
   executeNoEffect?(
     definition: ToolDefinition,
@@ -1408,11 +1415,36 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       await childAgentDepthForTurn(this.dependencies.database, turnId),
       toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
     );
-    return definitions.filter((definition) =>
+    const allowed = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
       && (definition.declaration.name !== RUN_AGENT_TOOL_NAME || exposeRunAgent)
     );
+    return this.augmentSkillsDefinition(allowed, authority.document);
+  }
+
+  /**
+   * 把按冻结 skillPolicy 过滤后的技能目录拼进 skills 工具描述。
+   * 声明本身是不可变模板，这里返回克隆体，绝不改写 host 持有的 definition。
+   */
+  private augmentSkillsDefinition(definitions: ToolDefinition[], document: PlainJsonValue): ToolDefinition[] {
+    const host = this.dependencies.host;
+    if (!host.skillDefinitions) return definitions;
+    const index = definitions.findIndex((definition) => definition.declaration.name === SKILLS_TOOL_NAME);
+    if (index === -1) return definitions;
+    const policy = authoritySkillPolicy(document);
+    const enabled = host.skillDefinitions().filter((skill) => isSkillEnabledByPolicy(policy, skill));
+    const target = definitions[index];
+    const baseDescription = typeof target.declaration.description === 'string' ? target.declaration.description : '';
+    const next = [...definitions];
+    next[index] = {
+      ...target,
+      declaration: {
+        ...target.declaration,
+        description: composeSkillsToolDescription(baseDescription, enabled)
+      }
+    };
+    return next;
   }
 
   private async readAuthority(turnId: string, toolName: string): Promise<ReliableToolDispatchAuthority> {
@@ -1932,6 +1964,20 @@ function authorityPolicy(document: PlainJsonValue): {
     preset: typeof policy.preset === 'string' ? policy.preset : 'custom',
     toolConfigs: toolConfigsRaw as unknown as Record<string, ToolPolicyToolConfigRecord>,
     sourceConfigs
+  };
+}
+
+/**
+ * 读取冻结 Authority 中的 skillPolicy。缺失/为空时返回 undefined（默认全部启用，opt-out）。
+ * sourceConfigs 由 configuration authority 冻结时 plain-clone，结构与 SkillPolicyRecord 一致。
+ */
+function authoritySkillPolicy(document: PlainJsonValue): Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined {
+  const authority = requireRecord(document, 'AuthoritySnapshot');
+  if (authority.skillPolicy === undefined || authority.skillPolicy === null) return undefined;
+  const raw = plainRecord(authority.skillPolicy, 'AuthoritySnapshot.skillPolicy');
+  if (raw.sourceConfigs === undefined || raw.sourceConfigs === null) return {};
+  return {
+    sourceConfigs: plainRecord(raw.sourceConfigs as PlainJsonValue | undefined, 'AuthoritySnapshot.skillPolicy.sourceConfigs') as unknown as SkillPolicyRecord['sourceConfigs']
   };
 }
 
