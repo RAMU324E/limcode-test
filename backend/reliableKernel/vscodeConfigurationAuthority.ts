@@ -21,6 +21,8 @@ import type {
   ModelProfileScopeLinkRecord,
   PlanReviewPolicyRecord,
   PlanReviewPolicyScopeLinkRecord,
+  RuleFileRecord,
+  RuleScope,
   RuntimeContextRecord,
   RuntimeContextScopeLinkRecord,
   SkillPolicyRecord,
@@ -62,9 +64,16 @@ import {
   globalStatusRevision,
   LIMCODE_GLOBAL_STATUS_LABEL,
   loadCommittedGlobalStatus,
-  saveGlobalStatusExpected
+  saveGlobalStatusExpected,
+  resolveDataRootUri
 } from '../capabilities/vscodeStorage/globalStatus';
 import type { StoragePaths } from '../capabilities/vscodeStorage/paths';
+import {
+  composeRuntimeContextRuleParts,
+  renderReliableRuntimeContextTemplate,
+  renderReliableSystemPromptTemplate,
+  type ReliablePromptRenderContext
+} from './runtimeContextRendering';
 import { loadRecordStore } from '../capabilities/vscodeStorage/recordStore';
 import {
   createDefaultAgentBlueprints
@@ -126,6 +135,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   /** Host-local workspace presence; shared WorkEnvironment records must not encode another Host's view. */
   private currentWorkspaceFolderIds = new Set<string>();
   private currentWorkspaceFolderRecords = new Map<string, WorkEnvironmentRecord>();
+  private currentWorkspaceFolders: readonly CurrentWorkspaceFolder[] = [];
 
   public constructor(
     private readonly getPaths: () => StoragePaths,
@@ -293,6 +303,32 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     )]
       .filter((id) => availableWorkEnvironmentIds.includes(id))
       .sort();
+    const promptRenderContext: ReliablePromptRenderContext = {
+      now: new Date(),
+      platform: process.platform,
+      ...(this.currentWorkspaceFolders[0]
+        ? { workspace: { name: this.currentWorkspaceFolders[0].name, uri: this.currentWorkspaceFolders[0].uri } }
+        : {}),
+      workEnvironments: allowedWorkEnvironmentIds
+        .map((id) => records.workEnvironments.find((environment) => environment.id === id))
+        .filter((environment): environment is WorkEnvironmentRecord => !!environment),
+      agentName: agent.name,
+      ...(agent.description ? { agentDescription: agent.description } : {}),
+      ...(workflow
+        ? { workflowName: workflow.name, ...(workflow.description ? { workflowDescription: workflow.description } : {}) }
+        : {})
+    };
+    const ruleFiles = await this.loadRuleFiles();
+    const renderedRuntimeContextParts = runtimeContexts
+      .map((context) => {
+        const text = renderReliableRuntimeContextTemplate(context.template, promptRenderContext).trim();
+        if (!text) return '';
+        const name = context.name.trim();
+        return name ? `[${name}]\n${text}` : text;
+      })
+      .filter(Boolean);
+    // 与旧 ECS RuntimeContextSnapshotSystem 一致：渲染后的运行时上下文在前，规则区域原样追加在后。
+    const runtimeContextText = [...renderedRuntimeContextParts, ...composeRuntimeContextRuleParts(ruleFiles)].join('\n\n');
     const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
       link.conversationId === request.conversationId && link.role === 'active'
     ));
@@ -356,12 +392,14 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       },
       systemPrompt: {
         id: systemPrompt?.id ?? (builtinWorkflow ? `builtin-system-prompt:${workflow?.id}` : builtinAgent ? `builtin-system-prompt:${agentId}` : null),
-        text: composeSystemInstruction(orderedPromptParts)
+        text: renderReliableSystemPromptTemplate(composeSystemInstruction(orderedPromptParts), promptRenderContext)
       },
       runtimeContext: {
         id: runtimeContext?.id ?? null,
         name: runtimeContexts.map((context) => context.name.trim()).filter(Boolean).join(' + '),
-        template: runtimeContexts.map((context) => context.template.trim()).filter(Boolean).join('\n\n')
+        template: runtimeContexts.map((context) => context.template.trim()).filter(Boolean).join('\n\n'),
+        // 占位符已渲染 + 规则区域注入后的模型可见文本；适配器优先使用，template 保留原文供编辑。
+        ...(runtimeContextText ? { text: runtimeContextText } : {})
       },
       workEnvironmentPolicy: {
         id: workEnvironmentPolicy?.id ?? null,
@@ -407,6 +445,45 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const workflow = mergeWorkflowsWithBuiltins(stored ?? []).find((candidate) => candidate.id === workflowId);
     if (!workflow) throw new Error(`Workflow 不存在：${workflowId}`);
     return { ...workflow };
+  }
+
+  /**
+   * 读取全局（<dataRoot>）与项目（第一个 workspace folder）的 AGENTS.md / CLAUDE.md。
+   * 与 capabilities/rulesCatalog 的路径约定一致；无 ExtensionContext（测试隔离 authority）时返回空。
+   */
+  private async loadRuleFiles(): Promise<RuleFileRecord[]> {
+    if (!this.context) return [];
+    const { readFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const roots: Array<{ scope: RuleScope; rootPath: string | undefined }> = [
+      { scope: 'global', rootPath: resolveDataRootUri(this.context).fsPath },
+      { scope: 'project', rootPath: this.currentWorkspaceFolders[0]?.rootPath }
+    ];
+    const rules: RuleFileRecord[] = [];
+    for (const { scope, rootPath } of roots) {
+      if (!rootPath) continue;
+      for (const kind of ['AGENTS', 'CLAUDE'] as const) {
+        const filePath = join(rootPath, kind === 'AGENTS' ? 'AGENTS.md' : 'CLAUDE.md');
+        let content = '';
+        let exists = false;
+        try {
+          content = await readFile(filePath, 'utf8');
+          exists = true;
+        } catch {
+          // 规则文件未创建（或不可读）时按「不存在」处理。
+        }
+        rules.push({
+          id: `rule:${scope}:${kind}`,
+          scope,
+          kind,
+          editable: kind === 'AGENTS',
+          path: filePath,
+          exists,
+          content
+        });
+      }
+    }
+    return rules;
   }
 
   public async synchronizeWorkspaceFolders(
@@ -678,6 +755,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     }, observedAt));
     this.currentWorkspaceFolderRecords = new Map(records.map((record) => [record.id, record]));
     this.currentWorkspaceFolderIds = new Set(this.currentWorkspaceFolderRecords.keys());
+    this.currentWorkspaceFolders = folders;
   }
 
   private async loadConfigurationClientRecords(): Promise<ConfigurationClientRecords> {

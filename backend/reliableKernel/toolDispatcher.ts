@@ -5,10 +5,14 @@ import {
   MAX_CONCURRENT_PROCESS_OR_MCP_TOOLS_PER_TURN
 } from '../../shared/agentScheduling';
 import {
+  SKILLS_TOOL_NAME,
   SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
   TRANSFER_TOOL_NAME,
+  type SkillDefinitionRecord,
+  type SkillPolicyRecord,
   type ToolDefinitionMetadataRecord,
-  type ToolPolicyToolConfigRecord
+  type ToolPolicyToolConfigRecord,
+  type WorkEnvironmentRecord
 } from '../../shared/protocol';
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import {
@@ -25,6 +29,20 @@ import {
   RUN_AGENT_TOOL_NAME,
   runAgentToolAvailableAtDepth
 } from '../world/modules/tools/definitions/runAgent';
+import { isSkillEnabledByPolicy } from '../world/modules/skill/policy';
+import { composeSkillsToolDescription } from '../world/modules/skill/skillDescription';
+import {
+  SWITCH_WORK_ENVIRONMENTS_TITLE,
+  TRANSFER_WORK_ENVIRONMENTS_TITLE,
+  workEnvironmentListText,
+  withTransferEnvironmentParameterHints,
+  withWorkEnvironmentIdParameterHints
+} from '../world/modules/workEnvironment/toolDescription';
+import {
+  augmentRunAgentToolSchema,
+  formatAgentTypeList,
+  type AgentTypeListEntry
+} from '../world/modules/tools/runAgentTypeDescription';
 import type { ToolDefinition, ToolResultOut, ToolRuntimeEvent } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDefinition,
@@ -85,6 +103,14 @@ export interface ReliableToolDispatcherHost {
   dispose?(): Promise<void> | void;
   /** Current immutable declarations, including memory-only MCP discovery results. */
   definitions(): Promise<ToolDefinition[]> | ToolDefinition[];
+  /** 磁盘扫描出的技能目录快照；用于把可用技能列表拼进 skills 工具描述。 */
+  skillDefinitions?(): SkillDefinitionRecord[];
+  /** 按冻结 authority 解析出的工作环境边界；用于把环境列表拼进 switch/transfer 工具描述。 */
+  workEnvironmentsForAuthority?(
+    authority: ReliableToolDispatchAuthority
+  ): Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
+  /** 可指派的 agent.type 列表（含内置与自定义，已排除运行时镜像）；用于拼进 runAgent 工具描述。 */
+  agentTypeEntries?(): Promise<AgentTypeListEntry[]> | AgentTypeListEntry[];
   /** Pure/repeatable capability call. The dispatcher persists its returned result before finalization. */
   executeNoEffect?(
     definition: ToolDefinition,
@@ -1408,11 +1434,121 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       await childAgentDepthForTurn(this.dependencies.database, turnId),
       toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
     );
-    return definitions.filter((definition) =>
+    const allowed = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
       && (definition.declaration.name !== RUN_AGENT_TOOL_NAME || exposeRunAgent)
     );
+    const withSkills = this.augmentSkillsDefinition(allowed, authority.document);
+    const withEnvironments = await this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
+    return this.augmentRunAgentDefinition(withEnvironments);
+  }
+
+  /**
+   * 把可指派的 agent.type 列表拼进 runAgent 工具描述与 agent.type 参数提示。
+   * 列表读取失败时保持原声明（降级为静态描述），不拖垮整个 Turn 的 schema 构建。
+   */
+  private async augmentRunAgentDefinition(definitions: ToolDefinition[]): Promise<ToolDefinition[]> {
+    const host = this.dependencies.host;
+    if (!host.agentTypeEntries) return definitions;
+    const index = definitions.findIndex((definition) => definition.declaration.name === RUN_AGENT_TOOL_NAME);
+    if (index === -1) return definitions;
+    let typeList: string;
+    try {
+      typeList = formatAgentTypeList(await host.agentTypeEntries());
+    } catch {
+      return definitions;
+    }
+    if (!typeList) return definitions;
+    const target = definitions[index];
+    const baseDescription = typeof target.declaration.description === 'string' ? target.declaration.description : '';
+    const augmented = augmentRunAgentToolSchema(
+      { description: baseDescription, parameters: target.declaration.parameters },
+      typeList
+    );
+    const next = [...definitions];
+    next[index] = {
+      ...target,
+      declaration: {
+        ...target.declaration,
+        description: augmented.description,
+        parameters: augmented.parameters as typeof target.declaration.parameters
+      }
+    };
+    return next;
+  }
+
+  /**
+   * 把冻结策略允许的工作环境列表拼进 switch_work_environment / transfer 工具描述与参数提示。
+   * 环境解析失败时保持原声明（降级为静态描述），不拖垮整个 Turn 的 schema 构建。
+   */
+  private async augmentWorkEnvironmentDefinitions(
+    definitions: ToolDefinition[],
+    authority: ReliableToolDispatchAuthority,
+    switchingEnabled: boolean
+  ): Promise<ToolDefinition[]> {
+    if (!switchingEnabled) return definitions;
+    const host = this.dependencies.host;
+    if (!host.workEnvironmentsForAuthority) return definitions;
+    const hasEnvironmentTool = definitions.some((definition) => WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name));
+    if (!hasEnvironmentTool) return definitions;
+    let environments: WorkEnvironmentRecord[];
+    try {
+      environments = (await host.workEnvironmentsForAuthority(authority)).allowed;
+    } catch {
+      return definitions;
+    }
+    return definitions.map((definition) => {
+      if (definition.declaration.name === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
+        const environmentText = workEnvironmentListText(environments, SWITCH_WORK_ENVIRONMENTS_TITLE);
+        const baseDescription = typeof definition.declaration.description === 'string' ? definition.declaration.description : '';
+        return {
+          ...definition,
+          declaration: {
+            ...definition.declaration,
+            description: [baseDescription, environmentText].filter(Boolean).join('\n\n'),
+            parameters: withWorkEnvironmentIdParameterHints(definition.declaration.parameters, environmentText) as typeof definition.declaration.parameters
+          }
+        };
+      }
+      if (definition.declaration.name === TRANSFER_TOOL_NAME) {
+        const environmentText = workEnvironmentListText(environments, TRANSFER_WORK_ENVIRONMENTS_TITLE);
+        const baseDescription = typeof definition.declaration.description === 'string' ? definition.declaration.description : '';
+        return {
+          ...definition,
+          declaration: {
+            ...definition.declaration,
+            description: [baseDescription, environmentText].filter(Boolean).join('\n\n'),
+            parameters: withTransferEnvironmentParameterHints(definition.declaration.parameters, environmentText) as typeof definition.declaration.parameters
+          }
+        };
+      }
+      return definition;
+    });
+  }
+
+  /**
+   * 把按冻结 skillPolicy 过滤后的技能目录拼进 skills 工具描述。
+   * 声明本身是不可变模板，这里返回克隆体，绝不改写 host 持有的 definition。
+   */
+  private augmentSkillsDefinition(definitions: ToolDefinition[], document: PlainJsonValue): ToolDefinition[] {
+    const host = this.dependencies.host;
+    if (!host.skillDefinitions) return definitions;
+    const index = definitions.findIndex((definition) => definition.declaration.name === SKILLS_TOOL_NAME);
+    if (index === -1) return definitions;
+    const policy = authoritySkillPolicy(document);
+    const enabled = host.skillDefinitions().filter((skill) => isSkillEnabledByPolicy(policy, skill));
+    const target = definitions[index];
+    const baseDescription = typeof target.declaration.description === 'string' ? target.declaration.description : '';
+    const next = [...definitions];
+    next[index] = {
+      ...target,
+      declaration: {
+        ...target.declaration,
+        description: composeSkillsToolDescription(baseDescription, enabled)
+      }
+    };
+    return next;
   }
 
   private async readAuthority(turnId: string, toolName: string): Promise<ReliableToolDispatchAuthority> {
@@ -1932,6 +2068,20 @@ function authorityPolicy(document: PlainJsonValue): {
     preset: typeof policy.preset === 'string' ? policy.preset : 'custom',
     toolConfigs: toolConfigsRaw as unknown as Record<string, ToolPolicyToolConfigRecord>,
     sourceConfigs
+  };
+}
+
+/**
+ * 读取冻结 Authority 中的 skillPolicy。缺失/为空时返回 undefined（默认全部启用，opt-out）。
+ * sourceConfigs 由 configuration authority 冻结时 plain-clone，结构与 SkillPolicyRecord 一致。
+ */
+function authoritySkillPolicy(document: PlainJsonValue): Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined {
+  const authority = requireRecord(document, 'AuthoritySnapshot');
+  if (authority.skillPolicy === undefined || authority.skillPolicy === null) return undefined;
+  const raw = plainRecord(authority.skillPolicy, 'AuthoritySnapshot.skillPolicy');
+  if (raw.sourceConfigs === undefined || raw.sourceConfigs === null) return {};
+  return {
+    sourceConfigs: plainRecord(raw.sourceConfigs as PlainJsonValue | undefined, 'AuthoritySnapshot.skillPolicy.sourceConfigs') as unknown as SkillPolicyRecord['sourceConfigs']
   };
 }
 

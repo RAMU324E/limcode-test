@@ -4,7 +4,8 @@ import { AgentBlueprintsKey, type BuiltinAgentDefinition, type BuiltinAgentRegis
 import { Agent, AgentKind } from '../agent/components';
 import { isTemporaryAgentEntity } from '../agent/identity';
 import type { ToolSchemaContributor } from './schemaContributors';
-import { DEFAULT_RUN_AGENT_TYPE, RUN_AGENT_TOOL_NAME } from './definitions/runAgent';
+import { RUN_AGENT_TOOL_NAME } from './definitions/runAgent';
+import { augmentRunAgentToolSchema, formatAgentTypeList, type AgentTypeListEntry } from './runAgentTypeDescription';
 
 export const runAgentToolSchemaContributor: ToolSchemaContributor = {
   key: 'run-agent-blueprint-types',
@@ -12,39 +13,14 @@ export const runAgentToolSchemaContributor: ToolSchemaContributor = {
   augment(tools, context) {
     const blueprints = context.world.tryGetResource(AgentBlueprintsKey);
     if (!blueprints) return tools;
-    return tools.map((tool) => tool.name === RUN_AGENT_TOOL_NAME ? withAgentTypeList(tool, context.world, blueprints) : tool);
+    const typeList = formatAgentTypeList(agentTypeEntries(context.world, blueprints));
+    if (!typeList) return tools;
+    return tools.map((tool) => tool.name === RUN_AGENT_TOOL_NAME ? augmentRunAgentToolSchema(tool, typeList) : tool);
   }
 };
 
-function withAgentTypeList(tool: ToolSchema, world: WorldReader, blueprints: BuiltinAgentRegistry): ToolSchema {
-  const typeList = formatAgentTypeList(world, blueprints.agents);
-  if (!typeList) return tool;
-
-  const parameters = cloneRecord(tool.parameters);
-  const properties = cloneRecord(parameters.properties);
-  const agent = cloneRecord(properties.agent);
-  const agentProperties = cloneRecord(agent.properties);
-  const typeProperty = cloneRecord(agentProperties.type);
-
-  typeProperty.description = [
-    `The Agent type/configuration id to use. Defaults to ${DEFAULT_RUN_AGENT_TYPE}. Use one of the available Agent types below. Runtime mirror ids are internal implementation details and are not valid Agent types; continue an existing child conversation with answerBridgeId instead.`,
-    'Available Agent types (pass one as agent.type):',
-    typeList
-  ].join('\n');
-  agentProperties.type = typeProperty;
-  agent.properties = agentProperties;
-  properties.agent = agent;
-  parameters.properties = properties;
-
-  return {
-    ...tool,
-    description: `${tool.description}\n\nPrefer answerBridgeId when continuing an existing child conversation. When creating a new child Agent, choose an agent.type from this list (type/config id + description only; runtime mirror ids are intentionally hidden):\n${typeList}`,
-    parameters
-  };
-}
-
-function formatAgentTypeList(world: WorldReader, agents: Record<string, BuiltinAgentDefinition>): string {
-  const lines: string[] = [];
+function agentTypeEntries(world: WorldReader, blueprints: BuiltinAgentRegistry): AgentTypeListEntry[] {
+  const entries: AgentTypeListEntry[] = [];
   const seen = new Set<string>();
 
   for (const entity of world.query(Agent).sort((left, right) => left - right)) {
@@ -52,30 +28,22 @@ function formatAgentTypeList(world: WorldReader, agents: Record<string, BuiltinA
     const agent = world.get(entity, Agent);
     if (!agent?.id || seen.has(agent.id)) continue;
     const kind = world.get(entity, AgentKind)?.kind;
-    if (agent.source === 'builtin' && !hasBuiltinAgentDefinition(agents, agent.id, kind)) continue;
+    if (agent.source === 'builtin' && !hasBuiltinAgentDefinition(blueprints.agents, agent.id, kind)) continue;
     seen.add(agent.id);
-    const label = agent.description?.trim() || agent.name.trim();
-    lines.push(label ? `- ${agent.id}: ${label}` : `- ${agent.id}`);
+    entries.push({ id: agent.id, label: agent.description?.trim() || agent.name.trim() });
   }
 
-  for (const agent of Object.values(agents)) {
+  for (const agent of Object.values(blueprints.agents)) {
     if (seen.has(agent.id) || seen.has(agent.kind)) continue;
     seen.add(agent.id);
-    const label = agent.description?.trim();
-    lines.push(label ? `- ${agent.id}: ${label}` : `- ${agent.id}`);
+    entries.push({ id: agent.id, label: agent.description?.trim() });
   }
 
-  return lines.join('\n');
+  return entries;
 }
 
 function hasBuiltinAgentDefinition(agents: Record<string, BuiltinAgentDefinition>, id: string, kind: string | undefined): boolean {
   return Object.values(agents).some((definition) => definition.id === id
     || definition.kind === id
     || (!!kind && (definition.id === kind || definition.kind === kind)));
-}
-
-function cloneRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? { ...(value as Record<string, unknown>) }
-    : {};
 }
