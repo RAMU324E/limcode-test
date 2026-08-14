@@ -2531,13 +2531,37 @@ async function checkImmutableReplacement() {
       thresholdTokens: 2,
       compressionPolicy: coordinatorPolicy
     });
+    const coordinatorAttachment = {
+      attachmentId: 'attachment-compression-coordinator',
+      name: 'coordinator.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 4_096
+    };
     for (let index = 0; index < 4; index += 1) {
+      const role = index % 2 === 0 ? 'assistant' : 'user';
+      const attachmentMessage = index === 1
+        ? JSON.stringify({
+            role: 'user',
+            parts: [{
+              text: `coordinator-message-${index}`
+            }, {
+              inlineData: {
+                ...coordinatorAttachment,
+                sha256: 'e'.repeat(64),
+                sourcePath: '/private/coordinator.pdf',
+                storage: 'managed',
+                status: 'available'
+              }
+            }]
+          })
+        : `coordinator-message-${index}-${'x'.repeat(256)}`;
       await appendMessageContextFixture(
         ctx,
         coordinatorSeed,
         `compression-coordinator-${index}`,
-        index % 2 === 0 ? 'assistant' : 'user',
-        `coordinator-message-${index}-${'x'.repeat(256)}`
+        role,
+        attachmentMessage,
+        index === 1 ? 'application/vnd.limcode.message+json' : 'text/plain'
       );
     }
     const coordinatorHead = await context.currentHeadRootId(coordinatorSeed.conversationId);
@@ -2582,15 +2606,15 @@ async function checkImmutableReplacement() {
       compressionThresholdTokens: 2,
       breakdown: {
         systemTokens: 0, toolSchemaTokens: 0, providerFramingTokens: 0,
-        contextTokens: 1, currentInputTokens: 0, runtimeDeliveryTokens: 0,
+        contextTokens: 2, currentInputTokens: 0, runtimeDeliveryTokens: 0,
         turnReminderTokens: 0, mediaTokens: 0, fixedTokens: 0,
-        bodyTokens: 1, fullTokens: 1
+        bodyTokens: 2, fullTokens: 2
       }
     });
     assert.equal(
       coordinatorRequestBudget.policyTrigger,
-      false,
-      'fixture must reproduce an underestimated ordinary-request budget'
+      true,
+      'fixture must cross the exact frozen ordinary-request threshold'
     );
     const coordinated = await coordinator.coordinate({
       turnId: coordinatorSeed.turnId,
@@ -2627,17 +2651,28 @@ async function checkImmutableReplacement() {
     const structuredMetadata = await get(ctx.database, 'ContentObject', coordinatedBlock.summary_object_id);
     assert.equal(structuredMetadata.content_type, kernel.CONTENT_TYPE_COMPRESSION_CONTENTS);
     const structuredCompression = JSON.parse((await ctx.store.read(structuredMetadata)).toString('utf8'));
+    const structuredCatalogContent = kernel.renderAttachmentCatalog(structuredCompression.attachmentCatalog);
+    assert.ok(structuredCatalogContent);
     assert.equal(
       structuredCompression.estimatedTokens,
-      kernel.estimateMessageContentsTokens(structuredCompression.contents)
+      kernel.estimateMessageContentsTokens([
+        ...structuredCompression.contents,
+        structuredCatalogContent
+      ])
     );
-    assert.deepEqual(structuredCompression, {
-      kind: 'compression_contents', version: 1,
-      contents: [{ role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] }],
-      trigger: 'auto',
-      methodKind: 'deterministic_summary',
-      estimatedTokens: structuredCompression.estimatedTokens
-    });
+    assert.equal(structuredCompression.trigger, 'auto');
+    assert.equal(structuredCompression.triggerReason, 'configured_threshold');
+    assert.equal(structuredCompression.triggerEstimatedTokens, 2);
+    assert.equal(structuredCompression.configuredThresholdTokens, 2);
+    assert.equal(structuredCompression.effectiveTriggerTokens, 2);
+    assert.equal(structuredCompression.estimatedTokensBefore, 2);
+    assert.equal(structuredCompression.providerInputTokens, 77);
+    assert.equal(structuredCompression.methodKind, 'deterministic_summary');
+    assert.deepEqual(structuredCompression.attachmentCatalog, [coordinatorAttachment]);
+    assert.doesNotMatch(JSON.stringify(structuredCompression.attachmentCatalog), /sha256|sourcePath|data|private/);
+    assert.deepEqual(structuredCompression.contents, [
+      { role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] }
+    ]);
     const coordinatedMaterialized = await context.materialize(coordinated.result.rootId);
     assert.equal(coordinatedMaterialized.segments.length, 2);
     assert.equal(coordinatedMaterialized.segments[0].segmentKind, 'compression');
@@ -2887,7 +2922,7 @@ async function checkImmutableReplacement() {
     assert.equal(nonReducingReplay.reason, 'non_reducing');
     assert.equal(nonReducingDispatches, 1);
     assertions.push('自动压缩协调器把request kind/source prefix冻结进recipe，复用ModelRequest/Operation/Attempt/fence；exact replay零外调；provider-native MessageContent[]按版本化codec持久化并按token预算保留连续finite tail');
-    assertions.push('Provider实测校准的Context越过阈值时，即使普通请求启发式预算仍低于阈值也必须触发自动压缩');
+    assertions.push('自动压缩只由冻结普通请求的完整模型投影预算越过配置阈值或安全输入上限触发；Context根校准不再独立触发');
     assertions.push('LLM capability adapter只发送冻结prefix，识别prior structured summary，并把CompactDone映射为单一durable completed事件；后续普通请求会展开版本化MessageContent[]而不是把JSON当Markdown');
     assertions.push('manual-only配置不会被自动调度；manualCurrentTurn在远低于冻结阈值时可显式压缩closed prefix，同时保留finite tail并冻结manual request kind');
     assertions.push('受保护tail使上下文越阈值但eligible prefix已不可缩小时，协调器按同head durable request精确跳过而不失败主Turn或重复外调');

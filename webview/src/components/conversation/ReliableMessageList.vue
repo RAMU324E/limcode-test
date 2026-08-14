@@ -203,6 +203,19 @@ const activeCompressionCard = computed<Record<string, unknown> | undefined>(() =
     trigger: purpose.trigger,
     method_kind: purpose.methodKind,
     source_count: purpose.sourceSegmentCount,
+    ...(purpose.triggerReason ? { trigger_reason: purpose.triggerReason } : {}),
+    ...(purpose.triggerEstimatedTokens === undefined ? {} : {
+      trigger_estimated_tokens: purpose.triggerEstimatedTokens
+    }),
+    ...(purpose.configuredThresholdTokens === undefined ? {} : {
+      configured_threshold_tokens: purpose.configuredThresholdTokens
+    }),
+    ...(purpose.safeInputLimitTokens === undefined ? {} : {
+      safe_input_limit_tokens: purpose.safeInputLimitTokens
+    }),
+    ...(purpose.effectiveTriggerTokens === undefined ? {} : {
+      effective_trigger_tokens: purpose.effectiveTriggerTokens
+    }),
     model_request_id: reliableText(request.id),
     created_at: request.created_at,
     retry_reason_label: retry.reasonLabel,

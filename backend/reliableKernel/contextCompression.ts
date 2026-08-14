@@ -48,6 +48,28 @@ export interface CreateCompressionCommand {
   /** Display-only facts frozen beside structured contents; Provider materialization ignores them. */
   summaryMetadata?: {
     trigger: 'auto' | 'manual';
+    triggerReason?: 'manual' | 'configured_threshold' | 'safe_input_limit';
+    triggerEstimatedTokens?: number;
+    configuredThresholdTokens?: number;
+    safeInputLimitTokens?: number;
+    effectiveTriggerTokens?: number;
+    requestBreakdown?: {
+      systemTokens: number;
+      toolSchemaTokens: number;
+      providerFramingTokens: number;
+      contextTokens: number;
+      currentInputTokens: number;
+      runtimeDeliveryTokens: number;
+      turnReminderTokens: number;
+      mediaTokens: number;
+      fixedTokens: number;
+      bodyTokens: number;
+      fullTokens: number;
+    };
+    estimatedTokensBefore?: number;
+    estimatedTokensAfter?: number;
+    providerInputTokens?: number;
+    providerOutputTokens?: number;
     /** Lightweight managed attachment directory; never includes bytes, SHA values or local paths. */
     attachmentCatalog?: AttachmentCatalogEntry[];
     methodKind: string;
@@ -749,6 +771,32 @@ function normalizeCompressionSummary(
       contents,
       ...(metadata ? {
         trigger: requireCompressionTrigger(metadata.trigger),
+        ...(metadata.triggerReason ? { triggerReason: requireCompressionTriggerReason(metadata.triggerReason) } : {}),
+        ...(metadata.triggerEstimatedTokens === undefined ? {} : {
+          triggerEstimatedTokens: requireEstimatedTokens(metadata.triggerEstimatedTokens, 'summaryMetadata.triggerEstimatedTokens')
+        }),
+        ...(metadata.configuredThresholdTokens === undefined ? {} : {
+          configuredThresholdTokens: requireEstimatedTokens(metadata.configuredThresholdTokens, 'summaryMetadata.configuredThresholdTokens')
+        }),
+        ...(metadata.safeInputLimitTokens === undefined ? {} : {
+          safeInputLimitTokens: requireEstimatedTokens(metadata.safeInputLimitTokens, 'summaryMetadata.safeInputLimitTokens')
+        }),
+        ...(metadata.effectiveTriggerTokens === undefined ? {} : {
+          effectiveTriggerTokens: requireEstimatedTokens(metadata.effectiveTriggerTokens, 'summaryMetadata.effectiveTriggerTokens')
+        }),
+        ...(metadata.requestBreakdown ? { requestBreakdown: requireRequestBreakdown(metadata.requestBreakdown) } : {}),
+        ...(metadata.estimatedTokensBefore === undefined ? {} : {
+          estimatedTokensBefore: requireEstimatedTokens(metadata.estimatedTokensBefore, 'summaryMetadata.estimatedTokensBefore')
+        }),
+        ...(metadata.estimatedTokensAfter === undefined ? {} : {
+          estimatedTokensAfter: requireEstimatedTokens(metadata.estimatedTokensAfter, 'summaryMetadata.estimatedTokensAfter')
+        }),
+        ...(metadata.providerInputTokens === undefined ? {} : {
+          providerInputTokens: requireEstimatedTokens(metadata.providerInputTokens, 'summaryMetadata.providerInputTokens')
+        }),
+        ...(metadata.providerOutputTokens === undefined ? {} : {
+          providerOutputTokens: requireEstimatedTokens(metadata.providerOutputTokens, 'summaryMetadata.providerOutputTokens')
+        }),
         ...(metadata.attachmentCatalog?.length ? {
           attachmentCatalog: normalizeAttachmentCatalog(metadata.attachmentCatalog, 'summaryMetadata.attachmentCatalog')
         } : {}),
@@ -772,6 +820,29 @@ function normalizeCompressionSummary(
     throw new TypeError(`Structured compression summary is not JSON serializable: ${String(error)}`);
   }
   return { content: encoded, contentType: CONTENT_TYPE_COMPRESSION_CONTENTS };
+}
+
+function requireCompressionTriggerReason(
+  value: unknown
+): 'manual' | 'configured_threshold' | 'safe_input_limit' {
+  if (value !== 'manual' && value !== 'configured_threshold' && value !== 'safe_input_limit') {
+    throw new TypeError('summaryMetadata.triggerReason is invalid.');
+  }
+  return value;
+}
+
+function requireRequestBreakdown(
+  value: NonNullable<NonNullable<CreateCompressionCommand['summaryMetadata']>['requestBreakdown']>
+): NonNullable<NonNullable<CreateCompressionCommand['summaryMetadata']>['requestBreakdown']> {
+  const fields: Array<keyof typeof value> = [
+    'systemTokens', 'toolSchemaTokens', 'providerFramingTokens', 'contextTokens',
+    'currentInputTokens', 'runtimeDeliveryTokens', 'turnReminderTokens', 'mediaTokens',
+    'fixedTokens', 'bodyTokens', 'fullTokens'
+  ];
+  return Object.fromEntries(fields.map((field) => [
+    field,
+    requireEstimatedTokens(value[field], `summaryMetadata.requestBreakdown.${field}`)
+  ])) as NonNullable<NonNullable<CreateCompressionCommand['summaryMetadata']>['requestBreakdown']>;
 }
 
 function requireCompressionTrigger(value: unknown): 'auto' | 'manual' {

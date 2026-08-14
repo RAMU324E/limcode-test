@@ -1479,7 +1479,11 @@ export class ClientDetailReader {
       requestKind,
       blockId: requirePhaseFId(recipe.blockId, 'compression recipe.blockId'),
       methodKind,
-      sourceSegmentCount
+      sourceSegmentCount,
+      ...(optionalCompressionTriggerReason(recipe.triggerReason) ? {
+        triggerReason: optionalCompressionTriggerReason(recipe.triggerReason)
+      } : {}),
+      ...compressionPresentationTokens(recipe)
     })), 'utf8');
   }
 
@@ -1516,10 +1520,13 @@ export class ClientDetailReader {
     if (trigger !== 'auto' && trigger !== 'manual') {
       throw new TypeError(`CompressionBlock ${recordId} has an invalid trigger.`);
     }
+    const triggerReason = optionalCompressionTriggerReason(summary.triggerReason);
     return Buffer.from(JSON.stringify(toWirePlain({
       title,
       trigger,
-      methodKind: requireCompressionMethodKind(summary.methodKind)
+      methodKind: requireCompressionMethodKind(summary.methodKind),
+      ...(triggerReason ? { triggerReason } : {}),
+      ...compressionPresentationTokens(summary)
     })), 'utf8');
   }
 
@@ -1755,6 +1762,35 @@ function requireFileChangeOperation(value: unknown): 'create_file' | 'replace_fi
     throw new TypeError(`Unsupported FileChangeSetMember operation: ${String(value)}.`);
   }
   return value as 'create_file' | 'replace_file' | 'delete_file' | 'create_directory' | 'delete_directory_tree';
+}
+
+function optionalCompressionTriggerReason(
+  value: unknown
+): 'manual' | 'configured_threshold' | 'safe_input_limit' | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'manual' || value === 'configured_threshold' || value === 'safe_input_limit') return value;
+  throw new TypeError(`Unsupported compression trigger reason: ${String(value)}.`);
+}
+
+function compressionPresentationTokens(summary: Record<string, unknown>): Record<string, number> {
+  const fields = [
+    'triggerEstimatedTokens',
+    'configuredThresholdTokens',
+    'safeInputLimitTokens',
+    'effectiveTriggerTokens',
+    'estimatedTokensBefore',
+    'estimatedTokensAfter',
+    'providerInputTokens',
+    'providerOutputTokens'
+  ] as const;
+  return Object.fromEntries(fields.flatMap((field) => {
+    const value = summary[field];
+    if (value === undefined) return [];
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+      throw new TypeError(`Compression presentation ${field} must be a non-negative safe integer.`);
+    }
+    return [[field, value] as const];
+  }));
 }
 
 function requireCompressionMethodKind(value: unknown): string {

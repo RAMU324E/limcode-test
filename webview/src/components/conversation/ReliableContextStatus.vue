@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import {
+  DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  DEFAULT_LLM_CONTEXT_ESTIMATOR_SLACK_TOKENS,
   type LlmProviderConfigRecord,
   type LlmUsageMetadataRecord
 } from '@shared/protocol';
@@ -55,6 +57,22 @@ const contextWindowTokens = computed(() =>
   ?? positiveInteger(modelConfig.value?.contextWindowTokens)
   ?? positiveInteger(providerConfig.value?.contextWindowTokens)
 );
+const maxOutputTokens = computed(() =>
+  positiveInteger(latestRequest.value?.max_output_tokens)
+  ?? positiveInteger(latestRequest.value?.maxOutputTokens)
+  ?? nestedGenerationToken(latestRequest.value?.model_profile_json)
+  ?? positiveInteger(modelConfig.value?.generationConfig?.maxOutputTokens)
+  ?? positiveInteger(providerConfig.value?.generationConfig?.maxOutputTokens)
+  ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS
+);
+const safeInputLimitTokens = computed(() => contextWindowTokens.value === undefined
+  ? undefined
+  : Math.max(
+      0,
+      contextWindowTokens.value
+        - Math.max(DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, maxOutputTokens.value)
+        - DEFAULT_LLM_CONTEXT_ESTIMATOR_SLACK_TOKENS
+    ));
 const exactUsage = computed(() => {
   if (ordinaryUsageStale.value) return undefined;
   const requestId = text(latestOrdinaryRequest.value?.id);
@@ -91,6 +109,13 @@ const thresholdTokens = computed(() =>
   ?? nestedToken(latestRequest.value?.model_profile_json, 'compressionThresholdTokens', 'compression_threshold_tokens')
   ?? configuredCompressionThreshold(contextWindowTokens.value)
 );
+const effectiveTriggerTokens = computed(() => {
+  const configured = thresholdTokens.value;
+  const safe = safeInputLimitTokens.value;
+  if (configured === undefined) return safe;
+  if (safe === undefined) return configured;
+  return Math.min(configured, safe);
+});
 const usageRatio = computed(() => actualContextTokens.value !== undefined && contextWindowTokens.value !== undefined
   ? actualContextTokens.value / contextWindowTokens.value
   : undefined);
@@ -98,8 +123,8 @@ const fillStyle = computed(() => ({
   width: usageRatio.value === undefined ? '0%' : `${Math.max(0, Math.min(1, usageRatio.value)) * 100}%`
 }));
 const thresholdStyle = computed(() => ({
-  left: contextWindowTokens.value && thresholdTokens.value
-    ? `${Math.max(0, Math.min(100, thresholdTokens.value / contextWindowTokens.value * 100))}%`
+  left: contextWindowTokens.value && effectiveTriggerTokens.value !== undefined
+    ? `${Math.max(0, Math.min(100, effectiveTriggerTokens.value / contextWindowTokens.value * 100))}%`
     : '100%'
 }));
 const compactLabel = computed(() => {
@@ -114,12 +139,18 @@ const tooltipRows = computed(() => [
   { label: '当前上下文', value: contextUsageLabel() },
   { label: '上下文窗口', value: contextWindowTokens.value === undefined ? '未知（暂未获取，且配置中未设置）' : `${formatTokenNumber(contextWindowTokens.value)} Token` },
   { label: '窗口占用', value: percentLabel.value },
-  { label: '压缩阈值', value: thresholdTokens.value === undefined ? '未知' : `${formatTokenNumber(thresholdTokens.value)} Token` },
+  { label: '配置压缩阈值', value: tokenValueLabel(thresholdTokens.value) },
+  { label: '安全输入上限', value: tokenValueLabel(safeInputLimitTokens.value) },
+  { label: '有效触发线', value: tokenValueLabel(effectiveTriggerTokens.value) },
+  {
+    label: '安全预留',
+    value: `${formatTokenNumber(Math.max(DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, maxOutputTokens.value))} 输出 + ${formatTokenNumber(DEFAULT_LLM_CONTEXT_ESTIMATOR_SLACK_TOKENS)} 估算误差 Token`
+  },
   { label: '数据来源', value: usageSourceLabel() }
 ]);
 const overThreshold = computed(() => actualContextTokens.value !== undefined
-  && thresholdTokens.value !== undefined
-  && actualContextTokens.value >= thresholdTokens.value);
+  && effectiveTriggerTokens.value !== undefined
+  && actualContextTokens.value >= effectiveTriggerTokens.value);
 
 function activeProviderConfig(): LlmProviderConfigRecord | undefined {
   const providerId = text(latestRequest.value?.provider_id);
@@ -197,6 +228,16 @@ function usageSourceLabel(): string {
   return latestRequest.value ? 'LLM 请求 / 当前 LLM 配置' : '当前 LLM 配置';
 }
 
+function nestedGenerationToken(value: unknown): number | undefined {
+  const source = asRecord(typeof value === 'string' ? parseJson(value) : value);
+  const generation = asRecord(source?.generationConfig ?? source?.generation_config);
+  return positiveInteger(generation?.maxOutputTokens ?? generation?.max_output_tokens);
+}
+
+function tokenValueLabel(value: number | undefined): string {
+  return value === undefined ? '未知' : `${formatTokenNumber(value)} Token`;
+}
+
 function nestedToken(value: unknown, ...keys: string[]): number | undefined {
   const source = asRecord(typeof value === 'string' ? parseJson(value) : value);
   if (!source) return undefined;
@@ -264,7 +305,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     <button type="button" class="reliable-context-button" :aria-label="`LLM 上下文 ${compactLabel}`">
       <span class="reliable-context-track" aria-hidden="true">
         <span class="reliable-context-fill" :style="fillStyle"></span>
-        <span v-if="thresholdTokens && contextWindowTokens" class="reliable-context-threshold" :style="thresholdStyle"></span>
+        <span v-if="effectiveTriggerTokens !== undefined && contextWindowTokens" class="reliable-context-threshold" :style="thresholdStyle"></span>
       </span>
       <span class="reliable-context-label">{{ compactLabel }}</span>
     </button>

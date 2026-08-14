@@ -14,6 +14,11 @@ export interface ReliableCompressionRequestPurpose {
   blockId: string;
   methodKind: string;
   sourceSegmentCount: number;
+  triggerReason?: 'manual' | 'configured_threshold' | 'safe_input_limit';
+  triggerEstimatedTokens?: number;
+  configuredThresholdTokens?: number;
+  safeInputLimitTokens?: number;
+  effectiveTriggerTokens?: number;
 }
 
 /**
@@ -65,6 +70,7 @@ export function parseReliableCompressionRequestPurpose(
   const blockId = text(record.blockId);
   const methodKind = text(record.methodKind);
   const sourceSegmentCount = integer(record.sourceSegmentCount);
+  const triggerReason = compressionTriggerReason(record.triggerReason);
   if (
     (trigger !== 'auto' && trigger !== 'manual')
     || (requestKind !== 'context_compression_pre' && requestKind !== 'context_compression_manual')
@@ -79,8 +85,35 @@ export function parseReliableCompressionRequestPurpose(
     requestKind,
     blockId,
     methodKind,
-    sourceSegmentCount
+    sourceSegmentCount,
+    ...(triggerReason ? { triggerReason } : {}),
+    ...optionalTokenFields(record)
   };
+}
+
+function compressionTriggerReason(
+  value: unknown
+): ReliableCompressionRequestPurpose['triggerReason'] {
+  return value === 'manual' || value === 'configured_threshold' || value === 'safe_input_limit'
+    ? value
+    : undefined;
+}
+
+function optionalTokenFields(record: Record<string, unknown>): Pick<
+  ReliableCompressionRequestPurpose,
+  'triggerEstimatedTokens' | 'configuredThresholdTokens' | 'safeInputLimitTokens' | 'effectiveTriggerTokens'
+> {
+  const result: Record<string, number> = {};
+  for (const field of [
+    'triggerEstimatedTokens',
+    'configuredThresholdTokens',
+    'safeInputLimitTokens',
+    'effectiveTriggerTokens'
+  ] as const) {
+    const value = record[field];
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) result[field] = value;
+  }
+  return result;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

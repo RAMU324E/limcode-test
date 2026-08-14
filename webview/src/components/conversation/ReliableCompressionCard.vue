@@ -13,6 +13,7 @@ import {
 } from '@shared/protocol';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
+import { formatTokenNumber } from './tokenUsageModel';
 
 const props = defineProps<{
   block: Record<string, unknown>;
@@ -80,15 +81,84 @@ const summaryText = computed(() => renderContents(envelope.value.contents));
 const providerNative = computed(() => envelope.value.contents.some((content) =>
   content.parts.some((part) => isProviderContextPart(part))
 ));
-const beforeTokens = computed(() => nonNegativeInteger(envelope.value.estimatedTokensBefore));
-const afterTokens = computed(() => nonNegativeInteger(envelope.value.estimatedTokensAfter));
+const beforeTokens = computed(() => firstToken(
+  props.block.estimated_tokens_before,
+  props.block.estimatedTokensBefore,
+  presentation.value.estimatedTokensBefore,
+  envelope.value.estimatedTokensBefore
+));
+const afterTokens = computed(() => firstToken(
+  props.block.estimated_tokens_after,
+  props.block.estimatedTokensAfter,
+  presentation.value.estimatedTokensAfter,
+  envelope.value.estimatedTokensAfter
+));
 const savedTokens = computed(() => beforeTokens.value !== undefined && afterTokens.value !== undefined
   ? Math.max(0, beforeTokens.value - afterTokens.value)
   : undefined);
+const triggerReason = computed(() =>
+  stringValue(props.block.trigger_reason ?? props.block.triggerReason)
+  || presentation.value.triggerReason
+  || envelope.value.triggerReason
+);
+const triggerEstimatedTokens = computed(() => firstToken(
+  props.block.trigger_estimated_tokens,
+  props.block.triggerEstimatedTokens,
+  presentation.value.triggerEstimatedTokens,
+  envelope.value.triggerEstimatedTokens
+));
+const configuredThresholdTokens = computed(() => firstToken(
+  props.block.configured_threshold_tokens,
+  props.block.configuredThresholdTokens,
+  presentation.value.configuredThresholdTokens,
+  envelope.value.configuredThresholdTokens
+));
+const safeInputLimitTokens = computed(() => firstToken(
+  props.block.safe_input_limit_tokens,
+  props.block.safeInputLimitTokens,
+  presentation.value.safeInputLimitTokens,
+  envelope.value.safeInputLimitTokens
+));
+const effectiveTriggerTokens = computed(() => firstToken(
+  props.block.effective_trigger_tokens,
+  props.block.effectiveTriggerTokens,
+  presentation.value.effectiveTriggerTokens,
+  envelope.value.effectiveTriggerTokens
+));
+const providerInputTokens = computed(() => firstToken(
+  presentation.value.providerInputTokens,
+  envelope.value.providerInputTokens
+));
+const providerOutputTokens = computed(() => firstToken(
+  presentation.value.providerOutputTokens,
+  envelope.value.providerOutputTokens
+));
+const triggerLabel = computed(() => {
+  const observed = triggerEstimatedTokens.value;
+  const suffix = observed === undefined ? '' : `（当时估算 ${formatTokenNumber(observed)} Token）`;
+  if (triggerReason.value === 'configured_threshold') return `配置阈值触发${suffix}`;
+  if (triggerReason.value === 'safe_input_limit') return `安全输入上限触发${suffix}`;
+  if (triggerReason.value === 'manual' || trigger.value === 'manual') return '手动触发';
+  return trigger.value === 'auto' ? `自动触发${suffix}` : '';
+});
+const diagnosticRows = computed(() => [
+  { label: '触发原因', value: triggerLabel.value },
+  { label: '触发时完整请求估算', value: tokenLabel(triggerEstimatedTokens.value) },
+  { label: '配置压缩阈值', value: tokenLabel(configuredThresholdTokens.value) },
+  { label: '安全输入上限', value: tokenLabel(safeInputLimitTokens.value) },
+  { label: '有效触发线', value: tokenLabel(effectiveTriggerTokens.value) },
+  { label: '触发时请求构成', value: envelope.value.requestBreakdownLabel ?? '' },
+  { label: '压缩前估算', value: tokenLabel(beforeTokens.value) },
+  { label: '压缩后估算', value: tokenLabel(afterTokens.value) },
+  { label: '压缩 Provider 实际输入', value: tokenLabel(providerInputTokens.value) },
+  { label: '压缩 Provider 实际输出', value: tokenLabel(providerOutputTokens.value) },
+  { label: '保留附件目录', value: envelope.value.attachmentCount === undefined ? '' : `${envelope.value.attachmentCount} 项（无正文）` }
+].filter((row) => row.value));
 const subtitle = computed(() => {
-  if (status.value === 'pending') return `${methodLabel.value} · 正在准备上下文压缩`;
-  if (status.value === 'running') return `${methodLabel.value} · 正在压缩上下文`;
-  if (status.value === 'committing') return `${methodLabel.value} · 压缩已完成，正在保存结果`;
+  const activityPrefix = [methodLabel.value, triggerLabel.value].filter(Boolean).join(' · ');
+  if (status.value === 'pending') return `${activityPrefix} · 正在准备上下文压缩`;
+  if (status.value === 'running') return `${activityPrefix} · 正在压缩上下文`;
+  if (status.value === 'committing') return `${activityPrefix} · 压缩已完成，正在保存结果`;
   if (status.value === 'retrying') {
     const reason = stringValue(props.block.retry_reason_label) || '压缩连接异常';
     const seconds = nonNegativeInteger(props.block.retry_delay_seconds) ?? 0;
@@ -96,9 +166,9 @@ const subtitle = computed(() => {
     const maximum = nonNegativeInteger(props.block.retry_max_attempts) ?? attempt;
     return `${reason} · ${seconds} 秒后自动恢复${attempt > 0 ? `（第 ${attempt}/${maximum} 次）` : ''}`;
   }
-  const facts = [methodLabel.value];
+  const facts = [methodLabel.value, triggerLabel.value];
   if (sourceCount.value !== undefined) facts.push(`${sourceCount.value} 个上下文段`);
-  if (savedTokens.value !== undefined) facts.push(`节省约 ${savedTokens.value} Token`);
+  if (savedTokens.value !== undefined) facts.push(`节省约 ${formatTokenNumber(savedTokens.value)} Token`);
   return facts.join(' · ');
 });
 
@@ -129,13 +199,27 @@ async function copySummary(): Promise<void> {
   window.setTimeout(() => { copied.value = false; }, 1200);
 }
 
-function parseEnvelope(text: string): {
+interface CompressionDiagnosticData {
+  triggerReason?: string;
+  triggerEstimatedTokens?: number;
+  configuredThresholdTokens?: number;
+  safeInputLimitTokens?: number;
+  effectiveTriggerTokens?: number;
+  estimatedTokensBefore?: number;
+  estimatedTokensAfter?: number;
+  providerInputTokens?: number;
+  providerOutputTokens?: number;
+  attachmentCount?: number;
+  requestBreakdownLabel?: string;
+}
+
+interface ParsedCompressionEnvelope extends CompressionDiagnosticData {
   trigger?: string;
   methodKind?: string;
   contents: MessageContent[];
-  estimatedTokensBefore?: number;
-  estimatedTokensAfter?: number;
-} {
+}
+
+function parseEnvelope(text: string): ParsedCompressionEnvelope {
   if (!text.trim()) return { contents: [] };
   try {
     const parsed = JSON.parse(text) as unknown;
@@ -147,19 +231,22 @@ function parseEnvelope(text: string): {
       contents,
       ...(stringValue(record.trigger) ? { trigger: stringValue(record.trigger) } : {}),
       ...(stringValue(record.methodKind ?? record.method_kind) ? { methodKind: stringValue(record.methodKind ?? record.method_kind) } : {}),
-      ...(nonNegativeInteger(record.estimatedTokensBefore ?? record.estimated_tokens_before) !== undefined
-        ? { estimatedTokensBefore: nonNegativeInteger(record.estimatedTokensBefore ?? record.estimated_tokens_before) }
+      ...parseDiagnosticFields(record),
+      ...(requestBreakdownLabel(record.requestBreakdown ?? record.request_breakdown)
+        ? { requestBreakdownLabel: requestBreakdownLabel(record.requestBreakdown ?? record.request_breakdown) }
         : {}),
-      ...(nonNegativeInteger(record.estimatedTokensAfter ?? record.estimated_tokens_after) !== undefined
-        ? { estimatedTokensAfter: nonNegativeInteger(record.estimatedTokensAfter ?? record.estimated_tokens_after) }
-        : {})
+      ...(Array.isArray(record.attachmentCatalog) ? { attachmentCount: record.attachmentCatalog.length } : {})
     };
   } catch {
     return { contents: [{ role: 'user', parts: [{ text }] }] };
   }
 }
 
-function parsePresentation(text: string): { title?: string; trigger?: string; methodKind?: string } {
+function parsePresentation(text: string): CompressionDiagnosticData & {
+  title?: string;
+  trigger?: string;
+  methodKind?: string;
+} {
   if (!text.trim()) return {};
   try {
     const record = asRecord(JSON.parse(text) as unknown);
@@ -167,11 +254,62 @@ function parsePresentation(text: string): { title?: string; trigger?: string; me
     return {
       ...(stringValue(record.title) ? { title: stringValue(record.title) } : {}),
       ...(stringValue(record.trigger) ? { trigger: stringValue(record.trigger) } : {}),
-      ...(stringValue(record.methodKind) ? { methodKind: stringValue(record.methodKind) } : {})
+      ...(stringValue(record.methodKind) ? { methodKind: stringValue(record.methodKind) } : {}),
+      ...parseDiagnosticFields(record)
     };
   } catch {
     return {};
   }
+}
+
+function parseDiagnosticFields(record: Record<string, unknown>): CompressionDiagnosticData {
+  const result: CompressionDiagnosticData = {};
+  const triggerReason = stringValue(record.triggerReason ?? record.trigger_reason);
+  if (triggerReason) result.triggerReason = triggerReason;
+  for (const [field, aliases] of Object.entries({
+    triggerEstimatedTokens: ['triggerEstimatedTokens', 'trigger_estimated_tokens'],
+    configuredThresholdTokens: ['configuredThresholdTokens', 'configured_threshold_tokens'],
+    safeInputLimitTokens: ['safeInputLimitTokens', 'safe_input_limit_tokens'],
+    effectiveTriggerTokens: ['effectiveTriggerTokens', 'effective_trigger_tokens'],
+    estimatedTokensBefore: ['estimatedTokensBefore', 'estimated_tokens_before'],
+    estimatedTokensAfter: ['estimatedTokensAfter', 'estimated_tokens_after'],
+    providerInputTokens: ['providerInputTokens', 'provider_input_tokens'],
+    providerOutputTokens: ['providerOutputTokens', 'provider_output_tokens']
+  } as const)) {
+    const value = firstToken(...aliases.map((alias) => record[alias]));
+    if (value !== undefined) (result as Record<string, unknown>)[field] = value;
+  }
+  return result;
+}
+
+function requestBreakdownLabel(value: unknown): string {
+  const record = asRecord(value);
+  if (!record) return '';
+  const rows = [
+    ['系统', firstToken(record.systemTokens, record.system_tokens)],
+    ['工具定义', firstToken(record.toolSchemaTokens, record.tool_schema_tokens)],
+    ['上下文', firstToken(record.contextTokens, record.context_tokens)],
+    ['当前输入', firstToken(record.currentInputTokens, record.current_input_tokens)],
+    ['运行时结果', firstToken(record.runtimeDeliveryTokens, record.runtime_delivery_tokens)],
+    ['提醒', firstToken(record.turnReminderTokens, record.turn_reminder_tokens)]
+  ] as const;
+  return rows
+    .flatMap(([label, count]) => count === undefined
+      ? []
+      : [`${label} ${formatTokenNumber(count)}`])
+    .join(' · ');
+}
+
+function firstToken(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const normalized = nonNegativeInteger(value);
+    if (normalized !== undefined) return normalized;
+  }
+  return undefined;
+}
+
+function tokenLabel(value: number | undefined): string {
+  return value === undefined ? '' : `${formatTokenNumber(value)} Token`;
 }
 
 function normalizeContents(value: unknown): MessageContent[] {
@@ -262,6 +400,12 @@ function nonNegativeInteger(value: unknown): number | undefined {
       <p v-if="contentDetail?.status === 'loading' || !contentDetail">正在读取压缩结果…</p>
       <p v-else-if="contentDetail.status === 'error'" data-testid="compression-detail-error">{{ contentDetail.error || '压缩详情读取失败' }}</p>
       <template v-else>
+        <dl v-if="diagnosticRows.length" class="compression-diagnostics" data-testid="compression-diagnostics">
+          <div v-for="row in diagnosticRows" :key="row.label">
+            <dt>{{ row.label }}</dt>
+            <dd>{{ row.value }}</dd>
+          </div>
+        </dl>
         <p v-if="providerNative" class="compression-provider-note">该块保留 OpenAI Responses 专用上下文；下一次请求会按原有结构复用，不会转换成 Markdown。</p>
         <pre v-if="summaryText" data-testid="compression-detail-summary">{{ summaryText }}</pre>
         <p v-else>压缩结果没有可见文本，但可能包含渠道专用上下文。</p>
@@ -299,6 +443,10 @@ function nonNegativeInteger(value: unknown): number | undefined {
 .compression-card-dismiss:focus-visible { color: var(--vscode-foreground); border-color: var(--vscode-panel-border); background: color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%); outline: none; }
 .compression-card-detail { display: grid; gap: var(--space-2); padding: 0 var(--space-3) var(--space-3) calc(var(--space-3) + 40px); }
 .compression-card-detail p { margin: 0; color: var(--vscode-descriptionForeground); }
+.compression-diagnostics { display: grid; gap: 3px; margin: 0; padding: var(--space-2); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-sm); }
+.compression-diagnostics > div { display: grid; grid-template-columns: minmax(128px, 0.7fr) minmax(0, 1fr); gap: var(--space-2); }
+.compression-diagnostics dt { color: var(--vscode-descriptionForeground); }
+.compression-diagnostics dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .compression-card-detail pre { max-height: 320px; margin: 0; padding: var(--space-2); overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-sm); font: inherit; }
 .compression-copy { justify-self: start; display: inline-flex; align-items: center; gap: 6px; }
 @keyframes compression-pulse {

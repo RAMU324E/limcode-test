@@ -16,7 +16,8 @@ import { ContextSequenceControlPlane, type StructuralContextRecord } from './con
 import { frozenCompressionPolicy, frozenContextProfile, readFrozenTurnAuthority } from './frozenAuthority';
 import {
   compressionOutputTokens,
-  estimateMessageContentsTokens
+  estimateMessageContentsTokens,
+  providerPromptTokens
 } from './contextTokenEstimator';
 import {
   MODEL_BODY_TARGET_TOKENS,
@@ -93,6 +94,7 @@ export type CoordinateCompressionResult =
   | {
       status: 'compressed';
       trigger: CompressionTrigger;
+      triggerReason: CompressionTriggerReason;
       modelRequestId: string;
       sourceRootId: string;
       sourceSegmentCount: number;
@@ -170,6 +172,13 @@ export class ReliableContextCompressionCoordinator {
         )
       };
     }
+    const triggerReason: CompressionTriggerReason = trigger === 'manual'
+      ? 'manual'
+      : automaticReason!;
+    const effectiveTriggerTokens = Math.min(
+      requestBudget.compressionThresholdTokens,
+      requestBudget.estimatedInputLimitTokens
+    );
     const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
     const protectedCurrentInputTokens = command.protectedCurrentInputTokens === undefined
       ? 0
@@ -265,6 +274,12 @@ export class ReliableContextCompressionCoordinator {
         kind: 'reliable-context-compression',
         requestKind: trigger === 'auto' ? 'context_compression_pre' : 'context_compression_manual',
         trigger,
+        triggerReason,
+        triggerEstimatedTokens: requestBudget.estimatedFullInputTokens,
+        configuredThresholdTokens: requestBudget.compressionThresholdTokens,
+        safeInputLimitTokens: requestBudget.estimatedInputLimitTokens,
+        effectiveTriggerTokens,
+        requestBreakdown: requestBudget.breakdown,
         sourceRootId: headRootId,
         sourceSegmentCount,
         sourceHash,
@@ -327,7 +342,9 @@ export class ReliableContextCompressionCoordinator {
     const combinedCatalogTokens = combinedCatalogContent
       ? estimateMessageContentsTokens([combinedCatalogContent])
       : 0;
-    const providerSummaryTokens = compressionOutputTokens(completed.usage)
+    const providerInputTokens = providerPromptTokens(completed.usage);
+    const providerOutputTokens = compressionOutputTokens(completed.usage);
+    const providerSummaryTokens = providerOutputTokens
       ?? estimateMessageContentsTokens(summary);
     const summaryEstimatedTokens = providerSummaryTokens + sourceCatalogTokens;
     const tailProjectedTokens = projectMaterializedSegmentsTokens(tailSegments);
@@ -364,6 +381,16 @@ export class ReliableContextCompressionCoordinator {
       summary,
       summaryMetadata: {
         trigger,
+        triggerReason,
+        triggerEstimatedTokens: requestBudget.estimatedFullInputTokens,
+        configuredThresholdTokens: requestBudget.compressionThresholdTokens,
+        safeInputLimitTokens: requestBudget.estimatedInputLimitTokens,
+        effectiveTriggerTokens,
+        requestBreakdown: requestBudget.breakdown,
+        estimatedTokensBefore: requestBudget.estimatedFullInputTokens,
+        estimatedTokensAfter: projectedTokens,
+        ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
+        ...(providerOutputTokens === undefined ? {} : { providerOutputTokens }),
         ...(sourceAttachmentCatalog.length > 0 ? { attachmentCatalog: sourceAttachmentCatalog } : {}),
         methodKind: policy.methodKind,
         estimatedTokens: summaryEstimatedTokens,
@@ -377,6 +404,7 @@ export class ReliableContextCompressionCoordinator {
     return {
       status: 'compressed',
       trigger,
+      triggerReason,
       modelRequestId: expectedModelRequestId,
       sourceRootId: headRootId,
       sourceSegmentCount,
