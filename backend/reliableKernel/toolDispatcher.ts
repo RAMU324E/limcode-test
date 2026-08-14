@@ -11,7 +11,8 @@ import {
   type SkillDefinitionRecord,
   type SkillPolicyRecord,
   type ToolDefinitionMetadataRecord,
-  type ToolPolicyToolConfigRecord
+  type ToolPolicyToolConfigRecord,
+  type WorkEnvironmentRecord
 } from '../../shared/protocol';
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import {
@@ -30,6 +31,13 @@ import {
 } from '../world/modules/tools/definitions/runAgent';
 import { isSkillEnabledByPolicy } from '../world/modules/skill/policy';
 import { composeSkillsToolDescription } from '../world/modules/skill/skillDescription';
+import {
+  SWITCH_WORK_ENVIRONMENTS_TITLE,
+  TRANSFER_WORK_ENVIRONMENTS_TITLE,
+  workEnvironmentListText,
+  withTransferEnvironmentParameterHints,
+  withWorkEnvironmentIdParameterHints
+} from '../world/modules/workEnvironment/toolDescription';
 import type { ToolDefinition, ToolResultOut, ToolRuntimeEvent } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDefinition,
@@ -92,6 +100,10 @@ export interface ReliableToolDispatcherHost {
   definitions(): Promise<ToolDefinition[]> | ToolDefinition[];
   /** 磁盘扫描出的技能目录快照；用于把可用技能列表拼进 skills 工具描述。 */
   skillDefinitions?(): SkillDefinitionRecord[];
+  /** 按冻结 authority 解析出的工作环境边界；用于把环境列表拼进 switch/transfer 工具描述。 */
+  workEnvironmentsForAuthority?(
+    authority: ReliableToolDispatchAuthority
+  ): Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
   /** Pure/repeatable capability call. The dispatcher persists its returned result before finalization. */
   executeNoEffect?(
     definition: ToolDefinition,
@@ -1420,7 +1432,57 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
       && (definition.declaration.name !== RUN_AGENT_TOOL_NAME || exposeRunAgent)
     );
-    return this.augmentSkillsDefinition(allowed, authority.document);
+    const withSkills = this.augmentSkillsDefinition(allowed, authority.document);
+    return this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
+  }
+
+  /**
+   * 把冻结策略允许的工作环境列表拼进 switch_work_environment / transfer 工具描述与参数提示。
+   * 环境解析失败时保持原声明（降级为静态描述），不拖垮整个 Turn 的 schema 构建。
+   */
+  private async augmentWorkEnvironmentDefinitions(
+    definitions: ToolDefinition[],
+    authority: ReliableToolDispatchAuthority,
+    switchingEnabled: boolean
+  ): Promise<ToolDefinition[]> {
+    if (!switchingEnabled) return definitions;
+    const host = this.dependencies.host;
+    if (!host.workEnvironmentsForAuthority) return definitions;
+    const hasEnvironmentTool = definitions.some((definition) => WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name));
+    if (!hasEnvironmentTool) return definitions;
+    let environments: WorkEnvironmentRecord[];
+    try {
+      environments = (await host.workEnvironmentsForAuthority(authority)).allowed;
+    } catch {
+      return definitions;
+    }
+    return definitions.map((definition) => {
+      if (definition.declaration.name === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
+        const environmentText = workEnvironmentListText(environments, SWITCH_WORK_ENVIRONMENTS_TITLE);
+        const baseDescription = typeof definition.declaration.description === 'string' ? definition.declaration.description : '';
+        return {
+          ...definition,
+          declaration: {
+            ...definition.declaration,
+            description: [baseDescription, environmentText].filter(Boolean).join('\n\n'),
+            parameters: withWorkEnvironmentIdParameterHints(definition.declaration.parameters, environmentText) as typeof definition.declaration.parameters
+          }
+        };
+      }
+      if (definition.declaration.name === TRANSFER_TOOL_NAME) {
+        const environmentText = workEnvironmentListText(environments, TRANSFER_WORK_ENVIRONMENTS_TITLE);
+        const baseDescription = typeof definition.declaration.description === 'string' ? definition.declaration.description : '';
+        return {
+          ...definition,
+          declaration: {
+            ...definition.declaration,
+            description: [baseDescription, environmentText].filter(Boolean).join('\n\n'),
+            parameters: withTransferEnvironmentParameterHints(definition.declaration.parameters, environmentText) as typeof definition.declaration.parameters
+          }
+        };
+      }
+      return definition;
+    });
   }
 
   /**

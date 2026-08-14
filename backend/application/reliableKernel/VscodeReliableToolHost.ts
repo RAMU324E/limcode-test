@@ -291,6 +291,14 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     return resolvePathInsideBoundary(active.id, active.rootPath, inputPath);
   }
 
+  /** 供 toolDispatcher 构建模型可见的工作环境列表；与执行时路径边界共用同一份解析与缓存。 */
+  public async workEnvironmentsForAuthority(authority: ReliableToolDispatchAuthority): Promise<{
+    active?: WorkEnvironmentRecord;
+    allowed: WorkEnvironmentRecord[];
+  }> {
+    return this.resolveEnvironments(authority);
+  }
+
   private async resolveEnvironments(authority: ReliableToolDispatchAuthority): Promise<{
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
