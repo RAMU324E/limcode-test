@@ -2347,11 +2347,17 @@ async function checkImmutableReplacement() {
     const seeded = await seedTurn(ctx, 'replacement', { thresholdTokens: 2 });
     const context = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
     for (let index = 0; index < 5; index += 1) {
+      const projected = runtimeDeliveryFixture(
+        `replacement-${index}`,
+        seeded.turnId,
+        `replacement-original-${index}`
+      );
       await context.appendContent({
         conversationId: seeded.conversationId,
         segmentKind: 'runtime_context',
         source: { sourceKind: 'runtime_context', sourceId: `replacement-${index}`, sourceRevision: '0' },
-        content: `replacement-original-${index}`, contentType: 'text/plain'
+        content: projected.content,
+        contentType: projected.contentType
       });
     }
     const sourceRootId = await context.currentHeadRootId(seeded.conversationId);
@@ -2925,11 +2931,13 @@ async function checkImmutableReplacement() {
       idempotencyKey: 'stale-race-replacement'
     });
     await published;
+    const raceDelivery = runtimeDeliveryFixture('race-head-append', seeded.turnId, 'new-current-head');
     const append = await context.appendContent({
       conversationId: seeded.conversationId,
       segmentKind: 'runtime_context',
       source: { sourceKind: 'runtime_context', sourceId: 'race-head-append', sourceRevision: '0' },
-      content: 'new-current-head', contentType: 'text/plain'
+      content: raceDelivery.content,
+      contentType: raceDelivery.contentType
     });
     releaseResolve();
     await assert.rejects(stalePromise, /head changed|assertion failed/i);
@@ -3096,8 +3104,33 @@ function createTurnControl(ctx, suffix, options = {}) {
   });
 }
 
-async function appendMessageContextFixture(ctx, seeded, suffix, role, content) {
-  const contentObject = await ctx.store.ingest(ctx.database, content, 'text/plain');
+function runtimeDeliveryFixture(suffix, targetTurnId, output) {
+  const processId = `fixture-process-${suffix}`;
+  const processReceiptId = `fixture-process-receipt-${suffix}`;
+  const projected = kernel.projectRuntimeDeliveryForModel({
+    phase: 'current_turn',
+    kind: 'process_completion',
+    deliveryId: `fixture-delivery-${suffix}`,
+    inboxItemId: `fixture-inbox-${suffix}`,
+    targetTurnId,
+    deliveredAt: '2026-01-01T00:00:00.000Z',
+    processId,
+    processReceiptId,
+    content: { kind: 'process_completion', processId, processReceiptId, output }
+  });
+  assert.ok(projected, 'current_turn Runtime Delivery must be model-visible');
+  return projected;
+}
+
+async function appendMessageContextFixture(
+  ctx,
+  seeded,
+  suffix,
+  role,
+  content,
+  contentType = 'text/plain'
+) {
+  const contentObject = await ctx.store.ingest(ctx.database, content, contentType);
   const messageId = `context-message-${suffix}`;
   const revisionId = `context-message-revision-${suffix}`;
   const now = new Date().toISOString();

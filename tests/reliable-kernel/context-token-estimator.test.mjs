@@ -111,6 +111,71 @@ test('tool_pair只估算实际重传的functionResponse，不重复计算历史�
   assert.ok(estimated < 100, `tool response estimate should exclude stored arguments, got ${estimated}`);
 });
 
+test('大批搜索结果按模型投影计量，不会把约250K请求误判为452K并提前压缩', () => {
+  const calls = ['advanced', 'search-a', 'search-b', 'search-c'].map((name) => ({
+    id: `call-${name}`,
+    functionCall: { name: `exa_${name}`, args: { query: name } }
+  }));
+  const segments = [
+    segment('message', MESSAGE_TYPE, JSON.stringify({
+      role: 'user', parts: [{ text: 'existing projected history' }]
+    }), 'user'),
+    segment('message', MESSAGE_TYPE, JSON.stringify({ role: 'model', parts: calls }), 'model'),
+    ...calls.map((call, index) => segment('tool_pair', TOOL_PAIR_TYPE, JSON.stringify({
+      kind: 'tool_pair',
+      toolCall: {
+        id: call.id,
+        providerCallId: call.id,
+        toolName: call.functionCall.name,
+        argumentsContentType: 'application/json',
+        arguments: JSON.stringify(call.functionCall.args)
+      },
+      toolModelResult: {
+        id: `result-${index}`,
+        resultContentType: 'application/json',
+        result: JSON.stringify({ ok: true, detail: { operations: 'x'.repeat(400_000 - index * 20_000) } })
+      }
+    })))
+  ];
+  const covered = kernel.estimateMaterializedContextTokens(segments.slice(0, 2));
+  const current = kernel.estimateMaterializedContextTokens(segments);
+  const projectedDelta = current - covered;
+  const rawToolTokens = segments.slice(2).reduce((total, item) =>
+    total + kernel.estimateContextSegmentTokens(item), 0);
+
+  assert.ok(rawToolTokens > 200_000, `fixture must reproduce the raw-result spike, got ${rawToolTokens}`);
+  assert.ok(projectedDelta > 0 && projectedDelta <= kernel.TOOL_RESULT_BATCH_MAX_TOKENS + 128,
+    `same-batch tool results must use the 16K model projection plus bounded envelope framing, got ${projectedDelta}`);
+
+  const projectedFullInput = 236_285 + projectedDelta;
+  const below = kernel.calculateFullRequestBudget({
+    contextWindowTokens: 353_000,
+    maxOutputTokens: 16_000,
+    compressionThresholdTokens: 334_000,
+    breakdown: emptyBreakdown({ bodyTokens: projectedFullInput })
+  });
+  assert.equal(below.estimatedInputLimitTokens, 329_000);
+  assert.equal(below.policyTrigger, false);
+  assert.equal(below.sendingTrigger, false);
+  assert.equal(kernel.automaticCompressionTriggerReason(below), undefined);
+
+  const safety = kernel.calculateFullRequestBudget({
+    contextWindowTokens: 353_000,
+    maxOutputTokens: 16_000,
+    compressionThresholdTokens: 334_000,
+    breakdown: emptyBreakdown({ bodyTokens: 329_001 })
+  });
+  assert.equal(kernel.automaticCompressionTriggerReason(safety), 'safe_input_limit');
+
+  const configured = kernel.calculateFullRequestBudget({
+    contextWindowTokens: 353_000,
+    maxOutputTokens: 16_000,
+    compressionThresholdTokens: 300_000,
+    breakdown: emptyBreakdown({ bodyTokens: 300_000 })
+  });
+  assert.equal(kernel.automaticCompressionTriggerReason(configured), 'configured_threshold');
+});
+
 test('压缩envelope使用provider输出token估算而非其持久化JSON大小', () => {
   const envelope = JSON.stringify({
     kind: 'compression_contents',

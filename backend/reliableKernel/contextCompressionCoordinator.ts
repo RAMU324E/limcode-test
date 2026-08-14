@@ -34,6 +34,21 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export type CompressionTrigger = 'auto' | 'manual';
+export type CompressionTriggerReason = 'manual' | 'configured_threshold' | 'safe_input_limit';
+
+export function automaticCompressionTriggerReason(
+  budget: Pick<FullRequestBudget,
+    | 'policyTrigger'
+    | 'sendingTrigger'
+    | 'compressionThresholdTokens'
+    | 'estimatedInputLimitTokens'>
+): Exclude<CompressionTriggerReason, 'manual'> | undefined {
+  if (budget.policyTrigger && budget.compressionThresholdTokens <= budget.estimatedInputLimitTokens) {
+    return 'configured_threshold';
+  }
+  if (budget.sendingTrigger) return 'safe_input_limit';
+  return budget.policyTrigger ? 'configured_threshold' : undefined;
+}
 
 export interface CoordinateCompressionCommand {
   turnId: string;
@@ -136,20 +151,21 @@ export class ReliableContextCompressionCoordinator {
         thresholdTokens: requestBudget.compressionThresholdTokens
       };
     }
-    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
-    if (
-      trigger === 'auto'
-      && !requestBudget.policyTrigger
-      && !requestBudget.sendingTrigger
-      && !decision.shouldCompress
-    ) {
+    const automaticReason = trigger === 'auto'
+      ? automaticCompressionTriggerReason(requestBudget)
+      : undefined;
+    if (trigger === 'auto' && !automaticReason) {
       return {
         status: 'skipped',
         reason: 'below_threshold',
-        estimatedTokens: Math.max(requestBudget.estimatedFullInputTokens, decision.estimatedTokens),
-        thresholdTokens: requestBudget.compressionThresholdTokens
+        estimatedTokens: requestBudget.estimatedFullInputTokens,
+        thresholdTokens: Math.min(
+          requestBudget.compressionThresholdTokens,
+          requestBudget.estimatedInputLimitTokens
+        )
       };
     }
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
     const protectedCurrentInputTokens = command.protectedCurrentInputTokens === undefined
       ? 0
       : requireNonNegativeTokenCount(command.protectedCurrentInputTokens, 'protectedCurrentInputTokens');

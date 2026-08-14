@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
+  DEFAULT_LLM_CONTEXT_ESTIMATOR_SLACK_TOKENS,
   MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
   type ContentPart,
   type InlineDataPart,
@@ -12,14 +13,14 @@ import {
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
   estimateTextTokens
-} from './contextTokenEstimator';
+} from './modelTokenEstimator';
 import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
 
 /** Decimal token budgets. They intentionally are not configurable in the practical first release. */
-export const ESTIMATOR_SLACK_TOKENS = 8_000;
+export const ESTIMATOR_SLACK_TOKENS = DEFAULT_LLM_CONTEXT_ESTIMATOR_SLACK_TOKENS;
 export const TURN_REMINDER_MAX_TOKENS = 2_000;
 export const TOOL_RESULT_MAX_TOKENS = 4_000;
 export const TOOL_RESULT_BATCH_MAX_TOKENS = 16_000;

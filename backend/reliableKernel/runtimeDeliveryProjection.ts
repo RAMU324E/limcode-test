@@ -9,7 +9,7 @@ import {
   normalizePlainJson,
   type PlainJsonValue
 } from './plainJson';
-import { estimateTextTokens } from './contextTokenEstimator';
+import { estimateTextTokens } from './modelTokenEstimator';
 
 export const RUNTIME_DELIVERY_MODEL_CONTENT_TYPE =
   'application/vnd.limcode.runtime-delivery-model+json';
