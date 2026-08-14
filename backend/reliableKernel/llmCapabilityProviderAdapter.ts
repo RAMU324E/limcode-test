@@ -418,9 +418,13 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   const systemPrompt = asRecord(authority.systemPrompt);
   if (typeof systemPrompt?.text === 'string' && systemPrompt.text.trim()) systemParts.push(systemPrompt.text.trim());
   const runtimeContext = asRecord(authority.runtimeContext);
-  if (typeof runtimeContext?.template === 'string' && runtimeContext.template.trim()) {
-    systemParts.push(runtimeContext.template.trim());
-  }
+  // 优先使用冻结时已渲染占位符并注入规则区域的 text；旧快照只有原始 template 时回退兼容。
+  const runtimeContextText = typeof runtimeContext?.text === 'string' && runtimeContext.text.trim()
+    ? runtimeContext.text.trim()
+    : typeof runtimeContext?.template === 'string' && runtimeContext.template.trim()
+      ? runtimeContext.template.trim()
+      : '';
+  if (runtimeContextText) systemParts.push(runtimeContextText);
   const contents: MessageContent[] = [];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
   for (const item of request.context) {
