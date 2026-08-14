@@ -1413,36 +1413,43 @@ async function checkProviderFullRequest() {
     const policyCloseAdapter = new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
       start(request, emit) {
         policyCloseCalls += 1;
-        emit({
-          type: 'llm:error',
-          payload: {
-            requestId: request.id,
-            message: 'OpenAI Responses WebSocket closed before terminal event: 1008 policy violation',
-            rawError: {
-              name: 'WebSocketCloseError',
+        if (policyCloseCalls === 1) {
+          emit({ type: 'llm:delta', payload: { requestId: request.id, text: 'discarded policy-close output' } });
+          emit({
+            type: 'llm:error',
+            payload: {
+              requestId: request.id,
               message: 'OpenAI Responses WebSocket closed before terminal event: 1008 policy violation',
-              closeCode: 1008,
-              phase: 'streaming',
-              receivedServerEvent: true,
-              retryable: false,
-              transportAttemptsExhausted: false
+              rawError: {
+                name: 'WebSocketCloseError',
+                message: 'OpenAI Responses WebSocket closed before terminal event: 1008 policy violation',
+                closeCode: 1008,
+                phase: 'streaming',
+                receivedServerEvent: true,
+                receivedSemanticOutput: true,
+                retryable: false,
+                transportAttemptsExhausted: false
+              }
             }
-          }
-        });
+          });
+          return;
+        }
+        emit({ type: 'llm:delta', payload: { requestId: request.id, text: 'recovered policy-close output' } });
+        emit({ type: 'llm:done', payload: { requestId: request.id, completedAt: Date.now() } });
       },
       compact() { throw new Error('unused'); },
       abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
     });
-    await assert.rejects(
-      boundedProvider.dispatch(policyCloseRequest.modelRequestId, policyCloseAdapter),
-      /WebSocket closed before terminal event: 1008/
-    );
-    assert.equal(policyCloseCalls, 1);
+    await boundedProvider.dispatch(policyCloseRequest.modelRequestId, policyCloseAdapter);
+    assert.equal(policyCloseCalls, 2);
     const policyCloseOperation = (await list(ctx.database, 'Operation', {
       owner_kind: 'model_request', owner_id: policyCloseRequest.modelRequestId
     }))[0];
-    assert.equal((await list(ctx.database, 'Attempt', { operation_id: policyCloseOperation.id })).length, 1);
-    assertions.push('WS 1000/1001正常关闭码在收到任何Responses事件前按不完整传输创建durable Attempt并恢复；1008策略关闭保持永久错误');
+    const policyCloseAttempts = (await list(ctx.database, 'Attempt', {
+      operation_id: policyCloseOperation.id
+    })).sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+    assert.deepEqual(policyCloseAttempts.map((entry) => entry.status), ['transient_failed', 'completed']);
+    assertions.push('WS 1000/1001/1008 等指定关闭码在 Responses 终态前统一创建 durable Attempt 并恢复；已有部分输出由新 Attempt 整体替换');
     faults.push('WebSocket close code 1000 before any Responses event or response.completed');
     metrics.preTerminalNormalCloseAttempts = preTerminalCloseCalls;
 

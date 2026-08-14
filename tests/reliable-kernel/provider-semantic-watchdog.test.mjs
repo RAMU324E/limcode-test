@@ -250,34 +250,139 @@ test('plan→update_task_list 后只有伪 thought progress 不会续命，seman
   });
 });
 
-test('已收到语义输出后发生 stall 会终止当前 Attempt，不盲目重放 Provider 请求', async () => {
-  await withApp('provider-no-replay-after-output', async (app, conversationId, turnId) => {
-    const request = await createRequest(app, conversationId, turnId, 'no-replay-after-output');
+test('已收到文本、思考或工具输出后发生 semantic idle stall 会切换 Attempt，只采纳恢复输出', async () => {
+  for (const fixture of [
+    {
+      kind: 'text',
+      content: { type: 'text_delta', text: 'discarded stall text' }
+    },
+    {
+      kind: 'thought',
+      content: { type: 'thought_delta', text: 'discarded stall thought' }
+    },
+    {
+      kind: 'tool',
+      content: {
+        type: 'tool_call_delta',
+        calls: [{ id: 'discarded-stall-call', name: 'echo', argumentsDelta: '{"partial":', streamIndex: '0' }]
+      }
+    }
+  ]) {
+    await withApp(`provider-stall-after-${fixture.kind}`, async (app, conversationId, turnId) => {
+      const request = await createRequest(app, conversationId, turnId, `stall-after-${fixture.kind}`);
+      const terminals = [];
+      let calls = 0;
+      await controlPlane(app, {
+        semanticTimeouts: { firstSemanticMs: 1_000, semanticIdleMs: 500 }
+      }).dispatch(request.modelRequestId, {
+        providerId: 'provider-watchdog',
+        async sendFullRequest(fullRequest, controls) {
+          calls += 1;
+          if (fullRequest.attemptSeq === '1') {
+            await controls.onEvent({
+              kind: 'output_delta', streamSeq: '1', content: fixture.content
+            });
+            await new Promise((resolve) => controls.signal.addEventListener('abort', resolve, { once: true }));
+            const aborted = new Error('watchdog replaced stalled partial stream');
+            aborted.name = 'AbortError';
+            throw aborted;
+          }
+          await controls.onEvent({
+            kind: 'completed', streamSeq: '1',
+            content: { text: `recovered-${fixture.kind}`, thought: '', toolCalls: [] }
+          });
+        }
+      }, { onTransientTerminal: (event) => terminals.push(event) });
+
+      assert.equal(calls, 2);
+      const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
+      assert.equal(durableRequest.terminal_state, 'completed');
+      assert.equal(durableRequest.stream_stats_json.attemptSeq, '2');
+      const operation = (await list(app, 'Operation', {
+        owner_kind: 'model_request', owner_id: request.modelRequestId
+      }))[0];
+      const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
+        .slice()
+        .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+      assert.deepEqual(attempts.map((entry) => entry.status), ['transient_failed', 'completed']);
+      assert.ok(terminals.some((terminal) =>
+        terminal.attemptSeq === '1'
+        && terminal.event.content.terminalState === 'provider_transient_stream_stalled'
+        && terminal.event.content.retrying === true
+        && terminal.event.content.discardOutput === true
+      ));
+      const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+      assert.equal(completed.content.text, `recovered-${fixture.kind}`);
+      assert.equal(completed.content.thought, '');
+      assert.deepEqual(completed.content.toolCalls, []);
+      const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
+      assert.ok(checkpoints.every((checkpoint) => checkpoint.attempt_seq === 2n),
+        'terminal prune must discard the stalled Attempt checkpoint');
+    });
+  }
+});
+
+test('普通 transient error 在已有语义输出后仍不盲目重放', async () => {
+  await withApp('provider-generic-no-replay-after-output', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'generic-no-replay-after-output');
     let calls = 0;
     await assert.rejects(
-      controlPlane(app).dispatch(request.modelRequestId, {
+      controlPlane(app, {
+        semanticTimeouts: { firstSemanticMs: 500, semanticIdleMs: 500 }
+      }).dispatch(request.modelRequestId, {
         providerId: 'provider-watchdog',
         async sendFullRequest(_fullRequest, controls) {
           calls += 1;
           await controls.onEvent({
-            kind: 'output_delta',
-            streamSeq: '1',
-            content: { type: 'text_delta', text: 'partial output' }
+            kind: 'output_delta', streamSeq: '1',
+            content: { type: 'text_delta', text: 'generic partial output' }
           });
-          await new Promise((resolve) => controls.signal.addEventListener('abort', resolve, { once: true }));
-          const aborted = new Error('watchdog aborted partial stream');
-          aborted.name = 'AbortError';
-          throw aborted;
+          throw new kernel.ProviderTransientError('temporary_service_error', 'generic transient after output');
         }
       }),
       /不自动重放请求/
     );
     assert.equal(calls, 1);
     assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, 'provider_failed');
+  });
+});
+
+test('连续 semantic idle stall 会自动重试到冻结预算上限后才终止', async () => {
+  await withApp('provider-stall-retry-exhaustion', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'stall-retry-exhaustion');
+    let calls = 0;
+    await assert.rejects(
+      controlPlane(app, {
+        semanticTimeouts: { firstSemanticMs: 80, semanticIdleMs: 20 }
+      }).dispatch(request.modelRequestId, {
+        providerId: 'provider-watchdog',
+        async sendFullRequest(_fullRequest, controls) {
+          calls += 1;
+          await controls.onEvent({
+            kind: 'output_delta', streamSeq: '1',
+            content: { type: 'text_delta', text: `stalled-${calls}` }
+          });
+          await new Promise((resolve) => controls.signal.addEventListener('abort', resolve, { once: true }));
+          const aborted = new Error(`watchdog aborted stalled Attempt ${calls}`);
+          aborted.name = 'AbortError';
+          throw aborted;
+        }
+      }),
+      (error) => /no semantic progress for 20ms/.test(error.message)
+        && !/不自动重放请求/.test(error.message)
+    );
+    assert.equal(calls, 4);
+    const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
+    assert.equal(durableRequest.terminal_state, 'provider_transient_stream_stalled');
     const operation = (await list(app, 'Operation', {
       owner_kind: 'model_request', owner_id: request.modelRequestId
     }))[0];
-    assert.equal((await list(app, 'Attempt', { operation_id: operation.id })).length, 1);
+    const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
+      .slice()
+      .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+    assert.deepEqual(attempts.map((entry) => entry.status), [
+      'transient_failed', 'transient_failed', 'transient_failed', 'failed'
+    ]);
   });
 });
 
@@ -692,6 +797,7 @@ test('所有可恢复的 Responses 终态前关闭都会创建 durable Attempt 2
     { closeCode: 1001, reason: ' Going Away' },
     { closeCode: 1005, reason: ' No Status Received' },
     { closeCode: 1006, reason: ' Abnormal Closure' },
+    { closeCode: 1008, reason: ' Policy Violation' },
     { closeCode: 1011, reason: ' Internal Error' },
     { closeCode: 1012, reason: ' Service Restart' },
     { closeCode: 1013, reason: ' Try Again Later' },
@@ -730,7 +836,9 @@ test('所有可恢复的 Responses 终态前关闭都会创建 durable Attempt 2
         abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
       };
       const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability);
-      await controlPlane(app).dispatch(request.modelRequestId, adapter);
+      await controlPlane(app, {
+        semanticTimeouts: { firstSemanticMs: 500, semanticIdleMs: 500 }
+      }).dispatch(request.modelRequestId, adapter);
 
       assert.equal(calls, 2);
       assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, 'completed');
@@ -743,6 +851,107 @@ test('所有可恢复的 Responses 终态前关闭都会创建 durable Attempt 2
       assert.equal(attempts.length, 2);
       assert.equal(attempts[0].status, 'transient_failed');
       assert.equal(attempts[1].status, 'completed');
+    });
+  }
+});
+
+test('配置的终态前关闭在文本、思考或工具输出后仍切换 Attempt，最终只采纳恢复输出', async () => {
+  for (const fixture of [
+    {
+      closeCode: 1013,
+      reason: 'upstream websocket disconnected; please reconnect',
+      emitPartial(requestId, emit) {
+        emit({ type: 'llm:delta', payload: { requestId, text: 'discarded text' } });
+      }
+    },
+    {
+      closeCode: 1006,
+      reason: 'abnormal closure',
+      emitPartial(requestId, emit) {
+        emit({
+          type: 'llm:thoughtDelta',
+          payload: { requestId, text: 'discarded thought', thoughtStartedAt: Date.now(), thoughtElapsedMs: 1 }
+        });
+      }
+    },
+    {
+      closeCode: 1008,
+      reason: 'policy violation',
+      emitPartial(requestId, emit) {
+        emit({
+          type: 'llm:toolCallDelta',
+          payload: {
+            requestId,
+            calls: [{ id: 'discarded-call', name: 'echo', argumentsDelta: '{"partial":', streamIndex: '0' }]
+          }
+        });
+      }
+    }
+  ]) {
+    await withApp(`provider-close-after-output-${fixture.closeCode}`, async (app, conversationId, turnId) => {
+      const request = await createRequest(app, conversationId, turnId, `close-after-output-${fixture.closeCode}`);
+      const message = `OpenAI Responses WebSocket closed before terminal event: ${fixture.closeCode} ${fixture.reason}`;
+      const terminals = [];
+      let calls = 0;
+      const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', {
+        start(llmRequest, emit) {
+          calls += 1;
+          if (calls === 1) {
+            fixture.emitPartial(llmRequest.id, emit);
+            emit({
+              type: 'llm:error',
+              payload: {
+                requestId: llmRequest.id,
+                message,
+                rawError: {
+                  name: 'WebSocketCloseError',
+                  message,
+                  closeCode: fixture.closeCode,
+                  phase: 'streaming',
+                  receivedServerEvent: true,
+                  receivedSemanticOutput: true,
+                  retryable: false,
+                  transportAttemptsExhausted: false
+                }
+              }
+            });
+            return;
+          }
+          emit({ type: 'llm:delta', payload: { requestId: llmRequest.id, text: `recovered-${fixture.closeCode}` } });
+          emit({ type: 'llm:done', payload: { requestId: llmRequest.id, completedAt: Date.now() } });
+        },
+        compact() { throw new Error('unused'); },
+        abort() {}, cancelRetry() {}, dispose() {}, listModels: async () => []
+      });
+
+      await controlPlane(app).dispatch(request.modelRequestId, adapter, {
+        onTransientTerminal: (terminal) => terminals.push(terminal)
+      });
+
+      assert.equal(calls, 2);
+      const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
+      assert.equal(durableRequest.terminal_state, 'completed');
+      assert.equal(durableRequest.stream_stats_json.attemptSeq, '2');
+      const operation = (await list(app, 'Operation', {
+        owner_kind: 'model_request', owner_id: request.modelRequestId
+      }))[0];
+      const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
+        .slice()
+        .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+      assert.deepEqual(attempts.map((entry) => entry.status), ['transient_failed', 'completed']);
+      assert.ok(terminals.some((terminal) =>
+        terminal.attemptSeq === '1'
+        && terminal.event.content.retrying === true
+        && terminal.event.content.discardOutput === true
+      ));
+      const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+      assert.equal(completed.content.text, `recovered-${fixture.closeCode}`);
+      assert.equal(completed.content.thought, '');
+      assert.deepEqual(completed.content.toolCalls, []);
+      const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
+      assert.ok(checkpoints.length > 0);
+      assert.ok(checkpoints.every((checkpoint) => checkpoint.attempt_seq === 2n),
+        'terminal prune must discard every failed-Attempt checkpoint');
     });
   }
 });
@@ -875,7 +1084,9 @@ test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted
       retryable: false,
       transportAttemptsExhausted: false
     }),
-    (error) => !(error instanceof kernel.ProviderTransientError)
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'connection_interrupted'
+      && error.retryAfterOutput === true
   );
   await assert.rejects(
     runRawError({ message: 'transport exhausted', retryable: true, transportAttemptsExhausted: true }),

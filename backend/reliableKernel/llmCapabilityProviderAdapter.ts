@@ -119,9 +119,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         if (terminal) return;
         terminal = true;
         detachAbort();
-        const terminalError = error instanceof ProviderTransientError && sawReplayUnsafeProviderOutput
-          ? new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`)
-          : error;
+        const terminalError = error instanceof ProviderTransientError
+          && sawReplayUnsafeProviderOutput
+          && !error.retryAfterOutput
+            ? new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`)
+            : error;
         void tail.then(
           () => terminalError === undefined ? resolve() : reject(terminalError),
           reject
@@ -1253,19 +1255,21 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
     signature,
     findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
   );
+  // A new reliable Attempt gets a fresh socket and transient accumulator, so these explicitly
+  // recoverable pre-terminal closes may replace partial text/thought/tool output instead of
+  // appending to it. They outrank receivedSemanticOutput, stale retryable=false metadata, an
+  // exhausted capability-local transport budget, and a close reason that would otherwise look
+  // permanent; the reliable ControlPlane's frozen Attempt budget remains authoritative.
+  if (preTerminalWebSocketClose?.retryable === true) {
+    return new ProviderTransientError('connection_interrupted', message, true);
+  }
+  if (preTerminalWebSocketClose?.retryable === false) return new Error(message);
   if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
     return new Error(message);
   }
   if (receivedSemanticOutput === true) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
   }
-  // A close handshake is not a Responses terminal event. Retry all shared transport/service close
-  // kinds even if an older capability serialized stale retryable=false metadata. Known protocol,
-  // data and policy close codes remain permanent and cannot fall through to the generic text rule.
-  if (preTerminalWebSocketClose?.retryable === true && transportAttemptsExhausted !== true) {
-    return new ProviderTransientError('connection_interrupted', message);
-  }
-  if (preTerminalWebSocketClose?.retryable === false) return new Error(message);
   if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
   if (status === 429 || /unexpected server response:\s*429\b/.test(signature)) {
     return new ProviderTransientError('rate_limited', message);

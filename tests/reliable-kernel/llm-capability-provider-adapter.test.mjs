@@ -1211,6 +1211,7 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
     [1001, ' Going Away'],
     [1005, ' No Status Received'],
     [1006, ' Abnormal Closure'],
+    [1008, ' Policy Violation'],
     [1011, ' Internal Error'],
     [1012, ' Service Restart'],
     [1013, ' Try Again Later'],
@@ -1220,22 +1221,18 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
   for (const [message, rawError, reason] of [
     ['temporary failure', { status: 429 }, 'rate_limited'],
     ['temporary failure', { code: 'ECONNRESET', message: 'socket hang up' }, 'connection_interrupted'],
-    ...retryablePreTerminalCloses.map(([closeCode, closeReason]) => [
-      `OpenAI Responses WebSocket closed before terminal event: ${closeCode}${closeReason}`,
-      {
-        name: 'WebSocketCloseError',
-        closeCode,
-        retryable: false,
-        transportAttemptsExhausted: false
-      },
-      'connection_interrupted'
-    ]),
-    ['OpenAI Responses WebSocket closed before terminal event: 1008 Missing first response.create message', {
-      name: 'WebSocketCloseError',
-      closeCode: 1008,
-      retryable: false,
-      transportAttemptsExhausted: false
-    }, 'connection_interrupted'],
+    ...retryablePreTerminalCloses.flatMap(([closeCode, closeReason]) => [false, true].map(
+      (transportAttemptsExhausted) => [
+        `OpenAI Responses WebSocket closed before terminal event: ${closeCode}${closeReason}`,
+        {
+          name: 'WebSocketCloseError',
+          closeCode,
+          retryable: false,
+          transportAttemptsExhausted
+        },
+        'connection_interrupted'
+      ]
+    )),
     ['OpenAI Responses WebSocket first_event timed out after 60000ms.', {
       code: 'LLM_TRANSPORT_TIMEOUT', phase: 'first_event'
     }, 'connection_interrupted'],
@@ -1247,13 +1244,15 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
     }));
     await assert.rejects(
       adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
-      (error) => error instanceof kernel.ProviderTransientError && error.reason === reason
+      (error) => error instanceof kernel.ProviderTransientError
+        && error.reason === reason
+        && (rawError?.closeCode === undefined || error.retryAfterOutput === true)
     );
   }
 });
 
-test('LLM capability adapter 不重试协议、数据、策略及未知的终态前关闭', async () => {
-  for (const closeCode of [1002, 1003, 1004, 1007, 1008, 1009, 1010, 1016, 3000]) {
+test('LLM capability adapter 不重试未配置的协议、数据及未知终态前关闭', async () => {
+  for (const closeCode of [1002, 1003, 1004, 1007, 1009, 1010, 1016, 3000]) {
     const message = `OpenAI Responses WebSocket closed before terminal event: ${closeCode} permanent close`;
     const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
       emit({
@@ -1280,7 +1279,38 @@ test('LLM capability adapter 不重试协议、数据、策略及未知的终态
   }
 });
 
-test('LLM capability adapter 允许 response.created 后重试，但在语义输出后拒绝盲重放', async () => {
+test('LLM capability adapter 只允许配置的终态前关闭在语义输出后切换 Attempt', async () => {
+  const afterConfiguredCloseOutput = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:delta', payload: { requestId: llmRequest.id, text: 'discarded partial' } });
+      emit({
+        type: 'llm:error',
+        payload: {
+          requestId: llmRequest.id,
+          message: 'OpenAI Responses WebSocket closed before terminal event: 1013 upstream websocket disconnected; please reconnect',
+          rawError: {
+            name: 'WebSocketCloseError',
+            closeCode: 1013,
+            receivedServerEvent: true,
+            receivedSemanticOutput: true,
+            retryable: false,
+            transportAttemptsExhausted: false
+          }
+        }
+      });
+    })
+  );
+  await assert.rejects(
+    afterConfiguredCloseOutput.sendFullRequest(request(), {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }),
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'connection_interrupted'
+      && error.retryAfterOutput === true
+      && !/不自动重放请求/.test(error.message)
+  );
+
   const afterRawEvent = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
     fakeCapability((llmRequest, emit) => {

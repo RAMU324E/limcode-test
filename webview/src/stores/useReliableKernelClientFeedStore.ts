@@ -540,6 +540,20 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         next.status = 'completed';
       } else if (message.event.kind === 'failed' || message.event.kind === 'cancelled') {
         next.status = message.event.kind;
+        if (content?.discardOutput === true) {
+          next.text = '';
+          next.thought = '';
+          next.toolCalls = [];
+          delete next.thoughtSignature;
+          delete next.thoughtStartedAt;
+          delete next.thoughtCompletedDurationMs;
+          delete next.thoughtElapsedMs;
+          delete next.thoughtDurationMs;
+          delete next.usageMetadata;
+          delete next.firstOutputAt;
+          delete next.completedAt;
+          delete next.streamOutputDurationMs;
+        }
         const terminalText = stringValue(content?.text);
         if (terminalText !== undefined) next.text = terminalText;
         const terminalThought = stringValue(content?.thought);

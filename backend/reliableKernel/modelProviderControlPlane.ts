@@ -223,7 +223,12 @@ export type ProviderTransientReason =
   | 'compression_timeout';
 
 export class ProviderTransientError extends Error {
-  public constructor(public readonly reason: ProviderTransientReason, message: string) {
+  public constructor(
+    public readonly reason: ProviderTransientReason,
+    message: string,
+    /** A new Attempt may replace partial output from the failed Attempt instead of appending to it. */
+    public readonly retryAfterOutput = false
+  ) {
     super(message);
     this.name = 'ProviderTransientError';
   }
@@ -924,7 +929,7 @@ export class ModelProviderControlPlane {
         );
         throw error;
       }
-      if (sawReplayUnsafeProviderEvent) {
+      if (sawReplayUnsafeProviderEvent && !error.retryAfterOutput) {
         const replayUnsafe = Object.assign(
           new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`),
           { cause: error }
@@ -971,6 +976,7 @@ export class ModelProviderControlPlane {
         `provider_transient_${error.reason}`,
         {
           retrying: true,
+          discardOutput: true,
           retryAttempt: Number(retryAttempt.attemptSeq - 1n),
           retryMaxAttempts: maxRetries,
           retryDelayMs: retryAttempt.delayMs,
@@ -1433,6 +1439,7 @@ export class ModelProviderControlPlane {
     terminalState: string,
     detail: {
       retrying?: boolean;
+      discardOutput?: boolean;
       retryAttempt?: number;
       retryMaxAttempts?: number;
       retryDelayMs?: number;
@@ -1450,6 +1457,7 @@ export class ModelProviderControlPlane {
           content: {
             terminalState,
             ...(detail.retrying ? { retrying: true } : {}),
+            ...(detail.discardOutput ? { discardOutput: true } : {}),
             ...(detail.retryAttempt !== undefined ? { retryAttempt: detail.retryAttempt } : {}),
             ...(detail.retryMaxAttempts !== undefined ? { retryMaxAttempts: detail.retryMaxAttempts } : {}),
             ...(detail.retryDelayMs !== undefined ? { retryDelayMs: detail.retryDelayMs } : {}),
@@ -1765,7 +1773,10 @@ function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; seman
           reason,
           sawProgress
             ? `Provider stream made no semantic progress for ${timeoutMs}ms.`
-            : `Provider produced no semantic event within ${timeoutMs}ms.`
+            : `Provider produced no semantic event within ${timeoutMs}ms.`,
+          // An idle timeout necessarily follows semantic output. Replace that incomplete Attempt
+          // wholesale; first-semantic timeout has no output and does not need this exception.
+          sawProgress
         )
       });
     }, timeoutMs);

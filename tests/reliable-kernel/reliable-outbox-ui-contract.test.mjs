@@ -162,3 +162,21 @@ test('全局设置首轮和重复快照都收敛读取状态，失败 section �
   assert.match(repeatedSnapshot, /settleSettingsStatus\(this, '设置已同步'\);\s*return;/);
   assert.match(initialSnapshot, /this\.refreshPendingSettingSection\(section\);\s*settleSettingsStatus\(this, '设置已同步'\);\s*return;/);
 });
+
+test('Provider 新 Attempt 会清除旧 Attempt 的部分文本、思考和工具预览', () => {
+  const store = read('webview/src/stores/useReliableKernelClientFeedStore.ts');
+  const lifecycle = read('webview/src/domain/reliableTransientLifecycle.ts');
+  const terminalBranch = store.slice(
+    store.indexOf("} else if (message.event.kind === 'failed' || message.event.kind === 'cancelled')"),
+    store.indexOf("} else if (content?.type === 'text_delta')")
+  );
+  const attemptFence = lifecycle.slice(
+    lifecycle.indexOf('const durableAttemptSeq = modelRequestAttemptSeq(request);'),
+    lifecycle.indexOf("if (request.status !== 'terminal') continue;")
+  );
+
+  assert.match(terminalBranch, /content\?\.discardOutput === true/);
+  assert.match(terminalBranch, /next\.text = '';[\s\S]*?next\.thought = '';[\s\S]*?next\.toolCalls = \[\];/);
+  assert.match(attemptFence, /durableAttemptSeq > transientAttemptSeq/);
+  assert.match(attemptFence, /delete requests\[entry\.modelRequestId\]/);
+});

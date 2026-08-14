@@ -1,14 +1,16 @@
 /**
  * A WebSocket close is only replay-safe at this boundary when the Responses request has not
- * reached a terminal event (and the caller has not observed semantic output). Keep this transport
- * list shared by the session and reliable Provider adapter so close metadata cannot lose retry
- * authority while crossing the capability boundary.
+ * reached a terminal event. A reliable retry starts a new Attempt/socket identity, so any partial
+ * output from the failed Attempt is replaced rather than appended. Keep this transport list shared
+ * by the session and reliable Provider adapter so close metadata cannot lose retry authority while
+ * crossing the capability boundary.
  */
 export const OPENAI_RESPONSES_RETRYABLE_PRE_TERMINAL_CLOSE_CODES = [
   1000, // Normal Closure before a Responses terminal event still leaves the request incomplete.
   1001, // Going Away.
   1005, // No Status Received (local sentinel; never sent on the wire).
   1006, // Abnormal Closure (TCP/proxy/network interruption without a close frame).
+  1008, // Provider/proxy policy close before the Responses request reached a terminal event.
   1011, // Server Internal Error.
   1012, // Service Restart.
   1013, // Try Again Later.
@@ -30,11 +32,9 @@ export interface OpenAIResponsesPreTerminalWebSocketClose {
 
 export function isRetryableOpenAIResponsesWebSocketClose(
   closeCode: number,
-  closeReason = ''
+  _closeReason = ''
 ): boolean {
-  return RETRYABLE_PRE_TERMINAL_CLOSE_CODES.has(closeCode)
-    || (closeCode === 1008
-      && closeReason.toLowerCase().includes('missing first response.create message'));
+  return RETRYABLE_PRE_TERMINAL_CLOSE_CODES.has(closeCode);
 }
 
 /**

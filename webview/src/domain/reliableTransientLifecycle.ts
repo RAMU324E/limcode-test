@@ -51,6 +51,19 @@ export function reconcileReliableTransientRequests(
       }
       continue;
     }
+    const durableAttemptSeq = modelRequestAttemptSeq(request);
+    const transientAttemptSeq = positiveBigInt(entry.attemptSeq);
+    if (
+      durableAttemptSeq !== undefined
+      && transientAttemptSeq !== undefined
+      && durableAttemptSeq > transientAttemptSeq
+    ) {
+      // The bounded durable Feed can advance to Attempt N+1 even when the process-local transient
+      // retry terminal was missed during a Webview/host handoff. Never keep Attempt N output beside
+      // the replacement Attempt: the retry is a whole-response replay, not a stream continuation.
+      delete requests[entry.modelRequestId];
+      continue;
+    }
     if (request.status !== 'terminal') continue;
 
     const link = linksByRequestId.get(entry.modelRequestId);
@@ -135,6 +148,26 @@ function completedToolFactsReady(
 
 function positiveDecimal(value: unknown): string | undefined {
   return typeof value === 'string' && /^[1-9]\d*$/.test(value) ? value : undefined;
+}
+
+function modelRequestAttemptSeq(request: Record<string, unknown>): bigint | undefined {
+  let streamStats = request.stream_stats_json;
+  if (typeof streamStats === 'string') {
+    try {
+      streamStats = JSON.parse(streamStats);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!streamStats || typeof streamStats !== 'object' || Array.isArray(streamStats)) return undefined;
+  return positiveBigInt((streamStats as Record<string, unknown>).attemptSeq);
+}
+
+function positiveBigInt(value: unknown): bigint | undefined {
+  if (typeof value === 'bigint' && value > 0n) return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return BigInt(value);
+  if (typeof value === 'string' && /^[1-9]\d*$/.test(value)) return BigInt(value);
+  return undefined;
 }
 
 function nonNegativeInteger(value: unknown): number | undefined {
