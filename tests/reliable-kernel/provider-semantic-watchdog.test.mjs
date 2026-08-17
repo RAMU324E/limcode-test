@@ -14,6 +14,10 @@ const kernel = await import(pathToFileURL(
   path.join(compiledRoot, 'backend/reliableKernel/index.js')
 ).href);
 
+function modelContent(text = '') {
+  return { role: 'model', parts: text ? [{ text }] : [] };
+}
+
 function dependencies() {
   return {
     authorityCompiler: {
@@ -179,7 +183,7 @@ test('可靠 Provider 请求携带冻结 Context root 所属的 conversationId',
         capturedConversationId = fullRequest.conversationId;
         await controls.onEvent({
           kind: 'completed', streamSeq: '1',
-          content: { text: 'done', thought: '', toolCalls: [] }
+          content: modelContent('done')
         });
       }
     });
@@ -226,7 +230,7 @@ test('plan→update_task_list 后只有伪 thought progress 不会续命，seman
         }
         await controls.onEvent({
           kind: 'completed', streamSeq: '1',
-          content: { text: '无需用户继续即可完成', thought: '', toolCalls: [] }
+          content: modelContent('无需用户继续即可完成')
         });
       }
     }, { onTransientTerminal: (event) => transient.push(event) });
@@ -289,7 +293,7 @@ test('已收到文本、思考或工具输出后发生 semantic idle stall 会�
           }
           await controls.onEvent({
             kind: 'completed', streamSeq: '1',
-            content: { text: `recovered-${fixture.kind}`, thought: '', toolCalls: [] }
+            content: modelContent(`recovered-${fixture.kind}`)
           });
         }
       }, { onTransientTerminal: (event) => terminals.push(event) });
@@ -312,9 +316,7 @@ test('已收到文本、思考或工具输出后发生 semantic idle stall 会�
         && terminal.event.content.discardOutput === true
       ));
       const completed = await app.modelProvider.completedEvent(request.modelRequestId);
-      assert.equal(completed.content.text, `recovered-${fixture.kind}`);
-      assert.equal(completed.content.thought, '');
-      assert.deepEqual(completed.content.toolCalls, []);
+      assert.deepEqual(completed.content, modelContent(`recovered-${fixture.kind}`));
       const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
       assert.ok(checkpoints.every((checkpoint) => checkpoint.attempt_seq === 2n),
         'terminal prune must discard the stalled Attempt checkpoint');
@@ -397,7 +399,7 @@ test('冻结 retryMaxAttempts=3 允许连续 transient failures 后第四个 Att
         calls += 1;
         if (calls <= 3) throw new kernel.ProviderTransientError('temporary_service_error', `temporary-${calls}`);
         await controls.onEvent({
-          kind: 'completed', streamSeq: '1', content: { text: 'recovered', thought: '', toolCalls: [] }
+          kind: 'completed', streamSeq: '1', content: modelContent('recovered')
         });
       }
     });
@@ -433,7 +435,7 @@ test('已提交 retrying/not-before 在 Host handoff 后由新 ControlPlane 恢�
       async sendFullRequest(fullRequest, controls) {
         assert.equal(fullRequest.attemptSeq, '2');
         await controls.onEvent({
-          kind: 'completed', streamSeq: '1', content: { text: 'resumed', thought: '', toolCalls: [] }
+          kind: 'completed', streamSeq: '1', content: modelContent('resumed')
         });
       }
     }, { reconnect: true });
@@ -556,7 +558,7 @@ test('Provider persists only the first delta while item_done and terminal remain
             kind: 'output_item_done', streamSeq: '5', content: { type: 'thought_done' }
           }));
           results.push(await controls.onEvent({
-            kind: 'completed', streamSeq: '6', content: { text: 'done', thought: '', toolCalls: [] }
+            kind: 'completed', streamSeq: '6', content: modelContent('done')
           }));
         }
       });
@@ -605,7 +607,7 @@ test('Provider semantic checkpoint overflow 有界合并且 terminal summary 仍
         }
         results.push(await controls.onEvent({
           kind: 'completed', streamSeq: '42',
-          content: { text: 'terminal survives capacity', thought: '', toolCalls: [] }
+          content: modelContent('terminal survives capacity')
         }));
       }
     });
@@ -646,7 +648,7 @@ test('单条 thought 后的合法静默在 idle 边界内完成且不创建重�
         await sleep(80);
         await controls.onEvent({
           kind: 'completed', streamSeq: '2',
-          content: { text: 'completed without reconnect', thought: '', toolCalls: [] }
+          content: modelContent('completed without reconnect')
         });
       }
     });
@@ -679,7 +681,7 @@ test('正常 semantic progress 会刷新 idle watchdog，首语义 black-hole �
           });
         }
         await controls.onEvent({
-          kind: 'completed', streamSeq: '5', content: { text: 'normal', thought: '', toolCalls: [] }
+          kind: 'completed', streamSeq: '5', content: modelContent('normal')
         });
       }
     });
@@ -699,7 +701,7 @@ test('正常 semantic progress 会刷新 idle watchdog，首语义 black-hole �
           throw aborted;
         }
         await controls.onEvent({
-          kind: 'completed', streamSeq: '1', content: { text: 'first timeout recovered', thought: '', toolCalls: [] }
+          kind: 'completed', streamSeq: '1', content: modelContent('first timeout recovered')
         });
       }
     }, { onTransientTerminal: (event) => terminals.push(event) });
@@ -948,9 +950,7 @@ test('配置的终态前关闭在文本、思考或工具输出后仍切换 Atte
         && terminal.event.content.discardOutput === true
       ));
       const completed = await app.modelProvider.completedEvent(request.modelRequestId);
-      assert.equal(completed.content.text, `recovered-${fixture.closeCode}`);
-      assert.equal(completed.content.thought, '');
-      assert.deepEqual(completed.content.toolCalls, []);
+      assert.deepEqual(completed.content, modelContent(`recovered-${fixture.closeCode}`));
       const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
       assert.ok(checkpoints.length > 0);
       assert.ok(checkpoints.every((checkpoint) => checkpoint.attempt_seq === 2n),

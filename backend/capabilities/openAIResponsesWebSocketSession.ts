@@ -40,6 +40,10 @@ export interface OpenAIResponsesToolCallArgumentDelta {
 
 export interface LimCodeOpenAIResponsesStreamChunk extends LLMStreamChunk {
   toolCallArgumentDeltas?: OpenAIResponsesToolCallArgumentDelta[];
+  /** Marks the provider boundary between independent reasoning output items. */
+  reasoningItemDone?: boolean;
+  /** Exact ordered model content proven against the terminal Responses output. */
+  completedContent?: Content;
 }
 
 export interface OpenAIResponsesWebSocketDecision {
@@ -298,6 +302,7 @@ async function* streamLocked(
   const continuationProjection = new OpenAIResponsesContinuationProjection();
   const toolCalls = new Map<string, ToolCallAccumulator>();
   let responseId: string | undefined;
+  let completedProjection: ReturnType<OpenAIResponsesContinuationProjection['completedProjection']>;
   let sawSemanticOutput = false;
   let completed = false;
 
@@ -343,9 +348,16 @@ async function* streamLocked(
         ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {})
       };
       const projected = continuationProjection.observe(raw, decodedChunk);
+      if (type === 'response.completed') {
+        completedProjection = continuationProjection.completedProjection(options.format);
+      }
       const chunk: LimCodeOpenAIResponsesStreamChunk = {
         ...projected.chunk,
-        ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {})
+        ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {}),
+        ...(type === 'response.output_item.done' && isRecord(raw.item) && raw.item.type === 'reasoning'
+          ? { reasoningItemDone: true }
+          : {}),
+        ...(completedProjection ? { completedContent: completedProjection.content } : {})
       };
       const semanticOutput = projected.semanticOutput
         || hasSemanticChunkOutput(chunk)
@@ -372,8 +384,7 @@ async function* streamLocked(
     }
 
     const resolvedResponseId = responseId;
-    const normalizedOutputItems = continuationProjection.completedOutputItems(options.format)
-      ?.map(stripWebSocketOnlyInputFields);
+    const normalizedOutputItems = completedProjection?.outputItems.map(stripWebSocketOnlyInputFields);
     const outputStateReliable = normalizedOutputItems !== undefined
       && (normalizedOutputItems.length > 0 || !sawSemanticOutput);
 
@@ -1541,7 +1552,9 @@ function hasMeaningfulChunk(chunk: LimCodeOpenAIResponsesStreamChunk): boolean {
     || !!chunk.usageMetadata
     || !!chunk.error
     || !!chunk.thoughtSignature
-    || !!chunk.thoughtSignatures;
+    || !!chunk.thoughtSignatures
+    || chunk.reasoningItemDone === true
+    || !!chunk.completedContent;
 }
 
 function closeAndInvalidate(session: WebSocketSession, terminate: boolean): void {

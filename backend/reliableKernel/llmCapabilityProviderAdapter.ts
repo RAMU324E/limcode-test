@@ -2,7 +2,13 @@ import type { LlmCapability } from '../capabilities/types';
 import type { LlmCompactRequest, LlmStartRequest, ToolSchema } from '../world/modules/llm/contracts';
 import { LlmEventType } from '../world/modules/llm/events';
 import type { WorldEvent } from '../ecs/types';
-import type { InlineDataPart, LlmProviderKind, MessageContent } from '../../shared/protocol';
+import {
+  READ_TOOL_NAME,
+  type AttachmentCatalogEntry,
+  type InlineDataPart,
+  type LlmProviderKind,
+  type MessageContent
+} from '../../shared/protocol';
 import {
   collectAttachmentCatalogFromStoredItems,
   mergeAttachmentCatalog,
@@ -11,6 +17,11 @@ import {
   type AttachmentCatalogStoredItem
 } from './attachmentCatalog';
 import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
+import {
+  compactReadFileToolArguments,
+  readFileToolDescription,
+  readFileToolParameters
+} from '../world/modules/tools/definitions/readFile';
 import { classifyOpenAIResponsesPreTerminalWebSocketClose } from '../capabilities/openAIResponsesWebSocketRetryPolicy';
 import { ProviderTransientError } from './modelProviderControlPlane';
 import type {
@@ -106,6 +117,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       let text = '';
       let thought = '';
       let thoughtSignature: string | undefined;
+      const outputParts: MessageContent['parts'] = [];
+      const completedThoughtBlockDurations: number[] = [];
       let thoughtElapsedMs: number | undefined;
       let thoughtStartedAt: number | undefined;
       let completedThoughtDurationMs = 0;
@@ -147,7 +160,10 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           case LlmEventType.Delta: {
             const delta = optionalText(payload?.text);
             text += delta;
-            if (delta) enqueue({ kind: 'output_delta', content: { type: 'text_delta', text: delta } });
+            if (delta) {
+              appendTextPart(outputParts, delta, false);
+              enqueue({ kind: 'output_delta', content: { type: 'text_delta', text: delta } });
+            }
             return;
           }
           case LlmEventType.ThoughtDelta: {
@@ -165,6 +181,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             }
             thoughtTimingObserved = true;
             if (delta) {
+              appendTextPart(outputParts, delta, true, thoughtSignature);
               enqueue({
                 kind: 'output_delta',
                 content: {
@@ -211,8 +228,10 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             const blockDurationMs = optionalNonNegativeNumber(payload?.thoughtDurationMs)
               ?? currentThoughtBlockDurationMs(blockStartedAt, thoughtElapsedMs, Date.now());
             completedThoughtDurationMs += blockDurationMs;
+            completedThoughtBlockDurations.push(blockDurationMs);
             thoughtTimingObserved = true;
             thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
+            completeLastThoughtPart(outputParts, blockDurationMs, thoughtSignature);
             enqueue({
               kind: 'output_item_done',
               content: {
@@ -240,6 +259,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           case LlmEventType.ToolCall: {
             const merged = toolCalls.merge(payload?.calls);
             if (merged.length > 0) {
+              upsertFunctionCallParts(outputParts, merged);
               enqueue({
                 kind: 'output_item_done',
                 content: {
@@ -265,16 +285,15 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             const usage = payload?.usageMetadata === undefined
               ? undefined
               : normalizePlainJson(payload.usageMetadata, 'LLM usage metadata');
+            const authoritativeContent = messageContentFromDonePayload(payload?.content);
+            const completedContent = compactReadToolCallsInContent(applyThoughtDurations(
+              authoritativeContent ?? { role: 'model', parts: outputParts },
+              completedThoughtBlockDurations,
+              thoughtTimingObserved ? completedThoughtDurationMs : undefined
+            ));
             enqueue({
               kind: 'completed',
-              content: {
-                text,
-                thought,
-                ...(thoughtSignature ? { thoughtSignature } : {}),
-                ...(thoughtTimingObserved ? { thoughtDurationMs: completedThoughtDurationMs } : {}),
-                toolCallsSemantics: 'snapshot',
-                toolCalls: normalizePlainJson(toolCalls.snapshot(), 'LLM terminal tool calls')
-              },
+              content: normalizePlainJson(completedContent, 'LLM completed MessageContent'),
               ...(usage !== undefined ? { usage } : {}),
               timing: {
                 ...(providerStartedAt !== undefined ? { providerStartedAt } : {}),
@@ -415,7 +434,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   const recipe = requireRecord(request.recipe, 'Provider recipe');
   const authority = requireRecord(request.authoritySnapshot, 'Provider authority snapshot');
   const toolPolicy = authorityToolPolicy(authority);
-  const tools = normalizeToolDefinitions(recipe.tools)
+  const availableTools = normalizeToolDefinitions(recipe.tools)
     .filter((tool) => providerToolAllowed(toolPolicy, tool))
     .map((tool) => tool.schema);
   const authorityModel = requireRecord(authority.model, 'Provider authority model');
@@ -481,6 +500,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   );
   const attachmentCatalogContent = renderAttachmentCatalog(attachmentCatalog);
   if (attachmentCatalogContent) contents.push(attachmentCatalogContent);
+  const tools = readToolsForAttachmentCatalog(availableTools, attachmentCatalog);
   if (currentTurnInput?.reinject) {
     const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
     if (!current || current.role !== 'user') {
@@ -953,6 +973,22 @@ function normalizeToolDefinitions(value: PlainJsonValue | undefined): Normalized
   });
 }
 
+function readToolsForAttachmentCatalog(
+  tools: ToolSchema[],
+  attachmentCatalog: readonly AttachmentCatalogEntry[]
+): ToolSchema[] {
+  const includeManagedAttachments = attachmentCatalog.length > 0;
+  const includeManagedPageRanges = attachmentCatalog.some((entry) =>
+    entry.mimeType === 'text/plain' || entry.mimeType === 'application/pdf');
+  return tools.map((tool) => tool.name === READ_TOOL_NAME
+    ? {
+        ...tool,
+        description: readFileToolDescription(includeManagedAttachments, includeManagedPageRanges),
+        parameters: readFileToolParameters(includeManagedAttachments, includeManagedPageRanges)
+      }
+    : tool);
+}
+
 function providerToolAllowed(
   policy: ReturnType<typeof authorityToolPolicy>,
   tool: NormalizedProviderToolDefinition
@@ -968,6 +1004,117 @@ function providerToolAllowed(
     ? config.disabledTools.filter((name): name is string => typeof name === 'string')
     : [];
   return !disabled.includes(tool.schema.name);
+}
+
+function appendTextPart(
+  parts: MessageContent['parts'],
+  delta: string,
+  thought: boolean,
+  thoughtSignature?: string
+): void {
+  const last = parts[parts.length - 1];
+  if (last && 'text' in last && (last.thought === true) === thought
+    && (!thought || last.thoughtDurationMs === undefined)) {
+    last.text += delta;
+    if (thought && thoughtSignature) last.thoughtSignature = thoughtSignature;
+    return;
+  }
+  parts.push({
+    text: delta,
+    ...(thought ? { thought: true, ...(thoughtSignature ? { thoughtSignature } : {}) } : {})
+  });
+}
+
+function completeLastThoughtPart(
+  parts: MessageContent['parts'],
+  durationMs: number,
+  thoughtSignature?: string
+): void {
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const part = parts[index];
+    if (!part || !('text' in part) || part.thought !== true || part.thoughtDurationMs !== undefined) continue;
+    part.thoughtDurationMs = durationMs;
+    if (thoughtSignature) part.thoughtSignature = thoughtSignature;
+    return;
+  }
+  if (thoughtSignature || durationMs > 0) {
+    parts.push({
+      text: '',
+      thought: true,
+      ...(thoughtSignature ? { thoughtSignature } : {}),
+      thoughtDurationMs: durationMs
+    });
+  }
+}
+
+function upsertFunctionCallParts(parts: MessageContent['parts'], calls: readonly ToolCallOutput[]): void {
+  for (const call of calls) {
+    const functionIndexes = parts
+      .map((part, index) => 'functionCall' in part ? index : -1)
+      .filter((index) => index >= 0);
+    const byId = call.id
+      ? parts.findIndex((part) => 'functionCall' in part && part.id === call.id)
+      : -1;
+    const existingIndex = byId >= 0 ? byId : functionIndexes[call.ordinal] ?? -1;
+    const next = {
+      ...(call.id ? { id: call.id } : {}),
+      functionCall: { name: call.name, args: call.arguments },
+      ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {})
+    };
+    if (existingIndex >= 0) parts[existingIndex] = next;
+    else parts.push(next);
+  }
+}
+
+function messageContentFromDonePayload(value: unknown): MessageContent | undefined {
+  if (value === undefined) return undefined;
+  const normalized = normalizePlainJson(value, 'LLM completed MessageContent');
+  const record = requireRecord(normalized, 'LLM completed MessageContent');
+  if (record.role !== 'model' || !Array.isArray(record.parts)) {
+    throw new TypeError('LLM completed MessageContent must contain model parts.');
+  }
+  return normalized as unknown as MessageContent;
+}
+
+function compactReadToolCallsInContent(content: MessageContent): MessageContent {
+  return {
+    ...content,
+    parts: content.parts.map((part) => {
+      if (!('functionCall' in part) || part.functionCall.name !== READ_TOOL_NAME) return part;
+      return {
+        ...part,
+        functionCall: {
+          ...part.functionCall,
+          args: compactReadFileToolArguments(part.functionCall.args)
+        }
+      };
+    })
+  };
+}
+
+function applyThoughtDurations(
+  content: MessageContent,
+  blockDurations: readonly number[],
+  totalDurationMs: number | undefined
+): MessageContent {
+  const parts = content.parts.map((part) => ({ ...part }));
+  const thoughtIndexes = parts
+    .map((part, index) => 'text' in part && part.thought === true ? index : -1)
+    .filter((index) => index >= 0);
+  let assigned = 0;
+  thoughtIndexes.forEach((partIndex, thoughtIndex) => {
+    const part = parts[partIndex];
+    if (!part || !('text' in part)) return;
+    const direct = blockDurations[thoughtIndex];
+    const duration = direct ?? (thoughtIndex === thoughtIndexes.length - 1 && totalDurationMs !== undefined
+      ? Math.max(0, totalDurationMs - assigned)
+      : undefined);
+    if (duration !== undefined) {
+      part.thoughtDurationMs = duration;
+      assigned += duration;
+    }
+  });
+  return { role: 'model', parts };
 }
 
 class CapabilityToolCallAccumulator {
@@ -1068,14 +1215,18 @@ function normalizeCapabilityToolCalls(value: unknown): NormalizedCapabilityToolC
     const argsJson = optionalText(record.argsJson);
     const id = optionalText(record.id);
     const explicitOrdinal = optionalOrdinal(record.ordinal ?? record.streamIndex);
+    const name = requireText(record.name, `LLM tool call ${index}.name`);
+    const normalizedArguments = argsJson
+      ? normalizePlainJson(JSON.parse(argsJson), `LLM tool call ${index}.argsJson`)
+      : normalizePlainJson(record.arguments ?? {}, `LLM tool call ${index}.arguments`);
     return {
       ...(id ? { id } : {}),
       ordinal: explicitOrdinal ?? index,
       hasExplicitOrdinal: explicitOrdinal !== undefined,
-      name: requireText(record.name, `LLM tool call ${index}.name`),
-      arguments: argsJson
-        ? normalizePlainJson(JSON.parse(argsJson), `LLM tool call ${index}.argsJson`)
-        : normalizePlainJson(record.arguments ?? {}, `LLM tool call ${index}.arguments`),
+      name,
+      arguments: name === READ_TOOL_NAME
+        ? normalizePlainJson(compactReadFileToolArguments(normalizedArguments), `LLM tool call ${index}.compactedReadArguments`)
+        : normalizedArguments,
       ...(optionalText(record.thoughtSignature) ? { thoughtSignature: optionalText(record.thoughtSignature) } : {})
     };
   });

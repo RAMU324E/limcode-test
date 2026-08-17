@@ -50,6 +50,10 @@ import {
   defaultLlmPromptCacheTtlForProvider,
   isPromptCacheSupportedProvider
 } from '../../shared/protocol';
+import {
+  geminiThinkingCapabilityForModel,
+  isGeminiThinkingLevelSupported
+} from '../../shared/geminiThinking';
 import type {
   ContentPart,
   FunctionCallPart,
@@ -351,7 +355,11 @@ export async function startLlmProvider(
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
     };
-    const provider = unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider;
+    const provider = installGeminiSchemaEncoder(
+      unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
+      settings.provider,
+      settings.model
+    );
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? unified.createLLMFromConfig({
           ...providerConfig,
@@ -473,6 +481,7 @@ async function runLlmAttempt(
   }
 
   let latestUsageMetadata: LlmUsageMetadataRecord | undefined;
+  let authoritativeCompletedContent: MessageContent | undefined;
   const timing: LlmAttemptTimingState = { streamTimingChunkCount: 0 };
   let activeThoughtBlock: ActiveThoughtBlock | undefined;
   let retryRecoveryPending = retryRecoveryNotice !== undefined;
@@ -514,6 +523,8 @@ async function runLlmAttempt(
       if (activeThoughtBlock && shouldCloseThoughtBlock(chunk)) activeThoughtBlock = finishThoughtBlock(request.id, activeThoughtBlock, chunkAt, emit);
       const chunkUsageMetadata = usageMetadataFromChunk(chunk);
       if (chunkUsageMetadata) latestUsageMetadata = mergeUsageMetadata(latestUsageMetadata, chunkUsageMetadata);
+      const completedContent = (chunk as LimCodeOpenAIResponsesStreamChunk).completedContent;
+      if (completedContent) authoritativeCompletedContent = fromUnifiedCompletedContent(completedContent);
       if (hasStreamTimingChunk(chunk)) {
         timing.firstStreamChunkAt ??= chunkAt;
         timing.firstStreamChunkMark ??= chunkMark;
@@ -553,6 +564,7 @@ async function runLlmAttempt(
     type: LlmEventType.Done,
     payload: {
       requestId: request.id,
+      ...(authoritativeCompletedContent ? { content: authoritativeCompletedContent } : {}),
       ...createDoneTiming(timing.firstStreamChunkAt, finishedAt, timing.firstStreamChunkMark, finishedMark, timing.streamTimingChunkCount),
       completedAt: finishedAt,
       ...(latestUsageMetadata ? { usageMetadata: latestUsageMetadata } : {})
@@ -1105,7 +1117,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = unified.createLLMFromConfig({
+  const provider = installGeminiSchemaEncoder(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -1117,7 +1129,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders);
+  }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model);
 
   const dryRun = (provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof dryRun !== 'function') {
@@ -1875,7 +1887,7 @@ async function resolveSummaryProvider(
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = unified.createLLMFromConfig({
+  const provider = installGeminiSchemaEncoder(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -1887,7 +1899,7 @@ async function resolveSummaryProvider(
     ...openAIResponsesWebSocketConfigEntry(runtimeSettings, request.conversationId),
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
-  }, registry.llmProviders);
+  }, registry.llmProviders), runtimeSettings.provider, runtimeSettings.model);
   return {
     provider,
     settings,
@@ -3443,6 +3455,178 @@ function toUnifiedFunctionDeclaration(tool: ToolSchema): UnifiedFunctionDeclarat
   };
 }
 
+function installGeminiSchemaEncoder<T>(
+  provider: T,
+  providerKind: LlmProviderKind,
+  modelId: string
+): T {
+  if (providerKind !== 'gemini') return provider;
+  const runtimeProvider = provider as T & {
+    format?: {
+      encodeRequest?: (request: unknown, stream: boolean) => unknown;
+      __limcodeGeminiSchemaEncoder?: true;
+    };
+  };
+  const format = runtimeProvider.format;
+  if (!format || typeof format.encodeRequest !== 'function' || format.__limcodeGeminiSchemaEncoder) return provider;
+  const originalEncodeRequest = format.encodeRequest.bind(format);
+  format.encodeRequest = (request, stream) => {
+    const normalizedRequest = normalizeGeminiThinkingRequest(request, modelId);
+    const encoded = originalEncodeRequest(normalizedRequest, stream);
+    restoreGeminiToolPropertyNames(encoded, normalizedRequest);
+    return encoded;
+  };
+  format.__limcodeGeminiSchemaEncoder = true;
+  return provider;
+}
+
+function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unknown {
+  if (!isRecord(request)) return request;
+  const capability = geminiThinkingCapabilityForModel(modelId);
+  if (capability.kind === 'unknown') return request;
+
+  const generationConfig = isRecord(request.generationConfig) ? request.generationConfig : {};
+  const sourceThinkingConfig = isRecord(generationConfig.thinkingConfig)
+    ? generationConfig.thinkingConfig
+    : {};
+  const thinkingConfig: Record<string, unknown> = { ...sourceThinkingConfig };
+
+  if (capability.kind === 'thinkingLevel') {
+    const configuredLevel = sourceThinkingConfig.thinkingLevel;
+    thinkingConfig.thinkingLevel = isGeminiThinkingLevelSupported(capability, configuredLevel)
+      ? configuredLevel
+      : capability.defaultLevel;
+    delete thinkingConfig.thinkingBudget;
+    if (thinkingConfig.includeThoughts === undefined) thinkingConfig.includeThoughts = true;
+  } else {
+    delete thinkingConfig.thinkingLevel;
+    if (capability.kind === 'unsupported') delete thinkingConfig.thinkingBudget;
+  }
+
+  const nextGenerationConfig: Record<string, unknown> = { ...generationConfig };
+  if (Object.keys(thinkingConfig).length > 0) nextGenerationConfig.thinkingConfig = thinkingConfig;
+  else delete nextGenerationConfig.thinkingConfig;
+  const { generationConfig: _sourceGenerationConfig, ...requestWithoutGenerationConfig } = request;
+  return Object.keys(nextGenerationConfig).length > 0
+    ? { ...requestWithoutGenerationConfig, generationConfig: nextGenerationConfig }
+    : requestWithoutGenerationConfig;
+}
+
+function restoreGeminiToolPropertyNames(encodedRequest: unknown, sourceRequest: unknown): void {
+  if (!isRecord(encodedRequest) || !isRecord(sourceRequest)) return;
+  const encodedGroups = Array.isArray(encodedRequest.tools) ? encodedRequest.tools : [];
+  const sourceGroups = Array.isArray(sourceRequest.tools) ? sourceRequest.tools : [];
+  const sourceDeclarations = sourceGroups.flatMap((group) => {
+    if (!isRecord(group) || !Array.isArray(group.functionDeclarations)) return [];
+    return group.functionDeclarations.filter(isRecord);
+  });
+  const sourceByName = new Map(sourceDeclarations
+    .filter((declaration) => typeof declaration.name === 'string')
+    .map((declaration) => [declaration.name as string, declaration]));
+  for (const group of encodedGroups) {
+    if (!isRecord(group) || !Array.isArray(group.functionDeclarations)) continue;
+    for (const declaration of group.functionDeclarations) {
+      if (!isRecord(declaration) || typeof declaration.name !== 'string') continue;
+      const source = sourceByName.get(declaration.name);
+      if (!source?.parameters) continue;
+      declaration.parameters = sanitizeGeminiFunctionSchema(source.parameters);
+    }
+  }
+}
+
+const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
+  'title',
+  'default',
+  'const',
+  '$defs',
+  'definitions',
+  '$schema',
+  'not',
+  'if',
+  'then',
+  'else',
+  'prefixItems',
+  'additionalProperties',
+  'multipleOf'
+]);
+
+function sanitizeGeminiFunctionSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeGeminiFunctionSchema);
+  if (!isRecord(value)) return value;
+
+  const result: Record<string, unknown> = {};
+  let stringifiedEnum = false;
+  for (const [key, child] of Object.entries(value)) {
+    if (GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(key)) continue;
+    if (key === 'properties' && isRecord(child)) {
+      result.properties = Object.fromEntries(
+        Object.entries(child).map(([propertyName, propertySchema]) => [
+          propertyName,
+          sanitizeGeminiFunctionSchema(propertySchema)
+        ])
+      );
+      continue;
+    }
+    if ((key === 'anyOf' || key === 'oneOf' || key === 'allOf') && Array.isArray(child)) {
+      const otherKeys = Object.keys(value).filter((candidate) =>
+        candidate !== key && !GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(candidate)
+      );
+      if (otherKeys.length === 0 && child.length > 0) {
+        const first = sanitizeGeminiFunctionSchema(child[0]);
+        if (isRecord(first)) Object.assign(result, first);
+      }
+      continue;
+    }
+    if (key === 'enum' && Array.isArray(child)) {
+      result.enum = child.map((item) => String(item));
+      stringifiedEnum = true;
+      continue;
+    }
+    result[key] = sanitizeGeminiFunctionSchema(child);
+  }
+
+  if (stringifiedEnum && (result.type === 'integer' || result.type === 'number')) result.type = 'string';
+  if (Array.isArray(result.required) && isRecord(result.properties)) {
+    const required = result.required.filter((propertyName): propertyName is string =>
+      typeof propertyName === 'string' && Object.prototype.hasOwnProperty.call(result.properties, propertyName)
+    );
+    if (required.length > 0) result.required = required;
+    else delete result.required;
+  }
+  return result;
+}
+
+function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
+  const parts: ContentPart[] = [];
+  for (const part of content.parts ?? []) {
+    if (isUnifiedThoughtTextPart(part)) {
+      const signature = thoughtSignatureFromPart(part);
+      parts.push({
+        text: part.text ?? '',
+        thought: true,
+        ...(signature ? { thoughtSignature: signature } : {})
+      });
+      continue;
+    }
+    if ('text' in part && typeof part.text === 'string') {
+      parts.push({ text: part.text });
+      continue;
+    }
+    if (isUnifiedFunctionCallPart(part)) {
+      const signature = thoughtSignatureFromPart(part);
+      parts.push({
+        ...(part.functionCall.callId ? { id: part.functionCall.callId } : {}),
+        functionCall: {
+          name: part.functionCall.name,
+          args: part.functionCall.args ?? {}
+        },
+        ...(signature ? { thoughtSignature: signature } : {})
+      });
+    }
+  }
+  return { role: 'model', parts };
+}
+
 export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk, emit: Emit): void {
   const text = chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
   if (text) emit({ type: LlmEventType.Delta, payload: { requestId, text } });
@@ -3464,16 +3648,36 @@ export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk
     });
   }
 
-  const calls = [
+  const callParts = [
     ...(chunk.functionCalls ?? []),
     ...(chunk.partsDelta ?? []).filter(isUnifiedFunctionCallPart)
-  ].map((part, index) => {
+  ];
+  const stableCallIndexes = new Map<string, number>();
+  const calls: Array<{ id: string; name: string; argsJson: string; thoughtSignature?: string }> = [];
+  callParts.forEach((part, index) => {
+    const stableCallId = part.functionCall.callId;
     const thoughtSignature = thoughtSignatureFromPart(part);
-    return {
-      id: part.functionCall.callId ?? `tool_call_${index}`,
+    const candidate = {
+      id: stableCallId ?? `tool_call_${index}`,
       name: part.functionCall.name,
       argsJson: stringifyJson(part.functionCall.args ?? {}),
       ...(thoughtSignature ? { thoughtSignature } : {})
+    };
+    const existingIndex = stableCallId ? stableCallIndexes.get(stableCallId) : undefined;
+    if (existingIndex === undefined) {
+      if (stableCallId) stableCallIndexes.set(stableCallId, calls.length);
+      calls.push(candidate);
+      return;
+    }
+
+    const existing = calls[existingIndex];
+    calls[existingIndex] = {
+      id: existing.id,
+      name: existing.name.trim() ? existing.name : candidate.name,
+      argsJson: candidate.argsJson.length > existing.argsJson.length ? candidate.argsJson : existing.argsJson,
+      ...(existing.thoughtSignature || candidate.thoughtSignature
+        ? { thoughtSignature: existing.thoughtSignature ?? candidate.thoughtSignature }
+        : {})
     };
   });
 
@@ -3653,7 +3857,10 @@ function disposeThoughtBlock(block: ActiveThoughtBlock): undefined {
 }
 
 function shouldCloseThoughtBlock(chunk: UnifiedLLMStreamChunk): boolean {
-  return !!chunk.finishReason || hasStreamOutput(chunk) || hasThoughtSignatureOnlyOutput(chunk);
+  return (chunk as LimCodeOpenAIResponsesStreamChunk).reasoningItemDone === true
+    || !!chunk.finishReason
+    || hasStreamOutput(chunk)
+    || hasThoughtSignatureOnlyOutput(chunk);
 }
 
 function finishThoughtBlock(requestId: string, block: ActiveThoughtBlock, finishedAt: number, emit: Emit): undefined {

@@ -1,4 +1,5 @@
 import type { LlmProviderKind, LlmReasoningMode, LlmThinkingLevel } from '@shared/protocol';
+import { geminiThinkingCapabilityForModel } from '@shared/geminiThinking';
 
 export type LlmParameterValueType = 'number' | 'boolean' | 'enum';
 
@@ -203,27 +204,38 @@ export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = 
   }
 ];
 
-export function thinkingLevelDefinition(provider: LlmProviderKind): LlmParameterDefinition {
-  const options = THINKING_LEVEL_OPTIONS[provider] ?? THINKING_LEVEL_OPTIONS['openai-compatible'];
+export function thinkingLevelDefinition(provider: LlmProviderKind, modelId?: string): LlmParameterDefinition {
+  const capability = provider === 'gemini' ? geminiThinkingCapabilityForModel(modelId) : undefined;
+  const options = capability?.levels.length
+    ? capability.levels.map((level) => THINKING_LEVEL_OPTIONS.gemini.find((option) => option.value === level)!)
+    : THINKING_LEVEL_OPTIONS[provider] ?? THINKING_LEVEL_OPTIONS['openai-compatible'];
   return withProviderDisplay({
     key: 'thinkingLevel',
     path: ['thinkingConfig', 'thinkingLevel'],
     label: '思考强度',
     description: 'LLM 的思考或推理强度；系统会按当前渠道转换为对应请求参数。',
     valueType: 'enum',
-    defaultValue: options[0]?.value ?? 'low',
+    defaultValue: capability?.kind === 'thinkingLevel' ? capability.defaultLevel : options[0]?.value ?? 'low',
     providers: [provider],
     options
   }, provider);
 }
 
-export function parameterDefinitionsForProvider(provider: LlmProviderKind): LlmParameterDefinition[] {
-  return [
-    ...LLM_PARAMETER_DEFINITIONS
-      .filter((definition) => definition.providers.includes(provider))
-      .map((definition) => withProviderDisplay(definition, provider)),
-    thinkingLevelDefinition(provider)
-  ];
+export function parameterDefinitionsForProvider(provider: LlmProviderKind, modelId?: string): LlmParameterDefinition[] {
+  const geminiCapability = provider === 'gemini' ? geminiThinkingCapabilityForModel(modelId) : undefined;
+  const definitions = LLM_PARAMETER_DEFINITIONS
+    .filter((definition) => definition.providers.includes(provider))
+    .filter((definition) => {
+      if (provider !== 'gemini' || definition.key !== 'thinkingBudget') return true;
+      return geminiCapability?.kind === 'thinkingBudget' || geminiCapability?.kind === 'unknown';
+    })
+    .map((definition) => withProviderDisplay(definition, provider));
+  const supportsThinkingLevel = provider !== 'gemini'
+    || geminiCapability?.kind === 'thinkingLevel'
+    || geminiCapability?.kind === 'unknown';
+  return supportsThinkingLevel
+    ? [...definitions, thinkingLevelDefinition(provider, modelId)]
+    : definitions;
 }
 
 export function labelForProvider(provider: LlmProviderKind): string {

@@ -29,7 +29,7 @@ export function createTerminalValidatedFetch(
   const bodyIdleTimeoutMs = positiveTimeout(options.bodyIdleTimeoutMs ?? DEFAULT_BODY_IDLE_TIMEOUT_MS);
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const response = await baseFetch(input, init);
-    if (!response.body || !isEventStream(response.headers.get('content-type'))) return response;
+    if (!response.ok || !response.body || !isEventStream(response.headers.get('content-type'))) return response;
 
     const reader = response.body.getReader();
     const tracker = new SseTerminalTracker(provider);

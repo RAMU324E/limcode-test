@@ -1,7 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const path = require('node:path');
 const http = require('node:http');
+const esbuild = require('esbuild');
 const { WebSocketServer } = require('ws');
 
 const originalLoad = Module._load;
@@ -24,7 +26,36 @@ const {
   emitUnifiedChunk,
   startLlmProvider
 } = require('../dist/extension/backend/capabilities/llmProvider.js');
+const {
+  createTerminalValidatedFetch
+} = require('../dist/extension/backend/capabilities/terminalValidatedFetch.js');
+const {
+  geminiThinkingCapabilityForModel
+} = require('../dist/extension/shared/geminiThinking.js');
 const { LlmEventType } = require('../dist/extension/backend/world/modules/llm/events.js');
+
+function loadLlmParameterDefinitions() {
+  const root = path.resolve(__dirname, '..');
+  const result = esbuild.buildSync({
+    entryPoints: [path.join(root, 'webview/src/components/settings/global/parameters/llmParameterDefinitions.ts')],
+    absWorkingDir: root,
+    bundle: true,
+    write: false,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node18',
+    tsconfig: path.join(root, 'tsconfig.webview.json'),
+    logLevel: 'silent'
+  });
+  const filename = path.join(root, '.test-gemini-thinking-parameters.cjs');
+  const compiled = new Module(filename, module);
+  compiled.filename = filename;
+  compiled.paths = Module._nodeModulePaths(root);
+  compiled._compile(result.outputFiles[0].text, filename);
+  return compiled.exports;
+}
+
+const { parameterDefinitionsForProvider } = loadLlmParameterDefinitions();
 
 function providerConfig(overrides = {}) {
   return {
@@ -312,6 +343,172 @@ test('missing or invalid transport keeps the normal OpenAI Responses HTTP dry-ru
   assert.match(result.curl, /^curl /);
 });
 
+test('Gemini dry-run removes unsupported multipleOf from nested tool schemas', async () => {
+  const request = chatRequest('request-gemini-multiple-of');
+  request.tools = [{
+    name: 'integer_value',
+    description: 'Checks nested numeric schema compatibility.',
+    parameters: {
+      type: 'object',
+      properties: {
+        options: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            value: { type: 'number', minimum: 0, maximum: 100, multipleOf: 1 }
+          },
+          required: ['title']
+        }
+      }
+    }
+  }];
+  const result = await dryRunLlmProvider(request, {
+    settings: async () => providerConfig({
+      provider: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      model: 'gemini-test',
+      stream: true
+    })
+  });
+
+  assert.doesNotMatch(result.bodyText, /multipleOf/i);
+  assert.match(result.bodyText, /"minimum":\s*0/);
+  assert.match(result.bodyText, /"maximum":\s*100/);
+  const declaration = result.body.tools[0].functionDeclarations[0];
+  assert.equal(declaration.parameters.properties.options.properties.title.type, 'string');
+  assert.deepEqual(declaration.parameters.properties.options.required, ['title']);
+});
+
+function geminiProviderConfig(overrides = {}) {
+  return providerConfig({
+    provider: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    model: 'gemini-3.7-flash',
+    models: [],
+    apiKey: '',
+    ...overrides
+  });
+}
+
+async function dryRunGeminiThinkingConfig(config, id) {
+  const result = await dryRunLlmProvider(chatRequest(id), { settings: async () => config });
+  return result.body.generationConfig?.thinkingConfig;
+}
+
+test('Gemini thinking capability follows model-specific official level sets', () => {
+  assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3.7-flash'), {
+    kind: 'thinkingLevel',
+    levels: ['low', 'medium', 'high'],
+    defaultLevel: 'high'
+  });
+  assert.deepEqual(geminiThinkingCapabilityForModel('models/gemini-3-flash-preview').levels, [
+    'minimal', 'low', 'medium', 'high'
+  ]);
+  assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3.7-flash-lite').levels, [
+    'minimal', 'low', 'medium', 'high'
+  ]);
+  assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3.1-pro-preview').levels, [
+    'low', 'medium', 'high'
+  ]);
+  assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3-pro-preview').levels, ['low', 'high']);
+  assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3.1-flash-lite-image').levels, ['minimal', 'high']);
+  assert.equal(geminiThinkingCapabilityForModel('gemini-2.5-pro').kind, 'thinkingBudget');
+});
+
+test('Gemini 3.7 parameter definitions expose only low, medium, high with high default', () => {
+  const definitions = parameterDefinitionsForProvider('gemini', 'gemini-3.7-flash');
+  const level = definitions.find((definition) => definition.key === 'thinkingLevel');
+  assert.ok(level);
+  assert.equal(level.defaultValue, 'high');
+  assert.deepEqual(level.options.map((option) => option.value), ['low', 'medium', 'high']);
+  assert.equal(definitions.some((definition) => definition.key === 'thinkingBudget'), false);
+  assert.equal(level.options.some((option) => ['minimal', 'xhigh', 'max'].includes(option.value)), false);
+
+  const gemini25 = parameterDefinitionsForProvider('gemini', 'gemini-2.5-flash');
+  assert.equal(gemini25.some((definition) => definition.key === 'thinkingBudget'), true);
+  assert.equal(gemini25.some((definition) => definition.key === 'thinkingLevel'), false);
+});
+
+test('Gemini explicit supported level survives provider config normalization', () => {
+  const normalized = normalizeLlmProviderConfig(geminiProviderConfig({
+    generationConfig: { thinkingConfig: { thinkingLevel: 'medium', includeThoughts: true } }
+  }));
+  assert.deepEqual(normalized.generationConfig?.thinkingConfig, {
+    includeThoughts: true,
+    thinkingLevel: 'medium'
+  });
+});
+
+test('Gemini 3.7 dry-run defaults to high thinking and thought summaries', async () => {
+  const thinkingConfig = await dryRunGeminiThinkingConfig(
+    geminiProviderConfig(),
+    'request-gemini-37-default-thinking'
+  );
+  assert.deepEqual(thinkingConfig, {
+    thinkingLevel: 'high',
+    includeThoughts: true
+  });
+});
+
+test('Gemini 3.7 preserves every explicitly supported thinking level', async () => {
+  for (const thinkingLevel of ['low', 'medium', 'high']) {
+    const thinkingConfig = await dryRunGeminiThinkingConfig(geminiProviderConfig({
+      generationConfig: { thinkingConfig: { thinkingLevel } }
+    }), `request-gemini-37-${thinkingLevel}`);
+    assert.equal(thinkingConfig.thinkingLevel, thinkingLevel);
+    assert.equal(thinkingConfig.includeThoughts, true);
+  }
+});
+
+test('Gemini 3.7 replaces unsupported levels and legacy numeric budgets with high', async () => {
+  for (const [label, configured] of [
+    ['minimal', { thinkingLevel: 'minimal' }],
+    ['xhigh', { thinkingLevel: 'xhigh' }],
+    ['max', { thinkingLevel: 'max' }],
+    ['budget', { thinkingBudget: 10_000 }]
+  ]) {
+    const thinkingConfig = await dryRunGeminiThinkingConfig(geminiProviderConfig({
+      generationConfig: { thinkingConfig: configured }
+    }), `request-gemini-37-invalid-${label}`);
+    assert.equal(thinkingConfig.thinkingLevel, 'high');
+    assert.equal(thinkingConfig.includeThoughts, true);
+    assert.equal('thinkingBudget' in thinkingConfig, false);
+  }
+});
+
+test('Gemini 2.5 keeps numeric budget and omits thinkingLevel at the request boundary', async () => {
+  const thinkingConfig = await dryRunGeminiThinkingConfig(geminiProviderConfig({
+    model: 'gemini-2.5-pro',
+    generationConfig: {
+      thinkingConfig: {
+        thinkingBudget: 4_096,
+        thinkingLevel: 'high'
+      }
+    }
+  }), 'request-gemini-25-budget');
+  assert.deepEqual(thinkingConfig, {
+    thinkingBudget: 4_096,
+    includeThoughts: true
+  });
+});
+
+test('Gemini raw requestBody keeps final override priority over normalized defaults', async () => {
+  const thinkingConfig = await dryRunGeminiThinkingConfig(geminiProviderConfig({
+    requestBody: {
+      generationConfig: {
+        thinkingConfig: {
+          thinkingLevel: 'low',
+          includeThoughts: false
+        }
+      }
+    }
+  }), 'request-gemini-37-request-body-override');
+  assert.deepEqual(thinkingConfig, {
+    thinkingLevel: 'low',
+    includeThoughts: false
+  });
+});
+
 test('final recoverable WS failure falls back to HTTP once and applies a short conversation cooldown', async () => {
   const server = await createTransportFallbackServer();
   try {
@@ -419,4 +616,76 @@ test('LimCode WS chunks expose argument previews before the completed tool call'
   assert.equal(events[0].payload.calls[0].argumentsDelta, '{"path":"demo.ts"');
   assert.deepEqual(events[1].payload.callIds, ['call-preview']);
   assert.equal(events[2].payload.calls[0].argsJson, '{"path":"demo.ts","content":"x"}');
+});
+
+test('terminal validation passes through non-2xx event-stream JSON errors unchanged', async () => {
+  const body = JSON.stringify({
+    error: {
+      code: 503,
+      status: 'UNAVAILABLE',
+      message: 'provider unavailable'
+    }
+  });
+  const original = new Response(body, {
+    status: 503,
+    headers: { 'content-type': 'text/event-stream' }
+  });
+  const guarded = createTerminalValidatedFetch(async () => original, 'gemini');
+
+  const response = await guarded('https://example.invalid');
+  assert.equal(response, original);
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    error: {
+      code: 503,
+      status: 'UNAVAILABLE',
+      message: 'provider unavailable'
+    }
+  });
+});
+
+test('terminal validation still rejects a truncated 2xx event stream', async () => {
+  const guarded = createTerminalValidatedFetch(async () => new Response(
+    'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n\n',
+    { status: 200, headers: { 'content-type': 'text/event-stream' } }
+  ), 'gemini');
+
+  const response = await guarded('https://example.invalid');
+  assert.equal(response.status, 200);
+  await assert.rejects(response.text(), (error) => error?.code === 'LLM_STREAM_TRUNCATED');
+});
+
+test('Gemini stream chunks merge complementary call representations with the same stable id', () => {
+  const events = [];
+
+  emitUnifiedChunk('request-gemini-tool', {
+    functionCalls: [{
+      functionCall: {
+        callId: 'call-gemini-stable',
+        name: 'get_weather',
+        args: { city: 'Paris' }
+      }
+    }],
+    partsDelta: [{
+      functionCall: {
+        callId: 'call-gemini-stable',
+        name: 'get_weather',
+        args: { city: 'Paris' }
+      },
+      thoughtSignature: 'gemini:signature'
+    }]
+  }, (event) => events.push(event));
+
+  assert.deepEqual(events.map((event) => event.type), [
+    LlmEventType.ToolCallPreviewDone,
+    LlmEventType.ToolCall
+  ]);
+  assert.deepEqual(events[0].payload.callIds, ['call-gemini-stable']);
+  assert.equal(events[1].payload.calls.length, 1);
+  assert.deepEqual(events[1].payload.calls[0], {
+    id: 'call-gemini-stable',
+    name: 'get_weather',
+    argsJson: '{"city":"Paris"}',
+    thoughtSignature: 'gemini:signature'
+  });
 });

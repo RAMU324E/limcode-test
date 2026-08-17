@@ -1269,7 +1269,7 @@ test('completed output owns reasoning and tool order while done supplies one tru
   }
 });
 
-test('multiple independent reasoning items remain visible but do not commit a lossy baseline', { concurrency: false }, async () => {
+test('multiple independent reasoning items preserve boundaries and commit one exact continuation baseline', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const requests = [];
   const first = reasoningItem('rs_first', ['first'], 'signature-first');
@@ -1294,16 +1294,110 @@ test('multiple independent reasoning items remain visible but do not commit a lo
       'multiple-reasoning-items',
       requestBody(format, [initial])
     ));
-    assert.equal(streamedThought(chunks), 'firstsecond');
+    assert.equal(streamedThought(chunks), 'first\nsecond');
+    assert.deepEqual(
+      chunks.find((chunk) => chunk.completedContent)?.completedContent,
+      {
+        role: 'model',
+        parts: [
+          {
+            text: 'first',
+            thought: true,
+            thoughtSignatures: { 'openai-responses': 'signature-first' }
+          },
+          {
+            text: 'second',
+            thought: true,
+            thoughtSignatures: { 'openai-responses': 'signature-second' }
+          }
+        ]
+      }
+    );
 
     await collect(streamOptions(
       server,
       format,
       'multiple-reasoning-items',
-      requestBody(format, [initial, reasoningModel('firstsecond', 'signature-second'), user('continue')])
+      requestBody(format, [initial, {
+        role: 'model',
+        parts: [
+          {
+            text: 'first',
+            thought: true,
+            thoughtSignatures: { 'openai-responses': 'signature-first' }
+          },
+          {
+            text: 'second',
+            thought: true,
+            thoughtSignatures: { 'openai-responses': 'signature-second' }
+          }
+        ]
+      }, user('continue')])
     ));
-    assert.equal('previous_response_id' in requests[1].request, false);
-    assert.equal(requests[1].request.input.length, 3);
+    assert.equal(requests[1].request.previous_response_id, 'resp_multiple_reasoning');
+    assert.equal(requests[1].request.input.length, 1);
+    assert.equal(requests[1].request.input[0].role, 'user');
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('completed content preserves reasoning-tool-reasoning-text order', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const first = reasoningItem('rs_order_first', ['inspect'], 'signature-inspect');
+  const second = reasoningItem('rs_order_second', ['verify'], 'signature-verify');
+  const call = {
+    id: 'fc_order',
+    type: 'function_call',
+    call_id: 'call_order',
+    name: 'read',
+    arguments: '{"path":"ordered.txt"}'
+  };
+  const answer = {
+    id: 'msg_order',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'done', annotations: [] }]
+  };
+  const server = await createServer((socket) => {
+    sendCompleted(socket, 'resp_reasoning_tool_reasoning', [first, call, second, answer]);
+  });
+  try {
+    const format = await formatForTest();
+    const chunks = await collect(streamOptions(
+      server,
+      format,
+      'reasoning-tool-reasoning-order',
+      requestBody(format, [user('preserve ordered output')])
+    ));
+    assert.equal(streamedThought(chunks), 'inspect\nverify');
+    assert.deepEqual(
+      chunks.find((chunk) => chunk.completedContent)?.completedContent,
+      {
+        role: 'model',
+        parts: [
+          {
+            text: 'inspect',
+            thought: true,
+            thoughtSignatures: { 'openai-responses': 'signature-inspect' }
+          },
+          {
+            functionCall: {
+              name: 'read',
+              args: { path: 'ordered.txt' },
+              callId: 'call_order'
+            }
+          },
+          {
+            text: 'verify',
+            thought: true,
+            thoughtSignatures: { 'openai-responses': 'signature-verify' }
+          },
+          { text: 'done' }
+        ]
+      }
+    );
   } finally {
     resetOpenAIResponsesWebSocketSessions();
     await server.close();

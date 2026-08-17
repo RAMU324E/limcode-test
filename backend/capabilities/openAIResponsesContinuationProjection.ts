@@ -1,4 +1,4 @@
-import type { LLMRequest, LLMStreamChunk, Part } from 'unified-llm-provider';
+import type { Content, LLMRequest, LLMStreamChunk, Part } from 'unified-llm-provider';
 
 export interface OpenAIResponsesContinuationEncoder {
   encodeRequest(request: LLMRequest, stream?: boolean): unknown;
@@ -9,10 +9,21 @@ export interface OpenAIResponsesContinuationProjectionResult {
   semanticOutput: boolean;
 }
 
+export interface OpenAIResponsesCompletedProjection {
+  content: Content;
+  outputItems: unknown[];
+}
+
 interface DoneOutputItem {
   item: Record<string, unknown>;
   outputIndex?: number;
   key: string;
+}
+
+interface TerminalOutputItem {
+  item: Record<string, unknown>;
+  outputIndex: number;
+  trustedSignature?: string;
 }
 
 interface ProjectedFunctionCall {
@@ -21,9 +32,15 @@ interface ProjectedFunctionCall {
   args: Record<string, unknown>;
 }
 
-interface ReasoningIdentity {
+interface ProjectedReasoningItem {
+  key: string;
   itemId?: string;
   outputIndex?: number;
+  text: string;
+  trustedSignature?: string;
+  summaryTextByIndex: Map<number, string>;
+  completedSummaryIndexes: Set<number>;
+  lastStreamedSummaryIndex?: number;
 }
 
 /**
@@ -36,16 +53,13 @@ interface ReasoningIdentity {
 export class OpenAIResponsesContinuationProjection {
   private visibleText = '';
   private thoughtText = '';
-  private thoughtSignature?: string;
   private readonly functionCalls: ProjectedFunctionCall[] = [];
   private readonly functionCallIndexes = new Map<string, number>();
   private readonly doneItems: DoneOutputItem[] = [];
   private readonly doneItemIndexes = new Map<string, number>();
   private completedOutput?: Record<string, unknown>[];
-  private reasoningIdentity?: ReasoningIdentity;
-  private readonly summaryTextByIndex = new Map<number, string>();
-  private readonly completedSummaryIndexes = new Set<number>();
-  private lastStreamedSummaryIndex?: number;
+  private readonly reasoningItems: ProjectedReasoningItem[] = [];
+  private readonly reasoningItemsByKey = new Map<string, ProjectedReasoningItem>();
   private unsafeReason?: string;
 
   public observe(
@@ -53,50 +67,74 @@ export class OpenAIResponsesContinuationProjection {
     decoded: LLMStreamChunk
   ): OpenAIResponsesContinuationProjectionResult {
     this.captureTerminalEvidence(raw);
-    const chunk = this.canonicalChunk(raw, decoded);
+    const canonical = this.canonicalChunk(raw, decoded);
+    const chunk = this.withReasoningItemBoundary(raw, canonical);
     this.accumulateChunk(raw, chunk);
     if (eventType(raw) === 'response.output_item.done') this.validateReasoningTerminal(raw);
     return { chunk, semanticOutput: hasSemanticChunkOutput(chunk) };
   }
 
-  public completedOutputItems(encoder: OpenAIResponsesContinuationEncoder): unknown[] | undefined {
+  public completedProjection(encoder: OpenAIResponsesContinuationEncoder): OpenAIResponsesCompletedProjection | undefined {
     if (this.unsafeReason) return undefined;
     const terminalItems = this.terminalItems();
     if (!terminalItems) return undefined;
     if (!this.validateTerminalProjection(terminalItems)) return undefined;
-    if (terminalItems.length === 0) return [];
+    if (terminalItems.length === 0) return { content: { role: 'model', parts: [] }, outputItems: [] };
 
     const parts: Part[] = [];
-    if (this.thoughtText || this.thoughtSignature) {
-      parts.push({
-        text: this.thoughtText,
-        thought: true,
-        ...(this.thoughtSignature
-          ? { thoughtSignatures: { 'openai-responses': this.thoughtSignature } }
-          : {})
-      });
+    let functionIndex = 0;
+    for (const entry of terminalItems) {
+      if (entry.item.type === 'reasoning') {
+        const reasoning = this.reasoningForTerminalItem(entry);
+        if (!reasoning) return undefined;
+        parts.push({
+          text: reasoning.text,
+          thought: true,
+          ...(reasoning.trustedSignature
+            ? { thoughtSignatures: { 'openai-responses': reasoning.trustedSignature } }
+            : {})
+        });
+        continue;
+      }
+      if (entry.item.type === 'message') {
+        const text = assistantMessageText(entry.item);
+        if (text) parts.push({ text });
+        continue;
+      }
+      if (entry.item.type === 'function_call') {
+        const call = this.functionCalls[functionIndex++];
+        if (!call) return undefined;
+        parts.push({
+          functionCall: {
+            name: call.name,
+            args: cloneJson(call.args),
+            callId: call.callId
+          }
+        });
+      }
     }
-    if (this.visibleText) parts.push({ text: this.visibleText });
-    for (const call of this.functionCalls) {
-      parts.push({
-        functionCall: {
-          name: call.name,
-          args: cloneJson(call.args),
-          callId: call.callId
-        }
-      });
-    }
-    if (parts.length === 0) return undefined;
 
+    if (parts.length === 0) return undefined;
+    const content: Content = { role: 'model', parts };
     let encoded: unknown;
     try {
-      encoded = encoder.encodeRequest({ contents: [{ role: 'model', parts }] }, false);
+      encoded = encoder.encodeRequest({ contents: [content] }, false);
     } catch {
       return undefined;
     }
     return isRecord(encoded) && Array.isArray(encoded.input)
-      ? encoded.input.map(cloneJson)
+      ? { content, outputItems: encoded.input.map(cloneJson) }
       : undefined;
+  }
+
+  private withReasoningItemBoundary(raw: Record<string, unknown>, decoded: LLMStreamChunk): LLMStreamChunk {
+    if (eventType(raw) !== 'response.output_item.done'
+      || !isRecord(raw.item)
+      || raw.item.type !== 'reasoning') return decoded;
+    const reasoning = this.reasoningItemForEvent(raw);
+    if (!reasoning || reasoning.text || !this.thoughtText) return decoded;
+    const text = (decoded.partsDelta ?? []).filter(isThoughtTextPart).map((part) => part.text ?? '').join('');
+    return text ? withCanonicalThoughtText(decoded, `\n${text}`) : decoded;
   }
 
   private canonicalChunk(raw: Record<string, unknown>, decoded: LLMStreamChunk): LLMStreamChunk {
@@ -109,57 +147,60 @@ export class OpenAIResponsesContinuationProjection {
       ? optionalString(raw.delta)
       : reasoningFullText(raw, type);
     if (!rawText) return decoded;
-    const identity = reasoningIdentity(raw);
-    if (!identity || !this.registerReasoningIdentity(identity)) return decoded;
+    const reasoning = this.reasoningItemForEvent(raw);
+    if (!reasoning) return decoded;
     const summaryIndex = nonNegativeInteger(raw.summary_index) ?? 0;
-    const isNewBlock = !this.summaryTextByIndex.has(summaryIndex);
-    if (!this.registerSummaryBlock(summaryIndex)) return decoded;
+    const isNewBlock = !reasoning.summaryTextByIndex.has(summaryIndex);
+    if (!this.registerSummaryBlock(reasoning, summaryIndex)) return decoded;
 
     const thoughtParts = (decoded.partsDelta ?? []).filter(isThoughtTextPart);
     const decodedText = thoughtParts.map((part) => part.text ?? '').join('');
-    const existingText = this.summaryTextByIndex.get(summaryIndex) ?? '';
-    let projectedText: string;
+    const existingText = reasoning.summaryTextByIndex.get(summaryIndex) ?? '';
+    let rawProjectedText: string;
     if (isDelta) {
-      if (this.completedSummaryIndexes.has(summaryIndex)) {
+      if (reasoning.completedSummaryIndexes.has(summaryIndex)) {
         this.markUnsafe('reasoning_delta_after_summary_done');
       }
       if (decodedText !== rawText) this.markUnsafe('reasoning_delta_projection_changed');
-      projectedText = rawText;
-      this.summaryTextByIndex.set(summaryIndex, `${existingText}${rawText}`);
+      rawProjectedText = rawText;
+      reasoning.summaryTextByIndex.set(summaryIndex, `${existingText}${rawText}`);
     } else {
       if (!rawText.startsWith(existingText)) {
         this.markUnsafe('reasoning_summary_terminal_revision_conflict');
         return withCanonicalThoughtText(decoded, '');
       }
-      projectedText = rawText.slice(existingText.length);
-      this.summaryTextByIndex.set(summaryIndex, rawText);
-      if (isReasoningFullTextDoneEvent(type)) this.completedSummaryIndexes.add(summaryIndex);
-      if (decodedText && decodedText !== projectedText && decodedText !== rawText) {
+      rawProjectedText = rawText.slice(existingText.length);
+      reasoning.summaryTextByIndex.set(summaryIndex, rawText);
+      if (isReasoningFullTextDoneEvent(type)) reasoning.completedSummaryIndexes.add(summaryIndex);
+      if (decodedText && decodedText !== rawProjectedText && decodedText !== rawText) {
         this.markUnsafe('reasoning_full_text_projection_changed');
       }
     }
 
-    if (isNewBlock && this.thoughtText && projectedText) projectedText = `\n${projectedText}`;
-    return withCanonicalThoughtText(decoded, projectedText);
+    if (isNewBlock && reasoning.text && rawProjectedText) reasoning.text += '\n';
+    reasoning.text += rawProjectedText;
+    let displayText = rawProjectedText;
+    if (isNewBlock && this.thoughtText && displayText) displayText = `\n${displayText}`;
+    return withCanonicalThoughtText(decoded, displayText);
   }
 
-  private registerSummaryBlock(summaryIndex: number): boolean {
-    if (this.summaryTextByIndex.has(summaryIndex)) {
-      if (summaryIndex !== this.lastStreamedSummaryIndex) {
+  private registerSummaryBlock(reasoning: ProjectedReasoningItem, summaryIndex: number): boolean {
+    if (reasoning.summaryTextByIndex.has(summaryIndex)) {
+      if (summaryIndex !== reasoning.lastStreamedSummaryIndex) {
         this.markUnsafe('reasoning_summary_blocks_out_of_order');
         return false;
       }
       return true;
     }
-    const expectedIndex = this.lastStreamedSummaryIndex === undefined
+    const expectedIndex = reasoning.lastStreamedSummaryIndex === undefined
       ? 0
-      : this.lastStreamedSummaryIndex + 1;
+      : reasoning.lastStreamedSummaryIndex + 1;
     if (summaryIndex !== expectedIndex) {
       this.markUnsafe('reasoning_summary_index_gap');
       return false;
     }
-    this.summaryTextByIndex.set(summaryIndex, '');
-    this.lastStreamedSummaryIndex = summaryIndex;
+    reasoning.summaryTextByIndex.set(summaryIndex, '');
+    reasoning.lastStreamedSummaryIndex = summaryIndex;
     return true;
   }
 
@@ -175,11 +216,12 @@ export class OpenAIResponsesContinuationProjection {
         && isRecord(raw.item)
         && raw.item.type === 'reasoning'
         && optionalString(raw.item.encrypted_content) === signature;
-      if (!trustedDoneSignature) {
+      const reasoning = this.reasoningItemForEvent(raw);
+      if (!trustedDoneSignature || !reasoning) {
         this.markUnsafe('reasoning_signature_from_untrusted_event');
-      } else if (this.thoughtSignature && this.thoughtSignature !== signature) {
+      } else if (reasoning.trustedSignature && reasoning.trustedSignature !== signature) {
         this.markUnsafe('reasoning_signature_conflict');
-      } else this.thoughtSignature = signature;
+      } else reasoning.trustedSignature = signature;
     }
 
     const calls = [
@@ -237,10 +279,8 @@ export class OpenAIResponsesContinuationProjection {
       } else if (canonicalString(this.doneItems[existingIndex]) !== canonicalString(candidate)) {
         this.markUnsafe('output_item_done_conflict');
       }
-      if (raw.item.type === 'reasoning') {
-        const identity = reasoningIdentity(raw);
-        if (identity) this.registerReasoningIdentity(identity);
-        else this.markUnsafe('reasoning_item_without_identity');
+      if (raw.item.type === 'reasoning' && !this.reasoningItemForEvent(raw)) {
+        this.markUnsafe('reasoning_item_without_identity');
       }
       return;
     }
@@ -272,11 +312,16 @@ export class OpenAIResponsesContinuationProjection {
       this.markUnsafe('reasoning_terminal_summary_invalid');
       return;
     }
-    // A terminal item may arrive after complete deltas. Validation is deferred until all decoded
-    // chunks (including a done-only full summary or a partial-delta suffix) have been accumulated.
+    const reasoning = this.reasoningItemForEvent(raw);
+    if (!reasoning) return;
+    if (reasoning.text && !summary.startsWith(reasoning.text)) {
+      this.markUnsafe('reasoning_terminal_revision_conflict');
+      return;
+    }
+    reasoning.text = summary;
   }
 
-  private terminalItems(): Array<{ item: Record<string, unknown>; trustedSignature?: string }> | undefined {
+  private terminalItems(): TerminalOutputItem[] | undefined {
     if (this.completedOutput === undefined) return undefined;
     if (this.completedOutput.length === 0) {
       const sorted = [...this.doneItems].sort((left, right) => {
@@ -289,6 +334,7 @@ export class OpenAIResponsesContinuationProjection {
       }
       return sorted.map((entry) => ({
         item: cloneJson(entry.item),
+        outputIndex: entry.outputIndex!,
         ...(entry.item.type === 'reasoning' && optionalString(entry.item.encrypted_content)
           ? { trustedSignature: optionalString(entry.item.encrypted_content) }
           : {})
@@ -296,7 +342,7 @@ export class OpenAIResponsesContinuationProjection {
     }
 
     const consumed = new Set<number>();
-    const result: Array<{ item: Record<string, unknown>; trustedSignature?: string }> = [];
+    const result: TerminalOutputItem[] = [];
     for (const [outputIndex, item] of this.completedOutput.entries()) {
       const matches = this.doneItems
         .map((entry, index) => ({ entry, index }))
@@ -309,6 +355,7 @@ export class OpenAIResponsesContinuationProjection {
       }
       result.push({
         item: cloneJson(item),
+        outputIndex,
         ...(item.type === 'reasoning' && matched && optionalString(matched.entry.item.encrypted_content)
           ? { trustedSignature: optionalString(matched.entry.item.encrypted_content) }
           : {})
@@ -318,29 +365,26 @@ export class OpenAIResponsesContinuationProjection {
     return result;
   }
 
-  private validateTerminalProjection(
-    terminal: Array<{ item: Record<string, unknown>; trustedSignature?: string }>
-  ): boolean {
-    const expectedTypes = [
-      ...(this.thoughtText || this.thoughtSignature ? ['reasoning'] : []),
-      ...(this.visibleText ? ['message'] : []),
-      ...this.functionCalls.map(() => 'function_call')
-    ];
-    if (terminal.length !== expectedTypes.length) return this.invalidate('terminal_member_count_mismatch');
-    if (terminal.filter((entry) => entry.item.type === 'reasoning').length > 1) {
-      return this.invalidate('multiple_reasoning_items_unrepresentable');
+  private validateTerminalProjection(terminal: TerminalOutputItem[]): boolean {
+    const reasoningEntries = terminal.filter((entry) => entry.item.type === 'reasoning');
+    const messageEntries = terminal.filter((entry) => entry.item.type === 'message');
+    const functionEntries = terminal.filter((entry) => entry.item.type === 'function_call');
+    if (reasoningEntries.length !== this.reasoningItems.length
+      || messageEntries.length !== (this.visibleText ? 1 : 0)
+      || functionEntries.length !== this.functionCalls.length
+      || terminal.length !== reasoningEntries.length + messageEntries.length + functionEntries.length) {
+      return this.invalidate('terminal_member_count_mismatch');
     }
 
     let functionIndex = 0;
-    for (let index = 0; index < terminal.length; index += 1) {
-      const entry = terminal[index];
-      if (entry.item.type !== expectedTypes[index]) return this.invalidate('terminal_member_order_mismatch');
+    for (const entry of terminal) {
       if (entry.item.type === 'reasoning') {
+        const reasoning = this.reasoningForTerminalItem(entry);
         const summary = reasoningSummaryText(entry.item.summary);
-        if (summary === undefined || summary !== this.thoughtText) {
+        if (!reasoning || summary === undefined || summary !== reasoning.text) {
           return this.invalidate('reasoning_terminal_revision_conflict');
         }
-        if ((entry.trustedSignature ?? undefined) !== (this.thoughtSignature ?? undefined)) {
+        if ((entry.trustedSignature ?? undefined) !== (reasoning.trustedSignature ?? undefined)) {
           return this.invalidate('reasoning_terminal_signature_conflict');
         }
         continue;
@@ -354,7 +398,7 @@ export class OpenAIResponsesContinuationProjection {
       }
       if (entry.item.type === 'function_call') {
         const call = this.functionCalls[functionIndex++];
-        if (!sameFunctionCall(entry.item, call)) {
+        if (!call || !sameFunctionCall(entry.item, call)) {
           return this.invalidate('function_call_terminal_conflict');
         }
         continue;
@@ -364,23 +408,51 @@ export class OpenAIResponsesContinuationProjection {
     return !this.unsafeReason;
   }
 
-  private registerReasoningIdentity(candidate: ReasoningIdentity): boolean {
-    if (!this.reasoningIdentity) {
-      this.reasoningIdentity = { ...candidate };
-      return true;
+  private reasoningItemForEvent(raw: Record<string, unknown>): ProjectedReasoningItem | undefined {
+    const identity = reasoningIdentity(raw);
+    if (!identity) {
+      this.markUnsafe('reasoning_item_without_identity');
+      return undefined;
     }
-    const current = this.reasoningIdentity;
-    const idConflict = current.itemId !== undefined && candidate.itemId !== undefined
-      && current.itemId !== candidate.itemId;
-    const indexConflict = current.outputIndex !== undefined && candidate.outputIndex !== undefined
-      && current.outputIndex !== candidate.outputIndex;
-    if (idConflict || indexConflict) {
-      this.markUnsafe('multiple_reasoning_items_unrepresentable');
-      return false;
+    const keys = reasoningIdentityKeys(identity);
+    const matches = [...new Set(keys
+      .map((key) => this.reasoningItemsByKey.get(key))
+      .filter((item): item is ProjectedReasoningItem => !!item))];
+    if (matches.length > 1) {
+      this.markUnsafe('reasoning_identity_conflict');
+      return undefined;
     }
-    current.itemId ??= candidate.itemId;
-    current.outputIndex ??= candidate.outputIndex;
-    return true;
+    const existing = matches[0];
+    if (existing) {
+      if ((existing.itemId && identity.itemId && existing.itemId !== identity.itemId)
+        || (existing.outputIndex !== undefined && identity.outputIndex !== undefined
+          && existing.outputIndex !== identity.outputIndex)) {
+        this.markUnsafe('reasoning_identity_conflict');
+        return undefined;
+      }
+      existing.itemId ??= identity.itemId;
+      existing.outputIndex ??= identity.outputIndex;
+      for (const key of keys) this.reasoningItemsByKey.set(key, existing);
+      return existing;
+    }
+
+    const item: ProjectedReasoningItem = {
+      key: keys[0],
+      ...(identity.itemId ? { itemId: identity.itemId } : {}),
+      ...(identity.outputIndex !== undefined ? { outputIndex: identity.outputIndex } : {}),
+      text: '',
+      summaryTextByIndex: new Map(),
+      completedSummaryIndexes: new Set()
+    };
+    this.reasoningItems.push(item);
+    for (const key of keys) this.reasoningItemsByKey.set(key, item);
+    return item;
+  }
+
+  private reasoningForTerminalItem(entry: TerminalOutputItem): ProjectedReasoningItem | undefined {
+    const itemId = optionalString(entry.item.id);
+    return (itemId ? this.reasoningItemsByKey.get(`id:${itemId}`) : undefined)
+      ?? this.reasoningItemsByKey.get(`output:${entry.outputIndex}`);
   }
 
   private markUnsafe(reason: string): void {
@@ -476,7 +548,7 @@ function reasoningSummaryPartText(value: unknown): string {
   return '';
 }
 
-function reasoningIdentity(value: Record<string, unknown>): ReasoningIdentity | undefined {
+function reasoningIdentity(value: Record<string, unknown>): { itemId?: string; outputIndex?: number } | undefined {
   const item = isRecord(value.item) ? value.item : undefined;
   const itemId = optionalString(value.item_id) ?? (item ? optionalString(item.id) : undefined);
   const outputIndex = nonNegativeInteger(value.output_index);
@@ -484,6 +556,13 @@ function reasoningIdentity(value: Record<string, unknown>): ReasoningIdentity | 
     ...(itemId ? { itemId } : {}),
     ...(outputIndex !== undefined ? { outputIndex } : {})
   } : undefined;
+}
+
+function reasoningIdentityKeys(identity: { itemId?: string; outputIndex?: number }): string[] {
+  return [
+    ...(identity.itemId ? [`id:${identity.itemId}`] : []),
+    ...(identity.outputIndex !== undefined ? [`output:${identity.outputIndex}`] : [])
+  ];
 }
 
 function isReasoningDeltaEvent(type: string): boolean {

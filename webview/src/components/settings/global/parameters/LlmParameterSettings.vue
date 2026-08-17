@@ -29,7 +29,7 @@ const editingJson = ref(false);
 const providerLabel = computed(() => labelForProvider(props.config.provider));
 const generationConfig = computed<LlmGenerationConfigRecord>(() => props.config.generationConfig ?? {});
 const requestBody = computed<LlmRequestBodyRecord>(() => props.config.requestBody ?? {});
-const definitions = computed(() => parameterDefinitionsForProvider(props.config.provider));
+const definitions = computed(() => parameterDefinitionsForProvider(props.config.provider, props.config.model));
 const activeDefinitions = computed(() => definitions.value.filter((definition) => hasPath(generationConfig.value, definition.path)));
 const availableDefinitions = computed<LlmParameterAddOption[]>(() => definitions.value.filter((definition) => !hasPath(generationConfig.value, definition.path)).map(withMutualExclusionState));
 const hasRequestBody = computed(() => Object.keys(requestBody.value).length > 0);

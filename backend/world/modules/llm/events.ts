@@ -1,4 +1,4 @@
-import type { LlmInvocationSettingsSnapshotRecord, LlmRawErrorInfoRecord, LlmUsageMetadataRecord } from '../../../../shared/protocol';
+import type { LlmInvocationSettingsSnapshotRecord, LlmRawErrorInfoRecord, LlmUsageMetadataRecord, MessageContent } from '../../../../shared/protocol';
 import type { LlmCompactResult } from './contracts';
 
 export const LlmEventType = {
@@ -104,6 +104,8 @@ export interface LlmStreamAggregationMetrics {
 
 export interface LlmDonePayload extends LlmStreamEpochPayload {
   requestId: string;
+  /** Exact ordered model content when the provider can prove a terminal projection. */
+  content?: MessageContent;
   createdAt?: number;
   streamOutputDurationMs?: number;
   usageMetadata?: LlmUsageMetadataRecord;

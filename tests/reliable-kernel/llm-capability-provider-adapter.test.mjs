@@ -195,15 +195,73 @@ test('LLM capability adapter 过滤未授权工具并提交一个完整终态事
   assert.equal(captured.model.provider, 'openai-compatible');
   assert.equal(captured.systemInstruction.parts[0].text, 'system instruction');
   assert.deepEqual(events.map((event) => event.kind), ['output_delta', 'output_item_done', 'completed']);
-  assert.equal(events.at(-1).content.text, 'hello');
-  assert.equal(events.at(-1).content.toolCalls.length, 1);
-  assert.equal(events.at(-1).content.toolCalls[0].name, 'echo');
+  assert.deepEqual(events.at(-1).content, {
+    role: 'model',
+    parts: [
+      { text: 'hello' },
+      { id: 'call-1', functionCall: { name: 'echo', args: { value: 1 } } }
+    ]
+  });
   assert.deepEqual(events.at(-1).timing, {
     providerStartedAt: 1_000,
     firstOutputAt: 1_250,
     completedAt: 1_500,
     streamOutputDurationMs: 250
   });
+});
+
+test('LLM capability adapter hides managed attachment input without a catalog and compacts Read placeholders', async () => {
+  const fullRequest = request();
+  fullRequest.authoritySnapshot.toolPolicy.allowedTools = ['read'];
+  fullRequest.recipe.tools = [{
+    name: 'read',
+    description: 'stale read description',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        attachmentId: { type: 'string' }
+      }
+    }
+  }];
+  let captured;
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+    captured = llmRequest;
+    emit({
+      type: 'llm:toolcall',
+      payload: {
+        requestId: llmRequest.id,
+        calls: [{
+          id: 'call-read',
+          name: 'read',
+          argsJson: JSON.stringify({
+            attachmentId: '',
+            endLine: 0,
+            items: [],
+            mode: 'text',
+            pages: '',
+            path: 'src\\demo.ts',
+            startLine: 0
+          })
+        }]
+      }
+    });
+    emit({ type: 'llm:done', payload: { requestId: llmRequest.id } });
+  }));
+  const events = [];
+  await adapter.sendFullRequest(fullRequest, {
+    onEvent: async (event) => {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+    }
+  });
+
+  assert.equal(captured.tools.length, 1);
+  assert.equal(captured.tools[0].parameters.properties.attachmentId, undefined);
+  assert.equal(captured.tools[0].parameters.properties.pages, undefined);
+  assert.equal(Object.keys(captured.tools[0].parameters.properties)[0], 'path');
+  assert.doesNotMatch(captured.tools[0].description, /attachmentId/);
+  assert.deepEqual(events.at(-1).content.parts[0].functionCall.args, { path: 'src/demo.ts' });
 });
 
 test('LLM capability adapter 的 YOLO 不扩大 allowedTools 或重新启用被禁 MCP 来源', async () => {
@@ -257,8 +315,15 @@ test('LLM capability adapter 在无可见思维文本时仍投影思考进度和
   assert.equal(events[0].content.thoughtElapsedMs, 1250);
   assert.equal(events[1].content.thoughtCompletedDurationMs, 1800);
   assert.equal(events[1].content.thoughtDurationMs, 1800);
-  assert.equal(events[2].content.thought, '');
-  assert.equal(events[2].content.thoughtDurationMs, 1800);
+  assert.deepEqual(events[2].content, {
+    role: 'model',
+    parts: [{
+      text: '',
+      thought: true,
+      thoughtSignature: 'reasoning-signature',
+      thoughtDurationMs: 1800
+    }]
+  });
 });
 
 test('LLM capability adapter 在多段思考后重新开放计时并提交累计总耗时', async () => {
@@ -302,8 +367,79 @@ test('LLM capability adapter 在多段思考后重新开放计时并提交累计
   });
   assert.equal(events[3].content.thoughtCompletedDurationMs, 700);
   assert.equal(events[4].content.thoughtDurationMs, 1600);
-  assert.equal(events[5].content.thought, 'firstsecond');
-  assert.equal(events[5].content.thoughtDurationMs, 1600);
+  assert.deepEqual(events[5].content, {
+    role: 'model',
+    parts: [
+      { text: 'first', thought: true, thoughtDurationMs: 700 },
+      { text: 'second', thought: true, thoughtDurationMs: 900 }
+    ]
+  });
+});
+
+test('LLM capability adapter 以权威 MessageContent 保留 reasoning-tool-reasoning 顺序和独立签名', async () => {
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+    emit({
+      type: 'llm:thoughtDelta',
+      payload: { requestId: llmRequest.id, text: 'first', thoughtStartedAt: 10_000 }
+    });
+    emit({
+      type: 'llm:thoughtDone',
+      payload: { requestId: llmRequest.id, thoughtStartedAt: 10_000, thoughtDurationMs: 700 }
+    });
+    emit({
+      type: 'llm:toolcall',
+      payload: {
+        requestId: llmRequest.id,
+        calls: [{ id: 'call-ordered', name: 'echo', argsJson: '{"value":1}' }]
+      }
+    });
+    emit({
+      type: 'llm:thoughtDelta',
+      payload: { requestId: llmRequest.id, text: 'second', thoughtStartedAt: 20_000 }
+    });
+    emit({
+      type: 'llm:thoughtDone',
+      payload: { requestId: llmRequest.id, thoughtStartedAt: 20_000, thoughtDurationMs: 900 }
+    });
+    emit({
+      type: 'llm:done',
+      payload: {
+        requestId: llmRequest.id,
+        content: {
+          role: 'model',
+          parts: [
+            { text: 'first', thought: true, thoughtSignature: 'openai-responses:first' },
+            { id: 'call-ordered', functionCall: { name: 'echo', args: { value: 1 } } },
+            { text: 'second', thought: true, thoughtSignature: 'openai-responses:second' },
+            { text: 'answer' }
+          ]
+        }
+      }
+    });
+  }));
+  const events = [];
+  await adapter.sendFullRequest(request(), {
+    onEvent: async (event) => {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+    }
+  });
+
+  assert.deepEqual(events.at(-1).content, {
+    role: 'model',
+    parts: [
+      {
+        text: 'first', thought: true,
+        thoughtSignature: 'openai-responses:first', thoughtDurationMs: 700
+      },
+      { id: 'call-ordered', functionCall: { name: 'echo', args: { value: 1 } } },
+      {
+        text: 'second', thought: true,
+        thoughtSignature: 'openai-responses:second', thoughtDurationMs: 900
+      },
+      { text: 'answer' }
+    ]
+  });
 });
 
 test('LLM capability adapter 只投影tool_pair响应并沿用原Provider call id', async () => {
@@ -902,7 +1038,7 @@ test('native output 已含旧用户内容时只追加一次带标签的当前 Tu
   assert.equal(estimate.fullTokens, estimate.fixedTokens + estimate.bodyTokens);
 });
 
-test('ModelProvider 完整输入预算在物理窗口前触发且不依赖用户阈值', () => {
+test('ModelProvider 完整输入预算在物理窗口前阻止发送且不改写用户压缩阈值', () => {
   const fullRequest = request();
   fullRequest.authoritySnapshot.model.maxOutputTokens = 16_000;
   fullRequest.authoritySnapshot.modelProfile = {
@@ -921,9 +1057,8 @@ test('ModelProvider 完整输入预算在物理窗口前触发且不依赖用户
   const modelProvider = Object.create(kernel.ModelProviderControlPlane.prototype);
   const budget = modelProvider.budgetFullRequest(fullRequest, adapter);
 
-  assert.equal(budget.policyTrigger, false, '用户阈值尚未到达');
-  assert.equal(budget.sendingTrigger, true, '物理窗口必须独立触发压缩');
-  assert.equal(budget.canSend, false);
+  assert.ok(budget.estimatedFullInputTokens < budget.compressionThresholdTokens, '用户阈值尚未到达');
+  assert.equal(budget.canSend, false, '物理窗口必须独立阻止不可发送请求');
   assert.equal(budget.estimatedInputLimitTokens, 8_000);
   assert.throws(
     () => modelProvider.assertRequestPreflight({
@@ -1165,10 +1300,9 @@ test('LLM capability adapter 跨十个独立ToolCall事件累积完整终态并�
   assert.equal(upserts.length, 10, '幂等重放不得制造第十一个完成调用');
   assert.ok(upserts.every((event) => event.content.semantics === 'upsert'));
   const terminal = events.at(-1).content;
-  assert.equal(terminal.toolCallsSemantics, 'snapshot');
-  assert.deepEqual(terminal.toolCalls.map((call) => call.id), Array.from({ length: 10 }, (_, index) => `call-${index}`));
-  assert.deepEqual(terminal.toolCalls.map((call) => call.ordinal), Array.from({ length: 10 }, (_, index) => index));
-  assert.deepEqual(terminal.toolCalls.map((call) => call.thoughtSignature), Array.from({ length: 10 }, (_, index) => `signature-${index}`));
+  const terminalCalls = terminal.parts.filter((part) => part.functionCall);
+  assert.deepEqual(terminalCalls.map((call) => call.id), Array.from({ length: 10 }, (_, index) => `call-${index}`));
+  assert.deepEqual(terminalCalls.map((call) => call.thoughtSignature), Array.from({ length: 10 }, (_, index) => `signature-${index}`));
 });
 
 test('LLM capability adapter 用显式ordinal稳定合并无Provider id调用并拒绝ordinal冲突', async () => {
@@ -1185,8 +1319,9 @@ test('LLM capability adapter 用显式ordinal稳定合并无Provider id调用并
       return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
     }
   });
-  assert.deepEqual(events.at(-1).content.toolCalls.map((call) => call.arguments.value), [1, 2]);
-  assert.equal(events.at(-1).content.toolCalls[0].id, 'late-id');
+  const acceptedCalls = events.at(-1).content.parts.filter((part) => part.functionCall);
+  assert.deepEqual(acceptedCalls.map((call) => call.functionCall.args.value), [1, 2]);
+  assert.equal(acceptedCalls[0].id, 'late-id');
 
   const conflicting = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
     emit({ type: 'llm:toolcall', payload: { requestId: llmRequest.id, calls: [{ ordinal: 7, name: 'echo', argsJson: '{"value":1}' }] } });
@@ -1554,6 +1689,12 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
 
   let ordinary;
   const ordinaryRequest = request();
+  ordinaryRequest.authoritySnapshot.toolPolicy.allowedTools = ['read'];
+  ordinaryRequest.recipe.tools = [{
+    name: 'read',
+    description: 'stale read description',
+    parameters: { type: 'object', properties: { path: { type: 'string' }, attachmentId: { type: 'string' } } }
+  }];
   ordinaryRequest.context = [compressed, tail];
   const ordinaryAdapter = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
@@ -1566,6 +1707,34 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
     onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
   });
   assertCatalog(ordinary.contents, sourceAttachment, tailAttachment);
+  assert.ok(ordinary.tools[0].parameters.properties.attachmentId);
+  assert.ok(ordinary.tools[0].parameters.properties.pages);
+  assert.match(ordinary.tools[0].description, /exact non-empty attachmentId from that catalog/);
+  assert.match(ordinary.tools[0].description, /at most 4 consecutive pages/);
+
+  let imageOnly;
+  const imageOnlyRequest = request();
+  imageOnlyRequest.authoritySnapshot.toolPolicy.allowedTools = ['read'];
+  imageOnlyRequest.recipe.tools = ordinaryRequest.recipe.tools;
+  imageOnlyRequest.context = [tail];
+  const imageOnlyAdapter = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      imageOnly = llmRequest;
+      emit({ type: 'llm:done', payload: { requestId: llmRequest.id } });
+    })
+  );
+  await imageOnlyAdapter.sendFullRequest(imageOnlyRequest, {
+    onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
+  });
+  assert.ok(imageOnly.tools[0].parameters.properties.attachmentId);
+  assert.equal(imageOnly.tools[0].parameters.properties.pages, undefined);
+  assert.doesNotMatch(imageOnly.tools[0].description, /nextPages/);
+  const imageCatalogText = imageOnly.contents.flatMap((content) => content.parts)
+    .map((part) => part.text ?? '')
+    .find((text) => text.includes('LimCode 托管附件目录'));
+  assert.ok(imageCatalogText);
+  assert.doesNotMatch(imageCatalogText, /"pages":"1-4"/);
 
   let native;
   const nativeRequest = compressionRequest('openai_responses_compact', [compressed, tail]);
@@ -1590,5 +1759,9 @@ function assertCatalog(contents, ...entries) {
     assert.match(catalogText, new RegExp(entry.name.replace('.', '\\.')));
   }
   assert.match(catalogText, /\{"attachmentId":"attachment-source-pdf","name":"source\.pdf","mimeType":"application\/pdf","sizeBytes":45678\}/);
+  assert.match(catalogText, /\{"attachmentId":"目录中的精确编号"\}/);
+  assert.match(catalogText, /"pages":"1-4"/);
+  assert.match(catalogText, /nextPages/);
+  assert.doesNotMatch(catalogText, /"mode":"attachment"/);
   assert.doesNotMatch(catalogText, /sha256|sourcePath|private|inlineData|data/);
 }

@@ -199,10 +199,7 @@ interface NormalizedToolCall {
 }
 
 interface NormalizedProviderOutput {
-  text: string;
-  thought: string;
-  thoughtSignature?: string;
-  thoughtDurationMs?: number;
+  content: MessageContent;
   toolCalls: NormalizedToolCall[];
   usage?: PlainJsonValue;
 }
@@ -621,8 +618,7 @@ export class ReliableAgentLoop {
     const turnTaskCard = await readCurrentTurnTaskCard(
       this.database,
       this.contentStore,
-      input.turnId,
-      { maxTokens: runtimeStatusCard ? 1_536 : 2_048 }
+      input.turnId
     );
     return normalizePlainJson({
       kind: 'reliable-agent-turn',
@@ -1883,37 +1879,27 @@ function isTerminalToolStatus(value: unknown): boolean {
 }
 
 function providerOutputMessage(output: NormalizedProviderOutput): MessageContent {
-  return {
-    role: 'model',
-    parts: [
-      ...(output.thought || output.thoughtDurationMs !== undefined ? [{
-        text: output.thought,
-        thought: true as const,
-        ...(output.thoughtSignature ? { thoughtSignature: output.thoughtSignature } : {}),
-        ...(output.thoughtDurationMs !== undefined ? { thoughtDurationMs: output.thoughtDurationMs } : {})
-      }] : []),
-      ...(output.text ? [{ text: output.text }] : []),
-      ...output.toolCalls.map((call) => ({
-        ...(call.providerCallId ? { id: call.providerCallId } : {}),
-        functionCall: { name: call.name, args: call.arguments },
-        ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {})
-      }))
-    ]
-  };
+  return output.content;
 }
 
 function normalizeProviderOutput(value: PlainJsonValue): NormalizedProviderOutput {
-  const record = requireRecord(value, 'Provider completed content');
-  return {
-    text: optionalText(record.text),
-    thought: optionalText(record.thought),
-    ...(optionalText(record.thoughtSignature) ? { thoughtSignature: optionalText(record.thoughtSignature) } : {}),
-    ...(optionalNonNegativeInteger(record.thoughtDurationMs) !== undefined
-      ? { thoughtDurationMs: optionalNonNegativeInteger(record.thoughtDurationMs) }
-      : {}),
-    toolCalls: normalizeToolCalls(record.toolCalls),
-    ...(record.usage !== undefined ? { usage: record.usage } : {})
-  };
+  const record = requireRecord(value, 'Provider completed MessageContent');
+  if (record.role !== 'model' || !Array.isArray(record.parts)) {
+    throw new TypeError('Provider completed MessageContent must contain model parts.');
+  }
+  const content = normalizePlainJson(record, 'Provider completed MessageContent') as unknown as MessageContent;
+  const calls: PlainJsonValue[] = [];
+  for (const part of content.parts) {
+    if (!('functionCall' in part)) continue;
+    calls.push(normalizePlainJson({
+      ...(part.id ? { id: part.id } : {}),
+      ordinal: calls.length,
+      name: part.functionCall.name,
+      arguments: part.functionCall.args,
+      ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {})
+    }, `Provider completed function call ${calls.length}`));
+  }
+  return { content, toolCalls: normalizeToolCalls(calls) };
 }
 
 function normalizeToolCalls(value: unknown): NormalizedToolCall[] {
