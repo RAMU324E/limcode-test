@@ -2537,7 +2537,39 @@ async function checkImmutableReplacement() {
       mimeType: 'application/pdf',
       sizeBytes: 4_096
     };
-    for (let index = 0; index < 4; index += 1) {
+    const coordinatorModelProvider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store);
+    const observedProjectionRootId = await context.currentHeadRootId(coordinatorSeed.conversationId);
+    const observedRequest = await coordinatorModelProvider.createModelRequest({
+      turnId: coordinatorSeed.turnId,
+      contextRootId: observedProjectionRootId,
+      authoritySnapshotId: coordinatorSeed.authoritySnapshotId,
+      recipe: { kind: 'provider-observed-compression-fixture' },
+      projectedEstimatedTokens: 1,
+      idempotencyKey: 'provider-observed-compression-fixture'
+    });
+    await coordinatorModelProvider.dispatch(observedRequest.modelRequestId, {
+      providerId: 'fake-local',
+      async sendFullRequest(_request, controls) {
+        await controls.onEvent({
+          kind: 'completed',
+          streamSeq: '1',
+          content: { type: 'provider-observed-compression-fixture' },
+          usage: { promptTokenCount: 20, totalTokenCount: 24 }
+        });
+      }
+    });
+    const observedMessageContent = JSON.stringify({
+      role: 'model',
+      parts: [{ text: `coordinator-message-0-${'x'.repeat(256)}` }]
+    });
+    await new kernel.TurnOutputControlPlane(ctx.database, ctx.store).appendAssistantMessage({
+      turnId: coordinatorSeed.turnId,
+      modelRequestId: observedRequest.modelRequestId,
+      sourceKey: observedRequest.modelRequestId,
+      content: observedMessageContent,
+      contentType: 'application/vnd.limcode.message+json'
+    });
+    for (let index = 1; index < 4; index += 1) {
       const role = index % 2 === 0 ? 'assistant' : 'user';
       const attachmentMessage = index === 1
         ? JSON.stringify({
@@ -2565,7 +2597,6 @@ async function checkImmutableReplacement() {
       );
     }
     const coordinatorHead = await context.currentHeadRootId(coordinatorSeed.conversationId);
-    const coordinatorModelProvider = new kernel.ModelProviderControlPlane(ctx.database, ctx.store);
     let compactDispatches = 0;
     let frozenCompressionBlockId;
     const coordinator = new kernel.ReliableContextCompressionCoordinator(
@@ -2606,16 +2637,59 @@ async function checkImmutableReplacement() {
       compressionThresholdTokens: 2,
       breakdown: {
         systemTokens: 0, toolSchemaTokens: 0, providerFramingTokens: 0,
-        contextTokens: 2, currentInputTokens: 0, runtimeDeliveryTokens: 0,
+        contextTokens: 1, currentInputTokens: 0, runtimeDeliveryTokens: 0,
         turnReminderTokens: 0, mediaTokens: 0, fixedTokens: 0,
-        bodyTokens: 2, fullTokens: 2
+        bodyTokens: 1, fullTokens: 1
       }
     });
-    assert.equal(
-      coordinatorRequestBudget.policyTrigger,
-      true,
-      'fixture must cross the exact frozen ordinary-request threshold'
+    assert.ok(
+      coordinatorRequestBudget.estimatedFullInputTokens < coordinatorRequestBudget.compressionThresholdTokens,
+      'fixture must keep the ordinary-request estimate below the configured threshold'
     );
+    const coordinatorCompression = new kernel.ContextCompressionControlPlane(ctx.database, ctx.store);
+    const coordinatorDecision = await coordinatorCompression.evaluate(
+      coordinatorHead,
+      coordinatorSeed.authoritySnapshotId
+    );
+    assert.equal(coordinatorDecision.shouldCompress, true);
+    assert.equal(coordinatorDecision.source, 'provider-observed-delta');
+    const localOnlyPolicy = {
+      ...coordinatorPolicy,
+      thresholdTokens: 100_000,
+      trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 100_000 },
+      config: {
+        ...coordinatorPolicy.config,
+        id: 'compression-config-local-estimate-only',
+        trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 100_000 }
+      }
+    };
+    const localOnlySeed = await seedTurn(ctx, 'compression-local-estimate-only', {
+      thresholdTokens: 100_000,
+      compressionPolicy: localOnlyPolicy
+    });
+    const localOnlyHead = await context.currentHeadRootId(localOnlySeed.conversationId);
+    const localOnlyBudget = kernel.calculateFullRequestBudget({
+      contextWindowTokens: 200_000,
+      maxOutputTokens: 16_000,
+      compressionThresholdTokens: 100_000,
+      breakdown: {
+        systemTokens: 0, toolSchemaTokens: 0, providerFramingTokens: 0,
+        contextTokens: 100_000, currentInputTokens: 0, runtimeDeliveryTokens: 0,
+        turnReminderTokens: 0, mediaTokens: 0, fixedTokens: 0,
+        bodyTokens: 100_000, fullTokens: 100_000
+      }
+    });
+    assert.ok(localOnlyBudget.estimatedFullInputTokens >= localOnlyBudget.compressionThresholdTokens);
+    const localOnlyResult = await coordinator.coordinate({
+      turnId: localOnlySeed.turnId,
+      authoritySnapshotId: localOnlySeed.authoritySnapshotId,
+      headRootId: localOnlyHead,
+      trigger: 'auto',
+      requestBudget: localOnlyBudget
+    });
+    assert.equal(localOnlyResult.status, 'skipped');
+    assert.equal(localOnlyResult.reason, 'below_threshold');
+    assert.equal(compactDispatches, 0);
     const coordinated = await coordinator.coordinate({
       turnId: coordinatorSeed.turnId,
       authoritySnapshotId: coordinatorSeed.authoritySnapshotId,
@@ -2662,10 +2736,10 @@ async function checkImmutableReplacement() {
     );
     assert.equal(structuredCompression.trigger, 'auto');
     assert.equal(structuredCompression.triggerReason, 'configured_threshold');
-    assert.equal(structuredCompression.triggerEstimatedTokens, 2);
+    assert.equal(structuredCompression.triggerTokens, coordinatorDecision.estimatedTokens);
+    assert.equal(structuredCompression.triggerTokenSource, coordinatorDecision.source);
     assert.equal(structuredCompression.configuredThresholdTokens, 2);
-    assert.equal(structuredCompression.effectiveTriggerTokens, 2);
-    assert.equal(structuredCompression.estimatedTokensBefore, 2);
+    assert.equal(structuredCompression.estimatedTokensBefore, 1);
     assert.equal(structuredCompression.providerInputTokens, 77);
     assert.equal(structuredCompression.methodKind, 'deterministic_summary');
     assert.deepEqual(structuredCompression.attachmentCatalog, [coordinatorAttachment]);
@@ -2922,7 +2996,7 @@ async function checkImmutableReplacement() {
     assert.equal(nonReducingReplay.reason, 'non_reducing');
     assert.equal(nonReducingDispatches, 1);
     assertions.push('自动压缩协调器把request kind/source prefix冻结进recipe，复用ModelRequest/Operation/Attempt/fence；exact replay零外调；provider-native MessageContent[]按版本化codec持久化并按token预算保留连续finite tail');
-    assertions.push('自动压缩只由冻结普通请求的完整模型投影预算越过配置阈值或安全输入上限触发；Context根校准不再独立触发');
+    assertions.push('自动压缩只由Provider实测基线优先的Context计量越过配置阈值触发；普通请求估算与物理输入预算仅用于规划和发送前校验，不再形成第二触发线');
     assertions.push('LLM capability adapter只发送冻结prefix，识别prior structured summary，并把CompactDone映射为单一durable completed事件；后续普通请求会展开版本化MessageContent[]而不是把JSON当Markdown');
     assertions.push('manual-only配置不会被自动调度；manualCurrentTurn在远低于冻结阈值时可显式压缩closed prefix，同时保留finite tail并冻结manual request kind');
     assertions.push('受保护tail使上下文越阈值但eligible prefix已不可缩小时，协调器按同head durable request精确跳过而不失败主Turn或重复外调');

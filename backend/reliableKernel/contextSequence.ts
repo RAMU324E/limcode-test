@@ -1065,33 +1065,43 @@ export class ContextSequenceControlPlane {
           })
         );
         const callSources = sourceSnapshot.snapshot.filter((source) => source.source_kind === 'tool_call');
-        if (callSources.length !== 1) {
+        if (callSources.length === 0) {
           removedSegmentIds.add(segmentId);
           continue;
         }
-        const toolCallId = requireId(callSources[0].source_id, 'ContextSegmentSource.source_id');
-        const linkSnapshot = await this.database.snapshot([
-          DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
-            where: { tool_call_id: toolCallId },
-            limit: 2
-          })
-        ]);
-        const links = rows(linkSnapshot.snapshot[0]);
-        if (links.length !== 1) {
-          removedSegmentIds.add(segmentId);
-          continue;
+        let hasLiveOwner = false;
+        const deletedOwners: Array<{ id: string; deletedAt: string }> = [];
+        for (const callSource of callSources) {
+          const toolCallId = requireId(callSource.source_id, 'ContextSegmentSource.source_id');
+          const linkSnapshot = await this.database.snapshot([
+            DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
+              where: { tool_call_id: toolCallId },
+              limit: 2
+            })
+          ]);
+          const links = rows(linkSnapshot.snapshot[0]);
+          if (links.length !== 1) continue;
+          const ownerMessageId = requireId(links[0].message_id, 'ToolCallSourceLink.message_id');
+          const ownerSnapshot = await this.database.snapshot([
+            DOMAIN_REPOSITORIES.domain('Message').get(ownerMessageId)
+          ]);
+          const owner = ownerSnapshot.snapshot[0] as DomainRow | null;
+          if (owner?.deleted_at === null) {
+            hasLiveOwner = true;
+            break;
+          }
+          if (owner?.deleted_at) {
+            deletedOwners.push({
+              id: ownerMessageId,
+              deletedAt: requireText(owner.deleted_at, 'Message.deleted_at')
+            });
+          }
         }
-        const ownerMessageId = requireId(links[0].message_id, 'ToolCallSourceLink.message_id');
-        const ownerSnapshot = await this.database.snapshot([
-          DOMAIN_REPOSITORIES.domain('Message').get(ownerMessageId)
-        ]);
-        const owner = ownerSnapshot.snapshot[0] as DomainRow | null;
-        if (!owner || owner.deleted_at === null) continue;
-        const deletedAt = requireText(owner.deleted_at, 'Message.deleted_at');
+        if (hasLiveOwner) continue;
         removedSegmentIds.add(segmentId);
-        ownerAssertions.push(DOMAIN_REPOSITORIES.domain('Message').assert(ownerMessageId, {
-          deleted_at: deletedAt
-        }));
+        ownerAssertions.push(...deletedOwners.map((owner) =>
+          DOMAIN_REPOSITORIES.domain('Message').assert(owner.id, { deleted_at: owner.deletedAt })
+        ));
       }
       if (removedSegmentIds.size === 0) continue;
 

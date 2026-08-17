@@ -40,21 +40,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export type CompressionTrigger = 'auto' | 'manual';
-export type CompressionTriggerReason = 'manual' | 'configured_threshold' | 'safe_input_limit';
-
-export function automaticCompressionTriggerReason(
-  budget: Pick<FullRequestBudget,
-    | 'policyTrigger'
-    | 'sendingTrigger'
-    | 'compressionThresholdTokens'
-    | 'estimatedInputLimitTokens'>
-): Exclude<CompressionTriggerReason, 'manual'> | undefined {
-  if (budget.policyTrigger && budget.compressionThresholdTokens <= budget.estimatedInputLimitTokens) {
-    return 'configured_threshold';
-  }
-  if (budget.sendingTrigger) return 'safe_input_limit';
-  return budget.policyTrigger ? 'configured_threshold' : undefined;
-}
+export type CompressionTriggerReason = 'manual' | 'configured_threshold';
 
 export interface CoordinateCompressionCommand {
   turnId: string;
@@ -150,7 +136,7 @@ export class ReliableContextCompressionCoordinator {
         requestBudget.estimatedInputLimitTokens
       );
     }
-    if (trigger === 'auto' && requestBudget.fixedOverPolicy && !requestBudget.sendingTrigger) {
+    if (trigger === 'auto' && requestBudget.fixedOverPolicy && requestBudget.canSend) {
       return {
         status: 'skipped',
         reason: 'fixed_over_policy',
@@ -158,28 +144,18 @@ export class ReliableContextCompressionCoordinator {
         thresholdTokens: requestBudget.compressionThresholdTokens
       };
     }
-    const automaticReason = trigger === 'auto'
-      ? automaticCompressionTriggerReason(requestBudget)
-      : undefined;
-    if (trigger === 'auto' && !automaticReason) {
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
+    if (trigger === 'auto' && !decision.shouldCompress) {
       return {
         status: 'skipped',
         reason: 'below_threshold',
-        estimatedTokens: requestBudget.estimatedFullInputTokens,
-        thresholdTokens: Math.min(
-          requestBudget.compressionThresholdTokens,
-          requestBudget.estimatedInputLimitTokens
-        )
+        estimatedTokens: decision.estimatedTokens,
+        thresholdTokens: decision.thresholdTokens
       };
     }
     const triggerReason: CompressionTriggerReason = trigger === 'manual'
       ? 'manual'
-      : automaticReason!;
-    const effectiveTriggerTokens = Math.min(
-      requestBudget.compressionThresholdTokens,
-      requestBudget.estimatedInputLimitTokens
-    );
-    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
+      : 'configured_threshold';
     const protectedCurrentInputTokens = command.protectedCurrentInputTokens === undefined
       ? 0
       : requireNonNegativeTokenCount(command.protectedCurrentInputTokens, 'protectedCurrentInputTokens');
@@ -275,10 +251,9 @@ export class ReliableContextCompressionCoordinator {
         requestKind: trigger === 'auto' ? 'context_compression_pre' : 'context_compression_manual',
         trigger,
         triggerReason,
-        triggerEstimatedTokens: requestBudget.estimatedFullInputTokens,
+        triggerTokens: decision.estimatedTokens,
+        triggerTokenSource: decision.source,
         configuredThresholdTokens: requestBudget.compressionThresholdTokens,
-        safeInputLimitTokens: requestBudget.estimatedInputLimitTokens,
-        effectiveTriggerTokens,
         requestBreakdown: requestBudget.breakdown,
         sourceRootId: headRootId,
         sourceSegmentCount,
@@ -382,10 +357,9 @@ export class ReliableContextCompressionCoordinator {
       summaryMetadata: {
         trigger,
         triggerReason,
-        triggerEstimatedTokens: requestBudget.estimatedFullInputTokens,
+        triggerTokens: decision.estimatedTokens,
+        triggerTokenSource: decision.source,
         configuredThresholdTokens: requestBudget.compressionThresholdTokens,
-        safeInputLimitTokens: requestBudget.estimatedInputLimitTokens,
-        effectiveTriggerTokens,
         requestBreakdown: requestBudget.breakdown,
         estimatedTokensBefore: requestBudget.estimatedFullInputTokens,
         estimatedTokensAfter: projectedTokens,
@@ -577,11 +551,9 @@ function requireFullRequestBudget(value: FullRequestBudget, expectedThresholdTok
   if (value.estimatedFullInputTokens !== value.fixedTokens + value.bodyTokens) {
     throw new Error('requestBudget full input total is inconsistent.');
   }
-  if (typeof value.policyTrigger !== 'boolean'
-    || typeof value.sendingTrigger !== 'boolean'
-    || typeof value.fixedOverPolicy !== 'boolean'
+  if (typeof value.fixedOverPolicy !== 'boolean'
     || typeof value.canSend !== 'boolean') {
-    throw new TypeError('requestBudget trigger/send flags must be booleans.');
+    throw new TypeError('requestBudget planning/send flags must be booleans.');
   }
   return value;
 }

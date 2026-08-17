@@ -101,29 +101,22 @@ const triggerReason = computed(() =>
   || presentation.value.triggerReason
   || envelope.value.triggerReason
 );
-const triggerEstimatedTokens = computed(() => firstToken(
-  props.block.trigger_estimated_tokens,
-  props.block.triggerEstimatedTokens,
-  presentation.value.triggerEstimatedTokens,
-  envelope.value.triggerEstimatedTokens
+const triggerTokens = computed(() => firstToken(
+  props.block.trigger_tokens,
+  props.block.triggerTokens,
+  presentation.value.triggerTokens,
+  envelope.value.triggerTokens
 ));
+const triggerTokenSource = computed(() =>
+  stringValue(props.block.trigger_token_source ?? props.block.triggerTokenSource)
+  || presentation.value.triggerTokenSource
+  || envelope.value.triggerTokenSource
+);
 const configuredThresholdTokens = computed(() => firstToken(
   props.block.configured_threshold_tokens,
   props.block.configuredThresholdTokens,
   presentation.value.configuredThresholdTokens,
   envelope.value.configuredThresholdTokens
-));
-const safeInputLimitTokens = computed(() => firstToken(
-  props.block.safe_input_limit_tokens,
-  props.block.safeInputLimitTokens,
-  presentation.value.safeInputLimitTokens,
-  envelope.value.safeInputLimitTokens
-));
-const effectiveTriggerTokens = computed(() => firstToken(
-  props.block.effective_trigger_tokens,
-  props.block.effectiveTriggerTokens,
-  presentation.value.effectiveTriggerTokens,
-  envelope.value.effectiveTriggerTokens
 ));
 const providerInputTokens = computed(() => firstToken(
   presentation.value.providerInputTokens,
@@ -134,22 +127,26 @@ const providerOutputTokens = computed(() => firstToken(
   envelope.value.providerOutputTokens
 ));
 const triggerLabel = computed(() => {
-  const observed = triggerEstimatedTokens.value;
-  const suffix = observed === undefined ? '' : `（当时估算 ${formatTokenNumber(observed)} Token）`;
-  if (triggerReason.value === 'configured_threshold') return `配置阈值触发${suffix}`;
-  if (triggerReason.value === 'safe_input_limit') return `安全输入上限触发${suffix}`;
+  if (triggerReason.value === 'configured_threshold') return '配置阈值触发';
   if (triggerReason.value === 'manual' || trigger.value === 'manual') return '手动触发';
-  return trigger.value === 'auto' ? `自动触发${suffix}` : '';
+  return trigger.value === 'auto' ? '自动触发' : '';
+});
+const triggerTokenSourceLabel = computed(() => {
+  switch (triggerTokenSource.value) {
+    case 'provider-observed-delta': return 'Provider 实测基线 + 新增内容估算';
+    case 'compression-output': return '压缩结果 Token';
+    case 'semantic': return '模型可见内容估算';
+    default: return '';
+  }
 });
 const diagnosticRows = computed(() => [
   { label: '触发原因', value: triggerLabel.value },
-  { label: '触发时完整请求估算', value: tokenLabel(triggerEstimatedTokens.value) },
+  { label: '触发时上下文', value: tokenLabel(triggerTokens.value) },
+  { label: '触发值来源', value: triggerTokenSourceLabel.value },
   { label: '配置压缩阈值', value: tokenLabel(configuredThresholdTokens.value) },
-  { label: '安全输入上限', value: tokenLabel(safeInputLimitTokens.value) },
-  { label: '有效触发线', value: tokenLabel(effectiveTriggerTokens.value) },
+  { label: '触发时完整请求估算', value: tokenLabel(beforeTokens.value) },
   { label: '触发时请求构成', value: envelope.value.requestBreakdownLabel ?? '' },
-  { label: '压缩前估算', value: tokenLabel(beforeTokens.value) },
-  { label: '压缩后估算', value: tokenLabel(afterTokens.value) },
+  { label: '压缩后上下文估算', value: tokenLabel(afterTokens.value) },
   { label: '压缩 Provider 实际输入', value: tokenLabel(providerInputTokens.value) },
   { label: '压缩 Provider 实际输出', value: tokenLabel(providerOutputTokens.value) },
   { label: '保留附件目录', value: envelope.value.attachmentCount === undefined ? '' : `${envelope.value.attachmentCount} 项（无正文）` }
@@ -201,10 +198,9 @@ async function copySummary(): Promise<void> {
 
 interface CompressionDiagnosticData {
   triggerReason?: string;
-  triggerEstimatedTokens?: number;
+  triggerTokens?: number;
+  triggerTokenSource?: string;
   configuredThresholdTokens?: number;
-  safeInputLimitTokens?: number;
-  effectiveTriggerTokens?: number;
   estimatedTokensBefore?: number;
   estimatedTokensAfter?: number;
   providerInputTokens?: number;
@@ -266,11 +262,11 @@ function parseDiagnosticFields(record: Record<string, unknown>): CompressionDiag
   const result: CompressionDiagnosticData = {};
   const triggerReason = stringValue(record.triggerReason ?? record.trigger_reason);
   if (triggerReason) result.triggerReason = triggerReason;
+  const triggerTokenSource = stringValue(record.triggerTokenSource ?? record.trigger_token_source);
+  if (triggerTokenSource) result.triggerTokenSource = triggerTokenSource;
   for (const [field, aliases] of Object.entries({
-    triggerEstimatedTokens: ['triggerEstimatedTokens', 'trigger_estimated_tokens'],
+    triggerTokens: ['triggerTokens', 'trigger_tokens'],
     configuredThresholdTokens: ['configuredThresholdTokens', 'configured_threshold_tokens'],
-    safeInputLimitTokens: ['safeInputLimitTokens', 'safe_input_limit_tokens'],
-    effectiveTriggerTokens: ['effectiveTriggerTokens', 'effective_trigger_tokens'],
     estimatedTokensBefore: ['estimatedTokensBefore', 'estimated_tokens_before'],
     estimatedTokensAfter: ['estimatedTokensAfter', 'estimated_tokens_after'],
     providerInputTokens: ['providerInputTokens', 'provider_input_tokens'],

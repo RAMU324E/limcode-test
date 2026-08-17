@@ -236,11 +236,7 @@ export class MainPanel {
         }
         const message = raw as WebviewToExtensionMessage;
         if (message.type === BridgeMessageType.ConversationOpen && message.payload?.conversationId) {
-          MainPanel.createOrShow(this.extensionUri, this.backendApp, {
-            conversationId: message.payload.conversationId,
-            title: message.payload.title,
-            reuse: true
-          });
+          this.openConversationFromPanel(message.payload.conversationId, message.payload.title);
           return;
         }
         if (message.type === BridgeMessageType.ConversationCreate) {
@@ -295,6 +291,22 @@ export class MainPanel {
         MainPanel.createOrShow(this.extensionUri, this.backendApp, { conversationId });
       })
       .catch((error) => console.warn('[LimCode] Failed to create panel conversation.', error));
+  }
+
+  private openConversationFromPanel(conversationIdInput: string, title?: string): void {
+    const conversationId = conversationIdInput.trim();
+    if (!conversationId) return;
+    void this.backendApp.conversationExists(conversationId).then((exists) => {
+      if (!exists) {
+        void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: 该对话已被删除或不再存在。`);
+        return;
+      }
+      MainPanel.createOrShow(this.extensionUri, this.backendApp, {
+        conversationId,
+        ...(title?.trim() ? { title: title.trim() } : {}),
+        reuse: true
+      });
+    }).catch((error) => console.warn('[LimCode] Failed to open panel conversation.', error));
   }
 
   private openPlanProposalFromPanel(payload: PlanProposalOpenPayload): void {

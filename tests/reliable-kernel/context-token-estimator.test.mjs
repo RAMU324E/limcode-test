@@ -35,7 +35,7 @@ function emptyBreakdown(overrides = {}) {
   return value;
 }
 
-test('Agent loop不以启发式预算预先屏蔽Provider实测压缩准入', () => {
+test('Agent loop始终进入Provider实测压缩准入，协调器只使用配置阈值决策', () => {
   const source = fs.readFileSync('backend/reliableKernel/agentLoop.ts', 'utf8');
   const budgetStart = source.indexOf('let budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);');
   const compressionStart = source.indexOf('this.compressionCoordinator.coordinate({', budgetStart);
@@ -43,12 +43,16 @@ test('Agent loop不以启发式预算预先屏蔽Provider实测压缩准入', ()
   assert.ok(budgetStart >= 0 && compressionStart > budgetStart && sendGate > compressionStart);
 
   const admission = source.slice(budgetStart, sendGate);
-  assert.doesNotMatch(
-    admission,
-    /if\s*\(\s*budget\.policyTrigger\s*\|\|\s*budget\.sendingTrigger\s*\)\s*\{[\s\S]*compressionCoordinator\.coordinate/,
-    'Provider实测判断必须能在本地预算低估时进入协调器'
-  );
+  assert.match(admission, /this\.compressionCoordinator\.coordinate\(\{/);
   assert.match(admission, /if \(compression\.status === 'compressed'\)/);
+
+  const coordinator = fs.readFileSync('backend/reliableKernel/contextCompressionCoordinator.ts', 'utf8');
+  assert.match(
+    coordinator,
+    /const decision = await this\.compression\.evaluate\(headRootId, authoritySnapshotId\);\s*if \(trigger === 'auto' && !decision\.shouldCompress\)/,
+    '自动压缩必须由Provider实测校准后的配置阈值判断准入'
+  );
+  assert.doesNotMatch(coordinator, /automaticCompressionTriggerReason/);
 });
 
 test('provider语义估算不会把base64图片字符当普通文本token', () => {
@@ -155,17 +159,18 @@ test('大批搜索结果按模型投影计量，不会把约250K请求误判为4
     breakdown: emptyBreakdown({ bodyTokens: projectedFullInput })
   });
   assert.equal(below.estimatedInputLimitTokens, 329_000);
-  assert.equal(below.policyTrigger, false);
-  assert.equal(below.sendingTrigger, false);
-  assert.equal(kernel.automaticCompressionTriggerReason(below), undefined);
+  assert.ok(below.estimatedFullInputTokens < below.compressionThresholdTokens);
+  assert.equal(below.canSend, true);
 
-  const safety = kernel.calculateFullRequestBudget({
+  const physicalLimit = kernel.calculateFullRequestBudget({
     contextWindowTokens: 353_000,
     maxOutputTokens: 16_000,
     compressionThresholdTokens: 334_000,
     breakdown: emptyBreakdown({ bodyTokens: 329_001 })
   });
-  assert.equal(kernel.automaticCompressionTriggerReason(safety), 'safe_input_limit');
+  assert.ok(physicalLimit.estimatedFullInputTokens < physicalLimit.compressionThresholdTokens,
+    '配置压缩阈值尚未到达');
+  assert.equal(physicalLimit.canSend, false, '物理输入预算只保留发送前校验语义');
 
   const configured = kernel.calculateFullRequestBudget({
     contextWindowTokens: 353_000,
@@ -173,7 +178,8 @@ test('大批搜索结果按模型投影计量，不会把约250K请求误判为4
     compressionThresholdTokens: 300_000,
     breakdown: emptyBreakdown({ bodyTokens: 300_000 })
   });
-  assert.equal(kernel.automaticCompressionTriggerReason(configured), 'configured_threshold');
+  assert.ok(configured.estimatedFullInputTokens >= configured.compressionThresholdTokens);
+  assert.equal(configured.canSend, true);
 });
 
 test('压缩envelope使用provider输出token估算而非其持久化JSON大小', () => {
@@ -256,7 +262,7 @@ test('完整请求preflight区分固定开销、压缩后过大和fixedOverPolic
     breakdown: emptyBreakdown({ fixedTokens: 45_000, bodyTokens: 1_000 })
   });
   assert.equal(fixedOverPolicy.fixedOverPolicy, true);
-  assert.equal(fixedOverPolicy.sendingTrigger, false);
+  assert.equal(fixedOverPolicy.canSend, true);
   assert.equal(fixedOverPolicy.policyBodyRoomTokens, 0);
   assert.equal(fixedOverPolicy.effectiveBodyTargetTokens, 48_000);
 });

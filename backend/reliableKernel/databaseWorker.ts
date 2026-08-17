@@ -642,6 +642,9 @@ function projectCompressionBlockRecord(database: Database.Database, blockId: str
                  ON segment_source.segment_id = anchor_source.segment_id
                 AND segment_source.source_kind = 'message_revision'
                JOIN message_revision AS revision ON revision.id = segment_source.source_id
+               JOIN message_part_of_conversation AS anchor_membership
+                 ON anchor_membership.message_id = revision.message_id
+                AND anchor_membership.conversation_id = block.conversation_id
               WHERE anchor_source.compression_block_id = block.id
               ORDER BY anchor_source.position DESC, anchor_source.id DESC
               LIMIT 1
@@ -2501,7 +2504,7 @@ function decodeContextRecords(
     const chunk = messageSegmentIds.slice(offset, offset + 500);
     const placeholders = chunk.map(() => '?').join(',');
     const sourceRows = database.prepare(`
-      SELECT source.segment_id AS segment_id, revision.role AS role
+      SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role
         FROM context_segment_source AS source
         JOIN message_revision AS revision
           ON revision.id = source.source_id
@@ -2754,6 +2757,9 @@ function executeClientProjectionSnapshot(
                   AND segment_source.source_kind = 'message_revision'
                  JOIN message_revision AS revision
                    ON revision.id = segment_source.source_id
+                 JOIN message_part_of_conversation AS anchor_membership
+                   ON anchor_membership.message_id = revision.message_id
+                  AND anchor_membership.conversation_id = block.conversation_id
                 WHERE anchor_source.compression_block_id = block.id
                 ORDER BY anchor_source.position DESC, anchor_source.id DESC
                 LIMIT 1

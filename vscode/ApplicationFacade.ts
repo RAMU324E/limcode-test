@@ -38,7 +38,6 @@ export interface ApplicationFacade {
   waitUntilHydrated(): Promise<void>;
   conversationExists(conversationId: string): Promise<boolean>;
   getConversationDisplayTitle(conversationId: string | undefined): string;
-  prepareConversationForSidebarOpen(conversationId: string, title?: string): boolean;
   renameConversationTitle(conversationId: string, title: string): Promise<boolean>;
   deleteConversation(conversationId: string): Promise<string[] | null>;
   abortConversation(

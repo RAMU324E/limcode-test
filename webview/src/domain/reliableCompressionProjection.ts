@@ -14,11 +14,10 @@ export interface ReliableCompressionRequestPurpose {
   blockId: string;
   methodKind: string;
   sourceSegmentCount: number;
-  triggerReason?: 'manual' | 'configured_threshold' | 'safe_input_limit';
-  triggerEstimatedTokens?: number;
+  triggerReason?: 'manual' | 'configured_threshold';
+  triggerTokens?: number;
+  triggerTokenSource?: 'provider-observed-delta' | 'compression-output' | 'semantic';
   configuredThresholdTokens?: number;
-  safeInputLimitTokens?: number;
-  effectiveTriggerTokens?: number;
 }
 
 /**
@@ -71,6 +70,7 @@ export function parseReliableCompressionRequestPurpose(
   const methodKind = text(record.methodKind);
   const sourceSegmentCount = integer(record.sourceSegmentCount);
   const triggerReason = compressionTriggerReason(record.triggerReason);
+  const triggerTokenSource = compressionTokenSource(record.triggerTokenSource);
   if (
     (trigger !== 'auto' && trigger !== 'manual')
     || (requestKind !== 'context_compression_pre' && requestKind !== 'context_compression_manual')
@@ -87,6 +87,7 @@ export function parseReliableCompressionRequestPurpose(
     methodKind,
     sourceSegmentCount,
     ...(triggerReason ? { triggerReason } : {}),
+    ...(triggerTokenSource ? { triggerTokenSource } : {}),
     ...optionalTokenFields(record)
   };
 }
@@ -94,21 +95,27 @@ export function parseReliableCompressionRequestPurpose(
 function compressionTriggerReason(
   value: unknown
 ): ReliableCompressionRequestPurpose['triggerReason'] {
-  return value === 'manual' || value === 'configured_threshold' || value === 'safe_input_limit'
+  return value === 'manual' || value === 'configured_threshold'
+    ? value
+    : undefined;
+}
+
+function compressionTokenSource(
+  value: unknown
+): ReliableCompressionRequestPurpose['triggerTokenSource'] {
+  return value === 'provider-observed-delta' || value === 'compression-output' || value === 'semantic'
     ? value
     : undefined;
 }
 
 function optionalTokenFields(record: Record<string, unknown>): Pick<
   ReliableCompressionRequestPurpose,
-  'triggerEstimatedTokens' | 'configuredThresholdTokens' | 'safeInputLimitTokens' | 'effectiveTriggerTokens'
+  'triggerTokens' | 'configuredThresholdTokens'
 > {
   const result: Record<string, number> = {};
   for (const field of [
-    'triggerEstimatedTokens',
-    'configuredThresholdTokens',
-    'safeInputLimitTokens',
-    'effectiveTriggerTokens'
+    'triggerTokens',
+    'configuredThresholdTokens'
   ] as const) {
     const value = record[field];
     if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) result[field] = value;

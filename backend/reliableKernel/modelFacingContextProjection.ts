@@ -121,8 +121,6 @@ export interface FullRequestBudget {
   safeBodyRoomTokens: number;
   policyBodyRoomTokens: number;
   effectiveBodyTargetTokens: number;
-  policyTrigger: boolean;
-  sendingTrigger: boolean;
   fixedOverPolicy: boolean;
   canSend: boolean;
   breakdown: ProjectedRequestTokenBreakdown;
@@ -213,8 +211,6 @@ export function calculateFullRequestBudget(input: FullRequestBudgetInput): FullR
       safeBodyRoomTokens,
       fixedOverPolicy ? safeBodyRoomTokens : policyBodyRoomTokens
     ),
-    policyTrigger: estimatedFullInputTokens >= compressionThresholdTokens,
-    sendingTrigger: estimatedFullInputTokens > estimatedInputLimitTokens,
     fixedOverPolicy,
     canSend: estimatedFullInputTokens <= estimatedInputLimitTokens,
     breakdown: { ...input.breakdown, fullTokens: estimatedFullInputTokens }

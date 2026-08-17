@@ -11,7 +11,8 @@ import {
   canonicalizeCompressionContents,
   estimateMaterializedContextTokens,
   estimateMessageContentsTokens,
-  ReliableContextTokenEstimator
+  ReliableContextTokenEstimator,
+  type ReliableContextTokenEstimateSource
 } from './contextTokenEstimator';
 import {
   DOMAIN_REPOSITORIES,
@@ -33,6 +34,7 @@ export interface CompressionDecision {
   rootId: string;
   authoritySnapshotId: string;
   estimatedTokens: number;
+  source: ReliableContextTokenEstimateSource;
   thresholdTokens: number;
   shouldCompress: boolean;
 }
@@ -48,11 +50,10 @@ export interface CreateCompressionCommand {
   /** Display-only facts frozen beside structured contents; Provider materialization ignores them. */
   summaryMetadata?: {
     trigger: 'auto' | 'manual';
-    triggerReason?: 'manual' | 'configured_threshold' | 'safe_input_limit';
-    triggerEstimatedTokens?: number;
+    triggerReason?: 'manual' | 'configured_threshold';
+    triggerTokens?: number;
+    triggerTokenSource?: ReliableContextTokenEstimateSource;
     configuredThresholdTokens?: number;
-    safeInputLimitTokens?: number;
-    effectiveTriggerTokens?: number;
     requestBreakdown?: {
       systemTokens: number;
       toolSchemaTokens: number;
@@ -158,6 +159,7 @@ export class ContextCompressionControlPlane {
       rootId,
       authoritySnapshotId,
       estimatedTokens,
+      source: estimate.source,
       thresholdTokens: profile.compressionThresholdTokens,
       shouldCompress: estimatedTokens >= profile.compressionThresholdTokens
     };
@@ -772,17 +774,14 @@ function normalizeCompressionSummary(
       ...(metadata ? {
         trigger: requireCompressionTrigger(metadata.trigger),
         ...(metadata.triggerReason ? { triggerReason: requireCompressionTriggerReason(metadata.triggerReason) } : {}),
-        ...(metadata.triggerEstimatedTokens === undefined ? {} : {
-          triggerEstimatedTokens: requireEstimatedTokens(metadata.triggerEstimatedTokens, 'summaryMetadata.triggerEstimatedTokens')
+        ...(metadata.triggerTokens === undefined ? {} : {
+          triggerTokens: requireEstimatedTokens(metadata.triggerTokens, 'summaryMetadata.triggerTokens')
+        }),
+        ...(metadata.triggerTokenSource === undefined ? {} : {
+          triggerTokenSource: requireCompressionTokenSource(metadata.triggerTokenSource)
         }),
         ...(metadata.configuredThresholdTokens === undefined ? {} : {
           configuredThresholdTokens: requireEstimatedTokens(metadata.configuredThresholdTokens, 'summaryMetadata.configuredThresholdTokens')
-        }),
-        ...(metadata.safeInputLimitTokens === undefined ? {} : {
-          safeInputLimitTokens: requireEstimatedTokens(metadata.safeInputLimitTokens, 'summaryMetadata.safeInputLimitTokens')
-        }),
-        ...(metadata.effectiveTriggerTokens === undefined ? {} : {
-          effectiveTriggerTokens: requireEstimatedTokens(metadata.effectiveTriggerTokens, 'summaryMetadata.effectiveTriggerTokens')
         }),
         ...(metadata.requestBreakdown ? { requestBreakdown: requireRequestBreakdown(metadata.requestBreakdown) } : {}),
         ...(metadata.estimatedTokensBefore === undefined ? {} : {
@@ -824,9 +823,16 @@ function normalizeCompressionSummary(
 
 function requireCompressionTriggerReason(
   value: unknown
-): 'manual' | 'configured_threshold' | 'safe_input_limit' {
-  if (value !== 'manual' && value !== 'configured_threshold' && value !== 'safe_input_limit') {
+): 'manual' | 'configured_threshold' {
+  if (value !== 'manual' && value !== 'configured_threshold') {
     throw new TypeError('summaryMetadata.triggerReason is invalid.');
+  }
+  return value;
+}
+
+function requireCompressionTokenSource(value: unknown): ReliableContextTokenEstimateSource {
+  if (value !== 'provider-observed-delta' && value !== 'compression-output' && value !== 'semantic') {
+    throw new TypeError('summaryMetadata.triggerTokenSource is invalid.');
   }
   return value;
 }

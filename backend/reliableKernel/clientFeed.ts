@@ -1483,6 +1483,9 @@ export class ClientDetailReader {
       ...(optionalCompressionTriggerReason(recipe.triggerReason) ? {
         triggerReason: optionalCompressionTriggerReason(recipe.triggerReason)
       } : {}),
+      ...(optionalCompressionTokenSource(recipe.triggerTokenSource) ? {
+        triggerTokenSource: optionalCompressionTokenSource(recipe.triggerTokenSource)
+      } : {}),
       ...compressionPresentationTokens(recipe)
     })), 'utf8');
   }
@@ -1521,11 +1524,13 @@ export class ClientDetailReader {
       throw new TypeError(`CompressionBlock ${recordId} has an invalid trigger.`);
     }
     const triggerReason = optionalCompressionTriggerReason(summary.triggerReason);
+    const triggerTokenSource = optionalCompressionTokenSource(summary.triggerTokenSource);
     return Buffer.from(JSON.stringify(toWirePlain({
       title,
       trigger,
       methodKind: requireCompressionMethodKind(summary.methodKind),
       ...(triggerReason ? { triggerReason } : {}),
+      ...(triggerTokenSource ? { triggerTokenSource } : {}),
       ...compressionPresentationTokens(summary)
     })), 'utf8');
   }
@@ -1766,18 +1771,24 @@ function requireFileChangeOperation(value: unknown): 'create_file' | 'replace_fi
 
 function optionalCompressionTriggerReason(
   value: unknown
-): 'manual' | 'configured_threshold' | 'safe_input_limit' | undefined {
+): 'manual' | 'configured_threshold' | undefined {
   if (value === undefined) return undefined;
-  if (value === 'manual' || value === 'configured_threshold' || value === 'safe_input_limit') return value;
+  if (value === 'manual' || value === 'configured_threshold') return value;
   throw new TypeError(`Unsupported compression trigger reason: ${String(value)}.`);
+}
+
+function optionalCompressionTokenSource(
+  value: unknown
+): 'provider-observed-delta' | 'compression-output' | 'semantic' | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'provider-observed-delta' || value === 'compression-output' || value === 'semantic') return value;
+  throw new TypeError(`Unsupported compression token source: ${String(value)}.`);
 }
 
 function compressionPresentationTokens(summary: Record<string, unknown>): Record<string, number> {
   const fields = [
-    'triggerEstimatedTokens',
+    'triggerTokens',
     'configuredThresholdTokens',
-    'safeInputLimitTokens',
-    'effectiveTriggerTokens',
     'estimatedTokensBefore',
     'estimatedTokensAfter',
     'providerInputTokens',

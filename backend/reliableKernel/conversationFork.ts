@@ -5,6 +5,7 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { conversationProjectLinkInsertStep } from './conversationProject';
+import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface ConversationForkCommand {
@@ -13,6 +14,8 @@ export interface ConversationForkCommand {
   reuseKey: string;
   sourceConversationId: string;
   sourceContextRootId: string;
+  /** Exact final Context segment retained by the target root; omitted only for whole-root callers. */
+  sourceContextEndSegmentId?: string;
   sourceMessageRevisionId?: string;
   /** Optional UI CAS: the selected Message must still point at this exact revision at commit. */
   expectedCurrentMessageRevisionId?: string;
@@ -32,6 +35,7 @@ export interface ConversationForkResult {
   branchLinkId: string;
   originLinkId: string;
   sharedRootNodeId: string | null;
+  copiedMessageCount?: number;
   deduplicated: boolean;
   commitSeq?: string;
 }
@@ -44,6 +48,14 @@ interface ForkIds {
   reuseLinkId: string;
   branchLinkId: string;
   originLinkId: string;
+}
+
+interface ForkRootShape {
+  rootNodeId: string | null;
+  tailNodeId: string | null;
+  tailSegmentCount: bigint;
+  segmentCount: bigint;
+  estimatedTokens: bigint;
 }
 
 /**
@@ -188,15 +200,56 @@ export class ConversationForkControlPlane {
       sourceMembership = rows[0];
     }
 
+    const sourceAgentSnapshot = await this.database.snapshotAll(
+      DOMAIN_REPOSITORIES.domain('AgentConversationLink').list({
+        where: { conversation_id: command.sourceConversationId },
+        orderBy: { column: 'id', direction: 'asc' },
+        limit: 1000
+      })
+    );
+    const sourceAgentLinks = sourceAgentSnapshot.snapshot;
+    const defaultAgentLinks = sourceAgentLinks.filter((link) => link.role === 'default');
+    if (defaultAgentLinks.length !== 1) {
+      throw new Error('Fork source Conversation must have exactly one default Agent relationship.');
+    }
+    const sourceContextRoots = (await this.database.snapshotAll(
+      DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').list({
+        where: { conversation_id: command.sourceConversationId },
+        orderBy: { column: 'id', direction: 'asc' },
+        limit: 1000
+      })
+    )).snapshot.sort((left, right) => {
+      const leftSeq = requireBigInt(left.root_seq, 'ContextSequenceRoot.root_seq');
+      const rightSeq = requireBigInt(right.root_seq, 'ContextSequenceRoot.root_seq');
+      return leftSeq < rightSeq ? -1 : leftSeq > rightSeq ? 1 : String(left.id).localeCompare(String(right.id));
+    });
+    const historicalSourceRoots = sourceContextRoots.filter((root) =>
+      requireId(root.id, 'ContextSequenceRoot.id') !== command.sourceContextRootId
+    );
+
     const now = this.timestamp();
-    const sharedRootNodeId = nullableId(sourceRoot.root_node_id, 'ContextSequenceRoot.root_node_id');
+    const targetRootShape = await resolveForkRootShape(
+      this.database,
+      sourceRoot,
+      command.sourceContextEndSegmentId
+    );
+    const sharedRootNodeId = targetRootShape.rootNodeId;
+    const transcript = await prepareConversationForkSnapshot(this.database, {
+      sourceConversationId: command.sourceConversationId,
+      targetConversationId: ids.targetConversationId,
+      ...(sourceMembership
+        ? { boundaryMessageSeq: requireBigInt(sourceMembership.message_seq, 'MessagePartOfConversation.message_seq') }
+        : {}),
+      targetAgentId: command.targetAgentId,
+      now
+    });
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Conversation').assert(command.sourceConversationId, {
         status: sourceConversation.status
       }),
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').assert(command.sourceContextRootId, {
         conversation_id: command.sourceConversationId,
-        root_node_id: sharedRootNodeId,
+        root_node_id: sourceRoot.root_node_id,
         tail_node_id: sourceRoot.tail_node_id,
         tail_segment_count: sourceRoot.tail_segment_count,
         segment_count: sourceRoot.segment_count
@@ -228,6 +281,29 @@ export class ConversationForkControlPlane {
             { conversation_id: command.sourceConversationId, message_id: sourceMembership.message_id }
           )]
         : []),
+      ...transcript.assertions,
+      DOMAIN_REPOSITORIES.domain('AgentConversationLink').assertExactIds(
+        { conversation_id: command.sourceConversationId },
+        sourceAgentLinks.map((link) => requireId(link.id, 'AgentConversationLink.id'))
+      ),
+      ...sourceAgentLinks.map((link) => DOMAIN_REPOSITORIES.domain('AgentConversationLink').assert(
+        requireId(link.id, 'AgentConversationLink.id'),
+        {
+          conversation_id: command.sourceConversationId,
+          agent_id: link.agent_id,
+          role: link.role
+        }
+      )),
+      ...historicalSourceRoots.map((root) => DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').assert(
+        requireId(root.id, 'ContextSequenceRoot.id'),
+        {
+          conversation_id: command.sourceConversationId,
+          root_node_id: root.root_node_id,
+          tail_node_id: root.tail_node_id,
+          tail_segment_count: root.tail_segment_count,
+          segment_count: root.segment_count
+        }
+      )),
       ...(sourceTurn
         ? [DOMAIN_REPOSITORIES.domain('Turn').assert(command.sourceTurnId!, {
             conversation_id: command.sourceConversationId
@@ -263,14 +339,35 @@ export class ConversationForkControlPlane {
         created_at: now,
         updated_at: now
       }),
+      ...historicalSourceRoots.map((root) => DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
+        id: stableId(
+          'context_root',
+          JSON.stringify([
+            'fork-history',
+            ids.targetConversationId,
+            requireId(root.id, 'ContextSequenceRoot.id')
+          ])
+        ),
+        conversation_id: ids.targetConversationId,
+        root_node_id: root.root_node_id,
+        tail_node_id: root.tail_node_id,
+        tail_segment_count: requireBigInt(root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count'),
+        segment_count: requireBigInt(root.segment_count, 'ContextSequenceRoot.segment_count'),
+        estimated_tokens: requireBigInt(root.estimated_tokens, 'ContextSequenceRoot.estimated_tokens'),
+        created_at: now
+      }, {
+        column: 'root_seq',
+        scope: { conversation_id: ids.targetConversationId }
+      })),
+      ...transcript.inserts,
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
         id: ids.targetRootId,
         conversation_id: ids.targetConversationId,
-        root_node_id: sharedRootNodeId,
-        tail_node_id: sourceRoot.tail_node_id,
-        tail_segment_count: sourceRoot.tail_segment_count,
-        segment_count: sourceRoot.segment_count,
-        estimated_tokens: sourceRoot.estimated_tokens,
+        root_node_id: targetRootShape.rootNodeId,
+        tail_node_id: targetRootShape.tailNodeId,
+        tail_segment_count: targetRootShape.tailSegmentCount,
+        segment_count: targetRootShape.segmentCount,
+        estimated_tokens: targetRootShape.estimatedTokens,
         created_at: now
       }, {
         column: 'root_seq',
@@ -282,14 +379,19 @@ export class ConversationForkControlPlane {
         root_id: ids.targetRootId,
         updated_at: now
       }),
-      DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
-        id: ids.targetAgentLinkId,
+      ...sourceAgentLinks.map((link) => DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+        ...link,
+        id: link.role === 'default'
+          ? ids.targetAgentLinkId
+          : stableId(
+              'agent_conversation_link',
+              JSON.stringify([ids.targetConversationId, requireId(link.id, 'AgentConversationLink.id')])
+            ),
         conversation_id: ids.targetConversationId,
-        agent_id: command.targetAgentId,
-        role: 'default',
+        agent_id: link.role === 'default' ? command.targetAgentId : link.agent_id,
         created_at: now,
         updated_at: now
-      }),
+      })),
       ...(command.sourceProjectContextId
         ? [conversationProjectLinkInsertStep({
             conversationId: ids.targetConversationId,
@@ -328,6 +430,7 @@ export class ConversationForkControlPlane {
       return {
         ...publicIds(ids),
         sharedRootNodeId,
+        copiedMessageCount: transcript.copiedVisibleMessageCount,
         deduplicated: false,
         commitSeq: commit.commitSeq
       };
@@ -418,6 +521,7 @@ function normalizeForkCommand(command: ConversationForkCommand) {
   const reuseKey = requireText(command.reuseKey, 'reuseKey');
   const sourceConversationId = requireId(command.sourceConversationId, 'sourceConversationId');
   const sourceContextRootId = requireId(command.sourceContextRootId, 'sourceContextRootId');
+  const sourceContextEndSegmentId = optionalId(command.sourceContextEndSegmentId, 'sourceContextEndSegmentId');
   const sourceMessageRevisionId = optionalId(command.sourceMessageRevisionId, 'sourceMessageRevisionId');
   const expectedCurrentMessageRevisionId = optionalId(
     command.expectedCurrentMessageRevisionId,
@@ -435,11 +539,15 @@ function normalizeForkCommand(command: ConversationForkCommand) {
   if (expectedCurrentMessageRevisionId && expectedCurrentMessageRevisionId !== sourceMessageRevisionId) {
     throw new TypeError('expectedCurrentMessageRevisionId must equal sourceMessageRevisionId.');
   }
+  if (sourceMessageRevisionId && !sourceContextEndSegmentId) {
+    throw new TypeError('sourceMessageRevisionId requires sourceContextEndSegmentId.');
+  }
   return {
     idempotencyKey,
     reuseKey,
     sourceConversationId,
     sourceContextRootId,
+    ...(sourceContextEndSegmentId ? { sourceContextEndSegmentId } : {}),
     ...(sourceMessageRevisionId ? { sourceMessageRevisionId } : {}),
     ...(expectedCurrentMessageRevisionId ? { expectedCurrentMessageRevisionId } : {}),
     ...(sourceTurnId ? { sourceTurnId } : {}),
@@ -461,6 +569,7 @@ function forkIds(command: ResolvedForkCommand): ForkIds {
     command.reuseKey,
     command.sourceConversationId,
     command.sourceContextRootId,
+    command.sourceContextEndSegmentId ?? null,
     command.sourceMessageRevisionId ?? null,
     command.sourceTurnId ?? null,
     command.sourceToolCallId ?? null,
@@ -541,4 +650,47 @@ function nullableId(value: unknown, label: string): string | null {
 function requireText(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty text.`);
   return value.trim();
+}
+
+function requireBigInt(value: unknown, label: string): bigint {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value);
+  if (typeof value === 'string' && /^-?\d+$/.test(value)) return BigInt(value);
+  throw new TypeError(`${label} must be an integer.`);
+}
+
+async function resolveForkRootShape(
+  database: RuntimeDatabase,
+  sourceRoot: DomainRow,
+  endSegmentId: string | undefined
+): Promise<ForkRootShape> {
+  if (!endSegmentId) {
+    return {
+      rootNodeId: nullableId(sourceRoot.root_node_id, 'ContextSequenceRoot.root_node_id'),
+      tailNodeId: nullableId(sourceRoot.tail_node_id, 'ContextSequenceRoot.tail_node_id'),
+      tailSegmentCount: requireBigInt(sourceRoot.tail_segment_count, 'ContextSequenceRoot.tail_segment_count'),
+      segmentCount: requireBigInt(sourceRoot.segment_count, 'ContextSequenceRoot.segment_count'),
+      estimatedTokens: requireBigInt(sourceRoot.estimated_tokens, 'ContextSequenceRoot.estimated_tokens')
+    };
+  }
+  const rootId = requireId(sourceRoot.id, 'ContextSequenceRoot.id');
+  const materialized = await database.materializeContext(rootId);
+  const endIndex = materialized.snapshot.records.findIndex((record) => record.segment.id === endSegmentId);
+  if (endIndex < 0) throw new Error(`Fork Context boundary segment ${endSegmentId} is not part of source root ${rootId}.`);
+  const prefix = materialized.snapshot.records.slice(0, endIndex + 1);
+  const first = prefix[0];
+  const last = prefix[prefix.length - 1];
+  if (!first || !last) throw new Error('Fork Context boundary cannot produce an empty root.');
+  const compressed = first.segment.segment_kind === 'compression';
+  return {
+    rootNodeId: requireId(compressed ? first.node.id : last.node.id, 'ContextSequenceNode.id'),
+    tailNodeId: compressed && prefix.length > 1
+      ? requireId(last.node.id, 'ContextSequenceNode.id')
+      : null,
+    tailSegmentCount: compressed ? BigInt(prefix.length - 1) : 0n,
+    segmentCount: BigInt(prefix.length),
+    estimatedTokens: prefix.reduce((total, record) =>
+      total + (requireBigInt(record.contentObject.byte_length, 'ContentObject.byte_length') + 3n) / 4n,
+    0n)
+  };
 }

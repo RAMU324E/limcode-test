@@ -211,6 +211,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (revision.message_id !== messageId) {
         throw new Error('Conversation fork command was replayed with a different source Message.');
       }
+      await this.product.configuration.mutations.copyConversationConfiguration(
+        sourceConversationId,
+        conversationId
+      );
       return { conversationId, deduplicated: true };
     }
 
@@ -267,6 +271,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       compareBigInt(left.root_seq, right.root_seq) || String(left.id).localeCompare(String(right.id))
     );
     let sourceRootId: string | undefined;
+    let sourceContextEndSegmentId: string | undefined;
     for (const root of roots) {
       const rootId = requireText(root.id, 'ContextSequenceRoot.id');
       const structure = await this.product.application.context.materializeStructure(rootId);
@@ -281,10 +286,14 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       });
       if (messageIndex >= 0 && containsClosedToolSuffix) {
         sourceRootId = rootId;
+        sourceContextEndSegmentId = requiredToolPairSegmentIds.at(-1)
+          ?? requireText(structure.records[messageIndex].segment.id, 'ContextSegment.id');
         break;
       }
     }
-    if (!sourceRootId) throw new Error('无法定位 Fork 源 MessageRevision 对应的 Context root。');
+    if (!sourceRootId || !sourceContextEndSegmentId) {
+      throw new Error('无法定位 Fork 源 MessageRevision 对应的 Context root。');
+    }
 
     const turnLinks = (await this.product.application.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({
@@ -304,12 +313,17 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       reuseKey,
       sourceConversationId,
       sourceContextRootId: sourceRootId,
+      sourceContextEndSegmentId,
       sourceMessageRevisionId: revisionId,
       expectedCurrentMessageRevisionId: revisionId,
       ...(sourceTurnIds.length === 1 ? { sourceTurnId: sourceTurnIds[0] } : {}),
       targetTitle: `${this.getConversationDisplayTitle(sourceConversationId)} 分支`,
       targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
     });
+    await this.product.configuration.mutations.copyConversationConfiguration(
+      sourceConversationId,
+      result.targetConversationId
+    );
     await this.refreshConversationHistory();
     return { conversationId: result.targetConversationId, deduplicated: result.deduplicated };
   }
@@ -327,13 +341,6 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     if (!conversationId) return DEFAULT_CONVERSATION_TITLE;
     const entry = this.historyEntries.find((candidate) => candidate.id === conversationId);
     return displayConversationTitle({ id: conversationId, title: entry?.title });
-  }
-
-  public prepareConversationForSidebarOpen(conversationId: string, title?: string): boolean {
-    const entry = this.historyEntries.find((candidate) => candidate.id === conversationId);
-    if (!entry) return false;
-    if (title?.trim() && entry.title !== title.trim()) entry.title = title.trim();
-    return true;
   }
 
   public async renameConversationTitle(conversationId: string, title: string): Promise<boolean> {

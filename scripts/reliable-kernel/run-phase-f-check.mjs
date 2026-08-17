@@ -16,6 +16,11 @@ import {
 
 const root = process.cwd();
 const NOW = '2026-08-01T00:00:00.000Z';
+const CHILD_MODEL_FALLBACK = Object.freeze({
+  providerConfigId: 'fake-local',
+  provider: 'openai-compatible',
+  model: 'fake-model'
+});
 const checkId = option('check');
 const PHASE_F_CHECKS = new Set([
   'candidate.conversation-fork-links',
@@ -103,6 +108,16 @@ async function checkConversationForkLinks() {
     const faults = [];
     const metrics = {};
     const seeded = await seedParent(ctx, 'fork');
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+        id: 'agent-link-fork-reviewer',
+        conversation_id: seeded.conversationId,
+        agent_id: 'agent-fork-reviewer',
+        role: 'reviewer',
+        created_at: NOW,
+        updated_at: NOW
+      })
+    ]);
     const projectUri = 'file:///workspace/fork-project';
     await ctx.database.transaction(kernel.projectFolderAssignmentSteps({
       conversationId: seeded.conversationId,
@@ -116,18 +131,30 @@ async function checkConversationForkLinks() {
     const context = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
     const sourceRootId = await context.currentHeadRootId(seeded.conversationId);
     const sourceRoot = await get(ctx.database, 'ContextSequenceRoot', sourceRootId);
+    const sourceMessageSegment = (await list(ctx.database, 'ContextSegmentSource', {
+      source_kind: 'message_revision',
+      source_id: seeded.messageRevisionId
+    }))[0];
+    assert.ok(sourceMessageSegment);
     const forks = ctx.services.conversationFork;
     const baseCommand = {
       idempotencyKey: 'fork-atomic',
       reuseKey: 'reuse-fork-atomic',
       sourceConversationId: seeded.conversationId,
       sourceContextRootId: sourceRootId,
+      sourceContextEndSegmentId: sourceMessageSegment.segment_id,
       sourceMessageRevisionId: seeded.messageRevisionId,
       sourceTurnId: seeded.turnId,
       expectedSourceHeadRootId: sourceRootId,
       targetTitle: 'Fork target',
       targetAgentId: 'fork-target-agent'
     };
+    await assert.rejects(forks.fork({
+      ...baseCommand,
+      idempotencyKey: 'fork-missing-exact-boundary',
+      reuseKey: 'reuse-fork-missing-exact-boundary',
+      sourceContextEndSegmentId: undefined
+    }), /sourceMessageRevisionId requires sourceContextEndSegmentId/);
 
     const originalTransaction = ctx.database.transaction.bind(ctx.database);
     let injected = false;
@@ -148,7 +175,7 @@ async function checkConversationForkLinks() {
     assert.equal((await list(ctx.database, 'ConversationOriginLink', { source_conversation_id: seeded.conversationId })).length, 0);
     assert.equal((await list(ctx.database, 'ConversationProjectLink', {})).length, 1);
     assert.equal((await list(ctx.database, 'Conversation', {})).length, 1);
-    assertions.push('fork中间故障使target Conversation/root/head/三类Link整笔SQLite事务回滚');
+    assertions.push('消息边界fork强制携带精确Context segment；fork中间故障使target Conversation/root/head/三类Link整笔SQLite事务回滚');
     faults.push('fork writer transaction fault after relation inserts');
 
     const forked = await forks.fork(baseCommand);
@@ -169,7 +196,62 @@ async function checkConversationForkLinks() {
       conversation_id: forked.targetConversationId
     }))[0];
     assert.equal(targetProjectLink.project_context_id, sourceProjectLink.project_context_id);
-    assertions.push('Reuse/Branch/Origin/ConversationProjectLink保持独立，fork原子继承ProjectContext且root共享immutable node前缀');
+    const targetAgentLinks = await list(ctx.database, 'AgentConversationLink', {
+      conversation_id: forked.targetConversationId
+    });
+    assert.deepEqual(
+      targetAgentLinks.map((link) => [link.role, link.agent_id]).sort(),
+      [['default', 'fork-target-agent'], ['reviewer', 'agent-fork-reviewer']]
+    );
+    const sourceMembershipsBeforeContinuation = await list(ctx.database, 'MessagePartOfConversation', {
+      conversation_id: seeded.conversationId
+    });
+    const targetMembershipsBeforeContinuation = await list(ctx.database, 'MessagePartOfConversation', {
+      conversation_id: forked.targetConversationId
+    });
+    assert.equal(forked.copiedMessageCount, 1);
+    assert.equal(targetMembershipsBeforeContinuation.length, 1);
+    assert.notEqual(targetMembershipsBeforeContinuation[0].message_id, seeded.messageId);
+    assert.equal(targetMembershipsBeforeContinuation[0].message_seq, sourceMembershipsBeforeContinuation[0].message_seq);
+    const targetMessageId = targetMembershipsBeforeContinuation[0].message_id;
+    const targetCurrent = (await list(ctx.database, 'MessageCurrentRevisionLink', {
+      message_id: targetMessageId
+    }))[0];
+    assert.ok(targetCurrent);
+    assert.notEqual(targetCurrent.revision_id, seeded.messageRevisionId);
+    const targetRevision = await get(ctx.database, 'MessageRevision', targetCurrent.revision_id);
+    const sourceRevision = await get(ctx.database, 'MessageRevision', seeded.messageRevisionId);
+    assert.equal(targetRevision.content_object_id, sourceRevision.content_object_id);
+    assert.equal(targetRevision.role, sourceRevision.role);
+    const targetSnapshot = await ctx.database.clientProjectionSnapshot(forked.targetConversationId);
+    assert.equal(String(targetSnapshot.snapshot.activeConversationWindow.visibleMessageCount), '1');
+    assert.deepEqual(
+      targetSnapshot.snapshot.activeConversationWindow.messages.map((message) => message.id),
+      [targetMessageId]
+    );
+    assertions.push('Reuse/Branch/Origin/ConversationProjectLink保持独立，fork原子继承ProjectContext并以新Message/Revision身份投影可见历史');
+
+    const targetControl = createTurnControl(ctx, 'fork-independent-continuation');
+    const targetContinuation = await targetControl.input({
+      source: { kind: 'command', key: 'fork-target-independent-input' },
+      conversationId: forked.targetConversationId,
+      leaseOwnerId: 'fork-target-executor',
+      hostBootId: ctx.database.hostBootId,
+      leaseExpiresAt: '2026-08-02T00:00:00.000Z',
+      content: 'target-only-continuation'
+    });
+    const targetMembershipsAfterContinuation = await list(ctx.database, 'MessagePartOfConversation', {
+      conversation_id: forked.targetConversationId
+    });
+    assert.equal(targetMembershipsAfterContinuation.length, 2);
+    assert.equal(targetMembershipsAfterContinuation.find((row) => row.message_id === targetContinuation.messageId)?.message_seq, 2n);
+    assert.equal((await list(ctx.database, 'MessagePartOfConversation', {
+      conversation_id: seeded.conversationId
+    })).length, 1);
+    const targetHeadAfterContinuation = await context.currentHeadRootId(forked.targetConversationId);
+    assert.notEqual(targetHeadAfterContinuation, forked.targetRootId);
+    assert.equal(await context.currentHeadRootId(seeded.conversationId), sourceRootId);
+    assertions.push('fork后目标续聊从复制序列继续递增，并与源Conversation的Message membership和Context head独立演进');
 
     const sourceAppend = await context.appendContent({
       conversationId: seeded.conversationId,
@@ -187,6 +269,178 @@ async function checkConversationForkLinks() {
     assert.equal((await context.materialize(sourceAppend.rootId)).segments.at(-1).content.toString('utf8'), 'source-after-fork');
     assert.equal((await context.materialize(targetAppend.rootId)).segments.at(-1).content.toString('utf8'), 'target-after-fork');
     assertions.push('fork后source/target独立append形成不同后继，原共享前缀保持immutable');
+
+    const prefixSeed = await seedParent(ctx, 'fork-prefix-c');
+    await prefixSeed.control.terminal({
+      source: { kind: 'callback', key: 'fork-prefix-c-terminal' },
+      turnId: prefixSeed.turnId,
+      terminalStatus: 'completed',
+      reason: 'fixture completed before second input'
+    });
+    const prefixBControl = createTurnControl(ctx, 'fork-prefix-b');
+    const prefixB = await prefixBControl.input({
+      source: { kind: 'command', key: 'fork-prefix-b-input' },
+      conversationId: prefixSeed.conversationId,
+      leaseOwnerId: 'fork-prefix-b-executor',
+      hostBootId: ctx.database.hostBootId,
+      leaseExpiresAt: '2026-08-02T00:00:00.000Z',
+      content: 'user-input-fork-prefix-b'
+    });
+    const prefixRootId = await context.currentHeadRootId(prefixSeed.conversationId);
+    const prefixCSource = (await list(ctx.database, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: prefixSeed.messageRevisionId
+    }))[0];
+    const prefixBSource = (await list(ctx.database, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: prefixB.messageRevisionId
+    }))[0];
+    const prefixAuthority = (await list(ctx.database, 'AuthoritySnapshot', {
+      turn_id: prefixB.turnId
+    }))[0];
+    assert.ok(prefixAuthority);
+    const prefixCompression = await new kernel.ContextCompressionControlPlane(
+      ctx.database,
+      ctx.store
+    ).create({
+      conversationId: prefixSeed.conversationId,
+      headRootId: prefixRootId,
+      authoritySnapshotId: prefixAuthority.id,
+      compressSegmentCount: 1,
+      title: 'Fork recursive compression fixture',
+      summary: 'COMPRESSED_PREFIX_C',
+      idempotencyKey: 'fork-recursive-compression'
+    });
+    const forkThroughB = await forks.fork({
+      idempotencyKey: 'fork-prefix-through-b',
+      reuseKey: 'reuse-fork-prefix-through-b',
+      sourceConversationId: prefixSeed.conversationId,
+      sourceContextRootId: prefixCompression.rootId,
+      sourceContextEndSegmentId: prefixBSource.segment_id,
+      sourceMessageRevisionId: prefixB.messageRevisionId,
+      expectedCurrentMessageRevisionId: prefixB.messageRevisionId,
+      sourceTurnId: prefixB.turnId,
+      expectedSourceHeadRootId: prefixCompression.rootId,
+      targetTitle: 'Fork through B',
+      targetAgentId: prefixSeed.agentId
+    });
+    const forkBMemberships = (await list(ctx.database, 'MessagePartOfConversation', {
+      conversation_id: forkThroughB.targetConversationId
+    })).sort((left, right) => Number(left.message_seq - right.message_seq));
+    assert.equal(forkBMemberships.length, 2);
+    const clonedCMessageId = forkBMemberships[0].message_id;
+    const clonedCCurrent = (await list(ctx.database, 'MessageCurrentRevisionLink', {
+      message_id: clonedCMessageId
+    }))[0];
+    const clonedCRevision = await get(ctx.database, 'MessageRevision', clonedCCurrent.revision_id);
+    const clonedCSource = (await list(ctx.database, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: clonedCRevision.id
+    }))[0];
+    assert.equal(clonedCSource.segment_id, prefixCSource.segment_id);
+    const clonedCTurnLink = (await list(ctx.database, 'MessageTurnLink', {
+      message_id: clonedCMessageId
+    }))[0];
+    const clonedCTermination = (await list(ctx.database, 'TurnTermination', {
+      turn_id: clonedCTurnLink.turn_id
+    }))[0];
+    assert.equal(clonedCTermination.terminal_status, 'interrupted');
+    assert.equal(clonedCTermination.reason, 'forked_history_snapshot');
+
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('CompressionBlock').insert({
+        id: 'fork-prefix-target-compression-block',
+        conversation_id: forkThroughB.targetConversationId,
+        status: 'enabled',
+        authority_snapshot_id: 'fork-prefix-compression-authority',
+        title_object_id: clonedCRevision.content_object_id,
+        summary_object_id: clonedCRevision.content_object_id,
+        created_at: NOW,
+        updated_at: NOW
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('CompressionBlockSource').insert({
+        id: 'fork-prefix-target-compression-source',
+        compression_block_id: 'fork-prefix-target-compression-block',
+        segment_id: clonedCSource.segment_id,
+        position: 1n,
+        created_at: NOW
+      })
+    ]);
+    const forkBProjection = await ctx.database.clientProjectionSnapshot(forkThroughB.targetConversationId);
+    const projectedBlock = forkBProjection.snapshot.activeConversationWindow.compressionBlocks.find((block) =>
+      block.id === 'fork-prefix-target-compression-block'
+    );
+    assert.ok(projectedBlock);
+    assert.equal(projectedBlock.anchor_message_id, clonedCMessageId);
+    assert.notEqual(projectedBlock.anchor_message_id, prefixSeed.messageId);
+
+    const forkBRoots = await list(ctx.database, 'ContextSequenceRoot', {
+      conversation_id: forkThroughB.targetConversationId
+    });
+    let recursiveSourceRootId;
+    for (const root of forkBRoots) {
+      const materialized = await context.materializeStructure(root.id);
+      if (materialized.records.some((record) => record.segment.id === clonedCSource.segment_id)) {
+        recursiveSourceRootId = root.id;
+        break;
+      }
+    }
+    assert.ok(recursiveSourceRootId);
+    assert.notEqual(recursiveSourceRootId, forkThroughB.targetRootId);
+
+    const forkCOnly = await forks.fork({
+      idempotencyKey: 'fork-prefix-c-only',
+      reuseKey: 'reuse-fork-prefix-c-only',
+      sourceConversationId: forkThroughB.targetConversationId,
+      sourceContextRootId: recursiveSourceRootId,
+      sourceContextEndSegmentId: clonedCSource.segment_id,
+      sourceMessageRevisionId: clonedCRevision.id,
+      expectedCurrentMessageRevisionId: clonedCRevision.id,
+      sourceTurnId: clonedCTurnLink.turn_id,
+      targetTitle: 'Recursive fork through C',
+      targetAgentId: prefixSeed.agentId
+    });
+    const cOnlyContext = await context.materialize(forkCOnly.targetRootId);
+    assert.deepEqual(cOnlyContext.segments.map((segment) => segment.segmentId), [clonedCSource.segment_id]);
+    const cOnlyModelInput = cOnlyContext.segments.map((segment) => segment.content.toString('utf8')).join('\n');
+    assert.match(cOnlyModelInput, /user-input-fork-prefix-c/);
+    assert.doesNotMatch(cOnlyModelInput, /user-input-fork-prefix-b/);
+    assertions.push('压缩后的B分支保留历史root，仍可从压缩前C递归fork并精确截止；裁断Turn降级为interrupted，Compression anchor只选目标Conversation消息');
+
+    const failedSeed = await seedParent(ctx, 'fork-preserve-failed-turn');
+    await failedSeed.control.terminal({
+      source: { kind: 'callback', key: 'fork-preserve-failed-turn-terminal' },
+      turnId: failedSeed.turnId,
+      terminalStatus: 'failed',
+      reason: 'provider_failed_before_output'
+    });
+    const failedRootId = await context.currentHeadRootId(failedSeed.conversationId);
+    const failedSource = (await list(ctx.database, 'ContextSegmentSource', {
+      source_kind: 'message_revision',
+      source_id: failedSeed.messageRevisionId
+    }))[0];
+    const failedFork = await forks.fork({
+      idempotencyKey: 'fork-preserve-failed-turn',
+      reuseKey: 'reuse-fork-preserve-failed-turn',
+      sourceConversationId: failedSeed.conversationId,
+      sourceContextRootId: failedRootId,
+      sourceContextEndSegmentId: failedSource.segment_id,
+      sourceMessageRevisionId: failedSeed.messageRevisionId,
+      expectedCurrentMessageRevisionId: failedSeed.messageRevisionId,
+      sourceTurnId: failedSeed.turnId,
+      expectedSourceHeadRootId: failedRootId,
+      targetTitle: 'Fork preserves failed Turn',
+      targetAgentId: failedSeed.agentId
+    });
+    const failedTargetMembership = (await list(ctx.database, 'MessagePartOfConversation', {
+      conversation_id: failedFork.targetConversationId
+    }))[0];
+    const failedTargetTurnLink = (await list(ctx.database, 'MessageTurnLink', {
+      message_id: failedTargetMembership.message_id
+    }))[0];
+    const failedTargetTermination = (await list(ctx.database, 'TurnTermination', {
+      turn_id: failedTargetTurnLink.turn_id
+    }))[0];
+    assert.equal(failedTargetTermination.terminal_status, 'failed');
+    assert.equal(failedTargetTermination.reason, 'provider_failed_before_output');
+    assertions.push('完整failed Turn无需final-output fence即可保留真实终态；只有被边界裁断的Turn降级');
 
     await assert.rejects(forks.fork({
       ...baseCommand,
@@ -762,6 +1016,8 @@ async function checkCancelSubtree() {
     const atomicSpawnCommand = {
       sourceToolCallId: atomicTool.toolCallId,
       childAgentId: 'child-agent-spawn-atomic',
+      modelFallback: CHILD_MODEL_FALLBACK,
+      sourceSettlement: 'child_handle',
       prompt: 'atomic concurrent spawn',
       completionPolicy: 'background',
       leaseOwnerId: 'child-owner-spawn-atomic',
@@ -912,6 +1168,8 @@ async function checkCancelSubtree() {
     const racedDescendantCommand = {
       sourceToolCallId: racedDescendantTool.toolCallId,
       childAgentId: 'child-agent-tree-raced-descendant',
+      modelFallback: CHILD_MODEL_FALLBACK,
+      sourceSettlement: 'child_handle',
       prompt: 'commit exactly between cancel tree read and writer transaction',
       completionPolicy: 'background',
       leaseOwnerId: 'child-owner-tree-raced-descendant',
@@ -973,6 +1231,8 @@ async function checkCancelSubtree() {
     await assert.rejects(ctx.services.children.spawn({
       sourceToolCallId: pendingDescendantTool.toolCallId,
       childAgentId: 'blocked-agent',
+      modelFallback: CHILD_MODEL_FALLBACK,
+      sourceSettlement: 'child_handle',
       prompt: 'must not spawn',
       completionPolicy: 'background',
       leaseOwnerId: 'blocked-owner',
@@ -982,9 +1242,219 @@ async function checkCancelSubtree() {
       source_tool_call_id: pendingDescendantTool.toolCallId
     })).length, 0);
     assertions.push('父树登记interrupt_subtree后spawn在写入前拒绝，不留下半创建lineage');
+
+    const planParent = await seedParent(ctx, 'plan-external-settlement');
+    const planRequest = {
+      plan: '把已批准 Plan 交给独立 Agent 对话执行。',
+      taskList: {
+        mode: 'rewrite',
+        items: [
+          { title: '创建可靠子执行', status: 'in_progress' },
+          { title: '保留 PlanReview 唯一结算权', status: 'pending' }
+        ]
+      }
+    };
+    const planTool = await ctx.services.effects.createToolCall({
+      source: { kind: 'callback', key: 'plan-external-tool' },
+      toolCallId: 'submit-plan-call-external-settlement',
+      turnId: planParent.turnId,
+      toolName: 'submit_plan',
+      arguments: planRequest
+    });
+    const planInteractions = new kernel.ToolInteractionControlPlane(
+      ctx.database,
+      ctx.store,
+      ctx.services.effects
+    );
+    const planPause = await planInteractions.pauseForPlanReview({
+      source: { kind: 'internal', key: 'plan-external-pause' },
+      toolCallId: planTool.toolCallId,
+      request: planRequest
+    });
+    const planOperation = await get(ctx.database, 'Operation', planPause.operationId);
+    assert.equal(planOperation.status, 'waiting_answer');
+    const externalIdentity = kernel.childExecutionSpawnIdentity({
+      sourceToolCallId: planTool.toolCallId
+    });
+    let externalEnsureAttempts = 0;
+    let externalSpawn;
+    let delegatedPlanPrompt;
+    planInteractions.setPlanDelegator({
+      preview: async ({ requestedAgentId }) => ({
+        ...externalIdentity,
+        agentId: requestedAgentId,
+        agentType: 'plan-external'
+      }),
+      ensure: async (request) => {
+        externalEnsureAttempts += 1;
+        delegatedPlanPrompt = request.prompt;
+        assert.deepEqual(request.expected, {
+          childExecutionId: externalIdentity.childExecutionId,
+          childConversationId: externalIdentity.childConversationId,
+          answerBridgeId: externalIdentity.answerBridgeId,
+          agentId: 'agent-plan-external',
+          agentType: 'plan-external'
+        });
+        externalSpawn = await ctx.services.children.spawn({
+          sourceToolCallId: planTool.toolCallId,
+          childAgentId: 'agent-plan-external',
+          modelFallback: CHILD_MODEL_FALLBACK,
+          sourceSettlement: 'external',
+          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务的默认 answerBridgeId 为 ${externalIdentity.answerBridgeId}。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })；继续同一子对话时该默认值保持不变。`,
+          completionPolicy: 'background',
+          leaseOwnerId: `child-owner-plan-external-${externalEnsureAttempts}`,
+          leaseExpiresAt: `2026-08-0${externalEnsureAttempts + 1}T00:00:00.000Z`
+        });
+        if (externalEnsureAttempts === 1) {
+          throw new Error('fault-after-plan-child-spawn-before-launch');
+        }
+        const claimed = await ctx.services.children.claimSpawnDispatch(externalSpawn.effectIntentId);
+        if (claimed) {
+          const externalReceipt = await ctx.services.children.recordSpawnReceipt({
+            sourceKey: 'plan-external-spawn-receipt',
+            attemptId: externalSpawn.attemptId,
+            outcome: 'succeeded',
+            detail: { adapter: 'deterministic-plan-external' }
+          });
+          const externalSettlement = await ctx.services.children.reconcileSpawnReceipt(
+            externalReceipt.effectReceiptId
+          );
+          assert.equal(externalSettlement.terminalToolResult, false);
+        } else {
+          const recovered = await ctx.services.children.recoverSpawnIntent(externalSpawn.effectIntentId);
+          assert.equal(recovered.childStatus, 'active');
+        }
+        return {
+          childExecutionId: externalSpawn.childExecutionId,
+          childConversationId: externalSpawn.childConversationId,
+          childTurnId: externalSpawn.childTurnId,
+          answerBridgeId: externalSpawn.answerBridgeId,
+          agentId: request.requestedAgentId,
+          agentType: 'plan-external'
+        };
+      }
+    });
+    const approvedPlanInput = {
+      source: { kind: 'command', key: 'plan-external-approve' },
+      requestId: planPause.requestId,
+      decision: 'accept',
+      response: {
+        planProposalId: planPause.proposalId,
+        executionTarget: 'new_conversation',
+        agentType: 'agent-plan-external'
+      }
+    };
+    await assert.rejects(
+      planInteractions.resolvePlanReview(approvedPlanInput),
+      /fault-after-plan-child-spawn-before-launch/
+    );
+    assert.equal(externalEnsureAttempts, 1);
+    assert.equal((await list(ctx.database, 'InteractionResponse', {
+      request_id: planPause.requestId
+    })).length, 1);
+    assert.equal((await list(ctx.database, 'ChildExecutionParentLink', {
+      source_tool_call_id: planTool.toolCallId
+    })).length, 1);
+    assert.equal((await get(ctx.database, 'ChildExecution', externalSpawn.childExecutionId)).status, 'starting');
+    assert.equal((await get(ctx.database, 'Operation', externalSpawn.operationId)).status, 'pending');
+    assert.equal((await get(ctx.database, 'Operation', externalSpawn.operationId)).tool_call_id, null);
+    assert.equal((await get(ctx.database, 'ToolCall', planTool.toolCallId)).status, 'waiting_answer');
+    assert.equal((await list(ctx.database, 'ToolExecution', {
+      tool_call_id: planTool.toolCallId
+    }))[0].status, 'waiting_answer');
+    assert.equal((await get(ctx.database, 'Operation', planPause.operationId)).status, 'waiting_answer');
+    assert.equal((await list(ctx.database, 'ToolResultArtifact', {
+      tool_call_id: planTool.toolCallId
+    })).length, 0);
+    assert.equal((await list(ctx.database, 'ToolModelResult', {
+      tool_call_id: planTool.toolCallId
+    })).length, 0);
+
+    const approvedPlan = await planInteractions.resolvePlanReview(approvedPlanInput);
+    assert.equal(approvedPlan.won, true);
+    assert.equal(approvedPlan.deduplicated, true);
+    assert.equal(externalEnsureAttempts, 2);
+    assert.equal((await list(ctx.database, 'ChildExecutionParentLink', {
+      source_tool_call_id: planTool.toolCallId
+    })).length, 1);
+    assert.equal((await get(ctx.database, 'Operation', externalSpawn.operationId)).status, 'succeeded');
+    assert.equal((await get(ctx.database, 'Operation', externalSpawn.operationId)).tool_call_id, null);
+    assert.equal((await get(ctx.database, 'ChildExecution', externalSpawn.childExecutionId)).status, 'active');
+    assert.equal((await get(ctx.database, 'AnswerBridge', externalSpawn.answerBridgeId)).status, 'open');
+    assert.equal((await get(ctx.database, 'Operation', planPause.operationId)).status, 'succeeded');
+    assert.equal((await list(ctx.database, 'ToolResultArtifact', {
+      tool_call_id: planTool.toolCallId
+    })).length, 1);
+    assert.equal((await list(ctx.database, 'ToolModelResult', {
+      tool_call_id: planTool.toolCallId
+    })).length, 1);
+    await planInteractions.resolvePlanReview(approvedPlanInput);
+    assert.equal(externalEnsureAttempts, 3);
+    assert.equal((await list(ctx.database, 'ChildExecutionParentLink', {
+      source_tool_call_id: planTool.toolCallId
+    })).length, 1);
+    await createTurnControl(ctx, 'plan-external-child-terminal').terminal({
+      source: { kind: 'callback', key: 'plan-external-child-terminal' },
+      turnId: externalSpawn.childTurnId,
+      terminalStatus: 'completed',
+      reason: 'plan external child completed before replay'
+    });
+    assert.equal(await ctx.services.children.observeTurnTerminal(
+      externalSpawn.childExecutionId,
+      externalSpawn.childTurnId
+    ), true);
+    assert.equal((await get(ctx.database, 'ChildExecution', externalSpawn.childExecutionId)).status, 'idle');
+    let terminalReplayLaunches = 0;
+    const terminalReplayCoordinator = new kernel.ReliableChildAgentCoordinator({
+      database: ctx.database,
+      effects: ctx.services.effects,
+      children: ctx.services.children,
+      answers: ctx.services.answers,
+      deliveries: ctx.services.deliveries,
+      modelProvider: {},
+      turns: createTurnControl(ctx, 'plan-external-terminal-replay'),
+      agentLoop: { async drive() { assert.fail('terminal Plan replay must not drive the child again'); } },
+      agents: {
+        async resolve({ agentId }) {
+          return { agentId, agentType: 'plan-external' };
+        }
+      },
+      modelProfiles: {
+        async initializeConversation() { return { created: false }; }
+      },
+      manualCompression: {
+        async admit() { throw new Error('unused'); },
+        async inspect() { return null; },
+        async driveIfPresent() { return null; }
+      },
+      now: ctx.now
+    });
+    terminalReplayCoordinator.launch = () => { terminalReplayLaunches += 1; };
+    try {
+      const terminalReplay = await terminalReplayCoordinator.ensureApprovedPlan({
+        sourceToolCallId: planTool.toolCallId,
+        parentTurnId: planParent.turnId,
+        requestedAgentId: 'agent-plan-external',
+        prompt: delegatedPlanPrompt,
+        expected: {
+          childExecutionId: externalIdentity.childExecutionId,
+          childConversationId: externalIdentity.childConversationId,
+          answerBridgeId: externalIdentity.answerBridgeId,
+          agentId: 'agent-plan-external',
+          agentType: 'plan-external'
+        }
+      });
+      assert.equal(terminalReplay.childExecutionId, externalSpawn.childExecutionId);
+      assert.equal(terminalReplayLaunches, 0);
+      assert.equal((await get(ctx.database, 'ChildExecution', externalSpawn.childExecutionId)).status, 'idle');
+    } finally {
+      await terminalReplayCoordinator.dispose();
+    }
+    assertions.push('Plan winning commit是durable child intent；首次spawn后launch故障可幂等恢复，child已idle后的replay确认同一lineage且不重启');
     faults.push('continuation after descendant creation');
     faults.push('descendant spawn committed between cancel tree read and writer transaction');
     faults.push('pending intent and active turns cancelled atomically');
+    faults.push('approved Plan commit before child launch with idempotent replay recovery');
     metrics.cancelledLineages = cancelled.lineageIds.length;
     metrics.siblingTerminationInputs = (await list(ctx.database, 'PendingTurnInput', {
       turn_id: sibling.childTurnId,
@@ -1435,9 +1905,9 @@ async function checkClientSnapshotBounds() {
     const durableRetryVisibility = messageListSource.indexOf("latest.status === 'retrying'");
     const transientThoughtSuppression = messageListSource.indexOf('if (hasVisibleStreamingTransientForTurn');
     assert.ok(durableRetryVisibility >= 0 && transientThoughtSuppression > durableRetryVisibility);
-    assert.match(messageListSource, /模型输出停滞/);
+    assert.match(messageListSource, /LLM 输出停滞/);
     assert.match(messageListSource, /reliableRetryStreamingActivityLabel/);
-    assert.match(transientActivitySource, /已启动，正在连接并等待模型输出/);
+    assert.match(transientActivitySource, /已启动，正在连接并等待 LLM 输出/);
     assert.ok(30 + 8 <= 40);
     const plainData = require(path.join(root, 'dist/extension/shared/plainData.js'));
     const proxy = new Proxy({ nested: [{ value: 'plain' }] }, {});
@@ -2029,7 +2499,7 @@ async function checkOldWriterNotRouted() {
   assert.match(conversationProjection, /call\.tool_name === 'run_agent' \? 'awaiting_child' : 'awaiting_user_input'/);
   const functionCallView = await fs.readFile('webview/src/components/content/parts/FunctionCallPartView.vue', 'utf8');
   assert.match(functionCallView, /awaiting_child: '等待子 Agent 回答'/);
-  assert.match(functionCallView, /子任务已转后台/);
+  assert.match(functionCallView, /子 Agent 已在后台运行/);
   const conversationRunner = await fs.readFile('backend/application/reliableKernel/ReliableConversationRunner.ts', 'utf8');
   assert.match(conversationRunner, /if \(intents\.length === 0\) return null;/);
   assert.doesNotMatch(conversationRunner, /must have exactly one admitted TurnIntent/);
@@ -2388,6 +2858,9 @@ async function checkRecoveryForegroundWait() {
             return { agentId: 'phase-f-child-agent', agentType: 'worker' };
           }
         },
+        modelProfiles: {
+          async initializeConversation() { return { created: false }; }
+        },
         manualCompression: {
           async admit() { throw new Error('unused'); },
           async inspect() { return null; },
@@ -2446,6 +2919,9 @@ async function checkRecoveryForegroundWait() {
           async resolve() {
             return { agentId: 'phase-f-failing-child', agentType: 'worker' };
           }
+        },
+        modelProfiles: {
+          async initializeConversation() { return { created: false }; }
         },
         manualCompression: {
           async admit() { throw new Error('unused'); },
@@ -2609,6 +3085,8 @@ async function checkRecoveryForegroundWait() {
       const spawned = await ctx.services.children.spawn({
         sourceToolCallId: tool.toolCallId,
         childAgentId: `child-agent-parallel-background-${suffix}`,
+        modelFallback: CHILD_MODEL_FALLBACK,
+        sourceSettlement: 'child_handle',
         prompt: `parallel background ${suffix}`,
         completionPolicy: 'background',
         leaseOwnerId: `child-owner-parallel-background-${suffix}`,
@@ -3017,7 +3495,21 @@ function phaseFAuthorityCompiler(suffix) {
           content: JSON.stringify({ providerConfigId: 'fake-local', modelId: 'fake-model', suffix })
         },
         authoritySnapshot: {
-          content: JSON.stringify({ turnId: request.turnId, executorAgentId: request.executorAgentId, suffix })
+          content: JSON.stringify({
+            turnId: request.turnId,
+            executorAgentId: request.executorAgentId,
+            suffix,
+            modelProfile: {
+              compressionThresholdTokens: 100_000,
+              contextWindowTokens: 200_000,
+              tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
+            },
+            model: {
+              providerConfigId: 'fake-local',
+              provider: 'openai-compatible',
+              modelId: 'fake-model'
+            }
+          })
         }
       };
     }
@@ -3039,6 +3531,8 @@ async function spawnStartedChild(ctx, parentTurnId, suffix, completionPolicy, op
   const spawned = await ctx.services.children.spawn({
     sourceToolCallId: tool.toolCallId,
     childAgentId: `child-agent-${suffix}`,
+    modelFallback: CHILD_MODEL_FALLBACK,
+    sourceSettlement: 'child_handle',
     prompt: `child prompt ${suffix}`,
     completionPolicy,
     ...(completionPolicy === 'wait_for_answer'
@@ -3160,7 +3654,7 @@ function emptyClientProjection(conversationId) {
     },
     subagentDeliverySummary: {
       childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
-      childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [],
+      childExecutionActiveTurnLinks: [], childExecutionActivities: [], childTurns: [], childExecutionLeases: [],
       childTurnTerminations: [], childTurnExecutorLinks: [], answerBridges: [],
       answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: []
     }

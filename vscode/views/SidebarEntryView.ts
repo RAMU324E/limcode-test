@@ -272,8 +272,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
   }
 
   private openConversationFromSidebar(webview: vscode.Webview, conversationId: string, title?: string): void {
-    void this.application().then((backendApp) => {
-      if (!backendApp.prepareConversationForSidebarOpen(conversationId, title)) {
+    void this.application().then(async (backendApp) => {
+      if (!await backendApp.conversationExists(conversationId)) {
         this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
         void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: 该对话已被删除或不再存在。`);
         return;
