@@ -1,7 +1,11 @@
 import {
+  createDelegatedPlanPrompt,
   createSubmitPlanToolOutput,
-  normalizeSubmitPlanToolRequest
+  DELEGATED_PLAN_APPROVAL_MESSAGE,
+  normalizeSubmitPlanToolRequest,
+  submitPlanOutputFromResult
 } from '../../shared/planReview';
+import type { SubmitPlanToolRequestRecord } from '../../shared/protocol';
 import { requireTaskListOperation } from '../../shared/taskListProjection';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import {
@@ -42,6 +46,39 @@ export interface PlanReviewResolutionResult extends AskUserResolutionResult {
   proposalId: string;
 }
 
+export interface PlanDelegationRequest {
+  sourceToolCallId: string;
+  parentTurnId: string;
+  requestedAgentId: string;
+  prompt: string;
+}
+
+export interface PlanDelegationIdentity {
+  childExecutionId: string;
+  childConversationId: string;
+  answerBridgeId: string;
+  agentId: string;
+  agentType: string;
+}
+
+export interface PlanDelegationResult {
+  childExecutionId: string;
+  childConversationId: string;
+  childTurnId: string;
+  answerBridgeId: string;
+  agentId: string;
+  agentType: string;
+}
+
+export interface PlanDelegationEnsureRequest extends PlanDelegationRequest {
+  expected: PlanDelegationIdentity;
+}
+
+export interface PlanDelegator {
+  preview(request: PlanDelegationRequest): Promise<PlanDelegationResult>;
+  ensure(request: PlanDelegationEnsureRequest): Promise<PlanDelegationResult>;
+}
+
 export interface ExecutionApprovalPauseResult {
   receiptId: string;
   requestId: string;
@@ -62,14 +99,23 @@ export interface ExecutionApprovalResolutionResult {
 /** ask_user reuses generic Tool/Interaction/Pause/Resolution facts; there is no AskUser table. */
 export class ToolInteractionControlPlane {
   private readonly now: () => string;
+  private planDelegator: PlanDelegator | undefined;
 
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore,
     private readonly effects: EffectControlPlane,
-    options: { now?: () => string } = {}
+    options: { now?: () => string; planDelegator?: PlanDelegator } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.planDelegator = options.planDelegator;
+  }
+
+  public setPlanDelegator(planDelegator: PlanDelegator): void {
+    if (this.planDelegator && this.planDelegator !== planDelegator) {
+      throw new Error('Plan delegator is already registered.');
+    }
+    this.planDelegator = planDelegator;
   }
 
   public async pauseForAskUser(input: {
@@ -602,37 +648,29 @@ export class ToolInteractionControlPlane {
     const executionTarget = responseRecord?.executionTarget === 'new_conversation'
       ? 'new_conversation' as const
       : 'current_conversation' as const;
-    if (decisionStatus === 'approved' && executionTarget === 'new_conversation') {
-      throw new Error('可靠 Plan 控制面尚未连接独立对话委派；请选择在当前对话中执行。');
-    }
-    const userMessage = optionalText(responseRecord?.message) ?? defaultPlanDecisionMessage(decisionStatus);
-    const output = createSubmitPlanToolOutput({
-      proposalId,
-      status: decisionStatus,
-      userMessage,
-      ...(decisionStatus === 'approved' ? { executionTarget } : {})
-    });
-    const operationStatus = input.decision === 'cancel'
-      ? 'cancelled' as const
-      : decisionStatus === 'rejected'
-        ? 'rejected' as const
-        : 'succeeded' as const;
-    const requestStatus = input.decision === 'cancel'
-      ? 'cancelled'
-      : decisionStatus === 'rejected'
-        ? 'rejected'
-        : 'succeeded';
+    const requestedAgentId = decisionStatus === 'approved' && executionTarget === 'new_conversation'
+      ? requireId(responseRecord?.agentType, 'Plan delegation agentType')
+      : undefined;
+    const delegationRequest = requestedAgentId
+      ? {
+          sourceToolCallId: toolCallId,
+          parentTurnId: requireId(turn.id, 'Plan delegation parent Turn.id'),
+          requestedAgentId,
+          prompt: createDelegatedPlanPrompt(subject.planRequest)
+        }
+      : undefined;
+    const userMessage = optionalText(responseRecord?.message)
+      ?? (requestedAgentId ? DELEGATED_PLAN_APPROVAL_MESSAGE : defaultPlanDecisionMessage(decisionStatus));
     const receiptId = sourceReceiptId(source, 'plan-review-resolve', JSON.stringify([requestId, input.decision]));
     const duplicate = await this.findSourceReceipt(source);
     if (duplicate) {
-      await this.effects.finalizeReadyInOrder(turn.id as string);
       return this.replayPlanResolution(duplicate, receiptId, requestId, proposalId);
     }
     const existingResponse = (await this.list('InteractionResponse', { request_id: requestId }, 2))[0];
     if (existingResponse) {
       const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
       const committed = await this.commitSource({ source, receiptId, conversationId, turnId: turn.id as string, steps: [] });
-      await this.effects.finalizeReadyInOrder(turn.id as string);
+      await this.helpWinningPlanResolution(requestId);
       return this.lostPlanResolution(committed.receipt, requestId, proposalId, committed.deduplicated);
     }
     const facts = await this.requireActiveToolFacts(toolCallId);
@@ -641,6 +679,26 @@ export class ToolInteractionControlPlane {
       || facts.execution.status !== 'waiting_answer'
       || operation.status !== 'waiting_answer'
     ) throw new Error(`ToolCall ${toolCallId} is no longer waiting for Plan review.`);
+
+    // Preview is deliberately read-only: the durable winning InteractionResponse below is the
+    // delegation intent. A competing response can therefore win without leaving an orphan child.
+    const delegation = delegationRequest
+      ? normalizePlanDelegationResult(await this.requirePlanDelegator().preview(delegationRequest))
+      : undefined;
+    const output = createSubmitPlanToolOutput({
+      proposalId,
+      status: decisionStatus,
+      userMessage,
+      ...(decisionStatus === 'approved' ? { executionTarget } : {}),
+      ...(delegation ? {
+        delegationStatus: 'backgrounded' as const,
+        agentId: delegation.agentId,
+        agentType: delegation.agentType,
+        childExecutionId: delegation.childExecutionId,
+        conversationId: delegation.childConversationId,
+        answerBridgeId: delegation.answerBridgeId
+      } : {})
+    });
 
     const response = await this.contentStore.prepare(
       this.database,
@@ -654,11 +712,6 @@ export class ToolInteractionControlPlane {
       }),
       'application/vnd.limcode.plan-review-response+json'
     );
-    const resultArtifact = await this.contentStore.prepare(
-      this.database,
-      canonicalJson({ toolCallId, status: operationStatus, detail: output }),
-      'application/vnd.limcode.tool-result-artifact+json'
-    );
     const now = this.timestamp();
     const committed = await this.commitSource({
       source,
@@ -667,7 +720,7 @@ export class ToolInteractionControlPlane {
       turnId: facts.turn.id as string,
       firstResponseRequestId: requestId,
       steps: [
-        ...preparedContentSteps([response, resultArtifact], 'plan_review_response'),
+        ...preparedContentSteps([response], 'plan_review_response'),
         DOMAIN_REPOSITORIES.domain('InteractionResponse').insert({
           id: stablePhaseDId('interaction_response', requestId),
           request_id: requestId,
@@ -681,37 +734,18 @@ export class ToolInteractionControlPlane {
         }),
         DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'waiting_answer' }),
         DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'waiting_answer' }),
-        DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: 'waiting_answer' }),
-        DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
-          id: stablePhaseDId('tool_result_artifact', `plan-review:${toolCallId}`),
-          tool_call_id: toolCallId,
-          role: 'no_effect_result',
-          content_object_id: resultArtifact.metadata.id,
-          created_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('InteractionRequest').update(requestId, { status: requestStatus, updated_at: now }),
-        DOMAIN_REPOSITORIES.domain('OperationResolution').insert({
-          id: stablePhaseDId('operation_resolution', pauseId),
-          pause_id: pauseId,
-          resolution_kind: operationStatus,
-          content_object_id: response.metadata.id,
-          created_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('OutcomePause').update(pauseId, { status: 'resolved', updated_at: now }),
-        DOMAIN_REPOSITORIES.domain('Operation').update(operation.id as string, {
-          status: operationStatus,
-          updated_at: now
-        })
+        DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: 'waiting_answer' })
       ]
     });
     if (committed.deduplicated) {
-      await this.effects.finalizeReadyInOrder(facts.turn.id as string);
       return this.replayPlanResolution(committed.receipt, receiptId, requestId, proposalId);
     }
     if (committed.firstResponseLost) {
-      await this.effects.finalizeReadyInOrder(facts.turn.id as string);
+      await this.helpWinningPlanResolution(requestId);
       return this.lostPlanResolution(committed.receipt, requestId, proposalId, false);
     }
+    await this.ensureWinningPlanDelegation(requestId, receiptId, proposalId, subject.planRequest);
+    await this.settleWinningPlanResponse(requestId, receiptId);
     const finalized = await this.effects.finalizeReadyInOrder(facts.turn.id as string);
     const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
       ?? await this.effects.readTerminalResult(toolCallId, false);
@@ -866,9 +900,213 @@ export class ToolInteractionControlPlane {
     return body.sourceReceiptId === receiptId;
   }
 
+  private async ensureWinningPlanDelegation(
+    requestId: string,
+    expectedReceiptId: string,
+    expectedProposalId: string,
+    planRequest: SubmitPlanToolRequestRecord
+  ): Promise<void> {
+    const responses = await this.list('InteractionResponse', { request_id: requestId }, 2);
+    if (responses.length !== 1) throw new Error('Stable Plan resolution must have one InteractionResponse.');
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requireId(responses[0].content_object_id, 'InteractionResponse.content_object_id')
+    ) as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+    if (body.sourceReceiptId !== expectedReceiptId) return;
+    const output = submitPlanOutputFromResult(body.output);
+    if (!output || output.proposalId !== expectedProposalId) {
+      throw new Error('Winning Plan response lost its durable submit_plan result.');
+    }
+    if (output.status !== 'approved' || output.executionTarget !== 'new_conversation') return;
+    if (output.delegationStatus !== 'backgrounded') {
+      throw new Error('Approved delegated Plan response lost its durable delegation intent.');
+    }
+    const persistedResponse = optionalRecord(body.response);
+    const requestedAgentId = requireId(persistedResponse?.agentType, 'Plan delegation requested agentType');
+    const subject = await this.readPlanReviewSubject(requestId);
+    if (subject.proposalId !== expectedProposalId) throw new Error('Plan delegation proposal identity changed.');
+    const expected = normalizePlanDelegationIdentity({
+      childExecutionId: output.childExecutionId,
+      childConversationId: output.conversationId,
+      answerBridgeId: output.answerBridgeId,
+      agentId: output.agentId,
+      agentType: output.agentType
+    });
+    const ensured = normalizePlanDelegationResult(await this.requirePlanDelegator().ensure({
+      sourceToolCallId: subject.toolCallId,
+      parentTurnId: requireId(
+        (await this.requireExisting('ToolCall', subject.toolCallId)).turn_id,
+        'Plan delegation parent Turn.id'
+      ),
+      requestedAgentId,
+      prompt: createDelegatedPlanPrompt(planRequest),
+      expected
+    }));
+    assertPlanDelegationIdentity(ensured, expected);
+  }
+
+  private async settleWinningPlanResponse(requestId: string, expectedReceiptId: string): Promise<void> {
+    const responses = await this.list('InteractionResponse', { request_id: requestId }, 2);
+    if (responses.length !== 1) throw new Error('Stable Plan settlement must have one InteractionResponse.');
+    const response = responses[0];
+    const responseMetadata = await this.requireExisting(
+      'ContentObject',
+      requireId(response.content_object_id, 'InteractionResponse.content_object_id')
+    ) as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(responseMetadata)).toString('utf8')) as Record<string, unknown>;
+    if (body.sourceReceiptId !== expectedReceiptId) {
+      throw new Error('Only the winning Plan response source may settle Plan review.');
+    }
+    const output = submitPlanOutputFromResult(body.output);
+    if (!output) throw new Error('Winning Plan response lost its durable submit_plan result.');
+    const decision = requirePlanResolutionDecision(body.decision);
+    const expectedDecisionStatus = decision === 'accept'
+      ? 'approved'
+      : decision === 'submit'
+        ? 'change_requested'
+        : 'rejected';
+    if (output.status !== expectedDecisionStatus) {
+      throw new Error('Winning Plan response decision and submit_plan result disagree.');
+    }
+    const operationStatus = decision === 'cancel'
+      ? 'cancelled' as const
+      : output.status === 'rejected'
+        ? 'rejected' as const
+        : 'succeeded' as const;
+    const requestStatus = decision === 'cancel'
+      ? 'cancelled'
+      : output.status === 'rejected'
+        ? 'rejected'
+        : 'succeeded';
+    const subject = await this.readPlanReviewSubject(requestId);
+    if (subject.proposalId !== output.proposalId) throw new Error('Plan settlement proposal identity changed.');
+    const pauseId = stablePhaseDId(
+      'outcome_pause',
+      stablePhaseDId('operation', `plan-review:${subject.toolCallId}`)
+    );
+    const pause = await this.requireExisting('OutcomePause', pauseId);
+    const operation = await this.requireExisting(
+      'Operation',
+      requireId(pause.operation_id, 'OutcomePause.operation_id')
+    );
+    const resultArtifact = await this.contentStore.prepare(
+      this.database,
+      canonicalJson({ toolCallId: subject.toolCallId, status: operationStatus, detail: output }),
+      'application/vnd.limcode.tool-result-artifact+json'
+    );
+    if (operation.status !== 'waiting_answer') {
+      await this.assertSettledPlanResponse({
+        requestId,
+        response,
+        pauseId,
+        operation,
+        operationStatus,
+        requestStatus,
+        toolCallId: subject.toolCallId,
+        resultArtifactId: resultArtifact.metadata.id
+      });
+      return;
+    }
+    const facts = await this.requireActiveToolFacts(subject.toolCallId);
+    const now = this.timestamp();
+    try {
+      await this.database.transaction([
+        ...preparedContentSteps([resultArtifact], 'plan_review_result'),
+        DOMAIN_REPOSITORIES.domain('InteractionResponse').assert(
+          requireId(response.id, 'InteractionResponse.id'),
+          { request_id: requestId, content_object_id: responseMetadata.id }
+        ),
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').assert(requestId, { status: 'pending' }),
+        DOMAIN_REPOSITORIES.domain('Turn').assert(facts.turn.id as string, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(facts.lease.id as string, {
+          conversation_id: facts.conversation.id,
+          turn_id: facts.turn.id
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(subject.toolCallId, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, {
+          status: 'waiting_answer'
+        }),
+        DOMAIN_REPOSITORIES.domain('OutcomePause').assert(pauseId, { status: 'waiting' }),
+        DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: 'waiting_answer' }),
+        DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+          id: stablePhaseDId('tool_result_artifact', `plan-review:${subject.toolCallId}`),
+          tool_call_id: subject.toolCallId,
+          role: 'no_effect_result',
+          content_object_id: resultArtifact.metadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').update(requestId, {
+          status: requestStatus,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('OperationResolution').insert({
+          id: stablePhaseDId('operation_resolution', pauseId),
+          pause_id: pauseId,
+          resolution_kind: operationStatus,
+          content_object_id: responseMetadata.id,
+          created_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('OutcomePause').update(pauseId, { status: 'resolved', updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('Operation').update(operation.id as string, {
+          status: operationStatus,
+          updated_at: now
+        })
+      ]);
+    } catch (error) {
+      if (!isRuntimeTransactionAssertionFailure(error) && !matchesExpectedUnique(error, [
+        ['tool_result_artifact', ['id']],
+        ['operation_resolution', ['id']]
+      ])) throw error;
+    }
+    await this.assertSettledPlanResponse({
+      requestId,
+      response,
+      pauseId,
+      operation,
+      operationStatus,
+      requestStatus,
+      toolCallId: subject.toolCallId,
+      resultArtifactId: resultArtifact.metadata.id
+    });
+  }
+
+  private async assertSettledPlanResponse(input: {
+    requestId: string;
+    response: DomainRow;
+    pauseId: string;
+    operation: DomainRow;
+    operationStatus: 'succeeded' | 'rejected' | 'cancelled';
+    requestStatus: string;
+    toolCallId: string;
+    resultArtifactId: string;
+  }): Promise<void> {
+    const [request, pause, operation] = await Promise.all([
+      this.requireExisting('InteractionRequest', input.requestId),
+      this.requireExisting('OutcomePause', input.pauseId),
+      this.requireExisting('Operation', requireId(input.operation.id, 'Operation.id'))
+    ]);
+    const [resolutions, artifacts] = await Promise.all([
+      this.list('OperationResolution', { pause_id: input.pauseId }, 2),
+      this.list('ToolResultArtifact', { tool_call_id: input.toolCallId }, 2)
+    ]);
+    if (
+      request.status !== input.requestStatus
+      || pause.status !== 'resolved'
+      || operation.status !== input.operationStatus
+      || resolutions.length !== 1
+      || resolutions[0].resolution_kind !== input.operationStatus
+      || resolutions[0].content_object_id !== input.response.content_object_id
+      || artifacts.length !== 1
+      || artifacts[0].role !== 'no_effect_result'
+      || artifacts[0].content_object_id !== input.resultArtifactId
+    ) throw new Error('Plan response settlement replay found conflicting facts.');
+  }
+
   private async readPlanReviewSubject(requestId: string): Promise<{
     toolCallId: string;
     proposalId: string;
+    planRequest: SubmitPlanToolRequestRecord;
   }> {
     const request = await this.requireExisting('InteractionRequest', requestId);
     if (request.request_kind !== 'plan_review') throw new Error('InteractionRequest is not plan_review.');
@@ -883,8 +1121,41 @@ export class ToolInteractionControlPlane {
       stablePhaseDId('interaction_request', `plan-review:${toolCallId}`) !== requestId
       || proposalId !== planProposalId(toolCallId)
     ) throw new Error('plan_review prompt does not match InteractionRequest identity.');
-    normalizeSubmitPlanToolRequest(body.request);
-    return { toolCallId, proposalId };
+    const planRequest = normalizeSubmitPlanToolRequest(body.request);
+    return { toolCallId, proposalId, planRequest };
+  }
+
+  private requirePlanDelegator(): PlanDelegator {
+    if (!this.planDelegator) {
+      throw new Error('可靠 Plan 控制面尚未连接独立对话委派。');
+    }
+    return this.planDelegator;
+  }
+
+  private async helpWinningPlanResolution(requestId: string): Promise<void> {
+    const subject = await this.readPlanReviewSubject(requestId);
+    const responses = await this.list('InteractionResponse', { request_id: requestId }, 2);
+    if (responses.length !== 1) throw new Error('Durable Plan winner must have one InteractionResponse.');
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requireId(responses[0].content_object_id, 'InteractionResponse.content_object_id')
+    ) as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+    const winnerReceiptId = requireId(body.sourceReceiptId, 'Plan winner sourceReceiptId');
+    const winnerReceipt = await this.requireExisting('CommandReceipt', winnerReceiptId);
+    const toolCall = await this.requireExisting('ToolCall', subject.toolCallId);
+    const parentTurnId = requireId(toolCall.turn_id, 'ToolCall.turn_id');
+    if (winnerReceipt.turn_id !== parentTurnId) {
+      throw new Error('Durable Plan winner receipt does not belong to the Plan parent Turn.');
+    }
+    await this.ensureWinningPlanDelegation(
+      requestId,
+      winnerReceiptId,
+      subject.proposalId,
+      subject.planRequest
+    );
+    await this.settleWinningPlanResponse(requestId, winnerReceiptId);
+    await this.effects.finalizeReadyInOrder(parentTurnId);
   }
 
   private async replayPlanResolution(
@@ -894,13 +1165,16 @@ export class ToolInteractionControlPlane {
     proposalId: string
   ): Promise<PlanReviewResolutionResult> {
     assertSourceReceipt(receipt, expectedReceiptId, 'plan-review-resolve');
-    const toolCallId = (await this.readPlanReviewSubject(requestId)).toolCallId;
+    const subject = await this.readPlanReviewSubject(requestId);
+    const won = await this.responseReceiptWon(requestId, receipt.id as string);
+    await this.helpWinningPlanResolution(requestId);
+    const toolCallId = subject.toolCallId;
     const terminal = await this.effects.readTerminalResult(toolCallId, true);
     return {
       receiptId: receipt.id as string,
       requestId,
       proposalId,
-      won: await this.responseReceiptWon(requestId, receipt.id as string),
+      won,
       deduplicated: true,
       ...(terminal ? { terminal: { ...terminal, receiptId: receipt.id as string } } : {})
     };
@@ -1035,6 +1309,60 @@ function normalizeSource<T extends PhaseDCommandSource['kind']>(
 
 function sourceReceiptId(source: PhaseDCommandSource, operation: string, scope: string): string {
   return stablePhaseDId('command_receipt', JSON.stringify([source.kind, source.key, operation, scope]));
+}
+
+function normalizePlanDelegationResult(result: PlanDelegationResult): PlanDelegationResult {
+  if (!result || typeof result !== 'object') throw new TypeError('Plan delegator returned no result.');
+  const identity = normalizePlanDelegationIdentity(result);
+  return {
+    ...identity,
+    childTurnId: requireId(result.childTurnId, 'Plan delegation childTurnId')
+  };
+}
+
+function normalizePlanDelegationIdentity(result: {
+  childExecutionId?: unknown;
+  childConversationId?: unknown;
+  answerBridgeId?: unknown;
+  agentId?: unknown;
+  agentType?: unknown;
+}): PlanDelegationIdentity {
+  if (!result || typeof result !== 'object') throw new TypeError('Plan delegator returned no identity.');
+  return {
+    childExecutionId: requireId(result.childExecutionId, 'Plan delegation childExecutionId'),
+    childConversationId: requireId(result.childConversationId, 'Plan delegation childConversationId'),
+    answerBridgeId: requireId(result.answerBridgeId, 'Plan delegation answerBridgeId'),
+    agentId: requireId(result.agentId, 'Plan delegation agentId'),
+    agentType: requireId(result.agentType, 'Plan delegation agentType')
+  };
+}
+
+function assertPlanDelegationIdentity(
+  actual: PlanDelegationResult,
+  expected: PlanDelegationIdentity
+): void {
+  for (const key of [
+    'childExecutionId',
+    'childConversationId',
+    'answerBridgeId',
+    'agentId',
+    'agentType'
+  ] as const) {
+    if (actual[key] !== expected[key]) {
+      throw new Error(`Plan delegation ensure changed durable ${key}.`);
+    }
+  }
+}
+
+function requirePlanResolutionDecision(value: unknown): 'accept' | 'submit' | 'reject' | 'cancel' {
+  if (value !== 'accept' && value !== 'submit' && value !== 'reject' && value !== 'cancel') {
+    throw new TypeError('Plan response decision is invalid.');
+  }
+  return value;
+}
+
+function isRuntimeTransactionAssertionFailure(error: unknown): boolean {
+  return (error as { code?: unknown })?.code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
 }
 
 function assertSourceReceipt(receipt: DomainRow, expected: string, operation: string): void {

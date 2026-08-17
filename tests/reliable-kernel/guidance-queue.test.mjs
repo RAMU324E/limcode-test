@@ -13,6 +13,19 @@ const { ReliableConversationRunner } = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/application/reliableKernel/ReliableConversationRunner.js')
 ).href);
 
+function modelContent(text = '', toolCalls = []) {
+  return {
+    role: 'model',
+    parts: [
+      ...(text ? [{ text }] : []),
+      ...toolCalls.map((call) => ({
+        ...(call.id ? { id: call.id } : {}),
+        functionCall: { name: call.name, args: call.arguments ?? {} }
+      }))
+    ]
+  };
+}
+
 function dependencies(overrides = {}) {
   return {
     authorityCompiler: {
@@ -105,11 +118,9 @@ test('引导消息等待当前回复和工具全部完成后按发送顺序自�
         await controls.onEvent({
           kind: 'completed',
           streamSeq: '1',
-          content: {
-            text: '先完成当前工具。',
-            thought: '',
-            toolCalls: [{ id: 'guidance-tool-provider-call', name: 'guidance_tool', arguments: {} }]
-          }
+          content: modelContent('先完成当前工具。', [
+            { id: 'guidance-tool-provider-call', name: 'guidance_tool', arguments: {} }
+          ])
         });
         return;
       }
@@ -123,11 +134,9 @@ test('引导消息等待当前回复和工具全部完成后按发送顺序自�
       await controls.onEvent({
         kind: 'completed',
         streamSeq: '1',
-        content: {
-          text: providerCalls === 2 ? '第一条引导消息已处理。' : '第二条引导消息已处理。',
-          thought: '',
-          toolCalls: []
-        }
+        content: modelContent(
+          providerCalls === 2 ? '第一条引导消息已处理。' : '第二条引导消息已处理。'
+        )
       });
     }
   };
@@ -259,16 +268,10 @@ test('Subagent RuntimeDelivery continuation 在当前回复和工具批次结束
         kind: 'completed',
         streamSeq: '1',
         content: providerCalls === 1
-          ? {
-              text: '先完成当前工具。',
-              thought: '',
-              toolCalls: [{ id: 'runtime-delivery-tool-provider-call', name: 'runtime_delivery_tool', arguments: {} }]
-            }
-          : {
-              text: 'Subagent 通知已处理。',
-              thought: '',
-              toolCalls: []
-            }
+          ? modelContent('先完成当前工具。', [
+              { id: 'runtime-delivery-tool-provider-call', name: 'runtime_delivery_tool', arguments: {} }
+            ])
+          : modelContent('Subagent 通知已处理。')
       });
     }
   };
@@ -456,11 +459,7 @@ test('没有工具时在当前模型输出结束后立即接续引导消息', as
       await controls.onEvent({
         kind: 'completed',
         streamSeq: '1',
-        content: {
-          text: providerCalls === 1 ? '当前输出完成。' : '无工具引导已处理。',
-          thought: '',
-          toolCalls: []
-        }
+        content: modelContent(providerCalls === 1 ? '当前输出完成。' : '无工具引导已处理。')
       });
     }
   };
@@ -616,7 +615,7 @@ test('已完成引导交接在扩展重启后仍会自动发送', async () => {
       observedContext = request.context.map((item) => item.content).join('\n');
       await controls.onEvent({
         kind: 'completed', streamSeq: '1',
-        content: { text: '重启后的引导消息已处理。', thought: '', toolCalls: [] }
+        content: modelContent('重启后的引导消息已处理。')
       });
     }
   };

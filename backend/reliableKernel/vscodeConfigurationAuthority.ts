@@ -173,27 +173,50 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     ];
     const scopesHighToLow = [...scopesLowToHigh].reverse();
 
-    const modelProfile = resolveScopedRecord(
-      records.modelProfileScopeLinks,
-      records.modelProfiles,
-      scopesHighToLow,
-      (link) => link.modelProfileId
-    );
+    const inheritedModelFallback = request.modelFallback;
+    const nonGlobalModelProfile = inheritedModelFallback
+      ? resolveScopedRecord(
+          records.modelProfileScopeLinks,
+          records.modelProfiles,
+          scopesHighToLow.filter((scope) => scope.scopeKind !== 'global'),
+          (link) => link.modelProfileId
+        )
+      : undefined;
+    const globalModelProfile = inheritedModelFallback
+      ? resolveRecordAtScope(
+          records.modelProfileScopeLinks,
+          records.modelProfiles,
+          { scopeKind: 'global' },
+          (link) => link.modelProfileId
+        )
+      : undefined;
+    const modelProfile = inheritedModelFallback
+      ? nonGlobalModelProfile
+      : resolveScopedRecord(
+          records.modelProfileScopeLinks,
+          records.modelProfiles,
+          scopesHighToLow,
+          (link) => link.modelProfileId
+        );
     const builtinModel = builtinWorkflow?.model ?? builtinAgent?.model;
     const requestedModel = request.modelOverride;
-    const providerConfigId = requestedModel
-      ? requestedModel.providerConfigId?.trim()
-      : modelProfile?.providerConfigId?.trim() || records.activeProviderConfigId;
+    const selectedModel: {
+      providerConfigId?: string;
+      provider?: LlmProviderConfigRecord['provider'];
+      model: string;
+    } | undefined = requestedModel
+      ?? modelProfile
+      ?? builtinModel
+      ?? inheritedModelFallback
+      ?? globalModelProfile;
+    const providerConfigId = selectedModel?.providerConfigId?.trim() || records.activeProviderConfigId;
     const provider = resolveRequestedProvider(records.providerConfigs, {
       providerConfigId,
-      providerKind: requestedModel?.provider,
-      modelId: requestedModel?.model
+      providerKind: selectedModel?.provider,
+      modelId: selectedModel?.model
     });
     if (!provider) throw new Error('没有可用的 LLM Provider 配置。');
-    const modelId = requestedModel?.model?.trim()
-      || modelProfile?.model?.trim()
-      || builtinModel?.model?.trim()
-      || provider.model?.trim();
+    const modelId = selectedModel?.model?.trim() || provider.model?.trim();
     if (!modelId) throw new Error(`Provider ${provider.id} 没有可用模型。`);
     if (!providerContainsModel(provider, modelId)) {
       throw new Error(`Provider ${provider.id} 不包含 ModelProfile 冻结的模型 ${modelId}。`);

@@ -187,14 +187,74 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
       defaultWorkEnvironmentId: workEnvironmentId
     });
     await authority.mutations.selectConversationWorkEnvironment('conversation:test', workEnvironmentId);
+    await authority.mutations.copyConversationConfiguration('conversation:test', 'conversation:fork');
 
     const snapshot = await authority.configurationClientState();
     assert.equal(snapshot.agents.some((record) => record.id === agent.id), true);
     assert.equal(snapshot.workflows.some((record) => record.id === workflow.id), true);
     assert.equal(snapshot.workflows.some((record) => record.id === 'builtin:plan'), true);
-    assert.equal(snapshot.conversationWorkflowSelections.length, 1);
-    assert.equal(snapshot.conversationWorkEnvironmentLinks.length, 1);
+    assert.equal(snapshot.conversationWorkflowSelections.length, 2);
+    assert.equal(snapshot.conversationWorkflowSelections.find((record) =>
+      record.conversationId === 'conversation:fork'
+    )?.workflowId, workflow.id);
+    assert.equal(snapshot.conversationWorkEnvironmentLinks.length, 2);
+    assert.equal(snapshot.conversationWorkEnvironmentLinks.find((record) =>
+      record.conversationId === 'conversation:fork'
+    )?.workEnvironmentId, workEnvironmentId);
     assert.equal(snapshot.workEnvironments.find((record) => record.id === workEnvironmentId)?.available, true);
+    const sourceModelLink = snapshot.modelProfileScopeLinks.find((link) =>
+      link.scopeKind === 'conversation' && link.scopeId === 'conversation:test'
+    );
+    const forkModelLink = snapshot.modelProfileScopeLinks.find((link) =>
+      link.scopeKind === 'conversation' && link.scopeId === 'conversation:fork'
+    );
+    assert.ok(sourceModelLink);
+    assert.ok(forkModelLink);
+    assert.notEqual(forkModelLink.modelProfileId, sourceModelLink.modelProfileId);
+    assert.equal(snapshot.modelProfiles.find((record) => record.id === forkModelLink.modelProfileId)?.model, 'model:test');
+    for (const links of [
+      snapshot.planReviewPolicyScopeLinks,
+      snapshot.toolPolicyScopeLinks,
+      snapshot.skillPolicyScopeLinks,
+      snapshot.systemPromptScopeLinks,
+      snapshot.runtimeContextScopeLinks,
+      snapshot.workEnvironmentPolicyScopeLinks,
+      snapshot.checkpointPolicyScopeLinks
+    ]) {
+      assert.equal(links.some((link) => link.scopeKind === 'conversation' && link.scopeId === 'conversation:fork'), false);
+    }
+
+    const forkCompiled = await authority.compile({
+      conversationId: 'conversation:fork',
+      turnId: 'turn:fork',
+      executorAgentId: agent.id,
+      intentKind: 'input'
+    });
+    const forkFrozen = JSON.parse(forkCompiled.authoritySnapshot.content);
+    const forkPreset = JSON.parse(forkCompiled.executionPreset.content);
+    assert.equal(forkFrozen.model.modelId, 'model:test');
+    assert.equal(forkFrozen.planReviewPolicy.mode, 'before_mutation');
+    assert.equal(forkPreset.defaultWorkEnvironmentId, workEnvironmentId);
+
+    await authority.mutations.setModelProfile({
+      scopeKind: 'conversation',
+      scopeId: 'conversation:test',
+      providerConfigId: provider.id,
+      provider: provider.provider,
+      model: 'model:source-after-fork'
+    });
+    const afterSourceModelChange = await authority.configurationClientState();
+    assert.equal(afterSourceModelChange.modelProfiles.find((record) =>
+      record.id === forkModelLink.modelProfileId
+    )?.model, 'model:test');
+    await authority.mutations.setModelProfile({
+      scopeKind: 'conversation',
+      scopeId: 'conversation:test',
+      name: '对话模型',
+      providerConfigId: provider.id,
+      provider: provider.provider,
+      model: 'model:test'
+    });
 
     const compiled = await authority.compile({
       conversationId: 'conversation:test',
@@ -273,6 +333,95 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     assert.equal(afterDelete.workflows.some((record) => record.id === workflow.id), false);
     assert.equal(afterDelete.conversationWorkflowSelections.length, 0);
     assert.equal(afterDelete.systemPromptScopeLinks.some((link) => link.scopeKind === 'workflow' && link.scopeId === workflow.id), false);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('子 Agent 模型优先级、父 Turn fallback 与手动续聊的 Conversation 选择保持稳定', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-child-model-inheritance-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: '子 Agent 模型测试 Provider' }),
+      id: 'provider:child-model-test',
+      model: 'model:global',
+      models: [
+        { id: 'model:global', name: 'Global' },
+        { id: 'model:parent', name: 'Parent' },
+        { id: 'model:child-agent', name: 'Child Agent' },
+        { id: 'model:manual', name: 'Manual' }
+      ],
+      modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const parentFallback = {
+      providerConfigId: provider.id,
+      provider: provider.provider,
+      model: 'model:parent'
+    };
+
+    await authority.mutations.setModelProfile({
+      scopeKind: 'agent',
+      scopeId: 'main',
+      name: '子 Agent 自有模型',
+      providerConfigId: provider.id,
+      provider: provider.provider,
+      model: 'model:child-agent'
+    });
+    const agentProfileWins = JSON.parse((await authority.compile({
+      conversationId: 'conversation:child-agent-profile',
+      turnId: 'turn:child-agent-profile',
+      executorAgentId: 'main',
+      intentKind: 'input',
+      modelFallback: parentFallback
+    })).authoritySnapshot.content);
+    assert.equal(agentProfileWins.model.modelId, 'model:child-agent');
+
+    await authority.mutations.clearModelProfile('agent', 'main');
+    const parentFallbackWins = JSON.parse((await authority.compile({
+      conversationId: 'conversation:child-parent-fallback',
+      turnId: 'turn:child-parent-fallback',
+      executorAgentId: 'main',
+      intentKind: 'input',
+      modelFallback: parentFallback
+    })).authoritySnapshot.content);
+    assert.equal(parentFallbackWins.model.modelId, 'model:parent');
+    assert.notEqual(parentFallbackWins.model.modelId, 'model:global');
+
+    assert.deepEqual(await authority.mutations.initializeConversationModelProfile({
+      conversationId: 'conversation:child-parent-fallback',
+      ...parentFallback
+    }), { created: true });
+    const manualContinuation = JSON.parse((await authority.compile({
+      conversationId: 'conversation:child-parent-fallback',
+      turnId: 'turn:child-manual-continuation',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.equal(manualContinuation.model.modelId, 'model:parent');
+
+    await authority.mutations.setModelProfile({
+      scopeKind: 'conversation',
+      scopeId: 'conversation:child-parent-fallback',
+      name: '用户显式切换',
+      providerConfigId: provider.id,
+      provider: provider.provider,
+      model: 'model:manual'
+    });
+    assert.deepEqual(await authority.mutations.initializeConversationModelProfile({
+      conversationId: 'conversation:child-parent-fallback',
+      ...parentFallback
+    }), { created: false });
+    const explicitSwitchWins = JSON.parse((await authority.compile({
+      conversationId: 'conversation:child-parent-fallback',
+      turnId: 'turn:child-explicit-switch',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.equal(explicitSwitchWins.model.modelId, 'model:manual');
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

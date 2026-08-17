@@ -441,7 +441,7 @@ export interface AskUserToolOutputRecord {
 
 export interface SubmitPlanToolRequestRecord {
   plan: string;
-  taskList?: TaskListToolOperationRecord;
+  taskList: TaskListToolOperationRecord;
 }
 
 export type SubmitPlanDecisionStatus = 'approved' | 'change_requested' | 'rejected';
@@ -457,6 +457,7 @@ export interface SubmitPlanToolOutputRecord {
   delegationStatus?: SubmitPlanDelegationStatus;
   agentId?: string;
   agentType?: string;
+  childExecutionId?: string;
   runId?: string;
   conversationId?: string;
   answerBridgeId?: string;

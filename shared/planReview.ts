@@ -19,12 +19,9 @@ export function normalizeSubmitPlanToolRequest(value: unknown): SubmitPlanToolRe
   if (!record) throw new Error('submit_plan arguments must be an object');
 
   const plan = requiredText(record.plan, 'plan', SUBMIT_PLAN_MAX_BODY_LENGTH);
-  const taskList = optionalTaskList(record.taskList);
+  const taskList = requiredTaskList(record.taskList);
 
-  return {
-    plan,
-    ...(taskList ? { taskList } : {})
-  };
+  return { plan, taskList };
 }
 
 export function submitPlanRequestFromArgs(value: unknown): SubmitPlanToolRequestRecord | undefined {
@@ -63,6 +60,7 @@ export function createSubmitPlanToolOutput(input: {
   delegationStatus?: SubmitPlanDelegationStatus;
   agentId?: string;
   agentType?: string;
+  childExecutionId?: string;
   runId?: string;
   conversationId?: string;
   answerBridgeId?: string;
@@ -77,6 +75,7 @@ export function createSubmitPlanToolOutput(input: {
     ...(input.delegationStatus ? { delegationStatus: input.delegationStatus } : {}),
     ...optionalOutputId('agentId', input.agentId),
     ...optionalOutputId('agentType', input.agentType),
+    ...optionalOutputId('childExecutionId', input.childExecutionId),
     ...optionalOutputId('runId', input.runId),
     ...optionalOutputId('conversationId', input.conversationId),
     ...optionalOutputId('answerBridgeId', input.answerBridgeId)
@@ -96,6 +95,7 @@ export function submitPlanOutputFromResult(value: unknown): SubmitPlanToolOutput
   const delegationStatus = output.delegationStatus === 'backgrounded' ? output.delegationStatus : undefined;
   const agentId = optionalText(output.agentId);
   const agentType = optionalText(output.agentType);
+  const childExecutionId = optionalText(output.childExecutionId);
   const runId = optionalText(output.runId);
   const conversationId = optionalText(output.conversationId);
   const answerBridgeId = optionalText(output.answerBridgeId);
@@ -108,6 +108,7 @@ export function submitPlanOutputFromResult(value: unknown): SubmitPlanToolOutput
     ...(delegationStatus ? { delegationStatus } : {}),
     ...(agentId ? { agentId } : {}),
     ...(agentType ? { agentType } : {}),
+    ...(childExecutionId ? { childExecutionId } : {}),
     ...(runId ? { runId } : {}),
     ...(conversationId ? { conversationId } : {}),
     ...(answerBridgeId ? { answerBridgeId } : {})
@@ -127,7 +128,7 @@ function isSubmitPlanExecutionTarget(value: unknown): value is SubmitPlanExecuti
   return value === 'current_conversation' || value === 'new_conversation';
 }
 
-function optionalOutputId<TKey extends 'agentId' | 'agentType' | 'runId' | 'conversationId' | 'answerBridgeId'>(
+function optionalOutputId<TKey extends 'agentId' | 'agentType' | 'childExecutionId' | 'runId' | 'conversationId' | 'answerBridgeId'>(
   key: TKey,
   value: string | undefined
 ): { [K in TKey]?: string } {
@@ -135,8 +136,10 @@ function optionalOutputId<TKey extends 'agentId' | 'agentType' | 'runId' | 'conv
   return id ? { [key]: id } as { [K in TKey]?: string } : {};
 }
 
-function optionalTaskList(value: unknown): TaskListToolOperationRecord | undefined {
-  if (value === undefined) return undefined;
+function requiredTaskList(value: unknown): TaskListToolOperationRecord {
+  if (value === undefined) {
+    throw new Error('taskList is required and must use the same shape as update_task_list: { mode, items }');
+  }
   const operation = taskListOperationFromArgs(value);
   if (!operation) throw new Error('taskList must use the same shape as update_task_list: { mode, items }');
   return cloneTaskListOperation(operation);

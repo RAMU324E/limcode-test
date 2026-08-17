@@ -299,6 +299,57 @@ export class VscodeConfigurationMutations {
     ));
   }
 
+  /**
+   * Seeds a newly-created child Conversation with its first frozen effective model. Existing
+   * conversation selection is authoritative, so a user switch racing this initializer is retained.
+   */
+  public initializeConversationModelProfile(input: {
+    conversationId: string;
+    providerConfigId?: string;
+    provider?: ModelProfileScopeSetPayload['provider'];
+    model: string;
+  }): Promise<{ created: boolean }> {
+    const scope = normalizeScope('conversation', input.conversationId);
+    const model = requireId(input.model, 'model');
+    return this.mutate(async (paths) => {
+      const recordStore = modelProfileStore(paths);
+      const linkStore = modelProfileLinkStore(paths);
+      const [records, links] = await Promise.all([loadStore(recordStore), loadStore(linkStore)]);
+      const matching = links.filter((link) => scopeMatches(link, scope));
+      if (matching.length > 1) {
+        throw new Error(`Conversation ${scope.scopeId} 存在多个 active ModelProfileScopeLink。`);
+      }
+      if (matching.length === 1) {
+        const recordId = matching[0].modelProfileId;
+        if (!records.some((record) => record.id === recordId)) {
+          throw new Error(`Conversation ${scope.scopeId} 的 ModelProfileScopeLink 指向不存在的记录。`);
+        }
+        return { created: false };
+      }
+
+      const now = Date.now();
+      const providerConfigId = normalizedOptionalText(input.providerConfigId);
+      const record: ModelProfileRecord = {
+        id: scopeRecordId(recordStore.idPrefix, scope),
+        name: '子对话继承 LLM',
+        ...(providerConfigId ? { providerConfigId } : {}),
+        ...(input.provider ? { provider: input.provider } : {}),
+        model
+      };
+      const link: ModelProfileScopeLinkRecord = {
+        id: scopeLinkId('model-profile', scope),
+        ...scope,
+        modelProfileId: record.id,
+        role: 'active',
+        createdAt: now,
+        updatedAt: now
+      };
+      await saveStore(recordStore, upsert(records, record));
+      await saveStore(linkStore, upsert(links, link));
+      return { created: true };
+    });
+  }
+
   public clearModelProfile(scopeKind: ScopeKind, scopeId?: string): Promise<void> {
     const scope = normalizeScope(scopeKind, scopeId);
     return this.mutate((paths) => this.clearScoped(
@@ -624,6 +675,90 @@ export class VscodeConfigurationMutations {
     });
   }
 
+  /** Copies only the explicit Conversation selections that define a fork's execution identity. */
+  public copyConversationConfiguration(
+    sourceConversationIdInput: string,
+    targetConversationIdInput: string
+  ): Promise<void> {
+    const sourceConversationId = requireId(sourceConversationIdInput, 'sourceConversationId');
+    const targetConversationId = requireId(targetConversationIdInput, 'targetConversationId');
+    if (sourceConversationId === targetConversationId) {
+      throw new TypeError('Conversation configuration fork requires different source and target ids.');
+    }
+    return this.mutate(async (paths) => {
+      const sourceScope: ScopeRef = { scopeKind: 'conversation', scopeId: sourceConversationId };
+      const targetScope: ScopeRef = { scopeKind: 'conversation', scopeId: targetConversationId };
+      const modelRecordStore = modelProfileStore(paths);
+      const modelLinkStore = modelProfileLinkStore(paths);
+      const [modelRecords, modelLinks] = await Promise.all([
+        loadStore(modelRecordStore),
+        loadStore(modelLinkStore)
+      ]);
+      const sourceModelLink = latest(modelLinks.filter((link) => scopeMatches(link, sourceScope)));
+      const targetModelLink = latest(modelLinks.filter((link) => scopeMatches(link, targetScope)));
+      if (sourceModelLink && !targetModelLink) {
+        const sourceModel = modelRecords.find((record) => record.id === sourceModelLink.modelProfileId);
+        if (!sourceModel) throw new Error(`配置 Link ${sourceModelLink.id} 指向不存在的记录。`);
+        const now = Date.now();
+        const modelProfileId = scopeRecordId(modelRecordStore.idPrefix, targetScope);
+        await saveStore(modelRecordStore, upsert(modelRecords, {
+          ...plainClone(sourceModel),
+          id: modelProfileId
+        }));
+        await saveStore(modelLinkStore, upsert(modelLinks, {
+          ...plainClone(sourceModelLink),
+          id: scopeLinkId('model-profile', targetScope),
+          ...targetScope,
+          modelProfileId,
+          createdAt: now,
+          updatedAt: now
+        }));
+      }
+
+      const workflowStore = conversationWorkflowSelectionStore(paths);
+      const workflowSelections = await loadStore(workflowStore);
+      const sourceWorkflow = latest(workflowSelections.filter((record) =>
+        record.conversationId === sourceConversationId && record.role === 'active'
+      ));
+      const targetWorkflow = latest(workflowSelections.filter((record) =>
+        record.conversationId === targetConversationId && record.role === 'active'
+      ));
+      if (sourceWorkflow && !targetWorkflow) {
+        const now = Date.now();
+        const copy: ConversationWorkflowSelectionRecord = {
+          ...plainClone(sourceWorkflow),
+          id: sourceWorkflow.scopeKind === 'global'
+            ? `conversation-workflow:global:${targetConversationId}`
+            : `conversation-workflow:workflow:${targetConversationId}:${sourceWorkflow.workflowId}`,
+          conversationId: targetConversationId,
+          createdAt: now,
+          updatedAt: now
+        };
+        await saveStore(workflowStore, upsert(workflowSelections, copy));
+      }
+
+      const environmentStore = conversationWorkEnvironmentLinkStore(paths);
+      const environmentLinks = await loadStore(environmentStore);
+      const sourceEnvironment = latest(environmentLinks.filter((record) =>
+        record.conversationId === sourceConversationId && record.role === 'active'
+      ));
+      const targetEnvironment = latest(environmentLinks.filter((record) =>
+        record.conversationId === targetConversationId && record.role === 'active'
+      ));
+      if (sourceEnvironment && !targetEnvironment) {
+        const now = Date.now();
+        const copy: ConversationWorkEnvironmentLinkRecord = {
+          ...plainClone(sourceEnvironment),
+          id: `conversation-work-environment:${targetConversationId}`,
+          conversationId: targetConversationId,
+          createdAt: now,
+          updatedAt: now
+        };
+        await saveStore(environmentStore, upsert(environmentLinks, copy));
+      }
+    });
+  }
+
   private mutate<T>(action: (paths: StoragePaths) => Promise<T>): Promise<T> {
     const paths = this.getPaths();
     const lockUri = vscode.Uri.joinPath(paths.settingsRootUri, CONFIGURATION_MUTATION_LOCK);
@@ -692,6 +827,7 @@ export class VscodeConfigurationMutations {
     const removedRecordIds = new Set(removed.map(linkedRecordId));
     await saveStore(recordStore, records.filter((record) => !removedRecordIds.has(record.id) || stillReferenced.has(record.id)));
   }
+
 }
 
 function agentStore(paths: StoragePaths): StoreSpec<AgentRecord, 'agent'> {

@@ -30,6 +30,7 @@ import {
   type ToolOutcomeStatus,
   type ToolTerminalResult
 } from './effectControlPlane';
+import { frozenModelSelection, readFrozenTurnAuthority } from './frozenAuthority';
 import { canonicalPlainJson } from './plainJson';
 import {
   isTransactionAssertionFailure,
@@ -48,8 +49,10 @@ import {
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
+  normalizeTurnModelOverride,
   normalizeCompiledTurnAuthority,
-  type TurnAuthorityCompiler
+  type TurnAuthorityCompiler,
+  type TurnModelOverride
 } from './turnControlPlane';
 
 export const CHILD_INTERRUPTION_RECOVERY_SOURCE_PREFIX = 'recovery:interrupt-subtree:';
@@ -57,13 +60,21 @@ export const CHILD_INTERRUPTION_RECOVERY_REASON =
   'Extension Host restart resumed an incomplete subtree interruption.';
 
 export type ChildCompletionPolicy = 'wait_for_answer' | 'background';
+export type ChildSpawnSourceSettlement = 'child_handle' | 'external';
 export type ChildSendMode = 'queue_next_turn' | 'interrupt_current_turn';
 
 export interface ChildExecutionSpawnCommand {
   sourceToolCallId: string;
   childAgentId: string;
+  /** Parent Turn's frozen effective model; child-local profiles still have higher precedence. */
+  modelFallback: TurnModelOverride;
   prompt: string;
   completionPolicy: ChildCompletionPolicy;
+  /**
+   * `child_handle` owns and settles a run_agent ToolCall. `external` only anchors lineage to a
+   * ToolCall whose interaction control plane remains its sole settlement owner.
+   */
+  sourceSettlement: ChildSpawnSourceSettlement;
   waitDeadlineAt?: string;
   childConversationId?: string;
   title?: string;
@@ -79,9 +90,33 @@ export interface ChildExecutionSpawnResult {
   operationId: string;
   attemptId: string;
   effectIntentId: string;
+  modelSelection: TurnModelOverride;
   completionPolicy: ChildCompletionPolicy;
   deduplicated: boolean;
   commitSeq?: string;
+}
+
+/** Stable identities reserved by a source ToolCall before any ChildExecution facts are written. */
+export interface ChildExecutionSpawnIdentity {
+  childExecutionId: string;
+  childConversationId: string;
+  childTurnId: string;
+  answerBridgeId: string;
+}
+
+export function childExecutionSpawnIdentity(input: {
+  sourceToolCallId: string;
+  childConversationId?: string;
+}): ChildExecutionSpawnIdentity {
+  const sourceToolCallId = requirePhaseFId(input.sourceToolCallId, 'sourceToolCallId');
+  const childConversationId = optionalPhaseFId(input.childConversationId, 'childConversationId')
+    ?? stablePhaseFId('conversation', 'child', sourceToolCallId);
+  return {
+    childExecutionId: stablePhaseFId('child_execution', sourceToolCallId),
+    childConversationId,
+    childTurnId: stablePhaseFId('turn', 'child-first', sourceToolCallId),
+    answerBridgeId: stablePhaseFId('answer_bridge', sourceToolCallId)
+  };
 }
 
 export interface ChildExecutionSendCommand {
@@ -311,7 +346,8 @@ export class ChildExecutionControlPlane {
         throw new Error('ChildExecution spawn is rejected because the parent lineage is terminating.');
       }
     }
-    if (parent.toolCall.status !== 'pending' || parent.toolExecution.status !== 'pending') {
+    const expectedSourceStatus = command.sourceSettlement === 'external' ? 'waiting_answer' : 'pending';
+    if (parent.toolCall.status !== expectedSourceStatus || parent.toolExecution.status !== expectedSourceStatus) {
       throw new Error(`Source ToolCall cannot spawn from ${String(parent.toolCall.status)}/${String(parent.toolExecution.status)}.`);
     }
 
@@ -324,8 +360,13 @@ export class ChildExecutionControlPlane {
       turnId: ids.childTurnId,
       executorAgentId: command.childAgentId,
       intentKind: 'input',
+      modelFallback: command.modelFallback,
       ...(workspace ? { workspace } : {})
     }), ids.childTurnId, command.childAgentId);
+    const modelSelection = frozenModelSelection(JSON.parse(asUtf8Text(
+      compiled.authoritySnapshot.content,
+      'Child AuthoritySnapshot'
+    )));
     const [requestContent, promptContent, authorityContent] = await Promise.all([
       this.contentStore.prepare(
         this.database,
@@ -362,8 +403,10 @@ export class ChildExecutionControlPlane {
         turn_id: parent.turn.id
       }),
       DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: parent.turn.id }),
-      DOMAIN_REPOSITORIES.domain('ToolCall').assert(command.sourceToolCallId, { status: 'pending' }),
-      DOMAIN_REPOSITORIES.domain('ToolExecution').assert(parent.toolExecution.id as string, { status: 'pending' }),
+      DOMAIN_REPOSITORIES.domain('ToolCall').assert(command.sourceToolCallId, { status: expectedSourceStatus }),
+      DOMAIN_REPOSITORIES.domain('ToolExecution').assert(parent.toolExecution.id as string, {
+        status: expectedSourceStatus
+      }),
       ...(parent.parentChildExecution
         ? [DOMAIN_REPOSITORIES.domain('ChildExecution').assert(parent.parentChildExecution.id as string, {
             status: parent.parentChildExecution.status
@@ -529,7 +572,7 @@ export class ChildExecutionControlPlane {
         id: ids.operationId,
         owner_kind: 'child_execution',
         owner_id: ids.childExecutionId,
-        tool_call_id: command.sourceToolCallId,
+        tool_call_id: command.sourceSettlement === 'child_handle' ? command.sourceToolCallId : null,
         status: 'pending',
         created_at: now,
         updated_at: now
@@ -555,20 +598,22 @@ export class ChildExecutionControlPlane {
         created_at: now,
         updated_at: now
       }),
-      DOMAIN_REPOSITORIES.domain('ToolCall').update(command.sourceToolCallId, {
-        status: 'executing',
-        updated_at: now
-      }),
-      DOMAIN_REPOSITORIES.domain('ToolExecution').update(parent.toolExecution.id as string, {
-        status: 'executing',
-        wait_deadline_at: command.waitDeadlineAt ?? null,
-        updated_at: now
-      })
+      ...(command.sourceSettlement === 'child_handle' ? [
+        DOMAIN_REPOSITORIES.domain('ToolCall').update(command.sourceToolCallId, {
+          status: 'executing',
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolExecution').update(parent.toolExecution.id as string, {
+          status: 'executing',
+          wait_deadline_at: command.waitDeadlineAt ?? null,
+          updated_at: now
+        })
+      ] : [])
     ];
 
     try {
       const commit = await this.database.transaction(steps);
-      return spawnResult(ids, command.completionPolicy, false, commit.commitSeq);
+      return spawnResult(ids, command.completionPolicy, modelSelection, false, commit.commitSeq);
     } catch (error) {
       if (!isExpectedSpawnIdentityConflict(error)) throw error;
       const raced = await this.findSpawnReplay(command, ids, requestContent);
@@ -579,6 +624,20 @@ export class ChildExecutionControlPlane {
 
   public claimSpawnDispatch(effectIntentId: string): Promise<boolean> {
     return this.effects.claimEffectDispatch(requirePhaseFId(effectIntentId, 'effectIntentId'));
+  }
+
+  /** Reads the immutable effective model selected for an already-admitted parent Turn. */
+  public async frozenModelSelectionForTurn(turnIdInput: string): Promise<TurnModelOverride> {
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const snapshots = await this.listRows('AuthoritySnapshot', { turn_id: turnId }, 2);
+    if (snapshots.length !== 1) throw new Error(`Turn ${turnId} must have exactly one AuthoritySnapshot.`);
+    const frozen = await readFrozenTurnAuthority(
+      this.database,
+      this.contentStore,
+      requirePhaseFId(snapshots[0].id, 'AuthoritySnapshot.id'),
+      turnId
+    );
+    return frozenModelSelection(frozen.document);
   }
 
   public recordSpawnReceipt(input: {
@@ -608,14 +667,19 @@ export class ChildExecutionControlPlane {
     const effectReceiptId = requirePhaseFId(effectReceiptIdInput, 'effectReceiptId');
     const facts = await this.readSpawnReceiptFacts(effectReceiptId);
     if (facts.intent.effect_kind !== 'subagent_spawn') throw new Error('EffectReceipt is not a subagent_spawn receipt.');
+    const request = spawnRequestMetadata(await this.effects.readEffectRequest(facts.intent.id as string));
+    const ownsSourceSettlement = request.sourceSettlement === 'child_handle';
+    if (ownsSourceSettlement !== (facts.toolCall !== null && facts.toolExecution !== null)) {
+      throw new Error('subagent_spawn source settlement ownership does not match its Operation lineage.');
+    }
     const currentOperationStatus = String(facts.operation.status);
     if (currentOperationStatus === 'waiting_answer' || TERMINAL_OPERATION_STATES.has(currentOperationStatus)) {
-      const settlement = TERMINAL_OPERATION_STATES.has(currentOperationStatus)
-        ? await this.finalizeWaitSettlement(facts.toolCall.id as string)
+      const settlement = ownsSourceSettlement && TERMINAL_OPERATION_STATES.has(currentOperationStatus)
+        ? await this.finalizeWaitSettlement(request.sourceToolCallId)
         : null;
       return {
         childExecutionId: facts.childExecution.id as string,
-        toolCallId: facts.toolCall.id as string,
+        toolCallId: request.sourceToolCallId,
         status: currentOperationStatus,
         terminalToolResult: settlement?.terminal !== undefined,
         deduplicated: true
@@ -623,7 +687,7 @@ export class ChildExecutionControlPlane {
     }
 
     const observed = requireSpawnObservedOutcome(facts.receipt.outcome);
-    const completionPolicy = completionPolicyFromRequest(await this.effects.readEffectRequest(facts.intent.id as string));
+    const completionPolicy = request.completionPolicy;
     const now = this.timestamp();
     const currentChildStatus = requireChildExecutionStatus(facts.childExecution.status);
     const cancellationCommitted = currentChildStatus === 'interrupting' || currentChildStatus === 'interrupted';
@@ -632,10 +696,10 @@ export class ChildExecutionControlPlane {
       && completionPolicy === 'wait_for_answer'
       && !cancelledAfterSpawn;
     const toolStatus = cancelledAfterSpawn ? 'cancelled' : observedToToolOutcome(observed);
-    const terminalResultSteps = successfulWait
+    const terminalResultSteps = !ownsSourceSettlement || successfulWait
       ? []
       : await this.prepareWaitResultArtifact(
-          facts.toolCall.id as string,
+          request.sourceToolCallId,
           toolStatus,
           cancelledAfterSpawn
             ? {
@@ -676,8 +740,8 @@ export class ChildExecutionControlPlane {
         status: nextChildStatus,
         updated_at: now
       }),
-      ...(successfulWait
-        ? [DOMAIN_REPOSITORIES.domain('ToolExecution').update(facts.toolExecution.id as string, {
+      ...(ownsSourceSettlement && successfulWait
+        ? [DOMAIN_REPOSITORIES.domain('ToolExecution').update(facts.toolExecution!.id as string, {
             status: 'waiting_answer',
             updated_at: now
           })]
@@ -687,12 +751,12 @@ export class ChildExecutionControlPlane {
     ];
     try {
       const commit = await this.database.transaction(steps);
-      const settlement = successfulWait
+      const settlement = !ownsSourceSettlement || successfulWait
         ? null
-        : await this.finalizeWaitSettlement(facts.toolCall.id as string);
+        : await this.finalizeWaitSettlement(request.sourceToolCallId);
       return {
         childExecutionId: facts.childExecution.id as string,
-        toolCallId: facts.toolCall.id as string,
+        toolCallId: request.sourceToolCallId,
         status: successfulWait ? 'waiting_answer' : toolStatus,
         terminalToolResult: settlement?.terminal !== undefined,
         deduplicated: false,
@@ -702,12 +766,12 @@ export class ChildExecutionControlPlane {
       if (!isExpectedSettlementRace(error)) throw error;
       const latestOperation = await this.requireExisting('Operation', facts.operation.id as string);
       if (latestOperation.status === facts.operation.status) throw error;
-      const settlement = TERMINAL_OPERATION_STATES.has(String(latestOperation.status))
-        ? await this.finalizeWaitSettlement(facts.toolCall.id as string)
+      const settlement = ownsSourceSettlement && TERMINAL_OPERATION_STATES.has(String(latestOperation.status))
+        ? await this.finalizeWaitSettlement(request.sourceToolCallId)
         : null;
       return {
         childExecutionId: facts.childExecution.id as string,
-        toolCallId: facts.toolCall.id as string,
+        toolCallId: request.sourceToolCallId,
         status: String(latestOperation.status),
         terminalToolResult: settlement?.terminal !== undefined,
         deduplicated: true
@@ -2859,7 +2923,7 @@ export class ChildExecutionControlPlane {
     ]);
     const child = requireRow(snapshot.snapshot[0], `ChildExecution ${ids.childExecutionId}`);
     const turnLink = requireRow(snapshot.snapshot[1], `ChildExecutionTurnLink ${ids.turnLinkId}`);
-    const active = requireRow(snapshot.snapshot[2], `ChildExecutionActiveTurnLink ${ids.activeTurnLinkId}`);
+    const active = optionalRow(snapshot.snapshot[2], `ChildExecutionActiveTurnLink ${ids.activeTurnLinkId}`);
     const bridge = requireRow(snapshot.snapshot[3], `AnswerBridge ${ids.answerBridgeId}`);
     const operation = requireRow(snapshot.snapshot[4], `Operation ${ids.operationId}`);
     const attempt = requireRow(snapshot.snapshot[5], `Attempt ${ids.attemptId}`);
@@ -2896,14 +2960,18 @@ export class ChildExecutionControlPlane {
       : childProjectLinks.length === 1
         && childProjectLinks[0].project_context_id === parentProjectLinks[0].project_context_id
       ;
+    const childStatus = requireChildExecutionStatus(child.status);
+    const activeLinkRequired = childStatus === 'starting'
+      || childStatus === 'active'
+      || childStatus === 'interrupting';
     if (
       child.child_conversation_id !== ids.childConversationId
       || turnLink.turn_id !== ids.childTurnId
-      || active.turn_id !== ids.childTurnId
+      || (active ? active.turn_id !== ids.childTurnId : activeLinkRequired)
       || bridge.child_execution_id !== ids.childExecutionId
       || operation.owner_kind !== 'child_execution'
       || operation.owner_id !== ids.childExecutionId
-      || operation.tool_call_id !== command.sourceToolCallId
+      || operation.tool_call_id !== (command.sourceSettlement === 'child_handle' ? command.sourceToolCallId : null)
       || attempt.operation_id !== ids.operationId
       || intent.attempt_id !== ids.attemptId
       || intent.effect_kind !== 'subagent_spawn'
@@ -2923,7 +2991,18 @@ export class ChildExecutionControlPlane {
       || origin.source_message_revision_id !== null
       || !projectInheritanceMatches
     ) throw new Error('ChildExecution spawn source was replayed with different facts.');
-    return spawnResult(ids, command.completionPolicy, true);
+    const frozen = await readFrozenTurnAuthority(
+      this.database,
+      this.contentStore,
+      ids.childAuthoritySnapshotId,
+      ids.childTurnId
+    );
+    return spawnResult(
+      ids,
+      command.completionPolicy,
+      frozenModelSelection(frozen.document),
+      true
+    );
   }
 
   /**
@@ -3131,11 +3210,20 @@ export class ChildExecutionControlPlane {
     if (operation.owner_kind !== 'child_execution') throw new Error('Spawn Operation is not owned by ChildExecution.');
     const childExecution = await this.requireExisting('ChildExecution', requirePhaseFId(operation.owner_id, 'Operation.owner_id'));
     const intentRows = await this.listRows('EffectIntent', { attempt_id: attempt.id }, 2);
-    const toolCall = await this.requireExisting('ToolCall', requirePhaseFId(operation.tool_call_id, 'Operation.tool_call_id'));
-    const toolExecutions = await this.listRows('ToolExecution', { tool_call_id: toolCall.id }, 2);
+    const toolCall = operation.tool_call_id === null
+      ? null
+      : await this.requireExisting('ToolCall', requirePhaseFId(operation.tool_call_id, 'Operation.tool_call_id'));
+    const toolExecutions = toolCall
+      ? await this.listRows('ToolExecution', { tool_call_id: toolCall.id }, 2)
+      : [];
     const bridges = await this.listRows('AnswerBridge', { child_execution_id: childExecution.id }, 2);
     const activeLinks = await this.listRows('ChildExecutionActiveTurnLink', { child_execution_id: childExecution.id }, 2);
-    if (intentRows.length !== 1 || toolExecutions.length !== 1 || bridges.length !== 1 || activeLinks.length > 1) {
+    if (
+      intentRows.length !== 1
+      || (toolCall !== null && toolExecutions.length !== 1)
+      || bridges.length !== 1
+      || activeLinks.length > 1
+    ) {
       throw new Error('Spawn receipt lineage facts are incomplete.');
     }
     const childTurn = activeLinks[0]
@@ -3151,7 +3239,7 @@ export class ChildExecutionControlPlane {
       childExecution,
       intent: intentRows[0],
       toolCall,
-      toolExecution: toolExecutions[0],
+      toolExecution: toolExecutions[0] ?? null,
       bridge: bridges[0],
       activeLink: activeLinks[0] ?? null,
       childTurn,
@@ -3490,6 +3578,7 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   const sourceToolCallId = requirePhaseFId(command.sourceToolCallId, 'sourceToolCallId');
   const childAgentId = requirePhaseFId(command.childAgentId, 'childAgentId');
   const completionPolicy = requireCompletionPolicy(command.completionPolicy);
+  const sourceSettlement = requireSpawnSourceSettlement(command.sourceSettlement);
   const waitDeadlineAt = command.waitDeadlineAt === undefined
     ? undefined
     : requireIsoTimestamp(command.waitDeadlineAt, 'waitDeadlineAt');
@@ -3499,11 +3588,16 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
   if (completionPolicy === 'background' && waitDeadlineAt) {
     throw new TypeError('background completion must not persist a foreground wait deadline.');
   }
+  if (sourceSettlement === 'external' && completionPolicy !== 'background') {
+    throw new TypeError('external source settlement requires background completion.');
+  }
   return {
     sourceToolCallId,
     childAgentId,
+    modelFallback: normalizeTurnModelOverride(command.modelFallback),
     prompt: requirePhaseFText(command.prompt, 'prompt'),
     completionPolicy,
+    sourceSettlement,
     ...(waitDeadlineAt ? { waitDeadlineAt } : {}),
     ...(optionalPhaseFId(command.childConversationId, 'childConversationId')
       ? { childConversationId: optionalPhaseFId(command.childConversationId, 'childConversationId')! }
@@ -3586,14 +3680,17 @@ function normalizeCancelCommand(command: ChildExecutionCancelCommand) {
 
 function spawnIds(command: ReturnType<typeof normalizeSpawnCommand>): SpawnIds {
   const source = command.sourceToolCallId;
-  const childExecutionId = stablePhaseFId('child_execution', source);
-  const childConversationId = command.childConversationId ?? stablePhaseFId('conversation', 'child', source);
+  const identity = childExecutionSpawnIdentity({
+    sourceToolCallId: source,
+    ...(command.childConversationId ? { childConversationId: command.childConversationId } : {})
+  });
+  const { childExecutionId, childConversationId, childTurnId, answerBridgeId } = identity;
   return {
     childExecutionId,
     childConversationId,
     childOriginLinkId: childConversationOriginLinkId(source),
     childAgentLinkId: stablePhaseFId('agent_conversation_link', 'child', source),
-    childTurnId: stablePhaseFId('turn', 'child-first', source),
+    childTurnId,
     childLeaseId: stablePhaseFId('execution_lease', 'child-first', source),
     childExecutorLinkId: stablePhaseFId('turn_executor_link', 'child-first', source),
     childAuthoritySnapshotId: stablePhaseFId('authority_snapshot', 'child-first', source),
@@ -3605,7 +3702,7 @@ function spawnIds(command: ReturnType<typeof normalizeSpawnCommand>): SpawnIds {
     parentLinkId: stablePhaseFId('child_execution_parent_link', source),
     turnLinkId: stablePhaseFId('child_execution_turn_link', 'first', source),
     activeTurnLinkId: stablePhaseFId('child_execution_active_turn_link', source),
-    answerBridgeId: stablePhaseFId('answer_bridge', source),
+    answerBridgeId,
     operationId: stablePhaseFId('operation', 'subagent-spawn', source),
     attemptId: stablePhaseFId('attempt', 'subagent-spawn', source, 1),
     effectIntentId: stablePhaseFId('effect_intent', 'subagent-spawn', source, 1),
@@ -3643,20 +3740,23 @@ function spawnRequestPayload(
   command: ReturnType<typeof normalizeSpawnCommand>,
   ids: SpawnIds
 ): Record<string, unknown> {
+  // Lease owner/expiry are host-local fencing facts stored on ExecutionLease. They are excluded
+  // from the immutable effect identity so a durable spawn can be replayed after Host restart.
   return {
+    sourceToolCallId: command.sourceToolCallId,
     childExecutionId: ids.childExecutionId,
     childConversationId: ids.childConversationId,
     childTurnId: ids.childTurnId,
     answerBridgeId: ids.answerBridgeId,
     childAgentId: command.childAgentId,
+    modelFallback: command.modelFallback,
     authoritySnapshotId: ids.childAuthoritySnapshotId,
     inputMessageId: ids.childMessageId,
     inputMessageRevisionId: ids.childMessageRevisionId,
     completionPolicy: command.completionPolicy,
+    sourceSettlement: command.sourceSettlement,
     waitDeadlineAt: command.waitDeadlineAt ?? null,
     title: command.title,
-    leaseOwnerId: command.leaseOwnerId,
-    leaseExpiresAt: command.leaseExpiresAt,
     prompt: command.prompt
   };
 }
@@ -3664,6 +3764,7 @@ function spawnRequestPayload(
 function spawnResult(
   ids: SpawnIds,
   completionPolicy: ChildCompletionPolicy,
+  modelSelection: TurnModelOverride,
   deduplicated: boolean,
   commitSeq?: string
 ): ChildExecutionSpawnResult {
@@ -3675,10 +3776,20 @@ function spawnResult(
     operationId: ids.operationId,
     attemptId: ids.attemptId,
     effectIntentId: ids.effectIntentId,
+    modelSelection,
     completionPolicy,
     deduplicated,
     ...(commitSeq ? { commitSeq } : {})
   };
+}
+
+function asUtf8Text(content: string | Uint8Array, label: string): string {
+  if (typeof content === 'string') return content;
+  try {
+    return Buffer.from(content).toString('utf8');
+  } catch (error) {
+    throw new Error(`${label} is not valid UTF-8 content: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function sendIds(command: ReturnType<typeof normalizeSendCommand>) {
@@ -3823,16 +3934,32 @@ function spawnRecoveryResult(facts: SpawnIntentFacts, reconciled: boolean): Chil
   };
 }
 
-function completionPolicyFromRequest(value: unknown): ChildCompletionPolicy {
+function spawnRequestMetadata(value: unknown): {
+  sourceToolCallId: string;
+  completionPolicy: ChildCompletionPolicy;
+  sourceSettlement: ChildSpawnSourceSettlement;
+} {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('subagent_spawn request payload is invalid.');
   }
-  return requireCompletionPolicy((value as Record<string, unknown>).completionPolicy);
+  const record = value as Record<string, unknown>;
+  return {
+    sourceToolCallId: requirePhaseFId(record.sourceToolCallId, 'subagent_spawn.sourceToolCallId'),
+    completionPolicy: requireCompletionPolicy(record.completionPolicy),
+    sourceSettlement: requireSpawnSourceSettlement(record.sourceSettlement)
+  };
 }
 
 function requireCompletionPolicy(value: unknown): ChildCompletionPolicy {
   if (value !== 'wait_for_answer' && value !== 'background') {
     throw new TypeError('completionPolicy must be wait_for_answer or background.');
+  }
+  return value;
+}
+
+function requireSpawnSourceSettlement(value: unknown): ChildSpawnSourceSettlement {
+  if (value !== 'child_handle' && value !== 'external') {
+    throw new TypeError('sourceSettlement must be child_handle or external.');
   }
   return value;
 }
@@ -3946,6 +4073,11 @@ function requireBigInt(value: unknown, label: string): bigint {
 function requireRow(value: unknown, label: string): DomainRow {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} does not exist.`);
   return value as DomainRow;
+}
+
+function optionalRow(value: unknown, label: string): DomainRow | null {
+  if (value === null || value === undefined) return null;
+  return requireRow(value, label);
 }
 
 function requireRows(value: unknown, label: string): DomainRow[] {

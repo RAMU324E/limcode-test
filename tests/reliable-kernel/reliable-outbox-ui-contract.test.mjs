@@ -89,6 +89,26 @@ test('Interaction 决策 outbox 跨重启固定 request id，UI 超时不删除�
   assert.match(askUser, /回答已提交，正在同步/);
 });
 
+test('Reliable Plan 审批保留当前对话与选择 Agent 新开对话两个入口', () => {
+  const plan = read('webview/src/components/plan/PlanProposalContent.vue');
+  const actionStart = plan.indexOf('<footer v-if="pending" class="plan-proposal-actions">');
+  const actionEnd = plan.indexOf('</footer>', actionStart);
+  const actions = plan.slice(actionStart, actionEnd);
+  const dispatchPanelStart = plan.indexOf('<ConfirmPanel', actionEnd);
+  const dispatchPanelEnd = plan.indexOf('</ConfirmPanel>', dispatchPanelStart);
+  const dispatchPanel = plan.slice(dispatchPanelStart, dispatchPanelEnd);
+
+  assert.ok(actionStart >= 0 && actionEnd > actionStart);
+  assert.match(actions, /新开对话执行/);
+  assert.match(actions, /在当前对话中执行/);
+  assert.doesNotMatch(actions, /v-if="!interactionView"/);
+  assert.match(dispatchPanel, /:open="dispatchPanelOpen"/);
+  assert.doesNotMatch(dispatchPanel, /!interactionView/);
+  assert.match(plan, /submitApproval\('new_conversation', agent\.id\)/);
+  assert.match(plan, /executionTarget:\s*'new_conversation'/);
+  assert.match(plan, /agentType:\s*normalizedAgentType/);
+});
+
 test('MainPanel 将 Ready/可见性作为 Reliable Feed 生命周期边界', () => {
   const feed = read('backend/reliableKernel/webviewFeedBridge.ts');
   const panel = read('vscode/panels/MainPanel.ts');

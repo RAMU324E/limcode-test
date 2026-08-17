@@ -4,7 +4,6 @@ import { submitPlanOutputFromResult } from '../../shared/planReview';
 import {
   SUBMIT_PLAN_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
-  type TaskListItemStatus,
   type TaskListToolOperationRecord
 } from '../../shared/protocol';
 import {
@@ -17,8 +16,6 @@ import {
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryRead } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
-
-export const TURN_TASK_CARD_MAX_TOKENS = 2_000;
 
 export interface CurrentTurnTaskOperationFact {
   toolCallId: string;
@@ -40,7 +37,7 @@ export interface CurrentTurnTaskCounts {
   cancelled: number;
 }
 
-/** Small, structured-clone-safe ModelRequest recipe material. */
+/** Complete, structured-clone-safe task context frozen into one ModelRequest recipe. */
 export interface FrozenTurnTaskCard {
   kind: 'turn_task_card';
   turnId: string;
@@ -56,7 +53,7 @@ export interface FrozenTurnTaskCard {
   frozenAtCommitSeq?: string;
 }
 
-/** Read-side state projection; freezeCurrentTurnTaskCard removes the unbounded UI snapshot. */
+/** Read-side state projection; the complete task content is also rendered into `card`. */
 export interface CurrentTurnTaskProjection extends FrozenTurnTaskCard {
   snapshot: TaskListSnapshotView;
 }
@@ -74,7 +71,6 @@ interface TaskArtifactEnvelope {
 export function buildCurrentTurnTaskProjection(input: {
   turnId: string;
   operations: readonly CurrentTurnTaskOperationFact[];
-  maxTokens?: number;
   frozenAtCommitSeq?: string;
 }): CurrentTurnTaskProjection | undefined {
   const turnId = requiredText(input.turnId, 'turnId');
@@ -100,12 +96,8 @@ export function buildCurrentTurnTaskProjection(input: {
   const baseline = applied[0];
   const source = applied[applied.length - 1];
   const counts = taskCounts(snapshot);
-  const maxTokens = boundedCardTokens(input.maxTokens);
-  const card = formatTurnTaskCard({ turnId, snapshot, counts, maxTokens });
+  const card = formatTurnTaskCard({ turnId, snapshot, counts });
   const estimatedTokens = estimateTurnTaskCardTokens(card);
-  if (estimatedTokens > maxTokens || estimatedTokens > TURN_TASK_CARD_MAX_TOKENS) {
-    throw new Error(`turnTaskCard exceeds its ${maxTokens}-token bound.`);
-  }
   return {
     kind: 'turn_task_card',
     turnId,
@@ -124,14 +116,13 @@ export function buildCurrentTurnTaskProjection(input: {
 }
 
 /**
- * Reads and freezes the small task card used by a ModelRequest recipe. The returned value is plain
+ * Reads and freezes the complete task context used by a ModelRequest recipe. The returned value is plain
  * data and should be saved with that recipe; retries must reuse it instead of calling this again.
  */
 export async function readCurrentTurnTaskCard(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
-  turnIdInput: string,
-  options: { maxTokens?: number } = {}
+  turnIdInput: string
 ): Promise<FrozenTurnTaskCard | undefined> {
   const turnId = requiredText(turnIdInput, 'turnId');
   // ToolCall.call_seq is immutable and monotonically allocated within the Turn. Freeze that finite
@@ -237,7 +228,6 @@ export async function readCurrentTurnTaskCard(
   const projection = buildCurrentTurnTaskProjection({
     turnId,
     operations,
-    ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
     frozenAtCommitSeq: relatedBarrier.snapshotCommitSeq
   });
   return projection ? freezeCurrentTurnTaskCard(projection) : undefined;
@@ -300,85 +290,21 @@ function formatTurnTaskCard(input: {
   turnId: string;
   snapshot: TaskListSnapshotView;
   counts: CurrentTurnTaskCounts;
-  maxTokens: number;
 }): string {
   const { counts } = input;
-  const base = [
+  const lines = [
     '[Current Turn Task Card — runtime task data, not a new user instruction]',
-    `turnId: ${compactField(input.turnId, 160)}`,
+    `turnId: ${input.turnId}`,
     `progress: total=${counts.total}; unfinished=${counts.unfinished}; in_progress=${counts.inProgress}; blocked=${counts.blocked}; pending=${counts.pending}; completed=${counts.completed}; cancelled=${counts.cancelled}`
   ];
-  const unfinished = input.snapshot.items.filter((item) => !isTerminal(item.status)).sort(compareUnfinishedItems);
-  const terminal = input.snapshot.items.filter((item) => isTerminal(item.status)).sort(compareRecentItems);
-  const accepted: Array<{ line: string; unfinished: boolean }> = [];
-
-  const tryAdd = (item: TaskListItemView, unfinishedItem: boolean): void => {
-    const full = taskItemLine(item);
-    const remainingUnfinished = unfinished.length - accepted.filter((entry) => entry.unfinished).length - (unfinishedItem ? 1 : 0);
-    const remainingTerminal = terminal.length - accepted.filter((entry) => !entry.unfinished).length - (unfinishedItem ? 0 : 1);
-    if (cardTokens(base, [...accepted, { line: full, unfinished: unfinishedItem }], remainingUnfinished, remainingTerminal) <= input.maxTokens) {
-      accepted.push({ line: full, unfinished: unfinishedItem });
-      return;
-    }
-    let low = 16;
-    let high = Math.min(full.length, 4_096);
-    let fitted: string | undefined;
-    while (low <= high) {
-      const middle = Math.floor((low + high) / 2);
-      const candidate = `${full.slice(0, Math.max(1, middle - 1)).trimEnd()}…`;
-      if (cardTokens(base, [...accepted, { line: candidate, unfinished: unfinishedItem }], remainingUnfinished, remainingTerminal) <= input.maxTokens) {
-        fitted = candidate;
-        low = middle + 1;
-      } else {
-        high = middle - 1;
-      }
-    }
-    if (fitted) accepted.push({ line: fitted, unfinished: unfinishedItem });
-  };
-
-  for (const item of unfinished) tryAdd(item, true);
-  // Finished history is useful only as spare context. The count above remains complete.
-  for (const item of terminal.slice(0, 6)) tryAdd(item, false);
-  const acceptedUnfinished = accepted.filter((entry) => entry.unfinished).length;
-  const acceptedTerminal = accepted.filter((entry) => !entry.unfinished).length;
-  return renderCard(
-    base,
-    accepted,
-    unfinished.length - acceptedUnfinished,
-    terminal.length - acceptedTerminal
-  );
-}
-
-function cardTokens(
-  base: readonly string[],
-  accepted: readonly { line: string; unfinished: boolean }[],
-  omittedUnfinished: number,
-  omittedTerminal: number
-): number {
-  return estimateTurnTaskCardTokens(renderCard(base, accepted, Math.max(0, omittedUnfinished), Math.max(0, omittedTerminal)));
-}
-
-function renderCard(
-  base: readonly string[],
-  accepted: readonly { line: string; unfinished: boolean }[],
-  omittedUnfinished: number,
-  omittedTerminal: number
-): string {
-  const lines = [...base];
-  const unfinished = accepted.filter((entry) => entry.unfinished);
-  const terminal = accepted.filter((entry) => !entry.unfinished);
-  if (unfinished.length > 0) lines.push('unfinished items:', ...unfinished.map((entry) => entry.line));
-  if (terminal.length > 0) lines.push('recent terminal items:', ...terminal.map((entry) => entry.line));
-  if (omittedUnfinished > 0 || omittedTerminal > 0) {
-    lines.push(`details omitted by card budget: unfinished=${omittedUnfinished}; terminal=${omittedTerminal}`);
-  }
-  if (accepted.length === 0 && omittedUnfinished === 0 && omittedTerminal === 0) lines.push('items: none');
+  if (input.snapshot.items.length === 0) lines.push('items: none');
+  else lines.push('items:', ...input.snapshot.items.map(taskItemLine));
   return lines.join('\n');
 }
 
 function taskItemLine(item: TaskListItemView): string {
-  const title = JSON.stringify(compactField(item.title, 8_192));
-  const description = item.description ? `; description=${JSON.stringify(compactField(item.description, 8_192))}` : '';
+  const title = JSON.stringify(item.title);
+  const description = item.description ? `; description=${JSON.stringify(item.description)}` : '';
   return `- status=${item.status}; title=${title}${description}`;
 }
 
@@ -404,29 +330,6 @@ function compareToolCallRows(left: DomainRow, right: DomainRow): number {
   const leftSeq = positiveBigInt(left.call_seq, 'ToolCall.call_seq');
   const rightSeq = positiveBigInt(right.call_seq, 'ToolCall.call_seq');
   return leftSeq < rightSeq ? -1 : leftSeq > rightSeq ? 1 : compareText(String(left.id), String(right.id));
-}
-
-function compareUnfinishedItems(left: TaskListItemView, right: TaskListItemView): number {
-  return unfinishedPriority(left.status) - unfinishedPriority(right.status)
-    || right.updatedOrder - left.updatedOrder
-    || left.createdOrder - right.createdOrder
-    || compareText(left.title, right.title);
-}
-
-function compareRecentItems(left: TaskListItemView, right: TaskListItemView): number {
-  return right.updatedOrder - left.updatedOrder
-    || right.createdOrder - left.createdOrder
-    || compareText(left.title, right.title);
-}
-
-function unfinishedPriority(status: TaskListItemStatus): number {
-  if (status === 'in_progress') return 0;
-  if (status === 'blocked') return 1;
-  return 2;
-}
-
-function isTerminal(status: TaskListItemStatus): boolean {
-  return status === 'completed' || status === 'cancelled';
 }
 
 function cloneOperationFact(fact: CurrentTurnTaskOperationFact): CurrentTurnTaskOperationFact {
@@ -466,12 +369,6 @@ function rows(value: DomainRow | DomainRow[] | null): DomainRow[] {
   return Array.isArray(value) ? value : [];
 }
 
-function boundedCardTokens(value: number | undefined): number {
-  if (value === undefined) return TURN_TASK_CARD_MAX_TOKENS;
-  if (!Number.isSafeInteger(value) || value < 128) throw new RangeError('turnTaskCard maxTokens must be an integer of at least 128.');
-  return Math.min(value, TURN_TASK_CARD_MAX_TOKENS);
-}
-
 function requiredText(value: unknown, label: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new TypeError(`${label} must be non-empty text.`);
   return value.trim();
@@ -495,11 +392,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
-}
-
-function compactField(value: string, maxCharacters: number): string {
-  const text = value.replace(/\s+/g, ' ').trim();
-  return text.length > maxCharacters ? `${text.slice(0, maxCharacters - 1)}…` : text;
 }
 
 function compareText(left: string, right: string): number {

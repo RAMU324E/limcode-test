@@ -29,9 +29,10 @@ test('Agent 工具声明说明异步用法，并只标记无条件必填参数',
   assert.match(runAgentTool.declaration.description, /Do NOT poll read_agent_answer/);
   assert.match(runAgentTool.declaration.description, /Never interrupt merely because/);
   assert.match(runAgentTool.declaration.parameters.properties.foregroundWaitMs.description, /Optional in run mode/);
+  assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.type, 'integer');
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.minimum, 0);
   assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.maximum, 86_400_000);
-  assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.multipleOf, 1);
+  assert.equal(runAgentTool.declaration.parameters.properties.foregroundWaitMs.multipleOf, undefined);
 
   assert.equal(runAgentTool.declaration.parameters.required, undefined,
     'prompt 只在 run 模式必填，不能让 interrupt 模式也被 JSON schema 拒绝');
@@ -64,6 +65,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
   const answerBridgeId = stablePhaseFId('answer_bridge', toolCallId);
   let spawnCommand;
   let resolvedSelection;
+  let initializedModel;
   const coordinator = new ReliableChildAgentCoordinator({
     database: {
       hostBootId: 'optional-wait-host',
@@ -88,7 +90,13 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
           effectIntentId: 'spawn-effect',
           attemptId: 'spawn-attempt',
           childExecutionId: 'spawn-child',
-          childTurnId: 'spawn-turn'
+          childConversationId: 'spawn-conversation',
+          childTurnId: 'spawn-turn',
+          modelSelection: {
+            providerConfigId: 'provider-parent',
+            provider: 'openai-compatible',
+            model: 'model-parent'
+          }
         };
       },
       async claimSpawnDispatch() { return true; },
@@ -124,6 +132,12 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
         resolvedSelection = selection;
         return { agentId: 'agent-child', agentType: 'worker' };
       }
+    },
+    modelProfiles: {
+      async initializeConversation(input) {
+        initializedModel = input;
+        return { created: true };
+      }
     }
   });
   coordinator.launch = () => {};
@@ -134,10 +148,19 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     toolCallId,
     toolName: 'run_agent',
     arguments: { prompt: 'inspect in the background', agent: { type: 'worker' } }
-  });
+  }, undefined, frozenRunAgentAuthority(1));
   assert.deepEqual(resolvedSelection, { agentType: 'worker' });
   assert.equal(spawnCommand.completionPolicy, 'background');
   assert.equal('waitDeadlineAt' in spawnCommand, false);
+  assert.deepEqual(spawnCommand.modelFallback, {
+    providerConfigId: 'provider-parent',
+    provider: 'openai-compatible',
+    model: 'model-parent'
+  });
+  assert.deepEqual(initializedModel, {
+    conversationId: 'spawn-conversation',
+    model: spawnCommand.modelFallback
+  });
   assert.match(spawnCommand.prompt, /inspect in the background/);
   assert.equal(background.disposition, 'settled');
 
@@ -277,7 +300,10 @@ test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后�
         };
       }
     },
-    agents: {}
+    agents: {},
+    modelProfiles: {
+      async initializeConversation() { return { created: false }; }
+    }
   });
 
   coordinator.launch(childExecutionId, turnId);
@@ -304,7 +330,13 @@ test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后�
 function frozenRunAgentAuthority(maxDepth) {
   return {
     snapshotId: `authority-depth-${maxDepth}`,
-    document: {},
+    document: {
+      model: {
+        providerConfigId: 'provider-parent',
+        provider: 'openai-compatible',
+        modelId: 'model-parent'
+      }
+    },
     toolConfig: {
       config: { [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY]: maxDepth }
     }
@@ -364,7 +396,13 @@ function createDepthCoordinator(lineageFromCurrentToRoot) {
           effectIntentId: 'depth-spawn-effect',
           attemptId: 'depth-spawn-attempt',
           childExecutionId: 'depth-spawn-child',
-          childTurnId: 'depth-spawn-turn'
+          childConversationId: 'depth-spawn-conversation',
+          childTurnId: 'depth-spawn-turn',
+          modelSelection: {
+            providerConfigId: 'provider-parent',
+            provider: 'openai-compatible',
+            model: 'model-parent'
+          }
         };
       },
       async claimSpawnDispatch() { return true; },
@@ -384,6 +422,9 @@ function createDepthCoordinator(lineageFromCurrentToRoot) {
         resolutions += 1;
         return { agentId: 'depth-agent', agentType: 'worker' };
       }
+    },
+    modelProfiles: {
+      async initializeConversation() { return { created: true }; }
     }
   });
   coordinator.launch = () => {};

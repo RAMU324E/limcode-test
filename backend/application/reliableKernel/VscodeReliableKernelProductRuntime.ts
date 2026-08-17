@@ -149,6 +149,10 @@ export class VscodeReliableKernelProductRuntime {
       resolveAttachmentReference: async (attachmentId) => {
         if (!application) throw new Error('可靠 Runtime 尚未完成组合，无法读取附件。');
         return application.attachments.managedReference(attachmentId);
+      },
+      resolveAttachmentContent: async (attachmentId) => {
+        if (!application) throw new Error('可靠 Runtime 尚未完成组合，无法读取附件正文。');
+        return application.attachments.resolveInlineData(attachmentId);
       }
     });
     const providers = new ReliableLlmProviderRegistry({
@@ -362,6 +366,15 @@ export class VscodeReliableKernelProductRuntime {
         turns: application.turns,
         agentLoop: application.agentLoop,
         agents: { resolve: (input) => configuration.resolveAgent(input) },
+        modelProfiles: {
+          initializeConversation: ({ conversationId, model }) =>
+            configuration.mutations.initializeConversationModelProfile({
+              conversationId,
+              ...(model.providerConfigId ? { providerConfigId: model.providerConfigId } : {}),
+              ...(model.provider ? { provider: model.provider } : {}),
+              model: model.model
+            })
+        },
         deliveryWakeups: application.processDeliveries,
         ownedProcessCleanup: application.childOwnedProcessCleanup,
         cancelTurnExecution: async ({ turnId, reason }) => {
@@ -381,6 +394,10 @@ export class VscodeReliableKernelProductRuntime {
           inspect: (input) => conversations!.inspectManualCompression(input),
           driveIfPresent: (input) => conversations!.driveManualCompressionIfPresent(input)
         }
+      });
+      application.interactions.setPlanDelegator({
+        preview: (input) => childAgents!.previewApprovedPlan(input),
+        ensure: (input) => childAgents!.ensureApprovedPlan(input)
       });
       // shell 覆盖是显式 opt-in；开启后把代理注入扩展宿主进程环境，子孙进程
       // （wrapper → PowerShell → curl/git）自动继承。这里必须在 open 返回前完成，

@@ -457,6 +457,266 @@ async function checkToolModelResultExactlyOnce() {
     assert.equal((await list(ctx.database, 'ToolModelResult', { tool_call_id: crashAskTool.toolCallId })).length, 1);
     assertions.push('ask_user响应commit后、ordered finalizer前崩溃时，同source重放只续做SQLite finalizer并补齐唯一模型结果');
 
+    const previewedPlans = [];
+    const ensuredPlans = [];
+    const planDelegationResult = (request, suffix = 'plan-review') => ({
+      childExecutionId: `child-execution-${suffix}`,
+      childConversationId: `conversation-${suffix}-child`,
+      childTurnId: `turn-${suffix}-child`,
+      answerBridgeId: `answer-bridge-${suffix}`,
+      agentId: request.requestedAgentId,
+      agentType: 'reviewer'
+    });
+    const planInteractions = new kernel.ToolInteractionControlPlane(ctx.database, ctx.store, effects, {
+      planDelegator: {
+        preview: async (request) => {
+          previewedPlans.push(request);
+          return planDelegationResult(request);
+        },
+        ensure: async (request) => {
+          ensuredPlans.push(request);
+          return planDelegationResult(request);
+        }
+      }
+    });
+    const planRequest = {
+      plan: '先实现可靠 Plan 委派，再完成定向验证。',
+      taskList: {
+        mode: 'rewrite',
+        items: [
+          { title: '实现委派', description: '复用 ChildExecution 和 AnswerBridge', status: 'in_progress' },
+          { title: '验证完整输入', description: '确认后续步骤也进入子 Agent 首轮 prompt', status: 'pending' }
+        ]
+      }
+    };
+    const currentPlanTool = await effects.createToolCall({
+      source: source('callback', 'tool-call:plan-current'),
+      toolCallId: 'tool-call-plan-current',
+      turnId: ctx.turnId,
+      toolName: 'submit_plan',
+      arguments: planRequest
+    });
+    const currentPlanPause = await planInteractions.pauseForPlanReview({
+      source: source('internal', 'plan-current:pause'),
+      toolCallId: currentPlanTool.toolCallId,
+      request: planRequest
+    });
+    const currentPlanResult = await planInteractions.resolvePlanReview({
+      source: source('command', 'plan-current:approve'),
+      requestId: currentPlanPause.requestId,
+      decision: 'accept',
+      response: {
+        planProposalId: currentPlanPause.proposalId,
+        executionTarget: 'current_conversation'
+      }
+    });
+    assert.equal(currentPlanResult.won, true);
+    assert.equal(previewedPlans.length, 0);
+    assert.equal(ensuredPlans.length, 0);
+    assert.deepEqual((await toolModelResultDetail(ctx, currentPlanTool.toolCallId)), {
+      kind: 'submit_plan.result',
+      proposalId: currentPlanPause.proposalId,
+      status: 'approved',
+      userMessage: 'User approved the plan. Continue with the approved plan.',
+      executionTarget: 'current_conversation'
+    });
+
+    const delegatedPlanTool = await effects.createToolCall({
+      source: source('callback', 'tool-call:plan-new-conversation'),
+      toolCallId: 'tool-call-plan-new-conversation',
+      turnId: ctx.turnId,
+      toolName: 'submit_plan',
+      arguments: planRequest
+    });
+    const delegatedPlanPause = await planInteractions.pauseForPlanReview({
+      source: source('internal', 'plan-new-conversation:pause'),
+      toolCallId: delegatedPlanTool.toolCallId,
+      request: planRequest
+    });
+    const delegatedPlanInput = {
+      source: source('command', 'plan-new-conversation:approve'),
+      requestId: delegatedPlanPause.requestId,
+      decision: 'accept',
+      response: {
+        planProposalId: delegatedPlanPause.proposalId,
+        executionTarget: 'new_conversation',
+        agentType: 'agent-reviewer'
+      }
+    };
+    const delegatedPlanResult = await planInteractions.resolvePlanReview(delegatedPlanInput);
+    assert.equal(delegatedPlanResult.won, true);
+    assert.equal(previewedPlans.length, 1);
+    assert.equal(ensuredPlans.length, 1);
+    assert.equal(previewedPlans[0].sourceToolCallId, delegatedPlanTool.toolCallId);
+    assert.equal(previewedPlans[0].parentTurnId, ctx.turnId);
+    assert.equal(previewedPlans[0].requestedAgentId, 'agent-reviewer');
+    assert.match(previewedPlans[0].prompt, /先实现可靠 Plan 委派/);
+    assert.match(previewedPlans[0].prompt, /实现委派/);
+    assert.match(previewedPlans[0].prompt, /验证完整输入/);
+    assert.deepEqual(ensuredPlans[0].expected, {
+      childExecutionId: 'child-execution-plan-review',
+      childConversationId: 'conversation-plan-review-child',
+      answerBridgeId: 'answer-bridge-plan-review',
+      agentId: 'agent-reviewer',
+      agentType: 'reviewer'
+    });
+    assert.deepEqual((await toolModelResultDetail(ctx, delegatedPlanTool.toolCallId)), {
+      kind: 'submit_plan.result',
+      proposalId: delegatedPlanPause.proposalId,
+      status: 'approved',
+      userMessage: 'Plan 已下发给 Agent 执行，请耐心等待。',
+      executionTarget: 'new_conversation',
+      delegationStatus: 'backgrounded',
+      agentId: 'agent-reviewer',
+      agentType: 'reviewer',
+      childExecutionId: 'child-execution-plan-review',
+      conversationId: 'conversation-plan-review-child',
+      answerBridgeId: 'answer-bridge-plan-review'
+    });
+    const delegatedPlanReplay = await planInteractions.resolvePlanReview(delegatedPlanInput);
+    assert.equal(delegatedPlanReplay.deduplicated, true);
+    assert.equal(delegatedPlanReplay.won, true);
+    assert.equal(previewedPlans.length, 1);
+    assert.equal(ensuredPlans.length, 2);
+    assertions.push('submit_plan当前对话批准不触发委派；新对话先只读preview，winning commit后及同source replay均幂等ensure完整Plan/taskList与稳定Child IDs');
+
+    let releaseRacedPreview;
+    let observeRacedPreview;
+    const racedPreviewStarted = new Promise((resolve) => { observeRacedPreview = resolve; });
+    const racedPreviewGate = new Promise((resolve) => { releaseRacedPreview = resolve; });
+    let racedEnsureCount = 0;
+    const racedPlanInteractions = new kernel.ToolInteractionControlPlane(ctx.database, ctx.store, effects, {
+      planDelegator: {
+        preview: async (request) => {
+          observeRacedPreview();
+          await racedPreviewGate;
+          return planDelegationResult(request, 'raced-loser');
+        },
+        ensure: async (request) => {
+          racedEnsureCount += 1;
+          return planDelegationResult(request, 'raced-loser');
+        }
+      }
+    });
+    const racedPlanTool = await effects.createToolCall({
+      source: source('callback', 'tool-call:plan-raced-loser'),
+      toolCallId: 'tool-call-plan-raced-loser',
+      turnId: ctx.turnId,
+      toolName: 'submit_plan',
+      arguments: planRequest
+    });
+    const racedPlanPause = await racedPlanInteractions.pauseForPlanReview({
+      source: source('internal', 'plan-raced-loser:pause'),
+      toolCallId: racedPlanTool.toolCallId,
+      request: planRequest
+    });
+    const racedDelegation = racedPlanInteractions.resolvePlanReview({
+      source: source('command', 'plan-raced-loser:new'),
+      requestId: racedPlanPause.requestId,
+      decision: 'accept',
+      response: {
+        planProposalId: racedPlanPause.proposalId,
+        executionTarget: 'new_conversation',
+        agentType: 'agent-reviewer'
+      }
+    });
+    await racedPreviewStarted;
+    const racedCurrentWinner = await racedPlanInteractions.resolvePlanReview({
+      source: source('command', 'plan-raced-loser:current'),
+      requestId: racedPlanPause.requestId,
+      decision: 'accept',
+      response: {
+        planProposalId: racedPlanPause.proposalId,
+        executionTarget: 'current_conversation'
+      }
+    });
+    releaseRacedPreview();
+    const racedDelegationLoser = await racedDelegation;
+    assert.equal(racedCurrentWinner.won, true);
+    assert.equal(racedDelegationLoser.won, false);
+    assert.equal(racedEnsureCount, 0);
+    assert.equal((await list(ctx.database, 'ChildExecutionParentLink', {
+      source_tool_call_id: racedPlanTool.toolCallId
+    })).length, 0);
+    assertions.push('并发current winner与new-conversation loser只允许read-only preview；firstResponseLost绝不ensure或创建ChildExecution');
+
+    let ensureAttemptsAfterCommit = 0;
+    let ensuredChildCount = 0;
+    const recoveringPlanInteractions = new kernel.ToolInteractionControlPlane(ctx.database, ctx.store, effects, {
+      planDelegator: {
+        preview: async (request) => planDelegationResult(request, 'post-commit-recovery'),
+        ensure: async (request) => {
+          ensureAttemptsAfterCommit += 1;
+          if (ensureAttemptsAfterCommit === 1) throw new Error('fault-after-plan-winning-commit-before-child-launch');
+          ensuredChildCount = 1;
+          return planDelegationResult(request, 'post-commit-recovery');
+        }
+      }
+    });
+    const recoveringPlanTool = await effects.createToolCall({
+      source: source('callback', 'tool-call:plan-post-commit-recovery'),
+      toolCallId: 'tool-call-plan-post-commit-recovery',
+      turnId: ctx.turnId,
+      toolName: 'submit_plan',
+      arguments: planRequest
+    });
+    const recoveringPlanPause = await recoveringPlanInteractions.pauseForPlanReview({
+      source: source('internal', 'plan-post-commit-recovery:pause'),
+      toolCallId: recoveringPlanTool.toolCallId,
+      request: planRequest
+    });
+    const recoveringPlanInput = {
+      source: source('command', 'plan-post-commit-recovery:approve'),
+      requestId: recoveringPlanPause.requestId,
+      decision: 'accept',
+      response: {
+        planProposalId: recoveringPlanPause.proposalId,
+        executionTarget: 'new_conversation',
+        agentType: 'agent-reviewer'
+      }
+    };
+    await assert.rejects(
+      recoveringPlanInteractions.resolvePlanReview(recoveringPlanInput),
+      /fault-after-plan-winning-commit-before-child-launch/
+    );
+    assert.equal((await list(ctx.database, 'InteractionResponse', {
+      request_id: recoveringPlanPause.requestId
+    })).length, 1);
+    assert.equal((await get(ctx.database, 'Operation', recoveringPlanPause.operationId)).status, 'waiting_answer');
+    assert.equal((await list(ctx.database, 'ToolResultArtifact', {
+      tool_call_id: recoveringPlanTool.toolCallId
+    })).length, 0);
+    assert.equal((await list(ctx.database, 'ToolModelResult', {
+      tool_call_id: recoveringPlanTool.toolCallId
+    })).length, 0);
+    const recoveringPlanHelperInput = {
+      source: source('command', 'plan-post-commit-recovery:helper'),
+      requestId: recoveringPlanPause.requestId,
+      decision: 'reject',
+      response: {
+        planProposalId: recoveringPlanPause.proposalId,
+        message: 'This different source must help the durable winner, not replace it.'
+      }
+    };
+    const recoveringPlanHelper = await recoveringPlanInteractions.resolvePlanReview(recoveringPlanHelperInput);
+    assert.equal(recoveringPlanHelper.deduplicated, false);
+    assert.equal(recoveringPlanHelper.won, false);
+    assert.equal(ensureAttemptsAfterCommit, 2);
+    assert.equal(ensuredChildCount, 1);
+    assert.equal((await list(ctx.database, 'ToolModelResult', {
+      tool_call_id: recoveringPlanTool.toolCallId
+    })).length, 1);
+    const recoveringPlanHelperReplay = await recoveringPlanInteractions.resolvePlanReview(recoveringPlanHelperInput);
+    assert.equal(recoveringPlanHelperReplay.deduplicated, true);
+    assert.equal(recoveringPlanHelperReplay.won, false);
+    assert.equal(ensureAttemptsAfterCommit, 3);
+    const recoveringPlanReplay = await recoveringPlanInteractions.resolvePlanReview(recoveringPlanInput);
+    assert.equal(recoveringPlanReplay.deduplicated, true);
+    assert.equal(recoveringPlanReplay.won, true);
+    assert.equal(ensureAttemptsAfterCommit, 4);
+    assert.equal(ensuredChildCount, 1);
+    assertions.push('winning Plan commit后ensure故障保留durable intent；不同source loser及其replay读取winner receipt帮助ensure/settle但自身仍won=false，child与finalize保持唯一');
+
     const taskTool = await createTool(ctx, effects, 'task-list', 'update_task_list');
     const taskResult = await interactions.settleTaskList({
       source: source('internal', 'task-list:settle'),
@@ -809,6 +1069,9 @@ async function checkToolModelResultExactlyOnce() {
         'ask_user competing responses and loser replay',
         'ask_user response before ordered model result',
         'ask_user response commit before finalizer crash',
+        'submit_plan current/new conversation routing and delegated Agent selection',
+        'submit_plan concurrent delegation loser after read-only preview',
+        'submit_plan winning commit before ensure failure and replay',
         'ordered no-effect completion',
         'competing no-effect settlement',
         'terminal state resurrection',
@@ -3646,6 +3909,18 @@ async function createAndDispatchPhaseDTool(effects, dispatcher, turnId, id, tool
 async function get(database, domain, id) {
   const snapshot = await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain(domain).get(id)]);
   return snapshot.snapshot[0];
+}
+
+async function toolModelResultDetail(ctx, toolCallId) {
+  const results = await list(ctx.database, 'ToolModelResult', { tool_call_id: toolCallId });
+  assert.equal(results.length, 1, `ToolCall ${toolCallId} must have one ToolModelResult`);
+  const revision = await get(ctx.database, 'MessageRevision', results[0].message_revision_id);
+  assert.ok(revision, `ToolCall ${toolCallId} result MessageRevision must exist`);
+  const metadata = await get(ctx.database, 'ContentObject', revision.content_object_id);
+  assert.ok(metadata, `ToolCall ${toolCallId} result ContentObject must exist`);
+  const envelope = JSON.parse((await ctx.store.read(metadata)).toString('utf8'));
+  assert.equal(envelope.toolCallId, toolCallId);
+  return envelope.detail;
 }
 
 async function list(database, domain, where, limit = 1000) {

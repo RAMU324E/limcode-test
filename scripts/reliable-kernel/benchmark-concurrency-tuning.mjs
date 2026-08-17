@@ -5,6 +5,11 @@ import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 
 const root = process.cwd();
+const CHILD_MODEL_FALLBACK = Object.freeze({
+  providerConfigId: 'benchmark',
+  provider: 'openai-compatible',
+  model: 'benchmark'
+});
 const kernel = await import(pathToFileURL(path.join(
   root,
   'dist/extension/backend/reliableKernel/index.js'
@@ -161,6 +166,8 @@ async function runChildDurableStart(iteration) {
         const spawned = await services.children.spawn({
           sourceToolCallId: tool.toolCallId,
           childAgentId: `child-agent-${iteration}-${index}`,
+          modelFallback: CHILD_MODEL_FALLBACK,
+          sourceSettlement: 'child_handle',
           prompt: `child prompt ${index}`,
           completionPolicy: 'background',
           leaseOwnerId: `child-owner-${iteration}-${index}`,
@@ -348,7 +355,16 @@ function benchmarkAuthorityCompiler(suffix) {
           content: JSON.stringify({ providerConfigId: 'benchmark', modelId: 'benchmark', suffix })
         },
         authoritySnapshot: {
-          content: JSON.stringify({ turnId: request.turnId, executorAgentId: request.executorAgentId, suffix })
+          content: JSON.stringify({
+            turnId: request.turnId,
+            executorAgentId: request.executorAgentId,
+            suffix,
+            model: {
+              providerConfigId: 'benchmark',
+              provider: 'openai-compatible',
+              modelId: 'benchmark'
+            }
+          })
         }
       };
     }

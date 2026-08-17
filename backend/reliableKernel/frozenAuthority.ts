@@ -2,7 +2,7 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
-import type { LlmCompressionConfigRecord, LlmProviderKind } from '../../shared/protocol';
+import type { ChatModelOverrideRecord, LlmCompressionConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
 export interface FrozenContextProfile {
   contextWindowTokens: number;
@@ -91,6 +91,23 @@ export function frozenModelIdentity(document: PlainJsonValue): { providerId: str
   return {
     providerId: requireText(document.model.providerConfigId, 'AuthoritySnapshot.model.providerConfigId'),
     modelId: requireText(document.model.modelId, 'AuthoritySnapshot.model.modelId')
+  };
+}
+
+/** Exact effective provider/model selection frozen for one Turn. */
+export function frozenModelSelection(document: PlainJsonValue): ChatModelOverrideRecord {
+  if (!isRecord(document) || !isRecord(document.model)) {
+    throw new Error('AuthoritySnapshot is missing frozen model selection.');
+  }
+  const provider = document.model.provider;
+  if (!isProviderKind(provider)) throw new Error('AuthoritySnapshot.model.provider is invalid.');
+  return {
+    providerConfigId: requireText(
+      document.model.providerConfigId,
+      'AuthoritySnapshot.model.providerConfigId'
+    ),
+    provider,
+    model: requireText(document.model.modelId, 'AuthoritySnapshot.model.modelId')
   };
 }
 

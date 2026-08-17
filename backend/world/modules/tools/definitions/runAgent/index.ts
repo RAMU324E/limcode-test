@@ -92,10 +92,9 @@ Do NOT poll read_agent_answer in a loop in the same response. Do NOT use tools t
           }
         },
         foregroundWaitMs: {
-          type: 'number',
+          type: 'integer',
           minimum: 0,
           maximum: 86_400_000,
-          multipleOf: 1,
           description: 'Optional in run mode. Foreground wait budget in integer milliseconds from 0 to 86400000; this is not an AgentRun timeout. Omit or use 0 to background immediately (recommended for delegation). Use a small positive value only when the current reply truly needs an immediate child result. When the budget expires, the child continues in the background and the tool returns agentId, runId, conversationId, and answerBridgeId.'
         },
         wait: {

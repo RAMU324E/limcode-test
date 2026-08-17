@@ -6,15 +6,22 @@ import type {
   ReliableAgentToolSettled
 } from './agentLoop';
 import type { AnswerControlPlane, RuntimeDeliveryControlPlane } from './answerDelivery';
-import type {
-  ChildExecutionCancelCommand,
-  ChildExecutionCancelSubtreeResult,
-  ChildExecutionControlPlane,
-  ChildExecutionSnapshot
+import {
+  childExecutionSpawnIdentity,
+  type ChildExecutionCancelCommand,
+  type ChildExecutionCancelSubtreeResult,
+  type ChildExecutionControlPlane,
+  type ChildExecutionSnapshot
 } from './childExecution';
+import type {
+  PlanDelegationEnsureRequest,
+  PlanDelegationRequest,
+  PlanDelegationResult
+} from './toolInteractions';
 import type { EffectControlPlane, ToolTerminalResult } from './effectControlPlane';
 import type { ModelProviderControlPlane } from './modelProviderControlPlane';
 import type { CoordinateCompressionResult } from './contextCompressionCoordinator';
+import { frozenModelSelection } from './frozenAuthority';
 import { stablePhaseFId } from './phaseFIdentity';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
@@ -48,6 +55,13 @@ export interface ReliableChildAgentSelector {
   resolve(input: { agentId?: string; agentType?: string }): Promise<ReliableChildAgentSelection>;
 }
 
+export interface ReliableChildModelProfileStore {
+  initializeConversation(input: {
+    conversationId: string;
+    model: TurnModelOverride;
+  }): Promise<{ created: boolean }>;
+}
+
 export interface ReliableChildAgentCoordinatorDependencies {
   database: RuntimeDatabase;
   effects: EffectControlPlane;
@@ -58,6 +72,7 @@ export interface ReliableChildAgentCoordinatorDependencies {
   turns: TurnControlPlane;
   agentLoop: ReliableAgentLoop;
   agents: ReliableChildAgentSelector;
+  modelProfiles: ReliableChildModelProfileStore;
   deliveryWakeups?: {
     notifyRuntimeDelivery(deliveryId: string): void;
   };
@@ -172,6 +187,90 @@ export class ReliableChildAgentCoordinator {
       default:
         return undefined;
     }
+  }
+
+  /** Resolves Agent configuration and reserves deterministic child identities without writing facts. */
+  public async previewApprovedPlan(input: PlanDelegationRequest): Promise<PlanDelegationResult> {
+    return (await this.planDelegationPreview(input)).result;
+  }
+
+  private async planDelegationPreview(input: PlanDelegationRequest): Promise<{
+    result: PlanDelegationResult;
+    selection: ReliableChildAgentSelection;
+  }> {
+    if (this.handoff) throw this.handoff;
+    if (this.disposing) throw new Error('ReliableChildAgentCoordinator is disposing.');
+    const sourceToolCallId = requireId(input.sourceToolCallId, 'sourceToolCallId');
+    const parentTurnId = requireId(input.parentTurnId, 'parentTurnId');
+    const sourceToolCall = await this.get('ToolCall', sourceToolCallId);
+    if (!sourceToolCall || requireId(sourceToolCall.turn_id, 'ToolCall.turn_id') !== parentTurnId) {
+      throw new Error('Plan delegation source ToolCall does not belong to the requested parent Turn.');
+    }
+    const selection = await this.dependencies.agents.resolve({
+      agentId: requireId(input.requestedAgentId, 'requestedAgentId')
+    });
+    const identity = childExecutionSpawnIdentity({ sourceToolCallId });
+    return {
+      result: {
+        ...identity,
+        agentId: selection.agentId,
+        agentType: selection.agentType
+      },
+      selection
+    };
+  }
+
+  /**
+   * Ensures the child lineage for an already-committed approved Plan. The durable Plan response is
+   * the intent; this method is idempotent and never owns settlement of the source submit_plan call.
+   */
+  public async ensureApprovedPlan(input: PlanDelegationEnsureRequest): Promise<PlanDelegationResult> {
+    const { result: preview, selection } = await this.planDelegationPreview(input);
+    assertExpectedPlanDelegation(preview, input.expected);
+    const sourceToolCallId = requireId(input.sourceToolCallId, 'sourceToolCallId');
+    const parentTurnId = requireId(input.parentTurnId, 'parentTurnId');
+    const spawned = await this.dependencies.children.spawn({
+      sourceToolCallId,
+      childAgentId: selection.agentId,
+      modelFallback: await this.dependencies.children.frozenModelSelectionForTurn(parentTurnId),
+      prompt: promptWithAnswerBridge(requireText(input.prompt, 'prompt'), preview.answerBridgeId),
+      completionPolicy: 'background',
+      sourceSettlement: 'external',
+      leaseOwnerId: this.childLeaseOwnerId,
+      leaseExpiresAt: leaseExpiry(this.timestamp(), 0)
+    });
+    await this.dependencies.modelProfiles.initializeConversation({
+      conversationId: spawned.childConversationId,
+      model: spawned.modelSelection
+    });
+    if (spawned.answerBridgeId !== preview.answerBridgeId) {
+      throw new Error('Plan delegation returned an unexpected AnswerBridge identity.');
+    }
+    const claimed = await this.dependencies.children.claimSpawnDispatch(spawned.effectIntentId);
+    if (claimed) {
+      const receipt = await this.dependencies.children.recordSpawnReceipt({
+        sourceKey: `plan-child-spawn:${spawned.attemptId}`,
+        attemptId: spawned.attemptId,
+        outcome: 'succeeded',
+        detail: { adapter: 'reliable-local-agent-loop', source: 'approved-plan' }
+      });
+      await this.dependencies.children.reconcileSpawnReceipt(receipt.effectReceiptId);
+      this.launch(spawned.childExecutionId, spawned.childTurnId);
+    } else {
+      const recovered = await this.dependencies.children.recoverSpawnIntent(spawned.effectIntentId);
+      if (recovered.shouldDrive) this.launch(recovered.childExecutionId, recovered.childTurnId);
+      if (recovered.childStatus === 'starting') {
+        throw new Error('Plan child spawn recovery did not finish its durable dispatch.');
+      }
+    }
+    return {
+      childExecutionId: spawned.childExecutionId,
+      childConversationId: spawned.childConversationId,
+      childTurnId: spawned.childTurnId,
+      answerBridgeId: spawned.answerBridgeId,
+      agentId: selection.agentId,
+      agentType: selection.agentType
+    };
   }
 
   /** Parent interruption closes local foreground waits but intentionally leaves children running. */
@@ -716,6 +815,12 @@ export class ReliableChildAgentCoordinator {
         report.deferredTurnIds.push(turnId);
         continue;
       }
+      // Repairs the crash boundary between the Runtime spawn transaction and the independent
+      // settings transaction. Existing Conversation selection remains authoritative.
+      await this.dependencies.modelProfiles.initializeConversation({
+        conversationId: requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id'),
+        model: await this.dependencies.children.frozenModelSelectionForTurn(turnId)
+      });
       if (await this.dependencies.turns.ownsExecutionLease({
         turnId,
         leaseOwnerId: this.childLeaseOwnerId,
@@ -1067,12 +1172,18 @@ export class ReliableChildAgentCoordinator {
     const spawned = await this.dependencies.children.spawn({
       sourceToolCallId: input.toolCallId,
       childAgentId: selection.agentId,
+      modelFallback: frozenParentModelSelection(authority),
       prompt: promptWithAnswerBridge(prompt, answerBridgeId),
       completionPolicy,
+      sourceSettlement: 'child_handle',
       ...(deadline ? { waitDeadlineAt: deadline } : {}),
       ...(selection.title ? { title: selection.title } : {}),
       leaseOwnerId: this.childLeaseOwnerId,
       leaseExpiresAt: leaseExpiry(this.timestamp(), foregroundWaitMs)
+    });
+    await this.dependencies.modelProfiles.initializeConversation({
+      conversationId: spawned.childConversationId,
+      model: spawned.modelSelection
     });
     if (spawned.answerBridgeId !== answerBridgeId) {
       throw new Error('ChildExecution returned an unexpected AnswerBridge identity.');
@@ -1809,8 +1920,32 @@ export class ReliableChildAgentCoordinator {
   }
 }
 
+function frozenParentModelSelection(
+  authority: ReliableToolDispatchAuthority | undefined
+): TurnModelOverride {
+  if (!authority) throw new Error('run_agent child spawn requires the parent Turn frozen authority.');
+  return frozenModelSelection(authority.document);
+}
+
 function promptWithAnswerBridge(prompt: string, answerBridgeId: string): string {
   return `${prompt}\n\n[Agent answer bridge]\n本次任务的默认 answerBridgeId 为 ${answerBridgeId}。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })；继续同一子对话时该默认值保持不变。`;
+}
+
+function assertExpectedPlanDelegation(
+  actual: PlanDelegationResult,
+  expected: PlanDelegationEnsureRequest['expected']
+): void {
+  for (const key of [
+    'childExecutionId',
+    'childConversationId',
+    'answerBridgeId',
+    'agentId',
+    'agentType'
+  ] as const) {
+    if (actual[key] !== requireId(expected[key], `Plan delegation expected ${key}`)) {
+      throw new Error(`Approved Plan delegation intent does not match stable ${key}.`);
+    }
+  }
 }
 
 function leaseExpiry(now: string, foregroundWaitMs: number): string {

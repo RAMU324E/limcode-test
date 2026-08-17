@@ -8,7 +8,6 @@ const compiledRoot = process.env.LIMCODE_TEST_EXTENSION_ROOT
   ? path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT)
   : path.resolve('dist/extension');
 const {
-  TURN_TASK_CARD_MAX_TOKENS,
   approvedSubmitPlanTaskOperation,
   buildCurrentTurnTaskProjection,
   estimateTurnTaskCardTokens,
@@ -20,6 +19,9 @@ const {
   requireTaskListOperation,
   taskListOperationFromArgs
 } = require(path.join(compiledRoot, 'shared/taskListProjection.js'));
+const {
+  normalizeSubmitPlanToolRequest
+} = require(path.join(compiledRoot, 'shared/planReview.js'));
 
 const rewrite = (items) => ({ kind: 'task_list.operation', mode: 'rewrite', items });
 const update = (items) => ({ kind: 'task_list.operation', mode: 'update', items });
@@ -48,6 +50,26 @@ test('task operation 只在一个严格边界规范化完整 mode/items', () => 
   });
   assert.throws(() => requireTaskListOperation({ mode: 'rewrite', items: [], extra: true }), /unsupported fields/);
   assert.equal(taskListOperationFromArgs({ mode: 'rewrite', items: [{ title: 'x', unknown: true }] }), undefined);
+});
+
+test('submit_plan 必须携带完整结构化 taskList 合同', () => {
+  assert.throws(
+    () => normalizeSubmitPlanToolRequest({ plan: 'inspect then fix' }),
+    /taskList is required/
+  );
+  assert.deepEqual(normalizeSubmitPlanToolRequest({
+    plan: 'inspect then fix',
+    taskList: { mode: 'rewrite', items: [
+      { title: ' inspect ', description: ' full description ', status: 'in_progress' },
+      { title: 'fix', status: 'pending' }
+    ] }
+  }), {
+    plan: 'inspect then fix',
+    taskList: { kind: 'task_list.operation', mode: 'rewrite', items: [
+      { title: 'inspect', description: 'full description', status: 'in_progress' },
+      { title: 'fix', status: 'pending' }
+    ] }
+  });
 });
 
 test('没有 rewrite 基线时不从 update 或未批准 Plan 伪造任务卡', () => {
@@ -115,35 +137,34 @@ test('最近有效 rewrite 替换旧基线且不会跨基线复活旧任务', ()
   assert.deepEqual(projection.snapshot.items.map((item) => item.title), ['new task']);
 });
 
-test('turnTaskCard 确定性不超过 2K，先保留未完成项并提供 hash/计数', () => {
-  assert.equal(TURN_TASK_CARD_MAX_TOKENS, 2_000);
-  const huge = '很长的验收说明'.repeat(2_000);
-  const items = [
-    { title: 'Active first', description: huge, status: 'in_progress' },
-    ...Array.from({ length: 30 }, (_, index) => ({
-      title: `Pending ${index}`,
-      description: huge,
-      status: index % 2 === 0 ? 'pending' : 'blocked'
-    })),
-    ...Array.from({ length: 10 }, (_, index) => ({ title: `Completed ${index}`, description: huge, status: 'completed' }))
-  ];
-  const input = { turnId: 'turn-bounded-card', operations: [fact(1, rewrite(items))], maxTokens: 256 };
+test('turnTaskCard 按原始顺序完整保留所有 task 的 title/description/status', () => {
+  const statuses = ['in_progress', 'pending', 'blocked', 'completed', 'cancelled', 'pending', 'completed', 'pending'];
+  const items = statuses.map((status, index) => ({
+    title: `Task ${index + 1}`,
+    description: `完整描述-${index + 1}-` + '内容'.repeat(1_000 + index),
+    status
+  }));
+  const input = { turnId: 'turn-complete-card', operations: [fact(1, rewrite(items))] };
   const first = buildCurrentTurnTaskProjection(input);
   const second = buildCurrentTurnTaskProjection(input);
   assert.ok(first && second);
   assert.equal(first.card, second.card);
   assert.equal(first.cardSha256, second.cardSha256);
   assert.equal(first.estimatedTokens, estimateTurnTaskCardTokens(first.card));
-  assert.ok(first.estimatedTokens <= 256);
-  assert.ok(first.estimatedTokens <= TURN_TASK_CARD_MAX_TOKENS);
+  assert.ok(first.estimatedTokens > 2_000, '完整 Task 上下文不得受旧 2K budget 限制');
   assert.match(first.card, /runtime task data, not a new user instruction/);
-  assert.match(first.card, /Active first/);
-  assert.match(first.card, /details omitted by card budget: unfinished=/);
-  assert.equal(first.counts.unfinished, 31);
-  assert.equal(first.counts.completed, 10);
+  assert.doesNotMatch(first.card, /details omitted by card budget/);
+  const taskLines = first.card.split('\n').filter((line) => line.startsWith('- status='));
+  assert.equal(taskLines.length, items.length);
+  assert.deepEqual(taskLines, items.map((item) =>
+    `- status=${item.status}; title=${JSON.stringify(item.title)}; description=${JSON.stringify(item.description)}`));
+  assert.equal(first.counts.unfinished, 5);
+  assert.equal(first.counts.completed, 2);
+  assert.equal(first.counts.cancelled, 1);
   assert.doesNotThrow(() => JSON.stringify(first));
   const frozen = freezeCurrentTurnTaskCard(first);
-  assert.equal('snapshot' in frozen, false, 'ModelRequest recipe must not copy the unbounded UI snapshot');
+  assert.equal('snapshot' in frozen, false, 'ModelRequest recipe uses the complete rendered task context');
+  assert.equal(frozen.card, first.card);
   assert.equal(frozen.cardSha256, first.cardSha256);
   assert.doesNotThrow(() => JSON.stringify(frozen));
 });

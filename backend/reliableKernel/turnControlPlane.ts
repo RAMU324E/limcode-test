@@ -127,6 +127,12 @@ export interface TurnAuthorityCompilationRequest {
   sourceTurnId?: string;
   /** Explicit next-Turn selection captured by the UI command admission boundary. */
   modelOverride?: TurnModelOverride;
+  /**
+   * Stable inherited selection used only when the target Agent/Workflow/Conversation/Run has no
+   * model profile of its own. Child execution uses the parent Turn's frozen effective model here;
+   * unlike modelOverride it must never hide a child Agent profile.
+   */
+  modelFallback?: TurnModelOverride;
   /** Conversation-bound workspace used only for model-visible runtime context/rule rendering. */
   workspace?: ProjectFolderAssignment;
 }
@@ -3748,7 +3754,7 @@ function normalizeTurnExecutionMembership(input: TurnExecutionMembership): TurnE
   };
 }
 
-function normalizeTurnModelOverride(input: TurnModelOverride): TurnModelOverride {
+export function normalizeTurnModelOverride(input: TurnModelOverride): TurnModelOverride {
   if (!input || typeof input !== 'object') throw new TypeError('modelOverride must be an object.');
   return {
     ...(input.providerConfigId?.trim()
@@ -4218,15 +4224,16 @@ export async function contextRootContainsCompleteToolPair(
   const pairSources = await listAllDomainRows(database, 'ContextSegmentSource', {
     segment_id: pairSegmentId
   });
-  const resultSource = pairSources.find((source) => source.source_kind === 'tool_model_result');
-  if (!resultSource) return false;
-  const resultSnapshot = await database.snapshot([
+  const resultSources = pairSources.filter((source) => source.source_kind === 'tool_model_result');
+  if (resultSources.length === 0) return false;
+  const resultSnapshot = await database.snapshot(resultSources.map((source) =>
     DOMAIN_REPOSITORIES.domain('ToolModelResult').get(
-      requireId(resultSource.source_id, 'ContextSegmentSource.source_id')
+      requireId(source.source_id, 'ContextSegmentSource.source_id')
     )
-  ]);
-  const result = resultSnapshot.snapshot[0] as DomainRow | null;
-  if (!result || result.tool_call_id !== toolCallId) return false;
+  ));
+  if (!resultSnapshot.snapshot.some((result) =>
+    !!result && !Array.isArray(result) && result.tool_call_id === toolCallId
+  )) return false;
 
   const materialized = await database.materializeContext(rootId);
   const visibleSegmentIds = materialized.snapshot.records.map((record) =>
