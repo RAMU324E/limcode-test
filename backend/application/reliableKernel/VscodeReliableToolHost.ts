@@ -13,6 +13,7 @@ import { createRulesCatalogCapability } from '../../capabilities/rulesCatalog';
 import { createVsCodeFsCapability } from '../../capabilities/vscodeFs';
 import { createWorkEnvironmentRuntimeCapability } from '../../capabilities/workEnvironmentTransfer';
 import { McpRuntimeManager, dedupeMcpToolNames } from '../mcpRuntimeManager';
+import { proxyForShellAndMcp } from './proxyEnvironment';
 import { createBuiltinToolDefinitions } from '../../world/modules/tools/definitions';
 import {
   toolDefinitionRecord,
@@ -21,7 +22,7 @@ import {
   type ToolResultOut,
   type ToolRuntimeEvent
 } from '../../world/modules/tools/registry';
-import type { RuleFileRecord, RuleScope, SkillDefinitionRecord, ToolDefinitionRecord, WorkEnvironmentRecord } from '../../../shared/protocol';
+import type { GlobalSettingsRecord, RuleFileRecord, RuleScope, SkillDefinitionRecord, ToolDefinitionRecord, WorkEnvironmentRecord } from '../../../shared/protocol';
 import type {
   ReliableAgentToolDispatchInput,
   ReliableAgentToolPause,
@@ -81,7 +82,11 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   ) {
     this.skills = createSkillCatalogCapability(context);
     this.rules = createRulesCatalogCapability(context);
-    this.mcp = new McpRuntimeManager(configuration);
+    this.mcp = new McpRuntimeManager({
+      loadGlobalSettings: (section) => configuration.loadGlobalSettings(section),
+      resolveProxySetting: async () =>
+        proxyForShellAndMcp((await configuration.loadGlobalSettings('common')).settings as GlobalSettingsRecord)
+    });
     this.mcp.setStateChangeListener(() => this.notifyStateChange());
     this.builtins = createBuiltinToolDefinitions({ command: this.commandDeclaration });
     this.filePlanner = new LocalFileToolPlanner((inputPath, authority) => this.resolveFilePath(inputPath, authority));

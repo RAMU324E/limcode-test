@@ -16,6 +16,7 @@ import {
   type ConversationSettingsGetPayload,
   type ConversationSettingsUpdatePayload,
   type GlobalSettingsGetPayload,
+  type GlobalSettingsRecord,
   type GlobalSettingsUpdatePayload,
   type GuidanceCancelPayload,
   type GuidanceControlResultPayload,
@@ -41,6 +42,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/reposi
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
 import { readVscodeSshWorkEnvironments } from './VscodeSshConfigurationReader';
+import { applyProxyEnvironment, currentProxyEnvironment, proxyForShellAndMcp } from './proxyEnvironment';
 
 export interface VscodeReliableKernelCommandRouterOptions {
   broadcast?(message: unknown): void;
@@ -138,6 +140,9 @@ export class VscodeReliableKernelCommandRouter {
     const stored = await this.product.configuration.loadGlobalSettings(section);
     const snapshot = this.globalSettingsSnapshot(stored);
     this.options.broadcast?.(snapshot);
+    if (section === 'common') {
+      await this.applyCommonProxyRuntime(stored.settings as GlobalSettingsRecord);
+    }
   }
 
   private async dispatch(
@@ -565,6 +570,10 @@ export class VscodeReliableKernelCommandRouter {
       if (!isSettingsRevisionConflictError(error)) throw error;
       const latest = await this.product.configuration.loadGlobalSettings(payload.section);
       this.broadcastOrPost(webview, this.globalSettingsSnapshot(latest));
+      if (payload.section === 'common') {
+        await this.applyCommonProxyRuntime(latest.settings as GlobalSettingsRecord)
+          .catch((proxyError) => console.warn('[LimCode] Failed to apply latest common proxy settings after conflict.', proxyError));
+      }
       this.postRequestError(
         webview,
         BridgeMessageType.GlobalSettingsUpdate,
@@ -576,9 +585,21 @@ export class VscodeReliableKernelCommandRouter {
     }
     const snapshot = this.globalSettingsSnapshot(stored, correlationId);
     this.broadcastOrPost(webview, snapshot);
+    if (payload.section === 'common') {
+      await this.applyCommonProxyRuntime(stored.settings as GlobalSettingsRecord);
+    }
     if (payload.section === 'mcpServers') {
       await this.product.toolHost.mcp.refreshFromSettings({ discover: true });
     }
+  }
+
+  private async applyCommonProxyRuntime(settings: GlobalSettingsRecord): Promise<void> {
+    // shell 覆盖开关变更即时生效；LLM 链路本身按请求读取代理设置。
+    const proxy = proxyForShellAndMcp(settings);
+    const proxyChanged = currentProxyEnvironment() !== proxy;
+    applyProxyEnvironment(proxy);
+    // 代理地址或 shell/MCP 开关变化时重建 MCP 连接；存量连接无法热切换 transport。
+    if (proxyChanged) await this.product.toolHost.mcp.refreshFromSettings({ discover: true });
   }
 
   private globalSettingsSnapshot(
