@@ -664,6 +664,35 @@ test('provider completed overlay remains streaming until the durable ModelReques
   assert.deepEqual(projection.messages[1]?.content.parts, [{ text: 'provider complete, commit pending' }]);
 });
 
+test('provider completed overlay preserves authoritative reasoning-tool-reasoning order', () => {
+  const completedContent = {
+    role: 'model' as const,
+    parts: [
+      { text: 'inspect', thought: true, thoughtSignature: 'openai-responses:first' },
+      { id: 'provider-read', functionCall: { name: 'read', args: { path: 'ordered.txt' } } },
+      { text: 'verify', thought: true, thoughtSignature: 'openai-responses:second' },
+      { text: 'done' }
+    ]
+  };
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-completed-parts',
+    records: {
+      ModelRequest: { request: {
+        id: 'request-completed-parts', turn_id: 'turn-completed-parts', request_seq: '1', model_id: 'model',
+        status: 'streaming', created_at: '2026-08-03T00:00:00.000Z'
+      } }
+    },
+    details: {},
+    transientModelRequests: { request: {
+      conversationId: 'conversation-completed-parts', turnId: 'turn-completed-parts',
+      modelRequestId: 'request-completed-parts', requestSeq: '1', providerId: 'provider', modelId: 'model',
+      streamSeq: '4', text: 'done', thought: 'inspect\nverify', toolCalls: [], completedContent,
+      status: 'completed', startedAt: 1_000, updatedAt: 2_000
+    } }
+  });
+  assert.deepEqual(projection.messages[0]?.content, completedContent);
+});
+
 test('a tail transient receives the next absolute display floor instead of the bounded-window index', () => {
   const projection = projectReliableConversation({
     conversationId: 'conversation-floor',

@@ -4,7 +4,7 @@ import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from
 import { answerFromValue, answerMarkdownSection } from './agentAnswerToolDisplay';
 
 export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
-  const conversationId = conversationIdFromRunAgentContext(context);
+  const conversationId = context.childConversationId?.trim() || undefined;
   const answer = answerFromValue(context.result);
   const metadataSections = runAgentMetadataSections(context);
   const outputSections = metadataSections.length > 0 || answer?.content
@@ -88,16 +88,6 @@ function row(label: string, value: unknown): Array<{ label: string; value: strin
   } catch {
     return [{ label, value: String(value) }];
   }
-}
-
-function conversationIdFromRunAgentContext(context: ToolDisplayContext): string | undefined {
-  return conversationIdFromValue(context.result) ?? conversationIdFromValue(context.progress);
-}
-
-function conversationIdFromValue(value: unknown): string | undefined {
-  const record = asRecord(value);
-  const conversationId = record?.childConversationId ?? record?.conversationId;
-  return typeof conversationId === 'string' && conversationId.trim() ? conversationId.trim() : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

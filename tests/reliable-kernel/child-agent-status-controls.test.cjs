@@ -23,7 +23,27 @@ function loadProjection() {
   return loaded.exports;
 }
 
+function loadConversationProjection() {
+  const relativePath = 'webview/src/domain/reliableConversationProjection.ts';
+  const absolute = path.join(root, relativePath);
+  const output = ts.transpileModule(source(relativePath), {
+    fileName: absolute,
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+  }).outputText;
+  const loaded = { exports: {} };
+  const localRequire = (specifier) => {
+    if (specifier === './reliableTransientModel.ts') return { transientFunctionCallParts: () => [] };
+    if (specifier === './reliableDetailKey.ts') {
+      return { reliableKernelDetailKey: (kind, recordId) => `${kind}:${recordId}` };
+    }
+    return require(specifier);
+  };
+  Function('require', 'module', 'exports', `${output}\n//# sourceURL=${absolute}`)(localRequire, loaded, loaded.exports);
+  return loaded.exports;
+}
+
 const { projectReliableAgentStatus } = loadProjection();
+const { projectReliableConversation } = loadConversationProjection();
 
 test('Agent status separates current child activity from the original task', () => {
   const projection = projectReliableAgentStatus({
@@ -89,6 +109,100 @@ test('interrupted and permanently terminal children do not expose a stop action'
   assert.deepEqual(projection.children.map((child) => child.interruptible), [false, false]);
 });
 
+test('Agent status projects durable run, Answer and Delivery identities with running children first', () => {
+  const projection = projectReliableAgentStatus({
+    conversationId: 'parent-conversation',
+    agentNames: new Map([['worker-agent', 'Worker']]),
+    records: {
+      Turn: {
+        parent: { id: 'parent-turn', conversation_id: 'parent-conversation', status: 'active' },
+        child: { id: 'child-turn', conversation_id: 'child-conversation', status: 'active' }
+      },
+      AgentConversationLink: {
+        child: { id: 'child-agent-link', conversation_id: 'child-conversation', agent_id: 'worker-agent', role: 'default' }
+      },
+      ChildExecution: {
+        finished: { id: 'finished-child', child_conversation_id: 'finished-conversation', status: 'closed', updated_at: '2026-08-17T11:00:00.000Z' },
+        running: { id: 'running-child', child_conversation_id: 'child-conversation', status: 'active', created_at: '2026-08-17T10:00:00.000Z', updated_at: '2026-08-17T10:05:00.000Z' }
+      },
+      ChildExecutionParentLink: {
+        finished: { id: 'finished-link', child_execution_id: 'finished-child', parent_turn_id: 'parent-turn', source_tool_call_id: 'finished-tool' },
+        running: { id: 'running-link', child_execution_id: 'running-child', parent_turn_id: 'parent-turn', source_tool_call_id: 'run-agent-tool' }
+      },
+      ChildExecutionActiveTurnLink: {
+        running: { id: 'active-link', child_execution_id: 'running-child', turn_id: 'child-turn' }
+      },
+      ChildExecutionActivity: {
+        running: { id: 'running-child', child_execution_id: 'running-child', kind: 'tool', summary: '正在运行命令', tool_call_id: 'child-tool' }
+      },
+      TurnExecutorLink: {
+        child: { id: 'executor-link', turn_id: 'child-turn', agent_id: 'worker-agent' }
+      },
+      AnswerBridge: {
+        running: {
+          id: 'answer-bridge', child_execution_id: 'running-child', status: 'open',
+          current_submission_id: 'answer-submission', current_submission_seq: '2',
+          current_turn_id: 'child-turn', current_submission_interrupted: 0,
+          current_title: 'Answer title', current_payload_id: 'answer-payload', current_byte_length: '42',
+          current_submission_created_at: '2026-08-17T10:04:00.000Z'
+        }
+      },
+      AnswerSubmission: {
+        running: { id: 'answer-submission', answer_bridge_id: 'answer-bridge', submission_seq: '2', turn_id: 'child-turn' }
+      },
+      RuntimeInboxItem: {
+        running: { id: 'answer-inbox', source_kind: 'answer_submission', source_id: 'answer-submission' }
+      },
+      RuntimeDelivery: {
+        running: {
+          id: 'answer-delivery', inbox_item_id: 'answer-inbox', attempt_seq: '1', phase: 'answer',
+          state: 'consumed', parent_handling_state: 'unhandled', updated_at: '2026-08-17T10:04:30.000Z'
+        }
+      }
+    }
+  });
+
+  assert.deepEqual(projection.children.map((child) => child.id), ['running-child', 'finished-child']);
+  assert.equal(projection.children[0].agentId, 'worker-agent');
+  assert.equal(projection.children[0].turnId, 'child-turn');
+  assert.equal(projection.children[0].activityToolCallId, 'child-tool');
+  assert.equal(projection.children[0].answerBridgeId, 'answer-bridge');
+  assert.equal(projection.children[0].answerSubmissionId, 'answer-submission');
+  assert.equal(projection.children[0].answerTitle, 'Answer title');
+  assert.equal(projection.children[0].deliveryId, 'answer-delivery');
+  assert.equal(projection.children[0].deliveryBadge, 'awaiting_parent');
+});
+
+test('run_agent navigation identity comes only from durable ChildExecution relations', () => {
+  const projected = projectReliableConversation({
+    conversationId: 'parent-conversation',
+    details: {},
+    records: {
+      Turn: {
+        parent: { id: 'parent-turn', conversation_id: 'parent-conversation', status: 'active' },
+        unrelated: { id: 'other-turn', conversation_id: 'other-conversation', status: 'active' }
+      },
+      ChildExecution: {
+        child: { id: 'child-execution', child_conversation_id: 'child-conversation', status: 'active' },
+        unrelated: { id: 'other-child', child_conversation_id: 'other-child-conversation', status: 'active' }
+      },
+      ChildExecutionParentLink: {
+        child: { id: 'child-link', child_execution_id: 'child-execution', parent_turn_id: 'parent-turn', source_tool_call_id: 'run-agent-tool' },
+        unrelated: { id: 'other-link', child_execution_id: 'other-child', parent_turn_id: 'other-turn', source_tool_call_id: 'other-tool' }
+      }
+    }
+  });
+  assert.deepEqual(projected.childConversationIdByToolCallId, {
+    'run-agent-tool': 'child-conversation'
+  });
+
+  const display = source('webview/src/components/content/toolDisplay/runAgentToolDisplay.ts');
+  const part = source('webview/src/components/content/parts/FunctionCallPartView.vue');
+  assert.match(display, /context\.childConversationId\?\.trim\(\)/);
+  assert.doesNotMatch(display, /conversationIdFromValue\(context\.(?:result|progress)\)/);
+  assert.match(part, /childConversationIdByToolCallId\[toolCall\.value\.id\]/);
+});
+
 test('UI and product routes bind recursive stop to child-isolated activity facts', () => {
   const panel = source('webview/src/components/input/ReliableAgentStatusPanel.vue');
   const worker = source('backend/reliableKernel/databaseWorker.ts');
@@ -96,13 +210,46 @@ test('UI and product routes bind recursive stop to child-isolated activity facts
   const facade = source('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.ts');
   const sidebar = source('webview/src/sidebar/SidebarApp.vue');
   assert.match(panel, /BridgeMessageType\.ToolExecutionCancel/);
+  assert.match(panel, /BridgeMessageType\.ConversationOpen/);
   assert.match(panel, /终止该 Agent 及其启动的所有子 Agent/);
+  assert.match(panel, /toolCallId: child\.sourceToolCallId/);
+  assert.match(panel, /selectedChildId\.value = child\.id/);
+  assert.match(panel, /class="agent-run-item-stop"[\s\S]*?@click\.stop="interruptChild\(child\)"/);
+  assert.match(panel, /不影响其他同级子 Agent/);
   assert.match(panel, /child\.activitySummary/);
+  assert.match(panel, /width: min\(760px, calc\(100vw - 58px\)\)/);
+  assert.match(panel, /height: min\(430px, calc\(100vh - 120px\)\)/);
+  assert.match(panel, /@media \(max-width: 620px\)[\s\S]*?grid-template-columns: minmax\(104px, 0\.38fr\) minmax\(0, 0\.62fr\)/);
+  assert.match(panel, /<AdvancedScrollbar/);
+  assert.match(panel, /requestDetail\('answer-content', submissionId/);
+  assert.match(panel, /<button type="button" class="agent-run-close"[\s\S]*?@click="closePanel"/);
+  assert.match(panel, /<div v-else class="agent-run-empty">暂无子 Agent。<\/div>/);
   assert.match(worker, /Child ToolCall\/ModelRequest rows stay isolated/);
   assert.match(worker, /capture_child_activity_from_/);
   assert.match(router, /product\.childAgents\.interruptSubtree/);
   assert.match(facade, /sidebar-child-interrupt/);
   assert.match(sidebar, /终止此子 Agent 及其启动的所有子 Agent/);
+});
+
+test('all host conversation-open routes validate persistent Conversation identity', () => {
+  const panel = source('vscode/panels/MainPanel.ts');
+  const sidebar = source('vscode/views/SidebarEntryView.ts');
+  const facadeContract = source('vscode/ApplicationFacade.ts');
+  const facade = source('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.ts');
+  const panelOpen = panel.slice(
+    panel.indexOf('private openConversationFromPanel('),
+    panel.indexOf('private openPlanProposalFromPanel(')
+  );
+  const sidebarOpen = sidebar.slice(
+    sidebar.indexOf('private openConversationFromSidebar('),
+    sidebar.indexOf('private openPanelFromSidebar(')
+  );
+  assert.match(panelOpen, /this\.backendApp\.conversationExists\(conversationId\)/);
+  assert.match(sidebarOpen, /await backendApp\.conversationExists\(conversationId\)/);
+  assert.doesNotMatch(sidebarOpen, /prepareConversationForSidebarOpen/);
+  assert.doesNotMatch(facadeContract, /prepareConversationForSidebarOpen/);
+  assert.doesNotMatch(facade, /prepareConversationForSidebarOpen/);
+  assert.match(facade, /conversationExists[\s\S]*?maybeRow\('Conversation', conversationId\)/);
 });
 
 test('parent feed receives a bounded child activity change without child ToolCall leakage', async () => {
@@ -149,6 +296,12 @@ test('parent feed receives a bounded child activity change without child ToolCal
     const child = await app.runtime.children.spawn({
       sourceToolCallId: 'child-activity-run-agent-call',
       childAgentId: 'agent-child',
+      modelFallback: {
+        providerConfigId: 'provider-local',
+        provider: 'openai-compatible',
+        model: 'model-local'
+      },
+      sourceSettlement: 'child_handle',
       prompt: 'inspect the workspace',
       completionPolicy: 'wait_for_answer',
       waitDeadlineAt: new Date(Date.now() + 60_000).toISOString(),
@@ -214,7 +367,7 @@ function runtimeDependencies() {
                 contextWindowTokens: 128000,
                 tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
               },
-              model: { providerConfigId: 'provider-local', modelId: 'model-local' },
+              model: { providerConfigId: 'provider-local', provider: 'openai-compatible', modelId: 'model-local' },
               policies: { toolPolicyId: 'tools-default', systemPromptId: 'prompt-default' }
             })
           }

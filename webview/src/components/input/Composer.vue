@@ -706,7 +706,6 @@ function middleEllipsis(value: string, maxLength: number): string {
     <div class="composer-zone composer-zone-top" aria-label="输入框上方功能区">
       <div class="composer-top-main">
         <ReliableQueuePanel />
-        <ReliableAgentStatusPanel />
         <AskUserTopPanel />
         <div v-if="ui.isEditing" class="composer-edit-indicator">
           <span class="composer-edit-indicator-icon" aria-hidden="true">
@@ -735,6 +734,7 @@ function middleEllipsis(value: string, maxLength: number): string {
         </div>
       </div>
       <div class="composer-top-actions">
+        <ReliableAgentStatusPanel />
         <BackgroundCommandPanel />
       </div>
     </div>

@@ -24,7 +24,7 @@ import {
   type ReliableKernelTransientBatchMessage,
   type ReliableKernelTransientMessage
 } from '@shared/reliableKernelClientFeed';
-import { createMessageId, type LlmUsageMetadataRecord } from '@shared/protocol';
+import { createMessageId, type LlmUsageMetadataRecord, type MessageContent } from '@shared/protocol';
 import {
   compareReliableTransientIdentity,
   mergeReliableCompletedToolCalls,
@@ -78,6 +78,8 @@ export interface ReliableKernelTransientState {
   streamSeq: string;
   text: string;
   thought: string;
+  /** Exact terminal model parts; present once the Provider completion is observed. */
+  completedContent?: MessageContent;
   thoughtSignature?: string;
   /** 当前思考块是否仍活动；与整个 Provider 请求的 streaming 状态相互独立。 */
   thoughtActive?: boolean;
@@ -509,12 +511,29 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
             updatedAt: observedAt
           };
       if (message.event.kind === 'completed') {
-        next.text = stringValue(content?.text) ?? next.text;
-        next.thought = stringValue(content?.thought) ?? next.thought;
-        next.thoughtSignature = stringValue(content?.thoughtSignature) ?? next.thoughtSignature;
-        const thoughtDurationMs = nonNegativeNumber(content?.thoughtDurationMs)
-          ?? next.thoughtDurationMs
-          ?? (next.thoughtActive
+        const completedContent = messageContentValue(content);
+        if (!completedContent) return;
+        next.completedContent = completedContent;
+        next.text = completedContent.parts
+          .filter((part) => 'text' in part && part.thought !== true)
+          .map((part) => 'text' in part ? part.text : '')
+          .join('');
+        next.thought = completedContent.parts
+          .filter((part) => 'text' in part && part.thought === true)
+          .map((part) => 'text' in part ? part.text : '')
+          .join('\n');
+        const terminalThoughtParts = completedContent.parts
+          .filter((part) => 'text' in part && part.thought === true);
+        next.thoughtSignature = [...terminalThoughtParts]
+          .reverse()
+          .map((part) => 'thoughtSignature' in part ? part.thoughtSignature : undefined)
+          .find((value): value is string => typeof value === 'string')
+          ?? next.thoughtSignature;
+        const thoughtDurationMs = terminalThoughtParts
+          .map((part) => 'thoughtDurationMs' in part ? nonNegativeNumber(part.thoughtDurationMs) ?? 0 : 0)
+          .reduce((sum, duration) => sum + duration, 0)
+          || next.thoughtDurationMs
+          || (next.thoughtActive
             ? (next.thoughtCompletedDurationMs ?? 0) + currentTransientThoughtDurationMs(next, observedAt)
             : next.thoughtCompletedDurationMs);
         if (thoughtDurationMs !== undefined) {
@@ -525,10 +544,16 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         delete next.thoughtStartedAt;
         delete next.thoughtElapsedMs;
         next.toolCalls = replaceReliableCompletedToolCalls(
-          content?.toolCalls,
+          completedContent.parts.flatMap((part) => 'functionCall' in part
+            ? [{
+                ...(part.id ? { id: part.id } : {}),
+                name: part.functionCall.name,
+                arguments: part.functionCall.args
+              }]
+            : []),
           message.modelRequestId,
           observedAt
-        ) ?? next.toolCalls;
+        ) ?? [];
         const usage = plainRecord(message.event.usage);
         if (usage) next.usageMetadata = usage;
         const timing = plainRecord(message.event.timing);
@@ -544,6 +569,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           next.text = '';
           next.thought = '';
           next.toolCalls = [];
+          delete next.completedContent;
           delete next.thoughtSignature;
           delete next.thoughtStartedAt;
           delete next.thoughtCompletedDurationMs;
@@ -1038,6 +1064,15 @@ function afterNextPaint(callback: () => void): void {
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined;
+}
+
+function messageContentValue(value: unknown): MessageContent | undefined {
+  const record = plainRecord(value);
+  if (!record || record.role !== 'model' || !Array.isArray(record.parts)) return undefined;
+  return {
+    role: 'model',
+    parts: structuredClone(record.parts) as MessageContent['parts']
+  };
 }
 
 function stringValue(value: unknown): string | undefined {

@@ -81,6 +81,8 @@ export interface ReliableConversationProjection {
   fileDiffByToolCallId: Record<string, ReliableFileDiffProjection>;
   fileDiffMemberIdsByToolCallId: Record<string, string[]>;
   fileChangeSetIdByToolCallId: Record<string, string>;
+  /** Durable ChildExecutionParentLink → ChildExecution navigation identity for run_agent cards. */
+  childConversationIdByToolCallId: Record<string, string>;
   loadingMessageRevisionIds: string[];
   missingToolArgumentIds: string[];
   missingToolResultIds: string[];
@@ -296,6 +298,10 @@ export function projectReliableConversation(
   }
 
   const fileChanges = projectReliableFileChanges(input.records, input.details);
+  const childConversationIdByToolCallId = projectChildConversationIdsByToolCallId(
+    input.records,
+    conversationId
+  );
   const terminationByMessageId = projectTurnTerminations(input.records, parsedMessages, conversationId);
   const toolCallsByMessageId = objectGroups(toolCalls, (call) => call.messageId);
   const toolCallEventsByCallId = objectGroups(toolCallEvents, (event) => event.toolCallId);
@@ -320,6 +326,7 @@ export function projectReliableConversation(
     fileDiffByToolCallId: fileChanges.diffByToolCallId,
     fileDiffMemberIdsByToolCallId: fileChanges.memberIdsByToolCallId,
     fileChangeSetIdByToolCallId: fileChanges.changeSetIdByToolCallId,
+    childConversationIdByToolCallId,
     loadingMessageRevisionIds,
     missingToolArgumentIds,
     missingToolResultIds,
@@ -327,6 +334,27 @@ export function projectReliableConversation(
     missingInteractionPromptIds: interactionProjection.missingPromptIds,
     missingFileDiffMemberIds: fileChanges.missingMemberIds
   };
+}
+
+function projectChildConversationIdsByToolCallId(
+  records: ReliableClientRecordBuckets,
+  conversationId: string
+): Record<string, string> {
+  const parentTurnIds = new Set(values(records.Turn)
+    .filter((turn) => text(turn.conversation_id) === conversationId)
+    .map((turn) => text(turn.id))
+    .filter((turnId): turnId is string => Boolean(turnId)));
+  const childrenById = firstBy(values(records.ChildExecution), (child) => text(child.id));
+  const result: Record<string, string> = {};
+  for (const link of values(records.ChildExecutionParentLink)) {
+    const parentTurnId = text(link.parent_turn_id);
+    const sourceToolCallId = text(link.source_tool_call_id);
+    const childExecutionId = text(link.child_execution_id);
+    if (!parentTurnId || !parentTurnIds.has(parentTurnId) || !sourceToolCallId || !childExecutionId) continue;
+    const childConversationId = text(childrenById.get(childExecutionId)?.child_conversation_id);
+    if (childConversationId) result[sourceToolCallId] = childConversationId;
+  }
+  return result;
 }
 
 export function reliableActiveConversationId(projections: Record<string, unknown>): string {
@@ -632,6 +660,7 @@ function transientSequenceAnchor(input: {
 }
 
 function transientMessageContent(transient: ReliableKernelTransientState): MessageContent {
+  if (transient.completedContent) return transient.completedContent;
   const parts: MessageContent['parts'] = [];
   const thoughtActive = transient.thoughtActive === true;
   const meaningfulThoughtTiming = thoughtActive
@@ -1212,6 +1241,7 @@ function emptyProjection(): ReliableConversationProjection {
     fileDiffByToolCallId: {},
     fileDiffMemberIdsByToolCallId: {},
     fileChangeSetIdByToolCallId: {},
+    childConversationIdByToolCallId: {},
     loadingMessageRevisionIds: [],
     missingToolArgumentIds: [],
     missingToolResultIds: [],

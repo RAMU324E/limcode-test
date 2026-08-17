@@ -172,6 +172,9 @@ const toolDisplay = computed(() => resolveToolDisplay({
   checkpointTimelineAnchors: [],
   shadowRepositories: [],
   currentConversationId: reliableConversation.conversationId.value,
+  childConversationId: toolCall.value
+    ? reliableConversation.projection.value.childConversationIdByToolCallId[toolCall.value.id]
+    : undefined,
   planProposalId: reliablePlanProposalId.value,
   stringifyValue
 }));

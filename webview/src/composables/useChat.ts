@@ -900,10 +900,10 @@ export function useChat() {
     const profile = conversationId
       ? modelProfileStore.localProfileFor('conversation', conversationId).profile
       : undefined;
-    const providerConfigId = profile?.providerConfigId?.trim()
-      || globalSettings.llm.activeProviderConfigId
-      || globalSettings.activeLlmProviderConfig?.id
-      || '';
+    // Only a conversation-local selection is an explicit next-Turn override. Falling back to the
+    // global dropdown here would hide Agent/Workflow profiles, especially after opening a child
+    // conversation whose stable inherited selection has not reached this Webview snapshot yet.
+    const providerConfigId = profile?.providerConfigId?.trim() ?? '';
     const config = globalSettings.llmProviderConfigs.configs.find((candidate) => candidate.id === providerConfigId);
     const profileModel = profile?.providerConfigId?.trim() === config?.id ? profile?.model.trim() ?? '' : '';
     const model = profileModel && config && modelExists(config, profileModel)

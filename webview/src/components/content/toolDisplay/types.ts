@@ -73,6 +73,8 @@ export interface ToolDisplayContext {
   checkpointTimelineAnchors?: CheckpointTimelineAnchorRecord[];
   shadowRepositories?: ShadowRepositoryRecord[];
   currentConversationId?: string;
+  /** Child Conversation resolved from durable ChildExecutionParentLink/ChildExecution facts. */
+  childConversationId?: string;
   /** Reliable plan identity is derived independently from the Interaction request identity. */
   planProposalId?: string;
   stringifyValue(value: unknown): string;

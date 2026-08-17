@@ -1,33 +1,49 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watchEffect } from 'vue';
-import { IconChevronDown, IconChevronRight, IconPlayerStop, IconRobot } from '@tabler/icons-vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue';
+import { IconMessage2, IconPlayerStop, IconRobot, IconX } from '@tabler/icons-vue';
 import { BridgeMessageType } from '@shared/protocol';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
+import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import { bridge } from '@webview/transport';
 import {
   projectReliableAgentStatus,
-  type ReliableChildAgentGroup,
   type ReliableChildAgentStatus
 } from '@webview/domain/reliableAgentStatusProjection';
+
+interface TooltipRow {
+  label: string;
+  value: string;
+}
 
 const reliableConversation = useReliableConversation();
 const agentStore = useAgentStore();
 const { interruptPhase } = useChat();
-const expanded = ref(false);
+const open = ref(false);
+const selectedChildId = ref<string>();
+const rootRef = ref<HTMLElement | null>(null);
+const listScroller = ref<HTMLElement | null>(null);
+const detailScroller = ref<HTMLElement | null>(null);
 const interruptFeedback = ref<Record<string, {
   requestId: string;
   phase: 'submitting' | 'committed' | 'failed';
   message: string;
 }>>({});
 const interruptProjectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 const projection = computed(() => projectReliableAgentStatus({
   conversationId: reliableConversation.conversationId.value,
   records: reliableConversation.feed.records,
   agentNames: new Map(agentStore.agents.map((agent) => [agent.id, agent.name]))
 }));
+const entries = computed(() => projection.value.children);
+const selectedEntry = computed(() =>
+  entries.value.find((child) => child.id === selectedChildId.value) ?? entries.value[0]
+);
+const runningCount = computed(() => entries.value.filter((child) => child.group === 'executing').length);
 const activeTurn = computed(() => Object.values(reliableConversation.feed.records.Turn ?? {}).find((turn) =>
   turn.conversation_id === reliableConversation.conversationId.value && turn.status === 'active'
 ));
@@ -36,22 +52,60 @@ const activeLease = computed(() => activeTurn.value && Object.values(reliableCon
 const currentStatus = computed(() => interruptPhase.value
   ? interruptPhase.value === 'stopping' ? '正在停止' : '正在请求停止'
   : activeTurn.value && activeLease.value ? '执行中' : '空闲');
-const groups: Array<{ id: ReliableChildAgentGroup; label: string }> = [
-  { id: 'executing', label: '执行中' },
-  { id: 'resumable', label: '可继续' },
-  { id: 'attention', label: '需处理' },
-  { id: 'finished', label: '已结束' }
-];
+const panelSummary = computed(() => {
+  if (entries.value.length === 0) return `${projection.value.currentAgentName} · ${currentStatus.value} · 暂无子 Agent`;
+  return runningCount.value > 0
+    ? `${projection.value.currentAgentName} · ${currentStatus.value} · ${runningCount.value} 个运行中 / ${entries.value.length} 个子 Agent`
+    : `${projection.value.currentAgentName} · ${currentStatus.value} · ${entries.value.length} 个子 Agent`;
+});
+const listRefreshKey = computed(() => entries.value
+  .map((child) => `${child.id}:${child.lifecycle}:${child.updatedAt ?? ''}`)
+  .join('|'));
+const detailRefreshKey = computed(() => {
+  const child = selectedEntry.value;
+  if (!child) return 'empty';
+  const answer = child.answerSubmissionId
+    ? reliableConversation.feed.details[reliableKernelDetailKey('answer-content', child.answerSubmissionId)]
+    : undefined;
+  return `${child.id}:${child.updatedAt ?? ''}:${answer?.status ?? 'none'}:${answer?.totalBytes ?? 0}`;
+});
+
+watch(entries, (nextEntries) => {
+  if (nextEntries.length === 0) {
+    selectedChildId.value = undefined;
+    return;
+  }
+  if (!selectedChildId.value || !nextEntries.some((child) => child.id === selectedChildId.value)) {
+    selectedChildId.value = nextEntries[0].id;
+  }
+}, { immediate: true });
+
+watch(open, (isOpen) => {
+  if (!isOpen) return;
+  void nextTick(() => {
+    listScroller.value?.scrollTo({ top: 0 });
+    detailScroller.value?.scrollTo({ top: 0 });
+  });
+});
+
+watch(selectedChildId, () => {
+  if (!open.value) return;
+  void nextTick(() => detailScroller.value?.scrollTo({ top: 0 }));
+});
 
 watchEffect(() => {
-  if (!expanded.value) return;
-  for (const child of projection.value.children) {
+  if (!open.value) return;
+  for (const child of entries.value) {
     reliableConversation.feed.requestDetail('tool-arguments-content', child.sourceToolCallId, { priority: 'expanded' });
+  }
+  const submissionId = selectedEntry.value?.answerSubmissionId;
+  if (submissionId) {
+    reliableConversation.feed.requestDetail('answer-content', submissionId, { priority: 'expanded' });
   }
 });
 
 watchEffect(() => {
-  const childById = new Map(projection.value.children.map((child) => [child.id, child]));
+  const childById = new Map(entries.value.map((child) => [child.id, child]));
   for (const childId of Object.keys(interruptFeedback.value)) {
     const child = childById.get(childId);
     if (child && !['interrupting', 'interrupted', 'closed'].includes(child.lifecycle)) continue;
@@ -102,30 +156,95 @@ const disposeInterruptError = bridge.on(BridgeMessageType.Error, (message) => {
   });
 });
 
+onMounted(() => {
+  document.addEventListener('pointerdown', onDocumentPointerDown, true);
+  document.addEventListener('keydown', onDocumentKeydown);
+});
+
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+  document.removeEventListener('keydown', onDocumentKeydown);
   disposeInterruptResult();
   disposeInterruptError();
   for (const timer of interruptProjectionTimers.values()) clearTimeout(timer);
   interruptProjectionTimers.clear();
 });
 
-function childrenIn(group: ReliableChildAgentGroup): ReliableChildAgentStatus[] {
-  return projection.value.children.filter((child) => child.group === group);
+function toggleOpen(): void {
+  open.value = !open.value;
 }
 
-function taskTitle(child: ReliableChildAgentStatus): string | undefined {
+function closePanel(): void {
+  open.value = false;
+}
+
+function selectEntry(child: ReliableChildAgentStatus): void {
+  selectedChildId.value = child.id;
+}
+
+function openConversationForEntry(child: ReliableChildAgentStatus | undefined): void {
+  const conversationId = child?.conversationId.trim();
+  if (!conversationId) return;
+  const conversation = reliableConversation.feed.records.Conversation?.[conversationId];
+  const title = text(conversation?.title);
+  bridge.request(BridgeMessageType.ConversationOpen, {
+    conversationId,
+    ...(title ? { title } : {})
+  });
+  closePanel();
+}
+
+function onDocumentPointerDown(event: PointerEvent): void {
+  if (!open.value) return;
+  const target = event.target;
+  if (target instanceof Node && rootRef.value?.contains(target)) return;
+  closePanel();
+}
+
+function onDocumentKeydown(event: KeyboardEvent): void {
+  if (open.value && event.key === 'Escape') closePanel();
+}
+
+function taskText(child: ReliableChildAgentStatus): string {
   const detail = reliableConversation.feed.details[
     reliableKernelDetailKey('tool-arguments-content', child.sourceToolCallId)
   ];
-  if (detail?.status !== 'ready') return undefined;
+  if (!detail || detail.status === 'loading') return '正在加载任务…';
+  if (detail.status === 'error') return `任务加载失败：${detail.error?.trim() || '未知错误'}`;
   try {
     const value = JSON.parse(detail.text) as unknown;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    const prompt = (value as Record<string, unknown>).prompt;
-    return typeof prompt === 'string' && prompt.trim() ? truncate(prompt.replace(/\s+/g, ' ').trim(), 96) : undefined;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return detail.text || '(无任务内容)';
+    const args = value as Record<string, unknown>;
+    const task = text(args.prompt) ?? text(args.plan);
+    return task ?? JSON.stringify(value, null, 2);
   } catch {
-    return undefined;
+    return detail.text || '(无任务内容)';
   }
+}
+
+function taskPreview(child: ReliableChildAgentStatus): string {
+  return truncate(taskText(child).replace(/\s+/g, ' ').trim(), 88);
+}
+
+function answerContent(child: ReliableChildAgentStatus): string {
+  if (!child.answerBridgeId) return '尚未建立 AnswerBridge。';
+  if (!child.answerSubmissionId) {
+    return child.group === 'executing'
+      ? '子 Agent 仍在运行，尚未提交 Answer。'
+      : '该子 Agent 尚未提交 Answer。';
+  }
+  const detail = reliableConversation.feed.details[
+    reliableKernelDetailKey('answer-content', child.answerSubmissionId)
+  ];
+  if (!detail || detail.status === 'loading') return '正在加载 Answer 正文…';
+  if (detail.status === 'error') return `Answer 正文加载失败：${detail.error?.trim() || '未知错误'}`;
+  return detail.text || '(Answer 正文为空)';
+}
+
+function answerSummary(child: ReliableChildAgentStatus): string {
+  if (child.answerTitle) return child.answerTitle;
+  if (child.answerSubmissionId) return `已提交${child.answerSubmissionSeq ? ` · #${child.answerSubmissionSeq}` : ''}`;
+  return child.answerBridgeStatus ? `AnswerBridge ${statusText(child.answerBridgeStatus)}` : '尚未提交';
 }
 
 function deliveryLabel(child: ReliableChildAgentStatus): string | undefined {
@@ -134,33 +253,54 @@ function deliveryLabel(child: ReliableChildAgentStatus): string | undefined {
     : child.deliveryBadge === 'delivery_failed' ? '回答发送失败' : undefined;
 }
 
+function statusTone(child: ReliableChildAgentStatus): 'running' | 'done' | 'warning' | 'error' {
+  if (child.deliveryBadge === 'delivery_failed' || child.group === 'attention') return 'error';
+  if (child.group === 'executing') return 'running';
+  if (child.group === 'finished') return 'done';
+  return 'warning';
+}
+
+function statusTooltipRows(child: ReliableChildAgentStatus): TooltipRow[] {
+  return [
+    { label: '子 Agent', value: child.lifecycleLabel },
+    ...(child.turnStatus ? [{ label: '回合', value: statusText(child.turnStatus) }] : []),
+    ...(child.activitySummary ? [{ label: '当前活动', value: child.activitySummary }] : []),
+    ...(child.turnTerminationStatus ? [{ label: '结束', value: statusText(child.turnTerminationStatus) }] : []),
+    ...(child.answerBridgeStatus ? [{ label: 'Answer', value: statusText(child.answerBridgeStatus) }] : []),
+    ...(child.deliveryState ? [{ label: '发送', value: statusText(child.deliveryState) }] : []),
+    ...(child.parentHandlingState ? [{ label: '主 Agent', value: statusText(child.parentHandlingState) }] : [])
+  ];
+}
+
 function interruptChild(child: ReliableChildAgentStatus): void {
+  selectedChildId.value = child.id;
   const current = interruptFeedback.value[child.id];
   if (!child.interruptible || current?.phase === 'submitting' || current?.phase === 'committed') return;
   clearInterruptProjectionTimer(child.id);
   const requestId = bridge.request(BridgeMessageType.ToolExecutionCancel, {
     toolCallId: child.sourceToolCallId,
     conversationId: reliableConversation.conversationId.value,
-    reason: '用户从 Agent 运行情况面板请求终止该子 Agent 及其启动的所有子 Agent。'
+    reason: '用户从 Agent 运行情况面板请求终止该 Agent 及其启动的所有子 Agent。'
   });
   setInterruptFeedback(child.id, { requestId, phase: 'submitting', message: '正在提交终止请求' });
+}
+
+function showInterruptAction(child: ReliableChildAgentStatus): boolean {
+  return child.interruptible
+    || child.lifecycle === 'interrupting'
+    || Boolean(interruptFeedback.value[child.id]);
 }
 
 function interruptButtonLabel(child: ReliableChildAgentStatus): string {
   const feedback = interruptFeedback.value[child.id];
   if (child.lifecycle === 'interrupting' || feedback?.phase === 'committed') return '正在终止';
   if (feedback?.phase === 'submitting') return '正在提交';
-  return feedback?.phase === 'failed' ? '重试终止' : '全部终止';
+  return feedback?.phase === 'failed' ? '重试终止' : '终止';
 }
 
 function interruptButtonDisabled(child: ReliableChildAgentStatus): boolean {
   const phase = interruptFeedback.value[child.id]?.phase;
   return !child.interruptible || phase === 'submitting' || phase === 'committed';
-}
-
-function interruptError(child: ReliableChildAgentStatus): string | undefined {
-  const feedback = interruptFeedback.value[child.id];
-  return feedback?.phase === 'failed' ? feedback.message : undefined;
 }
 
 function setInterruptFeedback(
@@ -190,104 +330,552 @@ function clearInterruptProjectionTimer(childId: string): void {
   interruptProjectionTimers.delete(childId);
 }
 
+function formatTime(value: string | undefined): string {
+  if (!value) return '-';
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).format(timestamp);
+}
+
+function byteLengthLabel(value: string | undefined): string {
+  if (!value || !/^\d+$/.test(value)) return '-';
+  const bytes = Number(value);
+  if (!Number.isSafeInteger(bytes)) return `${value} B`;
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(bytes < 10_240 ? 1 : 0)} KiB`;
+}
+
+function statusText(value: string): string {
+  const labels: Record<string, string> = {
+    starting: '启动中',
+    active: '运行中',
+    idle: '可继续',
+    interrupting: '正在终止',
+    interrupted: '已终止',
+    closed: '已结束',
+    needs_human: '需要处理',
+    pending: '等待中',
+    delivering: '正在发送',
+    consumed: '已接收',
+    handled: '已处理',
+    unhandled: '待处理',
+    failed: '失败',
+    completed: '已完成',
+    cancelled: '已取消',
+    open: '已建立'
+  };
+  return labels[value] ?? value;
+}
+
 function truncate(value: string, limit: number): string {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 </script>
 
 <template>
-  <section class="agent-status-panel" data-testid="reliable-agent-status-panel">
+  <div ref="rootRef" class="agent-run-root" data-testid="reliable-agent-status-panel">
     <button
       type="button"
-      class="agent-status-summary"
-      :aria-expanded="expanded"
-      @click="expanded = !expanded"
+      class="agent-run-trigger"
+      :class="{ 'is-active': open, 'has-running': runningCount > 0 }"
+      :aria-label="`子 Agent 面板，${panelSummary}`"
+      :aria-expanded="open"
+      @click.stop="toggleOpen"
     >
-      <IconChevronDown v-if="expanded" class="agent-status-caret" aria-hidden="true" />
-      <IconChevronRight v-else class="agent-status-caret" aria-hidden="true" />
-      <IconRobot class="agent-status-icon" aria-hidden="true" />
-      <span class="agent-status-name">{{ projection.currentAgentName }}</span>
-      <span class="agent-status-main-state">{{ currentStatus }}</span>
-      <span v-if="projection.children.length" class="agent-status-count">{{ projection.children.length }} 个子 Agent</span>
+      <IconRobot class="agent-run-trigger-icon" stroke="2" aria-hidden="true" />
+      <span v-if="entries.length" class="agent-run-count">{{ entries.length }}</span>
     </button>
-    <div v-if="expanded" class="agent-status-groups">
-      <template v-for="group in groups" :key="group.id">
-        <section v-if="childrenIn(group.id).length" class="agent-status-group">
-          <h4>{{ group.label }} · {{ childrenIn(group.id).length }}</h4>
-          <div v-for="child in childrenIn(group.id)" :key="child.id" class="agent-status-child">
-            <div class="agent-status-child-head">
-              <span class="agent-status-child-name">{{ child.agentName }}</span>
-              <span class="agent-status-lifecycle">{{ child.lifecycleLabel }}</span>
-              <span v-if="deliveryLabel(child)" class="agent-status-delivery" :class="`is-${child.deliveryBadge}`">{{ deliveryLabel(child) }}</span>
+
+    <section v-if="open" class="agent-run-panel" role="dialog" aria-label="子 Agent 面板">
+      <header class="agent-run-header">
+        <div class="agent-run-title">
+          <span>子 Agent</span>
+          <span>{{ panelSummary }}</span>
+        </div>
+        <div class="agent-run-header-actions">
+          <button
+            v-if="selectedEntry && showInterruptAction(selectedEntry)"
+            type="button"
+            class="agent-run-action-button"
+            :disabled="selectedEntry ? interruptButtonDisabled(selectedEntry) : true"
+            :aria-label="selectedEntry ? `${interruptButtonLabel(selectedEntry)} ${selectedEntry.agentName}` : '终止子 Agent'"
+            @click.stop="selectedEntry && interruptChild(selectedEntry)"
+          >
+            <IconPlayerStop aria-hidden="true" />
+            <span>{{ selectedEntry ? interruptButtonLabel(selectedEntry) : '终止' }}</span>
+          </button>
+          <button type="button" class="agent-run-close" aria-label="关闭子 Agent 面板" @click="closePanel">
+            <IconX stroke="2" aria-hidden="true" />
+          </button>
+        </div>
+      </header>
+
+      <div v-if="entries.length" class="agent-run-body">
+        <div class="agent-run-list-shell">
+          <div ref="listScroller" class="agent-run-list">
+            <div
+              v-for="child in entries"
+              :key="child.id"
+              class="agent-run-item"
+              :class="{
+                'is-selected': selectedEntry?.id === child.id,
+                'has-stop-action': showInterruptAction(child)
+              }"
+            >
               <button
-                v-if="child.interruptible || child.lifecycle === 'interrupting' || interruptFeedback[child.id]"
                 type="button"
-                class="agent-status-stop"
+                class="agent-run-item-select"
+                :aria-label="`查看 ${child.agentName} 的运行详情`"
+                @click="selectEntry(child)"
+              >
+                <span class="agent-run-item-top">
+                  <span class="agent-run-status" :class="`is-${statusTone(child)}`">{{ child.lifecycleLabel }}</span>
+                  <span class="agent-run-target">{{ child.agentName }}</span>
+                </span>
+                <span v-if="child.activitySummary" class="agent-run-activity">{{ child.activitySummary }}</span>
+                <span class="agent-run-preview">{{ taskPreview(child) }}</span>
+                <span class="agent-run-subline">{{ formatTime(child.createdAt) }} · {{ child.id }}</span>
+                <span v-if="deliveryLabel(child)" class="agent-run-answer-line" :class="{ 'is-error': child.deliveryBadge === 'delivery_failed' }">
+                  {{ deliveryLabel(child) }}
+                </span>
+              </button>
+              <button
+                v-if="showInterruptAction(child)"
+                type="button"
+                class="agent-run-item-stop"
                 :disabled="interruptButtonDisabled(child)"
-                :title="`${interruptButtonLabel(child)}：终止该 Agent 及其启动的所有子 Agent`"
-                :aria-label="`${interruptButtonLabel(child)} ${child.agentName}`"
-                @click="interruptChild(child)"
+                :aria-label="`${interruptButtonLabel(child)} ${child.agentName} 对话及其下级子 Agent；不影响其他同级子 Agent`"
+                @click.stop="interruptChild(child)"
               >
                 <IconPlayerStop aria-hidden="true" />
                 <span>{{ interruptButtonLabel(child) }}</span>
               </button>
             </div>
-            <p v-if="child.activitySummary" class="agent-status-activity">
-              <span>当前</span>{{ child.activitySummary }}
-            </p>
-            <p v-if="taskTitle(child)" class="agent-status-task"><span>任务</span>{{ taskTitle(child) }}</p>
-            <p v-if="interruptError(child)" class="agent-status-error" role="status">{{ interruptError(child) }}</p>
           </div>
-        </section>
-      </template>
-      <p v-if="projection.children.length === 0" class="agent-status-empty">暂无子 Agent。</p>
-    </div>
-  </section>
+          <AdvancedScrollbar :scroller="listScroller" :refresh-key="listRefreshKey" variant="minimal" />
+        </div>
+
+        <article v-if="selectedEntry" class="agent-run-detail">
+          <header class="agent-run-detail-header">
+            <span class="agent-run-detail-main">
+              <HoverTooltipPanel
+                class="agent-run-status"
+                :class="`is-${statusTone(selectedEntry)}`"
+                :aria-label="`子 Agent 状态：${selectedEntry.lifecycleLabel}`"
+                panel-title="可靠运行状态"
+                :rows="statusTooltipRows(selectedEntry)"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                tabindex="0"
+              >
+                <span>{{ selectedEntry.lifecycleLabel }}</span>
+              </HoverTooltipPanel>
+              <span class="agent-run-detail-id">{{ selectedEntry.id }}</span>
+            </span>
+            <button
+              type="button"
+              class="agent-run-open-conversation"
+              :aria-label="`打开对话 ${selectedEntry.conversationId}`"
+              @click="openConversationForEntry(selectedEntry)"
+            >
+              <IconMessage2 stroke="2" aria-hidden="true" />
+              <span>打开对话</span>
+            </button>
+          </header>
+
+          <div class="agent-run-detail-scroll-shell">
+            <div ref="detailScroller" class="agent-run-detail-scroll">
+              <section class="agent-run-detail-section">
+                <h3>运行状态</h3>
+                <dl class="agent-run-param-grid">
+                  <dt>子 Agent</dt><dd>{{ selectedEntry.lifecycleLabel }} ({{ selectedEntry.lifecycle }})</dd>
+                  <dt>当前回合</dt><dd>{{ selectedEntry.turnStatus ? `${statusText(selectedEntry.turnStatus)} (${selectedEntry.turnStatus})` : '-' }}</dd>
+                  <dt>当前活动</dt><dd>{{ selectedEntry.activitySummary || statusText(selectedEntry.activityKind || 'idle') }}</dd>
+                  <dt>回合结束</dt><dd>{{ selectedEntry.turnTerminationStatus ? `${statusText(selectedEntry.turnTerminationStatus)} (${selectedEntry.turnTerminationStatus})` : '-' }}</dd>
+                  <dt>AnswerBridge</dt><dd>{{ selectedEntry.answerBridgeStatus ? `${statusText(selectedEntry.answerBridgeStatus)} (${selectedEntry.answerBridgeStatus})` : '-' }}</dd>
+                  <dt>RuntimeDelivery</dt><dd>{{ selectedEntry.deliveryState ? `${statusText(selectedEntry.deliveryState)} (${selectedEntry.deliveryState})` : '-' }}</dd>
+                  <dt>主 Agent 处理</dt><dd>{{ selectedEntry.parentHandlingState ? `${statusText(selectedEntry.parentHandlingState)} (${selectedEntry.parentHandlingState})` : '-' }}</dd>
+                  <dt>开始</dt><dd>{{ formatTime(selectedEntry.createdAt) }}</dd>
+                  <dt>更新</dt><dd>{{ formatTime(selectedEntry.updatedAt) }}</dd>
+                </dl>
+                <p v-if="selectedEntry.turnTerminationReason" class="agent-run-state-note">{{ selectedEntry.turnTerminationReason }}</p>
+                <p v-if="selectedEntry.deliveryFailureReason" class="agent-run-state-note is-error">{{ selectedEntry.deliveryFailureReason }}</p>
+                <p v-if="interruptFeedback[selectedEntry.id]" class="agent-run-state-note" :class="{ 'is-error': interruptFeedback[selectedEntry.id].phase === 'failed' }" role="status">
+                  {{ interruptFeedback[selectedEntry.id].message }}
+                </p>
+              </section>
+
+              <section class="agent-run-detail-section">
+                <h3>身份与关系</h3>
+                <dl class="agent-run-param-grid">
+                  <dt>Agent ID</dt><dd>{{ selectedEntry.agentId || '-' }}</dd>
+                  <dt>ChildExecution ID</dt><dd>{{ selectedEntry.id }}</dd>
+                  <dt>Conversation ID</dt><dd>{{ selectedEntry.conversationId }}</dd>
+                  <dt>Parent Turn ID</dt><dd>{{ selectedEntry.parentTurnId }}</dd>
+                  <dt>Child Turn ID</dt><dd>{{ selectedEntry.turnId || '-' }}</dd>
+                  <dt>Source Tool Call ID</dt><dd>{{ selectedEntry.sourceToolCallId }}</dd>
+                  <dt>Parent ChildExecution ID</dt><dd>{{ selectedEntry.parentChildExecutionId || '-' }}</dd>
+                  <dt>Executor Agent ID</dt><dd>{{ selectedEntry.executorAgentId || '-' }}</dd>
+                  <dt>Activity Tool Call ID</dt><dd>{{ selectedEntry.activityToolCallId || '-' }}</dd>
+                  <dt>Activity Model Request ID</dt><dd>{{ selectedEntry.activityModelRequestId || '-' }}</dd>
+                </dl>
+              </section>
+
+              <section class="agent-run-detail-section">
+                <h3>任务</h3>
+                <pre>{{ taskText(selectedEntry) }}</pre>
+              </section>
+
+              <section class="agent-run-detail-section">
+                <h3>Answer</h3>
+                <p class="agent-run-answer-summary">{{ answerSummary(selectedEntry) }}</p>
+                <dl class="agent-run-param-grid agent-run-answer-grid">
+                  <dt>AnswerBridge ID</dt><dd>{{ selectedEntry.answerBridgeId || '-' }}</dd>
+                  <dt>Submission ID</dt><dd>{{ selectedEntry.answerSubmissionId || '-' }}</dd>
+                  <dt>Submission Turn ID</dt><dd>{{ selectedEntry.answerSubmissionTurnId || '-' }}</dd>
+                  <dt>Payload ID</dt><dd>{{ selectedEntry.answerPayloadId || '-' }}</dd>
+                  <dt>RuntimeDelivery ID</dt><dd>{{ selectedEntry.deliveryId || '-' }}</dd>
+                  <dt>提交时间</dt><dd>{{ formatTime(selectedEntry.answerSubmittedAt) }}</dd>
+                  <dt>正文大小</dt><dd>{{ byteLengthLabel(selectedEntry.answerByteLength) }}</dd>
+                  <dt>中断提交</dt><dd>{{ selectedEntry.answerSubmissionInterrupted === undefined ? '-' : selectedEntry.answerSubmissionInterrupted ? '是' : '否' }}</dd>
+                </dl>
+                <pre class="agent-run-answer-content">{{ answerContent(selectedEntry) }}</pre>
+              </section>
+            </div>
+            <AdvancedScrollbar :scroller="detailScroller" :refresh-key="detailRefreshKey" variant="minimal" />
+          </div>
+        </article>
+      </div>
+
+      <div v-else class="agent-run-empty">暂无子 Agent。</div>
+    </section>
+  </div>
 </template>
 
 <style scoped>
-.agent-status-panel {
-  width: 100%;
-  border: 1px solid var(--vscode-panel-border, transparent);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-foreground) 6%);
+.agent-run-root {
+  position: relative;
+  flex: 0 0 auto;
 }
 
-.agent-status-summary {
-  width: 100%;
-  min-height: 26px;
-  padding: 3px var(--space-2);
+.agent-run-trigger {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+}
+
+.agent-run-trigger:hover,
+.agent-run-trigger:focus-visible,
+.agent-run-trigger.is-active {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-panel-border, transparent);
+  background: var(--vscode-list-hoverBackground, transparent);
+  outline: none;
+}
+
+.agent-run-trigger.has-running .agent-run-trigger-icon {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.agent-run-trigger-icon { width: 16px; height: 16px; }
+
+.agent-run-count {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  border: 1px solid var(--vscode-editor-background);
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 68%, var(--vscode-editor-background) 32%);
+  font-size: 9px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-run-panel {
+  position: absolute;
+  right: calc(100% + 8px);
+  bottom: 0;
+  z-index: 40;
+  width: min(760px, calc(100vw - 58px));
+  height: min(430px, calc(100vh - 120px));
+  min-height: 260px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.32));
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-foreground) 6%);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
+  overflow: hidden;
+}
+
+.agent-run-header {
+  min-height: 38px;
+  padding: 7px 8px 7px 10px;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.28));
   display: flex;
   align-items: center;
-  gap: var(--space-1);
-  border: 0;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agent-run-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: var(--font-size-sm);
+  line-height: 1.25;
+}
+
+.agent-run-title span:first-child { font-weight: 600; }
+.agent-run-title span:last-child { color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); }
+.agent-run-header-actions { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; }
+
+.agent-run-action-button {
+  height: 24px;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.32));
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
   color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%);
+  font-size: var(--font-size-xs);
+  line-height: 1;
+}
+
+.agent-run-action-button svg { width: 13px; height: 13px; }
+.agent-run-action-button:not(:disabled):hover,
+.agent-run-action-button:not(:disabled):focus-visible { color: var(--vscode-errorForeground, #f48771); border-color: currentColor; outline: none; }
+.agent-run-action-button:disabled { opacity: .62; cursor: default; }
+
+.agent-run-close {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+}
+
+.agent-run-close:hover,
+.agent-run-close:focus-visible { color: var(--vscode-foreground); border-color: var(--vscode-panel-border, transparent); background: var(--vscode-list-hoverBackground, transparent); outline: none; }
+.agent-run-close :deep(svg) { width: 16px; height: 16px; }
+
+.agent-run-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(190px, 0.42fr) minmax(260px, 0.58fr);
+}
+
+.agent-run-list-shell,
+.agent-run-detail-scroll-shell { position: relative; min-height: 0; }
+
+.agent-run-list {
+  height: 100%;
+  min-height: 0;
+  padding: 6px;
+  border-right: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.22));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.agent-run-list::-webkit-scrollbar,
+.agent-run-detail-scroll::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+.agent-run-item {
+  position: relative;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+}
+
+.agent-run-item:hover,
+.agent-run-item:focus-within,
+.agent-run-item.is-selected {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-panel-border, transparent);
+  background: var(--vscode-list-hoverBackground, transparent);
+  outline: none;
+}
+
+.agent-run-item-select {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: inherit;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: inherit;
   background: transparent;
   text-align: left;
 }
 
-.agent-status-summary:hover { background: var(--vscode-list-hoverBackground, transparent); }
-.agent-status-caret, .agent-status-icon { width: 14px; height: 14px; flex: 0 0 auto; }
-.agent-status-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.agent-status-main-state { color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); }
-.agent-status-count { margin-left: auto; color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); }
-.agent-status-groups { padding: 0 var(--space-2) var(--space-2); display: grid; gap: var(--space-2); }
-.agent-status-group h4 { margin: 0 0 3px; color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); font-weight: 600; }
-.agent-status-child { min-width: 0; padding: 3px 0; font-size: var(--font-size-sm); }
-.agent-status-child + .agent-status-child { border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border, transparent) 55%, transparent); }
-.agent-status-child-head { display: flex; align-items: center; gap: var(--space-1); min-height: 22px; }
-.agent-status-child-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-status-lifecycle { color: var(--vscode-descriptionForeground); }
-.agent-status-delivery { padding: 0 4px; border-radius: 999px; color: var(--vscode-editorWarning-foreground, #cca700); background: color-mix(in srgb, currentColor 12%, transparent); }
-.agent-status-delivery.is-delivery_failed { color: var(--vscode-errorForeground, #f48771); }
-.agent-status-stop { margin-left: auto; min-height: 20px; padding: 1px 5px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid var(--vscode-panel-border, transparent); border-radius: var(--radius-sm); color: var(--vscode-descriptionForeground); background: transparent; font: inherit; }
-.agent-status-stop svg { width: 12px; height: 12px; }
-.agent-status-stop:not(:disabled):hover, .agent-status-stop:not(:disabled):focus-visible { color: var(--vscode-errorForeground, #f48771); border-color: currentColor; background: color-mix(in srgb, currentColor 9%, transparent); }
-.agent-status-stop:disabled { opacity: .62; cursor: default; }
-.agent-status-activity, .agent-status-task, .agent-status-error { min-width: 0; margin: 2px 0 0; display: flex; gap: var(--space-1); line-height: 1.35; }
-.agent-status-activity { color: var(--vscode-foreground); }
-.agent-status-task { color: var(--vscode-descriptionForeground); }
-.agent-status-activity span, .agent-status-task span { flex: 0 0 auto; color: var(--vscode-descriptionForeground); }
-.agent-status-error { color: var(--vscode-errorForeground, #f48771); }
-.agent-status-empty { margin: 0; color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); }
+.agent-run-item.has-stop-action .agent-run-item-select { padding-right: 64px; }
+.agent-run-item-select:focus-visible { outline: none; }
+
+.agent-run-item-stop {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 1;
+  min-height: 22px;
+  padding: 2px 5px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.32));
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 90%, var(--vscode-foreground) 10%);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.agent-run-item-stop svg { width: 12px; height: 12px; }
+.agent-run-item-stop:not(:disabled):hover,
+.agent-run-item-stop:not(:disabled):focus-visible {
+  color: var(--vscode-errorForeground, #f48771);
+  border-color: currentColor;
+  background: color-mix(in srgb, currentColor 8%, var(--vscode-editor-background) 92%);
+  outline: none;
+}
+.agent-run-item-stop:disabled { opacity: .62; cursor: default; }
+.agent-run-item-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+
+.agent-run-status {
+  flex: 0 0 auto;
+  min-width: 48px;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.agent-run-status.is-running { color: var(--vscode-editorWarning-foreground, #cca700); }
+.agent-run-status.is-done { color: var(--vscode-testing-iconPassed, #73c991); }
+.agent-run-status.is-warning { color: var(--vscode-editorWarning-foreground, #cca700); }
+.agent-run-status.is-error { color: var(--vscode-errorForeground, #f48771); }
+.agent-run-status:focus-visible { outline: 1px solid var(--vscode-focusBorder, currentColor); outline-offset: 1px; }
+
+.agent-run-target,
+.agent-run-activity,
+.agent-run-preview,
+.agent-run-subline,
+.agent-run-answer-line { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-run-target { color: var(--vscode-foreground); font-weight: 500; }
+.agent-run-activity { color: var(--vscode-foreground); font-size: var(--font-size-sm); }
+.agent-run-preview { font-size: var(--font-size-sm); }
+.agent-run-subline,
+.agent-run-answer-line { color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); font-variant-numeric: tabular-nums; }
+.agent-run-answer-line.is-error { color: var(--vscode-errorForeground, #f48771); }
+
+.agent-run-detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.agent-run-detail-header { min-height: 36px; padding: 7px 10px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.18)); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.agent-run-detail-main { min-width: 0; display: inline-flex; align-items: center; gap: 8px; }
+.agent-run-detail-id { min-width: 0; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-xs); font-family: var(--font-family-mono); }
+
+.agent-run-open-conversation {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.32));
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  font-size: var(--font-size-xs);
+  line-height: 1.2;
+}
+
+.agent-run-open-conversation:hover,
+.agent-run-open-conversation:focus-visible { color: var(--vscode-foreground); border-color: color-mix(in srgb, var(--vscode-foreground) 28%, transparent); background: var(--vscode-list-hoverBackground, transparent); outline: none; }
+.agent-run-open-conversation :deep(svg) { width: 14px; height: 14px; }
+.agent-run-detail-scroll-shell { flex: 1; }
+.agent-run-detail-scroll { height: 100%; padding: 10px; overflow-y: auto; scrollbar-width: none; }
+.agent-run-detail-section { margin-bottom: 14px; }
+.agent-run-detail-section h3 { margin: 0 0 6px; color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+
+.agent-run-detail-section pre {
+  margin: 0;
+  max-height: 188px;
+  padding: 8px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.24));
+  border-radius: var(--radius-sm);
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
+.agent-run-param-grid { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; margin: 0; color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); }
+.agent-run-param-grid dt { color: var(--vscode-descriptionForeground); }
+.agent-run-param-grid dd { min-width: 0; margin: 0; color: var(--vscode-foreground); overflow-wrap: anywhere; font-family: var(--font-family-mono); }
+.agent-run-answer-grid { margin-bottom: 8px; }
+.agent-run-answer-summary { margin: 0 0 6px; color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); }
+.agent-run-state-note { margin: 7px 0 0; color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); line-height: 1.4; }
+.agent-run-state-note.is-error { color: var(--vscode-errorForeground, #f48771); }
+.agent-run-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--vscode-descriptionForeground); font-size: var(--font-size-sm); }
+
+@media (max-width: 620px) {
+  .agent-run-panel { width: min(760px, calc(100vw - 112px)); }
+  .agent-run-body { grid-template-columns: minmax(104px, 0.38fr) minmax(0, 0.62fr); }
+  .agent-run-item.has-stop-action .agent-run-item-select { padding-right: 36px; }
+  .agent-run-item-stop { width: 22px; padding-inline: 0; }
+  .agent-run-item-stop span { display: none; }
+  .agent-run-param-grid { grid-template-columns: 1fr; gap: 2px; }
+  .agent-run-param-grid dd { margin-bottom: 4px; }
+}
 </style>

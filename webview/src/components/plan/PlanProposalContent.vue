@@ -369,6 +369,7 @@ function agentTypeDescription(agent: AgentRecord): string {
             <span>已交给 {{ delegatedExecution.agentType || delegatedExecution.agentId || 'Agent' }} 执行</span>
           </header>
           <dl class="plan-delegation-metadata">
+            <div v-if="delegatedExecution.childExecutionId"><dt>子执行 ID</dt><dd>{{ delegatedExecution.childExecutionId }}</dd></div>
             <div v-if="delegatedExecution.runId"><dt>运行 ID</dt><dd>{{ delegatedExecution.runId }}</dd></div>
             <div v-if="delegatedExecution.conversationId"><dt>对话 ID</dt><dd>{{ delegatedExecution.conversationId }}</dd></div>
             <div v-if="delegatedExecution.answerBridgeId"><dt>回答通道 ID</dt><dd>{{ delegatedExecution.answerBridgeId }}</dd></div>
@@ -428,7 +429,7 @@ function agentTypeDescription(agent: AgentRecord): string {
         <IconPencilMinus class="plan-action-icon" stroke="2" aria-hidden="true" />
         <span>{{ submitting === 'changes' ? '正在提交…' : changeFeedbackOpen ? '提交修改要求' : '要求修改' }}</span>
       </button>
-      <button v-if="!interactionView" type="button" class="plan-action secondary" :disabled="!!submitting || !dispatchAgentOptions.length" @click="openDispatchPanel">
+      <button type="button" class="plan-action secondary" :disabled="!!submitting || !dispatchAgentOptions.length" @click="openDispatchPanel">
         <IconMessagePlus class="plan-action-icon" stroke="2" aria-hidden="true" />
         <span>{{ submitting === 'approve-new' ? '正在分派…' : '新开对话执行' }}</span>
       </button>
@@ -440,7 +441,7 @@ function agentTypeDescription(agent: AgentRecord): string {
   </section>
 
   <ConfirmPanel
-    :open="dispatchPanelOpen && !interactionView"
+    :open="dispatchPanelOpen"
     title="选择执行 Agent"
     description="将创建一个独立的子 Agent 对话，并在后台执行已批准的 Plan。"
     :actions="dispatchPanelActions"
