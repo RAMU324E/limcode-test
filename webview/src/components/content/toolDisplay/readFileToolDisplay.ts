@@ -5,6 +5,8 @@ type ReadFileMode = 'text' | 'attachment';
 
 interface ReadFileArgs {
   path?: string;
+  attachmentId?: string;
+  pages?: string;
   mode?: ReadFileMode;
   startLine?: number;
   endLine?: number;
@@ -17,11 +19,20 @@ interface ReadFileLineRecord {
 
 interface ReadFileOutputRecord {
   path?: string;
+  attachmentId?: string;
+  name?: string;
   startLine?: number;
   endLine?: number;
   totalLines?: number;
   lines?: unknown;
   content?: unknown;
+  contentTruncated?: unknown;
+  omittedChars?: unknown;
+  requestedPages?: unknown;
+  returnedPages?: unknown;
+  totalPages?: unknown;
+  hasMore?: unknown;
+  nextPages?: unknown;
   mimeType?: unknown;
   sizeBytes?: unknown;
 }
@@ -40,12 +51,18 @@ export const readFileToolDisplay: ToolDisplayResolver = (context) => {
 
 function readFileInputSections(args: ReadFileArgs, context: ToolDisplayContext): ToolDisplaySection[] | undefined {
   const path = normalizePath(args.path);
-  if (!path) return undefined;
+  const attachmentId = normalizedText(args.attachmentId);
+  if (!path && !attachmentId) return undefined;
 
   const rows = parameterRows([
-    { label: '路径', value: path },
-    { label: '读取方式', value: args.mode === 'attachment' ? '附件' : '文本' },
-    { label: '行范围', value: args.mode === 'attachment' ? undefined : lineRangeText(args.startLine, args.endLine) }
+    { label: '路径', value: path || undefined },
+    { label: '附件编号', value: attachmentId },
+    { label: '页范围', value: args.pages },
+    {
+      label: '读取方式',
+      value: attachmentId ? '历史附件（自动识别）' : args.mode === 'attachment' ? '附件' : '文本'
+    },
+    { label: '行范围', value: !attachmentId && args.mode !== 'attachment' ? lineRangeText(args.startLine, args.endLine) : undefined }
   ]);
 
   return rows.length > 0
@@ -59,13 +76,18 @@ function readFileOutputSections(args: ReadFileArgs, context: ToolDisplayContext)
   const output = toolOutput(context.result);
   const record = outputRecord(output);
   const path = normalizePath(record?.path) || normalizePath(args.path);
+  const attachmentId = normalizedText(record?.attachmentId) || normalizedText(args.attachmentId);
+  const displaySource = path || normalizedText(record?.name) || attachmentId;
   const mode: ReadFileMode = attachmentOutput(record) ? 'attachment' : args.mode ?? 'text';
   const modeSuffix = `[${mode}]`;
-  const rangeSuffix = mode === 'attachment'
+  const pagesSuffix = normalizedText(record?.returnedPages) || args.pages
+    ? `[pages ${normalizedText(record?.returnedPages) ?? args.pages}]`
+    : '';
+  const rangeSuffix = mode === 'attachment' || attachmentId
     ? ''
     : lineRangeSuffix(record?.startLine ?? args.startLine, record?.endLine ?? args.endLine);
-  const title = path
-    ? `读取结果 · ${path}${modeSuffix}${rangeSuffix}`
+  const title = displaySource
+    ? `读取结果 · ${displaySource}${modeSuffix}${pagesSuffix}${rangeSuffix}`
     : '读取结果';
 
   const section = readFileOutputSection(title, output);
@@ -79,6 +101,8 @@ function readFileArgs(value: unknown): ReadFileArgs {
   if (!record) return {};
   return {
     path: stringValue(record.path),
+    attachmentId: normalizedText(record.attachmentId),
+    pages: normalizedText(record.pages),
     mode: readFileMode(record.mode),
     startLine: numberValue(record.startLine),
     endLine: numberValue(record.endLine)
@@ -102,12 +126,26 @@ function readFileOutputSection(title: string, output: unknown): ToolDisplaySecti
   if (attachmentOutput(record)) {
     const rows = parameterRows([
       { label: '文件类型', value: stringValue(record.mimeType) },
-      { label: '大小', value: attachmentSizeText(record.sizeBytes) }
+      { label: '大小', value: attachmentSizeText(record.sizeBytes) },
+      { label: '请求页范围', value: normalizedText(record.requestedPages) },
+      { label: '实际页范围', value: normalizedText(record.returnedPages) },
+      { label: '总页数', value: integerText(record.totalPages) },
+      { label: '下一范围', value: normalizedText(record.nextPages) }
     ]);
     return rows.length > 0 ? { kind: 'output', title, rows, rowStyle: 'keyValue' } : undefined;
   }
 
-  return typeof record.content === 'string' ? { kind: 'output', title, text: record.content } : undefined;
+  if (typeof record.content === 'string') {
+    const omittedChars = numberValue(record.omittedChars);
+    const pageSummary = normalizedText(record.returnedPages)
+      ? `\n\n[实际页范围 ${normalizedText(record.returnedPages)} / 共 ${integerText(record.totalPages) ?? '?'} 页${normalizedText(record.nextPages) ? `；下一范围 ${normalizedText(record.nextPages)}` : ''}]`
+      : '';
+    const truncationSummary = record.contentTruncated === true
+      ? `\n\n[内容已截断${omittedChars !== undefined ? `，省略 ${omittedChars} 个字符` : ''}]`
+      : '';
+    return { kind: 'output', title, text: `${record.content}${pageSummary}${truncationSummary}` };
+  }
+  return undefined;
 }
 
 function outputRecord(value: unknown): ReadFileOutputRecord | undefined {
@@ -172,17 +210,28 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+function normalizedText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
 function readFileMode(value: unknown): ReadFileMode | undefined {
   return value === 'text' || value === 'attachment' ? value : undefined;
 }
 
 function attachmentOutput(record: ReadFileOutputRecord | undefined): boolean {
-  return typeof record?.mimeType === 'string' && typeof record?.sizeBytes === 'number';
+  return typeof record?.mimeType === 'string'
+    && typeof record?.sizeBytes === 'number'
+    && typeof record?.content !== 'string';
 }
 
 function attachmentSizeText(value: unknown): string | undefined {
   const size = numberValue(value);
   return size === undefined ? undefined : `${size} bytes`;
+}
+
+function integerText(value: unknown): string | undefined {
+  const number = numberValue(value);
+  return number === undefined ? undefined : String(Math.floor(number));
 }
 
 function numberValue(value: unknown): number | undefined {

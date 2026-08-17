@@ -16,6 +16,8 @@ import type { ToolSchedulingResolver } from './schedulingContract';
 export interface ToolAttachmentCapability {
   /** Returns a metadata-only managed reference. Provider preparation resolves bytes on demand. */
   reference(attachmentId: string): Promise<InlineDataPart>;
+  /** Resolves immutable bytes only when a tool must inspect the attachment body itself. */
+  resolve?(attachmentId: string): Promise<InlineDataPart>;
 }
 
 export interface ToolDeps {

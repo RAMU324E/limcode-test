@@ -58,7 +58,8 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
     if (!textBuffer) return;
     const buffer = textBuffer;
     textBuffer = undefined;
-    const text = buffer.parts.map((part) => part.text).join('');
+    const separator = buffer.kind === 'thought' ? '\n' : '';
+    const text = buffer.parts.map((part) => part.text).join(separator);
     const normalizedText = nodes.length === 0 && buffer.kind === 'text' ? text.trimStart() : text;
     const hasThoughtTiming = buffer.kind === 'thought' && buffer.parts.some((part) =>
       (typeof part.thoughtStartedAt === 'number' && Number.isFinite(part.thoughtStartedAt) && part.thoughtStartedAt > 0)

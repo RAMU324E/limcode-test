@@ -55,6 +55,7 @@ export interface VscodeReliableToolHostOptions {
   cancelTurnWaits?: (input: { turnId: string; reason: string }) => Promise<void>;
   quiesce?: (reason: ExecutionHandoffError) => Promise<void>;
   resolveAttachmentReference?: (attachmentId: string) => Promise<import('../../../shared/protocol').InlineDataPart>;
+  resolveAttachmentContent?: (attachmentId: string) => Promise<import('../../../shared/protocol').InlineDataPart>;
 }
 
 /** VS Code capability adapter only; Runtime lifecycle remains owned by ReliableToolDispatcher. */
@@ -186,7 +187,10 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       workEnvironment: this.workEnvironment,
       skills: this.skills,
       ...(this.options.resolveAttachmentReference ? {
-        attachments: { reference: this.options.resolveAttachmentReference }
+        attachments: {
+          reference: this.options.resolveAttachmentReference,
+          ...(this.options.resolveAttachmentContent ? { resolve: this.options.resolveAttachmentContent } : {})
+        }
       } : {})
     }, context);
   }

@@ -1,12 +1,25 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { PDFDocument } from 'pdf-lib';
 import { AttachmentIngestService } from '../../dist/extension/backend/reliableKernel/attachmentIngest.js';
 import {
   collectAttachmentCatalogFromStoredItems,
   renderAttachmentCatalog
 } from '../../dist/extension/backend/reliableKernel/attachmentCatalog.js';
-import { readFileTool } from '../../dist/extension/backend/world/modules/tools/definitions/readFile/index.js';
+import {
+  compactReadFileToolArguments,
+  readFileTool,
+  readFileToolDescription,
+  readFileToolParameters
+} from '../../dist/extension/backend/world/modules/tools/definitions/readFile/index.js';
+import {
+  parseReadPageRange,
+  resolveReadPageRange
+} from '../../dist/extension/backend/world/modules/tools/definitions/readFile/pageRange.js';
+import {
+  splitReadTextPages
+} from '../../dist/extension/backend/world/modules/tools/definitions/readFile/textPages.js';
 
 const MIB = 1024 * 1024;
 const ATTACHMENT_LIMIT_BYTES = 20 * MIB;
@@ -62,6 +75,14 @@ function inlineAttachment(data, sizeBytes = undefined) {
       }
     }]
   };
+}
+
+async function createPdfBytes(pageCount) {
+  const pdf = await PDFDocument.create();
+  for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+    pdf.addPage([600 + pageNumber, 800]);
+  }
+  return Buffer.from(await pdf.save());
 }
 
 test('AttachmentIngest accepts an exact 20 MiB embedded attachment and externalizes it', async () => {
@@ -150,19 +171,85 @@ test('Attachment catalog keeps only lightweight immutable metadata across messag
   assert.ok(rendered);
   const text = rendered.parts[0].text;
   assert.match(text, /read/);
+  assert.match(text, /\{"attachmentId":"目录中的精确编号"\}/);
+  assert.match(text, /"pages":"1-4"/);
+  assert.match(text, /每次最多连续读取 4 页/);
+  assert.doesNotMatch(text, /"mode":"attachment"/);
   assert.match(text, /attachment-pdf-one/);
   assert.match(text, /attachment-image-two/);
   assert.doesNotMatch(text, /sha256|sourcePath|private|must-not-enter-catalog|data/);
 });
 
-test('read materializes an existing managed attachment by attachmentId without embedding bytes itself', async () => {
+test('read keeps path as the ordinary input and only exposes pages for managed TXT/PDF', () => {
+  const ordinary = readFileToolParameters(false, false);
+  assert.equal(ordinary.required, undefined);
+  assert.equal(Object.keys(ordinary.properties)[0], 'path');
+  assert.equal(ordinary.properties.attachmentId, undefined);
+  assert.equal(ordinary.properties.pages, undefined);
+  assert.doesNotMatch(readFileToolDescription(false, false), /attachmentId/);
+
+  const imageOnly = readFileToolParameters(true, false);
+  assert.match(imageOnly.properties.attachmentId.description, /Rare optional input/);
+  assert.equal(imageOnly.properties.pages, undefined);
+  assert.doesNotMatch(readFileToolDescription(true, false), /nextPages/);
+
+  const withPagedAttachments = readFileToolParameters(true, true);
+  assert.match(withPagedAttachments.properties.pages.description, /"N" or "N-M"/);
+  assert.match(readFileToolDescription(true, true), /at most 4 consecutive pages/);
+  assert.match(readFileToolDescription(true, true), /Never send an empty or invented attachmentId/);
+  assert.deepEqual(compactReadFileToolArguments({
+    attachmentId: '',
+    endLine: 0,
+    items: [],
+    mode: 'text',
+    pages: '',
+    path: 'src\\demo.ts',
+    startLine: 0
+  }), { path: 'src/demo.ts' });
+  assert.deepEqual(compactReadFileToolArguments({
+    attachmentId: ' attachment-one ',
+    endLine: 0,
+    items: [{}],
+    mode: 'attachment',
+    pages: '1 - 4',
+    path: '',
+    startLine: 0
+  }), { attachmentId: 'attachment-one', pages: '1-4' });
+});
+
+test('read page ranges reject ambiguous or oversized requests and report actual totals', () => {
+  assert.deepEqual(parseReadPageRange(' 2 - 5 '), {
+    ok: true,
+    range: { start: 2, end: 5, canonical: '2-5' }
+  });
+  assert.match(parseReadPageRange('0').error, /positive/);
+  assert.match(parseReadPageRange('4-2').error, /smaller/);
+  assert.match(parseReadPageRange('1-5').error, /at most 4/);
+  assert.match(parseReadPageRange('1,3').error, /N-M/);
+  assert.deepEqual(resolveReadPageRange('4-7', 5), {
+    ok: true,
+    range: {
+      requestedPages: '4-7',
+      returnedPages: '4-5',
+      start: 4,
+      end: 5,
+      totalPages: 5,
+      hasMore: false
+    }
+  });
+  assert.match(resolveReadPageRange('6', 5).error, /has 5 page/);
+});
+
+test('read copies only the requested real PDF pages and reports the next range', async () => {
+  const attachmentId = 'attachment-existing-pdf';
+  const sourceBytes = await createPdfBytes(6);
   const requested = [];
   const managed = {
     inlineData: {
-      attachmentId: 'attachment-existing-pdf',
+      attachmentId,
       name: 'existing.pdf',
       mimeType: 'application/pdf',
-      sizeBytes: 123_456,
+      sizeBytes: sourceBytes.byteLength,
       sha256: 'c'.repeat(64),
       storage: 'managed',
       status: 'available'
@@ -174,43 +261,235 @@ test('read materializes an existing managed attachment by attachmentId without e
     workEnvironment: {},
     skills: {},
     attachments: {
-      async reference(attachmentId) {
-        requested.push(attachmentId);
+      async reference(requestedId) {
+        requested.push(`reference:${requestedId}`);
         return structuredClone(managed);
+      },
+      async resolve(requestedId) {
+        requested.push(`resolve:${requestedId}`);
+        return { inlineData: { ...managed.inlineData, data: sourceBytes.toString('base64') } };
       }
     }
   };
   const context = { settingsSnapshot: { enableMultimodalTools: true }, emit() {} };
   const result = await readFileTool.execute(
-    { attachmentId: 'attachment-existing-pdf', mode: 'attachment', items: [{}] },
+    { attachmentId, pages: '2 - 5', items: [{}] },
     deps,
     context
   );
 
   assert.equal(result.ok, true);
-  assert.deepEqual(requested, ['attachment-existing-pdf']);
-  assert.deepEqual(result.output, {
-    attachmentId: 'attachment-existing-pdf',
-    name: 'existing.pdf',
-    mimeType: 'application/pdf',
-    sizeBytes: 123_456
-  });
-  assert.deepEqual(result.parts, [managed]);
-  assert.equal(result.parts[0].inlineData.data, undefined);
+  assert.deepEqual(requested, [`reference:${attachmentId}`, `resolve:${attachmentId}`]);
+  assert.equal(result.output.attachmentId, attachmentId);
+  assert.equal(result.output.name, 'existing.pdf');
+  assert.equal(result.output.mimeType, 'application/pdf');
+  assert.equal(result.output.sourceSizeBytes, sourceBytes.byteLength);
+  assert.equal(result.output.requestedPages, '2-5');
+  assert.equal(result.output.returnedPages, '2-5');
+  assert.equal(result.output.totalPages, 6);
+  assert.equal(result.output.hasMore, true);
+  assert.equal(result.output.nextPages, '6');
+  assert.equal(result.parts.length, 1);
+  assert.equal(result.parts[0].inlineData.attachmentId, undefined);
+  assert.equal(result.parts[0].inlineData.mimeType, 'application/pdf');
+  assert.equal(result.parts[0].inlineData.storage, 'embedded');
+  assert.equal(result.parts[0].inlineData.name, 'existing.pages-2-5.pdf');
+  const selectedPdf = await PDFDocument.load(Buffer.from(result.parts[0].inlineData.data, 'base64'));
+  assert.equal(selectedPdf.getPageCount(), 4);
+  assert.deepEqual(selectedPdf.getPages().map((page) => page.getWidth()), [602, 603, 604, 605]);
 
-  const missingMode = await readFileTool.execute(
-    { attachmentId: 'attachment-existing-pdf' },
-    deps,
-    context
-  );
-  assert.equal(missingMode.ok, false);
-  assert.match(String(missingMode.output), /mode="attachment"/);
+  const firstPage = await readFileTool.execute({ attachmentId }, deps, context);
+  assert.equal(firstPage.ok, true);
+  assert.equal(firstPage.output.returnedPages, '1');
+  assert.equal(firstPage.output.nextPages, '2');
+  const firstPdf = await PDFDocument.load(Buffer.from(firstPage.parts[0].inlineData.data, 'base64'));
+  assert.deepEqual(firstPdf.getPages().map((page) => page.getWidth()), [601]);
+
+  const clamped = await readFileTool.execute({ attachmentId, pages: '5-8' }, deps, context);
+  assert.equal(clamped.ok, true);
+  assert.equal(clamped.output.requestedPages, '5-8');
+  assert.equal(clamped.output.returnedPages, '5-6');
+  assert.equal(clamped.output.hasMore, false);
+  const clampedPdf = await PDFDocument.load(Buffer.from(clamped.parts[0].inlineData.data, 'base64'));
+  assert.deepEqual(clampedPdf.getPages().map((page) => page.getWidth()), [605, 606]);
 
   const conflict = await readFileTool.execute(
-    { path: 'other.pdf', attachmentId: 'attachment-existing-pdf', mode: 'attachment' },
+    { path: 'other.pdf', attachmentId, mode: 'attachment' },
     deps,
     context
   );
   assert.equal(conflict.ok, false);
   assert.match(String(conflict.output), /exactly one/);
+});
+
+test('read keeps images whole and rejects pages for image attachments', async () => {
+  const attachmentId = 'attachment-image';
+  const reference = {
+    inlineData: {
+      attachmentId,
+      name: 'diagram.png',
+      mimeType: 'image/png',
+      sizeBytes: 123,
+      storage: 'managed',
+      status: 'available'
+    }
+  };
+  const deps = {
+    fs: new Proxy({}, { get: () => () => { throw new Error('filesystem must not run'); } }),
+    command: {},
+    workEnvironment: {},
+    skills: {},
+    attachments: { async reference() { return structuredClone(reference); } }
+  };
+  const context = { settingsSnapshot: { enableMultimodalTools: true }, emit() {} };
+
+  const whole = await readFileTool.execute({ attachmentId }, deps, context);
+  assert.equal(whole.ok, true);
+  assert.deepEqual(whole.parts, [reference]);
+
+  const paged = await readFileTool.execute({ attachmentId, pages: '1' }, deps, context);
+  assert.equal(paged.ok, false);
+  assert.match(String(paged.output), /not supported for image/);
+});
+
+test('read rejects damaged managed PDFs without pretending pages were returned', async () => {
+  const attachmentId = 'attachment-damaged-pdf';
+  const reference = {
+    inlineData: {
+      attachmentId,
+      name: 'damaged.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 9,
+      storage: 'managed',
+      status: 'available'
+    }
+  };
+  const result = await readFileTool.execute({ attachmentId, pages: '1' }, {
+    fs: new Proxy({}, { get: () => () => { throw new Error('filesystem must not run'); } }),
+    command: {},
+    workEnvironment: {},
+    skills: {},
+    attachments: {
+      async reference() { return structuredClone(reference); },
+      async resolve() {
+        return { inlineData: { ...reference.inlineData, data: Buffer.from('not a pdf').toString('base64') } };
+      }
+    }
+  }, { settingsSnapshot: { enableMultimodalTools: true }, emit() {} });
+
+  assert.equal(result.ok, false);
+  assert.match(String(result.output), /could not be paged/);
+  assert.equal(result.parts, undefined);
+});
+
+test('read decodes a managed TXT as bounded UTF-8 without requiring multimodal support', async () => {
+  const attachmentId = 'attachment-notes-txt';
+  const content = 'first line\n第二行';
+  const bytes = Buffer.from(content, 'utf8');
+  const reference = {
+    inlineData: {
+      attachmentId,
+      name: 'notes.txt',
+      mimeType: 'text/plain',
+      sizeBytes: bytes.length,
+      storage: 'managed',
+      status: 'available'
+    }
+  };
+  const deps = {
+    fs: new Proxy({}, { get: () => () => { throw new Error('filesystem must not run'); } }),
+    command: {},
+    workEnvironment: {},
+    skills: {},
+    attachments: {
+      async reference(requestedId) {
+        assert.equal(requestedId, attachmentId);
+        return structuredClone(reference);
+      },
+      async resolve(requestedId) {
+        assert.equal(requestedId, attachmentId);
+        return { inlineData: { ...reference.inlineData, data: bytes.toString('base64') } };
+      }
+    }
+  };
+
+  const result = await readFileTool.execute({
+    attachmentId,
+    mode: 'text',
+    path: '',
+    items: [{}],
+    startLine: 0,
+    endLine: 0
+  }, deps, {
+    settingsSnapshot: { enableMultimodalTools: false },
+    emit() {}
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.output, {
+    attachmentId,
+    name: 'notes.txt',
+    mimeType: 'text/plain',
+    sizeBytes: bytes.length,
+    requestedPages: '1',
+    returnedPages: '1',
+    totalPages: 1,
+    hasMore: false,
+    content
+  });
+  assert.equal(result.parts, undefined);
+});
+
+test('read can page through a managed TXT and reconstruct every character exactly once', async () => {
+  const attachmentId = 'attachment-large-txt';
+  const content = [
+    ...Array.from({ length: 12 }, (_, index) => `section-${index}\n${String(index % 10).repeat(5_000)}\n`),
+    'x'.repeat(10_000),
+    '🙂tail'
+  ].join('');
+  const expectedPages = splitReadTextPages(content);
+  assert.ok(expectedPages.length > 4);
+  assert.equal(expectedPages.join(''), content);
+  const bytes = Buffer.from(content, 'utf8');
+  const reference = {
+    inlineData: {
+      attachmentId,
+      name: 'large.txt',
+      mimeType: 'text/plain',
+      sizeBytes: bytes.length,
+      storage: 'managed',
+      status: 'available'
+    }
+  };
+  const deps = {
+    fs: new Proxy({}, { get: () => () => { throw new Error('filesystem must not run'); } }),
+    command: {},
+    workEnvironment: {},
+    skills: {},
+    attachments: {
+      async reference() { return structuredClone(reference); },
+      async resolve() {
+        return { inlineData: { ...reference.inlineData, data: bytes.toString('base64') } };
+      }
+    }
+  };
+
+  const reconstructed = [];
+  for (let page = 1; page <= expectedPages.length; page += 1) {
+    const result = await readFileTool.execute({ attachmentId, pages: String(page) }, deps);
+    assert.equal(result.ok, true);
+    assert.equal(result.output.requestedPages, String(page));
+    assert.equal(result.output.returnedPages, String(page));
+    assert.equal(result.output.totalPages, expectedPages.length);
+    assert.equal(result.output.hasMore, page < expectedPages.length);
+    assert.equal(result.output.nextPages, page < expectedPages.length ? String(page + 1) : undefined);
+    reconstructed.push(result.output.content);
+  }
+  assert.equal(reconstructed.join(''), content);
+
+  const range = await readFileTool.execute({ attachmentId, pages: '1 - 4' }, deps);
+  assert.equal(range.ok, true);
+  assert.equal(range.output.returnedPages, '1-4');
+  assert.equal(range.output.content, expectedPages.slice(0, 4).join(''));
+  assert.equal(range.output.nextPages, `5-${Math.min(8, expectedPages.length)}`);
 });
