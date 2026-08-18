@@ -12,11 +12,11 @@ import {
   ReliableContextTokenEstimator
 } from './contextTokenEstimator';
 import {
-  calculateFullRequestBudget,
+  calculateFullRequestPlanningBudget,
   DEFAULT_OUTPUT_RESERVE_TOKENS,
-  preflightFullRequest,
+  preflightCompressionRequest,
   type ContextPlanningFailureCode,
-  type FullRequestBudget,
+  type FullRequestPlanningBudget,
   type ProjectedRequestTokenBreakdown
 } from './modelFacingContextProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
@@ -614,10 +614,10 @@ export class ModelProviderControlPlane {
   }
 
   /** Planning and dispatch both invoke the adapter's exact projection hook. */
-  public budgetFullRequest(
+  public planFullRequest(
     fullRequest: FullProviderRequest,
     adapter: FullRequestProviderAdapter
-  ): FullRequestBudget {
+  ): FullRequestPlanningBudget {
     if (adapter.providerId !== fullRequest.providerId) {
       throw providerConflict('Request preview adapter does not match its frozen provider.');
     }
@@ -627,7 +627,7 @@ export class ModelProviderControlPlane {
     const context = frozenContextProfile(fullRequest.authoritySnapshot);
     const breakdown = adapter.estimateFullRequestInput?.(fullRequest)
       ?? fallbackRequestBreakdown(estimateFullProviderContextFallback(fullRequest));
-    return calculateFullRequestBudget({
+    return calculateFullRequestPlanningBudget({
       contextWindowTokens: compression?.provider.contextWindowTokens ?? context.contextWindowTokens,
       maxOutputTokens: compression?.provider.maxOutputTokens
         ?? frozenPrimaryMaxOutputTokens(fullRequest.authoritySnapshot),
@@ -1591,23 +1591,23 @@ export class ModelProviderControlPlane {
     const compression = isCompressionRecipe(fullRequest.recipe)
       ? frozenCompressionPolicy(fullRequest.authoritySnapshot)
       : undefined;
-    const context = frozenContextProfile(fullRequest.authoritySnapshot);
-    const contextWindowTokens = compression?.provider.contextWindowTokens
-      ?? requirePositiveSafeNumber(request.context_window_tokens, 'ModelRequest.context_window_tokens');
-    const maxOutputTokens = compression?.provider.maxOutputTokens
-      ?? frozenPrimaryMaxOutputTokens(fullRequest.authoritySnapshot);
+    // Model-independent estimates are compression-planning input, never ordinary Provider-send
+    // authority. A real ordinary context limit is reported by the Provider itself.
+    if (!compression) return;
+    const contextWindowTokens = compression.provider.contextWindowTokens;
+    const maxOutputTokens = compression.provider.maxOutputTokens;
     const persistedEstimate = requireNonNegativeSafeNumber(
       request.estimated_context_tokens,
       'ModelRequest.estimated_context_tokens'
     );
     const breakdown = adapter.estimateFullRequestInput?.(fullRequest)
       ?? fallbackRequestBreakdown(persistedEstimate);
-    const result = preflightFullRequest({
+    const result = preflightCompressionRequest({
       contextWindowTokens,
       maxOutputTokens,
-      compressionThresholdTokens: compression ? contextWindowTokens : context.compressionThresholdTokens,
+      compressionThresholdTokens: contextWindowTokens,
       breakdown
-    }, compression ? 'compression_request_too_large' : 'request_still_too_large');
+    });
     if (result.status === 'ready') return;
     throw new ModelRequestPreflightError(
       result.code,

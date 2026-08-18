@@ -674,6 +674,9 @@ export class BoundedClientFeed {
         const turnId = field('turn_id');
         return Boolean(turnId && session.primaryTurnIds.has(turnId));
       }
+      case 'ModelContextProjection':
+        return field('owner_kind') === 'model_request'
+          && materialized('ModelRequest', field('owner_id'));
       case 'ModelRequestMessageLink': {
         const messageId = field('message_id');
         return materialized('ModelRequest', field('model_request_id'))
@@ -1847,6 +1850,7 @@ const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
   'Message',
   'MessageTurnLink',
   'ModelRequest',
+  'ModelContextProjection',
   'ModelRequestMessageLink',
   'ToolCall',
   'ToolCallSourceLink',
@@ -1911,6 +1915,7 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   turnTerminations: 'TurnTermination',
   turnExecutorLinks: 'TurnExecutorLink',
   modelRequests: 'ModelRequest',
+  modelContextProjections: 'ModelContextProjection',
   modelRequestMessageLinks: 'ModelRequestMessageLink',
   messageTurnLinks: 'MessageTurnLink',
   toolCalls: 'ToolCall',
@@ -2283,6 +2288,15 @@ function planMessageWindowEviction(
     if (!request) return { kind: 'snapshot' };
     if (request.status !== 'terminal') return { kind: 'pinned' };
     bundle.add(requestKey);
+    for (const [key, projection] of materializedRecordsMatching(
+      session,
+      'ModelContextProjection',
+      'owner_id',
+      requestId
+    )) {
+      if (recordStringField(projection, 'owner_kind') !== 'model_request') return { kind: 'snapshot' };
+      bundle.add(key);
+    }
     for (const [key, link] of materializedRecordsMatching(
       session,
       'ModelRequestMessageLink',
@@ -2874,6 +2888,10 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   let turnIds = snapshotIds(turns, 'turns');
   messageIds = snapshotIds(window, 'messages');
   requestIds = snapshotIds(turns, 'modelRequests');
+  filterSnapshotArray(turns, 'modelContextProjections', (projection) =>
+    snapshotField(projection, 'owner_kind') === 'model_request'
+    && requestIds.has(snapshotField(projection, 'owner_id') ?? '')
+  );
   toolCallIds = snapshotIds(tools, 'toolCalls');
   processIds = snapshotIds(tools, 'processes');
   filterSnapshotReference(turns, 'executionLeases', 'turn_id', turnIds);

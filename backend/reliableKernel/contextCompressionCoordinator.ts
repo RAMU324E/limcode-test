@@ -22,12 +22,12 @@ import {
 import {
   MODEL_BODY_TARGET_TOKENS,
   calculateEffectiveSummaryMaxTokens,
-  calculateFullRequestBudget,
+  calculateFullRequestPlanningBudget,
   projectStoredModelFacingWindow,
   selectContinuousAtomicTail,
   type AtomicContextGroup,
   type ContextPlanningFailureCode,
-  type FullRequestBudget
+  type FullRequestPlanningBudget
 } from './modelFacingContextProjection';
 import {
   ModelRequestPreflightError,
@@ -47,8 +47,8 @@ export interface CoordinateCompressionCommand {
   authoritySnapshotId: string;
   headRootId: string;
   trigger: CompressionTrigger;
-  /** Exact frozen ordinary request budget. Required for automatic compression; optional for manual. */
-  requestBudget?: FullRequestBudget;
+  /** Exact frozen ordinary request planning budget. Required for automatic compression; optional for manual. */
+  requestBudget?: FullRequestPlanningBudget;
   /** Exact active-Turn input that may need request-level reinjection after this compression. */
   protectedCurrentInputTokens?: number;
   /** Manual callers may freeze an explicit prefix. Automatic text selection uses a continuous token tail. */
@@ -126,24 +126,8 @@ export class ReliableContextCompressionCoordinator {
       throw new TypeError('Automatic compression requires the exact frozen ordinary request budget.');
     }
     const requestBudget = command.requestBudget
-      ? requireFullRequestBudget(command.requestBudget, policy.thresholdTokens)
-      : manualRequestBudget(frozen.document, policy.thresholdTokens);
-    if (requestBudget.fixedTokens > requestBudget.estimatedInputLimitTokens) {
-      return compressionError(
-        'fixed_overhead_infeasible',
-        'System instructions, tool schemas and provider framing exceed the safe input limit.',
-        requestBudget.fixedTokens,
-        requestBudget.estimatedInputLimitTokens
-      );
-    }
-    if (trigger === 'auto' && requestBudget.fixedOverPolicy && requestBudget.canSend) {
-      return {
-        status: 'skipped',
-        reason: 'fixed_over_policy',
-        estimatedTokens: requestBudget.estimatedFullInputTokens,
-        thresholdTokens: requestBudget.compressionThresholdTokens
-      };
-    }
+      ? requireFullRequestPlanningBudget(command.requestBudget, policy.thresholdTokens)
+      : manualRequestPlanningBudget(frozen.document, policy.thresholdTokens);
     const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
     if (trigger === 'auto' && !decision.shouldCompress) {
       return {
@@ -152,6 +136,22 @@ export class ReliableContextCompressionCoordinator {
         estimatedTokens: decision.estimatedTokens,
         thresholdTokens: decision.thresholdTokens
       };
+    }
+    if (trigger === 'auto' && requestBudget.fixedOverPolicy) {
+      return {
+        status: 'skipped',
+        reason: 'fixed_over_policy',
+        estimatedTokens: decision.estimatedTokens,
+        thresholdTokens: decision.thresholdTokens
+      };
+    }
+    if (requestBudget.fixedTokens > requestBudget.planningInputCapacityTokens) {
+      return compressionError(
+        'fixed_overhead_infeasible',
+        'System instructions, tool schemas and provider framing exceed the compression planning capacity.',
+        requestBudget.fixedTokens,
+        requestBudget.planningInputCapacityTokens
+      );
     }
     const triggerReason: CompressionTriggerReason = trigger === 'manual'
       ? 'manual'
@@ -166,20 +166,20 @@ export class ReliableContextCompressionCoordinator {
     const irreducibleAddendaTokens = currentInputAddendumTokens
       + requestBudget.breakdown.runtimeDeliveryTokens
       + requestBudget.breakdown.turnReminderTokens;
-    if (currentInputAddendumTokens > requestBudget.safeBodyRoomTokens) {
+    if (currentInputAddendumTokens > requestBudget.planningBodyRoomTokens) {
       return compressionError(
         'current_input_too_large',
-        'The exact current Turn input cannot fit in the safe model body room.',
+        'The exact current Turn input cannot fit in the compression planning body room.',
         currentInputAddendumTokens,
-        requestBudget.safeBodyRoomTokens
+        requestBudget.planningBodyRoomTokens
       );
     }
-    if (irreducibleAddendaTokens > requestBudget.safeBodyRoomTokens) {
+    if (irreducibleAddendaTokens > requestBudget.planningBodyRoomTokens) {
       return compressionError(
-        'request_still_too_large',
-        'Current input, runtime deliveries and the Turn reminder cannot fit even with empty history.',
+        'compressed_context_too_large',
+        'Current input, runtime deliveries and the Turn reminder cannot fit even with empty compressed history.',
         irreducibleAddendaTokens,
-        requestBudget.safeBodyRoomTokens
+        requestBudget.planningBodyRoomTokens
       );
     }
     // Materialize source structure/content only after the level-trigger passes. Below-threshold checks
@@ -211,7 +211,10 @@ export class ReliableContextCompressionCoordinator {
               - irreducibleAddendaTokens
               - (effectiveSummaryMaxTokens ?? 0))
           );
-    const hardContextRoomTokens = Math.max(0, requestBudget.safeBodyRoomTokens - irreducibleAddendaTokens);
+    const hardContextRoomTokens = Math.max(
+      0,
+      requestBudget.planningBodyRoomTokens - irreducibleAddendaTokens
+    );
     if (textTailPlan?.newestGroupTokens !== undefined && textTailPlan.newestGroupTokens > hardContextRoomTokens) {
       return compressionError(
         textTailPlan.newestGroupKind === 'tool_exchange' ? 'atomic_group_too_large' : 'finite_tail_too_large',
@@ -327,12 +330,12 @@ export class ReliableContextCompressionCoordinator {
       + Math.max(0, tailProjectedTokens - tailCatalogTokens)
       + combinedCatalogTokens;
     const projectedBodyTokens = projectedTokens + irreducibleAddendaTokens;
-    if (projectedBodyTokens > requestBudget.safeBodyRoomTokens) {
+    if (projectedBodyTokens > requestBudget.planningBodyRoomTokens) {
       return compressionError(
-        'request_still_too_large',
-        'The candidate compressed history plus frozen request addenda still exceeds the safe body room.',
+        'compressed_context_too_large',
+        'The candidate compressed history plus frozen request addenda still exceeds the compression planning body room.',
         projectedBodyTokens,
-        requestBudget.safeBodyRoomTokens
+        requestBudget.planningBodyRoomTokens
       );
     }
     if (policy.methodKind !== 'openai_responses_compact' && projectedTokens >= decision.estimatedTokens) {
@@ -499,16 +502,19 @@ function projectMaterializedSegmentsTokens(segments: ReadonlyArray<{
   }))).tokenCount;
 }
 
-function manualRequestBudget(document: PlainJsonValue, thresholdTokens: number): FullRequestBudget {
+function manualRequestPlanningBudget(
+  document: PlainJsonValue,
+  thresholdTokens: number
+): FullRequestPlanningBudget {
   const profile = frozenContextProfile(document);
-  return calculateFullRequestBudget({
+  return calculateFullRequestPlanningBudget({
     contextWindowTokens: profile.contextWindowTokens,
     compressionThresholdTokens: thresholdTokens,
     breakdown: emptyRequestBreakdown()
   });
 }
 
-function emptyRequestBreakdown(): FullRequestBudget['breakdown'] {
+function emptyRequestBreakdown(): FullRequestPlanningBudget['breakdown'] {
   return {
     systemTokens: 0,
     toolSchemaTokens: 0,
@@ -524,18 +530,20 @@ function emptyRequestBreakdown(): FullRequestBudget['breakdown'] {
   };
 }
 
-function requireFullRequestBudget(value: FullRequestBudget, expectedThresholdTokens: number): FullRequestBudget {
+function requireFullRequestPlanningBudget(
+  value: FullRequestPlanningBudget,
+  expectedThresholdTokens: number
+): FullRequestPlanningBudget {
   if (!value || typeof value !== 'object') throw new TypeError('requestBudget must be an object.');
-  const integerFields: Array<keyof FullRequestBudget> = [
+  const integerFields: Array<keyof FullRequestPlanningBudget> = [
     'contextWindowTokens',
     'compressionThresholdTokens',
     'outputReserveTokens',
-    'estimatorSlackTokens',
-    'estimatedInputLimitTokens',
+    'planningInputCapacityTokens',
     'fixedTokens',
     'bodyTokens',
     'estimatedFullInputTokens',
-    'safeBodyRoomTokens',
+    'planningBodyRoomTokens',
     'policyBodyRoomTokens',
     'effectiveBodyTargetTokens'
   ];
@@ -551,9 +559,8 @@ function requireFullRequestBudget(value: FullRequestBudget, expectedThresholdTok
   if (value.estimatedFullInputTokens !== value.fixedTokens + value.bodyTokens) {
     throw new Error('requestBudget full input total is inconsistent.');
   }
-  if (typeof value.fixedOverPolicy !== 'boolean'
-    || typeof value.canSend !== 'boolean') {
-    throw new TypeError('requestBudget planning/send flags must be booleans.');
+  if (typeof value.fixedOverPolicy !== 'boolean') {
+    throw new TypeError('requestBudget.fixedOverPolicy must be boolean.');
   }
   return value;
 }

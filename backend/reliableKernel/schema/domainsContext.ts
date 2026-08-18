@@ -41,7 +41,7 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   }),
   domain({
     key: 'ModelContextProjection', table: 'model_context_projection', repository: 'ModelContextProjectionRepository', codec: 'ModelContextProjectionRowCodec',
-    mutations: ['insert'], client: 'detail', deletePolicy: 'dataset-reset-only',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'dataset-reset-only',
     indexes: ['owner_kind,owner_id UNIQUE', 'root_id'],
     columns: [id(), text('owner_kind'), text('owner_id'), text('root_id'), text('purpose'), text('created_at')]
   }),

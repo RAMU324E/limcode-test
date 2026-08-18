@@ -6,7 +6,6 @@ import { createHash } from 'node:crypto';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
-  DEFAULT_LLM_CONTEXT_ESTIMATOR_SLACK_TOKENS,
   MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
   type ContentPart,
   type InlineDataPart,
@@ -23,8 +22,7 @@ import {
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
 
-/** Decimal token budgets. They intentionally are not configurable in the practical first release. */
-export const ESTIMATOR_SLACK_TOKENS = DEFAULT_LLM_CONTEXT_ESTIMATOR_SLACK_TOKENS;
+/** Decimal compression-planning budgets. They intentionally are not configurable in the practical first release. */
 export const TURN_REMINDER_MAX_TOKENS = 2_000;
 export const TOOL_RESULT_MAX_TOKENS = 4_000;
 export const TOOL_RESULT_BATCH_MAX_TOKENS = 16_000;
@@ -50,7 +48,7 @@ export function calculateEffectiveSummaryMaxTokens(
 export type ContextPlanningFailureCode =
   | 'fixed_overhead_infeasible'
   | 'compression_request_too_large'
-  | 'request_still_too_large'
+  | 'compressed_context_too_large'
   | 'finite_tail_too_large'
   | 'current_input_too_large'
   | 'atomic_group_too_large'
@@ -99,7 +97,7 @@ export interface ProjectedRequestTokenBreakdown {
   fullTokens: number;
 }
 
-export interface FullRequestBudgetInput {
+export interface FullRequestPlanningInput {
   contextWindowTokens: number;
   /** A provider's independent pure-input cap, when one exists. */
   providerInputLimitTokens?: number;
@@ -108,26 +106,29 @@ export interface FullRequestBudgetInput {
   breakdown: ProjectedRequestTokenBreakdown;
 }
 
-export interface FullRequestBudget {
+/**
+ * Heuristic request accounting used to plan compression. It is deliberately not an ordinary
+ * Provider-send admission contract: model-independent token estimates cannot authoritatively reject
+ * a request that the Provider may accept.
+ */
+export interface FullRequestPlanningBudget {
   contextWindowTokens: number;
   compressionThresholdTokens: number;
   providerInputLimitTokens?: number;
   outputReserveTokens: number;
-  estimatorSlackTokens: number;
-  estimatedInputLimitTokens: number;
+  planningInputCapacityTokens: number;
   fixedTokens: number;
   bodyTokens: number;
   estimatedFullInputTokens: number;
-  safeBodyRoomTokens: number;
+  planningBodyRoomTokens: number;
   policyBodyRoomTokens: number;
   effectiveBodyTargetTokens: number;
   fixedOverPolicy: boolean;
-  canSend: boolean;
   breakdown: ProjectedRequestTokenBreakdown;
 }
 
-export type FullRequestPreflightResult =
-  | { status: 'ready'; budget: FullRequestBudget }
+export type CompressionRequestPreflightResult =
+  | { status: 'ready'; budget: FullRequestPlanningBudget }
   | ContextPlanningFailure;
 
 export function estimateProjectedModelInput(input: ProjectedModelInput): ProjectedRequestTokenBreakdown {
@@ -173,7 +174,9 @@ export function estimateProjectedModelInput(input: ProjectedModelInput): Project
   };
 }
 
-export function calculateFullRequestBudget(input: FullRequestBudgetInput): FullRequestBudget {
+export function calculateFullRequestPlanningBudget(
+  input: FullRequestPlanningInput
+): FullRequestPlanningBudget {
   const contextWindowTokens = positiveTokenCount(input.contextWindowTokens, 'contextWindowTokens');
   const compressionThresholdTokens = positiveTokenCount(
     input.compressionThresholdTokens,
@@ -186,61 +189,56 @@ export function calculateFullRequestBudget(input: FullRequestBudgetInput): FullR
     ? DEFAULT_OUTPUT_RESERVE_TOKENS
     : positiveTokenCount(input.maxOutputTokens, 'maxOutputTokens');
   const outputReserveTokens = Math.max(DEFAULT_OUTPUT_RESERVE_TOKENS, maxOutputTokens);
-  const physicalLimit = providerInputLimitTokens ?? Math.max(0, contextWindowTokens - outputReserveTokens);
-  const estimatedInputLimitTokens = Math.max(0, physicalLimit - ESTIMATOR_SLACK_TOKENS);
+  const planningInputCapacityTokens = providerInputLimitTokens
+    ?? Math.max(0, contextWindowTokens - outputReserveTokens);
   const fixedTokens = nonNegativeTokenCount(input.breakdown.fixedTokens, 'breakdown.fixedTokens');
   const bodyTokens = nonNegativeTokenCount(input.breakdown.bodyTokens, 'breakdown.bodyTokens');
   const estimatedFullInputTokens = safeSum([fixedTokens, bodyTokens]);
-  const safeBodyRoomTokens = Math.max(0, estimatedInputLimitTokens - fixedTokens);
+  const planningBodyRoomTokens = Math.max(0, planningInputCapacityTokens - fixedTokens);
   const policyBodyRoomTokens = Math.max(0, compressionThresholdTokens - fixedTokens - 1);
-  const fixedOverPolicy = fixedTokens >= compressionThresholdTokens && fixedTokens <= estimatedInputLimitTokens;
+  const fixedOverPolicy = fixedTokens >= compressionThresholdTokens;
   return {
     contextWindowTokens,
     compressionThresholdTokens,
     ...(providerInputLimitTokens === undefined ? {} : { providerInputLimitTokens }),
     outputReserveTokens,
-    estimatorSlackTokens: ESTIMATOR_SLACK_TOKENS,
-    estimatedInputLimitTokens,
+    planningInputCapacityTokens,
     fixedTokens,
     bodyTokens,
     estimatedFullInputTokens,
-    safeBodyRoomTokens,
+    planningBodyRoomTokens,
     policyBodyRoomTokens,
     effectiveBodyTargetTokens: Math.min(
       MODEL_BODY_TARGET_TOKENS,
-      safeBodyRoomTokens,
-      fixedOverPolicy ? safeBodyRoomTokens : policyBodyRoomTokens
+      planningBodyRoomTokens,
+      fixedOverPolicy ? planningBodyRoomTokens : policyBodyRoomTokens
     ),
     fixedOverPolicy,
-    canSend: estimatedFullInputTokens <= estimatedInputLimitTokens,
     breakdown: { ...input.breakdown, fullTokens: estimatedFullInputTokens }
   };
 }
 
-export function preflightFullRequest(
-  input: FullRequestBudgetInput,
-  oversizedCode: Extract<ContextPlanningFailureCode, 'request_still_too_large' | 'compression_request_too_large'>
-    = 'request_still_too_large'
-): FullRequestPreflightResult {
-  const budget = calculateFullRequestBudget(input);
-  if (budget.fixedTokens > budget.estimatedInputLimitTokens) {
+/** Compression-only admission. Ordinary requests are always sent unless a Provider rejects them. */
+export function preflightCompressionRequest(
+  input: FullRequestPlanningInput
+): CompressionRequestPreflightResult {
+  const budget = calculateFullRequestPlanningBudget(input);
+  if (budget.fixedTokens > budget.planningInputCapacityTokens) {
     return planningFailure(
       'fixed_overhead_infeasible',
       budget.fixedTokens,
-      budget.estimatedInputLimitTokens,
+      budget.planningInputCapacityTokens,
       'fixedTokens',
-      'System instructions, tool schemas and provider framing exceed the safe input limit.'
+      'System instructions, tool schemas and provider framing exceed the compression input capacity.'
     );
   }
-  if (!budget.canSend) {
+  if (budget.estimatedFullInputTokens > budget.planningInputCapacityTokens) {
     return planningFailure(
-      oversizedCode,
+      'compression_request_too_large',
       budget.estimatedFullInputTokens,
-      budget.estimatedInputLimitTokens,
-      oversizedCode === 'compression_request_too_large' ? 'compressionInput' : undefined,
-      oversizedCode === 'compression_request_too_large'
-        ? 'The complete compression request exceeds the compression provider input limit.'
-        : 'The rebuilt complete model request still exceeds the provider input limit.'
+      budget.planningInputCapacityTokens,
+      'compressionInput',
+      'The complete compression request exceeds the compression provider input capacity.'
     );
   }
   return { status: 'ready', budget };
@@ -661,7 +659,7 @@ export interface NativeCompactWindowPlan extends ModelWindowProjection {
 
 export function planNativeCompactWindow(input: {
   contents: readonly MessageContent[];
-  estimatedInputLimitTokens: number;
+  inputCapacityTokens: number;
   fixedTokens?: number;
 }): NativeCompactWindowPlan | ContextPlanningFailure {
   const unresolvedMedia = firstUnresolvedMedia(input.contents);
@@ -674,11 +672,11 @@ export function planNativeCompactWindow(input: {
   const projected = projectOrdinaryModelWindow(input.contents);
   const fixedTokens = nonNegativeTokenCount(input.fixedTokens ?? 0, 'fixedTokens');
   const estimated = safeSum([fixedTokens, projected.tokenCount]);
-  const limit = nonNegativeTokenCount(input.estimatedInputLimitTokens, 'estimatedInputLimitTokens');
+  const limit = nonNegativeTokenCount(input.inputCapacityTokens, 'inputCapacityTokens');
   if (estimated > limit) {
     return planningFailure(
       'compression_request_too_large', estimated, limit, 'compressionInput',
-      'The complete native compact model-visible window exceeds the compression provider input limit.'
+      'The complete native compact model-visible window exceeds the compression provider input capacity.'
     );
   }
   return { status: 'ready', ...projected, retainedLocalTailCount: 0 };

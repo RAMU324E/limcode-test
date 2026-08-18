@@ -1038,7 +1038,7 @@ test('native output 已含旧用户内容时只追加一次带标签的当前 Tu
   assert.equal(estimate.fullTokens, estimate.fixedTokens + estimate.bodyTokens);
 });
 
-test('ModelProvider 完整输入预算在物理窗口前阻止发送且不改写用户压缩阈值', () => {
+test('ModelProvider普通请求的启发式规划不会在打开Provider前形成发送门禁', () => {
   const fullRequest = request();
   fullRequest.authoritySnapshot.model.maxOutputTokens = 16_000;
   fullRequest.authoritySnapshot.modelProfile = {
@@ -1049,26 +1049,24 @@ test('ModelProvider 完整输入预算在物理窗口前阻止发送且不改写
   fullRequest.context = [{
     segmentId: 'oversized-user', segmentKind: 'message', messageRole: 'user',
     contentType: 'application/vnd.limcode.message+json',
-    content: JSON.stringify({ role: 'user', parts: [{ text: 'large '.repeat(12_000) }] })
+    content: JSON.stringify({ role: 'user', parts: [{ text: 'large '.repeat(20_000) }] })
   }];
   const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability(() => {
-    throw new Error('budget test must not dispatch');
+    throw new Error('planning test does not dispatch directly');
   }));
   const modelProvider = Object.create(kernel.ModelProviderControlPlane.prototype);
-  const budget = modelProvider.budgetFullRequest(fullRequest, adapter);
+  const planning = modelProvider.planFullRequest(fullRequest, adapter);
 
-  assert.ok(budget.estimatedFullInputTokens < budget.compressionThresholdTokens, '用户阈值尚未到达');
-  assert.equal(budget.canSend, false, '物理窗口必须独立阻止不可发送请求');
-  assert.equal(budget.estimatedInputLimitTokens, 8_000);
-  assert.throws(
+  assert.ok(planning.estimatedFullInputTokens < planning.compressionThresholdTokens, '用户阈值尚未到达');
+  assert.ok(planning.estimatedFullInputTokens > planning.planningInputCapacityTokens,
+    'fixture必须超过本地压缩规划容量');
+  assert.equal('canSend' in planning, false);
+  assert.doesNotThrow(
     () => modelProvider.assertRequestPreflight({
       context_window_tokens: 32_000n,
-      estimated_context_tokens: BigInt(budget.estimatedFullInputTokens)
+      estimated_context_tokens: BigInt(planning.estimatedFullInputTokens)
     }, fullRequest, adapter),
-    (error) => error instanceof kernel.ModelRequestPreflightError
-      && error.code === 'request_still_too_large'
-      && error.estimatedTokens > error.limitTokens,
-    'dispatch 打开 Provider socket 前必须再次执行同一物理门'
+    'ordinary dispatch必须把真实上下文准入交给Provider'
   );
 });
 

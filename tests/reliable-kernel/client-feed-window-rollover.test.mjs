@@ -53,6 +53,7 @@ test('terminal Message/Request/Tool bundles roll incrementally while durable his
       new Set(Array.from({ length: 8 }, (_, index) => ids(fixture.prefix, index + 1).tool))
     );
     assert.equal(page.records.MessageTurnLink?.length, 8);
+    assert.equal(page.records.ModelContextProjection?.length, 8);
     assert.equal(page.records.ModelRequestMessageLink?.length, 8);
     assert.equal(page.records.ToolCallSourceLink?.length, 8);
     assert.equal(page.records.ToolExecution?.length, 8);
@@ -318,6 +319,14 @@ function terminalBundleSteps({ prefix, conversationId, turnId, contentObjectId, 
       updated_at: at,
       completed_at: null
     }),
+    kernel.DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
+      id: recordIds.projection,
+      owner_kind: 'model_request',
+      owner_id: recordIds.request,
+      root_id: `${prefix}-context-root-${String(sequence).padStart(3, '0')}`,
+      purpose: 'provider-request',
+      created_at: at
+    }),
     kernel.DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').insert({
       id: recordIds.requestMessage,
       model_request_id: recordIds.request,
@@ -390,6 +399,7 @@ function ids(prefix, sequence) {
     membership: `${prefix}-membership-${suffix}`,
     messageTurn: `${prefix}-message-turn-${suffix}`,
     request: `${prefix}-request-${suffix}`,
+    projection: `${prefix}-projection-${suffix}`,
     operation: `${prefix}-operation-${suffix}`,
     attempt: `${prefix}-attempt-${suffix}`,
     requestMessage: `${prefix}-request-message-${suffix}`,
@@ -428,6 +438,7 @@ function bundleRecordIdentities(recordIds) {
     ['Message', recordIds.message],
     ['MessageTurnLink', recordIds.messageTurn],
     ['ModelRequest', recordIds.request],
+    ['ModelContextProjection', recordIds.projection],
     ['ModelRequestMessageLink', recordIds.requestMessage],
     ['ToolCall', recordIds.tool],
     ['ToolCallSourceLink', recordIds.toolSource],
@@ -440,6 +451,7 @@ function assertBoundedCausalState(state) {
     'Message',
     'MessageTurnLink',
     'ModelRequest',
+    'ModelContextProjection',
     'ModelRequestMessageLink',
     'ToolCall',
     'ToolCallSourceLink',
@@ -450,6 +462,10 @@ function assertBoundedCausalState(state) {
   for (const link of Object.values(state.records.MessageTurnLink ?? {})) {
     assert.ok(state.records.Message?.[link.message_id]);
     assert.ok(state.records.Turn?.[link.turn_id]);
+  }
+  for (const projection of Object.values(state.records.ModelContextProjection ?? {})) {
+    assert.equal(projection.owner_kind, 'model_request');
+    assert.ok(state.records.ModelRequest?.[projection.owner_id]);
   }
   for (const link of Object.values(state.records.ModelRequestMessageLink ?? {})) {
     assert.ok(state.records.ModelRequest?.[link.model_request_id]);

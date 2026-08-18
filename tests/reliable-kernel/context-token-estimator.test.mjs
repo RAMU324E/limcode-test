@@ -35,16 +35,19 @@ function emptyBreakdown(overrides = {}) {
   return value;
 }
 
-test('Agent loop始终进入Provider实测压缩准入，协调器只使用配置阈值决策', () => {
+test('Agent loop只用启发式预算规划压缩且不再形成普通发送门禁', () => {
   const source = fs.readFileSync('backend/reliableKernel/agentLoop.ts', 'utf8');
-  const budgetStart = source.indexOf('let budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);');
-  const compressionStart = source.indexOf('this.compressionCoordinator.coordinate({', budgetStart);
-  const sendGate = source.indexOf('if (!budget.canSend)', compressionStart);
-  assert.ok(budgetStart >= 0 && compressionStart > budgetStart && sendGate > compressionStart);
+  const planningStart = source.indexOf(
+    'let planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);'
+  );
+  const compressionStart = source.indexOf('this.compressionCoordinator.coordinate({', planningStart);
+  const requestCreate = source.indexOf('this.modelProvider.createModelRequest({', compressionStart);
+  assert.ok(planningStart >= 0 && compressionStart > planningStart && requestCreate > compressionStart);
 
-  const admission = source.slice(budgetStart, sendGate);
+  const admission = source.slice(planningStart, requestCreate);
   assert.match(admission, /this\.compressionCoordinator\.coordinate\(\{/);
   assert.match(admission, /if \(compression\.status === 'compressed'\)/);
+  assert.doesNotMatch(admission, /canSend|request_still_too_large|safe limit/);
 
   const coordinator = fs.readFileSync('backend/reliableKernel/contextCompressionCoordinator.ts', 'utf8');
   assert.match(
@@ -52,7 +55,25 @@ test('Agent loop始终进入Provider实测压缩准入，协调器只使用配�
     /const decision = await this\.compression\.evaluate\(headRootId, authoritySnapshotId\);\s*if \(trigger === 'auto' && !decision\.shouldCompress\)/,
     '自动压缩必须由Provider实测校准后的配置阈值判断准入'
   );
-  assert.doesNotMatch(coordinator, /automaticCompressionTriggerReason/);
+  assert.ok(
+    coordinator.indexOf("if (trigger === 'auto' && !decision.shouldCompress)")
+      < coordinator.indexOf('requestBudget.fixedTokens > requestBudget.planningInputCapacityTokens'),
+    '低于Provider实测阈值的普通请求必须在启发式压缩容量检查前跳过'
+  );
+});
+
+test('上下文状态通过独立projection/head关系识别上一轮精确值已过期', () => {
+  const source = fs.readFileSync('webview/src/components/conversation/ReliableContextStatus.vue', 'utf8');
+  assert.match(source, /records\.ModelContextProjection/);
+  assert.match(source, /projection\.owner_kind === 'model_request'/);
+  assert.match(source, /requestRootId !== currentRootId/);
+  assert.match(
+    source,
+    /exactContextTokens\.value \?\? estimatedContextTokens\.value \?\? previousExactContextTokens\.value/,
+    '当前root估算必须优先于已过期的Provider精确输入'
+  );
+  assert.match(source, /最近请求精确输入/);
+  assert.doesNotMatch(source, /latestCompressionChange/);
 });
 
 test('provider语义估算不会把base64图片字符当普通文本token', () => {
@@ -152,34 +173,35 @@ test('大批搜索结果按模型投影计量，不会把约250K请求误判为4
     `same-batch tool results must use the 16K model projection plus bounded envelope framing, got ${projectedDelta}`);
 
   const projectedFullInput = 236_285 + projectedDelta;
-  const below = kernel.calculateFullRequestBudget({
+  const below = kernel.calculateFullRequestPlanningBudget({
     contextWindowTokens: 353_000,
     maxOutputTokens: 16_000,
     compressionThresholdTokens: 334_000,
     breakdown: emptyBreakdown({ bodyTokens: projectedFullInput })
   });
-  assert.equal(below.estimatedInputLimitTokens, 329_000);
+  assert.equal(below.planningInputCapacityTokens, 337_000);
   assert.ok(below.estimatedFullInputTokens < below.compressionThresholdTokens);
-  assert.equal(below.canSend, true);
+  assert.equal('canSend' in below, false);
+  assert.equal('estimatedInputLimitTokens' in below, false);
 
-  const physicalLimit = kernel.calculateFullRequestBudget({
+  const reproduced = kernel.calculateFullRequestPlanningBudget({
     contextWindowTokens: 353_000,
     maxOutputTokens: 16_000,
     compressionThresholdTokens: 334_000,
-    breakdown: emptyBreakdown({ bodyTokens: 329_001 })
+    breakdown: emptyBreakdown({ fixedTokens: 17_352, bodyTokens: 314_577 })
   });
-  assert.ok(physicalLimit.estimatedFullInputTokens < physicalLimit.compressionThresholdTokens,
-    '配置压缩阈值尚未到达');
-  assert.equal(physicalLimit.canSend, false, '物理输入预算只保留发送前校验语义');
+  assert.equal(reproduced.estimatedFullInputTokens, 331_929);
+  assert.equal(reproduced.planningInputCapacityTokens, 337_000);
+  assert.ok(260_688 < reproduced.compressionThresholdTokens,
+    'Provider实测锚定的当前估算仍低于配置压缩阈值');
 
-  const configured = kernel.calculateFullRequestBudget({
+  const configured = kernel.calculateFullRequestPlanningBudget({
     contextWindowTokens: 353_000,
     maxOutputTokens: 16_000,
     compressionThresholdTokens: 300_000,
     breakdown: emptyBreakdown({ bodyTokens: 300_000 })
   });
   assert.ok(configured.estimatedFullInputTokens >= configured.compressionThresholdTokens);
-  assert.equal(configured.canSend, true);
 });
 
 test('压缩envelope使用provider输出token估算而非其持久化JSON大小', () => {
@@ -204,11 +226,11 @@ test('provider usage上下文口径优先prompt/input，而不是input+output to
   assert.equal(kernel.compressionOutputTokens(usage), 900);
 });
 
-test('实用版完整请求预算使用48K主体、8K摘要、16K输出和8K误差预留', () => {
+test('实用版压缩规划使用48K主体、8K摘要和16K输出且没有全局估算硬门槛', () => {
   assert.equal(kernel.MODEL_BODY_TARGET_TOKENS, 48_000);
   assert.equal(kernel.SUMMARY_TARGET_TOKENS, 8_000);
   assert.equal(kernel.DEFAULT_OUTPUT_RESERVE_TOKENS, 16_000);
-  assert.equal(kernel.ESTIMATOR_SLACK_TOKENS, 8_000);
+  assert.equal(kernel.ESTIMATOR_SLACK_TOKENS, undefined);
   assert.equal(kernel.TOOL_RESULT_MAX_TOKENS, 4_000);
   assert.equal(kernel.TOOL_RESULT_BATCH_MAX_TOKENS, 16_000);
   assert.equal(kernel.calculateEffectiveSummaryMaxTokens(undefined, 48_000), 8_000);
@@ -225,7 +247,7 @@ test('实用版完整请求预算使用48K主体、8K摘要、16K输出和8K误�
     turnReminderContents: [{ role: 'user', parts: [{ text: 'one open task' }] }],
     providerFramingTokens: 17
   });
-  const budget = kernel.calculateFullRequestBudget({
+  const budget = kernel.calculateFullRequestPlanningBudget({
     contextWindowTokens: 200_000,
     providerInputLimitTokens: 100_000,
     maxOutputTokens: 2_000,
@@ -234,35 +256,34 @@ test('实用版完整请求预算使用48K主体、8K摘要、16K输出和8K误�
   });
   assert.equal(projected.fullTokens, projected.fixedTokens + projected.bodyTokens);
   assert.equal(budget.outputReserveTokens, 16_000);
-  assert.equal(budget.estimatedInputLimitTokens, 92_000);
+  assert.equal(budget.planningInputCapacityTokens, 100_000);
   assert.equal(budget.effectiveBodyTargetTokens, 48_000);
-  assert.equal(budget.canSend, true);
+  assert.equal('canSend' in budget, false);
 });
 
-test('完整请求preflight区分固定开销、压缩后过大和fixedOverPolicy', () => {
-  const fixed = kernel.preflightFullRequest({
+test('压缩请求preflight区分固定开销、完整压缩输入和fixedOverPolicy', () => {
+  const fixed = kernel.preflightCompressionRequest({
     contextWindowTokens: 40_000,
     compressionThresholdTokens: 30_000,
-    breakdown: emptyBreakdown({ fixedTokens: 17_000 })
+    breakdown: emptyBreakdown({ fixedTokens: 25_000 })
   });
   assert.equal(fixed.status, 'error');
   assert.equal(fixed.code, 'fixed_overhead_infeasible');
 
-  const body = kernel.preflightFullRequest({
+  const body = kernel.preflightCompressionRequest({
     contextWindowTokens: 100_000,
     compressionThresholdTokens: 90_000,
-    breakdown: emptyBreakdown({ fixedTokens: 1_000, bodyTokens: 80_000 })
+    breakdown: emptyBreakdown({ fixedTokens: 1_000, bodyTokens: 84_000 })
   });
   assert.equal(body.status, 'error');
-  assert.equal(body.code, 'request_still_too_large');
+  assert.equal(body.code, 'compression_request_too_large');
 
-  const fixedOverPolicy = kernel.calculateFullRequestBudget({
+  const fixedOverPolicy = kernel.calculateFullRequestPlanningBudget({
     contextWindowTokens: 200_000,
     compressionThresholdTokens: 40_000,
     breakdown: emptyBreakdown({ fixedTokens: 45_000, bodyTokens: 1_000 })
   });
   assert.equal(fixedOverPolicy.fixedOverPolicy, true);
-  assert.equal(fixedOverPolicy.canSend, true);
   assert.equal(fixedOverPolicy.policyBodyRoomTokens, 0);
   assert.equal(fixedOverPolicy.effectiveBodyTargetTokens, 48_000);
 });
@@ -394,13 +415,13 @@ test('native compact使用完整窗口且拒绝未固化sourcePath媒体', () =>
     { role: 'model', parts: [{ text: 'second' }] },
     { role: 'user', parts: [{ text: 'third' }] }
   ];
-  const ready = kernel.planNativeCompactWindow({ contents, estimatedInputLimitTokens: 100_000 });
+  const ready = kernel.planNativeCompactWindow({ contents, inputCapacityTokens: 100_000 });
   assert.equal(ready.status, 'ready');
   assert.equal(ready.contents.length, contents.length);
   assert.equal(ready.retainedLocalTailCount, 0);
   const oversized = kernel.planNativeCompactWindow({
     contents: [{ role: 'user', parts: [{ text: 'large '.repeat(10_000) }] }],
-    estimatedInputLimitTokens: 10
+    inputCapacityTokens: 10
   });
   assert.equal(oversized.status, 'error');
   assert.equal(oversized.code, 'compression_request_too_large');
@@ -408,7 +429,7 @@ test('native compact使用完整窗口且拒绝未固化sourcePath媒体', () =>
     contents: [{ role: 'user', parts: [{ inlineData: {
       mimeType: 'image/png', sourcePath: '/tmp/not-admitted.png', sizeBytes: 123
     } }] }],
-    estimatedInputLimitTokens: 100_000
+    inputCapacityTokens: 100_000
   });
   assert.equal(unresolved.status, 'error');
   assert.equal(unresolved.code, 'media_size_unknown');
@@ -417,7 +438,7 @@ test('native compact使用完整窗口且拒绝未固化sourcePath媒体', () =>
       mimeType: 'image/png', attachmentId: 'attachment-one', sizeBytes: 123,
       sha256: 'a'.repeat(64), storage: 'managed'
     } }] }],
-    estimatedInputLimitTokens: 100_000
+    inputCapacityTokens: 100_000
   });
   assert.equal(managed.status, 'ready');
 });

@@ -272,6 +272,7 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'ProcessOutputChunk',
   'ProcessReceipt',
   'ModelRequest',
+  'ModelContextProjection',
   'ModelRequestMessageLink',
   'CompressionBlock',
   /** Derived bounded view; not a persisted Runtime domain or schema-manifest entry. */
@@ -442,6 +443,7 @@ function seedRecordsFromSnapshot(
     processOutputChunks: 'ProcessOutputChunk',
     processReceipts: 'ProcessReceipt',
     modelRequests: 'ModelRequest',
+    modelContextProjections: 'ModelContextProjection',
     modelRequestMessageLinks: 'ModelRequestMessageLink',
     compressionBlocks: 'CompressionBlock',
     conversationContextStatuses: 'ConversationContextStatus',

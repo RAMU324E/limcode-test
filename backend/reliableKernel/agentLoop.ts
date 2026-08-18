@@ -336,16 +336,16 @@ export class ReliableAgentLoop {
           if (previewAdapter.providerId !== preview.providerId) {
             throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
           }
-          let budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);
-          // The adapter estimate protects the physical request limit, but it is only heuristic.
-          // Always let the coordinator compare the same frozen head with Provider-observed usage;
-          // otherwise an underestimated budget can suppress the only authoritative level trigger.
+          let planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
+          // Full-request tokenization is model-independent planning data. Compression admission is
+          // level-triggered by the Provider-observed Context estimate; ordinary sending is never
+          // rejected solely because this heuristic estimate is high.
           const compression = await this.compressionCoordinator.coordinate({
             turnId,
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             trigger: 'auto',
-            requestBudget: budget,
+            requestBudget: planningBudget,
             protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe)
           });
           if (compression.status === 'error') {
@@ -380,23 +380,14 @@ export class ReliableAgentLoop {
             if (previewAdapter.providerId !== preview.providerId) {
               throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
             }
-            budget = this.modelProvider.budgetFullRequest(preview, previewAdapter);
-          }
-          if (!budget.canSend) {
-            throw new ModelRequestPreflightError(
-              'request_still_too_large',
-              `request_still_too_large: rebuilt request is ${budget.estimatedFullInputTokens} tokens, `
-                + `safe limit is ${budget.estimatedInputLimitTokens}.`,
-              budget.estimatedFullInputTokens,
-              budget.estimatedInputLimitTokens
-            );
+            planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
           }
           const created = await this.modelProvider.createModelRequest({
             turnId,
             contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             recipe: frozenRecipe,
-            projectedEstimatedTokens: budget.estimatedFullInputTokens,
+            projectedEstimatedTokens: planningBudget.estimatedFullInputTokens,
             idempotencyKey
           });
           if (created.modelRequestId !== expectedModelRequestId) {

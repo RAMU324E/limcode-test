@@ -2610,7 +2610,7 @@ function executeClientProjectionSnapshot(
     };
     const emptyTurns = {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [], modelRequests: [],
-      modelRequestMessageLinks: []
+      modelContextProjections: [], modelRequestMessageLinks: []
     };
     const emptyTools = {
       messageTurnLinks: [],
@@ -2897,6 +2897,12 @@ function executeClientProjectionSnapshot(
         toolCallSourceLinks.map((row) => String(row.model_request_id))
       )
     ]).sort(compareModelRequestRows);
+    const modelContextProjections = queryAllByIds(
+      database,
+      'model_context_projection',
+      'owner_id',
+      modelRequests.map((row) => String(row.id))
+    ).filter((row) => row.owner_kind === 'model_request');
     const modelRequestMessageLinks = queryAllByIds(
       database,
       'model_request_message_link',
@@ -3059,6 +3065,7 @@ function executeClientProjectionSnapshot(
         turnTerminations: terminations,
         turnExecutorLinks: executorLinks,
         modelRequests,
+        modelContextProjections,
         modelRequestMessageLinks
       },
       activeToolAndInteractionSummary: {
@@ -3696,6 +3703,12 @@ function buildClientVisibleMessageHistoryRecords(
   const modelRequests = queryAllByIds(database, 'model_request', 'id', requestIds)
     .sort(compareModelRequestRows);
   include('ModelRequest', modelRequests);
+  include('ModelContextProjection', queryAllByIds(
+    database,
+    'model_context_projection',
+    'owner_id',
+    requestIds
+  ).filter((row) => row.owner_kind === 'model_request'));
 
   const toolCallIds = [...new Set(sourceLinks.map((row) => String(row.tool_call_id)))];
   const toolCalls = queryAllByIds(database, 'tool_call', 'id', toolCallIds)
