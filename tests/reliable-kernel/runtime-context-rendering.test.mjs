@@ -41,7 +41,7 @@ test('runtime context 渲染时间/平台/工作区/工作环境占位符', () =
   assert.match(rendered, /Platform: win32/);
   assert.match(rendered, /Workspace: AI tool/);
   assert.match(rendered, /URI: F:\\AI tool/);
-  assert.match(rendered, /Initial work environment:\nwork-env-local-test · Workspace · local_folder/);
+  assert.match(rendered, /Initial work environment:\nWorkspace · local_folder · F:\\AI tool/);
 });
 
 test('未绑定工作区与空工作环境使用明确降级文本并剥离环境段落', () => {
