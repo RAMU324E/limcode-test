@@ -14,6 +14,7 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
 
 export type ContextSegmentKind = 'system' | 'message' | 'tool_pair' | 'compression' | 'runtime_context';
 export type ContextSourceKind =
@@ -158,6 +159,7 @@ export interface MessageContextTruncateReplacement {
   messageRevisionId: string;
   contentObjectId: string;
   contentByteLength: bigint;
+  contentEstimatedTokens: number;
 }
 
 export interface MessageContextTruncatePlanInput extends MessageContextDeletePlanInput {
@@ -905,7 +907,10 @@ export class ContextSequenceControlPlane {
           contentByteLength: requireBigInt(
             input.replacement.contentByteLength,
             'replacement.contentByteLength'
-          )
+          ),
+          contentEstimatedTokens: optionalEstimatedTokens(
+            input.replacement.contentEstimatedTokens
+          )!
         }
       : null;
     if (replacement && replacement.contentByteLength < 0n) {
@@ -940,6 +945,7 @@ export class ContextSequenceControlPlane {
       blocks = expanded.blocks;
     }
 
+    let estimatedTokens = await this.estimateEditableContextTokens(prefix);
     const now = this.timestamp();
     let replacementSegmentId: string | null = null;
     const occurrenceSteps: RepositoryTransactionStep[] = [];
@@ -959,6 +965,7 @@ export class ContextSequenceControlPlane {
         segment: { id: replacementSegmentId, segment_kind: 'message' },
         contentObject: { byte_length: replacement.contentByteLength }
       });
+      estimatedTokens += replacement.contentEstimatedTokens;
     }
 
     const retainedSummary = prefix[0]?.segment.segment_kind === 'compression' ? prefix[0] : null;
@@ -970,9 +977,6 @@ export class ContextSequenceControlPlane {
     const summaryNodeId = retainedSummary
       ? contextSequenceNodeId(null, requireId(retainedSummary.segment.id, 'retained compression segment id'))
       : null;
-    const estimatedTokens = prefix.reduce((total, record) =>
-      total + estimateTokens(requireBigInt(record.contentObject.byte_length, 'ContentObject.byte_length')),
-    0n);
     const blockSteps = uniqueRows(blocks).flatMap((block) => {
       if (block.status !== 'enabled') return [];
       const blockId = requireId(block.id, 'CompressionBlock.id');
@@ -1353,6 +1357,18 @@ export class ContextSequenceControlPlane {
       segments: children.flatMap((child) => child.segments),
       blocks: [block, ...children.flatMap((child) => child.blocks)]
     };
+  }
+
+  private async estimateEditableContextTokens(records: readonly EditableContextSegment[]): Promise<bigint> {
+    if (records.length === 0) return 0n;
+    const metadata = records.map((record) => asContentObjectMetadata(record.contentObject));
+    const content = await this.contentStore.readMany(metadata);
+    return BigInt(projectStoredModelFacingWindow(records.map((record, index) => ({
+      segmentKind: requireSegmentKind(record.segment.segment_kind),
+      messageRole: null,
+      contentType: metadata[index].content_type,
+      content: content[index].toString('utf8')
+    }))).tokenCount);
   }
 
   private async readEditableSegment(segmentId: string): Promise<EditableContextSegment> {

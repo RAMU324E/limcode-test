@@ -2512,7 +2512,11 @@ export class TurnControlPlane {
           replacement: {
             messageRevisionId: revisionId,
             contentObjectId: content.metadata.id,
-            contentByteLength: content.metadata.byte_length
+            contentByteLength: content.metadata.byte_length,
+            contentEstimatedTokens: estimateStoredMessageContentTokens(
+              attachmentAdmission.value,
+              attachmentAdmission.contentType
+            )
           }
         })
       : await this.contextSequence.prepareMessageEditMutation({
@@ -2638,7 +2642,11 @@ export class TurnControlPlane {
       replacement: {
         messageRevisionId: revisionId,
         contentObjectId: content.metadata.id,
-        contentByteLength: content.metadata.byte_length
+        contentByteLength: content.metadata.byte_length,
+        contentEstimatedTokens: estimateStoredMessageContentTokens(
+          attachmentAdmission.value,
+          attachmentAdmission.contentType
+        )
       }
     });
     const compiled = await this.compileCurrentAuthority(

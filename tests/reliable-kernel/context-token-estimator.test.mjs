@@ -509,3 +509,24 @@ test('stored runtime_context hard-cut旧裸文本而不按普通user消息估算
     /must use application\/vnd\.limcode\.runtime-delivery-model\+json/
   );
 });
+
+
+test('truncate根Token估算复用模型投影而不是持久化字节长度', () => {
+  const contextSource = fs.readFileSync('backend/reliableKernel/contextSequence.ts', 'utf8');
+  const truncateStart = contextSource.indexOf('public async prepareMessageTruncateMutation');
+  const truncateEnd = contextSource.indexOf('public async prepareMessageRetryMutation', truncateStart);
+  const truncateBody = contextSource.slice(truncateStart, truncateEnd);
+  assert.match(truncateBody, /estimateEditableContextTokens\(prefix\)/);
+  assert.doesNotMatch(truncateBody, /prefix\.reduce\([\s\S]*contentObject\.byte_length/);
+  assert.match(
+    contextSource,
+    /private async estimateEditableContextTokens[\s\S]*?projectStoredModelFacingWindow\(/
+  );
+
+  const turnSource = fs.readFileSync('backend/reliableKernel/turnControlPlane.ts', 'utf8');
+  assert.equal(
+    turnSource.match(/contentEstimatedTokens: estimateStoredMessageContentTokens\(/g)?.length,
+    2,
+    '两个带替换消息的truncate入口都必须传入语义Token估算'
+  );
+});
