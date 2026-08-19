@@ -73,6 +73,15 @@ const FEED_RECOVERY_MAX_DELAY_MS = 30_000;
 const TRANSIENT_BATCH_INTERVAL_MS = 32;
 const TRANSIENT_BATCH_MAX_EVENTS = 128;
 
+function isToolCallDeltaTransient(event: ReliableAgentTransientEvent): boolean {
+  const content = event.event.content;
+  return event.event.kind === 'output_delta'
+    && content !== null
+    && typeof content === 'object'
+    && !Array.isArray(content)
+    && content.type === 'tool_call_delta';
+}
+
 export type ReliableKernelFeedBridgeErrorHandler = (
   error: unknown,
   context: { clientId: BridgeClientId; operation: 'connect' | 'post' | 'control' }
@@ -427,7 +436,13 @@ export class ReliableKernelWebviewFeedBridge {
       ) continue;
       client.pendingTransientEvents.push(event);
       const terminal = ['completed', 'failed', 'cancelled'].includes(event.event.kind);
-      if (terminal || client.pendingTransientEvents.length >= TRANSIENT_BATCH_MAX_EVENTS) {
+      // Tool argument previews are already aggregated by the provider capability. Flush them with
+      // any earlier queued thought/text events instead of adding another 32ms transport wait.
+      if (
+        isToolCallDeltaTransient(event)
+        || terminal
+        || client.pendingTransientEvents.length >= TRANSIENT_BATCH_MAX_EVENTS
+      ) {
         this.flushTransientQueue(client);
         continue;
       }

@@ -2,12 +2,22 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { createServer } from 'vite';
 
 const root = process.cwd();
 const kernel = await import(pathToFileURL(path.join(
   root,
   'dist/extension/backend/reliableKernel/index.js'
 )).href);
+
+async function createWebviewTestServer() {
+  return createServer({
+    configFile: path.join(root, 'vite.config.ts'),
+    server: { middlewareMode: true },
+    appType: 'custom',
+    logLevel: 'error'
+  });
+}
 
 test('process stream detail pages every CAS chunk beyond the projection window', async () => {
   const processId = 'process-detail-regression';
@@ -197,4 +207,101 @@ test('client summary keeps a long provider_call_id byte-for-byte', async () => {
   assert.equal(link.provider_call_id, providerCallId);
   assert.equal(link.summary_truncated, true);
   feed.disconnect(connection.sessionId);
+});
+
+test('streaming tool preview coalesces updates by animation frame and commits final immediately', async (context) => {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  const frames = new Map();
+  const cancelledFrames = [];
+  let nextFrameId = 1;
+  let app;
+  globalThis.window = {
+    addEventListener() {},
+    removeEventListener() {},
+    requestAnimationFrame(callback) {
+      const id = nextFrameId++;
+      frames.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame(id) {
+      cancelledFrames.push(id);
+      frames.delete(id);
+    }
+  };
+  context.after(async () => {
+    app?.unmount();
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    await server.close();
+  });
+
+  const vue = await import('vue');
+  const { default: StreamingToolCallPreview } = await server.ssrLoadModule(
+    '/src/components/content/parts/StreamingToolCallPreview.vue'
+  );
+  // ssrLoadModule only emits ssrRender; this test exercises setup/watch scheduling, not the template.
+  StreamingToolCallPreview.render = () => null;
+  const previewState = (updatedAt, final = false) => ({
+    id: 'preview:call-frame',
+    callId: 'call-frame',
+    name: 'custom_tool',
+    argumentsText: '',
+    receivedChars: 0,
+    final,
+    createdAt: 1,
+    updatedAt
+  });
+  const preview = vue.ref(previewState(1));
+  const renderer = vue.createRenderer({
+    patchProp() {},
+    insert() {},
+    remove() {},
+    createElement() { return {}; },
+    createText() { return {}; },
+    createComment() { return {}; },
+    setText() {},
+    setElementText() {},
+    parentNode() { return null; },
+    nextSibling() { return null; },
+    querySelector() { return null; },
+    setScopeId() {},
+    cloneNode(node) { return node; },
+    insertStaticContent() { return [{}, {}]; }
+  });
+  app = renderer.createApp(vue.defineComponent({
+    setup() {
+      return () => vue.h(StreamingToolCallPreview, {
+        preview: preview.value,
+        active: true
+      });
+    }
+  }));
+  app.provide(vue.ssrContextKey, { modules: new Set() });
+  app.mount({});
+  await vue.nextTick();
+  assert.equal(frames.size, 0, 'the initial preview is visible without waiting for a frame');
+
+  preview.value = previewState(2);
+  await vue.nextTick();
+  assert.equal(frames.size, 1);
+  const firstFrameId = [...frames.keys()][0];
+
+  preview.value = previewState(3);
+  await vue.nextTick();
+  assert.deepEqual([...frames.keys()], [firstFrameId], 'fast updates share one pending frame');
+
+  const firstFrame = frames.get(firstFrameId);
+  frames.delete(firstFrameId);
+  firstFrame(performance.now());
+  await vue.nextTick();
+  preview.value = previewState(4);
+  await vue.nextTick();
+  assert.equal(frames.size, 1, 'an update after the prior frame schedules the next natural frame');
+  const finalFrameId = [...frames.keys()][0];
+
+  preview.value = previewState(5, true);
+  await vue.nextTick();
+  assert.equal(frames.size, 0, 'final state does not wait for the pending animation frame');
+  assert.deepEqual(cancelledFrames, [finalFrameId]);
 });

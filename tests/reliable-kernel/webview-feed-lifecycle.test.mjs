@@ -101,6 +101,60 @@ test('stale visible renderer gets one exact resend, then Feed waits for a new Re
   bridge.close();
 });
 
+test('tool_call_delta immediately flushes earlier transient output in stream order', async () => {
+  const feed = fakeFeed();
+  const posted = [];
+  const bridge = new ReliableKernelWebviewFeedBridge(
+    feed,
+    { async read() { throw new Error('detail read is not expected'); } },
+    (error) => { throw error; }
+  );
+  const clientId = bridge.attach(webview(posted), {
+    kind: 'mainPanel',
+    panelId: 'tool-preview-panel',
+    conversationId: 'conversation-tool-preview'
+  });
+  bridge.reconnect(clientId);
+  await eventually(() => snapshots(posted).length === 1);
+
+  const transient = (streamSeq, content) => ({
+    conversationId: 'conversation-tool-preview',
+    turnId: 'turn-tool-preview',
+    modelRequestId: 'request-tool-preview',
+    requestSeq: '1',
+    providerId: 'provider-tool-preview',
+    modelId: 'model-tool-preview',
+    attemptSeq: '1',
+    socketGeneration: '1',
+    afterCommitSeq: '0',
+    observedAt: '2026-08-19T00:00:00.000Z',
+    event: { kind: 'output_delta', streamSeq, content }
+  });
+
+  bridge.broadcastTransient(transient('1', { type: 'thought_delta', text: '先分析' }));
+  await Promise.resolve();
+  assert.equal(transientPosts(posted).length, 0, 'ordinary output still waits for the existing batch window');
+
+  bridge.broadcastTransient(transient('2', {
+    type: 'tool_call_delta',
+    callId: 'call-tool-preview',
+    name: 'write',
+    argumentsDelta: '{"path":',
+    replace: false
+  }));
+  await Promise.resolve();
+
+  const [batch] = transientPosts(posted);
+  assert.equal(batch?.type, 'reliable-kernel.transient-batch');
+  assert.deepEqual(batch.events.map((entry) => entry.event.streamSeq), ['1', '2']);
+  assert.deepEqual(batch.events.map((entry) => entry.event.content.type), [
+    'thought_delta',
+    'tool_call_delta'
+  ]);
+
+  bridge.close();
+});
+
 function fakeFeed() {
   let sequence = 0;
   const connectCalls = [];
@@ -144,6 +198,13 @@ function webview(posted) {
 
 function snapshots(posted) {
   return posted.filter((message) => message.type === 'reliable-kernel.snapshot');
+}
+
+function transientPosts(posted) {
+  return posted.filter((message) =>
+    message.type === 'reliable-kernel.transient'
+    || message.type === 'reliable-kernel.transient-batch'
+  );
 }
 
 function tick() {

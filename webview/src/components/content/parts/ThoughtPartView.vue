@@ -3,8 +3,10 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { IconBulb } from '@tabler/icons-vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import StreamingIndicatorTail from '../StreamingIndicatorTail.vue';
+import { renderInlineMarkdown } from '../markdown/markdownRenderer';
 import { useSmoothStreamingText } from '../useSmoothStreamingText';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
+import TextPartView from './TextPartView.vue';
 import {
   THOUGHT_TIMER_REFRESH_INTERVAL_MS,
   formatThoughtDuration,
@@ -33,6 +35,7 @@ const { displayedText } = useSmoothStreamingText(
   () => props.streaming
 );
 const preview = computed(() => lastNonEmptyLine(displayedText.value) || '正在思考...');
+const previewHtml = computed(() => renderInlineMarkdown(preview.value));
 const liveDurationMs = computed(() => liveThoughtDurationMs({
   completedDurationMs: props.completedDurationMs,
   elapsedMs: props.elapsedMs,
@@ -104,16 +107,21 @@ function lastNonEmptyLine(text: string): string {
       <IconBulb stroke="2" aria-hidden="true" />
     </template>
     <template #summary>
-      <span class="thought-preview">{{ preview }}</span>
+      <span class="thought-preview" v-html="previewHtml"></span>
     </template>
     <template #trail>
       <span class="thought-tail">{{ tailText }}</span>
     </template>
 
-    <!-- 折叠时不要渲染完整思考正文。否则流式阶段每帧都会更新隐藏 pre 的完整 text node，长思考会明显掉帧。 -->
-    <div v-if="expanded" class="thought-content">
-      <pre>{{ displayedText }}</pre>
-    </div>
+    <!-- 折叠时不要渲染完整思考正文。否则流式阶段每帧都会更新隐藏 Markdown，长思考会明显掉帧。 -->
+    <TextPartView
+      v-if="expanded"
+      class="thought-content"
+      :text="displayedText"
+      markdown
+      preserve-soft-breaks
+      :show-streaming-indicator="false"
+    />
   </CollapsibleContentBlock>
   <div v-if="streaming" class="thought-streaming-row"><StreamingIndicatorTail :text="globalSettings.appearance.streamingTextThinking" variant="thinking" /></div>
 </template>
@@ -147,22 +155,11 @@ function lastNonEmptyLine(text: string): string {
   border-left: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.32));
   color: var(--vscode-descriptionForeground);
   background: var(--lc-content-input-background);
-  white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
   font: inherit;
   font-style: italic;
   line-height: 1.5;
-}
-
-.thought-content > pre {
-  margin: 0;
-  max-width: 100%;
-  min-width: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-  font: inherit;
 }
 
 .thought-streaming-row {

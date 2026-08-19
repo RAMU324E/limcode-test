@@ -88,3 +88,190 @@ test('Vue templates call LLMs LLM while preserving OpenAI and 模型渠道', () 
     assert.doesNotMatch(normalized, /(?<![A-Za-z])AI(?![A-Za-z])|模型/, `${file} contains obsolete AI/model wording`);
   }
 });
+
+test('thought cards render Markdown and merge adjacent reasoning output items', async (context) => {
+  const { createServer } = await import('vite');
+  const server = await createServer({
+    configFile: path.join(ROOT, 'vite.config.ts'),
+    server: { middlewareMode: true },
+    appType: 'custom',
+    logLevel: 'error'
+  });
+  context.after(async () => server.close());
+
+  const markdown = await server.ssrLoadModule('/src/components/content/markdown/markdownRenderer.ts');
+  assert.equal(
+    markdown.renderInlineMarkdown('**Assessing phase semantics**'),
+    '<strong>Assessing phase semantics</strong>'
+  );
+
+  const softBreakSource = 'first reasoning line\nsecond reasoning line';
+  const htmlFrom = (parts) => parts
+    .filter((part) => part.kind === 'html')
+    .map((part) => part.html)
+    .join('');
+  const commonmarkHtml = htmlFrom(markdown.renderMarkdownParts(softBreakSource));
+  const thoughtHtml = htmlFrom(markdown.renderMarkdownParts(softBreakSource, { preserveSoftBreaks: true }));
+  assert.equal(commonmarkHtml.includes('<br>'), false);
+  assert.equal(thoughtHtml.includes('<br>'), true);
+  assert.equal(htmlFrom(markdown.renderMarkdownParts(softBreakSource)), commonmarkHtml,
+    'thought soft-break cache must not alter ordinary Markdown rendering');
+
+  const streamingRenderer = markdown.createStreamingMarkdownPartsRenderer();
+  const commonmarkStreamHtml = htmlFrom(streamingRenderer.render(softBreakSource, { streaming: true }));
+  const thoughtStreamHtml = htmlFrom(streamingRenderer.render(softBreakSource, {
+    streaming: true,
+    preserveSoftBreaks: true
+  }));
+  assert.equal(commonmarkStreamHtml.includes('<br>'), false);
+  assert.equal(thoughtStreamHtml.includes('<br>'), true,
+    'switching one streaming renderer to thought mode must reset its prior CommonMark state');
+
+  const thoughtView = source('webview/src/components/content/parts/ThoughtPartView.vue');
+  assert.match(thoughtView, /v-html="previewHtml"/);
+  assert.match(thoughtView, /<TextPartView[\s\S]*?\smarkdown(?:\s|\n)/);
+  assert.match(thoughtView, /preserve-soft-breaks/);
+  assert.doesNotMatch(thoughtView, /<pre>\{\{ displayedText \}\}<\/pre>/);
+
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    addEventListener() {},
+    removeEventListener() {}
+  };
+  context.after(() => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  });
+
+  const { toRenderNodes } = await server.ssrLoadModule('/src/components/content/partRegistry.ts');
+  const thought = (id, text) => ({
+    text,
+    thought: true,
+    outputItem: { id, type: 'reasoning' }
+  });
+  const text = (id, value) => ({
+    text: value,
+    outputItem: { id, type: 'message' }
+  });
+
+  const merged = toRenderNodes([
+    thought('reasoning-1', '**Analyzing context**'),
+    thought('reasoning-2', '**Inspecting implementation**')
+  ]);
+  assert.deepEqual(merged.map((node) => node.kind), ['thought']);
+  assert.equal(merged[0].props.text, '**Analyzing context**\n**Inspecting implementation**');
+
+  const splitTextItems = toRenderNodes([text('message-1', 'first'), text('message-2', 'second')]);
+  assert.deepEqual(splitTextItems.map((node) => node.kind), ['text', 'text']);
+
+  const visibleTextBoundary = toRenderNodes([
+    thought('reasoning-1', 'before text'),
+    text('message-1', 'visible'),
+    thought('reasoning-2', 'after text')
+  ]);
+  assert.deepEqual(visibleTextBoundary.map((node) => node.kind), ['thought', 'text', 'thought']);
+
+  const toolBoundary = toRenderNodes([
+    thought('reasoning-1', 'before tool'),
+    { id: 'tool-1', functionCall: { name: 'read', args: {} } },
+    thought('reasoning-2', 'after tool')
+  ]);
+  assert.deepEqual(toolBoundary.map((node) => node.kind), ['thought', 'functionCall', 'thought']);
+});
+
+test('长流积压达到阈值时直刷，terminal时立即显示完整文本', async (context) => {
+  const server = await createViteServer(context);
+  const vue = await import('vue');
+  const { useSmoothStreamingText } = await server.ssrLoadModule(
+    '/src/components/content/useSmoothStreamingText.ts'
+  );
+
+  const frames = new Map();
+  let nextFrameId = 1;
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    requestAnimationFrame(callback) {
+      const id = nextFrameId++;
+      frames.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame(id) {
+      frames.delete(id);
+    },
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis)
+  };
+
+  const renderer = vue.createRenderer({
+    patchProp() {},
+    insert() {},
+    remove() {},
+    createElement() { return {}; },
+    createText() { return {}; },
+    createComment() { return {}; },
+    setText() {},
+    setElementText() {},
+    parentNode() { return null; },
+    nextSibling() { return null; },
+    querySelector() { return null; },
+    setScopeId() {},
+    cloneNode(node) { return node; },
+    insertStaticContent() { return [{}, {}]; }
+  });
+  const source = vue.ref('a');
+  const streaming = vue.ref(true);
+  let smooth;
+  const app = renderer.createApp(vue.defineComponent({
+    setup() {
+      smooth = useSmoothStreamingText(
+        () => source.value,
+        () => streaming.value,
+        { animateReplace: true, flushLagChars: 2_048 }
+      );
+      return () => null;
+    }
+  }));
+  app.mount({});
+  context.after(() => {
+    app.unmount();
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  });
+
+  const runFrames = () => {
+    let now = performance.now();
+    while (frames.size > 0) {
+      const batch = [...frames.values()];
+      frames.clear();
+      now += 16;
+      for (const callback of batch) callback(now);
+    }
+  };
+
+  await vue.nextTick();
+  runFrames();
+  assert.equal(smooth.displayedText.value, 'a');
+
+  const burst = `a${'x'.repeat(2_048)}`;
+  source.value = burst;
+  await vue.nextTick();
+  assert.equal(smooth.displayedText.value, burst, '大积压应在watch同步阶段直接刷新');
+  assert.equal(frames.size, 0);
+
+  const terminalTarget = `${burst}${'tail'.repeat(100)}`;
+  source.value = terminalTarget;
+  await vue.nextTick();
+  assert.equal(smooth.displayedText.value, burst, '小积压在流中仍保留平滑输出');
+  assert.ok(frames.size > 0);
+
+  streaming.value = false;
+  await vue.nextTick();
+  assert.equal(smooth.displayedText.value, terminalTarget, 'terminal切换必须立即同步完整文本');
+  assert.equal(frames.size, 0, 'terminal切换必须取消未执行的追赶帧');
+
+  const textPartSource = fs.readFileSync(
+    path.join(ROOT, 'webview/src/components/content/parts/TextPartView.vue'),
+    'utf8'
+  );
+  assert.match(textPartSource, /\{ animateReplace: true, flushLagChars: 2_048 \}/);
+});

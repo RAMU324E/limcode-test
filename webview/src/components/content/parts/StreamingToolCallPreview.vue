@@ -12,12 +12,11 @@ const props = defineProps<{
   active: boolean;
 }>();
 
-const FRAME_INTERVAL_MS = 50;
 const framedPreview = shallowRef<ReliableTransientToolCallState>({ ...props.preview });
 const pendingPreview = shallowRef<ReliableTransientToolCallState | undefined>();
 const previewScroller = ref<HTMLElement | null>(null);
 useBottomStickyScroller(previewScroller);
-let frameTimer: number | undefined;
+let frameRequest: number | undefined;
 let renderModeCallId = framedPreview.value.callId;
 const frozenRenderMode = ref<ToolCallPreviewRenderMode | undefined>();
 
@@ -65,20 +64,26 @@ watch(
   () => props.preview,
   (next) => {
     pendingPreview.value = { ...next };
-    if (frameTimer !== undefined) return;
-    frameTimer = window.setTimeout(flushPreviewFrame, FRAME_INTERVAL_MS);
+    if (next.final === true) {
+      if (frameRequest !== undefined) window.cancelAnimationFrame(frameRequest);
+      frameRequest = undefined;
+      flushPreviewFrame();
+      return;
+    }
+    if (frameRequest !== undefined) return;
+    frameRequest = window.requestAnimationFrame(flushPreviewFrame);
   },
   { deep: false }
 );
 
 onBeforeUnmount(() => {
-  if (frameTimer !== undefined) window.clearTimeout(frameTimer);
-  frameTimer = undefined;
+  if (frameRequest !== undefined) window.cancelAnimationFrame(frameRequest);
+  frameRequest = undefined;
   pendingPreview.value = undefined;
 });
 
 function flushPreviewFrame(): void {
-  frameTimer = undefined;
+  frameRequest = undefined;
   const next = pendingPreview.value;
   pendingPreview.value = undefined;
   if (next) framedPreview.value = next;

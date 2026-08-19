@@ -16,8 +16,9 @@ const props = withDefaults(
     streamingPhase?: 'waiting' | 'thinking' | 'writing';
     showStreamingIndicator?: boolean;
     markdown?: boolean;
+    preserveSoftBreaks?: boolean;
   }>(),
-  { streaming: false, streamingPhase: 'writing', showStreamingIndicator: true, markdown: false }
+  { streaming: false, streamingPhase: 'writing', showStreamingIndicator: true, markdown: false, preserveSoftBreaks: false }
 );
 
 const globalSettings = useGlobalSettingsStore();
@@ -33,7 +34,7 @@ const tailText = computed(() => {
 const { displayedText, replacing: replaceAnimating } = useSmoothStreamingText(
   () => props.text,
   () => props.streaming,
-  { animateReplace: true }
+  { animateReplace: true, flushLagChars: 2_048 }
 );
 const renderedParts = shallowRef<MarkdownRenderedPart[]>([]);
 const streamingMarkdownRenderer = createStreamingMarkdownPartsRenderer();
@@ -46,7 +47,7 @@ let markdownRenderGeneration = 0;
 const markdownReady = computed(() => props.markdown);
 
 watch(
-  () => [displayedText.value, props.streaming, props.markdown] as const,
+  () => [displayedText.value, props.streaming, props.markdown, props.preserveSoftBreaks] as const,
   () => renderCurrentMarkdown(),
   { immediate: true }
 );
@@ -82,9 +83,11 @@ function renderCurrentMarkdown(): void {
 
 function renderMarkdownNow(effectivelyStreaming: boolean): void {
   try {
-    // Provider 已结束后，平滑输出可能仍在追赶 backlog；此时仍按流式尾块处理，
-    // 直到 displayedText 真正追上最终文本，才做一次权威的整文解析并写入最终缓存。
-    renderedParts.value = streamingMarkdownRenderer.render(displayedText.value, { streaming: effectivelyStreaming });
+    // 流中按增量尾块解析；terminal 会先同步完整 displayedText，再写入权威整文缓存。
+    renderedParts.value = streamingMarkdownRenderer.render(displayedText.value, {
+      streaming: effectivelyStreaming,
+      preserveSoftBreaks: props.preserveSoftBreaks
+    });
   } catch (error) {
     streamingMarkdownRenderer.reset();
     console.warn('[LimCode] Failed to render markdown.', error);

@@ -30,6 +30,7 @@ type MarkdownRenderRule = (
 type MarkdownParser = {
   options: MarkdownOptions;
   render(text: string): string;
+  renderInline(text: string): string;
   parse(text: string, env: unknown): MarkdownToken[];
   use(plugin: unknown, options?: unknown): MarkdownParser;
   validateLink(url: string): boolean;
@@ -56,54 +57,71 @@ export interface StreamingMarkdownRendererDiagnostics {
   parsedChars: number;
 }
 
+export interface MarkdownRenderOptions {
+  streaming?: boolean;
+  preserveSoftBreaks?: boolean;
+}
+
 const FINAL_CACHE_LIMIT = 80;
 
 // ChatView 本身会在 bridge 握手后按需加载；解析器随 ChatView 一起就绪，避免消息首帧后再发起 Markdown 分包请求。
 const parser = createParser(MarkdownIt as unknown as MarkdownItConstructor);
+const softBreakParser = createParser(MarkdownIt as unknown as MarkdownItConstructor, true);
 const finalRenderCache = new Map<string, string>();
 const finalPartCache = new Map<string, MarkdownRenderedPart[]>();
 
 /** 渲染 Markdown。streaming=true 时不写入最终缓存，避免流式增量产生大量一次性 key。 */
-export function renderMarkdown(text: string, options: { streaming?: boolean } = {}): string {
+export function renderMarkdown(text: string, options: MarkdownRenderOptions = {}): string {
   const normalized = text.trimStart();
   if (!normalized) return '';
+  const renderParser = parserFor(options);
+  const cacheKey = finalCacheKey(normalized, options.preserveSoftBreaks === true);
 
   if (!options.streaming) {
-    const cached = finalRenderCache.get(normalized);
+    const cached = finalRenderCache.get(cacheKey);
     if (cached !== undefined) {
-      finalRenderCache.delete(normalized);
-      finalRenderCache.set(normalized, cached);
+      finalRenderCache.delete(cacheKey);
+      finalRenderCache.set(cacheKey, cached);
       return cached;
     }
   }
 
-  const html = parser.render(normalized);
+  const html = renderParser.render(normalized);
 
-  if (!options.streaming) rememberFinalRender(normalized, html);
+  if (!options.streaming) rememberFinalRender(cacheKey, html);
   return html;
+}
+
+/** 渲染适合标题、摘要等单行容器的内联 Markdown，不生成段落等块级标签。 */
+export function renderInlineMarkdown(text: string): string {
+  const normalized = text.trim();
+  if (!normalized) return '';
+  return parser.renderInline(normalized);
 }
 
 /**
  * 渲染 Markdown 为可由 Vue 组合展示的片段。
  * fenced / indented code block 会拆成 code 片段，交给专门的代码块显示器处理。
  */
-export function renderMarkdownParts(text: string, options: { streaming?: boolean } = {}): MarkdownRenderedPart[] {
+export function renderMarkdownParts(text: string, options: MarkdownRenderOptions = {}): MarkdownRenderedPart[] {
   const normalized = text.trimStart();
   if (!normalized) return [];
+  const renderParser = parserFor(options);
+  const cacheKey = finalCacheKey(normalized, options.preserveSoftBreaks === true);
 
   if (!options.streaming) {
-    const cached = finalPartCache.get(normalized);
+    const cached = finalPartCache.get(cacheKey);
     if (cached !== undefined) {
-      finalPartCache.delete(normalized);
-      finalPartCache.set(normalized, cached);
+      finalPartCache.delete(cacheKey);
+      finalPartCache.set(cacheKey, cached);
       return cached;
     }
   }
 
-  const tokens = parser.parse(normalized, {});
-  const parts = tokensToRenderedParts(parser, tokens);
+  const tokens = renderParser.parse(normalized, {});
+  const parts = tokensToRenderedParts(renderParser, tokens);
 
-  if (!options.streaming) rememberFinalParts(normalized, parts);
+  if (!options.streaming) rememberFinalParts(cacheKey, parts);
   return parts;
 }
 
@@ -114,20 +132,21 @@ export function renderMarkdownParts(text: string, options: { streaming?: boolean
  */
 export function createStreamingMarkdownPartsRenderer() {
   let previousText = '';
+  let previousPreserveSoftBreaks: boolean | undefined;
   let stableChars = 0;
   let stableParts: MarkdownRenderedPart[] = [];
   let incrementalDisabled = false;
   let parseCalls = 0;
   let parsedChars = 0;
 
-  const renderStreamingChunk = (source: string): MarkdownRenderedPart[] => {
+  const renderStreamingChunk = (source: string, preserveSoftBreaks: boolean): MarkdownRenderedPart[] => {
     if (!source) return [];
     parseCalls += 1;
     parsedChars += source.length;
-    return renderMarkdownParts(source, { streaming: true });
+    return renderMarkdownParts(source, { streaming: true, preserveSoftBreaks });
   };
 
-  const reset = (): void => {
+  const resetState = (): void => {
     previousText = '';
     stableChars = 0;
     stableParts = [];
@@ -136,33 +155,41 @@ export function createStreamingMarkdownPartsRenderer() {
     parsedChars = 0;
   };
 
+  const reset = (): void => {
+    resetState();
+    previousPreserveSoftBreaks = undefined;
+  };
+
   return {
-    render(text: string, options: { streaming?: boolean } = {}): MarkdownRenderedPart[] {
+    render(text: string, options: MarkdownRenderOptions = {}): MarkdownRenderedPart[] {
       const normalized = text.trimStart();
+      const preserveSoftBreaks = options.preserveSoftBreaks === true;
       if (!normalized) {
         reset();
         return [];
       }
       if (!options.streaming) {
-        const final = renderMarkdownParts(normalized, { streaming: false });
+        const final = renderMarkdownParts(normalized, { streaming: false, preserveSoftBreaks });
         reset();
         return final;
       }
 
-      if (!normalized.startsWith(previousText) || previousText.length < stableChars) reset();
+      if (previousPreserveSoftBreaks !== undefined && previousPreserveSoftBreaks !== preserveSoftBreaks) resetState();
+      previousPreserveSoftBreaks = preserveSoftBreaks;
+      if (!normalized.startsWith(previousText) || previousText.length < stableChars) resetState();
       previousText = normalized;
       if (containsGlobalMarkdownDefinition(normalized)) incrementalDisabled = true;
-      if (incrementalDisabled) return renderStreamingChunk(normalized);
+      if (incrementalDisabled) return renderStreamingChunk(normalized, preserveSoftBreaks);
 
       const tail = normalized.slice(stableChars);
       const commitIndex = findStreamingMarkdownCommitIndex(tail);
       if (commitIndex > 0) {
         const committed = tail.slice(0, commitIndex);
-        stableParts = [...stableParts, ...renderStreamingChunk(committed)];
+        stableParts = [...stableParts, ...renderStreamingChunk(committed, preserveSoftBreaks)];
         stableChars += commitIndex;
       }
       const mutableTail = normalized.slice(stableChars);
-      return [...stableParts, ...renderStreamingChunk(mutableTail)];
+      return [...stableParts, ...renderStreamingChunk(mutableTail, preserveSoftBreaks)];
     },
     reset,
     diagnostics(): StreamingMarkdownRendererDiagnostics {
@@ -270,13 +297,21 @@ function languageFromInfo(info: string | undefined): string {
   return classMatch?.[1] ?? trimmed.split(/\s+/)[0] ?? '';
 }
 
-function rememberFinalRender(text: string, html: string): void {
-  finalRenderCache.set(text, html);
+function parserFor(options: MarkdownRenderOptions): MarkdownParser {
+  return options.preserveSoftBreaks === true ? softBreakParser : parser;
+}
+
+function finalCacheKey(text: string, preserveSoftBreaks: boolean): string {
+  return `${preserveSoftBreaks ? 'soft-breaks' : 'commonmark'}\0${text}`;
+}
+
+function rememberFinalRender(cacheKey: string, html: string): void {
+  finalRenderCache.set(cacheKey, html);
   trimFinalCache(finalRenderCache);
 }
 
-function rememberFinalParts(text: string, parts: MarkdownRenderedPart[]): void {
-  finalPartCache.set(text, parts);
+function rememberFinalParts(cacheKey: string, parts: MarkdownRenderedPart[]): void {
+  finalPartCache.set(cacheKey, parts);
   trimFinalCache(finalPartCache);
 }
 
@@ -287,12 +322,12 @@ function trimFinalCache(cache: Map<string, unknown>): void {
   if (oldestKey !== undefined) cache.delete(oldestKey);
 }
 
-function createParser(MarkdownItCtor: MarkdownItConstructor): MarkdownParser {
+function createParser(MarkdownItCtor: MarkdownItConstructor, preserveSoftBreaks = false): MarkdownParser {
   const parser = new MarkdownItCtor({
     html: false,
     linkify: true,
     typographer: false,
-    breaks: false
+    breaks: preserveSoftBreaks
   });
 
   parser.use(texmath, {
