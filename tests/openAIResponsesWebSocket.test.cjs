@@ -33,6 +33,9 @@ const {
   geminiThinkingCapabilityForModel
 } = require('../dist/extension/shared/geminiThinking.js');
 const { LlmEventType } = require('../dist/extension/backend/world/modules/llm/events.js');
+const {
+  createLlmStreamEventBatcher
+} = require('../dist/extension/backend/capabilities/llmStreamEventBatcher.js');
 
 function loadLlmParameterDefinitions() {
   const root = path.resolve(__dirname, '..');
@@ -658,6 +661,37 @@ test('OpenAI Responses compact dry-run stays on the HTTP compact endpoint when c
   assert.match(result.calls[0].url, /^https:\/\//);
   assert.match(result.calls[0].url, /responses\/compact/);
   assert.doesNotMatch(result.calls[0].providerName, /WebSocket$/);
+});
+
+test('stream event batcher flushes earlier text and emits tool deltas immediately', () => {
+  const events = [];
+  const batcher = createLlmStreamEventBatcher((event) => events.push(event), { intervalMs: 10_000 });
+  batcher.emit({
+    type: LlmEventType.Delta,
+    payload: { requestId: 'request-tool-direct', text: 'before tool' }
+  });
+  assert.equal(events.length, 0);
+
+  for (const argumentsDelta of ['{"path":', '"demo.ts"}']) {
+    batcher.emit({
+      type: LlmEventType.ToolCallDelta,
+      payload: {
+        requestId: 'request-tool-direct',
+        calls: [{ id: 'call-tool-direct', name: 'write', argumentsDelta }]
+      }
+    });
+  }
+
+  assert.deepEqual(events.map((event) => event.type), [
+    LlmEventType.Delta,
+    LlmEventType.ToolCallDelta,
+    LlmEventType.ToolCallDelta
+  ]);
+  assert.deepEqual(
+    events.slice(1).map((event) => event.payload.calls[0].argumentsDelta),
+    ['{"path":', '"demo.ts"}']
+  );
+  batcher.dispose(false);
 });
 
 

@@ -5,7 +5,6 @@ import {
   type LlmDonePayload,
   type LlmErrorPayload,
   type LlmStreamAggregationMetrics,
-  type LlmToolCallDeltaPayload,
   type LlmThoughtDeltaPayload,
   type LlmThoughtProgressPayload
 } from '../world/modules/llm/events';
@@ -155,14 +154,13 @@ export function createLlmStreamEventBatcher(
 function isMergeableDeltaEvent(event: WorldEvent): boolean {
   return event.type === LlmEventType.Delta
     || event.type === LlmEventType.ThoughtDelta
-    || event.type === LlmEventType.ThoughtProgress
-    || event.type === LlmEventType.ToolCallDelta;
+    || event.type === LlmEventType.ThoughtProgress;
 }
 
 function mergeAdjacentDeltaEvents(previous: WorldEvent, next: WorldEvent): WorldEvent | undefined {
   if (previous.type !== next.type) return undefined;
-  const previousPayload = previous.payload as LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload | LlmToolCallDeltaPayload;
-  const nextPayload = next.payload as LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload | LlmToolCallDeltaPayload;
+  const previousPayload = previous.payload as LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload;
+  const nextPayload = next.payload as LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload;
   if (!sameStreamIdentity(previousPayload, nextPayload)) return undefined;
 
   if (previous.type === LlmEventType.Delta) {
@@ -174,12 +172,6 @@ function mergeAdjacentDeltaEvents(previous: WorldEvent, next: WorldEvent): World
         text: (previousPayload as LlmDeltaPayload).text + (nextPayload as LlmDeltaPayload).text
       }
     };
-  }
-
-  if (previous.type === LlmEventType.ToolCallDelta) {
-    const left = previousPayload as LlmToolCallDeltaPayload;
-    const right = nextPayload as LlmToolCallDeltaPayload;
-    return { ...next, payload: { ...left, ...right, calls: mergeToolCallArgumentDeltas(left.calls, right.calls) } };
   }
 
   if (previous.type === LlmEventType.ThoughtDelta) {
@@ -206,8 +198,8 @@ function mergeAdjacentDeltaEvents(previous: WorldEvent, next: WorldEvent): World
 }
 
 function sameStreamIdentity(
-  left: LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload | LlmToolCallDeltaPayload,
-  right: LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload | LlmToolCallDeltaPayload
+  left: LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload,
+  right: LlmDeltaPayload | LlmThoughtDeltaPayload | LlmThoughtProgressPayload
 ): boolean {
   return left.requestId === right.requestId
     && left.attemptId === right.attemptId
@@ -225,33 +217,6 @@ function outputItemIdentity(value: { outputItem?: unknown }): string {
 }
 
 function eventTextLength(event: WorldEvent): number {
-  if (event.type === LlmEventType.ToolCallDelta) {
-    return (event.payload as LlmToolCallDeltaPayload).calls
-      .reduce((total, call) => total + call.argumentsDelta.length, 0);
-  }
   const payload = event.payload as Partial<LlmDeltaPayload | LlmThoughtDeltaPayload>;
   return typeof payload.text === 'string' ? payload.text.length : 0;
-}
-
-function mergeToolCallArgumentDeltas(
-  left: LlmToolCallDeltaPayload['calls'],
-  right: LlmToolCallDeltaPayload['calls']
-): LlmToolCallDeltaPayload['calls'] {
-  const merged = left.map((call) => ({ ...call }));
-  const indexById = new Map(merged.map((call, index) => [call.id, index]));
-  for (const call of right) {
-    const index = indexById.get(call.id);
-    if (index === undefined) {
-      indexById.set(call.id, merged.length);
-      merged.push({ ...call });
-      continue;
-    }
-    const previous = merged[index]!;
-    merged[index] = {
-      ...previous,
-      ...call,
-      argumentsDelta: call.replace ? call.argumentsDelta : previous.argumentsDelta + call.argumentsDelta
-    };
-  }
-  return merged;
 }

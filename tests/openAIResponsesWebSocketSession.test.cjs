@@ -893,9 +893,13 @@ test('tool argument deltas stream independently and completed function calls are
       'tool-prefix',
       requestBody(format, [user('write a file')])
     ));
-    const streamedArgs = chunks
-      .flatMap((chunk) => chunk.toolCallArgumentDeltas ?? [])
+    const argumentDeltas = chunks.flatMap((chunk) => chunk.toolCallArgumentDeltas ?? []);
+    const streamedArgs = argumentDeltas
       .reduce((value, delta) => delta.replace ? delta.argumentsDelta : value + delta.argumentsDelta, '');
+    assert.deepEqual(
+      argumentDeltas.map((delta) => delta.argumentsDelta),
+      ['{"path":"a.txt",', '"content":"hello"}']
+    );
     assert.equal(streamedArgs, toolCall.arguments);
 
     const modelToolCall = {
@@ -930,6 +934,54 @@ test('tool argument deltas stream independently and completed function calls are
     assert.equal(requests[1].request.input[0].type, 'function_call_output');
     assert.equal(requests[1].request.input[0].call_id, toolCall.call_id);
     assert.equal(requests[1].request.input.some((item) => item.type === 'function_call'), false);
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('synchronous text delta bursts preserve provider event boundaries', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const assistant = {
+    id: 'msg_text_burst',
+    type: 'message',
+    role: 'assistant',
+    status: 'completed',
+    content: [{ type: 'output_text', text: 'hello world', annotations: [] }]
+  };
+  const server = await createServer((socket) => {
+    socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_text_burst' } }));
+    socket.send(JSON.stringify({
+      type: 'response.output_item.added',
+      response_id: 'resp_text_burst',
+      output_index: 0,
+      item: { ...assistant, status: 'in_progress', content: [] }
+    }));
+    for (const delta of ['hello ', 'world']) {
+      socket.send(JSON.stringify({
+        type: 'response.output_text.delta',
+        response_id: 'resp_text_burst',
+        item_id: assistant.id,
+        output_index: 0,
+        content_index: 0,
+        delta
+      }));
+    }
+    sendOutputItemDone(socket, 'resp_text_burst', 0, assistant);
+    sendResponseCompleted(socket, 'resp_text_burst');
+  });
+  try {
+    const format = await formatForTest();
+    const chunks = await collect(streamOptions(
+      server,
+      format,
+      'text-delta-burst',
+      requestBody(format, [user('stream text')])
+    ));
+    assert.deepEqual(
+      chunks.map((chunk) => chunk.textDelta).filter((delta) => typeof delta === 'string' && delta),
+      ['hello ', 'world']
+    );
   } finally {
     resetOpenAIResponsesWebSocketSessions();
     await server.close();

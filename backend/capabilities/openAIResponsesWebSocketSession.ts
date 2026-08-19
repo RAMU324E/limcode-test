@@ -1078,7 +1078,7 @@ async function* sendCreateAndReadEvents(
   currentConnectionIdentityHash: () => string,
   nextResponseCreateSeq: () => number
 ): AsyncGenerator<Record<string, unknown>> {
-  const queue = new MergeableAsyncQueue<Record<string, unknown>>(mergeDeltaEvents);
+  const queue = new AsyncEventQueue<Record<string, unknown>>();
   let sawTerminal = false;
   let sawEvent = false;
   let firstEventTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -1263,12 +1263,10 @@ function positiveTimeout(value: number | undefined, fallback: number, label: str
   return value;
 }
 
-class MergeableAsyncQueue<T> implements AsyncIterable<T> {
+class AsyncEventQueue<T> implements AsyncIterable<T> {
   private readonly items: Array<{ value?: T; done?: true; error?: Error }> = [];
   private readonly waiters: Array<(item: { value?: T; done?: true; error?: Error }) => void> = [];
   private closed = false;
-
-  public constructor(private readonly merge: (previous: T, next: T) => T | undefined) {}
 
   public push(value: T): void {
     if (this.closed) return;
@@ -1276,14 +1274,6 @@ class MergeableAsyncQueue<T> implements AsyncIterable<T> {
     if (waiter) {
       waiter({ value });
       return;
-    }
-    const last = this.items[this.items.length - 1];
-    if (last?.value !== undefined) {
-      const merged = this.merge(last.value, value);
-      if (merged !== undefined) {
-        last.value = merged;
-        return;
-      }
     }
     this.items.push({ value });
   }
@@ -1318,36 +1308,6 @@ class MergeableAsyncQueue<T> implements AsyncIterable<T> {
       if (item.value !== undefined) yield item.value;
     }
   }
-}
-
-const MERGEABLE_DELTA_EVENTS = new Set([
-  'response.output_text.delta',
-  'response.reasoning_summary_text.delta',
-  'response.reasoning_text.delta',
-  'response.reasoning.delta',
-  'response.function_call_arguments.delta',
-  'response.custom_tool_call_input.delta'
-]);
-const DELTA_IDENTITY_FIELDS = [
-  'response_id',
-  'item_id',
-  'call_id',
-  'output_index',
-  'content_index',
-  'summary_index'
-];
-
-function mergeDeltaEvents(
-  previous: Record<string, unknown>,
-  next: Record<string, unknown>
-): Record<string, unknown> | undefined {
-  const type = eventType(previous);
-  if (!type || type !== eventType(next) || !MERGEABLE_DELTA_EVENTS.has(type)) return undefined;
-  if (typeof previous.delta !== 'string' || typeof next.delta !== 'string') return undefined;
-  for (const field of DELTA_IDENTITY_FIELDS) {
-    if (previous[field] !== next[field]) return undefined;
-  }
-  return { ...previous, ...next, delta: previous.delta + next.delta };
 }
 
 function observeOutputItem(
