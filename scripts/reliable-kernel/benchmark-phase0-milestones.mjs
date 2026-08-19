@@ -203,12 +203,34 @@ async function benchmarkShortProcesses(sampleCount) {
           const dispatched = await app.processes.dispatchStart(prepared.effect.effectIntentId, 5_000);
           const dispatchDurationMs = performance.now() - dispatchStartedAt;
           assert.equal(dispatched.observation?.foreground?.state, 'exited');
+          const observation = dispatched.observation;
+          const foreground = observation?.foreground;
           const events = collector.snapshot().events.filter((event) => event.kind === 'process.phase');
           return {
             prepareDurationMs,
             dispatchDurationMs,
             totalDurationMs: prepareDurationMs + dispatchDurationMs,
             terminalStatus: dispatched.terminal?.status ?? null,
+            processEvidence: {
+              observationOutcome: observation?.outcome ?? null,
+              observationState: observation?.state ?? null,
+              launchOutcome: observation?.launch.outcome ?? null,
+              ...(observation?.launch.outcome && observation.launch.outcome !== 'succeeded'
+                ? { launchError: observation.launch.error }
+                : {}),
+              foregroundState: foreground?.state ?? null,
+              ...(foreground?.state === 'exited'
+                ? {
+                    exitCode: foreground.receipt.exitCode,
+                    signal: foreground.receipt.signal,
+                    terminationReason: foreground.receipt.terminationReason,
+                    stopRequested: foreground.receipt.stopRequested
+                  }
+                : {}),
+              ...(foreground?.state === 'outcome_unknown'
+                ? { outcomeUnknownReason: foreground.reason }
+                : {})
+            },
             phases: Object.fromEntries(['spawn', 'identity_ready', 'terminal_receipt', 'output_import'].map((phase) => {
               const observed = events.filter((event) => event.phase === phase);
               return [phase, {

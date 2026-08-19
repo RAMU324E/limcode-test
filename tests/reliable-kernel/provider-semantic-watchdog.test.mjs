@@ -506,7 +506,11 @@ test('Phase 0 Provider/Process/Client Feed 里程碑基准报告真实原始计�
     assert.deepEqual(report.process.map((entry) => entry.command), ['true', 'printf_x', 'rg']);
     for (const processCase of report.process) {
       const measurement = processCase.measurements[0];
-      assert.equal(measurement.terminalStatus, 'succeeded');
+      assert.equal(
+        measurement.terminalStatus,
+        'succeeded',
+        `${processCase.command}: ${JSON.stringify(measurement.processEvidence)}`
+      );
       for (const phase of ['spawn', 'identity_ready', 'terminal_receipt']) {
         assert.ok(measurement.phases[phase].count >= 1, `${processCase.command} lacks ${phase}`);
       }
