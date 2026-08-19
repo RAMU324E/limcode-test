@@ -276,6 +276,111 @@ test('retry源消息软删除后，transient输出锚定到上一条可见消息
   assert.equal(projection.messages[1].content.parts[0].text, '新的回答');
 });
 
+test('retry只有sourceTurn来源时，首个thought transient仍锚定到会话末尾', async (context) => {
+  const server = await createViteServer(context);
+  const { projectReliableConversation } = await server.ssrLoadModule(
+    '/src/domain/reliableConversationProjection.ts'
+  );
+  const { hasVisibleStreamingTransientForTurn } = await server.ssrLoadModule(
+    '/src/domain/reliableTransientActivity.ts'
+  );
+  const transientModelRequests = {
+    retry: {
+      conversationId: 'conversation-source-turn-retry',
+      turnId: 'turn-retry',
+      modelRequestId: 'request-retry',
+      requestSeq: '1',
+      providerId: 'provider-retry',
+      modelId: 'gpt-retry',
+      streamSeq: '1',
+      text: '',
+      thought: '**Planning Linux reproduction with Docker**',
+      thoughtActive: true,
+      outputParts: [{
+        text: '**Planning Linux reproduction with Docker**',
+        thought: true,
+        outputItem: { id: 'reasoning-1', ordinal: 0 }
+      }],
+      toolCalls: [],
+      status: 'streaming',
+      startedAt: Date.parse('2026-08-19T04:31:04.682Z'),
+      updatedAt: Date.parse('2026-08-19T04:31:04.715Z')
+    }
+  };
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-source-turn-retry',
+    records: {
+      Turn: {
+        source: {
+          id: 'turn-source',
+          conversation_id: 'conversation-source-turn-retry',
+          status: 'terminated',
+          created_at: '2026-08-19T04:30:00.000Z'
+        },
+        // Runtime retry intent has sourceTurnId only; its projected Turn has no source_message_id.
+        retry: {
+          id: 'turn-retry',
+          conversation_id: 'conversation-source-turn-retry',
+          status: 'active',
+          created_at: '2026-08-19T04:30:55.277Z'
+        }
+      },
+      Message: {
+        tail: {
+          id: 'message-source-tail',
+          conversation_id: 'conversation-source-turn-retry',
+          message_seq: '133',
+          revision_id: 'revision-source-tail',
+          role: 'model',
+          created_at: '2026-08-19T04:30:35.636Z'
+        }
+      },
+      MessageTurnLink: {
+        tail: {
+          id: 'message-turn-source-tail',
+          message_id: 'message-source-tail',
+          turn_id: 'turn-source',
+          role: 'model',
+          created_at: '2026-08-19T04:30:35.636Z'
+        }
+      },
+      ModelRequest: {
+        retry: {
+          id: 'request-retry',
+          turn_id: 'turn-retry',
+          request_seq: '1',
+          model_id: 'gpt-retry',
+          status: 'streaming',
+          created_at: '2026-08-19T04:30:55.748Z'
+        }
+      }
+    },
+    details: {
+      'message-content:revision-source-tail': ready(JSON.stringify({
+        role: 'model',
+        parts: [{ text: '上一回合输出' }]
+      }))
+    },
+    transientModelRequests
+  });
+
+  assert.deepEqual(projection.messages.map((message) => message.id), [
+    'message-source-tail',
+    'transient:request-retry'
+  ]);
+  assert.equal(projection.messages[1].seq, 133.5);
+  assert.equal(projection.messages[1].content.parts[0].thought, true);
+  assert.equal(
+    projection.messages[1].content.parts[0].text,
+    '**Planning Linux reproduction with Docker**'
+  );
+  assert.equal(hasVisibleStreamingTransientForTurn(
+    transientModelRequests,
+    'turn-retry',
+    new Set(['request-retry'])
+  ), true);
+});
+
 test('长流积压达到阈值时直刷，terminal时立即显示完整文本', async (context) => {
   const server = await createViteServer(context);
   const vue = await import('vue');

@@ -645,8 +645,8 @@ function transientSequenceAnchor(input: {
     const sourceMessageId = input.sourceMessageIdByTurnId.get(input.transient.turnId);
     if (sourceMessageId) {
       lower = input.messages.find((candidate) => candidate.message.id === sourceMessageId);
-      if (!lower) lower = [...input.messages].sort(compareParsedMessages).pop();
     }
+    if (!lower) lower = [...input.messages].sort(compareParsedMessages).pop();
   }
   if (!lower) return undefined;
   if (!upper) {
