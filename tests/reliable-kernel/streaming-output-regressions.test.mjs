@@ -228,7 +228,7 @@ test('retry activity disappears as soon as the current attempt renders model out
   }), undefined);
 });
 
-test('streaming tool preview coalesces updates by animation frame and commits final immediately', async (context) => {
+test('streaming tool preview coalesces updates by frame and preserves pending partial before final', async (context) => {
   const server = await createWebviewTestServer();
   const previousWindow = globalThis.window;
   const frames = new Map();
@@ -317,10 +317,28 @@ test('streaming tool preview coalesces updates by animation frame and commits fi
   preview.value = previewState(4);
   await vue.nextTick();
   assert.equal(frames.size, 1, 'an update after the prior frame schedules the next natural frame');
-  const finalFrameId = [...frames.keys()][0];
+  const partialFrameId = [...frames.keys()][0];
 
   preview.value = previewState(5, true);
   await vue.nextTick();
-  assert.equal(frames.size, 0, 'final state does not wait for the pending animation frame');
-  assert.deepEqual(cancelledFrames, [finalFrameId]);
+  assert.deepEqual([...frames.keys()], [partialFrameId], 'final keeps the pending partial frame');
+  assert.deepEqual(cancelledFrames, []);
+
+  const partialFrame = frames.get(partialFrameId);
+  frames.delete(partialFrameId);
+  partialFrame(performance.now());
+  await vue.nextTick();
+  assert.equal(frames.size, 1, 'final is scheduled for the frame after the pending partial');
+  const finalFrameId = [...frames.keys()][0];
+  assert.notEqual(finalFrameId, partialFrameId);
+
+  const finalFrame = frames.get(finalFrameId);
+  frames.delete(finalFrameId);
+  finalFrame(performance.now());
+  await vue.nextTick();
+  assert.equal(frames.size, 0);
+
+  preview.value = previewState(6, true);
+  await vue.nextTick();
+  assert.equal(frames.size, 0, 'final without a pending partial is still committed immediately');
 });

@@ -14,6 +14,7 @@ const props = defineProps<{
 
 const framedPreview = shallowRef<ReliableTransientToolCallState>({ ...props.preview });
 const pendingPreview = shallowRef<ReliableTransientToolCallState | undefined>();
+const pendingFinalPreview = shallowRef<ReliableTransientToolCallState | undefined>();
 const previewScroller = ref<HTMLElement | null>(null);
 useBottomStickyScroller(previewScroller);
 let frameRequest: number | undefined;
@@ -21,7 +22,7 @@ let renderModeCallId = framedPreview.value.callId;
 const frozenRenderMode = ref<ToolCallPreviewRenderMode | undefined>();
 
 const presentation = computed(() => toolCallPreviewPresentation(framedPreview.value));
-const previewFinal = computed(() => props.preview.final === true);
+const previewFinal = computed(() => framedPreview.value.final === true);
 const previewStreaming = computed(() => props.active && !previewFinal.value);
 const displayTitle = computed(() => {
   if (previewStreaming.value) return presentation.value.title;
@@ -63,10 +64,12 @@ watch(
 watch(
   () => props.preview,
   (next) => {
+    if (next.final === true && frameRequest !== undefined && pendingPreview.value) {
+      pendingFinalPreview.value = { ...next };
+      return;
+    }
     pendingPreview.value = { ...next };
     if (next.final === true) {
-      if (frameRequest !== undefined) window.cancelAnimationFrame(frameRequest);
-      frameRequest = undefined;
       flushPreviewFrame();
       return;
     }
@@ -80,6 +83,7 @@ onBeforeUnmount(() => {
   if (frameRequest !== undefined) window.cancelAnimationFrame(frameRequest);
   frameRequest = undefined;
   pendingPreview.value = undefined;
+  pendingFinalPreview.value = undefined;
 });
 
 function flushPreviewFrame(): void {
@@ -87,6 +91,11 @@ function flushPreviewFrame(): void {
   const next = pendingPreview.value;
   pendingPreview.value = undefined;
   if (next) framedPreview.value = next;
+  const finalPreview = pendingFinalPreview.value;
+  if (!finalPreview) return;
+  pendingFinalPreview.value = undefined;
+  pendingPreview.value = finalPreview;
+  frameRequest = window.requestAnimationFrame(flushPreviewFrame);
 }
 
 function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation>['kind']): string {
