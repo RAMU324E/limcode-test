@@ -24,7 +24,12 @@ import {
   type ReliableKernelTransientBatchMessage,
   type ReliableKernelTransientMessage
 } from '@shared/reliableKernelClientFeed';
-import { createMessageId, type LlmUsageMetadataRecord, type MessageContent } from '@shared/protocol';
+import {
+  createMessageId,
+  type LlmUsageMetadataRecord,
+  type MessageContent,
+  type ModelOutputItemReference
+} from '@shared/protocol';
 import {
   compareReliableTransientIdentity,
   mergeReliableCompletedToolCalls,
@@ -32,6 +37,13 @@ import {
   replaceReliableCompletedToolCalls,
   type ReliableTransientToolCallState
 } from '@webview/domain/reliableTransientModel';
+import {
+  applyReliableTransientOutputItem,
+  appendReliableTransientTextPart,
+  cloneReliableTransientParts,
+  syncReliableTransientFunctionCallParts,
+  updateReliableTransientThoughtPart
+} from '@webview/domain/reliableTransientOutput';
 import { reconcileReliableTransientRequests } from '@webview/domain/reliableTransientLifecycle';
 import { bridge } from '@webview/transport';
 
@@ -78,6 +90,8 @@ export interface ReliableKernelTransientState {
   streamSeq: string;
   text: string;
   thought: string;
+  /** Ordered low-latency model output; this is the transient rendering authority. */
+  outputParts: MessageContent['parts'];
   /** Exact terminal model parts; present once the Provider completion is observed. */
   completedContent?: MessageContent;
   thoughtSignature?: string;
@@ -484,6 +498,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       const current = identity === 'newer' ? undefined : prior;
       if (current && BigInt(current.streamSeq) >= BigInt(sequence)) return;
       const content = plainRecord(message.event.content);
+      const outputItem = modelOutputItemValue(content?.outputItem);
       const observedAt = timestamp(message.observedAt) || Date.now();
       const next: ReliableKernelTransientState = current
         ? {
@@ -505,6 +520,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
             streamSeq: sequence,
             text: '',
             thought: '',
+            outputParts: [],
             toolCalls: [],
             status: 'streaming',
             startedAt: observedAt,
@@ -514,6 +530,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         const completedContent = messageContentValue(content);
         if (!completedContent) return;
         next.completedContent = completedContent;
+        next.outputParts = cloneReliableTransientParts(completedContent.parts);
         next.text = completedContent.parts
           .filter((part) => 'text' in part && part.thought !== true)
           .map((part) => 'text' in part ? part.text : '')
@@ -548,7 +565,8 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
             ? [{
                 ...(part.id ? { id: part.id } : {}),
                 name: part.functionCall.name,
-                arguments: part.functionCall.args
+                arguments: part.functionCall.args,
+                ...(part.outputItem ? { outputItem: part.outputItem } : {})
               }]
             : []),
           message.modelRequestId,
@@ -565,9 +583,14 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         next.status = 'completed';
       } else if (message.event.kind === 'failed' || message.event.kind === 'cancelled') {
         next.status = message.event.kind;
+        // A Provider failure never authorizes dispatch of a partially assembled call. Retain
+        // auditable text/thought output, but remove the live tool card so it cannot still look active.
+        next.toolCalls = [];
+        next.outputParts = next.outputParts.filter((part) => !('functionCall' in part));
         if (content?.discardOutput === true) {
           next.text = '';
           next.thought = '';
+          next.outputParts = [];
           next.toolCalls = [];
           delete next.completedContent;
           delete next.thoughtSignature;
@@ -585,46 +608,97 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         const terminalThought = stringValue(content?.thought);
         if (terminalThought !== undefined) next.thought = terminalThought;
         if (next.thoughtActive) {
-          next.thoughtDurationMs = (next.thoughtCompletedDurationMs ?? 0)
-            + currentTransientThoughtDurationMs(next, observedAt);
+          const thoughtBlockDurationMs = currentTransientThoughtDurationMs(next, observedAt);
+          next.thoughtDurationMs = (next.thoughtCompletedDurationMs ?? 0) + thoughtBlockDurationMs;
           next.thoughtCompletedDurationMs = next.thoughtDurationMs;
+          next.outputParts = updateReliableTransientThoughtPart(next.outputParts, {
+            ...(next.thoughtSignature ? { thoughtSignature: next.thoughtSignature } : {}),
+            thoughtDurationMs: thoughtBlockDurationMs,
+            done: true
+          });
         }
         next.thoughtActive = false;
         delete next.thoughtStartedAt;
         delete next.thoughtElapsedMs;
       } else if (content?.type === 'text_delta') {
-        next.text += stringValue(content.text) ?? '';
+        const delta = stringValue(content.text) ?? '';
+        next.text += delta;
+        if (delta) {
+          next.outputParts = appendReliableTransientTextPart(next.outputParts, {
+            text: delta,
+            thought: false,
+            ...(outputItem ? { outputItem } : {})
+          });
+        }
       } else if (content?.type === 'thought_delta') {
-        next.thought += stringValue(content.text) ?? '';
+        const delta = stringValue(content.text) ?? '';
+        next.thought += delta;
         next.thoughtSignature = stringValue(content.thoughtSignature) ?? next.thoughtSignature;
         openTransientThought(next, content, observedAt);
+        if (delta) {
+          next.outputParts = appendReliableTransientTextPart(next.outputParts, {
+            text: delta,
+            thought: true,
+            ...(outputItem ? { outputItem } : {}),
+            ...(next.thoughtSignature ? { thoughtSignature: next.thoughtSignature } : {}),
+            ...(next.thoughtStartedAt !== undefined ? { thoughtStartedAt: next.thoughtStartedAt } : {}),
+            ...(next.thoughtCompletedDurationMs !== undefined
+              ? { thoughtCompletedDurationMs: next.thoughtCompletedDurationMs }
+              : {}),
+            ...(next.thoughtElapsedMs !== undefined ? { thoughtElapsedMs: next.thoughtElapsedMs } : {})
+          });
+        }
       } else if (content?.type === 'thought_progress') {
         next.thoughtSignature = stringValue(content.thoughtSignature) ?? next.thoughtSignature;
         openTransientThought(next, content, observedAt);
+        next.outputParts = updateReliableTransientThoughtPart(next.outputParts, {
+          ...(outputItem ? { outputItem } : {}),
+          ...(next.thoughtSignature ? { thoughtSignature: next.thoughtSignature } : {}),
+          ...(next.thoughtStartedAt !== undefined ? { thoughtStartedAt: next.thoughtStartedAt } : {}),
+          ...(next.thoughtCompletedDurationMs !== undefined
+            ? { thoughtCompletedDurationMs: next.thoughtCompletedDurationMs }
+            : {}),
+          ...(next.thoughtElapsedMs !== undefined ? { thoughtElapsedMs: next.thoughtElapsedMs } : {})
+        });
       } else if (content?.type === 'thought_done') {
+        const thoughtBlockDurationMs = nonNegativeNumber(content.thoughtBlockDurationMs)
+          ?? nonNegativeNumber(content.thoughtDurationMs)
+          ?? currentTransientThoughtDurationMs(next, observedAt);
         const thoughtDurationMs = nonNegativeNumber(content.thoughtDurationMs)
           ?? nonNegativeNumber(content.thoughtCompletedDurationMs)
-          ?? (next.thoughtCompletedDurationMs ?? 0) + currentTransientThoughtDurationMs(next, observedAt);
+          ?? (next.thoughtCompletedDurationMs ?? 0) + thoughtBlockDurationMs;
         next.thoughtDurationMs = thoughtDurationMs;
         next.thoughtCompletedDurationMs = thoughtDurationMs;
         next.thoughtActive = false;
         delete next.thoughtStartedAt;
         delete next.thoughtElapsedMs;
         next.thoughtSignature = stringValue(content.thoughtSignature) ?? next.thoughtSignature;
+        next.outputParts = updateReliableTransientThoughtPart(next.outputParts, {
+          ...(outputItem ? { outputItem } : {}),
+          ...(next.thoughtSignature ? { thoughtSignature: next.thoughtSignature } : {}),
+          thoughtDurationMs: thoughtBlockDurationMs,
+          done: true
+        });
+      } else if (content?.type === 'output_item_done' && outputItem) {
+        next.outputParts = applyReliableTransientOutputItem(next.outputParts, outputItem);
       } else if (content?.type === 'tool_call_delta') {
         next.toolCalls = mergeReliableToolCallDeltas(
           next.toolCalls,
           content.calls,
           message.modelRequestId,
-          observedAt
+          observedAt,
+          outputItem
         );
+        next.outputParts = syncReliableTransientFunctionCallParts(next.outputParts, next.toolCalls);
       } else if (content?.type === 'tool_calls' && Array.isArray(content.calls)) {
         next.toolCalls = mergeReliableCompletedToolCalls(
           next.toolCalls,
           content.calls,
           message.modelRequestId,
-          observedAt
+          observedAt,
+          outputItem
         );
+        next.outputParts = syncReliableTransientFunctionCallParts(next.outputParts, next.toolCalls);
       }
       this.transientModelRequests[message.modelRequestId] = next;
       // A streaming delta cannot retire any overlay. Full reconciliation scans the bounded durable
@@ -1064,6 +1138,17 @@ function afterNextPaint(callback: () => void): void {
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined;
+}
+
+function modelOutputItemValue(value: unknown): ModelOutputItemReference | undefined {
+  const record = plainRecord(value);
+  const id = nonEmptyString(record?.id);
+  const ordinal = nonNegativeNumber(record?.ordinal);
+  if (!id || ordinal === undefined) return undefined;
+  const phase = record?.phase === 'commentary' || record?.phase === 'final_answer'
+    ? record.phase
+    : undefined;
+  return { id, ordinal, ...(phase ? { phase } : {}) };
 }
 
 function messageContentValue(value: unknown): MessageContent | undefined {

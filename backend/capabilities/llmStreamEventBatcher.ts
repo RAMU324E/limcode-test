@@ -212,8 +212,16 @@ function sameStreamIdentity(
   return left.requestId === right.requestId
     && left.attemptId === right.attemptId
     && left.generation === right.generation
+    && outputItemIdentity(left) === outputItemIdentity(right)
     && left.streamSeq === undefined
     && right.streamSeq === undefined;
+}
+
+function outputItemIdentity(value: { outputItem?: unknown }): string {
+  const outputItem = value.outputItem;
+  if (!outputItem || typeof outputItem !== 'object' || Array.isArray(outputItem)) return '';
+  const id = (outputItem as { id?: unknown }).id;
+  return typeof id === 'string' ? id : '';
 }
 
 function eventTextLength(event: WorldEvent): number {

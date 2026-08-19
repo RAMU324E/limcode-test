@@ -1483,7 +1483,24 @@ export interface ConversationAgentSelectionRecord {
 
 export type ContentRole = MsgRole;
 
-export interface TextPart {
+/** OpenAI Responses 可显式区分工具前说明与最终答复；其他 provider 可不提供。 */
+export type AssistantMessagePhase = 'commentary' | 'final_answer';
+
+/**
+ * 一次模型输出中独立 output item 的稳定引用。
+ * `id` 是本次响应内稳定的展示/合并键，`ordinal` 表示 provider 输出顺序。
+ */
+export interface ModelOutputItemReference {
+  id: string;
+  ordinal: number;
+  phase?: AssistantMessagePhase;
+}
+
+export interface ModelOutputPartMetadata {
+  outputItem?: ModelOutputItemReference;
+}
+
+export interface TextPart extends ModelOutputPartMetadata {
   text: string;
   thought?: boolean;
   thoughtSignature?: string;
@@ -1497,7 +1514,7 @@ export interface TextPart {
   thoughtDurationMs?: number;
 }
 
-export interface FunctionCallPart {
+export interface FunctionCallPart extends ModelOutputPartMetadata {
   id?: string;
   functionCall: {
     name: string;
@@ -1506,7 +1523,7 @@ export interface FunctionCallPart {
   thoughtSignature?: string;
 }
 
-export interface FunctionResponsePart {
+export interface FunctionResponsePart extends ModelOutputPartMetadata {
   id?: string;
   functionResponse: {
     name: string;
@@ -1538,7 +1555,7 @@ export interface AttachmentCatalogEntry {
   sizeBytes: number;
 }
 
-export interface InlineDataPart {
+export interface InlineDataPart extends ModelOutputPartMetadata {
   inlineData: {
     mimeType: string;
     /** 运行时可用的纯 base64；持久化时小附件会外置到 attachments/blobs。 */
@@ -1558,11 +1575,11 @@ export interface InlineDataPart {
   };
 }
 
-export interface FileDataPart {
+export interface FileDataPart extends ModelOutputPartMetadata {
   fileData: { mimeType?: string; uri: string };
 }
 
-export interface ProviderContextPart {
+export interface ProviderContextPart extends ModelOutputPartMetadata {
   providerContext: {
     provider: string;
     format: string;

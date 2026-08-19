@@ -8,6 +8,7 @@ import type {
   LLMStreamChunk,
   StreamDecodeState
 } from 'unified-llm-provider';
+import type { AssistantMessagePhase, ModelOutputItemReference } from '../../shared/protocol';
 import {
   OpenAIResponsesContinuationProjection,
   hasSemanticChunkOutput
@@ -40,6 +41,10 @@ export interface OpenAIResponsesToolCallArgumentDelta {
 
 export interface LimCodeOpenAIResponsesStreamChunk extends LLMStreamChunk {
   toolCallArgumentDeltas?: OpenAIResponsesToolCallArgumentDelta[];
+  /** Output item owning this semantic chunk, when the Responses event identifies one. */
+  outputItem?: ModelOutputItemReference;
+  /** Terminal metadata update for an output item, including a late message phase. */
+  outputItemDone?: ModelOutputItemReference;
   /** Marks the provider boundary between independent reasoning output items. */
   reasoningItemDone?: boolean;
   /** Exact ordered model content proven against the terminal Responses output. */
@@ -250,6 +255,16 @@ interface ToolCallAccumulator {
   streamIndex?: string;
 }
 
+interface ToolCallAccumulatorRegistry {
+  readonly active: Set<ToolCallAccumulator>;
+  readonly byAlias: Map<string, ToolCallAccumulator>;
+}
+
+interface OutputItemRegistry {
+  readonly byAlias: Map<string, ModelOutputItemReference>;
+  nextOrdinal: number;
+}
+
 const sessions = new Map<string, WebSocketSession>();
 const proxyAgents = new Map<string, HttpsProxyAgent<string>>();
 
@@ -300,7 +315,11 @@ async function* streamLocked(
 
   const decodeState = options.format.createStreamState();
   const continuationProjection = new OpenAIResponsesContinuationProjection();
-  const toolCalls = new Map<string, ToolCallAccumulator>();
+  const toolCalls: ToolCallAccumulatorRegistry = {
+    active: new Set(),
+    byAlias: new Map()
+  };
+  const outputItems: OutputItemRegistry = { byAlias: new Map(), nextOrdinal: 0 };
   let responseId: string | undefined;
   let completedProjection: ReturnType<OpenAIResponsesContinuationProjection['completedProjection']>;
   let sawSemanticOutput = false;
@@ -322,6 +341,7 @@ async function* streamLocked(
     )) {
       const type = eventType(raw);
       responseId = responseIdFromPayload(raw) ?? responseId;
+      const outputItem = observeOutputItem(raw, outputItems);
       const argumentDeltas = captureToolCallArgumentDeltas(raw, toolCalls);
       if (isTerminalEvent(raw)) {
         observeTransportPhase(session, options, 'terminal', { reason: type ?? 'terminal' });
@@ -345,14 +365,18 @@ async function* streamLocked(
 
       const decodedChunk: LimCodeOpenAIResponsesStreamChunk = {
         ...decoded,
+        ...(outputItem.current ? { outputItem: outputItem.current } : {}),
+        ...(outputItem.done ? { outputItemDone: outputItem.done } : {}),
         ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {})
       };
       const projected = continuationProjection.observe(raw, decodedChunk);
       if (type === 'response.completed') {
-        completedProjection = continuationProjection.completedProjection(options.format);
+        completedProjection = continuationProjection.completedProjection();
       }
       const chunk: LimCodeOpenAIResponsesStreamChunk = {
         ...projected.chunk,
+        ...(outputItem.current ? { outputItem: outputItem.current } : {}),
+        ...(outputItem.done ? { outputItemDone: outputItem.done } : {}),
         ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {}),
         ...(type === 'response.output_item.done' && isRecord(raw.item) && raw.item.type === 'reasoning'
           ? { reasoningItemDone: true }
@@ -367,6 +391,7 @@ async function* streamLocked(
       }
       if (semanticOutput) sawSemanticOutput = true;
       if (hasMeaningfulChunk(chunk)) yield chunk;
+      if (outputItem.done) unregisterOutputItem(outputItems, outputItem.done);
 
       if (type === 'response.completed') {
         completed = true;
@@ -1325,16 +1350,81 @@ function mergeDeltaEvents(
   return { ...previous, ...next, delta: previous.delta + next.delta };
 }
 
+function observeOutputItem(
+  raw: Record<string, unknown>,
+  registry: OutputItemRegistry
+): { current?: ModelOutputItemReference; done?: ModelOutputItemReference } {
+  const type = eventType(raw);
+  const item = isRecord(raw.item) ? raw.item : undefined;
+  const aliases = outputItemAliases(item, raw);
+  if (aliases.length === 0) return {};
+  const matches = [...new Set(aliases
+    .map((alias) => registry.byAlias.get(alias))
+    .filter((value): value is ModelOutputItemReference => !!value))];
+  if (matches.length > 1) return {};
+
+  const existing = matches[0];
+  const wireOrdinal = typeof raw.output_index === 'number'
+    && Number.isSafeInteger(raw.output_index)
+    && raw.output_index >= 0
+      ? raw.output_index
+      : undefined;
+  const ordinal = existing?.ordinal ?? wireOrdinal ?? registry.nextOrdinal;
+  registry.nextOrdinal = Math.max(registry.nextOrdinal, ordinal + 1);
+  const wireId = (item ? normalizedString(item.id) : undefined) ?? normalizedString(raw.item_id);
+  const phase = assistantMessagePhase(item?.phase) ?? assistantMessagePhase(raw.phase) ?? existing?.phase;
+  const reference: ModelOutputItemReference = {
+    id: existing?.id ?? wireId ?? `output:${ordinal}`,
+    ordinal,
+    ...(phase ? { phase } : {})
+  };
+  for (const alias of [...aliases, `reference:${reference.id}`]) registry.byAlias.set(alias, reference);
+  if (existing && existing !== reference) {
+    for (const [alias, value] of registry.byAlias) {
+      if (value === existing) registry.byAlias.set(alias, reference);
+    }
+  }
+  return type === 'response.output_item.done'
+    ? { current: reference, done: reference }
+    : { current: reference };
+}
+
+function unregisterOutputItem(registry: OutputItemRegistry, reference: ModelOutputItemReference): void {
+  for (const [alias, value] of registry.byAlias) {
+    if (value === reference || value.id === reference.id) registry.byAlias.delete(alias);
+  }
+}
+
+function outputItemAliases(
+  item: Record<string, unknown> | undefined,
+  event: Record<string, unknown>
+): string[] {
+  const itemId = (item ? normalizedString(item.id) : undefined) ?? normalizedString(event.item_id);
+  const outputIndex = typeof event.output_index === 'number'
+    && Number.isSafeInteger(event.output_index)
+    && event.output_index >= 0
+      ? event.output_index
+      : undefined;
+  return [
+    ...(itemId ? [`item:${itemId}`] : []),
+    ...(outputIndex !== undefined ? [`output:${outputIndex}`] : [])
+  ];
+}
+
+function assistantMessagePhase(value: unknown): AssistantMessagePhase | undefined {
+  return value === 'commentary' || value === 'final_answer' ? value : undefined;
+}
+
 function captureToolCallArgumentDeltas(
   raw: Record<string, unknown>,
-  accumulators: Map<string, ToolCallAccumulator>
+  registry: ToolCallAccumulatorRegistry
 ): OpenAIResponsesToolCallArgumentDelta[] {
   const type = eventType(raw);
   if (type === 'response.output_item.added' && isRecord(raw.item)
     && raw.item.type === 'function_call') {
     const accumulator = toolAccumulatorFromItem(raw.item, raw);
     if (!accumulator) return [];
-    accumulators.set(accumulatorKey(raw.item, raw, accumulator.callId), accumulator);
+    registerToolAccumulator(registry, accumulator, raw.item, raw);
     return accumulator.arguments
       ? [{
           callId: accumulator.callId,
@@ -1346,7 +1436,7 @@ function captureToolCallArgumentDeltas(
   }
 
   if (type === 'response.function_call_arguments.delta') {
-    const accumulator = findToolAccumulator(raw, accumulators);
+    const accumulator = findToolAccumulator(raw, registry);
     const delta = typeof raw.delta === 'string' ? raw.delta : '';
     if (!accumulator || !delta) return [];
     accumulator.arguments += delta;
@@ -1363,28 +1453,36 @@ function captureToolCallArgumentDeltas(
     && (type !== 'response.output_item.done'
       || (isRecord(raw.item) && raw.item.type === 'function_call'))) {
     const source = type === 'response.output_item.done' && isRecord(raw.item) ? raw.item : raw;
-    const accumulator = findToolAccumulator(raw, accumulators)
+    const registered = findToolAccumulator(raw, registry);
+    const accumulator = registered
       ?? (isRecord(source) ? toolAccumulatorFromItem(source, raw) : undefined);
     const finalArguments = isRecord(source) ? normalizedString(source.arguments) : undefined;
-    if (!accumulator || finalArguments === undefined || finalArguments === accumulator.arguments) return [];
-    if (finalArguments.startsWith(accumulator.arguments)) {
-      const suffix = finalArguments.slice(accumulator.arguments.length);
-      accumulator.arguments = finalArguments;
-      return suffix ? [{
-        callId: accumulator.callId,
-        ...(accumulator.name ? { name: accumulator.name } : {}),
-        argumentsDelta: suffix,
-        ...(accumulator.streamIndex ? { streamIndex: accumulator.streamIndex } : {})
-      }] : [];
+    let deltas: OpenAIResponsesToolCallArgumentDelta[] = [];
+    if (accumulator && finalArguments !== undefined && finalArguments !== accumulator.arguments) {
+      if (finalArguments.startsWith(accumulator.arguments)) {
+        const suffix = finalArguments.slice(accumulator.arguments.length);
+        accumulator.arguments = finalArguments;
+        if (suffix) {
+          deltas = [{
+            callId: accumulator.callId,
+            ...(accumulator.name ? { name: accumulator.name } : {}),
+            argumentsDelta: suffix,
+            ...(accumulator.streamIndex ? { streamIndex: accumulator.streamIndex } : {})
+          }];
+        }
+      } else {
+        accumulator.arguments = finalArguments;
+        deltas = [{
+          callId: accumulator.callId,
+          ...(accumulator.name ? { name: accumulator.name } : {}),
+          argumentsDelta: finalArguments,
+          replace: true,
+          ...(accumulator.streamIndex ? { streamIndex: accumulator.streamIndex } : {})
+        }];
+      }
     }
-    accumulator.arguments = finalArguments;
-    return [{
-      callId: accumulator.callId,
-      ...(accumulator.name ? { name: accumulator.name } : {}),
-      argumentsDelta: finalArguments,
-      replace: true,
-      ...(accumulator.streamIndex ? { streamIndex: accumulator.streamIndex } : {})
-    }];
+    if (registered) unregisterToolAccumulator(registry, registered);
+    return deltas;
   }
   return [];
 }
@@ -1405,36 +1503,61 @@ function toolAccumulatorFromItem(
 
 function findToolAccumulator(
   event: Record<string, unknown>,
-  accumulators: Map<string, ToolCallAccumulator>
+  registry: ToolCallAccumulatorRegistry
 ): ToolCallAccumulator | undefined {
   const item = isRecord(event.item) ? event.item : undefined;
-  const directKeys = [
-    normalizedString(event.item_id),
-    item ? normalizedString(item.id) : undefined,
-    typeof event.output_index === 'number' ? `output:${event.output_index}` : undefined,
-    normalizedString(event.call_id),
-    item ? normalizedString(item.call_id) : undefined
-  ].filter((key): key is string => !!key);
-  for (const key of directKeys) {
-    const found = accumulators.get(key);
-    if (found) return found;
-  }
+  const matches = [...new Set(toolAccumulatorAliases(item, event)
+    .map((key) => registry.byAlias.get(key))
+    .filter((value): value is ToolCallAccumulator => !!value))];
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) return undefined;
+
   const callId = normalizedString(event.call_id) ?? (item ? normalizedString(item.call_id) : undefined);
   if (callId) {
-    for (const value of accumulators.values()) if (value.callId === callId) return value;
+    const callMatches = [...registry.active].filter((value) => value.callId === callId);
+    if (callMatches.length === 1) return callMatches[0];
+    if (callMatches.length > 1) return undefined;
   }
-  return accumulators.size === 1 ? accumulators.values().next().value : undefined;
+  return registry.active.size === 1 ? registry.active.values().next().value : undefined;
 }
 
-function accumulatorKey(
+function registerToolAccumulator(
+  registry: ToolCallAccumulatorRegistry,
+  accumulator: ToolCallAccumulator,
   item: Record<string, unknown>,
+  event: Record<string, unknown>
+): void {
+  registry.active.add(accumulator);
+  for (const alias of toolAccumulatorAliases(item, event, accumulator.callId)) {
+    registry.byAlias.set(alias, accumulator);
+  }
+}
+
+function unregisterToolAccumulator(
+  registry: ToolCallAccumulatorRegistry,
+  accumulator: ToolCallAccumulator
+): void {
+  registry.active.delete(accumulator);
+  for (const [alias, registered] of registry.byAlias) {
+    if (registered === accumulator) registry.byAlias.delete(alias);
+  }
+}
+
+function toolAccumulatorAliases(
+  item: Record<string, unknown> | undefined,
   event: Record<string, unknown>,
-  callId: string
-): string {
-  return normalizedString(item.id)
-    ?? normalizedString(event.item_id)
-    ?? (typeof event.output_index === 'number' ? `output:${event.output_index}` : undefined)
-    ?? callId;
+  fallbackCallId?: string
+): string[] {
+  const itemId = (item ? normalizedString(item.id) : undefined) ?? normalizedString(event.item_id);
+  const callId = normalizedString(event.call_id)
+    ?? (item ? normalizedString(item.call_id) : undefined)
+    ?? fallbackCallId;
+  const outputIndex = typeof event.output_index === 'number' ? event.output_index : undefined;
+  return [
+    ...(itemId ? [`item:${itemId}`] : []),
+    ...(outputIndex !== undefined ? [`output:${outputIndex}`] : []),
+    ...(callId ? [`call:${callId}`] : [])
+  ];
 }
 
 function streamIndex(item: Record<string, unknown>, event: Record<string, unknown>): string | undefined {
@@ -1554,6 +1677,7 @@ function hasMeaningfulChunk(chunk: LimCodeOpenAIResponsesStreamChunk): boolean {
     || !!chunk.thoughtSignature
     || !!chunk.thoughtSignatures
     || chunk.reasoningItemDone === true
+    || !!chunk.outputItemDone
     || !!chunk.completedContent;
 }
 

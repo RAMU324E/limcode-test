@@ -1,4 +1,8 @@
-import type { FunctionCallPart, ToolCallPreviewRecord } from '@shared/protocol';
+import type {
+  FunctionCallPart,
+  ModelOutputItemReference,
+  ToolCallPreviewRecord
+} from '@shared/protocol';
 import {
   advanceToolCallPreviewFields,
   appendToolCallPreviewArguments,
@@ -7,6 +11,7 @@ import {
 
 export interface ReliableTransientToolCallState extends ToolCallPreviewRecord {
   final: boolean;
+  outputItem?: ModelOutputItemReference;
   argumentsValue?: unknown;
   /** Process-local lexer state; never crosses the Webview bridge. */
   argumentPreviewState?: ToolCallPreviewIncrementalState;
@@ -48,6 +53,7 @@ interface CompletedToolCall {
   name: string;
   arguments: unknown;
   streamIndex?: string;
+  outputItem?: ModelOutputItemReference;
 }
 
 /**
@@ -59,7 +65,8 @@ export function mergeReliableToolCallDeltas(
   current: readonly ReliableTransientToolCallState[],
   input: unknown,
   modelRequestId: string,
-  observedAt: number
+  observedAt: number,
+  outputItem?: ModelOutputItemReference
 ): ReliableTransientToolCallState[] {
   if (!Array.isArray(input)) return [...current];
   const next = current.map((call) => ({ ...call }));
@@ -75,6 +82,7 @@ export function mergeReliableToolCallDeltas(
       callId,
       ...(delta.name ?? existing?.name ? { name: delta.name ?? existing?.name } : {}),
       ...(delta.streamIndex ?? existing?.streamIndex ? { streamIndex: delta.streamIndex ?? existing?.streamIndex } : {}),
+      ...(outputItem ?? existing?.outputItem ? { outputItem: outputItem ?? existing?.outputItem } : {}),
       ...preview,
       final: false,
       createdAt: existing?.createdAt ?? observedAt,
@@ -90,7 +98,8 @@ export function mergeReliableToolCallDeltas(
 export function replaceReliableCompletedToolCalls(
   input: unknown,
   modelRequestId: string,
-  observedAt: number
+  observedAt: number,
+  outputItem?: ModelOutputItemReference
 ): ReliableTransientToolCallState[] | undefined {
   if (!Array.isArray(input)) return undefined;
   const calls = input.map(completedToolCall).filter((call): call is CompletedToolCall => call !== undefined);
@@ -102,6 +111,7 @@ export function replaceReliableCompletedToolCalls(
       callId,
       name: call.name,
       ...(call.streamIndex ? { streamIndex: call.streamIndex } : {}),
+      ...(outputItem ?? call.outputItem ? { outputItem: outputItem ?? call.outputItem } : {}),
       ...previewFromText(raw),
       final: true,
       argumentsValue: call.arguments,
@@ -119,9 +129,10 @@ export function mergeReliableCompletedToolCalls(
   current: readonly ReliableTransientToolCallState[],
   input: unknown,
   modelRequestId: string,
-  observedAt: number
+  observedAt: number,
+  outputItem?: ModelOutputItemReference
 ): ReliableTransientToolCallState[] {
-  const completed = replaceReliableCompletedToolCalls(input, modelRequestId, observedAt);
+  const completed = replaceReliableCompletedToolCalls(input, modelRequestId, observedAt, outputItem);
   if (!completed) return [...current];
   const next = current.map((call) => ({ ...call }));
   for (const call of completed) {
@@ -145,7 +156,8 @@ export function transientFunctionCallParts(
         args: call.final
           ? (Object.prototype.hasOwnProperty.call(call, 'argumentsValue') ? call.argumentsValue : parseCompleteArguments(call))
           : parsePartialArguments(call)
-      }
+      },
+      ...(call.outputItem ? { outputItem: call.outputItem } : {})
     }];
   });
 }
@@ -249,8 +261,23 @@ function completedToolCall(value: unknown): CompletedToolCall | undefined {
     ...optionalTextField(source, 'id'),
     name,
     arguments: source.arguments,
-    ...streamIdentityField(source)
+    ...streamIdentityField(source),
+    ...(modelOutputItemFromValue(source.outputItem)
+      ? { outputItem: modelOutputItemFromValue(source.outputItem) }
+      : {})
   };
+}
+
+function modelOutputItemFromValue(value: unknown): ModelOutputItemReference | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  const id = typeof source.id === 'string' ? source.id.trim() : '';
+  const ordinal = source.ordinal;
+  if (!id || typeof ordinal !== 'number' || !Number.isSafeInteger(ordinal) || ordinal < 0) return undefined;
+  const phase = source.phase === 'commentary' || source.phase === 'final_answer'
+    ? source.phase
+    : undefined;
+  return { id, ordinal, ...(phase ? { phase } : {}) };
 }
 
 function optionalTextField<TKey extends string>(

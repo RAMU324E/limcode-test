@@ -936,6 +936,82 @@ test('tool argument deltas stream independently and completed function calls are
   }
 });
 
+test('later tool calls keep streaming output-index-only argument deltas after visible text', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const firstCall = {
+    id: 'fc_item_first',
+    type: 'function_call',
+    call_id: 'call_first',
+    name: 'read',
+    arguments: '{"path":"a.txt"}'
+  };
+  const commentary = {
+    id: 'msg_commentary_between_tools',
+    type: 'message',
+    role: 'assistant',
+    phase: 'commentary',
+    content: [{ type: 'output_text', text: '继续处理第二个文件。', annotations: [] }]
+  };
+  const secondCall = {
+    id: 'fc_item_second',
+    type: 'function_call',
+    call_id: 'call_second',
+    name: 'read',
+    arguments: '{"path":"b.txt"}'
+  };
+  const server = await createServer((socket) => {
+    socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_two_tools' } }));
+    socket.send(JSON.stringify({
+      type: 'response.output_item.added', response_id: 'resp_two_tools', output_index: 0,
+      item: { ...firstCall, arguments: '' }
+    }));
+    socket.send(JSON.stringify({
+      type: 'response.function_call_arguments.delta', response_id: 'resp_two_tools',
+      item_id: firstCall.id, output_index: 0, delta: firstCall.arguments
+    }));
+    sendOutputItemDone(socket, 'resp_two_tools', 0, firstCall);
+    socket.send(JSON.stringify({
+      type: 'response.output_text.delta', response_id: 'resp_two_tools',
+      item_id: commentary.id, output_index: 1, content_index: 0, delta: commentary.content[0].text
+    }));
+    sendOutputItemDone(socket, 'resp_two_tools', 1, commentary);
+    socket.send(JSON.stringify({
+      type: 'response.output_item.added', response_id: 'resp_two_tools', output_index: 2,
+      item: { ...secondCall, arguments: '' }
+    }));
+    socket.send(JSON.stringify({
+      type: 'response.function_call_arguments.delta', response_id: 'resp_two_tools',
+      output_index: 2, delta: '{"path":'
+    }));
+    socket.send(JSON.stringify({
+      type: 'response.in_progress', response: { id: 'resp_two_tools', status: 'in_progress' }
+    }));
+    socket.send(JSON.stringify({
+      type: 'response.function_call_arguments.delta', response_id: 'resp_two_tools',
+      output_index: 2, delta: '"b.txt"}'
+    }));
+    sendOutputItemDone(socket, 'resp_two_tools', 2, secondCall);
+    sendResponseCompleted(socket, 'resp_two_tools');
+  });
+  try {
+    const format = await formatForTest();
+    const chunks = await collect(streamOptions(
+      server,
+      format,
+      'tool-output-index-aliases',
+      requestBody(format, [user('read two files')])
+    ));
+    const secondDeltas = chunks
+      .flatMap((chunk) => chunk.toolCallArgumentDeltas ?? [])
+      .filter((delta) => delta.callId === secondCall.call_id);
+    assert.deepEqual(secondDeltas.map((delta) => delta.argumentsDelta), ['{"path":', '"b.txt"}']);
+    assert.equal(secondDeltas.some((delta) => delta.replace === true), false);
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
 test('complete multi-block reasoning deltas use one canonical newline in stream and continuation ledger', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const requests = [];
@@ -1303,12 +1379,14 @@ test('multiple independent reasoning items preserve boundaries and commit one ex
           {
             text: 'first',
             thought: true,
-            thoughtSignatures: { 'openai-responses': 'signature-first' }
+            thoughtSignatures: { 'openai-responses': 'signature-first' },
+            outputItem: { id: 'rs_first', ordinal: 0 }
           },
           {
             text: 'second',
             thought: true,
-            thoughtSignatures: { 'openai-responses': 'signature-second' }
+            thoughtSignatures: { 'openai-responses': 'signature-second' },
+            outputItem: { id: 'rs_second', ordinal: 1 }
           }
         ]
       }
@@ -1380,24 +1458,100 @@ test('completed content preserves reasoning-tool-reasoning-text order', { concur
           {
             text: 'inspect',
             thought: true,
-            thoughtSignatures: { 'openai-responses': 'signature-inspect' }
+            thoughtSignatures: { 'openai-responses': 'signature-inspect' },
+            outputItem: { id: 'rs_order_first', ordinal: 0 }
           },
           {
             functionCall: {
               name: 'read',
               args: { path: 'ordered.txt' },
               callId: 'call_order'
-            }
+            },
+            outputItem: { id: 'fc_order', ordinal: 1 }
           },
           {
             text: 'verify',
             thought: true,
-            thoughtSignatures: { 'openai-responses': 'signature-verify' }
+            thoughtSignatures: { 'openai-responses': 'signature-verify' },
+            outputItem: { id: 'rs_order_second', ordinal: 2 }
           },
-          { text: 'done' }
+          {
+            text: 'done',
+            outputItem: { id: 'msg_order', ordinal: 3 }
+          }
         ]
       }
     );
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('multiple assistant message items preserve commentary/final phases and one continuation baseline', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const requests = [];
+  const commentary = {
+    id: 'msg_phase_commentary',
+    type: 'message',
+    role: 'assistant',
+    phase: 'commentary',
+    content: [{ type: 'output_text', text: '先检查环境。', annotations: [] }]
+  };
+  const finalAnswer = {
+    id: 'msg_phase_final',
+    type: 'message',
+    role: 'assistant',
+    phase: 'final_answer',
+    content: [{ type: 'output_text', text: '检查完成。', annotations: [] }]
+  };
+  const server = await createServer((socket, request, connection) => {
+    requests.push({ request, connection });
+    if (requests.length === 1) {
+      sendCompleted(socket, 'resp_message_phases', [commentary, finalAnswer]);
+      return;
+    }
+    sendCompleted(socket, 'resp_message_phases_next', []);
+  });
+  try {
+    const format = await formatForTest();
+    const initial = user('check the environment');
+    const chunks = await collect(streamOptions(
+      server,
+      format,
+      'multiple-message-phases',
+      requestBody(format, [initial])
+    ));
+    const completed = chunks.find((chunk) => chunk.completedContent)?.completedContent;
+    assert.deepEqual(completed, {
+      role: 'model',
+      parts: [
+        {
+          text: '先检查环境。',
+          outputItem: { id: commentary.id, ordinal: 0, phase: 'commentary' }
+        },
+        {
+          text: '检查完成。',
+          outputItem: { id: finalAnswer.id, ordinal: 1, phase: 'final_answer' }
+        }
+      ]
+    });
+
+    const nextBody = requestBody(format, [initial, user('continue')]);
+    nextBody.input.splice(1, 0,
+      {
+        type: 'message', role: 'assistant', phase: 'commentary',
+        content: [{ type: 'output_text', text: '先检查环境。' }]
+      },
+      {
+        type: 'message', role: 'assistant', phase: 'final_answer',
+        content: [{ type: 'output_text', text: '检查完成。' }]
+      }
+    );
+    await collect(streamOptions(server, format, 'multiple-message-phases', nextBody));
+    assert.equal(requests[1].request.previous_response_id, 'resp_message_phases');
+    assert.equal(requests[1].request.input.length, 1);
+    assert.equal(requests[1].request.input[0].role, 'user');
   } finally {
     resetOpenAIResponsesWebSocketSessions();
     await server.close();
@@ -1520,13 +1674,25 @@ test('a first-event black hole emits transport phases, invalidates the socket, a
   }
 });
 
-test('a relay that stops after complete tool arguments fails on the event-idle deadline and releases the session lock', { concurrency: false }, async () => {
+test('a relay that stalls while assembling tool arguments fails on the event-idle deadline and releases the session lock', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const requests = [];
   const server = await createServer((socket, request, connection) => {
     requests.push({ request, connection });
     if (requests.length === 1) {
       socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp_stalled_tool' } }));
+      socket.send(JSON.stringify({
+        type: 'response.output_item.added',
+        response_id: 'resp_stalled_tool',
+        output_index: 0,
+        item: {
+          id: 'fc_stalled_tool',
+          type: 'function_call',
+          call_id: 'call_stalled_tool',
+          name: 'bash',
+          arguments: ''
+        }
+      }));
       socket.send(JSON.stringify({
         type: 'response.function_call_arguments.delta',
         response_id: 'resp_stalled_tool',
@@ -1546,7 +1712,13 @@ test('a relay that stops after complete tool arguments fails on the event-idle d
         format,
         'stalled-tool-call',
         requestBody(format, [user('run a command')]),
-        { timeouts: { firstEventMs: 100, eventIdleMs: 40, responseMs: 500, sendMs: 100, handshakeMs: 100 } }
+        { timeouts: {
+          firstEventMs: 100,
+          eventIdleMs: 40,
+          responseMs: 500,
+          sendMs: 100,
+          handshakeMs: 100
+        } }
       )),
       (error) => error?.code === 'LLM_TRANSPORT_TIMEOUT'
         && error?.phase === 'event_idle'
@@ -1558,7 +1730,13 @@ test('a relay that stops after complete tool arguments fails on the event-idle d
       format,
       'stalled-tool-call',
       requestBody(format, [user('run a command'), user('retry safely')]),
-      { timeouts: { firstEventMs: 100, eventIdleMs: 100, responseMs: 500, sendMs: 100, handshakeMs: 100 } }
+      { timeouts: {
+        firstEventMs: 100,
+        eventIdleMs: 100,
+        responseMs: 500,
+        sendMs: 100,
+        handshakeMs: 100
+      } }
     ));
     assert.equal(requests.length, 2);
     assert.notEqual(requests[0].connection, requests[1].connection);

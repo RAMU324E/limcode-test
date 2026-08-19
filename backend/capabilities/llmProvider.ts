@@ -74,7 +74,8 @@ import type {
   LlmToolCallFormat,
   LlmRawErrorInfoRecord,
   LlmUsageMetadataRecord,
-  MessageContent
+  MessageContent,
+  ModelOutputItemReference
 } from '../../shared/protocol';
 
 export const DEFAULT_LLM_BASE_URL = 'https://api.openai.com/v1';
@@ -452,7 +453,7 @@ async function runLlmAttempt(
   proxy?: string
 ): Promise<void> {
   const preparedRequest = await prepareLlmStartRequestMultimodal(request, options);
-  const unifiedRequest = toUnifiedRequest(preparedRequest, settings.generationConfig);
+  const unifiedRequest = toUnifiedRequest(preparedRequest, settings.generationConfig, settings.provider);
   const forceStreaming = isOpenAIResponsesWebSocketMode(settings);
   if (settings.stream === false && !forceStreaming) {
     const response = await provider.chat<UnifiedLLMResponse>(unifiedRequest, {
@@ -1138,7 +1139,11 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
 
   const preparedRequest = await prepareLlmStartRequestMultimodal(request, options);
   const webSocketMode = isOpenAIResponsesWebSocketMode(runtimeSettings);
-  const result = await dryRun.call(provider, toUnifiedRequest(preparedRequest, runtimeSettings.generationConfig), {
+  const result = await dryRun.call(provider, toUnifiedRequest(
+    preparedRequest,
+    runtimeSettings.generationConfig,
+    runtimeSettings.provider
+  ), {
     inputFormat: 'unified',
     outputFormat: 'unified',
     stream: runtimeSettings.stream !== false || webSocketMode,
@@ -1278,7 +1283,7 @@ async function dryRunOpenAIResponsesCompact(
     throw new Error('当前 unified-llm-provider 版本不支持 provider.compactDryRun。');
   }
   const result = await provider.compactDryRun(
-    { contents: normalizedContext.map(toUnifiedContent) },
+    { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
     {
       inputFormat: 'unified',
       outputFormat: 'unified',
@@ -1648,7 +1653,7 @@ async function compactWithOpenAIResponses(
       signalAborted: signal?.aborted === true
     });
     compacted = await provider.compact(
-      { contents: normalizedContext.map(toUnifiedContent) },
+      { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
       {
         inputFormat: 'unified',
         outputFormat: 'unified',
@@ -3375,13 +3380,62 @@ function attachmentPlaceholderPart(part: InlineDataPart, reason: string): Conten
   };
 }
 
-function toUnifiedRequest(request: LlmStartRequest, generationConfig?: LlmGenerationConfigRecord): UnifiedLLMRequest {
+function toUnifiedRequest(
+  request: LlmStartRequest,
+  generationConfig?: LlmGenerationConfigRecord,
+  providerKind?: LlmProviderKind
+): UnifiedLLMRequest {
   return {
-    contents: request.contents.map(toUnifiedContent),
+    contents: request.contents.flatMap((content) => toUnifiedContents(content, providerKind)),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map(toUnifiedPart) } } : {}),
     ...(request.tools.length === 0 ? {} : { tools: [{ functionDeclarations: request.tools.map(toUnifiedFunctionDeclaration) }] }),
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {})
   };
+}
+
+function toUnifiedContents(
+  content: MessageContent,
+  providerKind?: LlmProviderKind
+): UnifiedContent[] {
+  if (providerKind !== 'openai-responses' || content.role !== 'model'
+    || (content as MessageContent & { providerContext?: unknown }).providerContext) {
+    return [toUnifiedContent(content)];
+  }
+
+  const groups: ContentPart[][] = [];
+  for (const part of content.parts) {
+    const current = groups[groups.length - 1];
+    const currentIdentity = current?.[0]?.outputItem?.id;
+    const nextIdentity = part.outputItem?.id;
+    if (current && currentIdentity === nextIdentity) current.push(part);
+    else groups.push([part]);
+  }
+  return groups.map((parts) => {
+    const outputItem = parts[0]?.outputItem;
+    if (outputItem && parts.every((part) => isVisibleTextPart(part))) {
+      const rawItem = {
+        type: 'message',
+        role: 'assistant',
+        ...(outputItem.phase ? { phase: outputItem.phase } : {}),
+        content: parts.map((part) => ({
+          type: 'output_text',
+          text: isTextPart(part) ? part.text : ''
+        }))
+      };
+      return {
+        role: 'model',
+        parts: [],
+        providerContext: {
+          provider: 'openai',
+          format: 'openai-responses',
+          endpoint: 'responses',
+          itemType: 'message',
+          rawItem
+        }
+      } as UnifiedContent;
+    }
+    return toUnifiedContent({ role: content.role, parts });
+  });
 }
 
 function toUnifiedContent(content: MessageContent): UnifiedContent {
@@ -3599,17 +3653,19 @@ function sanitizeGeminiFunctionSchema(value: unknown): unknown {
 function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
   const parts: ContentPart[] = [];
   for (const part of content.parts ?? []) {
+    const outputItem = modelOutputItemFromValue(part);
     if (isUnifiedThoughtTextPart(part)) {
       const signature = thoughtSignatureFromPart(part);
       parts.push({
         text: part.text ?? '',
         thought: true,
-        ...(signature ? { thoughtSignature: signature } : {})
+        ...(signature ? { thoughtSignature: signature } : {}),
+        ...(outputItem ? { outputItem } : {})
       });
       continue;
     }
     if ('text' in part && typeof part.text === 'string') {
-      parts.push({ text: part.text });
+      parts.push({ text: part.text, ...(outputItem ? { outputItem } : {}) });
       continue;
     }
     if (isUnifiedFunctionCallPart(part)) {
@@ -3620,7 +3676,8 @@ function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
           name: part.functionCall.name,
           args: part.functionCall.args ?? {}
         },
-        ...(signature ? { thoughtSignature: signature } : {})
+        ...(signature ? { thoughtSignature: signature } : {}),
+        ...(outputItem ? { outputItem } : {})
       });
     }
   }
@@ -3628,8 +3685,12 @@ function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
 }
 
 export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk, emit: Emit): void {
+  const outputItem = modelOutputItemFromValue(chunk);
   const text = chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
-  if (text) emit({ type: LlmEventType.Delta, payload: { requestId, text } });
+  if (text) emit({
+    type: LlmEventType.Delta,
+    payload: { requestId, text, ...(outputItem ? { outputItem } : {}) }
+  });
 
   const argumentDeltas = (chunk as LimCodeOpenAIResponsesStreamChunk).toolCallArgumentDeltas ?? [];
   if (argumentDeltas.length > 0) {
@@ -3637,6 +3698,7 @@ export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk
       type: LlmEventType.ToolCallDelta,
       payload: {
         requestId,
+        ...(outputItem ? { outputItem } : {}),
         calls: argumentDeltas.map((delta) => ({
           id: delta.callId,
           ...(delta.name ? { name: delta.name } : {}),
@@ -3686,7 +3748,19 @@ export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk
       type: LlmEventType.ToolCallPreviewDone,
       payload: { requestId, callIds: calls.map((call) => call.id).filter((id): id is string => !!id) }
     });
-    emit({ type: LlmEventType.ToolCall, payload: { requestId, calls } });
+    emit({ type: LlmEventType.ToolCall, payload: {
+      requestId,
+      ...(outputItem ? { outputItem } : {}),
+      calls
+    } });
+  }
+
+  const outputItemDone = modelOutputItemDoneFromChunk(chunk);
+  if (outputItemDone) {
+    emit({
+      type: LlmEventType.OutputItemDone,
+      payload: { requestId, outputItem: outputItemDone }
+    });
   }
 }
 
@@ -3777,6 +3851,27 @@ function stripUndefined(value: unknown): unknown {
   return result;
 }
 
+function modelOutputItemFromValue(value: unknown): ModelOutputItemReference | undefined {
+  const source = isRecord(value) ? isRecord(value.outputItem) ? value.outputItem : undefined : undefined;
+  if (!source || typeof source.id !== 'string' || !source.id.trim()
+    || typeof source.ordinal !== 'number' || !Number.isSafeInteger(source.ordinal) || source.ordinal < 0) {
+    return undefined;
+  }
+  const phase = source.phase === 'commentary' || source.phase === 'final_answer'
+    ? source.phase
+    : undefined;
+  return {
+    id: source.id,
+    ordinal: source.ordinal,
+    ...(phase ? { phase } : {})
+  };
+}
+
+function modelOutputItemDoneFromChunk(chunk: UnifiedLLMStreamChunk): ModelOutputItemReference | undefined {
+  const value = (chunk as LimCodeOpenAIResponsesStreamChunk).outputItemDone;
+  return value ? modelOutputItemFromValue({ outputItem: value }) : undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -3805,19 +3900,23 @@ interface ActiveThoughtBlock {
   startedAt: number;
   progressTimer?: ReturnType<typeof setInterval>;
   thoughtSignature?: string;
+  outputItem?: ModelOutputItemReference;
 }
 
 function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock | undefined, chunk: UnifiedLLMStreamChunk, at: number, emit: Emit): ActiveThoughtBlock | undefined {
   let block = current;
+  const outputItem = modelOutputItemFromValue(chunk);
   const chunkSignature = thoughtSignatureFromChunk(chunk);
   if (chunkSignature) {
-    block ??= createActiveThoughtBlock(requestId, at, emit);
+    block ??= createActiveThoughtBlock(requestId, at, emit, outputItem);
+    block.outputItem ??= outputItem;
     block.thoughtSignature = chunkSignature;
   }
   for (const part of chunk.partsDelta ?? []) {
     if (!isUnifiedThoughtTextPart(part)) continue;
     const text = part.text ?? '';
-    block ??= createActiveThoughtBlock(requestId, at, emit);
+    block ??= createActiveThoughtBlock(requestId, at, emit, outputItem);
+    block.outputItem ??= outputItem;
     const signature = thoughtSignatureFromPart(part);
     if (signature) block.thoughtSignature = signature;
     if (!text) continue;
@@ -3828,6 +3927,7 @@ function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock | unde
         text,
         thoughtStartedAt: block.startedAt,
         thoughtElapsedMs: Math.max(0, at - block.startedAt),
+        ...(block.outputItem ? { outputItem: block.outputItem } : {}),
         ...(signature ? { thoughtSignature: signature } : {})
       }
     });
@@ -3835,8 +3935,13 @@ function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock | unde
   return block;
 }
 
-function createActiveThoughtBlock(requestId: string, startedAt: number, emit: Emit): ActiveThoughtBlock {
-  const block: ActiveThoughtBlock = { startedAt };
+function createActiveThoughtBlock(
+  requestId: string,
+  startedAt: number,
+  emit: Emit,
+  outputItem?: ModelOutputItemReference
+): ActiveThoughtBlock {
+  const block: ActiveThoughtBlock = { startedAt, ...(outputItem ? { outputItem } : {}) };
   block.progressTimer = setInterval(() => {
     emit({
       type: LlmEventType.ThoughtProgress,
@@ -3844,6 +3949,7 @@ function createActiveThoughtBlock(requestId: string, startedAt: number, emit: Em
         requestId,
         thoughtStartedAt: block.startedAt,
         thoughtElapsedMs: Math.max(0, Date.now() - block.startedAt),
+        ...(block.outputItem ? { outputItem: block.outputItem } : {}),
         ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {})
       }
     });
@@ -3871,6 +3977,7 @@ function finishThoughtBlock(requestId: string, block: ActiveThoughtBlock, finish
       requestId,
       thoughtStartedAt: block.startedAt,
       thoughtDurationMs: Math.max(0, finishedAt - block.startedAt),
+      ...(block.outputItem ? { outputItem: block.outputItem } : {}),
       ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {})
     }
   });

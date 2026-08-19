@@ -1,4 +1,10 @@
-import type { LlmInvocationSettingsSnapshotRecord, LlmRawErrorInfoRecord, LlmUsageMetadataRecord, MessageContent } from '../../../../shared/protocol';
+import type {
+  LlmInvocationSettingsSnapshotRecord,
+  LlmRawErrorInfoRecord,
+  LlmUsageMetadataRecord,
+  MessageContent,
+  ModelOutputItemReference
+} from '../../../../shared/protocol';
 import type { LlmCompactResult } from './contracts';
 
 export const LlmEventType = {
@@ -9,6 +15,7 @@ export const LlmEventType = {
   ThoughtDelta: 'llm:thoughtDelta',
   ThoughtProgress: 'llm:thoughtProgress',
   ThoughtDone: 'llm:thoughtDone',
+  OutputItemDone: 'llm:outputItemDone',
   ToolCallDelta: 'llm:toolCallDelta',
   ToolCallPreviewDone: 'llm:toolCallPreviewDone',
   ToolCall: 'llm:toolcall',
@@ -49,10 +56,12 @@ export interface LlmInvocationResolveErrorPayload {
 export interface LlmDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
   text: string;
+  outputItem?: ModelOutputItemReference;
 }
 export interface LlmThoughtDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
   text: string;
+  outputItem?: ModelOutputItemReference;
   thoughtSignature?: string;
   /** 当前思考块开始的权威墙钟时间；前端据此本地插值，不依赖高频后端 tick。 */
   thoughtStartedAt?: number;
@@ -60,6 +69,7 @@ export interface LlmThoughtDeltaPayload extends LlmStreamEpochPayload {
 }
 export interface LlmThoughtProgressPayload extends LlmStreamEpochPayload {
   requestId: string;
+  outputItem?: ModelOutputItemReference;
   /** 当前思考块开始的权威墙钟时间。 */
   thoughtStartedAt?: number;
   thoughtElapsedMs: number;
@@ -67,13 +77,19 @@ export interface LlmThoughtProgressPayload extends LlmStreamEpochPayload {
 }
 export interface LlmThoughtDonePayload extends LlmStreamEpochPayload {
   requestId: string;
+  outputItem?: ModelOutputItemReference;
   /** 本次完成的思考块开始时间，用于可靠层区分并累计多个块。 */
   thoughtStartedAt?: number;
   thoughtDurationMs: number;
   thoughtSignature?: string;
 }
+export interface LlmOutputItemDonePayload extends LlmStreamEpochPayload {
+  requestId: string;
+  outputItem: ModelOutputItemReference;
+}
 export interface LlmToolCallDeltaPayload extends LlmStreamEpochPayload {
   requestId: string;
+  outputItem?: ModelOutputItemReference;
   calls: Array<{
     id: string;
     name?: string;
@@ -89,6 +105,7 @@ export interface LlmToolCallPreviewDonePayload extends LlmStreamEpochPayload {
 }
 export interface LlmToolCallPayload extends LlmStreamEpochPayload {
   requestId: string;
+  outputItem?: ModelOutputItemReference;
   calls: Array<{ id?: string; name: string; argsJson: string; thoughtSignature?: string }>;
 }
 export interface LlmStreamAggregationMetrics {

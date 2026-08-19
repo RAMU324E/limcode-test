@@ -12,7 +12,6 @@ import type {
   ToolDisplayPolicyRecord,
   ToolSchedulingMode
 } from '@shared/protocol';
-import { transientFunctionCallParts } from './reliableTransientModel.ts';
 import { reliableKernelDetailKey } from './reliableDetailKey.ts';
 import type {
   ReliableKernelDetailState,
@@ -661,34 +660,10 @@ function transientSequenceAnchor(input: {
 
 function transientMessageContent(transient: ReliableKernelTransientState): MessageContent {
   if (transient.completedContent) return transient.completedContent;
-  const parts: MessageContent['parts'] = [];
-  const thoughtActive = transient.thoughtActive === true;
-  const meaningfulThoughtTiming = thoughtActive
-    || (transient.thoughtElapsedMs ?? 0) > 0
-    || (transient.thoughtCompletedDurationMs ?? 0) > 0
-    || (transient.thoughtDurationMs ?? 0) > 0;
-  if (transient.thought.trim() || meaningfulThoughtTiming) {
-    parts.push({
-      text: transient.thought,
-      thought: true,
-      ...(transient.thoughtSignature ? { thoughtSignature: transient.thoughtSignature } : {}),
-      ...(thoughtActive && transient.thoughtStartedAt !== undefined
-        ? { thoughtStartedAt: transient.thoughtStartedAt }
-        : {}),
-      ...(thoughtActive && transient.thoughtCompletedDurationMs !== undefined
-        ? { thoughtCompletedDurationMs: transient.thoughtCompletedDurationMs }
-        : {}),
-      ...(thoughtActive && transient.thoughtElapsedMs !== undefined
-        ? { thoughtElapsedMs: transient.thoughtElapsedMs }
-        : {}),
-      ...(!thoughtActive && transient.thoughtDurationMs !== undefined
-        ? { thoughtDurationMs: transient.thoughtDurationMs }
-        : {})
-    });
-  }
-  if (transient.text) parts.push({ text: transient.text });
-  parts.push(...transientFunctionCallParts(transient.toolCalls));
-  return { role: 'model', parts };
+  return {
+    role: 'model',
+    parts: transient.outputParts
+  };
 }
 
 function transientCausalFrontierReached(

@@ -7,7 +7,8 @@ import {
   type AttachmentCatalogEntry,
   type InlineDataPart,
   type LlmProviderKind,
-  type MessageContent
+  type MessageContent,
+  type ModelOutputItemReference
 } from '../../shared/protocol';
 import {
   collectAttachmentCatalogFromStoredItems,
@@ -167,15 +168,24 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           case LlmEventType.Delta: {
             const delta = optionalText(payload?.text);
+            const outputItem = modelOutputItemFromPayload(payload);
             text += delta;
             if (delta) {
-              appendTextPart(outputParts, delta, false);
-              enqueue({ kind: 'output_delta', content: { type: 'text_delta', text: delta } });
+              appendTextPart(outputParts, delta, false, undefined, outputItem);
+              enqueue({
+                kind: 'output_delta',
+                content: {
+                  type: 'text_delta',
+                  text: delta,
+                  ...(outputItem ? { outputItem: plainModelOutputItem(outputItem) } : {})
+                }
+              });
             }
             return;
           }
           case LlmEventType.ThoughtDelta: {
             const delta = optionalText(payload?.text);
+            const outputItem = modelOutputItemFromPayload(payload);
             thought += delta;
             thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
             const blockStartedAt = optionalPositiveNumber(payload?.thoughtStartedAt);
@@ -189,12 +199,13 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             }
             thoughtTimingObserved = true;
             if (delta) {
-              appendTextPart(outputParts, delta, true, thoughtSignature);
+              appendTextPart(outputParts, delta, true, thoughtSignature, outputItem);
               enqueue({
                 kind: 'output_delta',
                 content: {
                   type: 'thought_delta',
                   text: delta,
+                  ...(outputItem ? { outputItem: plainModelOutputItem(outputItem) } : {}),
                   ...(thoughtSignature ? { thoughtSignature } : {}),
                   ...(thoughtStartedAt !== undefined ? { thoughtStartedAt } : {}),
                   thoughtCompletedDurationMs: completedThoughtDurationMs,
@@ -205,6 +216,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           case LlmEventType.ThoughtProgress: {
+            const outputItem = modelOutputItemFromPayload(payload);
             const blockStartedAt = optionalPositiveNumber(payload?.thoughtStartedAt);
             const blockElapsedMs = optionalNonNegativeNumber(payload?.thoughtElapsedMs);
             if (blockStartedAt !== undefined && blockStartedAt !== thoughtStartedAt) {
@@ -222,6 +234,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
                 semanticProgress: false,
                 content: {
                   type: 'thought_progress',
+                  ...(outputItem ? { outputItem: plainModelOutputItem(outputItem) } : {}),
                   thoughtElapsedMs,
                   ...(thoughtStartedAt !== undefined ? { thoughtStartedAt } : {}),
                   thoughtCompletedDurationMs: completedThoughtDurationMs,
@@ -232,6 +245,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           case LlmEventType.ThoughtDone: {
+            const outputItem = modelOutputItemFromPayload(payload);
             const blockStartedAt = optionalPositiveNumber(payload?.thoughtStartedAt) ?? thoughtStartedAt;
             const blockDurationMs = optionalNonNegativeNumber(payload?.thoughtDurationMs)
               ?? currentThoughtBlockDurationMs(blockStartedAt, thoughtElapsedMs, Date.now());
@@ -244,7 +258,9 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               kind: 'output_item_done',
               content: {
                 type: 'thought_done',
+                ...(outputItem ? { outputItem: plainModelOutputItem(outputItem) } : {}),
                 ...(blockStartedAt !== undefined ? { thoughtStartedAt: blockStartedAt } : {}),
+                thoughtBlockDurationMs: blockDurationMs,
                 thoughtCompletedDurationMs: completedThoughtDurationMs,
                 thoughtDurationMs: completedThoughtDurationMs,
                 ...(thoughtSignature ? { thoughtSignature } : {})
@@ -254,25 +270,43 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             thoughtElapsedMs = undefined;
             return;
           }
+          case LlmEventType.OutputItemDone: {
+            const outputItem = modelOutputItemFromPayload(payload);
+            if (outputItem) {
+              applyOutputItemMetadata(outputParts, outputItem);
+              enqueue({
+                kind: 'output_item_done',
+                content: {
+                  type: 'output_item_done',
+                  outputItem: plainModelOutputItem(outputItem)
+                }
+              });
+            }
+            return;
+          }
           case LlmEventType.ToolCallDelta: {
+            const outputItem = modelOutputItemFromPayload(payload);
             enqueue({
               kind: 'output_delta',
               content: {
                 type: 'tool_call_delta',
+                ...(outputItem ? { outputItem: plainModelOutputItem(outputItem) } : {}),
                 calls: normalizePlainJson(payload?.calls ?? [], 'LLM tool call delta')
               }
             });
             return;
           }
           case LlmEventType.ToolCall: {
+            const outputItem = modelOutputItemFromPayload(payload);
             const merged = toolCalls.merge(payload?.calls);
             if (merged.length > 0) {
-              upsertFunctionCallParts(outputParts, merged);
+              upsertFunctionCallParts(outputParts, merged, outputItem);
               enqueue({
                 kind: 'output_item_done',
                 content: {
                   type: 'tool_calls',
                   semantics: 'upsert',
+                  ...(outputItem ? { outputItem: plainModelOutputItem(outputItem) } : {}),
                   calls: normalizePlainJson(merged, 'LLM completed tool call upserts')
                 }
               });
@@ -1104,18 +1138,25 @@ function appendTextPart(
   parts: MessageContent['parts'],
   delta: string,
   thought: boolean,
-  thoughtSignature?: string
+  thoughtSignature?: string,
+  outputItem?: ModelOutputItemReference
 ): void {
   const last = parts[parts.length - 1];
+  const sameOutputItem = outputItem
+    ? last?.outputItem?.id === outputItem.id
+    : last?.outputItem === undefined;
   if (last && 'text' in last && (last.thought === true) === thought
+    && sameOutputItem
     && (!thought || last.thoughtDurationMs === undefined)) {
     last.text += delta;
     if (thought && thoughtSignature) last.thoughtSignature = thoughtSignature;
+    if (outputItem) last.outputItem = outputItem;
     return;
   }
   parts.push({
     text: delta,
-    ...(thought ? { thought: true, ...(thoughtSignature ? { thoughtSignature } : {}) } : {})
+    ...(thought ? { thought: true, ...(thoughtSignature ? { thoughtSignature } : {}) } : {}),
+    ...(outputItem ? { outputItem } : {})
   });
 }
 
@@ -1141,7 +1182,11 @@ function completeLastThoughtPart(
   }
 }
 
-function upsertFunctionCallParts(parts: MessageContent['parts'], calls: readonly ToolCallOutput[]): void {
+function upsertFunctionCallParts(
+  parts: MessageContent['parts'],
+  calls: readonly ToolCallOutput[],
+  outputItem?: ModelOutputItemReference
+): void {
   for (const call of calls) {
     const functionIndexes = parts
       .map((part, index) => 'functionCall' in part ? index : -1)
@@ -1150,14 +1195,43 @@ function upsertFunctionCallParts(parts: MessageContent['parts'], calls: readonly
       ? parts.findIndex((part) => 'functionCall' in part && part.id === call.id)
       : -1;
     const existingIndex = byId >= 0 ? byId : functionIndexes[call.ordinal] ?? -1;
+    const prior = existingIndex >= 0 ? parts[existingIndex] : undefined;
+    const priorOutputItem = prior?.outputItem;
     const next = {
       ...(call.id ? { id: call.id } : {}),
       functionCall: { name: call.name, args: call.arguments },
-      ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {})
+      ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
+      ...(outputItem ?? priorOutputItem ? { outputItem: outputItem ?? priorOutputItem } : {})
     };
     if (existingIndex >= 0) parts[existingIndex] = next;
     else parts.push(next);
   }
+}
+
+function applyOutputItemMetadata(
+  parts: MessageContent['parts'],
+  outputItem: ModelOutputItemReference
+): void {
+  for (const part of parts) {
+    if (part.outputItem?.id === outputItem.id) part.outputItem = outputItem;
+  }
+}
+
+function modelOutputItemFromPayload(
+  payload: Record<string, unknown> | undefined
+): ModelOutputItemReference | undefined {
+  const source = asRecord(payload?.outputItem);
+  const id = optionalText(source?.id);
+  const ordinal = optionalOrdinal(source?.ordinal);
+  if (!id || ordinal === undefined) return undefined;
+  const phase = source?.phase === 'commentary' || source?.phase === 'final_answer'
+    ? source.phase
+    : undefined;
+  return { id, ordinal, ...(phase ? { phase } : {}) };
+}
+
+function plainModelOutputItem(outputItem: ModelOutputItemReference): PlainJsonValue {
+  return normalizePlainJson(outputItem, 'Model output item reference');
 }
 
 function messageContentFromDonePayload(value: unknown): MessageContent | undefined {

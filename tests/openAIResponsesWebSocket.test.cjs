@@ -55,7 +55,33 @@ function loadLlmParameterDefinitions() {
   return compiled.exports;
 }
 
+function loadTransientOutputModule() {
+  const root = path.resolve(__dirname, '..');
+  const result = esbuild.buildSync({
+    entryPoints: [path.join(root, 'webview/src/domain/reliableTransientOutput.ts')],
+    absWorkingDir: root,
+    bundle: true,
+    write: false,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node18',
+    tsconfig: path.join(root, 'tsconfig.webview.json'),
+    logLevel: 'silent'
+  });
+  const filename = path.join(root, '.test-reliable-transient-output.cjs');
+  const compiled = new Module(filename, module);
+  compiled.filename = filename;
+  compiled.paths = Module._nodeModulePaths(root);
+  compiled._compile(result.outputFiles[0].text, filename);
+  return compiled.exports;
+}
+
 const { parameterDefinitionsForProvider } = loadLlmParameterDefinitions();
+const {
+  appendReliableTransientTextPart,
+  applyReliableTransientOutputItem,
+  syncReliableTransientFunctionCallParts
+} = loadTransientOutputModule();
 
 function providerConfig(overrides = {}) {
   return {
@@ -330,6 +356,47 @@ test('OpenAI Responses WebSocket dry-run is streaming, store=false, incremental-
   assert.doesNotMatch(result.curl, new RegExp(rawApiKey));
   assert.doesNotMatch(result.maskedCurl, new RegExp(rawApiKey));
   assert.equal(result.maskedSecrets, true);
+});
+
+test('OpenAI Responses dry-run replays persisted assistant item boundaries and phases exactly', async () => {
+  const request = chatRequest('request-message-phase-replay');
+  request.contents = [
+    { role: 'user', parts: [{ text: 'Inspect the workspace' }] },
+    {
+      role: 'model',
+      parts: [
+        {
+          text: 'I will inspect it first.',
+          outputItem: { id: 'persisted-commentary', ordinal: 0, phase: 'commentary' }
+        },
+        {
+          text: 'Inspection complete.',
+          outputItem: { id: 'persisted-final', ordinal: 1, phase: 'final_answer' }
+        }
+      ]
+    },
+    { role: 'user', parts: [{ text: 'Continue' }] }
+  ];
+
+  const result = await dryRunLlmProvider(request, {
+    settings: async () => providerConfig({ openaiResponsesTransport: 'websocket' })
+  });
+  assert.deepEqual(result.body.input.slice(1, 3), [
+    {
+      type: 'message',
+      role: 'assistant',
+      phase: 'commentary',
+      content: [{ type: 'output_text', text: 'I will inspect it first.' }]
+    },
+    {
+      type: 'message',
+      role: 'assistant',
+      phase: 'final_answer',
+      content: [{ type: 'output_text', text: 'Inspection complete.' }]
+    }
+  ]);
+  assert.equal(result.body.input[3].role, 'user');
+  assert.equal(JSON.stringify(result.body.input).includes('persisted-commentary'), false);
 });
 
 test('missing or invalid transport keeps the normal OpenAI Responses HTTP dry-run behavior', async () => {
@@ -616,6 +683,78 @@ test('LimCode WS chunks expose argument previews before the completed tool call'
   assert.equal(events[0].payload.calls[0].argumentsDelta, '{"path":"demo.ts"');
   assert.deepEqual(events[1].payload.callIds, ['call-preview']);
   assert.equal(events[2].payload.calls[0].argsJson, '{"path":"demo.ts","content":"x"}');
+});
+
+test('LimCode chunks preserve output item identity and late assistant phase events', () => {
+  const events = [];
+  emitUnifiedChunk('request-output-item', {
+    textDelta: 'checking',
+    outputItem: { id: 'message-output-0', ordinal: 0 }
+  }, (event) => events.push(event));
+  emitUnifiedChunk('request-output-item', {
+    outputItem: { id: 'message-output-0', ordinal: 0, phase: 'commentary' },
+    outputItemDone: { id: 'message-output-0', ordinal: 0, phase: 'commentary' }
+  }, (event) => events.push(event));
+
+  assert.deepEqual(events.map((event) => event.type), [
+    LlmEventType.Delta,
+    LlmEventType.OutputItemDone
+  ]);
+  assert.deepEqual(events[0].payload.outputItem, { id: 'message-output-0', ordinal: 0 });
+  assert.deepEqual(events[1].payload.outputItem, {
+    id: 'message-output-0', ordinal: 0, phase: 'commentary'
+  });
+});
+
+test('transient output parts preserve thought/text/tool/text/tool order and update tools in place', () => {
+  const outputItem = (id, ordinal, phase) => ({ id, ordinal, ...(phase ? { phase } : {}) });
+  const tool = (callId, name, item, argumentsText = '') => ({
+    id: `preview:${callId}`,
+    callId,
+    name,
+    argumentsText,
+    receivedChars: argumentsText.length,
+    final: false,
+    outputItem: item,
+    createdAt: 1,
+    updatedAt: 1
+  });
+
+  let parts = [];
+  parts = appendReliableTransientTextPart(parts, {
+    text: '分析', thought: true, outputItem: outputItem('reasoning-0', 0)
+  });
+  parts = appendReliableTransientTextPart(parts, {
+    text: '先读取文件。', thought: false, outputItem: outputItem('message-1', 1)
+  });
+  let calls = [tool('call-read', 'read', outputItem('tool-2', 2), '{"path":')];
+  parts = syncReliableTransientFunctionCallParts(parts, calls);
+  parts = appendReliableTransientTextPart(parts, {
+    text: '再写入结果。', thought: false, outputItem: outputItem('message-3', 3)
+  });
+  calls = [...calls, tool('call-write', 'write', outputItem('tool-4', 4), '{"path":')];
+  parts = syncReliableTransientFunctionCallParts(parts, calls);
+
+  assert.deepEqual(parts.map((part) => {
+    if ('text' in part) return part.thought === true ? `thought:${part.text}` : `text:${part.text}`;
+    return `tool:${part.functionCall.name}`;
+  }), [
+    'thought:分析',
+    'text:先读取文件。',
+    'tool:read',
+    'text:再写入结果。',
+    'tool:write'
+  ]);
+
+  calls = [
+    tool('call-read', 'read', outputItem('tool-2', 2), '{"path":"a.txt"}'),
+    calls[1]
+  ];
+  parts = syncReliableTransientFunctionCallParts(parts, calls);
+  assert.equal(parts[2].id, 'call-read');
+  assert.equal(parts[3].text, '再写入结果。');
+  parts = applyReliableTransientOutputItem(parts, outputItem('message-1', 1, 'commentary'));
+  assert.equal(parts[1].outputItem.phase, 'commentary');
 });
 
 test('terminal validation passes through non-2xx event-stream JSON errors unchanged', async () => {

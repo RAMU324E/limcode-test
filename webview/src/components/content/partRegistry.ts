@@ -124,7 +124,10 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
 
   const pushTextPart = (part: TextPart, index: number): void => {
     const kind: TextBuffer['kind'] = part.thought === true ? 'thought' : 'text';
-    if (!textBuffer || textBuffer.kind !== kind) {
+    const priorOutputItemId = textBuffer?.parts[textBuffer.parts.length - 1]?.outputItem?.id;
+    const nextOutputItemId = part.outputItem?.id;
+    const textOutputItemChanged = kind === 'text' && priorOutputItemId !== nextOutputItemId;
+    if (!textBuffer || textBuffer.kind !== kind || textOutputItemChanged) {
       flushTextBuffer();
       textBuffer = { kind, startIndex: index, endIndex: index, parts: [part] };
       return;

@@ -190,11 +190,17 @@ test('Provider 新 Attempt 会清除旧 Attempt 的部分文本、思考和工�
     store.indexOf("} else if (message.event.kind === 'failed' || message.event.kind === 'cancelled')"),
     store.indexOf("} else if (content?.type === 'text_delta')")
   );
+  const terminalBeforeRetryDiscard = terminalBranch.slice(
+    0,
+    terminalBranch.indexOf('if (content?.discardOutput === true)')
+  );
   const attemptFence = lifecycle.slice(
     lifecycle.indexOf('const durableAttemptSeq = modelRequestAttemptSeq(request);'),
     lifecycle.indexOf("if (request.status !== 'terminal') continue;")
   );
 
+  assert.match(terminalBeforeRetryDiscard, /next\.toolCalls = \[\];/);
+  assert.match(terminalBeforeRetryDiscard, /next\.outputParts = next\.outputParts\.filter/);
   assert.match(terminalBranch, /content\?\.discardOutput === true/);
   assert.match(terminalBranch, /next\.text = '';[\s\S]*?next\.thought = '';[\s\S]*?next\.toolCalls = \[\];/);
   assert.match(attemptFence, /durableAttemptSeq > transientAttemptSeq/);
