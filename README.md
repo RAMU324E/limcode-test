@@ -1,8 +1,8 @@
 # Limcode Test
 
-Limcode Test 是基于 [LimCode](https://github.com/Lianues/limcode2) 演进、由 [奥德赛（odysseiaDev）](https://github.com/odysseiaDev) 共同维护的衍生项目。当前仓库独立管理发布与开发历史，并使用独立的扩展、命令、视图及数据命名空间，可与原版同时安装。
+Limcode Test 是基于 [LimCode](https://github.com/Lianues/limcode2) 演进、由 [lurenxing628](https://github.com/lurenxing628) 独立维护的衍生项目。当前仓库独立管理发布与开发历史，并使用独立的扩展、命令、视图及数据命名空间，可与原版同时安装。
 
-- 当前仓库：[odysseiaDev/limcode-test](https://github.com/odysseiaDev/limcode-test)
+- 当前仓库：[lurenxing628/limcode-test](https://github.com/lurenxing628/limcode-test)
 - 上游来源：[Lianues/limcode2](https://github.com/Lianues/limcode2)
 - 开源许可：[GNU GPL v3](LICENSE)
 
