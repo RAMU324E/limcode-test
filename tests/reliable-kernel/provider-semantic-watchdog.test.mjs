@@ -503,7 +503,7 @@ test('Phase 0 Provider/Process/Client Feed 里程碑基准报告真实原始计�
   }
 
   if (!report.process.skipped) {
-    assert.deepEqual(report.process.map((entry) => entry.command), ['true', 'printf_x', 'rg']);
+    assert.deepEqual(report.process.map((entry) => entry.command), ['true', 'printf_x', 'node_version']);
     for (const processCase of report.process) {
       const measurement = processCase.measurements[0];
       assert.equal(

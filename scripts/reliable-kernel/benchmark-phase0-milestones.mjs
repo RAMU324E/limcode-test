@@ -172,7 +172,7 @@ async function benchmarkShortProcesses(sampleCount) {
   const scenarios = [
     { name: 'true', command: 'true' },
     { name: 'printf_x', command: 'printf x' },
-    { name: 'rg', command: 'rg --version' }
+    { name: 'node_version', command: `${quotePosixShellArgument(process.execPath)} --version` }
   ];
   const output = [];
   for (const scenario of scenarios) {
@@ -474,6 +474,10 @@ function distribution(values) {
 
 function percentile(sorted, fraction) {
   return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)];
+}
+
+function quotePosixShellArgument(value) {
+  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
 }
 
 function positiveInteger(value, label) {
