@@ -1668,8 +1668,14 @@ export class ModelProviderControlPlane {
     }
     const task = isRecord(recipe.turnTaskCard) ? recipe.turnTaskCard : undefined;
     const runtime = isRecord(recipe.runtimeStatusCard) ? recipe.runtimeStatusCard : undefined;
+    const completionCheck = isRecord(recipe.openTaskCompletionCheck)
+      ? recipe.openTaskCompletionCheck
+      : undefined;
     const reminderParts = [
       typeof task?.card === 'string' && task.card.trim() ? task.card.trim() : '',
+      typeof completionCheck?.card === 'string' && completionCheck.card.trim()
+        ? completionCheck.card.trim()
+        : '',
       typeof runtime?.card === 'string' && runtime.card.trim() ? runtime.card.trim() : ''
     ].filter(Boolean);
     const unfinishedTaskCount = nonNegativeRecipeInteger(task?.counts, 'unfinished');

@@ -544,17 +544,8 @@ export class BoundedClientFeed {
         retainMaterializedRecordReferences(session, change.domain, change.id, record);
         rememberScopedProjectionIdentity(session, change.domain, change.id, record);
         if (
-          !wasKnown
-          && change.domain === 'Turn'
-          && record.conversation_id === session.activeConversationId
-          && session.currentTaskSourceMessageId
-        ) {
-          taskProjectionRefreshRequired = true;
-        }
-        if (
           change.domain === 'ToolOutcome'
           && record.status === 'succeeded'
-          && !session.currentTaskSourceMessageId
         ) {
           const toolCallId = recordStringField(record, 'tool_call_id');
           const toolCall = toolCallId

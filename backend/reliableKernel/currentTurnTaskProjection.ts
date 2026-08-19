@@ -24,7 +24,11 @@ export interface CurrentTurnTaskOperationFact {
   operation: TaskListToolOperationRecord;
   /** submit_plan is authoritative only when its durable result explicitly says approved. */
   planApproved?: boolean;
+  sourceTurnId?: string;
   sourceMessageId?: string;
+  /** Conversation-global ordering facts; omitted only by isolated reducer tests. */
+  sourceMessageSeq?: string;
+  providerOrdinal?: string;
 }
 
 export interface CurrentTurnTaskCounts {
@@ -44,6 +48,7 @@ export interface FrozenTurnTaskCard {
   revision: string;
   baselineToolCallId: string;
   sourceToolCallId: string;
+  sourceTurnId?: string;
   sourceMessageId?: string;
   operationCount: number;
   counts: CurrentTurnTaskCounts;
@@ -101,9 +106,10 @@ export function buildCurrentTurnTaskProjection(input: {
   return {
     kind: 'turn_task_card',
     turnId,
-    revision: `${source.callSeq}:${source.toolCallId}`,
+    revision: operationFactRevision(source),
     baselineToolCallId: baseline.toolCallId,
     sourceToolCallId: source.toolCallId,
+    ...(source.sourceTurnId ? { sourceTurnId: source.sourceTurnId } : {}),
     ...(source.sourceMessageId ? { sourceMessageId: source.sourceMessageId } : {}),
     operationCount: applied.length,
     snapshot,
@@ -125,18 +131,29 @@ export async function readCurrentTurnTaskCard(
   turnIdInput: string
 ): Promise<FrozenTurnTaskCard | undefined> {
   const turnId = requiredText(turnIdInput, 'turnId');
-  // ToolCall.call_seq is immutable and monotonically allocated within the Turn. Freeze that finite
-  // prefix first, then read only relations owned by those calls. Later global commits may advance
-  // snapshotCommitSeq, but cannot mutate the frozen calls or their CAS objects; new calls remain
-  // beyond this recipe's cutoff and are considered by the next request.
-  const callsBarrier = await database.snapshotAll(DOMAIN_REPOSITORIES.domain('ToolCall').list({
-    where: { turn_id: turnId },
+  const turnBarrier = await database.snapshot([
+    DOMAIN_REPOSITORIES.domain('Turn').get(turnId)
+  ]);
+  const currentTurn = requireDomainRow(turnBarrier.snapshot[0], `Turn ${turnId}`);
+  const conversationId = requiredText(currentTurn.conversation_id, 'Turn.conversation_id');
+
+  // Task state belongs to the Conversation. A new Turn continues from the latest visible rewrite
+  // and may therefore issue update-only operations without recreating the whole list.
+  const turnsBarrier = await database.snapshotAll(DOMAIN_REPOSITORIES.domain('Turn').list({
+    where: { conversation_id: conversationId },
     orderBy: { column: 'id', direction: 'asc' },
     limit: 1_000
   }));
+  const callReads: RepositoryRead[] = turnsBarrier.snapshot.map((turn) =>
+    DOMAIN_REPOSITORIES.domain('ToolCall').list({
+      where: { turn_id: requiredText(turn.id, 'Turn.id') },
+      orderBy: { column: 'id', direction: 'asc' },
+      limit: 1_000
+    }));
+  const callsBarrier = await database.snapshot(callReads);
   const calls = callsBarrier.snapshot
-    .filter((call) => call.tool_name === TASK_LIST_TOOL_NAME || call.tool_name === SUBMIT_PLAN_TOOL_NAME)
-    .sort(compareToolCallRows);
+    .flatMap(rows)
+    .filter((call) => call.tool_name === TASK_LIST_TOOL_NAME || call.tool_name === SUBMIT_PLAN_TOOL_NAME);
   if (calls.length === 0) return undefined;
 
   const relatedReads: RepositoryRead[] = calls.flatMap((call) => [
@@ -153,23 +170,19 @@ export async function readCurrentTurnTaskCard(
   const relatedBarrier = await database.snapshot(relatedReads);
   const artifactRows: DomainRow[] = [];
   const argumentMetadata = new Map<string, ContentObjectMetadata>();
-  const sourceMessageIds = new Map<string, string>();
+  const sourceLinks = new Map<string, DomainRow>();
   for (let index = 0; index < calls.length; index += 1) {
+    const toolCallId = requiredText(calls[index].id, 'ToolCall.id');
     const artifacts = rows(relatedBarrier.snapshot[index * 3]);
-    if (artifacts.length > 1) throw new Error(`ToolCall ${String(calls[index].id)} has multiple no-effect result artifacts.`);
+    if (artifacts.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple no-effect result artifacts.`);
     if (artifacts[0]) artifactRows.push(artifacts[0]);
     const metadata = relatedBarrier.snapshot[index * 3 + 1];
     if (metadata && !Array.isArray(metadata)) {
-      argumentMetadata.set(requiredText(calls[index].id, 'ToolCall.id'), metadata as ContentObjectMetadata);
+      argumentMetadata.set(toolCallId, metadata as ContentObjectMetadata);
     }
-    const sourceLinks = rows(relatedBarrier.snapshot[index * 3 + 2]);
-    if (sourceLinks.length > 1) throw new Error(`ToolCall ${String(calls[index].id)} has multiple source links.`);
-    if (sourceLinks[0]) {
-      sourceMessageIds.set(
-        requiredText(calls[index].id, 'ToolCall.id'),
-        requiredText(sourceLinks[0].message_id, 'ToolCallSourceLink.message_id')
-      );
-    }
+    const links = rows(relatedBarrier.snapshot[index * 3 + 2]);
+    if (links.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple source links.`);
+    if (links[0]) sourceLinks.set(toolCallId, links[0]);
   }
 
   const artifactMetadataBarrier = await database.snapshot(artifactRows.map((artifact) =>
@@ -189,46 +202,78 @@ export async function readCurrentTurnTaskCard(
     );
   }
 
+  const sourcedCalls = calls.flatMap((call) => {
+    const toolCallId = requiredText(call.id, 'ToolCall.id');
+    const source = sourceLinks.get(toolCallId);
+    return source ? [{ call, toolCallId, source }] : [];
+  });
+  const messageBarrier = await database.snapshot(sourcedCalls.flatMap(({ source }) => {
+    const messageId = requiredText(source.message_id, 'ToolCallSourceLink.message_id');
+    return [
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+        where: { message_id: messageId },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('Message').get(messageId)
+    ];
+  }));
+  const ordering = new Map<string, {
+    sourceMessageId: string;
+    sourceMessageSeq: string;
+    providerOrdinal: string;
+  }>();
+  for (let index = 0; index < sourcedCalls.length; index += 1) {
+    const { toolCallId, source } = sourcedCalls[index];
+    const memberships = rows(messageBarrier.snapshot[index * 2]);
+    if (memberships.length !== 1) throw new Error(`Task ToolCall ${toolCallId} must have one Message membership.`);
+    const message = messageBarrier.snapshot[index * 2 + 1];
+    if (!message || Array.isArray(message)) throw new Error(`Task ToolCall ${toolCallId} references a missing Message.`);
+    if (memberships[0].conversation_id !== conversationId || message.deleted_at !== null) continue;
+    ordering.set(toolCallId, {
+      sourceMessageId: requiredText(source.message_id, 'ToolCallSourceLink.message_id'),
+      sourceMessageSeq: integerText(memberships[0].message_seq, 'MessagePartOfConversation.message_seq'),
+      providerOrdinal: integerText(source.provider_ordinal, 'ToolCallSourceLink.provider_ordinal')
+    });
+  }
+
   const operations: CurrentTurnTaskOperationFact[] = [];
   for (const call of calls) {
     const toolCallId = requiredText(call.id, 'ToolCall.id');
     const artifact = artifactByCallId.get(toolCallId);
-    if (artifact === undefined) continue;
-    const sourceMessageId = sourceMessageIds.get(toolCallId);
+    const order = ordering.get(toolCallId);
+    if (artifact === undefined || !order) continue;
+    const common = {
+      toolCallId,
+      callSeq: integerText(call.call_seq, 'ToolCall.call_seq'),
+      sourceTurnId: requiredText(call.turn_id, 'ToolCall.turn_id'),
+      ...order
+    };
     if (call.tool_name === TASK_LIST_TOOL_NAME) {
       const operation = taskListOperationFromSettledArtifact(artifact, toolCallId);
       if (!operation) continue;
-      operations.push({
-        toolCallId,
-        callSeq: integerText(call.call_seq, 'ToolCall.call_seq'),
-        toolName: TASK_LIST_TOOL_NAME,
-        operation,
-        ...(sourceMessageId ? { sourceMessageId } : {})
-      });
+      operations.push({ ...common, toolName: TASK_LIST_TOOL_NAME, operation });
       continue;
     }
 
-    const planEnvelope = taskArtifactEnvelope(artifact, toolCallId);
-    if (planEnvelope.status !== 'succeeded') continue;
-    const output = submitPlanOutputFromResult(planEnvelope.detail);
-    if (output?.status !== 'approved') continue;
     const argsMetadata = argumentMetadata.get(toolCallId);
     if (!argsMetadata) throw new Error(`submit_plan ToolCall ${toolCallId} references missing arguments.`);
-    const args = asRecord(await readJson(contentStore, argsMetadata, 'submit_plan arguments'));
-    if (!args || args.taskList === undefined) continue;
+    const operation = approvedSubmitPlanTaskOperation({
+      argumentsValue: await readJson(contentStore, argsMetadata, 'submit_plan arguments'),
+      resultArtifactValue: artifact,
+      toolCallId
+    });
+    if (!operation) continue;
     operations.push({
-      toolCallId,
-      callSeq: integerText(call.call_seq, 'ToolCall.call_seq'),
+      ...common,
       toolName: SUBMIT_PLAN_TOOL_NAME,
-      operation: requireTaskListOperation(args.taskList),
-      planApproved: true,
-      ...(sourceMessageId ? { sourceMessageId } : {})
+      operation,
+      planApproved: true
     });
   }
   const projection = buildCurrentTurnTaskProjection({
     turnId,
     operations,
-    frozenAtCommitSeq: relatedBarrier.snapshotCommitSeq
+    frozenAtCommitSeq: messageBarrier.snapshotCommitSeq
   });
   return projection ? freezeCurrentTurnTaskCard(projection) : undefined;
 }
@@ -240,6 +285,7 @@ export function freezeCurrentTurnTaskCard(projection: CurrentTurnTaskProjection)
     revision: projection.revision,
     baselineToolCallId: projection.baselineToolCallId,
     sourceToolCallId: projection.sourceToolCallId,
+    ...(projection.sourceTurnId ? { sourceTurnId: projection.sourceTurnId } : {}),
     ...(projection.sourceMessageId ? { sourceMessageId: projection.sourceMessageId } : {}),
     operationCount: projection.operationCount,
     counts: { ...projection.counts },
@@ -272,7 +318,7 @@ export function approvedSubmitPlanTaskOperation(input: {
   const envelope = taskArtifactEnvelope(input.resultArtifactValue, input.toolCallId);
   if (envelope.status !== 'succeeded') return undefined;
   const output = submitPlanOutputFromResult(envelope.detail);
-  if (output?.status !== 'approved') return undefined;
+  if (output?.status !== 'approved' || output.executionTarget !== 'current_conversation') return undefined;
   const args = asRecord(input.argumentsValue);
   if (!args || args.taskList === undefined) return undefined;
   return requireTaskListOperation(args.taskList);
@@ -319,15 +365,27 @@ function taskCounts(snapshot: TaskListSnapshotView): CurrentTurnTaskCounts {
 }
 
 function compareOperationFacts(left: CurrentTurnTaskOperationFact, right: CurrentTurnTaskOperationFact): number {
+  if (left.sourceMessageSeq !== undefined || right.sourceMessageSeq !== undefined) {
+    const leftMessageSeq = left.sourceMessageSeq === undefined ? 0n : positiveBigInt(left.sourceMessageSeq, 'sourceMessageSeq');
+    const rightMessageSeq = right.sourceMessageSeq === undefined ? 0n : positiveBigInt(right.sourceMessageSeq, 'sourceMessageSeq');
+    if (leftMessageSeq !== rightMessageSeq) return leftMessageSeq < rightMessageSeq ? -1 : 1;
+
+    const leftOrdinal = left.providerOrdinal === undefined ? 0n : positiveBigInt(left.providerOrdinal, 'providerOrdinal');
+    const rightOrdinal = right.providerOrdinal === undefined ? 0n : positiveBigInt(right.providerOrdinal, 'providerOrdinal');
+    if (leftOrdinal !== rightOrdinal) return leftOrdinal < rightOrdinal ? -1 : 1;
+  }
   const leftSeq = positiveBigInt(left.callSeq, 'callSeq');
   const rightSeq = positiveBigInt(right.callSeq, 'callSeq');
   return leftSeq < rightSeq ? -1 : leftSeq > rightSeq ? 1 : compareText(left.toolCallId, right.toolCallId);
 }
 
-function compareToolCallRows(left: DomainRow, right: DomainRow): number {
-  const leftSeq = positiveBigInt(left.call_seq, 'ToolCall.call_seq');
-  const rightSeq = positiveBigInt(right.call_seq, 'ToolCall.call_seq');
-  return leftSeq < rightSeq ? -1 : leftSeq > rightSeq ? 1 : compareText(String(left.id), String(right.id));
+function operationFactRevision(fact: CurrentTurnTaskOperationFact): string {
+  return [
+    ...(fact.sourceMessageSeq !== undefined ? [fact.sourceMessageSeq] : []),
+    ...(fact.providerOrdinal !== undefined ? [fact.providerOrdinal] : []),
+    fact.callSeq,
+    fact.toolCallId
+  ].join(':');
 }
 
 function cloneOperationFact(fact: CurrentTurnTaskOperationFact): CurrentTurnTaskOperationFact {
@@ -337,7 +395,14 @@ function cloneOperationFact(fact: CurrentTurnTaskOperationFact): CurrentTurnTask
     toolName: fact.toolName,
     operation: requireTaskListOperation(fact.operation),
     ...(fact.planApproved === true ? { planApproved: true } : {}),
-    ...(fact.sourceMessageId ? { sourceMessageId: fact.sourceMessageId } : {})
+    ...(fact.sourceTurnId ? { sourceTurnId: requiredText(fact.sourceTurnId, 'sourceTurnId') } : {}),
+    ...(fact.sourceMessageId ? { sourceMessageId: fact.sourceMessageId } : {}),
+    ...(fact.sourceMessageSeq !== undefined
+      ? { sourceMessageSeq: integerText(fact.sourceMessageSeq, 'sourceMessageSeq') }
+      : {}),
+    ...(fact.providerOrdinal !== undefined
+      ? { providerOrdinal: integerText(fact.providerOrdinal, 'providerOrdinal') }
+      : {})
   };
 }
 
@@ -361,6 +426,11 @@ async function readJson(
   } catch (error) {
     throw new Error(`${label} content is not valid JSON: ${String(error)}`);
   }
+}
+
+function requireDomainRow(value: DomainRow | DomainRow[] | null, label: string): DomainRow {
+  if (!value || Array.isArray(value)) throw new Error(`${label} is missing.`);
+  return value;
 }
 
 function rows(value: DomainRow | DomainRow[] | null): DomainRow[] {

@@ -1490,6 +1490,81 @@ async function checkClientSnapshotBounds() {
         }
       }
     });
+    // createToolCall is a callback fixture and therefore has no Provider source relation. Add the
+    // minimal source facts required by currentTaskList's production ordering path.
+    const [taskToolRow] = await list(ctx.database, 'ToolCall', { id: taskTool.toolCallId });
+    const [taskAuthority] = await list(ctx.database, 'AuthoritySnapshot', { turn_id: seeded.turnId });
+    assert.ok(taskToolRow);
+    assert.ok(taskAuthority);
+    const taskModelRequestId = 'snapshot-task-model-request';
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').insert({
+        id: taskModelRequestId,
+        turn_id: seeded.turnId,
+        request_seq: 1n,
+        status: 'prepared',
+        terminal_state: null,
+        provider_id: 'fake-local',
+        model_id: 'fake-model',
+        context_window_tokens: 200000n,
+        compression_threshold_tokens: 100000n,
+        estimated_context_tokens: 0n,
+        authority_snapshot_id: taskAuthority.id,
+        settings_snapshot_object_id: null,
+        recipe_object_id: taskToolRow.arguments_object_id,
+        usage_json: null,
+        stream_stats_json: { attemptSeq: '1', socketGeneration: '0', retryReason: null },
+        created_at: NOW,
+        updated_at: NOW
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('Operation').insert({
+        id: 'snapshot-task-model-operation',
+        owner_kind: 'model_request',
+        owner_id: taskModelRequestId,
+        operation_seq: 1n,
+        tool_call_id: null,
+        status: 'pending',
+        created_at: NOW,
+        updated_at: NOW
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('Attempt').insert({
+        id: 'snapshot-task-model-attempt',
+        operation_id: 'snapshot-task-model-operation',
+        attempt_seq: 1n,
+        status: 'pending',
+        created_at: NOW,
+        updated_at: NOW,
+        completed_at: null
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').insert({
+        id: 'snapshot-task-source-link',
+        tool_call_id: taskTool.toolCallId,
+        model_request_id: taskModelRequestId,
+        message_id: seeded.messageId,
+        provider_call_id: 'snapshot-task-provider-call',
+        provider_ordinal: 0n,
+        batch_id: 'snapshot-task-batch',
+        batch_ordinal: 0n,
+        thought_signature: null,
+        created_at: NOW
+      })
+    ]);
+    await ctx.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').update(taskModelRequestId, {
+        status: 'terminal',
+        terminal_state: 'failed',
+        updated_at: NOW
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('Operation').update('snapshot-task-model-operation', {
+        status: 'failed',
+        updated_at: NOW
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('Attempt').update('snapshot-task-model-attempt', {
+        status: 'failed',
+        updated_at: NOW,
+        completed_at: NOW
+      })
+    ]);
     const failedTaskTool = await ctx.services.effects.createToolCall({
       source: { kind: 'callback', key: 'snapshot-failed-task-tool' },
       toolCallId: 'snapshot-failed-task-list-call',
@@ -1593,6 +1668,13 @@ async function checkClientSnapshotBounds() {
     assert.equal(snapshot.projections.activeConversationWindow.taskList[1].outcome, 'failed');
     assert.equal(snapshot.projections.activeConversationWindow.taskList[1].items, null);
     assert.equal(snapshot.projections.activeConversationWindow.taskList[1].detail_on_demand, false);
+    const taskListBeforeNewTurn = structuredClone(
+      snapshot.projections.activeConversationWindow.currentTaskList
+    );
+    assert.ok(taskListBeforeNewTurn);
+    assert.deepEqual(taskListBeforeNewTurn.items.map((item) => [item.title, item.status]), [
+      ['bounded projection', 'in_progress']
+    ]);
     assert.equal(JSON.stringify(snapshot).includes('user-input-snapshot'), false);
     assert.ok(metrics.snapshotTenThousandMs < 5_000, `10k snapshot took ${metrics.snapshotTenThousandMs}ms`);
     assertions.push('10,000个可见楼层的snapshot仍只发送最新200条且保留绝对display_seq=9801..10000；五类projection/单记录摘要/实际UTF-8总字节均受硬上限，task list不含正文/full Context；failed task artifact不做canonical解析且不阻断snapshot');
@@ -1937,8 +2019,11 @@ async function checkClientSnapshotBounds() {
       })
     ]);
     const newerTurnSnapshot = await ctx.database.clientProjectionSnapshot(seeded.conversationId);
-    assert.equal(newerTurnSnapshot.snapshot.activeConversationWindow.currentTaskList, null);
-    assertions.push('currentTaskList只投影latest Turn；新Turn无rewrite基线时返回null且不继承旧Turn任务');
+    assert.deepEqual(
+      newerTurnSnapshot.snapshot.activeConversationWindow.currentTaskList,
+      taskListBeforeNewTurn
+    );
+    assertions.push('currentTaskList按Conversation延续；新Turn无rewrite时保留原基线并允许后续update-only继续');
     return { assertions, faults, metrics };
   });
 }
@@ -3638,11 +3723,12 @@ function emptyClientProjection(conversationId) {
       conversationId, messages: [], visibleMessageCount: '0', lastMessageSeq: '0',
       projectContexts: [], conversationProjectLinks: [], conversationReuseLinks: [],
       conversationBranchLinks: [], conversationOriginLinks: [], agentConversationLinks: [],
-      commandReceipts: [], queuedTurnIntents: [], compressionBlocks: [], conversationContextStatuses: [], taskList: []
+      commandReceipts: [], queuedTurnIntents: [], compressionBlocks: [], conversationContextStatuses: [],
+      taskList: [], currentTaskList: null
     },
     activeTurnSummary: {
       turns: [], executionLeases: [], turnTerminations: [], turnExecutorLinks: [],
-      modelRequests: [], modelRequestMessageLinks: []
+      modelRequests: [], modelContextProjections: [], modelRequestMessageLinks: []
     },
     activeToolAndInteractionSummary: {
       messageTurnLinks: [], toolCalls: [], toolCallSourceLinks: [], toolCallPolicySnapshots: [],

@@ -2832,6 +2832,9 @@ function executeClientProjectionSnapshot(
          AND call.status <> 'terminal'
        ORDER BY turn.created_at ASC, call.call_seq ASC, call.id ASC
     `, { conversationId });
+    // currentTaskList is a self-contained Conversation projection. Do not pin its historical source
+    // ToolCall/Message into the bounded live window; a later settled task refreshes the projection
+    // when that source is no longer materialized.
     const toolCalls = mergeRowsById([
       ...nonterminalToolCalls,
       ...queryAllByIds(database, 'tool_call', 'id', [
@@ -2840,8 +2843,7 @@ function executeClientProjectionSnapshot(
         ...childParentLinks
           .filter((row) => childIdsSourcedFromActiveConversation.has(String(row.child_execution_id)))
           .map((row) => String(row.source_tool_call_id)),
-        ...pendingInteractionToolLinks.map((row) => String(row.tool_call_id)),
-        ...(currentTaskList ? [String(currentTaskList.sourceToolCallId)] : [])
+        ...pendingInteractionToolLinks.map((row) => String(row.tool_call_id))
       ])
     ]).sort(compareToolCallRows);
     const toolCallIds = toolCalls.map((row) => String(row.id));
@@ -3163,15 +3165,6 @@ function projectCurrentTaskList(
   database: Database.Database,
   conversationId: string
 ): Record<string, unknown> | null {
-  const latestTurn = queryPlainRows(database, `
-    SELECT turn.id
-      FROM turn
-     WHERE turn.conversation_id = @conversationId
-     ORDER BY turn.created_at DESC, turn.id DESC
-     LIMIT 1
-  `, { conversationId })[0];
-  if (!latestTurn) return null;
-  const turnId = String(latestTurn.id);
   const calls = queryPlainRows(database, `
     SELECT call.id,
            call.turn_id,
@@ -3180,8 +3173,10 @@ function projectCurrentTaskList(
            call.arguments_object_id,
            artifact.content_object_id AS artifact_content_object_id,
            source.message_id,
-           source.provider_ordinal
+           source.provider_ordinal,
+           membership.message_seq
       FROM tool_call AS call
+      JOIN turn ON turn.id = call.turn_id
       JOIN tool_result_artifact AS artifact
         ON artifact.tool_call_id = call.id
        AND artifact.role = 'no_effect_result'
@@ -3189,11 +3184,18 @@ function projectCurrentTaskList(
         ON task_operation.tool_call_id = call.id
        AND task_operation.status = 'succeeded'
       JOIN tool_call_source_link AS source ON source.tool_call_id = call.id
-     WHERE call.turn_id = @turnId
+      JOIN message_part_of_conversation AS membership
+        ON membership.message_id = source.message_id
+       AND membership.conversation_id = turn.conversation_id
+      JOIN message ON message.id = membership.message_id
+     WHERE turn.conversation_id = @conversationId
+       AND message.deleted_at IS NULL
        AND call.tool_name IN ('update_task_list', 'submit_plan')
-     ORDER BY call.call_seq ASC,
+     ORDER BY membership.message_seq ASC,
+              source.provider_ordinal ASC,
+              call.call_seq ASC,
               call.id ASC
-  `, { turnId });
+  `, { conversationId });
   if (calls.length === 0) return null;
 
   // The task panel is an optional client projection. A pre-hard-cut or malformed artifact must
@@ -3216,7 +3218,10 @@ function projectCurrentTaskList(
           callSeq: String(call.call_seq),
           toolName: 'update_task_list',
           operation,
-          sourceMessageId: String(call.message_id)
+          sourceTurnId: String(call.turn_id),
+          sourceMessageId: String(call.message_id),
+          sourceMessageSeq: String(call.message_seq),
+          providerOrdinal: String(call.provider_ordinal)
         });
         continue;
       }
@@ -3237,17 +3242,23 @@ function projectCurrentTaskList(
         toolName: 'submit_plan',
         operation,
         planApproved: true,
-        sourceMessageId: String(call.message_id)
+        sourceTurnId: String(call.turn_id),
+        sourceMessageId: String(call.message_id),
+        sourceMessageSeq: String(call.message_seq),
+        providerOrdinal: String(call.provider_ordinal)
       });
     }
-    const projection = buildCurrentTurnTaskProjection({ turnId, operations });
+    const projection = buildCurrentTurnTaskProjection({
+      turnId: String(calls[calls.length - 1].turn_id),
+      operations
+    });
     if (!projection) return null;
     return {
       conversationId,
       revision: projection.revision,
       operationCount: projection.operationCount,
       sourceToolCallId: projection.sourceToolCallId,
-      sourceTurnId: projection.turnId,
+      sourceTurnId: projection.sourceTurnId ?? projection.turnId,
       ...(projection.sourceMessageId ? { sourceMessageId: projection.sourceMessageId } : {}),
       baselineToolCallId: projection.baselineToolCallId,
       items: projection.snapshot.items,

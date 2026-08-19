@@ -26,12 +26,15 @@ const {
 const rewrite = (items) => ({ kind: 'task_list.operation', mode: 'rewrite', items });
 const update = (items) => ({ kind: 'task_list.operation', mode: 'update', items });
 const fact = (callSeq, operation, options = {}) => ({
-  toolCallId: `task-call-${callSeq}`,
+  toolCallId: options.toolCallId ?? `task-call-${callSeq}`,
   callSeq: String(callSeq),
   toolName: options.toolName ?? 'update_task_list',
   operation,
   ...(options.planApproved === true ? { planApproved: true } : {}),
-  sourceMessageId: `message-${callSeq}`
+  ...(options.sourceTurnId ? { sourceTurnId: options.sourceTurnId } : {}),
+  sourceMessageId: options.sourceMessageId ?? `message-${callSeq}`,
+  ...(options.sourceMessageSeq !== undefined ? { sourceMessageSeq: String(options.sourceMessageSeq) } : {}),
+  ...(options.providerOrdinal !== undefined ? { providerOrdinal: String(options.providerOrdinal) } : {})
 });
 
 test('task operation 只在一个严格边界规范化完整 mode/items', () => {
@@ -49,6 +52,10 @@ test('task operation 只在一个严格边界规范化完整 mode/items', () => 
     kind: 'task_list.operation', mode: 'update', items: [{ title: 'x', delete: true }]
   });
   assert.throws(() => requireTaskListOperation({ mode: 'rewrite', items: [], extra: true }), /unsupported fields/);
+  assert.throws(() => requireTaskListOperation({
+    mode: 'rewrite',
+    items: [{ title: 'Same task' }, { title: '  same   TASK ' }]
+  }), /duplicate title/);
   assert.equal(taskListOperationFromArgs({ mode: 'rewrite', items: [{ title: 'x', unknown: true }] }), undefined);
 });
 
@@ -56,6 +63,27 @@ test('submit_plan 必须携带完整结构化 taskList 合同', () => {
   assert.throws(
     () => normalizeSubmitPlanToolRequest({ plan: 'inspect then fix' }),
     /taskList is required/
+  );
+  assert.throws(
+    () => normalizeSubmitPlanToolRequest({
+      plan: 'inspect then fix',
+      taskList: { mode: 'update', items: [{ title: 'inspect' }] }
+    }),
+    /must use mode="rewrite"/
+  );
+  assert.throws(
+    () => normalizeSubmitPlanToolRequest({
+      plan: 'inspect then fix',
+      taskList: { mode: 'rewrite', items: [] }
+    }),
+    /at least one task/
+  );
+  assert.throws(
+    () => normalizeSubmitPlanToolRequest({
+      plan: 'inspect then fix',
+      taskList: { mode: 'rewrite', items: [{ title: 'inspect' }, { title: ' Inspect ' }] }
+    }),
+    /taskList must use the same shape/
   );
   assert.deepEqual(normalizeSubmitPlanToolRequest({
     plan: 'inspect then fix',
@@ -119,6 +147,43 @@ test('approved Plan rewrite 可建基线，只应用同 Turn 中其后的有效 
     completed: 1,
     cancelled: 0
   });
+});
+
+test('Conversation 任务基线允许后续 Turn 使用 update-only 继续', () => {
+  const projection = buildCurrentTurnTaskProjection({
+    turnId: 'turn-b',
+    operations: [
+      fact(1, rewrite([
+        { title: 'Implement', status: 'in_progress' },
+        { title: 'Verify', status: 'pending' }
+      ]), {
+        toolCallId: 'turn-a-rewrite',
+        sourceTurnId: 'turn-a',
+        sourceMessageId: 'message-10',
+        sourceMessageSeq: 10,
+        providerOrdinal: 0
+      }),
+      fact(1, update([
+        { title: 'Implement', status: 'completed' },
+        { title: 'Verify', status: 'in_progress' }
+      ]), {
+        toolCallId: 'turn-b-update',
+        sourceTurnId: 'turn-b',
+        sourceMessageId: 'message-20',
+        sourceMessageSeq: 20,
+        providerOrdinal: 0
+      })
+    ]
+  });
+  assert.ok(projection);
+  assert.equal(projection.baselineToolCallId, 'turn-a-rewrite');
+  assert.equal(projection.sourceToolCallId, 'turn-b-update');
+  assert.equal(projection.sourceTurnId, 'turn-b');
+  assert.equal(projection.revision, '20:0:1:turn-b-update');
+  assert.deepEqual(projection.snapshot.items.map((item) => [item.title, item.status]), [
+    ['Implement', 'completed'],
+    ['Verify', 'in_progress']
+  ]);
 });
 
 test('最近有效 rewrite 替换旧基线且不会跨基线复活旧任务', () => {
@@ -192,16 +257,26 @@ test('durable artifact hard-cut：只认 canonical operation，Plan 必须明确
   }, 'task-call'), /Task list operation must be a plain object/);
 
   const planArgs = { plan: 'do it', taskList: operation };
-  const result = (status) => ({
+  const result = (status, executionTarget = 'current_conversation') => ({
     toolCallId: 'plan-call',
     status: status === 'approved' ? 'succeeded' : 'rejected',
-    detail: { kind: 'submit_plan.result', proposalId: 'proposal', status }
+    detail: {
+      kind: 'submit_plan.result',
+      proposalId: 'proposal',
+      status,
+      ...(status === 'approved' ? { executionTarget } : {})
+    }
   });
   assert.deepEqual(approvedSubmitPlanTaskOperation({
     argumentsValue: planArgs,
     resultArtifactValue: result('approved'),
     toolCallId: 'plan-call'
   }), operation);
+  assert.equal(approvedSubmitPlanTaskOperation({
+    argumentsValue: planArgs,
+    resultArtifactValue: result('approved', 'new_conversation'),
+    toolCallId: 'plan-call'
+  }), undefined);
   assert.equal(approvedSubmitPlanTaskOperation({
     argumentsValue: planArgs,
     resultArtifactValue: result('change_requested'),
@@ -231,13 +306,10 @@ test('任务卡按不可变 ToolCall 前缀读取，无关 commitSeq 连续变�
   const database = {
     async snapshotAll() {
       return {
-        snapshotCommitSeq: '10',
+        snapshotCommitSeq: '11',
         snapshot: [{
-          id: toolCallId,
-          turn_id: 'task-prefix-race-turn',
-          call_seq: 1n,
-          tool_name: 'update_task_list',
-          arguments_object_id: 'task-prefix-race-arguments'
+          id: 'task-prefix-race-turn',
+          conversation_id: 'task-prefix-race-conversation'
         }]
       };
     },
@@ -245,17 +317,54 @@ test('任务卡按不可变 ToolCall 前缀读取，无关 commitSeq 连续变�
       snapshotCount += 1;
       if (snapshotCount === 1) {
         return {
-          snapshotCommitSeq: '11',
+          snapshotCommitSeq: '10',
+          snapshot: [{
+            id: 'task-prefix-race-turn',
+            conversation_id: 'task-prefix-race-conversation'
+          }]
+        };
+      }
+      if (snapshotCount === 2) {
+        return {
+          snapshotCommitSeq: '12',
+          snapshot: [[{
+            id: toolCallId,
+            turn_id: 'task-prefix-race-turn',
+            call_seq: 1n,
+            tool_name: 'update_task_list',
+            arguments_object_id: 'task-prefix-race-arguments'
+          }]]
+        };
+      }
+      if (snapshotCount === 3) {
+        return {
+          snapshotCommitSeq: '13',
           snapshot: [
             [artifact],
             { id: 'task-prefix-race-arguments' },
-            [{ message_id: 'task-prefix-race-message' }]
+            [{
+              message_id: 'task-prefix-race-message',
+              provider_ordinal: 0n
+            }]
           ]
         };
       }
+      if (snapshotCount === 4) {
+        return {
+          snapshotCommitSeq: '14',
+          snapshot: [{ id: 'task-prefix-race-result' }]
+        };
+      }
       return {
-        snapshotCommitSeq: '12',
-        snapshot: [{ id: 'task-prefix-race-result' }]
+        snapshotCommitSeq: '15',
+        snapshot: [
+          [{
+            conversation_id: 'task-prefix-race-conversation',
+            message_id: 'task-prefix-race-message',
+            message_seq: 1n
+          }],
+          { id: 'task-prefix-race-message', deleted_at: null }
+        ]
       };
     }
   };
@@ -278,9 +387,9 @@ test('任务卡按不可变 ToolCall 前缀读取，无关 commitSeq 连续变�
     'task-prefix-race-turn'
   );
   assert.ok(frozen);
-  assert.equal(frozen.frozenAtCommitSeq, '11');
+  assert.equal(frozen.frozenAtCommitSeq, '15');
   assert.equal(frozen.counts.unfinished, 1);
   assert.match(frozen.card, /survives unrelated commits/);
   assert.equal('snapshot' in frozen, false);
-  assert.equal(snapshotCount, 2);
+  assert.equal(snapshotCount, 5);
 });

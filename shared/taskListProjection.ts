@@ -201,6 +201,14 @@ export function requireTaskListOperation(value: unknown): TaskListToolOperationR
   if (!Array.isArray(record.items)) throw new TypeError('Task list operation items must be an array.');
 
   const items = record.items.map((rawItem, index) => requireOperationItem(rawItem, index, mode));
+  const seenTitles = new Set<string>();
+  for (const item of items) {
+    const key = titleKey(item.title);
+    if (seenTitles.has(key)) {
+      throw new TypeError(`Task list operation contains duplicate title: ${item.title}.`);
+    }
+    seenTitles.add(key);
+  }
   return { kind: 'task_list.operation', mode, items };
 }
 
@@ -371,10 +379,11 @@ export function applyTaskListOperationToSnapshot(
 
     const existing = byKey.get(key);
     const status = input.status ?? existing?.status ?? 'pending';
+    const description = input.description ?? existing?.description;
     const item: TaskListItemView = {
       key,
       title: input.title,
-      description: input.description ?? existing?.description,
+      ...(description ? { description } : {}),
       status,
       createdOrder: existing?.createdOrder ?? nextCreatedOrder++,
       updatedOrder: order.operationIndex * 10_000 + index,
@@ -446,7 +455,7 @@ function placeholderDeletedItem(input: TaskListToolItemRecord, index: number): T
   return {
     key: titleKey(input.title),
     title: input.title,
-    description: input.description,
+    ...(input.description ? { description: input.description } : {}),
     status: 'cancelled',
     createdOrder: index,
     updatedOrder: index
@@ -495,11 +504,11 @@ function cloneItem(item: TaskListItemView): TaskListItemView {
   return {
     key: item.key,
     title: item.title,
-    description: item.description,
+    ...(item.description ? { description: item.description } : {}),
     status: item.status,
     createdOrder: item.createdOrder,
     updatedOrder: item.updatedOrder,
-    sourceToolCallId: item.sourceToolCallId
+    ...(item.sourceToolCallId ? { sourceToolCallId: item.sourceToolCallId } : {})
   };
 }
 

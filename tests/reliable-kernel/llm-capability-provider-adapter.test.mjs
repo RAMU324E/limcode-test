@@ -1143,7 +1143,100 @@ test('ModelProvider普通请求的启发式规划不会在打开Provider前形�
   );
 });
 
-test('Agent loop final 的未完成任务只产生脱敏 telemetry，不形成门禁或二次请求', () => {
+test('Agent loop 对开放任务最多触发一次完成检查', async () => {
+  const recipe = {
+    kind: 'reliable-agent-turn',
+    turnTaskCard: {
+      counts: { unfinished: 2 },
+      card: '[Current Turn Task Card]\nunfinished=2'
+    }
+  };
+  assert.equal(kernel.decideOpenTaskCompletion(recipe, false), 'continue_once');
+  assert.equal(kernel.decideOpenTaskCompletion(recipe, true), 'complete_with_open_tasks');
+  assert.equal(kernel.decideOpenTaskCompletion({
+    kind: 'reliable-agent-turn',
+    turnTaskCard: { counts: { unfinished: 0 } }
+  }, false), 'complete');
+
+  const modelProvider = Object.create(kernel.ModelProviderControlPlane.prototype);
+  const addenda = await modelProvider.materializeRequestAddenda({
+    ...recipe,
+    openTaskCompletionCheck: {
+      kind: 'open_task_completion_check',
+      card: '[Open Task Completion Check]\ncontinue and reconcile the complete list'
+    }
+  }, 'turn-completion-check');
+  assert.equal(addenda.requestAddenda.turnReminder.unfinishedTaskCount, 2);
+  assert.equal(
+    addenda.requestAddenda.turnReminder.content,
+    '[Current Turn Task Card]\nunfinished=2\n\n'
+      + '[Open Task Completion Check]\ncontinue and reconcile the complete list'
+  );
+});
+
+test('Agent loop 开放任务的无工具输出只续行一轮再结束', async () => {
+  const loop = Object.create(kernel.ReliableAgentLoop.prototype);
+  let finalFenceCount = 0;
+  let terminalReason;
+  let assistantCommitCount = 0;
+  loop.observeLifecycle = () => {};
+  loop.observeOpenTasksAtFinal = () => {};
+  loop.readResumeState = async () => ({
+    requestSequence: 1n,
+    openTaskCompletionCheckConsumed: false
+  });
+  loop.readRoundFacts = async () => ({
+    turn: { id: 'turn-bounded', conversation_id: 'conversation-bounded', status: 'active' },
+    authority: { id: 'authority-bounded' },
+    head: { root_id: 'root-bounded' }
+  });
+  loop.cancelSupersededCompressionRequests = async () => {};
+  loop.terminateIfRequested = async () => false;
+  loop.maybeGet = async (_domain, id) => ({ id, status: 'terminal' });
+  loop.assertModelRequestRound = async (_request, sequence) => ({
+    kind: 'reliable-agent-turn',
+    round: sequence.toString(),
+    turnTaskCard: { counts: { unfinished: 1 } },
+    ...(sequence === 2n ? {
+      openTaskCompletionCheck: { kind: 'open_task_completion_check', card: 'check' }
+    } : {})
+  });
+  loop.readTerminalProviderOutput = async () => ({
+    content: { role: 'assistant', parts: [{ text: 'progress' }] },
+    toolCalls: []
+  });
+  loop.automaticDeliveries = {
+    async establishFinalOutputFence() {
+      finalFenceCount += 1;
+      return { established: true };
+    }
+  };
+  loop.turnOutput = {
+    async appendAssistantMessage() {
+      assistantCommitCount += 1;
+      return { messageId: `assistant-${assistantCommitCount}` };
+    }
+  };
+  loop.turns = {
+    async terminal(command) {
+      terminalReason = command.reason;
+    }
+  };
+  loop.requireExisting = async (domain) => {
+    assert.equal(domain, 'Turn');
+    return { id: 'turn-bounded', status: 'terminated' };
+  };
+  loop.readLoopTerminalStatus = async () => 'completed';
+
+  const result = await loop.drive('turn-bounded');
+  assert.equal(result.terminalStatus, 'completed');
+  assert.equal(result.modelRequestIds.length, 2);
+  assert.equal(assistantCommitCount, 2);
+  assert.equal(finalFenceCount, 1, '首轮进度消息不能提前建立 final-output fence');
+  assert.equal(terminalReason, 'model_completed_with_open_tasks');
+});
+
+test('Agent loop 最终仍有未完成任务时只产生脱敏 telemetry', () => {
   const loop = Object.create(kernel.ReliableAgentLoop.prototype);
   const lifecycle = [];
   loop.lifecycleObserver = { observe(event) { lifecycle.push(event); } };
@@ -1168,7 +1261,7 @@ test('Agent loop final 的未完成任务只产生脱敏 telemetry，不形成�
   loop.observeOpenTasksAtFinal('turn-final', '5', 'request-complete', {
     kind: 'reliable-agent-turn', turnTaskCard: { counts: { unfinished: 0 } }
   });
-  assert.equal(lifecycle.length, 1, '全部完成时不产生 telemetry，更不能触发第二次模型请求');
+  assert.equal(lifecycle.length, 1, '全部完成时不产生开放任务 telemetry');
 });
 
 test('Agent loop Provider wrapper 保留初始预算使用的精确估算器', async () => {

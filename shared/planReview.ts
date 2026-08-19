@@ -142,6 +142,8 @@ function requiredTaskList(value: unknown): TaskListToolOperationRecord {
   }
   const operation = taskListOperationFromArgs(value);
   if (!operation) throw new Error('taskList must use the same shape as update_task_list: { mode, items }');
+  if (operation.mode !== 'rewrite') throw new Error('submit_plan taskList must use mode="rewrite"');
+  if (operation.items.length === 0) throw new Error('submit_plan taskList must contain at least one task');
   return cloneTaskListOperation(operation);
 }
 

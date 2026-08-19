@@ -232,8 +232,22 @@ interface FrozenRuntimeStatusCard {
   card: string;
 }
 
+interface AgentLoopResumeState {
+  requestSequence: bigint;
+  openTaskCompletionCheckConsumed: boolean;
+}
+
+export type OpenTaskCompletionAction = 'complete' | 'continue_once' | 'complete_with_open_tasks';
+
 const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
 const RUNTIME_STATUS_RECIPE_LIMIT = 32;
+const OPEN_TASK_COMPLETION_CHECK_KIND = 'open_task_completion_check';
+const OPEN_TASK_COMPLETION_CHECK_CARD = [
+  '[Open Task Completion Check — system continuation, not a new user instruction]',
+  'The previous response ended while the task list still had unfinished items.',
+  'Continue the approved work where possible, then reconcile the complete task list before ending.',
+  'Keep genuinely unfinished or blocked items explicit; do not replace or narrow the approved scope.'
+].join('\n');
 
 /**
  * 单 Turn 的可靠 Agent loop。每轮都冻结 Context root/authority，Provider 完成摘要先落 SQLite/CAS，
@@ -291,7 +305,10 @@ export class ReliableAgentLoop {
       // settlement and Context append replays that one round idempotently. Only after the replayed
       // round is complete do we advance to request_seq + 1. There is no process-local round cap:
       // safety limits belong to explicit token/cost/time policy, never an invisible failed Turn.
-      let requestSequence = await this.resumeRequestSequence(turnId);
+      const resumeState = await this.readResumeState(turnId);
+      let requestSequence = resumeState.requestSequence;
+      let openTaskCompletionCheckConsumed = resumeState.openTaskCompletionCheckConsumed;
+      let includeOpenTaskCompletionCheck = false;
       agentRounds: for (;;) {
         const round = requestSequence.toString();
         let facts = await this.readRoundFacts(turnId);
@@ -327,7 +344,8 @@ export class ReliableAgentLoop {
             turnId,
             round,
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
-            tools: toolDefinitions
+            tools: toolDefinitions,
+            includeOpenTaskCompletionCheck
           });
           let preview = await this.modelProvider.previewOrdinaryRequest({
             turnId,
@@ -371,7 +389,8 @@ export class ReliableAgentLoop {
               turnId,
               round,
               headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
-              tools: toolDefinitions
+              tools: toolDefinitions,
+              includeOpenTaskCompletionCheck
             });
             preview = await this.modelProvider.previewOrdinaryRequest({
               turnId,
@@ -404,6 +423,10 @@ export class ReliableAgentLoop {
           requestSequence,
           expectedModelRequestId
         );
+        includeOpenTaskCompletionCheck = false;
+        if (recipeHasOpenTaskCompletionCheck(modelRequestRecipe)) {
+          openTaskCompletionCheckConsumed = true;
+        }
         const modelRequestId = expectedModelRequestId;
         modelRequestIds.push(modelRequestId);
         if (await this.terminateIfRequested(turnId, `round:${round}:model-request:${modelRequestId}`)) {
@@ -425,7 +448,13 @@ export class ReliableAgentLoop {
         if (await this.terminateIfRequested(turnId, `round:${round}:provider-output:${modelRequestId}`)) {
           return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
         }
-        if (output.toolCalls.length === 0) {
+        const openTaskCompletion = decideOpenTaskCompletion(
+          modelRequestRecipe,
+          openTaskCompletionCheckConsumed
+        );
+        const shouldContinueOpenTasks = output.toolCalls.length === 0
+          && openTaskCompletion === 'continue_once';
+        if (output.toolCalls.length === 0 && !shouldContinueOpenTasks) {
           const fence = await this.automaticDeliveries.establishFinalOutputFence({ turnId, modelRequestId });
           if (!fence.established) {
             if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
@@ -459,6 +488,15 @@ export class ReliableAgentLoop {
         assistantMessageIds.push(message.messageId);
         this.observeLifecycle({ turnId, stage: 'assistant_commit_completed', round, modelRequestId });
 
+        if (shouldContinueOpenTasks) {
+          // This visible output remains an in-progress assistant message. The next frozen recipe owns
+          // the one durable completion-check marker, so crash recovery cannot create an endless loop.
+          openTaskCompletionCheckConsumed = true;
+          includeOpenTaskCompletionCheck = true;
+          requestSequence += 1n;
+          continue agentRounds;
+        }
+
         if (output.toolCalls.length === 0) {
           // The final-output fence was committed before this visible Message. Automatic runtime
           // input must now target a new Turn; extending this Turn would rewrite a displayed final.
@@ -472,7 +510,9 @@ export class ReliableAgentLoop {
                 source: { kind: 'internal', key: `agent-loop:${turnId}:complete:${modelRequestId}` },
                 turnId,
                 terminalStatus: 'completed',
-                reason: 'model_completed_without_tool_calls'
+                reason: openTaskCompletion === 'complete_with_open_tasks'
+                  ? 'model_completed_with_open_tasks'
+                  : 'model_completed_without_tool_calls'
               });
             } catch (error) {
               if (isTurnTerminalInputConflictError(error)) {
@@ -605,6 +645,7 @@ export class ReliableAgentLoop {
     round: string;
     headRootId: string;
     tools: readonly ReliableAgentToolDefinition[];
+    includeOpenTaskCompletionCheck: boolean;
   }): Promise<PlainJsonValue> {
     const [currentTurnInput, runtimeStatusCard] = await Promise.all([
       this.readCurrentTurnInputReference(input.turnId, input.headRootId),
@@ -631,13 +672,19 @@ export class ReliableAgentLoop {
     const modelHandleCatalog = buildModelHandleCatalog(handleSources);
     return normalizePlainJson({
       kind: 'reliable-agent-turn',
-      projectionRevision: '2026-08-09',
+      projectionRevision: '2026-08-19',
       round: input.round,
       tools: input.tools,
       ...(modelHandleCatalog.entries.length > 0 ? { modelHandleCatalog } : {}),
       ...(currentTurnInput ? { currentTurnInput } : {}),
       ...(turnTaskCard ? { turnTaskCard } : {}),
-      ...(runtimeStatusCard ? { runtimeStatusCard } : {})
+      ...(runtimeStatusCard ? { runtimeStatusCard } : {}),
+      ...(input.includeOpenTaskCompletionCheck ? {
+        openTaskCompletionCheck: {
+          kind: OPEN_TASK_COMPLETION_CHECK_KIND,
+          card: OPEN_TASK_COMPLETION_CHECK_CARD
+        }
+      } : {})
     }, 'Reliable Agent recipe');
   }
 
@@ -1274,11 +1321,16 @@ export class ReliableAgentLoop {
    * result and every Context tool_pair were committed before a crash.
    */
   private async resumeRequestSequence(turnId: string): Promise<bigint> {
+    return (await this.readResumeState(turnId)).requestSequence;
+  }
+
+  private async readResumeState(turnId: string): Promise<AgentLoopResumeState> {
     const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
       .sort((left, right) => compareInteger(left.request_seq, right.request_seq));
     const recipes = await this.readModelRequestRecipes(requests);
     let expectedPhysicalSequence = 1n;
     let normalRound = 0n;
+    let openTaskCompletionCheckConsumed = false;
     for (const request of requests) {
       const actual = requirePositiveInteger(request.request_seq, 'ModelRequest.request_seq');
       if (actual !== expectedPhysicalSequence) {
@@ -1289,6 +1341,7 @@ export class ReliableAgentLoop {
       if (!recipe) throw new Error(`ModelRequest ${requestId} recipe batch lost its request.`);
       if (recipe.kind === 'reliable-agent-turn') {
         normalRound += 1n;
+        openTaskCompletionCheckConsumed ||= recipeHasOpenTaskCompletionCheck(recipe);
         const round = requirePositiveInteger(recipe.round, 'ModelRequest recipe.round');
         if (round !== normalRound) {
           throw new Error(`Turn ${turnId} ordinary ModelRequest round is not contiguous at ${normalRound.toString()}.`);
@@ -1302,7 +1355,10 @@ export class ReliableAgentLoop {
       }
       expectedPhysicalSequence += 1n;
     }
-    return normalRound === 0n ? 1n : normalRound;
+    return {
+      requestSequence: normalRound === 0n ? 1n : normalRound,
+      openTaskCompletionCheckConsumed
+    };
   }
 
   private async cancelSupersededCompressionRequests(turnId: string, currentHeadRootId: string): Promise<void> {
@@ -2189,6 +2245,21 @@ function optionalNonNegativeInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
     ? value
     : undefined;
+}
+
+function recipeHasOpenTaskCompletionCheck(recipe: Record<string, unknown>): boolean {
+  return asRecord(recipe.openTaskCompletionCheck)?.kind === OPEN_TASK_COMPLETION_CHECK_KIND;
+}
+
+export function decideOpenTaskCompletion(
+  recipe: PlainJsonValue,
+  completionCheckConsumed: boolean
+): OpenTaskCompletionAction {
+  const task = asRecord(asRecord(recipe)?.turnTaskCard);
+  const counts = asRecord(task?.counts);
+  const unfinished = optionalNonNegativeInteger(counts?.unfinished) ?? 0;
+  if (unfinished === 0) return 'complete';
+  return completionCheckConsumed ? 'complete_with_open_tasks' : 'continue_once';
 }
 
 function currentInputReferenceTokens(recipe: PlainJsonValue): number {

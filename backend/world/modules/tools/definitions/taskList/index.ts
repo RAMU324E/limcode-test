@@ -74,6 +74,8 @@ export const taskListTool: ToolDefinition = {
 Modes:
 - mode="rewrite": the items are the full task list that should currently be shown for the task/plan, and they replace the previous task list.
 - mode="update": the items are incremental changes; existing tasks are matched and updated by title, new titles are added, and delete=true removes the task with the same title.
+- Task state continues across Turns in the same conversation. Use update when continuing the same work instead of recreating a rewrite baseline.
+- Titles are update keys and must be unique within one operation after whitespace/case normalization.
 
 Usage rules:
 - For complex, multi-step, cross-file work, or when the user explicitly asks to track progress, first use rewrite to create 3-8 tasks.

@@ -27,9 +27,8 @@ const projectedSnapshot = computed(() => currentTaskListSnapshot(
 ));
 const snapshot = computed<TaskListSnapshotView>(() => {
   const projected = projectedSnapshot.value;
-  // The reliable projection is the current-Turn authority. Falling back to the whole
-  // conversation timeline revives a previous Turn's checklist when the current Turn has
-  // no valid rewrite baseline (for example update-only, retry, or edit-and-run).
+  // The reliable projection is the Conversation baseline. Live settled operations after its source
+  // are folded on top so a new Turn can continue the same list with update-only operations.
   if (!projected) return emptyTaskListSnapshot();
   const sourceIndex = timeline.value.entries.findIndex((entry) =>
     entry.toolCall.id === projected.sourceToolCallId
