@@ -289,8 +289,8 @@ const activityLabel = computed(() => {
   if (!latest) return '正在准备上下文';
   if (activeCompressionCard.value) return undefined;
   const retry = modelRequestRetryState(latest);
-  // Keep the durable retry identity visible throughout this Attempt. Its exact transient decides
-  // whether the row describes connection/output waiting or output currently being received.
+  // Keep the durable retry identity while the exact Attempt is waiting for output. Once its
+  // transient renders model-owned content, the content itself replaces this activity row.
   if (latest.status === 'retrying') {
     const delaySeconds = Math.max(0, Math.ceil(retry.remainingDelayMs / 1_000));
     return `${retry.reasonLabel}，${delaySeconds} 秒后自动恢复（第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次）`;

@@ -179,6 +179,103 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
   assert.deepEqual(toolBoundary.map((node) => node.kind), ['thought', 'functionCall', 'thought']);
 });
 
+async function createViteServer(context) {
+  const { createServer } = await import('vite');
+  const server = await createServer({
+    configFile: path.join(ROOT, 'vite.config.ts'),
+    server: { middlewareMode: true },
+    appType: 'custom',
+    logLevel: 'error'
+  });
+  context.after(async () => server.close());
+  return server;
+}
+
+function ready(text) {
+  return { status: 'ready', text, nextOffset: Buffer.byteLength(text), complete: true };
+}
+
+test('retry源消息软删除后，transient输出锚定到上一条可见消息', async (context) => {
+  const server = await createViteServer(context);
+  const { projectReliableConversation } = await server.ssrLoadModule(
+    '/src/domain/reliableConversationProjection.ts'
+  );
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-retry-anchor',
+    records: {
+      Turn: {
+        retry: {
+          id: 'turn-retry',
+          conversation_id: 'conversation-retry-anchor',
+          source_message_id: 'message-deleted',
+          status: 'active',
+          created_at: '2026-08-18T00:00:02.000Z'
+        }
+      },
+      Message: {
+        visible: {
+          id: 'message-visible',
+          conversation_id: 'conversation-retry-anchor',
+          message_seq: '1',
+          revision_id: 'revision-visible',
+          role: 'user',
+          created_at: '2026-08-18T00:00:00.000Z'
+        },
+        deleted: {
+          id: 'message-deleted',
+          conversation_id: 'conversation-retry-anchor',
+          message_seq: '2',
+          revision_id: 'revision-deleted',
+          role: 'model',
+          deleted_at: '2026-08-18T00:00:02.000Z',
+          created_at: '2026-08-18T00:00:01.000Z'
+        }
+      },
+      ModelRequest: {
+        retry: {
+          id: 'request-retry',
+          turn_id: 'turn-retry',
+          request_seq: '1',
+          model_id: 'gpt-retry',
+          status: 'streaming',
+          created_at: '2026-08-18T00:00:02.100Z'
+        }
+      }
+    },
+    details: {
+      'message-content:revision-visible': ready(JSON.stringify({
+        role: 'user',
+        parts: [{ text: '保留的问题' }]
+      }))
+    },
+    transientModelRequests: {
+      retry: {
+        conversationId: 'conversation-retry-anchor',
+        turnId: 'turn-retry',
+        modelRequestId: 'request-retry',
+        requestSeq: '1',
+        providerId: 'provider-retry',
+        modelId: 'gpt-retry',
+        streamSeq: '1',
+        text: '新的回答',
+        thought: '',
+        outputParts: [{ text: '新的回答' }],
+        toolCalls: [],
+        status: 'streaming',
+        startedAt: Date.parse('2026-08-18T00:00:02.100Z'),
+        updatedAt: Date.parse('2026-08-18T00:00:02.200Z')
+      }
+    }
+  });
+
+  assert.deepEqual(projection.messages.map((message) => message.id), [
+    'message-visible',
+    'transient:request-retry'
+  ]);
+  assert.equal(projection.messages[1].seq, 1.5);
+  assert.equal(projection.messages[1].content.parts[0].text, '新的回答');
+});
+
 test('长流积压达到阈值时直刷，terminal时立即显示完整文本', async (context) => {
   const server = await createViteServer(context);
   const vue = await import('vue');

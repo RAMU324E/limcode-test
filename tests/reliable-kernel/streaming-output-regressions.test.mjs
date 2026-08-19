@@ -209,6 +209,25 @@ test('client summary keeps a long provider_call_id byte-for-byte', async () => {
   feed.disconnect(connection.sessionId);
 });
 
+test('retry activity disappears as soon as the current attempt renders model output', async (context) => {
+  const server = await createWebviewTestServer();
+  context.after(async () => server.close());
+  const { reliableRetryStreamingActivityLabel } = await server.ssrLoadModule(
+    '/src/domain/reliableTransientActivity.ts'
+  );
+
+  assert.equal(reliableRetryStreamingActivityLabel({
+    retryAttempt: 1,
+    retryMaxAttempts: 3,
+    hasVisibleOutput: false
+  }), '第 1/3 次自动恢复已启动，正在连接并等待 LLM 输出');
+  assert.equal(reliableRetryStreamingActivityLabel({
+    retryAttempt: 1,
+    retryMaxAttempts: 3,
+    hasVisibleOutput: true
+  }), undefined);
+});
+
 test('streaming tool preview coalesces updates by animation frame and commits final immediately', async (context) => {
   const server = await createWebviewTestServer();
   const previousWindow = globalThis.window;

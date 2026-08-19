@@ -643,9 +643,10 @@ function transientSequenceAnchor(input: {
   }
   if (!lower) {
     const sourceMessageId = input.sourceMessageIdByTurnId.get(input.transient.turnId);
-    lower = sourceMessageId
-      ? input.messages.find((candidate) => candidate.message.id === sourceMessageId)
-      : undefined;
+    if (sourceMessageId) {
+      lower = input.messages.find((candidate) => candidate.message.id === sourceMessageId);
+      if (!lower) lower = [...input.messages].sort(compareParsedMessages).pop();
+    }
   }
   if (!lower) return undefined;
   if (!upper) {

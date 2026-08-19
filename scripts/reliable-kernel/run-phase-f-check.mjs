@@ -1908,6 +1908,7 @@ async function checkClientSnapshotBounds() {
     assert.match(messageListSource, /LLM 输出停滞/);
     assert.match(messageListSource, /reliableRetryStreamingActivityLabel/);
     assert.match(transientActivitySource, /已启动，正在连接并等待 LLM 输出/);
+    assert.match(transientActivitySource, /if \(input\.hasVisibleOutput\) return undefined;/);
     assert.ok(30 + 8 <= 40);
     const plainData = require(path.join(root, 'dist/extension/shared/plainData.js'));
     const proxy = new Proxy({ nested: [{ value: 'plain' }] }, {});
@@ -1916,7 +1917,7 @@ async function checkClientSnapshotBounds() {
     assert.notEqual(plain, proxy);
     assert.throws(() => plainData.toStructuredClonePlainData(new Map()), /forbidden class/);
     assert.throws(() => plainData.toStructuredClonePlainData({ callback() {} }), /unsupported function/);
-    assertions.push('可靠时间线使用30+8 segmented挂载上限、projection绝对楼层和瞬态向上取整；Message+Revision+detail状态驱动正文水合并以中性骨架展示；final工具参数快照持续到durable ToolCall接管；Attempt 2+的持久自动恢复状态优先于transient thought并始终可见；Bridge payload递归转plain且拒绝Map/function/class');
+    assertions.push('可靠时间线使用30+8 segmented挂载上限、projection绝对楼层和瞬态向上取整；Message+Revision+detail状态驱动正文水合并以中性骨架展示；final工具参数快照持续到durable ToolCall接管；Attempt 2+的持久自动恢复状态在无输出时优先展示，并在对应transient可见后让位；Bridge payload递归转plain且拒绝Map/function/class');
     faults.push('keyset insertion between pages');
     faults.push('detail payload larger than maxResponseBytes');
     metrics.snapshotBytes = wireBytes(snapshot);

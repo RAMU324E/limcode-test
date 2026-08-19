@@ -57,9 +57,8 @@ export function reliableRetryStreamingActivityLabel(input: {
   retryAttempt: number;
   retryMaxAttempts: number;
   hasVisibleOutput: boolean;
-}): string {
+}): string | undefined {
   const identity = `第 ${input.retryAttempt}/${input.retryMaxAttempts} 次自动恢复`;
-  return input.hasVisibleOutput
-    ? `${identity}中，正在接收 LLM 输出`
-    : `${identity}已启动，正在连接并等待 LLM 输出`;
+  if (input.hasVisibleOutput) return undefined;
+  return `${identity}已启动，正在连接并等待 LLM 输出`;
 }
