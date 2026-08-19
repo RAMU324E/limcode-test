@@ -540,7 +540,7 @@ test('truncate根Token估算复用模型投影而不是持久化字节长度', (
 test('当前扩展替换命令等待process真实终态，其他命令保持请求等待期', () => {
   const selfUpdate = [
     'code --uninstall-extension your-publisher.limcode-test',
-    'code --install-extension ./limcode-test-0.0.12.vsix'
+    'code --install-extension ./limcode-test-0.0.13.vsix'
   ].join(' && ');
 
   assert.equal(kernel.effectiveProcessForegroundWaitMs(selfUpdate, 1_000, 120_000), 120_000);
@@ -555,7 +555,7 @@ test('当前扩展替换命令等待process真实终态，其他命令保持请�
   );
   assert.equal(
     kernel.effectiveProcessForegroundWaitMs(
-      'code --install-extension ./limcode-test-0.0.12.vsix',
+      'code --install-extension ./limcode-test-0.0.13.vsix',
       1_000,
       120_000
     ),
