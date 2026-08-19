@@ -18,6 +18,14 @@ const { VscodeReliableKernelCommandRouter } = require(path.join(
   root,
   'dist/extension/backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js'
 ));
+const {
+  INTERACTION_ATTENTION_ACTION,
+  InteractionAttentionNotifier,
+  runtimeCommitNeedsInteractionAttention
+} = require(path.join(
+  root,
+  'dist/extension/backend/application/reliableKernel/interactionAttention.js'
+));
 
 test('stale Turn interrupt is idempotently reported as already_terminal', async () => {
   const posted = [];
@@ -168,6 +176,78 @@ test('durable Interaction result is posted before a stalled Agent resume complet
   await eventually(() => resumedConversations.length === 1);
   assert.deepEqual(resumedConversations, [{ conversationId: 'conversation-one', turnId: 'owner-turn' }]);
 });
+
+test('pending ASK and Plan interactions notify once and open the selected conversation', async () => {
+  const notifications = [];
+  const opened = [];
+  const notifier = new InteractionAttentionNotifier({
+    showInformationMessage(message, action) {
+      notifications.push({ message, action });
+      return Promise.resolve(message.includes('问题等待回答') ? action : undefined);
+    },
+    openConversation(request) {
+      opened.push(request);
+      return Promise.resolve();
+    }
+  });
+  const pending = [
+    attention('ask-one', 'ask_user', 'conversation-ask', 'ASK 对话', 1),
+    attention('ask-two', 'ask_user', 'conversation-ask', 'ASK 对话', 2),
+    attention('plan-one', 'plan_review', 'conversation-plan', 'Plan 对话', 3)
+  ];
+
+  notifier.synchronize(pending);
+  assert.equal(notifications.length, 2);
+  assert.deepEqual(notifications.map((entry) => entry.action), [
+    INTERACTION_ATTENTION_ACTION,
+    INTERACTION_ATTENTION_ACTION
+  ]);
+  assert.match(notifications[0].message, /2 个问题等待回答/);
+  assert.match(notifications[1].message, /Plan 等待审批/);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(opened, [{
+    conversationId: 'conversation-ask',
+    conversationTitle: 'ASK 对话'
+  }]);
+
+  notifier.synchronize(pending);
+  assert.equal(notifications.length, 2, 'repeated pending facts must not show duplicate notifications');
+});
+
+test('a replacement ASK request starts a new notification episode', () => {
+  const notifications = [];
+  const notifier = new InteractionAttentionNotifier({
+    showInformationMessage(message) {
+      notifications.push(message);
+      return Promise.resolve(undefined);
+    },
+    openConversation() {
+      return Promise.resolve();
+    }
+  });
+
+  notifier.synchronize([attention('ask-first', 'ask_user', 'conversation-one', '同一对话', 1)]);
+  notifier.synchronize([attention('ask-second', 'ask_user', 'conversation-one', '同一对话', 2)]);
+  notifier.synchronize([attention('ask-second', 'ask_user', 'conversation-one', '同一对话', 2)]);
+
+  assert.equal(notifications.length, 2);
+});
+
+test('Interaction commit domains trigger an attention refresh', () => {
+  for (const domain of ['InteractionRequest', 'InteractionOwnerLink', 'InteractionToolCallLink']) {
+    assert.equal(runtimeCommitNeedsInteractionAttention({
+      changes: [{ domain, kind: 'upsert', id: domain }]
+    }), true);
+  }
+  assert.equal(runtimeCommitNeedsInteractionAttention({
+    changes: [{ domain: 'ToolCall', kind: 'upsert', id: 'tool-call' }]
+  }), false);
+});
+
+function attention(requestId, kind, conversationId, conversationTitle, createdAt) {
+  return { requestId, kind, conversationId, conversationTitle, createdAt };
+}
 
 function webview(posted) {
   return {

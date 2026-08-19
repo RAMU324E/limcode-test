@@ -21,6 +21,7 @@ import {
   DEFAULT_CONVERSATION_TITLE,
   displayConversationTitle
 } from '../../../shared/conversationTitle';
+import { EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
 import type {
   BridgeClientId,
@@ -46,6 +47,12 @@ import { VscodeReliableKernelCutoverCoordinator } from './VscodeReliableKernelCu
 import { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
+  InteractionAttentionNotifier,
+  runtimeCommitNeedsInteractionAttention,
+  type InteractionAttentionKind,
+  type PendingInteractionAttention
+} from './interactionAttention';
+import {
   conversationHistoryPreviewFromBytes,
   conversationHistoryTitleContentFromBytes,
   projectChildConversationHistory
@@ -54,6 +61,7 @@ import {
 const HISTORY_CACHE_LIMIT = 512;
 const HISTORY_CONTENT_READ_CONCURRENCY = 4;
 const DEFAULT_HISTORY_PAGE_SIZE = 50;
+const INTERACTION_ATTENTION_REFRESH_DELAY_MS = 25;
 
 export interface VscodeReliableKernelApplicationFacadeOpenOptions {
   /** Startup may pre-resolve and claim this immutable placement before importing the full backend. */
@@ -68,6 +76,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private readonly webviews = new Map<BridgeClientId, vscode.Webview>();
   private readonly commandRouter: VscodeReliableKernelCommandRouter;
   private readonly externalHistoryWatcher: ExternalDataVersionWatcher;
+  private readonly interactionAttentionNotifier: InteractionAttentionNotifier;
   private historyEntries: SidebarConversationHistoryEntry[] = [];
   private originLinks: ConversationOriginLinkRecord[] = [];
   private readonly historyPreviewByRevisionId = new Map<string, string>();
@@ -75,6 +84,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private historyRefresh: Promise<void> | undefined;
   private historyRefreshPending = false;
   private historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private interactionAttentionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private hydration: Promise<void> | undefined;
   private unsubscribeCommit: (() => void) | undefined;
   private disposed = false;
@@ -86,6 +96,18 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     private readonly getPaths: () => StoragePaths,
     private readonly runtimePlacement: VscodeWorkspaceRuntimePlacement
   ) {
+    this.interactionAttentionNotifier = new InteractionAttentionNotifier({
+      showInformationMessage: (message, action) => vscode.window.showInformationMessage(message, action),
+      openConversation: ({ conversationId, conversationTitle }) => vscode.commands.executeCommand(
+        EXTENSION_COMMAND_IDS.openPanel,
+        {
+          conversationId,
+          ...(conversationTitle ? { title: conversationTitle } : {}),
+          reuse: true
+        }
+      ),
+      onError: (error) => console.warn('[LimCode] Failed to notify pending user interaction.', error)
+    });
     this.commandRouter = new VscodeReliableKernelCommandRouter(product, {
       broadcast: (message) => this.broadcast(message),
       createConversation: (options) => this.createConversation(options),
@@ -135,6 +157,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       await this.externalHistoryWatcher.start();
       if (this.disposed) return;
       await this.refreshConversationHistory();
+      if (this.disposed) return;
+      await this.refreshInteractionAttention();
       if (this.disposed) return;
       if (this.historyEntries.length === 0) await this.createConversation();
     })();
@@ -543,6 +567,9 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.disposed = true;
     if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
     this.historyRefreshTimer = undefined;
+    if (this.interactionAttentionRefreshTimer !== undefined) clearTimeout(this.interactionAttentionRefreshTimer);
+    this.interactionAttentionRefreshTimer = undefined;
+    this.interactionAttentionNotifier.clear();
     this.unsubscribeCommit?.();
     this.unsubscribeCommit = undefined;
     this.externalHistoryWatcher.cancel();
@@ -560,6 +587,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   private onRuntimeCommit(commit: RuntimeCommitResult): void {
     if (this.disposed) return;
+    if (runtimeCommitNeedsInteractionAttention(commit)) this.scheduleInteractionAttentionRefresh();
     if (!commit.changes.some((change) => [
       'Conversation',
       'Turn',
@@ -587,6 +615,58 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         console.error('[LimCode] Reliable conversation history refresh failed.', error);
       });
     }, 25);
+  }
+
+  private scheduleInteractionAttentionRefresh(): void {
+    if (this.interactionAttentionRefreshTimer !== undefined) {
+      clearTimeout(this.interactionAttentionRefreshTimer);
+    }
+    this.interactionAttentionRefreshTimer = setTimeout(() => {
+      this.interactionAttentionRefreshTimer = undefined;
+      void this.refreshInteractionAttention().catch((error) => {
+        console.warn('[LimCode] Pending user interaction refresh failed.', error);
+      });
+    }, INTERACTION_ATTENTION_REFRESH_DELAY_MS);
+  }
+
+  private async refreshInteractionAttention(): Promise<void> {
+    const requests = await this.list('InteractionRequest', { status: 'pending' }, 1000);
+    const resolved = await Promise.all(requests.map((request) => this.resolveInteractionAttention(request)));
+    if (this.disposed) return;
+    this.interactionAttentionNotifier.synchronize(
+      resolved.filter((request): request is PendingInteractionAttention => request !== undefined)
+    );
+  }
+
+  private async resolveInteractionAttention(
+    request: DomainRow
+  ): Promise<PendingInteractionAttention | undefined> {
+    const kind = interactionAttentionKind(request.request_kind);
+    if (!kind) return undefined;
+    const requestId = requireText(request.id, 'InteractionRequest.id');
+    const owners = await this.list('InteractionOwnerLink', { request_id: requestId }, 2);
+    if (owners.length !== 1) return undefined;
+    const turnId = requireText(owners[0].turn_id, 'InteractionOwnerLink.turn_id');
+    if (kind === 'plan_review') {
+      const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 1);
+      if (childMemberships.length > 0) return undefined;
+    }
+    const turn = await this.maybeRow('Turn', turnId);
+    if (!turn) return undefined;
+    const conversationId = requireText(turn.conversation_id, 'Turn.conversation_id');
+    const conversation = await this.maybeRow('Conversation', conversationId);
+    if (!conversation) return undefined;
+    const conversationTitle = displayConversationTitle({
+      id: conversationId,
+      title: typeof conversation.title === 'string' ? conversation.title : ''
+    });
+    return {
+      requestId,
+      kind,
+      conversationId,
+      conversationTitle,
+      createdAt: timestampMs(request.created_at)
+    };
   }
 
   private refreshConversationHistory(): Promise<void> {
@@ -895,6 +975,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private requireOpen(): void {
     if (this.disposed || this.productClosed) throw new Error('可靠 ApplicationFacade 已关闭。');
   }
+}
+
+function interactionAttentionKind(value: unknown): InteractionAttentionKind | undefined {
+  return value === 'ask_user' || value === 'plan_review' ? value : undefined;
 }
 
 function runtimeId(prefix: string): string {
