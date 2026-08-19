@@ -1404,7 +1404,7 @@
       "mutations": [
         "insert"
       ],
-      "client": "detail",
+      "client": "summary",
       "deletePolicy": "dataset-reset-only",
       "resetPolicy": "runtime-dataset",
       "indexes": [
