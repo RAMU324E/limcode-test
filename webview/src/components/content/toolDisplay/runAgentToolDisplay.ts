@@ -16,7 +16,7 @@ export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
 
   return {
     headerIcon: IconUsers,
-    ...(outputSections ? { outputSections } : {}),
+    outputSections: outputSections ?? [],
     headerActions: conversationId ? [{
         id: 'open-agent-run-conversation',
         label: '打开对话',
@@ -33,15 +33,13 @@ export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
 function runAgentMetadataSections(context: ToolDisplayContext): ToolDisplaySection[] {
   const record = asRecord(context.result) ?? asRecord(context.progress);
   if (!record) return [];
-  const answer = asRecord(record.answer);
   const rows = [
     ...stateRow('子 Agent 状态', record.childExecutionState),
     ...stateRow('当前任务状态', record.activeChildTurnState),
     ...stateRow('回答提交状态', record.answerSubmissionState),
     ...stateRow('回答发送状态', record.runtimeDeliveryState),
     ...stateRow('主 Agent 处理状态', record.parentHandlingState),
-    ...stateRow('结束状态', record.terminationState),
-    ...row('回答通道 ID', record.answerBridgeId ?? answer?.answerBridgeId)
+    ...stateRow('结束状态', record.terminationState)
   ];
   return rows.length > 0
     ? [{ kind: 'output', title: '子 Agent 运行结果', rows, rowStyle: 'keyValue' }]

@@ -499,12 +499,18 @@ function stringifyValue(value: unknown): string {
   }
 }
 
+function environmentDisplayRef(value: unknown): string | undefined {
+  const text = boundedInlineValue(value);
+  if (!text) return undefined;
+  return text.startsWith('work-env-') ? '工作环境' : text;
+}
+
 function fallbackToolSummary(toolName: string, args: unknown): string | undefined {
   const source = isRecord(args) ? args : undefined;
   if (!source) return undefined;
   if (toolName === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
-    const workEnvironmentId = boundedInlineValue(source.workEnvironmentId);
-    return workEnvironmentId ? `切换工作环境 · ${workEnvironmentId}` : '切换工作环境';
+    const workEnvironmentRef = boundedInlineValue(source.workEnvironmentRef);
+    return workEnvironmentRef ? `切换工作环境 · ${workEnvironmentRef}` : '切换工作环境';
   }
   if (toolName === SKILLS_TOOL_NAME) {
     const name = boundedInlineValue(source.name);
@@ -520,12 +526,12 @@ function fallbackToolSummary(toolName: string, args: unknown): string | undefine
     return title ? `提交 Agent 回答 · ${title}` : '提交 Agent 回答';
   }
   if (toolName === READ_AGENT_ANSWER_TOOL_NAME) {
-    const answerBridgeId = boundedInlineValue(source.answerBridgeId);
-    return answerBridgeId ? `读取 Agent 回答 · ${answerBridgeId}` : '读取 Agent 回答';
+    const childRef = boundedInlineValue(source.childRef);
+    return childRef ? `读取 Agent 回答 · ${childRef}` : '读取 Agent 回答';
   }
   if (toolName === 'run_agent') {
-    const answerBridgeId = boundedInlineValue(source.answerBridgeId);
-    if (source.mode === 'interrupt') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
+    const childRef = boundedInlineValue(source.childRef);
+    if (source.mode === 'interrupt') return childRef ? `Interrupt Agent · ${childRef}` : 'Interrupt Agent';
     const agent = isRecord(source.agent) ? source.agent : undefined;
     const agentType = boundedInlineValue(agent?.type) ?? 'worker';
     const prompt = boundedInlineValue(source.prompt);
@@ -535,8 +541,8 @@ function fallbackToolSummary(toolName: string, args: unknown): string | undefine
     const transfers = Array.isArray(source.transfers) ? source.transfers.filter(isRecord) : [];
     const first = transfers[0];
     if (!first) return '传输文件';
-    const from = [boundedInlineValue(first.fromEnvironment), boundedInlineValue(first.fromPath)].filter(Boolean).join(':');
-    const to = [boundedInlineValue(first.toEnvironment), boundedInlineValue(first.toPath)].filter(Boolean).join(':');
+    const from = [environmentDisplayRef(first.fromEnvironment), boundedInlineValue(first.fromPath)].filter(Boolean).join(':');
+    const to = [environmentDisplayRef(first.toEnvironment), boundedInlineValue(first.toPath)].filter(Boolean).join(':');
     const suffix = transfers.length > 1 ? ` +${transfers.length - 1}` : '';
     return boundedInlineValue(`${from} → ${to}${suffix}`);
   }

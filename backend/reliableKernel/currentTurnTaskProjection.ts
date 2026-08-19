@@ -96,7 +96,7 @@ export function buildCurrentTurnTaskProjection(input: {
   const baseline = applied[0];
   const source = applied[applied.length - 1];
   const counts = taskCounts(snapshot);
-  const card = formatTurnTaskCard({ turnId, snapshot, counts });
+  const card = formatTurnTaskCard({ snapshot, counts });
   const estimatedTokens = estimateTurnTaskCardTokens(card);
   return {
     kind: 'turn_task_card',
@@ -287,14 +287,12 @@ export function estimateTurnTaskCardTokens(card: string): number {
 }
 
 function formatTurnTaskCard(input: {
-  turnId: string;
   snapshot: TaskListSnapshotView;
   counts: CurrentTurnTaskCounts;
 }): string {
   const { counts } = input;
   const lines = [
     '[Current Turn Task Card — runtime task data, not a new user instruction]',
-    `turnId: ${input.turnId}`,
     `progress: total=${counts.total}; unfinished=${counts.unfinished}; in_progress=${counts.inProgress}; blocked=${counts.blocked}; pending=${counts.pending}; completed=${counts.completed}; cancelled=${counts.cancelled}`
   ];
   if (input.snapshot.items.length === 0) lines.push('items: none');

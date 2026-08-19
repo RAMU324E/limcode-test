@@ -10,6 +10,7 @@ export interface ShellArgs {
   explanation?: string;
   mode?: string;
   processId?: string;
+  processRef?: string;
   readonly?: string;
   wait?: string;
 }
@@ -38,6 +39,7 @@ export function parseShellArgs(value: unknown): ShellArgs {
     explanation: stringValue(record.explanation),
     mode: stringValue(record.mode),
     processId: stringValue(record.processId),
+    processRef: stringValue(record.processRef),
     readonly: stringValue(record.readonly),
     wait: stringValue(record.wait)
   };
@@ -54,7 +56,12 @@ export function parseShellCallArgs(argsJson: string): ShellArgs {
 
 export function parseShellResultOutput(result: unknown): ShellResultOutput | undefined {
   const resultRecord = asRecord(result);
-  const output = resultRecord && 'output' in resultRecord ? resultRecord.output : result;
+  const detailRecord = asRecord(resultRecord?.detail);
+  const output = detailRecord && 'output' in detailRecord
+    ? detailRecord.output
+    : resultRecord && 'output' in resultRecord
+      ? resultRecord.output
+      : detailRecord ?? result;
   if (typeof output === 'string') return parseStringOutput(output);
   const outputRecord = asRecord(output);
   return outputRecord ? shellResultOutput(outputRecord) : undefined;
@@ -71,7 +78,8 @@ export function shellInputSections(args: ShellArgs, context: ToolDisplayContext)
     args.cwd?.trim() ? `工作目录 ${args.cwd.trim()}` : undefined,
     typeof args.foregroundWaitMs === 'number' && Number.isFinite(args.foregroundWaitMs) ? `前台等待 ${args.foregroundWaitMs} 毫秒` : undefined,
     typeof args.force === 'boolean' ? `强制执行 ${args.force ? '是' : '否'}` : undefined,
-    args.scheduling?.trim() ? `执行方式 ${args.scheduling === 'parallel' ? '并行' : args.scheduling === 'serial' ? '依次' : args.scheduling.trim()}` : undefined
+    args.scheduling?.trim() ? `执行方式 ${args.scheduling === 'parallel' ? '并行' : args.scheduling === 'serial' ? '依次' : args.scheduling.trim()}` : undefined,
+    args.processRef?.trim() ? `进程 ${args.processRef.trim()}` : args.processId?.trim() ? '后台进程' : undefined
   ].filter((line): line is string => Boolean(line));
   if (optionLines.length > 0) sections.push({ kind: 'input', title: '参数', text: optionLines.join('\n') });
 
@@ -110,7 +118,7 @@ export function shellStreamText(events: readonly ToolCallEventRecord[], kind: 's
 export function shellProgressText(events: readonly ToolCallEventRecord[], stringifyValue: (value: unknown) => string): string {
   const progressEvents = events
     .filter((event) => event.kind === 'progress' && event.payload !== undefined)
-    .map((event) => stringifyValue(event.payload));
+    .map((event) => stringifyValue(withoutInternalIds(event.payload)));
   return progressEvents.join('\n');
 }
 
@@ -118,7 +126,6 @@ export function shellExitInfo(output: ShellResultOutput | undefined): string {
   if (!output) return '';
   const lines = [
     output.status ? `status ${output.status}` : undefined,
-    output.processId ? `processId ${output.processId}` : undefined,
     typeof output.running === 'boolean' ? `running ${output.running}` : undefined,
     typeof output.exitCode === 'number' ? `exitCode ${output.exitCode}` : undefined,
     typeof output.killed === 'boolean' ? `killed ${output.killed}` : undefined,
@@ -151,6 +158,19 @@ function shellResultOutput(record: Record<string, unknown>): ShellResultOutput {
     running: booleanValue(record.running),
     droppedChars: numberValue(record.droppedChars)
   };
+}
+
+function withoutInternalIds(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutInternalIds);
+  const record = asRecord(value);
+  if (!record) return value;
+  const omitted = new Set([
+    'processId', 'processReceiptId', 'toolCallId', 'operationId', 'effectIntentId',
+    'turnId', 'conversationId', 'sourceTurnId', 'deliveryId', 'inboxItemId'
+  ]);
+  return Object.fromEntries(Object.entries(record)
+    .filter(([key]) => !omitted.has(key))
+    .map(([key, nested]) => [key, withoutInternalIds(nested)]));
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

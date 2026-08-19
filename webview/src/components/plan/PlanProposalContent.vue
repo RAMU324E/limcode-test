@@ -366,14 +366,8 @@ function agentTypeDescription(agent: AgentRecord): string {
         <section v-if="delegatedExecution && !pending" class="plan-delegation-result" aria-label="Plan 执行信息">
           <header class="plan-delegation-heading">
             <IconRobot stroke="2" aria-hidden="true" />
-            <span>已交给 {{ delegatedExecution.agentType || delegatedExecution.agentId || 'Agent' }} 执行</span>
+            <span>已交给 {{ delegatedExecution.agentType || 'Agent' }} 执行</span>
           </header>
-          <dl class="plan-delegation-metadata">
-            <div v-if="delegatedExecution.childExecutionId"><dt>子执行 ID</dt><dd>{{ delegatedExecution.childExecutionId }}</dd></div>
-            <div v-if="delegatedExecution.runId"><dt>运行 ID</dt><dd>{{ delegatedExecution.runId }}</dd></div>
-            <div v-if="delegatedExecution.conversationId"><dt>对话 ID</dt><dd>{{ delegatedExecution.conversationId }}</dd></div>
-            <div v-if="delegatedExecution.answerBridgeId"><dt>回答通道 ID</dt><dd>{{ delegatedExecution.answerBridgeId }}</dd></div>
-          </dl>
           <button
             v-if="delegatedExecution.conversationId"
             type="button"
@@ -741,31 +735,6 @@ function agentTypeDescription(agent: AgentRecord): string {
   width: 15px;
   height: 15px;
   flex: 0 0 auto;
-}
-
-.plan-delegation-metadata {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-}
-
-.plan-delegation-metadata > div {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 112px minmax(0, 1fr);
-  gap: 8px;
-}
-
-.plan-delegation-metadata dt {
-  color: var(--vscode-descriptionForeground);
-}
-
-.plan-delegation-metadata dd {
-  min-width: 0;
-  margin: 0;
-  overflow-wrap: anywhere;
-  font-family: var(--vscode-editor-font-family, monospace);
-  font-size: var(--font-size-xs);
 }
 
 .plan-open-delegated-conversation {

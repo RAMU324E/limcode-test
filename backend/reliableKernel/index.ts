@@ -5,6 +5,7 @@ export * from './contextCompression';
 export * from './contextCompressionCoordinator';
 export * from './contextTokenEstimator';
 export * from './modelFacingContextProjection';
+export * from './modelHandleCatalog';
 export * from './currentTurnTaskProjection';
 export * from './attachmentIngest';
 export * from './attachmentCatalog';

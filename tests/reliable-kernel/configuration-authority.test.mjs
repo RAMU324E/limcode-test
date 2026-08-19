@@ -281,8 +281,8 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
       '[全局规则]\nGLOBAL\n\n[Agent 规则]\nAGENT\n\n[工作流规则]\nWORKFLOW\n\n[对话规则]\nCONVERSATION'
     );
     assert.equal(frozen.runtimeContext.template, 'ENV:\n{{$workEnvironment.current}}');
-    assert.match(frozen.runtimeContext.text, /work-env-local-/);
-    assert.doesNotMatch(frozen.runtimeContext.text, /work-env-remote-test/);
+    assert.match(frozen.runtimeContext.text, /Workspace · 本地/);
+    assert.doesNotMatch(frozen.runtimeContext.text, /work-env-/);
     assert.equal(frozen.workEnvironmentPolicy.enabled, true);
     assert.deepEqual(frozen.workEnvironmentPolicy.allowedWorkEnvironmentIds, [workEnvironmentId]);
     assert.equal(frozen.workEnvironmentPolicy.defaultWorkEnvironmentId, workEnvironmentId);
@@ -295,8 +295,8 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
       intentKind: 'input'
     })).authoritySnapshot.content);
     assert.equal(withoutEnvironmentPolicy.workEnvironmentPolicy.enabled, false);
-    assert.match(withoutEnvironmentPolicy.runtimeContext.text, /work-env-local-/);
-    assert.doesNotMatch(withoutEnvironmentPolicy.runtimeContext.text, new RegExp(remoteEnvironment.id));
+    assert.match(withoutEnvironmentPolicy.runtimeContext.text, /Workspace · 本地/);
+    assert.doesNotMatch(withoutEnvironmentPolicy.runtimeContext.text, /work-env-/);
 
     const changedProvider = {
       ...provider,

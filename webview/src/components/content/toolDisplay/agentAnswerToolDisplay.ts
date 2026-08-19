@@ -4,7 +4,7 @@ import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from
 export const readAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
   const answer = answerFromValue(context.result);
   if (!answer?.content) {
-    return { headerIcon: IconUsers };
+    return { headerIcon: IconUsers, outputSections: [] };
   }
 
   return {
@@ -18,14 +18,11 @@ export const submitAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
   const result = answerSubmitResult(context.result);
   const inputSections: ToolDisplaySection[] = [];
 
-  if (args?.title || args?.answerBridgeId) {
+  if (args?.title) {
     inputSections.push({
       kind: 'input',
       title: '提交信息',
-      rows: [
-        ...(args.answerBridgeId ? [{ label: '回答通道 ID', value: args.answerBridgeId }] : []),
-        ...(args.title ? [{ label: '标题', value: args.title }] : [])
-      ],
+      rows: [{ label: '标题', value: args.title }],
       rowStyle: 'keyValue'
     });
   }
@@ -33,19 +30,16 @@ export const submitAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
 
   return {
     headerIcon: IconUsers,
-    ...(inputSections.length > 0 ? { inputSections } : {}),
-    ...(result ? {
-      outputSections: [{
-        kind: 'output',
-        title: '提交结果',
-        rows: [
-          { label: '是否成功', value: result.ok === undefined ? '未知' : result.ok ? '是' : '否' },
-          ...(result.answerBridgeId ? [{ label: '回答通道 ID', value: result.answerBridgeId }] : []),
-          ...(result.updated !== undefined ? [{ label: '是否更新', value: result.updated ? '是' : '否' }] : [])
-        ],
-        rowStyle: 'keyValue'
-      }]
-    } : {})
+    inputSections,
+    outputSections: result ? [{
+      kind: 'output',
+      title: '提交结果',
+      rows: [
+        { label: '是否成功', value: result.ok === undefined ? '未知' : result.ok ? '是' : '否' },
+        ...(result.updated !== undefined ? [{ label: '是否更新', value: result.updated ? '是' : '否' }] : [])
+      ],
+      rowStyle: 'keyValue'
+    }] : []
   };
 };
 
@@ -53,24 +47,24 @@ export function answerMarkdownSection(title: string, content: string, kind: 'inp
   return { kind, title, text: content, markdown: true };
 }
 
-export function answerFromValue(value: unknown): { answerBridgeId?: string; title?: string; content?: string } | undefined {
+export function answerFromValue(value: unknown): { title?: string; content?: string } | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
   const nestedAnswer = asRecord(record.answer);
   const source = nestedAnswer ?? record;
-  const answerBridgeId = stringValue(source.answerBridgeId);
   const title = stringValue(source.title);
   const content = stringValue(source.content) ?? stringValue(source.result);
-  return answerBridgeId || title || content ? { ...(answerBridgeId ? { answerBridgeId } : {}), ...(title ? { title } : {}), ...(content ? { content } : {}) } : undefined;
+  return title || content ? { ...(title ? { title } : {}), ...(content ? { content } : {}) } : undefined;
 }
 
-function answerSubmitResult(value: unknown): { ok?: boolean; answerBridgeId?: string; updated?: boolean } | undefined {
+function answerSubmitResult(value: unknown): { ok?: boolean; updated?: boolean } | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
-  const answerBridgeId = stringValue(record.answerBridgeId);
   const ok = typeof record.ok === 'boolean' ? record.ok : undefined;
   const updated = typeof record.updated === 'boolean' ? record.updated : undefined;
-  return answerBridgeId || ok !== undefined || updated !== undefined ? { ...(ok !== undefined ? { ok } : {}), ...(answerBridgeId ? { answerBridgeId } : {}), ...(updated !== undefined ? { updated } : {}) } : undefined;
+  return ok !== undefined || updated !== undefined
+    ? { ...(ok !== undefined ? { ok } : {}), ...(updated !== undefined ? { updated } : {}) }
+    : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

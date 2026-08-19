@@ -153,6 +153,7 @@ test('turnTaskCard 按原始顺序完整保留所有 task 的 title/description/
   assert.equal(first.estimatedTokens, estimateTurnTaskCardTokens(first.card));
   assert.ok(first.estimatedTokens > 2_000, '完整 Task 上下文不得受旧 2K budget 限制');
   assert.match(first.card, /runtime task data, not a new user instruction/);
+  assert.doesNotMatch(first.card, /turn-complete-card/);
   assert.doesNotMatch(first.card, /details omitted by card budget/);
   const taskLines = first.card.split('\n').filter((line) => line.startsWith('- status='));
   assert.equal(taskLines.length, items.length);

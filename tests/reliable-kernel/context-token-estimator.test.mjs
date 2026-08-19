@@ -343,7 +343,7 @@ test('Reliable Context信封解码后同批结果共用16K且原CAS派生对象�
 
   const source = [
     { toolName: 'read', callId: 'a', resultId: 'ra', response: { path: '/a', text: 'BEGIN-A' + 'a'.repeat(80_000) + 'END-A' } },
-    { toolName: 'shell', callId: 'b', resultId: 'rb', response: { processId: 'p1', exitCode: 1, text: 'BEGIN-B' + 'b'.repeat(80_000) + 'END-B' }, priority: 'error_or_receipt', reread: { kind: 'process_output', processId: 'p1' } },
+    { toolName: 'shell', callId: 'b', resultId: 'rb', response: { processRef: 'P1', exitCode: 1, text: 'BEGIN-B' + 'b'.repeat(80_000) + 'END-B' }, priority: 'error_or_receipt', reread: { kind: 'process_output', processRef: 'P1' } },
     { toolName: 'tiny', callId: 'c', resultId: 'rc', response: { ok: true, value: 7 } }
   ];
   const before = structuredClone(source);
@@ -354,8 +354,8 @@ test('Reliable Context信封解码后同批结果共用16K且原CAS派生对象�
   assert.equal(first.items[2].truncated, false);
   assert.deepEqual(first.items[2].response, source[2].response);
   assert.ok(first.projectedTokens <= 16_000);
-  assert.equal(first.items[1].response.processId, 'p1');
-  assert.equal(first.items[1].response.rereadHint.processId, 'p1');
+  assert.equal(first.items[1].response.processRef, 'P1');
+  assert.equal(first.items[1].response.rereadHint.processRef, 'P1');
   assert.match(first.items[1].response.preview, /BEGIN-B/);
   assert.match(first.items[1].response.preview, /END-B/);
 });
@@ -486,7 +486,13 @@ test('stored runtime_context规划与Adapter共用typed envelope和4K渲染', ()
       toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} },
       systemPrompt: { text: '' }
     },
-    recipe: { kind: 'reliable-agent-turn', tools: [] },
+    recipe: {
+      kind: 'reliable-agent-turn',
+      tools: [],
+      modelHandleCatalog: {
+        entries: [{ kind: 'child', ref: 'A1', target: 'bridge-planner-runtime' }]
+      }
+    },
     context: [{ segmentId: 'runtime-planner-segment', ...stored }]
   };
   const adapter = new kernel.LlmCapabilityFullRequestAdapter('runtime-planner-provider', {});

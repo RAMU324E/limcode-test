@@ -2,7 +2,11 @@ import { fileURLToPath } from 'node:url';
 import * as path from 'node:path';
 import type { RuleFileRecord, RuleKind, RuleScope, WorkEnvironmentRecord } from '../../shared/protocol';
 import { stripInitialWorkEnvironmentSection } from '../../shared/runtimeContextText';
-import { formatWorkEnvironmentForDisplay } from '../../shared/workEnvironmentCatalog';
+import {
+  workEnvironmentDisplayName,
+  workEnvironmentDisplayPath,
+  workEnvironmentKindLabel
+} from '../../shared/workEnvironmentCatalog';
 
 // 与 world/modules/runtimeContext/placeholders.ts 的 formatWorkspaceUriForPrompt 逻辑一致；
 // 不复用原文件是因为它会拖入未被 tsconfig 编译的 ECS 死代码图（agentRun 模块已在上游删除）。
@@ -118,7 +122,17 @@ function replacePlaceholders(template: string, resolve: (token: string) => strin
 }
 
 function currentWorkEnvironmentText(context: ReliablePromptRenderContext): string {
-  return context.workEnvironments.map((environment) => formatWorkEnvironmentForDisplay(environment)).join('\n');
+  return context.workEnvironments.map((environment) => {
+    const parts = [
+      workEnvironmentDisplayName(environment),
+      workEnvironmentKindLabel(environment.kind)
+    ];
+    const displayPath = workEnvironmentDisplayPath(environment);
+    if (displayPath) parts.push(displayPath);
+    if (environment.os) parts.push(`os=${environment.os}`);
+    if (environment.description) parts.push(environment.description);
+    return parts.join(' · ');
+  }).join('\n');
 }
 
 function currentWorkEnvironmentSectionText(context: ReliablePromptRenderContext): string {

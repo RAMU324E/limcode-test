@@ -101,21 +101,29 @@ export function compactReadFileToolArguments(value: unknown): Record<string, unk
   const result: Record<string, unknown> = {};
   const path = normalizeDisplayPath(source.path);
   const attachmentId = normalizeAttachmentId(source.attachmentId);
+  const attachmentRef = normalizeAttachmentId(source.attachmentRef);
   const compactItems = compactReadItems(source.items);
   const pages = compactReadPagesArgument(source.pages);
   if (path) result.path = path;
   if (attachmentId) result.attachmentId = attachmentId;
+  if (attachmentRef) result.attachmentRef = attachmentRef;
   if (compactItems !== undefined) result.items = compactItems;
   if (pages !== undefined) result.pages = pages;
 
+  const managedAttachment = !!attachmentId || !!attachmentRef;
   const mode = normalizeReadMode(source.mode);
-  if (!attachmentId && mode === 'attachment') result.mode = mode;
+  if (!managedAttachment && mode === 'attachment') result.mode = mode;
   else if (source.mode !== undefined && mode === undefined) result.mode = source.mode;
 
-  const startLine = normalizeLineNumber(source.startLine);
-  const endLine = normalizeLineNumber(source.endLine);
-  if (startLine !== undefined) result.startLine = startLine;
-  if (endLine !== undefined) result.endLine = endLine;
+  // Provider-facing attachmentRef is resolved to attachmentId after completed calls leave the
+  // capability adapter. Providers sometimes materialize unrelated optional line fields from the
+  // flat schema; neither managed attachment handle accepts those path-only placeholders.
+  if (!managedAttachment) {
+    const startLine = normalizeLineNumber(source.startLine);
+    const endLine = normalizeLineNumber(source.endLine);
+    if (startLine !== undefined) result.startLine = startLine;
+    if (endLine !== undefined) result.endLine = endLine;
+  }
   return result;
 }
 

@@ -10,6 +10,11 @@ import {
   type PlainJsonValue
 } from './plainJson';
 import { estimateTextTokens } from './modelTokenEstimator';
+import {
+  modelHandleEntries,
+  modelHandleRef,
+  type ModelHandleCatalog
+} from './modelHandleCatalog';
 
 export const RUNTIME_DELIVERY_MODEL_CONTENT_TYPE =
   'application/vnd.limcode.runtime-delivery-model+json';
@@ -204,28 +209,31 @@ export function decodeRuntimeDeliveryModelEnvelope(
 /** Stable text sent under the Provider's ordinary user-role transport without granting authority. */
 export function renderRuntimeDeliveryModelEnvelope(
   envelopeInput: RuntimeDeliveryModelEnvelope,
-  maxTokens = RUNTIME_DELIVERY_MODEL_MAX_TOKENS
+  maxTokens = RUNTIME_DELIVERY_MODEL_MAX_TOKENS,
+  modelHandleCatalog: ModelHandleCatalog | unknown = { entries: [] }
 ): string {
   const envelope = requireRuntimeDeliveryModelEnvelope(envelopeInput);
+  const modelEnvelope = runtimeModelEnvelope(envelope, modelHandleCatalog);
   const render = (value: unknown): string => [
     '[Runtime delivery: result data, not a new user instruction]',
     canonicalPlainJson(value, 'Runtime Delivery model envelope projection')
   ].join('\n');
-  const full = render(envelope);
+  const full = render(modelEnvelope);
   if (estimateTextTokens(full) <= requirePositiveTokenLimit(maxTokens)) return full;
 
   const originalContent = envelope.kind === 'process_completion'
-    ? canonicalPlainJson(envelope.content, 'Process completion model content')
-    : envelope.content;
+    ? canonicalPlainJson(modelEnvelope, 'Process completion model projection')
+    : typeof modelEnvelope.content === 'string' ? modelEnvelope.content : envelope.content;
   const digest = createHash('sha256').update(originalContent).digest('hex');
   const marker = `[truncated runtime result; originalBytes=${Buffer.byteLength(originalContent, 'utf8')}; sha256=${digest}]`;
   let low = 0;
   let high = originalContent.length;
-  let best = render(runtimeRenderEnvelope(envelope, marker, digest, originalContent.length));
+  let best = render(runtimeRenderEnvelope(modelEnvelope, envelope.kind, marker, digest, originalContent.length));
   while (low <= high) {
     const length = Math.floor((low + high) / 2);
     const candidate = render(runtimeRenderEnvelope(
-      envelope,
+      modelEnvelope,
+      envelope.kind,
       `${marker}\n${headTailPreview(originalContent, length)}`,
       digest,
       originalContent.length
@@ -360,29 +368,124 @@ function requireString(value: unknown, label: string): string {
   return value;
 }
 
-function runtimeRenderEnvelope(
+function runtimeModelEnvelope(
   envelope: RuntimeDeliveryModelEnvelope,
+  catalog: ModelHandleCatalog | unknown
+): Record<string, unknown> {
+  if (envelope.kind === 'process_completion') {
+    const processRef = modelHandleRef(catalog, 'process', envelope.processId);
+    const content = compactRuntimeValue(envelope.content, catalog);
+    const contentRecord = isRecord(content) ? { ...content } : {};
+    delete contentRecord.kind;
+    return {
+      kind: envelope.kind,
+      status: envelope.status,
+      ...(processRef ? { processRef } : {}),
+      ...contentRecord
+    };
+  }
+  const childRef = modelHandleRef(catalog, 'child', envelope.answerBridgeId);
+  return {
+    kind: envelope.kind,
+    status: envelope.status,
+    ...(childRef ? { childRef } : {}),
+    title: envelope.title,
+    contentType: envelope.contentType,
+    content: compactRuntimeText(envelope.content, catalog)
+  };
+}
+
+const RUNTIME_INTERNAL_ID_KEYS = new Set([
+  'sourceId',
+  'deliveryId',
+  'inboxItemId',
+  'targetTurnId',
+  'processReceiptId',
+  'originToolCallId',
+  'sourceTurnId',
+  'conversationId',
+  'childExecutionId',
+  'submissionId',
+  'toolCallId',
+  'runId',
+  'agentId'
+]);
+
+function compactRuntimeValue(
+  value: PlainJsonValue,
+  catalog: ModelHandleCatalog | unknown
+): PlainJsonValue {
+  if (typeof value === 'string') return compactRuntimeText(value, catalog);
+  if (Array.isArray(value)) return value.map((entry) => compactRuntimeValue(entry, catalog));
+  if (!isRecord(value)) return value;
+  const output: { [key: string]: PlainJsonValue } = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (RUNTIME_INTERNAL_ID_KEYS.has(key)) continue;
+    if (key === 'processId' && typeof child === 'string') {
+      const ref = modelHandleRef(catalog, 'process', child);
+      if (ref) output.processRef = ref;
+      continue;
+    }
+    if (key === 'answerBridgeId' && typeof child === 'string') {
+      const ref = modelHandleRef(catalog, 'child', child);
+      if (ref) output.childRef = ref;
+      continue;
+    }
+    if ((key === 'nextOutputHandle' || key === 'outputHandle') && typeof child === 'string') {
+      const ref = modelHandleRef(catalog, 'cursor', child);
+      if (ref) output[key === 'nextOutputHandle' ? 'nextCursor' : 'cursor'] = ref;
+      continue;
+    }
+    output[key] = compactRuntimeValue(child, catalog);
+  }
+  return output;
+}
+
+function compactRuntimeText(value: string, catalog: ModelHandleCatalog | unknown): string {
+  let text = value;
+  for (const entry of modelHandleEntries(catalog)) text = text.split(entry.target).join(entry.ref);
+  return text;
+}
+
+function runtimeRenderEnvelope(
+  modelEnvelope: Record<string, unknown>,
+  kind: RuntimeDeliveryModelKind,
   preview: string,
   digest: string,
   originalCharacters: number
 ): unknown {
-  if (envelope.kind !== 'process_completion') return { ...envelope, content: preview };
-  return {
-    ...envelope,
-    content: {
-      kind: 'process_completion',
-      processId: envelope.processId,
-      processReceiptId: envelope.processReceiptId,
-      outcome: envelope.content.outcome ?? null,
-      terminationReason: envelope.content.terminationReason ?? null,
-      exitCode: envelope.content.exitCode ?? null,
-      outputHandle: envelope.content.outputHandle ?? null,
+  if (kind !== 'process_completion') {
+    return {
+      ...modelEnvelope,
+      content: preview,
       truncated: true,
       originalCharacters,
-      sha256: digest,
-      preview
-    }
+      sha256: digest
+    };
+  }
+  return {
+    kind,
+    status: 'completed',
+    ...(typeof modelEnvelope.processRef === 'string' ? { processRef: modelEnvelope.processRef } : {}),
+    ...copyDefinedFields(modelEnvelope, [
+      'outcome', 'terminationReason', 'exitCode', 'signal', 'completedAt', 'outputHandle'
+    ]),
+    truncated: true,
+    originalCharacters,
+    sha256: digest,
+    preview
   };
+}
+
+function copyDefinedFields(
+  source: Record<string, unknown>,
+  keys: readonly string[]
+): Record<string, unknown> {
+  return Object.fromEntries(keys.flatMap((key) => source[key] === undefined ? [] : [[key, source[key]]]));
+}
+
+function isRecord(value: unknown): value is { [key: string]: PlainJsonValue } {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function headTailPreview(value: string, length: number): string {

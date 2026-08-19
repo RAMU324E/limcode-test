@@ -36,6 +36,14 @@ import {
   projectSummaryModelWindow,
   type ProjectedRequestTokenBreakdown
 } from './modelFacingContextProjection';
+import {
+  buildModelHandleCatalog,
+  modelHandleEntries,
+  modelHandleRef,
+  normalizeModelHandleCatalog,
+  projectToolResultForModel,
+  type ModelHandleCatalog
+} from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import {
   decodeRuntimeDeliveryModelEnvelope,
@@ -432,6 +440,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
 
 function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   const recipe = requireRecord(request.recipe, 'Provider recipe');
+  const modelHandleCatalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
   const authority = requireRecord(request.authoritySnapshot, 'Provider authority snapshot');
   const toolPolicy = authorityToolPolicy(authority);
   const availableTools = normalizeToolDefinitions(recipe.tools)
@@ -462,7 +471,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       continue;
     }
     if (item.segmentKind === 'tool_pair') {
-      contents.push(...toolPairContents(item.content));
+      contents.push(...toolPairContents(item.content, modelHandleCatalog));
       continue;
     }
     const compressed = decodeCompressionContents(item.content, item.contentType);
@@ -479,7 +488,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       continue;
     }
     if (item.segmentKind === 'runtime_context') {
-      contents.push(runtimeContextContent(item.content, item.contentType));
+      contents.push(runtimeContextContent(item.content, item.contentType, modelHandleCatalog));
       continue;
     }
     const decoded = decodeMessageContent(item.content, item.contentType);
@@ -498,9 +507,15 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...attachmentCatalogs,
     collectAttachmentCatalogFromStoredItems(currentAttachmentItem)
   );
-  const attachmentCatalogContent = renderAttachmentCatalog(attachmentCatalog);
+  const attachmentCatalogContent = renderAttachmentCatalog(
+    attachmentCatalog,
+    (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
+  );
   if (attachmentCatalogContent) contents.push(attachmentCatalogContent);
-  const tools = readToolsForAttachmentCatalog(availableTools, attachmentCatalog);
+  const tools = modelFacingToolsForHandleCatalog(
+    readToolsForAttachmentCatalog(availableTools, attachmentCatalog),
+    modelHandleCatalog
+  );
   if (currentTurnInput?.reinject) {
     const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
     if (!current || current.role !== 'user') {
@@ -686,10 +701,12 @@ function compressionContext(
     current = [];
   };
   const recipe = requireRecord(request.recipe, 'Compression recipe');
-  const attachmentCatalog = collectAttachmentCatalogFromStoredItems(request.context.slice(
+  const sourceContext = request.context.slice(
     0,
     typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length
-  ));
+  );
+  const attachmentCatalog = collectAttachmentCatalogFromStoredItems(sourceContext);
+  const modelHandleCatalog = buildModelHandleCatalog(sourceContext.map((item) => item.content));
   const requestedCount = recipe.sourceSegmentCount;
   if (!Number.isSafeInteger(requestedCount) || (requestedCount as number) <= 0
     || (requestedCount as number) > request.context.length) {
@@ -701,11 +718,11 @@ function compressionContext(
   if (request.context[requestedCount as number]?.segmentKind === 'tool_pair') {
     throw new Error('Compression recipe splits an assistant function call from its tool_pair response.');
   }
-  for (const item of request.context.slice(0, requestedCount as number)) {
+  for (const item of sourceContext) {
     let decoded: MessageContent[];
-    if (item.segmentKind === 'tool_pair') decoded = toolPairContents(item.content);
+    if (item.segmentKind === 'tool_pair') decoded = toolPairContents(item.content, modelHandleCatalog);
     else if (item.segmentKind === 'runtime_context') {
-      decoded = [runtimeContextContent(item.content, item.contentType)];
+      decoded = [runtimeContextContent(item.content, item.contentType, modelHandleCatalog)];
     }
     else {
       const structured = decodeCompressionContents(item.content, item.contentType);
@@ -739,7 +756,10 @@ function compressionContext(
       canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
     }
   }
-  const attachmentCatalogContent = renderAttachmentCatalog(attachmentCatalog);
+  const attachmentCatalogContent = renderAttachmentCatalog(
+    attachmentCatalog,
+    (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
+  );
   if (attachmentCatalogContent) {
     contents.push(attachmentCatalogContent);
     current.push(attachmentCatalogContent);
@@ -765,7 +785,8 @@ function hasOrdinaryUserPart(content: MessageContent): boolean {
 
 function runtimeContextContent(
   content: string,
-  contentType: string
+  contentType: string,
+  modelHandleCatalog: ModelHandleCatalog = { entries: [] }
 ): MessageContent {
   const envelope = decodeRuntimeDeliveryModelEnvelope(content, contentType);
   return {
@@ -773,7 +794,7 @@ function runtimeContextContent(
     // therefore the authority boundary: runtime data never masquerades as naked user prose, and
     // its body cannot elevate a fake "System" heading into an instruction.
     role: 'user',
-    parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope) }]
+    parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope, undefined, modelHandleCatalog) }]
   };
 }
 
@@ -872,7 +893,10 @@ function decodeFrozenCurrentTurnInput(content: string, contentType: string): Mes
   return { role: 'user', parts: [{ text: content }] };
 }
 
-function toolPairContents(content: string): MessageContent[] {
+function toolPairContents(
+  content: string,
+  modelHandleCatalog: ModelHandleCatalog = { entries: [] }
+): MessageContent[] {
   const pair = requireRecord(normalizePlainJson(JSON.parse(content), 'Context tool pair'), 'Context tool pair');
   const call = requireRecord(pair.toolCall, 'Context tool pair.toolCall');
   const result = requireRecord(pair.toolModelResult, 'Context tool pair.toolModelResult');
@@ -887,7 +911,7 @@ function toolPairContents(content: string): MessageContent[] {
       ...(providerCallId ? { id: providerCallId } : {}),
       functionResponse: {
         name,
-        response: response.value,
+        response: projectToolResultForModel(name, response.value, modelHandleCatalog),
         ...(response.parts.length > 0 ? { parts: response.parts } : {})
       }
     }]
@@ -987,6 +1011,76 @@ function readToolsForAttachmentCatalog(
         parameters: readFileToolParameters(includeManagedAttachments, includeManagedPageRanges)
       }
     : tool);
+}
+
+function modelFacingToolsForHandleCatalog(
+  tools: ToolSchema[],
+  catalog: ModelHandleCatalog
+): ToolSchema[] {
+  return tools.map((tool) => {
+    const parameters = cloneSchemaRecord(tool.parameters);
+    if (tool.name === READ_TOOL_NAME) {
+      renameSchemaProperty(parameters, 'attachmentId', 'attachmentRef');
+    } else if (tool.name === 'bash' || tool.name === 'shell') {
+      renameSchemaProperty(parameters, 'processId', 'processRef');
+      renameSchemaProperty(parameters, 'outputHandle', 'cursor');
+    } else if (tool.name === 'run_agent' || tool.name === 'read_agent_answer' || tool.name === 'submit_agent_answer') {
+      renameSchemaProperty(parameters, 'answerBridgeId', 'childRef');
+      if (tool.name === 'run_agent') {
+        const properties = asRecord(parameters.properties);
+        const agent = asRecord(properties?.agent);
+        const agentProperties = asRecord(agent?.properties);
+        if (agentProperties) delete agentProperties.id;
+      }
+    } else if (tool.name === 'switch_work_environment') {
+      renameSchemaProperty(parameters, 'workEnvironmentId', 'workEnvironmentRef');
+    }
+    return {
+      ...tool,
+      description: modelFacingHandleText(tool.description ?? '', catalog),
+      parameters: replaceSchemaHandleText(parameters, catalog)
+    };
+  });
+}
+
+function renameSchemaProperty(parameters: Record<string, unknown>, from: string, to: string): void {
+  const properties = asRecord(parameters.properties);
+  if (properties && Object.prototype.hasOwnProperty.call(properties, from)) {
+    properties[to] = properties[from];
+    delete properties[from];
+  }
+  if (Array.isArray(parameters.required)) {
+    parameters.required = parameters.required.map((key) => key === from ? to : key);
+  }
+}
+
+function replaceSchemaHandleText(value: unknown, catalog: ModelHandleCatalog): unknown {
+  if (typeof value === 'string') return modelFacingHandleText(value, catalog);
+  if (Array.isArray(value)) return value.map((entry) => replaceSchemaHandleText(entry, catalog));
+  const record = asRecord(value);
+  if (!record) return value;
+  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [
+    key,
+    replaceSchemaHandleText(entry, catalog)
+  ]));
+}
+
+function modelFacingHandleText(value: string, catalog: ModelHandleCatalog): string {
+  let text = value;
+  for (const [from, to] of [
+    ['attachmentId', 'attachmentRef'],
+    ['processId', 'processRef'],
+    ['outputHandle', 'cursor'],
+    ['answerBridgeId', 'childRef'],
+    ['workEnvironmentId', 'workEnvironmentRef']
+  ] as const) text = text.split(from).join(to);
+  for (const entry of modelHandleEntries(catalog)) text = text.split(entry.target).join(entry.ref);
+  return text;
+}
+
+function cloneSchemaRecord(value: unknown): Record<string, unknown> {
+  const cloned = value === undefined ? {} : JSON.parse(JSON.stringify(value)) as unknown;
+  return asRecord(cloned) ?? {};
 }
 
 function providerToolAllowed(

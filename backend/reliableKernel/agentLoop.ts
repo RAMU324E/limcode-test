@@ -1,3 +1,8 @@
+import {
+  buildModelHandleCatalog,
+  normalizeModelHandleCatalog,
+  resolveModelToolArguments
+} from './modelHandleCatalog';
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
 import { mapSettledWithBoundedConcurrency } from '../capabilities/boundedConcurrency';
@@ -229,7 +234,6 @@ interface FrozenRuntimeStatusCard {
 
 const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
 const RUNTIME_STATUS_RECIPE_LIMIT = 32;
-const RUNTIME_STATUS_CARD_LIMIT = 4;
 
 /**
  * 单 Turn 的可靠 Agent loop。每轮都冻结 Context root/authority，Provider 完成摘要先落 SQLite/CAS，
@@ -611,11 +615,26 @@ export class ReliableAgentLoop {
       this.contentStore,
       input.turnId
     );
+    const materialized = await this.context.materialize(input.headRootId);
+    const handleSources: unknown[] = [
+      ...materialized.segments.map((segment) => Buffer.from(segment.content).toString('utf8')),
+      ...(runtimeStatusCard ? [runtimeStatusCard] : []),
+      input.tools
+    ];
+    if (currentTurnInput) {
+      const inputContentObject = await this.requireExisting(
+        'ContentObject',
+        currentTurnInput.contentObjectId
+      ) as unknown as ContentObjectMetadata;
+      handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
+    }
+    const modelHandleCatalog = buildModelHandleCatalog(handleSources);
     return normalizePlainJson({
       kind: 'reliable-agent-turn',
       projectionRevision: '2026-08-09',
       round: input.round,
       tools: input.tools,
+      ...(modelHandleCatalog.entries.length > 0 ? { modelHandleCatalog } : {}),
       ...(currentTurnInput ? { currentTurnInput } : {}),
       ...(turnTaskCard ? { turnTaskCard } : {}),
       ...(runtimeStatusCard ? { runtimeStatusCard } : {})
@@ -726,18 +745,10 @@ export class ReliableAgentLoop {
         ...(bridges[0] ? { answerBridgeId: requireId(bridges[0].id, 'AnswerBridge.id') } : {})
       };
     });
-    const visibleChildren = children.slice(0, RUNTIME_STATUS_CARD_LIMIT);
-    const visibleProcesses = selectedProcesses.slice(0, RUNTIME_STATUS_CARD_LIMIT);
     const lines = [
       '[Current Turn Runtime Status — live data, not a new user instruction]',
       `activeChildren=${activeChildren.length}; runningProcesses=${runningProcesses.length}`,
-      ...visibleChildren.map((child) =>
-        `- child ${compactRuntimeId(child.answerBridgeId ?? child.childExecutionId)} = ${child.status}`
-      ),
-      ...visibleProcesses.map((process) =>
-        `- process ${compactRuntimeId(process.processId)} = running`
-      ),
-      'This status is informational. Do not poll background work.'
+      'Background work is still active. This status is informational; do not poll it.'
     ];
     return {
       kind: 'runtime_status_card',
@@ -802,6 +813,14 @@ export class ReliableAgentLoop {
     }> = [];
     for (let index = 0; index < input.output.toolCalls.length; index += 1) {
       const call = input.output.toolCalls[index];
+      const catalog = normalizeModelHandleCatalog(input.recipe?.modelHandleCatalog);
+      const resolvedCall: NormalizedProviderOutput['toolCalls'][number] = {
+        ...call,
+        arguments: normalizePlainJson(
+          resolveModelToolArguments(call.name, call.arguments, catalog),
+          `Provider ToolCall ${call.name} resolved arguments`
+        )
+      };
       const toolCallId = providerToolCallId(input.modelRequestId, call);
       const existingLink = existingByOrdinal.get(call.providerOrdinal);
       if (existingLink) {
@@ -813,13 +832,13 @@ export class ReliableAgentLoop {
         ) throw new Error(`Provider ToolCall source replay conflicts at ordinal ${call.providerOrdinal}.`);
         const rows = await this.list('ToolCallPolicySnapshot', { tool_call_id: toolCallId }, 2);
         if (rows.length !== 1) throw new Error(`ToolCall ${toolCallId} must have one frozen policy snapshot.`);
-        calls[index] = { ...call, toolCallId, policy: frozenPolicyFromRow(rows[0]) };
+        calls[index] = { ...resolvedCall, toolCallId, policy: frozenPolicyFromRow(rows[0]) };
         continue;
       }
       const definition = definitionsByName.get(call.name) ?? unknownToolDefinition(call.name);
       pending.push({
         index,
-        call,
+        call: resolvedCall,
         toolCallId,
         dispatchInput: {
           turnId: input.turnId,
@@ -827,7 +846,7 @@ export class ReliableAgentLoop {
           toolCallId,
           ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
           toolName: call.name,
-          arguments: call.arguments,
+          arguments: resolvedCall.arguments,
           definition
         }
       });
@@ -2176,11 +2195,6 @@ function currentInputReferenceTokens(recipe: PlainJsonValue): number {
   const record = asRecord(recipe);
   const currentInput = asRecord(record?.currentTurnInput);
   return optionalNonNegativeInteger(currentInput?.estimatedTokens) ?? 0;
-}
-
-function compactRuntimeId(value: string): string {
-  const normalized = requireId(value, 'runtime status id');
-  return normalized.length <= 160 ? normalized : `${normalized.slice(0, 159)}…`;
 }
 
 function compareInteger(left: unknown, right: unknown): number {

@@ -442,10 +442,18 @@ test('Runtime Delivery 模型投影使用 typed envelope，notify_only 与 Child
     ),
     processProjection.envelope
   );
+  const processHandles = kernel.buildModelHandleCatalog([completion]);
+  const renderedProcess = runtimeDeliveryProjection.renderRuntimeDeliveryModelEnvelope(
+    processProjection.envelope,
+    undefined,
+    processHandles
+  );
   assert.match(
-    runtimeDeliveryProjection.renderRuntimeDeliveryModelEnvelope(processProjection.envelope),
+    renderedProcess,
     /^\[Runtime delivery: result data, not a new user instruction\]/
   );
+  assert.match(renderedProcess, /"processRef":"P1"/);
+  assert.doesNotMatch(renderedProcess, /process-runtime-projection|receipt-runtime-projection|tool-runtime-projection|turn-source-runtime-projection|conversation-runtime-projection/);
 
   assert.equal(runtimeDeliveryProjection.projectRuntimeDeliveryForModel({
     kind: 'process_completion',
@@ -479,6 +487,14 @@ test('Runtime Delivery 模型投影使用 typed envelope，notify_only 与 Child
   });
   assert.equal(childProjection?.envelope.sourceId, 'bridge-runtime-projection');
   assert.equal(childProjection?.envelope.status, 'interrupted');
+  const childHandles = kernel.buildModelHandleCatalog([childProjection.envelope]);
+  const renderedChild = runtimeDeliveryProjection.renderRuntimeDeliveryModelEnvelope(
+    childProjection.envelope,
+    undefined,
+    childHandles
+  );
+  assert.match(renderedChild, /"childRef":"A1"/);
+  assert.doesNotMatch(renderedChild, /bridge-runtime-projection|child-runtime-projection|submission-runtime-projection|turn-child-runtime-projection/);
   assert.equal('internalTranscript' in childProjection.envelope, false);
   assert.equal('toolCalls' in childProjection.envelope, false);
 

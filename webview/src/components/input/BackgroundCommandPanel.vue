@@ -191,6 +191,11 @@ function closePanel(): void {
   open.value = false;
 }
 
+function commandLabel(entry: CommandEntry): string {
+  const index = entries.value.findIndex((candidate) => candidate.processId === entry.processId);
+  return index >= 0 ? `命令 ${index + 1}` : '后台命令';
+}
+
 function selectEntry(entry: CommandEntry): void {
   selectedProcessId.value = entry.processId;
   void nextTick(() => detailScroller.value?.scrollTo({ top: 0 }));
@@ -434,7 +439,7 @@ function timestamp(value: unknown): number {
                 <span class="command-shell">{{ entry.shell }}</span>
               </span>
               <span class="command-preview">{{ commandPreview(entry) }}</span>
-              <span class="command-subline">{{ entry.accessLabel }} · {{ formatTime(entry.startedAt) }} · {{ entry.processId }}</span>
+              <span class="command-subline">{{ commandLabel(entry) }} · {{ entry.accessLabel }} · {{ formatTime(entry.startedAt) }}</span>
             </button>
           </div>
           <AdvancedScrollbar :scroller="listScroller" :refresh-key="entries.length" variant="minimal" />
@@ -443,7 +448,7 @@ function timestamp(value: unknown): number {
         <article v-if="selectedEntry" class="background-command-detail">
           <header class="command-detail-header">
             <span class="command-status" :class="`is-${selectedEntry.statusTone}`">{{ selectedEntry.statusLabel }}</span>
-            <span class="command-detail-id">{{ selectedEntry.processId }}</span>
+            <span class="command-detail-label">{{ commandLabel(selectedEntry) }} · {{ selectedEntry.shell }}</span>
             <button
               v-if="selectedEntry.running"
               type="button"
@@ -730,7 +735,7 @@ function timestamp(value: unknown): number {
 
 .command-shell,
 .command-subline,
-.command-detail-id {
+.command-detail-label {
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-xs);
 }
@@ -765,12 +770,11 @@ function timestamp(value: unknown): number {
   gap: 8px;
 }
 
-.command-detail-id {
+.command-detail-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Consolas, monospace);
 }
 
 .command-process-stop {

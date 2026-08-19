@@ -6,6 +6,7 @@ type ReadFileMode = 'text' | 'attachment';
 interface ReadFileArgs {
   path?: string;
   attachmentId?: string;
+  attachmentRef?: string;
   pages?: string;
   mode?: ReadFileMode;
   startLine?: number;
@@ -44,25 +45,26 @@ export const readFileToolDisplay: ToolDisplayResolver = (context) => {
 
   return {
     headerIcon: IconFileDescription,
-    ...(inputSections ? { inputSections } : {}),
-    ...(outputSections ? { outputSections } : {})
+    inputSections: inputSections ?? [],
+    outputSections: outputSections ?? []
   };
 };
 
 function readFileInputSections(args: ReadFileArgs, context: ToolDisplayContext): ToolDisplaySection[] | undefined {
   const path = normalizePath(args.path);
   const attachmentId = normalizedText(args.attachmentId);
-  if (!path && !attachmentId) return undefined;
+  const attachmentRef = normalizedText(args.attachmentRef);
+  if (!path && !attachmentId && !attachmentRef) return undefined;
 
   const rows = parameterRows([
     { label: '路径', value: path || undefined },
-    { label: '附件编号', value: attachmentId },
+    { label: '附件', value: attachmentRef ?? (attachmentId ? '历史附件' : undefined) },
     { label: '页范围', value: args.pages },
     {
       label: '读取方式',
-      value: attachmentId ? '历史附件（自动识别）' : args.mode === 'attachment' ? '附件' : '文本'
+      value: attachmentId || attachmentRef ? '历史附件（自动识别）' : args.mode === 'attachment' ? '附件' : '文本'
     },
-    { label: '行范围', value: !attachmentId && args.mode !== 'attachment' ? lineRangeText(args.startLine, args.endLine) : undefined }
+    { label: '行范围', value: !attachmentId && !attachmentRef && args.mode !== 'attachment' ? lineRangeText(args.startLine, args.endLine) : undefined }
   ]);
 
   return rows.length > 0
@@ -102,6 +104,7 @@ function readFileArgs(value: unknown): ReadFileArgs {
   return {
     path: stringValue(record.path),
     attachmentId: normalizedText(record.attachmentId),
+    attachmentRef: normalizedText(record.attachmentRef),
     pages: normalizedText(record.pages),
     mode: readFileMode(record.mode),
     startLine: numberValue(record.startLine),

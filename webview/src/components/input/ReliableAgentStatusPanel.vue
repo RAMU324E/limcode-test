@@ -440,7 +440,7 @@ function text(value: unknown): string | undefined {
                 </span>
                 <span v-if="child.activitySummary" class="agent-run-activity">{{ child.activitySummary }}</span>
                 <span class="agent-run-preview">{{ taskPreview(child) }}</span>
-                <span class="agent-run-subline">{{ formatTime(child.createdAt) }} · {{ child.id }}</span>
+                <span class="agent-run-subline">{{ formatTime(child.createdAt) }}</span>
                 <span v-if="deliveryLabel(child)" class="agent-run-answer-line" :class="{ 'is-error': child.deliveryBadge === 'delivery_failed' }">
                   {{ deliveryLabel(child) }}
                 </span>
@@ -477,12 +477,12 @@ function text(value: unknown): string | undefined {
               >
                 <span>{{ selectedEntry.lifecycleLabel }}</span>
               </HoverTooltipPanel>
-              <span class="agent-run-detail-id">{{ selectedEntry.id }}</span>
+              <span class="agent-run-detail-name">{{ selectedEntry.agentName }}</span>
             </span>
             <button
               type="button"
               class="agent-run-open-conversation"
-              :aria-label="`打开对话 ${selectedEntry.conversationId}`"
+              :aria-label="`打开 ${selectedEntry.agentName} 的对话`"
               @click="openConversationForEntry(selectedEntry)"
             >
               <IconMessage2 stroke="2" aria-hidden="true" />
@@ -499,8 +499,8 @@ function text(value: unknown): string | undefined {
                   <dt>当前回合</dt><dd>{{ selectedEntry.turnStatus ? `${statusText(selectedEntry.turnStatus)} (${selectedEntry.turnStatus})` : '-' }}</dd>
                   <dt>当前活动</dt><dd>{{ selectedEntry.activitySummary || statusText(selectedEntry.activityKind || 'idle') }}</dd>
                   <dt>回合结束</dt><dd>{{ selectedEntry.turnTerminationStatus ? `${statusText(selectedEntry.turnTerminationStatus)} (${selectedEntry.turnTerminationStatus})` : '-' }}</dd>
-                  <dt>AnswerBridge</dt><dd>{{ selectedEntry.answerBridgeStatus ? `${statusText(selectedEntry.answerBridgeStatus)} (${selectedEntry.answerBridgeStatus})` : '-' }}</dd>
-                  <dt>RuntimeDelivery</dt><dd>{{ selectedEntry.deliveryState ? `${statusText(selectedEntry.deliveryState)} (${selectedEntry.deliveryState})` : '-' }}</dd>
+                  <dt>Answer</dt><dd>{{ selectedEntry.answerBridgeStatus ? `${statusText(selectedEntry.answerBridgeStatus)} (${selectedEntry.answerBridgeStatus})` : '-' }}</dd>
+                  <dt>回答发送</dt><dd>{{ selectedEntry.deliveryState ? `${statusText(selectedEntry.deliveryState)} (${selectedEntry.deliveryState})` : '-' }}</dd>
                   <dt>主 Agent 处理</dt><dd>{{ selectedEntry.parentHandlingState ? `${statusText(selectedEntry.parentHandlingState)} (${selectedEntry.parentHandlingState})` : '-' }}</dd>
                   <dt>开始</dt><dd>{{ formatTime(selectedEntry.createdAt) }}</dd>
                   <dt>更新</dt><dd>{{ formatTime(selectedEntry.updatedAt) }}</dd>
@@ -513,22 +513,6 @@ function text(value: unknown): string | undefined {
               </section>
 
               <section class="agent-run-detail-section">
-                <h3>身份与关系</h3>
-                <dl class="agent-run-param-grid">
-                  <dt>Agent ID</dt><dd>{{ selectedEntry.agentId || '-' }}</dd>
-                  <dt>ChildExecution ID</dt><dd>{{ selectedEntry.id }}</dd>
-                  <dt>Conversation ID</dt><dd>{{ selectedEntry.conversationId }}</dd>
-                  <dt>Parent Turn ID</dt><dd>{{ selectedEntry.parentTurnId }}</dd>
-                  <dt>Child Turn ID</dt><dd>{{ selectedEntry.turnId || '-' }}</dd>
-                  <dt>Source Tool Call ID</dt><dd>{{ selectedEntry.sourceToolCallId }}</dd>
-                  <dt>Parent ChildExecution ID</dt><dd>{{ selectedEntry.parentChildExecutionId || '-' }}</dd>
-                  <dt>Executor Agent ID</dt><dd>{{ selectedEntry.executorAgentId || '-' }}</dd>
-                  <dt>Activity Tool Call ID</dt><dd>{{ selectedEntry.activityToolCallId || '-' }}</dd>
-                  <dt>Activity Model Request ID</dt><dd>{{ selectedEntry.activityModelRequestId || '-' }}</dd>
-                </dl>
-              </section>
-
-              <section class="agent-run-detail-section">
                 <h3>任务</h3>
                 <pre>{{ taskText(selectedEntry) }}</pre>
               </section>
@@ -537,11 +521,6 @@ function text(value: unknown): string | undefined {
                 <h3>Answer</h3>
                 <p class="agent-run-answer-summary">{{ answerSummary(selectedEntry) }}</p>
                 <dl class="agent-run-param-grid agent-run-answer-grid">
-                  <dt>AnswerBridge ID</dt><dd>{{ selectedEntry.answerBridgeId || '-' }}</dd>
-                  <dt>Submission ID</dt><dd>{{ selectedEntry.answerSubmissionId || '-' }}</dd>
-                  <dt>Submission Turn ID</dt><dd>{{ selectedEntry.answerSubmissionTurnId || '-' }}</dd>
-                  <dt>Payload ID</dt><dd>{{ selectedEntry.answerPayloadId || '-' }}</dd>
-                  <dt>RuntimeDelivery ID</dt><dd>{{ selectedEntry.deliveryId || '-' }}</dd>
                   <dt>提交时间</dt><dd>{{ formatTime(selectedEntry.answerSubmittedAt) }}</dd>
                   <dt>正文大小</dt><dd>{{ byteLengthLabel(selectedEntry.answerByteLength) }}</dd>
                   <dt>中断提交</dt><dd>{{ selectedEntry.answerSubmissionInterrupted === undefined ? '-' : selectedEntry.answerSubmissionInterrupted ? '是' : '否' }}</dd>
@@ -819,7 +798,7 @@ function text(value: unknown): string | undefined {
 .agent-run-detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .agent-run-detail-header { min-height: 36px; padding: 7px 10px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.18)); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .agent-run-detail-main { min-width: 0; display: inline-flex; align-items: center; gap: 8px; }
-.agent-run-detail-id { min-width: 0; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-xs); font-family: var(--font-family-mono); }
+.agent-run-detail-name { min-width: 0; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-xs); }
 
 .agent-run-open-conversation {
   flex: 0 0 auto;

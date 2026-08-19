@@ -5,12 +5,12 @@ import type {
 
 export const ATTACHMENT_CATALOG_HEADER = [
   '[LimCode 托管附件目录：仅包含不可变元数据，不包含附件正文。]',
-  '仅在确实需要查看历史附件时调用 read，参数为 {"attachmentId":"目录中的精确编号"}。',
-  'attachmentId 只能使用下方目录里的真实编号；不要留空、不要编造，也不要把文件名或 MIME 类型当作编号。'
+  '仅在确实需要查看历史附件时调用 read，参数为 {"attachmentRef":"目录中的短编号"}。',
+  'attachmentRef 只能使用下方目录里的 F1、F2 等真实短编号；不要留空、不要编造，也不要把文件名或 MIME 类型当作编号。'
 ].join('\n');
 
 export const ATTACHMENT_PAGE_RANGE_GUIDANCE = [
-  'TXT 或 PDF 可选 pages 范围，例如 {"attachmentId":"目录中的精确编号","pages":"1-4"}。',
+  'TXT 或 PDF 可选 pages 范围，例如 {"attachmentRef":"F1","pages":"1-4"}。',
   'pages 省略时默认第 1 页，每次最多连续读取 4 页；如需继续，复制 read 结果中的 nextPages。图片不要填写 pages。'
 ].join('\n');
 
@@ -76,11 +76,14 @@ export function normalizeAttachmentCatalog(
   return mergeAttachmentCatalog(value.map((entry, index) => normalizeEntry(entry, `${label}[${index}]`)));
 }
 
-export function renderAttachmentCatalog(catalog: readonly AttachmentCatalogEntry[]): MessageContent | undefined {
+export function renderAttachmentCatalog(
+  catalog: readonly AttachmentCatalogEntry[],
+  referenceFor?: (entry: AttachmentCatalogEntry, index: number) => string | undefined
+): MessageContent | undefined {
   const normalized = mergeAttachmentCatalog(catalog);
   if (normalized.length === 0) return undefined;
-  const rows = normalized.map((entry) => JSON.stringify({
-    attachmentId: entry.attachmentId,
+  const rows = normalized.map((entry, index) => JSON.stringify({
+    attachmentRef: referenceFor?.(entry, index) ?? `F${index + 1}`,
     name: entry.name,
     mimeType: entry.mimeType,
     sizeBytes: entry.sizeBytes

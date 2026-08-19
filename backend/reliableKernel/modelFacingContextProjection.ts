@@ -18,6 +18,12 @@ import {
   estimateTextTokens
 } from './modelTokenEstimator';
 import {
+  buildModelHandleCatalog,
+  modelHandleRef,
+  projectToolResultForModel,
+  type ModelHandleCatalog
+} from './modelHandleCatalog';
+import {
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
@@ -408,9 +414,9 @@ export function planTextCompressionTail(input: {
 export type ToolResultPriority = 'ordinary' | 'evidence' | 'error_or_receipt';
 
 export type ToolResultRereadTarget =
-  | { kind: 'process_output'; processId?: string; outputHandle?: string }
+  | { kind: 'process_output'; processRef?: string; cursor?: string }
   | { kind: 'file'; path: string; startLine?: number }
-  | { kind: 'child_answer'; answerBridgeId: string };
+  | { kind: 'child_answer'; childRef: string };
 
 export interface ToolResultProjectionInput {
   toolName: string;
@@ -507,8 +513,12 @@ export interface StoredModelFacingContextItem {
 export function projectStoredModelFacingWindow(
   items: readonly StoredModelFacingContextItem[]
 ): ModelWindowProjection {
-  const contents = items.flatMap(storedContextItemContents);
-  const catalogContent = renderAttachmentCatalog(collectAttachmentCatalogFromStoredItems(items));
+  const modelHandleCatalog = buildModelHandleCatalog(items.map((item) => item.content));
+  const contents = items.flatMap((item) => storedContextItemContents(item, modelHandleCatalog));
+  const catalogContent = renderAttachmentCatalog(
+    collectAttachmentCatalogFromStoredItems(items),
+    (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
+  );
   if (catalogContent) contents.push(catalogContent);
   return projectOrdinaryModelWindow(contents);
 }
@@ -553,12 +563,15 @@ export function projectOrdinaryModelWindow(contents: readonly MessageContent[]):
   };
 }
 
-function storedContextItemContents(item: StoredModelFacingContextItem): MessageContent[] {
+function storedContextItemContents(
+  item: StoredModelFacingContextItem,
+  modelHandleCatalog: ModelHandleCatalog
+): MessageContent[] {
   if (item.segmentKind === 'runtime_context') {
     const envelope = decodeRuntimeDeliveryModelEnvelope(item.content, item.contentType);
     return [{
       role: 'user',
-      parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope) }]
+      parts: [{ text: renderRuntimeDeliveryModelEnvelope(envelope, undefined, modelHandleCatalog) }]
     }];
   }
   if (item.segmentKind === 'tool_pair') {
@@ -576,7 +589,7 @@ function storedContextItemContents(item: StoredModelFacingContextItem): MessageC
             : {}),
           functionResponse: {
             name: call.toolName,
-            response: response.value,
+            response: projectToolResultForModel(call.toolName, response.value, modelHandleCatalog),
             ...(response.parts.length > 0 ? { parts: response.parts } : {})
           }
         }]
@@ -869,8 +882,6 @@ function toolResultSkeleton(
   return {
     kind: 'tool_result_preview',
     toolName: input.toolName,
-    ...(input.callId ? { callId: input.callId } : {}),
-    ...(input.resultId ? { resultId: input.resultId } : {}),
     ...(input.status ? { status: input.status } : {}),
     ...facts,
     originalChars,
@@ -885,8 +896,9 @@ function toolResultSkeleton(
 function collectImportantFacts(value: unknown): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   const wanted = new Set([
-    'status', 'error', 'exitCode', 'path', 'filePath', 'sourcePath', 'processId', 'outputHandle',
-    'answerBridgeId', 'receiptId', 'submissionId', 'childExecutionId', 'count', 'total', 'changedFiles'
+    'status', 'error', 'exitCode', 'path', 'filePath', 'sourcePath',
+    'attachmentRef', 'processRef', 'cursor', 'nextCursor', 'childRef', 'workEnvironmentRef',
+    'count', 'total', 'changedFiles'
   ]);
   const visit = (candidate: unknown, depth: number): void => {
     if (depth > 3 || !candidate || typeof candidate !== 'object') return;
@@ -917,13 +929,13 @@ function rereadHint(target: ToolResultRereadTarget): Record<string, unknown> {
   case 'process_output':
     return {
       kind: target.kind,
-      ...(target.processId ? { processId: target.processId } : {}),
-      ...(target.outputHandle ? { outputHandle: target.outputHandle } : {})
+      ...(target.processRef ? { processRef: target.processRef } : {}),
+      ...(target.cursor ? { cursor: target.cursor } : {})
     };
   case 'file':
     return { kind: target.kind, path: target.path, ...(target.startLine ? { startLine: target.startLine } : {}) };
   case 'child_answer':
-    return { kind: target.kind, answerBridgeId: target.answerBridgeId };
+    return { kind: target.kind, childRef: target.childRef };
   }
 }
 
@@ -1051,9 +1063,11 @@ function toolResultPriority(value: unknown): ToolResultPriority {
   ) {
     return 'error_or_receipt';
   }
-  return facts.processId !== undefined
-    || facts.outputHandle !== undefined
-    || facts.answerBridgeId !== undefined
+  return facts.processRef !== undefined
+    || facts.cursor !== undefined
+    || facts.nextCursor !== undefined
+    || facts.childRef !== undefined
+    || facts.attachmentRef !== undefined
     || facts.path !== undefined
     || facts.filePath !== undefined
     || facts.sourcePath !== undefined

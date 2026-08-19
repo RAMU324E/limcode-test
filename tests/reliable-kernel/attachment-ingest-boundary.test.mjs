@@ -171,12 +171,14 @@ test('Attachment catalog keeps only lightweight immutable metadata across messag
   assert.ok(rendered);
   const text = rendered.parts[0].text;
   assert.match(text, /read/);
-  assert.match(text, /\{"attachmentId":"目录中的精确编号"\}/);
+  assert.match(text, /\{"attachmentRef":"F1"/);
+  assert.match(text, /\{"attachmentRef":"F2"/);
   assert.match(text, /"pages":"1-4"/);
   assert.match(text, /每次最多连续读取 4 页/);
   assert.doesNotMatch(text, /"mode":"attachment"/);
-  assert.match(text, /attachment-pdf-one/);
-  assert.match(text, /attachment-image-two/);
+  assert.match(text, /report\.pdf/);
+  assert.match(text, /diagram\.png/);
+  assert.doesNotMatch(text, /attachment-pdf-one|attachment-image-two/);
   assert.doesNotMatch(text, /sha256|sourcePath|private|must-not-enter-catalog|data/);
 });
 
@@ -208,13 +210,19 @@ test('read keeps path as the ordinary input and only exposes pages for managed T
   }), { path: 'src/demo.ts' });
   assert.deepEqual(compactReadFileToolArguments({
     attachmentId: ' attachment-one ',
-    endLine: 0,
+    endLine: 1,
     items: [{}],
     mode: 'attachment',
     pages: '1 - 4',
     path: '',
-    startLine: 0
+    startLine: 1
   }), { attachmentId: 'attachment-one', pages: '1-4' });
+  assert.deepEqual(compactReadFileToolArguments({
+    attachmentRef: ' F1 ',
+    endLine: 1,
+    mode: 'attachment',
+    startLine: 1
+  }), { attachmentRef: 'F1' });
 });
 
 test('read page ranges reject ambiguous or oversized requests and report actual totals', () => {
