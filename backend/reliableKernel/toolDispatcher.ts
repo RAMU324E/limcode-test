@@ -15,6 +15,7 @@ import {
   type WorkEnvironmentRecord
 } from '../../shared/protocol';
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
+import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
 import {
   mapSettledWithBoundedAdmissionConcurrency,
   mapSettledWithBoundedConcurrency,
@@ -1220,7 +1221,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     });
     const started = await this.dependencies.processes.dispatchStart(
       prepared.effect.effectIntentId,
-      foregroundWaitMs,
+      effectiveProcessForegroundWaitMs(command, foregroundWaitMs, executionTimeoutMs),
       signal
     );
     const handoff = handoffReason(signal);
@@ -2431,6 +2432,19 @@ function processExitCode(observed: ProcessWaitObservation): number | null {
   if (value === null) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+export function effectiveProcessForegroundWaitMs(
+  command: string,
+  requestedWaitMs: number,
+  executionTimeoutMs: number
+): number {
+  const replacesCurrentExtension = command.includes('--uninstall-extension')
+    && command.includes('--install-extension')
+    && command.includes(EXTENSION_PACKAGE_NAME);
+  return replacesCurrentExtension
+    ? Math.max(requestedWaitMs, executionTimeoutMs)
+    : requestedWaitMs;
 }
 
 function requireWaitMs(value: PlainJsonValue | undefined): number {
