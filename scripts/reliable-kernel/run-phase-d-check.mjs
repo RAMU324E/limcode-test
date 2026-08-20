@@ -2427,6 +2427,30 @@ async function checkProcessWrapperRecovery() {
       assert.equal(recoveredBranch.observation.launch.outcome, 'succeeded', JSON.stringify(recoveredBranch.observation));
       assert.equal(recoveredBranch.observation.foreground.state, 'exited');
       assert.equal(recoveredBranch.observation.foreground.receipt.exitCode, '0');
+
+      const recoveredErrorTool = await createTool(ctx, effects, 'process-handled-powershell-error', 'bash');
+      const recoveredErrorPrepared = await processes.prepareStart({
+        source: source('internal', 'process-handled-powershell-error:prepare'),
+        toolCallId: recoveredErrorTool.toolCallId,
+        command: `try { Write-Error 'handled' -ErrorAction Stop } catch { Write-Output 'recovered' }`,
+        cwd: parent
+      });
+      const recoveredError = await processes.dispatchStart(recoveredErrorPrepared.effect.effectIntentId, 5_000);
+      assert.equal(recoveredError.observation.launch.outcome, 'succeeded', JSON.stringify(recoveredError.observation));
+      assert.equal(recoveredError.observation.foreground.state, 'exited');
+      assert.equal(recoveredError.observation.foreground.receipt.exitCode, '0');
+
+      const shadowedNativeTool = await createTool(ctx, effects, 'process-shadowed-native-name', 'bash');
+      const shadowedNativePrepared = await processes.prepareStart({
+        source: source('internal', 'process-shadowed-native-name:prepare'),
+        toolCallId: shadowedNativeTool.toolCallId,
+        command: `function node { ${nodeEvalCommand('process.exit(7)')}; Write-Output 'recovered' }; (node)`,
+        cwd: parent
+      });
+      const shadowedNative = await processes.dispatchStart(shadowedNativePrepared.effect.effectIntentId, 5_000);
+      assert.equal(shadowedNative.observation.launch.outcome, 'succeeded', JSON.stringify(shadowedNative.observation));
+      assert.equal(shadowedNative.observation.foreground.state, 'exited');
+      assert.equal(shadowedNative.observation.foreground.receipt.exitCode, '0');
     }
     const poisonNow = new Date().toISOString();
     await ctx.database.transaction([
@@ -2671,11 +2695,12 @@ async function checkProcessWrapperRecovery() {
       command: nodeEvalCommand("setInterval(()=>process.stdout.write('tick\\n'),100)"),
       cwd: parent
     });
-    await processes.dispatchStart(longPrepared.effect.effectIntentId);
+    const longStarted = await processes.dispatchStart(longPrepared.effect.effectIntentId);
+    assert.equal(longStarted.observation.launch.outcome, 'succeeded', JSON.stringify(longStarted.observation));
     const longId = longPrepared.request.processId;
 
     const wrongStopTool = await createTool(ctx, effects, 'process-stop-wrong', 'bash');
-    const longRow = await get(ctx.database, 'Process', longId);
+    const longRow = await waitForSingleRow(ctx.database, 'Process', { id: longId }, 5_000);
     const wrongStop = await effects.prepareEffectIntent({
       source: source('internal', 'process-stop-wrong:prepare'),
       toolCallId: wrongStopTool.toolCallId,

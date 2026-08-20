@@ -38,6 +38,8 @@ import {
 
 const windowsProcessFingerprints = new Map<string, string>();
 const PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE = 'bootstrap.ready';
+const PROCESS_WRAPPER_RENAME_MAX_ATTEMPTS = 6;
+const PROCESS_WRAPPER_RENAME_RETRY_DELAY_MS = 15;
 
 interface StreamState {
   tail: Buffer;
@@ -723,14 +725,15 @@ function spawnWindowsPowerShellCommand(
     `$limcodeParenExpression = if ($limcodeLastPipelineElement -is [System.Management.Automation.Language.CommandExpressionAst] -and $limcodeLastPipelineElement.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) { $limcodeLastPipelineElement.Expression } else { $null }`,
     `$limcodeParenPipelineElements = if ($null -ne $limcodeParenExpression) { @($limcodeParenExpression.Pipeline.PipelineElements) } else { @() }`,
     `$limcodeParenCommandName = if ($limcodeParenPipelineElements.Count -eq 1 -and $limcodeParenPipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) { $limcodeParenPipelineElements[0].GetCommandName() } else { $null }`,
-    `$limcodeParenCommandInfo = if ($null -ne $limcodeParenCommandName) { Get-Command -Name $limcodeParenCommandName -ErrorAction SilentlyContinue } else { $null }`,
-    `$limcodeParenthesizedNativeCommand = $null -ne $limcodeParenCommandInfo -and ($limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Application -or $limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::ExternalScript)`,
     `$limcodeErrorCount = $Error.Count; $LASTEXITCODE = $null`,
     request.command,
     `$limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE; $limcodeCommandAddedError = $Error.Count -gt $limcodeErrorCount`,
+    // Resolve the direct parenthesized command after execution so script-defined functions and aliases win.
+    `$limcodeParenCommandInfo = if ($null -ne $limcodeParenCommandName) { Get-Command -Name $limcodeParenCommandName -ErrorAction SilentlyContinue } else { $null }`,
+    `$limcodeParenthesizedNativeCommand = $null -ne $limcodeParenCommandInfo -and ($limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Application -or $limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::ExternalScript)`,
     `if (-not $limcodeCommandSucceeded) { if ($null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }; exit 1 }`,
     `if ($limcodeParenthesizedNativeCommand -and $null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }`,
-    `if ($limcodeCommandAddedError) { exit 1 }`,
+    `if ($null -ne $limcodeParenExpression -and $limcodeCommandAddedError) { exit 1 }`,
     `exit 0`
   ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
@@ -816,8 +819,24 @@ function writeAtomicBytes(filePath: string, bytes: Buffer): void {
   } finally {
     fs.closeSync(descriptor);
   }
-  fs.renameSync(temporary, filePath);
+  renameAtomicFileSync(temporary, filePath);
   syncDirectoryDurablySync(path.dirname(filePath));
+}
+
+function renameAtomicFileSync(sourcePath: string, targetPath: string): void {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.renameSync(sourcePath, targetPath);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      const transientWindowsBusy = process.platform === 'win32'
+        && (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY');
+      if (!transientWindowsBusy || attempt >= PROCESS_WRAPPER_RENAME_MAX_ATTEMPTS) throw error;
+      const delayMs = PROCESS_WRAPPER_RENAME_RETRY_DELAY_MS * attempt;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+    }
+  }
 }
 
 function boundedErrorMessage(
