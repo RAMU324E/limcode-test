@@ -163,7 +163,7 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
       })
     };
     loop.modelProvider = { projectAttachmentCatalog: async () => relationCatalog };
-    loop.readCurrentTurnInputReference = async () => undefined;
+    loop.readCurrentTurnInputReference = async () => ({});
     loop.readRuntimeStatusCard = async () => undefined;
     const frozenRecipe = await loop.freezeOrdinaryRequestRecipe({
       turnId: 'turn-main',

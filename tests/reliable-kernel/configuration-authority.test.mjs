@@ -328,6 +328,27 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     assert.deepEqual(childRemoteOnly.workEnvironmentPolicy.allowedWorkEnvironmentIds, [remoteEnvironment.id]);
     assert.equal(childRemoteOnly.workEnvironmentPolicy.defaultWorkEnvironmentId, remoteEnvironment.id);
 
+    await authority.mutations.setWorkEnvironmentPolicy({
+      scopeKind: 'conversation',
+      scopeId: 'conversation:child-disjoint',
+      enabled: true,
+      allowedWorkEnvironmentIds: [workEnvironmentId],
+      defaultWorkEnvironmentId: workEnvironmentId
+    });
+    const childDisjoint = JSON.parse((await authority.compile({
+      conversationId: 'conversation:child-disjoint',
+      turnId: 'turn:child-disjoint',
+      executorAgentId: agent.id,
+      intentKind: 'input',
+      inheritedWorkEnvironmentPolicy: {
+        enabled: true,
+        allowedWorkEnvironmentIds: [remoteEnvironment.id],
+        defaultWorkEnvironmentId: remoteEnvironment.id
+      }
+    })).authoritySnapshot.content);
+    assert.deepEqual(childDisjoint.workEnvironmentPolicy.allowedWorkEnvironmentIds, []);
+    assert.equal(childDisjoint.workEnvironmentPolicy.defaultWorkEnvironmentId, null);
+
     // 不携带继承边界时保持现状：无策略会话可见全部可用环境。
     const childUnbounded = JSON.parse((await authority.compile({
       conversationId: 'conversation:child-unbounded',

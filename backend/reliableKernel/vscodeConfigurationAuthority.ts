@@ -970,8 +970,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
 
 /**
  * Child executions inherit the parent Turn's frozen work-environment boundary: the child's own
- * scoped allow-list is intersected with the parent's, never widened. An empty intersection fails
- * safe to the parent boundary instead of silently re-widening.
+ * scoped allow-list is intersected with the parent's, never widened. An empty intersection remains
+ * empty so mutually exclusive policies fail closed instead of granting either side's environments.
  */
 function applyInheritedWorkEnvironmentBoundary(
   allowed: readonly string[],
@@ -985,7 +985,7 @@ function applyInheritedWorkEnvironmentBoundary(
     .filter((id) => availableIds.includes(id));
   const intersected = allowed.filter((id) => inheritedAllowed.includes(id));
   return {
-    allowedWorkEnvironmentIds: [...new Set(intersected.length > 0 ? intersected : inheritedAllowed)].sort(),
+    allowedWorkEnvironmentIds: [...new Set(intersected)].sort(),
     inheritedDefaultWorkEnvironmentId: inherited.defaultWorkEnvironmentId
   };
 }
