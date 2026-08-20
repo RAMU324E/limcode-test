@@ -314,6 +314,11 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     assert.equal(childInherited.workEnvironmentPolicy.defaultWorkEnvironmentId, workEnvironmentId);
 
     // 交集为父边界子集；父默认环境在交集内时被保留。
+    await authority.mutations.setRuntimeContext({
+      scopeKind: 'conversation',
+      scopeId: 'conversation:child-remote-only',
+      template: 'ENV:\n{{$workEnvironment.current}}'
+    });
     const childRemoteOnly = JSON.parse((await authority.compile({
       conversationId: 'conversation:child-remote-only',
       turnId: 'turn:child-remote-only',
@@ -327,6 +332,8 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     })).authoritySnapshot.content);
     assert.deepEqual(childRemoteOnly.workEnvironmentPolicy.allowedWorkEnvironmentIds, [remoteEnvironment.id]);
     assert.equal(childRemoteOnly.workEnvironmentPolicy.defaultWorkEnvironmentId, remoteEnvironment.id);
+    assert.match(childRemoteOnly.runtimeContext.text, /Remote Test/);
+    assert.doesNotMatch(childRemoteOnly.runtimeContext.text, /Workspace · 本地/);
 
     await authority.mutations.setWorkEnvironmentPolicy({
       scopeKind: 'conversation',
@@ -334,6 +341,11 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
       enabled: true,
       allowedWorkEnvironmentIds: [workEnvironmentId],
       defaultWorkEnvironmentId: workEnvironmentId
+    });
+    await authority.mutations.setRuntimeContext({
+      scopeKind: 'conversation',
+      scopeId: 'conversation:child-disjoint',
+      template: 'ENV:\n{{$workEnvironment.current}}'
     });
     const childDisjoint = JSON.parse((await authority.compile({
       conversationId: 'conversation:child-disjoint',
@@ -348,6 +360,8 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     })).authoritySnapshot.content);
     assert.deepEqual(childDisjoint.workEnvironmentPolicy.allowedWorkEnvironmentIds, []);
     assert.equal(childDisjoint.workEnvironmentPolicy.defaultWorkEnvironmentId, null);
+    assert.doesNotMatch(childDisjoint.runtimeContext.text, /Remote Test/);
+    assert.doesNotMatch(childDisjoint.runtimeContext.text, /Workspace · 本地/);
 
     // 不携带继承边界时保持现状：无策略会话可见全部可用环境。
     const childUnbounded = JSON.parse((await authority.compile({

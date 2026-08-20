@@ -2027,6 +2027,8 @@ async function checkMcpEffectRecovery() {
 
 async function checkProcessWrapperRecovery() {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-phase-d-process-'));
+  const fixtureReleasePaths = new Set();
+  const fixtureProcessIdentities = [];
   let ctx;
   try {
     ctx = await createRuntime(parent, 'process');
@@ -2037,8 +2039,9 @@ async function checkProcessWrapperRecovery() {
     );
     const tool = await createTool(ctx, effects, 'process-restart', 'bash');
     const recoveryReleasePath = path.join(parent, 'process-restart.release');
+    fixtureReleasePaths.add(recoveryReleasePath);
     const recoveryReleaseBase64 = Buffer.from(recoveryReleasePath, 'utf8').toString('base64');
-    const recoveryCode = `const fs=require('node:fs');const release=Buffer.from('${recoveryReleaseBase64}','base64').toString('utf8');const timer=setInterval(()=>{if(!fs.existsSync(release))return;clearInterval(timer);process.stdout.write('restart-output\\n'+'\\0'.repeat(8000));},10)`;
+    const recoveryCode = `const fs=require('node:fs');const release=Buffer.from('${recoveryReleaseBase64}','base64').toString('utf8');const deadline=Date.now()+15000;const timer=setInterval(()=>{if(fs.existsSync(release)){clearInterval(timer);process.stdout.write('restart-output\\n'+'\\0'.repeat(8000));return}if(Date.now()>=deadline){clearInterval(timer);process.exit(3)}},10)`;
     const command = nodeEvalCommand(recoveryCode);
     const prepared = await processes.prepareStart({
       source: source('internal', 'process-restart:prepare'),
@@ -2058,6 +2061,9 @@ async function checkProcessWrapperRecovery() {
     assert.equal(handoffModelResult.detail.processId, prepared.request.processId);
     assert.equal(handoffModelResult.detail.complete, false);
     const processId = prepared.request.processId;
+    fixtureProcessIdentities.push(processFixtureIdentity(
+      await waitForSingleRow(ctx.database, 'Process', { id: processId }, 5_000)
+    ));
     await ctx.database.close();
 
     let recoveryApp = await kernel.ReliableKernelApplication.open(
@@ -2361,6 +2367,31 @@ async function checkProcessWrapperRecovery() {
     }))[0];
     assert.equal(quickProcessReceipt.outcome, 'failed');
     assert.equal(quickProcessReceipt.exit_code, 7n);
+    if (process.platform === 'win32') {
+      const recoveredNativeTool = await createTool(ctx, effects, 'process-native-failure-recovered', 'bash');
+      const recoveredNativePrepared = await processes.prepareStart({
+        source: source('internal', 'process-native-failure-recovered:prepare'),
+        toolCallId: recoveredNativeTool.toolCallId,
+        command: `${nodeEvalCommand('process.exit(7)')}; Write-Output 'recovered'`,
+        cwd: parent
+      });
+      const recoveredNative = await processes.dispatchStart(recoveredNativePrepared.effect.effectIntentId, 5_000);
+      assert.equal(recoveredNative.observation.launch.outcome, 'succeeded', JSON.stringify(recoveredNative.observation));
+      assert.equal(recoveredNative.observation.foreground.state, 'exited');
+      assert.equal(recoveredNative.observation.foreground.receipt.exitCode, '0');
+
+      const builtinFailureTool = await createTool(ctx, effects, 'process-builtin-failure-after-native-success', 'bash');
+      const builtinFailurePrepared = await processes.prepareStart({
+        source: source('internal', 'process-builtin-failure-after-native-success:prepare'),
+        toolCallId: builtinFailureTool.toolCallId,
+        command: `${nodeEvalCommand('process.exit(0)')}; Write-Error 'builtin failure'`,
+        cwd: parent
+      });
+      const builtinFailure = await processes.dispatchStart(builtinFailurePrepared.effect.effectIntentId, 5_000);
+      assert.equal(builtinFailure.observation.launch.outcome, 'succeeded', JSON.stringify(builtinFailure.observation));
+      assert.equal(builtinFailure.observation.foreground.state, 'exited');
+      assert.equal(builtinFailure.observation.foreground.receipt.exitCode, '1');
+    }
     const poisonNow = new Date().toISOString();
     await ctx.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('ProcessCompletionDispatch').insert({
@@ -2424,7 +2455,8 @@ async function checkProcessWrapperRecovery() {
       command: nodeEvalCommand('setTimeout(()=>process.exit(9),200)'),
       cwd: parent
     });
-    await processes.dispatchStart(receiptOnlyPrepared.effect.effectIntentId, 0);
+    const receiptOnlyStarted = await processes.dispatchStart(receiptOnlyPrepared.effect.effectIntentId, 0);
+    assert.equal(receiptOnlyStarted?.observation?.launch.outcome, 'succeeded', JSON.stringify(receiptOnlyStarted?.observation));
     const receiptOnlyId = receiptOnlyPrepared.request.processId;
     const receiptOnlyExited = await waitUntilTerminal(processes, receiptOnlyId, 10_000);
     assert.equal(receiptOnlyExited.state, 'exited');
@@ -2446,7 +2478,8 @@ async function checkProcessWrapperRecovery() {
       command: nodeEvalCommand('setTimeout(()=>process.exit(0),120)'),
       cwd: parent
     });
-    await processes.dispatchStart(alreadyExitedStart.effect.effectIntentId, 0);
+    const alreadyExitedStarted = await processes.dispatchStart(alreadyExitedStart.effect.effectIntentId, 0);
+    assert.equal(alreadyExitedStarted?.observation?.launch.outcome, 'succeeded', JSON.stringify(alreadyExitedStarted?.observation));
     const alreadyExitedId = alreadyExitedStart.request.processId;
     const atomicAlreadyExited = await waitUntilTerminal(processes, alreadyExitedId, 10_000);
     assert.equal(atomicAlreadyExited.state, 'exited');
@@ -2477,7 +2510,8 @@ async function checkProcessWrapperRecovery() {
       command: nodeEvalCommand("setTimeout(()=>process.stdout.write('done'),200)"),
       cwd: parent
     });
-    await processes.dispatchStart(corruptPrepared.effect.effectIntentId);
+    const corruptStarted = await processes.dispatchStart(corruptPrepared.effect.effectIntentId);
+    assert.equal(corruptStarted?.observation?.launch.outcome, 'succeeded', JSON.stringify(corruptStarted?.observation));
     const corruptId = corruptPrepared.request.processId;
     const validExit = await waitUntilTerminal(processes, corruptId, 10_000);
     assert.equal(validExit.state, 'exited');
@@ -2496,18 +2530,22 @@ async function checkProcessWrapperRecovery() {
     assertions.push('exitCode/signal非法终止元组及身份不匹配receipt都不得伪造退出结果，明确outcome_unknown');
 
     const stopRaceTool = await createTool(ctx, effects, 'process-stop-close-race', 'bash');
-    const stopRaceCode = "const {spawn}=require('node:child_process');spawn(process.execPath,['-e','setTimeout(()=>{},1200)'],{stdio:['ignore','inherit','inherit']});setTimeout(()=>process.exit(0),250)";
+    const stopRaceReleasePath = path.join(parent, 'process-stop-close-race.release');
+    fixtureReleasePaths.add(stopRaceReleasePath);
+    const stopRaceCode = `const fs=require('node:fs');const {spawn}=require('node:child_process');const release=${JSON.stringify(stopRaceReleasePath)};const deadline=Date.now()+10000;const timer=setInterval(()=>{if(fs.existsSync(release)){clearInterval(timer);spawn(process.execPath,['-e','setTimeout(()=>{},1200)'],{stdio:['ignore','inherit','inherit']});setTimeout(()=>process.exit(0),25)}else if(Date.now()>=deadline){clearInterval(timer);process.exit(2)}},5)`;
     const stopRacePrepared = await processes.prepareStart({
       source: source('internal', 'process-stop-close-race:prepare'),
       toolCallId: stopRaceTool.toolCallId,
       command: nodeEvalCommand(stopRaceCode),
       cwd: parent
     });
-    await processes.dispatchStart(stopRacePrepared.effect.effectIntentId, 0);
+    const stopRaceStarted = await processes.dispatchStart(stopRacePrepared.effect.effectIntentId, 0);
+    assert.equal(stopRaceStarted?.observation?.launch.outcome, 'succeeded');
+    assert.equal(stopRaceStarted?.observation?.foreground?.state, 'running');
     const stopRaceId = stopRacePrepared.request.processId;
-    const stopRaceRow = await get(ctx.database, 'Process', stopRaceId);
+    const stopRaceRow = await waitForSingleRow(ctx.database, 'Process', { id: stopRaceId }, 5_000);
+    fixtureProcessIdentities.push(processFixtureIdentity(stopRaceRow));
     const stopRaceSpool = kernel.processSpoolPath(ctx.binding, stopRaceRow.spool_locator);
-    await new Promise((resolve) => setTimeout(resolve, 210));
     await fs.writeFile(path.join(stopRaceSpool, kernel.PROCESS_WRAPPER_STOP_REQUEST_FILE), JSON.stringify({
       kind: kernel.PROCESS_WRAPPER_PROTOCOL,
       processId: stopRaceId,
@@ -2517,11 +2555,17 @@ async function checkProcessWrapperRecovery() {
       commandDigest: stopRaceRow.command_digest,
       requestedAt: new Date().toISOString()
     }));
+    await fs.writeFile(stopRaceReleasePath, 'release');
     const stopRaceExited = await waitUntilTerminal(processes, stopRaceId, 10_000);
     assert.equal(stopRaceExited.state, 'exited');
-    assert.equal(stopRaceExited.receipt.exitCode, '0');
+    if (stopRaceExited.receipt.stopRequested) {
+      assert.equal(stopRaceExited.receipt.terminationReason, 'manual');
+    } else {
+      assert.equal(stopRaceExited.receipt.terminationReason, 'natural');
+      assert.equal(stopRaceExited.receipt.exitCode, '0');
+    }
     await processes.reconcileProcessExit(stopRaceId);
-    assertions.push('stop请求与子进程自然退出竞争时，PID消失不再杀死wrapper，close路径仍原子写真实exit receipt');
+    assertions.push('stop请求与子进程自然退出竞争时，durable Process先建立，竞争赢家由atomic exit receipt真实表述');
 
     const recoverStopStartTool = await createTool(ctx, effects, 'process-stop-recovery-target', 'bash');
     const recoverStopStart = await processes.prepareStart({
@@ -3011,14 +3055,23 @@ async function checkProcessWatchdog() {
       ]
     };
   } finally {
+    await releaseFixtureProcesses(fixtureReleasePaths, fixtureProcessIdentities);
     if (recoveryApp) await recoveryApp.close().catch(() => undefined);
     if (ctx?.database) await ctx.database.close().catch(() => undefined);
-    await fs.rm(parent, { recursive: true, force: true });
+    await fs.rm(parent, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 20 : 0,
+      retryDelay: 100
+    });
   }
 }
 
 async function checkProcessOutputBounds() {
   return withRuntime('process-output', async (ctx) => {
+    const fixtureReleasePaths = new Set();
+    const fixtureProcessIdentities = [];
+    try {
     const assertions = [];
     const effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
     const processes = new kernel.ProcessControlPlane(
@@ -3125,11 +3178,13 @@ async function checkProcessOutputBounds() {
 
     const staleTool = await createTool(ctx, effects, 'process-stale-output', 'bash');
     const staleReleasePath = path.join(ctx.parent, 'process-stale-output.release');
+    fixtureReleasePaths.add(staleReleasePath);
     const staleCode = [
       "const fs=require('node:fs')",
       "process.stdout.write('a'.repeat(70000))",
       `const release=${JSON.stringify(staleReleasePath)}`,
-      "const timer=setInterval(()=>{if(fs.existsSync(release)){clearInterval(timer);process.stdout.write('b'.repeat(1000000));}},10)"
+      "const deadline=Date.now()+15000",
+      "const timer=setInterval(()=>{if(fs.existsSync(release)){clearInterval(timer);process.stdout.write('b'.repeat(1000000));return}if(Date.now()>=deadline){clearInterval(timer);process.exit(3)}},10)"
     ].join(';');
     const stalePrepared = await processes.prepareStart({
       source: source('internal', 'process-stale-output:prepare'),
@@ -3138,6 +3193,9 @@ async function checkProcessOutputBounds() {
       cwd: ctx.parent
     });
     await processes.dispatchStart(stalePrepared.effect.effectIntentId);
+    fixtureProcessIdentities.push(processFixtureIdentity(
+      await waitForSingleRow(ctx.database, 'Process', { id: stalePrepared.request.processId }, 5_000)
+    ));
     const initialDeadline = Date.now() + 5_000;
     for (;;) {
       const initial = await processes.reconcileOutput(stalePrepared.request.processId);
@@ -3337,6 +3395,9 @@ async function checkProcessOutputBounds() {
       assertions,
       faults: ['single-call foreground output', 'model-response crash recovery', 'strict inline pagination', 'live tail accounting', 'live writer/import race', 'stale output commit after exit', 'spool loss before CAS import', 'sustained output beyond former retention bounds', 'continued drain', 'competing ProcessOutput reconcile', 'CAS/SQLite growth convergence', 'spool loss after CAS import', 'repeatable read_output', 'terminal tail']
     };
+    } finally {
+      await releaseFixtureProcesses(fixtureReleasePaths, fixtureProcessIdentities);
+    }
   });
 }
 
@@ -4037,11 +4098,48 @@ async function waitForTextFile(filePath, timeoutMs) {
   }
 }
 
+function processFixtureIdentity(row) {
+  return {
+    childPid: Number(row.child_pid),
+    processGroupId: Number(row.process_group_id),
+    startFingerprint: String(row.start_fingerprint)
+  };
+}
+
+async function releaseFixtureProcesses(releasePaths, identities) {
+  for (const releasePath of releasePaths) {
+    await fs.writeFile(releasePath, 'release').catch(() => undefined);
+  }
+  // Give release-gated children time to observe the file before any later temp-directory cleanup
+  // can remove it. Fingerprint verification and bounded tree kill remain the authority after this grace.
+  if (releasePaths.size > 0) await delay(500);
+  for (const identity of identities) {
+    try {
+      await waitForFingerprintGone(identity.childPid, identity.startFingerprint, 3_000);
+      continue;
+    } catch {
+      // The release gate is best-effort; fall back to a bounded tree kill for fixture cleanup only.
+    }
+    try {
+      if (process.platform === 'win32') {
+        childProcess.spawnSync('taskkill.exe', ['/PID', String(identity.childPid), '/T', '/F'], {
+          encoding: 'utf8', windowsHide: true
+        });
+      } else {
+        process.kill(-identity.processGroupId, 'SIGKILL');
+      }
+    } catch (error) {
+      if (error?.code !== 'ESRCH' && error?.code !== 'ENOENT') console.warn(error);
+    }
+    await waitForFingerprintGone(identity.childPid, identity.startFingerprint, 3_000).catch(() => undefined);
+  }
+}
+
 async function waitForFingerprintGone(pid, fingerprint, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      if (kernel.readLinuxStartFingerprint(pid) !== fingerprint) return;
+      if (kernel.readProcessStartFingerprint(pid) !== fingerprint) return;
     } catch (error) {
       if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return;
       throw error;

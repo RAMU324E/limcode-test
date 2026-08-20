@@ -335,6 +335,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         availableWorkEnvironmentIds
       );
     const promptWorkEnvironments = workEnvironmentPolicy?.enabled === true
+      || request.inheritedWorkEnvironmentPolicy !== undefined
       ? effectiveAllowedWorkEnvironmentIds
         .map((id) => records.workEnvironments.find((environment) => environment.id === id))
         .filter((environment): environment is WorkEnvironmentRecord => !!environment)
