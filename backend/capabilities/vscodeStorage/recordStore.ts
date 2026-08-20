@@ -482,7 +482,7 @@ async function recoverExistingRecordStoreLock(
     await fs.rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
     return 'recovered';
   } catch (error) {
-    if (isFileNotFound(error)) return 'missing';
+    if (isFileNotFound(error)) return 'recovered';
     if (isAlreadyExistsError(error)) return 'held';
     return 'held';
   }

@@ -212,8 +212,10 @@ function recoverExistingLockDirectory(lockPath: string, options: NormalizedSyncS
     fs.renameSync(lockPath, quarantinePath);
     return 'recovered';
   } catch (error) {
-    if (isFileNotFoundError(error)) return 'missing';
-    if (isAlreadyExistsError(error) || isTransientFileBusyError(error)) return 'held';
+    // Another contender may already have fenced this exact generation. Re-enter acquisition and
+    // inspect the canonical path again instead of waiting on a tombstone that cannot change.
+    if (isFileNotFoundError(error) || isAlreadyExistsError(error)) return 'recovered';
+    if (isTransientFileBusyError(error)) return 'held';
     throw error;
   }
 }

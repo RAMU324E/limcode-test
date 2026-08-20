@@ -166,3 +166,47 @@ test('async record-store lock publication classification is invariant when canon
     await fsp.rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+test('sync stale-generation race immediately re-enters acquisition after another contender fences it', windowsOnly, async () => {
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-sync-lock-stale-race-'));
+  const resourcePath = path.join(tempRoot, 'index.json');
+  const lockPath = `${resourcePath}.lock`;
+  const ownerToken = 'stale-generation-owner';
+  const quarantinePath = `${lockPath}.generation-owner-${ownerToken}`;
+  const originalRenameSync = fs.renameSync;
+  let injectedFenceRace = false;
+  try {
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
+      ownerToken,
+      pid: 2_147_483_647,
+      createdAt: Date.now() - 60_000,
+      resource: path.resolve(resourcePath)
+    })}\n`);
+    fs.renameSync = function raceGenerationFence(source, destination) {
+      if (!injectedFenceRace && String(source) === lockPath && String(destination) === quarantinePath) {
+        injectedFenceRace = true;
+        originalRenameSync.call(this, source, destination);
+        throw Object.assign(new Error('EEXIST: another contender already fenced the generation'), {
+          code: 'EEXIST', syscall: 'rename', path: String(source), dest: String(destination)
+        });
+      }
+      return originalRenameSync.call(this, source, destination);
+    };
+
+    let actionRuns = 0;
+    syncStorageResourceLock.withSyncStorageResourceLock(resourcePath, () => { actionRuns += 1; }, {
+      waitMs: 0,
+      staleMs: 0,
+      invalidMetadataWaitMs: 0,
+      pollIntervalMs: 1,
+      maxRetries: 2,
+      retryDelayMs: 0
+    });
+    assert.equal(injectedFenceRace, true);
+    assert.equal(actionRuns, 1);
+  } finally {
+    fs.renameSync = originalRenameSync;
+    await fsp.rm(tempRoot, { recursive: true, force: true });
+  }
+});

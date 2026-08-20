@@ -88,7 +88,7 @@ jobs:
         run: npm run compile
 
       - name: Run Windows storage and Wrapper regressions
-        run: node --test --test-concurrency=1 tests/settingsRevisionConflict.test.cjs tests/reliable-kernel/platform-runtime-compatibility.test.mjs
+        run: node --test --test-concurrency=1 tests/settingsRevisionConflict.test.cjs tests/storageLockRace.test.cjs tests/reliable-kernel/storage-lock-multiprocess.test.cjs tests/reliable-kernel/platform-runtime-compatibility.test.mjs
 
   macos-runtime-tests:
     name: macOS runtime compatibility tests
