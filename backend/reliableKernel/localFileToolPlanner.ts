@@ -259,12 +259,90 @@ function applyHunks(source: string, hunks: unknown[]): string {
     const oldContent = requireString(hunk.oldContent, `edit.hunks[${index}].oldContent`);
     const newContent = requireString(hunk.newContent, `edit.hunks[${index}].newContent`);
     if (!oldContent) throw new Error(`edit.hunks[${index}].oldContent must not be empty.`);
-    const first = output.indexOf(oldContent);
-    if (first < 0) throw new Error(`Hunk ${index}: no exact match found for oldContent.`);
-    if (hunk.replaceAll === true) output = output.split(oldContent).join(newContent);
-    else output = `${output.slice(0, first)}${newContent}${output.slice(first + oldContent.length)}`;
+
+    const normalizedOutput = normalizeTextWithRawBoundaries(output);
+    const normalizedOldContent = normalizeLineEndings(oldContent);
+    const matches = findAllExactMatchIndexes(normalizedOutput.text, normalizedOldContent);
+    if (matches.length === 0) throw new Error(`Hunk ${index}: no exact match found for oldContent.`);
+
+    const selectedMatches = hunk.replaceAll === true ? matches : [matches[0]];
+    const sourceLineEnding = preferredLineEnding(output);
+    const replacements = selectedMatches.map((matchIndex) => {
+      const start = normalizedOutput.rawBoundaries[matchIndex];
+      const end = normalizedOutput.rawBoundaries[matchIndex + normalizedOldContent.length];
+      const matchedContent = output.slice(start, end);
+      return {
+        start,
+        end,
+        content: applyLineEnding(newContent, preferredLineEnding(matchedContent, sourceLineEnding))
+      };
+    });
+    for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+      output = `${output.slice(0, replacement.start)}${replacement.content}${output.slice(replacement.end)}`;
+    }
   }
   return output;
+}
+
+function normalizeTextWithRawBoundaries(value: string): { text: string; rawBoundaries: number[] } {
+  const normalized: string[] = [];
+  const rawBoundaries = [0];
+  let index = 0;
+  while (index < value.length) {
+    if (value.charCodeAt(index) === 13) {
+      index += value.charCodeAt(index + 1) === 10 ? 2 : 1;
+      normalized.push('\n');
+    } else {
+      normalized.push(value[index]);
+      index += 1;
+    }
+    rawBoundaries.push(index);
+  }
+  return { text: normalized.join(''), rawBoundaries };
+}
+
+function normalizeLineEndings(value: string): string {
+  return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function findAllExactMatchIndexes(content: string, search: string): number[] {
+  const matches: number[] = [];
+  let fromIndex = 0;
+  while (fromIndex <= content.length) {
+    const found = content.indexOf(search, fromIndex);
+    if (found < 0) break;
+    matches.push(found);
+    fromIndex = found + Math.max(1, search.length);
+  }
+  return matches;
+}
+
+function preferredLineEnding(value: string, fallback = '\n'): string {
+  const counts = new Map<string, { count: number; firstIndex: number }>();
+  for (let index = 0; index < value.length; index += 1) {
+    let lineEnding: string | undefined;
+    if (value.charCodeAt(index) === 13) {
+      if (value.charCodeAt(index + 1) === 10) {
+        lineEnding = '\r\n';
+        index += 1;
+      } else {
+        lineEnding = '\r';
+      }
+    } else if (value.charCodeAt(index) === 10) {
+      lineEnding = '\n';
+    }
+    if (!lineEnding) continue;
+    const current = counts.get(lineEnding);
+    if (current) current.count += 1;
+    else counts.set(lineEnding, { count: 1, firstIndex: index });
+  }
+  return [...counts.entries()].sort((left, right) =>
+    right[1].count - left[1].count || left[1].firstIndex - right[1].firstIndex)[0]?.[0] ?? fallback;
+}
+
+function applyLineEnding(value: string, lineEnding: string): string {
+  const normalized = normalizeLineEndings(value);
+  return lineEnding === '\n' ? normalized : normalized.replace(/\n/g, lineEnding);
 }
 
 function lineStartOffset(source: string, line: number, allowAppend: boolean): number {

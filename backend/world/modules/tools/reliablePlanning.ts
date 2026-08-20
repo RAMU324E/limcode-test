@@ -409,7 +409,7 @@ export function planReliableChildAgentRun(
     };
   }
 
-  const promptWithAnswerBridge = `${prompt}\n\n[Agent answer bridge]\n本次任务已${input.continuation ? '沿用' : '分配'}默认 answerBridgeId：${answerBridgeId}。当你需要把阶段性结论或最终正文提交给来源 Agent 时，请调用 submit_agent_answer({ title, content })，未传 answerBridgeId 时会自动使用这个 answerBridgeId；即使本次 AgentRun 中断、重试或用户补充条件，只要继续在同一子对话中执行，默认值也应保持为这个 answerBridgeId；如果用户要求提交到其它 answerBridgeId，可显式传 submit_agent_answer({ answerBridgeId, title, content })。同一个 answerBridgeId 可以重复提交，每次提交都会通知来源 Agent。最终自然语言回复可以保持简短。`;
+  const promptWithAnswerBridge = `${prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要把阶段性结论或最终正文提交给来源 Agent 时，请调用 submit_agent_answer({ title, content }) 并省略 childRef；Runtime 会使用当前子任务的默认通道。只有在用户明确要求提交到其它通道时，才传入当前模型上下文中提供的短 childRef。继续同一子对话、中断或重试不会改变默认通道。最终自然语言回复可以保持简短。`;
   const background = foregroundWait.value === 0;
   return {
     ok: true,

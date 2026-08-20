@@ -1,7 +1,8 @@
 import {
   buildModelHandleCatalog,
   normalizeModelHandleCatalog,
-  resolveModelToolArguments
+  resolveModelToolArguments,
+  UnknownModelHandleReferenceError
 } from './modelHandleCatalog';
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
@@ -20,6 +21,7 @@ import {
 } from './guidanceIntent';
 import {
   EffectControlPlane,
+  type CreatedToolCallBatch,
   type FrozenToolCallPolicyDecision,
   type ToolOutcomeStatus,
   type ToolTerminalResult
@@ -94,6 +96,25 @@ export interface ReliableAgentToolSettled {
   status: ToolOutcomeStatus;
 }
 
+export interface ReliableAgentToolBatchAdmission {
+  readonly kind: 'checked-provider-tool-batch';
+  /** Process-local identity. The issuing dispatcher is the only authority that can resolve it. */
+  readonly token: object;
+}
+
+export interface ReliableAgentToolBatchConfirmationInput {
+  turnId: string;
+  modelRequestId: string;
+  messageId: string;
+  batchId: string;
+  recipeDefinitions: readonly ReliableAgentToolDefinition[];
+  calls: ReadonlyArray<ReliableAgentToolDispatchInput & {
+    providerOrdinal: number;
+    policy: FrozenToolCallPolicyDecision;
+  }>;
+  creation: CreatedToolCallBatch;
+}
+
 /** Dispatcher owns capability-specific EffectIntent/Receipt semantics and may durably pause the Turn. */
 export interface ReliableAgentToolDispatcher {
   /** turnId selects definitions through that Turn's immutable authority snapshot. */
@@ -106,8 +127,15 @@ export interface ReliableAgentToolDispatcher {
   freezeCall?(input: ReliableAgentToolDispatchInput & {
     definition: ReliableAgentToolDefinition;
   }): Promise<FrozenToolCallPolicyDecision>;
+  /** Turns one fresh atomic ToolCall batch receipt into a process-local checked fast-path token. */
+  confirmPreparedBatch?(
+    input: ReliableAgentToolBatchConfirmationInput
+  ): Promise<ReliableAgentToolBatchAdmission | undefined> | ReliableAgentToolBatchAdmission | undefined;
   /** Dispatches one already-frozen parallel group while sharing read-only preflight/finalization work. */
-  dispatchBatch?(inputs: readonly ReliableAgentToolDispatchInput[]): Promise<Array<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>>;
+  dispatchBatch?(
+    inputs: readonly ReliableAgentToolDispatchInput[],
+    options?: { admission?: ReliableAgentToolBatchAdmission }
+  ): Promise<Array<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>>;
   dispatch(input: ReliableAgentToolDispatchInput): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>;
   /** Prewired cancellation boundary; Runner may invoke it without knowing capability internals. */
   cancelActive?(input: { turnId: string; reason: string }): Promise<void> | void;
@@ -209,9 +237,15 @@ interface NormalizedProviderOutput {
   usage?: PlainJsonValue;
 }
 
-interface FrozenProviderToolCall extends NormalizedToolCall {
+interface ResolvedProviderToolCall extends NormalizedToolCall {
+  argumentResolutionError?: string;
+}
+
+interface FrozenProviderToolCall extends ResolvedProviderToolCall {
   toolCallId: string;
   policy: FrozenToolCallPolicyDecision;
+  /** Present only for the same-process, newly committed Provider batch. */
+  batchAdmission?: ReliableAgentToolBatchAdmission;
 }
 
 interface FrozenCurrentTurnInputReference {
@@ -837,8 +871,10 @@ export class ReliableAgentLoop {
     output: NormalizedProviderOutput;
     recipe?: { [key: string]: PlainJsonValue };
   }): Promise<FrozenProviderToolCall[]> {
-    const definitions = await this.readModelRequestToolDefinitions(input.modelRequestId, input.recipe);
+    const recipe = input.recipe ?? await this.readModelRequestRecipe(input.modelRequestId);
+    const definitions = await this.readModelRequestToolDefinitions(input.modelRequestId, recipe);
     const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
+    const catalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
     const existingLinks = await listAllDomainRows(
       this.database,
       'ToolCallSourceLink',
@@ -854,19 +890,31 @@ export class ReliableAgentLoop {
     const calls: Array<FrozenProviderToolCall | undefined> = new Array(input.output.toolCalls.length);
     const pending: Array<{
       index: number;
-      call: NormalizedProviderOutput['toolCalls'][number];
+      call: ResolvedProviderToolCall;
       toolCallId: string;
       dispatchInput: ReliableAgentToolDispatchInput & { definition: ReliableAgentToolDefinition };
     }> = [];
     for (let index = 0; index < input.output.toolCalls.length; index += 1) {
       const call = input.output.toolCalls[index];
-      const catalog = normalizeModelHandleCatalog(input.recipe?.modelHandleCatalog);
-      const resolvedCall: NormalizedProviderOutput['toolCalls'][number] = {
-        ...call,
-        arguments: normalizePlainJson(
+      let resolvedArguments: PlainJsonValue;
+      let argumentResolutionError: string | undefined;
+      try {
+        resolvedArguments = normalizePlainJson(
           resolveModelToolArguments(call.name, call.arguments, catalog),
           `Provider ToolCall ${call.name} resolved arguments`
-        )
+        );
+      } catch (error) {
+        if (!(error instanceof UnknownModelHandleReferenceError)) throw error;
+        resolvedArguments = normalizePlainJson(
+          call.arguments,
+          `Provider ToolCall ${call.name} unresolved arguments`
+        );
+        argumentResolutionError = errorMessage(error);
+      }
+      const resolvedCall: ResolvedProviderToolCall = {
+        ...call,
+        arguments: resolvedArguments,
+        ...(argumentResolutionError ? { argumentResolutionError } : {})
       };
       const toolCallId = providerToolCallId(input.modelRequestId, call);
       const existingLink = existingByOrdinal.get(call.providerOrdinal);
@@ -919,7 +967,7 @@ export class ReliableAgentLoop {
       return call;
     });
     const batchId = stableId('tool_call_batch', input.modelRequestId);
-    await this.effects.createToolCallBatch({
+    const creation = await this.effects.createToolCallBatch({
       source: { kind: 'callback', key: `agent-loop:${input.modelRequestId}:tool-batch` },
       batchId,
       turnId: input.turnId,
@@ -935,7 +983,29 @@ export class ReliableAgentLoop {
         policy: call.policy
       }))
     });
-    return frozenCalls;
+    const batchAdmission = creation && this.tools.confirmPreparedBatch
+      ? await this.tools.confirmPreparedBatch({
+          turnId: input.turnId,
+          modelRequestId: input.modelRequestId,
+          messageId: input.messageId,
+          batchId,
+          recipeDefinitions: definitions,
+          calls: frozenCalls.map((call) => ({
+            turnId: input.turnId,
+            modelRequestId: input.modelRequestId,
+            toolCallId: call.toolCallId,
+            ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
+            toolName: call.name,
+            arguments: call.arguments,
+            providerOrdinal: call.providerOrdinal,
+            policy: call.policy
+          })),
+          creation
+        })
+      : undefined;
+    return batchAdmission
+      ? frozenCalls.map((call) => ({ ...call, batchAdmission }))
+      : frozenCalls;
   }
 
   private async dispatchProviderToolBatch(input: {
@@ -1024,15 +1094,54 @@ export class ReliableAgentLoop {
         schedulingMode
       });
     }
-    const dispatched = await this.tools.dispatchBatch(input.calls.map((call) => ({
+    const invalidCalls = input.calls.filter((call) => call.argumentResolutionError);
+    if (invalidCalls.length > 0) {
+      await this.effects.settleWithoutEffectBatch({
+        turnId: input.turnId,
+        settlements: invalidCalls.map((call) => ({
+          source: {
+            kind: 'internal' as const,
+            key: `agent-loop:${call.toolCallId}:invalid-model-handle-reference`
+          },
+          toolCallId: call.toolCallId,
+          status: 'failed' as const,
+          detail: {
+            code: 'invalid_model_handle_reference',
+            error: call.argumentResolutionError!
+          }
+        }))
+      });
+      for (const call of invalidCalls) {
+        this.observeLifecycle({
+          turnId: input.turnId,
+          stage: 'tool_dispatch_completed',
+          round: input.round,
+          modelRequestId: input.modelRequestId,
+          toolCallId: call.toolCallId,
+          toolBatchSize: input.calls.length,
+          schedulingMode
+        });
+      }
+    }
+    const dispatchableCalls = input.calls.filter((call) => !call.argumentResolutionError);
+    if (dispatchableCalls.length === 0) return false;
+    const dispatchInputs = dispatchableCalls.map((call) => ({
       turnId: input.turnId,
       modelRequestId: input.modelRequestId,
       toolCallId: call.toolCallId,
       ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
       toolName: call.name,
       arguments: call.arguments
-    })));
-    if (dispatched.length !== input.calls.length) {
+    }));
+    const batchAdmission = dispatchableCalls.length > 0
+      && dispatchableCalls.every((call) => call.batchAdmission === dispatchableCalls[0].batchAdmission)
+      ? dispatchableCalls[0].batchAdmission
+      : undefined;
+    const dispatched = await this.tools.dispatchBatch(
+      dispatchInputs,
+      batchAdmission ? { admission: batchAdmission } : undefined
+    );
+    if (dispatched.length !== dispatchableCalls.length) {
       throw new Error('Tool dispatcher dispatchBatch result length does not match the provider group.');
     }
     for (let index = 0; index < dispatched.length; index += 1) {
@@ -1042,7 +1151,7 @@ export class ReliableAgentLoop {
         stage: 'tool_dispatch_completed',
         round: input.round,
         modelRequestId: input.modelRequestId,
-        toolCallId: input.calls[index].toolCallId,
+        toolCallId: dispatchableCalls[index].toolCallId,
         toolBatchSize: input.calls.length,
         schedulingMode
       });
@@ -1066,6 +1175,32 @@ export class ReliableAgentLoop {
         modelRequestId: input.modelRequestId,
         toolCallId: input.call.toolCallId
       });
+      if (input.call.argumentResolutionError) {
+        const failed = await this.effects.settleWithoutEffect({
+          source: {
+            kind: 'internal',
+            key: `agent-loop:${input.call.toolCallId}:invalid-model-handle-reference`
+          },
+          toolCallId: input.call.toolCallId,
+          status: 'failed',
+          detail: {
+            code: 'invalid_model_handle_reference',
+            error: input.call.argumentResolutionError
+          }
+        }, { finalize: false });
+        this.observeLifecycle({
+          turnId: input.turnId,
+          stage: 'tool_dispatch_completed',
+          round: input.round,
+          modelRequestId: input.modelRequestId,
+          toolCallId: input.call.toolCallId
+        });
+        return failed.terminal ?? {
+          disposition: 'settled',
+          toolCallId: input.call.toolCallId,
+          status: failed.status
+        };
+      }
       const dispatched = await this.tools.dispatch({
         turnId: input.turnId,
         modelRequestId: input.modelRequestId,

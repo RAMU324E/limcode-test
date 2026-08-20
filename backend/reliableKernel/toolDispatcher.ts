@@ -30,6 +30,7 @@ import {
   RUN_AGENT_TOOL_NAME,
   runAgentToolAvailableAtDepth
 } from '../world/modules/tools/definitions/runAgent';
+import { effectiveLocalPathReadMode } from '../world/modules/tools/definitions/readFile';
 import { isSkillEnabledByPolicy } from '../world/modules/skill/policy';
 import { composeSkillsToolDescription } from '../world/modules/skill/skillDescription';
 import {
@@ -49,6 +50,8 @@ import type {
   ReliableAgentToolDefinition,
   ReliableAgentToolDispatchInput,
   ReliableAgentToolDispatcher,
+  ReliableAgentToolBatchAdmission,
+  ReliableAgentToolBatchConfirmationInput,
   ReliableAgentToolPause,
   ReliableAgentToolSettled
 } from './agentLoop';
@@ -193,6 +196,44 @@ type InternalDispatchResult =
   | ReliableAgentToolSettled
   | DeferredNoEffectSettlement;
 
+interface PreparedProviderToolEntry {
+  identity: string;
+  frozenDefinition: ReliableAgentToolDefinition;
+  policy: FrozenToolCallPolicyDecision;
+}
+
+interface PreparedProviderToolBatch {
+  turnId: string;
+  modelRequestId: string;
+  definitions: readonly ToolDefinition[];
+  authority: ReliableToolDispatchAuthority;
+  entriesById: ReadonlyMap<string, PreparedProviderToolEntry>;
+}
+
+interface CheckedProviderToolEntry extends PreparedProviderToolEntry {
+  toolCall: DomainRow;
+  definitionMismatch?: string;
+}
+
+interface CheckedProviderToolBatch {
+  turnId: string;
+  modelRequestId: string;
+  definitions: readonly ToolDefinition[];
+  authority: ReliableToolDispatchAuthority;
+  entriesById: ReadonlyMap<string, CheckedProviderToolEntry>;
+  remainingCallIds: Set<string>;
+}
+
+interface ResolvedToolBatchPreflight {
+  definitions: readonly ToolDefinition[];
+  baseAuthority: ReliableToolDispatchAuthority;
+  freshCallIds: Set<string>;
+  toolCallsById: Map<string, DomainRow>;
+  frozenDecisionsById: Map<string, FrozenToolCallPolicyDecision>;
+  internalCallIds: Set<string>;
+  providerDefinitionMismatches: Map<string, string>;
+}
+
 /** Product Tool dispatcher. Every non-readonly external effect is committed before dispatch. */
 export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   private readonly workEnvironmentTransfers: WorkEnvironmentTransferEffectDispatcher;
@@ -209,6 +250,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   private readonly admissionSignals = new Map<string, AbortSignal>();
   private readonly activeDispatches = new Set<Promise<unknown>>();
   private readonly authorityCache = new Map<string, Promise<{ snapshotId: string; document: PlainJsonValue }>>();
+  private readonly pendingPreparedProviderBatches = new Map<string, PreparedProviderToolBatch>();
+  private readonly checkedProviderBatchAdmissions = new WeakMap<object, CheckedProviderToolBatch>();
   private handoff: ExecutionHandoffError | undefined;
 
   public constructor(private readonly dependencies: ReliableToolDispatcherDependencies) {
@@ -222,11 +265,13 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     await this.quiesce(this.handoff ?? new ExecutionHandoffError());
     this.activeHostExecutions.clear();
     this.authorityCache.clear();
+    this.pendingPreparedProviderBatches.clear();
     await this.dependencies.host.dispose?.();
   }
 
   public async quiesce(reason: ExecutionHandoffError): Promise<void> {
     this.handoff = reason;
+    this.pendingPreparedProviderBatches.clear();
     await this.dependencies.host.quiesce?.(reason);
     for (const batch of this.activeBatchDispatches.values()) {
       if (!batch.controller.signal.aborted) batch.controller.abort(reason);
@@ -283,7 +328,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     ]);
     const policy = authorityPolicy(authority.document);
     const liveByName = new Map(liveDefinitions.map((definition) => [definition.declaration.name, definition]));
-    return inputs.map((input) => {
+    const decisions = inputs.map((input) => {
       if (input.definition.name !== input.toolName) {
         throw new Error('Frozen Tool definition name does not match Provider call.');
       }
@@ -297,6 +342,125 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
       });
     });
+    this.rememberPreparedProviderBatch(inputs, decisions, liveDefinitions, authority);
+    return decisions;
+  }
+
+  public confirmPreparedBatch(
+    input: ReliableAgentToolBatchConfirmationInput
+  ): ReliableAgentToolBatchAdmission | undefined {
+    if (this.handoff) return undefined;
+    const prepared = this.pendingPreparedProviderBatches.get(input.modelRequestId);
+    this.pendingPreparedProviderBatches.delete(input.modelRequestId);
+    if (
+      !prepared
+      || prepared.turnId !== input.turnId
+      || prepared.modelRequestId !== input.modelRequestId
+      || input.creation.deduplicated
+      || !input.creation.commitSeq
+      || input.creation.batchId !== input.batchId
+      || input.creation.calls.length !== input.calls.length
+      || prepared.entriesById.size !== input.calls.length
+    ) return undefined;
+    if (!/^[1-9]\d*$/.test(input.creation.commitSeq)) return undefined;
+
+    const recipeByName = new Map<string, ReliableAgentToolDefinition[]>();
+    for (const definition of input.recipeDefinitions) {
+      const bucket = recipeByName.get(definition.name) ?? [];
+      bucket.push(definition);
+      recipeByName.set(definition.name, bucket);
+    }
+    const liveByName = new Map(prepared.definitions.map((definition) => [definition.declaration.name, definition]));
+    const createdById = new Map(input.creation.calls.map((call) => [call.toolCallId, call]));
+    const checkedEntries = new Map<string, CheckedProviderToolEntry>();
+    for (const call of input.calls) {
+      const pending = prepared.entriesById.get(call.toolCallId);
+      const created = createdById.get(call.toolCallId);
+      if (
+        !pending
+        || pending.identity !== preparedToolInputIdentity(call)
+        || canonicalPlainJson(pending.policy, 'Prepared Tool policy')
+          !== canonicalPlainJson(call.policy, 'Confirmed Tool policy')
+        || !created
+        || created.providerOrdinal !== call.providerOrdinal
+        || !created.toolExecutionId
+        || !/^[1-9]\d*$/.test(created.callSeq)
+      ) return undefined;
+      const recipeMatches = recipeByName.get(call.toolName) ?? [];
+      let definitionMismatch: string | undefined;
+      if (recipeMatches.length !== 1) {
+        definitionMismatch = `ModelRequest recipe 中工具 ${call.toolName} 不是唯一声明。`;
+      } else if (!sameReliableToolDefinition(recipeMatches[0], pending.frozenDefinition)) {
+        return undefined;
+      } else {
+        const live = liveByName.get(call.toolName);
+        if (live && !sameToolSource(live.declaration.source, recipeMatches[0].source)) {
+          definitionMismatch = `工具 ${call.toolName} 的当前 capability source 与 Provider 请求冻结 source 不一致；拒绝跨源执行。`;
+        }
+      }
+      checkedEntries.set(call.toolCallId, {
+        ...pending,
+        toolCall: {
+          id: call.toolCallId,
+          turn_id: input.turnId,
+          tool_name: call.toolName,
+          status: 'pending',
+          call_seq: BigInt(created.callSeq)
+        },
+        ...(definitionMismatch ? { definitionMismatch } : {})
+      });
+    }
+    if (checkedEntries.size !== input.calls.length) return undefined;
+    const token = {};
+    this.checkedProviderBatchAdmissions.set(token, {
+      turnId: input.turnId,
+      modelRequestId: input.modelRequestId,
+      definitions: prepared.definitions,
+      authority: prepared.authority,
+      entriesById: checkedEntries,
+      remainingCallIds: new Set(checkedEntries.keys())
+    });
+    return Object.freeze({ kind: 'checked-provider-tool-batch', token });
+  }
+
+  private rememberPreparedProviderBatch(
+    inputs: ReadonlyArray<ReliableAgentToolDispatchInput & { definition: ReliableAgentToolDefinition }>,
+    decisions: readonly FrozenToolCallPolicyDecision[],
+    definitions: readonly ToolDefinition[],
+    authority: ReliableToolDispatchAuthority
+  ): void {
+    const modelRequestIds = new Set(inputs.map((input) => input.modelRequestId));
+    const toolCallIds = new Set(inputs.map((input) => input.toolCallId));
+    if (
+      inputs.length === 0
+      || decisions.length !== inputs.length
+      || modelRequestIds.size !== 1
+      || toolCallIds.size !== inputs.length
+    ) return;
+    const modelRequestId = inputs[0].modelRequestId;
+    const entriesById = new Map<string, PreparedProviderToolEntry>();
+    for (let index = 0; index < inputs.length; index += 1) {
+      entriesById.set(inputs[index].toolCallId, {
+        identity: preparedToolInputIdentity(inputs[index]),
+        frozenDefinition: inputs[index].definition,
+        policy: decisions[index]
+      });
+    }
+    this.pendingPreparedProviderBatches.set(modelRequestId, {
+      turnId: inputs[0].turnId,
+      modelRequestId,
+      definitions: Object.freeze([...definitions]),
+      authority: {
+        snapshotId: authority.snapshotId,
+        document: authority.document
+      },
+      entriesById
+    });
+    while (this.pendingPreparedProviderBatches.size > 64) {
+      const oldest = this.pendingPreparedProviderBatches.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.pendingPreparedProviderBatches.delete(oldest);
+    }
   }
 
   private freezeDecision(
@@ -481,13 +645,14 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   }
 
   public dispatchBatch(
-    inputs: readonly ReliableAgentToolDispatchInput[]
+    inputs: readonly ReliableAgentToolDispatchInput[],
+    options: { admission?: ReliableAgentToolBatchAdmission } = {}
   ): Promise<Array<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>> {
     if (this.handoff) return Promise.reject(this.handoff);
     if (inputs.length === 0) return Promise.resolve([]);
     const turnId = requireId(inputs[0].turnId, 'turnId');
     const controller = new AbortController();
-    const task = this.dispatchBatchInternal(inputs, controller.signal);
+    const task = this.dispatchBatchInternal(inputs, controller.signal, options.admission);
     this.activeBatchDispatches.set(task, { turnId, controller });
     this.activeDispatches.add(task);
     void task.finally(() => {
@@ -497,15 +662,14 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     return task;
   }
 
-  private async dispatchBatchInternal(
+  private async resolveToolBatchPreflight(
     inputs: readonly ReliableAgentToolDispatchInput[],
-    parentSignal?: AbortSignal
-  ): Promise<Array<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>> {
-    if (inputs.length === 0) return [];
-    const turnId = requireId(inputs[0].turnId, 'turnId');
-    if (inputs.some((input) => input.turnId !== turnId)) {
-      throw new Error('dispatchBatch requires every ToolCall to belong to the same Turn.');
-    }
+    turnId: string,
+    admission?: ReliableAgentToolBatchAdmission
+  ): Promise<ResolvedToolBatchPreflight> {
+    const checked = this.consumeCheckedProviderBatch(inputs, turnId, admission);
+    if (checked) return checked;
+
     const [definitions, baseAuthority, preflight] = await Promise.all([
       this.dependencies.host.definitions(),
       this.readAuthority(turnId, 'tool-definitions'),
@@ -581,6 +745,90 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       inputs.filter((input) => !internalCallIds.has(input.toolCallId)),
       definitionsByName
     );
+    return {
+      definitions,
+      baseAuthority,
+      freshCallIds,
+      toolCallsById,
+      frozenDecisionsById,
+      internalCallIds,
+      providerDefinitionMismatches
+    };
+  }
+
+  private consumeCheckedProviderBatch(
+    inputs: readonly ReliableAgentToolDispatchInput[],
+    turnId: string,
+    admission?: ReliableAgentToolBatchAdmission
+  ): ResolvedToolBatchPreflight | undefined {
+    if (
+      !admission
+      || admission.kind !== 'checked-provider-tool-batch'
+      || !admission.token
+      || typeof admission.token !== 'object'
+    ) return undefined;
+    const checked = this.checkedProviderBatchAdmissions.get(admission.token);
+    if (!checked || checked.turnId !== turnId) return undefined;
+    const selected: CheckedProviderToolEntry[] = [];
+    for (const input of inputs) {
+      const entry = checked.entriesById.get(input.toolCallId);
+      if (
+        !entry
+        || !checked.remainingCallIds.has(input.toolCallId)
+        || input.modelRequestId !== checked.modelRequestId
+        || entry.identity !== preparedToolInputIdentity(input)
+      ) return undefined;
+      selected.push(entry);
+    }
+    const freshCallIds = new Set<string>();
+    const toolCallsById = new Map<string, DomainRow>();
+    const frozenDecisionsById = new Map<string, FrozenToolCallPolicyDecision>();
+    const providerDefinitionMismatches = new Map<string, string>();
+    for (let index = 0; index < inputs.length; index += 1) {
+      const input = inputs[index];
+      const entry = selected[index];
+      checked.remainingCallIds.delete(input.toolCallId);
+      freshCallIds.add(input.toolCallId);
+      toolCallsById.set(input.toolCallId, entry.toolCall);
+      frozenDecisionsById.set(input.toolCallId, entry.policy);
+      if (entry.definitionMismatch) {
+        providerDefinitionMismatches.set(input.toolCallId, entry.definitionMismatch);
+      }
+    }
+    if (checked.remainingCallIds.size === 0) {
+      this.checkedProviderBatchAdmissions.delete(admission.token);
+    }
+    return {
+      definitions: checked.definitions,
+      baseAuthority: checked.authority,
+      freshCallIds,
+      toolCallsById,
+      frozenDecisionsById,
+      internalCallIds: new Set(),
+      providerDefinitionMismatches
+    };
+  }
+
+  private async dispatchBatchInternal(
+    inputs: readonly ReliableAgentToolDispatchInput[],
+    parentSignal?: AbortSignal,
+    admission?: ReliableAgentToolBatchAdmission
+  ): Promise<Array<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>> {
+    if (inputs.length === 0) return [];
+    const turnId = requireId(inputs[0].turnId, 'turnId');
+    if (inputs.some((input) => input.turnId !== turnId)) {
+      throw new Error('dispatchBatch requires every ToolCall to belong to the same Turn.');
+    }
+    const {
+      definitions,
+      baseAuthority,
+      freshCallIds,
+      toolCallsById,
+      frozenDecisionsById,
+      providerDefinitionMismatches
+    } = await this.resolveToolBatchPreflight(inputs, turnId, admission);
+    const definitionsByName = new Map(definitions.map((definition) => [definition.declaration.name, definition]));
+    const policy = authorityPolicy(baseAuthority.document);
     type IndexedInput = { input: ReliableAgentToolDispatchInput; index: number };
     const indexed = inputs.map((input, index): IndexedInput => ({ input, index }));
     const requiresChildAdmission = (input: ReliableAgentToolDispatchInput): boolean =>
@@ -2278,6 +2526,25 @@ function plainOptionalRecord(value: unknown): Record<string, unknown> | undefine
     : undefined;
 }
 
+function preparedToolInputIdentity(input: ReliableAgentToolDispatchInput): string {
+  return canonicalPlainJson({
+    turnId: input.turnId,
+    modelRequestId: input.modelRequestId,
+    toolCallId: input.toolCallId,
+    providerCallId: input.providerCallId ?? null,
+    toolName: input.toolName,
+    arguments: input.arguments
+  }, 'Prepared Provider ToolCall');
+}
+
+function sameReliableToolDefinition(
+  left: ReliableAgentToolDefinition,
+  right: ReliableAgentToolDefinition
+): boolean {
+  return canonicalPlainJson(left, 'Recipe Tool definition')
+    === canonicalPlainJson(right, 'Prepared Tool definition');
+}
+
 function providerDefinitionMismatchFromRecipe(
   toolName: string,
   definition: ToolDefinition,
@@ -2396,7 +2663,11 @@ function isDeferredNoEffectSettlement(result: InternalDispatchResult): result is
 }
 
 function isAttachmentReadInput(input: ReliableAgentToolDispatchInput): boolean {
-  return input.toolName === 'read' && optionalText(plainOptionalRecord(input.arguments)?.mode) === 'attachment';
+  if (input.toolName !== 'read') return false;
+  const args = plainOptionalRecord(input.arguments);
+  const explicitMode = optionalText(args?.mode);
+  if (explicitMode !== undefined && explicitMode !== 'text' && explicitMode !== 'attachment') return false;
+  return effectiveLocalPathReadMode(args?.path, explicitMode as 'text' | 'attachment' | undefined) === 'attachment';
 }
 
 function noEffectModelDetail(toolName: string, result: ToolResultOut): PlainJsonValue {

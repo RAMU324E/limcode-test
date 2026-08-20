@@ -8,7 +8,7 @@ import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, a
 import { compactReadPagesArgument, resolveReadPageRange } from './pageRange';
 import { readTextPages } from './textPages';
 
-type ReadFileMode = 'text' | 'attachment';
+export type ReadFileMode = 'text' | 'attachment';
 
 interface ReadFileItem {
   path?: string;
@@ -39,7 +39,7 @@ export function readFileToolDescription(
   includeManagedPageRanges = includeManagedAttachments
 ): string {
   const parts = [
-    'Read UTF-8 text from one local file path or a batch of up to 8 local text files. For the common single-file case, pass only { path }; mode defaults to "text". Use { path, mode: "attachment" } only for a local PNG, JPEG, WebP, or PDF. For independent text files, prefer one items batch; results preserve input order. For local reads, provide exactly one of path or items.',
+    'Read UTF-8 text from one local file path or a batch of up to 8 local text files. For the common single-file case, pass only { path }; mode is inferred as "attachment" for local PNG, JPEG, WebP, or PDF paths and as "text" otherwise. Use an explicit mode only when the caller needs to require one behavior. For independent text files, prefer one items batch; results preserve input order. For local reads, provide exactly one of path or items.',
     includeManagedAttachments
       ? 'A LimCode managed attachment catalog is present. To read a past user-supplied attachment that has no usable local path, use an exact non-empty attachmentId from that catalog. Never send an empty or invented attachmentId, and never use a file name as the id. When attachmentId is used, provide neither path nor items.'
       : '',
@@ -60,7 +60,7 @@ export function readFileToolParameters(
 } {
   const properties: Record<string, unknown> = {
     path: { type: 'string', description: 'The usual input: a local file path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
-    mode: { type: 'string', enum: ['text', 'attachment'], description: 'Optional for path reads only. Omit it for ordinary UTF-8 text. Use "attachment" only for a local PNG, JPEG, WebP, or PDF.' },
+    mode: { type: 'string', enum: ['text', 'attachment'], description: 'Optional for path reads only. When omitted, recognized local PNG, JPEG, WebP, and PDF paths use "attachment"; all other paths use "text". Explicit "attachment" is supported only for those media paths.' },
     startLine: { type: 'number', description: 'Text path reads only. Optional 1-based start line (inclusive); omit it when not needed.' },
     endLine: { type: 'number', description: 'Text path reads only. Optional 1-based end line (inclusive); omit it when not needed.' },
     items: {
@@ -112,7 +112,7 @@ export function compactReadFileToolArguments(value: unknown): Record<string, unk
 
   const managedAttachment = !!attachmentId || !!attachmentRef;
   const mode = normalizeReadMode(source.mode);
-  if (!managedAttachment && mode === 'attachment') result.mode = mode;
+  if (!managedAttachment && mode) result.mode = mode;
   else if (source.mode !== undefined && mode === undefined) result.mode = source.mode;
 
   // Provider-facing attachmentRef is resolved to attachmentId after completed calls leave the
@@ -246,10 +246,9 @@ export const readFileTool: ToolDefinition = {
     if (args.pages !== undefined) {
       return { ok: false, output: 'pages is supported only for managed TXT and PDF attachments.' };
     }
-    const mode: ReadFileMode = explicitMode ?? 'text';
-
     const mimeType = inferMimeType(path);
     const isSupportedAttachment = !!mimeType && READ_ATTACHMENT_MIME_TYPES.has(mimeType);
+    const mode = effectiveLocalPathReadMode(path, explicitMode);
     if (mode === 'attachment') {
       if (!isSupportedAttachment || !mimeType) {
         return { ok: false, output: unsupportedAttachmentMessage(path) };
@@ -297,7 +296,7 @@ function summarizeReadFileToolCall(rawArgs: unknown): string | undefined {
   if (items) return `${items.length} text files`;
   if (!path) return undefined;
 
-  const mode = normalizeReadMode(args.mode) ?? 'text';
+  const mode = effectiveLocalPathReadMode(path, normalizeReadMode(args.mode));
   const modeSuffix = `[${mode}]`;
   if (mode === 'attachment') return `${path}${modeSuffix}`;
   const range = lineRangeSuffix(args.startLine, args.endLine);
@@ -515,6 +514,13 @@ function normalizeLineNumber(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   const line = Math.floor(value);
   return line > 0 ? line : undefined;
+}
+
+export function effectiveLocalPathReadMode(path: unknown, explicitMode?: ReadFileMode): ReadFileMode {
+  if (explicitMode) return explicitMode;
+  const normalizedPath = normalizeDisplayPath(path);
+  const mimeType = inferMimeType(normalizedPath);
+  return mimeType && READ_ATTACHMENT_MIME_TYPES.has(mimeType) ? 'attachment' : 'text';
 }
 
 function normalizeReadMode(value: unknown): ReadFileMode | undefined {

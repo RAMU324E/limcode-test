@@ -52,6 +52,7 @@ docs/architecture/*
 !/tests/reliable-kernel/product-composition.test.mjs
 !/tests/reliable-kernel/phase-b-foundation.test.mjs
 !/tests/reliable-kernel/streaming-output-regressions.test.mjs
+!/tests/reliable-kernel/tool-boundary-regressions.test.mjs
 !/tests/reliable-kernel/command-router-interaction.test.mjs
 !/tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs
 !/tests/reliable-kernel/webview-feed-lifecycle.test.mjs

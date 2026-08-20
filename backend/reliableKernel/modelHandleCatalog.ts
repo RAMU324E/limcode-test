@@ -1,5 +1,17 @@
 export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment';
 
+export class UnknownModelHandleReferenceError extends Error {
+  public readonly code = 'UNKNOWN_MODEL_HANDLE_REFERENCE';
+
+  public constructor(
+    public readonly kind: ModelHandleKind,
+    public readonly ref: string
+  ) {
+    super(`未知${handleKindLabel(kind)}引用：${ref}`);
+    this.name = 'UnknownModelHandleReferenceError';
+  }
+}
+
 export interface ModelHandleEntry {
   kind: ModelHandleKind;
   ref: string;
@@ -366,7 +378,7 @@ function replaceRef(
   const ref = optionalText(record[refKey]);
   if (!ref) return;
   const target = modelHandleTarget(catalog, kind, ref);
-  if (!target) throw new Error(`未知${handleKindLabel(kind)}引用：${ref}`);
+  if (!target) throw new UnknownModelHandleReferenceError(kind, ref);
   delete record[refKey];
   record[targetKey] = target;
 }
@@ -379,7 +391,7 @@ function replaceEnvironmentValue(
   const ref = optionalText(record[key]);
   if (!ref || ref === 'current' || !/^W[1-9]\d*$/.test(ref)) return;
   const target = modelHandleTarget(catalog, 'workEnvironment', ref);
-  if (!target) throw new Error(`未知工作环境引用：${ref}`);
+  if (!target) throw new UnknownModelHandleReferenceError('workEnvironment', ref);
   record[key] = target;
 }
 

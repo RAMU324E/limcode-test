@@ -162,6 +162,9 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     model: spawnCommand.modelFallback
   });
   assert.match(spawnCommand.prompt, /inspect in the background/);
+  assert.match(spawnCommand.prompt, /省略 childRef/);
+  assert.doesNotMatch(spawnCommand.prompt, /answer_bridge_[a-f0-9]{64}/);
+  assert.equal(spawnCommand.prompt.includes(answerBridgeId), false, '子提示不得泄漏 canonical AnswerBridge ID');
   assert.equal(background.disposition, 'settled');
 
   await assert.rejects(() => coordinator.dispatch({

@@ -233,7 +233,7 @@ export class ReliableChildAgentCoordinator {
       sourceToolCallId,
       childAgentId: selection.agentId,
       modelFallback: await this.dependencies.children.frozenModelSelectionForTurn(parentTurnId),
-      prompt: promptWithAnswerBridge(requireText(input.prompt, 'prompt'), preview.answerBridgeId),
+      prompt: promptWithAnswerBridge(requireText(input.prompt, 'prompt')),
       completionPolicy: 'background',
       sourceSettlement: 'external',
       leaseOwnerId: this.childLeaseOwnerId,
@@ -1173,7 +1173,7 @@ export class ReliableChildAgentCoordinator {
       sourceToolCallId: input.toolCallId,
       childAgentId: selection.agentId,
       modelFallback: frozenParentModelSelection(authority),
-      prompt: promptWithAnswerBridge(prompt, answerBridgeId),
+      prompt: promptWithAnswerBridge(prompt),
       completionPolicy,
       sourceSettlement: 'child_handle',
       ...(deadline ? { waitDeadlineAt: deadline } : {}),
@@ -1256,7 +1256,7 @@ export class ReliableChildAgentCoordinator {
       sourceToolCallId: input.toolCallId,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
       mode: activeTurnId ? 'interrupt_current_turn' : 'queue_next_turn',
-      content: promptWithAnswerBridge(prompt, answerBridgeId),
+      content: promptWithAnswerBridge(prompt),
       completionPolicy,
       ...(deadline ? { waitDeadlineAt: deadline } : {})
     });
@@ -1927,8 +1927,8 @@ function frozenParentModelSelection(
   return frozenModelSelection(authority.document);
 }
 
-function promptWithAnswerBridge(prompt: string, answerBridgeId: string): string {
-  return `${prompt}\n\n[Agent answer bridge]\n本次任务的默认 answerBridgeId 为 ${answerBridgeId}。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })；继续同一子对话时该默认值保持不变。`;
+function promptWithAnswerBridge(prompt: string): string {
+  return `${prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。只有在用户明确要求提交到其它通道时，才传入当前模型上下文中提供的短 childRef。继续同一子对话、中断或重试不会改变默认通道。`;
 }
 
 function assertExpectedPlanDelegation(
