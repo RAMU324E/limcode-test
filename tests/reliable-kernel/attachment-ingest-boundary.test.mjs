@@ -257,7 +257,7 @@ test('read keeps path as the ordinary input and only exposes pages for managed T
     pages: '',
     path: 'src\\demo.ts',
     startLine: 0
-  }), { path: 'src/demo.ts' });
+  }), { path: 'src/demo.ts', mode: 'text' });
   assert.deepEqual(compactReadFileToolArguments({
     attachmentId: ' attachment-one ',
     endLine: 1,
