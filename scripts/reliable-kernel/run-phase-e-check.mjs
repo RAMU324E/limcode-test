@@ -542,12 +542,13 @@ async function checkCompressionNodeBound() {
     const metrics = {};
     const seeded = await seedTurn(ctx, 'compression-bound', { thresholdTokens: 2 });
     const context = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
+    const beforeToolDelivery = runtimeDeliveryFixture('before-tool', seeded.turnId, 'before-tool-original');
     await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'system',
-      source: { sourceKind: 'system', sourceId: 'before-tool', sourceRevision: '0' },
-      content: 'before-tool-original', contentType: 'text/plain'
-
+      segmentKind: 'runtime_context',
+      source: { sourceKind: 'runtime_context', sourceId: 'before-tool', sourceRevision: '0' },
+      content: beforeToolDelivery.content,
+      contentType: beforeToolDelivery.contentType
     });
     const pair = await seedToolPair(ctx, seeded, 'pair-bound');
     const pairAppend = await context.appendToolPair({
@@ -563,13 +564,68 @@ async function checkCompressionNodeBound() {
       );
       await context.appendContent({
         conversationId: seeded.conversationId,
+        segmentKind: 'runtime_context',
+        source: { sourceKind: 'runtime_context', sourceId: `tail-bound-${index}`, sourceRevision: '0' },
+        content: tailDelivery.content,
+        contentType: tailDelivery.contentType
+      });
+    }
+    const sourceRootId = await context.currentHeadRootId(seeded.conversationId);
+    const sourceMaterialized = await context.materialize(sourceRootId);
+    assert.equal(sourceMaterialized.segments[2].segmentId, pairAppend.segmentId);
+    const pairSources = await list(ctx.database, 'ContextSegmentSource', { segment_id: pairAppend.segmentId });
+    assert.deepEqual(pairSources.map((row) => row.source_kind).sort(), ['tool_call', 'tool_model_result']);
+    assertions.push('tool call与唯一ToolModelResult形成一个tool_pair segment并登记两条同call_seq source，压缩只能按整个segment选取');
+
+    const rootBefore = await get(ctx.database, 'ContextSequenceRoot', sourceRootId);
+    const durableByteEstimate = sourceMaterialized.segments.reduce(
+      (sum, segment) => sum + Number((segment.contentObject.byte_length + 3n) / 4n),
+      0
+    );
+    assert.ok(Number(rootBefore.estimated_tokens) > 0);
+    const tokenEstimator = new kernel.ReliableContextTokenEstimator(ctx.database, ctx.store);
+    const providerAligned = await tokenEstimator.estimateRoot(sourceRootId);
+    const compression = new kernel.ContextCompressionControlPlane(ctx.database, ctx.store);
+    const decision = await compression.evaluate(sourceRootId, seeded.authoritySnapshotId);
+    assert.equal(decision.estimatedTokens, providerAligned.estimatedTokens);
+    assert.ok(Math.abs(decision.estimatedTokens - durableByteEstimate) < 1_000);
+    assert.equal(decision.shouldCompress, true);
+    assert.ok(decision.estimatedTokens >= decision.thresholdTokens);
+    const belowThreshold = await seedTurn(ctx, 'compression-below-threshold', {
+      thresholdTokens: 1_000_000
+    });
+    const belowThresholdRootId = await context.currentHeadRootId(belowThreshold.conversationId);
+    const belowThresholdDecision = await compression.evaluate(
+      belowThresholdRootId,
+      belowThreshold.authoritySnapshotId
+    );
+    assert.equal(belowThresholdDecision.shouldCompress, false);
+    const contentRowsBeforeExplicitCompression = await countAll(ctx.database, 'ContentObject');
+    const belowThresholdCompression = await compression.create({
+      conversationId: belowThreshold.conversationId,
+      headRootId: belowThresholdRootId,
+      authoritySnapshotId: belowThreshold.authoritySnapshotId,
+      compressSegmentCount: 1,
+      title: 'explicit-below-threshold',
+      summary: 'explicit-below-threshold',
+      idempotencyKey: 'below-threshold-explicit'
+    });
+    assert.equal(belowThresholdCompression.sourceCount, 1);
+    assert.ok(await countAll(ctx.database, 'ContentObject') > contentRowsBeforeExplicitCompression);
+    assert.equal(
+      await context.currentHeadRootId(belowThreshold.conversationId),
+      belowThresholdCompression.rootId
+    );
+
+    const multimodal = await seedTurn(ctx, 'compression-multimodal-token-estimate', {
+      thresholdTokens: 100_000
+    });
     await appendMessageContextFixture(
       ctx,
       multimodal,
       'large-inline-image',
       'user',
       JSON.stringify({
-
         role: 'user',
         parts: [{ inlineData: { mimeType: 'image/png', data: 'A'.repeat(700_000) } }]
       }),
@@ -614,9 +670,9 @@ async function checkCompressionNodeBound() {
         );
         await context.appendContent({
           conversationId: sized.conversationId,
-          segmentKind: 'system',
+          segmentKind: 'runtime_context',
           source: {
-            sourceKind: 'system',
+            sourceKind: 'runtime_context',
             sourceId: `compression-size-${sourceCount}-${index}`,
             sourceRevision: '0'
           },
@@ -658,16 +714,19 @@ async function checkCompressionNodeBound() {
     assert.equal(compressed.root.tail_segment_count, BigInt(expectedTail.length));
     assertions.push('compression root严格物化summary+finite tail，到tail_segment_count即停止且不重新带回被替换原文');
 
+    const afterCompressionDelivery = runtimeDeliveryFixture(
+      'after-compression', seeded.turnId, 'after-compression'
+    );
     const appended = await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'system',
-      source: { sourceKind: 'system', sourceId: 'after-compression', sourceRevision: '0' },
-      content: 'after-compression', contentType: 'text/plain'
-
+      segmentKind: 'runtime_context',
+      source: { sourceKind: 'runtime_context', sourceId: 'after-compression', sourceRevision: '0' },
+      content: afterCompressionDelivery.content,
+      contentType: afterCompressionDelivery.contentType
     });
     const afterAppend = await context.materialize(appended.rootId);
     assert.deepEqual(afterAppend.segments.map((segment) => segment.content.toString('utf8')), [
-      'FINITE-SUMMARY', ...expectedTail, 'after-compression'
+      'FINITE-SUMMARY', ...expectedTail, afterCompressionDelivery.content
     ]);
     assertions.push('compression后普通append只延长有限tail并继续复用summary，不重接被压缩prefix');
 
@@ -773,7 +832,6 @@ async function checkCompressionNodeBound() {
     return { assertions, faults, metrics };
   });
 }
-
 async function checkProviderFullRequest() {
   const authority = JSON.parse(await fs.readFile(
     path.join(root, 'docs/architecture/reliable-kernel/contracts/authority.json'),
