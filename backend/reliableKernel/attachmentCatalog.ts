@@ -34,11 +34,15 @@ export function collectAttachmentCatalogFromStoredItems(
 ): AttachmentCatalogEntry[] {
   return mergeAttachmentCatalog(...items.map((item) => {
     if (!isJsonContentType(item.contentType)) return [];
+    let parsed: unknown;
     try {
-      return collectAttachmentCatalog(JSON.parse(item.content) as unknown);
+      parsed = JSON.parse(item.content) as unknown;
     } catch {
       return [];
     }
+    // Parsing failure means the item is not a JSON envelope. Once parsed, however, malformed
+    // managed metadata and immutable metadata drift are authority violations and must fail closed.
+    return collectAttachmentCatalog(parsed);
   }));
 }
 
@@ -136,19 +140,25 @@ function collect(value: unknown, entries: AttachmentCatalogEntry[], seen: Set<ob
 function collectNestedJson(value: string, entries: AttachmentCatalogEntry[], seen: Set<object>): void {
   const trimmed = value.trim();
   if ((!trimmed.startsWith('{') && !trimmed.startsWith('[')) || trimmed.length > 16 * 1024 * 1024) return;
+  let parsed: unknown;
   try {
-    collect(JSON.parse(trimmed) as unknown, entries, seen);
+    parsed = JSON.parse(trimmed) as unknown;
   } catch {
     // Tool result text may start with JSON punctuation without being a JSON envelope.
+    return;
   }
+  collect(parsed, entries, seen);
 }
 
 function optionalInlineDataEntry(value: Record<string, unknown>): AttachmentCatalogEntry | undefined {
-  const attachmentId = optionalText(value.attachmentId);
-  const name = optionalText(value.name);
-  const mimeType = optionalText(value.mimeType);
+  if (value.attachmentId === undefined) return undefined;
+  const attachmentId = requireText(value.attachmentId, 'inlineData.attachmentId');
+  const name = requireText(value.name, 'inlineData.name');
+  const mimeType = requireText(value.mimeType, 'inlineData.mimeType');
   const sizeBytes = nonNegativeInteger(value.sizeBytes);
-  if (!attachmentId || !name || !mimeType || sizeBytes === undefined) return undefined;
+  if (sizeBytes === undefined) {
+    throw new TypeError('inlineData.sizeBytes must be a non-negative safe integer.');
+  }
   return { attachmentId, name, mimeType, sizeBytes };
 }
 

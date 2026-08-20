@@ -1078,6 +1078,7 @@ async function checkProviderFullRequest() {
       authoritySnapshot: expectedOriginalAuthority,
       recipe: { temperature: 0, tools: [{ name: 'echo' }] },
       context: expectedOriginalContext,
+      attachmentCatalog: [],
       requestCreatedAt: payloads[0].requestCreatedAt
     });
     assert.deepEqual(payloads[1], {
@@ -2635,6 +2636,8 @@ async function checkImmutableReplacement() {
               assert.equal(request.recipe.requestKind, 'context_compression_pre');
               assert.equal(request.recipe.sourceSegmentCount, 4);
               assert.equal(request.context.length, 4);
+              assert.deepEqual(request.recipe.attachmentCatalog, [coordinatorAttachment]);
+              assert.deepEqual(request.attachmentCatalog, [coordinatorAttachment]);
               frozenCompressionBlockId = request.recipe.blockId;
               await controls.onEvent({
                 kind: 'completed',
@@ -3467,7 +3470,7 @@ function assertNoContinuationPayload(request) {
   assert.ok(Array.isArray(request.context) && request.context.length > 0);
   const required = [
     'kind', 'modelRequestId', 'conversationId', 'attemptSeq', 'socketGeneration', 'providerId', 'modelId',
-    'authoritySnapshot', 'recipe', 'context', 'requestCreatedAt'
+    'authoritySnapshot', 'recipe', 'context', 'attachmentCatalog', 'requestCreatedAt'
   ];
   const expected = Object.prototype.hasOwnProperty.call(request, 'settingsSnapshot')
     ? [...required, 'settingsSnapshot']

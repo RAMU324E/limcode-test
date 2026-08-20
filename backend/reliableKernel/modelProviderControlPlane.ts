@@ -3,9 +3,13 @@ import { performance } from 'node:perf_hooks';
 import type { AttachmentCatalogEntry } from '../../shared/protocol';
 import {
   collectAttachmentCatalogFromStoredItems,
-  mergeAttachmentCatalog
+  mergeAttachmentCatalog,
+  normalizeAttachmentCatalog
 } from './attachmentCatalog';
-import { AttachmentCatalogProjection } from './attachmentCatalogProjection';
+import {
+  AttachmentCatalogProjection,
+  type AttachmentCatalogProjectionSegment
+} from './attachmentCatalogProjection';
 import {
   ContentAddressedStore,
   type ContentObjectIdentity,
@@ -346,6 +350,13 @@ export class ModelProviderControlPlane {
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
+  public projectAttachmentCatalog(
+    segments: readonly AttachmentCatalogProjectionSegment[],
+    additionalMessageRevisionIds: readonly string[] = []
+  ): Promise<AttachmentCatalogEntry[]> {
+    return this.attachmentCatalog.project(segments, additionalMessageRevisionIds);
+  }
+
   public async createModelRequest(command: CreateModelRequestCommand): Promise<ModelRequestCreationResult> {
     const turnId = requireId(command.turnId, 'turnId');
     const contextRootId = requireId(command.contextRootId, 'contextRootId');
@@ -559,14 +570,9 @@ export class ModelProviderControlPlane {
       recipe,
       requireId(request.turn_id, 'ModelRequest.turn_id')
     );
-    const attachmentCatalog = await this.attachmentCatalog.project(
-      providerSegments.map((segment) => ({
-        segmentId: segment.segmentId,
-        segmentKind: segment.segmentKind
-      })),
-      requestAddenda.requestAddenda?.currentTurnInput
-        ? [requestAddenda.requestAddenda.currentTurnInput.messageRevisionId]
-        : []
+    const attachmentCatalog = normalizeAttachmentCatalog(
+      isRecord(recipe) ? recipe.attachmentCatalog : undefined,
+      'ModelRequest recipe.attachmentCatalog'
     );
     const providerContext = providerSegments.map((segment) => ({
       segmentId: segment.segmentId,
@@ -627,14 +633,9 @@ export class ModelProviderControlPlane {
     }
     const model = frozenModelIdentity(frozen.document);
     const requestAddenda = await this.materializeRequestAddenda(recipe, turnId);
-    const attachmentCatalog = await this.attachmentCatalog.project(
-      materialized.segments.map((segment) => ({
-        segmentId: segment.segmentId,
-        segmentKind: segment.segmentKind
-      })),
-      requestAddenda.requestAddenda?.currentTurnInput
-        ? [requestAddenda.requestAddenda.currentTurnInput.messageRevisionId]
-        : []
+    const attachmentCatalog = normalizeAttachmentCatalog(
+      isRecord(recipe) ? recipe.attachmentCatalog : undefined,
+      'ModelRequest preview recipe.attachmentCatalog'
     );
     const providerContext = materialized.segments.map((segment) => ({
       segmentId: segment.segmentId,

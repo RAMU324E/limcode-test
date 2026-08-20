@@ -691,8 +691,13 @@ export class ReliableAgentLoop {
       input.turnId
     );
     const materialized = await this.context.materialize(input.headRootId);
+    const attachmentCatalog = await this.modelProvider.projectAttachmentCatalog(
+      materialized.segments.map((segment) => ({ segmentId: segment.segmentId })),
+      currentTurnInput ? [currentTurnInput.messageRevisionId] : []
+    );
     const handleSources: unknown[] = [
       ...materialized.segments.map((segment) => Buffer.from(segment.content).toString('utf8')),
+      attachmentCatalog,
       ...(runtimeStatusCard ? [runtimeStatusCard] : []),
       input.tools
     ];
@@ -709,6 +714,7 @@ export class ReliableAgentLoop {
       projectionRevision: '2026-08-19',
       round: input.round,
       tools: input.tools,
+      ...(attachmentCatalog.length > 0 ? { attachmentCatalog } : {}),
       ...(modelHandleCatalog.entries.length > 0 ? { modelHandleCatalog } : {}),
       ...(currentTurnInput ? { currentTurnInput } : {}),
       ...(turnTaskCard ? { turnTaskCard } : {}),

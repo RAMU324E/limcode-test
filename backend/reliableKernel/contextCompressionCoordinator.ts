@@ -239,6 +239,11 @@ export class ReliableContextCompressionCoordinator {
       };
     }
     const sourceSegments = materialized.records.slice(0, sourceSegmentCount);
+    const sourceAttachmentCatalog = await this.attachmentCatalog.project(
+      semanticMaterialized.segments.slice(0, sourceSegmentCount).map((segment) => ({
+        segmentId: segment.segmentId
+      }))
+    );
     const sourceHash = hashSource(sourceSegments);
     const idempotencyKey = [
       'context-compression', trigger, headRootId, policy.config.id, String(sourceSegmentCount), sourceHash
@@ -263,6 +268,7 @@ export class ReliableContextCompressionCoordinator {
         blockId: compressionBlockIdFor(frozen.conversationId, headRootId, expectedModelRequestId),
         compressionConfigId: policy.config.id,
         compressionMethodKind: policy.methodKind,
+        ...(sourceAttachmentCatalog.length > 0 ? { attachmentCatalog: sourceAttachmentCatalog } : {}),
         ...(effectiveSummaryMaxTokens === undefined ? {} : { effectiveSummaryMaxTokens })
       }, 'Reliable compression recipe'),
       idempotencyKey
@@ -293,13 +299,11 @@ export class ReliableContextCompressionCoordinator {
     const tailSegments = semanticMaterialized.segments.slice(sourceSegmentCount);
     const combinedAttachmentCatalog = await this.attachmentCatalog.project(
       semanticMaterialized.segments.map((segment) => ({
-        segmentId: segment.segmentId,
-        segmentKind: segment.segmentKind
+        segmentId: segment.segmentId
       }))
     );
     const tailAttachmentCatalog = await this.attachmentCatalog.project(tailSegments.map((segment) => ({
-      segmentId: segment.segmentId,
-      segmentKind: segment.segmentKind
+      segmentId: segment.segmentId
     })));
     const tailCatalogContent = renderAttachmentCatalog(tailAttachmentCatalog);
     const combinedCatalogContent = renderAttachmentCatalog(combinedAttachmentCatalog);

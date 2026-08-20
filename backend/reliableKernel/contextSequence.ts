@@ -249,7 +249,7 @@ export class ContextSequenceControlPlane {
       throw new TypeError(`appendContent cannot create ${segmentKind} segments.`);
     }
     const sources = [normalizeSource(command.source)];
-    validateSegmentSources(segmentKind, sources);
+    validateContextSegmentSources(segmentKind, sources);
     await this.preflightAppendTarget(
       conversationId, command.baseRootId, command.expectedHeadRootId, command.activate !== false
     );
@@ -1428,7 +1428,7 @@ export class ContextSequenceControlPlane {
     const conversationId = requireId(planInput.conversationId, 'conversationId');
     const sources = normalizeSources(planInput.sources);
     const segmentKind = requireSegmentKind(planInput.segmentKind);
-    validateSegmentSources(segmentKind, sources);
+    validateContextSegmentSources(segmentKind, sources);
     const activate = planInput.activate !== false;
     const head = await this.getHead(conversationId);
     const currentHeadRootId = head ? requireId(head.root_id, 'ConversationContextHeadLink.root_id') : null;
@@ -1870,7 +1870,10 @@ function headMutationSteps(
   })];
 }
 
-function validateSegmentSources(kind: ContextSegmentKind, sources: readonly ContextSourceOccurrence[]): void {
+export function validateContextSegmentSources(
+  kind: ContextSegmentKind,
+  sources: readonly ContextSourceOccurrence[]
+): void {
   if (kind === 'tool_pair') {
     if (sources.length !== 2 || sources[0].sourceKind !== 'tool_call' || sources[1].sourceKind !== 'tool_model_result') {
       throw new Error('tool_pair requires tool_call and tool_model_result source rows.');

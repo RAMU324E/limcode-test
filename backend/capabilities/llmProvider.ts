@@ -1228,27 +1228,12 @@ export async function dryRunCompactLlmProvider(
   if (methodConfig.kind === 'llm_summary' && !isSummaryProviderCallWithinWindow(calls[0]!, resolved.settings)) {
     throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
   }
-  if (methodConfig.kind === 'segmented_summary') {
-    const priorSummaryText = request.priorSummaryContents?.length
-      ? plainTextOfContents(request.priorSummaryContents)
-      : '';
-    if ((priorSummaryText || calls.length > 1) && calls.length < MAX_SEGMENTED_SUMMARY_CALLS) {
-      const merge = buildSummaryReplacementMergeCall(
-        priorSummaryText,
-        calls.map((_call, index) => `目标\n- delta ${index + 1}\n\n重要约束、决定和准确标识\n- 无\n\n工作状态\n  - 已完成\n    - delta ${index + 1}\n  - 正在做\n    - 无\n  - 受阻\n    - 无\n\n下一步\n- 无\n\n相关文件\n- 无`),
-        summaryDeltaContents(request),
-        methodConfig,
-        resolved.settings,
-        effectiveSummaryTargetTokens(methodConfig)
-      );
-      if (isSummaryProviderCallWithinWindow(merge, resolved.settings)) calls.push(merge);
-    }
-  }
+  const dryRunCalls = calls;
   const unified = await importUnifiedLlmProvider();
   const providerDryRun = (resolved.provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof providerDryRun !== 'function') throw new Error('当前 unified-llm-provider 版本不支持 provider.dryRun。');
   const results = [] as LlmCompactDryRunResult['calls'];
-  for (const [ordinal, call] of calls.entries()) {
+  for (const [ordinal, call] of dryRunCalls.entries()) {
     const result = await providerDryRun.call(resolved.provider, call.request, {
       inputFormat: 'unified',
       outputFormat: 'unified',
@@ -1266,6 +1251,9 @@ export async function dryRunCompactLlmProvider(
     kind: 'provider_requests',
     methodKind: methodConfig.kind,
     calls: results,
+    ...(methodConfig.kind === 'segmented_summary' ? {
+      note: '仅展示可预先确定的 leaf summary requests；后续 hierarchy merge requests 依赖前序 Provider 摘要，运行时动态构造。'
+    } : {}),
     generatedAt
   };
 }
@@ -1416,7 +1404,11 @@ export async function compactLlmProvider(
       : request;
 
     const retrySettings = await resolveCompactRetrySettings(request, methodConfig, options);
-    const retryEnabled = retrySettings?.retryOnError !== false && isRetryCapableCompressionMethod(methodConfig.kind);
+    // segmented_summary is a bounded multi-call operation. Retrying the whole handler would replay
+    // already-paid leaf calls, so recovery must happen at the durable ModelRequest boundary instead.
+    const retryEnabled = retrySettings?.retryOnError !== false
+      && isRetryCapableCompressionMethod(methodConfig.kind)
+      && methodConfig.kind !== 'segmented_summary';
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
     let retryCount = 0;
     let sawRetry = false;
@@ -1587,6 +1579,8 @@ function isRetryableCompactFailure(error: unknown, failure: LlmAttemptFailure): 
     || text.includes('缺少 llm api key')
     || text.includes('openai 原生压缩仅支持')
     || text.includes('media_size_unknown')
+    || text.includes('compression_request_too_large')
+    || text.includes('compression_source_too_large')
   );
 }
 
@@ -1789,39 +1783,18 @@ async function compactWithSegmentedSummary(
       (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
       signal
     );
-    const directCandidate = deltaSummaries.length === 1
-      ? extractSummaryTag(deltaSummaries[0] ?? '')
-      : '';
-    const requiresMerge = !!priorSummaryText
-      || deltaSummaries.length !== 1
-      || !isStructuredSummaryText(directCandidate)
-      || estimateTokenCount(directCandidate) > targetTokens;
-
-    if (!requiresMerge) {
-      finalSummary = finalizeStructuredSummary(directCandidate, deterministic, targetTokens);
-    } else if (calls.length < MAX_SEGMENTED_SUMMARY_CALLS) {
-      const mergeCall = buildSummaryReplacementMergeCall(
-        priorSummaryText,
-        deltaSummaries,
-        sourceContents,
-        methodConfig,
-        provider.settings,
-        targetTokens
-      );
-      if (isSummaryProviderCallWithinWindow(mergeCall, provider.settings)) {
-        try {
-          const merged = extractSummaryTag((await executeSummaryProviderCall(provider, mergeCall.request, signal)).trim());
-          finalSummary = finalizeStructuredSummary(merged, deterministic, targetTokens);
-        } catch (error) {
-          if (isRequestAbort(signal)) throw error;
-          if (!isContextLengthExceededError(error)) throw error;
-          logCompressionDebug('provider.compact.segmentedSummary.mergeFallback', {
-            error: errorDebugInfo(error),
-            deltaCount: deltaSummaries.length
-          });
-        }
-      }
-    }
+    const merged = await mergeSegmentedSummaryHierarchy(
+      provider,
+      calls.map((call, index) => ({
+        summary: deltaSummaries[index] ?? '',
+        sourceContents: call.sourceContents
+      })),
+      priorSummaryText,
+      methodConfig,
+      targetTokens,
+      signal
+    );
+    if (merged) finalSummary = finalizeStructuredSummary(merged, deterministic, targetTokens);
   }
 
   const contents = summaryContents(finalSummary, targetTokens);
@@ -2054,6 +2027,11 @@ function buildSegmentedSummaryProviderCalls(
   );
   const pushCurrent = (): void => {
     if (current.requestContents.length === 0) return;
+    if (groups.length >= MAX_SEGMENTED_SUMMARY_LEAF_CALLS) {
+      throw new Error(
+        `compression_source_too_large: segmented summary exceeds the ${MAX_SEGMENTED_SUMMARY_LEAF_CALLS}-leaf call budget.`
+      );
+    }
     groups.push(current);
     current = { requestContents: [], sourceContents: [] };
   };
@@ -2066,13 +2044,14 @@ function buildSegmentedSummaryProviderCalls(
       continue;
     }
     pushCurrent();
-    const safeUnits = splitOrReplaceOversizedSummaryUnit(
+    const safeUnits = splitOversizedSummaryUnit(
       unit,
       groups.length,
       priorFor(groups.length),
       methodConfig,
       settings,
-      totalTargetTokens
+      totalTargetTokens,
+      MAX_SEGMENTED_SUMMARY_LEAF_CALLS - groups.length
     );
     for (const safeUnit of safeUnits) {
       const next = [...current.requestContents, ...safeUnit.requestContents];
@@ -2087,9 +2066,10 @@ function buildSegmentedSummaryProviderCalls(
     }
   }
   pushCurrent();
-  if (groups.length > MAX_SEGMENTED_DELTA_CALLS) {
-    const overflow = groups.splice(MAX_SEGMENTED_DELTA_CALLS - 1);
-    groups.push(hierarchicalOverflowChunk(overflow));
+  if (groups.length > MAX_SEGMENTED_SUMMARY_LEAF_CALLS) {
+    throw new Error(
+      `compression_source_too_large: segmented summary requires ${groups.length} leaf calls; limit is ${MAX_SEGMENTED_SUMMARY_LEAF_CALLS}.`
+    );
   }
 
   const targetTokensPerCall = Math.max(128, Math.ceil(totalTargetTokens / groups.length));
@@ -2111,14 +2091,18 @@ function buildSegmentedSummaryProviderCalls(
   });
 }
 
-function splitOrReplaceOversizedSummaryUnit(
+function splitOversizedSummaryUnit(
   unit: SegmentedSummaryUnit,
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
   settings: LlmProviderConfigRecord,
-  targetTokens: number
+  targetTokens: number,
+  maxChunks: number
 ): SegmentedSummaryChunk[] {
+  if (maxChunks <= 0) {
+    throw new Error('compression_source_too_large: segmented summary exhausted the leaf call budget.');
+  }
   const direct = buildSegmentDeltaCall(
     unit.requestContents,
     index,
@@ -2144,6 +2128,9 @@ function splitOrReplaceOversizedSummaryUnit(
     );
     let remaining = textPart.text;
     while (remaining.length > 0) {
+      if (chunks.length >= maxChunks) {
+        throw new Error('compression_source_too_large: oversized message exceeds the leaf call budget.');
+      }
       const fitting = largestFittingSummaryTextPrefix(
         remaining,
         message.role,
@@ -2161,41 +2148,36 @@ function splitOrReplaceOversizedSummaryUnit(
     if (remaining.length === 0 && chunks.length > 0) return chunks;
   }
 
-  const sourceJson = JSON.stringify(unit.sourceContents);
-  const digest = createHash('sha256').update(sourceJson).digest('hex');
-  const fallback: MessageContent = {
-    role: 'user',
-    parts: [{ text: [
-      '[LimCode hierarchical compression fallback]',
-      `type=${unit.kind}`,
-      `sha256=${digest}`,
-      `originalTokens=${unit.estimatedTokens}`,
-      `messageCount=${unit.sourceContents.length}`,
-      `functionCallCount=${unit.functionCallCount}`,
-      `functionResponseCount=${unit.functionResponseCount}`,
-      'The original immutable Context lineage is preserved; this bounded descriptor replaces only this summary-provider input unit.'
-    ].join('\n') }]
-  };
-  return [{ requestContents: [fallback], sourceContents: unit.sourceContents }];
-}
-
-function hierarchicalOverflowChunk(chunks: readonly SegmentedSummaryChunk[]): SegmentedSummaryChunk {
-  const sourceContents = chunks.flatMap((chunk) => chunk.sourceContents);
-  const sourceJson = JSON.stringify(sourceContents);
-  const digest = createHash('sha256').update(sourceJson).digest('hex');
-  const fallback: MessageContent = {
-    role: 'user',
-    parts: [{ text: [
-      '[LimCode hierarchical compression fallback]',
-      'type=chunk_overflow',
-      `sha256=${digest}`,
-      `originalTokens=${estimateTokenCount(renderContentsForSummary(sourceContents))}`,
-      `messageCount=${sourceContents.length}`,
-      `collapsedChunkCount=${chunks.length}`,
-      'The original immutable Context lineage is preserved; this bounded descriptor replaces only overflow summary-provider chunks.'
-    ].join('\n') }]
-  };
-  return { requestContents: [fallback], sourceContents };
+  const transcript = renderContentsForSummary(unit.requestContents);
+  const chunks: SegmentedSummaryChunk[] = [];
+  const conservativePrior = sliceByTokens(
+    'previous-context '.repeat(SEGMENTED_PRIOR_CONTEXT_TOKENS * 2),
+    0,
+    SEGMENTED_PRIOR_CONTEXT_TOKENS
+  );
+  let remaining = transcript;
+  while (remaining.length > 0) {
+    if (chunks.length >= maxChunks) {
+      throw new Error(`compression_source_too_large: oversized ${unit.kind} exceeds the leaf call budget.`);
+    }
+    const fitting = largestFittingSummaryTextPrefix(
+      remaining,
+      'user',
+      index + chunks.length,
+      conservativePrior,
+      methodConfig,
+      settings,
+      targetTokens
+    );
+    if (!fitting) break;
+    const chunk: MessageContent = { role: 'user', parts: [{ text: fitting }] };
+    chunks.push({ requestContents: [chunk], sourceContents: [chunk] });
+    remaining = remaining.slice(fitting.length);
+  }
+  if (remaining.length === 0 && chunks.length > 0) return chunks;
+  throw new Error(
+    `compression_request_too_large: ${unit.kind} summary unit cannot be losslessly split for the frozen Provider window.`
+  );
 }
 
 function largestFittingSummaryTextPrefix(
@@ -2296,13 +2278,104 @@ function buildSummaryReplacementMergeCall(
   };
 }
 
+interface SegmentedSummaryNode {
+  summary: string;
+  sourceContents: MessageContent[];
+}
+
+async function mergeSegmentedSummaryHierarchy(
+  provider: ResolvedSummaryProvider,
+  initialNodes: readonly SegmentedSummaryNode[],
+  priorSummaryText: string,
+  methodConfig: LlmCompressionConfigRecord,
+  targetTokens: number,
+  signal?: AbortSignal
+): Promise<string> {
+  let nodes = [...initialNodes];
+  for (let level = 0; nodes.length > 1; level += 1) {
+    if (level >= MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS) {
+      throw new Error('compression_source_too_large: segmented summary exceeded the hierarchy depth limit.');
+    }
+    const groups = packSegmentedSummaryNodes(nodes, methodConfig, provider.settings, targetTokens);
+    if (groups.length >= nodes.length) {
+      throw new Error('compression_request_too_large: summary deltas cannot be merged inside the frozen Provider window.');
+    }
+    nodes = await mapWithBoundedConcurrency(
+      groups,
+      isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
+      async (group, _index, siblingSignal) => {
+        if (group.length === 1) return group[0]!;
+        const call = buildSummaryReplacementMergeCall(
+          '',
+          group.map((node) => node.summary),
+          group.flatMap((node) => node.sourceContents),
+          methodConfig,
+          provider.settings,
+          targetTokens
+        );
+        return {
+          summary: await summarizeSingleRound(provider, call, siblingSignal),
+          sourceContents: call.sourceContents
+        };
+      },
+      signal
+    );
+  }
+  if (nodes.length === 0) return '';
+  if (!priorSummaryText) return nodes[0]!.summary;
+  const call = buildSummaryReplacementMergeCall(
+    priorSummaryText,
+    [nodes[0]!.summary],
+    nodes[0]!.sourceContents,
+    methodConfig,
+    provider.settings,
+    targetTokens
+  );
+  if (!isSummaryProviderCallWithinWindow(call, provider.settings)) {
+    throw new Error('compression_request_too_large: prior summary and segmented delta cannot fit a merge request.');
+  }
+  return summarizeSingleRound(provider, call, signal);
+}
+
+function packSegmentedSummaryNodes(
+  nodes: readonly SegmentedSummaryNode[],
+  methodConfig: LlmCompressionConfigRecord,
+  settings: LlmProviderConfigRecord,
+  targetTokens: number
+): SegmentedSummaryNode[][] {
+  const groups: SegmentedSummaryNode[][] = [];
+  let current: SegmentedSummaryNode[] = [];
+  for (const node of nodes) {
+    const candidate = [...current, node];
+    const fits = current.length === 0 || isSummaryProviderCallWithinWindow(
+      buildSummaryReplacementMergeCall(
+        '',
+        candidate.map((entry) => entry.summary),
+        [],
+        methodConfig,
+        settings,
+        targetTokens
+      ),
+      settings
+    );
+    if (fits) {
+      current = candidate;
+      continue;
+    }
+    groups.push(current);
+    current = [node];
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
 function withSummaryTargetInstruction(prompt: string, targetTokens: number | undefined): string {
   if (typeof targetTokens !== 'number' || !Number.isFinite(targetTokens) || targetTokens <= 0) return prompt;
   return `${prompt}\n\n将可见摘要正文控制在约 ${Math.floor(targetTokens)} tokens；优先保留标识符、数字、文件名、依赖关系、决定和未完成事项。`;
 }
 
-const MAX_SEGMENTED_SUMMARY_CALLS = 16;
-const MAX_SEGMENTED_DELTA_CALLS = MAX_SEGMENTED_SUMMARY_CALLS - 1;
+const MAX_SEGMENTED_SUMMARY_LEAF_CALLS = 32;
+const MAX_SEGMENTED_SUMMARY_HIERARCHY_LEVELS = 6;
 const SEGMENTED_SUMMARY_CONCURRENCY = 3;
 const SEGMENTED_PRIOR_CONTEXT_TOKENS = 1_024;
 const SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS = 2_048;
@@ -2367,7 +2440,12 @@ async function summarizeSingleRound(
   if (!resolved.provider) return fallback;
 
   try {
-    const trimmed = (await executeSummaryProviderCall(resolved, call.request, signal)).trim();
+    const trimmed = (await executeSummaryProviderCall(
+      resolved,
+      call.request,
+      signal,
+      { allowCompatibilityRetry: false }
+    )).trim();
     return finalizeStructuredSummary(extractSummaryTag(trimmed), fallback, call.targetTokens);
   } catch (error) {
     if (isRequestAbort(signal)) throw error;
@@ -2385,7 +2463,8 @@ async function summarizeSingleRound(
 async function executeSummaryProviderCall(
   resolved: ResolvedSummaryProvider,
   request: SummaryProviderCall['request'],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options: { allowCompatibilityRetry?: boolean } = {}
 ): Promise<string> {
   if (!resolved.provider) return '';
   const execute = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
@@ -2428,6 +2507,7 @@ async function executeSummaryProviderCall(
   try {
     return await execute(initialRequest);
   } catch (error) {
+    if (options.allowCompatibilityRetry === false) throw error;
     if (hasMaxOutputTokens(initialRequest) && isUnsupportedMaxOutputTokensError(error)) {
       resolved.omitUnsupportedMaxOutputTokens = true;
       logCompressionDebug('provider.compact.summary.compatibilityRetry', {
@@ -2722,9 +2802,17 @@ function isStructuredSummaryText(text: string): boolean {
 }
 
 function finalizeStructuredSummary(candidate: string, fallback: string, targetTokens: number): string {
+  const fallbackSummary = parseStructuredSummary(fallback)
+    ?? structuredSummaryFromLooseText(fallback, 'active');
   const parsed = parseStructuredSummary(candidate);
-  if (!parsed) return fitTextToTokenLimit(fallback, targetTokens);
-  return fitStructuredSummary(parsed, targetTokens);
+  if (!parsed || structuredSummaryFactCount(parsed) === 0) {
+    return fitStructuredSummary(fallbackSummary, targetTokens);
+  }
+  return fitStructuredSummary(mergeStructuredSummaries(fallbackSummary, parsed), targetTokens);
+}
+
+function structuredSummaryFactCount(summary: StructuredSummary): number {
+  return Object.values(summary).reduce((count, facts) => count + facts.length, 0);
 }
 
 function mergeStructuredSummaries(prior: StructuredSummary, delta: StructuredSummary): StructuredSummary {
@@ -2735,6 +2823,8 @@ function mergeStructuredSummaries(prior: StructuredSummary, delta: StructuredSum
   return merged;
 }
 
+const MAX_STRUCTURED_SUMMARY_FACTS_PER_FIELD = 80;
+
 function replacementMergeFacts(prior: readonly string[], delta: readonly string[]): string[] {
   const facts = new Map<string, string>();
   for (const fact of [...prior, ...delta]) {
@@ -2744,7 +2834,12 @@ function replacementMergeFacts(prior: readonly string[], delta: readonly string[
     facts.delete(key);
     facts.set(key, normalized);
   }
-  return [...facts.values()].slice(-80);
+  const values = [...facts.values()];
+  if (values.length <= MAX_STRUCTURED_SUMMARY_FACTS_PER_FIELD) return values;
+  return [
+    values[0]!,
+    ...values.slice(-(MAX_STRUCTURED_SUMMARY_FACTS_PER_FIELD - 1))
+  ];
 }
 
 function summaryReplacementKey(fact: string): string {
@@ -2837,8 +2932,8 @@ function fitStructuredSummary(input: StructuredSummary, targetTokens: number): s
   while (estimateTokenCount(rendered) > targetTokens && changed) {
     changed = false;
     for (const field of dropOrder) {
-      if (summary[field].length <= 1) continue;
-      summary[field].shift();
+      if (summary[field].length <= 2) continue;
+      summary[field].splice(1, 1);
       changed = true;
       rendered = formatStructuredSummary(summary);
       if (estimateTokenCount(rendered) <= targetTokens) return rendered;

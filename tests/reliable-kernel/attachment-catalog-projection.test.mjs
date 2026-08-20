@@ -19,7 +19,7 @@ async function withRuntime(label, body) {
       JSON.stringify({ role: 'user', parts: [{ text: 'fixture' }] }),
       'application/vnd.limcode.message+json'
     );
-    await body(database, fixtureContent);
+    await body(database, fixtureContent, store);
   } finally {
     if (database) await database.close().catch(() => undefined);
     await fs.rm(parent, { recursive: true, force: true });
@@ -27,11 +27,15 @@ async function withRuntime(label, body) {
 }
 
 test('20 rounds and nested compression rebuild one request-local attachment catalog without durable copies', async () => {
-  await withRuntime('attachment-catalog-lineage', async (database, fixtureContent) => {
+  await withRuntime('attachment-catalog-lineage', async (database, fixtureContent, store) => {
     const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
     const steps = [
       repository('Conversation').insert({
         id: 'conversation-main', title: 'main', status: 'active', created_at: NOW, updated_at: NOW
+      }),
+      repository('Turn').insert({
+        id: 'turn-main', conversation_id: 'conversation-main', status: 'active',
+        created_at: NOW, updated_at: NOW, terminal_at: null
       }),
       repository('Attachment').insert({
         id: 'attachment-only-source',
@@ -50,7 +54,7 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
       const messageId = `message-${index}`;
       const revisionId = `revision-${index}`;
       const segmentId = `segment-${index}`;
-      segments.push({ segmentId, segmentKind: 'message' });
+      segments.push({ segmentId });
       steps.push(
         repository('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
         repository('MessageRevision').insert({
@@ -119,6 +123,12 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
     );
     await database.transaction(steps);
 
+    const originalSnapshot = database.snapshot.bind(database);
+    let projectionSnapshotCalls = 0;
+    database.snapshot = async (...args) => {
+      projectionSnapshotCalls += 1;
+      return originalSnapshot(...args);
+    };
     const projection = new kernel.AttachmentCatalogProjection(database);
     const expected = [{
       attachmentId: 'attachment-only-source',
@@ -129,18 +139,152 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
     for (let round = 0; round < 20; round += 1) {
       assert.deepEqual(await projection.project(segments), expected);
     }
-    assert.deepEqual(await projection.project([{
-      segmentId: 'segment-compression-main', segmentKind: 'compression'
-    }]), expected);
+    const relationCatalog = await projection.project([{ segmentId: 'segment-compression-main' }]);
+    assert.deepEqual(relationCatalog, expected);
+    const handles = kernel.buildModelHandleCatalog([relationCatalog]);
+    assert.deepEqual(handles.entries, [{
+      kind: 'attachment',
+      ref: 'F1',
+      target: 'attachment-only-source',
+      name: 'source.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 45678
+    }]);
+    assert.deepEqual(
+      kernel.resolveModelToolArguments('read', { attachmentRef: 'F1' }, handles),
+      { attachmentId: 'attachment-only-source' }
+    );
+    const loop = Object.create(kernel.ReliableAgentLoop.prototype);
+    loop.database = database;
+    loop.contentStore = store;
+    loop.context = {
+      materialize: async () => ({
+        segments: [{ segmentId: 'segment-compression-main', content: Buffer.from('{"kind":"fixture"}') }]
+      })
+    };
+    loop.modelProvider = { projectAttachmentCatalog: async () => relationCatalog };
+    loop.readCurrentTurnInputReference = async () => undefined;
+    loop.readRuntimeStatusCard = async () => undefined;
+    const frozenRecipe = await loop.freezeOrdinaryRequestRecipe({
+      turnId: 'turn-main',
+      round: '1',
+      headRootId: 'root-main',
+      tools: [],
+      includeOpenTaskCompletionCheck: false
+    });
+    assert.deepEqual(frozenRecipe.attachmentCatalog, expected);
+    assert.deepEqual(frozenRecipe.modelHandleCatalog.entries, handles.entries);
+    assert.ok(
+      projectionSnapshotCalls <= 100,
+      `cached 20-round + nested projection should use batched reads, observed ${projectionSnapshotCalls}`
+    );
+    database.snapshot = originalSnapshot;
+
+    const [concurrentCatalog, concurrentEmpty] = await Promise.all([
+      projection.project([{ segmentId: 'segment-compression-main' }]),
+      projection.project([{ segmentId: 'segment-1' }])
+    ]);
+    assert.deepEqual(concurrentCatalog, expected);
+    assert.deepEqual(concurrentEmpty, []);
+
+    assert.deepEqual(await projection.project([{ segmentId: 'segment-1' }]), []);
+    await database.transaction([
+      repository('Attachment').insert({
+        id: 'attachment-late-link',
+        sha256: 'b'.repeat(64),
+        byte_length: 12n,
+        mime_type: 'text/plain',
+        name: 'late.txt',
+        storage_mode: 'managed',
+        content_object_id: null,
+        created_at: NOW
+      }),
+      repository('AttachmentLink').insert({
+        id: 'attachment-link-late',
+        message_revision_id: 'revision-1',
+        attachment_id: 'attachment-late-link',
+        position: 0n,
+        created_at: NOW
+      })
+    ]);
+    assert.deepEqual(await projection.project([{ segmentId: 'segment-1' }]), [{
+      attachmentId: 'attachment-late-link',
+      name: 'late.txt',
+      mimeType: 'text/plain',
+      sizeBytes: 12
+    }]);
 
     const [attachments, links, compressionSources] = await Promise.all([
       database.snapshotAll(repository('Attachment').list({ orderBy: { column: 'id', direction: 'asc' }, limit: 100 })),
       database.snapshotAll(repository('AttachmentLink').list({ orderBy: { column: 'id', direction: 'asc' }, limit: 100 })),
       database.snapshotAll(repository('CompressionBlockSource').list({ orderBy: { column: 'id', direction: 'asc' }, limit: 100 }))
     ]);
-    assert.equal(attachments.snapshot.length, 1);
-    assert.equal(links.snapshot.length, 1);
+    assert.equal(attachments.snapshot.length, 2);
+    assert.equal(links.snapshot.length, 2);
     assert.equal(compressionSources.snapshot.length, 20);
+  });
+});
+
+test('message segment content mismatch fails closed before relation attachments are projected', async () => {
+  await withRuntime('attachment-catalog-content-mismatch', async (database, fixtureContent, store) => {
+    const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
+    const otherContent = await store.ingest(
+      database,
+      JSON.stringify({ role: 'user', parts: [{ text: 'different durable content' }] }),
+      'application/vnd.limcode.message+json'
+    );
+    await database.transaction([
+      repository('Message').insert({
+        id: 'message-content-mismatch', created_at: NOW, updated_at: NOW, deleted_at: null
+      }),
+      repository('MessageRevision').insert({
+        id: 'revision-content-mismatch', message_id: 'message-content-mismatch', revision_seq: 0n,
+        role: 'user', content_object_id: fixtureContent.id, created_at: NOW
+      }),
+      repository('ContextSegment').insert({
+        id: 'segment-content-mismatch', content_object_id: otherContent.id,
+        segment_kind: 'message', created_at: NOW
+      }),
+      repository('ContextSegmentSource').insert({
+        id: 'source-content-mismatch', segment_id: 'segment-content-mismatch',
+        source_kind: 'message_revision', source_id: 'revision-content-mismatch',
+        source_revision: 0n, created_at: NOW
+      })
+    ]);
+    const projection = new kernel.AttachmentCatalogProjection(database);
+    await assert.rejects(
+      projection.project([{ segmentId: 'segment-content-mismatch' }]),
+      /content does not match MessageRevision/
+    );
+  });
+});
+
+test('message source revision mismatch fails closed', async () => {
+  await withRuntime('attachment-catalog-revision-mismatch', async (database, fixtureContent) => {
+    const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
+    await database.transaction([
+      repository('Message').insert({
+        id: 'message-mismatch', created_at: NOW, updated_at: NOW, deleted_at: null
+      }),
+      repository('MessageRevision').insert({
+        id: 'revision-mismatch', message_id: 'message-mismatch', revision_seq: 1n,
+        role: 'user', content_object_id: fixtureContent.id, created_at: NOW
+      }),
+      repository('ContextSegment').insert({
+        id: 'segment-mismatch', content_object_id: fixtureContent.id,
+        segment_kind: 'message', created_at: NOW
+      }),
+      repository('ContextSegmentSource').insert({
+        id: 'source-mismatch', segment_id: 'segment-mismatch',
+        source_kind: 'message_revision', source_id: 'revision-mismatch',
+        source_revision: 0n, created_at: NOW
+      })
+    ]);
+    const projection = new kernel.AttachmentCatalogProjection(database);
+    await assert.rejects(
+      projection.project([{ segmentId: 'segment-mismatch' }]),
+      /source_revision does not match revision_seq/
+    );
   });
 });
 
@@ -187,7 +331,7 @@ test('compression lineage cycles fail closed without damaging the original expan
 
     const projection = new kernel.AttachmentCatalogProjection(database);
     await assert.rejects(
-      projection.project([{ segmentId: 'cycle-segment-a', segmentKind: 'compression' }]),
+      projection.project([{ segmentId: 'cycle-segment-a' }]),
       /Compression lineage cycle detected/
     );
     const sources = await database.snapshotAll(repository('CompressionBlockSource').list({
