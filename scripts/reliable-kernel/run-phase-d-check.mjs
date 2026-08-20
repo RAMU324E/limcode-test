@@ -1178,7 +1178,11 @@ async function checkFileProposalResultSeparated() {
 
     const outsideWriteRoot = path.join(ctx.parent, 'outside-write-parent');
     await fs.mkdir(outsideWriteRoot);
-    await fs.symlink(outsideWriteRoot, path.join(workspace, 'linked-parent'), 'dir');
+    await fs.symlink(
+      outsideWriteRoot,
+      path.join(workspace, 'linked-parent'),
+      process.platform === 'win32' ? 'junction' : 'dir'
+    );
     await assert.rejects(planner.plan(
       phaseDRuntimeDefinition('write'),
       {
@@ -1411,14 +1415,19 @@ async function checkFileProposalResultSeparated() {
     assert.equal(unapplied.status, 'failed');
     assert.equal(await fs.readFile(unappliedPath, 'utf8'), 'still-base');
 
+    const unknownPath = path.join(workspace, 'unreadable-target.txt');
+    const unknownBase = 'unreadable-base';
+    await fs.writeFile(unknownPath, unknownBase);
     const unknownTool = await createTool(ctx, effects, 'file-unknown', 'write');
     const unknownProposal = await files.propose({
       source: source('internal', 'file-unknown:proposal'),
       toolCallId: unknownTool.toolCallId,
       members: [{
-        operation: 'create_file',
+        operation: 'replace_file',
         workEnvironmentId: 'workspace',
-        targetPath: 'x'.repeat(5000),
+        targetPath: 'unreadable-target.txt',
+        baseDigest: sha256(unknownBase),
+        baseContent: unknownBase,
         targetContent: 'unreadable-target'
       }]
     });
@@ -1428,13 +1437,29 @@ async function checkFileProposalResultSeparated() {
       decision: 'approved'
     });
     await effects.claimEffectDispatch(unknownApproved.preparedEffect.effectIntentId);
-    const unknown = await files.recoverDispatchedEffect({
-      source: source('recovery', 'file-unknown:recover'),
-      effectIntentId: unknownApproved.preparedEffect.effectIntentId,
-      resolver: boundary
-    });
+    const fsPromisesForUnknown = require('node:fs/promises');
+    const originalReadFile = fsPromisesForUnknown.readFile;
+    fsPromisesForUnknown.readFile = async (target, ...args) => {
+      if (path.basename(String(target)).toLowerCase() === 'unreadable-target.txt') {
+        const error = new Error('injected-actual-read-unavailable');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return originalReadFile(target, ...args);
+    };
+    let unknown;
+    try {
+      unknown = await files.recoverDispatchedEffect({
+        source: source('recovery', 'file-unknown:recover'),
+        effectIntentId: unknownApproved.preparedEffect.effectIntentId,
+        resolver: boundary
+      });
+    } finally {
+      fsPromisesForUnknown.readFile = originalReadFile;
+    }
     assert.equal(unknown.status, 'outcome_unknown');
-    assertions.push('base/target/actual四分支真实覆盖：target成功、base未应用失败、二者皆非冲突、无法读取为outcome_unknown');
+    assert.equal(await fs.readFile(unknownPath, 'utf8'), unknownBase);
+    assertions.push('base/target/actual四分支真实覆盖：target成功、base未应用失败、二者皆非冲突、实际文件读取不可判定为outcome_unknown');
 
     const treePath = path.join(workspace, 'partial-tree');
     await fs.mkdir(path.join(treePath, 'removed'), { recursive: true });
@@ -1455,10 +1480,10 @@ async function checkFileProposalResultSeparated() {
       changeSetId: treeProposal.changeSetId,
       decision: 'approved'
     });
-    const fsPromises = require('node:fs/promises');
-    const originalRm = fsPromises.rm;
-    fsPromises.rm = async (target, options) => {
-      if (path.resolve(target) !== path.resolve(treePath)) return originalRm(target, options);
+    const fsPromisesForTree = require('node:fs/promises');
+    const originalRm = fsPromisesForTree.rm;
+    fsPromisesForTree.rm = async (target, options) => {
+      if (path.basename(String(target)).toLowerCase() !== 'partial-tree') return originalRm(target, options);
       await originalRm(path.join(target, 'removed'), options);
       throw new Error('injected-recursive-delete-after-partial-change');
     };
@@ -1466,7 +1491,7 @@ async function checkFileProposalResultSeparated() {
     try {
       treeResult = await dispatcher.dispatchRecordAndReconcile(treeApproved.preparedEffect.effectIntentId);
     } finally {
-      fsPromises.rm = originalRm;
+      fsPromisesForTree.rm = originalRm;
     }
     assert.equal(treeResult.observation.outcome, 'outcome_unknown');
     assert.equal(treeResult.terminal.status, 'outcome_unknown');
@@ -2011,7 +2036,10 @@ async function checkProcessWrapperRecovery() {
       ctx.database, ctx.store, effects, ctx.authority, ctx.binding
     );
     const tool = await createTool(ctx, effects, 'process-restart', 'bash');
-    const command = `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>{process.stdout.write('restart-output\\n'+'\\0'.repeat(8000))},3000)")}`;
+    const recoveryReleasePath = path.join(parent, 'process-restart.release');
+    const recoveryReleaseBase64 = Buffer.from(recoveryReleasePath, 'utf8').toString('base64');
+    const recoveryCode = `const fs=require('node:fs');const release=Buffer.from('${recoveryReleaseBase64}','base64').toString('utf8');const timer=setInterval(()=>{if(!fs.existsSync(release))return;clearInterval(timer);process.stdout.write('restart-output\\n'+'\\0'.repeat(8000));},10)`;
+    const command = nodeEvalCommand(recoveryCode);
     const prepared = await processes.prepareStart({
       source: source('internal', 'process-restart:prepare'),
       toolCallId: tool.toolCallId,
@@ -2043,6 +2071,7 @@ async function checkProcessWrapperRecovery() {
       assert.equal((await get(recoveryApp.database, 'Process', processId)).status, 'running');
       assert.equal((await list(recoveryApp.database, 'ProcessReceipt', { process_id: processId })).length, 0);
       assert.deepEqual(recoveryApp.processes.inspectExitObservers().activeProcessIds, [processId]);
+      await fs.writeFile(recoveryReleasePath, 'release');
 
       const exitedRow = await waitForPersistedProcessStatus(
         recoveryApp.database,
@@ -2135,7 +2164,7 @@ async function checkProcessWrapperRecovery() {
       const lifecyclePrepared = await recoveryApp.processes.prepareStart({
         source: source('internal', 'process-observer-close:prepare'),
         toolCallId: lifecycleTool.toolCallId,
-        command: `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>process.stdout.write('observer-close\\n'),3000)")}`,
+        command: nodeEvalCommand("setTimeout(()=>process.stdout.write('observer-close\\n'),3000)"),
         cwd: parent
       });
       await recoveryApp.processes.dispatchStart(lifecyclePrepared.effect.effectIntentId, 0);
@@ -2227,7 +2256,7 @@ async function checkProcessWrapperRecovery() {
     const idlePrepared = await processes.prepareStart({
       source: source('internal', 'process-idle-delivery:prepare'),
       toolCallId: idleTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>process.stdout.write('idle-complete\\n'),250)")}`,
+      command: nodeEvalCommand("setTimeout(()=>process.stdout.write('idle-complete\\n'),250)"),
       cwd: parent
     });
     const idleStarted = await processes.dispatchStart(idlePrepared.effect.effectIntentId, 0);
@@ -2320,7 +2349,7 @@ async function checkProcessWrapperRecovery() {
     const quickPrepared = await processes.prepareStart({
       source: source('internal', 'process-quick-failure:prepare'),
       toolCallId: quickTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote('process.exit(7)')}`,
+      command: nodeEvalCommand('process.exit(7)'),
       cwd: parent
     });
     const quick = await processes.dispatchStart(quickPrepared.effect.effectIntentId, 5_000);
@@ -2392,7 +2421,7 @@ async function checkProcessWrapperRecovery() {
     const receiptOnlyPrepared = await processes.prepareStart({
       source: source('internal', 'process-exit-receipt-only:prepare'),
       toolCallId: receiptOnlyTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote('setTimeout(()=>process.exit(9),200)')}`,
+      command: nodeEvalCommand('setTimeout(()=>process.exit(9),200)'),
       cwd: parent
     });
     await processes.dispatchStart(receiptOnlyPrepared.effect.effectIntentId, 0);
@@ -2414,7 +2443,7 @@ async function checkProcessWrapperRecovery() {
     const alreadyExitedStart = await processes.prepareStart({
       source: source('internal', 'process-stop-already-exited-target:prepare'),
       toolCallId: alreadyExitedTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote('setTimeout(()=>process.exit(0),120)')}`,
+      command: nodeEvalCommand('setTimeout(()=>process.exit(0),120)'),
       cwd: parent
     });
     await processes.dispatchStart(alreadyExitedStart.effect.effectIntentId, 0);
@@ -2445,7 +2474,7 @@ async function checkProcessWrapperRecovery() {
     const corruptPrepared = await processes.prepareStart({
       source: source('internal', 'process-corrupt:prepare'),
       toolCallId: corruptTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>process.stdout.write('done'),200)")}`,
+      command: nodeEvalCommand("setTimeout(()=>process.stdout.write('done'),200)"),
       cwd: parent
     });
     await processes.dispatchStart(corruptPrepared.effect.effectIntentId);
@@ -2467,11 +2496,11 @@ async function checkProcessWrapperRecovery() {
     assertions.push('exitCode/signal非法终止元组及身份不匹配receipt都不得伪造退出结果，明确outcome_unknown');
 
     const stopRaceTool = await createTool(ctx, effects, 'process-stop-close-race', 'bash');
-    const stopRaceCode = "const {spawn}=require('node:child_process');spawn('sleep',['1.2'],{stdio:['ignore','inherit','inherit']});setTimeout(()=>process.exit(0),250)";
+    const stopRaceCode = "const {spawn}=require('node:child_process');spawn(process.execPath,['-e','setTimeout(()=>{},1200)'],{stdio:['ignore','inherit','inherit']});setTimeout(()=>process.exit(0),250)";
     const stopRacePrepared = await processes.prepareStart({
       source: source('internal', 'process-stop-close-race:prepare'),
       toolCallId: stopRaceTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote(stopRaceCode)}`,
+      command: nodeEvalCommand(stopRaceCode),
       cwd: parent
     });
     await processes.dispatchStart(stopRacePrepared.effect.effectIntentId, 0);
@@ -2498,7 +2527,7 @@ async function checkProcessWrapperRecovery() {
     const recoverStopStart = await processes.prepareStart({
       source: source('internal', 'process-stop-recovery-target:prepare'),
       toolCallId: recoverStopStartTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote('setInterval(()=>{},1000)')}`,
+      command: nodeEvalCommand('setInterval(()=>{},1000)'),
       cwd: parent
     });
     await processes.dispatchStart(recoverStopStart.effect.effectIntentId);
@@ -2524,7 +2553,7 @@ async function checkProcessWrapperRecovery() {
     const winnerStopStart = await processes.prepareStart({
       source: source('internal', 'process-stop-winner-target:prepare'),
       toolCallId: winnerStopStartTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote('setInterval(()=>{},1000)')}`,
+      command: nodeEvalCommand('setInterval(()=>{},1000)'),
       cwd: parent
     });
     await processes.dispatchStart(winnerStopStart.effect.effectIntentId);
@@ -2559,7 +2588,7 @@ async function checkProcessWrapperRecovery() {
     const longPrepared = await processes.prepareStart({
       source: source('internal', 'process-stop-target:prepare'),
       toolCallId: longTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("setInterval(()=>process.stdout.write('tick\\n'),100)")}`,
+      command: nodeEvalCommand("setInterval(()=>process.stdout.write('tick\\n'),100)"),
       cwd: parent
     });
     await processes.dispatchStart(longPrepared.effect.effectIntentId);
@@ -2637,7 +2666,9 @@ async function checkProcessWrapperRecovery() {
     const wrapperCrashPrepared = await processes.prepareStart({
       source: source('internal', 'process-wrapper-crash:prepare'),
       toolCallId: wrapperCrashTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote('setInterval(()=>{},1000)')}`,
+      command: process.platform === 'win32'
+        ? 'while ($true) { Start-Sleep -Seconds 1 }'
+        : 'while :; do sleep 1; done',
       cwd: parent
     });
     await processes.dispatchStart(wrapperCrashPrepared.effect.effectIntentId, 0);
@@ -2650,10 +2681,30 @@ async function checkProcessWrapperRecovery() {
     const persistedUnknown = await processes.reconcileProcessExit(wrapperCrashId);
     assert.equal(persistedUnknown.state, 'outcome_unknown');
     assert.equal((await list(ctx.database, 'ProcessReceipt', { process_id: wrapperCrashId }))[0].outcome, 'outcome_unknown');
-    try {
-      process.kill(-Number(wrapperCrashRow.process_group_id), 'SIGKILL');
-    } catch (error) {
-      if (error?.code !== 'ESRCH') throw error;
+    if (process.platform === 'win32') {
+      const cleanup = childProcess.spawnSync('taskkill.exe', [
+        '/PID', String(wrapperCrashRow.child_pid), '/T', '/F'
+      ], { encoding: 'utf8', windowsHide: true });
+      if (cleanup.error) throw cleanup.error;
+      if (cleanup.status !== 0) {
+        try {
+          process.kill(Number(wrapperCrashRow.child_pid), 0);
+          throw new Error(`wrapper crash fixture cleanup failed: ${(cleanup.stderr || cleanup.stdout || '').trim()}`);
+        } catch (error) {
+          if (error?.code !== 'ESRCH' && error?.code !== 'ENOENT') throw error;
+        }
+      }
+      await waitForFingerprintGone(
+        Number(wrapperCrashRow.child_pid),
+        wrapperCrashRow.start_fingerprint,
+        3_000
+      );
+    } else {
+      try {
+        process.kill(-Number(wrapperCrashRow.process_group_id), 'SIGKILL');
+      } catch (error) {
+        if (error?.code !== 'ESRCH') throw error;
+      }
     }
     assertions.push('wrapper不可达而child仍存活时不靠裸child PID伪装running，明确并持久化outcome_unknown');
 
@@ -2747,7 +2798,7 @@ async function checkProcessWatchdog() {
     const timeoutPrepared = await processes.prepareStart({
       source: source('internal', 'process-watchdog-timeout:prepare'),
       toolCallId: timeoutTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote('setInterval(()=>{},1000)')}`,
+      command: nodeEvalCommand('setInterval(()=>{},1000)'),
       cwd: parent,
       executionTimeoutMs: 1_000,
       maxOutputBytes: 64 * 1024
@@ -2786,7 +2837,7 @@ async function checkProcessWatchdog() {
     const outputPrepared = await processes.prepareStart({
       source: source('internal', 'process-watchdog-output:prepare'),
       toolCallId: outputTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write(Buffer.alloc(1024*1024,120));setInterval(()=>{},1000)")}`,
+      command: nodeEvalCommand("process.stdout.write(Buffer.alloc(1024*1024,120));setInterval(()=>{},1000)"),
       cwd: parent,
       executionTimeoutMs: 10_000,
       maxOutputBytes: 1_024
@@ -2839,7 +2890,7 @@ async function checkProcessWatchdog() {
     const descendantPrepared = await processes.prepareStart({
       source: source('internal', 'process-watchdog-descendant:prepare'),
       toolCallId: descendantTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote(descendantCode)}`,
+      command: nodeEvalCommand(descendantCode),
       cwd: parent,
       executionTimeoutMs: 10_000,
       maxOutputBytes: 64 * 1024
@@ -2878,7 +2929,7 @@ async function checkProcessWatchdog() {
     const restartPrepared = await processes.prepareStart({
       source: source('internal', 'process-watchdog-restart:prepare'),
       toolCallId: restartTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("setInterval(()=>process.stdout.write('still-running\\n'),200)")}`,
+      command: nodeEvalCommand("setInterval(()=>process.stdout.write('still-running\\n'),200)"),
       cwd: parent,
       executionTimeoutMs: 1_500,
       maxOutputBytes: 64 * 1024
@@ -2978,7 +3029,7 @@ async function checkProcessOutputBounds() {
     const inlinePrepared = await processes.prepareStart({
       source: source('internal', 'process-inline-output:prepare'),
       toolCallId: inlineTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('inline-stdout');process.stderr.write('inline-stderr')")}`,
+      command: nodeEvalCommand("process.stdout.write('inline-stdout');process.stderr.write('inline-stderr')"),
       cwd: ctx.parent
     });
     const inlineStarted = await processes.dispatchStart(inlinePrepared.effect.effectIntentId, 5_000);
@@ -3001,7 +3052,7 @@ async function checkProcessOutputBounds() {
     const modelDetailCrashPrepared = await processes.prepareStart({
       source: source('internal', 'process-model-detail-crash:prepare'),
       toolCallId: modelDetailCrashTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('crash-recovered-output')")}`,
+      command: nodeEvalCommand("process.stdout.write('crash-recovered-output')"),
       cwd: ctx.parent
     });
     const originalRecordToolModelDetail = effects.recordToolModelDetail.bind(effects);
@@ -3038,7 +3089,7 @@ async function checkProcessOutputBounds() {
     const liveTailPrepared = await processes.prepareStart({
       source: source('internal', 'process-live-tail:prepare'),
       toolCallId: liveTailTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('abc');setTimeout(()=>process.exit(0),1200)")}`,
+      command: nodeEvalCommand("process.stdout.write('abc');setTimeout(()=>process.exit(0),1200)"),
       cwd: ctx.parent
     });
     await processes.dispatchStart(liveTailPrepared.effect.effectIntentId);
@@ -3059,7 +3110,7 @@ async function checkProcessOutputBounds() {
     const liveImportPrepared = await processes.prepareStart({
       source: source('internal', 'process-live-import:prepare'),
       toolCallId: liveImportTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote(liveImportCode)}`,
+      command: nodeEvalCommand(liveImportCode),
       cwd: ctx.parent
     });
     await processes.dispatchStart(liveImportPrepared.effect.effectIntentId);
@@ -3073,15 +3124,27 @@ async function checkProcessOutputBounds() {
     assertions.push('wrapper持续追加输出时reconcile只导入manifest已发布稳定前缀，不把正常并发误报为完整性损坏');
 
     const staleTool = await createTool(ctx, effects, 'process-stale-output', 'bash');
-    const staleCode = "process.stdout.write('a'.repeat(70000));setTimeout(()=>{process.stdout.write('b'.repeat(1000000));},900)";
+    const staleReleasePath = path.join(ctx.parent, 'process-stale-output.release');
+    const staleCode = [
+      "const fs=require('node:fs')",
+      "process.stdout.write('a'.repeat(70000))",
+      `const release=${JSON.stringify(staleReleasePath)}`,
+      "const timer=setInterval(()=>{if(fs.existsSync(release)){clearInterval(timer);process.stdout.write('b'.repeat(1000000));}},10)"
+    ].join(';');
     const stalePrepared = await processes.prepareStart({
       source: source('internal', 'process-stale-output:prepare'),
       toolCallId: staleTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote(staleCode)}`,
+      command: nodeEvalCommand(staleCode),
       cwd: ctx.parent
     });
     await processes.dispatchStart(stalePrepared.effect.effectIntentId);
-    await delay(350);
+    const initialDeadline = Date.now() + 5_000;
+    for (;;) {
+      const initial = await processes.reconcileOutput(stalePrepared.request.processId);
+      if (initial.retainedChunks > 0n) break;
+      if (Date.now() >= initialDeadline) throw new Error('Initial stale-output prefix did not become durable.');
+      await delay(25);
+    }
     const originalTransaction = ctx.database.transaction.bind(ctx.database);
     let injectedTerminal;
     let injectedStaleCommit = false;
@@ -3097,7 +3160,13 @@ async function checkProcessOutputBounds() {
       return originalTransaction(steps);
     };
     try {
-      await processes.reconcileOutput(stalePrepared.request.processId);
+      await fs.writeFile(staleReleasePath, 'release');
+      const staleCommitDeadline = Date.now() + 10_000;
+      while (!injectedStaleCommit) {
+        await processes.reconcileOutput(stalePrepared.request.processId);
+        if (Date.now() >= staleCommitDeadline) throw new Error('Stale output commit transaction was not observed.');
+        if (!injectedStaleCommit) await delay(25);
+      }
     } finally {
       ctx.database.transaction = originalTransaction;
     }
@@ -3113,7 +3182,7 @@ async function checkProcessOutputBounds() {
     const missingSpoolPrepared = await processes.prepareStart({
       source: source('internal', 'process-missing-spool:prepare'),
       toolCallId: missingSpoolTool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote("setTimeout(()=>process.stdout.write('retained-body'),500)")}`,
+      command: nodeEvalCommand("setTimeout(()=>process.stdout.write('retained-body'),500)"),
       cwd: ctx.parent
     });
     await processes.dispatchStart(missingSpoolPrepared.effect.effectIntentId);
@@ -3133,7 +3202,7 @@ async function checkProcessOutputBounds() {
     const prepared = await processes.prepareStart({
       source: source('internal', 'process-output:prepare'),
       toolCallId: tool.toolCallId,
-      command: `${shellQuote(process.execPath)} -e ${shellQuote(code)}`,
+      command: nodeEvalCommand(code),
       cwd: ctx.parent
     });
     const started = await processes.dispatchStart(prepared.effect.effectIntentId);
@@ -3793,7 +3862,12 @@ async function withRuntime(label, body) {
     return await body(ctx);
   } finally {
     if (ctx?.database) await ctx.database.close().catch(() => undefined);
-    await fs.rm(parent, { recursive: true, force: true });
+    await fs.rm(parent, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 20 : 0,
+      retryDelay: 100
+    });
   }
 }
 
@@ -4090,8 +4164,22 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+function nodeEvalCommand(code) {
+  const encoded = Buffer.from(String(code), 'utf8').toString('base64');
+  const bootstrap = `eval(Buffer.from('${encoded}','base64').toString('utf8'))`;
+  return `${shellCommandExecutable(process.execPath)} -e ${shellQuote(bootstrap)}`;
+}
+
+function shellCommandExecutable(value) {
+  const quoted = shellQuote(value);
+  return process.platform === 'win32' ? `& ${quoted}` : quoted;
+}
+
 function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
+  const text = String(value);
+  return process.platform === 'win32'
+    ? `'${text.replaceAll("'", "''")}'`
+    : `'${text.replaceAll("'", "'\\''")}'`;
 }
 
 async function writeEvidence(id, evidence, commitSha) {

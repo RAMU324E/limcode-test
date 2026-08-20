@@ -705,7 +705,7 @@ function spawnWindowsPowerShellCommand(
 ): ReturnType<typeof spawn> {
   const gatePath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE);
   const quotedGatePath = `'${gatePath.split("'").join("''")}'`;
-  const script = `$ProgressPreference = 'SilentlyContinue'; $gatePath = ${quotedGatePath}; while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }; Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ${request.command}`;
+  const script = `$ProgressPreference = 'SilentlyContinue'; $gatePath = ${quotedGatePath}; while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }; Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ${request.command}; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }`;
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   return spawn('powershell.exe', [
     '-NoLogo',
