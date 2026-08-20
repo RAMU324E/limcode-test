@@ -705,7 +705,34 @@ function spawnWindowsPowerShellCommand(
 ): ReturnType<typeof spawn> {
   const gatePath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE);
   const quotedGatePath = `'${gatePath.split("'").join("''")}'`;
-  const script = `$ProgressPreference = 'SilentlyContinue'; $gatePath = ${quotedGatePath}; while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }; Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ${request.command}; $limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE; if ($limcodeCommandSucceeded) { exit 0 }; if ($null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }; exit 1`;
+  const commandTextBase64 = Buffer.from(request.command, 'utf8').toString('base64');
+  const script = [
+    `$ProgressPreference = 'SilentlyContinue'`,
+    `$gatePath = ${quotedGatePath}`,
+    `while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }`,
+    `Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue`,
+    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$limcodeCommandText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${commandTextBase64}'))`,
+    `$limcodeTokens = $null; $limcodeParseErrors = $null`,
+    `$limcodeCommandAst = [System.Management.Automation.Language.Parser]::ParseInput($limcodeCommandText, [ref]$limcodeTokens, [ref]$limcodeParseErrors)`,
+    // Windows PowerShell 5.1 resets $? to true for a parenthesized expression. Detect only
+    // that exact syntax shape; a recursive lexical "last command" would misclassify unexecuted branches.
+    `$limcodeLastStatement = @($limcodeCommandAst.EndBlock.Statements)[-1]`,
+    `$limcodeLastPipelineElement = if ($limcodeLastStatement -is [System.Management.Automation.Language.PipelineAst] -and $limcodeLastStatement.PipelineElements.Count -eq 1) { $limcodeLastStatement.PipelineElements[0] } else { $null }`,
+    `$limcodeParenExpression = if ($limcodeLastPipelineElement -is [System.Management.Automation.Language.CommandExpressionAst] -and $limcodeLastPipelineElement.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) { $limcodeLastPipelineElement.Expression } else { $null }`,
+    `$limcodeParenPipelineElements = if ($null -ne $limcodeParenExpression) { @($limcodeParenExpression.Pipeline.PipelineElements) } else { @() }`,
+    `$limcodeParenCommandName = if ($limcodeParenPipelineElements.Count -eq 1 -and $limcodeParenPipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) { $limcodeParenPipelineElements[0].GetCommandName() } else { $null }`,
+    `$limcodeParenCommandInfo = if ($null -ne $limcodeParenCommandName) { Get-Command -Name $limcodeParenCommandName -ErrorAction SilentlyContinue } else { $null }`,
+    `$limcodeParenthesizedNativeCommand = $null -ne $limcodeParenCommandInfo -and ($limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Application -or $limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::ExternalScript)`,
+    `$limcodeErrorCount = $Error.Count; $LASTEXITCODE = $null`,
+    request.command,
+    `$limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE; $limcodeCommandAddedError = $Error.Count -gt $limcodeErrorCount`,
+    `if (-not $limcodeCommandSucceeded) { if ($null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }; exit 1 }`,
+    `if ($limcodeParenthesizedNativeCommand -and $null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }`,
+    `if ($limcodeCommandAddedError) { exit 1 }`,
+    `exit 0`
+  ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   return spawn('powershell.exe', [
     '-NoLogo',

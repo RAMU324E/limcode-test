@@ -2391,6 +2391,42 @@ async function checkProcessWrapperRecovery() {
       assert.equal(builtinFailure.observation.launch.outcome, 'succeeded', JSON.stringify(builtinFailure.observation));
       assert.equal(builtinFailure.observation.foreground.state, 'exited');
       assert.equal(builtinFailure.observation.foreground.receipt.exitCode, '1');
+
+      const parenthesizedNativeTool = await createTool(ctx, effects, 'process-parenthesized-native-failure', 'bash');
+      const parenthesizedNativePrepared = await processes.prepareStart({
+        source: source('internal', 'process-parenthesized-native-failure:prepare'),
+        toolCallId: parenthesizedNativeTool.toolCallId,
+        command: `(${nodeEvalCommand('process.exit(7)')})`,
+        cwd: parent
+      });
+      const parenthesizedNative = await processes.dispatchStart(parenthesizedNativePrepared.effect.effectIntentId, 5_000);
+      assert.equal(parenthesizedNative.observation.launch.outcome, 'succeeded', JSON.stringify(parenthesizedNative.observation));
+      assert.equal(parenthesizedNative.observation.foreground.state, 'exited');
+      assert.equal(parenthesizedNative.observation.foreground.receipt.exitCode, '7');
+
+      const parenthesizedBuiltinTool = await createTool(ctx, effects, 'process-parenthesized-builtin-failure', 'bash');
+      const parenthesizedBuiltinPrepared = await processes.prepareStart({
+        source: source('internal', 'process-parenthesized-builtin-failure:prepare'),
+        toolCallId: parenthesizedBuiltinTool.toolCallId,
+        command: `(Write-Error 'paren failure')`,
+        cwd: parent
+      });
+      const parenthesizedBuiltin = await processes.dispatchStart(parenthesizedBuiltinPrepared.effect.effectIntentId, 5_000);
+      assert.equal(parenthesizedBuiltin.observation.launch.outcome, 'succeeded', JSON.stringify(parenthesizedBuiltin.observation));
+      assert.equal(parenthesizedBuiltin.observation.foreground.state, 'exited');
+      assert.equal(parenthesizedBuiltin.observation.foreground.receipt.exitCode, '1');
+
+      const recoveredBranchTool = await createTool(ctx, effects, 'process-native-failure-recovered-by-branch', 'bash');
+      const recoveredBranchPrepared = await processes.prepareStart({
+        source: source('internal', 'process-native-failure-recovered-by-branch:prepare'),
+        toolCallId: recoveredBranchTool.toolCallId,
+        command: `${nodeEvalCommand('process.exit(7)')}; if ($true) { Write-Output 'recovered' } else { ${nodeEvalCommand('process.exit(0)')} }`,
+        cwd: parent
+      });
+      const recoveredBranch = await processes.dispatchStart(recoveredBranchPrepared.effect.effectIntentId, 5_000);
+      assert.equal(recoveredBranch.observation.launch.outcome, 'succeeded', JSON.stringify(recoveredBranch.observation));
+      assert.equal(recoveredBranch.observation.foreground.state, 'exited');
+      assert.equal(recoveredBranch.observation.foreground.receipt.exitCode, '0');
     }
     const poisonNow = new Date().toISOString();
     await ctx.database.transaction([
@@ -2792,8 +2828,14 @@ async function checkProcessWrapperRecovery() {
       ]
     };
   } finally {
+    await releaseFixtureProcesses(fixtureReleasePaths, fixtureProcessIdentities);
     if (ctx?.database) await ctx.database.close().catch(() => undefined);
-    await fs.rm(parent, { recursive: true, force: true });
+    await fs.rm(parent, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 20 : 0,
+      retryDelay: 100
+    });
   }
 }
 
@@ -3055,7 +3097,6 @@ async function checkProcessWatchdog() {
       ]
     };
   } finally {
-    await releaseFixtureProcesses(fixtureReleasePaths, fixtureProcessIdentities);
     if (recoveryApp) await recoveryApp.close().catch(() => undefined);
     if (ctx?.database) await ctx.database.close().catch(() => undefined);
     await fs.rm(parent, {
