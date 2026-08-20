@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import type { AttachmentCatalogEntry } from '../../shared/protocol';
+import {
+  collectAttachmentCatalogFromStoredItems,
+  mergeAttachmentCatalog
+} from './attachmentCatalog';
+import { AttachmentCatalogProjection } from './attachmentCatalogProjection';
 import {
   ContentAddressedStore,
   type ContentObjectIdentity,
@@ -88,6 +94,8 @@ export interface FullProviderRequest {
   settingsSnapshot?: PlainJsonValue;
   recipe: PlainJsonValue;
   context: FullProviderContextItem[];
+  /** Request-local relation-derived projection; never persisted in Context or compression envelopes. */
+  attachmentCatalog: AttachmentCatalogEntry[];
   requestAddenda?: {
     currentTurnInput?: {
       messageId: string;
@@ -303,6 +311,7 @@ const CONTENT_TYPE_CHECKPOINT = 'application/vnd.limcode.model-stream-checkpoint
 /** First-release provider path: each socket dispatch is rebuilt from one frozen root and immutable recipe. */
 export class ModelProviderControlPlane {
   private readonly context: ContextSequenceControlPlane;
+  private readonly attachmentCatalog: AttachmentCatalogProjection;
   private readonly tokenEstimator: ReliableContextTokenEstimator;
   private readonly now: () => string;
   private readonly epochNow: () => number;
@@ -333,6 +342,7 @@ export class ModelProviderControlPlane {
       'adapterDrainTimeoutMs'
     );
     this.context = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.attachmentCatalog = new AttachmentCatalogProjection(database);
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
@@ -545,6 +555,35 @@ export class ModelProviderControlPlane {
       materialized.segments
     );
     const requestCreatedAt = domainTimestampMs(request.created_at);
+    const requestAddenda = await this.materializeRequestAddenda(
+      recipe,
+      requireId(request.turn_id, 'ModelRequest.turn_id')
+    );
+    const attachmentCatalog = await this.attachmentCatalog.project(
+      providerSegments.map((segment) => ({
+        segmentId: segment.segmentId,
+        segmentKind: segment.segmentKind
+      })),
+      requestAddenda.requestAddenda?.currentTurnInput
+        ? [requestAddenda.requestAddenda.currentTurnInput.messageRevisionId]
+        : []
+    );
+    const providerContext = providerSegments.map((segment) => ({
+      segmentId: segment.segmentId,
+      segmentKind: segment.segmentKind,
+      messageRole: segment.messageRole,
+      contentType: segment.contentObject.content_type,
+      content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
+    }));
+    assertAttachmentProjectionCoverage(attachmentCatalog, [
+      ...providerContext,
+      ...(requestAddenda.requestAddenda?.currentTurnInput
+        ? [{
+            content: requestAddenda.requestAddenda.currentTurnInput.content,
+            contentType: requestAddenda.requestAddenda.currentTurnInput.contentType
+          }]
+        : [])
+    ]);
     return {
       kind: 'full-model-request',
       modelRequestId,
@@ -557,14 +596,9 @@ export class ModelProviderControlPlane {
       authoritySnapshot: frozenAuthority,
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
-      context: providerSegments.map((segment) => ({
-        segmentId: segment.segmentId,
-        segmentKind: segment.segmentKind,
-        messageRole: segment.messageRole,
-        contentType: segment.contentObject.content_type,
-        content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
-      })),
-      ...await this.materializeRequestAddenda(recipe, requireId(request.turn_id, 'ModelRequest.turn_id'))
+      context: providerContext,
+      attachmentCatalog,
+      ...requestAddenda
     };
   }
 
@@ -592,6 +626,32 @@ export class ModelProviderControlPlane {
       throw new Error('Preview Context projection belongs to another Conversation.');
     }
     const model = frozenModelIdentity(frozen.document);
+    const requestAddenda = await this.materializeRequestAddenda(recipe, turnId);
+    const attachmentCatalog = await this.attachmentCatalog.project(
+      materialized.segments.map((segment) => ({
+        segmentId: segment.segmentId,
+        segmentKind: segment.segmentKind
+      })),
+      requestAddenda.requestAddenda?.currentTurnInput
+        ? [requestAddenda.requestAddenda.currentTurnInput.messageRevisionId]
+        : []
+    );
+    const providerContext = materialized.segments.map((segment) => ({
+      segmentId: segment.segmentId,
+      segmentKind: segment.segmentKind,
+      messageRole: segment.messageRole,
+      contentType: segment.contentObject.content_type,
+      content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
+    }));
+    assertAttachmentProjectionCoverage(attachmentCatalog, [
+      ...providerContext,
+      ...(requestAddenda.requestAddenda?.currentTurnInput
+        ? [{
+            content: requestAddenda.requestAddenda.currentTurnInput.content,
+            contentType: requestAddenda.requestAddenda.currentTurnInput.contentType
+          }]
+        : [])
+    ]);
     return {
       kind: 'full-model-request',
       modelRequestId: modelRequestIdFor(turnId, idempotencyKey),
@@ -602,14 +662,9 @@ export class ModelProviderControlPlane {
       modelId: model.modelId,
       authoritySnapshot: frozen.document,
       recipe,
-      context: materialized.segments.map((segment) => ({
-        segmentId: segment.segmentId,
-        segmentKind: segment.segmentKind,
-        messageRole: segment.messageRole,
-        contentType: segment.contentObject.content_type,
-        content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
-      })),
-      ...await this.materializeRequestAddenda(recipe, turnId)
+      context: providerContext,
+      attachmentCatalog,
+      ...requestAddenda
     };
   }
 
@@ -2034,6 +2089,19 @@ function fallbackRequestBreakdown(estimatedTokens: number): ProjectedRequestToke
     bodyTokens: estimatedTokens,
     fullTokens: estimatedTokens
   };
+}
+
+function assertAttachmentProjectionCoverage(
+  relationCatalog: readonly AttachmentCatalogEntry[],
+  storedItems: ReadonlyArray<{ content: string; contentType?: string }>
+): void {
+  const referenced = collectAttachmentCatalogFromStoredItems(storedItems);
+  if (referenced.length === 0) return;
+  mergeAttachmentCatalog(relationCatalog, referenced);
+  const relationIds = new Set(relationCatalog.map((entry) => entry.attachmentId));
+  if (referenced.some((entry) => !relationIds.has(entry.attachmentId))) {
+    throw new Error('Managed attachment metadata has no AttachmentLink in the frozen Context lineage.');
+  }
 }
 
 function estimateFullProviderContextFallback(request: FullProviderRequest): number {

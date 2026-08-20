@@ -1,4 +1,5 @@
-import type { MessageContent } from '../../shared/protocol';
+import type { AttachmentCatalogEntry, MessageContent } from '../../shared/protocol';
+import { AttachmentCatalogProjection } from './attachmentCatalogProjection';
 import { ContentAddressedStore } from './contentAddressedStore';
 import {
   ContextSequenceControlPlane,
@@ -57,21 +58,27 @@ export interface ReliableContextTokenEstimate {
  */
 export class ReliableContextTokenEstimator {
   private readonly context: ContextSequenceControlPlane;
+  private readonly attachmentCatalog: AttachmentCatalogProjection;
 
   public constructor(
     private readonly database: RuntimeDatabase,
     contentStore: ContentAddressedStore
   ) {
     this.context = new ContextSequenceControlPlane(database, contentStore);
+    this.attachmentCatalog = new AttachmentCatalogProjection(database);
   }
 
   public async estimateRoot(rootIdInput: string): Promise<ReliableContextTokenEstimate> {
     const rootId = requireId(rootIdInput, 'rootId');
     const materialized = await this.context.materialize(rootId);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const projectedTokens = estimateMaterializedContextTokens(materialized.segments);
+    const attachmentCatalog = await this.attachmentCatalog.project(materialized.segments.map((segment) => ({
+      segmentId: segment.segmentId,
+      segmentKind: segment.segmentKind
+    })));
+    const projectedTokens = estimateMaterializedContextTokens(materialized.segments, attachmentCatalog);
     const compressed = compressionEstimate(materialized.segments);
-    const observed = await this.findObservedPrefix(conversationId, materialized.segments);
+    const observed = await this.findObservedPrefix(conversationId, materialized.segments, attachmentCatalog);
     if (observed) return observed;
     return {
       estimatedTokens: projectedTokens,
@@ -90,14 +97,24 @@ export class ReliableContextTokenEstimator {
       return (await this.estimateRoot(rootId)).estimatedTokens;
     }
     const full = await this.estimateRoot(rootId);
-    const fullProjected = estimateMaterializedContextTokens(materialized.segments);
-    const prefixProjected = estimateMaterializedContextTokens(materialized.segments.slice(0, segmentCount));
+    const prefixSegments = materialized.segments.slice(0, segmentCount);
+    const fullCatalog = await this.attachmentCatalog.project(materialized.segments.map((segment) => ({
+      segmentId: segment.segmentId,
+      segmentKind: segment.segmentKind
+    })));
+    const prefixCatalog = await this.attachmentCatalog.project(prefixSegments.map((segment) => ({
+      segmentId: segment.segmentId,
+      segmentKind: segment.segmentKind
+    })));
+    const fullProjected = estimateMaterializedContextTokens(materialized.segments, fullCatalog);
+    const prefixProjected = estimateMaterializedContextTokens(prefixSegments, prefixCatalog);
     return Math.max(0, full.estimatedTokens - Math.max(0, fullProjected - prefixProjected));
   }
 
   private async findObservedPrefix(
     conversationId: string,
-    current: readonly MaterializedContextSegment[]
+    current: readonly MaterializedContextSegment[],
+    currentCatalog: readonly AttachmentCatalogEntry[]
   ): Promise<ReliableContextTokenEstimate | null> {
     const turns = (await listAllDomainRows(this.database, 'Turn', {
       conversation_id: conversationId
@@ -142,13 +159,21 @@ export class ReliableContextTokenEstimator {
         const outputSegmentId = await this.messageSegmentId(requireId(links[0].message_id, 'ModelRequestMessageLink.message_id'));
         if (outputSegmentId && current[coveredSegmentCount]?.segmentId === outputSegmentId) {
           const total = providerTotalTokens(request.usage_json);
-          anchoredTokens = total ?? (input + estimateMaterializedContextTokens([
-            current[coveredSegmentCount]
-          ]));
+          const outputSegment = current[coveredSegmentCount];
+          const outputCatalog = await this.attachmentCatalog.project([{
+            segmentId: outputSegment.segmentId,
+            segmentKind: outputSegment.segmentKind
+          }]);
+          anchoredTokens = total ?? (input + estimateMaterializedContextTokens([outputSegment], outputCatalog));
           coveredSegmentCount += 1;
         }
-        const coveredProjected = estimateMaterializedContextTokens(current.slice(0, coveredSegmentCount));
-        const currentProjected = estimateMaterializedContextTokens(current);
+        const coveredSegments = current.slice(0, coveredSegmentCount);
+        const coveredCatalog = await this.attachmentCatalog.project(coveredSegments.map((segment) => ({
+          segmentId: segment.segmentId,
+          segmentKind: segment.segmentKind
+        })));
+        const coveredProjected = estimateMaterializedContextTokens(coveredSegments, coveredCatalog);
+        const currentProjected = estimateMaterializedContextTokens(current, currentCatalog);
         const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
         return {
           estimatedTokens: safeTokenCount(estimatedTokens, 'provider-observed Context estimate'),
@@ -191,14 +216,15 @@ export class ReliableContextTokenEstimator {
 }
 
 export function estimateMaterializedContextTokens(
-  segments: readonly MaterializedContextSegment[]
+  segments: readonly MaterializedContextSegment[],
+  attachmentCatalog: readonly AttachmentCatalogEntry[] = []
 ): number {
   const projected = projectStoredModelFacingWindow(segments.map((segment) => ({
     segmentKind: segment.segmentKind,
     messageRole: segment.messageRole,
     contentType: segment.contentObject.content_type,
     content: segment.content.toString('utf8')
-  })));
+  })), attachmentCatalog);
   const compressed = compressionEstimate(segments);
   if (compressed === undefined || segments.length === 0) return projected.tokenCount;
   const projectedCompression = projectStoredModelFacingWindow([{
@@ -206,7 +232,7 @@ export function estimateMaterializedContextTokens(
     messageRole: segments[0].messageRole,
     contentType: segments[0].contentObject.content_type,
     content: segments[0].content.toString('utf8')
-  }]).tokenCount;
+  }], attachmentCatalog).tokenCount;
   return safeTokenCount(
     projected.tokenCount - projectedCompression + compressed,
     'projected Context estimate'

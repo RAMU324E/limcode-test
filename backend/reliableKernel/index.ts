@@ -9,6 +9,7 @@ export * from './modelHandleCatalog';
 export * from './currentTurnTaskProjection';
 export * from './attachmentIngest';
 export * from './attachmentCatalog';
+export * from './attachmentCatalogProjection';
 export * from './agentLoop';
 export * from './answerDelivery';
 export * from './runtimeDeliveryProjection';

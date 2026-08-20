@@ -2587,7 +2587,7 @@ async function checkImmutableReplacement() {
             }]
           })
         : `coordinator-message-${index}-${'x'.repeat(256)}`;
-      await appendMessageContextFixture(
+      const appended = await appendMessageContextFixture(
         ctx,
         coordinatorSeed,
         `compression-coordinator-${index}`,
@@ -2595,6 +2595,28 @@ async function checkImmutableReplacement() {
         attachmentMessage,
         index === 1 ? 'application/vnd.limcode.message+json' : 'text/plain'
       );
+      if (index === 1) {
+        const now = new Date().toISOString();
+        await ctx.database.transaction([
+          kernel.DOMAIN_REPOSITORIES.domain('Attachment').insert({
+            id: coordinatorAttachment.attachmentId,
+            sha256: 'e'.repeat(64),
+            byte_length: BigInt(coordinatorAttachment.sizeBytes),
+            mime_type: coordinatorAttachment.mimeType,
+            name: coordinatorAttachment.name,
+            storage_mode: 'managed',
+            content_object_id: null,
+            created_at: now
+          }),
+          kernel.DOMAIN_REPOSITORIES.domain('AttachmentLink').insert({
+            id: 'attachment-link-compression-coordinator',
+            message_revision_id: appended.revisionId,
+            attachment_id: coordinatorAttachment.attachmentId,
+            position: 0n,
+            created_at: now
+          })
+        ]);
+      }
     }
     const coordinatorHead = await context.currentHeadRootId(coordinatorSeed.conversationId);
     let compactDispatches = 0;
@@ -2725,14 +2747,10 @@ async function checkImmutableReplacement() {
     const structuredMetadata = await get(ctx.database, 'ContentObject', coordinatedBlock.summary_object_id);
     assert.equal(structuredMetadata.content_type, kernel.CONTENT_TYPE_COMPRESSION_CONTENTS);
     const structuredCompression = JSON.parse((await ctx.store.read(structuredMetadata)).toString('utf8'));
-    const structuredCatalogContent = kernel.renderAttachmentCatalog(structuredCompression.attachmentCatalog);
-    assert.ok(structuredCatalogContent);
+    assert.equal(structuredCompression.attachmentCatalog, undefined);
     assert.equal(
       structuredCompression.estimatedTokens,
-      kernel.estimateMessageContentsTokens([
-        ...structuredCompression.contents,
-        structuredCatalogContent
-      ])
+      kernel.estimateMessageContentsTokens(structuredCompression.contents)
     );
     assert.equal(structuredCompression.trigger, 'auto');
     assert.equal(structuredCompression.triggerReason, 'configured_threshold');
@@ -2742,14 +2760,18 @@ async function checkImmutableReplacement() {
     assert.equal(structuredCompression.estimatedTokensBefore, 1);
     assert.equal(structuredCompression.providerInputTokens, 77);
     assert.equal(structuredCompression.methodKind, 'deterministic_summary');
-    assert.deepEqual(structuredCompression.attachmentCatalog, [coordinatorAttachment]);
-    assert.doesNotMatch(JSON.stringify(structuredCompression.attachmentCatalog), /sha256|sourcePath|data|private/);
     assert.deepEqual(structuredCompression.contents, [
       { role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] }
     ]);
     const coordinatedMaterialized = await context.materialize(coordinated.result.rootId);
     assert.equal(coordinatedMaterialized.segments.length, 2);
     assert.equal(coordinatedMaterialized.segments[0].segmentKind, 'compression');
+    assert.deepEqual(await new kernel.AttachmentCatalogProjection(ctx.database).project(
+      coordinatedMaterialized.segments.map((segment) => ({
+        segmentId: segment.segmentId,
+        segmentKind: segment.segmentKind
+      }))
+    ), [coordinatorAttachment]);
     let adapterCompactRequest;
     let adapterStartRequest;
     const capabilityAdapter = new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
@@ -2800,6 +2822,7 @@ async function checkImmutableReplacement() {
       kind: 'full-model-request', modelRequestId: 'adapter-compact',
       conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
+      attachmentCatalog: [],
       recipe: {
         kind: 'reliable-context-compression', sourceSegmentCount: 2,
         blockId: 'adapter-block', sourceHash: 'adapter-source', effectiveSummaryMaxTokens: 256
@@ -2835,6 +2858,7 @@ async function checkImmutableReplacement() {
       kind: 'full-model-request', modelRequestId: 'adapter-ordinary',
       conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
+      attachmentCatalog: [],
       recipe: { kind: 'reliable-agent-turn', round: '1', tools: [] },
       context: [{
         segmentId: 'adapter-summary', segmentKind: 'compression', messageRole: null,

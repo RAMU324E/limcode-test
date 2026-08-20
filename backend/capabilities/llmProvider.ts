@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { groupAtomicMessageContents } from '../reliableKernel/modelFacingContextProjection';
 import { decodeCanonicalBase64 } from './canonicalBase64';
 import { estimateTokenCount, sliceByTokens } from 'tokenx';
 import { mapWithBoundedConcurrency } from './boundedConcurrency';
@@ -2007,6 +2008,18 @@ function buildSummaryProviderCall(
   };
 }
 
+interface SegmentedSummaryChunk {
+  requestContents: MessageContent[];
+  sourceContents: MessageContent[];
+}
+
+interface SegmentedSummaryUnit extends SegmentedSummaryChunk {
+  kind: 'message' | 'tool_exchange' | 'tool_results';
+  estimatedTokens: number;
+  functionCallCount: number;
+  functionResponseCount: number;
+}
+
 function buildSegmentedSummaryProviderCalls(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
@@ -2019,58 +2032,77 @@ function buildSegmentedSummaryProviderCalls(
     .filter((segment) => segment.length > 0);
   if (sourceSegments.length === 0) return [];
   const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
-  const groups: MessageContent[][] = [];
-  let current: MessageContent[] = [];
-  for (const segment of sourceSegments) {
-    const candidate = [...current, ...segment];
-    const priorContext = groups.length === 0
-      ? priorSummaryText
-      : finalAnswerTextOf(groups[groups.length - 1] ?? []);
-    const candidateCall = buildSegmentDeltaCall(
-      candidate,
-      groups.length,
-      priorContext,
-      methodConfig,
-      settings,
-      totalTargetTokens
-    );
-    if (isSummaryProviderCallWithinWindow(candidateCall, settings)) {
-      current = candidate;
+  const units: SegmentedSummaryUnit[] = sourceSegments.flatMap((segment) =>
+    groupAtomicMessageContents(segment).map((group) => ({
+      kind: group.kind,
+      estimatedTokens: group.estimatedTokens,
+      functionCallCount: group.functionCallCount,
+      functionResponseCount: group.functionResponseCount,
+      requestContents: group.items,
+      sourceContents: group.items
+    }))
+  );
+  const groups: SegmentedSummaryChunk[] = [];
+  let current: SegmentedSummaryChunk = { requestContents: [], sourceContents: [] };
+
+  const priorFor = (index: number): string => index === 0
+    ? priorSummaryText
+    : finalAnswerTextOf(groups[index - 1]?.requestContents ?? []);
+  const fits = (contents: MessageContent[], index: number): boolean => isSummaryProviderCallWithinWindow(
+    buildSegmentDeltaCall(contents, index, priorFor(index), methodConfig, settings, totalTargetTokens),
+    settings
+  );
+  const pushCurrent = (): void => {
+    if (current.requestContents.length === 0) return;
+    groups.push(current);
+    current = { requestContents: [], sourceContents: [] };
+  };
+
+  for (const unit of units) {
+    const candidate = [...current.requestContents, ...unit.requestContents];
+    if (fits(candidate, groups.length)) {
+      current.requestContents = candidate;
+      current.sourceContents.push(...unit.sourceContents);
       continue;
     }
-    if (current.length === 0) {
-      throw new Error(`compression_source_too_large: segment ${groups.length + 1} cannot fit the frozen summary Provider window.`);
-    }
-    groups.push(current);
-    current = [...segment];
-    const nextPrior = finalAnswerTextOf(groups[groups.length - 1] ?? []);
-    const singleCall = buildSegmentDeltaCall(
-      current,
+    pushCurrent();
+    const safeUnits = splitOrReplaceOversizedSummaryUnit(
+      unit,
       groups.length,
-      nextPrior,
+      priorFor(groups.length),
       methodConfig,
       settings,
       totalTargetTokens
     );
-    if (!isSummaryProviderCallWithinWindow(singleCall, settings)) {
-      throw new Error(`compression_source_too_large: segment ${groups.length + 1} cannot fit the frozen summary Provider window.`);
+    for (const safeUnit of safeUnits) {
+      const next = [...current.requestContents, ...safeUnit.requestContents];
+      if (!fits(next, groups.length)) pushCurrent();
+      if (!fits(safeUnit.requestContents, groups.length)) {
+        throw new Error(
+          `compression_request_too_large: fixed summary prompt cannot fit chunk ${groups.length + 1} in the frozen Provider window.`
+        );
+      }
+      current.requestContents.push(...safeUnit.requestContents);
+      current.sourceContents.push(...safeUnit.sourceContents);
     }
   }
-  if (current.length > 0) groups.push(current);
+  pushCurrent();
   if (groups.length > MAX_SEGMENTED_DELTA_CALLS) {
-    throw new Error(`compression_source_too_large: ${groups.length} safe chunks exceed the ${MAX_SEGMENTED_DELTA_CALLS} delta-call limit.`);
+    const overflow = groups.splice(MAX_SEGMENTED_DELTA_CALLS - 1);
+    groups.push(hierarchicalOverflowChunk(overflow));
   }
 
   const targetTokensPerCall = Math.max(128, Math.ceil(totalTargetTokens / groups.length));
   return groups.map((group, index) => {
-    const priorContext = index === 0 ? priorSummaryText : finalAnswerTextOf(groups[index - 1] ?? []);
+    const priorContext = index === 0 ? priorSummaryText : finalAnswerTextOf(groups[index - 1]?.requestContents ?? []);
     const call = buildSegmentDeltaCall(
-      group,
+      group.requestContents,
       index,
       priorContext,
       methodConfig,
       settings,
-      targetTokensPerCall
+      targetTokensPerCall,
+      group.sourceContents
     );
     if (!isSummaryProviderCallWithinWindow(call, settings)) {
       throw new Error(`compression_request_too_large: summary chunk ${index + 1} exceeds the frozen Provider input limit.`);
@@ -2079,13 +2111,138 @@ function buildSegmentedSummaryProviderCalls(
   });
 }
 
+function splitOrReplaceOversizedSummaryUnit(
+  unit: SegmentedSummaryUnit,
+  index: number,
+  priorContext: string,
+  methodConfig: LlmCompressionConfigRecord,
+  settings: LlmProviderConfigRecord,
+  targetTokens: number
+): SegmentedSummaryChunk[] {
+  const direct = buildSegmentDeltaCall(
+    unit.requestContents,
+    index,
+    priorContext,
+    methodConfig,
+    settings,
+    targetTokens
+  );
+  if (isSummaryProviderCallWithinWindow(direct, settings)) return [unit];
+
+  const message = unit.kind === 'message' && unit.requestContents.length === 1
+    ? unit.requestContents[0]
+    : undefined;
+  const textPart = message?.parts.length === 1 && isVisibleTextPart(message.parts[0])
+    ? message.parts[0]
+    : undefined;
+  if (message && textPart) {
+    const chunks: SegmentedSummaryChunk[] = [];
+    const conservativePrior = sliceByTokens(
+      'previous-context '.repeat(SEGMENTED_PRIOR_CONTEXT_TOKENS * 2),
+      0,
+      SEGMENTED_PRIOR_CONTEXT_TOKENS
+    );
+    let remaining = textPart.text;
+    while (remaining.length > 0) {
+      const fitting = largestFittingSummaryTextPrefix(
+        remaining,
+        message.role,
+        index + chunks.length,
+        conservativePrior,
+        methodConfig,
+        settings,
+        targetTokens
+      );
+      if (!fitting) break;
+      const chunk: MessageContent = { role: message.role, parts: [{ ...textPart, text: fitting }] };
+      chunks.push({ requestContents: [chunk], sourceContents: [chunk] });
+      remaining = remaining.slice(fitting.length);
+    }
+    if (remaining.length === 0 && chunks.length > 0) return chunks;
+  }
+
+  const sourceJson = JSON.stringify(unit.sourceContents);
+  const digest = createHash('sha256').update(sourceJson).digest('hex');
+  const fallback: MessageContent = {
+    role: 'user',
+    parts: [{ text: [
+      '[LimCode hierarchical compression fallback]',
+      `type=${unit.kind}`,
+      `sha256=${digest}`,
+      `originalTokens=${unit.estimatedTokens}`,
+      `messageCount=${unit.sourceContents.length}`,
+      `functionCallCount=${unit.functionCallCount}`,
+      `functionResponseCount=${unit.functionResponseCount}`,
+      'The original immutable Context lineage is preserved; this bounded descriptor replaces only this summary-provider input unit.'
+    ].join('\n') }]
+  };
+  return [{ requestContents: [fallback], sourceContents: unit.sourceContents }];
+}
+
+function hierarchicalOverflowChunk(chunks: readonly SegmentedSummaryChunk[]): SegmentedSummaryChunk {
+  const sourceContents = chunks.flatMap((chunk) => chunk.sourceContents);
+  const sourceJson = JSON.stringify(sourceContents);
+  const digest = createHash('sha256').update(sourceJson).digest('hex');
+  const fallback: MessageContent = {
+    role: 'user',
+    parts: [{ text: [
+      '[LimCode hierarchical compression fallback]',
+      'type=chunk_overflow',
+      `sha256=${digest}`,
+      `originalTokens=${estimateTokenCount(renderContentsForSummary(sourceContents))}`,
+      `messageCount=${sourceContents.length}`,
+      `collapsedChunkCount=${chunks.length}`,
+      'The original immutable Context lineage is preserved; this bounded descriptor replaces only overflow summary-provider chunks.'
+    ].join('\n') }]
+  };
+  return { requestContents: [fallback], sourceContents };
+}
+
+function largestFittingSummaryTextPrefix(
+  text: string,
+  role: MessageContent['role'],
+  index: number,
+  priorContext: string,
+  methodConfig: LlmCompressionConfigRecord,
+  settings: LlmProviderConfigRecord,
+  targetTokens: number
+): string {
+  let low = 1;
+  let high = Math.max(1, estimateTokenCount(text));
+  let best = '';
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidateText = sliceByTokens(text, 0, middle);
+    if (!candidateText) {
+      low = middle + 1;
+      continue;
+    }
+    const call = buildSegmentDeltaCall(
+      [{ role, parts: [{ text: candidateText }] }],
+      index,
+      priorContext,
+      methodConfig,
+      settings,
+      targetTokens
+    );
+    if (isSummaryProviderCallWithinWindow(call, settings)) {
+      best = candidateText;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
+}
+
 function buildSegmentDeltaCall(
   segment: MessageContent[],
   index: number,
   priorContext: string,
   methodConfig: LlmCompressionConfigRecord,
   settings: LlmProviderConfigRecord,
-  targetTokens: number
+  targetTokens: number,
+  sourceContents: MessageContent[] = segment
 ): SummaryProviderCall {
   const boundedPrior = headTailTextByTokens(
     priorContext,
@@ -2095,7 +2252,7 @@ function buildSegmentDeltaCall(
   const userText = `${DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT}\n\n【前情(只读，不要重新总结)】\n${boundedPrior || '无'}\n\n【本回合记录】\n${transcript}`;
   return {
     label: `Segment ${index + 1}`,
-    sourceContents: segment,
+    sourceContents,
     targetTokens,
     request: {
       contents: [{ role: 'user', parts: [{ text: userText }] }],
