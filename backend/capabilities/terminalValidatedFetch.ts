@@ -1,6 +1,23 @@
+import { createHash } from 'node:crypto';
 import type { LlmProviderKind } from '../../shared/protocol';
 
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60_000;
+
+export interface LlmProviderWireToolItemTrace {
+  index: string;
+  idSha256?: string;
+}
+
+export interface LlmProviderWireInvariantTrace {
+  bodySha256: string;
+  messageCount: number;
+  toolItems: LlmProviderWireToolItemTrace[];
+}
+
+export interface TerminalValidatedFetchOptions {
+  bodyIdleTimeoutMs?: number;
+  onWireInvariantTrace?: (trace: LlmProviderWireInvariantTrace) => void;
+}
 
 export class LlmHttpStreamTerminationError extends Error {
   public readonly code: 'LLM_STREAM_TRUNCATED' | 'LLM_TRANSPORT_TIMEOUT';
@@ -24,11 +41,16 @@ export class LlmHttpStreamTerminationError extends Error {
 export function createTerminalValidatedFetch(
   baseFetch: typeof fetch,
   provider: LlmProviderKind,
-  options: { bodyIdleTimeoutMs?: number } = {}
+  options: TerminalValidatedFetchOptions = {}
 ): typeof fetch {
   const bodyIdleTimeoutMs = positiveTimeout(options.bodyIdleTimeoutMs ?? DEFAULT_BODY_IDLE_TIMEOUT_MS);
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    const response = await baseFetch(input, init);
+    const wireTrace = await inspectFinalWireBody(input, init, provider);
+    if (wireTrace) emitWireInvariantTrace(options.onWireInvariantTrace, wireTrace);
+    let response = await baseFetch(input, init);
+    if (!response.ok && wireTrace?.toolItems.length) {
+      response = annotateRemoteError(response, wireTrace.bodySha256);
+    }
     if (!response.ok || !response.body || !isEventStream(response.headers.get('content-type'))) return response;
 
     const reader = response.body.getReader();
@@ -83,6 +105,219 @@ export function createTerminalValidatedFetch(
       headers: response.headers
     });
   };
+}
+
+async function inspectFinalWireBody(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+  provider: LlmProviderKind
+): Promise<LlmProviderWireInvariantTrace | undefined> {
+  const bytes = await requestBodyBytes(input, init);
+  if (!bytes) return undefined;
+  const bodySha256 = createHash('sha256').update(bytes).digest('hex');
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch (cause) {
+    throw wireInvariantError(provider, bodySha256, 'final request body is not valid UTF-8 JSON', cause);
+  }
+  const root = requireWireRecord(body, provider, bodySha256, 'request body');
+  const toolItems: LlmProviderWireToolItemTrace[] = [];
+  let messageCount: number;
+  if (provider === 'openai-compatible' || provider === 'deepseek') {
+    const messages = requireWireArray(root.messages, provider, bodySha256, 'messages');
+    messageCount = messages.length;
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = asWireRecord(messages[index]);
+      if (message?.role !== 'tool') continue;
+      toolItems.push(requiredIdTrace(
+        message.tool_call_id,
+        `messages[${index}]`,
+        'tool_call_id',
+        provider,
+        bodySha256
+      ));
+    }
+  } else if (provider === 'openai-responses') {
+    const inputItems = requireWireArray(root.input, provider, bodySha256, 'input');
+    messageCount = inputItems.length;
+    for (let index = 0; index < inputItems.length; index += 1) {
+      const item = asWireRecord(inputItems[index]);
+      if (item?.type !== 'function_call_output') continue;
+      toolItems.push(requiredIdTrace(
+        item.call_id,
+        `input[${index}]`,
+        'call_id',
+        provider,
+        bodySha256
+      ));
+    }
+  } else if (provider === 'claude') {
+    const messages = requireWireArray(root.messages, provider, bodySha256, 'messages');
+    messageCount = messages.length;
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+      const message = asWireRecord(messages[messageIndex]);
+      if (!Array.isArray(message?.content)) continue;
+      for (let itemIndex = 0; itemIndex < message.content.length; itemIndex += 1) {
+        const item = asWireRecord(message.content[itemIndex]);
+        if (item?.type !== 'tool_result') continue;
+        toolItems.push(requiredIdTrace(
+          item.tool_use_id,
+          `messages[${messageIndex}].content[${itemIndex}]`,
+          'tool_use_id',
+          provider,
+          bodySha256
+        ));
+      }
+    }
+  } else {
+    const contents = requireWireArray(root.contents, provider, bodySha256, 'contents');
+    messageCount = contents.length;
+    for (let contentIndex = 0; contentIndex < contents.length; contentIndex += 1) {
+      const content = asWireRecord(contents[contentIndex]);
+      if (!Array.isArray(content?.parts)) continue;
+      for (let partIndex = 0; partIndex < content.parts.length; partIndex += 1) {
+        const part = asWireRecord(content.parts[partIndex]);
+        if (!part || !Object.prototype.hasOwnProperty.call(part, 'functionResponse')) continue;
+        const response = requireWireRecord(
+          part.functionResponse,
+          provider,
+          bodySha256,
+          `contents[${contentIndex}].parts[${partIndex}].functionResponse`
+        );
+        if (typeof response.name !== 'string' || !response.name.trim()) {
+          throw wireInvariantError(
+            provider,
+            bodySha256,
+            `Gemini contents[${contentIndex}].parts[${partIndex}].functionResponse.name must be non-empty`
+          );
+        }
+        if (!asWireRecord(response.response)) {
+          throw wireInvariantError(
+            provider,
+            bodySha256,
+            `Gemini contents[${contentIndex}].parts[${partIndex}].functionResponse.response must be an object`
+          );
+        }
+        const itemTrace: LlmProviderWireToolItemTrace = {
+          index: `contents[${contentIndex}].parts[${partIndex}]`
+        };
+        if (response.id !== undefined) {
+          if (typeof response.id !== 'string' || !response.id.trim()) {
+            throw wireInvariantError(
+              provider,
+              bodySha256,
+              `Gemini ${itemTrace.index}.functionResponse.id must be non-empty when provided`
+            );
+          }
+          itemTrace.idSha256 = hashId(response.id);
+        }
+        toolItems.push(itemTrace);
+      }
+    }
+  }
+  return { bodySha256, messageCount, toolItems };
+}
+
+async function requestBodyBytes(
+  input: string | URL | Request,
+  init: RequestInit | undefined
+): Promise<Buffer | undefined> {
+  if (init?.body !== undefined && init.body !== null) return bodyValueBytes(init.body);
+  if (typeof Request !== 'undefined' && input instanceof Request && input.body) {
+    return Buffer.from(await input.clone().arrayBuffer());
+  }
+  return undefined;
+}
+
+async function bodyValueBytes(body: NonNullable<RequestInit['body']>): Promise<Buffer> {
+  if (typeof body === 'string') return Buffer.from(body, 'utf8');
+  if (body instanceof URLSearchParams) return Buffer.from(body.toString(), 'utf8');
+  if (typeof Blob !== 'undefined' && body instanceof Blob) return Buffer.from(await body.arrayBuffer());
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  throw new TypeError('LLM final request body must be inspectable bytes before fetch.');
+}
+
+function requiredIdTrace(
+  value: unknown,
+  index: string,
+  field: string,
+  provider: LlmProviderKind,
+  bodySha256: string
+): LlmProviderWireToolItemTrace {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw wireInvariantError(provider, bodySha256, `${index}.${field} must be a non-empty string`);
+  }
+  return { index, idSha256: hashId(value) };
+}
+
+function hashId(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function requireWireArray(
+  value: unknown,
+  provider: LlmProviderKind,
+  bodySha256: string,
+  label: string
+): unknown[] {
+  if (!Array.isArray(value)) throw wireInvariantError(provider, bodySha256, `${label} must be an array`);
+  return value;
+}
+
+function requireWireRecord(
+  value: unknown,
+  provider: LlmProviderKind,
+  bodySha256: string,
+  label: string
+): Record<string, unknown> {
+  const record = asWireRecord(value);
+  if (!record) throw wireInvariantError(provider, bodySha256, `${label} must be an object`);
+  return record;
+}
+
+function asWireRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function wireInvariantError(
+  provider: LlmProviderKind,
+  bodySha256: string,
+  detail: string,
+  cause?: unknown
+): Error {
+  const error = new Error(`LLM ${provider} wire invariant failed: ${detail}; body_sha256=${bodySha256}.`);
+  return Object.assign(
+    error,
+    { code: 'LLM_WIRE_INVARIANT_FAILED', provider, bodySha256, ...(cause === undefined ? {} : { cause }) }
+  );
+}
+
+function emitWireInvariantTrace(
+  observer: TerminalValidatedFetchOptions['onWireInvariantTrace'],
+  trace: LlmProviderWireInvariantTrace
+): void {
+  try {
+    observer?.(trace);
+  } catch {
+    // Privacy-safe observability is best effort and never provider authority.
+  }
+  if (trace.toolItems.length > 0) {
+    console.info('[LimCode][ProviderWireInvariant]', JSON.stringify(trace));
+  }
+}
+
+function annotateRemoteError(response: Response, bodySha256: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set('x-limcode-wire-invariant', `passed; body_sha256=${bodySha256}`);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
 }
 
 class SseTerminalTracker {

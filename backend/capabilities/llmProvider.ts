@@ -870,6 +870,14 @@ function messageFromRawError(rawError: LlmRawErrorInfoRecord): string {
 }
 
 export function summarizeLlmRawError(rawError: LlmRawErrorInfoRecord): string {
+  const summary = summarizeLlmRawErrorBase(rawError);
+  const evidence = wireInvariantEvidence(rawError);
+  return evidence && remoteReportsMissingToolResultId(rawError)
+    ? `${summary} Local wire invariant passed before fetch; ${evidence}.`
+    : summary;
+}
+
+function summarizeLlmRawErrorBase(rawError: LlmRawErrorInfoRecord): string {
   const direct = specificErrorMessage(rawError.message);
   if (direct) return direct;
   for (const candidate of [
@@ -889,6 +897,19 @@ export function summarizeLlmRawError(rawError: LlmRawErrorInfoRecord): string {
   const kind = typeof rawError.kind === 'string' && rawError.kind.trim() ? rawError.kind.trim() : 'llm_error';
   const status = typeof rawError.status === 'number' ? ` HTTP ${rawError.status}` : '';
   return `LLM 请求失败：${kind}${status}`;
+}
+
+function wireInvariantEvidence(rawError: LlmRawErrorInfoRecord): string | undefined {
+  const headers = isRecord(rawError.headers) ? rawError.headers : undefined;
+  const value = headers?.['x-limcode-wire-invariant'];
+  return typeof value === 'string' && /^passed; body_sha256=[a-f0-9]{64}$/.test(value)
+    ? value.slice('passed; '.length)
+    : undefined;
+}
+
+function remoteReportsMissingToolResultId(rawError: LlmRawErrorInfoRecord): boolean {
+  const text = stringifyJson(toPlainJsonLike(rawError));
+  return /(?:missing|required)[^\n]{0,160}(?:tool_call_id|call_id|tool_use_id|functionResponse)|(?:tool_call_id|call_id|tool_use_id|functionResponse)[^\n]{0,160}(?:missing|required)/i.test(text);
 }
 
 function nestedMessage(value: unknown, depth = 0, seen = new Set<object>()): string | undefined {
