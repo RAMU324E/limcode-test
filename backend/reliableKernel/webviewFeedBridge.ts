@@ -22,6 +22,7 @@ import {
   type ReliableKernelSnapshotRequestMessage
 } from '../../shared/reliableKernelClientFeed';
 import { toStructuredClonePlainData } from '../../shared/plainData';
+import { normalizePlainJson } from './plainJson';
 import {
   BridgeMessageType,
   type BridgeClientId,
@@ -64,6 +65,8 @@ interface FeedClient {
   recoveryWake?: (retry: boolean) => void;
   lastDataPost?: FeedDataPost;
   pendingTransientEvents: ReliableAgentTransientEvent[];
+  transientToolCallKeys: Set<string>;
+  transientRawEventCount: number;
   transientFlushTimer?: NodeJS.Timeout;
 }
 
@@ -80,6 +83,117 @@ function isToolCallDeltaTransient(event: ReliableAgentTransientEvent): boolean {
     && typeof content === 'object'
     && !Array.isArray(content)
     && content.type === 'tool_call_delta';
+}
+
+function toolCallDeltaTransientKeys(event: ReliableAgentTransientEvent): string[] {
+  if (!isToolCallDeltaTransient(event)) return [];
+  const content = event.event.content as Record<string, unknown>;
+  const outputItem = isRecord(content.outputItem) ? content.outputItem : undefined;
+  const outputIdentity = typeof outputItem?.id === 'string'
+    ? `${outputItem.id}:${String(outputItem.ordinal ?? '')}`
+    : '';
+  const calls = Array.isArray(content.calls) ? content.calls : [content];
+  return calls.flatMap((value, index) => {
+    if (!isRecord(value)) return [];
+    const callIdentity = optionalIdentityText(value.id)
+      ?? optionalIdentityText(value.callId)
+      ?? optionalIdentityText(value.streamIndex)
+      ?? String(index);
+    return [`${transientRequestPrefix(event)}${outputIdentity}\0${callIdentity}`];
+  });
+}
+
+function transientRequestPrefix(event: ReliableAgentTransientEvent): string {
+  return `${event.modelRequestId}\0${event.attemptSeq}\0${event.socketGeneration}\0`;
+}
+
+function clearTransientToolCallKeys(client: FeedClient, event: ReliableAgentTransientEvent): void {
+  const prefix = transientRequestPrefix(event);
+  for (const key of client.transientToolCallKeys) {
+    if (key.startsWith(prefix)) client.transientToolCallKeys.delete(key);
+  }
+}
+
+function coalescePendingToolCallDelta(
+  pending: ReliableAgentTransientEvent[],
+  incoming: ReliableAgentTransientEvent
+): boolean {
+  if (!isToolCallDeltaTransient(incoming)) return false;
+  const previous = pending[pending.length - 1];
+  if (!previous || !isToolCallDeltaTransient(previous) || !sameTransientStream(previous, incoming)) return false;
+  const content = mergeToolCallDeltaContent(previous.event.content, incoming.event.content);
+  if (!content) return false;
+  pending[pending.length - 1] = {
+    ...incoming,
+    event: { ...incoming.event, content: normalizePlainJson(content, 'coalesced tool call delta') }
+  };
+  return true;
+}
+
+function sameTransientStream(left: ReliableAgentTransientEvent, right: ReliableAgentTransientEvent): boolean {
+  return left.conversationId === right.conversationId
+    && left.turnId === right.turnId
+    && left.modelRequestId === right.modelRequestId
+    && left.requestSeq === right.requestSeq
+    && left.attemptSeq === right.attemptSeq
+    && left.socketGeneration === right.socketGeneration;
+}
+
+function mergeToolCallDeltaContent(leftInput: unknown, rightInput: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(leftInput) || !isRecord(rightInput)) return undefined;
+  if (leftInput.type !== 'tool_call_delta' || rightInput.type !== 'tool_call_delta') return undefined;
+  if (JSON.stringify(leftInput.outputItem ?? null) !== JSON.stringify(rightInput.outputItem ?? null)) return undefined;
+  if (Array.isArray(leftInput.calls) && Array.isArray(rightInput.calls)) {
+    return {
+      ...leftInput,
+      ...rightInput,
+      calls: mergeToolCallDeltaRecords(leftInput.calls, rightInput.calls)
+    };
+  }
+  const merged = mergeOneToolCallDelta(leftInput, rightInput);
+  return merged ? { ...leftInput, ...rightInput, ...merged } : undefined;
+}
+
+function mergeToolCallDeltaRecords(left: unknown[], right: unknown[]): Record<string, unknown>[] {
+  const merged = left.filter(isRecord).map((value) => ({ ...value }));
+  for (let index = 0; index < right.length; index += 1) {
+    const incoming = right[index];
+    if (!isRecord(incoming)) continue;
+    const identity = toolCallDeltaRecordIdentity(incoming, index);
+    const priorIndex = merged.findIndex((candidate, candidateIndex) =>
+      toolCallDeltaRecordIdentity(candidate, candidateIndex) === identity
+    );
+    if (priorIndex < 0) {
+      merged.push({ ...incoming });
+      continue;
+    }
+    const next = mergeOneToolCallDelta(merged[priorIndex], incoming);
+    if (next) merged[priorIndex] = { ...merged[priorIndex], ...incoming, ...next };
+  }
+  return merged;
+}
+
+function mergeOneToolCallDelta(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>
+): { argumentsDelta: string; replace?: true } | undefined {
+  if (typeof left.argumentsDelta !== 'string' || typeof right.argumentsDelta !== 'string') return undefined;
+  if (right.replace === true) return { argumentsDelta: right.argumentsDelta, replace: true };
+  return {
+    argumentsDelta: left.argumentsDelta + right.argumentsDelta,
+    ...(left.replace === true ? { replace: true } : {})
+  };
+}
+
+function toolCallDeltaRecordIdentity(value: Record<string, unknown>, fallbackIndex: number): string {
+  return optionalIdentityText(value.id)
+    ?? optionalIdentityText(value.callId)
+    ?? optionalIdentityText(value.streamIndex)
+    ?? String(fallbackIndex);
+}
+
+function optionalIdentityText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
 export type ReliableKernelFeedBridgeErrorHandler = (
@@ -138,6 +252,8 @@ export class ReliableKernelWebviewFeedBridge {
     client.detailRequests = new Set<string>();
     client.historyRequests = new Set<string>();
     client.pendingTransientEvents = [];
+    client.transientToolCallKeys = new Set<string>();
+    client.transientRawEventCount = 0;
     client.recoveryAttempt = 0;
     this.clients.set(clientId, client);
     this.post(client, {
@@ -434,16 +550,26 @@ export class ReliableKernelWebviewFeedBridge {
         || !client.connection
         || client.meta.conversationId !== event.conversationId
       ) continue;
-      client.pendingTransientEvents.push(event);
+      const toolDeltaKeys = toolCallDeltaTransientKeys(event);
+      const firstToolDelta = toolDeltaKeys.some((key) => !client.transientToolCallKeys.has(key));
+      for (const key of toolDeltaKeys) client.transientToolCallKeys.add(key);
+      client.transientRawEventCount += 1;
+      if (!coalescePendingToolCallDelta(client.pendingTransientEvents, event)) {
+        client.pendingTransientEvents.push(event);
+      }
       const terminal = ['completed', 'failed', 'cancelled'].includes(event.event.kind);
-      // Tool argument previews are already aggregated by the provider capability. Flush them with
-      // any earlier queued thought/text events instead of adding another 32ms transport wait.
+      const itemBoundary = event.event.kind === 'output_item_done';
+      // The first delta makes a new call visible immediately. Later fragments of the same call use
+      // the short presentation window so a large edit cannot monopolize postMessage/renderer work.
+      // Durable item/terminal boundaries always flush the exact accumulated prefix first.
       if (
-        isToolCallDeltaTransient(event)
+        firstToolDelta
+        || itemBoundary
         || terminal
         || client.pendingTransientEvents.length >= TRANSIENT_BATCH_MAX_EVENTS
       ) {
         this.flushTransientQueue(client);
+        if (terminal) clearTransientToolCallKeys(client, event);
         continue;
       }
       if (client.transientFlushTimer !== undefined) continue;
@@ -462,6 +588,8 @@ export class ReliableKernelWebviewFeedBridge {
     }
     if (client.closed || client.pendingTransientEvents.length === 0) return;
     const events = client.pendingTransientEvents.splice(0, TRANSIENT_BATCH_MAX_EVENTS);
+    const rawEventCount = client.transientRawEventCount;
+    client.transientRawEventCount = 0;
     const conversationId = client.meta.conversationId;
     if (!conversationId || events.some((event) => event.conversationId !== conversationId)) return;
     const connectionPromise = client.connection;
@@ -491,6 +619,17 @@ export class ReliableKernelWebviewFeedBridge {
         observedAt: event.observedAt,
         event: event.event
       }));
+      this.diagnostics?.observe({
+        eventKind: 'feed.transient.flushed',
+        scopeKind: 'feed_session',
+        scopeId: connection.sessionId,
+        metadata: {
+          conversationId,
+          rawEventCount,
+          emittedEventCount: payloads.length,
+          toolDeltaEventCount: events.filter(isToolCallDeltaTransient).length
+        }
+      });
       if (payloads.length === 1) {
         this.post(client, {
           type: RELIABLE_KERNEL_TRANSIENT_MESSAGE,
@@ -519,6 +658,8 @@ export class ReliableKernelWebviewFeedBridge {
     if (client.transientFlushTimer !== undefined) clearTimeout(client.transientFlushTimer);
     client.transientFlushTimer = undefined;
     client.pendingTransientEvents.length = 0;
+    client.transientToolCallKeys.clear();
+    client.transientRawEventCount = 0;
   }
 
   public async setActiveConversation(

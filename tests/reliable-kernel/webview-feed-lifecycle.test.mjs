@@ -101,7 +101,7 @@ test('stale visible renderer gets one exact resend, then Feed waits for a new Re
   bridge.close();
 });
 
-test('tool_call_delta immediately flushes earlier transient output in stream order', async () => {
+test('tool_call_delta flushes a new call immediately and coalesces later fragments of that call', async () => {
   const feed = fakeFeed();
   const posted = [];
   const bridge = new ReliableKernelWebviewFeedBridge(
@@ -117,7 +117,7 @@ test('tool_call_delta immediately flushes earlier transient output in stream ord
   bridge.reconnect(clientId);
   await eventually(() => snapshots(posted).length === 1);
 
-  const transient = (streamSeq, content) => ({
+  const transient = (streamSeq, content, kind = 'output_delta') => ({
     conversationId: 'conversation-tool-preview',
     turnId: 'turn-tool-preview',
     modelRequestId: 'request-tool-preview',
@@ -128,7 +128,7 @@ test('tool_call_delta immediately flushes earlier transient output in stream ord
     socketGeneration: '1',
     afterCommitSeq: '0',
     observedAt: '2026-08-19T00:00:00.000Z',
-    event: { kind: 'output_delta', streamSeq, content }
+    event: { kind, streamSeq, content }
   });
 
   bridge.broadcastTransient(transient('1', { type: 'thought_delta', text: '先分析' }));
@@ -137,20 +137,41 @@ test('tool_call_delta immediately flushes earlier transient output in stream ord
 
   bridge.broadcastTransient(transient('2', {
     type: 'tool_call_delta',
-    callId: 'call-tool-preview',
-    name: 'write',
-    argumentsDelta: '{"path":',
-    replace: false
+    calls: [{ id: 'call-tool-preview', name: 'write', argumentsDelta: '{"path":' }]
   }));
   await Promise.resolve();
 
-  const [batch] = transientPosts(posted);
-  assert.equal(batch?.type, 'reliable-kernel.transient-batch');
-  assert.deepEqual(batch.events.map((entry) => entry.event.streamSeq), ['1', '2']);
-  assert.deepEqual(batch.events.map((entry) => entry.event.content.type), [
+  const [firstBatch] = transientPosts(posted);
+  assert.equal(firstBatch?.type, 'reliable-kernel.transient-batch');
+  assert.deepEqual(firstBatch.events.map((entry) => entry.event.streamSeq), ['1', '2']);
+  assert.deepEqual(firstBatch.events.map((entry) => entry.event.content.type), [
     'thought_delta',
     'tool_call_delta'
   ]);
+
+  for (let index = 3; index <= 12; index += 1) {
+    bridge.broadcastTransient(transient(String(index), {
+      type: 'tool_call_delta',
+      calls: [{ id: 'call-tool-preview', argumentsDelta: 'x' }]
+    }));
+  }
+  await Promise.resolve();
+  assert.equal(transientPosts(posted).length, 1, 'later fragments wait for one presentation window');
+  await eventually(() => transientPosts(posted).length === 2);
+  const compacted = transientPosts(posted)[1];
+  const compactedEvents = compacted.type === 'reliable-kernel.transient-batch'
+    ? compacted.events
+    : [compacted];
+  assert.equal(compactedEvents.length, 1);
+  assert.equal(compactedEvents[0].event.streamSeq, '12');
+  assert.equal(compactedEvents[0].event.content.calls[0].argumentsDelta, 'x'.repeat(10));
+
+  bridge.broadcastTransient(transient('13', {
+    type: 'tool_call_delta',
+    calls: [{ id: 'call-second', name: 'read', argumentsDelta: '{"path":"a"}' }]
+  }));
+  await Promise.resolve();
+  assert.equal(transientPosts(posted).length, 3, 'a different call becomes visible without the extra window');
 
   bridge.close();
 });

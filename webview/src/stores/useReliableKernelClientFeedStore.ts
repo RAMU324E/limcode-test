@@ -52,6 +52,12 @@ export interface ReliableKernelDetailState {
   text: string;
   totalBytes: number;
   error?: string;
+  /** Number of failed initial loads retained across automatic/manual retries. */
+  retryCount?: number;
+  /** Earliest epoch at which another automatic request may be admitted. */
+  nextRetryAt?: number;
+  /** Explicit non-recoverable detail failure; ordinary bridge/read errors remain retryable. */
+  terminalError?: boolean;
   /** A mutable detail is being extended while its last complete value remains renderable. */
   refreshing?: boolean;
   /** The last background refresh failed. This never invalidates the complete value in `text`. */
@@ -68,9 +74,18 @@ interface PendingDetailRequest {
   priority: ReliableKernelDetailPriority;
   enqueuedAt: number;
   mode: 'initial' | 'refresh';
+  retryCount: number;
 }
 
 export type ReliableKernelDetailPriority = 'critical' | 'expanded' | 'visible' | 'background';
+
+interface ReliableKernelDetailRequestOptions {
+  priority?: ReliableKernelDetailPriority;
+  /** Internal retry generation. Public callers should use retryDetail for an immediate retry. */
+  retryCount?: number;
+  /** Internal admission flag used only by an already-scheduled or explicit retry. */
+  bypassBackoff?: boolean;
+}
 
 interface ReliableKernelDetailCacheMeta {
   lastAccessedAt: number;
@@ -136,6 +151,7 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
 const DETAIL_CHUNK_MAX_BYTES = 262_144;
 const DETAIL_MAX_INFLIGHT_REQUESTS = 4;
 const DETAIL_REQUEST_DEADLINE_MS = 20_000;
+const DETAIL_AUTO_RETRY_DELAYS_MS = [250, 750, 2_000] as const;
 // The byte budget remains authoritative. A 256-entry cap evicted many small historical messages
 // after roughly eight conversations while leaving most of the 16 MiB budget unused.
 const DETAIL_CACHE_MAX_ENTRIES = 1_024;
@@ -148,6 +164,7 @@ const detailDecoders = new Map<string, TextDecoder>();
 // frame copies its entire prefix repeatedly; a single final join keeps large details linear.
 const detailTextChunks = new Map<string, string[]>();
 const detailRequestTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+const detailRetryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 const DETAIL_PRIORITY_ORDER: Readonly<Record<ReliableKernelDetailPriority, number>> = Object.freeze({
   critical: 0,
   expanded: 1,
@@ -301,6 +318,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         }
       }
       if (previousHostBootId && result.state.hostBootId !== previousHostBootId) {
+        clearAllDetailRetryTimers();
         this.details = {};
         this.detailCacheMeta = {};
       }
@@ -311,6 +329,9 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       this.projections = result.state.projections;
       this.records = result.state.records;
       this.snapshotRequired = result.state.snapshotRequired;
+      if (result.ack) {
+        invalidateRetryableDetailsForDurableMessage(this.$state, envelope, incomingType);
+      }
       if (result.ack && incomingType === RELIABLE_KERNEL_CHANGES_MESSAGE) {
         this.transientModelRequests = removeTransientModelRequests(
           this.transientModelRequests,
@@ -712,15 +733,15 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     requestDetail(
       kind: ReliableKernelClientDetailKind,
       recordId: string,
-      options: { priority?: ReliableKernelDetailPriority } = {}
+      options: ReliableKernelDetailRequestOptions = {}
     ): string | undefined {
       const id = recordId.trim();
       const sessionId = this.sessionId;
       if (!id || !sessionId) return undefined;
       const key = detailKey(kind, id);
       const current = this.details[key];
+      const priority = options.priority ?? 'visible';
       if (current?.status === 'ready') {
-        const priority = options.priority ?? 'visible';
         const pending = Object.values(this.pendingDetails).find((request) => request.key === key);
         if (pending && DETAIL_PRIORITY_ORDER[priority] < DETAIL_PRIORITY_ORDER[pending.priority]) {
           pending.priority = priority;
@@ -733,8 +754,21 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         };
         return key;
       }
-      if (current?.status === 'error') return key;
-      const priority = options.priority ?? 'visible';
+      if (current?.status === 'error') {
+        if (current.terminalError || !options.bypassBackoff) {
+          if (!current.terminalError && current.nextRetryAt !== undefined) {
+            this.scheduleDetailRetry(kind, id, {
+              priority,
+              retryCount: current.retryCount ?? 0,
+              mode: 'initial'
+            }, Math.max(0, current.nextRetryAt - Date.now()));
+          }
+          return key;
+        }
+        clearDetailRetryTimer(key);
+        delete this.details[key];
+        delete this.detailCacheMeta[key];
+      }
       if (current?.status === 'loading') {
         const pending = Object.values(this.pendingDetails).find((request) => request.key === key);
         if (pending && DETAIL_PRIORITY_ORDER[priority] < DETAIL_PRIORITY_ORDER[pending.priority]) {
@@ -744,8 +778,15 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         }
         return key;
       }
+      clearDetailRetryTimer(key);
       const requestId = createMessageId();
-      this.details[key] = { status: 'loading', text: '', totalBytes: 0 };
+      const retryCount = options.retryCount ?? current?.retryCount ?? 0;
+      this.details[key] = {
+        status: 'loading',
+        text: '',
+        totalBytes: 0,
+        ...(retryCount > 0 ? { retryCount } : {})
+      };
       detailTextChunks.set(requestId, []);
       this.pendingDetails[requestId] = {
         key,
@@ -755,7 +796,8 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         sessionId,
         priority,
         enqueuedAt: Date.now(),
-        mode: 'initial'
+        mode: 'initial',
+        retryCount
       };
       this.detailQueue.push(requestId);
       this.sortDetailQueue();
@@ -771,6 +813,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       const id = recordId.trim();
       if (!id) return undefined;
       const key = detailKey(kind, id);
+      clearDetailRetryTimer(key);
       const cancelledRequestIds = Object.entries(this.pendingDetails)
         .filter(([, pending]) => pending.key === key)
         .map(([requestId]) => requestId);
@@ -789,7 +832,11 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       }
       delete this.details[key];
       delete this.detailCacheMeta[key];
-      const requested = this.requestDetail(kind, id, options);
+      const requested = this.requestDetail(kind, id, {
+        ...options,
+        retryCount: 0,
+        bypassBackoff: true
+      });
       this.pumpDetailQueue();
       return requested;
     },
@@ -799,21 +846,24 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       recordId: string,
       options: { priority?: ReliableKernelDetailPriority } = {}
     ): string | undefined {
-      const key = detailKey(kind, recordId);
+      const key = detailKey(kind, recordId.trim());
       const current = this.details[key];
       if (current?.status === 'ready') {
-        return this.refreshDetail(kind, recordId, options);
+        clearDetailRetryTimer(key);
+        return this.refreshDetail(kind, recordId, {
+          ...options,
+          retryCount: 0,
+          bypassBackoff: true
+        });
       }
-      delete this.details[key];
-      delete this.detailCacheMeta[key];
-      return this.requestDetail(kind, recordId, options);
+      return this.reloadDetail(kind, recordId, options);
     },
 
     /** Continues a mutable process stream from its already-rendered durable byte prefix. */
     refreshDetail(
       kind: ReliableKernelClientDetailKind,
       recordId: string,
-      options: { priority?: ReliableKernelDetailPriority } = {}
+      options: ReliableKernelDetailRequestOptions = {}
     ): string | undefined {
       const id = recordId.trim();
       const sessionId = this.sessionId;
@@ -832,6 +882,18 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         }
         return key;
       }
+      const priority = options.priority ?? 'visible';
+      if (current.refreshError && !options.bypassBackoff) {
+        if (!current.terminalError && current.nextRetryAt !== undefined) {
+          this.scheduleDetailRetry(kind, id, {
+            priority,
+            retryCount: current.retryCount ?? 0,
+            mode: 'refresh'
+          }, Math.max(0, current.nextRetryAt - Date.now()));
+        }
+        return key;
+      }
+      clearDetailRetryTimer(key);
       const requestId = createMessageId();
       this.details[key] = {
         status: 'ready',
@@ -846,9 +908,10 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         recordId: id,
         nextOffset: current.totalBytes,
         sessionId,
-        priority: options.priority ?? 'visible',
+        priority,
         enqueuedAt: Date.now(),
-        mode: 'refresh'
+        mode: 'refresh',
+        retryCount: options.retryCount ?? current.retryCount ?? 0
       };
       this.detailQueue.push(requestId);
       this.sortDetailQueue();
@@ -921,6 +984,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           text: chunks.join(''),
           totalBytes: message.detail.totalBytes
         };
+        clearDetailRetryTimer(pending.key);
         this.detailCacheMeta[pending.key] = {
           lastAccessedAt: Date.now(),
           bytes: message.detail.totalBytes
@@ -952,22 +1016,73 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       const pending = this.pendingDetails[requestId];
       if (!pending) return;
       const current = this.details[pending.key];
+      const retryCount = pending.retryCount + 1;
+      const retryDelay = DETAIL_AUTO_RETRY_DELAYS_MS[retryCount - 1];
+      const nextRetryAt = retryDelay === undefined ? undefined : Date.now() + retryDelay;
       if (pending.mode === 'refresh' && current?.status === 'ready') {
         this.details[pending.key] = {
           status: 'ready',
           text: current.text,
           totalBytes: current.totalBytes,
-          refreshError: error
+          refreshError: error,
+          retryCount,
+          ...(nextRetryAt !== undefined ? { nextRetryAt } : {})
         };
       } else {
         this.details[pending.key] = {
           status: 'error',
           text: '',
           totalBytes: totalBytes ?? current?.totalBytes ?? 0,
-          error
+          error,
+          retryCount,
+          ...(nextRetryAt !== undefined ? { nextRetryAt } : {})
         };
       }
       this.finishDetailRequest(requestId);
+      if (retryDelay !== undefined) {
+        this.scheduleDetailRetry(pending.kind, pending.recordId, {
+          priority: pending.priority,
+          retryCount,
+          mode: pending.mode
+        }, retryDelay);
+      }
+    },
+
+    scheduleDetailRetry(
+      kind: ReliableKernelClientDetailKind,
+      recordId: string,
+      retry: {
+        priority: ReliableKernelDetailPriority;
+        retryCount: number;
+        mode: 'initial' | 'refresh';
+      },
+      delayMs: number
+    ): void {
+      const id = recordId.trim();
+      const sessionId = this.sessionId;
+      if (!id || !sessionId) return;
+      const key = detailKey(kind, id);
+      clearDetailRetryTimer(key);
+      detailRetryTimeouts.set(key, setTimeout(() => {
+        detailRetryTimeouts.delete(key);
+        if (this.sessionId !== sessionId) return;
+        const current = this.details[key];
+        if (retry.mode === 'refresh') {
+          if (current?.status !== 'ready' || !current.refreshError || current.terminalError) return;
+          this.refreshDetail(kind, id, {
+            priority: retry.priority,
+            retryCount: retry.retryCount,
+            bypassBackoff: true
+          });
+          return;
+        }
+        if (current?.status !== 'error' || current.terminalError) return;
+        this.requestDetail(kind, id, {
+          priority: retry.priority,
+          retryCount: retry.retryCount,
+          bypassBackoff: true
+        });
+      }, Math.max(0, Math.round(delayMs))));
     },
 
     expireDetailRequest(requestId: string): void {
@@ -1487,6 +1602,97 @@ function reconcileHistoryRecordsWithLiveChanges(
   return next;
 }
 
+function invalidateRetryableDetailsForDurableMessage(
+  state: ReliableKernelFeedStoreState,
+  envelope: Record<string, unknown> | undefined,
+  messageType: string | undefined
+): void {
+  const invalidatedKeys = new Set<string>();
+  if (messageType === RELIABLE_KERNEL_SNAPSHOT_MESSAGE) {
+    for (const key of Object.keys(state.details)) invalidatedKeys.add(key);
+  } else if (messageType === RELIABLE_KERNEL_CHANGES_MESSAGE) {
+    const changes = Array.isArray(envelope?.changes) ? envelope.changes : [];
+    for (const value of changes) {
+      const change = plainRecord(value);
+      if (change?.operation !== 'upsert') continue;
+      const type = nonEmptyString(change.type);
+      const id = nonEmptyString(change.id);
+      const record = plainRecord(change.record);
+      if (!type || !id) continue;
+      const add = (kind: ReliableKernelClientDetailKind, recordId: unknown = id): void => {
+        const normalizedId = nonEmptyString(recordId);
+        if (normalizedId) invalidatedKeys.add(detailKey(kind, normalizedId));
+      };
+      switch (type) {
+        case 'MessageRevision':
+          add('message-content');
+          break;
+        case 'TurnIntent':
+          add('turn-intent-preview');
+          break;
+        case 'ToolCall':
+          add('tool-arguments-content');
+          break;
+        case 'ToolOutcome':
+          add('tool-result-content', record?.tool_call_id ?? id);
+          break;
+        case 'ToolCallEvent':
+          add('tool-event-content');
+          break;
+        case 'InteractionRequest':
+          add('interaction-prompt');
+          break;
+        case 'FileChangeSetMember':
+          add('file-change-base-content');
+          add('file-change-content');
+          add('file-change-diff');
+          break;
+        case 'Process':
+          add('process-stdout');
+          add('process-stderr');
+          break;
+        case 'ProcessOutputChunk':
+          add('process-output');
+          add('process-stdout', record?.process_id);
+          add('process-stderr', record?.process_id);
+          break;
+        case 'ModelContextProjection':
+          add('context-projection-detail');
+          break;
+        case 'ModelRequest':
+          add('model-request-purpose');
+          break;
+        case 'CompressionBlock':
+          add('compression-presentation');
+          add('compression-content');
+          add('compression-title');
+          break;
+        case 'AnswerSubmission':
+          add('answer-content');
+          break;
+      }
+    }
+  }
+  for (const key of invalidatedKeys) {
+    const detail = state.details[key];
+    if (!detail || detail.terminalError) continue;
+    if (detail.status === 'error') {
+      clearDetailRetryTimer(key);
+      delete state.details[key];
+      delete state.detailCacheMeta[key];
+      continue;
+    }
+    if (detail.status === 'ready' && detail.refreshError) {
+      clearDetailRetryTimer(key);
+      state.details[key] = {
+        status: 'ready',
+        text: detail.text,
+        totalBytes: detail.totalBytes
+      };
+    }
+  }
+}
+
 function removedModelRequestIds(
   envelope: Record<string, unknown> | undefined
 ): Set<string> {
@@ -1576,7 +1782,19 @@ function compareIntegerStrings(left: string, right: string): number {
   return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
 }
 
+function clearDetailRetryTimer(key: string): void {
+  const timeout = detailRetryTimeouts.get(key);
+  if (timeout !== undefined) clearTimeout(timeout);
+  detailRetryTimeouts.delete(key);
+}
+
+function clearAllDetailRetryTimers(): void {
+  for (const timeout of detailRetryTimeouts.values()) clearTimeout(timeout);
+  detailRetryTimeouts.clear();
+}
+
 function cancelAllDetailRequests(state: ReliableKernelFeedStoreState): void {
+  clearAllDetailRetryTimers();
   for (const requestId of Object.keys(state.pendingDetails)) {
     const timeout = detailRequestTimeouts.get(requestId);
     if (timeout !== undefined) clearTimeout(timeout);

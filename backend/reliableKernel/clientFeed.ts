@@ -83,6 +83,12 @@ interface QueuedDataMessage {
   commitSeq: string;
 }
 
+interface PendingChangesBatch {
+  commitSeq: string;
+  changes: ReliableKernelClientChange[];
+  bytes: number;
+}
+
 type ClientScopedRuntimeChange = RuntimeChange & {
   removalCause?: 'window-eviction';
 };
@@ -96,7 +102,7 @@ interface ClientFeedSession {
   lastAckedCommitSeq: string | null;
   snapshotRequired: boolean;
   snapshotRequestGeneration: number;
-  queue: QueuedDataMessage[];
+  queue: PendingChangesBatch[];
   queuedBytes: number;
   send(message: ReliableKernelDataMessage): void;
   onFailure?: (error: unknown) => void;
@@ -315,26 +321,28 @@ export class BoundedClientFeed {
     // Database commitSeq is intentionally allowed to jump on the wire. Commits with no visible
     // records must not consume the one-inflight ACK channel or invalidate the Webview projection.
     if (scoped.changes.length === 0) return;
-    const message = this.createChangesMessage(session, { ...commit, changes: scoped.changes });
-    const bytes = wireBytes(message);
-    if (message.changes.length > CLIENT_CHANGE_BATCH_MAX_RECORDS || bytes > CLIENT_CHANGE_BATCH_MAX_BYTES) {
-      this.enterSnapshotRequired(session);
-      return;
-    }
-    const queued: QueuedDataMessage = { message, bytes, commitSeq: commit.commitSeq };
-    if (!session.inflight && session.queue.length === 0 && !session.refreshing) {
-      this.sendQueuedNow(session, queued);
-      return;
-    }
+    const pending = this.createPendingChanges(session, commit.commitSeq, scoped.changes);
     if (
-      session.queue.length + 1 > CLIENT_MAX_QUEUED_BATCHES
-      || session.queuedBytes + bytes > CLIENT_MAX_QUEUED_BYTES
+      pending.changes.length > CLIENT_CHANGE_BATCH_MAX_RECORDS
+      || pending.bytes > CLIENT_CHANGE_BATCH_MAX_BYTES
     ) {
       this.enterSnapshotRequired(session);
       return;
     }
-    session.queue.push(queued);
-    session.queuedBytes += bytes;
+    if (!session.inflight && session.queue.length === 0 && !session.refreshing) {
+      this.sendPendingNow(session, pending);
+      return;
+    }
+    if (this.compactPendingQueue(session, pending)) return;
+    if (
+      session.queue.length + 1 > CLIENT_MAX_QUEUED_BATCHES
+      || session.queuedBytes + pending.bytes > CLIENT_MAX_QUEUED_BYTES
+    ) {
+      this.enterSnapshotRequired(session);
+      return;
+    }
+    session.queue.push(pending);
+    session.queuedBytes += pending.bytes;
   }
 
   private enterSnapshotRequired(session: ClientFeedSession): void {
@@ -377,7 +385,16 @@ export class BoundedClientFeed {
     const next = session.queue.shift();
     if (!next) return;
     session.queuedBytes -= next.bytes;
-    this.sendQueuedNow(session, next);
+    this.sendPendingNow(session, next);
+  }
+
+  private sendPendingNow(session: ClientFeedSession, pending: PendingChangesBatch): void {
+    const message = this.createChangesMessage(session, pending.commitSeq, pending.changes);
+    this.sendQueuedNow(session, {
+      message,
+      bytes: wireBytes(message),
+      commitSeq: pending.commitSeq
+    });
   }
 
   private sendQueuedNow(session: ClientFeedSession, queued: QueuedDataMessage): void {
@@ -423,33 +440,59 @@ export class BoundedClientFeed {
 
   private createChangesMessage(
     session: ClientFeedSession,
-    commit: Omit<RuntimeCommitResult, 'changes'> & { changes: ClientScopedRuntimeChange[] }
+    commitSeq: string,
+    changes: ReliableKernelClientChange[]
   ): ReliableKernelChangesMessage {
-    const changes: ReliableKernelClientChange[] = [];
-    for (const change of commit.changes) {
-      if (!RELIABLE_KERNEL_CLIENT_CHANGE_TYPES.has(change.domain as never)) continue;
-      if (change.kind === 'remove') {
-        changes.push({
-          type: change.domain,
-          operation: 'remove',
-          id: change.id,
-          ...(change.removalCause ? { removalCause: change.removalCause } : {})
-        });
-        continue;
-      }
-      if (!change.record) throw new Error(`Committed client upsert ${change.domain}/${change.id} has no record projection.`);
-      const record = boundRecord(toWirePlain(change.record) as Record<string, PlainData>);
-      if (record.id !== change.id) throw new Error('Committed client upsert record identity mismatch.');
-      changes.push({ type: change.domain, operation: 'upsert', id: change.id, record });
-    }
     return {
       type: RELIABLE_KERNEL_CHANGES_MESSAGE,
       sessionId: session.sessionId,
       hostBootId: session.hostBootId,
       messageSeq: this.allocateMessageSeq(session),
-      commitSeq: requireDecimal(commit.commitSeq, 'commitSeq'),
+      commitSeq: requireDecimal(commitSeq, 'commitSeq'),
       changes
     };
+  }
+
+  private createPendingChanges(
+    session: ClientFeedSession,
+    commitSeq: string,
+    scopedChanges: ClientScopedRuntimeChange[]
+  ): PendingChangesBatch {
+    const changes = compactClientChanges(scopedChanges.map(toReliableClientChange));
+    return pendingChangesBatch(session, commitSeq, changes);
+  }
+
+  /**
+   * Slow renderers need the latest bounded projection delta, not every intermediate repaint of the
+   * same records. Only unsent changes sharing the current ACK baseline are compacted; the inflight
+   * frame remains byte-for-byte stable for retransmission.
+   */
+  private compactPendingQueue(session: ClientFeedSession, incoming: PendingChangesBatch): boolean {
+    if (session.queue.length === 0) return false;
+    const allChanges = compactClientChanges([
+      ...session.queue.flatMap((batch) => batch.changes),
+      ...incoming.changes
+    ]);
+    const compacted = pendingChangesBatch(session, incoming.commitSeq, allChanges);
+    if (
+      compacted.changes.length <= CLIENT_CHANGE_BATCH_MAX_RECORDS
+      && compacted.bytes <= CLIENT_CHANGE_BATCH_MAX_BYTES
+    ) {
+      session.queue = [compacted];
+      session.queuedBytes = compacted.bytes;
+      return true;
+    }
+
+    const tail = session.queue[session.queue.length - 1];
+    const tailChanges = compactClientChanges([...tail.changes, ...incoming.changes]);
+    const compactedTail = pendingChangesBatch(session, incoming.commitSeq, tailChanges);
+    if (
+      compactedTail.changes.length > CLIENT_CHANGE_BATCH_MAX_RECORDS
+      || compactedTail.bytes > CLIENT_CHANGE_BATCH_MAX_BYTES
+    ) return false;
+    session.queue[session.queue.length - 1] = compactedTail;
+    session.queuedBytes += compactedTail.bytes - tail.bytes;
+    return true;
   }
 
   private scopeCommit(
@@ -896,6 +939,50 @@ export class BoundedClientFeed {
     this.externalPollTimer = null;
     this.externalDataVersion = null;
   }
+}
+
+function toReliableClientChange(change: ClientScopedRuntimeChange): ReliableKernelClientChange {
+  if (!RELIABLE_KERNEL_CLIENT_CHANGE_TYPES.has(change.domain as never)) {
+    throw new Error(`Committed client change uses unknown domain ${change.domain}.`);
+  }
+  if (change.kind === 'remove') {
+    return {
+      type: change.domain,
+      operation: 'remove',
+      id: change.id,
+      ...(change.removalCause ? { removalCause: change.removalCause } : {})
+    };
+  }
+  if (!change.record) throw new Error(`Committed client upsert ${change.domain}/${change.id} has no record projection.`);
+  const record = boundRecord(toWirePlain(change.record) as Record<string, PlainData>);
+  if (record.id !== change.id) throw new Error('Committed client upsert record identity mismatch.');
+  return { type: change.domain, operation: 'upsert', id: change.id, record };
+}
+
+/** Last writer wins while the first occurrence retains repository/topological ordering. */
+function compactClientChanges(changes: readonly ReliableKernelClientChange[]): ReliableKernelClientChange[] {
+  const compacted = new Map<string, ReliableKernelClientChange>();
+  for (const change of changes) compacted.set(`${change.type}\0${change.id}`, change);
+  return [...compacted.values()];
+}
+
+function pendingChangesBatch(
+  session: ClientFeedSession,
+  commitSeqInput: string,
+  changes: ReliableKernelClientChange[]
+): PendingChangesBatch {
+  const commitSeq = requireDecimal(commitSeqInput, 'commitSeq');
+  const bytes = wireBytes({
+    type: RELIABLE_KERNEL_CHANGES_MESSAGE,
+    sessionId: session.sessionId,
+    hostBootId: session.hostBootId,
+    // Unsent batches have no transport sequence. Reserve every sequence digit reachable while the
+    // bounded queue drains, without consuming a sequence that the Webview could observe as a gap.
+    messageSeq: (session.nextMessageSeq + BigInt(CLIENT_MAX_QUEUED_BATCHES + 1)).toString(),
+    commitSeq,
+    changes
+  });
+  return { commitSeq, changes, bytes };
 }
 
 /** Fixed keyset pagination facade; offset and mutable sort keys are not accepted. */

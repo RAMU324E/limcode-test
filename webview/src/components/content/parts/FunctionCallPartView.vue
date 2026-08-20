@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
-import { IconFileDiff, IconTool, IconPlayerStop } from '@tabler/icons-vue';
+import { IconFileDiff, IconTool, IconPlayerStop, IconRefresh } from '@tabler/icons-vue';
 import {
   ASK_USER_TOOL_NAME,
   DELETE_TOOL_NAME,
@@ -73,7 +73,6 @@ const interactions = useInteractionStore();
 const expanded = ref(false);
 const userChangedExpanded = ref(false);
 const autoOpenedActionIds = ref<Set<string>>(new Set());
-const automaticallyRetriedDetailKeys = new Set<string>();
 const expandedPlanSectionKeys = ref<Set<string>>(new Set());
 const autoApplyCountdown = ref<number | undefined>(undefined);
 const cancelFeedback = ref<{
@@ -133,7 +132,21 @@ const toolEvents = computed<ToolCallEventRecord[]>(() => {
 });
 const transientPreview = computed(() => {
   const partId = props.part.id;
-  if (!partId || !props.messageId || toolCall.value) return undefined;
+  if (!partId || !props.messageId) return undefined;
+  const durableCallId = toolCall.value?.id;
+  if (durableCallId) {
+    const projection = reliableConversation.projection.value;
+    if (projection.interactionByToolCallId[durableCallId]?.status === 'pending') return undefined;
+    const revisionId = projection.messageRevisionIdByMessageId[props.messageId];
+    const messageDetail = revisionId
+      ? reliableConversation.feed.details[reliableKernelDetailKey('message-content', revisionId)]
+      : undefined;
+    if (
+      messageDetail?.status === 'error'
+      && messageDetail.nextRetryAt === undefined
+      && (messageDetail.retryCount ?? 0) >= 4
+    ) return undefined;
+  }
   return transientToolCallPreviewForMessage(
     reliableConversation.feed.transientModelRequests,
     Object.values(reliableConversation.feed.records.ModelRequestMessageLink ?? {}),
@@ -203,30 +216,48 @@ const outputSections = computed(() => {
   return sections;
 });
 const toolIcon = computed(() => toolDisplay.value.headerIcon ?? IconTool);
+const retryableDetailTargets = computed(() => {
+  const callId = toolCall.value?.id;
+  if (!callId) return [];
+  return expandedDetailTargets(callId).filter(({ kind, recordId }) => {
+    const detail = reliableConversation.feed.details[reliableKernelDetailKey(kind, recordId)];
+    return detail?.status === 'error' && detail.terminalError !== true;
+  });
+});
 const headerActions = computed<ToolHeaderAction[]>(() => {
   const call = toolCall.value;
-  if (
+  const actions: ToolHeaderAction[] = (
     call
     && reliableConversation.projection.value.fileChangeSetIdByToolCallId[call.id]
     && reliableFileDiff.value
-  ) {
-    return [{
-      id: `open-reliable-diff-${call.id}`,
-      label: '查看差异',
-      title: '使用执行记录中的修改前后内容查看差异，不依赖工作区当前文件',
-      icon: IconFileDiff,
+  )
+    ? [{
+        id: `open-reliable-diff-${call.id}`,
+        label: '查看差异',
+        title: '使用执行记录中的修改前后内容查看差异，不依赖工作区当前文件',
+        icon: IconFileDiff,
+        disabled: false,
+        invoke: () => {
+          bridge.request(BridgeMessageType.ToolDiffOpen, {
+            toolCallId: call.id,
+            ...(reliableConversation.conversationId.value
+              ? { conversationId: reliableConversation.conversationId.value }
+              : {})
+          });
+        }
+      }]
+    : [...toolDisplay.value.headerActions];
+  if (call && retryableDetailTargets.value.length > 0) {
+    actions.push({
+      id: `retry-reliable-details-${call.id}`,
+      label: '重试详情',
+      title: '立即重新读取参数、结果或文件差异详情',
+      icon: IconRefresh,
       disabled: false,
-      invoke: () => {
-        bridge.request(BridgeMessageType.ToolDiffOpen, {
-          toolCallId: call.id,
-          ...(reliableConversation.conversationId.value
-            ? { conversationId: reliableConversation.conversationId.value }
-            : {})
-        });
-      }
-    }];
+      invoke: retryExpandedDetailErrors
+    });
   }
-  return toolDisplay.value.headerActions;
+  return actions;
 });
 const headerPreview = computed(() => toolDisplay.value.headerPreview);
 const hasArgs = computed(() => inputSections.value.length > 0);
@@ -412,7 +443,6 @@ watch(() => toolCall.value?.id, () => {
   userChangedExpanded.value = false;
   expanded.value = autoExpandDetails.value;
   autoOpenedActionIds.value = new Set();
-  automaticallyRetriedDetailKeys.clear();
   clearAutoApplyTimers();
 });
 
@@ -440,7 +470,6 @@ watch(
       toolCallIds: [call.id],
       priority: hasMandatoryInteraction.value ? 'critical' : 'expanded'
     });
-    retryExpandedDetailErrors(true);
   },
   { immediate: true }
 );
@@ -747,18 +776,13 @@ function expandedDetailTargets(callId: string): Array<{
   return targets;
 }
 
-function retryExpandedDetailErrors(automatic = false): void {
+function retryExpandedDetailErrors(): void {
   const call = toolCall.value;
   if (!call) return;
   for (const { kind, recordId } of expandedDetailTargets(call.id)) {
     const key = reliableKernelDetailKey(kind, recordId);
-    const status = reliableConversation.feed.details[key]?.status;
-    if (status === 'ready') {
-      automaticallyRetriedDetailKeys.delete(key);
-      continue;
-    }
-    if (status !== 'error' || (automatic && automaticallyRetriedDetailKeys.has(key))) continue;
-    automaticallyRetriedDetailKeys.add(key);
+    const detail = reliableConversation.feed.details[key];
+    if (detail?.status !== 'error' || detail.terminalError) continue;
     reliableConversation.feed.retryDetail(kind, recordId, { priority: 'expanded' });
   }
 }

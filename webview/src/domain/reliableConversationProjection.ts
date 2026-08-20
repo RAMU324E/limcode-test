@@ -436,7 +436,10 @@ function projectReliableFileChanges(
         missingMemberIds.push(memberId);
         continue;
       }
-      if (detail.status === 'error') continue;
+      if (detail.status === 'error') {
+        if (!detail.terminalError) missingMemberIds.push(memberId);
+        continue;
+      }
       const payload = record(parseJson(detail.text));
       const diff = record(payload?.diff);
       const diffText = textPreserveWhitespace(diff?.text);
