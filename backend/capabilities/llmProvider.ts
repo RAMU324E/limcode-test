@@ -3388,7 +3388,11 @@ function toUnifiedRequest(
   return {
     contents: request.contents.flatMap((content) => toUnifiedContents(content, providerKind)),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map(toUnifiedPart) } } : {}),
-    ...(request.tools.length === 0 ? {} : { tools: [{ functionDeclarations: request.tools.map(toUnifiedFunctionDeclaration) }] }),
+    ...(request.tools.length === 0 ? {} : {
+      tools: [{
+        functionDeclarations: request.tools.map((tool) => toUnifiedFunctionDeclaration(tool, providerKind))
+      }]
+    }),
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {})
   };
 }
@@ -3498,15 +3502,35 @@ function toUnifiedPart(part: ContentPart): UnifiedPart {
   return assertNever(part);
 }
 
-function toUnifiedFunctionDeclaration(tool: ToolSchema): UnifiedFunctionDeclaration {
+function toUnifiedFunctionDeclaration(
+  tool: ToolSchema,
+  providerKind?: LlmProviderKind
+): UnifiedFunctionDeclaration {
   const parameters = isFunctionParameters(tool.parameters)
-    ? tool.parameters
+    ? providerCompatibleFunctionParameters(tool.name, tool.parameters, providerKind)
     : { type: 'object' as const, properties: {} };
   return {
     name: tool.name,
     description: tool.description,
     parameters
   };
+}
+
+function providerCompatibleFunctionParameters(
+  toolName: string,
+  parameters: UnifiedFunctionDeclaration['parameters'],
+  providerKind?: LlmProviderKind
+): UnifiedFunctionDeclaration['parameters'] {
+  if (
+    toolName !== 'edit'
+    || (providerKind !== 'claude' && providerKind !== 'gemini')
+    || !isRecord(parameters)
+  ) return parameters;
+  // Claude rejects top-level unions and Gemini drops them. Keep the full branch properties for
+  // those formats; the shared runtime validator remains the authoritative fail-closed boundary.
+  const parameterRecord = parameters as unknown as Record<string, unknown>;
+  const { oneOf: _unsupportedUnion, ...compatible } = parameterRecord;
+  return compatible as UnifiedFunctionDeclaration['parameters'];
 }
 
 function installGeminiSchemaEncoder<T>(
