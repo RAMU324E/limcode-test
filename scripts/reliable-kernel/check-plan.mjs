@@ -78,6 +78,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',
   'tests/reliable-kernel/runtime-context-rendering.test.mjs',
   'tests/reliable-kernel/streaming-output-regressions.test.mjs',
+  'tests/reliable-kernel/tool-boundary-regressions.test.mjs',
   'tests/reliable-kernel/vscode-fs-local-read.test.cjs',
   'tests/reliable-kernel/webview-feed-lifecycle.test.mjs',
   'tests/reliable-kernel/platform-runtime-compatibility.test.mjs',

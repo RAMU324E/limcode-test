@@ -19,6 +19,34 @@
     "sourceLink": "每个 Provider ToolCall 恰有一个 ToolCallSourceLink，独立关联 ModelRequest、assistant Message、providerCallId/ordinal 与 batch ordinal。",
     "policySnapshot": "每个 Provider ToolCall 恰有一个 ToolCallPolicySnapshot，在任何 capability dispatch 前冻结 summary、display、execution gate、change-apply、auto-submit 与 scheduling。",
     "atomicity": "同一 Provider completed snapshot 的全部 ToolCall、ToolExecution、ToolCallSourceLink 与 ToolCallPolicySnapshot 在一个 SQLite 事务中落库；不允许只观察到批次前缀。",
+    "freshDispatchAdmission": {
+      "scope": "process-local-one-shot",
+      "issuer": "same-dispatcher-after-non-deduplicated-atomic-create-commit",
+      "requiresNonDeduplicatedCommit": true,
+      "requiresCommitSeq": true,
+      "exactMatchFields": [
+        "batchId",
+        "turnId",
+        "modelRequestId",
+        "toolCallId",
+        "providerCallId",
+        "toolName",
+        "arguments",
+        "policy",
+        "providerOrdinal",
+        "callSeq"
+      ],
+      "skipsOnly": [
+        "fresh-tool-six-domain-preflight",
+        "model-request-recipe-reread",
+        "host-definition-reread",
+        "frozen-authority-reread"
+      ],
+      "subsetConsumption": true,
+      "recoveryReusable": false,
+      "fallback": "full-durable-preflight",
+      "preservesTerminationAndEffectFences": true
+    },
     "eventSemantics": "Provider output_item_done.tool_calls 是按 call identity 的 upsert；completed.toolCalls 是完整 snapshot。",
     "providerOrder": "ToolModelResult 与 Context tool_pair 始终按 Provider ordinal 写入；并行只改变 capability dispatch 的重叠，不改变模型上下文顺序。"
   },

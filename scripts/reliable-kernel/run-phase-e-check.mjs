@@ -544,8 +544,8 @@ async function checkCompressionNodeBound() {
     const context = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
     await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'runtime_context',
-      source: { sourceKind: 'runtime_context', sourceId: 'before-tool', sourceRevision: '0' },
+      segmentKind: 'system',
+      source: { sourceKind: 'system', sourceId: 'before-tool', sourceRevision: '0' },
       content: 'before-tool-original', contentType: 'text/plain'
     });
     const pair = await seedToolPair(ctx, seeded, 'pair-bound');
@@ -557,8 +557,8 @@ async function checkCompressionNodeBound() {
     for (let index = 0; index < 4; index += 1) {
       await context.appendContent({
         conversationId: seeded.conversationId,
-        segmentKind: 'runtime_context',
-        source: { sourceKind: 'runtime_context', sourceId: `tail-bound-${index}`, sourceRevision: '0' },
+        segmentKind: 'system',
+        source: { sourceKind: 'system', sourceId: `tail-bound-${index}`, sourceRevision: '0' },
         content: `tail-bound-${index}`, contentType: 'text/plain'
       });
     }
@@ -614,8 +614,8 @@ async function checkCompressionNodeBound() {
     });
     await context.appendContent({
       conversationId: multimodal.conversationId,
-      segmentKind: 'runtime_context',
-      source: { sourceKind: 'runtime_context', sourceId: 'large-inline-image', sourceRevision: '0' },
+      segmentKind: 'system',
+      source: { sourceKind: 'system', sourceId: 'large-inline-image', sourceRevision: '0' },
       content: JSON.stringify({
         role: 'user',
         parts: [{ inlineData: { mimeType: 'image/png', data: 'A'.repeat(700_000) } }]
@@ -656,9 +656,9 @@ async function checkCompressionNodeBound() {
       for (let index = 1; index < sourceCount; index += 1) {
         await context.appendContent({
           conversationId: sized.conversationId,
-          segmentKind: 'runtime_context',
+          segmentKind: 'system',
           source: {
-            sourceKind: 'runtime_context',
+            sourceKind: 'system',
             sourceId: `compression-size-${sourceCount}-${index}`,
             sourceRevision: '0'
           },
@@ -702,8 +702,8 @@ async function checkCompressionNodeBound() {
 
     const appended = await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'runtime_context',
-      source: { sourceKind: 'runtime_context', sourceId: 'after-compression', sourceRevision: '0' },
+      segmentKind: 'system',
+      source: { sourceKind: 'system', sourceId: 'after-compression', sourceRevision: '0' },
       content: 'after-compression', contentType: 'text/plain'
     });
     const afterAppend = await context.materialize(appended.rootId);
@@ -847,8 +847,8 @@ async function checkProviderFullRequest() {
     });
     await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'runtime_context',
-      source: { sourceKind: 'runtime_context', sourceId: 'provider-tail', sourceRevision: '0' },
+      segmentKind: 'system',
+      source: { sourceKind: 'system', sourceId: 'provider-tail', sourceRevision: '0' },
       content: 'provider-tail', contentType: 'text/plain'
     });
     const originalRootId = await context.currentHeadRootId(seeded.conversationId);
@@ -857,12 +857,12 @@ async function checkProviderFullRequest() {
       source_id: seeded.messageRevisionId,
       source_revision: 1n
     }))[0];
-    const runtimeSource = (await list(ctx.database, 'ContextSegmentSource', {
-      source_kind: 'runtime_context',
+    const tailSource = (await list(ctx.database, 'ContextSegmentSource', {
+      source_kind: 'system',
       source_id: 'provider-tail',
       source_revision: 0n
     }))[0];
-    assert.ok(messageSource && runtimeSource);
+    assert.ok(messageSource && tailSource);
     const expectedOriginalContext = [
       {
         segmentId: messageSource.segment_id,
@@ -901,8 +901,8 @@ async function checkProviderFullRequest() {
         })
       },
       {
-        segmentId: runtimeSource.segment_id,
-        segmentKind: 'runtime_context',
+        segmentId: tailSource.segment_id,
+        segmentKind: 'system',
         messageRole: null,
         contentType: 'text/plain',
         content: 'provider-tail'
@@ -930,8 +930,8 @@ async function checkProviderFullRequest() {
     assert.ok(await get(ctx.database, 'ModelRequest', created.modelRequestId));
     const currentHeadAppend = await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'runtime_context',
-      source: { sourceKind: 'runtime_context', sourceId: 'head-after-request-freeze', sourceRevision: '0' },
+      segmentKind: 'system',
+      source: { sourceKind: 'system', sourceId: 'head-after-request-freeze', sourceRevision: '0' },
       content: 'CURRENT-HEAD-AFTER-FROZEN-REQUEST',
       contentType: 'text/plain'
     });
@@ -1732,7 +1732,7 @@ async function checkProviderFullRequest() {
       },
       {
         segmentId: currentHeadAppend.segmentId,
-        segmentKind: 'runtime_context',
+        segmentKind: 'system',
         messageRole: null,
         contentType: 'text/plain',
         content: 'CURRENT-HEAD-AFTER-FROZEN-REQUEST'
@@ -2206,8 +2206,8 @@ async function checkProviderFullRequest() {
     })).length, 1);
     const binaryRoot = await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'runtime_context',
-      source: { sourceKind: 'runtime_context', sourceId: 'provider-non-utf8', sourceRevision: '0' },
+      segmentKind: 'system',
+      source: { sourceKind: 'system', sourceId: 'provider-non-utf8', sourceRevision: '0' },
       content: Uint8Array.from([0xff, 0xfe, 0xfd]),
       contentType: 'application/octet-stream'
     });
@@ -2631,7 +2631,7 @@ async function checkImmutableReplacement() {
         }
       }
     );
-    const coordinatorRequestBudget = kernel.calculateFullRequestBudget({
+    const coordinatorRequestBudget = kernel.calculateFullRequestPlanningBudget({
       contextWindowTokens: 200_000,
       maxOutputTokens: 16_000,
       compressionThresholdTokens: 2,
@@ -2668,7 +2668,7 @@ async function checkImmutableReplacement() {
       compressionPolicy: localOnlyPolicy
     });
     const localOnlyHead = await context.currentHeadRootId(localOnlySeed.conversationId);
-    const localOnlyBudget = kernel.calculateFullRequestBudget({
+    const localOnlyBudget = kernel.calculateFullRequestPlanningBudget({
       contextWindowTokens: 200_000,
       maxOutputTokens: 16_000,
       compressionThresholdTokens: 100_000,
@@ -2961,7 +2961,7 @@ async function checkImmutableReplacement() {
         }
       }
     );
-    const nonReducingRequestBudget = kernel.calculateFullRequestBudget({
+    const nonReducingRequestBudget = kernel.calculateFullRequestPlanningBudget({
       contextWindowTokens: 200_000,
       maxOutputTokens: 16_000,
       compressionThresholdTokens: 1,

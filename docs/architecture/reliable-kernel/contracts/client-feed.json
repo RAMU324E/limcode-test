@@ -25,7 +25,7 @@
     "maxQueuedBatches": 8,
     "maxQueuedBytes": 4194304,
     "snapshotRequiredCoalesced": true,
-    "queueOverflowRule": "丢弃尚未发送的普通 changes，合并为一个 snapshot-required 控制状态；等待当前 inflight 包结束后读取新快照。"
+    "queueOverflowRule": "先将共享当前ACK基线的未发送changes按(type,id)压缩为最新净变化；压缩后仍越过batch/bytes硬上限时，丢弃尚未发送的普通changes并合并为一个snapshot-required控制状态，等待当前inflight结束后读取新快照。"
   },
   "snapshot": {
     "projections": [
@@ -54,9 +54,10 @@
   "changes": {
     "source": "committed-transaction-result",
     "format": "typed-upsert-remove-batch",
-    "oneBatchPerDatabaseCommit": true,
+    "oneBatchPerDatabaseCommit": false,
+    "unsentCommitRangeCompaction": true,
     "durableReplayAcrossExtensionRestart": false,
-    "applyOrder": "server-foreign-key-topological",
+    "applyOrder": "未发送commit range按首次出现的server-foreign-key-topological位置保持顺序，同一(type,id)采用最终写入；客户端原子应用最终净变化。",
     "applyAtomicity": "客户端原子应用整批：任一条目应用失败则整批作废并请求新快照。",
     "unknownTypeRule": "遇到未知 change type 时请求新快照，不做本地猜测合并。",
     "gapRule": "丢失、乱序、未知类型或应用失败时请求新快照",
@@ -70,7 +71,8 @@
     "maxChangeBatchBytes": 1048576,
     "oneCommitOneAtomicBatch": true,
     "singleCommitOverflowRule": "不拆分事务形成半可见状态；不发送该普通批次，直接置 snapshot-required。",
-    "queueOverflowRule": "不无限排队；丢弃未发送普通批次并合并为单一 snapshot-required。",
+    "queueOverflowRule": "不无限排队；先合并共享ACK基线的未发送commit range，同一(type,id)只保留最终净变化；合并后仍超限才丢弃未发送普通批次并进入单一snapshot-required。",
+    "pendingSequenceRule": "未发送changes不分配messageSeq；只有真正进入inflight时才分配连续wire sequence，队列压缩不得制造messageSeq空洞。",
     "snapshotRequiredRule": "snapshot-required 本身只是一位控制状态，不形成队列；当前 inflight 完成后读取新有界快照。"
   },
   "pagination": {
@@ -178,7 +180,7 @@
   },
   "notes": [
     "r4: commitSeq 只在同一 hostBootId 内单调；snapshot 与 changes 通过原子 barrier 交接",
-    "r4: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；超限合并为单一 snapshot-required"
+    "r5: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；共享ACK基线的未发送commit range先压缩净变化，仍超限才转单一snapshot-required；未发送批次不占用wire messageSeq"
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",

@@ -735,6 +735,27 @@ function validateTool(tool, failures) {
     if (retry?.[field] !== false) failures.push(`tool.retryPolicy.${field}必须为false`);
   }
   if (tool?.parallelExecution?.supported !== true) failures.push('必须保留互不冲突工具的并行执行');
+  const freshAdmission = tool?.providerBatch?.freshDispatchAdmission;
+  if (
+    freshAdmission?.scope !== 'process-local-one-shot'
+    || freshAdmission?.issuer !== 'same-dispatcher-after-non-deduplicated-atomic-create-commit'
+    || freshAdmission?.requiresNonDeduplicatedCommit !== true
+    || freshAdmission?.requiresCommitSeq !== true
+    || freshAdmission?.subsetConsumption !== true
+    || freshAdmission?.recoveryReusable !== false
+    || freshAdmission?.fallback !== 'full-durable-preflight'
+    || freshAdmission?.preservesTerminationAndEffectFences !== true
+  ) failures.push('Provider fresh batch admission必须是同dispatcher签发、进程内一次性且失败回退完整durable preflight');
+  failures.push(...exactSetProblems('Provider fresh batch admission匹配字段', [
+    'batchId', 'turnId', 'modelRequestId', 'toolCallId', 'providerCallId',
+    'toolName', 'arguments', 'policy', 'providerOrdinal', 'callSeq'
+  ], freshAdmission?.exactMatchFields ?? []));
+  failures.push(...exactSetProblems('Provider fresh batch admission仅可省略', [
+    'fresh-tool-six-domain-preflight',
+    'model-request-recipe-reread',
+    'host-definition-reread',
+    'frozen-authority-reread'
+  ], freshAdmission?.skipsOnly ?? []));
   failures.push(...exactSetProblems('进程操作', ['execute', 'read_output', 'wait', 'stop'], tool?.processCapability?.operations ?? []));
   if (tool?.processCapability?.releaseMode !== 'detached-wrapper-exact-recovery') failures.push('后台进程首发必须使用detached wrapper精确恢复模式');
   failures.push(...exactSetProblems('进程wrapper证据', ['stableNonce', 'wrapperPid', 'childPid', 'processGroupId', 'startFingerprint', 'commandDigest', 'spoolPath'], tool?.processCapability?.wrapper?.requiredEvidence ?? []));
@@ -915,7 +936,13 @@ function validateClient(client, failures) {
   if (client?.session?.maxInflightDataMessages !== 1) failures.push('同一前端会话只能有一个数据包在途');
   for (const field of ['maxQueuedBatches', 'maxQueuedBytes']) if (!positiveInteger(client?.session?.[field])) failures.push(`client.session.${field}必须是正整数`);
   if (client?.session?.snapshotRequiredCoalesced !== true) failures.push('snapshot-required必须合并为单一控制状态');
-  if (!String(client?.session?.queueOverflowRule ?? '').includes('丢弃') || !String(client?.session?.queueOverflowRule ?? '').includes('snapshot-required')) failures.push('Client queue超限必须丢弃普通changes并转snapshot-required');
+  const queueOverflowRule = String(client?.session?.queueOverflowRule ?? '');
+  if (
+    !queueOverflowRule.includes('压缩')
+    || !queueOverflowRule.includes('仍越过')
+    || !queueOverflowRule.includes('丢弃')
+    || !queueOverflowRule.includes('snapshot-required')
+  ) failures.push('Client queue必须先压缩未发送净变化，仍超限才丢弃普通changes并转snapshot-required');
   failures.push(...exactSetProblems('Client session字段', ['sessionId', 'hostBootId', 'nextMessageSeq', 'inflightMessageSeq?', 'lastAckedCommitSeq?', 'snapshotRequired'], client?.session?.fields ?? []));
   if (client?.sequence?.persistenceAcrossHostRestart !== false || client?.sequence?.wireType !== 'decimal-integer-string') failures.push('commitSeq只能在hostBoot内单调并用十进制整数字符串传输');
 
@@ -925,10 +952,17 @@ function validateClient(client, failures) {
   if (snapshot?.includesFullContextHistory !== false || snapshot?.includesLargeToolContent !== false) failures.push('首屏快照不得携带完整上下文或大工具正文');
 
   const changes = client?.changes;
-  if (changes?.source !== 'committed-transaction-result' || changes?.oneBatchPerDatabaseCommit !== true || changes?.oneCommitOneAtomicBatch !== true) failures.push('前端变化必须直接来自已提交事务，并按事务整批发送');
+  if (
+    changes?.source !== 'committed-transaction-result'
+    || changes?.oneBatchPerDatabaseCommit !== false
+    || changes?.unsentCommitRangeCompaction !== true
+    || changes?.oneCommitOneAtomicBatch !== true
+  ) failures.push('前端变化必须来自已提交事务；单commit不可拆分，未发送commit range必须允许净变化压缩');
   failures.push(...exactSetProblems('changes字段', ['sessionId', 'hostBootId', 'commitSeq', 'changes'], changes?.fields ?? []));
   for (const field of ['maxChangeBatchRecords', 'maxChangeBatchBytes']) if (!positiveInteger(changes?.[field])) failures.push(`client.changes.${field}必须是正整数`);
+  if (!String(changes?.pendingSequenceRule ?? '').includes('不分配messageSeq') || !String(changes?.pendingSequenceRule ?? '').includes('空洞')) failures.push('未发送changes不得提前占用messageSeq或因压缩制造wire gap');
   if (!String(changes?.singleCommitOverflowRule ?? '').includes('不拆分') || !String(changes?.singleCommitOverflowRule ?? '').includes('snapshot-required')) failures.push('单commit超限必须保持原子并转snapshot-required');
+  if (!String(changes?.queueOverflowRule ?? '').includes('先合并') || !String(changes?.queueOverflowRule ?? '').includes('仍超限')) failures.push('changes queue合同必须先合并共享ACK基线，仍超限才snapshot');
   if (client?.snapshotFeedHandoff?.mode !== 'atomic-commit-seq-barrier') failures.push('snapshot→changes必须使用commitSeq原子barrier');
   if (client?.snapshotFeedHandoff?.persistentClientChangeLog !== false) failures.push('snapshot/feed barrier不得引入持久ClientChangeLog');
   const handoffText = JSON.stringify(client?.snapshotFeedHandoff ?? {});

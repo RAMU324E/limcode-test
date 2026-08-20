@@ -1300,7 +1300,7 @@ async function checkCancelSubtree() {
           childAgentId: 'agent-plan-external',
           modelFallback: CHILD_MODEL_FALLBACK,
           sourceSettlement: 'external',
-          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务的默认 answerBridgeId 为 ${externalIdentity.answerBridgeId}。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })；继续同一子对话时该默认值保持不变。`,
+          prompt: `${request.prompt}\n\n[Agent answer bridge]\n本次任务已绑定默认回答通道。需要提交阶段性结论或最终正文时调用 submit_agent_answer({ title, content })，并省略 childRef；Runtime 会使用当前子任务的默认通道。只有在用户明确要求提交到其它通道时，才传入当前模型上下文中提供的短 childRef。继续同一子对话、中断或重试不会改变默认通道。`,
           completionPolicy: 'background',
           leaseOwnerId: `child-owner-plan-external-${externalEnsureAttempts}`,
           leaseExpiresAt: `2026-08-0${externalEnsureAttempts + 1}T00:00:00.000Z`
@@ -1968,6 +1968,7 @@ async function checkClientSnapshotBounds() {
     const transientLifecycleSource = await fs.readFile(path.join(root, 'webview/src/domain/reliableTransientLifecycle.ts'), 'utf8');
     const transientActivitySource = await fs.readFile(path.join(root, 'webview/src/domain/reliableTransientActivity.ts'), 'utf8');
     const functionCallSource = await fs.readFile(path.join(root, 'webview/src/components/content/parts/FunctionCallPartView.vue'), 'utf8');
+    const detailStoreSource = await fs.readFile(path.join(root, 'webview/src/stores/useReliableKernelClientFeedStore.ts'), 'utf8');
     const messageItemSource = await fs.readFile(path.join(root, 'webview/src/components/conversation/MessageItem.vue'), 'utf8');
     assert.match(messageListSource, /v-for="[^"]*visibleTimelineRows"/);
     assert.match(messageListSource, /scroller/);
@@ -1980,7 +1981,13 @@ async function checkClientSnapshotBounds() {
     assert.match(messageListSource, /kind:\s*['"]message-content['"]/);
     assert.match(messageItemSource, /v-if="detailLoading"/);
     assert.match(transientModelSource, /options\.includeFinal === true/);
-    assert.match(functionCallSource, /!partId \|\| !props\.messageId \|\| toolCall\.value/);
+    assert.match(functionCallSource, /if \(!partId \|\| !props\.messageId\) return undefined;/);
+    assert.doesNotMatch(functionCallSource, /!props\.messageId \|\| toolCall\.value/);
+    assert.match(functionCallSource, /interactionByToolCallId\[durableCallId\]\?\.status === 'pending'/);
+    assert.match(functionCallSource, /messageDetail\?\.status === 'error'/);
+    assert.match(detailStoreSource, /DETAIL_AUTO_RETRY_DELAYS_MS = \[250, 750, 2_000\]/);
+    assert.match(functionCallSource, /label:\s*'重试详情'/);
+    assert.match(functionCallSource, /feed\.retryDetail\(kind, recordId/);
     assert.match(functionCallSource, /includeFinal:\s*true/);
     assert.match(transientLifecycleSource, /detailReady && toolFactsReady/);
     assert.match(messageListSource, /messages\.value\[messages\.value\.length - 1\]\?\.id/);
@@ -1999,7 +2006,7 @@ async function checkClientSnapshotBounds() {
     assert.notEqual(plain, proxy);
     assert.throws(() => plainData.toStructuredClonePlainData(new Map()), /forbidden class/);
     assert.throws(() => plainData.toStructuredClonePlainData({ callback() {} }), /unsupported function/);
-    assertions.push('可靠时间线使用30+8 segmented挂载上限、projection绝对楼层和瞬态向上取整；Message+Revision+detail状态驱动正文水合并以中性骨架展示；final工具参数快照持续到durable ToolCall接管；Attempt 2+的持久自动恢复状态在无输出时优先展示，并在对应transient可见后让位；Bridge payload递归转plain且拒绝Map/function/class');
+    assertions.push('可靠时间线使用30+8 segmented挂载上限、projection绝对楼层和瞬态向上取整；Message+Revision+detail状态驱动正文水合并以中性骨架展示；final工具参数快照持续到Message detail与匹配Tool facts可展示，pending交互或重试耗尽时显式交接；详情读取按250/750/2000ms有界退避且工具卡提供手动重试；Attempt 2+的持久自动恢复状态在无输出时优先展示，并在对应transient可见后让位；Bridge payload递归转plain且拒绝Map/function/class');
     faults.push('keyset insertion between pages');
     faults.push('detail payload larger than maxResponseBytes');
     metrics.snapshotBytes = wireBytes(snapshot);
@@ -2190,22 +2197,29 @@ async function checkClientQueueBounds() {
         })
       ]);
     }
-    const overflow = ctx.services.clientFeed.inspectSession(connection.sessionId);
-    assert.equal(overflow.snapshotRequired, true);
-    assert.equal(overflow.queuedBatches, 0);
+    const compacted = ctx.services.clientFeed.inspectSession(connection.sessionId);
+    assert.equal(compacted.snapshotRequired, false);
+    assert.equal(compacted.queuedBatches, 1);
+    assert.equal(compacted.nextMessageSeq, '2');
     assert.equal(sent.length, 1);
     await ctx.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: 'queue-count-coalesced', title: 'coalesced', status: 'active', created_at: NOW, updated_at: NOW
       })
     ]);
+    const extended = ctx.services.clientFeed.inspectSession(connection.sessionId);
+    assert.equal(extended.snapshotRequired, false);
+    assert.equal(extended.queuedBatches, 1);
+    assert.equal(extended.nextMessageSeq, '2');
     assert.equal(sent.length, 1);
     acknowledge(ctx.services.clientFeed, connection, sent[0]);
-    await waitFor(() => sent.length === 2, 5000, 'queue overflow snapshot handoff');
-    assert.equal(sent[1].type, 'reliable-kernel.snapshot');
+    await waitFor(() => sent.length === 2, 5000, 'queue compacted changes handoff');
+    assert.equal(sent[1].type, 'reliable-kernel.changes');
+    assert.equal(sent[1].messageSeq, '2');
+    assert.equal(sent[1].changes.length, 10);
     assert.equal(ctx.services.clientFeed.inspectSession(connection.sessionId).inflightMessageSeq, sent[1].messageSeq);
     ctx.services.clientFeed.disconnect(connection.sessionId);
-    return { sent, overflow };
+    return { sent, compacted, extended };
   });
 
   const byteEvidence = await withRuntime('client-queue-bytes', async (ctx) => {
@@ -2281,8 +2295,7 @@ async function checkClientQueueBounds() {
       activeConversationId: seeded.conversationId,
       send: (message) => sent.push(message)
     });
-    let previous;
-    let overflowAt = 0;
+    let latest;
     for (let batch = 1; batch <= 8; batch += 1) {
       const steps = [];
       for (let index = 0; index < 200; index += 1) {
@@ -2299,35 +2312,35 @@ async function checkClientQueueBounds() {
       }
       await ctx.database.transaction(steps);
       const current = ctx.services.clientFeed.inspectSession(connection.sessionId);
-      if (current.snapshotRequired) {
-        overflowAt = batch;
-        break;
-      }
-      previous = current;
+      assert.equal(current.snapshotRequired, false);
+      assert.equal(current.queuedBatches, 1);
+      assert.ok(current.queuedBytes > 0);
+      assert.ok(current.queuedBytes <= 1_048_576, 'compacted pending changes remain inside one wire batch');
+      latest = current;
     }
-    assert.ok(previous && previous.queuedBatches < 8);
-    assert.ok(previous.queuedBytes > 0);
-    const overflow = ctx.services.clientFeed.inspectSession(connection.sessionId);
-    assert.equal(overflow.snapshotRequired, true);
-    assert.equal(overflow.queuedBatches, 0);
-    assert.ok(overflowAt <= 8, 'byte overflow must occur before batch-count overflow');
+    assert.ok(latest);
+    acknowledge(ctx.services.clientFeed, connection, sent[0]);
+    await waitFor(() => sent.length === 2, 5000, 'byte-heavy compacted changes handoff');
+    assert.equal(sent[1].type, 'reliable-kernel.changes');
+    assert.equal(sent[1].messageSeq, '2');
+    assert.equal(sent[1].changes.length, 400);
     ctx.services.clientFeed.disconnect(connection.sessionId);
-    return { overflowAt, previousBytes: previous.queuedBytes };
+    return { compactedBytes: latest.queuedBytes, changeCount: sent[1].changes.length };
   });
 
   return {
     assertions: [
-      'slow ACK期间严格保持一个inflight；第9个普通batch使未发送队列清空并置单一snapshotRequired',
-      'snapshot-required不入队且后续commit只coalesce一位，ACK后atomic handoff为一份新snapshot',
-      'queuedBytes在batch数尚未达到8时越过4MiB即独立触发overflow'
+      'slow ACK期间严格保持一个inflight；共享ACK基线的未发送changes压缩为一个最新commit range',
+      '未发送changes不占用messageSeq，ACK后以连续sequence发送一份原子净变化batch',
+      '重复更新相同400条可见记录时按(type,id)保留最终值，queuedBytes不随commit数量线性累加'
     ],
-    faults: ['slow ACK batch-count overflow', 'slow ACK queued-byte overflow'],
+    faults: ['slow ACK repeated-record burst', 'slow ACK large repeated-record burst'],
     metrics: {
       maxInflight: 1,
-      maxQueuedBatchesObservedBeforeOverflow: 8,
-      byteOverflowAtBatch: byteEvidence.overflowAt,
-      queuedBytesBeforeByteOverflow: byteEvidence.previousBytes,
-      coalescedSnapshotMessages: countEvidence.sent.length
+      compactedQueuedBatches: countEvidence.compacted.queuedBatches,
+      compactedWireMessages: countEvidence.sent.length,
+      compactedLargeBatchBytes: byteEvidence.compactedBytes,
+      compactedLargeBatchChanges: byteEvidence.changeCount
     }
   };
 }
