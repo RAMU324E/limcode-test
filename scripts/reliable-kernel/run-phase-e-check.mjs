@@ -547,6 +547,7 @@ async function checkCompressionNodeBound() {
       segmentKind: 'system',
       source: { sourceKind: 'system', sourceId: 'before-tool', sourceRevision: '0' },
       content: 'before-tool-original', contentType: 'text/plain'
+
     });
     const pair = await seedToolPair(ctx, seeded, 'pair-bound');
     const pairAppend = await context.appendToolPair({
@@ -555,73 +556,25 @@ async function checkCompressionNodeBound() {
       toolModelResultId: pair.toolModelResultId
     });
     for (let index = 0; index < 4; index += 1) {
+      const tailDelivery = runtimeDeliveryFixture(
+        `tail-bound-${index}`,
+        seeded.turnId,
+        `tail-bound-${index}`
+      );
       await context.appendContent({
         conversationId: seeded.conversationId,
-        segmentKind: 'system',
-        source: { sourceKind: 'system', sourceId: `tail-bound-${index}`, sourceRevision: '0' },
-        content: `tail-bound-${index}`, contentType: 'text/plain'
-      });
-    }
-    const sourceRootId = await context.currentHeadRootId(seeded.conversationId);
-    const sourceMaterialized = await context.materialize(sourceRootId);
-    assert.equal(sourceMaterialized.segments[2].segmentId, pairAppend.segmentId);
-    const pairSources = await list(ctx.database, 'ContextSegmentSource', { segment_id: pairAppend.segmentId });
-    assert.deepEqual(pairSources.map((row) => row.source_kind).sort(), ['tool_call', 'tool_model_result']);
-    assertions.push('tool call与唯一ToolModelResult形成一个tool_pair segment并登记两条同call_seq source，压缩只能按整个segment选取');
+    await appendMessageContextFixture(
+      ctx,
+      multimodal,
+      'large-inline-image',
+      'user',
+      JSON.stringify({
 
-    const rootBefore = await get(ctx.database, 'ContextSequenceRoot', sourceRootId);
-    const durableByteEstimate = sourceMaterialized.segments.reduce(
-      (sum, segment) => sum + Number((segment.contentObject.byte_length + 3n) / 4n),
-      0
-    );
-    assert.ok(Number(rootBefore.estimated_tokens) > 0);
-    const tokenEstimator = new kernel.ReliableContextTokenEstimator(ctx.database, ctx.store);
-    const providerAligned = await tokenEstimator.estimateRoot(sourceRootId);
-    const compression = new kernel.ContextCompressionControlPlane(ctx.database, ctx.store);
-    const decision = await compression.evaluate(sourceRootId, seeded.authoritySnapshotId);
-    assert.equal(decision.estimatedTokens, providerAligned.estimatedTokens);
-    assert.ok(Math.abs(decision.estimatedTokens - durableByteEstimate) < 1_000);
-    assert.equal(decision.shouldCompress, true);
-    assert.ok(decision.estimatedTokens >= decision.thresholdTokens);
-    const belowThreshold = await seedTurn(ctx, 'compression-below-threshold', {
-      thresholdTokens: 1_000_000
-    });
-    const belowThresholdRootId = await context.currentHeadRootId(belowThreshold.conversationId);
-    const belowThresholdDecision = await compression.evaluate(
-      belowThresholdRootId,
-      belowThreshold.authoritySnapshotId
-    );
-    assert.equal(belowThresholdDecision.shouldCompress, false);
-    const contentRowsBeforeExplicitCompression = await countAll(ctx.database, 'ContentObject');
-    const belowThresholdCompression = await compression.create({
-      conversationId: belowThreshold.conversationId,
-      headRootId: belowThresholdRootId,
-      authoritySnapshotId: belowThreshold.authoritySnapshotId,
-      compressSegmentCount: 1,
-      title: 'explicit-below-threshold',
-      summary: 'explicit-below-threshold',
-      idempotencyKey: 'below-threshold-explicit'
-    });
-    assert.equal(belowThresholdCompression.sourceCount, 1);
-    assert.ok(await countAll(ctx.database, 'ContentObject') > contentRowsBeforeExplicitCompression);
-    assert.equal(
-      await context.currentHeadRootId(belowThreshold.conversationId),
-      belowThresholdCompression.rootId
-    );
-
-    const multimodal = await seedTurn(ctx, 'compression-multimodal-token-estimate', {
-      thresholdTokens: 100_000
-    });
-    await context.appendContent({
-      conversationId: multimodal.conversationId,
-      segmentKind: 'system',
-      source: { sourceKind: 'system', sourceId: 'large-inline-image', sourceRevision: '0' },
-      content: JSON.stringify({
         role: 'user',
         parts: [{ inlineData: { mimeType: 'image/png', data: 'A'.repeat(700_000) } }]
       }),
-      contentType: 'application/vnd.limcode.message+json'
-    });
+      'application/vnd.limcode.message+json'
+    );
     const multimodalRootId = await context.currentHeadRootId(multimodal.conversationId);
     const multimodalRoot = await get(ctx.database, 'ContextSequenceRoot', multimodalRootId);
     assert.ok(Number(multimodalRoot.estimated_tokens) > 100_000, 'legacy durable byte cache should reproduce the false threshold crossing');
@@ -654,6 +607,11 @@ async function checkCompressionNodeBound() {
     for (const sourceCount of [1, 64, 512]) {
       const sized = await seedTurn(ctx, `compression-size-${sourceCount}`, { thresholdTokens: 1 });
       for (let index = 1; index < sourceCount; index += 1) {
+        const sizedDelivery = runtimeDeliveryFixture(
+          `compression-size-${sourceCount}-${index}`,
+          sized.turnId,
+          `compression-size-${sourceCount}-${index}`
+        );
         await context.appendContent({
           conversationId: sized.conversationId,
           segmentKind: 'system',
@@ -662,8 +620,8 @@ async function checkCompressionNodeBound() {
             sourceId: `compression-size-${sourceCount}-${index}`,
             sourceRevision: '0'
           },
-          content: `compression-size-${sourceCount}-${index}`,
-          contentType: 'text/plain'
+          content: sizedDelivery.content,
+          contentType: sizedDelivery.contentType
         });
       }
       const sizedRoot = await context.currentHeadRootId(sized.conversationId);
@@ -705,6 +663,7 @@ async function checkCompressionNodeBound() {
       segmentKind: 'system',
       source: { sourceKind: 'system', sourceId: 'after-compression', sourceRevision: '0' },
       content: 'after-compression', contentType: 'text/plain'
+
     });
     const afterAppend = await context.materialize(appended.rootId);
     assert.deepEqual(afterAppend.segments.map((segment) => segment.content.toString('utf8')), [
