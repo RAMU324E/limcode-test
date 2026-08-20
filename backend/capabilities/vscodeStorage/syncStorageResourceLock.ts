@@ -8,6 +8,10 @@ import {
   retryTransientFileOperationSync,
   sleepSync
 } from './syncJson';
+import {
+  isRetryableWindowsLockGenerationRenameError,
+  isRetryableWindowsLockPublicationRenameError
+} from './lockRenameErrors';
 
 export interface SyncStorageResourceLockFileMetadata {
   ownerToken: string;
@@ -105,9 +109,11 @@ function acquireSyncStorageResourceLock(resourcePath: string, options: Normalize
       createLockDirectory(lockPath, metadata, options);
       return { lockPath, metadata };
     } catch (error) {
-      const contention = isLockContentionError(error, lockPath);
-      if (!contention && !isTransientCandidateRenameError(error, lockPath)) throw error;
-      if (contention && recoverExistingLockDirectory(lockPath, options)) continue;
+      if (
+        !isAlreadyExistsError(error)
+        && !isRetryableWindowsLockPublicationRenameError(error, lockPath, process.platform)
+      ) throw error;
+      if (recoverExistingLockDirectory(lockPath, options) === 'recovered') continue;
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for sync storage resource lock: ${lockPath}`);
       sleepSync(Math.min(options.pollIntervalMs, Math.max(1, deadline - Date.now())));
     }
@@ -183,18 +189,20 @@ function createLockDirectory(
   }
 }
 
-function recoverExistingLockDirectory(lockPath: string, options: NormalizedSyncStorageResourceLockOptions): boolean {
+type ExistingLockRecovery = 'missing' | 'recovered' | 'held';
+
+function recoverExistingLockDirectory(lockPath: string, options: NormalizedSyncStorageResourceLockOptions): ExistingLockRecovery {
   const snapshot = readLockDirectorySnapshot(lockPath, options);
-  if (snapshot.status === 'missing') return true;
+  if (snapshot.status === 'missing') return 'missing';
   const ageMs = snapshot.status === 'ok'
     ? Math.max(0, Date.now() - snapshot.metadata.createdAt)
     : Math.max(0, Date.now() - lockGenerationTimestamp(snapshot.stat));
   const staleAfterMs = snapshot.status === 'ok' ? options.staleMs : options.invalidMetadataWaitMs;
-  if (ageMs < staleAfterMs) return false;
+  if (ageMs < staleAfterMs) return 'held';
   // A synchronous critical section has no safe heartbeat opportunity. An old timestamp alone must
   // never fence a paused-but-live writer; otherwise it could resume and overwrite the new owner
   // before noticing the generation mismatch at release. Prefer availability loss over corruption.
-  if (snapshot.status === 'ok' && isProcessAlive(snapshot.metadata.pid)) return false;
+  if (snapshot.status === 'ok' && isProcessAlive(snapshot.metadata.pid)) return 'held';
 
   const generation = snapshot.status === 'ok'
     ? `owner-${snapshot.metadata.ownerToken}`
@@ -202,14 +210,10 @@ function recoverExistingLockDirectory(lockPath: string, options: NormalizedSyncS
   const quarantinePath = generationQuarantinePath(lockPath, generation);
   try {
     fs.renameSync(lockPath, quarantinePath);
-    return true;
+    return 'recovered';
   } catch (error) {
-    if (isFileNotFoundError(error) || isAlreadyExistsError(error)) {
-      // Another contender already quarantined this exact generation. Re-evaluate the canonical
-      // path; it may now be absent or owned by a newer generation.
-      return true;
-    }
-    if (isTransientFileBusyError(error)) return false;
+    if (isFileNotFoundError(error)) return 'missing';
+    if (isAlreadyExistsError(error) || isTransientFileBusyError(error)) return 'held';
     throw error;
   }
 }
@@ -295,49 +299,6 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function isLockContentionError(error: unknown, lockPath: string): boolean {
-  if (isAlreadyExistsError(error)) return true;
-  if (process.platform !== 'win32') return false;
-  const candidate = error as { code?: unknown; syscall?: unknown; dest?: unknown };
-  if (
-    candidate.code !== 'EPERM'
-    || candidate.syscall !== 'rename'
-    || typeof candidate.dest !== 'string'
-    || path.resolve(candidate.dest) !== path.resolve(lockPath)
-  ) return false;
-  try {
-    return fs.statSync(lockPath).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Windows only: the publication rename can fail transiently (EPERM/EACCES/EBUSY) when an
- * external reader — antivirus real-time scan, search indexer — holds a handle inside the
- * candidate directory while the canonical lock path does NOT exist yet. This is not lock
- * contention, so isLockContentionError cannot classify it (its statSync(lockPath) fails),
- * and without this branch the transient error escapes raw and kills the caller's turn.
- * Treat it as retryable within the acquire deadline; the rename remains the only atomic
- * compare-and-swap, so retrying cannot weaken mutual exclusion.
- */
-function isTransientCandidateRenameError(error: unknown, lockPath: string): boolean {
-  if (process.platform !== 'win32') return false;
-  const candidate = error as { code?: unknown; syscall?: unknown; dest?: unknown };
-  if (
-    (candidate.code !== 'EPERM' && candidate.code !== 'EACCES' && candidate.code !== 'EBUSY')
-    || candidate.syscall !== 'rename'
-    || typeof candidate.dest !== 'string'
-    || path.resolve(candidate.dest) !== path.resolve(lockPath)
-  ) return false;
-  try {
-    fs.statSync(lockPath);
-    return false; // lockPath exists -> another owner holds the lock; contention path handles it
-  } catch {
-    return true; // lockPath absent -> the candidate itself is transiently busy
-  }
-}
-
 function renameLockGenerationSync(
   sourcePath: string,
   destinationPath: string,
@@ -350,26 +311,16 @@ function renameLockGenerationSync(
     } catch (error) {
       if (
         attempt >= options.maxRetries
-        || !isExpectedWindowsLockReleaseRenameError(error, sourcePath, destinationPath)
+        || !isRetryableWindowsLockGenerationRenameError(
+          error,
+          sourcePath,
+          destinationPath,
+          process.platform
+        )
       ) throw error;
       sleepSync(options.retryDelayMs);
     }
   }
-}
-
-function isExpectedWindowsLockReleaseRenameError(
-  error: unknown,
-  sourcePath: string,
-  destinationPath: string
-): boolean {
-  if (process.platform !== 'win32') return false;
-  const candidate = error as { code?: unknown; syscall?: unknown; path?: unknown; dest?: unknown };
-  return (candidate.code === 'EPERM' || candidate.code === 'EACCES' || candidate.code === 'EBUSY')
-    && candidate.syscall === 'rename'
-    && typeof candidate.path === 'string'
-    && path.resolve(candidate.path) === path.resolve(sourcePath)
-    && typeof candidate.dest === 'string'
-    && path.resolve(candidate.dest) === path.resolve(destinationPath);
 }
 
 function isAlreadyExistsError(error: unknown): boolean {

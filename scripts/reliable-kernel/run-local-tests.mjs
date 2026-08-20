@@ -39,6 +39,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
   'tests/runAgentToolSchema.test.cjs',
   'tests/settingsRevisionConflict.test.cjs',
+  'tests/storageLockRace.test.cjs',
   'tests/vscodeStorageJsonDurability.test.cjs',
   'tests/webviewLocalResources.test.cjs'
 ]);

@@ -7,6 +7,10 @@ import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { readJson, writeJson } from './json';
 import { sortableName } from './naming';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
+import {
+  isRetryableWindowsLockGenerationRenameError,
+  isRetryableWindowsLockPublicationRenameError
+} from './lockRenameErrors';
 import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
 
 interface RecordsIndexFile {
@@ -420,9 +424,11 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
       await createRecordStoreLockDirectory(lockPath, metadata);
       break;
     } catch (error) {
-      const contention = await isRecordStoreLockContentionError(error, lockPath);
-      if (!contention && !(await isTransientRecordStoreCandidateRenameError(error, lockPath))) throw error;
-      if (contention && await removeStaleRecordStoreLock(lockPath, metadata.indexPath)) continue;
+      if (
+        !isAlreadyExistsError(error)
+        && !isRetryableWindowsLockPublicationRenameError(error, lockPath, process.platform)
+      ) throw error;
+      if (await recoverExistingRecordStoreLock(lockPath, metadata.indexPath) === 'recovered') continue;
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for record store lock: ${indexPath}`);
       await delay(25);
     }
@@ -446,7 +452,12 @@ async function withCrossProcessRecordStoreLock<T>(indexUri: vscode.Uri, action: 
   return result;
 }
 
-async function removeStaleRecordStoreLock(lockPath: string, expectedIndexPath: string): Promise<boolean> {
+type ExistingRecordStoreLockRecovery = 'missing' | 'recovered' | 'held';
+
+async function recoverExistingRecordStoreLock(
+  lockPath: string,
+  expectedIndexPath: string
+): Promise<ExistingRecordStoreLockRecovery> {
   try {
     const stat = await fs.stat(lockPath);
     const raw = await fs.readFile(
@@ -458,8 +469,8 @@ async function removeStaleRecordStoreLock(lockPath: string, expectedIndexPath: s
     const legacy = metadata ? undefined : parseLegacyRecordStoreLockMetadata(raw, expectedIndexPath);
     const ageMs = Math.max(0, Date.now() - (metadata?.createdAt ?? legacy?.createdAt ?? stat.mtimeMs));
     const staleAfterMs = metadata || legacy ? RECORD_STORE_LOCK_STALE_MS : RECORD_STORE_LOCK_INVALID_WAIT_MS;
-    if (ageMs < staleAfterMs) return false;
-    if ((metadata || legacy) && processIsAlive((metadata ?? legacy)!.pid)) return false;
+    if (ageMs < staleAfterMs) return 'held';
+    if ((metadata || legacy) && processIsAlive((metadata ?? legacy)!.pid)) return 'held';
     const generation = metadata?.ownerToken
       ?? (legacy ? `legacy-${legacy.pid}-${legacy.createdAt}` : `invalid-${Math.floor(stat.ctimeMs)}-${stat.size}`);
     const quarantinePath = recordStoreLockQuarantinePath(lockPath, `${generation}-${randomUUID()}`);
@@ -469,11 +480,11 @@ async function removeStaleRecordStoreLock(lockPath: string, expectedIndexPath: s
     // not resurrect or block the lock, but leaving every recovered generation behind would leak
     // one directory per crashed writer forever.
     await fs.rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
-    return true;
+    return 'recovered';
   } catch (error) {
-    if (isFileNotFound(error)) return true;
-    if (isAlreadyExistsError(error)) return false;
-    return false;
+    if (isFileNotFound(error)) return 'missing';
+    if (isAlreadyExistsError(error)) return 'held';
+    return 'held';
   }
 }
 
@@ -568,53 +579,6 @@ function isAlreadyExistsError(error: unknown): boolean {
   return code === 'EEXIST' || code === 'ENOTEMPTY';
 }
 
-async function isRecordStoreLockContentionError(error: unknown, lockPath: string): Promise<boolean> {
-  if (isAlreadyExistsError(error)) return true;
-  if (process.platform !== 'win32') return false;
-
-  const renameError = error as { code?: unknown; syscall?: unknown; dest?: unknown };
-  if (
-    renameError.code !== 'EPERM'
-    || renameError.syscall !== 'rename'
-    || typeof renameError.dest !== 'string'
-    || path.resolve(renameError.dest) !== path.resolve(lockPath)
-  ) return false;
-
-  // Windows reports EPERM rather than EEXIST/ENOTEMPTY when a candidate directory loses the
-  // atomic publication race. Reinterpret only that exact destination and only while it exists.
-  try {
-    return (await fs.stat(lockPath)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Windows only: the candidate publication rename can fail transiently (EPERM/EACCES/EBUSY) when
- * an external reader — antivirus real-time scan, search indexer — holds a handle inside the
- * candidate directory while the canonical lock path does NOT exist yet. This is not lock
- * contention, so isRecordStoreLockContentionError cannot classify it (its stat(lockPath)
- * fails), and without this branch the transient error escapes raw and kills the caller's turn.
- * Treat it as retryable within the acquire deadline; the rename remains the only atomic
- * compare-and-swap, so retrying cannot weaken mutual exclusion.
- */
-async function isTransientRecordStoreCandidateRenameError(error: unknown, lockPath: string): Promise<boolean> {
-  if (process.platform !== 'win32') return false;
-  const renameError = error as { code?: unknown; syscall?: unknown; dest?: unknown };
-  if (
-    (renameError.code !== 'EPERM' && renameError.code !== 'EACCES' && renameError.code !== 'EBUSY')
-    || renameError.syscall !== 'rename'
-    || typeof renameError.dest !== 'string'
-    || path.resolve(renameError.dest) !== path.resolve(lockPath)
-  ) return false;
-  try {
-    await fs.stat(lockPath);
-    return false; // lockPath exists -> another owner holds the lock; contention path handles it
-  } catch {
-    return true; // lockPath absent -> the candidate itself is transiently busy
-  }
-}
-
 async function renameRecordStoreLockGeneration(sourcePath: string, destinationPath: string): Promise<void> {
   for (let attempt = 1; ; attempt += 1) {
     try {
@@ -623,26 +587,16 @@ async function renameRecordStoreLockGeneration(sourcePath: string, destinationPa
     } catch (error) {
       if (
         attempt >= WINDOWS_LOCK_RELEASE_RENAME_ATTEMPTS
-        || !isExpectedWindowsLockReleaseRenameError(error, sourcePath, destinationPath)
+        || !isRetryableWindowsLockGenerationRenameError(
+          error,
+          sourcePath,
+          destinationPath,
+          process.platform
+        )
       ) throw error;
       await delay(WINDOWS_LOCK_RELEASE_RENAME_DELAY_MS);
     }
   }
-}
-
-function isExpectedWindowsLockReleaseRenameError(
-  error: unknown,
-  sourcePath: string,
-  destinationPath: string
-): boolean {
-  if (process.platform !== 'win32') return false;
-  const candidate = error as { code?: unknown; syscall?: unknown; path?: unknown; dest?: unknown };
-  return (candidate.code === 'EPERM' || candidate.code === 'EACCES' || candidate.code === 'EBUSY')
-    && candidate.syscall === 'rename'
-    && typeof candidate.path === 'string'
-    && path.resolve(candidate.path) === path.resolve(sourcePath)
-    && typeof candidate.dest === 'string'
-    && path.resolve(candidate.dest) === path.resolve(destinationPath);
 }
 
 function delay(milliseconds: number): Promise<void> {
