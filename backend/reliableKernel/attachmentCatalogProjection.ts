@@ -3,7 +3,7 @@ import { mergeAttachmentCatalog } from './attachmentCatalog';
 import {
   type ContextSegmentKind,
   type ContextSourceOccurrence,
-  validateContextSegmentSources
+  validateScopedContextSegmentSources
 } from './contextSequence';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -24,43 +24,55 @@ export class AttachmentCatalogProjection {
   private readonly blockSourceCache = new Map<string, DomainRow[]>();
   private readonly revisionLinkCache = new Map<string, DomainRow[]>();
   private readonly messageRevisionCache = new Map<string, DomainRow>();
+  private readonly messageMembershipCache = new Map<string, DomainRow[]>();
   private readonly toolCallCache = new Map<string, DomainRow>();
   private readonly toolResultCache = new Map<string, DomainRow>();
+  private readonly turnCache = new Map<string, DomainRow>();
   private readonly attachmentCache = new Map<string, DomainRow>();
 
   public constructor(private readonly database: RuntimeDatabase) {}
 
   public project(
+    conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[] = []
   ): Promise<AttachmentCatalogEntry[]> {
     // One worker per projection keeps caches bounded and prevents concurrent freezes from clearing or
     // mixing each other's lineage state. Late append-only AttachmentLink rows remain visible too.
     return new AttachmentCatalogProjection(this.database).projectIsolated(
+      requireId(conversationId, 'conversationId'),
       segments,
       additionalMessageRevisionIds
     );
   }
 
   private async projectIsolated(
+    conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[]
   ): Promise<AttachmentCatalogEntry[]> {
     const segmentIds = segments.map((segment) => requireId(segment.segmentId, 'segmentId'));
     await this.primeSegments(segmentIds);
-    await this.primeCompressionLineage(segmentIds);
+    await this.primeCompressionLineage(conversationId, segmentIds);
     const revisions: string[] = [];
     for (const segmentId of segmentIds) {
-      await this.collectSegmentRevisions(segmentId, revisions, new Set<string>());
+      await this.collectSegmentRevisions(conversationId, segmentId, revisions, new Set<string>());
     }
-    for (const revisionId of additionalMessageRevisionIds) {
-      revisions.push(requireId(revisionId, 'messageRevisionId'));
+    const additionalRevisionIds = additionalMessageRevisionIds.map((revisionId) =>
+      requireId(revisionId, 'messageRevisionId')
+    );
+    await this.primeMessageRevisionOwners(additionalRevisionIds);
+    for (const revisionId of additionalRevisionIds) {
+      if (!this.messageRevisionBelongsToConversation(revisionId, conversationId)) {
+        throw new Error(`MessageRevision ${revisionId} does not belong to Conversation ${conversationId}.`);
+      }
+      revisions.push(revisionId);
     }
 
     const uniqueRevisions = [...new Set(revisions)];
     await this.primeDomainRows('MessageRevision', uniqueRevisions, this.messageRevisionCache);
-    for (const [segmentId, sources] of this.sourceCache) {
-      for (const source of sources) {
+    for (const [segmentId] of this.sourceCache) {
+      for (const source of this.scopedSources(segmentId, conversationId)) {
         if (source.source_kind !== 'message_revision') continue;
         const revisionId = requireId(source.source_id, 'ContextSegmentSource.source_id');
         const revision = this.messageRevisionCache.get(revisionId);
@@ -89,6 +101,7 @@ export class AttachmentCatalogProjection {
   }
 
   private async collectSegmentRevisions(
+    conversationId: string,
     segmentId: string,
     revisions: string[],
     path: Set<string>
@@ -96,10 +109,9 @@ export class AttachmentCatalogProjection {
     if (path.has(segmentId)) throw new Error(`Compression lineage cycle detected at ${segmentId}.`);
     const segment = await this.segment(segmentId);
     const segmentKind = requireSegmentKind(segment.segment_kind);
-    const sources = this.sourceCache.get(segmentId);
-    if (!sources) throw new Error(`ContextSegmentSource cache was not primed for ${segmentId}.`);
+    const sources = this.scopedSources(segmentId, conversationId);
     const occurrences = sources.map(contextSourceOccurrence);
-    validateContextSegmentSources(segmentKind, occurrences);
+    validateScopedContextSegmentSources(segmentKind, occurrences);
 
     if (segmentKind === 'compression') {
       const blockId = occurrences[0].sourceId;
@@ -118,7 +130,7 @@ export class AttachmentCatalogProjection {
       );
       await this.primeSegments(childSegmentIds);
       for (const childSegmentId of childSegmentIds) {
-        await this.collectSegmentRevisions(childSegmentId, revisions, nextPath);
+        await this.collectSegmentRevisions(conversationId, childSegmentId, revisions, nextPath);
       }
       return;
     }
@@ -161,7 +173,10 @@ export class AttachmentCatalogProjection {
     return entries;
   }
 
-  private async primeCompressionLineage(rootSegmentIds: readonly string[]): Promise<void> {
+  private async primeCompressionLineage(
+    conversationId: string,
+    rootSegmentIds: readonly string[]
+  ): Promise<void> {
     const expanded = new Set<string>();
     let frontier = [...new Set(rootSegmentIds)];
     while (frontier.length > 0) {
@@ -173,10 +188,9 @@ export class AttachmentCatalogProjection {
         const segment = this.segmentCache.get(segmentId);
         if (!segment) throw new Error(`ContextSegment ${segmentId} cache was not primed.`);
         const segmentKind = requireSegmentKind(segment.segment_kind);
-        const sources = this.sourceCache.get(segmentId);
-        if (!sources) throw new Error(`ContextSegmentSource cache was not primed for ${segmentId}.`);
+        const sources = this.scopedSources(segmentId, conversationId);
         const occurrences = sources.map(contextSourceOccurrence);
-        validateContextSegmentSources(segmentKind, occurrences);
+        validateScopedContextSegmentSources(segmentKind, occurrences);
         if (segmentKind === 'compression') {
           compressionSegments.push({ segmentId, blockId: occurrences[0].sourceId });
         }
@@ -244,31 +258,130 @@ export class AttachmentCatalogProjection {
         ...batch.map((segmentId) => DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)),
         ...batch.map((segmentId) => DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
           where: { segment_id: segmentId },
-          limit: 3
+          limit: 257
         }))
       ]);
-      batch.forEach((segmentId, index) => {
+      for (const [index, segmentId] of batch.entries()) {
         const segment = result.snapshot[index];
         if (segment && !Array.isArray(segment)) this.segmentCache.set(segmentId, segment);
-        const sources = result.snapshot[batch.length + index];
-        if (!Array.isArray(sources)) throw new Error(`ContextSegmentSource snapshot for ${segmentId} is invalid.`);
-        const sorted = [...sources].sort(compareSegmentSource);
+        const sourceRows = result.snapshot[batch.length + index];
+        if (!Array.isArray(sourceRows)) {
+          throw new Error(`ContextSegmentSource snapshot for ${segmentId} is invalid.`);
+        }
+        const complete = sourceRows.length < 257
+          ? sourceRows
+          : await listAllDomainRows(this.database, 'ContextSegmentSource', { segment_id: segmentId });
+        const sorted = [...complete].sort(compareSegmentSource);
         this.sourceCache.set(segmentId, sorted);
         primedSources.push(...sorted);
+      }
+    }
+    await this.primeSourceOwners(primedSources);
+  }
+
+  private async primeSourceOwners(sources: readonly DomainRow[]): Promise<void> {
+    const revisionIds = sources
+      .filter((source) => source.source_kind === 'message_revision')
+      .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id'));
+    await this.primeMessageRevisionOwners(revisionIds);
+
+    const resultIds = sources
+      .filter((source) => source.source_kind === 'tool_model_result')
+      .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id'));
+    await this.primeDomainRows('ToolModelResult', resultIds, this.toolResultCache);
+    const toolCallIds = [
+      ...sources.filter((source) => source.source_kind === 'tool_call')
+        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
+      ...resultIds.map((resultId) => requireId(
+        this.toolResultCache.get(resultId)?.tool_call_id,
+        `ToolModelResult ${resultId}.tool_call_id`
+      ))
+    ];
+    await this.primeDomainRows('ToolCall', toolCallIds, this.toolCallCache);
+    await this.primeDomainRows(
+      'Turn',
+      toolCallIds.map((toolCallId) => requireId(
+        this.toolCallCache.get(toolCallId)?.turn_id,
+        `ToolCall ${toolCallId}.turn_id`
+      )),
+      this.turnCache
+    );
+  }
+
+  private async primeMessageRevisionOwners(revisionIds: readonly string[]): Promise<void> {
+    await this.primeDomainRows('MessageRevision', revisionIds, this.messageRevisionCache);
+    const messageIds = revisionIds.map((revisionId) => requireId(
+      this.messageRevisionCache.get(revisionId)?.message_id,
+      `MessageRevision ${revisionId}.message_id`
+    ));
+    const missing = [...new Set(messageIds)].filter((messageId) =>
+      !this.messageMembershipCache.has(messageId)
+    );
+    for (let offset = 0; offset < missing.length; offset += 128) {
+      const batch = missing.slice(offset, offset + 128);
+      const result = await this.database.snapshot(batch.map((messageId) =>
+        DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+          where: { message_id: messageId },
+          limit: 2
+        })
+      ));
+      batch.forEach((messageId, index) => {
+        const memberships = result.snapshot[index];
+        if (!Array.isArray(memberships)) {
+          throw new Error(`MessagePartOfConversation snapshot for ${messageId} is invalid.`);
+        }
+        if (memberships.length > 1) {
+          throw new Error(`Message ${messageId} belongs to multiple Conversations.`);
+        }
+        this.messageMembershipCache.set(messageId, memberships);
       });
     }
-    await this.primeDomainRows(
-      'ToolCall',
-      primedSources.filter((source) => source.source_kind === 'tool_call')
-        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
-      this.toolCallCache
-    );
-    await this.primeDomainRows(
-      'ToolModelResult',
-      primedSources.filter((source) => source.source_kind === 'tool_model_result')
-        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
-      this.toolResultCache
-    );
+  }
+
+  private scopedSources(segmentId: string, conversationId: string): DomainRow[] {
+    const sources = this.sourceCache.get(segmentId);
+    if (!sources) throw new Error(`ContextSegmentSource cache was not primed for ${segmentId}.`);
+    return sources.filter((source) => this.sourceBelongsToConversation(source, conversationId));
+  }
+
+  private sourceBelongsToConversation(source: DomainRow, conversationId: string): boolean {
+    const sourceKind = requireText(source.source_kind, 'ContextSegmentSource.source_kind');
+    const sourceId = requireId(source.source_id, 'ContextSegmentSource.source_id');
+    if (sourceKind === 'message_revision') {
+      return this.messageRevisionBelongsToConversation(sourceId, conversationId);
+    }
+    if (sourceKind === 'tool_call') {
+      return this.toolCallBelongsToConversation(sourceId, conversationId);
+    }
+    if (sourceKind === 'tool_model_result') {
+      const result = this.toolResultCache.get(sourceId);
+      if (!result) throw new Error(`ToolModelResult ${sourceId} cache was not primed.`);
+      return this.toolCallBelongsToConversation(
+        requireId(result.tool_call_id, `ToolModelResult ${sourceId}.tool_call_id`),
+        conversationId
+      );
+    }
+    // Compression/system/runtime Context is shared immutable lineage. Unknown kinds stay visible so
+    // the structural validator fails closed instead of silently discarding malformed authority data.
+    return true;
+  }
+
+  private messageRevisionBelongsToConversation(revisionId: string, conversationId: string): boolean {
+    const revision = this.messageRevisionCache.get(revisionId);
+    if (!revision) throw new Error(`MessageRevision ${revisionId} cache was not primed.`);
+    const messageId = requireId(revision.message_id, `MessageRevision ${revisionId}.message_id`);
+    const memberships = this.messageMembershipCache.get(messageId);
+    if (!memberships) throw new Error(`MessagePartOfConversation cache was not primed for ${messageId}.`);
+    return memberships.length === 1 && memberships[0].conversation_id === conversationId;
+  }
+
+  private toolCallBelongsToConversation(toolCallId: string, conversationId: string): boolean {
+    const toolCall = this.toolCallCache.get(toolCallId);
+    if (!toolCall) throw new Error(`ToolCall ${toolCallId} cache was not primed.`);
+    const turnId = requireId(toolCall.turn_id, `ToolCall ${toolCallId}.turn_id`);
+    const turn = this.turnCache.get(turnId);
+    if (!turn) throw new Error(`Turn ${turnId} cache was not primed.`);
+    return turn.conversation_id === conversationId;
   }
 
   private async primeRevisionLinks(revisionIds: readonly string[]): Promise<void> {

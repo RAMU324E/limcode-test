@@ -352,10 +352,11 @@ export class ModelProviderControlPlane {
   }
 
   public projectAttachmentCatalog(
+    conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[] = []
   ): Promise<AttachmentCatalogEntry[]> {
-    return this.attachmentCatalog.project(segments, additionalMessageRevisionIds);
+    return this.attachmentCatalog.project(conversationId, segments, additionalMessageRevisionIds);
   }
 
   public async createModelRequest(command: CreateModelRequestCommand): Promise<ModelRequestCreationResult> {

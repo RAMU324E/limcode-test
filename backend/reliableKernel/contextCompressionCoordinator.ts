@@ -240,6 +240,7 @@ export class ReliableContextCompressionCoordinator {
     }
     const sourceSegments = materialized.records.slice(0, sourceSegmentCount);
     const sourceAttachmentCatalog = await this.attachmentCatalog.project(
+      frozen.conversationId,
       semanticMaterialized.segments.slice(0, sourceSegmentCount).map((segment) => ({
         segmentId: segment.segmentId
       }))
@@ -298,13 +299,17 @@ export class ReliableContextCompressionCoordinator {
     const summary = compressionContents(completed.content);
     const tailSegments = semanticMaterialized.segments.slice(sourceSegmentCount);
     const combinedAttachmentCatalog = await this.attachmentCatalog.project(
+      frozen.conversationId,
       semanticMaterialized.segments.map((segment) => ({
         segmentId: segment.segmentId
       }))
     );
-    const tailAttachmentCatalog = await this.attachmentCatalog.project(tailSegments.map((segment) => ({
-      segmentId: segment.segmentId
-    })));
+    const tailAttachmentCatalog = await this.attachmentCatalog.project(
+      frozen.conversationId,
+      tailSegments.map((segment) => ({
+        segmentId: segment.segmentId
+      }))
+    );
     const tailCatalogContent = renderAttachmentCatalog(tailAttachmentCatalog);
     const combinedCatalogContent = renderAttachmentCatalog(combinedAttachmentCatalog);
     const tailCatalogTokens = tailCatalogContent

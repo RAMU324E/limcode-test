@@ -701,7 +701,9 @@ export class ReliableAgentLoop {
       this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round)
     ]);
     const materialized = await this.context.materialize(input.headRootId);
+    const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const attachmentCatalog = await this.modelProvider.projectAttachmentCatalog(
+      conversationId,
       materialized.segments.map((segment) => ({ segmentId: segment.segmentId })),
       currentTurnState.reference ? [currentTurnState.reference.messageRevisionId] : []
     );

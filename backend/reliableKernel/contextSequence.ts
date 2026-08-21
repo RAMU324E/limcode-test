@@ -249,7 +249,7 @@ export class ContextSequenceControlPlane {
       throw new TypeError(`appendContent cannot create ${segmentKind} segments.`);
     }
     const sources = [normalizeSource(command.source)];
-    validateContextSegmentSources(segmentKind, sources);
+    validateNewContextSegmentSources(segmentKind, sources);
     await this.preflightAppendTarget(
       conversationId, command.baseRootId, command.expectedHeadRootId, command.activate !== false
     );
@@ -1428,7 +1428,7 @@ export class ContextSequenceControlPlane {
     const conversationId = requireId(planInput.conversationId, 'conversationId');
     const sources = normalizeSources(planInput.sources);
     const segmentKind = requireSegmentKind(planInput.segmentKind);
-    validateContextSegmentSources(segmentKind, sources);
+    validateNewContextSegmentSources(segmentKind, sources);
     const activate = planInput.activate !== false;
     const head = await this.getHead(conversationId);
     const currentHeadRootId = head ? requireId(head.root_id, 'ConversationContextHeadLink.root_id') : null;
@@ -1870,7 +1870,22 @@ function headMutationSteps(
   })];
 }
 
-export function validateContextSegmentSources(
+export function validateNewContextSegmentSources(
+  kind: ContextSegmentKind,
+  sources: readonly ContextSourceOccurrence[]
+): void {
+  validateContextSegmentSourceShape(kind, sources);
+}
+
+/** Existing shared segments must be scoped to one Conversation before this shape check runs. */
+export function validateScopedContextSegmentSources(
+  kind: ContextSegmentKind,
+  sources: readonly ContextSourceOccurrence[]
+): void {
+  validateContextSegmentSourceShape(kind, sources);
+}
+
+function validateContextSegmentSourceShape(
   kind: ContextSegmentKind,
   sources: readonly ContextSourceOccurrence[]
 ): void {

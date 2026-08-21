@@ -72,9 +72,12 @@ export class ReliableContextTokenEstimator {
     const rootId = requireId(rootIdInput, 'rootId');
     const materialized = await this.context.materialize(rootId);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const attachmentCatalog = await this.attachmentCatalog.project(materialized.segments.map((segment) => ({
-      segmentId: segment.segmentId
-    })));
+    const attachmentCatalog = await this.attachmentCatalog.project(
+      conversationId,
+      materialized.segments.map((segment) => ({
+        segmentId: segment.segmentId
+      }))
+    );
     const projectedTokens = estimateMaterializedContextTokens(materialized.segments, attachmentCatalog);
     const compressed = compressionEstimate(materialized.segments);
     const observed = await this.findObservedPrefix(conversationId, materialized.segments, attachmentCatalog);
@@ -97,12 +100,19 @@ export class ReliableContextTokenEstimator {
     }
     const full = await this.estimateRoot(rootId);
     const prefixSegments = materialized.segments.slice(0, segmentCount);
-    const fullCatalog = await this.attachmentCatalog.project(materialized.segments.map((segment) => ({
-      segmentId: segment.segmentId
-    })));
-    const prefixCatalog = await this.attachmentCatalog.project(prefixSegments.map((segment) => ({
-      segmentId: segment.segmentId
-    })));
+    const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
+    const fullCatalog = await this.attachmentCatalog.project(
+      conversationId,
+      materialized.segments.map((segment) => ({
+        segmentId: segment.segmentId
+      }))
+    );
+    const prefixCatalog = await this.attachmentCatalog.project(
+      conversationId,
+      prefixSegments.map((segment) => ({
+        segmentId: segment.segmentId
+      }))
+    );
     const fullProjected = estimateMaterializedContextTokens(materialized.segments, fullCatalog);
     const prefixProjected = estimateMaterializedContextTokens(prefixSegments, prefixCatalog);
     return Math.max(0, full.estimatedTokens - Math.max(0, fullProjected - prefixProjected));
@@ -157,16 +167,19 @@ export class ReliableContextTokenEstimator {
         if (outputSegmentId && current[coveredSegmentCount]?.segmentId === outputSegmentId) {
           const total = providerTotalTokens(request.usage_json);
           const outputSegment = current[coveredSegmentCount];
-          const outputCatalog = await this.attachmentCatalog.project([{
+          const outputCatalog = await this.attachmentCatalog.project(conversationId, [{
             segmentId: outputSegment.segmentId
           }]);
           anchoredTokens = total ?? (input + estimateMaterializedContextTokens([outputSegment], outputCatalog));
           coveredSegmentCount += 1;
         }
         const coveredSegments = current.slice(0, coveredSegmentCount);
-        const coveredCatalog = await this.attachmentCatalog.project(coveredSegments.map((segment) => ({
-          segmentId: segment.segmentId
-        })));
+        const coveredCatalog = await this.attachmentCatalog.project(
+          conversationId,
+          coveredSegments.map((segment) => ({
+            segmentId: segment.segmentId
+          }))
+        );
         const coveredProjected = estimateMaterializedContextTokens(coveredSegments, coveredCatalog);
         const currentProjected = estimateMaterializedContextTokens(current, currentCatalog);
         const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
