@@ -14,6 +14,7 @@ async function withRuntime(label, body) {
   try {
     const candidate = await kernel.resetCandidateRuntimeRoot(parent);
     database = await kernel.RuntimeDatabase.open(candidate.authority, { hostBootId: label });
+
     const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
     const fixtureContent = await store.ingest(
       database,
@@ -25,6 +26,202 @@ async function withRuntime(label, body) {
     if (database) await database.close().catch(() => undefined);
     await fs.rm(parent, { recursive: true, force: true });
   }
+}
+
+test('compression persists reusable Attachment observations and replacement inherits provenance links', async () => {
+  await withRuntime('attachment-observation-persistence', async (database, _fixtureContent, store) => {
+    const seeded = await seedObservationCompressionTurn(database, store);
+    const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
+    const attachment = {
+      attachmentId: 'attachment-observation-target',
+      name: 'observation-target.png',
+      mimeType: 'image/png',
+      sizeBytes: 42
+    };
+    await database.transaction([repository('Attachment').insert({
+      id: attachment.attachmentId,
+      sha256: 'c'.repeat(64),
+      byte_length: BigInt(attachment.sizeBytes),
+      mime_type: attachment.mimeType,
+      name: attachment.name,
+      storage_mode: 'managed',
+      content_object_id: null,
+      created_at: NOW
+    })]);
+    const profileSha256 = 'd'.repeat(64);
+    const observation = {
+      attachmentId: attachment.attachmentId,
+      analysisProfileSha256: profileSha256,
+      document: {
+        kind: 'attachment_observation',
+        analysisProfileSha256: profileSha256,
+        summary: 'A red visual status indicator.',
+        salientFacts: ['The status indicator is red.'],
+        uncertainties: ['The surrounding interface is not visible.']
+      }
+    };
+    const context = new kernel.ContextSequenceControlPlane(database, store);
+    const compression = new kernel.ContextCompressionControlPlane(database, store);
+    const sourceRootId = await context.currentHeadRootId(seeded.conversationId);
+    const createCommand = {
+      conversationId: seeded.conversationId,
+      headRootId: sourceRootId,
+      authoritySnapshotId: seeded.authoritySnapshotId,
+      compressSegmentCount: 1,
+      title: 'observation compression',
+      summary: 'SUMMARY-WITH-OBSERVATION',
+      attachmentObservations: [observation],
+      idempotencyKey: 'observation-create'
+    };
+    const created = await compression.create(createCommand);
+    const observationRows = await listDomainRows(database, 'AttachmentObservationLink', {
+      attachment_id: attachment.attachmentId,
+      analysis_profile_sha256: profileSha256
+    });
+    assert.equal(observationRows.length, 1);
+    const observationRow = observationRows[0];
+    const blockLinks = await listDomainRows(database, 'CompressionBlockObservationLink', {
+      compression_block_id: created.compressionBlockId
+    });
+    assert.equal(blockLinks.length, 1);
+    assert.equal(blockLinks[0].observation_id, observationRow.id);
+    assert.equal(blockLinks[0].position, 0n);
+    const observationContent = await store.read(await getDomainRow(
+      database,
+      'ContentObject',
+      observationRow.content_object_id
+    ));
+    assert.deepEqual(JSON.parse(observationContent.toString('utf8')), observation.document);
+
+    const requirements = await kernel.loadAttachmentObservationRequirements(
+      database,
+      store,
+      [attachment],
+      { entries: [{
+        kind: 'attachment', ref: 'F1', target: attachment.attachmentId,
+        name: attachment.name, mimeType: attachment.mimeType, sizeBytes: attachment.sizeBytes
+      }] },
+      profileSha256
+    );
+    assert.deepEqual(requirements, [{
+      attachmentRef: 'F1',
+      attachmentId: attachment.attachmentId,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes,
+      cachedObservation: {
+        attachmentRef: 'F1',
+        summary: observation.document.summary,
+        salientFacts: observation.document.salientFacts,
+        uncertainties: observation.document.uncertainties
+      }
+    }]);
+
+    const commitBeforeReplay = (await database.inspect()).currentCommitSeq;
+    const replay = await compression.create(createCommand);
+    assert.equal(replay.deduplicated, true);
+    assert.equal(replay.compressionBlockId, created.compressionBlockId);
+    assert.equal((await database.inspect()).currentCommitSeq, commitBeforeReplay);
+    assert.equal((await listDomainRows(database, 'AttachmentObservationLink', {})).length, 1);
+    await assert.rejects(
+      compression.create({
+        ...createCommand,
+        attachmentObservations: [{
+          ...observation,
+          document: { ...observation.document, summary: 'CONFLICTING OBSERVATION' }
+        }]
+      }),
+      (error) => error?.code === 'COMPRESSION_IDEMPOTENCY_CONFLICT'
+    );
+
+    const replacementCommand = {
+      conversationId: seeded.conversationId,
+      previousBlockId: created.compressionBlockId,
+      expectedHeadRootId: created.rootId,
+      title: 'replacement observation compression',
+      summary: 'REPLACEMENT-SUMMARY',
+      previousStatus: 'disabled',
+      idempotencyKey: 'observation-replacement'
+    };
+    const replacement = await compression.replace(replacementCommand);
+    const replacementLinks = await listDomainRows(database, 'CompressionBlockObservationLink', {
+      compression_block_id: replacement.compressionBlockId
+    });
+    assert.equal(replacementLinks.length, 1);
+    assert.equal(replacementLinks[0].observation_id, observationRow.id);
+    assert.equal(replacementLinks[0].position, 0n);
+    assert.equal((await listDomainRows(database, 'AttachmentObservationLink', {})).length, 1);
+    const replacementReplay = await compression.replace(replacementCommand);
+    assert.equal(replacementReplay.deduplicated, true);
+    assert.equal(replacementReplay.compressionBlockId, replacement.compressionBlockId);
+  });
+});
+
+async function seedObservationCompressionTurn(database, store) {
+  const conversationId = 'conversation-observation-persistence';
+  await database.transaction([
+    kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+      id: conversationId, title: 'observation persistence', status: 'active',
+      created_at: NOW, updated_at: NOW
+    }),
+    kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+      id: 'agent-link-observation-persistence',
+      conversation_id: conversationId,
+      agent_id: 'agent-observation-persistence',
+      role: 'default',
+      created_at: NOW,
+      updated_at: NOW
+    })
+  ]);
+  const control = new kernel.TurnControlPlane(database, store, {
+    authorityCompiler: {
+      async compile(request) {
+        return {
+          turnId: request.turnId,
+          executorAgentId: request.executorAgentId,
+          executionPreset: { content: JSON.stringify({ providerConfigId: 'fake-local', modelId: 'fake-model' }) },
+          authoritySnapshot: { content: JSON.stringify({
+            kind: 'effective-turn-authority',
+            turnId: request.turnId,
+            executorAgentId: request.executorAgentId,
+            modelProfile: {
+              compressionThresholdTokens: 1,
+              contextWindowTokens: 200_000,
+              tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
+            },
+            model: { providerConfigId: 'fake-local', modelId: 'fake-model', maxOutputTokens: 16_000 },
+            policies: { toolPolicyId: 'tools-default', systemPromptId: 'prompt-default' }
+          }) }
+        };
+      }
+    }
+  });
+  const started = await control.input({
+    source: { kind: 'command', key: 'observation-persistence-input' },
+    conversationId,
+    leaseOwnerId: 'observation-persistence-executor',
+    hostBootId: 'observation-persistence-boot',
+    leaseExpiresAt: '2026-08-22T00:00:00.000Z',
+    content: 'user input with one managed visual attachment'
+  });
+  const authorities = await listDomainRows(database, 'AuthoritySnapshot', { turn_id: started.turnId });
+  assert.equal(authorities.length, 1);
+  return { conversationId, authoritySnapshotId: authorities[0].id };
+}
+
+async function listDomainRows(database, domain, where) {
+  const result = await database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({
+    where,
+    orderBy: { column: 'id', direction: 'asc' },
+    limit: 1_000
+  }));
+  return result.snapshot;
+}
+
+async function getDomainRow(database, domain, id) {
+  const result = await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain(domain).get(id)]);
+  assert.ok(result.snapshot[0], `${domain} ${id} must exist`);
+  return result.snapshot[0];
 }
 
 test('20 rounds and nested compression rebuild one request-local attachment catalog without durable copies', async () => {

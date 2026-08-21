@@ -20,10 +20,13 @@ import type {
   OpenAIResponsesWebSocketTimeoutPhase
 } from './openAIResponsesWebSocketSession';
 import { LlmEventType } from '../world/modules/llm/events';
+import { ATTACHMENT_OBSERVATION_PROMPT_REVISION } from '../world/modules/llm/contracts';
 import type {
   LlmCompactDryRunResult,
   LlmCompactRequest,
   LlmCompactResult,
+  LlmAttachmentObservation,
+  LlmAttachmentObservationRequirement,
   LlmDryRunOptions,
   LlmDryRunResult,
   LlmResolveInvocationRequest,
@@ -54,6 +57,11 @@ import {
   defaultLlmPromptCacheTtlForProvider,
   isPromptCacheSupportedProvider
 } from '../../shared/protocol';
+import {
+  normalizeAttachmentObservationRequirement,
+  normalizeLlmAttachmentObservation,
+  renderAttachmentObservationStateContent
+} from '../reliableKernel/attachmentObservations';
 import {
   geminiThinkingCapabilityForModel,
   isGeminiThinkingLevelSupported
@@ -1193,18 +1201,11 @@ export async function dryRunCompactLlmProvider(
   );
   if (methodConfig.kind === 'disabled') throw new Error('当前压缩方法已关闭。');
   const generatedAt = Date.now();
-  if (methodConfig.kind === 'deterministic_summary' || methodConfig.kind === 'manual_summary') {
-    return {
-      kind: 'no_provider_call',
-      methodKind: methodConfig.kind,
-      calls: [],
-      note: methodConfig.kind === 'manual_summary'
-        ? '该方法只生成本地可编辑摘要，不会调用 Provider。'
-        : '该方法使用确定性本地摘要，不会调用 Provider。',
-      generatedAt
-    };
-  }
   if (methodConfig.kind === 'openai_responses_compact') {
+    const observationContract = normalizeCompressionAttachmentObservationContract(request);
+    if (observationContract.requirements.length > 0) {
+      throw new TypeError('Provider-native Compact cannot carry text-summary Attachment observations.');
+    }
     const call = await dryRunOpenAIResponsesCompact(request, methodConfig, options, dryRunOptions);
     return {
       kind: 'provider_requests',
@@ -1213,25 +1214,45 @@ export async function dryRunCompactLlmProvider(
       generatedAt
     };
   }
-  if (summaryDeltaContents(request).length === 0) {
+  if (methodConfig.kind === 'deterministic_summary' || methodConfig.kind === 'manual_summary') {
+    await prepareCompressionMediaSemantics(request, methodConfig, options);
     return {
       kind: 'no_provider_call',
       methodKind: methodConfig.kind,
       calls: [],
-      note: '没有新的摘要源；沿用并收口现有 replacement summary，不调用 Provider。',
+      note: methodConfig.kind === 'manual_summary'
+        ? '该方法只生成本地可编辑摘要，不会调用 Provider；媒体必须已有持久化 observation。'
+        : '该方法使用确定性本地摘要，不会调用 Provider；媒体必须已有持久化 observation。',
       generatedAt
     };
   }
 
   const resolved = await resolveSummaryProvider(request, methodConfig, options, { allowPlaceholderApiKey: true });
   if (!resolved.provider) throw new Error('无法构造压缩 dry-run Provider。');
-  const calls: SummaryProviderCall[] = methodConfig.kind === 'segmented_summary'
-    ? buildSegmentedSummaryProviderCalls(request, methodConfig, resolved.settings)
-    : [buildSummaryProviderCall(request, methodConfig, resolved.settings)];
-  if (methodConfig.kind === 'llm_summary' && !isSummaryProviderCallWithinWindow(calls[0]!, resolved.settings)) {
+  const mediaSemantics = await prepareCompressionMediaSemanticsDryRun(
+    request,
+    methodConfig,
+    options,
+    resolved
+  );
+  const semanticRequest = mediaSemantics.request;
+  if (summaryDeltaContents(semanticRequest).length === 0) {
+    return {
+      kind: mediaSemantics.observationCalls.length > 0 ? 'provider_requests' : 'no_provider_call',
+      methodKind: methodConfig.kind,
+      calls: [],
+      note: '没有新的摘要源；沿用并收口现有 replacement summary。',
+      generatedAt
+    };
+  }
+
+  const summaryCalls: SummaryProviderCall[] = methodConfig.kind === 'segmented_summary'
+    ? buildSegmentedSummaryProviderCalls(semanticRequest, methodConfig, resolved.settings)
+    : [buildSummaryProviderCall(semanticRequest, methodConfig, resolved.settings)];
+  if (methodConfig.kind === 'llm_summary' && !isSummaryProviderCallWithinWindow(summaryCalls[0]!, resolved.settings)) {
     throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
   }
-  const dryRunCalls = calls;
+  const dryRunCalls = [...mediaSemantics.observationCalls, ...summaryCalls];
   const unified = await importUnifiedLlmProvider();
   const providerDryRun = (resolved.provider as unknown as Partial<UnifiedDryRunCapable>).dryRun;
   if (typeof providerDryRun !== 'function') throw new Error('当前 unified-llm-provider 版本不支持 provider.dryRun。');
@@ -1245,7 +1266,9 @@ export async function dryRunCompactLlmProvider(
     });
     results.push({
       ...formatUnifiedDryRunResult(result, resolved.settings, unified, dryRunOptions, resolved.apiKeyAvailable),
-      id: `${request.id}:summary:${ordinal}`,
+      id: ordinal < mediaSemantics.observationCalls.length
+        ? `${request.id}:attachment-observation:${ordinal}`
+        : `${request.id}:summary:${ordinal - mediaSemantics.observationCalls.length}`,
       label: call.label,
       ordinal
     });
@@ -1254,8 +1277,15 @@ export async function dryRunCompactLlmProvider(
     kind: 'provider_requests',
     methodKind: methodConfig.kind,
     calls: results,
-    ...(methodConfig.kind === 'segmented_summary' ? {
-      note: '仅展示可预先确定的 leaf summary requests；后续 hierarchy merge requests 依赖前序 Provider 摘要，运行时动态构造。'
+    ...(methodConfig.kind === 'segmented_summary' || mediaSemantics.observationCalls.length > 0 ? {
+      note: [
+        ...(mediaSemantics.observationCalls.length > 0
+          ? ['前置请求逐个分析缺失的 F 附件；后续 summary dry-run 使用明确的 observation 占位值。']
+          : []),
+        ...(methodConfig.kind === 'segmented_summary'
+          ? ['仅展示可预先确定的 leaf summary requests；后续 hierarchy merge requests 依赖前序 Provider 摘要，运行时动态构造。']
+          : [])
+      ].join(' ')
     } : {}),
     generatedAt
   };
@@ -1582,6 +1612,7 @@ function isRetryableCompactFailure(error: unknown, failure: LlmAttemptFailure): 
     || text.includes('缺少 llm api key')
     || text.includes('openai 原生压缩仅支持')
     || text.includes('media_size_unknown')
+    || text.includes('media_semantics_unavailable')
     || text.includes('compression_request_too_large')
     || text.includes('compression_source_too_large')
   );
@@ -1745,6 +1776,650 @@ function errorSearchText(error: unknown): string {
   return parts.filter(Boolean).join('\n');
 }
 
+interface PreparedCompressionMediaSemantics {
+  request: LlmCompactRequest;
+  profileSha256?: string;
+  requirements: LlmAttachmentObservationRequirement[];
+  observations: LlmAttachmentObservation[];
+  provider?: ResolvedSummaryProvider;
+}
+
+interface CompressionAttachmentObservationContract {
+  profileSha256?: string;
+  requirements: LlmAttachmentObservationRequirement[];
+}
+
+interface SemanticContentsProjection {
+  contents: MessageContent[];
+  representedRefs: Set<string>;
+}
+
+const ATTACHMENT_OBSERVATION_TARGET_TOKENS = 1_024;
+
+export class LlmMediaSemanticsUnavailableError extends Error {
+  public readonly code = 'media_semantics_unavailable';
+  public readonly attachmentRef?: string;
+  public readonly cause?: unknown;
+
+  public constructor(reason: string, attachmentRef?: string, cause?: unknown) {
+    super(`media_semantics_unavailable: ${attachmentRef ? `${attachmentRef}: ` : ''}${reason}`);
+    this.name = 'LlmMediaSemanticsUnavailableError';
+    this.attachmentRef = attachmentRef;
+    this.cause = cause;
+  }
+}
+
+const attachmentMediaSemanticsCache = new WeakMap<
+  LlmCompactRequest,
+  { cacheKey: string; promise: Promise<PreparedCompressionMediaSemantics> }
+>();
+
+async function prepareCompressionMediaSemantics(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  options: LlmProviderOptions,
+  signal?: AbortSignal,
+  initialProvider?: ResolvedSummaryProvider
+): Promise<PreparedCompressionMediaSemantics> {
+  const cacheKey = [
+    methodConfig.id,
+    methodConfig.kind,
+    request.attachmentObservationProfileSha256 ?? 'no-observation-profile'
+  ].join('\0');
+  const cached = attachmentMediaSemanticsCache.get(request);
+  if (cached?.cacheKey === cacheKey) return cached.promise;
+  const promise = prepareCompressionMediaSemanticsUncached(
+    request,
+    methodConfig,
+    options,
+    signal,
+    initialProvider
+  );
+  const entry = { cacheKey, promise };
+  attachmentMediaSemanticsCache.set(request, entry);
+  try {
+    return await promise;
+  } catch (error) {
+    if (attachmentMediaSemanticsCache.get(request) === entry) {
+      attachmentMediaSemanticsCache.delete(request);
+    }
+    throw error;
+  }
+}
+
+async function prepareCompressionMediaSemanticsUncached(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  options: LlmProviderOptions,
+  signal?: AbortSignal,
+  initialProvider?: ResolvedSummaryProvider
+): Promise<PreparedCompressionMediaSemantics> {
+  const contract = normalizeCompressionAttachmentObservationContract(request);
+  if (contract.requirements.length === 0) {
+    if (compressionRequestContainsInlineMedia(request)) {
+      throw new LlmMediaSemanticsUnavailableError(
+        'text compression contains media without a frozen F-reference observation contract.'
+      );
+    }
+    return {
+      request,
+      requirements: [],
+      observations: [],
+      ...(initialProvider ? { provider: initialProvider } : {})
+    };
+  }
+
+  const requirementsById = new Map(contract.requirements.map((requirement) => [
+    requirement.attachmentId,
+    requirement
+  ]));
+  const bodies = collectCompressionMediaBodies(request, requirementsById);
+  const observationsByRef = new Map<string, LlmAttachmentObservation>();
+  const missing = contract.requirements.filter((requirement) => {
+    if (!requirement.cachedObservation) return true;
+    observationsByRef.set(requirement.attachmentRef, cloneAttachmentObservation(requirement.cachedObservation));
+    return false;
+  });
+
+  let provider = initialProvider;
+  if (missing.length > 0) {
+    if (methodConfig.kind === 'deterministic_summary' || methodConfig.kind === 'manual_summary') {
+      throw new LlmMediaSemanticsUnavailableError(
+        `${methodConfig.kind} cannot inspect uncached media; choose a Provider-backed summary method.`
+      );
+    }
+    provider ??= await resolveSummaryProvider(request, methodConfig, options);
+    if (!provider.provider) {
+      throw new LlmMediaSemanticsUnavailableError(
+        'the frozen summary Provider is unavailable, so uncached media cannot be inspected.'
+      );
+    }
+    const preparation = createMultimodalPreparationContext();
+    const analyzed = await mapWithBoundedConcurrency(
+      missing,
+      isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
+      async (requirement, _index, siblingSignal) => {
+        const body = bodies.get(requirement.attachmentId);
+        if (!body) {
+          throw new LlmMediaSemanticsUnavailableError(
+            'the frozen compression source does not contain a resolvable media body.',
+            requirement.attachmentRef
+          );
+        }
+        return analyzeCompressionAttachment(
+          requirement,
+          body,
+          provider!,
+          options,
+          preparation,
+          siblingSignal
+        );
+      },
+      signal
+    );
+    analyzed.forEach((observation) => observationsByRef.set(observation.attachmentRef, observation));
+  }
+
+  const observations = contract.requirements.map((requirement) => {
+    const observation = observationsByRef.get(requirement.attachmentRef);
+    if (!observation) {
+      throw new LlmMediaSemanticsUnavailableError(
+        'no complete structured observation was produced.',
+        requirement.attachmentRef
+      );
+    }
+    return cloneAttachmentObservation(observation);
+  });
+  return {
+    request: projectCompressionRequestWithObservations(request, contract.requirements, observations),
+    profileSha256: contract.profileSha256,
+    requirements: contract.requirements,
+    observations,
+    ...(provider ? { provider } : {})
+  };
+}
+
+interface PreparedCompressionMediaSemanticsDryRun extends PreparedCompressionMediaSemantics {
+  observationCalls: SummaryProviderCall[];
+}
+
+async function prepareCompressionMediaSemanticsDryRun(
+  request: LlmCompactRequest,
+  methodConfig: LlmCompressionConfigRecord,
+  options: LlmProviderOptions,
+  provider: ResolvedSummaryProvider
+): Promise<PreparedCompressionMediaSemanticsDryRun> {
+  const contract = normalizeCompressionAttachmentObservationContract(request);
+  if (contract.requirements.length === 0) {
+    if (compressionRequestContainsInlineMedia(request)) {
+      throw new LlmMediaSemanticsUnavailableError(
+        'text compression contains media without a frozen F-reference observation contract.'
+      );
+    }
+    return {
+      request,
+      requirements: [],
+      observations: [],
+      provider,
+      observationCalls: []
+    };
+  }
+  const requirementsById = new Map(contract.requirements.map((requirement) => [
+    requirement.attachmentId,
+    requirement
+  ]));
+  const bodies = collectCompressionMediaBodies(request, requirementsById);
+  const preparation = createMultimodalPreparationContext();
+  const observations: LlmAttachmentObservation[] = [];
+  const observationCalls: SummaryProviderCall[] = [];
+  for (const requirement of contract.requirements) {
+    if (requirement.cachedObservation) {
+      observations.push(cloneAttachmentObservation(requirement.cachedObservation));
+      continue;
+    }
+    if (!provider.provider) {
+      throw new LlmMediaSemanticsUnavailableError(
+        'the dry-run summary Provider is unavailable, so uncached media cannot be inspected.',
+        requirement.attachmentRef
+      );
+    }
+    const body = bodies.get(requirement.attachmentId);
+    if (!body) {
+      throw new LlmMediaSemanticsUnavailableError(
+        'the frozen compression source does not contain a resolvable media body.',
+        requirement.attachmentRef
+      );
+    }
+    const media = await prepareAttachmentObservationMedia(
+      requirement,
+      body,
+      options,
+      preparation
+    );
+    observationCalls.push(buildAttachmentObservationProviderCall(
+      requirement,
+      media
+    ));
+    observations.push({
+      attachmentRef: requirement.attachmentRef,
+      summary: `[dry-run placeholder: runtime observation output for ${requirement.attachmentRef}]`,
+      salientFacts: [],
+      uncertainties: ['Dry-run cannot know the Provider observation response.']
+    });
+  }
+  return {
+    request: projectCompressionRequestWithObservations(request, contract.requirements, observations),
+    profileSha256: contract.profileSha256,
+    requirements: contract.requirements,
+    observations,
+    provider,
+    observationCalls
+  };
+}
+
+function normalizeCompressionAttachmentObservationContract(
+  request: LlmCompactRequest
+): CompressionAttachmentObservationContract {
+  const profile = request.attachmentObservationProfileSha256;
+  const rawRequirements = request.attachmentObservationRequirements;
+  if (profile === undefined && rawRequirements === undefined) return { requirements: [] };
+  if (typeof profile !== 'string' || !/^[0-9a-f]{64}$/i.test(profile)) {
+    throw new TypeError('Compression Attachment observation profile must be a SHA-256 hex digest.');
+  }
+  if (!Array.isArray(rawRequirements) || rawRequirements.length === 0) {
+    throw new TypeError('Compression Attachment observation requirements must be a non-empty array.');
+  }
+  const refs = new Set<string>();
+  const attachmentIds = new Set<string>();
+  const requirements = rawRequirements.map((value, index) => {
+    const requirement = normalizeAttachmentObservationRequirement(
+      value,
+      `attachmentObservationRequirements[${index}]`
+    );
+    if (refs.has(requirement.attachmentRef) || attachmentIds.has(requirement.attachmentId)) {
+      throw new Error('Compression Attachment observation requirements contain duplicate identities.');
+    }
+    refs.add(requirement.attachmentRef);
+    attachmentIds.add(requirement.attachmentId);
+    return requirement;
+  });
+  return { profileSha256: profile.toLowerCase(), requirements };
+}
+
+function compressionRequestContainsInlineMedia(request: LlmCompactRequest): boolean {
+  const collections = [
+    ...(request.priorSummaryContents ? [request.priorSummaryContents] : []),
+    request.contents,
+    ...(request.segments ?? [])
+  ];
+  return collections.some((contents) => contents.some((content) => content.parts.some((part) =>
+    isInlineDataPart(part)
+      || (isFunctionResponsePart(part) && (part.functionResponse.parts?.length ?? 0) > 0)
+  )));
+}
+
+function collectCompressionMediaBodies(
+  request: LlmCompactRequest,
+  requirementsById: ReadonlyMap<string, LlmAttachmentObservationRequirement>
+): Map<string, InlineDataPart> {
+  const bodies = new Map<string, InlineDataPart>();
+  const collections = [
+    ...(request.priorSummaryContents ? [request.priorSummaryContents] : []),
+    request.contents,
+    ...(request.segments ?? [])
+  ];
+  for (const contents of collections) {
+    for (const content of contents) {
+      for (const part of content.parts) {
+        if (isInlineDataPart(part)) collectCompressionMediaBody(part, requirementsById, bodies);
+        if (isFunctionResponsePart(part)) {
+          for (const media of part.functionResponse.parts ?? []) {
+            collectCompressionMediaBody(media, requirementsById, bodies);
+          }
+        }
+      }
+    }
+  }
+  return bodies;
+}
+
+function collectCompressionMediaBody(
+  part: InlineDataPart,
+  requirementsById: ReadonlyMap<string, LlmAttachmentObservationRequirement>,
+  bodies: Map<string, InlineDataPart>
+): void {
+  const attachmentId = part.inlineData.attachmentId?.trim();
+  const requirement = attachmentId ? requirementsById.get(attachmentId) : undefined;
+  if (!attachmentId || !requirement) {
+    throw new LlmMediaSemanticsUnavailableError(
+      'a summary media body has no matching frozen F-reference observation requirement.'
+    );
+  }
+  if (part.inlineData.mimeType !== requirement.mimeType
+    || (part.inlineData.name !== undefined && part.inlineData.name !== requirement.name)
+    || (part.inlineData.sizeBytes !== undefined && part.inlineData.sizeBytes !== requirement.sizeBytes)) {
+    throw new LlmMediaSemanticsUnavailableError(
+      'media metadata conflicts with the frozen Attachment catalog.',
+      requirement.attachmentRef
+    );
+  }
+  if (!bodies.has(attachmentId)) bodies.set(attachmentId, cloneInlineDataPart(part));
+}
+
+async function analyzeCompressionAttachment(
+  requirement: LlmAttachmentObservationRequirement,
+  body: InlineDataPart,
+  provider: ResolvedSummaryProvider,
+  options: LlmProviderOptions,
+  preparation: MultimodalPreparationContext,
+  signal?: AbortSignal
+): Promise<LlmAttachmentObservation> {
+  const providerMedia = await prepareAttachmentObservationMedia(
+    requirement,
+    body,
+    options,
+    preparation,
+    signal
+  );
+  const call = buildAttachmentObservationProviderCall(
+    requirement,
+    providerMedia
+  );
+  const response = await executeSummaryProviderCall(
+    provider,
+    call.request,
+    signal,
+    { allowCompatibilityRetry: false }
+  );
+  try {
+    return parseAttachmentObservationResponse(response, requirement.attachmentRef);
+  } catch (error) {
+    throw new LlmMediaSemanticsUnavailableError(
+      'the analysis Provider did not return the required structured observation.',
+      requirement.attachmentRef,
+      error
+    );
+  }
+}
+
+async function prepareAttachmentObservationMedia(
+  requirement: LlmAttachmentObservationRequirement,
+  body: InlineDataPart,
+  options: LlmProviderOptions,
+  preparation: MultimodalPreparationContext,
+  signal?: AbortSignal
+): Promise<InlineDataPart> {
+  if (!isModelToolResponseMultimodalMimeType(requirement.mimeType)) {
+    throw new LlmMediaSemanticsUnavailableError(
+      `MIME type ${requirement.mimeType} is outside the stable multimodal analysis policy.`,
+      requirement.attachmentRef
+    );
+  }
+  let prepared: ContentPart;
+  try {
+    prepared = await prepareInlineDataForLlm(body, options, false, 'native_compact', preparation);
+  } catch (error) {
+    if (isRequestAbort(signal)) throw error;
+    throw new LlmMediaSemanticsUnavailableError(
+      'exact media bytes could not be resolved.',
+      requirement.attachmentRef,
+      error
+    );
+  }
+  if (!isInlineDataPart(prepared) || !prepared.inlineData.data) {
+    throw new LlmMediaSemanticsUnavailableError(
+      'the Attachment resolver did not return an inline media body.',
+      requirement.attachmentRef
+    );
+  }
+  const resolvedBytes = requireCanonicalInlineDataSize(prepared, 'Attachment observation media');
+  if (resolvedBytes !== requirement.sizeBytes || prepared.inlineData.mimeType !== requirement.mimeType) {
+    throw new LlmMediaSemanticsUnavailableError(
+      'resolved media bytes conflict with frozen Attachment metadata.',
+      requirement.attachmentRef
+    );
+  }
+  return {
+    inlineData: {
+      mimeType: requirement.mimeType,
+      data: prepared.inlineData.data,
+      name: requirement.name
+    }
+  };
+}
+
+function buildAttachmentObservationProviderCall(
+  requirement: LlmAttachmentObservationRequirement,
+  media: InlineDataPart
+): SummaryProviderCall {
+  const systemPrompt = [
+    `Attachment observation contract revision: ${ATTACHMENT_OBSERVATION_PROMPT_REVISION}.`,
+    'Inspect exactly the attached media body. Return only one JSON object, without Markdown fences or prose.',
+    'Use exactly these keys: attachmentRef, summary, salientFacts, uncertainties.',
+    'attachmentRef must equal the supplied F reference. summary must be concise but semantically complete.',
+    'salientFacts and uncertainties must be JSON string arrays. Do not infer facts that are not visible.'
+  ].join('\n');
+  const sourceContent: MessageContent = {
+    role: 'user',
+    parts: [{
+      text: [
+        `attachmentRef: ${requirement.attachmentRef}`,
+        `name: ${requirement.name}`,
+        `mimeType: ${requirement.mimeType}`,
+        `sizeBytes: ${requirement.sizeBytes}`,
+        'Analyze this body now and return the strict JSON observation.'
+      ].join('\n')
+    }, media]
+  };
+  return {
+    label: `Attachment ${requirement.attachmentRef} observation`,
+    sourceContents: [sourceContent],
+    targetTokens: ATTACHMENT_OBSERVATION_TARGET_TOKENS,
+    request: {
+      contents: [sourceContent],
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS,
+        thinkingConfig: { thinkingLevel: 'low' }
+      }
+    }
+  };
+}
+
+function parseAttachmentObservationResponse(
+  value: string,
+  expectedRef: string
+): LlmAttachmentObservation {
+  const trimmed = value.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  const source = fenced ? fenced[1]!.trim() : trimmed;
+  const parsed = JSON.parse(source) as unknown;
+  if (!isRecord(parsed)) throw new TypeError('Attachment observation response must be an object.');
+  const allowed = new Set(['attachmentRef', 'summary', 'salientFacts', 'uncertainties']);
+  if (Object.keys(parsed).some((key) => !allowed.has(key)) || Object.keys(parsed).length !== allowed.size) {
+    throw new TypeError('Attachment observation response has unexpected or missing keys.');
+  }
+  const observation = normalizeLlmAttachmentObservation(parsed, 'Attachment observation response');
+  if (observation.attachmentRef !== expectedRef) {
+    throw new Error(`Attachment observation response must use ${expectedRef}.`);
+  }
+  return observation;
+}
+
+function projectCompressionRequestWithObservations(
+  request: LlmCompactRequest,
+  requirements: readonly LlmAttachmentObservationRequirement[],
+  observations: readonly LlmAttachmentObservation[]
+): LlmCompactRequest {
+  const requirementById = new Map(requirements.map((requirement) => [requirement.attachmentId, requirement]));
+  const observationByRef = new Map(observations.map((observation) => [observation.attachmentRef, observation]));
+  const prior = projectSemanticContents(request.priorSummaryContents ?? [], requirementById, observationByRef);
+  const current = projectSemanticContents(request.contents, requirementById, observationByRef);
+  const currentMissing = missingRepresentedObservations(requirements, prior.representedRefs, current.representedRefs);
+  const contents = currentMissing.length > 0
+    ? [attachmentObservationStateContent(currentMissing, observationByRef), ...current.contents]
+    : current.contents;
+
+  let segments: MessageContent[][] | undefined;
+  if (request.segments !== undefined) {
+    const represented = new Set(prior.representedRefs);
+    segments = request.segments.map((segment) => {
+      const projected = projectSemanticContents(segment, requirementById, observationByRef);
+      projected.representedRefs.forEach((ref) => represented.add(ref));
+      return projected.contents;
+    });
+    const missing = requirements.filter((requirement) => !represented.has(requirement.attachmentRef));
+    if (missing.length > 0) {
+      const state = attachmentObservationStateContent(missing, observationByRef);
+      if (segments.length === 0) segments.push([state]);
+      else segments[0] = [state, ...segments[0]];
+    }
+  }
+  return {
+    ...request,
+    contents,
+    ...(request.priorSummaryContents !== undefined ? { priorSummaryContents: prior.contents } : {}),
+    ...(segments !== undefined ? { segments } : {})
+  };
+}
+
+function projectSemanticContents(
+  contents: readonly MessageContent[],
+  requirementById: ReadonlyMap<string, LlmAttachmentObservationRequirement>,
+  observationByRef: ReadonlyMap<string, LlmAttachmentObservation>
+): SemanticContentsProjection {
+  const representedRefs = new Set<string>();
+  const projected = contents.map((content): MessageContent => ({
+    role: content.role,
+    parts: content.parts.flatMap((part): ContentPart[] => {
+      if (isInlineDataPart(part)) {
+        const requirement = requireObservationForMedia(part, requirementById);
+        const observation = requireObservationByRef(requirement.attachmentRef, observationByRef);
+        representedRefs.add(requirement.attachmentRef);
+        return [{ text: attachmentObservationDescriptor(requirement, observation) }];
+      }
+      if (isFunctionResponsePart(part) && part.functionResponse.parts?.length) {
+        const retained: InlineDataPart[] = [];
+        const descriptors: ContentPart[] = [];
+        for (const media of part.functionResponse.parts) {
+          const requirement = requireObservationForMedia(media, requirementById);
+          const observation = requireObservationByRef(requirement.attachmentRef, observationByRef);
+          representedRefs.add(requirement.attachmentRef);
+          descriptors.push({ text: attachmentObservationDescriptor(requirement, observation) });
+        }
+        const cloned = cloneJsonValue(part);
+        if (retained.length > 0) cloned.functionResponse.parts = retained;
+        else delete cloned.functionResponse.parts;
+        return [cloned, ...descriptors];
+      }
+      return [cloneJsonValue(part)];
+    })
+  }));
+  return { contents: projected, representedRefs };
+}
+
+function requireObservationForMedia(
+  media: InlineDataPart,
+  requirementById: ReadonlyMap<string, LlmAttachmentObservationRequirement>
+): LlmAttachmentObservationRequirement {
+  const attachmentId = media.inlineData.attachmentId?.trim();
+  const requirement = attachmentId ? requirementById.get(attachmentId) : undefined;
+  if (!requirement) {
+    throw new LlmMediaSemanticsUnavailableError(
+      'a summary media body has no matching frozen F-reference observation requirement.'
+    );
+  }
+  return requirement;
+}
+
+function requireObservationByRef(
+  attachmentRef: string,
+  observations: ReadonlyMap<string, LlmAttachmentObservation>
+): LlmAttachmentObservation {
+  const observation = observations.get(attachmentRef);
+  if (!observation) {
+    throw new LlmMediaSemanticsUnavailableError('a required observation is missing.', attachmentRef);
+  }
+  return observation;
+}
+
+function missingRepresentedObservations(
+  requirements: readonly LlmAttachmentObservationRequirement[],
+  ...representedSets: ReadonlySet<string>[]
+): LlmAttachmentObservationRequirement[] {
+  return requirements.filter((requirement) =>
+    representedSets.every((represented) => !represented.has(requirement.attachmentRef))
+  );
+}
+
+function attachmentObservationStateContent(
+  requirements: readonly LlmAttachmentObservationRequirement[],
+  observations: ReadonlyMap<string, LlmAttachmentObservation>
+): MessageContent {
+  return renderAttachmentObservationStateContent(
+    requirements,
+    requirements.map((requirement) =>
+      requireObservationByRef(requirement.attachmentRef, observations))
+  );
+}
+
+function attachmentObservationDescriptor(
+  requirement: LlmAttachmentObservationRequirement,
+  observation: LlmAttachmentObservation
+): string {
+  return JSON.stringify({
+    kind: 'attachment_observation',
+    promptRevision: ATTACHMENT_OBSERVATION_PROMPT_REVISION,
+    ...attachmentObservationModelRecord(requirement, observation)
+  });
+}
+
+function attachmentObservationModelRecord(
+  requirement: LlmAttachmentObservationRequirement,
+  observation: LlmAttachmentObservation
+): Record<string, unknown> {
+  return {
+    attachmentRef: requirement.attachmentRef,
+    name: requirement.name,
+    mimeType: requirement.mimeType,
+    sizeBytes: requirement.sizeBytes,
+    summary: observation.summary,
+    salientFacts: [...observation.salientFacts],
+    uncertainties: [...observation.uncertainties]
+  };
+}
+
+function compressionSummaryContents(
+  summary: string,
+  targetTokens: number,
+  requirements: readonly LlmAttachmentObservationRequirement[],
+  observations: readonly LlmAttachmentObservation[]
+): MessageContent[] {
+  const contents = summaryContents(summary, targetTokens);
+  if (requirements.length === 0) return contents;
+  const byRef = new Map(observations.map((observation) => [observation.attachmentRef, observation]));
+  return [...contents, attachmentObservationStateContent(requirements, byRef)];
+}
+
+function attachmentObservationResultFields(
+  prepared: PreparedCompressionMediaSemantics
+): Pick<LlmCompactResult, 'attachmentObservationProfileSha256' | 'attachmentObservations'> {
+  if (!prepared.profileSha256) return {};
+  return {
+    attachmentObservationProfileSha256: prepared.profileSha256,
+    attachmentObservations: prepared.observations.map(cloneAttachmentObservation)
+  };
+}
+
+function cloneAttachmentObservation(observation: LlmAttachmentObservation): LlmAttachmentObservation {
+  return {
+    attachmentRef: observation.attachmentRef,
+    summary: observation.summary,
+    salientFacts: [...observation.salientFacts],
+    uncertainties: [...observation.uncertainties]
+  };
+}
 
 async function compactWithSummary(
   request: LlmCompactRequest,
@@ -1752,15 +2427,28 @@ async function compactWithSummary(
   options: LlmProviderOptions,
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
-  const summary = await generateSummaryText(request, methodConfig, options, signal);
-  const contents = summaryContents(summary.text, effectiveSummaryTargetTokens(methodConfig));
+  const mediaSemantics = await prepareCompressionMediaSemantics(request, methodConfig, options, signal);
+  const summary = await generateSummaryText(
+    mediaSemantics.request,
+    methodConfig,
+    options,
+    signal,
+    mediaSemantics.provider
+  );
+  const contents = compressionSummaryContents(
+    summary.text,
+    effectiveSummaryTargetTokens(methodConfig),
+    mediaSemantics.requirements,
+    mediaSemantics.observations
+  );
   return {
     id: `summary-${request.blockId}`,
     object: 'limcode.context_summary',
     createdAt: Date.now(),
     contents,
     ...(summary.settings ? { settingsSnapshot: snapshotFromSettings(summary.settings, methodConfig) } : {}),
-    methodConfig
+    methodConfig,
+    ...attachmentObservationResultFields(mediaSemantics)
   };
 }
 
@@ -1771,15 +2459,26 @@ async function compactWithSegmentedSummary(
   options: LlmProviderOptions,
   signal?: AbortSignal
 ): Promise<LlmCompactResult> {
-  const provider = await resolveSummaryProvider(request, methodConfig, options);
+  const initialProvider = await resolveSummaryProvider(request, methodConfig, options);
+  const mediaSemantics = await prepareCompressionMediaSemantics(
+    request,
+    methodConfig,
+    options,
+    signal,
+    initialProvider
+  );
+  const provider = mediaSemantics.provider ?? initialProvider;
+  const semanticRequest = mediaSemantics.request;
   const targetTokens = effectiveSummaryTargetTokens(methodConfig);
-  const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
-  const sourceContents = summaryDeltaContents(request);
+  const priorSummaryText = semanticRequest.priorSummaryContents?.length
+    ? plainTextOfContents(semanticRequest.priorSummaryContents)
+    : '';
+  const sourceContents = summaryDeltaContents(semanticRequest);
   const deterministic = deterministicReplacementSummary(priorSummaryText, sourceContents, targetTokens);
   let finalSummary = deterministic;
 
   if (sourceContents.length > 0 && provider.provider) {
-    const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, provider.settings);
+    const calls = buildSegmentedSummaryProviderCalls(semanticRequest, methodConfig, provider.settings);
     const deltaSummaries = await mapWithBoundedConcurrency(
       calls,
       isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
@@ -1800,14 +2499,20 @@ async function compactWithSegmentedSummary(
     if (merged) finalSummary = finalizeStructuredSummary(merged, deterministic, targetTokens);
   }
 
-  const contents = summaryContents(finalSummary, targetTokens);
+  const contents = compressionSummaryContents(
+    finalSummary,
+    targetTokens,
+    mediaSemantics.requirements,
+    mediaSemantics.observations
+  );
   return {
     id: `summary-${request.blockId}`,
     object: 'limcode.context_summary',
     createdAt: Date.now(),
     contents,
     ...(provider.settings ? { settingsSnapshot: snapshotFromSettings(provider.settings, methodConfig) } : {}),
-    methodConfig
+    methodConfig,
+    ...attachmentObservationResultFields(mediaSemantics)
   };
 }
 
@@ -1927,7 +2632,7 @@ interface SummaryProviderCall {
   sourceContents: MessageContent[];
   targetTokens: number;
   request: {
-    contents: Array<{ role: 'user'; parts: Array<{ text: string }> }>;
+    contents: MessageContent[];
     systemInstruction: { parts: Array<{ text: string }> };
     generationConfig?: LlmGenerationConfigRecord;
   };
@@ -2617,7 +3322,8 @@ async function generateSummaryText(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
   options: LlmProviderOptions,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  resolvedProvider?: ResolvedSummaryProvider
 ): Promise<GeneratedSummaryTextResult> {
   const targetTokens = effectiveSummaryTargetTokens(methodConfig);
   const priorSummaryText = request.priorSummaryContents?.length
@@ -2630,7 +3336,7 @@ async function generateSummaryText(
 
   if (request.contents.length === 0) return { text: fallback };
 
-  const resolved = await resolveSummaryProvider(request, methodConfig, options);
+  const resolved = resolvedProvider ?? await resolveSummaryProvider(request, methodConfig, options);
   if (!resolved.provider) return { text: fallback, settings: resolved.settings };
 
   const call = buildSummaryProviderCall(request, methodConfig, resolved.settings);

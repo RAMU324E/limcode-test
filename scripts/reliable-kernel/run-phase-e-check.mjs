@@ -2655,6 +2655,26 @@ async function checkImmutableReplacement() {
       }
     }
     const coordinatorHead = await context.currentHeadRootId(coordinatorSeed.conversationId);
+    const coordinatorObservationProfile = kernel.attachmentObservationAnalysisProfileSha256(
+      coordinatorPolicy.provider
+    );
+    const coordinatorObservationRequirement = {
+      attachmentRef: 'F1',
+      attachmentId: coordinatorAttachment.attachmentId,
+      name: coordinatorAttachment.name,
+      mimeType: coordinatorAttachment.mimeType,
+      sizeBytes: coordinatorAttachment.sizeBytes
+    };
+    const coordinatorObservation = {
+      attachmentRef: 'F1',
+      summary: 'Coordinator PDF contains one durable visual fact.',
+      salientFacts: ['The PDF observation is reusable.'],
+      uncertainties: []
+    };
+    const coordinatorObservationState = kernel.renderAttachmentObservationStateContent(
+      [coordinatorObservationRequirement],
+      [coordinatorObservation]
+    );
     let compactDispatches = 0;
     let frozenCompressionBlockId;
     const coordinator = new kernel.ReliableContextCompressionCoordinator(
@@ -2680,16 +2700,26 @@ async function checkImmutableReplacement() {
                 entries: [coordinatorAttachment]
               }]);
               assert.deepEqual(request.attachmentCatalogState, request.recipe.attachmentCatalogState);
+              assert.equal(request.recipe.attachmentObservationProfileSha256, coordinatorObservationProfile);
+              assert.deepEqual(
+                request.recipe.attachmentObservationRequirements,
+                [coordinatorObservationRequirement]
+              );
               frozenCompressionBlockId = request.recipe.blockId;
               await controls.onEvent({
                 kind: 'completed',
                 streamSeq: '1',
                 content: {
                   type: 'compression_result',
-                  contents: [{
-                    role: 'model',
-                    parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }]
-                  }]
+                  contents: [
+                    {
+                      role: 'model',
+                      parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }]
+                    },
+                    coordinatorObservationState
+                  ],
+                  attachmentObservationProfileSha256: coordinatorObservationProfile,
+                  attachmentObservations: [coordinatorObservation]
                 },
                 usage: { promptTokenCount: 77, totalTokenCount: 91 }
               });
@@ -2806,8 +2836,22 @@ async function checkImmutableReplacement() {
     assert.equal(structuredCompression.providerInputTokens, 77);
     assert.equal(structuredCompression.methodKind, 'deterministic_summary');
     assert.deepEqual(structuredCompression.contents, [
-      { role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] }
+      { role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] },
+      coordinatorObservationState
     ]);
+    const coordinatorObservationLinks = await list(ctx.database, 'AttachmentObservationLink', {
+      attachment_id: coordinatorAttachment.attachmentId,
+      analysis_profile_sha256: coordinatorObservationProfile
+    });
+    assert.equal(coordinatorObservationLinks.length, 1);
+    const coordinatorBlockObservationLinks = await list(ctx.database, 'CompressionBlockObservationLink', {
+      compression_block_id: coordinated.result.compressionBlockId
+    });
+    assert.equal(coordinatorBlockObservationLinks.length, 1);
+    assert.equal(
+      coordinatorBlockObservationLinks[0].observation_id,
+      coordinatorObservationLinks[0].id
+    );
     const coordinatedMaterialized = await context.materialize(coordinated.result.rootId);
     assert.equal(coordinatedMaterialized.segments.length, 2);
     assert.equal(coordinatedMaterialized.segments[0].segmentKind, 'compression');

@@ -80,6 +80,62 @@ function compactRequest(provider) {
   };
 }
 
+function observationCompactRequest(kind = 'llm_summary', cachedObservation) {
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+XkW5WQAAAABJRU5ErkJggg==', 'base64');
+  const attachmentRef = 'F1';
+  const requirement = {
+    attachmentRef,
+    attachmentId: 'attachment-visual-evidence',
+    name: 'visual-evidence.png',
+    mimeType: 'image/png',
+    sizeBytes: bytes.byteLength,
+    ...(cachedObservation ? { cachedObservation } : {})
+  };
+  return {
+    bytes,
+    request: {
+      id: `observation-${kind}-${cachedObservation ? 'cached' : 'fresh'}`,
+      blockId: `observation-block-${kind}-${cachedObservation ? 'cached' : 'fresh'}`,
+      conversationId: 'conversation-observation',
+      methodKind: kind,
+      methodConfigSnapshot: {
+        id: `observation-config-${kind}`,
+        name: `Observation ${kind}`,
+        kind,
+        trigger: { mode: 'manual' },
+        llmSummary: { targetTokens: 1_000, generationConfig: { maxOutputTokens: 2_048 } },
+        createdAt: 1,
+        updatedAt: 1
+      },
+      contents: [{ role: 'user', parts: [
+        { text: 'Preserve the actual visual evidence during compression.' },
+        { inlineData: {
+          mimeType: requirement.mimeType,
+          name: requirement.name,
+          attachmentId: requirement.attachmentId,
+          sha256: 'a'.repeat(64),
+          sizeBytes: requirement.sizeBytes,
+          storage: 'managed'
+        } }
+      ] }],
+      sourceHash: 'source-observation',
+      attachmentObservationProfileSha256: 'b'.repeat(64),
+      attachmentObservationRequirements: [requirement]
+    }
+  };
+}
+
+function waitForCompactTerminal(capability, request, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('compact observation test timed out')), timeoutMs);
+    capability.compact(request, (event) => {
+      if (event.type !== 'llm:compactDone' && event.type !== 'llm:compactError') return;
+      clearTimeout(timeout);
+      resolve(event);
+    });
+  });
+}
+
 test('segmented summary preserves overflow text across leaf chunks and hierarchy merge requests', async () => {
   const provider = 'openai-compatible';
   const fixture = compactRequest(provider);
@@ -300,6 +356,249 @@ test('deterministic fallback preserves first and last anchors beyond the per-fie
   } finally {
     capability.dispose();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('text summary inspects each unique managed media body once and returns reusable F observations', async () => {
+  const fixture = observationCompactRequest('llm_summary');
+  const base64 = fixture.bytes.toString('base64');
+  const requestBodies = [];
+  let resolverCalls = 0;
+  const structured = [
+    '目标', '- Preserve the red status pixel from F1', '',
+    '重要约束、决定和准确标识', '- F1 is visual-evidence.png', '',
+    '工作状态', '  - 已完成', '    - Inspected F1',
+    '  - 正在做', '    - 无', '  - 受阻', '    - 无', '',
+    '下一步', '- 无', '', '相关文件', '- visual-evidence.png'
+  ].join('\n');
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString('utf8');
+    requestBodies.push(body);
+    const isObservation = body.includes('Attachment observation contract revision');
+    const content = isObservation
+      ? JSON.stringify({
+          attachmentRef: 'F1',
+          summary: 'A one-pixel red status indicator.',
+          salientFacts: ['The indicator is red.', 'The image contains one visible pixel.'],
+          uncertainties: ['No surrounding UI context is visible.']
+        })
+      : structured;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: `chatcmpl-observation-${requestBodies.length}`,
+      object: 'chat.completion',
+      created: 1,
+      model: 'gpt-test',
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const options = {
+    settings: async () => ({
+      ...providerConfig('openai-compatible', `http://127.0.0.1:${address.port}/v1`),
+      stream: false
+    }),
+    compressionSettings: async () => undefined,
+    async resolveAttachment(input) {
+      resolverCalls += 1;
+      assert.equal(input.attachmentId, 'attachment-visual-evidence');
+      return { inlineData: {
+        mimeType: 'image/png', name: 'visual-evidence.png', data: base64,
+        attachmentId: input.attachmentId, sizeBytes: fixture.bytes.byteLength
+      } };
+    }
+  };
+  const capability = createLlmProviderCapability(options);
+  try {
+    const terminal = await waitForCompactTerminal(capability, fixture.request);
+    assert.equal(terminal.type, 'llm:compactDone', terminal.payload.message);
+    assert.equal(resolverCalls, 1);
+    assert.equal(requestBodies.length, 2, 'one observation call must precede one summary call');
+    assert.match(requestBodies[0], /F1/);
+    assert.match(requestBodies[0], new RegExp(base64.slice(0, 24)));
+    assert.doesNotMatch(requestBodies[0], /attachment-visual-evidence|aaaaaaaaaaaaaaaa/);
+    assert.doesNotMatch(requestBodies[1], new RegExp(base64.slice(0, 24)));
+    assert.match(requestBodies[1], /one-pixel red status indicator/);
+    assert.equal(terminal.payload.result.attachmentObservationProfileSha256, 'b'.repeat(64));
+    assert.deepEqual(terminal.payload.result.attachmentObservations, [{
+      attachmentRef: 'F1',
+      summary: 'A one-pixel red status indicator.',
+      salientFacts: ['The indicator is red.', 'The image contains one visible pixel.'],
+      uncertainties: ['No surrounding UI context is visible.']
+    }]);
+    assert.equal(terminal.payload.result.contents.length, 2);
+    assert.match(terminal.payload.result.contents[1].parts[0].text, /attachment_observation_state/);
+    assert.match(terminal.payload.result.contents[1].parts[0].text, /"attachmentRef":"F1"/);
+    assert.doesNotMatch(JSON.stringify(terminal.payload.result.contents), /attachment-visual-evidence/);
+  } finally {
+    capability.dispose();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('successful media observation is reused when a later summary attempt retries', async () => {
+  const fixture = observationCompactRequest('llm_summary');
+  fixture.request.id = 'observation-summary-retry';
+  fixture.request.blockId = 'observation-summary-retry-block';
+  const base64 = fixture.bytes.toString('base64');
+  const requestBodies = [];
+  let resolverCalls = 0;
+  let summaryAttempts = 0;
+  const structured = [
+    '目标', '- Preserve F1 after retry', '',
+    '重要约束、决定和准确标识', '- F1 observation is durable', '',
+    '工作状态', '  - 已完成', '    - Summary retry succeeded',
+    '  - 正在做', '    - 无', '  - 受阻', '    - 无', '',
+    '下一步', '- 无', '', '相关文件', '- visual-evidence.png'
+  ].join('\n');
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString('utf8');
+    requestBodies.push(body);
+    if (body.includes('Attachment observation contract revision')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-retry-observation', object: 'chat.completion', created: 1, model: 'gpt-test',
+        choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify({
+          attachmentRef: 'F1',
+          summary: 'Retry-stable visual observation.',
+          salientFacts: ['The status is red.'],
+          uncertainties: []
+        }) }, finish_reason: 'stop' }]
+      }));
+      return;
+    }
+    summaryAttempts += 1;
+    if (summaryAttempts === 1) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'temporary summary failure', type: 'server_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-retry-summary', object: 'chat.completion', created: 1, model: 'gpt-test',
+      choices: [{ index: 0, message: { role: 'assistant', content: structured }, finish_reason: 'stop' }]
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const options = {
+    settings: async () => ({
+      ...providerConfig('openai-compatible', `http://127.0.0.1:${address.port}/v1`),
+      stream: false,
+      retryOnError: true,
+      retryMaxAttempts: 1
+    }),
+    compressionSettings: async () => undefined,
+    async resolveAttachment() {
+      resolverCalls += 1;
+      return { inlineData: {
+        mimeType: 'image/png', name: 'visual-evidence.png', data: base64,
+        attachmentId: 'attachment-visual-evidence', sizeBytes: fixture.bytes.byteLength
+      } };
+    }
+  };
+  const capability = createLlmProviderCapability(options);
+  try {
+    const terminal = await waitForCompactTerminal(capability, fixture.request, 15_000);
+    assert.equal(terminal.type, 'llm:compactDone', terminal.payload.message);
+    assert.equal(summaryAttempts, 2);
+    assert.equal(resolverCalls, 1);
+    assert.equal(requestBodies.filter((body) =>
+      body.includes('Attachment observation contract revision')
+    ).length, 1);
+    assert.equal(requestBodies.filter((body) => body.includes(base64.slice(0, 24))).length, 1);
+  } finally {
+    capability.dispose();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('compact dry-run exposes observation calls and never repeats media in the summary preview', async () => {
+  const fixture = observationCompactRequest('llm_summary');
+  const base64 = fixture.bytes.toString('base64');
+  let resolverCalls = 0;
+  const result = await dryRunCompactLlmProvider(fixture.request, {
+    settings: async () => providerConfig('openai-compatible', 'https://example.test/v1'),
+    compressionSettings: async () => undefined,
+    async resolveAttachment() {
+      resolverCalls += 1;
+      return { inlineData: {
+        mimeType: 'image/png', name: 'visual-evidence.png', data: base64,
+        attachmentId: 'attachment-visual-evidence', sizeBytes: fixture.bytes.byteLength
+      } };
+    }
+  });
+  assert.equal(result.kind, 'provider_requests');
+  assert.equal(result.calls.length, 2);
+  assert.equal(result.calls[0].label, 'Attachment F1 observation');
+  assert.equal(result.calls[1].label, 'Context Summary');
+  assert.equal(resolverCalls, 1);
+  assert.match(result.calls[0].bodyText, new RegExp(base64.slice(0, 24)));
+  assert.doesNotMatch(result.calls[1].bodyText, new RegExp(base64.slice(0, 24)));
+  assert.match(result.calls[1].bodyText, /dry-run placeholder/);
+  assert.match(result.note, /F 附件/);
+});
+
+test('local summary fails explicitly for uncached media and reuses cached observations without resolution', async () => {
+  const missing = observationCompactRequest('deterministic_summary');
+  let resolverCalls = 0;
+  const options = {
+    settings: async () => ({
+      ...providerConfig('openai-compatible', 'https://example.test/v1'),
+      apiKey: ''
+    }),
+    compressionSettings: async () => undefined,
+    async resolveAttachment() {
+      resolverCalls += 1;
+      throw new Error('local summaries must not resolve media');
+    }
+  };
+  const capability = createLlmProviderCapability(options);
+  try {
+    const failed = await waitForCompactTerminal(capability, missing.request);
+    assert.equal(failed.type, 'llm:compactError');
+    assert.match(failed.payload.message, /media_semantics_unavailable/);
+    assert.equal(failed.payload.rawError.code, 'media_semantics_unavailable');
+    assert.equal(resolverCalls, 0);
+
+    const uncontracted = observationCompactRequest('deterministic_summary');
+    uncontracted.request.id = 'observation-deterministic-no-contract';
+    uncontracted.request.blockId = 'observation-deterministic-no-contract-block';
+    delete uncontracted.request.attachmentObservationProfileSha256;
+    delete uncontracted.request.attachmentObservationRequirements;
+    const noContract = await waitForCompactTerminal(capability, uncontracted.request);
+    assert.equal(noContract.type, 'llm:compactError');
+    assert.match(noContract.payload.message, /without a frozen F-reference observation contract/);
+    assert.equal(resolverCalls, 0);
+
+    const cachedObservation = {
+      attachmentRef: 'F1',
+      summary: 'Cached visual observation.',
+      salientFacts: ['The status is red.'],
+      uncertainties: []
+    };
+    const cached = observationCompactRequest('deterministic_summary', cachedObservation);
+    const completed = await waitForCompactTerminal(capability, cached.request);
+    assert.equal(completed.type, 'llm:compactDone', completed.payload.message);
+    assert.equal(resolverCalls, 0);
+    assert.deepEqual(completed.payload.result.attachmentObservations, [cachedObservation]);
+    assert.match(completed.payload.result.contents[1].parts[0].text, /Cached visual observation/);
+  } finally {
+    capability.dispose();
   }
 });
 

@@ -6,6 +6,12 @@ import {
   type AttachmentCatalogState
 } from './attachmentCatalog';
 import { AttachmentCatalogProjection } from './attachmentCatalogProjection';
+import {
+  assertAttachmentObservationStateContent,
+  attachmentObservationAnalysisProfileSha256,
+  completeAttachmentObservationCommits,
+  loadAttachmentObservationRequirements
+} from './attachmentObservations';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore } from './contentAddressedStore';
 import {
@@ -265,6 +271,19 @@ export class ReliableContextCompressionCoordinator {
       frozen.conversationId,
       sourceAttachmentCatalogState.catalog
     );
+    const attachmentObservationProfileSha256 = policy.methodKind !== 'openai_responses_compact'
+      && sourceAttachmentCatalogState.catalog.length > 0
+        ? attachmentObservationAnalysisProfileSha256(policy.provider)
+        : undefined;
+    const attachmentObservationRequirements = attachmentObservationProfileSha256
+      ? await loadAttachmentObservationRequirements(
+          this.database,
+          this.contentStore,
+          sourceAttachmentCatalogState.catalog,
+          sourceAttachmentHandles,
+          attachmentObservationProfileSha256
+        )
+      : [];
     const sourceHash = hashSource(sourceSegments);
     const idempotencyKey = [
       'context-compression', trigger, headRootId, policy.config.id, String(sourceSegmentCount), sourceHash
@@ -275,37 +294,54 @@ export class ReliableContextCompressionCoordinator {
       headRootId,
       expectedModelRequestId
     );
-    const created = await this.modelProvider.createModelRequest({
-      turnId,
-      contextRootId: headRootId,
-      authoritySnapshotId,
-      recipe: normalizePlainJson({
-        kind: 'reliable-context-compression',
-        requestKind: trigger === 'auto' ? 'context_compression_pre' : 'context_compression_manual',
-        trigger,
-        triggerReason,
-        triggerTokens: decision.estimatedTokens,
-        triggerTokenSource: decision.source,
-        configuredThresholdTokens: requestBudget.compressionThresholdTokens,
-        requestBreakdown: requestBudget.breakdown,
-        sourceRootId: headRootId,
-        sourceSegmentCount,
-        sourceHash,
-        blockId: compressionBlockId,
-        compressionConfigId: policy.config.id,
-        compressionMethodKind: policy.methodKind,
-        attachmentCatalogState: sourceAttachmentCatalogState,
-        ...(sourceAttachmentHandles.entries.length > 0
-          ? { modelHandleCatalog: sourceAttachmentHandles }
-          : {}),
-        ...(effectiveSummaryMaxTokens === undefined ? {} : { effectiveSummaryMaxTokens })
-      }, 'Reliable compression recipe'),
-      idempotencyKey
-    });
-    if (created.modelRequestId !== expectedModelRequestId) {
-      throw new Error('Compression ModelProvider returned an unexpected stable request identity.');
+    let request = await this.optionalDomain('ModelRequest', expectedModelRequestId);
+    if (!request) {
+      const created = await this.modelProvider.createModelRequest({
+        turnId,
+        contextRootId: headRootId,
+        authoritySnapshotId,
+        recipe: normalizePlainJson({
+          kind: 'reliable-context-compression',
+          requestKind: trigger === 'auto' ? 'context_compression_pre' : 'context_compression_manual',
+          trigger,
+          triggerReason,
+          triggerTokens: decision.estimatedTokens,
+          triggerTokenSource: decision.source,
+          configuredThresholdTokens: requestBudget.compressionThresholdTokens,
+          requestBreakdown: requestBudget.breakdown,
+          sourceRootId: headRootId,
+          sourceSegmentCount,
+          sourceHash,
+          blockId: compressionBlockId,
+          compressionConfigId: policy.config.id,
+          compressionMethodKind: policy.methodKind,
+          attachmentCatalogState: sourceAttachmentCatalogState,
+          ...(sourceAttachmentHandles.entries.length > 0
+            ? { modelHandleCatalog: sourceAttachmentHandles }
+            : {}),
+          ...(attachmentObservationProfileSha256
+            ? {
+                attachmentObservationProfileSha256,
+                attachmentObservationRequirements
+              }
+            : {}),
+          ...(effectiveSummaryMaxTokens === undefined ? {} : { effectiveSummaryMaxTokens })
+        }, 'Reliable compression recipe'),
+        idempotencyKey
+      });
+      if (created.modelRequestId !== expectedModelRequestId) {
+        throw new Error('Compression ModelProvider returned an unexpected stable request identity.');
+      }
+      request = await this.requireDomain('ModelRequest', expectedModelRequestId);
+    } else {
+      assertFrozenCompressionModelRequestIdentity(
+        request,
+        turnId,
+        authoritySnapshotId,
+        policy.provider.providerConfigId,
+        policy.provider.modelId
+      );
     }
-    let request = await this.requireDomain('ModelRequest', expectedModelRequestId);
     if (request.status !== 'terminal') {
       const providerId = requireText(request.provider_id, 'ModelRequest.provider_id');
       const adapter = await this.providers.resolve(providerId);
@@ -324,7 +360,25 @@ export class ReliableContextCompressionCoordinator {
       throw new Error(`Compression ModelRequest ${expectedModelRequestId} ended as ${String(request.terminal_state)}.`);
     }
     const completed = await this.modelProvider.completedEvent(expectedModelRequestId);
-    const summary = compressionContents(completed.content);
+    const compressionResult = parseCompressionResult(completed.content);
+    const summary = compressionResult.contents;
+    if (compressionResult.attachmentObservationProfileSha256 !== attachmentObservationProfileSha256) {
+      throw new Error('Compression terminal Attachment observation profile conflicts with its frozen recipe.');
+    }
+    const attachmentObservations = attachmentObservationProfileSha256
+      ? completeAttachmentObservationCommits(
+          attachmentObservationRequirements,
+          compressionResult.attachmentObservations,
+          attachmentObservationProfileSha256
+        )
+      : [];
+    if (attachmentObservationProfileSha256) {
+      assertAttachmentObservationStateContent(
+        summary,
+        attachmentObservationRequirements,
+        compressionResult.attachmentObservations ?? []
+      );
+    }
     const tailSegments = semanticMaterialized.segments.slice(sourceSegmentCount);
     const tailAttachmentCatalogState = await this.attachmentCatalog.projectState(
       frozen.conversationId,
@@ -367,10 +421,11 @@ export class ReliableContextCompressionCoordinator {
     ).tokenCount;
     const providerInputTokens = providerPromptTokens(completed.usage);
     const providerOutputTokens = compressionOutputTokens(completed.usage);
-    const providerSummaryTokens = providerOutputTokens
-      ?? estimateMessageContentsTokens(summary);
-    const summaryEstimatedTokens = providerSummaryTokens;
-    const projectedTokens = providerSummaryTokens
+    // The durable replacement may include locally rendered Attachment observation state that is not
+    // part of Provider output accounting. Project the complete structured result instead of silently
+    // undercounting that model-visible state.
+    const summaryEstimatedTokens = estimateMessageContentsTokens(summary);
+    const projectedTokens = summaryEstimatedTokens
       + Math.max(0, candidateProjection.tokenCount - summaryProjectionTokens);
     const projectedBodyTokens = projectedTokens + irreducibleAddendaTokens;
     if (projectedBodyTokens > requestBudget.planningBodyRoomTokens) {
@@ -400,6 +455,7 @@ export class ReliableContextCompressionCoordinator {
       compressSegmentCount: sourceSegmentCount,
       title: command.title?.trim() || (trigger === 'auto' ? '自动上下文压缩' : '上下文压缩'),
       summary,
+      ...(attachmentObservations.length > 0 ? { attachmentObservations } : {}),
       summaryMetadata: {
         trigger,
         triggerReason,
@@ -467,11 +523,32 @@ export class ReliableContextCompressionCoordinator {
     });
   }
 
-  private async requireDomain(domain: string, id: string): Promise<DomainRow> {
+  private async optionalDomain(domain: string, id: string): Promise<DomainRow | undefined> {
     const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)]);
     const row = snapshot.snapshot[0];
-    if (!row || Array.isArray(row)) throw new Error(`${domain} ${id} does not exist.`);
+    if (Array.isArray(row)) throw new Error(`${domain} ${id} lookup returned a list.`);
+    return row ?? undefined;
+  }
+
+  private async requireDomain(domain: string, id: string): Promise<DomainRow> {
+    const row = await this.optionalDomain(domain, id);
+    if (!row) throw new Error(`${domain} ${id} does not exist.`);
     return row;
+  }
+}
+
+function assertFrozenCompressionModelRequestIdentity(
+  request: DomainRow,
+  turnId: string,
+  authoritySnapshotId: string,
+  providerId: string,
+  modelId: string
+): void {
+  if (request.turn_id !== turnId
+    || request.authority_snapshot_id !== authoritySnapshotId
+    || request.provider_id !== providerId
+    || request.model_id !== modelId) {
+    throw new Error('Existing compression ModelRequest conflicts with the frozen request identity.');
   }
 }
 
@@ -619,18 +696,41 @@ function closeToolExchangeBoundary(records: readonly StructuralContextRecord[], 
   return count;
 }
 
-function compressionContents(value: PlainJsonValue): MessageContent[] {
+interface ParsedCompressionResult {
+  contents: MessageContent[];
+  attachmentObservationProfileSha256?: string;
+  attachmentObservations?: PlainJsonValue[];
+}
+
+function parseCompressionResult(value: PlainJsonValue): ParsedCompressionResult {
   const record = requireRecord(value, 'Compression terminal content');
   if (record.type !== 'compression_result' || !Array.isArray(record.contents) || record.contents.length === 0) {
     throw new TypeError('Compression terminal checkpoint does not contain MessageContent[].');
   }
-  return record.contents.map((entry, index) => {
+  const contents = record.contents.map((entry, index) => {
     const content = requireRecord(entry, `Compression terminal content[${index}]`);
     if ((content.role !== 'user' && content.role !== 'model') || !Array.isArray(content.parts)) {
       throw new TypeError(`Compression terminal MessageContent ${index} is invalid.`);
     }
     return content as unknown as MessageContent;
   });
+  const rawProfile = record.attachmentObservationProfileSha256;
+  const rawObservations = record.attachmentObservations;
+  if ((rawProfile === undefined) !== (rawObservations === undefined)) {
+    throw new TypeError('Compression terminal Attachment observation contract is incomplete.');
+  }
+  const attachmentObservationProfileSha256 = rawProfile === undefined
+    ? undefined
+    : requireSha256(rawProfile, 'Compression terminal attachmentObservationProfileSha256');
+  const attachmentObservations = rawObservations === undefined
+    ? undefined
+    : Array.isArray(rawObservations)
+      ? rawObservations
+      : (() => { throw new TypeError('Compression terminal attachmentObservations must be an array.'); })();
+  return {
+    contents,
+    ...(attachmentObservationProfileSha256 ? { attachmentObservationProfileSha256, attachmentObservations } : {})
+  };
 }
 
 function hashSource(records: readonly StructuralContextRecord[]): string {
@@ -664,6 +764,12 @@ function requireNonNegativeTokenCount(value: number, label: string): number {
 function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
   return value;
+}
+
+function requireSha256(value: unknown, label: string): string {
+  const text = requireText(value, label).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(text)) throw new TypeError(`${label} must be a SHA-256 hex digest.`);
+  return text;
 }
 
 function requireTrigger(value: unknown): CompressionTrigger {

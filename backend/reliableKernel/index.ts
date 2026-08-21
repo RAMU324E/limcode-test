@@ -10,6 +10,7 @@ export * from './currentTurnTaskProjection';
 export * from './attachmentIngest';
 export * from './attachmentCatalog';
 export * from './attachmentCatalogProjection';
+export * from './attachmentObservations';
 export * from './conversationAttachmentHandles';
 export * from './agentLoop';
 export * from './answerDelivery';

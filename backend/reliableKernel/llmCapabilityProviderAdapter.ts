@@ -14,6 +14,11 @@ import {
   normalizeAttachmentCatalogState,
   renderAttachmentCatalogState
 } from './attachmentCatalog';
+import {
+  assertAttachmentObservationStateContent,
+  normalizeAttachmentObservationRequirement,
+  normalizeLlmAttachmentObservation
+} from './attachmentObservations';
 import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import {
   compactReadFileToolArguments,
@@ -440,6 +445,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             const usage = result.usageMetadata === undefined
               ? undefined
               : normalizeProviderPlainJson(result.usageMetadata, 'LLM compact result.usageMetadata');
+            const attachmentObservationResult = normalizeCompactAttachmentObservationResult(
+              result,
+              compactRequest,
+              contents as unknown as MessageContent[]
+            );
             sequence += 1n;
             const completeEvent: ProviderOutputStreamEvent = {
               kind: 'completed',
@@ -448,7 +458,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
                 type: 'compression_result',
                 contents,
                 ...(settingsSnapshot !== undefined ? { settingsSnapshot } : {}),
-                ...(methodConfig !== undefined ? { methodConfig } : {})
+                ...(methodConfig !== undefined ? { methodConfig } : {}),
+                ...attachmentObservationResult
               }, 'LLM compression terminal content'),
               ...(usage !== undefined ? { usage } : {})
             };
@@ -685,6 +696,12 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     modelId: requireText(provider.modelId, 'Compression modelId')
   };
   const context = compressionContext(request, compressionProvider, methodKind);
+  const attachmentObservationContract = frozenAttachmentObservationContract(
+    recipe,
+    methodKind,
+    context.attachmentCatalogState.catalog,
+    context.modelHandleCatalog
+  );
   const settingsSnapshot = normalizePlainJson({
     providerConfigId: compressionProvider.providerConfigId,
     provider: compressionProvider.provider,
@@ -709,8 +726,112 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
     ...(methodKind !== 'openai_responses_compact' && context.priorSummaryContents.length > 0
       ? { priorSummaryContents: context.priorSummaryContents }
       : {}),
+    ...attachmentObservationContract,
     ...(optionalText(recipe.sourceHash) ? { sourceHash: optionalText(recipe.sourceHash) } : {})
   };
+}
+
+type CompactAttachmentObservationContract = Pick<
+  LlmCompactRequest,
+  'attachmentObservationProfileSha256' | 'attachmentObservationRequirements'
+>;
+
+function frozenAttachmentObservationContract(
+  recipe: { [key: string]: PlainJsonValue },
+  methodKind: LlmCompactRequest['methodKind'],
+  attachmentCatalog: readonly AttachmentCatalogEntry[],
+  modelHandleCatalog: ModelHandleCatalog
+): CompactAttachmentObservationContract {
+  const rawProfile = recipe.attachmentObservationProfileSha256;
+  const rawRequirements = recipe.attachmentObservationRequirements;
+  if (methodKind === 'openai_responses_compact') {
+    if (rawProfile !== undefined || rawRequirements !== undefined) {
+      throw new TypeError('Provider-native Compact cannot carry text-summary Attachment observations.');
+    }
+    return {};
+  }
+  if (attachmentCatalog.length === 0) {
+    if (rawProfile !== undefined || rawRequirements !== undefined) {
+      throw new TypeError('Attachment observation contract must be absent when the frozen catalog is empty.');
+    }
+    return {};
+  }
+  if (rawProfile === undefined || rawRequirements === undefined) {
+    throw new TypeError('Text compression with managed Attachments requires a frozen observation contract.');
+  }
+  const attachmentObservationProfileSha256 = requireSha256(
+    rawProfile,
+    'Compression recipe attachmentObservationProfileSha256'
+  );
+  if (!Array.isArray(rawRequirements) || rawRequirements.length !== attachmentCatalog.length) {
+    throw new TypeError('Compression recipe must require exactly one observation per catalog Attachment.');
+  }
+  const attachmentObservationRequirements = rawRequirements.map((value, index) => {
+    const requirement = normalizeAttachmentObservationRequirement(
+      value,
+      `Compression recipe attachmentObservationRequirements[${index}]`
+    );
+    const attachment = attachmentCatalog[index];
+    if (!attachment
+      || requirement.attachmentId !== attachment.attachmentId
+      || requirement.name !== attachment.name
+      || requirement.mimeType !== attachment.mimeType
+      || requirement.sizeBytes !== attachment.sizeBytes) {
+      throw new Error(`Attachment observation requirement ${index} conflicts with the frozen catalog.`);
+    }
+    const attachmentRef = modelHandleRef(modelHandleCatalog, 'attachment', attachment.attachmentId);
+    if (!attachmentRef || requirement.attachmentRef !== attachmentRef) {
+      throw new Error(`Attachment observation requirement ${index} conflicts with its frozen model handle.`);
+    }
+    return requirement;
+  });
+  return { attachmentObservationProfileSha256, attachmentObservationRequirements };
+}
+
+function normalizeCompactAttachmentObservationResult(
+  result: Record<string, unknown>,
+  request: LlmCompactRequest,
+  contents: MessageContent[]
+): CompactAttachmentObservationContract & { attachmentObservations?: ReturnType<typeof normalizeLlmAttachmentObservation>[] } {
+  const expectedProfile = request.attachmentObservationProfileSha256;
+  const expectedRequirements = request.attachmentObservationRequirements;
+  const rawProfile = result.attachmentObservationProfileSha256;
+  const rawObservations = result.attachmentObservations;
+  if (!expectedProfile && !expectedRequirements) {
+    if (rawProfile !== undefined || rawObservations !== undefined) {
+      throw new TypeError('LLM compact result returned an unexpected Attachment observation contract.');
+    }
+    return {};
+  }
+  if (!expectedProfile || !expectedRequirements) {
+    throw new Error('Frozen compact Attachment observation contract is incomplete.');
+  }
+  const attachmentObservationProfileSha256 = requireSha256(
+    rawProfile,
+    'LLM compact result.attachmentObservationProfileSha256'
+  );
+  if (attachmentObservationProfileSha256 !== expectedProfile) {
+    throw new Error('LLM compact result returned Attachment observations for another analysis profile.');
+  }
+  if (!Array.isArray(rawObservations) || rawObservations.length !== expectedRequirements.length) {
+    throw new TypeError('LLM compact result must return exactly one observation per required Attachment.');
+  }
+  const attachmentObservations = rawObservations.map((value, index) => {
+    const observation = normalizeLlmAttachmentObservation(
+      value,
+      `LLM compact result.attachmentObservations[${index}]`
+    );
+    if (observation.attachmentRef !== expectedRequirements[index]?.attachmentRef) {
+      throw new Error(`LLM compact result Attachment observation ${index} has an unexpected reference.`);
+    }
+    return observation;
+  });
+  assertAttachmentObservationStateContent(
+    contents,
+    expectedRequirements,
+    attachmentObservations
+  );
+  return { attachmentObservationProfileSha256, attachmentObservations };
 }
 
 function frozenEffectiveCompressionConfig(
@@ -760,6 +881,8 @@ function compressionContext(
   contents: MessageContent[];
   segments: MessageContent[][];
   priorSummaryContents: MessageContent[];
+  attachmentCatalogState: ReturnType<typeof normalizeAttachmentCatalogState>;
+  modelHandleCatalog: ModelHandleCatalog;
 } {
   const contents: MessageContent[] = [];
   const priorSummaryContents: MessageContent[] = [];
@@ -856,13 +979,20 @@ function compressionContext(
         modelHandleCatalog
       ),
       segments: [],
-      priorSummaryContents: []
+      priorSummaryContents: [],
+      attachmentCatalogState,
+      modelHandleCatalog
     };
   }
+  const contentsMediaState = createManagedMediaBodyProjectionState();
+  const segmentsMediaState = createManagedMediaBodyProjectionState();
   return {
-    contents: projectSummaryModelWindow(contents).contents,
-    segments: segments.map((segment) => projectSummaryModelWindow(segment).contents),
-    priorSummaryContents
+    contents: projectSummaryModelWindow(contents, modelHandleCatalog, contentsMediaState).contents,
+    segments: segments.map((segment) =>
+      projectSummaryModelWindow(segment, modelHandleCatalog, segmentsMediaState).contents),
+    priorSummaryContents,
+    attachmentCatalogState,
+    modelHandleCatalog
   };
 }
 
@@ -1829,6 +1959,12 @@ function collectErrorSignature(value: unknown, fallback: string, depth = 0, seen
   const fields = ['name', 'kind', 'code', 'message', 'reason', 'cause', 'error', 'data', 'response'];
   const text = fields.map((key) => collectErrorSignature(record[key], '', depth + 1, seen)).join(' ');
   return depth === 0 ? `${fallback} ${text}` : text;
+}
+
+function requireSha256(value: unknown, label: string): string {
+  const text = requireText(value as PlainJsonValue | undefined, label).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(text)) throw new TypeError(`${label} must be a SHA-256 hex digest.`);
+  return text;
 }
 
 function requireProviderKind(value: PlainJsonValue | undefined): LlmProviderKind {

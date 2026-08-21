@@ -893,6 +893,165 @@ test('LLM capability adapter 仍拒绝 Provider 内容数组中的 undefined', a
   );
 });
 
+test('LLM capability adapter freezes and whitelists exact F observation contracts', async () => {
+  const mediaSegment = {
+    segmentId: 'observation-media-segment',
+    segmentKind: 'message',
+    messageRole: 'user',
+    contentType: 'application/vnd.limcode.message+json',
+    content: JSON.stringify({ role: 'user', parts: [{ inlineData: {
+      mimeType: 'image/png',
+      name: 'adapter-evidence.png',
+      attachmentId: 'attachment-adapter-evidence',
+      sha256: 'a'.repeat(64),
+      sizeBytes: 123,
+      storage: 'managed'
+    } }] })
+  };
+  const profileSha256 = 'b'.repeat(64);
+  const observation = {
+    attachmentRef: 'F1',
+    summary: 'Adapter-observed image semantics.',
+    salientFacts: ['The image contains evidence.'],
+    uncertainties: []
+  };
+  const fullRequest = compressionRequest('llm_summary', [mediaSegment]);
+  fullRequest.attachmentCatalogState = {
+    catalog: [{
+      attachmentId: 'attachment-adapter-evidence',
+      name: 'adapter-evidence.png',
+      mimeType: 'image/png',
+      sizeBytes: 123
+    }],
+    placements: [{
+      kind: 'attachment_catalog_delta',
+      afterSegmentId: mediaSegment.segmentId,
+      entries: [{
+        attachmentId: 'attachment-adapter-evidence',
+        name: 'adapter-evidence.png',
+        mimeType: 'image/png',
+        sizeBytes: 123
+      }]
+    }]
+  };
+  fullRequest.recipe.modelHandleCatalog = { entries: [{
+    kind: 'attachment',
+    ref: 'F1',
+    target: 'attachment-adapter-evidence',
+    name: 'adapter-evidence.png',
+    mimeType: 'image/png',
+    sizeBytes: 123
+  }] };
+  fullRequest.recipe.attachmentObservationProfileSha256 = profileSha256;
+  fullRequest.recipe.attachmentObservationRequirements = [{
+    attachmentRef: 'F1',
+    attachmentId: 'attachment-adapter-evidence',
+    name: 'adapter-evidence.png',
+    mimeType: 'image/png',
+    sizeBytes: 123
+  }];
+
+  let captured;
+  const capability = fakeCapability(() => { throw new Error('ordinary start must not run'); });
+  capability.compact = (compactRequest, emit) => {
+    captured = compactRequest;
+    emit({
+      type: 'llm:compactDone',
+      payload: {
+        requestId: compactRequest.id,
+        result: {
+          contents: [
+            { role: 'user', parts: [{ text: 'summary' }] },
+            kernel.renderAttachmentObservationStateContent(
+              fullRequest.recipe.attachmentObservationRequirements,
+              [observation]
+            )
+          ],
+          attachmentObservationProfileSha256: profileSha256,
+          attachmentObservations: [observation]
+        }
+      }
+    });
+  };
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
+  const events = [];
+  await adapter.sendFullRequest(fullRequest, {
+    onEvent: async (event) => {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+    }
+  });
+  assert.equal(captured.attachmentObservationProfileSha256, profileSha256);
+  assert.deepEqual(captured.attachmentObservationRequirements, fullRequest.recipe.attachmentObservationRequirements);
+  assert.equal(captured.contents.some((content) =>
+    content.parts.some((part) => part.inlineData?.attachmentId === 'attachment-adapter-evidence')
+  ), true);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].content.attachmentObservationProfileSha256, profileSha256);
+  assert.deepEqual(events[0].content.attachmentObservations, [observation]);
+
+  const drift = structuredClone(fullRequest);
+  drift.recipe.attachmentObservationRequirements[0].name = 'drifted.png';
+  assert.throws(
+    () => adapter.sendFullRequest(drift, {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }),
+    /conflicts with the frozen catalog/
+  );
+
+  const mismatchedCapability = fakeCapability(() => { throw new Error('ordinary start must not run'); });
+  mismatchedCapability.compact = (compactRequest, emit) => emit({
+    type: 'llm:compactDone',
+    payload: {
+      requestId: compactRequest.id,
+      result: {
+        contents: [
+          { role: 'user', parts: [{ text: 'summary' }] },
+          kernel.renderAttachmentObservationStateContent(
+            fullRequest.recipe.attachmentObservationRequirements,
+            [observation]
+          )
+        ],
+        attachmentObservationProfileSha256: 'c'.repeat(64),
+        attachmentObservations: [observation]
+      }
+    }
+  });
+  const mismatchedAdapter = new kernel.LlmCapabilityFullRequestAdapter(
+    'compression-provider',
+    mismatchedCapability
+  );
+  await assert.rejects(
+    mismatchedAdapter.sendFullRequest(fullRequest, {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }),
+    /another analysis profile/
+  );
+
+  const missingStateCapability = fakeCapability(() => { throw new Error('ordinary start must not run'); });
+  missingStateCapability.compact = (compactRequest, emit) => emit({
+    type: 'llm:compactDone',
+    payload: {
+      requestId: compactRequest.id,
+      result: {
+        contents: [{ role: 'user', parts: [{ text: 'summary without canonical state' }] }],
+        attachmentObservationProfileSha256: profileSha256,
+        attachmentObservations: [observation]
+      }
+    }
+  });
+  const missingStateAdapter = new kernel.LlmCapabilityFullRequestAdapter(
+    'compression-provider',
+    missingStateCapability
+  );
+  await assert.rejects(
+    missingStateAdapter.sendFullRequest(fullRequest, {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }),
+    /exactly one canonical Attachment observation state/
+  );
+});
+
 test('普通请求的当前原文与 Turn 提醒按冻结 addenda 发送且计入同一投影预算', async () => {
   const fullRequest = request();
   fullRequest.requestAddenda = {

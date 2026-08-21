@@ -73,6 +73,25 @@ export interface LlmDryRunResult {
   apiKeyAvailable?: boolean;
 }
 
+export const ATTACHMENT_OBSERVATION_PROMPT_REVISION = '2026-08-21';
+
+export interface LlmAttachmentObservation {
+  attachmentRef: string;
+  summary: string;
+  salientFacts: string[];
+  uncertainties: string[];
+}
+
+export interface LlmAttachmentObservationRequirement {
+  attachmentRef: string;
+  /** Runtime-only canonical identity used to match one media part; never rendered to the Provider. */
+  attachmentId: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  cachedObservation?: LlmAttachmentObservation;
+}
+
 export interface LlmCompactRequest {
   id: string;
   blockId: string;
@@ -89,6 +108,8 @@ export interface LlmCompactRequest {
   /** 分段总结：作为“回合1前情”的历史总结内容（逐字保留，不重新总结）。 */
   priorSummaryContents?: MessageContent[];
   sourceHash?: string;
+  attachmentObservationProfileSha256?: string;
+  attachmentObservationRequirements?: LlmAttachmentObservationRequirement[];
 }
 
 export interface LlmCompactDryRunCall extends LlmDryRunResult {
@@ -114,4 +135,6 @@ export interface LlmCompactResult {
   settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
   rawResponse?: unknown;
   methodConfig?: LlmCompressionConfigRecord;
+  attachmentObservationProfileSha256?: string;
+  attachmentObservations?: LlmAttachmentObservation[];
 }

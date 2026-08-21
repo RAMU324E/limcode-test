@@ -445,8 +445,9 @@ test('water-fill使用priority且必要骨架软超时不丢配对身份', () =>
   assert.deepEqual(skeletons.items.map((item) => item.resultId), source.map((item) => item.resultId));
 });
 
-test('摘要投影移除历史媒体字节并把长工具参数改为digest描述', () => {
-  const base64 = Buffer.from('SECRET-MEDIA-CONTENT'.repeat(2_000)).toString('base64');
+test('摘要投影保留首份托管媒体正文并把长工具参数改为digest描述', () => {
+  const raw = Buffer.from('SECRET-MEDIA-CONTENT'.repeat(2_000));
+  const base64 = raw.toString('base64');
   const projected = kernel.projectSummaryModelWindow([
     { role: 'model', parts: [{ id: 'call-write', functionCall: { name: 'write', args: { path: '/tmp/a', content: 'x'.repeat(80_000) } } }] },
     { role: 'user', parts: [{
@@ -454,17 +455,31 @@ test('摘要投影移除历史媒体字节并把长工具参数改为digest描�
       functionResponse: {
         name: 'write',
         response: { ok: true },
-        parts: [{ inlineData: { mimeType: 'image/png', name: 'evidence.png', data: base64 } }]
+        parts: [{ inlineData: {
+          mimeType: 'image/png',
+          name: 'evidence.png',
+          data: base64,
+          attachmentId: 'attachment-evidence',
+          sha256: 'a'.repeat(64),
+          sizeBytes: raw.byteLength,
+          storage: 'managed'
+        } }]
       }
     }] }
-  ]);
+  ], {
+    entries: [{
+      kind: 'attachment', ref: 'F1', target: 'attachment-evidence',
+      name: 'evidence.png', mimeType: 'image/png', sizeBytes: raw.byteLength
+    }]
+  });
   const encoded = JSON.stringify(projected.contents);
-  assert.equal(encoded.includes(base64), false);
-  assert.equal(projected.mediaTokens, 0);
+  assert.equal(encoded.includes(base64), true);
+  assert.ok(projected.mediaTokens > 0);
+  assert.equal(projected.uniqueManagedMediaBodyCount, 1);
   assert.equal(projected.contents.some((content) => content.parts.some((part) => 'functionCall' in part)), false);
-  assert.equal(projected.contents.some((content) => content.parts.some((part) => 'inlineData' in part)), false);
+  assert.equal(projected.contents.some((content) => content.parts.some((part) => 'inlineData' in part)), true);
   assert.match(encoded, /sha256/);
-  assert.match(encoded, /historical_media/);
+  assert.doesNotMatch(encoded, /historical_media/);
 });
 
 test('native compact使用完整窗口且拒绝未固化sourcePath媒体', () => {

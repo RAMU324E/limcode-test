@@ -1,6 +1,13 @@
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
 import { ContentAddressedStore } from './contentAddressedStore';
+import {
+  ATTACHMENT_OBSERVATION_CONTENT_TYPE,
+  attachmentObservationDocumentContent,
+  attachmentObservationLinkId,
+  compressionBlockObservationLinkId,
+  type AttachmentObservationCommit
+} from './attachmentObservations';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   ContextSequenceControlPlane,
@@ -15,6 +22,7 @@ import {
 } from './contextTokenEstimator';
 import {
   DOMAIN_REPOSITORIES,
+  savepoint,
   type DomainRow,
   type RepositoryTransactionStep
 } from './repositories';
@@ -81,6 +89,7 @@ export interface CreateCompressionCommand {
   };
   /** Provider-aligned estimate for the replacement Context only (summary/native output plus local tail). */
   projectedEstimatedTokens?: number;
+  attachmentObservations?: AttachmentObservationCommit[];
   idempotencyKey: string;
 }
 
@@ -107,6 +116,7 @@ interface CompressionReplayExpectation {
   projectionPurpose: string;
   sourceCount: number;
   expectedSourceSegmentIds?: readonly string[];
+  expectedObservations?: readonly { linkId: string; contentObjectId?: string }[];
 }
 
 export interface CompressionCommitResult {
@@ -172,6 +182,19 @@ export class ContextCompressionControlPlane {
     const requestedSourceCount = requirePositiveCount(command.compressSegmentCount);
     const titleIdentity = this.contentStore.identity(title, CONTENT_TYPE_TITLE);
     const summaryIdentity = this.contentStore.identity(summary.content, summary.contentType);
+    const observationPlans = normalizeAttachmentObservationCommits(command.attachmentObservations ?? []).map((observation) => {
+      const content = attachmentObservationDocumentContent(observation.document);
+      return {
+        observation,
+        content,
+        identity: this.contentStore.identity(content, ATTACHMENT_OBSERVATION_CONTENT_TYPE),
+        linkId: attachmentObservationLinkId(observation.attachmentId, observation.analysisProfileSha256)
+      };
+    });
+    const expectedObservations = observationPlans.map((plan) => ({
+      linkId: plan.linkId,
+      contentObjectId: plan.identity.id
+    }));
     const blockId = compressionBlockIdFor(conversationId, headRootId, idempotencyKey);
     const summarySegmentId = compressionSegmentIdFor(blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
@@ -190,7 +213,8 @@ export class ContextCompressionControlPlane {
         summaryObjectId: summaryIdentity.id,
         projectionRootId: headRootId,
         projectionPurpose: 'compression-source',
-        sourceCount: requestedSourceCount
+        sourceCount: requestedSourceCount,
+        expectedObservations
       });
     }
     const [materialized, semanticMaterialized] = await Promise.all([
@@ -206,6 +230,9 @@ export class ContextCompressionControlPlane {
     const head = await this.requireHead(conversationId, headRootId);
     const titleContent = await this.contentStore.prepare(this.database, title, CONTENT_TYPE_TITLE);
     const summaryContent = await this.contentStore.prepare(this.database, summary.content, summary.contentType);
+    const observationContents = await Promise.all(observationPlans.map((plan) =>
+      this.contentStore.prepare(this.database, plan.content, ATTACHMENT_OBSERVATION_CONTENT_TYPE)
+    ));
     const sourceSegments = materialized.records.slice(0, compressCount);
     const tail = materialized.records.slice(compressCount);
     const now = this.timestamp();
@@ -215,7 +242,10 @@ export class ContextCompressionControlPlane {
       : requireEstimatedTokens(command.projectedEstimatedTokens, 'projectedEstimatedTokens');
     const steps: RepositoryTransactionStep[] = [
       headAssertion(head, conversationId, headRootId),
-      ...preparedContentObjectSteps([titleContent, summaryContent], 'compression_content'),
+      ...preparedContentObjectSteps(
+        [titleContent, summaryContent, ...observationContents],
+        'compression_content'
+      ),
       DOMAIN_REPOSITORIES.domain('CompressionBlock').insert({
         id: blockId,
         conversation_id: conversationId,
@@ -226,6 +256,35 @@ export class ContextCompressionControlPlane {
         created_at: now,
         updated_at: now
       }),
+      ...observationPlans.flatMap((plan, index): RepositoryTransactionStep[] => [
+        savepoint(`attachment_observation_${index}`, [
+          DOMAIN_REPOSITORIES.domain('AttachmentObservationLink').insert({
+            id: plan.linkId,
+            attachment_id: plan.observation.attachmentId,
+            analysis_profile_sha256: plan.observation.analysisProfileSha256,
+            content_object_id: observationContents[index].metadata.id,
+            created_at: now
+          })
+        ], {
+          kind: 'rollback-and-continue-on-unique',
+          constraints: [
+            { domain: 'AttachmentObservationLink', columns: ['id'] },
+            { domain: 'AttachmentObservationLink', columns: ['attachment_id', 'analysis_profile_sha256'] }
+          ]
+        }),
+        DOMAIN_REPOSITORIES.domain('AttachmentObservationLink').assert(plan.linkId, {
+          attachment_id: plan.observation.attachmentId,
+          analysis_profile_sha256: plan.observation.analysisProfileSha256,
+          content_object_id: observationContents[index].metadata.id
+        }),
+        DOMAIN_REPOSITORIES.domain('CompressionBlockObservationLink').insert({
+          id: compressionBlockObservationLinkId(blockId, plan.linkId),
+          compression_block_id: blockId,
+          observation_id: plan.linkId,
+          position: BigInt(index),
+          created_at: now
+        })
+      ]),
       ...sourceSegments.map((segment, position) => compressionSourceInsert(
         blockId,
         requireId(segment.segment.id, 'ContextSegment.id'),
@@ -304,7 +363,8 @@ export class ContextCompressionControlPlane {
         summaryObjectId: summaryIdentity.id,
         projectionRootId: headRootId,
         projectionPurpose: 'compression-source',
-        sourceCount: compressCount
+        sourceCount: compressCount,
+        expectedObservations
       });
     }
   }
@@ -328,11 +388,17 @@ export class ContextCompressionControlPlane {
     const previousBlock = await this.requireDomain('CompressionBlock', previousBlockId);
     if (previousBlock.conversation_id !== conversationId) throw new Error('CompressionBlock belongs to another Conversation.');
     const projection = await this.findProjection('compression_block', previousBlockId);
-    const sourceRows = await this.listAllSources(previousBlockId);
+    const [sourceRows, observationRows] = await Promise.all([
+      this.listAllSources(previousBlockId),
+      this.listAllBlockObservations(previousBlockId)
+    ]);
     const authoritySnapshotId = requireId(previousBlock.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id');
     const expectedSourceSegmentIds = sourceRows.map((source) =>
       requireId(source.segment_id, 'CompressionBlockSource.segment_id')
     );
+    const expectedObservations = observationRows.map((row) => ({
+      linkId: requireId(row.observation_id, 'CompressionBlockObservationLink.observation_id')
+    }));
     const existing = await this.getOptional('CompressionBlock', blockId);
     if (existing) {
       return this.replay(existing, {
@@ -347,7 +413,8 @@ export class ContextCompressionControlPlane {
         projectionRootId: requireId(projection.root_id, 'ModelContextProjection.root_id'),
         projectionPurpose,
         sourceCount: sourceRows.length,
-        expectedSourceSegmentIds
+        expectedSourceSegmentIds,
+        expectedObservations
       });
     }
     if (previousBlock.status !== 'enabled') throw new Error('Only an enabled CompressionBlock can be replaced.');
@@ -384,6 +451,24 @@ export class ContextCompressionControlPlane {
         summary_object_id: summaryContent.metadata.id,
         created_at: now,
         updated_at: now
+      }),
+      ...observationRows.flatMap((row, position): RepositoryTransactionStep[] => {
+        const sourceLinkId = requireId(row.id, 'CompressionBlockObservationLink.id');
+        const observationId = requireId(row.observation_id, 'CompressionBlockObservationLink.observation_id');
+        return [
+          DOMAIN_REPOSITORIES.domain('CompressionBlockObservationLink').assert(sourceLinkId, {
+            compression_block_id: previousBlockId,
+            observation_id: observationId,
+            position: BigInt(position)
+          }),
+          DOMAIN_REPOSITORIES.domain('CompressionBlockObservationLink').insert({
+            id: compressionBlockObservationLinkId(blockId, observationId),
+            compression_block_id: blockId,
+            observation_id: observationId,
+            position: BigInt(position),
+            created_at: now
+          })
+        ];
       }),
       ...sourceRows.map((source, position) => compressionSourceInsert(
         blockId,
@@ -466,7 +551,8 @@ export class ContextCompressionControlPlane {
         projectionRootId: requireId(projection.root_id, 'ModelContextProjection.root_id'),
         projectionPurpose,
         sourceCount: sourceRows.length,
-        expectedSourceSegmentIds
+        expectedSourceSegmentIds,
+        expectedObservations
       });
     }
   }
@@ -548,6 +634,25 @@ export class ContextCompressionControlPlane {
     });
   }
 
+  private async listAllBlockObservations(blockId: string): Promise<DomainRow[]> {
+    const barrier = await this.database.snapshotAll(DOMAIN_REPOSITORIES.domain('CompressionBlockObservationLink').list({
+      where: { compression_block_id: blockId },
+      orderBy: { column: 'id', direction: 'asc' },
+      limit: 1000
+    }));
+    const rows = [...barrier.snapshot].sort((left, right) => {
+      const leftPosition = requireBigInt(left.position, 'CompressionBlockObservationLink.position');
+      const rightPosition = requireBigInt(right.position, 'CompressionBlockObservationLink.position');
+      return leftPosition < rightPosition ? -1 : leftPosition > rightPosition ? 1 : 0;
+    });
+    rows.forEach((row, position) => {
+      if (requireBigInt(row.position, 'CompressionBlockObservationLink.position') !== BigInt(position)) {
+        throw new Error(`CompressionBlock ${blockId} observation positions are not contiguous.`);
+      }
+    });
+    return rows;
+  }
+
   private async requireDomain(domain: string, id: string): Promise<DomainRow> {
     const row = await this.getOptional(domain, id);
     if (!row) throw new Error(`${domain} ${id} does not exist.`);
@@ -596,6 +701,29 @@ export class ContextCompressionControlPlane {
         || actual.some((segmentId, position) => segmentId !== expected.expectedSourceSegmentIds?.[position])
       ) throw compressionIdempotencyConflict(expected.blockId);
     }
+    const observationRows = await this.listAllBlockObservations(expected.blockId);
+    const expectedObservations = expected.expectedObservations ?? [];
+    if (observationRows.length !== expectedObservations.length) {
+      throw compressionIdempotencyConflict(expected.blockId);
+    }
+    const observationIds = observationRows.map((row) =>
+      requireId(row.observation_id, 'CompressionBlockObservationLink.observation_id')
+    );
+    if (observationIds.some((id, index) => id !== expectedObservations[index]?.linkId)) {
+      throw compressionIdempotencyConflict(expected.blockId);
+    }
+    const contentExpectations = expectedObservations.filter((entry) => entry.contentObjectId !== undefined);
+    if (contentExpectations.length > 0) {
+      const snapshot = await this.database.snapshot(contentExpectations.map((entry) =>
+        DOMAIN_REPOSITORIES.domain('AttachmentObservationLink').get(entry.linkId)
+      ));
+      contentExpectations.forEach((entry, index) => {
+        const link = snapshot.snapshot[index];
+        if (!link || Array.isArray(link) || link.content_object_id !== entry.contentObjectId) {
+          throw compressionIdempotencyConflict(expected.blockId);
+        }
+      });
+    }
     return {
       compressionBlockId: expected.blockId,
       summarySegmentId: expected.summarySegmentId,
@@ -610,6 +738,38 @@ export class ContextCompressionControlPlane {
   private timestamp(): string {
     return requireText(this.now(), 'clock result');
   }
+}
+
+function normalizeAttachmentObservationCommits(
+  values: readonly AttachmentObservationCommit[]
+): AttachmentObservationCommit[] {
+  const seenAttachments = new Set<string>();
+  return values.map((value, index) => {
+    if (!value || typeof value !== 'object') {
+      throw new TypeError(`attachmentObservations[${index}] must be an object.`);
+    }
+    const attachmentId = requireId(value.attachmentId, `attachmentObservations[${index}].attachmentId`);
+    const analysisProfileSha256 = requireSha256(
+      value.analysisProfileSha256,
+      `attachmentObservations[${index}].analysisProfileSha256`
+    );
+    if (seenAttachments.has(attachmentId)) {
+      throw new Error(`Compression contains duplicate observation for Attachment ${attachmentId}.`);
+    }
+    seenAttachments.add(attachmentId);
+    if (value.document.analysisProfileSha256 !== analysisProfileSha256) {
+      throw new Error(`Attachment ${attachmentId} observation document uses another analysis profile.`);
+    }
+    // Canonical encoding performs the complete document shape/bounds validation.
+    attachmentObservationDocumentContent(value.document);
+    return { attachmentId, analysisProfileSha256, document: value.document };
+  });
+}
+
+function requireSha256(value: unknown, label: string): string {
+  const text = requireText(value, label).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(text)) throw new TypeError(`${label} must be a SHA-256 hex digest.`);
+  return text;
 }
 
 function replacementProjectionPurpose(status: 'disabled' | 'soft_deleted'): string {

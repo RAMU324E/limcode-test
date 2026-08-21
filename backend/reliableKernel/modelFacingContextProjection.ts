@@ -875,12 +875,18 @@ export function firstUnresolvedMedia(contents: readonly MessageContent[]): strin
   return undefined;
 }
 
-/** Summary input uses readable descriptors, never historical base64 or signed function-call items. */
-export function projectSummaryModelWindow(contents: readonly MessageContent[]): ModelWindowProjection {
-  const ordinary = projectOrdinaryModelWindow(contents);
+/** Summary input keeps the first unique managed media body so the compression capability can
+ * produce a reusable semantic observation before replacing bytes with text. Historical tool calls
+ * remain readable descriptors and nested tool-response media is lifted beside that descriptor. */
+export function projectSummaryModelWindow(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ModelHandleCatalog | unknown = { entries: [] },
+  mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
+): ModelWindowProjection {
+  const ordinary = projectOrdinaryModelWindow(contents, modelHandleCatalogInput, mediaState);
   const projected = ordinary.contents.map((content): MessageContent => ({
     role: content.role,
-    parts: content.parts.map(summaryPart)
+    parts: content.parts.flatMap(summaryParts)
   }));
   return {
     contents: projected,
@@ -893,60 +899,44 @@ export function projectSummaryModelWindow(contents: readonly MessageContent[]): 
   };
 }
 
-function summaryPart(part: ContentPart): ContentPart {
+function summaryParts(part: ContentPart): ContentPart[] {
   if ('functionCall' in part) {
-    return { text: stableJson({
+    return [{ text: stableJson({
       kind: 'historical_tool_call',
       ...(part.id ? { callId: part.id } : {}),
       toolName: part.functionCall.name,
       arguments: boundedValueDescriptor(part.functionCall.args, TOOL_RESULT_MAX_TOKENS)
-    }) };
+    }) }];
   }
   if ('functionResponse' in part) {
-    return { text: stableJson({
-      kind: 'historical_tool_result',
-      ...(part.id ? { callId: part.id } : {}),
-      toolName: part.functionResponse.name,
-      result: boundedValueDescriptor(part.functionResponse.response, TOOL_RESULT_MAX_TOKENS),
-      ...(part.functionResponse.parts?.length
-        ? { media: part.functionResponse.parts.map(mediaDescriptor) }
-        : {})
-    }) };
+    return [
+      { text: stableJson({
+        kind: 'historical_tool_result',
+        ...(part.id ? { callId: part.id } : {}),
+        toolName: part.functionResponse.name,
+        result: boundedValueDescriptor(part.functionResponse.response, TOOL_RESULT_MAX_TOKENS)
+      }) },
+      ...(part.functionResponse.parts ?? []).map((media) => cloneJsonValue(media) as InlineDataPart)
+    ];
   }
-  if ('inlineData' in part) return { text: stableJson(mediaDescriptor(part)) };
+  if ('inlineData' in part) return [cloneJsonValue(part) as InlineDataPart];
   if ('fileData' in part) {
-    return { text: stableJson({
+    return [{ text: stableJson({
       kind: 'historical_media',
       mimeType: part.fileData.mimeType ?? 'application/octet-stream',
       uri: part.fileData.uri
-    }) };
+    }) }];
   }
   if ('providerContext' in part) {
     const raw = asRecord(part.providerContext.rawItem);
-    return { text: stableJson({
+    return [{ text: stableJson({
       kind: 'historical_provider_item',
       provider: part.providerContext.provider,
       format: part.providerContext.format,
       itemType: part.providerContext.itemType ?? raw?.type ?? 'unknown'
-    }) };
+    }) }];
   }
-  return { ...part };
-}
-
-function mediaDescriptor(part: InlineDataPart): Record<string, unknown> {
-  const value = part.inlineData;
-  const rawBytes = typeof value.sizeBytes === 'number' && Number.isSafeInteger(value.sizeBytes) && value.sizeBytes >= 0
-    ? value.sizeBytes
-    : typeof value.data === 'string'
-      ? decodedBase64Size(value.data)
-      : undefined;
-  return {
-    kind: 'historical_media',
-    ...(value.attachmentId ? { attachmentId: value.attachmentId } : {}),
-    ...(value.name ? { name: value.name } : {}),
-    mimeType: value.mimeType,
-    ...(rawBytes === undefined ? {} : { sizeBytes: rawBytes })
-  };
+  return [cloneJsonValue(part) as ContentPart];
 }
 
 function inlineMediaResolved(part: InlineDataPart): boolean {
