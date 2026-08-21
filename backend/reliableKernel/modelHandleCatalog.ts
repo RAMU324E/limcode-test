@@ -49,11 +49,15 @@ const MAX_NESTED_JSON_CHARS = 16 * 1024 * 1024;
  * Builds one small model-facing reference table from the exact values visible to a ModelRequest.
  * Canonical ids remain internal; only the short refs are rendered to the provider.
  */
-export function buildModelHandleCatalog(values: readonly unknown[]): ModelHandleCatalog {
+export function buildModelHandleCatalog(
+  values: readonly unknown[],
+  seededEntries: readonly ModelHandleEntry[] = []
+): ModelHandleCatalog {
   const candidates: ModelHandleCandidate[] = [];
   const seenObjects = new Set<object>();
   for (const value of values) collectCandidates(value, candidates, seenObjects);
 
+  const normalizedSeeds = normalizeModelHandleCatalog({ entries: seededEntries }).entries;
   const byTarget = new Map<string, ModelHandleEntry>();
   const counters: Record<ModelHandleKind, number> = {
     attachment: 0,
@@ -63,6 +67,16 @@ export function buildModelHandleCatalog(values: readonly unknown[]): ModelHandle
     workEnvironment: 0
   };
   const entries: ModelHandleEntry[] = [];
+  for (const seed of normalizedSeeds) {
+    const ordinal = Number(seed.ref.slice(1));
+    if (!Number.isSafeInteger(ordinal) || ordinal <= 0) {
+      throw new RangeError(`Seeded model handle ${seed.ref} is outside the safe ordinal range.`);
+    }
+    counters[seed.kind] = Math.max(counters[seed.kind], ordinal);
+    const cloned = { ...seed };
+    byTarget.set(targetKey(seed.kind, seed.target), cloned);
+    entries.push(cloned);
+  }
   for (const candidate of candidates) {
     const key = targetKey(candidate.kind, candidate.target);
     const existing = byTarget.get(key);

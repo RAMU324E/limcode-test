@@ -11,6 +11,10 @@ import {
   type AttachmentCatalogProjectionSegment
 } from './attachmentCatalogProjection';
 import {
+  ConversationAttachmentHandleRegistry,
+  type ConversationAttachmentHandleProjection
+} from './conversationAttachmentHandles';
+import {
   ContentAddressedStore,
   type ContentObjectIdentity,
   type ContentObjectMetadata
@@ -317,6 +321,7 @@ const CONTENT_TYPE_CHECKPOINT = 'application/vnd.limcode.model-stream-checkpoint
 export class ModelProviderControlPlane {
   private readonly context: ContextSequenceControlPlane;
   private readonly attachmentCatalog: AttachmentCatalogProjection;
+  private readonly attachmentHandles: ConversationAttachmentHandleRegistry;
   private readonly tokenEstimator: ReliableContextTokenEstimator;
   private readonly now: () => string;
   private readonly epochNow: () => number;
@@ -348,6 +353,7 @@ export class ModelProviderControlPlane {
     );
     this.context = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.attachmentCatalog = new AttachmentCatalogProjection(database);
+    this.attachmentHandles = new ConversationAttachmentHandleRegistry(database, { now: this.now });
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
@@ -357,6 +363,13 @@ export class ModelProviderControlPlane {
     additionalMessageRevisionIds: readonly string[] = []
   ): Promise<AttachmentCatalogEntry[]> {
     return this.attachmentCatalog.project(conversationId, segments, additionalMessageRevisionIds);
+  }
+
+  public ensureAttachmentHandles(
+    conversationId: string,
+    catalog: readonly AttachmentCatalogEntry[]
+  ): Promise<ConversationAttachmentHandleProjection> {
+    return this.attachmentHandles.ensure(conversationId, catalog);
   }
 
   public async createModelRequest(command: CreateModelRequestCommand): Promise<ModelRequestCreationResult> {

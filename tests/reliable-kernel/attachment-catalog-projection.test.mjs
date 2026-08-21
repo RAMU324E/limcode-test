@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import * as kernel from '../../dist/extension/backend/reliableKernel/index.js';
+import { prepareConversationForkSnapshot } from '../../dist/extension/backend/reliableKernel/conversationForkSnapshot.js';
 
 const NOW = '2026-08-20T00:00:00.000Z';
 
@@ -173,7 +174,10 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
         segments: [{ segmentId: 'segment-compression-main', content: Buffer.from('{"kind":"fixture"}') }]
       })
     };
-    loop.modelProvider = { projectAttachmentCatalog: async () => relationCatalog };
+    loop.modelProvider = {
+      projectAttachmentCatalog: async () => relationCatalog,
+      ensureAttachmentHandles: async () => ({ entries: handles.entries })
+    };
     loop.readCurrentTurnInputReference = async () => ({});
     loop.readRuntimeStatusCard = async () => undefined;
     const frozenRecipe = await loop.freezeOrdinaryRequestRecipe({
@@ -372,6 +376,149 @@ test('shared message segment resolves only the selected Conversation alias beyon
         sizeBytes: 300
       }]
     );
+  });
+});
+
+test('Conversation attachment handles stay stable when visible order changes and new media appears first', async () => {
+  await withRuntime('conversation-attachment-handles', async (database) => {
+    const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
+    const attachments = [
+      { attachmentId: 'attachment-old-one', name: 'old-one.png', mimeType: 'image/png', sizeBytes: 11 },
+      { attachmentId: 'attachment-old-two', name: 'old-two.png', mimeType: 'image/png', sizeBytes: 22 },
+      { attachmentId: 'attachment-new', name: 'new.png', mimeType: 'image/png', sizeBytes: 33 }
+    ];
+    await database.transaction([
+      repository('Conversation').insert({
+        id: 'conversation-handles', title: 'handles', status: 'active', created_at: NOW, updated_at: NOW
+      }),
+      ...attachments.map((entry, index) => repository('Attachment').insert({
+        id: entry.attachmentId,
+        sha256: String(index + 1).repeat(64),
+        byte_length: BigInt(entry.sizeBytes),
+        mime_type: entry.mimeType,
+        name: entry.name,
+        storage_mode: 'managed',
+        content_object_id: null,
+        created_at: NOW
+      }))
+    ]);
+
+    const registry = new kernel.ConversationAttachmentHandleRegistry(database, { now: () => NOW });
+    const first = await registry.ensure('conversation-handles', attachments.slice(0, 2));
+    assert.deepEqual(first.entries.map(({ target, ref }) => [target, ref]), [
+      ['attachment-old-one', 'F1'],
+      ['attachment-old-two', 'F2']
+    ]);
+
+    const reordered = await registry.ensure('conversation-handles', [attachments[2], attachments[1], attachments[0]]);
+    assert.deepEqual(reordered.entries.map(({ target, ref }) => [target, ref]), [
+      ['attachment-new', 'F3'],
+      ['attachment-old-two', 'F2'],
+      ['attachment-old-one', 'F1']
+    ]);
+    const rebuilt = kernel.buildModelHandleCatalog([
+      { inlineData: { attachmentId: 'attachment-new', ...attachments[2] } },
+      attachments
+    ], reordered.entries);
+    assert.equal(kernel.modelHandleRef(rebuilt, 'attachment', 'attachment-old-one'), 'F1');
+    assert.equal(kernel.modelHandleRef(rebuilt, 'attachment', 'attachment-old-two'), 'F2');
+    assert.equal(kernel.modelHandleRef(rebuilt, 'attachment', 'attachment-new'), 'F3');
+
+    const replayed = await new kernel.ConversationAttachmentHandleRegistry(database).ensure(
+      'conversation-handles',
+      attachments
+    );
+    assert.deepEqual(replayed.entries.map(({ target, ref }) => [target, ref]), [
+      ['attachment-old-one', 'F1'],
+      ['attachment-old-two', 'F2'],
+      ['attachment-new', 'F3']
+    ]);
+    const links = await database.snapshotAll(repository('ConversationAttachmentHandleLink').list({
+      where: { conversation_id: 'conversation-handles' }, orderBy: { column: 'id', direction: 'asc' }, limit: 100
+    }));
+    assert.equal(links.snapshot.length, 3);
+  });
+});
+
+test('fork snapshot preserves source attachment handle sequence for the copied prefix', async () => {
+  await withRuntime('conversation-attachment-handle-fork', async (database, fixtureContent) => {
+    const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
+    await database.transaction([
+      repository('Conversation').insert({
+        id: 'conversation-handle-source', title: 'source', status: 'active', created_at: NOW, updated_at: NOW
+      }),
+      repository('Message').insert({
+        id: 'message-handle-source', created_at: NOW, updated_at: NOW, deleted_at: null
+      }),
+      repository('MessageRevision').insert({
+        id: 'revision-handle-source', message_id: 'message-handle-source', revision_seq: 0n,
+        role: 'user', content_object_id: fixtureContent.id, created_at: NOW
+      }),
+      repository('MessageCurrentRevisionLink').insert({
+        id: 'current-handle-source', message_id: 'message-handle-source',
+        revision_id: 'revision-handle-source', updated_at: NOW
+      }),
+      repository('MessagePartOfConversation').insert({
+        id: 'membership-handle-source', conversation_id: 'conversation-handle-source',
+        message_id: 'message-handle-source', message_seq: 1n, created_at: NOW
+      }),
+      repository('ContextSegment').insert({
+        id: 'segment-handle-source', content_object_id: fixtureContent.id,
+        segment_kind: 'message', created_at: NOW
+      }),
+      repository('ContextSegmentSource').insert({
+        id: 'segment-source-handle-source', segment_id: 'segment-handle-source',
+        source_kind: 'message_revision', source_id: 'revision-handle-source',
+        source_revision: 0n, created_at: NOW
+      }),
+      repository('Attachment').insert({
+        id: 'attachment-handle-source', sha256: '9'.repeat(64), byte_length: 9n,
+        mime_type: 'image/png', name: 'fork.png', storage_mode: 'managed',
+        content_object_id: null, created_at: NOW
+      }),
+      repository('AttachmentLink').insert({
+        id: 'attachment-link-handle-source', message_revision_id: 'revision-handle-source',
+        attachment_id: 'attachment-handle-source', position: 0n, created_at: NOW
+      }),
+      repository('ConversationAttachmentHandleLink').insert({
+        id: kernel.conversationAttachmentHandleLinkId(
+          'conversation-handle-source',
+          'attachment-handle-source'
+        ),
+        conversation_id: 'conversation-handle-source', attachment_id: 'attachment-handle-source',
+        handle_seq: 7n, created_at: NOW
+      })
+    ]);
+
+    const plan = await prepareConversationForkSnapshot(database, {
+      sourceConversationId: 'conversation-handle-source',
+      targetConversationId: 'conversation-handle-target',
+      boundaryMessageSeq: 1n,
+      targetAgentId: 'agent-target',
+      now: NOW
+    });
+    const handleInsert = plan.inserts.find((step) =>
+      step.kind === 'insert' && step.domain === 'ConversationAttachmentHandleLink'
+    );
+    assert.ok(handleInsert);
+    assert.equal(handleInsert.row.conversation_id, 'conversation-handle-target');
+    assert.equal(handleInsert.row.attachment_id, 'attachment-handle-source');
+    assert.equal(handleInsert.row.handle_seq, 7n);
+
+    await database.transaction([
+      repository('Conversation').insert({
+        id: 'conversation-handle-target', title: 'target', status: 'active', created_at: NOW, updated_at: NOW
+      }),
+      ...plan.assertions,
+      ...plan.inserts
+    ]);
+    const targetLinks = await database.snapshotAll(repository('ConversationAttachmentHandleLink').list({
+      where: { conversation_id: 'conversation-handle-target' },
+      orderBy: { column: 'id', direction: 'asc' },
+      limit: 10
+    }));
+    assert.equal(targetLinks.snapshot.length, 1);
+    assert.equal(targetLinks.snapshot[0].handle_seq, 7n);
   });
 });
 

@@ -296,6 +296,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     );
     let sourceRootId: string | undefined;
     let sourceContextEndSegmentId: string | undefined;
+    let sourceContextSegmentIds: string[] | undefined;
     for (const root of roots) {
       const rootId = requireText(root.id, 'ContextSequenceRoot.id');
       const structure = await this.product.application.context.materializeStructure(rootId);
@@ -312,12 +313,23 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         sourceRootId = rootId;
         sourceContextEndSegmentId = requiredToolPairSegmentIds.at(-1)
           ?? requireText(structure.records[messageIndex].segment.id, 'ContextSegment.id');
+        sourceContextSegmentIds = structure.records.slice(0, previousIndex + 1).map((record) =>
+          requireText(record.segment.id, 'ContextSegment.id')
+        );
         break;
       }
     }
-    if (!sourceRootId || !sourceContextEndSegmentId) {
+    if (!sourceRootId || !sourceContextEndSegmentId || !sourceContextSegmentIds) {
       throw new Error('无法定位 Fork 源 MessageRevision 对应的 Context root。');
     }
+    const sourceAttachmentCatalog = await this.product.application.modelProvider.projectAttachmentCatalog(
+      sourceConversationId,
+      sourceContextSegmentIds.map((segmentId) => ({ segmentId }))
+    );
+    await this.product.application.modelProvider.ensureAttachmentHandles(
+      sourceConversationId,
+      sourceAttachmentCatalog
+    );
 
     const turnLinks = (await this.product.application.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({

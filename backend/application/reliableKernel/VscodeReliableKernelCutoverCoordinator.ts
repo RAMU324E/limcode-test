@@ -13,17 +13,14 @@ import {
   readPhysicalCutoverRequest,
   recoverInterruptedPhysicalCutover
 } from '../../reliableKernel/physicalCutover';
-import { migratePreviousRuntimeEpochIfRequired } from '../../reliableKernel/runtimeEpochMigration';
 import { migrateCurrentRuntimeManifestIfRequired } from '../../reliableKernel/runtimeManifestMigration';
 
 export interface VscodeReliableKernelCutoverResult {
   binding: RootBinding;
   initialized: boolean;
   cutoverPerformed: boolean;
-  epochMigrated?: boolean;
   manifestMigrated?: boolean;
   archiveDirectoryName?: string;
-  migrationBackupDirectoryName?: string;
 }
 
 /**
@@ -51,19 +48,6 @@ export class VscodeReliableKernelCutoverCoordinator {
         initialized: true,
         cutoverPerformed: true,
         ...(result.archiveDirectoryName ? { archiveDirectoryName: result.archiveDirectoryName } : {})
-      };
-    }
-
-    const epochMigration = await migratePreviousRuntimeEpochIfRequired(this.authority);
-    if (epochMigration) {
-      return {
-        binding: epochMigration.binding,
-        initialized: epochMigration.migrated,
-        cutoverPerformed: false,
-        epochMigrated: epochMigration.migrated,
-        ...(epochMigration.backupDirectoryName
-          ? { migrationBackupDirectoryName: epochMigration.backupDirectoryName }
-          : {})
       };
     }
 

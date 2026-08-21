@@ -42,7 +42,7 @@
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
     "incompatibleRuntimeData": "archive-and-reset",
-    "exactPredecessorUpgrade": "offline-epoch-2-to-3-only-with-exact-schema-fingerprint-and-durable-backup"
+    "exactPredecessorUpgrade": "none-current-epoch-only"
   },
   "sequenceAllocation": {
     "columnType": "INTEGER",
@@ -768,6 +768,44 @@
       ]
     },
     {
+      "key": "ConversationAttachmentHandleLink",
+      "table": "conversation_attachment_handle_link",
+      "repository": "ConversationAttachmentHandleLinkRepository",
+      "codec": "ConversationAttachmentHandleLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,attachment_id UNIQUE",
+        "conversation_id,handle_seq UNIQUE"
+      ],
+      "notes": [
+        "Conversation 与 Attachment 的稳定模型短引用关系；handle_seq 只在 Conversation scope 内递增，fork 继承已有序号"
+      ]
+    },
+    {
+      "key": "AttachmentObservationLink",
+      "table": "attachment_observation_link",
+      "repository": "AttachmentObservationLinkRepository",
+      "codec": "AttachmentObservationLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "dataset-reset-only",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "attachment_id,analysis_profile_sha256 UNIQUE",
+        "content_object_id"
+      ],
+      "notes": [
+        "Attachment 与冻结分析 profile 下语义观察 ContentObject 的独立关系；不把观察文本嵌入 Attachment"
+      ]
+    },
+    {
       "key": "InteractionRequest",
       "table": "interaction_request",
       "repository": "InteractionRequestRepository",
@@ -1487,6 +1525,26 @@
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "compression_block_id,segment_id,position UNIQUE"
+      ]
+    },
+    {
+      "key": "CompressionBlockObservationLink",
+      "table": "compression_block_observation_link",
+      "repository": "CompressionBlockObservationLinkRepository",
+      "codec": "CompressionBlockObservationLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-compression-block",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "compression_block_id,position UNIQUE",
+        "compression_block_id,observation_id UNIQUE",
+        "observation_id"
+      ],
+      "notes": [
+        "记录 CompressionBlock 实际采用的附件语义观察及顺序；观察本体可由同一 Attachment 的后续压缩复用"
       ]
     },
     {

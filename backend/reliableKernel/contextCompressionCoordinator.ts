@@ -245,6 +245,10 @@ export class ReliableContextCompressionCoordinator {
         segmentId: segment.segmentId
       }))
     );
+    const sourceAttachmentHandles = await this.modelProvider.ensureAttachmentHandles(
+      frozen.conversationId,
+      sourceAttachmentCatalog
+    );
     const sourceHash = hashSource(sourceSegments);
     const idempotencyKey = [
       'context-compression', trigger, headRootId, policy.config.id, String(sourceSegmentCount), sourceHash
@@ -270,6 +274,9 @@ export class ReliableContextCompressionCoordinator {
         compressionConfigId: policy.config.id,
         compressionMethodKind: policy.methodKind,
         ...(sourceAttachmentCatalog.length > 0 ? { attachmentCatalog: sourceAttachmentCatalog } : {}),
+        ...(sourceAttachmentHandles.entries.length > 0
+          ? { modelHandleCatalog: sourceAttachmentHandles }
+          : {}),
         ...(effectiveSummaryMaxTokens === undefined ? {} : { effectiveSummaryMaxTokens })
       }, 'Reliable compression recipe'),
       idempotencyKey

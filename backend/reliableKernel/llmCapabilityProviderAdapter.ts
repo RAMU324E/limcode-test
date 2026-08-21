@@ -745,7 +745,11 @@ function compressionContext(
     0,
     typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length
   );
-  const modelHandleCatalog = buildModelHandleCatalog(sourceContext.map((item) => item.content));
+  const seededHandleCatalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+  const modelHandleCatalog = buildModelHandleCatalog(
+    sourceContext.map((item) => item.content),
+    seededHandleCatalog.entries
+  );
   const requestedCount = recipe.sourceSegmentCount;
   if (!Number.isSafeInteger(requestedCount) || (requestedCount as number) <= 0
     || (requestedCount as number) > request.context.length) {

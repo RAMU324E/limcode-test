@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { conversationAttachmentHandleLinkId } from './conversationAttachmentHandles';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -188,6 +189,27 @@ export async function prepareConversationForkSnapshot(
   const fileFacts = await readFileFacts(database, tools);
   const interactionFacts = await readInteractionFacts(database, tools);
 
+  const attachmentIds = new Set([...messageFacts, ...toolResultMessages].flatMap((fact) =>
+    fact.attachments.map((link) => id(link.attachment_id, 'AttachmentLink.attachment_id'))
+  ));
+  const sourceAttachmentHandles = (await database.snapshotAll(
+    DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink').list({
+      where: { conversation_id: input.sourceConversationId },
+      orderBy: { column: 'id', direction: 'asc' },
+      limit: 1000
+    })
+  )).snapshot.filter((link) => attachmentIds.has(
+    id(link.attachment_id, 'ConversationAttachmentHandleLink.attachment_id')
+  ));
+  const handledAttachmentIds = new Set(sourceAttachmentHandles.map((link) =>
+    id(link.attachment_id, 'ConversationAttachmentHandleLink.attachment_id')
+  ));
+  for (const attachmentId of attachmentIds) {
+    if (!handledAttachmentIds.has(attachmentId)) {
+      throw new Error(`Fork source Attachment ${attachmentId} has no stable Conversation handle.`);
+    }
+  }
+
   const target = input.targetConversationId;
   const messageIdMap = new Map<string, string>();
   const revisionIdMap = new Map<string, string>();
@@ -205,6 +227,22 @@ export async function prepareConversationForkSnapshot(
   const assertions: RepositoryTransactionStep[] = [];
   const inserts: RepositoryTransactionStep[] = [];
   const preservedTurnIds = new Set<string>();
+  for (const handle of sourceAttachmentHandles) {
+    const sourceHandleId = id(handle.id, 'ConversationAttachmentHandleLink.id');
+    const attachmentId = id(handle.attachment_id, 'ConversationAttachmentHandleLink.attachment_id');
+    assertions.push(DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink').assert(sourceHandleId, {
+      conversation_id: input.sourceConversationId,
+      attachment_id: attachmentId,
+      handle_seq: handle.handle_seq
+    }));
+    inserts.push(DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink').insert({
+      ...handle,
+      id: conversationAttachmentHandleLinkId(target, attachmentId),
+      conversation_id: target,
+      attachment_id: attachmentId,
+      created_at: input.now
+    }));
+  }
   for (const fact of messageFacts) addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap);
   for (const fact of toolResultMessages) addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap);
 

@@ -175,5 +175,17 @@ export const CORE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-message',
     indexes: ['message_revision_id,attachment_id,position UNIQUE'],
     columns: [id(), ref('message_revision_id', 'message_revision'), ref('attachment_id', 'attachment', false, 'RESTRICT'), integer('position'), text('created_at')]
+  }),
+  domain({
+    key: 'ConversationAttachmentHandleLink', table: 'conversation_attachment_handle_link', repository: 'ConversationAttachmentHandleLinkRepository', codec: 'ConversationAttachmentHandleLinkRowCodec',
+    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-conversation',
+    indexes: ['conversation_id,attachment_id UNIQUE', 'conversation_id,handle_seq UNIQUE'],
+    columns: [id(), ref('conversation_id', 'conversation'), ref('attachment_id', 'attachment', false, 'RESTRICT'), integer('handle_seq'), text('created_at')]
+  }),
+  domain({
+    key: 'AttachmentObservationLink', table: 'attachment_observation_link', repository: 'AttachmentObservationLinkRepository', codec: 'AttachmentObservationLinkRowCodec',
+    mutations: ['insert'], client: 'none', deletePolicy: 'dataset-reset-only',
+    indexes: ['attachment_id,analysis_profile_sha256 UNIQUE', 'content_object_id'],
+    columns: [id(), ref('attachment_id', 'attachment', false, 'RESTRICT'), text('analysis_profile_sha256'), ref('content_object_id', 'content_object', false, 'RESTRICT'), text('created_at')]
   })
 ];

@@ -70,6 +70,12 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     columns: [id(), ref('compression_block_id', 'compression_block'), ref('segment_id', 'context_segment', false, 'RESTRICT'), integer('position'), text('created_at')]
   }),
   domain({
+    key: 'CompressionBlockObservationLink', table: 'compression_block_observation_link', repository: 'CompressionBlockObservationLinkRepository', codec: 'CompressionBlockObservationLinkRowCodec',
+    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-compression-block',
+    indexes: ['compression_block_id,position UNIQUE', 'compression_block_id,observation_id UNIQUE', 'observation_id'],
+    columns: [id(), ref('compression_block_id', 'compression_block'), ref('observation_id', 'attachment_observation_link', false, 'RESTRICT'), integer('position'), text('created_at')]
+  }),
+  domain({
     key: 'ModelStreamCheckpoint', table: 'model_stream_checkpoint', repository: 'ModelStreamCheckpointRepository', codec: 'ModelStreamCheckpointRowCodec',
     mutations: ['insert', 'delete'], client: 'none', deletePolicy: 'cascade-with-model-request',
     indexes: ['model_request_id,attempt_seq,socket_generation,stream_seq UNIQUE'],

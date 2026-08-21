@@ -120,77 +120,6 @@ export class RootAuthority {
     return readHistoricalBindingFile(this.expectedPaths().rootPointerPath);
   }
 
-  /**
-   * Fences every previous-epoch writer before an offline in-place schema migration. The old
-   * pointer remains authoritative until {@link commitInPlaceEpochMigration} atomically publishes
-   * the staged current-epoch binding.
-   */
-  public async stageInPlaceEpochMigration(previous: HistoricalRootBinding): Promise<RootBinding> {
-    const expectedPaths = this.expectedPaths();
-    if (!samePaths(previous.paths, expectedPaths)) {
-      throw new StaleRootBindingError('Historical RootBinding paths do not match the selected data root.');
-    }
-    if (previous.runtimeKernelEpoch >= RUNTIME_KERNEL_EPOCH) {
-      throw new RootAuthorityError('runtime-epoch-migration-invalid', 'Only an earlier Runtime epoch may be staged for migration.');
-    }
-    const next = migratedBinding(previous);
-    const currentPointer = await readHistoricalBindingFile(expectedPaths.rootPointerPath);
-    if (!currentPointer || !sameHistoricalBindingIdentity(currentPointer, previous)) {
-      if (currentPointer?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
-        const current = await this.current();
-        if (sameBindingIdentity(current, next)) return current;
-      }
-      throw new StaleRootBindingError('Historical RootBinding changed before epoch migration could be staged.');
-    }
-    const pending = await readBindingFile(expectedPaths.rootPendingPath);
-    if (pending) {
-      if (!sameBindingIdentity(pending, next)) {
-        throw new RootAuthorityError('root-binding-pending', 'A different RootBinding migration is already pending.');
-      }
-      return pending;
-    }
-    await writeDurableJson(expectedPaths.rootPendingPath, next);
-    return next;
-  }
-
-  /** Publishes an already-validated migrated database without changing its data-set identity. */
-  public async commitInPlaceEpochMigration(
-    previous: HistoricalRootBinding,
-    next: RootBinding
-  ): Promise<RootBinding> {
-    const expectedNext = migratedBinding(previous);
-    if (!sameBindingIdentity(next, expectedNext)) {
-      throw new RootAuthorityError('runtime-epoch-migration-invalid', 'Staged epoch migration binding does not match the authority plan.');
-    }
-    const currentPointer = await readHistoricalBindingFile(next.paths.rootPointerPath);
-    if (currentPointer?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
-      const current = await this.current();
-      if (sameBindingIdentity(current, next)) return current;
-      throw new StaleRootBindingError('A different current-epoch RootBinding was published.');
-    }
-    if (!currentPointer || !sameHistoricalBindingIdentity(currentPointer, previous)) {
-      throw new StaleRootBindingError('Historical RootBinding changed before epoch migration publication.');
-    }
-    const pending = await readBindingFile(next.paths.rootPendingPath);
-    if (!pending || !sameBindingIdentity(pending, next)) {
-      throw new RootAuthorityError('root-binding-pending', 'The staged epoch migration RootBinding is missing or does not match.');
-    }
-    const epoch: RuntimeEpochManifest = {
-      kind: 'limcode-runtime-kernel-epoch',
-      runtimeKernelEpoch: RUNTIME_KERNEL_EPOCH,
-      dataSetId: next.dataSetId,
-      rootInstanceId: next.rootInstanceId,
-      rootGeneration: next.rootGeneration,
-      initializedAt: new Date().toISOString()
-    };
-    await writeDurableJson(next.paths.runtimeEpochPath, epoch);
-    await syncIfFile(next.paths.databasePath);
-    await syncDirectory(next.paths.casRootPath);
-    await syncDirectory(next.paths.dataRootPath);
-    await commitPendingBinding(next);
-    return this.current();
-  }
-
   public async current(): Promise<RootBinding> {
     return this.readCurrent(this.expectedPaths());
   }
@@ -718,26 +647,6 @@ function samePaths(left: RuntimeRootPaths, right: RuntimeRootPaths): boolean {
     && left.rootPointerPath === right.rootPointerPath
     && left.rootPendingPath === right.rootPendingPath
     && left.runtimeEpochPath === right.runtimeEpochPath;
-}
-
-function migratedBinding(previous: HistoricalRootBinding): RootBinding {
-  return freezeRootBinding({
-    paths: previous.paths,
-    dataSetId: previous.dataSetId,
-    rootInstanceId: previous.rootInstanceId,
-    rootGeneration: previous.rootGeneration + 1,
-    pointerRevision: previous.pointerRevision + 1,
-    runtimeKernelEpoch: RUNTIME_KERNEL_EPOCH
-  });
-}
-
-function sameHistoricalBindingIdentity(left: HistoricalRootBinding, right: HistoricalRootBinding): boolean {
-  return left.dataSetId === right.dataSetId
-    && left.rootInstanceId === right.rootInstanceId
-    && left.rootGeneration === right.rootGeneration
-    && left.pointerRevision === right.pointerRevision
-    && left.runtimeKernelEpoch === right.runtimeKernelEpoch
-    && samePaths(left.paths, right.paths);
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

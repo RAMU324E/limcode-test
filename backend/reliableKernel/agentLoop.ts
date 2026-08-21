@@ -707,6 +707,10 @@ export class ReliableAgentLoop {
       materialized.segments.map((segment) => ({ segmentId: segment.segmentId })),
       currentTurnState.reference ? [currentTurnState.reference.messageRevisionId] : []
     );
+    const attachmentHandles = await this.modelProvider.ensureAttachmentHandles(
+      conversationId,
+      attachmentCatalog
+    );
     const handleSources: unknown[] = [
       ...materialized.segments.map((segment) => Buffer.from(segment.content).toString('utf8')),
       attachmentCatalog,
@@ -720,7 +724,7 @@ export class ReliableAgentLoop {
       ) as unknown as ContentObjectMetadata;
       handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
     }
-    const modelHandleCatalog = buildModelHandleCatalog(handleSources);
+    const modelHandleCatalog = buildModelHandleCatalog(handleSources, attachmentHandles.entries);
     const boundaryKey = currentTurnState.compressionBoundaryId ?? 'pre-compression';
     const turnTaskCardReminderEnabled = turnTaskCard
       ? shouldInjectTurnTaskCard({

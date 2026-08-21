@@ -2106,7 +2106,7 @@
     "startupRule": "cutover request 存在时先进入 cutover-only coordinator；精确 epoch-2 predecessor 可在数据库打开前按 boundedEpochUpgrade 离线升级并向前恢复；其他 pending、缺少 epoch 或未知漂移拒绝打开 Runtime。"
   },
   "epochPolicy": {
-    "current": "只允许一次精确 epoch 2→3 离线升级；其他 runtimeKernelEpoch 不兼容数据仍归档重置",
+    "current": "runtimeKernelEpoch 不兼容数据统一归档重置，不提供旧 epoch 原地升级或 fallback",
     "status": "单一当前 schema，不做协议协商或长期 migration chain",
     "roadmapNote": "新增 epoch 必须另行决策，不能自动沿用本次升级器"
   },
