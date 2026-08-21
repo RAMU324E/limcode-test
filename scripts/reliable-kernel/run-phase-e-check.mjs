@@ -463,21 +463,29 @@ async function checkContextStorageGrowth() {
     }
     const structuralP95 = percentile95(structuralSamples);
     const samples = [];
+    // Measure timer coverage across the whole pending batch. Warm worker responses commonly finish
+    // inside one 5ms interval; requiring every call to cross a tick would make faster code fail.
+    const heartbeatIntervalMs = 5;
+    const minimumHeartbeatCoverage = 0.75;
     let heartbeatTicks = 0;
-    let responsiveSamples = 0;
-    const heartbeat = setInterval(() => { heartbeatTicks += 1; }, 5);
+    const heartbeatStartedAt = performance.now();
+    const heartbeat = setInterval(() => { heartbeatTicks += 1; }, heartbeatIntervalMs);
     for (let round = 0; round < 40; round += 1) {
-      const tickBefore = heartbeatTicks;
       const started = performance.now();
       const materialized = await context.materialize(rootId);
       samples.push(performance.now() - started);
-      if (heartbeatTicks > tickBefore) responsiveSamples += 1;
       assert.equal(materialized.segments.length, 1000);
     }
+    const heartbeatElapsedMs = performance.now() - heartbeatStartedAt;
     clearInterval(heartbeat);
+    const expectedHeartbeatTicks = Math.floor(heartbeatElapsedMs / heartbeatIntervalMs);
+    assert.ok(expectedHeartbeatTicks > 0, 'Context materialization heartbeat window was too short to measure');
+    const minimumHeartbeatTicks = Math.ceil(expectedHeartbeatTicks * minimumHeartbeatCoverage);
+    const heartbeatCoverage = heartbeatTicks / expectedHeartbeatTicks;
     assert.ok(
-      responsiveSamples >= 30,
-      `only ${responsiveSamples}/40 materializations allowed an Extension Host heartbeat while pending`
+      heartbeatTicks >= minimumHeartbeatTicks,
+      `Extension Host heartbeat coverage ${heartbeatTicks}/${expectedHeartbeatTicks} `
+        + `(${(heartbeatCoverage * 100).toFixed(1)}%) was below ${minimumHeartbeatCoverage * 100}% while Context materialization was pending`
     );
     const p95 = percentile95(samples);
     assert.ok(p95 < 50, `1000-node full materialization p95 ${p95}ms (structure p95 ${structuralP95}ms)`);
@@ -520,8 +528,13 @@ async function checkContextStorageGrowth() {
       structuralMaterializationP95Ms: structuralP95,
       materializationSamplesMs: samples,
       materializationP95Ms: p95,
+      heartbeatIntervalMs,
+      heartbeatElapsedMs,
       heartbeatTicks,
-      responsiveMaterializationSamples: responsiveSamples,
+      expectedHeartbeatTicks,
+      minimumHeartbeatTicks,
+      minimumHeartbeatCoverage,
+      heartbeatCoverage,
       contextCasCache: workerDiagnostics.contextCasCache,
       ordinaryAppendHistoricalReads: forbiddenHistoryReads,
       ordinaryAppendRepositoryReads: ordinaryReads.length,
@@ -530,7 +543,7 @@ async function checkContextStorageGrowth() {
     };
   });
   metrics.performance = performanceMetrics;
-  assertions.push(`普通append使用≤20次identity-bounded Repository读取且不物化/哈希历史；2x规模中位耗时比${performanceMetrics.scaleRatio.toFixed(3)}≤2.5；真实1000节点+CAS物化p95=${performanceMetrics.materializationP95Ms.toFixed(3)}ms<50ms，至少30/40次调用期间事件循环持续心跳；Context CAS缓存保持有界且命中${performanceMetrics.contextCasCache.hits}次；1000节点后的单次DB+WAL+CAS写入仍低于量化上限`);
+  assertions.push(`普通append使用≤20次identity-bounded Repository读取且不物化/哈希历史；2x规模中位耗时比${performanceMetrics.scaleRatio.toFixed(3)}≤2.5；真实1000节点+CAS物化p95=${performanceMetrics.materializationP95Ms.toFixed(3)}ms<50ms，整批等待期间Extension Host heartbeat覆盖率=${(performanceMetrics.heartbeatCoverage * 100).toFixed(1)}%≥${performanceMetrics.minimumHeartbeatCoverage * 100}%；Context CAS缓存保持有界且命中${performanceMetrics.contextCasCache.hits}次；1000节点后的单次DB+WAL+CAS写入仍低于量化上限`);
 
   return { assertions, faults, metrics };
 }
