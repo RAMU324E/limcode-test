@@ -159,6 +159,20 @@ function controlPlane(app, overrides = {}) {
   });
 }
 
+function llmCapability(start) {
+  return {
+    start,
+    abort() {},
+    resolveInvocation() {},
+    compact() {},
+    dryRun() { throw new Error('unused'); },
+    dryRunCompact() { throw new Error('unused'); },
+    listModels() { return Promise.resolve([]); },
+    cancelRetry() {},
+    dispose() {}
+  };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -346,6 +360,166 @@ test('普通 transient error 在已有语义输出后仍不盲目重放', async 
     );
     assert.equal(calls, 1);
     assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, 'provider_failed');
+  });
+});
+
+test('Agent loop 将 Provider 失败部分输出物化为不进入 Context 的唯一 Message', async () => {
+  await withApp('agent-loop-durable-partial-output', async (app, conversationId, turnId) => {
+    let providerCalls = 0;
+    let nextRequestContents;
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter(
+      'provider-watchdog',
+      llmCapability((llmRequest, emit) => {
+        providerCalls += 1;
+        if (providerCalls === 1) {
+          emit({
+            type: 'llm:thoughtDelta',
+            payload: { requestId: llmRequest.id, text: 'durable partial thought' }
+          });
+          emit({
+            type: 'llm:delta',
+            payload: { requestId: llmRequest.id, text: 'durable partial answer' }
+          });
+          emit({
+            type: 'llm:toolcall',
+            payload: {
+              requestId: llmRequest.id,
+              calls: [{ id: 'incomplete-call', name: 'unused_tool', argsJson: '{"value":1}' }]
+            }
+          });
+          emit({
+            type: 'llm:error',
+            payload: {
+              requestId: llmRequest.id,
+              message: 'socket hang up after partial output',
+              rawError: { code: 'ECONNRESET', retryable: true }
+            }
+          });
+          return;
+        }
+        nextRequestContents = llmRequest.contents;
+        emit({
+          type: 'llm:done',
+          payload: {
+            requestId: llmRequest.id,
+            content: modelContent('next request completed')
+          }
+        });
+      })
+    );
+    app.agentLoop.providers = {
+      resolve(providerId) {
+        assert.equal(providerId, 'provider-watchdog');
+        return adapter;
+      }
+    };
+
+    const headBefore = (await list(app, 'ConversationContextHeadLink', {
+      conversation_id: conversationId
+    }))[0].root_id;
+    const failed = await app.agentLoop.drive(turnId);
+    assert.equal(failed.terminalStatus, 'failed');
+    assert.equal(failed.modelRequestIds.length, 1);
+    assert.equal(failed.assistantMessageIds.length, 1);
+    assert.equal(providerCalls, 1);
+
+    const modelRequestId = failed.modelRequestIds[0];
+    const durableRequest = await get(app, 'ModelRequest', modelRequestId);
+    assert.equal(durableRequest.status, 'terminal');
+    assert.equal(durableRequest.terminal_state, 'provider_failed');
+    const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: modelRequestId });
+    assert.equal(checkpoints.filter((row) => row.checkpoint_kind === 'partial_summary').length, 1);
+
+    const requestLinks = await list(app, 'ModelRequestMessageLink', { model_request_id: modelRequestId });
+    assert.equal(requestLinks.length, 1);
+    const messageId = requestLinks[0].message_id;
+    assert.equal(messageId, failed.assistantMessageIds[0]);
+    assert.ok(await get(app, 'Message', messageId));
+    const revisions = await list(app, 'MessageRevision', { message_id: messageId });
+    assert.equal(revisions.length, 1);
+    assert.equal(revisions[0].role, 'model');
+    assert.equal((await list(app, 'MessageCurrentRevisionLink', { message_id: messageId })).length, 1);
+    assert.equal((await list(app, 'MessagePartOfConversation', {
+      conversation_id: conversationId, message_id: messageId
+    })).length, 1);
+    assert.equal((await list(app, 'MessageTurnLink', {
+      turn_id: turnId, message_id: messageId, role: 'model'
+    })).length, 1);
+
+    const contentObject = await get(app, 'ContentObject', revisions[0].content_object_id);
+    const partialContent = JSON.parse((await app.contentStore.read(contentObject)).toString('utf8'));
+    assert.deepEqual(partialContent, {
+      role: 'model',
+      parts: [
+        { text: 'durable partial thought', thought: true },
+        { text: 'durable partial answer' }
+      ]
+    });
+    assert.equal(partialContent.parts.some((part) => part.functionCall), false);
+    assert.equal((await list(app, 'ContextSegmentSource', {
+      source_kind: 'message_revision', source_id: revisions[0].id
+    })).length, 0);
+    assert.equal((await list(app, 'ConversationContextHeadLink', {
+      conversation_id: conversationId
+    }))[0].root_id, headBefore, '失败部分消息不得推进 Context head');
+
+    const replayedMessageId = await app.agentLoop.materializeFailedPartialOutput(turnId, modelRequestId);
+    assert.equal(replayedMessageId, messageId);
+    assert.equal((await list(app, 'ModelRequestMessageLink', { model_request_id: modelRequestId })).length, 1);
+    assert.equal((await list(app, 'MessageRevision', { message_id: messageId })).length, 1);
+    assert.equal((await list(app, 'ConversationContextHeadLink', {
+      conversation_id: conversationId
+    }))[0].root_id, headBefore, '失败快照重入不得推进 Context head');
+
+    const nextTurn = await app.turns.input({
+      source: { kind: 'command', key: 'agent-loop-durable-partial-output-next-input' },
+      conversationId,
+      leaseOwnerId: 'agent-loop-durable-partial-output-next-owner',
+      hostBootId: app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+      content: 'next user request'
+    });
+    const completed = await app.agentLoop.drive(nextTurn.turnId);
+    assert.equal(completed.terminalStatus, 'completed');
+    assert.equal(providerCalls, 2);
+    assert.ok(nextRequestContents);
+    assert.equal(JSON.stringify(nextRequestContents).includes('durable partial answer'), false);
+    assert.equal(JSON.stringify(nextRequestContents).includes('durable partial thought'), false);
+  });
+});
+
+test('Agent loop 的空 Provider 失败不创建部分 Message', async () => {
+  await withApp('agent-loop-empty-provider-failure', async (app, conversationId, turnId) => {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter(
+      'provider-watchdog',
+      llmCapability((llmRequest, emit) => {
+        emit({
+          type: 'llm:error',
+          payload: {
+            requestId: llmRequest.id,
+            message: 'invalid request before output',
+            rawError: { retryable: false }
+          }
+        });
+      })
+    );
+    app.agentLoop.providers = { resolve() { return adapter; } };
+    const headBefore = (await list(app, 'ConversationContextHeadLink', {
+      conversation_id: conversationId
+    }))[0].root_id;
+
+    const failed = await app.agentLoop.drive(turnId);
+    assert.equal(failed.terminalStatus, 'failed');
+    assert.deepEqual(failed.assistantMessageIds, []);
+    assert.equal(failed.modelRequestIds.length, 1);
+    const modelRequestId = failed.modelRequestIds[0];
+    assert.equal((await list(app, 'ModelRequestMessageLink', { model_request_id: modelRequestId })).length, 0);
+    assert.equal((await list(app, 'ModelStreamCheckpoint', { model_request_id: modelRequestId }))
+      .some((row) => row.checkpoint_kind === 'partial_summary'), false);
+    assert.equal((await list(app, 'MessageTurnLink', { turn_id: turnId, role: 'model' })).length, 0);
+    assert.equal((await list(app, 'ConversationContextHeadLink', {
+      conversation_id: conversationId
+    }))[0].root_id, headBefore);
   });
 });
 

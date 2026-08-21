@@ -69,7 +69,7 @@ export type RuntimePerformanceMetricEvent =
     }
   | {
       kind: 'provider.stream_event';
-      eventKind: 'output_delta' | 'output_item_done' | 'terminal_summary' | 'other';
+      eventKind: 'output_delta' | 'output_item_done' | 'partial_summary' | 'terminal_summary' | 'other';
       checkpointed: boolean;
       transactionCount: number;
       durationMs: number;

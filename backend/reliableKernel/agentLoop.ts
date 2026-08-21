@@ -30,6 +30,7 @@ import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
   modelRequestIdFor,
+  PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   type FullRequestProviderAdapter,
   type ProviderStreamEvent,
   type StreamEventResult
@@ -650,6 +651,11 @@ export class ReliableAgentLoop {
         if (interruptionCheckError !== undefined) throw interruptionCheckError;
         this.observeLifecycle({ turnId, stage: 'failure_terminal_started' });
         if (!await this.terminateIfRequested(turnId, 'drive-failed')) {
+          const latestModelRequestId = modelRequestIds[modelRequestIds.length - 1];
+          const partialMessageId = await this.materializeFailedPartialOutput(turnId, latestModelRequestId);
+          if (partialMessageId && !assistantMessageIds.includes(partialMessageId)) {
+            assistantMessageIds.push(partialMessageId);
+          }
           await this.failActiveTurn(turnId, error);
         }
         this.observeLifecycle({ turnId, stage: 'failure_terminal_completed' });
@@ -1422,6 +1428,67 @@ export class ReliableAgentLoop {
     return 'failed';
   }
 
+  private async materializeFailedPartialOutput(
+    turnId: string,
+    modelRequestId: string | undefined
+  ): Promise<string | undefined> {
+    if (!modelRequestId) return undefined;
+    const request = await this.maybeGet('ModelRequest', modelRequestId);
+    if (
+      !request
+      || request.turn_id !== turnId
+      || request.status !== 'terminal'
+      || !isProviderFailureTerminalState(optionalText(request.terminal_state))
+    ) return undefined;
+
+    const checkpoints = await this.list('ModelStreamCheckpoint', { model_request_id: modelRequestId }, 512);
+    const partialCheckpoints = checkpoints.filter((row) => row.checkpoint_kind === 'partial_summary');
+    if (partialCheckpoints.length === 0) return undefined;
+    const stats = asRecord(request.stream_stats_json);
+    if (!stats) throw new TypeError(`ModelRequest ${modelRequestId} has invalid stream stats.`);
+    const attemptSeq = requirePositiveInteger(stats.attemptSeq, 'ModelRequest.stream_stats.attemptSeq');
+    const socketGeneration = requirePositiveInteger(
+      stats.socketGeneration,
+      'ModelRequest.stream_stats.socketGeneration'
+    );
+    const partial = partialCheckpoints
+      .filter((row) => reliableDecimal(row.attempt_seq) === attemptSeq
+        && reliableDecimal(row.socket_generation) === socketGeneration)
+      .sort((left, right) => compareInteger(right.stream_seq, left.stream_seq))[0];
+    if (!partial) return undefined;
+
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requireId(partial.content_object_id, 'ModelStreamCheckpoint.content_object_id')
+    );
+    const bytes = await this.contentStore.read(metadata as unknown as ContentObjectMetadata);
+    const envelope = normalizePlainJson(JSON.parse(bytes.toString('utf8')), 'Model partial checkpoint');
+    const record = requireRecord(envelope, 'Model partial checkpoint');
+    if (record.kind !== 'output_item_done') {
+      throw new Error(`ModelRequest ${modelRequestId} partial checkpoint is not an output item event.`);
+    }
+    const payload = requireRecord(record.content, 'Model partial checkpoint content');
+    if (payload.type !== PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE) {
+      throw new Error(`ModelRequest ${modelRequestId} partial checkpoint has an invalid snapshot type.`);
+    }
+    const output = normalizeProviderOutput(payload.message);
+    if (output.toolCalls.length > 0) {
+      throw new Error(`ModelRequest ${modelRequestId} partial checkpoint must not contain tool calls.`);
+    }
+    if (!output.content.parts.some((part) => 'text' in part && part.text.trim().length > 0)) {
+      return undefined;
+    }
+    const committed = await this.turnOutput.appendAssistantMessage({
+      turnId,
+      modelRequestId,
+      sourceKey: `failed-partial:${modelRequestId}`,
+      content: canonicalPlainJson(output.content, 'Failed partial Provider MessageContent'),
+      contentType: MESSAGE_CONTENT_TYPE,
+      contextDisposition: 'exclude'
+    });
+    return committed.messageId;
+  }
+
   private async readTerminalProviderOutput(modelRequestId: string): Promise<NormalizedProviderOutput> {
     const checkpoints = await this.list('ModelStreamCheckpoint', { model_request_id: modelRequestId }, 512);
     const terminal = checkpoints
@@ -2077,6 +2144,10 @@ const TERMINATION_INPUT_KINDS = [
 function isTerminalToolStatus(value: unknown): boolean {
   return ['succeeded', 'failed', 'partial', 'rejected', 'cancelled', 'conflict', 'outcome_unknown']
     .includes(String(value));
+}
+
+function isProviderFailureTerminalState(value: string): boolean {
+  return value === 'provider_failed' || value.startsWith('provider_transient_');
 }
 
 function providerOutputMessage(output: NormalizedProviderOutput): MessageContent {

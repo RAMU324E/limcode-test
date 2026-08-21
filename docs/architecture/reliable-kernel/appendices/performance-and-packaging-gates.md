@@ -22,7 +22,7 @@
 | ordinary transaction scaling | 数据规模 2x 时耗时增长 ≤2.5x |
 | per-turn storage growth | ≤1.5×本轮新增内容字节 + 128KB |
 | thousand-node materialization | <50ms |
-| ModelStreamCheckpoint rows | ≤ active request×64 + terminal request×33 |
+| ModelStreamCheckpoint rows | ≤ active request×64 + terminal request×34 |
 | compression sequence nodes | 单次 ≤4，O(1) |
 
 普通 transaction 不得 hash/rewrite/deep-clone full history，并须以常数个 identity-bounded Repository read 完成；Context root/node 首发保留到 dataset reset，这不允许每轮复制历史。Context CAS 正文读取/摘要校验必须在专用 database worker 或有界异步路径执行，不得在 Extension Host 用同步文件 I/O 换取 wall-clock gate 数字。

@@ -192,12 +192,12 @@
   "streamCheckpoint": {
     "retention": "Completed 终态围栏与摘要写入的同一 writer 事务内，由 ModelStreamCheckpointRepository 固定 pruneAfterTerminalFence mutation 仅保留当前 attempt/socket generation 尾部 32 条与终态摘要",
     "ordinaryDeltaRetention": "每个ModelRequest只持久化首个output_delta进度marker；其余delta走transient fanout，不作为可重建输出快照",
-    "activeCheckpointCapacity": "最多1个output_delta加32个output_item_done；Completed不受该容量限制",
+    "activeCheckpointCapacity": "最多1个output_delta加32个output_item_done；最终失败允许额外1个partial_summary冻结可展示部分输出；Completed不受该容量限制",
     "semanticOverflow": "第33个output_item_done必须明确失败ModelRequest，不得accepted-drop",
     "maintenanceMutation": "fixed-writer-prune-after-terminal-fence-only",
     "genericInsertDelete": false,
     "eventIdempotency": "同一(modelRequestId,attemptSeq,socketGeneration,streamSeq)仅checkpoint kind与canonical content identity完全相同时可重放；不同事件必须明确冲突，不得吞掉Completed",
-    "rowBound": "行数上界见 appendices/performance-and-packaging-gates.md（≤活跃请求×64+终态请求×33）"
+    "rowBound": "行数上界见 appendices/performance-and-packaging-gates.md（≤活跃请求×64+终态请求×34）"
   },
   "providerRetry": {
     "automaticTransientRetry": true,
@@ -229,7 +229,7 @@
     "storageGrowth": "每轮新增存储≤1.5×本轮新增内容字节+128KB；量化判定式以 appendices/performance-and-packaging-gates.md 为唯一权威",
     "ordinaryTransactionScale": "2x 规模普通事务耗时增长≤2.5x",
     "chainMaterialization": "千节点链物化<50ms",
-    "checkpointRowBound": "checkpoint 行数≤(活跃请求×64+终态请求×33)",
+    "checkpointRowBound": "checkpoint 行数≤(活跃请求×64+终态请求×34)",
     "compressionWriteCost": "单次压缩新增序列节点数=O(1)（≤4）",
     "ordinaryTransactionMayHashFullHistory": false,
     "ordinaryTransactionMayRewriteFullHistory": false,

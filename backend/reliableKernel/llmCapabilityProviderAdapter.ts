@@ -24,7 +24,11 @@ import {
   readFileToolParameters
 } from '../world/modules/tools/definitions/readFile';
 import { classifyOpenAIResponsesPreTerminalWebSocketClose } from '../capabilities/openAIResponsesWebSocketRetryPolicy';
-import { ProviderTransientError } from './modelProviderControlPlane';
+import { frozenProviderRetryPolicy } from './frozenAuthority';
+import {
+  PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
+  ProviderTransientError
+} from './modelProviderControlPlane';
 import type {
   FullProviderRequest,
   FullRequestProviderAdapter,
@@ -146,13 +150,26 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       };
       const finish = (error?: unknown): void => {
         if (terminal) return;
-        terminal = true;
-        detachAbort();
         const terminalError = error instanceof ProviderTransientError
           && sawReplayUnsafeProviderOutput
           && !error.retryAfterOutput
             ? new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`)
             : error;
+        if (terminalError !== undefined) {
+          const partialOutput = partialOutputSnapshot(outputParts);
+          if (partialOutput && shouldFreezeFailedPartialOutput(request, terminalError)) {
+            enqueue({
+              kind: 'output_item_done',
+              semanticProgress: false,
+              content: normalizePlainJson({
+                type: PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
+                message: partialOutput
+              }, 'LLM partial output snapshot')
+            });
+          }
+        }
+        terminal = true;
+        detachAbort();
         void tail.then(
           () => terminalError === undefined ? resolve() : reject(terminalError),
           reject
@@ -374,11 +391,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
 
       const onAbort = (): void => {
         this.capability.abort(request.modelRequestId);
-        finish(abortError());
+        finish(abortError(controls.signal));
       };
       const detachAbort = (): void => controls.signal?.removeEventListener('abort', onAbort);
       if (controls.signal?.aborted) {
-        finish(abortError());
+        finish(abortError(controls.signal));
         return;
       }
       controls.signal?.addEventListener('abort', onAbort, { once: true });
@@ -455,11 +472,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       };
       const onAbort = (): void => {
         this.capability.abort(request.modelRequestId);
-        finish(abortError());
+        finish(abortError(controls.signal));
       };
       const detachAbort = (): void => controls.signal?.removeEventListener('abort', onAbort);
       if (controls.signal?.aborted) {
-        finish(abortError());
+        finish(abortError(controls.signal));
         return;
       }
       controls.signal?.addEventListener('abort', onAbort, { once: true });
@@ -1134,6 +1151,29 @@ function providerToolAllowed(
   return !disabled.includes(tool.schema.name);
 }
 
+function shouldFreezeFailedPartialOutput(request: FullProviderRequest, error: unknown): boolean {
+  if (error instanceof Error && error.name === 'AbortError') return false;
+  if (!(error instanceof ProviderTransientError) || !error.retryAfterOutput) return true;
+  if (!/^[1-9]\d*$/.test(request.attemptSeq)) {
+    throw new TypeError('Provider request attemptSeq must be a positive decimal integer.');
+  }
+  const retryPolicy = frozenProviderRetryPolicy(request.authoritySnapshot);
+  return BigInt(request.attemptSeq) >= BigInt(retryPolicy.maxRetries + 1);
+}
+
+function partialOutputSnapshot(parts: MessageContent['parts']): MessageContent | undefined {
+  const textParts = parts
+    .filter((part) => 'text' in part && part.text.trim().length > 0)
+    .map((part) => {
+      if (!('text' in part)) throw new TypeError('Partial output snapshot accepted a non-text part.');
+      return {
+        ...part,
+        ...(part.outputItem ? { outputItem: { ...part.outputItem } } : {})
+      };
+    });
+  return textParts.length > 0 ? { role: 'model', parts: textParts } : undefined;
+}
+
 function appendTextPart(
   parts: MessageContent['parts'],
   delta: string,
@@ -1748,7 +1788,8 @@ function requireProviderKind(value: PlainJsonValue | undefined): LlmProviderKind
   return value as LlmProviderKind;
 }
 
-function abortError(): Error {
+function abortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof ProviderTransientError) return signal.reason;
   const error = new Error('Provider dispatch aborted.');
   error.name = 'AbortError';
   return error;

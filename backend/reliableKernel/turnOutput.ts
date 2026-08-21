@@ -7,7 +7,11 @@ import {
   providerPromptTokens,
   providerTotalTokens
 } from './contextTokenEstimator';
-import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import {
+  DOMAIN_REPOSITORIES,
+  type DomainRow,
+  type RepositoryTransactionStep
+} from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface AssistantMessageCommit {
@@ -39,11 +43,17 @@ export class TurnOutputControlPlane {
     sourceKey: string;
     content: string | Uint8Array;
     contentType?: string;
+    /** Failed partial output remains transcript data but must never become model-facing Context. */
+    contextDisposition?: 'append' | 'exclude';
   }): Promise<AssistantMessageCommit> {
     const turnId = requireId(input.turnId, 'turnId');
     const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
     const sourceKey = requireText(input.sourceKey, 'sourceKey');
     const contentType = requireText(input.contentType ?? 'application/vnd.limcode.message+json', 'contentType');
+    const contextDisposition = input.contextDisposition ?? 'append';
+    if (contextDisposition !== 'append' && contextDisposition !== 'exclude') {
+      throw new TypeError(`Unsupported assistant output Context disposition: ${String(contextDisposition)}`);
+    }
     const ids = outputIds(turnId, sourceKey);
     const identity = this.contentStore.identity(input.content, contentType);
     const modelRequest = await this.requireExisting('ModelRequest', modelRequestId);
@@ -57,25 +67,30 @@ export class TurnOutputControlPlane {
     const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
     const content = await this.contentStore.prepare(this.database, input.content, contentType);
-    const contentEstimatedTokens = estimateStoredMessageContentTokens(input.content, contentType);
-    const projections = await this.list('ModelContextProjection', {
-      owner_kind: 'model_request', owner_id: modelRequestId
-    }, 2);
     const currentHeadRootId = await this.context.currentHeadRootId(conversationId);
-    const providerAligned = projections.length === 1
-      && projections[0].root_id === currentHeadRootId;
-    const observedInputTokens = providerAligned ? providerPromptTokens(modelRequest.usage_json) : undefined;
-    const observedTotalTokens = providerAligned ? providerTotalTokens(modelRequest.usage_json) : undefined;
-    const resultingEstimatedTokens = observedTotalTokens
-      ?? (observedInputTokens === undefined ? undefined : observedInputTokens + contentEstimatedTokens);
-    const context = await this.context.prepareMessageAppendMutation({
-      conversationId,
-      messageRevisionId: ids.revisionId,
-      contentObjectId: content.metadata.id,
-      contentByteLength: content.metadata.byte_length,
-      contentEstimatedTokens,
-      ...(resultingEstimatedTokens === undefined ? {} : { resultingEstimatedTokens })
-    });
+    if (!currentHeadRootId) throw new Error(`Conversation ${conversationId} has no Context head before assistant output commit.`);
+    let contextSteps: RepositoryTransactionStep[] = [];
+    if (contextDisposition === 'append') {
+      const contentEstimatedTokens = estimateStoredMessageContentTokens(input.content, contentType);
+      const projections = await this.list('ModelContextProjection', {
+        owner_kind: 'model_request', owner_id: modelRequestId
+      }, 2);
+      const providerAligned = projections.length === 1
+        && projections[0].root_id === currentHeadRootId;
+      const observedInputTokens = providerAligned ? providerPromptTokens(modelRequest.usage_json) : undefined;
+      const observedTotalTokens = providerAligned ? providerTotalTokens(modelRequest.usage_json) : undefined;
+      const resultingEstimatedTokens = observedTotalTokens
+        ?? (observedInputTokens === undefined ? undefined : observedInputTokens + contentEstimatedTokens);
+      const context = await this.context.prepareMessageAppendMutation({
+        conversationId,
+        messageRevisionId: ids.revisionId,
+        contentObjectId: content.metadata.id,
+        contentByteLength: content.metadata.byte_length,
+        contentEstimatedTokens,
+        ...(resultingEstimatedTokens === undefined ? {} : { resultingEstimatedTokens })
+      });
+      contextSteps = context.steps;
+    }
     const now = requireText(this.now(), 'clock result');
 
     try {
@@ -130,7 +145,7 @@ export class TurnOutputControlPlane {
           message_id: ids.messageId,
           created_at: now
         }),
-        ...context.steps,
+        ...contextSteps,
         DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
       ]);
       const contextRootId = await this.context.currentHeadRootId(conversationId);

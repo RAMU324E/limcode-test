@@ -1040,7 +1040,7 @@ function executeModelStreamEvent(
   const attemptSeq = requirePositiveInteger(input.attemptSeq, 'ModelStreamEvent.attemptSeq');
   const socketGeneration = requirePositiveInteger(input.socketGeneration, 'ModelStreamEvent.socketGeneration');
   const streamSeq = requirePositiveInteger(input.streamSeq, 'ModelStreamEvent.streamSeq');
-  if (!['output_delta', 'output_item_done', 'terminal_summary'].includes(input.checkpointKind)) {
+  if (!['output_delta', 'output_item_done', 'partial_summary', 'terminal_summary'].includes(input.checkpointKind)) {
     throw new TypeError(`Unsupported ModelStream checkpoint kind: ${String(input.checkpointKind)}`);
   }
   if (typeof input.now !== 'string' || input.now.length === 0) throw new TypeError('ModelStreamEvent.now must be non-empty.');

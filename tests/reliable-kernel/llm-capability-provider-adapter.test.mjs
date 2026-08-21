@@ -1589,6 +1589,7 @@ test('LLM capability adapter 不重试未配置的协议、数据及未知终态
 });
 
 test('LLM capability adapter 只允许配置的终态前关闭在语义输出后切换 Attempt', async () => {
+  const retryableAttemptEvents = [];
   const afterConfiguredCloseOutput = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
     fakeCapability((llmRequest, emit) => {
@@ -1612,12 +1613,67 @@ test('LLM capability adapter 只允许配置的终态前关闭在语义输出后
   );
   await assert.rejects(
     afterConfiguredCloseOutput.sendFullRequest(request(), {
-      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+      onEvent: async (event) => {
+        retryableAttemptEvents.push(event);
+        return { accepted: true, checkpointed: true, terminal: false };
+      }
     }),
     (error) => error instanceof kernel.ProviderTransientError
       && error.reason === 'connection_interrupted'
       && error.retryAfterOutput === true
       && !/不自动重放请求/.test(error.message)
+  );
+  assert.deepEqual(retryableAttemptEvents.map((event) => event.kind), ['output_delta']);
+
+  const finalAttempt = request();
+  finalAttempt.attemptSeq = '2';
+  const finalAttemptEvents = [];
+  await assert.rejects(
+    afterConfiguredCloseOutput.sendFullRequest(finalAttempt, {
+      onEvent: async (event) => {
+        finalAttemptEvents.push(event);
+        return { accepted: true, checkpointed: true, terminal: false };
+      }
+    }),
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'connection_interrupted'
+      && error.retryAfterOutput === true
+  );
+  assert.equal(
+    finalAttemptEvents.at(-1).content.type,
+    kernel.PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
+    '冻结重试预算的最终 Attempt 才持久化失败部分输出'
+  );
+
+  const watchdogController = new AbortController();
+  const watchdogEvents = [];
+  const watchdogAdapter = new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:delta', payload: { requestId: llmRequest.id, text: 'watchdog partial' } });
+      watchdogController.abort(new kernel.ProviderTransientError(
+        'stream_stalled',
+        'semantic watchdog stalled',
+        true
+      ));
+    })
+  );
+  await assert.rejects(
+    watchdogAdapter.sendFullRequest(request(), {
+      signal: watchdogController.signal,
+      onEvent: async (event) => {
+        watchdogEvents.push(event);
+        return { accepted: true, checkpointed: true, terminal: false };
+      }
+    }),
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'stream_stalled'
+      && error.retryAfterOutput === true
+  );
+  assert.deepEqual(
+    watchdogEvents.map((event) => event.kind),
+    ['output_delta'],
+    'watchdog 丢弃并重试的非最终 Attempt 不得写 partial_summary'
   );
 
   const afterRawEvent = new kernel.LlmCapabilityFullRequestAdapter(
@@ -1672,10 +1728,19 @@ test('LLM capability adapter 只允许配置的终态前关闭在语义输出后
       && /语义输出.*不自动重放请求/.test(error.message)
   );
 
+  const afterSemanticEvents = [];
   const afterSemanticOutput = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
     fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:thoughtDelta', payload: { requestId: llmRequest.id, text: 'reasoning partial' } });
       emit({ type: 'llm:delta', payload: { requestId: llmRequest.id, text: 'partial' } });
+      emit({
+        type: 'llm:toolcall',
+        payload: {
+          requestId: llmRequest.id,
+          calls: [{ id: 'partial-call', name: 'echo', argsJson: '{"value":1}' }]
+        }
+      });
       emit({
         type: 'llm:error',
         payload: {
@@ -1688,10 +1753,28 @@ test('LLM capability adapter 只允许配置的终态前关闭在语义输出后
   );
   await assert.rejects(
     afterSemanticOutput.sendFullRequest(request(), {
-      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+      onEvent: async (event) => {
+        afterSemanticEvents.push(event);
+        return { accepted: true, checkpointed: true, terminal: false };
+      }
     }),
     (error) => !(error instanceof kernel.ProviderTransientError)
       && /不自动重放请求/.test(error.message)
+  );
+  assert.deepEqual(afterSemanticEvents.at(-1).content, {
+    type: kernel.PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
+    message: {
+      role: 'model',
+      parts: [
+        { text: 'reasoning partial', thought: true },
+        { text: 'partial' }
+      ]
+    }
+  });
+  assert.equal(
+    afterSemanticEvents.at(-1).content.message.parts.some((part) => part.functionCall),
+    false,
+    '失败快照不得提交未完成工具调用'
   );
 });
 

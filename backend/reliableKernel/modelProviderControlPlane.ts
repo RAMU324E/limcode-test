@@ -108,6 +108,7 @@ export interface FullProviderRequest {
 }
 
 export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed';
+export const PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE = 'partial_output_snapshot';
 export type ProviderTransientTerminalEventKind = 'failed' | 'cancelled';
 export type ProviderStreamEventKind = ProviderOutputStreamEventKind | ProviderTransientTerminalEventKind;
 
@@ -1109,13 +1110,22 @@ export class ModelProviderControlPlane {
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
     const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
     const event = normalizeStreamEvent(eventInput);
+    const completed = event.kind === 'completed';
+    const partialSummary = event.kind === 'output_item_done'
+      && isRecord(event.content)
+      && event.content.type === PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE;
+    const checkpointKind: 'output_delta' | 'output_item_done' | 'partial_summary' | 'terminal_summary' = completed
+      ? 'terminal_summary'
+      : partialSummary
+        ? 'partial_summary'
+        : event.kind as 'output_delta' | 'output_item_done';
     const metricStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
     let transactionCount = 0;
     const finish = (result: StreamEventResult): StreamEventResult => {
       if (metricStartedAt !== undefined) {
         this.database.recordPerformanceMetric({
           kind: 'provider.stream_event',
-          eventKind: event.kind === 'completed' ? 'terminal_summary' : event.kind,
+          eventKind: checkpointKind,
           checkpointed: result.checkpointed,
           transactionCount,
           durationMs: performance.now() - metricStartedAt
@@ -1130,10 +1140,6 @@ export class ModelProviderControlPlane {
       socketGeneration.toString(),
       event.streamSeq.toString()
     );
-    const completed = event.kind === 'completed';
-    const checkpointKind: 'output_delta' | 'output_item_done' | 'terminal_summary' = completed
-      ? 'terminal_summary'
-      : event.kind as 'output_delta' | 'output_item_done';
     const checkpointBytes = canonicalPlainJson({
       kind: event.kind,
       streamSeq: event.streamSeq.toString(),
