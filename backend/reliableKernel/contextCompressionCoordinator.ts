@@ -1,12 +1,17 @@
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
-import { renderAttachmentCatalog } from './attachmentCatalog';
+import {
+  rebaseAttachmentCatalogState,
+  selectAttachmentCatalogStateSegments,
+  type AttachmentCatalogState
+} from './attachmentCatalog';
 import { AttachmentCatalogProjection } from './attachmentCatalogProjection';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore } from './contentAddressedStore';
 import {
   ContextCompressionControlPlane,
   compressionBlockIdFor,
+  compressionSegmentIdFor,
   type CompressionCommitResult
 } from './contextCompression';
 import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
@@ -26,6 +31,7 @@ import {
   type ContextPlanningFailureCode,
   type FullRequestPlanningBudget
 } from './modelFacingContextProjection';
+import type { ModelHandleCatalog } from './modelHandleCatalog';
 import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
@@ -188,6 +194,14 @@ export class ReliableContextCompressionCoordinator {
       this.context.materialize(headRootId)
     ]);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
+    const fullAttachmentCatalogState = await this.attachmentCatalog.projectState(
+      frozen.conversationId,
+      semanticMaterialized.segments.map((segment) => ({ segmentId: segment.segmentId }))
+    );
+    const fullModelHandleCatalog = await this.modelProvider.ensureAttachmentHandles(
+      frozen.conversationId,
+      fullAttachmentCatalogState.catalog
+    );
     if (
       policy.methodKind === 'openai_responses_compact'
       && command.compressSegmentCount !== undefined
@@ -208,7 +222,9 @@ export class ReliableContextCompressionCoordinator {
             semanticMaterialized.segments,
             Math.max(0, requestBudget.effectiveBodyTargetTokens
               - irreducibleAddendaTokens
-              - (effectiveSummaryMaxTokens ?? 0))
+              - (effectiveSummaryMaxTokens ?? 0)),
+            fullAttachmentCatalogState,
+            fullModelHandleCatalog
           );
     const hardContextRoomTokens = Math.max(
       0,
@@ -239,7 +255,7 @@ export class ReliableContextCompressionCoordinator {
       };
     }
     const sourceSegments = materialized.records.slice(0, sourceSegmentCount);
-    const sourceAttachmentCatalog = await this.attachmentCatalog.project(
+    const sourceAttachmentCatalogState = await this.attachmentCatalog.projectState(
       frozen.conversationId,
       semanticMaterialized.segments.slice(0, sourceSegmentCount).map((segment) => ({
         segmentId: segment.segmentId
@@ -247,13 +263,18 @@ export class ReliableContextCompressionCoordinator {
     );
     const sourceAttachmentHandles = await this.modelProvider.ensureAttachmentHandles(
       frozen.conversationId,
-      sourceAttachmentCatalog
+      sourceAttachmentCatalogState.catalog
     );
     const sourceHash = hashSource(sourceSegments);
     const idempotencyKey = [
       'context-compression', trigger, headRootId, policy.config.id, String(sourceSegmentCount), sourceHash
     ].join(':');
     const expectedModelRequestId = modelRequestIdFor(turnId, idempotencyKey);
+    const compressionBlockId = compressionBlockIdFor(
+      frozen.conversationId,
+      headRootId,
+      expectedModelRequestId
+    );
     const created = await this.modelProvider.createModelRequest({
       turnId,
       contextRootId: headRootId,
@@ -270,10 +291,10 @@ export class ReliableContextCompressionCoordinator {
         sourceRootId: headRootId,
         sourceSegmentCount,
         sourceHash,
-        blockId: compressionBlockIdFor(frozen.conversationId, headRootId, expectedModelRequestId),
+        blockId: compressionBlockId,
         compressionConfigId: policy.config.id,
         compressionMethodKind: policy.methodKind,
-        ...(sourceAttachmentCatalog.length > 0 ? { attachmentCatalog: sourceAttachmentCatalog } : {}),
+        attachmentCatalogState: sourceAttachmentCatalogState,
         ...(sourceAttachmentHandles.entries.length > 0
           ? { modelHandleCatalog: sourceAttachmentHandles }
           : {}),
@@ -305,35 +326,52 @@ export class ReliableContextCompressionCoordinator {
     const completed = await this.modelProvider.completedEvent(expectedModelRequestId);
     const summary = compressionContents(completed.content);
     const tailSegments = semanticMaterialized.segments.slice(sourceSegmentCount);
-    const combinedAttachmentCatalog = await this.attachmentCatalog.project(
-      frozen.conversationId,
-      semanticMaterialized.segments.map((segment) => ({
-        segmentId: segment.segmentId
-      }))
-    );
-    const tailAttachmentCatalog = await this.attachmentCatalog.project(
+    const tailAttachmentCatalogState = await this.attachmentCatalog.projectState(
       frozen.conversationId,
       tailSegments.map((segment) => ({
         segmentId: segment.segmentId
       }))
     );
-    const tailCatalogContent = renderAttachmentCatalog(tailAttachmentCatalog);
-    const combinedCatalogContent = renderAttachmentCatalog(combinedAttachmentCatalog);
-    const tailCatalogTokens = tailCatalogContent
-      ? estimateMessageContentsTokens([tailCatalogContent])
-      : 0;
-    const combinedCatalogTokens = combinedCatalogContent
-      ? estimateMessageContentsTokens([combinedCatalogContent])
-      : 0;
+    const summarySegmentId = compressionSegmentIdFor(compressionBlockId);
+    const candidateAttachmentCatalogState = rebaseAttachmentCatalogState(
+      summarySegmentId,
+      sourceAttachmentCatalogState.catalog,
+      tailAttachmentCatalogState
+    );
+    const summaryContextItem = {
+      segmentId: summarySegmentId,
+      segmentKind: 'compression',
+      messageRole: null,
+      contentType: 'application/vnd.limcode.compression-contents+json',
+      content: JSON.stringify({ kind: 'compression_contents', version: 1, contents: summary })
+    };
+    const candidateContextItems = [
+      summaryContextItem,
+      ...tailSegments.map((segment) => ({
+        segmentId: segment.segmentId,
+        segmentKind: segment.segmentKind,
+        messageRole: segment.messageRole,
+        contentType: segment.contentObject.content_type,
+        content: segment.content.toString('utf8')
+      }))
+    ];
+    const candidateProjection = projectStoredModelFacingWindow(
+      candidateContextItems,
+      candidateAttachmentCatalogState,
+      fullModelHandleCatalog
+    );
+    const summaryProjectionTokens = projectStoredModelFacingWindow(
+      [summaryContextItem],
+      { catalog: [], placements: [] },
+      fullModelHandleCatalog
+    ).tokenCount;
     const providerInputTokens = providerPromptTokens(completed.usage);
     const providerOutputTokens = compressionOutputTokens(completed.usage);
     const providerSummaryTokens = providerOutputTokens
       ?? estimateMessageContentsTokens(summary);
     const summaryEstimatedTokens = providerSummaryTokens;
-    const tailProjectedTokens = projectMaterializedSegmentsTokens(tailSegments, tailAttachmentCatalog);
     const projectedTokens = providerSummaryTokens
-      + Math.max(0, tailProjectedTokens - tailCatalogTokens)
-      + combinedCatalogTokens;
+      + Math.max(0, candidateProjection.tokenCount - summaryProjectionTokens);
     const projectedBodyTokens = projectedTokens + irreducibleAddendaTokens;
     if (projectedBodyTokens > requestBudget.planningBodyRoomTokens) {
       return compressionError(
@@ -440,12 +478,15 @@ export class ReliableContextCompressionCoordinator {
 function selectCompressionPrefixByTokens(
   records: readonly StructuralContextRecord[],
   segments: ReadonlyArray<{
+    segmentId: string;
     segmentKind: string;
     messageRole: string | null;
     contentObject: { content_type: string };
     content: Buffer;
   }>,
-  tailBudgetTokens: number
+  tailBudgetTokens: number,
+  attachmentCatalogState: AttachmentCatalogState,
+  modelHandleCatalog: ModelHandleCatalog
 ): {
   sourceSegmentCount: number;
   newestGroupTokens?: number;
@@ -468,17 +509,23 @@ function selectCompressionPrefixByTokens(
     const functionResponseCount = items.filter((position) =>
       records[position].segment.segment_kind === 'tool_pair'
     ).length;
+    const segmentIds = items.map((position) => segments[position].segmentId);
+    const groupAttachmentState = selectAttachmentCatalogStateSegments(
+      attachmentCatalogState,
+      segmentIds
+    );
     groups.push({
       kind: functionResponseCount > 0 ? 'tool_exchange' : 'message',
       items,
       startIndex: start,
       endIndexExclusive: index,
       estimatedTokens: projectStoredModelFacingWindow(items.map((position) => ({
+        segmentId: segments[position].segmentId,
         segmentKind: segments[position].segmentKind,
         messageRole: segments[position].messageRole,
         contentType: segments[position].contentObject.content_type,
         content: segments[position].content.toString('utf8')
-      }))).tokenCount,
+      })), groupAttachmentState, modelHandleCatalog).tokenCount,
       functionCallCount: functionResponseCount > 0 ? 1 : 0,
       functionResponseCount,
       complete: true
@@ -490,20 +537,6 @@ function selectCompressionPrefixByTokens(
     sourceSegmentCount: selected.prefixItems.length,
     ...(newest ? { newestGroupTokens: newest.estimatedTokens, newestGroupKind: newest.kind } : {})
   };
-}
-
-function projectMaterializedSegmentsTokens(segments: ReadonlyArray<{
-  segmentKind: string;
-  messageRole: string | null;
-  contentObject: { content_type: string };
-  content: Buffer;
-}>, attachmentCatalog: Parameters<typeof projectStoredModelFacingWindow>[1] = []): number {
-  return projectStoredModelFacingWindow(segments.map((segment) => ({
-    segmentKind: segment.segmentKind,
-    messageRole: segment.messageRole,
-    contentType: segment.contentObject.content_type,
-    content: segment.content.toString('utf8')
-  })), attachmentCatalog).tokenCount;
 }
 
 function manualRequestPlanningBudget(

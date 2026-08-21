@@ -1,5 +1,7 @@
-import type { AttachmentCatalogEntry, MessageContent } from '../../shared/protocol';
+import type { MessageContent } from '../../shared/protocol';
+import type { AttachmentCatalogState } from './attachmentCatalog';
 import { AttachmentCatalogProjection } from './attachmentCatalogProjection';
+import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
 import { ContentAddressedStore } from './contentAddressedStore';
 import {
   ContextSequenceControlPlane,
@@ -10,6 +12,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
+import type { ModelHandleCatalog } from './modelHandleCatalog';
 import {
   canonicalizeCompressionContents,
   estimateJsonTokens,
@@ -59,6 +62,7 @@ export interface ReliableContextTokenEstimate {
 export class ReliableContextTokenEstimator {
   private readonly context: ContextSequenceControlPlane;
   private readonly attachmentCatalog: AttachmentCatalogProjection;
+  private readonly attachmentHandles: ConversationAttachmentHandleRegistry;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -66,21 +70,35 @@ export class ReliableContextTokenEstimator {
   ) {
     this.context = new ContextSequenceControlPlane(database, contentStore);
     this.attachmentCatalog = new AttachmentCatalogProjection(database);
+    this.attachmentHandles = new ConversationAttachmentHandleRegistry(database);
   }
 
   public async estimateRoot(rootIdInput: string): Promise<ReliableContextTokenEstimate> {
     const rootId = requireId(rootIdInput, 'rootId');
     const materialized = await this.context.materialize(rootId);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const attachmentCatalog = await this.attachmentCatalog.project(
+    const attachmentCatalogState = await this.attachmentCatalog.projectState(
       conversationId,
       materialized.segments.map((segment) => ({
         segmentId: segment.segmentId
       }))
     );
-    const projectedTokens = estimateMaterializedContextTokens(materialized.segments, attachmentCatalog);
+    const modelHandleCatalog = await this.attachmentHandles.ensure(
+      conversationId,
+      attachmentCatalogState.catalog
+    );
+    const projectedTokens = estimateMaterializedContextTokens(
+      materialized.segments,
+      attachmentCatalogState,
+      modelHandleCatalog
+    );
     const compressed = compressionEstimate(materialized.segments);
-    const observed = await this.findObservedPrefix(conversationId, materialized.segments, attachmentCatalog);
+    const observed = await this.findObservedPrefix(
+      conversationId,
+      materialized.segments,
+      attachmentCatalogState,
+      modelHandleCatalog
+    );
     if (observed) return observed;
     return {
       estimatedTokens: projectedTokens,
@@ -101,27 +119,40 @@ export class ReliableContextTokenEstimator {
     const full = await this.estimateRoot(rootId);
     const prefixSegments = materialized.segments.slice(0, segmentCount);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const fullCatalog = await this.attachmentCatalog.project(
+    const fullAttachmentState = await this.attachmentCatalog.projectState(
       conversationId,
       materialized.segments.map((segment) => ({
         segmentId: segment.segmentId
       }))
     );
-    const prefixCatalog = await this.attachmentCatalog.project(
+    const prefixAttachmentState = await this.attachmentCatalog.projectState(
       conversationId,
       prefixSegments.map((segment) => ({
         segmentId: segment.segmentId
       }))
     );
-    const fullProjected = estimateMaterializedContextTokens(materialized.segments, fullCatalog);
-    const prefixProjected = estimateMaterializedContextTokens(prefixSegments, prefixCatalog);
+    const modelHandleCatalog = await this.attachmentHandles.ensure(
+      conversationId,
+      fullAttachmentState.catalog
+    );
+    const fullProjected = estimateMaterializedContextTokens(
+      materialized.segments,
+      fullAttachmentState,
+      modelHandleCatalog
+    );
+    const prefixProjected = estimateMaterializedContextTokens(
+      prefixSegments,
+      prefixAttachmentState,
+      modelHandleCatalog
+    );
     return Math.max(0, full.estimatedTokens - Math.max(0, fullProjected - prefixProjected));
   }
 
   private async findObservedPrefix(
     conversationId: string,
     current: readonly MaterializedContextSegment[],
-    currentCatalog: readonly AttachmentCatalogEntry[]
+    currentAttachmentState: AttachmentCatalogState,
+    modelHandleCatalog: ModelHandleCatalog
   ): Promise<ReliableContextTokenEstimate | null> {
     const turns = (await listAllDomainRows(this.database, 'Turn', {
       conversation_id: conversationId
@@ -167,21 +198,33 @@ export class ReliableContextTokenEstimator {
         if (outputSegmentId && current[coveredSegmentCount]?.segmentId === outputSegmentId) {
           const total = providerTotalTokens(request.usage_json);
           const outputSegment = current[coveredSegmentCount];
-          const outputCatalog = await this.attachmentCatalog.project(conversationId, [{
+          const outputAttachmentState = await this.attachmentCatalog.projectState(conversationId, [{
             segmentId: outputSegment.segmentId
           }]);
-          anchoredTokens = total ?? (input + estimateMaterializedContextTokens([outputSegment], outputCatalog));
+          anchoredTokens = total ?? (input + estimateMaterializedContextTokens(
+            [outputSegment],
+            outputAttachmentState,
+            modelHandleCatalog
+          ));
           coveredSegmentCount += 1;
         }
         const coveredSegments = current.slice(0, coveredSegmentCount);
-        const coveredCatalog = await this.attachmentCatalog.project(
+        const coveredAttachmentState = await this.attachmentCatalog.projectState(
           conversationId,
           coveredSegments.map((segment) => ({
             segmentId: segment.segmentId
           }))
         );
-        const coveredProjected = estimateMaterializedContextTokens(coveredSegments, coveredCatalog);
-        const currentProjected = estimateMaterializedContextTokens(current, currentCatalog);
+        const coveredProjected = estimateMaterializedContextTokens(
+          coveredSegments,
+          coveredAttachmentState,
+          modelHandleCatalog
+        );
+        const currentProjected = estimateMaterializedContextTokens(
+          current,
+          currentAttachmentState,
+          modelHandleCatalog
+        );
         const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
         return {
           estimatedTokens: safeTokenCount(estimatedTokens, 'provider-observed Context estimate'),
@@ -225,17 +268,20 @@ export class ReliableContextTokenEstimator {
 
 export function estimateMaterializedContextTokens(
   segments: readonly MaterializedContextSegment[],
-  attachmentCatalog: readonly AttachmentCatalogEntry[] = []
+  attachmentCatalogState: AttachmentCatalogState | unknown = { catalog: [], placements: [] },
+  modelHandleCatalog: ModelHandleCatalog | unknown = { entries: [] }
 ): number {
   const projected = projectStoredModelFacingWindow(segments.map((segment) => ({
+    segmentId: segment.segmentId,
     segmentKind: segment.segmentKind,
     messageRole: segment.messageRole,
     contentType: segment.contentObject.content_type,
     content: segment.content.toString('utf8')
-  })), attachmentCatalog);
+  })), attachmentCatalogState, modelHandleCatalog);
   const compressed = compressionEstimate(segments);
   if (compressed === undefined || segments.length === 0) return projected.tokenCount;
   const projectedCompression = projectStoredModelFacingWindow([{
+    segmentId: segments[0].segmentId,
     segmentKind: segments[0].segmentKind,
     messageRole: segments[0].messageRole,
     contentType: segments[0].contentObject.content_type,

@@ -173,7 +173,7 @@ export class ContextCompressionControlPlane {
     const titleIdentity = this.contentStore.identity(title, CONTENT_TYPE_TITLE);
     const summaryIdentity = this.contentStore.identity(summary.content, summary.contentType);
     const blockId = compressionBlockIdFor(conversationId, headRootId, idempotencyKey);
-    const summarySegmentId = stableId('compression_segment', blockId);
+    const summarySegmentId = compressionSegmentIdFor(blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
     const rootId = stableId('compression_root', blockId, headRootId);
     const projectionId = stableId('compression_projection', blockId);
@@ -320,7 +320,7 @@ export class ContextCompressionControlPlane {
     const titleIdentity = this.contentStore.identity(title, CONTENT_TYPE_TITLE);
     const summaryIdentity = this.contentStore.identity(summary.content, summary.contentType);
     const blockId = stableId('compression_replacement', previousBlockId, idempotencyKey);
-    const summarySegmentId = stableId('compression_segment', blockId);
+    const summarySegmentId = compressionSegmentIdFor(blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
     const rootId = stableId('compression_root', blockId, expectedHeadRootId);
     const projectionId = stableId('compression_projection', blockId);
@@ -704,6 +704,10 @@ function stableId(kind: string, ...parts: string[]): string {
     .update(parts.join('\0'))
     .digest('hex');
   return `${kind}_${digest}`;
+}
+
+export function compressionSegmentIdFor(blockIdInput: string): string {
+  return stableId('compression_segment', requireId(blockIdInput, 'compressionBlockId'));
 }
 
 export function compressionBlockIdFor(

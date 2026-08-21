@@ -493,7 +493,8 @@ test('stored runtime_context规划与Adapter共用typed envelope和4K渲染', ()
         entries: [{ kind: 'child', ref: 'A1', target: 'bridge-planner-runtime' }]
       }
     },
-    context: [{ segmentId: 'runtime-planner-segment', ...stored }]
+    context: [{ segmentId: 'runtime-planner-segment', ...stored }],
+    attachmentCatalogState: { catalog: [], placements: [] }
   };
   const adapter = new kernel.LlmCapabilityFullRequestAdapter('runtime-planner-provider', {});
   const sent = adapter.estimateFullRequestInput(fullRequest);

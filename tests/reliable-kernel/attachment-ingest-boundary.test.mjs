@@ -5,7 +5,9 @@ import { PDFDocument } from 'pdf-lib';
 import { AttachmentIngestService } from '../../dist/extension/backend/reliableKernel/attachmentIngest.js';
 import {
   collectAttachmentCatalogFromStoredItems,
-  renderAttachmentCatalog
+  normalizeAttachmentCatalogState,
+  renderAttachmentCatalog,
+  renderAttachmentCatalogState
 } from '../../dist/extension/backend/reliableKernel/attachmentCatalog.js';
 import {
   compactReadFileToolArguments,
@@ -159,8 +161,7 @@ test('Attachment catalog keeps only lightweight immutable metadata across messag
       content: JSON.stringify({
         kind: 'compression_contents',
         version: 1,
-        contents: [{ role: 'model', parts: [{ text: 'summary' }] }],
-        attachmentCatalog: [first]
+        contents: [{ role: 'model', parts: [{ text: 'summary' }] }]
       })
     }
   ];
@@ -180,6 +181,42 @@ test('Attachment catalog keeps only lightweight immutable metadata across messag
   assert.match(text, /diagram\.png/);
   assert.doesNotMatch(text, /attachment-pdf-one|attachment-image-two/);
   assert.doesNotMatch(text, /sha256|sourcePath|private|must-not-enter-catalog|data/);
+});
+
+test('attachment catalog state rejects tail drift and unavailable placement anchors', () => {
+  const entry = {
+    attachmentId: 'attachment-state-one',
+    name: 'state.pdf',
+    mimeType: 'application/pdf',
+    sizeBytes: 42
+  };
+  const state = normalizeAttachmentCatalogState({
+    catalog: [entry],
+    placements: [{
+      kind: 'attachment_catalog_delta',
+      afterSegmentId: 'segment-state-one',
+      entries: [entry]
+    }]
+  });
+  assert.deepEqual(state.catalog, [entry]);
+  assert.throws(
+    () => normalizeAttachmentCatalogState({ catalog: [entry], placements: [] }),
+    /do not reconstruct/
+  );
+  assert.throws(
+    () => normalizeAttachmentCatalogState({
+      catalog: [entry],
+      placements: [
+        { kind: 'attachment_catalog_delta', afterSegmentId: 'segment-state-one', entries: [entry] },
+        { kind: 'attachment_catalog_delta', afterSegmentId: 'segment-state-two', entries: [entry] }
+      ]
+    }),
+    /repeats active attachment/
+  );
+  assert.throws(
+    () => renderAttachmentCatalogState(state, ['another-segment']),
+    /unavailable ContextSegment/
+  );
 });
 
 test('stored managed attachment metadata fails closed after JSON parsing', () => {

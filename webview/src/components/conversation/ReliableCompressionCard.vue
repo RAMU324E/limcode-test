@@ -223,6 +223,10 @@ function parseEnvelope(text: string): ParsedCompressionEnvelope {
     const record = asRecord(parsed);
     if (!record) return { contents: [{ role: 'user', parts: [{ text }] }] };
     const contents = normalizeContents(record.contents ?? record.resultContents ?? []);
+    const attachmentCatalogState = asRecord(record.attachmentCatalogState);
+    const attachmentCatalog = Array.isArray(attachmentCatalogState?.catalog)
+      ? attachmentCatalogState.catalog
+      : undefined;
     return {
       contents,
       ...(stringValue(record.trigger) ? { trigger: stringValue(record.trigger) } : {}),
@@ -231,7 +235,7 @@ function parseEnvelope(text: string): ParsedCompressionEnvelope {
       ...(requestBreakdownLabel(record.requestBreakdown ?? record.request_breakdown)
         ? { requestBreakdownLabel: requestBreakdownLabel(record.requestBreakdown ?? record.request_breakdown) }
         : {}),
-      ...(Array.isArray(record.attachmentCatalog) ? { attachmentCount: record.attachmentCatalog.length } : {})
+      ...(attachmentCatalog ? { attachmentCount: attachmentCatalog.length } : {})
     };
   } catch {
     return { contents: [{ role: 'user', parts: [{ text }] }] };

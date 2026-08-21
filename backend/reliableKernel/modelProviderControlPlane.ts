@@ -4,7 +4,8 @@ import type { AttachmentCatalogEntry } from '../../shared/protocol';
 import {
   collectAttachmentCatalogFromStoredItems,
   mergeAttachmentCatalog,
-  normalizeAttachmentCatalog
+  normalizeAttachmentCatalogState,
+  type AttachmentCatalogState
 } from './attachmentCatalog';
 import {
   AttachmentCatalogProjection,
@@ -102,8 +103,8 @@ export interface FullProviderRequest {
   settingsSnapshot?: PlainJsonValue;
   recipe: PlainJsonValue;
   context: FullProviderContextItem[];
-  /** Request-local relation-derived projection; never persisted in Context or compression envelopes. */
-  attachmentCatalog: AttachmentCatalogEntry[];
+  /** Frozen relation-derived model state; never persisted in Context or compression envelopes. */
+  attachmentCatalogState: AttachmentCatalogState;
   requestAddenda?: {
     currentTurnInput?: {
       messageId: string;
@@ -357,12 +358,12 @@ export class ModelProviderControlPlane {
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
-  public projectAttachmentCatalog(
+  public projectAttachmentCatalogState(
     conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[] = []
-  ): Promise<AttachmentCatalogEntry[]> {
-    return this.attachmentCatalog.project(conversationId, segments, additionalMessageRevisionIds);
+  ): Promise<AttachmentCatalogState> {
+    return this.attachmentCatalog.projectState(conversationId, segments, additionalMessageRevisionIds);
   }
 
   public ensureAttachmentHandles(
@@ -380,7 +381,7 @@ export class ModelProviderControlPlane {
     const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId === undefined
       ? null
       : requireId(command.settingsSnapshotContentObjectId, 'settingsSnapshotContentObjectId');
-    const recipe = normalizePlainJson(command.recipe, 'ModelRequest recipe');
+    const recipe = normalizeModelRequestRecipe(command.recipe, 'ModelRequest recipe');
     const recipeBytes = canonicalPlainJson(recipe, 'ModelRequest recipe');
     const recipeIdentity = this.contentStore.identity(recipeBytes, CONTENT_TYPE_RECIPE);
     const modelRequestId = modelRequestIdFor(turnId, idempotencyKey);
@@ -585,9 +586,9 @@ export class ModelProviderControlPlane {
       recipe,
       requireId(request.turn_id, 'ModelRequest.turn_id')
     );
-    const attachmentCatalog = normalizeAttachmentCatalog(
-      isRecord(recipe) ? recipe.attachmentCatalog : undefined,
-      'ModelRequest recipe.attachmentCatalog'
+    const attachmentCatalogState = normalizeAttachmentCatalogState(
+      isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
+      'ModelRequest recipe.attachmentCatalogState'
     );
     const providerContext = providerSegments.map((segment) => ({
       segmentId: segment.segmentId,
@@ -596,7 +597,7 @@ export class ModelProviderControlPlane {
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
-    assertAttachmentProjectionCoverage(attachmentCatalog, [
+    assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,
       ...(requestAddenda.requestAddenda?.currentTurnInput
         ? [{
@@ -618,7 +619,7 @@ export class ModelProviderControlPlane {
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
       context: providerContext,
-      attachmentCatalog,
+      attachmentCatalogState,
       ...requestAddenda
     };
   }
@@ -637,7 +638,7 @@ export class ModelProviderControlPlane {
     const contextRootId = requireId(command.contextRootId, 'contextRootId');
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
     const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
-    const recipe = normalizePlainJson(command.recipe, 'ModelRequest preview recipe');
+    const recipe = normalizeModelRequestRecipe(command.recipe, 'ModelRequest preview recipe');
     if (isCompressionRecipe(recipe)) throw new TypeError('Ordinary request preview cannot use a compression recipe.');
     const [frozen, materialized] = await Promise.all([
       readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId),
@@ -648,9 +649,9 @@ export class ModelProviderControlPlane {
     }
     const model = frozenModelIdentity(frozen.document);
     const requestAddenda = await this.materializeRequestAddenda(recipe, turnId);
-    const attachmentCatalog = normalizeAttachmentCatalog(
-      isRecord(recipe) ? recipe.attachmentCatalog : undefined,
-      'ModelRequest preview recipe.attachmentCatalog'
+    const attachmentCatalogState = normalizeAttachmentCatalogState(
+      isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
+      'ModelRequest preview recipe.attachmentCatalogState'
     );
     const providerContext = materialized.segments.map((segment) => ({
       segmentId: segment.segmentId,
@@ -659,7 +660,7 @@ export class ModelProviderControlPlane {
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
-    assertAttachmentProjectionCoverage(attachmentCatalog, [
+    assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,
       ...(requestAddenda.requestAddenda?.currentTurnInput
         ? [{
@@ -679,7 +680,7 @@ export class ModelProviderControlPlane {
       authoritySnapshot: frozen.document,
       recipe,
       context: providerContext,
-      attachmentCatalog,
+      attachmentCatalogState,
       ...requestAddenda
     };
   }
@@ -2486,6 +2487,21 @@ function decimalString(value: unknown, label: string): string {
     throw new TypeError(`${label} must be a decimal integer string.`);
   }
   return value;
+}
+
+function normalizeModelRequestRecipe(value: PlainJsonValue, label: string): PlainJsonValue {
+  const normalized = normalizePlainJson(value, label);
+  if (!isRecord(normalized)) throw new TypeError(`${label} must be an object.`);
+  if ('attachmentCatalog' in normalized) {
+    throw new TypeError(`${label} must use attachmentCatalogState, not attachmentCatalog.`);
+  }
+  const attachmentCatalogState = normalized.attachmentCatalogState === undefined
+    ? { catalog: [], placements: [] }
+    : normalizeAttachmentCatalogState(normalized.attachmentCatalogState, `${label}.attachmentCatalogState`);
+  return normalizePlainJson({
+    ...normalized,
+    attachmentCatalogState
+  }, label);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

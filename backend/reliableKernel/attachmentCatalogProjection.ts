@@ -1,5 +1,10 @@
 import type { AttachmentCatalogEntry } from '../../shared/protocol';
-import { mergeAttachmentCatalog } from './attachmentCatalog';
+import {
+  mergeAttachmentCatalog,
+  normalizeAttachmentCatalogState,
+  type AttachmentCatalogPlacement,
+  type AttachmentCatalogState
+} from './attachmentCatalog';
 import {
   type ContextSegmentKind,
   type ContextSourceOccurrence,
@@ -32,31 +37,41 @@ export class AttachmentCatalogProjection {
 
   public constructor(private readonly database: RuntimeDatabase) {}
 
-  public project(
+  public async project(
     conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[] = []
   ): Promise<AttachmentCatalogEntry[]> {
+    return (await this.projectState(conversationId, segments, additionalMessageRevisionIds)).catalog;
+  }
+
+  public projectState(
+    conversationId: string,
+    segments: readonly AttachmentCatalogProjectionSegment[],
+    additionalMessageRevisionIds: readonly string[] = []
+  ): Promise<AttachmentCatalogState> {
     // One worker per projection keeps caches bounded and prevents concurrent freezes from clearing or
     // mixing each other's lineage state. Late append-only AttachmentLink rows remain visible too.
-    return new AttachmentCatalogProjection(this.database).projectIsolated(
+    return new AttachmentCatalogProjection(this.database).projectStateIsolated(
       requireId(conversationId, 'conversationId'),
       segments,
       additionalMessageRevisionIds
     );
   }
 
-  private async projectIsolated(
+  private async projectStateIsolated(
     conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[]
-  ): Promise<AttachmentCatalogEntry[]> {
+  ): Promise<AttachmentCatalogState> {
     const segmentIds = segments.map((segment) => requireId(segment.segmentId, 'segmentId'));
     await this.primeSegments(segmentIds);
     await this.primeCompressionLineage(conversationId, segmentIds);
-    const revisions: string[] = [];
+    const revisionsBySegment: string[][] = [];
     for (const segmentId of segmentIds) {
+      const revisions: string[] = [];
       await this.collectSegmentRevisions(conversationId, segmentId, revisions, new Set<string>());
+      revisionsBySegment.push(revisions);
     }
     const additionalRevisionIds = additionalMessageRevisionIds.map((revisionId) =>
       requireId(revisionId, 'messageRevisionId')
@@ -66,10 +81,9 @@ export class AttachmentCatalogProjection {
       if (!this.messageRevisionBelongsToConversation(revisionId, conversationId)) {
         throw new Error(`MessageRevision ${revisionId} does not belong to Conversation ${conversationId}.`);
       }
-      revisions.push(revisionId);
     }
 
-    const uniqueRevisions = [...new Set(revisions)];
+    const uniqueRevisions = [...new Set([...revisionsBySegment.flat(), ...additionalRevisionIds])];
     await this.primeDomainRows('MessageRevision', uniqueRevisions, this.messageRevisionCache);
     for (const [segmentId] of this.sourceCache) {
       for (const source of this.scopedSources(segmentId, conversationId)) {
@@ -95,9 +109,51 @@ export class AttachmentCatalogProjection {
         requireId(link.attachment_id, 'AttachmentLink.attachment_id')
       )
     ));
-    return mergeAttachmentCatalog(...await Promise.all(
-      uniqueRevisions.map((revisionId) => this.catalogForRevision(revisionId))
+    const catalogByRevision = new Map<string, AttachmentCatalogEntry[]>();
+    for (const revisionId of uniqueRevisions) {
+      catalogByRevision.set(revisionId, await this.catalogForRevision(revisionId));
+    }
+
+    let catalog: AttachmentCatalogEntry[] = [];
+    const placements: AttachmentCatalogPlacement[] = [];
+    for (const [index, segmentId] of segmentIds.entries()) {
+      const segmentCatalog = mergeAttachmentCatalog(...revisionsBySegment[index].map((revisionId) =>
+        catalogByRevision.get(revisionId) ?? []
+      ));
+      const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
+      catalog = mergeAttachmentCatalog(catalog, segmentCatalog);
+      const segment = this.segmentCache.get(segmentId);
+      if (!segment) throw new Error(`ContextSegment ${segmentId} cache was not primed.`);
+      if (requireSegmentKind(segment.segment_kind) === 'compression') {
+        if (catalog.length > 0) {
+          placements.push({
+            kind: 'attachment_catalog_checkpoint',
+            afterSegmentId: segmentId,
+            entries: catalog
+          });
+        }
+        continue;
+      }
+      const delta = segmentCatalog.filter((entry) => !previousIds.has(entry.attachmentId));
+      if (delta.length > 0) {
+        placements.push({
+          kind: 'attachment_catalog_delta',
+          afterSegmentId: segmentId,
+          entries: delta
+        });
+      }
+    }
+
+    const additionalCatalog = mergeAttachmentCatalog(...additionalRevisionIds.map((revisionId) =>
+      catalogByRevision.get(revisionId) ?? []
     ));
+    const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
+    catalog = mergeAttachmentCatalog(catalog, additionalCatalog);
+    const currentTurnDelta = additionalCatalog.filter((entry) => !previousIds.has(entry.attachmentId));
+    if (currentTurnDelta.length > 0) {
+      placements.push({ kind: 'current_turn_delta', entries: currentTurnDelta });
+    }
+    return normalizeAttachmentCatalogState({ catalog, placements }, 'projected attachmentCatalogState');
   }
 
   private async collectSegmentRevisions(

@@ -702,18 +702,18 @@ export class ReliableAgentLoop {
     ]);
     const materialized = await this.context.materialize(input.headRootId);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const attachmentCatalog = await this.modelProvider.projectAttachmentCatalog(
+    const attachmentCatalogState = await this.modelProvider.projectAttachmentCatalogState(
       conversationId,
       materialized.segments.map((segment) => ({ segmentId: segment.segmentId })),
       currentTurnState.reference ? [currentTurnState.reference.messageRevisionId] : []
     );
     const attachmentHandles = await this.modelProvider.ensureAttachmentHandles(
       conversationId,
-      attachmentCatalog
+      attachmentCatalogState.catalog
     );
     const handleSources: unknown[] = [
       ...materialized.segments.map((segment) => Buffer.from(segment.content).toString('utf8')),
-      attachmentCatalog,
+      attachmentCatalogState.catalog,
       ...(runtimeStatusCard ? [runtimeStatusCard] : []),
       input.tools
     ];
@@ -735,10 +735,10 @@ export class ReliableAgentLoop {
       : false;
     return normalizePlainJson({
       kind: 'reliable-agent-turn',
-      projectionRevision: '2026-08-19',
+      projectionRevision: '2026-08-21',
       round: input.round,
       tools: input.tools,
-      ...(attachmentCatalog.length > 0 ? { attachmentCatalog } : {}),
+      attachmentCatalogState,
       ...(modelHandleCatalog.entries.length > 0 ? { modelHandleCatalog } : {}),
       ...(currentTurnState.reference ? { currentTurnInput: currentTurnState.reference } : {}),
       ...(turnTaskCard ? {

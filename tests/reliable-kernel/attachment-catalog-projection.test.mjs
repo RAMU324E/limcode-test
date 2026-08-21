@@ -147,11 +147,17 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
     for (let round = 0; round < 20; round += 1) {
       assert.deepEqual(await projection.project('conversation-main', segments), expected);
     }
-    const relationCatalog = await projection.project(
+    const relationCatalogState = await projection.projectState(
       'conversation-main',
       [{ segmentId: 'segment-compression-main' }]
     );
+    const relationCatalog = relationCatalogState.catalog;
     assert.deepEqual(relationCatalog, expected);
+    assert.deepEqual(relationCatalogState.placements, [{
+      kind: 'attachment_catalog_checkpoint',
+      afterSegmentId: 'segment-compression-main',
+      entries: expected
+    }]);
     const handles = kernel.buildModelHandleCatalog([relationCatalog]);
     assert.deepEqual(handles.entries, [{
       kind: 'attachment',
@@ -175,7 +181,7 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
       })
     };
     loop.modelProvider = {
-      projectAttachmentCatalog: async () => relationCatalog,
+      projectAttachmentCatalogState: async () => relationCatalogState,
       ensureAttachmentHandles: async () => ({ entries: handles.entries })
     };
     loop.readCurrentTurnInputReference = async () => ({});
@@ -187,7 +193,7 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
       tools: [],
       includeOpenTaskCompletionCheck: false
     });
-    assert.deepEqual(frozenRecipe.attachmentCatalog, expected);
+    assert.deepEqual(frozenRecipe.attachmentCatalogState, relationCatalogState);
     assert.deepEqual(frozenRecipe.modelHandleCatalog.entries, handles.entries);
     assert.ok(
       projectionSnapshotCalls <= 120,
@@ -222,12 +228,36 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
         created_at: NOW
       })
     ]);
-    assert.deepEqual(await projection.project('conversation-main', [{ segmentId: 'segment-1' }]), [{
+    const lateAttachment = {
       attachmentId: 'attachment-late-link',
       name: 'late.txt',
       mimeType: 'text/plain',
       sizeBytes: 12
-    }]);
+    };
+    assert.deepEqual(await projection.project('conversation-main', [{ segmentId: 'segment-1' }]), [
+      lateAttachment
+    ]);
+    assert.deepEqual(await projection.projectState('conversation-main', [
+      { segmentId: 'segment-0' },
+      { segmentId: 'segment-1' }
+    ]), {
+      catalog: [...expected, lateAttachment],
+      placements: [
+        { kind: 'attachment_catalog_delta', afterSegmentId: 'segment-0', entries: expected },
+        { kind: 'attachment_catalog_delta', afterSegmentId: 'segment-1', entries: [lateAttachment] }
+      ]
+    });
+    assert.deepEqual(await projection.projectState(
+      'conversation-main',
+      [{ segmentId: 'segment-0' }],
+      ['revision-1']
+    ), {
+      catalog: [...expected, lateAttachment],
+      placements: [
+        { kind: 'attachment_catalog_delta', afterSegmentId: 'segment-0', entries: expected },
+        { kind: 'current_turn_delta', entries: [lateAttachment] }
+      ]
+    });
 
     const [attachments, links, compressionSources] = await Promise.all([
       database.snapshotAll(repository('Attachment').list({ orderBy: { column: 'id', direction: 'asc' }, limit: 100 })),

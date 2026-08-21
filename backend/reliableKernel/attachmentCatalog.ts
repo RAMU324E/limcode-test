@@ -19,6 +19,34 @@ export interface AttachmentCatalogStoredItem {
   contentType?: string;
 }
 
+export type AttachmentCatalogPlacement =
+  | {
+      kind: 'attachment_catalog_delta';
+      afterSegmentId: string;
+      entries: AttachmentCatalogEntry[];
+    }
+  | {
+      kind: 'attachment_catalog_checkpoint';
+      afterSegmentId: string;
+      entries: AttachmentCatalogEntry[];
+    }
+  | {
+      kind: 'current_turn_delta';
+      entries: AttachmentCatalogEntry[];
+    };
+
+/** Frozen model-only state. Catalog is the complete visible set; placements define exact delivery order. */
+export interface AttachmentCatalogState {
+  catalog: AttachmentCatalogEntry[];
+  placements: AttachmentCatalogPlacement[];
+}
+
+export interface RenderedAttachmentCatalogState {
+  catalog: AttachmentCatalogEntry[];
+  afterSegment: ReadonlyMap<string, MessageContent>;
+  currentTurn?: MessageContent;
+}
+
 /**
  * Collects immutable managed attachment references from durable JSON envelopes. Attachment bytes,
  * hashes and local paths are deliberately excluded from the resulting directory.
@@ -80,12 +108,198 @@ export function normalizeAttachmentCatalog(
   return mergeAttachmentCatalog(value.map((entry, index) => normalizeEntry(entry, `${label}[${index}]`)));
 }
 
+export function normalizeAttachmentCatalogState(
+  value: unknown,
+  label = 'attachmentCatalogState'
+): AttachmentCatalogState {
+  const record = asRecord(value);
+  if (!record) throw new TypeError(`${label} must be an object.`);
+  const catalog = normalizeAttachmentCatalog(record.catalog, `${label}.catalog`);
+  if (!Array.isArray(record.placements)) throw new TypeError(`${label}.placements must be an array.`);
+  const catalogById = new Map(catalog.map((entry) => [entry.attachmentId, entry]));
+  const active = new Map<string, AttachmentCatalogEntry>();
+  const firstAppearance: string[] = [];
+  const segmentAnchors = new Set<string>();
+  let currentTurnSeen = false;
+  const placements = record.placements.map((value, index): AttachmentCatalogPlacement => {
+    const placement = asRecord(value);
+    if (!placement) throw new TypeError(`${label}.placements[${index}] must be an object.`);
+    const kind = placement.kind;
+    if (kind !== 'attachment_catalog_delta'
+      && kind !== 'attachment_catalog_checkpoint'
+      && kind !== 'current_turn_delta') {
+      throw new TypeError(`${label}.placements[${index}].kind is unsupported.`);
+    }
+    if (currentTurnSeen) throw new Error(`${label}.current_turn_delta must be the final placement.`);
+    const entries = normalizeAttachmentCatalog(
+      placement.entries,
+      `${label}.placements[${index}].entries`
+    );
+    if (entries.length === 0) throw new Error(`${label}.placements[${index}] must not be empty.`);
+    for (const entry of entries) {
+      const catalogEntry = catalogById.get(entry.attachmentId);
+      if (!catalogEntry || !sameEntry(catalogEntry, entry)) {
+        throw new Error(`${label}.placements[${index}] conflicts with catalog entry ${entry.attachmentId}.`);
+      }
+    }
+
+    if (kind === 'attachment_catalog_checkpoint') {
+      for (const attachmentId of active.keys()) {
+        if (!entries.some((entry) => entry.attachmentId === attachmentId)) {
+          throw new Error(`${label}.placements[${index}] checkpoint drops active attachment ${attachmentId}.`);
+        }
+      }
+      for (const entry of entries) {
+        if (!active.has(entry.attachmentId)) firstAppearance.push(entry.attachmentId);
+      }
+      active.clear();
+      for (const entry of entries) active.set(entry.attachmentId, entry);
+    } else {
+      for (const entry of entries) {
+        if (active.has(entry.attachmentId)) {
+          throw new Error(`${label}.placements[${index}] delta repeats active attachment ${entry.attachmentId}.`);
+        }
+        active.set(entry.attachmentId, entry);
+        firstAppearance.push(entry.attachmentId);
+      }
+    }
+
+    if (kind === 'current_turn_delta') {
+      currentTurnSeen = true;
+      return { kind, entries };
+    }
+    const afterSegmentId = requireText(
+      placement.afterSegmentId,
+      `${label}.placements[${index}].afterSegmentId`
+    );
+    if (segmentAnchors.has(afterSegmentId)) {
+      throw new Error(`${label} has multiple placements after ContextSegment ${afterSegmentId}.`);
+    }
+    segmentAnchors.add(afterSegmentId);
+    return { kind, afterSegmentId, entries };
+  });
+
+  if (active.size !== catalog.length
+    || catalog.some((entry) => !active.has(entry.attachmentId))
+    || firstAppearance.some((attachmentId, index) => catalog[index]?.attachmentId !== attachmentId)) {
+    throw new Error(`${label} placements do not reconstruct the catalog in first-visible order.`);
+  }
+  return { catalog, placements };
+}
+
+/**
+ * Renders and binds every frozen placement to an exact model-window anchor. Unknown or missing
+ * anchors fail closed so a catalog can never silently drift to the request tail.
+ */
+export function renderAttachmentCatalogState(
+  stateInput: AttachmentCatalogState | unknown,
+  availableSegmentIds: readonly string[],
+  referenceFor?: (entry: AttachmentCatalogEntry, index: number) => string | undefined,
+  options: { allowCurrentTurnDelta?: boolean } = {}
+): RenderedAttachmentCatalogState {
+  const state = normalizeAttachmentCatalogState(stateInput);
+  const available = new Set(availableSegmentIds.map((segmentId, index) =>
+    requireText(segmentId, `availableSegmentIds[${index}]`)
+  ));
+  const afterSegment = new Map<string, MessageContent>();
+  let currentTurn: MessageContent | undefined;
+  for (const placement of state.placements) {
+    const rendered = renderAttachmentCatalogPlacement(placement, referenceFor);
+    if (placement.kind === 'current_turn_delta') {
+      if (!options.allowCurrentTurnDelta) {
+        throw new Error('Attachment catalog current_turn_delta has no current Turn input anchor.');
+      }
+      currentTurn = rendered;
+      continue;
+    }
+    if (!available.has(placement.afterSegmentId)) {
+      throw new Error(`Attachment catalog placement references unavailable ContextSegment ${placement.afterSegmentId}.`);
+    }
+    afterSegment.set(placement.afterSegmentId, rendered);
+  }
+  return {
+    catalog: state.catalog,
+    afterSegment,
+    ...(currentTurn ? { currentTurn } : {})
+  };
+}
+
+export function selectAttachmentCatalogStateSegments(
+  stateInput: AttachmentCatalogState | unknown,
+  segmentIds: readonly string[]
+): AttachmentCatalogState {
+  const state = normalizeAttachmentCatalogState(stateInput);
+  const selectedIds = new Set(segmentIds.map((segmentId, index) =>
+    requireText(segmentId, `segmentIds[${index}]`)
+  ));
+  const placements = state.placements.filter((placement) =>
+    placement.kind !== 'current_turn_delta' && selectedIds.has(placement.afterSegmentId)
+  );
+  return normalizeAttachmentCatalogState({
+    catalog: mergeAttachmentCatalog(...placements.map((placement) => placement.entries)),
+    placements
+  });
+}
+
+/** Rebases a tail state behind a new compression checkpoint for exact post-compression planning. */
+export function rebaseAttachmentCatalogState(
+  checkpointSegmentIdInput: string,
+  checkpointCatalogInput: readonly AttachmentCatalogEntry[],
+  tailStateInput: AttachmentCatalogState | unknown
+): AttachmentCatalogState {
+  const checkpointSegmentId = requireText(checkpointSegmentIdInput, 'checkpointSegmentId');
+  const checkpointCatalog = mergeAttachmentCatalog(checkpointCatalogInput);
+  const tailState = normalizeAttachmentCatalogState(tailStateInput, 'tailAttachmentCatalogState');
+  const active = new Map(checkpointCatalog.map((entry) => [entry.attachmentId, entry]));
+  const placements: AttachmentCatalogPlacement[] = checkpointCatalog.length > 0
+    ? [{
+        kind: 'attachment_catalog_checkpoint',
+        afterSegmentId: checkpointSegmentId,
+        entries: checkpointCatalog
+      }]
+    : [];
+  for (const placement of tailState.placements) {
+    if (placement.kind === 'attachment_catalog_checkpoint') {
+      const entries = mergeAttachmentCatalog([...active.values()], placement.entries);
+      active.clear();
+      for (const entry of entries) active.set(entry.attachmentId, entry);
+      placements.push({ ...placement, entries });
+      continue;
+    }
+    const entries = placement.entries.filter((entry) => !active.has(entry.attachmentId));
+    for (const entry of entries) active.set(entry.attachmentId, entry);
+    if (entries.length > 0) placements.push({ ...placement, entries });
+  }
+  return normalizeAttachmentCatalogState({
+    catalog: mergeAttachmentCatalog(checkpointCatalog, tailState.catalog),
+    placements
+  });
+}
+
 export function renderAttachmentCatalog(
   catalog: readonly AttachmentCatalogEntry[],
   referenceFor?: (entry: AttachmentCatalogEntry, index: number) => string | undefined
 ): MessageContent | undefined {
   const normalized = mergeAttachmentCatalog(catalog);
-  if (normalized.length === 0) return undefined;
+  return normalized.length > 0
+    ? renderAttachmentCatalogEntries('attachment_catalog_checkpoint', normalized, referenceFor)
+    : undefined;
+}
+
+export function renderAttachmentCatalogPlacement(
+  placement: AttachmentCatalogPlacement,
+  referenceFor?: (entry: AttachmentCatalogEntry, index: number) => string | undefined
+): MessageContent {
+  return renderAttachmentCatalogEntries(placement.kind, placement.entries, referenceFor);
+}
+
+function renderAttachmentCatalogEntries(
+  kind: AttachmentCatalogPlacement['kind'],
+  catalog: readonly AttachmentCatalogEntry[],
+  referenceFor?: (entry: AttachmentCatalogEntry, index: number) => string | undefined
+): MessageContent {
+  const normalized = mergeAttachmentCatalog(catalog);
+  if (normalized.length === 0) throw new Error('Attachment catalog state placement must not be empty.');
   const rows = normalized.map((entry, index) => JSON.stringify({
     attachmentRef: referenceFor?.(entry, index) ?? `F${index + 1}`,
     name: entry.name,
@@ -94,16 +308,32 @@ export function renderAttachmentCatalog(
   }));
   const includesPagedAttachment = normalized.some((entry) =>
     entry.mimeType === 'text/plain' || entry.mimeType === 'application/pdf');
+  const stateGuidance = kind === 'attachment_catalog_checkpoint'
+    ? '这是附件目录检查点：它替换此前目录状态。'
+    : '这是附件目录增量：把下列条目加入当前目录状态。';
   return {
+    // MessageContent currently exposes only user/model roles. This explicit system-reminder envelope
+    // is rendered only at the Provider boundary and is never persisted as Conversation user prose.
     role: 'user',
     parts: [{
       text: [
+        '<system-reminder>',
         ATTACHMENT_CATALOG_HEADER,
+        `状态类型：${kind}`,
+        stateGuidance,
         ...(includesPagedAttachment ? [ATTACHMENT_PAGE_RANGE_GUIDANCE] : []),
-        ...rows
+        ...rows,
+        '</system-reminder>'
       ].join('\n')
     }]
   };
+}
+
+function sameEntry(left: AttachmentCatalogEntry, right: AttachmentCatalogEntry): boolean {
+  return left.attachmentId === right.attachmentId
+    && left.name === right.name
+    && left.mimeType === right.mimeType
+    && left.sizeBytes === right.sizeBytes;
 }
 
 function collect(value: unknown, entries: AttachmentCatalogEntry[], seen: Set<object>): void {
@@ -122,13 +352,10 @@ function collect(value: unknown, entries: AttachmentCatalogEntry[], seen: Set<ob
     const entry = optionalInlineDataEntry(inlineData);
     if (entry) entries.push(entry);
   }
-  if (record.kind === 'compression_contents' && record.attachmentCatalog !== undefined) {
-    entries.push(...normalizeAttachmentCatalog(record.attachmentCatalog));
-  }
   for (const [key, child] of Object.entries(record)) {
     // Base64 bodies and provider-native ciphertext can be enormous and can never contain directory
     // structure. Skipping them also guarantees catalog collection is independent of payload size.
-    if (key === 'data' || key === 'encryptedContent' || key === 'attachmentCatalog') continue;
+    if (key === 'data' || key === 'encryptedContent') continue;
     if (key === 'result' && typeof child === 'string') {
       collectNestedJson(child, entries, seen);
       continue;

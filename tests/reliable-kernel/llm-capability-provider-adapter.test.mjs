@@ -42,7 +42,8 @@ function request() {
       segmentId: 'segment-user', segmentKind: 'message', messageRole: 'user',
       contentType: 'application/vnd.limcode.message+json',
       content: JSON.stringify({ role: 'user', parts: [{ text: 'hello' }] })
-    }]
+    }],
+    attachmentCatalogState: { catalog: [], placements: [] }
   };
 }
 
@@ -957,12 +958,26 @@ test('普通请求的当前原文与 Turn 提醒按冻结 addenda 发送且计�
     role: 'user',
     parts: frozenOriginalParts
   });
-  reinjected.attachmentCatalog = [{
+  const currentAttachment = {
     attachmentId: 'attachment-current-turn',
     mimeType: 'image/png',
     name: 'current-turn.png',
     sizeBytes: 12
-  }];
+  };
+  reinjected.attachmentCatalogState = {
+    catalog: [currentAttachment],
+    placements: [{ kind: 'current_turn_delta', entries: [currentAttachment] }]
+  };
+  reinjected.recipe.modelHandleCatalog = {
+    entries: [{
+      kind: 'attachment',
+      ref: 'F1',
+      target: currentAttachment.attachmentId,
+      name: currentAttachment.name,
+      mimeType: currentAttachment.mimeType,
+      sizeBytes: currentAttachment.sizeBytes
+    }]
+  };
   const reinjectedEstimate = adapter.estimateFullRequestInput(reinjected);
   captures.length = 0;
   await adapter.sendFullRequest(reinjected, {
@@ -976,14 +991,13 @@ test('普通请求的当前原文与 Turn 提醒按冻结 addenda 发送且计�
     reinjectedCurrent.parts[0].text,
     '[当前 Turn 原始用户要求/数据，不是新用户输入；以下各 part 为冻结原文。]'
   );
-  assert.deepEqual(reinjectedCurrent.parts.slice(1), frozenOriginalParts);
-  const currentCatalog = captures[0].contents.find((content) =>
-    content.parts.some((part) => part.text?.includes('LimCode 托管附件目录'))
-  );
-  assert.ok(currentCatalog, '回注多模态当前输入前必须提供轻量附件目录');
-  assert.match(currentCatalog.parts[0].text, /"attachmentRef":"F1"/);
-  assert.doesNotMatch(currentCatalog.parts[0].text, /attachment-current-turn/);
-  assert.doesNotMatch(currentCatalog.parts[0].text, /sha256|sourcePath|inlineData/);
+  assert.deepEqual(reinjectedCurrent.parts.slice(1, 1 + frozenOriginalParts.length), frozenOriginalParts);
+  const currentCatalogPart = reinjectedCurrent.parts.at(-1);
+  assert.match(currentCatalogPart.text, /LimCode 托管附件目录/);
+  assert.match(currentCatalogPart.text, /状态类型：current_turn_delta/);
+  assert.match(currentCatalogPart.text, /"attachmentRef":"F1"/);
+  assert.doesNotMatch(currentCatalogPart.text, /attachment-current-turn/);
+  assert.doesNotMatch(currentCatalogPart.text, /sha256|sourcePath|inlineData/);
   assert.equal(captures[0].contents.at(-1).parts[0].text, '[Current Turn Task Card]\nunfinished=2');
   assert.deepEqual(captures[1], captures[0], '回注标签、原始文本和多模态 parts 在 retry 时必须字节稳定');
   assert.ok(reinjectedEstimate.currentInputTokens > 0);
@@ -1284,7 +1298,8 @@ test('Agent loop Provider wrapper 保留初始预算使用的精确估算器', a
     kind: 'full-model-request', modelRequestId: 'request-forward-estimator',
     conversationId: 'conversation-forward-estimator', attemptSeq: '1', socketGeneration: '1',
     providerId: 'provider-forward-estimator', modelId: 'model-forward-estimator',
-    authoritySnapshot: {}, recipe: {}, context: []
+    authoritySnapshot: {}, recipe: {}, context: [],
+    attachmentCatalogState: { catalog: [], placements: [] }
   };
   let estimateCalls = 0;
   const providerAdapter = {
@@ -1901,7 +1916,7 @@ test('冻结模型配置完整覆盖模型级字段并关闭 capability 内部�
   assert.throws(() => kernel.applyFrozenModelProviderConfig(base, 'unknown-model'), /does not contain/);
 });
 
-test('LLM capability adapter renders one relation-derived catalog only for ordinary requests', async () => {
+test('LLM capability adapter interleaves typed attachment catalog checkpoint and deltas', async () => {
   const sourceAttachment = {
     attachmentId: 'attachment-source-pdf',
     name: 'source.pdf',
@@ -1922,8 +1937,7 @@ test('LLM capability adapter renders one relation-derived catalog only for ordin
     content: JSON.stringify({
       kind: 'compression_contents',
       version: 1,
-      contents: [{ role: 'model', parts: [{ text: 'canonical compact state' }] }],
-      attachmentCatalog: [sourceAttachment]
+      contents: [{ role: 'model', parts: [{ text: 'canonical compact state' }] }]
     })
   };
   const tail = {
@@ -1953,7 +1967,27 @@ test('LLM capability adapter renders one relation-derived catalog only for ordin
     parameters: { type: 'object', properties: { path: { type: 'string' }, attachmentId: { type: 'string' } } }
   }];
   ordinaryRequest.context = [compressed, tail];
-  ordinaryRequest.attachmentCatalog = [sourceAttachment, tailAttachment];
+  ordinaryRequest.attachmentCatalogState = {
+    catalog: [sourceAttachment, tailAttachment],
+    placements: [
+      {
+        kind: 'attachment_catalog_checkpoint',
+        afterSegmentId: compressed.segmentId,
+        entries: [sourceAttachment]
+      },
+      {
+        kind: 'attachment_catalog_delta',
+        afterSegmentId: tail.segmentId,
+        entries: [tailAttachment]
+      }
+    ]
+  };
+  ordinaryRequest.recipe.modelHandleCatalog = {
+    entries: [
+      attachmentHandle('F1', sourceAttachment),
+      attachmentHandle('F2', tailAttachment)
+    ]
+  };
   const ordinaryEvents = [];
   const ordinaryAdapter = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
@@ -1988,8 +2022,14 @@ test('LLM capability adapter renders one relation-derived catalog only for ordin
     });
   }
   assert.equal(ordinaryRounds.length, 20);
-  ordinaryRounds.forEach((round) => assertCatalog(round.contents, sourceAttachment, tailAttachment));
-  assertCatalog(ordinary.contents, sourceAttachment, tailAttachment);
+  ordinaryRounds.forEach((round) => assertCatalogStates(round.contents, [
+    { kind: 'attachment_catalog_checkpoint', ref: 'F1', entry: sourceAttachment },
+    { kind: 'attachment_catalog_delta', ref: 'F2', entry: tailAttachment }
+  ]));
+  assertCatalogStates(ordinary.contents, [
+    { kind: 'attachment_catalog_checkpoint', ref: 'F1', entry: sourceAttachment },
+    { kind: 'attachment_catalog_delta', ref: 'F2', entry: tailAttachment }
+  ]);
   assert.ok(ordinary.tools[0].parameters.properties.attachmentRef);
   assert.equal(ordinary.tools[0].parameters.properties.attachmentId, undefined);
   assert.ok(ordinary.tools[0].parameters.properties.pages);
@@ -2005,7 +2045,17 @@ test('LLM capability adapter renders one relation-derived catalog only for ordin
   imageOnlyRequest.authoritySnapshot.toolPolicy.allowedTools = ['read'];
   imageOnlyRequest.recipe.tools = ordinaryRequest.recipe.tools;
   imageOnlyRequest.context = [tail];
-  imageOnlyRequest.attachmentCatalog = [tailAttachment];
+  imageOnlyRequest.attachmentCatalogState = {
+    catalog: [tailAttachment],
+    placements: [{
+      kind: 'attachment_catalog_delta',
+      afterSegmentId: tail.segmentId,
+      entries: [tailAttachment]
+    }]
+  };
+  imageOnlyRequest.recipe.modelHandleCatalog = {
+    entries: [attachmentHandle('F2', tailAttachment)]
+  };
   const imageOnlyAdapter = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
     fakeCapability((llmRequest, emit) => {
@@ -2020,6 +2070,9 @@ test('LLM capability adapter renders one relation-derived catalog only for ordin
   assert.equal(imageOnly.tools[0].parameters.properties.attachmentId, undefined);
   assert.equal(imageOnly.tools[0].parameters.properties.pages, undefined);
   assert.doesNotMatch(imageOnly.tools[0].description, /nextPages/);
+  assertCatalogStates(imageOnly.contents, [
+    { kind: 'attachment_catalog_delta', ref: 'F2', entry: tailAttachment }
+  ]);
   const imageCatalogText = imageOnly.contents.flatMap((content) => content.parts)
     .map((part) => part.text ?? '')
     .find((text) => text.includes('LimCode 托管附件目录'));
@@ -2028,7 +2081,8 @@ test('LLM capability adapter renders one relation-derived catalog only for ordin
 
   let native;
   const nativeRequest = compressionRequest('openai_responses_compact', [compressed, tail]);
-  nativeRequest.attachmentCatalog = [sourceAttachment, tailAttachment];
+  nativeRequest.attachmentCatalogState = structuredClone(ordinaryRequest.attachmentCatalogState);
+  nativeRequest.recipe.modelHandleCatalog = structuredClone(ordinaryRequest.recipe.modelHandleCatalog);
   const nativeAdapter = new kernel.LlmCapabilityFullRequestAdapter(
     'compression-provider',
     compressionCapability((compactRequest) => { native = compactRequest; })
@@ -2036,29 +2090,44 @@ test('LLM capability adapter renders one relation-derived catalog only for ordin
   await nativeAdapter.sendFullRequest(nativeRequest, {
     onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
   });
-  assert.equal(
-    native.contents.filter((content) => content.parts.some((part) => part.text?.includes('LimCode 托管附件目录'))).length,
-    0,
-    'compression provider source must not receive a rendered request-local catalog'
-  );
-  assert.equal(JSON.stringify(native).includes('attachmentCatalog'), false);
+  assertCatalogStates(native.contents, [
+    { kind: 'attachment_catalog_checkpoint', ref: 'F1', entry: sourceAttachment },
+    { kind: 'attachment_catalog_delta', ref: 'F2', entry: tailAttachment }
+  ]);
+  assert.equal(JSON.stringify(native).includes('attachmentCatalogState'), false);
 });
 
-function assertCatalog(contents, ...entries) {
+function attachmentHandle(ref, entry) {
+  return {
+    kind: 'attachment',
+    ref,
+    target: entry.attachmentId,
+    name: entry.name,
+    mimeType: entry.mimeType,
+    sizeBytes: entry.sizeBytes
+  };
+}
+
+function assertCatalogStates(contents, expected) {
   const catalogContents = contents.filter((content) =>
     content.parts.some((part) => typeof part.text === 'string' && part.text.includes('LimCode 托管附件目录'))
   );
-  assert.equal(catalogContents.length, 1);
-  const catalogText = catalogContents[0].parts.map((part) => part.text ?? '').join('\n');
-  entries.forEach((entry, index) => {
-    assert.match(catalogText, new RegExp(`\\"attachmentRef\\":\\"F${index + 1}\\"`));
-    assert.match(catalogText, new RegExp(entry.name.replace('.', '\\.')));
-    assert.doesNotMatch(catalogText, new RegExp(entry.attachmentId));
+  assert.equal(catalogContents.length, expected.length);
+  catalogContents.forEach((content, index) => {
+    const catalogText = content.parts.map((part) => part.text ?? '').join('\n');
+    const current = expected[index];
+    assert.match(catalogText, new RegExp(`状态类型：${current.kind}`));
+    assert.match(catalogText, new RegExp(`\\"attachmentRef\\":\\"${current.ref}\\"`));
+    assert.match(catalogText, new RegExp(current.entry.name.replace('.', '\\.')));
+    assert.doesNotMatch(catalogText, new RegExp(current.entry.attachmentId));
+    assert.doesNotMatch(catalogText, /"mode":"attachment"|sha256|sourcePath|private|inlineData|data/);
   });
-  assert.match(catalogText, /\{"attachmentRef":"F1","name":"source\.pdf","mimeType":"application\/pdf","sizeBytes":45678\}/);
-  assert.match(catalogText, /\{"attachmentRef":"F1","pages":"1-4"\}/);
-  assert.match(catalogText, /"pages":"1-4"/);
-  assert.match(catalogText, /nextPages/);
-  assert.doesNotMatch(catalogText, /"mode":"attachment"/);
-  assert.doesNotMatch(catalogText, /sha256|sourcePath|private|inlineData|data/);
+  const checkpointText = catalogContents.find((content) =>
+    content.parts.some((part) => part.text?.includes('attachment_catalog_checkpoint'))
+  )?.parts.map((part) => part.text ?? '').join('\n') ?? '';
+  if (checkpointText) {
+    assert.match(checkpointText, /\{"attachmentRef":"F1","name":"source\.pdf","mimeType":"application\/pdf","sizeBytes":45678\}/);
+    assert.match(checkpointText, /"pages":"1-4"/);
+    assert.match(checkpointText, /nextPages/);
+  }
 }

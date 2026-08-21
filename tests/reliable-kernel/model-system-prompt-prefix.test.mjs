@@ -58,7 +58,8 @@ test('可靠请求只使用 AuthoritySnapshot 中冻结的前置提示词，并�
       messageRole: 'user',
       contentType: 'application/vnd.limcode.message+json',
       content: JSON.stringify({ role: 'user', parts: [{ text: 'hello' }] })
-    }]
+    }],
+    attachmentCatalogState: { catalog: [], placements: [] }
   };
   let captured;
   const capability = {

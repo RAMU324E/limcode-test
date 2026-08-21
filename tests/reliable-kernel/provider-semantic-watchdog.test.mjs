@@ -966,7 +966,8 @@ test('transient failures 达到冻结上限后才终止，408/425/429/5xx 均可
         model: { provider: 'openai-responses' },
         toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} }
       },
-      recipe: { tools: [] }, context: []
+      recipe: { tools: [] }, context: [],
+      attachmentCatalogState: { catalog: [], placements: [] }
     }, { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
   }
   for (const status of [408, 425, 429, 500, 503]) {
@@ -1206,7 +1207,8 @@ test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted
         model: { provider: 'openai-responses' },
         toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} }
       },
-      recipe: { tools: [] }, context: []
+      recipe: { tools: [] }, context: [],
+      attachmentCatalogState: { catalog: [], placements: [] }
     }, { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
   }
 

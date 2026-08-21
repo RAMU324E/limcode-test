@@ -11,8 +11,8 @@ import {
   type ModelOutputItemReference
 } from '../../shared/protocol';
 import {
-  normalizeAttachmentCatalog,
-  renderAttachmentCatalog
+  normalizeAttachmentCatalogState,
+  renderAttachmentCatalogState
 } from './attachmentCatalog';
 import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import {
@@ -512,13 +512,30 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   if (runtimeContextText) systemParts.push(runtimeContextText);
   const contents: MessageContent[] = [];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
+  const currentTurnInput = request.requestAddenda?.currentTurnInput;
+  const attachmentCatalogState = normalizeAttachmentCatalogState(
+    request.attachmentCatalogState,
+    'Provider request attachmentCatalogState'
+  );
+  const renderedAttachmentState = renderAttachmentCatalogState(
+    attachmentCatalogState,
+    request.context.map((item) => item.segmentId),
+    (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId),
+    { allowCurrentTurnDelta: currentTurnInput?.reinject === true }
+  );
+  const appendAttachmentState = (segmentId: string): void => {
+    const placement = renderedAttachmentState.afterSegment.get(segmentId);
+    if (placement) contents.push(placement);
+  };
   for (const item of request.context) {
     if (item.segmentKind === 'system') {
       systemParts.push(contextText(item.content, item.contentType));
+      appendAttachmentState(item.segmentId);
       continue;
     }
     if (item.segmentKind === 'tool_pair') {
       contents.push(...toolPairContents(item.content, modelHandleCatalog));
+      appendAttachmentState(item.segmentId);
       continue;
     }
     const compressed = decodeCompressionContents(item.content, item.contentType);
@@ -531,29 +548,26 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       const start = contents.length;
       contents.push(...compressed.contents);
       canonicalCompressionRanges.push({ start, end: contents.length });
+      appendAttachmentState(item.segmentId);
       continue;
     }
     if (item.segmentKind === 'runtime_context') {
       contents.push(runtimeContextContent(item.content, item.contentType, modelHandleCatalog));
+      appendAttachmentState(item.segmentId);
       continue;
     }
     const decoded = decodeMessageContent(item.content, item.contentType);
     if (decoded) {
       contents.push(decoded);
+      appendAttachmentState(item.segmentId);
       continue;
     }
     const role = item.messageRole === 'model' ? 'model' : 'user';
     contents.push({ role, parts: [{ text: item.content }] });
+    appendAttachmentState(item.segmentId);
   }
-  const currentTurnInput = request.requestAddenda?.currentTurnInput;
-  const attachmentCatalog = normalizeAttachmentCatalog(request.attachmentCatalog, 'Provider request attachmentCatalog');
-  const attachmentCatalogContent = renderAttachmentCatalog(
-    attachmentCatalog,
-    (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
-  );
-  if (attachmentCatalogContent) contents.push(attachmentCatalogContent);
   const tools = modelFacingToolsForHandleCatalog(
-    readToolsForAttachmentCatalog(availableTools, attachmentCatalog),
+    readToolsForAttachmentCatalog(availableTools, attachmentCatalogState.catalog),
     modelHandleCatalog
   );
   if (currentTurnInput?.reinject) {
@@ -561,7 +575,11 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     if (!current || current.role !== 'user') {
       throw new TypeError('Frozen current Turn input must be a user MessageContent.');
     }
-    contents.push(reinjectedCurrentTurnInput(current));
+    const reinjected = reinjectedCurrentTurnInput(current);
+    if (renderedAttachmentState.currentTurn) {
+      reinjected.parts.push(...renderedAttachmentState.currentTurn.parts);
+    }
+    contents.push(reinjected);
   }
   const turnReminder = request.requestAddenda?.turnReminder;
   if (turnReminder) {
@@ -595,6 +613,12 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     openAIResponsesContinuation: { volatileTailContentKinds },
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
   };
+}
+
+function requireAttachmentHandle(catalog: ModelHandleCatalog, attachmentId: string): string {
+  const ref = modelHandleRef(catalog, 'attachment', attachmentId);
+  if (!ref) throw new Error(`Attachment ${attachmentId} has no frozen model handle.`);
+  return ref;
 }
 
 function reinjectedCurrentTurnInput(current: MessageContent): MessageContent {
@@ -745,7 +769,14 @@ function compressionContext(
     0,
     typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length
   );
+  const attachmentCatalogState = normalizeAttachmentCatalogState(
+    request.attachmentCatalogState,
+    'Compression request attachmentCatalogState'
+  );
   const seededHandleCatalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+  for (const entry of attachmentCatalogState.catalog) {
+    requireAttachmentHandle(seededHandleCatalog, entry.attachmentId);
+  }
   const modelHandleCatalog = buildModelHandleCatalog(
     sourceContext.map((item) => item.content),
     seededHandleCatalog.entries
@@ -761,6 +792,11 @@ function compressionContext(
   if (request.context[requestedCount as number]?.segmentKind === 'tool_pair') {
     throw new Error('Compression recipe splits an assistant function call from its tool_pair response.');
   }
+  const renderedAttachmentState = renderAttachmentCatalogState(
+    attachmentCatalogState,
+    sourceContext.map((item) => item.segmentId),
+    (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId)
+  );
   for (const item of sourceContext) {
     let decoded: MessageContent[];
     if (item.segmentKind === 'tool_pair') decoded = toolPairContents(item.content, modelHandleCatalog);
@@ -781,9 +817,11 @@ function compressionContext(
         }];
       }
     }
+    const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
     if (item.segmentKind === 'compression' && contents.length === 0
       && methodKind !== 'openai_responses_compact') {
       priorSummaryContents.push(...decoded);
+      if (attachmentStateContent) priorSummaryContents.push(attachmentStateContent);
       continue;
     }
     const protectedStart = contents.length;
@@ -798,9 +836,11 @@ function compressionContext(
     if (item.segmentKind === 'compression' && methodKind === 'openai_responses_compact') {
       canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
     }
+    if (attachmentStateContent) {
+      current.push(attachmentStateContent);
+      contents.push(attachmentStateContent);
+    }
   }
-  // Attachment directories are ordinary request-local projections. Summary/Compact providers receive
-  // only frozen source contents; the resulting compression segment keeps lineage, not a catalog copy.
   flush();
   if (methodKind === 'openai_responses_compact') {
     return {

@@ -1,10 +1,13 @@
-import { renderAttachmentCatalog } from './attachmentCatalog';
+import {
+  normalizeAttachmentCatalogState,
+  renderAttachmentCatalogState,
+  type AttachmentCatalogState
+} from './attachmentCatalog';
 import { createHash } from 'node:crypto';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
-  type AttachmentCatalogEntry,
   type ContentPart,
   type InlineDataPart,
   type MessageContent
@@ -18,6 +21,7 @@ import {
 import {
   buildModelHandleCatalog,
   modelHandleRef,
+  normalizeModelHandleCatalog,
   projectToolResultForModel,
   type ModelHandleCatalog
 } from './modelHandleCatalog';
@@ -498,6 +502,7 @@ export interface ModelWindowProjection {
 }
 
 export interface StoredModelFacingContextItem {
+  segmentId?: string;
   segmentKind: string;
   messageRole: string | null;
   contentType: string;
@@ -510,15 +515,31 @@ export interface StoredModelFacingContextItem {
  */
 export function projectStoredModelFacingWindow(
   items: readonly StoredModelFacingContextItem[],
-  attachmentCatalog: readonly AttachmentCatalogEntry[] = []
+  attachmentCatalogState: AttachmentCatalogState | unknown = { catalog: [], placements: [] },
+  seededModelHandleCatalog: ModelHandleCatalog | unknown = { entries: [] }
 ): ModelWindowProjection {
-  const modelHandleCatalog = buildModelHandleCatalog(items.map((item) => item.content));
-  const contents = items.flatMap((item) => storedContextItemContents(item, modelHandleCatalog));
-  const catalogContent = renderAttachmentCatalog(
-    attachmentCatalog,
-    (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
+  const state = normalizeAttachmentCatalogState(attachmentCatalogState);
+  const seededHandles = normalizeModelHandleCatalog(seededModelHandleCatalog);
+  const modelHandleCatalog = buildModelHandleCatalog(
+    [...items.map((item) => item.content), state.catalog],
+    seededHandles.entries
   );
-  if (catalogContent) contents.push(catalogContent);
+  const segmentIds = items.map((item, index) => item.segmentId?.trim() || `stored-context-item-${index}`);
+  const renderedState = renderAttachmentCatalogState(
+    state,
+    segmentIds,
+    (entry) => {
+      const ref = modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId);
+      if (!ref) throw new Error(`Attachment ${entry.attachmentId} has no model handle.`);
+      return ref;
+    }
+  );
+  const contents: MessageContent[] = [];
+  items.forEach((item, index) => {
+    contents.push(...storedContextItemContents(item, modelHandleCatalog));
+    const placement = renderedState.afterSegment.get(segmentIds[index]);
+    if (placement) contents.push(placement);
+  });
   return projectOrdinaryModelWindow(contents);
 }
 

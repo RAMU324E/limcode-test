@@ -1106,9 +1106,13 @@ async function checkProviderFullRequest() {
       providerId: 'fake-local',
       modelId: 'fake-model',
       authoritySnapshot: expectedOriginalAuthority,
-      recipe: { temperature: 0, tools: [{ name: 'echo' }] },
+      recipe: {
+        temperature: 0,
+        tools: [{ name: 'echo' }],
+        attachmentCatalogState: { catalog: [], placements: [] }
+      },
       context: expectedOriginalContext,
-      attachmentCatalog: [],
+      attachmentCatalogState: { catalog: [], placements: [] },
       requestCreatedAt: payloads[0].requestCreatedAt
     });
     assert.deepEqual(payloads[1], {
@@ -1793,7 +1797,8 @@ async function checkProviderFullRequest() {
       tools: [{
         name: 'path-tool',
         inputSchema: { type: 'object', properties: { suffix: { type: 'string' } } }
-      }]
+      }],
+      attachmentCatalogState: { catalog: [], placements: [] }
     });
     assert.throws(() => kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').update(created.modelRequestId, {
       recipe_object_id: 'mutate-forbidden'
@@ -2666,8 +2671,15 @@ async function checkImmutableReplacement() {
               assert.equal(request.recipe.requestKind, 'context_compression_pre');
               assert.equal(request.recipe.sourceSegmentCount, 4);
               assert.equal(request.context.length, 4);
-              assert.deepEqual(request.recipe.attachmentCatalog, [coordinatorAttachment]);
-              assert.deepEqual(request.attachmentCatalog, [coordinatorAttachment]);
+              assert.deepEqual(request.recipe.attachmentCatalogState.catalog, [coordinatorAttachment]);
+              assert.deepEqual(request.recipe.attachmentCatalogState.placements.map((placement) => ({
+                kind: placement.kind,
+                entries: placement.entries
+              })), [{
+                kind: 'attachment_catalog_delta',
+                entries: [coordinatorAttachment]
+              }]);
+              assert.deepEqual(request.attachmentCatalogState, request.recipe.attachmentCatalogState);
               frozenCompressionBlockId = request.recipe.blockId;
               await controls.onEvent({
                 kind: 'completed',
@@ -2799,12 +2811,16 @@ async function checkImmutableReplacement() {
     const coordinatedMaterialized = await context.materialize(coordinated.result.rootId);
     assert.equal(coordinatedMaterialized.segments.length, 2);
     assert.equal(coordinatedMaterialized.segments[0].segmentKind, 'compression');
-    assert.deepEqual(await new kernel.AttachmentCatalogProjection(ctx.database).project(
-      coordinatedMaterialized.segments.map((segment) => ({
-        segmentId: segment.segmentId,
-        segmentKind: segment.segmentKind
-      }))
-    ), [coordinatorAttachment]);
+    const coordinatedAttachmentState = await new kernel.AttachmentCatalogProjection(ctx.database).projectState(
+      coordinatorSeed.conversationId,
+      coordinatedMaterialized.segments.map((segment) => ({ segmentId: segment.segmentId }))
+    );
+    assert.deepEqual(coordinatedAttachmentState.catalog, [coordinatorAttachment]);
+    assert.deepEqual(coordinatedAttachmentState.placements, [{
+      kind: 'attachment_catalog_checkpoint',
+      afterSegmentId: coordinatedMaterialized.segments[0].segmentId,
+      entries: [coordinatorAttachment]
+    }]);
     let adapterCompactRequest;
     let adapterStartRequest;
     const capabilityAdapter = new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
@@ -2855,7 +2871,7 @@ async function checkImmutableReplacement() {
       kind: 'full-model-request', modelRequestId: 'adapter-compact',
       conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
-      attachmentCatalog: [],
+      attachmentCatalogState: { catalog: [], placements: [] },
       recipe: {
         kind: 'reliable-context-compression', sourceSegmentCount: 2,
         blockId: 'adapter-block', sourceHash: 'adapter-source', effectiveSummaryMaxTokens: 256
@@ -2891,7 +2907,7 @@ async function checkImmutableReplacement() {
       kind: 'full-model-request', modelRequestId: 'adapter-ordinary',
       conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
-      attachmentCatalog: [],
+      attachmentCatalogState: { catalog: [], placements: [] },
       recipe: { kind: 'reliable-agent-turn', round: '1', tools: [] },
       context: [{
         segmentId: 'adapter-summary', segmentKind: 'compression', messageRole: null,
@@ -3500,7 +3516,7 @@ function assertNoContinuationPayload(request) {
   assert.ok(Array.isArray(request.context) && request.context.length > 0);
   const required = [
     'kind', 'modelRequestId', 'conversationId', 'attemptSeq', 'socketGeneration', 'providerId', 'modelId',
-    'authoritySnapshot', 'recipe', 'context', 'attachmentCatalog', 'requestCreatedAt'
+    'authoritySnapshot', 'recipe', 'context', 'attachmentCatalogState', 'requestCreatedAt'
   ];
   const expected = Object.prototype.hasOwnProperty.call(request, 'settingsSnapshot')
     ? [...required, 'settingsSnapshot']

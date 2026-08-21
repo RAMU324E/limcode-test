@@ -322,13 +322,13 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     if (!sourceRootId || !sourceContextEndSegmentId || !sourceContextSegmentIds) {
       throw new Error('无法定位 Fork 源 MessageRevision 对应的 Context root。');
     }
-    const sourceAttachmentCatalog = await this.product.application.modelProvider.projectAttachmentCatalog(
+    const sourceAttachmentCatalogState = await this.product.application.modelProvider.projectAttachmentCatalogState(
       sourceConversationId,
       sourceContextSegmentIds.map((segmentId) => ({ segmentId }))
     );
     await this.product.application.modelProvider.ensureAttachmentHandles(
       sourceConversationId,
-      sourceAttachmentCatalog
+      sourceAttachmentCatalogState.catalog
     );
 
     const turnLinks = (await this.product.application.database.snapshotAll(
