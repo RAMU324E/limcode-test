@@ -1,5 +1,8 @@
 import { createHash } from 'crypto';
-import { groupAtomicMessageContents } from '../reliableKernel/modelFacingContextProjection';
+import {
+  groupAtomicMessageContents,
+  isModelToolResponseMultimodalMimeType
+} from '../reliableKernel/modelFacingContextProjection';
 import { decodeCanonicalBase64 } from './canonicalBase64';
 import { estimateTokenCount, sliceByTokens } from 'tokenx';
 import { mapWithBoundedConcurrency } from './boundedConcurrency';
@@ -3350,7 +3353,6 @@ function nonEmptyRecord(value: unknown): value is Record<string, unknown> {
 
 // 产品能力边界：附件存储/预览不受此集合限制；送模只使用各 Provider 的共同稳定类型。
 // 其他 MIME 会转为显式文本占位，避免静默丢失，也不伪装模型已经读取过该附件。
-const TOOL_RESPONSE_MULTIMODAL_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'application/pdf', 'text/plain']);
 const TOOL_RESPONSE_CONTEXT_FALLBACK_MESSAGE = '工具调用在本次 LLM 请求上下文中没有对应响应，已自动补充兜底响应。原工具执行结果不可用；如仍需要结果，请重新执行相关操作。';
 
 interface ToolCallContextNormalizationResult {
@@ -3366,9 +3368,13 @@ interface TrackedFunctionCall {
 }
 
 async function prepareLlmStartRequestMultimodal(request: LlmStartRequest, options: LlmProviderOptions): Promise<LlmStartRequest> {
+  const preparation = createMultimodalPreparationContext();
   const [contents, systemInstruction] = await Promise.all([
-    Promise.all(request.contents.map((content) => prepareLlmContentMultimodal(content, options, false))),
-    request.systemInstruction ? prepareLlmContentMultimodal(request.systemInstruction, options, false) : Promise.resolve(undefined)
+    Promise.all(request.contents.map((content) =>
+      prepareLlmContentMultimodal(content, options, false, 'ordinary', preparation))),
+    request.systemInstruction
+      ? prepareLlmContentMultimodal(request.systemInstruction, options, false, 'ordinary', preparation)
+      : Promise.resolve(undefined)
   ]);
   const normalized = assertCanonicalProviderToolContext(contents);
   return {
@@ -3382,8 +3388,9 @@ export async function prepareNativeCompactContentsMultimodal(
   contents: MessageContent[],
   options: LlmProviderOptions
 ): Promise<MessageContent[]> {
+  const preparation = createMultimodalPreparationContext();
   return Promise.all(contents.map((content) =>
-    prepareLlmContentMultimodal(content, options, false, 'native_compact')));
+    prepareLlmContentMultimodal(content, options, false, 'native_compact', preparation)));
 }
 
 function assertCanonicalProviderToolContext(contents: MessageContent[]): MessageContent[] {
@@ -3515,14 +3522,29 @@ function normalizeToolCallId(value: string | undefined): string | undefined {
 
 type MultimodalPreparationMode = 'ordinary' | 'native_compact';
 
+interface AttachmentResolutionCacheEntry {
+  mimeType?: string;
+  name?: string;
+  promise: Promise<InlineDataPart | undefined>;
+}
+
+interface MultimodalPreparationContext {
+  attachmentResolutions: Map<string, AttachmentResolutionCacheEntry>;
+}
+
+function createMultimodalPreparationContext(): MultimodalPreparationContext {
+  return { attachmentResolutions: new Map<string, AttachmentResolutionCacheEntry>() };
+}
+
 async function prepareLlmContentMultimodal(
   content: MessageContent,
   options: LlmProviderOptions,
   toolResponse: boolean,
-  mode: MultimodalPreparationMode = 'ordinary'
+  mode: MultimodalPreparationMode = 'ordinary',
+  preparation: MultimodalPreparationContext = createMultimodalPreparationContext()
 ): Promise<MessageContent> {
   const parts = await Promise.all(content.parts.map((part) =>
-    prepareLlmPartMultimodal(part, options, toolResponse, mode)));
+    prepareLlmPartMultimodal(part, options, toolResponse, mode, preparation)));
   return { ...content, parts: parts.flat() };
 }
 
@@ -3530,12 +3552,15 @@ async function prepareLlmPartMultimodal(
   part: ContentPart,
   options: LlmProviderOptions,
   toolResponse: boolean,
-  mode: MultimodalPreparationMode
+  mode: MultimodalPreparationMode,
+  preparation: MultimodalPreparationContext
 ): Promise<ContentPart[]> {
-  if (isInlineDataPart(part)) return [await prepareInlineDataForLlm(part, options, toolResponse, mode)];
+  if (isInlineDataPart(part)) {
+    return [await prepareInlineDataForLlm(part, options, toolResponse, mode, preparation)];
+  }
   if (isFunctionResponsePart(part) && part.functionResponse.parts?.length) {
     const prepared = await Promise.all(part.functionResponse.parts.map((inlinePart) =>
-      prepareInlineDataForLlm(inlinePart, options, true, mode)));
+      prepareInlineDataForLlm(inlinePart, options, true, mode, preparation)));
     const inlineParts = prepared.filter(isInlineDataPart).filter((inlinePart) => isSupportedToolResponseInlineData(inlinePart));
     const placeholders = prepared.filter(isTextPart).map((textPart) => textPart.text).filter(Boolean);
     return [{
@@ -3554,7 +3579,8 @@ async function prepareInlineDataForLlm(
   part: InlineDataPart,
   options: LlmProviderOptions,
   toolResponse: boolean,
-  mode: MultimodalPreparationMode
+  mode: MultimodalPreparationMode,
+  preparation: MultimodalPreparationContext
 ): Promise<ContentPart> {
   if (mode === 'ordinary' && toolResponse && !isSupportedToolResponseInlineData(part)) {
     return attachmentPlaceholderPart(part, '附件类型不在工具响应白名单中');
@@ -3568,15 +3594,9 @@ async function prepareInlineDataForLlm(
 
   let resolved: InlineDataPart | undefined;
   try {
-    resolved = options.resolveAttachment
-      ? await options.resolveAttachment({
-        attachmentId: part.inlineData.attachmentId,
-        sourcePath: part.inlineData.sourcePath,
-        mimeType: part.inlineData.mimeType,
-        name: part.inlineData.name
-      })
-      : undefined;
+    resolved = await resolveAttachmentOnce(part, options, preparation);
   } catch (error) {
+    if (error instanceof AttachmentResolutionMetadataConflictError) throw error;
     if (mode === 'native_compact') {
       throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), errorSearchText(error));
     }
@@ -3595,6 +3615,55 @@ async function prepareInlineDataForLlm(
     );
   }
   return attachmentPlaceholderPart(part, resolved?.inlineData.error ?? '附件读取失败');
+}
+
+class AttachmentResolutionMetadataConflictError extends Error {
+  public constructor(key: string) {
+    super(`Attachment resolver metadata conflicts for ${key}.`);
+    this.name = 'AttachmentResolutionMetadataConflictError';
+  }
+}
+
+async function resolveAttachmentOnce(
+  part: InlineDataPart,
+  options: LlmProviderOptions,
+  preparation: MultimodalPreparationContext
+): Promise<InlineDataPart | undefined> {
+  if (!options.resolveAttachment) return undefined;
+  const attachmentId = part.inlineData.attachmentId?.trim();
+  const sourcePath = part.inlineData.sourcePath?.trim();
+  const mimeType = part.inlineData.mimeType?.trim() || undefined;
+  const name = part.inlineData.name?.trim() || undefined;
+  const key = attachmentId
+    ? `attachment:${attachmentId}`
+    : sourcePath
+      ? `source:${sourcePath}`
+      : `descriptor:${mimeType ?? ''}\0${name ?? ''}`;
+  const existing = preparation.attachmentResolutions.get(key);
+  if (existing) {
+    if ((existing.mimeType && mimeType && existing.mimeType !== mimeType)
+      || (existing.name && name && existing.name !== name)) {
+      throw new AttachmentResolutionMetadataConflictError(key);
+    }
+    existing.mimeType ??= mimeType;
+    existing.name ??= name;
+    const resolved = await existing.promise;
+    return resolved ? cloneInlineDataPart(resolved) : undefined;
+  }
+  const input = {
+    attachmentId: part.inlineData.attachmentId,
+    sourcePath: part.inlineData.sourcePath,
+    mimeType: part.inlineData.mimeType,
+    name: part.inlineData.name
+  };
+  const promise = Promise.resolve().then(() => options.resolveAttachment!(input));
+  preparation.attachmentResolutions.set(key, { mimeType, name, promise });
+  const resolved = await promise;
+  return resolved ? cloneInlineDataPart(resolved) : undefined;
+}
+
+function cloneInlineDataPart(part: InlineDataPart): InlineDataPart {
+  return { ...part, inlineData: { ...part.inlineData } };
 }
 
 export class LlmNativeCompactMediaError extends Error {
@@ -3634,7 +3703,7 @@ function mediaReferenceLabel(part: InlineDataPart): string {
 }
 
 function isSupportedToolResponseInlineData(part: InlineDataPart): boolean {
-  return TOOL_RESPONSE_MULTIMODAL_MIME_TYPES.has(part.inlineData.mimeType);
+  return isModelToolResponseMultimodalMimeType(part.inlineData.mimeType);
 }
 
 function withAttachmentPlaceholders(response: unknown, placeholders: string[]): unknown {

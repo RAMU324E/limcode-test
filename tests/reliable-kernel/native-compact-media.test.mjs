@@ -25,6 +25,49 @@ test('Native Compact validates multi-megabyte canonical media without RegExp sta
   assert.equal(prepared[0].parts[0].inlineData.sizeBytes, bytes.byteLength);
 });
 
+test('Native Compact resolves one repeated managed attachment only once per request', async () => {
+  const reference = {
+    inlineData: {
+      attachmentId: 'attachment-native-repeat',
+      mimeType: 'image/png',
+      name: 'repeat.png',
+      sizeBytes: 1,
+      sha256: 'b'.repeat(64)
+    }
+  };
+  let resolveCalls = 0;
+  const prepared = await prepareNativeCompactContentsMultimodal([
+    { role: 'user', parts: [structuredClone(reference)] },
+    { role: 'user', parts: [structuredClone(reference)] }
+  ], {
+    settings: undefined,
+    async resolveAttachment(input) {
+      resolveCalls += 1;
+      assert.equal(input.attachmentId, 'attachment-native-repeat');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { inlineData: { ...reference.inlineData, data: 'Zg==' } };
+    }
+  });
+
+  assert.equal(resolveCalls, 1);
+  assert.equal(prepared[0].parts[0].inlineData.data, 'Zg==');
+  assert.equal(prepared[1].parts[0].inlineData.data, 'Zg==');
+  assert.notEqual(prepared[0].parts[0].inlineData, prepared[1].parts[0].inlineData);
+
+  await assert.rejects(
+    prepareNativeCompactContentsMultimodal([
+      { role: 'user', parts: [structuredClone(reference)] },
+      { role: 'user', parts: [{ inlineData: { ...reference.inlineData, name: 'drift.png' } }] }
+    ], {
+      settings: undefined,
+      async resolveAttachment() {
+        return { inlineData: { ...reference.inlineData, data: 'Zg==' } };
+      }
+    }),
+    /metadata conflicts/
+  );
+});
+
 test('Native Compact still rejects noncanonical media and declared-size mismatches', async () => {
   await assert.rejects(
     prepareNativeCompactContentsMultimodal([{

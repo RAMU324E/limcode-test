@@ -94,6 +94,64 @@ test('provider语义估算不会把base64图片字符当普通文本token', () =
   assert.ok(estimated > 0 && estimated < 2_000, `multimodal estimate should stay bounded, got ${estimated}`);
 });
 
+test('普通模型窗口只保留同一托管附件的首次正文并在工具响应内保留F引用', () => {
+  const attachment = {
+    attachmentId: 'attachment-repeat-media',
+    mimeType: 'image/png',
+    name: 'repeat.png',
+    sizeBytes: 1,
+    sha256: 'a'.repeat(64),
+    data: 'Zg=='
+  };
+  const inlinePart = () => ({ inlineData: { ...attachment } });
+  const contents = [
+    { role: 'user', parts: [inlinePart()] },
+    { role: 'model', parts: [{ id: 'call-repeat', functionCall: { name: 'read', args: {} } }] },
+    {
+      role: 'user',
+      parts: [{
+        id: 'call-repeat',
+        functionResponse: {
+          name: 'read',
+          response: { ok: true },
+          parts: [inlinePart()]
+        }
+      }]
+    },
+    { role: 'user', parts: [inlinePart()] }
+  ];
+  const handles = {
+    entries: [{
+      kind: 'attachment',
+      ref: 'F7',
+      target: attachment.attachmentId,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes
+    }]
+  };
+
+  const projected = kernel.projectOrdinaryModelWindow(contents, handles);
+  assert.equal(projected.uniqueManagedMediaBodyCount, 1);
+  assert.equal(projected.suppressedManagedMediaBodyCount, 2);
+  assert.equal(projected.contents.flatMap((content) => content.parts)
+    .filter((part) => 'inlineData' in part).length, 1);
+  const response = projected.contents[2].parts[0].functionResponse;
+  assert.equal(response.parts, undefined);
+  assert.deepEqual(response.response.repeatedManagedMedia.map((entry) => entry.attachmentRef), ['F7']);
+  const repeatedText = projected.contents[3].parts[0].text;
+  assert.match(repeatedText, /repeated_managed_media_body_omitted/);
+  assert.match(repeatedText, /F7/);
+  assert.doesNotMatch(repeatedText, /attachment-repeat-media|sha256|data/);
+  assert.throws(
+    () => kernel.projectOrdinaryModelWindow([
+      { role: 'user', parts: [inlinePart()] },
+      { role: 'user', parts: [{ inlineData: { ...attachment, name: 'drift.png' } }] }
+    ], handles),
+    /metadata changed/
+  );
+});
+
 test('provider compaction ciphertext只保留rawItem权威副本且不按密文字符收费', () => {
   const ciphertext = 'cipher'.repeat(20_000);
   const contents = [{

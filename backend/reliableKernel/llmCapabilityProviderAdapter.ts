@@ -33,9 +33,11 @@ import type {
   ProviderOutputStreamEvent
 } from './modelProviderControlPlane';
 import {
+  createManagedMediaBodyProjectionState,
   estimateProjectedModelInput,
   projectOrdinaryModelWindow,
   projectSummaryModelWindow,
+  suppressRepeatedManagedMediaBodies,
   type ProjectedRequestTokenBreakdown
 } from './modelFacingContextProjection';
 import {
@@ -592,7 +594,11 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...(turnReminder ? ['turn_reminder' as const] : [])
   ];
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
-  const projectedContents = projectOrdinaryContentsPreservingRanges(contents, canonicalCompressionRanges);
+  const projectedContents = projectOrdinaryContentsPreservingRanges(
+    contents,
+    canonicalCompressionRanges,
+    modelHandleCatalog
+  );
   return {
     id: request.modelRequestId,
     conversationId: requireText(request.conversationId, 'Provider request conversationId'),
@@ -844,7 +850,11 @@ function compressionContext(
   flush();
   if (methodKind === 'openai_responses_compact') {
     return {
-      contents: projectOrdinaryContentsPreservingRanges(contents, canonicalCompressionRanges),
+      contents: projectOrdinaryContentsPreservingRanges(
+        contents,
+        canonicalCompressionRanges,
+        modelHandleCatalog
+      ),
       segments: [],
       priorSummaryContents: []
     };
@@ -877,9 +887,13 @@ function runtimeContextContent(
 
 function projectOrdinaryContentsPreservingRanges(
   contents: readonly MessageContent[],
-  canonicalRanges: readonly { start: number; end: number }[]
+  canonicalRanges: readonly { start: number; end: number }[],
+  modelHandleCatalog: ModelHandleCatalog
 ): MessageContent[] {
-  if (canonicalRanges.length === 0) return projectOrdinaryModelWindow(contents).contents;
+  if (canonicalRanges.length === 0) {
+    return projectOrdinaryModelWindow(contents, modelHandleCatalog).contents;
+  }
+  const mediaState = createManagedMediaBodyProjectionState();
   const projected: MessageContent[] = [];
   let cursor = 0;
   for (const range of canonicalRanges) {
@@ -887,13 +901,25 @@ function projectOrdinaryContentsPreservingRanges(
       || range.start < cursor || range.end < range.start || range.end > contents.length) {
       throw new RangeError('Canonical compression ranges are invalid or overlapping.');
     }
-    projected.push(...projectOrdinaryModelWindow(contents.slice(cursor, range.start)).contents);
-    // Provider-native Compact output is the canonical next window. It is deliberately not passed
-    // through the 4K/16K ordinary-history projection a second time.
-    projected.push(...contents.slice(range.start, range.end));
+    projected.push(...projectOrdinaryModelWindow(
+      contents.slice(cursor, range.start),
+      modelHandleCatalog,
+      mediaState
+    ).contents);
+    // Provider-native Compact output is the canonical next window. Only repeat-media suppression is
+    // applied here; tool results and provider-native items are not projected a second time.
+    projected.push(...suppressRepeatedManagedMediaBodies(
+      contents.slice(range.start, range.end),
+      modelHandleCatalog,
+      mediaState
+    ));
     cursor = range.end;
   }
-  projected.push(...projectOrdinaryModelWindow(contents.slice(cursor)).contents);
+  projected.push(...projectOrdinaryModelWindow(
+    contents.slice(cursor),
+    modelHandleCatalog,
+    mediaState
+  ).contents);
   return projected;
 }
 

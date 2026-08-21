@@ -39,6 +39,14 @@ export const SUMMARY_TARGET_TOKENS = DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKE
 export const MODEL_BODY_TARGET_TOKENS = MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS;
 export const TEXT_PREVIEW_HEAD_RATIO = 0.6;
 
+export function isModelToolResponseMultimodalMimeType(value: string): boolean {
+  return value === 'image/png'
+    || value === 'image/jpeg'
+    || value === 'image/webp'
+    || value === 'application/pdf'
+    || value === 'text/plain';
+}
+
 export function calculateEffectiveSummaryMaxTokens(
   configuredTargetTokens: number | undefined,
   effectiveBodyTargetTokensInput: number
@@ -499,6 +507,22 @@ export interface ModelWindowProjection {
   mediaTokens: number;
   toolResultBatches: ToolResultBatchProjection[];
   mandatoryBatchOverTarget: boolean;
+  uniqueManagedMediaBodyCount: number;
+  suppressedManagedMediaBodyCount: number;
+}
+
+export interface ManagedMediaBodyProjectionState {
+  seenAttachmentMetadata: Map<string, string>;
+  uniqueBodyCount: number;
+  suppressedBodyCount: number;
+}
+
+export function createManagedMediaBodyProjectionState(): ManagedMediaBodyProjectionState {
+  return {
+    seenAttachmentMetadata: new Map<string, string>(),
+    uniqueBodyCount: 0,
+    suppressedBodyCount: 0
+  };
 }
 
 export interface StoredModelFacingContextItem {
@@ -540,11 +564,15 @@ export function projectStoredModelFacingWindow(
     const placement = renderedState.afterSegment.get(segmentIds[index]);
     if (placement) contents.push(placement);
   });
-  return projectOrdinaryModelWindow(contents);
+  return projectOrdinaryModelWindow(contents, modelHandleCatalog);
 }
 
 /** Common ordinary/native model-visible representation: same items, same result previews. */
-export function projectOrdinaryModelWindow(contents: readonly MessageContent[]): ModelWindowProjection {
+export function projectOrdinaryModelWindow(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ModelHandleCatalog | unknown = { entries: [] },
+  mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
+): ModelWindowProjection {
   const projected = contents.map(cloneMessageContent);
   const batches: ToolResultBatchProjection[] = [];
   for (const group of groupAtomicMessageContents(projected)) {
@@ -574,12 +602,128 @@ export function projectOrdinaryModelWindow(contents: readonly MessageContent[]):
       };
     });
   }
+  const uniqueBefore = mediaState.uniqueBodyCount;
+  const suppressedBefore = mediaState.suppressedBodyCount;
+  const mediaProjected = suppressRepeatedManagedMediaBodies(
+    projected,
+    modelHandleCatalogInput,
+    mediaState
+  );
   return {
-    contents: projected,
-    tokenCount: estimateMessageContentsTokens(projected),
-    mediaTokens: estimateMessageContentsMediaTokens(projected),
+    contents: mediaProjected,
+    tokenCount: estimateMessageContentsTokens(mediaProjected),
+    mediaTokens: estimateMessageContentsMediaTokens(mediaProjected),
     toolResultBatches: batches,
-    mandatoryBatchOverTarget: batches.some((batch) => batch.mandatoryBatchOverTarget)
+    mandatoryBatchOverTarget: batches.some((batch) => batch.mandatoryBatchOverTarget),
+    uniqueManagedMediaBodyCount: mediaState.uniqueBodyCount - uniqueBefore,
+    suppressedManagedMediaBodyCount: mediaState.suppressedBodyCount - suppressedBefore
+  };
+}
+
+/**
+ * Keeps the first model-visible body for each managed Attachment and replaces later bodies with an
+ * explicit short-reference observation. Function-response pairing remains intact: nested repeats are
+ * removed from parts and described inside the same response object.
+ */
+export function suppressRepeatedManagedMediaBodies(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ModelHandleCatalog | unknown = { entries: [] },
+  state: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
+): MessageContent[] {
+  const modelHandleCatalog = normalizeModelHandleCatalog(modelHandleCatalogInput);
+  return contents.map((content): MessageContent => ({
+    role: content.role,
+    parts: content.parts.map((part): ContentPart => {
+      if ('inlineData' in part) {
+        const omission = repeatedManagedMediaOmission(part, modelHandleCatalog, state);
+        if (!omission) return cloneJsonValue(part) as InlineDataPart;
+        const { inlineData: _inlineData, ...metadata } = part;
+        return { ...metadata, text: stableJson(omission) };
+      }
+      if ('functionResponse' in part && part.functionResponse.parts?.length) {
+        const retained: InlineDataPart[] = [];
+        const omissions: Record<string, unknown>[] = [];
+        for (const inlinePart of part.functionResponse.parts) {
+          if (!isModelToolResponseMultimodalMimeType(inlinePart.inlineData.mimeType)) {
+            retained.push(cloneJsonValue(inlinePart) as InlineDataPart);
+            continue;
+          }
+          const omission = repeatedManagedMediaOmission(inlinePart, modelHandleCatalog, state);
+          if (omission) omissions.push(omission);
+          else retained.push(cloneJsonValue(inlinePart) as InlineDataPart);
+        }
+        const { parts: _parts, ...responseWithoutParts } = part.functionResponse;
+        return {
+          ...cloneJsonValue(part) as Extract<ContentPart, { functionResponse: unknown }>,
+          functionResponse: {
+            ...responseWithoutParts,
+            response: omissions.length > 0
+              ? withRepeatedManagedMediaOmissions(responseWithoutParts.response, omissions)
+              : cloneJsonValue(responseWithoutParts.response),
+            ...(retained.length > 0 ? { parts: retained } : {})
+          }
+        };
+      }
+      return cloneJsonValue(part) as ContentPart;
+    })
+  }));
+}
+
+function repeatedManagedMediaOmission(
+  part: InlineDataPart,
+  modelHandleCatalog: ModelHandleCatalog,
+  state: ManagedMediaBodyProjectionState
+): Record<string, unknown> | undefined {
+  const attachmentId = optionalText(part.inlineData.attachmentId);
+  if (!attachmentId) return undefined;
+  const metadata = stableJson({
+    mimeType: part.inlineData.mimeType,
+    name: optionalText(part.inlineData.name) ?? null,
+    sizeBytes: optionalNonNegativeInteger(part.inlineData.sizeBytes) ?? null,
+    sha256: optionalText(part.inlineData.sha256) ?? null
+  });
+  const existing = state.seenAttachmentMetadata.get(attachmentId);
+  if (!existing) {
+    state.seenAttachmentMetadata.set(attachmentId, metadata);
+    state.uniqueBodyCount += 1;
+    return undefined;
+  }
+  if (existing !== metadata) {
+    throw new Error(`Managed Attachment ${attachmentId} metadata changed across one model window.`);
+  }
+  state.suppressedBodyCount += 1;
+  const attachmentRef = modelHandleRef(modelHandleCatalog, 'attachment', attachmentId);
+  return {
+    kind: 'repeated_managed_media_body_omitted',
+    ...(attachmentRef ? { attachmentRef } : {}),
+    ...(optionalText(part.inlineData.name) ? { name: optionalText(part.inlineData.name) } : {}),
+    mimeType: part.inlineData.mimeType,
+    ...(optionalNonNegativeInteger(part.inlineData.sizeBytes) === undefined
+      ? {}
+      : { sizeBytes: optionalNonNegativeInteger(part.inlineData.sizeBytes) }),
+    note: attachmentRef
+      ? `正文已在更早上下文提供；后续需要时使用 ${attachmentRef}。`
+      : '正文已在更早上下文提供。'
+  };
+}
+
+function withRepeatedManagedMediaOmissions(
+  response: unknown,
+  omissions: readonly Record<string, unknown>[]
+): unknown {
+  const record = asRecord(response);
+  if (record) {
+    const previous = Array.isArray(record.repeatedManagedMedia)
+      ? record.repeatedManagedMedia.map((entry) => cloneJsonValue(entry))
+      : [];
+    return {
+      ...cloneJsonValue(record) as Record<string, unknown>,
+      repeatedManagedMedia: [...previous, ...omissions]
+    };
+  }
+  return {
+    result: cloneJsonValue(response),
+    repeatedManagedMedia: omissions
   };
 }
 
@@ -743,7 +887,9 @@ export function projectSummaryModelWindow(contents: readonly MessageContent[]): 
     tokenCount: estimateMessageContentsTokens(projected),
     mediaTokens: estimateMessageContentsMediaTokens(projected),
     toolResultBatches: ordinary.toolResultBatches,
-    mandatoryBatchOverTarget: ordinary.mandatoryBatchOverTarget
+    mandatoryBatchOverTarget: ordinary.mandatoryBatchOverTarget,
+    uniqueManagedMediaBodyCount: ordinary.uniqueManagedMediaBodyCount,
+    suppressedManagedMediaBodyCount: ordinary.suppressedManagedMediaBodyCount
   };
 }
 
@@ -1174,6 +1320,16 @@ function positiveTokenCount(value: number, label: string): number {
 function nonNegativeTokenCount(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`${label} must be a non-negative safe integer.`);
   return value;
+}
+
+function optionalText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
 }
 
 function requireText(value: unknown, label: string): string {

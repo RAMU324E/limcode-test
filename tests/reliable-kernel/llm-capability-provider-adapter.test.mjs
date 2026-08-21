@@ -1060,7 +1060,7 @@ test('纯文字当前 Turn 输入与 Context 同源投影，且被压缩移除�
   assert.throws(() => adapter.estimateFullRequestInput(unsupported), /must be a user MessageContent/);
 });
 
-test('native output 已含旧用户内容时只追加一次带标签的当前 Turn 原文', async () => {
+test('native output 已含旧用户内容时只追加一次带标签的当前 Turn 文本与F引用', async () => {
   const originalParts = [
     { text: 'NATIVE_CURRENT_INPUT_9182' },
     {
@@ -1097,6 +1097,23 @@ test('native output 已含旧用户内容时只追加一次带标签的当前 Tu
   };
   const fullRequest = request();
   fullRequest.context = [nativeOutput];
+  const nativeAttachment = {
+    attachmentId: 'attachment-native-current',
+    mimeType: 'image/png',
+    name: 'native-current.png',
+    sizeBytes: 21
+  };
+  fullRequest.attachmentCatalogState = {
+    catalog: [nativeAttachment],
+    placements: [{
+      kind: 'attachment_catalog_checkpoint',
+      afterSegmentId: nativeOutput.segmentId,
+      entries: [nativeAttachment]
+    }]
+  };
+  fullRequest.recipe.modelHandleCatalog = {
+    entries: [attachmentHandle('F5', nativeAttachment)]
+  };
   fullRequest.requestAddenda = {
     currentTurnInput: {
       messageId: 'message-native-current',
@@ -1125,7 +1142,11 @@ test('native output 已含旧用户内容时只追加一次带标签的当前 Tu
     content.parts.some((part) => part.text === label)
   );
   assert.equal(labeled.length, 1, 'native canonical window 后只能追加一个当前 Turn 回注项');
-  assert.deepEqual(labeled[0].parts.slice(1), originalParts, '回注必须逐项保留原始文本与多模态 parts');
+  assert.deepEqual(labeled[0].parts.slice(1, 2), originalParts.slice(0, 1));
+  assert.equal('inlineData' in labeled[0].parts[2], false);
+  assert.match(labeled[0].parts[2].text, /repeated_managed_media_body_omitted/);
+  assert.match(labeled[0].parts[2].text, /F5/);
+  assert.doesNotMatch(labeled[0].parts[2].text, /attachment-native-current|sha256|data/);
   assert.equal(captures[0].contents.filter((content) =>
     content.parts.some((part) => part.text === 'NATIVE_CURRENT_INPUT_9182')
   ).length, 2, '一份属于 native 历史，一份属于明确标记的当前 Turn 回注');
@@ -2096,6 +2117,99 @@ test('LLM capability adapter interleaves typed attachment catalog checkpoint and
   ]);
   assert.equal(JSON.stringify(native).includes('attachmentCatalogState'), false);
 });
+
+test('ordinary and native compact windows suppress repeated managed media across segment boundaries', async () => {
+  const attachment = {
+    attachmentId: 'attachment-cross-window-repeat',
+    name: 'cross.png',
+    mimeType: 'image/png',
+    sizeBytes: 1
+  };
+  const inline = {
+    inlineData: {
+      ...attachment,
+      sha256: 'f'.repeat(64),
+      storage: 'managed',
+      status: 'available'
+    }
+  };
+  const first = {
+    segmentId: 'repeat-first',
+    segmentKind: 'message',
+    messageRole: 'user',
+    contentType: 'application/vnd.limcode.message+json',
+    content: JSON.stringify({ role: 'user', parts: [inline] })
+  };
+  const second = {
+    ...first,
+    segmentId: 'repeat-second'
+  };
+  const state = {
+    catalog: [attachment],
+    placements: [{
+      kind: 'attachment_catalog_delta',
+      afterSegmentId: first.segmentId,
+      entries: [attachment]
+    }]
+  };
+  const handles = { entries: [attachmentHandle('F9', attachment)] };
+
+  let ordinary;
+  const ordinaryRequest = request();
+  ordinaryRequest.context = [first, second];
+  ordinaryRequest.attachmentCatalogState = state;
+  ordinaryRequest.recipe.modelHandleCatalog = handles;
+  await new kernel.LlmCapabilityFullRequestAdapter(
+    'provider-config',
+    fakeCapability((llmRequest, emit) => {
+      ordinary = llmRequest;
+      emit({ type: 'llm:done', payload: { requestId: llmRequest.id } });
+    })
+  ).sendFullRequest(ordinaryRequest, {
+    onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
+  });
+  assertSingleRepeatedMediaBody(ordinary.contents, 'F9');
+
+  const compactEnvelope = {
+    segmentId: 'repeat-compact-range',
+    segmentKind: 'compression',
+    messageRole: null,
+    contentType: 'application/vnd.limcode.compression-contents+json',
+    content: JSON.stringify({
+      kind: 'compression_contents',
+      version: 1,
+      contents: [{ role: 'user', parts: [inline] }]
+    })
+  };
+  const nativeState = {
+    catalog: [attachment],
+    placements: [{
+      kind: 'attachment_catalog_checkpoint',
+      afterSegmentId: compactEnvelope.segmentId,
+      entries: [attachment]
+    }]
+  };
+  let native;
+  const nativeRequest = compressionRequest('openai_responses_compact', [compactEnvelope, second]);
+  nativeRequest.attachmentCatalogState = nativeState;
+  nativeRequest.recipe.modelHandleCatalog = handles;
+  await new kernel.LlmCapabilityFullRequestAdapter(
+    'compression-provider',
+    compressionCapability((compactRequest) => { native = compactRequest; })
+  ).sendFullRequest(nativeRequest, {
+    onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
+  });
+  assertSingleRepeatedMediaBody(native.contents, 'F9');
+});
+
+function assertSingleRepeatedMediaBody(contents, ref) {
+  const parts = contents.flatMap((content) => content.parts);
+  assert.equal(parts.filter((part) => 'inlineData' in part).length, 1);
+  const omission = parts.find((part) => part.text?.includes('repeated_managed_media_body_omitted'))?.text;
+  assert.ok(omission);
+  assert.match(omission, new RegExp(ref));
+  assert.doesNotMatch(omission, /attachment-cross-window-repeat|sha256|data/);
+}
 
 function attachmentHandle(ref, entry) {
   return {
