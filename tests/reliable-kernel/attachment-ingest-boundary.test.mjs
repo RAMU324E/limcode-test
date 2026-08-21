@@ -182,6 +182,56 @@ test('Attachment catalog keeps only lightweight immutable metadata across messag
   assert.doesNotMatch(text, /sha256|sourcePath|private|must-not-enter-catalog|data/);
 });
 
+test('stored managed attachment metadata fails closed after JSON parsing', () => {
+  const stored = (inlineData) => [{
+    contentType: 'application/json',
+    content: JSON.stringify({ parts: [{ inlineData }] })
+  }];
+  assert.throws(
+    () => collectAttachmentCatalogFromStoredItems(stored({ attachmentId: 'attachment-missing-name' })),
+    /inlineData.name must be non-empty text/
+  );
+  assert.throws(
+    () => collectAttachmentCatalogFromStoredItems([{
+      contentType: 'application/json',
+      content: JSON.stringify({ result: JSON.stringify({
+        parts: [{ inlineData: { attachmentId: 'attachment-nested-missing-name' } }]
+      }) })
+    }]),
+    /inlineData.name must be non-empty text/
+  );
+  assert.throws(
+    () => collectAttachmentCatalogFromStoredItems(stored({
+      attachmentId: 'attachment-invalid-size',
+      name: 'report.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: -1
+    })),
+    /inlineData.sizeBytes must be a non-negative safe integer/
+  );
+  assert.throws(
+    () => collectAttachmentCatalogFromStoredItems([
+      ...stored({
+        attachmentId: 'attachment-drift',
+        name: 'report.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 10
+      }),
+      ...stored({
+        attachmentId: 'attachment-drift',
+        name: 'renamed.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 10
+      })
+    ]),
+    /metadata changed for immutable attachment attachment-drift/
+  );
+  assert.deepEqual(collectAttachmentCatalogFromStoredItems([{
+    contentType: 'application/json',
+    content: '{not-json'
+  }]), []);
+});
+
 test('read keeps path as the ordinary input and only exposes pages for managed TXT/PDF', () => {
   const ordinary = readFileToolParameters(false, false);
   assert.equal(ordinary.required, undefined);
@@ -207,7 +257,7 @@ test('read keeps path as the ordinary input and only exposes pages for managed T
     pages: '',
     path: 'src\\demo.ts',
     startLine: 0
-  }), { path: 'src/demo.ts' });
+  }), { path: 'src/demo.ts', mode: 'text' });
   assert.deepEqual(compactReadFileToolArguments({
     attachmentId: ' attachment-one ',
     endLine: 1,

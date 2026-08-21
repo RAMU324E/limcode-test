@@ -10,6 +10,8 @@ export const PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM = 32_768;
 export const PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS = 250;
 export const PROCESS_SPOOL_DIRECTORY = 'process-spool';
 export const PROCESS_WRAPPER_IDENTITY_FILE = 'identity.json';
+export const PROCESS_WRAPPER_BOOTSTRAP_FILE = 'bootstrap-receipt.json';
+export const PROCESS_WRAPPER_LAUNCH_FAILURE_FILE = 'launch-failure-receipt.json';
 export const PROCESS_WRAPPER_MANIFEST_FILE = 'manifest.json';
 export const PROCESS_WRAPPER_EXIT_RECEIPT_FILE = 'exit-receipt.json';
 export const PROCESS_WRAPPER_STOP_REQUEST_FILE = 'stop-request.json';
@@ -39,6 +41,36 @@ export interface ProcessWrapperLaunchRequest {
   executionDeadlineAt: string | null;
   maxOutputBytes: number | null;
   createdAt: string;
+}
+
+export type ProcessWrapperBootstrapPhase = 'wrapper_spawned' | 'child_spawned' | 'identity_ready';
+
+export interface ProcessWrapperBootstrapReceipt {
+  kind: typeof PROCESS_WRAPPER_PROTOCOL;
+  processId: string;
+  stableNonce: string;
+  wrapperPid: string;
+  childPid: string | null;
+  commandDigest: string;
+  spoolLocator: string;
+  phase: ProcessWrapperBootstrapPhase;
+  updatedAt: string;
+}
+
+export interface ProcessWrapperLaunchFailureReceipt {
+  kind: typeof PROCESS_WRAPPER_PROTOCOL;
+  processId: string;
+  stableNonce: string;
+  wrapperPid: string;
+  childPid: string | null;
+  commandDigest: string;
+  spoolLocator: string;
+  phase: Exclude<ProcessWrapperBootstrapPhase, 'identity_ready'>;
+  commandReleased: false;
+  errorName: string;
+  errorCode: string | null;
+  errorMessage: string;
+  failedAt: string;
 }
 
 export interface ProcessWrapperIdentity {
@@ -160,6 +192,61 @@ export function listProcessSpoolChunks(spoolPath: string): ProcessSpoolChunk[] {
       byteLength: BigInt(stat.size).toString()
     }];
   }).sort((left, right) => compareDecimal(left.chunkSeq, right.chunkSeq));
+}
+
+export function parseWrapperBootstrapReceipt(value: unknown): ProcessWrapperBootstrapReceipt {
+  const record = exactRecord(value, [
+    'kind', 'processId', 'stableNonce', 'wrapperPid', 'childPid', 'commandDigest',
+    'spoolLocator', 'phase', 'updatedAt'
+  ], 'ProcessWrapperBootstrapReceipt');
+  if (record.kind !== PROCESS_WRAPPER_PROTOCOL) throw new TypeError('Invalid ProcessWrapperBootstrapReceipt.kind.');
+  const phase = requireBootstrapPhase(record.phase);
+  const childPid = record.childPid === null ? null : requireDecimalString(record.childPid, 'childPid');
+  if ((phase === 'wrapper_spawned') !== (childPid === null)) {
+    throw new TypeError('ProcessWrapperBootstrapReceipt childPid does not match phase.');
+  }
+  return {
+    kind: PROCESS_WRAPPER_PROTOCOL,
+    processId: requireText(record.processId, 'processId'),
+    stableNonce: requireText(record.stableNonce, 'stableNonce'),
+    wrapperPid: requireDecimalString(record.wrapperPid, 'wrapperPid'),
+    childPid,
+    commandDigest: requireSha256(record.commandDigest, 'commandDigest'),
+    spoolLocator: requireLocator(record.spoolLocator),
+    phase,
+    updatedAt: requireIsoTimestamp(record.updatedAt, 'updatedAt')
+  };
+}
+
+export function parseWrapperLaunchFailureReceipt(value: unknown): ProcessWrapperLaunchFailureReceipt {
+  const record = exactRecord(value, [
+    'kind', 'processId', 'stableNonce', 'wrapperPid', 'childPid', 'commandDigest',
+    'spoolLocator', 'phase', 'commandReleased', 'errorName', 'errorCode', 'errorMessage', 'failedAt'
+  ], 'ProcessWrapperLaunchFailureReceipt');
+  if (record.kind !== PROCESS_WRAPPER_PROTOCOL) throw new TypeError('Invalid ProcessWrapperLaunchFailureReceipt.kind.');
+  const phase = requireBootstrapPhase(record.phase);
+  if (phase === 'identity_ready') throw new TypeError('Launch failure cannot follow identity_ready.');
+  const childPid = record.childPid === null ? null : requireDecimalString(record.childPid, 'childPid');
+  if ((phase === 'wrapper_spawned') !== (childPid === null)) {
+    throw new TypeError('ProcessWrapperLaunchFailureReceipt childPid does not match phase.');
+  }
+  if (record.commandReleased !== false) throw new TypeError('Launch failure must prove commandReleased=false.');
+  const errorCode = record.errorCode === null ? null : requireBoundedText(record.errorCode, 'errorCode', 128);
+  return {
+    kind: PROCESS_WRAPPER_PROTOCOL,
+    processId: requireText(record.processId, 'processId'),
+    stableNonce: requireText(record.stableNonce, 'stableNonce'),
+    wrapperPid: requireDecimalString(record.wrapperPid, 'wrapperPid'),
+    childPid,
+    commandDigest: requireSha256(record.commandDigest, 'commandDigest'),
+    spoolLocator: requireLocator(record.spoolLocator),
+    phase,
+    commandReleased: false,
+    errorName: requireBoundedText(record.errorName, 'errorName', 128),
+    errorCode,
+    errorMessage: requireBoundedText(record.errorMessage, 'errorMessage', 2_048),
+    failedAt: requireIsoTimestamp(record.failedAt, 'failedAt')
+  };
 }
 
 export function parseWrapperIdentity(value: unknown): ProcessWrapperIdentity {
@@ -533,6 +620,26 @@ function exactRecordVariant(
     }
   }
   throw new TypeError(`${label} fields do not match the current wrapper contract.`);
+}
+
+function requireBootstrapPhase(value: unknown): ProcessWrapperBootstrapPhase {
+  if (value !== 'wrapper_spawned' && value !== 'child_spawned' && value !== 'identity_ready') {
+    throw new TypeError('Invalid process wrapper bootstrap phase.');
+  }
+  return value;
+}
+
+function requireIsoTimestamp(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+    throw new TypeError(`${label} must be an ISO timestamp.`);
+  }
+  return value;
+}
+
+function requireBoundedText(value: unknown, label: string, maximumLength: number): string {
+  const text = requireText(value, label);
+  if (text.length > maximumLength) throw new TypeError(`${label} exceeds ${maximumLength} characters.`);
+  return text;
 }
 
 function requireTerminationReason(value: unknown): ProcessTerminationReason {

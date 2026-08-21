@@ -1,12 +1,10 @@
-import {
-  collectAttachmentCatalogFromStoredItems,
-  renderAttachmentCatalog
-} from './attachmentCatalog';
+import { renderAttachmentCatalog } from './attachmentCatalog';
 import { createHash } from 'node:crypto';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
+  type AttachmentCatalogEntry,
   type ContentPart,
   type InlineDataPart,
   type MessageContent
@@ -511,12 +509,13 @@ export interface StoredModelFacingContextItem {
  * This is intentionally pure: callers keep the stored CAS bytes unchanged.
  */
 export function projectStoredModelFacingWindow(
-  items: readonly StoredModelFacingContextItem[]
+  items: readonly StoredModelFacingContextItem[],
+  attachmentCatalog: readonly AttachmentCatalogEntry[] = []
 ): ModelWindowProjection {
   const modelHandleCatalog = buildModelHandleCatalog(items.map((item) => item.content));
   const contents = items.flatMap((item) => storedContextItemContents(item, modelHandleCatalog));
   const catalogContent = renderAttachmentCatalog(
-    collectAttachmentCatalogFromStoredItems(items),
+    attachmentCatalog,
     (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
   );
   if (catalogContent) contents.push(catalogContent);

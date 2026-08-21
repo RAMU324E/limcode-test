@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { selectEditToolMode } from '../../shared/editToolArguments';
+import { validateEditToolArguments, type ValidatedEditToolArguments } from '../../shared/editToolArguments';
+import { applyDeleteEdit, applyHunkEdit, applyInsertEdit } from '../capabilities/editStrategies';
 import type { ToolDefinition } from '../world/modules/tools/registry';
 import type {
   ReliableAgentToolDispatchInput
@@ -81,8 +82,8 @@ export class LocalFileToolPlanner {
     authority: ReliableToolDispatchAuthority,
     signal?: AbortSignal
   ): Promise<FileChangeProposalMemberInput> {
-    const args = requireRecord(input.arguments, 'edit arguments');
-    const inputPath = requireText(args.path, 'edit.path');
+    const args = validateEditToolArguments(input.arguments);
+    const inputPath = args.path;
     const resolved = await this.resolvePath(inputPath, authority);
     signal?.throwIfAborted();
     const current = await inspectLocalTarget(resolved.absolutePath);
@@ -229,131 +230,16 @@ async function planMissingParentDirectories(
   return members;
 }
 
-function applyEditArguments(source: string, args: { [key: string]: unknown }): string {
-  const mode = selectEditToolMode(args);
-  if (mode === 'hunk') {
-    if (!Array.isArray(args.hunks)) throw new Error('edit.hunks must be an array.');
-    return applyHunks(source, args.hunks);
+function applyEditArguments(source: string, args: ValidatedEditToolArguments): string {
+  const applied = args.mode === 'hunk'
+    ? applyHunkEdit(source, args.hunks)
+    : args.mode === 'insert'
+      ? applyInsertEdit(source, args.insert.line, args.insert.content)
+      : applyDeleteEdit(source, args.delete.startLine, args.delete.endLine);
+  if (applied.failed > 0) {
+    throw new Error(applied.results.find((result) => !result.success)?.error ?? `edit ${args.mode} failed.`);
   }
-  if (mode === 'insert') {
-    const insert = requireUnknownRecord(args.insert, 'edit.insert');
-    const line = requirePositiveLine(insert.line, 'edit.insert.line');
-    const content = requireString(insert.content, 'edit.insert.content');
-    const offset = lineStartOffset(source, line, true);
-    return `${source.slice(0, offset)}${content}${source.slice(offset)}`;
-  }
-  const deletion = requireUnknownRecord(args.delete, 'edit.delete');
-  const startLine = requirePositiveLine(deletion.startLine, 'edit.delete.startLine');
-  const endLine = requirePositiveLine(deletion.endLine, 'edit.delete.endLine');
-  if (endLine < startLine) throw new Error('edit.delete.endLine must be >= startLine.');
-  const start = lineStartOffset(source, startLine, false);
-  const end = lineStartOffset(source, endLine + 1, true);
-  return `${source.slice(0, start)}${source.slice(end)}`;
-}
-
-function applyHunks(source: string, hunks: unknown[]): string {
-  if (hunks.length === 0) throw new Error('edit.hunks must not be empty.');
-  let output = source;
-  for (let index = 0; index < hunks.length; index += 1) {
-    const hunk = requireUnknownRecord(hunks[index], `edit.hunks[${index}]`);
-    const oldContent = requireString(hunk.oldContent, `edit.hunks[${index}].oldContent`);
-    const newContent = requireString(hunk.newContent, `edit.hunks[${index}].newContent`);
-    if (!oldContent) throw new Error(`edit.hunks[${index}].oldContent must not be empty.`);
-
-    const normalizedOutput = normalizeTextWithRawBoundaries(output);
-    const normalizedOldContent = normalizeLineEndings(oldContent);
-    const matches = findAllExactMatchIndexes(normalizedOutput.text, normalizedOldContent);
-    if (matches.length === 0) throw new Error(`Hunk ${index}: no exact match found for oldContent.`);
-
-    const selectedMatches = hunk.replaceAll === true ? matches : [matches[0]];
-    const sourceLineEnding = preferredLineEnding(output);
-    const replacements = selectedMatches.map((matchIndex) => {
-      const start = normalizedOutput.rawBoundaries[matchIndex];
-      const end = normalizedOutput.rawBoundaries[matchIndex + normalizedOldContent.length];
-      const matchedContent = output.slice(start, end);
-      return {
-        start,
-        end,
-        content: applyLineEnding(newContent, preferredLineEnding(matchedContent, sourceLineEnding))
-      };
-    });
-    for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
-      output = `${output.slice(0, replacement.start)}${replacement.content}${output.slice(replacement.end)}`;
-    }
-  }
-  return output;
-}
-
-function normalizeTextWithRawBoundaries(value: string): { text: string; rawBoundaries: number[] } {
-  const normalized: string[] = [];
-  const rawBoundaries = [0];
-  let index = 0;
-  while (index < value.length) {
-    if (value.charCodeAt(index) === 13) {
-      index += value.charCodeAt(index + 1) === 10 ? 2 : 1;
-      normalized.push('\n');
-    } else {
-      normalized.push(value[index]);
-      index += 1;
-    }
-    rawBoundaries.push(index);
-  }
-  return { text: normalized.join(''), rawBoundaries };
-}
-
-function normalizeLineEndings(value: string): string {
-  return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-}
-
-function findAllExactMatchIndexes(content: string, search: string): number[] {
-  const matches: number[] = [];
-  let fromIndex = 0;
-  while (fromIndex <= content.length) {
-    const found = content.indexOf(search, fromIndex);
-    if (found < 0) break;
-    matches.push(found);
-    fromIndex = found + Math.max(1, search.length);
-  }
-  return matches;
-}
-
-function preferredLineEnding(value: string, fallback = '\n'): string {
-  const counts = new Map<string, { count: number; firstIndex: number }>();
-  for (let index = 0; index < value.length; index += 1) {
-    let lineEnding: string | undefined;
-    if (value.charCodeAt(index) === 13) {
-      if (value.charCodeAt(index + 1) === 10) {
-        lineEnding = '\r\n';
-        index += 1;
-      } else {
-        lineEnding = '\r';
-      }
-    } else if (value.charCodeAt(index) === 10) {
-      lineEnding = '\n';
-    }
-    if (!lineEnding) continue;
-    const current = counts.get(lineEnding);
-    if (current) current.count += 1;
-    else counts.set(lineEnding, { count: 1, firstIndex: index });
-  }
-  return [...counts.entries()].sort((left, right) =>
-    right[1].count - left[1].count || left[1].firstIndex - right[1].firstIndex)[0]?.[0] ?? fallback;
-}
-
-function applyLineEnding(value: string, lineEnding: string): string {
-  const normalized = normalizeLineEndings(value);
-  return lineEnding === '\n' ? normalized : normalized.replace(/\n/g, lineEnding);
-}
-
-function lineStartOffset(source: string, line: number, allowAppend: boolean): number {
-  const starts = [0];
-  for (let index = 0; index < source.length; index += 1) {
-    if (source.charCodeAt(index) === 10) starts.push(index + 1);
-  }
-  const maximum = starts.length + (allowAppend && starts.at(-1) !== source.length ? 1 : 0);
-  if (line < 1 || line > maximum) throw new Error(`Line ${line} is outside 1-${maximum}.`);
-  if (line === starts.length + 1) return source.length;
-  return starts[line - 1];
+  return applied.newContent;
 }
 
 function normalizedRelativeTarget(resolved: ResolvedLocalToolPath): string {
@@ -369,7 +255,7 @@ function normalizedRelativeTarget(resolved: ResolvedLocalToolPath): string {
 }
 
 function decodeUtf8Exact(bytes: Buffer, label: string): string {
-  const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  const decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   if (!Buffer.from(decoded, 'utf8').equals(bytes)) throw new Error(`${label} is not canonical UTF-8 text.`);
   return decoded;
 }
@@ -377,11 +263,6 @@ function decodeUtf8Exact(bytes: Buffer, label: string): string {
 function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
   return value;
-}
-
-function requireUnknownRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
-  return value as Record<string, unknown>;
 }
 
 function requireString(value: unknown, label: string): string {
@@ -393,13 +274,6 @@ function requireText(value: unknown, label: string): string {
   const text = requireString(value, label).trim();
   if (!text) throw new TypeError(`${label} must be non-empty.`);
   return text;
-}
-
-function requirePositiveLine(value: unknown, label: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
-    throw new TypeError(`${label} must be a positive integer.`);
-  }
-  return value;
 }
 
 function isNotFound(error: unknown): boolean {

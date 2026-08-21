@@ -542,11 +542,13 @@ async function checkCompressionNodeBound() {
     const metrics = {};
     const seeded = await seedTurn(ctx, 'compression-bound', { thresholdTokens: 2 });
     const context = new kernel.ContextSequenceControlPlane(ctx.database, ctx.store);
+    const beforeToolDelivery = runtimeDeliveryFixture('before-tool', seeded.turnId, 'before-tool-original');
     await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'system',
-      source: { sourceKind: 'system', sourceId: 'before-tool', sourceRevision: '0' },
-      content: 'before-tool-original', contentType: 'text/plain'
+      segmentKind: 'runtime_context',
+      source: { sourceKind: 'runtime_context', sourceId: 'before-tool', sourceRevision: '0' },
+      content: beforeToolDelivery.content,
+      contentType: beforeToolDelivery.contentType
     });
     const pair = await seedToolPair(ctx, seeded, 'pair-bound');
     const pairAppend = await context.appendToolPair({
@@ -555,11 +557,17 @@ async function checkCompressionNodeBound() {
       toolModelResultId: pair.toolModelResultId
     });
     for (let index = 0; index < 4; index += 1) {
+      const tailDelivery = runtimeDeliveryFixture(
+        `tail-bound-${index}`,
+        seeded.turnId,
+        `tail-bound-${index}`
+      );
       await context.appendContent({
         conversationId: seeded.conversationId,
-        segmentKind: 'system',
-        source: { sourceKind: 'system', sourceId: `tail-bound-${index}`, sourceRevision: '0' },
-        content: `tail-bound-${index}`, contentType: 'text/plain'
+        segmentKind: 'runtime_context',
+        source: { sourceKind: 'runtime_context', sourceId: `tail-bound-${index}`, sourceRevision: '0' },
+        content: tailDelivery.content,
+        contentType: tailDelivery.contentType
       });
     }
     const sourceRootId = await context.currentHeadRootId(seeded.conversationId);
@@ -612,16 +620,17 @@ async function checkCompressionNodeBound() {
     const multimodal = await seedTurn(ctx, 'compression-multimodal-token-estimate', {
       thresholdTokens: 100_000
     });
-    await context.appendContent({
-      conversationId: multimodal.conversationId,
-      segmentKind: 'system',
-      source: { sourceKind: 'system', sourceId: 'large-inline-image', sourceRevision: '0' },
-      content: JSON.stringify({
+    await appendMessageContextFixture(
+      ctx,
+      multimodal,
+      'large-inline-image',
+      'user',
+      JSON.stringify({
         role: 'user',
         parts: [{ inlineData: { mimeType: 'image/png', data: 'A'.repeat(700_000) } }]
       }),
-      contentType: 'application/vnd.limcode.message+json'
-    });
+      'application/vnd.limcode.message+json'
+    );
     const multimodalRootId = await context.currentHeadRootId(multimodal.conversationId);
     const multimodalRoot = await get(ctx.database, 'ContextSequenceRoot', multimodalRootId);
     assert.ok(Number(multimodalRoot.estimated_tokens) > 100_000, 'legacy durable byte cache should reproduce the false threshold crossing');
@@ -654,16 +663,21 @@ async function checkCompressionNodeBound() {
     for (const sourceCount of [1, 64, 512]) {
       const sized = await seedTurn(ctx, `compression-size-${sourceCount}`, { thresholdTokens: 1 });
       for (let index = 1; index < sourceCount; index += 1) {
+        const sizedDelivery = runtimeDeliveryFixture(
+          `compression-size-${sourceCount}-${index}`,
+          sized.turnId,
+          `compression-size-${sourceCount}-${index}`
+        );
         await context.appendContent({
           conversationId: sized.conversationId,
-          segmentKind: 'system',
+          segmentKind: 'runtime_context',
           source: {
-            sourceKind: 'system',
+            sourceKind: 'runtime_context',
             sourceId: `compression-size-${sourceCount}-${index}`,
             sourceRevision: '0'
           },
-          content: `compression-size-${sourceCount}-${index}`,
-          contentType: 'text/plain'
+          content: sizedDelivery.content,
+          contentType: sizedDelivery.contentType
         });
       }
       const sizedRoot = await context.currentHeadRootId(sized.conversationId);
@@ -700,15 +714,19 @@ async function checkCompressionNodeBound() {
     assert.equal(compressed.root.tail_segment_count, BigInt(expectedTail.length));
     assertions.push('compression root严格物化summary+finite tail，到tail_segment_count即停止且不重新带回被替换原文');
 
+    const afterCompressionDelivery = runtimeDeliveryFixture(
+      'after-compression', seeded.turnId, 'after-compression'
+    );
     const appended = await context.appendContent({
       conversationId: seeded.conversationId,
-      segmentKind: 'system',
-      source: { sourceKind: 'system', sourceId: 'after-compression', sourceRevision: '0' },
-      content: 'after-compression', contentType: 'text/plain'
+      segmentKind: 'runtime_context',
+      source: { sourceKind: 'runtime_context', sourceId: 'after-compression', sourceRevision: '0' },
+      content: afterCompressionDelivery.content,
+      contentType: afterCompressionDelivery.contentType
     });
     const afterAppend = await context.materialize(appended.rootId);
     assert.deepEqual(afterAppend.segments.map((segment) => segment.content.toString('utf8')), [
-      'FINITE-SUMMARY', ...expectedTail, 'after-compression'
+      'FINITE-SUMMARY', ...expectedTail, afterCompressionDelivery.content
     ]);
     assertions.push('compression后普通append只延长有限tail并继续复用summary，不重接被压缩prefix');
 
@@ -814,7 +832,6 @@ async function checkCompressionNodeBound() {
     return { assertions, faults, metrics };
   });
 }
-
 async function checkProviderFullRequest() {
   const authority = JSON.parse(await fs.readFile(
     path.join(root, 'docs/architecture/reliable-kernel/contracts/authority.json'),
@@ -1078,6 +1095,7 @@ async function checkProviderFullRequest() {
       authoritySnapshot: expectedOriginalAuthority,
       recipe: { temperature: 0, tools: [{ name: 'echo' }] },
       context: expectedOriginalContext,
+      attachmentCatalog: [],
       requestCreatedAt: payloads[0].requestCreatedAt
     });
     assert.deepEqual(payloads[1], {
@@ -2587,7 +2605,7 @@ async function checkImmutableReplacement() {
             }]
           })
         : `coordinator-message-${index}-${'x'.repeat(256)}`;
-      await appendMessageContextFixture(
+      const appended = await appendMessageContextFixture(
         ctx,
         coordinatorSeed,
         `compression-coordinator-${index}`,
@@ -2595,6 +2613,28 @@ async function checkImmutableReplacement() {
         attachmentMessage,
         index === 1 ? 'application/vnd.limcode.message+json' : 'text/plain'
       );
+      if (index === 1) {
+        const now = new Date().toISOString();
+        await ctx.database.transaction([
+          kernel.DOMAIN_REPOSITORIES.domain('Attachment').insert({
+            id: coordinatorAttachment.attachmentId,
+            sha256: 'e'.repeat(64),
+            byte_length: BigInt(coordinatorAttachment.sizeBytes),
+            mime_type: coordinatorAttachment.mimeType,
+            name: coordinatorAttachment.name,
+            storage_mode: 'managed',
+            content_object_id: null,
+            created_at: now
+          }),
+          kernel.DOMAIN_REPOSITORIES.domain('AttachmentLink').insert({
+            id: 'attachment-link-compression-coordinator',
+            message_revision_id: appended.revisionId,
+            attachment_id: coordinatorAttachment.attachmentId,
+            position: 0n,
+            created_at: now
+          })
+        ]);
+      }
     }
     const coordinatorHead = await context.currentHeadRootId(coordinatorSeed.conversationId);
     let compactDispatches = 0;
@@ -2613,6 +2653,8 @@ async function checkImmutableReplacement() {
               assert.equal(request.recipe.requestKind, 'context_compression_pre');
               assert.equal(request.recipe.sourceSegmentCount, 4);
               assert.equal(request.context.length, 4);
+              assert.deepEqual(request.recipe.attachmentCatalog, [coordinatorAttachment]);
+              assert.deepEqual(request.attachmentCatalog, [coordinatorAttachment]);
               frozenCompressionBlockId = request.recipe.blockId;
               await controls.onEvent({
                 kind: 'completed',
@@ -2725,14 +2767,10 @@ async function checkImmutableReplacement() {
     const structuredMetadata = await get(ctx.database, 'ContentObject', coordinatedBlock.summary_object_id);
     assert.equal(structuredMetadata.content_type, kernel.CONTENT_TYPE_COMPRESSION_CONTENTS);
     const structuredCompression = JSON.parse((await ctx.store.read(structuredMetadata)).toString('utf8'));
-    const structuredCatalogContent = kernel.renderAttachmentCatalog(structuredCompression.attachmentCatalog);
-    assert.ok(structuredCatalogContent);
+    assert.equal(structuredCompression.attachmentCatalog, undefined);
     assert.equal(
       structuredCompression.estimatedTokens,
-      kernel.estimateMessageContentsTokens([
-        ...structuredCompression.contents,
-        structuredCatalogContent
-      ])
+      kernel.estimateMessageContentsTokens(structuredCompression.contents)
     );
     assert.equal(structuredCompression.trigger, 'auto');
     assert.equal(structuredCompression.triggerReason, 'configured_threshold');
@@ -2742,14 +2780,18 @@ async function checkImmutableReplacement() {
     assert.equal(structuredCompression.estimatedTokensBefore, 1);
     assert.equal(structuredCompression.providerInputTokens, 77);
     assert.equal(structuredCompression.methodKind, 'deterministic_summary');
-    assert.deepEqual(structuredCompression.attachmentCatalog, [coordinatorAttachment]);
-    assert.doesNotMatch(JSON.stringify(structuredCompression.attachmentCatalog), /sha256|sourcePath|data|private/);
     assert.deepEqual(structuredCompression.contents, [
       { role: 'model', parts: [{ text: 'STRUCTURED-SUMMARY-CONTENT' }] }
     ]);
     const coordinatedMaterialized = await context.materialize(coordinated.result.rootId);
     assert.equal(coordinatedMaterialized.segments.length, 2);
     assert.equal(coordinatedMaterialized.segments[0].segmentKind, 'compression');
+    assert.deepEqual(await new kernel.AttachmentCatalogProjection(ctx.database).project(
+      coordinatedMaterialized.segments.map((segment) => ({
+        segmentId: segment.segmentId,
+        segmentKind: segment.segmentKind
+      }))
+    ), [coordinatorAttachment]);
     let adapterCompactRequest;
     let adapterStartRequest;
     const capabilityAdapter = new kernel.LlmCapabilityFullRequestAdapter('fake-local', {
@@ -2800,6 +2842,7 @@ async function checkImmutableReplacement() {
       kind: 'full-model-request', modelRequestId: 'adapter-compact',
       conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
+      attachmentCatalog: [],
       recipe: {
         kind: 'reliable-context-compression', sourceSegmentCount: 2,
         blockId: 'adapter-block', sourceHash: 'adapter-source', effectiveSummaryMaxTokens: 256
@@ -2835,6 +2878,7 @@ async function checkImmutableReplacement() {
       kind: 'full-model-request', modelRequestId: 'adapter-ordinary',
       conversationId: coordinatorSeed.conversationId, attemptSeq: '1', socketGeneration: '1',
       providerId: 'fake-local', modelId: 'fake-model', authoritySnapshot: adapterAuthority,
+      attachmentCatalog: [],
       recipe: { kind: 'reliable-agent-turn', round: '1', tools: [] },
       context: [{
         segmentId: 'adapter-summary', segmentKind: 'compression', messageRole: null,
@@ -3443,7 +3487,7 @@ function assertNoContinuationPayload(request) {
   assert.ok(Array.isArray(request.context) && request.context.length > 0);
   const required = [
     'kind', 'modelRequestId', 'conversationId', 'attemptSeq', 'socketGeneration', 'providerId', 'modelId',
-    'authoritySnapshot', 'recipe', 'context', 'requestCreatedAt'
+    'authoritySnapshot', 'recipe', 'context', 'attachmentCatalog', 'requestCreatedAt'
   ];
   const expected = Object.prototype.hasOwnProperty.call(request, 'settingsSnapshot')
     ? [...required, 'settingsSnapshot']

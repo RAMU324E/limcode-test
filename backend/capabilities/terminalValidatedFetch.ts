@@ -1,6 +1,22 @@
 import type { LlmProviderKind } from '../../shared/protocol';
+import {
+  annotateProviderWireError,
+  emitProviderWireInvariantTrace,
+  inspectFinalProviderWireBody,
+  type LlmProviderWireInvariantTrace
+} from './providerWireInvariant';
+
+export type {
+  LlmProviderWireInvariantTrace,
+  LlmProviderWireToolItemTrace
+} from './providerWireInvariant';
 
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60_000;
+
+export interface TerminalValidatedFetchOptions {
+  bodyIdleTimeoutMs?: number;
+  onWireInvariantTrace?: (trace: LlmProviderWireInvariantTrace) => void;
+}
 
 export class LlmHttpStreamTerminationError extends Error {
   public readonly code: 'LLM_STREAM_TRUNCATED' | 'LLM_TRANSPORT_TIMEOUT';
@@ -24,11 +40,16 @@ export class LlmHttpStreamTerminationError extends Error {
 export function createTerminalValidatedFetch(
   baseFetch: typeof fetch,
   provider: LlmProviderKind,
-  options: { bodyIdleTimeoutMs?: number } = {}
+  options: TerminalValidatedFetchOptions = {}
 ): typeof fetch {
   const bodyIdleTimeoutMs = positiveTimeout(options.bodyIdleTimeoutMs ?? DEFAULT_BODY_IDLE_TIMEOUT_MS);
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    const response = await baseFetch(input, init);
+    const wireTrace = await inspectFinalProviderWireBody(input, init, provider);
+    if (wireTrace) emitProviderWireInvariantTrace(options.onWireInvariantTrace, wireTrace);
+    let response = await baseFetch(input, init);
+    if (!response.ok && wireTrace?.toolItems.length) {
+      response = annotateProviderWireError(response, wireTrace.bodySha256);
+    }
     if (!response.ok || !response.body || !isEventStream(response.headers.get('content-type'))) return response;
 
     const reader = response.body.getReader();

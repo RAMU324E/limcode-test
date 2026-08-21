@@ -11,11 +11,8 @@ import {
   type ModelOutputItemReference
 } from '../../shared/protocol';
 import {
-  collectAttachmentCatalogFromStoredItems,
-  mergeAttachmentCatalog,
   normalizeAttachmentCatalog,
-  renderAttachmentCatalog,
-  type AttachmentCatalogStoredItem
+  renderAttachmentCatalog
 } from './attachmentCatalog';
 import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import {
@@ -514,7 +511,6 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       : '';
   if (runtimeContextText) systemParts.push(runtimeContextText);
   const contents: MessageContent[] = [];
-  const attachmentCatalogs = [collectAttachmentCatalogFromStoredItems(request.context)];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
   for (const item of request.context) {
     if (item.segmentKind === 'system') {
@@ -535,7 +531,6 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       const start = contents.length;
       contents.push(...compressed.contents);
       canonicalCompressionRanges.push({ start, end: contents.length });
-      attachmentCatalogs.push(compressed.attachmentCatalog);
       continue;
     }
     if (item.segmentKind === 'runtime_context') {
@@ -551,13 +546,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     contents.push({ role, parts: [{ text: item.content }] });
   }
   const currentTurnInput = request.requestAddenda?.currentTurnInput;
-  const currentAttachmentItem: AttachmentCatalogStoredItem[] = currentTurnInput
-    ? [{ content: currentTurnInput.content, contentType: currentTurnInput.contentType }]
-    : [];
-  const attachmentCatalog = mergeAttachmentCatalog(
-    ...attachmentCatalogs,
-    collectAttachmentCatalogFromStoredItems(currentAttachmentItem)
-  );
+  const attachmentCatalog = normalizeAttachmentCatalog(request.attachmentCatalog, 'Provider request attachmentCatalog');
   const attachmentCatalogContent = renderAttachmentCatalog(
     attachmentCatalog,
     (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
@@ -756,7 +745,6 @@ function compressionContext(
     0,
     typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length
   );
-  const attachmentCatalog = collectAttachmentCatalogFromStoredItems(sourceContext);
   const modelHandleCatalog = buildModelHandleCatalog(sourceContext.map((item) => item.content));
   const requestedCount = recipe.sourceSegmentCount;
   if (!Number.isSafeInteger(requestedCount) || (requestedCount as number) <= 0
@@ -807,14 +795,8 @@ function compressionContext(
       canonicalCompressionRanges.push({ start: protectedStart, end: contents.length });
     }
   }
-  const attachmentCatalogContent = renderAttachmentCatalog(
-    attachmentCatalog,
-    (entry) => modelHandleRef(modelHandleCatalog, 'attachment', entry.attachmentId)
-  );
-  if (attachmentCatalogContent) {
-    contents.push(attachmentCatalogContent);
-    current.push(attachmentCatalogContent);
-  }
+  // Attachment directories are ordinary request-local projections. Summary/Compact providers receive
+  // only frozen source contents; the resulting compression segment keeps lineage, not a catalog copy.
   flush();
   if (methodKind === 'openai_responses_compact') {
     return {
@@ -879,7 +861,6 @@ interface CompressionProviderBinding {
 
 interface DecodedCompressionContents {
   contents: MessageContent[];
-  attachmentCatalog: ReturnType<typeof normalizeAttachmentCatalog>;
   nativeBinding?: CompressionProviderBinding;
 }
 
@@ -899,14 +880,13 @@ function decodeCompressionContents(content: string, contentType: string): Decode
     }
     return item as unknown as MessageContent;
   });
-  const attachmentCatalog = normalizeAttachmentCatalog(envelope.attachmentCatalog);
   const rawBinding = asRecord(envelope.nativeBinding);
   const nativeBinding = rawBinding ? {
     providerConfigId: requireText(rawBinding.providerConfigId, 'Compression native providerConfigId'),
     provider: requireProviderKind(normalizePlainJson(rawBinding.provider, 'Compression native provider')),
     modelId: requireText(rawBinding.modelId, 'Compression native modelId')
   } : undefined;
-  return { contents, attachmentCatalog, ...(nativeBinding ? { nativeBinding } : {}) };
+  return { contents, ...(nativeBinding ? { nativeBinding } : {}) };
 }
 
 function assertCompressionBinding(

@@ -1,5 +1,6 @@
 import type { EditToolMode } from '../../shared/protocol';
 import type { FsHunkEditRequest } from './types';
+import { applyExactEditHunk, convertLineEndings, firstLineEnding, normalizeLineEndings } from '../../shared/editHunkMatcher';
 
 export interface EditApplyResult {
   mode: EditToolMode;
@@ -30,7 +31,7 @@ export interface EditApplyHunkResult {
 }
 
 export function applyHunkEdit(originalContent: string, hunks: FsHunkEditRequest[]): EditApplyResult {
-  let currentContent = normalizeLineEndings(originalContent);
+  let currentContent = originalContent;
   const results: EditApplyHunkResult[] = [];
 
   for (let index = 0; index < hunks.length; index += 1) {
@@ -40,36 +41,35 @@ export function applyHunkEdit(originalContent: string, hunks: FsHunkEditRequest[
       continue;
     }
 
-    const oldContent = normalizeLineEndings(hunk.oldContent);
-    const newContent = normalizeLineEndings(hunk.newContent);
+    const oldContent = hunk.oldContent;
+    const newContent = hunk.newContent;
     const replaceAll = hunk.replaceAll === true;
     if (!oldContent) {
       results.push({ index, success: false, error: `Hunk ${index} has empty oldContent. Provide existing file content to locate the replacement.`, matchCount: 0 });
       continue;
     }
 
-    const matches = findAllExactMatchIndexes(currentContent, oldContent);
-    const candidateLines = matches.slice(0, 20).map((matchIndex) => getLineNumberAtIndex(currentContent, matchIndex));
+    const applied = applyExactEditHunk(currentContent, { oldContent, newContent, replaceAll });
+    const matches = applied.matches;
+    const candidateLines = matches.slice(0, 20).map((match) => getLineNumberAtIndex(currentContent, match.sourceStart));
     if (matches.length === 0) {
       results.push({ index, success: false, error: `Hunk ${index}: no exact match found for oldContent.`, matchCount: 0 });
       continue;
     }
 
-    const replacementIndexes = replaceAll ? matches : [matches[0]];
-    const newFileContent = replaceAtIndexes(currentContent, replacementIndexes, oldContent.length, newContent);
-    const firstMatch = replacementIndexes[0];
+    const firstMatch = matches[0]!.sourceStart;
     const startLine = getLineNumberAtIndex(currentContent, firstMatch);
     const endLine = startLine + Math.max(countTextLines(newContent), 1) - 1;
 
-    currentContent = newFileContent;
+    currentContent = applied.content;
     results.push({
       index,
       success: true,
       startLine,
       endLine,
       appliedBy: replaceAll ? 'search_replace_all' : 'search_replace_first',
-      matchCount: matches.length,
-      replacements: replacementIndexes.length,
+      matchCount: applied.matchCount,
+      replacements: applied.replacements,
       candidateLines
     });
   }
@@ -87,15 +87,13 @@ export function applyHunkEdit(originalContent: string, hunks: FsHunkEditRequest[
 }
 
 export function applyInsertEdit(originalContent: string, line: number, content: string): EditApplyResult {
-  const normalized = normalizeLineEndings(originalContent);
-  const split = splitLinesPreserveTrailing(normalized);
-  const lines = split.lines;
-  const totalLines = lines.length;
+  const offsets = lineStartOffsets(originalContent);
+  const totalLines = offsets.length;
 
   if (!Number.isFinite(line) || line < 1) {
     return {
       mode: 'insert',
-      newContent: normalized,
+      newContent: originalContent,
       totalHunks: 1,
       applied: 0,
       failed: 1,
@@ -105,7 +103,7 @@ export function applyInsertEdit(originalContent: string, line: number, content: 
   if (line > totalLines + 1) {
     return {
       mode: 'insert',
-      newContent: normalized,
+      newContent: originalContent,
       totalHunks: 1,
       applied: 0,
       failed: 1,
@@ -113,12 +111,19 @@ export function applyInsertEdit(originalContent: string, line: number, content: 
     };
   }
 
-  const insertText = normalizeLineEndings(content);
-  const insertLines = insertText === '' ? [] : insertText.split('\n');
-  const insertIndex = line - 1;
-  lines.splice(insertIndex, 0, ...insertLines);
-
-  const newContent = joinLinesPreserveTrailing(lines, split.endsWithNewline);
+  const eol = firstLineEnding(originalContent) ?? firstLineEnding(content) ?? '\n';
+  const insertText = convertLineEndings(content, eol);
+  const sourceEndsWithEol = /(?:\r\n|\r|\n)$/.test(originalContent);
+  let newContent: string;
+  if (line === totalLines + 1) {
+    const prefix = originalContent && !sourceEndsWithEol ? eol : '';
+    const suffix = sourceEndsWithEol && insertText && !/(?:\r\n|\r|\n)$/.test(insertText) ? eol : '';
+    newContent = `${originalContent}${prefix}${insertText}${suffix}`;
+  } else {
+    const insertOffset = offsets[line - 1]!;
+    const suffix = insertText && !/(?:\r\n|\r|\n)$/.test(insertText) ? eol : '';
+    newContent = `${originalContent.slice(0, insertOffset)}${insertText}${suffix}${originalContent.slice(insertOffset)}`;
+  }
   const endLine = line + Math.max(countTextLines(insertText), 1) - 1;
   return {
     mode: 'insert',
@@ -131,15 +136,13 @@ export function applyInsertEdit(originalContent: string, line: number, content: 
 }
 
 export function applyDeleteEdit(originalContent: string, startLine: number, endLine: number): EditApplyResult {
-  const normalized = normalizeLineEndings(originalContent);
-  const split = splitLinesPreserveTrailing(normalized);
-  const lines = split.lines;
-  const totalLines = lines.length;
+  const offsets = lineStartOffsets(originalContent);
+  const totalLines = offsets.length;
 
   if (!Number.isFinite(startLine) || startLine < 1 || !Number.isFinite(endLine) || endLine < 1) {
     return {
       mode: 'delete',
-      newContent: normalized,
+      newContent: originalContent,
       totalHunks: 1,
       applied: 0,
       failed: 1,
@@ -149,7 +152,7 @@ export function applyDeleteEdit(originalContent: string, startLine: number, endL
   if (startLine > endLine) {
     return {
       mode: 'delete',
-      newContent: normalized,
+      newContent: originalContent,
       totalHunks: 1,
       applied: 0,
       failed: 1,
@@ -159,7 +162,7 @@ export function applyDeleteEdit(originalContent: string, startLine: number, endL
   if (startLine > totalLines) {
     return {
       mode: 'delete',
-      newContent: normalized,
+      newContent: originalContent,
       totalHunks: 1,
       applied: 0,
       failed: 1,
@@ -168,11 +171,10 @@ export function applyDeleteEdit(originalContent: string, startLine: number, endL
   }
 
   const clampedEnd = Math.min(endLine, totalLines);
-  const deleteStart = startLine - 1;
-  const deleteCount = clampedEnd - deleteStart;
-  lines.splice(deleteStart, deleteCount);
-
-  const newContent = joinLinesPreserveTrailing(lines, split.endsWithNewline);
+  const deleteStart = offsets[startLine - 1]!;
+  const deleteEnd = clampedEnd === totalLines ? originalContent.length : offsets[clampedEnd]!;
+  const deleteCount = clampedEnd - startLine + 1;
+  const newContent = `${originalContent.slice(0, deleteStart)}${originalContent.slice(deleteEnd)}`;
   return {
     mode: 'delete',
     newContent,
@@ -183,50 +185,37 @@ export function applyDeleteEdit(originalContent: string, startLine: number, endL
   };
 }
 
-function splitLinesPreserveTrailing(text: string): { lines: string[]; endsWithNewline: boolean } {
-  const normalized = normalizeLineEndings(text);
-  const endsWithNewline = normalized.endsWith('\n');
-  const lines = normalized.split('\n');
-  if (endsWithNewline) lines.pop();
-  return { lines, endsWithNewline };
-}
-
-function joinLinesPreserveTrailing(lines: string[], endsWithNewline: boolean): string {
-  const body = lines.join('\n');
-  return endsWithNewline ? `${body}\n` : body;
-}
-
-function findAllExactMatchIndexes(content: string, search: string): number[] {
-  if (!search) return [];
-  const matches: number[] = [];
-  let fromIndex = 0;
-  while (fromIndex <= content.length) {
-    const found = content.indexOf(search, fromIndex);
-    if (found < 0) break;
-    matches.push(found);
-    fromIndex = found + Math.max(1, search.length);
+function lineStartOffsets(text: string): number[] {
+  const contentStart = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const starts = [contentStart];
+  for (let index = contentStart; index < text.length;) {
+    const code = text.charCodeAt(index);
+    if (code === 13) {
+      index += text.charCodeAt(index + 1) === 10 ? 2 : 1;
+      if (index < text.length) starts.push(index);
+      continue;
+    }
+    index += 1;
+    if (code === 10 && index < text.length) starts.push(index);
   }
-  return matches;
-}
-
-function replaceAtIndexes(content: string, indexes: number[], length: number, replacement: string): string {
-  let result = content;
-  for (const index of [...indexes].sort((left, right) => right - left)) {
-    result = `${result.slice(0, index)}${replacement}${result.slice(index + length)}`;
-  }
-  return result;
+  return starts;
 }
 
 function getLineNumberAtIndex(content: string, index: number): number {
   let line = 1;
-  for (let i = 0; i < index; i += 1) if (content.charCodeAt(i) === 10) line += 1;
+  for (let offset = 0; offset < index;) {
+    const code = content.charCodeAt(offset);
+    if (code === 13) {
+      offset += content.charCodeAt(offset + 1) === 10 ? 2 : 1;
+      line += 1;
+      continue;
+    }
+    offset += 1;
+    if (code === 10) line += 1;
+  }
   return line;
 }
 
 function countTextLines(text: string): number {
-  return text ? text.split('\n').length : 0;
-}
-
-function normalizeLineEndings(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return text ? normalizeLineEndings(text).split('\n').length : 0;
 }

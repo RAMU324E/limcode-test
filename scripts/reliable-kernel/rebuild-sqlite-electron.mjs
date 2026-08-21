@@ -26,7 +26,10 @@ const result = childProcess.spawnSync(
     cwd: root,
     encoding: 'utf8',
     stdio: 'inherit',
-    shell: process.platform === 'win32'
+    shell: process.platform === 'win32',
+    // better-sqlite3 13 ships host prebuilds and its binding.gyp otherwise emits a no-op target.
+    // Force the real addon target so a successful electron-rebuild cannot silently leave no output.
+    env: { ...process.env, npm_config_force_build: '1' }
   }
 );
 if (result.error) throw result.error;

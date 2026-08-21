@@ -48,6 +48,7 @@ import {
   isLocalFolderWorkEnvironment,
   workEnvironmentIdFromUri
 } from '../../shared/workEnvironmentCatalog';
+import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBoundary';
 import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
 import {
   loadLlmCompressionConfigsSettings,
@@ -327,8 +328,15 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     )]
       .filter((id) => availableWorkEnvironmentIds.includes(id))
       .sort();
+    const { allowedWorkEnvironmentIds: effectiveAllowedWorkEnvironmentIds, inheritedDefaultWorkEnvironmentId } =
+      applyInheritedWorkEnvironmentBoundary(
+        allowedWorkEnvironmentIds,
+        request.inheritedWorkEnvironmentPolicy,
+        availableWorkEnvironmentIds
+      );
     const promptWorkEnvironments = workEnvironmentPolicy?.enabled === true
-      ? allowedWorkEnvironmentIds
+      || request.inheritedWorkEnvironmentPolicy !== undefined
+      ? effectiveAllowedWorkEnvironmentIds
         .map((id) => records.workEnvironments.find((environment) => environment.id === id))
         .filter((environment): environment is WorkEnvironmentRecord => !!environment)
       // 与旧 ECS runtimeContextWorkEnvironmentsForConversation 一致：策略停用时只暴露本地 folder，
@@ -361,13 +369,13 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       link.conversationId === request.conversationId && link.role === 'active'
     ));
     const preferredWorkEnvironmentId = selectedEnvironment?.workEnvironmentId
-      && allowedWorkEnvironmentIds.includes(selectedEnvironment.workEnvironmentId)
+      && effectiveAllowedWorkEnvironmentIds.includes(selectedEnvironment.workEnvironmentId)
       ? selectedEnvironment.workEnvironmentId
-      : workEnvironmentPolicy?.defaultWorkEnvironmentId;
+      : workEnvironmentPolicy?.defaultWorkEnvironmentId ?? inheritedDefaultWorkEnvironmentId ?? undefined;
     const defaultWorkEnvironmentId = preferredWorkEnvironmentId
-      && allowedWorkEnvironmentIds.includes(preferredWorkEnvironmentId)
+      && effectiveAllowedWorkEnvironmentIds.includes(preferredWorkEnvironmentId)
       ? preferredWorkEnvironmentId
-      : allowedWorkEnvironmentIds[0] ?? null;
+      : effectiveAllowedWorkEnvironmentIds[0] ?? null;
 
     const executionPreset = {
       kind: 'turn-execution-preset',
@@ -432,7 +440,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       workEnvironmentPolicy: {
         id: workEnvironmentPolicy?.id ?? null,
         enabled: workEnvironmentPolicy?.enabled ?? false,
-        allowedWorkEnvironmentIds,
+        allowedWorkEnvironmentIds: effectiveAllowedWorkEnvironmentIds,
         defaultWorkEnvironmentId
       }
     };
@@ -961,6 +969,28 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
 
 }
 
+/**
+ * Child executions inherit the parent Turn's frozen work-environment boundary: the child's own
+ * scoped allow-list is intersected with the parent's, never widened. An empty intersection remains
+ * empty so mutually exclusive policies fail closed instead of granting either side's environments.
+ */
+function applyInheritedWorkEnvironmentBoundary(
+  allowed: readonly string[],
+  inherited: FrozenWorkEnvironmentBoundaryPolicy | undefined,
+  availableIds: readonly string[]
+): { allowedWorkEnvironmentIds: string[]; inheritedDefaultWorkEnvironmentId: string | null } {
+  if (!inherited) {
+    return { allowedWorkEnvironmentIds: [...allowed], inheritedDefaultWorkEnvironmentId: null };
+  }
+  const inheritedAllowed = [...new Set(inherited.allowedWorkEnvironmentIds)]
+    .filter((id) => availableIds.includes(id));
+  const intersected = allowed.filter((id) => inheritedAllowed.includes(id));
+  return {
+    allowedWorkEnvironmentIds: [...new Set(intersected)].sort(),
+    inheritedDefaultWorkEnvironmentId: inherited.defaultWorkEnvironmentId
+  };
+}
+
 function projectWorkEnvironmentPolicies(
   policies: readonly WorkEnvironmentPolicyRecord[],
   environments: readonly WorkEnvironmentRecord[],
@@ -969,19 +999,26 @@ function projectWorkEnvironmentPolicies(
   const availableIds = new Set(
     environments.filter((environment) => environment.available).map((environment) => environment.id)
   );
-  const workspaceIds = [...currentWorkspaceFolderIds].filter((id) => availableIds.has(id));
+  // Each Host projects its own workspace folders into the allow-list and default without
+  // publishing host-local facts into the shared policy store. Folder order follows environment index.
+  const workspaceIds = environments
+    .filter((environment) => environment.available && currentWorkspaceFolderIds.has(environment.id))
+    .sort((left, right) => (left.index ?? 0) - (right.index ?? 0) || left.id.localeCompare(right.id))
+    .map((environment) => environment.id);
   return policies.map((policy) => {
-    const configuredAvailableIds = policy.allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
-    // Preserve the former automatic local-folder fallback without publishing this Host's default
-    // into the shared policy store. Any configured environment that is usable here still wins.
-    const allowedWorkEnvironmentIds = configuredAvailableIds.length > 0 || workspaceIds.length === 0
-      ? [...policy.allowedWorkEnvironmentIds]
-      : [...new Set([...policy.allowedWorkEnvironmentIds, ...workspaceIds])];
+    // Workspace folders always join the projected allow-list so they appear checked in the editor
+    // regardless of whether the shared policy already lists them.
+    const allowedWorkEnvironmentIds = workspaceIds.length > 0
+      ? [...new Set([...workspaceIds, ...policy.allowedWorkEnvironmentIds])]
+      : [...policy.allowedWorkEnvironmentIds];
     const eligibleDefaultIds = allowedWorkEnvironmentIds.filter((id) => availableIds.has(id));
-    const defaultWorkEnvironmentId = policy.defaultWorkEnvironmentId
-      && eligibleDefaultIds.includes(policy.defaultWorkEnvironmentId)
-      ? policy.defaultWorkEnvironmentId
-      : eligibleDefaultIds[0];
+    // Prefer this Host's primary workspace folder as projected default when available;
+    // fall back to the stored policy default if it remains eligible.
+    const defaultWorkEnvironmentId = workspaceIds.length > 0
+      ? workspaceIds[0]
+      : policy.defaultWorkEnvironmentId && eligibleDefaultIds.includes(policy.defaultWorkEnvironmentId)
+        ? policy.defaultWorkEnvironmentId
+        : eligibleDefaultIds[0];
     const { defaultWorkEnvironmentId: _storedDefault, ...rest } = policy;
     return {
       ...rest,

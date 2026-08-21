@@ -12,9 +12,11 @@ import {
   PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS,
   PROCESS_OUTPUT_MAX_TERMINAL_TAIL_BYTES_PER_STREAM,
   PROCESS_TERMINATION_GRACE_MS,
+  PROCESS_WRAPPER_BOOTSTRAP_FILE,
   PROCESS_WRAPPER_CHUNKS_DIRECTORY,
   PROCESS_WRAPPER_EXIT_RECEIPT_FILE,
   PROCESS_WRAPPER_IDENTITY_FILE,
+  PROCESS_WRAPPER_LAUNCH_FAILURE_FILE,
   PROCESS_WRAPPER_MANIFEST_FILE,
   PROCESS_WRAPPER_PROTOCOL,
   PROCESS_WRAPPER_STOP_REQUEST_FILE,
@@ -25,14 +27,19 @@ import {
   type ProcessStopRequest,
   type ProcessStreamKind,
   type ProcessTerminationReason,
+  type ProcessWrapperBootstrapPhase,
+  type ProcessWrapperBootstrapReceipt,
   type ProcessWrapperExitReceipt,
   type ProcessWrapperIdentity,
+  type ProcessWrapperLaunchFailureReceipt,
   type ProcessWrapperLaunchRequest,
   type ProcessWrapperManifest
 } from './processProtocol';
 
 const windowsProcessFingerprints = new Map<string, string>();
 const PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE = 'bootstrap.ready';
+const PROCESS_WRAPPER_RENAME_MAX_ATTEMPTS = 6;
+const PROCESS_WRAPPER_RENAME_RETRY_DELAY_MS = 15;
 
 interface StreamState {
   tail: Buffer;
@@ -62,7 +69,7 @@ interface WrapperState {
 
 if (require.main === module) {
   runWrapper(process.argv[2]).catch((error) => {
-    // Missing/corrupt evidence is deliberately handled as outcome_unknown by the host recovery scan.
+    // Valid launch contracts publish a durable failure receipt before this bounded stderr fallback.
     console.error(`[limcode-process-wrapper] ${boundedErrorMessage(error)}`);
     process.exitCode = 1;
   });
@@ -75,80 +82,102 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
   const request = parseLaunchRequest(JSON.parse(fs.readFileSync(requestPath, 'utf8')));
   if (path.basename(spoolPath) !== request.spoolLocator) throw new Error('Launch request spool locator mismatch.');
   const chunksPath = path.join(spoolPath, PROCESS_WRAPPER_CHUNKS_DIRECTORY);
-  fs.mkdirSync(chunksPath, { recursive: true });
+  let bootstrapPhase: ProcessWrapperBootstrapPhase = 'wrapper_spawned';
+  let childPid: string | null = null;
+  let child!: ReturnType<typeof spawn>;
+  let exitPromise!: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  let closePromise!: Promise<void>;
+  let identity!: ProcessWrapperIdentity;
+  let state!: WrapperState;
+  writeBootstrapReceipt(request, spoolPath, bootstrapPhase, childPid);
 
-  const child = process.platform === 'win32'
-    ? spawnWindowsPowerShellCommand(request, spoolPath)
-    : (() => {
-        const bashExecutable = '/bin/bash';
-        const bootstrapCommand = `IFS= read -r _ <&3 || exit 125; exec ${bashExecutable} -c ${shellQuote(request.command)}`;
-        return spawn(bootstrapCommand, {
-          cwd: request.cwd,
-          shell: bashExecutable,
-          detached: true,
-          stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-          windowsHide: true
-        });
-      })();
-  const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    child.once('error', reject);
-    child.once('exit', (code, signal) => resolve({ code, signal }));
-  });
-  const closePromise = new Promise<void>((resolve) => {
-    child.once('close', () => resolve());
-    child.once('error', () => resolve());
-  });
-  if (!child.pid) {
-    await exitPromise;
-    throw new Error('Detached wrapper did not observe a child PID.');
-  }
-  const childPid = String(child.pid);
-  let startFingerprint: string;
   try {
-    startFingerprint = readProcessStartFingerprint(childPid);
+    fs.mkdirSync(chunksPath, { recursive: true });
+
+    child = process.platform === 'win32'
+      ? spawnWindowsPowerShellCommand(request, spoolPath)
+      : (() => {
+          const bashExecutable = '/bin/bash';
+          const bootstrapCommand = `IFS= read -r _ <&3 || exit 125; exec ${bashExecutable} -c ${shellQuote(request.command)}`;
+          return spawn(bootstrapCommand, {
+            cwd: request.cwd,
+            shell: bashExecutable,
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+            windowsHide: true
+          });
+        })();
+    exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    closePromise = new Promise<void>((resolve) => {
+      child.once('close', () => resolve());
+      child.once('error', () => resolve());
+    });
+    if (!child.pid) {
+      await exitPromise;
+      throw new Error('Detached wrapper did not observe a child PID.');
+    }
+    childPid = String(child.pid);
+    bootstrapPhase = 'child_spawned';
+    writeBootstrapReceipt(request, spoolPath, bootstrapPhase, childPid);
+
+    let startFingerprint: string;
+    try {
+      startFingerprint = readProcessStartFingerprint(childPid);
+    } catch (error) {
+      await abortBlockedChild(childPid, exitPromise);
+      throw error;
+    }
+    if (process.platform === 'win32') windowsProcessFingerprints.set(childPid, startFingerprint);
+    identity = {
+      kind: PROCESS_WRAPPER_PROTOCOL,
+      processId: request.processId,
+      stableNonce: request.stableNonce,
+      wrapperPid: String(process.pid),
+      childPid,
+      processGroupId: childPid,
+      startFingerprint,
+      commandDigest: request.commandDigest,
+      spoolLocator: request.spoolLocator,
+      startedAt: new Date().toISOString()
+    };
+    state = {
+      request,
+      identity,
+      spoolPath,
+      chunksPath,
+      nextChunkSeq: 1n,
+      retainedBytes: 0n,
+      retainedChunks: 0n,
+      droppedBytes: 0n,
+      observedOutputBytes: 0n,
+      truncated: false,
+      stopRequested: false,
+      terminationReason: null,
+      terminationWitnesses: new Set(),
+      forceKillTimer: null,
+      forceKillDueAt: null,
+      deadlineTimer: null,
+      flushTimer: null,
+      stdout: { tail: Buffer.alloc(0) },
+      stderr: { tail: Buffer.alloc(0) }
+    };
+    try {
+      writeAtomicJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE), identity);
+      writeManifest(state, 'running');
+    } catch (error) {
+      await abortBlockedChild(childPid, exitPromise);
+      throw error;
+    }
   } catch (error) {
-    await abortBlockedChild(childPid, exitPromise);
-    throw error;
-  }
-  if (process.platform === 'win32') windowsProcessFingerprints.set(childPid, startFingerprint);
-  const identity: ProcessWrapperIdentity = {
-    kind: PROCESS_WRAPPER_PROTOCOL,
-    processId: request.processId,
-    stableNonce: request.stableNonce,
-    wrapperPid: String(process.pid),
-    childPid,
-    processGroupId: childPid,
-    startFingerprint,
-    commandDigest: request.commandDigest,
-    spoolLocator: request.spoolLocator,
-    startedAt: new Date().toISOString()
-  };
-  const state: WrapperState = {
-    request,
-    identity,
-    spoolPath,
-    chunksPath,
-    nextChunkSeq: 1n,
-    retainedBytes: 0n,
-    retainedChunks: 0n,
-    droppedBytes: 0n,
-    observedOutputBytes: 0n,
-    truncated: false,
-    stopRequested: false,
-    terminationReason: null,
-    terminationWitnesses: new Set(),
-    forceKillTimer: null,
-    forceKillDueAt: null,
-    deadlineTimer: null,
-    flushTimer: null,
-    stdout: { tail: Buffer.alloc(0) },
-    stderr: { tail: Buffer.alloc(0) }
-  };
-  try {
-    writeAtomicJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE), identity);
-    writeManifest(state, 'running');
-  } catch (error) {
-    await abortBlockedChild(childPid, exitPromise);
+    if (childPid && exitPromise) await abortBlockedChild(childPid, exitPromise).catch(() => undefined);
+    try {
+      writeLaunchFailureReceipt(request, spoolPath, bootstrapPhase, childPid, error);
+    } catch (receiptError) {
+      console.error(`[limcode-process-wrapper] launch failure receipt: ${boundedErrorMessage(receiptError, request, spoolPath)}`);
+    }
     throw error;
   }
 
@@ -159,20 +188,36 @@ async function runWrapper(requestPathInput: string | undefined): Promise<void> {
     observeStopRequest(state);
   }, Math.min(100, PROCESS_OUTPUT_MAX_FLUSH_DELAY_MS));
   state.deadlineTimer = scheduleExecutionDeadline(state);
-  if (process.platform === 'win32') {
-    writeAtomicBytes(
-      path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE),
-      Buffer.from('ready\n', 'utf8')
-    );
-  } else {
-    const bootstrapGate = child.stdio[3];
-    if (!bootstrapGate || typeof (bootstrapGate as NodeJS.WritableStream).end !== 'function') {
-      clearInterval(stopPoll);
-      clearWatchdogTimers(state);
-      await abortBlockedChild(childPid, exitPromise);
-      throw new Error('Detached wrapper bootstrap pipe is unavailable.');
+  try {
+    if (process.platform === 'win32') {
+      writeAtomicBytes(
+        path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE),
+        Buffer.from('ready\n', 'utf8')
+      );
+    } else {
+      const bootstrapGate = child.stdio[3];
+      if (!bootstrapGate || typeof (bootstrapGate as NodeJS.WritableStream).end !== 'function') {
+        throw new Error('Detached wrapper bootstrap pipe is unavailable.');
+      }
+      (bootstrapGate as NodeJS.WritableStream).end('\n');
     }
-    (bootstrapGate as NodeJS.WritableStream).end('\n');
+  } catch (error) {
+    clearInterval(stopPoll);
+    clearWatchdogTimers(state);
+    await abortBlockedChild(childPid, exitPromise).catch(() => undefined);
+    try {
+      writeLaunchFailureReceipt(request, spoolPath, 'child_spawned', childPid, error);
+    } catch (receiptError) {
+      console.error(`[limcode-process-wrapper] launch failure receipt: ${boundedErrorMessage(receiptError, request, spoolPath)}`);
+    }
+    throw error;
+  }
+  bootstrapPhase = 'identity_ready';
+  try {
+    writeBootstrapReceipt(request, spoolPath, bootstrapPhase, childPid);
+  } catch (error) {
+    // identity.json is already durable authority. Bootstrap progress is best-effort from here.
+    console.error(`[limcode-process-wrapper] ${boundedErrorMessage(error, request, spoolPath)}`);
   }
 
   const exit = await exitPromise.finally(() => clearInterval(stopPoll));
@@ -662,7 +707,35 @@ function spawnWindowsPowerShellCommand(
 ): ReturnType<typeof spawn> {
   const gatePath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE);
   const quotedGatePath = `'${gatePath.split("'").join("''")}'`;
-  const script = `$ProgressPreference = 'SilentlyContinue'; $gatePath = ${quotedGatePath}; while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }; Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ${request.command}`;
+  const commandTextBase64 = Buffer.from(request.command, 'utf8').toString('base64');
+  const script = [
+    `$ProgressPreference = 'SilentlyContinue'`,
+    `$gatePath = ${quotedGatePath}`,
+    `while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }`,
+    `Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue`,
+    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$limcodeCommandText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${commandTextBase64}'))`,
+    `$limcodeTokens = $null; $limcodeParseErrors = $null`,
+    `$limcodeCommandAst = [System.Management.Automation.Language.Parser]::ParseInput($limcodeCommandText, [ref]$limcodeTokens, [ref]$limcodeParseErrors)`,
+    // Windows PowerShell 5.1 resets $? to true for a parenthesized expression. Detect only
+    // that exact syntax shape; a recursive lexical "last command" would misclassify unexecuted branches.
+    `$limcodeLastStatement = @($limcodeCommandAst.EndBlock.Statements)[-1]`,
+    `$limcodeLastPipelineElement = if ($limcodeLastStatement -is [System.Management.Automation.Language.PipelineAst] -and $limcodeLastStatement.PipelineElements.Count -eq 1) { $limcodeLastStatement.PipelineElements[0] } else { $null }`,
+    `$limcodeParenExpression = if ($limcodeLastPipelineElement -is [System.Management.Automation.Language.CommandExpressionAst] -and $limcodeLastPipelineElement.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) { $limcodeLastPipelineElement.Expression } else { $null }`,
+    `$limcodeParenPipelineElements = if ($null -ne $limcodeParenExpression) { @($limcodeParenExpression.Pipeline.PipelineElements) } else { @() }`,
+    `$limcodeParenCommandName = if ($limcodeParenPipelineElements.Count -eq 1 -and $limcodeParenPipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) { $limcodeParenPipelineElements[0].GetCommandName() } else { $null }`,
+    `$limcodeErrorCount = $Error.Count; $LASTEXITCODE = $null`,
+    request.command,
+    `$limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE; $limcodeCommandAddedError = $Error.Count -gt $limcodeErrorCount`,
+    // Resolve the direct parenthesized command after execution so script-defined functions and aliases win.
+    `$limcodeParenCommandInfo = if ($null -ne $limcodeParenCommandName) { Get-Command -Name $limcodeParenCommandName -ErrorAction SilentlyContinue } else { $null }`,
+    `$limcodeParenthesizedNativeCommand = $null -ne $limcodeParenCommandInfo -and ($limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Application -or $limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::ExternalScript)`,
+    `if (-not $limcodeCommandSucceeded) { if ($null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }; exit 1 }`,
+    `if ($limcodeParenthesizedNativeCommand -and $null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }`,
+    `if ($null -ne $limcodeParenExpression -and $limcodeCommandAddedError) { exit 1 }`,
+    `exit 0`
+  ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   return spawn('powershell.exe', [
     '-NoLogo',
@@ -684,6 +757,54 @@ function spawnWindowsPowerShellCommand(
   });
 }
 
+function writeBootstrapReceipt(
+  request: ProcessWrapperLaunchRequest,
+  spoolPath: string,
+  phase: ProcessWrapperBootstrapPhase,
+  childPid: string | null
+): void {
+  const receipt: ProcessWrapperBootstrapReceipt = {
+    kind: PROCESS_WRAPPER_PROTOCOL,
+    processId: request.processId,
+    stableNonce: request.stableNonce,
+    wrapperPid: String(process.pid),
+    childPid,
+    commandDigest: request.commandDigest,
+    spoolLocator: request.spoolLocator,
+    phase,
+    updatedAt: new Date().toISOString()
+  };
+  writeAtomicJson(path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_FILE), receipt);
+}
+
+function writeLaunchFailureReceipt(
+  request: ProcessWrapperLaunchRequest,
+  spoolPath: string,
+  phase: Exclude<ProcessWrapperBootstrapPhase, 'identity_ready'>,
+  childPid: string | null,
+  error: unknown
+): void {
+  const candidate = error as { name?: unknown; code?: unknown };
+  const receipt: ProcessWrapperLaunchFailureReceipt = {
+    kind: PROCESS_WRAPPER_PROTOCOL,
+    processId: request.processId,
+    stableNonce: request.stableNonce,
+    wrapperPid: String(process.pid),
+    childPid,
+    commandDigest: request.commandDigest,
+    spoolLocator: request.spoolLocator,
+    phase,
+    commandReleased: false,
+    errorName: boundedMetadataText(candidate.name, 'Error', 128),
+    errorCode: typeof candidate.code === 'string'
+      ? boundedMetadataText(candidate.code, 'UNKNOWN', 128)
+      : null,
+    errorMessage: boundedErrorMessage(error, request, spoolPath),
+    failedAt: new Date().toISOString()
+  };
+  writeAtomicJson(path.join(spoolPath, PROCESS_WRAPPER_LAUNCH_FAILURE_FILE), receipt);
+}
+
 function writeAtomicJson(filePath: string, value: unknown): void {
   writeAtomicBytes(filePath, Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8'));
 }
@@ -698,11 +819,45 @@ function writeAtomicBytes(filePath: string, bytes: Buffer): void {
   } finally {
     fs.closeSync(descriptor);
   }
-  fs.renameSync(temporary, filePath);
+  renameAtomicFileSync(temporary, filePath);
   syncDirectoryDurablySync(path.dirname(filePath));
 }
 
-function boundedErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.slice(0, 2_048);
+function renameAtomicFileSync(sourcePath: string, targetPath: string): void {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.renameSync(sourcePath, targetPath);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      const transientWindowsBusy = process.platform === 'win32'
+        && (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY');
+      if (!transientWindowsBusy || attempt >= PROCESS_WRAPPER_RENAME_MAX_ATTEMPTS) throw error;
+      const delayMs = PROCESS_WRAPPER_RENAME_RETRY_DELAY_MS * attempt;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+    }
+  }
+}
+
+function boundedErrorMessage(
+  error: unknown,
+  request?: ProcessWrapperLaunchRequest,
+  spoolPath?: string
+): string {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const [sensitive, replacement] of [
+    [request?.command, '[command]'],
+    [request?.cwd, '[cwd]'],
+    [spoolPath, '[spool]']
+  ] as const) {
+    if (sensitive) message = message.split(sensitive).join(replacement);
+  }
+  return boundedMetadataText(message.replace(/[\r\n\t]+/g, ' '), 'Unknown wrapper failure.', 2_048);
+}
+
+function boundedMetadataText(value: unknown, fallback: string, maximumLength: number): string {
+  const text = typeof value === 'string'
+    ? value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim()
+    : '';
+  return (text || fallback).slice(0, maximumLength);
 }

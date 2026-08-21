@@ -29,17 +29,21 @@ import {
   MIN_PROCESS_MAX_OUTPUT_BYTES,
   PROCESS_OUTPUT_MAX_CHUNK_BYTES,
   PROCESS_TERMINATION_GRACE_MS,
+  PROCESS_WRAPPER_BOOTSTRAP_FILE,
   PROCESS_WRAPPER_CHUNKS_DIRECTORY,
   PROCESS_WRAPPER_EXIT_RECEIPT_FILE,
   PROCESS_WRAPPER_IDENTITY_FILE,
+  PROCESS_WRAPPER_LAUNCH_FAILURE_FILE,
   PROCESS_WRAPPER_MANIFEST_FILE,
   PROCESS_WRAPPER_PROTOCOL,
   PROCESS_WRAPPER_STOP_REQUEST_FILE,
   isWrapperProcessReachable,
   listProcessSpoolChunks,
   parseStopRequest,
+  parseWrapperBootstrapReceipt,
   parseWrapperExitReceipt,
   parseWrapperIdentity,
+  parseWrapperLaunchFailureReceipt,
   parseWrapperManifest,
   processWrapperManifestLiveTails,
   processChunkFileName,
@@ -48,8 +52,10 @@ import {
   readProcessStartFingerprint,
   type ProcessStopRequest,
   type ProcessTerminationReason,
+  type ProcessWrapperBootstrapReceipt,
   type ProcessWrapperExitReceipt,
   type ProcessWrapperIdentity,
+  type ProcessWrapperLaunchFailureReceipt,
   type ProcessWrapperLaunchRequest,
   type ProcessWrapperManifest
 } from './processProtocol';
@@ -192,6 +198,12 @@ interface ProcessOutputCounters {
   truncated: boolean;
 }
 
+interface WrapperLaunchMonitor {
+  exit: { code: number | null; signal: NodeJS.Signals | null } | null;
+  stderrText(): string;
+  release(): void;
+}
+
 interface PreparedProcessOutputChunk {
   chunkSeq: bigint;
   streamKind: 'stdout' | 'stderr';
@@ -211,7 +223,9 @@ interface ProcessOutputCursor {
 
 const PROCESS_START = 'process_start' as const;
 const PROCESS_STOP = 'process_stop_request' as const;
-const WRAPPER_IDENTITY_WAIT_MS = 5_000;
+const WRAPPER_BOOTSTRAP_WAIT_MS = 15_000;
+const WRAPPER_IDENTITY_WAIT_MS = 30_000;
+const WRAPPER_PRE_IDENTITY_STDERR_MAX_BYTES = 8 * 1024;
 const WRAPPER_IDENTITY_POLL_MS = 20;
 const WRAPPER_EXIT_RECEIPT_SETTLE_MS = 500;
 const PROCESS_EXIT_OBSERVER_POLL_MS = 250;
@@ -417,27 +431,7 @@ export class ProcessControlPlane {
     await writeAtomicJson(launchPath, launch);
     if (signal?.aborted) return { outcome: 'cancelled', error: 'Process start cancelled before wrapper spawn.' };
     const spawnStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
-    const spawned = await new Promise<{ ok: true } | { ok: false; error: unknown }>((resolve) => {
-      try {
-        const wrapper = spawn(process.execPath, [path.join(__dirname, 'processWrapper.js'), launchPath], {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true
-        });
-        const onError = (error: Error) => resolve({ ok: false, error });
-        wrapper.once('error', onError);
-        wrapper.once('spawn', () => {
-          wrapper.off('error', onError);
-          wrapper.on('error', (error) => {
-            console.warn('[reliable-kernel] detached process wrapper error:', errorMessage(error));
-          });
-          wrapper.unref();
-          resolve({ ok: true });
-        });
-      } catch (error) {
-        resolve({ ok: false, error });
-      }
-    });
+    const spawned = await spawnWrapperForLaunch(launchPath);
     if (spawnStartedAt !== undefined) {
       this.database.recordPerformanceMetric({
         kind: 'process.phase',
@@ -447,7 +441,12 @@ export class ProcessControlPlane {
     }
     if (!spawned.ok) return { outcome: 'failed', error: errorMessage(spawned.error) };
     const identityStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
-    const evidence = await waitForLaunchEvidence(request, spoolPath, launch.createdAt, WRAPPER_IDENTITY_WAIT_MS);
+    let evidence: ProcessLaunchObservation;
+    try {
+      evidence = await waitForLaunchEvidence(request, spoolPath, launch.createdAt, spawned.monitor);
+    } finally {
+      spawned.monitor.release();
+    }
     if (identityStartedAt !== undefined && evidence.outcome === 'succeeded') {
       const readyAt = performance.now();
       this.processIdentityReadyAt.set(request.processId, readyAt);
@@ -1449,22 +1448,30 @@ export class ProcessControlPlane {
     const spoolPath = processSpoolPath(this.binding, request.spoolLocator);
     let launch: ProcessLaunchObservation;
     try {
-      const identity = parseWrapperIdentity(await readJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE)));
-      assertIdentityMatchesStart(identity, request);
-      launch = { outcome: 'succeeded', identity };
-    } catch (identityError) {
+      const failure = parseWrapperLaunchFailureReceipt(
+        await readJson(path.join(spoolPath, PROCESS_WRAPPER_LAUNCH_FAILURE_FILE))
+      );
+      assertLaunchFailureMatchesStart(request, failure);
+      launch = { outcome: 'failed', error: launchFailureMessage(failure) };
+    } catch (failureError) {
       try {
-        const receipt = parseWrapperExitReceipt(await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)));
-        assertExitReceiptMatchesStartRequest(request, receipt);
-        launch = {
-          outcome: 'succeeded',
-          identity: identityFromExitReceipt(request, receipt, requireText(intent.created_at, 'EffectIntent.created_at'))
-        };
-      } catch (receiptError) {
-        launch = {
-          outcome: 'outcome_unknown',
-          error: `${errorMessage(identityError)}; ${errorMessage(receiptError)}`
-        };
+        const identity = parseWrapperIdentity(await readJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE)));
+        assertIdentityMatchesStart(identity, request);
+        launch = { outcome: 'succeeded', identity };
+      } catch (identityError) {
+        try {
+          const receipt = parseWrapperExitReceipt(await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)));
+          assertExitReceiptMatchesStartRequest(request, receipt);
+          launch = {
+            outcome: 'succeeded',
+            identity: identityFromExitReceipt(request, receipt, requireText(intent.created_at, 'EffectIntent.created_at'))
+          };
+        } catch (receiptError) {
+          launch = {
+            outcome: 'outcome_unknown',
+            error: `${errorMessage(failureError)}; ${errorMessage(identityError)}; ${errorMessage(receiptError)}`
+          };
+        }
       }
     }
     const observation = await this.observeStart(request, launch, 0);
@@ -2865,6 +2872,35 @@ function processEvidenceMatches(processRow: DomainRow, request: ProcessStopEffec
     && processRow.spool_locator === request.spoolLocator;
 }
 
+function assertBootstrapMatchesStart(
+  request: ProcessStartRequest,
+  receipt: ProcessWrapperBootstrapReceipt
+): void {
+  if (
+    receipt.processId !== request.processId
+    || receipt.stableNonce !== request.stableNonce
+    || receipt.commandDigest !== request.commandDigest
+    || receipt.spoolLocator !== request.spoolLocator
+  ) throw new Error('Wrapper bootstrap receipt does not match process_start request.');
+}
+
+function assertLaunchFailureMatchesStart(
+  request: ProcessStartRequest,
+  receipt: ProcessWrapperLaunchFailureReceipt
+): void {
+  if (
+    receipt.processId !== request.processId
+    || receipt.stableNonce !== request.stableNonce
+    || receipt.commandDigest !== request.commandDigest
+    || receipt.spoolLocator !== request.spoolLocator
+  ) throw new Error('Wrapper launch failure receipt does not match process_start request.');
+}
+
+function launchFailureMessage(receipt: ProcessWrapperLaunchFailureReceipt): string {
+  const code = receipt.errorCode ? ` ${receipt.errorCode}` : '';
+  return `Wrapper launch failed during ${receipt.phase}: ${receipt.errorName}${code}: ${receipt.errorMessage}`;
+}
+
 function assertIdentityMatchesStart(identity: ProcessWrapperIdentity, request: ProcessStartRequest): void {
   if (
     identity.processId !== request.processId
@@ -2982,17 +3018,88 @@ function isTransactionAssertionFailure(error: unknown): boolean {
   return (error as Error & { code?: string }).code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED';
 }
 
+function boundedPreIdentityStderr(bytes: Buffer): string {
+  return bytes.toString('utf8')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[^\x20-\x7e\u0080-\uffff]/g, '')
+    .trim()
+    .slice(-2_048);
+}
+
+async function spawnWrapperForLaunch(
+  launchPath: string
+): Promise<{ ok: true; monitor: WrapperLaunchMonitor } | { ok: false; error: unknown }> {
+  return new Promise((resolve) => {
+    try {
+      const wrapper = spawn(process.execPath, [path.join(__dirname, 'processWrapper.js'), launchPath], {
+        detached: true,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        windowsHide: true
+      });
+      let exit: WrapperLaunchMonitor['exit'] = null;
+      let stderr = Buffer.alloc(0);
+      let released = false;
+      const captureStderr = (chunk: Buffer | string) => {
+        stderr = Buffer.concat([stderr, Buffer.from(chunk)]);
+        if (stderr.byteLength > WRAPPER_PRE_IDENTITY_STDERR_MAX_BYTES) {
+          stderr = stderr.subarray(stderr.byteLength - WRAPPER_PRE_IDENTITY_STDERR_MAX_BYTES);
+        }
+      };
+      wrapper.stderr?.on('data', captureStderr);
+      wrapper.once('exit', (code, signal) => { exit = { code, signal }; });
+      const onSpawnError = (error: Error) => resolve({ ok: false, error });
+      wrapper.once('error', onSpawnError);
+      wrapper.once('spawn', () => {
+        wrapper.off('error', onSpawnError);
+        wrapper.on('error', (error) => {
+          console.warn('[reliable-kernel] detached process wrapper error:', errorMessage(error));
+        });
+        wrapper.unref();
+        (wrapper.stderr as NodeJS.ReadableStream & { unref?: () => void } | null)?.unref?.();
+        resolve({
+          ok: true,
+          monitor: {
+            get exit() { return exit; },
+            stderrText: () => boundedPreIdentityStderr(stderr),
+            release: () => {
+              if (released) return;
+              released = true;
+              wrapper.stderr?.off('data', captureStderr);
+              wrapper.stderr?.resume();
+            }
+          }
+        });
+      });
+    } catch (error) {
+      resolve({ ok: false, error });
+    }
+  });
+}
+
 async function waitForLaunchEvidence(
   request: ProcessStartRequest,
   spoolPath: string,
   startedAt: string,
-  timeoutMs: number
+  monitor: WrapperLaunchMonitor
 ): Promise<ProcessLaunchObservation> {
-  const deadline = Date.now() + timeoutMs;
+  const bootstrapDeadline = Date.now() + WRAPPER_BOOTSTRAP_WAIT_MS;
+  let identityDeadline = bootstrapDeadline;
+  let bootstrapSeen = false;
+  let lastBootstrapPhase: ProcessWrapperBootstrapReceipt['phase'] | undefined;
+  let wrapperExitObservedAt: number | undefined;
+  const bootstrapPath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_FILE);
+  const failurePath = path.join(spoolPath, PROCESS_WRAPPER_LAUNCH_FAILURE_FILE);
   const identityPath = path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE);
   const exitPath = path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE);
-  let lastError = 'Wrapper launch evidence did not appear.';
-  while (Date.now() <= deadline) {
+  let lastError = 'Wrapper bootstrap evidence did not appear.';
+  for (;;) {
+    try {
+      const failure = parseWrapperLaunchFailureReceipt(await readJson(failurePath));
+      assertLaunchFailureMatchesStart(request, failure);
+      return { outcome: 'failed', error: launchFailureMessage(failure) };
+    } catch (error) {
+      if (!isNotFound(error)) lastError = errorMessage(error);
+    }
     try {
       const identity = parseWrapperIdentity(await readJson(identityPath));
       assertIdentityMatchesStart(identity, request);
@@ -3010,9 +3117,32 @@ async function waitForLaunchEvidence(
     } catch (error) {
       if (!isNotFound(error)) lastError = errorMessage(error);
     }
+    try {
+      const bootstrap = parseWrapperBootstrapReceipt(await readJson(bootstrapPath));
+      assertBootstrapMatchesStart(request, bootstrap);
+      if (!bootstrapSeen || bootstrap.phase !== lastBootstrapPhase) {
+        bootstrapSeen = true;
+        lastBootstrapPhase = bootstrap.phase;
+        identityDeadline = Date.now() + WRAPPER_IDENTITY_WAIT_MS;
+      }
+    } catch (error) {
+      if (!isNotFound(error)) lastError = errorMessage(error);
+    }
+
+    if (monitor.exit && wrapperExitObservedAt === undefined) wrapperExitObservedAt = Date.now();
+    const deadline = bootstrapSeen ? identityDeadline : bootstrapDeadline;
+    if (
+      Date.now() >= deadline
+      || wrapperExitObservedAt !== undefined && Date.now() - wrapperExitObservedAt >= WRAPPER_EXIT_RECEIPT_SETTLE_MS
+    ) {
+      const stderr = monitor.stderrText();
+      return {
+        outcome: 'outcome_unknown',
+        error: stderr ? `${lastError} Pre-identity stderr: ${stderr}` : lastError
+      };
+    }
     await sleep(WRAPPER_IDENTITY_POLL_MS);
   }
-  return { outcome: 'outcome_unknown', error: lastError };
 }
 
 async function writeAtomicJson(filePath: string, value: unknown): Promise<void> {

@@ -957,6 +957,12 @@ test('普通请求的当前原文与 Turn 提醒按冻结 addenda 发送且计�
     role: 'user',
     parts: frozenOriginalParts
   });
+  reinjected.attachmentCatalog = [{
+    attachmentId: 'attachment-current-turn',
+    mimeType: 'image/png',
+    name: 'current-turn.png',
+    sizeBytes: 12
+  }];
   const reinjectedEstimate = adapter.estimateFullRequestInput(reinjected);
   captures.length = 0;
   await adapter.sendFullRequest(reinjected, {
@@ -1895,7 +1901,7 @@ test('冻结模型配置完整覆盖模型级字段并关闭 capability 内部�
   assert.throws(() => kernel.applyFrozenModelProviderConfig(base, 'unknown-model'), /does not contain/);
 });
 
-test('LLM capability adapter renders one body-free attachment catalog for ordinary and native compact requests', async () => {
+test('LLM capability adapter renders one relation-derived catalog only for ordinary requests', async () => {
   const sourceAttachment = {
     attachmentId: 'attachment-source-pdf',
     name: 'source.pdf',
@@ -1938,6 +1944,7 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
   };
 
   let ordinary;
+  const ordinaryRounds = [];
   const ordinaryRequest = request();
   ordinaryRequest.authoritySnapshot.toolPolicy.allowedTools = ['read'];
   ordinaryRequest.recipe.tools = [{
@@ -1946,11 +1953,13 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
     parameters: { type: 'object', properties: { path: { type: 'string' }, attachmentId: { type: 'string' } } }
   }];
   ordinaryRequest.context = [compressed, tail];
+  ordinaryRequest.attachmentCatalog = [sourceAttachment, tailAttachment];
   const ordinaryEvents = [];
   const ordinaryAdapter = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
     fakeCapability((llmRequest, emit) => {
       ordinary = llmRequest;
+      ordinaryRounds.push(structuredClone(llmRequest));
       emit({
         type: 'llm:toolcall',
         payload: {
@@ -1970,12 +1979,16 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
       emit({ type: 'llm:done', payload: { requestId: llmRequest.id } });
     })
   );
-  await ordinaryAdapter.sendFullRequest(ordinaryRequest, {
-    onEvent: async (event) => {
-      ordinaryEvents.push(event);
-      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
-    }
-  });
+  for (let round = 0; round < 20; round += 1) {
+    await ordinaryAdapter.sendFullRequest(ordinaryRequest, {
+      onEvent: async (event) => {
+        ordinaryEvents.push(event);
+        return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+      }
+    });
+  }
+  assert.equal(ordinaryRounds.length, 20);
+  ordinaryRounds.forEach((round) => assertCatalog(round.contents, sourceAttachment, tailAttachment));
   assertCatalog(ordinary.contents, sourceAttachment, tailAttachment);
   assert.ok(ordinary.tools[0].parameters.properties.attachmentRef);
   assert.equal(ordinary.tools[0].parameters.properties.attachmentId, undefined);
@@ -1992,6 +2005,7 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
   imageOnlyRequest.authoritySnapshot.toolPolicy.allowedTools = ['read'];
   imageOnlyRequest.recipe.tools = ordinaryRequest.recipe.tools;
   imageOnlyRequest.context = [tail];
+  imageOnlyRequest.attachmentCatalog = [tailAttachment];
   const imageOnlyAdapter = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
     fakeCapability((llmRequest, emit) => {
@@ -2014,6 +2028,7 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
 
   let native;
   const nativeRequest = compressionRequest('openai_responses_compact', [compressed, tail]);
+  nativeRequest.attachmentCatalog = [sourceAttachment, tailAttachment];
   const nativeAdapter = new kernel.LlmCapabilityFullRequestAdapter(
     'compression-provider',
     compressionCapability((compactRequest) => { native = compactRequest; })
@@ -2021,7 +2036,12 @@ test('LLM capability adapter renders one body-free attachment catalog for ordina
   await nativeAdapter.sendFullRequest(nativeRequest, {
     onEvent: async (event) => ({ accepted: true, checkpointed: true, terminal: event.kind === 'completed' })
   });
-  assertCatalog(native.contents, sourceAttachment, tailAttachment);
+  assert.equal(
+    native.contents.filter((content) => content.parts.some((part) => part.text?.includes('LimCode 托管附件目录'))).length,
+    0,
+    'compression provider source must not receive a rendered request-local catalog'
+  );
+  assert.equal(JSON.stringify(native).includes('attachmentCatalog'), false);
 });
 
 function assertCatalog(contents, ...entries) {
