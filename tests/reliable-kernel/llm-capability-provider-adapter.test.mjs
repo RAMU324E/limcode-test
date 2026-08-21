@@ -262,7 +262,10 @@ test('LLM capability adapter hides managed attachment input without a catalog an
   assert.equal(captured.tools[0].parameters.properties.pages, undefined);
   assert.equal(Object.keys(captured.tools[0].parameters.properties)[0], 'path');
   assert.doesNotMatch(captured.tools[0].description, /attachmentId/);
-  assert.deepEqual(events.at(-1).content.parts[0].functionCall.args, { path: 'src/demo.ts' });
+  assert.deepEqual(events.at(-1).content.parts[0].functionCall.args, {
+    mode: 'text',
+    path: 'src/demo.ts'
+  });
 });
 
 test('LLM capability adapter 只向模型暴露 P/O/A/W 短引用 schema', async () => {
