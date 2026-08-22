@@ -60,6 +60,28 @@ test('Turn 输入 outbox 先持久化完整命令，再用同 command/request id
   assert.match(composer, /draft\.value\s*=\s*failure\.text/);
 });
 
+test('等待队列按 guidance/runtime continuation 分流，并展示真实后台来源', () => {
+  const queue = read('webview/src/components/input/ReliableQueuePanel.vue');
+  const sharedFeed = read('shared/reliableKernelClientFeed.ts');
+  const feed = read('backend/reliableKernel/clientFeed.ts');
+  const worker = read('backend/reliableKernel/databaseWorker.ts');
+
+  assert.match(sharedFeed, /kind:\s*'runtime_continuation'/);
+  assert.match(sharedFeed, /RuntimeDeliveryIntentLink/);
+  assert.match(feed, /listRows\('RuntimeDeliveryIntentLink', \{ turn_intent_id: recordId \}, 2\)/);
+  assert.match(feed, /inbox\.source_kind === 'process_receipt'/);
+  assert.match(feed, /inbox\.source_kind !== 'answer_submission'/);
+  assert.match(worker, /runtimeDeliveryIntentLinks/);
+  assert.match(queue, /等待队列 · \{\{ queueItems\.length \}\}/);
+  assert.match(queue, /preview\?\.kind === 'guidance'/);
+  assert.match(queue, /preview\?\.kind === 'runtime_continuation'/);
+  assert.match(queue, /IconTerminal2/);
+  assert.match(queue, /IconRobot/);
+  assert.match(queue, /subagentName\(preview\.source\.agentId\)/);
+  assert.match(queue, /v-if="item\.committed && guidancePreview\(item\.preview\)"/);
+  assert.match(queue, /runtimePreview\(item\.preview\)\?\.source\.kind === 'background_process'/);
+});
+
 test('Interaction 决策 outbox 跨重启固定 request id，UI 超时不删除重放依据', () => {
   const interactions = read('webview/src/stores/useInteractionStore.ts');
   const bootstrap = read('webview/src/composables/useBridgeBootstrap.ts');

@@ -98,6 +98,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/vscodeStorageJsonDurability.test.cjs',
   'tests/webviewLocalResources.test.cjs',
   'webview/tests/reliableConversationProjection.test.ts',
+  'tests/reliable-kernel/reliable-queue-ordering.test.mjs',
   'webview/tests/segmentedTimeline.test.ts'
 ]);
 

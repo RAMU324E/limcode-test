@@ -55,6 +55,7 @@ docs/architecture/*
 !/tests/reliable-kernel/tool-boundary-regressions.test.mjs
 !/tests/reliable-kernel/command-router-interaction.test.mjs
 !/tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs
+!/tests/reliable-kernel/reliable-queue-ordering.test.mjs
 !/tests/reliable-kernel/webview-feed-lifecycle.test.mjs
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs
 !/tests/reliable-kernel/provider-semantic-watchdog.test.mjs

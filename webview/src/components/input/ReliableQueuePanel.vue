@@ -9,24 +9,24 @@ import {
   IconPlayerPause,
   IconPlayerPlay,
   IconRefresh,
+  IconRobot,
+  IconTerminal2,
   IconTrash,
   IconX
 } from '@tabler/icons-vue';
 import { BridgeMessageType } from '@shared/protocol';
+import type {
+  ReliableKernelGuidanceTurnIntentPreview,
+  ReliableKernelRuntimeContinuationTurnIntentPreview,
+  ReliableKernelRuntimeContinuationSource,
+  ReliableKernelTurnIntentPreview
+} from '@shared/reliableKernelClientFeed';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
-
-interface TurnIntentPreview {
-  version: number;
-  text: string;
-  editorText: string;
-  hasAttachments: boolean;
-  truncated: boolean;
-  revisionSeq: string;
-  position: string;
-  hold: 'none' | 'paused';
-}
+import { compareReliableQueueOrder } from '@webview/domain/reliableQueueOrdering';
+import { useClientStateStore } from '@webview/stores/useClientStateStore';
 
 interface QueueItem {
   id: string;
@@ -37,10 +37,11 @@ interface QueueItem {
   retryable?: boolean;
   error?: string;
   committed?: boolean;
-  preview?: TurnIntentPreview;
+  preview?: ReliableKernelTurnIntentPreview;
 }
 
 const reliableConversation = useReliableConversation();
+const clientState = useClientStateStore();
 const {
   currentPendingTurnInputs,
   currentTurnInputFailure,
@@ -55,6 +56,7 @@ const {
 } = useChat();
 
 const requestedIntentVersions = new Map<string, string>();
+const listScroller = ref<HTMLElement | null>(null);
 const editingIntentId = ref<string>();
 const editingText = ref('');
 const editError = ref('');
@@ -74,9 +76,7 @@ watchEffect(() => {
     const id = typeof intent.id === 'string' ? intent.id : '';
     if (!id) continue;
     activeIds.add(id);
-    const version = typeof intent.current_revision_seq === 'string'
-      ? intent.current_revision_seq
-      : String(intent.updated_at ?? '');
+    const version = intentPreviewProjectionVersion(intent, id);
     const previous = requestedIntentVersions.get(id);
     if (previous === undefined) {
       reliableConversation.feed.requestDetail('turn-intent-preview', id, { priority: 'critical' });
@@ -108,19 +108,9 @@ const committedItems = computed<QueueItem[]>(() => committedQueueRecords.value.m
     committed: true,
     ...(preview ? { preview } : {})
   };
-}).filter((item) => item.id).sort((left, right) => {
-  const leftPosition = left.preview?.position;
-  const rightPosition = right.preview?.position;
-  if (leftPosition && rightPosition) {
-    const order = compareIntegerStrings(leftPosition, rightPosition);
-    if (order !== 0) return order;
-  } else if (leftPosition) {
-    return -1;
-  } else if (rightPosition) {
-    return 1;
-  }
-  return left.createdAt - right.createdAt || left.id.localeCompare(right.id);
-}));
+}).filter((item) => item.id).sort((left, right) =>
+  compareReliableQueueOrder(queueOrderValue(left), queueOrderValue(right))
+));
 
 const optimisticItems = computed<QueueItem[]>(() => {
   const committedIds = new Set(committedItems.value.map((item) => item.id));
@@ -179,7 +169,7 @@ const reorderPending = computed(() => currentPendingGuidanceControls.value.some(
 const canReorder = computed(() =>
   optimisticItems.value.length === 0
   && committedItems.value.length > 1
-  && committedItems.value.every((item) => Boolean(item.preview?.revisionSeq))
+  && committedItems.value.every((item) => Boolean(guidancePreview(item.preview)?.revisionSeq))
   && currentPendingGuidanceControls.value.length === 0
 );
 const hasQueuedItems = computed(() => queueItems.value.some((item) =>
@@ -190,7 +180,12 @@ const waitReason = computed(() => {
   if (queueItems.value.some((item) => item.state === 'accepted')) return '消息已保存，正在显示';
   if (queueItems.value.some((item) => item.state === 'unconfirmed')) return '消息尚未确认，可手动重试';
   if (!hasQueuedItems.value) return '等待系统确认';
-  if (committedItems.value.length > 0 && committedItems.value.every((item) => item.preview?.hold === 'paused')) {
+  const guidanceItems = committedItems.value.filter((item) => guidancePreview(item.preview));
+  if (
+    guidanceItems.length > 0
+    && guidanceItems.length === committedItems.value.length
+    && guidanceItems.every((item) => guidancePreview(item.preview)?.hold === 'paused')
+  ) {
     return '所有引导消息均已暂停';
   }
   const pendingInteraction = Object.values(
@@ -199,41 +194,189 @@ const waitReason = computed(() => {
   return pendingInteraction ? '等待当前操作完成' : '等待当前回复和工具完成';
 });
 
-function turnIntentPreview(intentId: string): TurnIntentPreview | undefined {
+function intentPreviewProjectionVersion(intent: Record<string, unknown>, intentId: string): string {
+  const revision = typeof intent.current_revision_seq === 'string'
+    ? intent.current_revision_seq
+    : String(intent.updated_at ?? '');
+  const link = Object.values(
+    reliableConversation.feed.records.RuntimeDeliveryIntentLink ?? {}
+  ).find((candidate) => candidate.turn_intent_id === intentId);
+  const deliveryId = typeof link?.delivery_id === 'string' ? link.delivery_id : '';
+  const delivery = deliveryId
+    ? reliableConversation.feed.records.RuntimeDelivery?.[deliveryId]
+    : undefined;
+  return [
+    revision,
+    String(link?.id ?? ''),
+    String(delivery?.state ?? ''),
+    String(delivery?.updated_at ?? '')
+  ].join(':');
+}
+
+function turnIntentPreview(intentId: string): ReliableKernelTurnIntentPreview | undefined {
   const detail = reliableConversation.feed.details[
     reliableKernelDetailKey('turn-intent-preview', intentId)
   ];
   if (!detail || detail.status !== 'ready') return undefined;
   try {
     const value = JSON.parse(detail.text) as Record<string, unknown>;
+    if (value.version !== 3 || typeof value.revisionSeq !== 'string') return undefined;
+    if (value.kind === 'guidance') {
+      if (
+        typeof value.text !== 'string'
+        || typeof value.editorText !== 'string'
+        || typeof value.position !== 'string'
+        || (value.hold !== 'none' && value.hold !== 'paused')
+      ) return undefined;
+      return {
+        version: 3,
+        kind: 'guidance',
+        text: value.text,
+        editorText: value.editorText,
+        hasAttachments: value.hasAttachments === true,
+        truncated: value.truncated === true,
+        revisionSeq: value.revisionSeq,
+        position: value.position,
+        hold: value.hold
+      };
+    }
     if (
-      typeof value.text !== 'string'
-      || typeof value.editorText !== 'string'
-      || typeof value.revisionSeq !== 'string'
-      || typeof value.position !== 'string'
-      || (value.hold !== 'none' && value.hold !== 'paused')
+      value.kind !== 'runtime_continuation'
+      || typeof value.sourceTurnId !== 'string'
+      || typeof value.deliveryId !== 'string'
+      || typeof value.deliveryState !== 'string'
+      || typeof value.phase !== 'string'
     ) return undefined;
+    const source = runtimeContinuationSource(value.source);
+    if (!source) return undefined;
     return {
-      version: typeof value.version === 'number' ? value.version : 2,
-      text: value.text,
-      editorText: value.editorText,
-      hasAttachments: value.hasAttachments === true,
-      truncated: value.truncated === true,
+      version: 3,
+      kind: 'runtime_continuation',
       revisionSeq: value.revisionSeq,
-      position: value.position,
-      hold: value.hold
+      sourceTurnId: value.sourceTurnId,
+      deliveryId: value.deliveryId,
+      deliveryState: value.deliveryState,
+      phase: value.phase,
+      source
     };
   } catch {
     return undefined;
   }
 }
 
-function previewText(preview?: TurnIntentPreview): string {
-  if (!preview) return '正在读取排队消息…';
+function runtimeContinuationSource(value: unknown): ReliableKernelRuntimeContinuationSource | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  const inboxItemId = nonEmptyText(source.inboxItemId);
+  const sourceId = nonEmptyText(source.sourceId);
+  if (!inboxItemId || !sourceId) return undefined;
+  if (source.kind === 'background_process') {
+    const processId = nonEmptyText(source.processId);
+    const processReceiptId = nonEmptyText(source.processReceiptId);
+    const processStatus = nonEmptyText(source.processStatus);
+    const outcome = nonEmptyText(source.outcome);
+    if (!processId || !processReceiptId || !processStatus || !outcome) return undefined;
+    return {
+      kind: 'background_process',
+      inboxItemId,
+      sourceId,
+      processId,
+      processReceiptId,
+      processStatus,
+      outcome,
+      ...optionalTextField(source, 'commandPreview'),
+      ...optionalTextField(source, 'toolCallId'),
+      ...optionalTextField(source, 'exitCode'),
+      ...optionalTextField(source, 'exitSignal')
+    };
+  }
+  if (source.kind !== 'subagent') return undefined;
+  const submissionId = nonEmptyText(source.submissionId);
+  const childExecutionId = nonEmptyText(source.childExecutionId);
+  const childConversationId = nonEmptyText(source.childConversationId);
+  const childStatus = nonEmptyText(source.childStatus);
+  if (
+    !submissionId
+    || !childExecutionId
+    || !childConversationId
+    || !childStatus
+    || typeof source.interrupted !== 'boolean'
+  ) return undefined;
+  return {
+    kind: 'subagent',
+    inboxItemId,
+    sourceId,
+    submissionId,
+    childExecutionId,
+    childConversationId,
+    childStatus,
+    interrupted: source.interrupted,
+    ...optionalTextField(source, 'agentId'),
+    ...optionalTextField(source, 'title')
+  };
+}
+
+function optionalTextField<K extends string>(
+  record: Record<string, unknown>,
+  key: K
+): Partial<Record<K, string>> {
+  const value = nonEmptyText(record[key]);
+  return value ? { [key]: value } as Record<K, string> : {};
+}
+
+function nonEmptyText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function guidancePreview(
+  preview?: ReliableKernelTurnIntentPreview
+): ReliableKernelGuidanceTurnIntentPreview | undefined {
+  return preview?.kind === 'guidance' ? preview : undefined;
+}
+
+function runtimePreview(
+  preview?: ReliableKernelTurnIntentPreview
+): ReliableKernelRuntimeContinuationTurnIntentPreview | undefined {
+  return preview?.kind === 'runtime_continuation' ? preview : undefined;
+}
+
+function previewText(preview?: ReliableKernelTurnIntentPreview): string {
+  if (!preview) return '正在读取等待项…';
+  if (preview.kind === 'runtime_continuation') {
+    if (preview.source.kind === 'background_process') {
+      const command = preview.source.commandPreview
+        || `后台命令 ${shortIdentity(preview.source.processId)}`;
+      return `${command} · ${processOutcomeLabel(preview.source.outcome)}`;
+    }
+    const name = subagentName(preview.source.agentId);
+    if (preview.source.title) return `${name} · ${preview.source.title}`;
+    return `${name} 已返回${preview.source.interrupted ? '中断结果' : '回答'}`;
+  }
   const text = preview.text.trim();
   if (text) return `${text}${preview.truncated ? '…' : ''}`;
   if (preview.hasAttachments) return '附件消息';
   return '(空消息)';
+}
+
+function subagentName(agentId?: string): string {
+  if (!agentId) return '子 Agent';
+  return clientState.agents.find((agent) => agent.id === agentId)?.name.trim() || agentId;
+}
+
+function processOutcomeLabel(outcome: string): string {
+  switch (outcome) {
+    case 'succeeded': return '已完成';
+    case 'failed': return '执行失败';
+    case 'cancelled': return '已取消';
+    case 'timed_out': return '已超时';
+    case 'output_limit_exceeded': return '输出超限';
+    case 'outcome_unknown': return '结果未知';
+    default: return outcome;
+  }
+}
+
+function shortIdentity(value: string): string {
+  return value.length <= 8 ? value : value.slice(0, 8);
 }
 
 function submissionText(text: string, content?: { parts?: readonly unknown[] }): string {
@@ -253,9 +396,14 @@ function stateLabel(item: QueueItem): string {
   if (item.state === 'submitting') return '正在提交';
   if (item.state === 'unconfirmed') return '尚未确认';
   if (item.state === 'accepted') return '已保存';
-  if (item.state === 'acknowledged') return '已进入引导队列';
+  if (item.state === 'acknowledged') return '已进入等待队列';
   if (item.state === 'failed') return '发送失败';
-  if (item.preview?.hold === 'paused') return '已暂停';
+  const runtime = runtimePreview(item.preview);
+  if (runtime) {
+    if (runtime.deliveryState === 'failed') return '续跑失败';
+    return runtime.source.kind === 'background_process' ? '后台结果' : 'Agent 回答';
+  }
+  if (guidancePreview(item.preview)?.hold === 'paused') return '已暂停';
   return '等待引导';
 }
 
@@ -264,9 +412,10 @@ function itemBusy(item: QueueItem): boolean {
 }
 
 function beginEdit(item: QueueItem): void {
-  if (!item.preview || itemBusy(item)) return;
+  const preview = guidancePreview(item.preview);
+  if (!preview || itemBusy(item)) return;
   editingIntentId.value = item.id;
-  editingText.value = item.preview.editorText;
+  editingText.value = preview.editorText;
   editError.value = '';
 }
 
@@ -277,33 +426,36 @@ function closeEdit(): void {
 }
 
 function saveEdit(item: QueueItem): void {
-  if (!item.preview) return;
+  const preview = guidancePreview(item.preview);
+  if (!preview) return;
   const text = editingText.value.trim();
-  if (!text && !item.preview.hasAttachments) {
+  if (!text && !preview.hasAttachments) {
     editError.value = '没有附件的引导消息不能为空。';
     return;
   }
-  if (editGuidance(item.id, item.preview.revisionSeq, text)) closeEdit();
+  if (editGuidance(item.id, preview.revisionSeq, text)) closeEdit();
 }
 
 function removeItem(item: QueueItem): void {
-  if (!item.preview || itemBusy(item)) return;
+  const preview = guidancePreview(item.preview);
+  if (!preview || itemBusy(item)) return;
   if (!window.confirm('确定删除这条等待中的引导消息吗？')) return;
-  cancelGuidance(item.id, item.preview.revisionSeq);
+  cancelGuidance(item.id, preview.revisionSeq);
   if (editingIntentId.value === item.id) closeEdit();
 }
 
 function togglePause(item: QueueItem): void {
-  if (!item.preview || itemBusy(item)) return;
+  const preview = guidancePreview(item.preview);
+  if (!preview || itemBusy(item)) return;
   setGuidancePaused(
     item.id,
-    item.preview.revisionSeq,
-    item.preview.hold !== 'paused'
+    preview.revisionSeq,
+    preview.hold !== 'paused'
   );
 }
 
 function startDrag(event: DragEvent, item: QueueItem): void {
-  if (!canReorder.value || !item.preview) {
+  if (!canReorder.value || !guidancePreview(item.preview)) {
     event.preventDefault();
     return;
   }
@@ -319,7 +471,7 @@ function dropOn(event: DragEvent, target: QueueItem): void {
   const sourceId = draggingIntentId.value || event.dataTransfer?.getData('text/plain');
   draggingIntentId.value = undefined;
   if (!sourceId || sourceId === target.id || !canReorder.value) return;
-  const ordered = [...committedItems.value];
+  const ordered = committedItems.value.filter((item) => guidancePreview(item.preview));
   const sourceIndex = ordered.findIndex((item) => item.id === sourceId);
   const targetIndex = ordered.findIndex((item) => item.id === target.id);
   if (sourceIndex < 0 || targetIndex < 0) return;
@@ -327,8 +479,17 @@ function dropOn(event: DragEvent, target: QueueItem): void {
   ordered.splice(targetIndex, 0, moved);
   reorderGuidance(ordered.map((item) => ({
     intentId: item.id,
-    expectedRevisionSeq: item.preview!.revisionSeq
+    expectedRevisionSeq: guidancePreview(item.preview)!.revisionSeq
   })));
+}
+
+function queueOrderValue(item: QueueItem) {
+  const position = guidancePreview(item.preview)?.position;
+  return {
+    id: item.id,
+    createdAt: item.createdAt,
+    ...(position ? { position } : {})
+  };
 }
 
 function timestamp(value: unknown): number {
@@ -337,22 +498,14 @@ function timestamp(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function compareIntegerStrings(left: string, right: string): number {
-  if (!/^(?:0|[1-9]\d*)$/.test(left) || !/^(?:0|[1-9]\d*)$/.test(right)) {
-    return left.localeCompare(right);
-  }
-  const leftValue = BigInt(left);
-  const rightValue = BigInt(right);
-  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
-}
 </script>
 
 <template>
-  <section v-if="queueItems.length > 0" class="reliable-queue" aria-label="引导消息状态">
+  <section v-if="queueItems.length > 0" class="reliable-queue" aria-label="等待队列状态">
     <div class="reliable-queue-header">
       <span class="reliable-queue-title">
         <IconBolt class="reliable-queue-guide-icon" :size="14" stroke="2" aria-hidden="true" />
-        引导消息 · {{ queueItems.length }}
+        等待队列 · {{ queueItems.length }}
       </span>
       <span class="reliable-queue-reason">{{ waitReason }}</span>
     </div>
@@ -365,22 +518,27 @@ function compareIntegerStrings(left: string, right: string): number {
       </button>
     </div>
 
-    <ol class="reliable-queue-list">
+    <div class="reliable-queue-list-shell">
+      <ol ref="listScroller" class="reliable-queue-list">
       <li
         v-for="(item, index) in queueItems"
         :key="item.id"
         class="reliable-queue-item"
         :class="[
           `is-${item.state}`,
-          { 'is-paused': item.preview?.hold === 'paused', 'is-dragging': draggingIntentId === item.id }
+          {
+            'is-paused': guidancePreview(item.preview)?.hold === 'paused',
+            'is-runtime': Boolean(runtimePreview(item.preview)),
+            'is-dragging': draggingIntentId === item.id
+          }
         ]"
-        :draggable="Boolean(item.committed && canReorder && !itemBusy(item))"
+        :draggable="Boolean(item.committed && guidancePreview(item.preview) && canReorder && !itemBusy(item))"
         @dragstart="startDrag($event, item)"
         @dragend="draggingIntentId = undefined"
         @dragover.prevent
         @drop="dropOn($event, item)"
       >
-        <template v-if="editingIntentId === item.id && item.preview">
+        <template v-if="editingIntentId === item.id && guidancePreview(item.preview)">
           <textarea
             v-model="editingText"
             class="reliable-queue-editor"
@@ -402,18 +560,32 @@ function compareIntegerStrings(left: string, right: string): number {
         <template v-else>
           <IconAlertCircle v-if="item.state === 'failed'" :size="14" stroke="2" aria-hidden="true" />
           <IconGripVertical
-            v-else-if="item.committed"
+            v-else-if="item.committed && guidancePreview(item.preview)"
             class="reliable-queue-grip"
             :class="{ 'is-disabled': !canReorder }"
             :size="14"
             stroke="2"
             aria-hidden="true"
           />
+          <IconTerminal2
+            v-else-if="runtimePreview(item.preview)?.source.kind === 'background_process'"
+            class="reliable-queue-source-icon"
+            :size="14"
+            stroke="2"
+            aria-hidden="true"
+          />
+          <IconRobot
+            v-else-if="runtimePreview(item.preview)?.source.kind === 'subagent'"
+            class="reliable-queue-source-icon"
+            :size="14"
+            stroke="2"
+            aria-hidden="true"
+          />
           <span v-else class="reliable-queue-index">{{ index + 1 }}</span>
           <span class="reliable-queue-state">{{ stateLabel(item) }}</span>
-          <span class="reliable-queue-text" :title="item.text">{{ item.text }}</span>
+          <span class="reliable-queue-text">{{ item.text }}</span>
 
-          <div v-if="item.committed" class="reliable-queue-actions">
+          <div v-if="item.committed && guidancePreview(item.preview)" class="reliable-queue-actions">
             <button
               type="button"
               title="编辑引导消息"
@@ -424,11 +596,11 @@ function compareIntegerStrings(left: string, right: string): number {
             </button>
             <button
               type="button"
-              :title="item.preview?.hold === 'paused' ? '恢复这条引导消息' : '暂停这条引导消息'"
-              :disabled="!item.preview || itemBusy(item)"
+              :title="guidancePreview(item.preview)?.hold === 'paused' ? '恢复这条引导消息' : '暂停这条引导消息'"
+              :disabled="!guidancePreview(item.preview) || itemBusy(item)"
               @click="togglePause(item)"
             >
-              <IconPlayerPlay v-if="item.preview?.hold === 'paused'" :size="13" stroke="2" aria-hidden="true" />
+              <IconPlayerPlay v-if="guidancePreview(item.preview)?.hold === 'paused'" :size="13" stroke="2" aria-hidden="true" />
               <IconPlayerPause v-else :size="13" stroke="2" aria-hidden="true" />
             </button>
             <button
@@ -454,8 +626,10 @@ function compareIntegerStrings(left: string, right: string): number {
           </button>
           <span v-if="item.error" class="reliable-queue-error" :title="item.error">草稿已保留，可直接重试</span>
         </template>
-      </li>
-    </ol>
+        </li>
+      </ol>
+      <AdvancedScrollbar :scroller="listScroller" :refresh-key="queueItems.length" variant="minimal" />
+    </div>
   </section>
 </template>
 
@@ -519,6 +693,12 @@ function compareIntegerStrings(left: string, right: string): number {
   min-width: 0;
 }
 
+.reliable-queue-list-shell {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
 .reliable-queue-list {
   max-height: 180px;
   display: flex;
@@ -564,8 +744,13 @@ function compareIntegerStrings(left: string, right: string): number {
   color: var(--vscode-errorForeground, #f14c4c);
 }
 
+.reliable-queue-item.is-runtime {
+  background: color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%);
+}
+
 .reliable-queue-index,
-.reliable-queue-grip {
+.reliable-queue-grip,
+.reliable-queue-source-icon {
   width: 14px;
   flex: 0 0 auto;
 }
@@ -576,7 +761,8 @@ function compareIntegerStrings(left: string, right: string): number {
   opacity: 0.7;
 }
 
-.reliable-queue-grip {
+.reliable-queue-grip,
+.reliable-queue-source-icon {
   color: var(--vscode-descriptionForeground);
 }
 
