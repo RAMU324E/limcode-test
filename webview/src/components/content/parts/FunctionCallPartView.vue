@@ -415,6 +415,11 @@ const commandSummaryPrefix = computed(() => {
 });
 const hasCommandSummaryMeta = computed(() => Boolean(commandAccessLabel.value || commandForegroundWaitLabel.value));
 const summaryTitle = computed(() => [commandAccessLabel.value, commandForegroundWaitLabel.value, summaryLabel.value].filter(Boolean).join(' · ') || undefined);
+const streamingPreviewMaxBodyHeight = computed(() => {
+  const size = Math.max(1, props.batchSize ?? 1);
+  if (props.batchMode !== 'parallel' || size === 1) return 168;
+  return Math.max(32, Math.min(96, Math.floor(192 / size)));
+});
 const hasBatchMeta = computed(() => props.batchIndex !== undefined && props.batchMode !== undefined && props.batchState !== undefined);
 const batchModeLabel = computed(() => props.batchMode === 'parallel' ? '并行执行' : '依次执行');
 const batchStateLabel = computed(() => {
@@ -951,6 +956,8 @@ function isFinalizingProgress(progress: unknown): boolean {
     v-if="transientPreview"
     :preview="transientPreview"
     :active="props.streaming === true"
+    :max-body-height="streamingPreviewMaxBodyHeight"
+    :compact="props.batchMode === 'parallel' && (props.batchSize ?? 1) > 1"
   />
   <CollapsibleContentBlock
     v-else

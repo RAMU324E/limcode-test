@@ -7,10 +7,15 @@ import { useBottomStickyScroller } from '@webview/composables/useBottomStickyScr
 import type { ReliableTransientToolCallState } from '@webview/domain/reliableTransientModel';
 import TextPartView from './TextPartView.vue';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   preview: ReliableTransientToolCallState;
   active: boolean;
-}>();
+  maxBodyHeight?: number;
+  compact?: boolean;
+}>(), {
+  maxBodyHeight: 168,
+  compact: false
+});
 
 const framedPreview = shallowRef<ReliableTransientToolCallState>({ ...props.preview });
 const pendingPreview = shallowRef<ReliableTransientToolCallState | undefined>();
@@ -22,6 +27,9 @@ let renderModeCallId = framedPreview.value.callId;
 const frozenRenderMode = ref<ToolCallPreviewRenderMode | undefined>();
 
 const presentation = computed(() => toolCallPreviewPresentation(framedPreview.value));
+const previewStyle = computed(() => ({
+  '--tool-preview-max-body-height': `${Math.max(24, Math.round(props.maxBodyHeight))}px`
+}));
 const previewFinal = computed(() => framedPreview.value.final === true);
 const previewStreaming = computed(() => props.active && !previewFinal.value);
 const displayTitle = computed(() => {
@@ -111,7 +119,13 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
 </script>
 
 <template>
-  <section class="tool-preview-card" aria-live="polite" :aria-label="displayTitle">
+  <section
+    class="tool-preview-card"
+    :class="{ 'is-compact': compact }"
+    :style="previewStyle"
+    aria-live="polite"
+    :aria-label="displayTitle"
+  >
     <header class="tool-preview-header">
       <span class="tool-preview-icon" aria-hidden="true"><component :is="icon" :size="15" stroke="1.8" /></span>
       <span class="tool-preview-heading">
@@ -150,6 +164,18 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
   background: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
   color: var(--vscode-foreground);
   min-width: 0;
+}
+
+.tool-preview-card.is-compact {
+  gap: var(--space-1);
+  margin: var(--space-1) 0;
+  padding-block: var(--space-2);
+}
+
+.tool-preview-card.is-compact .tool-preview-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tool-preview-header {
@@ -221,13 +247,13 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
 .tool-preview-code-shell {
   position: relative;
   min-width: 0;
-  max-height: 168px;
+  max-height: var(--tool-preview-max-body-height, 168px);
   border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 76%, transparent);
   background: color-mix(in srgb, var(--vscode-textCodeBlock-background) 86%, transparent);
 }
 
 .tool-preview-code-scroll {
-  max-height: 168px;
+  max-height: var(--tool-preview-max-body-height, 168px);
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-width: none;
