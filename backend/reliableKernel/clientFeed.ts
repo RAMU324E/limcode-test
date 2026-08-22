@@ -9,14 +9,19 @@ import {
   type ReliableKernelClientDetailKind,
   type ReliableKernelDataMessage,
   type ReliableKernelHistoryPage,
-  type ReliableKernelSnapshotMessage
+  type ReliableKernelRuntimeContinuationSource,
+  type ReliableKernelRuntimeContinuationTurnIntentPreview,
+  type ReliableKernelSnapshotMessage,
+  type ReliableKernelTurnIntentPreview
 } from '../../shared/reliableKernelClientFeed';
 import type { PlainData } from '../../shared/plainData';
 import { buildFileDiffRecord } from '../capabilities/fileDiff';
 import {
   initialGuidancePosition,
   parseInputTurnIntentEnvelopeText,
-  TURN_INTENT_ENVELOPE_CONTENT_TYPE
+  parseRuntimeContinuationTurnIntentEnvelopeText,
+  TURN_INTENT_ENVELOPE_CONTENT_TYPE,
+  type RuntimeContinuationTurnIntentEnvelope
 } from './guidanceIntent';
 import {
   CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE,
@@ -785,6 +790,9 @@ export class BoundedClientFeed {
         return materialized('AnswerBridge', field('answer_bridge_id'));
       case 'RuntimeDelivery':
         return field('target_conversation_id') === activeConversationId;
+      case 'RuntimeDeliveryIntentLink':
+        return materialized('RuntimeDelivery', field('delivery_id'))
+          && materialized('TurnIntent', field('turn_intent_id'));
       case 'RuntimeInboxItem':
         return referencedBy('RuntimeDelivery');
       default:
@@ -1080,6 +1088,8 @@ interface MessageContentMetadataWaiter {
 const PROCESS_DETAIL_INDEX_CACHE_ENTRIES = 8;
 const MESSAGE_CONTENT_METADATA_CACHE_ENTRIES = 1_024;
 const TURN_INTENT_PREVIEW_TEXT_CHARACTERS = 512;
+const TURN_INTENT_SOURCE_LABEL_CHARACTERS = 240;
+const TURN_INTENT_SOURCE_ARGUMENTS_MAX_BYTES = 64 * 1024;
 
 /** On-demand CAS detail reader with an actual wire-byte response cap. */
 export class ClientDetailReader {
@@ -1654,16 +1664,24 @@ export class ClientDetailReader {
     let position = initialGuidancePosition(requirePhaseFText(current.intent.created_at, 'TurnIntent.created_at'));
     let hold: 'none' | 'paused' = 'none';
     if (metadata.content_type === TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
-      const envelope = parseInputTurnIntentEnvelopeText(
-        (await this.contentStore.read(metadata)).toString('utf8')
-      );
-      if (!envelope) throw new Error(`TurnIntent ${recordId} is not an ordinary guidance message.`);
+      const envelopeSource = (await this.contentStore.read(metadata)).toString('utf8');
+      const inputEnvelope = parseInputTurnIntentEnvelopeText(envelopeSource);
+      if (!inputEnvelope) {
+        const runtimeEnvelope = parseRuntimeContinuationTurnIntentEnvelopeText(envelopeSource);
+        if (!runtimeEnvelope) throw new Error(`TurnIntent ${recordId} has an unsupported envelope kind.`);
+        const preview = await this.materializeRuntimeContinuationTurnIntentPreview(
+          recordId,
+          current,
+          runtimeEnvelope
+        );
+        return Buffer.from(JSON.stringify(toWirePlain(preview)), 'utf8');
+      }
       metadata = await this.requireExisting(
         'ContentObject',
-        envelope.messageContentObjectId
+        inputEnvelope.messageContentObjectId
       ) as ContentObjectMetadata;
-      position = envelope.guidance.position;
-      hold = envelope.guidance.hold;
+      position = inputEnvelope.guidance.position;
+      hold = inputEnvelope.guidance.hold;
     }
     const source = (await this.contentStore.read(metadata)).toString('utf8');
     let text = '';
@@ -1696,8 +1714,9 @@ export class ClientDetailReader {
     const characters = Array.from(editorText);
     const truncated = characters.length > TURN_INTENT_PREVIEW_TEXT_CHARACTERS;
     const visibleText = characters.slice(0, TURN_INTENT_PREVIEW_TEXT_CHARACTERS).join('');
-    return Buffer.from(JSON.stringify({
-      version: 2,
+    const preview: ReliableKernelTurnIntentPreview = {
+      version: 3,
+      kind: 'guidance',
       text: visibleText,
       editorText,
       hasAttachments,
@@ -1705,7 +1724,147 @@ export class ClientDetailReader {
       revisionSeq: current.revisionSeq,
       position,
       hold
-    }), 'utf8');
+    };
+    return Buffer.from(JSON.stringify(toWirePlain(preview)), 'utf8');
+  }
+
+  private async materializeRuntimeContinuationTurnIntentPreview(
+    recordId: string,
+    current: { contentObjectId: string; revisionSeq: string; intent: DomainRow },
+    envelope: RuntimeContinuationTurnIntentEnvelope
+  ): Promise<ReliableKernelRuntimeContinuationTurnIntentPreview> {
+    const links = await this.listRows('RuntimeDeliveryIntentLink', { turn_intent_id: recordId }, 2);
+    if (links.length !== 1) {
+      throw new Error(`Runtime continuation TurnIntent ${recordId} must have one RuntimeDeliveryIntentLink.`);
+    }
+    const deliveryId = requirePhaseFId(
+      links[0]!.delivery_id,
+      'RuntimeDeliveryIntentLink.delivery_id'
+    );
+    const delivery = await this.requireExisting('RuntimeDelivery', deliveryId);
+    if (delivery.target_conversation_id !== current.intent.conversation_id) {
+      throw new Error(`RuntimeDelivery ${deliveryId} targets a different Conversation than TurnIntent ${recordId}.`);
+    }
+    if (delivery.phase !== 'next_turn') {
+      throw new Error(`Runtime continuation TurnIntent ${recordId} requires a next_turn RuntimeDelivery.`);
+    }
+    const inboxItemId = requirePhaseFId(
+      delivery.inbox_item_id,
+      'RuntimeDelivery.inbox_item_id'
+    );
+    const inbox = await this.requireExisting('RuntimeInboxItem', inboxItemId);
+    const source = await this.materializeRuntimeContinuationSource(inbox, inboxItemId);
+    return {
+      version: 3,
+      kind: 'runtime_continuation',
+      revisionSeq: current.revisionSeq,
+      sourceTurnId: envelope.sourceTurnId,
+      deliveryId,
+      deliveryState: requirePhaseFText(delivery.state, 'RuntimeDelivery.state'),
+      phase: requirePhaseFText(delivery.phase, 'RuntimeDelivery.phase'),
+      source
+    };
+  }
+
+  private async materializeRuntimeContinuationSource(
+    inbox: DomainRow,
+    inboxItemId: string
+  ): Promise<ReliableKernelRuntimeContinuationSource> {
+    const sourceId = requirePhaseFId(inbox.source_id, 'RuntimeInboxItem.source_id');
+    if (inbox.source_kind === 'process_receipt') {
+      const receipt = await this.requireExisting('ProcessReceipt', sourceId);
+      const processId = requirePhaseFId(receipt.process_id, 'ProcessReceipt.process_id');
+      const process = await this.requireExisting('Process', processId);
+      const origins = await this.listRows('ProcessOriginLink', { process_id: processId }, 2);
+      if (origins.length !== 1) throw new Error(`Process ${processId} must have one ProcessOriginLink.`);
+      const toolCallId = requirePhaseFId(origins[0]!.tool_call_id, 'ProcessOriginLink.tool_call_id');
+      const toolCall = await this.requireExisting('ToolCall', toolCallId);
+      const commandPreview = await this.runtimeProcessCommandPreview(toolCall);
+      const exitCode = optionalRuntimeIntegerText(receipt.exit_code, 'ProcessReceipt.exit_code');
+      const exitSignal = receipt.exit_signal === null
+        ? undefined
+        : requirePhaseFText(receipt.exit_signal, 'ProcessReceipt.exit_signal');
+      return {
+        kind: 'background_process',
+        inboxItemId,
+        sourceId,
+        processId,
+        processReceiptId: sourceId,
+        processStatus: requirePhaseFText(process.status, 'Process.status'),
+        outcome: requirePhaseFText(receipt.outcome, 'ProcessReceipt.outcome'),
+        ...(commandPreview ? { commandPreview } : {}),
+        toolCallId,
+        ...(exitCode ? { exitCode } : {}),
+        ...(exitSignal ? { exitSignal } : {})
+      };
+    }
+    if (inbox.source_kind !== 'answer_submission') {
+      throw new Error(`RuntimeInboxItem ${inboxItemId} has unsupported source kind ${String(inbox.source_kind)}.`);
+    }
+    const submission = await this.requireExisting('AnswerSubmission', sourceId);
+    const bridge = await this.requireExisting(
+      'AnswerBridge',
+      requirePhaseFId(submission.answer_bridge_id, 'AnswerSubmission.answer_bridge_id')
+    );
+    const childExecutionId = requirePhaseFId(
+      bridge.child_execution_id,
+      'AnswerBridge.child_execution_id'
+    );
+    const child = await this.requireExisting('ChildExecution', childExecutionId);
+    const childConversationId = requirePhaseFId(
+      child.child_conversation_id,
+      'ChildExecution.child_conversation_id'
+    );
+    const agentLinks = await this.listRows('AgentConversationLink', {
+      conversation_id: childConversationId,
+      role: 'default'
+    }, 2);
+    if (agentLinks.length !== 1) {
+      throw new Error(`Child Conversation ${childConversationId} must have one default AgentConversationLink.`);
+    }
+    const payloads = await this.listRows('AnswerPayload', { submission_id: sourceId }, 2);
+    if (payloads.length !== 1) throw new Error(`AnswerSubmission ${sourceId} must have one AnswerPayload.`);
+    const interrupted = runtimeBoolean(submission.interrupted, 'AnswerSubmission.interrupted');
+    const title = payloads[0]!.title === null
+      ? undefined
+      : boundedTurnIntentSourceText(
+          requirePhaseFText(payloads[0]!.title, 'AnswerPayload.title'),
+          TURN_INTENT_SOURCE_LABEL_CHARACTERS
+        );
+    return {
+      kind: 'subagent',
+      inboxItemId,
+      sourceId,
+      submissionId: sourceId,
+      childExecutionId,
+      childConversationId,
+      childStatus: requirePhaseFText(child.status, 'ChildExecution.status'),
+      interrupted,
+      agentId: requirePhaseFId(agentLinks[0]!.agent_id, 'AgentConversationLink.agent_id'),
+      ...(title ? { title } : {})
+    };
+  }
+
+  private async runtimeProcessCommandPreview(toolCall: DomainRow): Promise<string | undefined> {
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requirePhaseFId(toolCall.arguments_object_id, 'ToolCall.arguments_object_id')
+    ) as ContentObjectMetadata;
+    const byteLength = requireRuntimeNonNegativeBigInt(
+      metadata.byte_length,
+      'ToolCall arguments ContentObject.byte_length'
+    );
+    if (byteLength > BigInt(TURN_INTENT_SOURCE_ARGUMENTS_MAX_BYTES)) return undefined;
+    try {
+      const parsed = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+      const command = (parsed as Record<string, unknown>).command;
+      return typeof command === 'string'
+        ? boundedTurnIntentSourceText(command, TURN_INTENT_SOURCE_LABEL_CHARACTERS)
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async readOptionalContent(value: unknown, label: string): Promise<Buffer> {
@@ -1841,6 +2000,27 @@ export class ClientDetailReader {
     if (!row) throw new Error(`${domain} ${id} does not exist.`);
     return row;
   }
+}
+
+function runtimeBoolean(value: unknown, label: string): boolean {
+  if (value === 0n) return false;
+  if (value === 1n) return true;
+  throw new TypeError(`${label} must be SQLite boolean 0 or 1.`);
+}
+
+function optionalRuntimeIntegerText(value: unknown, label: string): string | undefined {
+  if (value === null) return undefined;
+  if (typeof value !== 'bigint') throw new TypeError(`${label} must be a SQLite INTEGER or NULL.`);
+  return value.toString();
+}
+
+function boundedTurnIntentSourceText(value: string, maxCharacters: number): string | undefined {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) return undefined;
+  const characters = Array.from(normalized);
+  return characters.length <= maxCharacters
+    ? normalized
+    : `${characters.slice(0, Math.max(0, maxCharacters - 1)).join('')}…`;
 }
 
 function requireFileChangeOperation(value: unknown): 'create_file' | 'replace_file' | 'delete_file' | 'create_directory' | 'delete_directory_tree' {
@@ -2029,7 +2209,8 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   answerBridges: 'AnswerBridge',
   answerSubmissions: 'AnswerSubmission',
   runtimeInboxItems: 'RuntimeInboxItem',
-  runtimeDeliveries: 'RuntimeDelivery'
+  runtimeDeliveries: 'RuntimeDelivery',
+  runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink'
 });
 
 function recordKey(domain: string, id: string): string {
@@ -3074,6 +3255,11 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
   filterSnapshotReference(subagents, 'answerSubmissions', 'answer_bridge_id', answerBridgeIds);
 
   const deliveryIds = snapshotIds(subagents, 'runtimeDeliveries');
+  const queuedTurnIntentIds = snapshotIds(window, 'queuedTurnIntents');
+  filterSnapshotArray(subagents, 'runtimeDeliveryIntentLinks', (link) =>
+    deliveryIds.has(snapshotField(link, 'delivery_id') ?? '')
+    && queuedTurnIntentIds.has(snapshotField(link, 'turn_intent_id') ?? '')
+  );
   const inboxIds = new Set(snapshotArray(subagents, 'runtimeDeliveries').flatMap((delivery) => {
     const id = snapshotField(delivery, 'inbox_item_id');
     return id ? [id] : [];

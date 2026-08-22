@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
@@ -32,9 +32,14 @@ import {
   prioritizedTimelineDetailDemand
 } from './segmentedTimeline';
 
-const props = withDefaults(defineProps<{ emptyHint?: string; scroller?: HTMLElement | null }>(), {
+const props = withDefaults(defineProps<{
+  emptyHint?: string;
+  scroller?: HTMLElement | null;
+  followLatest?: boolean;
+}>(), {
   emptyHint: '还没有消息，发一条试试。',
-  scroller: null
+  scroller: null,
+  followLatest: true
 });
 const emit = defineEmits<{
   (event: 'edit-message', message: MessageRecord, deleteCount: number): void;
@@ -102,7 +107,9 @@ const earlierSegmentLabel = computed(() => feed.historyLoading
   ? '正在加载更早内容'
   : feed.historyError && segmentStart.value === 0
     ? '重试加载更早内容'
-    : '显示更早内容'
+    : segmentStart.value > 0
+      ? `显示更早内容（前方 ${segmentStart.value} 个步骤）`
+      : '显示更早内容'
 );
 const compressionTimeline = computed(() => projectReliableCompressionTimeline(
   compressionBlocks.value,
@@ -120,6 +127,15 @@ const terminationRowsByAnchor = computed(() => {
 });
 
 watch(
+  () => props.followLatest,
+  (followLatest) => {
+    followLatestSegment.value = followLatest;
+    if (followLatest) segmentStart.value = latestTimelineSegmentStart(messages.value.length);
+  },
+  { immediate: true }
+);
+
+watch(
   () => `${messages.value.length}:${messages.value[messages.value.length - 1]?.id ?? ''}`,
   () => {
     const total = messages.value.length;
@@ -132,8 +148,10 @@ watch(
 
 watch(conversationId, () => {
   pendingHistoryAnchorId.value = null;
-  followLatestSegment.value = true;
-  segmentStart.value = latestTimelineSegmentStart(messages.value.length);
+  followLatestSegment.value = props.followLatest;
+  segmentStart.value = props.followLatest
+    ? latestTimelineSegmentStart(messages.value.length)
+    : clampTimelineSegmentStart(messages.value.length, segmentStart.value);
 });
 
 watch(
@@ -352,6 +370,11 @@ watch(
       .map(([toolCallId]) => toolCallId)
   ].join('|'),
   () => {
+    const pinnedDetailKeys = visibleTimelineRows.value.flatMap((message) => {
+      const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
+      return revisionId ? [reliableKernelDetailKey('message-content', revisionId)] : [];
+    });
+    feed.setPinnedDetailKeys(pinnedDetailKeys);
     const demand = prioritizedTimelineDetailDemand(
       visibleTimelineRows.value.map((message) => message.id)
     );
@@ -365,6 +388,8 @@ watch(
   },
   { immediate: true }
 );
+
+onBeforeUnmount(() => feed.setPinnedDetailKeys([]));
 
 function deleteCount(message: MessageRecord): number {
   const index = messages.value.findIndex((candidate) => candidate.id === message.id);

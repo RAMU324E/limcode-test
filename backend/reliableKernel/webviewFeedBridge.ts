@@ -12,14 +12,21 @@ import {
   RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE,
   RELIABLE_KERNEL_SNAPSHOT_MESSAGE,
   RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE,
   RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE,
-  RELIABLE_KERNEL_TRANSIENT_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE,
   type ReliableKernelAckMessage,
   type ReliableKernelClientDiagnosticMessage,
   type ReliableKernelDataMessage,
   type ReliableKernelDetailRequestMessage,
   type ReliableKernelHistoryPageRequestMessage,
-  type ReliableKernelSnapshotRequestMessage
+  type ReliableKernelSnapshotRequestMessage,
+  type ReliableKernelTransientAckMessage,
+  type ReliableKernelTransientBatchItem,
+  type ReliableKernelTransientBatchMessage,
+  type ReliableKernelTransientSnapshotMessage,
+  type ReliableKernelTransientSnapshotRequestMessage
 } from '../../shared/reliableKernelClientFeed';
 import { toStructuredClonePlainData } from '../../shared/plainData';
 import { normalizePlainJson } from './plainJson';
@@ -37,6 +44,10 @@ import type {
   ClientHistoryReader
 } from './clientFeed';
 import type { ReliableDiagnosticObserver } from './diagnosticJournal';
+import {
+  ReliableTransientReplayStore,
+  type ReliableTransientReplaySnapshot
+} from './transientReplay';
 
 interface FeedDataPost {
   sessionId: string;
@@ -47,6 +58,21 @@ interface FeedDataPost {
   plain: unknown;
   resendCount: number;
   diagnostic: ReliableDataDiagnostic;
+}
+
+interface PendingTransientEvent {
+  event: ReliableAgentTransientEvent;
+  fromStreamSeq: string;
+}
+
+interface TransientDelivery {
+  deliveryId: string;
+  sessionId: string;
+  navigationGeneration: number;
+  postedAt: number;
+  ackTimer: NodeJS.Timeout;
+  kind: 'batch' | 'snapshot';
+  resendCount: number;
 }
 
 interface FeedClient {
@@ -64,10 +90,13 @@ interface FeedClient {
   recoveryTimer?: NodeJS.Timeout;
   recoveryWake?: (retry: boolean) => void;
   lastDataPost?: FeedDataPost;
-  pendingTransientEvents: ReliableAgentTransientEvent[];
+  pendingTransientEvents: PendingTransientEvent[];
   transientToolCallKeys: Set<string>;
   transientRawEventCount: number;
   transientFlushTimer?: NodeJS.Timeout;
+  transientFlushInFlight: boolean;
+  transientDeliveries: Map<string, TransientDelivery>;
+  transientDropDiagnosticKeys: Set<string>;
 }
 
 const FEED_ACK_TIMEOUT_MS = 30_000;
@@ -75,6 +104,9 @@ const FEED_MAX_FRAME_RESENDS = 1;
 const FEED_RECOVERY_MAX_DELAY_MS = 30_000;
 const TRANSIENT_BATCH_INTERVAL_MS = 32;
 const TRANSIENT_BATCH_MAX_EVENTS = 128;
+const TRANSIENT_ACK_TIMEOUT_MS = 2_000;
+const TRANSIENT_MAX_SNAPSHOT_RESENDS = 1;
+const TRANSIENT_MAX_DROP_DIAGNOSTIC_KEYS = 512;
 
 function isToolCallDeltaTransient(event: ReliableAgentTransientEvent): boolean {
   const content = event.event.content;
@@ -115,17 +147,20 @@ function clearTransientToolCallKeys(client: FeedClient, event: ReliableAgentTran
 }
 
 function coalescePendingToolCallDelta(
-  pending: ReliableAgentTransientEvent[],
+  pending: PendingTransientEvent[],
   incoming: ReliableAgentTransientEvent
 ): boolean {
   if (!isToolCallDeltaTransient(incoming)) return false;
   const previous = pending[pending.length - 1];
-  if (!previous || !isToolCallDeltaTransient(previous) || !sameTransientStream(previous, incoming)) return false;
-  const content = mergeToolCallDeltaContent(previous.event.content, incoming.event.content);
+  if (!previous || !isToolCallDeltaTransient(previous.event) || !sameTransientStream(previous.event, incoming)) return false;
+  const content = mergeToolCallDeltaContent(previous.event.event.content, incoming.event.content);
   if (!content) return false;
   pending[pending.length - 1] = {
-    ...incoming,
-    event: { ...incoming.event, content: normalizePlainJson(content, 'coalesced tool call delta') }
+    event: {
+      ...incoming,
+      event: { ...incoming.event, content: normalizePlainJson(content, 'coalesced tool call delta') }
+    },
+    fromStreamSeq: previous.fromStreamSeq
   };
   return true;
 }
@@ -210,12 +245,17 @@ export type ReliableKernelFeedBridgeErrorHandler = (
 export interface ReliableKernelWebviewFeedBridgeOptions {
   ackTimeoutMs?: number;
   maxFrameResends?: number;
+  transientAckTimeoutMs?: number;
+  maxTransientSnapshotResends?: number;
 }
 
 export class ReliableKernelWebviewFeedBridge {
   private readonly clients = new Map<BridgeClientId, FeedClient>();
   private readonly ackTimeoutMs: number;
   private readonly maxFrameResends: number;
+  private readonly transientAckTimeoutMs: number;
+  private readonly maxTransientSnapshotResends: number;
+  private readonly transientReplay = new ReliableTransientReplayStore();
   private closed = false;
 
   public constructor(
@@ -232,6 +272,16 @@ export class ReliableKernelWebviewFeedBridge {
       options.maxFrameResends,
       FEED_MAX_FRAME_RESENDS,
       'maxFrameResends'
+    );
+    this.transientAckTimeoutMs = positiveInteger(
+      options.transientAckTimeoutMs,
+      TRANSIENT_ACK_TIMEOUT_MS,
+      'transientAckTimeoutMs'
+    );
+    this.maxTransientSnapshotResends = nonNegativeInteger(
+      options.maxTransientSnapshotResends,
+      TRANSIENT_MAX_SNAPSHOT_RESENDS,
+      'maxTransientSnapshotResends'
     );
   }
 
@@ -254,6 +304,9 @@ export class ReliableKernelWebviewFeedBridge {
     client.pendingTransientEvents = [];
     client.transientToolCallKeys = new Set<string>();
     client.transientRawEventCount = 0;
+    client.transientFlushInFlight = false;
+    client.transientDeliveries = new Map<string, TransientDelivery>();
+    client.transientDropDiagnosticKeys = new Set<string>();
     client.recoveryAttempt = 0;
     this.clients.set(clientId, client);
     this.post(client, {
@@ -307,11 +360,24 @@ export class ReliableKernelWebviewFeedBridge {
     }
     this.clearLastDataPost(client);
     this.clearTransientQueue(client);
+    this.clearTransientDeliveries(client);
     client.detailRequests.clear();
     client.historyRequests.clear();
     client.navigationGeneration += 1;
-    client.connection = this.connect(client, client.navigationGeneration);
-    void previous?.then((connection) => this.feed.disconnect(connection.sessionId), () => undefined);
+    const navigationGeneration = client.navigationGeneration;
+    const connection = this.connect(client, navigationGeneration);
+    client.connection = connection;
+    void connection.then((active) => {
+      if (
+        client.closed
+        || !client.ready
+        || !client.visible
+        || client.connection !== connection
+        || client.navigationGeneration !== navigationGeneration
+      ) return;
+      this.replayTransientConversation(client, active, 'connection');
+    }, () => undefined);
+    void previous?.then((active) => this.feed.disconnect(active.sessionId), () => undefined);
     this.post(client, {
       id: randomUUID(),
       type: BridgeMessageType.Hello,
@@ -325,6 +391,7 @@ export class ReliableKernelWebviewFeedBridge {
     this.cancelRecoveryTimer(client);
     this.clearLastDataPost(client);
     this.clearTransientQueue(client);
+    this.clearTransientDeliveries(client);
     client.detailRequests.clear();
     client.historyRequests.clear();
     client.navigationGeneration += 1;
@@ -346,6 +413,7 @@ export class ReliableKernelWebviewFeedBridge {
     this.cancelRecoveryTimer(client);
     this.clearLastDataPost(client);
     this.clearTransientQueue(client);
+    this.clearTransientDeliveries(client);
     client.detailRequests.clear();
     client.historyRequests.clear();
     this.clients.delete(clientId);
@@ -363,6 +431,8 @@ export class ReliableKernelWebviewFeedBridge {
     if (!isRecord(message)) return false;
     if (
       message.type !== RELIABLE_KERNEL_ACK_MESSAGE
+      && message.type !== RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE
+      && message.type !== RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE
       && message.type !== RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE
@@ -387,6 +457,43 @@ export class ReliableKernelWebviewFeedBridge {
         const posted = client.lastDataPost;
         this.feed.acknowledge(ack);
         this.observeAck(client, ack, posted);
+        return true;
+      }
+      if (message.type === RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE) {
+        const ack = normalizeTransientAck(message);
+        if (
+          ack.sessionId !== connection.sessionId
+          || ack.hostBootId !== connection.hostBootId
+          || (ack.navigationGeneration !== undefined
+            && BigInt(ack.navigationGeneration) !== BigInt(client.navigationGeneration))
+        ) return true;
+        this.observeTransientAck(client, ack);
+        return true;
+      }
+      if (message.type === RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE) {
+        const request = normalizeTransientSnapshotRequest(message);
+        if (
+          request.sessionId !== connection.sessionId
+          || request.hostBootId !== connection.hostBootId
+          || request.conversationId !== client.meta.conversationId
+          || (request.navigationGeneration !== undefined
+            && BigInt(request.navigationGeneration) !== BigInt(client.navigationGeneration))
+        ) return true;
+        const snapshot = this.transientReplay.snapshot(request);
+        this.diagnostics?.observe({
+          eventKind: snapshot ? 'feed.transient.snapshot_requested' : 'feed.transient.snapshot_unavailable',
+          scopeKind: 'model_request',
+          scopeId: request.modelRequestId,
+          correlationId: request.requestId,
+          metadata: {
+            conversationId: request.conversationId,
+            sessionId: request.sessionId,
+            attemptSeq: request.attemptSeq,
+            socketGeneration: request.socketGeneration,
+            afterStreamSeq: request.afterStreamSeq
+          }
+        });
+        if (snapshot) this.postTransientSnapshot(client, connection, snapshot, request.requestId, 0);
         return true;
       }
       if (message.type === RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE) {
@@ -542,26 +649,35 @@ export class ReliableKernelWebviewFeedBridge {
   /** Broadcasts a memory-only stream overlay only to panels scoped to the same Conversation. */
   public broadcastTransient(event: ReliableAgentTransientEvent): void {
     if (this.closed) return;
+    this.transientReplay.observe(event);
     for (const client of this.clients.values()) {
-      if (
-        client.closed
-        || !client.ready
-        || !client.visible
-        || !client.connection
-        || client.meta.conversationId !== event.conversationId
-      ) continue;
+      if (client.closed || client.meta.conversationId !== event.conversationId) continue;
+      const dropReason = !client.ready
+        ? 'not_ready'
+        : !client.visible
+          ? 'hidden'
+          : !client.connection
+            ? 'not_connected'
+            : undefined;
+      if (dropReason) {
+        this.observeTransientDrop(client, event, dropReason);
+        continue;
+      }
       const toolDeltaKeys = toolCallDeltaTransientKeys(event);
       const firstToolDelta = toolDeltaKeys.some((key) => !client.transientToolCallKeys.has(key));
       for (const key of toolDeltaKeys) client.transientToolCallKeys.add(key);
       client.transientRawEventCount += 1;
       if (!coalescePendingToolCallDelta(client.pendingTransientEvents, event)) {
-        client.pendingTransientEvents.push(event);
+        client.pendingTransientEvents.push({
+          event,
+          fromStreamSeq: String(event.event.streamSeq)
+        });
       }
       const terminal = ['completed', 'failed', 'cancelled'].includes(event.event.kind);
       const itemBoundary = event.event.kind === 'output_item_done';
       // The first delta makes a new call visible immediately. Later fragments of the same call use
       // the short presentation window so a large edit cannot monopolize postMessage/renderer work.
-      // Durable item/terminal boundaries always flush the exact accumulated prefix first.
+      // Item/terminal boundaries always flush the exact accumulated prefix first.
       if (
         firstToolDelta
         || itemBoundary
@@ -586,28 +702,36 @@ export class ReliableKernelWebviewFeedBridge {
       clearTimeout(client.transientFlushTimer);
       client.transientFlushTimer = undefined;
     }
-    if (client.closed || client.pendingTransientEvents.length === 0) return;
-    const events = client.pendingTransientEvents.splice(0, TRANSIENT_BATCH_MAX_EVENTS);
-    const rawEventCount = client.transientRawEventCount;
-    client.transientRawEventCount = 0;
+    if (
+      client.closed
+      || client.transientFlushInFlight
+      || client.pendingTransientEvents.length === 0
+    ) return;
     const conversationId = client.meta.conversationId;
-    if (!conversationId || events.some((event) => event.conversationId !== conversationId)) return;
     const connectionPromise = client.connection;
-    if (!connectionPromise || !client.ready || !client.visible) return;
+    if (!conversationId || !connectionPromise || !client.ready || !client.visible) return;
+    client.transientFlushInFlight = true;
     void connectionPromise.then((connection) => {
       if (
         client.closed
+        || !client.ready
         || !client.visible
         || client.connection !== connectionPromise
         || client.meta.conversationId !== conversationId
-      ) return;
-      const common = {
-        sessionId: connection.sessionId,
-        navigationGeneration: String(client.navigationGeneration),
-        hostBootId: connection.hostBootId,
-        conversationId
-      };
-      const payloads = events.map((event) => ({
+      ) {
+        const first = client.pendingTransientEvents[0]?.event;
+        if (first) this.observeTransientDrop(client, first, 'generation_changed');
+        this.clearTransientQueue(client);
+        return;
+      }
+      const pending = client.pendingTransientEvents.splice(0, TRANSIENT_BATCH_MAX_EVENTS);
+      const rawEventCount = client.transientRawEventCount;
+      client.transientRawEventCount = 0;
+      if (pending.some(({ event }) => event.conversationId !== conversationId)) {
+        this.clearTransientQueue(client);
+        return;
+      }
+      const payloads: ReliableKernelTransientBatchItem[] = pending.map(({ event, fromStreamSeq }) => ({
         turnId: event.turnId,
         modelRequestId: event.modelRequestId,
         requestSeq: event.requestSeq,
@@ -616,8 +740,12 @@ export class ReliableKernelWebviewFeedBridge {
         attemptSeq: event.attemptSeq,
         socketGeneration: event.socketGeneration,
         afterCommitSeq: event.afterCommitSeq,
+        fromStreamSeq,
         observedAt: event.observedAt,
-        event: event.event
+        event: {
+          ...event.event,
+          streamSeq: String(event.event.streamSeq)
+        }
       }));
       this.diagnostics?.observe({
         eventKind: 'feed.transient.flushed',
@@ -627,23 +755,12 @@ export class ReliableKernelWebviewFeedBridge {
           conversationId,
           rawEventCount,
           emittedEventCount: payloads.length,
-          toolDeltaEventCount: events.filter(isToolCallDeltaTransient).length
+          toolDeltaEventCount: pending.filter(({ event }) => isToolCallDeltaTransient(event)).length,
+          firstStreamSeq: payloads[0]?.fromStreamSeq ?? '0',
+          lastStreamSeq: payloads[payloads.length - 1]?.event.streamSeq ?? '0'
         }
       });
-      if (payloads.length === 1) {
-        this.post(client, {
-          type: RELIABLE_KERNEL_TRANSIENT_MESSAGE,
-          ...common,
-          ...payloads[0]
-        });
-      } else {
-        this.post(client, {
-          type: RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE,
-          ...common,
-          events: payloads
-        });
-      }
-      if (client.pendingTransientEvents.length > 0) this.flushTransientQueue(client);
+      this.postTransientBatch(client, connection, conversationId, payloads);
     }, (error) => {
       if (
         error instanceof FeedConnectionSupersededError
@@ -651,6 +768,228 @@ export class ReliableKernelWebviewFeedBridge {
         || client.connection !== connectionPromise
       ) return;
       this.onError(error, { clientId: client.clientId, operation: 'post' });
+    }).finally(() => {
+      client.transientFlushInFlight = false;
+      if (
+        !client.closed
+        && client.ready
+        && client.visible
+        && client.connection
+        && client.pendingTransientEvents.length > 0
+      ) this.flushTransientQueue(client);
+    });
+  }
+
+  private postTransientBatch(
+    client: FeedClient,
+    connection: ClientFeedConnection,
+    conversationId: string,
+    events: ReliableKernelTransientBatchItem[]
+  ): void {
+    if (events.length === 0) return;
+    const deliveryId = randomUUID();
+    this.postTransientEnvelope(client, connection, {
+      type: RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE,
+      deliveryId,
+      sessionId: connection.sessionId,
+      navigationGeneration: String(client.navigationGeneration),
+      hostBootId: connection.hostBootId,
+      conversationId,
+      events
+    }, {
+      deliveryId,
+      kind: 'batch',
+      resendCount: 0
+    });
+  }
+
+  private postTransientSnapshot(
+    client: FeedClient,
+    connection: ClientFeedConnection,
+    snapshot: ReliableTransientReplaySnapshot,
+    requestId: string | undefined,
+    resendCount: number
+  ): void {
+    const deliveryId = randomUUID();
+    const message: ReliableKernelTransientSnapshotMessage = {
+      type: RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE,
+      deliveryId,
+      ...(requestId ? { requestId } : {}),
+      sessionId: connection.sessionId,
+      navigationGeneration: String(client.navigationGeneration),
+      hostBootId: connection.hostBootId,
+      ...snapshot
+    };
+    this.postTransientEnvelope(client, connection, message, {
+      deliveryId,
+      kind: 'snapshot',
+      resendCount
+    });
+  }
+
+  private postTransientEnvelope(
+    client: FeedClient,
+    connection: ClientFeedConnection,
+    message: ReliableKernelTransientBatchMessage | ReliableKernelTransientSnapshotMessage,
+    input: Pick<TransientDelivery, 'deliveryId' | 'kind' | 'resendCount'>
+  ): void {
+    if (
+      client.closed
+      || !client.ready
+      || !client.visible
+      || client.meta.conversationId !== message.conversationId
+    ) return;
+    let plain: unknown;
+    try {
+      plain = toStructuredClonePlainData(message, 'reliable transient webview message');
+    } catch (error) {
+      this.onError(error, { clientId: client.clientId, operation: 'post' });
+      return;
+    }
+    const delivery: TransientDelivery = {
+      ...input,
+      sessionId: connection.sessionId,
+      navigationGeneration: client.navigationGeneration,
+      postedAt: Date.now(),
+      ackTimer: this.armTransientAckTimer(client, input.deliveryId)
+    };
+    client.transientDeliveries.set(input.deliveryId, delivery);
+    void client.webview.postMessage(plain).then((delivered) => {
+      if (delivered === false) this.failTransientDelivery(client, delivery, 'post_false');
+    }, (error) => {
+      this.onError(error, { clientId: client.clientId, operation: 'post' });
+      this.failTransientDelivery(client, delivery, 'post_rejected');
+    });
+  }
+
+  private armTransientAckTimer(client: FeedClient, deliveryId: string): NodeJS.Timeout {
+    const timer = setTimeout(() => {
+      const delivery = client.transientDeliveries.get(deliveryId);
+      if (!delivery) return;
+      this.failTransientDelivery(client, delivery, 'ack_timeout');
+    }, this.transientAckTimeoutMs);
+    timer.unref();
+    return timer;
+  }
+
+  private failTransientDelivery(
+    client: FeedClient,
+    delivery: TransientDelivery,
+    reason: 'post_false' | 'post_rejected' | 'ack_timeout'
+  ): void {
+    if (client.transientDeliveries.get(delivery.deliveryId) !== delivery) return;
+    clearTimeout(delivery.ackTimer);
+    client.transientDeliveries.delete(delivery.deliveryId);
+    this.diagnostics?.observe({
+      eventKind: `feed.transient.${reason}`,
+      scopeKind: 'feed_session',
+      scopeId: delivery.sessionId,
+      correlationId: delivery.deliveryId,
+      metadata: {
+        ...(client.meta.conversationId ? { conversationId: client.meta.conversationId } : {}),
+        deliveryKind: delivery.kind,
+        resendCount: delivery.resendCount,
+        elapsedMs: Math.max(0, Date.now() - delivery.postedAt)
+      }
+    });
+    if (
+      client.closed
+      || !client.ready
+      || !client.visible
+      || delivery.navigationGeneration !== client.navigationGeneration
+      || delivery.resendCount >= this.maxTransientSnapshotResends
+    ) return;
+    const connectionPromise = client.connection;
+    const conversationId = client.meta.conversationId;
+    if (!connectionPromise || !conversationId) return;
+    // One cumulative replay supersedes every unacknowledged transient frame in this generation.
+    this.clearTransientDeliveries(client);
+    void connectionPromise.then((connection) => {
+      if (
+        client.closed
+        || !client.ready
+        || !client.visible
+        || client.connection !== connectionPromise
+        || client.navigationGeneration !== delivery.navigationGeneration
+        || client.meta.conversationId !== conversationId
+      ) return;
+      const snapshots = this.transientReplay.snapshotsForConversation(conversationId);
+      for (const snapshot of snapshots) {
+        this.postTransientSnapshot(client, connection, snapshot, undefined, delivery.resendCount + 1);
+      }
+    }, () => undefined);
+  }
+
+  private observeTransientAck(client: FeedClient, ack: ReliableKernelTransientAckMessage): void {
+    const delivery = client.transientDeliveries.get(ack.deliveryId);
+    if (
+      !delivery
+      || delivery.sessionId !== ack.sessionId
+      || delivery.navigationGeneration !== client.navigationGeneration
+    ) return;
+    clearTimeout(delivery.ackTimer);
+    client.transientDeliveries.delete(ack.deliveryId);
+    this.diagnostics?.observe({
+      eventKind: 'feed.transient.acked',
+      scopeKind: 'feed_session',
+      scopeId: ack.sessionId,
+      correlationId: ack.deliveryId,
+      metadata: {
+        ...(client.meta.conversationId ? { conversationId: client.meta.conversationId } : {}),
+        deliveryKind: delivery.kind,
+        headCount: ack.heads.length,
+        elapsedMs: Math.max(0, Date.now() - delivery.postedAt)
+      }
+    });
+  }
+
+  private replayTransientConversation(
+    client: FeedClient,
+    connection: ClientFeedConnection,
+    reason: 'connection'
+  ): void {
+    const conversationId = client.meta.conversationId;
+    if (!conversationId) return;
+    const snapshots = this.transientReplay.snapshotsForConversation(conversationId);
+    client.transientDropDiagnosticKeys.clear();
+    if (snapshots.length === 0) return;
+    this.diagnostics?.observe({
+      eventKind: 'feed.transient.connection_replay',
+      scopeKind: 'feed_session',
+      scopeId: connection.sessionId,
+      metadata: { conversationId, reason, snapshotCount: snapshots.length }
+    });
+    for (const snapshot of snapshots) {
+      this.postTransientSnapshot(client, connection, snapshot, undefined, 0);
+    }
+  }
+
+  private observeTransientDrop(
+    client: FeedClient,
+    event: ReliableAgentTransientEvent,
+    reason: 'not_ready' | 'hidden' | 'not_connected' | 'generation_changed'
+  ): void {
+    const key = `${event.modelRequestId}\0${event.attemptSeq}\0${event.socketGeneration}\0${reason}`;
+    if (client.transientDropDiagnosticKeys.has(key)) return;
+    client.transientDropDiagnosticKeys.add(key);
+    while (client.transientDropDiagnosticKeys.size > TRANSIENT_MAX_DROP_DIAGNOSTIC_KEYS) {
+      const oldest = client.transientDropDiagnosticKeys.values().next().value as string | undefined;
+      if (!oldest) break;
+      client.transientDropDiagnosticKeys.delete(oldest);
+    }
+    this.diagnostics?.observe({
+      eventKind: `feed.transient.dropped.${reason}`,
+      scopeKind: 'model_request',
+      scopeId: event.modelRequestId,
+      correlationId: String(event.event.streamSeq),
+      metadata: {
+        conversationId: event.conversationId,
+        clientId: client.clientId,
+        attemptSeq: event.attemptSeq,
+        socketGeneration: event.socketGeneration,
+        streamSeq: String(event.event.streamSeq),
+        navigationGeneration: client.navigationGeneration
+      }
     });
   }
 
@@ -660,6 +999,11 @@ export class ReliableKernelWebviewFeedBridge {
     client.pendingTransientEvents.length = 0;
     client.transientToolCallKeys.clear();
     client.transientRawEventCount = 0;
+  }
+
+  private clearTransientDeliveries(client: FeedClient): void {
+    for (const delivery of client.transientDeliveries.values()) clearTimeout(delivery.ackTimer);
+    client.transientDeliveries.clear();
   }
 
   public async setActiveConversation(
@@ -679,6 +1023,7 @@ export class ReliableKernelWebviewFeedBridge {
     if (this.closed) return;
     this.closed = true;
     for (const clientId of [...this.clients.keys()]) this.detach(clientId);
+    this.transientReplay.clear();
   }
 
   private async connect(client: FeedClient, navigationGeneration: number): Promise<ClientFeedConnection> {
@@ -901,8 +1246,15 @@ export class ReliableKernelWebviewFeedBridge {
       return;
     }
     if (!message.modelRequestId) return;
+    const eventKind = message.eventKind === 'transient-painted'
+      ? 'webview.transient.painted'
+      : message.eventKind === 'transient-gap'
+        ? 'webview.transient.gap'
+        : message.eventKind === 'transient-snapshot-replayed'
+          ? 'webview.transient.snapshot_replayed'
+          : 'webview.transient.snapshot_rejected';
     this.diagnostics?.observe({
-      eventKind: 'webview.transient.painted',
+      eventKind,
       scopeKind: 'model_request',
       scopeId: message.modelRequestId,
       correlationId: message.streamSeq,
@@ -1083,9 +1435,58 @@ function normalizeAck(message: Record<string, unknown>): ReliableKernelAckMessag
   };
 }
 
+function normalizeTransientAck(message: Record<string, unknown>): ReliableKernelTransientAckMessage {
+  if (!Array.isArray(message.heads) || message.heads.length > 256) {
+    throw new TypeError('transient ack.heads is invalid.');
+  }
+  return {
+    type: RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE,
+    deliveryId: requireText(message.deliveryId, 'transient ack.deliveryId'),
+    sessionId: requireText(message.sessionId, 'transient ack.sessionId'),
+    hostBootId: requireText(message.hostBootId, 'transient ack.hostBootId'),
+    ...(message.navigationGeneration === undefined
+      ? {}
+      : { navigationGeneration: requireDecimal(message.navigationGeneration, 'transient ack.navigationGeneration') }),
+    heads: message.heads.map((value, index) => {
+      if (!isRecord(value)) throw new TypeError(`transient ack.heads[${index}] is invalid.`);
+      return {
+        modelRequestId: requireText(value.modelRequestId, `transient ack.heads[${index}].modelRequestId`),
+        attemptSeq: requireDecimal(value.attemptSeq, `transient ack.heads[${index}].attemptSeq`),
+        socketGeneration: requireDecimal(value.socketGeneration, `transient ack.heads[${index}].socketGeneration`),
+        streamSeq: requireDecimal(value.streamSeq, `transient ack.heads[${index}].streamSeq`)
+      };
+    })
+  };
+}
+
+function normalizeTransientSnapshotRequest(
+  message: Record<string, unknown>
+): ReliableKernelTransientSnapshotRequestMessage {
+  return {
+    type: RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE,
+    requestId: requireText(message.requestId, 'transient snapshot request.requestId'),
+    sessionId: requireText(message.sessionId, 'transient snapshot request.sessionId'),
+    hostBootId: requireText(message.hostBootId, 'transient snapshot request.hostBootId'),
+    ...(message.navigationGeneration === undefined
+      ? {}
+      : { navigationGeneration: requireDecimal(message.navigationGeneration, 'transient snapshot request.navigationGeneration') }),
+    conversationId: requireText(message.conversationId, 'transient snapshot request.conversationId'),
+    modelRequestId: requireText(message.modelRequestId, 'transient snapshot request.modelRequestId'),
+    attemptSeq: requireDecimal(message.attemptSeq, 'transient snapshot request.attemptSeq'),
+    socketGeneration: requireDecimal(message.socketGeneration, 'transient snapshot request.socketGeneration'),
+    afterStreamSeq: requireDecimal(message.afterStreamSeq, 'transient snapshot request.afterStreamSeq')
+  };
+}
+
 function normalizeClientDiagnostic(message: Record<string, unknown>): ReliableKernelClientDiagnosticMessage {
   const eventKind = message.eventKind;
-  if (eventKind !== 'feed-painted' && eventKind !== 'transient-painted') {
+  if (![
+    'feed-painted',
+    'transient-painted',
+    'transient-gap',
+    'transient-snapshot-replayed',
+    'transient-snapshot-rejected'
+  ].includes(String(eventKind))) {
     throw new TypeError('client diagnostic.eventKind is invalid.');
   }
   const observedAt = requireText(message.observedAt, 'client diagnostic.observedAt');
@@ -1093,7 +1494,7 @@ function normalizeClientDiagnostic(message: Record<string, unknown>): ReliableKe
   return {
     type: RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
     sessionId: requireText(message.sessionId, 'client diagnostic.sessionId'),
-    eventKind,
+    eventKind: eventKind as ReliableKernelClientDiagnosticMessage['eventKind'],
     observedAt: new Date(Date.parse(observedAt)).toISOString(),
     ...(message.conversationId === undefined ? {} : { conversationId: requireText(message.conversationId, 'client diagnostic.conversationId') }),
     ...(message.turnId === undefined ? {} : { turnId: requireText(message.turnId, 'client diagnostic.turnId') }),

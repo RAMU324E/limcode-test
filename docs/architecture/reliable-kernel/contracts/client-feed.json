@@ -106,6 +106,7 @@
   "details": {
     "onDemand": [
       "message-content",
+      "turn-intent-preview",
       "tool-arguments-content",
       "tool-result-content",
       "file-change-base-content",
@@ -115,6 +116,14 @@
       "context-projection-detail",
       "answer-content"
     ],
+    "turnIntentPreview": {
+      "version": 3,
+      "kinds": [
+        "guidance",
+        "runtime_continuation"
+      ],
+      "runtimeContinuationRule": "运行时续跑预览必须经 RuntimeDeliveryIntentLink 解析到唯一 RuntimeDelivery，再按 RuntimeInboxItem.source_kind 投影后台进程或子 Agent 来源；禁止从 TurnIntent 文本猜测 delivery/source 身份。"
+    },
     "maxResponseBytes": 2097152,
     "chunkedRead": {
       "when": "单条记录超过 maxResponseBytes",
@@ -180,7 +189,8 @@
   },
   "notes": [
     "r4: commitSeq 只在同一 hostBootId 内单调；snapshot 与 changes 通过原子 barrier 交接",
-    "r5: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；共享ACK基线的未发送commit range先压缩净变化，仍超限才转单一snapshot-required；未发送批次不占用wire messageSeq"
+    "r5: 单 commit 批次和宿主内存队列均有 records/bytes 硬上限；共享ACK基线的未发送commit range先压缩净变化，仍超限才转单一snapshot-required；未发送批次不占用wire messageSeq",
+    "r6: RuntimeDeliveryIntentLink 进入有界投影；turn-intent-preview v3 以 guidance/runtime_continuation 判别，并展示后台进程或子 Agent 的真实来源"
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",

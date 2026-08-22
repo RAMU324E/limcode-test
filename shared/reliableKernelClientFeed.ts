@@ -15,6 +15,9 @@ export const RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE = 'reliable-kernel.hist
 export const RELIABLE_KERNEL_HISTORY_PAGE_ERROR_MESSAGE = 'reliable-kernel.history-page-error';
 export const RELIABLE_KERNEL_TRANSIENT_MESSAGE = 'reliable-kernel.transient';
 export const RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE = 'reliable-kernel.transient-batch';
+export const RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE = 'reliable-kernel.transient-ack';
+export const RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE = 'reliable-kernel.transient-snapshot-request';
+export const RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE = 'reliable-kernel.transient-snapshot';
 export const RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE = 'reliable-kernel.client-diagnostic';
 
 export interface ReliableKernelClientChange {
@@ -80,6 +83,64 @@ export type ReliableKernelClientDetailKind =
   | 'compression-content'
   | 'compression-title'
   | 'answer-content';
+
+export interface ReliableKernelGuidanceTurnIntentPreview {
+  version: 3;
+  kind: 'guidance';
+  text: string;
+  editorText: string;
+  hasAttachments: boolean;
+  truncated: boolean;
+  revisionSeq: string;
+  position: string;
+  hold: 'none' | 'paused';
+}
+
+export interface ReliableKernelBackgroundProcessContinuationSource {
+  kind: 'background_process';
+  inboxItemId: string;
+  sourceId: string;
+  processId: string;
+  processReceiptId: string;
+  processStatus: string;
+  outcome: string;
+  commandPreview?: string;
+  toolCallId?: string;
+  exitCode?: string;
+  exitSignal?: string;
+}
+
+export interface ReliableKernelSubagentContinuationSource {
+  kind: 'subagent';
+  inboxItemId: string;
+  sourceId: string;
+  submissionId: string;
+  childExecutionId: string;
+  childConversationId: string;
+  childStatus: string;
+  interrupted: boolean;
+  agentId?: string;
+  title?: string;
+}
+
+export type ReliableKernelRuntimeContinuationSource =
+  | ReliableKernelBackgroundProcessContinuationSource
+  | ReliableKernelSubagentContinuationSource;
+
+export interface ReliableKernelRuntimeContinuationTurnIntentPreview {
+  version: 3;
+  kind: 'runtime_continuation';
+  revisionSeq: string;
+  sourceTurnId: string;
+  deliveryId: string;
+  deliveryState: string;
+  phase: string;
+  source: ReliableKernelRuntimeContinuationSource;
+}
+
+export type ReliableKernelTurnIntentPreview =
+  | ReliableKernelGuidanceTurnIntentPreview
+  | ReliableKernelRuntimeContinuationTurnIntentPreview;
 
 export interface ReliableKernelDetailRequestMessage {
   type: typeof RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE;
@@ -166,10 +227,12 @@ export interface ReliableKernelTransientMessage {
   providerId: string;
   modelId: string;
   /** Provider retry identity. A changed attempt/generation starts a fresh transient accumulator. */
-  attemptSeq?: string;
-  socketGeneration?: string;
+  attemptSeq: string;
+  socketGeneration: string;
   /** Durable feed frontier that must be painted before this overlay is causally displayable. */
-  afterCommitSeq?: string;
+  afterCommitSeq: string;
+  /** First provider sequence represented by this event after bounded bridge coalescing. */
+  fromStreamSeq: string;
   observedAt: string;
   event: {
     kind: 'output_delta' | 'output_item_done' | 'completed' | 'failed' | 'cancelled';
@@ -193,6 +256,7 @@ export type ReliableKernelTransientBatchItem = Omit<
 /** One bounded IPC envelope for an ordered burst of memory-only stream events. */
 export interface ReliableKernelTransientBatchMessage {
   type: typeof RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE;
+  deliveryId: string;
   sessionId: string;
   navigationGeneration?: string;
   hostBootId: string;
@@ -200,11 +264,65 @@ export interface ReliableKernelTransientBatchMessage {
   events: ReliableKernelTransientBatchItem[];
 }
 
-/** Client-reported paint markers contain identities/timestamps only; arbitrary metadata is forbidden. */
+export interface ReliableKernelTransientRequestHead {
+  modelRequestId: string;
+  attemptSeq: string;
+  socketGeneration: string;
+  streamSeq: string;
+}
+
+/** Transport receipt only; durable Feed commit acknowledgement remains a separate contract. */
+export interface ReliableKernelTransientAckMessage {
+  type: typeof RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE;
+  deliveryId: string;
+  sessionId: string;
+  hostBootId: string;
+  navigationGeneration?: string;
+  heads: ReliableKernelTransientRequestHead[];
+}
+
+export interface ReliableKernelTransientSnapshotRequestMessage {
+  type: typeof RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  hostBootId: string;
+  navigationGeneration?: string;
+  conversationId: string;
+  modelRequestId: string;
+  attemptSeq: string;
+  socketGeneration: string;
+  /** Last contiguous sequence retained by the Webview; zero means no trusted prefix. */
+  afterStreamSeq: string;
+}
+
+/** A cumulative, memory-only replay projection for one exact Provider request attempt. */
+export interface ReliableKernelTransientSnapshotMessage {
+  type: typeof RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE;
+  deliveryId: string;
+  requestId?: string;
+  sessionId: string;
+  hostBootId: string;
+  navigationGeneration?: string;
+  conversationId: string;
+  turnId: string;
+  modelRequestId: string;
+  requestSeq: string;
+  providerId: string;
+  modelId: string;
+  attemptSeq: string;
+  socketGeneration: string;
+  afterCommitSeq: string;
+  headStreamSeq: string;
+  observedAt: string;
+  /** Coalesced semantic replay events in first-observed output order. */
+  events: ReliableKernelTransientBatchItem[];
+}
+
+/** Client-reported paint/gap markers contain identities/timestamps only; arbitrary metadata is forbidden. */
 export interface ReliableKernelClientDiagnosticMessage {
   type: typeof RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE;
   sessionId: string;
-  eventKind: 'feed-painted' | 'transient-painted';
+  eventKind: 'feed-painted' | 'transient-painted' | 'transient-gap' | 'transient-snapshot-replayed' | 'transient-snapshot-rejected';
   observedAt: string;
   conversationId?: string;
   turnId?: string;
@@ -288,7 +406,8 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'AnswerBridge',
   'AnswerSubmission',
   'RuntimeInboxItem',
-  'RuntimeDelivery'
+  'RuntimeDelivery',
+  'RuntimeDeliveryIntentLink'
 ] as const);
 
 export function createEmptyReliableKernelClientState(): ReliableKernelBoundedClientState {
@@ -459,7 +578,8 @@ function seedRecordsFromSnapshot(
     answerBridges: 'AnswerBridge',
     answerSubmissions: 'AnswerSubmission',
     runtimeInboxItems: 'RuntimeInboxItem',
-    runtimeDeliveries: 'RuntimeDelivery'
+    runtimeDeliveries: 'RuntimeDelivery',
+    runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink'
   };
   const visit = (value: PlainData): void => {
     if (Array.isArray(value)) {

@@ -11,8 +11,11 @@ import {
   RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE,
   RELIABLE_KERNEL_SNAPSHOT_MESSAGE,
   RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE,
   RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE,
   RELIABLE_KERNEL_TRANSIENT_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE,
+  RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE,
   applyReliableKernelDataMessage,
   createEmptyReliableKernelClientState,
   type ReliableKernelBoundedClientState,
@@ -21,8 +24,10 @@ import {
   type ReliableKernelDetailResultMessage,
   type ReliableKernelHistoryPageErrorMessage,
   type ReliableKernelHistoryPageResultMessage,
+  type ReliableKernelTransientBatchItem,
   type ReliableKernelTransientBatchMessage,
-  type ReliableKernelTransientMessage
+  type ReliableKernelTransientMessage,
+  type ReliableKernelTransientSnapshotMessage
 } from '@shared/reliableKernelClientFeed';
 import {
   createMessageId,
@@ -123,8 +128,22 @@ export interface ReliableKernelTransientState {
   completedAt?: number;
   streamOutputDurationMs?: number;
   status: 'streaming' | 'completed' | 'failed' | 'cancelled';
+  /** A continuity gap is being healed; the last contiguous prefix remains renderable. */
+  recovering?: boolean;
   startedAt: number;
   updatedAt: number;
+}
+
+interface PendingTransientRecovery {
+  requestId: string;
+  sessionId: string;
+  hostBootId: string;
+  navigationGeneration?: string;
+  conversationId: string;
+  modelRequestId: string;
+  attemptSeq: string;
+  socketGeneration: string;
+  afterStreamSeq: string;
 }
 
 interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState {
@@ -133,9 +152,12 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   detailQueue: string[];
   activeDetailRequestIds: string[];
   detailCacheMeta: Record<string, ReliableKernelDetailCacheMeta>;
+  /** Ready detail entries owned by the currently mounted timeline segment. */
+  pinnedDetailKeys: string[];
   retiredSessionIds: string[];
   navigationGeneration: string | null;
   transientModelRequests: Record<string, ReliableKernelTransientState>;
+  pendingTransientRecoveries: Record<string, PendingTransientRecovery>;
   /** Memory-only immutable history prefix for the currently projected Conversation. */
   historyConversationId: string | null;
   historyRecords: ReliableKernelBoundedClientState['records'];
@@ -180,9 +202,11 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     detailQueue: [],
     activeDetailRequestIds: [],
     detailCacheMeta: {},
+    pinnedDetailKeys: [],
     retiredSessionIds: [],
     navigationGeneration: null,
     transientModelRequests: {},
+    pendingTransientRecoveries: {},
     historyConversationId: null,
     historyRecords: {},
     historyNextBeforeMessageSeq: null,
@@ -223,11 +247,15 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         this.observeHistoryPageError(message);
         return;
       }
+      if (isReliableKernelTransientSnapshotMessage(message)) {
+        this.observeTransientSnapshot(message);
+        return;
+      }
       if (isReliableKernelTransientBatchMessage(message)) {
         this.observeTransientBatch(message);
         return;
       }
-      if (isReliableKernelTransientMessage(message)) this.observeTransient(message);
+      if (isReliableKernelTransientMessage(message)) this.observeTransientFrame(message);
     },
 
     observeData(message: unknown): void {
@@ -300,8 +328,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       }> = [];
       if (previousSessionId && result.state.sessionId !== previousSessionId) {
         this.retiredSessionIds = [...this.retiredSessionIds, previousSessionId].slice(-16);
-        const sameTransientScope = previousHostBootId === result.state.hostBootId
-          && previousConversationId !== undefined
+        const sameTransientScope = previousConversationId !== undefined
           && previousConversationId === activeConversationId(result.state.projections);
         if (sameTransientScope) {
           replayDetails = Object.values(this.pendingDetails).map((pending) => ({
@@ -312,9 +339,12 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           }));
         }
         cancelAllDetailRequests(this.$state);
+        this.pendingTransientRecoveries = {};
         if (!sameTransientScope) {
           this.transientModelRequests = {};
           reportedTransientPaints.clear();
+        } else if (previousHostBootId !== result.state.hostBootId) {
+          this.transientModelRequests = markTransientRequestsRecovering(this.transientModelRequests);
         }
       }
       if (previousHostBootId && result.state.hostBootId !== previousHostBootId) {
@@ -477,16 +507,210 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     },
 
     observeTransientBatch(message: ReliableKernelTransientBatchMessage): void {
+      if (!transientEnvelopeMatches(this.$state, message)) return;
+      let accepted = true;
       for (const event of message.events) {
-        this.observeTransient({
+        const transient: ReliableKernelTransientMessage = {
           type: RELIABLE_KERNEL_TRANSIENT_MESSAGE,
           ...event,
           sessionId: message.sessionId,
           ...(message.navigationGeneration ? { navigationGeneration: message.navigationGeneration } : {}),
           hostBootId: message.hostBootId,
           conversationId: message.conversationId
-        });
+        };
+        if (!this.observeTransientFrame(transient)) accepted = false;
       }
+      // A gap intentionally withholds the transport receipt. The explicit snapshot request is the
+      // primary recovery path; the Host ACK watchdog is the bounded fallback if that request drops.
+      if (accepted) {
+        this.ackTransientDelivery(
+          message.deliveryId,
+          message.sessionId,
+          message.hostBootId,
+          message.navigationGeneration,
+          transientHeadsForItems(this.transientModelRequests, message.events)
+        );
+      }
+    },
+
+    observeTransientFrame(message: ReliableKernelTransientMessage): boolean {
+      if (!transientEnvelopeMatches(this.$state, message)) return false;
+      const decision = transientContinuityDecision(
+        this.transientModelRequests[message.modelRequestId],
+        message
+      );
+      if (decision.kind === 'invalid') return false;
+      if (decision.kind === 'stale') return true;
+      if (decision.kind === 'gap') {
+        this.requestTransientSnapshot(message, decision.afterStreamSeq);
+        return false;
+      }
+      if (decision.replacesIdentity) {
+        this.pendingTransientRecoveries = removeTransientRecoveriesForModelRequest(
+          this.pendingTransientRecoveries,
+          message.modelRequestId
+        );
+      }
+      this.observeTransient(message);
+      return true;
+    },
+
+    requestTransientSnapshot(message: ReliableKernelTransientMessage, afterStreamSeq: string): void {
+      const sessionId = this.sessionId;
+      const hostBootId = this.hostBootId;
+      if (!sessionId || !hostBootId) return;
+      const key = transientRecoveryKey(
+        message.modelRequestId,
+        message.attemptSeq,
+        message.socketGeneration
+      );
+      if (this.pendingTransientRecoveries[key]) return;
+      const requestId = createMessageId();
+      const recovery: PendingTransientRecovery = {
+        requestId,
+        sessionId,
+        hostBootId,
+        ...(this.navigationGeneration ? { navigationGeneration: this.navigationGeneration } : {}),
+        conversationId: message.conversationId,
+        modelRequestId: message.modelRequestId,
+        attemptSeq: message.attemptSeq,
+        socketGeneration: message.socketGeneration,
+        afterStreamSeq
+      };
+      this.pendingTransientRecoveries[key] = recovery;
+      const current = this.transientModelRequests[message.modelRequestId];
+      if (
+        current
+        && compareReliableTransientIdentity(current, message.attemptSeq, message.socketGeneration) === 'same'
+      ) current.recovering = true;
+      bridge.postRaw({
+        type: RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE,
+        ...recovery
+      });
+      reportTransientRecoveryDiagnostic(this.$state, message, 'transient-gap', message.event.streamSeq);
+    },
+
+    observeTransientSnapshot(message: ReliableKernelTransientSnapshotMessage): void {
+      if (!transientEnvelopeMatches(this.$state, message)) return;
+      const headStreamSeq = decimal(message.headStreamSeq);
+      const attemptSeq = decimal(message.attemptSeq);
+      const socketGeneration = decimal(message.socketGeneration);
+      const requestSeq = positiveDecimal(message.requestSeq);
+      const afterCommitSeq = decimal(message.afterCommitSeq);
+      const providerId = nonEmptyString(message.providerId);
+      const modelId = nonEmptyString(message.modelId);
+      const validEvents = headStreamSeq !== undefined
+        && attemptSeq !== undefined
+        && socketGeneration !== undefined
+        && Boolean(requestSeq && afterCommitSeq !== undefined && providerId && modelId)
+        && message.events.length > 0
+        && message.events.every((event) => transientSnapshotItemMatches(message, event, headStreamSeq));
+      const prior = this.transientModelRequests[message.modelRequestId];
+      const identity = compareReliableTransientIdentity(prior, attemptSeq, socketGeneration);
+      if (!validEvents || identity === 'stale') {
+        this.ackTransientDelivery(
+          message.deliveryId,
+          message.sessionId,
+          message.hostBootId,
+          message.navigationGeneration,
+          prior ? [transientHead(prior)] : []
+        );
+        reportTransientSnapshotDiagnostic(this.$state, message, 'transient-snapshot-rejected');
+        return;
+      }
+
+      delete this.transientModelRequests[message.modelRequestId];
+      try {
+        message.events.forEach((event, index) => {
+          // Snapshot events are a semantic cumulative projection rather than the original frame
+          // sequence. Apply them in projection order, then publish the authoritative provider head.
+          const localSequence = String(index + 1);
+          this.observeTransient({
+            type: RELIABLE_KERNEL_TRANSIENT_MESSAGE,
+            ...event,
+            fromStreamSeq: localSequence,
+            sessionId: message.sessionId,
+            ...(message.navigationGeneration ? { navigationGeneration: message.navigationGeneration } : {}),
+            hostBootId: message.hostBootId,
+            conversationId: message.conversationId,
+            event: { ...event.event, streamSeq: localSequence }
+          });
+        });
+      } catch {
+        if (prior) this.transientModelRequests[message.modelRequestId] = prior;
+        else delete this.transientModelRequests[message.modelRequestId];
+        this.ackTransientDelivery(
+          message.deliveryId,
+          message.sessionId,
+          message.hostBootId,
+          message.navigationGeneration,
+          prior ? [transientHead(prior)] : []
+        );
+        reportTransientSnapshotDiagnostic(this.$state, message, 'transient-snapshot-rejected');
+        return;
+      }
+      const recovered = this.transientModelRequests[message.modelRequestId];
+      if (!recovered) {
+        const terminalKind = message.events[message.events.length - 1]?.event.kind;
+        if (terminalKind === 'completed' || terminalKind === 'failed' || terminalKind === 'cancelled') {
+          const key = transientRecoveryKey(message.modelRequestId, message.attemptSeq, message.socketGeneration);
+          delete this.pendingTransientRecoveries[key];
+          this.ackTransientDelivery(
+            message.deliveryId,
+            message.sessionId,
+            message.hostBootId,
+            message.navigationGeneration,
+            [{
+              modelRequestId: message.modelRequestId,
+              attemptSeq: message.attemptSeq,
+              socketGeneration: message.socketGeneration,
+              streamSeq: headStreamSeq!
+            }]
+          );
+          reportTransientSnapshotDiagnostic(this.$state, message, 'transient-snapshot-replayed');
+          return;
+        }
+        if (prior) this.transientModelRequests[message.modelRequestId] = prior;
+        this.ackTransientDelivery(
+          message.deliveryId,
+          message.sessionId,
+          message.hostBootId,
+          message.navigationGeneration,
+          prior ? [transientHead(prior)] : []
+        );
+        reportTransientSnapshotDiagnostic(this.$state, message, 'transient-snapshot-rejected');
+        return;
+      }
+      recovered.streamSeq = headStreamSeq!;
+      recovered.updatedAt = timestamp(message.observedAt) || Date.now();
+      recovered.recovering = false;
+      const key = transientRecoveryKey(message.modelRequestId, message.attemptSeq, message.socketGeneration);
+      delete this.pendingTransientRecoveries[key];
+      this.ackTransientDelivery(
+        message.deliveryId,
+        message.sessionId,
+        message.hostBootId,
+        message.navigationGeneration,
+        [transientHead(recovered)]
+      );
+      reportTransientSnapshotDiagnostic(this.$state, message, 'transient-snapshot-replayed');
+    },
+
+    ackTransientDelivery(
+      deliveryId: string,
+      sessionId: string,
+      hostBootId: string,
+      navigationGeneration: string | undefined,
+      heads: ReturnType<typeof transientHead>[]
+    ): void {
+      bridge.postRaw({
+        type: RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE,
+        deliveryId,
+        sessionId,
+        hostBootId,
+        ...(navigationGeneration ? { navigationGeneration } : {}),
+        heads
+      });
     },
 
     observeTransient(message: ReliableKernelTransientMessage): void {
@@ -728,6 +952,11 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         reconcileReliableTransientRequests(this.transientModelRequests, this.records, this.details);
       }
       if (!current) reportTransientPaint(this.sessionId, message, sequence);
+    },
+
+    setPinnedDetailKeys(keys: string[]): void {
+      this.pinnedDetailKeys = [...new Set(keys.filter((key) => key.length > 0))].slice(0, 256);
+      pruneDetailCache(this.$state);
     },
 
     requestDetail(
@@ -1163,6 +1392,7 @@ export function isReliableKernelFeedMessage(message: unknown): boolean {
     || isReliableKernelDetailErrorMessage(message)
     || isReliableKernelHistoryPageResultMessage(message)
     || isReliableKernelHistoryPageErrorMessage(message)
+    || isReliableKernelTransientSnapshotMessage(message)
     || isReliableKernelTransientBatchMessage(message)
     || isReliableKernelTransientMessage(message);
 }
@@ -1195,14 +1425,33 @@ function isReliableKernelHistoryPageErrorMessage(message: unknown): message is R
 function isReliableKernelTransientBatchMessage(message: unknown): message is ReliableKernelTransientBatchMessage {
   return isRecord(message)
     && message.type === RELIABLE_KERNEL_TRANSIENT_BATCH_MESSAGE
+    && nonEmptyString(message.deliveryId) !== undefined
     && Array.isArray(message.events)
+    && message.events.length > 0
+    && message.events.every((event) =>
+      isRecord(event)
+      && decimal(event.fromStreamSeq) !== undefined
+      && isRecord(event.event)
+      && decimal(event.event.streamSeq) !== undefined
+    );
+}
+
+function isReliableKernelTransientSnapshotMessage(message: unknown): message is ReliableKernelTransientSnapshotMessage {
+  return isRecord(message)
+    && message.type === RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_MESSAGE
+    && nonEmptyString(message.deliveryId) !== undefined
+    && decimal(message.headStreamSeq) !== undefined
+    && Array.isArray(message.events)
+    && message.events.length > 0
     && message.events.every((event) => isRecord(event) && isRecord(event.event));
 }
 
 function isReliableKernelTransientMessage(message: unknown): message is ReliableKernelTransientMessage {
   return isRecord(message)
     && message.type === RELIABLE_KERNEL_TRANSIENT_MESSAGE
-    && isRecord(message.event);
+    && decimal(message.fromStreamSeq) !== undefined
+    && isRecord(message.event)
+    && decimal(message.event.streamSeq) !== undefined;
 }
 
 function reportFeedPaint(message: unknown, conversationId?: string): void {
@@ -1245,6 +1494,189 @@ function reportTransientPaint(
     ...(message.socketGeneration ? { socketGeneration: message.socketGeneration } : {}),
     streamSeq
   }));
+}
+
+function transientEnvelopeMatches(
+  state: ReliableKernelFeedStoreState,
+  message: {
+    sessionId: string;
+    hostBootId: string;
+    navigationGeneration?: string;
+    conversationId: string;
+  }
+): boolean {
+  if (
+    !state.hostBootId
+    || message.hostBootId !== state.hostBootId
+    || !state.sessionId
+    || message.sessionId !== state.sessionId
+    || state.retiredSessionIds.includes(message.sessionId)
+  ) return false;
+  const conversationId = activeConversationId(state.projections);
+  if (!conversationId || message.conversationId !== conversationId) return false;
+  const incomingGeneration = optionalDecimal(message.navigationGeneration);
+  return !(
+    incomingGeneration
+    && state.navigationGeneration
+    && BigInt(incomingGeneration) !== BigInt(state.navigationGeneration)
+  );
+}
+
+type TransientContinuityDecision =
+  | { kind: 'accept'; replacesIdentity: boolean }
+  | { kind: 'stale' }
+  | { kind: 'gap'; afterStreamSeq: string }
+  | { kind: 'invalid' };
+
+function transientContinuityDecision(
+  current: ReliableKernelTransientState | undefined,
+  message: ReliableKernelTransientMessage
+): TransientContinuityDecision {
+  const fromStreamSeq = decimal(message.fromStreamSeq);
+  const streamSeq = decimal(message.event.streamSeq);
+  const attemptSeq = decimal(message.attemptSeq);
+  const socketGeneration = decimal(message.socketGeneration);
+  if (
+    fromStreamSeq === undefined
+    || streamSeq === undefined
+    || attemptSeq === undefined
+    || socketGeneration === undefined
+    || BigInt(streamSeq) < BigInt(fromStreamSeq)
+  ) return { kind: 'invalid' };
+  const identity = compareReliableTransientIdentity(current, attemptSeq, socketGeneration);
+  if (identity === 'stale') return { kind: 'stale' };
+  const replacesIdentity = identity === 'newer';
+  const afterStreamSeq = replacesIdentity ? '0' : current?.streamSeq ?? '0';
+  if (!replacesIdentity && BigInt(streamSeq) <= BigInt(afterStreamSeq)) return { kind: 'stale' };
+  if (BigInt(fromStreamSeq) !== BigInt(afterStreamSeq) + 1n) {
+    return { kind: 'gap', afterStreamSeq };
+  }
+  return { kind: 'accept', replacesIdentity };
+}
+
+function transientSnapshotItemMatches(
+  snapshot: ReliableKernelTransientSnapshotMessage,
+  item: ReliableKernelTransientBatchItem,
+  headStreamSeq: string
+): boolean {
+  const fromStreamSeq = decimal(item.fromStreamSeq);
+  const streamSeq = decimal(item.event.streamSeq);
+  const kind = item.event.kind;
+  const validKind = kind === 'output_delta'
+    || kind === 'output_item_done'
+    || kind === 'completed'
+    || kind === 'failed'
+    || kind === 'cancelled';
+  const validCompletedContent = kind !== 'completed' || messageContentValue(item.event.content) !== undefined;
+  return validKind
+    && validCompletedContent
+    && item.modelRequestId === snapshot.modelRequestId
+    && item.turnId === snapshot.turnId
+    && item.requestSeq === snapshot.requestSeq
+    && item.providerId === snapshot.providerId
+    && item.modelId === snapshot.modelId
+    && item.attemptSeq === snapshot.attemptSeq
+    && item.socketGeneration === snapshot.socketGeneration
+    && item.afterCommitSeq === snapshot.afterCommitSeq
+    && fromStreamSeq !== undefined
+    && streamSeq !== undefined
+    && BigInt(streamSeq) >= BigInt(fromStreamSeq)
+    && BigInt(streamSeq) <= BigInt(headStreamSeq);
+}
+
+function transientHead(state: ReliableKernelTransientState): {
+  modelRequestId: string;
+  attemptSeq: string;
+  socketGeneration: string;
+  streamSeq: string;
+} {
+  return {
+    modelRequestId: state.modelRequestId,
+    attemptSeq: state.attemptSeq ?? '0',
+    socketGeneration: state.socketGeneration ?? '0',
+    streamSeq: state.streamSeq
+  };
+}
+
+function transientHeadsForItems(
+  states: Record<string, ReliableKernelTransientState>,
+  items: ReliableKernelTransientBatchItem[]
+): ReturnType<typeof transientHead>[] {
+  const result: ReturnType<typeof transientHead>[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    if (seen.has(item.modelRequestId)) continue;
+    seen.add(item.modelRequestId);
+    const state = states[item.modelRequestId];
+    if (state) result.push(transientHead(state));
+  }
+  return result;
+}
+
+function transientRecoveryKey(
+  modelRequestId: string,
+  attemptSeq: string,
+  socketGeneration: string
+): string {
+  return `${modelRequestId}\0${attemptSeq}\0${socketGeneration}`;
+}
+
+function removeTransientRecoveriesForModelRequest(
+  recoveries: Record<string, PendingTransientRecovery>,
+  modelRequestId: string
+): Record<string, PendingTransientRecovery> {
+  return Object.fromEntries(
+    Object.entries(recoveries).filter(([, recovery]) => recovery.modelRequestId !== modelRequestId)
+  );
+}
+
+function markTransientRequestsRecovering(
+  requests: Record<string, ReliableKernelTransientState>
+): Record<string, ReliableKernelTransientState> {
+  return Object.fromEntries(
+    Object.entries(requests).map(([id, request]) => [id, { ...request, recovering: true }])
+  );
+}
+
+function reportTransientRecoveryDiagnostic(
+  state: ReliableKernelFeedStoreState,
+  message: ReliableKernelTransientMessage,
+  eventKind: 'transient-gap',
+  streamSeq: string | bigint
+): void {
+  if (!state.sessionId) return;
+  bridge.postRaw({
+    type: RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
+    sessionId: state.sessionId,
+    eventKind,
+    observedAt: new Date().toISOString(),
+    conversationId: message.conversationId,
+    turnId: message.turnId,
+    modelRequestId: message.modelRequestId,
+    attemptSeq: message.attemptSeq,
+    socketGeneration: message.socketGeneration,
+    streamSeq: String(streamSeq)
+  });
+}
+
+function reportTransientSnapshotDiagnostic(
+  state: ReliableKernelFeedStoreState,
+  message: ReliableKernelTransientSnapshotMessage,
+  eventKind: 'transient-snapshot-replayed' | 'transient-snapshot-rejected'
+): void {
+  if (!state.sessionId) return;
+  bridge.postRaw({
+    type: RELIABLE_KERNEL_CLIENT_DIAGNOSTIC_MESSAGE,
+    sessionId: state.sessionId,
+    eventKind,
+    observedAt: new Date().toISOString(),
+    conversationId: message.conversationId,
+    turnId: message.turnId,
+    modelRequestId: message.modelRequestId,
+    attemptSeq: message.attemptSeq,
+    socketGeneration: message.socketGeneration,
+    streamSeq: message.headStreamSeq
+  });
 }
 
 function afterNextPaint(callback: () => void): void {
@@ -1630,6 +2062,14 @@ function invalidateRetryableDetailsForDurableMessage(
         case 'TurnIntent':
           add('turn-intent-preview');
           break;
+        case 'RuntimeDeliveryIntentLink':
+          add('turn-intent-preview', record?.turn_intent_id);
+          break;
+        case 'RuntimeDelivery':
+          for (const link of Object.values(state.records.RuntimeDeliveryIntentLink ?? {})) {
+            if (link.delivery_id === id) add('turn-intent-preview', link.turn_intent_id);
+          }
+          break;
         case 'ToolCall':
           add('tool-arguments-content');
           break;
@@ -1823,15 +2263,21 @@ function cancelAllDetailRequests(state: ReliableKernelFeedStoreState): void {
 }
 
 function pruneDetailCache(state: ReliableKernelFeedStoreState): void {
-  const candidates = Object.entries(state.detailCacheMeta)
-    .filter(([key]) => state.details[key]?.status === 'ready')
+  const ready = Object.entries(state.detailCacheMeta)
+    .filter(([key]) => state.details[key]?.status === 'ready');
+  const pinned = new Set(state.pinnedDetailKeys);
+  // Mounted timeline bodies are explicitly owned by the current view and do not consume the
+  // ordinary LRU budget. Otherwise one large visible transcript segment would evict every tool or
+  // process detail as soon as it finishes loading.
+  const candidates = ready
+    .filter(([key]) => !pinned.has(key))
     .sort((left, right) => left[1].lastAccessedAt - right[1].lastAccessedAt || left[0].localeCompare(right[0]));
   let totalBytes = candidates.reduce((total, [, meta]) => total + meta.bytes, 0);
   let totalEntries = candidates.length;
   for (const [key, meta] of candidates) {
     if (totalEntries <= DETAIL_CACHE_MAX_ENTRIES && totalBytes <= DETAIL_CACHE_MAX_BYTES) break;
-    // Keep the newest/only oversized detail while it is being viewed; otherwise its watcher would
-    // immediately request the same payload again and create a hydration loop.
+    // Keep the newest/only oversized detail while it is being viewed; deleting it here changes its
+    // demand signature and immediately requests the same multi-page payload again.
     if (totalEntries <= 1) break;
     delete state.details[key];
     delete state.detailCacheMeta[key];

@@ -2646,7 +2646,7 @@ function executeClientProjectionSnapshot(
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [], childTurnTerminations: [], childTurnExecutorLinks: [],
       childExecutionActivities: [],
       answerBridges: [], answerSubmissions: [],
-      runtimeInboxItems: [], runtimeDeliveries: []
+      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: []
     };
     if (conversationId === null) {
       database.exec('COMMIT');
@@ -3059,6 +3059,13 @@ function executeClientProjectionSnapshot(
     });
     const inboxIds = deliveries.map((row) => String(row.inbox_item_id));
     const inboxItems = queryAllByIds(database, 'runtime_inbox_item', 'id', inboxIds);
+    const queuedTurnIntentIds = new Set(queuedTurnIntents.map((row) => String(row.id)));
+    const runtimeDeliveryIntentLinks = queryAllByIds(
+      database,
+      'runtime_delivery_intent_link',
+      'delivery_id',
+      deliveryIds
+    ).filter((link) => queuedTurnIntentIds.has(String(link.turn_intent_id)));
 
     const snapshot: ClientProjectionSnapshot = {
       navigationSummary: { conversations },
@@ -3128,7 +3135,8 @@ function executeClientProjectionSnapshot(
         answerBridges,
         answerSubmissions,
         runtimeInboxItems: inboxItems,
-        runtimeDeliveries: projectedDeliveries
+        runtimeDeliveries: projectedDeliveries,
+        runtimeDeliveryIntentLinks
       }
     };
     database.exec('COMMIT');

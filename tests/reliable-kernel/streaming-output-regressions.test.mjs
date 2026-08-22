@@ -41,7 +41,8 @@ function emptyClientProjection() {
       childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [],
       childTurnTerminations: [], childTurnExecutorLinks: [], childExecutionActivities: [],
-      answerBridges: [], answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: []
+      answerBridges: [], answerSubmissions: [], runtimeInboxItems: [], runtimeDeliveries: [],
+      runtimeDeliveryIntentLinks: []
     }
   };
 }
@@ -176,6 +177,202 @@ test('detail load errors use bounded backoff, manual reset, and durable invalida
     'durable invalidation also cancels the pending retry timer');
   store.requestDetail('file-change-diff', memberId, { priority: 'expanded' });
   assert.equal(detailRequests().length, 6, 'fresh demand is admitted after durable invalidation');
+});
+
+test('pinned timeline bodies do not evict the only oversized visible detail or ordinary LRU entry', async (context) => {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  const posted = [];
+  let persistedState;
+  globalThis.window = {
+    addEventListener() {},
+    removeEventListener() {},
+    requestAnimationFrame(callback) {
+      callback(performance.now());
+      return 1;
+    },
+    cancelAnimationFrame() {},
+    acquireVsCodeApi() {
+      return {
+        postMessage(message) { posted.push(message); },
+        getState() { return persistedState; },
+        setState(value) { persistedState = value; }
+      };
+    }
+  };
+  context.after(async () => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    await server.close();
+  });
+
+  const pinia = await import('pinia');
+  const { useReliableKernelClientFeedStore } = await server.ssrLoadModule(
+    '/src/stores/useReliableKernelClientFeedStore.ts'
+  );
+  pinia.setActivePinia(pinia.createPinia());
+  const store = useReliableKernelClientFeedStore();
+  store.observe({
+    type: 'reliable-kernel.snapshot',
+    sessionId: 'detail-cache-session',
+    hostBootId: 'detail-cache-boot',
+    messageSeq: '1',
+    snapshotCommitSeq: '1',
+    projections: {}
+  });
+
+  const pinnedKey = 'message-content:pinned-visible-revision';
+  const oversizedKey = 'tool-result-content:oversized-visible-tool';
+  store.details[pinnedKey] = { status: 'ready', text: 'pinned', totalBytes: 32 * 1024 * 1024 };
+  store.detailCacheMeta[pinnedKey] = { lastAccessedAt: 1, bytes: 32 * 1024 * 1024 };
+  store.details[oversizedKey] = { status: 'ready', text: 'oversized', totalBytes: 16 * 1024 * 1024 + 1 };
+  store.detailCacheMeta[oversizedKey] = { lastAccessedAt: 2, bytes: 16 * 1024 * 1024 + 1 };
+  store.setPinnedDetailKeys([pinnedKey]);
+
+  assert.equal(store.details[pinnedKey]?.status, 'ready');
+  assert.equal(store.details[oversizedKey]?.status, 'ready',
+    'the sole oversized unpinned detail must remain mounted instead of starting a hydration loop');
+  store.requestDetail('tool-result-content', 'oversized-visible-tool', { priority: 'expanded' });
+  assert.equal(posted.some((message) => message.type === 'reliable-kernel.detail-request'), false,
+    'ready oversized detail demand must not issue another transport request');
+
+  delete store.details[oversizedKey];
+  delete store.detailCacheMeta[oversizedKey];
+  const ordinaryKey = 'tool-arguments-content:ordinary-visible-tool';
+  store.details[ordinaryKey] = { status: 'ready', text: 'ordinary', totalBytes: 8 };
+  store.detailCacheMeta[ordinaryKey] = { lastAccessedAt: 3, bytes: 8 };
+  store.setPinnedDetailKeys([pinnedKey]);
+  assert.equal(store.details[ordinaryKey]?.status, 'ready',
+    'pinned timeline bytes must not consume the ordinary detail LRU budget');
+});
+test('transient sequence gap retains the contiguous prefix and atomically adopts a cumulative snapshot', async (context) => {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  const posted = [];
+  let persistedState;
+  globalThis.window = {
+    addEventListener() {},
+    removeEventListener() {},
+    requestAnimationFrame(callback) {
+      callback(performance.now());
+      return 1;
+    },
+    cancelAnimationFrame() {},
+    acquireVsCodeApi() {
+      return {
+        postMessage(message) { posted.push(message); },
+        getState() { return persistedState; },
+        setState(value) { persistedState = value; }
+      };
+    }
+  };
+  context.after(async () => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    await server.close();
+  });
+
+  const pinia = await import('pinia');
+  const { useReliableKernelClientFeedStore } = await server.ssrLoadModule(
+    '/src/stores/useReliableKernelClientFeedStore.ts'
+  );
+  pinia.setActivePinia(pinia.createPinia());
+  const store = useReliableKernelClientFeedStore();
+  store.observe({
+    type: 'reliable-kernel.snapshot',
+    sessionId: 'transient-gap-session',
+    hostBootId: 'transient-gap-boot',
+    navigationGeneration: '7',
+    messageSeq: '1',
+    snapshotCommitSeq: '0',
+    projections: { activeConversationWindow: { conversationId: 'conversation-transient-gap' } }
+  });
+
+  const item = (fromStreamSeq, streamSeq, text) => ({
+    turnId: 'turn-transient-gap',
+    modelRequestId: 'request-transient-gap',
+    requestSeq: '1',
+    providerId: 'provider-transient-gap',
+    modelId: 'model-transient-gap',
+    attemptSeq: '1',
+    socketGeneration: '1',
+    afterCommitSeq: '0',
+    fromStreamSeq,
+    observedAt: '2026-08-21T00:00:00.000Z',
+    event: {
+      kind: 'output_delta',
+      streamSeq,
+      content: { type: 'text_delta', text }
+    }
+  });
+  const envelope = (deliveryId, events) => ({
+    type: 'reliable-kernel.transient-batch',
+    deliveryId,
+    sessionId: 'transient-gap-session',
+    hostBootId: 'transient-gap-boot',
+    navigationGeneration: '7',
+    conversationId: 'conversation-transient-gap',
+    events
+  });
+
+  store.observe(envelope('delivery-contiguous', [item('1', '1', 'A')]));
+  assert.equal(store.transientModelRequests['request-transient-gap'].text, 'A');
+  assert.ok(posted.some((message) =>
+    message.type === 'reliable-kernel.transient-ack'
+    && message.deliveryId === 'delivery-contiguous'
+  ));
+
+  store.observe(envelope('delivery-gap', [item('3', '3', 'C')]));
+  const retained = store.transientModelRequests['request-transient-gap'];
+  assert.equal(retained.text, 'A', 'the renderer must not accept a non-contiguous suffix');
+  assert.equal(retained.streamSeq, '1');
+  assert.equal(retained.recovering, true);
+  assert.equal(posted.some((message) =>
+    message.type === 'reliable-kernel.transient-ack'
+    && message.deliveryId === 'delivery-gap'
+  ), false, 'a gapped delivery intentionally withholds its ACK');
+  const request = posted.find((message) => message.type === 'reliable-kernel.transient-snapshot-request');
+  assert.ok(request);
+  assert.equal(request.afterStreamSeq, '1');
+  assert.equal(request.modelRequestId, 'request-transient-gap');
+
+  store.observe({
+    type: 'reliable-kernel.transient-snapshot',
+    deliveryId: 'delivery-replay',
+    requestId: request.requestId,
+    sessionId: 'transient-gap-session',
+    hostBootId: 'transient-gap-boot',
+    navigationGeneration: '7',
+    conversationId: 'conversation-transient-gap',
+    turnId: 'turn-transient-gap',
+    modelRequestId: 'request-transient-gap',
+    requestSeq: '1',
+    providerId: 'provider-transient-gap',
+    modelId: 'model-transient-gap',
+    attemptSeq: '1',
+    socketGeneration: '1',
+    afterCommitSeq: '0',
+    headStreamSeq: '3',
+    observedAt: '2026-08-21T00:00:01.000Z',
+    events: [item('1', '3', 'ABC')]
+  });
+
+  const recovered = store.transientModelRequests['request-transient-gap'];
+  assert.equal(recovered.text, 'ABC');
+  assert.equal(recovered.streamSeq, '3');
+  assert.equal(recovered.recovering, false);
+  assert.ok(posted.some((message) =>
+    message.type === 'reliable-kernel.transient-ack'
+    && message.deliveryId === 'delivery-replay'
+    && message.heads[0]?.streamSeq === '3'
+  ));
+  assert.ok(posted.some((message) =>
+    message.type === 'reliable-kernel.client-diagnostic'
+    && message.eventKind === 'transient-snapshot-replayed'
+  ));
+  const mainPanel = fs.readFileSync(path.join(root, 'vscode/panels/MainPanel.ts'), 'utf8');
+  assert.match(mainPanel, /type === RELIABLE_KERNEL_TRANSIENT_ACK_MESSAGE/);
+  assert.match(mainPanel, /type === RELIABLE_KERNEL_TRANSIENT_SNAPSHOT_REQUEST_MESSAGE/);
 });
 
 test('completed transient tool preview remains authoritative until message body and tool facts are ready', async (context) => {
@@ -405,6 +602,145 @@ test('concurrent Message detail reads batch immutable Revision and ContentObject
     'continuation pages reuse immutable metadata instead of issuing two more worker reads each');
 });
 
+test('turn-intent preview resolves a background command through RuntimeDeliveryIntentLink', async () => {
+  const intentId = 'runtime-process-intent';
+  const conversationId = 'runtime-process-conversation';
+  const envelopeObjectId = 'runtime-process-envelope';
+  const argumentsObjectId = 'runtime-process-arguments';
+  const envelopeBytes = Buffer.from(JSON.stringify({
+    version: 1,
+    kind: 'runtime_continuation',
+    sourceTurnId: 'runtime-process-source-turn'
+  }), 'utf8');
+  const argumentsBytes = Buffer.from(JSON.stringify({
+    command: 'npm run check\n  -- --focused'
+  }), 'utf8');
+  const rows = {
+    TurnIntent: [{
+      id: intentId,
+      conversation_id: conversationId,
+      turn_id: null,
+      state: 'queued',
+      created_at: '2026-08-21T00:00:00.000Z',
+      updated_at: '2026-08-21T00:00:00.000Z'
+    }],
+    ChildExecutionIntentLink: [],
+    TurnIntentRevision: [{
+      id: 'runtime-process-intent-revision',
+      intent_id: intentId,
+      revision_seq: 1n,
+      content_object_id: envelopeObjectId,
+      created_at: '2026-08-21T00:00:00.000Z'
+    }],
+    ContentObject: [
+      {
+        id: envelopeObjectId,
+        content_type: 'application/vnd.limcode.turn-intent+json',
+        byte_length: BigInt(envelopeBytes.length)
+      },
+      {
+        id: argumentsObjectId,
+        content_type: 'application/json',
+        byte_length: BigInt(argumentsBytes.length)
+      }
+    ],
+    RuntimeDeliveryIntentLink: [{
+      id: 'runtime-process-delivery-intent-link',
+      delivery_id: 'runtime-process-delivery',
+      turn_intent_id: intentId,
+      created_at: '2026-08-21T00:00:00.000Z'
+    }],
+    RuntimeDelivery: [{
+      id: 'runtime-process-delivery',
+      inbox_item_id: 'runtime-process-inbox',
+      target_conversation_id: conversationId,
+      target_turn_id: null,
+      phase: 'next_turn',
+      attempt_seq: 1n,
+      retry_of_delivery_id: null,
+      state: 'pending',
+      failure_reason: null,
+      created_at: '2026-08-21T00:00:00.000Z',
+      updated_at: '2026-08-21T00:00:00.000Z'
+    }],
+    RuntimeInboxItem: [{
+      id: 'runtime-process-inbox',
+      source_kind: 'process_receipt',
+      source_id: 'runtime-process-receipt'
+    }],
+    ProcessReceipt: [{
+      id: 'runtime-process-receipt',
+      process_id: 'runtime-process',
+      outcome: 'succeeded',
+      exit_code: 0n,
+      exit_signal: null
+    }],
+    Process: [{ id: 'runtime-process', status: 'exited' }],
+    ProcessOriginLink: [{
+      id: 'runtime-process-origin',
+      process_id: 'runtime-process',
+      tool_call_id: 'runtime-process-tool-call'
+    }],
+    ToolCall: [{
+      id: 'runtime-process-tool-call',
+      arguments_object_id: argumentsObjectId
+    }]
+  };
+  const content = new Map([
+    [envelopeObjectId, envelopeBytes],
+    [argumentsObjectId, argumentsBytes]
+  ]);
+  const database = {
+    async snapshot(reads) {
+      return {
+        snapshotCommitSeq: '1',
+        snapshot: reads.map((read) => {
+          const candidates = rows[read.domain] ?? [];
+          if (read.kind === 'get') {
+            return candidates.find((row) => row.id === read.id) ?? null;
+          }
+          if (read.kind !== 'list') throw new Error(`unexpected read ${read.kind}`);
+          const where = read.where ?? {};
+          return candidates.filter((row) => Object.entries(where).every(
+            ([field, expected]) => row[field] === expected
+          )).slice(0, read.limit);
+        })
+      };
+    }
+  };
+  const contentStore = {
+    async read(metadata) {
+      const bytes = content.get(metadata.id);
+      assert.ok(bytes, `missing content bytes for ${metadata.id}`);
+      return bytes;
+    }
+  };
+  const reader = new kernel.ClientDetailReader(database, contentStore);
+  const detail = await reader.read({
+    kind: 'turn-intent-preview',
+    recordId: intentId,
+    conversationId,
+    offset: 0,
+    maxBytes: 64 * 1024
+  });
+  const preview = JSON.parse(Buffer.from(detail.chunk, 'base64').toString('utf8'));
+  assert.equal(preview.version, 3);
+  assert.equal(preview.kind, 'runtime_continuation');
+  assert.equal(preview.deliveryId, 'runtime-process-delivery');
+  assert.deepEqual(preview.source, {
+    kind: 'background_process',
+    inboxItemId: 'runtime-process-inbox',
+    sourceId: 'runtime-process-receipt',
+    processId: 'runtime-process',
+    processReceiptId: 'runtime-process-receipt',
+    processStatus: 'exited',
+    outcome: 'succeeded',
+    commandPreview: 'npm run check -- --focused',
+    toolCallId: 'runtime-process-tool-call',
+    exitCode: '0'
+  });
+});
+
 test('slow ACK compacts unsent visible commits without allocating wire sequence gaps or snapshot fallback', async () => {
   let onCommit;
   const projection = emptyClientProjection();
@@ -504,7 +840,7 @@ test('client summary keeps a long provider_call_id byte-for-byte', async () => {
       childExecutions: [], childExecutionParentLinks: [], childExecutionTurnLinks: [],
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [],
       childTurnTerminations: [], childTurnExecutorLinks: [], answerBridges: [], answerSubmissions: [],
-      runtimeInboxItems: [], runtimeDeliveries: []
+      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: []
     }
   };
   const sent = [];
@@ -546,6 +882,127 @@ test('retry activity disappears as soon as the current attempt renders model out
     retryMaxAttempts: 3,
     hasVisibleOutput: true
   }), undefined);
+});
+
+test('user upward scroll detaches the reactive sticky signal across later content growth', async (context) => {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  const previousElement = globalThis.Element;
+  const previousHTMLElement = globalThis.HTMLElement;
+  const previousResizeObserver = globalThis.ResizeObserver;
+  const previousMutationObserver = globalThis.MutationObserver;
+  const frames = new Map();
+  const resizeObservers = [];
+  let nextFrameId = 1;
+  let app;
+
+  class FakeElement extends EventTarget {
+    scrollTop = 800;
+    scrollHeight = 1_000;
+    clientHeight = 200;
+    firstElementChild = null;
+    scrollTo(input) {
+      this.scrollTop = typeof input === 'number' ? input : input.top ?? this.scrollTop;
+    }
+    closest() { return null; }
+  }
+  class FakeResizeObserver {
+    constructor(callback) {
+      this.callback = callback;
+      resizeObservers.push(this);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  class FakeMutationObserver {
+    constructor(callback) { this.callback = callback; }
+    observe() {}
+    disconnect() {}
+  }
+  globalThis.Element = FakeElement;
+  globalThis.HTMLElement = FakeElement;
+  globalThis.ResizeObserver = FakeResizeObserver;
+  globalThis.MutationObserver = FakeMutationObserver;
+  globalThis.window = {
+    addEventListener() {},
+    removeEventListener() {},
+    requestAnimationFrame(callback) {
+      const id = nextFrameId++;
+      frames.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame(id) { frames.delete(id); }
+  };
+  context.after(async () => {
+    app?.unmount();
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    if (previousElement === undefined) delete globalThis.Element;
+    else globalThis.Element = previousElement;
+    if (previousHTMLElement === undefined) delete globalThis.HTMLElement;
+    else globalThis.HTMLElement = previousHTMLElement;
+    if (previousResizeObserver === undefined) delete globalThis.ResizeObserver;
+    else globalThis.ResizeObserver = previousResizeObserver;
+    if (previousMutationObserver === undefined) delete globalThis.MutationObserver;
+    else globalThis.MutationObserver = previousMutationObserver;
+    await server.close();
+  });
+
+  const vue = await import('vue');
+  const { useBottomStickyScroller } = await server.ssrLoadModule(
+    '/src/composables/useBottomStickyScroller.ts'
+  );
+  const element = new FakeElement();
+  let sticky;
+  const renderer = vue.createRenderer({
+    patchProp() {}, insert() {}, remove() {}, createElement() { return {}; },
+    createText() { return {}; }, createComment() { return {}; }, setText() {},
+    setElementText() {}, parentNode() { return null; }, nextSibling() { return null; },
+    querySelector() { return null; }, setScopeId() {}, cloneNode(node) { return node; },
+    insertStaticContent() { return [{}, {}]; }
+  });
+  app = renderer.createApp(vue.defineComponent({
+    setup() {
+      const scroller = vue.ref(element);
+      sticky = useBottomStickyScroller(scroller, { reattachDelayMs: 0 });
+      return () => null;
+    }
+  }));
+  app.mount({});
+  await vue.nextTick();
+  assert.equal(sticky.stickyToBottom.value, true);
+
+  const wheel = new Event('wheel');
+  Object.defineProperty(wheel, 'deltaY', { value: -120 });
+  element.dispatchEvent(wheel);
+  element.scrollTop = 600;
+  element.dispatchEvent(new Event('scroll'));
+  assert.equal(sticky.stickyToBottom.value, false, 'upward user intent detaches follow-latest immediately');
+
+  element.scrollHeight = 1_200;
+  resizeObservers.forEach((observer) => observer.callback([]));
+  for (const [id, callback] of [...frames]) {
+    frames.delete(id);
+    callback(performance.now());
+  }
+  assert.equal(element.scrollTop, 600, 'later content growth must preserve the detached reading position');
+  assert.equal(sticky.stickyToBottom.value, false);
+
+  element.scrollTop = 1_000;
+  element.dispatchEvent(new Event('scroll'));
+  assert.equal(sticky.stickyToBottom.value, true, 'returning to the exact bottom reattaches follow-latest');
+
+  const conversationView = fs.readFileSync(path.join(
+    root,
+    'webview/src/components/conversation/ConversationView.vue'
+  ), 'utf8');
+  const messageList = fs.readFileSync(path.join(
+    root,
+    'webview/src/components/conversation/ReliableMessageList.vue'
+  ), 'utf8');
+  assert.match(conversationView, /:follow-latest="followLatestTimeline"/);
+  assert.match(messageList, /\(\) => props\.followLatest/);
 });
 
 test('streaming tool preview coalesces updates by frame and preserves pending partial before final', async (context) => {

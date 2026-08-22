@@ -144,6 +144,7 @@ test('tool_call_delta flushes a new call immediately and coalesces later fragmen
   const [firstBatch] = transientPosts(posted);
   assert.equal(firstBatch?.type, 'reliable-kernel.transient-batch');
   assert.deepEqual(firstBatch.events.map((entry) => entry.event.streamSeq), ['1', '2']);
+  assert.deepEqual(firstBatch.events.map((entry) => entry.fromStreamSeq), ['1', '2']);
   assert.deepEqual(firstBatch.events.map((entry) => entry.event.content.type), [
     'thought_delta',
     'tool_call_delta'
@@ -163,6 +164,7 @@ test('tool_call_delta flushes a new call immediately and coalesces later fragmen
     ? compacted.events
     : [compacted];
   assert.equal(compactedEvents.length, 1);
+  assert.equal(compactedEvents[0].fromStreamSeq, '3');
   assert.equal(compactedEvents[0].event.streamSeq, '12');
   assert.equal(compactedEvents[0].event.content.calls[0].argumentsDelta, 'x'.repeat(10));
 
@@ -172,6 +174,125 @@ test('tool_call_delta flushes a new call immediately and coalesces later fragmen
   }));
   await Promise.resolve();
   assert.equal(transientPosts(posted).length, 3, 'a different call becomes visible without the extra window');
+
+  bridge.close();
+});
+
+test('hidden Webview receives one cumulative transient snapshot after reveal', async () => {
+  const feed = fakeFeed();
+  const posted = [];
+  const bridge = new ReliableKernelWebviewFeedBridge(
+    feed,
+    { async read() { throw new Error('detail read is not expected'); } },
+    (error) => { throw error; }
+  );
+  const clientId = bridge.attach(webview(posted), {
+    kind: 'mainPanel',
+    panelId: 'hidden-transient-panel',
+    conversationId: 'conversation-hidden-transient'
+  });
+  bridge.reconnect(clientId);
+  await eventually(() => snapshots(posted).length === 1);
+  bridge.setVisible(clientId, false);
+  await eventually(() => feed.disconnected.includes('session-1'));
+
+  const transient = (streamSeq, text, type = 'text_delta') => ({
+    conversationId: 'conversation-hidden-transient',
+    turnId: 'turn-hidden-transient',
+    modelRequestId: 'request-hidden-transient',
+    requestSeq: '1',
+    providerId: 'provider-hidden-transient',
+    modelId: 'model-hidden-transient',
+    attemptSeq: '1',
+    socketGeneration: '1',
+    afterCommitSeq: '0',
+    observedAt: '2026-08-21T00:00:00.000Z',
+    event: { kind: 'output_delta', streamSeq, content: { type, text } }
+  });
+  bridge.broadcastTransient(transient('1', 'hello '));
+  bridge.broadcastTransient(transient('2', 'world'));
+  bridge.broadcastTransient(transient('3', 'think', 'thought_delta'));
+  bridge.broadcastTransient(transient('4', '!'));
+  assert.equal(transientSnapshots(posted).length, 0, 'hidden renderers receive no live postMessage');
+
+  bridge.setVisible(clientId, true);
+  await eventually(() => snapshots(posted).length === 2 && transientSnapshots(posted).length === 1);
+  const replay = transientSnapshots(posted)[0];
+  assert.equal(replay.sessionId, 'session-2');
+  assert.equal(replay.headStreamSeq, '4');
+  assert.equal(replay.events.length, 3, 'only adjacent deltas of the same semantic block are collapsed');
+  assert.deepEqual(replay.events.map((event) => event.fromStreamSeq), ['1', '3', '4']);
+  assert.deepEqual(replay.events.map((event) => event.event.content.type), [
+    'text_delta',
+    'thought_delta',
+    'text_delta'
+  ]);
+  assert.deepEqual(replay.events.map((event) => event.event.content.text), ['hello world', 'think', '!']);
+
+  bridge.close();
+});
+
+test('postMessage false heals a transient batch with a bounded cumulative snapshot', async () => {
+  const feed = fakeFeed();
+  const posted = [];
+  let rejectNextTransientBatch = true;
+  const rejectingWebview = {
+    async postMessage(message) {
+      posted.push(message);
+      if (message.type === 'reliable-kernel.transient-batch' && rejectNextTransientBatch) {
+        rejectNextTransientBatch = false;
+        return false;
+      }
+      return true;
+    }
+  };
+  const bridge = new ReliableKernelWebviewFeedBridge(
+    feed,
+    { async read() { throw new Error('detail read is not expected'); } },
+    () => undefined,
+    undefined,
+    undefined,
+    undefined,
+    { transientAckTimeoutMs: 100, maxTransientSnapshotResends: 1 }
+  );
+  const clientId = bridge.attach(rejectingWebview, {
+    kind: 'mainPanel',
+    panelId: 'rejected-transient-panel',
+    conversationId: 'conversation-rejected-transient'
+  });
+  bridge.reconnect(clientId);
+  await eventually(() => snapshots(posted).length === 1);
+  await tick();
+  const snapshotCountBeforeRejectedBatch = transientSnapshots(posted).length;
+  bridge.broadcastTransient({
+    conversationId: 'conversation-rejected-transient',
+    turnId: 'turn-rejected-transient',
+    modelRequestId: 'request-rejected-transient',
+    requestSeq: '1',
+    providerId: 'provider-rejected-transient',
+    modelId: 'model-rejected-transient',
+    attemptSeq: '1',
+    socketGeneration: '1',
+    afterCommitSeq: '0',
+    observedAt: '2026-08-21T00:00:00.000Z',
+    event: {
+      kind: 'output_delta',
+      streamSeq: '1',
+      content: {
+        type: 'tool_call_delta',
+        calls: [{ id: 'call-rejected-transient', name: 'write', argumentsDelta: '{"path":"a"}' }]
+      }
+    }
+  });
+
+  await eventually(() =>
+    transientPosts(posted).length >= 1
+    && transientSnapshots(posted).length === snapshotCountBeforeRejectedBatch + 1
+  );
+  const replay = transientSnapshots(posted)[0];
+  assert.equal(replay.modelRequestId, 'request-rejected-transient');
+  assert.equal(replay.headStreamSeq, '1');
+  assert.equal(replay.events[0].event.content.calls[0].argumentsDelta, '{"path":"a"}');
 
   bridge.close();
 });
@@ -219,6 +340,10 @@ function webview(posted) {
 
 function snapshots(posted) {
   return posted.filter((message) => message.type === 'reliable-kernel.snapshot');
+}
+
+function transientSnapshots(posted) {
+  return posted.filter((message) => message.type === 'reliable-kernel.transient-snapshot');
 }
 
 function transientPosts(posted) {

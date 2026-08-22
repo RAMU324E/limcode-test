@@ -19,6 +19,7 @@ const currentDisplayMessages = computed(() => reliableConversation.projection.va
 const scroller = ref<HTMLElement | null>(null);
 const conversationBody = ref<HTMLElement | null>(null);
 const bottomStickyScroller = useBottomStickyScroller(scroller);
+const followLatestTimeline = computed(() => bottomStickyScroller.stickyToBottom.value);
 let pendingInitialBottomConversationId = '';
 let initialBottomScrollFrame: number | undefined;
 let pendingEditAuthority: TurnAuthoritySelection = {};
@@ -201,6 +202,7 @@ function compactMessagePreview(parts: MessageContent['parts']): string {
         <ReliableMessageList
           :empty-hint="emptyHint"
           :scroller="scroller"
+          :follow-latest="followLatestTimeline"
           @edit-message="startReliableMessageEdit"
         />
       </div>
