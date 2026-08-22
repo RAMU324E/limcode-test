@@ -224,7 +224,8 @@ test('synthetic partial exposes a model_request retry target', () => {
       request: {
         conversationId: 'conversation-partial', turnId: 'turn-partial', modelRequestId: 'request-partial',
         requestSeq: '1', providerId: 'provider-partial', modelId: 'gpt-partial',
-        streamSeq: '2', text: 'partial output', thought: '', toolCalls: [], status: 'failed',
+        streamSeq: '2', text: 'partial output', thought: '',
+        outputParts: [{ text: 'partial output' }], toolCalls: [], status: 'failed',
         startedAt: 1_767_225_601_000, updatedAt: 1_767_225_602_000
       }
     }
@@ -656,7 +657,8 @@ test('provider completed overlay remains streaming until the durable ModelReques
     transientModelRequests: { request: {
       conversationId: 'conversation-commit-gap', turnId: 'turn-commit-gap',
       modelRequestId: 'request-commit-gap', requestSeq: '1', providerId: 'provider', modelId: 'model',
-      streamSeq: '2', text: 'provider complete, commit pending', thought: '', toolCalls: [],
+      streamSeq: '2', text: 'provider complete, commit pending', thought: '',
+      outputParts: [{ text: 'provider complete, commit pending' }], toolCalls: [],
       status: 'completed', startedAt: 1_000, updatedAt: 2_000
     } }
   });
@@ -677,20 +679,35 @@ test('provider completed overlay preserves authoritative reasoning-tool-reasonin
   const projection = projectReliableConversation({
     conversationId: 'conversation-completed-parts',
     records: {
+      Message: { user: {
+        id: 'message-completed-parts-user', conversation_id: 'conversation-completed-parts',
+        message_seq: '1', revision_id: 'revision-completed-parts-user', role: 'user',
+        created_at: '2026-08-03T00:00:00.000Z'
+      } },
+      MessageTurnLink: { user: {
+        id: 'message-turn-completed-parts-user', message_id: 'message-completed-parts-user',
+        turn_id: 'turn-completed-parts', role: 'input'
+      } },
       ModelRequest: { request: {
         id: 'request-completed-parts', turn_id: 'turn-completed-parts', request_seq: '1', model_id: 'model',
         status: 'streaming', created_at: '2026-08-03T00:00:00.000Z'
       } }
     },
-    details: {},
+    details: {
+      'message-content:revision-completed-parts-user': ready(JSON.stringify({
+        role: 'user', parts: [{ text: 'start' }]
+      }))
+    },
     transientModelRequests: { request: {
       conversationId: 'conversation-completed-parts', turnId: 'turn-completed-parts',
       modelRequestId: 'request-completed-parts', requestSeq: '1', providerId: 'provider', modelId: 'model',
-      streamSeq: '4', text: 'done', thought: 'inspect\nverify', toolCalls: [], completedContent,
+      streamSeq: '4', text: 'done', thought: 'inspect\nverify',
+      outputParts: completedContent.parts, toolCalls: [], completedContent,
       status: 'completed', startedAt: 1_000, updatedAt: 2_000
     } }
   });
-  assert.deepEqual(projection.messages[0]?.content, completedContent);
+  const overlay = projection.messages.find((message) => message.id === 'transient:request-completed-parts');
+  assert.deepEqual(overlay?.content, completedContent);
 });
 
 test('a tail transient receives the next absolute display floor instead of the bounded-window index', () => {
@@ -731,7 +748,8 @@ test('a tail transient receives the next absolute display floor instead of the b
       'request-117': {
         conversationId: 'conversation-floor', turnId: 'turn-floor', modelRequestId: 'request-117',
         requestSeq: '2', providerId: 'provider-floor', modelId: 'gpt-floor', streamSeq: '1',
-        text: 'next floor', thought: '', toolCalls: [], status: 'streaming', startedAt: 2_000, updatedAt: 2_000
+        text: 'next floor', thought: '', outputParts: [{ text: 'next floor' }],
+        toolCalls: [], status: 'streaming', startedAt: 2_000, updatedAt: 2_000
       }
     }
   });
@@ -774,7 +792,12 @@ test('transient content atomically occupies a durable shell until its revision d
     'request-a': {
       conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request-a',
       requestSeq: '1', providerId: 'provider-a', modelId: 'gpt-5.6-sol', streamSeq: '3',
-      text: '', thought: 'provider supplied thought', thoughtSignature: 'signature-a', toolCalls,
+      text: '', thought: 'provider supplied thought', thoughtSignature: 'signature-a',
+      outputParts: [
+        { text: 'provider supplied thought', thought: true, thoughtSignature: 'signature-a' },
+        { id: 'provider-call-a', functionCall: { name: 'write', args: {} } }
+      ],
+      toolCalls,
       status: 'streaming' as const, startedAt: 1_000, updatedAt: 2_000
     }
   };
@@ -825,7 +848,8 @@ test('a next model overlay waits while an earlier tool call is not durably termi
       'request-a': {
         conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request-a',
         requestSeq: '2', providerId: 'provider-a', modelId: 'gpt-5.6-sol', streamSeq: '1',
-        text: 'must wait', thought: '', toolCalls: [], status: 'streaming',
+        text: 'must wait', thought: '', outputParts: [{ text: 'must wait' }],
+        toolCalls: [], status: 'streaming',
         startedAt: Date.parse('2026-08-03T00:00:10.000Z'), updatedAt: Date.parse('2026-08-03T00:00:11.000Z')
       }
     }
@@ -859,7 +883,10 @@ test('provider reasoning timing remains visible even when no thought text is exp
       request: {
         conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request',
         requestSeq: '1', providerId: 'provider-a', modelId: 'gpt-5.6-sol', streamSeq: '1',
-        text: '', thought: '', thoughtActive: true, thoughtStartedAt: 1_000,
+        text: '', thought: '', outputParts: [{
+          text: '', thought: true, thoughtStartedAt: 1_000,
+          thoughtCompletedDurationMs: 700, thoughtElapsedMs: 1500
+        }], thoughtActive: true, thoughtStartedAt: 1_000,
         thoughtCompletedDurationMs: 700, thoughtElapsedMs: 1500,
         toolCalls: [], status: 'streaming',
         startedAt: 1_000, updatedAt: 2_500
@@ -897,7 +924,8 @@ test('completed empty zero-duration reasoning is final and does not leave a phan
       request: {
         conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request',
         requestSeq: '1', providerId: 'provider-a', modelId: 'gpt-5.6-sol', streamSeq: '2',
-        text: 'done', thought: '', thoughtElapsedMs: 0, thoughtDurationMs: 0, toolCalls: [], status: 'completed',
+        text: 'done', thought: '', outputParts: [{ text: 'done' }],
+        thoughtElapsedMs: 0, thoughtDurationMs: 0, toolCalls: [], status: 'completed',
         startedAt: 1_000, updatedAt: 2_000
       }
     }
@@ -927,7 +955,8 @@ test('durable completed ModelRequest suppresses a stale streaming overlay when i
       request: {
         conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request',
         requestSeq: '205', providerId: 'provider-a', modelId: 'gpt-5.6-sol', streamSeq: '9',
-        text: 'stale', thought: '', toolCalls: [], status: 'streaming',
+        text: 'stale', thought: '', outputParts: [{ text: 'stale' }],
+        toolCalls: [], status: 'streaming',
         startedAt: Date.parse('2026-08-03T00:07:11.000Z'), updatedAt: Date.parse('2026-08-03T00:11:20.000Z')
       }
     }
@@ -966,7 +995,8 @@ test('an evicted historical overlay is not appended after a 200-message durable 
       stale: {
         conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request-205',
         requestSeq: '205', providerId: 'provider-a', modelId: 'gpt-5.6-sol', streamSeq: '12',
-        text: 'must not move', thought: '', toolCalls: [], status: 'streaming',
+        text: 'must not move', thought: '', outputParts: [{ text: 'must not move' }],
+        toolCalls: [], status: 'streaming',
         startedAt: Date.parse('2026-08-03T00:07:11.000Z'), updatedAt: Date.parse('2026-08-03T00:11:20.000Z')
       }
     }
@@ -1004,7 +1034,8 @@ test('an active transient uses its frozen model and a Turn anchor instead of the
       active: {
         conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request-active',
         requestSeq: '1', providerId: 'provider-frozen', modelId: 'gpt-5.6-sol', afterCommitSeq: '5',
-        streamSeq: '1', text: 'live', thought: '', toolCalls: [], status: 'streaming',
+        streamSeq: '1', text: 'live', thought: '', outputParts: [{ text: 'live' }],
+        toolCalls: [], status: 'streaming',
         startedAt: Date.parse('2026-08-03T00:00:01.000Z'), updatedAt: Date.parse('2026-08-03T00:00:02.000Z')
       }
     },
@@ -1046,7 +1077,8 @@ test('the latest failed terminal partial retains exact model_request retry ident
       failed: {
         conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request-failed',
         requestSeq: '3', providerId: 'provider-a', modelId: 'gpt-5.6-sol', streamSeq: '4',
-        text: 'usable partial', thought: '', toolCalls: [], status: 'streaming',
+        text: 'usable partial', thought: '', outputParts: [{ text: 'usable partial' }],
+        toolCalls: [], status: 'streaming',
         startedAt: Date.parse('2026-08-03T00:00:01.000Z'), updatedAt: Date.parse('2026-08-03T00:00:02.000Z')
       }
     }
