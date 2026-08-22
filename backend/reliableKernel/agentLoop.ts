@@ -17,6 +17,7 @@ import {
   compareGuidancePositions,
   initialGuidancePosition,
   parseInputTurnIntentEnvelope,
+  parseRuntimeContinuationTurnIntentEnvelope,
   TURN_INTENT_ENVELOPE_CONTENT_TYPE
 } from './guidanceIntent';
 import {
@@ -1710,9 +1711,8 @@ export class ReliableAgentLoop {
   /**
    * A Provider round containing tools owns the whole tool batch. Once that response boundary is
    * durably complete, hand off before issuing another Provider request when either ordinary user
-   * guidance or an internal RuntimeDelivery continuation is already queued. RuntimeDelivery used
-   * to be skipped here because its no-message TurnIntent is encoded as kind=retry; consequently a
-   * late Subagent answer could wait through every subsequent round of the active Turn.
+   * guidance or an internal RuntimeDelivery continuation is already queued. The latter now has an
+   * explicit runtime_continuation envelope, so it cannot be confused with a user retry.
    */
   private async completeForQueuedBoundaryInput(input: {
     turnId: string;
@@ -1827,7 +1827,7 @@ export class ReliableAgentLoop {
         });
         continue;
       }
-      if (!isQueuedRuntimeContinuationEnvelope(envelopeValue)) continue;
+      if (!parseRuntimeContinuationTurnIntentEnvelope(envelopeValue)) continue;
       boundaryInputs.push({
         intent: candidate,
         kind: 'runtime_continuation',
@@ -2469,24 +2469,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
-}
-
-/**
- * RuntimeDelivery continuations are frozen as no-message retry envelopes so they can inherit the
- * source Turn authority without fabricating a user message. Explicit user retries always carry
- * rewind lineage, while maintenance retries carry runtimeMaintenance; neither may be treated as a
- * response-boundary notification handoff.
- */
-function isQueuedRuntimeContinuationEnvelope(value: unknown): boolean {
-  const record = asRecord(value);
-  return record?.kind === 'retry'
-    && typeof record.sourceTurnId === 'string'
-    && record.sourceTurnId.trim().length > 0
-    && record.runtimeMaintenance === undefined
-    && record.sourceMessageId === undefined
-    && record.sourceMessageRevisionId === undefined
-    && record.sourceModelRequestId === undefined
-    && record.messageContentObjectId === undefined;
 }
 
 function optionalText(value: unknown): string {

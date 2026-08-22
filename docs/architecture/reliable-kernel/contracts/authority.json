@@ -13,7 +13,8 @@
     "r4: 首发禁用 ProviderContinuation，不建对应运行表；保留 Conversation fork 三类独立 Link",
     "r4: 配置 authority 逐对象/ScopeLink crosswalk 到 migration physical manifest；不再用聚合 Policy 代替独立领域",
     "r4: Process 使用 detached wrapper、durable spool与可续CAS chunks；MCP 调用复用 EffectIntent/Receipt",
-    "r5: Provider 工具批次使用 ToolCallSourceLink 独立表达来源，并由 ToolCallPolicySnapshot 冻结展示、门禁、change-apply 与调度决定"
+    "r5: Provider 工具批次使用 ToolCallSourceLink 独立表达来源，并由 ToolCallPolicySnapshot 冻结展示、门禁、change-apply 与调度决定",
+    "r6: RuntimeDeliveryIntentLink 明确记录 next-turn Delivery 触发的 TurnIntent；Runtime continuation 不再借用 retry 身份"
   ],
   "contractRevision": "2026-07-31-r4",
   "status": "planned",
@@ -42,7 +43,7 @@
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
     "incompatibleRuntimeData": "archive-and-reset",
-    "exactPredecessorUpgrade": "none-current-epoch-only"
+    "exactPredecessorUpgrade": "offline-epoch-3-to-4-only-with-exact-schema-fingerprint-and-durable-backup"
   },
   "sequenceAllocation": {
     "columnType": "INTEGER",
@@ -1888,6 +1889,25 @@
       ],
       "notes": [
         "target_turn_id 可空；同一Inbox/Conversation的初始自动投递只有一个attempt=1，phase/target可在authority CAS下收敛；人工 redeliver 创建全局attempt+1并写 retry_of_delivery_id；目标不存在时置 failed(reason=target-gone)"
+      ]
+    },
+    {
+      "key": "RuntimeDeliveryIntentLink",
+      "table": "runtime_delivery_intent_link",
+      "repository": "RuntimeDeliveryIntentLinkRepository",
+      "codec": "RuntimeDeliveryIntentLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-delivery",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "delivery_id UNIQUE",
+        "turn_intent_id UNIQUE"
+      ],
+      "notes": [
+        "next-turn RuntimeDelivery 与其触发的 TurnIntent 之间的一对一关系；结果正文和来源事实仍由 RuntimeInbox/Delivery 领域持有"
       ]
     },
     {

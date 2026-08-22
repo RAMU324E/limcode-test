@@ -277,7 +277,7 @@ SQLite long-lived connection 只能缓存由 RootAuthority 建立的 immutable f
 
 最终 VSIX 的 cutover-only coordinator 是 archive actor。它按 physical manifest journaled archive Runtime、filter settings/scope links、验证配置与外部 untouched 项，再创建 SQLite/CAS/epoch 并原子切 pointer。激活前失败按 journal 恢复；激活后不自动回退旧 writer。
 
-已落盘 SQLite epoch 2 到当前 epoch 3 只允许在 Extension Host 重启后的数据库打开前做一次精确、有界升级：先校验完整 predecessor 指纹并生成一致性备份，再写 pending writer fence，以单个 SQLite 事务升级并通过 durable journal 向前收敛。未知 schema、缺失备份或绑定冲突都 fail closed；这不改变单一当前 epoch，也不允许运行期协议协商或长期 migration chain。
+已落盘 SQLite epoch 3 到当前 epoch 4 只允许在 Extension Host 重启后的数据库打开前做一次精确、有界升级：先校验完整 table/index/trigger DDL、manifest 与 RootBinding predecessor 指纹并生成一致性备份，再写 pending writer fence，以单个 SQLite 事务新增包括 `RuntimeDeliveryIntentLink` 在内的四张关系表、刷新 schema manifest 与 RootBinding，并通过 durable journal 向前收敛。既有对话、消息、附件和 CAS identity 全部保持不变；仅对稳定 id、CommandReceipt、RuntimeDelivery 与旧 CAS envelope 全部吻合的 Child Runtime continuation 发布当前 CAS，并重指向其 intent/preset revision、补独立 Link，不保留运行时 fallback。未知 schema、缺失备份或绑定冲突都 fail closed。
 
 ## 18. 失败原则
 

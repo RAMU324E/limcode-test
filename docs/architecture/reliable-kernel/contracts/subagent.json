@@ -125,10 +125,12 @@
     "domains": [
       "RuntimeInboxItem",
       "RuntimeDelivery",
+      "RuntimeDeliveryIntentLink",
       "RuntimeDeliveryInputLink",
       "RuntimeDeliveryWake",
       "TurnFinalOutputFence"
     ],
+    "intentLink": "phase=next_turn 且需要新 Turn 时，RuntimeDeliveryIntentLink 一对一记录该 Delivery 触发的 TurnIntent；Intent 使用 runtime_continuation 类型，不借用 retry。",
     "inboxBoundary": "RuntimeInboxItem只保存来源事实；目标Conversation、目标Turn、phase与attempt都属于RuntimeDelivery。",
     "phases": [
       "current_turn",

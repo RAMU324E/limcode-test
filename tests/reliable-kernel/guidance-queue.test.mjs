@@ -325,6 +325,14 @@ test('Subagent RuntimeDelivery continuation 在当前回复和工具批次结束
         created_at: deliveryNow,
         updated_at: deliveryNow
       }),
+      kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+        id: 'runtime-handoff-child-agent-link',
+        conversation_id: 'runtime-handoff-child-conversation',
+        agent_id: 'agent-reviewer',
+        role: 'default',
+        created_at: deliveryNow,
+        updated_at: deliveryNow
+      }),
       kernel.DOMAIN_REPOSITORIES.domain('Turn').insert({
         id: 'runtime-handoff-child-turn',
         conversation_id: 'runtime-handoff-child-conversation',
@@ -391,11 +399,50 @@ test('Subagent RuntimeDelivery continuation 在当前回复和工具批次结束
     const continuation = await runner.runtimeContinuation({
       commandId: 'runtime-delivery:subagent-timeout-answer',
       conversationId,
-      sourceTurnId: first.turnId
+      sourceTurnId: first.turnId,
+      deliveryId: runtimeDelivery.delivery.id
     });
     assert.equal(first.admitted, true);
     assert.equal(continuation.admitted, false);
     assert.equal(providerCalls, 1, '当前回复和工具尚未结束时不得抢占');
+
+    const [deliveryIntentLink] = await listRows(app.database, 'RuntimeDeliveryIntentLink', {
+      turn_intent_id: continuation.intentId
+    });
+    assert.equal(deliveryIntentLink.delivery_id, runtimeDelivery.delivery.id);
+    const continuationEnvelope = await readCurrentIntentEnvelope(app, continuation.intentId);
+    assert.deepEqual(continuationEnvelope, {
+      version: 1,
+      kind: 'runtime_continuation',
+      sourceTurnId: first.turnId
+    });
+    assert.equal('deliveryId' in continuationEnvelope, false, 'Delivery 身份只能存在于独立 Link 中');
+
+    const previewReader = new kernel.ClientDetailReader(app.database, app.contentStore);
+    const previewDetail = await previewReader.read({
+      kind: 'turn-intent-preview',
+      recordId: continuation.intentId,
+      conversationId,
+      offset: 0,
+      maxBytes: 64 * 1024
+    });
+    const preview = JSON.parse(Buffer.from(previewDetail.chunk, 'base64').toString('utf8'));
+    assert.equal(preview.version, 3);
+    assert.equal(preview.kind, 'runtime_continuation');
+    assert.equal(preview.deliveryId, runtimeDelivery.delivery.id);
+    assert.equal(preview.source.kind, 'subagent');
+    assert.equal(preview.source.agentId, 'agent-reviewer');
+    assert.equal(preview.source.childExecutionId, 'runtime-handoff-child-execution');
+    assert.equal(preview.source.title, 'Interrupted Subagent result');
+    assert.equal(preview.source.interrupted, true);
+    const projection = await app.database.clientProjectionSnapshot(conversationId);
+    assert.deepEqual(
+      projection.snapshot.subagentDeliverySummary.runtimeDeliveryIntentLinks.map((link) => ({
+        deliveryId: link.delivery_id,
+        intentId: link.turn_intent_id
+      })),
+      [{ deliveryId: runtimeDelivery.delivery.id, intentId: continuation.intentId }]
+    );
 
     releaseTool();
     await withTimeout(runner.waitForIdle(), 10_000, 'RuntimeDelivery continuation 未在响应边界立即接续');
@@ -806,6 +853,16 @@ test('引导消息支持编辑附件正文、取消、重排、暂停恢复、�
     await fs.rm(parent, { recursive: true, force: true });
   }
 });
+
+async function readCurrentIntentEnvelope(app, intentId) {
+  const revisions = await listRows(app.database, 'TurnIntentRevision', { intent_id: intentId });
+  assert.equal(revisions.length, 1);
+  const [metadata] = await listRows(app.database, 'ContentObject', {
+    id: revisions[0].content_object_id
+  });
+  assert.equal(metadata.content_type, 'application/vnd.limcode.turn-intent+json');
+  return JSON.parse((await app.contentStore.read(metadata)).toString('utf8'));
+}
 
 async function currentIntentRevisionSeq(database, intentId) {
   const revisions = await listRows(database, 'TurnIntentRevision', { intent_id: intentId });

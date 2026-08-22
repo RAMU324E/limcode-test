@@ -9,6 +9,7 @@ import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   parseInputTurnIntentEnvelopeText,
+  runtimeContinuationTurnIntentEnvelope,
   TURN_INTENT_ENVELOPE_CONTENT_TYPE
 } from './guidanceIntent';
 import {
@@ -42,6 +43,11 @@ import {
   stablePhaseFId,
   sqliteUniqueFailureIncludes
 } from './phaseFIdentity';
+import {
+  CHILD_RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE as RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE,
+  TURN_EXECUTION_PRESET_CONTENT_TYPE,
+  childRuntimeDeliveryContinuationIds as runtimeDeliveryContinuationIds
+} from './runtimeDeliveryContinuationIdentity';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -295,8 +301,6 @@ const TERMINATED_TURN = 'terminated';
 export const CHILD_TURN_ANSWER_WAIT_OWNER_KIND = 'child_turn_answer_wait';
 export const LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND = 'answer_bridge_wait';
 const SUBAGENT_SPAWN_CONTENT_TYPE = 'application/vnd.limcode.subagent-spawn+json';
-const RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE =
-  'application/vnd.limcode.child-runtime-delivery-continuation+json';
 const TERMINAL_OPERATION_STATES = new Set([
   'succeeded', 'failed', 'partial', 'rejected', 'cancelled', 'conflict', 'outcome_unknown'
 ]);
@@ -912,7 +916,7 @@ export class ChildExecutionControlPlane {
     const preset = await this.contentStore.prepare(
       this.database,
       canonicalPlainJson({ kind: 'child-continuation', mode: command.mode }),
-      'application/vnd.limcode.turn-execution-preset+json'
+      TURN_EXECUTION_PRESET_CONTENT_TYPE
     );
     const interrupt = currentTurn && command.mode === 'interrupt_current_turn'
       ? await this.contentStore.prepare(
@@ -1104,17 +1108,15 @@ export class ChildExecutionControlPlane {
     const [intentContent, presetContent] = await Promise.all([
       this.contentStore.prepare(
         this.database,
-        canonicalPlainJson({
-          kind: 'child-runtime-delivery-continuation',
-          deliveryId: command.deliveryId,
+        canonicalPlainJson(runtimeContinuationTurnIntentEnvelope({
           sourceTurnId: command.sourceTurnId
-        }),
+        })),
         RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE
       ),
       this.contentStore.prepare(
         this.database,
-        canonicalPlainJson({ kind: 'child-runtime-delivery-continuation' }),
-        'application/vnd.limcode.turn-execution-preset+json'
+        canonicalPlainJson({ kind: 'runtime_continuation' }),
+        TURN_EXECUTION_PRESET_CONTENT_TYPE
       )
     ]);
     const now = this.timestamp();
@@ -1171,6 +1173,12 @@ export class ChildExecutionControlPlane {
           state: 'queued',
           created_at: now,
           updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').insert({
+          id: ids.deliveryIntentLinkId,
+          delivery_id: command.deliveryId,
+          turn_intent_id: ids.turnIntentId,
+          created_at: now
         }),
         DOMAIN_REPOSITORIES.domain('TurnIntentRevision').insert({
           id: ids.turnIntentRevisionId,
@@ -1312,29 +1320,18 @@ export class ChildExecutionControlPlane {
     if (agentLinks.length !== 1) throw new Error('Child Conversation must have one default Agent link.');
     const executorAgentId = requirePhaseFId(agentLinks[0].agent_id, 'AgentConversationLink.agent_id');
     const childConversationId = requirePhaseFId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
-    const workspace = await projectFolderForConversation(this.database, childConversationId);
-    const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
-      requirePhaseFId(previousTurn.id, 'previous Turn.id')
-    );
-    const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
-      conversationId: childConversationId,
-      turnId: ids.turnId,
-      executorAgentId,
-      intentKind: 'continuation',
-      sourceTurnId: requirePhaseFId(previousTurn.id, 'previous Turn.id'),
-      ...(workspace ? { workspace } : {}),
-      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {})
-    }), ids.turnId, executorAgentId);
-    const authorityContent = await this.contentStore.prepare(
-      this.database,
-      compiled.authoritySnapshot.content,
-      compiled.authoritySnapshot.contentType
-    );
     const intentContentObjectId = requirePhaseFId(
       revisions[0].content_object_id,
       'TurnIntentRevision.content_object_id'
     );
     let messageContentObject = await this.requireExisting('ContentObject', intentContentObjectId);
+    const invisibleRuntimeDelivery = messageContentObject.content_type === RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE;
+    const deliveryIntentLink = invisibleRuntimeDelivery
+      ? (await this.listRows('RuntimeDeliveryIntentLink', { turn_intent_id: command.turnIntentId }, 2))[0]
+      : undefined;
+    if (invisibleRuntimeDelivery && !deliveryIntentLink) {
+      throw new Error(`Child Runtime continuation TurnIntent ${command.turnIntentId} has no RuntimeDeliveryIntentLink.`);
+    }
     if (messageContentObject.content_type === TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
       const envelope = parseInputTurnIntentEnvelopeText(
         (await this.contentStore.read(messageContentObject as ContentObjectMetadata)).toString('utf8')
@@ -1351,7 +1348,24 @@ export class ChildExecutionControlPlane {
       'queued child message ContentObject.id'
     );
     const messageContentType = requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type');
-    const invisibleRuntimeDelivery = messageContentType === RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE;
+    const workspace = await projectFolderForConversation(this.database, childConversationId);
+    const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
+      requirePhaseFId(previousTurn.id, 'previous Turn.id')
+    );
+    const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
+      conversationId: childConversationId,
+      turnId: ids.turnId,
+      executorAgentId,
+      intentKind: invisibleRuntimeDelivery ? 'runtime_continuation' : 'continuation',
+      sourceTurnId: requirePhaseFId(previousTurn.id, 'previous Turn.id'),
+      ...(workspace ? { workspace } : {}),
+      ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {})
+    }), ids.turnId, executorAgentId);
+    const authorityContent = await this.contentStore.prepare(
+      this.database,
+      compiled.authoritySnapshot.content,
+      compiled.authoritySnapshot.contentType
+    );
     const messageContentBytes = invisibleRuntimeDelivery
       ? undefined
       : await this.contentStore.read(messageContentObject as ContentObjectMetadata);
@@ -1427,6 +1441,15 @@ export class ChildExecutionControlPlane {
         updated_at: now
       }),
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(command.turnIntentId, { state: 'queued', turn_id: null }),
+      ...(deliveryIntentLink ? [
+        DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').assert(
+          requirePhaseFId(deliveryIntentLink.id, 'RuntimeDeliveryIntentLink.id'),
+          {
+            delivery_id: requirePhaseFId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id'),
+            turn_intent_id: command.turnIntentId
+          }
+        )
+      ] : []),
       DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(intentLink.id as string, {
         child_execution_id: command.childExecutionId,
         turn_intent_id: command.turnIntentId,
@@ -2390,7 +2413,7 @@ export class ChildExecutionControlPlane {
       );
       const expectedPresetObjectId = this.contentStore.identity(
         canonicalPlainJson({ kind: 'child-continuation', mode: match.mode }),
-        'application/vnd.limcode.turn-execution-preset+json'
+        TURN_EXECUTION_PRESET_CONTENT_TYPE
       ).id;
       const expectedLinkState = intent.state === 'queued' ? 'pending' : intent.state;
       if (
@@ -3329,23 +3352,26 @@ export class ChildExecutionControlPlane {
       DOMAIN_REPOSITORIES.domain('TurnIntent').get(ids.turnIntentId),
       DOMAIN_REPOSITORIES.domain('TurnIntentRevision').get(ids.turnIntentRevisionId),
       DOMAIN_REPOSITORIES.domain('TurnExecutionPresetRevision').get(ids.presetRevisionId),
-      DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').get(ids.intentLinkId)
+      DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').get(ids.intentLinkId),
+      DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').get(ids.deliveryIntentLinkId)
     ]);
     const intent = requireRow(snapshot.snapshot[0], `TurnIntent ${ids.turnIntentId}`);
     const revision = requireRow(snapshot.snapshot[1], `TurnIntentRevision ${ids.turnIntentRevisionId}`);
     const preset = requireRow(snapshot.snapshot[2], `TurnExecutionPresetRevision ${ids.presetRevisionId}`);
     const link = requireRow(snapshot.snapshot[3], `ChildExecutionIntentLink ${ids.intentLinkId}`);
+    const deliveryIntentLink = requireRow(
+      snapshot.snapshot[4],
+      `RuntimeDeliveryIntentLink ${ids.deliveryIntentLinkId}`
+    );
     const expectedIntent = this.contentStore.identity(
-      canonicalPlainJson({
-        kind: 'child-runtime-delivery-continuation',
-        deliveryId: command.deliveryId,
+      canonicalPlainJson(runtimeContinuationTurnIntentEnvelope({
         sourceTurnId: command.sourceTurnId
-      }),
+      })),
       RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE
     );
     const expectedPreset = this.contentStore.identity(
-      canonicalPlainJson({ kind: 'child-runtime-delivery-continuation' }),
-      'application/vnd.limcode.turn-execution-preset+json'
+      canonicalPlainJson({ kind: 'runtime_continuation' }),
+      TURN_EXECUTION_PRESET_CONTENT_TYPE
     );
     if (
       receipt.id !== ids.commandReceiptId
@@ -3359,6 +3385,8 @@ export class ChildExecutionControlPlane {
       || link.child_execution_id !== command.childExecutionId
       || link.turn_intent_id !== ids.turnIntentId
       || !['pending', 'admitted'].includes(String(link.state))
+      || deliveryIntentLink.delivery_id !== command.deliveryId
+      || deliveryIntentLink.turn_intent_id !== ids.turnIntentId
     ) throw new Error('Runtime delivery continuation identity was replayed with different facts.');
     return {
       childExecutionId: command.childExecutionId,
@@ -3845,20 +3873,6 @@ function sendIdentityIds(
   };
 }
 
-function runtimeDeliveryContinuationIds(
-  command: ReturnType<typeof normalizeRuntimeDeliveryContinuationCommand>
-) {
-  const scope = [command.deliveryId, command.childExecutionId, command.sourceTurnId];
-  return {
-    sourceKey: `runtime-delivery-child:${command.deliveryId}`,
-    commandReceiptId: stablePhaseFId('command_receipt', 'child-runtime-delivery', ...scope),
-    turnIntentId: stablePhaseFId('turn_intent', 'child-runtime-delivery', ...scope),
-    turnIntentRevisionId: stablePhaseFId('turn_intent_revision', 'child-runtime-delivery', ...scope),
-    presetRevisionId: stablePhaseFId('turn_execution_preset_revision', 'child-runtime-delivery', ...scope),
-    intentLinkId: stablePhaseFId('child_execution_intent_link', 'child-runtime-delivery', ...scope)
-  };
-}
-
 function sendResult(
   command: ReturnType<typeof normalizeSendCommand>,
   ids: ReturnType<typeof sendIds>,
@@ -4043,7 +4057,9 @@ function isExpectedRuntimeDeliveryContinuationConflict(error: unknown): boolean 
   return isTransactionAssertionFailure(error) || sqliteUniqueFailureIncludes(error, [
     'command_receipt.source_kind, command_receipt.source_key',
     'turn_intent.id',
-    'child_execution_intent_link.turn_intent_id'
+    'child_execution_intent_link.turn_intent_id',
+    'runtime_delivery_intent_link.delivery_id',
+    'runtime_delivery_intent_link.turn_intent_id'
   ]);
 }
 

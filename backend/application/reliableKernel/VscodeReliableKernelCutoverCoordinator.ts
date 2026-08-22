@@ -1,19 +1,35 @@
+import { randomUUID } from 'node:crypto';
+import { syncDirectoryDurably } from '../../capabilities/filesystem/durableDirectorySync';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import {
   initializeCutoverRuntimeBinding,
   initializeEmptyRuntimeRoot
 } from '../../reliableKernel/runtimeDatabase';
 import {
   RootAuthority,
-  RootAuthorityError
+  RootAuthorityError,
+  StaleRootBindingError,
+  type HistoricalRootBinding
 } from '../../reliableKernel/rootAuthority';
-import type { RootBinding } from '../../reliableKernel/contracts';
+import {
+  RUNTIME_KERNEL_EPOCH,
+  type RootBinding,
+  type RuntimeRootPaths
+} from '../../reliableKernel/contracts';
 import {
   legacyRuntimeRequiresCutover,
   performPhysicalCutover,
   readPhysicalCutoverRequest,
   recoverInterruptedPhysicalCutover
 } from '../../reliableKernel/physicalCutover';
+import {
+  PREVIOUS_RUNTIME_KERNEL_EPOCH,
+  migratePreviousRuntimeEpochIfRequired
+} from '../../reliableKernel/runtimeEpochMigration';
 import { migrateCurrentRuntimeManifestIfRequired } from '../../reliableKernel/runtimeManifestMigration';
+
+export const VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY = '.limcode-runtime-backups';
 
 export interface VscodeReliableKernelCutoverResult {
   binding: RootBinding;
@@ -21,25 +37,30 @@ export interface VscodeReliableKernelCutoverResult {
   cutoverPerformed: boolean;
   manifestMigrated?: boolean;
   archiveDirectoryName?: string;
+  epochMigratedFrom?: number;
+  epochMigrationBackupPath?: string;
+  epochResetFrom?: number;
+  epochResetBackupPath?: string;
 }
 
 /**
  * Final-VSIX startup gate. A legacy file Runtime is never opened or imported: an explicit drained
  * request archives it with a durable journal, filters independent configuration, and only then
- * atomically activates the current SQLite/CAS RootBinding. Missing requests fail closed.
+ * atomically activates the current SQLite/CAS RootBinding. The exact epoch-3 predecessor is
+ * upgraded offline before RuntimeDatabase opens; other incompatible epochs are archived/reset.
  */
 export class VscodeReliableKernelCutoverCoordinator {
   public constructor(
     private readonly authority: RootAuthority,
-    private readonly dataRootPath: string
+    private readonly runtimeScopeRootPath: string
   ) {}
 
   public async ensureCurrentRoot(): Promise<VscodeReliableKernelCutoverResult> {
-    await recoverInterruptedPhysicalCutover(this.dataRootPath, this.authority);
-    const request = await readPhysicalCutoverRequest(this.dataRootPath);
+    await recoverInterruptedPhysicalCutover(this.runtimeScopeRootPath, this.authority);
+    const request = await readPhysicalCutoverRequest(this.runtimeScopeRootPath);
     if (request) {
       const result = await performPhysicalCutover(
-        this.dataRootPath,
+        this.runtimeScopeRootPath,
         this.authority,
         initializeCutoverRuntimeBinding
       );
@@ -51,9 +72,39 @@ export class VscodeReliableKernelCutoverCoordinator {
       };
     }
 
+    const epochMigration = await migratePreviousRuntimeEpochIfRequired(this.authority);
+    if (epochMigration) {
+      return {
+        binding: epochMigration.binding,
+        initialized: epochMigration.migrated,
+        cutoverPerformed: false,
+        epochMigratedFrom: PREVIOUS_RUNTIME_KERNEL_EPOCH,
+        ...(epochMigration.backupPath
+          ? { epochMigrationBackupPath: epochMigration.backupPath }
+          : {})
+      };
+    }
+
+    const historical = await this.authority.readHistoricalPointerForCutover();
+    if (historical && historical.runtimeKernelEpoch < RUNTIME_KERNEL_EPOCH) {
+      const reset = await archiveAndResetIncompatibleRuntime(
+        this.authority,
+        this.runtimeScopeRootPath,
+        historical
+      );
+      return {
+        binding: reset.binding,
+        initialized: true,
+        cutoverPerformed: false,
+        archiveDirectoryName: reset.archiveDirectoryName,
+        epochResetFrom: historical.runtimeKernelEpoch,
+        epochResetBackupPath: reset.backupPath
+      };
+    }
+
     try {
       const binding = await this.authority.current();
-      const manifestMigration = migrateCurrentRuntimeManifestIfRequired(binding);
+      const manifestMigration = await migrateCurrentRuntimeManifestIfRequired(binding);
       return {
         binding,
         initialized: false,
@@ -64,7 +115,7 @@ export class VscodeReliableKernelCutoverCoordinator {
       if (!(error instanceof RootAuthorityError) || error.code !== 'root-binding-missing') throw error;
     }
 
-    if (await legacyRuntimeRequiresCutover(this.dataRootPath)) {
+    if (await legacyRuntimeRequiresCutover(this.runtimeScopeRootPath)) {
       throw new RootAuthorityError(
         'cutover-request-required',
         '检测到旧运行数据，但没有已完成drain的cutover request；为避免误动用户数据，拒绝启动。'
@@ -89,4 +140,150 @@ export class VscodeReliableKernelCutoverCoordinator {
       throw error;
     }
   }
+}
+
+interface IncompatibleRuntimeResetResult {
+  binding: RootBinding;
+  archiveDirectoryName: string;
+  backupPath: string;
+}
+
+async function archiveAndResetIncompatibleRuntime(
+  authority: RootAuthority,
+  runtimeScopeRootPathInput: string,
+  historical: HistoricalRootBinding
+): Promise<IncompatibleRuntimeResetResult> {
+  const runtimeScopeRootPath = normalizedAbsolutePath(runtimeScopeRootPathInput, 'Workspace Runtime scope root');
+  const expected = authority.expectedPaths();
+  assertHistoricalBindingMatchesExpected(historical, expected);
+
+  const controlRootPath = path.dirname(expected.rootPointerPath);
+  if (
+    path.dirname(controlRootPath) !== runtimeScopeRootPath
+    || path.dirname(expected.dataRootPath) !== controlRootPath
+  ) {
+    throw new RootAuthorityError(
+      'runtime-epoch-reset-path-invalid',
+      `Runtime epoch reset path is outside the selected Workspace scope: ${controlRootPath}`
+    );
+  }
+
+  const backupRootPath = path.join(
+    runtimeScopeRootPath,
+    VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY
+  );
+  const archiveDirectoryName = [
+    timestampSlug(),
+    `epoch-${historical.runtimeKernelEpoch}-to-${RUNTIME_KERNEL_EPOCH}`,
+    randomUUID().slice(0, 8)
+  ].join('-');
+  const backupPath = path.join(backupRootPath, archiveDirectoryName);
+  await fs.mkdir(backupRootPath, { recursive: true, mode: 0o700 });
+  await fs.rename(controlRootPath, backupPath);
+  await syncDirectoryDurably(backupRootPath);
+  await syncDirectoryDurably(runtimeScopeRootPath);
+
+  try {
+    const binding = await initializeEmptyRuntimeRoot(authority);
+    await syncDirectoryDurably(runtimeScopeRootPath);
+    return { binding, archiveDirectoryName, backupPath };
+  } catch (error) {
+    const restored = await restoreArchivedRuntimeAfterFailedActivation({
+      authority,
+      runtimeScopeRootPath,
+      controlRootPath,
+      backupRootPath,
+      backupPath,
+      archiveDirectoryName
+    }).catch((rollbackError: unknown) => {
+      throw new RootAuthorityError(
+        'runtime-epoch-reset-rollback-failed',
+        `Runtime epoch reset failed and the archived root could not be restored: ${backupPath}`,
+        combinedFailure(error, rollbackError)
+      );
+    });
+    throw new RootAuthorityError(
+      'runtime-epoch-reset-failed',
+      restored
+        ? `Runtime epoch reset failed; the previous Runtime root was restored: ${controlRootPath}`
+        : `Runtime epoch reset did not finish cleanly; the previous Runtime root remains archived at: ${backupPath}`,
+      error
+    );
+  }
+}
+
+async function restoreArchivedRuntimeAfterFailedActivation(input: {
+  authority: RootAuthority;
+  runtimeScopeRootPath: string;
+  controlRootPath: string;
+  backupRootPath: string;
+  backupPath: string;
+  archiveDirectoryName: string;
+}): Promise<boolean> {
+  const published = await input.authority.readHistoricalPointerForCutover();
+  if (published?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) return false;
+
+  if (await exists(input.controlRootPath)) {
+    const failedPath = path.join(
+      input.backupRootPath,
+      `${input.archiveDirectoryName}-failed-current-${randomUUID().slice(0, 8)}`
+    );
+    await fs.rename(input.controlRootPath, failedPath);
+    await syncDirectoryDurably(input.backupRootPath);
+  }
+  await fs.rename(input.backupPath, input.controlRootPath);
+  await syncDirectoryDurably(input.backupRootPath);
+  await syncDirectoryDurably(input.runtimeScopeRootPath);
+  return true;
+}
+
+function assertHistoricalBindingMatchesExpected(
+  historical: HistoricalRootBinding,
+  expected: RuntimeRootPaths
+): void {
+  if (!samePaths(historical.paths, expected)) {
+    throw new StaleRootBindingError(
+      'Historical RootBinding paths do not match the selected Workspace Runtime root.'
+    );
+  }
+}
+
+function samePaths(left: RuntimeRootPaths, right: RuntimeRootPaths): boolean {
+  return left.dataRootPath === right.dataRootPath
+    && left.databasePath === right.databasePath
+    && left.casRootPath === right.casRootPath
+    && left.rootPointerPath === right.rootPointerPath
+    && left.rootPendingPath === right.rootPendingPath
+    && left.runtimeEpochPath === right.runtimeEpochPath;
+}
+
+function normalizedAbsolutePath(value: string, label: string): string {
+  if (typeof value !== 'string' || !path.isAbsolute(value) || path.resolve(value) !== value) {
+    throw new TypeError(`${label} must be a normalized absolute path.`);
+  }
+  return value;
+}
+
+async function exists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function combinedFailure(activationError: unknown, rollbackError: unknown): Error {
+  const error = new Error('Runtime epoch activation and rollback both failed.');
+  (error as Error & { causes?: readonly unknown[] }).causes = [activationError, rollbackError];
+  return error;
+}
+
+function timestampSlug(): string {
+  const date = new Date();
+  const pad = (value: number, length = 2): string => String(value).padStart(length, '0');
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`
+    + `-${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`
+    + `-${pad(date.getUTCMilliseconds(), 3)}`;
 }

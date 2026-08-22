@@ -351,6 +351,7 @@ export class VscodeReliableKernelProductRuntime {
         }
         const continuation = await runner.runtimeContinuation({
           commandId: `runtime-delivery:${request.deliveryId}`,
+          deliveryId: request.deliveryId,
           conversationId: request.conversationId,
           sourceTurnId: request.sourceTurnId
         });

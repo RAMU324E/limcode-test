@@ -9,12 +9,13 @@
   "fallbackToLegacyRuntime": false,
   "runtimeProtocolNegotiation": false,
   "boundedEpochUpgrade": {
-    "fromEpoch": 2,
-    "toEpoch": 3,
+    "fromEpoch": 3,
+    "toEpoch": 4,
     "mode": "offline-startup-exact-predecessor-only",
     "sourcePolicy": "exact-table-index-trigger-manifest-and-binding-fingerprint",
     "backupPolicy": "sqlite-backup-api-plus-root-binding-and-epoch-manifest",
     "recoveryPolicy": "durable-journal-forward-only",
+    "legacyChildContinuationPolicy": "offline-rewrite-to-current-envelope-and-link-exact-identity-only",
     "unknownDriftPolicy": "fail-before-pending-pointer",
     "compatibilityFallback": false
   },
@@ -2103,10 +2104,10 @@
       "atomic-rename-pointer",
       "delete-pending"
     ],
-    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；精确 epoch-2 predecessor 可在数据库打开前按 boundedEpochUpgrade 离线升级并向前恢复；其他 pending、缺少 epoch 或未知漂移拒绝打开 Runtime。"
+    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；精确 epoch-3 predecessor 可在数据库打开前按 boundedEpochUpgrade 离线升级并向前恢复，旧 Child Runtime continuation 仅在稳定身份、CAS 与命令收据全部吻合时一次性转换为当前 envelope + RuntimeDeliveryIntentLink；当前 epoch 4 仅允许同样规则下精确新增 RuntimeDeliveryIntentLink；其他 pending、缺少 epoch 或未知漂移拒绝打开 Runtime。"
   },
   "epochPolicy": {
-    "current": "runtimeKernelEpoch 不兼容数据统一归档重置，不提供旧 epoch 原地升级或 fallback",
+    "current": "只允许一次精确 epoch 3→4 离线升级；epoch 4 内只允许精确新增 RuntimeDeliveryIntentLink；两条路径都只在旧 Child Runtime continuation 的稳定身份、CAS 与命令收据完全吻合时离线转换，不提供运行时 fallback；其他不兼容 Runtime 归档重置",
     "status": "单一当前 schema，不做协议协商或长期 migration chain",
     "roadmapNote": "新增 epoch 必须另行决策，不能自动沿用本次升级器"
   },

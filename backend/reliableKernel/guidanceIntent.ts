@@ -14,6 +14,14 @@ export interface InputTurnIntentEnvelope {
   guidance: GuidanceIntentMetadata;
 }
 
+export interface RuntimeContinuationTurnIntentEnvelope {
+  version: 1;
+  kind: 'runtime_continuation';
+  sourceTurnId: string;
+}
+
+export type TurnIntentEnvelope = InputTurnIntentEnvelope | RuntimeContinuationTurnIntentEnvelope;
+
 /**
  * Queue controls are persisted by appending a TurnIntentRevision whose CAS payload is this
  * envelope. The user message itself remains a separate immutable ContentObject, so editing text
@@ -53,6 +61,33 @@ export function parseInputTurnIntentEnvelope(value: unknown): InputTurnIntentEnv
 
 export function parseInputTurnIntentEnvelopeText(source: string): InputTurnIntentEnvelope | null {
   return parseInputTurnIntentEnvelope(JSON.parse(source) as unknown);
+}
+
+export function runtimeContinuationTurnIntentEnvelope(input: {
+  sourceTurnId: string;
+}): RuntimeContinuationTurnIntentEnvelope {
+  return {
+    version: 1,
+    kind: 'runtime_continuation',
+    sourceTurnId: requireId(input.sourceTurnId, 'sourceTurnId')
+  };
+}
+
+export function parseRuntimeContinuationTurnIntentEnvelope(
+  value: unknown
+): RuntimeContinuationTurnIntentEnvelope | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== 'runtime_continuation') return null;
+  return runtimeContinuationTurnIntentEnvelope({
+    sourceTurnId: requireId(record.sourceTurnId, 'TurnIntent runtime_continuation.sourceTurnId')
+  });
+}
+
+export function parseRuntimeContinuationTurnIntentEnvelopeText(
+  source: string
+): RuntimeContinuationTurnIntentEnvelope | null {
+  return parseRuntimeContinuationTurnIntentEnvelope(JSON.parse(source) as unknown);
 }
 
 /** New ordinary inputs naturally sort after any queue order explicitly persisted by controls. */

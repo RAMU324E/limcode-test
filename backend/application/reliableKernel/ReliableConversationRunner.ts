@@ -343,6 +343,7 @@ export class ReliableConversationRunner {
   /** Durable internal continuation: no visible synthetic user message and frozen source authority. */
   public async runtimeContinuation(input: {
     commandId: string;
+    deliveryId: string;
     conversationId: string;
     sourceTurnId: string;
   }): Promise<TurnCommandResult> {
@@ -350,7 +351,8 @@ export class ReliableConversationRunner {
     const command: TurnRuntimeContinuationCommand = {
       source: { kind: 'internal', key: input.commandId },
       ...this.lease(input.conversationId),
-      sourceTurnId: input.sourceTurnId
+      sourceTurnId: input.sourceTurnId,
+      deliveryId: input.deliveryId
     };
     const result = await this.application.turns.runtimeContinuation(command);
     this.wake(result);

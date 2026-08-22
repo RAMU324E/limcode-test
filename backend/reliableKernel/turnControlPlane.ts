@@ -20,7 +20,9 @@ import {
   initialGuidancePosition,
   inputTurnIntentEnvelope,
   parseInputTurnIntentEnvelope,
+  parseRuntimeContinuationTurnIntentEnvelope,
   reorderedGuidancePosition,
+  runtimeContinuationTurnIntentEnvelope,
   TURN_INTENT_ENVELOPE_CONTENT_TYPE
 } from './guidanceIntent';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
@@ -68,7 +70,7 @@ const TURN_TERMINATION_INPUT_KINDS = [
 const TERMINAL_BLOCKING_INPUT_KINDS = ['runtime_delivery', ...TURN_TERMINATION_INPUT_KINDS] as const;
 
 export type TurnCommandSourceKind = 'command' | 'callback' | 'internal' | 'recovery';
-export type TurnCommandOperation = 'input' | 'edit' | 'delete' | 'retry' | 'interrupt' | 'continuation' | 'terminal' | 'guidance';
+export type TurnCommandOperation = 'input' | 'edit' | 'delete' | 'retry' | 'interrupt' | 'continuation' | 'runtime_continuation' | 'terminal' | 'guidance';
 export type TurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'outcome_unknown';
 export type TurnCommandContent = string | Uint8Array;
 
@@ -124,7 +126,7 @@ export interface TurnAuthorityCompilationRequest {
   conversationId: string;
   turnId: string;
   executorAgentId: string;
-  intentKind: 'input' | 'retry' | 'continuation';
+  intentKind: 'input' | 'retry' | 'continuation' | 'runtime_continuation';
   sourceTurnId?: string;
   /** Explicit next-Turn selection captured by the UI command admission boundary. */
   modelOverride?: TurnModelOverride;
@@ -201,17 +203,30 @@ export interface TurnContinuationCommand extends TurnExecutionCommand {
   contentType?: string;
 }
 
-/** Internal no-visible-message continuation with authority inherited from one source Turn. */
-export interface TurnRuntimeContinuationCommand extends TurnExecutionCommand {
+/** Internal no-visible-message continuation created for one exact RuntimeDelivery. */
+export interface TurnRuntimeDeliveryContinuationCommand extends TurnExecutionCommand {
   source: TurnInitiatingSource & { kind: 'internal' };
   sourceTurnId: string;
+  deliveryId: string;
+  maintenance?: undefined;
+}
+
+/** Internal no-visible-message product maintenance with authority inherited from one source Turn. */
+export interface TurnRuntimeMaintenanceCommand extends TurnExecutionCommand {
+  source: TurnInitiatingSource & { kind: 'internal' };
+  sourceTurnId: string;
+  deliveryId?: undefined;
   /**
    * Immutable product-maintenance identity carried by the admitted TurnIntent CAS payload.
    * This is deliberately not process-local state: startup recovery can classify and replay a
    * maintenance Turn even when the Host died before its first ModelRequest was created.
    */
-  maintenance?: TurnRuntimeMaintenanceDescriptor;
+  maintenance: TurnRuntimeMaintenanceDescriptor;
 }
+
+export type TurnRuntimeContinuationCommand =
+  | TurnRuntimeDeliveryContinuationCommand
+  | TurnRuntimeMaintenanceCommand;
 
 export type TurnRuntimeMaintenanceDescriptor =
   | TurnRuntimeMaintenanceDescriptorV1
@@ -443,8 +458,9 @@ interface CurrentGuidanceIntent {
 
 interface StartIntentPlan {
   command: TurnExecutionCommand;
-  operation: 'input' | 'retry' | 'continuation';
+  operation: 'input' | 'retry' | 'continuation' | 'runtime_continuation';
   sourceTurnId?: string;
+  deliveryId?: string;
   retryTarget?: MessageRetryTarget;
   expectedMessageRevisionId?: string;
   messageContent?: TurnCommandContent;
@@ -466,6 +482,7 @@ interface StartCommandIds {
   presetRevision: string;
   authorityRevision: string;
   intentExecutorLink: string;
+  runtimeDeliveryIntentLink?: string;
   turn: string;
   lease: string;
   authoritySnapshot: string;
@@ -570,14 +587,21 @@ export class TurnControlPlane {
     if (command.source.kind !== 'internal') {
       throw new TypeError('Runtime continuation requires an internal source.');
     }
+    if (command.maintenance) {
+      return this.startIntent({
+        command,
+        operation: 'retry',
+        sourceTurnId: command.sourceTurnId,
+        inheritSourceAuthority: true,
+        runtimeMaintenance: normalizeRuntimeMaintenance(command.maintenance)
+      });
+    }
     return this.startIntent({
       command,
-      operation: 'retry',
+      operation: 'runtime_continuation',
       sourceTurnId: command.sourceTurnId,
-      inheritSourceAuthority: true,
-      ...(command.maintenance
-        ? { runtimeMaintenance: normalizeRuntimeMaintenance(command.maintenance) }
-        : {})
+      deliveryId: requireId(command.deliveryId, 'deliveryId'),
+      inheritSourceAuthority: true
     });
   }
 
@@ -1606,6 +1630,12 @@ export class TurnControlPlane {
     await this.requireExisting('ContentObject', authorityObjectId);
     const executorAgentId = requireId(executorLinks[0].agent_id, 'TurnIntentExecutorLink.agent_id');
     const decoded = await this.decodeQueuedIntent(intentContent);
+    const deliveryIntentLink = decoded.operation === 'runtime_continuation'
+      ? (await this.listRows('RuntimeDeliveryIntentLink', { turn_intent_id: intentId }, 2))[0]
+      : undefined;
+    if (decoded.operation === 'runtime_continuation' && !deliveryIntentLink) {
+      throw new Error(`Runtime continuation TurnIntent ${intentId} has no RuntimeDeliveryIntentLink.`);
+    }
     const ids = dependentStartCommandIds(intentId, decoded.messageContent !== null);
     const admissionReceiptId = intentDependentEntityId(intentId, 'admission_command_receipt');
     const now = this.timestamp();
@@ -1645,6 +1675,15 @@ export class TurnControlPlane {
       : [];
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, { state: TURN_INTENT_STATE_QUEUED, turn_id: null }),
+      ...(deliveryIntentLink ? [
+        DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').assert(
+          requireId(deliveryIntentLink.id, 'RuntimeDeliveryIntentLink.id'),
+          {
+            delivery_id: requireId(deliveryIntentLink.delivery_id, 'RuntimeDeliveryIntentLink.delivery_id'),
+            turn_intent_id: intentId
+          }
+        )
+      ] : []),
       DOMAIN_REPOSITORIES.domain('TurnIntentRevision').assertExactIds(
         { intent_id: intentId },
         intentRevisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
@@ -1745,7 +1784,7 @@ export class TurnControlPlane {
   }
 
   private async decodeQueuedIntent(intentContent: ContentObjectMetadata): Promise<{
-    operation: 'input' | 'retry' | 'continuation';
+    operation: 'input' | 'retry' | 'continuation' | 'runtime_continuation';
     messageContent: PreparedContentObject | null;
   }> {
     if (intentContent.content_type !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
@@ -1760,6 +1799,10 @@ export class TurnControlPlane {
           metadata: await this.readContentObject(inputEnvelope.messageContentObjectId)
         }
       };
+    }
+    const runtimeContinuationEnvelope = parseRuntimeContinuationTurnIntentEnvelope(value);
+    if (runtimeContinuationEnvelope) {
+      return { operation: 'runtime_continuation', messageContent: null };
     }
     if (value.kind === 'retry') return { operation: 'retry', messageContent: null };
     if (value.kind !== 'continuation') throw new Error('Queued TurnIntent has an unsupported intent envelope.');
@@ -1816,17 +1859,29 @@ export class TurnControlPlane {
       retryTarget ?? null,
       command.membership ?? null
     ];
-    // The four-field scope is a persisted identity contract used by every pre-v2 command,
-    // including legacy manual-compression Turns. Only target-frozen v2 maintenance commands may
-    // extend it; appending a null (or a v1 descriptor) would make old receipts unreplayable.
+    if (plan.deliveryId) commandScopeParts.push(plan.deliveryId);
     if (plan.runtimeMaintenance?.version === 2) commandScopeParts.push(plan.runtimeMaintenance);
     const commandScope = JSON.stringify(commandScopeParts);
     const baseIds = startCommandIds(source, plan.operation, plan.messageContent !== undefined, commandScope);
-    const ids = command.membership
+    const scopedIds = command.membership
       ? childExecutionStartIds(baseIds, command.membership.childExecutionId, plan.messageContent !== undefined)
       : baseIds;
+    const ids: StartCommandIds = plan.deliveryId
+      ? {
+          ...scopedIds,
+          runtimeDeliveryIntentLink: intentDependentEntityId(scopedIds.intent, 'runtime_delivery_intent_link')
+        }
+      : scopedIds;
     const duplicate = await this.findReceipt(source);
-    if (duplicate) return this.replayStartResult(duplicate, ids, plan.operation, command.conversationId);
+    if (duplicate) {
+      return this.replayStartResult(
+        duplicate,
+        ids,
+        plan.operation,
+        command.conversationId,
+        plan.deliveryId
+      );
+    }
 
     const conversation = await this.getConversation(command.conversationId);
     if (plan.runtimeMaintenance) await this.requireConversationIdle(command.conversationId);
@@ -1894,7 +1949,15 @@ export class TurnControlPlane {
           })),
           TURN_INTENT_ENVELOPE_CONTENT_TYPE
         )
-      : await this.contentStore.prepare(
+      : plan.operation === 'runtime_continuation'
+        ? await this.contentStore.prepare(
+            this.database,
+            JSON.stringify(runtimeContinuationTurnIntentEnvelope({
+              sourceTurnId: requireId(plan.sourceTurnId, 'sourceTurnId')
+            })),
+            TURN_INTENT_ENVELOPE_CONTENT_TYPE
+          )
+        : await this.contentStore.prepare(
         this.database,
         JSON.stringify({
           kind: plan.operation,
@@ -2014,6 +2077,14 @@ export class TurnControlPlane {
           authorityContent,
           ...(messageContent ? [messageContent] : [])
         ], 'intent_content'),
+        ...(plan.deliveryId ? [
+          DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(plan.deliveryId, {
+            target_conversation_id: conversation.id,
+            target_turn_id: null,
+            phase: 'next_turn',
+            state: 'pending'
+          })
+        ] : []),
         DOMAIN_REPOSITORIES.domain('TurnIntent').insert({
           id: ids.intent,
           conversation_id: conversation.id,
@@ -2022,6 +2093,14 @@ export class TurnControlPlane {
           created_at: now,
           updated_at: now
         }),
+        ...(plan.deliveryId ? [
+          DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').insert({
+            id: requireId(ids.runtimeDeliveryIntentLink, 'RuntimeDeliveryIntentLink.id'),
+            delivery_id: plan.deliveryId,
+            turn_intent_id: ids.intent,
+            created_at: now
+          })
+        ] : []),
         DOMAIN_REPOSITORIES.domain('TurnIntentRevision').insert({
           id: ids.intentRevision,
           intent_id: ids.intent,
@@ -2059,7 +2138,15 @@ export class TurnControlPlane {
             })])
       ]
     });
-    if (commit.deduplicated) return this.replayStartResult(commit.receipt, ids, plan.operation, command.conversationId);
+    if (commit.deduplicated) {
+      return this.replayStartResult(
+        commit.receipt,
+        ids,
+        plan.operation,
+        command.conversationId,
+        plan.deliveryId
+      );
+    }
     return this.readStartResult(commit, ids, command.conversationId);
   }
 
@@ -3280,12 +3367,21 @@ export class TurnControlPlane {
     receipt: DomainRow,
     ids: StartCommandIds,
     operation: StartIntentPlan['operation'],
-    conversationId: string
+    conversationId: string,
+    runtimeDeliveryId?: string
   ): Promise<TurnCommandResult> {
     assertReceiptIdentity(receipt, ids.receipt, operation);
     if (receipt.conversation_id !== conversationId) throw sourceOperationMismatch(receipt, operation);
     const intent = await this.maybeGet('TurnIntent', ids.intent);
     if (!intent) throw sourceOperationMismatch(receipt, operation);
+    if (operation === 'runtime_continuation') {
+      const linkId = requireId(ids.runtimeDeliveryIntentLink, 'RuntimeDeliveryIntentLink.id');
+      const deliveryId = requireId(runtimeDeliveryId, 'runtimeDeliveryId');
+      const link = await this.maybeGet('RuntimeDeliveryIntentLink', linkId);
+      if (!link || link.delivery_id !== deliveryId || link.turn_intent_id !== ids.intent) {
+        throw sourceOperationMismatch(receipt, operation);
+      }
+    }
     const admitted = intent.state === TURN_INTENT_STATE_ADMITTED && typeof intent.turn_id === 'string';
     if (admitted && intent.turn_id !== ids.turn) {
       throw new Error(`TurnIntent ${ids.intent} is linked to an unexpected Turn.`);

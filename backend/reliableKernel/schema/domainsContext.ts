@@ -184,6 +184,12 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
     columns: [id(), ref('inbox_item_id', 'runtime_inbox_item'), text('target_conversation_id'), text('target_turn_id', { nullable: true }), text('phase'), integer('attempt_seq'), ref('retry_of_delivery_id', 'runtime_delivery', true, 'RESTRICT'), text('state'), text('failure_reason', { nullable: true }), text('created_at'), text('updated_at')]
   }),
   domain({
+    key: 'RuntimeDeliveryIntentLink', table: 'runtime_delivery_intent_link', repository: 'RuntimeDeliveryIntentLinkRepository', codec: 'RuntimeDeliveryIntentLinkRowCodec',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-delivery',
+    indexes: ['delivery_id UNIQUE', 'turn_intent_id UNIQUE'],
+    columns: [id(), ref('delivery_id', 'runtime_delivery'), ref('turn_intent_id', 'turn_intent'), text('created_at')]
+  }),
+  domain({
     key: 'RuntimeDeliveryInputLink', table: 'runtime_delivery_input_link', repository: 'RuntimeDeliveryInputLinkRepository', codec: 'RuntimeDeliveryInputLinkRowCodec',
     mutations: ['insert', 'update'], client: 'none', deletePolicy: 'cascade-with-delivery',
     indexes: ['delivery_id UNIQUE', 'pending_turn_input_id UNIQUE', 'handled_at'],

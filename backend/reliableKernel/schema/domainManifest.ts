@@ -73,7 +73,7 @@ export function domainSchemaDigest(schema: RuntimeDomainSchema): string {
   return createHash('sha256').update(JSON.stringify(schema)).digest('hex');
 }
 
-function createRootBindingTableSql(): string {
+export function createRootBindingTableSql(): string {
   return `CREATE TABLE root_binding (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     data_root_path TEXT NOT NULL,
@@ -90,7 +90,7 @@ function createRootBindingTableSql(): string {
   )`;
 }
 
-function createSchemaManifestTableSql(): string {
+export function createSchemaManifestTableSql(): string {
   return `CREATE TABLE schema_manifest (
     domain_key TEXT PRIMARY KEY,
     table_name TEXT NOT NULL UNIQUE,
@@ -148,8 +148,8 @@ export function createRuntimeDomainIndexSql(
 }
 
 function validateDomainManifest(): void {
-  if (RUNTIME_DOMAIN_SCHEMAS.length !== 90) {
-    throw new Error(`Runtime domain schema exact set must contain 90 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
+  if (RUNTIME_DOMAIN_SCHEMAS.length !== 91) {
+    throw new Error(`Runtime domain schema exact set must contain 91 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
   }
   for (const field of ['key', 'table', 'repository', 'codec'] as const) {
     const values = RUNTIME_DOMAIN_SCHEMAS.map((entry) => entry[field]);

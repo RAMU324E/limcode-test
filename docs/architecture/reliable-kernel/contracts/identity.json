@@ -30,6 +30,7 @@
     "deliveryAttempt": "attempt_seq 从 1 开始；人工 redeliver 创建 attempt_seq+1 并写 retry_of_delivery_id",
     "deliveryDedupe": "RuntimeDelivery(inbox_item_id,target_conversation_id,attempt_seq) UNIQUE；phase与target是同一attempt内受authority CAS保护的可收敛路由状态",
     "targetTurnIdNullable": "phase=next_turn的RuntimeDelivery.target_turn_id允许为空，由新Turn在启动事务内回写。",
+    "intentLink": "RuntimeDeliveryIntentLink(delivery_id UNIQUE,turn_intent_id UNIQUE)；只表达哪份投递触发哪条 runtime_continuation TurnIntent",
     "inputLink": "RuntimeDeliveryInputLink(delivery_id UNIQUE,pending_turn_input_id UNIQUE)；执行器吸收对应输入时写 handled_at",
     "rule": "重复回调只能命中同一 inbox 与同一 delivery attempt；同一 attempt 不能重复注入，失败重投必须显式创建下一 attempt。"
   },

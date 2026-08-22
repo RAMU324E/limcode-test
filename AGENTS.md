@@ -10,7 +10,7 @@
 
 当前项目仍然处于开发模式，因此不要对旧格式有任何兜底，也不需要保留旧功能代码的兼容和体验，也不需要写什么协议v1，v2等之类的运行时内部版本号，全面使用新格式新功能更优秀的代码。
 
-允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。
+允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。当前唯一有界例外是为保留已落盘对话而执行精确`Runtime epoch 3 → 4`离线升级：必须在数据库打开前核对table/index/trigger/manifest/RootBinding完整指纹，使用SQLite Backup API持久备份，通过pending pointer、单事务和durable journal向前恢复；任何未知漂移仍fail closed，不得扩展成通用迁移链。
 
 ### 1.1 独立领域对象必须独立建模
 

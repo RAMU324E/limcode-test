@@ -152,6 +152,7 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'RuntimeInboxItem',
   'RuntimeInboxPayloadLink',
   'RuntimeDelivery',
+  'RuntimeDeliveryIntentLink',
   'RuntimeDeliveryInputLink',
   'RuntimeDeliveryWake'
 ];
@@ -441,6 +442,21 @@ function validateMigration(root, migration, failures) {
   for (const field of ['legacyRuntimeImport', 'dualWrite', 'fallbackToLegacyRuntime', 'runtimeProtocolNegotiation']) {
     if (migration?.[field] !== false) failures.push(`migration.${field}必须为false`);
   }
+  const boundedEpochUpgrade = migration?.boundedEpochUpgrade;
+  if (
+    boundedEpochUpgrade?.fromEpoch !== 3
+    || boundedEpochUpgrade?.toEpoch !== 4
+    || boundedEpochUpgrade?.mode !== 'offline-startup-exact-predecessor-only'
+    || boundedEpochUpgrade?.sourcePolicy !== 'exact-table-index-trigger-manifest-and-binding-fingerprint'
+    || boundedEpochUpgrade?.backupPolicy !== 'sqlite-backup-api-plus-root-binding-and-epoch-manifest'
+    || boundedEpochUpgrade?.recoveryPolicy !== 'durable-journal-forward-only'
+    || boundedEpochUpgrade?.legacyChildContinuationPolicy
+      !== 'offline-rewrite-to-current-envelope-and-link-exact-identity-only'
+    || boundedEpochUpgrade?.unknownDriftPolicy !== 'fail-before-pending-pointer'
+    || boundedEpochUpgrade?.compatibilityFallback !== false
+  ) {
+    failures.push('Runtime epoch只允许精确3到4离线升级并必须具备备份、journal与未知漂移拒绝合同');
+  }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
   }
@@ -567,7 +583,9 @@ function validateAuthority(authority, migration, failures) {
   if (authority?.schemaPolicy?.currentManifestRequired !== true
     || authority?.schemaPolicy?.runtimeKernelEpoch !== 'single-current-epoch'
     || authority?.schemaPolicy?.incrementalLegacyMigrationChain !== false
-    || authority?.schemaPolicy?.incompatibleRuntimeData !== 'archive-and-reset') {
+    || authority?.schemaPolicy?.incompatibleRuntimeData !== 'archive-and-reset'
+    || authority?.schemaPolicy?.exactPredecessorUpgrade
+      !== 'offline-epoch-3-to-4-only-with-exact-schema-fingerprint-and-durable-backup') {
     failures.push('SQLite schema必须只有当前manifest和单一运行epoch，不维护旧迁移链');
   }
   if (authority?.rootPolicy?.mode !== 'offline-restart-only' || authority?.rootPolicy?.onlineMigration !== false) {
@@ -643,6 +661,8 @@ function validateAuthority(authority, migration, failures) {
   requireDomainIndex(domains, 'ModelRequestMessageLink', 'model_request_id UNIQUE', failures);
   requireDomainIndex(domains, 'ModelRequestMessageLink', 'message_id UNIQUE', failures);
   requireDomainIndex(domains, 'RuntimeDelivery', 'inbox_item_id,target_conversation_id,attempt_seq UNIQUE', failures);
+  requireDomainIndex(domains, 'RuntimeDeliveryIntentLink', 'delivery_id UNIQUE', failures);
+  requireDomainIndex(domains, 'RuntimeDeliveryIntentLink', 'turn_intent_id UNIQUE', failures);
   requireDomainIndex(domains, 'RuntimeDeliveryInputLink', 'delivery_id UNIQUE', failures);
   requireDomainIndex(domains, 'RuntimeDeliveryInputLink', 'pending_turn_input_id UNIQUE', failures);
   requireDomainIndex(domains, 'RuntimeInboxPayloadLink', 'inbox_item_id UNIQUE', failures);

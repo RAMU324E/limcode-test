@@ -46,6 +46,8 @@ export * from './processProtocol';
 export * from './repositories';
 export * from './repositoryPagination';
 export * from './rootAuthority';
+export * from './runtimeDeliveryContinuationIdentity';
+export * from './runtimeEpochMigration';
 export * from './runtimeManifestMigration';
 export * from './runtimeDatabase';
 export * from './runtimeApplication';

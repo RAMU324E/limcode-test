@@ -166,7 +166,7 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 - 旧 Runtime 归档，配置按 manifest preserve/filter，Workspace 与未知用户文件不触碰；
 - 激活后只修复新内核，不自动回退旧 writer。
 
-已经实际落盘的 SQLite epoch 2 数据是上述硬切之后的用户运行数据，不属于旧文件 Runtime。为避免丢失对话历史，启动门仅允许一个有界例外：数据库打开前执行精确 `epoch 2 → 3` 离线升级。升级器要求 table/index/trigger/manifest/RootBinding 全量指纹吻合，先用 SQLite Backup API 持久备份，再以 pending pointer、单事务和 journal 向前恢复；任何未知漂移仍 fail closed，且不建立版本协商或通用迁移链。
+已经实际落盘的 SQLite epoch 3 数据通过唯一的有界例外保留：数据库打开前执行精确 `epoch 3 → 4` 离线升级。升级器要求 table/index/trigger/manifest/RootBinding 全量 DDL 指纹吻合，先用 SQLite Backup API 持久备份，再以 pending pointer、单事务和 journal 向前恢复；升级新增 ConversationAttachmentHandleLink、AttachmentObservationLink、CompressionBlockObservationLink 和 RuntimeDeliveryIntentLink 四张关系表，不改写既有对话、消息、附件或 CAS 对象。旧 Child Runtime continuation 只有在稳定 id、CommandReceipt、RuntimeDelivery 与旧 CAS envelope 全部吻合时，才在该离线事务中发布当前 envelope、重指向其 intent/preset revision 并补独立 Link；不保留运行时 fallback。已处于 epoch 4、仅缺最后一张 Link 表的数据库执行同一精确转换后原地增表保留历史。
 
 真实 cutover actor 是最终 VSIX 的 `cutover-only coordinator`：旧宿主先关闭 admission、drain 并持久化 request，然后退出；最终 VSIX 安装并重启后先完成 journaled archive、配置过滤和校验，再创建 SQLite/CAS/epoch 并原子激活 RootBinding。归档失败时 active pointer 不变且可按 journal 恢复。
 
@@ -190,7 +190,7 @@ Gate 的机器身份是稳定 `check.id`，handler 使用 `Map<checkId, handler>
 
 ## 9. 明确不做
 
-- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；精确 `epoch 2 → 3` 离线升级是唯一有界例外；
+- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；精确 `epoch 3 → 4` 离线升级和 epoch 4 内单表增量是有界例外；
 - 运行时 schema v1/v2 协商；
 - 在线 Context root/node GC 或 CAS 引用计数；
 - 持久 ClientChangeLog 或跨宿主持久 feed；
