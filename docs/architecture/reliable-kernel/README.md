@@ -166,7 +166,7 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 - 旧 Runtime 归档，配置按 manifest preserve/filter，Workspace 与未知用户文件不触碰；
 - 激活后只修复新内核，不自动回退旧 writer。
 
-已经实际落盘的 SQLite epoch 3 数据通过唯一的有界例外保留：数据库打开前执行精确 `epoch 3 → 4` 离线升级。升级器要求 table/index/trigger/manifest/RootBinding 全量 DDL 指纹吻合，先用 SQLite Backup API 持久备份，再以 pending pointer、单事务和 journal 向前恢复；升级新增 ConversationAttachmentHandleLink、AttachmentObservationLink、CompressionBlockObservationLink 和 RuntimeDeliveryIntentLink 四张关系表，不改写既有对话、消息、附件或 CAS 对象。旧 Child Runtime continuation 只有在稳定 id、CommandReceipt、RuntimeDelivery 与旧 CAS envelope 全部吻合时，才在该离线事务中发布当前 envelope、重指向其 intent/preset revision 并补独立 Link；不保留运行时 fallback。已处于 epoch 4、仅缺最后一张 Link 表的数据库执行同一精确转换后原地增表保留历史。
+已经实际落盘的 SQLite epoch 3 数据通过唯一的有界例外保留：数据库打开前执行精确 `epoch 3 → 4` 离线升级。升级器只承认从已发布 VSIX 提取出的两个完整 manifest 指纹：0.0.10–0.0.11 的 `ModelContextProjection.client_mapping=detail` 与 0.0.12–0.0.14 的 `summary`；二者物理 DDL 及其余 86 个领域完全相同，任何第三种组合仍 fail closed。升级器要求 table/index/trigger/manifest/RootBinding 全量 DDL 指纹吻合，先用 SQLite Backup API 持久备份，再以 pending pointer、单事务和 journal 向前恢复；Windows 上 RootBinding 仍保存 canonical path，只有 `better-sqlite3` 原生 I/O 边界使用 namespaced path，避免备份临时库跨过 `MAX_PATH`。升级新增 ConversationAttachmentHandleLink、AttachmentObservationLink、CompressionBlockObservationLink 和 RuntimeDeliveryIntentLink 四张关系表，不改写既有对话、消息、附件或 CAS 对象。旧 Child Runtime continuation 只有在稳定 id、CommandReceipt、RuntimeDelivery 与旧 CAS envelope 全部吻合时，才在该离线事务中发布当前 envelope、重指向其 intent/preset revision 并补独立 Link；不保留运行时 fallback。已处于 epoch 4、仅缺最后一张 Link 表的数据库执行同一精确转换后原地增表保留历史。
 
 真实 cutover actor 是最终 VSIX 的 `cutover-only coordinator`：旧宿主先关闭 admission、drain 并持久化 request，然后退出；最终 VSIX 安装并重启后先完成 journaled archive、配置过滤和校验，再创建 SQLite/CAS/epoch 并原子激活 RootBinding。归档失败时 active pointer 不变且可按 journal 恢复。
 

@@ -27,6 +27,8 @@ const {
 
 const windowsOnly = { skip: process.platform !== 'win32' };
 const darwinOnly = { skip: process.platform !== 'darwin' };
+const windowsPathSeparator = String.fromCharCode(92);
+const windowsNamespacePrefix = `${windowsPathSeparator}${windowsPathSeparator}?${windowsPathSeparator}`;
 
 test('目录元数据同步保持普通文件严格语义并兼容当前平台', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-directory-sync-'));
@@ -53,6 +55,52 @@ test('跨平台进程指纹可稳定识别当前进程', () => {
   assert.ok(expected, `unsupported test platform: ${process.platform}/${process.arch}`);
   assert.match(first, expected);
 });
+
+test('SQLite Windows原生边界转换drive与UNC长路径且保持逻辑路径独立', () => {
+  const drivePath = [
+    'C:',
+    'Users',
+    'tester',
+    'AppData',
+    'Roaming',
+    'Code',
+    'User',
+    'globalStorage',
+    'your-publisher.limcode-test',
+    'd'.repeat(180),
+    'limcode.sqlite'
+  ].join(windowsPathSeparator);
+  const driveNativePath = `${windowsNamespacePrefix}${drivePath}`;
+  assert.equal(kernel.toSqliteFilePath(drivePath, 'win32'), driveNativePath);
+  assert.equal(kernel.toSqliteFilePath(driveNativePath, 'win32'), driveNativePath);
+
+  const uncPath = [
+    '',
+    '',
+    'server',
+    'share',
+    'u'.repeat(180),
+    'limcode.sqlite'
+  ].join(windowsPathSeparator);
+  const uncNativePath = [
+    '',
+    '',
+    '?',
+    'UNC',
+    'server',
+    'share',
+    'u'.repeat(180),
+    'limcode.sqlite'
+  ].join(windowsPathSeparator);
+  assert.equal(kernel.toSqliteFilePath(uncPath, 'win32'), uncNativePath);
+  assert.equal(kernel.toSqliteFilePath(uncNativePath, 'win32'), uncNativePath);
+  assert.equal(kernel.toSqliteFilePath('/var/lib/limcode/limcode.sqlite', 'linux'), '/var/lib/limcode/limcode.sqlite');
+  assert.throws(
+    () => kernel.toSqliteFilePath(['relative', 'limcode.sqlite'].join(windowsPathSeparator), 'win32'),
+    /must be absolute on Windows/
+  );
+});
+
 
 test('macOS Wrapper核验要求PID存活且命令行包含精确launch路径', darwinOnly, async () => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-wrapper-reachable-'));
@@ -267,6 +315,65 @@ test('精确 epoch 3 启动时无损升级并保留既有 Conversation', async (
   }
 });
 
+test('0.0.10至0.0.11的epoch 3 manifest可在生产深路径从fenced journal无损升级', async () => {
+  const fixture = await createEpoch3RuntimeFixture('published-detail-deep-path', {
+    modelContextProjectionClientMapping: 'detail',
+    productionDepth: true
+  });
+  let runtime;
+  try {
+    assert.equal(fixture.modelContextProjectionClientMapping, 'detail');
+    await assert.rejects(
+      kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority, {
+        onFaultPoint(point) {
+          if (point === 'before-backup') throw new Error('fault:before-backup');
+        }
+      }),
+      /fault:before-backup/
+    );
+
+    const controlRoot = path.dirname(fixture.paths.dataRootPath);
+    const journalPath = path.join(controlRoot, kernel.RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE);
+    const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'));
+    assert.equal(journal.state, 'fenced');
+    const backupTemporaryPath = path.join(
+      controlRoot,
+      kernel.RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
+      journal.backupDirectoryName,
+      `limcode.epoch-3.sqlite.${process.pid}.tmp`
+    );
+    assert.ok(
+      backupTemporaryPath.length > 260,
+      `production-depth epoch backup must exceed MAX_PATH, found ${backupTemporaryPath.length}`
+    );
+    assert.ok(backupTemporaryPath.length > fixture.paths.databasePath.length);
+    await fs.access(fixture.paths.rootPendingPath);
+
+    const recovered = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
+    assert.equal(recovered?.binding.runtimeKernelEpoch, kernel.RUNTIME_KERNEL_EPOCH);
+    assert.equal(recovered?.binding.dataSetId, fixture.previousBinding.dataSetId);
+    assert.equal(recovered?.binding.paths.databasePath, fixture.paths.databasePath);
+    assert.equal(recovered?.binding.paths.databasePath.includes(windowsNamespacePrefix), false);
+    await fs.access(path.join(recovered.backupPath, 'limcode.epoch-3.sqlite'));
+    await assert.rejects(fs.access(journalPath), { code: 'ENOENT' });
+    await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
+
+    runtime = await kernel.RuntimeDatabase.open(fixture.authority);
+    const preserved = await runtime.snapshot([
+      kernel.DOMAIN_REPOSITORIES.domain('Conversation').get(fixture.conversationId),
+      kernel.DOMAIN_REPOSITORIES.domain('ContentObject').get(fixture.oldContentObjectId)
+    ]);
+    assert.equal(preserved.snapshot[0]?.title, fixture.conversationTitle);
+    const store = new kernel.ContentAddressedStore(fixture.authority, recovered.binding);
+    const oldBytes = await store.read(preserved.snapshot[1]);
+    assert.equal(JSON.parse(oldBytes.toString('utf8')).parts[0].text, fixture.oldMessageText);
+    await assertMigratedLegacyChildContinuation(runtime, store, fixture.legacyContinuation);
+  } finally {
+    if (runtime) await runtime.close().catch(() => undefined);
+    await fs.rm(fixture.cleanupRoot, { recursive: true, force: true });
+  }
+});
+
 test('epoch 3 升级在四个持久化断点后都能继续完成且保留历史', async (t) => {
   for (const point of [
     'after-writer-fence',
@@ -329,6 +436,61 @@ test('epoch 3 出现未知结构漂移时保持旧指针且不归档历史', asy
     await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
   } finally {
     await fs.rm(fixture.runtimeScopeRoot, { recursive: true, force: true });
+  }
+});
+
+test('epoch 3 manifest只接受两个已发布指纹并拒绝任意mapping或错误digest', async () => {
+  const fixture = await createEpoch3RuntimeFixture('unsupported-manifest-variant');
+  try {
+    const pointerBefore = await fs.readFile(fixture.paths.rootPointerPath, 'utf8');
+    const modelContextProjection = kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.find(
+      (schema) => schema.key === 'ModelContextProjection'
+    );
+    assert.ok(modelContextProjection);
+    const writeManifest = async (clientMapping, schemaDigest) => {
+      const database = new Database(kernel.toSqliteFilePath(fixture.paths.databasePath), { fileMustExist: true });
+      try {
+        const result = database.prepare(`
+          UPDATE schema_manifest
+             SET client_mapping = @clientMapping,
+                 schema_digest = @schemaDigest
+           WHERE domain_key = 'ModelContextProjection'
+        `).run({ clientMapping, schemaDigest });
+        assert.equal(result.changes, 1);
+        database.pragma('wal_checkpoint(TRUNCATE)');
+      } finally {
+        database.close();
+      }
+    };
+    const assertRejectedBeforeFence = async () => {
+      await assert.rejects(
+        new VscodeReliableKernelCutoverCoordinator(
+          fixture.authority,
+          fixture.runtimeScopeRoot
+        ).ensureCurrentRoot(),
+        (error) => error?.code === 'runtime-epoch-migration-schema-mismatch'
+          && /ModelContextProjection/.test(error.message)
+      );
+      assert.equal(await fs.readFile(fixture.paths.rootPointerPath, 'utf8'), pointerBefore);
+      await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
+      await assert.rejects(
+        fs.access(path.join(
+          path.dirname(fixture.paths.dataRootPath),
+          kernel.RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE
+        )),
+        { code: 'ENOENT' }
+      );
+    };
+
+    await writeManifest(
+      'window',
+      kernel.domainSchemaDigest({ ...modelContextProjection, client: 'window' })
+    );
+    await assertRejectedBeforeFence();
+    await writeManifest('detail', '0'.repeat(64));
+    await assertRejectedBeforeFence();
+  } finally {
+    await fs.rm(fixture.cleanupRoot, { recursive: true, force: true });
   }
 });
 
@@ -631,7 +793,7 @@ async function createEpoch4WithoutRuntimeDeliveryIntentLinkFixture(label) {
     await runtime.close();
     runtime = undefined;
 
-    const database = new Database(binding.paths.databasePath, { fileMustExist: true });
+    const database = new Database(kernel.toSqliteFilePath(binding.paths.databasePath), { fileMustExist: true });
     try {
       database.defaultSafeIntegers(true);
       database.exec('BEGIN IMMEDIATE');
@@ -666,8 +828,17 @@ async function createEpoch4WithoutRuntimeDeliveryIntentLinkFixture(label) {
   }
 }
 
-async function createEpoch3RuntimeFixture(label) {
-  const runtimeScopeRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-epoch3-${label}-`));
+async function createEpoch3RuntimeFixture(label, options = {}) {
+  const cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-epoch3-${label}-`));
+  const runtimeScopeRoot = options.productionDepth
+    ? path.join(
+        cleanupRoot,
+        'globalStorage',
+        '.limcode-workspace-runtimes',
+        'scopes',
+        `folder-${'a'.repeat(64)}`
+      )
+    : cleanupRoot;
   const dataRootPath = path.join(runtimeScopeRoot, '.limcode-runtime', 'active');
   const authority = new kernel.RootAuthority(() => dataRootPath);
   const binding = await kernel.initializeEmptyRuntimeRoot(authority);
@@ -728,7 +899,7 @@ async function createEpoch3RuntimeFixture(label) {
     await runtime.close();
     runtime = undefined;
 
-    const database = new Database(binding.paths.databasePath, { fileMustExist: true });
+    const database = new Database(kernel.toSqliteFilePath(binding.paths.databasePath), { fileMustExist: true });
     try {
       database.defaultSafeIntegers(true);
       database.exec('BEGIN IMMEDIATE');
@@ -749,6 +920,38 @@ async function createEpoch3RuntimeFixture(label) {
         database.prepare(
           'UPDATE schema_manifest SET runtime_kernel_epoch = @epoch'
         ).run({ epoch: BigInt(kernel.PREVIOUS_RUNTIME_KERNEL_EPOCH) });
+        const modelContextProjection = kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.find(
+          (schema) => schema.key === 'ModelContextProjection'
+        );
+        assert.ok(modelContextProjection);
+        const modelContextProjectionClientMapping = options.modelContextProjectionClientMapping ?? 'summary';
+        const modelContextProjectionSchemaDigest = kernel.domainSchemaDigest({
+          ...modelContextProjection,
+          client: modelContextProjectionClientMapping
+        });
+        if (modelContextProjectionClientMapping === 'detail') {
+          assert.equal(
+            modelContextProjectionSchemaDigest,
+            kernel.EPOCH_3_MODEL_CONTEXT_DETAIL_SCHEMA_DIGEST
+          );
+        } else if (modelContextProjectionClientMapping === 'summary') {
+          assert.equal(
+            modelContextProjectionSchemaDigest,
+            kernel.EPOCH_3_MODEL_CONTEXT_SUMMARY_SCHEMA_DIGEST
+          );
+        }
+        const manifestUpdate = database.prepare(`
+          UPDATE schema_manifest
+             SET client_mapping = @clientMapping,
+                 schema_digest = @schemaDigest
+           WHERE domain_key = 'ModelContextProjection'
+             AND runtime_kernel_epoch = @epoch
+        `).run({
+          clientMapping: modelContextProjectionClientMapping,
+          schemaDigest: modelContextProjectionSchemaDigest,
+          epoch: BigInt(kernel.PREVIOUS_RUNTIME_KERNEL_EPOCH)
+        });
+        assert.equal(manifestUpdate.changes, 1);
         database.prepare(
           'UPDATE root_binding SET runtime_kernel_epoch = @epoch WHERE singleton = 1'
         ).run({ epoch: BigInt(kernel.PREVIOUS_RUNTIME_KERNEL_EPOCH) });
@@ -779,9 +982,11 @@ async function createEpoch3RuntimeFixture(label) {
     );
     return {
       authority,
+      cleanupRoot,
       runtimeScopeRoot,
       paths: binding.paths,
       previousBinding,
+      modelContextProjectionClientMapping: options.modelContextProjectionClientMapping ?? 'summary',
       conversationId,
       conversationTitle,
       oldContentObjectId: oldContent.id,
@@ -790,7 +995,7 @@ async function createEpoch3RuntimeFixture(label) {
     };
   } catch (error) {
     if (runtime) await runtime.close().catch(() => undefined);
-    await fs.rm(runtimeScopeRoot, { recursive: true, force: true });
+    await fs.rm(cleanupRoot, { recursive: true, force: true });
     throw error;
   }
 }

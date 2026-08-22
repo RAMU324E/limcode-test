@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
+import { toSqliteFilePath } from './sqliteFilePath';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
 import {
@@ -164,7 +165,7 @@ void start().catch((error) => {
 async function start(): Promise<void> {
   if (data.mode === 'initialize') {
     await mkdir(data.binding.paths.casRootPath, { recursive: false });
-    const database = new Database(data.binding.paths.databasePath, { fileMustExist: false });
+    const database = new Database(toSqliteFilePath(data.binding.paths.databasePath), { fileMustExist: false });
     try {
       configureWriterConnection(database);
       initializeCurrentSchema(database, data.binding);
@@ -176,11 +177,11 @@ async function start(): Promise<void> {
     return;
   }
 
-  const writer = new Database(data.binding.paths.databasePath, { fileMustExist: true });
+  const writer = new Database(toSqliteFilePath(data.binding.paths.databasePath), { fileMustExist: true });
   configureWriterConnection(writer);
   assertCurrentSchema(writer, data.binding);
   configureTransactionChangeCapture(writer);
-  const reader = new Database(data.binding.paths.databasePath, { readonly: true, fileMustExist: true });
+  const reader = new Database(toSqliteFilePath(data.binding.paths.databasePath), { readonly: true, fileMustExist: true });
   configureReaderConnection(reader);
   let commitSeq = 0n;
   let closed = false;

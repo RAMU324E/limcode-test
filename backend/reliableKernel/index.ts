@@ -49,6 +49,7 @@ export * from './rootAuthority';
 export * from './runtimeDeliveryContinuationIdentity';
 export * from './runtimeEpochMigration';
 export * from './runtimeManifestMigration';
+export * from './sqliteFilePath';
 export * from './runtimeDatabase';
 export * from './runtimeApplication';
 export * from './toolDispatcher';

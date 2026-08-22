@@ -21,6 +21,7 @@ import {
 import type { RuntimeDomainSchema } from './schema/types';
 import { migrateChildRuntimeDeliveryIntentLinks } from './runtimeDeliveryIntentLinkMigration';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
+import { toSqliteFilePath } from './sqliteFilePath';
 import {
   RootAuthority,
   RootAuthorityError,
@@ -49,8 +50,49 @@ export const PREVIOUS_RUNTIME_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = O
   RUNTIME_DOMAIN_SCHEMAS.filter((schema) => !ADDED_DOMAIN_KEYS.has(schema.key))
 );
 
+const PREVIOUS_MODEL_CONTEXT_PROJECTION_KEY = 'ModelContextProjection';
+export const EPOCH_3_MODEL_CONTEXT_DETAIL_SCHEMA_DIGEST =
+  '4c587475862e73a9bf2c172e29d92c047e0e60a674630ce5b54e2e921f00c760';
+export const EPOCH_3_MODEL_CONTEXT_SUMMARY_SCHEMA_DIGEST =
+  'f84996edbfcb6a9b62d9c42a5140cf279cf3d646e9a75872c52cbeb909c546a9';
+
+export const PREVIOUS_RUNTIME_MANIFEST_VARIANT_CONTRACTS = Object.freeze([
+  Object.freeze({
+    id: 'epoch-3-v0.0.10-v0.0.11',
+    modelContextProjectionClientMapping: 'detail' as const,
+    modelContextProjectionSchemaDigest: EPOCH_3_MODEL_CONTEXT_DETAIL_SCHEMA_DIGEST
+  }),
+  Object.freeze({
+    id: 'epoch-3-v0.0.12-v0.0.14',
+    modelContextProjectionClientMapping: 'summary' as const,
+    modelContextProjectionSchemaDigest: EPOCH_3_MODEL_CONTEXT_SUMMARY_SCHEMA_DIGEST
+  })
+]);
+
+interface PreviousRuntimeManifestVariant {
+  id: string;
+  schemas: readonly RuntimeDomainSchema[];
+  schemasByKey: ReadonlyMap<string, RuntimeDomainSchema>;
+}
+
+const PREVIOUS_RUNTIME_MANIFEST_VARIANTS: readonly PreviousRuntimeManifestVariant[] = Object.freeze(
+  PREVIOUS_RUNTIME_MANIFEST_VARIANT_CONTRACTS.map((contract) => {
+    const schemas = Object.freeze(PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.map((schema) =>
+      schema.key === PREVIOUS_MODEL_CONTEXT_PROJECTION_KEY
+        ? Object.freeze({ ...schema, client: contract.modelContextProjectionClientMapping })
+        : schema
+    ));
+    return Object.freeze({
+      id: contract.id,
+      schemas,
+      schemasByKey: new Map(schemas.map((schema) => [schema.key, schema]))
+    });
+  })
+);
+
 export type RuntimeEpochMigrationFaultPoint =
   | 'after-writer-fence'
+  | 'before-backup'
   | 'after-backup'
   | 'after-database-commit'
   | 'after-pointer-publication';
@@ -170,6 +212,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
     if (databaseState === 'previous') {
       await assertPreviousEpochRoot(previous);
       if (journal.state === 'fenced') {
+        await fault(options, 'before-backup');
         journal.databaseBackupSha256 = await ensureDatabaseBackup(controlRoot, journal);
         journal.state = 'backed_up';
         journal.updatedAt = new Date().toISOString();
@@ -271,7 +314,7 @@ async function assertPreviousEpochManifest(binding: HistoricalRootBinding): Prom
 }
 
 function assertPreviousEpochDatabaseFile(binding: HistoricalRootBinding): void {
-  const database = new Database(binding.paths.databasePath, { readonly: true, fileMustExist: true });
+  const database = new Database(toSqliteFilePath(binding.paths.databasePath), { readonly: true, fileMustExist: true });
   try {
     database.defaultSafeIntegers(true);
     assertPreviousEpochDatabase(database, binding);
@@ -308,23 +351,7 @@ function assertPreviousEpochDatabase(
   const rows = database.prepare(
     'SELECT * FROM schema_manifest ORDER BY domain_key'
   ).all() as Array<Record<string, unknown>>;
-  if (rows.length !== PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.length) {
-    throw new RootAuthorityError(
-      'runtime-epoch-migration-schema-mismatch',
-      'Epoch-3 schema manifest domain count is invalid.'
-    );
-  }
-  const byKey = new Map(PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.map((schema) => [schema.key, schema]));
-  for (const row of rows) {
-    const key = requireText(row.domain_key, 'schema_manifest.domain_key');
-    const schema = byKey.get(key);
-    if (!schema || !manifestMatches(row, schema, PREVIOUS_RUNTIME_KERNEL_EPOCH)) {
-      throw new RootAuthorityError(
-        'runtime-epoch-migration-schema-mismatch',
-        `Epoch-3 schema manifest mismatch for ${key}.`
-      );
-    }
-  }
+  assertPublishedPreviousEpochManifest(rows);
 
   const violations = database.pragma('foreign_key_check') as unknown[];
   if (violations.length > 0) {
@@ -340,7 +367,7 @@ async function migrateDatabase(
   previous: HistoricalRootBinding,
   next: RootBinding
 ): Promise<void> {
-  const database = new Database(file, { fileMustExist: true });
+  const database = new Database(toSqliteFilePath(file), { fileMustExist: true });
   try {
     database.defaultSafeIntegers(true);
     configureWriterConnection(database);
@@ -440,7 +467,7 @@ function inspectDatabaseBindingState(
   previous: HistoricalRootBinding,
   next: RootBinding
 ): 'previous' | 'current' | 'unknown' {
-  const database = new Database(file, { readonly: true, fileMustExist: true });
+  const database = new Database(toSqliteFilePath(file), { readonly: true, fileMustExist: true });
   try {
     database.defaultSafeIntegers(true);
     const row = database.prepare(
@@ -481,11 +508,15 @@ async function ensureDatabaseBackup(
     await fs.rm(temporary, { force: true });
     await removeSqliteSidecars(temporary);
     const source = new Database(
-      journal.previousBinding.paths.databasePath,
+      toSqliteFilePath(journal.previousBinding.paths.databasePath),
       { readonly: true, fileMustExist: true }
     );
     try {
-      await source.backup(temporary);
+      try {
+        await source.backup(toSqliteFilePath(temporary));
+      } catch (error) {
+        throw runtimeEpochBackupError('create', temporary, error);
+      }
     } finally {
       source.close();
     }
@@ -536,13 +567,24 @@ async function verifyExistingBackup(
 }
 
 function verifyBackupDatabase(file: string, previous: HistoricalRootBinding): void {
-  const database = new Database(file, { readonly: true, fileMustExist: true });
+  const database = new Database(toSqliteFilePath(file), { readonly: true, fileMustExist: true });
   try {
     database.defaultSafeIntegers(true);
     assertPreviousEpochDatabase(database, previous);
   } finally {
     database.close();
   }
+}
+
+function runtimeEpochBackupError(stage: string, file: string, cause: unknown): RootAuthorityError {
+  const code = typeof (cause as { code?: unknown } | null)?.code === 'string'
+    ? `; SQLite code ${(cause as { code: string }).code}`
+    : '';
+  return new RootAuthorityError(
+    'runtime-epoch-migration-backup-failed',
+    `Epoch-3 SQLite backup ${stage} failed${code}; path length ${file.length}.`,
+    cause
+  );
 }
 
 async function removeSqliteSidecars(file: string): Promise<void> {
@@ -743,6 +785,36 @@ function storedBindingMatches(
     && row.runtime_kernel_epoch === BigInt(expected.runtimeKernelEpoch);
 }
 
+function assertPublishedPreviousEpochManifest(rows: Array<Record<string, unknown>>): void {
+  if (rows.length !== PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.length) {
+    throw new RootAuthorityError(
+      'runtime-epoch-migration-schema-mismatch',
+      'Epoch-3 schema manifest domain count is invalid.'
+    );
+  }
+  for (const variant of PREVIOUS_RUNTIME_MANIFEST_VARIANTS) {
+    if (rows.every((row) => {
+      const key = requireText(row.domain_key, 'schema_manifest.domain_key');
+      const schema = variant.schemasByKey.get(key);
+      return Boolean(schema && manifestMatches(row, schema, PREVIOUS_RUNTIME_KERNEL_EPOCH));
+    })) return;
+  }
+  const mismatch = rows.find((row) => {
+    const key = requireText(row.domain_key, 'schema_manifest.domain_key');
+    return PREVIOUS_RUNTIME_MANIFEST_VARIANTS.every((variant) => {
+      const schema = variant.schemasByKey.get(key);
+      return !schema || !manifestMatches(row, schema, PREVIOUS_RUNTIME_KERNEL_EPOCH);
+    });
+  });
+  const key = mismatch
+    ? requireText(mismatch.domain_key, 'schema_manifest.domain_key')
+    : '<mixed-published-variants>';
+  throw new RootAuthorityError(
+    'runtime-epoch-migration-schema-mismatch',
+    `Epoch-3 schema manifest mismatch for ${key}.`
+  );
+}
+
 function manifestMatches(
   row: Record<string, unknown>,
   schema: RuntimeDomainSchema,
@@ -881,4 +953,20 @@ if (PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.length !== 87) {
   throw new Error(
     `Epoch-3 migration contract must contain 87 domains, found ${PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.length}.`
   );
+}
+
+for (const variant of PREVIOUS_RUNTIME_MANIFEST_VARIANTS) {
+  if (variant.schemas.length !== PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.length) {
+    throw new Error(`Epoch-3 published manifest variant ${variant.id} has an invalid domain count.`);
+  }
+  const modelContextProjection = variant.schemasByKey.get(PREVIOUS_MODEL_CONTEXT_PROJECTION_KEY);
+  const contract = PREVIOUS_RUNTIME_MANIFEST_VARIANT_CONTRACTS.find((candidate) => candidate.id === variant.id);
+  if (
+    !modelContextProjection
+    || !contract
+    || modelContextProjection.client !== contract.modelContextProjectionClientMapping
+    || domainSchemaDigest(modelContextProjection) !== contract.modelContextProjectionSchemaDigest
+  ) {
+    throw new Error(`Epoch-3 published manifest variant ${variant.id} fingerprint changed.`);
+  }
 }

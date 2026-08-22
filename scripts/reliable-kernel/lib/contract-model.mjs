@@ -442,12 +442,34 @@ function validateMigration(root, migration, failures) {
   for (const field of ['legacyRuntimeImport', 'dualWrite', 'fallbackToLegacyRuntime', 'runtimeProtocolNegotiation']) {
     if (migration?.[field] !== false) failures.push(`migration.${field}必须为false`);
   }
+  const expectedPublishedPredecessorManifestVariants = [
+    {
+      id: 'epoch-3-v0.0.10-v0.0.11',
+      extensionVersions: ['0.0.10', '0.0.11'],
+      domainKey: 'ModelContextProjection',
+      clientMapping: 'detail',
+      schemaDigest: '4c587475862e73a9bf2c172e29d92c047e0e60a674630ce5b54e2e921f00c760'
+    },
+    {
+      id: 'epoch-3-v0.0.12-v0.0.14',
+      extensionVersions: ['0.0.12', '0.0.13', '0.0.14'],
+      domainKey: 'ModelContextProjection',
+      clientMapping: 'summary',
+      schemaDigest: 'f84996edbfcb6a9b62d9c42a5140cf279cf3d646e9a75872c52cbeb909c546a9'
+    }
+  ];
   const boundedEpochUpgrade = migration?.boundedEpochUpgrade;
   if (
     boundedEpochUpgrade?.fromEpoch !== 3
     || boundedEpochUpgrade?.toEpoch !== 4
     || boundedEpochUpgrade?.mode !== 'offline-startup-exact-predecessor-only'
     || boundedEpochUpgrade?.sourcePolicy !== 'exact-table-index-trigger-manifest-and-binding-fingerprint'
+    || JSON.stringify(boundedEpochUpgrade?.publishedPredecessorManifestVariants)
+      !== JSON.stringify(expectedPublishedPredecessorManifestVariants)
+    || boundedEpochUpgrade?.variantPolicy
+      !== 'two-exact-published-manifest-fingerprints-only; all-other-domain-manifest-and-physical-fingerprints-identical'
+    || boundedEpochUpgrade?.sqliteNativePathPolicy
+      !== 'persist-canonical-root-binding-path-use-win32-namespaced-path-only-at-sqlite-io-boundary'
     || boundedEpochUpgrade?.backupPolicy !== 'sqlite-backup-api-plus-root-binding-and-epoch-manifest'
     || boundedEpochUpgrade?.recoveryPolicy !== 'durable-journal-forward-only'
     || boundedEpochUpgrade?.legacyChildContinuationPolicy

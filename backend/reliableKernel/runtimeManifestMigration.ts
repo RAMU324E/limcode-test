@@ -15,6 +15,7 @@ import {
 import type { RuntimeDomainSchema } from './schema/types';
 import { migrateChildRuntimeDeliveryIntentLinks } from './runtimeDeliveryIntentLinkMigration';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
+import { toSqliteFilePath } from './sqliteFilePath';
 
 const ADDITIVE_DOMAIN_KEY = 'RuntimeDeliveryIntentLink';
 
@@ -45,7 +46,7 @@ interface SupportedManifestPredecessor {
 export async function migrateCurrentRuntimeManifestIfRequired(
   binding: RootBinding
 ): Promise<RuntimeManifestMigrationResult> {
-  const database = new Database(binding.paths.databasePath, { fileMustExist: true });
+  const database = new Database(toSqliteFilePath(binding.paths.databasePath), { fileMustExist: true });
   try {
     configureWriterConnection(database);
     try {
