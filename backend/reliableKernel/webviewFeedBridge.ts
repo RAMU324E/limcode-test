@@ -75,6 +75,11 @@ interface TransientDelivery {
   resendCount: number;
 }
 
+interface PostedMessageDeliveryObserver {
+  onUndelivered(): void;
+  onRejected(error: unknown): void;
+}
+
 interface FeedClient {
   clientId: BridgeClientId;
   webview: vscode.Webview;
@@ -854,11 +859,12 @@ export class ReliableKernelWebviewFeedBridge {
       ackTimer: this.armTransientAckTimer(client, input.deliveryId)
     };
     client.transientDeliveries.set(input.deliveryId, delivery);
-    void client.webview.postMessage(plain).then((delivered) => {
-      if (delivered === false) this.failTransientDelivery(client, delivery, 'post_false');
-    }, (error) => {
-      this.onError(error, { clientId: client.clientId, operation: 'post' });
-      this.failTransientDelivery(client, delivery, 'post_rejected');
+    this.deliverPostedMessage(client, plain, false, undefined, {
+      onUndelivered: () => this.failTransientDelivery(client, delivery, 'post_false'),
+      onRejected: (error) => {
+        this.onError(error, { clientId: client.clientId, operation: 'post' });
+        this.failTransientDelivery(client, delivery, 'post_rejected');
+      }
     });
   }
 
@@ -1152,11 +1158,17 @@ export class ReliableKernelWebviewFeedBridge {
     client: FeedClient,
     plain: unknown,
     requestResponseMessage: boolean,
-    dataMessage?: ReliableDataDiagnostic
+    dataMessage?: ReliableDataDiagnostic,
+    deliveryObserver?: PostedMessageDeliveryObserver
   ): void {
     void client.webview.postMessage(plain).then(
       (delivered) => {
-        if (delivered !== false || client.closed) return;
+        if (delivered !== false) return;
+        if (deliveryObserver) {
+          deliveryObserver.onUndelivered();
+          return;
+        }
+        if (client.closed) return;
         if (requestResponseMessage) {
           this.onError(new Error('VS Code rejected reliable request-response postMessage delivery.'), {
             clientId: client.clientId,
@@ -1175,6 +1187,10 @@ export class ReliableKernelWebviewFeedBridge {
         this.retryOrSuspendDataPost(client, pending);
       },
       (error) => {
+        if (deliveryObserver) {
+          deliveryObserver.onRejected(error);
+          return;
+        }
         if (dataMessage && !dataMessage.emptyChanges) {
           this.diagnostics?.observe({
             eventKind: 'feed.data.post_failed',
