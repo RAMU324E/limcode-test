@@ -2,7 +2,7 @@
   "name": "limcode-test",
   "displayName": "Limcode Test",
   "description": "VS Code extension with a TypeScript ECS backend, Vue webview frontend, and a basic LLM chat flow.",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "publisher": "your-publisher",
   "private": true,
   "repository": {

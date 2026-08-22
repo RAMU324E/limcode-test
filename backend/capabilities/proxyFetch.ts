@@ -10,9 +10,8 @@ import * as http from 'http';
 import type * as net from 'net';
 import * as tls from 'tls';
 import { URL } from 'url';
-import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
+import { EXTENSION_USER_AGENT } from '../../shared/extensionIdentity';
 
-const USER_AGENT = EXTENSION_PACKAGE_NAME;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_OVERALL_TIMEOUT_MS = 15 * 60 * 1_000;
@@ -87,7 +86,7 @@ export function createProxyFetch(
     if (init?.headers) {
       new Headers(init.headers).forEach((value, key) => requestHeaders.set(key, value));
     }
-    if (!requestHeaders.has('user-agent')) requestHeaders.set('user-agent', USER_AGENT);
+    if (!requestHeaders.has('user-agent')) requestHeaders.set('user-agent', EXTENSION_USER_AGENT);
 
     const bodyBuffer = init?.body !== undefined
       ? await requestBodyBuffer(init.body)
