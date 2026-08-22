@@ -1761,6 +1761,57 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
   }
 });
 
+test('LLM capability adapter 在 Responses WS 结构化超时已有语义输出后切换 whole Attempt', async () => {
+  for (const phase of ['event_idle', 'response']) {
+    const events = [];
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter(
+      'provider-config',
+      fakeCapability((llmRequest, emit) => {
+        emit({
+          type: 'llm:thoughtDelta',
+          payload: { requestId: llmRequest.id, text: `discarded ${phase} thought` }
+        });
+        emit({
+          type: 'llm:error',
+          payload: {
+            requestId: llmRequest.id,
+            message: `OpenAI Responses WebSocket ${phase} timed out after 120000ms.`,
+            rawError: {
+              name: 'OpenAIResponsesWebSocketTimeoutError',
+              code: 'LLM_TRANSPORT_TIMEOUT',
+              transport: 'websocket',
+              phase,
+              timeoutMs: 120_000,
+              receivedServerEvent: true,
+              receivedSemanticOutput: true,
+              retryable: true,
+              transportAttemptsExhausted: false
+            }
+          }
+        });
+      })
+    );
+
+    await assert.rejects(
+      adapter.sendFullRequest(request(), {
+        onEvent: async (event) => {
+          events.push(event);
+          return { accepted: true, checkpointed: true, terminal: false };
+        }
+      }),
+      (error) => error instanceof kernel.ProviderTransientError
+        && error.reason === 'connection_interrupted'
+        && error.retryAfterOutput === true
+        && !/不自动重放请求/.test(error.message)
+    );
+    assert.deepEqual(
+      events.map((event) => event.kind),
+      ['output_delta'],
+      `${phase} 的非最终失败 Attempt 不得冻结 partial snapshot`
+    );
+  }
+});
+
 test('LLM capability adapter 不重试未配置的协议、数据及未知终态前关闭', async () => {
   for (const closeCode of [1002, 1003, 1004, 1007, 1009, 1010, 1016, 3000]) {
     const message = `OpenAI Responses WebSocket closed before terminal event: ${closeCode} permanent close`;

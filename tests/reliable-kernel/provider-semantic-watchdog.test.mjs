@@ -338,6 +338,85 @@ test('已收到文本、思考或工具输出后发生 semantic idle stall 会�
   }
 });
 
+test('Responses WS event_idle 在已有语义输出后废弃旧 Attempt 并自动恢复', async () => {
+  await withApp('provider-responses-ws-event-idle-retry', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'responses-ws-event-idle-retry');
+    const transientTerminals = [];
+    const requestContents = [];
+    let calls = 0;
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter(
+      'provider-watchdog',
+      llmCapability((llmRequest, emit) => {
+        calls += 1;
+        requestContents.push(llmRequest.contents);
+        if (calls === 1) {
+          emit({
+            type: 'llm:thoughtDelta',
+            payload: { requestId: llmRequest.id, text: 'discarded timeout thought' }
+          });
+          emit({
+            type: 'llm:error',
+            payload: {
+              requestId: llmRequest.id,
+              message: 'OpenAI Responses WebSocket event_idle timed out after 120000ms.',
+              rawError: {
+                name: 'OpenAIResponsesWebSocketTimeoutError',
+                code: 'LLM_TRANSPORT_TIMEOUT',
+                transport: 'websocket',
+                phase: 'event_idle',
+                timeoutMs: 120_000,
+                receivedServerEvent: true,
+                receivedSemanticOutput: true,
+                retryable: true,
+                transportAttemptsExhausted: false
+              }
+            }
+          });
+          return;
+        }
+        emit({
+          type: 'llm:done',
+          payload: { requestId: llmRequest.id, content: modelContent('recovered after event_idle') }
+        });
+      })
+    );
+
+    const result = await controlPlane(app, {
+      semanticTimeouts: { firstSemanticMs: 1_000, semanticIdleMs: 1_000 }
+    }).dispatch(request.modelRequestId, adapter, {
+      onTransientTerminal: (event) => transientTerminals.push(event)
+    });
+
+    assert.equal(result.terminalState, 'completed');
+    assert.equal(calls, 2);
+    assert.deepEqual(requestContents[1], requestContents[0],
+      'whole-Attempt replacement must preserve the frozen durable Context input');
+    const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
+    assert.equal(durableRequest.terminal_state, 'completed');
+    assert.equal(durableRequest.stream_stats_json.attemptSeq, '2');
+    const operation = (await list(app, 'Operation', {
+      owner_kind: 'model_request', owner_id: request.modelRequestId
+    }))[0];
+    const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
+      .slice()
+      .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+    assert.deepEqual(attempts.map((entry) => entry.status), ['transient_failed', 'completed']);
+    assert.ok(transientTerminals.some((terminal) =>
+      terminal.attemptSeq === '1'
+      && terminal.event.content.terminalState === 'provider_transient_connection_interrupted'
+      && terminal.event.content.retrying === true
+      && terminal.event.content.discardOutput === true
+    ));
+    const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+    assert.deepEqual(completed.content, modelContent('recovered after event_idle'));
+    const checkpoints = await list(app, 'ModelStreamCheckpoint', {
+      model_request_id: request.modelRequestId
+    });
+    assert.ok(checkpoints.every((checkpoint) => checkpoint.attempt_seq === 2n),
+      'successful recovery must prune the timed-out Attempt checkpoint');
+  });
+});
+
 test('普通 transient error 在已有语义输出后仍不盲目重放', async () => {
   await withApp('provider-generic-no-replay-after-output', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'generic-no-replay-after-output');

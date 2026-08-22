@@ -714,6 +714,7 @@ function enrichModelMessages(
 }
 
 function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClientRecord): void {
+  const requestId = text(request.id);
   const turnId = text(request.turn_id);
   const model = text(request.model_id);
   const usageMetadata = usageMetadataFromRequest(request);
@@ -727,6 +728,11 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
   const materializationStatus: MessageRecord['status'] = request.status === 'terminal'
     ? request.terminal_state === 'completed' ? 'final' : 'partial'
     : 'streaming';
+  const retryTarget = request.status === 'terminal'
+    && request.terminal_state !== 'completed'
+    && requestId
+    ? { kind: 'model_request' as const, modelRequestId: requestId }
+    : entry.message.retryTarget;
   // ModelRequestMessageLink is an additional authoritative live association. Keep using its Turn
   // identity even though MessageTurnLink now also arrives incrementally: commits may expose the
   // request/message fact first, and projection must remain correct at every atomic feed frontier.
@@ -734,6 +740,7 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
   entry.message = {
     ...entry.message,
     status: materializationStatus,
+    ...(retryTarget ? { retryTarget } : {}),
     ...(model ? { model } : {}),
     ...(usageMetadata ? { usageMetadata } : {}),
     ...((providerStartedAt || timestamp(request.created_at)) > 0

@@ -124,7 +124,7 @@ test('reliable projection restores model, usage, tool facts and exact failed ter
             completedAt: 1_767_225_601_500,
             streamOutputDurationMs: 250
           },
-          status: 'terminal', created_at: '2026-08-03T00:00:01.000Z'
+          status: 'terminal', terminal_state: 'completed', created_at: '2026-08-03T00:00:01.000Z'
         }
       },
       ModelRequestMessageLink: {
@@ -1052,6 +1052,50 @@ test('the latest failed terminal partial retains exact model_request retry ident
     }
   });
   const partial = projection.messages.find((message) => message.id === 'transient:request-failed');
+  assert.equal(partial?.status, 'partial');
+  assert.deepEqual(partial?.retryTarget, { kind: 'model_request', modelRequestId: 'request-failed' });
+});
+
+test('a durable failed partial retries its ModelRequest instead of the Context-excluded Message', () => {
+  const projection = projectReliableConversation({
+    conversationId: 'conversation-a',
+    records: {
+      Message: {
+        user: {
+          id: 'user', conversation_id: 'conversation-a', message_seq: '1', revision_id: 'revision-user',
+          role: 'user', created_at: '2026-08-03T00:00:00.000Z'
+        },
+        failed: {
+          id: 'message-failed', conversation_id: 'conversation-a', message_seq: '2',
+          revision_id: 'revision-failed', role: 'model', created_at: '2026-08-03T00:00:01.000Z'
+        }
+      },
+      MessageTurnLink: {
+        user: { id: 'user-turn', message_id: 'user', turn_id: 'turn-a', role: 'input' },
+        failed: { id: 'failed-turn', message_id: 'message-failed', turn_id: 'turn-a', role: 'model' }
+      },
+      ModelRequest: {
+        failed: {
+          id: 'request-failed', turn_id: 'turn-a', request_seq: '3', provider_id: 'provider-a',
+          model_id: 'gpt-5.6-sol', status: 'terminal', terminal_state: 'provider_failed',
+          created_at: '2026-08-03T00:00:01.000Z'
+        }
+      },
+      ModelRequestMessageLink: {
+        failed: {
+          id: 'request-message-failed', model_request_id: 'request-failed', message_id: 'message-failed'
+        }
+      }
+    },
+    details: {
+      'message-content:revision-user': ready(JSON.stringify({ role: 'user', parts: [{ text: 'go' }] })),
+      'message-content:revision-failed': ready(JSON.stringify({
+        role: 'model', parts: [{ text: 'usable failed partial' }]
+      }))
+    }
+  });
+
+  const partial = projection.messages.find((message) => message.id === 'message-failed');
   assert.equal(partial?.status, 'partial');
   assert.deepEqual(partial?.retryTarget, { kind: 'model_request', modelRequestId: 'request-failed' });
 });

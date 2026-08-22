@@ -70,6 +70,14 @@ interface ToolCallOutput {
 
 const CURRENT_TURN_INPUT_REINJECTION_LABEL =
   '[当前 Turn 原始用户要求/数据，不是新用户输入；以下各 part 为冻结原文。]';
+const OPENAI_RESPONSES_WEBSOCKET_TIMEOUT_PHASES = new Set([
+  'handshake',
+  'send',
+  'health_probe',
+  'first_event',
+  'event_idle',
+  'response'
+]);
 
 /** 把现有无状态 LLM capability 适配为可靠内核 full-request Provider 边界。 */
 export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapter {
@@ -1819,6 +1827,7 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
+  const openAIResponsesWebSocketTimeout = isStructuredOpenAIResponsesWebSocketTimeout(raw);
   const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
     signature,
     findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
@@ -1834,6 +1843,12 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   if (preTerminalWebSocketClose?.retryable === false) return new Error(message);
   if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
     return new Error(message);
+  }
+  // This timeout comes from the Responses WS session state machine, not from an arbitrary error
+  // string. A new reliable Attempt owns a fresh transient accumulator, so it may replace any
+  // uncommitted semantic output from the timed-out Attempt without replaying completed tools.
+  if (openAIResponsesWebSocketTimeout) {
+    return new ProviderTransientError('connection_interrupted', message, true);
   }
   if (receivedSemanticOutput === true) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
@@ -1860,6 +1875,32 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
     return new ProviderTransientError('connection_interrupted', message);
   }
   return new Error(message);
+}
+
+function isStructuredOpenAIResponsesWebSocketTimeout(
+  value: unknown,
+  depth = 0,
+  seen = new Set<object>()
+): boolean {
+  if (depth > 6 || value === null || value === undefined || typeof value !== 'object' || seen.has(value)) {
+    return false;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, 32).some((entry) =>
+      isStructuredOpenAIResponsesWebSocketTimeout(entry, depth + 1, seen));
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.code === 'LLM_TRANSPORT_TIMEOUT'
+    && record.transport === 'websocket'
+    && typeof record.phase === 'string'
+    && OPENAI_RESPONSES_WEBSOCKET_TIMEOUT_PHASES.has(record.phase)
+  ) {
+    return true;
+  }
+  return Object.values(record).slice(0, 32).some((nested) =>
+    isStructuredOpenAIResponsesWebSocketTimeout(nested, depth + 1, seen));
 }
 
 function compactProviderError(payload: Record<string, unknown> | undefined): Error {
