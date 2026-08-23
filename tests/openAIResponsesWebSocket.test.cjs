@@ -475,16 +475,24 @@ test('OpenAI-compatible Gemini 3 round-trips function-call thought signatures', 
   const signed = provider.format.encodeRequest({
     contents: [{
       role: 'model',
-      parts: [{
-        functionCall: { name: 'update_task_list', args: {}, callId: 'call-signed' },
-        thoughtSignatures: { gemini: 'real-signature' }
-      }]
+      parts: [
+        {
+          functionCall: { name: 'update_task_list', args: {}, callId: 'call-signed' },
+          thoughtSignatures: { gemini: 'real-signature' }
+        },
+        { functionCall: { name: 'read', args: {}, callId: 'call-signed-parallel' } }
+      ]
     }]
   }, false);
   assert.equal(
     signed.messages[0].tool_calls[0].extra_content.google.thought_signature,
     'real-signature'
   );
+  assert.equal(
+    signed.messages[0].tool_calls[0].extra_content.google.thoughtSignature,
+    'real-signature'
+  );
+  assert.equal(signed.messages[0].tool_calls[1].extra_content, undefined);
 
   const transferred = provider.format.encodeRequest({
     contents: [{
@@ -499,7 +507,10 @@ test('OpenAI-compatible Gemini 3 round-trips function-call thought signatures', 
     transferred.messages[0].tool_calls[0].extra_content.google.thought_signature,
     'skip_thought_signature_validator'
   );
-  assert.equal(transferred.messages[0].tool_calls[1].extra_content, undefined);
+  assert.equal(
+    transferred.messages[0].tool_calls[1].extra_content.google.thought_signature,
+    'skip_thought_signature_validator'
+  );
 
   const decoded = provider.format.decodeResponse({
     choices: [{
@@ -509,7 +520,7 @@ test('OpenAI-compatible Gemini 3 round-trips function-call thought signatures', 
           id: 'call-response',
           type: 'function',
           function: { name: 'update_task_list', arguments: '{}' },
-          extra_content: { google: { thought_signature: 'response-signature' } }
+          extra_content: { google: { thoughtSignature: 'response-signature' } }
         }]
       },
       finish_reason: 'tool_calls'
@@ -561,6 +572,10 @@ test('OpenAI-compatible Gemini 3 dry-run fills missing transferred signatures', 
   });
   assert.equal(
     result.body.messages[0].tool_calls[0].extra_content.google.thought_signature,
+    'skip_thought_signature_validator'
+  );
+  assert.equal(
+    result.body.messages[0].tool_calls[0].extra_content.google.thoughtSignature,
     'skip_thought_signature_validator'
   );
 });

@@ -4722,16 +4722,25 @@ function attachGeminiOpenAIThoughtSignaturesToRequest(encoded: unknown, source: 
   for (let groupIndex = 0; groupIndex < Math.min(encodedCallGroups.length, sourceCallGroups.length); groupIndex += 1) {
     const encodedCalls = encodedCallGroups[groupIndex];
     const sourceCalls = sourceCallGroups[groupIndex];
+    const sourceSignatures = sourceCalls.map(geminiSignatureFromUnifiedPart);
+    const transferredGroup = sourceSignatures.every((signature) => !signature);
     for (let callIndex = 0; callIndex < Math.min(encodedCalls.length, sourceCalls.length); callIndex += 1) {
-      const signature = geminiSignatureFromUnifiedPart(sourceCalls[callIndex])
-        ?? (callIndex === 0 ? GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR : undefined);
+      const signature = sourceSignatures[callIndex]
+        ?? (transferredGroup ? GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR : undefined);
       if (!signature) continue;
       const toolCall = encodedCalls[callIndex];
       const extraContent = isRecord(toolCall.extra_content) ? toolCall.extra_content : {};
       const google = isRecord(extraContent.google) ? extraContent.google : {};
+      const attachedSignature = normalizedSignatureString(google.thought_signature)
+        ?? normalizedSignatureString(google.thoughtSignature)
+        ?? signature;
       toolCall.extra_content = {
         ...extraContent,
-        google: { ...google, thought_signature: normalizedSignatureString(google.thought_signature) ?? signature }
+        google: {
+          ...google,
+          thought_signature: attachedSignature,
+          thoughtSignature: attachedSignature
+        }
       };
     }
   }
@@ -4761,12 +4770,12 @@ function readGeminiOpenAIToolCallSignatures(raw: unknown, stream: boolean): Gemi
 
 function geminiOpenAIToolCallSignature(toolCall: Record<string, unknown>): string | undefined {
   const extraContent = isRecord(toolCall.extra_content) ? toolCall.extra_content : undefined;
-  const google = isRecord(extraContent?.google)
-    ? extraContent.google
-    : isRecord(extraContent?.vertex)
-      ? extraContent.vertex
-      : undefined;
-  return normalizedSignatureString(google?.thought_signature);
+  const google = isRecord(extraContent?.google) ? extraContent.google : undefined;
+  const vertex = isRecord(extraContent?.vertex) ? extraContent.vertex : undefined;
+  return normalizedSignatureString(google?.thought_signature)
+    ?? normalizedSignatureString(google?.thoughtSignature)
+    ?? normalizedSignatureString(vertex?.thought_signature)
+    ?? normalizedSignatureString(vertex?.thoughtSignature);
 }
 
 function attachGeminiSignaturesToUnifiedCalls(
