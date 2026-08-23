@@ -24,6 +24,7 @@ const {
   dryRunCompactLlmProvider,
   dryRunLlmProvider,
   emitUnifiedChunk,
+  installGeminiOpenAICompatibleThoughtSignatures,
   startLlmProvider
 } = require('../dist/extension/backend/capabilities/llmProvider.js');
 const {
@@ -464,6 +465,142 @@ async function dryRunGeminiThinkingConfig(config, id) {
   const result = await dryRunLlmProvider(chatRequest(id), { settings: async () => config });
   return result.body.generationConfig?.thinkingConfig;
 }
+
+test('OpenAI-compatible Gemini 3 round-trips function-call thought signatures', async () => {
+  const unified = await import('unified-llm-provider');
+  const provider = installGeminiOpenAICompatibleThoughtSignatures({
+    format: new unified.OpenAICompatibleFormat('firebase/gemini-3.7-flash')
+  }, 'openai-compatible', 'firebase/gemini-3.7-flash');
+
+  const signed = provider.format.encodeRequest({
+    contents: [{
+      role: 'model',
+      parts: [{
+        functionCall: { name: 'update_task_list', args: {}, callId: 'call-signed' },
+        thoughtSignatures: { gemini: 'real-signature' }
+      }]
+    }]
+  }, false);
+  assert.equal(
+    signed.messages[0].tool_calls[0].extra_content.google.thought_signature,
+    'real-signature'
+  );
+
+  const transferred = provider.format.encodeRequest({
+    contents: [{
+      role: 'model',
+      parts: [
+        { functionCall: { name: 'update_task_list', args: {}, callId: 'call-transferred' } },
+        { functionCall: { name: 'read', args: {}, callId: 'call-parallel' } }
+      ]
+    }]
+  }, false);
+  assert.equal(
+    transferred.messages[0].tool_calls[0].extra_content.google.thought_signature,
+    'skip_thought_signature_validator'
+  );
+  assert.equal(transferred.messages[0].tool_calls[1].extra_content, undefined);
+
+  const decoded = provider.format.decodeResponse({
+    choices: [{
+      message: {
+        content: null,
+        tool_calls: [{
+          id: 'call-response',
+          type: 'function',
+          function: { name: 'update_task_list', arguments: '{}' },
+          extra_content: { google: { thought_signature: 'response-signature' } }
+        }]
+      },
+      finish_reason: 'tool_calls'
+    }]
+  });
+  assert.equal(decoded.content.parts[0].thoughtSignatures.gemini, 'response-signature');
+
+  const streamState = provider.format.createStreamState();
+  const chunk = provider.format.decodeStreamChunk({
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: 'call-stream',
+          type: 'function',
+          function: { name: 'update_task_list', arguments: '{}' },
+          extra_content: { google: { thought_signature: 'stream-signature' } }
+        }]
+      },
+      finish_reason: 'tool_calls'
+    }]
+  }, streamState);
+  const streamedCall = [...(chunk.functionCalls ?? []), ...(chunk.partsDelta ?? [])]
+    .find((part) => part.functionCall?.callId === 'call-stream');
+  assert.equal(streamedCall.thoughtSignatures.gemini, 'stream-signature');
+});
+
+test('OpenAI-compatible Gemini 3 dry-run fills missing transferred signatures', async () => {
+  const request = chatRequest('gemini-openai-compatible-signature');
+  request.contents = [
+    {
+      role: 'model',
+      parts: [{ id: 'call-transferred', functionCall: { name: 'update_task_list', args: {} } }]
+    },
+    {
+      role: 'user',
+      parts: [{
+        id: 'call-transferred',
+        functionResponse: { name: 'update_task_list', response: { ok: true } }
+      }]
+    }
+  ];
+  const result = await dryRunLlmProvider(request, {
+    settings: async () => providerConfig({
+      provider: 'openai-compatible',
+      model: 'firebase/gemini-3.7-flash',
+      models: []
+    })
+  });
+  assert.equal(
+    result.body.messages[0].tool_calls[0].extra_content.google.thought_signature,
+    'skip_thought_signature_validator'
+  );
+});
+
+test('Gemini dry-run merges split parallel function responses into one turn', async () => {
+  const request = chatRequest('gemini-parallel-tool-responses');
+  request.contents = [
+    {
+      role: 'model',
+      parts: [
+        {
+          id: 'call-read-a',
+          functionCall: { name: 'read', args: { path: 'a.txt' } },
+          thoughtSignature: 'gemini:parallel-signature'
+        },
+        { id: 'call-read-b', functionCall: { name: 'read', args: { path: 'b.txt' } } }
+      ]
+    },
+    {
+      role: 'user',
+      parts: [{ id: 'call-read-a', functionResponse: { name: 'read', response: { ok: true } } }]
+    },
+    {
+      role: 'user',
+      parts: [{ id: 'call-read-b', functionResponse: { name: 'read', response: { ok: true } } }]
+    },
+    { role: 'user', parts: [{ text: 'continue' }] }
+  ];
+
+  const result = await dryRunLlmProvider(request, {
+    settings: async () => geminiProviderConfig()
+  });
+
+  assert.equal(result.body.contents.length, 3);
+  assert.deepEqual(
+    result.body.contents[1].parts.map((part) => part.functionResponse?.id),
+    ['call-read-a', 'call-read-b']
+  );
+  assert.equal(result.body.contents[2].parts[0].text, 'continue');
+});
 
 test('Gemini thinking capability follows model-specific official level sets', () => {
   assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3.7-flash'), {

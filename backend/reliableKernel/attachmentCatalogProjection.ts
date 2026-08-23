@@ -344,23 +344,24 @@ export class AttachmentCatalogProjection {
     const resultIds = sources
       .filter((source) => source.source_kind === 'tool_model_result')
       .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id'));
-    await this.primeDomainRows('ToolModelResult', resultIds, this.toolResultCache);
+    await this.primeDomainRows('ToolModelResult', resultIds, this.toolResultCache, false);
     const toolCallIds = [
       ...sources.filter((source) => source.source_kind === 'tool_call')
         .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
-      ...resultIds.map((resultId) => requireId(
-        this.toolResultCache.get(resultId)?.tool_call_id,
-        `ToolModelResult ${resultId}.tool_call_id`
-      ))
+      ...resultIds.flatMap((resultId) => {
+        const result = this.toolResultCache.get(resultId);
+        return result ? [requireId(result.tool_call_id, `ToolModelResult ${resultId}.tool_call_id`)] : [];
+      })
     ];
-    await this.primeDomainRows('ToolCall', toolCallIds, this.toolCallCache);
+    await this.primeDomainRows('ToolCall', toolCallIds, this.toolCallCache, false);
     await this.primeDomainRows(
       'Turn',
-      toolCallIds.map((toolCallId) => requireId(
-        this.toolCallCache.get(toolCallId)?.turn_id,
-        `ToolCall ${toolCallId}.turn_id`
-      )),
-      this.turnCache
+      toolCallIds.flatMap((toolCallId) => {
+        const toolCall = this.toolCallCache.get(toolCallId);
+        return toolCall ? [requireId(toolCall.turn_id, `ToolCall ${toolCallId}.turn_id`)] : [];
+      }),
+      this.turnCache,
+      false
     );
   }
 
@@ -411,7 +412,7 @@ export class AttachmentCatalogProjection {
     }
     if (sourceKind === 'tool_model_result') {
       const result = this.toolResultCache.get(sourceId);
-      if (!result) throw new Error(`ToolModelResult ${sourceId} cache was not primed.`);
+      if (!result) return false;
       return this.toolCallBelongsToConversation(
         requireId(result.tool_call_id, `ToolModelResult ${sourceId}.tool_call_id`),
         conversationId
@@ -433,11 +434,10 @@ export class AttachmentCatalogProjection {
 
   private toolCallBelongsToConversation(toolCallId: string, conversationId: string): boolean {
     const toolCall = this.toolCallCache.get(toolCallId);
-    if (!toolCall) throw new Error(`ToolCall ${toolCallId} cache was not primed.`);
+    if (!toolCall) return false;
     const turnId = requireId(toolCall.turn_id, `ToolCall ${toolCallId}.turn_id`);
     const turn = this.turnCache.get(turnId);
-    if (!turn) throw new Error(`Turn ${turnId} cache was not primed.`);
-    return turn.conversation_id === conversationId;
+    return turn?.conversation_id === conversationId;
   }
 
   private async primeRevisionLinks(revisionIds: readonly string[]): Promise<void> {
@@ -464,7 +464,8 @@ export class AttachmentCatalogProjection {
   private async primeDomainRows(
     domain: string,
     ids: readonly string[],
-    cache: Map<string, DomainRow>
+    cache: Map<string, DomainRow>,
+    required = true
   ): Promise<void> {
     const missing = [...new Set(ids)].filter((id) => !cache.has(id));
     for (let offset = 0; offset < missing.length; offset += 128) {
@@ -474,7 +475,10 @@ export class AttachmentCatalogProjection {
       ));
       batch.forEach((id, index) => {
         const row = result.snapshot[index];
-        if (!row || Array.isArray(row)) throw new Error(`${domain} ${id} does not exist.`);
+        if (!row || Array.isArray(row)) {
+          if (required) throw new Error(`${domain} ${id} does not exist.`);
+          return;
+        }
         cache.set(id, row);
       });
     }
