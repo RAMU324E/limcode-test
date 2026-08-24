@@ -7,10 +7,10 @@ import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import {
   decideInterruptWatchdog,
+  decideTurnInputWithdrawal,
   interruptTargetHasSettled,
   type ReliableInterruptPhase
-} from '@webview/domain/reliableInterruptLifecycle';
-import { decideTurnInputWithdrawal } from '@webview/domain/reliableTurnInputWithdrawal';
+} from '@shared/reliableControlLifecycle';
 import { toStructuredClonePlainData } from '@shared/plainData';
 import {
   createMessageId,

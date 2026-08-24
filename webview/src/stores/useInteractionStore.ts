@@ -15,7 +15,7 @@ import {
 import {
   decideInteractionResolution,
   type InteractionResolutionDecision
-} from '@webview/domain/interactionOutbox';
+} from '@shared/reliableControlLifecycle';
 import { bridge } from '@webview/transport';
 
 const RESPONSE_TIMEOUT_MS = 8_000;

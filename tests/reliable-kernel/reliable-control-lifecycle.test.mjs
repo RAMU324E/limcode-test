@@ -2,17 +2,16 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import {
-  decideInteractionResolution
-} from '../../webview/src/domain/interactionOutbox.ts';
-import {
-  decideInterruptWatchdog
-} from '../../webview/src/domain/reliableInterruptLifecycle.ts';
-import {
-  decideTurnInputWithdrawal
-} from '../../webview/src/domain/reliableTurnInputWithdrawal.ts';
 
 const root = process.cwd();
+const {
+  decideInteractionResolution,
+  decideInterruptWatchdog,
+  decideTurnInputWithdrawal
+} = await import(pathToFileURL(path.join(
+  root,
+  'dist/extension/shared/reliableControlLifecycle.js'
+)).href);
 const {
   createSubmitPlanToolOutput,
   planProposalStatusToDecision,

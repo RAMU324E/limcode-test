@@ -30,6 +30,7 @@
     "backend/application/reliableKernel/**/*.ts",
     "backend/application/mcpRuntimeManager.ts",
     "backend/application/runtimeBuildInfo.ts",
+    "shared/reliableControlLifecycle.ts",
     "vscode/**/*.ts"
   ],
   "exclude": [

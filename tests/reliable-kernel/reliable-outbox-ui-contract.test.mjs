@@ -105,7 +105,7 @@ test('乐观等待消息撤回在 receipt 可见前不重放，提交竞态收�
 
 test('停止 outbox 持久化后投递，超时重同步并以同一命令有限重放', () => {
   const chat = read('webview/src/composables/useChat.ts');
-  const lifecycle = read('webview/src/domain/reliableInterruptLifecycle.ts');
+  const lifecycle = read('shared/reliableControlLifecycle.ts');
   const standaloneSend = chat.slice(
     chat.indexOf('function sendStandaloneInterrupt'),
     chat.indexOf('function sendForkRequest')
