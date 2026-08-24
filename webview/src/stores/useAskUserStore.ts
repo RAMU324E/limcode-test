@@ -17,9 +17,6 @@ interface AskUserStoreState {
   drafts: Record<string, AskUserDraftState>;
 }
 
-const submitTimers = new Map<string, number>();
-const SUBMIT_CONFIRM_TIMEOUT_MS = 6_000;
-
 export const useAskUserStore = defineStore('askUser', {
   state: (): AskUserStoreState => ({
     drafts: {}
@@ -88,53 +85,50 @@ export const useAskUserStore = defineStore('askUser', {
         submittingAction: 'answer',
         error: undefined
       };
-      const accepted = useInteractionStore().resolve(target, 'submit', {
+      const resolution = useInteractionStore().resolve(target, 'submit', {
         answer: plainAnswer(answer)
       } as unknown as JsonValue);
-      if (!accepted) {
-        this.drafts[toolCallId] = { ...current, submitting: false, submittingAction: undefined, error: '问题状态已变化，请等待同步后重试。' };
+      if (!resolution.accepted) {
+        this.drafts[toolCallId] = {
+          ...current,
+          submitting: false,
+          submittingAction: undefined,
+          error: resolution.message
+        };
         return false;
       }
-      this.scheduleSubmitTimeout(toolCallId);
       return true;
     },
     cancel(toolCallId: string, target: InteractionResolveTarget): void {
       const current = this.draftFor(toolCallId);
       if (current.submitting) return;
       this.drafts[toolCallId] = { ...current, submitting: true, submittingAction: 'cancel', error: undefined };
-      const accepted = useInteractionStore().resolve(target, 'cancel', { reason: '用户取消了问题。' });
-      if (!accepted) {
-        this.drafts[toolCallId] = { ...current, submitting: false, submittingAction: undefined, error: '问题状态已变化，请等待同步后重试。' };
+      const resolution = useInteractionStore().resolve(target, 'cancel', { reason: '用户取消了问题。' });
+      if (!resolution.accepted) {
+        this.drafts[toolCallId] = {
+          ...current,
+          submitting: false,
+          submittingAction: undefined,
+          error: resolution.message
+        };
         return;
       }
-      this.scheduleSubmitTimeout(toolCallId);
     },
     clearDraft(toolCallId: string): void {
-      const timer = submitTimers.get(toolCallId);
-      if (timer !== undefined) window.clearTimeout(timer);
-      submitTimers.delete(toolCallId);
       if (!(toolCallId in this.drafts)) return;
       const next = { ...this.drafts };
       delete next[toolCallId];
       this.drafts = next;
     },
-    scheduleSubmitTimeout(toolCallId: string): void {
-      const existing = submitTimers.get(toolCallId);
-      if (existing !== undefined) window.clearTimeout(existing);
-      const timer = window.setTimeout(() => {
-        submitTimers.delete(toolCallId);
-        const current = this.drafts[toolCallId];
-        if (!current?.submitting) return;
-        this.drafts[toolCallId] = {
-          ...current,
-          submitting: false,
-          submittingAction: undefined,
-          error: current.submittingAction === 'cancel'
-            ? '取消暂未得到确认，请重试。'
-            : '提交暂未得到确认，请重试。'
-        };
-      }, SUBMIT_CONFIRM_TIMEOUT_MS);
-      submitTimers.set(toolCallId, timer);
+    releaseSubmission(toolCallId: string, message: string): void {
+      const current = this.drafts[toolCallId];
+      if (!current?.submitting) return;
+      this.drafts[toolCallId] = {
+        ...current,
+        submitting: false,
+        submittingAction: undefined,
+        error: message
+      };
     }
   }
 });

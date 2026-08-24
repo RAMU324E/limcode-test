@@ -6,7 +6,16 @@ import type {
   InteractionOwnerLinkRecord,
   JsonValue
 } from '@shared/conversationReliability';
-import { BridgeMessageType, createMessageId, type InteractionResultPayload } from '@shared/protocol';
+import {
+  BridgeMessageType,
+  createMessageId,
+  type InteractionOutcomeStatus,
+  type InteractionResultPayload
+} from '@shared/protocol';
+import {
+  decideInteractionResolution,
+  type InteractionResolutionDecision
+} from '@webview/domain/interactionOutbox';
 import { bridge } from '@webview/transport';
 
 const RESPONSE_TIMEOUT_MS = 8_000;
@@ -33,7 +42,21 @@ export interface PendingInteractionResolution {
   sentClientId?: string;
   sentGeneration?: string;
   automaticRetryCount?: number;
+  phase: 'submitting' | 'uncertain';
+  lastError?: string;
 }
+
+export type InteractionResolveResult =
+  | {
+      accepted: true;
+      mode: 'created' | 'replayed' | 'superseded';
+      message?: string;
+    }
+  | {
+      accepted: false;
+      code: 'request_ended' | 'decision_not_allowed' | 'decision_in_flight';
+      message: string;
+    };
 
 export interface ObservedInteractionResult {
   payload: InteractionResultPayload;
@@ -45,6 +68,10 @@ export interface ObservedInteractionResult {
 const responseTimers = new Map<string, number>();
 const retryTimers = new Map<string, number>();
 const sentThisBoot = new Set<string>();
+const supersededRequests = new Map<string, {
+  interactionRequestId: string;
+  decision: DurableInteractionDecision;
+}>();
 
 /**
  * Interaction 请求和最终 response 仍以可靠 Runtime 为权威；这里是 Webview 的持久发送箱。
@@ -57,26 +84,37 @@ export const useInteractionStore = defineStore('interactions', () => {
   const pendingResolutions = computed(() => Object.values(pending)
     .sort((left, right) => left.startedAt - right.startedAt || left.interactionRequestId.localeCompare(right.interactionRequestId)));
 
-  function resolve(target: InteractionResolveTarget, decision: DurableInteractionDecision, response: JsonValue): boolean {
+  function resolve(
+    target: InteractionResolveTarget,
+    decision: DurableInteractionDecision,
+    response: JsonValue
+  ): InteractionResolveResult {
     const { request, owner } = target;
-    if (request.state !== 'pending' || !request.choices.includes(decision)) return false;
     const frozenResponse = cloneJson(response);
     const existing = pending[request.id];
-    if (existing) {
-      if (
-        existing.interactionRevision !== request.revision
-        || existing.ownerTurnId !== owner.turnId
-        || existing.conversationId !== owner.conversationId
-        || existing.decision !== decision
-        || JSON.stringify(existing.response) !== JSON.stringify(frozenResponse)
-      ) return false;
+    const admission = decideInteractionResolution({
+      requestState: request.state,
+      choices: request.choices,
+      ...(existing ? { existing } : {}),
+      existingSubmitting: !!submitting[request.id],
+      interactionRevision: request.revision,
+      ownerTurnId: owner.turnId,
+      conversationId: owner.conversationId,
+      decision,
+      response: frozenResponse
+    });
+    if (admission.kind === 'rejected' || admission.kind === 'blocked') {
+      return rejectedResolutionResult(admission, request.state, request.choices.includes(decision));
+    }
+    if (admission.kind === 'replay' && existing) {
       postResolution(existing, {
         force: true,
         showSubmitting: true,
         resetRetryBudget: true
       });
-      return true;
+      return { accepted: true, mode: 'replayed' };
     }
+    if (admission.kind === 'supersede' && existing) retireSupersededResolution(existing);
 
     const record: PendingInteractionResolution = {
       interactionRequestId: request.id,
@@ -86,7 +124,8 @@ export const useInteractionStore = defineStore('interactions', () => {
       decision,
       response: frozenResponse,
       requestId: createMessageId(),
-      startedAt: Date.now()
+      startedAt: Date.now(),
+      phase: 'submitting'
     };
     pending[request.id] = record;
     // The outbox must exist before postMessage: a synchronous host response or process exit cannot
@@ -97,7 +136,31 @@ export const useInteractionStore = defineStore('interactions', () => {
       showSubmitting: true,
       resetRetryBudget: true
     });
-    return true;
+    return admission.kind === 'supersede'
+      ? {
+          accepted: true,
+          mode: 'superseded',
+          message: '已替换本地尚未确认的决定；最终仍以服务端最先落盘的结果为准。'
+        }
+      : { accepted: true, mode: 'created' };
+  }
+
+  function retireSupersededResolution(record: PendingInteractionResolution): void {
+    clearResponseTimer(record.interactionRequestId);
+    clearRetryTimer(record.interactionRequestId);
+    delete submitting[record.interactionRequestId];
+    supersededRequests.set(record.requestId, {
+      interactionRequestId: record.interactionRequestId,
+      decision: record.decision
+    });
+    while (supersededRequests.size > 256) {
+      const oldest = supersededRequests.keys().next().value as string | undefined;
+      if (!oldest) break;
+      supersededRequests.delete(oldest);
+    }
+    for (const key of [...sentThisBoot]) {
+      if (key.startsWith(`${record.requestId}:`)) sentThisBoot.delete(key);
+    }
   }
 
   function replayForClient(
@@ -118,11 +181,51 @@ export const useInteractionStore = defineStore('interactions', () => {
   }
 
   function applyResult(payload: InteractionResultPayload, correlationId?: string): void {
-    const record = pending[payload.targetId]
-      ?? Object.values(pending).find((candidate) => candidate.requestId === correlationId);
+    const current = pending[payload.targetId];
+    const exact = current
+      && (!correlationId || current.requestId === correlationId)
+      ? current
+      : correlationId
+        ? Object.values(pending).find((candidate) => candidate.requestId === correlationId)
+        : undefined;
+    const superseded = correlationId ? supersededRequests.get(correlationId) : undefined;
+    const settlesRequest = interactionResultSettlesRequest(payload.status);
+
+    if (exact) {
+      if (settlesRequest) {
+        observeResult(
+          payload,
+          correlationId,
+          interactionResultConfirmsSubmittedDecision(payload.status) ? exact.decision : undefined
+        );
+        clear(exact.interactionRequestId);
+      } else if (payload.status === 'stale') {
+        observeResult(payload, correlationId);
+        clear(exact.interactionRequestId);
+      } else {
+        markResolutionUncertain(exact, interactionFailureMessage(payload));
+      }
+      return;
+    }
+    if (superseded) {
+      supersededRequests.delete(correlationId!);
+      if (!settlesRequest) return;
+      observeResult(payload, correlationId, superseded.decision);
+      const latest = pending[superseded.interactionRequestId];
+      if (latest) clear(latest.interactionRequestId);
+      return;
+    }
+    if (!current) observeResult(payload, correlationId);
+  }
+
+  function observeResult(
+    payload: InteractionResultPayload,
+    correlationId?: string,
+    decision?: DurableInteractionDecision
+  ): void {
     observedResults[payload.targetId] = {
       payload,
-      ...(record && payload.status === 'committed' ? { decision: record.decision } : {}),
+      ...(decision ? { decision } : {}),
       ...(correlationId ? { correlationId } : {}),
       observedAt: Date.now()
     };
@@ -132,7 +235,6 @@ export const useInteractionStore = defineStore('interactions', () => {
       const oldest = stale.shift();
       if (oldest) delete observedResults[oldest[0]];
     }
-    if (record) clear(record.interactionRequestId);
   }
 
   /** Legacy projection reconciliation retained for callers that own typed InteractionRequest facts. */
@@ -157,14 +259,24 @@ export const useInteractionStore = defineStore('interactions', () => {
     }
   }
 
-  /** A bridge-level error unlocks the UI but preserves the outbox for same-id retry/restart replay. */
-  function observeTransportError(correlationId: string | undefined): void {
+  function markResolutionUncertain(record: PendingInteractionResolution, message: string): void {
+    clearResponseTimer(record.interactionRequestId);
+    delete submitting[record.interactionRequestId];
+    pending[record.interactionRequestId] = {
+      ...record,
+      phase: 'uncertain',
+      lastError: message
+    };
+    persistOutbox(pending);
+    armRetry(record.interactionRequestId);
+  }
+
+  /** A bridge-level error unlocks the UI but preserves an explicit retryable outbox state. */
+  function observeTransportError(correlationId: string | undefined, message = '交互提交失败，请重试。'): void {
     if (!correlationId) return;
     const record = Object.values(pending).find((candidate) => candidate.requestId === correlationId);
     if (!record) return;
-    clearResponseTimer(record.interactionRequestId);
-    delete submitting[record.interactionRequestId];
-    armRetry(record.interactionRequestId);
+    markResolutionUncertain(record, message);
   }
 
   function hasPendingResolution(interactionRequestId: string): boolean {
@@ -179,6 +291,10 @@ export const useInteractionStore = defineStore('interactions', () => {
     const result = observedResults[targetId];
     if (!result || (correlationId && result.correlationId !== correlationId)) return undefined;
     return result;
+  }
+
+  function issueFor(interactionRequestId: string): string | undefined {
+    return pending[interactionRequestId]?.lastError;
   }
 
   function postResolution(
@@ -208,8 +324,10 @@ export const useInteractionStore = defineStore('interactions', () => {
       lastSentAt: Date.now(),
       ...(clientId ? { sentClientId: clientId } : {}),
       sentGeneration: deliveryGeneration,
-      automaticRetryCount
+      automaticRetryCount,
+      phase: options.showSubmitting ? 'submitting' : 'uncertain'
     };
+    delete next.lastError;
     pending[record.interactionRequestId] = next;
     persistOutbox(pending);
     sentThisBoot.add(deliveryKey);
@@ -231,10 +349,16 @@ export const useInteractionStore = defineStore('interactions', () => {
         decision: next.decision,
         response: cloneJson(next.response)
       }, { requestId: next.requestId });
-    } catch {
+    } catch (error) {
       sentThisBoot.delete(deliveryKey);
       clearResponseTimer(record.interactionRequestId);
       delete submitting[record.interactionRequestId];
+      pending[record.interactionRequestId] = {
+        ...next,
+        phase: 'uncertain',
+        lastError: error instanceof Error ? error.message : '交互提交失败，请重试。'
+      };
+      persistOutbox(pending);
     }
   }
 
@@ -243,6 +367,14 @@ export const useInteractionStore = defineStore('interactions', () => {
     responseTimers.set(interactionRequestId, window.setTimeout(() => {
       responseTimers.delete(interactionRequestId);
       delete submitting[interactionRequestId];
+      const current = pending[interactionRequestId];
+      if (!current) return;
+      pending[interactionRequestId] = {
+        ...current,
+        phase: 'uncertain',
+        lastError: '提交暂未得到确认，可重试或改选其他决定。'
+      };
+      persistOutbox(pending);
     }, RESPONSE_TIMEOUT_MS));
   }
 
@@ -292,9 +424,45 @@ export const useInteractionStore = defineStore('interactions', () => {
     observeTransportError,
     hasPendingResolution,
     isPending,
-    resultFor
+    resultFor,
+    issueFor
   };
 });
+
+function rejectedResolutionResult(
+  admission: Extract<InteractionResolutionDecision, { kind: 'blocked' | 'rejected' }>,
+  requestState: string,
+  decisionAllowed: boolean
+): InteractionResolveResult {
+  return {
+    accepted: false,
+    code: requestState !== 'pending'
+      ? 'request_ended'
+      : !decisionAllowed
+        ? 'decision_not_allowed'
+        : 'decision_in_flight',
+    message: admission.message
+  };
+}
+
+function interactionResultSettlesRequest(status: InteractionOutcomeStatus): boolean {
+  return status === 'committed'
+    || status === 'already_applied'
+    || status === 'already_satisfied'
+    || status === 'already_resolved';
+}
+
+function interactionResultConfirmsSubmittedDecision(status: InteractionOutcomeStatus): boolean {
+  return status === 'committed';
+}
+
+function interactionFailureMessage(payload: InteractionResultPayload): string {
+  const reason = payload.reason?.trim();
+  if (reason) return reason;
+  if (payload.status === 'blocked') return '当前决定暂时被阻止，可重试或改选其他决定。';
+  if (payload.status === 'outcome_unknown') return '服务端暂时无法确认结果，可重试或等待状态同步。';
+  return '当前决定未被服务端接受，可重试或改选其他决定。';
+}
 
 function readPersistedOutbox(): Record<string, PendingInteractionResolution> {
   const value = bridge.readPersistedState<Record<string, PendingInteractionResolution>>(PERSISTED_INTERACTION_OUTBOX_KEY);
@@ -316,6 +484,7 @@ function readPersistedOutbox(): Record<string, PendingInteractionResolution> {
     && ['accept', 'submit', 'reject', 'cancel'].includes(record.decision)
   ).map(([id, record]) => [id, {
     ...record,
+    phase: 'uncertain' as const,
     response: cloneJson(record.response)
   }]));
 }

@@ -87,7 +87,7 @@ export function useBridgeBootstrap(): void {
       const payload = message.payload;
       if (!payload) return;
       if (payload.requestType === BridgeMessageType.InteractionResolve) {
-        interactions.observeTransportError(message.correlationId);
+        interactions.observeTransportError(message.correlationId, payload.message);
       }
       if (payload.requestType === BridgeMessageType.ModelProfileScopeSet) {
         modelProfiles.rejectPending(message.correlationId, payload.message);

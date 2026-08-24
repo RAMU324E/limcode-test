@@ -37,11 +37,19 @@ const directInteractionResult = computed(() => {
   return requestId ? interactions.resultFor(requestId) : undefined;
 });
 const directInteractionDecision = computed(() => directInteractionResult.value?.decision);
+const interactionIssue = computed(() => {
+  const requestId = interaction.value?.request.id;
+  return requestId ? interactions.issueFor(requestId) : undefined;
+});
+const submissionIssue = computed(() => draft.value.error || interactionIssue.value);
 const pending = computed(() =>
   interaction.value?.request.state === 'pending' && directInteractionResult.value === undefined
 );
 const submitting = computed(() => pending.value && !!interaction.value
-  && (draft.value.submitting || interactions.isPending(interaction.value.request.id)));
+  && (
+    interactions.isPending(interaction.value.request.id)
+    || (draft.value.submitting && !interactionIssue.value)
+  ));
 const interactive = computed(() => pending.value && !submitting.value && !!toolCallId.value && !!interaction.value);
 const customSelected = computed(() => output.value ? !!output.value.customText : draft.value.customSelected);
 const customText = computed(() => output.value?.customText ?? draft.value.customText);
@@ -54,6 +62,7 @@ const selectionModeLabel = computed(() => props.request.multiple ? '可多选' :
 const statusLabel = computed(() => {
   if (!props.toolCall) return '正在准备问题';
   if (submitting.value) return draft.value.submittingAction === 'cancel' ? '正在取消问题' : '正在提交回答';
+  if (interactionIssue.value && pending.value) return '提交暂未确认，可重试或改选';
   if (pending.value) return props.placement === 'tool-detail' ? '等待你的回答 · 与输入框上方同步' : '等待你的回答';
   if (output.value) return '已回答';
   if (props.toolCall.status === 'error') return '问题已取消';
@@ -68,6 +77,24 @@ const statusLabel = computed(() => {
   if (interaction.value.request.state === 'cancelled' || interaction.value.request.state === 'expired') return '问题已取消';
   return '问题已结束';
 });
+
+watch(
+  () => `${toolCallId.value}:${interaction.value?.request.id ?? ''}:${interaction.value ? interactions.isPending(interaction.value.request.id) : false}:${interactionIssue.value ?? ''}`,
+  () => {
+    const id = toolCallId.value;
+    const target = interaction.value;
+    const current = draft.value;
+    if (!id || !target || !pending.value || !current.submitting) return;
+    if (interactions.isPending(target.request.id)) return;
+    askUser.releaseSubmission(
+      id,
+      interactionIssue.value
+        ?? (current.submittingAction === 'cancel'
+          ? '取消暂未得到确认，请重试。'
+          : '提交暂未得到确认，请重试。')
+    );
+  }
+);
 
 watch(
   () => `${props.toolCall?.id ?? ''}:${props.toolCall?.status ?? 'missing'}:${interaction.value?.request.id ?? ''}:${interaction.value?.request.revision ?? 0}:${interaction.value?.request.state ?? 'missing'}:${directInteractionResult.value?.observedAt ?? 'no-direct-result'}:${output.value ? 'output' : 'no-output'}`,
@@ -266,7 +293,7 @@ function emptyDraft(): AskUserDraftState {
       </div>
     </div>
 
-    <p v-if="draft.error && pending" class="ask-user-error" role="alert">{{ draft.error }}</p>
+    <p v-if="submissionIssue && pending" class="ask-user-error" role="alert">{{ submissionIssue }}</p>
 
     <footer v-if="pending" class="ask-user-actions">
       <button type="button" class="ask-user-action secondary" :disabled="submitting" @click="cancel">
