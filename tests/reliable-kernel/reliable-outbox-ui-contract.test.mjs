@@ -80,6 +80,61 @@ test('等待队列按 guidance/runtime continuation 分流，并展示真实后�
   assert.match(queue, /subagentName\(preview\.source\.agentId\)/);
   assert.match(queue, /v-if="item\.committed && guidancePreview\(item\.preview\)"/);
   assert.match(queue, /runtimePreview\(item\.preview\)\?\.source\.kind === 'background_process'/);
+  assert.match(queue, /ConfirmPanel/);
+  assert.match(queue, /withdrawTurnInputSubmission/);
+  assert.doesNotMatch(queue, /window\.confirm/);
+  assert.match(queue, /item\.withdrawable && item\.commandId/);
+  assert.match(queue, /reliable-queue-remove-confirm/);
+});
+
+test('乐观等待消息撤回在 receipt 可见前不重放，提交竞态收敛到 guidance cancel', () => {
+  const chat = read('webview/src/composables/useChat.ts');
+  assert.match(chat, /withdrawnAt\?: number/);
+  assert.match(chat, /withdrawalReceiptReplayRequested\?: boolean/);
+  assert.match(chat, /submission\.withdrawnAt/);
+  assert.match(chat, /decideTurnInputWithdrawal/);
+  assert.match(chat, /durableReceiptObserved[\s\S]*?replay_receipt/);
+  assert.match(chat, /withdrawalReceiptReplay:\s*true/);
+  assert.match(chat, /WITHDRAWAL_RECEIPT_REPLAY_MS/);
+  assert.match(chat, /armWithdrawalReceiptReplay/);
+  assert.match(chat, /replayWithdrawnTurnInputReceipt/);
+  assert.match(chat, /withdrawalReceiptReplayRequested:\s*true[\s\S]*?撤回状态会自动重查/);
+  assert.match(chat, /BridgeMessageType\.GuidanceCancel/);
+  assert.match(chat, /withdrawTurnInputSubmission/);
+});
+
+test('停止 outbox 持久化后投递，超时重同步并以同一命令有限重放', () => {
+  const chat = read('webview/src/composables/useChat.ts');
+  const lifecycle = read('webview/src/domain/reliableInterruptLifecycle.ts');
+  const standaloneSend = chat.slice(
+    chat.indexOf('function sendStandaloneInterrupt'),
+    chat.indexOf('function sendForkRequest')
+  );
+  const actionSend = chat.slice(
+    chat.indexOf('function requestActionInterrupt'),
+    chat.indexOf('function submitConversationAction')
+  );
+
+  assert.match(chat, /INTERRUPT_WATCHDOG_MS\s*=\s*8_000/);
+  assert.match(chat, /INTERRUPT_MAX_AUTOMATIC_RETRIES\s*=\s*2/);
+  assert.match(chat, /startedAt:\s*number/);
+  assert.match(chat, /automaticRetryCount:\s*number/);
+  assert.match(chat, /BridgeMessageType\.ClientResync/);
+  assert.match(chat, /leaseEpoch:\s*0[\s\S]*?command:\s*current\.command/);
+  assert.match(chat, /hasInterruptWatchdog\('standalone'/);
+  assert.match(chat, /hasInterruptWatchdog\('action'/);
+  assert.match(chat, /validInterruptState/);
+  assert.match(chat, /validConversationActionRecords/);
+  assert.ok(
+    standaloneSend.indexOf('setInterruptState(next)') < standaloneSend.indexOf('bridge.request(BridgeMessageType.TurnInterrupt'),
+    'standalone stop must persist before transport dispatch'
+  );
+  assert.ok(
+    actionSend.indexOf('setConversationAction(nextAction)') < actionSend.indexOf('bridge.request(BridgeMessageType.TurnInterrupt'),
+    'history-action stop must persist before transport dispatch'
+  );
+  assert.match(lifecycle, /kind:\s*'retry';\s*nextAutomaticRetryCount/);
+  assert.match(lifecycle, /return \{ kind: 'failed' \}/);
 });
 
 test('Interaction 决策 outbox 跨重启固定 request id，UI 超时不删除重放依据', () => {
@@ -88,6 +143,7 @@ test('Interaction 决策 outbox 跨重启固定 request id，UI 超时不删除�
   const router = read('backend/application/reliableKernel/VscodeReliableKernelCommandRouter.ts');
   const plan = read('webview/src/components/plan/PlanProposalContent.vue');
   const askUser = read('webview/src/components/askUser/AskUserContent.vue');
+  const askUserStore = read('webview/src/stores/useAskUserStore.ts');
 
   assert.match(interactions, /PERSISTED_INTERACTION_OUTBOX_KEY/);
   assert.match(interactions, /response:\s*JsonValue/);
@@ -106,9 +162,50 @@ test('Interaction 决策 outbox 跨重启固定 request id，UI 超时不删除�
   assert.match(bootstrap, /interactions\.replayForClient/);
   assert.match(bootstrap, /interactions\.reconcileReliableFacts/);
   assert.match(router, /this\.post\(webview,[\s\S]*?void this\.resumeInteractionOwner/);
-  assert.match(plan, /提交暂未确认，可点击原操作重试/);
+  assert.match(interactions, /decideInteractionResolution/);
+  assert.match(interactions, /retireSupersededResolution/);
+  assert.match(interactions, /phase:\s*'uncertain'/);
+  assert.match(interactions, /current\.requestId === correlationId/);
+  assert.match(interactions, /interactionResultSettlesRequest/);
+  assert.match(interactions, /interactionResultConfirmsSubmittedDecision/);
+  assert.match(interactions, /else if \(payload\.status === 'stale'\)/);
+  assert.match(interactions, /markResolutionUncertain\(exact, interactionFailureMessage\(payload\)\)/);
+  assert.match(interactions, /function markResolutionUncertain/);
+  assert.match(plan, /提交暂未确认，可点击任一操作重试或改选/);
+  assert.match(plan, /resolutionNotice/);
   assert.match(plan, /interactions\.resultFor\(requestId\)/);
   assert.match(askUser, /回答已提交，正在同步/);
+  assert.match(askUser, /interactionIssue/);
+  assert.match(askUser, /submissionIssue/);
+  assert.match(askUserStore, /releaseSubmission/);
+  assert.doesNotMatch(askUserStore, /SUBMIT_CONFIRM_TIMEOUT_MS|submitTimers/);
+});
+
+test('等待型工具全局停止使用 cancelled，显式审批拒绝仍走 rejected', () => {
+  const dispatcher = read('backend/reliableKernel/toolDispatcher.ts');
+  const router = read('backend/application/reliableKernel/VscodeReliableKernelCommandRouter.ts');
+  const fileEffects = read('backend/reliableKernel/fileEffects.ts');
+  const cancelWaiting = dispatcher.slice(
+    dispatcher.indexOf('public async cancelWaiting'),
+    dispatcher.indexOf('public async cancelActive')
+  );
+  const interactionResolve = router.slice(
+    router.indexOf('private async handleInteractionResolve'),
+    router.indexOf('private async resumeInteractionOwner')
+  );
+  const toolCancel = router.slice(
+    router.indexOf('private async handleToolCancel'),
+    router.indexOf('private async handleToolExecution')
+  );
+
+  assert.match(cancelWaiting, /resolveAskUser[\s\S]*?cancelled:\s*true/);
+  assert.match(cancelWaiting, /request_kind === 'file_change_approval'[\s\S]*?decision:\s*'cancelled'/);
+  assert.match(cancelWaiting, /request_kind === 'plan_review'[\s\S]*?decision:\s*'cancel'/);
+  assert.match(cancelWaiting, /request_kind === 'exec_approval'[\s\S]*?decision:\s*'cancel'/);
+  assert.match(fileEffects, /FileChangeDecisionValue = 'approved' \| 'rejected' \| 'cancelled' \| 'expired'/);
+  assert.match(interactionResolve, /payload\.decision === 'cancel'[\s\S]*?\? 'cancelled'[\s\S]*?: 'rejected'/);
+  assert.match(interactionResolve, /payload\.decision === 'cancel'[\s\S]*?\? 'cancel'[\s\S]*?: 'reject'/);
+  assert.match(toolCancel, /decision:\s*'cancel'/);
 });
 
 test('Reliable Plan 审批保留当前对话与选择 Agent 新开对话两个入口', () => {

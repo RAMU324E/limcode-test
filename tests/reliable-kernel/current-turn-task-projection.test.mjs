@@ -295,7 +295,11 @@ test('durable artifact hard-cut：只认 canonical operation，Plan 必须明确
   const planArgs = { plan: 'do it', taskList: operation };
   const result = (status, executionTarget = 'current_conversation') => ({
     toolCallId: 'plan-call',
-    status: status === 'approved' ? 'succeeded' : 'rejected',
+    status: status === 'approved'
+      ? 'succeeded'
+      : status === 'cancelled'
+        ? 'cancelled'
+        : 'rejected',
     detail: {
       kind: 'submit_plan.result',
       proposalId: 'proposal',
@@ -325,7 +329,7 @@ test('durable artifact hard-cut：只认 canonical operation，Plan 必须明确
   }), undefined);
   assert.equal(approvedSubmitPlanTaskOperation({
     argumentsValue: planArgs,
-    resultArtifactValue: { ...result('approved'), status: 'cancelled' },
+    resultArtifactValue: result('cancelled'),
     toolCallId: 'plan-call'
   }), undefined);
 });
