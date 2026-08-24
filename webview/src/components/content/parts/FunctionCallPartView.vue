@@ -80,6 +80,7 @@ const cancelFeedback = ref<{
   phase: 'submitting' | 'committed' | 'failed';
   message: string;
 } | undefined>(undefined);
+const interactionResolutionNotice = ref('');
 const disposeCancelError = bridge.on(BridgeMessageType.Error, (message) => {
   const current = cancelFeedback.value;
   if (
@@ -277,6 +278,15 @@ const settledControlInteractionAwaitingOutcome = computed(() => {
 });
 const interactionDecisionPending = computed(() => [executionInteraction.value, fileChangeInteractionView.value, resultReviewInteraction.value]
   .some((target) => !!target && interactions.isPending(target.request.id)));
+const interactionOutboxIssue = computed(() => [
+  executionInteraction.value,
+  fileChangeInteractionView.value,
+  resultReviewInteraction.value
+].flatMap((target) => target ? [interactions.issueFor(target.request.id)] : [])
+  .find((message): message is string => Boolean(message)));
+const interactionResolutionMessage = computed(() =>
+  interactionResolutionNotice.value || interactionOutboxIssue.value
+);
 const hasMandatoryInteraction = computed(() => Boolean(
   askUserInteractionView.value?.request.state === 'pending'
   || planReviewInteractionView.value?.request.state === 'pending'
@@ -499,12 +509,14 @@ watch(() => toolCall.value?.id, () => {
   expandedPlanSectionKeys.value = new Set();
   clearCancelProjectionTimer();
   cancelFeedback.value = undefined;
+  interactionResolutionNotice.value = '';
 });
 
 watch(() => toolCall.value?.status, (status) => {
   if (status === 'success' || status === 'warning' || status === 'error') {
     clearCancelProjectionTimer();
     cancelFeedback.value = undefined;
+    interactionResolutionNotice.value = '';
   }
 });
 
@@ -651,7 +663,12 @@ function resolveToolInteraction(kind: DurableInteractionRequestKind, decision: '
         : undefined;
   if (!target || target.request.state !== 'pending') return;
   if (kind === 'patch_approval') clearAutoApplyTimers();
-  interactions.resolve(target, decision, decision === 'reject' ? { reason: rejectionReason(kind) } : {});
+  const result = interactions.resolve(
+    target,
+    decision,
+    decision === 'reject' ? { reason: rejectionReason(kind) } : {}
+  );
+  interactionResolutionNotice.value = result.message ?? '';
 }
 
 function cancelToolExecution(): void {
@@ -845,6 +862,7 @@ function labelForToolCall(
     if (planOutput?.status === 'approved') return 'Plan 已批准';
     if (planOutput?.status === 'change_requested') return '要求修改 Plan';
     if (planOutput?.status === 'rejected') return 'Plan 已拒绝';
+    if (planOutput?.status === 'cancelled') return 'Plan 已取消';
   }
   if (call.status === 'error' && isInterruptedResult(result)) {
     return '已被用户中断';
@@ -1137,6 +1155,10 @@ function isFinalizingProgress(progress: unknown): boolean {
       </p>
     </div>
   </CollapsibleContentBlock>
+
+  <p v-if="interactionResolutionMessage" class="part-card-note tool-interaction-resolution-note" role="status">
+    {{ interactionResolutionMessage }}
+  </p>
 
   <div v-if="!transientPreview && needsExecutionDecision" class="tool-decision-actions is-external">
     <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'accept')">批准执行</button>

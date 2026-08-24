@@ -91,6 +91,7 @@ export interface ExecutionApprovalResolutionResult {
   requestId: string;
   won: boolean;
   approved: boolean;
+  cancelled: boolean;
   deduplicated: boolean;
   terminal?: ToolTerminalResult;
   commitSeq?: string;
@@ -393,7 +394,7 @@ export class ToolInteractionControlPlane {
   public async resolveExecutionApproval(input: {
     source: PhaseDCommandSource;
     requestId: string;
-    decision: 'accept' | 'reject';
+    decision: 'accept' | 'reject' | 'cancel';
     response: unknown;
   }): Promise<ExecutionApprovalResolutionResult> {
     const source = normalizeSource(input.source, ['command'], 'execution-approval-resolve');
@@ -428,6 +429,7 @@ export class ToolInteractionControlPlane {
       throw new Error(`ToolCall ${toolCallId} is no longer waiting for execution approval.`);
     }
     const approved = input.decision === 'accept';
+    const cancelled = input.decision === 'cancel';
     const response = await this.contentStore.prepare(
       this.database,
       canonicalJson({
@@ -462,7 +464,7 @@ export class ToolInteractionControlPlane {
         DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'waiting_answer' }),
         DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'waiting_answer' }),
         DOMAIN_REPOSITORIES.domain('InteractionRequest').update(requestId, {
-          status: approved ? 'succeeded' : 'rejected',
+          status: approved ? 'succeeded' : cancelled ? 'cancelled' : 'rejected',
           updated_at: now
         }),
         DOMAIN_REPOSITORIES.domain('ToolCall').update(toolCallId, { status: 'pending', updated_at: now }),
@@ -476,12 +478,19 @@ export class ToolInteractionControlPlane {
     if (committed.deduplicated || committed.firstResponseLost) {
       return this.replayExecutionApprovalResolution(committed.receipt, receiptId, requestId, toolCallId);
     }
-    const terminal = approved ? undefined : await this.settleRejectedExecutionApproval(requestId, toolCallId);
+    const terminal = approved
+      ? undefined
+      : await this.settleDeclinedExecutionApproval(
+          requestId,
+          toolCallId,
+          cancelled ? 'cancelled' : 'rejected'
+        );
     return {
       receiptId,
       requestId,
       won: true,
       approved,
+      cancelled,
       deduplicated: false,
       commitSeq: committed.commitSeq,
       ...(terminal ? { terminal } : {})
@@ -644,7 +653,9 @@ export class ToolInteractionControlPlane {
       ? 'approved' as const
       : input.decision === 'submit'
         ? 'change_requested' as const
-        : 'rejected' as const;
+        : input.decision === 'cancel'
+          ? 'cancelled' as const
+          : 'rejected' as const;
     const executionTarget = responseRecord?.executionTarget === 'new_conversation'
       ? 'new_conversation' as const
       : 'current_conversation' as const;
@@ -826,26 +837,40 @@ export class ToolInteractionControlPlane {
     assertSourceReceipt(receipt, expectedReceiptId, 'execution-approval-resolve');
     const request = await this.requireExisting('InteractionRequest', requestId);
     const approved = request.status === 'succeeded';
-    if (!approved && request.status !== 'rejected') {
+    const cancelled = request.status === 'cancelled';
+    if (!approved && !cancelled && request.status !== 'rejected') {
       throw new Error(`Execution approval ${requestId} is not resolved.`);
     }
-    const terminal = approved ? undefined : await this.settleRejectedExecutionApproval(requestId, toolCallId);
+    const terminal = approved
+      ? undefined
+      : await this.settleDeclinedExecutionApproval(
+          requestId,
+          toolCallId,
+          cancelled ? 'cancelled' : 'rejected'
+        );
     return {
       receiptId: receipt.id as string,
       requestId,
       won: await this.responseReceiptWon(requestId, receipt.id as string),
       approved,
+      cancelled,
       deduplicated: true,
       ...(terminal ? { terminal } : {})
     };
   }
 
-  private async settleRejectedExecutionApproval(requestId: string, toolCallId: string): Promise<ToolTerminalResult | undefined> {
+  private async settleDeclinedExecutionApproval(
+    requestId: string,
+    toolCallId: string,
+    status: 'rejected' | 'cancelled'
+  ): Promise<ToolTerminalResult | undefined> {
+    const cancelled = status === 'cancelled';
+    const reason = cancelled ? '工具执行审批已取消。' : '用户拒绝执行工具。';
     const settled = await this.effects.settleWithoutEffect({
-      source: { kind: 'internal', key: `execution-approval-rejected:${requestId}` },
+      source: { kind: 'internal', key: `execution-approval-${status}:${requestId}` },
       toolCallId,
-      status: 'rejected',
-      detail: { requestId, reason: '用户拒绝执行工具。' }
+      status,
+      detail: { requestId, reason }
     });
     return settled.terminal;
   }
@@ -965,16 +990,18 @@ export class ToolInteractionControlPlane {
       ? 'approved'
       : decision === 'submit'
         ? 'change_requested'
-        : 'rejected';
+        : decision === 'cancel'
+          ? 'cancelled'
+          : 'rejected';
     if (output.status !== expectedDecisionStatus) {
       throw new Error('Winning Plan response decision and submit_plan result disagree.');
     }
-    const operationStatus = decision === 'cancel'
+    const operationStatus = output.status === 'cancelled'
       ? 'cancelled' as const
       : output.status === 'rejected'
         ? 'rejected' as const
         : 'succeeded' as const;
-    const requestStatus = decision === 'cancel'
+    const requestStatus = output.status === 'cancelled'
       ? 'cancelled'
       : output.status === 'rejected'
         ? 'rejected'
@@ -1398,9 +1425,10 @@ function planProposalId(toolCallId: string): string {
   return `plan-proposal:${requireId(toolCallId, 'toolCallId')}`;
 }
 
-function defaultPlanDecisionMessage(status: 'approved' | 'change_requested' | 'rejected'): string {
+function defaultPlanDecisionMessage(status: 'approved' | 'change_requested' | 'rejected' | 'cancelled'): string {
   if (status === 'approved') return 'User approved the plan. Continue with the approved plan.';
   if (status === 'change_requested') return 'User requested changes to the plan. Revise the plan and submit it again.';
+  if (status === 'cancelled') return 'The current response was stopped, so the pending plan review was cancelled.';
   return 'User rejected the plan.';
 }
 

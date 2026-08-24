@@ -2396,7 +2396,7 @@ export class EffectControlPlane {
     const decisions = await this.list('FileChangeDecision', { change_set_id: changeSets[0].id }, 2);
     if (decisions.length !== 1) return null;
     const decision = String(decisions[0].decision);
-    if (decision !== 'rejected' && decision !== 'expired') return null;
+    if (decision !== 'rejected' && decision !== 'cancelled' && decision !== 'expired') return null;
     return {
       status: decision === 'rejected' ? 'rejected' : 'cancelled',
       detail: { changeSetId: changeSets[0].id, decision }

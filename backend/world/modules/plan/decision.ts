@@ -57,9 +57,12 @@ export function completePlanDecision(
     updatedAt: now
   });
 
-  if (status === 'rejected') {
-    const reason = message || '用户拒绝 Plan。';
-    const result = { ok: false, output, denied: true, reason };
+  if (status === 'rejected' || status === 'cancelled') {
+    const cancelled = status === 'cancelled';
+    const reason = message || (cancelled ? 'Plan 审批已取消。' : '用户拒绝 Plan。');
+    const result = cancelled
+      ? { ok: false, output, cancelled: true, interrupted: true, error: reason }
+      : { ok: false, output, denied: true, reason };
     cmd.add(toolCall, ToolState, transitionToolState(state, 'error', { error: reason, result, durationMs }, now));
     cmd.remove(toolCall, InFlight);
     spawnToolCallEvent(cmd, {
@@ -128,5 +131,6 @@ function normalizedDecisionMessage(status: SubmitPlanDecisionStatus, value: stri
   if (text) return text;
   if (status === 'approved') return 'User approved the plan. Continue with the approved plan.';
   if (status === 'change_requested') return 'User requested changes to the plan. Revise the plan and submit it again.';
+  if (status === 'cancelled') return 'The current response was stopped, so the pending plan review was cancelled.';
   return 'User rejected the plan.';
 }

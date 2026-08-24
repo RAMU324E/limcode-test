@@ -560,7 +560,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         await this.dependencies.files.decide({
           source: { kind: 'command', key: `${sourceKey}:file-change:${requestId}` },
           changeSetId: requireId(changeSets[0].id, 'FileChangeSet.id'),
-          decision: 'rejected',
+          decision: 'cancelled',
           response: { reason }
         });
         continue;
@@ -578,7 +578,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         await this.dependencies.interactions.resolveExecutionApproval({
           source: { kind: 'command', key: `${sourceKey}:execution-approval:${requestId}` },
           requestId,
-          decision: 'reject',
+          decision: 'cancel',
           response: { reason }
         });
         continue;
@@ -1086,12 +1086,13 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
 
     if (frozenDecision.executionGate === 'approval_required' && !FILE_TOOLS.has(input.toolName)) {
       const approval = await this.executionApprovalState(input.toolCallId);
-      if (approval === 'rejected') {
+      if (approval === 'rejected' || approval === 'cancelled') {
+        const cancelled = approval === 'cancelled';
         const settled = await this.dependencies.effects.settleWithoutEffect({
-          source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:execution-approval-rejected` },
+          source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:execution-approval-${approval}` },
           toolCallId: input.toolCallId,
-          status: 'rejected',
-          detail: { reason: '用户拒绝执行工具。' }
+          status: approval,
+          detail: { reason: cancelled ? '工具执行审批已取消。' : '用户拒绝执行工具。' }
         });
         return this.settledResult(input.toolCallId, settled.status, settled.terminal);
       }
@@ -2055,7 +2056,10 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const changeSets = await this.list('FileChangeSet', { tool_call_id: toolCallId }, 2);
     if (changeSets.length === 1) {
       const decisions = await this.list('FileChangeDecision', { change_set_id: changeSets[0].id }, 2);
-      if (decisions.length === 1 && ['rejected', 'expired'].includes(String(decisions[0].decision))) {
+      if (
+        decisions.length === 1
+        && ['rejected', 'cancelled', 'expired'].includes(String(decisions[0].decision))
+      ) {
         return {
           disposition: 'settled',
           toolCallId,
@@ -2264,7 +2268,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     };
   }
 
-  private async executionApprovalState(toolCallId: string): Promise<'missing' | 'pending' | 'approved' | 'rejected'> {
+  private async executionApprovalState(
+    toolCallId: string
+  ): Promise<'missing' | 'pending' | 'approved' | 'rejected' | 'cancelled'> {
     const links = await this.list('InteractionToolCallLink', { tool_call_id: toolCallId }, 10);
     const requests = (await Promise.all(links.map(async (link) => {
       const rows = await this.list('InteractionRequest', { id: requireId(link.request_id, 'InteractionToolCallLink.request_id') }, 2);
@@ -2275,6 +2281,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (requests.length !== 1) throw new Error(`ToolCall ${toolCallId} has multiple execution approvals.`);
     if (requests[0].status === 'pending') return 'pending';
     if (requests[0].status === 'succeeded') return 'approved';
+    if (requests[0].status === 'cancelled') return 'cancelled';
     return 'rejected';
   }
 

@@ -40,6 +40,7 @@ const clientState = useClientStateStore();
 const agentStore = useAgentStore();
 const interactions = useInteractionStore();
 const submitting = ref<undefined | 'approve-current' | 'approve-new' | 'changes' | 'reject'>(undefined);
+const resolutionNotice = ref('');
 const changeFeedbackOpen = ref(false);
 const dispatchPanelOpen = ref(false);
 const selectedDispatchAgentType = ref('');
@@ -62,21 +63,27 @@ const directInteractionResult = computed(() => {
   return requestId ? interactions.resultFor(requestId) : undefined;
 });
 const directInteractionDecision = computed(() => directInteractionResult.value?.decision);
+const interactionIssue = computed(() => {
+  const requestId = interaction.value?.request.id;
+  return requestId ? interactions.issueFor(requestId) : undefined;
+});
 const interactionStatus = computed<PlanProposalStatus | undefined>(() => {
   const target = interaction.value;
   if (!target) return undefined;
   if (target.request.state === 'pending') {
     if (directInteractionDecision.value === 'accept') return 'approved';
     if (directInteractionDecision.value === 'submit') return 'change_requested';
-    if (directInteractionDecision.value === 'reject' || directInteractionDecision.value === 'cancel') return 'rejected';
+    if (directInteractionDecision.value === 'reject') return 'rejected';
+    if (directInteractionDecision.value === 'cancel') return 'cancelled';
     return 'pending';
   }
   const response = clientState.interactionResponses.find((candidate) =>
     candidate.interactionRequestId === target.request.id
     && candidate.interactionRevision === target.request.revision);
-  if (!response) return target.request.state === 'cancelled' ? 'rejected' : undefined;
+  if (!response) return target.request.state === 'cancelled' ? 'cancelled' : undefined;
   if (response.decision === 'accept') return 'approved';
   if (response.decision === 'submit') return 'change_requested';
+  if (response.decision === 'cancel') return 'cancelled';
   return 'rejected';
 });
 const status = computed<PlanProposalStatus>(() => output.value?.status ?? interactionStatus.value ?? proposal.value?.status ?? 'pending');
@@ -110,7 +117,8 @@ const statusLabel = computed(() => {
   if (submitting.value === 'approve-new') return '正在分派 Plan';
   if (submitting.value === 'changes') return '正在提交修改要求';
   if (submitting.value === 'reject') return '正在拒绝 Plan';
-  if (awaitingConfirmation.value) return '提交暂未确认，可点击原操作重试';
+  if (resolutionNotice.value) return resolutionNotice.value;
+  if (awaitingConfirmation.value) return interactionIssue.value || '提交暂未确认，可点击任一操作重试或改选';
   if (directInteractionResult.value && status.value === 'pending') return '审批决定已提交，正在同步';
   if (props.toolCall?.status === 'error' && status.value === 'pending') return 'Plan 已取消';
   if (!interaction.value && status.value === 'pending') return '正在准备 Plan 审批';
@@ -124,6 +132,7 @@ const statusLabel = computed(() => {
     case 'approved': return 'Plan 已批准';
     case 'change_requested': return '已要求修改 Plan';
     case 'rejected': return 'Plan 已拒绝';
+    case 'cancelled': return 'Plan 已取消';
   }
 });
 const statusTone = computed(() => {
@@ -132,6 +141,7 @@ const statusTone = computed(() => {
     case 'approved': return 'approved';
     case 'change_requested': return 'changes';
     case 'rejected': return 'rejected';
+    case 'cancelled': return 'cancelled';
     default: return 'pending';
   }
 });
@@ -165,6 +175,7 @@ watch(
     changeFeedbackText.value = '';
     dispatchPanelOpen.value = false;
     selectedDispatchAgentType.value = '';
+    resolutionNotice.value = '';
     panelExpanded.value = false;
     emit('panel-expanded-change', false);
   }
@@ -178,6 +189,7 @@ watch(
       changeFeedbackOpen.value = false;
       changeFeedbackText.value = '';
       dispatchPanelOpen.value = false;
+      resolutionNotice.value = '';
     }
   },
   { immediate: true }
@@ -225,22 +237,22 @@ function submitApproval(target: 'current_conversation' | 'new_conversation', age
   if (target === 'new_conversation') {
     const normalizedAgentType = agentType?.trim();
     if (!normalizedAgentType) return;
-    const accepted = interactions.resolve(interactionTarget, 'accept', {
+    const resolution = interactions.resolve(interactionTarget, 'accept', {
       planProposalId,
       message: DELEGATED_PLAN_APPROVAL_MESSAGE,
       executionTarget: 'new_conversation',
       agentType: normalizedAgentType
     });
-    if (accepted) submitting.value = 'approve-new';
+    if (acceptResolution(resolution)) submitting.value = 'approve-new';
     return;
   }
 
-  const accepted = interactions.resolve(interactionTarget, 'accept', {
+  const resolution = interactions.resolve(interactionTarget, 'accept', {
     planProposalId,
     message: defaultMessageForDecision('approve'),
     executionTarget: 'current_conversation'
   });
-  if (accepted) submitting.value = 'approve-current';
+  if (acceptResolution(resolution)) submitting.value = 'approve-current';
 }
 
 function decide(kind: 'changes' | 'reject', message = defaultMessageForDecision(kind)): void {
@@ -248,11 +260,16 @@ function decide(kind: 'changes' | 'reject', message = defaultMessageForDecision(
   const planProposalId = proposalIdentity.value;
   if (!interactionTarget || !planProposalId || !pending.value || submitting.value) return;
   const userMessage = message.trim() || defaultMessageForDecision(kind);
-  const accepted = interactions.resolve(interactionTarget, kind === 'changes' ? 'submit' : 'reject', {
+  const resolution = interactions.resolve(interactionTarget, kind === 'changes' ? 'submit' : 'reject', {
     planProposalId,
     message: userMessage
   });
-  if (accepted) submitting.value = kind;
+  if (acceptResolution(resolution)) submitting.value = kind;
+}
+
+function acceptResolution(result: ReturnType<typeof interactions.resolve>): boolean {
+  resolutionNotice.value = result.message ?? '';
+  return result.accepted;
 }
 
 function openChangeFeedback(): void {
@@ -280,9 +297,10 @@ function submitChangeFeedback(): void {
   decide('changes', changeFeedbackText.value.trim() || defaultMessageForDecision('changes'));
 }
 
-function defaultMessageForDecision(kind: 'approve' | 'changes' | 'reject'): string {
+function defaultMessageForDecision(kind: 'approve' | 'changes' | 'reject' | 'cancel'): string {
   if (kind === 'approve') return 'User approved the plan. Continue with the approved plan.';
   if (kind === 'changes') return 'User requested changes to the plan. Revise the plan and submit it again.';
+  if (kind === 'cancel') return 'The current response was stopped, so the pending plan review was cancelled.';
   return 'User rejected the plan.';
 }
 
@@ -292,6 +310,7 @@ function localizedUserMessage(message: string | undefined): string | undefined {
   if (text === defaultMessageForDecision('approve')) return '用户已批准 Plan，可以继续执行。';
   if (text === defaultMessageForDecision('changes')) return '用户要求修改 Plan，请调整后重新提交。';
   if (text === defaultMessageForDecision('reject')) return '用户已拒绝 Plan。';
+  if (text === defaultMessageForDecision('cancel')) return '当前回复已停止，Plan 审批已取消。';
   return text;
 }
 
@@ -361,6 +380,7 @@ function agentTypeDescription(agent: AgentRecord): string {
           />
         </section>
 
+        <p v-if="resolutionNotice && pending" class="plan-proposal-message" role="status">{{ resolutionNotice }}</p>
         <p v-if="userMessage && !pending" class="plan-proposal-message">{{ userMessage }}</p>
 
         <section v-if="delegatedExecution && !pending" class="plan-delegation-result" aria-label="Plan 执行信息">
@@ -612,6 +632,12 @@ function agentTypeDescription(agent: AgentRecord): string {
 .tone-rejected .plan-proposal-status {
   border-color: color-mix(in srgb, var(--vscode-errorForeground, #f48771) 42%, var(--vscode-panel-border));
   color: var(--vscode-errorForeground, #f48771);
+}
+
+.tone-cancelled .plan-proposal-status {
+  border-color: color-mix(in srgb, var(--vscode-descriptionForeground) 38%, var(--vscode-panel-border));
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
 }
 
 .plan-proposal-scroll-shell {

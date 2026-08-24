@@ -39,5 +39,8 @@ export interface RunPlanProposalLinkData {
 export const RunPlanProposalLink = defineComponent<RunPlanProposalLinkData>('RunPlanProposalLink');
 
 export function isFinalPlanProposalStatus(status: PlanProposalStatus): boolean {
-  return status === 'approved' || status === 'change_requested' || status === 'rejected';
+  return status === 'approved'
+    || status === 'change_requested'
+    || status === 'rejected'
+    || status === 'cancelled';
 }

@@ -116,12 +116,20 @@ export function submitPlanOutputFromResult(value: unknown): SubmitPlanToolOutput
 }
 
 export function planProposalStatusToDecision(status: PlanProposalStatus): SubmitPlanDecisionStatus | undefined {
-  if (status === 'approved' || status === 'change_requested' || status === 'rejected') return status;
+  if (
+    status === 'approved'
+    || status === 'change_requested'
+    || status === 'rejected'
+    || status === 'cancelled'
+  ) return status;
   return undefined;
 }
 
 function isSubmitPlanDecisionStatus(value: unknown): value is SubmitPlanDecisionStatus {
-  return value === 'approved' || value === 'change_requested' || value === 'rejected';
+  return value === 'approved'
+    || value === 'change_requested'
+    || value === 'rejected'
+    || value === 'cancelled';
 }
 
 function isSubmitPlanExecutionTarget(value: unknown): value is SubmitPlanExecutionTarget {

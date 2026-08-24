@@ -1495,7 +1495,11 @@ export class VscodeReliableKernelCommandRouter {
       const result = await this.product.application.files.decide({
         source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
         changeSetId: String(changeSet.id),
-        decision: payload.decision === 'accept' || payload.decision === 'submit' ? 'approved' : 'rejected',
+        decision: payload.decision === 'accept' || payload.decision === 'submit'
+          ? 'approved'
+          : payload.decision === 'cancel'
+            ? 'cancelled'
+            : 'rejected',
         response: payload.response
       });
       won = result.won;
@@ -1514,7 +1518,11 @@ export class VscodeReliableKernelCommandRouter {
       const result = await this.product.application.interactions.resolveExecutionApproval({
         source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
         requestId: payload.interactionRequestId,
-        decision: payload.decision === 'accept' || payload.decision === 'submit' ? 'accept' : 'reject',
+        decision: payload.decision === 'accept' || payload.decision === 'submit'
+          ? 'accept'
+          : payload.decision === 'cancel'
+            ? 'cancel'
+            : 'reject',
         response: payload.response
       });
       won = result.won;
@@ -1564,7 +1572,7 @@ export class VscodeReliableKernelCommandRouter {
         interactionRequestId: String(request.id),
         interactionRevision: 1,
         ownerTurnId: String(owner.turn_id),
-        decision: request.request_kind === 'ask_user' ? 'cancel' : 'reject',
+        decision: 'cancel',
         response: { reason: payload.reason ?? '用户取消工具。' }
       });
       return;

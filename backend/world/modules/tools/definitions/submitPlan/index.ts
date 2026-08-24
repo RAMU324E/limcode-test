@@ -88,11 +88,12 @@ function summarizeSubmitPlanToolCall(rawArgs: unknown, context: { result?: unkno
   }
 }
 
-function statusLabel(status: 'approved' | 'change_requested' | 'rejected'): string {
+function statusLabel(status: 'approved' | 'change_requested' | 'rejected' | 'cancelled'): string {
   switch (status) {
     case 'approved': return '已批准';
     case 'change_requested': return '要求修改';
     case 'rejected': return '已拒绝';
+    case 'cancelled': return '已取消';
   }
 }
 

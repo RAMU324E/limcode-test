@@ -25,7 +25,7 @@ export type FileChangeOperation =
   | 'delete_file'
   | 'create_directory'
   | 'delete_directory_tree';
-export type FileChangeDecisionValue = 'approved' | 'rejected' | 'expired';
+export type FileChangeDecisionValue = 'approved' | 'rejected' | 'cancelled' | 'expired';
 export type FileMemberOutcome = 'succeeded' | 'failed' | 'conflict' | 'cancelled' | 'outcome_unknown';
 export type FileMutationOutcome = 'succeeded' | 'failed' | 'partial' | 'conflict' | 'cancelled' | 'outcome_unknown';
 
@@ -1650,7 +1650,7 @@ function requireOperation(value: unknown): FileChangeOperation {
 }
 
 function requireDecision(value: unknown): FileChangeDecisionValue {
-  if (!['approved', 'rejected', 'expired'].includes(String(value))) {
+  if (!['approved', 'rejected', 'cancelled', 'expired'].includes(String(value))) {
     throw new TypeError(`Unsupported FileChangeDecision: ${String(value)}`);
   }
   return value as FileChangeDecisionValue;

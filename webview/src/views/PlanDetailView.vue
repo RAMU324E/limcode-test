@@ -43,6 +43,7 @@ const title = computed(() => {
   if (result?.status === 'approved') return 'Plan 已批准';
   if (result?.status === 'change_requested') return 'Plan 要求修改';
   if (result?.status === 'rejected') return 'Plan 已拒绝';
+  if (result?.status === 'cancelled') return 'Plan 已取消';
   if (planInteraction.value?.request.state === 'pending') return '等待审批 Plan';
   return 'Plan 详情';
 });

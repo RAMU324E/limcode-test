@@ -444,7 +444,7 @@ export interface SubmitPlanToolRequestRecord {
   taskList: TaskListToolOperationRecord;
 }
 
-export type SubmitPlanDecisionStatus = 'approved' | 'change_requested' | 'rejected';
+export type SubmitPlanDecisionStatus = 'approved' | 'change_requested' | 'rejected' | 'cancelled';
 export type SubmitPlanExecutionTarget = 'current_conversation' | 'new_conversation';
 export type SubmitPlanDelegationStatus = 'backgrounded';
 
@@ -856,7 +856,7 @@ export type WorkflowIconKey = 'list-details';
 export type PlanReviewMode = 'off' | 'before_mutation';
 export type PlanReviewRequiredToolRiskLevel = 'write' | 'command' | 'agent';
 export type PlanReviewPolicyScopeKind = ConfigScopeKind;
-export type PlanProposalStatus = 'pending' | 'approved' | 'change_requested' | 'rejected';
+export type PlanProposalStatus = 'pending' | 'approved' | 'change_requested' | 'rejected' | 'cancelled';
 
 export interface WorkflowRecord {
   id: string;
