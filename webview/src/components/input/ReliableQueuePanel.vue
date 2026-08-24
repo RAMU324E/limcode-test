@@ -24,6 +24,7 @@ import type {
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import { compareReliableQueueOrder } from '@webview/domain/reliableQueueOrdering';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
@@ -37,6 +38,7 @@ interface QueueItem {
   retryable?: boolean;
   error?: string;
   committed?: boolean;
+  withdrawable?: boolean;
   preview?: ReliableKernelTurnIntentPreview;
 }
 
@@ -46,6 +48,7 @@ const {
   currentPendingTurnInputs,
   currentTurnInputFailure,
   retryTurnInputSubmission,
+  withdrawTurnInputSubmission,
   editGuidance,
   cancelGuidance,
   setGuidancePaused,
@@ -61,6 +64,16 @@ const editingIntentId = ref<string>();
 const editingText = ref('');
 const editError = ref('');
 const draggingIntentId = ref<string>();
+const removalTarget = ref<QueueItem>();
+const removalDescription = computed(() => {
+  const target = removalTarget.value;
+  if (!target) return '';
+  const text = target.text.trim();
+  const preview = text.length > 120 ? `${text.slice(0, 117)}…` : text;
+  return target.committed
+    ? `将从可靠等待队列中取消“${preview}”。`
+    : `将撤回尚未确认的等待消息“${preview}”，并停止自动重放。`;
+});
 
 const committedQueueRecords = computed(() => Object.values(
   reliableConversation.feed.records.TurnIntent ?? {}
@@ -137,7 +150,9 @@ const optimisticItems = computed<QueueItem[]>(() => {
             : 'submitting',
       createdAt: submission.submittedAt,
       commandId: submission.commandId,
-      retryable
+      retryable,
+      withdrawable: submission.requestType === BridgeMessageType.TurnEnqueue
+        || result?.admitted === false
     }];
   });
 });
@@ -436,12 +451,30 @@ function saveEdit(item: QueueItem): void {
   if (editGuidance(item.id, preview.revisionSeq, text)) closeEdit();
 }
 
-function removeItem(item: QueueItem): void {
+function requestRemoveItem(item: QueueItem): void {
   const preview = guidancePreview(item.preview);
-  if (!preview || itemBusy(item)) return;
-  if (!window.confirm('确定删除这条等待中的引导消息吗？')) return;
-  cancelGuidance(item.id, preview.revisionSeq);
+  if (itemBusy(item)) return;
+  if (!preview && !item.withdrawable) return;
+  removalTarget.value = item;
+}
+
+function closeRemovePanel(): void {
+  removalTarget.value = undefined;
+}
+
+function confirmRemoveItem(): void {
+  const item = removalTarget.value;
+  if (!item) return;
+  const preview = guidancePreview(item.preview);
+  const accepted = preview
+    ? cancelGuidance(item.id, preview.revisionSeq)
+    : item.commandId ? withdrawTurnInputSubmission(item.commandId) : false;
+  if (!accepted) {
+    closeRemovePanel();
+    return;
+  }
   if (editingIntentId.value === item.id) closeEdit();
+  closeRemovePanel();
 }
 
 function togglePause(item: QueueItem): void {
@@ -608,12 +641,22 @@ function timestamp(value: unknown): number {
               class="is-danger"
               title="删除引导消息"
               :disabled="!item.preview || itemBusy(item)"
-              @click="removeItem(item)"
+              @click="requestRemoveItem(item)"
             >
               <IconTrash :size="13" stroke="2" aria-hidden="true" />
             </button>
           </div>
 
+          <button
+            v-if="item.withdrawable && item.commandId"
+            type="button"
+            class="reliable-queue-withdraw is-danger"
+            title="撤回这条等待消息"
+            @click="requestRemoveItem(item)"
+          >
+            <IconTrash :size="13" stroke="2" aria-hidden="true" />
+            撤回
+          </button>
           <button
             v-if="item.retryable && item.commandId"
             type="button"
@@ -631,6 +674,18 @@ function timestamp(value: unknown): number {
       <AdvancedScrollbar :scroller="listScroller" :refresh-key="queueItems.length" variant="minimal" />
     </div>
   </section>
+
+  <ConfirmPanel
+    :open="!!removalTarget"
+    title="删除等待消息"
+    :description="removalDescription"
+    cancel-label="保留"
+    confirm-label="删除"
+    danger
+    test-id="reliable-queue-remove-confirm"
+    @cancel="closeRemovePanel"
+    @confirm="confirmRemoveItem"
+  />
 </template>
 
 <style scoped>

@@ -34,6 +34,8 @@ import type { ReliableDiagnosticObserver } from '../../reliableKernel/diagnostic
 
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 const EXTERNAL_WAKE_POLL_MS = 500;
+const TERMINATION_RECOVERY_BASE_DELAY_MS = 250;
+const TERMINATION_RECOVERY_MAX_DELAY_MS = 10_000;
 const LOCAL_TURN_WAKE_DOMAINS = new Set([
   'EffectIntent',
   'EffectReceipt',
@@ -100,6 +102,8 @@ interface WaitingOwnedTurn {
 interface DeferredRecoveryTurn {
   conversationId: string;
   turnId: string;
+  nextAttemptAt?: number;
+  failureCount?: number;
 }
 
 export interface ReliableConversationRunnerRecoveryReport {
@@ -145,6 +149,7 @@ export class ReliableConversationRunner {
   private readonly admissions = new Map<string, AdmissionSlot>();
   private readonly waitingOwned = new Map<string, WaitingOwnedTurn>();
   private readonly deferredRecovery = new Map<string, DeferredRecoveryTurn>();
+  private readonly terminationRecoveryFailures = new Map<string, number>();
   private readonly interruptCancellationSignaled = new Set<string>();
   private externalWakeTimer: NodeJS.Timeout | undefined;
   private externalWakePollInFlight = false;
@@ -699,6 +704,7 @@ export class ReliableConversationRunner {
     this.externalWakeTimer = undefined;
     this.waitingOwned.clear();
     this.deferredRecovery.clear();
+    this.terminationRecoveryFailures.clear();
     this.interruptCancellationSignaled.clear();
   }
 
@@ -728,8 +734,17 @@ export class ReliableConversationRunner {
       task: Promise.resolve()
     };
     const task = this.runDriveSlot(slot)
-      .catch((error) => {
+      .catch(async (error) => {
         slot.error = error;
+        let terminationPending = false;
+        try {
+          terminationPending = Boolean(await this.findPendingTermination(turnId));
+        } catch (inspectionError) {
+          this.onError(inspectionError, { operation: 'watch-recovery', conversationId, turnId });
+        }
+        if (terminationPending && !this.disposed) {
+          this.deferFailedTerminationRecovery(slot, error);
+        }
         this.onError(error, { operation: 'drive', conversationId, turnId });
       })
       .finally(() => this.finishDriveSlot(slot));
@@ -791,6 +806,7 @@ export class ReliableConversationRunner {
         slot.completedGeneration = generation;
         if (this.disposed) return;
         if (result.terminalStatus === 'waiting') {
+          this.terminationRecoveryFailures.delete(slot.turnId);
           if (slot.requestedGeneration > generation) continue;
           if (!await this.ownsExecution(slot.turnId)) {
             // The Turn is still durably active, but this process no longer owns its generation.
@@ -820,6 +836,7 @@ export class ReliableConversationRunner {
         // an old Promise.finally callback.
         slot.terminal = true;
         slot.completedGeneration = slot.requestedGeneration;
+        this.terminationRecoveryFailures.delete(slot.turnId);
         this.scheduleAdmission(slot.conversationId);
         return;
       } catch (error) {
@@ -1143,9 +1160,11 @@ export class ReliableConversationRunner {
         }
       }
       for (const deferred of [...this.deferredRecovery.values()]) {
+        if (deferred.nextAttemptAt !== undefined && Date.now() < deferred.nextAttemptAt) continue;
         const facts = await this.application.turns.recoveryFacts(deferred.turnId);
         if (facts.judgment !== 'resume') {
           this.deferredRecovery.delete(deferred.turnId);
+          this.terminationRecoveryFailures.delete(deferred.turnId);
           continue;
         }
         const claimed = await this.application.turns.claimRecoveryExecution({
@@ -1285,6 +1304,7 @@ export class ReliableConversationRunner {
     const facts = await this.application.turns.recoveryFacts(slot.turnId);
     if (facts.judgment !== 'resume') {
       this.deferredRecovery.delete(slot.turnId);
+      this.terminationRecoveryFailures.delete(slot.turnId);
       return null;
     }
     const claimed = await this.application.turns.claimRecoveryExecution({
@@ -1345,12 +1365,50 @@ export class ReliableConversationRunner {
     if (rejected) this.onError(rejected.reason, { operation: 'drive', conversationId, turnId });
   }
 
-  private deferExecutionRecovery(slot: Pick<DriveSlot, 'conversationId' | 'turnId'>): void {
+  private deferFailedTerminationRecovery(
+    slot: Pick<DriveSlot, 'conversationId' | 'turnId'>,
+    error: unknown
+  ): void {
     if (this.disposed) return;
+    const failureCount = (this.terminationRecoveryFailures.get(slot.turnId) ?? 0) + 1;
+    this.terminationRecoveryFailures.set(slot.turnId, failureCount);
+    const delayMs = Math.min(
+      TERMINATION_RECOVERY_MAX_DELAY_MS,
+      TERMINATION_RECOVERY_BASE_DELAY_MS * (2 ** Math.min(10, failureCount - 1))
+    );
     this.waitingOwned.delete(slot.turnId);
     this.deferredRecovery.set(slot.turnId, {
       conversationId: slot.conversationId,
-      turnId: slot.turnId
+      turnId: slot.turnId,
+      failureCount,
+      nextAttemptAt: Date.now() + delayMs
+    });
+    this.diagnostics?.observe({
+      eventKind: 'turn_interrupt_recovery_scheduled',
+      scopeKind: 'turn',
+      scopeId: slot.turnId,
+      correlationId: slot.turnId,
+      metadata: {
+        conversationId: slot.conversationId,
+        turnId: slot.turnId,
+        stage: 'drive_failed_with_pending_termination',
+        status: 'scheduled',
+        reasonCode: 'pending_termination',
+        round: failureCount,
+        errorName: error instanceof Error ? error.name : 'unknown'
+      }
+    });
+    this.ensureExternalWakePolling();
+  }
+
+  private deferExecutionRecovery(slot: Pick<DriveSlot, 'conversationId' | 'turnId'>): void {
+    if (this.disposed) return;
+    this.waitingOwned.delete(slot.turnId);
+    const existing = this.deferredRecovery.get(slot.turnId);
+    this.deferredRecovery.set(slot.turnId, {
+      conversationId: slot.conversationId,
+      turnId: slot.turnId,
+      ...(existing?.failureCount ? { failureCount: existing.failureCount } : {})
     });
     this.ensureExternalWakePolling();
   }

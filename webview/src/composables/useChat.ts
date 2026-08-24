@@ -5,9 +5,15 @@ import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
-import { interruptTargetHasSettled } from '@webview/domain/reliableInterruptLifecycle';
+import {
+  decideInterruptWatchdog,
+  interruptTargetHasSettled,
+  type ReliableInterruptPhase
+} from '@webview/domain/reliableInterruptLifecycle';
+import { decideTurnInputWithdrawal } from '@webview/domain/reliableTurnInputWithdrawal';
 import { toStructuredClonePlainData } from '@shared/plainData';
 import {
+  createMessageId,
   type CompressionCommandTarget,
   type CompressionStartPayload,
   type ConversationCommandMetadata,
@@ -27,15 +33,24 @@ const reliableCommandSessionId = globalThis.crypto.randomUUID();
 const PERSISTED_CONTROL_KEY = 'reliableConversationControls';
 const TURN_INPUT_RETRY_MS = 30_000;
 const TURN_INPUT_MAX_AUTOMATIC_RETRIES_PER_GENERATION = 1;
+const WITHDRAWN_TURN_INPUT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const WITHDRAWAL_RECEIPT_REPLAY_MS = 30_000;
+const INTERRUPT_WATCHDOG_MS = 8_000;
+const INTERRUPT_MAX_AUTOMATIC_RETRIES = 2;
 const turnInputRetryTimers = new Map<string, number>();
+const withdrawalReceiptReplayTimers = new Map<string, number>();
+const interruptWatchdogTimers = new Map<string, number>();
 
-type InterruptPhase = 'requesting' | 'stopping';
+type InterruptPhase = ReliableInterruptPhase;
 interface InterruptState {
   conversationId: string;
   turnId: string;
   phase: InterruptPhase;
   command: ConversationCommandMetadata;
   cascadeChildAgents: boolean;
+  startedAt: number;
+  lastSentAt?: number;
+  automaticRetryCount: number;
   requestId?: string;
   sentSessionId?: string;
 }
@@ -52,6 +67,9 @@ interface ConversationActionInterrupt {
   turnId: string;
   phase: InterruptPhase;
   command: ConversationCommandMetadata;
+  startedAt: number;
+  lastSentAt?: number;
+  automaticRetryCount: number;
   requestId?: string;
   sentSessionId?: string;
 }
@@ -96,6 +114,10 @@ export interface PendingTurnInputSubmission {
   sentSessionId?: string;
   automaticRetryCount?: number;
   result?: TurnInputResultPayload;
+  withdrawnAt?: number;
+  withdrawalReceiptReplayRequested?: boolean;
+  withdrawalCancelRequested?: boolean;
+  withdrawalCommand?: ConversationCommandMetadata;
 }
 
 export interface FailedTurnInputSubmission extends PendingTurnInputSubmission {
@@ -152,8 +174,22 @@ bridge.on(BridgeMessageType.TurnInputResult, (message) => {
     || pending.requestType !== payload.requestType
   ) return;
   clearTurnInputRetry(payload.commandId);
+  clearWithdrawalReceiptReplay(payload.commandId);
   if (payload.status === 'rejected') {
-    failTurnInputSubmission(pending, payload.message || '消息发送失败，请重试。');
+    if (pending.withdrawnAt) {
+      removePendingTurnInputSubmission(pending.commandId);
+      setActionNotice(pending.conversationId, payload.message || '等待消息未提交，无需继续撤回。');
+    } else {
+      failTurnInputSubmission(pending, payload.message || '消息发送失败，请重试。');
+    }
+    return;
+  }
+  if (pending.withdrawnAt) {
+    pendingTurnInputSubmissions.value = {
+      ...pendingTurnInputSubmissions.value,
+      [payload.commandId]: { ...pending, result: payload }
+    };
+    persistControls();
     return;
   }
   turnInputAcknowledgements.value = {
@@ -210,8 +246,14 @@ bridge.on(BridgeMessageType.TurnInterruptResult, (message) => {
     && payload.turnId === pending.turnId
     && payload.conversationId === pending.conversationId
   ) {
-    if (payload.status === 'already_terminal') setInterruptState(undefined);
-    else setInterruptState({ ...pending, phase: 'stopping', requestId: undefined });
+    if (payload.status === 'already_terminal') {
+      setInterruptState(undefined);
+    } else {
+      const next = { ...pending, phase: 'stopping' as const, requestId: undefined };
+      setInterruptState(next);
+      armStandaloneInterruptWatchdog(next);
+    }
+    clearActionNotice(payload.conversationId);
   }
 
   const action = conversationActionStates.value[payload.conversationId];
@@ -227,13 +269,17 @@ bridge.on(BridgeMessageType.TurnInterruptResult, (message) => {
       interrupt: undefined,
       blockedAtCommitSeq: undefined
     });
+    clearActionNotice(payload.conversationId);
     return;
   }
-  setConversationAction({
+  const nextAction: ConversationActionState = {
     ...action,
     phase: 'stopping',
     interrupt: { ...action.interrupt, phase: 'stopping', requestId: undefined }
-  });
+  };
+  setConversationAction(nextAction);
+  armActionInterruptWatchdog(nextAction);
+  clearActionNotice(payload.conversationId);
 });
 
 bridge.on(BridgeMessageType.ConversationActionResult, (message) => {
@@ -332,6 +378,21 @@ bridge.on(BridgeMessageType.Error, (message) => {
     const pending = Object.values(pendingTurnInputSubmissions.value).find((candidate) =>
       candidate.requestId === message.correlationId && candidate.requestType === requestType
     );
+    if (pending?.withdrawnAt) {
+      pendingTurnInputSubmissions.value = {
+        ...pendingTurnInputSubmissions.value,
+        [pending.commandId]: { ...pending, withdrawalReceiptReplayRequested: true }
+      };
+      persistControls();
+      setActionNotice(
+        pending.conversationId,
+        message.payload?.message
+          ? `${message.payload.message}（撤回状态会自动重查。）`
+          : '撤回状态暂未确认，将自动重查。'
+      );
+      armWithdrawalReceiptReplay(pending.commandId);
+      return;
+    }
     if (pending) failTurnInputSubmission(
       pending,
       message.payload?.message || '消息提交失败，草稿已恢复。'
@@ -340,25 +401,23 @@ bridge.on(BridgeMessageType.Error, (message) => {
   }
   if (requestType === BridgeMessageType.TurnInterrupt) {
     const pending = interruptState.value;
-    if (pending?.requestId && pending.requestId === message.correlationId) setInterruptState(undefined);
+    if (pending?.requestId && pending.requestId === message.correlationId) {
+      setInterruptState(undefined);
+      setActionNotice(
+        pending.conversationId,
+        message.payload?.message || '停止请求失败，可再次点击停止重试。'
+      );
+    }
     const action = Object.values(conversationActionStates.value).find((candidate) =>
       candidate.interrupt?.requestId === message.correlationId
     );
     if (action) {
-      setConversationAction({
-        ...action,
-        phase: 'requesting_stop',
-        interrupt: {
-          ...action.interrupt!,
-          phase: 'requesting',
-          requestId: undefined
-        }
-      });
+      clearConversationAction(action.conversationId);
       setActionNotice(
         action.conversationId,
         message.payload?.message
-          ? `${message.payload.message}（可再次点击停止重放同一请求。）`
-          : '停止请求失败；可再次点击停止重放同一请求。'
+          ? `${message.payload.message}（请重新执行原操作。）`
+          : '停止请求失败；请重新执行原操作。'
       );
     }
     return;
@@ -391,8 +450,22 @@ bridge.on(BridgeMessageType.Error, (message) => {
   }
 });
 
+function removePendingTurnInputSubmission(commandId: string): void {
+  clearTurnInputRetry(commandId);
+  clearWithdrawalReceiptReplay(commandId);
+  if (!pendingTurnInputSubmissions.value[commandId]) return;
+  const next = { ...pendingTurnInputSubmissions.value };
+  delete next[commandId];
+  pendingTurnInputSubmissions.value = next;
+  const nextAcknowledgements = { ...turnInputAcknowledgements.value };
+  delete nextAcknowledgements[commandId];
+  turnInputAcknowledgements.value = nextAcknowledgements;
+  persistControls();
+}
+
 function failTurnInputSubmission(pending: PendingTurnInputSubmission, message: string): void {
   clearTurnInputRetry(pending.commandId);
+  clearWithdrawalReceiptReplay(pending.commandId);
   const nextPending = { ...pendingTurnInputSubmissions.value };
   delete nextPending[pending.commandId];
   pendingTurnInputSubmissions.value = nextPending;
@@ -440,9 +513,22 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
   let changed = false;
   const next = { ...pendingTurnInputSubmissions.value };
   for (const pending of Object.values(next)) {
-    const { observed, durableReceiptObserved } = turnInputDurableObservation(records, pending);
-    if (!observed) continue;
-    if (durableReceiptObserved) confirmTurnInputFromDurableReceipt(pending);
+    const observation = turnInputDurableObservation(records, pending);
+    if (pending.withdrawnAt) {
+      const updated = reconcileWithdrawnTurnInput(records, pending, observation.durableReceiptObserved);
+      if (updated === null) {
+        clearTurnInputRetry(pending.commandId);
+        clearWithdrawalReceiptReplay(pending.commandId);
+        delete next[pending.commandId];
+        changed = true;
+      } else if (updated !== pending) {
+        next[pending.commandId] = updated;
+        changed = true;
+      }
+      continue;
+    }
+    if (!observation.observed) continue;
+    if (observation.durableReceiptObserved) confirmTurnInputFromDurableReceipt(pending);
     clearTurnInputRetry(pending.commandId);
     delete next[pending.commandId];
     changed = true;
@@ -453,6 +539,117 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
     // one-shot UI handoff until Composer clears its draft and explicitly dismisses it; deleting the
     // ACK here can race Vue's batched watcher and leave the input permanently disabled.
     persistControls();
+  }
+}
+
+function reconcileWithdrawnTurnInput(
+  records: Record<string, Record<string, Record<string, unknown>>>,
+  pending: PendingTurnInputSubmission,
+  durableReceiptObserved: boolean
+): PendingTurnInputSubmission | null {
+  const result = pending.result;
+  const intentRow = result?.intentId ? records.TurnIntent?.[result.intentId] : undefined;
+  const decision = decideTurnInputWithdrawal({
+    durableReceiptObserved,
+    receiptReplayRequested: pending.withdrawalReceiptReplayRequested === true,
+    ...(result ? {
+      result: {
+        admitted: result.admitted,
+        ...(result.intentId ? { intentId: result.intentId } : {}),
+        ...(result.turnId ? { turnId: result.turnId } : {})
+      }
+    } : {}),
+    ...(intentRow ? {
+      intent: {
+        state: String(intentRow.state ?? ''),
+        ...(typeof intentRow.current_revision_seq === 'string'
+          ? { currentRevisionSeq: intentRow.current_revision_seq }
+          : {})
+      }
+    } : {}),
+    cancelRequested: pending.withdrawalCancelRequested === true
+  });
+
+  if (decision.kind === 'replay_receipt') {
+    const updated: PendingTurnInputSubmission = {
+      ...pending,
+      withdrawalReceiptReplayRequested: true
+    };
+    queueMicrotask(() => replayWithdrawnTurnInputReceipt(updated));
+    return updated;
+  }
+  if (decision.kind === 'cancel_intent') {
+    const command = pending.withdrawalCommand ?? nextReliableCommandMetadata();
+    const updated: PendingTurnInputSubmission = {
+      ...pending,
+      withdrawalCommand: command,
+      withdrawalCancelRequested: true
+    };
+    queueMicrotask(() => submitWithdrawnGuidanceCancel(
+      updated,
+      decision.intentId,
+      decision.expectedRevisionSeq,
+      command
+    ));
+    return updated;
+  }
+  if (decision.kind === 'already_started') {
+    setActionNotice(
+      pending.conversationId,
+      '这条消息已开始执行，无法再从等待队列撤回；如需终止，请使用输入框旁的停止按钮。'
+    );
+    return null;
+  }
+  if (decision.kind === 'settled') {
+    clearActionNotice(pending.conversationId);
+    return null;
+  }
+  if (
+    decision.kind === 'wait'
+    && durableReceiptObserved
+    && pending.withdrawalReceiptReplayRequested
+    && !pending.result
+  ) armWithdrawalReceiptReplay(pending.commandId);
+  return pending;
+}
+
+function replayWithdrawnTurnInputReceipt(submission: PendingTurnInputSubmission): void {
+  postTurnInputSubmission(
+    submission,
+    bridge.currentClientId(),
+    undefined,
+    { withdrawalReceiptReplay: true }
+  );
+  const current = pendingTurnInputSubmissions.value[submission.commandId];
+  if (current?.withdrawnAt && current.withdrawalReceiptReplayRequested && !current.result) {
+    armWithdrawalReceiptReplay(current.commandId);
+  }
+}
+
+function submitWithdrawnGuidanceCancel(
+  pending: PendingTurnInputSubmission,
+  intentId: string,
+  expectedRevisionSeq: string,
+  command: ConversationCommandMetadata
+): void {
+  const requestId = command.commandId;
+  beginGuidanceControl({
+    commandId: command.commandId,
+    requestId,
+    conversationId: pending.conversationId,
+    action: 'cancel',
+    intentIds: [intentId],
+    submittedAt: Date.now()
+  });
+  try {
+    bridge.request(BridgeMessageType.GuidanceCancel, {
+      conversationId: pending.conversationId,
+      intentId,
+      expectedRevisionSeq,
+      command
+    }, { requestId });
+  } catch (error) {
+    failGuidanceControl(command.commandId, pending.conversationId, error);
   }
 }
 
@@ -491,7 +688,7 @@ function turnInputDurableObservation(
 
 function replayTurnInputSubmissions(clientId: string, sessionId?: string): void {
   for (const submission of Object.values(pendingTurnInputSubmissions.value)) {
-    if (submission.result) continue;
+    if (submission.result || submission.withdrawnAt) continue;
     if (
       submission.sentClientId === clientId
       && (sessionId === undefined || submission.sentSessionId === sessionId)
@@ -504,10 +701,18 @@ function postTurnInputSubmission(
   submission: PendingTurnInputSubmission,
   clientId = bridge.currentClientId(),
   sessionId?: string,
-  options: { automaticRetry?: boolean; resetRetryBudget?: boolean } = {}
+  options: {
+    automaticRetry?: boolean;
+    resetRetryBudget?: boolean;
+    withdrawalReceiptReplay?: boolean;
+  } = {}
 ): void {
   const current = pendingTurnInputSubmissions.value[submission.commandId];
-  if (!current || current.result) return;
+  if (
+    !current
+    || current.result
+    || (current.withdrawnAt && !options.withdrawalReceiptReplay)
+  ) return;
   const sameGeneration = current.sentClientId === clientId
     && current.sentSessionId === sessionId;
   const automaticRetryCount = options.automaticRetry
@@ -530,7 +735,7 @@ function postTurnInputSubmission(
     [next.commandId]: next
   };
   persistControls();
-  if (automaticRetryCount < TURN_INPUT_MAX_AUTOMATIC_RETRIES_PER_GENERATION) {
+  if (!options.withdrawalReceiptReplay && automaticRetryCount < TURN_INPUT_MAX_AUTOMATIC_RETRIES_PER_GENERATION) {
     armTurnInputRetry(next.commandId);
   } else {
     clearTurnInputRetry(next.commandId);
@@ -545,6 +750,19 @@ function postTurnInputSubmission(
       command: { ...next.command }
     }, { requestId: next.requestId });
   } catch (error) {
+    if (next.withdrawnAt) {
+      pendingTurnInputSubmissions.value = {
+        ...pendingTurnInputSubmissions.value,
+        [next.commandId]: { ...next, withdrawalReceiptReplayRequested: true }
+      };
+      persistControls();
+      setActionNotice(
+        next.conversationId,
+        error instanceof Error ? error.message : '撤回状态暂未确认，将自动重查。'
+      );
+      armWithdrawalReceiptReplay(next.commandId);
+      return;
+    }
     failTurnInputSubmission(
       next,
       error instanceof Error ? error.message : '消息提交失败，草稿已保留。'
@@ -557,7 +775,7 @@ function armTurnInputRetry(commandId: string): void {
   turnInputRetryTimers.set(commandId, window.setTimeout(() => {
     turnInputRetryTimers.delete(commandId);
     const pending = pendingTurnInputSubmissions.value[commandId];
-    if (pending && !pending.result) {
+    if (pending && !pending.result && !pending.withdrawnAt) {
       postTurnInputSubmission(
         pending,
         pending.sentClientId,
@@ -574,12 +792,42 @@ function clearTurnInputRetry(commandId: string): void {
   turnInputRetryTimers.delete(commandId);
 }
 
+function armWithdrawalReceiptReplay(commandId: string): void {
+  if (withdrawalReceiptReplayTimers.has(commandId)) return;
+  withdrawalReceiptReplayTimers.set(commandId, window.setTimeout(() => {
+    withdrawalReceiptReplayTimers.delete(commandId);
+    const pending = pendingTurnInputSubmissions.value[commandId];
+    if (!pending?.withdrawnAt || !pending.withdrawalReceiptReplayRequested || pending.result) return;
+    replayWithdrawnTurnInputReceipt(pending);
+  }, WITHDRAWAL_RECEIPT_REPLAY_MS));
+}
+
+function clearWithdrawalReceiptReplay(commandId: string): void {
+  const timer = withdrawalReceiptReplayTimers.get(commandId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  withdrawalReceiptReplayTimers.delete(commandId);
+}
+
 function setInterruptState(next: InterruptState | undefined): void {
+  const previous = interruptState.value;
+  if (
+    previous
+    && (!next || next.conversationId !== previous.conversationId || next.turnId !== previous.turnId)
+  ) clearInterruptWatchdog('standalone', previous.conversationId, previous.turnId);
   interruptState.value = next;
   persistControls();
 }
 
 function setConversationAction(action: ConversationActionState): void {
+  const previous = conversationActionStates.value[action.conversationId];
+  if (
+    previous?.interrupt
+    && (
+      !action.interrupt
+      || action.interrupt.turnId !== previous.interrupt.turnId
+      || action.interrupt.command.commandId !== previous.interrupt.command.commandId
+    )
+  ) clearInterruptWatchdog('action', action.conversationId, previous.interrupt.turnId);
   conversationActionStates.value = {
     ...conversationActionStates.value,
     [action.conversationId]: action
@@ -588,7 +836,9 @@ function setConversationAction(action: ConversationActionState): void {
 }
 
 function clearConversationAction(conversationId: string): void {
-  if (!conversationActionStates.value[conversationId]) return;
+  const current = conversationActionStates.value[conversationId];
+  if (!current) return;
+  if (current.interrupt) clearInterruptWatchdog('action', conversationId, current.interrupt.turnId);
   const next = { ...conversationActionStates.value };
   delete next[conversationId];
   conversationActionStates.value = next;
@@ -617,6 +867,164 @@ function clearActionNotice(conversationId: string): void {
   const next = { ...actionNotices.value };
   delete next[conversationId];
   actionNotices.value = next;
+}
+
+function interruptWatchdogKey(
+  kind: 'standalone' | 'action',
+  conversationId: string,
+  turnId: string
+): string {
+  return `${kind}:${conversationId}:${turnId}`;
+}
+
+function hasInterruptWatchdog(
+  kind: 'standalone' | 'action',
+  conversationId: string,
+  turnId: string
+): boolean {
+  return interruptWatchdogTimers.has(interruptWatchdogKey(kind, conversationId, turnId));
+}
+
+function clearInterruptWatchdog(
+  kind: 'standalone' | 'action',
+  conversationId: string,
+  turnId: string
+): void {
+  const key = interruptWatchdogKey(kind, conversationId, turnId);
+  const timer = interruptWatchdogTimers.get(key);
+  if (timer !== undefined) window.clearTimeout(timer);
+  interruptWatchdogTimers.delete(key);
+}
+
+function armStandaloneInterruptWatchdog(state: InterruptState): void {
+  const key = interruptWatchdogKey('standalone', state.conversationId, state.turnId);
+  clearInterruptWatchdog('standalone', state.conversationId, state.turnId);
+  interruptWatchdogTimers.set(key, window.setTimeout(() => {
+    interruptWatchdogTimers.delete(key);
+    const current = interruptState.value;
+    if (
+      !current
+      || current.conversationId !== state.conversationId
+      || current.turnId !== state.turnId
+      || current.command.commandId !== state.command.commandId
+    ) return;
+    requestInterruptResync(current.conversationId);
+    const decision = decideInterruptWatchdog({
+      settled: false,
+      phase: current.phase,
+      automaticRetryCount: current.automaticRetryCount,
+      maxAutomaticRetries: INTERRUPT_MAX_AUTOMATIC_RETRIES
+    });
+    if (decision.kind === 'retry') {
+      const requestId = createMessageId();
+      const next: InterruptState = {
+        ...current,
+        phase: 'stopping',
+        requestId,
+        lastSentAt: Date.now(),
+        automaticRetryCount: decision.nextAutomaticRetryCount
+      };
+      setInterruptState(next);
+      armStandaloneInterruptWatchdog(next);
+      try {
+        bridge.request(BridgeMessageType.TurnInterrupt, {
+          conversationId: current.conversationId,
+          turnId: current.turnId,
+          leaseEpoch: 0,
+          command: current.command,
+          ...(current.cascadeChildAgents ? { cascadeChildAgents: true } : {})
+        }, { requestId });
+      } catch (error) {
+        setActionNotice(
+          current.conversationId,
+          error instanceof Error
+            ? `${error.message}（停止命令已保存，将自动重试。）`
+            : '停止请求暂时无法投递；命令已保存，将自动重试。'
+        );
+      }
+      return;
+    }
+    if (decision.kind === 'failed') {
+      setInterruptState(undefined);
+      setActionNotice(
+        current.conversationId,
+        '停止请求已保存，但状态尚未收敛；已解除锁定，可再次停止或刷新对话。'
+      );
+    }
+  }, INTERRUPT_WATCHDOG_MS));
+}
+
+function armActionInterruptWatchdog(action: ConversationActionState): void {
+  const currentInterrupt = action.interrupt;
+  if (!currentInterrupt) return;
+  const key = interruptWatchdogKey('action', action.conversationId, currentInterrupt.turnId);
+  clearInterruptWatchdog('action', action.conversationId, currentInterrupt.turnId);
+  interruptWatchdogTimers.set(key, window.setTimeout(() => {
+    interruptWatchdogTimers.delete(key);
+    const currentAction = conversationActionStates.value[action.conversationId];
+    const current = currentAction?.interrupt;
+    if (
+      !currentAction
+      || !current
+      || current.turnId !== currentInterrupt.turnId
+      || current.command.commandId !== currentInterrupt.command.commandId
+    ) return;
+    requestInterruptResync(currentAction.conversationId);
+    const decision = decideInterruptWatchdog({
+      settled: false,
+      phase: current.phase,
+      automaticRetryCount: current.automaticRetryCount,
+      maxAutomaticRetries: INTERRUPT_MAX_AUTOMATIC_RETRIES
+    });
+    if (decision.kind === 'retry') {
+      const requestId = createMessageId();
+      const nextAction: ConversationActionState = {
+        ...currentAction,
+        phase: 'stopping',
+        interrupt: {
+          ...current,
+          phase: 'stopping',
+          requestId,
+          lastSentAt: Date.now(),
+          automaticRetryCount: decision.nextAutomaticRetryCount
+        }
+      };
+      setConversationAction(nextAction);
+      armActionInterruptWatchdog(nextAction);
+      try {
+        bridge.request(BridgeMessageType.TurnInterrupt, {
+          conversationId: currentAction.conversationId,
+          turnId: current.turnId,
+          leaseEpoch: 0,
+          command: current.command
+        }, { requestId });
+      } catch (error) {
+        setActionNotice(
+          currentAction.conversationId,
+          error instanceof Error
+            ? `${error.message}（停止命令已保存，将自动重试。）`
+            : '停止请求暂时无法投递；原操作仍会自动恢复。'
+        );
+      }
+      return;
+    }
+    if (decision.kind === 'failed') {
+      clearConversationAction(currentAction.conversationId);
+      setActionNotice(
+        currentAction.conversationId,
+        '旧回复的停止状态尚未收敛；原操作已解除锁定，请重试或刷新对话。'
+      );
+    }
+  }, INTERRUPT_WATCHDOG_MS));
+}
+
+function requestInterruptResync(conversationId: string): void {
+  try {
+    bridge.request(BridgeMessageType.ClientResync, { conversationId });
+  } catch {
+    // The fixed-id interrupt replay remains the recovery authority even if this best-effort resync
+    // cannot be posted during a transport handoff.
+  }
 }
 
 function beginGuidanceControl(control: PendingGuidanceControl): void {
@@ -676,7 +1084,7 @@ export function useChat() {
   const currentInterruptPhase = computed<InterruptPhase | undefined>(() =>
     currentActionInterrupt.value?.phase ?? currentStandaloneInterrupt.value?.phase
   );
-  const interruptPending = computed(() => currentInterruptPhase.value === 'stopping');
+  const interruptPending = computed(() => currentInterruptPhase.value !== undefined);
   const conversationActionPending = computed(() => Boolean(currentConversationAction.value));
   const conversationActionLabel = computed(() => currentConversationAction.value?.label);
   const compressionPending = computed(() => currentConversationAction.value?.action === 'compress');
@@ -687,6 +1095,7 @@ export function useChat() {
   const currentPendingTurnInputs = computed(() => Object.values(pendingTurnInputSubmissions.value)
     .filter((submission) =>
       submission.conversationId === reliableConversation.conversationId.value
+      && !submission.withdrawnAt
       && !turnInputDurableObservation(reliableRecords.value, submission).observed
     )
     .sort((left, right) => left.submittedAt - right.submittedAt || left.commandId.localeCompare(right.commandId)));
@@ -703,6 +1112,7 @@ export function useChat() {
     for (const pending of Object.values(pendingTurnInputSubmissions.value)) {
       if (
         pending.conversationId === conversationId
+        && !pending.withdrawnAt
         && turnInputDurableObservation(reliableRecords.value, pending).observed
       ) acknowledgements[pending.commandId] = { conversationId };
     }
@@ -810,13 +1220,45 @@ export function useChat() {
 
   function retryTurnInputSubmission(commandId: string): boolean {
     const pending = pendingTurnInputSubmissions.value[commandId];
-    if (!pending || pending.result) return false;
+    if (!pending || pending.result || pending.withdrawnAt) return false;
     postTurnInputSubmission(
       pending,
       bridge.currentClientId(),
       reliableConversation.feed.sessionId ?? undefined,
       { resetRetryBudget: true }
     );
+    return true;
+  }
+
+  function withdrawTurnInputSubmission(commandId: string): boolean {
+    const pending = pendingTurnInputSubmissions.value[commandId];
+    if (!pending || pending.withdrawnAt) return false;
+    const isQueuedInput = pending.requestType === BridgeMessageType.TurnEnqueue
+      || pending.result?.admitted === false;
+    if (!isQueuedInput || pending.result?.admitted === true) {
+      setActionNotice(
+        pending.conversationId,
+        '这条消息已经开始执行，无法从等待队列撤回。'
+      );
+      return false;
+    }
+    clearTurnInputRetry(commandId);
+    const nextAcknowledgements = { ...turnInputAcknowledgements.value };
+    delete nextAcknowledgements[commandId];
+    turnInputAcknowledgements.value = nextAcknowledgements;
+    pendingTurnInputSubmissions.value = {
+      ...pendingTurnInputSubmissions.value,
+      [commandId]: {
+        ...pending,
+        withdrawnAt: Date.now(),
+        withdrawalReceiptReplayRequested: false,
+        withdrawalCancelRequested: false,
+        withdrawalCommand: nextReliableCommandMetadata()
+      }
+    };
+    clearActionNotice(pending.conversationId);
+    persistControls();
+    reconcileTurnInputSubmissions(reliableRecords.value);
     return true;
   }
 
@@ -1062,6 +1504,8 @@ export function useChat() {
         const sessionChanged = action.interrupt.sentSessionId !== reliableConversation.feed.sessionId;
         if (force || sessionChanged) {
           requestActionInterrupt(action, action.interrupt.turnId, action.interrupt.command);
+        } else if (!hasInterruptWatchdog('action', conversationId, action.interrupt.turnId)) {
+          armActionInterruptWatchdog(action);
         }
         return;
       }
@@ -1085,13 +1529,12 @@ export function useChat() {
     frozenCommand?: ConversationCommandMetadata
   ): void {
     const command = frozenCommand ?? nextReliableCommandMetadata();
-    const requestId = bridge.request(BridgeMessageType.TurnInterrupt, {
-      conversationId: action.conversationId,
-      turnId,
-      leaseEpoch: activeLeaseGeneration(turnId) ?? 0,
-      command
-    });
-    setConversationAction({
+    const previous = action.interrupt?.turnId === turnId
+      && action.interrupt.command.commandId === command.commandId
+      ? action.interrupt
+      : undefined;
+    const requestId = createMessageId();
+    const nextAction: ConversationActionState = {
       ...action,
       phase: 'requesting_stop',
       blockedAtCommitSeq: undefined,
@@ -1100,9 +1543,31 @@ export function useChat() {
         phase: 'requesting',
         command,
         requestId,
+        startedAt: previous?.startedAt ?? Date.now(),
+        lastSentAt: Date.now(),
+        automaticRetryCount: previous?.automaticRetryCount ?? 0,
         ...(reliableConversation.feed.sessionId ? { sentSessionId: reliableConversation.feed.sessionId } : {})
       }
-    });
+    };
+    // Persist the exact command and correlation before posting. This keeps a synchronous transport
+    // failure or Webview reload from erasing the user's stop intent.
+    setConversationAction(nextAction);
+    armActionInterruptWatchdog(nextAction);
+    try {
+      bridge.request(BridgeMessageType.TurnInterrupt, {
+        conversationId: action.conversationId,
+        turnId,
+        leaseEpoch: activeLeaseGeneration(turnId) ?? 0,
+        command
+      }, { requestId });
+    } catch (error) {
+      setActionNotice(
+        action.conversationId,
+        error instanceof Error
+          ? `${error.message}（停止命令已保存，将自动重试。）`
+          : '停止请求暂时无法投递；原操作仍会自动恢复。'
+      );
+    }
   }
 
   function submitConversationAction(action: ConversationActionState): void {
@@ -1145,6 +1610,8 @@ export function useChat() {
     }
     if (pending.sentSessionId !== reliableConversation.feed.sessionId) {
       sendStandaloneInterrupt(pending);
+    } else if (!hasInterruptWatchdog('standalone', pending.conversationId, pending.turnId)) {
+      armStandaloneInterruptWatchdog(pending);
     }
   }
 
@@ -1172,26 +1639,43 @@ export function useChat() {
       turnId,
       phase: 'requesting',
       command: nextReliableCommandMetadata(),
-      cascadeChildAgents
+      cascadeChildAgents,
+      startedAt: Date.now(),
+      automaticRetryCount: 0
     };
     sendStandaloneInterrupt(next);
     return true;
   }
 
   function sendStandaloneInterrupt(pending: InterruptState): void {
-    const requestId = bridge.request(BridgeMessageType.TurnInterrupt, {
-      conversationId: pending.conversationId,
-      turnId: pending.turnId,
-      leaseEpoch: activeLeaseGeneration(pending.turnId) ?? 0,
-      command: pending.command,
-      ...(pending.cascadeChildAgents ? { cascadeChildAgents: true } : {})
-    });
-    setInterruptState({
+    const requestId = createMessageId();
+    const next: InterruptState = {
       ...pending,
       phase: 'requesting',
       requestId,
+      lastSentAt: Date.now(),
       ...(reliableConversation.feed.sessionId ? { sentSessionId: reliableConversation.feed.sessionId } : {})
-    });
+    };
+    // Persist before transport dispatch so a thrown postMessage cannot leave the composer locked
+    // without a replayable stop command.
+    setInterruptState(next);
+    armStandaloneInterruptWatchdog(next);
+    try {
+      bridge.request(BridgeMessageType.TurnInterrupt, {
+        conversationId: pending.conversationId,
+        turnId: pending.turnId,
+        leaseEpoch: activeLeaseGeneration(pending.turnId) ?? 0,
+        command: pending.command,
+        ...(pending.cascadeChildAgents ? { cascadeChildAgents: true } : {})
+      }, { requestId });
+    } catch (error) {
+      setActionNotice(
+        pending.conversationId,
+        error instanceof Error
+          ? `${error.message}（停止命令已保存，将自动重试。）`
+          : '停止请求暂时无法投递；命令已保存，将自动重试。'
+      );
+    }
   }
 
   function sendForkRequest(request: ForkRequestState): void {
@@ -1363,6 +1847,7 @@ export function useChat() {
     dismissTurnInputAcknowledgement,
     dismissTurnInputFailure,
     retryTurnInputSubmission,
+    withdrawTurnInputSubmission,
     editGuidance,
     cancelGuidance,
     setGuidancePaused,
@@ -1377,9 +1862,10 @@ export function useChat() {
 function readPersistedControls(): PersistedConversationControls {
   const value = bridge.readPersistedState<PersistedConversationControls>(PERSISTED_CONTROL_KEY);
   if (!value || typeof value !== 'object' || Array.isArray(value)) return emptyPersistedControls();
+  const interrupt = validInterruptState(value.interrupt);
   return {
-    ...(value.interrupt ? { interrupt: value.interrupt } : {}),
-    conversationActions: plainRecord(value.conversationActions),
+    ...(interrupt ? { interrupt } : {}),
+    conversationActions: validConversationActionRecords(value.conversationActions),
     forkRequests: plainRecord(value.forkRequests),
     pendingTurnInputs: validTurnInputRecords(value.pendingTurnInputs),
     failedTurnInputs: validFailedTurnInputRecords(value.failedTurnInputs)
@@ -1399,9 +1885,113 @@ function plainRecord<T>(value: Record<string, T> | undefined): Record<string, T>
   return value && typeof value === 'object' && !Array.isArray(value) ? { ...value } : {};
 }
 
+function validInterruptState(value: InterruptState | undefined): InterruptState | undefined {
+  if (
+    !value
+    || typeof value !== 'object'
+    || typeof value.conversationId !== 'string'
+    || typeof value.turnId !== 'string'
+    || !validInterruptPhase(value.phase)
+    || !validConversationCommand(value.command)
+    || typeof value.cascadeChildAgents !== 'boolean'
+    || !validTimestamp(value.startedAt)
+    || !validAutomaticRetryCount(value.automaticRetryCount)
+    || !validOptionalTimestamp(value.lastSentAt)
+    || !validOptionalText(value.requestId)
+    || !validOptionalText(value.sentSessionId)
+  ) return undefined;
+  return value;
+}
+
+function validConversationActionRecords(
+  value: Record<string, ConversationActionState> | undefined
+): Record<string, ConversationActionState> {
+  return Object.fromEntries(Object.entries(plainRecord(value)).filter(([conversationId, action]) =>
+    typeof action?.actionId === 'string'
+    && typeof action?.conversationId === 'string'
+    && action.conversationId === conversationId
+    && (action.action === 'edit' || action.action === 'retry' || action.action === 'delete' || action.action === 'compress')
+    && (
+      action.phase === 'waiting_for_idle'
+      || action.phase === 'requesting_stop'
+      || action.phase === 'stopping'
+      || action.phase === 'submitting'
+      || action.phase === 'running'
+    )
+    && typeof action.targetId === 'string'
+    && typeof action.label === 'string'
+    && validConversationActionPayload(action.commandPayload)
+    && (action.interrupt === undefined || validConversationActionInterrupt(action.interrupt))
+    && validOptionalText(action.requestId)
+    && validOptionalText(action.sentSessionId)
+    && validOptionalText(action.submittedAtCommitSeq)
+    && validOptionalText(action.blockedAtCommitSeq)
+    && validOptionalText(action.operationTurnId)
+  ));
+}
+
+function validConversationActionInterrupt(value: ConversationActionInterrupt): boolean {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && typeof value.turnId === 'string'
+    && validInterruptPhase(value.phase)
+    && validConversationCommand(value.command)
+    && validTimestamp(value.startedAt)
+    && validAutomaticRetryCount(value.automaticRetryCount)
+    && validOptionalTimestamp(value.lastSentAt)
+    && validOptionalText(value.requestId)
+    && validOptionalText(value.sentSessionId)
+  );
+}
+
+function validConversationActionPayload(value: ConversationActionPayload | undefined): boolean {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && isConversationActionRequestType(value.type)
+    && value.payload
+    && typeof value.payload === 'object'
+    && validConversationCommand(value.payload.command)
+  );
+}
+
+function validConversationCommand(value: ConversationCommandMetadata | undefined): boolean {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && typeof value.commandId === 'string'
+    && value.commandId.length > 0
+    && Number.isSafeInteger(value.expectedVersion)
+    && value.expectedVersion >= 0
+    && validTimestamp(value.issuedAt)
+  );
+}
+
+function validInterruptPhase(value: string | undefined): value is InterruptPhase {
+  return value === 'requesting' || value === 'stopping';
+}
+
+function validTimestamp(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function validOptionalTimestamp(value: number | undefined): boolean {
+  return value === undefined || validTimestamp(value);
+}
+
+function validAutomaticRetryCount(value: number | undefined): value is number {
+  return Number.isSafeInteger(value) && (value ?? -1) >= 0;
+}
+
+function validOptionalText(value: string | undefined): boolean {
+  return value === undefined || typeof value === 'string';
+}
+
 function validTurnInputRecords(
   value: Record<string, PendingTurnInputSubmission> | undefined
 ): Record<string, PendingTurnInputSubmission> {
+  const withdrawnCutoff = Date.now() - WITHDRAWN_TURN_INPUT_RETENTION_MS;
   return Object.fromEntries(Object.entries(plainRecord(value)).filter(([, submission]) =>
     typeof submission?.commandId === 'string'
     && typeof submission?.requestId === 'string'
@@ -1411,6 +2001,10 @@ function validTurnInputRecords(
     && (submission?.requestType === BridgeMessageType.TurnStart || submission?.requestType === BridgeMessageType.TurnEnqueue)
     && typeof submission?.command?.commandId === 'string'
     && submission.command.commandId === submission.commandId
+    && (
+      submission.withdrawnAt === undefined
+      || (typeof submission.withdrawnAt === 'number' && submission.withdrawnAt >= withdrawnCutoff)
+    )
   ));
 }
 
