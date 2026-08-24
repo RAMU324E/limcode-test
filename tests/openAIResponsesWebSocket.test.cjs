@@ -414,7 +414,7 @@ test('missing or invalid transport keeps the normal OpenAI Responses HTTP dry-ru
   assert.match(result.curl, /^curl /);
 });
 
-test('Gemini dry-run removes unsupported multipleOf from nested tool schemas', async () => {
+test('Gemini dry-run removes unsupported propertyNames and multipleOf from nested tool schemas', async () => {
   const request = chatRequest('request-gemini-multiple-of');
   request.tools = [{
     name: 'integer_value',
@@ -426,7 +426,13 @@ test('Gemini dry-run removes unsupported multipleOf from nested tool schemas', a
           type: 'object',
           properties: {
             title: { type: 'string' },
-            value: { type: 'number', minimum: 0, maximum: 100, multipleOf: 1 }
+            value: {
+              type: 'object',
+              propertyNames: { type: 'string' },
+              properties: {
+                score: { type: 'number', minimum: 0, maximum: 100, multipleOf: 1 }
+              }
+            }
           },
           required: ['title']
         }
@@ -442,7 +448,7 @@ test('Gemini dry-run removes unsupported multipleOf from nested tool schemas', a
     })
   });
 
-  assert.doesNotMatch(result.bodyText, /multipleOf/i);
+  assert.doesNotMatch(result.bodyText, /propertyNames|multipleOf/i);
   assert.match(result.bodyText, /"minimum":\s*0/);
   assert.match(result.bodyText, /"maximum":\s*100/);
   const declaration = result.body.tools[0].functionDeclarations[0];
