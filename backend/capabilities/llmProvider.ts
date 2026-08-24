@@ -4890,6 +4890,7 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   'else',
   'prefixItems',
   'additionalProperties',
+  'propertyNames',
   'multipleOf'
 ]);
 
