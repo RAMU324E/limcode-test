@@ -28,7 +28,7 @@ function emittedRequireClosure(entry) {
   return [...seen].map((file) => `/${path.relative(distRoot, file).split(path.sep).join('/')}`);
 }
 
-test('0.0.16扩展版本与所有默认请求头保持一致', () => {
+test('0.0.17扩展版本与所有默认请求头保持一致', () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8'));
   const identity = require(path.join(distRoot, 'shared/extensionIdentity.js'));
   const productSource = fs.readFileSync(
@@ -37,10 +37,10 @@ test('0.0.16扩展版本与所有默认请求头保持一致', () => {
   );
   const proxySource = fs.readFileSync(path.resolve('backend/capabilities/proxyFetch.ts'), 'utf8');
 
-  assert.equal(manifest.version, '0.0.16');
+  assert.equal(manifest.version, '0.0.17');
   assert.equal(identity.EXTENSION_VERSION, manifest.version);
   assert.equal(identity.EXTENSION_USER_AGENT, `${manifest.name}/${manifest.version}`);
-  assert.equal(identity.EXTENSION_USER_AGENT, 'limcode-test/0.0.16');
+  assert.equal(identity.EXTENSION_USER_AGENT, 'limcode-test/0.0.17');
   assert.match(productSource, /headers: \{ 'User-Agent': EXTENSION_USER_AGENT \}/);
   assert.match(proxySource, /requestHeaders\.set\('user-agent', EXTENSION_USER_AGENT\)/);
 });
