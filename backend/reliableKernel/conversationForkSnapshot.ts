@@ -894,6 +894,14 @@ function mapped(values: Map<string, string>, sourceId: string, label: string): s
 }
 
 function copyId(targetConversationId: string, kind: string, sourceId: string): string {
+  return conversationForkSnapshotCopyId(targetConversationId, kind, sourceId);
+}
+
+export function conversationForkSnapshotCopyId(
+  targetConversationId: string,
+  kind: string,
+  sourceId: string
+): string {
   const digest = createHash('sha256')
     .update('limcode-conversation-fork-snapshot\0')
     .update(targetConversationId)

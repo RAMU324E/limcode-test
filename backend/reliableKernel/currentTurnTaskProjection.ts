@@ -14,6 +14,7 @@ import {
   type TaskListSnapshotView
 } from '../../shared/taskListProjection';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import { conversationForkSnapshotCopyId } from './conversationForkSnapshot';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryRead } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
 
@@ -266,7 +267,7 @@ export async function readCurrentTurnTaskCard(
       ...order
     };
     if (call.tool_name === TASK_LIST_TOOL_NAME) {
-      const operation = taskListOperationFromSettledArtifact(artifact, toolCallId);
+      const operation = taskListOperationFromSettledArtifact(artifact, toolCallId, conversationId);
       if (!operation) continue;
       operations.push({ ...common, toolName: TASK_LIST_TOOL_NAME, operation });
       continue;
@@ -277,7 +278,8 @@ export async function readCurrentTurnTaskCard(
     const operation = approvedSubmitPlanTaskOperation({
       argumentsValue: await readJson(contentStore, argsMetadata, 'submit_plan arguments'),
       resultArtifactValue: artifact,
-      toolCallId
+      toolCallId,
+      conversationId
     });
     if (!operation) continue;
     operations.push({
@@ -316,9 +318,10 @@ export function freezeCurrentTurnTaskCard(projection: CurrentTurnTaskProjection)
 /** Non-success is not task state; successful settlement alone receives strict canonical parsing. */
 export function taskListOperationFromSettledArtifact(
   value: unknown,
-  expectedToolCallId: string
+  expectedToolCallId: string,
+  conversationId?: string
 ): TaskListToolOperationRecord | undefined {
-  const envelope = taskArtifactEnvelope(value, expectedToolCallId);
+  const envelope = taskArtifactEnvelope(value, expectedToolCallId, conversationId);
   if (envelope.status !== 'succeeded') return undefined;
   const detail = asRecord(envelope.detail);
   if (!detail || detail.kind !== 'task-list') {
@@ -331,8 +334,9 @@ export function approvedSubmitPlanTaskOperation(input: {
   argumentsValue: unknown;
   resultArtifactValue: unknown;
   toolCallId: string;
+  conversationId?: string;
 }): TaskListToolOperationRecord | undefined {
-  const envelope = taskArtifactEnvelope(input.resultArtifactValue, input.toolCallId);
+  const envelope = taskArtifactEnvelope(input.resultArtifactValue, input.toolCallId, input.conversationId);
   if (envelope.status !== 'succeeded') return undefined;
   const output = submitPlanOutputFromResult(envelope.detail);
   if (output?.status !== 'approved' || output.executionTarget !== 'current_conversation') return undefined;
@@ -423,10 +427,21 @@ function cloneOperationFact(fact: CurrentTurnTaskOperationFact): CurrentTurnTask
   };
 }
 
-function taskArtifactEnvelope(value: unknown, expectedToolCallId: string): TaskArtifactEnvelope {
+function taskArtifactEnvelope(
+  value: unknown,
+  expectedToolCallId: string,
+  conversationId?: string
+): TaskArtifactEnvelope {
   const record = asRecord(value);
   if (!record) throw new Error(`ToolResultArtifact ${expectedToolCallId} content is not an object.`);
-  if (record.toolCallId !== expectedToolCallId) {
+  if (
+    record.toolCallId !== expectedToolCallId
+    && (
+      typeof record.toolCallId !== 'string'
+      || conversationId === undefined
+      || conversationForkSnapshotCopyId(conversationId, 'tool_call', record.toolCallId) !== expectedToolCallId
+    )
+  ) {
     throw new Error(`ToolResultArtifact ${expectedToolCallId} identifies another ToolCall.`);
   }
   if (typeof record.status !== 'string') throw new Error(`ToolResultArtifact ${expectedToolCallId} has no status.`);

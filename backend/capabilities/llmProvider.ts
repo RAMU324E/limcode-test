@@ -368,7 +368,7 @@ export async function startLlmProvider(
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
     };
-    const provider = installGeminiSchemaEncoder(
+    const provider = installGeminiProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
@@ -1151,7 +1151,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = installGeminiSchemaEncoder(unified.createLLMFromConfig({
+  const provider = installGeminiProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -2595,7 +2595,7 @@ async function resolveSummaryProvider(
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = installGeminiSchemaEncoder(unified.createLLMFromConfig({
+  const provider = installGeminiProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -4433,8 +4433,11 @@ function toUnifiedRequest(
   generationConfig?: LlmGenerationConfigRecord,
   providerKind?: LlmProviderKind
 ): UnifiedLLMRequest {
+  const contents = providerKind === 'gemini'
+    ? mergeGeminiFunctionResponseTurns(request.contents)
+    : request.contents;
   return {
-    contents: request.contents.flatMap((content) => toUnifiedContents(content, providerKind)),
+    contents: contents.flatMap((content) => toUnifiedContents(content, providerKind)),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map(toUnifiedPart) } } : {}),
     ...(request.tools.length === 0 ? {} : {
       tools: [{
@@ -4443,6 +4446,29 @@ function toUnifiedRequest(
     }),
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {})
   };
+}
+
+function mergeGeminiFunctionResponseTurns(contents: readonly MessageContent[]): MessageContent[] {
+  const merged: MessageContent[] = [];
+  for (let index = 0; index < contents.length; index += 1) {
+    const content = contents[index];
+    if (content.role !== 'user' || content.parts.length === 0 || !content.parts.every(isFunctionResponsePart)) {
+      merged.push(content);
+      continue;
+    }
+    const parts: ContentPart[] = [...content.parts];
+    while (
+      index + 1 < contents.length
+      && contents[index + 1].role === 'user'
+      && contents[index + 1].parts.length > 0
+      && contents[index + 1].parts.every(isFunctionResponsePart)
+    ) {
+      parts.push(...contents[index + 1].parts);
+      index += 1;
+    }
+    merged.push(parts.length === content.parts.length ? content : { ...content, parts });
+  }
+  return merged;
 }
 
 function toUnifiedContents(
@@ -4581,6 +4607,18 @@ function providerCompatibleFunctionParameters(
   return compatible as UnifiedFunctionDeclaration['parameters'];
 }
 
+function installGeminiProviderCompatibility<T>(
+  provider: T,
+  providerKind: LlmProviderKind,
+  modelId: string
+): T {
+  return installGeminiOpenAICompatibleThoughtSignatures(
+    installGeminiSchemaEncoder(provider, providerKind, modelId),
+    providerKind,
+    modelId
+  );
+}
+
 function installGeminiSchemaEncoder<T>(
   provider: T,
   providerKind: LlmProviderKind,
@@ -4604,6 +4642,185 @@ function installGeminiSchemaEncoder<T>(
   };
   format.__limcodeGeminiSchemaEncoder = true;
   return provider;
+}
+
+const GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR = 'skip_thought_signature_validator';
+
+export function installGeminiOpenAICompatibleThoughtSignatures<T>(
+  provider: T,
+  providerKind: LlmProviderKind,
+  modelId: string
+): T {
+  if (
+    providerKind !== 'openai-compatible'
+    || geminiThinkingCapabilityForModel(modelId).kind !== 'thinkingLevel'
+  ) return provider;
+  const runtimeProvider = provider as T & {
+    format?: {
+      encodeRequest?: (request: unknown, stream: boolean) => unknown;
+      decodeResponse?: (raw: unknown) => unknown;
+      decodeStreamChunk?: (raw: unknown, state: unknown) => unknown;
+      __limcodeGeminiOpenAIThoughtSignatures?: true;
+    };
+  };
+  const format = runtimeProvider.format;
+  if (!format || format.__limcodeGeminiOpenAIThoughtSignatures) return provider;
+
+  if (typeof format.encodeRequest === 'function') {
+    const encodeRequest = format.encodeRequest.bind(format);
+    format.encodeRequest = (request, stream) => {
+      const encoded = encodeRequest(request, stream);
+      attachGeminiOpenAIThoughtSignaturesToRequest(encoded, request);
+      return encoded;
+    };
+  }
+  if (typeof format.decodeResponse === 'function') {
+    const decodeResponse = format.decodeResponse.bind(format);
+    format.decodeResponse = (raw) => {
+      const signatures = readGeminiOpenAIToolCallSignatures(raw, false);
+      const decoded = decodeResponse(raw);
+      attachGeminiSignaturesToUnifiedCalls(decoded, signatures);
+      return decoded;
+    };
+  }
+  if (typeof format.decodeStreamChunk === 'function') {
+    const decodeStreamChunk = format.decodeStreamChunk.bind(format);
+    const streamSignatures = new WeakMap<object, GeminiOpenAIToolCallSignatures>();
+    format.decodeStreamChunk = (raw, state) => {
+      const stateKey = isRecord(state) ? state : format;
+      const signatures = streamSignatures.get(stateKey) ?? emptyGeminiOpenAIToolCallSignatures();
+      mergeGeminiOpenAIToolCallSignatures(signatures, readGeminiOpenAIToolCallSignatures(raw, true));
+      streamSignatures.set(stateKey, signatures);
+      const decoded = decodeStreamChunk(raw, state);
+      attachGeminiSignaturesToUnifiedCalls(decoded, signatures);
+      return decoded;
+    };
+  }
+  format.__limcodeGeminiOpenAIThoughtSignatures = true;
+  return provider;
+}
+
+interface GeminiOpenAIToolCallSignatures {
+  byId: Map<string, string>;
+  byIndex: Map<number, string>;
+}
+
+function attachGeminiOpenAIThoughtSignaturesToRequest(encoded: unknown, source: unknown): void {
+  if (!isRecord(encoded) || !isRecord(source)) return;
+  const messages = Array.isArray(encoded.messages) ? encoded.messages.filter(isRecord) : [];
+  const encodedCallGroups = messages.flatMap((message) =>
+    message.role === 'assistant' && Array.isArray(message.tool_calls)
+      ? [message.tool_calls.filter(isRecord)]
+      : []);
+  const sourceContents = Array.isArray(source.contents) ? source.contents.filter(isRecord) : [];
+  const sourceCallGroups = sourceContents.flatMap((content) => {
+    if (content.role !== 'model' || !Array.isArray(content.parts)) return [];
+    const calls = content.parts.filter((part) => isRecord(part) && isRecord(part.functionCall));
+    return calls.length > 0 ? [calls] : [];
+  });
+
+  for (let groupIndex = 0; groupIndex < Math.min(encodedCallGroups.length, sourceCallGroups.length); groupIndex += 1) {
+    const encodedCalls = encodedCallGroups[groupIndex];
+    const sourceCalls = sourceCallGroups[groupIndex];
+    const sourceSignatures = sourceCalls.map(geminiSignatureFromUnifiedPart);
+    const transferredGroup = sourceSignatures.every((signature) => !signature);
+    for (let callIndex = 0; callIndex < Math.min(encodedCalls.length, sourceCalls.length); callIndex += 1) {
+      const signature = sourceSignatures[callIndex]
+        ?? (transferredGroup ? GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR : undefined);
+      if (!signature) continue;
+      const toolCall = encodedCalls[callIndex];
+      const extraContent = isRecord(toolCall.extra_content) ? toolCall.extra_content : {};
+      const google = isRecord(extraContent.google) ? extraContent.google : {};
+      const attachedSignature = normalizedSignatureString(google.thought_signature)
+        ?? normalizedSignatureString(google.thoughtSignature)
+        ?? signature;
+      toolCall.extra_content = {
+        ...extraContent,
+        google: {
+          ...google,
+          thought_signature: attachedSignature,
+          thoughtSignature: attachedSignature
+        }
+      };
+    }
+  }
+}
+
+function readGeminiOpenAIToolCallSignatures(raw: unknown, stream: boolean): GeminiOpenAIToolCallSignatures {
+  const signatures = emptyGeminiOpenAIToolCallSignatures();
+  if (!isRecord(raw) || !Array.isArray(raw.choices)) return signatures;
+  const choice = raw.choices.find(isRecord);
+  if (!choice) return signatures;
+  const rawMessage = choice[stream ? 'delta' : 'message'];
+  if (!isRecord(rawMessage) || !Array.isArray(rawMessage.tool_calls)) return signatures;
+  rawMessage.tool_calls
+    .filter((toolCall): toolCall is Record<string, unknown> => isRecord(toolCall))
+    .forEach((toolCall, ordinal) => {
+      const signature = geminiOpenAIToolCallSignature(toolCall);
+      if (!signature) return;
+      const callId = normalizedSignatureString(toolCall.id);
+      const index = typeof toolCall.index === 'number' && Number.isSafeInteger(toolCall.index)
+        ? toolCall.index
+        : ordinal;
+      if (callId) signatures.byId.set(callId, signature);
+      signatures.byIndex.set(index, signature);
+    });
+  return signatures;
+}
+
+function geminiOpenAIToolCallSignature(toolCall: Record<string, unknown>): string | undefined {
+  const extraContent = isRecord(toolCall.extra_content) ? toolCall.extra_content : undefined;
+  const google = isRecord(extraContent?.google) ? extraContent.google : undefined;
+  const vertex = isRecord(extraContent?.vertex) ? extraContent.vertex : undefined;
+  return normalizedSignatureString(google?.thought_signature)
+    ?? normalizedSignatureString(google?.thoughtSignature)
+    ?? normalizedSignatureString(vertex?.thought_signature)
+    ?? normalizedSignatureString(vertex?.thoughtSignature);
+}
+
+function attachGeminiSignaturesToUnifiedCalls(
+  decoded: unknown,
+  signatures: GeminiOpenAIToolCallSignatures
+): void {
+  if (!isRecord(decoded)) return;
+  const candidates = [
+    ...(Array.isArray(decoded.functionCalls) ? decoded.functionCalls : []),
+    ...(Array.isArray(decoded.partsDelta) ? decoded.partsDelta : []),
+    ...(isRecord(decoded.content) && Array.isArray(decoded.content.parts) ? decoded.content.parts : [])
+  ];
+  const seen = new Set<object>();
+  let ordinal = 0;
+  for (const candidate of candidates) {
+    if (!isRecord(candidate) || !isRecord(candidate.functionCall) || seen.has(candidate)) continue;
+    seen.add(candidate);
+    const callId = normalizedSignatureString(candidate.functionCall.callId);
+    const signature = (callId ? signatures.byId.get(callId) : undefined) ?? signatures.byIndex.get(ordinal);
+    ordinal += 1;
+    if (!signature) continue;
+    const existing = isRecord(candidate.thoughtSignatures) ? candidate.thoughtSignatures : {};
+    candidate.thoughtSignatures = { ...existing, gemini: signature };
+  }
+}
+
+function geminiSignatureFromUnifiedPart(part: Record<string, unknown>): string | undefined {
+  const signatures = isRecord(part.thoughtSignatures) ? part.thoughtSignatures : undefined;
+  const mapped = normalizedSignatureString(signatures?.gemini);
+  if (mapped) return mapped;
+  const portable = normalizedSignatureString(part.thoughtSignature);
+  if (!portable) return undefined;
+  return portable.startsWith('gemini:') ? portable.slice('gemini:'.length) : portable;
+}
+
+function emptyGeminiOpenAIToolCallSignatures(): GeminiOpenAIToolCallSignatures {
+  return { byId: new Map(), byIndex: new Map() };
+}
+
+function mergeGeminiOpenAIToolCallSignatures(
+  target: GeminiOpenAIToolCallSignatures,
+  source: GeminiOpenAIToolCallSignatures
+): void {
+  for (const [id, signature] of source.byId) target.byId.set(id, signature);
+  for (const [index, signature] of source.byIndex) target.byIndex.set(index, signature);
 }
 
 function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unknown {

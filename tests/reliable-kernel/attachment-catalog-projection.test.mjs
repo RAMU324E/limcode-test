@@ -749,7 +749,7 @@ test('fork snapshot preserves source attachment handle sequence for the copied p
   });
 });
 
-test('shared tool-pair segment selects one call/result alias pair from the target Conversation', async () => {
+test('shared tool-pair segment ignores deleted-fork aliases and selects the target Conversation pair', async () => {
   await withRuntime('attachment-catalog-tool-alias', async (database, fixtureContent) => {
     const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
     const steps = [repository('ContextSegment').insert({
@@ -799,6 +799,16 @@ test('shared tool-pair segment selects one call/result alias pair from the targe
       );
     }
     steps.push(
+      repository('ContextSegmentSource').insert({
+        id: 'source-tool-call-deleted-fork', segment_id: 'segment-shared-tool-pair',
+        source_kind: 'tool_call', source_id: 'tool-call-deleted-fork',
+        source_revision: 1n, created_at: NOW
+      }),
+      repository('ContextSegmentSource').insert({
+        id: 'source-tool-result-deleted-fork', segment_id: 'segment-shared-tool-pair',
+        source_kind: 'tool_model_result', source_id: 'tool-result-deleted-fork',
+        source_revision: 1n, created_at: NOW
+      }),
       repository('Attachment').insert({
         id: 'attachment-tool-target', sha256: 'e'.repeat(64), byte_length: 42n,
         mime_type: 'image/png', name: 'tool-target.png', storage_mode: 'managed',

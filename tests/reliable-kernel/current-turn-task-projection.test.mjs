@@ -17,6 +17,9 @@ const {
   taskListOperationFromSettledArtifact
 } = require(path.join(compiledRoot, 'backend/reliableKernel/currentTurnTaskProjection.js'));
 const {
+  conversationForkSnapshotCopyId
+} = require(path.join(compiledRoot, 'backend/reliableKernel/conversationForkSnapshot.js'));
+const {
   requireTaskListOperation,
   taskListOperationFromArgs
 } = require(path.join(compiledRoot, 'shared/taskListProjection.js'));
@@ -257,6 +260,25 @@ test('durable artifact hard-cut：只认 canonical operation，Plan 必须明确
     detail: { kind: 'task-list', operation }
   };
   assert.deepEqual(taskListOperationFromSettledArtifact(settled, 'task-call'), operation);
+
+  const forkConversationId = 'conversation-fork-target';
+  const sourceToolCallId = 'rk_tool_call_source';
+  const targetToolCallId = conversationForkSnapshotCopyId(
+    forkConversationId,
+    'tool_call',
+    sourceToolCallId
+  );
+  assert.deepEqual(taskListOperationFromSettledArtifact(
+    { ...settled, toolCallId: sourceToolCallId },
+    targetToolCallId,
+    forkConversationId
+  ), operation);
+  assert.throws(() => taskListOperationFromSettledArtifact(
+    { ...settled, toolCallId: 'unrelated-tool-call' },
+    targetToolCallId,
+    forkConversationId
+  ), /identifies another ToolCall/);
+
   for (const status of ['failed', 'rejected', 'cancelled']) {
     assert.equal(taskListOperationFromSettledArtifact({
       toolCallId: 'task-call',
