@@ -130,6 +130,10 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
   const thoughtView = source('webview/src/components/content/parts/ThoughtPartView.vue');
   assert.match(thoughtView, /v-html="previewHtml"/);
   assert.match(thoughtView, /<TextPartView[\s\S]*?\smarkdown(?:\s|\n)/);
+  assert.match(thoughtView, /<TextPartView[\s\S]*?:text="text"[\s\S]*?:streaming="streaming"/,
+    'expanded thought Markdown must consume the authoritative stream instead of reclassifying smoothed frames as final replacements');
+  assert.doesNotMatch(thoughtView, /<TextPartView[\s\S]*?:text="displayedText"[\s\S]*?:show-streaming-indicator="false"/,
+    'expanded thought Markdown must not smooth the already-smoothed preview stream a second time');
   assert.match(thoughtView, /preserve-soft-breaks/);
   assert.doesNotMatch(thoughtView, /<pre>\{\{ displayedText \}\}<\/pre>/);
 
@@ -158,8 +162,11 @@ test('thought cards render Markdown and merge adjacent reasoning output items', 
     thought('reasoning-1', '**Analyzing context**'),
     thought('reasoning-2', '**Inspecting implementation**')
   ]);
+  const single = toRenderNodes([thought('reasoning-1', '**Analyzing context**')]);
   assert.deepEqual(merged.map((node) => node.kind), ['thought']);
   assert.equal(merged[0].props.text, '**Analyzing context**\n**Inspecting implementation**');
+  assert.equal(merged[0].key, single[0].key,
+    'appending an adjacent reasoning item must preserve the thought component and its expanded state');
 
   const splitTextItems = toRenderNodes([text('message-1', 'first'), text('message-2', 'second')]);
   assert.deepEqual(splitTextItems.map((node) => node.kind), ['text', 'text']);
@@ -464,11 +471,13 @@ test('长流积压达到阈值时直刷，terminal时立即显示完整文本', 
   source.value = terminalTarget;
   await vue.nextTick();
   assert.equal(smooth.displayedText.value, burst, '小积压在流中仍保留平滑输出');
+  assert.equal(smooth.replacing.value, false, '活动流只能追加正文，不能进入会把展开内容淡出的最终替换动画');
   assert.ok(frames.size > 0);
 
   streaming.value = false;
   await vue.nextTick();
   assert.equal(smooth.displayedText.value, terminalTarget, 'terminal切换必须立即同步完整文本');
+  assert.equal(smooth.replacing.value, false, '流式结束不能把思考正文淡出');
   assert.equal(frames.size, 0, 'terminal切换必须取消未执行的追赶帧');
 
   const textPartSource = fs.readFileSync(

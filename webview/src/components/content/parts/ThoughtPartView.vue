@@ -113,11 +113,13 @@ function lastNonEmptyLine(text: string): string {
       <span class="thought-tail">{{ tailText }}</span>
     </template>
 
-    <!-- 折叠时不要渲染完整思考正文。否则流式阶段每帧都会更新隐藏 Markdown，长思考会明显掉帧。 -->
+    <!-- 折叠时不渲染完整 Markdown；展开后由正文组件直接消费原始流，不能把预览的平滑帧误当成最终文本替换。 -->
     <TextPartView
       v-if="expanded"
       class="thought-content"
-      :text="displayedText"
+      :text="text"
+      :streaming="streaming"
+      streaming-phase="thinking"
       markdown
       preserve-soft-breaks
       :show-streaming-indicator="false"

@@ -100,8 +100,12 @@ export function toRenderNodes(parts: readonly ContentPart[]): RichRenderNode[] {
           }
         }
       }
+      const firstOutputItemId = buffer.parts[0]?.outputItem?.id;
       nodes.push({
-        key: `thought:${buffer.startIndex}:${buffer.endIndex}`,
+        // Adjacent reasoning output items share one visible card. Anchor that card to its first
+        // provider item so appending another reasoning item updates the existing Vue component
+        // instead of remounting it and resetting its local expanded state.
+        key: firstOutputItemId ? `thought:${firstOutputItemId}` : `thought:${buffer.startIndex}`,
         kind: 'thought',
         props: {
           text: normalizedText.trimEnd(),
