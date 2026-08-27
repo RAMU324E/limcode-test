@@ -444,6 +444,95 @@ test('text summary inspects each unique managed media body once and returns reus
   }
 });
 
+test('provider media rejection preserves the attachment with an explicit unknown observation and continues summary', async () => {
+  const fixture = observationCompactRequest('llm_summary');
+  fixture.request.id = 'observation-provider-rejected';
+  fixture.request.blockId = 'observation-provider-rejected-block';
+  const base64 = fixture.bytes.toString('base64');
+  const requestBodies = [];
+  let rejectObservation = true;
+  const structured = [
+    '目标', '- Preserve F1 without inventing visual details', '',
+    '重要约束、决定和准确标识', '- F1 remains attached but unobserved', '',
+    '工作状态', '  - 已完成', '    - Text compression completed',
+    '  - 正在做', '    - 无', '  - 受阻', '    - Image observation unavailable', '',
+    '下一步', '- Retry F1 with a compatible provider', '', '相关文件', '- visual-evidence.png'
+  ].join('\n');
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString('utf8');
+    requestBodies.push(body);
+    const isObservation = body.includes('Attachment observation contract revision');
+    if (isObservation && rejectObservation) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Upstream request failed', type: 'upstream_error' } }));
+      return;
+    }
+    const content = isObservation
+      ? JSON.stringify({
+          attachmentRef: 'F1',
+          summary: 'Recovered real visual observation.',
+          salientFacts: ['The retry inspected the original image.'],
+          uncertainties: []
+        })
+      : structured;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-fallback-summary', object: 'chat.completion', created: 1, model: 'gpt-test',
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const capability = createLlmProviderCapability({
+    settings: async () => ({
+      ...providerConfig('openai-compatible', `http://127.0.0.1:${address.port}/v1`),
+      stream: false
+    }),
+    compressionSettings: async () => undefined,
+    async resolveAttachment(input) {
+      return { inlineData: {
+        mimeType: 'image/png', name: 'visual-evidence.png', data: base64,
+        attachmentId: input.attachmentId, sizeBytes: fixture.bytes.byteLength
+      } };
+    }
+  });
+  try {
+    const terminal = await waitForCompactTerminal(capability, fixture.request);
+    assert.equal(terminal.type, 'llm:compactDone', terminal.payload.message);
+    assert.equal(requestBodies.length, 2, 'one rejected observation must be followed by text summary');
+    assert.match(requestBodies[0], new RegExp(base64.slice(0, 24)));
+    assert.doesNotMatch(requestBodies[1], new RegExp(base64.slice(0, 24)));
+    assert.match(requestBodies[1], /Attachment content was not observed/);
+    const fallbackObservation = {
+      attachmentRef: 'F1',
+      summary: 'Attachment F1 (visual-evidence.png) was preserved without content analysis.',
+      salientFacts: [
+        'Original attachment preserved as F1.',
+        `Metadata: mimeType=image/png; sizeBytes=${fixture.bytes.byteLength}.`
+      ],
+      uncertainties: ['Attachment content was not observed; visual or media details remain unknown.']
+    };
+    assert.deepEqual(terminal.payload.result.attachmentObservations, [fallbackObservation]);
+
+    rejectObservation = false;
+    const retryFixture = observationCompactRequest('llm_summary', fallbackObservation);
+    const retried = await waitForCompactTerminal(capability, retryFixture.request);
+    assert.equal(retried.type, 'llm:compactDone', retried.payload.message);
+    assert.equal(requestBodies.filter((body) => body.includes('Attachment observation contract revision')).length, 2);
+    assert.equal(retried.payload.result.attachmentObservations[0].summary, 'Recovered real visual observation.');
+  } finally {
+    capability.dispose();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('successful media observation is reused when a later summary attempt retries', async () => {
   const fixture = observationCompactRequest('llm_summary');
   fixture.request.id = 'observation-summary-retry';
@@ -553,7 +642,7 @@ test('compact dry-run exposes observation calls and never repeats media in the s
   assert.match(result.note, /F 附件/);
 });
 
-test('local summary fails explicitly for uncached media and reuses cached observations without resolution', async () => {
+test('local summary preserves uncached media as unknown and reuses real cached observations without resolution', async () => {
   const missing = observationCompactRequest('deterministic_summary');
   let resolverCalls = 0;
   const options = {
@@ -569,10 +658,18 @@ test('local summary fails explicitly for uncached media and reuses cached observ
   };
   const capability = createLlmProviderCapability(options);
   try {
-    const failed = await waitForCompactTerminal(capability, missing.request);
-    assert.equal(failed.type, 'llm:compactError');
-    assert.match(failed.payload.message, /media_semantics_unavailable/);
-    assert.equal(failed.payload.rawError.code, 'media_semantics_unavailable');
+    const fallback = await waitForCompactTerminal(capability, missing.request);
+    assert.equal(fallback.type, 'llm:compactDone', fallback.payload.message);
+    assert.deepEqual(fallback.payload.result.attachmentObservations, [{
+      attachmentRef: 'F1',
+      summary: 'Attachment F1 (visual-evidence.png) was preserved without content analysis.',
+      salientFacts: [
+        'Original attachment preserved as F1.',
+        `Metadata: mimeType=image/png; sizeBytes=${missing.bytes.byteLength}.`
+      ],
+      uncertainties: ['Attachment content was not observed; visual or media details remain unknown.']
+    }]);
+    assert.match(fallback.payload.result.contents[1].parts[0].text, /Attachment content was not observed/);
     assert.equal(resolverCalls, 0);
 
     const uncontracted = observationCompactRequest('deterministic_summary');
