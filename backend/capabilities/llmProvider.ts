@@ -1795,6 +1795,8 @@ interface SemanticContentsProjection {
 }
 
 const ATTACHMENT_OBSERVATION_TARGET_TOKENS = 1_024;
+const ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY =
+  'Attachment content was not observed; visual or media details remain unknown.';
 
 export class LlmMediaSemanticsUnavailableError extends Error {
   public readonly code = 'media_semantics_unavailable';
@@ -1876,48 +1878,46 @@ async function prepareCompressionMediaSemanticsUncached(
   const bodies = collectCompressionMediaBodies(request, requirementsById);
   const observationsByRef = new Map<string, LlmAttachmentObservation>();
   const missing = contract.requirements.filter((requirement) => {
-    if (!requirement.cachedObservation) return true;
+    if (!requirement.cachedObservation || isUnavailableAttachmentObservation(requirement.cachedObservation)) return true;
     observationsByRef.set(requirement.attachmentRef, cloneAttachmentObservation(requirement.cachedObservation));
     return false;
   });
 
   let provider = initialProvider;
   if (missing.length > 0) {
-    if (methodConfig.kind === 'deterministic_summary' || methodConfig.kind === 'manual_summary') {
-      throw new LlmMediaSemanticsUnavailableError(
-        `${methodConfig.kind} cannot inspect uncached media; choose a Provider-backed summary method.`
+    const localOnly = methodConfig.kind === 'deterministic_summary' || methodConfig.kind === 'manual_summary';
+    if (!localOnly) provider ??= await resolveSummaryProvider(request, methodConfig, options);
+    if (localOnly || !provider?.provider) {
+      missing.forEach((requirement) => observationsByRef.set(
+        requirement.attachmentRef,
+        unavailableAttachmentObservation(requirement)
+      ));
+    } else {
+      const preparation = createMultimodalPreparationContext();
+      const analyzed = await mapWithBoundedConcurrency(
+        missing,
+        isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
+        async (requirement, _index, siblingSignal) => {
+          const body = bodies.get(requirement.attachmentId);
+          if (!body) return unavailableAttachmentObservation(requirement);
+          try {
+            return await analyzeCompressionAttachment(
+              requirement,
+              body,
+              provider!,
+              options,
+              preparation,
+              siblingSignal
+            );
+          } catch (error) {
+            if (isRequestAbort(siblingSignal)) throw error;
+            return unavailableAttachmentObservation(requirement);
+          }
+        },
+        signal
       );
+      analyzed.forEach((observation) => observationsByRef.set(observation.attachmentRef, observation));
     }
-    provider ??= await resolveSummaryProvider(request, methodConfig, options);
-    if (!provider.provider) {
-      throw new LlmMediaSemanticsUnavailableError(
-        'the frozen summary Provider is unavailable, so uncached media cannot be inspected.'
-      );
-    }
-    const preparation = createMultimodalPreparationContext();
-    const analyzed = await mapWithBoundedConcurrency(
-      missing,
-      isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
-      async (requirement, _index, siblingSignal) => {
-        const body = bodies.get(requirement.attachmentId);
-        if (!body) {
-          throw new LlmMediaSemanticsUnavailableError(
-            'the frozen compression source does not contain a resolvable media body.',
-            requirement.attachmentRef
-          );
-        }
-        return analyzeCompressionAttachment(
-          requirement,
-          body,
-          provider!,
-          options,
-          preparation,
-          siblingSignal
-        );
-      },
-      signal
-    );
-    analyzed.forEach((observation) => observationsByRef.set(observation.attachmentRef, observation));
   }
 
   const observations = contract.requirements.map((requirement) => {
@@ -1973,7 +1973,7 @@ async function prepareCompressionMediaSemanticsDryRun(
   const observations: LlmAttachmentObservation[] = [];
   const observationCalls: SummaryProviderCall[] = [];
   for (const requirement of contract.requirements) {
-    if (requirement.cachedObservation) {
+    if (requirement.cachedObservation && !isUnavailableAttachmentObservation(requirement.cachedObservation)) {
       observations.push(cloneAttachmentObservation(requirement.cachedObservation));
       continue;
     }
@@ -2419,6 +2419,24 @@ function cloneAttachmentObservation(observation: LlmAttachmentObservation): LlmA
     salientFacts: [...observation.salientFacts],
     uncertainties: [...observation.uncertainties]
   };
+}
+
+function unavailableAttachmentObservation(
+  requirement: LlmAttachmentObservationRequirement
+): LlmAttachmentObservation {
+  return {
+    attachmentRef: requirement.attachmentRef,
+    summary: `Attachment ${requirement.attachmentRef} (${requirement.name}) was preserved without content analysis.`,
+    salientFacts: [
+      `Original attachment preserved as ${requirement.attachmentRef}.`,
+      `Metadata: mimeType=${requirement.mimeType}; sizeBytes=${requirement.sizeBytes}.`
+    ],
+    uncertainties: [ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY]
+  };
+}
+
+function isUnavailableAttachmentObservation(observation: LlmAttachmentObservation): boolean {
+  return observation.uncertainties.includes(ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY);
 }
 
 async function compactWithSummary(
