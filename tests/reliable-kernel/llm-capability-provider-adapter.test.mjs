@@ -1715,7 +1715,7 @@ test('LLM capability adapter 用显式ordinal稳定合并无Provider id调用并
   );
 });
 
-test('LLM capability adapter 将 429、网络错误和所有可恢复的终态前关闭映射为可靠 Provider transient reason', async () => {
+test('LLM capability adapter 将 429、流截断、网络错误和所有可恢复的终态前关闭映射为可靠 Provider transient reason', async () => {
   const retryablePreTerminalCloses = [
     [1000, ''],
     [1001, ' Going Away'],
@@ -1730,6 +1730,9 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
   ];
   for (const [message, rawError, reason] of [
     ['temporary failure', { status: 429 }, 'rate_limited'],
+    ['gemini SSE stream ended without provider terminal evidence.', {
+      code: 'LLM_STREAM_TRUNCATED', phase: 'response_body'
+    }, 'connection_interrupted'],
     ['temporary failure', { code: 'ECONNRESET', message: 'socket hang up' }, 'connection_interrupted'],
     ...retryablePreTerminalCloses.flatMap(([closeCode, closeReason]) => [false, true].map(
       (transportAttemptsExhausted) => [
@@ -1756,7 +1759,10 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
       adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
       (error) => error instanceof kernel.ProviderTransientError
         && error.reason === reason
-        && (rawError?.closeCode === undefined || error.retryAfterOutput === true)
+        && (
+          (rawError?.closeCode === undefined && rawError?.code !== 'LLM_STREAM_TRUNCATED')
+          || error.retryAfterOutput === true
+        )
     );
   }
 });
