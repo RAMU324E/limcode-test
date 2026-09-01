@@ -1850,6 +1850,9 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   if (openAIResponsesWebSocketTimeout) {
     return new ProviderTransientError('connection_interrupted', message, true);
   }
+  if (/\bllm_stream_truncated\b/.test(signature)) {
+    return new ProviderTransientError('connection_interrupted', message, true);
+  }
   if (receivedSemanticOutput === true) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
   }
