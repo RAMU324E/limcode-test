@@ -2147,6 +2147,40 @@ test('冻结模型配置完整覆盖模型级字段并关闭 capability 内部�
   assert.throws(() => kernel.applyFrozenModelProviderConfig(base, 'unknown-model'), /does not contain/);
 });
 
+test('模型没有专属 modelConfig 时保留渠道级 contextWindowTokens', () => {
+  const base = {
+    id: 'provider-config',
+    name: 'Provider',
+    provider: 'gemini',
+    baseUrl: 'https://example.test/v1',
+    model: 'gemini-large',
+    models: [{ id: 'gemini-large', name: 'Gemini Large' }],
+    apiKey: 'secret',
+    toolCallFormat: 'function-call',
+    openaiResponsesTransport: 'http',
+    stream: true,
+    retryOnError: true,
+    retryMaxAttempts: 3,
+    enableMultimodalTools: true,
+    contextWindowTokens: 1_000_000,
+    headers: { Base: 'yes' },
+    generationConfig: { temperature: 0.5 },
+    requestBody: { base: true },
+    modelConfigs: [],
+    createdAt: 1,
+    updatedAt: 1
+  };
+  const resolved = kernel.applyFrozenModelProviderConfig(base, 'gemini-large');
+  // 之前这里会被误删成 undefined，导致压缩准入回落到 200K 默认窗口而报 compression_request_too_large。
+  assert.equal(resolved.contextWindowTokens, 1_000_000);
+  // 其余渠道级字段与既有行为一致：没有 modelConfig 时一律保留。
+  assert.deepEqual(resolved.headers, { Base: 'yes' });
+  assert.deepEqual(resolved.generationConfig, { temperature: 0.5 });
+  assert.deepEqual(resolved.requestBody, { base: true });
+  assert.equal(resolved.retryOnError, false);
+  assert.equal(resolved.retryMaxAttempts, 0);
+});
+
 test('LLM capability adapter interleaves typed attachment catalog checkpoint and deltas', async () => {
   const sourceAttachment = {
     attachmentId: 'attachment-source-pdf',
