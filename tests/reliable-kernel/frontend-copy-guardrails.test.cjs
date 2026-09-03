@@ -67,7 +67,7 @@ test('front-end copy uses natural Agent and status wording', () => {
 
 test('渠道保存请求不制造脱离本地状态的 updatedAt', () => {
   const store = source('webview/src/stores/useGlobalSettingsStore.ts');
-  const saveMethod = store.match(/saveLlmProviderConfigs\(\): void \{[\s\S]*?\n    \},\n    queueLlmCompressionConfigsAutoSave/)?.[0];
+  const saveMethod = store.match(/saveLlmProviderConfigs\(\): void \{[\s\S]*?\r?\n    \},\r?\n    queueLlmCompressionConfigsAutoSave/)?.[0];
 
   assert.ok(saveMethod, 'saveLlmProviderConfigs source is missing');
   assert.doesNotMatch(saveMethod, /updatedAt:\s*Date\.now\(\)/);
