@@ -470,8 +470,8 @@ test('Agent loop 将 Provider 失败部分输出物化为不进入 Context 的�
             type: 'llm:error',
             payload: {
               requestId: llmRequest.id,
-              message: 'socket hang up after partial output',
-              rawError: { code: 'ECONNRESET', retryable: true }
+              message: 'provider protocol error after partial output',
+              rawError: { code: 'PROVIDER_PROTOCOL_ERROR', retryable: false }
             }
           });
           return;

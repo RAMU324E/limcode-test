@@ -1828,6 +1828,7 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
   const openAIResponsesWebSocketTimeout = isStructuredOpenAIResponsesWebSocketTimeout(raw);
+  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)/.test(signature);
   const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
     signature,
     findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
@@ -1850,7 +1851,7 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   if (openAIResponsesWebSocketTimeout) {
     return new ProviderTransientError('connection_interrupted', message, true);
   }
-  if (/\bllm_stream_truncated\b/.test(signature)) {
+  if (replaySafeTransportFailure) {
     return new ProviderTransientError('connection_interrupted', message, true);
   }
   if (receivedSemanticOutput === true) {
