@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import * as kernel from '../../dist/extension/backend/reliableKernel/index.js';
 import { prepareConversationForkSnapshot } from '../../dist/extension/backend/reliableKernel/conversationForkSnapshot.js';
+import { createLlmProviderCapability } from '../../dist/extension/backend/capabilities/llmProvider.js';
 
 const NOW = '2026-08-20T00:00:00.000Z';
 
@@ -154,6 +155,185 @@ test('compression persists reusable Attachment observations and replacement inhe
     const replacementReplay = await compression.replace(replacementCommand);
     assert.equal(replacementReplay.deduplicated, true);
     assert.equal(replacementReplay.compressionBlockId, replacement.compressionBlockId);
+  });
+});
+
+test('unavailable observations remain visible but never become reusable observation commits', () => {
+  const profile = 'd'.repeat(64);
+  const first = {
+    attachmentRef: 'F1', attachmentId: 'unavailable-image', name: 'unavailable.png',
+    mimeType: 'image/png', sizeBytes: 42
+  };
+  const second = { ...first, attachmentRef: 'F2', attachmentId: 'observed-image', name: 'observed.png' };
+  const unavailable = {
+    attachmentRef: 'F1', summary: 'Original attachment preserved without analysis.', salientFacts: [],
+    uncertainties: ['Attachment content was not observed; visual or media details remain unknown.']
+  };
+  const observed = {
+    attachmentRef: 'F2', summary: 'A red indicator.', salientFacts: ['The indicator is red.'], uncertainties: []
+  };
+  const requirements = [first, second];
+  const observations = [unavailable, observed];
+  const state = kernel.renderAttachmentObservationStateContent(requirements, observations);
+  kernel.assertAttachmentObservationStateContent([state], requirements, observations);
+  assert.match(state.parts[0].text, /Attachment content was not observed/);
+  const commits = kernel.completeAttachmentObservationCommits(requirements, observations, profile);
+  assert.deepEqual(commits.map((entry) => entry.attachmentId), [second.attachmentId]);
+  assert.equal(commits[0].document.summary, observed.summary);
+  assert.deepEqual(kernel.completeAttachmentObservationCommits([first], [unavailable], profile), []);
+  assert.throws(() => kernel.completeAttachmentObservationCommits(requirements, [observed], profile), /one observation/);
+  assert.throws(() => kernel.completeAttachmentObservationCommits(requirements, [unavailable, unavailable], profile), /duplicate/);
+  assert.throws(() => kernel.completeAttachmentObservationCommits([first, first], observations, profile), /duplicate identities/);
+  assert.throws(() => kernel.completeAttachmentObservationCommits(
+    [first, { ...second, attachmentId: first.attachmentId }], observations, profile
+  ), /duplicate identities/);
+  assert.throws(() => kernel.completeAttachmentObservationCommits(
+    requirements, [unavailable, { ...observed, attachmentRef: 'F3' }], profile
+  ), /omitted/);
+  assert.throws(() => kernel.completeAttachmentObservationCommits(
+    [first], [{ ...unavailable, summary: '' }], profile
+  ), /non-empty/);
+});
+
+test('unavailable observation documents are rejected at the durable encoding boundary', () => {
+  assert.throws(() => kernel.attachmentObservationDocumentContent({
+    kind: 'attachment_observation', analysisProfileSha256: 'd'.repeat(64),
+    summary: 'Original attachment preserved without analysis.', salientFacts: [],
+    uncertainties: ['Attachment content was not observed; visual or media details remain unknown.']
+  }), /unavailable.*cannot be cached/i);
+});
+
+test('unavailable observations recover through real provider calls and database commits without rewriting history', async (t) => {
+  await withRuntime('attachment-observation-recovery', async (database, _fixtureContent, store) => {
+    const seeded = await seedObservationCompressionTurn(database, store);
+    const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+XkW5WQAAAABJRU5ErkJggg==', 'base64');
+    const mediaContent = await store.ingest(database, bytes, 'image/png');
+    const attachment = {
+      attachmentId: 'attachment-observation-target', name: 'observation-target.png',
+      mimeType: 'image/png', sizeBytes: bytes.byteLength
+    };
+    await database.transaction([kernel.DOMAIN_REPOSITORIES.domain('Attachment').insert({
+      id: attachment.attachmentId, sha256: mediaContent.sha256, byte_length: BigInt(bytes.byteLength),
+      mime_type: attachment.mimeType, name: attachment.name, storage_mode: 'managed',
+      content_object_id: mediaContent.id, created_at: NOW
+    })]);
+    const originalAttachment = await getDomainRow(database, 'Attachment', attachment.attachmentId);
+    const profile = 'd'.repeat(64);
+    const handles = { entries: [{
+      kind: 'attachment', ref: 'F1', target: attachment.attachmentId,
+      name: attachment.name, mimeType: attachment.mimeType, sizeBytes: attachment.sizeBytes
+    }] };
+    const recovered = {
+      attachmentRef: 'F1', summary: 'Recovered real visual observation.',
+      salientFacts: ['The indicator is red.'], uncertainties: []
+    };
+    let rejectObservation = true;
+    let observationCalls = 0;
+    let summaryCalls = 0;
+    t.mock.method(globalThis, 'fetch', async (_input, init) => {
+      assert.equal(typeof init.body, 'string');
+      const observation = init.body.includes('Attachment observation contract revision');
+      if (observation) observationCalls += 1;
+      else summaryCalls += 1;
+      if (observation && rejectObservation) {
+        return new Response(JSON.stringify({ error: { message: 'Upstream request failed', type: 'upstream_error' } }), {
+          status: 400, headers: { 'content-type': 'application/json' }
+        });
+      }
+      return new Response(JSON.stringify({
+        id: 'offline-observation-recovery', object: 'chat.completion', created: 1, model: 'gpt-test',
+        choices: [{ index: 0, message: {
+          role: 'assistant', content: observation ? JSON.stringify(recovered) : '<summary>Preserve image F1.</summary>'
+        }, finish_reason: 'stop' }]
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const capability = createLlmProviderCapability({
+      settings: {
+        id: 'offline-observation-provider', name: 'Offline observation provider', provider: 'openai-compatible',
+        baseUrl: 'https://provider.invalid/v1', apiKey: 'offline-placeholder', model: 'gpt-test',
+        models: [], modelConfigs: [], toolCallFormat: 'function-call', openaiResponsesTransport: 'http',
+        stream: false, retryOnError: false, retryMaxAttempts: 0, enableMultimodalTools: true,
+        contextWindowTokens: 65_536, createdAt: 1, updatedAt: 1
+      },
+      async resolveAttachment() {
+        return { inlineData: {
+          mimeType: attachment.mimeType, name: attachment.name, attachmentId: attachment.attachmentId,
+          data: bytes.toString('base64'), sizeBytes: bytes.byteLength
+        } };
+      }
+    });
+    const context = new kernel.ContextSequenceControlPlane(database, store);
+    const compression = new kernel.ContextCompressionControlPlane(database, store);
+    const load = () => kernel.loadAttachmentObservationRequirements(database, store, [attachment], handles, profile);
+    async function compress(id) {
+      const requirements = await load();
+      const terminal = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Observation recovery timed out.')), 10_000);
+        capability.compact({
+          id, blockId: `${id}-block`, conversationId: seeded.conversationId, methodKind: 'llm_summary',
+          methodConfigSnapshot: {
+            id: 'observation-recovery', name: 'Observation recovery', kind: 'llm_summary',
+            trigger: { mode: 'manual' }, llmSummary: { targetTokens: 1_000 }, createdAt: 1, updatedAt: 1
+          },
+          contents: [{ role: 'user', parts: [
+            { text: 'Preserve the actual visual evidence during compression.' },
+            { inlineData: {
+              mimeType: attachment.mimeType, name: attachment.name, attachmentId: attachment.attachmentId,
+              sha256: mediaContent.sha256, sizeBytes: bytes.byteLength, storage: 'managed'
+            } }
+          ] }],
+          attachmentObservationProfileSha256: profile, attachmentObservationRequirements: requirements
+        }, (event) => {
+          if (event.type !== 'llm:compactDone' && event.type !== 'llm:compactError') return;
+          clearTimeout(timer);
+          resolve(event);
+        });
+      });
+      assert.equal(terminal.type, 'llm:compactDone', terminal.payload.message);
+      const result = terminal.payload.result;
+      kernel.assertAttachmentObservationStateContent(result.contents, requirements, result.attachmentObservations);
+      const command = {
+        conversationId: seeded.conversationId, headRootId: await context.currentHeadRootId(seeded.conversationId),
+        authoritySnapshotId: seeded.authoritySnapshotId, compressSegmentCount: 1,
+        title: id, summary: result.contents, idempotencyKey: id,
+        attachmentObservations: kernel.completeAttachmentObservationCommits(requirements, result.attachmentObservations, profile)
+      };
+      return { created: await compression.create(command), command, result, cached: await load() };
+    }
+    try {
+      const first = await compress('observation-unavailable-first');
+      const firstBlock = await getDomainRow(database, 'CompressionBlock', first.created.compressionBlockId);
+      const firstSummaryMetadata = await getDomainRow(database, 'ContentObject', firstBlock.summary_object_id);
+      const firstSummary = await store.read(firstSummaryMetadata);
+      const second = await compress('observation-unavailable-again');
+      rejectObservation = false;
+      const successful = await compress('observation-recovered');
+      const reused = await compress('observation-reused');
+      assert.equal(first.cached[0].cachedObservation, undefined);
+      assert.equal(second.cached[0].cachedObservation, undefined);
+      assert.deepEqual(successful.cached[0].cachedObservation, recovered);
+      assert.deepEqual(reused.result.attachmentObservations, [recovered]);
+      assert.equal(observationCalls, 3, 'retry failed observations but reuse the first successful result');
+      assert.equal(summaryCalls, 4);
+      assert.equal((await listDomainRows(database, 'AttachmentObservationLink', {})).length, 1);
+      for (const attempt of [first, second]) {
+        assert.equal((await listDomainRows(database, 'CompressionBlockObservationLink', {
+          compression_block_id: attempt.created.compressionBlockId
+        })).length, 0);
+        assert.match(JSON.stringify(attempt.result.contents), /Attachment content was not observed/);
+        assert.equal((await compression.create(attempt.command)).deduplicated, true);
+      }
+      assert.equal((await listDomainRows(database, 'CompressionBlockObservationLink', {})).length, 2);
+      assert.deepEqual(await store.read(firstSummaryMetadata), firstSummary);
+      assert.deepEqual(await getDomainRow(database, 'Attachment', attachment.attachmentId), originalAttachment);
+      assert.deepEqual(await store.read(mediaContent), bytes);
+      const commitSeq = (await database.inspect()).currentCommitSeq;
+      assert.equal((await compression.create(successful.command)).deduplicated, true);
+      assert.equal((await compression.create(reused.command)).deduplicated, true);
+      assert.equal((await database.inspect()).currentCommitSeq, commitSeq);
+    } finally {
+      capability.dispose();
+    }
   });
 });
 

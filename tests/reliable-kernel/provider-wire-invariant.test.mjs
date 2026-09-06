@@ -7,12 +7,84 @@ import { createRequire } from 'node:module';
 const root = process.cwd();
 const require = createRequire(import.meta.url);
 const {
-  createTerminalValidatedFetch
+  createTerminalValidatedFetch,
+  LlmHttpStreamTerminationError
 } = require(path.join(root, 'dist/extension/backend/capabilities/terminalValidatedFetch.js'));
 const {
   summarizeLlmRawError
 } = require(path.join(root, 'dist/extension/backend/capabilities/llmProvider.js'));
 const unified = await import('unified-llm-provider');
+
+function failingSse(error, terminal = false) {
+  let sent = false;
+  return new Response(new ReadableStream({
+    pull(controller) {
+      if (!sent) {
+        sent = true;
+        controller.enqueue(new TextEncoder().encode(terminal
+          ? 'data: [DONE]\n\n'
+          : 'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n\n'));
+      } else {
+        controller.error(error);
+      }
+    }
+  }), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+test('SSE reader 的明确连接故障归一为截断并保留 cause', async () => {
+  for (const error of [
+    new TypeError('terminated'),
+    Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    new Error('read failed', { cause: Object.assign(new Error('peer reset'), { code: 'ECONNRESET' }) })
+  ]) {
+    const guarded = createTerminalValidatedFetch(async () => failingSse(error), 'gemini');
+    const response = await guarded('https://provider.invalid');
+    await assert.rejects(response.text(), (actual) =>
+      actual instanceof LlmHttpStreamTerminationError
+      && actual.code === 'LLM_STREAM_TRUNCATED'
+      && actual.phase === 'response_body'
+      && actual.cause === error
+    );
+  }
+});
+
+test('SSE reader 的取消、未知/解析错误及终态后的错误不转换为截断', async () => {
+  for (const [error, terminal, abort, useRequest] of [
+    [new DOMException('stopped', 'AbortError'), false, false, false],
+    [new TypeError('terminated'), false, true, false],
+    [new TypeError('terminated'), false, true, true],
+    [new SyntaxError('invalid JSON'), false, false, false],
+    [new Error('unknown failure'), false, false, false],
+    [new TypeError('terminated'), true, false, false]
+  ]) {
+    const controller = new AbortController();
+    const guarded = createTerminalValidatedFetch(async () => {
+      if (abort) controller.abort();
+      return failingSse(error, terminal);
+    }, 'gemini');
+    const response = useRequest
+      ? await guarded(new Request('https://provider.invalid', { signal: controller.signal }))
+      : await guarded('https://provider.invalid', { signal: controller.signal });
+    await assert.rejects(response.text(), (actual) => actual === error);
+  }
+});
+
+test('真实 SDK 的 SSE JSON 解析错误不因响应体封装变成截断', async () => {
+  const provider = unified.createLLMFromConfig({
+    provider: 'gemini', model: 'gemini-test', apiKey: 'offline-placeholder',
+    baseUrl: 'https://provider.invalid/v1beta',
+    fetch: createTerminalValidatedFetch(async () => new Response(
+      'data: invalid-json\n\ndata: [DONE]\n\n',
+      { headers: { 'content-type': 'text/event-stream' } }
+    ), 'gemini')
+  }, unified.createBootstrapExtensionRegistry().llmProviders);
+  const chunks = [];
+  for await (const chunk of provider.chatStream({
+    contents: [{ role: 'user', parts: [{ text: 'hello' }] }]
+  }, { inputFormat: 'unified', outputFormat: 'unified' })) chunks.push(chunk);
+  assert.equal(chunks.find((chunk) => chunk.error)?.error.kind, 'stream_parse_error');
+  assert.doesNotMatch(JSON.stringify(chunks), /LLM_STREAM_TRUNCATED/);
+});
 
 const callId = 'super-secret-call-id';
 const privateOutput = 'private-output-do-not-log';

@@ -25,9 +25,11 @@ export class LlmHttpStreamTerminationError extends Error {
   public constructor(
     message: string,
     code: 'LLM_STREAM_TRUNCATED' | 'LLM_TRANSPORT_TIMEOUT' = 'LLM_STREAM_TRUNCATED',
-    public readonly timeoutMs?: number
+    public readonly timeoutMs?: number,
+    public readonly cause?: unknown
   ) {
-    super(message);
+    // The SDK's stream_read_error retains only the message, dropping code and cause.
+    super(`[${code}] ${message}`);
     this.name = 'LlmHttpStreamTerminationError';
     this.code = code;
   }
@@ -53,6 +55,7 @@ export function createTerminalValidatedFetch(
     if (!response.ok || !response.body || !isEventStream(response.headers.get('content-type'))) return response;
 
     const reader = response.body.getReader();
+    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
     const tracker = new SseTerminalTracker(provider);
     // Fetch implementations expose decoded response bytes while commonly retaining the encoded
     // Content-Length header. Only compare lengths when no content coding can change the byte count.
@@ -65,7 +68,16 @@ export function createTerminalValidatedFetch(
       async pull(controller) {
         if (closed) return;
         try {
-          const next = await readWithIdleDeadline(reader, bodyIdleTimeoutMs);
+          const next = await readWithIdleDeadline(reader, bodyIdleTimeoutMs).catch((error: unknown) => {
+            // Only transport reads are eligible; parser failures and explicit cancellation are not.
+            if (!closed && !signal?.aborted && !tracker.sawTerminal && isBodyConnectionFailure(error)) {
+              throw new LlmHttpStreamTerminationError(
+                `${provider} SSE response body read interrupted: ${error.message}`,
+                'LLM_STREAM_TRUNCATED', undefined, error
+              );
+            }
+            throw error;
+          });
           if (!next.done) {
             receivedBytes += next.value.byteLength;
             tracker.push(next.value);
@@ -191,6 +203,16 @@ function hasTerminalJsonEvidence(value: unknown, provider: LlmProviderKind, dept
     if (typeof reason === 'string' && reason.trim()) return true;
   }
   return Object.values(record).some((entry) => hasTerminalJsonEvidence(entry, provider, depth + 1));
+}
+
+function isBodyConnectionFailure(error: unknown, depth = 0): error is Error {
+  if (depth > 6 || !(error instanceof Error) || error.name === 'AbortError' || error.name === 'SyntaxError') {
+    return false;
+  }
+  const { code, cause } = error as Error & { code?: unknown; cause?: unknown };
+  return error.message === 'terminated'
+    || (typeof code === 'string' && /^(?:UND_ERR_SOCKET|UND_ERR_BODY_TIMEOUT|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT)$/.test(code))
+    || isBodyConnectionFailure(cause, depth + 1);
 }
 
 async function readWithIdleDeadline(

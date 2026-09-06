@@ -1828,6 +1828,7 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
   const openAIResponsesWebSocketTimeout = isStructuredOpenAIResponsesWebSocketTimeout(raw);
+  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)/.test(signature);
   const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
     signature,
     findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
@@ -1848,6 +1849,9 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   // string. A new reliable Attempt owns a fresh transient accumulator, so it may replace any
   // uncommitted semantic output from the timed-out Attempt without replaying completed tools.
   if (openAIResponsesWebSocketTimeout) {
+    return new ProviderTransientError('connection_interrupted', message, true);
+  }
+  if (replaySafeTransportFailure) {
     return new ProviderTransientError('connection_interrupted', message, true);
   }
   if (receivedSemanticOutput === true) {

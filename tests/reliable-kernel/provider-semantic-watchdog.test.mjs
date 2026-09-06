@@ -18,7 +18,7 @@ function modelContent(text = '') {
   return { role: 'model', parts: text ? [{ text }] : [] };
 }
 
-function dependencies() {
+function dependencies(provider = 'openai-responses') {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -36,7 +36,7 @@ function dependencies() {
               executorAgentId: request.executorAgentId,
               model: {
                 providerConfigId: 'provider-watchdog',
-                provider: 'openai-responses',
+                provider,
                 modelId: 'model-watchdog',
                 retryPolicy: { enabled: true, maxRetries: 3 }
               },
@@ -86,11 +86,11 @@ function dependencies() {
   };
 }
 
-async function withApp(name, run) {
+async function withApp(name, run, provider) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `${name}-`));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
-  const app = await kernel.ReliableKernelApplication.open(authority, dependencies());
+  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(provider));
   try {
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -417,6 +417,84 @@ test('Responses WS event_idle 在已有语义输出后废弃旧 Attempt 并自�
   });
 });
 
+test('Gemini SSE terminated 经真实 SDK 包装后仍丢弃部分思考和工具调用并自动恢复', async (t) => {
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  await withApp('gemini-sse-read-retry', async (app, conversationId, turnId) => {
+    let calls = 0;
+    let releaseFailure;
+    const failureGate = new Promise((resolve) => { releaseFailure = resolve; });
+    const encoder = new TextEncoder();
+    const sse = (candidate) => encoder.encode(`data: ${JSON.stringify({ candidates: [candidate] })}\n\n`);
+    const requestBodies = [];
+    t.mock.method(globalThis, 'fetch', async (_input, init) => {
+      calls += 1;
+      requestBodies.push(init.body);
+      if (calls > 1) {
+        return new Response(sse({
+          content: { role: 'model', parts: [{ text: 'recovered from SSE disconnect' }] },
+          finishReason: 'STOP'
+        }), { headers: { 'content-type': 'text/event-stream' } });
+      }
+      const chunks = [
+        sse({ content: { role: 'model', parts: [{ text: 'discarded thought', thought: true }] } }),
+        sse({ content: { role: 'model', parts: [{ functionCall: { name: 'unused_tool', args: { value: 1 } } }] } })
+      ];
+      return new Response(new ReadableStream({
+        async pull(controller) {
+          if (chunks.length) return controller.enqueue(chunks.shift());
+          await failureGate;
+          controller.error(new TypeError('terminated', {
+            cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' })
+          }));
+        }
+      }), { headers: { 'content-type': 'text/event-stream' } });
+    });
+    const capability = createLlmProviderCapability({
+      settings: {
+        id: 'provider-watchdog', name: 'offline Gemini', provider: 'gemini',
+        model: 'model-watchdog', models: [], modelConfigs: [],
+        apiKey: 'offline-placeholder', baseUrl: 'https://provider.invalid/v1beta',
+        stream: true, retryOnError: false, retryMaxAttempts: 0,
+        toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+      }
+    });
+    const events = [];
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', {
+      ...capability,
+      start(request, emit) {
+        capability.start(request, (event) => {
+          events.push(event);
+          emit(event);
+          if (event.type === 'llm:toolcall') releaseFailure();
+        });
+      }
+    });
+    try {
+      const request = await createRequest(app, conversationId, turnId, 'real-sdk-sse-retry');
+      const result = await controlPlane(app, {
+        semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+      }).dispatch(request.modelRequestId, adapter);
+      assert.equal(result.terminalState, 'completed');
+      assert.equal(calls, 2, 'must retry in the durable ControlPlane, not inside the SDK/capability');
+      assert.equal(requestBodies[1], requestBodies[0]);
+      const error = events.find((event) => event.type === 'llm:error');
+      assert.match(error.payload.message, /SSE 流读取中断（已接收 2 个数据块）/);
+      assert.match(error.payload.message, /LLM_STREAM_TRUNCATED/);
+      assert.ok(events.some((event) => event.type === 'llm:thoughtDelta'));
+      const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+      assert.deepEqual(completed.content, modelContent('recovered from SSE disconnect'));
+      const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
+      assert.ok(checkpoints.every((entry) => entry.attempt_seq === 2n));
+      assert.equal((await list(app, 'ToolCall')).length, 0, 'failed Attempt tool output must not execute');
+    } finally {
+      releaseFailure();
+      capability.dispose();
+    }
+  }, 'gemini');
+});
+
 test('普通 transient error 在已有语义输出后仍不盲目重放', async () => {
   await withApp('provider-generic-no-replay-after-output', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'generic-no-replay-after-output');
@@ -470,8 +548,8 @@ test('Agent loop 将 Provider 失败部分输出物化为不进入 Context 的�
             type: 'llm:error',
             payload: {
               requestId: llmRequest.id,
-              message: 'socket hang up after partial output',
-              rawError: { code: 'ECONNRESET', retryable: true }
+              message: 'provider protocol error after partial output',
+              rawError: { code: 'PROVIDER_PROTOCOL_ERROR', retryable: false }
             }
           });
           return;

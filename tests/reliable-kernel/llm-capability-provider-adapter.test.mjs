@@ -1715,7 +1715,7 @@ test('LLM capability adapter 用显式ordinal稳定合并无Provider id调用并
   );
 });
 
-test('LLM capability adapter 将 429、网络错误和所有可恢复的终态前关闭映射为可靠 Provider transient reason', async () => {
+test('LLM capability adapter 将 429、流截断、网络错误和所有可恢复的终态前关闭映射为可靠 Provider transient reason', async () => {
   const retryablePreTerminalCloses = [
     [1000, ''],
     [1001, ' Going Away'],
@@ -1730,6 +1730,9 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
   ];
   for (const [message, rawError, reason] of [
     ['temporary failure', { status: 429 }, 'rate_limited'],
+    ['gemini SSE stream ended without provider terminal evidence.', {
+      code: 'LLM_STREAM_TRUNCATED', phase: 'response_body'
+    }, 'connection_interrupted'],
     ['temporary failure', { code: 'ECONNRESET', message: 'socket hang up' }, 'connection_interrupted'],
     ...retryablePreTerminalCloses.flatMap(([closeCode, closeReason]) => [false, true].map(
       (transportAttemptsExhausted) => [
@@ -1756,7 +1759,10 @@ test('LLM capability adapter 将 429、网络错误和所有可恢复的终态�
       adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
       (error) => error instanceof kernel.ProviderTransientError
         && error.reason === reason
-        && (rawError?.closeCode === undefined || error.retryAfterOutput === true)
+        && (
+          (rawError?.closeCode === undefined && rawError?.code !== 'LLM_STREAM_TRUNCATED')
+          || error.retryAfterOutput === true
+        )
     );
   }
 });
@@ -1810,6 +1816,34 @@ test('LLM capability adapter 在 Responses WS 结构化超时已有语义输出�
       `${phase} 的非最终失败 Attempt 不得冻结 partial snapshot`
     );
   }
+});
+
+test('LLM capability adapter 在 HTTP body 超时且已有输出后切换 whole Attempt', async () => {
+  const events = [];
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+    emit({ type: 'llm:delta', payload: { requestId: llmRequest.id, text: 'partial' } });
+    emit({
+      type: 'llm:error',
+      payload: {
+        requestId: llmRequest.id,
+        message: 'HTTP response body was idle for 60000ms.',
+        rawError: { code: 'LLM_TRANSPORT_TIMEOUT', phase: 'response_body', timeoutMs: 60_000 }
+      }
+    });
+  }));
+
+  await assert.rejects(
+    adapter.sendFullRequest(request(), {
+      onEvent: async (event) => {
+        events.push(event);
+        return { accepted: true, checkpointed: true, terminal: false };
+      }
+    }),
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'connection_interrupted'
+      && error.retryAfterOutput === true
+  );
+  assert.deepEqual(events.map((event) => event.kind), ['output_delta']);
 });
 
 test('LLM capability adapter 不重试未配置的协议、数据及未知终态前关闭', async () => {
@@ -2010,23 +2044,19 @@ test('LLM capability adapter 只允许配置的终态前关闭在语义输出后
         return { accepted: true, checkpointed: true, terminal: false };
       }
     }),
-    (error) => !(error instanceof kernel.ProviderTransientError)
-      && /不自动重放请求/.test(error.message)
+    (error) => error instanceof kernel.ProviderTransientError
+      && error.reason === 'connection_interrupted'
+      && error.retryAfterOutput === true
+      && !/不自动重放请求/.test(error.message)
   );
-  assert.deepEqual(afterSemanticEvents.at(-1).content, {
-    type: kernel.PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
-    message: {
-      role: 'model',
-      parts: [
-        { text: 'reasoning partial', thought: true },
-        { text: 'partial' }
-      ]
-    }
-  });
-  assert.equal(
-    afterSemanticEvents.at(-1).content.message.parts.some((part) => part.functionCall),
-    false,
-    '失败快照不得提交未完成工具调用'
+  assert.deepEqual(
+    afterSemanticEvents.map((event) => event.kind),
+    ['output_delta', 'output_delta', 'output_item_done'],
+    '重试前已流出的工具调用仍归失败 Attempt，后续 whole-Attempt 替换不得追加 partial snapshot'
+  );
+  assert.notEqual(
+    afterSemanticEvents.at(-1).content.type,
+    kernel.PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE
   );
 });
 

@@ -14,6 +14,8 @@ import { RuntimeDatabase } from './runtimeDatabase';
 
 export const ATTACHMENT_OBSERVATION_CONTENT_TYPE = 'application/vnd.limcode.attachment-observation+json';
 export const ATTACHMENT_OBSERVATION_STATE_KIND = 'attachment_observation_state';
+export const ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY =
+  'Attachment content was not observed; visual or media details remain unknown.';
 
 export interface AttachmentObservationDocument {
   kind: 'attachment_observation';
@@ -225,15 +227,26 @@ export function completeAttachmentObservationCommits(
   const requirements = requirementsInput.map((value, index) =>
     normalizeRequirement(value, `attachmentObservationRequirements[${index}]`)
   );
+  const requiredRefs = new Set<string>();
+  const requiredAttachments = new Set<string>();
+  for (const requirement of requirements) {
+    if (requiredRefs.has(requirement.attachmentRef) || requiredAttachments.has(requirement.attachmentId)) {
+      throw new Error('Compression attachment observation requirements contain duplicate identities.');
+    }
+    requiredRefs.add(requirement.attachmentRef);
+    requiredAttachments.add(requirement.attachmentId);
+  }
   if (observations.length !== requirements.length) {
     throw new Error('Compression did not return one observation for every required Attachment.');
   }
-  return requirements.map((requirement): AttachmentObservationCommit => {
+  return requirements.flatMap((requirement): AttachmentObservationCommit[] => {
     const observation = byRef.get(requirement.attachmentRef);
     if (!observation) {
       throw new Error(`Compression omitted attachment observation ${requirement.attachmentRef}.`);
     }
-    return {
+    // Unavailable results stay in the immutable summary, not in the reusable observation cache.
+    if (isUnavailableAttachmentObservation(observation)) return [];
+    return [{
       attachmentId: requirement.attachmentId,
       analysisProfileSha256: profileSha256,
       document: {
@@ -243,8 +256,14 @@ export function completeAttachmentObservationCommits(
         salientFacts: [...observation.salientFacts],
         uncertainties: [...observation.uncertainties]
       }
-    };
+    }];
   });
+}
+
+export function isUnavailableAttachmentObservation(
+  observation: Pick<LlmAttachmentObservation, 'uncertainties'>
+): boolean {
+  return observation.uncertainties.includes(ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY);
 }
 
 export function normalizeLlmAttachmentObservation(
@@ -292,13 +311,17 @@ function normalizeAttachmentObservationDocument(value: unknown): AttachmentObser
   if (record.kind !== 'attachment_observation') {
     throw new TypeError('Attachment observation document.kind is invalid.');
   }
-  return {
+  const document: AttachmentObservationDocument = {
     kind: 'attachment_observation',
     analysisProfileSha256: requireSha256(record.analysisProfileSha256, 'Attachment observation analysisProfileSha256'),
     summary: requireBoundedText(record.summary, 'Attachment observation summary', 8_000),
     salientFacts: normalizeTextList(record.salientFacts, 'Attachment observation salientFacts', 32, 2_000),
     uncertainties: normalizeTextList(record.uncertainties, 'Attachment observation uncertainties', 16, 2_000)
   };
+  if (isUnavailableAttachmentObservation(document)) {
+    throw new TypeError('Unavailable attachment observations cannot be cached.');
+  }
+  return document;
 }
 
 function normalizeCatalogEntry(value: AttachmentCatalogEntry, index: number): AttachmentCatalogEntry {
