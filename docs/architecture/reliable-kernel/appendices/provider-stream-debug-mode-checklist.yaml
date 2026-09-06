@@ -32,10 +32,11 @@ steps:
     title: 回归与交付
     status: in_progress
     exit_signal: 完整门禁、关闭和开启行为对照、资源边界及实际构建核验完成
-    partial_evidence: 当前功能通过 check:local，365 项中 352 通过、13 跳过、0 失败；等待集成新合并请求后的干净构建与交付
+    partial_evidence: 0.0.18 集成后通过 check:local，367 项中 354 通过、13 跳过、0 失败；发布包和远端检查独立核验
 checks:
   - id: scenarios
-    status: pending
+    status: done
+    evidence: provider-stream-debug-mode-acceptance.md 逐项列出证据与安装边界，不把代码检查当作本机安装
     requirement: 逐项核对方案 A01 至 A28，不把测试数量等同于覆盖范围
   - id: authority
     status: done

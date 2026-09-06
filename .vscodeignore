@@ -1,4 +1,7 @@
 .vscode/**
+.playwright-cli/**
+output/**
+.gitattributes
 .agents/**
 .github/**
 .claude/**

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import * as path from 'node:path';
 import { EXTENSION_VERSION } from '../../../shared/extensionIdentity';
 import type { DebugCaptureManifest } from '../../../shared/debugCapture';
@@ -12,11 +12,16 @@ function readSource(): Omit<DebugCaptureManifest['source'], 'hostBootId'> {
   const extensionRoot = path.resolve(__dirname, '../../../../..');
   let sourceCommit = '未找到构建来源';
   try {
-    const record = JSON.parse(readFileSync(path.join(extensionRoot, 'dist/extension/reliable-kernel-compile-provenance.json'), 'utf8'));
-    sourceCommit = `${record.commitSha ?? record.commit ?? '未知提交'}${record.worktreeClean === false ? ':含未提交改动' : ''}`;
+    const compilationProof = path.join(extensionRoot, 'dist/extension/reliable-kernel-compile-provenance.json');
+    // 编译证明不随安装包分发；安装包使用同次构建生成的发布证明。
+    const proof = existsSync(compilationProof) ? compilationProof : path.join(extensionRoot, 'dist/build-provenance.json');
+    const record = JSON.parse(readFileSync(proof, 'utf8'));
+    if (typeof record.commitSha === 'string' && /^[a-f0-9]{40}$/.test(record.commitSha)) {
+      sourceCommit = `${record.commitSha}${record.worktreeClean === false ? ':含未提交改动' : ''}`;
+    }
   } catch { /* 缺失明确保留，不推测提交号。 */ }
   const moduleHashes: Record<string, string> = {};
-  const modules = ['../../capabilities/llmProvider', '../../capabilities/openAIResponsesWebSocketSession', '../../capabilities/terminalValidatedFetch', '../../capabilities/llmStreamEventBatcher', '../llmCapabilityProviderAdapter', '../webviewFeedBridge', './observer', './analyzer'];
+  const modules = ['../../capabilities/llmProvider', '../../capabilities/openAIResponsesWebSocketSession', '../../capabilities/terminalValidatedFetch', '../../capabilities/llmStreamEventBatcher', '../llmCapabilityProviderAdapter', '../webviewFeedBridge', './observer', './analyzer', './controller', './files', './service', './source', '../../../shared/debugCaptureEncoding'];
   for (const id of modules) {
     try { moduleHashes[id] = hash(readFileSync(require.resolve(id))); } catch { moduleHashes[id] = '无法读取'; }
   }
