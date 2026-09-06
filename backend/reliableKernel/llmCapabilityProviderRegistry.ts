@@ -133,7 +133,7 @@ export function applyFrozenModelProviderConfig(
     retryMaxAttempts: 0
   };
 
-  if (modelConfig?.contextWindowTokens === undefined) delete resolved.contextWindowTokens;
+  if (modelConfig?.contextWindowTokens === undefined && modelConfig) delete resolved.contextWindowTokens;
   if (modelConfig?.promptCache === undefined && modelConfig) delete resolved.promptCache;
   if (modelConfig?.headers === undefined && modelConfig) delete resolved.headers;
   if (modelConfig?.generationConfig === undefined && modelConfig) delete resolved.generationConfig;

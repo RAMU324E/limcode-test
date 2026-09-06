@@ -1262,8 +1262,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
               name: plain.name.trim() || '未命名渠道',
               apiKey: plain.apiKey.trim(),
               baseUrl: plain.baseUrl.trim(),
-              model: plain.model.trim(),
-              updatedAt: Date.now()
+              model: plain.model.trim()
             };
           })
         }
