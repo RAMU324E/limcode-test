@@ -60,9 +60,13 @@ async function createFallbackServer({
   let httpCalls = 0;
   let webSocketCalls = 0;
   const webSocketRequests = [];
+  const httpRequests = [];
   const server = http.createServer((request, response) => {
+    let body = '';
+    request.on('data', chunk => { body += chunk; });
     request.resume();
     request.once('end', () => {
+      httpRequests.push(JSON.parse(body));
       httpCalls += 1;
       const responseId = `resp_http_${httpCalls}`;
       response.writeHead(200, {
@@ -176,6 +180,7 @@ async function createFallbackServer({
     baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
     counts: () => ({ httpCalls, webSocketCalls }),
     webSocketRequests: () => [...webSocketRequests],
+    httpRequests: () => structuredClone(httpRequests),
     async close() {
       for (const client of webSocketServer.clients) client.terminate();
       await new Promise((resolve) => webSocketServer.close(resolve));
@@ -184,10 +189,10 @@ async function createFallbackServer({
   };
 }
 
-async function runFallbackRequest(server, id, conversationId, traces, attemptOverrides, debugCapture) {
+async function runFallbackRequest(server, id, conversationId, traces, attemptOverrides, debugCapture, tools = []) {
   const events = [];
   await startLlmProvider(
-    reliableRequest(id, conversationId, attemptOverrides),
+    { ...reliableRequest(id, conversationId, attemptOverrides), tools },
     (event) => events.push(event),
     {
       debugCapture,
@@ -202,6 +207,25 @@ async function responsesFormat() {
   const unified = await import('unified-llm-provider');
   return new unified.OpenAIResponsesFormat('gpt-test');
 }
+
+test('自动切换连接后仍明确保留编辑工具的非严格参数约束', async t => {
+  resetOpenAIResponsesWebSocketSessions();
+  const server = await createFallbackServer({ sendCreatedBeforeClose: true });
+  t.after(async () => { resetOpenAIResponsesWebSocketSessions(); await server.close(); });
+  const { editToolParameters } = require('../../dist/extension/backend/world/modules/tools/definitions/edit/index.js');
+  const parameters = editToolParameters();
+  const original = structuredClone(parameters);
+  const events = await runFallbackRequest(server, 'edit-fallback', 'edit-fallback-conversation', [], undefined, undefined, [{ name: 'edit', description: '编辑文件', parameters }]);
+  assert.ok(events.some(event => event.type === 'llm:done'));
+  assert.deepEqual(server.counts(), { httpCalls: 1, webSocketCalls: 1 });
+  for (const body of [server.webSocketRequests()[0].request, server.httpRequests()[0]]) {
+    const edit = body.tools.find(tool => tool.name === 'edit');
+    assert.equal(edit.strict, false, '连接切换不能恢复自动严格模式');
+    assert.equal(edit.parameters.oneOf, undefined);
+    assert.deepEqual(edit.parameters.required, ['path']);
+  }
+  assert.deepEqual(parameters, original);
+});
 
 test('取证跟随真实长连接切换到普通连接，并保留同一请求的来源', async t => {
   resetOpenAIResponsesWebSocketSessions();

@@ -378,17 +378,17 @@ export async function startLlmProvider(
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
     };
-    const provider = installGeminiProviderCompatibility(
+    const provider = installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
     );
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
-      ? unified.createLLMFromConfig({
+      ? installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
@@ -1183,7 +1183,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = installGeminiProviderCompatibility(unified.createLLMFromConfig({
+  const provider = installProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -2749,7 +2749,7 @@ async function resolveSummaryProvider(
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
-  const provider = installGeminiProviderCompatibility(unified.createLLMFromConfig({
+  const provider = installProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
     apiKey: runtimeSettings.apiKey,
@@ -4595,7 +4595,7 @@ function toUnifiedRequest(
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map(toUnifiedPart) } } : {}),
     ...(request.tools.length === 0 ? {} : {
       tools: [{
-        functionDeclarations: request.tools.map((tool) => toUnifiedFunctionDeclaration(tool, providerKind))
+        functionDeclarations: request.tools.map(toUnifiedFunctionDeclaration)
       }]
     }),
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {})
@@ -4730,12 +4730,9 @@ function toUnifiedPart(part: ContentPart): UnifiedPart {
   return assertNever(part);
 }
 
-function toUnifiedFunctionDeclaration(
-  tool: ToolSchema,
-  providerKind?: LlmProviderKind
-): UnifiedFunctionDeclaration {
+function toUnifiedFunctionDeclaration(tool: ToolSchema): UnifiedFunctionDeclaration {
   const parameters = isFunctionParameters(tool.parameters)
-    ? providerCompatibleFunctionParameters(tool.name, tool.parameters, providerKind)
+    ? providerCompatibleFunctionParameters(tool.name, tool.parameters)
     : { type: 'object' as const, properties: {} };
   return {
     name: tool.name,
@@ -4746,55 +4743,56 @@ function toUnifiedFunctionDeclaration(
 
 function providerCompatibleFunctionParameters(
   toolName: string,
-  parameters: UnifiedFunctionDeclaration['parameters'],
-  providerKind?: LlmProviderKind
+  parameters: UnifiedFunctionDeclaration['parameters']
 ): UnifiedFunctionDeclaration['parameters'] {
-  if (
-    toolName !== 'edit'
-    || (providerKind !== 'claude' && providerKind !== 'gemini')
-    || !isRecord(parameters)
-  ) return parameters;
-  // Claude rejects top-level unions and Gemini drops them. Keep the full branch properties for
-  // those formats; the shared runtime validator remains the authoritative fail-closed boundary.
+  if (toolName !== 'edit' || !isRecord(parameters)) return parameters;
   const parameterRecord = parameters as unknown as Record<string, unknown>;
   const { oneOf: _unsupportedUnion, ...compatible } = parameterRecord;
   return compatible as UnifiedFunctionDeclaration['parameters'];
 }
 
-function installGeminiProviderCompatibility<T>(
+function installProviderCompatibility<T>(
   provider: T,
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
   return installGeminiOpenAICompatibleThoughtSignatures(
-    installGeminiSchemaEncoder(provider, providerKind, modelId),
+    installProviderSchemaEncoder(provider, providerKind, modelId),
     providerKind,
     modelId
   );
 }
 
-function installGeminiSchemaEncoder<T>(
+function installProviderSchemaEncoder<T>(
   provider: T,
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
-  if (providerKind !== 'gemini') return provider;
+  if (providerKind !== 'gemini' && providerKind !== 'openai-responses') return provider;
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
-      __limcodeGeminiSchemaEncoder?: true;
+      __limcodeProviderSchemaEncoder?: true;
     };
   };
   const format = runtimeProvider.format;
-  if (!format || typeof format.encodeRequest !== 'function' || format.__limcodeGeminiSchemaEncoder) return provider;
+  if (!format || typeof format.encodeRequest !== 'function' || format.__limcodeProviderSchemaEncoder) return provider;
   const originalEncodeRequest = format.encodeRequest.bind(format);
   format.encodeRequest = (request, stream) => {
-    const normalizedRequest = normalizeGeminiThinkingRequest(request, modelId);
+    const normalizedRequest = providerKind === 'gemini'
+      ? normalizeGeminiThinkingRequest(request, modelId)
+      : request;
     const encoded = originalEncodeRequest(normalizedRequest, stream);
-    restoreGeminiToolPropertyNames(encoded, normalizedRequest);
+    if (providerKind === 'gemini') {
+      restoreGeminiToolPropertyNames(encoded, normalizedRequest);
+    } else if (isRecord(encoded) && Array.isArray(encoded.tools)) {
+      for (const tool of encoded.tools) {
+        if (isRecord(tool) && tool.type === 'function' && tool.name === 'edit') tool.strict = false;
+      }
+    }
     return encoded;
   };
-  format.__limcodeGeminiSchemaEncoder = true;
+  format.__limcodeProviderSchemaEncoder = true;
   return provider;
 }
 
