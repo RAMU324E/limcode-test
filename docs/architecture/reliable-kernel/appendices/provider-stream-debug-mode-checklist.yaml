@@ -4,7 +4,7 @@ steps:
   - id: contracts
     title: 契约与控制骨架
     status: done
-    evidence: 控制器 16 项测试、设置文件与监听测试通过；控制器尚未装配进产品
+    evidence: 控制器 16 项测试、设置文件与监听测试通过；控制器已装配进产品
     exit_signal: 默认关闭、范围和预算冻结、重复启停与旧操作隔离有确定行为
   - id: provenance
     title: 来源关联验证
@@ -30,9 +30,10 @@ steps:
     exit_signal: 设置、启停、查看、导出、分析和受控清理均可使用
   - id: delivery
     title: 回归与交付
-    status: in_progress
+    status: done
     exit_signal: 完整门禁、关闭和开启行为对照、资源边界及实际构建核验完成
-    partial_evidence: 0.0.18 集成后通过 check:local，367 项中 354 通过、13 跳过、0 失败；发布包和远端检查独立核验
+    evidence: 完整本地检查 367 项中 354 通过、13 跳过、0 失败；提交后检查通过；四平台安装包完整性、内容、来源及各 42 个关键文件摘要通过
+    boundary: 本项完成本地交付核验；远端结果以 v0.0.18 发布资产与对应提交检查为准，本轮不覆盖本机现用扩展
 checks:
   - id: scenarios
     status: done
