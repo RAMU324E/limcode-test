@@ -58,6 +58,8 @@ import {
   isPromptCacheSupportedProvider
 } from '../../shared/protocol';
 import {
+  ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY,
+  isUnavailableAttachmentObservation,
   normalizeAttachmentObservationRequirement,
   normalizeLlmAttachmentObservation,
   renderAttachmentObservationStateContent
@@ -1795,8 +1797,6 @@ interface SemanticContentsProjection {
 }
 
 const ATTACHMENT_OBSERVATION_TARGET_TOKENS = 1_024;
-const ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY =
-  'Attachment content was not observed; visual or media details remain unknown.';
 // Attachment observation runs one Provider call per media body and must survive
 // reasoning-heavy models that spend part of the output budget on thoughts.
 // Kept local on purpose: SUMMARY_PROVIDER_MIN_OUTPUT_TOKENS is shared with the
@@ -2543,10 +2543,6 @@ function unavailableAttachmentObservation(
     ],
     uncertainties: [ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY]
   };
-}
-
-function isUnavailableAttachmentObservation(observation: LlmAttachmentObservation): boolean {
-  return observation.uncertainties.includes(ATTACHMENT_OBSERVATION_UNAVAILABLE_UNCERTAINTY);
 }
 
 async function compactWithSummary(
