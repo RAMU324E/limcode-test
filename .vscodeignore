@@ -44,6 +44,7 @@ node_modules/better-sqlite3/prebuilds/**
 src/**
 src copy/**
 scripts/**
+vendor/**
 docs/**
 milestone/**
 remote-exec/**

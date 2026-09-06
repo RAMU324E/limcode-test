@@ -56,6 +56,8 @@ interface CompletedToolCall {
   outputItem?: ModelOutputItemReference;
 }
 
+export type ReliableToolApplyObserver = (change: { callId: string; streamIndex?: string; before: string; fragment: string; after: string; operation: 'append' | 'replace' | 'complete' }) => void;
+
 /**
  * Merges raw provider argument deltas by durable call identity first and stream index second. The
  * process-local preview retains the complete raw argument stream until the durable completed
@@ -66,7 +68,8 @@ export function mergeReliableToolCallDeltas(
   input: unknown,
   modelRequestId: string,
   observedAt: number,
-  outputItem?: ModelOutputItemReference
+  outputItem?: ModelOutputItemReference,
+  observe?: ReliableToolApplyObserver
 ): ReliableTransientToolCallState[] {
   if (!Array.isArray(input)) return [...current];
   const next = current.map((call) => ({ ...call }));
@@ -90,6 +93,7 @@ export function mergeReliableToolCallDeltas(
     };
     if (existingIndex === undefined) next.push(call);
     else next[existingIndex] = call;
+    try { observe?.({ callId, streamIndex: call.streamIndex, before: existing?.argumentsText ?? '', fragment: delta.argumentsDelta, after: call.argumentsText, operation: delta.replace ? 'replace' : 'append' }); } catch { /* 观察不改变显示。 */ }
   }
   return next;
 }
@@ -99,14 +103,16 @@ export function replaceReliableCompletedToolCalls(
   input: unknown,
   modelRequestId: string,
   observedAt: number,
-  outputItem?: ModelOutputItemReference
+  outputItem?: ModelOutputItemReference,
+  observe?: ReliableToolApplyObserver,
+  current: readonly ReliableTransientToolCallState[] = []
 ): ReliableTransientToolCallState[] | undefined {
   if (!Array.isArray(input)) return undefined;
   const calls = input.map(completedToolCall).filter((call): call is CompletedToolCall => call !== undefined);
   return calls.map((call, index) => {
     const callId = call.id ?? syntheticCallId(modelRequestId, call.streamIndex, index);
     const raw = stringifyArguments(call.arguments);
-    return {
+    const completed: ReliableTransientToolCallState = {
       id: `transient-tool-preview:${modelRequestId}:${callId}`,
       callId,
       name: call.name,
@@ -118,6 +124,8 @@ export function replaceReliableCompletedToolCalls(
       createdAt: observedAt,
       updatedAt: observedAt
     };
+    try { observe?.({ callId, streamIndex: completed.streamIndex, before: current.find(item => item.callId === callId)?.argumentsText ?? '', fragment: raw, after: raw, operation: 'complete' }); } catch { /* 观察不改变最终替换。 */ }
+    return completed;
   });
 }
 
@@ -130,15 +138,18 @@ export function mergeReliableCompletedToolCalls(
   input: unknown,
   modelRequestId: string,
   observedAt: number,
-  outputItem?: ModelOutputItemReference
+  outputItem?: ModelOutputItemReference,
+  observe?: ReliableToolApplyObserver
 ): ReliableTransientToolCallState[] {
   const completed = replaceReliableCompletedToolCalls(input, modelRequestId, observedAt, outputItem);
   if (!completed) return [...current];
   const next = current.map((call) => ({ ...call }));
   for (const call of completed) {
     const index = next.findIndex((candidate) => candidate.callId === call.callId);
+    const before = index < 0 ? '' : next[index]!.argumentsText;
     if (index < 0) next.push(call);
     else next[index] = call;
+    try { observe?.({ callId: call.callId, streamIndex: call.streamIndex, before, fragment: call.argumentsText, after: call.argumentsText, operation: 'complete' }); } catch { /* 观察不改变完成状态。 */ }
   }
   return next;
 }

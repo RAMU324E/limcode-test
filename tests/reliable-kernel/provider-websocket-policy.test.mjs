@@ -184,12 +184,13 @@ async function createFallbackServer({
   };
 }
 
-async function runFallbackRequest(server, id, conversationId, traces, attemptOverrides) {
+async function runFallbackRequest(server, id, conversationId, traces, attemptOverrides, debugCapture) {
   const events = [];
   await startLlmProvider(
     reliableRequest(id, conversationId, attemptOverrides),
     (event) => events.push(event),
     {
+      debugCapture,
       settings: async () => providerConfig(server.baseUrl),
       onTransportTrace: (trace) => traces.push(trace)
     }
@@ -201,6 +202,25 @@ async function responsesFormat() {
   const unified = await import('unified-llm-provider');
   return new unified.OpenAIResponsesFormat('gpt-test');
 }
+
+test('取证跟随真实长连接切换到普通连接，并保留同一请求的来源', async t => {
+  resetOpenAIResponsesWebSocketSessions();
+  const server = await createFallbackServer({ sendCreatedBeforeClose: true });
+  t.after(async () => { resetOpenAIResponsesWebSocketSessions(); await server.close(); });
+  const records = [];
+  const recorder = { active: () => 'capture-fallback', record: event => {
+    records.push(structuredClone(event)); return { runId: 'capture-fallback', captureSeq: records.length };
+  } };
+  const events = await runFallbackRequest(server, 'request-debug-fallback', 'conversation-debug-fallback', [], undefined, recorder);
+  assert.ok(events.some(event => event.type === 'llm:done'));
+  assert.deepEqual(server.counts(), { httpCalls: 1, webSocketCalls: 1 });
+  assert.ok(records.some(event => event.stage === 'transport.receive' && event.metadata.transport === 'websocket'));
+  assert.ok(records.some(event => event.stage === 'transport.receive' && event.metadata.transport === 'http'));
+  assert.ok(records.some(event => event.stage === 'transport.phase' && event.metadata.phase === 'http_fallback'));
+  assert.ok(records.some(event => event.stage === 'http.decoded'));
+  assert.ok(records.some(event => event.stage === 'capability.output' && event.sources.length > 0));
+  assert.ok(records.filter(event => event.context).every(event => event.context.modelRequestId === 'request-debug-fallback'));
+});
 
 function responseRequestBody(format, contents) {
   return format.encodeRequest({ contents }, true);

@@ -10,8 +10,10 @@ import {
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { LlmCapabilityFullRequestAdapter } from './llmCapabilityProviderAdapter';
 import type { FullRequestProviderAdapter } from './modelProviderControlPlane';
+import type { DebugCaptureRecorder } from './debugCapture/observer';
 
 export interface ReliableLlmProviderRegistryOptions {
+  debugCapture?: DebugCaptureRecorder;
   loadProviderConfig(providerConfigId: string): Promise<LlmProviderConfigRecord>;
   proxy?: () => string | undefined | Promise<string | undefined>;
   headers?: Record<string, string>;
@@ -37,6 +39,7 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
 
   public constructor(private readonly options: ReliableLlmProviderRegistryOptions) {
     this.capability = createLlmProviderCapability({
+      debugCapture: options.debugCapture,
       settings: async (request) => {
         const frozen = request && 'model' in request ? request.model : undefined;
         const snapshot = request && 'settingsSnapshot' in request ? request.settingsSnapshot : undefined;
@@ -68,7 +71,7 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
     const providerId = requireId(providerIdInput, 'providerId');
     const existing = this.adapters.get(providerId);
     if (existing) return existing;
-    const adapter = new LlmCapabilityFullRequestAdapter(providerId, this.capability);
+    const adapter = new LlmCapabilityFullRequestAdapter(providerId, this.capability, this.options.debugCapture);
     this.adapters.set(providerId, adapter);
     return adapter;
   }

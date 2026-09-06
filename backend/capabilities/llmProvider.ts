@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { associateDebugCapture, captureDebug, debugCaptureSources, debugSource, DebugHttpObservation, getDebugCaptureContext, type DebugCaptureRecorder } from '../reliableKernel/debugCapture/observer';
 import {
   groupAtomicMessageContents,
   isModelToolResponseMultimodalMimeType
@@ -169,6 +170,7 @@ export interface LlmProviderTransportTrace {
 }
 
 export interface LlmProviderOptions {
+  debugCapture?: DebugCaptureRecorder;
   settings: MaybeProvider<LlmProviderConfigRecord, LlmSettingsRequest>;
   proxy?: MaybeProvider<string>;
   compressionSettings?: LlmCompressionSettingsProvider;
@@ -335,6 +337,9 @@ export async function startLlmProvider(
   retryControl: RetryControl = { cancelRequested: false }
 ): Promise<void> {
   const streamEvents = createLlmStreamEventBatcher(emit, {
+    onDerived: options.debugCapture ? (event, inputs) => {
+      if (options.debugCapture?.active(getDebugCaptureContext(request))) associateDebugCapture(event, inputs.flatMap(input => [...debugCaptureSources(input)]));
+    } : undefined,
     onTerminalMetrics: (metrics) => {
       if (metrics.rawDeltaEvents === 0) return;
       console.log('[LimCode][LlmStreamAggregation]', JSON.stringify({
@@ -353,7 +358,10 @@ export async function startLlmProvider(
     const registry = unified.createBootstrapExtensionRegistry();
     const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
     const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
-    const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
+    const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
+    const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider, {
+      createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined
+    });
     const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
     const requestBody = requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId);
     if (proxy) console.log(`[LimCode] LLM proxy enabled: ${proxy}`);
@@ -466,6 +474,17 @@ async function runLlmAttempt(
   retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice,
   proxy?: string
 ): Promise<void> {
+  const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
+  const observingEmit = (value: unknown): Emit => {
+    if (!options.debugCapture?.active(debugContext)) return emit;
+    const sdkSource = debugSource(unified.getLlmObservation(value));
+    const refs = sdkSource ? [sdkSource] : debugCaptureSources(value);
+    return event => {
+      const ref = captureDebug(options.debugCapture, debugContext, () => ({ stage: 'capability.output', sources: refs, payload: event, metadata: { kind: event.type } }));
+      if (ref) associateDebugCapture(event, [ref]);
+      emit(event);
+    };
+  };
   const preparedRequest = await prepareLlmStartRequestMultimodal(request, options);
   const unifiedRequest = toUnifiedRequest(preparedRequest, settings.generationConfig, settings.provider);
   const forceStreaming = isOpenAIResponsesWebSocketMode(settings);
@@ -480,7 +499,7 @@ async function runLlmAttempt(
       throw new LlmAttemptFailureError(failureFromProviderError(response.error, { rawResponse: response.rawResponse }));
     }
     emitRetryRecovered(request.id, emit, retryRecoveryNotice);
-    emitUnifiedResponse(request.id, response, emit);
+    emitUnifiedResponse(request.id, response, observingEmit(response));
     const completedAt = Date.now();
     emit({
       type: LlmEventType.Done,
@@ -512,7 +531,8 @@ async function runLlmAttempt(
           signal,
           retryRecoveryNotice,
           proxy,
-          onTransportTrace: options.onTransportTrace
+          onTransportTrace: options.onTransportTrace,
+          debugCapture: options.debugCapture
         })
       : provider.chatStream<UnifiedLLMStreamChunk>(unifiedRequest, {
           inputFormat: 'unified',
@@ -520,6 +540,7 @@ async function runLlmAttempt(
           signal
         });
     for await (const chunk of stream) {
+      const chunkEmit = observingEmit(chunk);
       if (signal?.aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
       if (hasUnifiedError(chunk)) {
         const failure = failureFromProviderError(chunk.error, {
@@ -534,8 +555,8 @@ async function runLlmAttempt(
         emitRetryRecovered(request.id, emit, retryRecoveryNotice);
         retryRecoveryPending = false;
       }
-      activeThoughtBlock = emitThoughtDeltas(request.id, activeThoughtBlock, chunk, chunkAt, emit);
-      if (activeThoughtBlock && shouldCloseThoughtBlock(chunk)) activeThoughtBlock = finishThoughtBlock(request.id, activeThoughtBlock, chunkAt, emit);
+      activeThoughtBlock = emitThoughtDeltas(request.id, activeThoughtBlock, chunk, chunkAt, chunkEmit);
+      if (activeThoughtBlock && shouldCloseThoughtBlock(chunk)) activeThoughtBlock = finishThoughtBlock(request.id, activeThoughtBlock, chunkAt, chunkEmit);
       const chunkUsageMetadata = usageMetadataFromChunk(chunk);
       if (chunkUsageMetadata) latestUsageMetadata = mergeUsageMetadata(latestUsageMetadata, chunkUsageMetadata);
       const completedContent = (chunk as LimCodeOpenAIResponsesStreamChunk).completedContent;
@@ -545,7 +566,7 @@ async function runLlmAttempt(
         timing.firstStreamChunkMark ??= chunkMark;
         timing.streamTimingChunkCount += 1;
       }
-      emitUnifiedChunk(request.id, chunk, emit);
+      emitUnifiedChunk(request.id, chunk, chunkEmit);
     }
   } catch (error) {
     const aborted = isRequestAbort(signal);
@@ -588,6 +609,7 @@ async function runLlmAttempt(
 }
 
 async function* streamOpenAIResponsesWithLimCodeSession(input: {
+  debugCapture?: DebugCaptureRecorder;
   request: LlmStartRequest;
   settings: LlmProviderConfigRecord;
   provider: UnifiedChatProvider;
@@ -641,6 +663,11 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   try {
     const { streamOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
     yield* streamOpenAIResponsesWebSocketSession({
+      debugCapture: input.debugCapture ? {
+        recorder: input.debugCapture,
+        context: getDebugCaptureContext(input.request) ?? { conversationId, modelRequestId: input.request.id },
+        metadata: { url: dryRun.url }
+      } : undefined,
       sessionKey,
       url: dryRun.url,
       headers: dryRun.headers,
@@ -830,10 +857,13 @@ function traceFromWebSocketPhase(
 }
 
 function reportTransportTrace(
-  input: { onTransportTrace?: (trace: LlmProviderTransportTrace) => void },
+  input: { onTransportTrace?: (trace: LlmProviderTransportTrace) => void; debugCapture?: DebugCaptureRecorder; request?: LlmStartRequest },
   trace: LlmProviderTransportTrace
 ): void {
   try {
+    captureDebug(input.debugCapture, (input.request ? getDebugCaptureContext(input.request) : undefined)
+      ?? { conversationId: trace.conversationId, modelRequestId: trace.requestId },
+      () => ({ stage: 'transport.phase', payload: trace, metadata: { phase: trace.phase } }));
     input.onTransportTrace?.(trace);
   } catch {
     // Observability is best-effort and must not become Provider authority.

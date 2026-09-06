@@ -1,0 +1,2 @@
+# 补丁中的空白上下文行必须保留一个前导空格。
+vendor/*.patch whitespace=-blank-at-eol

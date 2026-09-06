@@ -3,6 +3,9 @@ import { BridgeMessageType, type BridgeChannel, type WebviewToExtensionMessage }
 /** 把出站消息类型映射到桥接通道。逻辑与旧 vscodeBridge 保持一致。 */
 export function channelForType(type: WebviewToExtensionMessage['type']): BridgeChannel {
   switch (type) {
+    case BridgeMessageType.DebugCaptureCommand:
+    case BridgeMessageType.DebugCaptureObservation:
+      return 'diagnostics';
     case BridgeMessageType.TurnStart:
     case BridgeMessageType.TurnEnqueue:
     case BridgeMessageType.TurnInterrupt:

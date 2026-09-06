@@ -1893,6 +1893,25 @@
         "unknownFilePolicy": "leave-untouched-unless-indexed"
       },
       {
+        "id": "setting.debugCapture",
+        "logicalDomain": "DebugCaptureSettings",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "debug-capture.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "DebugCaptureSettings",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
         "id": "setting.mcpServers",
         "logicalDomain": "McpServerConfig",
         "physicalKind": "settings-section",

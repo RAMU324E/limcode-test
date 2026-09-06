@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { getCurrentInstance, nextTick, onBeforeUnmount, ref } from 'vue';
+import { getCurrentInstance, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
 interface TooltipPanelRow {
   kind?: 'row';
@@ -22,8 +22,9 @@ const props = withDefaults(
     panelTitle: string;
     rows: TooltipPanelItem[];
     delayMs?: number;
+    disabled?: boolean;
   }>(),
-  { delayMs: 320 }
+  { delayMs: 320, disabled: false }
 );
 
 const instanceId = getCurrentInstance()?.uid ?? Math.random().toString(36).slice(2);
@@ -49,6 +50,7 @@ onBeforeUnmount(() => {
 });
 
 function scheduleOpen(): void {
+  if (props.disabled) return;
   cancelHideTimer();
   cancelShowTimer();
   showTimer = window.setTimeout(() => {
@@ -58,6 +60,7 @@ function scheduleOpen(): void {
 }
 
 function openNow(): void {
+  if (props.disabled) return;
   cancelShowTimer();
   cancelHideTimer();
   if (open.value) {
@@ -90,6 +93,13 @@ function closeNow(): void {
   detachPositionListeners();
   detachPanelResizeObserver();
 }
+
+watch(() => props.disabled, disabled => {
+  if (!disabled) return;
+  // 确认框打开时，提示的退场动画也不能继续遮挡按钮。
+  if (panelRef.value) panelRef.value.style.visibility = 'hidden';
+  closeNow();
+});
 
 function cancelShowTimer(): void {
   if (showTimer === undefined) return;

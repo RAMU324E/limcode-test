@@ -2,6 +2,8 @@ import { createHash } from 'crypto';
 import { networkInterfaces } from 'os';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import WebSocket, { type RawData } from 'ws';
+import { captureDebug, associateDebugCapture, debugCaptureSources } from '../reliableKernel/debugCapture/observer';
+import { observeToolAssembly, type DebugWebSocketObservation } from '../reliableKernel/debugCapture/webSocketObservation';
 import type {
   Content,
   LLMRequest,
@@ -112,6 +114,7 @@ export interface OpenAIResponsesFormatAdapter {
 }
 
 export interface OpenAIResponsesWebSocketStreamOptions {
+  debugCapture?: DebugWebSocketObservation;
   sessionKey: string;
   url: string;
   headers: Record<string, string>;
@@ -337,12 +340,17 @@ async function* streamLocked(
       () => {
         session.responseCreateSeq += 1;
         return session.responseCreateSeq;
-      }
+      },
+      options.debugCapture ? { ...options.debugCapture, metadata: {
+        sessionKeyHash: prepared.decision.sessionKeyHash,
+        connectionGeneration: session.connectionGeneration,
+        transport: 'websocket'
+      } } : undefined
     )) {
       const type = eventType(raw);
       responseId = responseIdFromPayload(raw) ?? responseId;
       const outputItem = observeOutputItem(raw, outputItems);
-      const argumentDeltas = captureToolCallArgumentDeltas(raw, toolCalls);
+      const argumentDeltas = captureToolCallArgumentDeltas(raw, toolCalls, options.debugCapture);
       if (isTerminalEvent(raw)) {
         observeTransportPhase(session, options, 'terminal', { reason: type ?? 'terminal' });
       }
@@ -355,6 +363,9 @@ async function* streamLocked(
 
       let decoded: LLMStreamChunk;
       try {
+        captureDebug(options.debugCapture?.recorder, options.debugCapture?.context, () => ({
+          stage: 'ws.decode_input', payload: raw, sources: debugCaptureSources(raw)
+        }));
         decoded = options.format.decodeStreamChunk(raw, decodeState);
       } catch (error) {
         closeAndInvalidate(session, true);
@@ -390,6 +401,10 @@ async function* streamLocked(
         observeTransportPhase(session, options, 'first_semantic_event');
       }
       if (semanticOutput) sawSemanticOutput = true;
+      const observed = captureDebug(options.debugCapture?.recorder, options.debugCapture?.context, () => ({
+        stage: 'ws.decoded', payload: chunk, sources: debugCaptureSources(raw)
+      }));
+      if (observed) associateDebugCapture(chunk, [observed]);
       if (hasMeaningfulChunk(chunk)) yield chunk;
       if (outputItem.done) unregisterOutputItem(outputItems, outputItem.done);
 
@@ -434,6 +449,9 @@ async function* streamLocked(
       ? session.successfulIncrementalRequests + 1
       : 0;
   } catch (error) {
+    captureDebug(options.debugCapture?.recorder, options.debugCapture?.context, () => ({
+      stage: 'ws.error', payload: { message: errorText(error) }
+    }));
     const annotated = markReceivedSemanticOutput(error, sawSemanticOutput);
     observeTransportFailure(session, options, annotated);
     closeAndInvalidate(session, true);
@@ -1076,11 +1094,14 @@ async function* sendCreateAndReadEvents(
   ) => void) | undefined,
   expectedConnectionIdentityHash: string,
   currentConnectionIdentityHash: () => string,
-  nextResponseCreateSeq: () => number
+  nextResponseCreateSeq: () => number,
+  debug?: DebugWebSocketObservation
 ): AsyncGenerator<Record<string, unknown>> {
   const queue = new AsyncEventQueue<Record<string, unknown>>();
   let sawTerminal = false;
   let sawEvent = false;
+  let rawSequence = 0;
+  let sentSequence = 0;
   let firstEventTimeout: ReturnType<typeof setTimeout> | undefined;
   let eventIdleTimeout: ReturnType<typeof setTimeout> | undefined;
   let responseTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -1111,12 +1132,20 @@ async function* sendCreateAndReadEvents(
   };
   const onAbort = () => queue.fail(abortError(signal));
   const onMessage = (data: RawData) => {
+    rawSequence += 1;
+    const received = captureDebug(debug?.recorder, debug?.context, () => ({
+      stage: 'transport.receive', bytes: data,
+      metadata: { ...debug?.metadata, rawSequence, responseCreateSeq: sentSequence }
+    }));
     const parsed = parseWebSocketData(data);
     if (!parsed.ok) {
+      captureDebug(debug?.recorder, debug?.context, () => ({ stage: 'ws.parse_error',
+        payload: { message: parsed.error.message }, sources: received ? [received] : [] }));
       queue.fail(parsed.error);
       return;
     }
     const value = parsed.value;
+    if (received) associateDebugCapture(value, [received]);
     if (!sawEvent) {
       sawEvent = true;
       observe?.('first_raw_event');
@@ -1186,6 +1215,9 @@ async function* sendCreateAndReadEvents(
     const responseCreateFrameSha256 = createHash('sha256').update(payloadText, 'utf8').digest('hex');
     const responseCreateFrameBytes = Buffer.byteLength(payloadText, 'utf8');
     const responseCreateSeq = nextResponseCreateSeq();
+    sentSequence = responseCreateSeq;
+    captureDebug(debug?.recorder, debug?.context, () => ({ stage: 'transport.send', payload: payloadText,
+      metadata: { ...debug?.metadata, responseCreateSeq } }));
     observe?.('send_started');
     await sendWithDeadline(socket, payloadText, timeouts.sendMs, signal);
     observe?.('request_sent', {
@@ -1377,7 +1409,8 @@ function assistantMessagePhase(value: unknown): AssistantMessagePhase | undefine
 
 function captureToolCallArgumentDeltas(
   raw: Record<string, unknown>,
-  registry: ToolCallAccumulatorRegistry
+  registry: ToolCallAccumulatorRegistry,
+  debug?: DebugWebSocketObservation
 ): OpenAIResponsesToolCallArgumentDelta[] {
   const type = eventType(raw);
   if (type === 'response.output_item.added' && isRecord(raw.item)
@@ -1385,6 +1418,7 @@ function captureToolCallArgumentDeltas(
     const accumulator = toolAccumulatorFromItem(raw.item, raw);
     if (!accumulator) return [];
     registerToolAccumulator(registry, accumulator, raw.item, raw);
+    observeToolAssembly(debug, raw, accumulator, '', accumulator.arguments, 'append', 'registered_item');
     return accumulator.arguments
       ? [{
           callId: accumulator.callId,
@@ -1396,10 +1430,16 @@ function captureToolCallArgumentDeltas(
   }
 
   if (type === 'response.function_call_arguments.delta') {
-    const accumulator = findToolAccumulator(raw, registry);
+    let selection = 'unmatched';
+    const accumulator = findToolAccumulator(raw, registry, debug?.recorder.active(debug.context) ? (reason) => { selection = reason; } : undefined);
     const delta = typeof raw.delta === 'string' ? raw.delta : '';
-    if (!accumulator || !delta) return [];
+    if (!accumulator || !delta) {
+      observeToolAssembly(debug, raw, accumulator, accumulator?.arguments ?? '', delta, 'rejected', selection);
+      return [];
+    }
+    const before = accumulator.arguments;
     accumulator.arguments += delta;
+    observeToolAssembly(debug, raw, accumulator, before, delta, 'append', selection);
     return [{
       callId: accumulator.callId,
       ...(accumulator.name ? { name: accumulator.name } : {}),
@@ -1413,11 +1453,13 @@ function captureToolCallArgumentDeltas(
     && (type !== 'response.output_item.done'
       || (isRecord(raw.item) && raw.item.type === 'function_call'))) {
     const source = type === 'response.output_item.done' && isRecord(raw.item) ? raw.item : raw;
-    const registered = findToolAccumulator(raw, registry);
+    let selection = 'unmatched';
+    const registered = findToolAccumulator(raw, registry, debug?.recorder.active(debug.context) ? (reason) => { selection = reason; } : undefined);
     const accumulator = registered
       ?? (isRecord(source) ? toolAccumulatorFromItem(source, raw) : undefined);
     const finalArguments = isRecord(source) ? normalizedString(source.arguments) : undefined;
     let deltas: OpenAIResponsesToolCallArgumentDelta[] = [];
+    const before = accumulator?.arguments ?? '';
     if (accumulator && finalArguments !== undefined && finalArguments !== accumulator.arguments) {
       if (finalArguments.startsWith(accumulator.arguments)) {
         const suffix = finalArguments.slice(accumulator.arguments.length);
@@ -1441,6 +1483,8 @@ function captureToolCallArgumentDeltas(
         }];
       }
     }
+    for (const delta of deltas) observeToolAssembly(debug, raw, accumulator, before, delta.argumentsDelta, delta.replace ? 'replace' : 'append', selection);
+    observeToolAssembly(debug, raw, accumulator, accumulator?.arguments ?? '', '', 'complete', selection);
     if (registered) unregisterToolAccumulator(registry, registered);
     return deltas;
   }
@@ -1463,21 +1507,23 @@ function toolAccumulatorFromItem(
 
 function findToolAccumulator(
   event: Record<string, unknown>,
-  registry: ToolCallAccumulatorRegistry
+  registry: ToolCallAccumulatorRegistry,
+  selected?: (reason: string) => void
 ): ToolCallAccumulator | undefined {
   const item = isRecord(event.item) ? event.item : undefined;
   const matches = [...new Set(toolAccumulatorAliases(item, event)
     .map((key) => registry.byAlias.get(key))
     .filter((value): value is ToolCallAccumulator => !!value))];
-  if (matches.length === 1) return matches[0];
-  if (matches.length > 1) return undefined;
+  if (matches.length === 1) { selected?.('alias'); return matches[0]; }
+  if (matches.length > 1) { selected?.('ambiguous_alias'); return undefined; }
 
   const callId = normalizedString(event.call_id) ?? (item ? normalizedString(item.call_id) : undefined);
   if (callId) {
     const callMatches = [...registry.active].filter((value) => value.callId === callId);
-    if (callMatches.length === 1) return callMatches[0];
-    if (callMatches.length > 1) return undefined;
+    if (callMatches.length === 1) { selected?.('call_id'); return callMatches[0]; }
+    if (callMatches.length > 1) { selected?.('ambiguous_call_id'); return undefined; }
   }
+  selected?.(registry.active.size === 1 ? 'single_active_fallback' : 'unmatched');
   return registry.active.size === 1 ? registry.active.values().next().value : undefined;
 }
 

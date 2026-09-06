@@ -63,7 +63,7 @@ Module._load = function loadWithVscodeMock(request, parent, isMain) {
   return originalModuleLoad.call(this, request, parent, isMain);
 };
 
-const { registerGlobalSettingsWatcher } = require('../vscode/watchers/GlobalSettingsWatcher.ts');
+const { registerGlobalSettingsWatcher, sectionFromSettingsUri } = require('../vscode/watchers/GlobalSettingsWatcher.ts');
 
 Module._load = originalModuleLoad;
 if (previousTsLoader) require.extensions['.ts'] = previousTsLoader;
@@ -89,7 +89,7 @@ test('设置监听只从 settings 和三个配置小目录开始', () => {
   })), [
     {
       base: '/custom-data/settings',
-      pattern: '{llm,llm-compression,appearance,attachments,checkpoint-maintenance}.json'
+      pattern: '{llm,llm-compression,appearance,attachments,checkpoint-maintenance,debug-capture}.json'
     },
     { base: '/custom-data/settings/llm-provider-configs', pattern: '**/*.json' },
     { base: '/custom-data/settings/llm-compression-configs', pattern: '**/*.json' },
@@ -104,4 +104,9 @@ test('侧栏不再创建旧的会话历史文件监听', () => {
   const source = fs.readFileSync(path.join(process.cwd(), 'vscode/views/SidebarEntryView.ts'), 'utf8');
   assert.doesNotMatch(source, /createFileSystemWatcher/);
   assert.doesNotMatch(source, /getConversationHistoryRootUri/);
+});
+
+test('调试默认设置复用设置监听，不把取证正文纳入监听', () => {
+  assert.equal(sectionFromSettingsUri(new MockUri('/custom-data/settings/debug-capture.json')), 'debugCapture');
+  assert.equal(sectionFromSettingsUri(new MockUri('/custom-data/diagnostics/debug-captures/record/events.jsonl')), undefined);
 });

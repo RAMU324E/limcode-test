@@ -2,6 +2,7 @@ import type { LlmCapability } from '../capabilities/types';
 import type { LlmCompactRequest, LlmStartRequest, ToolSchema } from '../world/modules/llm/contracts';
 import { LlmEventType } from '../world/modules/llm/events';
 import type { WorldEvent } from '../ecs/types';
+import { captureDebug, debugCaptureSources, setDebugCaptureContext, type DebugCaptureRecorder } from './debugCapture/observer';
 import {
   READ_TOOL_NAME,
   type AttachmentCatalogEntry,
@@ -83,7 +84,8 @@ const OPENAI_RESPONSES_WEBSOCKET_TIMEOUT_PHASES = new Set([
 export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapter {
   public constructor(
     public readonly providerId: string,
-    private readonly capability: LlmCapability
+    private readonly capability: LlmCapability,
+    private readonly debugCapture?: DebugCaptureRecorder
   ) {
     if (!providerId.trim()) throw new TypeError('providerId must be non-empty.');
   }
@@ -135,8 +137,13 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     if (request.providerId !== this.providerId) {
       return Promise.reject(new Error(`Provider request ${request.providerId} cannot use adapter ${this.providerId}.`));
     }
-    if (isCompressionRequest(request.recipe)) return this.sendCompressionRequest(request, controls);
+    const debugContext = { conversationId: request.conversationId, modelRequestId: request.modelRequestId, attemptSeq: request.attemptSeq, socketGeneration: request.socketGeneration };
+    if (isCompressionRequest(request.recipe)) {
+      captureDebug(this.debugCapture, debugContext, () => ({ stage: 'scope.exit', metadata: { reason: '上下文压缩' } }));
+      return this.sendCompressionRequest(request, controls);
+    }
     const llmRequest = toLlmStartRequest(request);
+    if (this.debugCapture) setDebugCaptureContext(llmRequest, debugContext);
     return new Promise<void>((resolve, reject) => {
       let sequence = 0n;
       let text = '';
@@ -154,10 +161,15 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       let sawReplayUnsafeProviderOutput = false;
       let tail = Promise.resolve();
 
-      const enqueue = (event: Omit<ProviderOutputStreamEvent, 'streamSeq'>): void => {
+      const pushEvent = (event: Omit<ProviderOutputStreamEvent, 'streamSeq'>, source?: WorldEvent): void => {
         sequence += 1n;
         if (event.semanticProgress !== false) sawReplayUnsafeProviderOutput = true;
         const completeEvent: ProviderOutputStreamEvent = { ...event, streamSeq: sequence.toString() };
+        captureDebug(this.debugCapture, debugContext, () => ({ stage: 'provider.output', payload: completeEvent,
+          metadata: { streamSeq: String(completeEvent.streamSeq), kind: completeEvent.kind,
+            sourceRelation: event.kind === 'completed' || !source ? 'request_finalization' : 'world_event',
+            sourceUnlinked: event.kind !== 'completed' && event.semanticProgress !== false && Boolean(source) && !debugCaptureSources(source).length },
+          sources: debugCaptureSources(source) }));
         tail = tail.then(() => controls.onEvent(completeEvent)).then(() => undefined);
       };
       const finish = (error?: unknown): void => {
@@ -170,7 +182,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         if (terminalError !== undefined) {
           const partialOutput = partialOutputSnapshot(outputParts);
           if (partialOutput && shouldFreezeFailedPartialOutput(request, terminalError)) {
-            enqueue({
+            pushEvent({
               kind: 'output_item_done',
               semanticProgress: false,
               content: normalizePlainJson({
@@ -181,6 +193,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           }
         }
         terminal = true;
+        captureDebug(this.debugCapture, debugContext, () => ({ stage: 'provider.end', metadata: { status: terminalError === undefined ? 'completed' : 'failed' },
+          ...(terminalError === undefined ? {} : { payload: terminalError instanceof Error ? { name: terminalError.name, message: terminalError.message } : String(terminalError) }) }));
         detachAbort();
         void tail.then(
           () => terminalError === undefined ? resolve() : reject(terminalError),
@@ -190,6 +204,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       const emit = (event: WorldEvent): void => {
         if (terminal) return;
         try {
+          const enqueue = (output: Omit<ProviderOutputStreamEvent, 'streamSeq'>) => pushEvent(output, event);
           const payload = asRecord(event.payload);
           switch (event.type) {
           case LlmEventType.Started:

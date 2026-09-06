@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
+import DebugCaptureSettings from './DebugCaptureSettings.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
@@ -76,5 +77,6 @@ function inputNumber(event: Event): number {
         渠道配置页：<code>{{ settings.filePaths.llmProviderConfigs || '正在获取模型渠道配置路径…' }}</code>
       </p>
     </div>
+    <DebugCaptureSettings />
   </section>
 </template>

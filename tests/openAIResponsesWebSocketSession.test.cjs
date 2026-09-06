@@ -200,6 +200,38 @@ async function collect(options) {
   return chunks;
 }
 
+test('调试观察保留陌生工具编号与实际追加目标，原始消息在解析前捕获', async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const observations = [];
+  const recorder = {
+    active: () => 'capture-a',
+    record(input) {
+      observations.push(structuredClone(input));
+      return { runId: 'capture-a', captureSeq: observations.length };
+    }
+  };
+  const server = await createServer((socket) => {
+    socket.send(JSON.stringify({ type: 'response.output_item.added', output_index: 0,
+      item: { type: 'function_call', id: 'fc-a', call_id: 'call-a', name: 'bash', arguments: '' } }));
+    socket.send(JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: 'fc-foreign', output_index: 9, delta: '{"x":1}' }));
+    sendCompleted(socket, 'response-a', [{ type: 'function_call', id: 'fc-a', call_id: 'call-a', name: 'bash', arguments: '{}' }]);
+  });
+  try {
+    await collect(streamOptions(server, format, 'debug-routing', requestBody(format, [user('test')]), {
+      debugCapture: { recorder, context: { conversationId: 'conversation-a', modelRequestId: 'request-a', attemptSeq: '1', socketGeneration: '1' } }
+    }));
+    const wrong = observations.find(e => e.stage === 'ws.tool_assembly' && e.metadata.rawItemId === 'fc-foreign');
+    assert.equal(wrong.metadata.callId, 'call-a');
+    assert.equal(wrong.metadata.selectionReason, 'single_active_fallback');
+    assert.equal(wrong.payload, '{"x":1}');
+    const raw = observations[wrong.sources[0].captureSeq - 1];
+    assert.equal(raw.stage, 'transport.receive');
+    assert.equal(JSON.parse(Buffer.from(raw.bytes).toString()).item_id, 'fc-foreign');
+    assert.equal(observations.filter(e => e.stage === 'transport.send').length, 1);
+  } finally { resetOpenAIResponsesWebSocketSessions(); await server.close(); }
+});
+
 function streamOptions(server, format, sessionKey, body, overrides = {}) {
   return {
     sessionKey,

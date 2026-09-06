@@ -12,6 +12,9 @@ import type {
 } from '../../reliableKernel/agentLoop';
 import { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
 import { ReliableDiagnosticJournal } from '../../reliableKernel/diagnosticJournal';
+import { DebugCaptureService } from '../../reliableKernel/debugCapture/service';
+import { debugCaptureSource } from '../../reliableKernel/debugCapture/source';
+import { captureDebug } from '../../reliableKernel/debugCapture/observer';
 import { FrozenAuthorityMcpPolicyGate } from '../../reliableKernel/frozenMcpPolicyGate';
 import { ReliableLlmProviderRegistry } from '../../reliableKernel/llmCapabilityProviderRegistry';
 import {
@@ -67,6 +70,7 @@ export class VscodeReliableKernelProductRuntime {
   public readonly conversations: ReliableConversationRunner;
   public readonly providerRegistry: ReliableLlmProviderRegistry;
   public readonly diagnostics: ReliableDiagnosticJournal;
+  public readonly debugCapture: DebugCaptureService;
 
   private recoveryReport: ReliableKernelRecoveryReport | undefined;
   private recoveryError: unknown;
@@ -84,6 +88,7 @@ export class VscodeReliableKernelProductRuntime {
     conversations: ReliableConversationRunner;
     providerRegistry: ReliableLlmProviderRegistry;
     diagnostics: ReliableDiagnosticJournal;
+    debugCapture: DebugCaptureService;
     initializeConfiguration: () => Promise<void>;
   }) {
     this.application = input.application;
@@ -94,6 +99,7 @@ export class VscodeReliableKernelProductRuntime {
     this.conversations = input.conversations;
     this.providerRegistry = input.providerRegistry;
     this.diagnostics = input.diagnostics;
+    this.debugCapture = input.debugCapture;
     this.initializeConfiguration = input.initializeConfiguration;
   }
 
@@ -130,6 +136,7 @@ export class VscodeReliableKernelProductRuntime {
       authority = createVscodeRootAuthority(runtimePlacement);
     }
     const diagnostics = new ReliableDiagnosticJournal(authority, await authority.current());
+    const debugCapture = new DebugCaptureService(authority, await authority.current(), debugCaptureSource(''));
     let application: ReliableKernelApplication | undefined;
     let childAgents: ReliableChildAgentCoordinator | undefined;
     let fileDiffs: VscodeReliableFileDiffEditor | undefined;
@@ -156,6 +163,7 @@ export class VscodeReliableKernelProductRuntime {
       }
     });
     const providers = new ReliableLlmProviderRegistry({
+      debugCapture,
       loadProviderConfig: (providerConfigId) => configuration.providerConfig(providerConfigId),
       proxy: async () => {
         const common = await configuration.loadGlobalSettings('common');
@@ -205,6 +213,8 @@ export class VscodeReliableKernelProductRuntime {
     const observedFirstTransient = new Set<string>();
     const transientObserver: ReliableAgentTransientObserver = {
       observe(event) {
+        captureDebug(debugCapture, { conversationId: event.conversationId, modelRequestId: event.modelRequestId, attemptSeq: event.attemptSeq, socketGeneration: event.socketGeneration },
+          () => ({ stage: 'runtime.transient', metadata: { streamSeq: String(event.event.streamSeq), kind: event.event.kind } }));
         application?.webviewFeed.broadcastTransient(event);
         const transientGeneration = `${event.modelRequestId}:${event.attemptSeq}:${event.socketGeneration}`;
         if (!observedFirstTransient.has(transientGeneration)) {
@@ -297,6 +307,8 @@ export class VscodeReliableKernelProductRuntime {
         runtimeBuildInfo: getRuntimeBuildInfo
       });
       fileDiffs = new VscodeReliableFileDiffEditor(application.files, diagnostics);
+      debugCapture.source.hostBootId = application.database.hostBootId;
+      application.webviewFeed.setDebugCapture(debugCapture);
       conversations = new ReliableConversationRunner(
         application,
         `vscode-product:${application.database.hostBootId}`,
@@ -418,9 +430,11 @@ export class VscodeReliableKernelProductRuntime {
         conversations,
         providerRegistry: providers,
         diagnostics,
+        debugCapture,
         initializeConfiguration
       });
     } catch (error) {
+      await debugCapture.close().catch(() => undefined);
       if (application) {
         fileDiffs?.dispose();
         conversations?.dispose();
@@ -498,6 +512,7 @@ export class VscodeReliableKernelProductRuntime {
     cancellation.name = 'AbortError';
     this.recoveryController?.abort(cancellation);
     try {
+      await this.debugCapture.close().catch(() => undefined);
       this.fileDiffs.dispose();
       this.conversations.dispose();
       await this.application.beginHandoff();

@@ -1,4 +1,5 @@
 import type { TurnExecutionPhase, TurnLifecycleStatus } from './turnLifecycle';
+import type { DebugCaptureSettings, DebugCaptureCommand, DebugCaptureResult, DebugCaptureUiBatch, DebugCaptureUiAck } from './debugCapture';
 import type {
   AuthoritySnapshotRecord,
   CommittedConversationHead,
@@ -36,7 +37,7 @@ export interface WebviewClientMeta {
   planProposalId?: string;
 }
 
-export const GLOBAL_SETTINGS_SECTIONS = ['common', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'mcpServers'] as const;
+export const GLOBAL_SETTINGS_SECTIONS = ['common', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'mcpServers', 'debugCapture'] as const;
 export type GlobalSettingsSection = typeof GLOBAL_SETTINGS_SECTIONS[number];
 
 export const CONVERSATION_SETTINGS_SECTIONS = ['common', 'llm'] as const;
@@ -109,6 +110,10 @@ export enum BridgeMessageType {
   GlobalSettingsGet = 'settings.global.get',
   GlobalSettingsUpdate = 'settings.global.update',
   GlobalSettingsSnapshot = 'settings.global.snapshot',
+  DebugCaptureCommand = 'diagnostics.capture.command',
+  DebugCaptureResult = 'diagnostics.capture.result',
+  DebugCaptureObservation = 'diagnostics.capture.observation',
+  DebugCaptureObservationAck = 'diagnostics.capture.observation.ack',
   ConversationSettingsGet = 'settings.conversation.get',
   ConversationSettingsUpdate = 'settings.conversation.update',
   ConversationSettingsSnapshot = 'settings.conversation.snapshot',
@@ -2704,7 +2709,7 @@ export interface AppearanceSettingsRecord {
   /** AI 已输出工具调用、工具正在排队或执行时显示的文字。 */
   streamingTextToolExecuting: string;
 }
-export type GlobalSettingsSectionValue = GlobalSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | AttachmentSettingsRecord | McpServersSettingsRecord;
+export type GlobalSettingsSectionValue = GlobalSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | AttachmentSettingsRecord | McpServersSettingsRecord | DebugCaptureSettings;
 export interface GlobalSettingsGetPayload {
   section: GlobalSettingsSection;
 }
@@ -2831,6 +2836,8 @@ export interface AttachmentReloadResultPayload {
 }
 
 export type WebviewToExtensionMessage =
+  | BridgeEnvelope<BridgeMessageType.DebugCaptureCommand, DebugCaptureCommand>
+  | BridgeEnvelope<BridgeMessageType.DebugCaptureObservation, DebugCaptureUiBatch>
   | BridgeEnvelope<BridgeMessageType.Ready, undefined>
   | BridgeEnvelope<BridgeMessageType.Ack, BridgeAckPayload>
   | BridgeEnvelope<BridgeMessageType.Ping, { text: string; sentAt: number }>
@@ -2906,6 +2913,8 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.FsStatGet, FsStatGetPayload>;
 
 export type ExtensionToWebviewMessage =
+  | BridgeEnvelope<BridgeMessageType.DebugCaptureResult, DebugCaptureResult>
+  | BridgeEnvelope<BridgeMessageType.DebugCaptureObservationAck, DebugCaptureUiAck>
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>
   | BridgeEnvelope<BridgeMessageType.Pong, { text: string; receivedAt: number }>
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>

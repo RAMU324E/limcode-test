@@ -1,4 +1,6 @@
 import { defineStore } from 'pinia';
+import { debugCaptureTrace } from '@webview/transport/debugCapture';
+import type { ReliableToolApplyObserver } from '@webview/domain/reliableTransientModel';
 import {
   RELIABLE_KERNEL_CHANGES_MESSAGE,
   RELIABLE_KERNEL_CLIENT_CHANGE_TYPES,
@@ -534,11 +536,15 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     },
 
     observeTransientFrame(message: ReliableKernelTransientMessage): boolean {
-      if (!transientEnvelopeMatches(this.$state, message)) return false;
+      if (!transientEnvelopeMatches(this.$state, message)) {
+        debugCaptureTrace.observe(debugContext(message), () => ({ stage: 'ui.frame', metadata: { ...debugFrameMetadata(message), decision: 'envelope_rejected' } }));
+        return false;
+      }
       const decision = transientContinuityDecision(
         this.transientModelRequests[message.modelRequestId],
         message
       );
+      debugCaptureTrace.observe(debugContext(message), () => ({ stage: 'ui.frame', metadata: { ...debugFrameMetadata(message), decision: decision.kind } }));
       if (decision.kind === 'invalid') return false;
       if (decision.kind === 'stale') return true;
       if (decision.kind === 'gap') {
@@ -592,6 +598,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
 
     observeTransientSnapshot(message: ReliableKernelTransientSnapshotMessage): void {
       if (!transientEnvelopeMatches(this.$state, message)) return;
+      debugCaptureTrace.observe(debugContext(message), () => ({ stage: 'ui.snapshot', metadata: { sessionId: message.sessionId, snapshotId: message.deliveryId, headStreamSeq: message.headStreamSeq, mode: 'rebuild' }, payload: message.events }));
       const headStreamSeq = decimal(message.headStreamSeq);
       const attemptSeq = decimal(message.attemptSeq);
       const socketGeneration = decimal(message.socketGeneration);
@@ -634,7 +641,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
             hostBootId: message.hostBootId,
             conversationId: message.conversationId,
             event: { ...event.event, streamSeq: localSequence }
-          });
+          }, { mode: 'rebuild', snapshotId: message.deliveryId, headStreamSeq: message.headStreamSeq });
         });
       } catch {
         if (prior) this.transientModelRequests[message.modelRequestId] = prior;
@@ -713,7 +720,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       });
     },
 
-    observeTransient(message: ReliableKernelTransientMessage): void {
+    observeTransient(message: ReliableKernelTransientMessage, debugMode: { mode: 'apply' | 'rebuild'; snapshotId?: string; headStreamSeq?: string } = { mode: 'apply' }): void {
       if (
         !this.hostBootId
         || message.hostBootId !== this.hostBootId
@@ -745,6 +752,10 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       const content = plainRecord(message.event.content);
       const outputItem = modelOutputItemValue(content?.outputItem);
       const observedAt = timestamp(message.observedAt) || Date.now();
+      const debug = debugContext(message);
+      const observeTool: ReliableToolApplyObserver | undefined = debugCaptureTrace.active(debug) ? change => {
+        debugCaptureTrace.tool(debug, { ...debugFrameMetadata(message), ...debugMode, callId: change.callId, streamIndex: change.streamIndex ?? null, operation: change.operation }, change.before, change.fragment, change.after);
+      } : undefined;
       const next: ReliableKernelTransientState = current
         ? {
             ...current,
@@ -815,7 +826,10 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
               }]
             : []),
           message.modelRequestId,
-          observedAt
+          observedAt,
+          undefined,
+          observeTool,
+          next.toolCalls
         ) ?? [];
         const usage = plainRecord(message.event.usage);
         if (usage) next.usageMetadata = usage;
@@ -932,7 +946,8 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           content.calls,
           message.modelRequestId,
           observedAt,
-          outputItem
+          outputItem,
+          observeTool
         );
         next.outputParts = syncReliableTransientFunctionCallParts(next.outputParts, next.toolCalls);
       } else if (content?.type === 'tool_calls' && Array.isArray(content.calls)) {
@@ -941,11 +956,13 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           content.calls,
           message.modelRequestId,
           observedAt,
-          outputItem
+          outputItem,
+          observeTool
         );
         next.outputParts = syncReliableTransientFunctionCallParts(next.outputParts, next.toolCalls);
       }
       this.transientModelRequests[message.modelRequestId] = next;
+      debugCaptureTrace.observe(debug, () => ({ stage: 'ui.frame', metadata: { ...debugFrameMetadata(message), ...debugMode, decision: 'applied', status: next.status }, payload: message.event }));
       // A streaming delta cannot retire any overlay. Full reconciliation scans the bounded durable
       // window and is needed only at terminal events or durable Feed commits.
       if (next.status !== 'streaming') {
@@ -2361,4 +2378,12 @@ function activeConversationId(projections: Record<string, unknown>): string | un
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function debugContext(message: { conversationId: string; modelRequestId: string; attemptSeq: string; socketGeneration: string }) {
+  return { conversationId: message.conversationId, modelRequestId: message.modelRequestId, attemptSeq: message.attemptSeq, socketGeneration: message.socketGeneration };
+}
+function debugFrameMetadata(message: ReliableKernelTransientMessage) {
+  return { sessionId: message.sessionId, streamSeq: message.event.streamSeq, fromStreamSeq: message.fromStreamSeq ?? message.event.streamSeq,
+    navigationGeneration: message.navigationGeneration ?? '', kind: message.event.kind };
 }

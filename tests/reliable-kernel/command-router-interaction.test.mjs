@@ -30,6 +30,7 @@ const {
 test('stale Turn interrupt is idempotently reported as already_terminal', async () => {
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
     toolHost: { setStateChangeListener() {} }
   });
   router.maybeRow = async (domain, id) => {
@@ -60,6 +61,7 @@ test('stale Turn interrupt is idempotently reported as already_terminal', async 
 test('stale Conversation settings request returns scoped error without throwing', async () => {
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
     toolHost: { setStateChangeListener() {} }
   });
   router.readConversationSettings = async () => undefined;
@@ -80,6 +82,7 @@ test('stale Conversation settings request returns scoped error without throwing'
 test('failed global settings read preserves section scope for Webview loading state', async () => {
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} },
     toolHost: { setStateChangeListener() {} },
     configuration: {
       async loadGlobalSettings(section) {
@@ -112,6 +115,7 @@ test('durable Interaction result is posted before a stalled Agent resume complet
   const resume = deferred();
   const resumedConversations = [];
   const product = {
+    debugCapture: { setListener() {} },
     toolHost: { setStateChangeListener() {} },
     application: {
       interactions: {

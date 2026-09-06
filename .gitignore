@@ -46,6 +46,10 @@ docs/architecture/*
 !/tests/reliable-kernel/context-token-estimator.test.mjs
 !/tests/reliable-kernel/current-turn-task-projection.test.mjs
 !/tests/reliable-kernel/diagnostic-journal.test.mjs
+!/tests/reliable-kernel/debug-capture-controller.test.mjs
+!/tests/reliable-kernel/debug-capture-provenance.test.mjs
+!/tests/reliable-kernel/debug-capture-files.test.mjs
+!/tests/reliable-kernel/debug-capture-ui.test.mjs
 !/tests/reliable-kernel/llm-capability-provider-adapter.test.mjs
 !/tests/reliable-kernel/model-system-prompt-prefix.test.mjs
 !/tests/reliable-kernel/native-compact-media.test.mjs
@@ -80,3 +84,5 @@ docs/architecture/*
 /scripts/reliable-kernel/model-independent-hotpaths-after.json
 /scripts/reliable-kernel/tool-scheduler-model-independent-after.json
 /scripts/reliable-kernel/tool-scheduler-phase*-*.json
+.playwright-cli/
+/output/playwright/

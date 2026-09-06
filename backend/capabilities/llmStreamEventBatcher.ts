@@ -20,6 +20,7 @@ export interface LlmStreamEventBatcherOptions {
   maxBufferedChars?: number;
   now?: () => number;
   onTerminalMetrics?: (metrics: LlmStreamAggregationMetrics) => void;
+  onDerived?: (event: WorldEvent, sources: readonly WorldEvent[]) => void;
 }
 
 export interface LlmStreamEventBatcher {
@@ -104,6 +105,7 @@ export function createLlmStreamEventBatcher(
       const bufferedChars = eventTextLength(event);
       pending = { event, eventCount: 1, bufferedChars, queuedAt: now() };
     } else {
+      try { options.onDerived?.(merged, [pending.event, event]); } catch { /* 观察不改变合并结果。 */ }
       pending = {
         ...pending,
         event: merged,
@@ -130,7 +132,9 @@ export function createLlmStreamEventBatcher(
       const snapshot = metrics();
       const payload = event.payload as LlmDonePayload | LlmErrorPayload;
       sink({ type: LlmEventType.ToolCallPreviewDone, payload: { requestId: payload.requestId, all: true } });
-      sink({ ...event, payload: { ...payload, streamAggregation: snapshot } });
+      const completed = { ...event, payload: { ...payload, streamAggregation: snapshot } };
+      try { options.onDerived?.(completed, [event]); } catch { /* 观察不改变终态。 */ }
+      sink(completed);
       options.onTerminalMetrics?.(snapshot);
       return;
     }

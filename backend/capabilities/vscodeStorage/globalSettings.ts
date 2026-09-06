@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '../../../shared/debugCapture';
 import type {
   AttachmentSettingsRecord,
   AppearanceSettingsRecord,
@@ -39,6 +40,11 @@ const GLOBAL_SETTINGS_SECTION_SPECS: Record<FileBackedGlobalSettingsSection, {
   createDefault: () => GlobalSettingsSectionValue;
   normalize: (input: Partial<GlobalSettingsSectionValue> | undefined) => GlobalSettingsSectionValue;
 }> = {
+  debugCapture: {
+    fileName: 'debug-capture.json',
+    createDefault: normalizeDebugCaptureSettings,
+    normalize: (input) => normalizeDebugCaptureSettings(input as Partial<DebugCaptureSettings> | undefined)
+  },
   llm: {
     fileName: LLM_SETTINGS_FILE,
     createDefault: createDefaultLlmSettings,
@@ -283,6 +289,11 @@ function isValidGlobalSettingsSectionValue(section: GlobalSettingsSection, value
   if (section === 'attachments') {
     return typeof record.maxStoredInlineFileMb === 'number'
       && Number.isFinite(record.maxStoredInlineFileMb);
+  }
+  if (section === 'debugCapture') {
+    return (record.scope === 'conversation' || record.scope === 'workspace')
+      && (record.maxMiB === 8 || record.maxMiB === 16 || record.maxMiB === 32)
+      && (record.maxMinutes === 5 || record.maxMinutes === 15 || record.maxMinutes === 30);
   }
   return false;
 }

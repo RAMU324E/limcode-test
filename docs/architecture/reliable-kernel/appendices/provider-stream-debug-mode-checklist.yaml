@@ -1,0 +1,48 @@
+feature: 2026-09-07-provider-stream-debug-mode
+design: provider-stream-debug-mode-design.md
+steps:
+  - id: contracts
+    title: 契约与控制骨架
+    status: done
+    evidence: 控制器 16 项测试、设置文件与监听测试通过；控制器尚未装配进产品
+    exit_signal: 默认关闭、范围和预算冻结、重复启停与旧操作隔离有确定行为
+  - id: provenance
+    title: 来源关联验证
+    status: done
+    verification: 依赖观察接口 5 项测试与长连接 35 项测试通过，原文位置、错误归属和中途开启均有证据
+    evidence: provider-stream-debug-mode-progress.md
+    decision: 用户已同意扩展到依赖库源码观察接口与固定构建，继续实施
+    exit_signal: 两种连接均保留真实输入与实际解码的可验证关系，不修改依赖私有状态
+  - id: persistence
+    title: 有界持久化
+    status: done
+    evidence: 原文及索引校验、三档容量写满、异常写入、三阶段强制退出和只读前缀测试通过
+    exit_signal: 原文、索引、可靠截止点、容量及内存限制和异常前缀读取通过验证
+  - id: coverage
+    title: 完成链路覆盖
+    status: done
+    evidence: 长连接与普通连接实际组装观察、自动切换测试和界面追加及重建记录已接入
+    exit_signal: 工具错配、重复追加、完成、连接切换和界面重建均有定位证据
+  - id: operations
+    title: 用户操作与离线分析
+    status: done
+    evidence: 设置页六项操作接通，浏览器三档宽度无越界，导出及读取时互斥清理测试通过
+    exit_signal: 设置、启停、查看、导出、分析和受控清理均可使用
+  - id: delivery
+    title: 回归与交付
+    status: in_progress
+    exit_signal: 完整门禁、关闭和开启行为对照、资源边界及实际构建核验完成
+    partial_evidence: 当前功能通过 check:local，365 项中 352 通过、13 跳过、0 失败；等待集成新合并请求后的干净构建与交付
+checks:
+  - id: scenarios
+    status: pending
+    requirement: 逐项核对方案 A01 至 A28，不把测试数量等同于覆盖范围
+  - id: authority
+    status: done
+    requirement: 不改业务数据库、模型内容、执行或重试规则，普通日志限制不变
+  - id: resources
+    status: done
+    requirement: 默认关闭、有限内存和写盘、不自动覆盖或上传
+  - id: provenance
+    status: done
+    requirement: 来源未关联、缺失、中途开启与版本差异必须明确报告

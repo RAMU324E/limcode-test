@@ -31,6 +31,35 @@ async function saveLatestGlobalSettings(authority, section, settings) {
   return authority.saveGlobalSettings(section, settings, current.revision);
 }
 
+test('调试默认设置使用独立设置文件、现有修订检查与当前数据目录，不保存开启状态', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-debug-settings-'));
+  try {
+    let currentRoot = path.join(root, 'first');
+    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(vscode.Uri.file(currentRoot)));
+    const initial = await authority.loadGlobalSettings('debugCapture');
+    assert.deepEqual(initial.settings, { scope: 'conversation', maxMiB: 32, maxMinutes: 30 });
+    assert.equal(initial.filePath, path.join(currentRoot, 'settings', 'debug-capture.json'));
+    const updated = await authority.saveGlobalSettings('debugCapture', {
+      scope: 'workspace', maxMiB: 8, maxMinutes: 5, enabled: true
+    }, initial.revision);
+    assert.deepEqual(updated.settings, { scope: 'workspace', maxMiB: 8, maxMinutes: 5 });
+    await assert.rejects(authority.saveGlobalSettings('debugCapture', initial.settings, initial.revision), /revision|版本|冲突/i);
+    const saved = JSON.parse(await fs.readFile(initial.filePath, 'utf8'));
+    assert.equal('enabled' in saved.settings, false);
+    currentRoot = path.join(root, 'second');
+    const switched = await authority.loadGlobalSettings('debugCapture');
+    assert.deepEqual(switched.settings, initial.settings);
+    assert.equal(switched.filePath, path.join(currentRoot, 'settings', 'debug-capture.json'));
+    assert.deepEqual(JSON.parse(await fs.readFile(initial.filePath, 'utf8')).settings, updated.settings);
+    const damaged = JSON.parse(await fs.readFile(switched.filePath, 'utf8'));
+    damaged.settings.maxMiB = 999;
+    await fs.writeFile(switched.filePath, JSON.stringify(damaged));
+    await assert.rejects(authority.loadGlobalSettings('debugCapture'), /内容损坏/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('ToolPolicy 层按能力上界收窄、深合并配置，并保持来源 deny 单调', () => {
   const resolved = resolveToolPolicyLayers([
     {

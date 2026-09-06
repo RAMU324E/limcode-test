@@ -1,4 +1,5 @@
 import type { LlmProviderKind } from '../../shared/protocol';
+import type { DebugHttpObservation } from '../reliableKernel/debugCapture/observer';
 import {
   annotateProviderWireError,
   emitProviderWireInvariantTrace,
@@ -16,6 +17,7 @@ const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60_000;
 export interface TerminalValidatedFetchOptions {
   bodyIdleTimeoutMs?: number;
   onWireInvariantTrace?: (trace: LlmProviderWireInvariantTrace) => void;
+  createObservation?: () => DebugHttpObservation;
 }
 
 export class LlmHttpStreamTerminationError extends Error {
@@ -46,17 +48,22 @@ export function createTerminalValidatedFetch(
 ): typeof fetch {
   const bodyIdleTimeoutMs = positiveTimeout(options.bodyIdleTimeoutMs ?? DEFAULT_BODY_IDLE_TIMEOUT_MS);
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const observation = options.createObservation?.();
     const wireTrace = await inspectFinalProviderWireBody(input, init, provider);
     if (wireTrace) emitProviderWireInvariantTrace(options.onWireInvariantTrace, wireTrace);
-    let response = await baseFetch(input, init);
+    observation?.request(input, init);
+    let response: Response;
+    try { response = await baseFetch(input, init); }
+    catch (error) { observation?.end('fetch_error', error); throw error; }
     if (!response.ok && wireTrace?.toolItems.length) {
       response = annotateProviderWireError(response, wireTrace.bodySha256);
     }
-    if (!response.ok || !response.body || !isEventStream(response.headers.get('content-type'))) return response;
+    const validatedStream = response.ok && isEventStream(response.headers.get('content-type'));
+    if (!response.body || (!validatedStream && !observation)) return response;
 
     const reader = response.body.getReader();
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const tracker = new SseTerminalTracker(provider);
+    const tracker = validatedStream ? new SseTerminalTracker(provider) : undefined;
     // Fetch implementations expose decoded response bytes while commonly retaining the encoded
     // Content-Length header. Only compare lengths when no content coding can change the byte count.
     const expectedBytes = hasIdentityContentEncoding(response.headers.get('content-encoding'))
@@ -68,9 +75,9 @@ export function createTerminalValidatedFetch(
       async pull(controller) {
         if (closed) return;
         try {
-          const next = await readWithIdleDeadline(reader, bodyIdleTimeoutMs).catch((error: unknown) => {
+          const next = await (validatedStream ? readWithIdleDeadline(reader, bodyIdleTimeoutMs) : reader.read()).catch((error: unknown) => {
             // Only transport reads are eligible; parser failures and explicit cancellation are not.
-            if (!closed && !signal?.aborted && !tracker.sawTerminal && isBodyConnectionFailure(error)) {
+            if (validatedStream && !closed && !signal?.aborted && !tracker?.sawTerminal && isBodyConnectionFailure(error)) {
               throw new LlmHttpStreamTerminationError(
                 `${provider} SSE response body read interrupted: ${error.message}`,
                 'LLM_STREAM_TRUNCATED', undefined, error
@@ -80,41 +87,46 @@ export function createTerminalValidatedFetch(
           });
           if (!next.done) {
             receivedBytes += next.value.byteLength;
-            tracker.push(next.value);
+            observation?.raw(next.value);
+            tracker?.push(next.value);
             controller.enqueue(next.value);
             return;
           }
 
           closed = true;
-          tracker.finish();
-          if (expectedBytes !== undefined && receivedBytes !== expectedBytes) {
+          tracker?.finish();
+          if (validatedStream && expectedBytes !== undefined && receivedBytes !== expectedBytes) {
             throw new LlmHttpStreamTerminationError(
               `HTTP stream ended after ${receivedBytes} of ${expectedBytes} declared bytes.`
             );
           }
-          if (!tracker.sawTerminal) {
+          if (tracker && !tracker.sawTerminal) {
             throw new LlmHttpStreamTerminationError(
               `${provider} SSE stream ended without provider terminal evidence.`
             );
           }
           controller.close();
+          observation?.end('eof');
         } catch (error) {
           closed = true;
+          observation?.end('read_error', error);
           void reader.cancel(error).catch(() => undefined);
           controller.error(error);
         }
       },
       async cancel(reason) {
         closed = true;
+        observation?.end('cancel', reason);
         await reader.cancel(reason);
       }
     });
 
-    return new Response(body, {
+    const wrapped = new Response(body, {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers
     });
+    return observation ? observation.bind(wrapped) : wrapped;
   };
 }
 

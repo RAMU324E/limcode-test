@@ -184,7 +184,8 @@
         "setting.llmCompression",
         "setting.checkpointMaintenance",
         "setting.appearance",
-        "setting.attachments"
+        "setting.attachments",
+        "setting.debugCapture"
       ]
     },
     {

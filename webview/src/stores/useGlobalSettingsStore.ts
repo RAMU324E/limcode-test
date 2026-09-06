@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia';
+import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '@shared/debugCapture';
 import {
   GLOBAL_SETTINGS_SECTIONS,
   type AttachmentSettingsRecord,
@@ -71,6 +72,7 @@ interface GlobalSettingsState {
   /** 附件：控制 base64 小附件托管阈值。 */
   attachments: AttachmentSettingsRecord;
   mcpServers: McpServersSettingsRecord;
+  debugCapture: DebugCaptureSettings;
   /** 各 section 的来源文件路径，用于在 UI 展示。 */
   filePaths: Partial<Record<GlobalSettingsSection, string>>;
   /** 各 section 最近一次已确认内容的指纹。 */
@@ -803,6 +805,7 @@ function plainSettingsFromState(state: GlobalSettingsState, section: GlobalSetti
     case 'appearance': return { ...state.appearance };
     case 'attachments': return { maxStoredInlineFileMb: state.attachments.maxStoredInlineFileMb };
     case 'mcpServers': return { servers: state.mcpServers.servers.map(toPlainMcpServer) };
+    case 'debugCapture': return normalizeDebugCaptureSettings(state.debugCapture);
   }
 }
 
@@ -1004,6 +1007,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     appearance: emptyAppearance(),
     attachments: emptyAttachments(),
     mcpServers: emptyMcpServers(),
+    debugCapture: normalizeDebugCaptureSettings(),
     filePaths: {},
     revisions: {},
     baselines: {},
@@ -1127,6 +1131,15 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
           defaultDataRootPath: this.common.defaultDataRootPath
         }
       });
+    },
+    setDebugCaptureSettings(patch: Partial<DebugCaptureSettings>): void {
+      this.debugCapture = normalizeDebugCaptureSettings({ ...this.debugCapture, ...patch });
+      this.enqueueSettingsUpdate({ section: 'debugCapture', settings: normalizeDebugCaptureSettings(this.debugCapture) });
+    },
+    ensureDebugCaptureSettings(): void {
+      if (this.loadedSections.debugCapture || this.loadingSettingsSections.debugCapture) return;
+      this.markLoadingSettingSection('debugCapture');
+      bridge.request(BridgeMessageType.GlobalSettingsGet, { section: 'debugCapture' });
     },
     saveLlm(): void {
       this.status = '正在保存当前渠道选择...';
@@ -2013,6 +2026,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         this.appearance = { ...emptyAppearance(), ...(value as AppearanceSettingsRecord) };
       } else if (section === 'attachments') {
         this.attachments = { ...emptyAttachments(), ...(value as AttachmentSettingsRecord) };
+      } else if (section === 'debugCapture') {
+        this.debugCapture = normalizeDebugCaptureSettings(value as DebugCaptureSettings);
       } else if (section === 'mcpServers') {
         const settings = value as McpServersSettingsRecord;
         this.mcpServers = { servers: [...(settings.servers ?? [])].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id)) };

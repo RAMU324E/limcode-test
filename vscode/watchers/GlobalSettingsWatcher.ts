@@ -6,7 +6,7 @@ import { LIMCODE_GLOBAL_STATUS_FILE } from '../../backend/capabilities/vscodeSto
 
 /** 每个递归监听都从自己的小目录开始，避免扫描整个插件数据目录。 */
 const GLOBAL_SETTINGS_WATCH_SPECS = [
-  { baseSegments: [], pattern: '{llm,llm-compression,appearance,attachments,checkpoint-maintenance}.json' },
+  { baseSegments: [], pattern: '{llm,llm-compression,appearance,attachments,checkpoint-maintenance,debug-capture}.json' },
   { baseSegments: ['llm-provider-configs'], pattern: '**/*.json' },
   { baseSegments: ['llm-compression-configs'], pattern: '**/*.json' },
   { baseSegments: ['mcp-servers'], pattern: '**/*.json' }
@@ -17,7 +17,8 @@ const FILE_NAME_SECTIONS: Record<string, GlobalSettingsSection> = {
   'llm-compression.json': 'llmCompression',
   'appearance.json': 'appearance',
   'attachments.json': 'attachments',
-  'checkpoint-maintenance.json': 'checkpointMaintenance'
+  'checkpoint-maintenance.json': 'checkpointMaintenance',
+  'debug-capture.json': 'debugCapture'
 };
 
 const DIRECTORY_SECTIONS: Record<string, GlobalSettingsSection> = {

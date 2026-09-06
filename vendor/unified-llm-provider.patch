@@ -1,0 +1,572 @@
+diff --git a/package.json b/package.json
+index f9f525c..f3696cc 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "unified-llm-provider",
+-  "version": "0.1.35",
++  "version": "0.1.35-limcode.1",
+   "description": "统一 LLM Provider npm 包：一套统一结构接入 Gemini / Claude / OpenAI Compatible / OpenAI Responses / DeepSeek",
+   "license": "MIT",
+   "type": "module",
+diff --git a/src/index.ts b/src/index.ts
+index 0c458cf..27ca125 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -12,6 +12,7 @@ export * from './llm/vision.js';
+ export * from './llm/transport.js';
+ export { resetOpenAIResponsesWebSocketSessions } from './llm/websocket-openai-responses.js';
+ export * from './llm/response.js';
++export * from './llm/observation.js';
+ export * from './llm/convert.js';
+ export * from './llm/debug-utils.js';
+ 
+diff --git a/src/llm/formats/openai-responses.ts b/src/llm/formats/openai-responses.ts
+index 1be02a5..0a684bc 100644
+--- a/src/llm/formats/openai-responses.ts
++++ b/src/llm/formats/openai-responses.ts
+@@ -312,7 +312,7 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+         // encrypted_content 只在 output_item.done 阶段采信，避免保存未完成或最终全量重复签名。
+         emitReasoningItemSummary(chunk, streamState, item, data);
+       } else if (item?.type === 'function_call') {
+-        rememberPendingFunctionCall(streamState, item);
++        rememberPendingFunctionCall(streamState, item, data);
+       }
+     } else if (isReasoningTextDeltaEvent(event)) {
+       emitReasoningDeltaText(chunk, streamState, data, data.delta);
+@@ -325,6 +325,7 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+         streamState,
+         data.item_id ?? data.id ?? data.call_id,
+         data.delta,
++        data,
+       );
+     } else if (event === 'response.function_call_arguments.done') {
+       const itemKey = rememberPendingFunctionCall(streamState, {
+@@ -332,8 +333,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+         call_id: data.call_id,
+         name: data.name,
+         arguments: data.arguments,
+-      });
+-      if (itemKey) emitFunctionCallChunk(chunk, itemKey, streamState);
++      }, data);
++      if (itemKey) emitFunctionCallChunk(chunk, itemKey, streamState, data);
+     } else if (event === 'response.output_item.done') {
+       const item = data.item;
+       if (item?.type === 'reasoning') {
+@@ -342,8 +343,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+         emitReasoningItemSummary(chunk, streamState, item, data);
+         emitReasoningSignature(chunk, streamState, item, data);
+       } else if (item?.type === 'function_call') {
+-        rememberPendingFunctionCall(streamState, item);
+-        emitFunctionCallChunk(chunk, item, streamState);
++        rememberPendingFunctionCall(streamState, item, data);
++        emitFunctionCallChunk(chunk, item, streamState, data);
+       } else if (item?.type === 'compaction') {
+         appendPartDelta(chunk, createProviderContextPart(item, 'responses'));
+       }
+@@ -364,7 +365,7 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+           appendPartDelta(chunk, createProviderContextPart(item, 'responses'));
+         }
+       }
+-      flushPendingFunctionCalls(chunk, streamState);
++      flushPendingFunctionCalls(chunk, streamState, data);
+     }
+ 
+     return chunk;
+@@ -819,11 +820,13 @@ function parseFunctionCallArguments(argumentsValue: unknown): Record<string, unk
+ function rememberPendingFunctionCall(
+   state: OpenAIResponsesStreamState,
+   item: any,
++  raw?: object,
+ ): string | undefined {
+   const itemKey = getPendingFunctionCallKey(item);
+   if (!itemKey) return undefined;
+ 
+   const pending = state.pendingFunctionCalls.get(itemKey) ?? { argumentsText: '' };
++  const before = pending.argumentsText;
+   const callId = normalizeCallId(item.call_id) ?? pending.callId ?? normalizeCallId(item.id);
+   if (callId) pending.callId = callId;
+   if (typeof item.name === 'string' && item.name.trim()) pending.name = item.name;
+@@ -836,6 +839,7 @@ function rememberPendingFunctionCall(
+   }
+ 
+   state.pendingFunctionCalls.set(itemKey, pending);
++  observeFunctionAssembly(raw, pending, itemKey, before, pending.argumentsText, 'replace', 'item_key');
+   return itemKey;
+ }
+ 
+@@ -843,13 +847,16 @@ function appendPendingFunctionCallArguments(
+   state: OpenAIResponsesStreamState,
+   itemId: unknown,
+   delta: unknown,
++  raw?: object,
+ ): void {
+   const itemKey = normalizeCallId(itemId);
+   if (!itemKey || typeof delta !== 'string') return;
+ 
+   const pending = state.pendingFunctionCalls.get(itemKey) ?? { argumentsText: '' };
++  const before = pending.argumentsText;
+   pending.argumentsText += delta;
+   state.pendingFunctionCalls.set(itemKey, pending);
++  observeFunctionAssembly(raw, pending, itemKey, before, delta, 'append', 'item_key');
+ }
+ 
+ function getPendingFunctionCallKey(item: any): string | undefined {
+@@ -860,14 +867,18 @@ function emitFunctionCallChunk(
+   chunk: LLMStreamChunk,
+   itemOrKey: any,
+   state: OpenAIResponsesStreamState,
++  raw?: object,
+ ): void {
+   const itemKey = typeof itemOrKey === 'string'
+     ? itemOrKey
+-    : rememberPendingFunctionCall(state, itemOrKey);
++    : rememberPendingFunctionCall(state, itemOrKey, raw);
+   if (!itemKey) return;
+ 
+   const pending = state.pendingFunctionCalls.get(itemKey);
+-  if (!pending?.name) return;
++  if (!pending?.name) {
++    if (pending) observeFunctionAssembly(raw, pending, itemKey, pending.argumentsText, '', 'rejected', 'missing_name');
++    return;
++  }
+ 
+   const functionCall = tryCreateFunctionCallPart({
+     id: itemKey,
+@@ -875,23 +886,35 @@ function emitFunctionCallChunk(
+     name: pending.name,
+     arguments: pending.argumentsText,
+   });
+-  if (!functionCall) return;
++  if (!functionCall) { observeFunctionAssembly(raw, pending, itemKey, pending.argumentsText, '', 'rejected', 'invalid_arguments'); return; }
+ 
+   const emittedId = functionCall.functionCall.callId ?? itemKey;
+-  if (state.emittedFunctionCallIds.has(emittedId)) return;
++  if (state.emittedFunctionCallIds.has(emittedId)) { observeFunctionAssembly(raw, pending, itemKey, pending.argumentsText, '', 'rejected', 'already_emitted'); return; }
+   state.emittedFunctionCallIds.add(emittedId);
+   state.pendingFunctionCalls.delete(itemKey);
+ 
+   chunk.functionCalls = [...(chunk.functionCalls ?? []), functionCall];
+   chunk.partsDelta = [...(chunk.partsDelta ?? []), functionCall];
++  observeFunctionAssembly(raw, pending, itemKey, pending.argumentsText, '', 'complete', 'parsed');
+ }
+ 
+-function flushPendingFunctionCalls(chunk: LLMStreamChunk, state: OpenAIResponsesStreamState): void {
++function flushPendingFunctionCalls(chunk: LLMStreamChunk, state: OpenAIResponsesStreamState, raw?: object): void {
+   for (const itemKey of [...state.pendingFunctionCalls.keys()]) {
+-    emitFunctionCallChunk(chunk, itemKey, state);
++    emitFunctionCallChunk(chunk, itemKey, state, raw);
+   }
+ }
+ 
++const functionObservationRuns = new WeakMap<object, string>();
++function observeFunctionAssembly(raw: object | undefined, pending: PendingOpenAIResponsesFunctionCall, itemKey: string, before: string, fragment: string, operation: string, reason: string): void {
++  observeLlmDerived(raw, token => {
++    const first = functionObservationRuns.get(pending) !== token;
++    functionObservationRuns.set(pending, token);
++    return { kind: 'tool_assembly', value: { callId: pending.callId ?? itemKey, streamIndex: itemKey,
++      beforeChars: before.length, afterChars: pending.argumentsText.length, fragment, operation, selectionReason: reason,
++      ...(first ? { baseline: before } : {}) } };
++  });
++}
++
+ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
+   try {
+     return createFunctionCallPart(item);
+@@ -899,3 +922,4 @@ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
+     return undefined;
+   }
+ }
++import { observeLlmDerived } from '../observation.js';
+diff --git a/src/llm/observation.ts b/src/llm/observation.ts
+new file mode 100644
+index 0000000..2429bdc
+--- /dev/null
++++ b/src/llm/observation.ts
+@@ -0,0 +1,129 @@
++/** 进程内观察接口：不向请求体或模型输出添加字段。 */
++export interface LlmResponseObservation {
++  kind: 'sse_event' | 'decode_input' | 'decoded' | 'body' | 'parse_end' | 'tool_assembly';
++  streamId: string;
++  captureToken: string;
++  eventSeq?: number;
++  byteStart?: number;
++  byteEnd?: number;
++  parent?: unknown;
++  value?: unknown;
++}
++
++export interface LlmResponseObserver {
++  streamId: string;
++  active(): string | undefined;
++  observe(event: LlmResponseObservation): unknown;
++}
++
++const observers = new WeakMap<object, LlmResponseObserver>();
++const sources = new WeakMap<object, unknown>();
++
++export function attachLlmResponseObserver<T extends object>(response: T, observer: LlmResponseObserver): T {
++  observers.set(response, observer);
++  return response;
++}
++
++export function getLlmResponseObserver(response: object): LlmResponseObserver | undefined {
++  return observers.get(response);
++}
++
++export function getLlmObservation(value: unknown): unknown {
++  return value !== null && typeof value === 'object' ? sources.get(value) : undefined;
++}
++
++export function carryLlmObservation<T>(from: unknown, to: T): T {
++  const source = getLlmObservation(from);
++  if (source !== undefined && to !== null && typeof to === 'object') sources.set(to, source);
++  return to;
++}
++
++export function observeLlmObject<T>(
++  value: T,
++  observer: LlmResponseObserver | undefined,
++  event: () => Omit<LlmResponseObservation, 'streamId' | 'captureToken'>,
++): T {
++  try {
++    const captureToken = observer?.active();
++    if (observer && captureToken) {
++      if (value !== null && typeof value === 'object') observers.set(value, observer);
++      const source = observer.observe({ ...event(), streamId: observer.streamId, captureToken });
++      if (source !== undefined && value !== null && typeof value === 'object') sources.set(value, source);
++    }
++  } catch {
++    // 观察失败不影响解析和模型结果。
++  }
++  return value;
++}
++
++export function observeLlmDerived(parent: object | undefined, event: (captureToken: string) => Pick<LlmResponseObservation, 'kind' | 'value'>): void {
++  try {
++    const observer = parent ? observers.get(parent) : undefined;
++    const captureToken = observer?.active();
++    if (observer && captureToken) observer.observe({ ...event(captureToken), streamId: observer.streamId, captureToken, parent: getLlmObservation(parent) });
++  } catch { /* 观察不改变解码。 */ }
++}
++
++/** 跟随真实解析器逐行前进，不建立第二份事件队列或累计正文。 */
++export class LlmSseObservation {
++  private offset = 0;
++  private readStart = 0;
++  private bytes: Uint8Array = new Uint8Array();
++  private handledLines = 0;
++  private scannedLines = 0;
++  private cursor = -1;
++  private lineEnd: number | undefined;
++  private eventStart: number | undefined;
++  private token: string | undefined;
++  private eventSeq = 0;
++
++  public constructor(private readonly observer: LlmResponseObserver) {
++    this.token = this.active();
++    if (this.token) this.eventStart = 0;
++  }
++
++  public read(bytes: Uint8Array): void {
++    this.readStart = this.offset;
++    this.offset += bytes.byteLength;
++    this.bytes = bytes;
++    this.handledLines = this.scannedLines = 0;
++    this.cursor = -1;
++  }
++
++  public line(): void {
++    this.handledLines += 1;
++    const token = this.active();
++    if (token !== this.token) {
++      this.token = token;
++      this.eventStart = undefined;
++    }
++    if (!token) {
++      this.lineEnd = undefined;
++      return;
++    }
++    while (this.scannedLines < this.handledLines) {
++      this.cursor = this.bytes.indexOf(10, this.cursor + 1);
++      this.scannedLines += 1;
++      if (this.cursor < 0) break;
++    }
++    this.lineEnd = this.cursor < 0 ? this.offset : this.readStart + this.cursor + 1;
++  }
++
++  public end(): void { this.lineEnd = this.offset; }
++
++  public dispatch<T>(value: T, data: string, event?: string): T {
++    this.eventSeq += 1;
++    const byteStart = this.eventStart;
++    const byteEnd = this.lineEnd;
++    const eventSeq = this.eventSeq;
++    this.eventStart = byteEnd;
++    if (!data) return value;
++    return observeLlmObject(value, this.observer, () => ({
++      kind: 'sse_event', eventSeq, byteStart, byteEnd, value: { event, data },
++    }));
++  }
++
++  private active(): string | undefined {
++    try { return this.observer.active(); } catch { return undefined; }
++  }
++}
+diff --git a/src/llm/providers/base.ts b/src/llm/providers/base.ts
+index 72505df..929b569 100644
+--- a/src/llm/providers/base.ts
++++ b/src/llm/providers/base.ts
+@@ -10,6 +10,7 @@ import { detectLLMRequestSignatureRepresentation } from '../../signatures/normal
+ import { buildRequestTransport, sendRequest, type EndpointConfig } from '../transport.js';
+ import type { LLMProxyOption } from '../../config/types.js';
+ import { processResponse, processStreamResponse } from '../response.js';
++import { carryLlmObservation } from '../observation.js';
+ import { streamOpenAIResponsesWebSocket } from '../websocket-openai-responses.js';
+ import type { FormatRegistry } from '../../registry/formats.js';
+ import { bodyToCurlPayload, formatRequestAsCurl, type CurlFormatOptions } from '../debug-utils.js';
+@@ -289,12 +290,12 @@ export class LLMProvider implements LLMProviderLike {
+     const res = await sendRequest(built.endpoint, built.body, false, options?.signal, this.loggingDir);
+     const canonicalResponse = await processResponse(res, this.format);
+ 
+-    return encodeResponseToFormat(canonicalResponse, {
++    return carryLlmObservation(canonicalResponse, encodeResponseToFormat(canonicalResponse, {
+       format: built.outputFormat,
+       sourceFormat: this.providerFormat,
+       registry: options?.formatRegistry,
+       signatureMode: this.resolveUnifiedSignatureMode(built.canonicalRequest, built.inputFormat, built.outputFormat),
+-    }) as TOutput;
++    })) as TOutput;
+   }
+ 
+   async *chatStream<TOutput = LLMStreamChunk>(request: unknown, options?: LLMCallOptions): AsyncGenerator<TOutput> {
+@@ -323,12 +324,12 @@ export class LLMProvider implements LLMProviderLike {
+     const res = await sendRequest(built.endpoint, built.body, true, options?.signal, this.loggingDir);
+ 
+     for await (const chunk of processStreamResponse(res, this.format)) {
+-      yield encodeStreamChunkToFormat(chunk, {
++      yield carryLlmObservation(chunk, encodeStreamChunkToFormat(chunk, {
+         format: built.outputFormat,
+         sourceFormat: this.providerFormat,
+         registry: options?.formatRegistry,
+         signatureMode: this.resolveUnifiedSignatureMode(built.canonicalRequest, built.inputFormat, built.outputFormat),
+-      }) as TOutput;
++      })) as TOutput;
+     }
+   }
+ 
+@@ -393,4 +394,3 @@ export class LLMProvider implements LLMProviderLike {
+     return this.providerName;
+   }
+ }
+-
+diff --git a/src/llm/response.ts b/src/llm/response.ts
+index 8c4e118..9496fa5 100644
+--- a/src/llm/response.ts
++++ b/src/llm/response.ts
+@@ -7,6 +7,7 @@
+ 
+ import type { LLMRawErrorInfo, LLMResponse, LLMStreamChunk } from '../types.js';
+ import type { FormatAdapter } from './formats/types.js';
++import { getLlmResponseObserver, getLlmObservation, observeLlmObject, LlmSseObservation } from './observation.js';
+ 
+ // ============ 通用错误透传 ============
+ 
+@@ -38,6 +39,7 @@ function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false
+ async function readResponseBody(res: Response): Promise<{ bodyText: string; rawBody?: unknown }> {
+   const bodyText = await res.text();
+   const parsed = tryParseJson(bodyText);
++  observeLlmObject(parsed, getLlmResponseObserver(res), () => ({ kind: 'body', value: bodyText }));
+   return parsed.ok ? { bodyText, rawBody: parsed.value } : { bodyText };
+ }
+ 
+@@ -119,33 +121,35 @@ export async function processResponse(
+   const headers = headersToRecord(res.headers);
+   const { bodyText, rawBody } = await readResponseBody(res);
+   const rawResponse = rawBody ?? bodyText;
++  const observed = (chunk: LLMResponse) => observeLlmObject(chunk, getLlmResponseObserver(res), () => ({ kind: 'decoded', value: chunk }));
+ 
+   if (!res.ok) {
+-    return createErrorResponse({
++    return observed(createErrorResponse({
+       kind: 'http_error',
+       status: res.status,
+       statusText: res.statusText,
+       headers,
+       bodyText,
+       ...(rawBody !== undefined ? { rawBody } : {}),
+-    });
++    }));
+   }
+ 
+   if (isProviderErrorPayload(rawResponse)) {
+-    return createErrorResponse({
++    return observed(createErrorResponse({
+       kind: 'response_error',
+       status: res.status,
+       statusText: res.statusText,
+       headers,
+       bodyText,
+       rawBody: rawResponse,
+-    });
++    }));
+   }
+ 
+   try {
+-    return format.decodeResponse(rawResponse);
++    const result = format.decodeResponse(rawResponse);
++    return observeLlmObject(result, getLlmResponseObserver(res), () => ({ kind: 'decoded', value: result }));
+   } catch (err) {
+-    return createErrorResponse({
++    return observed(createErrorResponse({
+       kind: 'decode_error',
+       status: res.status,
+       statusText: res.statusText,
+@@ -153,7 +157,7 @@ export async function processResponse(
+       bodyText,
+       rawBody: rawResponse,
+       message: stringifyError(err),
+-    });
++    }));
+   }
+ }
+ 
+@@ -165,17 +169,18 @@ export async function* processStreamResponse(
+   format: FormatAdapter,
+ ): AsyncGenerator<LLMStreamChunk> {
+   const headers = headersToRecord(res.headers);
++  const observed = (chunk: LLMStreamChunk, parent?: unknown) => observeLlmObject(chunk, getLlmResponseObserver(res), () => ({ kind: 'decoded', value: chunk, parent }));
+ 
+   if (!res.ok) {
+     const { bodyText, rawBody } = await readResponseBody(res);
+-    yield createErrorStreamChunk({
++    yield observed(createErrorStreamChunk({
+       kind: 'http_error',
+       status: res.status,
+       statusText: res.statusText,
+       headers,
+       bodyText,
+       ...(rawBody !== undefined ? { rawBody } : {}),
+-    });
++    }));
+     return;
+   }
+ 
+@@ -184,7 +189,7 @@ export async function* processStreamResponse(
+     for await (const sse of parseSSE(res)) {
+       const parsed = tryParseJson(sse.data);
+       if (!parsed.ok) {
+-        yield createErrorStreamChunk({
++        yield observed(createErrorStreamChunk({
+           kind: 'stream_parse_error',
+           status: res.status,
+           statusText: res.statusText,
+@@ -194,16 +199,19 @@ export async function* processStreamResponse(
+           bodyText: sse.data,
+           message: `SSE data 不是 JSON: ${sse.data}`,
+           rawChunk: sse.data,
+-        });
++        }), getLlmObservation(sse));
+         continue;
+       }
+ 
+       const payload = isPlainObject(parsed.value)
+         ? { ...parsed.value, ...(sse.event ? { event: sse.event } : {}) }
+         : parsed.value;
++      observeLlmObject(payload, getLlmResponseObserver(res), () => ({
++        kind: 'decode_input', parent: getLlmObservation(sse), value: payload,
++      }));
+ 
+       if (isProviderErrorPayload(payload, sse.event)) {
+-        yield createErrorStreamChunk({
++        yield observed(createErrorStreamChunk({
+           kind: 'stream_error',
+           status: res.status,
+           statusText: res.statusText,
+@@ -211,14 +219,17 @@ export async function* processStreamResponse(
+           event: sse.event ?? stringField(isPlainObject(payload) ? payload.event : undefined),
+           data: sse.data,
+           rawChunk: payload,
+-        });
++        }), getLlmObservation(payload));
+         continue;
+       }
+ 
+       try {
+-        yield format.decodeStreamChunk(payload, state);
++        const chunk = format.decodeStreamChunk(payload, state);
++        yield observeLlmObject(chunk, getLlmResponseObserver(res), () => ({
++          kind: 'decoded', parent: getLlmObservation(payload), value: chunk,
++        }));
+       } catch (err) {
+-        yield createErrorStreamChunk({
++        yield observed(createErrorStreamChunk({
+           kind: 'decode_error',
+           status: res.status,
+           statusText: res.statusText,
+@@ -227,17 +238,17 @@ export async function* processStreamResponse(
+           data: sse.data,
+           rawChunk: payload,
+           message: stringifyError(err),
+-        });
++        }), getLlmObservation(payload));
+       }
+     }
+   } catch (err) {
+-    yield createErrorStreamChunk({
++    yield observed(createErrorStreamChunk({
+       kind: 'stream_read_error',
+       status: res.status,
+       statusText: res.statusText,
+       headers,
+       message: stringifyError(err),
+-    });
++    }));
+   }
+ }
+ 
+@@ -262,6 +273,8 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+   let currentEvent: string | undefined;
+   let dataLines: string[] = [];
+   let chunksRead = 0;
++  const observer = getLlmResponseObserver(response);
++  const observation = observer ? new LlmSseObservation(observer) : undefined;
+ 
+   const dispatch = (): SSEChunk | 'done' | undefined => {
+     const data = dataLines.join('\n');
+@@ -269,8 +282,10 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+     dataLines = [];
+     currentEvent = undefined;
+ 
++    const chunk = data ? { event, data } : undefined;
++    observation?.dispatch(chunk, data, event);
+     if (data === '[DONE]') return 'done';
+-    return data ? { event, data } : undefined;
++    return chunk;
+   };
+ 
+   const handleLine = (rawLine: string): SSEChunk | 'done' | undefined => {
+@@ -299,6 +314,7 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+       const { done, value } = await reader.read();
+       if (done) break;
+       chunksRead++;
++      observation?.read(value);
+ 
+       buffer += decoder.decode(value, { stream: true });
+ 
+@@ -306,12 +322,14 @@ async function* parseSSE(response: Response): AsyncGenerator<SSEChunk> {
+       buffer = lines.pop() ?? '';
+ 
+       for (const line of lines) {
++        observation?.line();
+         const chunk = handleLine(line);
+         if (chunk === 'done') return;
+         if (chunk) yield chunk;
+       }
+     }
+ 
++    observation?.end();
+     buffer += decoder.decode();
+     if (buffer) {
+       const lines = buffer.split('\n');

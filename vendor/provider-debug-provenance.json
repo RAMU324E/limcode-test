@@ -1,0 +1,8 @@
+{
+  "upstreamPackage": "unified-llm-provider@0.1.35",
+  "upstreamCommit": "3cb58dad30bda99d7c414ba5dd230745e6298bdb",
+  "version": "0.1.35-limcode.1",
+  "archive": "unified-llm-provider-0.1.35-limcode.1.tgz",
+  "archiveSha256": "ab375b5256822d32a1cc3d5786fa98e5a2a5ed326bab6dd663b9e6d7ac5eabea",
+  "patchSha256": "8103660eae7ff589ee9716b3a5d103909f51db4b3260a2abfec5496a3f7e2081"
+}

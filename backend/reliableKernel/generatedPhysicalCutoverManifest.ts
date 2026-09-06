@@ -499,6 +499,11 @@ export const PHYSICAL_CUTOVER_MANIFEST: PhysicalCutoverManifest = Object.freeze(
       "disposition": "preserve-whole"
     },
     {
+      "id": "setting.debugCapture",
+      "relativePath": "debug-capture.json",
+      "disposition": "preserve-whole"
+    },
+    {
       "id": "setting.mcpServers",
       "relativePath": "mcp-servers",
       "disposition": "preserve-whole"

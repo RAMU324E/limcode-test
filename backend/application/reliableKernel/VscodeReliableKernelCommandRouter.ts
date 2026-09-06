@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
+import type { DebugCaptureCommand, DebugCaptureSettings } from '../../../shared/debugCapture';
 import {
   BridgeMessageType,
   type AttachmentOpenPayload,
@@ -63,6 +64,7 @@ export class VscodeReliableKernelCommandRouter {
     private readonly product: VscodeReliableKernelProductRuntime,
     private readonly options: VscodeReliableKernelCommandRouterOptions = {}
   ) {
+    this.product.debugCapture.setListener(state => this.options.broadcast?.({ id: randomUUID(), type: BridgeMessageType.DebugCaptureResult, channel: 'diagnostics', payload: { state } }));
     this.product.toolHost.setStateChangeListener(() => {
       if (!this.options.broadcast) return;
       void this.product.ensureCapabilitiesReady()
@@ -145,6 +147,33 @@ export class VscodeReliableKernelCommandRouter {
     }
   }
 
+  private async debugCommand(webview: vscode.Webview, command: DebugCaptureCommand, correlationId: string): Promise<void> {
+    const capture = this.product.debugCapture;
+    let analysis;
+    switch (command.action) {
+      case 'status': break;
+      case 'start': {
+        const stored = await this.product.configuration.loadGlobalSettings('debugCapture');
+        await capture.start({ commandId: command.commandId, conversationId: command.conversationId, settings: stored.settings as DebugCaptureSettings });
+        break;
+      }
+      case 'stop': await capture.stop(command.runId); break;
+      case 'analyze': analysis = await capture.analyze(command.runId); break;
+      case 'delete': await capture.files.remove(command.runId); break;
+      case 'open':
+        await capture.files.withRead(command.runId, async root => { await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(root)); });
+        break;
+      case 'export': {
+        const target = await vscode.window.showOpenDialog({ canSelectFiles: false, canSelectFolders: true, canSelectMany: false, openLabel: '导出到此目录' });
+        if (target?.[0]) await capture.files.export(command.runId, path.join(target[0].fsPath, command.runId));
+        break;
+      }
+      default: throw new Error('未知取证操作。');
+    }
+    this.post(webview, { id: randomUUID(), type: BridgeMessageType.DebugCaptureResult, channel: 'diagnostics', correlationId,
+      payload: { state: await capture.state(), ...(analysis ? { analysis } : {}) } });
+  }
+
   private async dispatch(
     clientId: string,
     webview: vscode.Webview,
@@ -154,6 +183,14 @@ export class VscodeReliableKernelCommandRouter {
       case BridgeMessageType.Ready:
         this.product.application.webviewFeed.reconnect(clientId);
         await this.postConfigurationSnapshot(webview, message.id);
+        if (this.product.debugCapture.active()) this.post(webview, { id: randomUUID(), type: BridgeMessageType.DebugCaptureResult, channel: 'diagnostics', payload: { state: await this.product.debugCapture.state() } });
+        return;
+      case BridgeMessageType.DebugCaptureCommand:
+        await this.debugCommand(webview, requirePayload(message.payload, '取证操作'), message.id);
+        return;
+      case BridgeMessageType.DebugCaptureObservation:
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.DebugCaptureObservationAck, channel: 'diagnostics', correlationId: message.id,
+          payload: this.product.debugCapture.observeUi(clientId, requirePayload(message.payload, '界面取证')) });
         return;
       case BridgeMessageType.ConversationOpen:
         if (message.payload?.conversationId) {

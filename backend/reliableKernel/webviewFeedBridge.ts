@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { captureDebug, type DebugCaptureRecorder } from './debugCapture/observer';
 import type * as vscode from 'vscode';
 import {
   RELIABLE_KERNEL_ACK_MESSAGE,
@@ -255,6 +256,8 @@ export interface ReliableKernelWebviewFeedBridgeOptions {
 }
 
 export class ReliableKernelWebviewFeedBridge {
+  private debugCapture?: DebugCaptureRecorder;
+  public setDebugCapture(recorder: DebugCaptureRecorder): void { this.debugCapture = recorder; }
   private readonly clients = new Map<BridgeClientId, FeedClient>();
   private readonly ackTimeoutMs: number;
   private readonly maxFrameResends: number;
@@ -859,6 +862,11 @@ export class ReliableKernelWebviewFeedBridge {
       ackTimer: this.armTransientAckTimer(client, input.deliveryId)
     };
     client.transientDeliveries.set(input.deliveryId, delivery);
+    for (const item of message.events) {
+      captureDebug(this.debugCapture, { conversationId: message.conversationId, modelRequestId: item.modelRequestId, attemptSeq: item.attemptSeq, socketGeneration: item.socketGeneration },
+        () => ({ stage: 'feed.send', metadata: { clientId: client.clientId, sessionId: message.sessionId, kind: input.kind, deliveryId: input.deliveryId,
+          streamSeq: String(item.event.streamSeq), fromStreamSeq: item.fromStreamSeq ?? String(item.event.streamSeq), resendCount: input.resendCount }, payload: item }));
+    }
     this.deliverPostedMessage(client, plain, false, undefined, {
       onUndelivered: () => this.failTransientDelivery(client, delivery, 'post_false'),
       onRejected: (error) => {
