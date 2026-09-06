@@ -97,7 +97,7 @@ function closeNow(): void {
 watch(() => props.disabled, disabled => {
   if (!disabled) return;
   // 确认框打开时，提示的退场动画也不能继续遮挡按钮。
-  if (panelRef.value) panelRef.value.style.visibility = 'hidden';
+  if (panelRef.value) panelRef.value.style.display = 'none';
   closeNow();
 });
 
