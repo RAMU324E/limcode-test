@@ -83,15 +83,28 @@ test('shared validator and declaration enforce exactly one complete branch while
   }), /exactly one edit branch/i);
 });
 
-test('provider dry-runs keep edit union where supported and retain all flat branches otherwise', async () => {
+test('provider dry-runs flatten only the edit union and retain complete branch schemas', async () => {
   const parameters = editToolParameters();
-  for (const provider of ['openai-compatible', 'deepseek', 'openai-responses', 'claude', 'gemini']) {
+  const originalParameters = structuredClone(parameters);
+  const flatParameters = structuredClone(parameters);
+  delete flatParameters.oneOf;
+  const cases = [
+    ...['openai-compatible', 'deepseek', 'openai-responses', 'claude', 'gemini']
+      .map((provider) => ({ provider, stream: false })),
+    { provider: 'openai-responses', stream: true, openaiResponsesTransport: 'http' },
+    { provider: 'openai-responses', stream: true, openaiResponsesTransport: 'websocket' }
+  ];
+  for (const providerSettings of cases) {
+    const { provider } = providerSettings;
     const result = await dryRunLlmProvider({
       id: `edit-schema-${provider}`,
       invocationId: `edit-schema-${provider}`,
       conversationId: `edit-schema-${provider}`,
       contents: [{ role: 'user', parts: [{ text: 'edit a file' }] }],
-      tools: [{ name: 'edit', description: 'edit', parameters }]
+      tools: [
+        { name: 'edit', description: 'edit', parameters },
+        { name: 'schema_probe', description: 'unrelated tool', parameters }
+      ]
     }, {
       settings: async () => ({
         id: `provider-${provider}`,
@@ -102,7 +115,7 @@ test('provider dry-runs keep edit union where supported and retain all flat bran
         models: [],
         apiKey: 'test-key',
         toolCallFormat: 'function-call',
-        stream: false,
+        ...providerSettings,
         retryOnError: false,
         retryMaxAttempts: 0,
         enableMultimodalTools: true,
@@ -112,18 +125,32 @@ test('provider dry-runs keep edit union where supported and retain all flat bran
         updatedAt: 1
       })
     });
-    const schema = provider === 'gemini'
-      ? result.body.tools[0].functionDeclarations[0].parameters
-      : provider === 'claude'
-        ? result.body.tools[0].input_schema
-        : provider === 'openai-responses'
-          ? result.body.tools[0].parameters
-          : result.body.tools[0].function.parameters;
-    assert.ok(schema.properties.hunks, `${provider} dropped hunks`);
-    assert.ok(schema.properties.insert, `${provider} dropped insert`);
-    assert.ok(schema.properties.delete, `${provider} dropped delete`);
-    if (provider === 'claude' || provider === 'gemini') assert.equal(schema.oneOf, undefined);
-    else assert.equal(schema.oneOf.length, 3);
+    const declarations = provider === 'gemini' ? result.body.tools[0].functionDeclarations : result.body.tools;
+    if (provider === 'openai-responses') {
+      assert.equal(declarations[0].strict, false, 'Responses must not make all edit branches required through implicit strict mode');
+      assert.equal(declarations[1].strict, undefined, 'Unrelated tools must keep their original strictness');
+    }
+    const [schema, unrelatedSchema] = declarations.map((declaration) => provider === 'claude'
+      ? declaration.input_schema
+      : provider === 'openai-compatible' || provider === 'deepseek'
+        ? declaration.function.parameters
+        : declaration.parameters);
+    assert.equal(schema.oneOf, undefined, `${provider} must not send constraint-only edit union branches`);
+    assert.equal(schema.type, 'object');
+    assert.deepEqual(schema.required, ['path']);
+    assert.equal(schema.properties.hunks.type, 'array');
+    assert.equal(schema.properties.hunks.minItems, 1);
+    assert.equal(schema.properties.hunks.items.type, 'object');
+    assert.deepEqual(schema.properties.hunks.items.required, ['oldContent', 'newContent']);
+    assert.equal(schema.properties.insert.type, 'object');
+    assert.deepEqual(schema.properties.insert.required, ['line', 'content']);
+    assert.equal(schema.properties.delete.type, 'object');
+    assert.deepEqual(schema.properties.delete.required, ['startLine', 'endLine']);
+    if (provider !== 'gemini') assert.deepEqual(schema, flatParameters);
+    if (provider === 'openai-compatible' || provider === 'deepseek' || provider === 'openai-responses') {
+      assert.deepEqual(unrelatedSchema, originalParameters);
+    }
+    assert.deepEqual(parameters, originalParameters, `${provider} mutated the source schema`);
   }
 });
 
@@ -134,6 +161,38 @@ test('path-only edit is rejected before path resolution or file inspection', asy
       /exactly one edit branch/i
     );
     assert.equal(resolverCalls(), 0);
+  });
+});
+
+test('flattened provider schemas do not permit malformed or conflicting edits to reach files', async () => {
+  await withPlannerFile('unchanged\n', async ({ planner, absolutePath, resolverCalls }) => {
+    for (const argumentsValue of [
+      { path: 'sample.txt', hunks: [] },
+      { path: 'sample.txt', insert: {} },
+      { path: 'sample.txt', hunks: [{ oldContent: 'unchanged' }] },
+      { path: 'sample.txt', insert: { line: 0, content: 'changed' } },
+      { path: 'sample.txt', delete: { startLine: 2, endLine: 1 } },
+      {
+        path: 'sample.txt',
+        hunks: [{ oldContent: 'unchanged', newContent: 'changed' }],
+        insert: { line: 1, content: ' ' },
+        delete: { startLine: 1, endLine: 1 }
+      },
+      {
+        path: 'sample.txt',
+        hunks: [{ oldContent: 'unchanged', newContent: 'changed' }],
+        delete: { startLine: 1, endLine: 1 }
+      },
+      {
+        path: 'sample.txt',
+        insert: { line: 1, content: 'changed' },
+        delete: { startLine: 1, endLine: 1 }
+      }
+    ]) {
+      await assert.rejects(planEdit(planner, argumentsValue), TypeError);
+      assert.equal(resolverCalls(), 0);
+    }
+    assert.equal(await fs.readFile(absolutePath, 'utf8'), 'unchanged\n');
   });
 });
 
