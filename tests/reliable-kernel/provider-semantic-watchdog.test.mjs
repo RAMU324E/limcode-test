@@ -495,6 +495,75 @@ test('Gemini SSE terminated 经真实 SDK 包装后仍丢弃部分思考和工�
   }, 'gemini');
 });
 
+test('中文服务暂时不可用经真实 SSE 和 SDK 后自动替换失败 Attempt', async (context) => {
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  await withApp('localized-service-error-retry', async (app, conversationId, turnId) => {
+    const requestBodies = [];
+    context.mock.method(globalThis, 'fetch', async (_input, init) => {
+      requestBodies.push(init.body);
+      const chunks = requestBodies.length === 1
+        ? [
+            { choices: [{ index: 0, delta: { reasoning_content: 'discarded thought' }, finish_reason: null }] },
+            { choices: [{ index: 0, delta: { content: 'discarded answer' }, finish_reason: null }] },
+            { error: { message: '模型服务暂时不可用，请稍后重试' } }
+          ]
+        : [{ choices: [{ index: 0, delta: { content: 'recovered from temporary service failure' }, finish_reason: 'stop' }] }];
+      return new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', {
+        headers: { 'content-type': 'text/event-stream' }
+      });
+    });
+    const capability = createLlmProviderCapability({
+      settings: {
+        id: 'provider-watchdog', name: 'offline service failure', provider: 'openai-compatible',
+        model: 'model-watchdog', models: [], modelConfigs: [],
+        apiKey: 'offline-placeholder', baseUrl: 'https://provider.invalid/v1',
+        stream: true, retryOnError: false, retryMaxAttempts: 0,
+        toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+      }
+    });
+    const events = [];
+    const transientTerminals = [];
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', {
+      ...capability,
+      start(request, emit) {
+        capability.start(request, (event) => {
+          events.push(event);
+          emit(event);
+        });
+      }
+    });
+    try {
+      const request = await createRequest(app, conversationId, turnId, 'localized-service-error-retry');
+      const result = await controlPlane(app, {
+        semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+      }).dispatch(request.modelRequestId, adapter, {
+        onTransientTerminal: (event) => transientTerminals.push(event)
+      });
+      assert.equal(result.terminalState, 'completed');
+      assert.equal(requestBodies.length, 2, 'only the reliable ControlPlane retries the failed request');
+      assert.equal(requestBodies[1], requestBodies[0]);
+      assert.ok(events.some((event) => event.type === 'llm:thoughtDelta'));
+      assert.ok(events.some((event) => event.type === 'llm:delta'));
+      assert.equal(events.find((event) => event.type === 'llm:error').payload.message, '模型服务暂时不可用，请稍后重试');
+      assert.ok(transientTerminals.some((terminal) =>
+        terminal.attemptSeq === '1'
+        && terminal.event.content.terminalState === 'provider_transient_temporary_service_error'
+        && terminal.event.content.retrying === true
+        && terminal.event.content.discardOutput === true
+      ));
+      const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+      assert.deepEqual(completed.content, modelContent('recovered from temporary service failure'));
+      const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
+      assert.ok(checkpoints.every((checkpoint) => checkpoint.attempt_seq === 2n));
+      assert.equal((await list(app, 'ToolCall')).length, 0);
+    } finally {
+      capability.dispose();
+    }
+  }, 'openai-compatible');
+});
+
 test('普通 transient error 在已有语义输出后仍不盲目重放', async () => {
   await withApp('provider-generic-no-replay-after-output', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'generic-no-replay-after-output');

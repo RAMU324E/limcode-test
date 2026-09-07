@@ -1767,6 +1767,52 @@ test('LLM capability adapter 将 429、流截断、网络错误和所有可恢�
   }
 });
 
+test('LLM capability adapter 将中文服务暂时不可用和明确的临时服务故障标记为可替换部分输出', async () => {
+  for (const [message, rawError] of [
+    ['模型服务暂时不可用，请稍后重试', undefined],
+    ['模型服务暂时不可用，请稍后重试', { receivedSemanticOutput: true }],
+    ['模型服务暂时不可用，请稍后重试', { status: 200, receivedSemanticOutput: true }],
+    ['Service temporarily unavailable', { receivedSemanticOutput: true }],
+    ...[408, 425, 500, 502, 503, 504].map((status) => [
+      'temporary failure', { status, receivedSemanticOutput: true }
+    ])
+  ]) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:thoughtDelta', payload: { requestId: llmRequest.id, text: 'unfinished thought' } });
+      emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
+    }));
+    await assert.rejects(
+      adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
+      (error) => error instanceof kernel.ProviderTransientError
+        && error.reason === 'temporary_service_error'
+        && error.retryAfterOutput === true,
+      JSON.stringify({ message, rawError })
+    );
+  }
+});
+
+test('LLM capability adapter 不因稍后重试文案放宽永久错误或显式禁止重试', async () => {
+  for (const [message, rawError] of [
+    ['未知错误，请稍后重试', undefined],
+    ['模型服务暂时不可用，请稍后重试', { retryable: false }],
+    ['模型服务暂时不可用，请稍后重试', { transportAttemptsExhausted: true }],
+    ['模型服务暂时不可用，请稍后重试', { code: 'invalid_api_key' }],
+    ['模型服务暂时不可用，请稍后重试', { code: 'insufficient_quota' }],
+    ...[400, 401, 403, 404, 422].map((status) => [
+      '模型服务暂时不可用，请稍后重试', { status }
+    ])
+  ]) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
+    }));
+    await assert.rejects(
+      adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
+      (error) => !(error instanceof kernel.ProviderTransientError),
+      JSON.stringify({ message, rawError })
+    );
+  }
+});
+
 test('LLM capability adapter 在 Responses WS 结构化超时已有语义输出后切换 whole Attempt', async () => {
   for (const phase of ['event_idle', 'response']) {
     const events = [];
