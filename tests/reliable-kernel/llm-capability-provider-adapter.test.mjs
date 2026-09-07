@@ -139,6 +139,45 @@ function memoryReadDatabase(tables = {}) {
   };
 }
 
+test('压缩进度持久化失败会终止对应 Provider，不遗留后台生成', async () => {
+  const capability = fakeCapability(() => {});
+  const aborted = [];
+  capability.abort = (requestId) => aborted.push(requestId);
+  capability.compact = (compactRequest, emit) => {
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+  };
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
+  const fullRequest = compressionRequest('llm_summary', request().context);
+  await assert.rejects(adapter.sendFullRequest(fullRequest, {
+    async onCompressionProgress() { throw new Error('activity persistence failed'); },
+    async onEvent() { throw new Error('no partial summary should be emitted'); }
+  }), /activity persistence failed/);
+  assert.deepEqual(aborted, [fullRequest.modelRequestId]);
+});
+
+test('压缩进度只走元数据侧通道，终态后迟到进度不再转发', async () => {
+  const capability = compressionCapability(() => {});
+  const complete = capability.compact;
+  capability.compact = (compactRequest, emit) => {
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+    complete(compactRequest, emit);
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+  };
+  const progress = [];
+  const events = [];
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
+  await adapter.sendFullRequest(compressionRequest('llm_summary', request().context), {
+    async onCompressionProgress(streamSeq) { progress.push(streamSeq); },
+    async onEvent(event) {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: true };
+    }
+  });
+  assert.deepEqual(progress, ['1', '2']);
+  assert.deepEqual(events.map((event) => [event.kind, event.streamSeq]), [['completed', '3']]);
+});
+
 test('可靠 LLM adapter 拒绝缺失 conversationId 的请求', async () => {
   let started = false;
   const invalid = request();

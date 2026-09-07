@@ -43,6 +43,7 @@ import {
   DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT,
   DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT,
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+  normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT,
@@ -179,6 +180,7 @@ export interface LlmProviderOptions {
   headers?: MaybeProvider<Record<string, string>>;
   resolveAttachment?: (input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }) => Promise<InlineDataPart | undefined>;
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
+  onCompressionProgress?: () => void;
 }
 interface RetryControl {
   cancelRequested: boolean;
@@ -1477,10 +1479,17 @@ export async function compactLlmProvider(
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
     let retryCount = 0;
     let sawRetry = false;
+    const handlerOptions: LlmProviderOptions = {
+      ...options,
+      onCompressionProgress: () => {
+        if (signal?.aborted) return;
+        emit({ type: LlmEventType.CompactProgress, payload: { requestId: request.id } });
+      }
+    };
 
     while (true) {
       try {
-        const result = await handler(handlerRequest, methodConfig, options, signal);
+        const result = await handler(handlerRequest, methodConfig, handlerOptions, signal);
         logCompressionDebug('provider.compact.done', {
           ...compactRequestDebugInfo(request),
           resultId: result.id,
@@ -2710,6 +2719,7 @@ interface ResolvedSummaryProvider {
   proxy?: string;
   webSocketSessionKey?: string;
   omitUnsupportedMaxOutputTokens: boolean;
+  onCompressionProgress?: () => void;
 }
 
 /** 组装总结用 provider（复用运行时渠道解析 + 代理/头合并）；无 API Key 时 provider 为 undefined 表示回退确定性摘要。 */
@@ -2768,6 +2778,7 @@ async function resolveSummaryProvider(
     stream: settings.stream !== false,
     apiKeyAvailable,
     unified,
+    onCompressionProgress: options.onCompressionProgress,
     ...(proxy ? { proxy } : {}),
     ...(isOpenAIResponsesWebSocketMode(settings)
       ? {
@@ -3346,6 +3357,11 @@ async function executeSummaryProviderCall(
           }));
         }
         text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
+        if (chunk.textDelta?.trim() || chunk.partsDelta?.some((part) =>
+          'text' in part && typeof part.text === 'string' && part.text.trim()
+        )) {
+          resolved.onCompressionProgress?.();
+        }
       }
       return text;
     }
@@ -3511,6 +3527,7 @@ function normalizeCompressionConfig(input: LlmCompressionConfigRecord | undefine
     id: input?.id ?? 'inline-compression-config',
     name: input?.name ?? '临时压缩方法',
     kind,
+    maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(input?.maxDurationMinutes),
     trigger: input?.trigger ?? { mode: 'manual' },
     ...(input?.openaiResponsesCompact ? { openaiResponsesCompact: input.openaiResponsesCompact } : {}),
     ...(input?.llmSummary ? { llmSummary: input.llmSummary } : {}),

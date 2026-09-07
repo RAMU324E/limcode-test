@@ -1524,7 +1524,7 @@ async function checkProviderFullRequest() {
       entry.event.content.terminalState === 'provider_transient_first_semantic_timeout'
       && entry.event.content.retrying === true
     ));
-    assertions.push('普通Provider语义deadline冻结为首语义80秒/后续idle60秒；terminal-only压缩只等待270秒CompactDone/CompactError终态；明确传输错误仍走即时重试');
+    assertions.push('普通Provider语义deadline冻结为首语义80秒/后续idle60秒；无中间进度的压缩等待270秒CompactDone/CompactError终态；明确传输错误仍走即时重试');
     assertions.push('冻结retryMaxAttempts=3允许三个持久transient_failed Attempt后第四次恢复；每次仍复用同一ModelRequest与完整请求');
     assertions.push('submit_plan→update_task_list后的本地thought_progress既不算首个语义输出也不能续命，35ms首语义超时自动Attempt恢复而无需用户继续');
     faults.push('three consecutive retryable Provider failures before recovery');
@@ -1680,7 +1680,7 @@ async function checkProviderFullRequest() {
       emitCompressionDone(request, emit, 'compression transport recovered');
     }));
     assert.equal(transportCompressionCalls, 2);
-    assertions.push('terminal-only压缩超过旧60秒等比阈值但早于270秒等比deadline时仅有一个Attempt；超过完成deadline以compression_timeout创建Attempt 2；明确transport错误仍立即恢复');
+    assertions.push('无中间进度的压缩超过旧60秒等比阈值但早于270秒等比deadline时仅有一个Attempt；超过无进度deadline以compression_timeout创建Attempt 2；明确transport错误仍立即恢复');
     faults.push('terminal-only compression emits no semantic delta before a valid long-running CompactDone');
     metrics.compressionCompletionDeadlineAttempts = timeoutCompressionCalls;
 

@@ -450,6 +450,19 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         if (terminal) return;
         try {
           const payload = asRecord(event.payload);
+          if (event.type === LlmEventType.CompactProgress) {
+            sequence += 1n;
+            const progressSeq = sequence.toString();
+            tail = tail.then(async () => {
+              if (!controls.signal?.aborted) await controls.onCompressionProgress?.(progressSeq);
+            });
+            void tail.catch((error: unknown) => {
+              if (terminal) return;
+              finish(error);
+              this.capability.abort(request.modelRequestId);
+            });
+            return;
+          }
           if (event.type === LlmEventType.CompactDone) {
             const result = asRecord(payload?.result);
             if (!result) throw new TypeError('LLM compact result must be an object.');

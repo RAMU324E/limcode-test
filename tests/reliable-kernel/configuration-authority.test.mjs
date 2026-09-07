@@ -20,6 +20,7 @@ const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend
 const { loadRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { frozenCompressionPolicy } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
+const { createDefaultLlmCompressionConfig, normalizeLlmCompressionMaxDurationMinutes } = require('../../dist/extension/shared/protocol.js');
 const { resolveToolPolicyLayers } = require('../../dist/extension/shared/toolPolicyResolution.js');
 const {
   createRemoteServerWorkEnvironmentRecord,
@@ -777,7 +778,20 @@ test('不相关的旧压缩配置不会阻塞 Agent、Workflow 与 Configuration
   }
 });
 
-test('压缩配置 hard-cut 旧保留字段并冻结压缩 Provider 自己的窗口与输出上限', async () => {
+test('压缩最长时间默认20分钟并限制为1到1440分钟的整数', () => {
+  assert.equal(createDefaultLlmCompressionConfig().maxDurationMinutes, 20);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(undefined), 20);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(NaN), 20);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(Infinity), 20);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes('37'), 20);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(37), 37);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(2.6), 3);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(0), 1);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(-5), 1);
+  assert.equal(normalizeLlmCompressionMaxDurationMinutes(999999999), 1440);
+});
+
+test('压缩配置 hard-cut 旧保留字段并冻结压缩 Provider 自己的窗口、输出上限和最长时间', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-compression-config-cutover-'));
   try {
     const paths = createVscodeStoragePaths(vscode.Uri.file(root));
@@ -831,6 +845,7 @@ test('压缩配置 hard-cut 旧保留字段并冻结压缩 Provider 自己的窗
     );
     const compressionConfig = {
       ...legacyCompressionConfig,
+      maxDurationMinutes: 37,
       trigger: {
         mode: 'token_threshold',
         thresholdUnit: 'tokens',
@@ -842,6 +857,8 @@ test('压缩配置 hard-cut 旧保留字段并冻结压缩 Provider 自己的窗
       configs: [compressionConfig]
     });
     const normalizedConfig = saved.settings.configs[0];
+    assert.equal(normalizedConfig.maxDurationMinutes, 37);
+    assert.equal((await authority.loadGlobalSettings('llmCompressionConfigs')).settings.configs[0].maxDurationMinutes, 37);
     assert.equal(normalizedConfig.llmSummary.targetTokens, 8_000);
     assert.deepEqual(Object.keys(normalizedConfig.trigger).sort(), [
       'mode', 'thresholdPercent', 'thresholdTokens', 'thresholdUnit'
@@ -865,10 +882,22 @@ test('压缩配置 hard-cut 旧保留字段并冻结压缩 Provider 自己的窗
     assert.equal(frozen.compression.provider.modelId, summary.model);
     assert.equal(frozen.compression.provider.contextWindowTokens, 64_000);
     assert.equal(frozen.compression.provider.maxOutputTokens, 12_000);
+    assert.equal(frozen.compression.config.maxDurationMinutes, 37);
     assert.equal(Object.hasOwn(frozen.compression, 'preserveLatestMessages'), false);
     assert.equal(Object.hasOwn(frozen.compression.config.trigger, 'preserveLatestMessages'), false);
     assert.equal(Object.hasOwn(frozen.compression.config.trigger, 'reserveLatestUserMessageTokens'), false);
     assert.equal(frozenCompressionPolicy(frozen).provider.contextWindowTokens, 64_000);
+    await saveLatestGlobalSettings(authority, 'llmCompressionConfigs', {
+      configs: [{ ...normalizedConfig, maxDurationMinutes: 45 }]
+    });
+    const nextFrozen = JSON.parse((await authority.compile({
+      conversationId: 'conversation:compression-cutover',
+      turnId: 'turn:compression-cutover-next',
+      executorAgentId: 'main',
+      intentKind: 'input'
+    })).authoritySnapshot.content);
+    assert.equal(nextFrozen.compression.config.maxDurationMinutes, 45);
+    assert.equal(frozen.compression.config.maxDurationMinutes, 37);
 
     const incomplete = structuredClone(frozen);
     delete incomplete.compression.provider.contextWindowTokens;

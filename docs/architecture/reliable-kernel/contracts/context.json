@@ -217,7 +217,8 @@
       "ordinaryIdle": 60000,
       "compressionCompletion": 270000
     },
-    "compressionProgressContract": "compact()为terminal-only；只以CompactDone/CompactError满足270秒完成deadline，不等待不存在的thought/text语义事件",
+    "compressionProgressContract": "compact()只以CompactDone/CompactError提交终态；真实非空白文本或思考通过metadata-only进度重置270秒无进度deadline，心跳、usage与signature-only不续命；未完成摘要不落盘，进度不阻断有界重试，总dispatch期限与取消仍有效",
+    "compressionDurationContract": "单次压缩总时限读取Turn冻结compression.config.maxDurationMinutes，默认20分钟，整数范围1至1440分钟；每次Attempt独立计时，不修改普通请求20分钟总时限或压缩270秒无进度保护，不从实时设置变更在途请求",
     "visible": true,
     "visibleWhenTransientThoughtExists": true,
     "visibilityAuthority": "只读取已提交ModelRequest/Attempt事实或commit feed；不得建立瞬时retry observer第二authority",

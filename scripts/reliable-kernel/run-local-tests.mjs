@@ -22,6 +22,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/conversation-deletion-recovery.test.mjs',
   'tests/reliable-kernel/frontend-copy-guardrails.test.cjs',
   'tests/reliable-kernel/guidance-queue.test.mjs',
+  'tests/reliable-kernel/compression-progress-ui.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/diagnostic-journal.test.mjs',
   'tests/reliable-kernel/debug-capture-controller.test.mjs',

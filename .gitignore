@@ -42,6 +42,7 @@ docs/architecture/*
 /tests/reliable-kernel/*
 !/tests/reliable-kernel/attachment-ingest-boundary.test.mjs
 !/tests/reliable-kernel/canonical-base64.test.mjs
+!/tests/reliable-kernel/compression-progress-ui.test.mjs
 !/tests/reliable-kernel/configuration-authority.test.mjs
 !/tests/reliable-kernel/context-token-estimator.test.mjs
 !/tests/reliable-kernel/current-turn-task-projection.test.mjs

@@ -232,6 +232,7 @@ const activeCompressionCard = computed<Record<string, unknown> | undefined>(() =
       configured_threshold_tokens: purpose.configuredThresholdTokens
     }),
     model_request_id: reliableText(request.id),
+    last_stream_event_at: reliableInteger(modelRequestStreamStats(request)?.lastStreamEventAt),
     created_at: request.created_at,
     retry_reason_label: retry.reasonLabel,
     retry_delay_seconds: Math.max(0, Math.ceil(retry.remainingDelayMs / 1_000)),
