@@ -1730,6 +1730,7 @@ test('LLM capability adapter 将 429、流截断、网络错误和所有可恢�
   ];
   for (const [message, rawError, reason] of [
     ['temporary failure', { status: 429 }, 'rate_limited'],
+    ['Streaming error: 429: rate limited', undefined, 'rate_limited'],
     ['gemini SSE stream ended without provider terminal evidence.', {
       code: 'LLM_STREAM_TRUNCATED', phase: 'response_body'
     }, 'connection_interrupted'],
@@ -1791,15 +1792,51 @@ test('LLM capability adapter 将中文服务暂时不可用和明确的临时服
   }
 });
 
+test('LLM capability adapter 识别 SSE 文本状态码和 SERVICE_BUSY', async () => {
+  const serviceBusyMessage = "Streaming error: 503: {'code': 'SERVICE_BUSY', 'message': '服务繁忙，请稍后重试', 'traceId': 'trace-service-busy-fixture'}";
+  for (const [message, rawError] of [
+    [serviceBusyMessage, undefined],
+    [serviceBusyMessage, { status: 200, receivedSemanticOutput: true }],
+    ...[408, 425, 500, 502, 503, 504].map((status) => [
+      `Streaming error: ${status}: temporary upstream failure`, { receivedSemanticOutput: true }
+    ]),
+    ['temporary failure', { code: 'SERVICE_BUSY', receivedSemanticOutput: true }],
+    ['temporary failure', { cause: { message: 'Streaming error: 503: temporary upstream failure' }, status: 200 }],
+    ['服务繁忙，请稍后重试', { status: 200, receivedSemanticOutput: true }]
+  ]) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:thoughtDelta', payload: { requestId: llmRequest.id, text: 'unfinished thought' } });
+      emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
+    }));
+    await assert.rejects(
+      adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
+      (error) => error instanceof kernel.ProviderTransientError
+        && error.reason === 'temporary_service_error'
+        && error.retryAfterOutput === true,
+      JSON.stringify({ message, rawError })
+    );
+  }
+});
+
 test('LLM capability adapter 不因稍后重试文案放宽永久错误或显式禁止重试', async () => {
   for (const [message, rawError] of [
     ['未知错误，请稍后重试', undefined],
+    ['Request failed at item 503', undefined],
+    ['Streaming error: 5030: unknown failure', undefined],
+    ['服务繁忙，请稍后重试', { retryable: false }],
+    ['Streaming error: 503: SERVICE_BUSY', { transportAttemptsExhausted: true }],
+    ['Streaming error: 503: SERVICE_BUSY', { code: 'invalid_api_key' }],
+    ['Streaming error: 503: SERVICE_BUSY', { code: 'insufficient_quota' }],
     ['模型服务暂时不可用，请稍后重试', { retryable: false }],
     ['模型服务暂时不可用，请稍后重试', { transportAttemptsExhausted: true }],
     ['模型服务暂时不可用，请稍后重试', { code: 'invalid_api_key' }],
     ['模型服务暂时不可用，请稍后重试', { code: 'insufficient_quota' }],
     ...[400, 401, 403, 404, 422].map((status) => [
       '模型服务暂时不可用，请稍后重试', { status }
+    ]),
+    ...[400, 401, 403, 404, 422].flatMap((status) => [
+      ['Streaming error: 503: SERVICE_BUSY', { status }],
+      [`Streaming error: ${status}: SERVICE_BUSY`, { status: 200 }]
     ])
   ]) {
     const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {

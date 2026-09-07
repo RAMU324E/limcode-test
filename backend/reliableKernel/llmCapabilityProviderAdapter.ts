@@ -1837,8 +1837,12 @@ function capabilityThrownProviderError(error: unknown): Error {
 }
 
 function classifyProviderFailure(message: string, raw: Record<string, unknown> | undefined): Error {
-  const status = findNumericStatus(raw);
   const signature = collectErrorSignature(raw, message).toLowerCase();
+  const structuredStatus = findNumericStatus(raw);
+  const embeddedStatus = /\b(?:streaming error|unexpected server response):\s*([45]\d{2})\b/.exec(signature);
+  const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299)) && embeddedStatus
+    ? Number(embeddedStatus[1])
+    : structuredStatus;
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
@@ -1872,14 +1876,13 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const temporaryServiceFailure = status === 408
     || status === 425
     || (status !== undefined && status >= 500 && status <= 599)
-    || /unexpected server response:\s*(?:408|425|5\d\d)\b/.test(signature)
     || ((status === undefined || (status >= 200 && status <= 299))
-      && /\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b|模型服务暂时不可用/.test(signature));
+      && /\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bservice_busy\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b|模型服务暂时不可用|服务繁忙/.test(signature));
   if (receivedSemanticOutput === true && !temporaryServiceFailure) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
   }
   if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
-  if (status === 429 || /unexpected server response:\s*429\b/.test(signature)) {
+  if (status === 429) {
     return new ProviderTransientError('rate_limited', message);
   }
   if (temporaryServiceFailure) {

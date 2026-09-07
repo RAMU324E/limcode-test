@@ -18,7 +18,7 @@ function modelContent(text = '') {
   return { role: 'model', parts: text ? [{ text }] : [] };
 }
 
-function dependencies(provider = 'openai-responses') {
+function dependencies(provider = 'openai-responses', retryPolicy = { enabled: true, maxRetries: 3 }) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -38,7 +38,7 @@ function dependencies(provider = 'openai-responses') {
                 providerConfigId: 'provider-watchdog',
                 provider,
                 modelId: 'model-watchdog',
-                retryPolicy: { enabled: true, maxRetries: 3 }
+                retryPolicy
               },
               modelProfile: {
                 compressionThresholdTokens: 100000,
@@ -86,11 +86,11 @@ function dependencies(provider = 'openai-responses') {
   };
 }
 
-async function withApp(name, run, provider) {
+async function withApp(name, run, provider, retryPolicy) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `${name}-`));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
-  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(provider));
+  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(provider, retryPolicy));
   try {
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -562,6 +562,77 @@ test('中文服务暂时不可用经真实 SSE 和 SDK 后自动替换失败 Att
       capability.dispose();
     }
   }, 'openai-compatible');
+});
+
+test('SSE 服务繁忙按冻结的四次重试预算恢复或终止', async (context) => {
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  const serviceBusyMessage = "Streaming error: 503: {'code': 'SERVICE_BUSY', 'message': '服务繁忙，请稍后重试', 'traceId': 'trace-service-busy-fixture'}";
+  for (const recover of [true, false]) {
+    await context.test(recover ? '第四次重试成功' : '耗尽四次重试后停止', async (scenario) => {
+      await withApp(`sse-service-busy-${recover ? 'recover' : 'exhausted'}`, async (app, conversationId, turnId) => {
+        const requestBodies = [];
+        scenario.mock.method(globalThis, 'fetch', async (_input, init) => {
+          requestBodies.push(init.body);
+          const chunks = recover && requestBodies.length === 5
+            ? [{ choices: [{ index: 0, delta: { content: 'recovered from service busy' }, finish_reason: 'stop' }] }]
+            : [
+                { choices: [{ index: 0, delta: { reasoning_content: 'discarded thought' }, finish_reason: null }] },
+                { choices: [{ index: 0, delta: { content: 'discarded answer' }, finish_reason: null }] },
+                { error: { message: requestBodies.length === 1 ? '模型服务暂时不可用，请稍后重试' : serviceBusyMessage } }
+              ];
+          return new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', {
+            headers: { 'content-type': 'text/event-stream' }
+          });
+        });
+        const capability = createLlmProviderCapability({
+          settings: {
+            id: 'provider-watchdog', name: 'offline service busy', provider: 'openai-compatible',
+            model: 'model-watchdog', models: [], modelConfigs: [],
+            apiKey: 'offline-placeholder', baseUrl: 'https://provider.invalid/v1',
+            stream: true, retryOnError: false, retryMaxAttempts: 0,
+            toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+          }
+        });
+        try {
+          const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability);
+          const request = await createRequest(app, conversationId, turnId, 'sse-service-busy-budget');
+          const transientTerminals = [];
+          const dispatch = controlPlane(app, {
+            semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+          }).dispatch(request.modelRequestId, adapter, {
+            onTransientTerminal: (event) => transientTerminals.push(event)
+          });
+          if (recover) {
+            assert.equal((await dispatch).terminalState, 'completed');
+            const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+            assert.deepEqual(completed.content, modelContent('recovered from service busy'));
+          } else {
+            await assert.rejects(dispatch, /SERVICE_BUSY/);
+            const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
+            assert.equal(durableRequest.terminal_state, 'provider_transient_temporary_service_error');
+          }
+          assert.equal(requestBodies.length, 5, 'initial Attempt plus exactly four configured retries');
+          assert.ok(requestBodies.every((body) => body === requestBodies[0]));
+          const retryingTerminals = transientTerminals.filter((terminal) => terminal.event.content.retrying === true);
+          assert.deepEqual(retryingTerminals.map((terminal) => terminal.attemptSeq), ['1', '2', '3', '4']);
+          assert.ok(retryingTerminals.every((terminal) => terminal.event.content.discardOutput === true));
+          const operation = (await list(app, 'Operation', {
+            owner_kind: 'model_request', owner_id: request.modelRequestId
+          }))[0];
+          const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
+            .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+          assert.deepEqual(attempts.map((attempt) => attempt.status), [
+            'transient_failed', 'transient_failed', 'transient_failed', 'transient_failed', recover ? 'completed' : 'failed'
+          ]);
+          assert.equal((await list(app, 'ToolCall')).length, 0);
+        } finally {
+          capability.dispose();
+        }
+      }, 'openai-compatible', { enabled: true, maxRetries: 4 });
+    });
+  }
 });
 
 test('普通 transient error 在已有语义输出后仍不盲目重放', async () => {
