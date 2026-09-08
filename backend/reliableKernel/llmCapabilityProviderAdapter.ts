@@ -33,6 +33,7 @@ import {
   ProviderTransientError
 } from './modelProviderControlPlane';
 import type {
+  FullProviderContextItem,
   FullProviderRequest,
   FullRequestProviderAdapter,
   ProviderDispatchControls,
@@ -522,6 +523,35 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
   }
 }
 
+function isolateCrossChannelGptThoughtSignatures(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  if (
+    provider !== 'openai-responses'
+    || content.role !== 'model'
+    || !source?.providerId.trim()
+    || source.providerId === request.providerId
+    || !isGptModelId(source.modelId)
+    || !isGptModelId(request.modelId)
+  ) return content;
+  return {
+    ...content,
+    parts: content.parts.map((part) => {
+      if (!('thoughtSignature' in part) || !part.thoughtSignature?.startsWith('openai-responses:')) return part;
+      const { thoughtSignature: _signature, ...projected } = part;
+      return projected;
+    })
+  };
+}
+
+function isGptModelId(modelId: string): boolean {
+  const name = modelId.slice(modelId.lastIndexOf('/') + 1).trim().replace(/^\[[^\]]+\][\s_-]*/, '');
+  return /^gpt[-_.]?\d/i.test(name);
+}
+
 function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   const recipe = requireRecord(request.recipe, 'Provider recipe');
   const modelHandleCatalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
@@ -594,7 +624,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     }
     const decoded = decodeMessageContent(item.content, item.contentType);
     if (decoded) {
-      contents.push(decoded);
+      contents.push(isolateCrossChannelGptThoughtSignatures(decoded, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
     }
@@ -1843,7 +1873,7 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
   const openAIResponsesWebSocketTimeout = isStructuredOpenAIResponsesWebSocketTimeout(raw);
-  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)/.test(signature);
+  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|peer closed connection without sending complete message body|\bincomplete chunked read\b/.test(signature);
   const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
     signature,
     findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
