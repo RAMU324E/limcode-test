@@ -11,7 +11,7 @@ import type {
   ToolPolicyScopeKind,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
-import { EDIT_TOOL_NAME } from '@shared/protocol';
+import { ASK_USER_TOOL_NAME, EDIT_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
@@ -40,6 +40,11 @@ const scroller = ref<HTMLElement | null>(null);
 const expandedToolNames = ref<string[]>([]);
 
 const tools = computed(() => store.toolDefinitions);
+const interactionApprovalTools = computed(() => [SUBMIT_PLAN_TOOL_NAME, ASK_USER_TOOL_NAME].flatMap((toolName) => {
+  const tool = tools.value.find((candidate) => candidate.name === toolName);
+  const field = tool?.configSchema?.fields.find((candidate) => candidate.key === 'autoApprove');
+  return tool && field ? [{ tool, field }] : [];
+}));
 const builtinTools = computed(() => tools.value.filter((tool) => tool.source?.kind !== 'mcp'));
 const mcpTools = computed(() => tools.value.filter((tool) => tool.source?.kind === 'mcp'));
 const mcpSourceGroups = computed(() => clientState.mcpToolSources.map((source) => ({
@@ -468,6 +473,29 @@ function inputNumber(event: Event): number {
       </div>
     </header>
 
+    <section v-if="interactionApprovalTools.length > 0" class="tool-policy-preset-section interaction-auto-approval" aria-label="无人值守审批">
+      <div class="tool-policy-preset-heading">
+        <span>无人值守审批 · Ask / Plan</span>
+        <small>默认关闭。开启后允许 LLM 无人值守地继续任务，请按需分别启用。</small>
+      </div>
+      <div class="interaction-auto-approval-options">
+        <LcCheckbox
+          v-for="{ tool, field } in interactionApprovalTools"
+          :key="tool.name"
+          :model-value="configForTool(tool)[field.key] === true"
+          :disabled="readonly"
+          :aria-label="field.label"
+          @update:model-value="updateScalarField(tool, field, $event)"
+        >
+          <span class="preset-card-copy">
+            <strong>{{ field.label }}</strong>
+            <small>{{ field.description }}</small>
+          </span>
+        </LcCheckbox>
+      </div>
+      <p class="interaction-auto-approval-hint">对后续新回合生效，已经等待的问题或计划请手动处理一次。不会启用被禁用的工具，也不改变命令执行、文件修改等其它审批设置。</p>
+    </section>
+
     <section class="tool-policy-preset-section" aria-label="工具策略预设">
       <div class="tool-policy-preset-heading">
         <span>工具策略预设</span>
@@ -837,6 +865,23 @@ function inputNumber(event: Event): number {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-2);
+}
+
+.interaction-auto-approval {
+  border-inline-start: 3px solid var(--vscode-descriptionForeground);
+}
+
+.interaction-auto-approval-options {
+  display: grid;
+  gap: var(--space-3);
+  padding-block: var(--space-1);
+}
+
+.interaction-auto-approval-hint {
+  margin: 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
 }
 
 .tool-policy-preset-card {

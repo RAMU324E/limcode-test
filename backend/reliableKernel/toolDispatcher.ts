@@ -14,7 +14,8 @@ import {
   type ToolPolicyToolConfigRecord,
   type WorkEnvironmentRecord
 } from '../../shared/protocol';
-import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
+import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE, PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
+import { BACKGROUND_ASK_USER_AUTO_ANSWER } from '../../shared/askUser';
 import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
 import {
   mapSettledWithBoundedAdmissionConcurrency,
@@ -69,7 +70,7 @@ import type {
   FileMutationDispatcher
 } from './fileEffects';
 import { authorizeFrozenPlanReview, type FrozenPlanReviewRiskLevel } from './frozenMcpPolicyGate';
-import { readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenInteractionAutoApproval, readFrozenTurnAuthority } from './frozenAuthority';
 import type { McpEffectDispatcher } from './mcpEffects';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import type { ProcessControlPlane, ProcessWaitObservation } from './processEffects';
@@ -1031,7 +1032,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     if (readySettlement) return readySettlement;
     const existingPause = options.assumeFresh ? undefined : await this.readExistingPause(input.toolCallId);
     if (existingPause) {
-      return await this.autoApproveChildPlan(input, existingPause) ?? existingPause;
+      return await this.autoApproveInteraction(input, existingPause) ?? existingPause;
     }
     const definitions = options.definitions ?? await this.dependencies.host.definitions();
     const definition = definitions.find((candidate) => candidate.declaration.name === input.toolName);
@@ -1136,12 +1137,13 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         toolCallId: input.toolCallId,
         prompt: input.arguments
       });
-      return {
+      const waiting: ReliableAgentToolPause = {
         disposition: 'paused',
         toolCallId: input.toolCallId,
         reason: 'awaiting_user',
         resumeKey: pause.requestId
       };
+      return await this.autoApproveInteraction(input, waiting, authority) ?? waiting;
     }
     if (input.toolName === 'submit_plan') {
       const pause = await this.dependencies.interactions.pauseForPlanReview({
@@ -1155,7 +1157,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         reason: 'awaiting_plan_review',
         resumeKey: pause.requestId
       };
-      return await this.autoApproveChildPlan(input, waiting) ?? waiting;
+      return await this.autoApproveInteraction(input, waiting, authority) ?? waiting;
     }
     if (input.toolName === 'update_task_list') {
       const settled = await this.dependencies.interactions.settleTaskList({
@@ -2234,30 +2236,42 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     };
   }
 
-  /**
-   * A ChildExecution is already an explicit delegation boundary. Preserve the durable PlanReview
-   * audit trail, but resolve it internally so background/nested Agents never block on the user.
-   * Root conversations remain interactive because they have no ChildExecutionTurnLink.
-   */
-  private async autoApproveChildPlan(
+  private async autoApproveInteraction(
     input: ReliableAgentToolDispatchInput,
-    pause: ReliableAgentToolPause
+    pause: ReliableAgentToolPause,
+    authority?: ReliableToolDispatchAuthority
   ): Promise<InternalDispatchResult | undefined> {
-    if (input.toolName !== 'submit_plan' || pause.reason !== 'awaiting_plan_review') return undefined;
-    const memberships = await this.list('ChildExecutionTurnLink', { turn_id: input.turnId }, 2);
+    const toolName = input.toolName;
+    if (toolName !== 'ask_user' && toolName !== 'submit_plan') return undefined;
+    if (pause.reason !== (toolName === 'ask_user' ? 'awaiting_user' : 'awaiting_plan_review')) return undefined;
+    const memberships = toolName === 'submit_plan'
+      ? await this.list('ChildExecutionTurnLink', { turn_id: input.turnId }, 2)
+      : [];
     if (memberships.length > 1) {
       throw new Error(`Child Turn ${input.turnId} has non-unique ChildExecution membership.`);
     }
-    if (memberships.length === 0) return undefined;
-    const resolved = await this.dependencies.interactions.resolvePlanReview({
-      source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:child-plan-auto-approve` },
-      requestId: requireId(pause.resumeKey, 'child plan review resumeKey'),
-      decision: 'accept',
-      response: {
-        executionTarget: 'current_conversation',
-        message: CHILD_PLAN_AUTO_APPROVAL_MESSAGE
-      }
-    });
+    const childPlan = memberships.length === 1;
+    if (!childPlan) {
+      const frozen = authority ?? await this.readAuthority(input.turnId, toolName);
+      if (!frozenInteractionAutoApproval(frozen.document, toolName)) return undefined;
+    }
+    if (await this.turnTerminationRequested(input.turnId)) return undefined;
+    const requestId = requireId(pause.resumeKey, 'interaction resumeKey');
+    const resolved = toolName === 'ask_user'
+      ? await this.dependencies.interactions.resolveAskUser({
+          source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:ask-user-auto-approve` },
+          requestId,
+          response: { answer: { selectedOptionIndexes: [], customText: BACKGROUND_ASK_USER_AUTO_ANSWER } }
+        })
+      : await this.dependencies.interactions.resolvePlanReview({
+          source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:${childPlan ? 'child-plan' : 'plan'}-auto-approve` },
+          requestId,
+          decision: 'accept',
+          response: {
+            executionTarget: 'current_conversation',
+            message: childPlan ? CHILD_PLAN_AUTO_APPROVAL_MESSAGE : PLAN_AUTO_APPROVAL_MESSAGE
+          }
+        });
     const terminal = resolved.terminal
       ?? await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
     return terminal ?? {

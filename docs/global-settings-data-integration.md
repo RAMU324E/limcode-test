@@ -121,3 +121,12 @@ storage.loadActiveLlmProviderConfig()
 6. 如果未来需要被 Agent/Workflow 等引用，是否计划用 Link 存 id，而不是嵌入配置对象？
 7. 是否通过 getPaths() 获取路径？
 ```
+
+## 7. Ask / Plan 无人值守审批
+
+- 设置入口位于“工具”页顶部的“无人值守审批”区块，提供“自动批准 Plan”和“自动回应 Ask”两个独立开关，默认均关闭。
+- 复用现有 ToolPolicy record 与配置保存通道，分别存储为 submit_plan 和 ask_user 的 toolConfigs 配置中的 config.autoApprove。全局策略按原有规则被 Agent / 工作流 / 对话继承，局部 false 可以覆盖全局 true。
+- 设置随 Turn 的工具权限快照冻结，仅对后续新回合生效；修改开关不会追溯批准已等待的交互，已有等待需手动处理一次。
+- Plan 自动批准后在当前会话继续，不创建新的子 Agent；子 Agent 按父任务授权自动批准 Plan 的既有行为不变。
+- Ask 自动返回明确标记为系统回复的自主决策指引，不代选第一个选项、不伪造用户具体回答。需要人工提供凭据或关键决策的任务不宜开启。
+- 自动响应仍保存 InteractionRequest / InteractionResponse / OperationResolution，保留首响应优先、恢复和取消语义；不绕过工具禁用、命令执行或文件修改审批。
