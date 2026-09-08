@@ -456,6 +456,151 @@ test('Gemini dry-run removes unsupported propertyNames and multipleOf from neste
   assert.deepEqual(declaration.parameters.properties.options.required, ['title']);
 });
 
+function exclusiveBoundsTool() {
+  const selection = {
+    type: 'object',
+    properties: { radius: { type: 'number', exclusiveMinimum: 0 } }
+  };
+  return {
+    name: 'live2d_rig_transform',
+    description: 'Transform selected geometry.',
+    parameters: {
+      type: 'object',
+      properties: {
+        operations: {
+          type: 'array', minItems: 1, maxItems: 32,
+          items: { type: 'object', properties: { selection } }
+        },
+        range: structuredClone(selection),
+        selection,
+        bounded: { type: 'number', minimum: 0, maximum: 100, exclusiveMinimum: 1, exclusiveMaximum: 99 },
+        exclusiveMinimum: { type: 'string' },
+        exclusiveMaximum: { type: 'string' },
+        propertyNames: { type: 'string' },
+        title: { type: 'string' }
+      },
+      required: ['operations', 'exclusiveMinimum', 'exclusiveMaximum', 'propertyNames', 'title']
+    }
+  };
+}
+
+function assertGeminiBoundsCompatibility(parameters, originalParameters) {
+  const properties = parameters.properties;
+  assert.deepEqual(properties.operations.items.properties.selection.properties.radius, { type: 'number' });
+  assert.deepEqual(properties.range.properties.radius, { type: 'number' });
+  assert.deepEqual(properties.selection.properties.radius, { type: 'number' });
+  assert.deepEqual(properties.bounded, { type: 'number', minimum: 0, maximum: 100 });
+  assert.equal(properties.operations.minItems, 1);
+  assert.equal(properties.operations.maxItems, 32);
+  for (const name of ['exclusiveMinimum', 'exclusiveMaximum', 'propertyNames', 'title']) {
+    assert.deepEqual(properties[name], { type: 'string' });
+  }
+  assert.deepEqual(parameters.required, originalParameters.required);
+}
+
+for (const [providerKind, modelId] of [
+  ['gemini', '[FB]-gemini-3.8-flash'],
+  ['openai-compatible', 'gemini-3.8-flash'],
+  ['openai-compatible', 'firebase/gemini-3.8-flash'],
+  ['openai-compatible', '[FB]-gemini-3.8-flash'],
+  ['openai-compatible', 'models/gemini-2.5-pro'],
+  ['openai-compatible', 'GEMINI-1.5-PRO']
+]) {
+  test(`${providerKind} ${modelId} removes exclusive bounds only from outbound Gemini schemas`, async () => {
+    const request = chatRequest('gemini-exclusive-bounds');
+    request.tools = [exclusiveBoundsTool()];
+    const original = structuredClone(request);
+    const result = await dryRunLlmProvider(request, {
+      settings: async () => providerConfig({ provider: providerKind, model: modelId, models: [] })
+    });
+    const declaration = providerKind === 'gemini'
+      ? result.body.tools[0].functionDeclarations[0]
+      : result.body.tools[0].function;
+    assert.equal(declaration.name, request.tools[0].name);
+    assertGeminiBoundsCompatibility(declaration.parameters, original.tools[0].parameters);
+    assert.deepEqual(request, original);
+  });
+}
+
+for (const [providerKind, modelId] of [
+  ['openai-compatible', 'gpt-6-astra'],
+  ['openai-compatible', 'qwen3.8-max'],
+  ['openai-compatible', 'gemini-3-relay/gpt-6-astra'],
+  ['openai-compatible', '[gemini-3-relay]-qwen3.8-max'],
+  ['openai-responses', 'gpt-6-astra']
+]) {
+  test(`${providerKind} ${modelId} keeps non-Gemini tool schema bounds unchanged`, async () => {
+    const request = chatRequest('non-gemini-exclusive-bounds');
+    request.tools = [exclusiveBoundsTool()];
+    const original = structuredClone(request);
+    const result = await dryRunLlmProvider(request, {
+      settings: async () => providerConfig({ provider: providerKind, model: modelId, models: [] })
+    });
+    const declaration = providerKind === 'openai-responses' ? result.body.tools[0] : result.body.tools[0].function;
+    assert.deepEqual(declaration.parameters, original.tools[0].parameters);
+    assert.deepEqual(request, original);
+  });
+}
+
+for (const providerKind of ['gemini', 'openai-compatible']) {
+  test(`${providerKind} Gemini sends compatible MCP schemas without changing tool history or signatures`, async (context) => {
+    const request = chatRequest('gemini-exclusive-bounds-wire');
+    request.tools = [exclusiveBoundsTool()];
+    request.contents = [
+      {
+        role: 'model',
+        parts: [{
+          id: 'call-rig',
+          functionCall: { name: 'live2d_rig_transform', args: { radius: 0.5, exclusiveMinimum: 'argument' } },
+          thoughtSignature: 'gemini:retained-signature'
+        }]
+      },
+      {
+        role: 'user',
+        parts: [{
+          id: 'call-rig',
+          functionResponse: { name: 'live2d_rig_transform', response: { exclusiveMinimum: 'tool result' } }
+        }]
+      }
+    ];
+    const original = structuredClone(request);
+    const requestBodies = [];
+    context.mock.method(globalThis, 'fetch', async (_input, init) => {
+      requestBodies.push(JSON.parse(init.body));
+      const chunk = providerKind === 'gemini'
+        ? { candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] }
+        : { choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] };
+      return new Response(`data: ${JSON.stringify(chunk)}\n\n${providerKind === 'gemini' ? '' : 'data: [DONE]\n\n'}`, {
+        headers: { 'content-type': 'text/event-stream' }
+      });
+    });
+    const events = [];
+    await startLlmProvider(request, (event) => events.push(event), {
+      settings: async () => providerConfig({ provider: providerKind, model: 'gemini-3.8-flash', models: [] })
+    });
+    assert.equal(requestBodies.length, 1);
+    const body = requestBodies[0];
+    const declaration = providerKind === 'gemini' ? body.tools[0].functionDeclarations[0] : body.tools[0].function;
+    assertGeminiBoundsCompatibility(declaration.parameters, original.tools[0].parameters);
+    if (providerKind === 'gemini') {
+      assert.equal(body.contents[0].parts[0].thoughtSignature, 'retained-signature');
+      assert.deepEqual(body.contents[0].parts[0].functionCall.args, original.contents[0].parts[0].functionCall.args);
+      assert.equal(body.contents[1].parts[0].functionResponse.response.exclusiveMinimum, 'tool result');
+    } else {
+      const call = body.messages[0].tool_calls[0];
+      assert.equal(call.extra_content.google.thought_signature, 'retained-signature');
+      assert.equal(call.extra_content.google.thoughtSignature, 'retained-signature');
+      assert.equal(call.id, 'call-rig');
+      assert.deepEqual(JSON.parse(call.function.arguments), original.contents[0].parts[0].functionCall.args);
+      assert.equal(body.messages[1].tool_call_id, 'call-rig');
+      assert.equal(JSON.parse(body.messages[1].content).exclusiveMinimum, 'tool result');
+    }
+    assert.equal(events.some((event) => event.type === LlmEventType.Error), false);
+    assert.equal(events.some((event) => event.type === LlmEventType.Done), true);
+    assert.deepEqual(request, original);
+  });
+}
+
 function geminiProviderConfig(overrides = {}) {
   return providerConfig({
     provider: 'gemini',

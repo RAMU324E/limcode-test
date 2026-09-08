@@ -4768,7 +4768,11 @@ function installProviderSchemaEncoder<T>(
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
-  if (providerKind !== 'gemini' && providerKind !== 'openai-responses') return provider;
+  const geminiOpenAICompatible = providerKind === 'openai-compatible'
+    && /^gemini-(?:\d|pro(?:-|$)|flash(?:-|$))/i.test(
+      modelId.slice(modelId.lastIndexOf('/') + 1).trim().replace(/^\[[^\]]+\][\s_-]*/, '')
+    );
+  if (providerKind !== 'gemini' && providerKind !== 'openai-responses' && !geminiOpenAICompatible) return provider;
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
@@ -4783,8 +4787,8 @@ function installProviderSchemaEncoder<T>(
       ? normalizeGeminiThinkingRequest(request, modelId)
       : request;
     const encoded = originalEncodeRequest(normalizedRequest, stream);
-    if (providerKind === 'gemini') {
-      restoreGeminiToolPropertyNames(encoded, normalizedRequest);
+    if (providerKind === 'gemini' || geminiOpenAICompatible) {
+      restoreGeminiToolSchemas(encoded, normalizedRequest);
     } else if (isRecord(encoded) && Array.isArray(encoded.tools)) {
       for (const tool of encoded.tools) {
         if (isRecord(tool) && tool.type === 'function' && tool.name === 'edit') tool.strict = false;
@@ -5007,7 +5011,7 @@ function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unkn
     : requestWithoutGenerationConfig;
 }
 
-function restoreGeminiToolPropertyNames(encodedRequest: unknown, sourceRequest: unknown): void {
+function restoreGeminiToolSchemas(encodedRequest: unknown, sourceRequest: unknown): void {
   if (!isRecord(encodedRequest) || !isRecord(sourceRequest)) return;
   const encodedGroups = Array.isArray(encodedRequest.tools) ? encodedRequest.tools : [];
   const sourceGroups = Array.isArray(sourceRequest.tools) ? sourceRequest.tools : [];
@@ -5018,14 +5022,16 @@ function restoreGeminiToolPropertyNames(encodedRequest: unknown, sourceRequest: 
   const sourceByName = new Map(sourceDeclarations
     .filter((declaration) => typeof declaration.name === 'string')
     .map((declaration) => [declaration.name as string, declaration]));
-  for (const group of encodedGroups) {
-    if (!isRecord(group) || !Array.isArray(group.functionDeclarations)) continue;
-    for (const declaration of group.functionDeclarations) {
-      if (!isRecord(declaration) || typeof declaration.name !== 'string') continue;
-      const source = sourceByName.get(declaration.name);
-      if (!source?.parameters) continue;
-      declaration.parameters = sanitizeGeminiFunctionSchema(source.parameters);
-    }
+  const encodedDeclarations = encodedGroups.flatMap((group) => {
+    if (!isRecord(group)) return [];
+    if (Array.isArray(group.functionDeclarations)) return group.functionDeclarations.filter(isRecord);
+    return group.type === 'function' && isRecord(group.function) ? [group.function] : [];
+  });
+  for (const declaration of encodedDeclarations) {
+    if (typeof declaration.name !== 'string') continue;
+    const source = sourceByName.get(declaration.name);
+    if (!source?.parameters) continue;
+    declaration.parameters = sanitizeGeminiFunctionSchema(source.parameters);
   }
 }
 
@@ -5043,7 +5049,9 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   'prefixItems',
   'additionalProperties',
   'propertyNames',
-  'multipleOf'
+  'multipleOf',
+  'exclusiveMinimum',
+  'exclusiveMaximum'
 ]);
 
 function sanitizeGeminiFunctionSchema(value: unknown): unknown {
