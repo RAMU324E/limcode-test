@@ -35,6 +35,7 @@ import {
   type TurnInterruptPayload,
   type TurnInputResultPayload,
   type TurnStartPayload,
+  type TurnSteerPayload,
   type WebviewToExtensionMessage
 } from '../../../shared/protocol';
 import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
@@ -44,6 +45,7 @@ import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import type { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
 import { readVscodeSshWorkEnvironments } from './VscodeSshConfigurationReader';
 import { applyProxyEnvironment, currentProxyEnvironment, proxyForShellAndMcp } from './proxyEnvironment';
+import { GlobalSettingsSaveBarrier } from './GlobalSettingsSaveBarrier';
 
 export interface VscodeReliableKernelCommandRouterOptions {
   broadcast?(message: unknown): void;
@@ -59,6 +61,7 @@ export interface VscodeReliableKernelCommandRouterOptions {
 export class VscodeReliableKernelCommandRouter {
   private configurationMutationQueue: Promise<void> = Promise.resolve();
   private readonly clientIdByWebview = new WeakMap<vscode.Webview, string>();
+  private readonly settingsSaveBarrier = new GlobalSettingsSaveBarrier();
 
   public constructor(
     private readonly product: VscodeReliableKernelProductRuntime,
@@ -96,6 +99,19 @@ export class VscodeReliableKernelCommandRouter {
           admitted: false,
           deduplicated: false,
           message: text
+        });
+      } else if (message.type === BridgeMessageType.TurnSteer && message.payload?.conversationId) {
+        this.post(webview, {
+          id: randomUUID(),
+          type: BridgeMessageType.TurnSteerResult,
+          channel: 'control',
+          correlationId: message.id,
+          payload: {
+            conversationId: message.payload.conversationId,
+            ...(message.payload.command?.commandId ? { commandId: message.payload.command.commandId } : {}),
+            receipts: [],
+            error: text
+          }
         });
       } else if (
         (message.type === BridgeMessageType.GlobalSettingsGet || message.type === BridgeMessageType.GlobalSettingsUpdate)
@@ -135,6 +151,10 @@ export class VscodeReliableKernelCommandRouter {
       }
       void vscode.window.showWarningMessage(`LimCode：${text}`);
     });
+  }
+
+  public detachClient(clientId: string): void {
+    this.settingsSaveBarrier.detach(clientId);
   }
 
   /** 文件监听器发现其他 Extension Host 已提交设置后，重新读盘并广播。 */
@@ -179,11 +199,26 @@ export class VscodeReliableKernelCommandRouter {
     webview: vscode.Webview,
     message: WebviewToExtensionMessage
   ): Promise<void> {
+    if (message.type === BridgeMessageType.TurnStart || message.type === BridgeMessageType.TurnEnqueue
+      || message.type === BridgeMessageType.MessageEdit || message.type === BridgeMessageType.MessageRetryFrom) {
+      if (this.settingsSaveBarrier.hasClients) {
+        const commandId = requireText(message.payload?.command?.commandId, 'commandId');
+        const committed = await this.list('CommandReceipt', { source_kind: 'command', source_key: commandId }, 1);
+        if (committed.length === 0) {
+          await this.settingsSaveBarrier.flush();
+          await this.configurationMutationQueue;
+        }
+      }
+    }
     switch (message.type) {
       case BridgeMessageType.Ready:
+        this.settingsSaveBarrier.attach(clientId, webview);
         this.product.application.webviewFeed.reconnect(clientId);
         await this.postConfigurationSnapshot(webview, message.id);
         if (this.product.debugCapture.active()) this.post(webview, { id: randomUUID(), type: BridgeMessageType.DebugCaptureResult, channel: 'diagnostics', payload: { state: await this.product.debugCapture.state() } });
+        return;
+      case BridgeMessageType.GlobalSettingsFlushResult:
+        this.settingsSaveBarrier.receive(clientId, message.correlationId, requirePayload(message.payload, '设置保存确认'));
         return;
       case BridgeMessageType.DebugCaptureCommand:
         await this.debugCommand(webview, requirePayload(message.payload, '取证操作'), message.id);
@@ -465,6 +500,9 @@ export class VscodeReliableKernelCommandRouter {
           message.type,
           requirePayload(message.payload, 'Turn input')
         );
+        return;
+      case BridgeMessageType.TurnSteer:
+        await this.handleTurnSteer(webview, message.id, requirePayload(message.payload, 'Turn steer'));
         return;
       case BridgeMessageType.TurnInterrupt:
         await this.handleInterrupt(
@@ -964,6 +1002,48 @@ export class VscodeReliableKernelCommandRouter {
     });
   }
 
+  private async handleTurnSteer(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: TurnSteerPayload
+  ): Promise<void> {
+    const conversationId = requireText(payload.conversationId, 'conversationId');
+    const provider = this.product.application.modelProvider;
+    if (payload.action === 'status') {
+      this.post(webview, {
+        id: randomUUID(),
+        type: BridgeMessageType.TurnSteerResult,
+        channel: 'control',
+        correlationId,
+        payload: {
+          conversationId,
+          ...(payload.command?.commandId ? { commandId: payload.command.commandId } : {}),
+          receipts: await provider.steeringReceipts(conversationId)
+        }
+      });
+      return;
+    }
+    const leaseEpoch = payload.leaseEpoch;
+    if (typeof leaseEpoch !== 'number' || !Number.isSafeInteger(leaseEpoch) || leaseEpoch <= 0) {
+      throw new TypeError('Turn steer 缺少有效的 ExecutionLease generation。');
+    }
+    await this.product.ensureCapabilitiesReady();
+    const receipt = await provider.steer({
+      commandId: requireText(payload.command.commandId, 'commandId'),
+      conversationId,
+      turnId: requireText(payload.turnId, 'turnId'),
+      leaseEpoch: BigInt(leaseEpoch),
+      content: requirePayload(payload.content, 'Turn steer content')
+    });
+    this.post(webview, {
+      id: randomUUID(),
+      type: BridgeMessageType.TurnSteerResult,
+      channel: 'control',
+      correlationId,
+      payload: { conversationId, commandId: payload.command.commandId, receipts: [receipt] }
+    });
+  }
+
   private postTurnInputResult(
     webview: vscode.Webview,
     correlationId: string,
@@ -1374,6 +1454,8 @@ export class VscodeReliableKernelCommandRouter {
       });
       return;
     }
+    await this.settingsSaveBarrier.flush();
+    await this.configurationMutationQueue;
     const activeTurns = await this.list('Turn', { conversation_id: conversationId, status: 'active' }, 2);
     if (activeTurns.length > 0) {
       this.postCompressionCommandResult(webview, correlationId, {

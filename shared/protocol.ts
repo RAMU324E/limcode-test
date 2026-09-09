@@ -1,4 +1,5 @@
 import type { TurnExecutionPhase, TurnLifecycleStatus } from './turnLifecycle';
+import type { NativeSteeringReceipt, OpenAIResponsesNativeSettings } from './openAIResponsesNative';
 import type { DebugCaptureSettings, DebugCaptureCommand, DebugCaptureResult, DebugCaptureUiBatch, DebugCaptureUiAck } from './debugCapture';
 import type {
   AuthoritySnapshotRecord,
@@ -59,6 +60,8 @@ export enum BridgeMessageType {
   TurnInputResult = 'turn.input.result',
   TurnInterrupt = 'turn.interrupt',
   TurnInterruptResult = 'turn.interrupt.result',
+  TurnSteer = 'turn.steer',
+  TurnSteerResult = 'turn.steer.result',
   GuidanceEdit = 'guidance.edit',
   GuidanceCancel = 'guidance.cancel',
   GuidanceReorder = 'guidance.reorder',
@@ -110,6 +113,8 @@ export enum BridgeMessageType {
   GlobalSettingsGet = 'settings.global.get',
   GlobalSettingsUpdate = 'settings.global.update',
   GlobalSettingsSnapshot = 'settings.global.snapshot',
+  GlobalSettingsFlush = 'settings.global.flush',
+  GlobalSettingsFlushResult = 'settings.global.flush.result',
   DebugCaptureCommand = 'diagnostics.capture.command',
   DebugCaptureResult = 'diagnostics.capture.result',
   DebugCaptureObservation = 'diagnostics.capture.observation',
@@ -539,8 +544,18 @@ export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
 export const DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT = 90;
 export const DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES = 20;
 export const MAX_LLM_COMPRESSION_DURATION_MINUTES = 1_440;
-/** Decimal token cap for the model-visible conversation body after text compaction. */
-export const MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS = 48_000;
+/** Default decimal token target for the model-visible conversation body after text compaction. */
+export const DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS = 48_000;
+/** Smallest retained body a Conversation may be configured down to. */
+export const MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS = 1_000;
+/**
+ * Largest share of the room below the compression threshold that the retained body may claim.
+ *
+ * Compaction has to leave the Conversation meaningfully below its own trigger level. A retained
+ * body sized at the whole remaining room lands back on the threshold as soon as the next Turn is
+ * appended, so a configured target is capped at half of it.
+ */
+export const MAX_LLM_COMPRESSION_BODY_TARGET_ROOM_SHARE = 0.5;
 /** Default and hard cap for the visible text produced by summary-based compaction. */
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS = 8_000;
 /** Default frozen output allowance when a compression Provider has no explicit maximum. */
@@ -602,6 +617,8 @@ export interface LlmCompressionConfigRecord {
   name: string;
   kind: LlmCompressionMethodKind;
   maxDurationMinutes?: number;
+  /** Token target for the conversation body text compaction retains; unset uses the default. */
+  bodyTargetTokens?: number;
   trigger: {
     mode: LlmCompressionTriggerMode;
     thresholdTokens?: number;
@@ -628,6 +645,11 @@ export function createDefaultLlmCompressionSettings(): LlmCompressionSettingsRec
   return { providerBindings: [], modelBindings: [] };
 }
 
+export function normalizeLlmCompressionBodyTargetTokens(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS;
+  return Math.max(MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS, Math.round(value));
+}
+
 export function normalizeLlmCompressionMaxDurationMinutes(value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES;
   return Math.min(MAX_LLM_COMPRESSION_DURATION_MINUTES, Math.max(1, Math.round(value)));
@@ -640,6 +662,7 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
     name,
     kind: 'segmented_summary',
     maxDurationMinutes: DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES,
+    bodyTargetTokens: DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS,
     trigger: {
       mode: 'token_threshold',
       thresholdUnit: 'percent',
@@ -707,6 +730,8 @@ export interface LlmProviderModelConfigRecord {
   headers?: LlmProviderHeadersRecord;
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
+  /** Astra 原生能力配置；缺省表示跟随渠道级配置。 */
+  nativeResponses?: OpenAIResponsesNativeSettings;
   createdAt: number;
   updatedAt: number;
 }
@@ -734,6 +759,11 @@ export interface LlmProviderConfigRecord {
   headers?: LlmProviderHeadersRecord;
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
+  /**
+   * Astra 原生能力配置（provider-scoped）。显式 enabled 同时表示确认该兼容渠道支持原生能力；
+   * 仅对 openai-responses + 精确 Astra 模型生效。
+   */
+  nativeResponses?: OpenAIResponsesNativeSettings;
   /** 针对单个模型的完整高级配置；命中模型时整体替代渠道默认高级配置。 */
   modelConfigs: LlmProviderModelConfigRecord[];
   createdAt: number;
@@ -766,6 +796,8 @@ export interface LlmInvocationSettingsSnapshotRecord {
   promptCache?: LlmPromptCacheConfigRecord;
   generationConfig?: LlmGenerationConfigRecord;
   requestBody?: LlmRequestBodyRecord;
+  /** 本次调用冻结的 Astra 原生能力配置（已按渠道/模型配置合并）。 */
+  nativeResponses?: OpenAIResponsesNativeSettings;
   compressionConfigId?: string;
   compressionMethodKind?: LlmCompressionMethodKind;
   compressionTrigger?: LlmCompressionConfigRecord['trigger'];
@@ -955,6 +987,8 @@ export interface ToolPolicyToolConfigRecord {
    * 用户拒绝时仍会向 AI 回传“用户拒绝使用该结果”的工具响应，避免 AgentRun 永久等待。
    */
   autoSubmitResult?: boolean;
+  /** 是否在 Astra 原生通道允许该工具异步准入（output_item.done 即持久化准入、结果延迟投递）；缺省/false = 同步。 */
+  nativeAsync?: boolean;
   display?: ToolDisplayPolicyRecord;
   config: ToolConfigRecord;
 }
@@ -1508,6 +1542,10 @@ export interface ModelOutputItemReference {
   id: string;
   ordinal: number;
   phase?: AssistantMessagePhase;
+  /** 原生链上该 item 所属 response；自动后继/转向边界按此切分，绝不跨边界静默拼接。 */
+  providerResponseId?: string;
+  /** 该 response 的 previous_response_id（链上首个 response 缺省）。 */
+  previousResponseId?: string;
 }
 
 export interface ModelOutputPartMetadata {
@@ -1535,6 +1573,11 @@ export interface FunctionCallPart extends ModelOutputPartMetadata {
     args: unknown;
   };
   thoughtSignature?: string;
+  /**
+   * Astra 原生异步调用标记：声明或接收到 async:true 时保留，双向无损传播。
+   * 仅为合法性的历史证据；当前请求是否允许 pending 由目标 capability 与持久化准入共同决定。
+   */
+  async?: boolean;
 }
 
 export interface FunctionResponsePart extends ModelOutputPartMetadata {
@@ -2367,6 +2410,31 @@ export interface TurnInterruptResultPayload {
   cascadeChildAgents: boolean;
 }
 
+/**
+ * Native mid-turn steering. Default action `submit` sends one user MessageContent through the
+ * native steering path; `status` only reads locally persisted receipts for the conversation
+ * (optionally correlated by command.commandId) and never touches the provider.
+ */
+export interface TurnSteerPayload {
+  action?: 'submit' | 'status';
+  conversationId: string;
+  command: ConversationCommandMetadata;
+  /** submit 必填：目标 Turn。 */
+  turnId?: string;
+  /** submit 必填：正数 = 期望的 ExecutionLease 代。 */
+  leaseEpoch?: number;
+  /** submit 必填：单条用户消息内容。 */
+  content?: MessageContent;
+}
+
+export interface TurnSteerResultPayload {
+  conversationId: string;
+  /** submit/live 路径返回本条提交的一张收据；status 路径返回本地已知的全部收据。 */
+  receipts: NativeSteeringReceipt[];
+  commandId?: string;
+  error?: string;
+}
+
 export interface GuidanceControlTarget {
   intentId: string;
   expectedRevisionSeq: string;
@@ -2722,6 +2790,10 @@ export type GlobalSettingsSectionValue = GlobalSettingsRecord | LlmSettingsRecor
 export interface GlobalSettingsGetPayload {
   section: GlobalSettingsSection;
 }
+export interface GlobalSettingsFlushResultPayload {
+  status: 'saved' | 'failed';
+  message?: string;
+}
 export interface GlobalSettingsSnapshotPayload {
   section: GlobalSettingsSection;
   settings: GlobalSettingsSectionValue;
@@ -2855,6 +2927,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.TurnStart, TurnStartPayload>
   | BridgeEnvelope<BridgeMessageType.TurnEnqueue, TurnEnqueuePayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterrupt, TurnInterruptPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnSteer, TurnSteerPayload>
   | BridgeEnvelope<BridgeMessageType.GuidanceEdit, GuidanceEditPayload>
   | BridgeEnvelope<BridgeMessageType.GuidanceCancel, GuidanceCancelPayload>
   | BridgeEnvelope<BridgeMessageType.GuidanceReorder, GuidanceReorderPayload>
@@ -2906,6 +2979,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.CheckpointRestore, CheckpointRestorePayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsGet, GlobalSettingsGetPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsUpdate, GlobalSettingsUpdatePayload>
+  | BridgeEnvelope<BridgeMessageType.GlobalSettingsFlushResult, GlobalSettingsFlushResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsGet, ConversationSettingsGetPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsUpdate, ConversationSettingsUpdatePayload>
   | BridgeEnvelope<BridgeMessageType.ProjectFoldersGet, undefined>
@@ -2936,6 +3010,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInputResult, TurnInputResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>
+  | BridgeEnvelope<BridgeMessageType.TurnSteerResult, TurnSteerResultPayload>
   | BridgeEnvelope<BridgeMessageType.GuidanceControlResult, GuidanceControlResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationActionResult, ConversationActionResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationForkResult, ConversationForkResultPayload>
@@ -2949,6 +3024,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.AttachmentOpenResult, AttachmentOpenResultPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReloadResult, AttachmentReloadResultPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsSnapshot, GlobalSettingsSnapshotPayload>
+  | BridgeEnvelope<BridgeMessageType.GlobalSettingsFlush, undefined>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsSnapshot, ConversationSettingsSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.ProjectFoldersSnapshot, ProjectFoldersSnapshotPayload>
   | BridgeEnvelope<BridgeMessageType.FsStatResult, FsStatResultPayload>;

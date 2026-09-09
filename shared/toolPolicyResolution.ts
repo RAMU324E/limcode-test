@@ -132,6 +132,11 @@ function mergeToolConfigs(
         : current?.autoSubmitResult !== undefined
           ? { autoSubmitResult: current.autoSubmitResult }
           : {}),
+      ...(incoming.nativeAsync !== undefined
+        ? { nativeAsync: incoming.nativeAsync }
+        : current?.nativeAsync !== undefined
+          ? { nativeAsync: current.nativeAsync }
+          : {}),
       ...(current?.display || incoming.display
         ? { display: { ...(current?.display ?? {}), ...(incoming.display ?? {}) } }
         : {})

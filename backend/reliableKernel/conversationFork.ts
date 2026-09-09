@@ -8,6 +8,7 @@ import { conversationProjectLinkInsertStep } from './conversationProject';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { ReliableContextTokenEstimator } from './contextTokenEstimator';
+import { ContextSequenceControlPlane } from './contextSequence';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface ConversationForkCommand {
@@ -58,6 +59,7 @@ interface ForkRootShape {
   tailSegmentCount: bigint;
   segmentCount: bigint;
   estimatedTokens: bigint;
+  segmentIds?: string[];
 }
 
 /**
@@ -68,6 +70,7 @@ interface ForkRootShape {
 export class ConversationForkControlPlane {
   private readonly now: () => string;
   private readonly tokenEstimator: ReliableContextTokenEstimator;
+  private readonly context: ContextSequenceControlPlane;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -76,6 +79,7 @@ export class ConversationForkControlPlane {
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
+    this.context = new ContextSequenceControlPlane(database, contentStore, options);
   }
 
   public async fork(commandInput: ConversationForkCommand): Promise<ConversationForkResult> {
@@ -233,6 +237,7 @@ export class ConversationForkControlPlane {
     );
 
     const now = this.timestamp();
+    await this.context.assertNativeContextClosed(command.sourceContextRootId, command.sourceContextEndSegmentId);
     const targetRootShape = await resolveForkRootShape(
       this.database,
       this.tokenEstimator,
@@ -246,6 +251,7 @@ export class ConversationForkControlPlane {
       ...(sourceMembership
         ? { boundaryMessageSeq: requireBigInt(sourceMembership.message_seq, 'MessagePartOfConversation.message_seq') }
         : {}),
+      ...(targetRootShape.segmentIds ? { contextSegmentIds: targetRootShape.segmentIds } : {}),
       targetAgentId: command.targetAgentId,
       now
     });
@@ -696,6 +702,7 @@ async function resolveForkRootShape(
       : null,
     tailSegmentCount: compressed ? BigInt(prefix.length - 1) : 0n,
     segmentCount: BigInt(prefix.length),
+    segmentIds: prefix.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
     estimatedTokens: BigInt(await tokenEstimator.estimateRootPrefix(rootId, prefix.length))
   };
 }

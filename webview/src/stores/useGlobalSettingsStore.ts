@@ -6,6 +6,7 @@ import {
   type AppearanceSettingsRecord,
   createMessageId,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  normalizeLlmCompressionBodyTargetTokens,
   normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -44,6 +45,8 @@ import {
   type McpServerTransportRecord
 } from '@shared/protocol';
 import { createDefaultLlmCompressionConfig } from '@shared/protocol';
+import { normalizeOpenAIResponsesNativeSettings } from '@shared/openAIResponsesCapabilities';
+import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
 import { bridge, BridgeMessageType } from '@webview/transport';
 
 type SelectableCompressionMethodKind = 'openai_responses_compact' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
@@ -221,6 +224,7 @@ function createDefaultProviderConfig(name = '新渠道配置', provider: LlmProv
 
 function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, modelId: string): LlmProviderModelConfigRecord {
   const now = Date.now();
+  const nativeResponses = normalizeOpenAIResponsesNativeSettings(config.nativeResponses);
   return {
     id: `llm-model-config-${slugId(modelId)}-${createMessageId()}`,
     modelId,
@@ -233,6 +237,7 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(config.provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, config.provider),
+    ...(nativeResponses ? { nativeResponses } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -324,6 +329,7 @@ function normalizeModelConfigsForUi(
 
 function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId: string, provider: LlmProviderKind): LlmProviderModelConfigRecord {
   const now = Date.now();
+  const nativeResponses = normalizeOpenAIResponsesNativeSettings(config.nativeResponses);
   return {
     id: config.id?.trim() || `llm-model-config-${createMessageId()}`,
     modelId,
@@ -336,6 +342,7 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
+    ...(nativeResponses ? { nativeResponses } : {}),
     headers: sanitizeHeaders(config.headers) ?? {},
     generationConfig: normalizeGenerationConfigForUi(config.generationConfig) ?? {},
     requestBody: sanitizeRequestBody(config.requestBody) ?? {},
@@ -579,6 +586,7 @@ function normalizeCompressionConfigForUi(
   return {
     ...config,
     maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(config.maxDurationMinutes),
+    bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(config.bodyTargetTokens),
     trigger: normalizeCompressionTriggerForUi(config.trigger, contextWindowTokens)
   };
 }
@@ -624,12 +632,12 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
   const models = sanitizeModels(config.models);
   return {
     id: config.id,
-    name: config.name,
+    name: config.name.trim() || '未命名渠道',
     provider: config.provider,
-    baseUrl: config.baseUrl,
-    model: config.model,
+    baseUrl: config.baseUrl.trim(),
+    model: config.model.trim(),
     models,
-    apiKey: config.apiKey,
+    apiKey: config.apiKey.trim(),
     toolCallFormat: config.toolCallFormat,
     openaiResponsesTransport: normalizeOpenAIResponsesTransport(config.openaiResponsesTransport),
     stream: config.stream !== false,
@@ -639,6 +647,9 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) } : {}),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: sanitizePromptCache(config.promptCache, config.provider),
+    ...(normalizeOpenAIResponsesNativeSettings(config.nativeResponses)
+      ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
+      : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
@@ -661,6 +672,9 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider) } : { contextWindowTokens: providerDefaultContextWindow(provider) }),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: sanitizePromptCache(config.promptCache, provider),
+    ...(normalizeOpenAIResponsesNativeSettings(config.nativeResponses)
+      ? { nativeResponses: normalizeOpenAIResponsesNativeSettings(config.nativeResponses) }
+      : {}),
     ...(sanitizeHeaders(config.headers) ? { headers: sanitizeHeaders(config.headers) } : {}),
     ...(sanitizeGenerationConfig(config.generationConfig) ? { generationConfig: sanitizeGenerationConfig(config.generationConfig) } : {}),
     ...(sanitizeRequestBody(config.requestBody) ? { requestBody: sanitizeRequestBody(config.requestBody) } : {}),
@@ -717,6 +731,7 @@ function toPlainCompressionConfig(config: LlmCompressionConfigRecord): LlmCompre
     name: normalized.name,
     kind: normalized.kind,
     maxDurationMinutes: normalized.maxDurationMinutes,
+    bodyTargetTokens: normalized.bodyTargetTokens,
     trigger: {
       mode: normalized.trigger.mode,
       ...(normalized.trigger.thresholdTokens !== undefined ? { thresholdTokens: normalized.trigger.thresholdTokens } : {}),
@@ -740,7 +755,7 @@ function toPlainCompressionConfig(config: LlmCompressionConfigRecord): LlmCompre
       }
     } : {}),
     createdAt: normalized.createdAt,
-    updatedAt: Date.now()
+    updatedAt: normalized.updatedAt
   };
 }
 
@@ -816,6 +831,40 @@ function cloneSettingsValue<T extends GlobalSettingsSectionValue>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function normalizeSettingsSnapshot(section: GlobalSettingsSection, settings: GlobalSettingsSectionValue): GlobalSettingsSectionValue {
+  if (section === 'llmProviderConfigs') {
+    return { configs: (settings as LlmProviderConfigsRecord).configs.map((config) => toPlainProviderConfig(normalizeProviderConfigForUi(config))) };
+  }
+  if (section === 'llmCompressionConfigs') return { configs: (settings as LlmCompressionConfigsRecord).configs.map(toPlainCompressionConfig) };
+  if (section === 'llmCompression') return toPlainCompressionSettings({ ...emptyLlmCompression(), ...settings as LlmCompressionSettingsRecord });
+  return cloneSettingsValue(settings);
+}
+
+function mapSettingsRecordTimes(value: GlobalSettingsSectionValue, visit: (key: string, timestamp: number) => number): GlobalSettingsSectionValue {
+  const copy = cloneSettingsValue(value) as unknown as Record<string, unknown>;
+  for (const collection of ['configs', 'providerBindings', 'modelBindings', 'servers']) {
+    const records = copy[collection];
+    if (!Array.isArray(records)) continue;
+    for (const record of records) {
+      if (!isPlainJsonObject(record) || typeof record.id !== 'string') continue;
+      const key = JSON.stringify([collection, record.id]);
+      if (typeof record.updatedAt === 'number') record.updatedAt = visit(key, record.updatedAt);
+      if (collection === 'configs' && Array.isArray(record.modelConfigs)) {
+        for (const model of record.modelConfigs) {
+          if (isPlainJsonObject(model) && typeof model.id === 'string' && typeof model.updatedAt === 'number') {
+            model.updatedAt = visit(JSON.stringify([collection, record.id, 'modelConfigs', model.id]), model.updatedAt);
+          }
+        }
+      }
+    }
+  }
+  return copy as unknown as GlobalSettingsSectionValue;
+}
+
+function sameSettingsContent(left: GlobalSettingsSectionValue, right: GlobalSettingsSectionValue): boolean {
+  return sameSerializableValue(mapSettingsRecordTimes(left, () => 0), mapSettingsRecordTimes(right, () => 0));
+}
+
 const MERGE_MISSING = Symbol('merge-missing');
 type MergeNodeValue = unknown | typeof MERGE_MISSING;
 
@@ -825,7 +874,13 @@ function mergeSettingsThreeWay(
   remote: GlobalSettingsSectionValue,
   localWinsConflicts = false
 ): { value: GlobalSettingsSectionValue; conflicts: string[] } {
-  const merged = mergeNode(base, local, remote, '$', localWinsConflicts);
+  // 记录的更新时间是保存元数据，不与用户设置字段一起参与冲突判定。
+  const timestamps = new Map<string, number>();
+  for (const value of [base, local, remote]) mapSettingsRecordTimes(value, (key, timestamp) => { timestamps.set(key, timestamp); return timestamp; });
+  const [alignedBase, alignedLocal, alignedRemote] = [base, local, remote].map((value) =>
+    mapSettingsRecordTimes(value, (key, timestamp) => timestamps.get(key) ?? timestamp)
+  );
+  const merged = mergeNode(alignedBase, alignedLocal, alignedRemote, '$', localWinsConflicts);
   return {
     value: cloneSettingsValue(merged.value as GlobalSettingsSectionValue),
     conflicts: merged.conflicts
@@ -929,25 +984,44 @@ function cloneMergeValue(value: MergeNodeValue): MergeNodeValue {
 let modelFetchTimeout: number | undefined;
 const LLM_PROVIDER_CONFIGS_AUTOSAVE_DELAY_MS = 400;
 const LLM_COMPRESSION_CONFIGS_AUTOSAVE_DELAY_MS = 400;
+const SETTINGS_SAVE_ACK_TIMEOUT_MS = 5_000;
+const SETTINGS_FLUSH_TIMEOUT_MS = 12_000;
 let llmProviderConfigsAutoSaveTimer: number | undefined;
 let llmCompressionConfigsAutoSaveTimer: number | undefined;
 
 type PendingGlobalSettingsUpdate = Omit<GlobalSettingsUpdatePayload, 'expectedRevision'>;
-interface SectionSaveAttempt { requestId: string; payload: PendingGlobalSettingsUpdate }
+interface SectionSaveAttempt { requestId: string; payload: PendingGlobalSettingsUpdate; expectedRevision: string }
 interface SectionSaveCoordinator {
   inFlight?: SectionSaveAttempt;
   queued?: PendingGlobalSettingsUpdate;
   awaitingConflictSnapshot?: boolean;
+  timeout?: number;
+  recoveryRequestId?: string;
+  paused?: boolean;
+  ignoredReplyIds: Set<string>;
 }
 const sectionSaveCoordinators = new Map<GlobalSettingsSection, SectionSaveCoordinator>();
 
 function coordinatorFor(section: GlobalSettingsSection): SectionSaveCoordinator {
   let coordinator = sectionSaveCoordinators.get(section);
   if (!coordinator) {
-    coordinator = {};
+    coordinator = { ignoredReplyIds: new Set() };
     sectionSaveCoordinators.set(section, coordinator);
   }
   return coordinator;
+}
+
+function clearSectionSaveTimeout(coordinator: SectionSaveCoordinator): void {
+  if (coordinator.timeout !== undefined) window.clearTimeout(coordinator.timeout);
+  coordinator.timeout = undefined;
+}
+
+function ignoreSettingsReply(coordinator: SectionSaveCoordinator, requestId: string | undefined): void {
+  if (!requestId) return;
+  coordinator.ignoredReplyIds.add(requestId);
+  if (coordinator.ignoredReplyIds.size > 64) {
+    coordinator.ignoredReplyIds.delete(coordinator.ignoredReplyIds.values().next().value!);
+  }
 }
 
 function clearLlmProviderConfigsAutoSaveTimer(): void {
@@ -974,6 +1048,7 @@ function hasPendingLlmCompressionConfigsSave(): boolean {
 
 function hasPendingSectionSave(section: GlobalSettingsSection): boolean {
   const coordinator = sectionSaveCoordinators.get(section);
+  if (coordinator?.paused) return false;
   const timerPending = section === 'llmProviderConfigs'
     ? llmProviderConfigsAutoSaveTimer !== undefined
     : section === 'llmCompressionConfigs' && llmCompressionConfigsAutoSaveTimer !== undefined;
@@ -983,7 +1058,7 @@ function hasPendingSectionSave(section: GlobalSettingsSection): boolean {
 function isSectionDirty(state: GlobalSettingsState, section: GlobalSettingsSection): boolean {
   const baseline = state.baselines[section];
   const contentDirty = baseline !== undefined
-    && !sameSerializableValue(plainSettingsFromState(state, section), baseline);
+    && !sameSettingsContent(plainSettingsFromState(state, section), baseline);
   return contentDirty || state.pendingSettingsSections[section] === true || hasPendingSectionSave(section);
 }
 
@@ -1057,11 +1132,16 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       const coordinator = coordinatorFor(payload.section);
       coordinator.queued = { ...payload, settings: cloneSettingsValue(payload.settings) };
       this.markPendingSettingSection(payload.section);
+      if (coordinator.paused && coordinator.inFlight) {
+        this.recoverSettingsSave(payload.section);
+        return;
+      }
+      coordinator.paused = false;
       this.pumpSettingsUpdate(payload.section);
     },
     pumpSettingsUpdate(section: GlobalSettingsSection): void {
       const coordinator = coordinatorFor(section);
-      if (coordinator.inFlight || coordinator.awaitingConflictSnapshot || this.externalChangedSections[section] || !coordinator.queued) return;
+      if (coordinator.paused || coordinator.inFlight || coordinator.awaitingConflictSnapshot || this.externalChangedSections[section] || !coordinator.queued) return;
       const expectedRevision = this.revisions[section];
       if (!expectedRevision) {
         if (!this.loadingSettingsSections[section]) {
@@ -1073,15 +1153,72 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       }
       const payload = coordinator.queued;
       coordinator.queued = undefined;
+      const requestId = createMessageId();
       try {
-        const requestId = bridge.request(BridgeMessageType.GlobalSettingsUpdate, { ...payload, expectedRevision });
-        coordinator.inFlight = { requestId, payload };
+        coordinator.inFlight = { requestId, payload, expectedRevision };
+        clearSectionSaveTimeout(coordinator);
+        coordinator.timeout = window.setTimeout(() => this.recoverSettingsSave(section), SETTINGS_SAVE_ACK_TIMEOUT_MS);
+        bridge.request(BridgeMessageType.GlobalSettingsUpdate, { ...payload, expectedRevision }, { requestId });
       } catch (error) {
+        clearSectionSaveTimeout(coordinator);
+        coordinator.inFlight = undefined;
         coordinator.queued = payload;
+        coordinator.paused = true;
+        this.clearPendingSettingSection(section);
         const message = `设置保存请求发送失败：${messageFromError(error)}`;
         this.failedSettingsSections[section] = message;
         this.status = `设置保存失败：${message}`;
       }
+    },
+    recoverSettingsSave(section: GlobalSettingsSection): void {
+      const coordinator = coordinatorFor(section);
+      clearSectionSaveTimeout(coordinator);
+      ignoreSettingsReply(coordinator, coordinator.recoveryRequestId);
+      const requestId = createMessageId();
+      coordinator.recoveryRequestId = requestId;
+      coordinator.paused = false;
+      this.markLoadingSettingSection(section);
+      coordinator.timeout = window.setTimeout(() => {
+        ignoreSettingsReply(coordinator, requestId);
+        coordinator.recoveryRequestId = undefined;
+        coordinator.timeout = undefined;
+        coordinator.paused = true;
+        this.clearLoadingSettingSection(section);
+        this.clearPendingSettingSection(section);
+        this.failedSettingsSections[section] = '无法确认设置是否保存，本地修改已保留，请重新读取后重试。';
+        this.status = this.failedSettingsSections[section]!;
+      }, SETTINGS_SAVE_ACK_TIMEOUT_MS);
+      try {
+        bridge.request(BridgeMessageType.GlobalSettingsGet, { section }, { requestId });
+      } catch (error) {
+        this.setError(`无法核对设置：${messageFromError(error)}`, {
+          section, correlationId: requestId, requestType: BridgeMessageType.GlobalSettingsGet
+        });
+      }
+    },
+    flushForExecution(): Promise<void> {
+      if (llmProviderConfigsAutoSaveTimer !== undefined) this.saveLlmProviderConfigs();
+      if (llmCompressionConfigsAutoSaveTimer !== undefined) this.saveLlmCompressionConfigs();
+      return new Promise<void>((resolve, reject) => {
+        const finish = (error?: Error) => {
+          unsubscribe();
+          window.clearTimeout(timeout);
+          if (error) reject(error);
+          else resolve();
+        };
+        const check = () => {
+          for (const section of CHANNEL_SETTINGS_SECTIONS) {
+            if (this.externalChangedSections[section] || this.failedSettingsSections[section]) {
+              finish(new Error(this.failedSettingsSections[section] || '设置有未处理的修改冲突，请先在设置页确认。'));
+              return;
+            }
+          }
+          if (CHANNEL_SETTINGS_SECTIONS.every((section) => !isSectionDirty(this, section) && !this.loadingSettingsSections[section])) finish();
+        };
+        const unsubscribe = this.$subscribe(check, { detached: true, flush: 'sync' });
+        const timeout = window.setTimeout(() => finish(new Error('设置尚未确认保存，已暂停本次操作，请检查设置页。')), SETTINGS_FLUSH_TIMEOUT_MS);
+        check();
+      });
     },
     markLoadingSettingSection(section: GlobalSettingsSection): void {
       this.loadingSettingsSections[section] = true;
@@ -1098,21 +1235,21 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       delete this.pendingSettingsSections[section];
     },
     requestAll(): void {
-      clearLlmProviderConfigsAutoSaveTimer();
-      clearLlmCompressionConfigsAutoSaveTimer();
-      sectionSaveCoordinators.clear();
       this.status = '正在读取设置...';
-      this.revisions = {};
-      this.baselines = {};
-      this.pendingExternalSnapshots = {};
-      this.externalChangedSections = {};
-      this.loadedSections = {};
-      this.loadingSettingsSections = {};
-      this.pendingSettingsSections = {};
-      this.failedSettingsSections = {};
       for (const section of GLOBAL_SETTINGS_SECTIONS) {
+        const coordinator = coordinatorFor(section);
+        if (coordinator.inFlight || coordinator.queued || coordinator.paused) {
+          this.recoverSettingsSave(section);
+          continue;
+        }
         this.markLoadingSettingSection(section);
         bridge.request(BridgeMessageType.GlobalSettingsGet, { section });
+      }
+    },
+    reconcilePendingSettings(): void {
+      for (const section of GLOBAL_SETTINGS_SECTIONS) {
+        const coordinator = coordinatorFor(section);
+        if (coordinator.inFlight || coordinator.queued || coordinator.paused) this.recoverSettingsSave(section);
       }
     },
     requestChannelSettings(): void {
@@ -1485,6 +1622,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
       this.selectCompressionConfigForActiveProvider(config.id);
     },
+    setActiveCompressionBodyTargetTokens(value: number): void {
+      const config = this.ensureCompressionConfigForActiveProvider();
+      if (!config) return;
+      this.updateCompressionConfig(config.id, { bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(value) });
+      this.selectCompressionConfigForActiveProvider(config.id);
+    },
     setActiveCompressionMethodKind(kind: SelectableCompressionMethodKind): void {
       const config = this.ensureCompressionConfigForActiveProvider();
       if (!config) return;
@@ -1547,6 +1690,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       const config = this.ensureCompressionConfigForActiveModel(modelId);
       if (!config) return;
       this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
+      this.selectCompressionConfigForActiveModel(modelId, config.id);
+    },
+    setModelCompressionBodyTargetTokens(modelId: string, value: number): void {
+      const config = this.ensureCompressionConfigForActiveModel(modelId);
+      if (!config) return;
+      this.updateCompressionConfig(config.id, { bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(value) });
       this.selectCompressionConfigForActiveModel(modelId, config.id);
     },
     setModelCompressionProviderConfig(modelId: string, providerConfigId: string): void {
@@ -1636,6 +1785,15 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
+    updateActiveLlmNativeResponses(nativeResponses: OpenAIResponsesNativeSettings | undefined): void {
+      const config = this.activeLlmProviderConfig;
+      if (!config) return;
+      const normalized = normalizeOpenAIResponsesNativeSettings(nativeResponses);
+      if (normalized) config.nativeResponses = normalized;
+      else delete config.nativeResponses;
+      config.updatedAt = Date.now();
+      this.queueLlmProviderConfigsAutoSave();
+    },
     updateActiveLlmHeaders(headers: LlmProviderHeadersRecord | undefined): void {
       const config = this.activeLlmProviderConfig;
       if (!config) return;
@@ -1717,6 +1875,18 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
       modelConfig.promptCache = sanitizePromptCache(promptCache, config.provider);
+      modelConfig.updatedAt = Date.now();
+      config.updatedAt = Date.now();
+      this.queueLlmProviderConfigsAutoSave();
+    },
+    updateActiveModelConfigNativeResponses(modelConfigId: string, nativeResponses: OpenAIResponsesNativeSettings | undefined): void {
+      const config = this.activeLlmProviderConfig;
+      if (!config) return;
+      const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
+      if (!modelConfig) return;
+      const normalized = normalizeOpenAIResponsesNativeSettings(nativeResponses);
+      if (normalized) modelConfig.nativeResponses = normalized;
+      else delete modelConfig.nativeResponses;
       modelConfig.updatedAt = Date.now();
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
@@ -1892,9 +2062,10 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         delete this.pendingExternalSnapshots[item];
         delete this.externalChangedSections[item];
         const coordinator = coordinatorFor(item);
+        coordinator.paused = false;
         coordinator.awaitingConflictSnapshot = false;
         coordinator.queued = undefined;
-        if (!sameSerializableValue(merged, payload.settings)) {
+        if (!sameSettingsContent(merged, payload.settings)) {
           this.enqueueSettingsUpdate({ section: item, settings: plainSettingsFromState(this, item) });
         }
       }
@@ -1906,6 +2077,8 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         const payload = this.pendingExternalSnapshots[item];
         if (!payload || coordinatorFor(item).inFlight) continue;
         const coordinator = coordinatorFor(item);
+        coordinator.paused = false;
+        clearSectionSaveTimeout(coordinator);
         coordinator.queued = undefined;
         coordinator.awaitingConflictSnapshot = false;
         if (item === 'llmProviderConfigs') {
@@ -1926,13 +2099,39 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     },
     applySnapshot(payload: GlobalSettingsSnapshotPayload, correlationId?: string): void {
       const section = payload.section;
+      payload = { ...payload, settings: normalizeSettingsSnapshot(section, payload.settings) };
       const coordinator = coordinatorFor(section);
+      if (correlationId && coordinator.ignoredReplyIds.has(correlationId)) return;
+      if (correlationId && coordinator.recoveryRequestId === correlationId) {
+        clearSectionSaveTimeout(coordinator);
+        coordinator.recoveryRequestId = undefined;
+        ignoreSettingsReply(coordinator, correlationId);
+        const attempted = coordinator.inFlight;
+        if (attempted && sameSettingsContent(attempted.payload.settings, payload.settings)) {
+          this.applySnapshot(payload, attempted.requestId);
+          return;
+        }
+        if (attempted) {
+          ignoreSettingsReply(coordinator, attempted.requestId);
+          coordinator.inFlight = undefined;
+          coordinator.queued = { section, settings: plainSettingsFromState(this, section) };
+        }
+        coordinator.paused = false;
+        coordinator.awaitingConflictSnapshot = false;
+        this.resolveExternalSnapshot(payload);
+        return;
+      }
       const localAttempt = correlationId && coordinator.inFlight?.requestId === correlationId
         ? coordinator.inFlight
         : undefined;
 
       if (localAttempt) {
+        clearSectionSaveTimeout(coordinator);
+        ignoreSettingsReply(coordinator, localAttempt.requestId);
+        ignoreSettingsReply(coordinator, coordinator.recoveryRequestId);
+        coordinator.recoveryRequestId = undefined;
         coordinator.inFlight = undefined;
+        coordinator.paused = false;
         coordinator.awaitingConflictSnapshot = false;
         const current = plainSettingsFromState(this, section);
         const merged = mergeSettingsThreeWay(localAttempt.payload.settings, current, payload.settings, true);
@@ -1941,7 +2140,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         this.flushDependentSettingsAfterCommittedSnapshot(payload);
         if (coordinator.queued) {
           coordinator.queued.settings = plainSettingsFromState(this, section);
-        } else if (!sameSerializableValue(merged.value, payload.settings)) {
+        } else if (!sameSettingsContent(merged.value, payload.settings)) {
           coordinator.queued = { section, settings: plainSettingsFromState(this, section) };
         }
         const pendingExternal = this.pendingExternalSnapshots[section];
@@ -1996,8 +2195,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       const local = plainSettingsFromState(this, section);
       const merged = mergeSettingsThreeWay(baseline, local, payload.settings);
       if (merged.conflicts.length > 0) {
-        this.stageExternalSnapshot(payload);
+        this.stageExternalSnapshot(payload, true);
         coordinatorFor(section).awaitingConflictSnapshot = false;
+        coordinatorFor(section).paused = true;
+        this.clearLoadingSettingSection(section);
+        this.clearPendingSettingSection(section);
+        this.failedSettingsSections[section] = '其他窗口也修改了这项设置，请选择保留当前或载入外部。';
         this.status = `其他窗口也修改了这项设置，本地内容已保留，请选择保留当前或载入外部。`;
         return false;
       }
@@ -2005,17 +2208,19 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.applySectionSettings(section, merged.value);
       delete this.pendingExternalSnapshots[section];
       delete this.externalChangedSections[section];
+      coordinatorFor(section).paused = false;
       coordinatorFor(section).awaitingConflictSnapshot = false;
+      if (coordinatorFor(section).queued) coordinatorFor(section).queued!.settings = plainSettingsFromState(this, section);
       this.pumpSettingsUpdate(section);
       this.refreshPendingSettingSection(section);
       return true;
     },
-    stageExternalSnapshot(payload: GlobalSettingsSnapshotPayload): void {
+    stageExternalSnapshot(payload: GlobalSettingsSnapshotPayload, conflicting = false): void {
       this.pendingExternalSnapshots[payload.section] = {
         ...payload,
         settings: cloneSettingsValue(payload.settings)
       };
-      this.externalChangedSections[payload.section] = true;
+      if (conflicting) this.externalChangedSections[payload.section] = true;
     },
     applyCommittedMetadata(payload: GlobalSettingsSnapshotPayload): void {
       this.loadedSections[payload.section] = true;
@@ -2086,18 +2291,30 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.closeFetchedModelsDialog();
       if (options.section) {
         const coordinator = coordinatorFor(options.section);
+        if (options.correlationId && coordinator.ignoredReplyIds.has(options.correlationId)) return;
+        if (options.correlationId && coordinator.recoveryRequestId === options.correlationId) {
+          clearSectionSaveTimeout(coordinator);
+          ignoreSettingsReply(coordinator, coordinator.recoveryRequestId);
+          coordinator.recoveryRequestId = undefined;
+        }
         if (options.correlationId && coordinator.inFlight?.requestId === options.correlationId) {
+          clearSectionSaveTimeout(coordinator);
           const failed = coordinator.inFlight;
+          ignoreSettingsReply(coordinator, failed.requestId);
           coordinator.inFlight = undefined;
           coordinator.queued = coordinator.queued ?? failed.payload;
         }
         if (options.code === 'settings_revision_conflict') {
           coordinator.awaitingConflictSnapshot = true;
-          if (!this.pendingExternalSnapshots[options.section]) {
-            this.markLoadingSettingSection(options.section);
-            bridge.request(BridgeMessageType.GlobalSettingsGet, { section: options.section });
+          const latest = this.pendingExternalSnapshots[options.section];
+          if (latest) {
+            this.resolveExternalSnapshot(latest);
+          } else {
+            this.recoverSettingsSave(options.section);
           }
+          return;
         }
+        coordinator.paused = true;
         this.clearLoadingSettingSection(options.section);
         this.refreshPendingSettingSection(options.section);
         this.failedSettingsSections[options.section] = message;

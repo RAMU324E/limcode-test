@@ -162,6 +162,7 @@ function sanitizeToolConfigs(
       ...(supportsChangeApply && typeof rawRecord.autoApplyChange === 'boolean' ? { autoApplyChange: rawRecord.autoApplyChange } : {}),
       ...(supportsChangeApply ? normalizedAutoApplyChangeDelay(rawRecord.autoApplyChangeDelaySeconds) : {}),
       ...(typeof rawRecord.autoSubmitResult === 'boolean' ? { autoSubmitResult: rawRecord.autoSubmitResult } : {}),
+      ...(typeof rawRecord.nativeAsync === 'boolean' ? { nativeAsync: rawRecord.nativeAsync } : {}),
       ...(display ? { display } : {})
     };
     if (
@@ -170,6 +171,7 @@ function sanitizeToolConfigs(
       || nextRecord.autoApplyChange !== undefined
       || nextRecord.autoApplyChangeDelaySeconds !== undefined
       || nextRecord.autoSubmitResult !== undefined
+      || nextRecord.nativeAsync !== undefined
       || nextRecord.display !== undefined
     ) result[toolName] = nextRecord;
   }

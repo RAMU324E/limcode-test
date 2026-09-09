@@ -16,6 +16,13 @@ import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { ContextModelSource } from './databaseWorkerProtocol';
 import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
+import { currentExecutionLeaseFence } from './executionLeaseFence';
+import {
+  NativeAsyncWorkPendingError,
+  parseNativeAdmissionContent,
+  TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION,
+  type NativePendingWorkRef
+} from './nativeToolFacts';
 
 export type ContextSegmentKind = 'system' | 'message' | 'tool_pair' | 'compression' | 'runtime_context';
 export type ContextSourceKind =
@@ -135,6 +142,8 @@ export interface FreshConversationMessageContextPlanInput {
 export interface MessageContextAppendPlanInput {
   conversationId: string;
   messageRevisionId: string;
+  /** Already committed immutable revision; omitted when the caller allocates it in this transaction. */
+  existingRevisionSeq?: bigint;
   contentObjectId: string;
   contentByteLength: bigint;
   /** Provider-semantic estimate for the appended Message. */
@@ -188,6 +197,14 @@ interface AppendOccurrencePlan {
   baseRootId?: string | null;
   expectedHeadRootId?: string | null;
   activate?: boolean;
+  /**
+   * Authorized native partial tool_pair construction (single declared source). Only the native
+   * append methods set this after proving the durable native admission; generic append paths can
+   * never produce the partial shape.
+   */
+  nativePartialPair?: 'tool_call' | 'tool_model_result';
+  /** Atomic execution fence asserted in every committing transaction of the native append. */
+  executionFence?: { callTurnId: string };
 }
 
 interface BaseShape {
@@ -696,6 +713,282 @@ export class ContextSequenceControlPlane {
     }
   }
 
+  /**
+   * Appends the chronological CALL occurrence of one durably admitted native ToolCall. The segment
+   * is a native partial tool_pair (single tool_call source, native:true body); the matching result
+   * occurrence is appended later by appendNativeToolResult, never by rewriting this segment.
+   * Fencing follows the ambient AsyncLocalStorage convention: callers wrap live work in
+   * runWithExecutionLeaseFence(captured) and the writer transaction asserts that full tuple
+   * atomically (a newer replacement lease is never adopted). Without an ambient fence the append
+   * runs the no-lease terminal closure branch: it asserts NO ExecutionLease for the Conversation
+   * and a terminated originating Turn in the same transaction.
+   */
+  public async appendNativeToolCall(command: {
+    conversationId: string;
+    toolCallId: string;
+    providerCallId?: string;
+    baseRootId?: string | null;
+    expectedHeadRootId?: string | null;
+    activate?: boolean;
+  }): Promise<ContextAppendResult> {
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const toolCallId = requireId(command.toolCallId, 'toolCallId');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ToolCall').get(toolCallId),
+      DOMAIN_REPOSITORIES.domain('ToolCallEvent').list({
+        where: { tool_call_id: toolCallId, event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
+        where: { tool_call_id: toolCallId },
+        limit: 2
+      })
+    ]);
+    const toolCall = requireRow(snapshot.snapshot[0], `ToolCall ${toolCallId}`);
+    const admissionEvent = requireNativeAdmissionEvent(toolCallId, rows(snapshot.snapshot[1]));
+    const sourceLinks = rows(snapshot.snapshot[2]);
+    if (sourceLinks.length !== 1) {
+      throw new Error(`Native ToolCall ${toolCallId} lacks its unique ToolCallSourceLink.`);
+    }
+    const turnId = requireId(toolCall.turn_id, 'ToolCall.turn_id');
+    const related = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('ContentObject').get(
+        requireId(toolCall.arguments_object_id, 'ToolCall.arguments_object_id')
+      )
+    ]);
+    const turn = requireRow(related.snapshot[0], `Turn ${turnId}`);
+    if (turn.conversation_id !== conversationId) throw new Error('ToolCall belongs to another Conversation.');
+    const argumentMetadata = asContentObjectMetadata(requireRow(
+      related.snapshot[1],
+      `ContentObject ${String(toolCall.arguments_object_id)}`
+    ));
+    const admission = parseNativeAdmissionContent(
+      JSON.parse((await this.contentStore.read(await this.eventContentMetadata(admissionEvent))).toString('utf8'))
+    );
+    if (command.providerCallId !== undefined && command.providerCallId !== admission.providerCallId) {
+      throw new Error(`Native ToolCall ${toolCallId} provider call id conflicts with its durable admission.`);
+    }
+    await this.preflightAppendTarget(
+      conversationId, command.baseRootId, command.expectedHeadRootId, command.activate !== false
+    );
+    const [argumentsBytes] = await this.contentStore.readMany([argumentMetadata]);
+    const callSeq = requireBigInt(toolCall.call_seq, 'ToolCall.call_seq');
+    const content = await this.contentStore.prepare(this.database, JSON.stringify({
+      kind: 'tool_pair',
+      native: true,
+      toolCall: {
+        id: toolCallId,
+        providerCallId: admission.providerCallId,
+        responseId: admission.responseId,
+        async: admission.declaredAsync,
+        callSeq: callSeq.toString(),
+        toolName: requireText(toolCall.tool_name, 'ToolCall.tool_name'),
+        argumentsContentType: argumentMetadata.content_type,
+        arguments: argumentsBytes.toString('utf8'),
+        ...(sourceLinks[0].thought_signature === null || sourceLinks[0].thought_signature === undefined
+          ? {}
+          : { thoughtSignature: requireText(sourceLinks[0].thought_signature, 'ToolCallSourceLink.thought_signature') }),
+        ...(admission.outputItem ? { outputItem: admission.outputItem } : {})
+      }
+    }), CONTENT_TYPE_TOOL_PAIR);
+    return this.appendOccurrence({
+      conversationId,
+      segmentKind: 'tool_pair',
+      sources: [{ sourceKind: 'tool_call', sourceId: toolCallId, sourceRevision: callSeq }],
+      content,
+      baseRootId: command.baseRootId,
+      expectedHeadRootId: command.expectedHeadRootId,
+      activate: command.activate,
+      nativePartialPair: 'tool_call',
+      executionFence: { callTurnId: turnId }
+    });
+  }
+
+  /**
+   * Appends the chronological RESULT occurrence of one settled native ToolCall. Trigger contract:
+   * (a) the Kernel delivery pump, on the checkpointed response.created that admits the matched
+   * explicit result create (before the carrier's own output commits, never waiting on the network
+   * inside onEvent) — so any intervening automatic successor output precedes the result; or (b)
+   * the explicit switch/cancel/fork closure path for old-provider undelivered settlements. Never
+   * the in-stream settlement path. Requires the call occurrence to exist already.
+   * Fencing is the appendNativeToolCall ambient convention: an ambient captured lease fence is
+   * asserted atomically (a fresh-Turn owner may close old settled facts with its own fence);
+   * without one, the no-lease terminal closure branch applies.
+   */
+  public async appendNativeToolResult(command: {
+    conversationId: string;
+    toolCallId: string;
+    toolModelResultId: string;
+    baseRootId?: string | null;
+    expectedHeadRootId?: string | null;
+    activate?: boolean;
+  }): Promise<ContextAppendResult> {
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const toolCallId = requireId(command.toolCallId, 'toolCallId');
+    const toolModelResultId = requireId(command.toolModelResultId, 'toolModelResultId');
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ToolCall').get(toolCallId),
+      DOMAIN_REPOSITORIES.domain('ToolModelResult').get(toolModelResultId),
+      DOMAIN_REPOSITORIES.domain('ToolCallEvent').list({
+        where: { tool_call_id: toolCallId, event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'tool_call', source_id: toolCallId },
+        limit: 2
+      }),
+      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
+        where: { tool_call_id: toolCallId },
+        limit: 2
+      })
+    ]);
+    const toolCall = requireRow(snapshot.snapshot[0], `ToolCall ${toolCallId}`);
+    const modelResult = requireRow(snapshot.snapshot[1], `ToolModelResult ${toolModelResultId}`);
+    if (modelResult.tool_call_id !== toolCallId) throw new Error('ToolModelResult does not belong to ToolCall.');
+    const admissionEvent = requireNativeAdmissionEvent(toolCallId, rows(snapshot.snapshot[2]));
+    const callSources = rows(snapshot.snapshot[3]);
+    if (callSources.length !== 1) {
+      throw new Error(`Native ToolCall ${toolCallId} result occurrence requires its call occurrence first.`);
+    }
+    const sourceLinks = rows(snapshot.snapshot[4]);
+    if (sourceLinks.length !== 1) {
+      throw new Error(`Native ToolCall ${toolCallId} lacks its unique ToolCallSourceLink.`);
+    }
+    const callSeq = requireBigInt(toolCall.call_seq, 'ToolCall.call_seq');
+    if (requireBigInt(callSources[0].source_revision, 'ContextSegmentSource.source_revision') !== callSeq) {
+      throw new Error(`Native ToolCall ${toolCallId} call occurrence conflicts with its call_seq.`);
+    }
+    const turnId = requireId(toolCall.turn_id, 'ToolCall.turn_id');
+    const resultRevisionId = requireId(modelResult.message_revision_id, 'ToolModelResult.message_revision_id');
+    const related = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('MessageRevision').get(resultRevisionId),
+      DOMAIN_REPOSITORIES.domain('ContentObject').get(
+        requireId(toolCall.arguments_object_id, 'ToolCall.arguments_object_id')
+      )
+    ]);
+    const turn = requireRow(related.snapshot[0], `Turn ${turnId}`);
+    if (turn.conversation_id !== conversationId) throw new Error('ToolCall belongs to another Conversation.');
+    const resultRevision = requireRow(related.snapshot[1], `MessageRevision ${resultRevisionId}`);
+    const resultContentId = requireId(resultRevision.content_object_id, 'MessageRevision.content_object_id');
+    const argumentMetadata = asContentObjectMetadata(requireRow(
+      related.snapshot[2],
+      `ContentObject ${String(toolCall.arguments_object_id)}`
+    ));
+    const resultMetadata = asContentObjectMetadata(
+      await this.requireContentObjectMetadata(resultContentId)
+    );
+    const admission = parseNativeAdmissionContent(
+      JSON.parse((await this.contentStore.read(await this.eventContentMetadata(admissionEvent))).toString('utf8'))
+    );
+    await this.preflightAppendTarget(
+      conversationId, command.baseRootId, command.expectedHeadRootId, command.activate !== false
+    );
+    const [argumentsBytes, resultBytes] = await this.contentStore.readMany([argumentMetadata, resultMetadata]);
+    const content = await this.contentStore.prepare(this.database, JSON.stringify({
+      kind: 'tool_pair',
+      native: true,
+      toolCall: {
+        id: toolCallId,
+        providerCallId: admission.providerCallId,
+        responseId: admission.responseId,
+        async: admission.declaredAsync,
+        callSeq: callSeq.toString(),
+        toolName: requireText(toolCall.tool_name, 'ToolCall.tool_name'),
+        argumentsContentType: argumentMetadata.content_type,
+        arguments: argumentsBytes.toString('utf8'),
+        ...(sourceLinks[0].thought_signature === null || sourceLinks[0].thought_signature === undefined
+          ? {}
+          : { thoughtSignature: requireText(sourceLinks[0].thought_signature, 'ToolCallSourceLink.thought_signature') }),
+        ...(admission.outputItem ? { outputItem: admission.outputItem } : {})
+      },
+      toolModelResult: {
+        id: toolModelResultId,
+        messageRevisionId: resultRevisionId,
+        resultContentType: resultMetadata.content_type,
+        result: resultBytes.toString('utf8')
+      }
+    }), CONTENT_TYPE_TOOL_PAIR);
+    return this.appendOccurrence({
+      conversationId,
+      segmentKind: 'tool_pair',
+      sources: [{ sourceKind: 'tool_model_result', sourceId: toolModelResultId, sourceRevision: callSeq }],
+      content,
+      baseRootId: command.baseRootId,
+      expectedHeadRootId: command.expectedHeadRootId,
+      activate: command.activate,
+      nativePartialPair: 'tool_model_result',
+      executionFence: { callTurnId: turnId }
+    });
+  }
+
+  /**
+   * Read-only guard for an immutable Context prefix (fork/historical cut): every native call
+   * occurrence inside the prefix must have its result occurrence inside the SAME prefix. Ordinary
+   * atomic pairs are closed by construction. Throws NativeAsyncWorkPendingError naming the open
+   * calls; never writes.
+   */
+  public async assertNativeContextClosed(rootIdInput: string, endSegmentIdInput?: string): Promise<void> {
+    const rootId = requireId(rootIdInput, 'rootId');
+    const endSegmentId = endSegmentIdInput === undefined ? undefined : requireId(endSegmentIdInput, 'endSegmentId');
+    const structure = await this.materializeStructure(rootId);
+    const prefixRecords: StructuralContextRecord[] = [];
+    if (endSegmentId === undefined) {
+      prefixRecords.push(...structure.records);
+    } else {
+      let found = false;
+      for (const record of structure.records) {
+        prefixRecords.push(record);
+        if (record.segment.id === endSegmentId) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) throw new Error(`Context root ${rootId} does not contain end segment ${endSegmentId}.`);
+    }
+    const pairRecords = prefixRecords.filter((record) => record.segment.segment_kind === 'tool_pair');
+    if (pairRecords.length === 0) return;
+    const sourceSnapshot = await this.database.snapshot(pairRecords.map((record) =>
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { segment_id: requireId(record.segment.id, 'ContextSegment.id') },
+        orderBy: { column: 'id', direction: 'asc' },
+        limit: 1000
+      })
+    ));
+    const openCalls = new Map<string, string>();
+    const resultSources: ContextSourceOccurrence[] = [];
+    for (const [index, record] of pairRecords.entries()) {
+      const shape = classifyToolPairSources(rows(sourceSnapshot.snapshot[index]).map(contextSourceOccurrence));
+      if (shape.kind === 'atomic') continue;
+      if (shape.kind === 'native_call') {
+        openCalls.set(shape.call.sourceId, requireId(record.segment.id, 'ContextSegment.id'));
+      } else {
+        resultSources.push(shape.result);
+      }
+    }
+    if (openCalls.size === 0 && resultSources.length === 0) return;
+    const resultSnapshot = await this.database.snapshot(resultSources.map((source) =>
+      DOMAIN_REPOSITORIES.domain('ToolModelResult').get(source.sourceId)
+    ));
+    for (const [index, source] of resultSources.entries()) {
+      const result = requireRow(resultSnapshot.snapshot[index], `ToolModelResult ${source.sourceId}`);
+      const ownerCallId = requireId(result.tool_call_id, 'ToolModelResult.tool_call_id');
+      if (!openCalls.delete(ownerCallId)) {
+        throw new Error(`Native ToolModelResult ${source.sourceId} has no call occurrence in this Context prefix.`);
+      }
+    }
+    if (openCalls.size === 0) return;
+    const pending: NativePendingWorkRef[] = [...openCalls.entries()].map(([toolCallId, segmentId]) => ({
+      toolCallId,
+      reason: `result occurrence missing in Context prefix (call segment ${segmentId})`
+    }));
+    throw new NativeAsyncWorkPendingError(
+      pending,
+      'Append the native result occurrences before cutting this Context prefix.'
+    );
+  }
+
   public async materializeStructure(rootId: string): Promise<MaterializedContextStructure> {
     const barrier = await this.database.materializeContext(requireId(rootId, 'rootId'));
     this.observeMetrics({ kind: 'materialize', mode: 'structure', count: 1 });
@@ -784,11 +1077,17 @@ export class ContextSequenceControlPlane {
     };
   }
 
-  /** Prepared steps are committed by TurnControlPlane together with the new MessageRevision. */
+  /** Prepared steps attach a new or already committed MessageRevision atomically with caller state. */
   public async prepareMessageAppendMutation(input: MessageContextAppendPlanInput): Promise<ContextMutationPlan> {
     const conversationId = requireId(input.conversationId, 'conversationId');
     const revisionId = requireId(input.messageRevisionId, 'messageRevisionId');
     const contentObjectId = requireId(input.contentObjectId, 'contentObjectId');
+    const existingRevisionSeq = input.existingRevisionSeq === undefined
+      ? undefined
+      : requireBigInt(input.existingRevisionSeq, 'existingRevisionSeq');
+    if (existingRevisionSeq !== undefined && existingRevisionSeq < 1n) {
+      throw new TypeError('existingRevisionSeq must be positive.');
+    }
     const contentByteLength = requireBigInt(input.contentByteLength, 'contentByteLength');
     if (contentByteLength < 0n) throw new TypeError('contentByteLength must be non-negative.');
     const contentEstimatedTokens = optionalEstimatedTokens(input.contentEstimatedTokens)
@@ -807,9 +1106,16 @@ export class ContextSequenceControlPlane {
     return {
       steps: [
         ...headAssertionSteps(conversationId, head, baseRootId),
+        ...(existingRevisionSeq === undefined ? [] : [
+          DOMAIN_REPOSITORIES.domain('MessageRevision').assert(revisionId, {
+            revision_seq: existingRevisionSeq,
+            content_object_id: contentObjectId
+          })
+        ]),
         ...messageOccurrenceWithAllocatedRevisionSteps({
           segmentId,
           revisionId,
+          existingRevisionSeq,
           contentObjectId,
           now
         }),
@@ -1071,15 +1377,27 @@ export class ContextSequenceControlPlane {
             limit: 1000
           })
         );
-        const callSources = sourceSnapshot.snapshot.filter((source) => source.source_kind === 'tool_call');
-        if (callSources.length === 0) {
-          removedSegmentIds.add(segmentId);
-          continue;
+        // Atomic pairs and native partial occurrences share one owner rule: the assistant Message
+        // that produced the call. A native result-only segment resolves its owner through the
+        // persisted ToolModelResult instead of a call source on the same segment.
+        const shape = classifyToolPairSources(sourceSnapshot.snapshot.map(contextSourceOccurrence));
+        const ownerCallIds: string[] = [];
+        if (shape.kind === 'native_result') {
+          const resultSnapshot = await this.database.snapshot([
+            DOMAIN_REPOSITORIES.domain('ToolModelResult').get(shape.result.sourceId)
+          ]);
+          const result = resultSnapshot.snapshot[0] as DomainRow | null;
+          if (!result) {
+            removedSegmentIds.add(segmentId);
+            continue;
+          }
+          ownerCallIds.push(requireId(result.tool_call_id, 'ToolModelResult.tool_call_id'));
+        } else {
+          ownerCallIds.push(shape.call.sourceId);
         }
         let hasLiveOwner = false;
         const deletedOwners: Array<{ id: string; deletedAt: string }> = [];
-        for (const callSource of callSources) {
-          const toolCallId = requireId(callSource.source_id, 'ContextSegmentSource.source_id');
+        for (const toolCallId of ownerCallIds) {
           const linkSnapshot = await this.database.snapshot([
             DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
               where: { tool_call_id: toolCallId },
@@ -1431,7 +1749,16 @@ export class ContextSequenceControlPlane {
     const conversationId = requireId(planInput.conversationId, 'conversationId');
     const sources = normalizeSources(planInput.sources);
     const segmentKind = requireSegmentKind(planInput.segmentKind);
-    validateNewContextSegmentSources(segmentKind, sources);
+    if (planInput.nativePartialPair === undefined) {
+      validateNewContextSegmentSources(segmentKind, sources);
+    } else if (
+      segmentKind !== 'tool_pair'
+      || sources.length !== 1
+      || sources[0].sourceKind !== planInput.nativePartialPair
+    ) {
+      throw new Error('Native partial tool_pair construction requires its single declared source.');
+    }
+    const fenceSteps = nativeExecutionFenceSteps(planInput.executionFence, conversationId);
     const activate = planInput.activate !== false;
     const head = await this.getHead(conversationId);
     const currentHeadRootId = head ? requireId(head.root_id, 'ConversationContextHeadLink.root_id') : null;
@@ -1453,7 +1780,7 @@ export class ContextSequenceControlPlane {
       const existingRoot = await this.getOptional('ContextSequenceRoot', rootId);
       if (existingNode && existingRoot) {
         return this.replayOrActivateAppend({
-          conversationId, expectedHeadRootId, activate, root: existingRoot, segmentId, nodeId, rootId
+          conversationId, expectedHeadRootId, activate, root: existingRoot, segmentId, nodeId, rootId, fenceSteps
         });
       }
       const tipNodeId = base.compression ? base.tailNodeId : base.rootNodeId;
@@ -1467,7 +1794,8 @@ export class ContextSequenceControlPlane {
             root: base.root,
             segmentId,
             nodeId: tipNodeId,
-            rootId: base.rootId
+            rootId: base.rootId,
+            fenceSteps
           });
         }
       }
@@ -1492,6 +1820,7 @@ export class ContextSequenceControlPlane {
         };
     const steps: RepositoryTransactionStep[] = [
       ...(activate ? headAssertionSteps(conversationId, head, expectedHeadRootId) : []),
+      ...fenceSteps,
       ...preparedContentObjectSteps([planInput.content], 'context_content'),
       ...occurrenceInsertSteps({
         segmentId,
@@ -1533,7 +1862,7 @@ export class ContextSequenceControlPlane {
       const racedRoot = await this.getOptional('ContextSequenceRoot', rootId);
       if (!racedNode || !racedRoot) throw sourceParentConflictError(sources, baseRootId);
       return this.replayOrActivateAppend({
-        conversationId, expectedHeadRootId, activate, root: racedRoot, segmentId, nodeId, rootId
+        conversationId, expectedHeadRootId, activate, root: racedRoot, segmentId, nodeId, rootId, fenceSteps
       });
     }
   }
@@ -1546,6 +1875,7 @@ export class ContextSequenceControlPlane {
     segmentId: string;
     nodeId: string;
     rootId: string;
+    fenceSteps?: RepositoryTransactionStep[];
   }): Promise<ContextAppendResult> {
     if (!input.activate) return this.replayAppend(input.root, input.segmentId, input.nodeId, input.rootId);
     const latestHead = await this.getHead(input.conversationId);
@@ -1556,6 +1886,7 @@ export class ContextSequenceControlPlane {
     if (latestHeadRootId !== input.expectedHeadRootId) throw staleHeadError(input.conversationId);
     const commit = await this.database.transaction([
       ...headAssertionSteps(input.conversationId, latestHead, input.expectedHeadRootId),
+      ...(input.fenceSteps ?? []),
       ...headMutationSteps(input.conversationId, latestHead, input.rootId, this.timestamp())
     ]);
     this.observeMetrics({ kind: 'transaction', operation: 'activate', count: 1 });
@@ -1641,6 +1972,16 @@ export class ContextSequenceControlPlane {
     return (snapshot.snapshot[0] as DomainRow | null) ?? null;
   }
 
+  private async requireContentObjectMetadata(id: string): Promise<ContentObjectMetadata> {
+    const row = await this.getOptional('ContentObject', id);
+    if (!row) throw new Error(`ContentObject ${id} does not exist.`);
+    return asContentObjectMetadata(row);
+  }
+
+  private async eventContentMetadata(event: DomainRow): Promise<ContentObjectMetadata> {
+    return this.requireContentObjectMetadata(requireId(event.content_object_id, 'ToolCallEvent.content_object_id'));
+  }
+
   private replayAppend(root: DomainRow, segmentId: string, nodeId: string, rootId: string): ContextAppendResult {
     return {
       segmentId,
@@ -1701,9 +2042,18 @@ interface PlannedNode {
 function messageOccurrenceWithAllocatedRevisionSteps(input: {
   segmentId: string;
   revisionId: string;
+  existingRevisionSeq?: bigint;
   contentObjectId: string;
   now: string;
 }): RepositoryTransactionStep[] {
+  const source = {
+    id: stableId('context_segment_source', 'message_revision', input.revisionId),
+    segment_id: input.segmentId,
+    source_kind: 'message_revision',
+    source_id: input.revisionId,
+    created_at: input.now
+  };
+  const sourceRepository = DOMAIN_REPOSITORIES.domain('ContextSegmentSource');
   return [savepoint('edited_message_context_occurrence', [
     DOMAIN_REPOSITORIES.domain('ContextSegment').insert({
       id: input.segmentId,
@@ -1711,13 +2061,9 @@ function messageOccurrenceWithAllocatedRevisionSteps(input: {
       segment_kind: 'message',
       created_at: input.now
     }),
-    DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insertMessageContextSourceForRevision({
-      id: stableId('context_segment_source', 'message_revision', input.revisionId),
-      segment_id: input.segmentId,
-      source_kind: 'message_revision',
-      source_id: input.revisionId,
-      created_at: input.now
-    }, input.revisionId)
+    input.existingRevisionSeq === undefined
+      ? sourceRepository.insertMessageContextSourceForRevision(source, input.revisionId)
+      : sourceRepository.insert({ ...source, source_revision: input.existingRevisionSeq })
   ], {
     kind: 'rollback-and-continue-on-unique',
     constraints: EXPECTED_OCCURRENCE_CONSTRAINTS
@@ -1886,6 +2232,83 @@ export function validateScopedContextSegmentSources(
   sources: readonly ContextSourceOccurrence[]
 ): void {
   validateContextSegmentSourceShape(kind, sources);
+}
+
+/** Classified source shape of one persisted tool_pair segment. */
+export type ContextToolPairSourceShape =
+  | { kind: 'atomic'; call: ContextSourceOccurrence; result: ContextSourceOccurrence }
+  | { kind: 'native_call'; call: ContextSourceOccurrence }
+  | { kind: 'native_result'; result: ContextSourceOccurrence };
+
+/**
+ * Classifies the sources of a persisted tool_pair segment. Atomic pairs keep the exact legacy
+ * rule; native partial occurrences carry exactly one source and are only ever committed through
+ * the admission-proving native append path, so readers may trust a persisted partial shape.
+ */
+export function classifyToolPairSources(
+  sources: readonly ContextSourceOccurrence[]
+): ContextToolPairSourceShape {
+  if (
+    sources.length === 2
+    && sources[0].sourceKind === 'tool_call'
+    && sources[1].sourceKind === 'tool_model_result'
+  ) {
+    if (sources[0].sourceRevision !== sources[1].sourceRevision) {
+      throw new Error('tool_pair source rows must share call_seq source_revision.');
+    }
+    return { kind: 'atomic', call: sources[0], result: sources[1] };
+  }
+  if (sources.length === 1 && sources[0].sourceKind === 'tool_call') {
+    return { kind: 'native_call', call: sources[0] };
+  }
+  if (sources.length === 1 && sources[0].sourceKind === 'tool_model_result') {
+    return { kind: 'native_result', result: sources[0] };
+  }
+  throw new Error('tool_pair requires tool_call and tool_model_result source rows, or one native partial source row.');
+}
+
+/** Maps one persisted ContextSegmentSource row to its occurrence identity. */
+function contextSourceOccurrence(row: DomainRow): ContextSourceOccurrence {
+  return {
+    sourceKind: requireSourceKind(row.source_kind),
+    sourceId: requireId(row.source_id, 'ContextSegmentSource.source_id'),
+    sourceRevision: requireBigInt(row.source_revision, 'ContextSegmentSource.source_revision')
+  };
+}
+
+/** Requires exactly one durable native admission event for a native ToolCall fact. */
+function requireNativeAdmissionEvent(toolCallId: string, events: readonly DomainRow[]): DomainRow {
+  if (events.length !== 1) {
+    throw new Error(
+      `ToolCall ${toolCallId} has ${events.length === 0 ? 'no' : 'multiple'} durable native admission event(s); native Context occurrences require exactly one.`
+    );
+  }
+  return events[0];
+}
+
+/**
+ * Atomic execution-fence steps of a native append. An ambient captured lease fence needs no extra
+ * step here: RuntimeDatabase.transaction already prepends its full immutable tuple assertion in
+ * this ALS scope (only the Conversation attribution is prechecked for a clear error). The unfenced
+ * terminal closure branch asserts the absence of any Conversation ExecutionLease plus a terminated
+ * originating Turn.
+ */
+function nativeExecutionFenceSteps(
+  executionFence: AppendOccurrencePlan['executionFence'],
+  conversationId: string
+): RepositoryTransactionStep[] {
+  if (!executionFence) return [];
+  const fence = currentExecutionLeaseFence();
+  if (fence) {
+    if (fence.conversationId !== conversationId) {
+      throw new Error('Native Context append fence belongs to another Conversation.');
+    }
+    return [];
+  }
+  return [
+    DOMAIN_REPOSITORIES.domain('ExecutionLease').assertNone({ conversation_id: conversationId }),
+    DOMAIN_REPOSITORIES.domain('Turn').assert(executionFence.callTurnId, { status: 'terminated' })
+  ];
 }
 
 function validateContextSegmentSourceShape(

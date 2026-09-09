@@ -5,6 +5,10 @@ import {
   requireChildExecutionStatus
 } from './childExecutionState';
 import {
+  TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION,
+  TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+} from './nativeToolFacts';
+import {
   isTransactionAssertionFailure,
   sqliteUniqueFailureIncludes,
   stablePhaseFId
@@ -16,6 +20,7 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+
 
 export type AutomaticRuntimeDeliveryReason =
   | 'source_turn_active'
@@ -88,6 +93,20 @@ export class AutomaticRuntimeDeliveryRouter {
     if (turn.status !== 'active' || request.turn_id !== turnId || request.status !== 'terminal') {
       return { established: false, fenceId };
     }
+    // Legacy rule: a final-output fence requires a no-tool-call request. The native exception must
+    // atomically prove every candidate-linked call terminal, context-closed and server-admitted —
+    // anything less stays fail-closed and the Turn continues with a carrier request instead.
+    const sourceLinks = await this.list('ToolCallSourceLink', { model_request_id: modelRequestId }, 500);
+    let callGuardSteps: RepositoryTransactionStep[];
+    if (sourceLinks.length === 0) {
+      callGuardSteps = [
+        DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').assertNone({ model_request_id: modelRequestId })
+      ];
+    } else {
+      const proof = await this.buildNativeDeliveredCallGuard(sourceLinks);
+      if (!proof) return { established: false, fenceId };
+      callGuardSteps = proof;
+    }
     const now = new Date().toISOString();
     try {
       await this.database.transaction([
@@ -97,7 +116,7 @@ export class AutomaticRuntimeDeliveryRouter {
           turn_id: turnId,
           status: 'terminal'
         }),
-        DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').assertNone({ model_request_id: modelRequestId }),
+        ...callGuardSteps,
         DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertNone({
           target_turn_id: turnId,
           phase: 'current_turn',
@@ -129,6 +148,68 @@ export class AutomaticRuntimeDeliveryRouter {
       ])) return { established: false, fenceId };
       throw error;
     }
+  }
+
+  /**
+   * Atomic guard replacing the no-tool-call assertNone for a completed native logical request.
+   * Returns the frozen assertion steps only when EVERY linked call is durably admitted, terminal,
+   * settled with its result occurrence appended, and server-admission delivered. The proof freezes
+   * the exact row identities it relied on, so a concurrent fact change fails the transaction
+   * instead of slipping a half-proven fence through.
+   */
+  private async buildNativeDeliveredCallGuard(
+    sourceLinks: readonly DomainRow[]
+  ): Promise<RepositoryTransactionStep[] | null> {
+    const steps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').assertExactIds(
+        { model_request_id: requireId(sourceLinks[0].model_request_id, 'ToolCallSourceLink.model_request_id') },
+        sourceLinks.map((link) => requireId(link.id, 'ToolCallSourceLink.id'))
+      )
+    ];
+    for (const link of sourceLinks) {
+      const toolCallId = requireId(link.tool_call_id, 'ToolCallSourceLink.tool_call_id');
+      const [call, results, admissions, deliveries] = await Promise.all([
+        this.maybeGet('ToolCall', toolCallId),
+        this.list('ToolModelResult', { tool_call_id: toolCallId }, 2),
+        this.list('ToolCallEvent', {
+          tool_call_id: toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
+        }, 2),
+        this.list('ToolCallEvent', {
+          tool_call_id: toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+        }, 2)
+      ]);
+      if (!call || call.status !== 'terminal') return null;
+      if (results.length !== 1) return null;
+      if (admissions.length !== 1 || deliveries.length !== 1) return null;
+      const resultId = requireId(results[0].id, 'ToolModelResult.id');
+      const contextSources = await this.list('ContextSegmentSource', {
+        source_kind: 'tool_model_result',
+        source_id: resultId
+      }, 2);
+      if (contextSources.length !== 1) return null;
+      steps.push(
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: call.status }),
+        DOMAIN_REPOSITORIES.domain('ToolModelResult').assertExactIds(
+          { tool_call_id: toolCallId },
+          [resultId]
+        ),
+        DOMAIN_REPOSITORIES.domain('ContextSegmentSource').assertExactIds(
+          { source_kind: 'tool_model_result', source_id: resultId },
+          [requireId(contextSources[0].id, 'ContextSegmentSource.id')]
+        ),
+        DOMAIN_REPOSITORIES.domain('ToolCallEvent').assertExactIds(
+          { tool_call_id: toolCallId, event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION },
+          [requireId(admissions[0].id, 'ToolCallEvent.id')]
+        ),
+        DOMAIN_REPOSITORIES.domain('ToolCallEvent').assertExactIds(
+          { tool_call_id: toolCallId, event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY },
+          [requireId(deliveries[0].id, 'ToolCallEvent.id')]
+        )
+      );
+    }
+    return steps;
   }
 
   public async resolve(input: {

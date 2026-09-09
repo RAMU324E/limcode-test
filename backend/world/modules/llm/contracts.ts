@@ -12,6 +12,11 @@ export interface ToolSchema {
   name: string;
   description: string;
   parameters: unknown;
+  /**
+   * Astra 原生异步声明（per-tool nativeAsync 策略解析结果）。仅在目标 capability.asyncTools
+   * 为真时才会编码到线上；其他 provider/模型永远看不到该标记。
+   */
+  async?: boolean;
 }
 
 export interface LlmStartRequest {
@@ -36,7 +41,17 @@ export interface LlmStartRequest {
    */
   openAIResponsesContinuation?: {
     volatileTailContentKinds: Array<'current_turn_input' | 'turn_reminder'>;
+    /**
+     * 压缩后显式 rebase 等场景要求硬重开链：不带 previous_response_id、发送完整持久化输入、
+     * 重置 continuation 基线。仅作为传输决策原因传递，不改变普通请求内容。
+     */
+    forceFullReason?: string;
   };
+  /**
+   * 持久化准入的原生异步调用 ID（provider call_id）。仅这些调用允许在 contents 中
+   * 保持 pending-without-result；普通未决/孤儿/错配调用仍然失败。缺省 = 无例外。
+   */
+  nativeAsyncAdmittedCallIds?: readonly string[];
 }
 
 export interface LlmResolveInvocationRequest {

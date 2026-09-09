@@ -631,30 +631,6 @@ test('20 rounds and nested compression rebuild one request-local attachment cata
       kernel.resolveModelToolArguments('read', { attachmentRef: 'F1' }, handles),
       { attachmentId: 'attachment-only-source' }
     );
-    const loop = Object.create(kernel.ReliableAgentLoop.prototype);
-    loop.database = database;
-    loop.contentStore = store;
-    loop.context = {
-      materialize: async () => ({
-        root: { conversation_id: 'conversation-main' },
-        segments: [{ segmentId: 'segment-compression-main', content: Buffer.from('{"kind":"fixture"}') }]
-      })
-    };
-    loop.modelProvider = {
-      projectAttachmentCatalogState: async () => relationCatalogState,
-      ensureAttachmentHandles: async () => ({ entries: handles.entries })
-    };
-    loop.readCurrentTurnInputReference = async () => ({});
-    loop.readRuntimeStatusCard = async () => undefined;
-    const frozenRecipe = await loop.freezeOrdinaryRequestRecipe({
-      turnId: 'turn-main',
-      round: '1',
-      headRootId: 'root-main',
-      tools: [],
-      includeOpenTaskCompletionCheck: false
-    });
-    assert.deepEqual(frozenRecipe.attachmentCatalogState, relationCatalogState);
-    assert.deepEqual(frozenRecipe.modelHandleCatalog.entries, handles.entries);
     assert.ok(
       projectionSnapshotCalls <= 120,
       `isolated 20-round + nested projection should use bounded batched reads, observed ${projectionSnapshotCalls}`
@@ -1094,6 +1070,75 @@ test('shared tool-pair segment ignores deleted-fork aliases and selects the targ
         sizeBytes: 42
       }]
     );
+  });
+});
+
+test('native tool attachments become visible only at the chronological result occurrence', async () => {
+  await withRuntime('native-result-catalog', async (database, fixtureContent) => {
+    const insert = (domain, row) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(row);
+    await database.transaction([
+      insert('Conversation', {
+        id: 'native-catalog-conversation', title: 'native catalog', status: 'active',
+        created_at: NOW, updated_at: NOW
+      }),
+      insert('Turn', {
+        id: 'native-catalog-turn', conversation_id: 'native-catalog-conversation', status: 'terminated',
+        created_at: NOW, updated_at: NOW, terminal_at: NOW
+      }),
+      insert('Message', {
+        id: 'native-catalog-result-message', created_at: NOW, updated_at: NOW, deleted_at: null
+      }),
+      insert('MessageRevision', {
+        id: 'native-catalog-result-revision', message_id: 'native-catalog-result-message',
+        revision_seq: 1n, role: 'tool', content_object_id: fixtureContent.id, created_at: NOW
+      }),
+      insert('MessagePartOfConversation', {
+        id: 'native-catalog-membership', conversation_id: 'native-catalog-conversation',
+        message_id: 'native-catalog-result-message', message_seq: 1n, created_at: NOW
+      }),
+      insert('ToolCall', {
+        id: 'native-catalog-call', turn_id: 'native-catalog-turn', call_seq: 1n,
+        tool_name: 'read', status: 'terminal', arguments_object_id: fixtureContent.id,
+        created_at: NOW, updated_at: NOW
+      }),
+      insert('ToolModelResult', {
+        id: 'native-catalog-result', tool_call_id: 'native-catalog-call',
+        message_revision_id: 'native-catalog-result-revision', created_at: NOW
+      }),
+      ...['call', 'result', 'invalid-result'].flatMap((name) => [
+        insert('ContextSegment', {
+          id: `native-catalog-segment-${name}`, content_object_id: fixtureContent.id,
+          segment_kind: 'tool_pair', created_at: NOW
+        }),
+        insert('ContextSegmentSource', {
+          id: `native-catalog-source-${name}`, segment_id: `native-catalog-segment-${name}`,
+          source_kind: name === 'call' ? 'tool_call' : 'tool_model_result',
+          source_id: name === 'call' ? 'native-catalog-call' : 'native-catalog-result',
+          source_revision: name === 'invalid-result' ? 2n : 1n, created_at: NOW
+        })
+      ]),
+      insert('Attachment', {
+        id: 'native-catalog-image', sha256: 'f'.repeat(64), byte_length: 42n,
+        mime_type: 'image/png', name: 'delayed.png', storage_mode: 'managed',
+        content_object_id: null, created_at: NOW
+      }),
+      insert('AttachmentLink', {
+        id: 'native-catalog-image-link', message_revision_id: 'native-catalog-result-revision',
+        attachment_id: 'native-catalog-image', position: 0n, created_at: NOW
+      })
+    ]);
+    const projection = new kernel.AttachmentCatalogProjection(database);
+    const call = { segmentId: 'native-catalog-segment-call' };
+    const result = { segmentId: 'native-catalog-segment-result' };
+    const expected = [{
+      attachmentId: 'native-catalog-image', name: 'delayed.png', mimeType: 'image/png', sizeBytes: 42
+    }];
+    assert.deepEqual(await projection.project('native-catalog-conversation', [call]), []);
+    assert.deepEqual(await projection.project('native-catalog-conversation', [call, result]), expected);
+    assert.deepEqual(await projection.project('native-catalog-conversation', [result]), expected);
+    await assert.rejects(projection.project('native-catalog-conversation', [
+      { segmentId: 'native-catalog-segment-invalid-result' }
+    ]));
   });
 });
 

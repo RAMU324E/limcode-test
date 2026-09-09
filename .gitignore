@@ -35,6 +35,7 @@ docs/architecture/*
 !/tests/processSpoolCleanup.test.cjs
 !/tests/openAIResponsesWebSocket.test.cjs
 !/tests/openAIResponsesWebSocketSession.test.cjs
+!/tests/openAIResponsesWebSocketNative.test.cjs
 !/tests/runAgentToolSchema.test.cjs
 !/tests/settingsRevisionConflict.test.cjs
 !/tests/webviewLocalResources.test.cjs
@@ -44,6 +45,8 @@ docs/architecture/*
 !/tests/reliable-kernel/canonical-base64.test.mjs
 !/tests/reliable-kernel/compression-progress-ui.test.mjs
 !/tests/reliable-kernel/configuration-authority.test.mjs
+!/tests/reliable-kernel/global-settings-live-save.test.mjs
+!/tests/reliable-kernel/request-compression-settings.test.mjs
 !/tests/reliable-kernel/context-token-estimator.test.mjs
 !/tests/reliable-kernel/conversation-fork-context.test.mjs
 !/tests/reliable-kernel/current-turn-task-projection.test.mjs
@@ -55,6 +58,12 @@ docs/architecture/*
 !/tests/reliable-kernel/llm-capability-provider-adapter.test.mjs
 !/tests/reliable-kernel/model-system-prompt-prefix.test.mjs
 !/tests/reliable-kernel/native-compact-media.test.mjs
+!/tests/reliable-kernel/native-astra-integration.test.mjs
+!/tests/reliable-kernel/native-tool-admission.test.mjs
+!/tests/reliable-kernel/native-compression-guard.test.mjs
+!/tests/reliable-kernel/native-provider-capability.test.mjs
+!/tests/reliable-kernel/native-request-orchestration.test.mjs
+!/tests/reliable-kernel/llm-provider-configs-native.test.mjs
 !/tests/reliable-kernel/product-composition.test.mjs
 !/tests/reliable-kernel/phase-b-foundation.test.mjs
 !/tests/reliable-kernel/streaming-output-regressions.test.mjs
@@ -77,11 +86,13 @@ docs/architecture/*
 !/tests/reliable-kernel/guidance-queue.test.mjs
 !/tests/reliable-kernel/workspace-runtime-isolation.test.mjs
 !/tests/reliable-kernel/vscode-fs-local-read.test.cjs
+!/tests/reliable-kernel/claude-cross-model-thinking-replay.test.mjs
 !/tests/vscodeStorageJsonDurability.test.cjs
 !/webview/tests/
 /webview/tests/*
 !/webview/tests/segmentedTimeline.test.ts
 !/webview/tests/reliableConversationProjection.test.ts
+!/webview/tests/nativeConversationProjection.test.ts
 /scripts/reliable-kernel/concurrency-read-*.json
 /scripts/reliable-kernel/concurrency-tuning-*.json
 /scripts/reliable-kernel/model-independent-hotpaths-after.json

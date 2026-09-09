@@ -99,6 +99,16 @@ storage.loadActiveLlmProviderConfig()
 
 这样 LLM capability 只拿当前激活的模型连接配置；未来 Agent / Workflow / 其他对象如需复用某个渠道，应通过独立 Link/关系数据引用配置 id，不要把渠道配置嵌进 Agent 或 Conversation。
 
+### 4.1 Astra 原生 Responses 配置
+
+- `LlmProviderConfigRecord.nativeResponses` 与模型专属配置的同名字段只保存 `enabled`、`asyncTools`、`steering`、`reasoningUpdates`、`multiplexing` 布尔选项；仍通过 `llmProviderConfigs` section 保存，不新增 Bridge CRUD 或数据目录。
+- 模型专属配置完整替代渠道默认配置，不在读取时偷偷继承原生开关。后端归一化、前端 `normalizeModelConfigForUi`、`toPlainModelConfig` 都必须保留这些字段；创建模型配置时的显式复制与运行时继承不同。
+- 能力只对 OpenAI Responses 的精确 Astra 型号及受支持快照开放。官方渠道可按渠道默认启用；第三方中继必须显式确认支持。HTTP/SSE 支持原生工具续接与动态推理；回合内转向和命名通道多路复用只在 WebSocket 模式开放。
+- 显式缓存复用 `promptCache`：`enabled`、`mode: 'explicit'`、`ttl: '30m'`。线级使用 `prompt_cache_options` 和符合条件的内容断点，不把旧 `prompt_cache_retention` 当作等价配置。
+- 每个工具的异步许可独立保存在 `ToolPolicy.toolConfigs[toolName].nativeAsync`。它不改变执行审批、变更应用、结果回传审批或调度策略；冻结工具定义中的 `metadata.nativeAsync` 经适配器映射为 `ToolSchema.async`，最终才成为线级声明的 `async`。
+- 配置编辑只影响后续冻结请求。聊天中的转向按钮读取当前 `ModelRequest.stream_stats_json.nativeCapabilities`，不能从尚未生效的可编辑设置推断当前连接能力。
+- 保存与重载必须保留模型级原生配置；发送前继续使用专用 plain-data 转换，禁止把 Pinia/Vue Proxy 放进 bridge payload。
+
 ## 5. 前端对接标准
 
 1. 页面组件不要直接调用 bridge，统一通过对应 Pinia store action。
@@ -122,13 +132,16 @@ storage.loadActiveLlmProviderConfig()
 7. 是否通过 getPaths() 获取路径？
 ```
 
-## 7. 压缩时限设置
+## 7. 压缩保留量与时限设置
 
-- 设置入口位于渠道默认配置和 LLM 专属配置的“上下文压缩”模块末尾，复用 `LlmCompressionSettingsEditor`。
+- 压缩时限入口位于渠道默认配置和 LLM 专属配置的“上下文压缩”模块末尾，复用 `LlmCompressionSettingsEditor`。
 - `LlmCompressionConfigRecord.maxDurationMinutes` 表示一次压缩尝试的总时限，单位为整数分钟，默认 `20`，范围 `1–1440`；空值或非数值使用默认值。
 - 该字段属于现有 `llmCompressionConfigs` record，通过原有全局设置更新通道、独立 record 存储及修订检查保存；渠道与模型仍复用现有绑定和写时复制规则。
-- 时限随 Turn 的 compression authority 冻结。修改在使用新配置快照的回合生效，不读取实时设置来改变在途请求或自动重试。
+- 压缩时限在建立请求时通过独立设置引用冻结；修改只影响后续新建请求，不改变在途压缩或其自动重试。
 - 此设置只影响压缩请求，不改变普通聊天的 20 分钟总时限，也不改变压缩连续 270 秒无真实文本或思考进度的超时保护。每次自动重试重新计时，重试预算与取消机制保持不变。
+- `LlmCompressionConfigRecord.bodyTargetTokens` 是文字压缩后保留的对话主体 Token 目标，默认 `48000`；实际预算仍受 Provider 实测校准与触发阈值以下剩余空间的一半限制。
+- 保留量复用同一配置 record 和渠道/模型绑定。前端 `toPlainCompressionConfig` 与后端 `normalizeLlmCompressionConfig` 必须保留该字段，并复用 `normalizeLlmCompressionBodyTargetTokens`；否则保存回包会把用户修改还原为默认值。
+- 保留量与压缩时限一样在请求建立时冻结：保存影响同一任务的后续请求，旧请求重放继续采用原值。
 
 ## 8. Ask / Plan 无人值守审批
 
@@ -138,3 +151,11 @@ storage.loadActiveLlmProviderConfig()
 - Plan 自动批准后在当前会话继续，不创建新的子 Agent；子 Agent 按父任务授权自动批准 Plan 的既有行为不变。
 - Ask 自动返回明确标记为系统回复的自主决策指引，不代选第一个选项、不伪造用户具体回答。需要人工提供凭据或关键决策的任务不宜开启。
 - 自动响应仍保存 InteractionRequest / InteractionResponse / OperationResolution，保留首响应优先、恢复和取消语义；不绕过工具禁用、命令执行或文件修改审批。
+
+## 9. 保存确认与执行时机
+
+1. 自动保存延迟只合并编辑，不代表保存完成。新输入、重新生成、编辑后执行或手动压缩开始前，宿主通过 `settings.global.flush/result` 等待已就绪页面提交相关设置。该消息只协调保存完成，配置内容仍走既有 get/update/snapshot，不增加配置存储入口。
+2. 保存回应必须关联原请求。五秒未确认时读取磁盘核对；再等待五秒仍失败则明确报错并保留表单。不能盲目认定已成功，也不能清空未保存内容。
+3. 转换为普通传输数据的函数必须没有副作用，尤其不能把 updatedAt 改成当前时间。前端只在真实编辑时更新修改时间；后台保存产生的记录时间差异不参与设置内容比较或冲突判定。
+4. 新压缩请求读取当前模型对应的最新压缩设置，并通过已有单次请求设置引用固定；其重试、恢复和历史重放不读取后来改动的设置。模型身份、权限和历史基础配置不被覆盖。
+5. 聊天中的当前配置和最近请求实际采用配置分开显示。外观等即时页面设置与模型请求设置不能混为同一种生效时机。

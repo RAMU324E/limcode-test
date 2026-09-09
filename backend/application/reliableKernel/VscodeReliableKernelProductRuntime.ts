@@ -271,6 +271,7 @@ export class VscodeReliableKernelProductRuntime {
     try {
       application = await ReliableKernelApplication.open(authority, {
         authorityCompiler: configuration,
+        compressionSettingsAuthority: configuration,
         resolveWorkEnvironment: async (workEnvironmentId) => {
           const environment = await configuration.workEnvironment(workEnvironmentId);
           if (!environment.available || environment.kind !== 'localFolder' || !environment.rootPath) return undefined;

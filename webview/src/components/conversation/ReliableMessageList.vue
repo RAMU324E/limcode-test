@@ -19,6 +19,7 @@ import {
   hasVisibleStreamingTransientForTurn,
   reliableRetryStreamingActivityLabel
 } from '@webview/domain/reliableTransientActivity';
+import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
 import MessageItem from './MessageItem.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
@@ -527,20 +528,6 @@ function timelineFloor(message: MessageRecord, visibleIndex: number): number {
   return absoluteTimelineFloor(projected, segmentStart.value + visibleIndex + 1);
 }
 
-function modelRequestStreamStats(request: Record<string, unknown>): Record<string, unknown> | undefined {
-  const raw = request.stream_stats_json;
-  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>;
-  if (typeof raw !== 'string') return undefined;
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function formatActivityTime(value: number): string {
   const date = new Date(value);
   return Number.isFinite(date.getTime())
@@ -636,7 +623,7 @@ function messageRenderKey(message: MessageRecord): string {
         :mutation-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
         :retry-blocked="retryBlocked(message)"
         :compact-blocked="(conversationActionPending && isConversationActionTarget(message)) || !projection.messageRevisionIdByMessageId[message.id]"
-        :fork-blocked="forkPendingTargetIds.has(message.id) || !projection.messageRevisionIdByMessageId[message.id]"
+        :fork-blocked="forkPendingTargetIds.has(message.id) || !projection.messageRevisionIdByMessageId[message.id] || message.status === 'streaming'"
         :pending-label="conversationActionLabel ?? '正在提交操作'"
         :floor-number="timelineFloor(message, index)"
         @edit-message="emit('edit-message', message, deleteCount(message))"

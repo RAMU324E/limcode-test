@@ -31,6 +31,7 @@ import {
   type McpMemoryConnectionRegistry
 } from './mcpEffects';
 import { ModelProviderControlPlane } from './modelProviderControlPlane';
+import type { CompressionSettingsAuthority } from './requestCompressionSettings';
 import { PhaseDRecoveryScanner, type PhaseDRecoveryResult } from './phaseDRecovery';
 import { type PhaseFRecoveryResult } from './phaseFRecovery';
 import { ProcessControlPlane } from './processEffects';
@@ -75,6 +76,7 @@ function missingMcpPolicyGate(): never {
 
 export interface ReliableKernelApplicationDependencies {
   authorityCompiler: TurnAuthorityCompiler;
+  compressionSettingsAuthority?: CompressionSettingsAuthority;
   resolveWorkEnvironment: WorkEnvironmentBoundaryResolver;
   mcpConnections: McpMemoryConnectionRegistry;
   mcpPolicyGate?: McpExistingPolicyGate;
@@ -167,7 +169,11 @@ export class ReliableKernelApplication {
     this.conversationDeletion = new ConversationDeletionControlPlane(database);
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
     this.compression = new ContextCompressionControlPlane(database, contentStore, options);
-    this.modelProvider = new ModelProviderControlPlane(database, contentStore, options);
+    this.modelProvider = new ModelProviderControlPlane(database, contentStore, {
+      ...options,
+      attachments: this.attachments,
+      compressionSettingsAuthority: dependencies.compressionSettingsAuthority
+    });
     this.compressionCoordinator = new ReliableContextCompressionCoordinator(
       database,
       contentStore,

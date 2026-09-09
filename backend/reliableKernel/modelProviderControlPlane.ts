@@ -52,15 +52,36 @@ import {
   frozenCompressionPolicy,
   frozenContextProfile,
   frozenModelIdentity,
+  frozenModelSelection,
   frozenProviderRetryPolicy,
   readFrozenTurnAuthority,
   type FrozenProviderRetryPolicy
 } from './frozenAuthority';
 import {
+  applyRequestCompressionSettings,
+  readRequestTurnAuthority,
+  type CompressionSettingsAuthority
+} from './requestCompressionSettings';
+import {
   ExecutionHandoffError,
   handoffReason,
-  isExecutionHandoffError
+  isExecutionHandoffError,
+  runWithExecutionLeaseFence,
+  type ExecutionLeaseFence
 } from './executionLeaseFence';
+import type { OpenAIResponsesNativeHooks } from '../capabilities/openAIResponsesNativeControl';
+import type {
+  OpenAIResponsesNativeCapabilities,
+  OpenAIResponsesToolOutput
+} from '../../shared/openAIResponsesNative';
+import type { MessageContent } from '../../shared/protocol';
+import {
+  NativeSteeringStore,
+  type NativeSteeringReceipt,
+  type NativeSteeringUpdate
+} from './nativeSteering';
+import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
+import type { AttachmentIngestService } from './attachmentIngest';
 
 export interface CreateModelRequestCommand {
   turnId: string;
@@ -107,6 +128,12 @@ export interface FullProviderRequest {
   context: FullProviderContextItem[];
   /** Frozen relation-derived model state; never persisted in Context or compression envelopes. */
   attachmentCatalogState: AttachmentCatalogState;
+  /**
+   * Provider call ids of durably native-admitted ToolCalls of this Conversation. The Provider
+   * requires capability + historical async evidence + membership in this list before projecting
+   * async-marked call items; populated only for native-frozen requests.
+   */
+  nativeAsyncAdmittedCallIds?: readonly string[];
   requestAddenda?: {
     currentTurnInput?: {
       messageId: string;
@@ -126,7 +153,7 @@ export interface FullProviderRequest {
   };
 }
 
-export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed';
+export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed' | 'native_control';
 export const PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE = 'partial_output_snapshot';
 export type ProviderTransientTerminalEventKind = 'failed' | 'cancelled';
 export type ProviderStreamEventKind = ProviderOutputStreamEventKind | ProviderTransientTerminalEventKind;
@@ -140,6 +167,11 @@ export interface ProviderStreamEvent {
   /** Process-local signal: false for synthetic clocks such as thought_progress. Never persisted. */
   semanticProgress?: boolean;
 }
+
+/** Native control is durable authority, never a client transient replay event. */
+export type ProviderTransientStreamEvent = Omit<ProviderStreamEvent, 'kind'> & {
+  kind: Exclude<ProviderStreamEventKind, 'native_control'>;
+};
 
 export interface ProviderStreamTiming {
   providerStartedAt?: number;
@@ -160,6 +192,8 @@ export interface ProviderTransientTerminalObservation {
 
 export interface ProviderDispatchControls {
   signal?: AbortSignal;
+  /** Process-local Astra native hooks; forwarded by the Provider adapter, never serialized. */
+  native?: OpenAIResponsesNativeHooks;
   onEvent(event: ProviderOutputStreamEvent): Promise<StreamEventResult>;
   onCompressionProgress?(streamSeq: string | bigint): Promise<void>;
 }
@@ -170,6 +204,14 @@ export interface FullRequestProviderAdapter {
   /** Optional exact projection hook. Production adapters use the same projected input for this and send. */
   estimateFullRequestInput?(request: FullProviderRequest): ProjectedRequestTokenBreakdown;
   sendFullRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
+  /**
+   * Astra native tool-result wire conversion with original call identity. Required on the native
+   * path: managed image/file blocks become valid Responses input blocks; text passes through;
+   * unresolvable references throw (never a silent JSON.stringify fallback).
+   */
+  materializeNativeToolOutput?(
+    outputs: readonly OpenAIResponsesToolOutput[]
+  ): Promise<readonly OpenAIResponsesToolOutput[]>;
 }
 
 export class ModelRequestPreflightError extends Error {
@@ -237,6 +279,28 @@ export interface CompletedModelRequestEvent {
   usage?: PlainJsonValue;
 }
 
+/** One-object steering command; content is a single full MessageContent (composer attachments included). */
+export interface NativeSteerCommand {
+  commandId: string;
+  conversationId: string;
+  turnId: string;
+  /** ExecutionLease generation captured by the caller's Turn view; proves the command targets the live owner. */
+  leaseEpoch: string | bigint;
+  content: MessageContent;
+}
+
+/** Registered by the Agent loop's native session while its dispatch owns a live native chain. */
+export interface NativeSteeringSessionHandle {
+  conversationId: string;
+  turnId: string;
+  modelRequestId: string;
+  /** Execution authority captured when the native controller registered; never re-read later. */
+  fence: ExecutionLeaseFence;
+  steer(command: NativeSteerCommand): Promise<NativeSteeringReceipt>;
+}
+
+export type { NativeSteeringReceipt, NativeSteeringUpdate };
+
 export type ProviderTransientReason =
   | 'connection_interrupted'
   | 'rate_limited'
@@ -257,6 +321,14 @@ export class ProviderTransientError extends Error {
   }
 }
 
+type ModelStreamCheckpointKind =
+  | 'output_delta'
+  | 'output_item_done'
+  | 'native_control'
+  | 'native_tool_call'
+  | 'partial_summary'
+  | 'terminal_summary';
+
 interface StreamStats {
   attemptSeq: string;
   socketGeneration: string;
@@ -271,6 +343,13 @@ interface StreamStats {
   /** Low-frequency metadata-only liveness marker; never contains Provider output bytes. */
   lastStreamSeq?: string;
   lastStreamEventAt?: number;
+  /** Frozen native capability summary persisted from an accepted response.created; UI gating only. */
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities;
+  /**
+   * The FIRST physical response's actual usage.input_tokens of a native logical chain. Calibrates
+   * the original ModelContextProjection root; never substituted by later/cumulative usage.
+   */
+  nativeInitialPromptTokenCount?: number;
 }
 
 interface StreamIdentity {
@@ -331,8 +410,13 @@ export class ModelProviderControlPlane {
   private readonly semanticTimeouts: ProviderSemanticTimeouts;
   private readonly retryDelaysMs: readonly number[];
   private readonly adapterDrainTimeoutMs: number;
+  private readonly compressionSettingsAuthority?: CompressionSettingsAuthority;
   private readonly activeSockets = new Map<string, Set<AbortController>>();
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
+  private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
+  private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
+  /** Durable Astra steering submissions/receipts; shared with the Agent loop's native session. */
+  public readonly nativeSteering: NativeSteeringStore;
   private handoff: ExecutionHandoffError | undefined;
 
   public constructor(
@@ -344,9 +428,12 @@ export class ModelProviderControlPlane {
       semanticTimeouts?: Partial<ProviderSemanticTimeouts>;
       retryDelaysMs?: readonly number[];
       adapterDrainTimeoutMs?: number;
+      compressionSettingsAuthority?: CompressionSettingsAuthority;
+      attachments?: AttachmentIngestService;
     } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.compressionSettingsAuthority = options.compressionSettingsAuthority;
     this.epochNow = options.epochNow ?? Date.now;
     this.semanticTimeouts = normalizeSemanticTimeouts(options.semanticTimeouts);
     this.retryDelaysMs = normalizeRetryDelays(options.retryDelaysMs);
@@ -358,6 +445,10 @@ export class ModelProviderControlPlane {
     this.attachmentCatalog = new AttachmentCatalogProjection(database);
     this.attachmentHandles = new ConversationAttachmentHandleRegistry(database, { now: this.now });
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
+    this.nativeSteering = new NativeSteeringStore(database, contentStore, {
+      now: this.now,
+      ...(options.attachments ? { attachments: options.attachments } : {})
+    });
   }
 
   public projectAttachmentCatalogState(
@@ -373,6 +464,32 @@ export class ModelProviderControlPlane {
     catalog: readonly AttachmentCatalogEntry[]
   ): Promise<ConversationAttachmentHandleProjection> {
     return this.attachmentHandles.ensure(conversationId, catalog);
+  }
+
+  public async freezeRequestSettings(turnId: string, authoritySnapshotId: string): Promise<string | undefined> {
+    if (!this.compressionSettingsAuthority) return undefined;
+    const lastRead = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ModelRequest').list({
+        where: { turn_id: turnId }, orderBy: { column: 'request_seq', direction: 'desc' }, limit: 1
+      })
+    ]);
+    const last = rows(lastRead.snapshot[0])[0];
+    if (last && last.terminal_state !== 'cancelled') {
+      const recipeRow = await this.requireDomain('ContentObject', requireId(last.recipe_object_id, 'ModelRequest.recipe_object_id'));
+      const recipe = parsePlainJson(await this.contentStore.read(asContentObjectMetadata(recipeRow)), 'ModelRequest recipe');
+      // 普通请求尚未建立时的恢复，必须继续使用先行压缩已经固定的设置。
+      if (isCompressionRecipe(recipe)) {
+        return optionalId(last.settings_snapshot_object_id, 'ModelRequest.settings_snapshot_object_id') ?? undefined;
+      }
+    }
+    const frozen = await readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId);
+    const selected = await this.compressionSettingsAuthority.loadRequestCompressionSettings(frozenModelSelection(frozen.document));
+    const snapshot = normalizePlainJson({ requestCompression: selected }, '请求压缩设置');
+    applyRequestCompressionSettings(frozen.document, snapshot);
+    const content = await this.contentStore.ingest(
+      this.database, canonicalPlainJson(snapshot), 'application/vnd.limcode.model-request-settings+json'
+    );
+    return content.id;
   }
 
   public async createModelRequest(command: CreateModelRequestCommand): Promise<ModelRequestCreationResult> {
@@ -391,7 +508,7 @@ export class ModelProviderControlPlane {
     const operationId = stableId('model_request_operation', modelRequestId);
     const attemptId = stableId('model_request_attempt', modelRequestId, '1');
 
-    const frozen = await this.readFrozenAuthority(authoritySnapshotId, turnId);
+    const frozen = await this.readFrozenAuthority(authoritySnapshotId, turnId, settingsSnapshotContentObjectId ?? undefined);
     if (settingsSnapshotContentObjectId) {
       const settingsRow = await this.requireDomain('ContentObject', settingsSnapshotContentObjectId);
       parsePlainJson(await this.contentStore.read(asContentObjectMetadata(settingsRow)), 'ModelRequest settings snapshot');
@@ -556,8 +673,8 @@ export class ModelProviderControlPlane {
     const contentRows = [recipeContent, ...(settingsContent ? [settingsContent] : [])];
     const bytes = await this.contentStore.readMany(contentRows.map(asContentObjectMetadata));
     const recipe = parsePlainJson(bytes[0], 'ModelRequest recipe');
-    const frozenAuthority = frozen.document;
     const settingsSnapshot = settingsContent ? parsePlainJson(bytes[1], 'ModelRequest settings snapshot') : undefined;
+    const frozenAuthority = applyRequestCompressionSettings(frozen.document, settingsSnapshot);
     const contextConversationId = requireId(
       materialized.root.conversation_id,
       'ContextSequenceRoot.conversation_id'
@@ -592,6 +709,9 @@ export class ModelProviderControlPlane {
       isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
       'ModelRequest recipe.attachmentCatalogState'
     );
+    const nativeAdmittedCallIds = isRecord(recipe) && isRecord(recipe.nativeResponses)
+      ? await this.listNativeAdmittedProviderCallIds(contextConversationId)
+      : undefined;
     const providerContext = providerSegments.map((segment) => ({
       segmentId: segment.segmentId,
       segmentKind: segment.segmentKind,
@@ -623,6 +743,9 @@ export class ModelProviderControlPlane {
       recipe,
       context: providerContext,
       attachmentCatalogState,
+      ...(nativeAdmittedCallIds !== undefined && nativeAdmittedCallIds.length > 0
+        ? { nativeAsyncAdmittedCallIds: nativeAdmittedCallIds }
+        : {}),
       ...requestAddenda
     };
   }
@@ -644,7 +767,7 @@ export class ModelProviderControlPlane {
     const recipe = normalizeModelRequestRecipe(command.recipe, 'ModelRequest preview recipe');
     if (isCompressionRecipe(recipe)) throw new TypeError('Ordinary request preview cannot use a compression recipe.');
     const [frozen, materialized] = await Promise.all([
-      readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId),
+      readRequestTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId, command.settingsSnapshotContentObjectId),
       this.context.materialize(contextRootId)
     ]);
     if (requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id') !== frozen.conversationId) {
@@ -819,6 +942,68 @@ export class ModelProviderControlPlane {
     await Promise.allSettled([...this.activeDispatches]);
   }
 
+  /**
+   * Agent-loop native sessions register while their dispatch owns a live chain. Returns the
+   * unregister callback; registration is identity-checked so a stale stream never evicts a newer one.
+   */
+  public registerNativeSteeringSession(handle: NativeSteeringSessionHandle): () => void {
+    const existing = this.nativeSessions.get(handle.turnId);
+    if (existing && existing.modelRequestId !== handle.modelRequestId) {
+      throw providerConflict(`Turn ${handle.turnId} already has an active native steering session.`);
+    }
+    this.nativeSessions.set(handle.turnId, handle);
+    return () => {
+      if (this.nativeSessions.get(handle.turnId) === handle) this.nativeSessions.delete(handle.turnId);
+    };
+  }
+
+  /**
+   * UI steering commands run outside the Agent loop's AsyncLocalStorage fence. Validate the payload
+   * against the session's captured owner token, then execute every write under that exact fence.
+   */
+  public async steer(command: NativeSteerCommand): Promise<NativeSteeringReceipt> {
+    const commandId = requireText(command.commandId, 'NativeSteerCommand.commandId');
+    const turnId = requireId(command.turnId, 'NativeSteerCommand.turnId');
+    const conversationId = requireId(command.conversationId, 'NativeSteerCommand.conversationId');
+    const handle = this.nativeSessions.get(turnId);
+    if (!handle) {
+      throw new Error(`Turn ${turnId} has no active native steering session.`);
+    }
+    if (handle.conversationId !== conversationId) {
+      throw new Error('Native steering command Conversation does not match the active session.');
+    }
+    if (handle.fence.generation.toString() !== String(command.leaseEpoch)) {
+      throw new Error('Native steering command lease epoch does not match the active Turn owner.');
+    }
+    return runWithExecutionLeaseFence(handle.fence, () =>
+      handle.steer({ ...command, commandId, turnId, conversationId })
+    );
+  }
+
+  /** Reload/status view: every durable steering receipt of one Conversation, oldest first. */
+  public steeringReceipts(conversationId: string): Promise<NativeSteeringReceipt[]> {
+    return this.nativeSteering.receiptsForConversation(requireId(conversationId, 'conversationId'));
+  }
+
+  /** Process-local steering broadcast; fires only after the matching durable commit. */
+  public subscribeSteering(listener: (update: NativeSteeringUpdate) => void): () => void {
+    this.steeringListeners.add(listener);
+    return () => {
+      this.steeringListeners.delete(listener);
+    };
+  }
+
+  /** Called by the Agent loop's native session after each durable steering commit. */
+  public emitNativeSteeringUpdate(update: NativeSteeringUpdate): void {
+    for (const listener of this.steeringListeners) {
+      try {
+        listener(update);
+      } catch {
+        // Observation must never become a second control path.
+      }
+    }
+  }
+
   private async dispatchRequest(
     modelRequestIdInput: string,
     adapter: FullRequestProviderAdapter,
@@ -923,6 +1108,27 @@ export class ModelProviderControlPlane {
             firstSemanticMs: this.semanticTimeouts.firstSemanticMs,
             semanticIdleMs: this.semanticTimeouts.semanticIdleMs
           });
+      // Native logical requests span physical response boundaries; between a boundary and the next
+      // response.created the server intentionally waits for our tool results/steering, and the
+      // client lane-admission queue may hold this request before its first response.created.
+      // Both are proven local/server waits: suspend the idle watchdog, never the total deadline.
+      const nativeRequest = !compression
+        && isRecord(fullRequest.recipe)
+        && isRecord(fullRequest.recipe.nativeResponses);
+      const nativeWait = { boundary: false, laneQueue: false, suspended: false };
+      const updateNativeWaitSuspension = (next: Partial<{ boundary: boolean; laneQueue: boolean }>): void => {
+        if (!nativeRequest) return;
+        if (next.boundary !== undefined) nativeWait.boundary = next.boundary;
+        if (next.laneQueue !== undefined) nativeWait.laneQueue = next.laneQueue;
+        const shouldSuspend = nativeWait.boundary || nativeWait.laneQueue;
+        if (shouldSuspend === nativeWait.suspended) return;
+        nativeWait.suspended = shouldSuspend;
+        if (shouldSuspend) {
+          (progressWaiter as SemanticProgressWaiter).suspend();
+        } else {
+          (progressWaiter as SemanticProgressWaiter).resume();
+        }
+      };
       const streamDurability: StreamDurabilityState = {
         outputDeltaCheckpointed: false,
         lastActivityPersistedAt: this.epochNow() - (compression ? DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS : 0)
@@ -930,6 +1136,14 @@ export class ModelProviderControlPlane {
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
           signal: controller.signal,
+          ...(nativeRequest
+            ? {
+                native: {
+                  onLaneQueueState: (queued: boolean) =>
+                    updateNativeWaitSuspension({ laneQueue: queued === true })
+                }
+              }
+            : {}),
           ...(compression ? {
             onCompressionProgress: async (streamSeq: string | bigint) => {
               if (controller.signal.aborted) return;
@@ -950,7 +1164,20 @@ export class ModelProviderControlPlane {
           onEvent: async (event) => {
             const observedSeq = decimalBigInt(event.streamSeq, 'Provider event streamSeq');
             if (observedSeq > lastObservedStreamSeq) lastObservedStreamSeq = observedSeq;
-            const semanticProgress = event.semanticProgress !== false;
+            // Control acknowledgments never count as semantic progress; a proven input-wait
+            // suspends the idle watchdog until the next response.created proves server activity.
+            let semanticProgress = event.semanticProgress !== false;
+            if (event.kind === 'native_control') {
+              semanticProgress = false;
+              if (nativeRequest) {
+                const controlType = isRecord(event.content) ? event.content.type : undefined;
+                if (controlType === 'response.completed' || controlType === 'response.incomplete') {
+                  updateNativeWaitSuspension({ boundary: true });
+                } else if (controlType === 'response.created') {
+                  updateNativeWaitSuspension({ boundary: false, laneQueue: false });
+                }
+              }
+            }
             if (semanticProgress) {
               sawReplayUnsafeProviderEvent = true;
               progressWaiter.observeProgress();
@@ -1204,26 +1431,155 @@ export class ModelProviderControlPlane {
     socketGenerationInput: string | bigint,
     eventInput: ProviderOutputStreamEvent
   ): Promise<StreamEventResult> {
-    const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
-    const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
-    const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
     const event = normalizeStreamEvent(eventInput);
     const completed = event.kind === 'completed';
     const partialSummary = event.kind === 'output_item_done'
       && isRecord(event.content)
       && event.content.type === PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE;
-    const checkpointKind: 'output_delta' | 'output_item_done' | 'partial_summary' | 'terminal_summary' = completed
+    const checkpointKind: ModelStreamCheckpointKind = event.kind === 'completed'
       ? 'terminal_summary'
       : partialSummary
         ? 'partial_summary'
-        : event.kind as 'output_delta' | 'output_item_done';
+        : event.kind;
+    return this.recordStreamCheckpoint(modelRequestIdInput, attemptSeqInput, socketGenerationInput, {
+      checkpointKind,
+      envelopeKind: event.kind,
+      streamSeq: event.streamSeq,
+      content: event.content,
+      ...(event.usage !== undefined ? { usage: event.usage } : {}),
+      ...(event.timing !== undefined ? { timing: event.timing } : {})
+    });
+  }
+
+  /**
+   * Essential durable admission proof for one completed native call item. Non-droppable and outside
+   * the ordinary checkpoint capacity; the kernel executes the call only when this returns
+   * checkpointed=true. Never emitted for deltas.
+   */
+  public async recordNativeToolCallProof(
+    modelRequestIdInput: string,
+    attemptSeqInput: string | bigint,
+    socketGenerationInput: string | bigint,
+    streamSeqInput: string | bigint,
+    proof: PlainJsonValue
+  ): Promise<StreamEventResult> {
+    return this.recordStreamCheckpoint(modelRequestIdInput, attemptSeqInput, socketGenerationInput, {
+      checkpointKind: 'native_tool_call',
+      envelopeKind: 'native_tool_call',
+      streamSeq: decimalBigInt(streamSeqInput, 'streamSeq'),
+      content: normalizePlainJson(proof, 'Native tool call proof')
+    });
+  }
+
+  /** Persists the frozen native capabilities observed on an accepted response.created for UI gating. */
+  public async persistNativeCapabilities(
+    modelRequestIdInput: string,
+    attemptSeqInput: string | bigint,
+    socketGenerationInput: string | bigint,
+    capabilities: OpenAIResponsesNativeCapabilities
+  ): Promise<boolean> {
+    const summary = normalizeNativeCapabilitiesSummary(capabilities);
+    return this.mergeNativeStreamStats(modelRequestIdInput, attemptSeqInput, socketGenerationInput, (stats) => {
+      const existing = isRecord(stats.nativeCapabilities) ? stats.nativeCapabilities : undefined;
+      if (existing
+        && existing.asyncTools === summary.asyncTools
+        && existing.steering === summary.steering
+        && existing.reasoningUpdates === summary.reasoningUpdates
+        && existing.multiplexing === summary.multiplexing
+        && existing.explicitCaching === summary.explicitCaching) {
+        return { outcome: 'present' };
+      }
+      return { outcome: 'write', stats: { ...stats, nativeCapabilities: summary } };
+    });
+  }
+
+  /**
+   * Persists the first physical response's actual prompt tokens of a native chain exactly once;
+   * later responses and cumulative totals never overwrite this original-root anchor.
+   */
+  public async persistNativeInitialPromptTokens(
+    modelRequestIdInput: string,
+    attemptSeqInput: string | bigint,
+    socketGenerationInput: string | bigint,
+    tokenCountInput: number
+  ): Promise<boolean> {
+    const tokenCount = requireNonNegativeSafeNumber(tokenCountInput, 'nativeInitialPromptTokenCount');
+    return this.mergeNativeStreamStats(modelRequestIdInput, attemptSeqInput, socketGenerationInput, (stats) =>
+      stats.nativeInitialPromptTokenCount !== undefined
+        ? { outcome: 'present' as const }
+        : { outcome: 'write' as const, stats: { ...stats, nativeInitialPromptTokenCount: tokenCount } }
+    );
+  }
+
+  /**
+   * Optimistic stream-stats merge for native anchors. The heartbeat writer mutates the same JSON
+   * column mid-stream, so a stale full-column assert is retried from a fresh read (bounded)
+   * instead of failing the dispatch; an identity change or a concurrent anchor write ends the
+   * attempt honestly, and every retry re-validates before writing.
+   */
+  private async mergeNativeStreamStats(
+    modelRequestIdInput: string,
+    attemptSeqInput: string | bigint,
+    socketGenerationInput: string | bigint,
+    merge: (stats: StreamStats) => { outcome: 'write'; stats: StreamStats } | { outcome: 'present' }
+  ): Promise<boolean> {
+    const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
+    const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
+    const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const request = await this.requireDomain('ModelRequest', modelRequestId);
+      if (request.status === 'terminal') return false;
+      const stats = parseStreamStats(request.stream_stats_json);
+      if (stats.attemptSeq !== attemptSeq.toString() || stats.socketGeneration !== socketGeneration.toString()) {
+        return false;
+      }
+      const decision = merge(stats);
+      if (decision.outcome === 'present') return true;
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            status: request.status,
+            // JSON predicates compare encoded bytes, not normalized object key order.
+            stream_stats_json: request.stream_stats_json
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+            stream_stats_json: decision.stats,
+            updated_at: this.timestamp()
+          })
+        ]);
+        return true;
+      } catch (error) {
+        if (!isAssertionFailure(error) || attempt === 2) throw error;
+      }
+    }
+    return false;
+  }
+
+  private async recordStreamCheckpoint(
+    modelRequestIdInput: string,
+    attemptSeqInput: string | bigint,
+    socketGenerationInput: string | bigint,
+    event: {
+      checkpointKind: ModelStreamCheckpointKind;
+      envelopeKind: string;
+      streamSeq: bigint;
+      content: PlainJsonValue;
+      usage?: PlainJsonValue;
+      timing?: ProviderStreamTiming;
+    }
+  ): Promise<StreamEventResult> {
+    const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
+    const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
+    const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
+    const completed = event.checkpointKind === 'terminal_summary';
+    const checkpointKind = event.checkpointKind;
     const metricStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
     let transactionCount = 0;
     const finish = (result: StreamEventResult): StreamEventResult => {
       if (metricStartedAt !== undefined) {
         this.database.recordPerformanceMetric({
           kind: 'provider.stream_event',
-          eventKind: checkpointKind,
+          eventKind: checkpointKind === 'native_control' || checkpointKind === 'native_tool_call' ? 'other' : checkpointKind,
           checkpointed: result.checkpointed,
           transactionCount,
           durationMs: performance.now() - metricStartedAt
@@ -1239,7 +1595,7 @@ export class ModelProviderControlPlane {
       event.streamSeq.toString()
     );
     const checkpointBytes = canonicalPlainJson({
-      kind: event.kind,
+      kind: event.envelopeKind,
       streamSeq: event.streamSeq.toString(),
       content: event.content,
       ...(event.usage !== undefined ? { usage: event.usage } : {}),
@@ -1288,7 +1644,9 @@ export class ModelProviderControlPlane {
         ignoredReason: 'old-socket-generation'
       });
     }
-    const activeCheckpoints = rows(preflight.snapshot[3]);
+    // Native control/admission facts are essential durable rows outside the droppable display cap.
+    const activeCheckpoints = rows(preflight.snapshot[3])
+      .filter((row) => row.checkpoint_kind !== 'native_control' && row.checkpoint_kind !== 'native_tool_call');
     if (
       checkpointKind === 'output_delta'
       && activeCheckpoints.filter((row) => row.checkpoint_kind === 'output_delta').length
@@ -1341,55 +1699,63 @@ export class ModelProviderControlPlane {
     attemptSeq: bigint,
     expectedStats: StreamStats
   ): Promise<StreamIdentity> {
-    const bundle = await this.readRequestBundle(modelRequestId, attemptSeq);
-    if (bundle.request.status === 'terminal' || bundle.fence) throw new Error('Terminal ModelRequest cannot open a socket.');
-    if (bundle.turn.status !== 'active') {
-      await this.cancelCurrentRequest(modelRequestId, 'turn-not-active');
-      throw new Error('ModelRequest parent Turn is not active.');
-    }
-    const currentStats = parseStreamStats(bundle.request.stream_stats_json);
-    if (!sameStats(currentStats, expectedStats) || currentStats.attemptSeq !== attemptSeq.toString()) {
-      throw staleStreamError('ModelRequest identity changed before socket open.');
-    }
-    const socketGeneration = decimalBigInt(currentStats.socketGeneration, 'socketGeneration') + 1n;
-    const nextStats: StreamStats = { ...currentStats, socketGeneration: socketGeneration.toString() };
-    delete nextStats.retryNotBeforeAt;
-    delete nextStats.retryDelayMs;
-    delete nextStats.lastStreamSeq;
-    delete nextStats.lastStreamEventAt;
-    const now = this.timestamp();
-    try {
-      await this.database.transaction([
-        DOMAIN_REPOSITORIES.domain('Turn').assert(requireId(bundle.turn.id, 'Turn.id'), { status: 'active' }),
-        DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
-          status: bundle.request.status,
-          stream_stats_json: currentStats
-        }),
-        DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
-        DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
-          operation_id: bundle.operation.id,
-          attempt_seq: attemptSeq
-        }),
-        DOMAIN_REPOSITORIES.domain('Attempt').update(requireId(bundle.attempt.id, 'Attempt.id'), {
-          status: 'running', updated_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('Operation').update(requireId(bundle.operation.id, 'Operation.id'), {
-          status: 'running', updated_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-          status: 'streaming', stream_stats_json: nextStats, updated_at: now
-        })
-      ]);
-    } catch (error) {
-      if (!isAssertionFailure(error)) throw error;
-      const latest = await this.requireDomain('ModelRequest', modelRequestId);
-      const latestTurn = await this.requireDomain('Turn', requireId(latest.turn_id, 'ModelRequest.turn_id'));
-      if (latestTurn.status !== 'active' && latest.status !== 'terminal') {
-        await this.cancel(modelRequestId, 'turn-not-active');
+    // Same heartbeat-tolerant retry as terminalizeRequest: the full stats assert guards identity,
+    // a benign metadata write between the bundle read and the transaction must not force a stale
+    // stream error while the identity is provably unchanged.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const bundle = await this.readRequestBundle(modelRequestId, attemptSeq);
+      if (bundle.request.status === 'terminal' || bundle.fence) throw new Error('Terminal ModelRequest cannot open a socket.');
+      if (bundle.turn.status !== 'active') {
+        await this.cancelCurrentRequest(modelRequestId, 'turn-not-active');
+        throw new Error('ModelRequest parent Turn is not active.');
       }
-      throw staleStreamError('ModelRequest identity changed before socket open.');
+      const currentStats = parseStreamStats(bundle.request.stream_stats_json);
+      if (!sameStats(currentStats, expectedStats) || currentStats.attemptSeq !== attemptSeq.toString()) {
+        throw staleStreamError('ModelRequest identity changed before socket open.');
+      }
+      const socketGeneration = decimalBigInt(currentStats.socketGeneration, 'socketGeneration') + 1n;
+      const nextStats: StreamStats = { ...currentStats, socketGeneration: socketGeneration.toString() };
+      delete nextStats.retryNotBeforeAt;
+      delete nextStats.retryDelayMs;
+      delete nextStats.lastStreamSeq;
+      delete nextStats.lastStreamEventAt;
+      const now = this.timestamp();
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('Turn').assert(requireId(bundle.turn.id, 'Turn.id'), { status: 'active' }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            status: bundle.request.status,
+            stream_stats_json: bundle.request.stream_stats_json
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
+          DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
+            operation_id: bundle.operation.id,
+            attempt_seq: attemptSeq
+          }),
+          DOMAIN_REPOSITORIES.domain('Attempt').update(requireId(bundle.attempt.id, 'Attempt.id'), {
+            status: 'running', updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('Operation').update(requireId(bundle.operation.id, 'Operation.id'), {
+            status: 'running', updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+            status: 'streaming', stream_stats_json: nextStats, updated_at: now
+          })
+        ]);
+        return { attemptSeq, socketGeneration, stats: nextStats };
+      } catch (error) {
+        if (!isAssertionFailure(error)) throw error;
+        if (attempt === 2) {
+          const latest = await this.requireDomain('ModelRequest', modelRequestId);
+          const latestTurn = await this.requireDomain('Turn', requireId(latest.turn_id, 'ModelRequest.turn_id'));
+          if (latestTurn.status !== 'active' && latest.status !== 'terminal') {
+            await this.cancel(modelRequestId, 'turn-not-active');
+          }
+          throw staleStreamError('ModelRequest identity changed before socket open.');
+        }
+      }
     }
-    return { attemptSeq, socketGeneration, stats: nextStats };
+    throw staleStreamError('ModelRequest identity changed before socket open.');
   }
 
   private async createTransientRetry(
@@ -1403,14 +1769,6 @@ export class ModelProviderControlPlane {
     }
     const retryOrdinal = Number(failed.attemptSeq);
     if (retryOrdinal > maxRetries) throw new Error('Provider transient retry budget is exhausted.');
-    const bundle = await this.readRequestBundle(modelRequestId, failed.attemptSeq);
-    const currentStats = parseStreamStats(bundle.request.stream_stats_json);
-    if (
-      bundle.request.status === 'terminal'
-      || bundle.fence
-      || bundle.turn.status !== 'active'
-      || !sameStats(currentStats, failed.stats)
-    ) return null;
     const nextAttemptSeq = failed.attemptSeq + 1n;
     const attemptId = stableId('model_request_attempt', modelRequestId, nextAttemptSeq.toString());
     const delayMs = retryDelayMs(
@@ -1419,46 +1777,59 @@ export class ModelProviderControlPlane {
       `${modelRequestId}:${retryOrdinal}`
     );
     const retryNotBeforeAt = this.epochNow() + delayMs;
-    const now = this.timestamp();
-    const nextStats: StreamStats = {
-      attemptSeq: nextAttemptSeq.toString(),
-      socketGeneration: '0',
-      retryReason: reason,
-      retryMaxAttempts: maxRetries,
-      retryDelayMs: delayMs,
-      retryNotBeforeAt
-    };
-    try {
-      await this.database.transaction([
-        DOMAIN_REPOSITORIES.domain('Turn').assert(requireId(bundle.turn.id, 'Turn.id'), { status: 'active' }),
-        DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
-          status: 'streaming', stream_stats_json: currentStats
-        }),
-        DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
-        DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
-          status: 'running', attempt_seq: failed.attemptSeq
-        }),
-        DOMAIN_REPOSITORIES.domain('Attempt').update(requireId(bundle.attempt.id, 'Attempt.id'), {
-          status: 'transient_failed', updated_at: now, completed_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('Attempt').insertWithNextSequence({
-          id: attemptId,
-          operation_id: requireId(bundle.operation.id, 'Operation.id'),
-          status: 'pending',
-          created_at: now,
-          updated_at: now,
-          completed_at: null
-        }, { column: 'attempt_seq', scope: { operation_id: requireId(bundle.operation.id, 'Operation.id') } }),
-        DOMAIN_REPOSITORIES.domain('Attempt').assert(attemptId, { attempt_seq: nextAttemptSeq }),
-        DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-          status: 'retrying', stream_stats_json: nextStats, updated_at: now
-        })
-      ]);
-      return { attemptSeq: nextAttemptSeq, delayMs, retryNotBeforeAt };
-    } catch (error) {
-      if (!isRecoverableProviderRace(error)) throw error;
-      return null;
+    // Same heartbeat-tolerant retry: assertion failures from benign stats metadata writes are
+    // retried from a fresh bundle; a genuine concurrent retry (unique/identity race) still loses.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const bundle = await this.readRequestBundle(modelRequestId, failed.attemptSeq);
+      const currentStats = parseStreamStats(bundle.request.stream_stats_json);
+      if (
+        bundle.request.status === 'terminal'
+        || bundle.fence
+        || bundle.turn.status !== 'active'
+        || !sameStats(currentStats, failed.stats)
+      ) return null;
+      const now = this.timestamp();
+      const nextStats: StreamStats = {
+        attemptSeq: nextAttemptSeq.toString(),
+        socketGeneration: '0',
+        retryReason: reason,
+        retryMaxAttempts: maxRetries,
+        retryDelayMs: delayMs,
+        retryNotBeforeAt
+      };
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('Turn').assert(requireId(bundle.turn.id, 'Turn.id'), { status: 'active' }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            status: 'streaming', stream_stats_json: bundle.request.stream_stats_json
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
+          DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
+            status: 'running', attempt_seq: failed.attemptSeq
+          }),
+          DOMAIN_REPOSITORIES.domain('Attempt').update(requireId(bundle.attempt.id, 'Attempt.id'), {
+            status: 'transient_failed', updated_at: now, completed_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('Attempt').insertWithNextSequence({
+            id: attemptId,
+            operation_id: requireId(bundle.operation.id, 'Operation.id'),
+            status: 'pending',
+            created_at: now,
+            updated_at: now,
+            completed_at: null
+          }, { column: 'attempt_seq', scope: { operation_id: requireId(bundle.operation.id, 'Operation.id') } }),
+          DOMAIN_REPOSITORIES.domain('Attempt').assert(attemptId, { attempt_seq: nextAttemptSeq }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+            status: 'retrying', stream_stats_json: nextStats, updated_at: now
+          })
+        ]);
+        return { attemptSeq: nextAttemptSeq, delayMs, retryNotBeforeAt };
+      } catch (error) {
+        if (!isRecoverableProviderRace(error)) throw error;
+        if (!isAssertionFailure(error) || attempt === 2) return null;
+      }
     }
+    return null;
   }
 
   private async cancelCurrentRequest(
@@ -1609,38 +1980,40 @@ export class ModelProviderControlPlane {
     identity: StreamIdentity,
     terminal: { attemptStatus: string; operationStatus: string; terminalState: string }
   ): Promise<boolean> {
-    const bundle = await this.readRequestBundle(modelRequestId, identity.attemptSeq);
-    if (bundle.request.status === 'terminal' || bundle.fence) return false;
-    const currentStats = parseStreamStats(bundle.request.stream_stats_json);
-    if (!sameStats(currentStats, identity.stats)) return false;
-    const now = this.timestamp();
-    try {
-      await this.database.transaction([
-        DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
-          status: bundle.request.status, stream_stats_json: currentStats
-        }),
-        DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
-        DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
-          operation_id: bundle.operation.id, attempt_seq: identity.attemptSeq
-        }),
-        DOMAIN_REPOSITORIES.domain('Attempt').update(requireId(bundle.attempt.id, 'Attempt.id'), {
-          status: terminal.attemptStatus, updated_at: now, completed_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('Operation').update(requireId(bundle.operation.id, 'Operation.id'), {
-          status: terminal.operationStatus, updated_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-          status: 'terminal', terminal_state: terminal.terminalState, updated_at: now
-        })
-      ]);
-      return true;
-    } catch (error) {
-      if (!isAssertionFailure(error)) throw error;
-      const latest = await this.requireDomain('ModelRequest', modelRequestId);
-      const latestStats = parseStreamStats(latest.stream_stats_json);
-      if (latest.status === 'terminal' || !sameStats(latestStats, identity.stats)) return false;
-      throw error;
+    // The full stream_stats assert doubles as the identity fence, but the activity heartbeat also
+    // writes that column. A benign metadata write must not strand the request non-terminal:
+    // identity is re-validated on every attempt and the bounded retry absorbs the metadata race.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const bundle = await this.readRequestBundle(modelRequestId, identity.attemptSeq);
+      if (bundle.request.status === 'terminal' || bundle.fence) return false;
+      const currentStats = parseStreamStats(bundle.request.stream_stats_json);
+      if (!sameStats(currentStats, identity.stats)) return false;
+      const now = this.timestamp();
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            status: bundle.request.status, stream_stats_json: bundle.request.stream_stats_json
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
+          DOMAIN_REPOSITORIES.domain('Attempt').assert(requireId(bundle.attempt.id, 'Attempt.id'), {
+            operation_id: bundle.operation.id, attempt_seq: identity.attemptSeq
+          }),
+          DOMAIN_REPOSITORIES.domain('Attempt').update(requireId(bundle.attempt.id, 'Attempt.id'), {
+            status: terminal.attemptStatus, updated_at: now, completed_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('Operation').update(requireId(bundle.operation.id, 'Operation.id'), {
+            status: terminal.operationStatus, updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+            status: 'terminal', terminal_state: terminal.terminalState, updated_at: now
+          })
+        ]);
+        return true;
+      } catch (error) {
+        if (!isAssertionFailure(error) || attempt === 2) throw error;
+      }
     }
+    return false;
   }
 
   private async readRequestBundle(modelRequestId: string, attemptSeq: bigint): Promise<RequestBundle> {
@@ -1662,12 +2035,13 @@ export class ModelProviderControlPlane {
     };
   }
 
-  private async readFrozenAuthority(authoritySnapshotId: string, turnId: string): Promise<FrozenAuthority> {
-    const frozen = await readFrozenTurnAuthority(
+  private async readFrozenAuthority(authoritySnapshotId: string, turnId: string, settingsSnapshotContentObjectId?: string): Promise<FrozenAuthority> {
+    const frozen = await readRequestTurnAuthority(
       this.database,
       this.contentStore,
       authoritySnapshotId,
-      turnId
+      turnId,
+      settingsSnapshotContentObjectId
     );
     const model = frozenModelIdentity(frozen.document);
     const context = frozenContextProfile(frozen.document);
@@ -1848,6 +2222,41 @@ export class ModelProviderControlPlane {
     };
   }
 
+  /** Every durably native-admitted provider call id of the Conversation, in ToolCall order. */
+  private async listNativeAdmittedProviderCallIds(conversationId: string): Promise<readonly string[]> {
+    const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId });
+    const providerCallIds: string[] = [];
+    for (const turn of turns) {
+      const calls = await listAllDomainRows(this.database, 'ToolCall', {
+        turn_id: requireId(turn.id, 'Turn.id')
+      });
+      if (calls.length === 0) continue;
+      const snapshot = await this.database.snapshot(calls.flatMap((call) => [
+        DOMAIN_REPOSITORIES.domain('ToolCallEvent').list({
+          where: {
+            tool_call_id: requireId(call.id, 'ToolCall.id'),
+            event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
+          },
+          limit: 1
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
+          where: { tool_call_id: requireId(call.id, 'ToolCall.id') },
+          limit: 1
+        })
+      ]));
+      for (let index = 0; index < calls.length; index += 1) {
+        const events = rows(snapshot.snapshot[index * 2]);
+        if (events.length === 0) continue;
+        const links = rows(snapshot.snapshot[index * 2 + 1]);
+        const providerCallId = links[0]?.provider_call_id;
+        if (typeof providerCallId === 'string' && providerCallId.length > 0) {
+          providerCallIds.push(providerCallId);
+        }
+      }
+    }
+    return providerCallIds;
+  }
+
   private async requireDomain(domain: string, id: string): Promise<DomainRow> {
     const row = await this.getOptional(domain, id);
     if (!row) throw new Error(`${domain} ${id} does not exist.`);
@@ -1864,20 +2273,32 @@ export class ModelProviderControlPlane {
   }
 }
 
-function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; semanticIdleMs: number }): {
+interface SemanticProgressWaiter {
   promise: Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>;
   observeProgress(): void;
+  suspend(): void;
+  resume(): void;
   dispose(): void;
-} {
+}
+
+function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; semanticIdleMs: number }): SemanticProgressWaiter {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let sawProgress = false;
   let settled = false;
+  // A proven native input-wait (response boundary with outstanding required input) is not a stall:
+  // the server deliberately waits for our tool results/steering, possibly longer than any idle
+  // deadline (manual approvals included). The total dispatch timeout remains the outer bound.
+  let suspended = false;
   let resolveTimeout!: (outcome: { kind: 'semantic_timed_out'; error: ProviderTransientError }) => void;
   const promise = new Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>((resolve) => {
     resolveTimeout = resolve;
   });
-  const arm = (timeoutMs: number) => {
+  const clear = () => {
     if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  const arm = (timeoutMs: number) => {
+    clear();
     timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -1900,7 +2321,7 @@ function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; seman
   return {
     promise,
     observeProgress() {
-      if (settled) return;
+      if (settled || suspended) return;
       sawProgress = true;
       // Re-arm immediately when the Provider event is observed. The durable checkpoint Promise may
       // itself block behind SQLite/CAS work; clearing the old timer until that Promise settles leaves
@@ -1908,10 +2329,20 @@ function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; seman
       // adapter deadline.
       arm(timeouts.semanticIdleMs);
     },
+    suspend() {
+      if (settled) return;
+      suspended = true;
+      clear();
+    },
+    resume() {
+      if (settled || !suspended) return;
+      suspended = false;
+      // The next response proves liveness by itself; grant a fresh semantic window from here.
+      arm(sawProgress ? timeouts.semanticIdleMs : timeouts.firstSemanticMs);
+    },
     dispose() {
       settled = true;
-      if (timer !== undefined) clearTimeout(timer);
-      timer = undefined;
+      clear();
     }
   };
 }
@@ -2273,7 +2704,7 @@ function normalizeStreamEvent(event: ProviderStreamEvent): {
   usage?: PlainJsonValue;
   timing?: ProviderStreamTiming;
 } {
-  if (!event || !['output_delta', 'output_item_done', 'completed'].includes(event.kind)) {
+  if (!event || !['output_delta', 'output_item_done', 'completed', 'native_control'].includes(event.kind)) {
     throw new TypeError(`Unsupported Provider stream event: ${String(event?.kind)}`);
   }
   const streamSeq = decimalBigInt(event.streamSeq, 'streamSeq');
@@ -2313,7 +2744,28 @@ function parseStreamStats(value: unknown): StreamStats {
       : {}),
     ...(optionalTimestamp(value.lastStreamEventAt, 'lastStreamEventAt') !== undefined
       ? { lastStreamEventAt: optionalTimestamp(value.lastStreamEventAt, 'lastStreamEventAt') }
+      : {}),
+    ...(isRecord(value.nativeCapabilities)
+      ? { nativeCapabilities: normalizeNativeCapabilitiesSummary(value.nativeCapabilities) }
+      : {}),
+    ...(optionalNonNegativeTokenCount(value.nativeInitialPromptTokenCount) !== undefined
+      ? { nativeInitialPromptTokenCount: optionalNonNegativeTokenCount(value.nativeInitialPromptTokenCount) }
       : {})
+  };
+}
+
+function optionalNonNegativeTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function normalizeNativeCapabilitiesSummary(value: unknown): OpenAIResponsesNativeCapabilities {
+  const record = isRecord(value) ? value : {};
+  return {
+    asyncTools: record.asyncTools === true,
+    steering: record.steering === true,
+    reasoningUpdates: record.reasoningUpdates === true,
+    multiplexing: record.multiplexing === true,
+    explicitCaching: record.explicitCaching === true
   };
 }
 

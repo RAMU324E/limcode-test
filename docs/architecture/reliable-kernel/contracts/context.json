@@ -79,7 +79,7 @@
       "segmentCount",
       "estimatedTokens"
     ],
-    "estimatedTokensRule": "root 上的 estimatedTokens 仅为参考缓存；压缩触发判定使用的令牌数在构造 projection 时按 AuthoritySnapshot 冻结的 ModelProfile 估算器重算",
+    "estimatedTokensRule": "root 上的 estimatedTokens 仅为参考缓存；压缩触发判定读取当前 Context 估算，并使用基础 AuthoritySnapshot 加本次请求独立设置所确定的阈值",
     "rootRetention": "ContextSequenceRoot 与 ContextSequenceNode 首版保留到 runtime dataset reset，不在线删除",
     "currentHead": "ConversationContextHeadLink(conversation_id UNIQUE,root_id) 在创建新 current root 的同一事务内更新",
     "fullPrefixStoredPerProjection": false,
@@ -129,6 +129,15 @@
       "streamStats"
     ],
     "recipeImmutable": true,
+    "requestCompressionSettings": {
+      "reference": "settings_snapshot_object_id",
+      "selection": "设置快照的 requestCompression 保存模型身份校验值、上下文计算配置和压缩配置；空引用明确选择本轮基础配置，不做版本探测或格式猜测",
+      "freezeBoundary": "普通模型请求建立前；先行压缩与后续普通请求共用同一引用",
+      "recovery": "已建立的请求及先行压缩恢复使用原设置引用，不重新读设置文件",
+      "immutable": true,
+      "mayChangePrimaryModelOrPermissions": false,
+      "schemaChangeRequired": false
+    },
     "aggregateAuthority": "ModelRequest、其唯一Operation、1至2个连续Attempt及可选Completed Fence必须由writer按最终状态整体校验；通用update不得制造聚合不一致",
     "cancelMutation": "request-level fixed writer cancel-current：事务内读取并终止当时最新attempt/socket；旧provider outcome仍只允许按精确identity收口",
     "rule": "insert 后 recipe 字段不可变；update 仅允许 status、终态、usage 与 streamStats 字段；status 单调，terminal 不得复活；任何允许列更新仍须通过聚合不变量"
@@ -141,7 +150,7 @@
     "retry": "new-model-request-attempt",
     "attachment": "新建摘要 segment+node(parent NULL)+新 root；root.tailNodeId 指向未压缩尾部链头，root.tailSegmentCount 精确限定只回溯多少个尾部节点；物化顺序=摘要 segment+该有限尾部切片",
     "sourceRegistration": "CompressionBlockSource 登记被压缩的 segment 区间（compression_block_id,segment_id,position UNIQUE）",
-    "trigger": "新 segment 追加后由压缩规划器判定；阈值来源=AuthoritySnapshot 冻结的 ModelProfile 字段；estimatedTokens 按 profile 估算器在构造 projection 时重算",
+    "trigger": "准备下一次普通请求时按当前 Context 估算与本次请求固定的压缩设置判定；新手动压缩也读取当前对应模型的压缩配置；已开始的压缩保持原设置直至结束",
     "writeCost": "序列挂接单次新增节点数=O(1)（≤4）；来源登记按本次被压缩区间写入，不冒充 O(1)",
     "invalidatesInFlightContinuation": true,
     "management": {

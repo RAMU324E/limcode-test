@@ -47,6 +47,7 @@ export function useBridgeBootstrap(): void {
       const previousClientId = announcedClientId;
       if (message.clientId) announcedClientId = message.clientId;
       if (previousClientId && message.clientId && previousClientId !== message.clientId) {
+        globalSettings.reconcilePendingSettings();
         bridge.ready();
       }
       session.applyHello(message.payload?.meta, message.payload?.runtime);
@@ -76,6 +77,14 @@ export function useBridgeBootstrap(): void {
     }),
     bridge.on(BridgeMessageType.GlobalSettingsSnapshot, (message) => {
       if (message.payload) globalSettings.applySnapshot(message.payload, message.correlationId);
+    }),
+    bridge.on(BridgeMessageType.GlobalSettingsFlush, (message) => {
+      void globalSettings.flushForExecution().then(
+        () => bridge.request(BridgeMessageType.GlobalSettingsFlushResult, { status: 'saved' }, { correlationId: message.id }),
+        (error: unknown) => bridge.request(BridgeMessageType.GlobalSettingsFlushResult, {
+          status: 'failed', message: error instanceof Error ? error.message : String(error)
+        }, { correlationId: message.id })
+      );
     }),
     bridge.on(BridgeMessageType.ConversationSettingsSnapshot, (message) => {
       if (message.payload) conversationSettings.applySnapshot(message.payload);

@@ -26,6 +26,7 @@ import {
   defaultLlmPromptCacheModeForProvider,
   defaultLlmPromptCacheTtlForProvider
 } from '../../../shared/protocol';
+import { normalizeOpenAIResponsesNativeSettings } from '../../../shared/openAIResponsesCapabilities';
 import { DEFAULT_LLM_BASE_URL } from '../llmProvider';
 import { isSettingsRevisionConflictError } from '../settingsRevisionConflict';
 import type { StoragePaths } from './paths';
@@ -134,6 +135,7 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
   const promptCache = normalizePromptCache(input?.promptCache, provider);
   const modelConfigs = normalizeModelConfigs(input?.modelConfigs, models, provider);
   const contextWindowTokens = finitePositiveInteger(input?.contextWindowTokens) ?? providerDefaultContextWindow(provider);
+  const nativeResponses = normalizeOpenAIResponsesNativeSettings(input?.nativeResponses);
   return {
     id: stringOrDefault(input?.id, fallback.id),
     name: stringOrDefault(input?.name, fallback.name),
@@ -151,6 +153,7 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
     contextWindowTokens,
     systemPromptPrefix: normalizeSystemPromptPrefix(input?.systemPromptPrefix),
     promptCache,
+    ...(nativeResponses ? { nativeResponses } : {}),
     ...(headers ? { headers } : {}),
     ...(generationConfig ? { generationConfig } : {}),
     ...(requestBody ? { requestBody } : {}),
@@ -236,6 +239,7 @@ function normalizeModelConfigs(
     const generationConfig = normalizeGenerationConfig(item.generationConfig);
     const requestBody = normalizeRequestBody(item.requestBody);
     const promptCache = normalizePromptCache(item.promptCache, provider);
+    const nativeResponses = normalizeOpenAIResponsesNativeSettings(item.nativeResponses);
     byModelId.set(modelId, {
       id: stringOrDefault(item.id, `llm-model-config-${createMessageId()}`),
       modelId,
@@ -248,6 +252,7 @@ function normalizeModelConfigs(
       contextWindowTokens: finitePositiveInteger(item.contextWindowTokens) ?? providerDefaultContextWindow(provider),
       systemPromptPrefix: normalizeSystemPromptPrefix(item.systemPromptPrefix),
       promptCache,
+      ...(nativeResponses ? { nativeResponses } : {}),
       ...(headers ? { headers } : {}),
       ...(generationConfig ? { generationConfig } : {}),
       ...(requestBody ? { requestBody } : {}),

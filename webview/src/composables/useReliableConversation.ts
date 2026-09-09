@@ -9,6 +9,7 @@ import {
   useReliableKernelClientFeedStore,
   type ReliableKernelDetailPriority
 } from '@webview/stores/useReliableKernelClientFeedStore';
+import { steeringReceiptsByConversationState } from '@webview/composables/steeringReceipts';
 
 export interface ReliableDetailDemand {
   /** Timeline rows currently mounted (or about to enter the viewport). */
@@ -50,7 +51,8 @@ export function useReliableConversation(): SharedReliableConversation {
     records: records.value,
     details: feed.details,
     transientModelRequests: feed.transientModelRequests,
-    lastCommitSeq: feed.lastCommitSeq
+    lastCommitSeq: feed.lastCommitSeq,
+    steeringReceipts: Object.values(steeringReceiptsByConversationState().value[conversationId.value] ?? {})
   }));
 
   function ensureDetails(demand: ReliableDetailDemand = {}): void {

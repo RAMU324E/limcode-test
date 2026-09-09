@@ -12,6 +12,7 @@ import {
   type LlmPromptCacheConfigRecord,
   type LlmRequestBodyRecord
 } from '@shared/protocol';
+import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import InputPanel from '@webview/components/ui/InputPanel.vue';
@@ -145,6 +146,10 @@ function updateDefaultPromptCache(value: LlmPromptCacheConfigRecord | undefined)
   settings.updateActiveLlmPromptCache(value);
 }
 
+function updateDefaultNativeResponses(value: OpenAIResponsesNativeSettings | undefined): void {
+  settings.updateActiveLlmNativeResponses(value);
+}
+
 function updateDefaultHeaders(value: LlmProviderHeadersRecord | undefined): void {
   settings.updateActiveLlmHeaders(value);
 }
@@ -167,6 +172,10 @@ function updateModelRequestBody(modelConfigId: string, value: LlmRequestBodyReco
 
 function updateModelPromptCache(modelConfigId: string, value: LlmPromptCacheConfigRecord | undefined): void {
   settings.updateActiveModelConfigPromptCache(modelConfigId, value);
+}
+
+function updateModelNativeResponses(modelConfigId: string, value: OpenAIResponsesNativeSettings | undefined): void {
+  settings.updateActiveModelConfigNativeResponses(modelConfigId, value);
 }
 
 function updateModelHeaders(modelConfigId: string, value: LlmProviderHeadersRecord | undefined): void {
@@ -211,6 +220,7 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
     contextWindowTokens: modelConfig.contextWindowTokens,
     systemPromptPrefix: modelConfig.systemPromptPrefix,
     promptCache: modelConfig.promptCache,
+    ...(modelConfig.nativeResponses ? { nativeResponses: { ...modelConfig.nativeResponses } } : {}),
     headers: modelConfig.headers ?? {},
     generationConfig: modelConfig.generationConfig ?? {},
     requestBody: modelConfig.requestBody ?? {},
@@ -282,6 +292,10 @@ function updateDefaultCompressionMaxDurationMinutes(value: number): void {
   settings.setActiveCompressionMaxDurationMinutes(value);
 }
 
+function updateDefaultCompressionBodyTargetTokens(value: number): void {
+  settings.setActiveCompressionBodyTargetTokens(value);
+}
+
 function updateModelCompressionProviderConfigId(modelId: string, providerConfigId: string): void {
   settings.setModelCompressionProviderConfig(modelId, providerConfigId);
 }
@@ -296,6 +310,10 @@ function updateModelCompressionTrigger(modelId: string, patch: Partial<LlmCompre
 
 function updateModelCompressionMaxDurationMinutes(modelId: string, value: number): void {
   settings.setModelCompressionMaxDurationMinutes(modelId, value);
+}
+
+function updateModelCompressionBodyTargetTokens(modelId: string, value: number): void {
+  settings.setModelCompressionBodyTargetTokens(modelId, value);
 }
 
 function openCreate(): void {
@@ -533,6 +551,7 @@ function cancelDelete(): void {
               @update-generation-config="updateDefaultGenerationConfig"
               @update-request-body="updateDefaultRequestBody"
               @update-prompt-cache="updateDefaultPromptCache"
+              @update-native-responses="updateDefaultNativeResponses"
               @update-headers="updateDefaultHeaders"
             />
             <LlmCompressionSettingsEditor
@@ -545,6 +564,7 @@ function cancelDelete(): void {
               @update-method-kind="updateDefaultCompressionMethodKind"
               @update-trigger="updateDefaultCompressionTrigger"
               @update-max-duration-minutes="updateDefaultCompressionMaxDurationMinutes"
+              @update-body-target-tokens="updateDefaultCompressionBodyTargetTokens"
             />
           </div>
         </article>
@@ -608,6 +628,7 @@ function cancelDelete(): void {
                   @update-generation-config="updateModelGenerationConfig(modelConfig.id, $event)"
                   @update-request-body="updateModelRequestBody(modelConfig.id, $event)"
                   @update-prompt-cache="updateModelPromptCache(modelConfig.id, $event)"
+                  @update-native-responses="updateModelNativeResponses(modelConfig.id, $event)"
                   @update-headers="updateModelHeaders(modelConfig.id, $event)"
                 />
                 <LlmCompressionSettingsEditor
@@ -620,6 +641,7 @@ function cancelDelete(): void {
                   @update-method-kind="updateModelCompressionMethodKind(modelConfig.modelId, $event)"
                   @update-trigger="updateModelCompressionTrigger(modelConfig.modelId, $event)"
                   @update-max-duration-minutes="updateModelCompressionMaxDurationMinutes(modelConfig.modelId, $event)"
+                  @update-body-target-tokens="updateModelCompressionBodyTargetTokens(modelConfig.modelId, $event)"
                 />
               </div>
             </article>

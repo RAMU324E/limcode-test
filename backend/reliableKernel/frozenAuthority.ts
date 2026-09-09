@@ -168,7 +168,7 @@ export function frozenContextProfile(document: PlainJsonValue): FrozenContextPro
   };
 }
 
-/** Compression policy is part of the immutable Turn authority, never re-read from live settings. */
+/** 解析已固定的有效配置；新请求可由独立请求设置覆盖压缩部分，重放不读当前配置。 */
 export function frozenCompressionPolicy(document: PlainJsonValue): FrozenCompressionPolicy | undefined {
   if (!isRecord(document) || !isRecord(document.compression)) return undefined;
   const compression = document.compression;

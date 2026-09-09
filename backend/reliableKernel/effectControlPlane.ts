@@ -1,4 +1,4 @@
-import type { InlineDataPart } from '../../shared/protocol';
+import type { InlineDataPart, ModelOutputItemReference } from '../../shared/protocol';
 import {
   AttachmentAdmissionError,
   type AttachmentIngestService,
@@ -24,6 +24,31 @@ import {
   runWithoutExecutionLeaseFence,
   type ExecutionLeaseFence
 } from './executionLeaseFence';
+import {
+  isNativeAdmissionBoundary,
+  NATIVE_TOOL_ADMISSION_CONTENT_TYPE,
+  NATIVE_TOOL_DELIVERY_CONTENT_TYPE,
+  NativeAsyncWorkPendingError,
+  nativeAdmissionContent,
+  nativeDeliveryContent,
+  normalizeNativeStreamIdentity,
+  parseNativeAdmissionContent,
+  parseNativeControlCheckpoint,
+  parseNativeDeliveryContent,
+  parseNativeToolCallCheckpoint,
+  TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION,
+  TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY,
+  type NativeToolCallStreamIdentity
+} from './nativeToolFacts';
+
+export {
+  NATIVE_ASYNC_WORK_PENDING_CODE,
+  NativeAsyncWorkPendingError,
+  TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION,
+  TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY,
+  type NativePendingWorkRef,
+  type NativeToolCallStreamIdentity
+} from './nativeToolFacts';
 
 export type PhaseDSourceKind = 'command' | 'callback' | 'internal' | 'recovery';
 export type PhaseDEffectKind =
@@ -103,6 +128,65 @@ export interface AppendedToolCallEvent {
   receiptId: string;
   eventId: string;
   eventSeq: string;
+  deduplicated: boolean;
+  commitSeq?: string;
+}
+
+/** Durable native admission attribution of one ToolCall (row identity + parsed event payload). */
+export interface NativeToolAdmission {
+  eventId: string;
+  toolCallId: string;
+  providerCallId: string;
+  checkpointId: string;
+  attemptSeq: string;
+  socketGeneration: string;
+  streamSeq: string;
+  responseId: string;
+  declaredAsync: boolean;
+  admittedAt: string;
+  /** Actual output-item reference copied from the admission proof. */
+  outputItem?: ModelOutputItemReference;
+}
+
+/**
+ * One durably admitted native ToolCall whose result facts are not fully closed yet.
+ * Ordinary unmarked unresolved calls never appear here; they keep failing the regular guards.
+ */
+export interface NativePendingToolCall {
+  toolCallId: string;
+  toolName: string;
+  turnId: string;
+  turnActive: boolean;
+  status: string;
+  providerCallId: string | undefined;
+  /** ToolCallSourceLink.message_id — the assistant Message carrying the call. */
+  messageId: string;
+  /** ToolCallSourceLink.model_request_id — the request that admitted the call. */
+  modelRequestId: string;
+  /** The unique ToolModelResult id once the call is settled. */
+  toolModelResultId: string | undefined;
+  callContextSegmentId: string | undefined;
+  resultContextSegmentId: string | undefined;
+  /** A unique ToolModelResult exists (the call reached its terminal settlement). */
+  settled: boolean;
+  /** A native_delivery ToolCallEvent records a server-admitted result delivery. */
+  delivered: boolean;
+  admittedAt: string;
+}
+
+export interface NativeResultDeliveryInput {
+  toolCallId: string;
+  /** The logical local ModelRequest whose continuation carried the outputs (may be unchanged). */
+  carrierModelRequestId: string;
+  /** Server response.created identity that admitted the outputs. */
+  providerResponseId: string;
+  connectionGeneration?: string;
+  streamId?: string;
+}
+
+export interface NativeResultDeliveryMark {
+  receiptId: string;
+  events: Array<{ toolCallId: string; eventId: string }>;
   deduplicated: boolean;
   commitSeq?: string;
 }
@@ -248,6 +332,9 @@ export class EffectControlPlane {
   private readonly now: () => string;
   private readonly onDiagnostic: (diagnostic: PhaseDDiagnostic) => void;
   private readonly attachments?: AttachmentIngestService;
+  private readonly toolModelResultListeners = new Set<
+    (events: Array<{ turnId: string; toolCallId: string }>) => void
+  >();
   private readonly finalizationFlights = new Map<string, {
     rerun: boolean;
     promise: Promise<ToolTerminalResult[]>;
@@ -343,6 +430,12 @@ export class EffectControlPlane {
   /**
    * Persists one completed Provider output as an indivisible call batch. ToolCall is the lifecycle
    * fact; source/policy are separate one-to-one facts and can never be observed half-populated.
+   *
+   * Native streamed admission (streamIdentity present) admits exactly one call while the logical
+   * ModelRequest is still in flight: the persisted complete native call item checkpoint is the
+   * execution proof, asynchronous calls admit at the item boundary, synchronous calls additionally
+   * require the matching native_control response-boundary checkpoint. A native_admission
+   * ToolCallEvent is committed in the same transaction so the proof survives checkpoint pruning.
    */
   public async createToolCallBatch(input: {
     source: PhaseDCommandSource;
@@ -351,6 +444,7 @@ export class EffectControlPlane {
     modelRequestId: string;
     messageId: string;
     entries: readonly ToolCallBatchEntry[];
+    streamIdentity?: NativeToolCallStreamIdentity;
   }): Promise<CreatedToolCallBatch> {
     const source = normalizeSource(input.source, ['callback', 'internal'], 'tool-call-batch-create');
     const batchId = requireId(input.batchId, 'batchId');
@@ -362,25 +456,49 @@ export class EffectControlPlane {
     }
     const entries = input.entries.map((entry, index) => normalizeToolCallBatchEntry(entry, index));
     assertUniqueBatchEntries(entries);
-    const scope = canonicalJson({ batchId, turnId, modelRequestId, messageId, entries });
+    const streamIdentity = input.streamIdentity === undefined
+      ? undefined
+      : normalizeNativeStreamIdentity(input.streamIdentity);
+    if (streamIdentity !== undefined && entries.length !== 1) {
+      throw new Error('Native streamed ToolCall admission persists exactly one call per batch.');
+    }
+    const scope = canonicalJson({
+      batchId,
+      turnId,
+      modelRequestId,
+      messageId,
+      entries,
+      ...(streamIdentity === undefined ? {} : { streamIdentity })
+    });
     const receiptId = sourceReceiptId(source, 'tool-call-batch-create', scope);
     const duplicate = await this.findSourceReceipt(source);
     if (duplicate) {
-      return this.replayToolCallBatch(duplicate, receiptId, batchId, modelRequestId, messageId, entries);
+      return this.replayToolCallBatch(duplicate, receiptId, batchId, modelRequestId, messageId, entries, streamIdentity);
     }
 
     const turnContext = await this.requireActiveTurnContext(turnId);
     const modelRequest = await this.requireExisting('ModelRequest', modelRequestId);
-    if (
-      modelRequest.turn_id !== turnId
-      || modelRequest.status !== 'terminal'
-      || modelRequest.terminal_state !== 'completed'
-    ) throw new Error(`ModelRequest ${modelRequestId} is not the completed Provider source for Turn ${turnId}.`);
+    if (streamIdentity === undefined) {
+      if (
+        modelRequest.turn_id !== turnId
+        || modelRequest.status !== 'terminal'
+        || modelRequest.terminal_state !== 'completed'
+      ) throw new Error(`ModelRequest ${modelRequestId} is not the completed Provider source for Turn ${turnId}.`);
+    } else if (modelRequest.turn_id !== turnId) {
+      throw new Error(`ModelRequest ${modelRequestId} does not belong to Turn ${turnId}.`);
+    } else if (modelRequest.status === 'terminal') {
+      throw new Error(
+        `ModelRequest ${modelRequestId} is already terminal; native streamed admission of ${entries[0].toolCallId} requires the in-flight request.`
+      );
+    }
     await this.requireExisting('Message', messageId);
     const messageLinks = await this.list('ModelRequestMessageLink', { model_request_id: modelRequestId }, 2);
     if (messageLinks.length !== 1 || messageLinks[0].message_id !== messageId) {
       throw new Error(`ModelRequest ${modelRequestId} is not linked to assistant Message ${messageId}.`);
     }
+    const nativeProof = streamIdentity === undefined
+      ? undefined
+      : await this.requireNativeAdmissionProof(modelRequestId, streamIdentity, entries[0]);
 
     const argumentContents = await this.contentStore.prepareBatch(
       this.database,
@@ -400,22 +518,47 @@ export class EffectControlPlane {
       argumentsContent: argumentContents[index]
     }));
     const now = this.timestamp();
+    const nativeAdmissionContentObject = streamIdentity === undefined || nativeProof === undefined
+      ? undefined
+      : await this.contentStore.prepare(
+          this.database,
+          canonicalJson(nativeAdmissionContent({
+            providerCallId: entries[0].providerCallId as string,
+            checkpointId: nativeProof.checkpointId,
+            attemptSeq: streamIdentity.attemptSeq,
+            socketGeneration: streamIdentity.socketGeneration,
+            streamSeq: streamIdentity.streamSeq,
+            responseId: nativeProof.responseId,
+            declaredAsync: nativeProof.declaredAsync,
+            admittedAt: now,
+            ...(nativeProof.outputItem ? { outputItem: nativeProof.outputItem } : {})
+          })),
+          NATIVE_TOOL_ADMISSION_CONTENT_TYPE
+        );
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: ACTIVE_TURN }),
       DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(turnContext.lease.id as string, {
         conversation_id: turnContext.conversation.id,
         turn_id: turnId
       }),
-      DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
-        turn_id: turnId,
-        status: 'terminal',
-        terminal_state: 'completed'
-      }),
+      streamIdentity === undefined
+        ? DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            turn_id: turnId,
+            status: 'terminal',
+            terminal_state: 'completed'
+          })
+        : DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            turn_id: turnId,
+            status: requireText(modelRequest.status, 'ModelRequest.status')
+          }),
       DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').assert(messageLinks[0].id as string, {
         model_request_id: modelRequestId,
         message_id: messageId
       }),
-      ...preparedContentSteps(preparedEntries.map((entry) => entry.argumentsContent), 'tool_batch_args')
+      ...preparedContentSteps(preparedEntries.map((entry) => entry.argumentsContent), 'tool_batch_args'),
+      ...(nativeAdmissionContentObject === undefined
+        ? []
+        : preparedContentSteps([nativeAdmissionContentObject], 'tool_native_admission'))
     ];
     // Lifecycle rows are staged first; relation/snapshot rows are staged only after the complete
     // Provider call set exists. SQLite commit still publishes the whole batch atomically.
@@ -476,6 +619,20 @@ export class EffectControlPlane {
         })
       );
     }
+    if (streamIdentity !== undefined && nativeAdmissionContentObject !== undefined) {
+      steps.push(
+        DOMAIN_REPOSITORIES.domain('ToolCallEvent').insertWithNextSequence({
+          id: stablePhaseDId('tool_call_event', `native_admission:${entries[0].toolCallId}`),
+          tool_call_id: entries[0].toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION,
+          content_object_id: nativeAdmissionContentObject.metadata.id,
+          created_at: now
+        }, {
+          column: 'event_seq',
+          scope: { tool_call_id: entries[0].toolCallId }
+        })
+      );
+    }
 
     const committed = await this.commitSource({
       source,
@@ -486,7 +643,7 @@ export class EffectControlPlane {
       steps
     });
     if (committed.deduplicated) {
-      return this.replayToolCallBatch(committed.receipt, receiptId, batchId, modelRequestId, messageId, entries);
+      return this.replayToolCallBatch(committed.receipt, receiptId, batchId, modelRequestId, messageId, entries, streamIdentity);
     }
     return {
       receiptId,
@@ -559,6 +716,399 @@ export class EffectControlPlane {
       receiptId,
       eventId,
       eventSeq: allocatedValue(committed, 'ToolCallEvent', eventId, 'event_seq'),
+      deduplicated: false,
+      commitSeq: committed.commitSeq
+    };
+  }
+
+  /**
+   * Locates the durable native admission of one ToolCall by row identity (tool_call_id +
+   * event_kind), never by a deterministic event id, so forked copies with rewritten row ids and
+   * pruned original checkpoints still resolve. A ToolCall is native-admitted iff this exists.
+   */
+  public async readNativeAdmission(toolCallIdInput: string): Promise<NativeToolAdmission | undefined> {
+    const toolCallId = requireId(toolCallIdInput, 'toolCallId');
+    const events = await this.list('ToolCallEvent', {
+      tool_call_id: toolCallId,
+      event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
+    }, 2);
+    if (events.length === 0) return undefined;
+    if (events.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple native admission events.`);
+    const content = parseNativeAdmissionContent(await this.readToolCallEventContent(events[0]));
+    return {
+      eventId: requireId(events[0].id, 'ToolCallEvent.id'),
+      toolCallId,
+      providerCallId: content.providerCallId,
+      checkpointId: content.checkpointId,
+      attemptSeq: content.attemptSeq,
+      socketGeneration: content.socketGeneration,
+      streamSeq: content.streamSeq,
+      responseId: content.responseId,
+      declaredAsync: content.declaredAsync,
+      admittedAt: content.admittedAt,
+      ...(content.outputItem ? { outputItem: content.outputItem } : {})
+    };
+  }
+
+  /**
+   * Outstanding native work of one Conversation (optionally one Turn): durably admitted native
+   * calls whose result is not settled, not server-admission-marked, or whose result Context
+   * occurrence is not appended yet. Fully closed calls are omitted; callers filter by turnActive
+   * and the settled/delivered flags for their own guard semantics.
+   */
+  public async listNativePendingWork(input: {
+    conversationId: string;
+    turnId?: string;
+  }): Promise<NativePendingToolCall[]> {
+    const conversationId = requireId(input.conversationId, 'conversationId');
+    const turns = input.turnId === undefined
+      ? await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId })
+      : [await this.requireExisting('Turn', requireId(input.turnId, 'turnId'))];
+    const pending: NativePendingToolCall[] = [];
+    for (const turn of turns) {
+      if (turn.conversation_id !== conversationId) {
+        throw new Error(`Turn ${String(turn.id)} belongs to another Conversation.`);
+      }
+      const calls = await listAllDomainRows(this.database, 'ToolCall', { turn_id: turn.id as string });
+      for (const call of calls) {
+        const toolCallId = requireId(call.id, 'ToolCall.id');
+        const admissions = await this.list('ToolCallEvent', {
+          tool_call_id: toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
+        }, 2);
+        if (admissions.length === 0) continue;
+        if (admissions.length > 1) {
+          throw new Error(`ToolCall ${toolCallId} has multiple native admission events.`);
+        }
+        const links = await this.list('ToolCallSourceLink', { tool_call_id: toolCallId }, 2);
+        if (links.length !== 1) {
+          throw new Error(`Native ToolCall ${toolCallId} lacks its unique ToolCallSourceLink.`);
+        }
+        const results = await this.list('ToolModelResult', { tool_call_id: toolCallId }, 2);
+        if (results.length > 1) throw new Error(`ToolCall ${toolCallId} has multiple ToolModelResult rows.`);
+        const result = results[0];
+        const deliveries = await this.list('ToolCallEvent', {
+          tool_call_id: toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+        }, 2);
+        if (deliveries.length > 1) {
+          throw new Error(`ToolCall ${toolCallId} has multiple native delivery events.`);
+        }
+        const callSources = await this.list('ContextSegmentSource', {
+          source_kind: 'tool_call',
+          source_id: toolCallId
+        }, 2);
+        if (callSources.length > 1) {
+          throw new Error(`ToolCall ${toolCallId} has multiple Context occurrences.`);
+        }
+        const resultSources = result === undefined
+          ? []
+          : await this.list('ContextSegmentSource', {
+              source_kind: 'tool_model_result',
+              source_id: requireId(result.id, 'ToolModelResult.id')
+            }, 2);
+        if (resultSources.length > 1) {
+          throw new Error(`ToolModelResult ${String(result?.id)} has multiple Context occurrences.`);
+        }
+        const resultContextSegmentId = resultSources.length === 1
+          ? requireId(resultSources[0].segment_id, 'ContextSegmentSource.segment_id')
+          : undefined;
+        const settled = result !== undefined;
+        const delivered = deliveries.length === 1;
+        if (settled && delivered && resultContextSegmentId !== undefined) continue;
+        const admission = parseNativeAdmissionContent(await this.readToolCallEventContent(admissions[0]));
+        pending.push({
+          toolCallId,
+          toolName: requireText(call.tool_name, 'ToolCall.tool_name'),
+          turnId: requireId(turn.id, 'Turn.id'),
+          turnActive: turn.status === ACTIVE_TURN,
+          status: requireText(call.status, 'ToolCall.status'),
+          providerCallId: admission.providerCallId,
+          messageId: requireId(links[0].message_id, 'ToolCallSourceLink.message_id'),
+          modelRequestId: requireId(links[0].model_request_id, 'ToolCallSourceLink.model_request_id'),
+          toolModelResultId: result === undefined ? undefined : requireId(result.id, 'ToolModelResult.id'),
+          callContextSegmentId: callSources.length === 1
+            ? requireId(callSources[0].segment_id, 'ContextSegmentSource.segment_id')
+            : undefined,
+          resultContextSegmentId,
+          settled,
+          delivered,
+          admittedAt: admission.admittedAt
+        });
+      }
+    }
+    return pending;
+  }
+
+  /**
+   * Fork/model-switch guard: every durably admitted native call of the Conversation must own a
+   * terminal ToolModelResult AND its result Context occurrence. Throws NativeAsyncWorkPendingError
+   * (code NATIVE_ASYNC_WORK_PENDING) naming each open call otherwise.
+   */
+  public async assertNativeWorkSettledForConversation(conversationIdInput: string): Promise<void> {
+    const conversationId = requireId(conversationIdInput, 'conversationId');
+    const open = (await this.listNativePendingWork({ conversationId })).filter((entry) =>
+      !entry.settled || entry.resultContextSegmentId === undefined
+    );
+    if (open.length === 0) return;
+    throw new NativeAsyncWorkPendingError(
+      open.map((entry) => ({
+        toolCallId: entry.toolCallId,
+        reason: !entry.settled
+          ? `result not settled (ToolCall status ${entry.status})`
+          : 'result Context occurrence not appended'
+      })),
+      'Wait for the active Turn to settle and append every native result, or cancel it, before forking or switching.'
+    );
+  }
+
+  /**
+   * Commits the durable "server admitted this result" fact once per native ToolCall. The Kernel
+   * delivery pump calls this only for a matched explicit result create whose response.created is
+   * already checkpointed — the carrier's native_control response.created naming the provider call
+   * id in admittedToolResultCallIds is the required durable admission proof (proven replay works
+   * even after the carrier sealed; an unverified new delivery is rejected). Unknown or failed
+   * outcomes stay unmarked and remain visible through listNativePendingWork. Exactly-once is
+   * enforced inside the writer transaction: a repeat with the same carrier identity deduplicates,
+   * a conflicting carrier fails.
+   */
+  public async markNativeResultsDelivered(input: {
+    source: PhaseDCommandSource;
+    deliveries: readonly NativeResultDeliveryInput[];
+  }): Promise<NativeResultDeliveryMark> {
+    const source = normalizeSource(input.source, ['callback', 'internal'], 'native-tool-delivery-mark');
+    if (!Array.isArray(input.deliveries) || input.deliveries.length === 0) {
+      throw new TypeError('Native result delivery requires at least one delivery.');
+    }
+    const deliveries = input.deliveries.map((delivery, index) => ({
+      toolCallId: requireId(delivery?.toolCallId, `deliveries[${index}].toolCallId`),
+      carrierModelRequestId: requireId(
+        delivery?.carrierModelRequestId,
+        `deliveries[${index}].carrierModelRequestId`
+      ),
+      providerResponseId: requireText(
+        delivery?.providerResponseId,
+        `deliveries[${index}].providerResponseId`
+      ),
+      ...(delivery?.connectionGeneration === undefined
+        ? {}
+        : {
+            connectionGeneration: requireDecimalString(
+              delivery.connectionGeneration,
+              `deliveries[${index}].connectionGeneration`
+            )
+          }),
+      ...(delivery?.streamId === undefined
+        ? {}
+        : { streamId: requireText(delivery.streamId, `deliveries[${index}].streamId`) })
+    }));
+    if (new Set(deliveries.map((delivery) => delivery.toolCallId)).size !== deliveries.length) {
+      throw new Error('Native result delivery repeats a ToolCall identity.');
+    }
+    const scope = canonicalJson({ deliveries });
+    const receiptId = sourceReceiptId(source, 'native-tool-delivery-mark', scope);
+    const duplicate = await this.findSourceReceipt(source);
+    if (duplicate) {
+      assertSourceReceipt(duplicate, receiptId, 'native-tool-delivery-mark');
+      return {
+        receiptId,
+        events: await this.readNativeDeliveryEventRefs(deliveries.map((delivery) => delivery.toolCallId)),
+        deduplicated: true
+      };
+    }
+
+    const prepared: Array<{
+      delivery: (typeof deliveries)[number];
+      call: DomainRow;
+      result: DomainRow;
+      providerCallId: string;
+      alreadyDelivered: boolean;
+    }> = [];
+    for (const delivery of deliveries) {
+      const call = await this.requireExisting('ToolCall', delivery.toolCallId);
+      if (call.status !== 'terminal') {
+        throw new Error(`ToolCall ${delivery.toolCallId} is not terminal; only settled native results can be delivered.`);
+      }
+      const admissions = await this.list('ToolCallEvent', {
+        tool_call_id: delivery.toolCallId,
+        event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
+      }, 2);
+      if (admissions.length !== 1) {
+        throw new Error(`ToolCall ${delivery.toolCallId} has no durable native admission to deliver.`);
+      }
+      const results = await this.list('ToolModelResult', { tool_call_id: delivery.toolCallId }, 2);
+      if (results.length !== 1) {
+        throw new Error(`ToolCall ${delivery.toolCallId} lacks its unique ToolModelResult.`);
+      }
+      const links = await this.list('ToolCallSourceLink', { tool_call_id: delivery.toolCallId }, 2);
+      if (links.length !== 1) {
+        throw new Error(`ToolCall ${delivery.toolCallId} lacks its unique ToolCallSourceLink.`);
+      }
+      const existing = await this.list('ToolCallEvent', {
+        tool_call_id: delivery.toolCallId,
+        event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+      }, 2);
+      if (existing.length > 1) {
+        throw new Error(`ToolCall ${delivery.toolCallId} has multiple native delivery events.`);
+      }
+      let alreadyDelivered = false;
+      if (existing.length === 1) {
+        const content = parseNativeDeliveryContent(await this.readToolCallEventContent(existing[0]));
+        if (
+          content.carrierModelRequestId !== delivery.carrierModelRequestId
+          || content.providerResponseId !== delivery.providerResponseId
+          || content.toolModelResultId !== requireId(results[0].id, 'ToolModelResult.id')
+        ) {
+          throw new Error(`ToolCall ${delivery.toolCallId} already has a conflicting native delivery.`);
+        }
+        alreadyDelivered = true;
+      }
+      prepared.push({
+        delivery,
+        call,
+        result: results[0],
+        providerCallId: requireText(links[0].provider_call_id, 'ToolCallSourceLink.provider_call_id'),
+        alreadyDelivered
+      });
+    }
+    const turnIdValues = new Set(prepared.map((entry) => requireId(entry.call.turn_id, 'ToolCall.turn_id')));
+    if (turnIdValues.size !== 1) {
+      throw new Error('One native result delivery command must belong to a single Turn.');
+    }
+    const turnId = [...turnIdValues][0];
+    const turn = await this.requireExisting('Turn', turnId);
+
+    // The carrier is the local logical ModelRequest whose continuation carried the outputs to the
+    // server. Proof of the actual server admission is the carrier's persisted native_control
+    // response.created checkpoint naming this call in admittedToolResultCallIds — a wrong, missing
+    // or cross-Turn carrier can never produce it, and a later-sealed carrier with the checkpoint
+    // still supports proven recovery repair (never an unverified new delivery).
+    const carrierIds = new Set<string>();
+    for (const delivery of deliveries) {
+      if (carrierIds.has(delivery.carrierModelRequestId)) continue;
+      const carrier = await this.requireExisting('ModelRequest', delivery.carrierModelRequestId);
+      if (carrier.turn_id !== turnId) {
+        throw new Error(
+          `Carrier ModelRequest ${delivery.carrierModelRequestId} does not belong to Turn ${turnId}; it cannot carry native results of this Turn.`
+        );
+      }
+      carrierIds.add(delivery.carrierModelRequestId);
+    }
+    const fence = currentExecutionLeaseFence();
+    if (fence && fence.conversationId !== turn.conversation_id) {
+      throw new Error('Native result delivery fence belongs to another Conversation.');
+    }
+    // commitSource's transaction already prepends the ambient fence's full tuple assertion;
+    // unfenced recovery/closure marking deliberately survives its source Turn.
+
+    const fresh = prepared.filter((entry) => !entry.alreadyDelivered);
+    for (const entry of fresh) {
+      await this.requireNativeAdmissionCreatedProof(
+        entry.delivery.carrierModelRequestId,
+        entry.providerCallId,
+        entry.delivery.providerResponseId
+      );
+    }
+    const now = this.timestamp();
+    const contents = await this.contentStore.prepareBatch(
+      this.database,
+      fresh.map((entry) => ({
+        content: canonicalJson(nativeDeliveryContent({
+          toolModelResultId: requireId(entry.result.id, 'ToolModelResult.id'),
+          messageRevisionId: requireId(entry.result.message_revision_id, 'ToolModelResult.message_revision_id'),
+          providerCallId: entry.providerCallId,
+          carrierModelRequestId: entry.delivery.carrierModelRequestId,
+          providerResponseId: entry.delivery.providerResponseId,
+          ...(entry.delivery.connectionGeneration === undefined
+            ? {}
+            : { connectionGeneration: entry.delivery.connectionGeneration }),
+          ...(entry.delivery.streamId === undefined ? {} : { streamId: entry.delivery.streamId }),
+          deliveredAt: now
+        })),
+        contentType: NATIVE_TOOL_DELIVERY_CONTENT_TYPE
+      }))
+    );
+    if (contents.length !== fresh.length) {
+      throw new Error('Native delivery content prepare returned the wrong result count.');
+    }
+    const steps: RepositoryTransactionStep[] = [
+      ...[...carrierIds].map((carrierModelRequestId) =>
+        DOMAIN_REPOSITORIES.domain('ModelRequest').assert(carrierModelRequestId, { turn_id: turnId })
+      )
+    ];
+    for (const [index, entry] of fresh.entries()) {
+      steps.push(
+        DOMAIN_REPOSITORIES.domain('ToolCall').assert(entry.delivery.toolCallId, { status: 'terminal' }),
+        DOMAIN_REPOSITORIES.domain('ToolModelResult').assert(requireId(entry.result.id, 'ToolModelResult.id'), {
+          tool_call_id: entry.delivery.toolCallId
+        }),
+        DOMAIN_REPOSITORIES.domain('ToolCallEvent').assertNone({
+          tool_call_id: entry.delivery.toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+        }),
+        ...preparedContentSteps([contents[index]], 'tool_native_delivery'),
+        DOMAIN_REPOSITORIES.domain('ToolCallEvent').insertWithNextSequence({
+          id: stablePhaseDId('tool_call_event', `native_delivery:${entry.delivery.toolCallId}`),
+          tool_call_id: entry.delivery.toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY,
+          content_object_id: contents[index].metadata.id,
+          created_at: now
+        }, {
+          column: 'event_seq',
+          scope: { tool_call_id: entry.delivery.toolCallId }
+        })
+      );
+    }
+
+    let committed: CommandCommit;
+    try {
+      committed = await this.commitSource({
+        source,
+        receiptId,
+        conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+        turnId,
+        receiptPreflight: { receipt: duplicate ?? null },
+        steps
+      });
+    } catch (error) {
+      // A racing delivery committed first (same or conflicting carrier). First-wins: identical
+      // carrier identity deduplicates; anything else is a real conflict and must surface.
+      if (!isTransactionAssertionError(error) && !matchesExpectedUnique(error, [
+        ['tool_call_event', ['id']],
+        ['tool_call_event', ['tool_call_id', 'event_seq']]
+      ])) throw error;
+      const events: Array<{ toolCallId: string; eventId: string }> = [];
+      for (const entry of prepared) {
+        const rows = await this.list('ToolCallEvent', {
+          tool_call_id: entry.delivery.toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+        }, 2);
+        if (rows.length !== 1) throw error;
+        const content = parseNativeDeliveryContent(await this.readToolCallEventContent(rows[0]));
+        if (
+          content.carrierModelRequestId !== entry.delivery.carrierModelRequestId
+          || content.providerResponseId !== entry.delivery.providerResponseId
+        ) throw error;
+        events.push({
+          toolCallId: entry.delivery.toolCallId,
+          eventId: requireId(rows[0].id, 'ToolCallEvent.id')
+        });
+      }
+      return { receiptId, events, deduplicated: true };
+    }
+    if (committed.deduplicated) {
+      return {
+        receiptId,
+        events: await this.readNativeDeliveryEventRefs(deliveries.map((delivery) => delivery.toolCallId)),
+        deduplicated: true
+      };
+    }
+    return {
+      receiptId,
+      events: prepared.map((entry) => ({
+        toolCallId: entry.delivery.toolCallId,
+        eventId: stablePhaseDId('tool_call_event', `native_delivery:${entry.delivery.toolCallId}`)
+      })),
       deduplicated: false,
       commitSeq: committed.commitSeq
     };
@@ -1745,13 +2295,42 @@ export class EffectControlPlane {
         // Delete synchronously with the final rerun check. A later caller now creates a new flight
         // instead of attaching to an already-resolved promise and losing its requested pass.
         if (this.finalizationFlights.get(turnId) === flight) this.finalizationFlights.delete(turnId);
-        return [...finalizedById.values()];
+        const results = [...finalizedById.values()];
+        this.emitToolModelResults(turnId, results);
+        return results;
       }
     })().finally(() => {
       if (this.finalizationFlights.get(turnId) === flight) this.finalizationFlights.delete(turnId);
     });
     this.finalizationFlights.set(turnId, flight);
     return flight.promise;
+  }
+
+  /**
+   * Internal settlement observation for the dispatcher's delivery-pump wake. Fires once per
+   * finalize flight with the newly committed ToolModelResult owners; listener exceptions never
+   * break finalization. Terminals committed outside a finalize flight (file decision plans) are
+   * re-announced by the dispatcher at its own observation points instead.
+   */
+  public subscribeToolModelResults(
+    listener: (events: Array<{ turnId: string; toolCallId: string }>) => void
+  ): () => void {
+    this.toolModelResultListeners.add(listener);
+    return () => {
+      this.toolModelResultListeners.delete(listener);
+    };
+  }
+
+  private emitToolModelResults(turnId: string, results: readonly ToolTerminalResult[]): void {
+    if (results.length === 0 || this.toolModelResultListeners.size === 0) return;
+    const events = results.map((result) => ({ turnId, toolCallId: result.toolCallId }));
+    for (const listener of [...this.toolModelResultListeners]) {
+      try {
+        listener(events);
+      } catch {
+        // Settlement observers must never break finalization.
+      }
+    }
   }
 
   private async finalizeReadyInOrderPass(turnId: string): Promise<ToolTerminalResult[]> {
@@ -2452,7 +3031,8 @@ export class EffectControlPlane {
     batchId: string,
     modelRequestId: string,
     messageId: string,
-    entries: readonly ToolCallBatchEntry[]
+    entries: readonly ToolCallBatchEntry[],
+    streamIdentity?: NativeToolCallStreamIdentity
   ): Promise<CreatedToolCallBatch> {
     assertSourceReceipt(receipt, expectedReceiptId, 'tool-call-batch-create');
     const calls: CreatedToolCallBatch['calls'] = [];
@@ -2467,6 +3047,15 @@ export class EffectControlPlane {
         || links.length !== 1
         || policies.length !== 1
       ) throw new Error(`ToolCall batch replay facts conflict for ${entry.toolCallId}.`);
+      if (streamIdentity !== undefined) {
+        const admissions = await this.list('ToolCallEvent', {
+          tool_call_id: entry.toolCallId,
+          event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
+        }, 2);
+        if (admissions.length !== 1) {
+          throw new Error(`ToolCall ${entry.toolCallId} native replay lacks its durable admission event.`);
+        }
+      }
       const link = links[0];
       if (
         link.model_request_id !== modelRequestId
@@ -2576,6 +3165,166 @@ export class EffectControlPlane {
       requireId(intent.request_object_id, 'EffectIntent.request_object_id')
     );
     return JSON.parse((await this.contentStore.read(metadata)).toString('utf8'));
+  }
+
+  private async readToolCallEventContent(event: DomainRow): Promise<unknown> {
+    const metadata = await this.requireContentObject(
+      requireId(event.content_object_id, 'ToolCallEvent.content_object_id')
+    );
+    return JSON.parse((await this.contentStore.read(metadata)).toString('utf8'));
+  }
+
+  private async readNativeDeliveryEventRefs(
+    toolCallIds: readonly string[]
+  ): Promise<Array<{ toolCallId: string; eventId: string }>> {
+    const events: Array<{ toolCallId: string; eventId: string }> = [];
+    for (const toolCallId of toolCallIds) {
+      const rows = await this.list('ToolCallEvent', {
+        tool_call_id: toolCallId,
+        event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+      }, 2);
+      if (rows.length !== 1) {
+        throw new Error(`ToolCall ${toolCallId} native delivery replay facts are missing.`);
+      }
+      events.push({ toolCallId, eventId: requireId(rows[0].id, 'ToolCallEvent.id') });
+    }
+    return events;
+  }
+
+  /**
+   * Validates the persisted complete native call item checkpoint behind one streamed admission.
+   * Asynchronous calls admit at the complete item; synchronous calls additionally require the
+   * native_control response boundary of the SAME provider response (matched by responseId inside
+   * the same attempt/socket epoch) and never admit at mere item completion.
+   */
+  private async requireNativeAdmissionProof(
+    modelRequestId: string,
+    identity: NativeToolCallStreamIdentity,
+    entry: ToolCallBatchEntry
+  ): Promise<{ checkpointId: string; responseId: string; declaredAsync: boolean; outputItem?: ModelOutputItemReference }> {
+    const providerCallId = entry.providerCallId;
+    if (typeof providerCallId !== 'string' || providerCallId.length === 0) {
+      throw new Error(
+        `Native ToolCall ${entry.toolCallId} requires the original provider call id; anonymous native calls cannot be admitted.`
+      );
+    }
+    const itemSeq = BigInt(identity.streamSeq);
+    const attemptSeq = BigInt(identity.attemptSeq);
+    const socketGeneration = BigInt(identity.socketGeneration);
+    const checkpoints = (await listAllDomainRows(this.database, 'ModelStreamCheckpoint', {
+      model_request_id: modelRequestId
+    })).filter((row) =>
+      requireBigInt(row.attempt_seq, 'ModelStreamCheckpoint.attempt_seq') === attemptSeq
+      && requireBigInt(row.socket_generation, 'ModelStreamCheckpoint.socket_generation') === socketGeneration
+    );
+    const checkpoint = checkpoints.find((row) =>
+      row.checkpoint_kind === 'native_tool_call'
+      && requireBigInt(row.stream_seq, 'ModelStreamCheckpoint.stream_seq') === itemSeq
+    );
+    if (!checkpoint) {
+      throw new Error(
+        `ModelRequest ${modelRequestId} has no persisted complete native call item at ${identity.attemptSeq}/${identity.socketGeneration}/${identity.streamSeq}.`
+      );
+    }
+    const checkpointContent = parseNativeToolCallCheckpoint(
+      await this.readCheckpointContent(checkpoint)
+    );
+    if (
+      checkpointContent.toolName !== entry.toolName
+      || checkpointContent.providerCallId !== providerCallId
+      || checkpointContent.providerOrdinal !== entry.providerOrdinal
+      || canonicalJson(checkpointContent.arguments) !== canonicalJson(entry.arguments)
+    ) {
+      throw new Error(
+        `Native checkpoint ${String(checkpoint.id)} does not match ToolCall ${entry.toolCallId} identity.`
+      );
+    }
+    const checkpointId = requireId(checkpoint.id, 'ModelStreamCheckpoint.id');
+    if (checkpointContent.async) {
+      if (identity.completedResponseStreamSeq !== undefined || identity.providerResponseId !== undefined) {
+        throw new Error('Asynchronous native admission does not take a response boundary.');
+      }
+      return {
+        checkpointId,
+        responseId: checkpointContent.responseId,
+        declaredAsync: true,
+        ...(checkpointContent.outputItem ? { outputItem: checkpointContent.outputItem } : {})
+      };
+    }
+    if (identity.completedResponseStreamSeq === undefined || identity.providerResponseId === undefined) {
+      throw new Error(
+        `Synchronous native ToolCall ${entry.toolCallId} requires completedResponseStreamSeq and providerResponseId; sync calls never admit at item completion.`
+      );
+    }
+    if (checkpointContent.responseId !== identity.providerResponseId) {
+      throw new Error(
+        `Native call item ${checkpointId} belongs to provider response ${checkpointContent.responseId}, not ${identity.providerResponseId}.`
+      );
+    }
+    const boundarySeq = BigInt(identity.completedResponseStreamSeq);
+    if (boundarySeq <= itemSeq) {
+      throw new Error('Native sync admission boundary must follow the complete call item checkpoint.');
+    }
+    const boundary = checkpoints.find((row) =>
+      row.checkpoint_kind === 'native_control'
+      && requireBigInt(row.stream_seq, 'ModelStreamCheckpoint.stream_seq') === boundarySeq
+    );
+    if (!boundary) {
+      throw new Error(
+        `ModelRequest ${modelRequestId} has no native response boundary checkpoint at stream_seq ${identity.completedResponseStreamSeq}.`
+      );
+    }
+    const boundaryContent = parseNativeControlCheckpoint(await this.readCheckpointContent(boundary));
+    if (!isNativeAdmissionBoundary(boundaryContent)) {
+      throw new Error(
+        `Native control checkpoint ${String(boundary.id)} (${boundaryContent.type}${boundaryContent.reason ? `/${boundaryContent.reason}` : ''}) is not an admission boundary for synchronous calls.`
+      );
+    }
+    if (boundaryContent.responseId !== identity.providerResponseId) {
+      throw new Error('Native sync admission boundary belongs to another provider response.');
+    }
+    return {
+      checkpointId,
+      responseId: checkpointContent.responseId,
+      declaredAsync: false,
+      ...(checkpointContent.outputItem ? { outputItem: checkpointContent.outputItem } : {})
+    };
+  }
+
+  private async readCheckpointContent(checkpoint: DomainRow): Promise<unknown> {
+    const metadata = await this.requireContentObject(
+      requireId(checkpoint.content_object_id, 'ModelStreamCheckpoint.content_object_id')
+    );
+    const envelope = plainRecord(JSON.parse((await this.contentStore.read(metadata)).toString('utf8')));
+    if (!envelope || envelope.kind !== checkpoint.checkpoint_kind
+      || envelope.streamSeq !== String(checkpoint.stream_seq)) {
+      throw new TypeError(`Native checkpoint ${String(checkpoint.id)} has an invalid envelope identity.`);
+    }
+    return envelope.content;
+  }
+
+  /**
+   * Proves the actual server admission behind one result delivery: the carrier ModelRequest owns a
+   * persisted native_control response.created checkpoint for the delivered provider response that
+   * names the original provider call id in admittedToolResultCallIds. Without it the delivery is
+   * unverified and must stay unmarked (recovery retains it for the closure path instead).
+   */
+  private async requireNativeAdmissionCreatedProof(
+    carrierModelRequestId: string,
+    providerCallId: string,
+    providerResponseId: string
+  ): Promise<void> {
+    const checkpoints = (await listAllDomainRows(this.database, 'ModelStreamCheckpoint', {
+      model_request_id: carrierModelRequestId
+    })).filter((row) => row.checkpoint_kind === 'native_control');
+    for (const checkpoint of checkpoints) {
+      const content = parseNativeControlCheckpoint(await this.readCheckpointContent(checkpoint));
+      if (content.type !== 'response.created' || content.responseId !== providerResponseId) continue;
+      if ((content.admittedToolResultCallIds ?? []).includes(providerCallId)) return;
+    }
+    throw new Error(
+      `Carrier ModelRequest ${carrierModelRequestId} has no durable response.created admission for ${providerResponseId} naming provider call ${providerCallId}; the delivery is unverified.`
+    );
   }
 
   private async requireContentObject(id: string): Promise<ContentObjectMetadata> {

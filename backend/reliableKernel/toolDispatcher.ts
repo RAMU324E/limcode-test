@@ -235,6 +235,201 @@ interface ResolvedToolBatchPreflight {
   providerDefinitionMismatches: Map<string, string>;
 }
 
+type NativeSchedulingLaneKind = 'ordinary' | 'attachment' | 'processOrMcp' | 'child';
+
+/** The exact batch classifier, shared so native per-item scheduling preserves lane semantics. */
+function nativeSchedulingLaneKind(
+  input: ReliableAgentToolDispatchInput,
+  definitionsByName: ReadonlyMap<string, ToolDefinition>
+): NativeSchedulingLaneKind {
+  if (
+    input.toolName === RUN_AGENT_TOOL_NAME
+    && optionalText(plainOptionalRecord(input.arguments)?.mode) !== 'interrupt'
+  ) return 'child';
+  if (
+    PROCESS_TOOLS.has(input.toolName)
+    || definitionsByName.get(input.toolName)?.declaration.source?.kind === 'mcp'
+  ) return 'processOrMcp';
+  if (isAttachmentReadInput(input)) return 'attachment';
+  return 'ordinary';
+}
+
+/** FIFO bounded slot lane shared by every natively scheduled call of one Turn. */
+class NativeSchedulingLane {
+  private active = 0;
+  private readonly waiters: Array<{
+    resolve(): void;
+    onAbort(): void;
+  }> = [];
+
+  public constructor(private readonly limit: number) {}
+
+  public acquire(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) {
+      return Promise.reject(signal.reason ?? new Error('Native scheduling lane wait was cancelled.'));
+    }
+    if (this.active < this.limit) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter = {
+        resolve,
+        onAbort: () => {
+          const index = this.waiters.indexOf(waiter);
+          if (index < 0) return;
+          this.waiters.splice(index, 1);
+          reject(signal.reason ?? new Error('Native scheduling lane wait was cancelled.'));
+        }
+      };
+      signal.addEventListener('abort', waiter.onAbort, { once: true });
+      this.waiters.push(waiter);
+    });
+  }
+
+  public release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      next.resolve();
+      return;
+    }
+    this.active -= 1;
+  }
+}
+
+/** Child-start admission slot; released early at the durable spawn boundary or on completion. */
+class NativeChildAdmissionControl implements BoundedAdmissionControl {
+  private released = false;
+
+  public constructor(private readonly lane: NativeSchedulingLane) {}
+
+  public release(): void {
+    if (this.released) return;
+    this.released = true;
+    this.lane.release();
+  }
+}
+
+interface PlannedNativeCall {
+  input: ReliableAgentToolDispatchInput;
+  preflight: ResolvedToolBatchPreflight;
+  laneKind: NativeSchedulingLaneKind;
+  serial: boolean;
+}
+
+/**
+ * Turn-scoped scheduler for durably admitted native streamed calls. All calls of one Turn share
+ * the batch lane limits, a serial-policy chain equivalent to the batch group ordering (parallel
+ * generations drain before a serial call; later work waits for it), and the child admission
+ * barrier. It never creates per-call lane pools, so native per-item admission cannot multiply
+ * the Turn's real concurrency.
+ */
+class NativeTurnToolScheduler {
+  private decisionTail: Promise<unknown> = Promise.resolve();
+  private serialTail: Promise<unknown> = Promise.resolve();
+  private generation = new Set<Promise<unknown>>();
+  private readonly lanes: Record<Exclude<NativeSchedulingLaneKind, 'child'>, NativeSchedulingLane> = {
+    ordinary: new NativeSchedulingLane(MAX_CONCURRENT_ORDINARY_TOOLS_PER_TURN),
+    attachment: new NativeSchedulingLane(MAX_CONCURRENT_ATTACHMENT_READS_PER_TURN),
+    processOrMcp: new NativeSchedulingLane(MAX_CONCURRENT_PROCESS_OR_MCP_TOOLS_PER_TURN)
+  };
+  private readonly childLane = new NativeSchedulingLane(MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN);
+  private activeTasks = 0;
+  public readonly controller = new AbortController();
+
+  public constructor(
+    private readonly plan: (input: ReliableAgentToolDispatchInput) => Promise<PlannedNativeCall>,
+    private readonly execute: (
+      planned: PlannedNativeCall,
+      signal: AbortSignal,
+      specialAdmission?: BoundedAdmissionControl
+    ) => Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>,
+    private readonly settleCancelled: (
+      input: ReliableAgentToolDispatchInput,
+      reason: string
+    ) => Promise<ToolTerminalResult | ReliableAgentToolSettled>,
+    private readonly onIdle: () => void
+  ) {}
+
+  public schedule(
+    input: ReliableAgentToolDispatchInput
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    this.activeTasks += 1;
+    // Admission-order planning: preflight/classification/queue insertion are chained per Turn so
+    // concurrent scheduleAdmittedCall invocations cannot interleave their ordering decision.
+    const decision = this.decisionTail.then(() => this.plan(input));
+    this.decisionTail = decision.then(() => undefined, () => undefined);
+    const task = decision.then((planned) => this.start(planned));
+    return task.finally(() => {
+      this.activeTasks -= 1;
+      if (this.activeTasks === 0) this.onIdle();
+    });
+  }
+
+  private start(
+    planned: PlannedNativeCall
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    if (planned.serial) {
+      // A serial call drains the current parallel generation, then runs behind the serial chain.
+      const drain = Promise.allSettled([...this.generation]);
+      this.generation = new Set();
+      const task = this.serialTail.then(async () => {
+        await drain;
+        return this.runInLane(planned);
+      });
+      this.serialTail = task.then(() => undefined, () => undefined);
+      return task;
+    }
+    const gate = this.serialTail;
+    const task = (async () => {
+      await gate;
+      return this.runInLane(planned);
+    })();
+    this.generation.add(task);
+    void task.finally(() => {
+      this.generation.delete(task);
+    }).catch(() => undefined);
+    return task;
+  }
+
+  private async runInLane(
+    planned: PlannedNativeCall
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    const signal = this.controller.signal;
+    const handoff = handoffReason(signal);
+    if (handoff) throw handoff;
+    if (planned.laneKind === 'child') {
+      let admission: NativeChildAdmissionControl;
+      try {
+        await this.childLane.acquire(signal);
+      } catch (error) {
+        const lateHandoff = handoffReason(signal);
+        if (lateHandoff || isExecutionHandoffError(error)) throw lateHandoff ?? error;
+        return this.settleCancelled(planned.input, 'Turn cancelled while waiting for a native child admission slot.');
+      }
+      admission = new NativeChildAdmissionControl(this.childLane);
+      try {
+        return await this.execute(planned, signal, admission);
+      } finally {
+        admission.release();
+      }
+    }
+    const lane = this.lanes[planned.laneKind];
+    try {
+      await lane.acquire(signal);
+    } catch (error) {
+      const lateHandoff = handoffReason(signal);
+      if (lateHandoff || isExecutionHandoffError(error)) throw lateHandoff ?? error;
+      return this.settleCancelled(planned.input, 'Turn cancelled while waiting for a native scheduling slot.');
+    }
+    try {
+      return await this.execute(planned, signal);
+    } finally {
+      lane.release();
+    }
+  }
+}
+
 /** Product Tool dispatcher. Every non-readonly external effect is committed before dispatch. */
 export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   private readonly workEnvironmentTransfers: WorkEnvironmentTransferEffectDispatcher;
@@ -253,6 +448,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   private readonly authorityCache = new Map<string, Promise<{ snapshotId: string; document: PlainJsonValue }>>();
   private readonly pendingPreparedProviderBatches = new Map<string, PreparedProviderToolBatch>();
   private readonly checkedProviderBatchAdmissions = new WeakMap<object, CheckedProviderToolBatch>();
+  private readonly toolSettlementListeners = new Map<string, Set<(event: { toolCallId: string }) => void>>();
+  private readonly effectsSettlementUnsubscribe: () => void;
+  private readonly nativeTurnSchedulers = new Map<string, NativeTurnToolScheduler>();
   private handoff: ExecutionHandoffError | undefined;
 
   public constructor(private readonly dependencies: ReliableToolDispatcherDependencies) {
@@ -260,19 +458,166 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       dependencies.database,
       dependencies.effects
     );
+    this.effectsSettlementUnsubscribe = dependencies.effects.subscribeToolModelResults((events) => {
+      for (const event of events) this.emitToolSettlement(event.turnId, event.toolCallId);
+    });
   }
 
   public async dispose(): Promise<void> {
     await this.quiesce(this.handoff ?? new ExecutionHandoffError());
+    this.effectsSettlementUnsubscribe();
+    this.toolSettlementListeners.clear();
     this.activeHostExecutions.clear();
     this.authorityCache.clear();
     this.pendingPreparedProviderBatches.clear();
     await this.dependencies.host.dispose?.();
   }
 
+  /**
+   * Per-Turn settlement wake for the native delivery pump: fires whenever a ToolCall of the Turn
+   * gains a terminal ToolModelResult by any dispatcher-observable path (finalize flights, approval
+   * resumes and file-decision commits observed at dispatch boundaries). Firing is a wake, not a
+   * result channel; the listener re-reads durable facts. Recovery-driven settlements have no live
+   * pump and are discovered through EffectControlPlane.listNativePendingWork instead.
+   */
+  public subscribeToolSettlements(
+    input: { turnId: string },
+    listener: (event: { toolCallId: string }) => void
+  ): () => void {
+    const turnId = requireId(input.turnId, 'turnId');
+    let listeners = this.toolSettlementListeners.get(turnId);
+    if (!listeners) {
+      listeners = new Set();
+      this.toolSettlementListeners.set(turnId, listeners);
+    }
+    listeners.add(listener);
+    return () => {
+      const current = this.toolSettlementListeners.get(turnId);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) this.toolSettlementListeners.delete(turnId);
+    };
+  }
+
+  private emitToolSettlement(turnId: string, toolCallId: string): void {
+    const listeners = this.toolSettlementListeners.get(turnId);
+    if (!listeners || listeners.size === 0) return;
+    for (const listener of [...listeners]) {
+      try {
+        listener({ toolCallId });
+      } catch {
+        // A delivery-pump wake must never break the settling dispatch.
+      }
+    }
+  }
+
+  /**
+   * Starts one durably admitted native streamed ToolCall through the Turn's shared scheduler:
+   * the same classifiers, lane limits, serial ordering, approval flow and child admission barrier
+   * as a Provider batch, with scheduling state shared across every native call of the Turn.
+   */
+  public scheduleAdmittedCall(
+    input: ReliableAgentToolDispatchInput
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    if (this.handoff) return Promise.reject(this.handoff);
+    const turnId = requireId(input.turnId, 'turnId');
+    let scheduler = this.nativeTurnSchedulers.get(turnId);
+    if (!scheduler) {
+      const created = new NativeTurnToolScheduler(
+        (call) => this.planAdmittedCall(call),
+        (planned, signal, admission) => this.executeAdmittedCall(planned, signal, admission),
+        (call, reason) => this.settleCancelledCapability(call, reason),
+        () => {
+          if (this.nativeTurnSchedulers.get(turnId) === created) {
+            this.nativeTurnSchedulers.delete(turnId);
+          }
+        }
+      );
+      scheduler = created;
+      this.nativeTurnSchedulers.set(turnId, scheduler);
+    }
+    const task = scheduler.schedule(input);
+    this.activeBatchDispatches.set(task, { turnId, controller: scheduler.controller });
+    this.activeDispatches.add(task);
+    void task.finally(() => {
+      this.activeBatchDispatches.delete(task);
+      this.activeDispatches.delete(task);
+    }).catch(() => undefined);
+    return task;
+  }
+
+  private async planAdmittedCall(input: ReliableAgentToolDispatchInput): Promise<PlannedNativeCall> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const preflight = await this.resolveToolBatchPreflight([input], turnId);
+    const decision = preflight.frozenDecisionsById.get(input.toolCallId);
+    if (!decision) throw new Error(`Native ToolCall ${input.toolCallId} lacks a frozen policy snapshot.`);
+    const definitionsByName = new Map(
+      preflight.definitions.map((definition) => [definition.declaration.name, definition])
+    );
+    return {
+      input,
+      preflight,
+      laneKind: nativeSchedulingLaneKind(input, definitionsByName),
+      serial: decision.schedulingMode !== 'parallel'
+    };
+  }
+
+  private async executeAdmittedCall(
+    planned: PlannedNativeCall,
+    signal: AbortSignal,
+    specialAdmission?: BoundedAdmissionControl
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    const { input, preflight } = planned;
+    const policy = authorityPolicy(preflight.baseAuthority.document);
+    const result = await (async (): Promise<InternalDispatchResult> => {
+      this.admissionSignals.set(input.toolCallId, signal);
+      try {
+        const definitionMismatch = preflight.providerDefinitionMismatches.get(input.toolCallId);
+        if (definitionMismatch) return await this.reject(input, definitionMismatch);
+        return await this.dispatchInternal(input, {
+          skipInitialFinalization: true,
+          assumeFresh: preflight.freshCallIds.has(input.toolCallId),
+          toolCall: preflight.toolCallsById.get(input.toolCallId),
+          frozenDecision: preflight.frozenDecisionsById.get(input.toolCallId),
+          skipProviderDefinitionCheck: true,
+          deferNoEffectSettlement: false,
+          definitions: preflight.definitions,
+          authority: {
+            snapshotId: preflight.baseAuthority.snapshotId,
+            document: preflight.baseAuthority.document,
+            ...(policy.toolConfigs[input.toolName] ? { toolConfig: policy.toolConfigs[input.toolName] } : {})
+          },
+          ...(specialAdmission ? { specialAdmission } : {})
+        });
+      } catch (error) {
+        if (isExecutionHandoffError(error)) throw error;
+        return this.settleDispatchFailure(
+          input,
+          `tool-native-schedule:${input.toolCallId}:dispatcher-failed`,
+          error,
+          false
+        );
+      } finally {
+        if (this.admissionSignals.get(input.toolCallId) === signal) {
+          this.admissionSignals.delete(input.toolCallId);
+        }
+      }
+    })();
+    if (isDeferredNoEffectSettlement(result)) {
+      throw new Error('Native scheduled ToolCall leaked a deferred readonly settlement.');
+    }
+    await this.dependencies.effects.finalizeReadyInOrder(input.turnId);
+    if (!isToolSettledResult(result)) return result;
+    return await this.dependencies.effects.readTerminalResult(result.toolCallId, false) ?? result;
+  }
+
   public async quiesce(reason: ExecutionHandoffError): Promise<void> {
     this.handoff = reason;
     this.pendingPreparedProviderBatches.clear();
+    for (const scheduler of this.nativeTurnSchedulers.values()) {
+      if (!scheduler.controller.signal.aborted) scheduler.controller.abort(reason);
+    }
+    this.nativeTurnSchedulers.clear();
     await this.dependencies.host.quiesce?.(reason);
     for (const batch of this.activeBatchDispatches.values()) {
       if (!batch.controller.signal.aborted) batch.controller.abort(reason);
@@ -290,22 +635,33 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const definitions = turnId
       ? await this.definitionsForTurn(available, turnId)
       : available;
-    return definitions.map((definition) => ({
-      name: requireText(definition.declaration.name, 'Tool declaration.name'),
-      description: typeof definition.declaration.description === 'string'
-        ? definition.declaration.description
-        : '',
-      parameters: normalizePlainJson(definition.declaration.parameters ?? {}, `Tool ${definition.declaration.name} parameters`),
-      ...(definition.declaration.source
-        ? { source: normalizePlainJson(definition.declaration.source, `Tool ${definition.declaration.name} source`) }
-        : {}),
-      ...(definition.declaration.metadata
-        ? { metadata: normalizePlainJson(definition.declaration.metadata, `Tool ${definition.declaration.name} metadata`) }
-        : {}),
-      ...(definition.declaration.defaultConfig
-        ? { defaultConfig: normalizePlainJson(definition.declaration.defaultConfig, `Tool ${definition.declaration.name} default config`) }
-        : {})
-    }));
+    const nativeAsyncTools = turnId === undefined
+      ? undefined
+      : nativeAsyncEnabledTools(await this.readAuthority(turnId, 'tool-definitions'));
+    return definitions.map((definition) => {
+      const name = requireText(definition.declaration.name, 'Tool declaration.name');
+      const metadata = nativeAsyncToolMetadata(
+        name,
+        definition.declaration.metadata
+          ? normalizePlainJson(definition.declaration.metadata, `Tool ${name} metadata`)
+          : undefined,
+        nativeAsyncTools
+      );
+      return {
+        name,
+        description: typeof definition.declaration.description === 'string'
+          ? definition.declaration.description
+          : '',
+        parameters: normalizePlainJson(definition.declaration.parameters ?? {}, `Tool ${name} parameters`),
+        ...(definition.declaration.source
+          ? { source: normalizePlainJson(definition.declaration.source, `Tool ${name} source`) }
+          : {}),
+        ...(metadata ? { metadata } : {}),
+        ...(definition.declaration.defaultConfig
+          ? { defaultConfig: normalizePlainJson(definition.declaration.defaultConfig, `Tool ${name} default config`) }
+          : {})
+      };
+    });
   }
 
   public async freezeCall(
@@ -1312,7 +1668,10 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       }
       await this.dependencies.effects.finalizeReadyInOrder(input.turnId);
       const terminal = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
-      if (terminal) return terminal;
+      if (terminal) {
+        this.emitToolSettlement(input.turnId, terminal.toolCallId);
+        return terminal;
+      }
       return {
         disposition: 'paused',
         toolCallId: input.toolCallId,
@@ -1346,10 +1705,16 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       decision: 'approved',
       response: { actor: 'frozen-tool-policy', automatic: true }
     });
-    if (decision.terminal) return decision.terminal;
+    if (decision.terminal) {
+      this.emitToolSettlement(input.turnId, decision.terminal.toolCallId);
+      return decision.terminal;
+    }
     if (!decision.preparedEffect) {
       const terminal = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
-      if (terminal) return terminal;
+      if (terminal) {
+        this.emitToolSettlement(input.turnId, terminal.toolCallId);
+        return terminal;
+      }
       const settled = await this.readReadySettlement(input.toolCallId);
       if (settled) return settled;
       return {
@@ -1399,7 +1764,10 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         };
       }
       const terminal = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
-      if (terminal) return terminal;
+      if (terminal) {
+        this.emitToolSettlement(input.turnId, terminal.toolCallId);
+        return terminal;
+      }
       const decisions = await this.list('FileChangeDecision', { change_set_id: changeSetId }, 2);
       if (decisions.length > 0 || Date.now() >= deadline) return undefined;
       if (await this.turnTerminationRequested(input.turnId)) {
@@ -1996,7 +2364,10 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
     if (finalize) await this.dependencies.effects.finalizeReadyInOrder(input.turnId);
     const terminal = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
-    if (terminal) return terminal;
+    if (terminal) {
+      this.emitToolSettlement(input.turnId, terminal.toolCallId);
+      return terminal;
+    }
     const operations = await listAllDomainRows(this.dependencies.database, 'Operation', {
       tool_call_id: input.toolCallId
     });
@@ -2045,7 +2416,10 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const turnId = requireId(calls[0].turn_id, 'ToolCall.turn_id');
     if (finalize) await this.dependencies.effects.finalizeReadyInOrder(turnId);
     const terminal = await this.dependencies.effects.readTerminalResult(toolCallId, false);
-    if (terminal) return terminal;
+    if (terminal) {
+      this.emitToolSettlement(turnId, terminal.toolCallId);
+      return terminal;
+    }
     const operations = await listAllDomainRows(this.dependencies.database, 'Operation', { tool_call_id: toolCallId });
     if (operations.length > 0 && operations.every((operation) => isTerminalOperationStatus(operation.status))) {
       return {
@@ -2396,6 +2770,38 @@ function definitionAllowedByAuthority(
     ? configRecord.disabledTools.filter((name): name is string => typeof name === 'string')
     : [];
   return !disabled.includes(definition.declaration.name);
+}
+
+/**
+ * Frozen-policy native async opt-in set. Only tools explicitly configured with nativeAsync:true
+ * may ever be declared async on a native channel; false/missing policy means synchronous, and a
+ * declaration-carried flag is never enough on its own.
+ */
+function nativeAsyncEnabledTools(authority: ReliableToolDispatchAuthority): ReadonlySet<string> {
+  const enabled = new Set<string>();
+  for (const [rawName, config] of Object.entries(authorityPolicy(authority.document).toolConfigs)) {
+    const toolName = rawName.trim();
+    if (toolName && config?.nativeAsync === true) enabled.add(toolName);
+  }
+  return enabled;
+}
+
+/** Merges declaration metadata with the frozen policy's async opt-in for the recipe freeze. */
+function nativeAsyncToolMetadata(
+  toolName: string,
+  declarationMetadata: PlainJsonValue | undefined,
+  nativeAsyncTools: ReadonlySet<string> | undefined
+): PlainJsonValue | undefined {
+  const base = declarationMetadata !== null
+    && typeof declarationMetadata === 'object'
+    && !Array.isArray(declarationMetadata)
+    ? declarationMetadata as { [key: string]: PlainJsonValue }
+    : undefined;
+  if (nativeAsyncTools?.has(toolName) === true) return { ...(base ?? {}), nativeAsync: true };
+  if (!base) return undefined;
+  const rest = { ...base };
+  delete rest.nativeAsync;
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
 interface CommandPolicyConfig {

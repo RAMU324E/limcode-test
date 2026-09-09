@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
 import { conversationAttachmentHandleLinkId } from './conversationAttachmentHandles';
+import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
+import { NATIVE_STEER_MESSAGE_TURN_ROLE } from './nativeSteering';
+import {
+  isNativeRequest,
+  readForkContextLineage,
+  readNativeMessageContextRevisions,
+  type NativeMessageContextRevision
+} from './conversationForkContext';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -68,6 +76,7 @@ export async function prepareConversationForkSnapshot(
     sourceConversationId: string;
     targetConversationId: string;
     boundaryMessageSeq?: bigint;
+    contextSegmentIds?: readonly string[];
     targetAgentId: string;
     now: string;
   }
@@ -83,8 +92,39 @@ export async function prepareConversationForkSnapshot(
       limit: 1000
     })
   );
+  const contextLineage = input.contextSegmentIds
+    ? await readForkContextLineage(database, input.contextSegmentIds)
+    : undefined;
+  let boundaryMessageSeq = input.boundaryMessageSeq;
+  if (contextLineage) {
+    const membershipsByMessage = new Map(membershipBarrier.snapshot.map((membership) => [
+      id(membership.message_id, 'MessagePartOfConversation.message_id'), membership
+    ]));
+    const revisionIds = unique(contextLineage.messageSources.map((source) => id(source.source_id, 'ContextSegmentSource.source_id')));
+    const revisions = revisionIds.length > 0 ? await database.snapshot(revisionIds.map((revisionId) =>
+      DOMAIN_REPOSITORIES.domain('MessageRevision').get(revisionId)
+    )) : null;
+    const revisionsById = new Map<string, DomainRow>();
+    for (const [index, revisionId] of revisionIds.entries()) {
+      const value = revisions!.snapshot[index];
+      if (value === null) continue;
+      revisionsById.set(revisionId, row(value, `MessageRevision ${revisionId}`));
+    }
+    for (const source of contextLineage.messageSources) {
+      const revision = revisionsById.get(id(source.source_id, 'ContextSegmentSource.source_id'));
+      if (!revision) continue;
+      const membership = membershipsByMessage.get(id(revision.message_id, 'MessageRevision.message_id'));
+      if (!membership || (revision.role !== 'user' && revision.role !== 'model')) continue;
+      if (source.source_revision !== revision.revision_seq
+        || contextLineage.contentObjectIds.get(id(source.segment_id, 'ContextSegmentSource.segment_id')) !== revision.content_object_id) {
+        throw new Error('Fork Context MessageRevision provenance is inconsistent.');
+      }
+      const sequence = integer(membership.message_seq, 'MessagePartOfConversation.message_seq');
+      if (sequence > boundaryMessageSeq) boundaryMessageSeq = sequence;
+    }
+  }
   const prefixMemberships = membershipBarrier.snapshot
-    .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= input.boundaryMessageSeq!)
+    .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq)
     .sort(compareMessageMembership);
   if (prefixMemberships.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
@@ -147,9 +187,10 @@ export async function prepareConversationForkSnapshot(
     ];
   });
   const relationBarrier = relationReads.length > 0 ? await database.snapshot(relationReads) : null;
-  const messageFacts: MessageFact[] = visibleCandidates.map((candidate, index) => {
+  const messageFacts: MessageFact[] = [];
+  for (const [index, candidate] of visibleCandidates.entries()) {
     const offset = index * 5;
-    return {
+    const fact: MessageFact = {
       ...candidate,
       attachments: rows(relationBarrier!.snapshot[offset], 'AttachmentLink fork source lookup'),
       contextSources: rows(relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource fork source lookup'),
@@ -157,7 +198,14 @@ export async function prepareConversationForkSnapshot(
       requestLinks: rows(relationBarrier!.snapshot[offset + 3], 'ModelRequestMessageLink fork source lookup'),
       toolSources: rows(relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink fork source lookup')
     };
-  });
+    if (fact.turnLinks.some((link) => link.role === NATIVE_STEER_MESSAGE_TURN_ROLE)) {
+      if (!contextLineage) throw new Error('Native steering fork requires an explicit Context prefix.');
+      if (!fact.contextSources.some((source) => contextLineage.segmentIds.has(id(source.segment_id, 'ContextSegmentSource.segment_id')))) {
+        continue;
+      }
+    }
+    messageFacts.push(fact);
+  }
 
   const requestIds = unique(messageFacts.flatMap((fact) => [
     ...fact.requestLinks.map((link) => id(link.model_request_id, 'ModelRequestMessageLink.model_request_id')),
@@ -166,6 +214,25 @@ export async function prepareConversationForkSnapshot(
   const requestRows = await getRows(database, 'ModelRequest', requestIds);
   const requestAggregates = await readRequestAggregates(database, requestRows);
   const requestIdSet = new Set(requestAggregates.map((entry) => id(entry.request.id, 'ModelRequest.id')));
+  const nativeRevisions = new Map<string, NativeMessageContextRevision[]>();
+  const requestRowsById = new Map(requestRows.map((request) => [id(request.id, 'ModelRequest.id'), request]));
+  for (const fact of messageFacts) {
+    if (fact.revision.role !== 'model' || !fact.requestLinks.some((link) => {
+      const request = requestRowsById.get(id(link.model_request_id, 'ModelRequestMessageLink.model_request_id'));
+      return request && isNativeRequest(request);
+    })) continue;
+    if (!contextLineage) throw new Error('Native model output fork requires an explicit Context prefix.');
+    const messageId = id(fact.message.id, 'Message.id');
+    const revisions = await readNativeMessageContextRevisions(database, messageId);
+    const additional: NativeMessageContextRevision[] = [];
+    for (const revision of revisions) {
+      if (revision.sources.some((source) => !contextLineage.segmentIds.has(id(source.segment_id, 'ContextSegmentSource.segment_id')))) {
+        throw new Error('Fork boundary splits a native logical model message; select its completed message boundary.');
+      }
+      if (revision.revision.id !== fact.revision.id) additional.push(revision);
+    }
+    nativeRevisions.set(messageId, additional);
+  }
 
   const toolSources = messageFacts
     .flatMap((fact) => fact.toolSources)
@@ -176,6 +243,15 @@ export async function prepareConversationForkSnapshot(
     unique(toolSources.map((source) => id(source.tool_call_id, 'ToolCallSourceLink.tool_call_id')))
   );
   const tools = await readToolFacts(database, toolSources, toolRows);
+  if (contextLineage) {
+    const included = contextLineage.segmentIds;
+    for (const tool of tools) {
+      if (!tool.events.some((event) => event.event_kind === TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION)) continue;
+      if (tool.pairSources.some((source) => !included.has(id(source.segment_id, 'ContextSegmentSource.segment_id')))) {
+        throw new Error('Fork boundary crosses a native response or excludes its tool result; choose a completed response boundary.');
+      }
+    }
+  }
   const toolResultMessages = await readToolResultMessages(database, tools, input.sourceConversationId);
 
   const turnIds = unique([
@@ -192,6 +268,11 @@ export async function prepareConversationForkSnapshot(
   const attachmentIds = new Set([...messageFacts, ...toolResultMessages].flatMap((fact) =>
     fact.attachments.map((link) => id(link.attachment_id, 'AttachmentLink.attachment_id'))
   ));
+  for (const revisions of nativeRevisions.values()) {
+    for (const revision of revisions) {
+      for (const attachment of revision.attachments) attachmentIds.add(id(attachment.attachment_id, 'AttachmentLink.attachment_id'));
+    }
+  }
   const sourceAttachmentHandles = (await database.snapshotAll(
     DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink').list({
       where: { conversation_id: input.sourceConversationId },
@@ -219,6 +300,12 @@ export async function prepareConversationForkSnapshot(
     messageIdMap.set(sourceMessageId, copyId(target, 'message', sourceMessageId));
     revisionIdMap.set(sourceRevisionId, copyId(target, 'message_revision', sourceRevisionId));
   }
+  for (const revisions of nativeRevisions.values()) {
+    for (const revision of revisions) {
+      const revisionId = id(revision.revision.id, 'MessageRevision.id');
+      revisionIdMap.set(revisionId, copyId(target, 'message_revision', revisionId));
+    }
+  }
   const turnIdMap = idMap(target, 'turn', turnIds);
   const requestIdMap = idMap(target, 'model_request', requestIds);
   const toolIdMap = idMap(target, 'tool_call', tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')));
@@ -245,6 +332,37 @@ export async function prepareConversationForkSnapshot(
   }
   for (const fact of messageFacts) addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap);
   for (const fact of toolResultMessages) addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap);
+  for (const [messageId, revisions] of nativeRevisions) {
+    const targetMessageId = mapped(messageIdMap, messageId, 'Message');
+    for (const { revision, sources, attachments } of revisions) {
+      const sourceRevisionId = id(revision.id, 'MessageRevision.id');
+      const targetRevisionId = mapped(revisionIdMap, sourceRevisionId, 'MessageRevision');
+      assertions.push(DOMAIN_REPOSITORIES.domain('MessageRevision').assert(sourceRevisionId, {
+        message_id: messageId,
+        revision_seq: revision.revision_seq,
+        role: revision.role,
+        content_object_id: revision.content_object_id
+      }));
+      inserts.push(DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
+        ...revision, id: targetRevisionId, message_id: targetMessageId
+      }));
+      for (const source of sources) {
+        inserts.push(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
+          ...source,
+          id: copyId(target, 'context_segment_source', id(source.id, 'ContextSegmentSource.id')),
+          source_id: targetRevisionId,
+          source_revision: revision.revision_seq
+        }));
+      }
+      for (const attachment of attachments) {
+        inserts.push(DOMAIN_REPOSITORIES.domain('AttachmentLink').insert({
+          ...attachment,
+          id: copyId(target, 'attachment_link', id(attachment.id, 'AttachmentLink.id')),
+          message_revision_id: targetRevisionId
+        }));
+      }
+    }
+  }
 
   for (const turn of turnRows) {
     const sourceTurnId = id(turn.id, 'Turn.id');
@@ -444,7 +562,10 @@ async function readToolFacts(
   ));
   return partial.map((fact, index) => {
     const resultSources = rows(resultSourceBarrier.snapshot[index], 'ToolModelResult Context source lookup');
-    if (resultSources.length !== 1 || resultSources[0].segment_id !== fact.callSource.segment_id) {
+    const native = fact.events.some((event) => event.event_kind === TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION);
+    if (resultSources.length !== 1
+      || compareInteger(resultSources[0].source_revision, fact.callSource.source_revision) !== 0
+      || (!native && resultSources[0].segment_id !== fact.callSource.segment_id)) {
       throw new Error(`Fork source ToolCall ${String(fact.toolCall.id)} has an incomplete Context pair.`);
     }
     return { ...fact, pairSources: [fact.callSource, resultSources[0]], fileChangeSet: null, fileMembers: [], fileDecision: null, interactionLinks: [] };
@@ -955,3 +1076,4 @@ function compareMessageMembership(left: DomainRow, right: DomainRow): number {
     || id(left.message_id, 'MessagePartOfConversation.message_id')
       .localeCompare(id(right.message_id, 'MessagePartOfConversation.message_id'));
 }
+

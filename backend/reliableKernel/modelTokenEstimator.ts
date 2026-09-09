@@ -146,6 +146,12 @@ function estimateProviderContextTokens(value: unknown): number {
       const summary = asRecord(value);
       return total + estimateTextTokens(typeof summary?.text === 'string' ? summary.text : '');
     }, 0) : 0;
+  case 'configuration_update': {
+    // Native reasoning selection item; tiny but model-visible on the wire.
+    const reasoning = asRecord(raw.reasoning);
+    return FUNCTION_OVERHEAD_TOKENS
+      + estimateTextTokens(typeof reasoning?.effort === 'string' ? reasoning.effort : '');
+  }
   case 'compaction':
     // Ciphertext is an opaque provider handle, not a text prompt. The compression envelope carries
     // the provider-observed output token estimate for this state when one is available.
