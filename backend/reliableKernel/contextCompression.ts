@@ -20,6 +20,7 @@ import {
   ReliableContextTokenEstimator,
   type ReliableContextTokenEstimateSource
 } from './contextTokenEstimator';
+import { MAX_PROVIDER_TOKEN_CALIBRATION_RATIO } from './modelFacingContextProjection';
 import {
   DOMAIN_REPOSITORIES,
   savepoint,
@@ -76,6 +77,11 @@ export interface CreateCompressionCommand {
     };
     estimatedTokensBefore?: number;
     estimatedTokensAfter?: number;
+    /** Provider/estimator ratio used to size the retained tail, within [1, 4]. */
+    providerCalibrationRatio?: number;
+    /** estimatedTokensBefore/After re-expressed in Provider tokens by that ratio. */
+    calibratedTokensBefore?: number;
+    calibratedTokensAfter?: number;
     providerInputTokens?: number;
     providerOutputTokens?: number;
     methodKind: string;
@@ -809,6 +815,15 @@ function estimateCompressionSummaryInput(
     : estimateMessageContentsTokens(input);
 }
 
+function requireCalibrationRatio(value: number): number {
+  if (!Number.isFinite(value) || value < 1 || value > MAX_PROVIDER_TOKEN_CALIBRATION_RATIO) {
+    throw new TypeError(
+      `summaryMetadata.providerCalibrationRatio must be within [1, ${MAX_PROVIDER_TOKEN_CALIBRATION_RATIO}].`
+    );
+  }
+  return value;
+}
+
 function requireEstimatedTokens(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`${label} must be a non-negative safe integer.`);
@@ -950,6 +965,15 @@ function normalizeCompressionSummary(
         }),
         ...(metadata.estimatedTokensAfter === undefined ? {} : {
           estimatedTokensAfter: requireEstimatedTokens(metadata.estimatedTokensAfter, 'summaryMetadata.estimatedTokensAfter')
+        }),
+        ...(metadata.providerCalibrationRatio === undefined ? {} : {
+          providerCalibrationRatio: requireCalibrationRatio(metadata.providerCalibrationRatio)
+        }),
+        ...(metadata.calibratedTokensBefore === undefined ? {} : {
+          calibratedTokensBefore: requireEstimatedTokens(metadata.calibratedTokensBefore, 'summaryMetadata.calibratedTokensBefore')
+        }),
+        ...(metadata.calibratedTokensAfter === undefined ? {} : {
+          calibratedTokensAfter: requireEstimatedTokens(metadata.calibratedTokensAfter, 'summaryMetadata.calibratedTokensAfter')
         }),
         ...(metadata.providerInputTokens === undefined ? {} : {
           providerInputTokens: requireEstimatedTokens(metadata.providerInputTokens, 'summaryMetadata.providerInputTokens')

@@ -234,6 +234,160 @@ export function calculateFullRequestPlanningBudget(
   };
 }
 
+/**
+ * Upper bound on how far Provider tokenization may exceed the local estimator before planning stops
+ * trusting the anchor. A stale or unusual anchor must not be able to collapse the retained tail.
+ */
+export const MAX_PROVIDER_TOKEN_CALIBRATION_RATIO = 4;
+
+/**
+ * Ratio between Provider-observed tokens and the local estimator on the same frozen request.
+ *
+ * Compression budgets mix two units. The context window, the configured threshold and the body
+ * target are Provider token facts, while every content measurement here comes from the
+ * model-independent local estimator. That estimator is tuned for English prose and runs far below
+ * real tokenization on CJK and code, so planning a retained tail directly against a Provider-unit
+ * target keeps roughly this ratio's worth of extra real Context and re-crosses the threshold within
+ * minutes. The same Provider-observed anchor that already level-triggers compression removes the
+ * mismatch, so calibration costs no extra Provider call.
+ */
+export interface ProviderTokenCalibration {
+  /** Provider-observed full-input tokens for the frozen request. */
+  observedTokens: number;
+  /** Local estimator total for that same request. */
+  estimatedTokens: number;
+  /** observedTokens / estimatedTokens, bounded to [1, MAX_PROVIDER_TOKEN_CALIBRATION_RATIO]. */
+  ratio: number;
+}
+
+/** Identity calibration used whenever no Provider anchor covers the frozen request. */
+export const UNCALIBRATED_PROVIDER_TOKENS: ProviderTokenCalibration = {
+  observedTokens: 0,
+  estimatedTokens: 0,
+  ratio: 1
+};
+
+/**
+ * Calibration only ever tightens planning. An estimator that over-counts already produces a
+ * conservative plan, and widening it from a single observation could push the real request past the
+ * Provider window, so the ratio is clamped at 1 from below.
+ */
+export function providerTokenCalibration(
+  observedTokens: number,
+  estimatedTokens: number
+): ProviderTokenCalibration {
+  const observed = nonNegativeTokenCount(observedTokens, 'observedTokens');
+  const estimated = nonNegativeTokenCount(estimatedTokens, 'estimatedTokens');
+  if (observed === 0 || estimated === 0) return UNCALIBRATED_PROVIDER_TOKENS;
+  const ratio = Math.min(
+    MAX_PROVIDER_TOKEN_CALIBRATION_RATIO,
+    Math.max(1, observed / estimated)
+  );
+  return { observedTokens: observed, estimatedTokens: estimated, ratio };
+}
+
+/** Converts a local estimator measurement into the Provider unit the budgets are written in. */
+export function calibrateEstimatorToProvider(
+  tokens: number,
+  calibration: ProviderTokenCalibration
+): number {
+  return Math.ceil(nonNegativeTokenCount(tokens, 'estimator tokens') * calibrationRatio(calibration));
+}
+
+/** Converts a Provider-unit budget into the local estimator unit that Context selection measures. */
+export function calibrateProviderToEstimator(
+  tokens: number,
+  calibration: ProviderTokenCalibration
+): number {
+  return Math.floor(nonNegativeTokenCount(tokens, 'provider tokens') / calibrationRatio(calibration));
+}
+
+export interface CalibratedCompressionRoomsInput {
+  budget: FullRequestPlanningBudget;
+  calibration: ProviderTokenCalibration;
+  /** Current input, runtime deliveries and the Turn reminder, in local estimator tokens. */
+  irreducibleAddendaTokens: number;
+}
+
+/**
+ * Compression planning rooms with one declared unit per field.
+ *
+ * Every `calibrated*` field is in Provider tokens, matching the context window, the configured
+ * threshold and the body target. `hardContextRoomTokens` is converted back into estimator tokens
+ * because it is compared against locally measured Context groups.
+ */
+export interface CalibratedCompressionRooms {
+  calibration: ProviderTokenCalibration;
+  /** Fixed overhead re-expressed in Provider tokens. */
+  calibratedFixedTokens: number;
+  /** Irreducible request addenda re-expressed in Provider tokens. */
+  calibratedAddendaTokens: number;
+  /** Provider-unit body room left by the Provider input capacity. */
+  calibratedPlanningBodyRoomTokens: number;
+  /** Provider-unit body target the retained Context must land under. */
+  calibratedBodyTargetTokens: number;
+  /** Room for the newest indivisible Context group, in local estimator tokens. */
+  hardContextRoomTokens: number;
+}
+
+export function calculateCalibratedCompressionRooms(
+  input: CalibratedCompressionRoomsInput
+): CalibratedCompressionRooms {
+  const { budget, calibration } = input;
+  const calibratedFixedTokens = calibrateEstimatorToProvider(budget.fixedTokens, calibration);
+  const calibratedAddendaTokens = calibrateEstimatorToProvider(
+    nonNegativeTokenCount(input.irreducibleAddendaTokens, 'irreducibleAddendaTokens'),
+    calibration
+  );
+  const calibratedPlanningBodyRoomTokens = Math.max(
+    0,
+    budget.planningInputCapacityTokens - calibratedFixedTokens
+  );
+  const calibratedPolicyBodyRoomTokens = Math.max(
+    0,
+    budget.compressionThresholdTokens - calibratedFixedTokens - 1
+  );
+  return {
+    calibration,
+    calibratedFixedTokens,
+    calibratedAddendaTokens,
+    calibratedPlanningBodyRoomTokens,
+    calibratedBodyTargetTokens: Math.min(
+      MODEL_BODY_TARGET_TOKENS,
+      calibratedPlanningBodyRoomTokens,
+      budget.fixedOverPolicy ? calibratedPlanningBodyRoomTokens : calibratedPolicyBodyRoomTokens
+    ),
+    hardContextRoomTokens: calibrateProviderToEstimator(
+      Math.max(0, calibratedPlanningBodyRoomTokens - calibratedAddendaTokens),
+      calibration
+    )
+  };
+}
+
+/** Retained-tail allowance in local estimator tokens, after reserving the Provider summary budget. */
+export function calibratedTailBudgetTokens(
+  rooms: CalibratedCompressionRooms,
+  summaryMaxTokens: number
+): number {
+  return calibrateProviderToEstimator(
+    Math.max(
+      0,
+      rooms.calibratedBodyTargetTokens
+        - rooms.calibratedAddendaTokens
+        - nonNegativeTokenCount(summaryMaxTokens, 'summaryMaxTokens')
+    ),
+    rooms.calibration
+  );
+}
+
+function calibrationRatio(calibration: ProviderTokenCalibration): number {
+  const ratio = calibration?.ratio;
+  if (!Number.isFinite(ratio) || (ratio as number) < 1 || (ratio as number) > MAX_PROVIDER_TOKEN_CALIBRATION_RATIO) {
+    throw new RangeError(`Provider token calibration ratio must be within [1, ${MAX_PROVIDER_TOKEN_CALIBRATION_RATIO}].`);
+  }
+  return ratio as number;
+}
+
 /** Compression-only admission. Ordinary requests are always sent unless a Provider rejects them. */
 export function preflightCompressionRequest(
   input: FullRequestPlanningInput
