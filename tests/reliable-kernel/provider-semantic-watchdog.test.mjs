@@ -1441,6 +1441,68 @@ test('Provider semantic checkpoint overflow 有界合并且 terminal summary 仍
   });
 });
 
+test('native control and tool admission checkpoints remain durable after visual checkpoint coalescing', async () => {
+  const { MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/reliableKernel/databaseWorkerProtocol.js')
+  ).href);
+  const normalItemCount = MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT + 1;
+  await withApp('provider-native-critical-checkpoints', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'native-critical-checkpoints');
+    let ordinaryCoalesced = false;
+    const durableIds = [];
+    await controlPlane(app, {
+      semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+    }).dispatch(request.modelRequestId, {
+      providerId: 'provider-watchdog',
+      async sendFullRequest(fullRequest, controls) {
+        for (let item = 1; item <= normalItemCount; item += 1) {
+          const result = await controls.onEvent({
+            kind: 'output_item_done',
+            streamSeq: String(item),
+            content: { type: 'synthetic_item', item }
+          });
+          ordinaryCoalesced ||= result.ignoredReason === 'checkpoint-capacity';
+        }
+        let sequence = BigInt(normalItemCount);
+        for (const checkpointKind of ['native_control', 'native_tool_call']) {
+          sequence += 1n;
+          const checkpointId = `${request.modelRequestId}-${checkpointKind}`;
+          const content = await app.contentStore.prepare(
+            app.database,
+            JSON.stringify({ kind: checkpointKind, streamSeq: sequence.toString() }),
+            'application/json'
+          );
+          const committed = await app.database.commitModelStreamEvent({
+            modelRequestId: request.modelRequestId,
+            checkpointId,
+            attemptSeq: BigInt(fullRequest.attemptSeq),
+            socketGeneration: BigInt(fullRequest.socketGeneration),
+            streamSeq: sequence,
+            checkpointKind,
+            terminalFenceId: null,
+            contentObject: content.metadata,
+            ...(content.insert ? { contentInsert: content.insert } : {}),
+            usage: null,
+            terminalStats: null,
+            now: new Date().toISOString()
+          });
+          assert.equal(committed.checkpointed, true, `${checkpointKind} must authorize durable recovery, not just transient display`);
+          const persisted = await get(app, 'ModelStreamCheckpoint', checkpointId);
+          assert.equal(persisted.content_object_id, content.metadata.id);
+          durableIds.push(checkpointId);
+        }
+        await controls.onEvent({
+          kind: 'completed', streamSeq: String(sequence + 1n),
+          content: modelContent('native facts survived checkpoint pressure')
+        });
+      }
+    });
+    assert.equal(ordinaryCoalesced, true);
+    for (const id of durableIds) assert.ok(await get(app, 'ModelStreamCheckpoint', id));
+    assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, 'completed');
+  });
+});
+
 test('单条 thought 后的合法静默在 idle 边界内完成且不创建重试 Attempt', async () => {
   await withApp('provider-legitimate-thought-silence', async (app, conversationId, turnId) => {
     const provider = controlPlane(app, {

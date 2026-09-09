@@ -1,6 +1,7 @@
 import type * as vscode from 'vscode';
 import type {
   AgentRecord,
+  ChatModelOverrideRecord,
   CheckpointPolicyRecord,
   CheckpointPolicyScopeLinkRecord,
   ClientState,
@@ -36,12 +37,15 @@ import type {
   WorkEnvironmentRecord,
   WorkflowRecord
 } from '../../shared/protocol';
+import { normalizePlainJson } from './plainJson';
+import type { RequestCompressionSettings } from './requestCompressionSettings';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS
 } from '../../shared/protocol';
 import { createEmptyClientState } from '../../shared/clientStateSchema';
+import { normalizeOpenAIResponsesNativeSettings } from '../../shared/openAIResponsesCapabilities';
 import { resolveToolPolicyLayers, type ToolPolicyLayer } from '../../shared/toolPolicyResolution';
 import {
   createLocalFolderWorkEnvironmentRecord,
@@ -317,6 +321,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
       ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
+    // Native facts freeze with the Turn: the kernel capability gate must replay identically after
+    // recovery even if the editable channel settings change mid-request.
+    const nativeResponses = normalizeOpenAIResponsesNativeSettings(
+      selectedModelConfig?.nativeResponses ?? provider.nativeResponses
+    );
     const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
     const compressionThresholdTokens = compression.thresholdTokens;
     const allowedTools = toolPolicy.allowedTools;
@@ -397,9 +406,15 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         providerConfigId: provider.id,
         provider: provider.provider,
         modelId,
+        baseUrl: provider.baseUrl,
+        openaiResponsesTransport: provider.openaiResponsesTransport,
         enableMultimodalTools,
         systemPromptPrefix,
         maxOutputTokens,
+        ...(primaryGenerationConfig?.thinkingConfig
+          ? { thinkingConfig: clonePlain(primaryGenerationConfig.thinkingConfig) }
+          : {}),
+        ...(nativeResponses ? { nativeResponses } : {}),
         retryPolicy: frozenProviderRetryPolicy(provider, modelId)
       },
       modelProfile: {
@@ -940,6 +955,38 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     };
   }
 
+  public async loadRequestCompressionSettings(
+    model: ChatModelOverrideRecord
+  ): Promise<RequestCompressionSettings> {
+    const paths = this.getPaths();
+    const [providers, configs, selection] = await Promise.all([
+      loadLlmProviderConfigsSettings(paths),
+      loadLlmCompressionConfigsSettings(paths),
+      loadGlobalSettingsFile(paths.settingsRootUri, 'llmCompression')
+    ]);
+    const provider = providers.settings.configs.find((candidate) => candidate.id === model.providerConfigId);
+    if (!provider || provider.provider !== model.provider || !providerContainsModel(provider, model.model)) {
+      throw new Error('当前对话使用的模型渠道已删除或改变，请重新选择模型。');
+    }
+    const contextWindowTokens = resolveContextWindow(provider, model.model);
+    const resolved = resolveFrozenCompression({
+      compressionConfigs: configs.settings.configs,
+      compressionSettings: normalizeLlmCompressionSettings(
+        selection.settings as Partial<LlmCompressionSettingsRecord>, configs.settings.configs
+      ),
+      providerConfigs: providers.settings.configs
+    }, provider, model.model, contextWindowTokens);
+    return {
+      model: { ...model },
+      modelProfile: {
+        contextWindowTokens,
+        compressionThresholdTokens: resolved.thresholdTokens,
+        tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
+      },
+      compression: normalizePlainJson(resolved.snapshot, '请求压缩配置')
+    };
+  }
+
   private async loadRecords(): Promise<ConfigurationRecords> {
     const paths = this.getPaths();
     const [
@@ -1035,7 +1082,7 @@ interface FrozenCompressionResolution {
 
 /** Resolves the exact model/provider/default binding once and freezes a credential-free replay document. */
 function resolveFrozenCompression(
-  records: ConfigurationRecords,
+  records: Pick<ConfigurationRecords, 'compressionSettings' | 'compressionConfigs' | 'providerConfigs'>,
   primaryProvider: LlmProviderConfigRecord,
   primaryModelId: string,
   contextWindowTokens: number

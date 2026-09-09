@@ -11,6 +11,7 @@ import {
   MAX_LLM_COMPRESSION_BODY_TARGET_ROOM_SHARE,
   type ContentPart,
   type InlineDataPart,
+  type ModelOutputItemReference,
   type MessageContent
 } from '../../shared/protocol';
 import {
@@ -696,6 +697,101 @@ export interface StoredModelFacingContextItem {
 }
 
 /**
+ * Native reasoning `configuration_update` items are transport-only: they select the reasoning
+ * effort for subsequent responses but carry no semantic content. They must never reach the
+ * standalone /responses/compact endpoint or a text-summary input; after a compaction the rebase
+ * re-applies the effective effort as one fresh update before the next user message.
+ */
+export const NATIVE_CONFIGURATION_UPDATE_ITEM_TYPE = 'configuration_update';
+
+export interface NativeConfigurationUpdateFact {
+  /** Reasoning effort selected by the update, when declared. */
+  effort?: string;
+}
+
+export function isNativeConfigurationUpdatePart(part: ContentPart): boolean {
+  if (!('providerContext' in part)) return false;
+  if (part.providerContext.itemType === NATIVE_CONFIGURATION_UPDATE_ITEM_TYPE) return true;
+  return asRecord(part.providerContext.rawItem)?.type === NATIVE_CONFIGURATION_UPDATE_ITEM_TYPE;
+}
+
+export function nativeConfigurationUpdateEffort(part: ContentPart): string | undefined {
+  if (!('providerContext' in part)) return undefined;
+  if (part.providerContext.itemType !== NATIVE_CONFIGURATION_UPDATE_ITEM_TYPE
+    && asRecord(part.providerContext.rawItem)?.type !== NATIVE_CONFIGURATION_UPDATE_ITEM_TYPE) {
+    return undefined;
+  }
+  const raw = asRecord(part.providerContext.rawItem);
+  const reasoning = asRecord(raw?.reasoning);
+  return optionalText(reasoning?.effort);
+}
+
+/** Collects every configuration_update in model-facing chronological order. */
+export function collectNativeConfigurationUpdates(
+  contents: readonly MessageContent[]
+): NativeConfigurationUpdateFact[] {
+  const updates: NativeConfigurationUpdateFact[] = [];
+  for (const content of contents) {
+    for (const part of content.parts) {
+      if (!isNativeConfigurationUpdatePart(part)) continue;
+      const effort = nativeConfigurationUpdateEffort(part);
+      updates.push(effort === undefined ? {} : { effort });
+    }
+  }
+  return updates;
+}
+
+/**
+ * Outbound-projection-only filter for compression-bound windows: drops configuration_update items
+ * while preserving every semantic item in its original chronological position. The durable stored
+ * Context is never mutated; callers send the returned contents and keep the update facts for the
+ * post-compression rebase.
+ */
+export function stripNativeConfigurationUpdates(contents: readonly MessageContent[]): {
+  contents: MessageContent[];
+  removedCount: number;
+  updates: NativeConfigurationUpdateFact[];
+} {
+  const updates: NativeConfigurationUpdateFact[] = [];
+  const stripped: MessageContent[] = [];
+  for (const content of contents) {
+    if (!content.parts.some(isNativeConfigurationUpdatePart)) {
+      stripped.push(cloneMessageContent(content));
+      continue;
+    }
+    const retained: ContentPart[] = [];
+    for (const part of content.parts) {
+      if (isNativeConfigurationUpdatePart(part)) {
+        const effort = nativeConfigurationUpdateEffort(part);
+        updates.push(effort === undefined ? {} : { effort });
+      } else {
+        retained.push(cloneJsonValue(part) as ContentPart);
+      }
+    }
+    // An update-only carrier has no semantic content left; the rebase re-applies the effort.
+    if (retained.length > 0) stripped.push({ role: content.role, parts: retained });
+  }
+  return { contents: stripped, removedCount: updates.length, updates };
+}
+
+/** Scans durable stored Context items for configuration_update facts without altering them. */
+export function collectStoredNativeConfigurationUpdates(
+  items: readonly StoredModelFacingContextItem[]
+): NativeConfigurationUpdateFact[] {
+  const updates: NativeConfigurationUpdateFact[] = [];
+  for (const item of items) {
+    for (const content of storedContextItemContents(item, { entries: [] })) {
+      for (const part of content.parts) {
+        if (!isNativeConfigurationUpdatePart(part)) continue;
+        const effort = nativeConfigurationUpdateEffort(part);
+        updates.push(effort === undefined ? {} : { effort });
+      }
+    }
+  }
+  return updates;
+}
+
+/**
  * Decodes the Reliable Context envelopes before applying the ordinary/native shared projection.
  * This is intentionally pure: callers keep the stored CAS bytes unchanged.
  */
@@ -921,6 +1017,49 @@ function storedContextItemContents(
         }]
       }];
     }
+    if (call && !result && typeof call.toolName === 'string') {
+      // A durably admitted native call whose delayed result has not arrived yet. The provider must
+      // see its own call item at exactly this chronological position; the self-contained result
+      // segment appended later completes the exchange on the wire. Only facts actually stored by
+      // the admission are projected: the real async flag, provider call id, thought signature and
+      // a structurally complete output-item reference. native:true alone never implies async.
+      const storedOutputItem = asRecord(call.outputItem);
+      const outputItem: ModelOutputItemReference | undefined = storedOutputItem
+        && typeof storedOutputItem.id === 'string' && storedOutputItem.id.length > 0
+        && typeof storedOutputItem.ordinal === 'number'
+        && Number.isSafeInteger(storedOutputItem.ordinal) && storedOutputItem.ordinal >= 0
+        ? {
+            id: storedOutputItem.id,
+            ordinal: storedOutputItem.ordinal,
+            ...(storedOutputItem.phase === 'commentary' || storedOutputItem.phase === 'final_answer'
+              ? { phase: storedOutputItem.phase }
+              : {}),
+            ...(typeof storedOutputItem.providerResponseId === 'string' && storedOutputItem.providerResponseId
+              ? { providerResponseId: storedOutputItem.providerResponseId }
+              : {}),
+            ...(typeof storedOutputItem.previousResponseId === 'string' && storedOutputItem.previousResponseId
+              ? { previousResponseId: storedOutputItem.previousResponseId }
+              : {})
+          }
+        : undefined;
+      return [{
+        role: 'model',
+        parts: [{
+          ...(typeof call.providerCallId === 'string' && call.providerCallId.trim()
+            ? { id: call.providerCallId }
+            : {}),
+          functionCall: {
+            name: call.toolName,
+            args: parseNestedJson(call.arguments) ?? {}
+          },
+          ...(typeof call.async === 'boolean' ? { async: call.async } : {}),
+          ...(typeof call.thoughtSignature === 'string' && call.thoughtSignature.trim()
+            ? { thoughtSignature: call.thoughtSignature }
+            : {}),
+          ...(outputItem ? { outputItem } : {})
+        }]
+      }];
+    }
   }
   if (item.contentType === 'application/vnd.limcode.compression-contents+json') {
     const envelope = parseRecord(item.content);
@@ -1046,10 +1185,13 @@ export function projectSummaryModelWindow(
   mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): ModelWindowProjection {
   const ordinary = projectOrdinaryModelWindow(contents, modelHandleCatalogInput, mediaState);
-  const projected = ordinary.contents.map((content): MessageContent => ({
-    role: content.role,
-    parts: content.parts.flatMap(summaryParts)
-  }));
+  const projected = ordinary.contents
+    .map((content): MessageContent => ({
+      role: content.role,
+      parts: content.parts.flatMap(summaryParts)
+    }))
+    // A carrier left empty by a dropped transport-only update contributes nothing to the summary.
+    .filter((content) => content.parts.length > 0);
   return {
     contents: projected,
     tokenCount: estimateMessageContentsTokens(projected),
@@ -1090,6 +1232,9 @@ function summaryParts(part: ContentPart): ContentPart[] {
     }) }];
   }
   if ('providerContext' in part) {
+    // Transport-only reasoning selection: it carries no semantic content for the summarizer and
+    // provider-native compact rejects it. The post-compression rebase re-applies the effort.
+    if (isNativeConfigurationUpdatePart(part)) return [];
     const raw = asRecord(part.providerContext.rawItem);
     return [{ text: stableJson({
       kind: 'historical_provider_item',

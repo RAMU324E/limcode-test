@@ -134,11 +134,14 @@ const toolEvents = computed<ToolCallEventRecord[]>(() => {
 const transientPreview = computed(() => {
   const partId = props.part.id;
   if (!partId || !props.messageId) return undefined;
+  const projection = reliableConversation.projection.value;
   const durableCallId = toolCall.value?.id;
+  // 转向边界拆分出的展示条目没有独立的持久化身份；预览与正文详请一律回溯到来源聚合消息，
+  // durable ToolCall 的归属仍按拆分条目自身（ToolCallSourceLink 精确解析后的位置）。
+  const sourceMessageId = projection.splitSourceMessageIdByMessageId[props.messageId] ?? props.messageId;
   if (durableCallId) {
-    const projection = reliableConversation.projection.value;
     if (projection.interactionByToolCallId[durableCallId]?.status === 'pending') return undefined;
-    const revisionId = projection.messageRevisionIdByMessageId[props.messageId];
+    const revisionId = projection.messageRevisionIdByMessageId[sourceMessageId];
     const messageDetail = revisionId
       ? reliableConversation.feed.details[reliableKernelDetailKey('message-content', revisionId)]
       : undefined;
@@ -152,7 +155,7 @@ const transientPreview = computed(() => {
     reliableConversation.feed.transientModelRequests,
     Object.values(reliableConversation.feed.records.ModelRequestMessageLink ?? {}),
     reliableConversation.conversationId.value,
-    props.messageId,
+    sourceMessageId,
     partId,
     { includeFinal: true }
   );

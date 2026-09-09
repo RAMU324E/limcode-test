@@ -5,7 +5,11 @@ import {
   UnknownModelHandleReferenceError
 } from './modelHandleCatalog';
 import { createHash } from 'node:crypto';
-import type { MessageContent } from '../../shared/protocol';
+import type {
+  LlmOpenAIResponsesTransport,
+  LlmProviderKind,
+  MessageContent
+} from '../../shared/protocol';
 import { mapSettledWithBoundedConcurrency } from '../capabilities/boundedConcurrency';
 import { classifyCommandCall } from '../world/modules/tools/definitions/command';
 import type { RuntimeDeliveryControlPlane } from './answerDelivery';
@@ -24,6 +28,7 @@ import {
   EffectControlPlane,
   type CreatedToolCallBatch,
   type FrozenToolCallPolicyDecision,
+  type NativeToolAdmission,
   type ToolOutcomeStatus,
   type ToolTerminalResult
 } from './effectControlPlane';
@@ -33,9 +38,18 @@ import {
   modelRequestIdFor,
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   type FullRequestProviderAdapter,
-  type ProviderStreamEvent,
+  type ProviderTransientStreamEvent,
   type StreamEventResult
 } from './modelProviderControlPlane';
+import {
+  openAIResponsesNativeCapabilities,
+  normalizeOpenAIResponsesNativeSettings
+} from '../../shared/openAIResponsesCapabilities';
+import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
+import { NativeRequestSession } from './nativeRequestSession';
+import { NativeAsyncWorkPendingError, TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY } from './nativeToolFacts';
+import { readNativeSteeringInFlight } from './nativeSteering';
+import { planNativeCompressionRebase } from './nativeCompressionGuard';
 import {
   readCurrentTurnTaskCard,
   shouldInjectTurnTaskCard,
@@ -51,6 +65,7 @@ import {
   TurnControlPlane,
   type TurnInputCommand
 } from './turnControlPlane';
+import { readFrozenTurnAuthority } from './frozenAuthority';
 import { assistantMessageIdFor, TurnOutputControlPlane } from './turnOutput';
 import { ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
 import type {
@@ -141,6 +156,23 @@ export interface ReliableAgentToolDispatcher {
     options?: { admission?: ReliableAgentToolBatchAdmission }
   ): Promise<Array<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>>;
   dispatch(input: ReliableAgentToolDispatchInput): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>;
+  /**
+   * Starts one durably admitted native streamed call using the dispatcher's own classifiers,
+   * serial/parallel policy, approval/admission behavior and shared Turn scheduling limits. The
+   * kernel never imposes a second scheduler for early async execution.
+   */
+  scheduleAdmittedCall?(
+    input: ReliableAgentToolDispatchInput
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled>;
+  /**
+   * Fires whenever a ToolCall of the Turn gains a terminal ToolModelResult through any live path
+   * (dispatch resolution, batch, approval resume, deferred no-effect, cancellation settlement).
+   * Native async deliveries depend on it while the loop is blocked inside a logical request.
+   */
+  subscribeToolSettlements?(
+    input: { turnId: string },
+    listener: (event: { toolCallId: string }) => void
+  ): () => void;
   /** Prewired cancellation boundary; Runner may invoke it without knowing capability internals. */
   cancelActive?(input: { turnId: string; reason: string }): Promise<void> | void;
   /** Host handoff aborts local waits without inventing a user cancellation or terminal Turn. */
@@ -162,7 +194,7 @@ export interface ReliableAgentTransientEvent {
   socketGeneration: string;
   /** Durable commit frontier visible before this Provider socket was dispatched. */
   afterCommitSeq: string;
-  event: ProviderStreamEvent;
+  event: ProviderTransientStreamEvent;
   observedAt: string;
 }
 
@@ -383,15 +415,20 @@ export class ReliableAgentLoop {
             facts = await this.readRoundFacts(turnId);
           }
           const toolDefinitions = await this.tools.definitions(turnId);
+          const settingsSnapshotContentObjectId = await this.modelProvider.freezeRequestSettings(
+            turnId, requireId(facts.authority.id, 'AuthoritySnapshot.id')
+          );
           let frozenRecipe = await this.freezeOrdinaryRequestRecipe({
             turnId,
             round,
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+            authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             tools: toolDefinitions,
             includeOpenTaskCompletionCheck
           });
           let preview = await this.modelProvider.previewOrdinaryRequest({
             turnId,
+            settingsSnapshotContentObjectId,
             contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             recipe: frozenRecipe,
@@ -407,6 +444,7 @@ export class ReliableAgentLoop {
           // rejected solely because this heuristic estimate is high.
           const compression = await this.compressionCoordinator.coordinate({
             turnId,
+            settingsSnapshotContentObjectId,
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             trigger: 'auto',
@@ -428,15 +466,32 @@ export class ReliableAgentLoop {
             if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
               facts = await this.readRoundFacts(turnId);
             }
+            // A compression on a native turn always rebases the fresh chain; without detected
+            // updates the plan carries no configuration_update but still resets the cache.
+            const nativeRebasePlan = compression.nativeRebase
+              ?? planNativeCompressionRebase({ nativeEnabled: true, updates: [] });
             frozenRecipe = await this.freezeOrdinaryRequestRecipe({
               turnId,
               round,
               headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+              authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
               tools: toolDefinitions,
-              includeOpenTaskCompletionCheck
+              includeOpenTaskCompletionCheck,
+              ...(nativeRebasePlan
+                ? {
+                    nativeRebase: {
+                      cacheReset: nativeRebasePlan.cacheReset,
+                      forceFullReason: nativeRebasePlan.forceFullReason,
+                      ...(nativeRebasePlan.freshConfigurationUpdate
+                        ? { freshConfigurationUpdate: nativeRebasePlan.freshConfigurationUpdate }
+                        : {})
+                    }
+                  }
+                : {})
             });
             preview = await this.modelProvider.previewOrdinaryRequest({
               turnId,
+              settingsSnapshotContentObjectId,
               contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
               authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
               recipe: frozenRecipe,
@@ -448,8 +503,14 @@ export class ReliableAgentLoop {
             }
             planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
           }
+          await this.guardNativeModelSwitch(
+            requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+            preview.providerId,
+            preview.modelId
+          );
           const created = await this.modelProvider.createModelRequest({
             turnId,
+            settingsSnapshotContentObjectId,
             contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             recipe: frozenRecipe,
@@ -521,15 +582,31 @@ export class ReliableAgentLoop {
           }
         }
         this.observeLifecycle({ turnId, stage: 'assistant_commit_started', round, modelRequestId });
-        const message = await this.turnOutput.appendAssistantMessage({
-          turnId,
-          modelRequestId,
-          sourceKey: modelRequestId,
-          content: JSON.stringify(providerOutputMessage(output)),
-          contentType: MESSAGE_CONTENT_TYPE
-        });
+        const nativeCapabilities = readFrozenNativeCapabilities(modelRequestRecipe);
+        const message = nativeCapabilities
+          ? await this.turnOutput.appendNativeAssistantAggregate({
+              turnId,
+              modelRequestId,
+              content: JSON.stringify(providerOutputMessage(output)),
+              contentType: MESSAGE_CONTENT_TYPE
+            })
+          : await this.turnOutput.appendAssistantMessage({
+              turnId,
+              modelRequestId,
+              sourceKey: modelRequestId,
+              content: JSON.stringify(providerOutputMessage(output)),
+              contentType: MESSAGE_CONTENT_TYPE
+            });
         assistantMessageIds.push(message.messageId);
         this.observeLifecycle({ turnId, stage: 'assistant_commit_completed', round, modelRequestId });
+        // A completed full-history request is the stateless server-admission proof for earlier
+        // native results actually projected onto its sent body.
+        if (nativeCapabilities) {
+          await this.markNativeCarrierDeliveries(
+            requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+            modelRequestId
+          );
+        }
 
         if (shouldContinueOpenTasks) {
           // This visible output remains an in-progress assistant message. The next frozen recipe owns
@@ -596,13 +673,21 @@ export class ReliableAgentLoop {
         )) {
           return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
         }
-        const batchDispatch = await this.dispatchProviderToolBatch({
-          conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-          turnId,
-          round,
-          modelRequestId,
-          calls: batch
-        });
+        const batchDispatch = nativeCapabilities
+          ? await this.dispatchNativeToolBatch({
+              conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+              turnId,
+              round,
+              modelRequestId,
+              calls: batch
+            })
+          : await this.dispatchProviderToolBatch({
+              conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+              turnId,
+              round,
+              modelRequestId,
+              calls: batch
+            });
         if (batchDispatch.status === 'interrupted') {
           return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
         }
@@ -622,6 +707,60 @@ export class ReliableAgentLoop {
           round,
           modelRequestId
         })) {
+          const terminalTurn = await this.requireExisting('Turn', turnId);
+          return {
+            turnId,
+            terminalStatus: await this.readLoopTerminalStatus(turnId, terminalTurn),
+            modelRequestIds,
+            assistantMessageIds,
+            toolCallIds
+          };
+        }
+        // A native logical ModelRequest that delivered every call's result and received final
+        // successor text is complete: the aggregate is the final answer, never a new legacy round.
+        // Undelivered (HTTP-pending or unadmitted) calls still continue with a carrier request.
+        if (nativeCapabilities && await this.nativeLogicalRequestDeliveredAll(batch)) {
+          const fence = await this.automaticDeliveries.establishFinalOutputFence({ turnId, modelRequestId });
+          if (!fence.established) {
+            if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
+              requestSequence += 1n;
+              continue agentRounds;
+            }
+            const latestTurn = await this.requireExisting('Turn', turnId);
+            if (latestTurn.status !== 'active') {
+              return {
+                turnId,
+                terminalStatus: await this.readLoopTerminalStatus(turnId, latestTurn),
+                modelRequestIds,
+                assistantMessageIds,
+                toolCallIds
+              };
+            }
+            throw new Error(`Turn ${turnId} could not establish final-output authority.`);
+          }
+          if (await this.terminateIfRequested(turnId, `round:${round}:native-final-output-fenced:${modelRequestId}`)) {
+            return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+          }
+          this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
+          try {
+            await this.turns.terminal({
+              source: { kind: 'internal', key: `agent-loop:${turnId}:complete-native:${modelRequestId}` },
+              turnId,
+              terminalStatus: 'completed',
+              reason: 'native_logical_request_completed'
+            });
+          } catch (error) {
+            if (isTurnTerminalInputConflictError(error)) {
+              if (await this.terminateIfRequested(turnId, `round:${round}:native-final-output-fenced:${modelRequestId}`)) {
+                return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+              }
+              throw new Error(
+                `Runtime input crossed final-output fence for Turn ${turnId}: ${errorMessage(error)}`
+              );
+            }
+            throw error;
+          }
+          this.observeLifecycle({ turnId, stage: 'turn_terminal_completed', round, modelRequestId });
           const terminalTurn = await this.requireExisting('Turn', turnId);
           return {
             turnId,
@@ -692,14 +831,22 @@ export class ReliableAgentLoop {
     turnId: string;
     round: string;
     headRootId: string;
+    authoritySnapshotId: string;
     tools: readonly ReliableAgentToolDefinition[];
     includeOpenTaskCompletionCheck: boolean;
+    /** Outcome of a just-committed native compression rebase, frozen into the successor request. */
+    nativeRebase?: {
+      cacheReset?: boolean;
+      forceFullReason?: 'compression';
+      freshConfigurationUpdate?: { effort: string };
+    };
   }): Promise<PlainJsonValue> {
-    const [currentTurnState, runtimeStatusCard, turnTaskCard, previousTaskCard] = await Promise.all([
+    const [currentTurnState, runtimeStatusCard, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
       this.readCurrentTurnInputReference(input.turnId, input.headRootId),
       this.readRuntimeStatusCard(input.turnId),
       readCurrentTurnTaskCard(this.database, this.contentStore, input.turnId),
-      this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round)
+      this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round),
+      this.readNativeRecipeFreeze(input)
     ]);
     const materialized = await this.context.materialize(input.headRootId);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
@@ -753,8 +900,172 @@ export class ReliableAgentLoop {
           kind: OPEN_TASK_COMPLETION_CHECK_KIND,
           card: OPEN_TASK_COMPLETION_CHECK_CARD
         }
-      } : {})
+      } : {}),
+      ...(nativeFreeze.nativeResponses ? { nativeResponses: nativeFreeze.nativeResponses } : {}),
+      ...(nativeFreeze.nativeReasoning ? { nativeReasoning: nativeFreeze.nativeReasoning } : {})
     }, 'Reliable Agent recipe');
+  }
+
+  /**
+   * Freezes the Astra native decision and reasoning facts into the ordinary recipe so recovery
+   * replays byte-identical behavior. Capability inputs come from the frozen Turn authority (never
+   * live settings). The base stays stable on a compatible lineage; effort changes become pending
+   * configuration updates. Mode/model/provider changes and compression rebase discard stale updates.
+   */
+  private async readNativeRecipeFreeze(input: {
+    turnId: string;
+    round: string;
+    authoritySnapshotId: string;
+    nativeRebase?: {
+      cacheReset?: boolean;
+      forceFullReason?: 'compression';
+      freshConfigurationUpdate?: { effort: string };
+    };
+  }): Promise<{
+    nativeResponses?: OpenAIResponsesNativeCapabilities;
+    nativeReasoning?: {
+      baseEffort?: string;
+      baseMode?: 'standard' | 'pro';
+      updates: ReadonlyArray<{ effort: string }>;
+      effectiveEffort?: string;
+      resetCache?: boolean;
+      forceFullReason?: 'compression';
+      pendingConfigurationUpdate?: { effort: string };
+    };
+  }> {
+    const frozen = await readFrozenTurnAuthority(
+      this.database,
+      this.contentStore,
+      requireId(input.authoritySnapshotId, 'authoritySnapshotId'),
+      requireId(input.turnId, 'turnId')
+    );
+    const documentModel = asRecord(frozen.document)?.model;
+    const modelRecord = asRecord(documentModel);
+    const capabilities = openAIResponsesNativeCapabilities({
+      provider: modelRecord?.provider as LlmProviderKind | undefined,
+      model: typeof modelRecord?.modelId === 'string' ? modelRecord.modelId : undefined,
+      baseUrl: typeof modelRecord?.baseUrl === 'string' ? modelRecord.baseUrl : undefined,
+      transport: modelRecord?.openaiResponsesTransport as LlmOpenAIResponsesTransport | undefined,
+      nativeResponses: normalizeOpenAIResponsesNativeSettings(modelRecord?.nativeResponses)
+    });
+    if (!capabilities.asyncTools && !capabilities.steering && !capabilities.reasoningUpdates) {
+      return {};
+    }
+    const thinking = asRecord(modelRecord?.thinkingConfig);
+    const configuredEffort = typeof thinking?.thinkingLevel === 'string' && thinking.thinkingLevel !== 'not-set' && thinking.thinkingLevel !== 'non-set'
+      ? thinking.thinkingLevel
+      : undefined;
+    const configuredMode = thinking?.reasoningMode === 'standard' || thinking?.reasoningMode === 'pro'
+      ? thinking.reasoningMode
+      : undefined;
+    // The base request reasoning stays stable across the conversation's native chains; a changed
+    // configured effort is bridged by exactly one new configuration_update (never adjacent), and a
+    // changed reasoning mode resets the base because updates carry effort only. The previous
+    // pending update counts as applied by its own request.
+    let baseEffort = configuredEffort;
+    let baseMode: 'standard' | 'pro' | undefined = configuredMode;
+    let carriedUpdates: ReadonlyArray<{ effort: string }> = [];
+    let pendingConfigurationUpdate = capabilities.reasoningUpdates
+      ? input.nativeRebase?.freshConfigurationUpdate
+      : undefined;
+    const previous = capabilities.reasoningUpdates
+      ? await this.readLatestNativeReasoning(
+          requireId((await this.requireExisting('Turn', input.turnId)).conversation_id, 'Turn.conversation_id'),
+          requireId(modelRecord?.providerConfigId, 'native model.providerConfigId'),
+          requireId(modelRecord?.modelId, 'native model.modelId')
+        )
+      : undefined;
+    if (previous) {
+      const appliedUpdates = [
+        ...previous.updates,
+        ...(previous.pendingConfigurationUpdate ? [previous.pendingConfigurationUpdate] : [])
+      ];
+      if (previous.baseMode !== configuredMode) {
+        carriedUpdates = [];
+      } else {
+        baseEffort = previous.baseEffort ?? configuredEffort;
+        baseMode = previous.baseMode ?? configuredMode;
+        carriedUpdates = appliedUpdates;
+        const previousEffective = previous.effectiveEffort
+          ?? appliedUpdates[appliedUpdates.length - 1]?.effort
+          ?? previous.baseEffort;
+        if (
+          !pendingConfigurationUpdate
+          && configuredEffort !== undefined
+          && configuredEffort !== previousEffective
+        ) {
+          pendingConfigurationUpdate = { effort: configuredEffort };
+        }
+      }
+    }
+    if (input.nativeRebase?.forceFullReason === 'compression') carriedUpdates = [];
+    const effectiveEffort = pendingConfigurationUpdate?.effort
+      ?? configuredEffort
+      ?? carriedUpdates[carriedUpdates.length - 1]?.effort
+      ?? baseEffort;
+    return {
+      nativeResponses: capabilities,
+      nativeReasoning: {
+        ...(baseEffort ? { baseEffort } : {}),
+        ...(baseMode ? { baseMode } : {}),
+        updates: carriedUpdates,
+        ...(effectiveEffort ? { effectiveEffort } : {}),
+        ...(input.nativeRebase?.cacheReset === true ? { resetCache: true } : {}),
+        ...(input.nativeRebase?.forceFullReason === 'compression' ? { forceFullReason: 'compression' as const } : {}),
+        ...(pendingConfigurationUpdate ? { pendingConfigurationUpdate } : {})
+      }
+    };
+  }
+
+  /**
+   * Reads the newest ordinary request on the compatible model/provider lineage. A non-native or
+   * different model/provider request ends that lineage; older native choices cannot leak across it.
+   */
+  private async readLatestNativeReasoning(
+    conversationId: string,
+    providerId: string,
+    modelId: string
+  ): Promise<{
+    baseEffort?: string;
+    baseMode?: 'standard' | 'pro';
+    updates: ReadonlyArray<{ effort: string }>;
+    effectiveEffort?: string;
+    pendingConfigurationUpdate?: { effort: string };
+  } | undefined> {
+    const turns = (await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId }))
+      .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+    for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+      const requests = (await listAllDomainRows(this.database, 'ModelRequest', {
+        turn_id: requireId(turns[turnIndex].id, 'Turn.id')
+      })).sort((left, right) => compareInteger(right.request_seq, left.request_seq));
+      for (const request of requests) {
+        const recipe = (await this.readModelRequestRecipes([request])).get(requireId(request.id, 'ModelRequest.id'));
+        if (!recipe || recipe.kind !== 'reliable-agent-turn') continue;
+        if (request.provider_id !== providerId || request.model_id !== modelId
+          || asRecord(recipe.nativeResponses) === undefined) return undefined;
+        const reasoning = asRecord(recipe.nativeReasoning);
+        if (!reasoning) return undefined;
+        const updates = Array.isArray(reasoning.updates)
+          ? reasoning.updates
+              .map((entry) => asRecord(entry))
+              .filter((entry): entry is Record<string, unknown> => entry !== undefined && typeof entry.effort === 'string')
+              .map((entry) => ({ effort: entry.effort as string }))
+          : [];
+        const pending = asRecord(reasoning.pendingConfigurationUpdate);
+        return {
+          ...(typeof reasoning.baseEffort === 'string' ? { baseEffort: reasoning.baseEffort } : {}),
+          ...(reasoning.baseMode === 'standard' || reasoning.baseMode === 'pro'
+            ? { baseMode: reasoning.baseMode }
+            : {}),
+          updates,
+          ...(typeof reasoning.effectiveEffort === 'string' ? { effectiveEffort: reasoning.effectiveEffort } : {}),
+          ...(pending && typeof pending.effort === 'string'
+            ? { pendingConfigurationUpdate: { effort: pending.effort } }
+            : {})
+        };
+      }
+    }
+    return undefined;
   }
 
   private async readPreviousTaskCardReminderStateForRound(
@@ -946,7 +1257,14 @@ export class ReliableAgentLoop {
       'ToolCallSourceLink',
       { model_request_id: input.modelRequestId }
     );
-    if (existingLinks.length !== 0 && existingLinks.length !== input.output.toolCalls.length) {
+    // Native streamed admission legitimately persists a subset of links before the terminal read;
+    // each one is still validated against its ordinal below. Ordinary batches stay all-or-nothing.
+    const nativePartialBatch = asRecord(recipe.nativeResponses) !== undefined;
+    if (
+      existingLinks.length !== 0
+      && (existingLinks.length > input.output.toolCalls.length
+        || (existingLinks.length !== input.output.toolCalls.length && !nativePartialBatch))
+    ) {
       throw new Error(`ModelRequest ${input.modelRequestId} has an incomplete durable ToolCall batch.`);
     }
     const existingByOrdinal = new Map(existingLinks.map((link) => [
@@ -1033,22 +1351,30 @@ export class ReliableAgentLoop {
       return call;
     });
     const batchId = stableId('tool_call_batch', input.modelRequestId);
-    const creation = await this.effects.createToolCallBatch({
-      source: { kind: 'callback', key: `agent-loop:${input.modelRequestId}:tool-batch` },
-      batchId,
-      turnId: input.turnId,
-      modelRequestId: input.modelRequestId,
-      messageId: input.messageId,
-      entries: frozenCalls.map((call) => ({
-        toolCallId: call.toolCallId,
-        toolName: call.name,
-        arguments: call.arguments,
-        ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
-        providerOrdinal: call.providerOrdinal,
-        ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
-        policy: call.policy
-      }))
-    });
+    // Native streamed admission already created its calls in per-call batches; the terminal batch
+    // creates only the missing entries. A fully linked ordinary batch still replays through the
+    // same stable receipt so its process-local admission token survives recovery.
+    const creationCalls = pending.length > 0
+      ? pending.map((entry) => frozenCalls[entry.index])
+      : frozenCalls;
+    const creation = pending.length > 0 || !nativePartialBatch
+      ? await this.effects.createToolCallBatch({
+          source: { kind: 'callback', key: `agent-loop:${input.modelRequestId}:tool-batch` },
+          batchId,
+          turnId: input.turnId,
+          modelRequestId: input.modelRequestId,
+          messageId: input.messageId,
+          entries: creationCalls.map((call) => ({
+            toolCallId: call.toolCallId,
+            toolName: call.name,
+            arguments: call.arguments,
+            ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
+            providerOrdinal: call.providerOrdinal,
+            ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
+            policy: call.policy
+          }))
+        })
+      : undefined;
     const batchAdmission = creation && this.tools.confirmPreparedBatch
       ? await this.tools.confirmPreparedBatch({
           turnId: input.turnId,
@@ -1056,7 +1382,7 @@ export class ReliableAgentLoop {
           messageId: input.messageId,
           batchId,
           recipeDefinitions: definitions,
-          calls: frozenCalls.map((call) => ({
+          calls: creationCalls.map((call) => ({
             turnId: input.turnId,
             modelRequestId: input.modelRequestId,
             toolCallId: call.toolCallId,
@@ -1123,6 +1449,111 @@ export class ReliableAgentLoop {
       cursor = end;
     }
     return { status: 'completed' };
+  }
+
+  /**
+   * Native logical-request batch: admitted calls reconcile settlement and append their result
+   * occurrence explicitly (closure path — live-chain deliveries already committed at the admission
+   * created event); unadmitted runs keep the exact ordinary group/pair semantics. A round with
+   * fresh occurrences continues so the next request carries ready results; only a fully stalled
+   * admitted set parks the Turn until its settlement wake.
+   */
+  private async dispatchNativeToolBatch(input: {
+    conversationId: string;
+    turnId: string;
+    round: string;
+    modelRequestId: string;
+    calls: readonly FrozenProviderToolCall[];
+  }): Promise<{ status: 'completed' } | { status: 'waiting' | 'interrupted'; toolCallId: string }> {
+    const admissions = new Map<string, NativeToolAdmission | undefined>();
+    for (const call of input.calls) {
+      admissions.set(call.toolCallId, await this.effects.readNativeAdmission(call.toolCallId));
+    }
+    let progressed = false;
+    let firstPending: string | undefined;
+    let cursor = 0;
+    while (cursor < input.calls.length) {
+      const call = input.calls[cursor];
+      if (!admissions.get(call.toolCallId)) {
+        let end = cursor + 1;
+        while (end < input.calls.length && !admissions.get(input.calls[end].toolCallId)) end += 1;
+        const runDispatch = await this.dispatchProviderToolBatch({
+          conversationId: input.conversationId,
+          turnId: input.turnId,
+          round: input.round,
+          modelRequestId: input.modelRequestId,
+          calls: input.calls.slice(cursor, end)
+        });
+        if (runDispatch.status !== 'completed') return runDispatch;
+        progressed = true;
+        cursor = end;
+        continue;
+      }
+      if (await this.terminateIfRequested(
+        input.turnId,
+        `round:${input.round}:native-tool-batch:${cursor}`,
+        call.toolCallId
+      )) {
+        return { status: 'interrupted', toolCallId: call.toolCallId };
+      }
+      let terminal = await this.effects.readTerminalResult(call.toolCallId, false);
+      if (!terminal) {
+        // The dispatcher reconciles its own durable frontier; this never re-executes committed effects.
+        await this.dispatchProviderToolCall({
+          turnId: input.turnId,
+          round: input.round,
+          modelRequestId: input.modelRequestId,
+          call
+        });
+        terminal = await this.effects.readTerminalResult(call.toolCallId, false);
+      }
+      if (terminal) {
+        const appended = await this.appendNativeResultOccurrenceOnce({
+          conversationId: input.conversationId,
+          toolCallId: call.toolCallId,
+          toolModelResultId: terminal.toolModelResultId
+        });
+        if (appended) {
+          progressed = true;
+          this.observeLifecycle({
+            turnId: input.turnId,
+            stage: 'context_tool_pair_committed',
+            round: input.round,
+            modelRequestId: input.modelRequestId,
+            toolCallId: call.toolCallId,
+            contextPairCount: 1,
+            contextTransactionCount: 1
+          });
+        }
+      } else {
+        firstPending ??= call.toolCallId;
+      }
+      cursor += 1;
+    }
+    if (firstPending && !progressed) return { status: 'waiting', toolCallId: firstPending };
+    return { status: 'completed' };
+  }
+
+  /** Idempotent explicit result occurrence append of the native closure path. */
+  private async appendNativeResultOccurrenceOnce(input: {
+    conversationId: string;
+    toolCallId: string;
+    toolModelResultId: string;
+  }): Promise<boolean> {
+    const sources = await this.list('ContextSegmentSource', {
+      source_kind: 'tool_model_result',
+      source_id: input.toolModelResultId
+    }, 2);
+    if (sources.length > 1) {
+      throw new Error(`ToolModelResult ${input.toolModelResultId} has multiple Context occurrences.`);
+    }
+    if (sources.length === 1) return false;
+    await this.context.appendNativeToolResult({
+      conversationId: input.conversationId,
+      toolCallId: input.toolCallId,
+      toolModelResultId: input.toolModelResultId
+    });
+    return true;
   }
 
   private async dispatchProviderToolGroup(input: {
@@ -1412,66 +1843,375 @@ export class ReliableAgentLoop {
     const adapter = await this.providers.resolve(providerId);
     if (adapter.providerId !== providerId) throw new Error(`Provider registry returned ${adapter.providerId} for ${providerId}.`);
     const dispatchBarrier = await this.database.snapshot([]);
+    const recipe = await this.readModelRequestRecipe(modelRequestId);
+    const nativeCapabilities = readFrozenNativeCapabilities(recipe);
+    let session: NativeRequestSession | undefined;
+    if (nativeCapabilities) {
+      const definitions = await this.readModelRequestToolDefinitions(modelRequestId, recipe);
+      const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
+      const catalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+      session = new NativeRequestSession({
+        database: this.database,
+        contentStore: this.contentStore,
+        context: this.context,
+        turnOutput: this.turnOutput,
+        effects: this.effects,
+        tools: this.tools,
+        modelProvider: this.modelProvider,
+        conversationId,
+        turnId,
+        modelRequestId,
+        providerId,
+        modelId,
+        capabilities: nativeCapabilities,
+        resolveAdapter: async (id) => this.providers.resolve(id),
+        resolveDefinition: (name) => definitionsByName.get(name) ?? unknownToolDefinition(name),
+        freezePolicies: async (inputs) => this.freezeDispatchPolicies(inputs),
+        dispatchCall: async (input) => this.dispatchNativeCall(input),
+        toolCallIdFor: (providerOrdinal, providerCallId, name) =>
+          providerToolCallId(modelRequestId, { providerOrdinal, providerCallId, name, arguments: {} }),
+        closeAdmittedCall: async (toolCallId, sourceKey) => this.closeNativeAdmittedCall(toolCallId, sourceKey),
+        resolveCallArguments: (name, argumentsValue) => {
+          try {
+            return {
+              arguments: normalizePlainJson(
+                resolveModelToolArguments(name, argumentsValue, catalog),
+                `Native ToolCall ${name} resolved arguments`
+              )
+            };
+          } catch (error) {
+            if (!(error instanceof UnknownModelHandleReferenceError)) throw error;
+            return {
+              arguments: normalizePlainJson(argumentsValue, `Native ToolCall ${name} unresolved arguments`),
+              error: errorMessage(error)
+            };
+          }
+        },
+        now: this.now
+      });
+      await session.reconcile();
+    }
+    const activeSession = session;
     const wrapped: FullRequestProviderAdapter = {
       providerId,
       ...(adapter.estimateFullRequestInput
         ? { estimateFullRequestInput: (fullRequest) => adapter.estimateFullRequestInput!(fullRequest) }
         : {}),
-      sendFullRequest: (fullRequest, controls) => adapter.sendFullRequest(fullRequest, {
-        signal: controls.signal,
-        onEvent: async (event): Promise<StreamEventResult> => {
-          const observe = (): void => this.observeTransientEvent({
-            conversationId,
-            turnId,
-            modelRequestId,
-            requestSeq,
-            providerId,
-            modelId,
-            attemptSeq: fullRequest.attemptSeq,
-            socketGeneration: fullRequest.socketGeneration,
-            afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
-            event: {
-              kind: event.kind,
-              streamSeq: event.streamSeq,
-              content: event.content,
-              ...(event.usage !== undefined ? { usage: event.usage } : {}),
-              ...(event.timing !== undefined ? { timing: event.timing } : {})
-            },
-            observedAt: this.timestamp()
-          });
-          // Streaming deltas are intentionally low-latency. A terminal visual state, however,
-          // must never outrun the durable terminal checkpoint it claims to represent.
-          if (event.kind === 'completed') {
-            const result = await controls.onEvent(event);
+      sendFullRequest: (fullRequest, controls) => {
+        activeSession?.bindStream({
+          attemptSeq: fullRequest.attemptSeq,
+          socketGeneration: fullRequest.socketGeneration
+        });
+        return adapter.sendFullRequest(fullRequest, {
+          signal: controls.signal,
+          ...(controls.native || activeSession
+            ? {
+                native: {
+                  ...(controls.native ?? {}),
+                  ...(activeSession ? activeSession.hooks() : {})
+                }
+              }
+            : {}),
+          onEvent: async (event): Promise<StreamEventResult> => {
+            // Control observations go straight to durable control handling and the steering
+            // subscription; they are never fed into the text transient replay.
+            if (event.kind === 'native_control') {
+              const result = await controls.onEvent(event);
+              if (activeSession) await activeSession.afterNativeControl(event, result);
+              return result;
+            }
+            const transientKind = event.kind;
+            const observe = (): void => this.observeTransientEvent({
+              conversationId,
+              turnId,
+              modelRequestId,
+              requestSeq,
+              providerId,
+              modelId,
+              attemptSeq: fullRequest.attemptSeq,
+              socketGeneration: fullRequest.socketGeneration,
+              afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
+              event: {
+                kind: transientKind,
+                streamSeq: event.streamSeq,
+                content: event.content,
+                ...(event.usage !== undefined ? { usage: event.usage } : {}),
+                ...(event.timing !== undefined ? { timing: event.timing } : {})
+              },
+              observedAt: this.timestamp()
+            });
+            if (activeSession) {
+              if (event.kind === 'output_delta') {
+                activeSession.observeDelta(event.content);
+              }
+              if (event.kind === 'output_item_done') {
+                const callItem = activeSession.parseCallItem(event.content);
+                if (callItem) {
+                  const proof = activeSession.buildCallProof(callItem);
+                  const result = await this.modelProvider.recordNativeToolCallProof(
+                    modelRequestId,
+                    fullRequest.attemptSeq,
+                    fullRequest.socketGeneration,
+                    event.streamSeq,
+                    proof
+                  );
+                  observe();
+                  await activeSession.admitStreamedCall(callItem, event.streamSeq, result);
+                  return result;
+                }
+                const result = await controls.onEvent(event);
+                observe();
+                await activeSession.admitStreamedContentItem(event, result);
+                return result;
+              }
+            }
+            // Streaming deltas are intentionally low-latency. A terminal visual state, however,
+            // must never outrun the durable terminal checkpoint it claims to represent.
+            if (event.kind === 'completed') {
+              const result = await controls.onEvent(event);
+              observe();
+              return result;
+            }
             observe();
-            return result;
+            return controls.onEvent(event);
           }
-          observe();
-          return controls.onEvent(event);
-        }
-      })
+        })
+      }
     };
     const streamStats = asRecord(request.stream_stats_json);
     const reconnect = reliableDecimal(streamStats?.socketGeneration) > 0n || request.status === 'streaming';
-    await this.modelProvider.dispatch(modelRequestId, wrapped, {
-      ...(reconnect ? { reconnect: true } : {}),
-      onTransientTerminal: (terminal) => this.observeTransientEvent({
-        conversationId,
-        turnId,
-        modelRequestId,
-        requestSeq,
-        providerId,
-        modelId,
-        attemptSeq: terminal.attemptSeq,
-        socketGeneration: terminal.socketGeneration,
-        afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
-        event: terminal.event,
-        observedAt: this.timestamp()
-      })
-    });
-    // The terminal CAS checkpoint is the only final-output authority. The transient collector exists
+    let outcome: 'completed' | 'failed' | 'cancelled' | 'handoff' = 'completed';
+    try {
+      await this.modelProvider.dispatch(modelRequestId, wrapped, {
+        ...(reconnect ? { reconnect: true } : {}),
+        onTransientTerminal: (terminal) => this.observeTransientEvent({
+          conversationId,
+          turnId,
+          modelRequestId,
+          requestSeq,
+          providerId,
+          modelId,
+          attemptSeq: terminal.attemptSeq,
+          socketGeneration: terminal.socketGeneration,
+          afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
+          event: terminal.event,
+          observedAt: this.timestamp()
+        })
+      });
+    } catch (error) {
+      outcome = isExecutionHandoffError(error)
+        ? 'handoff'
+        : error instanceof Error && error.name === 'AbortError'
+          ? 'cancelled'
+          : 'failed';
+      throw error;
+    } finally {
+      if (session) await session.dispose(outcome);
+    }
+    // The terminal CAS checkpoint is the only final output authority. The transient collector exists
     // solely to drive low-latency UI observation and must never become a second durable result path.
     return this.readTerminalProviderOutput(modelRequestId);
+  }
+
+  /**
+   * Model/channel switch guard before a new frozen provider request: fully context-closed native
+   * calls never block; unsettled or occurrence-missing calls and in-flight steering owned by a
+   * different provider/model reject the switch (never a silent drop). Configuration saves stay
+   * unaffected — only applying the request to the provider is guarded.
+   */
+  private async guardNativeModelSwitch(
+    conversationId: string,
+    providerId: string,
+    modelId: string
+  ): Promise<void> {
+    const pending = (await this.effects.listNativePendingWork({ conversationId }))
+      .filter((entry) => !entry.settled || entry.resultContextSegmentId === undefined);
+    const steering = await readNativeSteeringInFlight(this.database, conversationId);
+    if (pending.length === 0 && steering.length === 0) return;
+    const allowedTargets = new Set<string>();
+    for (const entry of pending) {
+      const request = await this.maybeGet('ModelRequest', entry.modelRequestId);
+      if (!request) continue;
+      allowedTargets.add(`${requireText(request.provider_id, 'ModelRequest.provider_id')}/${requireText(request.model_id, 'ModelRequest.model_id')}`);
+    }
+    for (const entry of steering) {
+      const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: entry.turnId });
+      const latest = requests.sort((left, right) => compareInteger(right.request_seq, left.request_seq))[0];
+      if (latest) {
+        allowedTargets.add(`${requireText(latest.provider_id, 'ModelRequest.provider_id')}/${requireText(latest.model_id, 'ModelRequest.model_id')}`);
+      }
+    }
+    const target = `${providerId}/${modelId}`;
+    if (allowedTargets.has(target)) return;
+    const detail = [
+      pending.length > 0 ? `${pending.length} native tool call(s) not context-closed` : '',
+      steering.length > 0 ? `${steering.length} steering submission(s) in flight` : ''
+    ].filter(Boolean).join(' and ');
+    throw new NativeAsyncWorkPendingError(
+      pending.map((entry) => ({
+        toolCallId: entry.toolCallId,
+        reason: 'native work owned by another provider/model is not context-closed'
+      })),
+      `Switching the Conversation to ${target} is blocked until ${detail} settles; the pending native work stays owned by its original provider/model.`
+    );
+  }
+
+  /**
+   * True when every call of a completed native logical request has a server-admission delivery
+   * fact. Unadmitted calls (ordinary sync) and admitted-but-undelivered ones (HTTP-pending or
+   * chain-dead) keep the Turn alive for a carrier request instead.
+   */
+  private async nativeLogicalRequestDeliveredAll(calls: readonly FrozenProviderToolCall[]): Promise<boolean> {
+    for (const call of calls) {
+      const admission = await this.effects.readNativeAdmission(call.toolCallId);
+      if (!admission) return false;
+      const deliveries = await this.list('ToolCallEvent', {
+        tool_call_id: call.toolCallId,
+        event_kind: TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY
+      }, 2);
+      if (deliveries.length !== 1) return false;
+    }
+    return true;
+  }
+
+  /** Policy freeze for native streamed admissions, mirroring the terminal batch path. */
+  private async freezeDispatchPolicies(
+    inputs: ReadonlyArray<ReliableAgentToolDispatchInput & { definition: ReliableAgentToolDefinition }>
+  ): Promise<FrozenToolCallPolicyDecision[]> {
+    if (this.tools.freezeCalls) return this.tools.freezeCalls(inputs);
+    return Promise.all(inputs.map((input) => this.tools.freezeCall
+      ? this.tools.freezeCall(input)
+      : Promise.resolve(fallbackFrozenToolPolicy(input.definition, input.arguments))));
+  }
+
+  /**
+   * Native call dispatch with the same failure semantics as the terminal batch path. Native
+   * admissions require the dispatcher's own scheduling; falling back to the old single-call path
+   * would recreate the scheduling bypass, so an unsupported dispatcher fails explicitly.
+   */
+  private async dispatchNativeCall(
+    input: ReliableAgentToolDispatchInput
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    const existing = await this.effects.readTerminalResult(input.toolCallId, false);
+    if (existing) return existing;
+    if (!this.tools.scheduleAdmittedCall) {
+      throw new Error(
+        'Native streamed admission requires a tool dispatcher implementing scheduleAdmittedCall.'
+      );
+    }
+    try {
+      return await this.tools.scheduleAdmittedCall(input);
+    } catch (error) {
+      if (isExecutionHandoffError(error)) throw error;
+      await this.effects.finalizeReadyInOrder(input.turnId);
+      const terminal = await this.effects.readTerminalResult(input.toolCallId, false);
+      if (terminal) return terminal;
+      const failed = await this.effects.settleWithoutEffect({
+        source: { kind: 'internal', key: `agent-loop:${input.toolCallId}:native-dispatcher-failed` },
+        toolCallId: input.toolCallId,
+        status: 'failed',
+        detail: { error: errorMessage(error) }
+      });
+      return failed.terminal ?? {
+        disposition: 'settled',
+        toolCallId: input.toolCallId,
+        status: failed.status
+      };
+    }
+  }
+
+  /**
+   * Abandoned-chain closure for one admitted native call: cancel pending effects, settle a real
+   * cancelled result, and leave the terminal ToolModelResult for the explicit occurrence append.
+   */
+  private async closeNativeAdmittedCall(toolCallId: string, sourceKey: string): Promise<void> {
+    if (await this.effects.readTerminalResult(toolCallId, false)) return;
+    await this.cancelUndispatchedToolEffects(toolCallId, sourceKey);
+    const call = await this.requireExisting('ToolCall', toolCallId);
+    const turnId = requireId(call.turn_id, 'ToolCall.turn_id');
+    const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
+    if (operations.length === 0) {
+      await this.effects.settleWithoutEffect({
+        source: { kind: 'internal', key: `${sourceKey}:cancel-native-tool` },
+        toolCallId,
+        status: 'cancelled',
+        detail: { reason: 'native_logical_request_ended' }
+      });
+      return;
+    }
+    await this.effects.finalizeReadyInOrder(turnId);
+    const terminal = await this.effects.readTerminalResult(toolCallId, false)
+      ?? await this.reconcileCommittedToolCall?.(toolCallId)
+      ?? await this.effects.finalizeTerminalOperationsWithFallback({
+        source: { kind: 'internal', key: `${sourceKey}:close-native-effect` },
+        toolCallId,
+        detail: { reason: 'native_logical_request_ended_after_effect_terminal' }
+      });
+    if (!terminal) await this.requireTerminalToolResult(toolCallId);
+  }
+
+  /**
+   * Stateless carrier delivery: a completed full-history request proves server admission of every
+   * earlier settled native result actually projected onto its sent body (its frozen Context root).
+   * Calls dropped by compression or delivered by a live chain stay untouched.
+   */
+  private async markNativeCarrierDeliveries(
+    conversationId: string,
+    carrierModelRequestId: string
+  ): Promise<void> {
+    const pending = (await this.effects.listNativePendingWork({ conversationId }))
+      .filter((entry) =>
+        entry.modelRequestId !== carrierModelRequestId
+        && entry.settled
+        && !entry.delivered
+        && entry.resultContextSegmentId !== undefined);
+    if (pending.length === 0) return;
+    const projection = await this.maybeGet(
+      'ModelContextProjection',
+      stableId('model_request_projection', carrierModelRequestId)
+    );
+    if (!projection) throw new Error(`ModelRequest ${carrierModelRequestId} lacks its Context projection.`);
+    const structure = await this.context.materializeStructure(
+      requireId(projection.root_id, 'ModelContextProjection.root_id')
+    );
+    const projectedSegmentIds = new Set(structure.records.map((record) =>
+      requireId(record.segment.id, 'ContextSegment.id')
+    ));
+    const eligible = pending.filter((entry) =>
+      projectedSegmentIds.has(requireText(entry.resultContextSegmentId, 'NativePendingToolCall.resultContextSegmentId')));
+    if (eligible.length === 0) return;
+    // The carrier's first response.created is the actual server-admission proof of its sent body.
+    const checkpoints = await this.list('ModelStreamCheckpoint', { model_request_id: carrierModelRequestId }, 512);
+    let providerResponseId: string | undefined;
+    for (const checkpoint of checkpoints
+      .filter((row) => row.checkpoint_kind === 'native_control')
+      .sort((left, right) => compareInteger(left.stream_seq, right.stream_seq))) {
+      const metadata = await this.requireExisting(
+        'ContentObject',
+        requireId(checkpoint.content_object_id, 'ModelStreamCheckpoint.content_object_id')
+      ) as unknown as ContentObjectMetadata;
+      const envelope = asRecord(normalizePlainJson(
+        JSON.parse((await this.contentStore.read(metadata)).toString('utf8')),
+        'Native control checkpoint'
+      ));
+      const content = asRecord(envelope?.content);
+      if (content?.type === 'response.created' && typeof content.responseId === 'string') {
+        providerResponseId = content.responseId;
+        break;
+      }
+    }
+    if (!providerResponseId) return;
+    await this.effects.markNativeResultsDelivered({
+      source: {
+        kind: 'callback',
+        key: `agent-loop:${carrierModelRequestId}:native-carrier-delivery:${providerResponseId}`
+      },
+      deliveries: eligible.map((entry) => ({
+        toolCallId: entry.toolCallId,
+        carrierModelRequestId,
+        providerResponseId
+      }))
+    });
   }
 
   private async readLoopTerminalStatus(
@@ -2010,12 +2750,21 @@ export class ReliableAgentLoop {
           }
           terminal ??= await this.requireTerminalToolResult(toolCallId);
         }
-        await this.appendTerminalToolPairOnce({
-          conversationId,
-          toolCallId,
-          toolModelResultId: terminal.toolModelResultId,
-          ...(call.providerCallId ? { providerCallId: call.providerCallId } : {})
-        });
+        if (await this.effects.readNativeAdmission(toolCallId)) {
+          // The native call occurrence already exists; only the result occurrence closes the pair.
+          await this.appendNativeResultOccurrenceOnce({
+            conversationId,
+            toolCallId,
+            toolModelResultId: terminal.toolModelResultId
+          });
+        } else {
+          await this.appendTerminalToolPairOnce({
+            conversationId,
+            toolCallId,
+            toolModelResultId: terminal.toolModelResultId,
+            ...(call.providerCallId ? { providerCallId: call.providerCallId } : {})
+          });
+        }
       }
     }
 
@@ -2327,6 +3076,24 @@ function isToolPause(
   value: ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled
 ): value is ReliableAgentToolPause {
   return 'disposition' in value && value.disposition === 'paused';
+}
+
+/** Reads the frozen native capability decision of one ordinary recipe; undefined on the old path. */
+function readFrozenNativeCapabilities(
+  recipe: { [key: string]: PlainJsonValue }
+): OpenAIResponsesNativeCapabilities | undefined {
+  const record = asRecord(recipe.nativeResponses);
+  if (!record) return undefined;
+  const capabilities: OpenAIResponsesNativeCapabilities = {
+    asyncTools: record.asyncTools === true,
+    steering: record.steering === true,
+    reasoningUpdates: record.reasoningUpdates === true,
+    multiplexing: record.multiplexing === true,
+    explicitCaching: record.explicitCaching === true
+  };
+  return capabilities.asyncTools || capabilities.steering || capabilities.reasoningUpdates
+    ? capabilities
+    : undefined;
 }
 
 function providerToolCallId(modelRequestId: string, call: NormalizedToolCall): string {

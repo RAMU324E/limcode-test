@@ -56,7 +56,7 @@ export interface ModelStreamEventCommitInput {
   attemptSeq: bigint;
   socketGeneration: bigint;
   streamSeq: bigint;
-  checkpointKind: 'output_delta' | 'output_item_done' | 'partial_summary' | 'terminal_summary';
+  checkpointKind: 'output_delta' | 'output_item_done' | 'native_control' | 'native_tool_call' | 'partial_summary' | 'terminal_summary';
   terminalFenceId: string | null;
   contentObject: DomainRow;
   contentInsert?: RepositoryInsertMutation;

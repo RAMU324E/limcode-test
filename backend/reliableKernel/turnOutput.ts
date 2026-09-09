@@ -164,6 +164,317 @@ export class TurnOutputControlPlane {
     }
   }
 
+  /**
+   * Astra native streaming: one immutable item-only MessageRevision per completed output item.
+   * The first item creates the aggregate's Message/relations (one Message per ModelRequest, link
+   * stays 1:1); later items append revisions and advance the current pointer. Call items persist
+   * the proving revision with contextDisposition 'exclude' — their Context occurrence is owned by
+   * the native tool pair append, so a call never enters Context twice.
+   */
+  public async appendNativeAssistantItem(input: {
+    turnId: string;
+    modelRequestId: string;
+    /** Stable provider item identity (global output ordinal); replay of the same item deduplicates. */
+    itemKey: string;
+    content: string | Uint8Array;
+    /**
+     * Whole-chain-so-far aggregate content for the durable current projection. The item-only
+     * revision stays the Context source; the cumulative revision is the current pointer target so
+     * a mid-stream reload never shows only one item. The final chain aggregate replaces it.
+     */
+    cumulativeContent: string | Uint8Array;
+    contentType?: string;
+    contextDisposition?: 'append' | 'exclude';
+  }): Promise<AssistantMessageCommit> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
+    const itemKey = requireText(input.itemKey, 'itemKey');
+    const contentType = requireText(input.contentType ?? 'application/vnd.limcode.message+json', 'contentType');
+    const contextDisposition = input.contextDisposition ?? 'append';
+    if (contextDisposition !== 'append' && contextDisposition !== 'exclude') {
+      throw new TypeError(`Unsupported assistant output Context disposition: ${String(contextDisposition)}`);
+    }
+    const ids = outputIds(turnId, modelRequestId);
+    const revisionId = nativeItemRevisionId(turnId, modelRequestId, itemKey);
+    const cumulativeRevisionId = nativeCumulativeRevisionId(turnId, modelRequestId, itemKey);
+    const identity = this.contentStore.identity(input.content, contentType);
+    const cumulativeIdentity = this.contentStore.identity(input.cumulativeContent, contentType);
+    const existingRevision = await this.maybeGet('MessageRevision', revisionId);
+    if (existingRevision) {
+      return this.replayNativeAssistantItem(
+        ids,
+        revisionId,
+        cumulativeRevisionId,
+        identity.id,
+        cumulativeIdentity.id,
+        itemKey
+      );
+    }
+    const modelRequest = await this.requireExisting('ModelRequest', modelRequestId);
+    if (modelRequest.turn_id !== turnId) throw new Error('ModelRequest belongs to another Turn.');
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
+    if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
+    const content = await this.contentStore.prepare(this.database, input.content, contentType);
+    const cumulativeContent = await this.contentStore.prepare(this.database, input.cumulativeContent, contentType);
+    const existingMessage = await this.maybeGet('Message', ids.messageId);
+    let contextSteps: RepositoryTransactionStep[] = [];
+    if (contextDisposition === 'append') {
+      const contentEstimatedTokens = estimateStoredMessageContentTokens(input.content, contentType);
+      const context = await this.context.prepareMessageAppendMutation({
+        conversationId,
+        messageRevisionId: revisionId,
+        contentObjectId: content.metadata.id,
+        contentByteLength: content.metadata.byte_length,
+        contentEstimatedTokens
+      });
+      contextSteps = context.steps;
+    }
+    const now = requireText(this.now(), 'clock result');
+    const revisionSteps: RepositoryTransactionStep[] = existingMessage
+      ? [
+          DOMAIN_REPOSITORIES.domain('Message').assert(ids.messageId, { deleted_at: null }),
+          DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+            id: revisionId,
+            message_id: ids.messageId,
+            role: 'model',
+            content_object_id: content.metadata.id,
+            created_at: now
+          }, {
+            column: 'revision_seq',
+            scope: { message_id: ids.messageId }
+          }),
+          DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+            id: cumulativeRevisionId,
+            message_id: ids.messageId,
+            role: 'model',
+            content_object_id: cumulativeContent.metadata.id,
+            created_at: now
+          }, {
+            column: 'revision_seq',
+            scope: { message_id: ids.messageId }
+          }),
+          DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(ids.currentRevisionLinkId, {
+            message_id: ids.messageId
+          }),
+          DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(ids.currentRevisionLinkId, {
+            revision_id: cumulativeRevisionId,
+            updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('Message').update(ids.messageId, { updated_at: now })
+        ]
+      : [
+          DOMAIN_REPOSITORIES.domain('Message').insert({
+            id: ids.messageId,
+            created_at: now,
+            updated_at: now,
+            deleted_at: null
+          }),
+          DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+            id: revisionId,
+            message_id: ids.messageId,
+            role: 'model',
+            content_object_id: content.metadata.id,
+            created_at: now
+          }, {
+            column: 'revision_seq',
+            scope: { message_id: ids.messageId }
+          }),
+          DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+            id: cumulativeRevisionId,
+            message_id: ids.messageId,
+            role: 'model',
+            content_object_id: cumulativeContent.metadata.id,
+            created_at: now
+          }, {
+            column: 'revision_seq',
+            scope: { message_id: ids.messageId }
+          }),
+          DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
+            id: ids.currentRevisionLinkId,
+            message_id: ids.messageId,
+            revision_id: cumulativeRevisionId,
+            updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insertWithNextSequence({
+            id: ids.membershipId,
+            conversation_id: conversationId,
+            message_id: ids.messageId,
+            created_at: now
+          }, {
+            column: 'message_seq',
+            scope: { conversation_id: conversationId }
+          }),
+          DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
+            id: ids.turnLinkId,
+            turn_id: turnId,
+            message_id: ids.messageId,
+            role: 'model',
+            created_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').insert({
+            id: ids.modelRequestLinkId,
+            model_request_id: modelRequestId,
+            message_id: ids.messageId,
+            created_at: now
+          })
+        ];
+    try {
+      const committed = await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(requireId(leaseRows[0].id, 'ExecutionLease.id'), {
+          conversation_id: conversationId,
+          turn_id: turnId
+        }),
+        ...preparedContentObjectSteps([content, cumulativeContent], 'assistant_output'),
+        ...revisionSteps,
+        ...contextSteps,
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+      ]);
+      const contextRootId = await this.context.currentHeadRootId(conversationId);
+      if (!contextRootId) throw new Error(`Conversation ${conversationId} has no Context head after assistant output commit.`);
+      return {
+        messageId: ids.messageId,
+        messageRevisionId: revisionId,
+        contentObjectId: content.metadata.id,
+        contextRootId,
+        deduplicated: false,
+        commitSeq: committed.commitSeq
+      };
+    } catch (error) {
+      if (!isUniqueOrAssertionFailure(error) || !await this.maybeGet('MessageRevision', revisionId)) throw error;
+      return this.replayNativeAssistantItem(
+        ids,
+        revisionId,
+        cumulativeRevisionId,
+        identity.id,
+        cumulativeIdentity.id,
+        itemKey
+      );
+    }
+  }
+
+  /** Mid-stream-safe replay: proves the persisted item + cumulative pair without the final aggregate. */
+  private async replayNativeAssistantItem(
+    ids: ReturnType<typeof outputIds>,
+    itemRevisionId: string,
+    cumulativeRevisionId: string,
+    expectedContentObjectId: string,
+    expectedCumulativeObjectId: string,
+    itemKey: string
+  ): Promise<AssistantMessageCommit> {
+    const revision = await this.requireExisting('MessageRevision', itemRevisionId);
+    if (revision.content_object_id !== expectedContentObjectId || revision.role !== 'model') {
+      throw new Error(`Native assistant item ${itemKey} was replayed with different facts.`);
+    }
+    const cumulative = await this.requireExisting('MessageRevision', cumulativeRevisionId);
+    if (cumulative.content_object_id !== expectedCumulativeObjectId || cumulative.role !== 'model') {
+      throw new Error(`Native assistant cumulative ${itemKey} was replayed with different facts.`);
+    }
+    const membership = (await this.list('MessagePartOfConversation', { message_id: ids.messageId }, 2))[0];
+    if (!membership) throw new Error(`Assistant output ${ids.messageId} lacks Conversation membership.`);
+    const heads = await this.list('ConversationContextHeadLink', {
+      conversation_id: requireId(membership.conversation_id, 'MessagePartOfConversation.conversation_id')
+    }, 2);
+    if (heads.length !== 1) throw new Error('Conversation must have exactly one Context head.');
+    return {
+      messageId: ids.messageId,
+      messageRevisionId: itemRevisionId,
+      contentObjectId: expectedContentObjectId,
+      contextRootId: requireId(heads[0].root_id, 'ConversationContextHeadLink.root_id'),
+      deduplicated: true
+    };
+  }
+
+  /**
+   * Final whole-chain aggregate revision of a native logical request. When item revisions already
+   * carried every completed item into Context, the aggregate is the UI projection only and never
+   * re-enters Context (no duplicate native calls/text). Without item revisions it degrades to the
+   * ordinary single-revision commit.
+   */
+  public async appendNativeAssistantAggregate(input: {
+    turnId: string;
+    modelRequestId: string;
+    content: string | Uint8Array;
+    contentType?: string;
+  }): Promise<AssistantMessageCommit> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
+    const ids = outputIds(turnId, modelRequestId);
+    const existingMessage = await this.maybeGet('Message', ids.messageId);
+    if (!existingMessage) {
+      return this.appendAssistantMessage({
+        turnId,
+        modelRequestId,
+        sourceKey: modelRequestId,
+        content: input.content,
+        ...(input.contentType ? { contentType: input.contentType } : {})
+      });
+    }
+    const contentType = requireText(input.contentType ?? 'application/vnd.limcode.message+json', 'contentType');
+    const identity = this.contentStore.identity(input.content, contentType);
+    const existingRevision = await this.maybeGet('MessageRevision', ids.revisionId);
+    if (existingRevision) {
+      return this.replay(ids, identity.id, modelRequestId);
+    }
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
+    if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
+    const content = await this.contentStore.prepare(this.database, input.content, contentType);
+    const now = requireText(this.now(), 'clock result');
+    try {
+      const committed = await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active' }),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(requireId(leaseRows[0].id, 'ExecutionLease.id'), {
+          conversation_id: conversationId,
+          turn_id: turnId
+        }),
+        ...preparedContentObjectSteps([content], 'assistant_output'),
+        DOMAIN_REPOSITORIES.domain('Message').assert(ids.messageId, { deleted_at: null }),
+        DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').assert(ids.modelRequestLinkId, {
+          model_request_id: modelRequestId,
+          message_id: ids.messageId
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+          id: ids.revisionId,
+          message_id: ids.messageId,
+          role: 'model',
+          content_object_id: content.metadata.id,
+          created_at: now
+        }, {
+          column: 'revision_seq',
+          scope: { message_id: ids.messageId }
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(ids.currentRevisionLinkId, {
+          message_id: ids.messageId
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(ids.currentRevisionLinkId, {
+          revision_id: ids.revisionId,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('Message').update(ids.messageId, { updated_at: now }),
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+      ]);
+      const contextRootId = await this.context.currentHeadRootId(conversationId);
+      if (!contextRootId) throw new Error(`Conversation ${conversationId} has no Context head after assistant output commit.`);
+      return {
+        messageId: ids.messageId,
+        messageRevisionId: ids.revisionId,
+        contentObjectId: content.metadata.id,
+        contextRootId,
+        deduplicated: false,
+        commitSeq: committed.commitSeq
+      };
+    } catch (error) {
+      if (!isUniqueOrAssertionFailure(error) || !await this.maybeGet('MessageRevision', ids.revisionId)) throw error;
+      return this.replay(ids, identity.id, modelRequestId);
+    }
+  }
+
   private async replay(
     ids: ReturnType<typeof outputIds>,
     expectedContentObjectId: string,
@@ -214,6 +525,27 @@ export class TurnOutputControlPlane {
 
 export function assistantMessageIdFor(turnId: string, sourceKey: string): string {
   return outputIds(requireId(turnId, 'turnId'), requireText(sourceKey, 'sourceKey')).messageId;
+}
+
+/** Deterministic per-item revision identity of the one aggregate assistant Message of a ModelRequest. */
+export function nativeItemRevisionId(turnId: string, modelRequestId: string, itemKey: string): string {
+  return `rk_message_revision_${createHash('sha256')
+    .update(JSON.stringify([requireId(turnId, 'turnId'), requireId(modelRequestId, 'modelRequestId'), 'native_item', requireText(itemKey, 'itemKey')]))
+    .digest('hex')
+    .slice(0, 32)}`;
+}
+
+/** Deterministic per-item CUMULATIVE revision identity (the durable current projection target). */
+export function nativeCumulativeRevisionId(turnId: string, modelRequestId: string, itemKey: string): string {
+  return `rk_message_revision_${createHash('sha256')
+    .update(JSON.stringify([requireId(turnId, 'turnId'), requireId(modelRequestId, 'modelRequestId'), 'native_cumulative', requireText(itemKey, 'itemKey')]))
+    .digest('hex')
+    .slice(0, 32)}`;
+}
+
+/** The standard (final aggregate) revision identity of one assistant output Message. */
+export function assistantMessageRevisionIdFor(turnId: string, sourceKey: string): string {
+  return outputIds(requireId(turnId, 'turnId'), requireText(sourceKey, 'sourceKey')).revisionId;
 }
 
 function outputIds(turnId: string, sourceKey: string) {

@@ -52,7 +52,7 @@ test('Agent loop只用启发式预算规划压缩且不再形成普通发送门�
   const coordinator = fs.readFileSync('backend/reliableKernel/contextCompressionCoordinator.ts', 'utf8');
   assert.match(
     coordinator,
-    /const decision = await this\.compression\.evaluate\(headRootId, authoritySnapshotId\);\s*if \(trigger === 'auto' && !decision\.shouldCompress\)/,
+    /const decision = await this\.compression\.evaluate\(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId\);\s*if \(trigger === 'auto' && !decision\.shouldCompress\)/,
     '自动压缩必须由Provider实测校准后的配置阈值判断准入'
   );
   assert.ok(

@@ -13,15 +13,30 @@ import {
   loadAttachmentObservationRequirements
 } from './attachmentObservations';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
-import { ContentAddressedStore } from './contentAddressedStore';
+import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import {
   ContextCompressionControlPlane,
   compressionBlockIdFor,
   compressionSegmentIdFor,
   type CompressionCommitResult
 } from './contextCompression';
-import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
-import { frozenCompressionPolicy, frozenContextProfile, readFrozenTurnAuthority } from './frozenAuthority';
+import {
+  ContextSequenceControlPlane,
+  type MaterializedContext,
+  type MaterializedContextSegment,
+  type StructuralContextRecord
+} from './contextSequence';
+import { EffectControlPlane } from './effectControlPlane';
+import { frozenCompressionPolicy, frozenContextProfile } from './frozenAuthority';
+import { readRequestTurnAuthority } from './requestCompressionSettings';
+import {
+  evaluateNativeCompressionGuard,
+  planNativeCompressionRebase,
+  selectBlockingNativePendingCalls,
+  type NativeCompressionGuardFacts,
+  type NativeCompressionRebasePlan
+} from './nativeCompressionGuard';
+import { readNativeSteeringInFlight } from './nativeSteering';
 import {
   compressionOutputTokens,
   estimateMessageContentsTokens,
@@ -33,6 +48,7 @@ import {
   calculateFullRequestPlanningBudget,
   calibrateEstimatorToProvider,
   calibratedTailBudgetTokens,
+  collectStoredNativeConfigurationUpdates,
   projectStoredModelFacingWindow,
   providerTokenCalibration,
   selectContinuousAtomicTail,
@@ -58,6 +74,7 @@ export type CompressionTriggerReason = 'manual' | 'configured_threshold';
 export interface CoordinateCompressionCommand {
   turnId: string;
   authoritySnapshotId: string;
+  settingsSnapshotContentObjectId?: string;
   headRootId: string;
   trigger: CompressionTrigger;
   /** Exact frozen ordinary request planning budget. Required for automatic compression; optional for manual. */
@@ -79,9 +96,14 @@ export type CoordinateCompressionResult =
         | 'fixed_over_policy'
         | 'finite_tail'
         | 'empty_context'
-        | 'non_reducing';
+        | 'non_reducing'
+        | 'native_pending_tools'
+        | 'native_steering_in_flight';
       estimatedTokens?: number;
       thresholdTokens?: number;
+      /** Actionable counts when the skip defers in-flight native work. */
+      pendingNativeToolCalls?: number;
+      pendingNativeSteeringInputs?: number;
     }
   | {
       status: 'error';
@@ -98,6 +120,12 @@ export type CoordinateCompressionResult =
       sourceRootId: string;
       sourceSegmentCount: number;
       diagnostics?: Array<'native_over_target'>;
+      /**
+       * Explicit full-context rebase for the native path: fresh chain (forceFullReason), observable
+       * cache reset, and the effective reasoning re-applied as one fresh configuration_update.
+       * Present when the compacted history carried native reasoning facts.
+       */
+      nativeRebase?: NativeCompressionRebasePlan;
       result: CompressionCommitResult;
     };
 
@@ -113,6 +141,7 @@ export class ReliableContextCompressionCoordinator {
   private readonly context: ContextSequenceControlPlane;
   private readonly attachmentCatalog: AttachmentCatalogProjection;
   private readonly compression: ContextCompressionControlPlane;
+  private readonly effects: EffectControlPlane;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -124,6 +153,7 @@ export class ReliableContextCompressionCoordinator {
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
     this.attachmentCatalog = new AttachmentCatalogProjection(database);
     this.compression = new ContextCompressionControlPlane(database, contentStore, options);
+    this.effects = new EffectControlPlane(database, contentStore, options);
   }
 
   public async coordinate(command: CoordinateCompressionCommand): Promise<CoordinateCompressionResult> {
@@ -131,7 +161,11 @@ export class ReliableContextCompressionCoordinator {
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
     const headRootId = requireId(command.headRootId, 'headRootId');
     const trigger = requireTrigger(command.trigger);
-    const frozen = await readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId);
+    const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId
+      ?? await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId);
+    const frozen = await readRequestTurnAuthority(
+      this.database, this.contentStore, authoritySnapshotId, turnId, settingsSnapshotContentObjectId
+    );
     const policy = frozenCompressionPolicy(frozen.document);
     if (!policy || policy.methodKind === 'disabled') return { status: 'skipped', reason: 'disabled' };
     if (trigger === 'auto' && policy.triggerMode !== 'token_threshold') {
@@ -143,7 +177,7 @@ export class ReliableContextCompressionCoordinator {
     const requestBudget = command.requestBudget
       ? requireFullRequestPlanningBudget(command.requestBudget, policy.thresholdTokens)
       : manualRequestPlanningBudget(frozen.document, policy.thresholdTokens);
-    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId);
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId);
     if (trigger === 'auto' && !decision.shouldCompress) {
       return {
         status: 'skipped',
@@ -263,15 +297,49 @@ export class ReliableContextCompressionCoordinator {
       : command.compressSegmentCount === undefined
         ? textTailPlan?.sourceSegmentCount ?? 0
         : requirePrefixCount(command.compressSegmentCount, materialized.records.length);
-    const sourceSegmentCount = policy.methodKind === 'openai_responses_compact'
+    const plannedSourceSegmentCount = policy.methodKind === 'openai_responses_compact'
       ? requestedSourceSegmentCount
       : closeToolExchangeBoundary(materialized.records, requestedSourceSegmentCount);
-    if (sourceSegmentCount <= 0 || sourceSegmentCount > materialized.records.length) {
+    if (plannedSourceSegmentCount <= 0 || plannedSourceSegmentCount > materialized.records.length) {
       return {
         status: 'skipped',
         reason: 'finite_tail',
         estimatedTokens: decision.estimatedTokens,
         thresholdTokens: decision.thresholdTokens
+      };
+    }
+    // Native async calls admitted but not yet delivered, and in-flight steering, must never be
+    // silently compacted away: the delayed result/steering message lands at the future tail and
+    // would lose its call/logical-request dependency. Defer actionably or shrink the source
+    // prefix so the closure stays in the retained tail.
+    const nativeGuardFacts = await this.readNativeCompressionGuardFacts(frozen.conversationId);
+    const nativeGuard = evaluateNativeCompressionGuard({
+      fullWindowRequired: policy.methodKind === 'openai_responses_compact',
+      facts: nativeGuardFacts,
+      orderedSegmentIds: materialized.records.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
+      requestedSourceSegmentCount: plannedSourceSegmentCount
+    });
+    if (nativeGuard.status === 'defer') {
+      return {
+        status: 'skipped',
+        reason: nativeGuard.reason,
+        estimatedTokens: decision.estimatedTokens,
+        thresholdTokens: decision.thresholdTokens,
+        pendingNativeToolCalls: nativeGuard.pendingToolCalls,
+        pendingNativeSteeringInputs: nativeGuard.pendingSteeringInputs
+      };
+    }
+    const sourceSegmentCount = nativeGuard.status === 'protect'
+      ? closeToolExchangeBoundary(materialized.records, nativeGuard.sourceSegmentCount)
+      : plannedSourceSegmentCount;
+    if (sourceSegmentCount <= 0) {
+      return {
+        status: 'skipped',
+        reason: 'native_pending_tools',
+        estimatedTokens: decision.estimatedTokens,
+        thresholdTokens: decision.thresholdTokens,
+        pendingNativeToolCalls: nativeGuardFacts.pendingToolCalls.length,
+        pendingNativeSteeringInputs: nativeGuardFacts.pendingSteeringInputs
       };
     }
     const sourceSegments = materialized.records.slice(0, sourceSegmentCount);
@@ -299,8 +367,14 @@ export class ReliableContextCompressionCoordinator {
         )
       : [];
     const sourceHash = hashSource(sourceSegments);
+    // configuration_update items are transport-only: they leave the compacted window (the
+    // provider-native compact input is stripped downstream) while the effective reasoning effort
+    // survives in the frozen rebase plan, re-applied as one fresh update before the next user
+    // message. The cache/continuation reset this forces stays observable through the plan.
+    const nativeRebase = await this.planNativeRebase(turnId, semanticMaterialized, sourceSegmentCount);
     const idempotencyKey = [
-      'context-compression', trigger, headRootId, policy.config.id, String(sourceSegmentCount), sourceHash
+      'context-compression', trigger, headRootId, policy.config.id, String(sourceSegmentCount), sourceHash,
+      ...(settingsSnapshotContentObjectId ? [settingsSnapshotContentObjectId] : [])
     ].join(':');
     const expectedModelRequestId = modelRequestIdFor(turnId, idempotencyKey);
     const compressionBlockId = compressionBlockIdFor(
@@ -314,6 +388,7 @@ export class ReliableContextCompressionCoordinator {
         turnId,
         contextRootId: headRootId,
         authoritySnapshotId,
+        settingsSnapshotContentObjectId,
         recipe: normalizePlainJson({
           kind: 'reliable-context-compression',
           requestKind: trigger === 'auto' ? 'context_compression_pre' : 'context_compression_manual',
@@ -329,6 +404,7 @@ export class ReliableContextCompressionCoordinator {
           blockId: compressionBlockId,
           compressionConfigId: policy.config.id,
           compressionMethodKind: policy.methodKind,
+          ...(nativeRebase ? { nativeRebase } : {}),
           attachmentCatalogState: sourceAttachmentCatalogState,
           ...(sourceAttachmentHandles.entries.length > 0
             ? { modelHandleCatalog: sourceAttachmentHandles }
@@ -446,6 +522,18 @@ export class ReliableContextCompressionCoordinator {
       calibration
     );
     if (projectedBodyTokens > rooms.calibratedPlanningBodyRoomTokens) {
+      if (nativeGuardFacts.pendingToolCalls.length > 0) {
+        // The protected native tail cannot shrink until the in-flight calls settle; defer the
+        // compression instead of failing the Turn on its frozen addenda.
+        return {
+          status: 'skipped',
+          reason: 'native_pending_tools',
+          estimatedTokens: decision.estimatedTokens,
+          thresholdTokens: decision.thresholdTokens,
+          pendingNativeToolCalls: nativeGuardFacts.pendingToolCalls.length,
+          pendingNativeSteeringInputs: nativeGuardFacts.pendingSteeringInputs
+        };
+      }
       return compressionError(
         'compressed_context_too_large',
         'The candidate compressed history plus frozen request addenda still exceeds the compression planning body room.',
@@ -496,6 +584,17 @@ export class ReliableContextCompressionCoordinator {
         estimatedTokens: summaryEstimatedTokens,
         ...(policy.methodKind === 'openai_responses_compact'
           ? { nativeBinding: policy.provider }
+          : {}),
+        ...(nativeRebase
+          ? {
+              nativeRebase: {
+                cacheReset: true as const,
+                droppedConfigurationUpdates: nativeRebase.droppedConfigurationUpdates,
+                ...(nativeRebase.effectiveReasoning === undefined
+                  ? {}
+                  : { effectiveEffort: nativeRebase.effectiveReasoning.effort })
+              }
+            }
           : {})
       },
       projectedEstimatedTokens: projectedTokens,
@@ -512,6 +611,7 @@ export class ReliableContextCompressionCoordinator {
         && calibrateEstimatorToProvider(projectedTokens, calibration) > rooms.calibratedBodyTargetTokens
         ? { diagnostics: ['native_over_target' as const] }
         : {}),
+      ...(nativeRebase ? { nativeRebase } : {}),
       result: committed
     };
   }
@@ -547,6 +647,116 @@ export class ReliableContextCompressionCoordinator {
       ...(input.compressSegmentCount === undefined ? {} : { compressSegmentCount: input.compressSegmentCount }),
       ...(input.title?.trim() ? { title: input.title.trim() } : {})
     });
+  }
+
+  /**
+   * Read-only native guard facts. Pending async work comes from the tool slice's durable
+   * admission/delivery domains; in-flight steering comes from the kernel-owned steering reader.
+   * Only calls fully closed in the Context are historical; terminal-Turn leftovers with an
+   * unsettled result or a missing result occurrence still block.
+   */
+  private async readNativeCompressionGuardFacts(conversationId: string): Promise<NativeCompressionGuardFacts> {
+    const [pendingWork, inFlightSteering] = await Promise.all([
+      this.effects.listNativePendingWork({ conversationId }),
+      readNativeSteeringInFlight(this.database, conversationId)
+    ]);
+    const pendingToolCalls = selectBlockingNativePendingCalls(
+      pendingWork.map((call) => ({
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        turnId: call.turnId,
+        ...(call.providerCallId === undefined ? {} : { providerCallId: call.providerCallId }),
+        ...(call.callContextSegmentId === undefined ? {} : { callContextSegmentId: call.callContextSegmentId }),
+        ...(call.resultContextSegmentId === undefined ? {} : { resultContextSegmentId: call.resultContextSegmentId }),
+        settled: call.settled === true,
+        delivered: call.delivered === true
+      }))
+    );
+    return { pendingToolCalls, pendingSteeringInputs: inFlightSteering.length };
+  }
+
+  /**
+   * Builds the explicit native rebase plan for a committed compression. Update facts are scanned
+   * from the durable stored window (source slice drops, retained tail survives); the effective
+   * effort prefers the kernel-frozen recipe facts so recovery replays the same selection.
+   */
+  private async planNativeRebase(
+    turnId: string,
+    semanticMaterialized: MaterializedContext,
+    sourceSegmentCount: number
+  ): Promise<NativeCompressionRebasePlan | undefined> {
+    const storedItems = (segments: MaterializedContextSegment[]) => segments.map((segment) => ({
+      segmentId: segment.segmentId,
+      segmentKind: segment.segmentKind,
+      messageRole: segment.messageRole,
+      contentType: segment.contentObject.content_type,
+      content: segment.content.toString('utf8')
+    }));
+    const updates = collectStoredNativeConfigurationUpdates(storedItems(
+      semanticMaterialized.segments.slice(0, sourceSegmentCount)
+    ));
+    const retainedUpdates = collectStoredNativeConfigurationUpdates(storedItems(
+      semanticMaterialized.segments.slice(sourceSegmentCount)
+    ));
+    const frozenNativeReasoning = await this.readLatestFrozenNativeReasoning(turnId);
+    return planNativeCompressionRebase({
+      nativeEnabled: frozenNativeReasoning !== undefined || updates.length > 0 || retainedUpdates.length > 0,
+      updates,
+      retainedUpdates,
+      ...(frozenNativeReasoning?.effectiveEffort === undefined
+        ? {}
+        : { frozenEffectiveEffort: frozenNativeReasoning.effectiveEffort })
+    });
+  }
+
+  /**
+   * Reads the kernel-frozen native reasoning facts from the latest ordinary ModelRequest recipe of
+   * the Turn. Compression recipes are skipped; an ordinary recipe without nativeReasoning means the
+   * Turn is not on the native reasoning path. Update-selected effort is the only value a fresh
+   * configuration_update may carry, so it is returned only when frozen updates exist.
+   */
+  private async readLatestFrozenNativeReasoning(turnId: string): Promise<{ effectiveEffort?: string } | undefined> {
+    const snapshot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ModelRequest').list({
+        where: { turn_id: turnId },
+        orderBy: { column: 'request_seq', direction: 'desc' },
+        limit: 8
+      })
+    ]);
+    for (const request of rows(snapshot.snapshot[0])) {
+      const recipeRow = await this.optionalDomain(
+        'ContentObject',
+        requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
+      );
+      if (!recipeRow) continue;
+      const recipe = requireRecord(
+        normalizePlainJson(
+          JSON.parse((await this.contentStore.read(asContentObjectMetadata(recipeRow))).toString('utf8')),
+          'ModelRequest recipe'
+        ),
+        'ModelRequest recipe'
+      );
+      if (recipe.kind === 'reliable-context-compression') continue;
+      if (recipe.nativeReasoning === undefined) return undefined;
+      const nativeReasoning = requireRecord(recipe.nativeReasoning, 'ModelRequest recipe nativeReasoning');
+      const updates = Array.isArray(nativeReasoning.updates) ? nativeReasoning.updates : [];
+      if (updates.length === 0) return {};
+      const direct = typeof nativeReasoning.effectiveEffort === 'string' && nativeReasoning.effectiveEffort.trim()
+        ? nativeReasoning.effectiveEffort.trim()
+        : undefined;
+      const fromUpdates = updates
+        .map((update) => {
+          if (!update || typeof update !== 'object' || Array.isArray(update) || !('effort' in update)) {
+            return undefined;
+          }
+          return typeof update.effort === 'string' && update.effort.trim() ? update.effort.trim() : undefined;
+        })
+        .filter((effort): effort is string => effort !== undefined)
+        .pop();
+      const effectiveEffort = direct ?? fromUpdates;
+      return effectiveEffort === undefined ? {} : { effectiveEffort };
+    }
+    return undefined;
   }
 
   private async optionalDomain(domain: string, id: string): Promise<DomainRow | undefined> {
@@ -790,6 +1000,10 @@ function requireNonNegativeTokenCount(value: number, label: string): number {
 function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
   return value;
+}
+
+function asContentObjectMetadata(row: DomainRow): ContentObjectMetadata {
+  return row as ContentObjectMetadata;
 }
 
 function requireSha256(value: unknown, label: string): string {

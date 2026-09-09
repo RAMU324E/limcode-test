@@ -16,8 +16,16 @@ import {
   type LlmRequestBodyRecord,
   type LlmToolCallFormat
 } from '@shared/protocol';
+import {
+  isAstraModel,
+  isOfficialOpenAIChannel,
+  normalizeOpenAIResponsesNativeSettings,
+  openAIResponsesNativeCapabilities
+} from '@shared/openAIResponsesCapabilities';
+import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
+import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
 import LlmHeadersSettings from './parameters/LlmHeadersSettings.vue';
 import LlmParameterSettings from './parameters/LlmParameterSettings.vue';
@@ -41,6 +49,7 @@ const emit = defineEmits<{
   (event: 'update-generation-config', value: LlmGenerationConfigRecord | undefined): void;
   (event: 'update-request-body', value: LlmRequestBodyRecord | undefined): void;
   (event: 'update-prompt-cache', value: LlmPromptCacheConfigRecord | undefined): void;
+  (event: 'update-native-responses', value: OpenAIResponsesNativeSettings | undefined): void;
   (event: 'update-headers', value: LlmProviderHeadersRecord | undefined): void;
 }>();
 
@@ -174,6 +183,92 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
   if (props.config.provider === 'claude') return value === '5m' || value === '1h' ? value : '1h';
   return defaultLlmPromptCacheTtlForProvider(props.config.provider);
 }
+
+const nativeModelSupported = computed(() => props.config.provider === 'openai-responses' && isAstraModel(props.config.model));
+const nativeOfficialChannel = computed(() => isOfficialOpenAIChannel(props.config.baseUrl));
+const nativeSettings = computed(() => normalizeOpenAIResponsesNativeSettings(props.config.nativeResponses));
+/** 原生能力总闸：精确 Astra 模型，且官方渠道或显式确认中继支持；显式禁用永远关闭。 */
+const nativeGateAvailable = computed(() => {
+  if (!nativeModelSupported.value) return false;
+  const enabled = nativeSettings.value?.enabled;
+  if (enabled === false) return false;
+  return enabled === true || nativeOfficialChannel.value;
+});
+const nativeCapabilities = computed(() => openAIResponsesNativeCapabilities({
+  provider: props.config.provider,
+  model: props.config.model,
+  baseUrl: props.config.baseUrl,
+  transport: props.config.openaiResponsesTransport,
+  nativeResponses: props.config.nativeResponses
+}));
+const nativeWebsocketTransport = computed(() => (props.config.openaiResponsesTransport ?? 'http') === 'websocket');
+const nativeEnabledState = computed(() => {
+  const enabled = nativeSettings.value?.enabled;
+  return enabled === true ? 'enabled' : enabled === false ? 'disabled' : 'default';
+});
+const nativeEnabledStateOptions: SettingsDropdownOption[] = [
+  {
+    value: 'default',
+    label: '按渠道默认',
+    description: '官方 OpenAI 渠道视为支持 Astra 原生能力；第三方中继默认不使用。'
+  },
+  {
+    value: 'enabled',
+    label: '确认支持并启用',
+    description: '显式确认该渠道或中继支持 Astra 原生 Responses 能力（异步工具、转向、动态推理、多路复用）。'
+  },
+  {
+    value: 'disabled',
+    label: '禁用原生能力',
+    description: '即使是官方渠道也不使用原生能力，退回普通 Responses 行为。'
+  }
+];
+const nativeCapabilityStateText = computed(() => {
+  if (!nativeModelSupported.value) return '当前 LLM 不支持';
+  if (!nativeGateAvailable.value) return '未启用';
+  return '已启用';
+});
+const nativeCapabilityRows = computed(() => [
+  { label: '原生异步工具', value: nativeCapabilities.value.asyncTools ? '可用' : '不可用' },
+  { label: '回合内转向', value: nativeCapabilities.value.steering ? '可用' : '不可用' },
+  { label: '动态推理更新', value: nativeCapabilities.value.reasoningUpdates ? '可用' : '不可用' },
+  { label: 'WebSocket 多路复用', value: nativeCapabilities.value.multiplexing ? '可用' : '不可用' },
+  { label: '显式缓存', value: nativeCapabilities.value.explicitCaching ? '可用' : '不可用' }
+]);
+const nativeGateHint = computed(() => {
+  if (props.config.provider !== 'openai-responses') return '';
+  if (!nativeModelSupported.value) {
+    return '原生能力只对精确的 gpt-6-astra（含日期版本）开放，不会从其它 gpt-* 名称推断；当前 LLM 使用普通 Responses 行为。';
+  }
+  if (nativeSettings.value?.enabled === false) return '原生能力已显式禁用；当前 LLM 使用普通 Responses 行为。';
+  if (!nativeOfficialChannel.value && nativeSettings.value?.enabled !== true) {
+    return '第三方中继默认不使用原生能力；确认该中继支持后，将上方设置改为「确认支持并启用」。';
+  }
+  return '原生能力只影响 Astra 原生请求；进行中的请求以发起时冻结的能力为准，修改设置不会改变已发出的请求。';
+});
+
+function emitNativeResponses(next: OpenAIResponsesNativeSettings): void {
+  emit('update-native-responses', normalizeOpenAIResponsesNativeSettings(next));
+}
+
+function updateNativeEnabledState(value: string): void {
+  const current = nativeSettings.value ?? {};
+  if (value === 'enabled') {
+    emitNativeResponses({ ...current, enabled: true });
+    return;
+  }
+  if (value === 'disabled') {
+    emitNativeResponses({ ...current, enabled: false });
+    return;
+  }
+  const rest = { ...current };
+  delete rest.enabled;
+  emitNativeResponses(rest);
+}
+
+function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 'multiplexing', value: boolean): void {
+  emitNativeResponses({ ...(nativeSettings.value ?? {}), [key]: value });
+}
 </script>
 
 <template>
@@ -279,6 +374,105 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
         @update:model-value="updatePromptCacheTtl"
       />
     </label>
+
+    <template v-if="config.provider === 'openai-responses'">
+      <div class="global-settings-field global-settings-field-wide native-capabilities-field">
+        <span class="native-capabilities-heading">
+          <span>Astra 原生能力</span>
+          <HoverTooltipPanel
+            panel-title="原生能力状态"
+            :rows="nativeCapabilityRows"
+            :delay-ms="180"
+          >
+            <button type="button" class="native-capability-badge" :class="{ 'is-active': nativeGateAvailable }">
+              {{ nativeCapabilityStateText }}
+            </button>
+          </HoverTooltipPanel>
+        </span>
+        <span class="stream-checkbox-text">{{ nativeGateHint }}</span>
+      </div>
+
+      <label class="global-settings-field native-enabled-state-field">
+        <span>原生能力支持</span>
+        <SettingsDropdown
+          :model-value="nativeEnabledState"
+          :options="nativeEnabledStateOptions"
+          :disabled="!nativeModelSupported"
+          title="选择 Astra 原生能力支持方式"
+          @update:model-value="updateNativeEnabledState"
+        />
+        <span class="stream-checkbox-text">第三方中继选择「确认支持并启用」，即确认该中继支持 Astra 原生能力。</span>
+      </label>
+
+      <div class="global-settings-field stream-field">
+        <span>原生异步工具</span>
+        <div class="stream-checkbox-row">
+          <LcCheckbox
+            :model-value="nativeCapabilities.asyncTools"
+            :disabled="!nativeGateAvailable"
+            size="sm"
+            aria-label="启用原生异步工具"
+            @update:model-value="updateNativeFlag('asyncTools', $event)"
+          >
+            <span class="stream-checkbox-enable">启用</span>
+          </LcCheckbox>
+        </div>
+        <span class="stream-checkbox-text">在工具策略中单独标记「原生异步」的工具可以异步执行，结果稍后按原始调用 ID 回传；不改变执行审批、文件审批与调度方式。</span>
+      </div>
+
+      <div class="global-settings-field stream-field">
+        <span>回合内转向</span>
+        <div class="stream-checkbox-row">
+          <LcCheckbox
+            :model-value="nativeCapabilities.steering"
+            :disabled="!nativeGateAvailable || !nativeWebsocketTransport"
+            size="sm"
+            aria-label="启用回合内转向"
+            @update:model-value="updateNativeFlag('steering', $event)"
+          >
+            <span class="stream-checkbox-enable">启用</span>
+          </LcCheckbox>
+        </div>
+        <span class="stream-checkbox-text">回复进行中可把新消息立即注入当前原生请求，被接受的输入会产生后续响应；需要 WebSocket 连接模式。转向回执中的「已发送 / 已接受」不代表内容已生效。</span>
+      </div>
+
+      <div class="global-settings-field stream-field">
+        <span>动态推理更新</span>
+        <div class="stream-checkbox-row">
+          <LcCheckbox
+            :model-value="nativeCapabilities.reasoningUpdates"
+            :disabled="!nativeGateAvailable"
+            size="sm"
+            aria-label="启用动态推理更新"
+            @update:model-value="updateNativeFlag('reasoningUpdates', $event)"
+          >
+            <span class="stream-checkbox-enable">启用</span>
+          </LcCheckbox>
+        </div>
+        <span class="stream-checkbox-text">允许在两个响应之间调整推理档位。Limcode 的本地上下文压缩与动态推理兼容：压缩请求不携带推理更新，压缩完成后自动恢复当前档位（缓存会重置并可观察）；与服务端自动压缩不兼容的机制 Limcode 不使用。</span>
+      </div>
+
+      <div class="global-settings-field stream-field">
+        <span>WebSocket 多路复用</span>
+        <div class="stream-checkbox-row">
+          <LcCheckbox
+            :model-value="nativeCapabilities.multiplexing"
+            :disabled="!nativeGateAvailable || !nativeWebsocketTransport"
+            size="sm"
+            aria-label="启用 WebSocket 多路复用"
+            @update:model-value="updateNativeFlag('multiplexing', $event)"
+          >
+            <span class="stream-checkbox-enable">启用</span>
+          </LcCheckbox>
+        </div>
+        <span class="stream-checkbox-text">多个对话以命名通道复用同一 WebSocket 物理连接；需要 WebSocket 连接模式。物理连接断开会使所有通道的缓存失效。</span>
+      </div>
+
+      <div v-if="nativeCapabilities.explicitCaching" class="global-settings-field stream-field native-explicit-cache-field">
+        <span>显式缓存</span>
+        <span class="stream-checkbox-text">Astra 原生连接保留显式缓存参数：prompt_cache_options（30 分钟 TTL）与内容缓存断点不会被剥离；本地上下文压缩后缓存重置，并随后续请求重建。在上方「提示词缓存」中选择缓存模式。</span>
+      </div>
+    </template>
 
     <div class="global-settings-field stream-field retry-field">
       <span>报错自动重试</span>
@@ -402,6 +596,27 @@ function normalizePromptCacheTtl(value: string | undefined): LlmPromptCacheTtl {
   color: var(--vscode-descriptionForeground);
   font-size: var(--font-size-xs);
   line-height: 1.45;
+}
+
+.native-capabilities-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.native-capability-badge {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-2);
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  cursor: default;
+}
+
+.native-capability-badge.is-active {
+  color: var(--vscode-foreground);
 }
 
 .token-number-input[type='number'] {

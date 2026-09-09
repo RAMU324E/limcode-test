@@ -1,6 +1,4 @@
 import { createHash } from 'crypto';
-import { networkInterfaces } from 'os';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 import WebSocket, { type RawData } from 'ws';
 import { captureDebug, associateDebugCapture, debugCaptureSources } from '../reliableKernel/debugCapture/observer';
 import { observeToolAssembly, type DebugWebSocketObservation } from '../reliableKernel/debugCapture/webSocketObservation';
@@ -11,26 +9,76 @@ import type {
   StreamDecodeState
 } from 'unified-llm-provider';
 import type { AssistantMessagePhase, ModelOutputItemReference } from '../../shared/protocol';
+import type {
+  OpenAIResponsesNativeEvent,
+  OpenAIResponsesRequiredInput,
+  OpenAIResponsesSteeringCommand,
+  OpenAIResponsesToolOutput
+} from '../../shared/openAIResponsesNative';
+import {
+  OpenAIResponsesNativeDeliveryError,
+  type OpenAIResponsesNativeController,
+  type OpenAIResponsesNativeHooks,
+  type OpenAIResponsesNativeResultAdmission
+} from './openAIResponsesNativeControl';
 import {
   OpenAIResponsesContinuationProjection,
   hasSemanticChunkOutput
 } from './openAIResponsesContinuationProjection';
-import { isRetryableOpenAIResponsesWebSocketClose } from './openAIResponsesWebSocketRetryPolicy';
+import {
+  AsyncEventQueue,
+  MAX_SOCKET_AGE_MS,
+  NETWORK_IDENTITY_CHECK_INTERVAL_MS,
+  OpenAIResponsesWebSocketCloseError,
+  OpenAIResponsesWebSocketTimeoutError,
+  abortError,
+  canonicalHash,
+  canonicalString,
+  cloneJson,
+  errorText,
+  eventType,
+  invalidateOpenAIResponsesWebSocketContinuation,
+  isAbort,
+  isRecord,
+  nestedMessage,
+  normalizedString,
+  numericField,
+  observeOpenAIResponsesWebSocketFailure,
+  observeOpenAIResponsesWebSocketPhase,
+  openSocket,
+  parseWebSocketData,
+  probeSocket,
+  resetOpenAIResponsesWebSocketConnectionState,
+  resolvedTimeouts,
+  sendWithDeadline,
+  shortCanonicalHash,
+  startOpenAIResponsesWebSocketHeartbeat,
+  structuredTransportError,
+  throwIfAborted,
+  webSocketConnectionConfig,
+  type OpenAIResponsesWebSocketConnectionReason,
+  type OpenAIResponsesWebSocketContinuationState,
+  type OpenAIResponsesWebSocketPhase,
+  type OpenAIResponsesWebSocketPhaseKind,
+  type OpenAIResponsesWebSocketTimeoutPhase,
+  type OpenAIResponsesWebSocketTimeouts
+} from './openAIResponsesWebSocketConnection';
+import {
+  acquireOpenAIResponsesWebSocketLane,
+  resetOpenAIResponsesWebSocketMultiplexer
+} from './openAIResponsesWebSocketMultiplexer';
 export { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
+export {
+  OpenAIResponsesWebSocketCloseError,
+  OpenAIResponsesWebSocketTimeoutError,
+  type OpenAIResponsesWebSocketPhase,
+  type OpenAIResponsesWebSocketPhaseKind,
+  type OpenAIResponsesWebSocketTimeoutPhase,
+  type OpenAIResponsesWebSocketTimeouts
+} from './openAIResponsesWebSocketConnection';
 
-const MAX_SOCKET_AGE_MS = 55 * 60 * 1_000;
 const MAX_RETAINED_SESSIONS = 32;
 const IDLE_SESSION_TTL_MS = MAX_SOCKET_AGE_MS;
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
-const DEFAULT_SEND_TIMEOUT_MS = 10_000;
-const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 120_000;
-const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 120_000;
-const DEFAULT_RESPONSE_TIMEOUT_MS = 15 * 60 * 1_000;
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 20_000;
-const DEFAULT_PONG_TIMEOUT_MS = 60_000;
-const DEFAULT_PRE_SEND_PROBE_STALE_MS = 45_000;
-const DEFAULT_PRE_SEND_PROBE_TIMEOUT_MS = 2_000;
-const NETWORK_IDENTITY_CHECK_INTERVAL_MS = 2_000;
 const MAX_SUCCESSFUL_INCREMENTAL_REQUESTS = 16;
 
 export interface OpenAIResponsesToolCallArgumentDelta {
@@ -51,19 +99,15 @@ export interface LimCodeOpenAIResponsesStreamChunk extends LLMStreamChunk {
   reasoningItemDone?: boolean;
   /** Exact ordered model content proven against the terminal Responses output. */
   completedContent?: Content;
+  /** Native provider control observation; present only on capability-gated native streams. */
+  nativeEvent?: OpenAIResponsesNativeEvent;
 }
 
 export interface OpenAIResponsesWebSocketDecision {
   sessionKeyHash: string;
   connectionGeneration: number;
   connectionReused: boolean;
-  connectionReason:
-    | 'reused'
-    | 'new_connection'
-    | 'retry_forced_reconnect'
-    | 'socket_expired'
-    | 'socket_unhealthy'
-    | 'handshake_identity_changed';
+  connectionReason: OpenAIResponsesWebSocketConnectionReason;
   mode: 'full' | 'incremental';
   reason: string;
   fullInputItemCount: number;
@@ -72,40 +116,13 @@ export interface OpenAIResponsesWebSocketDecision {
   sentInputFingerprint: string;
   baselineFingerprint?: string;
   previousResponseIdUsed?: string;
+  /** Multiplexed native lane carrying this request. */
+  streamId?: string;
+  /** Native dynamic reasoning: applied configuration_update instead of rewriting the prefix. */
+  reasoningUpdateApplied?: { fromEffort: string; toEffort: string };
 }
 
-export type OpenAIResponsesWebSocketPhaseKind =
-  | 'lock_wait'
-  | 'lock_acquired'
-  | 'socket_opening'
-  | 'socket_reused'
-  | 'socket_opened'
-  | 'socket_probe_started'
-  | 'socket_probe_succeeded'
-  | 'send_started'
-  | 'request_sent'
-  | 'first_raw_event'
-  | 'first_semantic_event'
-  | 'terminal'
-  | 'timeout'
-  | 'abort'
-  | 'transport_error';
-
-export interface OpenAIResponsesWebSocketPhase {
-  phase: OpenAIResponsesWebSocketPhaseKind;
-  observedAt: number;
-  sessionKeyHash: string;
-  connectionGeneration: number;
-  elapsedMs?: number;
-  connectionReused?: boolean;
-  connectionReason?: OpenAIResponsesWebSocketDecision['connectionReason'];
-  mode?: OpenAIResponsesWebSocketDecision['mode'];
-  reason?: string;
-  timeoutPhase?: OpenAIResponsesWebSocketTimeoutPhase;
-  responseCreateFrameSha256?: string;
-  responseCreateFrameBytes?: number;
-  responseCreateSeq?: number;
-}
+export type { OpenAIResponsesWebSocketConnectionReason } from './openAIResponsesWebSocketConnection';
 
 export interface OpenAIResponsesFormatAdapter {
   createStreamState(): StreamDecodeState;
@@ -126,6 +143,11 @@ export interface OpenAIResponsesWebSocketStreamOptions {
     volatileTailContentKinds: Array<'current_turn_input' | 'turn_reminder'>;
     forceFullReason?: string;
   };
+  /**
+   * Capability-gated native Astra mode. Absence preserves the legacy exclusive-session transport
+   * byte for byte; presence enables native events, controllers and optional lane multiplexing.
+   */
+  native?: OpenAIResponsesNativeTransportOptions;
   /** Reliable retries must never reuse the physical socket that owned the failed attempt. */
   forceNewConnection?: boolean;
   signal?: AbortSignal;
@@ -136,58 +158,13 @@ export interface OpenAIResponsesWebSocketStreamOptions {
   timeouts?: Partial<OpenAIResponsesWebSocketTimeouts>;
 }
 
-export interface OpenAIResponsesWebSocketTimeouts {
-  handshakeMs: number;
-  sendMs: number;
-  firstEventMs: number;
-  eventIdleMs: number;
-  responseMs: number;
-  heartbeatIntervalMs: number;
-  pongTimeoutMs: number;
-  preSendProbeStaleMs: number;
-  preSendProbeTimeoutMs: number;
+export interface OpenAIResponsesNativeTransportOptions extends OpenAIResponsesNativeHooks {
+  steering: boolean;
+  reasoningUpdates: boolean;
+  multiplexing: boolean;
 }
 
-export type OpenAIResponsesWebSocketTimeoutPhase =
-  | 'handshake'
-  | 'send'
-  | 'health_probe'
-  | 'first_event'
-  | 'event_idle'
-  | 'response';
-
-export class OpenAIResponsesWebSocketTimeoutError extends Error {
-  public readonly code = 'LLM_TRANSPORT_TIMEOUT';
-  public readonly transport = 'websocket';
-  public readonly retryable = true;
-  public readonly transportAttemptsExhausted = false;
-  public readonly receivedServerEvent: boolean;
-  public receivedSemanticOutput = false;
-
-  public constructor(
-    public readonly phase: OpenAIResponsesWebSocketTimeoutPhase,
-    public readonly timeoutMs: number,
-    receivedServerEvent = false
-  ) {
-    super(`OpenAI Responses WebSocket ${phase} timed out after ${timeoutMs}ms.`);
-    this.name = 'OpenAIResponsesWebSocketTimeoutError';
-    this.receivedServerEvent = receivedServerEvent;
-  }
-}
-
-interface LastRequestState {
-  body: Record<string, unknown>;
-  durableInputItems: unknown[];
-  baseSignature: string;
-  volatileTailLayout?: string;
-}
-
-interface LastResponseState {
-  responseId: string;
-  outputItems: unknown[];
-}
-
-interface WebSocketSession {
+interface WebSocketSession extends OpenAIResponsesWebSocketContinuationState {
   key: string;
   socket?: WebSocket;
   connectedAt?: number;
@@ -197,9 +174,6 @@ interface WebSocketSession {
   connectionGeneration: number;
   responseCreateSeq: number;
   lastUsedAt: number;
-  lastRequest?: LastRequestState;
-  lastResponse?: LastResponseState;
-  successfulIncrementalRequests: number;
   lockTail: Promise<void>;
   activeOperations: number;
 }
@@ -212,6 +186,10 @@ interface PreparedCreatePayload {
   baseSignature: string;
   volatileTailLayout?: string;
   decision: OpenAIResponsesWebSocketDecision;
+  /** Native mode: reasoning anchored on the wire for the committed baseline. */
+  nativeAnchoredReasoning?: unknown;
+  /** Native mode: effective effort after the applied configuration_update, when any. */
+  nativeEffectiveEffort?: string;
 }
 
 interface LocalContinuationBoundary {
@@ -221,34 +199,9 @@ interface LocalContinuationBoundary {
   forceFullReason?: string;
 }
 
-interface WebSocketConnectionConfig {
-  url: string;
-  headers: Record<string, string>;
-  proxy?: string;
-  identityHash: string;
-}
-
-class OpenAIResponsesWebSocketCloseError extends Error {
-  public readonly transport = 'websocket';
-  public readonly retryable: boolean;
-  public readonly transportAttemptsExhausted = false;
-  public receivedSemanticOutput = false;
-
-  public constructor(
-    public readonly closeCode: number,
-    public readonly closeReason: string,
-    public readonly phase: 'connecting' | 'awaiting_first_event' | 'streaming',
-    public readonly receivedServerEvent: boolean
-  ) {
-    super(`OpenAI Responses WebSocket closed before terminal event: ${closeCode}${closeReason ? ` ${closeReason}` : ''}`);
-    this.name = 'WebSocketCloseError';
-    this.retryable = isRetryableOpenAIResponsesWebSocketClose(closeCode, closeReason);
-  }
-}
-
 interface SocketAdmission {
   reused: boolean;
-  reason: OpenAIResponsesWebSocketDecision['connectionReason'];
+  reason: OpenAIResponsesWebSocketConnectionReason;
 }
 
 interface ToolCallAccumulator {
@@ -269,7 +222,6 @@ interface OutputItemRegistry {
 }
 
 const sessions = new Map<string, WebSocketSession>();
-const proxyAgents = new Map<string, HttpsProxyAgent<string>>();
 
 /**
  * Codex-style Responses WebSocket session:
@@ -277,10 +229,22 @@ const proxyAgents = new Map<string, HttpsProxyAgent<string>>();
  * - the baseline uses the same canonical semantic projection yielded to the reliable kernel;
  * - only response.completed commits continuation state;
  * - every uncertainty falls back to a full request.
+ *
+ * With `options.native` present the stream becomes a capability-gated native logical request: it
+ * may span steering successors and tool-result continuations on one connection, emits native
+ * control events as chunks, registers a process-local controller, and can run as a named lane on
+ * the multiplexed connection pool. Without it, behavior is byte-compatible with the legacy
+ * exclusive-session transport.
  */
 export async function* streamOpenAIResponsesWebSocketSession(
   options: OpenAIResponsesWebSocketStreamOptions
 ): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
+  if (options.native) {
+    yield* streamOpenAIResponsesNativeSession(
+      options as OpenAIResponsesWebSocketStreamOptions & { native: OpenAIResponsesNativeTransportOptions }
+    );
+    return;
+  }
   const session = sessionFor(options.sessionKey);
   yield* withSessionLock(session, options, () => streamLocked(session, options));
 }
@@ -288,7 +252,8 @@ export async function* streamOpenAIResponsesWebSocketSession(
 export function resetOpenAIResponsesWebSocketSessions(): void {
   for (const session of sessions.values()) closeAndInvalidate(session, true);
   sessions.clear();
-  proxyAgents.clear();
+  resetOpenAIResponsesWebSocketMultiplexer();
+  resetOpenAIResponsesWebSocketConnectionState();
 }
 
 async function* streamLocked(
@@ -313,7 +278,14 @@ async function* streamLocked(
   }
 
   const fullBody = sanitizeResponsesCreateBody(options.body);
-  const prepared = prepareCreatePayload(session, fullBody, connection, options.format, options.continuation);
+  const prepared = prepareCreatePayload(
+    session,
+    { key: session.key, connectionGeneration: session.connectionGeneration },
+    fullBody,
+    connection,
+    options.format,
+    options.continuation
+  );
   options.onDecision?.(prepared.decision);
 
   const decodeState = options.format.createStreamState();
@@ -361,7 +333,9 @@ async function* streamLocked(
         return;
       }
 
-      let decoded: LLMStreamChunk;
+      // The session is the sole nativeEvent authority on this channel; the format decoder's
+      // nativeEvent surface (SSE-only) never applies here and is excluded from the chunk type.
+      let decoded: Omit<LLMStreamChunk, 'nativeEvent'>;
       try {
         captureDebug(options.debugCapture?.recorder, options.debugCapture?.context, () => ({
           stage: 'ws.decode_input', payload: raw, sources: debugCaptureSources(raw)
@@ -384,8 +358,9 @@ async function* streamLocked(
       if (type === 'response.completed') {
         completedProjection = continuationProjection.completedProjection();
       }
+      const projectedChunk: Omit<LLMStreamChunk, 'nativeEvent'> = projected.chunk;
       const chunk: LimCodeOpenAIResponsesStreamChunk = {
-        ...projected.chunk,
+        ...projectedChunk,
         ...(outputItem.current ? { outputItem: outputItem.current } : {}),
         ...(outputItem.done ? { outputItemDone: outputItem.done } : {}),
         ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {}),
@@ -424,7 +399,9 @@ async function* streamLocked(
     }
 
     const resolvedResponseId = responseId;
-    const normalizedOutputItems = completedProjection?.outputItems.map(stripWebSocketOnlyInputFields);
+    const normalizedOutputItems = completedProjection?.outputItems.map(
+      (item) => stripWebSocketOnlyInputFields(item)
+    );
     const outputStateReliable = normalizedOutputItems !== undefined
       && (normalizedOutputItems.length > 0 || !sawSemanticOutput);
 
@@ -475,8 +452,27 @@ async function* withSessionLock<T>(
   session.lockTail = previous.then(() => gate);
 
   let acquired = false;
+  const onLaneQueueState = options.native?.onLaneQueueState;
+  const localCapacityWait = session.activeOperations > 0;
+  if (localCapacityWait) {
+    try {
+      onLaneQueueState?.(true);
+    } catch {
+      // Local wait diagnostics must never become lock authority.
+    }
+  }
   try {
-    await waitForTurn(previous, options.signal);
+    try {
+      await waitForTurn(previous, options.signal);
+    } finally {
+      if (localCapacityWait) {
+        try {
+          onLaneQueueState?.(false);
+        } catch {
+          // Local wait diagnostics must never become lock authority.
+        }
+      }
+    }
     acquired = true;
     session.activeOperations += 1;
     observeTransportPhase(session, options, 'lock_acquired', { elapsedMs: Date.now() - queuedAt });
@@ -560,18 +556,7 @@ function observeTransportPhase(
   phase: OpenAIResponsesWebSocketPhaseKind,
   detail: Partial<OpenAIResponsesWebSocketPhase> = {}
 ): void {
-  const observation: OpenAIResponsesWebSocketPhase = {
-    ...detail,
-    phase,
-    observedAt: Date.now(),
-    sessionKeyHash: createHash('sha256').update(session.key).digest('hex').slice(0, 12),
-    connectionGeneration: detail.connectionGeneration ?? session.connectionGeneration
-  };
-  try {
-    options.onPhase?.(observation);
-  } catch {
-    // Diagnostics must never become transport authority or fail a provider request.
-  }
+  observeOpenAIResponsesWebSocketPhase(session, options.onPhase, phase, detail);
 }
 
 function observeTransportFailure(
@@ -579,22 +564,7 @@ function observeTransportFailure(
   options: OpenAIResponsesWebSocketStreamOptions,
   error: unknown
 ): void {
-  const timeout = error instanceof OpenAIResponsesWebSocketTimeoutError ? error : undefined;
-  const aborted = isAbort(options.signal, error);
-  observeTransportPhase(
-    session,
-    options,
-    timeout ? 'timeout' : aborted ? 'abort' : 'transport_error',
-    {
-      ...(timeout ? { timeoutPhase: timeout.phase } : {}),
-      reason: timeout ? `timeout_${timeout.phase}` : aborted ? 'signal_aborted' : errorName(error)
-    }
-  );
-}
-
-function errorName(error: unknown): string {
-  if (error instanceof Error && error.name.trim()) return error.name.trim();
-  return typeof error === 'string' && error.trim() ? 'Error' : 'UnknownError';
+  observeOpenAIResponsesWebSocketFailure(session, options.onPhase, options.signal, error);
 }
 
 function evictOverflowSessions(): void {
@@ -675,7 +645,11 @@ async function ensureSocket(
   session.connectionGeneration += 1;
   session.responseCreateSeq = 0;
   session.lastUsedAt = Date.now();
-  startHeartbeat(session, session.socket, timeouts);
+  const ownedSocket = session.socket;
+  startOpenAIResponsesWebSocketHeartbeat(session, ownedSocket, timeouts, () => {
+    if (session.socket !== ownedSocket) return;
+    closeAndInvalidate(session, true);
+  });
   observeTransportPhase(session, options, 'socket_opened', {
     connectionReused: false,
     connectionReason: reason
@@ -688,87 +662,37 @@ function requireConnectionIdentity(session: WebSocketSession): string {
   return session.connectionIdentityHash;
 }
 
-function currentNetworkIdentityFingerprint(): string {
-  let addresses: string[];
-  try {
-    addresses = Object.entries(networkInterfaces())
-      .flatMap(([name, records]) => (records ?? [])
-        .filter((record) => !record.internal)
-        .map((record) => [
-          name,
-          String(record.family),
-          record.address,
-          record.netmask,
-          record.cidr ?? '',
-          String(record.scopeid ?? '')
-        ].join(':')))
-      .sort();
-  } catch {
-    addresses = ['network-interfaces-unavailable'];
-  }
-  return createHash('sha256')
-    .update(addresses.length > 0 ? addresses.join('\n') : 'no-external-network')
-    .digest('hex');
-}
-
-function structuredTransportError(
-  message: string,
-  code: string,
-  phase: 'connecting' | 'awaiting_first_event' | 'streaming',
-  receivedServerEvent: boolean
-): Error {
-  return Object.assign(new Error(message), {
-    code,
-    transport: 'websocket' as const,
-    phase,
-    receivedServerEvent,
-    receivedSemanticOutput: false,
-    retryable: true,
-    transportAttemptsExhausted: false
-  });
-}
-
-function webSocketConnectionConfig(options: OpenAIResponsesWebSocketStreamOptions): WebSocketConnectionConfig {
-  const url = toWebSocketUrl(options.url);
-  const headers = webSocketHeaders(options.headers);
-  const proxy = normalizeProxyUrl(options.proxy);
-  return {
-    url,
-    headers,
-    ...(proxy ? { proxy } : {}),
-    identityHash: canonicalHash({
-      url,
-      headers,
-      proxy: proxy ?? null,
-      networkIdentityFingerprint: currentNetworkIdentityFingerprint()
-    })
-  };
-}
-
 function prepareCreatePayload(
-  session: WebSocketSession,
+  continuation: OpenAIResponsesWebSocketContinuationState,
+  identity: { key: string; connectionGeneration: number },
   fullBody: Record<string, unknown>,
   connection: SocketAdmission,
   format: OpenAIResponsesFormatAdapter,
-  continuation: OpenAIResponsesWebSocketStreamOptions['continuation']
+  continuationHint: OpenAIResponsesWebSocketStreamOptions['continuation'],
+  native?: OpenAIResponsesNativeTransportOptions,
+  streamId?: string
 ): PreparedCreatePayload {
   const connectionReused = connection.reused;
   const fullInputItems = Array.isArray(fullBody.input) ? fullBody.input.map(cloneJson) : [];
-  const boundary = localContinuationBoundary(fullInputItems, format, continuation);
-  const baseSignature = canonicalHash(requestBase(fullBody));
-  const baseline = session.lastRequest && session.lastResponse
-    ? [...session.lastRequest.durableInputItems, ...session.lastResponse.outputItems]
+  const boundary = localContinuationBoundary(fullInputItems, format, continuationHint, native !== undefined);
+  // Native dynamic reasoning keeps request-level reasoning out of the baseline signature so a pure
+  // effort change can ride a configuration_update instead of rewriting the cached prefix.
+  const signatureBase = requestBase(fullBody);
+  if (native?.reasoningUpdates) delete signatureBase.reasoning;
+  const baseSignature = canonicalHash(signatureBase);
+  const baseline = continuation.lastRequest && continuation.lastResponse
+    ? [...continuation.lastRequest.durableInputItems, ...continuation.lastResponse.outputItems]
     : undefined;
 
   let reason = 'no_completed_baseline';
   let canIncrement = false;
   if (!connectionReused) reason = 'new_socket_generation';
-  else if (!session.lastRequest || !session.lastResponse || !baseline) reason = 'no_completed_baseline';
+  else if (!continuation.lastRequest || !continuation.lastResponse || !baseline) reason = 'no_completed_baseline';
   else if (boundary.forceFullReason) reason = boundary.forceFullReason;
-  else if (session.lastRequest.baseSignature !== baseSignature) reason = 'request_properties_changed';
-  else if (session.lastRequest.volatileTailLayout !== boundary.volatileTailLayout) {
+  else if (continuation.lastRequest.baseSignature !== baseSignature) reason = 'request_properties_changed';
+  else if (continuation.lastRequest.volatileTailLayout !== boundary.volatileTailLayout) {
     reason = 'volatile_tail_layout_changed';
-  } else if (session.successfulIncrementalRequests >= MAX_SUCCESSFUL_INCREMENTAL_REQUESTS) {
+  } else if (continuation.successfulIncrementalRequests >= MAX_SUCCESSFUL_INCREMENTAL_REQUESTS) {
     reason = 'periodic_rebase';
   } else {
     const mismatch = prefixMismatchReason(boundary.durableInputItems, baseline);
@@ -783,21 +707,63 @@ function prepareCreatePayload(
     }
   }
 
+  // Native dynamic reasoning: only a pure effort change on an otherwise compatible continuation
+  // rides a configuration_update; any other reasoning shape change rebases with a full request.
+  let reasoningUpdate: { fromEffort: string; toEffort: string } | undefined;
+  if (canIncrement && native?.reasoningUpdates && continuation.lastRequest) {
+    const anchored = continuation.lastRequest.nativeAnchoredReasoning;
+    const caller = fullBody.reasoning;
+    const anchoredEffort = continuation.lastRequest.nativeEffectiveEffort
+      ?? reasoningEffortOf(anchored);
+    const callerEffort = reasoningEffortOf(caller);
+    const shapeMatches = canonicalString(reasoningWithoutEffort(anchored) ?? null)
+      === canonicalString(reasoningWithoutEffort(caller) ?? null);
+    if (!shapeMatches) {
+      canIncrement = false;
+      reason = 'reasoning_shape_changed';
+    } else if (
+      anchoredEffort !== undefined
+      && callerEffort !== undefined
+      && anchoredEffort !== callerEffort
+    ) {
+      reasoningUpdate = { fromEffort: anchoredEffort, toEffort: callerEffort };
+    }
+  }
+
   const sentInput = canIncrement && baseline
     ? [
         ...boundary.durableInputItems.slice(baseline.length),
         ...boundary.volatileInputItems
       ]
     : fullInputItems;
+  if (reasoningUpdate) {
+    sentInput.unshift({ type: 'configuration_update', reasoning: { effort: reasoningUpdate.toEffort } });
+  }
   const payload: Record<string, unknown> = {
     type: 'response.create',
     ...fullBody,
     input: sentInput,
     store: false,
-    ...(canIncrement && session.lastResponse
-      ? { previous_response_id: session.lastResponse.responseId }
-      : {})
+    ...(canIncrement && continuation.lastResponse
+      ? { previous_response_id: continuation.lastResponse.responseId }
+      : {}),
+    ...(streamId ? { stream_id: streamId } : {})
   };
+  if (canIncrement && native?.reasoningUpdates && continuation.lastRequest) {
+    // Keep the request-level reasoning anchored at the prefix's original value for the whole
+    // chain; an appended configuration_update (when present) selects the effective effort.
+    const anchored = continuation.lastRequest.nativeAnchoredReasoning;
+    if (anchored !== undefined) payload.reasoning = cloneJson(anchored);
+    else delete payload.reasoning;
+  }
+  const nativeAnchoredReasoning = canIncrement
+    ? continuation.lastRequest?.nativeAnchoredReasoning
+    : cloneJson(fullBody.reasoning);
+  const nativeEffectiveEffort = reasoningUpdate?.toEffort
+    ?? (canIncrement
+      ? continuation.lastRequest?.nativeEffectiveEffort
+        ?? reasoningEffortOf(continuation.lastRequest?.nativeAnchoredReasoning)
+      : reasoningEffortOf(fullBody.reasoning));
   return {
     payload,
     fullBody,
@@ -805,9 +771,17 @@ function prepareCreatePayload(
     durableInputItems: boundary.durableInputItems,
     baseSignature,
     ...(boundary.volatileTailLayout ? { volatileTailLayout: boundary.volatileTailLayout } : {}),
+    ...(native
+      ? {
+          ...(nativeAnchoredReasoning !== undefined
+            ? { nativeAnchoredReasoning: cloneJson(nativeAnchoredReasoning) }
+            : {}),
+          ...(nativeEffectiveEffort !== undefined ? { nativeEffectiveEffort } : {})
+        }
+      : {}),
     decision: {
-      sessionKeyHash: createHash('sha256').update(session.key).digest('hex').slice(0, 12),
-      connectionGeneration: session.connectionGeneration,
+      sessionKeyHash: createHash('sha256').update(identity.key).digest('hex').slice(0, 12),
+      connectionGeneration: identity.connectionGeneration,
       connectionReused,
       connectionReason: connection.reason,
       mode: canIncrement ? 'incremental' : 'full',
@@ -817,17 +791,30 @@ function prepareCreatePayload(
       fullInputFingerprint: shortCanonicalHash(fullInputItems),
       sentInputFingerprint: shortCanonicalHash(sentInput),
       ...(baseline ? { baselineFingerprint: shortCanonicalHash(baseline) } : {}),
-      ...(canIncrement && session.lastResponse
-        ? { previousResponseIdUsed: session.lastResponse.responseId }
-        : {})
+      ...(canIncrement && continuation.lastResponse
+        ? { previousResponseIdUsed: continuation.lastResponse.responseId }
+        : {}),
+      ...(streamId ? { streamId } : {}),
+      ...(reasoningUpdate ? { reasoningUpdateApplied: reasoningUpdate } : {})
     }
   };
+}
+
+function reasoningEffortOf(reasoning: unknown): string | undefined {
+  return isRecord(reasoning) ? normalizedString(reasoning.effort) : undefined;
+}
+
+function reasoningWithoutEffort(reasoning: unknown): unknown {
+  if (!isRecord(reasoning)) return reasoning;
+  const { effort: _effort, ...rest } = reasoning;
+  return rest;
 }
 
 function localContinuationBoundary(
   fullInputItems: unknown[],
   format: OpenAIResponsesFormatAdapter,
-  continuation: OpenAIResponsesWebSocketStreamOptions['continuation']
+  continuation: OpenAIResponsesWebSocketStreamOptions['continuation'],
+  native = false
 ): LocalContinuationBoundary {
   if (!continuation) {
     return {
@@ -879,7 +866,7 @@ function localContinuationBoundary(
       forceFullReason: 'volatile_tail_encode_failed'
     };
   }
-  const volatileInputItems = encoded.input.map(stripWebSocketOnlyInputFields);
+  const volatileInputItems = encoded.input.map((item) => stripWebSocketOnlyInputFields(item, native));
   const offset = fullInputItems.length - volatileInputItems.length;
   if (offset < 0) {
     return {
@@ -905,26 +892,28 @@ function localContinuationBoundary(
   };
 }
 
-function sanitizeResponsesCreateBody(value: unknown): Record<string, unknown> {
+function sanitizeResponsesCreateBody(value: unknown, native = false): Record<string, unknown> {
   if (!isRecord(value)) throw new Error('OpenAI Responses WebSocket body must be a JSON object.');
   const next = cloneJson(value);
   delete next.type;
   delete next.stream;
   delete next.background;
   delete next.previous_response_id;
-  delete next.prompt_cache_options;
+  // Explicit prompt caching is retained on supported native Astra channels only; the legacy
+  // compatibility endpoint keeps the historical strip behavior unchanged.
+  if (!native) delete next.prompt_cache_options;
   next.store = false;
-  next.input = Array.isArray(next.input) ? next.input.map(stripWebSocketOnlyInputFields) : [];
+  next.input = Array.isArray(next.input) ? next.input.map((item) => stripWebSocketOnlyInputFields(item, native)) : [];
   return next;
 }
 
-function stripWebSocketOnlyInputFields(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripWebSocketOnlyInputFields);
+function stripWebSocketOnlyInputFields(value: unknown, native = false): unknown {
+  if (Array.isArray(value)) return value.map((item) => stripWebSocketOnlyInputFields(item, native));
   if (!isRecord(value)) return value;
   const result: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    if (key === 'prompt_cache_breakpoint') continue;
-    result[key] = stripWebSocketOnlyInputFields(child);
+    if (key === 'prompt_cache_breakpoint' && !native) continue;
+    result[key] = stripWebSocketOnlyInputFields(child, native);
   }
   return result;
 }
@@ -947,140 +936,6 @@ function prefixMismatchReason(items: unknown[], prefix: unknown[]): string | und
     }
   }
   return undefined;
-}
-
-async function openSocket(
-  connection: WebSocketConnectionConfig,
-  timeoutMs: number,
-  signal?: AbortSignal
-): Promise<WebSocket> {
-  throwIfAborted(signal);
-  const agent = proxyAgent(connection.proxy);
-  return new Promise<WebSocket>((resolve, reject) => {
-    let settled = false;
-    const socket = new WebSocket(connection.url, {
-      headers: connection.headers,
-      perMessageDeflate: false,
-      ...(agent ? { agent } : {}),
-      ...(connection.proxy ? { rejectUnauthorized: false } : {})
-    });
-    const cleanup = () => {
-      clearTimeout(timeout);
-      signal?.removeEventListener('abort', onAbort);
-      socket.off('open', onOpen);
-      socket.off('error', onError);
-      socket.off('close', onClose);
-    };
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) {
-        try { socket.terminate(); } catch { /* noop */ }
-        reject(error);
-      } else resolve(socket);
-    };
-    const onAbort = () => finish(abortError(signal));
-    const onOpen = () => finish();
-    const onError = (error: Error) => finish(error);
-    const onClose = (code: number, reason: Buffer) => finish(
-      new OpenAIResponsesWebSocketCloseError(code, reason.toString('utf8').trim(), 'connecting', false)
-    );
-    signal?.addEventListener('abort', onAbort, { once: true });
-    const timeout = setTimeout(
-      () => finish(new OpenAIResponsesWebSocketTimeoutError('handshake', timeoutMs)),
-      timeoutMs
-    );
-    socket.once('open', onOpen);
-    socket.once('error', onError);
-    socket.once('close', onClose);
-  });
-}
-
-function startHeartbeat(
-  session: WebSocketSession,
-  socket: WebSocket,
-  timeouts: OpenAIResponsesWebSocketTimeouts
-): void {
-  if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
-  session.lastPongAt = Date.now();
-
-  const invalidateOwnedSocket = () => {
-    if (session.socket !== socket) return;
-    closeAndInvalidate(session, true);
-  };
-  socket.on('pong', () => {
-    if (session.socket === socket) session.lastPongAt = Date.now();
-  });
-  socket.on('error', invalidateOwnedSocket);
-  socket.on('close', invalidateOwnedSocket);
-
-  const heartbeat = setInterval(() => {
-    if (session.socket !== socket) {
-      clearInterval(heartbeat);
-      return;
-    }
-    if (socket.readyState !== WebSocket.OPEN) {
-      invalidateOwnedSocket();
-      return;
-    }
-    const lastPongAt = session.lastPongAt ?? session.connectedAt ?? 0;
-    if (Date.now() - lastPongAt >= timeouts.pongTimeoutMs) {
-      invalidateOwnedSocket();
-      return;
-    }
-    try {
-      socket.ping((error?: Error) => {
-        if (error) invalidateOwnedSocket();
-      });
-    } catch {
-      invalidateOwnedSocket();
-    }
-  }, timeouts.heartbeatIntervalMs);
-  heartbeat.unref?.();
-  session.heartbeatTimer = heartbeat;
-}
-
-function probeSocket(socket: WebSocket, timeoutMs: number, signal?: AbortSignal): Promise<void> {
-  throwIfAborted(signal);
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => {
-      clearTimeout(timeout);
-      signal?.removeEventListener('abort', onAbort);
-      socket.off('pong', onPong);
-      socket.off('error', onError);
-      socket.off('close', onClose);
-    };
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve();
-    };
-    const onAbort = () => finish(abortError(signal));
-    const onPong = () => finish();
-    const onError = (error: Error) => finish(error);
-    const onClose = (code: number, reason: Buffer) => finish(
-      new OpenAIResponsesWebSocketCloseError(code, reason.toString('utf8').trim(), 'connecting', false)
-    );
-    const timeout = setTimeout(
-      () => finish(new OpenAIResponsesWebSocketTimeoutError('health_probe', timeoutMs)),
-      timeoutMs
-    );
-    signal?.addEventListener('abort', onAbort, { once: true });
-    socket.once('pong', onPong);
-    socket.once('error', onError);
-    socket.once('close', onClose);
-    try {
-      socket.ping((error?: Error) => {
-        if (error) finish(error);
-      });
-    } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)));
-    }
-  });
 }
 
 async function* sendCreateAndReadEvents(
@@ -1231,124 +1086,14 @@ async function* sendCreateAndReadEvents(
   }
 }
 
-function sendWithDeadline(
-  socket: WebSocket,
-  payload: string,
-  timeoutMs: number,
-  signal?: AbortSignal
-): Promise<void> {
-  throwIfAborted(signal);
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => {
-      clearTimeout(timeout);
-      signal?.removeEventListener('abort', onAbort);
-    };
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve();
-    };
-    const onAbort = () => finish(abortError(signal));
-    const timeout = setTimeout(
-      () => finish(new OpenAIResponsesWebSocketTimeoutError('send', timeoutMs)),
-      timeoutMs
-    );
-    signal?.addEventListener('abort', onAbort, { once: true });
-    socket.send(payload, (error) => finish(error ?? undefined));
-  });
-}
-
-function resolvedTimeouts(
-  overrides: Partial<OpenAIResponsesWebSocketTimeouts> | undefined
-): OpenAIResponsesWebSocketTimeouts {
-  return {
-    handshakeMs: positiveTimeout(overrides?.handshakeMs, DEFAULT_HANDSHAKE_TIMEOUT_MS, 'handshakeMs'),
-    sendMs: positiveTimeout(overrides?.sendMs, DEFAULT_SEND_TIMEOUT_MS, 'sendMs'),
-    firstEventMs: positiveTimeout(overrides?.firstEventMs, DEFAULT_FIRST_EVENT_TIMEOUT_MS, 'firstEventMs'),
-    eventIdleMs: positiveTimeout(overrides?.eventIdleMs, DEFAULT_EVENT_IDLE_TIMEOUT_MS, 'eventIdleMs'),
-    responseMs: positiveTimeout(overrides?.responseMs, DEFAULT_RESPONSE_TIMEOUT_MS, 'responseMs'),
-    heartbeatIntervalMs: positiveTimeout(
-      overrides?.heartbeatIntervalMs,
-      DEFAULT_HEARTBEAT_INTERVAL_MS,
-      'heartbeatIntervalMs'
-    ),
-    pongTimeoutMs: positiveTimeout(overrides?.pongTimeoutMs, DEFAULT_PONG_TIMEOUT_MS, 'pongTimeoutMs'),
-    preSendProbeStaleMs: positiveTimeout(
-      overrides?.preSendProbeStaleMs,
-      DEFAULT_PRE_SEND_PROBE_STALE_MS,
-      'preSendProbeStaleMs'
-    ),
-    preSendProbeTimeoutMs: positiveTimeout(
-      overrides?.preSendProbeTimeoutMs,
-      DEFAULT_PRE_SEND_PROBE_TIMEOUT_MS,
-      'preSendProbeTimeoutMs'
-    )
-  };
-}
-
-function positiveTimeout(value: number | undefined, fallback: number, label: string): number {
-  if (value === undefined) return fallback;
-  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${label} must be a positive integer.`);
-  return value;
-}
-
-class AsyncEventQueue<T> implements AsyncIterable<T> {
-  private readonly items: Array<{ value?: T; done?: true; error?: Error }> = [];
-  private readonly waiters: Array<(item: { value?: T; done?: true; error?: Error }) => void> = [];
-  private closed = false;
-
-  public push(value: T): void {
-    if (this.closed) return;
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter({ value });
-      return;
-    }
-    this.items.push({ value });
-  }
-
-  public end(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.emit({ done: true });
-  }
-
-  public fail(error: Error): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.emit({ error });
-  }
-
-  private emit(item: { value?: T; done?: true; error?: Error }): void {
-    const waiter = this.waiters.shift();
-    if (waiter) waiter(item);
-    else this.items.push(item);
-  }
-
-  public async *[Symbol.asyncIterator](): AsyncGenerator<T> {
-    while (true) {
-      const item = this.items.shift() ?? await new Promise<{
-        value?: T;
-        done?: true;
-        error?: Error;
-      }>((resolve) => this.waiters.push(resolve));
-      if (item.error) throw item.error;
-      if (item.done) return;
-      if (item.value !== undefined) yield item.value;
-    }
-  }
-}
-
 function observeOutputItem(
   raw: Record<string, unknown>,
-  registry: OutputItemRegistry
+  registry: OutputItemRegistry,
+  ordinalBase = 0
 ): { current?: ModelOutputItemReference; done?: ModelOutputItemReference } {
   const type = eventType(raw);
   const item = isRecord(raw.item) ? raw.item : undefined;
-  const aliases = outputItemAliases(item, raw);
+  const aliases = outputItemAliases(item, raw, ordinalBase);
   if (aliases.length === 0) return {};
   const matches = [...new Set(aliases
     .map((alias) => registry.byAlias.get(alias))
@@ -1359,7 +1104,7 @@ function observeOutputItem(
   const wireOrdinal = typeof raw.output_index === 'number'
     && Number.isSafeInteger(raw.output_index)
     && raw.output_index >= 0
-      ? raw.output_index
+      ? ordinalBase + raw.output_index
       : undefined;
   const ordinal = existing?.ordinal ?? wireOrdinal ?? registry.nextOrdinal;
   registry.nextOrdinal = Math.max(registry.nextOrdinal, ordinal + 1);
@@ -1389,7 +1134,8 @@ function unregisterOutputItem(registry: OutputItemRegistry, reference: ModelOutp
 
 function outputItemAliases(
   item: Record<string, unknown> | undefined,
-  event: Record<string, unknown>
+  event: Record<string, unknown>,
+  ordinalBase = 0
 ): string[] {
   const itemId = (item ? normalizedString(item.id) : undefined) ?? normalizedString(event.item_id);
   const outputIndex = typeof event.output_index === 'number'
@@ -1399,7 +1145,7 @@ function outputItemAliases(
       : undefined;
   return [
     ...(itemId ? [`item:${itemId}`] : []),
-    ...(outputIndex !== undefined ? [`output:${outputIndex}`] : [])
+    ...(outputIndex !== undefined ? [`output:${ordinalBase + outputIndex}`] : [])
   ];
 }
 
@@ -1410,14 +1156,15 @@ function assistantMessagePhase(value: unknown): AssistantMessagePhase | undefine
 function captureToolCallArgumentDeltas(
   raw: Record<string, unknown>,
   registry: ToolCallAccumulatorRegistry,
-  debug?: DebugWebSocketObservation
+  debug?: DebugWebSocketObservation,
+  ordinalBase = 0
 ): OpenAIResponsesToolCallArgumentDelta[] {
   const type = eventType(raw);
   if (type === 'response.output_item.added' && isRecord(raw.item)
     && raw.item.type === 'function_call') {
-    const accumulator = toolAccumulatorFromItem(raw.item, raw);
+    const accumulator = toolAccumulatorFromItem(raw.item, raw, ordinalBase);
     if (!accumulator) return [];
-    registerToolAccumulator(registry, accumulator, raw.item, raw);
+    registerToolAccumulator(registry, accumulator, raw.item, raw, ordinalBase);
     observeToolAssembly(debug, raw, accumulator, '', accumulator.arguments, 'append', 'registered_item');
     return accumulator.arguments
       ? [{
@@ -1431,7 +1178,7 @@ function captureToolCallArgumentDeltas(
 
   if (type === 'response.function_call_arguments.delta') {
     let selection = 'unmatched';
-    const accumulator = findToolAccumulator(raw, registry, debug?.recorder.active(debug.context) ? (reason) => { selection = reason; } : undefined);
+    const accumulator = findToolAccumulator(raw, registry, debug?.recorder.active(debug.context) ? (reason) => { selection = reason; } : undefined, ordinalBase);
     const delta = typeof raw.delta === 'string' ? raw.delta : '';
     if (!accumulator || !delta) {
       observeToolAssembly(debug, raw, accumulator, accumulator?.arguments ?? '', delta, 'rejected', selection);
@@ -1454,9 +1201,9 @@ function captureToolCallArgumentDeltas(
       || (isRecord(raw.item) && raw.item.type === 'function_call'))) {
     const source = type === 'response.output_item.done' && isRecord(raw.item) ? raw.item : raw;
     let selection = 'unmatched';
-    const registered = findToolAccumulator(raw, registry, debug?.recorder.active(debug.context) ? (reason) => { selection = reason; } : undefined);
+    const registered = findToolAccumulator(raw, registry, debug?.recorder.active(debug.context) ? (reason) => { selection = reason; } : undefined, ordinalBase);
     const accumulator = registered
-      ?? (isRecord(source) ? toolAccumulatorFromItem(source, raw) : undefined);
+      ?? (isRecord(source) ? toolAccumulatorFromItem(source, raw, ordinalBase) : undefined);
     const finalArguments = isRecord(source) ? normalizedString(source.arguments) : undefined;
     let deltas: OpenAIResponsesToolCallArgumentDelta[] = [];
     const before = accumulator?.arguments ?? '';
@@ -1493,7 +1240,8 @@ function captureToolCallArgumentDeltas(
 
 function toolAccumulatorFromItem(
   item: Record<string, unknown>,
-  event: Record<string, unknown>
+  event: Record<string, unknown>,
+  ordinalBase = 0
 ): ToolCallAccumulator | undefined {
   const callId = normalizedString(item.call_id) ?? normalizedString(event.call_id);
   if (!callId) return undefined;
@@ -1501,17 +1249,18 @@ function toolAccumulatorFromItem(
     callId,
     ...(normalizedString(item.name) ? { name: normalizedString(item.name) } : {}),
     arguments: normalizedString(item.arguments) ?? '',
-    ...(streamIndex(item, event) ? { streamIndex: streamIndex(item, event) } : {})
+    ...(streamIndex(item, event, ordinalBase) ? { streamIndex: streamIndex(item, event, ordinalBase) } : {})
   };
 }
 
 function findToolAccumulator(
   event: Record<string, unknown>,
   registry: ToolCallAccumulatorRegistry,
-  selected?: (reason: string) => void
+  selected?: (reason: string) => void,
+  ordinalBase = 0
 ): ToolCallAccumulator | undefined {
   const item = isRecord(event.item) ? event.item : undefined;
-  const matches = [...new Set(toolAccumulatorAliases(item, event)
+  const matches = [...new Set(toolAccumulatorAliases(item, event, undefined, ordinalBase)
     .map((key) => registry.byAlias.get(key))
     .filter((value): value is ToolCallAccumulator => !!value))];
   if (matches.length === 1) { selected?.('alias'); return matches[0]; }
@@ -1531,10 +1280,11 @@ function registerToolAccumulator(
   registry: ToolCallAccumulatorRegistry,
   accumulator: ToolCallAccumulator,
   item: Record<string, unknown>,
-  event: Record<string, unknown>
+  event: Record<string, unknown>,
+  ordinalBase = 0
 ): void {
   registry.active.add(accumulator);
-  for (const alias of toolAccumulatorAliases(item, event, accumulator.callId)) {
+  for (const alias of toolAccumulatorAliases(item, event, accumulator.callId, ordinalBase)) {
     registry.byAlias.set(alias, accumulator);
   }
 }
@@ -1552,7 +1302,8 @@ function unregisterToolAccumulator(
 function toolAccumulatorAliases(
   item: Record<string, unknown> | undefined,
   event: Record<string, unknown>,
-  fallbackCallId?: string
+  fallbackCallId?: string,
+  ordinalBase = 0
 ): string[] {
   const itemId = (item ? normalizedString(item.id) : undefined) ?? normalizedString(event.item_id);
   const callId = normalizedString(event.call_id)
@@ -1561,15 +1312,19 @@ function toolAccumulatorAliases(
   const outputIndex = typeof event.output_index === 'number' ? event.output_index : undefined;
   return [
     ...(itemId ? [`item:${itemId}`] : []),
-    ...(outputIndex !== undefined ? [`output:${outputIndex}`] : []),
+    ...(outputIndex !== undefined ? [`output:${ordinalBase + outputIndex}`] : []),
     ...(callId ? [`call:${callId}`] : [])
   ];
 }
 
-function streamIndex(item: Record<string, unknown>, event: Record<string, unknown>): string | undefined {
+function streamIndex(
+  item: Record<string, unknown>,
+  event: Record<string, unknown>,
+  ordinalBase = 0
+): string | undefined {
   return normalizedString(item.id)
     ?? normalizedString(event.item_id)
-    ?? (typeof event.output_index === 'number' ? `output:${event.output_index}` : undefined);
+    ?? (typeof event.output_index === 'number' ? `output:${ordinalBase + event.output_index}` : undefined);
 }
 
 function responseIdFromPayload(raw: Record<string, unknown>): string | undefined {
@@ -1684,7 +1439,8 @@ function hasMeaningfulChunk(chunk: LimCodeOpenAIResponsesStreamChunk): boolean {
     || !!chunk.thoughtSignatures
     || chunk.reasoningItemDone === true
     || !!chunk.outputItemDone
-    || !!chunk.completedContent;
+    || !!chunk.completedContent
+    || !!chunk.nativeEvent;
 }
 
 function closeAndInvalidate(session: WebSocketSession, terminate: boolean): void {
@@ -1705,147 +1461,1497 @@ function closeAndInvalidate(session: WebSocketSession, terminate: boolean): void
 }
 
 function invalidateContinuation(session: WebSocketSession): void {
-  session.lastRequest = undefined;
-  session.lastResponse = undefined;
-  session.successfulIncrementalRequests = 0;
+  invalidateOpenAIResponsesWebSocketContinuation(session);
 }
 
-function webSocketHeaders(headers: Record<string, string>): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers)) {
-    const normalized = key.toLowerCase();
-    if (normalized === 'content-type' || normalized === 'content-length'
-      || normalized === 'connection' || normalized === 'upgrade'
-      || normalized.startsWith('sec-websocket-')) continue;
-    result[normalized] = value;
+
+// ---------------------------------------------------------------------------
+// Native capability-gated persistent response sessions
+// ---------------------------------------------------------------------------
+
+/**
+ * One logical native request may span several physical Responses on one connection: an automatic
+ * steering successor, a required tool-input continuation, or continuations delivering async tool
+ * results. The chain below keeps the stream open across those boundaries while preserving
+ * per-response decode state and chain-unique output/tool identities. Non-native streams never
+ * reach this section.
+ */
+
+interface NativeChainLease {
+  readonly connectionGeneration: number;
+  readonly streamId: string | undefined;
+  readonly continuation: OpenAIResponsesWebSocketContinuationState;
+  readonly connectionReused: boolean;
+  readonly connectionReason: OpenAIResponsesWebSocketConnectionReason;
+  sendFrame(
+    frame: Record<string, unknown>,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<{ responseCreateSeq?: number }>;
+  events(): AsyncIterable<Record<string, unknown>>;
+  healthy(): boolean;
+  /**
+   * Active-response capacity, separate from lane ownership: held while a response may run for
+   * this lease, released during proven client-input waits, reacquired before a create/steer that
+   * can start a response. Idempotent; the exclusive session implements both as no-ops.
+   */
+  acquirePermit(signal?: AbortSignal): Promise<void>;
+  releasePermit(): void;
+  release(outcome: 'quiescent' | 'error' | 'abort', staleCreatesExpected: number): void;
+}
+
+interface NativePendingSteer {
+  submissionId: string;
+  input: OpenAIResponsesSteeringCommand['input'];
+  wireInput: unknown[];
+  targetResponseId: string;
+  steerId?: string;
+  state: 'queued' | 'sent' | 'accepted' | 'waiting_for_input' | 'continuing' | 'failed';
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+interface NativePendingToolSubmission {
+  wireItems: unknown[];
+  /** Plain provider call IDs, used to settle outstanding async tracking. */
+  callIds: string[];
+  /** Coverage keys matching the required-input gate (`approval:` prefixed for approvals). */
+  coverageKeys: string[];
+  resolve: (admission: OpenAIResponsesNativeResultAdmission) => void;
+  reject: (error: Error) => void;
+}
+
+interface NativeAdmittedPendingBatch {
+  batch: NativePendingToolSubmission[];
+  previousResponseId: string;
+  /** Accepted steers the server prepends to this create (snapshot at send), in accept order. */
+  appliedSteerCount: number;
+  responseCreateSeq?: number;
+}
+
+interface NativeActiveResponse {
+  responseId: string;
+  responseCreateSeq?: number;
+  decodeState: StreamDecodeState;
+  projection: OpenAIResponsesContinuationProjection;
+  toolCalls: ToolCallAccumulatorRegistry;
+  ordinalBase: number;
+}
+
+interface NativeChainState {
+  lease: NativeChainLease;
+  options: OpenAIResponsesWebSocketStreamOptions & { native: OpenAIResponsesNativeTransportOptions };
+  native: OpenAIResponsesNativeTransportOptions;
+  timeouts: OpenAIResponsesWebSocketTimeouts;
+  prepared: PreparedCreatePayload;
+  frozenWireSettings: Record<string, unknown>;
+  asyncToolNames: Set<string>;
+  outputRegistry: OutputItemRegistry;
+  outbox: LimCodeOpenAIResponsesStreamChunk[];
+  outboxSignal: { promise: Promise<void>; resolve: () => void };
+  initialResponseCreateSeq?: number;
+  latestResponseId?: string;
+  latestTerminalResponseId?: string;
+  chainResponseIds: Set<string>;
+  chainTail: unknown[];
+  chainTailReliable: boolean;
+  activeResponse?: NativeActiveResponse;
+  seenAnyResponse: boolean;
+  sawSemanticOutput: boolean;
+  firstEventSeen: boolean;
+  steerQueue: NativePendingSteer[];
+  steerInFlight?: NativePendingSteer;
+  steerSending: boolean;
+  steersById: Map<string, NativePendingSteer>;
+  acceptedUnapplied: NativePendingSteer[];
+  createQueue: NativePendingToolSubmission[];
+  createInFlight?: NativeAdmittedPendingBatch;
+  createSending: boolean;
+  outstandingAsyncCalls: Set<string>;
+  pendingRequiredCalls: Map<string, OpenAIResponsesRequiredInput>;
+  requiredCalls: Map<string, OpenAIResponsesRequiredInput>;
+  requiredInputPending: boolean;
+  endRequested: boolean;
+  released: boolean;
+  quiesced: boolean;
+  providerErrorEnd: boolean;
+}
+
+async function* streamOpenAIResponsesNativeSession(
+  options: OpenAIResponsesWebSocketStreamOptions & { native: OpenAIResponsesNativeTransportOptions }
+): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
+  const native = options.native;
+  const timeouts = resolvedTimeouts(options.timeouts);
+  if (native.multiplexing) {
+    const sessionKeyHash = createHash('sha256').update(options.sessionKey).digest('hex').slice(0, 12);
+    const admission = await acquireOpenAIResponsesWebSocketLane({
+      sessionKey: options.sessionKey,
+      url: options.url,
+      headers: options.headers,
+      ...(options.proxy ? { proxy: options.proxy } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      timeouts,
+      ...(options.forceNewConnection !== undefined
+        ? { forceNewConnection: options.forceNewConnection }
+        : {}),
+      ...(options.onPhase ? { onPhase: options.onPhase } : {}),
+      ...(native.onLaneQueueState ? { onLaneQueueState: native.onLaneQueueState } : {}),
+      ...(options.debugCapture
+        ? {
+            debug: {
+              ...options.debugCapture,
+              metadata: { ...options.debugCapture.metadata, sessionKeyHash, transport: 'websocket' }
+            }
+          }
+        : {})
+    });
+    yield* runNativeChain(admission.lease, options, native, timeouts);
+    return;
   }
-  return result;
+  const session = sessionFor(options.sessionKey);
+  yield* withSessionLock(session, options, () => streamExclusiveNativeLocked(session, options, native, timeouts));
 }
 
-function normalizeProxyUrl(proxy?: string): string | undefined {
-  const normalized = proxy?.trim();
-  return normalized ? new URL(normalized).toString() : undefined;
-}
-
-function proxyAgent(proxy?: string): HttpsProxyAgent<string> | undefined {
-  const normalized = proxy?.trim();
-  if (!normalized) return undefined;
-  const cached = proxyAgents.get(normalized);
-  if (cached) return cached;
-  const agent = new HttpsProxyAgent(normalized, { rejectUnauthorized: false });
-  proxyAgents.set(normalized, agent);
-  return agent;
-}
-
-function toWebSocketUrl(value: string): string {
-  const url = new URL(value);
-  if (url.protocol === 'https:') url.protocol = 'wss:';
-  else if (url.protocol === 'http:') url.protocol = 'ws:';
-  return url.toString();
-}
-
-function parseWebSocketData(data: RawData): { ok: true; value: Record<string, unknown> } | { ok: false; error: Error } {
+async function* streamExclusiveNativeLocked(
+  session: WebSocketSession,
+  options: OpenAIResponsesWebSocketStreamOptions & { native: OpenAIResponsesNativeTransportOptions },
+  native: OpenAIResponsesNativeTransportOptions,
+  timeouts: OpenAIResponsesWebSocketTimeouts
+): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
+  let admission: SocketAdmission;
   try {
-    const text = typeof data === 'string'
-      ? data
-      : Array.isArray(data)
-        ? Buffer.concat(data).toString('utf8')
-        : data instanceof ArrayBuffer
-          ? Buffer.from(new Uint8Array(data)).toString('utf8')
-          : Buffer.isBuffer(data)
-            ? data.toString('utf8')
-            : Buffer.from(data as Uint8Array).toString('utf8');
-    const parsed: unknown = JSON.parse(text);
-    if (!isRecord(parsed)) throw new Error('WebSocket event must be a JSON object.');
-    return { ok: true, value: parsed };
+    throwIfAborted(options.signal);
+    admission = await ensureSocket(session, options, timeouts);
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
+    const annotated = markReceivedSemanticOutput(error, false);
+    observeTransportFailure(session, options, annotated);
+    closeAndInvalidate(session, true);
+    if (isAbort(options.signal, annotated)) throw abortError(options.signal);
+    throw annotated;
+  }
+  const socket = session.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    closeAndInvalidate(session, true);
+    throw new Error('OpenAI Responses WebSocket connection is unavailable.');
+  }
+  const lease = createExclusiveNativeLease(session, socket, options, admission);
+  yield* runNativeChain(lease, options, native, timeouts);
+}
+
+function createExclusiveNativeLease(
+  session: WebSocketSession,
+  socket: WebSocket,
+  options: OpenAIResponsesWebSocketStreamOptions,
+  admission: SocketAdmission
+): NativeChainLease {
+  const queue = new AsyncEventQueue<Record<string, unknown>>();
+  const debug = options.debugCapture
+    ? {
+        ...options.debugCapture,
+        metadata: {
+          ...options.debugCapture.metadata,
+          sessionKeyHash: createHash('sha256').update(session.key).digest('hex').slice(0, 12),
+          connectionGeneration: session.connectionGeneration,
+          transport: 'websocket'
+        }
+      }
+    : undefined;
+  let sawEvent = false;
+  let rawSequence = 0;
+  let released = false;
+  const onMessage = (data: RawData) => {
+    rawSequence += 1;
+    const received = captureDebug(debug?.recorder, debug?.context, () => ({
+      stage: 'transport.receive',
+      bytes: data,
+      metadata: { ...debug?.metadata, rawSequence, responseCreateSeq: session.responseCreateSeq }
+    }));
+    const parsed = parseWebSocketData(data);
+    if (!parsed.ok) {
+      captureDebug(debug?.recorder, debug?.context, () => ({
+        stage: 'ws.parse_error',
+        payload: { message: parsed.error.message },
+        sources: received ? [received] : []
+      }));
+      queue.fail(parsed.error);
+      return;
+    }
+    if (received) associateDebugCapture(parsed.value, [received]);
+    sawEvent = true;
+    queue.push(parsed.value);
+  };
+  const onError = (error: Error) => {
+    const wrapped = structuredTransportError(
+      error.message || 'OpenAI Responses WebSocket transport error.',
+      typeof (error as Error & { code?: unknown }).code === 'string'
+        ? (error as Error & { code: string }).code
+        : 'websocket_error',
+      sawEvent ? 'streaming' : 'awaiting_first_event',
+      sawEvent
+    );
+    (wrapped as Error & { cause?: unknown }).cause = error;
+    queue.fail(wrapped);
+  };
+  const onClose = (code: number, reason: Buffer) => {
+    queue.fail(new OpenAIResponsesWebSocketCloseError(
+      code,
+      reason.toString('utf8').trim(),
+      sawEvent ? 'streaming' : 'awaiting_first_event',
+      sawEvent
+    ));
+  };
+  const onAbort = () => queue.fail(abortError(options.signal));
+  socket.on('message', onMessage);
+  socket.once('error', onError);
+  socket.once('close', onClose);
+  options.signal?.addEventListener('abort', onAbort, { once: true });
+  const expectedConnectionIdentityHash = requireConnectionIdentity(session);
+  const networkIdentityTimer = setInterval(() => {
+    try {
+      if (webSocketConnectionConfig(options).identityHash !== expectedConnectionIdentityHash) {
+        queue.fail(structuredTransportError(
+          'OpenAI Responses WebSocket local network changed.',
+          'network_changed',
+          sawEvent ? 'streaming' : 'awaiting_first_event',
+          sawEvent
+        ));
+      }
+    } catch {
+      // A transient failure to enumerate interfaces is not itself network authority.
+    }
+  }, NETWORK_IDENTITY_CHECK_INTERVAL_MS);
+  networkIdentityTimer.unref?.();
+  return {
+    connectionGeneration: session.connectionGeneration,
+    streamId: undefined,
+    continuation: session,
+    connectionReused: admission.reused,
+    connectionReason: admission.reason,
+    async sendFrame(frame, timeoutMs, signal) {
+      if (released) throw new Error('OpenAI Responses WebSocket lane lease is released.');
+      if (session.socket !== socket || socket.readyState !== WebSocket.OPEN) {
+        throw structuredTransportError(
+          'OpenAI Responses WebSocket connection is unavailable.',
+          'websocket_unavailable',
+          'streaming',
+          sawEvent
+        );
+      }
+      const isCreate = eventType(frame) === 'response.create';
+      const responseCreateSeq = isCreate ? ++session.responseCreateSeq : undefined;
+      const payloadText = JSON.stringify(frame);
+      captureDebug(debug?.recorder, debug?.context, () => ({
+        stage: 'transport.send',
+        payload: payloadText,
+        metadata: {
+          ...debug?.metadata,
+          ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {})
+        }
+      }));
+      await sendWithDeadline(socket, payloadText, timeoutMs, signal);
+      return responseCreateSeq !== undefined ? { responseCreateSeq } : {};
+    },
+    events() {
+      return queue;
+    },
+    healthy() {
+      return session.socket === socket && socket.readyState === WebSocket.OPEN;
+    },
+    acquirePermit() {
+      // The exclusive session lock already serializes the whole connection.
+      return Promise.resolve();
+    },
+    releasePermit() {
+      // The exclusive session lock already serializes the whole connection.
+    },
+    release(outcome) {
+      if (released) return;
+      released = true;
+      clearInterval(networkIdentityTimer);
+      options.signal?.removeEventListener('abort', onAbort);
+      socket.off('message', onMessage);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+      queue.end();
+      if (outcome !== 'quiescent') closeAndInvalidate(session, true);
+    }
+  };
+}
+
+async function* runNativeChain(
+  lease: NativeChainLease,
+  options: OpenAIResponsesWebSocketStreamOptions & { native: OpenAIResponsesNativeTransportOptions },
+  native: OpenAIResponsesNativeTransportOptions,
+  timeouts: OpenAIResponsesWebSocketTimeouts
+): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
+  const fullBody = sanitizeResponsesCreateBody(options.body, true);
+  const identity = { key: options.sessionKey, connectionGeneration: lease.connectionGeneration };
+  const prepared = prepareCreatePayload(
+    lease.continuation,
+    identity,
+    fullBody,
+    { reused: lease.connectionReused, reason: lease.connectionReason },
+    options.format,
+    options.continuation,
+    native,
+    lease.streamId
+  );
+  options.onDecision?.(prepared.decision);
+
+  const frozenWireSettings = { ...prepared.payload };
+  delete frozenWireSettings.type;
+  delete frozenWireSettings.input;
+  delete frozenWireSettings.previous_response_id;
+  const state: NativeChainState = {
+    lease,
+    options,
+    native,
+    timeouts,
+    prepared,
+    frozenWireSettings,
+    asyncToolNames: collectNativeAsyncToolNames(fullBody),
+    outputRegistry: { byAlias: new Map(), nextOrdinal: 0 },
+    outbox: [],
+    outboxSignal: createNativeSignal(),
+    chainResponseIds: new Set(),
+    chainTail: [],
+    chainTailReliable: true,
+    seenAnyResponse: false,
+    sawSemanticOutput: false,
+    firstEventSeen: false,
+    steerQueue: [],
+    steerSending: false,
+    steersById: new Map(),
+    acceptedUnapplied: [],
+    createQueue: [],
+    createSending: false,
+    outstandingAsyncCalls: new Set(),
+    pendingRequiredCalls: new Map(),
+    requiredCalls: new Map(),
+    requiredInputPending: false,
+    endRequested: false,
+    released: false,
+    quiesced: false,
+    providerErrorEnd: false
+  };
+
+  let releaseOutcome: 'quiescent' | 'error' | 'abort' = 'error';
+  let staleCreatesExpected = 0;
+  let controllerRegistered = false;
+  try {
+    state.initialResponseCreateSeq = await sendNativeCreateFrame(state, prepared.payload);
+    const controller = createNativeController(state);
+    native.onController?.(controller);
+    controllerRegistered = true;
+    yield* nativeChainEventLoop(state);
+    if (state.providerErrorEnd) {
+      rejectNativePendingWork(state, 'failed', 'lane_error');
+      releaseOutcome = 'error';
+      staleCreatesExpected = countStaleCreatesExpected(state);
+      return;
+    }
+    commitNativeContinuation(state);
+    releaseOutcome = 'quiescent';
+  } catch (error) {
+    captureDebug(options.debugCapture?.recorder, options.debugCapture?.context, () => ({
+      stage: 'ws.error',
+      payload: { message: errorText(error) }
+    }));
+    const annotated = markReceivedSemanticOutput(error, state.sawSemanticOutput);
+    observeOpenAIResponsesWebSocketFailure(identity, options.onPhase, options.signal, annotated);
+    const aborted = isAbort(options.signal, annotated);
+    staleCreatesExpected = countStaleCreatesExpected(state);
+    const disconnected = aborted ? [] : disconnectNativeSteerChunks(state);
+    rejectNativePendingWork(state, aborted ? 'abort' : 'admission_unknown', 'connection_lost');
+    releaseOutcome = aborted ? 'abort' : 'error';
+    for (const chunk of disconnected) yield chunk;
+    if (aborted) throw abortError(options.signal);
+    throw annotated;
+  } finally {
+    state.released = true;
+    if (controllerRegistered) native.onController?.(undefined);
+    lease.release(releaseOutcome, releaseOutcome === 'quiescent' ? 0 : staleCreatesExpected);
   }
 }
 
-function eventType(value: Record<string, unknown>): string {
-  return typeof value.type === 'string'
-    ? value.type
-    : typeof value.event === 'string'
-      ? value.event
-      : '';
+async function sendNativeCreateFrame(
+  state: NativeChainState,
+  payload: Record<string, unknown>
+): Promise<number | undefined> {
+  const payloadText = JSON.stringify(payload);
+  const responseCreateFrameSha256 = createHash('sha256').update(payloadText, 'utf8').digest('hex');
+  const responseCreateFrameBytes = Buffer.byteLength(payloadText, 'utf8');
+  observeNativePhase(state, 'send_started');
+  const { responseCreateSeq } = await state.lease.sendFrame(payload, state.timeouts.sendMs, state.options.signal);
+  observeNativePhase(state, 'request_sent', {
+    responseCreateFrameSha256,
+    responseCreateFrameBytes,
+    ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {})
+  });
+  return responseCreateSeq;
 }
 
-function nestedMessage(value: Record<string, unknown>): string | undefined {
-  const direct = normalizedString(value.message);
-  if (direct && !isGenericErrorLabel(direct)) return direct;
-  if (isRecord(value.error)) {
-    const message = normalizedString(value.error.message);
-    if (message && !isGenericErrorLabel(message)) return message;
+function observeNativePhase(
+  state: NativeChainState,
+  phase: OpenAIResponsesWebSocketPhaseKind,
+  detail: Partial<OpenAIResponsesWebSocketPhase> = {}
+): void {
+  observeOpenAIResponsesWebSocketPhase(
+    { key: state.options.sessionKey, connectionGeneration: state.lease.connectionGeneration },
+    state.options.onPhase,
+    phase,
+    {
+      ...(state.lease.streamId ? { streamId: state.lease.streamId } : {}),
+      ...detail
+    }
+  );
+}
+
+function createNativeSignal(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+function notifyNativeOutbox(state: NativeChainState): void {
+  state.outboxSignal.resolve();
+  state.outboxSignal = createNativeSignal();
+}
+
+function queueNativeEvent(state: NativeChainState, event: OpenAIResponsesNativeEvent): void {
+  state.outbox.push({ nativeEvent: event });
+  notifyNativeOutbox(state);
+}
+
+function drainNativeOutbox(state: NativeChainState): LimCodeOpenAIResponsesStreamChunk[] {
+  return state.outbox.splice(0);
+}
+
+function createNativeController(state: NativeChainState): OpenAIResponsesNativeController {
+  return {
+    get responseId() {
+      return state.latestResponseId;
+    },
+    get connectionGeneration() {
+      return state.lease.connectionGeneration;
+    },
+    get streamId() {
+      return state.lease.streamId;
+    },
+    steer(command) {
+      return enqueueNativeSteer(state, command);
+    },
+    submitToolResults(outputs) {
+      return enqueueNativeToolSubmission(state, outputs);
+    },
+    endLogicalRequest() {
+      requestNativeLogicalEnd(state);
+    }
+  };
+}
+
+async function* nativeChainEventLoop(
+  state: NativeChainState
+): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
+  const iterator = state.lease.events()[Symbol.asyncIterator]();
+  const responseDeadlineAt = Date.now() + state.timeouts.responseMs;
+  const firstEventDeadlineAt = Date.now() + state.timeouts.firstEventMs;
+  let lastEventAt = Date.now();
+  let abortReject!: (error: Error) => void;
+  const abortRace = new Promise<never>((_resolve, reject) => {
+    abortReject = reject;
+  });
+  const onAbort = () => abortReject(abortError(state.options.signal));
+  state.options.signal?.addEventListener('abort', onAbort, { once: true });
+  // A wire-event read is never abandoned mid-race: the same pending read is carried across
+  // outbox-only wakeups and replaced only after it settles, so a lost race can never discard a
+  // queued event (an orphaned read would silently swallow the next frame, e.g. steer.accepted).
+  let pendingNext: Promise<
+    | { kind: 'event'; step: IteratorResult<Record<string, unknown>> }
+    | { kind: 'failed'; error: Error }
+  > | undefined;
+  const readNext = () => {
+    pendingNext = iterator.next().then(
+      (step) => ({ kind: 'event' as const, step }),
+      (error: Error) => ({ kind: 'failed' as const, error })
+    );
+    return pendingNext;
+  };
+  try {
+    for (;;) {
+      throwIfAborted(state.options.signal);
+      pumpSteerQueue(state);
+      pumpCreateQueue(state);
+      for (const chunk of drainNativeOutbox(state)) yield chunk;
+      if (state.providerErrorEnd) return;
+      if (isNativeChainQuiescent(state)) {
+        state.quiesced = true;
+        return;
+      }
+      // A proven client-input wait holds lane ownership but no active-response permit, so other
+      // conversations' responses can run on this connection meanwhile.
+      if (isNativeChainPermitReleasableWait(state)) state.lease.releasePermit();
+
+      const now = Date.now();
+      const deadlines: Array<{ at: number; phase: 'first_event' | 'event_idle' | 'response'; ms: number }> = [
+        { at: responseDeadlineAt, phase: 'response', ms: state.timeouts.responseMs }
+      ];
+      if (!state.firstEventSeen) {
+        deadlines.push({ at: firstEventDeadlineAt, phase: 'first_event', ms: state.timeouts.firstEventMs });
+      } else if (!isNativeChainWaitingOnClient(state)) {
+        deadlines.push({ at: lastEventAt + state.timeouts.eventIdleMs, phase: 'event_idle', ms: state.timeouts.eventIdleMs });
+      }
+      deadlines.sort((left, right) => left.at - right.at);
+      const deadline = deadlines[0];
+      if (now >= deadline.at) {
+        throw new OpenAIResponsesWebSocketTimeoutError(deadline.phase, deadline.ms, state.firstEventSeen);
+      }
+
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      try {
+        pendingNext ??= readNext();
+        const result = await Promise.race([
+          pendingNext,
+          abortRace.then(() => ({ kind: 'aborted' as const })),
+          state.outboxSignal.promise.then(() => ({ kind: 'outbox' as const })),
+          new Promise<{ kind: 'timeout' }>((resolve) => {
+            timeoutHandle = setTimeout(
+              () => resolve({ kind: 'timeout' }),
+              Math.max(1, deadline.at - now)
+            );
+          })
+        ]);
+        if (result.kind === 'timeout') {
+          throw new OpenAIResponsesWebSocketTimeoutError(deadline.phase, deadline.ms, state.firstEventSeen);
+        }
+        if (result.kind === 'aborted') throw abortError(state.options.signal);
+        if (result.kind === 'outbox') continue;
+        pendingNext = undefined;
+        if (result.kind === 'failed') throw result.error;
+        if (result.step.done) {
+          throw new OpenAIResponsesWebSocketCloseError(1005, '', 'streaming', state.firstEventSeen);
+        }
+        const raw = result.step.value;
+        lastEventAt = Date.now();
+        if (!state.firstEventSeen) {
+          state.firstEventSeen = true;
+          observeNativePhase(state, 'first_raw_event');
+        }
+        for (const chunk of processNativeWireEvent(state, raw)) yield chunk;
+      } finally {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  } finally {
+    state.options.signal?.removeEventListener('abort', onAbort);
+    // The lease owns queue termination: release() ends the queue and settles any parked read.
+    // This finally must NOT await iterator.return() — async generators serialize it behind a
+    // parked read, which only settles at release, and release runs after this loop exits: that
+    // ordering deadlocks teardown permanently.
   }
-  if (isRecord(value.response)) return nestedMessage(value.response);
-  return undefined;
 }
 
-function isGenericErrorLabel(value: string): boolean {
-  return new Set([
-    'stream_error',
-    'upstream_error',
-    'http_error',
-    'response_error',
-    'decode_error',
-    'stream_read_error',
-    'stream_parse_error',
-    'llm_error'
-  ]).has(value.trim().toLowerCase());
+/**
+ * Quiescence requires a terminal boundary with nothing outstanding: no response in flight, no
+ * steer queued/sent/accepted-unapplied, no required input wait, no outstanding tool calls and no
+ * tool-result create queued or awaiting admission. Anything else keeps the stream alive so an
+ * automatic successor or required-input continuation can arrive without deadlock.
+ */
+function isNativeChainQuiescent(state: NativeChainState): boolean {
+  if (!state.seenAnyResponse || state.activeResponse) return false;
+  if (state.providerErrorEnd) return false;
+  if (state.endRequested) return true;
+  if (state.steerSending || state.steerInFlight || state.steerQueue.length > 0) return false;
+  if (state.createSending || state.createInFlight || state.createQueue.length > 0) return false;
+  if (state.acceptedUnapplied.length > 0) return false;
+  if (state.requiredInputPending) return false;
+  if (state.outstandingAsyncCalls.size > 0) return false;
+  if (state.requiredCalls.size > 0 || state.pendingRequiredCalls.size > 0) return false;
+  return true;
 }
 
-function canonicalHash(value: unknown): string {
-  return createHash('sha256').update(canonicalString(value)).digest('hex');
+/**
+ * A terminal boundary with outstanding async calls, required input, queued coverage waiters or an
+ * unadmitted continuation is an intentional client-side wait, not a stalled socket: the per-event
+ * idle deadline pauses there (the total logical budget and cancellation never pause).
+ */
+function isNativeChainWaitingOnClient(state: NativeChainState): boolean {
+  if (state.activeResponse || !state.seenAnyResponse || state.endRequested) return false;
+  return state.outstandingAsyncCalls.size > 0
+    || state.requiredCalls.size > 0
+    || state.pendingRequiredCalls.size > 0
+    || state.requiredInputPending
+    || state.createQueue.length > 0
+    || state.createInFlight !== undefined
+    || state.createSending
+    || state.steerInFlight !== undefined
+    || state.steerSending;
 }
 
-function shortCanonicalHash(value: unknown): string {
-  return canonicalHash(value).slice(0, 16);
+/**
+ * A proven client-input wait with nothing that can start a response outstanding: the lane's
+ * active-response permit is released so other conversations can use the capacity. Permits are
+ * retained across expected automatic successors, sent-unacked steers, unadmitted creates and any
+ * in-flight response.
+ */
+function isNativeChainPermitReleasableWait(state: NativeChainState): boolean {
+  if (!state.seenAnyResponse || state.activeResponse || state.endRequested) return false;
+  if (state.steerSending || state.steerInFlight || state.steerQueue.length > 0) return false;
+  if (state.acceptedUnapplied.some((steer) => steer.state === 'accepted')) return false;
+  if (state.createSending || state.createInFlight) return false;
+  return state.outstandingAsyncCalls.size > 0
+    || state.requiredCalls.size > 0
+    || state.pendingRequiredCalls.size > 0
+    || state.requiredInputPending
+    || state.createQueue.length > 0;
 }
 
-function canonicalString(value: unknown): string {
-  if (value === null) return 'null';
-  if (value === undefined) return 'undefined';
-  if (typeof value !== 'object') return JSON.stringify(value) ?? String(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalString).join(',')}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalString(record[key])}`).join(',')}}`;
+function processNativeWireEvent(
+  state: NativeChainState,
+  raw: Record<string, unknown>
+): LimCodeOpenAIResponsesStreamChunk[] {
+  const type = eventType(raw);
+  switch (type) {
+    case 'response.steer.accepted':
+      handleNativeSteerAccepted(state, raw);
+      return drainNativeOutbox(state);
+    case 'response.steer.pending':
+      handleNativeSteerPending(state, raw);
+      return drainNativeOutbox(state);
+    case 'response.steer.failed':
+      handleNativeSteerFailed(state, raw);
+      return drainNativeOutbox(state);
+    case 'response.created':
+      return startNativeResponse(state, raw);
+    case 'response.completed':
+    case 'response.incomplete':
+      return finishNativeResponse(state, raw, type);
+    default:
+      if (isTerminalEvent(raw)) observeNativePhase(state, 'terminal', { reason: type || 'terminal' });
+      if (isProviderErrorPayload(raw)) return failNativeChainWithProviderError(state, raw);
+      if (!state.activeResponse) return [];
+      return decodeNativeWireEvent(state, raw);
+  }
 }
 
-function cloneJson<T>(value: T): T {
-  if (typeof structuredClone === 'function') return structuredClone(value);
-  return JSON.parse(JSON.stringify(value)) as T;
+function startNativeResponse(
+  state: NativeChainState,
+  raw: Record<string, unknown>
+): LimCodeOpenAIResponsesStreamChunk[] {
+  const responseId = responseIdFromPayload(raw);
+  if (!responseId) return [];
+  const response = isRecord(raw.response) ? raw.response : undefined;
+  const previousResponseId = (response ? normalizedString(response.previous_response_id) : undefined)
+    ?? normalizedString(raw.previous_response_id);
+  if (state.activeResponse) {
+    // A new response before the previous one terminated breaks the projection chain; the
+    // continuation baseline falls back to a full rebase rather than trusting a partial tail.
+    state.chainTailReliable = false;
+  }
+
+  let admittedSeq = state.seenAnyResponse ? undefined : state.initialResponseCreateSeq;
+  let admittedToolResultCallIds: string[] | undefined;
+  const inFlight = state.createInFlight;
+  if (inFlight) {
+    state.createInFlight = undefined;
+    // The server prepends only the accepted steers snapshotted when this create was sent;
+    // steers accepted afterwards keep waiting for their own continuation boundary.
+    const appliedSteers = state.acceptedUnapplied.splice(0, inFlight.appliedSteerCount);
+    markNativeSteersApplied(state, appliedSteers);
+    for (const steer of appliedSteers) {
+      state.chainTail.push(...steer.wireInput);
+    }
+    state.chainTail.push(...inFlight.batch.flatMap((sub) => sub.wireItems));
+    const admission: OpenAIResponsesNativeResultAdmission = {
+      responseId,
+      previousResponseId: inFlight.previousResponseId,
+      connectionGeneration: state.lease.connectionGeneration,
+      ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+    };
+    admittedSeq = inFlight.responseCreateSeq;
+    admittedToolResultCallIds = inFlight.batch.flatMap((sub) => sub.callIds);
+    for (const sub of inFlight.batch) sub.resolve(admission);
+  } else if (state.seenAnyResponse && state.acceptedUnapplied.length > 0) {
+    // Automatic steering successor: the accepted input enters history before this response.
+    appendAcceptedSteerInputsToTail(state);
+  }
+
+  state.requiredCalls = new Map();
+  state.requiredInputPending = [...state.steersById.values()].some(
+    (steer) => steer.state === 'waiting_for_input'
+  );
+  state.activeResponse = {
+    responseId,
+    ...(admittedSeq !== undefined ? { responseCreateSeq: admittedSeq } : {}),
+    decodeState: state.options.format.createStreamState(),
+    projection: new OpenAIResponsesContinuationProjection(),
+    toolCalls: { active: new Set(), byAlias: new Map() },
+    ordinalBase: state.outputRegistry.nextOrdinal
+  };
+  state.seenAnyResponse = true;
+  state.chainResponseIds.add(responseId);
+  state.latestResponseId = responseId;
+  queueNativeEvent(state, {
+    type: 'response.created',
+    responseId,
+    connectionGeneration: state.lease.connectionGeneration,
+    ...(previousResponseId ? { previousResponseId } : {}),
+    ...(state.lease.streamId ? { streamId: state.lease.streamId } : {}),
+    ...(admittedSeq !== undefined ? { responseCreateSeq: String(admittedSeq) } : {}),
+    ...(admittedToolResultCallIds && admittedToolResultCallIds.length > 0
+      ? { admittedToolResultCallIds }
+      : {})
+  });
+  return drainNativeOutbox(state);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+function finishNativeResponse(
+  state: NativeChainState,
+  raw: Record<string, unknown>,
+  type: 'response.completed' | 'response.incomplete'
+): LimCodeOpenAIResponsesStreamChunk[] {
+  observeNativePhase(state, 'terminal', { reason: type });
+  const response = isRecord(raw.response) ? raw.response : undefined;
+  const incompleteDetails = response && isRecord(response.incomplete_details)
+    ? response.incomplete_details
+    : undefined;
+  const incompleteReason = type === 'response.incomplete'
+    ? normalizedString(incompleteDetails?.reason)
+    : undefined;
+  // A steered incomplete is a normal boundary on the native path; every other incomplete stays
+  // as strict as the legacy transport.
+  const steeredBoundary = type === 'response.incomplete'
+    && incompleteReason === 'steered'
+    && state.native.steering;
+  if (type === 'response.incomplete' && !steeredBoundary) {
+    return failNativeChainWithProviderError(state, raw);
+  }
+
+  const chunks: LimCodeOpenAIResponsesStreamChunk[] = [];
+  const active = state.activeResponse;
+  if (active) chunks.push(...decodeNativeWireEvent(state, raw));
+  // A steered boundary terminalizes from done items only: the server finished the current output
+  // item before switching, so the same proven segment (never fabricated) joins the chain tail.
+  const projection = active?.projection;
+  const segment = projection
+    ? (steeredBoundary
+        ? projection.incompleteBoundaryProjection()
+        : projection.completedProjection())
+    : undefined;
+  const responseId = responseIdFromPayload(raw) ?? active?.responseId ?? state.latestResponseId ?? '';
+  if (segment) {
+    state.chainTail.push(
+      ...segment.outputItems.map((item) => stripWebSocketOnlyInputFields(item, true))
+    );
+    if (chunks.length > 0) {
+      chunks[chunks.length - 1] = { ...chunks[chunks.length - 1], completedContent: segment.content };
+    } else {
+      chunks.push({ completedContent: segment.content });
+    }
+  } else {
+    state.chainTailReliable = false;
+  }
+
+  state.requiredCalls = state.pendingRequiredCalls;
+  state.pendingRequiredCalls = new Map();
+  const requiredInput = [...state.requiredCalls.values()];
+  state.latestTerminalResponseId = responseId || undefined;
+  state.activeResponse = undefined;
+  queueNativeEvent(state, {
+    type,
+    responseId,
+    connectionGeneration: state.lease.connectionGeneration,
+    ...(state.lease.streamId ? { streamId: state.lease.streamId } : {}),
+    ...(incompleteReason ? { reason: incompleteReason } : {}),
+    ...(type === 'response.completed'
+      ? nativeResponseUsage(raw) ? { usage: nativeResponseUsage(raw) } : {}
+      : {}),
+    ...(requiredInput.length > 0 ? { requiredInput } : {}),
+    ...(active?.responseCreateSeq !== undefined
+      ? { responseCreateSeq: String(active.responseCreateSeq) }
+      : {})
+  });
+  chunks.push(...drainNativeOutbox(state));
+  return chunks;
 }
 
-function normalizedString(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  return trimmed || undefined;
+function nativeResponseUsage(raw: Record<string, unknown>): Record<string, unknown> | undefined {
+  const response = isRecord(raw.response) ? raw.response : undefined;
+  if (response && isRecord(response.usage)) return response.usage;
+  return isRecord(raw.usage) ? raw.usage : undefined;
 }
 
-function numericField(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+function failNativeChainWithProviderError(
+  state: NativeChainState,
+  raw: Record<string, unknown>
+): LimCodeOpenAIResponsesStreamChunk[] {
+  state.providerErrorEnd = true;
+  return [createErrorStreamChunk(errorInfoFromPayload(raw, state.sawSemanticOutput))];
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function decodeNativeWireEvent(
+  state: NativeChainState,
+  raw: Record<string, unknown>
+): LimCodeOpenAIResponsesStreamChunk[] {
+  const active = state.activeResponse;
+  if (!active) return [];
+  const type = eventType(raw);
+  const outputItem = observeOutputItem(raw, state.outputRegistry, active.ordinalBase);
+  const argumentDeltas = captureToolCallArgumentDeltas(
+    raw,
+    active.toolCalls,
+    state.options.debugCapture,
+    active.ordinalBase
+  );
+  if (type === 'response.output_item.done' && isRecord(raw.item)) {
+    classifyNativeCallItem(state, raw.item);
+  }
+
+  // The session is the sole nativeEvent authority on this channel; the format decoder's
+  // nativeEvent surface (SSE-only) never applies here and is excluded from the chunk type.
+  let decoded: Omit<LLMStreamChunk, 'nativeEvent'>;
+  try {
+    captureDebug(state.options.debugCapture?.recorder, state.options.debugCapture?.context, () => ({
+      stage: 'ws.decode_input',
+      payload: raw,
+      sources: debugCaptureSources(raw)
+    }));
+    decoded = state.options.format.decodeStreamChunk(raw, active.decodeState);
+  } catch (error) {
+    const wrapped = new Error(`OpenAI Responses WebSocket decode failed: ${errorText(error)}`);
+    (wrapped as Error & { cause?: unknown }).cause = error;
+    throw wrapped;
+  }
+
+  const decodedChunk: LimCodeOpenAIResponsesStreamChunk = {
+    ...decoded,
+    ...(outputItem.current ? { outputItem: outputItem.current } : {}),
+    ...(outputItem.done ? { outputItemDone: outputItem.done } : {}),
+    ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {})
+  };
+  const projected = active.projection.observe(raw, decodedChunk);
+  const projectedChunk: Omit<LLMStreamChunk, 'nativeEvent'> = projected.chunk;
+  const chunk: LimCodeOpenAIResponsesStreamChunk = {
+    ...projectedChunk,
+    ...(outputItem.current ? { outputItem: outputItem.current } : {}),
+    ...(outputItem.done ? { outputItemDone: outputItem.done } : {}),
+    ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {}),
+    ...(type === 'response.output_item.done' && isRecord(raw.item) && raw.item.type === 'reasoning'
+      ? { reasoningItemDone: true }
+      : {})
+  };
+  const semanticOutput = projected.semanticOutput
+    || hasSemanticChunkOutput(chunk)
+    || argumentDeltas.length > 0;
+  if (semanticOutput && !state.sawSemanticOutput) {
+    observeNativePhase(state, 'first_semantic_event');
+  }
+  if (semanticOutput) state.sawSemanticOutput = true;
+  const observed = captureDebug(state.options.debugCapture?.recorder, state.options.debugCapture?.context, () => ({
+    stage: 'ws.decoded',
+    payload: chunk,
+    sources: debugCaptureSources(raw)
+  }));
+  if (observed) associateDebugCapture(chunk, [observed]);
+  if (outputItem.done) unregisterOutputItem(state.outputRegistry, outputItem.done);
+  return hasMeaningfulChunk(chunk) ? [chunk] : [];
 }
 
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw abortError(signal);
+/**
+ * Main's authority rule: a call is async only when the returned item says `async: true` AND the
+ * frozen request declared that tool async. Missing/false flags and undeclared async items stay
+ * synchronous and become required inputs for the continuation gate.
+ */
+function classifyNativeCallItem(state: NativeChainState, item: Record<string, unknown>): void {
+  const itemType = normalizedString(item.type);
+  const name = normalizedString(item.name);
+  if (itemType === 'function_call' || itemType === 'custom_tool_call') {
+    const callId = normalizedString(item.call_id);
+    if (!callId) return;
+    if (item.async === true && name !== undefined && state.asyncToolNames.has(name)) {
+      state.outstandingAsyncCalls.add(callId);
+      return;
+    }
+    state.pendingRequiredCalls.set(callId, {
+      type: itemType === 'function_call' ? 'function_call_output' : 'custom_tool_call_output',
+      callId,
+      ...(name ? { name } : {})
+    });
+    return;
+  }
+  if (itemType === 'mcp_approval_request') {
+    const approvalRequestId = normalizedString(item.id);
+    if (!approvalRequestId) return;
+    state.pendingRequiredCalls.set(`approval:${approvalRequestId}`, {
+      type: 'mcp_approval_response',
+      approvalRequestId,
+      ...(name ? { name } : {})
+    });
+  }
 }
 
-function abortError(signal?: AbortSignal): Error {
-  if (signal?.reason instanceof Error) return signal.reason;
-  const error = new Error(signal?.reason ? String(signal.reason) : 'OpenAI Responses WebSocket request aborted.');
-  error.name = 'AbortError';
-  return error;
+function handleNativeSteerAccepted(state: NativeChainState, raw: Record<string, unknown>): void {
+  const steer = isRecord(raw.steer) ? raw.steer : undefined;
+  const steerId = steer ? normalizedString(steer.id) : undefined;
+  const target = steer ? normalizedString(steer.previous_response_id) : undefined;
+  const inFlight = state.steerInFlight;
+  if (!inFlight || (target !== undefined && target !== inFlight.targetResponseId)) {
+    captureDebug(state.options.debugCapture?.recorder, state.options.debugCapture?.context, () => ({
+      stage: 'ws.steer_stale',
+      payload: { steerId, target }
+    }));
+    return;
+  }
+  inFlight.steerId = steerId;
+  inFlight.state = 'accepted';
+  if (steerId) state.steersById.set(steerId, inFlight);
+  state.acceptedUnapplied.push(inFlight);
+  state.steerInFlight = undefined;
+  queueNativeEvent(state, {
+    type: 'response.steer.accepted',
+    responseId: target ?? inFlight.targetResponseId,
+    submissionId: inFlight.submissionId,
+    ...(steerId ? { steerId } : {}),
+    connectionGeneration: state.lease.connectionGeneration,
+    ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+  });
+  // The next serialized steer may only go out after this ack.
+  pumpSteerQueue(state);
 }
 
-function isAbort(signal: AbortSignal | undefined, error: unknown): boolean {
-  return signal?.aborted === true || (error instanceof Error && error.name === 'AbortError');
+function handleNativeSteerPending(state: NativeChainState, raw: Record<string, unknown>): void {
+  const steer = isRecord(raw.steer) ? raw.steer : undefined;
+  const steerId = steer ? normalizedString(steer.id) : undefined;
+  const submission = (steerId ? state.steersById.get(steerId) : undefined) ?? state.steerInFlight;
+  if (!submission) return;
+  submission.state = 'waiting_for_input';
+  state.requiredInputPending = true;
+  const requiredInput = parseNativeRequiredInput(raw.required_input);
+  for (const entry of requiredInput) {
+    const key = entry.callId ?? (entry.approvalRequestId ? `approval:${entry.approvalRequestId}` : undefined);
+    if (key) state.requiredCalls.set(key, entry);
+  }
+  queueNativeEvent(state, {
+    type: 'response.steer.pending',
+    responseId: submission.targetResponseId,
+    submissionId: submission.submissionId,
+    ...(steerId ? { steerId } : {}),
+    ...(requiredInput.length > 0 ? { requiredInput } : {}),
+    connectionGeneration: state.lease.connectionGeneration,
+    ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+  });
+}
+
+function handleNativeSteerFailed(state: NativeChainState, raw: Record<string, unknown>): void {
+  const steer = isRecord(raw.steer) ? raw.steer : undefined;
+  const steerId = steer ? normalizedString(steer.id) : undefined;
+  const submission = (steerId ? state.steersById.get(steerId) : undefined) ?? state.steerInFlight;
+  if (!submission) return;
+  submission.state = 'failed';
+  if (steerId) state.steersById.delete(steerId);
+  const appliedIndex = state.acceptedUnapplied.indexOf(submission);
+  if (appliedIndex >= 0) state.acceptedUnapplied.splice(appliedIndex, 1);
+  if (state.steerInFlight === submission) state.steerInFlight = undefined;
+  state.requiredInputPending = [...state.steersById.values()].some(
+    (pending) => pending.state === 'waiting_for_input'
+  );
+  const errorRecord = isRecord(raw.error) ? raw.error : undefined;
+  const code = normalizedString(errorRecord?.code);
+  queueNativeEvent(state, {
+    type: 'response.steer.failed',
+    responseId: submission.targetResponseId,
+    submissionId: submission.submissionId,
+    ...(steerId ? { steerId } : {}),
+    input: submission.input,
+    error: {
+      ...(code ? { code } : {}),
+      message: nestedMessage(raw) ?? 'OpenAI Responses steering failed.'
+    },
+    connectionGeneration: state.lease.connectionGeneration,
+    ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+  });
+  pumpSteerQueue(state);
+}
+
+function parseNativeRequiredInput(value: unknown): OpenAIResponsesRequiredInput[] {
+  if (!Array.isArray(value)) return [];
+  const parsed: OpenAIResponsesRequiredInput[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) continue;
+    const type = normalizedString(entry.type);
+    if (type !== 'function_call_output'
+      && type !== 'custom_tool_call_output'
+      && type !== 'mcp_approval_response') continue;
+    const callId = normalizedString(entry.call_id);
+    const approvalRequestId = normalizedString(entry.approval_request_id);
+    const name = normalizedString(entry.name);
+    parsed.push({
+      type,
+      ...(callId ? { callId } : {}),
+      ...(approvalRequestId ? { approvalRequestId } : {}),
+      ...(name ? { name } : {})
+    });
+  }
+  return parsed;
+}
+
+function enqueueNativeSteer(
+  state: NativeChainState,
+  command: OpenAIResponsesSteeringCommand
+): Promise<void> {
+  if (state.released || state.quiesced) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'controller_released', command.submissionId));
+  }
+  if (state.endRequested) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'logical_request_ended', command.submissionId));
+  }
+  if (!state.native.steering) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'steering_not_enabled', command.submissionId));
+  }
+  const submissionId = normalizedString(command.submissionId);
+  if (!submissionId || !Array.isArray(command.input) || command.input.length === 0) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'invalid_input', command.submissionId));
+  }
+  const targetResponseId = normalizedString(command.previousResponseId) ?? state.latestResponseId;
+  if (!targetResponseId) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'no_response_yet', submissionId));
+  }
+  let wireInput: unknown[];
+  try {
+    wireInput = encodeNativeSteerInput(state.options.format, command.input);
+  } catch {
+    return Promise.reject(nativeDeliveryError('not_sent', 'encode_failed', submissionId));
+  }
+  return new Promise<void>((resolve, reject) => {
+    state.steerQueue.push({
+      submissionId,
+      input: command.input,
+      wireInput,
+      targetResponseId,
+      state: 'queued',
+      resolve,
+      reject
+    });
+    pumpSteerQueue(state);
+  });
+}
+
+/**
+ * Steering sends are serialized per lane: only one submission may await its accepted/failed ack,
+ * because the official ack carries no client correlation. Queued-unsent submissions reject as
+ * `not_sent` on teardown; only the sent-unacked one (and accepted-unapplied ones) can become
+ * `response.steer.disconnected` observations.
+ */
+function pumpSteerQueue(state: NativeChainState): void {
+  if (state.steerSending || state.steerInFlight || state.steerQueue.length === 0) return;
+  if (state.released || state.endRequested) return;
+  const steer = state.steerQueue.shift()!;
+  // The wire event accepts ONLY type, previous_response_id and input; submissionId never leaves
+  // the client.
+  const frame: Record<string, unknown> = {
+    type: 'response.steer',
+    previous_response_id: steer.targetResponseId,
+    input: steer.wireInput
+  };
+  state.steerSending = true;
+  void (async () => {
+    try {
+      await state.lease.acquirePermit(state.options.signal);
+    } catch (error) {
+      state.steerSending = false;
+      steer.reject(isAbort(state.options.signal, error)
+        ? abortError(state.options.signal)
+        : nativeDeliveryError('not_sent', state.released ? 'controller_released' : 'capacity_unavailable', steer.submissionId));
+      return;
+    }
+    if (state.released || state.endRequested) {
+      state.steerSending = false;
+      state.lease.releasePermit();
+      steer.reject(nativeDeliveryError(
+        'not_sent',
+        state.released ? 'controller_released' : 'logical_request_ended',
+        steer.submissionId
+      ));
+      return;
+    }
+    // The permit is intentionally retained after this send: an accepted steer may produce an
+    // automatic successor, which must count against active-response capacity.
+    state.lease.sendFrame(frame, state.timeouts.sendMs, state.options.signal).then(
+      () => {
+        state.steerSending = false;
+        if (state.released) {
+          steer.reject(nativeDeliveryError('not_sent', 'controller_released', steer.submissionId));
+          return;
+        }
+        state.steerInFlight = steer;
+        steer.state = 'sent';
+        steer.resolve();
+        queueNativeEvent(state, {
+          type: 'response.steer.submitted',
+          responseId: steer.targetResponseId,
+          submissionId: steer.submissionId,
+          input: steer.input,
+          connectionGeneration: state.lease.connectionGeneration,
+          ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+        });
+      },
+      (error: unknown) => {
+        state.steerSending = false;
+        steer.reject(isAbort(state.options.signal, error)
+          ? abortError(state.options.signal)
+          : nativeDeliveryError('not_sent', 'send_failed', steer.submissionId));
+      }
+    );
+  })();
+}
+
+function enqueueNativeToolSubmission(
+  state: NativeChainState,
+  outputs: readonly OpenAIResponsesToolOutput[]
+): Promise<OpenAIResponsesNativeResultAdmission> {
+  if (state.released || state.quiesced) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'controller_released'));
+  }
+  if (state.endRequested) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'logical_request_ended'));
+  }
+  let built: { wireItems: unknown[]; callIds: string[]; coverageKeys: string[] };
+  try {
+    built = buildNativeToolOutputItems(outputs);
+  } catch {
+    return Promise.reject(nativeDeliveryError('not_sent', 'invalid_input'));
+  }
+  if (built.wireItems.length === 0) {
+    return Promise.reject(nativeDeliveryError('not_sent', 'invalid_input'));
+  }
+  for (const callId of built.callIds) state.outstandingAsyncCalls.delete(callId);
+  for (const key of built.coverageKeys) {
+    state.requiredCalls.delete(key);
+    state.pendingRequiredCalls.delete(key);
+  }
+  return new Promise<OpenAIResponsesNativeResultAdmission>((resolve, reject) => {
+    state.createQueue.push({ ...built, resolve, reject });
+    pumpCreateQueue(state);
+    // Wake the read loop: a queued or in-flight continuation changes the client-wait deadline
+    // computation and the quiescence evaluation.
+    notifyNativeOutbox(state);
+  });
+}
+
+/**
+ * Continuation creates never escape while the lane's latest response is mid-flight, while any
+ * required synchronous output is uncovered, or while a steer could still produce an automatic
+ * successor ahead of this create — an unread automatic response.created must never be
+ * misattributed as a result admission. Once coverage is complete and no automatic successor is
+ * expected, the queued submissions merge into one create carrying the frozen original settings
+ * and the latest response ID. Accepted steering is server-prepended by the API and never repeated
+ * in this input; the create snapshots how many accepted steers the server will prepend to it.
+ */
+function pumpCreateQueue(state: NativeChainState): void {
+  if (state.createSending || state.createInFlight || state.createQueue.length === 0) return;
+  if (state.released || state.endRequested) return;
+  if (state.activeResponse || !state.latestTerminalResponseId) return;
+  // A queued, sending or sent-unacked steer may still be accepted and queue an automatic
+  // successor ahead of this create; an accepted steer without a pending required input
+  // definitively will. Only waiting_for_required_input steers cannot auto-continue.
+  if (state.steerQueue.length > 0 || state.steerSending || state.steerInFlight) return;
+  if (state.acceptedUnapplied.some((steer) => steer.state === 'accepted')) return;
+  const covered = new Set(state.createQueue.flatMap((sub) => sub.coverageKeys));
+  for (const key of state.requiredCalls.keys()) {
+    if (!covered.has(key)) return;
+  }
+  const batch = state.createQueue.splice(0);
+  const previousResponseId = state.latestTerminalResponseId;
+  const frame: Record<string, unknown> = {
+    ...state.frozenWireSettings,
+    type: 'response.create',
+    input: batch.flatMap((sub) => sub.wireItems),
+    previous_response_id: previousResponseId,
+    store: false
+  };
+  state.createSending = true;
+  void (async () => {
+    try {
+      await state.lease.acquirePermit(state.options.signal);
+    } catch (error) {
+      state.createSending = false;
+      for (const sub of batch) {
+        sub.reject(isAbort(state.options.signal, error)
+          ? abortError(state.options.signal)
+          : nativeDeliveryError('not_sent', state.released ? 'controller_released' : 'capacity_unavailable', undefined, sub.callIds));
+      }
+      return;
+    }
+    // Revalidate the full gate after the capacity wait: a steer accepted meanwhile now expects
+    // an automatic successor ahead of this create, and anything else may have ended the chain.
+    const covered = new Set(batch.flatMap((sub) => sub.coverageKeys));
+    const gateOpen = !state.released
+      && !state.endRequested
+      && !state.activeResponse
+      && state.latestTerminalResponseId !== undefined
+      && state.steerQueue.length === 0
+      && !state.steerSending
+      && !state.steerInFlight
+      && !state.acceptedUnapplied.some((steer) => steer.state === 'accepted')
+      && [...state.requiredCalls.keys()].every((key) => covered.has(key));
+    if (!gateOpen) {
+      state.createSending = false;
+      state.lease.releasePermit();
+      state.createQueue.unshift(...batch);
+      notifyNativeOutbox(state);
+      return;
+    }
+    // The permit stays held: the admitted continuation will run a response on this lane.
+    state.lease.sendFrame(frame, state.timeouts.sendMs, state.options.signal).then(
+      ({ responseCreateSeq }) => {
+        state.createSending = false;
+        if (state.released) {
+          for (const sub of batch) {
+            sub.reject(nativeDeliveryError('not_sent', 'controller_released', undefined, sub.callIds));
+          }
+          return;
+        }
+        state.createInFlight = {
+          batch,
+          previousResponseId,
+          appliedSteerCount: state.acceptedUnapplied.length,
+          ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {})
+        };
+        notifyNativeOutbox(state);
+      },
+      (error: unknown) => {
+        state.createSending = false;
+        for (const sub of batch) {
+          sub.reject(isAbort(state.options.signal, error)
+            ? abortError(state.options.signal)
+            : nativeDeliveryError('not_sent', 'send_failed', undefined, sub.callIds));
+        }
+      }
+    );
+  })();
+}
+
+function requestNativeLogicalEnd(state: NativeChainState): void {
+  if (state.released || state.quiesced) return;
+  state.endRequested = true;
+  // The kernel has durably disposed of this work; the stream ends at the next response boundary.
+  state.outstandingAsyncCalls.clear();
+  for (const steer of state.steerQueue.splice(0)) {
+    steer.reject(nativeDeliveryError('not_sent', 'logical_request_ended', steer.submissionId));
+  }
+  for (const sub of state.createQueue.splice(0)) {
+    sub.reject(nativeDeliveryError('not_sent', 'logical_request_ended', undefined, sub.callIds));
+  }
+  notifyNativeOutbox(state);
+}
+
+function appendAcceptedSteerInputsToTail(state: NativeChainState): void {
+  const applied = state.acceptedUnapplied.splice(0);
+  markNativeSteersApplied(state, applied);
+  for (const steer of applied) {
+    state.chainTail.push(...steer.wireInput);
+  }
+}
+
+/**
+ * Once a continuation exists for an accepted steer (automatic successor or an admitted explicit
+ * create), the steer is no longer pending: it transitions to continuing and leaves the ack map,
+ * so requiredInputPending recomputes false and a late failure frame is treated as stale.
+ */
+function markNativeSteersApplied(state: NativeChainState, steers: NativePendingSteer[]): void {
+  for (const steer of steers) {
+    steer.state = 'continuing';
+    if (steer.steerId) state.steersById.delete(steer.steerId);
+  }
+}
+
+/**
+ * Responses the server may still create for a dead lease: continuations of accepted (or possibly
+ * accepted) steering, admissions of unacknowledged creates, and the initial response when its
+ * created never arrived. The in-flight response itself is already filtered by retired identity.
+ */
+function countStaleCreatesExpected(state: NativeChainState): number {
+  return (state.initialResponseCreateSeq !== undefined && !state.seenAnyResponse ? 1 : 0)
+    + state.acceptedUnapplied.length
+    + (state.createInFlight ? 1 : 0)
+    + (state.steerInFlight ? 1 : 0);
+}
+
+/**
+ * Connection loss with unresolved steering: sent-unacked and accepted-unapplied submissions are
+ * delivery-unknown and surface as response.steer.disconnected observations. Queued-unsent
+ * submissions instead reject as `not_sent`; they were never on the wire.
+ */
+function disconnectNativeSteerChunks(state: NativeChainState): LimCodeOpenAIResponsesStreamChunk[] {
+  const events: OpenAIResponsesNativeEvent[] = [];
+  if (state.steerInFlight) {
+    events.push({
+      type: 'response.steer.disconnected',
+      responseId: state.steerInFlight.targetResponseId,
+      submissionId: state.steerInFlight.submissionId,
+      input: state.steerInFlight.input,
+      connectionGeneration: state.lease.connectionGeneration,
+      ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+    });
+    state.steerInFlight = undefined;
+  }
+  for (const steer of state.acceptedUnapplied.splice(0)) {
+    events.push({
+      type: 'response.steer.disconnected',
+      responseId: steer.targetResponseId,
+      submissionId: steer.submissionId,
+      ...(steer.steerId ? { steerId: steer.steerId } : {}),
+      input: steer.input,
+      connectionGeneration: state.lease.connectionGeneration,
+      ...(state.lease.streamId ? { streamId: state.lease.streamId } : {})
+    });
+  }
+  return events.map((nativeEvent) => ({ nativeEvent }));
+}
+
+function rejectNativePendingWork(
+  state: NativeChainState,
+  disposition: 'not_sent' | 'admission_unknown' | 'failed' | 'abort',
+  reasonOrError: string | unknown
+): void {
+  const aborted = disposition === 'abort';
+  const reason = typeof reasonOrError === 'string' ? reasonOrError : 'connection_lost';
+  for (const steer of state.steerQueue.splice(0)) {
+    steer.reject(aborted
+      ? abortError(state.options.signal)
+      : nativeDeliveryError('not_sent', reason, steer.submissionId));
+  }
+  for (const sub of state.createQueue.splice(0)) {
+    sub.reject(aborted
+      ? abortError(state.options.signal)
+      : nativeDeliveryError('not_sent', reason, undefined, sub.callIds));
+  }
+  const inFlight = state.createInFlight;
+  state.createInFlight = undefined;
+  if (inFlight) {
+    for (const sub of inFlight.batch) {
+      sub.reject(aborted
+        ? abortError(state.options.signal)
+        : nativeDeliveryError(
+            disposition === 'failed' ? 'failed' : 'admission_unknown',
+            reason,
+            undefined,
+            sub.callIds
+          ));
+    }
+  }
+}
+
+function commitNativeContinuation(state: NativeChainState): void {
+  const normalizedTail = state.chainTailReliable ? state.chainTail : undefined;
+  const outputStateReliable = normalizedTail !== undefined
+    && (normalizedTail.length > 0 || !state.sawSemanticOutput);
+  if (!state.latestTerminalResponseId || !outputStateReliable || !state.lease.healthy()) {
+    invalidateOpenAIResponsesWebSocketContinuation(state.lease.continuation);
+    return;
+  }
+  state.lease.continuation.lastRequest = {
+    body: cloneJson(state.prepared.fullBody),
+    durableInputItems: state.prepared.durableInputItems.map(cloneJson),
+    baseSignature: state.prepared.baseSignature,
+    ...(state.prepared.volatileTailLayout ? { volatileTailLayout: state.prepared.volatileTailLayout } : {}),
+    ...(state.prepared.nativeAnchoredReasoning !== undefined
+      ? { nativeAnchoredReasoning: cloneJson(state.prepared.nativeAnchoredReasoning) }
+      : {}),
+    ...(state.prepared.nativeEffectiveEffort !== undefined
+      ? { nativeEffectiveEffort: state.prepared.nativeEffectiveEffort }
+      : {})
+  };
+  state.lease.continuation.lastResponse = {
+    responseId: state.latestTerminalResponseId,
+    outputItems: (normalizedTail ?? []).map(cloneJson)
+  };
+  state.lease.continuation.successfulIncrementalRequests = state.prepared.decision.mode === 'incremental'
+    ? state.lease.continuation.successfulIncrementalRequests + 1
+    : 0;
+}
+
+function buildNativeToolOutputItems(
+  outputs: readonly OpenAIResponsesToolOutput[]
+): { wireItems: unknown[]; callIds: string[]; coverageKeys: string[] } {
+  const wireItems: unknown[] = [];
+  const callIds: string[] = [];
+  const coverageKeys: string[] = [];
+  for (const output of outputs) {
+    if (output.type === 'mcp_approval_response') {
+      const approvalRequestId = normalizedString(output.approvalRequestId);
+      if (!approvalRequestId) throw new Error('mcp_approval_response requires approvalRequestId.');
+      wireItems.push({
+        type: 'mcp_approval_response',
+        approval_request_id: approvalRequestId,
+        approve: output.approve === true
+      });
+      coverageKeys.push(`approval:${approvalRequestId}`);
+      continue;
+    }
+    const callId = normalizedString(output.callId);
+    if (!callId) throw new Error(`${output.type} requires callId.`);
+    const payload = typeof output.output === 'string'
+      ? output.output
+      : JSON.stringify(output.output ?? null);
+    wireItems.push({ type: output.type, call_id: callId, output: payload });
+    callIds.push(callId);
+    coverageKeys.push(callId);
+  }
+  return { wireItems, callIds, coverageKeys };
+}
+
+function encodeNativeSteerInput(
+  format: OpenAIResponsesFormatAdapter,
+  input: OpenAIResponsesSteeringCommand['input']
+): unknown[] {
+  const contents = input.map((message) => {
+    const parts: unknown[] = [];
+    for (const part of message.parts) {
+      if ('text' in part) {
+        if (!part.thought) parts.push({ text: part.text });
+      } else if ('inlineData' in part) parts.push({ inlineData: part.inlineData });
+      else if ('fileData' in part) parts.push({ fileData: part.fileData });
+    }
+    return { role: 'user' as const, parts };
+  }).filter((content) => content.parts.length > 0);
+  if (contents.length === 0) throw new Error('OpenAI Responses steering input must contain user content.');
+  // The format encoder owns wire validation; unsupported parts surface as encode_failed.
+  const encoded = format.encodeRequest({ contents: contents as Content[] }, false);
+  if (!isRecord(encoded) || !Array.isArray(encoded.input) || encoded.input.length === 0) {
+    throw new Error('OpenAI Responses steering input encoding failed.');
+  }
+  return encoded.input.map((item) => stripWebSocketOnlyInputFields(item, true));
+}
+
+function collectNativeAsyncToolNames(fullBody: Record<string, unknown>): Set<string> {
+  const names = new Set<string>();
+  if (!Array.isArray(fullBody.tools)) return names;
+  for (const tool of fullBody.tools) {
+    if (!isRecord(tool) || tool.async !== true) continue;
+    const type = normalizedString(tool.type);
+    if (type !== 'function' && type !== 'custom') continue;
+    const name = normalizedString(tool.name);
+    if (name) names.add(name);
+  }
+  return names;
+}
+
+function nativeDeliveryError(
+  disposition: 'not_sent' | 'admission_unknown' | 'failed',
+  reason: string,
+  submissionId?: string,
+  callIds?: string[]
+): OpenAIResponsesNativeDeliveryError {
+  return new OpenAIResponsesNativeDeliveryError(
+    disposition,
+    `OpenAI Responses native delivery ${disposition}: ${reason}.`,
+    {
+      ...(submissionId ? { submissionId } : {}),
+      ...(callIds && callIds.length > 0 ? { callIds: [...callIds] } : {}),
+      reason
+    }
+  );
 }

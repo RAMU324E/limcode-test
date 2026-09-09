@@ -470,7 +470,7 @@ async function visibleToolNames(maxDepth, lineageFromCurrentToRoot) {
   const dispatcher = new ReliableToolDispatcher({
     database,
     contentStore: {},
-    effects: {},
+    effects: { subscribeToolModelResults: () => () => undefined },
     files: {},
     fileMutations: {},
     processes: {},

@@ -8,6 +8,7 @@ import {
 import {
   type ContextSegmentKind,
   type ContextSourceOccurrence,
+  classifyToolPairSources,
   validateScopedContextSegmentSources
 } from './contextSequence';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
@@ -167,7 +168,7 @@ export class AttachmentCatalogProjection {
     const segmentKind = requireSegmentKind(segment.segment_kind);
     const sources = this.scopedSources(segmentId, conversationId);
     const occurrences = sources.map(contextSourceOccurrence);
-    validateScopedContextSegmentSources(segmentKind, occurrences);
+    if (segmentKind !== 'tool_pair') validateScopedContextSegmentSources(segmentKind, occurrences);
 
     if (segmentKind === 'compression') {
       const blockId = occurrences[0].sourceId;
@@ -196,15 +197,25 @@ export class AttachmentCatalogProjection {
       return;
     }
     if (segmentKind === 'tool_pair') {
-      const callSource = occurrences[0];
-      const resultSource = occurrences[1];
-      const call = await this.cachedDomain('ToolCall', callSource.sourceId, this.toolCallCache);
-      if (requireBigInt(call.call_seq, 'ToolCall.call_seq') !== callSource.sourceRevision) {
-        throw new Error(`ToolCall ${callSource.sourceId} source_revision does not match call_seq.`);
+      const shape = classifyToolPairSources(occurrences);
+      if (shape.kind === 'native_call') {
+        const call = await this.cachedDomain('ToolCall', shape.call.sourceId, this.toolCallCache);
+        if (requireBigInt(call.call_seq, 'ToolCall.call_seq') !== shape.call.sourceRevision) {
+          throw new Error(`ToolCall ${shape.call.sourceId} source_revision does not match call_seq.`);
+        }
+        return;
       }
+      const resultSource = shape.result;
       const result = await this.cachedDomain('ToolModelResult', resultSource.sourceId, this.toolResultCache);
-      if (requireId(result.tool_call_id, 'ToolModelResult.tool_call_id') !== callSource.sourceId) {
-        throw new Error(`ToolModelResult ${resultSource.sourceId} does not belong to ToolCall ${callSource.sourceId}.`);
+      const toolCallId = shape.kind === 'atomic'
+        ? shape.call.sourceId
+        : requireId(result.tool_call_id, 'ToolModelResult.tool_call_id');
+      const call = await this.cachedDomain('ToolCall', toolCallId, this.toolCallCache);
+      if (requireBigInt(call.call_seq, 'ToolCall.call_seq') !== resultSource.sourceRevision) {
+        throw new Error(`ToolCall ${toolCallId} source_revision does not match call_seq.`);
+      }
+      if (requireId(result.tool_call_id, 'ToolModelResult.tool_call_id') !== toolCallId) {
+        throw new Error(`ToolModelResult ${resultSource.sourceId} does not belong to ToolCall ${toolCallId}.`);
       }
       const revisionId = requireId(result.message_revision_id, 'ToolModelResult.message_revision_id');
       revisions.push(revisionId);
@@ -246,7 +257,8 @@ export class AttachmentCatalogProjection {
         const segmentKind = requireSegmentKind(segment.segment_kind);
         const sources = this.scopedSources(segmentId, conversationId);
         const occurrences = sources.map(contextSourceOccurrence);
-        validateScopedContextSegmentSources(segmentKind, occurrences);
+        if (segmentKind === 'tool_pair') classifyToolPairSources(occurrences);
+        else validateScopedContextSegmentSources(segmentKind, occurrences);
         if (segmentKind === 'compression') {
           compressionSegments.push({ segmentId, blockId: occurrences[0].sourceId });
         }

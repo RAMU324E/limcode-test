@@ -9,6 +9,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.TurnStart:
     case BridgeMessageType.TurnEnqueue:
     case BridgeMessageType.TurnInterrupt:
+    case BridgeMessageType.TurnSteer:
     case BridgeMessageType.GuidanceEdit:
     case BridgeMessageType.GuidanceCancel:
     case BridgeMessageType.GuidanceReorder:
@@ -67,6 +68,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
       return 'state';
     case BridgeMessageType.GlobalSettingsGet:
     case BridgeMessageType.GlobalSettingsUpdate:
+    case BridgeMessageType.GlobalSettingsFlushResult:
     case BridgeMessageType.ConversationSettingsGet:
     case BridgeMessageType.ConversationSettingsUpdate:
       return 'settings';

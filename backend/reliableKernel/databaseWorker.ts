@@ -1043,7 +1043,7 @@ function executeModelStreamEvent(
   const attemptSeq = requirePositiveInteger(input.attemptSeq, 'ModelStreamEvent.attemptSeq');
   const socketGeneration = requirePositiveInteger(input.socketGeneration, 'ModelStreamEvent.socketGeneration');
   const streamSeq = requirePositiveInteger(input.streamSeq, 'ModelStreamEvent.streamSeq');
-  if (!['output_delta', 'output_item_done', 'partial_summary', 'terminal_summary'].includes(input.checkpointKind)) {
+  if (!['output_delta', 'output_item_done', 'native_control', 'native_tool_call', 'partial_summary', 'terminal_summary'].includes(input.checkpointKind)) {
     throw new TypeError(`Unsupported ModelStream checkpoint kind: ${String(input.checkpointKind)}`);
   }
   if (typeof input.now !== 'string' || input.now.length === 0) throw new TypeError('ModelStreamEvent.now must be non-empty.');
@@ -1106,39 +1106,31 @@ function executeModelStreamEvent(
       database.exec('ROLLBACK');
       return { accepted: false, checkpointed: false, terminal: false, ignoredReason: 'old-socket-generation' };
     }
-    const checkpointCountRow = database.prepare(`
-      SELECT COUNT(*) AS count,
-             COALESCE(SUM(CASE WHEN checkpoint_kind = 'output_delta' THEN 1 ELSE 0 END), 0) AS output_delta_count
-        FROM model_stream_checkpoint
-       WHERE model_request_id = ?
-    `).get(modelRequestId) as { count: bigint; output_delta_count: bigint };
-    if (
-      typeof checkpointCountRow.count !== 'bigint'
-      || typeof checkpointCountRow.output_delta_count !== 'bigint'
-    ) throw new Error('ModelStream checkpoint counts were not INTEGER values.');
-    if (
-      input.checkpointKind === 'output_delta'
-      && checkpointCountRow.output_delta_count >= BigInt(MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT)
-    ) {
-      database.exec('ROLLBACK');
-      return {
-        accepted: true,
-        checkpointed: false,
-        terminal: false,
-        ignoredReason: 'checkpoint-capacity'
-      };
-    }
-    if (
-      input.checkpointKind === 'output_item_done'
-      && checkpointCountRow.count >= BigInt(MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT)
-    ) {
-      database.exec('ROLLBACK');
-      return {
-        accepted: true,
-        checkpointed: false,
-        terminal: false,
-        ignoredReason: 'checkpoint-capacity'
-      };
+    if (input.checkpointKind === 'output_delta' || input.checkpointKind === 'output_item_done') {
+      const checkpointCountRow = database.prepare(`
+        SELECT COUNT(*) AS count,
+               COALESCE(SUM(CASE WHEN checkpoint_kind = 'output_delta' THEN 1 ELSE 0 END), 0) AS output_delta_count
+          FROM model_stream_checkpoint
+         WHERE model_request_id = ? AND checkpoint_kind NOT IN ('native_control', 'native_tool_call')
+      `).get(modelRequestId) as { count: bigint; output_delta_count: bigint };
+      if (
+        typeof checkpointCountRow.count !== 'bigint'
+        || typeof checkpointCountRow.output_delta_count !== 'bigint'
+      ) throw new Error('ModelStream checkpoint counts were not INTEGER values.');
+      if (
+        (input.checkpointKind === 'output_delta'
+          && checkpointCountRow.output_delta_count >= BigInt(MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT))
+        || (input.checkpointKind === 'output_item_done'
+          && checkpointCountRow.count >= BigInt(MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT))
+      ) {
+        database.exec('ROLLBACK');
+        return {
+          accepted: true,
+          checkpointed: false,
+          terminal: false,
+          ignoredReason: 'checkpoint-capacity'
+        };
+      }
     }
     const contentId = requireRuntimeId(input.contentObject.id);
     assertPreparedContentInsert(input.contentObject, input.contentInsert);
@@ -1402,6 +1394,14 @@ function assertExecutionLeaseFence(
   throw error;
 }
 
+const NATIVE_CAPABILITY_FIELDS: Readonly<Record<string, true>> = {
+  asyncTools: true,
+  steering: true,
+  reasoningUpdates: true,
+  multiplexing: true,
+  explicitCaching: true
+};
+
 function decodeModelStreamIdentity(value: unknown): {
   attemptSeq: bigint;
   socketGeneration: bigint;
@@ -1426,7 +1426,9 @@ function decodeModelStreamIdentity(value: unknown): {
     'completedAt',
     'streamOutputDurationMs',
     'lastStreamSeq',
-    'lastStreamEventAt'
+    'lastStreamEventAt',
+    'nativeCapabilities',
+    'nativeInitialPromptTokenCount'
   ]);
   if (
     !keys.includes('attemptSeq')
@@ -1458,6 +1460,24 @@ function decodeModelStreamIdentity(value: unknown): {
   assertOptionalStreamTiming(record.streamOutputDurationMs, 'streamOutputDurationMs', true);
   optionalDecimalInteger(record.lastStreamSeq, 'lastStreamSeq');
   optionalPositiveInteger(record.lastStreamEventAt, 'lastStreamEventAt');
+  optionalNonNegativeInteger(record.nativeInitialPromptTokenCount, 'nativeInitialPromptTokenCount');
+  if (record.nativeCapabilities !== undefined) {
+    const capabilities = record.nativeCapabilities;
+    if (!capabilities || typeof capabilities !== 'object' || Array.isArray(capabilities)) {
+      throw new TypeError('ModelRequest.stream_stats_json.nativeCapabilities must be an object.');
+    }
+    const native = capabilities as Record<string, unknown>;
+    for (const key of Object.keys(native)) {
+      if (NATIVE_CAPABILITY_FIELDS[key] !== true) {
+        throw new TypeError(`Unknown ModelRequest native capability ${key}.`);
+      }
+    }
+    for (const key in NATIVE_CAPABILITY_FIELDS) {
+      if (typeof native[key] !== 'boolean') {
+        throw new TypeError(`ModelRequest native capability ${key} must be boolean.`);
+      }
+    }
+  }
   return {
     attemptSeq,
     socketGeneration: decimalRuntimeInteger(record.socketGeneration, 'stream_stats.socketGeneration'),

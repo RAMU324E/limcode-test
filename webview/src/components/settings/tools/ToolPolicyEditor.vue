@@ -291,6 +291,7 @@ function cloneToolConfigs(): Record<string, ToolPolicyToolConfigRecord> {
       ...(typeof record.autoApplyChange === 'boolean' ? { autoApplyChange: record.autoApplyChange } : {}),
       ...(typeof record.autoApplyChangeDelaySeconds === 'number' ? { autoApplyChangeDelaySeconds: record.autoApplyChangeDelaySeconds } : {}),
       ...(typeof record.autoSubmitResult === 'boolean' ? { autoSubmitResult: record.autoSubmitResult } : {}),
+      ...(typeof record.nativeAsync === 'boolean' ? { nativeAsync: record.nativeAsync } : {}),
       ...(record.display ? { display: { ...record.display } } : {})
     };
   }
@@ -360,6 +361,21 @@ function toolGateValue(tool: ToolDefinitionRecord, key: ToolGateSettingKey): boo
   if (key === 'autoApproveExecution') return tool.metadata?.defaultAutoApproveExecution ?? true;
   if (key === 'autoApplyChange') return tool.metadata?.defaultAutoApplyChange ?? true;
   return tool.metadata?.defaultAutoSubmitResult ?? true;
+}
+
+/** 原生异步与执行审批、结果回传、调度预设相互独立；只有显式开启才生效。 */
+function nativeAsyncValue(tool: ToolDefinitionRecord): boolean {
+  return effectivePolicy.value?.toolConfigs?.[tool.name]?.nativeAsync === true;
+}
+
+function updateNativeAsync(tool: ToolDefinitionRecord, value: boolean): void {
+  if (props.readonly) return;
+  const nextConfigs = cloneToolConfigs();
+  nextConfigs[tool.name] = {
+    ...(nextConfigs[tool.name] ?? { config: sanitizeConfigForTool(tool, configForTool(tool)) }),
+    nativeAsync: value
+  };
+  store.setPolicyForScope(props.scopeKind, props.scopeId, effectivePolicy.value?.allowedTools ?? [], effectivePolicy.value?.name, nextConfigs, cloneSourceConfigs());
 }
 
 function supportsChangeApply(tool: ToolDefinitionRecord): boolean {
@@ -689,6 +705,18 @@ function inputNumber(event: Event): number {
                           <span class="permission-copy">
                             <span class="permission-title">自动回传结果</span>
                             <span class="permission-desc">开启时工具结果自动发送给 LLM；关闭时先询问是否发送。</span>
+                          </span>
+                        </LcCheckbox>
+                        <LcCheckbox
+                          class="tool-permission-card"
+                          :class="{ 'is-enabled': nativeAsyncValue(tool) }"
+                          :model-value="nativeAsyncValue(tool)"
+                          :disabled="readonly"
+                          @update:model-value="updateNativeAsync(tool, $event)"
+                        >
+                          <span class="permission-copy">
+                            <span class="permission-title">原生异步执行</span>
+                            <span class="permission-desc">仅在 Astra 原生渠道开启「原生异步工具」后生效：该工具可异步执行，结果稍后按原始调用回传；不改变上方的执行审批与调度设置。</span>
                           </span>
                         </LcCheckbox>
                         <LcCheckbox

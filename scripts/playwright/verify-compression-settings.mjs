@@ -313,6 +313,7 @@ async function verifyViewport(browser, viewport, outputDirectory) {
     assert(sliderAttributes.step === '1', `滑块没有使用整数位置步长：${sliderAttributes.step}`);
     assert(Number(sliderAttributes.max) < fixtureProvider.contextWindowTokens, '滑块仍直接把大 Token 数交给原生 range');
 
+    const saveStartIndex = await page.evaluate(() => window.__limcodeMockHostPostedMessages.length);
     await thresholdSlider.scrollIntoViewIfNeeded();
     const sliderBox = await thresholdSlider.boundingBox();
     assert(sliderBox, '无法读取压缩阈值滑块的位置');
@@ -329,6 +330,9 @@ async function verifyViewport(browser, viewport, outputDirectory) {
     assert(Number.isSafeInteger(adjustedThreshold), `滑块调整后不是安全整数：${adjustedThreshold}`);
     assert(adjustedThreshold >= 1_000, `滑块调整后错误回落到 ${adjustedThreshold} token`);
     assert(adjustedThreshold % 1_000 === 0, `滑块调整后没有保持 1k 对齐：${adjustedThreshold}`);
+    const saveRecovery = await verifySaveRecovery(page, saveStartIndex);
+    await page.locator('.channel-content[aria-busy="false"]').waitFor({ state: 'visible' });
+    assert(Number(await thresholdInput.inputValue()) === adjustedThreshold, '保存恢复覆盖了刚调整的阈值');
 
     const layout = await compressionSection.evaluate((element) => {
       const rect = element.getBoundingClientRect();
@@ -356,6 +360,7 @@ async function verifyViewport(browser, viewport, outputDirectory) {
       height: viewport.height,
       screenshot,
       layout,
+      saveRecovery,
       pageErrors,
       consoleErrors,
       consoleWarnings,
@@ -365,6 +370,58 @@ async function verifyViewport(browser, viewport, outputDirectory) {
   } finally {
     await context.close();
   }
+}
+
+async function verifySaveRecovery(page, startIndex) {
+  const disk = structuredClone(SETTINGS_FIXTURES);
+  const revisions = Object.fromEntries(Object.keys(disk).map((section) => [section, `playwright-${section}-revision`]));
+  const flushId = 'playwright-save-before-execution';
+  await postHostMessage(page, { id: flushId, type: 'settings.global.flush', channel: 'settings', clientId: CLIENT_ID });
+  let index = startIndex;
+  let writes = 0;
+  let droppedConfirmation = false;
+  let recoveryRead = false;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const messages = await page.evaluate((offset) => window.__limcodeMockHostPostedMessages.slice(offset), index);
+    index += messages.length;
+    for (const message of messages) {
+      if (message.type === 'settings.global.update') {
+        const section = message.payload.section;
+        assert(message.payload.expectedRevision === revisions[section], `保存没有使用当前版本：${section}`);
+        disk[section] = message.payload.settings;
+        if (section === 'llmCompressionConfigs' || section === 'llmProviderConfigs') {
+          disk[section] = { configs: disk[section].configs.map((config) => ({ ...config, updatedAt: Date.now() })) };
+        }
+        revisions[section] = `playwright-save-${++writes}`;
+        if (!droppedConfirmation && section === 'llmCompressionConfigs') {
+          droppedConfirmation = true;
+          continue;
+        }
+        await postHostMessage(page, {
+          ...settingsSnapshotMessage(section, disk[section]), correlationId: message.id,
+          payload: { ...settingsSnapshotMessage(section, disk[section]).payload, revision: revisions[section] }
+        });
+      } else if (message.type === 'settings.global.get') {
+        const section = message.payload.section;
+        if (droppedConfirmation && section === 'llmCompressionConfigs') recoveryRead = true;
+        await postHostMessage(page, {
+          ...settingsSnapshotMessage(section, disk[section]), correlationId: message.id,
+          payload: { ...settingsSnapshotMessage(section, disk[section]).payload, revision: revisions[section] }
+        });
+      } else if (message.type === 'settings.global.flush.result' && message.correlationId === flushId) {
+        assert(message.payload.status === 'saved', `保存前置确认失败：${message.payload.message}`);
+        assert(droppedConfirmation && recoveryRead, '没有经过保存确认丢失后的磁盘核对');
+        await page.waitForTimeout(500);
+        const extraWrites = await page.evaluate((offset) => window.__limcodeMockHostPostedMessages.slice(offset)
+          .filter((item) => item.type === 'settings.global.update').length, index);
+        assert(extraWrites === 0, '保存完成后仍在无修改重复保存');
+        return { droppedConfirmation, recoveryRead, writes, completed: true };
+      }
+    }
+    await page.waitForTimeout(25);
+  }
+  throw new Error('保存确认恢复未在有界时间内完成。');
 }
 
 function helloMessage() {

@@ -21,6 +21,21 @@ import type {
   OpenAIResponsesWebSocketTimeoutPhase
 } from './openAIResponsesWebSocketSession';
 import { LlmEventType } from '../world/modules/llm/events';
+import {
+  isAstraModel,
+  normalizeOpenAIResponsesNativeSettings,
+  openAIResponsesNativeCapabilities
+} from '../../shared/openAIResponsesCapabilities';
+import type {
+  OpenAIResponsesNativeCapabilities,
+  OpenAIResponsesToolOutput
+} from '../../shared/openAIResponsesNative';
+import { OpenAIResponsesNativeDeliveryError } from './openAIResponsesNativeControl';
+import type {
+  OpenAIResponsesNativeController,
+  OpenAIResponsesNativeHooks,
+  OpenAIResponsesNativeResultAdmission
+} from './openAIResponsesNativeControl';
 import { ATTACHMENT_OBSERVATION_PROMPT_REVISION } from '../world/modules/llm/contracts';
 import type {
   LlmCompactDryRunResult,
@@ -35,7 +50,7 @@ import type {
   LlmModelSettings,
   ToolSchema
 } from '../world/modules/llm/contracts';
-import type { Emit, LlmCapability } from './types';
+import type { Emit, LlmCapability, LlmStartRuntimeControls } from './types';
 import {
   isFileDataPart,
   isFunctionCallPart,
@@ -89,6 +104,7 @@ import type {
   LlmRequestBodyRecord,
   LlmToolCallFormat,
   LlmRawErrorInfoRecord,
+  LlmThinkingLevel,
   LlmUsageMetadataRecord,
   MessageContent,
   ModelOutputItemReference
@@ -246,7 +262,7 @@ export function createLlmProviderCapability(options: LlmProviderOptions): LlmCap
     resolveInvocation(request, emit) {
       void resolveLlmInvocationProvider(request, emit, options, resolvedRuntimeSettingsByInvocationId);
     },
-    start(request, emit) {
+    start(request, emit, controls) {
       controllers.get(request.id)?.abort(createAbortError(`Superseded LLM request: ${request.id}`));
       retryControls.get(request.id)?.wakeRetryWait?.();
 
@@ -255,7 +271,7 @@ export function createLlmProviderCapability(options: LlmProviderOptions): LlmCap
       controllers.set(request.id, controller);
       retryControls.set(request.id, retryControl);
 
-      void startLlmProvider(request, emit, options, controller.signal, resolvedRuntimeSettingsByInvocationId, retryControl)
+      void startLlmProvider(request, emit, options, controller.signal, resolvedRuntimeSettingsByInvocationId, retryControl, controls)
         .finally(() => {
           if (controllers.get(request.id) === controller) {
             controllers.delete(request.id);
@@ -336,7 +352,8 @@ export async function startLlmProvider(
   options: LlmProviderOptions,
   signal?: AbortSignal,
   resolvedRuntimeSettingsByInvocationId?: Map<string, LlmProviderConfigRecord>,
-  retryControl: RetryControl = { cancelRequested: false }
+  retryControl: RetryControl = { cancelRequested: false },
+  controls?: LlmStartRuntimeControls
 ): Promise<void> {
   const streamEvents = createLlmStreamEventBatcher(emit, {
     onDerived: options.debugCapture ? (event, inputs) => {
@@ -355,6 +372,13 @@ export async function startLlmProvider(
   try {
     const settings = await resolveRuntimeSettings(request, options, resolvedRuntimeSettingsByInvocationId);
     emitLlmStarted(streamEmit, request.id, request.invocationId, resolveModelDisplayName(settings));
+    const nativeCapabilities = openAIResponsesNativeCapabilities({
+      provider: settings.provider,
+      model: settings.model,
+      baseUrl: settings.baseUrl,
+      transport: settings.openaiResponsesTransport,
+      nativeResponses: settings.nativeResponses
+    });
 
     const unified = await importUnifiedLlmProvider();
     const registry = unified.createBootstrapExtensionRegistry();
@@ -365,7 +389,10 @@ export async function startLlmProvider(
       createObservation: options.debugCapture ? () => new DebugHttpObservation(options.debugCapture!, debugContext, unified.attachLlmResponseObserver) : undefined
     });
     const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
-    const requestBody = requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId);
+    const requestBody = withoutNativeServerSideCompaction(
+      requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId),
+      request.contents
+    );
     if (proxy) console.log(`[LimCode] LLM proxy enabled: ${proxy}`);
     const providerConfig = {
       provider: settings.provider,
@@ -410,7 +437,9 @@ export async function startLlmProvider(
           options,
           signal,
           sawRetry ? { retryAttempt: retryCount, retryMaxAttempts: maxRetries } : undefined,
-          proxy
+          proxy,
+          nativeCapabilities,
+          controls
         );
         return;
       } catch (error) {
@@ -474,7 +503,9 @@ async function runLlmAttempt(
   options: LlmProviderOptions,
   signal?: AbortSignal,
   retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice,
-  proxy?: string
+  proxy?: string,
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities,
+  controls?: LlmStartRuntimeControls
 ): Promise<void> {
   const debugContext = getDebugCaptureContext(request) ?? { conversationId: request.conversationId ?? '', modelRequestId: request.id };
   const observingEmit = (value: unknown): Emit => {
@@ -487,8 +518,13 @@ async function runLlmAttempt(
       emit(event);
     };
   };
-  const preparedRequest = await prepareLlmStartRequestMultimodal(request, options);
-  const unifiedRequest = toUnifiedRequest(preparedRequest, settings.generationConfig, settings.provider);
+  const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities);
+  const unifiedRequest = toUnifiedRequest(
+    preparedRequest,
+    effectiveRequestGenerationConfig(request, settings),
+    settings.provider,
+    nativeCapabilities
+  );
   const forceStreaming = isOpenAIResponsesWebSocketMode(settings);
   if (settings.stream === false && !forceStreaming) {
     const response = await provider.chat<UnifiedLLMResponse>(unifiedRequest, {
@@ -517,10 +553,38 @@ async function runLlmAttempt(
   }
 
   let latestUsageMetadata: LlmUsageMetadataRecord | undefined;
-  let authoritativeCompletedContent: MessageContent | undefined;
+  let chainUsageTotals: LlmUsageMetadataRecord | undefined;
+  const nativeChain: OpenAIResponsesNativeChainContext = {};
+  const completedContents: MessageContent[] = [];
   const timing: LlmAttemptTimingState = { streamTimingChunkCount: 0 };
   let activeThoughtBlock: ActiveThoughtBlock | undefined;
   let retryRecoveryPending = retryRecoveryNotice !== undefined;
+  const nativeHooks = controls?.native;
+  // 只包装 onController（媒体解析）；onLaneQueueState 等其他本地 hook 原样透传。
+  const wrappedNativeHooks: OpenAIResponsesNativeHooks | undefined = nativeHooks
+    ? {
+        ...nativeHooks,
+        ...(nativeHooks.onController
+          ? {
+              onController: (controller: OpenAIResponsesNativeController | undefined) =>
+                nativeHooks.onController!(controller ? wrapOpenAIResponsesNativeController(controller, options) : undefined)
+            }
+          : {})
+      }
+    : undefined;
+  const nativeStreamOptions = forceStreaming && nativeCapabilities && (
+    nativeCapabilities.asyncTools || nativeCapabilities.steering
+    || nativeCapabilities.reasoningUpdates || nativeCapabilities.multiplexing)
+    ? {
+        ...(wrappedNativeHooks ?? {}),
+        steering: nativeCapabilities.steering,
+        reasoningUpdates: nativeCapabilities.reasoningUpdates,
+        multiplexing: nativeCapabilities.multiplexing
+      }
+    : undefined;
+  const nativeHttpSession = !forceStreaming
+    && nativeCapabilities?.asyncTools === true
+    && settings.provider === 'openai-responses';
   try {
     const stream: AsyncIterable<UnifiedLLMStreamChunk> = forceStreaming
       ? streamOpenAIResponsesWithLimCodeSession({
@@ -534,13 +598,21 @@ async function runLlmAttempt(
           retryRecoveryNotice,
           proxy,
           onTransportTrace: options.onTransportTrace,
-          debugCapture: options.debugCapture
+          debugCapture: options.debugCapture,
+          ...(nativeStreamOptions ? { native: nativeStreamOptions } : {})
         })
-      : provider.chatStream<UnifiedLLMStreamChunk>(unifiedRequest, {
-          inputFormat: 'unified',
-          outputFormat: 'unified',
-          signal
-        });
+      : nativeHttpSession
+        ? streamOpenAIResponsesNativeHttpSession({
+            provider,
+            unifiedRequest,
+            signal,
+            ...(wrappedNativeHooks ? { hooks: wrappedNativeHooks } : {})
+          })
+        : provider.chatStream<UnifiedLLMStreamChunk>(unifiedRequest, {
+            inputFormat: 'unified',
+            outputFormat: 'unified',
+            signal
+          });
     for await (const chunk of stream) {
       const chunkEmit = observingEmit(chunk);
       if (signal?.aborted) throw createAbortError(`Aborted LLM request: ${request.id}`);
@@ -553,22 +625,51 @@ async function runLlmAttempt(
       }
       const chunkAt = Date.now();
       const chunkMark = nowMonotonicMs();
+      const nativeEvent = (chunk as LimCodeOpenAIResponsesStreamChunk).nativeEvent;
+      if (nativeEvent) {
+        if (nativeEvent.type === 'response.created') {
+          // 新 response 开始：上一 response 的 usage 并入链聚合，输出 item 归属切换。
+          if (latestUsageMetadata) {
+            chainUsageTotals = sumUsageMetadata(chainUsageTotals, latestUsageMetadata);
+            latestUsageMetadata = undefined;
+          }
+          nativeChain.current = {
+            responseId: nativeEvent.responseId,
+            ...(nativeEvent.previousResponseId ? { previousResponseId: nativeEvent.previousResponseId } : {})
+          };
+        }
+        chunkEmit({
+          type: LlmEventType.NativeControl,
+          payload: {
+            requestId: request.id,
+            event: nativeEvent.type === 'response.created' && nativeCapabilities
+              ? { ...nativeEvent, capabilities: nativeCapabilities }
+              : nativeEvent
+          }
+        });
+      }
       if (retryRecoveryPending && hasStreamTimingChunk(chunk)) {
         emitRetryRecovered(request.id, emit, retryRecoveryNotice);
         retryRecoveryPending = false;
       }
-      activeThoughtBlock = emitThoughtDeltas(request.id, activeThoughtBlock, chunk, chunkAt, chunkEmit);
+      activeThoughtBlock = emitThoughtDeltas(request.id, activeThoughtBlock, chunk, chunkAt, chunkEmit, nativeChain);
       if (activeThoughtBlock && shouldCloseThoughtBlock(chunk)) activeThoughtBlock = finishThoughtBlock(request.id, activeThoughtBlock, chunkAt, chunkEmit);
       const chunkUsageMetadata = usageMetadataFromChunk(chunk);
       if (chunkUsageMetadata) latestUsageMetadata = mergeUsageMetadata(latestUsageMetadata, chunkUsageMetadata);
       const completedContent = (chunk as LimCodeOpenAIResponsesStreamChunk).completedContent;
-      if (completedContent) authoritativeCompletedContent = fromUnifiedCompletedContent(completedContent);
+      if (completedContent) completedContents.push(fromUnifiedCompletedContent(completedContent, nativeChain));
+      const httpCompletedContents = (chunk as OpenAIResponsesHttpNativeStreamChunk).completedContents;
+      if (Array.isArray(httpCompletedContents)) {
+        for (const content of httpCompletedContents) {
+          completedContents.push(fromUnifiedCompletedContent(content, nativeChain));
+        }
+      }
       if (hasStreamTimingChunk(chunk)) {
         timing.firstStreamChunkAt ??= chunkAt;
         timing.firstStreamChunkMark ??= chunkMark;
         timing.streamTimingChunkCount += 1;
       }
-      emitUnifiedChunk(request.id, chunk, chunkEmit);
+      emitUnifiedChunk(request.id, chunk, chunkEmit, nativeChain);
     }
   } catch (error) {
     const aborted = isRequestAbort(signal);
@@ -598,6 +699,16 @@ async function runLlmAttempt(
   const finishedMark = nowMonotonicMs();
   if (activeThoughtBlock) finishThoughtBlock(request.id, activeThoughtBlock, finishedAt, emit);
   if (retryRecoveryPending) emitRetryRecovered(request.id, emit, retryRecoveryNotice);
+  // 原生链可能有多个物理 response；Done 只在逻辑链尾发出，内容按链序聚合，
+  // 每个 part 的 outputItem.providerResponseId/previousResponseId 保留边界，绝不跨边界静默拼接。
+  const authoritativeCompletedContent = completedContents.length === 0
+    ? undefined
+    : completedContents.length === 1
+      ? completedContents[0]
+      : { role: 'model' as const, parts: completedContents.flatMap((content) => content.parts) };
+  const aggregatedUsageMetadata = latestUsageMetadata
+    ? sumUsageMetadata(chainUsageTotals, latestUsageMetadata)
+    : chainUsageTotals;
   emit({
     type: LlmEventType.Done,
     payload: {
@@ -605,7 +716,7 @@ async function runLlmAttempt(
       ...(authoritativeCompletedContent ? { content: authoritativeCompletedContent } : {}),
       ...createDoneTiming(timing.firstStreamChunkAt, finishedAt, timing.firstStreamChunkMark, finishedMark, timing.streamTimingChunkCount),
       completedAt: finishedAt,
-      ...(latestUsageMetadata ? { usageMetadata: latestUsageMetadata } : {})
+      ...(aggregatedUsageMetadata ? { usageMetadata: aggregatedUsageMetadata } : {})
     }
   });
 }
@@ -621,6 +732,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   signal?: AbortSignal;
   retryRecoveryNotice?: LlmAttemptRetryRecoveryNotice;
   proxy?: string;
+  native?: OpenAIResponsesWebSocketStreamOptions['native'];
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
 }): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
   const conversationId = requireOpenAIResponsesWebSocketConversationId(input.request.conversationId);
@@ -676,6 +788,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
       body: dryRun.body,
       format,
       ...(continuation ? { continuation } : {}),
+      ...(input.native ? { native: input.native } : {}),
       forceNewConnection: reliableAttempt?.attemptSeq !== undefined
         && reliableAttempt.attemptSeq > 1,
       signal: input.signal,
@@ -727,6 +840,220 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   }
 }
 
+interface OpenAIResponsesNativeHttpQueuedSubmission {
+  outputs: readonly OpenAIResponsesToolOutput[];
+  resolve: (admission: OpenAIResponsesNativeResultAdmission) => void;
+  reject: (error: unknown) => void;
+}
+
+/** vendor fork 在 Astra SSE 解码时附加的原生事件（结构子集；无 WS 连接代）。 */
+interface OpenAIResponsesHttpNativeStreamChunk extends UnifiedLLMStreamChunk {
+  nativeEvent?: {
+    type: 'response.created' | 'response.completed' | 'response.incomplete';
+    responseId: string;
+    previousResponseId?: string;
+    reason?: string;
+    usage?: Record<string, unknown>;
+    admittedToolResultCallIds?: string[];
+  };
+  completedContents?: UnifiedContent[];
+}
+
+/**
+ * HTTP/SSE 原生会话：与 WS 同一个 OpenAIResponsesNativeController 契约的轻量泵。
+ * 逻辑请求跨多个物理 SSE response 存活；submitToolResults 排入队列，达界后以
+ * stateless 全量历史（既有 unified contents + 已解码 response 输出原样回传 + 每个就绪结果
+ * 一个 function_call_output raw input item）发起下一个物理 response，并在其真实
+ * response.created 解决准入收据。store=false，不伪造任何物理连接身份；steering 仅 WS。
+ */
+async function* streamOpenAIResponsesNativeHttpSession(input: {
+  provider: UnifiedChatProvider;
+  unifiedRequest: UnifiedLLMRequest;
+  signal?: AbortSignal;
+  hooks?: OpenAIResponsesNativeHooks;
+}): AsyncGenerator<UnifiedLLMStreamChunk> {
+  const queue: OpenAIResponsesNativeHttpQueuedSubmission[] = [];
+  let logicalEnded = false;
+  let latestResponseId: string | undefined;
+  let waiting: (() => void) | undefined;
+  const wake = (): void => {
+    const pending = waiting;
+    waiting = undefined;
+    pending?.();
+  };
+  const controller: OpenAIResponsesNativeController = {
+    get responseId() { return latestResponseId; },
+    connectionGeneration: undefined,
+    streamId: undefined,
+    steer() {
+      return Promise.reject(new OpenAIResponsesNativeDeliveryError(
+        'not_sent',
+        'Astra steering requires the native WebSocket transport.'
+      ));
+    },
+    submitToolResults(outputs) {
+      if (outputs.length === 0) {
+        return Promise.reject(new OpenAIResponsesNativeDeliveryError(
+          'failed',
+          'Native tool-result submission requires at least one output.'
+        ));
+      }
+      if (logicalEnded) {
+        return Promise.reject(new OpenAIResponsesNativeDeliveryError(
+          'not_sent',
+          'Logical native request already ended.'
+        ));
+      }
+      return new Promise<OpenAIResponsesNativeResultAdmission>((resolve, reject) => {
+        queue.push({ outputs, resolve, reject });
+        wake();
+      });
+    },
+    endLogicalRequest() {
+      logicalEnded = true;
+      wake();
+    }
+  };
+  input.hooks?.onController?.(controller);
+
+  const rejectQueued = (error: OpenAIResponsesNativeDeliveryError): void => {
+    for (const submission of queue.splice(0, queue.length)) submission.reject(error);
+  };
+  // 跨物理 response 维护所有未决原生调用 ID：同步/异步结果都经同一控制器泵交付，
+  // async 只影响内核的早期准入时点，不影响"结果必须回传"。任何 response 接收到的调用
+  // 进入集合，只有随续流真实交付（drain 进出站历史）才移除；部分就绪不影响其余未决项。
+  const pendingNativeCallIds = new Set<string>();
+  let contents = input.unifiedRequest.contents;
+  try {
+    for (;;) {
+      const drained = queue.splice(0, queue.length);
+      for (const submission of drained) {
+        for (const output of submission.outputs) {
+          if (output.callId) pendingNativeCallIds.delete(output.callId);
+        }
+      }
+      let drainedSettled = false;
+      const responseContents: UnifiedContent[] = [];
+      try {
+        for await (const chunk of input.provider.chatStream<UnifiedLLMStreamChunk>(
+          { ...input.unifiedRequest, contents },
+          { inputFormat: 'unified', outputFormat: 'unified', signal: input.signal }
+        )) {
+          const nativeChunk = chunk as OpenAIResponsesHttpNativeStreamChunk;
+          const nativeEvent = nativeChunk.nativeEvent;
+          if (nativeEvent?.type === 'response.created' && typeof nativeEvent.responseId === 'string' && nativeEvent.responseId) {
+            latestResponseId = nativeEvent.responseId;
+            if (!drainedSettled && drained.length > 0) {
+              drainedSettled = true;
+              const admission: OpenAIResponsesNativeResultAdmission = { responseId: nativeEvent.responseId };
+              for (const submission of drained) submission.resolve(admission);
+              // 数据级观察：本 create 实际携带的结果 call_id，供内核先落投递事实再处理新输出。
+              const admittedToolResultCallIds = drained.flatMap((submission) =>
+                submission.outputs.map((output) => output.callId).filter((callId): callId is string => !!callId));
+              if (admittedToolResultCallIds.length > 0) {
+                nativeChunk.nativeEvent = { ...nativeEvent, admittedToolResultCallIds };
+              }
+            }
+          }
+          collectNativeHttpOutstandingCallIds(chunk, pendingNativeCallIds);
+          if (Array.isArray(nativeChunk.completedContents)) responseContents.push(...nativeChunk.completedContents);
+          yield chunk;
+        }
+      } catch (error) {
+        // 续流 POST 已经发起：无法证明"从未到达线上"，一律 admission_unknown；
+        // not_sent 只留给从未 drain 出站（尚在队列）的提交。
+        const deliveryError = new OpenAIResponsesNativeDeliveryError(
+          'admission_unknown',
+          `Native HTTP continuation failed after the continuation request began: ${error instanceof Error ? error.message : String(error)}`
+        );
+        for (const submission of drained) submission.reject(deliveryError);
+        rejectQueued(deliveryError);
+        throw error;
+      }
+
+      // 还有任何未决调用（同步或异步，含更早 response 遗留下来且尚未交付的）且队列空：
+      // 等待内核经控制器交付或显式终止逻辑请求；全部已决且队列空时才是普通终态。
+      while (queue.length === 0 && !logicalEnded && pendingNativeCallIds.size > 0) {
+        await new Promise<void>((resolveWait, rejectWait) => {
+          const onAbort = (): void => {
+            waiting = undefined;
+            rejectWait(createAbortError(`Aborted LLM request while awaiting native HTTP continuation.`));
+          };
+          waiting = () => {
+            input.signal?.removeEventListener('abort', onAbort);
+            resolveWait();
+          };
+          if (input.signal?.aborted) {
+            waiting = undefined;
+            rejectWait(createAbortError(`Aborted LLM request while awaiting native HTTP continuation.`));
+            return;
+          }
+          input.signal?.addEventListener('abort', onAbort, { once: true });
+        });
+      }
+      if (queue.length === 0) break;
+      contents = [
+        ...contents,
+        ...responseContents,
+        ...queue.flatMap((submission) => submission.outputs.map(nativeToolOutputContent))
+      ];
+    }
+  } finally {
+    input.hooks?.onController?.(undefined);
+    rejectQueued(new OpenAIResponsesNativeDeliveryError(
+      'not_sent',
+      'Native HTTP session ended before the submission reached the wire.'
+    ));
+  }
+}
+
+/**
+ * 从流式 chunk 收集接收到的原生调用 ID（async:true/false/缺失全部计入）。
+ * 原生 HTTP 会话里同步与异步结果都经控制器交付，结果未回传前会话不得结束。
+ */
+function collectNativeHttpOutstandingCallIds(chunk: UnifiedLLMStreamChunk, pending: Set<string>): void {
+  const callParts = [
+    ...(chunk.functionCalls ?? []),
+    ...(chunk.partsDelta ?? []).filter((part) => 'functionCall' in part)
+  ];
+  for (const part of callParts) {
+    if (!('functionCall' in part)) continue;
+    const callId = part.functionCall.callId;
+    if (callId) pending.add(callId);
+  }
+}
+
+/** 把交付的工具输出包装成 raw input item 内容，借 providerContext 无损直通到线上。 */
+function nativeToolOutputContent(output: OpenAIResponsesToolOutput): UnifiedContent {
+  return {
+    role: 'user',
+    parts: [{
+      providerContext: {
+        provider: 'openai',
+        format: 'openai-responses',
+        endpoint: 'responses',
+        itemType: output.type,
+        rawItem: nativeToolOutputRawItem(output)
+      }
+    }]
+  } as unknown as UnifiedContent;
+}
+
+function nativeToolOutputRawItem(output: OpenAIResponsesToolOutput): Record<string, unknown> {
+  if (output.type === 'mcp_approval_response') {
+    return {
+      type: 'mcp_approval_response',
+      ...(output.approvalRequestId ? { approval_request_id: output.approvalRequestId } : {}),
+      ...(output.approve !== undefined ? { approve: output.approve } : {})
+    };
+  }
+  return {
+    type: output.type,
+    ...(output.callId ? { call_id: output.callId } : {}),
+    ...(output.output !== undefined ? { output: output.output } : {})
+  };
+}
+
 function openAIResponsesContinuationHint(
   request: LlmStartRequest,
   unifiedRequest: UnifiedLLMRequest
@@ -743,7 +1070,10 @@ function openAIResponsesContinuationHint(
   }
   return {
     volatileTailContents: unifiedRequest.contents.slice(unifiedRequest.contents.length - kinds.length),
-    volatileTailContentKinds: [...kinds]
+    volatileTailContentKinds: [...kinds],
+    ...(typeof metadata.forceFullReason === 'string' && metadata.forceFullReason
+      ? { forceFullReason: metadata.forceFullReason }
+      : {})
   };
 }
 
@@ -1184,7 +1514,10 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
   const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
-  const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
+  const requestBody = withoutNativeServerSideCompaction(
+    requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId),
+    request.contents
+  );
   const provider = installProviderCompatibility(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
     model: runtimeSettings.model,
@@ -1204,12 +1537,20 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     throw new Error('当前 unified-llm-provider 版本不支持 provider.dryRun，请更新依赖。');
   }
 
-  const preparedRequest = await prepareLlmStartRequestMultimodal(request, options);
+  const nativeCapabilities = openAIResponsesNativeCapabilities({
+    provider: runtimeSettings.provider,
+    model: runtimeSettings.model,
+    baseUrl: runtimeSettings.baseUrl,
+    transport: runtimeSettings.openaiResponsesTransport,
+    nativeResponses: runtimeSettings.nativeResponses
+  });
+  const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities);
   const webSocketMode = isOpenAIResponsesWebSocketMode(runtimeSettings);
   const result = await dryRun.call(provider, toUnifiedRequest(
     preparedRequest,
-    runtimeSettings.generationConfig,
-    runtimeSettings.provider
+    effectiveRequestGenerationConfig(request, runtimeSettings),
+    runtimeSettings.provider,
+    nativeCapabilities
   ), {
     inputFormat: 'unified',
     outputFormat: 'unified',
@@ -1218,7 +1559,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   });
 
   if (webSocketMode) {
-    const displayResult = openAIResponsesWebSocketDryRunResult(result, dryRunOptions.includeApiKey === true);
+    const displayResult = openAIResponsesWebSocketDryRunResult(result, dryRunOptions.includeApiKey === true, runtimeSettings.model);
     return formatUnifiedDryRunResult(displayResult, runtimeSettings, unified, dryRunOptions, apiKeyAvailable, displayResult.maskedCurl);
   }
   return formatUnifiedDryRunResult(result, runtimeSettings, unified, dryRunOptions, apiKeyAvailable);
@@ -3904,9 +4245,10 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
   const headers = normalizeHeaders(settings?.headers);
   const generationConfig = settings?.generationConfig;
   const requestBody = settings?.requestBody;
+  const nativeResponses = normalizeOpenAIResponsesNativeSettings(settings?.nativeResponses);
   const contextWindowTokens = normalizeContextWindowTokens(settings?.contextWindowTokens);
   const retryMaxAttempts = normalizeRetryMaxAttempts(settings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
-  return {
+  return adaptAstraNativeParameterSettings({
     id: settings?.id?.trim() || 'llm-provider-config-default',
     name: settings?.name?.trim() || '默认渠道',
     provider: normalizeProvider(settings?.provider),
@@ -3926,10 +4268,95 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {}),
     ...(nonEmptyRecord(requestBody) ? { requestBody } : {}),
     promptCache: normalizePromptCache(settings?.promptCache, normalizeProvider(settings?.provider)),
+    ...(nativeResponses ? { nativeResponses } : {}),
     modelConfigs: settings?.modelConfigs ?? [],
     createdAt: settings?.createdAt ?? 0,
     updatedAt: settings?.updatedAt ?? 0
-  };
+  });
+}
+
+/** Astra 模型不支持的请求参数；reasoning none/minimal 也不受支持。 */
+const ASTRA_UNSUPPORTED_REQUEST_BODY_KEYS: Record<string, true> = {
+  temperature: true,
+  top_p: true,
+  top_logprobs: true,
+  logprobs: true
+};
+const ASTRA_UNSUPPORTED_INCLUDE_VALUES: Record<string, true> = {
+  'message.output_text.logprobs': true
+};
+
+/**
+ * Astra 参数适配：精确 Astra 模型 + openai-responses 时，剔除不支持的 temperature/top_p/
+ * top_logprobs/logprobs，把 reasoning none/minimal 提升为 low。其他模型/渠道原样返回（同一引用）。
+ * 适配在设置解析时完成，冻结快照/恢复因此总是携带有效值。幂等。
+ */
+function adaptAstraNativeParameterSettings(settings: LlmProviderConfigRecord): LlmProviderConfigRecord {
+  if (settings.provider !== 'openai-responses' || !isAstraModel(settings.model)) return settings;
+  const generationConfig = adaptAstraGenerationConfig(settings.generationConfig);
+  const requestBody = adaptAstraRequestBody(settings.requestBody);
+  if (generationConfig === settings.generationConfig && requestBody === settings.requestBody) return settings;
+  const next = { ...settings };
+  if (generationConfig !== settings.generationConfig) {
+    if (generationConfig && nonEmptyRecord(generationConfig)) next.generationConfig = generationConfig;
+    else delete next.generationConfig;
+  }
+  if (requestBody !== settings.requestBody) {
+    if (requestBody && nonEmptyRecord(requestBody)) next.requestBody = requestBody;
+    else delete next.requestBody;
+  }
+  return next;
+}
+
+function adaptAstraGenerationConfig(
+  generationConfig: LlmGenerationConfigRecord | undefined
+): LlmGenerationConfigRecord | undefined {
+  if (!generationConfig) return generationConfig;
+  const thinkingLevel = generationConfig.thinkingConfig?.thinkingLevel;
+  const adaptedLevel: LlmThinkingLevel | undefined = thinkingLevel === 'none' || thinkingLevel === 'minimal' ? 'low' : thinkingLevel;
+  const changed = generationConfig.temperature !== undefined
+    || generationConfig.topP !== undefined
+    || adaptedLevel !== thinkingLevel;
+  if (!changed) return generationConfig;
+  const next: LlmGenerationConfigRecord = { ...generationConfig };
+  delete next.temperature;
+  delete next.topP;
+  if (adaptedLevel !== thinkingLevel && generationConfig.thinkingConfig) {
+    next.thinkingConfig = { ...generationConfig.thinkingConfig, thinkingLevel: adaptedLevel };
+  }
+  return next;
+}
+
+/**
+ * 单次请求实际使用的 generationConfig：冻结调用快照携带时以快照为准（冻结 recipe 的
+ * base reasoning 等），否则用解析出的渠道/模型配置。Astra 目标上快照值同样过一遍参数适配。
+ */
+function effectiveRequestGenerationConfig(
+  request: LlmStartRequest,
+  settings: LlmProviderConfigRecord
+): LlmGenerationConfigRecord | undefined {
+  const frozen = request.settingsSnapshot?.generationConfig;
+  if (!frozen) return settings.generationConfig;
+  return settings.provider === 'openai-responses' && isAstraModel(settings.model)
+    ? adaptAstraGenerationConfig(frozen)
+    : frozen;
+}
+
+function adaptAstraRequestBody(requestBody: LlmRequestBodyRecord | undefined): LlmRequestBodyRecord | undefined {
+  if (!requestBody) return requestBody;
+  const entries = Object.entries(requestBody).filter(([key]) => !ASTRA_UNSUPPORTED_REQUEST_BODY_KEYS[key]);
+  const include = requestBody.include;
+  const adaptedInclude = Array.isArray(include)
+    ? include.filter((value) => !(typeof value === 'string' && ASTRA_UNSUPPORTED_INCLUDE_VALUES[value]))
+    : undefined;
+  const includeChanged = Array.isArray(include) && adaptedInclude !== undefined && adaptedInclude.length !== include.length;
+  if (entries.length === Object.keys(requestBody).length && !includeChanged) return requestBody;
+  const next = Object.fromEntries(entries) as LlmRequestBodyRecord;
+  if (adaptedInclude !== undefined) {
+    if (adaptedInclude.length > 0) next.include = adaptedInclude;
+    else delete next.include;
+  }
+  return next;
 }
 
 async function resolveRuntimeSettings(
@@ -3963,6 +4390,7 @@ function snapshotFromSettings(settings: LlmProviderConfigRecord, compressionConf
     ...(settings.generationConfig ? { generationConfig: settings.generationConfig } : {}),
     ...(settings.requestBody ? { requestBody: settings.requestBody } : {}),
     ...(settings.promptCache ? { promptCache: settings.promptCache } : {}),
+    ...(settings.nativeResponses ? { nativeResponses: settings.nativeResponses } : {}),
     ...(compressionConfig?.id ? { compressionConfigId: compressionConfig.id } : {}),
     ...(compressionConfig?.kind ? { compressionMethodKind: compressionConfig.kind } : {}),
     ...(compressionConfig?.trigger ? { compressionTrigger: compressionConfig.trigger } : {}),
@@ -4100,9 +4528,9 @@ function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, 
   };
 }
 
-function openAIResponsesWebSocketDryRunResult(result: UnifiedDryRunResult, includeApiKey: boolean): UnifiedDryRunResult & { maskedCurl: string } {
+function openAIResponsesWebSocketDryRunResult(result: UnifiedDryRunResult, includeApiKey: boolean, model?: string): UnifiedDryRunResult & { maskedCurl: string } {
   const url = toWebSocketUrl(result.url);
-  const body = openAIResponsesWebSocketDryRunPayload(result.body);
+  const body = openAIResponsesWebSocketDryRunPayload(result.body, isAstraModel(model));
   const headers = result.headers;
   return {
     ...result,
@@ -4115,22 +4543,23 @@ function openAIResponsesWebSocketDryRunResult(result: UnifiedDryRunResult, inclu
   };
 }
 
-function openAIResponsesWebSocketDryRunPayload(body: unknown): Record<string, unknown> {
-  const record = isRecord(body) ? stripOpenAIResponsesWebSocketUnsupportedFields(body) as Record<string, unknown> : {};
+function openAIResponsesWebSocketDryRunPayload(body: unknown, preserveNativeCache = false): Record<string, unknown> {
+  const record = isRecord(body) ? stripOpenAIResponsesWebSocketUnsupportedFields(body, preserveNativeCache) as Record<string, unknown> : {};
   delete record.type;
   delete record.stream;
   delete record.background;
   delete record.previous_response_id;
-  delete record.prompt_cache_options;
+  // Astra WS 必须保留显式缓存选项与断点；其他模型保持原有剥离行为。
+  if (!preserveNativeCache) delete record.prompt_cache_options;
   return { type: 'response.create', ...record, store: false };
 }
 
-function stripOpenAIResponsesWebSocketUnsupportedFields(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripOpenAIResponsesWebSocketUnsupportedFields);
+function stripOpenAIResponsesWebSocketUnsupportedFields(value: unknown, preserveNativeCache = false): unknown {
+  if (Array.isArray(value)) return value.map((entry) => stripOpenAIResponsesWebSocketUnsupportedFields(entry, preserveNativeCache));
   if (!isRecord(value)) return value;
   return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => key !== 'prompt_cache_breakpoint')
-    .map(([key, nested]) => [key, stripOpenAIResponsesWebSocketUnsupportedFields(nested)]));
+    .filter(([key]) => preserveNativeCache || key !== 'prompt_cache_breakpoint')
+    .map(([key, nested]) => [key, stripOpenAIResponsesWebSocketUnsupportedFields(nested, preserveNativeCache)]));
 }
 
 function formatWebSocketDryRun(url: string, headers: Record<string, string>, body: unknown): string {
@@ -4244,7 +4673,11 @@ interface TrackedFunctionCall {
   closed: boolean;
 }
 
-async function prepareLlmStartRequestMultimodal(request: LlmStartRequest, options: LlmProviderOptions): Promise<LlmStartRequest> {
+async function prepareLlmStartRequestMultimodal(
+  request: LlmStartRequest,
+  options: LlmProviderOptions,
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities
+): Promise<LlmStartRequest> {
   const preparation = createMultimodalPreparationContext();
   const [contents, systemInstruction] = await Promise.all([
     Promise.all(request.contents.map((content) =>
@@ -4253,12 +4686,26 @@ async function prepareLlmStartRequestMultimodal(request: LlmStartRequest, option
       ? prepareLlmContentMultimodal(request.systemInstruction, options, false, 'ordinary', preparation)
       : Promise.resolve(undefined)
   ]);
-  const normalized = assertCanonicalProviderToolContext(contents);
+  const normalized = assertCanonicalProviderToolContext(contents, nativeAsyncAdmission(request, nativeCapabilities));
   return {
     ...request,
     contents: normalized,
     ...(systemInstruction ? { systemInstruction } : {})
   };
+}
+
+/**
+ * 当前请求允许保持 pending 的原生异步调用集合。例外同时要求：
+ * 目标 capability.asyncTools 为真（当前 target 才有异步编码资格）、调用 part 携带 async 标记
+ * （历史证据）且 call ID 在 Kernel/Tools 持久化准入名单内（权威证明）。
+ */
+function nativeAsyncAdmission(
+  request: LlmStartRequest,
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities
+): { admittedCallIds: ReadonlySet<string> } | undefined {
+  if (nativeCapabilities?.asyncTools !== true) return undefined;
+  const admittedCallIds = new Set((request.nativeAsyncAdmittedCallIds ?? []).map((id) => id.trim()).filter(Boolean));
+  return admittedCallIds.size > 0 ? { admittedCallIds } : undefined;
 }
 
 export async function prepareNativeCompactContentsMultimodal(
@@ -4270,8 +4717,11 @@ export async function prepareNativeCompactContentsMultimodal(
     prepareLlmContentMultimodal(content, options, false, 'native_compact', preparation)));
 }
 
-function assertCanonicalProviderToolContext(contents: MessageContent[]): MessageContent[] {
-  const normalized = normalizeToolCallResponseContext(contents);
+function assertCanonicalProviderToolContext(
+  contents: MessageContent[],
+  nativeAsync?: { admittedCallIds: ReadonlySet<string> }
+): MessageContent[] {
+  const normalized = normalizeToolCallResponseContext(contents, nativeAsync);
   if (normalized.orphanResponseCount > 0 || normalized.fallbackResponseCount > 0) {
     throw new Error(
       `Provider boundary rejected non-canonical tool context: ${normalized.orphanResponseCount} orphan response(s), ${normalized.fallbackResponseCount} unresolved call(s).`
@@ -4280,7 +4730,10 @@ function assertCanonicalProviderToolContext(contents: MessageContent[]): Message
   return contents;
 }
 
-function normalizeToolCallResponseContext(contents: MessageContent[]): ToolCallContextNormalizationResult {
+function normalizeToolCallResponseContext(
+  contents: MessageContent[],
+  nativeAsync?: { admittedCallIds: ReadonlySet<string> }
+): ToolCallContextNormalizationResult {
   const pendingById = new Map<string, TrackedFunctionCall>();
   const pendingByName = new Map<string, TrackedFunctionCall[]>();
   const calls: TrackedFunctionCall[] = [];
@@ -4318,6 +4771,11 @@ function normalizeToolCallResponseContext(contents: MessageContent[]): ToolCallC
   const fallbackResponsesByContentIndex = new Map<number, FunctionResponsePart[]>();
   for (const call of calls) {
     if (call.closed) continue;
+    // 持久化准入的原生异步调用可以合法保持 pending；普通未决调用仍然走兜底并失败。
+    if (nativeAsync && call.part.async === true) {
+      const callId = normalizeToolCallId(call.part.id);
+      if (callId && nativeAsync.admittedCallIds.has(callId)) continue;
+    }
     const list = fallbackResponsesByContentIndex.get(call.contentIndex) ?? [];
     list.push(fallbackFunctionResponsePart(call.part));
     fallbackResponsesByContentIndex.set(call.contentIndex, list);
@@ -4454,7 +4912,7 @@ async function prepareLlmPartMultimodal(
 
 async function prepareInlineDataForLlm(
   part: InlineDataPart,
-  options: LlmProviderOptions,
+  options: Pick<LlmProviderOptions, 'resolveAttachment'>,
   toolResponse: boolean,
   mode: MultimodalPreparationMode,
   preparation: MultimodalPreparationContext
@@ -4503,7 +4961,7 @@ class AttachmentResolutionMetadataConflictError extends Error {
 
 async function resolveAttachmentOnce(
   part: InlineDataPart,
-  options: LlmProviderOptions,
+  options: Pick<LlmProviderOptions, 'resolveAttachment'>,
   preparation: MultimodalPreparationContext
 ): Promise<InlineDataPart | undefined> {
   if (!options.resolveAttachment) return undefined;
@@ -4599,22 +5057,156 @@ function attachmentPlaceholderPart(part: InlineDataPart, reason: string): Conten
   };
 }
 
+type NativeAttachmentResolverOptions = Pick<LlmProviderOptions, 'resolveAttachment'>;
+
+/**
+ * 原生控制器包装：steer/submitToolResults 先经过既有授权附件解析（与请求多模态准备同一
+ * fenced root / 会话身份），再把线级形状交给 Transport/会话的原始控制器。准入收据原样回传。
+ * 解析失败必须让提交直接失败——绝不静默降级、绝不把媒体 JSON 化成文本。
+ */
+function wrapOpenAIResponsesNativeController(
+  controller: OpenAIResponsesNativeController,
+  options: LlmProviderOptions
+): OpenAIResponsesNativeController {
+  return {
+    get responseId() { return controller.responseId; },
+    get connectionGeneration() { return controller.connectionGeneration; },
+    get streamId() { return controller.streamId; },
+    async steer(command) {
+      const input = await Promise.all(command.input.map((content) => resolveNativeSteeringContent(content, options)));
+      await controller.steer({ ...command, input });
+    },
+    async submitToolResults(outputs) {
+      const resolved = await resolveOpenAIResponsesNativeToolOutputs(outputs, options);
+      return controller.submitToolResults(resolved);
+    },
+    endLogicalRequest() {
+      controller.endLogicalRequest();
+    }
+  };
+}
+
+async function resolveNativeSteeringContent(
+  content: MessageContent,
+  options: NativeAttachmentResolverOptions
+): Promise<MessageContent> {
+  const preparation = createMultimodalPreparationContext();
+  const parts = await Promise.all(content.parts.map(async (part) => {
+    if (!isInlineDataPart(part) || part.inlineData.data) return part;
+    const resolved = await resolveAttachmentOnce(part, options, preparation);
+    if (!resolved?.inlineData.data) {
+      throw new Error(`Native steering attachment ${mediaReferenceLabel(part)} could not be resolved under the current fenced root.`);
+    }
+    return resolved;
+  }));
+  return { ...content, parts };
+}
+
+/**
+ * 把内核交付的原生工具输出解析为线级形状。function_call_output.output 的媒体块可以携带
+ * 托管引用（attachmentId/sourcePath/sha256 + mimeType），在此解析成 data URL；input_text 与
+ * 已就绪的 data URL 块原样透传。Adapter 的 materializeNativeToolOutput 与控制器包装共用本函数。
+ */
+export async function resolveOpenAIResponsesNativeToolOutputs(
+  outputs: readonly OpenAIResponsesToolOutput[],
+  options: NativeAttachmentResolverOptions
+): Promise<OpenAIResponsesToolOutput[]> {
+  const preparation = createMultimodalPreparationContext();
+  return Promise.all(outputs.map(async (output) => {
+    if (!Array.isArray(output.output)) return output;
+    return { ...output, output: await resolveNativeOutputBlocks(output.output, options, preparation) };
+  }));
+}
+
+async function resolveNativeOutputBlocks(
+  blocks: Array<Record<string, unknown>>,
+  options: NativeAttachmentResolverOptions,
+  preparation: MultimodalPreparationContext
+): Promise<Array<Record<string, unknown>>> {
+  return Promise.all(blocks.map(async (block) => {
+    if ('inlineData' in block) {
+      throw new TypeError('Native tool output blocks must be Responses content blocks, not raw InlineDataPart values.');
+    }
+    const managed = nativeManagedBlockReference(block);
+    if (!managed) return block;
+    const resolved = await resolveAttachmentOnce(managed, options, preparation);
+    if (!resolved?.inlineData.data) {
+      throw new Error(`Native tool output attachment ${mediaReferenceLabel(managed)} could not be resolved under the current fenced root.`);
+    }
+    const dataUrl = `data:${resolved.inlineData.mimeType || 'application/octet-stream'};base64,${resolved.inlineData.data}`;
+    const name = typeof block.name === 'string' && block.name ? block.name : resolved.inlineData.name;
+    return block.type === 'input_image'
+      ? { type: 'input_image', image_url: dataUrl, ...(name ? { name } : {}) }
+      : { type: 'input_file', file_data: dataUrl, ...(name ? { filename: name } : {}) };
+  }));
+}
+
+/** 识别携带托管引用的媒体块；已含线级 data URL 或非媒体块返回 undefined。 */
+function nativeManagedBlockReference(block: Record<string, unknown>): InlineDataPart | undefined {
+  if (block.type !== 'input_image' && block.type !== 'input_file') return undefined;
+  if (typeof block.image_url === 'string' || typeof block.file_data === 'string') return undefined;
+  const attachmentId = typeof block.attachmentId === 'string' && block.attachmentId.trim() ? block.attachmentId : undefined;
+  const sourcePath = typeof block.sourcePath === 'string' && block.sourcePath.trim() ? block.sourcePath : undefined;
+  const sha256 = typeof block.sha256 === 'string' && block.sha256.trim() ? block.sha256 : undefined;
+  if (!attachmentId && !sourcePath && !sha256) return undefined;
+  const mimeType = typeof block.mimeType === 'string' ? block.mimeType : '';
+  const name = typeof block.name === 'string' && block.name ? block.name : undefined;
+  return {
+    inlineData: {
+      mimeType,
+      ...(name ? { name } : {}),
+      ...(attachmentId ? { attachmentId } : {}),
+      ...(sourcePath ? { sourcePath } : {}),
+      ...(sha256 ? { sha256 } : {})
+    }
+  };
+}
+
+function isNativeConfigurationUpdatePart(part: ContentPart): boolean {
+  if (!isProviderContextPart(part)) return false;
+  if (part.providerContext.itemType === 'configuration_update') return true;
+  const rawItem = part.providerContext.rawItem;
+  return isRecord(rawItem) && rawItem.type === 'configuration_update';
+}
+
+/**
+ * 服务端 compaction 与 reasoning configuration_update 是官方不支持组合：历史携带
+ * configuration_update 时，从有效请求体中剥掉 context_management 与 truncation:'auto'。
+ * LimCode 本地压缩仍是唯一压缩权威；无 configuration_update 时原样返回（同一引用）。
+ */
+function withoutNativeServerSideCompaction(
+  requestBody: LlmRequestBodyRecord | undefined,
+  contents: readonly MessageContent[]
+): LlmRequestBodyRecord | undefined {
+  if (!requestBody) return requestBody;
+  if (!contents.some((content) => content.parts.some(isNativeConfigurationUpdatePart))) return requestBody;
+  const stripContextManagement = 'context_management' in requestBody;
+  const stripTruncation = requestBody.truncation === 'auto';
+  if (!stripContextManagement && !stripTruncation) return requestBody;
+  const next = { ...requestBody };
+  if (stripContextManagement) delete next.context_management;
+  if (stripTruncation) delete next.truncation;
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
 export function toUnifiedRequest(
   request: LlmStartRequest,
   generationConfig?: LlmGenerationConfigRecord,
-  providerKind?: LlmProviderKind
+  providerKind?: LlmProviderKind,
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities
 ): UnifiedLLMRequest {
+  const nativeAsync = nativeCapabilities?.asyncTools === true;
   const contents = providerKind === 'gemini'
     ? mergeGeminiFunctionResponseTurns(request.contents)
     : providerKind === 'claude'
       ? projectClaudeThoughtReplay(request.contents)
       : request.contents;
   return {
-    contents: contents.flatMap((content) => toUnifiedContents(content, providerKind)),
-    ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map(toUnifiedPart) } } : {}),
+    contents: contents.flatMap((content) => toUnifiedContents(content, providerKind, nativeAsync)),
+    ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map((part) => toUnifiedPart(part, false)) } } : {}),
     ...(request.tools.length === 0 ? {} : {
       tools: [{
-        functionDeclarations: request.tools.map(toUnifiedFunctionDeclaration)
+        functionDeclarations: request.tools.map((tool) => toUnifiedFunctionDeclaration(tool, nativeAsync))
       }]
     }),
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {})
@@ -4683,11 +5275,12 @@ function mergeGeminiFunctionResponseTurns(contents: readonly MessageContent[]): 
 
 function toUnifiedContents(
   content: MessageContent,
-  providerKind?: LlmProviderKind
+  providerKind?: LlmProviderKind,
+  nativeAsync = false
 ): UnifiedContent[] {
   if (providerKind !== 'openai-responses' || content.role !== 'model'
     || (content as MessageContent & { providerContext?: unknown }).providerContext) {
-    return [toUnifiedContent(content)];
+    return [toUnifiedContent(content, nativeAsync)];
   }
 
   const groups: ContentPart[][] = [];
@@ -4722,20 +5315,20 @@ function toUnifiedContents(
         }
       } as UnifiedContent;
     }
-    return toUnifiedContent({ role: content.role, parts });
+    return toUnifiedContent({ role: content.role, parts }, nativeAsync);
   });
 }
 
-function toUnifiedContent(content: MessageContent): UnifiedContent {
+function toUnifiedContent(content: MessageContent, nativeAsync = false): UnifiedContent {
   const providerContext = (content as MessageContent & { providerContext?: unknown }).providerContext;
   return {
     role: content.role === 'model' ? 'model' : 'user',
-    parts: content.parts.map(toUnifiedPart),
+    parts: content.parts.map((part) => toUnifiedPart(part, nativeAsync)),
     ...(providerContext ? { providerContext } : {})
   } as UnifiedContent;
 }
 
-function toUnifiedPart(part: ContentPart): UnifiedPart {
+function toUnifiedPart(part: ContentPart, nativeAsync = false): UnifiedPart {
   if (isTextPart(part)) {
     const thoughtSignatures = thoughtSignaturesFromPortableSignature(part.thoughtSignature);
     return {
@@ -4749,7 +5342,13 @@ function toUnifiedPart(part: ContentPart): UnifiedPart {
   if (isFunctionCallPart(part)) {
     const thoughtSignatures = thoughtSignaturesFromPortableSignature(part.thoughtSignature);
     return {
-      functionCall: { name: part.functionCall.name, args: asRecord(part.functionCall.args), ...(part.id ? { callId: part.id } : {}) },
+      functionCall: {
+        name: part.functionCall.name,
+        args: asRecord(part.functionCall.args),
+        ...(part.id ? { callId: part.id } : {}),
+        // 已声明/接收的原生异步标记：仅当前目标 capability.asyncTools 为真时编码上线。
+        ...(nativeAsync && part.async === true ? { async: true } : {})
+      },
       // Gemini 会校验带工具调用的 thoughtSignature；作为 part 同层级字段透传给 provider。
       ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
       ...(thoughtSignatures ? { thoughtSignatures } : {})
@@ -4786,15 +5385,17 @@ function toUnifiedPart(part: ContentPart): UnifiedPart {
   return assertNever(part);
 }
 
-function toUnifiedFunctionDeclaration(tool: ToolSchema): UnifiedFunctionDeclaration {
+function toUnifiedFunctionDeclaration(tool: ToolSchema, nativeAsync = false): UnifiedFunctionDeclaration {
   const parameters = isFunctionParameters(tool.parameters)
     ? providerCompatibleFunctionParameters(tool.name, tool.parameters)
     : { type: 'object' as const, properties: {} };
   return {
     name: tool.name,
     description: tool.description,
-    parameters
-  };
+    parameters,
+    // Astra 原生异步声明：仅 per-tool nativeAsync 且当前 capability.asyncTools 时编码。
+    ...(nativeAsync && tool.async === true ? { async: true } : {})
+  } as UnifiedFunctionDeclaration;
 }
 
 function providerCompatibleFunctionParameters(
@@ -5228,10 +5829,13 @@ function sanitizeGeminiFunctionSchema(value: unknown): unknown {
   return result;
 }
 
-function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
+function fromUnifiedCompletedContent(
+  content: UnifiedContent,
+  nativeChain?: OpenAIResponsesNativeChainContext
+): MessageContent {
   const parts: ContentPart[] = [];
   for (const part of content.parts ?? []) {
-    const outputItem = modelOutputItemFromValue(part);
+    const outputItem = stampNativeResponse(modelOutputItemFromValue(part), nativeChain);
     if (isUnifiedThoughtTextPart(part)) {
       const signature = thoughtSignatureFromPart(part);
       parts.push({
@@ -5248,6 +5852,7 @@ function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
     }
     if (isUnifiedFunctionCallPart(part)) {
       const signature = thoughtSignatureFromPart(part);
+      const receivedAsync = 'async' in part.functionCall && part.functionCall.async === true;
       parts.push({
         ...(part.functionCall.callId ? { id: part.functionCall.callId } : {}),
         functionCall: {
@@ -5255,6 +5860,8 @@ function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
           args: part.functionCall.args ?? {}
         },
         ...(signature ? { thoughtSignature: signature } : {}),
+        // 接收到的原生异步标记是历史事实，与当前 capability 无关，始终无损保留。
+        ...(receivedAsync ? { async: true } : {}),
         ...(outputItem ? { outputItem } : {})
       });
     }
@@ -5262,8 +5869,13 @@ function fromUnifiedCompletedContent(content: UnifiedContent): MessageContent {
   return { role: 'model', parts };
 }
 
-export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk, emit: Emit): void {
-  const outputItem = modelOutputItemFromValue(chunk);
+export function emitUnifiedChunk(
+  requestId: string,
+  chunk: UnifiedLLMStreamChunk,
+  emit: Emit,
+  nativeChain?: OpenAIResponsesNativeChainContext
+): void {
+  const outputItem = stampNativeResponse(modelOutputItemFromValue(chunk), nativeChain);
   const text = chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
   if (text) emit({
     type: LlmEventType.Delta,
@@ -5293,15 +5905,17 @@ export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk
     ...(chunk.partsDelta ?? []).filter(isUnifiedFunctionCallPart)
   ];
   const stableCallIndexes = new Map<string, number>();
-  const calls: Array<{ id: string; name: string; argsJson: string; thoughtSignature?: string }> = [];
+  const calls: Array<{ id: string; name: string; argsJson: string; thoughtSignature?: string; async?: boolean }> = [];
   callParts.forEach((part, index) => {
     const stableCallId = part.functionCall.callId;
     const thoughtSignature = thoughtSignatureFromPart(part);
+    const receivedAsync = 'async' in part.functionCall && part.functionCall.async === true;
     const candidate = {
       id: stableCallId ?? `tool_call_${index}`,
       name: part.functionCall.name,
       argsJson: stringifyJson(part.functionCall.args ?? {}),
-      ...(thoughtSignature ? { thoughtSignature } : {})
+      ...(thoughtSignature ? { thoughtSignature } : {}),
+      ...(receivedAsync ? { async: true } : {})
     };
     const existingIndex = stableCallId ? stableCallIndexes.get(stableCallId) : undefined;
     if (existingIndex === undefined) {
@@ -5317,7 +5931,8 @@ export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk
       argsJson: candidate.argsJson.length > existing.argsJson.length ? candidate.argsJson : existing.argsJson,
       ...(existing.thoughtSignature || candidate.thoughtSignature
         ? { thoughtSignature: existing.thoughtSignature ?? candidate.thoughtSignature }
-        : {})
+        : {}),
+      ...(existing.async === true || candidate.async === true ? { async: true } : {})
     };
   });
 
@@ -5333,7 +5948,7 @@ export function emitUnifiedChunk(requestId: string, chunk: UnifiedLLMStreamChunk
     } });
   }
 
-  const outputItemDone = modelOutputItemDoneFromChunk(chunk);
+  const outputItemDone = stampNativeResponse(modelOutputItemDoneFromChunk(chunk), nativeChain);
   if (outputItemDone) {
     emit({
       type: LlmEventType.OutputItemDone,
@@ -5417,6 +6032,45 @@ function mergeUsageMetadata(
   return { ...previous, ...next };
 }
 
+/** 原生链上当前正在解码的物理 response；output item 元数据按它标记归属边界。 */
+interface OpenAIResponsesNativeChainContext {
+  current?: { responseId: string; previousResponseId?: string };
+}
+
+/** 跨 response 聚合计费 token：链上每个物理 response 的输入/输出都是真实计费量。 */
+function sumUsageMetadata(
+  previous: LlmUsageMetadataRecord | undefined,
+  next: LlmUsageMetadataRecord
+): LlmUsageMetadataRecord {
+  if (!previous) return next;
+  const summed: LlmUsageMetadataRecord = { ...previous };
+  for (const [key, value] of Object.entries(next)) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      (summed as Record<string, unknown>)[key] = value;
+      continue;
+    }
+    const base = (previous as Record<string, unknown>)[key];
+    (summed as Record<string, unknown>)[key] = (typeof base === 'number' && Number.isFinite(base) ? base : 0) + value;
+  }
+  return summed;
+}
+
+/** 给 output item 元数据标记原生 response 边界；非原生路径原样返回（同一引用）。 */
+function stampNativeResponse(
+  outputItem: ModelOutputItemReference | undefined,
+  nativeChain?: OpenAIResponsesNativeChainContext
+): ModelOutputItemReference | undefined {
+  const current = nativeChain?.current;
+  if (!outputItem || !current) return outputItem;
+  if (outputItem.providerResponseId === current.responseId
+    && outputItem.previousResponseId === current.previousResponseId) return outputItem;
+  return {
+    ...outputItem,
+    providerResponseId: current.responseId,
+    ...(current.previousResponseId ? { previousResponseId: current.previousResponseId } : {})
+  };
+}
+
 function stripUndefined(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripUndefined);
   if (!isRecord(value)) return value;
@@ -5438,10 +6092,18 @@ function modelOutputItemFromValue(value: unknown): ModelOutputItemReference | un
   const phase = source.phase === 'commentary' || source.phase === 'final_answer'
     ? source.phase
     : undefined;
+  const providerResponseId = typeof source.providerResponseId === 'string' && source.providerResponseId.trim()
+    ? source.providerResponseId
+    : undefined;
+  const previousResponseId = typeof source.previousResponseId === 'string' && source.previousResponseId.trim()
+    ? source.previousResponseId
+    : undefined;
   return {
     id: source.id,
     ordinal: source.ordinal,
-    ...(phase ? { phase } : {})
+    ...(phase ? { phase } : {}),
+    ...(providerResponseId ? { providerResponseId } : {}),
+    ...(previousResponseId ? { previousResponseId } : {})
   };
 }
 
@@ -5457,7 +6119,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function hasStreamTimingChunk(chunk: UnifiedLLMStreamChunk): boolean {
   return hasStreamOutput(chunk)
     || hasThoughtOutput(chunk)
-    || ((chunk as LimCodeOpenAIResponsesStreamChunk).toolCallArgumentDeltas?.length ?? 0) > 0;
+    || ((chunk as LimCodeOpenAIResponsesStreamChunk).toolCallArgumentDeltas?.length ?? 0) > 0
+    || (chunk as LimCodeOpenAIResponsesStreamChunk).nativeEvent !== undefined;
 }
 
 function hasThoughtOutput(chunk: UnifiedLLMStreamChunk): boolean {
@@ -5481,9 +6144,9 @@ interface ActiveThoughtBlock {
   outputItem?: ModelOutputItemReference;
 }
 
-function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock | undefined, chunk: UnifiedLLMStreamChunk, at: number, emit: Emit): ActiveThoughtBlock | undefined {
+function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock | undefined, chunk: UnifiedLLMStreamChunk, at: number, emit: Emit, nativeChain?: OpenAIResponsesNativeChainContext): ActiveThoughtBlock | undefined {
   let block = current;
-  const outputItem = modelOutputItemFromValue(chunk);
+  const outputItem = stampNativeResponse(modelOutputItemFromValue(chunk), nativeChain);
   const chunkSignature = thoughtSignatureFromChunk(chunk);
   if (chunkSignature) {
     block ??= createActiveThoughtBlock(requestId, at, emit, outputItem);

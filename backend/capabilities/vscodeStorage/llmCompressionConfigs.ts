@@ -11,6 +11,7 @@ import {
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
   createDefaultLlmCompressionConfig,
+  normalizeLlmCompressionBodyTargetTokens,
   normalizeLlmCompressionMaxDurationMinutes
 } from '../../../shared/protocol';
 import { isSettingsRevisionConflictError } from '../settingsRevisionConflict';
@@ -135,6 +136,7 @@ export function normalizeLlmCompressionConfig(input: Partial<LlmCompressionConfi
     kind,
     trigger,
     maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(input?.maxDurationMinutes),
+    bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(input?.bodyTargetTokens),
     ...(normalizeOpenAICompact(input?.openaiResponsesCompact) ? { openaiResponsesCompact: normalizeOpenAICompact(input?.openaiResponsesCompact) } : {}),
     ...(llmSummary ? { llmSummary } : {}),
     createdAt,

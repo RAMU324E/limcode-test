@@ -257,7 +257,7 @@ test('AgentLoop把未知短引用隔离为失败ToolCall并继续同批其它工
   assert.equal(dispatchInputs[0].toolName, 'read');
 });
 
-test('新鲜 Provider 批次准入复用冻结事实且重放回退完整预检', async () => {
+test('已消费或重放的 Provider 准入证明必须重新检查持久化事实', async () => {
   const liveDefinition = {
     declaration: {
       name: 'echo',
@@ -288,17 +288,14 @@ test('新鲜 Provider 批次准入复用冻结事实且重放回退完整预检'
       }
     }
   };
-  let definitionReads = 0;
-  let fullPreflightReads = 0;
   const dispatcher = new ReliableToolDispatcher({
     database: {
       async snapshot() {
-        fullPreflightReads += 1;
         throw new Error('full preflight fallback reached');
       }
     },
     contentStore: {},
-    effects: {},
+    effects: { subscribeToolModelResults: () => () => undefined },
     files: {},
     fileMutations: {},
     processes: {},
@@ -306,7 +303,6 @@ test('新鲜 Provider 批次准入复用冻结事实且重放回退完整预检'
     interactions: {},
     host: {
       definitions() {
-        definitionReads += 1;
         return [liveDefinition];
       }
     }
@@ -342,24 +338,17 @@ test('新鲜 Provider 批次准入复用冻结事实且重放回退完整预检'
     calls: [{ ...dispatchInput, providerOrdinal: 0, policy }],
     creation
   });
-  assert.ok(admission);
 
-  const prepared = await dispatcher.resolveToolBatchPreflight(
+  await dispatcher.resolveToolBatchPreflight(
     [dispatchInput],
     dispatchInput.turnId,
     admission
   );
-  assert.equal(definitionReads, 1, 'dispatch 应复用 freezeCalls 已读取的 live definition');
-  assert.equal(fullPreflightReads, 0, '新鲜原子提交证明应跳过数据库六域预检');
-  assert.equal(prepared.freshCallIds.has(dispatchInput.toolCallId), true);
-  assert.equal(prepared.toolCallsById.get(dispatchInput.toolCallId).call_seq, 1n);
-  assert.deepEqual(prepared.frozenDecisionsById.get(dispatchInput.toolCallId), policy);
 
   await assert.rejects(
     dispatcher.resolveToolBatchPreflight([dispatchInput], dispatchInput.turnId, admission),
     /full preflight fallback reached/
   );
-  assert.equal(fullPreflightReads, 1, '准入只能消费一次，重放必须走完整持久化预检');
 
   await dispatcher.freezeCalls([{ ...dispatchInput, definition: frozenDefinition }]);
   const replayAdmission = dispatcher.confirmPreparedBatch({

@@ -68,7 +68,8 @@ agentSystem                → archive-reset（当前没有独立 AgentSystem au
 - `PendingTurnInput` 表达当前 Turn 的补充；
 - `Turn` 表达已经开始的一次执行生命周期；
 - `ExecutionLease` 是 Conversation 当前执行 ownership；
-- `AuthoritySnapshot` 冻结本 Turn 的有效配置；
+- `AuthoritySnapshot` 冻结本 Turn 的模型身份、执行权限与基础配置；
+- 新请求的压缩设置通过已有 `ModelRequest.settings_snapshot_object_id` 独立固定。保存配置不改写既有 Turn 或 ModelRequest；下一次尚未建立的请求读取对应模型的当前压缩配置，先行压缩与随后普通请求共用同一份设置；
 - `TurnTermination` 只表达终止事实；
 - `TurnExecutorLink` 保存历史 Agent executor 归属；
 - `CommandReceipt(source_kind, source_key)` 对 command/callback/internal/recovery 去重。

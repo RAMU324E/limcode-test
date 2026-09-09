@@ -92,6 +92,29 @@ export class OpenAIResponsesContinuationProjection {
     const terminalItems = this.terminalItems();
     if (!terminalItems) return undefined;
     if (!this.validateTerminalProjection(terminalItems)) return undefined;
+    return this.projectTerminalItems(terminalItems);
+  }
+
+  /**
+   * Terminalizes a response that ended `response.incomplete` (for example reason=steered) from
+   * done output items only. The server finished the current output item at the boundary; every
+   * item must be proven exactly like the completed path (message/reasoning/function-call
+   * provenance, signature preservation, contiguous output indexes). Any unproven item yields
+   * undefined — nothing is fabricated. Meaningless once response.completed arrived (use
+   * completedProjection); legacy callers are untouched.
+   */
+  public incompleteBoundaryProjection(): OpenAIResponsesCompletedProjection | undefined {
+    if (this.unsafeReason) return undefined;
+    if (this.completedOutput !== undefined) return undefined;
+    const terminalItems = this.doneOnlyTerminalItems();
+    if (!terminalItems) return undefined;
+    if (!this.validateTerminalProjection(terminalItems)) return undefined;
+    return this.projectTerminalItems(terminalItems);
+  }
+
+  private projectTerminalItems(
+    terminalItems: TerminalOutputItem[]
+  ): OpenAIResponsesCompletedProjection | undefined {
     if (terminalItems.length === 0) return { content: { role: 'model', parts: [] }, outputItems: [] };
 
     const parts: Part[] = [];
@@ -388,23 +411,7 @@ export class OpenAIResponsesContinuationProjection {
 
   private terminalItems(): TerminalOutputItem[] | undefined {
     if (this.completedOutput === undefined) return undefined;
-    if (this.completedOutput.length === 0) {
-      const sorted = [...this.doneItems].sort((left, right) => {
-        if (left.outputIndex === undefined || right.outputIndex === undefined) return 0;
-        return left.outputIndex - right.outputIndex;
-      });
-      if (sorted.some((entry) => entry.outputIndex === undefined)) return this.fail('done_output_index_missing');
-      for (let index = 0; index < sorted.length; index += 1) {
-        if (sorted[index].outputIndex !== index) return this.fail('done_output_index_gap');
-      }
-      return sorted.map((entry) => ({
-        item: cloneJson(entry.item),
-        outputIndex: entry.outputIndex!,
-        ...(entry.item.type === 'reasoning' && optionalString(entry.item.encrypted_content)
-          ? { trustedSignature: optionalString(entry.item.encrypted_content) }
-          : {})
-      }));
-    }
+    if (this.completedOutput.length === 0) return this.doneOnlyTerminalItems();
 
     const consumed = new Set<number>();
     const result: TerminalOutputItem[] = [];
@@ -428,6 +435,29 @@ export class OpenAIResponsesContinuationProjection {
     }
     if (consumed.size !== this.doneItems.length) return this.fail('completed_done_membership_conflict');
     return result;
+  }
+
+  /**
+   * Terminal items proven solely by output_item.done evidence (no response.completed output
+   * array): sorted, gap-free, and signature-preserving. Shared by the empty-output completed
+   * path and the steered-incomplete boundary projection.
+   */
+  private doneOnlyTerminalItems(): TerminalOutputItem[] | undefined {
+    const sorted = [...this.doneItems].sort((left, right) => {
+      if (left.outputIndex === undefined || right.outputIndex === undefined) return 0;
+      return left.outputIndex - right.outputIndex;
+    });
+    if (sorted.some((entry) => entry.outputIndex === undefined)) return this.fail('done_output_index_missing');
+    for (let index = 0; index < sorted.length; index += 1) {
+      if (sorted[index].outputIndex !== index) return this.fail('done_output_index_gap');
+    }
+    return sorted.map((entry) => ({
+      item: cloneJson(entry.item),
+      outputIndex: entry.outputIndex!,
+      ...(entry.item.type === 'reasoning' && optionalString(entry.item.encrypted_content)
+        ? { trustedSignature: optionalString(entry.item.encrypted_content) }
+        : {})
+    }));
   }
 
   private validateTerminalProjection(terminal: TerminalOutputItem[]): boolean {

@@ -4,6 +4,8 @@ import type {
   LlmUsageMetadataRecord,
   MessageContent,
   MessageRecord,
+  ModelOutputItemReference,
+  ModelOutputPartMetadata,
   RunTerminationRecord,
   ToolCallEventKind,
   ToolCallEventRecord,
@@ -13,6 +15,8 @@ import type {
   ToolSchedulingMode
 } from '@shared/protocol';
 import { reliableKernelDetailKey } from './reliableDetailKey.ts';
+import { modelRequestNativeCapabilities } from '../reliability/modelRequestStreamStats.ts';
+import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import type {
   ReliableKernelDetailState,
   ReliableKernelTransientState
@@ -27,6 +31,8 @@ export interface ReliableConversationProjectionInput {
   details: Record<string, ReliableKernelDetailState>;
   transientModelRequests?: Record<string, ReliableKernelTransientState>;
   lastCommitSeq?: string | null;
+  /** 当前对话已知的转向回执；驱动聚合消息在转向边界的精确拆分，缺失时保留完整内容。 */
+  steeringReceipts?: readonly NativeSteeringReceipt[];
 }
 
 export interface ReliableFileDiffProjection {
@@ -72,6 +78,8 @@ export interface ReliableConversationProjection {
   turnIdByMessageId: Record<string, string>;
   modelRequestIdByMessageId: Record<string, string>;
   messageRevisionIdByMessageId: Record<string, string>;
+  /** 转向边界拆分出的展示条目 → 来源聚合消息 id；用于预览/详请归属，不代表持久化身份。 */
+  splitSourceMessageIdByMessageId: Record<string, string>;
   terminationByMessageId: Record<string, RunTerminationRecord>;
   toolResultByCallId: Record<string, unknown>;
   toolOutcomeStatusByCallId: Record<string, ReliableToolOutcomeProjectionStatus>;
@@ -95,6 +103,8 @@ interface ParsedMessage {
   message: MessageRecord;
   turnId?: string;
   revisionReady: boolean;
+  /** 原生聚合消息在转向边界拆分后，后继 run 条目指向来源聚合消息。 */
+  splitFromMessageId?: string;
 }
 
 interface FunctionCallTarget {
@@ -212,6 +222,16 @@ export function projectReliableConversation(
     lastCommitSeq: input.lastCommitSeq ?? undefined
   });
   parsedMessages.sort(compareParsedMessages);
+  const splitSourceMessageIdByMessageId = splitAggregateMessagesAtSteeringBoundaries(
+    parsedMessages,
+    input.steeringReceipts ?? [],
+    modelRequestIdByMessageId
+  );
+  // 拆分条目继承来源消息的 Turn 归属；终止/运行展示按同一 Turn 解释，不虚构独立边界。
+  for (const [syntheticId, sourceId] of Object.entries(splitSourceMessageIdByMessageId)) {
+    const turnId = turnIdByMessageId[sourceId];
+    if (turnId) turnIdByMessageId[syntheticId] = turnId;
+  }
   const absoluteFloorByMessageId = projectAbsoluteMessageFloors(parsedMessages);
 
   const callsByTurn = groupBy(values(input.records.ToolCall), (record) => text(record.turn_id));
@@ -317,6 +337,7 @@ export function projectReliableConversation(
     turnIdByMessageId,
     modelRequestIdByMessageId,
     messageRevisionIdByMessageId,
+    splitSourceMessageIdByMessageId,
     terminationByMessageId,
     toolResultByCallId,
     toolOutcomeStatusByCallId,
@@ -493,23 +514,36 @@ function appendTransientMessages(input: {
     // only a fallback for the brief interval before that independent record arrives.
     if (!request && !transientCausalFrontierReached(transient, input.lastCommitSeq)) continue;
     if (!request && (durableLatestRequestSeqByTurn.get(transient.turnId) ?? 0n) >= requestSeq) continue;
-    if (!priorToolCallsSettled(transient, request, input.toolCallFacts)) continue;
+    // 原生异步链上，Provider/Kernel 已授权在异步调用未决时继续输出；
+    // 只有非原生路径保留「前序调用未终结则不显示新输出」的抑制。
+    const nativeAsyncContinuation = request !== undefined
+      && modelRequestNativeCapabilities(request)?.asyncTools === true;
+    if (!nativeAsyncContinuation && !priorToolCallsSettled(transient, request, input.toolCallFacts)) continue;
 
     const linkedMessageId = input.messageIdByModelRequestId.get(transient.modelRequestId);
     const durableTarget = linkedMessageId
       ? messages.find((entry) => entry.message.id === linkedMessageId)
       : undefined;
-    if (durableTarget?.revisionReady) continue;
 
     const content = transientMessageContent(transient);
     const hasVisibleContent = content.parts.length > 0;
+    // 原生流式会把每个完成 item 的不可变 Revision 提前推进为当前 Revision（durableTarget
+    // 在请求未终结时就 revisionReady）。此时瞬态仍持有在飞 item 的实时增量，必须继续合并；
+    // 非原生路径保持原有「Revision 就绪即丢弃瞬态」的行为不变。
+    const nativeEarlyRevision = durableTarget?.revisionReady === true
+      && (hasOutputItemIdentity(durableTarget.message.content) || hasOutputItemIdentity(content));
+    if (durableTarget?.revisionReady && (!nativeEarlyRevision || request?.status === 'terminal')) continue;
+
     const model = transient.modelId;
     const usageMetadata = transient.usageMetadata ?? usageMetadataFromRequest(request);
     const projectedStatus = transientProjectionStatus(transient, request);
     if (durableTarget) {
+      const mergedContent = nativeEarlyRevision
+        ? mergeTransientContentWithDurable(durableTarget.message.content, content)
+        : hasVisibleContent ? content : durableTarget.message.content;
       durableTarget.message = {
         ...durableTarget.message,
-        ...(hasVisibleContent ? { content } : {}),
+        content: mergedContent,
         status: projectedStatus,
         ...(model ? { model } : {}),
         ...(usageMetadata ? { usageMetadata } : {}),
@@ -670,6 +704,54 @@ function transientMessageContent(transient: ReliableKernelTransientState): Messa
   };
 }
 
+function partOutputItem(part: MessageContent['parts'][number]): ModelOutputItemReference | undefined {
+  return (part as ModelOutputPartMetadata).outputItem;
+}
+
+function hasOutputItemIdentity(content: MessageContent): boolean {
+  return content.parts.some((part) => text(partOutputItem(part)?.id) !== undefined);
+}
+
+/**
+ * 原生提前 Revision（当前指针=最新完成 item）与瞬态累计内容的合并。瞬态在同一个 Webview
+ * 会话内按时序累计了全部 item，是被覆盖部分的展示权威；durable 部分只在瞬态缺失时
+ * （重载/恢复间隙）按 outputItem.ordinal 插回正确时序位置，绝不按身份重复。
+ * 去重身份：providerCallId（functionCall part id）+ outputItem.id。
+ */
+function mergeTransientContentWithDurable(durable: MessageContent, transient: MessageContent): MessageContent {
+  if (transient.parts.length === 0) return durable;
+  if (durable.parts.length === 0) return transient;
+  const transientItemIds = new Set<string>();
+  const transientCallIds = new Set<string>();
+  for (const part of transient.parts) {
+    const itemId = text(partOutputItem(part)?.id);
+    if (itemId) transientItemIds.add(itemId);
+    if ('functionCall' in part) {
+      const callId = text(part.id);
+      if (callId) transientCallIds.add(callId);
+    }
+  }
+  const merged = [...transient.parts];
+  for (const part of durable.parts) {
+    const itemId = text(partOutputItem(part)?.id);
+    if (itemId && transientItemIds.has(itemId)) continue;
+    const callId = 'functionCall' in part ? text(part.id) : undefined;
+    if (callId && transientCallIds.has(callId)) continue;
+    // 无身份部分无法安全去重；瞬态累计已覆盖同时序内容，宁可不插回。
+    if (!itemId && !callId) continue;
+    const ordinal = partOutputItem(part)?.ordinal;
+    const insertAt = ordinal === undefined
+      ? -1
+      : merged.findIndex((candidate) => {
+          const candidateOrdinal = partOutputItem(candidate)?.ordinal;
+          return candidateOrdinal !== undefined && candidateOrdinal > ordinal;
+        });
+    if (insertAt >= 0) merged.splice(insertAt, 0, part);
+    else merged.push(part);
+  }
+  return { role: transient.role, parts: merged };
+}
+
 function transientCausalFrontierReached(
   transient: ReliableKernelTransientState,
   lastCommitSeq: string | undefined
@@ -766,6 +848,86 @@ function compareParsedMessages(left: ParsedMessage, right: ParsedMessage): numbe
     || left.message.id.localeCompare(right.message.id);
 }
 
+/**
+ * 原生聚合内容按 outputItem.providerResponseId 连续段分组。任何一个部分缺少 response
+ * 身份（非原生、占位、注入部件）都返回 undefined——只有完整标记的原生聚合链才拆分。
+ */
+function responseRunsByProviderResponseId(
+  content: MessageContent
+): Array<{ responseId: string; parts: MessageContent['parts'] }> | undefined {
+  const runs: Array<{ responseId: string; parts: MessageContent['parts'] }> = [];
+  for (const part of content.parts) {
+    const responseId = text(partOutputItem(part)?.providerResponseId);
+    if (!responseId) return undefined;
+    const last = runs[runs.length - 1];
+    if (last && last.responseId === responseId) last.parts.push(part);
+    else runs.push({ responseId, parts: [part] });
+  }
+  return runs.length >= 2 ? runs : undefined;
+}
+
+/**
+ * 原生聚合消息（一个 ModelRequest 一条 Message）横跨多个 response：初始响应 + 每次被接受
+ * 转向产生的自动后继。转向用户消息必须按真实时序渲染在初始输出与后继输出之间，所以把聚合
+ * 内容在转向边界拆开：第一段留在原消息位置，后继段作为拆分展示条目插入对应转向消息之后。
+ * 配对完全依据持久化转向回执（modelRequestId + successorResponseId + messageId）——
+ * 任何后继 response 缺少权威回执时保留完整聚合内容，绝不按顺序猜测配对。
+ * 拆分只影响展示：条目经 splitFromMessageId 回溯来源，持久化身份与 ToolCallSourceLink 不变。
+ */
+function splitAggregateMessagesAtSteeringBoundaries(
+  messages: ParsedMessage[],
+  steeringReceipts: readonly NativeSteeringReceipt[],
+  modelRequestIdByMessageId: Record<string, string>
+): Record<string, string> {
+  const splitSourceMessageIdByMessageId: Record<string, string> = {};
+  if (steeringReceipts.length === 0) return splitSourceMessageIdByMessageId;
+  const messagesById = new Map(messages.map((entry) => [entry.message.id, entry]));
+  for (const entry of [...messages].sort(compareParsedMessages)) {
+    if (entry.message.role !== 'model') continue;
+    const runs = responseRunsByProviderResponseId(entry.message.content);
+    if (!runs) continue;
+    const requestId = modelRequestIdByMessageId[entry.message.id];
+    if (!requestId) continue;
+    const steerMessageIdBySuccessorResponseId = new Map<string, string>();
+    for (const receipt of steeringReceipts) {
+      if (receipt.modelRequestId !== requestId) continue;
+      const successorResponseId = receipt.successorResponseId?.trim();
+      const messageId = receipt.messageId?.trim();
+      if (successorResponseId && messageId) steerMessageIdBySuccessorResponseId.set(successorResponseId, messageId);
+    }
+    const [firstRun, ...successorRuns] = runs;
+    const pairings = successorRuns.map((run) => steerMessageIdBySuccessorResponseId.get(run.responseId));
+    // 任一后继 response 缺少权威配对（回执尚未加载）→ 保留完整内容，等待精确状态。
+    if (pairings.some((messageId) => !messageId || !messagesById.has(messageId))) continue;
+    entry.message = {
+      ...entry.message,
+      content: { ...entry.message.content, parts: firstRun.parts }
+    };
+    successorRuns.forEach((run, index) => {
+      const steerMessageId = pairings[index]!;
+      const steer = messagesById.get(steerMessageId)!;
+      const syntheticId = `${entry.message.id}:steer-successor:${run.responseId}`;
+      // 拆分条目不复制定位/用量元数据：重试入口与 Token 展示只属于完整聚合消息。
+      const { retryTarget: _retryTarget, usageMetadata: _usageMetadata, ...messageBase } = entry.message;
+      splitSourceMessageIdByMessageId[syntheticId] = entry.message.id;
+      messages.push({
+        record: entry.record,
+        ...(entry.turnId ? { turnId: entry.turnId } : {}),
+        revisionReady: entry.revisionReady,
+        splitFromMessageId: entry.message.id,
+        message: {
+          ...messageBase,
+          id: syntheticId,
+          content: { ...entry.message.content, parts: run.parts },
+          seq: steer.message.seq + 0.25
+        }
+      });
+    });
+  }
+  messages.sort(compareParsedMessages);
+  return splitSourceMessageIdByMessageId;
+}
+
 function functionCallTargets(messages: ParsedMessage[]): FunctionCallTarget[] {
   const targets: FunctionCallTarget[] = [];
   for (const entry of [...messages].sort((left, right) => left.message.seq - right.message.seq)) {
@@ -794,7 +956,13 @@ function resolveFunctionCallTarget(input: {
   if (!linkedOwnerMessageId) return undefined;
   const owner = input.messages.find((entry) => entry.message.id === linkedOwnerMessageId);
   if (!owner) return undefined;
-  const ownerTargets = input.functionTargets.filter((target) => target.messageId === linkedOwnerMessageId);
+  // 原生聚合消息在转向边界拆成多个展示条目后，durable part 可能落在任一拆分条目里；
+  // ToolCallSourceLink 仍然只指向来源聚合消息，所以把解析范围扩大到它的全部拆分条目。
+  const ownerMessageIds = new Set([linkedOwnerMessageId]);
+  for (const entry of input.messages) {
+    if (entry.splitFromMessageId === linkedOwnerMessageId) ownerMessageIds.add(entry.message.id);
+  }
+  const ownerTargets = input.functionTargets.filter((target) => ownerMessageIds.has(target.messageId));
   const providerOrdinal = integer(input.sourceLink.provider_ordinal);
   const exact = providerCallId
     ? ownerTargets.find((candidate) => text(candidate.part.id) === providerCallId)
@@ -1219,6 +1387,7 @@ function emptyProjection(): ReliableConversationProjection {
     turnIdByMessageId: {},
     modelRequestIdByMessageId: {},
     messageRevisionIdByMessageId: {},
+    splitSourceMessageIdByMessageId: {},
     terminationByMessageId: {},
     toolResultByCallId: {},
     toolOutcomeStatusByCallId: {},

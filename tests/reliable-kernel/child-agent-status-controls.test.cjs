@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const ts = require('typescript');
+const { createRequire } = require('node:module');
 
 const root = process.cwd();
 
@@ -12,38 +13,26 @@ function source(relativePath) {
   return fs.readFileSync(path.join(root, relativePath), 'utf8');
 }
 
-function loadProjection() {
-  const absolute = path.join(root, 'webview/src/domain/reliableAgentStatusProjection.ts');
-  const output = ts.transpileModule(source('webview/src/domain/reliableAgentStatusProjection.ts'), {
-    fileName: absolute,
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
-  }).outputText;
-  const loaded = { exports: {} };
-  Function('require', 'module', 'exports', `${output}\n//# sourceURL=${absolute}`)(require, loaded, loaded.exports);
-  return loaded.exports;
-}
-
-function loadConversationProjection() {
-  const relativePath = 'webview/src/domain/reliableConversationProjection.ts';
+function loadTypeScript(relativePath) {
   const absolute = path.join(root, relativePath);
   const output = ts.transpileModule(source(relativePath), {
     fileName: absolute,
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
   }).outputText;
   const loaded = { exports: {} };
+  const fromSource = createRequire(absolute);
   const localRequire = (specifier) => {
-    if (specifier === './reliableTransientModel.ts') return { transientFunctionCallParts: () => [] };
-    if (specifier === './reliableDetailKey.ts') {
-      return { reliableKernelDetailKey: (kind, recordId) => `${kind}:${recordId}` };
+    if (specifier.startsWith('.') && specifier.endsWith('.ts')) {
+      return loadTypeScript(path.relative(root, path.resolve(path.dirname(absolute), specifier)));
     }
-    return require(specifier);
+    return fromSource(specifier);
   };
   Function('require', 'module', 'exports', `${output}\n//# sourceURL=${absolute}`)(localRequire, loaded, loaded.exports);
   return loaded.exports;
 }
 
-const { projectReliableAgentStatus } = loadProjection();
-const { projectReliableConversation } = loadConversationProjection();
+const { projectReliableAgentStatus } = loadTypeScript('webview/src/domain/reliableAgentStatusProjection.ts');
+const { projectReliableConversation } = loadTypeScript('webview/src/domain/reliableConversationProjection.ts');
 
 test('Agent status separates current child activity from the original task', () => {
   const projection = projectReliableAgentStatus({

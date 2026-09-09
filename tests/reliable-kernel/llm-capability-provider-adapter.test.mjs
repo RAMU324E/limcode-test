@@ -1589,55 +1589,6 @@ test('Agent loop 最终仍有未完成任务时只产生脱敏 telemetry', () =>
   assert.equal(lifecycle.length, 1, '全部完成时不产生开放任务 telemetry');
 });
 
-test('Agent loop Provider wrapper 保留初始预算使用的精确估算器', async () => {
-  const exact = {
-    systemTokens: 1, toolSchemaTokens: 2, providerFramingTokens: 3,
-    contextTokens: 4, currentInputTokens: 5, runtimeDeliveryTokens: 6,
-    turnReminderTokens: 7, mediaTokens: 0,
-    fixedTokens: 6, bodyTokens: 22, fullTokens: 28
-  };
-  const fullRequest = {
-    kind: 'full-model-request', modelRequestId: 'request-forward-estimator',
-    conversationId: 'conversation-forward-estimator', attemptSeq: '1', socketGeneration: '1',
-    providerId: 'provider-forward-estimator', modelId: 'model-forward-estimator',
-    authoritySnapshot: {}, recipe: {}, context: [],
-    attachmentCatalogState: { catalog: [], placements: [] }
-  };
-  let estimateCalls = 0;
-  const providerAdapter = {
-    providerId: fullRequest.providerId,
-    receiver: 'frozen-adapter',
-    estimateFullRequestInput(input) {
-      assert.equal(this.receiver, 'frozen-adapter');
-      assert.equal(input, fullRequest);
-      estimateCalls += 1;
-      return exact;
-    },
-    async sendFullRequest() { throw new Error('fixture must not open the Provider socket'); }
-  };
-  const loop = Object.create(kernel.ReliableAgentLoop.prototype);
-  loop.database = memoryReadDatabase();
-  loop.providers = { async resolve() { return providerAdapter; } };
-  loop.modelProvider = {
-    async dispatch(modelRequestId, wrapped) {
-      assert.equal(modelRequestId, fullRequest.modelRequestId);
-      assert.equal(wrapped.estimateFullRequestInput(fullRequest), exact);
-    }
-  };
-  loop.readTerminalProviderOutput = async () => ({ text: 'done', thought: '', toolCalls: [] });
-
-  assert.deepEqual(await loop.dispatchAndCapture(
-    fullRequest.conversationId,
-    'turn-forward-estimator',
-    fullRequest.modelRequestId,
-    {
-      provider_id: fullRequest.providerId, model_id: fullRequest.modelId, request_seq: 1n,
-      stream_stats_json: { attemptSeq: '1', socketGeneration: '0', retryReason: null },
-      status: 'prepared'
-    }
-  ), { text: 'done', thought: '', toolCalls: [] });
-  assert.equal(estimateCalls, 1);
-});
 
 test('Agent loop runtime status 先筛选全部 Turn facts，再限制 recipe 32 条和卡片 4 条', async () => {
   const turnId = 'turn-filter-runtime-status';

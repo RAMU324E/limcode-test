@@ -140,7 +140,7 @@
     "pdf-lib": "1.17.1",
     "tokenx": "^1.3.0",
     "undici": "^6.26.0",
-    "unified-llm-provider": "file:vendor/unified-llm-provider-0.1.35-limcode.1.tgz",
+    "unified-llm-provider": "file:vendor/unified-llm-provider-0.1.35-limcode.2.tgz",
     "ws": "8.21.1",
     "zod": "4.4.3"
   }

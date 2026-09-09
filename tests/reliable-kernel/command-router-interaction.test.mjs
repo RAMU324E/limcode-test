@@ -58,6 +58,58 @@ test('stale Turn interrupt is idempotently reported as already_terminal', async 
   assert.equal(posted[0].payload.cascadeChildAgents, true);
 });
 
+test('新输入等待其他设置页面保存确认，而已经提交的输入重放不被新设置阻挡', async () => {
+  const posted = [];
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} }, toolHost: { setStateChangeListener() {} }
+  });
+  const flushes = [];
+  router.settingsSaveBarrier.attach('settings-page', {
+    async postMessage(message) { flushes.push(message); return true; }
+  });
+  let replay = false;
+  router.list = async (domain) => {
+    assert.equal(domain, 'CommandReceipt');
+    return replay ? [{ id: 'existing-receipt' }] : [];
+  };
+  let admissions = 0;
+  router.handleTurnInput = async () => { admissions += 1; };
+  const input = {
+    id: 'input-await-save', type: protocol.BridgeMessageType.TurnStart,
+    payload: { conversationId: 'conversation', text: '输入', command: { commandId: 'input-command' } }
+  };
+  const pending = router.dispatch('chat-page', webview(posted), input);
+  await eventually(() => flushes.length === 1);
+  assert.equal(admissions, 0);
+  await router.dispatch('settings-page', webview(posted), {
+    id: 'flush-result', type: protocol.BridgeMessageType.GlobalSettingsFlushResult,
+    correlationId: flushes[0].id, payload: { status: 'saved' }
+  });
+  await pending;
+  assert.equal(admissions, 1);
+  replay = true;
+  await router.dispatch('chat-page', webview(posted), input);
+  assert.equal(admissions, 2);
+  assert.equal(flushes.length, 1);
+});
+
+test('已经开始的手动压缩查询结果不重新等待设置页面', async () => {
+  const posted = [];
+  const router = new VscodeReliableKernelCommandRouter({
+    debugCapture: { setListener() {} }, toolHost: { setStateChangeListener() {} },
+    conversations: { async inspectManualCompression() { return { turnId: 'maintenance', inProgress: true }; } }
+  });
+  router.requireRow = async () => ({ id: 'conversation' });
+  router.settingsSaveBarrier.attach('settings-page', {
+    async postMessage() { assert.fail('重放不得等待新设置'); }
+  });
+  await router.dispatch('chat', webview(posted), {
+    id: 'manual-query', type: protocol.BridgeMessageType.CompressionStart,
+    payload: { conversationId: 'conversation', command: { commandId: 'manual' }, target: { kind: 'current_head', expectedRootId: 'root' } }
+  });
+  assert.equal(posted[0].payload.status, 'in_progress');
+});
+
 test('stale Conversation settings request returns scoped error without throwing', async () => {
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({

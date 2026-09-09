@@ -71,7 +71,12 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
     const providerId = requireId(providerIdInput, 'providerId');
     const existing = this.adapters.get(providerId);
     if (existing) return existing;
-    const adapter = new LlmCapabilityFullRequestAdapter(providerId, this.capability, this.options.debugCapture);
+    const adapter = new LlmCapabilityFullRequestAdapter(
+      providerId,
+      this.capability,
+      this.options.debugCapture,
+      this.options.resolveAttachment
+    );
     this.adapters.set(providerId, adapter);
     return adapter;
   }
@@ -129,7 +134,11 @@ export function applyFrozenModelProviderConfig(
         : { generationConfig: { ...modelConfig.generationConfig } }),
       ...(modelConfig.requestBody === undefined
         ? { requestBody: undefined }
-        : { requestBody: { ...modelConfig.requestBody } })
+        : { requestBody: { ...modelConfig.requestBody } }),
+      // nativeResponses 遵循与其他高级配置一致的模型级整体替代语义。
+      ...(modelConfig.nativeResponses === undefined
+        ? { nativeResponses: undefined }
+        : { nativeResponses: { ...modelConfig.nativeResponses } })
     } : {}),
     // Reliable retry identity lives in ModelRequest/Attempt; the capability must not retry invisibly.
     retryOnError: false,
@@ -141,6 +150,7 @@ export function applyFrozenModelProviderConfig(
   if (modelConfig?.headers === undefined && modelConfig) delete resolved.headers;
   if (modelConfig?.generationConfig === undefined && modelConfig) delete resolved.generationConfig;
   if (modelConfig?.requestBody === undefined && modelConfig) delete resolved.requestBody;
+  if (modelConfig?.nativeResponses === undefined && modelConfig) delete resolved.nativeResponses;
   return resolved;
 }
 

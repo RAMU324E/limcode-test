@@ -30,9 +30,9 @@ import {
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   frozenContextProfile,
-  readFrozenTurnAuthority,
   type FrozenContextProfile
 } from './frozenAuthority';
+import { readRequestTurnAuthority } from './requestCompressionSettings';
 
 export interface FrozenContextProfileDocument {
   modelProfile: FrozenContextProfile;
@@ -91,6 +91,17 @@ export interface CreateCompressionCommand {
       providerConfigId: string;
       provider: string;
       modelId: string;
+    };
+    /**
+     * Native full-context rebase facts frozen for observability when a compression lands on a
+     * native history: the connection-local cache/continuation chain resets, transport-only
+     * configuration_update items leave the compacted window, and the effective reasoning effort
+     * is preserved for the fresh update applied before the next user message.
+     */
+    nativeRebase?: {
+      cacheReset: true;
+      droppedConfigurationUpdates: number;
+      effectiveEffort?: string;
     };
   };
   /** Provider-aligned estimate for the replacement Context only (summary/native output plus local tail). */
@@ -156,11 +167,11 @@ export class ContextCompressionControlPlane {
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
-  public async evaluate(rootIdInput: string, authoritySnapshotIdInput: string): Promise<CompressionDecision> {
+  public async evaluate(rootIdInput: string, authoritySnapshotIdInput: string, settingsSnapshotContentObjectId?: string): Promise<CompressionDecision> {
     const rootId = requireId(rootIdInput, 'rootId');
     const authoritySnapshotId = requireId(authoritySnapshotIdInput, 'authoritySnapshotId');
     const [frozen, estimate] = await Promise.all([
-      this.readFrozenProfile(authoritySnapshotId),
+      this.readFrozenProfile(authoritySnapshotId, settingsSnapshotContentObjectId),
       this.tokenEstimator.estimateRoot(rootId)
     ]);
     if (frozen.conversationId !== estimate.conversationId) {
@@ -576,14 +587,16 @@ export class ContextCompressionControlPlane {
     return commit.commitSeq;
   }
 
-  private async readFrozenProfile(authoritySnapshotId: string): Promise<{
+  private async readFrozenProfile(authoritySnapshotId: string, settingsSnapshotContentObjectId?: string): Promise<{
     profile: FrozenContextProfileDocument['modelProfile'];
     conversationId: string;
   }> {
-    const frozen = await readFrozenTurnAuthority(
+    const frozen = await readRequestTurnAuthority(
       this.database,
       this.contentStore,
-      authoritySnapshotId
+      authoritySnapshotId,
+      undefined,
+      settingsSnapshotContentObjectId
     );
     return {
       profile: frozenContextProfile(frozen.document),
@@ -994,6 +1007,9 @@ function normalizeCompressionSummary(
             provider: requireText(metadata.nativeBinding.provider, 'summaryMetadata.nativeBinding.provider'),
             modelId: requireText(metadata.nativeBinding.modelId, 'summaryMetadata.nativeBinding.modelId')
           }
+        } : {}),
+        ...(metadata.nativeRebase ? {
+          nativeRebase: requireNativeRebaseMetadata(metadata.nativeRebase)
         } : {})
       } : {})
     });
@@ -1010,6 +1026,24 @@ function requireCompressionTriggerReason(
     throw new TypeError('summaryMetadata.triggerReason is invalid.');
   }
   return value;
+}
+
+function requireNativeRebaseMetadata(
+  value: NonNullable<NonNullable<CreateCompressionCommand['summaryMetadata']>['nativeRebase']>
+): NonNullable<NonNullable<CreateCompressionCommand['summaryMetadata']>['nativeRebase']> {
+  if (value.cacheReset !== true) {
+    throw new TypeError('summaryMetadata.nativeRebase.cacheReset must be true.');
+  }
+  return {
+    cacheReset: true,
+    droppedConfigurationUpdates: requireEstimatedTokens(
+      value.droppedConfigurationUpdates,
+      'summaryMetadata.nativeRebase.droppedConfigurationUpdates'
+    ),
+    ...(value.effectiveEffort === undefined
+      ? {}
+      : { effectiveEffort: requireText(value.effectiveEffort, 'summaryMetadata.nativeRebase.effectiveEffort') })
+  };
 }
 
 function requireCompressionTokenSource(value: unknown): ReliableContextTokenEstimateSource {

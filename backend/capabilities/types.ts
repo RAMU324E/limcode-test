@@ -30,13 +30,23 @@ import type {
   WorkEnvironmentRecord
 } from '../../shared/protocol';
 import type { EditToolMode } from '../../shared/protocol';
+import type { OpenAIResponsesNativeHooks } from './openAIResponsesNativeControl';
 
 export type Emit = (event: WorldEvent) => void;
+
+/**
+ * Process-local per-request runtime controls. Never persisted, never serialized through the
+ * Webview bridge. `native` carries Astra native hooks (controller registration) from the
+ * reliable kernel dispatch; undefined on non-native paths.
+ */
+export interface LlmStartRuntimeControls {
+  native?: OpenAIResponsesNativeHooks;
+}
 
 /** LLM 能力：无状态函数根据 request 启动流式执行，并通过 emit 回灌事件。 */
 export interface LlmCapability {
   resolveInvocation(request: LlmResolveInvocationRequest, emit: Emit): void;
-  start(request: LlmStartRequest, emit: Emit): void;
+  start(request: LlmStartRequest, emit: Emit, controls?: LlmStartRuntimeControls): void;
   compact(request: LlmCompactRequest, emit: Emit): void;
   dryRun(request: LlmStartRequest, options?: LlmDryRunOptions): Promise<LlmDryRunResult>;
   dryRunCompact(request: LlmCompactRequest, options?: LlmDryRunOptions): Promise<LlmCompactDryRunResult>;

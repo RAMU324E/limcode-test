@@ -12,6 +12,8 @@ import {
   type ReliableInterruptPhase
 } from '@shared/reliableControlLifecycle';
 import { toStructuredClonePlainData } from '@shared/plainData';
+import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
+import { mergeSteeringReceipts, steeringReceiptsByConversationState } from '@webview/composables/steeringReceipts';
 import {
   createMessageId,
   type CompressionCommandTarget,
@@ -25,7 +27,8 @@ import {
   type MessageRetryFromPayload,
   type MessageRetryTarget,
   type TurnAuthoritySelection,
-  type TurnInputResultPayload
+  type TurnInputResultPayload,
+  type TurnSteerResultPayload
 } from '@shared/protocol';
 
 let reliableCommandSequence = 0;
@@ -163,6 +166,40 @@ const turnInputAcknowledgements = ref<Record<string, TurnInputAcknowledgement>>(
 const pendingGuidanceControls = ref<Record<string, PendingGuidanceControl>>({});
 const guidanceControlFailures = ref<Record<string, GuidanceControlFailure>>({});
 
+interface SteeringSubmissionState {
+  commandId: string;
+  conversationId: string;
+  submittedAt: number;
+}
+
+interface SteeringSubmissionResult {
+  conversationId: string;
+  ok: boolean;
+}
+
+interface SteeringFailureNotice {
+  commandId?: string;
+  message: string;
+  at: number;
+}
+
+/** 转向提交只以 TurnSteerResult 回执为准；本地仅跟踪「正在提交」以便禁用重复提交。 */
+const steeringSubmissions = ref<Record<string, SteeringSubmissionState>>({});
+const steeringSubmissionResults = ref<Record<string, SteeringSubmissionResult>>({});
+const steeringReceiptsByConversation = steeringReceiptsByConversationState();
+const steeringFailures = ref<Record<string, SteeringFailureNotice>>({});
+const steeringStatusRequested = new Set<string>();
+
+function isPlausibleSteeringReceipt(value: unknown): value is NativeSteeringReceipt {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Partial<NativeSteeringReceipt>;
+  return typeof record.submissionId === 'string' && !!record.submissionId
+    && typeof record.turnId === 'string'
+    && typeof record.state === 'string'
+    && typeof record.updatedAt === 'number'
+    && Number.isFinite(record.updatedAt);
+}
+
 bridge.on(BridgeMessageType.TurnInputResult, (message) => {
   const payload = message.payload;
   if (!payload) return;
@@ -280,6 +317,36 @@ bridge.on(BridgeMessageType.TurnInterruptResult, (message) => {
   setConversationAction(nextAction);
   armActionInterruptWatchdog(nextAction);
   clearActionNotice(payload.conversationId);
+});
+
+bridge.on(BridgeMessageType.TurnSteerResult, (message) => {
+  const payload = message.payload;
+  if (!payload || typeof payload.conversationId !== 'string' || !payload.conversationId) return;
+  const conversationId = payload.conversationId;
+  if (payload.error) {
+    steeringFailures.value = {
+      ...steeringFailures.value,
+      [conversationId]: {
+        ...(payload.commandId ? { commandId: payload.commandId } : {}),
+        message: payload.error,
+        at: Date.now()
+      }
+    };
+  }
+  if (payload.commandId && steeringSubmissions.value[payload.commandId]) {
+    const nextSubmissions = { ...steeringSubmissions.value };
+    delete nextSubmissions[payload.commandId];
+    steeringSubmissions.value = nextSubmissions;
+    steeringSubmissionResults.value = {
+      ...steeringSubmissionResults.value,
+      [payload.commandId]: { conversationId, ok: !payload.error }
+    };
+  }
+  const receipts = Array.isArray(payload.receipts)
+    ? payload.receipts.filter(isPlausibleSteeringReceipt)
+    : [];
+  if (receipts.length === 0) return;
+  mergeSteeringReceipts(conversationId, receipts);
 });
 
 bridge.on(BridgeMessageType.ConversationActionResult, (message) => {
@@ -1126,6 +1193,17 @@ export function useChat() {
   const currentGuidanceControlFailure = computed(() =>
     guidanceControlFailures.value[reliableConversation.conversationId.value]
   );
+  /** 当前对话的转向回执，按最近更新排序；状态原样来自后端回执，不在本地推断。 */
+  const currentSteeringReceipts = computed(() => {
+    const receipts = steeringReceiptsByConversation.value[reliableConversation.conversationId.value] ?? {};
+    return Object.values(receipts).sort((left, right) =>
+      right.updatedAt - left.updatedAt || right.submissionId.localeCompare(left.submissionId)
+    );
+  });
+  const currentSteeringFailure = computed(() => steeringFailures.value[reliableConversation.conversationId.value]);
+  const currentSteeringSubmitting = computed(() => Object.values(steeringSubmissions.value)
+    .some((submission) => submission.conversationId === reliableConversation.conversationId.value));
+  const steeringSubmissionResultsById = computed(() => steeringSubmissionResults.value);
   const forkPendingTargetIds = computed(() => new Set(Object.values(forkRequests.value)
     .filter((request) => request.sourceConversationId === reliableConversation.conversationId.value && request.requestId)
     .map((request) => request.messageId)));
@@ -1678,6 +1756,89 @@ export function useChat() {
     }
   }
 
+  /**
+   * 原生回合内转向：把一条用户消息立即提交给进行中的原生请求。
+   * 可用性由调用方按进行中原生请求的冻结能力判断；这里只对当前活动 Turn 失败关闭。
+   */
+  function steerCurrentTurn(text: string, content?: MessageContent): { commandId: string } | undefined {
+    const conversationId = activeConversationId();
+    const turnId = activeTurnId(conversationId);
+    const trimmed = text.trim();
+    if (!conversationId || !turnId) return undefined;
+    if (!trimmed && !content?.parts?.length) return undefined;
+    const frozenContent = toStructuredClonePlainData(
+      content?.parts?.length ? content : { role: 'user', parts: [{ text: trimmed }] },
+      'steer content'
+    ) as unknown as MessageContent;
+    if (frozenContent.parts.length === 0) return undefined;
+    const command = nextReliableCommandMetadata();
+    const submission: SteeringSubmissionState = {
+      commandId: command.commandId,
+      conversationId,
+      submittedAt: Date.now()
+    };
+    steeringSubmissions.value = { ...steeringSubmissions.value, [command.commandId]: submission };
+    try {
+      bridge.request(BridgeMessageType.TurnSteer, {
+        action: 'submit',
+        conversationId,
+        turnId,
+        leaseEpoch: activeLeaseGeneration(turnId) ?? 0,
+        content: frozenContent,
+        command
+      }, { requestId: command.commandId });
+    } catch (error) {
+      const nextSubmissions = { ...steeringSubmissions.value };
+      delete nextSubmissions[command.commandId];
+      steeringSubmissions.value = nextSubmissions;
+      steeringSubmissionResults.value = {
+        ...steeringSubmissionResults.value,
+        [command.commandId]: { conversationId, ok: false }
+      };
+      steeringFailures.value = {
+        ...steeringFailures.value,
+        [conversationId]: {
+          commandId: command.commandId,
+          message: error instanceof Error ? error.message : '转向请求暂时无法投递。',
+          at: Date.now()
+        }
+      };
+      return undefined;
+    }
+    return { commandId: command.commandId };
+  }
+
+  /** 重新读取当前对话已持久化的转向回执（每个 Webview 会话每个对话最多主动读一次）。 */
+  function ensureSteeringReceipts(conversationId: string): void {
+    const id = conversationId.trim();
+    if (!id || steeringStatusRequested.has(id)) return;
+    steeringStatusRequested.add(id);
+    try {
+      bridge.request(BridgeMessageType.TurnSteer, {
+        action: 'status',
+        conversationId: id,
+        command: nextReliableCommandMetadata()
+      });
+    } catch {
+      steeringStatusRequested.delete(id);
+    }
+  }
+
+  function dismissSteeringFailure(): void {
+    const conversationId = activeConversationId();
+    if (!steeringFailures.value[conversationId]) return;
+    const next = { ...steeringFailures.value };
+    delete next[conversationId];
+    steeringFailures.value = next;
+  }
+
+  function dismissSteeringSubmissionResult(commandId: string): void {
+    if (!steeringSubmissionResults.value[commandId]) return;
+    const next = { ...steeringSubmissionResults.value };
+    delete next[commandId];
+    steeringSubmissionResults.value = next;
+  }
+
   function sendForkRequest(request: ForkRequestState): void {
     const requestId = bridge.request(BridgeMessageType.ConversationFork, request.payload);
     setForkRequest({
@@ -1855,7 +2016,15 @@ export function useChat() {
     currentPendingGuidanceControls,
     currentGuidanceControlFailure,
     dismissGuidanceControlFailure,
-    forkPendingTargetIds
+    forkPendingTargetIds,
+    steerCurrentTurn,
+    ensureSteeringReceipts,
+    currentSteeringReceipts,
+    currentSteeringFailure,
+    dismissSteeringFailure,
+    currentSteeringSubmitting,
+    steeringSubmissionResultsById,
+    dismissSteeringSubmissionResult
   };
 }
 

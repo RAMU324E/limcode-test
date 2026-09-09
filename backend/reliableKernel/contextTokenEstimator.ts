@@ -166,10 +166,18 @@ export class ReliableContextTokenEstimator {
       })).filter((request) =>
         request.status === 'terminal'
         && request.terminal_state === 'completed'
-        && providerPromptTokens(request.usage_json) !== undefined
       ).sort(compareRequestsNewestFirst);
 
       for (const request of requests) {
+        const calibration = nativePromptCalibration(request.stream_stats_json);
+        // A native logical ModelRequest spans multiple physical responses whose usage_json is
+        // cumulative billing; only the FIRST physical response's prompt count calibrates the
+        // initial projection root. A native anchor without that count yields no calibration at
+        // all rather than an invalid aggregate. Other providers keep the usage_json anchor.
+        const input = calibration.native
+          ? calibration.promptTokens
+          : providerPromptTokens(request.usage_json);
+        if (input === undefined) continue;
         const requestId = requireId(request.id, 'ModelRequest.id');
         const related = await this.database.snapshot([
           DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').list({
@@ -190,13 +198,11 @@ export class ReliableContextTokenEstimator {
         // ordinary request is not a prefix, no older ordinary request can be a safer calibration.
         if (!isSegmentPrefix(projected.segments, current)) return null;
 
-        const input = providerPromptTokens(request.usage_json);
-        if (input === undefined) continue;
         let coveredSegmentCount = projected.segments.length;
         let anchoredTokens = input;
         const outputSegmentId = await this.messageSegmentId(requireId(links[0].message_id, 'ModelRequestMessageLink.message_id'));
         if (outputSegmentId && current[coveredSegmentCount]?.segmentId === outputSegmentId) {
-          const total = providerTotalTokens(request.usage_json);
+          const total = calibration.native ? undefined : providerTotalTokens(request.usage_json);
           const outputSegment = current[coveredSegmentCount];
           const outputAttachmentState = await this.attachmentCatalog.projectState(conversationId, [{
             segmentId: outputSegment.segmentId
@@ -358,7 +364,14 @@ export function estimateToolPairContentTokens(content: string): number {
   const pair = parseRecord(content);
   const call = asRecord(pair?.toolCall);
   const result = asRecord(pair?.toolModelResult);
-  if (!call || !result) return estimateTextTokens(content);
+  if (!call) return estimateTextTokens(content);
+  if (!result) {
+    // A native async call admitted before its delayed result arrives: count the call item only.
+    return MESSAGE_OVERHEAD_TOKENS
+      + FUNCTION_OVERHEAD_TOKENS
+      + estimateTextTokens(typeof call.toolName === 'string' ? call.toolName : '')
+      + estimateJsonTokens(parseNestedJson(call.arguments) ?? {});
+  }
   const response = parseNestedJson(result.result);
   return MESSAGE_OVERHEAD_TOKENS
     + FUNCTION_OVERHEAD_TOKENS
@@ -464,6 +477,27 @@ export function providerTotalTokens(value: unknown): number | undefined {
 export function compressionOutputTokens(value: unknown): number | undefined {
   const usage = usageRecord(value);
   return firstTokenCount(usage, ['candidatesTokenCount', 'completion_tokens', 'output_tokens', 'outputTokens']);
+}
+
+/**
+ * Detects a native logical ModelRequest anchor from its persisted stream stats. A native chain
+ * spans multiple physical responses, so the terminal usage_json is cumulative billing that must
+ * never calibrate the initial ModelContextProjection root: the FIRST physical response's actual
+ * usage.input_tokens is the only valid anchor, and a marked native anchor without it yields no
+ * calibration (the caller skips the request instead of falling back to the aggregate).
+ */
+export function nativePromptCalibration(streamStats: unknown): { native: boolean; promptTokens?: number } {
+  const stats = typeof streamStats === 'string' ? parseRecord(streamStats) : asRecord(streamStats);
+  if (!stats || (stats.nativeCapabilities === undefined && stats.nativeInitialPromptTokenCount === undefined)) {
+    return { native: false };
+  }
+  const initial = stats.nativeInitialPromptTokenCount;
+  return {
+    native: true,
+    ...(typeof initial === 'number' && Number.isSafeInteger(initial) && initial >= 0
+      ? { promptTokens: initial }
+      : {})
+  };
 }
 
 function usageRecord(value: unknown): Record<string, unknown> | undefined {

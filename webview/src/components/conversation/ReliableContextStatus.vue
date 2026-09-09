@@ -2,6 +2,7 @@
 import { computed, watch } from 'vue';
 import {
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  type LlmCompressionConfigRecord,
   type LlmProviderConfigRecord,
   type LlmUsageMetadataRecord
 } from '@shared/protocol';
@@ -128,6 +129,15 @@ const thresholdTokens = computed(() =>
   ?? nestedToken(latestRequest.value?.model_profile_json, 'compressionThresholdTokens', 'compression_threshold_tokens')
   ?? configuredCompressionThreshold(contextWindowTokens.value)
 );
+const currentConfiguredWindow = computed(() => positiveInteger(modelConfig.value?.contextWindowTokens)
+  ?? positiveInteger(providerConfig.value?.contextWindowTokens));
+const currentConfiguredThreshold = computed(() => configuredCompressionThreshold(currentConfiguredWindow.value));
+const currentCompressionMode = computed(() => {
+  const config = configuredCompressionConfig();
+  if (config?.kind === 'disabled') return '已关闭';
+  if (config?.trigger.mode === 'manual') return '仅手动压缩';
+  return tokenValueLabel(currentConfiguredThreshold.value);
+});
 const usageRatio = computed(() => actualContextTokens.value !== undefined && contextWindowTokens.value !== undefined
   ? actualContextTokens.value / contextWindowTokens.value
   : undefined);
@@ -156,7 +166,8 @@ const tooltipRows = computed(() => [
     : []),
   { label: '上下文窗口', value: contextWindowTokens.value === undefined ? '未知（暂未获取，且配置中未设置）' : `${formatTokenNumber(contextWindowTokens.value)} Token` },
   { label: '窗口占用', value: percentLabel.value },
-  { label: '配置压缩阈值', value: tokenValueLabel(thresholdTokens.value) },
+  { label: '当前配置压缩阈值', value: currentCompressionMode.value },
+  { label: '最近请求采用阈值', value: latestRequest.value ? tokenValueLabel(thresholdTokens.value) : '尚未发起请求' },
   { label: '数据来源', value: usageSourceLabel() }
 ]);
 const overThreshold = computed(() => actualContextTokens.value !== undefined
@@ -204,8 +215,7 @@ function selectedModelId(config: LlmProviderConfigRecord | undefined): string {
   return override || config.model?.trim() || '';
 }
 
-function configuredCompressionThreshold(contextWindow: number | undefined): number | undefined {
-  if (!contextWindow) return undefined;
+function configuredCompressionConfig(): LlmCompressionConfigRecord | undefined {
   const configId = providerConfig.value?.id;
   const model = modelId.value;
   const modelBinding = configId && model
@@ -217,9 +227,14 @@ function configuredCompressionThreshold(contextWindow: number | undefined): numb
   const compressionId = modelBinding?.compressionConfigId
     ?? providerBinding?.compressionConfigId
     ?? globalSettings.llmCompression.defaultConfigId;
-  const config = globalSettings.llmCompressionConfigs.configs.find((candidate) => candidate.id === compressionId)
+  return globalSettings.llmCompressionConfigs.configs.find((candidate) => candidate.id === compressionId)
     ?? globalSettings.llmCompressionConfigs.configs[0];
-  const explicit = positiveInteger(config?.trigger?.thresholdTokens);
+}
+
+function configuredCompressionThreshold(contextWindow: number | undefined): number | undefined {
+  if (!contextWindow) return undefined;
+  const config = configuredCompressionConfig();
+  const explicit = config?.trigger.thresholdUnit === 'tokens' ? positiveInteger(config.trigger.thresholdTokens) : undefined;
   if (explicit !== undefined) return Math.min(contextWindow, explicit);
   const percent = finiteNumber(config?.trigger?.thresholdPercent) ?? DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT;
   return Math.round(contextWindow * Math.max(0, Math.min(100, percent)) / 100);

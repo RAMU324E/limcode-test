@@ -1,4 +1,6 @@
 import type { LlmCapability } from '../capabilities/types';
+import { resolveOpenAIResponsesNativeToolOutputs } from '../capabilities/llmProvider';
+import type { OpenAIResponsesToolOutput } from '../../shared/openAIResponsesNative';
 import type { LlmCompactRequest, LlmStartRequest, ToolSchema } from '../world/modules/llm/contracts';
 import { LlmEventType } from '../world/modules/llm/events';
 import type { WorldEvent } from '../ecs/types';
@@ -8,6 +10,7 @@ import {
   type AttachmentCatalogEntry,
   type InlineDataPart,
   type LlmProviderKind,
+  type LlmThinkingLevel,
   type MessageContent,
   type ModelOutputItemReference
 } from '../../shared/protocol';
@@ -40,10 +43,13 @@ import type {
   ProviderOutputStreamEvent
 } from './modelProviderControlPlane';
 import {
+  collectNativeConfigurationUpdates,
+  isNativeConfigurationUpdatePart,
   createManagedMediaBodyProjectionState,
   estimateProjectedModelInput,
   projectOrdinaryModelWindow,
   projectSummaryModelWindow,
+  stripNativeConfigurationUpdates,
   suppressRepeatedManagedMediaBodies,
   type ProjectedRequestTokenBreakdown
 } from './modelFacingContextProjection';
@@ -68,6 +74,8 @@ interface ToolCallOutput {
   name: string;
   arguments: PlainJsonValue;
   thoughtSignature?: string;
+  /** Received Astra native async flag (historical fact, not an admission proof). */
+  async?: boolean;
 }
 
 const CURRENT_TURN_INPUT_REINJECTION_LABEL =
@@ -86,9 +94,25 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
   public constructor(
     public readonly providerId: string,
     private readonly capability: LlmCapability,
-    private readonly debugCapture?: DebugCaptureRecorder
+    private readonly debugCapture?: DebugCaptureRecorder,
+    private readonly resolveAttachment?: (input: {
+      attachmentId?: string;
+      sourcePath?: string;
+      mimeType?: string;
+      name?: string;
+    }) => Promise<InlineDataPart | undefined>
   ) {
     if (!providerId.trim()) throw new TypeError('providerId must be non-empty.');
+  }
+
+  /**
+   * 把内核交付的原生工具输出解析为线级 Responses 形状：托管媒体引用经既有授权附件解析器
+   * 转成 data URL 块，文本与就绪块原样透传；绝不把媒体 JSON 化成文本。解析失败直接抛错。
+   */
+  public materializeNativeToolOutput(
+    outputs: readonly OpenAIResponsesToolOutput[]
+  ): Promise<OpenAIResponsesToolOutput[]> {
+    return resolveOpenAIResponsesNativeToolOutputs(outputs, { resolveAttachment: this.resolveAttachment });
   }
 
   public estimateFullRequestInput(request: FullProviderRequest): ProjectedRequestTokenBreakdown {
@@ -358,6 +382,19 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             }
             return;
           }
+          case LlmEventType.NativeControl: {
+            // 原生控制观察（response 边界/转向/准入事实）：不是语义输出，不阻断重放，
+            // 由 Kernel 通过既有 checkpoint 机制持久化为控制事实。
+            const nativeEvent = payload?.event;
+            if (nativeEvent) {
+              enqueue({
+                kind: 'native_control',
+                semanticProgress: false,
+                content: normalizePlainJson(nativeEvent, 'LLM native control event')
+              });
+            }
+            return;
+          }
           case LlmEventType.Done: {
             if (thoughtStartedAt !== undefined) {
               completedThoughtDurationMs += currentThoughtBlockDurationMs(
@@ -428,7 +465,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       }
       controls.signal?.addEventListener('abort', onAbort, { once: true });
       try {
-        this.capability.start(llmRequest, emit);
+        this.capability.start(llmRequest, emit, controls.native ? { native: controls.native } : undefined);
       } catch (error) {
         finish(capabilityThrownProviderError(error));
       }
@@ -589,7 +626,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       ? runtimeContext.template.trim()
       : '';
   if (runtimeContextText) systemParts.push(runtimeContextText);
-  const contents: MessageContent[] = [];
+  let contents: MessageContent[] = [];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
   const currentTurnInput = request.requestAddenda?.currentTurnInput;
   const attachmentCatalogState = normalizeAttachmentCatalogState(
@@ -649,6 +686,12 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     readToolsForAttachmentCatalog(availableTools, attachmentCatalogState.catalog),
     modelHandleCatalog
   );
+  // 冻结原生 reasoning：configuration_update 历史/待决更新按序置于持久化上下文之后、
+  // 当前 Turn 易失尾之前（最新 update 支配后续 response；cache 前缀不被尾部易失内容干扰）。
+  const nativeReasoning = frozenNativeReasoning(recipe);
+  if (nativeReasoning) {
+    contents = appendNativeConfigurationUpdates(contents, nativeReasoning);
+  }
   if (currentTurnInput?.reinject) {
     const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
     if (!current || current.role !== 'user') {
@@ -690,10 +733,31 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       providerConfigId: request.providerId,
       provider,
       modelId: request.modelId,
-      systemPromptPrefix
+      systemPromptPrefix,
+      // 冻结的 base reasoning 随快照携带；provider 端优先于实时渠道配置使用。
+      ...(nativeReasoning?.baseEffort || nativeReasoning?.baseMode
+        ? {
+            generationConfig: {
+              thinkingConfig: {
+                ...(nativeReasoning.baseEffort ? { thinkingLevel: nativeReasoning.baseEffort } : {}),
+                ...(nativeReasoning.baseMode ? { reasoningMode: nativeReasoning.baseMode } : {})
+              }
+            }
+          }
+        : {})
     },
     reliableProviderAttempt: reliableProviderAttempt(request, authorityModel),
-    openAIResponsesContinuation: { volatileTailContentKinds },
+    openAIResponsesContinuation: {
+      volatileTailContentKinds,
+      ...(nativeReasoning?.forceFullReason
+        ? { forceFullReason: nativeReasoning.forceFullReason }
+        : nativeReasoning?.resetCache
+          ? { forceFullReason: 'native_reasoning_cache_reset' }
+          : {})
+    },
+    ...(request.nativeAsyncAdmittedCallIds?.length
+      ? { nativeAsyncAdmittedCallIds: [...request.nativeAsyncAdmittedCallIds] }
+      : {}),
     ...(systemText ? { systemInstruction: { role: 'user', parts: [{ text: systemText }] } } : {})
   };
 }
@@ -1038,12 +1102,16 @@ function compressionContext(
   }
   flush();
   if (methodKind === 'openai_responses_compact') {
+    // 独立 /responses/compact 拒绝 configuration_update 输入项：只剥传输级 reasoning 选择，
+    // 语义上下文保持完整；有效 effort 由 Compression 的 rebase 计划在下一个请求重锚。
     return {
-      contents: projectOrdinaryContentsPreservingRanges(
-        contents,
-        canonicalCompressionRanges,
-        modelHandleCatalog
-      ),
+      contents: stripNativeConfigurationUpdates(
+        projectOrdinaryContentsPreservingRanges(
+          contents,
+          canonicalCompressionRanges,
+          modelHandleCatalog
+        )
+      ).contents,
       segments: [],
       priorSummaryContents: [],
       attachmentCatalogState,
@@ -1125,6 +1193,117 @@ interface CompressionProviderBinding {
   modelId: string;
 }
 
+/** 冻结的原生 reasoning 配方（Kernel recipe.nativeReasoning）。effort 已在解析层归一。 */
+interface FrozenNativeReasoning {
+  baseEffort?: LlmThinkingLevel;
+  baseMode?: 'standard' | 'pro';
+  updates: Array<{ effort?: string }>;
+  effectiveEffort?: string;
+  pendingConfigurationUpdate?: { effort?: string };
+  resetCache?: boolean;
+  forceFullReason?: string;
+}
+
+const LLM_THINKING_LEVELS: Record<string, true> = {
+  'not-set': true,
+  'non-set': true,
+  none: true,
+  minimal: true,
+  low: true,
+  medium: true,
+  high: true,
+  xhigh: true,
+  max: true
+};
+
+/** Astra 不接受 none/minimal；与 llmProvider 的 Astra→low 适配一致，在冻结解析层归一。 */
+function normalizeNativeEffort(value: unknown): string | undefined {
+  const effort = optionalText(value);
+  if (!effort) return undefined;
+  return effort === 'none' || effort === 'minimal' ? 'low' : effort;
+}
+
+function asLlmThinkingLevel(value: string | undefined): LlmThinkingLevel | undefined {
+  return value !== undefined && LLM_THINKING_LEVELS[value] ? (value as LlmThinkingLevel) : undefined;
+}
+
+function frozenNativeReasoning(recipe: { [key: string]: PlainJsonValue }): FrozenNativeReasoning | undefined {
+  const value = asRecord(recipe.nativeReasoning);
+  if (!value) return undefined;
+  const updates = Array.isArray(value.updates)
+    ? value.updates.map((entry, index) => {
+        const record = requireRecord(entry, `Provider recipe.nativeReasoning.updates[${index}]`);
+        const effort = normalizeNativeEffort(record.effort);
+        return effort ? { effort } : {};
+      })
+    : [];
+  const pending = asRecord(value.pendingConfigurationUpdate);
+  const pendingEffort = pending ? normalizeNativeEffort(pending.effort) : undefined;
+  const baseEffort = asLlmThinkingLevel(normalizeNativeEffort(value.baseEffort));
+  const baseModeRaw = optionalText(value.baseMode);
+  const effectiveEffort = normalizeNativeEffort(value.effectiveEffort);
+  const forceFullReason = optionalText(value.forceFullReason);
+  return {
+    ...(baseEffort ? { baseEffort } : {}),
+    ...(baseModeRaw === 'standard' || baseModeRaw === 'pro' ? { baseMode: baseModeRaw } : {}),
+    updates,
+    ...(effectiveEffort ? { effectiveEffort } : {}),
+    ...(pending ? { pendingConfigurationUpdate: pendingEffort ? { effort: pendingEffort } : {} } : {}),
+    ...(value.resetCache === true ? { resetCache: true } : {}),
+    ...(forceFullReason ? { forceFullReason } : {})
+  };
+}
+
+/** Updates introduced at the same request boundary collapse to the latest effort; canonical
+ * history stays unchanged, and the outbound stream never receives adjacent configuration updates. */
+function appendNativeConfigurationUpdates(
+  contents: MessageContent[],
+  nativeReasoning: FrozenNativeReasoning
+): MessageContent[] {
+  const desiredEffort = nativeReasoning.pendingConfigurationUpdate?.effort
+    ?? nativeReasoning.updates[nativeReasoning.updates.length - 1]?.effort;
+  if (!desiredEffort) return contents;
+  const present = collectNativeConfigurationUpdates(contents);
+  if (present[present.length - 1]?.effort === desiredEffort) return contents;
+
+  // Replace only trailing transport updates. Earlier updates separated by real message content
+  // retain their exact position; this projection never mutates the durable parts.
+  let last = contents.length - 1;
+  let retainedParts = 0;
+  for (; last >= 0; last -= 1) {
+    const parts = contents[last].parts;
+    retainedParts = parts.length;
+    while (retainedParts > 0 && isNativeConfigurationUpdatePart(parts[retainedParts - 1])) {
+      retainedParts -= 1;
+    }
+    if (retainedParts > 0) break;
+  }
+  const projected = contents.slice(0, last + 1);
+  if (last >= 0 && retainedParts !== contents[last].parts.length) {
+    projected[last] = { ...contents[last], parts: contents[last].parts.slice(0, retainedParts) };
+  }
+  projected.push(nativeConfigurationUpdateContent(desiredEffort));
+  return projected;
+}
+
+function nativeConfigurationUpdateContent(effort: string | undefined): MessageContent {
+  return {
+    role: 'user',
+    parts: [{
+      providerContext: {
+        provider: 'openai',
+        format: 'openai-responses',
+        endpoint: 'responses',
+        itemType: 'configuration_update',
+        rawItem: {
+          type: 'configuration_update',
+          ...(effort ? { reasoning: { effort } } : {})
+        }
+      }
+    }]
+  };
+}
+
 interface DecodedCompressionContents {
   contents: MessageContent[];
   nativeBinding?: CompressionProviderBinding;
@@ -1196,10 +1375,31 @@ function toolPairContents(
 ): MessageContent[] {
   const pair = requireRecord(normalizePlainJson(JSON.parse(content), 'Context tool pair'), 'Context tool pair');
   const call = requireRecord(pair.toolCall, 'Context tool pair.toolCall');
-  const result = requireRecord(pair.toolModelResult, 'Context tool pair.toolModelResult');
   requireText(call.id, 'Context tool pair.toolCall.id');
   const providerCallId = optionalText(call.providerCallId);
   const name = requireText(call.toolName, 'Context tool pair.toolCall.toolName');
+  if (pair.toolModelResult === undefined) {
+    // 持久化准入的原生异步调用（结果尚未到达）：provider 必须在精确时序位置看到自己的
+    // 调用项。只投影准入时实际存储的事实：真实 async 标记、provider call id、
+    // thoughtSignature 与结构完整的 outputItem；native:true 本身绝不隐含 async。
+    if (pair.native !== true) throw new TypeError('Context tool pair is missing toolModelResult.');
+    const storedOutputItem = modelOutputItemFromPayload({ outputItem: call.outputItem });
+    const storedThoughtSignature = optionalText(call.thoughtSignature);
+    return [{
+      role: 'model',
+      parts: [{
+        ...(providerCallId ? { id: providerCallId } : {}),
+        functionCall: {
+          name,
+          args: parseNestedJson(call.arguments, 'Context tool call arguments')
+        },
+        ...(call.async === true ? { async: true } : {}),
+        ...(storedThoughtSignature ? { thoughtSignature: storedThoughtSignature } : {}),
+        ...(storedOutputItem ? { outputItem: storedOutputItem } : {})
+      }]
+    }];
+  }
+  const result = requireRecord(pair.toolModelResult, 'Context tool pair.toolModelResult');
   const decoded = parseNestedJson(result.result, 'Context tool result');
   const response = splitToolResponseAttachments(decoded);
   return [{
@@ -1285,7 +1485,9 @@ function normalizeToolDefinitions(value: PlainJsonValue | undefined): Normalized
       schema: {
         name: requireText(record.name, `Provider recipe.tools[${index}].name`),
         description: optionalText(record.description),
-        parameters: record.parameters ?? {}
+        parameters: record.parameters ?? {},
+        // 策略权威 metadata.nativeAsync → 线上契约 ToolSchema.async（provider 端唯一读取字段）。
+        ...(asRecord(record.metadata)?.nativeAsync === true ? { async: true } : {})
       },
       ...(record.source === undefined
         ? {}
@@ -1487,6 +1689,7 @@ function upsertFunctionCallParts(
       ...(call.id ? { id: call.id } : {}),
       functionCall: { name: call.name, args: call.arguments },
       ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
+      ...(call.async === true ? { async: true } : {}),
       ...(outputItem ?? priorOutputItem ? { outputItem: outputItem ?? priorOutputItem } : {})
     };
     if (existingIndex >= 0) parts[existingIndex] = next;
@@ -1513,7 +1716,15 @@ function modelOutputItemFromPayload(
   const phase = source?.phase === 'commentary' || source?.phase === 'final_answer'
     ? source.phase
     : undefined;
-  return { id, ordinal, ...(phase ? { phase } : {}) };
+  const providerResponseId = optionalText(source?.providerResponseId);
+  const previousResponseId = optionalText(source?.previousResponseId);
+  return {
+    id,
+    ordinal,
+    ...(phase ? { phase } : {}),
+    ...(providerResponseId ? { providerResponseId } : {}),
+    ...(previousResponseId ? { previousResponseId } : {})
+  };
 }
 
 function plainModelOutputItem(outputItem: ModelOutputItemReference): PlainJsonValue {
@@ -1628,6 +1839,10 @@ class CapabilityToolCallAccumulator {
           existing.thoughtSignature = signature;
           enriched = true;
         }
+        if (candidate.async === true && existing.async !== true) {
+          existing.async = true;
+          enriched = true;
+        }
         if (enriched) changed.push({ ...existing });
         continue;
       }
@@ -1638,7 +1853,8 @@ class CapabilityToolCallAccumulator {
         ordinal,
         name: candidate.name,
         arguments: candidate.arguments,
-        ...(candidate.thoughtSignature ? { thoughtSignature: candidate.thoughtSignature } : {})
+        ...(candidate.thoughtSignature ? { thoughtSignature: candidate.thoughtSignature } : {}),
+        ...(candidate.async === true ? { async: true } : {})
       };
       this.calls.push(call);
       this.explicitOrdinalByCallIndex.push(candidate.hasExplicitOrdinal ? explicitOrdinal : undefined);
@@ -1681,7 +1897,8 @@ function normalizeCapabilityToolCalls(value: unknown): NormalizedCapabilityToolC
       arguments: name === READ_TOOL_NAME
         ? normalizePlainJson(compactReadFileToolArguments(normalizedArguments), `LLM tool call ${index}.compactedReadArguments`)
         : normalizedArguments,
-      ...(optionalText(record.thoughtSignature) ? { thoughtSignature: optionalText(record.thoughtSignature) } : {})
+      ...(optionalText(record.thoughtSignature) ? { thoughtSignature: optionalText(record.thoughtSignature) } : {}),
+      ...(record.async === true ? { async: true } : {})
     };
   });
 }

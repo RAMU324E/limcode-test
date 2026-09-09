@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
+import { IconBolt, IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import {
   type AgentRecord,
@@ -31,6 +31,8 @@ import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
+import SteeringStatusPanel from '@webview/components/input/SteeringStatusPanel.vue';
+import { modelRequestNativeCapabilities } from '@webview/reliability/modelRequestStreamStats';
 
 const props = withDefaults(
   defineProps<{
@@ -65,7 +67,11 @@ const {
   currentTurnInputAcknowledgements,
   currentTurnInputFailure,
   dismissTurnInputAcknowledgement,
-  dismissTurnInputFailure
+  dismissTurnInputFailure,
+  steerCurrentTurn,
+  currentSteeringSubmitting,
+  steeringSubmissionResultsById,
+  dismissSteeringSubmissionResult
 } = useChat();
 const highlighted = ref(false);
 const editorExpanded = ref(false);
@@ -81,6 +87,7 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const attachmentScroller = ref<HTMLElement | null>(null);
 const channelModelPanel = ref<{ configId: string; style: Record<string, string> } | null>(null);
 const currentSubmissionCommandId = ref<string>();
+const currentSteerCommandId = ref<string>();
 
 const draft = computed({
   get: () => ui.composerDraft,
@@ -98,6 +105,24 @@ const sendTitle = computed(() => {
 const currentExecution = computed(() => Object.values(reliableConversation.feed.records.Turn ?? {}).find((turn) =>
   turn.conversation_id === reliableConversation.conversationId.value && turn.status === 'active'
 ));
+/** 进行中的原生请求：只有它的冻结能力（response.created 时写入）决定转向入口是否存在。 */
+const activeStreamingModelRequest = computed(() => {
+  const turn = currentExecution.value;
+  if (!turn || typeof turn.id !== 'string') return undefined;
+  return Object.values(reliableConversation.feed.records.ModelRequest ?? {})
+    .filter((request) => request.turn_id === turn.id && request.status === 'streaming')
+    .sort((left, right) => (Number(right.request_seq) || 0) - (Number(left.request_seq) || 0))[0];
+});
+const nativeSteeringAvailable = computed(() =>
+  modelRequestNativeCapabilities(activeStreamingModelRequest.value)?.steering === true
+);
+const canSteerNow = computed(() =>
+  nativeSteeringAvailable.value
+  && hasDraftContent.value
+  && !conversationInputDisabled.value
+  && !currentSteeringSubmitting.value
+  && !ui.isEditing
+);
 const canCompressCurrentContext = computed(() =>
   !currentExecution.value
   && !compressionPending.value
@@ -261,6 +286,22 @@ watch(
 );
 
 watch(
+  () => currentSteerCommandId.value
+    ? steeringSubmissionResultsById.value[currentSteerCommandId.value]
+    : undefined,
+  (result) => {
+    const commandId = currentSteerCommandId.value;
+    if (!commandId || !result) return;
+    currentSteerCommandId.value = undefined;
+    dismissSteeringSubmissionResult(commandId);
+    // 失败时保留草稿：转向输入可能从未落库，用户可修改后改用普通发送或重试。
+    if (!result.ok) return;
+    attachmentSnapshots.value = { ...attachmentSnapshots.value, chat: [] };
+    ui.clearChatDraft();
+  }
+);
+
+watch(
   [
     () => currentTurnInputFailure.value?.commandId,
     () => draft.value,
@@ -350,6 +391,16 @@ function submit(): void {
   const submission = sendMessage(text, content, currentTurnAuthoritySelection());
   if (!submission) return;
   currentSubmissionCommandId.value = submission.commandId;
+}
+
+/** 原生转向：立即把草稿注入进行中的原生请求；普通发送按钮仍只排队，停止按钮语义不变。 */
+function steerNow(): void {
+  if (!canSteerNow.value) return;
+  const text = draft.value.trim();
+  const content = buildMessageContent(text, selectedAttachments.value);
+  const submission = steerCurrentTurn(text, content);
+  if (!submission) return;
+  currentSteerCommandId.value = submission.commandId;
 }
 
 function openFilePicker(): void { fileInput.value?.click(); }
@@ -706,6 +757,7 @@ function middleEllipsis(value: string, maxLength: number): string {
     <div class="composer-zone composer-zone-top" aria-label="输入框上方功能区">
       <div class="composer-top-main">
         <ReliableQueuePanel />
+        <SteeringStatusPanel />
         <AskUserTopPanel />
         <div v-if="ui.isEditing" class="composer-edit-indicator">
           <span class="composer-edit-indicator-icon" aria-hidden="true">
@@ -960,6 +1012,17 @@ function middleEllipsis(value: string, maxLength: number): string {
         <svg class="composer-compact-icon" viewBox="0 0 24 24" focusable="false" aria-hidden="true">
           <path d="M5 5h14l-7 6zM5 19h14l-7-6z" />
         </svg>
+      </button>
+      <button
+        v-if="nativeSteeringAvailable"
+        type="button"
+        class="composer-steer"
+        :disabled="!canSteerNow"
+        aria-label="立即介入当前回复"
+        title="立即介入当前回复（原生转向）：把消息注入进行中的回复；普通发送仍只加入等待队列，停止按钮语义不变"
+        @click="steerNow"
+      >
+        <IconBolt class="composer-send-icon" stroke="2" aria-hidden="true" />
       </button>
       <button
         type="button"
@@ -1490,6 +1553,7 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-send,
+.composer-steer,
 .composer-compact {
   flex: 0 0 auto;
   display: inline-flex;
@@ -1504,6 +1568,7 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-send:hover:not(:disabled),
+.composer-steer:hover:not(:disabled),
 .composer-compact:hover:not(:disabled) {
   color: var(--vscode-foreground);
   background: var(--vscode-list-hoverBackground, transparent);
@@ -1511,6 +1576,7 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-send:disabled,
+.composer-steer:disabled,
 .composer-compact:disabled {
   color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
   background: transparent;

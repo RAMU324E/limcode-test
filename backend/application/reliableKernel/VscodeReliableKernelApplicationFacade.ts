@@ -10,6 +10,8 @@ import { RUNTIME_KERNEL_EPOCH } from '../../reliableKernel/contracts';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
+import { readNativeSteeringInFlight } from '../../reliableKernel/nativeSteering';
+import { isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
 import {
   createVscodeRootAuthority,
   resolveVscodeWorkspaceRuntimePlacement,
@@ -21,6 +23,7 @@ import {
   DEFAULT_CONVERSATION_TITLE,
   displayConversationTitle
 } from '../../../shared/conversationTitle';
+import { BridgeMessageType } from '../../../shared/protocol';
 import { EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
 import type {
@@ -90,6 +93,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private interactionAttentionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private hydration: Promise<void> | undefined;
   private unsubscribeCommit: (() => void) | undefined;
+  private unsubscribeSteering: (() => void) | undefined;
   private disposed = false;
   private productClosed = false;
 
@@ -126,6 +130,19 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       }
     );
     this.unsubscribeCommit = product.application.database.onCommit((commit) => this.onRuntimeCommit(commit));
+    this.unsubscribeSteering = product.application.modelProvider.subscribeSteering((update) => {
+      this.broadcast({
+        id: randomUUID(),
+        type: BridgeMessageType.TurnSteerResult,
+        channel: 'control',
+        payload: {
+          conversationId: update.conversationId,
+          receipts: update.receipts,
+          ...(update.commandId ? { commandId: update.commandId } : {}),
+          ...(update.error ? { error: update.error } : {})
+        }
+      });
+    });
   }
 
   public static async open(
@@ -266,15 +283,44 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       message_id: messageId
     }, 2);
     if (memberships.length !== 1) throw new Error('Fork 源 Message 不属于当前 Conversation。');
+    const nativeSteering = await readNativeSteeringInFlight(this.product.application.database, sourceConversationId);
+    if (nativeSteering.length > 0) {
+      throw new Error('当前对话仍有未收口的原生转向，请等待完成后再创建分支。');
+    }
+    const nativeWork = await this.product.application.runtime.effects.listNativePendingWork({
+      conversationId: sourceConversationId
+    });
+    for (const work of nativeWork) {
+      if (work.turnActive || !work.settled || !work.callContextSegmentId || work.resultContextSegmentId) continue;
+      await this.product.application.context.appendNativeToolResult({
+        conversationId: sourceConversationId,
+        toolCallId: work.toolCallId,
+        toolModelResultId: requireText(work.toolModelResultId, 'NativePendingToolCall.toolModelResultId')
+      });
+    }
+    await this.product.application.runtime.effects.assertNativeWorkSettledForConversation(sourceConversationId);
     const sources = await this.list('ContextSegmentSource', {
       source_kind: 'message_revision',
       source_id: revisionId
     }, 10);
-    if (sources.length === 0) throw new Error('Fork 源 MessageRevision 尚未进入 Context DAG。');
     const sourceSegmentIds = new Set(sources.map((row) => requireText(row.segment_id, 'ContextSegmentSource.segment_id')));
     const revision = await this.requireRow('MessageRevision', revisionId);
-    const requiredToolPairSegmentIds: string[] = [];
+    const requiredToolContext: Array<{ callSegmentId: string; resultSegmentId: string; native: boolean }> = [];
+    let nativeMessageProjection = false;
     if (revision.role === 'model') {
+      const requestLinks = await this.list('ModelRequestMessageLink', { message_id: messageId }, 2);
+      if (requestLinks.length === 1) {
+        const request = await this.requireRow('ModelRequest', requireText(requestLinks[0].model_request_id, 'ModelRequestMessageLink.model_request_id'));
+        if (isNativeRequest(request)) {
+          if (request.status !== 'terminal') throw new Error('原生模型消息尚未结束，请等待完整消息收口后再创建分支。');
+          nativeMessageProjection = true;
+          for (const item of await readNativeMessageContextRevisions(this.product.application.database, messageId)) {
+            for (const source of item.sources) {
+              sourceSegmentIds.add(requireText(source.segment_id, 'ContextSegmentSource.segment_id'));
+            }
+          }
+        }
+      }
       const callLinks = (await this.product.application.database.snapshotAll(
         DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
           where: { message_id: messageId },
@@ -286,19 +332,32 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       );
       for (const callLink of callLinks) {
         const toolCallId = requireText(callLink.tool_call_id, 'ToolCallSourceLink.tool_call_id');
-        const pairSources = await this.list('ContextSegmentSource', {
-          source_kind: 'tool_call',
-          source_id: toolCallId
-        }, 2);
-        if (pairSources.length !== 1) {
-          throw new Error('Fork 源模型消息仍有未闭合工具调用，无法创建非规范 Context 分支。');
+        const [callSources, results, nativeAdmission] = await Promise.all([
+          this.list('ContextSegmentSource', { source_kind: 'tool_call', source_id: toolCallId }, 2),
+          this.list('ToolModelResult', { tool_call_id: toolCallId }, 2),
+          this.product.application.runtime.effects.readNativeAdmission(toolCallId)
+        ]);
+        if (callSources.length !== 1 || results.length !== 1) {
+          throw new Error('Fork 源模型消息仍有未闭合工具调用，请等待工具完成后再创建分支。');
         }
-        requiredToolPairSegmentIds.push(requireText(
-          pairSources[0].segment_id,
-          'ContextSegmentSource.segment_id'
-        ));
+        const resultSources = await this.list('ContextSegmentSource', {
+          source_kind: 'tool_model_result',
+          source_id: requireText(results[0].id, 'ToolModelResult.id')
+        }, 2);
+        if (resultSources.length !== 1
+          || compareBigInt(callSources[0].source_revision, resultSources[0].source_revision) !== 0) {
+          throw new Error('Fork 源工具结果尚未进入对应的 Context，请等待结果收口。');
+        }
+        const callSegmentId = requireText(callSources[0].segment_id, 'ContextSegmentSource.segment_id');
+        const resultSegmentId = requireText(resultSources[0].segment_id, 'ContextSegmentSource.segment_id');
+        if (!nativeAdmission && callSegmentId !== resultSegmentId) {
+          throw new Error('Fork 源同步工具调用与结果没有组成原子 Context 工具对。');
+        }
+        requiredToolContext.push({ callSegmentId, resultSegmentId, native: nativeAdmission !== undefined });
+        if (nativeAdmission) sourceSegmentIds.add(callSegmentId);
       }
     }
+    if (sourceSegmentIds.size === 0) throw new Error('Fork 源 MessageRevision 尚未进入 Context DAG。');
     const roots = (await this.product.application.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').list({
         where: { conversation_id: sourceConversationId },
@@ -311,22 +370,36 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     let sourceRootId: string | undefined;
     let sourceContextEndSegmentId: string | undefined;
     let sourceContextSegmentIds: string[] | undefined;
+    const nativeContext = nativeMessageProjection || requiredToolContext.some((tool) => tool.native);
     for (const root of roots) {
       const rootId = requireText(root.id, 'ContextSequenceRoot.id');
       const structure = await this.product.application.context.materializeStructure(rootId);
       const segmentIndexes = new Map(structure.records.map((record, index) => [String(record.segment.id), index]));
-      const messageIndex = structure.records.findIndex((record) => sourceSegmentIds.has(String(record.segment.id)));
+      let messageIndex = -1;
+      for (const segmentId of sourceSegmentIds) {
+        const index = segmentIndexes.get(segmentId);
+        if (index === undefined) {
+          messageIndex = -1;
+          break;
+        }
+        messageIndex = Math.max(messageIndex, index);
+      }
       let previousIndex = messageIndex;
-      const containsClosedToolSuffix = messageIndex >= 0 && requiredToolPairSegmentIds.every((segmentId) => {
-        const index = segmentIndexes.get(segmentId) ?? -1;
-        if (index <= previousIndex) return false;
-        previousIndex = index;
+      const containsClosedToolSuffix = messageIndex >= 0 && requiredToolContext.every((tool) => {
+        const callIndex = segmentIndexes.get(tool.callSegmentId) ?? -1;
+        const resultIndex = segmentIndexes.get(tool.resultSegmentId) ?? -1;
+        if (nativeContext) {
+          if (callIndex < 0 || resultIndex < callIndex) return false;
+          previousIndex = Math.max(previousIndex, resultIndex);
+          return true;
+        }
+        if (callIndex <= previousIndex || resultIndex !== callIndex) return false;
+        previousIndex = resultIndex;
         return true;
       });
       if (messageIndex >= 0 && containsClosedToolSuffix) {
         sourceRootId = rootId;
-        sourceContextEndSegmentId = requiredToolPairSegmentIds.at(-1)
-          ?? requireText(structure.records[messageIndex].segment.id, 'ContextSegment.id');
+        sourceContextEndSegmentId = requireText(structure.records[previousIndex].segment.id, 'ContextSegment.id');
         sourceContextSegmentIds = structure.records.slice(0, previousIndex + 1).map((record) =>
           requireText(record.segment.id, 'ContextSegment.id')
         );
@@ -520,6 +593,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     const backupPath = path.join(backupRoot, timestampSlug());
     this.unsubscribeCommit?.();
     this.unsubscribeCommit = undefined;
+    this.unsubscribeSteering?.();
+    this.unsubscribeSteering = undefined;
     this.productClosed = true;
     await this.product.close();
     let archived = false;
@@ -574,6 +649,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   public detachWebview(clientId: BridgeClientId): void {
+    this.commandRouter.detachClient(clientId);
     this.webviews.delete(clientId);
     this.product.application.webviewFeed.detach(clientId);
   }
@@ -598,6 +674,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.interactionAttentionNotifier.clear();
     this.unsubscribeCommit?.();
     this.unsubscribeCommit = undefined;
+    this.unsubscribeSteering?.();
+    this.unsubscribeSteering = undefined;
     this.externalHistoryWatcher.cancel();
     // Host handoff must not wait behind a projection read which the old Host no longer needs.
     // Closing the product below rejects/settles ordinary database work; keep rejection observed.
