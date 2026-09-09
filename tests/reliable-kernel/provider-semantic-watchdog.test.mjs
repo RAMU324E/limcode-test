@@ -1227,8 +1227,14 @@ test('冻结 retryMaxAttempts=3 允许连续 transient failures 后第四个 Att
 test('已提交 retrying/not-before 在 Host handoff 后由新 ControlPlane 恢复，且永久错误不重试', async () => {
   await withApp('provider-retry-recovery', async (app, conversationId, turnId) => {
     const handoffRetryDelayMs = 10_000;
+    // This case proves durable retry ownership across handoff, not short watchdog deadlines.
+    // A completed checkpoint may await ordinary fsync longer than the helper's 30ms idle budget.
+    const semanticTimeouts = {
+      firstSemanticMs: kernel.RELIABLE_PROVIDER_SEMANTIC_DEADLINES_MS.ordinaryFirst,
+      semanticIdleMs: kernel.RELIABLE_PROVIDER_SEMANTIC_DEADLINES_MS.ordinaryIdle
+    };
     const request = await createRequest(app, conversationId, turnId, 'retry-recovery');
-    const firstHost = controlPlane(app, { retryDelaysMs: [handoffRetryDelayMs] });
+    const firstHost = controlPlane(app, { retryDelaysMs: [handoffRetryDelayMs], semanticTimeouts });
     const firstDispatch = firstHost.dispatch(request.modelRequestId, {
       providerId: 'provider-watchdog',
       async sendFullRequest() {
@@ -1241,7 +1247,7 @@ test('已提交 retrying/not-before 在 Host handoff 后由新 ControlPlane 恢�
     await firstHost.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture handoff'));
     await assert.rejects(firstDispatch, /handoff/i);
 
-    const secondHost = controlPlane(app, { retryDelaysMs: [handoffRetryDelayMs] });
+    const secondHost = controlPlane(app, { retryDelaysMs: [handoffRetryDelayMs], semanticTimeouts });
     secondHost.epochNow = () => Date.now() + handoffRetryDelayMs;
     await secondHost.dispatch(request.modelRequestId, {
       providerId: 'provider-watchdog',
