@@ -6,6 +6,8 @@ import {
 } from './repositories';
 import { conversationProjectLinkInsertStep } from './conversationProject';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
+import type { ContentAddressedStore } from './contentAddressedStore';
+import { ReliableContextTokenEstimator } from './contextTokenEstimator';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export interface ConversationForkCommand {
@@ -65,12 +67,15 @@ interface ForkRootShape {
  */
 export class ConversationForkControlPlane {
   private readonly now: () => string;
+  private readonly tokenEstimator: ReliableContextTokenEstimator;
 
   public constructor(
     private readonly database: RuntimeDatabase,
+    contentStore: ContentAddressedStore,
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
   public async fork(commandInput: ConversationForkCommand): Promise<ConversationForkResult> {
@@ -230,6 +235,7 @@ export class ConversationForkControlPlane {
     const now = this.timestamp();
     const targetRootShape = await resolveForkRootShape(
       this.database,
+      this.tokenEstimator,
       sourceRoot,
       command.sourceContextEndSegmentId
     );
@@ -661,6 +667,7 @@ function requireBigInt(value: unknown, label: string): bigint {
 
 async function resolveForkRootShape(
   database: RuntimeDatabase,
+  tokenEstimator: ReliableContextTokenEstimator,
   sourceRoot: DomainRow,
   endSegmentId: string | undefined
 ): Promise<ForkRootShape> {
@@ -689,8 +696,6 @@ async function resolveForkRootShape(
       : null,
     tailSegmentCount: compressed ? BigInt(prefix.length - 1) : 0n,
     segmentCount: BigInt(prefix.length),
-    estimatedTokens: prefix.reduce((total, record) =>
-      total + (requireBigInt(record.contentObject.byte_length, 'ContentObject.byte_length') + 3n) / 4n,
-    0n)
+    estimatedTokens: BigInt(await tokenEstimator.estimateRootPrefix(rootId, prefix.length))
   };
 }

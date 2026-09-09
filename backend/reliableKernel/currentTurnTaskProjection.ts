@@ -254,6 +254,41 @@ export async function readCurrentTurnTaskCard(
     });
   }
 
+  const copiedArtifacts = calls.flatMap((call) => {
+    const toolCallId = requiredText(call.id, 'ToolCall.id');
+    const artifact = asRecord(artifactByCallId.get(toolCallId));
+    if (
+      !ordering.has(toolCallId)
+      || !artifact
+      || typeof artifact.toolCallId !== 'string'
+      || taskArtifactIdentifiesToolCall(artifact.toolCallId, toolCallId, conversationId)
+    ) return [];
+    return [{ toolCallId, sourceToolCallId: artifact.toolCallId, callSeq: call.call_seq, artifact }];
+  });
+  let frozenAtCommitSeq = messageBarrier.snapshotCommitSeq;
+  if (copiedArtifacts.length > 0) {
+    const sourcesBarrier = await database.snapshot(copiedArtifacts.flatMap((copy) =>
+      [copy.toolCallId, copy.sourceToolCallId].map((sourceId) =>
+        DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+          where: {
+            source_kind: 'tool_call',
+            source_id: sourceId,
+            source_revision: positiveBigInt(copy.callSeq, 'ToolCall.call_seq')
+          },
+          limit: 2
+        }))));
+    for (const [index, copy] of copiedArtifacts.entries()) {
+      const currentSources = rows(sourcesBarrier.snapshot[index * 2]);
+      const originalSources = rows(sourcesBarrier.snapshot[index * 2 + 1]);
+      if (
+        currentSources.length === 1
+        && originalSources.length === 1
+        && currentSources[0].segment_id === originalSources[0].segment_id
+      ) artifactByCallId.set(copy.toolCallId, { ...copy.artifact, toolCallId: copy.toolCallId });
+    }
+    frozenAtCommitSeq = sourcesBarrier.snapshotCommitSeq;
+  }
+
   const operations: CurrentTurnTaskOperationFact[] = [];
   for (const call of calls) {
     const toolCallId = requiredText(call.id, 'ToolCall.id');
@@ -292,7 +327,7 @@ export async function readCurrentTurnTaskCard(
   const projection = buildCurrentTurnTaskProjection({
     turnId,
     operations,
-    frozenAtCommitSeq: messageBarrier.snapshotCommitSeq
+    frozenAtCommitSeq
   });
   return projection ? freezeCurrentTurnTaskCard(projection) : undefined;
 }
@@ -434,18 +469,22 @@ function taskArtifactEnvelope(
 ): TaskArtifactEnvelope {
   const record = asRecord(value);
   if (!record) throw new Error(`ToolResultArtifact ${expectedToolCallId} content is not an object.`);
-  if (
-    record.toolCallId !== expectedToolCallId
-    && (
-      typeof record.toolCallId !== 'string'
-      || conversationId === undefined
-      || conversationForkSnapshotCopyId(conversationId, 'tool_call', record.toolCallId) !== expectedToolCallId
-    )
-  ) {
+  if (!taskArtifactIdentifiesToolCall(record.toolCallId, expectedToolCallId, conversationId)) {
     throw new Error(`ToolResultArtifact ${expectedToolCallId} identifies another ToolCall.`);
   }
   if (typeof record.status !== 'string') throw new Error(`ToolResultArtifact ${expectedToolCallId} has no status.`);
   return { toolCallId: expectedToolCallId, status: record.status, detail: record.detail };
+}
+
+function taskArtifactIdentifiesToolCall(
+  toolCallId: unknown,
+  expectedToolCallId: string,
+  conversationId?: string
+): boolean {
+  return toolCallId === expectedToolCallId
+    || (typeof toolCallId === 'string'
+      && conversationId !== undefined
+      && conversationForkSnapshotCopyId(conversationId, 'tool_call', toolCallId) === expectedToolCallId);
 }
 
 async function readJson(
