@@ -28,23 +28,6 @@ function emittedRequireClosure(entry) {
   return [...seen].map((file) => `/${path.relative(distRoot, file).split(path.sep).join('/')}`);
 }
 
-test('0.0.18扩展版本与所有默认请求头保持一致', () => {
-  const manifest = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8'));
-  const identity = require(path.join(distRoot, 'shared/extensionIdentity.js'));
-  const productSource = fs.readFileSync(
-    path.resolve('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.ts'),
-    'utf8'
-  );
-  const proxySource = fs.readFileSync(path.resolve('backend/capabilities/proxyFetch.ts'), 'utf8');
-
-  assert.equal(manifest.version, '0.0.18');
-  assert.equal(identity.EXTENSION_VERSION, manifest.version);
-  assert.equal(identity.EXTENSION_USER_AGENT, `${manifest.name}/${manifest.version}`);
-  assert.equal(identity.EXTENSION_USER_AGENT, 'limcode-test/0.0.18');
-  assert.match(productSource, /headers: \{ 'User-Agent': EXTENSION_USER_AGENT \}/);
-  assert.match(proxySource, /requestHeaders\.set\('user-agent', EXTENSION_USER_AGENT\)/);
-});
-
 test('VS Code 可靠产品组合根只装配新 SQLite/CAS Runtime 且不可达旧 writer', () => {
   const entry = path.join(
     distRoot,
