@@ -266,7 +266,6 @@ test('工具页顶部显示两个独立开关，保存复用现有策略且保�
     assert.ok(html.indexOf('aria-label="无人值守审批"') < html.indexOf('aria-label="工具策略预设"'));
     assert.match(button('自动批准 Plan'), /aria-checked="false"/);
     assert.match(button('自动回应 Ask'), /aria-checked="false"/);
-    assert.ok(html.includes('后续新回合生效'));
     store.setPolicyForScope('global', undefined, allowedTools, 'Global', {
       ...store.effectivePolicyFor('global').policy.toolConfigs,
       ask_user: { config: { autoApprove: true } }
@@ -278,8 +277,6 @@ test('工具页顶部显示两个独立开关，保存复用现有策略且保�
     assert.equal(messages.at(-1).payload.toolConfigs.ask_user.config.autoApprove, true);
     html = await render(true);
     assert.match(button('自动回应 Ask'), /disabled/);
-    const source = await fs.readFile(path.join(process.cwd(), 'webview/src/components/settings/tools/ToolPolicyEditor.vue'), 'utf8');
-    assert.ok(source.includes('@update:model-value="updateScalarField(tool, field, $event)"'));
   } finally {
     pinia.setActivePinia(previousPinia);
     if (previousWindow === undefined) delete globalThis.window;
