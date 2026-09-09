@@ -6,6 +6,7 @@ import {
   type AppearanceSettingsRecord,
   createMessageId,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
   DEFAULT_LLM_RETRY_ON_ERROR,
@@ -577,6 +578,7 @@ function normalizeCompressionConfigForUi(
 ): LlmCompressionConfigRecord {
   return {
     ...config,
+    maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(config.maxDurationMinutes),
     trigger: normalizeCompressionTriggerForUi(config.trigger, contextWindowTokens)
   };
 }
@@ -714,6 +716,7 @@ function toPlainCompressionConfig(config: LlmCompressionConfigRecord): LlmCompre
     id: normalized.id,
     name: normalized.name,
     kind: normalized.kind,
+    maxDurationMinutes: normalized.maxDurationMinutes,
     trigger: {
       mode: normalized.trigger.mode,
       ...(normalized.trigger.thresholdTokens !== undefined ? { thresholdTokens: normalized.trigger.thresholdTokens } : {}),
@@ -1476,6 +1479,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.queueLlmCompressionConfigsAutoSave();
       this.selectCompressionConfigForActiveProvider(config.id);
     },
+    setActiveCompressionMaxDurationMinutes(value: number): void {
+      const config = this.ensureCompressionConfigForActiveProvider();
+      if (!config) return;
+      this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
+      this.selectCompressionConfigForActiveProvider(config.id);
+    },
     setActiveCompressionMethodKind(kind: SelectableCompressionMethodKind): void {
       const config = this.ensureCompressionConfigForActiveProvider();
       if (!config) return;
@@ -1532,6 +1541,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       }
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
+      this.selectCompressionConfigForActiveModel(modelId, config.id);
+    },
+    setModelCompressionMaxDurationMinutes(modelId: string, value: number): void {
+      const config = this.ensureCompressionConfigForActiveModel(modelId);
+      if (!config) return;
+      this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
       this.selectCompressionConfigForActiveModel(modelId, config.id);
     },
     setModelCompressionProviderConfig(modelId: string, providerConfigId: string): void {

@@ -456,6 +456,151 @@ test('Gemini dry-run removes unsupported propertyNames and multipleOf from neste
   assert.deepEqual(declaration.parameters.properties.options.required, ['title']);
 });
 
+function exclusiveBoundsTool() {
+  const selection = {
+    type: 'object',
+    properties: { radius: { type: 'number', exclusiveMinimum: 0 } }
+  };
+  return {
+    name: 'live2d_rig_transform',
+    description: 'Transform selected geometry.',
+    parameters: {
+      type: 'object',
+      properties: {
+        operations: {
+          type: 'array', minItems: 1, maxItems: 32,
+          items: { type: 'object', properties: { selection } }
+        },
+        range: structuredClone(selection),
+        selection,
+        bounded: { type: 'number', minimum: 0, maximum: 100, exclusiveMinimum: 1, exclusiveMaximum: 99 },
+        exclusiveMinimum: { type: 'string' },
+        exclusiveMaximum: { type: 'string' },
+        propertyNames: { type: 'string' },
+        title: { type: 'string' }
+      },
+      required: ['operations', 'exclusiveMinimum', 'exclusiveMaximum', 'propertyNames', 'title']
+    }
+  };
+}
+
+function assertGeminiBoundsCompatibility(parameters, originalParameters) {
+  const properties = parameters.properties;
+  assert.deepEqual(properties.operations.items.properties.selection.properties.radius, { type: 'number' });
+  assert.deepEqual(properties.range.properties.radius, { type: 'number' });
+  assert.deepEqual(properties.selection.properties.radius, { type: 'number' });
+  assert.deepEqual(properties.bounded, { type: 'number', minimum: 0, maximum: 100 });
+  assert.equal(properties.operations.minItems, 1);
+  assert.equal(properties.operations.maxItems, 32);
+  for (const name of ['exclusiveMinimum', 'exclusiveMaximum', 'propertyNames', 'title']) {
+    assert.deepEqual(properties[name], { type: 'string' });
+  }
+  assert.deepEqual(parameters.required, originalParameters.required);
+}
+
+for (const [providerKind, modelId] of [
+  ['gemini', '[FB]-gemini-3.8-flash'],
+  ['openai-compatible', 'gemini-3.8-flash'],
+  ['openai-compatible', 'firebase/gemini-3.8-flash'],
+  ['openai-compatible', '[FB]-gemini-3.8-flash'],
+  ['openai-compatible', 'models/gemini-2.5-pro'],
+  ['openai-compatible', 'GEMINI-1.5-PRO']
+]) {
+  test(`${providerKind} ${modelId} removes exclusive bounds only from outbound Gemini schemas`, async () => {
+    const request = chatRequest('gemini-exclusive-bounds');
+    request.tools = [exclusiveBoundsTool()];
+    const original = structuredClone(request);
+    const result = await dryRunLlmProvider(request, {
+      settings: async () => providerConfig({ provider: providerKind, model: modelId, models: [] })
+    });
+    const declaration = providerKind === 'gemini'
+      ? result.body.tools[0].functionDeclarations[0]
+      : result.body.tools[0].function;
+    assert.equal(declaration.name, request.tools[0].name);
+    assertGeminiBoundsCompatibility(declaration.parameters, original.tools[0].parameters);
+    assert.deepEqual(request, original);
+  });
+}
+
+for (const [providerKind, modelId] of [
+  ['openai-compatible', 'gpt-6-astra'],
+  ['openai-compatible', 'qwen3.8-max'],
+  ['openai-compatible', 'gemini-3-relay/gpt-6-astra'],
+  ['openai-compatible', '[gemini-3-relay]-qwen3.8-max'],
+  ['openai-responses', 'gpt-6-astra']
+]) {
+  test(`${providerKind} ${modelId} keeps non-Gemini tool schema bounds unchanged`, async () => {
+    const request = chatRequest('non-gemini-exclusive-bounds');
+    request.tools = [exclusiveBoundsTool()];
+    const original = structuredClone(request);
+    const result = await dryRunLlmProvider(request, {
+      settings: async () => providerConfig({ provider: providerKind, model: modelId, models: [] })
+    });
+    const declaration = providerKind === 'openai-responses' ? result.body.tools[0] : result.body.tools[0].function;
+    assert.deepEqual(declaration.parameters, original.tools[0].parameters);
+    assert.deepEqual(request, original);
+  });
+}
+
+for (const providerKind of ['gemini', 'openai-compatible']) {
+  test(`${providerKind} Gemini sends compatible MCP schemas without changing tool history or signatures`, async (context) => {
+    const request = chatRequest('gemini-exclusive-bounds-wire');
+    request.tools = [exclusiveBoundsTool()];
+    request.contents = [
+      {
+        role: 'model',
+        parts: [{
+          id: 'call-rig',
+          functionCall: { name: 'live2d_rig_transform', args: { radius: 0.5, exclusiveMinimum: 'argument' } },
+          thoughtSignature: 'gemini:retained-signature'
+        }]
+      },
+      {
+        role: 'user',
+        parts: [{
+          id: 'call-rig',
+          functionResponse: { name: 'live2d_rig_transform', response: { exclusiveMinimum: 'tool result' } }
+        }]
+      }
+    ];
+    const original = structuredClone(request);
+    const requestBodies = [];
+    context.mock.method(globalThis, 'fetch', async (_input, init) => {
+      requestBodies.push(JSON.parse(init.body));
+      const chunk = providerKind === 'gemini'
+        ? { candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] }
+        : { choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] };
+      return new Response(`data: ${JSON.stringify(chunk)}\n\n${providerKind === 'gemini' ? '' : 'data: [DONE]\n\n'}`, {
+        headers: { 'content-type': 'text/event-stream' }
+      });
+    });
+    const events = [];
+    await startLlmProvider(request, (event) => events.push(event), {
+      settings: async () => providerConfig({ provider: providerKind, model: 'gemini-3.8-flash', models: [] })
+    });
+    assert.equal(requestBodies.length, 1);
+    const body = requestBodies[0];
+    const declaration = providerKind === 'gemini' ? body.tools[0].functionDeclarations[0] : body.tools[0].function;
+    assertGeminiBoundsCompatibility(declaration.parameters, original.tools[0].parameters);
+    if (providerKind === 'gemini') {
+      assert.equal(body.contents[0].parts[0].thoughtSignature, 'retained-signature');
+      assert.deepEqual(body.contents[0].parts[0].functionCall.args, original.contents[0].parts[0].functionCall.args);
+      assert.equal(body.contents[1].parts[0].functionResponse.response.exclusiveMinimum, 'tool result');
+    } else {
+      const call = body.messages[0].tool_calls[0];
+      assert.equal(call.extra_content.google.thought_signature, 'retained-signature');
+      assert.equal(call.extra_content.google.thoughtSignature, 'retained-signature');
+      assert.equal(call.id, 'call-rig');
+      assert.deepEqual(JSON.parse(call.function.arguments), original.contents[0].parts[0].functionCall.args);
+      assert.equal(body.messages[1].tool_call_id, 'call-rig');
+      assert.equal(JSON.parse(body.messages[1].content).exclusiveMinimum, 'tool result');
+    }
+    assert.equal(events.some((event) => event.type === LlmEventType.Error), false);
+    assert.equal(events.some((event) => event.type === LlmEventType.Done), true);
+    assert.deepEqual(request, original);
+  });
+}
+
 function geminiProviderConfig(overrides = {}) {
   return providerConfig({
     provider: 'gemini',
@@ -621,6 +766,99 @@ test('Gemini dry-run merges split parallel function responses into one turn', as
     ['call-read-a', 'call-read-b']
   );
   assert.equal(result.body.contents[2].parts[0].text, 'continue');
+});
+
+function claudeProviderConfig(overrides = {}) {
+  return providerConfig({
+    provider: 'claude',
+    baseUrl: 'https://api.anthropic.com/v1',
+    model: 'claude-test',
+    models: [],
+    ...overrides
+  });
+}
+
+function claudeRenderCall(callId) {
+  return { id: callId, functionCall: { name: 'live2d_view_render_model', args: { callId } } };
+}
+
+function claudeRenderResponse(callId, withImage = false) {
+  return {
+    id: callId,
+    functionResponse: {
+      name: 'live2d_view_render_model',
+      response: { ok: true, callId },
+      ...(withImage
+        ? { parts: [{ inlineData: { mimeType: 'image/png', name: `${callId}.png`, data: 'iVBORw0KGgo=' } }] }
+        : {})
+    }
+  };
+}
+
+async function dryRunClaudeMessages(id, contents) {
+  const request = chatRequest(id);
+  request.contents = contents;
+  const result = await dryRunLlmProvider(request, { settings: async () => claudeProviderConfig() });
+  return result.body.messages;
+}
+
+function claudeToolResultIds(message) {
+  return (Array.isArray(message.content) ? message.content : [])
+    .filter((block) => block.type === 'tool_result')
+    .map((block) => block.tool_use_id);
+}
+
+test('Claude dry-run 把并行工具结果与夹在中间的附件目录并入紧邻的一条 user 消息', async () => {
+  const messages = await dryRunClaudeMessages('claude-parallel-tool-results', [
+    { role: 'user', parts: [{ text: '把模型左右转到极限并各渲染一张' }] },
+    {
+      role: 'model',
+      parts: [claudeRenderCall('toolu_A'), claudeRenderCall('toolu_B'), claudeRenderCall('toolu_C')]
+    },
+    { role: 'user', parts: [claudeRenderResponse('toolu_A', true)] },
+    { role: 'user', parts: [{ text: '[附件目录] toolu_B.png' }] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_B', true)] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_C')] }
+  ]);
+
+  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'user']);
+  assert.deepEqual(messages[1].content.map((block) => block.id), ['toolu_A', 'toolu_B', 'toolu_C']);
+  assert.deepEqual(claudeToolResultIds(messages[2]), ['toolu_A', 'toolu_B', 'toolu_C']);
+  // tool_result 必须排在最前，夹在中间的附件目录文本按原顺序追加在其后。
+  assert.deepEqual(messages[2].content.slice(3), [{ type: 'text', text: '[附件目录] toolu_B.png' }]);
+  assert.deepEqual(messages[2].content[0].content[1], {
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' }
+  });
+});
+
+test('Claude dry-run 分别配对相邻两批并行工具调用', async () => {
+  const messages = await dryRunClaudeMessages('claude-consecutive-tool-batches', [
+    { role: 'user', parts: [{ text: '连续两轮渲染' }] },
+    { role: 'model', parts: [claudeRenderCall('toolu_A'), claudeRenderCall('toolu_B')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_A')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_B')] },
+    { role: 'model', parts: [claudeRenderCall('toolu_C'), claudeRenderCall('toolu_D')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_C')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_D')] }
+  ]);
+
+  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'user', 'assistant', 'user']);
+  assert.deepEqual(claudeToolResultIds(messages[2]), ['toolu_A', 'toolu_B']);
+  assert.deepEqual(claudeToolResultIds(messages[4]), ['toolu_C', 'toolu_D']);
+});
+
+test('Claude dry-run 不改动已经正确配对的工具轮次与其后的人类发言', async () => {
+  const messages = await dryRunClaudeMessages('claude-already-paired', [
+    { role: 'user', parts: [{ text: '渲染一张' }] },
+    { role: 'model', parts: [claudeRenderCall('toolu_A')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_A')] },
+    { role: 'user', parts: [{ text: '继续' }] }
+  ]);
+
+  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'user', 'user']);
+  assert.deepEqual(claudeToolResultIds(messages[2]), ['toolu_A']);
+  assert.equal(messages[3].content, '继续');
 });
 
 test('Gemini thinking capability follows model-specific official level sets', () => {

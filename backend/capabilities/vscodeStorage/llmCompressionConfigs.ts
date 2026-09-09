@@ -10,7 +10,8 @@ import type {
 import {
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
-  createDefaultLlmCompressionConfig
+  createDefaultLlmCompressionConfig,
+  normalizeLlmCompressionMaxDurationMinutes
 } from '../../../shared/protocol';
 import { isSettingsRevisionConflictError } from '../settingsRevisionConflict';
 import type { StoragePaths } from './paths';
@@ -133,6 +134,7 @@ export function normalizeLlmCompressionConfig(input: Partial<LlmCompressionConfi
     name: stringOrDefault(input?.name, fallback.name),
     kind,
     trigger,
+    maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(input?.maxDurationMinutes),
     ...(normalizeOpenAICompact(input?.openaiResponsesCompact) ? { openaiResponsesCompact: normalizeOpenAICompact(input?.openaiResponsesCompact) } : {}),
     ...(llmSummary ? { llmSummary } : {}),
     createdAt,

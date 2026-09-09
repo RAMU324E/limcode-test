@@ -121,3 +121,20 @@ storage.loadActiveLlmProviderConfig()
 6. 如果未来需要被 Agent/Workflow 等引用，是否计划用 Link 存 id，而不是嵌入配置对象？
 7. 是否通过 getPaths() 获取路径？
 ```
+
+## 7. 压缩时限设置
+
+- 设置入口位于渠道默认配置和 LLM 专属配置的“上下文压缩”模块末尾，复用 `LlmCompressionSettingsEditor`。
+- `LlmCompressionConfigRecord.maxDurationMinutes` 表示一次压缩尝试的总时限，单位为整数分钟，默认 `20`，范围 `1–1440`；空值或非数值使用默认值。
+- 该字段属于现有 `llmCompressionConfigs` record，通过原有全局设置更新通道、独立 record 存储及修订检查保存；渠道与模型仍复用现有绑定和写时复制规则。
+- 时限随 Turn 的 compression authority 冻结。修改在使用新配置快照的回合生效，不读取实时设置来改变在途请求或自动重试。
+- 此设置只影响压缩请求，不改变普通聊天的 20 分钟总时限，也不改变压缩连续 270 秒无真实文本或思考进度的超时保护。每次自动重试重新计时，重试预算与取消机制保持不变。
+
+## 8. Ask / Plan 无人值守审批
+
+- 设置入口位于“工具”页顶部的“无人值守审批”区块，提供“自动批准 Plan”和“自动回应 Ask”两个独立开关，默认均关闭。
+- 复用现有 ToolPolicy record 与配置保存通道，分别存储为 submit_plan 和 ask_user 的 toolConfigs 配置中的 config.autoApprove。全局策略按原有规则被 Agent / 工作流 / 对话继承，局部 false 可以覆盖全局 true。
+- 设置随 Turn 的工具权限快照冻结，仅对后续新回合生效；修改开关不会追溯批准已等待的交互，已有等待需手动处理一次。
+- Plan 自动批准后在当前会话继续，不创建新的子 Agent；子 Agent 按父任务授权自动批准 Plan 的既有行为不变。
+- Ask 自动返回明确标记为系统回复的自主决策指引，不代选第一个选项、不伪造用户具体回答。需要人工提供凭据或关键决策的任务不宜开启。
+- 自动响应仍保存 InteractionRequest / InteractionResponse / OperationResolution，保留首响应优先、恢复和取消语义；不绕过工具禁用、命令执行或文件修改审批。

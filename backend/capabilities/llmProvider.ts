@@ -43,6 +43,7 @@ import {
   DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT,
   DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT,
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+  normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT,
@@ -179,6 +180,7 @@ export interface LlmProviderOptions {
   headers?: MaybeProvider<Record<string, string>>;
   resolveAttachment?: (input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }) => Promise<InlineDataPart | undefined>;
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
+  onCompressionProgress?: () => void;
 }
 interface RetryControl {
   cancelRequested: boolean;
@@ -1477,10 +1479,17 @@ export async function compactLlmProvider(
     const maxRetries = normalizeRetryMaxAttempts(retrySettings?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
     let retryCount = 0;
     let sawRetry = false;
+    const handlerOptions: LlmProviderOptions = {
+      ...options,
+      onCompressionProgress: () => {
+        if (signal?.aborted) return;
+        emit({ type: LlmEventType.CompactProgress, payload: { requestId: request.id } });
+      }
+    };
 
     while (true) {
       try {
-        const result = await handler(handlerRequest, methodConfig, options, signal);
+        const result = await handler(handlerRequest, methodConfig, handlerOptions, signal);
         logCompressionDebug('provider.compact.done', {
           ...compactRequestDebugInfo(request),
           resultId: result.id,
@@ -2710,6 +2719,7 @@ interface ResolvedSummaryProvider {
   proxy?: string;
   webSocketSessionKey?: string;
   omitUnsupportedMaxOutputTokens: boolean;
+  onCompressionProgress?: () => void;
 }
 
 /** 组装总结用 provider（复用运行时渠道解析 + 代理/头合并）；无 API Key 时 provider 为 undefined 表示回退确定性摘要。 */
@@ -2768,6 +2778,7 @@ async function resolveSummaryProvider(
     stream: settings.stream !== false,
     apiKeyAvailable,
     unified,
+    onCompressionProgress: options.onCompressionProgress,
     ...(proxy ? { proxy } : {}),
     ...(isOpenAIResponsesWebSocketMode(settings)
       ? {
@@ -3346,6 +3357,11 @@ async function executeSummaryProviderCall(
           }));
         }
         text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
+        if (chunk.textDelta?.trim() || chunk.partsDelta?.some((part) =>
+          'text' in part && typeof part.text === 'string' && part.text.trim()
+        )) {
+          resolved.onCompressionProgress?.();
+        }
       }
       return text;
     }
@@ -3511,6 +3527,7 @@ function normalizeCompressionConfig(input: LlmCompressionConfigRecord | undefine
     id: input?.id ?? 'inline-compression-config',
     name: input?.name ?? '临时压缩方法',
     kind,
+    maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(input?.maxDurationMinutes),
     trigger: input?.trigger ?? { mode: 'manual' },
     ...(input?.openaiResponsesCompact ? { openaiResponsesCompact: input.openaiResponsesCompact } : {}),
     ...(input?.llmSummary ? { llmSummary: input.llmSummary } : {}),
@@ -4768,7 +4785,11 @@ function installProviderSchemaEncoder<T>(
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
-  if (providerKind !== 'gemini' && providerKind !== 'openai-responses') return provider;
+  const geminiOpenAICompatible = providerKind === 'openai-compatible'
+    && /^gemini-(?:\d|pro(?:-|$)|flash(?:-|$))/i.test(
+      modelId.slice(modelId.lastIndexOf('/') + 1).trim().replace(/^\[[^\]]+\][\s_-]*/, '')
+    );
+  if (providerKind !== 'gemini' && providerKind !== 'openai-responses' && providerKind !== 'claude' && !geminiOpenAICompatible) return provider;
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
@@ -4783,8 +4804,10 @@ function installProviderSchemaEncoder<T>(
       ? normalizeGeminiThinkingRequest(request, modelId)
       : request;
     const encoded = originalEncodeRequest(normalizedRequest, stream);
-    if (providerKind === 'gemini') {
-      restoreGeminiToolPropertyNames(encoded, normalizedRequest);
+    if (providerKind === 'gemini' || geminiOpenAICompatible) {
+      restoreGeminiToolSchemas(encoded, normalizedRequest);
+    } else if (providerKind === 'claude') {
+      restoreClaudeToolResultPairing(encoded);
     } else if (isRecord(encoded) && Array.isArray(encoded.tools)) {
       for (const tool of encoded.tools) {
         if (isRecord(tool) && tool.type === 'function' && tool.name === 'edit') tool.strict = false;
@@ -4794,6 +4817,76 @@ function installProviderSchemaEncoder<T>(
   };
   format.__limcodeProviderSchemaEncoder = true;
   return provider;
+}
+
+interface ClaudeToolResultBatch {
+  toolResults: unknown[];
+  trailing: unknown[];
+  endIndexExclusive: number;
+}
+
+/**
+ * Claude 要求一条 assistant 消息里的每个 tool_use 都在紧随其后的那一条 user 消息里拿到 tool_result。
+ * 规范上下文把每个工具结果冻结成独立片段，附件目录之类的片段还会排在它们中间，编码后就是多条 user 消息，
+ * 并行工具调用因此被判为 `tool_use ids were found without tool_result blocks immediately after`。
+ * 这里只重排 Claude 出站消息：同一批 tool_result 合并进紧邻的一条 user 消息，夹在中间的其他内容按原顺序追加到其后。
+ */
+function restoreClaudeToolResultPairing(encodedRequest: unknown): void {
+  if (!isRecord(encodedRequest) || !Array.isArray(encodedRequest.messages)) return;
+  const messages = encodedRequest.messages;
+  const paired: unknown[] = [];
+  let regrouped = false;
+  for (let index = 0; index < messages.length; index += 1) {
+    paired.push(messages[index]);
+    const toolUseIds = claudeToolUseIds(messages[index]);
+    if (toolUseIds.length === 0) continue;
+    const batch = collectClaudeToolResults(messages, index + 1, toolUseIds);
+    if (!batch) continue;
+    paired.push({ role: 'user', content: [...batch.toolResults, ...batch.trailing] });
+    if (batch.endIndexExclusive > index + 2 || batch.trailing.length > 0) regrouped = true;
+    index = batch.endIndexExclusive - 1;
+  }
+  if (regrouped) encodedRequest.messages = paired;
+}
+
+function claudeToolUseIds(message: unknown): string[] {
+  if (!isRecord(message) || message.role !== 'assistant' || !Array.isArray(message.content)) return [];
+  return message.content.flatMap((block) => isRecord(block)
+    && block.type === 'tool_use'
+    && typeof block.id === 'string'
+    && block.id.length > 0
+    ? [block.id]
+    : []);
+}
+
+/** Scans the user messages that answer one assistant tool_use batch; stops at the first non-user message. */
+function collectClaudeToolResults(
+  messages: readonly unknown[],
+  startIndex: number,
+  toolUseIds: readonly string[]
+): ClaudeToolResultBatch | undefined {
+  const pending = new Set(toolUseIds);
+  const toolResults: unknown[] = [];
+  const trailing: unknown[] = [];
+  let index = startIndex;
+  for (; index < messages.length && pending.size > 0; index += 1) {
+    const message = messages[index];
+    if (!isRecord(message) || message.role !== 'user') break;
+    for (const block of claudeContentBlocks(message.content)) {
+      const toolUseId = isRecord(block) && block.type === 'tool_result' && typeof block.tool_use_id === 'string'
+        ? block.tool_use_id
+        : undefined;
+      if (toolUseId !== undefined && pending.delete(toolUseId)) toolResults.push(block);
+      else trailing.push(block);
+    }
+  }
+  return toolResults.length > 0 ? { toolResults, trailing, endIndexExclusive: index } : undefined;
+}
+
+function claudeContentBlocks(content: unknown): unknown[] {
+  if (Array.isArray(content)) return content;
+  if (typeof content === 'string' && content.length > 0) return [{ type: 'text', text: content }];
+  return [];
 }
 
 const GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR = 'skip_thought_signature_validator';
@@ -5007,7 +5100,7 @@ function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unkn
     : requestWithoutGenerationConfig;
 }
 
-function restoreGeminiToolPropertyNames(encodedRequest: unknown, sourceRequest: unknown): void {
+function restoreGeminiToolSchemas(encodedRequest: unknown, sourceRequest: unknown): void {
   if (!isRecord(encodedRequest) || !isRecord(sourceRequest)) return;
   const encodedGroups = Array.isArray(encodedRequest.tools) ? encodedRequest.tools : [];
   const sourceGroups = Array.isArray(sourceRequest.tools) ? sourceRequest.tools : [];
@@ -5018,14 +5111,16 @@ function restoreGeminiToolPropertyNames(encodedRequest: unknown, sourceRequest: 
   const sourceByName = new Map(sourceDeclarations
     .filter((declaration) => typeof declaration.name === 'string')
     .map((declaration) => [declaration.name as string, declaration]));
-  for (const group of encodedGroups) {
-    if (!isRecord(group) || !Array.isArray(group.functionDeclarations)) continue;
-    for (const declaration of group.functionDeclarations) {
-      if (!isRecord(declaration) || typeof declaration.name !== 'string') continue;
-      const source = sourceByName.get(declaration.name);
-      if (!source?.parameters) continue;
-      declaration.parameters = sanitizeGeminiFunctionSchema(source.parameters);
-    }
+  const encodedDeclarations = encodedGroups.flatMap((group) => {
+    if (!isRecord(group)) return [];
+    if (Array.isArray(group.functionDeclarations)) return group.functionDeclarations.filter(isRecord);
+    return group.type === 'function' && isRecord(group.function) ? [group.function] : [];
+  });
+  for (const declaration of encodedDeclarations) {
+    if (typeof declaration.name !== 'string') continue;
+    const source = sourceByName.get(declaration.name);
+    if (!source?.parameters) continue;
+    declaration.parameters = sanitizeGeminiFunctionSchema(source.parameters);
   }
 }
 
@@ -5043,7 +5138,9 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   'prefixItems',
   'additionalProperties',
   'propertyNames',
-  'multipleOf'
+  'multipleOf',
+  'exclusiveMinimum',
+  'exclusiveMaximum'
 ]);
 
 function sanitizeGeminiFunctionSchema(value: unknown): unknown {

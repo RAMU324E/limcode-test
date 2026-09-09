@@ -537,6 +537,8 @@ export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 4;
 export const MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS = 10;
 export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
 export const DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT = 90;
+export const DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES = 20;
+export const MAX_LLM_COMPRESSION_DURATION_MINUTES = 1_440;
 /** Decimal token cap for the model-visible conversation body after text compaction. */
 export const MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS = 48_000;
 /** Default and hard cap for the visible text produced by summary-based compaction. */
@@ -599,6 +601,7 @@ export interface LlmCompressionConfigRecord {
   id: string;
   name: string;
   kind: LlmCompressionMethodKind;
+  maxDurationMinutes?: number;
   trigger: {
     mode: LlmCompressionTriggerMode;
     thresholdTokens?: number;
@@ -625,12 +628,18 @@ export function createDefaultLlmCompressionSettings(): LlmCompressionSettingsRec
   return { providerBindings: [], modelBindings: [] };
 }
 
+export function normalizeLlmCompressionMaxDurationMinutes(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES;
+  return Math.min(MAX_LLM_COMPRESSION_DURATION_MINUTES, Math.max(1, Math.round(value)));
+}
+
 export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): LlmCompressionConfigRecord {
   const now = Date.now();
   return {
     id: `llm-compression-config-${createMessageId()}`,
     name,
     kind: 'segmented_summary',
+    maxDurationMinutes: DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES,
     trigger: {
       mode: 'token_threshold',
       thresholdUnit: 'percent',

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import type { AttachmentCatalogEntry } from '../../shared/protocol';
+import { normalizeLlmCompressionMaxDurationMinutes, type AttachmentCatalogEntry } from '../../shared/protocol';
 import {
   collectAttachmentCatalogFromStoredItems,
   mergeAttachmentCatalog,
@@ -45,6 +45,7 @@ import { RuntimeDatabase } from './runtimeDatabase';
 import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
   MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT,
+  type ContextModelSource,
   type ModelRequestCancelResult
 } from './databaseWorkerProtocol';
 import {
@@ -86,6 +87,7 @@ export interface FullProviderContextItem {
   segmentId: string;
   segmentKind: string;
   messageRole: string | null;
+  modelSource?: ContextModelSource;
   contentType: string;
   content: string;
 }
@@ -159,6 +161,7 @@ export interface ProviderTransientTerminalObservation {
 export interface ProviderDispatchControls {
   signal?: AbortSignal;
   onEvent(event: ProviderOutputStreamEvent): Promise<StreamEventResult>;
+  onCompressionProgress?(streamSeq: string | bigint): Promise<void>;
 }
 
 export interface FullRequestProviderAdapter {
@@ -204,7 +207,6 @@ const DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS = 1_000;
 export interface ProviderSemanticTimeouts {
   firstSemanticMs: number;
   semanticIdleMs: number;
-  /** Terminal-only compact() requests emit no semantic delta; this bounds their completed/error event. */
   compressionCompletionMs: number;
 }
 
@@ -594,6 +596,7 @@ export class ModelProviderControlPlane {
       segmentId: segment.segmentId,
       segmentKind: segment.segmentKind,
       messageRole: segment.messageRole,
+      ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
@@ -657,6 +660,7 @@ export class ModelProviderControlPlane {
       segmentId: segment.segmentId,
       segmentKind: segment.segmentKind,
       messageRole: segment.messageRole,
+      ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
@@ -904,22 +908,45 @@ export class ModelProviderControlPlane {
       const detachCallerSignal = relayAbort(options.signal, controller);
       const unregister = this.registerActiveSocket(modelRequestId, controller);
       const abortWaiter = createAbortWaiter(controller.signal);
+      const compression = isCompressionRecipe(fullRequest.recipe);
+      const configuredTimeoutMs = compression
+        ? normalizeLlmCompressionMaxDurationMinutes(
+            frozenCompressionPolicy(fullRequest.authoritySnapshot)?.config.maxDurationMinutes
+          ) * 60_000
+        : DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS;
       const timeoutWaiter = createProviderTimeoutWaiter(
-        options.timeoutMs ?? DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS
+        options.timeoutMs ?? configuredTimeoutMs
       );
-      const progressWaiter = isCompressionRecipe(fullRequest.recipe)
-        ? createCompressionCompletionWaiter(this.semanticTimeouts.compressionCompletionMs)
+      const progressWaiter = compression
+        ? createCompressionProgressWaiter(this.semanticTimeouts.compressionCompletionMs)
         : createSemanticProgressWaiter({
             firstSemanticMs: this.semanticTimeouts.firstSemanticMs,
             semanticIdleMs: this.semanticTimeouts.semanticIdleMs
           });
       const streamDurability: StreamDurabilityState = {
         outputDeltaCheckpointed: false,
-        lastActivityPersistedAt: this.epochNow()
+        lastActivityPersistedAt: this.epochNow() - (compression ? DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS : 0)
       };
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
           signal: controller.signal,
+          ...(compression ? {
+            onCompressionProgress: async (streamSeq: string | bigint) => {
+              if (controller.signal.aborted) return;
+              const observedSeq = decimalBigInt(streamSeq, 'Provider compression progress streamSeq');
+              if (observedSeq <= lastObservedStreamSeq) return;
+              lastObservedStreamSeq = observedSeq;
+              progressWaiter.observeProgress();
+              await this.persistStreamActivityIfDue(
+                modelRequestId,
+                identity.attemptSeq,
+                identity.socketGeneration,
+                observedSeq,
+                this.epochNow(),
+                streamDurability
+              );
+            }
+          } : {}),
           onEvent: async (event) => {
             const observedSeq = decimalBigInt(event.streamSeq, 'Provider event streamSeq');
             if (observedSeq > lastObservedStreamSeq) lastObservedStreamSeq = observedSeq;
@@ -1889,7 +1916,7 @@ function createSemanticProgressWaiter(timeouts: { firstSemanticMs: number; seman
   };
 }
 
-function createCompressionCompletionWaiter(timeoutMs: number): {
+function createCompressionProgressWaiter(timeoutMs: number): {
   promise: Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>;
   observeProgress(): void;
   dispose(): void;
@@ -1900,22 +1927,26 @@ function createCompressionCompletionWaiter(timeoutMs: number): {
   const promise = new Promise<{ kind: 'semantic_timed_out'; error: ProviderTransientError }>((resolve) => {
     resolveTimeout = resolve;
   });
-  timer = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    resolveTimeout({
-      kind: 'semantic_timed_out',
-      error: new ProviderTransientError(
-        'compression_timeout',
-        `Provider compression produced no terminal event within ${timeoutMs}ms.`
-      )
-    });
-  }, timeoutMs);
+  const arm = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolveTimeout({
+        kind: 'semantic_timed_out',
+        error: new ProviderTransientError(
+          'compression_timeout',
+          `Provider compression made no text or thought progress for ${timeoutMs}ms.`
+        )
+      });
+    }, timeoutMs);
+  };
+  arm();
   return {
     promise,
-    // compact() is terminal-only. It emits no text/thought progress, so only CompactDone or
-    // CompactError may satisfy this deadline; this no-op keeps the dispatch event path uniform.
-    observeProgress() {},
+    observeProgress() {
+      if (!settled) arm();
+    },
     dispose() {
       settled = true;
       if (timer !== undefined) clearTimeout(timer);

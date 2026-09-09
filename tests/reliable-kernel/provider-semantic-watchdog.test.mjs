@@ -18,7 +18,7 @@ function modelContent(text = '') {
   return { role: 'model', parts: text ? [{ text }] : [] };
 }
 
-function dependencies(provider = 'openai-responses') {
+function dependencies(provider = 'openai-responses', retryPolicy = { enabled: true, maxRetries: 3 }, compression = false) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -38,13 +38,29 @@ function dependencies(provider = 'openai-responses') {
                 providerConfigId: 'provider-watchdog',
                 provider,
                 modelId: 'model-watchdog',
-                retryPolicy: { enabled: true, maxRetries: 3 }
+                retryPolicy
               },
               modelProfile: {
                 compressionThresholdTokens: 100000,
                 contextWindowTokens: 128000,
                 tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
               },
+              ...(compression ? {
+                compression: {
+                  enabled: true,
+                  methodKind: 'llm_summary',
+                  thresholdTokens: 1,
+                  config: {
+                    id: 'compression-watchdog', name: 'offline summary', kind: 'llm_summary',
+                    ...(typeof compression === 'object' ? { maxDurationMinutes: compression.maxDurationMinutes } : {}),
+                    trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 1 }
+                  },
+                  provider: {
+                    providerConfigId: 'provider-watchdog', provider, modelId: 'model-watchdog',
+                    contextWindowTokens: 128000, maxOutputTokens: 16000, retryPolicy
+                  }
+                }
+              } : {}),
               toolPolicy: { id: 'tools-default', allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {} },
               systemPrompt: { id: 'prompt-default', text: '' },
               runtimeContext: { id: null, name: '', template: '' },
@@ -86,11 +102,11 @@ function dependencies(provider = 'openai-responses') {
   };
 }
 
-async function withApp(name, run, provider) {
+async function withApp(name, run, provider, retryPolicy, compression) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `${name}-`));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
-  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(provider));
+  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(provider, retryPolicy, compression));
   try {
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -129,14 +145,22 @@ async function get(app, domain, id) {
   return (await app.database.snapshot([kernel.DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0];
 }
 
-async function createRequest(app, conversationId, turnId, key) {
+async function createRequest(app, conversationId, turnId, key, compression = false) {
   const head = (await list(app, 'ConversationContextHeadLink', { conversation_id: conversationId }))[0];
   const authority = (await list(app, 'AuthoritySnapshot', { turn_id: turnId }))[0];
   return app.modelProvider.createModelRequest({
     turnId,
     contextRootId: head.root_id,
     authoritySnapshotId: authority.id,
-    recipe: {
+    recipe: compression ? {
+      kind: 'reliable-context-compression',
+      sourceRootId: head.root_id,
+      sourceSegmentCount: 1,
+      blockId: 'compression-block-' + key,
+      compressionMethodKind: 'llm_summary',
+      effectiveSummaryMaxTokens: 8000,
+      sourceHash: 'frozen-source-hash'
+    } : {
       kind: 'reliable-agent-turn',
       round: '3',
       previousTool: 'update_task_list',
@@ -176,6 +200,281 @@ function llmCapability(start) {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+async function summaryCapability(provider) {
+  await import('unified-llm-provider');
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  return createLlmProviderCapability({
+    settings: {
+      id: 'provider-watchdog', name: 'offline compression', provider,
+      model: 'model-watchdog', models: [], modelConfigs: [],
+      apiKey: 'offline-placeholder', baseUrl: 'https://provider.invalid/v1',
+      stream: true, retryOnError: false, retryMaxAttempts: 0,
+      toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+    }
+  });
+}
+
+function summaryParts(text) {
+  return [
+    '目标\n- ' + text + '\n',
+    '重要约束、决定和准确标识\n- 无\n',
+    '工作状态\n- 已完成\n  - 无\n',
+    '- 正在做\n  - 无\n- 受阻\n  - 无\n',
+    '下一步\n- 无\n',
+    '相关文件\n- 无\n'
+  ];
+}
+
+function summarySseResponse(chunks, signal, idleChunks = []) {
+  const encoder = new TextEncoder();
+  let index = 0;
+  return new Response(new ReadableStream({
+    async pull(controller) {
+      await sleep(100);
+      if (signal.aborted) {
+        controller.error(signal.reason);
+        return;
+      }
+      if (index >= chunks.length && idleChunks.length === 0) {
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+        return;
+      }
+      const chunk = index < chunks.length ? chunks[index] : idleChunks[(index - chunks.length) % idleChunks.length];
+      index += 1;
+      controller.enqueue(encoder.encode(typeof chunk === 'string' ? chunk : 'data: ' + JSON.stringify(chunk) + '\n\n'));
+    }
+  }), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+test('压缩真实思考和文本持续生成超过旧完成期限仍在同一 Attempt 完成', async (context) => {
+  await withApp('compression-live-progress', async (app, conversationId, turnId) => {
+    let calls = 0;
+    context.mock.method(globalThis, 'fetch', async (_input, init) => {
+      calls += 1;
+      const chunks = [
+        ...Array.from({ length: 6 }, (_, index) => ({
+          choices: [{ index: 0, delta: { reasoning_content: 'thinking ' + index }, finish_reason: null }]
+        })),
+        ...summaryParts('summary 0 summary 1').map((content, index) => ({
+          choices: [{ index: 0, delta: { content }, finish_reason: index === 5 ? 'stop' : null }]
+        }))
+      ];
+      return summarySseResponse(chunks, init.signal);
+    });
+    const capability = await summaryCapability('openai-compatible');
+    const events = [];
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', {
+      ...capability,
+      compact(request, emit) {
+        capability.compact(request, (event) => { events.push(event); emit(event); });
+      }
+    });
+    try {
+      const request = await createRequest(app, conversationId, turnId, 'live-summary', true);
+      const result = await controlPlane(app, {
+        semanticTimeouts: { compressionCompletionMs: 500 }
+      }).dispatch(request.modelRequestId, adapter);
+      assert.equal(result.terminalState, 'completed');
+      assert.equal(calls, 1);
+      assert.equal(events.filter((event) => event.type === 'llm:compactProgress').length, 12);
+      const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+      assert.match(JSON.stringify(completed.content), /summary 0 summary 1/);
+      assert.doesNotMatch(JSON.stringify(completed.content), /thinking/);
+      const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
+      assert.equal(checkpoints.length, 1);
+      assert.equal(checkpoints[0].attempt_seq, 1n);
+    } finally {
+      capability.dispose();
+    }
+  }, 'openai-compatible', { enabled: true, maxRetries: 1 }, true);
+});
+
+test('压缩输出停滞后心跳、空白、usage 和签名不能续命，重试只采纳完整摘要', async (context) => {
+  await withApp('compression-stalled-progress', async (app, conversationId, turnId) => {
+    const requestBodies = [];
+    context.mock.method(globalThis, 'fetch', async (_input, init) => {
+      requestBodies.push(init.body);
+      if (requestBodies.length > 1) {
+        return summarySseResponse([{
+          candidates: [{
+            content: { role: 'model', parts: [{ text: summaryParts('recovered summary').join('') }] },
+            finishReason: 'STOP'
+          }]
+        }], init.signal);
+      }
+      return summarySseResponse([
+        { candidates: [{ content: { role: 'model', parts: [{ text: 'discarded thought', thought: true }] } }] },
+        { candidates: [{ content: { role: 'model', parts: [{ text: 'discarded summary' }] } }] }
+      ], init.signal, [
+        ': keep-alive\n\n',
+        { candidates: [{ content: { role: 'model', parts: [] } }] },
+        { usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 2 } },
+        { candidates: [{ content: { role: 'model', parts: [{ thought: true, thoughtSignature: 'opaque-signature' }] } }] },
+        { candidates: [{ content: { role: 'model', parts: [{ text: ' \n ', thought: true }] } }] }
+      ]);
+    });
+    const capability = await summaryCapability('gemini');
+    const progress = [];
+    const transient = [];
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', {
+      ...capability,
+      compact(request, emit) {
+        capability.compact(request, (event) => {
+          if (event.type === 'llm:compactProgress') progress.push(event);
+          emit(event);
+        });
+      }
+    });
+    try {
+      const request = await createRequest(app, conversationId, turnId, 'stalled-summary', true);
+      const result = await controlPlane(app, {
+        semanticTimeouts: { compressionCompletionMs: 750 }
+      }).dispatch(request.modelRequestId, adapter, {
+        onTransientTerminal: (event) => transient.push(event)
+      });
+      assert.equal(result.terminalState, 'completed');
+      assert.equal(requestBodies.length, 2);
+      assert.equal(requestBodies[1], requestBodies[0]);
+      assert.equal(progress.length, 3);
+      assert.ok(progress.every((event) => Object.keys(event.payload).join() === 'requestId'));
+      assert.ok(transient.some((entry) =>
+        entry.event.content.terminalState === 'provider_transient_compression_timeout'
+        && entry.event.content.retrying === true && entry.event.content.discardOutput === true
+      ));
+      const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+      assert.match(JSON.stringify(completed.content), /recovered summary/);
+      assert.doesNotMatch(JSON.stringify(completed.content), /discarded/);
+      const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
+      assert.equal(checkpoints.length, 1);
+      assert.equal(checkpoints[0].attempt_seq, 2n);
+      assert.equal((await list(app, 'ToolCall')).length, 0);
+    } finally {
+      capability.dispose();
+    }
+  }, 'gemini', { enabled: true, maxRetries: 1 }, true);
+});
+
+test('压缩最长时间读取冻结配置，普通请求保持20分钟且内部测试覆盖值仍有效', async (context) => {
+  const durations = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  context.mock.method(globalThis, 'setTimeout', (callback, duration, ...args) => {
+    durations.push(duration);
+    return originalSetTimeout(callback, duration, ...args);
+  });
+  for (const scenario of [
+    { name: 'configured', compression: true, minutes: 37, expected: 37 * 60000 },
+    { name: 'default', compression: true, expected: 20 * 60000 },
+    { name: 'ordinary', compression: false, minutes: 37, expected: 20 * 60000 },
+    { name: 'override', compression: true, minutes: 37, expected: 1500, timeoutMs: 1500 }
+  ]) {
+    await withApp('compression-duration-' + scenario.name, async (app, conversationId, turnId) => {
+      const request = await createRequest(app, conversationId, turnId, scenario.name, scenario.compression);
+      durations.length = 0;
+      await controlPlane(app).dispatch(request.modelRequestId, {
+        providerId: 'provider-watchdog',
+        async sendFullRequest(_request, controls) {
+          await controls.onEvent({
+            kind: 'completed', streamSeq: '1',
+            content: scenario.compression
+              ? { type: 'compression_result', contents: [modelContent('summary')] }
+              : modelContent('ordinary output')
+          });
+        }
+      }, { timeoutMs: scenario.timeoutMs });
+      assert.ok(durations.includes(scenario.expected), JSON.stringify(durations));
+      if (scenario.expected !== 20 * 60000) assert.ok(!durations.includes(20 * 60000));
+    }, 'openai-compatible', { enabled: false, maxRetries: 0 }, { maxDurationMinutes: scenario.minutes });
+  }
+});
+
+test('压缩首个进度立即可见，后续元数据限频且不保存部分摘要', async () => {
+  await withApp('compression-progress-metadata', async (app, conversationId, turnId) => {
+    const request = await createRequest(app, conversationId, turnId, 'progress-metadata', true);
+    const provider = controlPlane(app, { semanticTimeouts: { compressionCompletionMs: 1000 } });
+    let now = 10000;
+    provider.epochNow = () => now;
+    await provider.dispatch(request.modelRequestId, {
+      providerId: 'provider-watchdog',
+      async sendFullRequest(_request, controls) {
+        await controls.onCompressionProgress('1');
+        const first = (await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json;
+        assert.equal(first.lastStreamEventAt, 10000);
+        assert.equal(first.lastStreamSeq, '1');
+        now = 14999;
+        for (let sequence = 2; sequence <= 50; sequence += 1) {
+          await controls.onCompressionProgress(String(sequence));
+        }
+        assert.deepEqual((await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json, first);
+        now = 15000;
+        await controls.onCompressionProgress('51');
+        const next = (await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json;
+        assert.equal(next.lastStreamEventAt, 15000);
+        assert.equal(next.lastStreamSeq, '51');
+        now = 25000;
+        await controls.onCompressionProgress('51');
+        await controls.onCompressionProgress('1');
+        assert.deepEqual((await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json, next);
+        assert.equal((await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId })).length, 0);
+        assert.equal((await list(app, 'CompressionBlock')).length, 0);
+        await controls.onEvent({
+          kind: 'completed', streamSeq: '52',
+          content: { type: 'compression_result', contents: [modelContent('complete summary')] }
+        });
+      }
+    });
+    const terminal = await get(app, 'ModelRequest', request.modelRequestId);
+    assert.equal(terminal.terminal_state, 'completed');
+    assert.equal(terminal.stream_stats_json.lastStreamEventAt, undefined);
+    assert.equal((await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId })).length, 1);
+  }, 'openai-compatible', { enabled: false, maxRetries: 0 }, true);
+});
+
+test('压缩重复或迟到进度不能绕过重试上限、取消和总时限', async () => {
+  for (const scenario of ['retry-budget', 'cancel', 'dispatch-deadline']) {
+    await withApp('compression-guard-' + scenario, async (app, conversationId, turnId) => {
+      const request = await createRequest(app, conversationId, turnId, scenario, true);
+      const caller = new AbortController();
+      const provider = controlPlane(app, { semanticTimeouts: { compressionCompletionMs: 300 } });
+      let calls = 0;
+      let staleProgress;
+      const dispatch = provider.dispatch(request.modelRequestId, {
+        providerId: 'provider-watchdog',
+        async sendFullRequest(_request, controls) {
+          calls += 1;
+          if (staleProgress) {
+            await staleProgress('999');
+            assert.equal((await get(app, 'ModelRequest', request.modelRequestId)).stream_stats_json.lastStreamEventAt, undefined);
+          }
+          staleProgress = controls.onCompressionProgress;
+          let sequence = 1;
+          await controls.onCompressionProgress(String(sequence));
+          if (scenario === 'cancel') caller.abort();
+          while (!controls.signal.aborted) {
+            await sleep(50);
+            if (scenario !== 'retry-budget') sequence += 1;
+            await controls.onCompressionProgress(String(sequence));
+          }
+          await controls.onCompressionProgress('1000');
+          throw controls.signal.reason;
+        }
+      }, { signal: caller.signal, timeoutMs: scenario === 'dispatch-deadline' ? 200 : 2000 });
+      if (scenario === 'cancel') {
+        await assert.rejects(dispatch, { name: 'AbortError' });
+        assert.match((await get(app, 'ModelRequest', request.modelRequestId)).terminal_state, /cancelled/);
+      } else {
+        await assert.rejects(dispatch, (error) =>
+          error.reason === (scenario === 'retry-budget' ? 'compression_timeout' : 'connection_interrupted')
+        );
+      }
+      assert.equal(calls, scenario === 'retry-budget' ? 2 : 1);
+      assert.equal((await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId })).length, 0);
+    }, 'openai-compatible', { enabled: scenario === 'retry-budget', maxRetries: scenario === 'retry-budget' ? 1 : 0 }, true);
+  }
+});
 
 async function waitForRequestStatus(app, requestId, status, timeoutMs = 1000) {
   const deadline = Date.now() + timeoutMs;
@@ -495,6 +794,187 @@ test('Gemini SSE terminated 经真实 SDK 包装后仍丢弃部分思考和工�
   }, 'gemini');
 });
 
+test('中文服务暂时不可用经真实 SSE 和 SDK 后自动替换失败 Attempt', async (context) => {
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  await withApp('localized-service-error-retry', async (app, conversationId, turnId) => {
+    const requestBodies = [];
+    context.mock.method(globalThis, 'fetch', async (_input, init) => {
+      requestBodies.push(init.body);
+      const chunks = requestBodies.length === 1
+        ? [
+            { choices: [{ index: 0, delta: { reasoning_content: 'discarded thought' }, finish_reason: null }] },
+            { choices: [{ index: 0, delta: { content: 'discarded answer' }, finish_reason: null }] },
+            { error: { message: '模型服务暂时不可用，请稍后重试' } }
+          ]
+        : [{ choices: [{ index: 0, delta: { content: 'recovered from temporary service failure' }, finish_reason: 'stop' }] }];
+      return new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', {
+        headers: { 'content-type': 'text/event-stream' }
+      });
+    });
+    const capability = createLlmProviderCapability({
+      settings: {
+        id: 'provider-watchdog', name: 'offline service failure', provider: 'openai-compatible',
+        model: 'model-watchdog', models: [], modelConfigs: [],
+        apiKey: 'offline-placeholder', baseUrl: 'https://provider.invalid/v1',
+        stream: true, retryOnError: false, retryMaxAttempts: 0,
+        toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+      }
+    });
+    const events = [];
+    const transientTerminals = [];
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', {
+      ...capability,
+      start(request, emit) {
+        capability.start(request, (event) => {
+          events.push(event);
+          emit(event);
+        });
+      }
+    });
+    try {
+      const request = await createRequest(app, conversationId, turnId, 'localized-service-error-retry');
+      const result = await controlPlane(app, {
+        semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+      }).dispatch(request.modelRequestId, adapter, {
+        onTransientTerminal: (event) => transientTerminals.push(event)
+      });
+      assert.equal(result.terminalState, 'completed');
+      assert.equal(requestBodies.length, 2, 'only the reliable ControlPlane retries the failed request');
+      assert.equal(requestBodies[1], requestBodies[0]);
+      assert.ok(events.some((event) => event.type === 'llm:thoughtDelta'));
+      assert.ok(events.some((event) => event.type === 'llm:delta'));
+      assert.equal(events.find((event) => event.type === 'llm:error').payload.message, '模型服务暂时不可用，请稍后重试');
+      assert.ok(transientTerminals.some((terminal) =>
+        terminal.attemptSeq === '1'
+        && terminal.event.content.terminalState === 'provider_transient_temporary_service_error'
+        && terminal.event.content.retrying === true
+        && terminal.event.content.discardOutput === true
+      ));
+      const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+      assert.deepEqual(completed.content, modelContent('recovered from temporary service failure'));
+      const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: request.modelRequestId });
+      assert.ok(checkpoints.every((checkpoint) => checkpoint.attempt_seq === 2n));
+      assert.equal((await list(app, 'ToolCall')).length, 0);
+    } finally {
+      capability.dispose();
+    }
+  }, 'openai-compatible');
+});
+
+test('SSE 服务繁忙按冻结的四次重试预算恢复或终止', async (context) => {
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  const serviceBusyMessage = "Streaming error: 503: {'code': 'SERVICE_BUSY', 'message': '服务繁忙，请稍后重试', 'traceId': 'trace-service-busy-fixture'}";
+  for (const recover of [true, false]) {
+    await context.test(recover ? '第四次重试成功' : '耗尽四次重试后停止', async (scenario) => {
+      await withApp(`sse-service-busy-${recover ? 'recover' : 'exhausted'}`, async (app, conversationId, turnId) => {
+        const requestBodies = [];
+        scenario.mock.method(globalThis, 'fetch', async (_input, init) => {
+          requestBodies.push(init.body);
+          const chunks = recover && requestBodies.length === 5
+            ? [{ choices: [{ index: 0, delta: { content: 'recovered from service busy' }, finish_reason: 'stop' }] }]
+            : [
+                { choices: [{ index: 0, delta: { reasoning_content: 'discarded thought' }, finish_reason: null }] },
+                { choices: [{ index: 0, delta: { content: 'discarded answer' }, finish_reason: null }] },
+                { error: { message: requestBodies.length === 1 ? '模型服务暂时不可用，请稍后重试' : serviceBusyMessage } }
+              ];
+          return new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', {
+            headers: { 'content-type': 'text/event-stream' }
+          });
+        });
+        const capability = createLlmProviderCapability({
+          settings: {
+            id: 'provider-watchdog', name: 'offline service busy', provider: 'openai-compatible',
+            model: 'model-watchdog', models: [], modelConfigs: [],
+            apiKey: 'offline-placeholder', baseUrl: 'https://provider.invalid/v1',
+            stream: true, retryOnError: false, retryMaxAttempts: 0,
+            toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+          }
+        });
+        try {
+          const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability);
+          const request = await createRequest(app, conversationId, turnId, 'sse-service-busy-budget');
+          const transientTerminals = [];
+          const dispatch = controlPlane(app, {
+            semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+          }).dispatch(request.modelRequestId, adapter, {
+            onTransientTerminal: (event) => transientTerminals.push(event)
+          });
+          if (recover) {
+            assert.equal((await dispatch).terminalState, 'completed');
+            const completed = await app.modelProvider.completedEvent(request.modelRequestId);
+            assert.deepEqual(completed.content, modelContent('recovered from service busy'));
+          } else {
+            await assert.rejects(dispatch, /SERVICE_BUSY/);
+            const durableRequest = await get(app, 'ModelRequest', request.modelRequestId);
+            assert.equal(durableRequest.terminal_state, 'provider_transient_temporary_service_error');
+          }
+          assert.equal(requestBodies.length, 5, 'initial Attempt plus exactly four configured retries');
+          assert.ok(requestBodies.every((body) => body === requestBodies[0]));
+          const retryingTerminals = transientTerminals.filter((terminal) => terminal.event.content.retrying === true);
+          assert.deepEqual(retryingTerminals.map((terminal) => terminal.attemptSeq), ['1', '2', '3', '4']);
+          assert.ok(retryingTerminals.every((terminal) => terminal.event.content.discardOutput === true));
+          const operation = (await list(app, 'Operation', {
+            owner_kind: 'model_request', owner_id: request.modelRequestId
+          }))[0];
+          const attempts = (await list(app, 'Attempt', { operation_id: operation.id }))
+            .sort((left, right) => Number(left.attempt_seq) - Number(right.attempt_seq));
+          assert.deepEqual(attempts.map((attempt) => attempt.status), [
+            'transient_failed', 'transient_failed', 'transient_failed', 'transient_failed', recover ? 'completed' : 'failed'
+          ]);
+          assert.equal((await list(app, 'ToolCall')).length, 0);
+        } finally {
+          capability.dispose();
+        }
+      }, 'openai-compatible', { enabled: true, maxRetries: 4 });
+    });
+  }
+});
+
+test('incomplete chunked read 遵守冻结重试次数和关闭自动重试设置', async (testContext) => {
+  const message = 'Streaming error: peer closed connection without sending complete message body (incomplete chunked read)';
+  for (const scenario of [
+    { name: 'recover', enabled: true, recover: true, attempts: 5 },
+    { name: 'exhausted', enabled: true, recover: false, attempts: 5 },
+    { name: 'disabled', enabled: false, recover: false, attempts: 1 }
+  ]) {
+    await testContext.test(scenario.name, async () => {
+      await withApp('chunked-read-' + scenario.name, async (app, conversationId, turnId) => {
+        const bodies = [];
+        const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((request, emit) => {
+          bodies.push(JSON.stringify(request.contents));
+          if (scenario.recover && bodies.length === scenario.attempts) {
+            emit({ type: 'llm:done', payload: { requestId: request.id, content: modelContent('recovered') } });
+          } else {
+            emit({ type: 'llm:thoughtDelta', payload: { requestId: request.id, text: 'discarded partial thought' } });
+            emit({ type: 'llm:error', payload: { requestId: request.id, message } });
+          }
+        }));
+        const created = await createRequest(app, conversationId, turnId, 'chunked-read-budget');
+        const terminals = [];
+        const dispatch = controlPlane(app, {
+          semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+        }).dispatch(created.modelRequestId, adapter, { onTransientTerminal: (event) => terminals.push(event) });
+        if (scenario.recover) {
+          assert.equal((await dispatch).terminalState, 'completed');
+          assert.deepEqual((await app.modelProvider.completedEvent(created.modelRequestId)).content, modelContent('recovered'));
+        } else {
+          await assert.rejects(dispatch, /incomplete chunked read/);
+          assert.equal((await get(app, 'ModelRequest', created.modelRequestId)).terminal_state, 'provider_transient_connection_interrupted');
+        }
+        assert.equal(bodies.length, scenario.attempts);
+        assert.ok(bodies.every((body) => body === bodies[0]));
+        assert.equal(terminals.filter((terminal) => terminal.event.content.retrying === true).length, scenario.attempts - 1);
+        const operation = (await list(app, 'Operation', { owner_kind: 'model_request', owner_id: created.modelRequestId }))[0];
+        assert.equal((await list(app, 'Attempt', { operation_id: operation.id })).length, scenario.attempts);
+      }, 'openai-responses', { enabled: scenario.enabled, maxRetries: scenario.enabled ? 4 : 0 });
+    });
+  }
+});
+
 test('普通 transient error 在已有语义输出后仍不盲目重放', async () => {
   await withApp('provider-generic-no-replay-after-output', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'generic-no-replay-after-output');
@@ -787,7 +1267,7 @@ test('已提交 retrying/not-before 在 Host handoff 后由新 ControlPlane 恢�
   });
 });
 
-test('生产 deadline 固定为普通首语义300秒/idle600秒与压缩终态270秒', () => {
+test('生产 deadline 固定为普通首语义300秒/idle600秒与压缩无进度270秒', () => {
   assert.deepEqual(kernel.RELIABLE_PROVIDER_SEMANTIC_DEADLINES_MS, {
     ordinaryFirst: 300_000,
     ordinaryIdle: 600_000,

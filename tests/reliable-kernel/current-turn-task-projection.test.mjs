@@ -433,3 +433,101 @@ test('任务卡按不可变 ToolCall 前缀读取，无关 commitSeq 连续变�
   assert.equal('snapshot' in frozen, false);
   assert.equal(snapshotCount, 5);
 });
+
+function forkTaskFixture(depth, options = {}) {
+  const conversations = Array.from({ length: depth + 1 }, (unused, index) => 'conversation-fork-' + index);
+  const conversationId = conversations.at(-1);
+  const sourceToolCallId = 'original-task-call';
+  const copiedToolIds = [sourceToolCallId];
+  for (const targetId of conversations.slice((options.originDepth ?? 0) + 1)) {
+    copiedToolIds.push(conversationForkSnapshotCopyId(targetId, 'tool_call', copiedToolIds.at(-1)));
+  }
+  const toolCallId = copiedToolIds.at(-1);
+  const operation = rewrite([{ title: 'inherited task', status: 'in_progress' }]);
+  const artifact = {
+    toolCallId: options.unrelated ? 'unrelated-task-call' : sourceToolCallId,
+    status: 'succeeded',
+    detail: options.plan
+      ? { kind: 'submit_plan.result', proposalId: 'proposal', status: 'approved', executionTarget: 'current_conversation' }
+      : { kind: 'task-list', operation }
+  };
+  const tables = {
+    Turn: [{ id: 'new-turn', conversation_id: conversationId }],
+    ToolCall: [{ id: toolCallId, turn_id: 'new-turn', call_seq: 1n, tool_name: options.plan ? 'submit_plan' : 'update_task_list', arguments_object_id: 'arguments' }],
+    ToolResultArtifact: [{ id: 'artifact', tool_call_id: toolCallId, role: 'no_effect_result', content_object_id: 'result' }],
+    ContentObject: [{ id: 'arguments' }, { id: 'result' }],
+    ToolCallSourceLink: [{ tool_call_id: toolCallId, message_id: 'message', provider_ordinal: 0n }],
+    MessagePartOfConversation: [{ message_id: 'message', conversation_id: conversationId, message_seq: 1n }],
+    Message: [{ id: 'message', deleted_at: null }],
+    ContextSegmentSource: copiedToolIds.map((sourceId, index) => ({
+      id: 'segment-source-' + index, segment_id: 'shared-tool-segment', source_kind: 'tool_call',
+      source_id: sourceId, source_revision: 1n
+    })),
+    ConversationBranchLink: options.deletedParents ? [] : conversations.slice(1).map((target, index) => ({
+      id: 'branch-' + index, target_conversation_id: target, source_conversation_id: conversations[index]
+    }))
+  };
+  if (options.wrongSegment) tables.ContextSegmentSource.at(-1).segment_id = 'unrelated-segment';
+  if (options.wrongRevision) tables.ContextSegmentSource.at(-1).source_revision = 2n;
+  if (options.missingSource) tables.ContextSegmentSource.shift();
+  if (options.ambiguousSource) tables.ContextSegmentSource.push({ ...tables.ContextSegmentSource[0], id: 'duplicate-source' });
+  let sourceReads = 0;
+  let branchReads = 0;
+  const read = (query) => {
+    if (query.domain === 'ContextSegmentSource') sourceReads += 1;
+    if (query.domain === 'ConversationBranchLink') branchReads += 1;
+    const values = tables[query.domain] ?? [];
+    if (query.kind === 'get') return values.find((value) => value.id === query.id) ?? null;
+    return values.filter((value) => Object.entries(query.where ?? {}).every(([key, expected]) => value[key] === expected));
+  };
+  const database = {
+    async snapshot(queries) { return { snapshotCommitSeq: '20', snapshot: queries.map(read) }; },
+    async snapshotAll(query) { return { snapshotCommitSeq: '20', snapshot: read(query) }; }
+  };
+  const contentStore = {
+    async read(metadata) {
+      return Buffer.from(JSON.stringify(metadata.id === 'result' ? artifact : { plan: 'approved plan', taskList: operation }));
+    }
+  };
+  return { database, contentStore, artifact, toolCallId, sourceReads: () => sourceReads, branchReads: () => branchReads };
+}
+
+for (const depth of [0, 1, 2, 3]) {
+  test('任务卡读取第 ' + depth + ' 层手动分支时保留合法的历史工具结果', async () => {
+    const fixture = forkTaskFixture(depth);
+    const before = structuredClone(fixture.artifact);
+    const card = await readCurrentTurnTaskCard(fixture.database, fixture.contentStore, 'new-turn');
+    assert.equal(card.sourceToolCallId, fixture.toolCallId);
+    assert.equal(card.counts.inProgress, 1);
+    assert.match(card.card, /inherited task/);
+    assert.deepEqual(fixture.artifact, before, '读取投影不能改写持久化结果');
+    if (depth < 2) assert.equal(fixture.sourceReads(), 0, '原生及一层调用不增加来源查询');
+  });
+}
+
+test('多级分支支持中途创建的任务和已审批计划', async () => {
+  for (const options of [{ originDepth: 1 }, { plan: true }, { plan: true, originDepth: 1 }]) {
+    const fixture = forkTaskFixture(3, options);
+    const card = await readCurrentTurnTaskCard(fixture.database, fixture.contentStore, 'new-turn');
+    assert.equal(card.counts.inProgress, 1);
+    assert.equal(card.sourceToolCallId, fixture.toolCallId);
+  }
+});
+
+test('多级分支仍拒绝无关工具结果、缺失来源和不同工具段', async () => {
+  for (const options of [
+    { unrelated: true }, { wrongSegment: true }, { wrongRevision: true },
+    { missingSource: true }, { ambiguousSource: true }, { unrelated: true, plan: true }
+  ]) {
+    const fixture = forkTaskFixture(2, options);
+    await assert.rejects(readCurrentTurnTaskCard(fixture.database, fixture.contentStore, 'new-turn'), /identifies another ToolCall/);
+  }
+});
+
+test('多级分支在父会话已删除时仍用不可变工具段验证归属', async () => {
+  const fixture = forkTaskFixture(5, { deletedParents: true });
+  const card = await readCurrentTurnTaskCard(fixture.database, fixture.contentStore, 'new-turn');
+  assert.equal(card.sourceToolCallId, fixture.toolCallId);
+  assert.equal(card.counts.inProgress, 1);
+  assert.equal(fixture.branchReads(), 0);
+});

@@ -62,7 +62,7 @@ export function createReliableKernelRuntimeServices(
       deliveries.prepareNextTurnDeliverySteps(conversationId, turnId, now)
   });
   const answers = new AnswerControlPlane(database, contentStore, children, options);
-  const conversationFork = new ConversationForkControlPlane(database, options);
+  const conversationFork = new ConversationForkControlPlane(database, contentStore, options);
   const recovery = new PhaseFRecoveryScanner(database, answers, deliveries, children, options);
   const clientFeed = new BoundedClientFeed(database);
   const history = new ClientHistoryReader(database);

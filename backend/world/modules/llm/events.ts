@@ -25,6 +25,7 @@ export const LlmEventType = {
   RetryStarted: 'llm:retryStarted',
   RetryCancelled: 'llm:retryCancelled',
   RetryRecovered: 'llm:retryRecovered',
+  CompactProgress: 'llm:compactProgress',
   CompactDone: 'llm:compactDone',
   CompactError: 'llm:compactError'
 } as const;
@@ -146,6 +147,9 @@ export interface LlmRetryPayload extends LlmStreamEpochPayload {
   retryMaxAttempts: number;
   retryDelayMs?: number;
   createdAt: number;
+}
+export interface LlmCompactProgressPayload {
+  requestId: string;
 }
 export interface LlmCompactDonePayload {
   requestId: string;

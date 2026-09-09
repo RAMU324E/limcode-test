@@ -278,6 +278,10 @@ function updateDefaultCompressionTrigger(patch: Partial<LlmCompressionConfigReco
   settings.updateActiveCompressionTrigger(patch);
 }
 
+function updateDefaultCompressionMaxDurationMinutes(value: number): void {
+  settings.setActiveCompressionMaxDurationMinutes(value);
+}
+
 function updateModelCompressionProviderConfigId(modelId: string, providerConfigId: string): void {
   settings.setModelCompressionProviderConfig(modelId, providerConfigId);
 }
@@ -288,6 +292,10 @@ function updateModelCompressionMethodKind(modelId: string, kind: SelectableCompr
 
 function updateModelCompressionTrigger(modelId: string, patch: Partial<LlmCompressionConfigRecord['trigger']>): void {
   settings.updateModelCompressionTrigger(modelId, patch);
+}
+
+function updateModelCompressionMaxDurationMinutes(modelId: string, value: number): void {
+  settings.setModelCompressionMaxDurationMinutes(modelId, value);
 }
 
 function openCreate(): void {
@@ -536,6 +544,7 @@ function cancelDelete(): void {
               @update-provider-config-id="updateDefaultCompressionProviderConfigId"
               @update-method-kind="updateDefaultCompressionMethodKind"
               @update-trigger="updateDefaultCompressionTrigger"
+              @update-max-duration-minutes="updateDefaultCompressionMaxDurationMinutes"
             />
           </div>
         </article>
@@ -610,6 +619,7 @@ function cancelDelete(): void {
                   @update-provider-config-id="updateModelCompressionProviderConfigId(modelConfig.modelId, $event)"
                   @update-method-kind="updateModelCompressionMethodKind(modelConfig.modelId, $event)"
                   @update-trigger="updateModelCompressionTrigger(modelConfig.modelId, $event)"
+                  @update-max-duration-minutes="updateModelCompressionMaxDurationMinutes(modelConfig.modelId, $event)"
                 />
               </div>
             </article>

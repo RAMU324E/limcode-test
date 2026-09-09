@@ -39,6 +39,7 @@ import {
   type ContextContentMaterializationSnapshot,
   type ContextMaterializationRecord,
   type ContextMaterializationSnapshot,
+  type ContextModelSource,
   type DatabaseWorkerData,
   type DatabaseWorkerDiagnostics,
   type DatabaseWorkerRequest,
@@ -2520,35 +2521,64 @@ function decodeContextRecords(
     .filter((row) => row.segment_kind === 'message')
     .map((row) => requireRuntimeId(row.segment_id));
   const roles = new Map<string, string[]>();
+  const modelSources = new Map<string, ContextModelSource | null>();
   for (let offset = 0; offset < messageSegmentIds.length; offset += 500) {
     const chunk = messageSegmentIds.slice(offset, offset + 500);
     const placeholders = chunk.map(() => '?').join(',');
     const sourceRows = database.prepare(`
-      SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role
+      SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role,
+             model_request.provider_id AS source_provider_id,
+             model_request.model_id AS source_model_id
         FROM context_segment_source AS source
         JOIN message_revision AS revision
           ON revision.id = source.source_id
          AND revision.revision_seq = source.source_revision
+        LEFT JOIN model_request_message_link AS model_link
+          ON model_link.message_id = revision.message_id
+         AND revision.revision_seq = 1
+         AND revision.role = 'model'
+        LEFT JOIN model_request
+          ON model_request.id = model_link.model_request_id
        WHERE source.source_kind = 'message_revision'
          AND source.segment_id IN (${placeholders})
        ORDER BY source.segment_id, source.id
-    `).all(...chunk) as Array<{ segment_id: string; role: string }>;
+    `).all(...chunk) as Array<{
+      segment_id: string;
+      role: string;
+      source_provider_id: string | null;
+      source_model_id: string | null;
+    }>;
     for (const source of sourceRows) {
       const segmentId = requireRuntimeId(source.segment_id);
       if (typeof source.role !== 'string' || source.role.length === 0) {
         throw new Error(`Message ContextSegment ${segmentId} has an invalid role.`);
       }
       const current = roles.get(segmentId) ?? [];
-      current.push(source.role);
+      if (!current.includes(source.role)) current.push(source.role);
       roles.set(segmentId, current);
+      const modelSource = source.source_provider_id && source.source_model_id
+        ? { providerId: source.source_provider_id, modelId: source.source_model_id }
+        : null;
+      const previousSource = modelSources.get(segmentId);
+      if (previousSource === undefined) modelSources.set(segmentId, modelSource);
+      else if (previousSource && (
+        !modelSource
+        || previousSource.providerId !== modelSource.providerId
+        || previousSource.modelId !== modelSource.modelId
+      )) modelSources.set(segmentId, null);
     }
   }
-  return rows.map((row) => decodeContextRecord(row, roles.get(String(row.segment_id)) ?? []));
+  return rows.map((row) => decodeContextRecord(
+    row,
+    roles.get(String(row.segment_id)) ?? [],
+    modelSources.get(String(row.segment_id))
+  ));
 }
 
 function decodeContextRecord(
   row: Record<string, unknown>,
-  messageRoles: readonly string[]
+  messageRoles: readonly string[],
+  modelSource?: ContextModelSource | null
 ): ContextMaterializationRecord {
   const segmentKind = typeof row.segment_kind === 'string' ? row.segment_kind : '';
   let messageRole: string | null = null;
@@ -2579,7 +2609,8 @@ function decodeContextRecord(
       storage_key: row.content_storage_key,
       created_at: row.content_created_at
     }),
-    messageRole
+    messageRole,
+    ...(modelSource ? { modelSource } : {})
   };
 }
 

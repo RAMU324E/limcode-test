@@ -73,7 +73,7 @@ export interface LlmDryRunResult {
   apiKeyAvailable?: boolean;
 }
 
-export const ATTACHMENT_OBSERVATION_PROMPT_REVISION = '2026-08-21';
+export const ATTACHMENT_OBSERVATION_PROMPT_REVISION = '2026-09-07';
 
 export interface LlmAttachmentObservation {
   attachmentRef: string;

@@ -139,6 +139,45 @@ function memoryReadDatabase(tables = {}) {
   };
 }
 
+test('压缩进度持久化失败会终止对应 Provider，不遗留后台生成', async () => {
+  const capability = fakeCapability(() => {});
+  const aborted = [];
+  capability.abort = (requestId) => aborted.push(requestId);
+  capability.compact = (compactRequest, emit) => {
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+  };
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
+  const fullRequest = compressionRequest('llm_summary', request().context);
+  await assert.rejects(adapter.sendFullRequest(fullRequest, {
+    async onCompressionProgress() { throw new Error('activity persistence failed'); },
+    async onEvent() { throw new Error('no partial summary should be emitted'); }
+  }), /activity persistence failed/);
+  assert.deepEqual(aborted, [fullRequest.modelRequestId]);
+});
+
+test('压缩进度只走元数据侧通道，终态后迟到进度不再转发', async () => {
+  const capability = compressionCapability(() => {});
+  const complete = capability.compact;
+  capability.compact = (compactRequest, emit) => {
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+    complete(compactRequest, emit);
+    emit({ type: 'llm:compactProgress', payload: { requestId: compactRequest.id } });
+  };
+  const progress = [];
+  const events = [];
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
+  await adapter.sendFullRequest(compressionRequest('llm_summary', request().context), {
+    async onCompressionProgress(streamSeq) { progress.push(streamSeq); },
+    async onEvent(event) {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: true };
+    }
+  });
+  assert.deepEqual(progress, ['1', '2']);
+  assert.deepEqual(events.map((event) => [event.kind, event.streamSeq]), [['completed', '3']]);
+});
+
 test('可靠 LLM adapter 拒绝缺失 conversationId 的请求', async () => {
   let started = false;
   const invalid = request();
@@ -154,6 +193,89 @@ test('可靠 LLM adapter 拒绝缺失 conversationId 的请求', async () => {
     /conversationId must be non-empty/
   );
   assert.equal(started, false);
+});
+
+test('GPT 推理签名只隔离明确跨渠道的来源，同名跨渠道也隔离', async (testContext) => {
+  const scenarios = [
+    { name: '同名跨渠道', sourceProvider: 'source-channel', sourceModel: 'gpt-6-astra', targetModel: 'gpt-6-astra', isolate: true },
+    { name: '渠道前缀不同', sourceProvider: 'source-channel', sourceModel: '[azure]-gpt-6-astra', targetModel: 'factorygpt/gpt-6-astra', isolate: true },
+    { name: '同渠道同模型', sourceProvider: 'provider-config', sourceModel: 'gpt-6-astra', targetModel: 'gpt-6-astra' },
+    { name: '同渠道不同模型', sourceProvider: 'provider-config', sourceModel: 'gpt-5.5', targetModel: 'gpt-6-astra' },
+    { name: '来源不明', targetModel: 'gpt-6-astra' },
+    { name: '来源不是 GPT', sourceProvider: 'source-channel', sourceModel: 'claude-opus', targetModel: 'gpt-6-astra' },
+    { name: '目标不是 GPT', sourceProvider: 'source-channel', sourceModel: 'gpt-6-astra', targetModel: 'kimi-k3' },
+    { name: '渠道名字包含 GPT 不算 GPT 模型', sourceProvider: 'source-channel', sourceModel: 'factorygpt/qwen-max', targetModel: 'gpt-6-astra' },
+    { name: '命名空间包含 GPT 型号仍不算 GPT 模型', sourceProvider: 'source-channel', sourceModel: 'gpt-6-relay/qwen-max', targetModel: 'gpt-6-astra' },
+    { name: '方括号渠道标签包含 GPT 型号仍不算 GPT 模型', sourceProvider: 'source-channel', sourceModel: '[gpt-6-relay]-qwen-max', targetModel: 'gpt-6-astra' },
+    { name: '目标不是 Responses 协议', sourceProvider: 'source-channel', sourceModel: 'gpt-6-astra', targetModel: 'gpt-6-astra', provider: 'openai-compatible' }
+  ];
+  for (const scenario of scenarios) {
+    await testContext.test(scenario.name, async () => {
+      const fullRequest = request();
+      fullRequest.modelId = scenario.targetModel;
+      fullRequest.authoritySnapshot.model.modelId = scenario.targetModel;
+      fullRequest.authoritySnapshot.model.provider = scenario.provider ?? 'openai-responses';
+      const original = {
+        role: 'model',
+        parts: [
+          { text: 'retain reasoning summary', thought: true, thoughtSignature: 'openai-responses:source-encrypted' },
+          { text: 'retain visible answer' },
+          { id: 'call-signature', functionCall: { name: 'echo', args: { value: 1 } }, thoughtSignature: 'openai-responses:source-encrypted' },
+          { text: 'retain other provider signature', thought: true, thoughtSignature: 'gemini:untouched' },
+          { providerContext: { format: 'openai-responses', itemType: 'compaction', rawItem: { type: 'compaction', encrypted_content: 'retain-compaction' } } }
+        ]
+      };
+      fullRequest.context.push({
+        segmentId: 'source-model-message', segmentKind: 'message', messageRole: 'model',
+        contentType: 'application/vnd.limcode.message+json', content: JSON.stringify(original),
+        ...(scenario.sourceProvider ? { modelSource: { providerId: scenario.sourceProvider, modelId: scenario.sourceModel } } : {})
+      });
+      const frozen = JSON.stringify(fullRequest);
+      let captured;
+      const adapter = new kernel.LlmCapabilityFullRequestAdapter(fullRequest.providerId, fakeCapability((llmRequest, emit) => {
+        captured = llmRequest;
+        emit({ type: 'llm:done', payload: { requestId: llmRequest.id, parts: [{ text: 'done' }] } });
+      }));
+      await adapter.sendFullRequest(fullRequest, { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: true }) });
+      const expected = structuredClone(original);
+      if (scenario.isolate) {
+        delete expected.parts[0].thoughtSignature;
+        delete expected.parts[2].thoughtSignature;
+      }
+      assert.deepEqual(captured.contents.at(-1), expected);
+      assert.equal(JSON.stringify(fullRequest), frozen, '出站隔离不得修改冻结历史或来源记录');
+    });
+  }
+});
+
+test('同渠道 GPT 解密报错及再次重试都保留原始签名，不做错误触发的清理', async () => {
+  const fullRequest = request();
+  fullRequest.modelId = 'gpt-6-astra';
+  fullRequest.authoritySnapshot.model = {
+    providerConfigId: fullRequest.providerId, provider: 'openai-responses', modelId: fullRequest.modelId
+  };
+  const content = { role: 'model', parts: [{ text: 'keep', thought: true, thoughtSignature: 'openai-responses:keep-same-channel' }] };
+  fullRequest.context.push({
+    segmentId: 'same-channel-message', segmentKind: 'message', messageRole: 'model',
+    contentType: 'application/vnd.limcode.message+json', content: JSON.stringify(content),
+    modelSource: { providerId: fullRequest.providerId, modelId: fullRequest.modelId }
+  });
+  const captures = [];
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(fullRequest.providerId, fakeCapability((llmRequest, emit) => {
+    captures.push(llmRequest);
+    emit({ type: 'llm:error', payload: {
+      requestId: llmRequest.id,
+      message: 'The encrypted content could not be verified. Reason: Encrypted content could not be decrypted or parsed.'
+    } });
+  }));
+  for (const attemptSeq of ['1', '2']) {
+    fullRequest.attemptSeq = attemptSeq;
+    await assert.rejects(adapter.sendFullRequest(fullRequest, {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }), (error) => !(error instanceof kernel.ProviderTransientError) && /could not be verified/.test(error.message));
+  }
+  assert.equal(captures.length, 2);
+  for (const captured of captures) assert.deepEqual(captured.contents.at(-1), content);
 });
 
 test('LLM capability adapter 过滤未授权工具并提交一个完整终态事件', async () => {
@@ -1730,6 +1852,7 @@ test('LLM capability adapter 将 429、流截断、网络错误和所有可恢�
   ];
   for (const [message, rawError, reason] of [
     ['temporary failure', { status: 429 }, 'rate_limited'],
+    ['Streaming error: 429: rate limited', undefined, 'rate_limited'],
     ['gemini SSE stream ended without provider terminal evidence.', {
       code: 'LLM_STREAM_TRUNCATED', phase: 'response_body'
     }, 'connection_interrupted'],
@@ -1764,6 +1887,108 @@ test('LLM capability adapter 将 429、流截断、网络错误和所有可恢�
           || error.retryAfterOutput === true
         )
     );
+  }
+});
+
+test('LLM capability adapter 将中文服务暂时不可用和明确的临时服务故障标记为可替换部分输出', async () => {
+  for (const [message, rawError] of [
+    ['模型服务暂时不可用，请稍后重试', undefined],
+    ['模型服务暂时不可用，请稍后重试', { receivedSemanticOutput: true }],
+    ['模型服务暂时不可用，请稍后重试', { status: 200, receivedSemanticOutput: true }],
+    ['Service temporarily unavailable', { receivedSemanticOutput: true }],
+    ...[408, 425, 500, 502, 503, 504].map((status) => [
+      'temporary failure', { status, receivedSemanticOutput: true }
+    ])
+  ]) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:thoughtDelta', payload: { requestId: llmRequest.id, text: 'unfinished thought' } });
+      emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
+    }));
+    await assert.rejects(
+      adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
+      (error) => error instanceof kernel.ProviderTransientError
+        && error.reason === 'temporary_service_error'
+        && error.retryAfterOutput === true,
+      JSON.stringify({ message, rawError })
+    );
+  }
+});
+
+test('LLM capability adapter 识别 SSE 文本状态码和 SERVICE_BUSY', async () => {
+  const serviceBusyMessage = "Streaming error: 503: {'code': 'SERVICE_BUSY', 'message': '服务繁忙，请稍后重试', 'traceId': 'trace-service-busy-fixture'}";
+  for (const [message, rawError] of [
+    [serviceBusyMessage, undefined],
+    [serviceBusyMessage, { status: 200, receivedSemanticOutput: true }],
+    ...[408, 425, 500, 502, 503, 504].map((status) => [
+      `Streaming error: ${status}: temporary upstream failure`, { receivedSemanticOutput: true }
+    ]),
+    ['temporary failure', { code: 'SERVICE_BUSY', receivedSemanticOutput: true }],
+    ['temporary failure', { cause: { message: 'Streaming error: 503: temporary upstream failure' }, status: 200 }],
+    ['服务繁忙，请稍后重试', { status: 200, receivedSemanticOutput: true }]
+  ]) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:thoughtDelta', payload: { requestId: llmRequest.id, text: 'unfinished thought' } });
+      emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
+    }));
+    await assert.rejects(
+      adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
+      (error) => error instanceof kernel.ProviderTransientError
+        && error.reason === 'temporary_service_error'
+        && error.retryAfterOutput === true,
+      JSON.stringify({ message, rawError })
+    );
+  }
+});
+
+test('LLM capability adapter 不因稍后重试文案放宽永久错误或显式禁止重试', async () => {
+  for (const [message, rawError] of [
+    ['未知错误，请稍后重试', undefined],
+    ['Request failed at item 503', undefined],
+    ['Streaming error: 5030: unknown failure', undefined],
+    ['服务繁忙，请稍后重试', { retryable: false }],
+    ['Streaming error: 503: SERVICE_BUSY', { transportAttemptsExhausted: true }],
+    ['Streaming error: 503: SERVICE_BUSY', { code: 'invalid_api_key' }],
+    ['Streaming error: 503: SERVICE_BUSY', { code: 'insufficient_quota' }],
+    ['模型服务暂时不可用，请稍后重试', { retryable: false }],
+    ['模型服务暂时不可用，请稍后重试', { transportAttemptsExhausted: true }],
+    ['模型服务暂时不可用，请稍后重试', { code: 'invalid_api_key' }],
+    ['模型服务暂时不可用，请稍后重试', { code: 'insufficient_quota' }],
+    ...[400, 401, 403, 404, 422].map((status) => [
+      '模型服务暂时不可用，请稍后重试', { status }
+    ]),
+    ...[400, 401, 403, 404, 422].flatMap((status) => [
+      ['Streaming error: 503: SERVICE_BUSY', { status }],
+      [`Streaming error: ${status}: SERVICE_BUSY`, { status: 200 }]
+    ])
+  ]) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+      emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
+    }));
+    await assert.rejects(
+      adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) }),
+      (error) => !(error instanceof kernel.ProviderTransientError),
+      JSON.stringify({ message, rawError })
+    );
+  }
+});
+
+test('上游 incomplete chunked read 在无输出和部分输出后都进入连接中断重试', async () => {
+  const message = 'Streaming error: peer closed connection without sending complete message body (incomplete chunked read)';
+  for (const partialOutput of [false, true]) {
+    for (const nested of [false, true]) {
+      const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+        if (partialOutput) emit({ type: 'llm:thoughtDelta', payload: { requestId: llmRequest.id, text: 'unfinished thought' } });
+        emit({ type: 'llm:error', payload: {
+          requestId: llmRequest.id,
+          message: nested ? 'upstream stream failed' : message,
+          rawError: { status: 200, receivedSemanticOutput: partialOutput, ...(nested ? { cause: { message } } : {}) }
+        } });
+      }));
+      await assert.rejects(adapter.sendFullRequest(request(), {
+        onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+      }), (error) => error instanceof kernel.ProviderTransientError
+        && error.reason === 'connection_interrupted' && error.retryAfterOutput === true);
+    }
   }
 });
 

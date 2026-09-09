@@ -33,6 +33,7 @@ import {
   ProviderTransientError
 } from './modelProviderControlPlane';
 import type {
+  FullProviderContextItem,
   FullProviderRequest,
   FullRequestProviderAdapter,
   ProviderDispatchControls,
@@ -450,6 +451,19 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         if (terminal) return;
         try {
           const payload = asRecord(event.payload);
+          if (event.type === LlmEventType.CompactProgress) {
+            sequence += 1n;
+            const progressSeq = sequence.toString();
+            tail = tail.then(async () => {
+              if (!controls.signal?.aborted) await controls.onCompressionProgress?.(progressSeq);
+            });
+            void tail.catch((error: unknown) => {
+              if (terminal) return;
+              finish(error);
+              this.capability.abort(request.modelRequestId);
+            });
+            return;
+          }
           if (event.type === LlmEventType.CompactDone) {
             const result = asRecord(payload?.result);
             if (!result) throw new TypeError('LLM compact result must be an object.');
@@ -520,6 +534,35 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       }
     });
   }
+}
+
+function isolateCrossChannelGptThoughtSignatures(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: FullProviderRequest,
+  provider: LlmProviderKind
+): MessageContent {
+  if (
+    provider !== 'openai-responses'
+    || content.role !== 'model'
+    || !source?.providerId.trim()
+    || source.providerId === request.providerId
+    || !isGptModelId(source.modelId)
+    || !isGptModelId(request.modelId)
+  ) return content;
+  return {
+    ...content,
+    parts: content.parts.map((part) => {
+      if (!('thoughtSignature' in part) || !part.thoughtSignature?.startsWith('openai-responses:')) return part;
+      const { thoughtSignature: _signature, ...projected } = part;
+      return projected;
+    })
+  };
+}
+
+function isGptModelId(modelId: string): boolean {
+  const name = modelId.slice(modelId.lastIndexOf('/') + 1).trim().replace(/^\[[^\]]+\][\s_-]*/, '');
+  return /^gpt[-_.]?\d/i.test(name);
 }
 
 function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
@@ -594,7 +637,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     }
     const decoded = decodeMessageContent(item.content, item.contentType);
     if (decoded) {
-      contents.push(decoded);
+      contents.push(isolateCrossChannelGptThoughtSignatures(decoded, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
     }
@@ -1837,13 +1880,17 @@ function capabilityThrownProviderError(error: unknown): Error {
 }
 
 function classifyProviderFailure(message: string, raw: Record<string, unknown> | undefined): Error {
-  const status = findNumericStatus(raw);
   const signature = collectErrorSignature(raw, message).toLowerCase();
+  const structuredStatus = findNumericStatus(raw);
+  const embeddedStatus = /\b(?:streaming error|unexpected server response):\s*([45]\d{2})\b/.exec(signature);
+  const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299)) && embeddedStatus
+    ? Number(embeddedStatus[1])
+    : structuredStatus;
   const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
   const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
   const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
   const openAIResponsesWebSocketTimeout = isStructuredOpenAIResponsesWebSocketTimeout(raw);
-  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)/.test(signature);
+  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|peer closed connection without sending complete message body|\bincomplete chunked read\b/.test(signature);
   const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
     signature,
     findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
@@ -1869,26 +1916,23 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
   if (replaySafeTransportFailure) {
     return new ProviderTransientError('connection_interrupted', message, true);
   }
-  if (receivedSemanticOutput === true) {
+  const temporaryServiceFailure = status === 408
+    || status === 425
+    || (status !== undefined && status >= 500 && status <= 599)
+    || ((status === undefined || (status >= 200 && status <= 299))
+      && /\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bservice_busy\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b|模型服务暂时不可用|服务繁忙/.test(signature));
+  if (receivedSemanticOutput === true && !temporaryServiceFailure) {
     return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
   }
   if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
-  if (status === 429 || /unexpected server response:\s*429\b/.test(signature)) {
+  if (status === 429) {
     return new ProviderTransientError('rate_limited', message);
   }
-  if (
-    status === 408
-    || status === 425
-    || (status !== undefined && status >= 500 && status <= 599)
-    || /unexpected server response:\s*(?:408|425|5\d\d)\b/.test(signature)
-  ) {
-    return new ProviderTransientError('temporary_service_error', message);
+  if (temporaryServiceFailure) {
+    return new ProviderTransientError('temporary_service_error', message, true);
   }
   if (/\b(econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|websocket closed before (?:terminal event|response\.completed|open)|timed? out/.test(signature)) {
     return new ProviderTransientError('connection_interrupted', message);
-  }
-  if (/\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b/.test(signature)) {
-    return new ProviderTransientError('temporary_service_error', message);
   }
   if (explicitlyRetryable === true) {
     return new ProviderTransientError('connection_interrupted', message);

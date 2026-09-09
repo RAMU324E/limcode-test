@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -201,6 +202,88 @@ test('unavailable observation documents are rejected at the durable encoding bou
     summary: 'Original attachment preserved without analysis.', salientFacts: [],
     uncertainties: ['Attachment content was not observed; visual or media details remain unknown.']
   }), /unavailable.*cannot be cached/i);
+});
+
+test('current observation contract isolates persisted unavailable caches without rewriting history', async () => {
+  await withRuntime('attachment-observation-cache-contract', async (database, _fixtureContent, store) => {
+    const seeded = await seedObservationCompressionTurn(database, store);
+    const bytes = Buffer.from('original attachment content');
+    const mediaContent = await store.ingest(database, bytes, 'image/png');
+    const attachment = {
+      attachmentId: 'cached-unavailable-attachment', name: 'cached-unavailable.png',
+      mimeType: 'image/png', sizeBytes: bytes.byteLength
+    };
+    const attachmentRow = {
+      id: attachment.attachmentId, sha256: mediaContent.sha256, byte_length: BigInt(bytes.byteLength),
+      mime_type: attachment.mimeType, name: attachment.name, storage_mode: 'managed',
+      content_object_id: mediaContent.id, created_at: NOW
+    };
+    const provider = { providerConfigId: 'cache-contract-provider', provider: 'gemini', modelId: 'cache-contract-model' };
+    const previousProfile = createHash('sha256').update(kernel.canonicalPlainJson({
+      kind: 'attachment_observation_analysis_profile', promptRevision: '2026-08-21', ...provider
+    }, 'previous observation profile')).digest('hex');
+    const unavailable = {
+      attachmentRef: 'F1', summary: 'Original attachment preserved without analysis.', salientFacts: [],
+      uncertainties: ['Attachment content was not observed; visual or media details remain unknown.']
+    };
+    const previousDocument = JSON.stringify({
+      kind: 'attachment_observation', analysisProfileSha256: previousProfile,
+      summary: unavailable.summary, salientFacts: unavailable.salientFacts, uncertainties: unavailable.uncertainties
+    });
+    const previousContent = await store.ingest(database, previousDocument, kernel.ATTACHMENT_OBSERVATION_CONTENT_TYPE);
+    const previousLink = {
+      id: kernel.attachmentObservationLinkId(attachment.attachmentId, previousProfile),
+      attachment_id: attachment.attachmentId, analysis_profile_sha256: previousProfile,
+      content_object_id: previousContent.id, created_at: NOW
+    };
+    await database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Attachment').insert(attachmentRow),
+      kernel.DOMAIN_REPOSITORIES.domain('AttachmentObservationLink').insert(previousLink)
+    ]);
+    const handles = { entries: [{
+      kind: 'attachment', ref: 'F1', target: attachment.attachmentId,
+      name: attachment.name, mimeType: attachment.mimeType, sizeBytes: attachment.sizeBytes
+    }] };
+    const profile = kernel.attachmentObservationAnalysisProfileSha256(provider);
+    const load = () => kernel.loadAttachmentObservationRequirements(database, store, [attachment], handles, profile);
+    const requirements = await load();
+    assert.notEqual(profile, previousProfile);
+    assert.equal(requirements[0].cachedObservation, undefined);
+    const context = new kernel.ContextSequenceControlPlane(database, store);
+    const compression = new kernel.ContextCompressionControlPlane(database, store);
+    const create = async (observation, id) => {
+      const command = {
+        conversationId: seeded.conversationId, headRootId: await context.currentHeadRootId(seeded.conversationId),
+        authoritySnapshotId: seeded.authoritySnapshotId, compressSegmentCount: 1, title: id, idempotencyKey: id,
+        summary: [kernel.renderAttachmentObservationStateContent(requirements, [observation])],
+        attachmentObservations: kernel.completeAttachmentObservationCommits(requirements, [observation], profile)
+      };
+      return { command, result: await compression.create(command) };
+    };
+    const unavailableCompression = await create(unavailable, 'current-contract-unavailable');
+    const unavailableBlock = await getDomainRow(database, 'CompressionBlock', unavailableCompression.result.compressionBlockId);
+    const unavailableSummary = await getDomainRow(database, 'ContentObject', unavailableBlock.summary_object_id);
+    const unavailableSummaryBytes = await store.read(unavailableSummary);
+    assert.equal((await load())[0].cachedObservation, undefined);
+    assert.equal((await listDomainRows(database, 'AttachmentObservationLink', {})).length, 1);
+    const recovered = {
+      attachmentRef: 'F1', summary: 'Recovered observation under the current contract.',
+      salientFacts: ['The indicator is red.'], uncertainties: []
+    };
+    const recoveredCompression = await create(recovered, 'current-contract-recovered');
+    assert.deepEqual((await load())[0].cachedObservation, recovered);
+    assert.equal((await listDomainRows(database, 'AttachmentObservationLink', {})).length, 2);
+    assert.deepEqual(await getDomainRow(database, 'AttachmentObservationLink', previousLink.id), previousLink);
+    assert.equal((await store.read(previousContent)).toString('utf8'), previousDocument);
+    assert.deepEqual(await store.read(unavailableSummary), unavailableSummaryBytes);
+    assert.deepEqual(await getDomainRow(database, 'Attachment', attachment.attachmentId), attachmentRow);
+    assert.deepEqual(await store.read(mediaContent), bytes);
+    assert.equal((await compression.create(recoveredCompression.command)).deduplicated, true);
+    await assert.rejects(
+      kernel.loadAttachmentObservationRequirements(database, store, [attachment], handles, previousProfile),
+      /Unavailable attachment observations cannot be cached/
+    );
+  });
 });
 
 test('unavailable observations recover through real provider calls and database commits without rewriting history', async (t) => {

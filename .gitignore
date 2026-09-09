@@ -42,8 +42,10 @@ docs/architecture/*
 /tests/reliable-kernel/*
 !/tests/reliable-kernel/attachment-ingest-boundary.test.mjs
 !/tests/reliable-kernel/canonical-base64.test.mjs
+!/tests/reliable-kernel/compression-progress-ui.test.mjs
 !/tests/reliable-kernel/configuration-authority.test.mjs
 !/tests/reliable-kernel/context-token-estimator.test.mjs
+!/tests/reliable-kernel/conversation-fork-context.test.mjs
 !/tests/reliable-kernel/current-turn-task-projection.test.mjs
 !/tests/reliable-kernel/diagnostic-journal.test.mjs
 !/tests/reliable-kernel/debug-capture-controller.test.mjs
@@ -62,6 +64,7 @@ docs/architecture/*
 !/tests/reliable-kernel/reliable-control-lifecycle.test.mjs
 !/tests/reliable-kernel/plan-interrupt-recovery.test.mjs
 !/tests/reliable-kernel/waiting-interaction-cancellation.test.mjs
+!/tests/reliable-kernel/interaction-auto-approval.test.mjs
 !/tests/reliable-kernel/reliable-queue-ordering.test.mjs
 !/tests/reliable-kernel/webview-feed-lifecycle.test.mjs
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs
