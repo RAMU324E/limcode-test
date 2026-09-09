@@ -2052,6 +2052,8 @@ function compressionPresentationTokens(summary: Record<string, unknown>): Record
     'configuredThresholdTokens',
     'estimatedTokensBefore',
     'estimatedTokensAfter',
+    'calibratedTokensBefore',
+    'calibratedTokensAfter',
     'providerInputTokens',
     'providerOutputTokens'
   ] as const;

@@ -69,11 +69,24 @@ test('上下文状态通过独立projection/head关系识别上一轮精确值�
   assert.match(source, /requestRootId !== currentRootId/);
   assert.match(
     source,
-    /exactContextTokens\.value \?\? estimatedContextTokens\.value \?\? previousExactContextTokens\.value/,
-    '当前root估算必须优先于已过期的Provider精确输入'
+    /exactContextTokens\.value\s+\?\? compressionProjectedContextTokens\.value\s+\?\? estimatedContextTokens\.value\s+\?\? previousExactContextTokens\.value/,
+    '当前root的压缩实测换算值与估算都必须优先于已过期的Provider精确输入'
   );
   assert.match(source, /最近请求精确输入/);
   assert.doesNotMatch(source, /latestCompressionChange/);
+});
+
+test('压缩刚结束时上下文占用直接显示压缩自己算出的实测体积', () => {
+  const source = fs.readFileSync('webview/src/components/conversation/ReliableContextStatus.vue', 'utf8');
+  // 压缩已经按Provider实测倍率算过一次结果，界面再拿估算器重算只会先低后高地跳一次。
+  assert.match(source, /calibratedTokensAfter/);
+  assert.match(source, /requestDetail\('compression-presentation'/);
+  assert.match(source, /if \(!ordinaryUsageStale\.value\) return false;/);
+  assert.match(
+    source,
+    /rootCreatedAt < blockCreatedAt\) return false;/,
+    '回退到更早的root后，压缩投影描述的已经不是要发送的上下文'
+  );
 });
 
 test('provider语义估算不会把base64图片字符当普通文本token', () => {
