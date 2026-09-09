@@ -77,6 +77,7 @@ docs/architecture/*
 !/tests/reliable-kernel/guidance-queue.test.mjs
 !/tests/reliable-kernel/workspace-runtime-isolation.test.mjs
 !/tests/reliable-kernel/vscode-fs-local-read.test.cjs
+!/tests/reliable-kernel/claude-cross-model-thinking-replay.test.mjs
 !/tests/vscodeStorageJsonDurability.test.cjs
 !/webview/tests/
 /webview/tests/*
