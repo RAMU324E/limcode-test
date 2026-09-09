@@ -4768,7 +4768,7 @@ function installProviderSchemaEncoder<T>(
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
-  if (providerKind !== 'gemini' && providerKind !== 'openai-responses') return provider;
+  if (providerKind !== 'gemini' && providerKind !== 'openai-responses' && providerKind !== 'claude') return provider;
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
@@ -4785,6 +4785,8 @@ function installProviderSchemaEncoder<T>(
     const encoded = originalEncodeRequest(normalizedRequest, stream);
     if (providerKind === 'gemini') {
       restoreGeminiToolPropertyNames(encoded, normalizedRequest);
+    } else if (providerKind === 'claude') {
+      restoreClaudeToolResultPairing(encoded);
     } else if (isRecord(encoded) && Array.isArray(encoded.tools)) {
       for (const tool of encoded.tools) {
         if (isRecord(tool) && tool.type === 'function' && tool.name === 'edit') tool.strict = false;
@@ -4794,6 +4796,76 @@ function installProviderSchemaEncoder<T>(
   };
   format.__limcodeProviderSchemaEncoder = true;
   return provider;
+}
+
+interface ClaudeToolResultBatch {
+  toolResults: unknown[];
+  trailing: unknown[];
+  endIndexExclusive: number;
+}
+
+/**
+ * Claude 要求一条 assistant 消息里的每个 tool_use 都在紧随其后的那一条 user 消息里拿到 tool_result。
+ * 规范上下文把每个工具结果冻结成独立片段，附件目录之类的片段还会排在它们中间，编码后就是多条 user 消息，
+ * 并行工具调用因此被判为 `tool_use ids were found without tool_result blocks immediately after`。
+ * 这里只重排 Claude 出站消息：同一批 tool_result 合并进紧邻的一条 user 消息，夹在中间的其他内容按原顺序追加到其后。
+ */
+function restoreClaudeToolResultPairing(encodedRequest: unknown): void {
+  if (!isRecord(encodedRequest) || !Array.isArray(encodedRequest.messages)) return;
+  const messages = encodedRequest.messages;
+  const paired: unknown[] = [];
+  let regrouped = false;
+  for (let index = 0; index < messages.length; index += 1) {
+    paired.push(messages[index]);
+    const toolUseIds = claudeToolUseIds(messages[index]);
+    if (toolUseIds.length === 0) continue;
+    const batch = collectClaudeToolResults(messages, index + 1, toolUseIds);
+    if (!batch) continue;
+    paired.push({ role: 'user', content: [...batch.toolResults, ...batch.trailing] });
+    if (batch.endIndexExclusive > index + 2 || batch.trailing.length > 0) regrouped = true;
+    index = batch.endIndexExclusive - 1;
+  }
+  if (regrouped) encodedRequest.messages = paired;
+}
+
+function claudeToolUseIds(message: unknown): string[] {
+  if (!isRecord(message) || message.role !== 'assistant' || !Array.isArray(message.content)) return [];
+  return message.content.flatMap((block) => isRecord(block)
+    && block.type === 'tool_use'
+    && typeof block.id === 'string'
+    && block.id.length > 0
+    ? [block.id]
+    : []);
+}
+
+/** Scans the user messages that answer one assistant tool_use batch; stops at the first non-user message. */
+function collectClaudeToolResults(
+  messages: readonly unknown[],
+  startIndex: number,
+  toolUseIds: readonly string[]
+): ClaudeToolResultBatch | undefined {
+  const pending = new Set(toolUseIds);
+  const toolResults: unknown[] = [];
+  const trailing: unknown[] = [];
+  let index = startIndex;
+  for (; index < messages.length && pending.size > 0; index += 1) {
+    const message = messages[index];
+    if (!isRecord(message) || message.role !== 'user') break;
+    for (const block of claudeContentBlocks(message.content)) {
+      const toolUseId = isRecord(block) && block.type === 'tool_result' && typeof block.tool_use_id === 'string'
+        ? block.tool_use_id
+        : undefined;
+      if (toolUseId !== undefined && pending.delete(toolUseId)) toolResults.push(block);
+      else trailing.push(block);
+    }
+  }
+  return toolResults.length > 0 ? { toolResults, trailing, endIndexExclusive: index } : undefined;
+}
+
+function claudeContentBlocks(content: unknown): unknown[] {
+  if (Array.isArray(content)) return content;
+  if (typeof content === 'string' && content.length > 0) return [{ type: 'text', text: content }];
+  return [];
 }
 
 const GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR = 'skip_thought_signature_validator';
