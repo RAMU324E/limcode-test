@@ -28,11 +28,15 @@ import {
   providerPromptTokens
 } from './contextTokenEstimator';
 import {
-  MODEL_BODY_TARGET_TOKENS,
+  calculateCalibratedCompressionRooms,
   calculateEffectiveSummaryMaxTokens,
   calculateFullRequestPlanningBudget,
+  calibrateEstimatorToProvider,
+  calibratedTailBudgetTokens,
   projectStoredModelFacingWindow,
+  providerTokenCalibration,
   selectContinuousAtomicTail,
+  UNCALIBRATED_PROVIDER_TOKENS,
   type AtomicContextGroup,
   type ContextPlanningFailureCode,
   type FullRequestPlanningBudget
@@ -215,27 +219,37 @@ export class ReliableContextCompressionCoordinator {
     ) {
       throw new RangeError('OpenAI native Compact must receive the complete frozen model-visible Context window.');
     }
+    // The level trigger already anchors this Context on a Provider prompt count. Reusing that anchor
+    // as the estimator calibration keeps the retained tail sized in the same unit as the threshold
+    // that selected it; without it a CJK/code Conversation keeps roughly the ratio's worth of extra
+    // real Context after every compression and re-crosses the threshold within minutes.
+    const calibration = decision.source === 'provider-observed-delta'
+      ? providerTokenCalibration(decision.estimatedTokens, requestBudget.estimatedFullInputTokens)
+      : UNCALIBRATED_PROVIDER_TOKENS;
+    const rooms = calculateCalibratedCompressionRooms({
+      budget: requestBudget,
+      calibration,
+      irreducibleAddendaTokens,
+      ...(policy.config.bodyTargetTokens === undefined
+        ? {}
+        : { bodyTargetTokens: policy.config.bodyTargetTokens })
+    });
     const effectiveSummaryMaxTokens = policy.methodKind === 'openai_responses_compact'
       ? undefined
       : calculateEffectiveSummaryMaxTokens(
           policy.config.llmSummary?.targetTokens,
-          requestBudget.effectiveBodyTargetTokens
+          rooms.calibratedBodyTargetTokens
         );
     const textTailPlan = policy.methodKind === 'openai_responses_compact' || command.compressSegmentCount !== undefined
       ? undefined
       : selectCompressionPrefixByTokens(
             materialized.records,
             semanticMaterialized.segments,
-            Math.max(0, requestBudget.effectiveBodyTargetTokens
-              - irreducibleAddendaTokens
-              - (effectiveSummaryMaxTokens ?? 0)),
+            calibratedTailBudgetTokens(rooms, effectiveSummaryMaxTokens ?? 0),
             fullAttachmentCatalogState,
             fullModelHandleCatalog
           );
-    const hardContextRoomTokens = Math.max(
-      0,
-      requestBudget.planningBodyRoomTokens - irreducibleAddendaTokens
-    );
+    const hardContextRoomTokens = rooms.hardContextRoomTokens;
     if (textTailPlan?.newestGroupTokens !== undefined && textTailPlan.newestGroupTokens > hardContextRoomTokens) {
       return compressionError(
         textTailPlan.newestGroupKind === 'tool_exchange' ? 'atomic_group_too_large' : 'finite_tail_too_large',
@@ -427,16 +441,21 @@ export class ReliableContextCompressionCoordinator {
     const summaryEstimatedTokens = estimateMessageContentsTokens(summary);
     const projectedTokens = summaryEstimatedTokens
       + Math.max(0, candidateProjection.tokenCount - summaryProjectionTokens);
-    const projectedBodyTokens = projectedTokens + irreducibleAddendaTokens;
-    if (projectedBodyTokens > requestBudget.planningBodyRoomTokens) {
+    const projectedBodyTokens = calibrateEstimatorToProvider(
+      projectedTokens + irreducibleAddendaTokens,
+      calibration
+    );
+    if (projectedBodyTokens > rooms.calibratedPlanningBodyRoomTokens) {
       return compressionError(
         'compressed_context_too_large',
         'The candidate compressed history plus frozen request addenda still exceeds the compression planning body room.',
         projectedBodyTokens,
-        requestBudget.planningBodyRoomTokens
+        rooms.calibratedPlanningBodyRoomTokens
       );
     }
-    if (policy.methodKind !== 'openai_responses_compact' && projectedTokens >= decision.estimatedTokens) {
+    const projectedProviderTokens = calibrateEstimatorToProvider(projectedTokens, calibration)
+      + rooms.calibratedFixedTokens;
+    if (policy.methodKind !== 'openai_responses_compact' && projectedProviderTokens >= decision.estimatedTokens) {
       // A large protected tail can cross the threshold while the currently eligible prefix is
       // already compact.  The durable ModelRequest makes this decision exact-replayable for this
       // frozen head; treating it as a level-triggered skip keeps the primary Agent Turn alive and
@@ -465,6 +484,12 @@ export class ReliableContextCompressionCoordinator {
         requestBreakdown: requestBudget.breakdown,
         estimatedTokensBefore: requestBudget.estimatedFullInputTokens,
         estimatedTokensAfter: projectedTokens,
+        providerCalibrationRatio: calibration.ratio,
+        calibratedTokensBefore: calibrateEstimatorToProvider(
+          requestBudget.estimatedFullInputTokens,
+          calibration
+        ),
+        calibratedTokensAfter: projectedProviderTokens,
         ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
         ...(providerOutputTokens === undefined ? {} : { providerOutputTokens }),
         methodKind: policy.methodKind,
@@ -483,7 +508,8 @@ export class ReliableContextCompressionCoordinator {
       modelRequestId: expectedModelRequestId,
       sourceRootId: headRootId,
       sourceSegmentCount,
-      ...(policy.methodKind === 'openai_responses_compact' && projectedTokens > MODEL_BODY_TARGET_TOKENS
+      ...(policy.methodKind === 'openai_responses_compact'
+        && calibrateEstimatorToProvider(projectedTokens, calibration) > rooms.calibratedBodyTargetTokens
         ? { diagnostics: ['native_over_target' as const] }
         : {}),
       result: committed

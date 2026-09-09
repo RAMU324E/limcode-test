@@ -5,7 +5,9 @@ import {
   DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES,
   MAX_LLM_COMPRESSION_DURATION_MINUTES,
   normalizeLlmCompressionMaxDurationMinutes,
-  MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
+  DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS,
+  MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS,
+  normalizeLlmCompressionBodyTargetTokens,
   type LlmCompressionConfigRecord,
   type LlmCompressionMethodKind,
   type LlmProviderConfigRecord,
@@ -31,6 +33,7 @@ const emit = defineEmits<{
   (event: 'update-method-kind', value: SelectableCompressionMethodKind): void;
   (event: 'update-trigger', value: Partial<LlmCompressionConfigRecord['trigger']>): void;
   (event: 'update-max-duration-minutes', value: number): void;
+  (event: 'update-body-target-tokens', value: number): void;
 }>();
 
 const providerOptions: SettingsDropdownOption[] = [
@@ -117,7 +120,19 @@ const recommendedThresholdTokens = computed(() => {
   );
 });
 const compressionThresholdInputValue = computed(() => String(compressionThresholdTokens.value || ''));
-const compressionBodyTargetLabel = formatTokenLabel(MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS);
+const compressionBodyTargetMaxTokens = computed(() => (
+  compressionAutoEnabled.value && compressionThresholdTokens.value > 0
+    ? compressionThresholdTokens.value
+    : props.contextWindowTokens
+));
+const compressionBodyTargetTokens = computed(() => clampBodyTargetTokens(
+  normalizeLlmCompressionBodyTargetTokens(props.config?.bodyTargetTokens)
+));
+const recommendedBodyTargetTokens = computed(() => clampBodyTargetTokens(
+  DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS
+));
+const compressionBodyTargetLabel = computed(() => formatTokenLabel(compressionBodyTargetTokens.value));
+const compressionBodyTargetInputValue = computed(() => String(compressionBodyTargetTokens.value || ''));
 const compressionMaxDurationMinutes = computed(() => normalizeLlmCompressionMaxDurationMinutes(props.config?.maxDurationMinutes));
 
 function providerLabel(provider: LlmProviderKind | undefined): string {
@@ -197,6 +212,25 @@ function updateCompressionThresholdFromTokens(value: number): void {
   });
 }
 
+function clampBodyTargetTokens(value: number): number {
+  const aligned = alignTokenCountToK(value);
+  const floor = alignTokenCountToK(MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS);
+  const ceiling = compressionBodyTargetMaxTokens.value;
+  const alignedCeiling = ceiling >= TOKEN_STEP ? Math.floor(ceiling / TOKEN_STEP) * TOKEN_STEP : undefined;
+  const bounded = alignedCeiling === undefined ? aligned : Math.min(alignedCeiling, aligned);
+  return Math.max(floor, bounded);
+}
+
+function updateBodyTargetTokens(event: Event): void {
+  const value = numericInputValue(event);
+  if (value === undefined) return;
+  updateBodyTargetFromTokens(value);
+}
+
+function updateBodyTargetFromTokens(value: number): void {
+  emit('update-body-target-tokens', clampBodyTargetTokens(value));
+}
+
 function updateMethodKind(value: string): void {
   emit('update-method-kind', value as SelectableCompressionMethodKind);
 }
@@ -213,7 +247,7 @@ function updateMaxDurationMinutes(event: Event): void {
     <header class="compression-settings-header">
       <div>
         <label>上下文压缩</label>
-        <p>当前压缩方法：{{ compressionKindLabel(config?.kind) }}。文字压缩后的对话主体会按可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} Token；OpenAI 原生压缩必须使用 OpenAI Responses 渠道。</p>
+        <p>当前压缩方法：{{ compressionKindLabel(config?.kind) }}。文字压缩后保留的对话主体目标为 {{ compressionBodyTargetLabel }} Token，可用空间不足时会进一步收紧；OpenAI 原生压缩必须使用 OpenAI Responses 渠道。</p>
       </div>
     </header>
     <div class="global-settings-grid compression-settings-grid">
@@ -252,7 +286,7 @@ function updateMaxDurationMinutes(event: Event): void {
         <div class="compression-trigger-head">
           <div>
             <span class="compression-trigger-title">完整输入 Token 触发阈值</span>
-            <p>完整输入包含系统要求、工具定义、运行提醒和对话。这个数值只决定何时压缩；压缩后的对话主体会按 LLM 可用空间动态收紧，最多 {{ compressionBodyTargetLabel }} Token。</p>
+            <p>完整输入包含系统要求、工具定义、运行提醒和对话。这个数值只决定何时压缩；压缩后保留多少对话在下面单独设置。</p>
           </div>
         </div>
 
@@ -282,6 +316,44 @@ function updateMaxDurationMinutes(event: Event): void {
             :disabled="contextWindowTokens <= 0"
             aria-label="拖拽调整自动压缩触发阈值"
             @update:model-value="updateCompressionThresholdFromTokens"
+          />
+        </div>
+      </div>
+      <div class="compression-trigger-panel global-settings-field-wide">
+        <div class="compression-trigger-head">
+          <div>
+            <span class="compression-trigger-title">压缩后保留的对话 Token 数</span>
+            <p>压缩后仍然逐字发给 LLM 的对话主体上限，按渠道实测倍率换算成真实 Token 计算。默认 {{ formatTokenLabel(DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS) }}；调高保留更多细节但压缩更频繁。</p>
+            <p>为避免压缩完立刻再次触发，实际保留量最多取触发阈值以下剩余空间的一半。</p>
+          </div>
+        </div>
+
+        <div class="compression-threshold-control">
+          <label class="global-settings-field compression-threshold-input-field">
+            <span>保留 Token 数</span>
+            <span class="threshold-input-shell">
+              <input
+                class="token-number-input"
+                :value="compressionBodyTargetInputValue"
+                type="number"
+                :min="MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS"
+                :max="compressionBodyTargetMaxTokens || undefined"
+                :step="TOKEN_STEP"
+                :disabled="compressionBodyTargetMaxTokens <= 0"
+                @change="updateBodyTargetTokens"
+              />
+              <span>Token</span>
+            </span>
+          </label>
+
+          <TokenThresholdSlider
+            :model-value="compressionBodyTargetTokens"
+            :max-tokens="compressionBodyTargetMaxTokens"
+            :step-tokens="TOKEN_STEP"
+            :recommended-tokens="recommendedBodyTargetTokens"
+            :disabled="compressionBodyTargetMaxTokens <= 0"
+            aria-label="拖拽调整压缩后保留的对话 Token 数"
+            @update:model-value="updateBodyTargetFromTokens"
           />
         </div>
       </div>

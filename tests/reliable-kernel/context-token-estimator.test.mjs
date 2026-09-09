@@ -69,11 +69,24 @@ test('上下文状态通过独立projection/head关系识别上一轮精确值�
   assert.match(source, /requestRootId !== currentRootId/);
   assert.match(
     source,
-    /exactContextTokens\.value \?\? estimatedContextTokens\.value \?\? previousExactContextTokens\.value/,
-    '当前root估算必须优先于已过期的Provider精确输入'
+    /exactContextTokens\.value\s+\?\? compressionProjectedContextTokens\.value\s+\?\? estimatedContextTokens\.value\s+\?\? previousExactContextTokens\.value/,
+    '当前root的压缩实测换算值与估算都必须优先于已过期的Provider精确输入'
   );
   assert.match(source, /最近请求精确输入/);
   assert.doesNotMatch(source, /latestCompressionChange/);
+});
+
+test('压缩刚结束时上下文占用直接显示压缩自己算出的实测体积', () => {
+  const source = fs.readFileSync('webview/src/components/conversation/ReliableContextStatus.vue', 'utf8');
+  // 压缩已经按Provider实测倍率算过一次结果，界面再拿估算器重算只会先低后高地跳一次。
+  assert.match(source, /calibratedTokensAfter/);
+  assert.match(source, /requestDetail\('compression-presentation'/);
+  assert.match(source, /if \(!ordinaryUsageStale\.value\) return false;/);
+  assert.match(
+    source,
+    /rootCreatedAt < blockCreatedAt\) return false;/,
+    '回退到更早的root后，压缩投影描述的已经不是要发送的上下文'
+  );
 });
 
 test('provider语义估算不会把base64图片字符当普通文本token', () => {
@@ -317,6 +330,127 @@ test('实用版压缩规划使用48K主体、8K摘要和16K输出且没有全局
   assert.equal(budget.planningInputCapacityTokens, 100_000);
   assert.equal(budget.effectiveBodyTargetTokens, 48_000);
   assert.equal('canSend' in budget, false);
+});
+
+test('Provider实测校准把48K主体目标换算回本地估算单位再挑选保留tail', () => {
+  // 真实复现：300K窗口、270K阈值、Provider实测271,656、同一请求本地估算144,419。
+  const budget = kernel.calculateFullRequestPlanningBudget({
+    contextWindowTokens: 300_000,
+    maxOutputTokens: 16_000,
+    compressionThresholdTokens: 270_000,
+    breakdown: emptyBreakdown({ fixedTokens: 23_304, bodyTokens: 121_115 })
+  });
+  assert.equal(budget.estimatedFullInputTokens, 144_419);
+  assert.equal(budget.effectiveBodyTargetTokens, 48_000);
+
+  const calibration = kernel.providerTokenCalibration(271_656, budget.estimatedFullInputTokens);
+  assert.ok(calibration.ratio > 1.88 && calibration.ratio < 1.882, `ratio=${calibration.ratio}`);
+
+  const rooms = kernel.calculateCalibratedCompressionRooms({
+    budget,
+    calibration,
+    irreducibleAddendaTokens: 0
+  });
+  assert.equal(rooms.calibratedFixedTokens, 43_836);
+  assert.equal(rooms.calibratedPlanningBodyRoomTokens, 240_164);
+  assert.equal(rooms.calibratedBodyTargetTokens, 48_000);
+
+  const summaryMaxTokens = kernel.calculateEffectiveSummaryMaxTokens(undefined, rooms.calibratedBodyTargetTokens);
+  assert.equal(summaryMaxTokens, 8_000);
+  const tailBudgetTokens = kernel.calibratedTailBudgetTokens(rooms, summaryMaxTokens);
+  assert.equal(tailBudgetTokens, 21_264);
+  // 未校准时同一预算会保留40,000本地估算token，也就是约75,000个真实Provider token。
+  assert.ok(
+    Math.round(tailBudgetTokens * calibration.ratio) <= 48_000 - summaryMaxTokens,
+    '按校准比例还原后的保留tail必须落在48K主体目标之内'
+  );
+});
+
+test('配置的主体目标生效，且被阈值以下剩余空间的一半挡住避免压缩后立刻再触发', () => {
+  const budget = kernel.calculateFullRequestPlanningBudget({
+    contextWindowTokens: 300_000,
+    maxOutputTokens: 16_000,
+    compressionThresholdTokens: 270_000,
+    breakdown: emptyBreakdown({ fixedTokens: 23_304, bodyTokens: 121_115 })
+  });
+  const calibration = kernel.providerTokenCalibration(271_656, budget.estimatedFullInputTokens);
+
+  const lowered = kernel.calculateCalibratedCompressionRooms({
+    budget,
+    calibration,
+    irreducibleAddendaTokens: 0,
+    bodyTargetTokens: 30_000
+  });
+  assert.equal(lowered.calibratedBodyTargetTokens, 30_000);
+
+  // 270,000阈值减去43,836真实固定开销后还剩226,163；配置调到120K也只能拿到其中一半。
+  const raised = kernel.calculateCalibratedCompressionRooms({
+    budget,
+    calibration,
+    irreducibleAddendaTokens: 0,
+    bodyTargetTokens: 120_000
+  });
+  assert.equal(raised.calibratedBodyTargetTokens, 113_081);
+  assert.ok(
+    raised.calibratedBodyTargetTokens + raised.calibratedFixedTokens < budget.compressionThresholdTokens,
+    '压缩后的真实体积必须明显低于触发阈值，否则下一回合会立刻再次压缩'
+  );
+});
+
+test('没有Provider锚点时校准是恒等的，且比例只收紧不放宽', () => {
+  const budget = kernel.calculateFullRequestPlanningBudget({
+    contextWindowTokens: 300_000,
+    maxOutputTokens: 16_000,
+    compressionThresholdTokens: 270_000,
+    breakdown: emptyBreakdown({ fixedTokens: 23_304, bodyTokens: 121_115 })
+  });
+  assert.equal(kernel.UNCALIBRATED_PROVIDER_TOKENS.ratio, 1);
+  const identity = kernel.calculateCalibratedCompressionRooms({
+    budget,
+    calibration: kernel.UNCALIBRATED_PROVIDER_TOKENS,
+    irreducibleAddendaTokens: 0
+  });
+  assert.equal(identity.calibratedFixedTokens, 23_304);
+  assert.equal(
+    kernel.calibratedTailBudgetTokens(identity, kernel.calculateEffectiveSummaryMaxTokens(undefined, 48_000)),
+    40_000
+  );
+
+  // 本地估算高于Provider实测时不放宽规划：单次观测不足以支撑更大的保留上下文。
+  assert.equal(kernel.providerTokenCalibration(80_000, 100_000).ratio, 1);
+  // 异常锚点不得把保留tail压成零。
+  assert.equal(kernel.MAX_PROVIDER_TOKEN_CALIBRATION_RATIO, 4);
+  assert.equal(kernel.providerTokenCalibration(1_000_000, 10_000).ratio, 4);
+  assert.equal(kernel.providerTokenCalibration(0, 10_000).ratio, 1);
+
+  assert.equal(kernel.calibrateEstimatorToProvider(10_000, { ratio: 2 }), 20_000);
+  assert.equal(kernel.calibrateProviderToEstimator(20_000, { ratio: 2 }), 10_000);
+  assert.throws(() => kernel.calibrateEstimatorToProvider(10, { ratio: 0.5 }), RangeError);
+  assert.throws(() => kernel.calibrateEstimatorToProvider(10, { ratio: 5 }), RangeError);
+});
+
+test('自动压缩用触发时那次Provider锚点校准保留tail，而不是直接吃估算单位的主体目标', () => {
+  const coordinator = fs.readFileSync('backend/reliableKernel/contextCompressionCoordinator.ts', 'utf8');
+  assert.match(
+    coordinator,
+    /const calibration = decision\.source === 'provider-observed-delta'\s*\?\s*providerTokenCalibration\(decision\.estimatedTokens, requestBudget\.estimatedFullInputTokens\)/,
+    '校准比例必须来自level-trigger已经拿到的同一个Provider锚点'
+  );
+  assert.match(
+    coordinator,
+    /calibratedTailBudgetTokens\(rooms, effectiveSummaryMaxTokens \?\? 0\)/,
+    '保留tail必须按校准后的预算挑选'
+  );
+  assert.doesNotMatch(
+    coordinator,
+    /requestBudget\.effectiveBodyTargetTokens\s+-\s+irreducibleAddendaTokens/,
+    '不得再用估算单位的主体目标直接减去附加项来当tail预算'
+  );
+  assert.match(
+    coordinator,
+    /projectedProviderTokens >= decision\.estimatedTokens/,
+    'non_reducing判断必须和触发口径同一单位'
+  );
 });
 
 test('压缩请求preflight区分固定开销、完整压缩输入和fixedOverPolicy', () => {

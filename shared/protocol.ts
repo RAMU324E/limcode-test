@@ -539,8 +539,18 @@ export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
 export const DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT = 90;
 export const DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES = 20;
 export const MAX_LLM_COMPRESSION_DURATION_MINUTES = 1_440;
-/** Decimal token cap for the model-visible conversation body after text compaction. */
-export const MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS = 48_000;
+/** Default decimal token target for the model-visible conversation body after text compaction. */
+export const DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS = 48_000;
+/** Smallest retained body a Conversation may be configured down to. */
+export const MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS = 1_000;
+/**
+ * Largest share of the room below the compression threshold that the retained body may claim.
+ *
+ * Compaction has to leave the Conversation meaningfully below its own trigger level. A retained
+ * body sized at the whole remaining room lands back on the threshold as soon as the next Turn is
+ * appended, so a configured target is capped at half of it.
+ */
+export const MAX_LLM_COMPRESSION_BODY_TARGET_ROOM_SHARE = 0.5;
 /** Default and hard cap for the visible text produced by summary-based compaction. */
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS = 8_000;
 /** Default frozen output allowance when a compression Provider has no explicit maximum. */
@@ -602,6 +612,8 @@ export interface LlmCompressionConfigRecord {
   name: string;
   kind: LlmCompressionMethodKind;
   maxDurationMinutes?: number;
+  /** Token target for the conversation body text compaction retains; unset uses the default. */
+  bodyTargetTokens?: number;
   trigger: {
     mode: LlmCompressionTriggerMode;
     thresholdTokens?: number;
@@ -628,6 +640,11 @@ export function createDefaultLlmCompressionSettings(): LlmCompressionSettingsRec
   return { providerBindings: [], modelBindings: [] };
 }
 
+export function normalizeLlmCompressionBodyTargetTokens(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS;
+  return Math.max(MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS, Math.round(value));
+}
+
 export function normalizeLlmCompressionMaxDurationMinutes(value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES;
   return Math.min(MAX_LLM_COMPRESSION_DURATION_MINUTES, Math.max(1, Math.round(value)));
@@ -640,6 +657,7 @@ export function createDefaultLlmCompressionConfig(name = '默认压缩方法'): 
     name,
     kind: 'segmented_summary',
     maxDurationMinutes: DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES,
+    bodyTargetTokens: DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS,
     trigger: {
       mode: 'token_threshold',
       thresholdUnit: 'percent',
