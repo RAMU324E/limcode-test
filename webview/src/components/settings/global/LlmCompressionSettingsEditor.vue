@@ -2,6 +2,9 @@
 import { computed } from 'vue';
 import {
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES,
+  MAX_LLM_COMPRESSION_DURATION_MINUTES,
+  normalizeLlmCompressionMaxDurationMinutes,
   MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
   type LlmCompressionConfigRecord,
   type LlmCompressionMethodKind,
@@ -27,6 +30,7 @@ const emit = defineEmits<{
   (event: 'update-provider-config-id', value: string): void;
   (event: 'update-method-kind', value: SelectableCompressionMethodKind): void;
   (event: 'update-trigger', value: Partial<LlmCompressionConfigRecord['trigger']>): void;
+  (event: 'update-max-duration-minutes', value: number): void;
 }>();
 
 const providerOptions: SettingsDropdownOption[] = [
@@ -114,6 +118,7 @@ const recommendedThresholdTokens = computed(() => {
 });
 const compressionThresholdInputValue = computed(() => String(compressionThresholdTokens.value || ''));
 const compressionBodyTargetLabel = formatTokenLabel(MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS);
+const compressionMaxDurationMinutes = computed(() => normalizeLlmCompressionMaxDurationMinutes(props.config?.maxDurationMinutes));
 
 function providerLabel(provider: LlmProviderKind | undefined): string {
   return providerOptions.find((option) => option.value === provider)?.label ?? '未知渠道';
@@ -195,6 +200,12 @@ function updateCompressionThresholdFromTokens(value: number): void {
 function updateMethodKind(value: string): void {
   emit('update-method-kind', value as SelectableCompressionMethodKind);
 }
+
+function updateMaxDurationMinutes(event: Event): void {
+  const value = normalizeLlmCompressionMaxDurationMinutes(numericInputValue(event));
+  (event.target as HTMLInputElement).value = String(value);
+  emit('update-max-duration-minutes', value);
+}
 </script>
 
 <template>
@@ -273,6 +284,31 @@ function updateMethodKind(value: string): void {
             @update:model-value="updateCompressionThresholdFromTokens"
           />
         </div>
+      </div>
+      <div class="compression-trigger-panel global-settings-field-wide">
+        <div class="compression-trigger-head">
+          <div>
+            <span class="compression-trigger-title">单次压缩最长时间</span>
+            <p>每次压缩尝试的总时限，包含等待和生成。可设置 1–{{ MAX_LLM_COMPRESSION_DURATION_MINUTES }} 分钟，默认 {{ DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES }} 分钟；每次重试单独计时。连续 4 分 30 秒无有效输出仍会提前超时。</p>
+            <p>修改在新回合生效，不改变正在执行的压缩及其自动重试。</p>
+          </div>
+        </div>
+        <label class="global-settings-field">
+          <span>最长时间</span>
+          <span class="threshold-input-shell">
+            <input
+              class="token-number-input"
+              :value="compressionMaxDurationMinutes"
+              type="number"
+              :min="1"
+              :max="MAX_LLM_COMPRESSION_DURATION_MINUTES"
+              :step="1"
+              aria-label="单次压缩最长时间（分钟）"
+              @change="updateMaxDurationMinutes"
+            />
+            <span>分钟</span>
+          </span>
+        </label>
       </div>
     </div>
   </section>

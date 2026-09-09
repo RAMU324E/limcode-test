@@ -153,15 +153,23 @@ const diagnosticRows = computed(() => [
 ].filter((row) => row.value));
 const subtitle = computed(() => {
   const activityPrefix = [methodLabel.value, triggerLabel.value].filter(Boolean).join(' · ');
+  const attempt = nonNegativeInteger(props.block.retry_attempt) ?? 0;
+  const maximum = nonNegativeInteger(props.block.retry_max_attempts) ?? attempt;
+  const retryLabel = attempt > 0 ? `（第 ${attempt}/${maximum} 次重试）` : '';
   if (status.value === 'pending') return `${activityPrefix} · 正在准备上下文压缩`;
-  if (status.value === 'running') return `${activityPrefix} · 正在压缩上下文`;
+  if (status.value === 'running') {
+    const progressAt = nonNegativeInteger(props.block.last_stream_event_at);
+    const progressTime = progressAt ? new Date(progressAt) : undefined;
+    const progress = progressTime && Number.isFinite(progressTime.getTime())
+      ? `已收到模型输出 · 最近进度 ${progressTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+      : '等待模型输出';
+    return `${activityPrefix} · ${progress}${retryLabel}`;
+  }
   if (status.value === 'committing') return `${activityPrefix} · 压缩已完成，正在保存结果`;
   if (status.value === 'retrying') {
     const reason = stringValue(props.block.retry_reason_label) || '压缩连接异常';
     const seconds = nonNegativeInteger(props.block.retry_delay_seconds) ?? 0;
-    const attempt = nonNegativeInteger(props.block.retry_attempt) ?? 0;
-    const maximum = nonNegativeInteger(props.block.retry_max_attempts) ?? attempt;
-    return `${reason} · ${seconds} 秒后自动恢复${attempt > 0 ? `（第 ${attempt}/${maximum} 次）` : ''}`;
+    return `${reason} · ${seconds} 秒后自动恢复${retryLabel}`;
   }
   const facts = [methodLabel.value, triggerLabel.value];
   if (sourceCount.value !== undefined) facts.push(`${sourceCount.value} 个上下文段`);

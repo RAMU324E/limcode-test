@@ -121,3 +121,11 @@ storage.loadActiveLlmProviderConfig()
 6. 如果未来需要被 Agent/Workflow 等引用，是否计划用 Link 存 id，而不是嵌入配置对象？
 7. 是否通过 getPaths() 获取路径？
 ```
+
+## 7. 压缩时限设置
+
+- 设置入口位于渠道默认配置和 LLM 专属配置的“上下文压缩”模块末尾，复用 `LlmCompressionSettingsEditor`。
+- `LlmCompressionConfigRecord.maxDurationMinutes` 表示一次压缩尝试的总时限，单位为整数分钟，默认 `20`，范围 `1–1440`；空值或非数值使用默认值。
+- 该字段属于现有 `llmCompressionConfigs` record，通过原有全局设置更新通道、独立 record 存储及修订检查保存；渠道与模型仍复用现有绑定和写时复制规则。
+- 时限随 Turn 的 compression authority 冻结。修改在使用新配置快照的回合生效，不读取实时设置来改变在途请求或自动重试。
+- 此设置只影响压缩请求，不改变普通聊天的 20 分钟总时限，也不改变压缩连续 270 秒无真实文本或思考进度的超时保护。每次自动重试重新计时，重试预算与取消机制保持不变。
