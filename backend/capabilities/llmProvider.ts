@@ -4599,14 +4599,16 @@ function attachmentPlaceholderPart(part: InlineDataPart, reason: string): Conten
   };
 }
 
-function toUnifiedRequest(
+export function toUnifiedRequest(
   request: LlmStartRequest,
   generationConfig?: LlmGenerationConfigRecord,
   providerKind?: LlmProviderKind
 ): UnifiedLLMRequest {
   const contents = providerKind === 'gemini'
     ? mergeGeminiFunctionResponseTurns(request.contents)
-    : request.contents;
+    : providerKind === 'claude'
+      ? projectClaudeThoughtReplay(request.contents)
+      : request.contents;
   return {
     contents: contents.flatMap((content) => toUnifiedContents(content, providerKind)),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map(toUnifiedPart) } } : {}),
@@ -4617,6 +4619,43 @@ function toUnifiedRequest(
     }),
     ...(nonEmptyRecord(generationConfig) ? { generationConfig } : {})
   };
+}
+
+/**
+ * Claude 把 thinking 块的 signature 定义成必填：它用签名验证这段思考确实由 Claude 生成。
+ * 其它渠道产出的思考只带自己那一家的签名，回放时 Claude 适配器仍会写成 thinking 块，
+ * 于是整条请求被 Anthropic 以 `thinking.signature: Field required` 拒绝。这些思考对 Claude
+ * 也没有任何可用价值，所以在投影阶段就摘掉，只保留 Claude 自己签过的那些。
+ */
+function projectClaudeThoughtReplay(contents: readonly MessageContent[]): MessageContent[] {
+  let dropped = 0;
+  const projected = contents.map((content) => {
+    const next = withoutForeignClaudeThoughts(content);
+    dropped += content.parts.length - next.parts.length;
+    return next;
+  });
+  // 丢弃本身是正确行为，但它替换掉的是一个原本会炸出来的 400，所以留一条只含数量的痕迹：
+  // 万一有一天是 Claude 自己的签名在链路上被吞了，这个计数是唯一能看见的信号。
+  if (dropped > 0) {
+    try {
+      console.info('[LimCode][ClaudeThoughtReplay]', JSON.stringify({ droppedForeignThoughtParts: dropped }));
+    } catch {
+      // 可观测性永远不是 provider 权威。
+    }
+  }
+  return projected;
+}
+
+function withoutForeignClaudeThoughts(content: MessageContent): MessageContent {
+  if (content.role !== 'model') return content;
+  const parts = content.parts.filter((part) => !isForeignThoughtPart(part, 'claude'));
+  return parts.length === content.parts.length ? content : { ...content, parts };
+}
+
+function isForeignThoughtPart(part: ContentPart, provider: string): boolean {
+  if (!isTextPart(part) || part.thought !== true) return false;
+  const signature = normalizedSignatureString(part.thoughtSignature);
+  return parsePortableThoughtSignature(signature ?? '')?.provider !== provider;
 }
 
 function mergeGeminiFunctionResponseTurns(contents: readonly MessageContent[]): MessageContent[] {
