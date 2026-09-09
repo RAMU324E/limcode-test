@@ -768,6 +768,99 @@ test('Gemini dry-run merges split parallel function responses into one turn', as
   assert.equal(result.body.contents[2].parts[0].text, 'continue');
 });
 
+function claudeProviderConfig(overrides = {}) {
+  return providerConfig({
+    provider: 'claude',
+    baseUrl: 'https://api.anthropic.com/v1',
+    model: 'claude-test',
+    models: [],
+    ...overrides
+  });
+}
+
+function claudeRenderCall(callId) {
+  return { id: callId, functionCall: { name: 'live2d_view_render_model', args: { callId } } };
+}
+
+function claudeRenderResponse(callId, withImage = false) {
+  return {
+    id: callId,
+    functionResponse: {
+      name: 'live2d_view_render_model',
+      response: { ok: true, callId },
+      ...(withImage
+        ? { parts: [{ inlineData: { mimeType: 'image/png', name: `${callId}.png`, data: 'iVBORw0KGgo=' } }] }
+        : {})
+    }
+  };
+}
+
+async function dryRunClaudeMessages(id, contents) {
+  const request = chatRequest(id);
+  request.contents = contents;
+  const result = await dryRunLlmProvider(request, { settings: async () => claudeProviderConfig() });
+  return result.body.messages;
+}
+
+function claudeToolResultIds(message) {
+  return (Array.isArray(message.content) ? message.content : [])
+    .filter((block) => block.type === 'tool_result')
+    .map((block) => block.tool_use_id);
+}
+
+test('Claude dry-run 把并行工具结果与夹在中间的附件目录并入紧邻的一条 user 消息', async () => {
+  const messages = await dryRunClaudeMessages('claude-parallel-tool-results', [
+    { role: 'user', parts: [{ text: '把模型左右转到极限并各渲染一张' }] },
+    {
+      role: 'model',
+      parts: [claudeRenderCall('toolu_A'), claudeRenderCall('toolu_B'), claudeRenderCall('toolu_C')]
+    },
+    { role: 'user', parts: [claudeRenderResponse('toolu_A', true)] },
+    { role: 'user', parts: [{ text: '[附件目录] toolu_B.png' }] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_B', true)] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_C')] }
+  ]);
+
+  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'user']);
+  assert.deepEqual(messages[1].content.map((block) => block.id), ['toolu_A', 'toolu_B', 'toolu_C']);
+  assert.deepEqual(claudeToolResultIds(messages[2]), ['toolu_A', 'toolu_B', 'toolu_C']);
+  // tool_result 必须排在最前，夹在中间的附件目录文本按原顺序追加在其后。
+  assert.deepEqual(messages[2].content.slice(3), [{ type: 'text', text: '[附件目录] toolu_B.png' }]);
+  assert.deepEqual(messages[2].content[0].content[1], {
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' }
+  });
+});
+
+test('Claude dry-run 分别配对相邻两批并行工具调用', async () => {
+  const messages = await dryRunClaudeMessages('claude-consecutive-tool-batches', [
+    { role: 'user', parts: [{ text: '连续两轮渲染' }] },
+    { role: 'model', parts: [claudeRenderCall('toolu_A'), claudeRenderCall('toolu_B')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_A')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_B')] },
+    { role: 'model', parts: [claudeRenderCall('toolu_C'), claudeRenderCall('toolu_D')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_C')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_D')] }
+  ]);
+
+  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'user', 'assistant', 'user']);
+  assert.deepEqual(claudeToolResultIds(messages[2]), ['toolu_A', 'toolu_B']);
+  assert.deepEqual(claudeToolResultIds(messages[4]), ['toolu_C', 'toolu_D']);
+});
+
+test('Claude dry-run 不改动已经正确配对的工具轮次与其后的人类发言', async () => {
+  const messages = await dryRunClaudeMessages('claude-already-paired', [
+    { role: 'user', parts: [{ text: '渲染一张' }] },
+    { role: 'model', parts: [claudeRenderCall('toolu_A')] },
+    { role: 'user', parts: [claudeRenderResponse('toolu_A')] },
+    { role: 'user', parts: [{ text: '继续' }] }
+  ]);
+
+  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'user', 'user']);
+  assert.deepEqual(claudeToolResultIds(messages[2]), ['toolu_A']);
+  assert.equal(messages[3].content, '继续');
+});
+
 test('Gemini thinking capability follows model-specific official level sets', () => {
   assert.deepEqual(geminiThinkingCapabilityForModel('gemini-3.7-flash'), {
     kind: 'thinkingLevel',
