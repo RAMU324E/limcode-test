@@ -6,6 +6,7 @@ import {
   type AppearanceSettingsRecord,
   createMessageId,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
+  normalizeLlmCompressionBodyTargetTokens,
   normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
@@ -579,6 +580,7 @@ function normalizeCompressionConfigForUi(
   return {
     ...config,
     maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(config.maxDurationMinutes),
+    bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(config.bodyTargetTokens),
     trigger: normalizeCompressionTriggerForUi(config.trigger, contextWindowTokens)
   };
 }
@@ -1485,6 +1487,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
       this.selectCompressionConfigForActiveProvider(config.id);
     },
+    setActiveCompressionBodyTargetTokens(value: number): void {
+      const config = this.ensureCompressionConfigForActiveProvider();
+      if (!config) return;
+      this.updateCompressionConfig(config.id, { bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(value) });
+      this.selectCompressionConfigForActiveProvider(config.id);
+    },
     setActiveCompressionMethodKind(kind: SelectableCompressionMethodKind): void {
       const config = this.ensureCompressionConfigForActiveProvider();
       if (!config) return;
@@ -1547,6 +1555,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
       const config = this.ensureCompressionConfigForActiveModel(modelId);
       if (!config) return;
       this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
+      this.selectCompressionConfigForActiveModel(modelId, config.id);
+    },
+    setModelCompressionBodyTargetTokens(modelId: string, value: number): void {
+      const config = this.ensureCompressionConfigForActiveModel(modelId);
+      if (!config) return;
+      this.updateCompressionConfig(config.id, { bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(value) });
       this.selectCompressionConfigForActiveModel(modelId, config.id);
     },
     setModelCompressionProviderConfig(modelId: string, providerConfigId: string): void {

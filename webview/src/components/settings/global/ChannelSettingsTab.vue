@@ -282,6 +282,10 @@ function updateDefaultCompressionMaxDurationMinutes(value: number): void {
   settings.setActiveCompressionMaxDurationMinutes(value);
 }
 
+function updateDefaultCompressionBodyTargetTokens(value: number): void {
+  settings.setActiveCompressionBodyTargetTokens(value);
+}
+
 function updateModelCompressionProviderConfigId(modelId: string, providerConfigId: string): void {
   settings.setModelCompressionProviderConfig(modelId, providerConfigId);
 }
@@ -296,6 +300,10 @@ function updateModelCompressionTrigger(modelId: string, patch: Partial<LlmCompre
 
 function updateModelCompressionMaxDurationMinutes(modelId: string, value: number): void {
   settings.setModelCompressionMaxDurationMinutes(modelId, value);
+}
+
+function updateModelCompressionBodyTargetTokens(modelId: string, value: number): void {
+  settings.setModelCompressionBodyTargetTokens(modelId, value);
 }
 
 function openCreate(): void {
@@ -545,6 +553,7 @@ function cancelDelete(): void {
               @update-method-kind="updateDefaultCompressionMethodKind"
               @update-trigger="updateDefaultCompressionTrigger"
               @update-max-duration-minutes="updateDefaultCompressionMaxDurationMinutes"
+              @update-body-target-tokens="updateDefaultCompressionBodyTargetTokens"
             />
           </div>
         </article>
@@ -620,6 +629,7 @@ function cancelDelete(): void {
                   @update-method-kind="updateModelCompressionMethodKind(modelConfig.modelId, $event)"
                   @update-trigger="updateModelCompressionTrigger(modelConfig.modelId, $event)"
                   @update-max-duration-minutes="updateModelCompressionMaxDurationMinutes(modelConfig.modelId, $event)"
+                  @update-body-target-tokens="updateModelCompressionBodyTargetTokens(modelConfig.modelId, $event)"
                 />
               </div>
             </article>

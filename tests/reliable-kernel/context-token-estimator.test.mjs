@@ -353,6 +353,37 @@ test('Provider实测校准把48K主体目标换算回本地估算单位再挑选
   );
 });
 
+test('配置的主体目标生效，且被阈值以下剩余空间的一半挡住避免压缩后立刻再触发', () => {
+  const budget = kernel.calculateFullRequestPlanningBudget({
+    contextWindowTokens: 300_000,
+    maxOutputTokens: 16_000,
+    compressionThresholdTokens: 270_000,
+    breakdown: emptyBreakdown({ fixedTokens: 23_304, bodyTokens: 121_115 })
+  });
+  const calibration = kernel.providerTokenCalibration(271_656, budget.estimatedFullInputTokens);
+
+  const lowered = kernel.calculateCalibratedCompressionRooms({
+    budget,
+    calibration,
+    irreducibleAddendaTokens: 0,
+    bodyTargetTokens: 30_000
+  });
+  assert.equal(lowered.calibratedBodyTargetTokens, 30_000);
+
+  // 270,000阈值减去43,836真实固定开销后还剩226,163；配置调到120K也只能拿到其中一半。
+  const raised = kernel.calculateCalibratedCompressionRooms({
+    budget,
+    calibration,
+    irreducibleAddendaTokens: 0,
+    bodyTargetTokens: 120_000
+  });
+  assert.equal(raised.calibratedBodyTargetTokens, 113_081);
+  assert.ok(
+    raised.calibratedBodyTargetTokens + raised.calibratedFixedTokens < budget.compressionThresholdTokens,
+    '压缩后的真实体积必须明显低于触发阈值，否则下一回合会立刻再次压缩'
+  );
+});
+
 test('没有Provider锚点时校准是恒等的，且比例只收紧不放宽', () => {
   const budget = kernel.calculateFullRequestPlanningBudget({
     contextWindowTokens: 300_000,

@@ -7,7 +7,8 @@ import { createHash } from 'node:crypto';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
-  MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS,
+  DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS,
+  MAX_LLM_COMPRESSION_BODY_TARGET_ROOM_SHARE,
   type ContentPart,
   type InlineDataPart,
   type MessageContent
@@ -30,13 +31,13 @@ import {
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
 
-/** Decimal compression-planning budgets. They intentionally are not configurable in the practical first release. */
+/** Decimal compression-planning budgets. Only the body target below is Conversation-configurable. */
 export const TURN_REMINDER_MAX_TOKENS = 2_000;
 export const TOOL_RESULT_MAX_TOKENS = 4_000;
 export const TOOL_RESULT_BATCH_MAX_TOKENS = 16_000;
 export const DEFAULT_OUTPUT_RESERVE_TOKENS = DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
 export const SUMMARY_TARGET_TOKENS = DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS;
-export const MODEL_BODY_TARGET_TOKENS = MAX_LLM_COMPRESSION_BODY_TARGET_TOKENS;
+export const MODEL_BODY_TARGET_TOKENS = DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS;
 export const TEXT_PREVIEW_HEAD_RATIO = 0.6;
 
 export function isModelToolResponseMultimodalMimeType(value: string): boolean {
@@ -307,6 +308,8 @@ export interface CalibratedCompressionRoomsInput {
   calibration: ProviderTokenCalibration;
   /** Current input, runtime deliveries and the Turn reminder, in local estimator tokens. */
   irreducibleAddendaTokens: number;
+  /** Configured Provider-unit body target; the frozen default applies when a Conversation has none. */
+  bodyTargetTokens?: number;
 }
 
 /**
@@ -324,7 +327,7 @@ export interface CalibratedCompressionRooms {
   calibratedAddendaTokens: number;
   /** Provider-unit body room left by the Provider input capacity. */
   calibratedPlanningBodyRoomTokens: number;
-  /** Provider-unit body target the retained Context must land under. */
+  /** Provider-unit body target the retained Context must land under, after the room-share cap. */
   calibratedBodyTargetTokens: number;
   /** Room for the newest indivisible Context group, in local estimator tokens. */
   hardContextRoomTokens: number;
@@ -334,6 +337,9 @@ export function calculateCalibratedCompressionRooms(
   input: CalibratedCompressionRoomsInput
 ): CalibratedCompressionRooms {
   const { budget, calibration } = input;
+  const configuredBodyTargetTokens = input.bodyTargetTokens === undefined
+    ? MODEL_BODY_TARGET_TOKENS
+    : positiveTokenCount(input.bodyTargetTokens, 'bodyTargetTokens');
   const calibratedFixedTokens = calibrateEstimatorToProvider(budget.fixedTokens, calibration);
   const calibratedAddendaTokens = calibrateEstimatorToProvider(
     nonNegativeTokenCount(input.irreducibleAddendaTokens, 'irreducibleAddendaTokens'),
@@ -353,9 +359,11 @@ export function calculateCalibratedCompressionRooms(
     calibratedAddendaTokens,
     calibratedPlanningBodyRoomTokens,
     calibratedBodyTargetTokens: Math.min(
-      MODEL_BODY_TARGET_TOKENS,
+      configuredBodyTargetTokens,
       calibratedPlanningBodyRoomTokens,
-      budget.fixedOverPolicy ? calibratedPlanningBodyRoomTokens : calibratedPolicyBodyRoomTokens
+      budget.fixedOverPolicy
+        ? calibratedPlanningBodyRoomTokens
+        : Math.floor(calibratedPolicyBodyRoomTokens * MAX_LLM_COMPRESSION_BODY_TARGET_ROOM_SHARE)
     ),
     hardContextRoomTokens: calibrateProviderToEstimator(
       Math.max(0, calibratedPlanningBodyRoomTokens - calibratedAddendaTokens),

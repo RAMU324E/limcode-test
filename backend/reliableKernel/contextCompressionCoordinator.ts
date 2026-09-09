@@ -28,7 +28,6 @@ import {
   providerPromptTokens
 } from './contextTokenEstimator';
 import {
-  MODEL_BODY_TARGET_TOKENS,
   calculateCalibratedCompressionRooms,
   calculateEffectiveSummaryMaxTokens,
   calculateFullRequestPlanningBudget,
@@ -230,7 +229,10 @@ export class ReliableContextCompressionCoordinator {
     const rooms = calculateCalibratedCompressionRooms({
       budget: requestBudget,
       calibration,
-      irreducibleAddendaTokens
+      irreducibleAddendaTokens,
+      ...(policy.config.bodyTargetTokens === undefined
+        ? {}
+        : { bodyTargetTokens: policy.config.bodyTargetTokens })
     });
     const effectiveSummaryMaxTokens = policy.methodKind === 'openai_responses_compact'
       ? undefined
@@ -507,7 +509,7 @@ export class ReliableContextCompressionCoordinator {
       sourceRootId: headRootId,
       sourceSegmentCount,
       ...(policy.methodKind === 'openai_responses_compact'
-        && calibrateEstimatorToProvider(projectedTokens, calibration) > MODEL_BODY_TARGET_TOKENS
+        && calibrateEstimatorToProvider(projectedTokens, calibration) > rooms.calibratedBodyTargetTokens
         ? { diagnostics: ['native_over_target' as const] }
         : {}),
       result: committed
