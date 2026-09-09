@@ -66,7 +66,17 @@ Provide 2-8 concise options using only user-facing labels and optional descripti
       defaultAutoApproveExecution: true,
       defaultAutoSubmitResult: true,
       checkpoint: { before: false, after: false }
-    }
+    },
+    configSchema: {
+      fields: [{
+        key: 'autoApprove',
+        label: '自动回应 Ask',
+        type: 'boolean',
+        description: '收到提问后自动回复“根据现有上下文自行选择最优方案并继续”，不代选具体选项。仅在允许 LLM 自主决策时开启。',
+        defaultValue: false
+      }]
+    },
+    defaultConfig: { autoApprove: false }
   },
   execution: 'runtime',
   scheduling: staticToolScheduling('parallel', 'await_user_answer'),

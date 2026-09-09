@@ -85,6 +85,19 @@ export async function readFrozenTurnAuthority(
   };
 }
 
+export function frozenInteractionAutoApproval(
+  document: PlainJsonValue,
+  toolName: 'ask_user' | 'submit_plan'
+): boolean {
+  if (!isRecord(document) || !isRecord(document.toolPolicy)) return false;
+  const policy = document.toolPolicy;
+  if (!Array.isArray(policy.allowedTools) || !policy.allowedTools.includes(toolName) || !isRecord(policy.toolConfigs)) {
+    return false;
+  }
+  const tool = policy.toolConfigs[toolName];
+  return isRecord(tool) && isRecord(tool.config) && tool.config.autoApprove === true;
+}
+
 export function frozenModelIdentity(document: PlainJsonValue): { providerId: string; modelId: string } {
   if (!isRecord(document) || !isRecord(document.model)) {
     throw new Error('AuthoritySnapshot is missing frozen model identity.');

@@ -19,7 +19,7 @@ const { createVscodeStoragePaths } = require('../../dist/extension/backend/capab
 const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { loadRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
-const { frozenCompressionPolicy } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
+const { frozenCompressionPolicy, frozenInteractionAutoApproval } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
 const { createDefaultLlmCompressionConfig, normalizeLlmCompressionMaxDurationMinutes } = require('../../dist/extension/shared/protocol.js');
 const { resolveToolPolicyLayers } = require('../../dist/extension/shared/toolPolicyResolution.js');
 const {
@@ -597,6 +597,55 @@ test('VscodeConfigurationAuthority 让 Agent 缺省 preset 继承全局 YOLO，�
     });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Ask/Plan 自动审批通过原有工具策略落盘、继承并允许局部关闭', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-auto-approval-settings-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = {
+      ...createDefaultLlmProviderConfig({ name: 'Auto approval provider' }),
+      id: 'provider:auto-approval', model: 'model:auto-approval',
+      models: [{ id: 'model:auto-approval', name: 'Test model' }], modelConfigs: []
+    };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const compileRequest = {
+      conversationId: 'conversation:auto-approval', turnId: 'turn:auto-approval',
+      executorAgentId: 'main', intentKind: 'input'
+    };
+    const initial = JSON.parse((await authority.compile(compileRequest)).authoritySnapshot.content);
+    assert.equal(frozenInteractionAutoApproval(initial, 'ask_user'), false);
+    assert.equal(frozenInteractionAutoApproval(initial, 'submit_plan'), false);
+    await authority.mutations.setToolPolicy({
+      scopeKind: 'global', preset: 'custom', allowedTools: ['ask_user', 'submit_plan', 'write'],
+      toolConfigs: {
+        ask_user: { config: { autoApprove: true } },
+        submit_plan: { config: { autoApprove: true } },
+        write: { config: { allowOutsideProjectPaths: false }, autoApplyChange: false }
+      }
+    });
+    const reopened = new VscodeConfigurationAuthority(() => paths);
+    const inherited = JSON.parse((await reopened.compile(compileRequest)).authoritySnapshot.content);
+    assert.equal(frozenInteractionAutoApproval(inherited, 'ask_user'), true);
+    assert.equal(frozenInteractionAutoApproval(inherited, 'submit_plan'), true);
+    assert.equal(inherited.toolPolicy.toolConfigs.write.autoApplyChange, false);
+    await reopened.mutations.setToolPolicy({
+      scopeKind: 'conversation', scopeId: compileRequest.conversationId,
+      allowedTools: ['ask_user', 'submit_plan', 'write'],
+      toolConfigs: { ask_user: { config: {} }, submit_plan: { config: { autoApprove: false } } }
+    });
+    const overridden = JSON.parse((await reopened.compile(compileRequest)).authoritySnapshot.content);
+    assert.equal(frozenInteractionAutoApproval(overridden, 'ask_user'), true);
+    assert.equal(frozenInteractionAutoApproval(overridden, 'submit_plan'), false);
+    assert.equal(frozenInteractionAutoApproval(inherited, 'submit_plan'), true);
+    assert.deepEqual(overridden.toolPolicy.toolConfigs.write, inherited.toolPolicy.toolConfigs.write);
+  } finally {
+    const resolvedRoot = await fs.realpath(root);
+    assert.equal(path.dirname(resolvedRoot), await fs.realpath(os.tmpdir()));
+    await fs.rm(resolvedRoot, { recursive: true, force: true });
   }
 });
 

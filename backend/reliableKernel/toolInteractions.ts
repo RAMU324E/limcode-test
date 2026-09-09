@@ -1,3 +1,4 @@
+import { BACKGROUND_ASK_USER_AUTO_ANSWER, normalizeAskUserToolRequest, resolveAskUserAnswer } from '../../shared/askUser';
 import {
   createDelegatedPlanPrompt,
   createSubmitPlanToolOutput,
@@ -7,7 +8,7 @@ import {
 } from '../../shared/planReview';
 import type { SubmitPlanToolRequestRecord } from '../../shared/protocol';
 import { requireTaskListOperation } from '../../shared/taskListProjection';
-import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { ContentAddressedStore, type ContentObjectMetadata, type PreparedContentObject } from './contentAddressedStore';
 import {
   EffectControlPlane,
   preparedContentSteps,
@@ -17,6 +18,7 @@ import {
   type ToolTerminalResult
 } from './effectControlPlane';
 import { canonicalPlainJson as canonicalJson, normalizePlainJson } from './plainJson';
+import { frozenInteractionAutoApproval, readFrozenTurnAuthority } from './frozenAuthority';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -503,13 +505,24 @@ export class ToolInteractionControlPlane {
     response: unknown;
     cancelled?: boolean;
   }): Promise<AskUserResolutionResult> {
-    const source = normalizeSource(input.source, ['command'], 'ask-user-resolve');
+    const source = normalizeSource(input.source, ['command', 'internal'], 'ask-user-resolve');
     const requestId = requireId(input.requestId, 'requestId');
     const request = await this.requireExisting('InteractionRequest', requestId);
     if (request.request_kind !== 'ask_user') throw new Error('InteractionRequest is not ask_user.');
     const ownerRows = await this.list('InteractionOwnerLink', { request_id: requestId }, 2);
     if (ownerRows.length !== 1) throw new Error('ask_user InteractionRequest must have one owner link.');
     const turn = await this.requireExisting('Turn', requireId(ownerRows[0].turn_id, 'InteractionOwnerLink.turn_id'));
+    if (source.kind === 'internal') {
+      if (input.cancelled === true || !await this.autoApprovalAllowed(turn.id as string, 'ask_user')) {
+        throw new Error('内部 Ask 自动回复需要冻结工具策略明确授权，且不能取消问题。');
+      }
+      const automaticResponse = {
+        answer: { selectedOptionIndexes: [], customText: BACKGROUND_ASK_USER_AUTO_ANSWER }
+      };
+      if (canonicalJson(input.response) !== canonicalJson(automaticResponse)) {
+        throw new Error('内部 Ask 自动回复只能使用系统默认回答，不能代选用户答案。');
+      }
+    }
     const pauseId = stablePhaseDId('outcome_pause', stablePhaseDId('operation', `ask-user:${await this.toolCallIdForRequest(requestId)}`));
     const pause = await this.requireExisting('OutcomePause', pauseId);
     const operation = await this.requireExisting('Operation', requireId(pause.operation_id, 'OutcomePause.operation_id'));
@@ -547,6 +560,9 @@ export class ToolInteractionControlPlane {
       canonicalJson({ requestId, sourceReceiptId: receiptId, response: input.response }),
       'application/vnd.limcode.ask-user-response+json'
     );
+    const automaticResult = source.kind === 'internal'
+      ? await this.prepareAutomaticAskResult(request, toolCallId)
+      : undefined;
     const now = this.timestamp();
     const committed = await this.commitSource({
       source,
@@ -555,7 +571,7 @@ export class ToolInteractionControlPlane {
       turnId: facts.turn.id as string,
       firstResponseRequestId: requestId,
       steps: [
-        ...preparedContentSteps([response], 'ask_user_response'),
+        ...preparedContentSteps(automaticResult ? [response, automaticResult] : [response], 'ask_user_response'),
         // The first-response UNIQUE must linearize before lifecycle assertions so a concurrent
         // loser can replay the winner instead of surfacing a stale-state assertion.
         DOMAIN_REPOSITORIES.domain('InteractionResponse').insert({
@@ -572,6 +588,13 @@ export class ToolInteractionControlPlane {
         DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'waiting_answer' }),
         DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'waiting_answer' }),
         DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: 'waiting_answer' }),
+        ...(automaticResult ? [DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+          id: stablePhaseDId('tool_result_artifact', `ask-user:${toolCallId}`),
+          tool_call_id: toolCallId,
+          role: 'no_effect_result',
+          content_object_id: automaticResult.metadata.id,
+          created_at: now
+        })] : []),
         DOMAIN_REPOSITORIES.domain('InteractionRequest').update(requestId, {
           status,
           updated_at: now
@@ -629,11 +652,14 @@ export class ToolInteractionControlPlane {
     const turn = await this.requireExisting('Turn', requireId(ownerRows[0].turn_id, 'InteractionOwnerLink.turn_id'));
     if (source.kind === 'internal') {
       if (input.decision !== 'accept') {
-        throw new Error('内部 Plan 决策只允许自动批准子 Agent Plan。');
+        throw new Error('内部 Plan 决策只允许自动批准。');
       }
       const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turn.id }, 2);
-      if (childMemberships.length !== 1) {
-        throw new Error('只有属于唯一 ChildExecution 的子 Agent Turn 才能内部自动批准 Plan。');
+      if (childMemberships.length > 1) {
+        throw new Error('内部 Plan 自动批准要求唯一 ChildExecution 归属。');
+      }
+      if (childMemberships.length === 0 && !await this.autoApprovalAllowed(turn.id as string, 'submit_plan')) {
+        throw new Error('内部 Plan 自动批准需要父任务授权或冻结工具策略明确开启。');
       }
     }
     const subject = await this.readPlanReviewSubject(requestId);
@@ -659,6 +685,9 @@ export class ToolInteractionControlPlane {
     const executionTarget = responseRecord?.executionTarget === 'new_conversation'
       ? 'new_conversation' as const
       : 'current_conversation' as const;
+    if (source.kind === 'internal' && executionTarget !== 'current_conversation') {
+      throw new Error('内部 Plan 自动批准只能在当前会话执行，不能委派新 Agent。');
+    }
     const requestedAgentId = decisionStatus === 'approved' && executionTarget === 'new_conversation'
       ? requireId(responseRecord?.agentType, 'Plan delegation agentType')
       : undefined;
@@ -1223,6 +1252,36 @@ export class ToolInteractionControlPlane {
       deduplicated,
       ...(terminal ? { terminal: { ...terminal, receiptId: receipt.id as string } } : {})
     };
+  }
+
+  private async prepareAutomaticAskResult(request: DomainRow, toolCallId: string): Promise<PreparedContentObject> {
+    const metadata = await this.requireExisting(
+      'ContentObject',
+      requireId(request.prompt_object_id, 'InteractionRequest.prompt_object_id')
+    ) as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+    if (body.toolCallId !== toolCallId) throw new Error('Ask 自动回复与请求的 ToolCall 不一致。');
+    const output = resolveAskUserAnswer(normalizeAskUserToolRequest(body.prompt), {
+      selectedOptionIndexes: [],
+      customText: BACKGROUND_ASK_USER_AUTO_ANSWER
+    });
+    return this.contentStore.prepare(
+      this.database,
+      canonicalJson({ toolCallId, status: 'succeeded', detail: output }),
+      'application/vnd.limcode.tool-result-artifact+json'
+    );
+  }
+
+  private async autoApprovalAllowed(turnId: string, toolName: 'ask_user' | 'submit_plan'): Promise<boolean> {
+    const snapshots = await this.list('AuthoritySnapshot', { turn_id: turnId }, 2);
+    if (snapshots.length !== 1) throw new Error('内部自动审批需要唯一的冻结 AuthoritySnapshot。');
+    const frozen = await readFrozenTurnAuthority(
+      this.database,
+      this.contentStore,
+      requireId(snapshots[0].id, 'AuthoritySnapshot.id'),
+      turnId
+    );
+    return frozenInteractionAutoApproval(frozen.document, toolName);
   }
 
   private async requireActiveToolFacts(toolCallId: string): Promise<{

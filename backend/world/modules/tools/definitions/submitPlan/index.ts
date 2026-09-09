@@ -65,7 +65,17 @@ Approval can execute in the current conversation or delegate the approved Plan t
       defaultAutoApproveExecution: true,
       defaultAutoSubmitResult: true,
       checkpoint: { before: false, after: false }
-    }
+    },
+    configSchema: {
+      fields: [{
+        key: 'autoApprove',
+        label: '自动批准 Plan',
+        type: 'boolean',
+        description: '自动同意 LLM 提交的计划，在当前会话继续执行，不另建子 Agent。子 Agent 已有的计划自动批准行为保持不变。',
+        defaultValue: false
+      }]
+    },
+    defaultConfig: { autoApprove: false }
   },
   execution: 'runtime',
   scheduling: staticToolScheduling('serial', 'await_plan_review'),

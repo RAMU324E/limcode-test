@@ -15,6 +15,12 @@ const { ReliableConversationRunner } = await import(pathToFileURL(
 const { submitPlanTool } = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/world/modules/tools/definitions/submitPlan/index.js')
 ).href);
+const { askUserTool } = await import(pathToFileURL(
+  path.join(root, 'dist/extension/backend/world/modules/tools/definitions/askUser/index.js')
+).href);
+const { taskListTool } = await import(pathToFileURL(
+  path.join(root, 'dist/extension/backend/world/modules/tools/definitions/taskList/index.js')
+).href);
 
 const PLAN_ARGS = {
   plan: '1. 检查停止路径。\n2. 验证终结事实。',
@@ -96,29 +102,64 @@ test('中断 ACK 后 cancelWaiting 连续失败会由 level-triggered recovery �
   }
 });
 
+test('开启无人值守审批后 Plan、Ask 和后续生成连续完成，不等待人工命令', async () => {
+  const harness = await createHarness({ autoApproveInteractions: true });
+  try {
+    const started = await harness.runner.input({
+      commandId: 'auto-approval-input', conversationId: harness.conversationId, text: '按计划自主继续。'
+    });
+    await eventually(async () => (await rows(harness.app, 'TurnTermination', { turn_id: started.turnId })).length === 1, 10_000, 'Auto-approved Turn did not finish');
+    const [termination] = await rows(harness.app, 'TurnTermination', { turn_id: started.turnId });
+    assert.equal(termination.terminal_status, 'completed', JSON.stringify({ termination, errors: harness.errors, providerCalls: harness.providerCalls }));
+    assert.equal(harness.providerCalls, 4);
+    const requests = await rows(harness.app, 'InteractionRequest');
+    assert.deepEqual(requests.map((request) => [request.request_kind, request.status]).sort(), [
+      ['ask_user', 'succeeded'], ['plan_review', 'succeeded']
+    ]);
+    assert.equal((await rows(harness.app, 'InteractionResponse')).length, 2);
+    assert.equal((await rows(harness.app, 'ToolOutcome')).length, 3);
+    assert.deepEqual(harness.errors, []);
+  } finally {
+    await harness.close();
+  }
+});
+
 async function createHarness(options = {}) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-plan-interrupt-'));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
   let providerCalls = 0;
+  const replies = [modelContent([{ id: 'provider-plan-call', name: 'submit_plan', arguments: PLAN_ARGS }])];
+  if (options.autoApproveInteractions) {
+    replies.push(modelContent([{
+      id: 'provider-ask-call', name: 'ask_user',
+      arguments: { question: '如何继续？', options: [{ label: '最小修改' }, { label: '重构' }] }
+    }]));
+    replies.push(modelContent([{
+      id: 'provider-task-complete-call', name: 'update_task_list',
+      arguments: { mode: 'update', items: PLAN_ARGS.taskList.items.map((item) => ({ title: item.title, status: 'completed' })) }
+    }]));
+    replies.push({ role: 'model', parts: [{ text: '已按自动回复继续并完成。' }] });
+  }
   const provider = {
     providerId: 'provider-plan-interrupt',
     async sendFullRequest(_request, controls) {
       providerCalls += 1;
-      if (providerCalls !== 1) throw new Error(`Unexpected Provider call ${providerCalls}.`);
+      const content = replies[providerCalls - 1];
+      if (!content) throw new Error(`Unexpected Provider call ${providerCalls}.`);
       await controls.onEvent({
         kind: 'completed',
         streamSeq: '1',
-        content: modelContent([{ id: 'provider-plan-call', name: 'submit_plan', arguments: PLAN_ARGS }])
+        content
       });
     }
   };
   const host = {
-    definitions() { return [submitPlanTool]; },
+    definitions() { return options.autoApproveInteractions ? [submitPlanTool, askUserTool, taskListTool] : [submitPlanTool]; },
     async cancelTurnWaits() {},
     async dispose() {}
   };
-  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(provider, host));
+  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(provider, host, options));
   options.patchCancelWaiting?.(app.toolDispatcher);
   const errors = [];
   const runner = new ReliableConversationRunner(
@@ -152,6 +193,7 @@ async function createHarness(options = {}) {
     runner,
     errors,
     conversationId,
+    get providerCalls() { return providerCalls; },
     async startPlan() {
       const started = await runner.input({
         commandId: `input-${path.basename(parent)}`,
@@ -172,7 +214,7 @@ async function createHarness(options = {}) {
   };
 }
 
-function dependencies(provider, host) {
+function dependencies(provider, host, options) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -201,11 +243,15 @@ function dependencies(provider, host) {
               },
               toolPolicy: {
                 id: 'plan-interrupt-tools',
-                allowedTools: ['submit_plan'],
+                allowedTools: options.autoApproveInteractions ? ['submit_plan', 'ask_user', 'update_task_list'] : ['submit_plan'],
                 preset: 'custom',
-                toolConfigs: {},
+                toolConfigs: options.autoApproveInteractions ? {
+                  ask_user: { config: { autoApprove: true } },
+                  submit_plan: { config: { autoApprove: true } }
+                } : {},
                 sourceConfigs: {}
               },
+              planReviewPolicy: { mode: 'optional' },
               systemPrompt: { id: 'plan-interrupt-prompt', text: '' },
               runtimeContext: { id: null, name: '', template: '' },
               workEnvironmentPolicy: {

@@ -64,6 +64,7 @@ docs/architecture/*
 !/tests/reliable-kernel/reliable-control-lifecycle.test.mjs
 !/tests/reliable-kernel/plan-interrupt-recovery.test.mjs
 !/tests/reliable-kernel/waiting-interaction-cancellation.test.mjs
+!/tests/reliable-kernel/interaction-auto-approval.test.mjs
 !/tests/reliable-kernel/reliable-queue-ordering.test.mjs
 !/tests/reliable-kernel/webview-feed-lifecycle.test.mjs
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs

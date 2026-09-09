@@ -51,6 +51,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/vscode-fs-local-read.test.cjs',
   'tests/reliable-kernel/webview-feed-lifecycle.test.mjs',
   'tests/reliable-kernel/waiting-interaction-cancellation.test.mjs',
+  'tests/reliable-kernel/interaction-auto-approval.test.mjs',
   'tests/reliable-kernel/platform-runtime-compatibility.test.mjs',
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
   'tests/runAgentToolSchema.test.cjs',
