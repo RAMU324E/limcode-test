@@ -14,6 +14,7 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import type { ContextModelSource } from './databaseWorkerProtocol';
 import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
 
 export type ContextSegmentKind = 'system' | 'message' | 'tool_pair' | 'compression' | 'runtime_context';
@@ -108,6 +109,7 @@ export interface MaterializedContextSegment {
   segmentId: string;
   segmentKind: ContextSegmentKind;
   messageRole: string | null;
+  modelSource?: ContextModelSource;
   contentObject: ContentObjectMetadata;
   content: Buffer;
 }
@@ -715,6 +717,7 @@ export class ContextSequenceControlPlane {
         segmentId: requireId(record.segment.id, 'ContextSegment.id'),
         segmentKind: requireSegmentKind(record.segment.segment_kind),
         messageRole: nullableText(record.messageRole, 'Context message role'),
+        ...(record.modelSource ? { modelSource: record.modelSource } : {}),
         contentObject: asContentObjectMetadata(record.contentObject),
         content: bufferView(record.content)
       })),

@@ -934,6 +934,47 @@ test('SSE 服务繁忙按冻结的四次重试预算恢复或终止', async (con
   }
 });
 
+test('incomplete chunked read 遵守冻结重试次数和关闭自动重试设置', async (testContext) => {
+  const message = 'Streaming error: peer closed connection without sending complete message body (incomplete chunked read)';
+  for (const scenario of [
+    { name: 'recover', enabled: true, recover: true, attempts: 5 },
+    { name: 'exhausted', enabled: true, recover: false, attempts: 5 },
+    { name: 'disabled', enabled: false, recover: false, attempts: 1 }
+  ]) {
+    await testContext.test(scenario.name, async () => {
+      await withApp('chunked-read-' + scenario.name, async (app, conversationId, turnId) => {
+        const bodies = [];
+        const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((request, emit) => {
+          bodies.push(JSON.stringify(request.contents));
+          if (scenario.recover && bodies.length === scenario.attempts) {
+            emit({ type: 'llm:done', payload: { requestId: request.id, content: modelContent('recovered') } });
+          } else {
+            emit({ type: 'llm:thoughtDelta', payload: { requestId: request.id, text: 'discarded partial thought' } });
+            emit({ type: 'llm:error', payload: { requestId: request.id, message } });
+          }
+        }));
+        const created = await createRequest(app, conversationId, turnId, 'chunked-read-budget');
+        const terminals = [];
+        const dispatch = controlPlane(app, {
+          semanticTimeouts: { firstSemanticMs: 10_000, semanticIdleMs: 10_000 }
+        }).dispatch(created.modelRequestId, adapter, { onTransientTerminal: (event) => terminals.push(event) });
+        if (scenario.recover) {
+          assert.equal((await dispatch).terminalState, 'completed');
+          assert.deepEqual((await app.modelProvider.completedEvent(created.modelRequestId)).content, modelContent('recovered'));
+        } else {
+          await assert.rejects(dispatch, /incomplete chunked read/);
+          assert.equal((await get(app, 'ModelRequest', created.modelRequestId)).terminal_state, 'provider_transient_connection_interrupted');
+        }
+        assert.equal(bodies.length, scenario.attempts);
+        assert.ok(bodies.every((body) => body === bodies[0]));
+        assert.equal(terminals.filter((terminal) => terminal.event.content.retrying === true).length, scenario.attempts - 1);
+        const operation = (await list(app, 'Operation', { owner_kind: 'model_request', owner_id: created.modelRequestId }))[0];
+        assert.equal((await list(app, 'Attempt', { operation_id: operation.id })).length, scenario.attempts);
+      }, 'openai-responses', { enabled: scenario.enabled, maxRetries: scenario.enabled ? 4 : 0 });
+    });
+  }
+});
+
 test('普通 transient error 在已有语义输出后仍不盲目重放', async () => {
   await withApp('provider-generic-no-replay-after-output', async (app, conversationId, turnId) => {
     const request = await createRequest(app, conversationId, turnId, 'generic-no-replay-after-output');

@@ -45,6 +45,7 @@ import { RuntimeDatabase } from './runtimeDatabase';
 import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
   MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT,
+  type ContextModelSource,
   type ModelRequestCancelResult
 } from './databaseWorkerProtocol';
 import {
@@ -86,6 +87,7 @@ export interface FullProviderContextItem {
   segmentId: string;
   segmentKind: string;
   messageRole: string | null;
+  modelSource?: ContextModelSource;
   contentType: string;
   content: string;
 }
@@ -594,6 +596,7 @@ export class ModelProviderControlPlane {
       segmentId: segment.segmentId,
       segmentKind: segment.segmentKind,
       messageRole: segment.messageRole,
+      ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
@@ -657,6 +660,7 @@ export class ModelProviderControlPlane {
       segmentId: segment.segmentId,
       segmentKind: segment.segmentKind,
       messageRole: segment.messageRole,
+      ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));

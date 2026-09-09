@@ -22,12 +22,18 @@ export interface ExecutionLeaseFencePayload {
   generation: bigint;
 }
 
+export interface ContextModelSource {
+  providerId: string;
+  modelId: string;
+}
+
 export interface ContextMaterializationRecord {
   node: DomainRow;
   segment: DomainRow;
   contentObject: DomainRow;
   /** Immutable MessageRevision role resolved through ContextSegmentSource; NULL for non-message segments. */
   messageRole: string | null;
+  modelSource?: ContextModelSource;
 }
 
 export interface ContextMaterializationSnapshot {
