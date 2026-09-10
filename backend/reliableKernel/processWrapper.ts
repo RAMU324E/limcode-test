@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { syncDirectoryDurablySync } from '../capabilities/filesystem/durableDirectorySync';
+import { resolveWindowsPowerShell } from '../capabilities/windowsPowerShell';
 import * as path from 'node:path';
 import {
   MAX_PROCESS_EXECUTION_TIMEOUT_MS,
@@ -718,8 +719,9 @@ function spawnWindowsPowerShellCommand(
     `$limcodeCommandText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${commandTextBase64}'))`,
     `$limcodeTokens = $null; $limcodeParseErrors = $null`,
     `$limcodeCommandAst = [System.Management.Automation.Language.Parser]::ParseInput($limcodeCommandText, [ref]$limcodeTokens, [ref]$limcodeParseErrors)`,
-    // Windows PowerShell 5.1 resets $? to true for a parenthesized expression. Detect only
-    // that exact syntax shape; a recursive lexical "last command" would misclassify unexecuted branches.
+    // The 5.1 fallback resets $? to true for a parenthesized expression; PowerShell 7 does not, and the
+    // same detection is inert there. Detect only that exact syntax shape; a recursive lexical
+    // "last command" would misclassify unexecuted branches.
     `$limcodeLastStatement = @($limcodeCommandAst.EndBlock.Statements)[-1]`,
     `$limcodeLastPipelineElement = if ($limcodeLastStatement -is [System.Management.Automation.Language.PipelineAst] -and $limcodeLastStatement.PipelineElements.Count -eq 1) { $limcodeLastStatement.PipelineElements[0] } else { $null }`,
     `$limcodeParenExpression = if ($limcodeLastPipelineElement -is [System.Management.Automation.Language.CommandExpressionAst] -and $limcodeLastPipelineElement.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) { $limcodeLastPipelineElement.Expression } else { $null }`,
@@ -737,7 +739,7 @@ function spawnWindowsPowerShellCommand(
     `exit 0`
   ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
-  return spawn('powershell.exe', [
+  return spawn(resolveWindowsPowerShell().executable, [
     '-NoLogo',
     '-NoProfile',
     '-NonInteractive',

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +18,7 @@ const durableDirectorySync = require(path.join(
   distRoot,
   'backend/capabilities/filesystem/durableDirectorySync.js'
 ));
+const windowsPowerShell = require(path.join(distRoot, 'backend/capabilities/windowsPowerShell.js'));
 const {
   VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY,
   VscodeReliableKernelCutoverCoordinator
@@ -1243,6 +1245,62 @@ test('macOS Bash Wrapper超时会终止进程组并发布终态收据', darwinOn
     assert.equal(result.receipt.terminationReason, 'timed_out');
     assert.equal(result.receipt.stopRequested, false);
     assert.ok(Date.now() - startedAt < 8_000, 'timeout termination exceeded its bounded grace period');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows命令壳解析结果自洽：PowerShell 7给出绝对路径，缺失时回退5.1', () => {
+  const runtime = windowsPowerShell.resolveWindowsPowerShell();
+  assert.equal(runtime, windowsPowerShell.resolveWindowsPowerShell());
+  if (process.platform !== 'win32') {
+    assert.deepEqual(runtime, { executable: 'powershell.exe', edition: 'desktop' });
+    return;
+  }
+  if (runtime.edition === 'desktop') {
+    assert.equal(runtime.executable, 'powershell.exe');
+    return;
+  }
+  assert.equal(runtime.edition, 'core');
+  assert.ok(path.isAbsolute(runtime.executable), runtime.executable);
+  assert.equal(path.basename(runtime.executable).toLowerCase(), 'pwsh.exe');
+  assert.ok(existsSync(runtime.executable), runtime.executable);
+});
+
+test('命令语法说明随实际解析到的PowerShell版本切换链式操作符', () => {
+  const core = windowsPowerShell.powerShellCommandSyntaxGuidance('core');
+  const desktop = windowsPowerShell.powerShellCommandSyntaxGuidance('desktop');
+  assert.match(core, /&&/);
+  assert.doesNotMatch(desktop, /&&/);
+  assert.match(desktop, /5\.1/);
+});
+
+test('Windows包装器实际拉起解析到的PowerShell版本', windowsOnly, async () => {
+  const runtime = windowsPowerShell.resolveWindowsPowerShell();
+  const result = await runPlatformWrapper({
+    command: '[Console]::Out.Write($PSVersionTable.PSEdition)',
+    timeoutMs: 15_000,
+    suffix: 'edition'
+  });
+  try {
+    assert.equal(result.run.status, 0, result.run.stderr);
+    assert.equal(result.output.trim(), runtime.edition === 'core' ? 'Core' : 'Desktop');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell 7下管道链式操作符可直接透传给包装器', { skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core' }, async () => {
+  const result = await runPlatformWrapper({
+    command: "Write-Output 'chain-a' && Write-Output 'chain-b'",
+    timeoutMs: 15_000,
+    suffix: 'chain'
+  });
+  try {
+    assert.equal(result.run.status, 0, result.run.stderr);
+    assert.equal(result.receipt.exitCode, '0');
+    assert.match(result.output, /chain-a/);
+    assert.match(result.output, /chain-b/);
   } finally {
     await fs.rm(result.parent, { recursive: true, force: true });
   }
