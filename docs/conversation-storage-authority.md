@@ -1,6 +1,6 @@
 # Conversation 可靠存储权威模型（Epoch 6）
 
-> 状态：本文描述当前文件后端实现，只用于理解现状和迁移来源，不是可靠运行内核目标合同。目标定义以[`docs/architecture/reliable-kernel/contracts/`](./architecture/reliable-kernel/contracts/README.md)为准；对应能力切换后，本文转为历史记录。
+> 状态：历史文档，描述已退役的文件后端和迁移来源，不是当前生产存储规范。生产已使用 SQLite/CAS；当前入口见[可靠运行内核架构](./architecture/reliable-kernel/README.md)，约束以其 [`contracts/`](./architecture/reliable-kernel/contracts/README.md) 为准。下文的 HEAD、文件 mutation 和旧 epoch 仅用于历史解释。
 
 ## 1. 目标
 

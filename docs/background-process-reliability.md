@@ -1,6 +1,6 @@
 # 后台进程退出的可靠投递语义
 
-> 状态：本文描述当前文件后端实现，只用于理解现有后台进程语义和迁移来源，不是可靠运行内核目标合同。目标定义以[`docs/architecture/reliable-kernel/contracts/`](./architecture/reliable-kernel/contracts/README.md)为准；Runtime/Tool/File能力切换后，本文转为历史记录。
+> 状态：历史文档，描述已退役的后台进程文件实现和迁移来源。当前生产由可靠内核 Process/Effect/RuntimeDelivery 与 detached wrapper 处理退出观察和投递；入口见[可靠运行内核架构](./architecture/reliable-kernel/README.md)，定义以其 [`contracts/`](./architecture/reliable-kernel/contracts/README.md) 为准。下文旧记录和 outbox 不是当前写入入口。
 
 ## 1. 领域边界
 

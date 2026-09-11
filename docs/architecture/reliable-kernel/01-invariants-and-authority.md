@@ -9,13 +9,13 @@
 运行权威：limcode.sqlite
 大内容权威：CAS
 外部世界：Workspace / Provider / detached Process wrapper / MCP / Subagent runtime
-ECS：已提交运行事实的只读投影
+领域定义：复用 ECS/world 的独立对象与 Link；生产运行投影由 Client Feed 直接读取已提交事实
 Webview：有界客户端读模型
 ```
 
 任何层都不能冒充另一层：
 
-- ECS 状态不能反向覆盖 SQLite；
+- ECS/world 定义不提供第二套运行 writer；任何进程内投影都不能反向覆盖 SQLite；
 - Webview 展示字段不能决定运行终态；
 - CAS 内容不能暗中携带领域关系；
 - Provider transport 优化不能成为模型上下文权威；
@@ -52,6 +52,8 @@ Runtime domain exact set 只在 [`authority.json#runtimeDomains`](./contracts/au
 归属记录位于 Runtime 控制目录，包含数据集/根身份、conversationId、hostBootId、ownerToken 和进程启动指纹，不进入 Conversation 配置，不保存第二套 Turn 状态。原子目录发布负责抢占唯一性；释放核对 token；死宿主接管使用旧 token 的确定性隔离目录。只有进程退出或 PID 启动指纹不匹配可证明失效，租约过期、心跳延迟和未知状态均不能抢占活宿主。
 
 同宿主主聊天页按对话共享正在打开的 Promise，重复打开聚焦已有面板。计划和工具详情等附属视图保留同一对话归属。关闭最后一个视图，仅在没有在途命令、执行、队列、回执收尾或待投递工作时释放；仍有后台工作则保留至收尾。外部 EffectReceipt / ProcessReceipt 按既有幂等规则落盘，后续继续执行和通知由目标对话宿主处理。
+
+打开或恢复面板必须在初始化失败时释放尚未交给面板的归属引用；如果 Feed 已连接但页面初始化失败，同时断开该连接。认领等待期间关闭的面板也不能遗留引用。失败面板没有后台工作时，其他宿主可以立即重新认领该对话。
 
 配置根 admission 覆盖 placement 选择到宿主注册，锁顺序固定为配置根 admission → Runtime scope maintenance。旧文件 physical cutover 会过滤共享的 conversation settings / scope links，因此必须在此 admission 内核验所有 Runtime scopes 离线；不能只枚举当前目录后放任新 scope 注册。普通运行、模型等待和工具执行不持有 admission。
 

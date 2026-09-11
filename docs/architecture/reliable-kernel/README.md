@@ -1,22 +1,22 @@
-# 可靠运行内核总计划
+# 可靠运行内核架构
 
 > 合同修订：`2026-07-31-r4`
-> 当前状态：计划已收口，尚未开始 Phase B SQLite 生产实现或切换
-> 使用范围：作者本人、当前 Linux x64 电脑、本地 VS Code Extension Host、手工安装 VSIX
-> 计划结构：一份背景、七个实施阶段、三个正式出口
+> 当前状态：生产入口已切换到 ReliableKernelApplication、SQLite 与 CAS；下文说明现状和持续有效的边界。
+> 支持范围：Windows x64、Linux x64、macOS x64 / arm64 的本地 VS Code Extension Host。
+> 文档结构：本页描述现状，`contracts/` 定义机器合同，`phases/` 保留实施阶段依据；阶段编号不表示当前待办状态。
 
-## 1. 一句话目标
+## 1. 当前职责
 
-保留 LimCode2 已验证的 Agent 运行语义，用一个 SQLite 热控制面和一个 CAS 内容目录替换自制文件数据库，并集中解决：
+可靠内核以 SQLite 热控制面和 CAS 内容目录承载 Agent 运行语义。它替代旧文件 Runtime，集中处理原实现中的以下问题：
 
 1. 工具提案、外部执行与模型终态混在一起；
 2. 长对话重复复制完整历史，导致近似 O(n²) 的存储、同步和深拷贝；
 3. 子代理执行、答案提交、投递、父 Turn 处理与终止控制缺少同一组权威事实；
 4. Client changes、后台进程观察和硬切归档没有可执行的容量与恢复边界。
 
-完整来龙去脉见[项目背景](./BACKGROUND.md)。机器定义以 [`contracts/`](./contracts/README.md) 为唯一权威，人读文档只解释边界与实施顺序。
+历史背景见[项目背景](./BACKGROUND.md)。机器定义以 [`contracts/`](./contracts/README.md) 为唯一权威，人读文档解释当前入口、数据权威与验证边界。
 
-## 2. 最终结构
+## 2. 当前结构
 
 ```text
 一个 limcode.sqlite 热控制面
@@ -36,15 +36,35 @@
 - SQLite 保存小而关键、需要事务约束的运行事实；
 - CAS 保存工具原始结果、文件目标内容、上下文段、答案正文、进程输出 chunk 和回执详情；
 - Agent、Conversation、Message、Turn、Tool、Process、Answer 与关系继续独立建模；
-- ECS 只接收已提交事实形成只读投影，不再拥有运行生命周期；
+- 运行生命周期由可靠内核控制面负责；`backend/world` 仍复用部分领域定义与工具声明，但旧 ECS World/System 循环不是生产入口，也不是 Client Feed 的中间写入者；
 - Webview 只接收有界快照和有界 changes，历史大内容按需读取；
 - Agent、Workflow、Policy、Prompt、ModelProfile、WorkEnvironment、RuntimeContext 与 Settings 继续位于独立配置文件根，不进入 Runtime SQLite。
 
-### 2.1 对话级宿主归属
+### 2.1 生产入口与依赖方向
+
+```text
+vscode/extension.ts
+→ VscodeReliableKernelApplicationFacade.open
+→ VscodeReliableKernelCutoverCoordinator.ensureCurrentRoot
+→ VscodeReliableKernelProductRuntime.open
+→ ReliableKernelApplication
+```
 
 | 边界 | 当前代码入口 | 职责 |
 | --- | --- | --- |
+| 宿主命令 | `backend/application/reliableKernel/VscodeReliableKernelCommandRouter.ts` | 校验 bridge payload、区分全局与对话作用域、调用控制面 |
+| 产品装配 | `backend/application/reliableKernel/VscodeReliableKernelProductRuntime.ts` | 注入配置 authority、provider、工具宿主与会话执行器 |
 | 宿主归属 | `backend/reliableKernel/ConversationRuntimeOwnerManager.ts`、`runtimeHostControl.ts` | 对话独占、视图/后台生命周期、维护与宿主注册互斥；不替代 ExecutionLease |
+| Runtime 装配 | `backend/reliableKernel/runtimeApplication.ts` | 共享同一 RootBinding、RuntimeDatabase 与 CAS，组合控制面 |
+| Turn 队列控制 | `backend/reliableKernel/turnControlPlane.ts`、`turnGuidanceQueue.ts`、`turnCommandWire.ts` | Turn 主控制面、guidance 修订/暂停/取消/重排、共享命令身份与事务约束 |
+| 运行写入 | `backend/reliableKernel/runtimeDatabase.ts`、`databaseWorker.ts` | SQLite 事务、独立领域 mutation、提交后的 typed changes |
+| 客户端查询 | `backend/reliableKernel/clientProjection.ts`、`runtimeSqlRows.ts` | 只读记录投影、原子快照与历史页；通过受限接口读取 worker 已核验的 CAS 内容 |
+| 前端运行投影 | `backend/reliableKernel/clientFeed.ts`、`webviewFeedBridge.ts` | 有界 snapshot / changes、序列与会话隔离、历史按需读取 |
+| 配置权威 | `backend/reliableKernel/vscodeConfigurationAuthority.ts` | 读取独立配置 roots，冻结执行配置，不把配置迁入 Runtime SQLite |
+| 外部执行 | `backend/capabilities/`、`VscodeReliableToolHost` | 执行 LLM、MCP、文件、传输与进程能力，不接管领域生命周期 |
+| LLM 适配分工 | `backend/capabilities/llmProvider.ts`、`llmStreamEventProjection.ts`、`geminiProviderAdaptation.ts`、`unifiedMessageConversion.ts`、`llmRequestContentPreparation.ts` | capability 生命周期、流事件投影、Gemini 适配、消息转换与多模态内容准备；关键模块均纳入现有构建/调试指纹 |
+
+运行事实提交后直接进入 Client Feed；不要向退役的 `productionWorld`、旧文件 writer 或旧 clientSync 路径追加生产行为。全局配置可以广播，对话设置只能同步到同一对话；前端当前作用域不能由收到的快照重新指定。
 
 同一工作区的多个宿主可以同时运行不同对话；同一对话只能由一个宿主驱动。主聊天页重复打开聚焦已有页，其他窗口只对被占用对话提示冲突。关闭空闲对话立即释放归属；执行中对话在后台收尾后释放。创建、升级、归档和重置仍要求维护互斥，并先核验其他宿主已退出；不能只关闭本窗口后移动共享目录。配置入口继续拒绝运行期间切换数据根，本次不新增迁移或切换命令。
 
@@ -176,11 +196,18 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 - 旧 Runtime 归档，配置按 manifest preserve/filter，Workspace 与未知用户文件不触碰；
 - 激活后只修复新内核，不自动回退旧 writer。
 
-已经实际落盘的 SQLite epoch 3 数据通过唯一的有界例外保留：数据库打开前执行精确 `epoch 3 → 4` 离线升级。升级器只承认从已发布 VSIX 提取出的两个完整 manifest 指纹：0.0.10–0.0.11 的 `ModelContextProjection.client_mapping=detail` 与 0.0.12–0.0.14 的 `summary`；二者物理 DDL 及其余 86 个领域完全相同，任何第三种组合仍 fail closed。升级器要求 table/index/trigger/manifest/RootBinding 全量 DDL 指纹吻合，先用 SQLite Backup API 持久备份，再以 pending pointer、单事务和 journal 向前恢复；Windows 上 RootBinding 仍保存 canonical path，只有 `better-sqlite3` 原生 I/O 边界使用 namespaced path，避免备份临时库跨过 `MAX_PATH`。升级新增 ConversationAttachmentHandleLink、AttachmentObservationLink、CompressionBlockObservationLink 和 RuntimeDeliveryIntentLink 四张关系表，不改写既有对话、消息、附件或 CAS 对象。旧 Child Runtime continuation 只有在稳定 id、CommandReceipt、RuntimeDelivery 与旧 CAS envelope 全部吻合时，才在该离线事务中发布当前 envelope、重指向其 intent/preset revision 并补独立 Link；不保留运行时 fallback。已处于 epoch 4、仅缺最后一张 Link 表的数据库执行同一精确转换后原地增表保留历史。
+已经落盘的 SQLite 数据只保留两种精确、有界的升级入口：
+
+1. **epoch 3 → 4**：数据库打开前核对 table/index/trigger/manifest/RootBinding 完整指纹。仅承认已发布的 0.0.10–0.0.11 `ModelContextProjection.client_mapping=detail` 与 0.0.12–0.0.14 `summary` 两套完整前驱；其他领域与物理 DDL 必须一致。使用 SQLite Backup API 持久备份，再通过 pending pointer、单事务与 durable journal 向前恢复。新增 ConversationAttachmentHandleLink、AttachmentObservationLink、CompressionBlockObservationLink、RuntimeDeliveryIntentLink 四张关系表。
+2. **epoch 4 精确单表增量**：仅允许其他表、索引、trigger、manifest 元数据和 RootBinding 均符合当前定义、只缺 RuntimeDeliveryIntentLink 的前驱。在单事务中补表；不得修复其他领域的 `client_mapping`、digest 或任意未知漂移。
+
+两条路径都只有在旧 Child Runtime continuation 的稳定 id、CommandReceipt、RuntimeDelivery 与 CAS envelope 全部吻合时，才转换为当前 envelope 并补独立 Link；不保留运行时 fallback，不改写既有对话正文。Windows 只在 SQLite 原生 I/O 边界使用 namespaced path，持久 RootBinding 仍保存 canonical path。未知漂移拒绝打开，不根据当前 schema 临时推导新的“历史格式”。
 
 真实 cutover actor 是最终 VSIX 的 `cutover-only coordinator`：旧宿主先关闭 admission、drain 并持久化 request，然后退出；最终 VSIX 安装并重启后先完成 journaled archive、配置过滤和校验，再创建 SQLite/CAS/epoch 并原子激活 RootBinding。归档失败时 active pointer 不变且可按 journal 恢复。
 
-## 8. 七个阶段与三个出口
+## 8. 实施阶段与验证出口
+
+以下是实施阶段和 gate 的分类，不是当前实现进度清单：
 
 ```text
 A 合同、边界与物理清单
@@ -200,7 +227,7 @@ Gate 的机器身份是稳定 `check.id`，handler 使用 `Map<checkId, handler>
 
 ## 9. 明确不做
 
-- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；精确 `epoch 3 → 4` 离线升级和 epoch 4 内单表增量是有界例外；
+- 旧文件 Runtime 导入、双写、兼容 adapter、fallback 或长期 migration chain；只有上述精确 epoch 3 → 4 和 epoch 4 RuntimeDeliveryIntentLink 增量是有界例外；
 - 运行时 schema v1/v2 协商；
 - 在线 Context root/node GC 或 CAS 引用计数；
 - 持久 ClientChangeLog 或跨宿主持久 feed；
@@ -210,22 +237,22 @@ Gate 的机器身份是稳定 `check.id`，handler 使用 `Map<checkId, handler>
 - 把配置 authority 迁入 Runtime SQLite；
 - 把本地测试、fixture、benchmark、数据库或密钥打入 VSIX。
 
-## 10. 计划收口完成与后续边界
+## 10. 当前开发与验证边界
 
-本 r4 收口只证明合同与校验器结构可以自洽，不代表 foundation/candidate/installed 已实现。只有 `npm run check:contracts:plan` 退出 0 后，才允许冻结 Phase B schema/Repository 接口；本轮不开始 Phase B 实现。
+SQLite/CAS、Turn/Effect/Tool/Process、Context、子代理与 Client Feed 已接入生产组合根。`check:contracts:plan` 只检查合同结构自洽，不执行这些能力，也不证明当前 VSIX 已在目标宿主通过验收。
 
-后续最终完成仍要求：
+后续修改和发布仍需分别验证以下不变量，不得把“已有源码”或“类型检查通过”当作运行证据：
 
 1. Turn 是唯一执行身份；
 2. 每个终态 ToolCall 只有一个 ToolModelResult；
 3. Context DAG 不复制历史前缀；
-4. detached wrapper、无总量截断的分批登记与output handle完整遍历通过故障测试；
+4. detached wrapper 身份核验、进程输出容量与分批读取通过故障测试；
 5. 六类 recovery scan 各有证据；
 6. interrupt_subtree、fork Links、MCP Effect 与 immutable compression replacement 通过 candidate；
 7. snapshot/changes/queue/barrier 全部有界；
-8. old writer 在 candidate 不可达，在 G 才物理删除；
+8. 生产导入图不包含旧 writer，修改不能恢复旧运行入口或增加 fallback；
 9. physical migration manifest 与 cutover journal 真正执行；
-10. targets 中 9 个 installed smoke（含真实文件 mutation 与普通 Turn interrupt）全部通过。
+10. 目标平台真实安装 smoke 通过，包括文件 mutation 与普通 Turn interrupt。
 
 ## 11. 常用检查
 

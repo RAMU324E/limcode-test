@@ -1,8 +1,8 @@
 # 模型上下文投影、中断与压缩一致性
 
-> 状态：本文描述当前实现基线，只用于理解现有行为和迁移来源，不是可靠运行内核目标合同。目标定义以[`docs/architecture/reliable-kernel/contracts/`](./architecture/reliable-kernel/contracts/README.md)为准；Provider/Context能力切换后，本文转为历史记录。
+> 状态：历史文档，描述已退役的 Provider/Context 实现和迁移来源。当前生产使用可靠内核 ContextSequence DAG 与 ModelRequest 投影；入口见[可靠运行内核架构](./architecture/reliable-kernel/README.md)，定义以其 [`contracts/`](./architecture/reliable-kernel/contracts/README.md) 为准。
 
-本文描述 LimCode 中 `Message`、运行终止事实、模型上下文、工具交换和压缩之间的边界。新增或修改任何 LLM 请求、压缩、历史重放、dry-run、fork、retry 或消息编辑逻辑时，都必须遵守本文不变量。
+本文保留旧实现中消息、运行终止、模型上下文、工具交换和压缩的设计背景。修改当前 LLM 请求、压缩、重放、fork、retry 或消息编辑时，应使用可靠内核现行合同，不再依赖下文的旧 Run/文件投影入口。
 
 ## 1. 核心原则
 

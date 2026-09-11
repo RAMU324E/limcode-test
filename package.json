@@ -1,7 +1,7 @@
 {
   "name": "limcode-test",
   "displayName": "Limcode Test",
-  "description": "VS Code extension with a TypeScript ECS backend, Vue webview frontend, and a basic LLM chat flow.",
+  "description": "VS Code AI assistant with a TypeScript reliable runtime, SQLite/CAS persistence, and Vue webviews.",
   "version": "0.0.20",
   "publisher": "your-publisher",
   "private": true,

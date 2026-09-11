@@ -2,6 +2,8 @@
 
 本文件是 Limcode Test 项目后续开发时 AI Agent / 开发者需要遵守的架构准则。项目由 [lurenxing628](https://github.com/lurenxing628) 独立维护，仓库地址为 <https://github.com/lurenxing628/limcode-test>。重点是：**ECS 数据、协议、effect、存储都要保持领域对象解耦**。当前准则来自 Agent 与 Conversation 解耦改造经验。
 
+当前生产入口是 `vscode/extension.ts → VscodeReliableKernelApplicationFacade → VscodeReliableKernelProductRuntime → ReliableKernelApplication`。Runtime 生命周期与提交权威由可靠内核和 SQLite worker 持有，Client Feed 直接投影已提交事实；`backend/world` 中仍复用部分领域类型、工具声明与 prompt helper，但旧 ECS World/System 循环不是生产执行器。下文 ECS 示例表达领域解耦准则，不得据此恢复旧运行 writer。
+
 提交消息只写简明中文标题，不添加 `feat:`、`fix:` 等类型前缀，不使用晦涩说法，也不写正文。每个提交只表达一个完整改动。
 
 ## 1. 总原则
@@ -10,7 +12,12 @@
 
 当前项目仍然处于开发模式，因此不要对旧格式有任何兜底，也不需要保留旧功能代码的兼容和体验，也不需要写什么协议v1，v2等之类的运行时内部版本号，全面使用新格式新功能更优秀的代码。
 
-允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。当前唯一有界例外是为保留已落盘对话而执行精确`Runtime epoch 3 → 4`离线升级：必须在数据库打开前核对table/index/trigger/manifest/RootBinding完整指纹，使用SQLite Backup API持久备份，通过pending pointer、单事务和durable journal向前恢复；任何未知漂移仍fail closed，不得扩展成通用迁移链。
+允许机器合同使用日期化`planRevision/contractRevision`、密码学domain separator或单一Runtime schema epoch来标识当前定义；这些标识不得用于运行时版本协商、旧格式fallback或维护未发布格式的migration链。不兼容Runtime数据直接使用当前schema manifest重新创建或通过Runtime epoch reset/archive，配置和Workspace独立保留。为保留已落盘对话，当前仅有以下两个已列入机器合同的有界例外：
+
+- 精确`Runtime epoch 3 → 4`离线升级：数据库打开前核对table/index/trigger/manifest/RootBinding完整指纹，只接受合同列出的两套已发布前驱；使用SQLite Backup API持久备份，通过pending pointer、单事务和durable journal向前恢复。
+- epoch 4内精确补`RuntimeDeliveryIntentLink`：其他物理对象、manifest元数据和RootBinding必须完全符合当前定义，只允许缺少这一张关系表；单事务补表及身份严格核验的旧Child Runtime continuation转换，不允许顺带修复`client_mapping`、digest或其他metadata漂移。
+
+任何未知漂移仍fail closed，不得根据任意旧字段值推导“可兼容”schema，也不得把这些例外扩展成通用迁移链。
 
 ### 1.1 独立领域对象必须独立建模
 
@@ -481,31 +488,33 @@ Storage 按领域分目录，或在共用 SQLite 中按领域独立表与 Reposi
 
 ## 8. 当前 Agent / Conversation 案例
 
-当前目标结构：
+当前生产结构：
 
 ```text
-ECS:
-  Agent 独立
-  Conversation / Session 独立
-  Message 属于 Conversation
-  AgentConversationLink 独立表达关系
+Configuration:
+  Agent / ModelProfile / Policy 位于独立配置 roots
+
+Runtime domains:
+  Conversation 独立
+  Message / MessageRevision 与 Conversation 的关系独立
+  AgentConversationLink 独立表达 Agent 与 Conversation 的关系
+  Turn / EffectIntent / EffectReceipt 独立表达执行与外部结果
 
 Protocol:
-  agents[]
-  sessions[]
-  messages[]
-  toolCalls[]
-  agentConversationLinks[]
+  ConfigurationSnapshot 投影配置
+  有界 Runtime snapshot / changes 投影已提交运行事实
+  对话设置按 conversationId 分发，不能覆盖其他面板的作用域
 
 Storage:
-  agents/
-  conversations/
-  agent-conversation-links/
+  独立配置 roots 保存 Agent、Workflow、Policy、Settings
+  Runtime SQLite 按领域保存 Conversation、Message、Turn 与各类 Link
+  CAS 保存正文和大结果
 
-System:
-  InputSystem 写入 conversation message
-  LlmDispatchSystem 通过 AgentConversationLink 找 active agent
-  LlmPollSystem 写回 assistant message
+Execution:
+  CommandRouter / Facade 接收命令
+  可靠内核 control planes 解释独立领域与 Link 并提交事实
+  capability adapters 执行外部能力
+  Client Feed 直接投影已提交事实到 Webview
 ```
 
 这套方式后续应用于所有类似模块：只要两个概念可以被不同功能复用，就不要做所有权绑定，而是通过独立 link 和 system 组合。

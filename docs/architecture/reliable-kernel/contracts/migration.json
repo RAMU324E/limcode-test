@@ -2150,10 +2150,10 @@
       "atomic-rename-pointer",
       "delete-pending"
     ],
-    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；精确 epoch-3 predecessor 可在数据库打开前按 boundedEpochUpgrade 离线升级并向前恢复，旧 Child Runtime continuation 仅在稳定身份、CAS 与命令收据全部吻合时一次性转换为当前 envelope + RuntimeDeliveryIntentLink；当前 epoch 4 仅允许同样规则下精确新增 RuntimeDeliveryIntentLink；其他 pending、缺少 epoch 或未知漂移拒绝打开 Runtime。"
+    "startupRule": "cutover request 存在时先进入 cutover-only coordinator；精确 epoch-3 predecessor 可在数据库打开前按 boundedEpochUpgrade 离线升级并向前恢复，旧 Child Runtime continuation 仅在稳定身份、CAS 与命令收据全部吻合时一次性转换为当前 envelope + RuntimeDeliveryIntentLink；当前 epoch 4 只接受除缺少 RuntimeDeliveryIntentLink 外所有物理对象、manifest 元数据与 RootBinding 均符合当前定义的精确前驱；不得修复任意 client_mapping 或 digest 漂移。其他 pending、缺少 epoch 或未知漂移拒绝打开 Runtime。"
   },
   "epochPolicy": {
-    "current": "只允许一次精确 epoch 3→4 离线升级；epoch 4 内只允许精确新增 RuntimeDeliveryIntentLink；两条路径都只在旧 Child Runtime continuation 的稳定身份、CAS 与命令收据完全吻合时离线转换，不提供运行时 fallback；其他不兼容 Runtime 归档重置",
+    "current": "只允许一次精确 epoch 3→4 离线升级；epoch 4 内只允许其他物理结构和 manifest 元数据完全匹配的 RuntimeDeliveryIntentLink 单表增量，不推导或接受其他领域的历史 client_mapping/digest 组合；两条路径都只在旧 Child Runtime continuation 的稳定身份、CAS 与命令收据完全吻合时离线转换，不提供运行时 fallback；其他不兼容 Runtime 归档重置",
     "status": "单一当前 schema，不做协议协商或长期 migration chain",
     "roadmapNote": "新增 epoch 必须另行决策，不能自动沿用本次升级器"
   },

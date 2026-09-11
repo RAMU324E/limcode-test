@@ -27,22 +27,15 @@ Limcode Test 不是简单改名。它仍然是在 VS Code 中使用的对话助�
 
 ## 当前能力
 
-- 主 Webview 提供基础 AI 对话界面。
-- Webview 通过 bridge 发送 `chat:send`，后端 ECS chat systems 生成 assistant 消息并触发 `llm.start` effect。
-- LLM capability 使用通用 provider 命名；当前基础链路默认跑 Deepseek：
-  - Base URL: `https://api.deepseek.com/v1`
-  - Model: `deepseek-v4-flash`
-- LLM API 设置保存为 VS Code `globalStorageUri` 下的明文文件：
-  - `settings/llm-api.json`
-  - Webview 顶部“LLM 设置”可以直接查看和修改 `provider/baseUrl/model/apiKey/temperature`。
-- 对话持久化也通过 VS Code `globalStorageUri`，并在文件层面拆分 agent、conversation、link：
-  - `agents/index.json` + `agents/records/{timeSlugHash}.json`：只保存 agent 组件投影。
-  - `conversations/index.json` + `conversations/{timeSlugHash}/conversation.json`：只保存对话元数据。
-  - `conversations/{timeSlugHash}/messages/index.json` + `messages/chunks/000000.json`：保存该对话的消息块和消息关联的 toolCalls。
-  - `agent-conversation-links/index.json` + `agent-conversation-links/records/{timeSlugHash}.json`：只保存 agent 与 conversation 的 link 关系。
-- `RuntimeEnv.paths` 记录插件全局数据目录，以及 agents / conversations / links / settings 等独立数据根目录和索引路径。
+- Vue / Pinia Webview 通过 bridge 发送命令；VS Code 应用层把命令交给可靠内核，不再运行旧 ECS chat systems。
+- `ReliableKernelApplication` 组合 Turn、Effect、Tool、Process、Context 与子代理控制面；SQLite worker 统一提交运行事实，外部能力通过 LLM / MCP / 文件 / 进程适配器执行。
+- 对话、消息、执行状态和关系分别保存在 Runtime SQLite 的独立领域表中；正文、附件和工具大结果保存在 CAS。不存在 JSON conversation chunks 与 SQLite 双写。
+- Webview 接收有界 snapshot / changes；长历史和大内容按需读取，不把整段历史随每次更新重发。
+- Agent、Workflow、Policy、模型配置和 Settings 保持独立配置权威。LLM 渠道记录位于当前配置根的 `settings/llm-provider-configs/index.json` 与 `records/`，由设置页管理。
+- 数据路径统一由 `getPaths()` 和 RootAuthority 解析；Runtime 长连接持有完整、带 fencing 的 RootBinding，不能自行从 `globalStorageUri` 拼接业务路径。
+- 文件传输默认允许项目外路径；用户显式关闭 `allowOutsideProjectPaths` 时，源与目标必须真实位于各自工作环境根内，不能借符号链接绕过。
 
-> 当前开发阶段按需求把 LLM API Key 明文保存到 `settings/llm-api.json`，不使用环境变量，也不使用 VS Code SecretStorage。
+> 当前开发阶段 LLM API Key 仍随渠道配置记录明文保存，不使用 VS Code SecretStorage；请勿分享包含密钥的配置目录。
 
 ## 支持平台
 
@@ -67,7 +60,7 @@ npm run build
 常用命令：
 
 ```text
-Limcode Test: Open AI Chat
+Limcode Test: Open LLM Chat
 Limcode Test: Reveal Data Storage Folder
 ```
 
@@ -76,7 +69,7 @@ Limcode Test: Reveal Data Storage Folder
 - 从 `main` 创建独立分支进行开发。
 - 通过 Pull Request 合并改动，不直接改写已经共享的历史。
 - 提交消息只写简明中文标题，不添加类型前缀，也不写正文。
-- 提交前运行 `npm run check:plan:tracked`，确保构建、类型检查和测试通过。
+- 提交前运行 `npm run check:plan:tracked` 检查构建、类型和合同；行为回归另运行 `npm run check:local` 或相关测试。合同检查通过不代表运行时或真实安装验收通过。
 
 ## 常用脚本
 
@@ -97,7 +90,10 @@ npm run package:darwin-arm64   # 打包 macOS Apple Silicon VSIX
 ## 目录概览
 
 ```text
-backend/                 # ECS world、application composition root、capabilities
+backend/application/     # VS Code 产品组合根、命令路由与配置协调
+backend/reliableKernel/  # Runtime 控制面、SQLite worker、CAS 与 Client Feed
+backend/capabilities/    # LLM、文件、进程、网络及配置存储适配器
+backend/world/           # 当前仍复用的领域类型、工具声明和 prompt helper；不是运行主循环
 shared/                  # Webview 与扩展共享协议
 vscode/                  # VS Code extension entry、commands、panels、views
 webview/                 # Vue Webview 前端
@@ -107,6 +103,6 @@ docs/                    # 架构与开发约束说明
 ## 架构文档
 
 - [新运行系统架构](docs/architecture/reliable-kernel/README.md)：当前运行架构、约束合同和检查规则。
-- [Conversation 可靠存储权威模型](docs/conversation-storage-authority.md)：当前文件后端实现说明；对应能力切换后转为历史记录。
-- [模型上下文投影、中断与压缩一致性](docs/model-context-projection.md)：当前实现说明；Provider/Context 能力切换后转为历史记录。
-- [后台进程 completion 可靠注入语义](docs/background-process-reliability.md)：当前实现说明；Runtime/Tool/File 能力切换后转为历史记录。
+- [Conversation 可靠存储权威模型](docs/conversation-storage-authority.md)：旧文件后端的历史说明，不是当前 SQLite 写入规范。
+- [模型上下文投影、中断与压缩一致性](docs/model-context-projection.md)：旧 Provider/Context 实现的历史说明；当前以可靠内核合同为准。
+- [后台进程 completion 可靠注入语义](docs/background-process-reliability.md)：旧后台进程实现的历史说明；当前使用可靠内核 Process/Effect/Delivery 链路。

@@ -583,6 +583,59 @@ test('epoch 4 缺少 RuntimeDeliveryIntentLink 时原地增表并保留历史', 
   }
 });
 
+test('epoch 4 拒绝未列入前驱合同的领域 mapping，且不改写历史或补表', async (t) => {
+  for (const missingAdditiveDomain of [false, true]) {
+    await t.test(missingAdditiveDomain ? '单表前驱包含额外 metadata 漂移' : '当前 schema 包含 metadata 漂移', async () => {
+      const fixture = await createEpoch4WithoutRuntimeDeliveryIntentLinkFixture('metadata-drift');
+      try {
+        const coordinator = new VscodeReliableKernelCutoverCoordinator(
+          fixture.authority,
+          fixture.runtimeScopeRoot
+        );
+        if (!missingAdditiveDomain) await coordinator.ensureCurrentRoot();
+        const pointerBefore = await fs.readFile(fixture.binding.paths.rootPointerPath, 'utf8');
+        const schema = kernel.RUNTIME_DOMAIN_SCHEMAS.find((item) => item.key === 'Conversation');
+        const clientMapping = schema.client === 'none' ? 'detail' : 'none';
+        let manifestBefore;
+        const database = new Database(fixture.binding.paths.databasePath, { fileMustExist: true });
+        try {
+          database.prepare(`
+            UPDATE schema_manifest SET client_mapping = ?, schema_digest = ? WHERE domain_key = ?
+          `).run(clientMapping, kernel.domainSchemaDigest({ ...schema, client: clientMapping }), schema.key);
+          manifestBefore = database.prepare('SELECT * FROM schema_manifest WHERE domain_key = ?').get(schema.key);
+        } finally {
+          database.close();
+        }
+
+        await assert.rejects(coordinator.ensureCurrentRoot(), /Runtime manifest drift is unsupported/);
+        assert.equal(await fs.readFile(fixture.binding.paths.rootPointerPath, 'utf8'), pointerBefore);
+        await assert.rejects(fs.access(fixture.binding.paths.rootPendingPath), { code: 'ENOENT' });
+        const inspection = new Database(fixture.binding.paths.databasePath, { readonly: true, fileMustExist: true });
+        try {
+          assert.deepEqual(
+            inspection.prepare('SELECT * FROM schema_manifest WHERE domain_key = ?').get(schema.key),
+            manifestBefore
+          );
+          assert.equal(
+            inspection.prepare('SELECT title FROM conversation WHERE id = ?').get(fixture.conversationId).title,
+            fixture.conversationTitle
+          );
+          assert.equal(
+            inspection.prepare(
+              "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'runtime_delivery_intent_link'"
+            ).get().count,
+            missingAdditiveDomain ? 0 : 1
+          );
+        } finally {
+          inspection.close();
+        }
+      } finally {
+        await fs.rm(fixture.runtimeScopeRoot, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test('epoch 4 单表 predecessor 含额外结构漂移时 fail closed 且历史原地保留', async () => {
   const fixture = await createEpoch4WithoutRuntimeDeliveryIntentLinkFixture('unknown-drift');
   try {
