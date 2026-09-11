@@ -111,6 +111,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/interaction-auto-approval.test.mjs',
   'tests/reliable-kernel/platform-runtime-compatibility.test.mjs',
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
+  'tests/reliable-kernel/work-environment-transfer-boundary.test.cjs',
   'tests/llmErrorRedaction.test.cjs',
   'tests/localFileResources.test.cjs',
   'tests/processSpoolCleanup.test.cjs',

@@ -73,6 +73,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/interaction-auto-approval.test.mjs',
   'tests/reliable-kernel/platform-runtime-compatibility.test.mjs',
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
+  'tests/reliable-kernel/work-environment-transfer-boundary.test.cjs',
   'tests/runAgentToolSchema.test.cjs',
   'tests/settingsRevisionConflict.test.cjs',
   'tests/storageLockRace.test.cjs',
