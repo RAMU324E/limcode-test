@@ -709,7 +709,7 @@ function spawnWindowsPowerShellCommand(
   const gatePath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE);
   const quotedGatePath = `'${gatePath.split("'").join("''")}'`;
   const commandTextBase64 = Buffer.from(request.command, 'utf8').toString('base64');
-  const script = [
+  const prelude = [
     `$ProgressPreference = 'SilentlyContinue'`,
     `$gatePath = ${quotedGatePath}`,
     `while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }`,
@@ -731,8 +731,9 @@ function spawnWindowsPowerShellCommand(
     `$limcodeParenExpression = if ($limcodeLastPipelineElement -is [System.Management.Automation.Language.CommandExpressionAst] -and $limcodeLastPipelineElement.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) { $limcodeLastPipelineElement.Expression } else { $null }`,
     `$limcodeParenPipelineElements = if ($null -ne $limcodeParenExpression) { @($limcodeParenExpression.Pipeline.PipelineElements) } else { @() }`,
     `$limcodeParenCommandName = if ($limcodeParenPipelineElements.Count -eq 1 -and $limcodeParenPipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) { $limcodeParenPipelineElements[0].GetCommandName() } else { $null }`,
-    `$limcodeErrorCount = $Error.Count; $LASTEXITCODE = $null`,
-    request.command,
+    `$limcodeErrorCount = $Error.Count; $LASTEXITCODE = $null`
+  ].join('; ');
+  const epilogue = [
     `$limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE; $limcodeCommandAddedError = $Error.Count -gt $limcodeErrorCount`,
     // Resolve the direct parenthesized command after execution so script-defined functions and aliases win.
     `$limcodeParenCommandInfo = if ($null -ne $limcodeParenCommandName) { Get-Command -Name $limcodeParenCommandName -ErrorAction SilentlyContinue } else { $null }`,
@@ -742,6 +743,11 @@ function spawnWindowsPowerShellCommand(
     `if ($null -ne $limcodeParenExpression -and $limcodeCommandAddedError) { exit 1 }`,
     `exit 0`
   ].join('; ');
+  // Semicolons would put the whole script on one line, so a trailing `#` comment in the command would
+  // comment the epilogue out and lose the exit code, and a parse error would report its column against
+  // the prelude. Newlines fix both; the prelude stays a single line so the reported line number is
+  // always the command's own line plus one.
+  const script = `${prelude}\n${request.command}\n${epilogue}`;
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   return spawn(resolveWindowsPowerShell().executable, [
     '-NoLogo',
@@ -755,6 +761,11 @@ function spawnWindowsPowerShellCommand(
     encoded
   ], {
     cwd: request.cwd,
+    // A parse error aborts the whole script before any statement runs, so the in-script $PSStyle
+    // settings cannot reach it. TERM is read at startup instead, which suppresses PowerShell's own
+    // colouring even then, and also the trailing reset that $PSStyle.Reset is too read-only to drop.
+    // Output a native command colours itself is untouched, and Windows PowerShell 5.1 ignores this.
+    env: { ...process.env, TERM: 'dumb' },
     // The Wrapper process itself is detached. A second detached PowerShell with piped output exits
     // before the bootstrap gate on Windows, so it remains attached to the durable Wrapper.
     detached: false,

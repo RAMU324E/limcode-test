@@ -28,9 +28,8 @@ const PS_UTF8_PREFIX = [
   '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
   "$PSDefaultParameterValues['*:Encoding'] = 'utf8'",
   // PowerShell 7 colours its own formatting and error views; the 5.1 fallback never did.
-  "if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }",
-  ''
-].join('; ');
+  "if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }"
+].join('; ') + '\n';
 
 type ShellKind = 'powershell' | 'bash';
 type StaticClassification = 'allow' | 'deny' | 'unknown';
@@ -405,6 +404,9 @@ function nonInteractiveEnv(kind: ShellKind): NodeJS.ProcessEnv {
     ...process.env,
     CI: process.env.CI ?? '1',
     NO_COLOR: process.env.NO_COLOR ?? '1',
+    // PowerShell only honours TERM, and unlike NO_COLOR it also covers a parse error, which aborts
+    // the script before the UTF-8 prefix can run.
+    ...(kind === 'powershell' ? { TERM: 'dumb' } : {}),
     PYTHONIOENCODING: 'utf-8',
     ...(kind === 'bash' ? { LANG: process.env.LANG || 'en_US.UTF-8' } : {})
   };

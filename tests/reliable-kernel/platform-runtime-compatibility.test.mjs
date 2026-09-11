@@ -1313,10 +1313,40 @@ test('PowerShell 7的错误与表格输出不再夹带自身的ANSI着色', wind
     suffix: 'ansi'
   });
   try {
-    // PowerShell 自身的着色会整段包裹错误视图和表头；只允许错误记录结尾那个无法关闭的复位序列。
-    const escapes = result.output.match(/\[[0-9;]*m/g) ?? [];
-    assert.deepEqual(new Set(escapes), new Set(escapes.length > 0 ? ['[0m'] : []));
+    // TERM=dumb 在启动时就关掉了 PowerShell 自身的着色，连 $PSStyle.Reset 拔不掉的尾巴一并没了。
+    assert.deepEqual(result.output.match(/\u001b\[[0-9;]*m/g) ?? [], []);
     assert.match(result.output, /limcode-does-not-exist/);
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('解析期错误同样不带ANSI，且行号指向命令自己的行', windowsOnly, async () => {
+  // 整个脚本一次性解析，解析失败时脚本内的 $PSStyle 设置一条都没执行过；
+  // 前置项压成单行后，命令第 N 行的语法错误应报在第 N+1 行。
+  const result = await runPlatformWrapper({
+    command: "Write-Output 'a'\nWrite-Output 'b'\n$x = ( 1; 2 )",
+    timeoutMs: 15_000,
+    suffix: 'parseansi'
+  });
+  try {
+    assert.deepEqual(result.output.match(/\u001b\[[0-9;]*m/g) ?? [], []);
+    assert.notEqual(result.receipt.exitCode, '0');
+    assert.match(result.output, /^\s*4 \|/m);
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('命令末尾的行注释不会吞掉退出码判定', windowsOnly, async () => {
+  // 用分号拼成一行时，# 之后的整条退出码判定链都会变成注释，真实退出码 3 会退化成 1。
+  const result = await runPlatformWrapper({
+    command: "cmd /c exit 3 # 顺手写个注释",
+    timeoutMs: 15_000,
+    suffix: 'trailingcomment'
+  });
+  try {
+    assert.equal(result.receipt.exitCode, '3');
   } finally {
     await fs.rm(result.parent, { recursive: true, force: true });
   }

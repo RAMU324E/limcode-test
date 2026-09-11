@@ -73,6 +73,6 @@ function candidateDirectories(): string[] {
  */
 export function powerShellCommandSyntaxGuidance(edition: WindowsPowerShellRuntime['edition']): string {
   return edition === 'core'
-    ? 'chain multiple commands with && or ||, or separate them with semicolons; quote paths that contain spaces; for long output, prefer piping to Select-Object -First N.'
-    : 'separate multiple commands with semicolons, because Windows PowerShell 5.1 has no pipeline chain operators; quote paths that contain spaces; for long output, prefer piping to Select-Object -First N.';
+    ? 'chain multiple commands with && or ||, or separate them with semicolons; quote paths that contain spaces; for long output, prefer piping to Select-Object -First N. PowerShell has no backslash escape, so a bash-style \\" is a syntax error; write a script longer than one line to a file first instead of inlining it.'
+    : 'separate multiple commands with semicolons, because Windows PowerShell 5.1 has no pipeline chain operators; quote paths that contain spaces; for long output, prefer piping to Select-Object -First N. PowerShell has no backslash escape, so a bash-style \\" is a syntax error; write a script longer than one line to a file first instead of inlining it.';
 }
