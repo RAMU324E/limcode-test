@@ -23,10 +23,10 @@ const {
   createOpenAIResponsesWebSocketSessionKey,
   dryRunCompactLlmProvider,
   dryRunLlmProvider,
-  emitUnifiedChunk,
-  installGeminiOpenAICompatibleThoughtSignatures,
   startLlmProvider
 } = require('../dist/extension/backend/capabilities/llmProvider.js');
+const { emitUnifiedChunk } = require('../dist/extension/backend/capabilities/llmStreamEventProjection.js');
+const { installGeminiOpenAICompatibleThoughtSignatures } = require('../dist/extension/backend/capabilities/geminiProviderAdaptation.js');
 const {
   createTerminalValidatedFetch
 } = require('../dist/extension/backend/capabilities/terminalValidatedFetch.js');

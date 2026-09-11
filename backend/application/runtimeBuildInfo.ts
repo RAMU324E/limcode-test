@@ -70,6 +70,10 @@ function runtimeModulePaths(): string[] {
   const paths = [__filename];
   for (const moduleId of [
     '../capabilities/llmProvider',
+    '../capabilities/llmStreamEventProjection',
+    '../capabilities/geminiProviderAdaptation',
+    '../capabilities/unifiedMessageConversion',
+    '../capabilities/llmRequestContentPreparation',
     '../capabilities/openAIResponsesWebSocketSession',
     '../capabilities/openAIResponsesWebSocketConnection',
     '../capabilities/openAIResponsesWebSocketMultiplexer',
@@ -81,7 +85,7 @@ function runtimeModulePaths(): string[] {
     '../reliableKernel/nativeCompressionGuard',
     '../reliableKernel/conversationForkContext',
     '../capabilities/llmStreamEventBatcher',
-    '../world/modules/tools/systems/ToolCallPreviewSystem',
+    '../reliableKernel/webviewFeedBridge',
     '../../shared/protocol',
     'unified-llm-provider/package.json',
     'ws/package.json',

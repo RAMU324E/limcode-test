@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { prepareNativeCompactContentsMultimodal } from '../../dist/extension/backend/capabilities/llmProvider.js';
+import { prepareNativeCompactContentsMultimodal } from '../../dist/extension/backend/capabilities/llmRequestContentPreparation.js';
 
 const MIB = 1024 * 1024;
 

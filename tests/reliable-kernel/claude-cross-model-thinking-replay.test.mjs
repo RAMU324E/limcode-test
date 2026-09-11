@@ -7,7 +7,7 @@ const root = process.cwd();
 const require = createRequire(import.meta.url);
 const {
   toUnifiedRequest
-} = require(path.join(root, 'dist/extension/backend/capabilities/llmProvider.js'));
+} = require(path.join(root, 'dist/extension/backend/capabilities/unifiedMessageConversion.js'));
 const unified = await import('unified-llm-provider');
 
 /** 别家渠道产出的思考：签名前缀不是 claude，Claude 永远无法验证它。 */

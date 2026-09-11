@@ -21,7 +21,7 @@ function readSource(): Omit<DebugCaptureManifest['source'], 'hostBootId'> {
     }
   } catch { /* 缺失明确保留，不推测提交号。 */ }
   const moduleHashes: Record<string, string> = {};
-  const modules = ['../../capabilities/llmProvider', '../../capabilities/openAIResponsesWebSocketSession', '../../capabilities/terminalValidatedFetch', '../../capabilities/llmStreamEventBatcher', '../llmCapabilityProviderAdapter', '../webviewFeedBridge', './observer', './analyzer', './controller', './files', './service', './source', '../../../shared/debugCaptureEncoding'];
+  const modules = ['../../capabilities/llmProvider', '../../capabilities/llmStreamEventProjection', '../../capabilities/geminiProviderAdaptation', '../../capabilities/unifiedMessageConversion', '../../capabilities/llmRequestContentPreparation', '../../capabilities/openAIResponsesWebSocketSession', '../../capabilities/terminalValidatedFetch', '../../capabilities/llmStreamEventBatcher', '../llmCapabilityProviderAdapter', '../webviewFeedBridge', './observer', './analyzer', './controller', './files', './service', './source', '../../../shared/debugCaptureEncoding'];
   for (const id of modules) {
     try { moduleHashes[id] = hash(readFileSync(require.resolve(id))); } catch { moduleHashes[id] = '无法读取'; }
   }
