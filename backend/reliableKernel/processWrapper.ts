@@ -711,16 +711,6 @@ function spawnWindowsPowerShellCommand(
   const gatePath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE);
   const quotedGatePath = `'${gatePath.split("'").join("''")}'`;
   const prelude = [
-    `$ProgressPreference = 'SilentlyContinue'`,
-    `$gatePath = ${quotedGatePath}`,
-    `while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }`,
-    `Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue`,
-    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
-    `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
-    // PowerShell 7 colours its own formatting and error views; the 5.1 fallback never did, so without
-    // this the escape sequences become noise in the output the model reads. Native command output is
-    // written through untouched, so a tool that emits its own colour keeps it.
-    `if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }`,
     ...(needsDesktopStatusFix ? [
       `$limcodeCommandText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${Buffer.from(request.command, 'utf8').toString('base64')}'))`,
       `$limcodeTokens = $null; $limcodeParseErrors = $null`,
@@ -734,9 +724,12 @@ function spawnWindowsPowerShellCommand(
     ] : []),
     `$LASTEXITCODE = $null`
   ].join('; ');
-  const epilogue = [
+  const checkExitStatus = [
     `$limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE`,
-    `if (-not $limcodeCommandSucceeded) { if ($null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }; exit 1 }`,
+    `if (-not $limcodeCommandSucceeded) { if ($null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }; exit 1 }`
+  ];
+  const epilogue = [
+    ...checkExitStatus,
     ...(needsDesktopStatusFix ? [
       `$limcodeCommandAddedError = $Error.Count -gt $limcodeErrorCount`,
       // Resolve the direct parenthesized command after execution so script-defined functions and aliases win.
@@ -754,6 +747,18 @@ function spawnWindowsPowerShellCommand(
   const script = `${prelude}\n${request.command}\n${epilogue}`;
   const scriptPath = path.join(spoolPath, 'command.ps1');
   fs.writeFileSync(scriptPath, `\uFEFF${script}`, 'utf8');
+  const bootstrap = [
+    `$ProgressPreference = 'SilentlyContinue'`,
+    `$gatePath = ${quotedGatePath}`,
+    `while (-not (Test-Path -LiteralPath $gatePath)) { Start-Sleep -Milliseconds 10 }`,
+    `Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue`,
+    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }`,
+    `. '${scriptPath.split("'").join("''")}'`,
+    ...checkExitStatus,
+    `exit 0`
+  ].join('; ');
   return spawn(powerShell.executable, [
     '-NoLogo',
     '-NoProfile',
@@ -762,14 +767,10 @@ function spawnWindowsPowerShellCommand(
     'Bypass',
     '-OutputFormat',
     'Text',
-    '-File',
-    scriptPath
+    '-Command',
+    bootstrap
   ], {
     cwd: request.cwd,
-    // A parse error aborts the whole script before any statement runs, so the in-script $PSStyle
-    // settings cannot reach it. TERM is read at startup instead, which suppresses PowerShell's own
-    // colouring even then, and also the trailing reset that $PSStyle.Reset is too read-only to drop.
-    // Output a native command colours itself is untouched, and Windows PowerShell 5.1 ignores this.
     env: { ...process.env, TERM: 'dumb', PYTHONIOENCODING: 'utf-8' },
     // The Wrapper process itself is detached. A second detached PowerShell with piped output exits
     // before the bootstrap gate on Windows, so it remains attached to the durable Wrapper.

@@ -1478,6 +1478,26 @@ test('PowerShell 7括号内已恢复的链式命令不会被5.1修正误报失�
   }
 });
 
+test('Windows解析错误等待身份记录完成后才退出并保留诊断', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: "Write-Output 'must-not-run'\n$broken = ( 1; 2 )",
+    timeoutMs: 15_000,
+    suffix: 'parse_after_identity',
+    fingerprintDelayMs: 1_500
+  });
+  try {
+    assert.equal(result.bootstrap.phase, 'identity_ready');
+    assert.equal(result.bootstrap.childPid, result.identity.childPid);
+    assert.equal(result.receipt.exitCode, '1');
+    assert.match(result.output, /ParserError/);
+    assert.match(result.output, /\$broken/);
+    assert.doesNotMatch(result.output, /^must-not-run\r?$/m);
+    assert.doesNotMatch(result.output, /\u001b\[/);
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
 test('concurrent Windows cold starts all publish durable bootstrap and identity evidence', windowsOnly, async () => {
   const results = await Promise.all(Array.from({ length: 6 }, (_, index) => runPlatformWrapper({
     command: `Write-Output 'cold-${index}'`,
@@ -1595,7 +1615,7 @@ test('host consumes durable pre-identity failure instead of waiting for outcome_
   }
 });
 
-async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env }) {
+async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env, fingerprintDelayMs = 0 }) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-wrapper-${process.platform}-`));
   const spoolLocator = `process_${process.platform}_${suffix}`;
   const spoolPath = path.join(parent, spoolLocator);
@@ -1616,7 +1636,15 @@ async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env }) 
   };
   const launchPath = path.join(spoolPath, 'launch.json');
   await fs.writeFile(launchPath, `${JSON.stringify(request, null, 2)}\n`);
-  const run = await runWrapperProcess(launchPath, 15_000, env);
+  const preloadPath = fingerprintDelayMs ? path.join(parent, 'delay-fingerprint.cjs') : undefined;
+  if (preloadPath) {
+    await fs.writeFile(preloadPath, [
+      `const protocol = require(${JSON.stringify(path.join(distRoot, 'backend/reliableKernel/processProtocol.js'))});`,
+      'const readFingerprint = protocol.readProcessStartFingerprint;',
+      `protocol.readProcessStartFingerprint = (pid) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${fingerprintDelayMs}); return readFingerprint(pid); };`
+    ].join('\n'));
+  }
+  const run = await runWrapperProcess(launchPath, 15_000, env, preloadPath);
   assert.equal(run.status, 0, run.stderr);
 
   const bootstrap = processProtocol.parseWrapperBootstrapReceipt(JSON.parse(
@@ -1631,9 +1659,10 @@ async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env }) 
   return { parent, spoolPath, run, bootstrap, identity, manifest, receipt, output };
 }
 
-function runWrapperProcess(launchPath, timeoutMs, env) {
+function runWrapperProcess(launchPath, timeoutMs, env, preloadPath) {
   return new Promise((resolve, reject) => {
     const child = childProcess.spawn(process.execPath, [
+      ...(preloadPath ? ['--require', preloadPath] : []),
       path.join(distRoot, 'backend/reliableKernel/processWrapper.js'),
       launchPath
     ], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
