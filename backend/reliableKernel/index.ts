@@ -57,6 +57,7 @@ export * from './runtimeApplication';
 export * from './toolDispatcher';
 export * from './toolInteractions';
 export * from './turnControlPlane';
+export { GuidanceControlConflictError, isGuidanceControlConflictError } from './turnGuidanceQueue';
 export * from './turnOutput';
 export * from './turnRecovery';
 export * from './schema/domainManifest';

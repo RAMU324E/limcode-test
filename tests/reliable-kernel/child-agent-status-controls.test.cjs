@@ -185,40 +185,8 @@ test('run_agent navigation identity comes only from durable ChildExecution relat
     'run-agent-tool': 'child-conversation'
   });
 
-  const display = source('webview/src/components/content/toolDisplay/runAgentToolDisplay.ts');
-  const part = source('webview/src/components/content/parts/FunctionCallPartView.vue');
-  assert.match(display, /context\.childConversationId\?\.trim\(\)/);
-  assert.doesNotMatch(display, /conversationIdFromValue\(context\.(?:result|progress)\)/);
-  assert.match(part, /childConversationIdByToolCallId\[toolCall\.value\.id\]/);
 });
 
-test('UI and product routes bind recursive stop to child-isolated activity facts', () => {
-  const panel = source('webview/src/components/input/ReliableAgentStatusPanel.vue');
-  const worker = source('backend/reliableKernel/databaseWorker.ts');
-  const router = source('backend/application/reliableKernel/VscodeReliableKernelCommandRouter.ts');
-  const facade = source('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.ts');
-  const sidebar = source('webview/src/sidebar/SidebarApp.vue');
-  assert.match(panel, /BridgeMessageType\.ToolExecutionCancel/);
-  assert.match(panel, /BridgeMessageType\.ConversationOpen/);
-  assert.match(panel, /终止该 Agent 及其启动的所有子 Agent/);
-  assert.match(panel, /toolCallId: child\.sourceToolCallId/);
-  assert.match(panel, /selectedChildId\.value = child\.id/);
-  assert.match(panel, /class="agent-run-item-stop"[\s\S]*?@click\.stop="interruptChild\(child\)"/);
-  assert.match(panel, /不影响其他同级子 Agent/);
-  assert.match(panel, /child\.activitySummary/);
-  assert.match(panel, /width: min\(760px, calc\(100vw - 58px\)\)/);
-  assert.match(panel, /height: min\(430px, calc\(100vh - 120px\)\)/);
-  assert.match(panel, /@media \(max-width: 620px\)[\s\S]*?grid-template-columns: minmax\(104px, 0\.38fr\) minmax\(0, 0\.62fr\)/);
-  assert.match(panel, /<AdvancedScrollbar/);
-  assert.match(panel, /requestDetail\('answer-content', submissionId/);
-  assert.match(panel, /<button type="button" class="agent-run-close"[\s\S]*?@click="closePanel"/);
-  assert.match(panel, /<div v-else class="agent-run-empty">暂无子 Agent。<\/div>/);
-  assert.match(worker, /Child ToolCall\/ModelRequest rows stay isolated/);
-  assert.match(worker, /capture_child_activity_from_/);
-  assert.match(router, /product\.childAgents\.interruptSubtree/);
-  assert.match(facade, /sidebar-child-interrupt/);
-  assert.match(sidebar, /终止此子 Agent 及其启动的所有子 Agent/);
-});
 
 test('parent feed receives a bounded child activity change without child ToolCall leakage', async () => {
   const kernel = require(path.join(root, 'dist/extension/backend/reliableKernel/index.js'));

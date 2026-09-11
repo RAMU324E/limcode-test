@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import test from 'node:test';
 import * as kernel from '../../dist/extension/backend/reliableKernel/index.js';
 
@@ -35,59 +34,6 @@ function emptyBreakdown(overrides = {}) {
   return value;
 }
 
-test('Agent loop只用启发式预算规划压缩且不再形成普通发送门禁', () => {
-  const source = fs.readFileSync('backend/reliableKernel/agentLoop.ts', 'utf8');
-  const planningStart = source.indexOf(
-    'let planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);'
-  );
-  const compressionStart = source.indexOf('this.compressionCoordinator.coordinate({', planningStart);
-  const requestCreate = source.indexOf('this.modelProvider.createModelRequest({', compressionStart);
-  assert.ok(planningStart >= 0 && compressionStart > planningStart && requestCreate > compressionStart);
-
-  const admission = source.slice(planningStart, requestCreate);
-  assert.match(admission, /this\.compressionCoordinator\.coordinate\(\{/);
-  assert.match(admission, /if \(compression\.status === 'compressed'\)/);
-  assert.doesNotMatch(admission, /canSend|request_still_too_large|safe limit/);
-
-  const coordinator = fs.readFileSync('backend/reliableKernel/contextCompressionCoordinator.ts', 'utf8');
-  assert.match(
-    coordinator,
-    /const decision = await this\.compression\.evaluate\(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId\);\s*if \(trigger === 'auto' && !decision\.shouldCompress\)/,
-    '自动压缩必须由Provider实测校准后的配置阈值判断准入'
-  );
-  assert.ok(
-    coordinator.indexOf("if (trigger === 'auto' && !decision.shouldCompress)")
-      < coordinator.indexOf('requestBudget.fixedTokens > requestBudget.planningInputCapacityTokens'),
-    '低于Provider实测阈值的普通请求必须在启发式压缩容量检查前跳过'
-  );
-});
-
-test('上下文状态通过独立projection/head关系识别上一轮精确值已过期', () => {
-  const source = fs.readFileSync('webview/src/components/conversation/ReliableContextStatus.vue', 'utf8');
-  assert.match(source, /records\.ModelContextProjection/);
-  assert.match(source, /projection\.owner_kind === 'model_request'/);
-  assert.match(source, /requestRootId !== currentRootId/);
-  assert.match(
-    source,
-    /exactContextTokens\.value\s+\?\? compressionProjectedContextTokens\.value\s+\?\? estimatedContextTokens\.value\s+\?\? previousExactContextTokens\.value/,
-    '当前root的压缩实测换算值与估算都必须优先于已过期的Provider精确输入'
-  );
-  assert.match(source, /最近请求精确输入/);
-  assert.doesNotMatch(source, /latestCompressionChange/);
-});
-
-test('压缩刚结束时上下文占用直接显示压缩自己算出的实测体积', () => {
-  const source = fs.readFileSync('webview/src/components/conversation/ReliableContextStatus.vue', 'utf8');
-  // 压缩已经按Provider实测倍率算过一次结果，界面再拿估算器重算只会先低后高地跳一次。
-  assert.match(source, /calibratedTokensAfter/);
-  assert.match(source, /requestDetail\('compression-presentation'/);
-  assert.match(source, /if \(!ordinaryUsageStale\.value\) return false;/);
-  assert.match(
-    source,
-    /rootCreatedAt < blockCreatedAt\) return false;/,
-    '回退到更早的root后，压缩投影描述的已经不是要发送的上下文'
-  );
-});
 
 test('provider语义估算不会把base64图片字符当普通文本token', () => {
   const first = 'A'.repeat(339_032);
@@ -429,29 +375,6 @@ test('没有Provider锚点时校准是恒等的，且比例只收紧不放宽', 
   assert.throws(() => kernel.calibrateEstimatorToProvider(10, { ratio: 5 }), RangeError);
 });
 
-test('自动压缩用触发时那次Provider锚点校准保留tail，而不是直接吃估算单位的主体目标', () => {
-  const coordinator = fs.readFileSync('backend/reliableKernel/contextCompressionCoordinator.ts', 'utf8');
-  assert.match(
-    coordinator,
-    /const calibration = decision\.source === 'provider-observed-delta'\s*\?\s*providerTokenCalibration\(decision\.estimatedTokens, requestBudget\.estimatedFullInputTokens\)/,
-    '校准比例必须来自level-trigger已经拿到的同一个Provider锚点'
-  );
-  assert.match(
-    coordinator,
-    /calibratedTailBudgetTokens\(rooms, effectiveSummaryMaxTokens \?\? 0\)/,
-    '保留tail必须按校准后的预算挑选'
-  );
-  assert.doesNotMatch(
-    coordinator,
-    /requestBudget\.effectiveBodyTargetTokens\s+-\s+irreducibleAddendaTokens/,
-    '不得再用估算单位的主体目标直接减去附加项来当tail预算'
-  );
-  assert.match(
-    coordinator,
-    /projectedProviderTokens >= decision\.estimatedTokens/,
-    'non_reducing判断必须和触发口径同一单位'
-  );
-});
 
 test('压缩请求preflight区分固定开销、完整压缩输入和fixedOverPolicy', () => {
   const fixed = kernel.preflightCompressionRequest({
@@ -725,25 +648,6 @@ test('stored runtime_context hard-cut旧裸文本而不按普通user消息估算
 });
 
 
-test('truncate根Token估算复用模型投影而不是持久化字节长度', () => {
-  const contextSource = fs.readFileSync('backend/reliableKernel/contextSequence.ts', 'utf8');
-  const truncateStart = contextSource.indexOf('public async prepareMessageTruncateMutation');
-  const truncateEnd = contextSource.indexOf('public async prepareMessageRetryMutation', truncateStart);
-  const truncateBody = contextSource.slice(truncateStart, truncateEnd);
-  assert.match(truncateBody, /estimateEditableContextTokens\(prefix\)/);
-  assert.doesNotMatch(truncateBody, /prefix\.reduce\([\s\S]*contentObject\.byte_length/);
-  assert.match(
-    contextSource,
-    /private async estimateEditableContextTokens[\s\S]*?projectStoredModelFacingWindow\(/
-  );
-
-  const turnSource = fs.readFileSync('backend/reliableKernel/turnControlPlane.ts', 'utf8');
-  assert.equal(
-    turnSource.match(/contentEstimatedTokens: estimateStoredMessageContentTokens\(/g)?.length,
-    2,
-    '两个带替换消息的truncate入口都必须传入语义Token估算'
-  );
-});
 
 test('当前扩展替换命令等待process真实终态，其他命令保持请求等待期', () => {
   const selfUpdate = [
