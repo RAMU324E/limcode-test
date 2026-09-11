@@ -1372,6 +1372,112 @@ test('单引号here-string管给解释器时内容完全字面，不需要转义
   }
 });
 
+test('Windows包装器支持超过命令行上限的Unicode内联脚本并保留退出码', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: [
+      "@'",
+      `// ${'长脚本'.repeat(8192)}`,
+      'console.log("long-inline 中文 😀");',
+      'process.exit(7);',
+      "'@ | node -"
+    ].join('\n'),
+    timeoutMs: 15_000,
+    suffix: 'long_inline'
+  });
+  try {
+    assert.equal(result.bootstrap.phase, 'identity_ready');
+    assert.equal(result.output.trim(), 'long-inline 中文 😀');
+    assert.equal(result.receipt.exitCode, '7');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows PowerShell 5.1文件执行保留长脚本Unicode和括号原生退出码', windowsOnly, async () => {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !['path', 'programfiles', 'programw6432', 'programfiles(x86)'].includes(key.toLowerCase())
+  ));
+  env.PATH = (process.env.PATH ?? process.env.Path ?? '').split(path.delimiter)
+    .filter((directory) => !existsSync(path.join(directory.trim().replace(/^"(.*)"$/, '$1'), 'pwsh.exe')))
+    .join(path.delimiter);
+  const result = await runPlatformWrapper({
+    command: [
+      `# ${'长脚本'.repeat(8192)}`,
+      '[Console]::Out.Write("$($PSVersionTable.PSEdition) 中文 😀")',
+      '(cmd /c exit 7)'
+    ].join('\n'),
+    env,
+    timeoutMs: 15_000,
+    suffix: 'desktop_long_unicode'
+  });
+  try {
+    assert.equal(result.output, 'Desktop 中文 😀');
+    assert.equal(result.receipt.exitCode, '7');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows包装器为子进程统一设置Python标准流UTF8编码', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: "node -p 'process.env.PYTHONIOENCODING'",
+    env: { ...process.env, PYTHONIOENCODING: 'ascii' },
+    timeoutMs: 15_000,
+    suffix: 'python_encoding'
+  });
+  try {
+    assert.equal(result.output.trim(), 'utf-8');
+    assert.equal(result.receipt.exitCode, '0');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('Windows包装器的Python内联脚本保留中文emoji与退出码', windowsOnly, async (context) => {
+  const python = childProcess.spawnSync('python', ['--version'], {
+    stdio: 'ignore', windowsHide: true, timeout: 5_000
+  });
+  if (python.error || python.status !== 0) {
+    context.skip('This end-to-end check requires Python on PATH.');
+    return;
+  }
+  const result = await runPlatformWrapper({
+    command: [
+      "@'",
+      'import sys',
+      'print(sys.stdout.encoding)',
+      'print("中文测试 😀")',
+      'sys.exit(7)',
+      "'@ | python -"
+    ].join('\n'),
+    env: { ...process.env, PYTHONIOENCODING: 'ascii' },
+    timeoutMs: 15_000,
+    suffix: 'python_unicode'
+  });
+  try {
+    assert.match(result.output, /^utf-8\r?\n中文测试 😀\r?\n$/);
+    assert.equal(result.receipt.exitCode, '7');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell 7括号内已恢复的链式命令不会被5.1修正误报失败', {
+  skip: process.platform !== 'win32' || windowsPowerShell.resolveWindowsPowerShell().edition !== 'core'
+}, async () => {
+  const result = await runPlatformWrapper({
+    command: "(Get-Item -LiteralPath './limcode-missing-item' -ErrorAction SilentlyContinue || Write-Output 'recovered')",
+    timeoutMs: 15_000,
+    suffix: 'parenthesized_recovery'
+  });
+  try {
+    assert.equal(result.output.trim(), 'recovered');
+    assert.equal(result.receipt.exitCode, '0');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
 test('concurrent Windows cold starts all publish durable bootstrap and identity evidence', windowsOnly, async () => {
   const results = await Promise.all(Array.from({ length: 6 }, (_, index) => runPlatformWrapper({
     command: `Write-Output 'cold-${index}'`,
@@ -1489,7 +1595,7 @@ test('host consumes durable pre-identity failure instead of waiting for outcome_
   }
 });
 
-async function runPlatformWrapper({ command, timeoutMs, suffix = 'test' }) {
+async function runPlatformWrapper({ command, timeoutMs, suffix = 'test', env }) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-wrapper-${process.platform}-`));
   const spoolLocator = `process_${process.platform}_${suffix}`;
   const spoolPath = path.join(parent, spoolLocator);
@@ -1510,7 +1616,8 @@ async function runPlatformWrapper({ command, timeoutMs, suffix = 'test' }) {
   };
   const launchPath = path.join(spoolPath, 'launch.json');
   await fs.writeFile(launchPath, `${JSON.stringify(request, null, 2)}\n`);
-  const run = await runWrapperProcess(launchPath, 15_000);
+  const run = await runWrapperProcess(launchPath, 15_000, env);
+  assert.equal(run.status, 0, run.stderr);
 
   const bootstrap = processProtocol.parseWrapperBootstrapReceipt(JSON.parse(
     await fs.readFile(path.join(spoolPath, processProtocol.PROCESS_WRAPPER_BOOTSTRAP_FILE), 'utf8')
@@ -1524,12 +1631,12 @@ async function runPlatformWrapper({ command, timeoutMs, suffix = 'test' }) {
   return { parent, spoolPath, run, bootstrap, identity, manifest, receipt, output };
 }
 
-function runWrapperProcess(launchPath, timeoutMs) {
+function runWrapperProcess(launchPath, timeoutMs, env) {
   return new Promise((resolve, reject) => {
     const child = childProcess.spawn(process.execPath, [
       path.join(distRoot, 'backend/reliableKernel/processWrapper.js'),
       launchPath
-    ], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    ], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });

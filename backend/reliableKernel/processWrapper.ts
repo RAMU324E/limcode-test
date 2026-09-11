@@ -706,9 +706,10 @@ function spawnWindowsPowerShellCommand(
   request: ProcessWrapperLaunchRequest,
   spoolPath: string
 ): ReturnType<typeof spawn> {
+  const powerShell = resolveWindowsPowerShell();
+  const needsDesktopStatusFix = powerShell.edition === 'desktop';
   const gatePath = path.join(spoolPath, PROCESS_WRAPPER_BOOTSTRAP_GATE_FILE);
   const quotedGatePath = `'${gatePath.split("'").join("''")}'`;
-  const commandTextBase64 = Buffer.from(request.command, 'utf8').toString('base64');
   const prelude = [
     `$ProgressPreference = 'SilentlyContinue'`,
     `$gatePath = ${quotedGatePath}`,
@@ -720,27 +721,30 @@ function spawnWindowsPowerShellCommand(
     // this the escape sequences become noise in the output the model reads. Native command output is
     // written through untouched, so a tool that emits its own colour keeps it.
     `if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }`,
-    `$limcodeCommandText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${commandTextBase64}'))`,
-    `$limcodeTokens = $null; $limcodeParseErrors = $null`,
-    `$limcodeCommandAst = [System.Management.Automation.Language.Parser]::ParseInput($limcodeCommandText, [ref]$limcodeTokens, [ref]$limcodeParseErrors)`,
-    // The 5.1 fallback resets $? to true for a parenthesized expression; PowerShell 7 does not, and the
-    // same detection is inert there. Detect only that exact syntax shape; a recursive lexical
-    // "last command" would misclassify unexecuted branches.
-    `$limcodeLastStatement = @($limcodeCommandAst.EndBlock.Statements)[-1]`,
-    `$limcodeLastPipelineElement = if ($limcodeLastStatement -is [System.Management.Automation.Language.PipelineAst] -and $limcodeLastStatement.PipelineElements.Count -eq 1) { $limcodeLastStatement.PipelineElements[0] } else { $null }`,
-    `$limcodeParenExpression = if ($limcodeLastPipelineElement -is [System.Management.Automation.Language.CommandExpressionAst] -and $limcodeLastPipelineElement.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) { $limcodeLastPipelineElement.Expression } else { $null }`,
-    `$limcodeParenPipelineElements = if ($null -ne $limcodeParenExpression) { @($limcodeParenExpression.Pipeline.PipelineElements) } else { @() }`,
-    `$limcodeParenCommandName = if ($limcodeParenPipelineElements.Count -eq 1 -and $limcodeParenPipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) { $limcodeParenPipelineElements[0].GetCommandName() } else { $null }`,
-    `$limcodeErrorCount = $Error.Count; $LASTEXITCODE = $null`
+    ...(needsDesktopStatusFix ? [
+      `$limcodeCommandText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${Buffer.from(request.command, 'utf8').toString('base64')}'))`,
+      `$limcodeTokens = $null; $limcodeParseErrors = $null`,
+      `$limcodeCommandAst = [System.Management.Automation.Language.Parser]::ParseInput($limcodeCommandText, [ref]$limcodeTokens, [ref]$limcodeParseErrors)`,
+      `$limcodeLastStatement = @($limcodeCommandAst.EndBlock.Statements)[-1]`,
+      `$limcodeLastPipelineElement = if ($limcodeLastStatement -is [System.Management.Automation.Language.PipelineAst] -and $limcodeLastStatement.PipelineElements.Count -eq 1) { $limcodeLastStatement.PipelineElements[0] } else { $null }`,
+      `$limcodeParenExpression = if ($limcodeLastPipelineElement -is [System.Management.Automation.Language.CommandExpressionAst] -and $limcodeLastPipelineElement.Expression -is [System.Management.Automation.Language.ParenExpressionAst]) { $limcodeLastPipelineElement.Expression } else { $null }`,
+      `$limcodeParenPipelineElements = if ($null -ne $limcodeParenExpression) { @($limcodeParenExpression.Pipeline.PipelineElements) } else { @() }`,
+      `$limcodeParenCommandName = if ($limcodeParenPipelineElements.Count -eq 1 -and $limcodeParenPipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) { $limcodeParenPipelineElements[0].GetCommandName() } else { $null }`,
+      `$limcodeErrorCount = $Error.Count`
+    ] : []),
+    `$LASTEXITCODE = $null`
   ].join('; ');
   const epilogue = [
-    `$limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE; $limcodeCommandAddedError = $Error.Count -gt $limcodeErrorCount`,
-    // Resolve the direct parenthesized command after execution so script-defined functions and aliases win.
-    `$limcodeParenCommandInfo = if ($null -ne $limcodeParenCommandName) { Get-Command -Name $limcodeParenCommandName -ErrorAction SilentlyContinue } else { $null }`,
-    `$limcodeParenthesizedNativeCommand = $null -ne $limcodeParenCommandInfo -and ($limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Application -or $limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::ExternalScript)`,
+    `$limcodeCommandSucceeded = $?; $limcodeNativeExitCode = $LASTEXITCODE`,
     `if (-not $limcodeCommandSucceeded) { if ($null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }; exit 1 }`,
-    `if ($limcodeParenthesizedNativeCommand -and $null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }`,
-    `if ($null -ne $limcodeParenExpression -and $limcodeCommandAddedError) { exit 1 }`,
+    ...(needsDesktopStatusFix ? [
+      `$limcodeCommandAddedError = $Error.Count -gt $limcodeErrorCount`,
+      // Resolve the direct parenthesized command after execution so script-defined functions and aliases win.
+      `$limcodeParenCommandInfo = if ($null -ne $limcodeParenCommandName) { Get-Command -Name $limcodeParenCommandName -ErrorAction SilentlyContinue } else { $null }`,
+      `$limcodeParenthesizedNativeCommand = $null -ne $limcodeParenCommandInfo -and ($limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Application -or $limcodeParenCommandInfo.CommandType -eq [System.Management.Automation.CommandTypes]::ExternalScript)`,
+      `if ($limcodeParenthesizedNativeCommand -and $null -ne $limcodeNativeExitCode -and $limcodeNativeExitCode -ne 0) { exit $limcodeNativeExitCode }`,
+      `if ($null -ne $limcodeParenExpression -and $limcodeCommandAddedError) { exit 1 }`
+    ] : []),
     `exit 0`
   ].join('; ');
   // Semicolons would put the whole script on one line, so a trailing `#` comment in the command would
@@ -748,8 +752,9 @@ function spawnWindowsPowerShellCommand(
   // the prelude. Newlines fix both; the prelude stays a single line so the reported line number is
   // always the command's own line plus one.
   const script = `${prelude}\n${request.command}\n${epilogue}`;
-  const encoded = Buffer.from(script, 'utf16le').toString('base64');
-  return spawn(resolveWindowsPowerShell().executable, [
+  const scriptPath = path.join(spoolPath, 'command.ps1');
+  fs.writeFileSync(scriptPath, `\uFEFF${script}`, 'utf8');
+  return spawn(powerShell.executable, [
     '-NoLogo',
     '-NoProfile',
     '-NonInteractive',
@@ -757,15 +762,15 @@ function spawnWindowsPowerShellCommand(
     'Bypass',
     '-OutputFormat',
     'Text',
-    '-EncodedCommand',
-    encoded
+    '-File',
+    scriptPath
   ], {
     cwd: request.cwd,
     // A parse error aborts the whole script before any statement runs, so the in-script $PSStyle
     // settings cannot reach it. TERM is read at startup instead, which suppresses PowerShell's own
     // colouring even then, and also the trailing reset that $PSStyle.Reset is too read-only to drop.
     // Output a native command colours itself is untouched, and Windows PowerShell 5.1 ignores this.
-    env: { ...process.env, TERM: 'dumb' },
+    env: { ...process.env, TERM: 'dumb', PYTHONIOENCODING: 'utf-8' },
     // The Wrapper process itself is detached. A second detached PowerShell with piped output exits
     // before the bootstrap gate on Windows, so it remains attached to the durable Wrapper.
     detached: false,
