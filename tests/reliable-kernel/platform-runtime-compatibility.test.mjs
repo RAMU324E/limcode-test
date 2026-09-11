@@ -1352,6 +1352,26 @@ test('命令末尾的行注释不会吞掉退出码判定', windowsOnly, async (
   }
 });
 
+test('单引号here-string管给解释器时内容完全字面，不需要转义', windowsOnly, async () => {
+  // 工具描述推荐用这条路径代替先落盘：双引号、反斜杠、反引号、${x} 都应原样到达 node，退出码也照常回传。
+  const result = await runPlatformWrapper({
+    command: [
+      "@'",
+      'console.log("q\\"q b\\\\b `t ${x} 中文");',
+      'process.exit(3);',
+      "'@ | node -"
+    ].join('\n'),
+    timeoutMs: 15_000,
+    suffix: 'herestring'
+  });
+  try {
+    assert.match(result.output, /q"q b\\b `t \$\{x\} 中文/);
+    assert.equal(result.receipt.exitCode, '3');
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
 test('concurrent Windows cold starts all publish durable bootstrap and identity evidence', windowsOnly, async () => {
   const results = await Promise.all(Array.from({ length: 6 }, (_, index) => runPlatformWrapper({
     command: `Write-Output 'cold-${index}'`,
