@@ -98,6 +98,7 @@ test('已经开始的手动压缩查询结果不重新等待设置页面', async
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({
     debugCapture: { setListener() {} }, toolHost: { setStateChangeListener() {} },
+    application: { database: { conversationOwners: passthroughConversationOwners() } },
     conversations: { async inspectManualCompression() { return { turnId: 'maintenance', inProgress: true }; } }
   });
   router.requireRow = async () => ({ id: 'conversation' });

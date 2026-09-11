@@ -77,6 +77,7 @@ docs/architecture/*
 !/tests/reliable-kernel/interaction-auto-approval.test.mjs
 !/tests/reliable-kernel/reliable-queue-ordering.test.mjs
 !/tests/reliable-kernel/webview-feed-lifecycle.test.mjs
+!/tests/reliable-kernel/panel-owner-lifecycle.test.mjs
 !/tests/reliable-kernel/provider-websocket-policy.test.mjs
 !/tests/reliable-kernel/provider-semantic-watchdog.test.mjs
 !/tests/reliable-kernel/child-agent-status-controls.test.cjs

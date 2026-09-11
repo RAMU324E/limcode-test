@@ -89,6 +89,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/native-request-orchestration.test.mjs',
   'tests/reliable-kernel/llm-provider-configs-native.test.mjs',
   'tests/reliable-kernel/phase-b-foundation.test.mjs',
+  'tests/reliable-kernel/panel-owner-lifecycle.test.mjs',
   'tests/reliable-kernel/plan-interrupt-recovery.test.mjs',
   'tests/reliable-kernel/product-composition.test.mjs',
   'tests/reliable-kernel/proxy-environment.test.mjs',

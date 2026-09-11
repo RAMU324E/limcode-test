@@ -149,7 +149,12 @@ export class MainPanel {
         await backendApp.releaseConversation(conversationId, referenceId);
         return;
       }
-      MainPanel.revive(webviewPanel, extensionUri, backendApp, options, referenceId);
+      try {
+        MainPanel.revive(webviewPanel, extensionUri, backendApp, options, referenceId);
+      } catch (error) {
+        await backendApp.releaseConversation(conversationId, referenceId);
+        throw error;
+      }
       if (options.conversationId) {
         MainPanel.scheduleRestoredTitleRefresh(backendApp, options.conversationId);
       }
@@ -294,9 +299,10 @@ export class MainPanel {
       return;
     }
     const referenceId = createMessageId();
+    let panel: vscode.WebviewPanel | undefined;
     try {
       await backendApp.retainConversation(conversationId, referenceId);
-      const panel = vscode.window.createWebviewPanel(
+      panel = vscode.window.createWebviewPanel(
         MainPanel.viewType,
         panelTitle(options, backendApp),
         column,
@@ -304,6 +310,7 @@ export class MainPanel {
       );
       MainPanel.revive(panel, extensionUri, backendApp, options, referenceId);
     } catch (error) {
+      panel?.dispose();
       await backendApp.releaseConversation(conversationId, referenceId);
       void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: ${MainPanel.conversationOpenFailureMessage(error)}`);
     }
@@ -386,11 +393,15 @@ export class MainPanel {
     this.refreshTitle(options.title);
     this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri, this.kind);
     this.clientId = this.backendApp.attachWebview(panel.webview, this.panelWebviewMeta());
-    this.backendApp.setWebviewVisible(this.clientId, panel.visible);
-
-    this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri, {
-      enableLocalFileResources: supportsLocalFileResources(this.kind)
-    });
+    try {
+      this.backendApp.setWebviewVisible(this.clientId, panel.visible);
+      this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri, {
+        enableLocalFileResources: supportsLocalFileResources(this.kind)
+      });
+    } catch (error) {
+      this.backendApp.detachWebview(this.clientId);
+      throw error;
+    }
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.onDidChangeViewState(() => {
