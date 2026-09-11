@@ -27,6 +27,8 @@ const PS_UTF8_PREFIX = [
   '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
   '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
   "$PSDefaultParameterValues['*:Encoding'] = 'utf8'",
+  // PowerShell 7 colours its own formatting and error views; the 5.1 fallback never did.
+  "if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }",
   ''
 ].join('; ');
 

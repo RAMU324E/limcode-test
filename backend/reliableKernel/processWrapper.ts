@@ -716,6 +716,10 @@ function spawnWindowsPowerShellCommand(
     `Remove-Item -LiteralPath $gatePath -Force -ErrorAction SilentlyContinue`,
     `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
     `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    // PowerShell 7 colours its own formatting and error views; the 5.1 fallback never did, so without
+    // this the escape sequences become noise in the output the model reads. Native command output is
+    // written through untouched, so a tool that emits its own colour keeps it.
+    `if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText'; $PSStyle.Formatting.Error = ''; $PSStyle.Formatting.ErrorAccent = ''; $PSStyle.Formatting.Warning = ''; $PSStyle.Formatting.Verbose = ''; $PSStyle.Formatting.Debug = '' }`,
     `$limcodeCommandText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${commandTextBase64}'))`,
     `$limcodeTokens = $null; $limcodeParseErrors = $null`,
     `$limcodeCommandAst = [System.Management.Automation.Language.Parser]::ParseInput($limcodeCommandText, [ref]$limcodeTokens, [ref]$limcodeParseErrors)`,

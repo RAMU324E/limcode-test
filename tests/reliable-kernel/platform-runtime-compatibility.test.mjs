@@ -1306,6 +1306,22 @@ test('PowerShell 7下管道链式操作符可直接透传给包装器', { skip: 
   }
 });
 
+test('PowerShell 7的错误与表格输出不再夹带自身的ANSI着色', windowsOnly, async () => {
+  const result = await runPlatformWrapper({
+    command: "Get-ChildItem -LiteralPath '.' | Format-Table Name; Get-Content -LiteralPath 'C:\limcode-does-not-exist\a.txt'",
+    timeoutMs: 15_000,
+    suffix: 'ansi'
+  });
+  try {
+    // PowerShell 自身的着色会整段包裹错误视图和表头；只允许错误记录结尾那个无法关闭的复位序列。
+    const escapes = result.output.match(/\[[0-9;]*m/g) ?? [];
+    assert.deepEqual(new Set(escapes), new Set(escapes.length > 0 ? ['[0m'] : []));
+    assert.match(result.output, /limcode-does-not-exist/);
+  } finally {
+    await fs.rm(result.parent, { recursive: true, force: true });
+  }
+});
+
 test('concurrent Windows cold starts all publish durable bootstrap and identity evidence', windowsOnly, async () => {
   const results = await Promise.all(Array.from({ length: 6 }, (_, index) => runPlatformWrapper({
     command: `Write-Output 'cold-${index}'`,
