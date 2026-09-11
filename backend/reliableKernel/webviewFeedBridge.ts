@@ -707,6 +707,19 @@ export class ReliableKernelWebviewFeedBridge {
     }
   }
 
+  /**
+   * Posts a configuration-channel message only to panels currently bound to the given Conversation.
+   * The attach/navigation metadata is the single Conversation-binding authority; global broadcasts
+   * keep flowing through the facade and never enter this path.
+   */
+  public postToConversation(conversationId: string, message: Record<string, unknown>): void {
+    if (this.closed) return;
+    for (const client of this.clients.values()) {
+      if (client.closed || client.meta.conversationId !== conversationId) continue;
+      this.post(client, message);
+    }
+  }
+
   private flushTransientQueue(client: FeedClient): void {
     if (client.transientFlushTimer !== undefined) {
       clearTimeout(client.transientFlushTimer);

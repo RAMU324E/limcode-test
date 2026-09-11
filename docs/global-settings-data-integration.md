@@ -12,9 +12,9 @@
 
 配置入口属于哪一级设置页：
 
-- `global`：全局设置页，使用 `GLOBAL_SETTINGS_SECTIONS` + `GlobalSettingsBridge` + `settings.global.get/update/snapshot`。
+- `global`：全局设置页，使用 `GLOBAL_SETTINGS_SECTIONS` + `VscodeReliableKernelCommandRouter` + `settings.global.get/update/snapshot`。
 - `conversation`：对话设置页，使用 conversation settings 的 section 与 bridge。
-- `agent`：后续如有 Agent 设置页，再按 agent settings scope 扩展。
+- `agent`：Agent 设置页使用独立 Agent 配置与对应 scope links，不把对话数据嵌入 Agent。
 
 如果配置入口在全局设置页，就应优先作为 GlobalSettings 的 section，而不是新增独立消息类型。
 
@@ -91,13 +91,9 @@ llmProviderConfigs:
 <dataRoot>/settings/llm-provider-configs/records/*.json
 ```
 
-运行时读取：
+运行时由 `VscodeConfigurationAuthority` 从当前配置根读取记录，再依据模型配置与 scope links 解析本次执行使用的连接参数。LLM capability 只接收解析后的配置，不直接读取 Webview state 或旧 storage facade。
 
-```ts
-storage.loadActiveLlmProviderConfig()
-```
-
-这样 LLM capability 只拿当前激活的模型连接配置；未来 Agent / Workflow / 其他对象如需复用某个渠道，应通过独立 Link/关系数据引用配置 id，不要把渠道配置嵌进 Agent 或 Conversation。
+Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配置及作用域关系引用配置 id，不把渠道配置对象嵌入主体。
 
 ### 4.1 Astra 原生 Responses 配置
 
@@ -117,6 +113,7 @@ storage.loadActiveLlmProviderConfig()
 4. 下拉内容可能溢出时必须复用 `webview/src/components/navigation/AdvancedScrollbar.vue`；SettingsDropdown 已内置 `variant="minimal"` 基础滑块样式，并支持 `maxHeight` / `height`。
 5. 删除/危险确认必须复用 `webview/src/components/ui/ConfirmPanel.vue`。
 6. 需要输入名称/重命名时优先复用 `webview/src/components/ui/InputPanel.vue`。
+7. 全局设置快照可以广播；对话设置只同步给同一 `conversationId` 的面板。前端作用域由当前导航目标确定，外来或迟到快照不能改写该作用域，保存和各策略编辑器也不能从未校验的 incoming payload 选择目标对话。
 
 ## 6. 后端对接检查清单
 

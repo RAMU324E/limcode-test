@@ -22,9 +22,12 @@ export const useConversationSettingsStore = defineStore('conversationSettings', 
   }),
   actions: {
     request(conversationId: string): void {
-      if (!conversationId) return;
       // 进入对话时先占位 conversationId，避免快照未到时保存按钮不可用。
       if (this.common.conversationId !== conversationId) this.common = emptyCommon(conversationId);
+      if (!conversationId) {
+        this.status = '';
+        return;
+      }
       this.status = '正在读取对话设置...';
       bridge.request(BridgeMessageType.ConversationSettingsGet, { conversationId, section: 'common' });
     },
@@ -37,10 +40,18 @@ export const useConversationSettingsStore = defineStore('conversationSettings', 
       });
     },
     applySnapshot(payload: ConversationSettingsSnapshotPayload): void {
-      if (payload.section === 'common') {
-        this.common = payload.settings as ConversationSettingsRecord;
-      }
+      const conversationId = this.common.conversationId;
+      const settings = payload.settings as ConversationSettingsRecord;
+      // 导航决定作用域；快照自身的两处会话身份必须一致，不能用错位正文覆盖当前表单。
+      if (!conversationId || payload.conversationId !== conversationId
+        || settings?.conversationId !== conversationId || payload.section !== 'common') return;
+      this.common = { conversationId, name: settings.name };
       this.status = '对话设置已同步';
+    },
+    applyError(error: { message: string; conversationId?: string }): void {
+      // 迟到错误只影响仍绑定该会话的视图。
+      if (!this.common.conversationId || error.conversationId !== this.common.conversationId) return;
+      this.status = error.message;
     }
   }
 });

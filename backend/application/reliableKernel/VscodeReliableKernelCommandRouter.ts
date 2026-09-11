@@ -49,6 +49,8 @@ import { GlobalSettingsSaveBarrier } from './GlobalSettingsSaveBarrier';
 
 export interface VscodeReliableKernelCommandRouterOptions {
   broadcast?(message: unknown): void;
+  /** Delivers a Conversation-scoped message only to panels currently bound to that Conversation. */
+  postToConversation?(conversationId: string, message: unknown): void;
   createConversation?(options: { projectFolderUri?: string }): Promise<string>;
   forkConversation?(request: ConversationForkPayload): Promise<{
     conversationId: string;
@@ -125,6 +127,18 @@ export class VscodeReliableKernelCommandRouter {
         // The Webview tracks loading/failure independently per section. Preserve that scope on generic
         // read/write failures so one invalid settings store does not leave the whole channel page pending.
         this.postRequestError(webview, message.type, text, message.id, { section: message.payload.section });
+      } else if (
+        message.type === BridgeMessageType.ConversationSettingsGet
+        || message.type === BridgeMessageType.ConversationSettingsUpdate
+      ) {
+        const conversationId = message.type === BridgeMessageType.ConversationSettingsGet
+          ? message.payload?.conversationId
+          : message.payload?.settings?.conversationId;
+        this.postRequestError(webview, message.type, text, message.id, {
+          ...(typeof conversationId === 'string' && conversationId.trim()
+            ? { conversationId: conversationId.trim() }
+            : {})
+        });
       } else if (isGuidanceControlType(message.type)) {
         const payload = message.payload as
           | GuidanceEditPayload
@@ -799,7 +813,10 @@ export class VscodeReliableKernelCommandRouter {
     });
     const stored = await this.readConversationSettings(conversationId, payload.section);
     if (!stored) throw new Error(`Conversation ${conversationId} 不存在。`);
-    this.broadcastOrPost(webview, this.conversationSettingsSnapshot(stored, correlationId));
+    const snapshot = this.conversationSettingsSnapshot(stored, correlationId);
+    // 会话设置只同步当前绑定该会话的面板；缺少定向通道时只回请求方，绝不退化为全局广播。
+    if (this.options.postToConversation) this.options.postToConversation(conversationId, snapshot);
+    else this.post(webview, snapshot);
   }
 
   private async readConversationSettings(
@@ -1994,7 +2011,11 @@ export class VscodeReliableKernelCommandRouter {
       id: randomUUID(),
       type: BridgeMessageType.Error,
       channel: 'diagnostics',
-      ...(section ? { scope: { kind: 'settings' as const, level: 'global' as const, id: section } } : {}),
+      ...(section
+        ? { scope: { kind: 'settings' as const, level: 'global' as const, id: section } }
+        : details.conversationId
+          ? { scope: { kind: 'settings' as const, level: 'conversation' as const, id: details.conversationId } }
+          : {}),
       correlationId,
       payload: { requestType, message, ...payloadDetails }
     });

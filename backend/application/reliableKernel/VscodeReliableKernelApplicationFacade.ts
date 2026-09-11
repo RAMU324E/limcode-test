@@ -120,6 +120,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     });
     this.commandRouter = new VscodeReliableKernelCommandRouter(product, {
       broadcast: (message) => this.broadcast(message),
+      postToConversation: (conversationId, message) =>
+        this.product.application.webviewFeed.postToConversation(conversationId, message as Record<string, unknown>),
       createConversation: (options) => this.createConversation(options),
       forkConversation: (request) => this.forkConversation(request),
       conversationIdForClient: (clientId) => this.webviewConversationIds.get(clientId)

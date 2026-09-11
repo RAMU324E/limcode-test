@@ -105,6 +105,16 @@ export function useBridgeBootstrap(): void {
         agents.rejectPending(message.correlationId, payload.message);
       }
       if (
+        payload.requestType === BridgeMessageType.ConversationSettingsGet
+        || payload.requestType === BridgeMessageType.ConversationSettingsUpdate
+      ) {
+        const scope = message.scope;
+        conversationSettings.applyError({
+          message: payload.message,
+          conversationId: scope?.kind === 'settings' && scope.level === 'conversation' ? scope.id : undefined
+        });
+      }
+      if (
         payload.requestType === BridgeMessageType.GlobalSettingsGet
         || payload.requestType === BridgeMessageType.GlobalSettingsUpdate
         || payload.requestType === BridgeMessageType.LlmProviderModelsGet
@@ -135,9 +145,12 @@ export function useBridgeBootstrap(): void {
 
   disposers.push(
     watch(
-      () => clientState.currentConversationId,
-      (conversationId) => {
-        if ((session.viewKind !== 'chat' && session.viewKind !== 'planDetail') || !conversationId) return;
+      [() => clientState.currentConversationId, () => session.viewKind],
+      ([conversationId, viewKind]) => {
+        if ((viewKind !== 'chat' && viewKind !== 'planDetail') || !conversationId) {
+          conversationSettings.request('');
+          return;
+        }
         // Hello already carries the Feed's scoped Conversation. Reopening that same id would create
         // a second startup generation; only an actual in-panel navigation needs ConversationOpen.
         if (conversationId !== session.conversationId) {

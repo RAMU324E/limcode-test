@@ -25,6 +25,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/canonical-base64.test.mjs',
   'tests/reliable-kernel/command-router-interaction.test.mjs',
   'tests/reliable-kernel/conversation-runtime-ownership.test.mjs',
+  'tests/reliable-kernel/conversation-settings-isolation.test.mjs',
   'tests/reliable-kernel/child-agent-status-controls.test.cjs',
   'tests/reliable-kernel/client-feed-window-rollover.test.mjs',
   'tests/reliable-kernel/conversation-deletion-recovery.test.mjs',
