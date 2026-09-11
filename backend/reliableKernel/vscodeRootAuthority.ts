@@ -2,8 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { createVscodeStoragePaths } from '../capabilities/vscodeStorage/paths';
-import { ROOT_BINDING_POINTER_FILE } from './contracts';
+import { ROOT_BINDING_POINTER_FILE, createRuntimeRootPaths } from './contracts';
 import { RootAuthority } from './rootAuthority';
+import { assertRuntimeHostsOffline } from './runtimeHostControl';
 
 type VscodeStoragePaths = ReturnType<typeof createVscodeStoragePaths>;
 
@@ -11,7 +12,6 @@ export const VSCODE_RUNTIME_CONTROL_DIRECTORY = '.limcode-runtime';
 export const VSCODE_RUNTIME_ACTIVE_DIRECTORY = 'active';
 export const VSCODE_WORKSPACE_RUNTIMES_DIRECTORY = '.limcode-workspace-runtimes';
 export const VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY = 'scopes';
-export const VSCODE_WORKSPACE_RUNTIME_OWNER_DIRECTORY = 'runtime-owner';
 export const VSCODE_LEGACY_RUNTIME_OWNER_DIRECTORY = 'legacy-owner';
 export const VSCODE_LEGACY_RUNTIME_OWNER_FILE = 'owner.json';
 
@@ -127,15 +127,6 @@ export function resolveVscodeLegacyRuntimeOwnerPath(
   );
 }
 
-/** Stable pre-SQLite owner claim path shared by startup and diagnostics. */
-export function resolveVscodeWorkspaceRuntimeOwnerClaimPath(
-  placement: Pick<VscodeWorkspaceRuntimePlacement, 'runtimeScopeRootPath'>
-): string {
-  return path.join(
-    path.resolve(placement.runtimeScopeRootPath),
-    VSCODE_WORKSPACE_RUNTIME_OWNER_DIRECTORY
-  );
-}
 
 /**
  * Selects the workspace Runtime without moving or rewriting an existing fenced root. The first
@@ -166,10 +157,41 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
 
 /** Builds RootAuthority from the immutable placement captured for this Extension Host activation. */
 export function createVscodeRootAuthority(
-  placement: Pick<VscodeWorkspaceRuntimePlacement, 'runtimeDataRootPath'>
+  placement: Pick<VscodeWorkspaceRuntimePlacement, 'runtimeDataRootPath' | 'configurationRootPath'>
 ): RootAuthority {
   const runtimeDataRootPath = path.resolve(placement.runtimeDataRootPath);
-  return new RootAuthority(() => runtimeDataRootPath);
+  const configurationRootPath = path.resolve(placement.configurationRootPath);
+  return new RootAuthority(() => runtimeDataRootPath, undefined, () => configurationRootPath);
+}
+
+/**
+ * Offline assertion spanning every Runtime root contained in one configuration data root: the
+ * legacy root and each workspace scope root. The legacy physical cutover filters/deletes shared
+ * configuration records outside its own Runtime control tree, so checking only its own Host
+ * liveness is not enough. Call only while holding the configuration-root admission
+ * (RootAuthority.withRuntimeHostAdmission); the admission serializes the enumeration against new
+ * scope registration. A scoped (non-configuration) root simply enumerates itself.
+ */
+export async function assertConfigurationRootRuntimesOffline(
+  configurationRootPath: string,
+  exceptHostBootId?: string
+): Promise<void> {
+  const configurationRoot = path.resolve(configurationRootPath);
+  await assertRuntimeHostsOffline(
+    createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({ globalStoragePath: configurationRoot })),
+    exceptHostBootId
+  );
+  const scopesRoot = path.join(
+    configurationRoot,
+    VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
+    VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY
+  );
+  for (const scopeKey of await directoryEntryNames(scopesRoot)) {
+    await assertRuntimeHostsOffline(
+      createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({ globalStoragePath: path.join(scopesRoot, scopeKey) })),
+      exceptHostBootId
+    );
+  }
 }
 
 async function readLegacyRuntimeOwner(configurationRootPath: string): Promise<VscodeLegacyRuntimeOwner | undefined> {
@@ -257,6 +279,15 @@ function isText(value: unknown): value is string {
 
 function isWorkspaceRuntimeScopeKind(value: unknown): value is VscodeWorkspaceRuntimeScopeKind {
   return value === 'workspace-file' || value === 'folder' || value === 'folder-set' || value === 'empty';
+}
+
+async function directoryEntryNames(directoryPath: string): Promise<string[]> {
+  try {
+    return await fs.readdir(directoryPath);
+  } catch (error) {
+    if (isMissingPathError(error)) return [];
+    throw error;
+  }
 }
 
 function isMissingPathError(error: unknown): boolean {

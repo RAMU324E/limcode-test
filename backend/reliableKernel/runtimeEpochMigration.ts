@@ -20,6 +20,7 @@ import {
 } from './schema/domainManifest';
 import type { RuntimeDomainSchema } from './schema/types';
 import { migrateChildRuntimeDeliveryIntentLinks } from './runtimeDeliveryIntentLinkMigration';
+import { assertRuntimeHostsOffline, withRuntimeMaintenance } from './runtimeHostControl';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import { toSqliteFilePath } from './sqliteFilePath';
 import {
@@ -130,11 +131,27 @@ interface MigrationLock {
 }
 
 /**
+ * Read-only startup-gate preflight: true only when {@link migratePreviousRuntimeEpochIfRequired}
+ * would mutate (a durable migration journal exists or the historical pointer is the exact epoch-3
+ * predecessor). Pure current-epoch roots return false so multi-host attach stays offline-free.
+ */
+export async function previousRuntimeEpochMigrationRequired(authority: RootAuthority): Promise<boolean> {
+  const paths = authority.expectedPaths();
+  const controlRoot = path.dirname(paths.dataRootPath);
+  if (await readJournal(controlRoot)) return true;
+  const initialPointer = await authority.readHistoricalPointerForCutover();
+  return initialPointer?.runtimeKernelEpoch === PREVIOUS_RUNTIME_KERNEL_EPOCH;
+}
+
+/**
  * Upgrades only the exact epoch-3 SQLite/CAS contract immediately preceding epoch 4. The upgrade
  * runs before RuntimeDatabase opens, preserves Conversation/Message/Attachment rows and every
  * existing CAS object, creates the four relation tables, and converts only the exact legacy Child
  * Runtime continuation envelope into the current independent-Link representation. Unknown epochs
  * or schema drift are never guessed.
+ *
+ * The mutation holds the Runtime maintenance claim and requires every registered Host to be
+ * offline; the read-only "not required" branch performs neither.
  */
 export async function migratePreviousRuntimeEpochIfRequired(
   authority: RootAuthority,
@@ -151,7 +168,9 @@ export async function migratePreviousRuntimeEpochIfRequired(
     return undefined;
   }
 
-  return withMigrationLock(controlRoot, async () => {
+  return withRuntimeMaintenance(paths, async () => {
+    await assertRuntimeHostsOffline(paths);
+    return withMigrationLock(controlRoot, async () => {
     let journal = await readJournal(controlRoot);
     const previous = await authority.readHistoricalPointerForCutover();
     if (previous?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
@@ -253,6 +272,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
       backupDirectoryName: journal.backupDirectoryName,
       backupPath: backupRootPath(controlRoot, journal)
     };
+    });
   });
 }
 

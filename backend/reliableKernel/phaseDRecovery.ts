@@ -6,6 +6,7 @@ import {
 import { FileChangeControlPlane, type WorkEnvironmentBoundaryResolver } from './fileEffects';
 import { McpEffectDispatcher } from './mcpEffects';
 import { ProcessControlPlane } from './processEffects';
+import { ConversationOwnershipGate, type ConversationOwnershipAcquisition } from './conversationOwnershipGate';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -26,6 +27,22 @@ export interface PhaseDRecoveryResult {
   terminalToolCallIds: string[];
 }
 
+interface PhaseDScanContext {
+  conversationId?: string;
+  gate: ConversationOwnershipGate;
+}
+
+interface HangingEffectRecovery {
+  reconciled: boolean;
+  unknown: boolean;
+  terminalToolCallId?: string;
+}
+
+interface UnresolvedFileChangeRecovery {
+  reconciled: boolean;
+  terminalToolCallId?: string;
+}
+
 function isTerminalOperationOutcome(value: unknown): boolean {
   return ['succeeded', 'failed', 'partial', 'rejected', 'cancelled', 'conflict', 'outcome_unknown'].includes(String(value));
 }
@@ -44,7 +61,7 @@ function requireOperationOutcome(value: unknown): 'succeeded' | 'failed' | 'part
 
 /** Minimal registry: exactly the two Phase D-owned scans, not a general recovery rule engine. */
 export class PhaseDRecoveryScanner {
-  private readonly handlers: ReadonlyMap<PhaseDRecoveryId, (signal?: AbortSignal) => Promise<PhaseDRecoveryResult>>;
+  private readonly handlers: ReadonlyMap<PhaseDRecoveryId, (signal: AbortSignal | undefined, context: PhaseDScanContext) => Promise<PhaseDRecoveryResult>>;
   private readonly workEnvironmentTransfers: WorkEnvironmentTransferEffectDispatcher;
 
   public constructor(
@@ -57,9 +74,9 @@ export class PhaseDRecoveryScanner {
     private readonly turns: TurnControlPlane
   ) {
     this.workEnvironmentTransfers = new WorkEnvironmentTransferEffectDispatcher(database, effects);
-    this.handlers = new Map<PhaseDRecoveryId, (signal?: AbortSignal) => Promise<PhaseDRecoveryResult>>([
-      [PHASE_D_RECOVERY_EFFECT_INTENT_HANGING, (signal) => this.scanHangingEffects(signal)],
-      [PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED, (signal) => this.scanUnresolvedFileChanges(signal)]
+    this.handlers = new Map<PhaseDRecoveryId, (signal: AbortSignal | undefined, context: PhaseDScanContext) => Promise<PhaseDRecoveryResult>>([
+      [PHASE_D_RECOVERY_EFFECT_INTENT_HANGING, (signal, context) => this.scanHangingEffects(signal, context)],
+      [PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED, (signal, context) => this.scanUnresolvedFileChanges(signal, context)]
     ]);
   }
 
@@ -67,53 +84,113 @@ export class PhaseDRecoveryScanner {
     return [...this.handlers.keys()];
   }
 
-  public async run(id: PhaseDRecoveryId, signal?: AbortSignal): Promise<PhaseDRecoveryResult> {
+  public async run(id: PhaseDRecoveryId, signal?: AbortSignal, conversationId?: string): Promise<PhaseDRecoveryResult> {
+    signal?.throwIfAborted();
+    const gate = new ConversationOwnershipGate(this.database, 'claim');
+    try {
+      return await this.runWithGate(id, signal, conversationId, gate);
+    } finally {
+      await gate.releaseClaimed();
+    }
+  }
+
+  /**
+   * Runs every Phase D scan. With `conversationId` the scans only touch that Conversation's
+   * durable work; unscoped passes claim eligible unowned work and skip conversations another
+   * live or unknown owner holds, leaving their rows durable and retryable for the owning Host.
+   */
+  public async runAll(signal?: AbortSignal, conversationId?: string): Promise<PhaseDRecoveryResult[]> {
+    signal?.throwIfAborted();
+    const gate = new ConversationOwnershipGate(this.database, 'claim');
+    try {
+      // Close receipts already durable at the scan boundary before dispatched-effect recovery can
+      // classify them as missing. A second candidate read below closes receipts racing this pass.
+      await this.reconcileReceiptCandidates(signal, conversationId, gate);
+      const results = [
+        await this.runWithGate(PHASE_D_RECOVERY_EFFECT_INTENT_HANGING, signal, conversationId, gate),
+        await this.runWithGate(PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED, signal, conversationId, gate)
+      ];
+      await this.reconcileCommittedFactsWithGate(signal, conversationId, gate);
+      return results;
+    } finally {
+      await gate.releaseClaimed();
+    }
+  }
+
+  /**
+   * Deterministic DB-only continuation; it is not a registered recovery stable ID. The default
+   * acquisition is `owned` so recurring convergence never claims unrelated Conversations merely
+   * because an external commit arrived; explicit recovery passes `claim` through runAll.
+   */
+  public async reconcileCommittedFacts(
+    signal?: AbortSignal,
+    options: { conversationId?: string; acquisition?: ConversationOwnershipAcquisition } = {}
+  ): Promise<{
+    receipts: number;
+    toolResults: number;
+    failed: number;
+  }> {
+    const gate = new ConversationOwnershipGate(this.database, options.acquisition ?? 'owned');
+    try {
+      return await this.reconcileCommittedFactsWithGate(signal, options.conversationId, gate);
+    } finally {
+      await gate.releaseClaimed();
+    }
+  }
+
+  private async runWithGate(
+    id: PhaseDRecoveryId,
+    signal: AbortSignal | undefined,
+    conversationId: string | undefined,
+    gate: ConversationOwnershipGate
+  ): Promise<PhaseDRecoveryResult> {
     signal?.throwIfAborted();
     const handler = this.handlers.get(id);
     if (!handler) throw new Error(`Phase D does not own recovery scan ${String(id)}.`);
-    return handler(signal);
+    return handler(signal, { ...(conversationId === undefined ? {} : { conversationId }), gate });
   }
 
-  public async runAll(signal?: AbortSignal): Promise<PhaseDRecoveryResult[]> {
-    signal?.throwIfAborted();
-    // Close receipts already durable at the scan boundary before dispatched-effect recovery can
-    // classify them as missing. A second candidate read below closes receipts racing this pass.
-    await this.reconcileReceiptCandidates(signal);
-    const results = [
-      await this.run(PHASE_D_RECOVERY_EFFECT_INTENT_HANGING, signal),
-      await this.run(PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED, signal)
-    ];
-    await this.reconcileCommittedFacts(signal);
-    return results;
-  }
-
-  /** Deterministic DB-only continuation; it is not a registered recovery stable ID. */
-  public async reconcileCommittedFacts(signal?: AbortSignal): Promise<{
+  private async reconcileCommittedFactsWithGate(
+    signal: AbortSignal | undefined,
+    conversationId: string | undefined,
+    gate: ConversationOwnershipGate
+  ): Promise<{
     receipts: number;
     toolResults: number;
     failed: number;
   }> {
     signal?.throwIfAborted();
-    const receiptResult = await this.reconcileReceiptCandidates(signal);
+    const receiptResult = await this.reconcileReceiptCandidates(signal, conversationId, gate);
     let toolResults = 0;
     let failed = receiptResult.failed;
 
-    const activeTurns = await listAllDomainRows(this.database, 'Turn', { status: 'active' });
+    const activeTurns = await listAllDomainRows(this.database, 'Turn', {
+      status: 'active',
+      ...(conversationId === undefined ? {} : { conversation_id: conversationId })
+    });
     for (const turn of activeTurns) {
       signal?.throwIfAborted();
-      try {
-        toolResults += (await this.effects.finalizeReadyInOrder(String(turn.id))).length;
-      } catch (error) {
-        // One malformed/incomplete Turn must not prevent unrelated committed effects from
-        // converging. The next local commit or startup pass retries this exact durable frontier.
-        console.warn('[reliable-kernel] Turn finalization convergence failed.', String(turn.id), error);
-        failed += 1;
-      }
+      const ran = await gate.run(String(turn.conversation_id), async () => {
+        try {
+          toolResults += (await this.effects.finalizeReadyInOrder(String(turn.id))).length;
+        } catch (error) {
+          // One malformed/incomplete Turn must not prevent unrelated committed effects from
+          // converging. The next local commit or startup pass retries this exact durable frontier.
+          console.warn('[reliable-kernel] Turn finalization convergence failed.', String(turn.id), error);
+          failed += 1;
+        }
+      });
+      // Another live owner finalizes its own Turn; nothing is dispatched without the source owner.
+      if (!ran.ran) continue;
     }
     return { receipts: receiptResult.receipts, toolResults, failed };
   }
 
-  private async reconcileReceiptCandidates(signal?: AbortSignal): Promise<{ receipts: number; failed: number }> {
+  private async reconcileReceiptCandidates(
+    signal: AbortSignal | undefined,
+    conversationId: string | undefined,
+    gate: ConversationOwnershipGate
+  ): Promise<{ receipts: number; failed: number }> {
     let receipts = 0;
     let failed = 0;
     const candidates = await this.database.effectReceiptReconciliationCandidates();
@@ -129,8 +206,17 @@ export class PhaseDRecoveryScanner {
         if (Array.isArray(intent) || !intent || Array.isArray(receipt) || !receipt) {
           throw new Error(`Effect receipt recovery candidate ${candidate.effectIntentId} lost its immutable facts.`);
         }
-        const result = await this.resumePersistedReceipt(intent, receipt);
-        if (result !== undefined) receipts += 1;
+        const candidateConversationId = await this.effects.conversationIdForEffect(String(intent.id));
+        if (conversationId !== undefined && candidateConversationId !== conversationId) continue;
+        if (candidateConversationId === null) {
+          // Genuinely detached receipts (for example process_exit) converge from any Host.
+          const result = await this.resumePersistedReceipt(intent, receipt);
+          if (result !== undefined) receipts += 1;
+          continue;
+        }
+        const ran = await gate.run(candidateConversationId, () => this.resumePersistedReceipt(intent, receipt));
+        if (!ran.ran) continue;
+        if (ran.value !== undefined) receipts += 1;
       } catch (error) {
         // Recovery is a set of independent durable candidates. Continue so one bad process/tool
         // cannot hold every Conversation behind it hostage.
@@ -145,89 +231,40 @@ export class PhaseDRecoveryScanner {
     return { receipts, failed };
   }
 
-  private async scanHangingEffects(signal?: AbortSignal): Promise<PhaseDRecoveryResult> {
+  private async scanHangingEffects(signal: AbortSignal | undefined, context: PhaseDScanContext): Promise<PhaseDRecoveryResult> {
     const terminal = new Set<string>();
     let scanned = 0;
     let reconciled = 0;
     let unknown = 0;
 
     const intents = await listAllDomainRows(this.database, 'EffectIntent', { dispatch_state: 'dispatched' });
-    scanned += intents.length;
+    const eligible: Array<{ intent: DomainRow; conversationId: string | null }> = [];
     for (const intent of intents) {
       signal?.throwIfAborted();
       try {
-      const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
-      if (receipts.length > 0) {
-        if (receipts.length !== 1) throw new Error(`EffectIntent ${String(intent.id)} has multiple EffectReceipts.`);
-        const arrived = await this.resumePersistedReceipt(intent, receipts[0]);
-        if (arrived !== undefined) {
-          reconciled += 1;
-          if (arrived === null) {
-            if (receipts[0].outcome === 'outcome_unknown') unknown += 1;
-          } else {
-            if (arrived.status === 'outcome_unknown') unknown += 1;
-            terminal.add(arrived.toolCallId);
-          }
-        }
-        continue;
+        const intentConversationId = await this.effects.conversationIdForEffect(String(intent.id));
+        if (context.conversationId !== undefined && intentConversationId !== context.conversationId) continue;
+        eligible.push({ intent, conversationId: intentConversationId });
+      } catch (error) {
+        signal?.throwIfAborted();
+        console.warn('[reliable-kernel] Hanging effect ownership resolution failed.', String(intent.id), error);
       }
-      // Several code-server browser clients may have independent Extension Hosts over the same
-      // Runtime root. A newly opened Host must not mistake another live Host's in-flight external
-      // effect for crash residue merely because the receipt has not arrived yet. Only the Turn's
-      // durable lease plus the lease Host's process identity is accepted as liveness proof; dead or
-      // missing owners still fall through to the conservative effect-specific recovery below.
-      if (await this.isOwnedByLiveTurnHost(intent)) continue;
-      const source = {
-        kind: 'recovery' as const,
-        key: `recovery:effect-intent-hanging:${intent.id as string}`
-      };
-      let result: ToolTerminalResult | null;
-      switch (intent.effect_kind) {
-        case 'file_mutation':
-          result = await this.files.recoverDispatchedEffect({
-            source,
-            effectIntentId: intent.id as string,
-            resolver: this.resolveWorkEnvironment
-          });
-          break;
-        case 'process_start':
-          result = await this.processes.recoverDispatchedStart({
-            source,
-            effectIntentId: intent.id as string
-          });
-          break;
-        case 'mcp_tool_call':
-          result = await this.mcp.recoverDispatched({
-            source,
-            effectIntentId: intent.id as string
-          });
-          break;
-        case 'file_transfer':
-          result = await this.workEnvironmentTransfers.recoverDispatched({
-            source,
-            effectIntentId: intent.id as string
-          });
-          break;
-        case 'process_exit': {
-          const observed = await this.processes.recoverDispatchedExit({ source, effectIntentId: intent.id as string });
-          if (observed.state === 'running') continue;
-          if (observed.state === 'outcome_unknown') unknown += 1;
-          result = null;
-          break;
-        }
-        case 'process_stop_request':
-          result = await this.processes.recoverDispatchedStop({
-            source,
-            effectIntentId: intent.id as string
-          });
-          break;
-        default:
-          // subagent effects belong to Phase F and are deliberately not registered here.
-          continue;
-      }
-      reconciled += 1;
-      if (result?.status === 'outcome_unknown') unknown += 1;
-      if (result) terminal.add(result.toolCallId);
+    }
+    scanned = eligible.length;
+    for (const { intent, conversationId: intentConversationId } of eligible) {
+      signal?.throwIfAborted();
+      try {
+      // subagent effects belong to Phase F and the child scheduler; gating them here would claim
+      // their Conversation for a scan that never reconciles them.
+      if (intent.effect_kind === 'subagent_spawn') continue;
+      if (intentConversationId !== null && !await context.gate.check(intentConversationId)) continue;
+      const recovery = intentConversationId === null
+        ? { ran: true as const, value: await this.recoverHangingEffectIntent(intent) }
+        : await context.gate.run(intentConversationId, () => this.recoverHangingEffectIntent(intent));
+      if (!recovery.ran) continue;
+      if (recovery.value.reconciled) reconciled += 1;
+      if (recovery.value.unknown) unknown += 1;
+      if (recovery.value.terminalToolCallId) terminal.add(recovery.value.terminalToolCallId);
       } catch (error) {
         signal?.throwIfAborted();
         console.warn('[reliable-kernel] Hanging effect recovery failed.', String(intent.id), error);
@@ -240,6 +277,80 @@ export class PhaseDRecoveryScanner {
       reconciled,
       unknown,
       terminalToolCallIds: [...terminal]
+    };
+  }
+
+  private async recoverHangingEffectIntent(intent: DomainRow): Promise<HangingEffectRecovery> {
+    const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
+    if (receipts.length > 0) {
+      if (receipts.length !== 1) throw new Error(`EffectIntent ${String(intent.id)} has multiple EffectReceipts.`);
+      const arrived = await this.resumePersistedReceipt(intent, receipts[0]);
+      if (arrived === undefined) return { reconciled: false, unknown: false };
+      if (arrived === null) {
+        return { reconciled: true, unknown: receipts[0].outcome === 'outcome_unknown' };
+      }
+      return {
+        reconciled: true,
+        unknown: arrived.status === 'outcome_unknown',
+        terminalToolCallId: arrived.toolCallId
+      };
+    }
+    // Several code-server browser clients may have independent Extension Hosts over the same
+    // Runtime root. A newly opened Host must not mistake another live Host's in-flight external
+    // effect for crash residue merely because the receipt has not arrived yet. Only the Turn's
+    // durable lease plus the lease Host's process identity is accepted as liveness proof; dead or
+    // missing owners still fall through to the conservative effect-specific recovery below.
+    if (await this.isOwnedByLiveTurnHost(intent)) return { reconciled: false, unknown: false };
+    const source = {
+      kind: 'recovery' as const,
+      key: `recovery:effect-intent-hanging:${intent.id as string}`
+    };
+    let result: ToolTerminalResult | null;
+    switch (intent.effect_kind) {
+      case 'file_mutation':
+        result = await this.files.recoverDispatchedEffect({
+          source,
+          effectIntentId: intent.id as string,
+          resolver: this.resolveWorkEnvironment
+        });
+        break;
+      case 'process_start':
+        result = await this.processes.recoverDispatchedStart({
+          source,
+          effectIntentId: intent.id as string
+        });
+        break;
+      case 'mcp_tool_call':
+        result = await this.mcp.recoverDispatched({
+          source,
+          effectIntentId: intent.id as string
+        });
+        break;
+      case 'file_transfer':
+        result = await this.workEnvironmentTransfers.recoverDispatched({
+          source,
+          effectIntentId: intent.id as string
+        });
+        break;
+      case 'process_exit': {
+        const observed = await this.processes.recoverDispatchedExit({ source, effectIntentId: intent.id as string });
+        if (observed.state === 'running') return { reconciled: false, unknown: false };
+        return { reconciled: true, unknown: observed.state === 'outcome_unknown' };
+      }
+      case 'process_stop_request':
+        result = await this.processes.recoverDispatchedStop({
+          source,
+          effectIntentId: intent.id as string
+        });
+        break;
+      default:
+        // subagent effects belong to Phase F and are deliberately not registered here.
+        return { reconciled: false, unknown: false };
+    }
+    return {
+      reconciled: true,
+      unknown: result?.status === 'outcome_unknown',
+      ...(result ? { terminalToolCallId: result.toolCallId } : {})
     };
   }
 
@@ -312,17 +423,23 @@ export class PhaseDRecoveryScanner {
     }
   }
 
-  private async scanUnresolvedFileChanges(signal?: AbortSignal): Promise<PhaseDRecoveryResult> {
+  private async scanUnresolvedFileChanges(signal: AbortSignal | undefined, context: PhaseDScanContext): Promise<PhaseDRecoveryResult> {
     const pending = await listAllDomainRows(this.database, 'FileChangeSet', { status: 'pending' });
-    const ordered: Array<{ changeSet: DomainRow; turnId: string; callSeq: bigint }> = [];
+    const ordered: Array<{ changeSet: DomainRow; turnId: string; conversationId: string; callSeq: bigint }> = [];
     for (const changeSet of pending) {
       signal?.throwIfAborted();
       try {
         const calls = await this.list('ToolCall', { id: changeSet.tool_call_id }, 1);
         if (calls.length !== 1) throw new Error(`Pending FileChangeSet ${String(changeSet.id)} has no ToolCall.`);
+        const turnId = String(calls[0].turn_id);
+        const turns = await this.list('Turn', { id: turnId }, 1);
+        if (turns.length !== 1) throw new Error(`Pending FileChangeSet ${String(changeSet.id)} has no Turn.`);
+        const changeConversationId = String(turns[0].conversation_id);
+        if (context.conversationId !== undefined && changeConversationId !== context.conversationId) continue;
         ordered.push({
           changeSet,
-          turnId: String(calls[0].turn_id),
+          turnId,
+          conversationId: changeConversationId,
           callSeq: requirePositiveBigInt(calls[0].call_seq, 'ToolCall.call_seq')
         });
       } catch (error) {
@@ -335,47 +452,54 @@ export class PhaseDRecoveryScanner {
     const terminal = new Set<string>();
     const finalizedRecoveryTurns = new Set<string>();
     let reconciled = 0;
-    for (const { changeSet, turnId } of ordered) {
+    for (const { changeSet, turnId, conversationId: changeConversationId } of ordered) {
       signal?.throwIfAborted();
       try {
-      const decisions = await this.list('FileChangeDecision', { change_set_id: changeSet.id }, 1);
-      if (decisions.length > 0) continue;
-      const recovery = await this.turns.recoveryFacts(turnId);
-      if (recovery.judgment === 'needs_human') continue;
-      if (recovery.judgment === 'finalize' && !recovery.executionLeaseExists) {
-        if (!finalizedRecoveryTurns.has(turnId)) {
-          await this.turns.finalizeRecovery({
-            source: { kind: 'recovery', key: `recovery:turn-finalize:${turnId}` },
-            turnId,
-            terminalStatus: 'cancelled',
-            reason: 'Phase D finalized an unresolved file Turn with no execution lease.'
+      const recovery = await context.gate.run(changeConversationId, async (): Promise<UnresolvedFileChangeRecovery> => {
+        const decisions = await this.list('FileChangeDecision', { change_set_id: changeSet.id }, 1);
+        if (decisions.length > 0) return { reconciled: false };
+        const recoveryFacts = await this.turns.recoveryFacts(turnId);
+        if (recoveryFacts.judgment === 'needs_human') return { reconciled: false };
+        if (recoveryFacts.judgment === 'finalize' && !recoveryFacts.executionLeaseExists) {
+          if (!finalizedRecoveryTurns.has(turnId)) {
+            await this.turns.finalizeRecovery({
+              source: { kind: 'recovery', key: `recovery:turn-finalize:${turnId}` },
+              turnId,
+              terminalStatus: 'cancelled',
+              reason: 'Phase D finalized an unresolved file Turn with no execution lease.'
+            });
+            finalizedRecoveryTurns.add(turnId);
+          }
+          const closed = await this.list('FileChangeDecision', { change_set_id: changeSet.id }, 1);
+          if (closed.length === 1) {
+            const toolCallId = String(changeSet.tool_call_id);
+            const result = await this.effects.readTerminalResult(toolCallId, true);
+            return { reconciled: true, ...(result ? { terminalToolCallId: toolCallId } : {}) };
+          }
+          return { reconciled: false };
+        }
+        try {
+          const result = await this.files.decide({
+            source: {
+              kind: 'recovery',
+              key: `recovery:file-change-unresolved:${changeSet.id as string}`
+            },
+            changeSetId: changeSet.id as string,
+            decision: 'expired',
+            response: { reason: 'Unresolved FileChangeSet expired during Phase D restart scan.' }
           });
-          finalizedRecoveryTurns.add(turnId);
+          return {
+            reconciled: true,
+            ...(result.terminal ? { terminalToolCallId: result.terminal.toolCallId } : {})
+          };
+        } catch (error) {
+          if (!(error instanceof ToolCallOrderBlockedError)) throw error;
+          return { reconciled: false };
         }
-        const closed = await this.list('FileChangeDecision', { change_set_id: changeSet.id }, 1);
-        if (closed.length === 1) {
-          reconciled += 1;
-          const toolCallId = String(changeSet.tool_call_id);
-          const result = await this.effects.readTerminalResult(toolCallId, true);
-          if (result) terminal.add(toolCallId);
-        }
-        continue;
-      }
-      try {
-        const result = await this.files.decide({
-          source: {
-            kind: 'recovery',
-            key: `recovery:file-change-unresolved:${changeSet.id as string}`
-          },
-          changeSetId: changeSet.id as string,
-          decision: 'expired',
-          response: { reason: 'Unresolved FileChangeSet expired during Phase D restart scan.' }
-        });
-        reconciled += 1;
-        if (result.terminal) terminal.add(result.terminal.toolCallId);
-      } catch (error) {
-        if (!(error instanceof ToolCallOrderBlockedError)) throw error;
-      }
+      });
+      if (!recovery.ran) continue;
+      if (recovery.value.reconciled) reconciled += 1;
+      if (recovery.value.terminalToolCallId) terminal.add(recovery.value.terminalToolCallId);
       } catch (error) {
         signal?.throwIfAborted();
         console.warn('[reliable-kernel] Unresolved file change recovery failed.', String(changeSet.id), error);
@@ -383,7 +507,7 @@ export class PhaseDRecoveryScanner {
     }
     return {
       id: PHASE_D_RECOVERY_FILE_CHANGE_UNRESOLVED,
-      scanned: pending.length,
+      scanned: context.conversationId === undefined ? pending.length : ordered.length,
       reconciled,
       unknown: 0,
       terminalToolCallIds: [...terminal]

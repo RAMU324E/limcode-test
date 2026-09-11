@@ -7,6 +7,7 @@ import {
   CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
   LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND
 } from './childExecution';
+import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import { isTransactionAssertionFailure, requireIsoTimestamp } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -36,9 +37,14 @@ interface ContinuationWaitOwner {
   answerBridge: DomainRow;
 }
 
+interface PhaseFScanContext {
+  conversationId?: string;
+  gate: ConversationOwnershipGate;
+}
+
 /** Registers exactly the four Phase F-owned startup scans on top of the Phase D scanner pattern. */
 export class PhaseFRecoveryScanner {
-  private readonly handlers: ReadonlyMap<PhaseFRecoveryId, (signal?: AbortSignal) => Promise<PhaseFRecoveryResult>>;
+  private readonly handlers: ReadonlyMap<PhaseFRecoveryId, (signal: AbortSignal | undefined, context: PhaseFScanContext) => Promise<PhaseFRecoveryResult>>;
   private readonly now: () => string;
 
   public constructor(
@@ -49,11 +55,11 @@ export class PhaseFRecoveryScanner {
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
-    this.handlers = new Map<PhaseFRecoveryId, (signal?: AbortSignal) => Promise<PhaseFRecoveryResult>>([
-      [PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT, (signal) => this.scanAnswerInboxInvariant(signal)],
-      [PHASE_F_RECOVERY_DELIVERY_PENDING, (signal) => this.scanPendingDeliveries(signal)],
-      [PHASE_F_RECOVERY_FOREGROUND_WAIT_EXPIRED, (signal) => this.scanExpiredForegroundWaits(signal)],
-      [PHASE_F_RECOVERY_INTERRUPTED_SUBTREE_INCOMPLETE, (signal) => this.scanIncompleteInterruptedSubtrees(signal)]
+    this.handlers = new Map<PhaseFRecoveryId, (signal: AbortSignal | undefined, context: PhaseFScanContext) => Promise<PhaseFRecoveryResult>>([
+      [PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT, (signal, context) => this.scanAnswerInboxInvariant(signal, true, context)],
+      [PHASE_F_RECOVERY_DELIVERY_PENDING, (signal, context) => this.scanPendingDeliveries(signal, context)],
+      [PHASE_F_RECOVERY_FOREGROUND_WAIT_EXPIRED, (signal, context) => this.scanExpiredForegroundWaits(signal, context)],
+      [PHASE_F_RECOVERY_INTERRUPTED_SUBTREE_INCOMPLETE, (signal, context) => this.scanIncompleteInterruptedSubtrees(signal, context)]
     ]);
   }
 
@@ -61,42 +67,72 @@ export class PhaseFRecoveryScanner {
     return [...this.handlers.keys()];
   }
 
-  public async run(id: PhaseFRecoveryId, signal?: AbortSignal): Promise<PhaseFRecoveryResult> {
+  public async run(id: PhaseFRecoveryId, signal?: AbortSignal, conversationId?: string): Promise<PhaseFRecoveryResult> {
+    signal?.throwIfAborted();
+    const gate = new ConversationOwnershipGate(this.database, 'claim');
+    try {
+      return await this.runWithGate(id, signal, { ...(conversationId === undefined ? {} : { conversationId }), gate });
+    } finally {
+      await gate.releaseClaimed();
+    }
+  }
+
+  /**
+   * Runs every Phase F scan. With `conversationId` the scans only touch work whose mutable
+   * execution belongs to that Conversation; unscoped passes claim eligible unowned work and
+   * skip conversations another live or unknown owner holds, leaving their rows retryable.
+   */
+  public async runAll(signal?: AbortSignal, conversationId?: string): Promise<PhaseFRecoveryResult[]> {
+    signal?.throwIfAborted();
+    const gate = new ConversationOwnershipGate(this.database, 'claim');
+    const context: PhaseFScanContext = { ...(conversationId === undefined ? {} : { conversationId }), gate };
+    try {
+      await this.reconcileChildConversationOrigins(signal, context);
+      // A Host may die after the child Turn commits terminal but before the process-local
+      // coordinator clears ChildExecutionActiveTurnLink. Reconcile that durable half-transition
+      // before the registered scans so history/runtime state cannot remain falsely active forever.
+      await this.reconcileTerminalChildActiveTurns(signal, context);
+      const results = [
+        await this.scanAnswerInboxInvariant(signal, false, context),
+        await this.runWithGate(PHASE_F_RECOVERY_DELIVERY_PENDING, signal, context),
+        await this.runWithGate(PHASE_F_RECOVERY_FOREGROUND_WAIT_EXPIRED, signal, context),
+        await this.runWithGate(PHASE_F_RECOVERY_INTERRUPTED_SUBTREE_INCOMPLETE, signal, context)
+      ];
+      await this.reconcileTerminalChildActiveTurns(signal, context);
+      return results;
+    } finally {
+      await gate.releaseClaimed();
+    }
+  }
+
+  private async runWithGate(
+    id: PhaseFRecoveryId,
+    signal: AbortSignal | undefined,
+    context: PhaseFScanContext
+  ): Promise<PhaseFRecoveryResult> {
     signal?.throwIfAborted();
     const handler = this.handlers.get(id);
     if (!handler) throw new Error(`Phase F does not own recovery scan ${String(id)}.`);
-    return handler(signal);
-  }
-
-  public async runAll(signal?: AbortSignal): Promise<PhaseFRecoveryResult[]> {
-    signal?.throwIfAborted();
-    await this.reconcileChildConversationOrigins(signal);
-    // A Host may die after the child Turn commits terminal but before the process-local
-    // coordinator clears ChildExecutionActiveTurnLink. Reconcile that durable half-transition
-    // before the registered scans so history/runtime state cannot remain falsely active forever.
-    await this.reconcileTerminalChildActiveTurns(signal);
-    const results = [
-      await this.scanAnswerInboxInvariant(signal, false),
-      await this.run(PHASE_F_RECOVERY_DELIVERY_PENDING, signal),
-      await this.run(PHASE_F_RECOVERY_FOREGROUND_WAIT_EXPIRED, signal),
-      await this.run(PHASE_F_RECOVERY_INTERRUPTED_SUBTREE_INCOMPLETE, signal)
-    ];
-    await this.reconcileTerminalChildActiveTurns(signal);
-    return results;
+    return handler(signal, context);
   }
 
   /** Deterministic lineage migration for pre-atomic child records; it adds no fifth scan ID. */
-  private async reconcileChildConversationOrigins(signal?: AbortSignal): Promise<void> {
+  private async reconcileChildConversationOrigins(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<void> {
     signal?.throwIfAborted();
     const candidates = await this.database.childConversationOriginCandidates();
     for (const candidate of candidates) {
       signal?.throwIfAborted();
+      if (context.conversationId !== undefined) {
+        const child = await this.maybeGetRow('ChildExecution', candidate.childExecutionId);
+        if (!child || String(child.child_conversation_id) !== context.conversationId) continue;
+      }
+      // The origin fact is immutable and idempotent; any Host may materialize the missing fact.
       await this.children.ensureConversationOrigin(candidate.childExecutionId);
     }
   }
 
   /** Deterministic DB-only closure; it adds no fifth registered recovery policy. */
-  private async reconcileTerminalChildActiveTurns(signal?: AbortSignal): Promise<void> {
+  private async reconcileTerminalChildActiveTurns(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<void> {
     const links = await listAllDomainRows(this.database, 'ChildExecutionActiveTurnLink');
     const turns = links.length === 0
       ? []
@@ -108,34 +144,41 @@ export class PhaseFRecoveryScanner {
       const turnId = String(link.turn_id);
       const turn = requireRow(turns[index], `Turn ${turnId}`);
       if (turn.status !== 'terminated') continue;
-      const terminations = await listAllDomainRows(this.database, 'TurnTermination', { turn_id: turnId });
-      if (terminations.length !== 1) {
-        throw new Error(`Terminal child Turn ${turnId} must have exactly one TurnTermination.`);
-      }
-      if (terminations[0].terminal_status === 'failed') {
-        const reason = typeof terminations[0].reason === 'string' && terminations[0].reason.trim()
-          ? terminations[0].reason.trim()
-          : `Child Turn ${turnId} failed.`;
-        const failed = await this.answers.reconcileFailedTurn({
-          childExecutionId: String(link.child_execution_id),
-          turnId,
-          reason
-        });
-        if (failed?.disposition.kind === 'delivery_required') {
-          await this.deliveries.createAutomatic({
-            inboxItemId: failed.disposition.command.inboxItemId,
-            targetConversationId: failed.disposition.command.targetConversationId,
-            sourceTurnId: failed.disposition.automaticSourceTurnId
-          });
+      const turnConversationId = String(turn.conversation_id);
+      if (context.conversationId !== undefined && turnConversationId !== context.conversationId) continue;
+      const ran = await context.gate.run(turnConversationId, async () => {
+        const terminations = await listAllDomainRows(this.database, 'TurnTermination', { turn_id: turnId });
+        if (terminations.length !== 1) {
+          throw new Error(`Terminal child Turn ${turnId} must have exactly one TurnTermination.`);
         }
-      }
-      await this.children.observeTurnTerminal(String(link.child_execution_id), turnId);
+        if (terminations[0].terminal_status === 'failed') {
+          const reason = typeof terminations[0].reason === 'string' && terminations[0].reason.trim()
+            ? terminations[0].reason.trim()
+            : `Child Turn ${turnId} failed.`;
+          const failed = await this.answers.reconcileFailedTurn({
+            childExecutionId: String(link.child_execution_id),
+            turnId,
+            reason
+          });
+          if (failed?.disposition.kind === 'delivery_required') {
+            await this.deliveries.createAutomatic({
+              inboxItemId: failed.disposition.command.inboxItemId,
+              targetConversationId: failed.disposition.command.targetConversationId,
+              sourceTurnId: failed.disposition.automaticSourceTurnId
+            });
+          }
+        }
+        await this.children.observeTurnTerminal(String(link.child_execution_id), turnId);
+      });
+      // A foreign live owner reconciles its own terminal child Turns.
+      if (!ran.ran) continue;
     }
   }
 
   private async scanAnswerInboxInvariant(
-    signal?: AbortSignal,
-    includeMissingInboxAudit = true
+    signal: AbortSignal | undefined,
+    includeMissingInboxAudit: boolean,
+    context: PhaseFScanContext
   ): Promise<PhaseFRecoveryResult> {
     const availableInbox = (await listAllDomainRows(this.database, 'RuntimeInboxItem', {
       state: 'available'
@@ -174,58 +217,70 @@ export class PhaseFRecoveryScanner {
       bridgeId,
       requireRow(bridgeSnapshot[index], `AnswerBridge ${bridgeId}`)
     ]));
-    const affectedIds: string[] = [];
-    let unchanged = 0;
+    const parentConversationCache = new Map<string, string>();
+    const scoped: Array<{ submission: DomainRow; parentConversationId: string }> = [];
     for (const submission of submissions) {
       signal?.throwIfAborted();
-      const submissionId = String(submission.id);
-      let changed = false;
       const bridge = bridgeById.get(String(submission.answer_bridge_id))!;
-      if (bridge.current_submission_id !== submissionId) {
-        if (await this.markInboxStateForSubmission(submissionId, 'settled')) {
-          affectedIds.push(submissionId);
-        } else {
-          unchanged += 1;
+      const parentConversationId = await this.parentConversationIdForChild(
+        String(bridge.child_execution_id),
+        parentConversationCache
+      );
+      if (context.conversationId !== undefined && parentConversationId !== context.conversationId) continue;
+      scoped.push({ submission, parentConversationId });
+    }
+    const affectedIds: string[] = [];
+    let unchanged = 0;
+    for (const { submission, parentConversationId } of scoped) {
+      signal?.throwIfAborted();
+      const submissionId = String(submission.id);
+      const bridge = bridgeById.get(String(submission.answer_bridge_id))!;
+      const ran = await context.gate.run(parentConversationId, async () => {
+        let changed = false;
+        if (bridge.current_submission_id !== submissionId) {
+          return { changed: await this.markInboxStateForSubmission(submissionId, 'settled') };
         }
-        continue;
-      }
-      const inbox = await this.answers.ensureInboxForSubmission(submissionId);
-      if (inbox.deferredLiveOwner) {
+        const inbox = await this.answers.ensureInboxForSubmission(submissionId);
+        if (inbox.deferredLiveOwner) return { changed: false };
+        if (inbox.created) changed = true;
+        let disposition = await this.answers.classifyDeliveryRecovery(submissionId);
+        if (disposition.kind === 'settled_by_answer') {
+          // The answer may have atomically settled the Operation but crashed before ordered
+          // ToolOutcome materialization. Every ToolCall is checked independently during replay.
+          const waits = await this.answers.reconcileCommittedWaits(submissionId);
+          if (waits.newlySettledToolCallIds.length > 0) changed = true;
+          if (await this.markInboxState(inbox.inboxItemId, 'settled')) changed = true;
+        } else if (disposition.kind === 'delivery_required') {
+          // The immutable answer may have committed immediately before the coordinator/tool callback
+          // failed. Recreate the parent wait edge before choosing a RuntimeDelivery; otherwise a
+          // waiting run_agent and a newly injected runtime_delivery can deadlock each other.
+          const waits = await this.answers.reconcileCommittedWaits(submissionId);
+          if (waits.newlySettledToolCallIds.length > 0) changed = true;
+          disposition = await this.answers.classifyDeliveryRecovery(submissionId);
+        }
+        if (disposition.kind === 'delivery_required') {
+          const delivery = await this.deliveries.createAutomatic({
+            inboxItemId: disposition.command.inboxItemId,
+            targetConversationId: disposition.command.targetConversationId,
+            sourceTurnId: disposition.automaticSourceTurnId
+          });
+          if (!delivery.deduplicated) changed = true;
+        } else if (disposition.kind === 'existing') {
+          if (await this.markInboxState(inbox.inboxItemId, 'routed')) changed = true;
+        }
+        return { changed };
+      });
+      if (!ran.ran) {
+        // Another live owner converges its own answer routing; the durable submission remains.
         unchanged += 1;
         continue;
       }
-      if (inbox.created) changed = true;
-      let disposition = await this.answers.classifyDeliveryRecovery(submissionId);
-      if (disposition.kind === 'settled_by_answer') {
-        // The answer may have atomically settled the Operation but crashed before ordered
-        // ToolOutcome materialization. Every ToolCall is checked independently during replay.
-        const waits = await this.answers.reconcileCommittedWaits(submissionId);
-        if (waits.newlySettledToolCallIds.length > 0) changed = true;
-        if (await this.markInboxState(inbox.inboxItemId, 'settled')) changed = true;
-      } else if (disposition.kind === 'delivery_required') {
-        // The immutable answer may have committed immediately before the coordinator/tool callback
-        // failed. Recreate the parent wait edge before choosing a RuntimeDelivery; otherwise a
-        // waiting run_agent and a newly injected runtime_delivery can deadlock each other.
-        const waits = await this.answers.reconcileCommittedWaits(submissionId);
-        if (waits.newlySettledToolCallIds.length > 0) changed = true;
-        disposition = await this.answers.classifyDeliveryRecovery(submissionId);
-      }
-      if (disposition.kind === 'delivery_required') {
-        const delivery = await this.deliveries.createAutomatic({
-          inboxItemId: disposition.command.inboxItemId,
-          targetConversationId: disposition.command.targetConversationId,
-          sourceTurnId: disposition.automaticSourceTurnId
-        });
-        if (!delivery.deduplicated) changed = true;
-      } else if (disposition.kind === 'existing') {
-        if (await this.markInboxState(inbox.inboxItemId, 'routed')) changed = true;
-      }
-      if (changed) affectedIds.push(submissionId);
+      if (ran.value.changed) affectedIds.push(submissionId);
       else unchanged += 1;
     }
     return {
       id: PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT,
-      scanned: submissions.length,
+      scanned: scoped.length,
       reconciled: affectedIds.length,
       unchanged,
       affectedIds
@@ -278,16 +333,27 @@ export class PhaseFRecoveryScanner {
     }
   }
 
-  private async scanPendingDeliveries(signal?: AbortSignal): Promise<PhaseFRecoveryResult> {
-    const pending = await listAllDomainRows(this.database, 'RuntimeDelivery', { state: 'pending' });
+  private async scanPendingDeliveries(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<PhaseFRecoveryResult> {
+    const pending = (await listAllDomainRows(this.database, 'RuntimeDelivery', { state: 'pending' }))
+      .filter((delivery) =>
+        context.conversationId === undefined
+        || String(delivery.target_conversation_id) === context.conversationId
+      );
     const affectedIds: string[] = [];
     let unchanged = 0;
     for (const delivery of pending) {
       signal?.throwIfAborted();
       const deliveryId = String(delivery.id);
-      const result = await this.deliveries.advance(deliveryId);
-      const changed = result.changed;
-      if (changed) affectedIds.push(deliveryId);
+      const ran = await context.gate.run(
+        String(delivery.target_conversation_id),
+        () => this.deliveries.advance(deliveryId)
+      );
+      if (!ran.ran) {
+        // The target Conversation's live owner advances its own pending deliveries.
+        unchanged += 1;
+        continue;
+      }
+      if (ran.value.changed) affectedIds.push(deliveryId);
       else unchanged += 1;
     }
     return {
@@ -299,11 +365,14 @@ export class PhaseFRecoveryScanner {
     };
   }
 
-  private async scanExpiredForegroundWaits(signal?: AbortSignal): Promise<PhaseFRecoveryResult> {
+  private async scanExpiredForegroundWaits(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<PhaseFRecoveryResult> {
     const now = this.timestamp();
     const executions = await listAllDomainRows(this.database, 'ToolExecution', {
       status: 'waiting_answer'
     });
+    const conversationByToolCall = await this.conversationByToolCallId(
+      [...new Set(executions.map((execution) => String(execution.tool_call_id)))]
+    );
     const links = (await Promise.all(executions.map((execution) =>
       listAllDomainRows(this.database, 'ChildExecutionParentLink', {
         source_tool_call_id: execution.tool_call_id
@@ -333,68 +402,85 @@ export class PhaseFRecoveryScanner {
     }
     const continuationOwners = await this.resolveContinuationWaitOwners(continuationOperations);
     const affectedIds: string[] = [];
+    let scanned = 0;
     let unchanged = 0;
     for (const execution of executions) {
       signal?.throwIfAborted();
+      const toolCallId = String(execution.tool_call_id);
+      const waitConversationId = conversationByToolCall.get(toolCallId);
+      if (!waitConversationId) throw new Error(`Waiting ToolCall ${toolCallId} has no Conversation.`);
+      if (context.conversationId !== undefined && waitConversationId !== context.conversationId) continue;
+      scanned += 1;
       const deadline = execution.wait_deadline_at;
       if (typeof deadline !== 'string' || Date.parse(deadline) > Date.parse(now)) {
         unchanged += 1;
         continue;
       }
-      const toolCallId = String(execution.tool_call_id);
-      const childExecutionId = childByToolCall.get(toolCallId);
-      if (childExecutionId) {
-        if (await this.children.settleForegroundTimeout(childExecutionId, now)) {
-          affectedIds.push(String(execution.id));
-        } else {
-          unchanged += 1;
+      const ran = await context.gate.run(waitConversationId, async () => {
+        const childExecutionId = childByToolCall.get(toolCallId);
+        if (childExecutionId) {
+          return { settled: await this.children.settleForegroundTimeout(childExecutionId, now) };
         }
+        const continuationRows = continuationByToolCall.get(toolCallId) ?? [];
+        if (continuationRows.length > 0) {
+          if (continuationRows.length !== 1) {
+            throw new Error(`Continuation ToolCall ${toolCallId} has multiple waiting Operations.`);
+          }
+          const continuation = continuationRows[0];
+          const owner = continuationOwners.get(String(continuation.id));
+          if (!owner) throw new Error(`Continuation wait ${String(continuation.id)} has no exact owner.`);
+          const settled = await this.children.settleContinuationWaits({
+            answerBridgeId: String(owner.answerBridge.id),
+            toolCallId,
+            detail: { timeout: true, recovered: true },
+            sourceIdentity: `recovery-foreground-timeout:${toolCallId}:${String(deadline)}`,
+            observedAt: now
+          });
+          return { settled: settled.length > 0 };
+        }
+        // ask_user and other independent waiting operations are owned by their own recovery scanners.
+        return { settled: false };
+      });
+      if (!ran.ran) {
+        // The waiting Conversation's live owner settles its own expired foreground waits.
+        unchanged += 1;
         continue;
       }
-      const continuationRows = continuationByToolCall.get(toolCallId) ?? [];
-      if (continuationRows.length > 0) {
-        if (continuationRows.length !== 1) {
-          throw new Error(`Continuation ToolCall ${toolCallId} has multiple waiting Operations.`);
-        }
-        const continuation = continuationRows[0];
-        const owner = continuationOwners.get(String(continuation.id));
-        if (!owner) throw new Error(`Continuation wait ${String(continuation.id)} has no exact owner.`);
-        const settled = await this.children.settleContinuationWaits({
-          answerBridgeId: String(owner.answerBridge.id),
-          toolCallId,
-          detail: { timeout: true, recovered: true },
-          sourceIdentity: `recovery-foreground-timeout:${toolCallId}:${String(deadline)}`,
-          observedAt: now
-        });
-        if (settled.length > 0) affectedIds.push(String(execution.id));
-        else unchanged += 1;
-        continue;
-      }
-      // ask_user and other independent waiting operations are owned by their own recovery scanners.
-      unchanged += 1;
+      if (ran.value.settled) affectedIds.push(String(execution.id));
+      else unchanged += 1;
     }
     return {
       id: PHASE_F_RECOVERY_FOREGROUND_WAIT_EXPIRED,
-      scanned: executions.length,
+      scanned,
       reconciled: affectedIds.length,
       unchanged,
       affectedIds
     };
   }
 
-  private async scanIncompleteInterruptedSubtrees(signal?: AbortSignal): Promise<PhaseFRecoveryResult> {
+  private async scanIncompleteInterruptedSubtrees(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<PhaseFRecoveryResult> {
+    const parentConversationCache = new Map<string, string>();
     const roots = await listAllDomainRows(this.database, 'ChildExecution', {
       status: 'interrupting'
     });
     const affectedIds: string[] = [];
     let unchanged = 0;
+    let scannedRoots = 0;
     for (const root of roots) {
       signal?.throwIfAborted();
-      const result = await this.children.interruptSubtree({
+      const rootConversationId = await this.parentConversationIdForChild(String(root.id), parentConversationCache);
+      if (context.conversationId !== undefined && rootConversationId !== context.conversationId) continue;
+      scannedRoots += 1;
+      const ran = await context.gate.run(rootConversationId, () => this.children.interruptSubtree({
         sourceKey: childInterruptionRecoverySourceKey(String(root.id)),
         childExecutionId: String(root.id),
         reason: CHILD_INTERRUPTION_RECOVERY_REASON
-      });
+      }));
+      if (!ran.ran) {
+        unchanged += 1;
+        continue;
+      }
+      const result = ran.value;
       if (
         result.terminationRequestsWritten > 0
         || result.intentsCancelled > 0
@@ -489,8 +575,13 @@ export class PhaseFRecoveryScanner {
         child.status === 'closed'
         && bridge?.status === 'interrupted'
         && bridge.current_submission_id === null
-        && await this.closeEmptyInterruptedBridge(bridge)
-      ) affectedIds.push(childExecutionId);
+      ) {
+        const childConversationId = await this.parentConversationIdForChild(childExecutionId, parentConversationCache);
+        if (context.conversationId !== undefined && childConversationId !== context.conversationId) continue;
+        const ran = await context.gate.run(childConversationId, () => this.closeEmptyInterruptedBridge(bridge));
+        if (!ran.ran) continue;
+        if (ran.value) affectedIds.push(childExecutionId);
+      }
     }
     let terminalWaitCandidates = 0;
     for (const childExecutionId of candidateIds) {
@@ -499,13 +590,19 @@ export class PhaseFRecoveryScanner {
       if (!child || !bridge) continue;
       const cancellationCommitted = child.status === 'interrupting' || child.status === 'interrupted';
       if (!cancellationCommitted) continue;
+      const childConversationId = await this.parentConversationIdForChild(childExecutionId, parentConversationCache);
+      if (context.conversationId !== undefined && childConversationId !== context.conversationId) continue;
       terminalWaitCandidates += 1;
-      const settled = await this.children.settleCancelledExecutionWaits({
+      const ran = await context.gate.run(childConversationId, () => this.children.settleCancelledExecutionWaits({
         childExecutionId,
         reason: 'Extension Host restart closed a cancelled child wait after lineage commit.',
         sourceIdentity: `recovery:cancelled-child-waits:${childExecutionId}`
-      });
-      if (settled.foregroundSettled || settled.continuationSettlements > 0) {
+      }));
+      if (!ran.ran) {
+        unchanged += 1;
+        continue;
+      }
+      if (ran.value.foregroundSettled || ran.value.continuationSettlements > 0) {
         affectedIds.push(childExecutionId);
       } else {
         unchanged += 1;
@@ -563,6 +660,8 @@ export class PhaseFRecoveryScanner {
       const childExecutionId = String(child.id);
       const bridge = bridgeByChild.get(childExecutionId);
       if (!bridge) continue;
+      const childConversationId = await this.parentConversationIdForChild(childExecutionId, parentConversationCache);
+      if (context.conversationId !== undefined && childConversationId !== context.conversationId) continue;
       const cancellationTurn = turnMemberships
         .filter((link) => link.child_execution_id === childExecutionId)
         .filter((link) => terminalTurnIds.has(String(link.turn_id)))
@@ -573,34 +672,40 @@ export class PhaseFRecoveryScanner {
         })
         .sort((left, right) => compareCounter(right.turn_seq, left.turn_seq))[0];
       if (!cancellationTurn) {
-        if (child.status === 'interrupted' && await this.closeEmptyInterruptedBridge(bridge)) {
-          affectedIds.push(childExecutionId);
+        if (child.status === 'interrupted') {
+          const ran = await context.gate.run(childConversationId, () => this.closeEmptyInterruptedBridge(bridge));
+          if (ran.ran && ran.value) affectedIds.push(childExecutionId);
         }
         continue;
       }
       partialCandidates += 1;
-      const turnId = String(cancellationTurn.turn_id);
-      const termination = terminationByTurn.get(turnId)!;
-      const reason = typeof termination.reason === 'string' && termination.reason.trim()
-        ? termination.reason.trim()
-        : 'Extension Host restart recovered an interrupted child partial answer.';
-      const partial = await this.answers.ensureInterruptedPartial({ childExecutionId, turnId, reason });
-      if (!partial) {
+      const ran = await context.gate.run(childConversationId, async () => {
+        const turnId = String(cancellationTurn.turn_id);
+        const termination = terminationByTurn.get(turnId)!;
+        const reason = typeof termination.reason === 'string' && termination.reason.trim()
+          ? termination.reason.trim()
+          : 'Extension Host restart recovered an interrupted child partial answer.';
+        const partial = await this.answers.ensureInterruptedPartial({ childExecutionId, turnId, reason });
+        if (!partial) return { recovered: false };
+        await this.answers.reconcileCommittedWaits(partial.submissionId);
+        const disposition = await this.answers.classifyDeliveryRecovery(partial.submissionId);
+        if (disposition.kind === 'delivery_required') await this.deliveries.createAutomatic({
+          inboxItemId: disposition.command.inboxItemId,
+          targetConversationId: disposition.command.targetConversationId,
+          sourceTurnId: disposition.automaticSourceTurnId
+        });
+        return { recovered: true };
+      });
+      if (!ran.ran) {
         unchanged += 1;
         continue;
       }
-      await this.answers.reconcileCommittedWaits(partial.submissionId);
-      const disposition = await this.answers.classifyDeliveryRecovery(partial.submissionId);
-      if (disposition.kind === 'delivery_required') await this.deliveries.createAutomatic({
-        inboxItemId: disposition.command.inboxItemId,
-        targetConversationId: disposition.command.targetConversationId,
-        sourceTurnId: disposition.automaticSourceTurnId
-      });
-      affectedIds.push(childExecutionId);
+      if (ran.value.recovered) affectedIds.push(childExecutionId);
+      else unchanged += 1;
     }
     return {
       id: PHASE_F_RECOVERY_INTERRUPTED_SUBTREE_INCOMPLETE,
-      scanned: roots.length + terminalWaitCandidates + partialCandidates,
+      scanned: scannedRoots + terminalWaitCandidates + partialCandidates,
       reconciled: new Set(affectedIds).size,
       unchanged,
       affectedIds: [...new Set(affectedIds)]
@@ -719,6 +824,60 @@ export class PhaseFRecoveryScanner {
       });
     }
     return result;
+  }
+
+  /** Resolves the Conversation whose waits a ChildExecution's subtree authority belongs to. */
+  private async parentConversationIdForChild(
+    childExecutionId: string,
+    cache: Map<string, string>
+  ): Promise<string> {
+    const cached = cache.get(childExecutionId);
+    if (cached !== undefined) return cached;
+    const links = await listAllDomainRows(this.database, 'ChildExecutionParentLink', {
+      child_execution_id: childExecutionId
+    });
+    if (links.length !== 1) {
+      throw new Error(`ChildExecution ${childExecutionId} must retain exactly one ChildExecutionParentLink.`);
+    }
+    const parentTurnId = String(links[0].parent_turn_id);
+    const parentTurn = requireRow(
+      (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').get(parentTurnId)])).snapshot[0],
+      `Parent Turn ${parentTurnId}`
+    );
+    const conversationId = String(parentTurn.conversation_id);
+    cache.set(childExecutionId, conversationId);
+    return conversationId;
+  }
+
+  private async conversationByToolCallId(toolCallIds: readonly string[]): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    if (toolCallIds.length === 0) return result;
+    const snapshot = await this.database.snapshot(toolCallIds.flatMap((toolCallId) => [
+      DOMAIN_REPOSITORIES.domain('ToolCall').get(toolCallId)
+    ]));
+    const turnIds = [...new Set(toolCallIds.map((toolCallId, index) => {
+      const toolCall = requireRow(snapshot.snapshot[index], `ToolCall ${toolCallId}`);
+      return String(toolCall.turn_id);
+    }))];
+    const turnSnapshot = await this.database.snapshot(turnIds.map((turnId) =>
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId)
+    ));
+    const conversationByTurn = new Map(turnIds.map((turnId, index) => [
+      turnId,
+      String(requireRow(turnSnapshot.snapshot[index], `Turn ${turnId}`).conversation_id)
+    ]));
+    for (const [index, toolCallId] of toolCallIds.entries()) {
+      const toolCall = requireRow(snapshot.snapshot[index], `ToolCall ${toolCallId}`);
+      result.set(toolCallId, conversationByTurn.get(String(toolCall.turn_id))!);
+    }
+    return result;
+  }
+
+  private async maybeGetRow(domain: string, id: string): Promise<DomainRow | null> {
+    const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)]);
+    const value = snapshot.snapshot[0];
+    if (Array.isArray(value)) throw new TypeError(`${domain} get returned rows.`);
+    return value;
   }
 
   private timestamp(): string {

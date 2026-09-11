@@ -29,6 +29,7 @@ import {
 } from '../../shared/reliableKernelClientFeed';
 import type { ApplicationFacade } from '../ApplicationFacade';
 import type { ApplicationStartup } from '../ApplicationStartup';
+import { isConversationRuntimeOwnerBusyError } from '../../backend/reliableKernel/ConversationRuntimeOwnerManager';
 
 export interface MainPanelOptions {
   conversationId?: string;
@@ -48,6 +49,10 @@ export class MainPanel {
   public static readonly viewType = MAIN_PANEL_VIEW_TYPE;
 
   private static readonly panels = new Map<string, MainPanel>();
+  /** In-flight claim-before-open per Conversation view identity; simultaneous opens share it. */
+  private static readonly pendingConversationOpens = new Map<string, Promise<void>>();
+  /** Serializes the check-claim-register section across command, restore and navigation opens. */
+  private static readonly conversationOpenChains = new Map<string, Promise<void>>();
   private static readonly conversationPanelStateEmitter = new vscode.EventEmitter<void>();
   public static readonly onDidChangeConversationPanelState = MainPanel.conversationPanelStateEmitter.event;
 
@@ -60,6 +65,8 @@ export class MainPanel {
   private readonly conversationId?: string;
   private readonly toolCallId?: string;
   private readonly planProposalId?: string;
+  /** This view's independent Conversation owner reference; released only on dispose. */
+  private readonly ownerReferenceId?: string;
   private readonly disposables: vscode.Disposable[] = [];
 
   public static registerSerializer(context: vscode.ExtensionContext, startup: ApplicationStartup): void {
@@ -77,22 +84,17 @@ export class MainPanel {
               startupDispose.dispose();
               return;
             }
+            await MainPanel.claimRestoredConversationPanel(
+              webviewPanel,
+              context.extensionUri,
+              backendApp,
+              options,
+              () => disposed
+            );
             startupDispose.dispose();
-            MainPanel.revive(webviewPanel, context.extensionUri, backendApp, options);
-            if (options.conversationId) {
-              // A serialized conversation identity is sufficient to restore and handshake. Refresh
-              // its display title after lazy history hydration instead of blocking the whole view.
-              void backendApp.waitUntilHydrated().then(
-                () => MainPanel.refreshConversationTitle(options.conversationId!),
-                () => undefined
-              );
-            }
           } catch (error) {
-            if (disposed) {
-              startupDispose.dispose();
-              return;
-            }
             startupDispose.dispose();
+            if (disposed) return;
             MainPanel.renderUnavailable(
               webviewPanel,
               error instanceof Error ? error.message : String(error)
@@ -100,6 +102,66 @@ export class MainPanel {
           }
         }
       })
+    );
+  }
+
+  /**
+   * Restored Conversation views join the same per-Conversation open section as live opens: an
+   * already-live main chat panel is adopted (the restored duplicate closes), otherwise the
+   * restored view retains the Conversation owner before it revives. Every failure path either
+   * leaves the reference held by the revived view or releases it; nothing leaks.
+   */
+  private static async claimRestoredConversationPanel(
+    webviewPanel: vscode.WebviewPanel,
+    extensionUri: vscode.Uri,
+    backendApp: ApplicationFacade,
+    options: MainPanelOptions,
+    isDisposed: () => boolean
+  ): Promise<void> {
+    const kind = panelKind(options);
+    const conversationId = kind === 'chat' || kind === 'planDetail'
+      ? stringValue(options.conversationId)
+      : undefined;
+    if (!conversationId) {
+      if (isDisposed()) return;
+      MainPanel.revive(webviewPanel, extensionUri, backendApp, options);
+      return;
+    }
+    await MainPanel.enqueueConversationOpen(conversationId, async () => {
+      if (isDisposed()) return;
+      const existing = MainPanel.existingConversationPanel(kind, options, conversationId);
+      if (existing && (kind === 'chat' || options.reuse)) {
+        existing.refreshTitle(options.title);
+        existing.panel.reveal(webviewPanel.viewColumn ?? vscode.ViewColumn.One);
+        MainPanel.notifyConversationPanelStateChanged();
+        webviewPanel.dispose();
+        return;
+      }
+      const referenceId = createMessageId();
+      try {
+        await backendApp.retainConversation(conversationId, referenceId);
+      } catch (error) {
+        if (!isDisposed()) MainPanel.renderUnavailable(webviewPanel, MainPanel.conversationOpenFailureMessage(error));
+        return;
+      }
+      // A restore blocked behind a queued open may already have been closed by the user.
+      if (isDisposed()) {
+        await backendApp.releaseConversation(conversationId, referenceId);
+        return;
+      }
+      MainPanel.revive(webviewPanel, extensionUri, backendApp, options, referenceId);
+      if (options.conversationId) {
+        MainPanel.scheduleRestoredTitleRefresh(backendApp, options.conversationId);
+      }
+    });
+  }
+
+  private static scheduleRestoredTitleRefresh(backendApp: ApplicationFacade, conversationId: string): void {
+    // A serialized conversation identity is sufficient to restore and handshake. Refresh its
+    // display title after lazy history hydration instead of blocking the whole view.
+    void backendApp.waitUntilHydrated().then(
+      () => MainPanel.refreshConversationTitle(conversationId),
+      () => undefined
     );
   }
 
@@ -123,40 +185,146 @@ export class MainPanel {
     MainPanel.renderUnavailable(panel, message);
   }
 
+  /**
+   * Opens or focuses a panel. Conversation views claim the Conversation Runtime owner BEFORE the
+   * panel exists: the main chat view is unique per Conversation in this Host regardless of the
+   * reuse flag, simultaneous opens of the same view identity share one in-flight Promise, and a
+   * failed claim reports a per-Conversation error without leaking the owner reference. Surfaces
+   * without a Conversation identity (settings kinds) never touch ownership.
+   */
   public static createOrShow(
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
     options: MainPanelOptions = {}
-  ): void {
+  ): Promise<void> {
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+    const kind = panelKind(options);
+    const conversationId = kind === 'chat' || kind === 'planDetail'
+      ? stringValue(options.conversationId)
+      : undefined;
 
-    if (options.reuse) {
-      const existing = [...MainPanel.panels.values()].find((candidate) => candidate.matches(options));
-      if (existing) {
-        existing.refreshTitle(options.title);
-        existing.panel.reveal(column);
-        MainPanel.notifyConversationPanelStateChanged();
-        return;
+    if (!conversationId) {
+      if (options.reuse) {
+        const existing = [...MainPanel.panels.values()].find((candidate) => candidate.matches(options));
+        if (existing) {
+          existing.refreshTitle(options.title);
+          existing.panel.reveal(column);
+          MainPanel.notifyConversationPanelStateChanged();
+          return Promise.resolve();
+        }
       }
+      const panel = vscode.window.createWebviewPanel(
+        MainPanel.viewType,
+        panelTitle(options, backendApp),
+        column,
+        MainPanel.webviewPanelOptions(extensionUri, kind)
+      );
+      MainPanel.revive(panel, extensionUri, backendApp, options);
+      return Promise.resolve();
     }
 
-    const panel = vscode.window.createWebviewPanel(
-      MainPanel.viewType,
-      panelTitle(options, backendApp),
-      column,
-      MainPanel.webviewPanelOptions(extensionUri, panelKind(options))
-    );
+    const existing = MainPanel.existingConversationPanel(kind, options, conversationId);
+    if (existing && (kind === 'chat' || options.reuse)) {
+      existing.refreshTitle(options.title);
+      existing.panel.reveal(column);
+      MainPanel.notifyConversationPanelStateChanged();
+      return Promise.resolve();
+    }
 
-    MainPanel.revive(panel, extensionUri, backendApp, options);
+    const flightKey = kind === 'chat'
+      ? `chat:${conversationId}`
+      : `${kind}:${conversationId}:${options.toolCallId ?? ''}:${options.planProposalId ?? ''}`;
+    const pending = MainPanel.pendingConversationOpens.get(flightKey);
+    if (pending) return pending;
+    const open = MainPanel.enqueueConversationOpen(conversationId, () =>
+      MainPanel.openClaimedConversationPanel(extensionUri, backendApp, options, conversationId, column)
+    );
+    MainPanel.pendingConversationOpens.set(flightKey, open);
+    const cleanup = () => {
+      if (MainPanel.pendingConversationOpens.get(flightKey) === open) {
+        MainPanel.pendingConversationOpens.delete(flightKey);
+      }
+    };
+    void open.then(cleanup, cleanup);
+    return open;
+  }
+
+  private static existingConversationPanel(
+    kind: MainPanelKind,
+    options: MainPanelOptions,
+    conversationId: string
+  ): MainPanel | undefined {
+    for (const panel of MainPanel.panels.values()) {
+      if (kind === 'chat') {
+        if (panel.kind === 'chat' && panel.conversationId === conversationId) return panel;
+      } else if (panel.matches(options)) {
+        return panel;
+      }
+    }
+    return undefined;
+  }
+
+  private static enqueueConversationOpen(conversationId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = MainPanel.conversationOpenChains.get(conversationId) ?? Promise.resolve();
+    const current = previous.then(operation, operation);
+    MainPanel.conversationOpenChains.set(conversationId, current);
+    const cleanup = () => {
+      if (MainPanel.conversationOpenChains.get(conversationId) === current) {
+        MainPanel.conversationOpenChains.delete(conversationId);
+      }
+    };
+    void current.then(cleanup, cleanup);
+    return current;
+  }
+
+  private static async openClaimedConversationPanel(
+    extensionUri: vscode.Uri,
+    backendApp: ApplicationFacade,
+    options: MainPanelOptions,
+    conversationId: string,
+    column: vscode.ViewColumn
+  ): Promise<void> {
+    const kind = panelKind(options);
+    // A restore or a differently-keyed opener may have adopted this Conversation while queued.
+    const existing = MainPanel.existingConversationPanel(kind, options, conversationId);
+    if (existing && (kind === 'chat' || options.reuse)) {
+      existing.refreshTitle(options.title);
+      existing.panel.reveal(column);
+      MainPanel.notifyConversationPanelStateChanged();
+      return;
+    }
+    const referenceId = createMessageId();
+    try {
+      await backendApp.retainConversation(conversationId, referenceId);
+      const panel = vscode.window.createWebviewPanel(
+        MainPanel.viewType,
+        panelTitle(options, backendApp),
+        column,
+        MainPanel.webviewPanelOptions(extensionUri, kind)
+      );
+      MainPanel.revive(panel, extensionUri, backendApp, options, referenceId);
+    } catch (error) {
+      await backendApp.releaseConversation(conversationId, referenceId);
+      void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: ${MainPanel.conversationOpenFailureMessage(error)}`);
+    }
+  }
+
+  private static conversationOpenFailureMessage(error: unknown): string {
+    // A busy Conversation is the only expected refusal: another window owns exactly that
+    // Conversation while the rest of this window keeps working.
+    if (isConversationRuntimeOwnerBusyError(error)) return error.message;
+    console.error('[LimCode] Failed to open conversation panel.', error);
+    return `无法打开对话：${error instanceof Error ? error.message : String(error)}`;
   }
 
   private static revive(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
-    options: MainPanelOptions = {}
+    options: MainPanelOptions = {},
+    ownerReferenceId?: string
   ): void {
-    const instance = new MainPanel(panel, extensionUri, backendApp, options);
+    const instance = new MainPanel(panel, extensionUri, backendApp, options, ownerReferenceId);
     MainPanel.panels.set(instance.panelId, instance);
     MainPanel.notifyConversationPanelStateChanged();
   }
@@ -202,7 +370,8 @@ export class MainPanel {
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
-    options: MainPanelOptions
+    options: MainPanelOptions,
+    ownerReferenceId?: string
   ) {
     this.panel = panel;
     this.extensionUri = extensionUri;
@@ -212,6 +381,7 @@ export class MainPanel {
     this.conversationId = options.conversationId;
     this.toolCallId = options.toolCallId;
     this.planProposalId = options.planProposalId;
+    this.ownerReferenceId = ownerReferenceId;
 
     this.refreshTitle(options.title);
     this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri, this.kind);
@@ -265,6 +435,11 @@ export class MainPanel {
     MainPanel.panels.delete(this.panelId);
     MainPanel.notifyConversationPanelStateChanged();
     this.backendApp.detachWebview(this.clientId);
+    // Only dispose releases this view's owner reference; a hidden panel stays retained so its
+    // Conversation cannot idle-release to a peer Host while it is merely backgrounded.
+    if (this.conversationId && this.ownerReferenceId) {
+      void this.backendApp.releaseConversation(this.conversationId, this.ownerReferenceId);
+    }
 
     while (this.disposables.length) {
       const disposable = this.disposables.pop();
@@ -290,7 +465,7 @@ export class MainPanel {
     void this.backendApp
       .createConversation(options)
       .then((conversationId) => {
-        MainPanel.createOrShow(this.extensionUri, this.backendApp, { conversationId });
+        void MainPanel.createOrShow(this.extensionUri, this.backendApp, { conversationId });
       })
       .catch((error) => console.warn('[LimCode] Failed to create panel conversation.', error));
   }
@@ -303,7 +478,7 @@ export class MainPanel {
         void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: 该对话已被删除或不再存在。`);
         return;
       }
-      MainPanel.createOrShow(this.extensionUri, this.backendApp, {
+      void MainPanel.createOrShow(this.extensionUri, this.backendApp, {
         conversationId,
         ...(title?.trim() ? { title: title.trim() } : {}),
         reuse: true
@@ -313,7 +488,7 @@ export class MainPanel {
 
   private openPlanProposalFromPanel(payload: PlanProposalOpenPayload): void {
     const conversationId = payload.conversationId?.trim() || this.conversationId;
-    MainPanel.createOrShow(this.extensionUri, this.backendApp, {
+    void MainPanel.createOrShow(this.extensionUri, this.backendApp, {
       kind: 'planDetail',
       ...(conversationId ? { conversationId } : {}),
       ...(payload.toolCallId?.trim() ? { toolCallId: payload.toolCallId.trim() } : {}),

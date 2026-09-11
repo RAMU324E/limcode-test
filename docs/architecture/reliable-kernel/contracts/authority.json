@@ -33,8 +33,9 @@
       "foreign_keys": "on-per-connection"
     },
     "connectionModel": {
-      "writer": "single-dedicated-worker",
-      "reader": "wal-snapshot"
+      "writer": "single-dedicated-worker-per-host",
+      "reader": "wal-snapshot",
+      "crossHostWrites": "sqlite-serialized-transactions"
     },
     "nestingPolicy": "savepoint"
   },
@@ -48,13 +49,18 @@
   "sequenceAllocation": {
     "columnType": "INTEGER",
     "allocation": "single-writer-transaction-max-plus-one",
-    "concurrency": "single-writer-no-race",
+    "concurrency": "sqlite-serialized-writer-transactions",
     "messageSeqReuse": "never-including-soft-deleted-messages"
   },
   "rootPolicy": {
     "mode": "offline-restart-only",
     "onlineMigration": false,
     "pathSource": "getPaths-and-RootAuthority",
+    "hostRegistration": "serialized-with-runtime-maintenance",
+    "maintenanceLifetime": "operation-only",
+    "maintenanceExclusivity": "reject-live-or-unknown-other-hosts",
+    "configurationRootAdmission": "placement-through-host-registration",
+    "sharedConfigurationMaintenance": "all-runtime-scopes-offline",
     "rootBindingFields": [
       "paths",
       "dataSetId",
@@ -63,6 +69,20 @@
       "pointerRevision",
       "runtimeKernelEpoch"
     ]
+  },
+  "conversationHostOwnership": {
+    "manager": "ConversationRuntimeOwnerManager",
+    "scope": ["dataSetId", "conversationId"],
+    "storage": "runtime-control-directory",
+    "publication": "atomic-nonempty-directory-rename",
+    "singleHostPerConversation": true,
+    "multipleHostsPerWorkspace": true,
+    "executionLeaseIsSeparate": true,
+    "takeover": "verified-dead-or-reused-process-only",
+    "liveHostPreemption": false,
+    "release": "no-view-references-no-active-commands-no-pending-runtime-work",
+    "gates": ["open", "restore", "admission", "recovery", "child-execution", "delivery-wake", "conversation-mutation"],
+    "externalReceipts": "durable-idempotent-independent-of-panel-lifetime"
   },
   "configurationDomains": [
     {

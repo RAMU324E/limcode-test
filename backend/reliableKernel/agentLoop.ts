@@ -387,6 +387,11 @@ export class ReliableAgentLoop {
       agentRounds: for (;;) {
         const round = requestSequence.toString();
         let facts = await this.readRoundFacts(turnId);
+        const conversationId = requireId(facts.turn.conversation_id, 'Turn.conversation_id');
+        if (!this.database.conversationOwners.owns(conversationId)) {
+          throw new ExecutionHandoffError(`Conversation ${conversationId} is not owned by this Runtime Host.`);
+        }
+        await this.database.conversationOwners.assertOwned(conversationId);
         await this.cancelSupersededCompressionRequests(
           turnId,
           requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id')

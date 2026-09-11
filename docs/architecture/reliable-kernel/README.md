@@ -28,6 +28,7 @@
 + ChildExecution + Parent/Turn/Intent/ActiveTurn Links
 + AnswerBridge / AnswerSubmission
 + bounded snapshot / changes ClientState
++ ConversationRuntimeOwnerManager（对话级宿主归属）
 ```
 
 含义：
@@ -38,6 +39,14 @@
 - ECS 只接收已提交事实形成只读投影，不再拥有运行生命周期；
 - Webview 只接收有界快照和有界 changes，历史大内容按需读取；
 - Agent、Workflow、Policy、Prompt、ModelProfile、WorkEnvironment、RuntimeContext 与 Settings 继续位于独立配置文件根，不进入 Runtime SQLite。
+
+### 2.1 对话级宿主归属
+
+| 边界 | 当前代码入口 | 职责 |
+| --- | --- | --- |
+| 宿主归属 | `backend/reliableKernel/ConversationRuntimeOwnerManager.ts`、`runtimeHostControl.ts` | 对话独占、视图/后台生命周期、维护与宿主注册互斥；不替代 ExecutionLease |
+
+同一工作区的多个宿主可以同时运行不同对话；同一对话只能由一个宿主驱动。主聊天页重复打开聚焦已有页，其他窗口只对被占用对话提示冲突。关闭空闲对话立即释放归属；执行中对话在后台收尾后释放。创建、升级、归档和重置仍要求维护互斥，并先核验其他宿主已退出；不能只关闭本窗口后移动共享目录。配置入口继续拒绝运行期间切换数据根，本次不新增迁移或切换命令。
 
 ## 3. r4 已冻结的首发决定
 
@@ -143,6 +152,7 @@ AnswerSubmission / ProcessReceipt / 外部完成事实
 - snapshot、change batch、宿主待发送 batches/bytes 与 Webview 活动窗口都有硬上限；
 - 单 commit 或队列超限时丢弃尚未发送的普通 changes，合并为一个 `snapshot-required` 控制状态；
 - gap、未知类型、hostBootId 变化或应用失败时整份重取有界 snapshot；
+- 本地 `onCommit` 不代表跨进程广播；`externalDataVersion` 检测其他宿主提交后触发有界快照，后台继续执行由持久 `RuntimeDeliveryWake` 按对话归属路由；
 - 首发不建设持久 `ClientChangeLog`。
 
 数值与状态机只在 [`client-feed.json`](./contracts/client-feed.json) 定义。

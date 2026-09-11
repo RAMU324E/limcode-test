@@ -8,7 +8,9 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
   const openPanelCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.openPanel, async (options?: unknown) => {
     const backendApp = await readyApplication(startup);
     if (!backendApp) return;
-    MainPanel.createOrShow(context.extensionUri, backendApp, await resolveOpenPanelOptions(backendApp, options));
+    // Claim-before-open resolves after the panel is shown, an existing one is focused, or a
+    // peer-owned Conversation has reported its per-Conversation refusal.
+    await MainPanel.createOrShow(context.extensionUri, backendApp, await resolveOpenPanelOptions(backendApp, options));
   });
 
   const revealGlobalStorageCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.revealGlobalStorage, async () => {

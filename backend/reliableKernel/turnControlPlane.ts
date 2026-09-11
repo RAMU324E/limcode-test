@@ -551,17 +551,35 @@ export class TurnControlPlane {
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
   }
 
+  /**
+   * Conversation-runtime ownership boundary shared by every mutating command, admission and
+   * recovery entry below. A direct control-plane caller (child execution, delivery, recovery,
+   * tests) receives the same guard as the product Runner: a Conversation owned by a live or
+   * unknown peer Host rejects with ConversationRuntimeOwnerBusyError before any receipt or row
+   * is written, and the held activity pin covers the full read-check-write sequence so an idle
+   * release cannot race the mutation. Read-only facts/fence queries stay ungated.
+   */
+  private runOwnedConversationMutation<T>(
+    conversationId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    return this.database.conversationOwners.run(
+      requireId(conversationId, 'conversationId'),
+      operation
+    );
+  }
+
   public input(command: TurnInputCommand): Promise<TurnCommandResult> {
-    return this.startIntent({
+    return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
       command,
       operation: 'input',
       messageContent: command.content,
       messageContentType: command.contentType ?? 'text/plain'
-    });
+    }));
   }
 
   public retry(command: TurnRetryCommand): Promise<TurnCommandResult> {
-    return this.startIntent({
+    return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
       command,
       operation: 'retry',
       sourceTurnId: command.sourceTurnId,
@@ -570,17 +588,17 @@ export class TurnControlPlane {
         ? { expectedMessageRevisionId: requireId(command.expectedMessageRevisionId, 'expectedMessageRevisionId') }
         : {}),
       rewindSourceOutput: true
-    });
+    }));
   }
 
   public continuation(command: TurnContinuationCommand): Promise<TurnCommandResult> {
-    return this.startIntent({
+    return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
       command,
       operation: 'continuation',
       sourceTurnId: command.sourceTurnId,
       messageContent: command.content,
       messageContentType: command.contentType ?? 'text/plain'
-    });
+    }));
   }
 
   public runtimeContinuation(command: TurnRuntimeContinuationCommand): Promise<TurnCommandResult> {
@@ -588,57 +606,65 @@ export class TurnControlPlane {
       throw new TypeError('Runtime continuation requires an internal source.');
     }
     if (command.maintenance) {
-      return this.startIntent({
+      return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
         command,
         operation: 'retry',
         sourceTurnId: command.sourceTurnId,
         inheritSourceAuthority: true,
         runtimeMaintenance: normalizeRuntimeMaintenance(command.maintenance)
-      });
+      }));
     }
-    return this.startIntent({
+    return this.runOwnedConversationMutation(command.conversationId, () => this.startIntent({
       command,
       operation: 'runtime_continuation',
       sourceTurnId: command.sourceTurnId,
       deliveryId: requireId(command.deliveryId, 'deliveryId'),
       inheritSourceAuthority: true
-    });
+    }));
   }
 
   public edit(command: TurnEditCommand): Promise<TurnCommandResult> {
-    return this.editMessage(command);
+    return this.runOwnedConversationMutation(command.conversationId, () => this.editMessage(command));
   }
 
   public editAndRun(command: TurnEditAndRunCommand): Promise<TurnCommandResult> {
-    return this.editMessageAndRun(command);
+    return this.runOwnedConversationMutation(command.conversationId, () => this.editMessageAndRun(command));
   }
 
   public delete(command: TurnDeleteCommand): Promise<TurnCommandResult> {
-    return this.softDeleteMessage(command);
+    return this.runOwnedConversationMutation(command.conversationId, () => this.softDeleteMessage(command));
   }
 
   public editGuidance(command: TurnGuidanceEditCommand): Promise<TurnCommandResult> {
-    return this.reviseGuidanceText(command);
+    return this.runOwnedConversationMutation(command.conversationId, () => this.reviseGuidanceText(command));
   }
 
   public cancelGuidance(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
-    return this.cancelQueuedGuidance(command);
+    return this.runOwnedConversationMutation(command.conversationId, () => this.cancelQueuedGuidance(command));
   }
 
   public setGuidanceHold(command: TurnGuidanceHoldCommand): Promise<TurnCommandResult> {
-    return this.reviseGuidanceHold(command);
+    return this.runOwnedConversationMutation(command.conversationId, () => this.reviseGuidanceHold(command));
   }
 
   public reorderGuidance(command: TurnGuidanceReorderCommand): Promise<TurnCommandResult> {
-    return this.reorderQueuedGuidance(command);
+    return this.runOwnedConversationMutation(command.conversationId, () => this.reorderQueuedGuidance(command));
   }
 
-  public interrupt(command: TurnInterruptCommand): Promise<TurnCommandResult> {
-    return this.requestInterrupt(command);
+  public async interrupt(command: TurnInterruptCommand): Promise<TurnCommandResult> {
+    const turn = await this.getTurn(requireId(command.turnId, 'turnId'));
+    return this.runOwnedConversationMutation(
+      requireId(turn.conversation_id, 'Turn.conversation_id'),
+      () => this.requestInterrupt(command)
+    );
   }
 
-  public terminal(command: TurnTerminalCommand): Promise<TurnCommandResult> {
-    return this.recordTerminal(command);
+  public async terminal(command: TurnTerminalCommand): Promise<TurnCommandResult> {
+    const turn = await this.getTurn(requireId(command.turnId, 'turnId'));
+    return this.runOwnedConversationMutation(
+      requireId(turn.conversation_id, 'Turn.conversation_id'),
+      () => this.recordTerminal(command)
+    );
   }
 
   private async reviseGuidanceText(command: TurnGuidanceEditCommand): Promise<TurnCommandResult> {
@@ -996,34 +1022,44 @@ export class TurnControlPlane {
     leaseExpiresAt: string;
   }): Promise<TurnCommandResult | null> {
     const conversationId = requireId(input.conversationId, 'conversationId');
-    const queued = (await listAllDomainRows(this.database, 'TurnIntent', { conversation_id: conversationId }))
-      .filter((intent) => intent.state === TURN_INTENT_STATE_QUEUED && intent.turn_id === null);
-    if (queued.length === 0) return null;
-    const childIntentLinks = await listAllDomainRows(this.database, 'ChildExecutionIntentLink', { state: 'pending' });
-    const childIntentIds = new Set(childIntentLinks.map((link) => String(link.turn_intent_id)));
-    const ranked: Array<{ intent: DomainRow; position: string }> = [];
-    for (const candidate of queued) {
-      const intentId = requireId(candidate.id, 'TurnIntent.id');
-      if (childIntentIds.has(intentId)) continue;
-      const guidance = await this.maybeCurrentGuidanceIntent(conversationId, intentId);
-      if (guidance?.hold === 'paused') continue;
-      ranked.push({
-        intent: candidate,
-        position: guidance?.position
-          ?? initialGuidancePosition(requireTimestamp(candidate.created_at, 'TurnIntent.created_at'))
-      });
-    }
-    const intent = ranked.sort((left, right) =>
-      compareGuidancePositions(left.position, right.position)
-      || String(left.intent.created_at).localeCompare(String(right.intent.created_at))
-      || String(left.intent.id).localeCompare(String(right.intent.id))
-    )[0]?.intent;
-    if (!intent) return null;
-    return this.admitQueuedIntent(intent, input);
+    return this.runOwnedConversationMutation(conversationId, async () => {
+      const queued = (await listAllDomainRows(this.database, 'TurnIntent', { conversation_id: conversationId }))
+        .filter((intent) => intent.state === TURN_INTENT_STATE_QUEUED && intent.turn_id === null);
+      if (queued.length === 0) return null;
+      const childIntentLinks = await listAllDomainRows(this.database, 'ChildExecutionIntentLink', { state: 'pending' });
+      const childIntentIds = new Set(childIntentLinks.map((link) => String(link.turn_intent_id)));
+      const ranked: Array<{ intent: DomainRow; position: string }> = [];
+      for (const candidate of queued) {
+        const intentId = requireId(candidate.id, 'TurnIntent.id');
+        if (childIntentIds.has(intentId)) continue;
+        const guidance = await this.maybeCurrentGuidanceIntent(conversationId, intentId);
+        if (guidance?.hold === 'paused') continue;
+        ranked.push({
+          intent: candidate,
+          position: guidance?.position
+            ?? initialGuidancePosition(requireTimestamp(candidate.created_at, 'TurnIntent.created_at'))
+        });
+      }
+      const intent = ranked.sort((left, right) =>
+        compareGuidancePositions(left.position, right.position)
+        || String(left.intent.created_at).localeCompare(String(right.intent.created_at))
+        || String(left.intent.id).localeCompare(String(right.intent.id))
+      )[0]?.intent;
+      if (!intent) return null;
+      return this.admitQueuedIntent(intent, input);
+    });
   }
 
   /** Finalize-only recovery for the identity.json active/no-lease orphan combination. */
   public async finalizeRecovery(command: TurnTerminalCommand): Promise<TurnCommandResult> {
+    const turn = await this.getTurn(requireId(command.turnId, 'turnId'));
+    return this.runOwnedConversationMutation(
+      requireId(turn.conversation_id, 'Turn.conversation_id'),
+      () => this.finalizeRecoveryOwned(command)
+    );
+  }
+
+  private async finalizeRecoveryOwned(command: TurnTerminalCommand): Promise<TurnCommandResult> {
     const source = normalizeTerminalSource(command.source);
     if (source.kind !== 'recovery') throw new TypeError('Turn recovery finalization requires recovery source kind.');
     const turnId = requireId(command.turnId, 'turnId');
@@ -1266,8 +1302,35 @@ export class TurnControlPlane {
    * recovery command: an existing lease from another boot is fenced by an exact-row
    * assertion before replacement, while active/no-lease recovery requires the PendingTurnInput
    * fact mandated by identity.json. It never revives a terminal or finalize-only Turn.
+   *
+   * Elapsed time alone never displaces another Host: a lease whose owning Host boot is verifiably
+   * live (or cannot be proven dead) stays authoritative past its expiry. Cross-boot takeover
+   * requires a definitely dead/reused process identity via RuntimeDatabase.isHostAlive; the
+   * exact-row generation CAS then fences every delayed write from the old owner. Reclaiming an
+   * expired lease owned by this same Host boot remains allowed, which is how waiting Turns whose
+   * renewal stopped resume after a human/process wake.
+   *
+   * The Conversation-runtime ownership boundary applies first: a Conversation owned by a live or
+   * unknown peer Host rejects with ConversationRuntimeOwnerBusyError before any recovery receipt
+   * or ExecutionLease row is read for mutation, so direct control-plane callers can never rebind
+   * a peer-owned Conversation's execution. A null result keeps its existing meaning: lease-level
+   * stand-down while this Host legitimately owns the Conversation.
    */
   public async claimRecoveryExecution(input: {
+    turnId: string;
+    leaseOwnerId: string;
+    hostBootId: string;
+    leaseExpiresAt: string;
+  }): Promise<TurnRecoveryLeaseClaimResult | null> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const turn = await this.getTurn(turnId);
+    return this.runOwnedConversationMutation(
+      requireId(turn.conversation_id, 'Turn.conversation_id'),
+      () => this.claimRecoveryExecutionOwned(input)
+    );
+  }
+
+  private async claimRecoveryExecutionOwned(input: {
     turnId: string;
     leaseOwnerId: string;
     hostBootId: string;
@@ -1326,15 +1389,19 @@ export class TurnControlPlane {
         throw new Error(`Turn ${turnId} is already owned by another runner in the current host boot.`);
       }
       if (
-        !expired
-        && lease.host_boot_id !== hostBootId
+        lease.host_boot_id !== hostBootId
         && await this.database.isHostAlive(requireId(lease.host_boot_id, 'ExecutionLease.host_boot_id'))
-      ) return null;
+      ) {
+        // A verifiably live (or not proven dead) Host is authoritative regardless of lease expiry;
+        // elapsed time never justifies displacing it.
+        return null;
+      }
 
       // The initial recovery receipt identifies only the first generation claimed by this Host.
-      // Ownership may subsequently move A→B→A. Once the observed lease is expired (or its Host is
-      // definitely dead), create a generation-scoped receipt and CAS the exact current owner row;
-      // an old per-Host receipt must never permanently block that return path.
+      // Ownership may subsequently move A→B→A. Once the observed lease is owned by this Host boot
+      // (expired or not) or its old Host is definitely dead, create a generation-scoped receipt
+      // and CAS the exact current owner row; an old per-Host receipt must never permanently block
+      // that return path.
       const nextGeneration = generation + 1n;
       const reclaimSource: TurnCommandSource = {
         kind: 'recovery',
@@ -1428,11 +1495,11 @@ export class TurnControlPlane {
     if (
       existingLease
       && existingLease.host_boot_id !== hostBootId
-      && !existingLeaseExpired
       && await this.database.isHostAlive(requireId(existingLease.host_boot_id, 'ExecutionLease.host_boot_id'))
     ) {
-      // Before expiry, a verifiably live Host is authoritative. After expiry the generation CAS
-      // fences every delayed write, so another Host may safely recover an event-loop-stuck owner.
+      // A verifiably live (or not proven dead) Host remains authoritative past lease expiry:
+      // elapsed time alone never displaces it. Takeover requires a definitely dead/reused process
+      // identity; the exact-row generation CAS below still fences every delayed write.
       return null;
     }
     if (

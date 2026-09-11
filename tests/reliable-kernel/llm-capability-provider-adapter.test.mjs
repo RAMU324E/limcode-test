@@ -1504,6 +1504,14 @@ test('Agent loop 开放任务的无工具输出只续行一轮再结束', async 
   let finalFenceCount = 0;
   let terminalReason;
   let assistantCommitCount = 0;
+  loop.database = {
+    conversationOwners: {
+      owns: (conversationId) => conversationId === 'conversation-bounded',
+      async assertOwned(conversationId) {
+        assert.equal(conversationId, 'conversation-bounded');
+      }
+    }
+  };
   loop.observeLifecycle = () => {};
   loop.observeOpenTasksAtFinal = () => {};
   loop.readResumeState = async () => ({

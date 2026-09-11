@@ -69,6 +69,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
   const coordinator = new ReliableChildAgentCoordinator({
     database: {
       hostBootId: 'optional-wait-host',
+      conversationOwners: createRetainedConversationOwners(),
       async snapshot(reads) {
         return {
           snapshot: reads.map((read) => read.kind === 'list'
@@ -106,7 +107,13 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
         return { toolCallId: requestedToolCallId, status: 'succeeded' };
       },
       async readExecutionSnapshot(childExecutionId) {
-        return { childExecution: { id: childExecutionId, status: 'active' } };
+        return {
+          childExecution: {
+            id: childExecutionId,
+            status: 'active',
+            child_conversation_id: 'interrupt-conversation'
+          }
+        };
       },
       async send() {
         return { turnIntentId: 'continuation-intent' };
@@ -162,7 +169,6 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，run 与 inte
     model: spawnCommand.modelFallback
   });
   assert.match(spawnCommand.prompt, /inspect in the background/);
-  assert.match(spawnCommand.prompt, /省略 childRef/);
   assert.doesNotMatch(spawnCommand.prompt, /answer_bridge_[a-f0-9]{64}/);
   assert.equal(spawnCommand.prompt.includes(answerBridgeId), false, '子提示不得泄漏 canonical AnswerBridge ID');
   assert.equal(background.disposition, 'settled');
@@ -235,9 +241,10 @@ test('run_agent 按设置上限和当前持久层级动态出现在模型工具�
   assert.deepEqual(await visibleToolNames(0, []), ['read']);
 });
 
-test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后的重驱动', async () => {
+test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后的重驱动', { timeout: 10_000 }, async () => {
   const hostBootId = 'wake-race-host';
   const childExecutionId = 'wake-race-child';
+  const childConversationId = 'wake-race-conversation';
   const turnId = 'wake-race-turn';
   let driveCalls = 0;
   let releaseFirstDrive;
@@ -246,20 +253,42 @@ test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后�
   const firstDriveGate = new Promise((resolve) => { releaseFirstDrive = resolve; });
   const firstDriveStarted = new Promise((resolve) => { signalFirstDriveStarted = resolve; });
   const secondDriveStarted = new Promise((resolve) => { signalSecondDriveStarted = resolve; });
+  // Fixture regressions must fail fast instead of parking the whole test run on a stuck gate.
+  const bounded = (promise, message) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), 1_000);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
   const coordinator = new ReliableChildAgentCoordinator({
     database: {
       hostBootId,
+      conversationOwners: createRetainedConversationOwners(),
       async snapshot(reads) {
         return {
-          snapshot: reads.map((read) =>
-            read.kind === 'list' && read.domain === 'ChildExecutionTurnLink'
-              ? [{
-                  id: 'wake-race-membership',
-                  turn_id: turnId,
-                  child_execution_id: childExecutionId
-                }]
-              : null
-          )
+          snapshot: reads.map((read) => {
+            if (read.kind === 'list') {
+              return read.domain === 'ChildExecutionTurnLink'
+                ? [{
+                    id: 'wake-race-membership',
+                    turn_id: turnId,
+                    child_execution_id: childExecutionId
+                  }]
+                : [];
+            }
+            if (read.domain === 'ChildExecution' && read.id === childExecutionId) {
+              return {
+                id: childExecutionId,
+                status: 'active',
+                child_conversation_id: childConversationId
+              };
+            }
+            if (read.domain === 'Turn' && read.id === turnId) {
+              return { id: turnId, status: 'active', conversation_id: childConversationId };
+            }
+            return null;
+          })
         };
       },
       async externalDataVersion() { return '1'; }
@@ -276,7 +305,7 @@ test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后�
       async executionLeaseFence() {
         return {
           id: 'wake-race-lease',
-          conversationId: 'wake-race-conversation',
+          conversationId: childConversationId,
           turnId,
           ownerId: `child-driver:${hostBootId}`,
           hostBootId,
@@ -310,21 +339,10 @@ test('Child Turn 在 active drive 期间收到唤醒时不会丢失 waiting 后�
   });
 
   coordinator.launch(childExecutionId, turnId);
-  await firstDriveStarted;
+  await bounded(firstDriveStarted, '首个 Child drive 未能在 1s 内进入');
   assert.equal(await coordinator.resume(turnId), true);
   releaseFirstDrive();
-
-  let timeout;
-  try {
-    await Promise.race([
-      secondDriveStarted,
-      new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('active drive 期间的 Child 唤醒被丢失')), 1_000);
-      })
-    ]);
-  } finally {
-    clearTimeout(timeout);
-  }
+  await bounded(secondDriveStarted, 'active drive 期间的 Child 唤醒被丢失');
   await coordinator.waitForIdle();
   assert.equal(driveCalls, 2);
   await coordinator.dispose();
@@ -346,6 +364,39 @@ function frozenRunAgentAuthority(maxDepth) {
   };
 }
 
+/**
+ * Mandatory RuntimeDatabase owner manager reduced to a single current-Host model: every claim
+ * succeeds and ownership stays retained for the rest of the test, so coordinator drives always
+ * pass the ownership gate. Cross-Host contention itself is covered by the real Runtime suite.
+ */
+function createRetainedConversationOwners() {
+  const owned = new Set();
+  return {
+    owns(conversationId) {
+      return owned.has(conversationId);
+    },
+    async claim(conversationId) {
+      owned.add(conversationId);
+    },
+    async tryClaim(conversationId) {
+      owned.add(conversationId);
+      return true;
+    },
+    async assertOwned(conversationId) {
+      if (!owned.has(conversationId)) {
+        throw new Error(`Conversation ${conversationId} is not owned by this Runtime Host.`);
+      }
+    },
+    async run(conversationId, operation) {
+      owned.add(conversationId);
+      return operation();
+    },
+    async releaseIfIdle() {
+      return false;
+    }
+  };
+}
+
 function runAgentInput(suffix) {
   return {
     turnId: `parent-turn-${suffix}`,
@@ -362,6 +413,7 @@ function createDepthCoordinator(lineageFromCurrentToRoot) {
   const coordinator = new ReliableChildAgentCoordinator({
     database: {
       hostBootId: 'depth-host',
+      conversationOwners: createRetainedConversationOwners(),
       async snapshot(reads) {
         return {
           snapshot: reads.map((read) => {

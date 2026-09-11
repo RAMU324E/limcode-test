@@ -38,6 +38,7 @@ import { applyProxyEnvironment, normalizeProxySetting, proxyForShellAndMcp } fro
 import { VscodeReliableFileDiffEditor } from './VscodeReliableFileDiffEditor';
 import { getRuntimeBuildInfo } from '../runtimeBuildInfo';
 import { ReliableConversationRunner } from './ReliableConversationRunner';
+import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 
 export interface VscodeReliableKernelProductRuntimeOptions {
   /** Tests/candidate validation may supply an isolated authority. Production resolves it through getPaths(). */
@@ -75,7 +76,9 @@ export class VscodeReliableKernelProductRuntime {
   private recoveryReport: ReliableKernelRecoveryReport | undefined;
   private recoveryError: unknown;
   private recoveryTask: Promise<ReliableKernelRecoveryReport> | undefined;
-  private recoveryController: AbortController | undefined;
+  private readonly recoveryController = new AbortController();
+  private readonly conversationRecoveryTasks = new Map<string, Promise<void>>();
+  private readonly externalRuntimeWatcher: ExternalDataVersionWatcher;
   private closing = false;
   private readonly initializeConfiguration: () => Promise<void>;
 
@@ -101,6 +104,11 @@ export class VscodeReliableKernelProductRuntime {
     this.diagnostics = input.diagnostics;
     this.debugCapture = input.debugCapture;
     this.initializeConfiguration = input.initializeConfiguration;
+    this.externalRuntimeWatcher = new ExternalDataVersionWatcher(
+      () => this.application.database.externalDataVersion(),
+      () => this.application.refreshExternalRuntimeWork(),
+      { onError: (error) => console.error('[LimCode] 跨宿主 Runtime 同步失败。', error) }
+    );
   }
 
   public static async open(
@@ -321,6 +329,8 @@ export class VscodeReliableKernelProductRuntime {
         const app = application;
         const runner = conversations;
         if (!app || !runner) return { acknowledged: false };
+        if (!app.database.conversationOwners.owns(request.conversationId)) return { acknowledged: false };
+        await app.database.conversationOwners.assertOwned(request.conversationId);
         if (request.action === 'notify_only') {
           const acknowledged = await app.runtime.deliveries.acknowledgeNotification(request.deliveryId);
           // The RuntimeDelivery ACK is the durable notification fence. A host crash after this point
@@ -461,9 +471,9 @@ export class VscodeReliableKernelProductRuntime {
   public startRecovery(): Promise<ReliableKernelRecoveryReport> {
     if (this.recoveryTask) return this.recoveryTask;
     if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
-    const controller = new AbortController();
-    this.recoveryController = controller;
+    const controller = this.recoveryController;
     this.recoveryTask = (async () => {
+      await this.externalRuntimeWatcher.start();
       const [report] = await Promise.all([
         this.application.recover(controller.signal),
         this.toolHost.initialize(),
@@ -475,6 +485,7 @@ export class VscodeReliableKernelProductRuntime {
         controller.signal.throwIfAborted();
         await this.conversations.recoverStartup(controller.signal);
       }
+      await this.application.refreshExternalRuntimeWork();
       this.recoveryReport = report;
       return report;
     })().catch((error) => {
@@ -491,6 +502,29 @@ export class VscodeReliableKernelProductRuntime {
       this.toolHost.initialize(),
       this.initializeConfiguration()
     ]).then(() => undefined);
+  }
+
+  /** A view may take over a crashed peer after this host's startup recovery has already finished. */
+  public recoverConversation(conversationId: string): Promise<void> {
+    if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
+    const existing = this.conversationRecoveryTasks.get(conversationId);
+    if (existing) return existing;
+    const signal = this.recoveryController.signal;
+    const task = this.application.database.conversationOwners.run(conversationId, async () => {
+      signal.throwIfAborted();
+      await this.ensureCapabilitiesReady();
+      await this.application.recoverConversation(conversationId, signal);
+      signal.throwIfAborted();
+      await this.childAgents.recoverStartup(signal, conversationId);
+      signal.throwIfAborted();
+      await this.conversations.recoverStartup(signal, conversationId);
+    }).finally(() => {
+      if (this.conversationRecoveryTasks.get(conversationId) === task) {
+        this.conversationRecoveryTasks.delete(conversationId);
+      }
+    });
+    this.conversationRecoveryTasks.set(conversationId, task);
+    return task;
   }
 
   public recoveryState(): VscodeReliableKernelRecoveryState {
@@ -511,7 +545,8 @@ export class VscodeReliableKernelProductRuntime {
     this.closing = true;
     const cancellation = new Error('Reliable Runtime recovery cancelled for Host handoff.');
     cancellation.name = 'AbortError';
-    this.recoveryController?.abort(cancellation);
+    this.recoveryController.abort(cancellation);
+    this.externalRuntimeWatcher.cancel();
     try {
       await this.debugCapture.close().catch(() => undefined);
       this.fileDiffs.dispose();
@@ -521,6 +556,8 @@ export class VscodeReliableKernelProductRuntime {
       // an unresponsive external server cannot make Extension Host reload wait forever.
       await this.toolHost.dispose();
       await this.recoveryTask?.catch(() => undefined);
+      await Promise.allSettled(this.conversationRecoveryTasks.values());
+      await this.externalRuntimeWatcher.stop();
       await this.conversations.waitForIdle();
       // Never close the database underneath in-flight child Turn finalization.
       await this.childAgents.dispose();

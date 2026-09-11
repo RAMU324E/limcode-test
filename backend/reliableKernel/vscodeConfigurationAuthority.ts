@@ -689,7 +689,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       const input = settings as Partial<GlobalSettingsRecord>;
       const requestedDataRootPath = input.dataFilePath?.trim() ?? current.dataFilePath;
       if (requestedDataRootPath !== current.dataFilePath) {
-        throw new Error('可靠 Runtime 运行期间不能切换 data root；请通过受控重置/切换命令并重载窗口。');
+        throw new Error('可靠 Runtime 运行期间不能切换 data root；如需清空开发数据，请通过受控重置命令归档重置并重载窗口。');
       }
       const committedStatus = await saveGlobalStatusExpected(
         context,

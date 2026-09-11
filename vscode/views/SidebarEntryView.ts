@@ -278,7 +278,9 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
         void vscode.window.showWarningMessage(`${EXTENSION_BRAND}: 该对话已被删除或不再存在。`);
         return;
       }
-      MainPanel.createOrShow(this.extensionUri, backendApp, {
+      // A peer-owned Conversation reports its refusal inside createOrShow without affecting the
+      // sidebar or any other Conversation.
+      void MainPanel.createOrShow(this.extensionUri, backendApp, {
         conversationId,
         title,
         reuse: true
@@ -288,7 +290,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
 
   private openPanelFromSidebar(options: MainPanelOptions): void {
     void this.application().then(
-      (backendApp) => MainPanel.createOrShow(this.extensionUri, backendApp, options),
+      (backendApp) => void MainPanel.createOrShow(this.extensionUri, backendApp, options),
       (error) => console.warn('[LimCode] Failed to open sidebar panel.', error)
     );
   }
@@ -297,7 +299,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     void this.application()
       .then((backendApp) => backendApp.createConversation({ projectFolderUri }).then((conversationId) => ({ backendApp, conversationId })))
       .then(({ backendApp, conversationId }) => {
-        MainPanel.createOrShow(this.extensionUri, backendApp, { conversationId });
+        void MainPanel.createOrShow(this.extensionUri, backendApp, { conversationId });
         this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
       })
       .catch((error) => console.warn('[LimCode] Failed to create sidebar conversation.', error));

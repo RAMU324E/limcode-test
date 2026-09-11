@@ -602,6 +602,11 @@ function validateAuthority(authority, migration, failures) {
   if (database?.genericJsonTables !== false) failures.push('禁止通用JSON领域表');
   if (database?.arbitrarySqlBatch !== false) failures.push('禁止业务层任意SQL批处理');
   if (database?.businessWritesThroughRepositories !== true) failures.push('业务写入必须经过领域仓储');
+  if (database?.connectionModel?.writer !== 'single-dedicated-worker-per-host'
+    || database?.connectionModel?.crossHostWrites !== 'sqlite-serialized-transactions'
+    || authority?.sequenceAllocation?.concurrency !== 'sqlite-serialized-writer-transactions') {
+    failures.push('每个宿主独立 SQLite worker，跨宿主写入和序号分配必须由 SQLite 事务互斥');
+  }
   if (authority?.schemaPolicy?.currentManifestRequired !== true
     || authority?.schemaPolicy?.runtimeKernelEpoch !== 'single-current-epoch'
     || authority?.schemaPolicy?.incrementalLegacyMigrationChain !== false
@@ -614,6 +619,28 @@ function validateAuthority(authority, migration, failures) {
     failures.push('换根只能离线并在重启后完成');
   }
   failures.push(...exactSetProblems('RootBinding字段', ROOT_BINDING_FIELDS, authority?.rootPolicy?.rootBindingFields ?? []));
+  if (authority?.rootPolicy?.hostRegistration !== 'serialized-with-runtime-maintenance'
+    || authority?.rootPolicy?.maintenanceLifetime !== 'operation-only'
+    || authority?.rootPolicy?.configurationRootAdmission !== 'placement-through-host-registration'
+    || authority?.rootPolicy?.sharedConfigurationMaintenance !== 'all-runtime-scopes-offline'
+    || authority?.rootPolicy?.maintenanceExclusivity !== 'reject-live-or-unknown-other-hosts') {
+    failures.push('Runtime 维护必须与宿主注册互斥，且不得破坏存活或身份未知的其他宿主');
+  }
+  const ownership = authority?.conversationHostOwnership;
+  failures.push(...exactSetProblems('会话宿主归属作用域', ['dataSetId', 'conversationId'], ownership?.scope ?? []));
+  if (ownership?.manager !== 'ConversationRuntimeOwnerManager'
+    || ownership?.storage !== 'runtime-control-directory'
+    || ownership?.singleHostPerConversation !== true
+    || ownership?.multipleHostsPerWorkspace !== true
+    || ownership?.executionLeaseIsSeparate !== true
+    || ownership?.liveHostPreemption !== false
+    || ownership?.takeover !== 'verified-dead-or-reused-process-only'
+    || ownership?.release !== 'no-view-references-no-active-commands-no-pending-runtime-work') {
+    failures.push('同工作区允许多宿主，每个对话必须单宿主归属，且独立于 ExecutionLease');
+  }
+  failures.push(...exactSetProblems('会话归属门禁', [
+    'open', 'restore', 'admission', 'recovery', 'child-execution', 'delivery-wake', 'conversation-mutation'
+  ], ownership?.gates ?? []));
 
   failures.push(...exactSetProblems(
     '配置交叉映射字段',
@@ -729,6 +756,14 @@ function validateIdentity(identity, failures) {
   if (identity?.turnIdentity?.soleExecutionIdentity !== true) failures.push('Turn必须是唯一执行身份');
   if (identity?.turnIdentity?.runIdAuthorityAllowed !== false) failures.push('RunId不得继续作为权威身份');
   if (identity?.turnIdentity?.dedupeBy !== 'CommandReceipt(source_kind,source_key)') failures.push('命令去重必须使用CommandReceipt(source_kind,source_key)');
+  failures.push(...exactSetProblems('会话宿主身份字段', [
+    'dataSetId', 'rootInstanceId', 'rootGeneration', 'conversationId', 'hostBootId',
+    'ownerToken', 'processId', 'processStartIdentity', 'startedAt'
+  ], identity?.conversationOwnerIdentity?.fields ?? []));
+  if (identity?.conversationOwnerIdentity?.scope !== 'authority.json#conversationHostOwnership') {
+    failures.push('会话宿主身份必须引用统一的 conversationHostOwnership 合同');
+  }
+  nonEmptyString(identity?.recoveryJudgment?.precondition, '恢复前置会话归属条件', failures);
   failures.push(...exactSetProblems('Effect身份字段', ['operationId', 'attemptId', 'effectIntentId', 'effectReceiptId'], identity?.effectIdentity?.fields ?? []));
   failures.push(...exactSetProblems('提供方流身份字段', ['modelRequestId', 'attemptSeq', 'socketGeneration', 'streamSeq'], identity?.providerStreamIdentity?.fields ?? []));
   failures.push(...exactSetProblems('RootBinding字段', ROOT_BINDING_FIELDS, identity?.rootBinding?.fields ?? []));
@@ -978,6 +1013,17 @@ function validateSubagent(subagent, failures) {
 function validateClient(client, failures) {
   if (client?.persistence?.clientChangeLog !== false || client?.persistence?.clientCommitTables !== false) failures.push('第一版不得持久化前端变更日志或提交表');
   if (client?.persistence?.sessionState !== 'memory-only') failures.push('前端同步会话必须只在内存中');
+  if (client?.crossHostSynchronization?.detection !== 'sqlite-externalDataVersion'
+    || client?.crossHostSynchronization?.projection !== 'bounded-snapshot-required-on-external-change'
+    || client?.crossHostSynchronization?.backgroundWake !== 'persistent-RuntimeDeliveryWake-owner-routed-level-scan'
+    || client?.crossHostSynchronization?.daemonRequired !== false) {
+    failures.push('跨宿主同步必须检测外部 SQLite 提交并使用有界快照及归属路由的持久唤醒');
+  }
+  if (client?.conversationViews?.mainChat !== 'single-flight-open-and-focus-existing-per-host'
+    || client?.conversationViews?.foreignOwner !== 'reject-only-the-occupied-conversation'
+    || client?.conversationViews?.lastViewClosed !== 'release-only-after-runtime-work-and-command-pins-settle') {
+    failures.push('主聊天页按对话去重，跨宿主只拒绝被占用对话，关闭视图不得释放未收尾工作');
+  }
   if (client?.session?.maxInflightDataMessages !== 1) failures.push('同一前端会话只能有一个数据包在途');
   for (const field of ['maxQueuedBatches', 'maxQueuedBytes']) if (!positiveInteger(client?.session?.[field])) failures.push(`client.session.${field}必须是正整数`);
   if (client?.session?.snapshotRequiredCoalesced !== true) failures.push('snapshot-required必须合并为单一控制状态');

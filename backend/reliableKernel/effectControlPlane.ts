@@ -1396,6 +1396,23 @@ export class EffectControlPlane {
     return isEffectDispatchRequestEnvelope(value) ? value.dispatchFence : undefined;
   }
 
+  /**
+   * Resolves the Conversation whose mutable execution this effect belongs to, following
+   * EffectIntent → Attempt → Operation → ToolCall → Turn. Returns null only for genuinely
+   * detached effects (for example a Process-owned process_exit Operation with no ToolCall);
+   * a missing dispatch fence is never treated as detached. Ownership gates use this before any
+   * pending/dispatched convergence so a foreign live owner is never dispatched locally.
+   */
+  public async conversationIdForEffect(effectIntentIdInput: string): Promise<string | null> {
+    const intent = await this.requireExisting('EffectIntent', requireId(effectIntentIdInput, 'effectIntentId'));
+    const attempt = await this.requireExisting('Attempt', requireId(intent.attempt_id, 'EffectIntent.attempt_id'));
+    const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
+    if (operation.tool_call_id === null) return null;
+    const toolCall = await this.requireExisting('ToolCall', requireId(operation.tool_call_id, 'Operation.tool_call_id'));
+    const turn = await this.requireExisting('Turn', requireId(toolCall.turn_id, 'ToolCall.turn_id'));
+    return requireId(turn.conversation_id, 'Turn.conversation_id');
+  }
+
   /** Receipt writes do not require or assert an ExecutionLease. */
   public async recordEffectReceipt(input: {
     source: PhaseDCommandSource;

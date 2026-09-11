@@ -31,7 +31,8 @@ test('stale Turn interrupt is idempotently reported as already_terminal', async 
   const posted = [];
   const router = new VscodeReliableKernelCommandRouter({
     debugCapture: { setListener() {} },
-    toolHost: { setStateChangeListener() {} }
+    toolHost: { setStateChangeListener() {} },
+    application: { database: { conversationOwners: passthroughConversationOwners() } }
   });
   router.maybeRow = async (domain, id) => {
     assert.equal(domain, 'Turn');
@@ -170,6 +171,7 @@ test('durable Interaction result is posted before a stalled Agent resume complet
     debugCapture: { setListener() {} },
     toolHost: { setStateChangeListener() {} },
     application: {
+      database: { conversationOwners: passthroughConversationOwners() },
       interactions: {
         async resolvePlanReview(input) {
           assert.equal(input.source.key, 'interaction:interaction-request:accept:fixed-interaction-command');
@@ -310,6 +312,15 @@ function webview(posted) {
     async postMessage(message) {
       posted.push(message);
       return true;
+    }
+  };
+}
+
+/** The mandatory RuntimeDatabase owner manager reduced to its command-run contract. */
+function passthroughConversationOwners() {
+  return {
+    async run(conversationId, operation) {
+      return operation();
     }
   };
 }

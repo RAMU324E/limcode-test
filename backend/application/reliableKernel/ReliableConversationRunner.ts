@@ -27,6 +27,10 @@ import {
   runWithExecutionLeaseFence,
   type ExecutionLeaseFence
 } from '../../reliableKernel/executionLeaseFence';
+import {
+  isConversationRuntimeOwnerBusyError,
+  type ConversationRuntimeOwnerManager
+} from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
 import type { CoordinateCompressionResult } from '../../reliableKernel/contextCompressionCoordinator';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
@@ -181,18 +185,20 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const content = serializeUserContent(input.text, input.content);
-    const command: TurnInputCommand = {
-      source: { kind: 'command', key: input.commandId },
-      ...this.lease(input.conversationId),
-      ...(input.agentId?.trim() ? { executorAgentId: input.agentId.trim() } : {}),
-      ...(input.model ? { modelOverride: input.model } : {}),
-      content: content.value,
-      contentType: content.contentType
-    };
-    const result = await this.application.turns.input(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const content = serializeUserContent(input.text, input.content);
+      const command: TurnInputCommand = {
+        source: { kind: 'command', key: input.commandId },
+        ...this.lease(input.conversationId),
+        ...(input.agentId?.trim() ? { executorAgentId: input.agentId.trim() } : {}),
+        ...(input.model ? { modelOverride: input.model } : {}),
+        content: content.value,
+        contentType: content.contentType
+      };
+      const result = await this.application.turns.input(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   public async editGuidance(input: {
@@ -203,16 +209,18 @@ export class ReliableConversationRunner {
     text: string;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const command: TurnGuidanceEditCommand = {
-      source: { kind: 'command', key: input.commandId },
-      conversationId: input.conversationId,
-      intentId: input.intentId,
-      expectedRevisionSeq: input.expectedRevisionSeq,
-      text: input.text
-    };
-    const result = await this.application.turns.editGuidance(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const command: TurnGuidanceEditCommand = {
+        source: { kind: 'command', key: input.commandId },
+        conversationId: input.conversationId,
+        intentId: input.intentId,
+        expectedRevisionSeq: input.expectedRevisionSeq,
+        text: input.text
+      };
+      const result = await this.application.turns.editGuidance(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   public async cancelGuidance(input: {
@@ -222,15 +230,17 @@ export class ReliableConversationRunner {
     expectedRevisionSeq: string;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const command: TurnGuidanceCancelCommand = {
-      source: { kind: 'command', key: input.commandId },
-      conversationId: input.conversationId,
-      intentId: input.intentId,
-      expectedRevisionSeq: input.expectedRevisionSeq
-    };
-    const result = await this.application.turns.cancelGuidance(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const command: TurnGuidanceCancelCommand = {
+        source: { kind: 'command', key: input.commandId },
+        conversationId: input.conversationId,
+        intentId: input.intentId,
+        expectedRevisionSeq: input.expectedRevisionSeq
+      };
+      const result = await this.application.turns.cancelGuidance(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   public async setGuidanceHold(input: {
@@ -241,16 +251,18 @@ export class ReliableConversationRunner {
     hold: 'none' | 'paused';
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const command: TurnGuidanceHoldCommand = {
-      source: { kind: 'command', key: input.commandId },
-      conversationId: input.conversationId,
-      intentId: input.intentId,
-      expectedRevisionSeq: input.expectedRevisionSeq,
-      hold: input.hold
-    };
-    const result = await this.application.turns.setGuidanceHold(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const command: TurnGuidanceHoldCommand = {
+        source: { kind: 'command', key: input.commandId },
+        conversationId: input.conversationId,
+        intentId: input.intentId,
+        expectedRevisionSeq: input.expectedRevisionSeq,
+        hold: input.hold
+      };
+      const result = await this.application.turns.setGuidanceHold(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   public async reorderGuidance(input: {
@@ -259,14 +271,16 @@ export class ReliableConversationRunner {
     items: Array<{ intentId: string; expectedRevisionSeq: string }>;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const command: TurnGuidanceReorderCommand = {
-      source: { kind: 'command', key: input.commandId },
-      conversationId: input.conversationId,
-      items: input.items
-    };
-    const result = await this.application.turns.reorderGuidance(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const command: TurnGuidanceReorderCommand = {
+        source: { kind: 'command', key: input.commandId },
+        conversationId: input.conversationId,
+        items: input.items
+      };
+      const result = await this.application.turns.reorderGuidance(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   public async retry(input: {
@@ -279,20 +293,22 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const command: TurnRetryCommand = {
-      source: { kind: 'command', key: input.commandId },
-      ...this.lease(input.conversationId),
-      ...(input.agentId?.trim() ? { executorAgentId: input.agentId.trim() } : {}),
-      ...(input.model ? { modelOverride: input.model } : {}),
-      sourceTurnId: input.sourceTurnId,
-      target: input.target,
-      ...(input.expectedMessageRevisionId
-        ? { expectedMessageRevisionId: input.expectedMessageRevisionId }
-        : {})
-    };
-    const result = await this.application.turns.retry(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const command: TurnRetryCommand = {
+        source: { kind: 'command', key: input.commandId },
+        ...this.lease(input.conversationId),
+        ...(input.agentId?.trim() ? { executorAgentId: input.agentId.trim() } : {}),
+        ...(input.model ? { modelOverride: input.model } : {}),
+        sourceTurnId: input.sourceTurnId,
+        target: input.target,
+        ...(input.expectedMessageRevisionId
+          ? { expectedMessageRevisionId: input.expectedMessageRevisionId }
+          : {})
+      };
+      const result = await this.application.turns.retry(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   public async editAndRun(input: {
@@ -307,21 +323,23 @@ export class ReliableConversationRunner {
     model?: ChatModelOverrideRecord;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const content = serializeUserContent(input.text, input.content);
-    const command: TurnEditAndRunCommand = {
-      source: { kind: 'command', key: input.commandId },
-      ...this.lease(input.conversationId),
-      messageId: input.messageId,
-      expectedRevisionId: input.expectedRevisionId,
-      content: content.value,
-      contentType: content.contentType,
-      ...(input.deleteFollowing ? { deleteFollowing: true } : {}),
-      ...(input.agentId?.trim() ? { executorAgentId: input.agentId.trim() } : {}),
-      ...(input.model ? { modelOverride: input.model } : {})
-    };
-    const result = await this.application.turns.editAndRun(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const content = serializeUserContent(input.text, input.content);
+      const command: TurnEditAndRunCommand = {
+        source: { kind: 'command', key: input.commandId },
+        ...this.lease(input.conversationId),
+        messageId: input.messageId,
+        expectedRevisionId: input.expectedRevisionId,
+        content: content.value,
+        contentType: content.contentType,
+        ...(input.deleteFollowing ? { deleteFollowing: true } : {}),
+        ...(input.agentId?.trim() ? { executorAgentId: input.agentId.trim() } : {}),
+        ...(input.model ? { modelOverride: input.model } : {})
+      };
+      const result = await this.application.turns.editAndRun(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   public async continuation(input: {
@@ -332,17 +350,19 @@ export class ReliableConversationRunner {
     content?: MessageContent;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const content = serializeUserContent(input.text, input.content);
-    const command: TurnContinuationCommand = {
-      source: { kind: 'command', key: input.commandId },
-      ...this.lease(input.conversationId),
-      sourceTurnId: input.sourceTurnId,
-      content: content.value,
-      contentType: content.contentType
-    };
-    const result = await this.application.turns.continuation(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const content = serializeUserContent(input.text, input.content);
+      const command: TurnContinuationCommand = {
+        source: { kind: 'command', key: input.commandId },
+        ...this.lease(input.conversationId),
+        sourceTurnId: input.sourceTurnId,
+        content: content.value,
+        contentType: content.contentType
+      };
+      const result = await this.application.turns.continuation(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   /** Durable internal continuation: no visible synthetic user message and frozen source authority. */
@@ -353,15 +373,17 @@ export class ReliableConversationRunner {
     sourceTurnId: string;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const command: TurnRuntimeContinuationCommand = {
-      source: { kind: 'internal', key: input.commandId },
-      ...this.lease(input.conversationId),
-      sourceTurnId: input.sourceTurnId,
-      deliveryId: input.deliveryId
-    };
-    const result = await this.application.turns.runtimeContinuation(command);
-    this.wake(result);
-    return result;
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const command: TurnRuntimeContinuationCommand = {
+        source: { kind: 'internal', key: input.commandId },
+        ...this.lease(input.conversationId),
+        sourceTurnId: input.sourceTurnId,
+        deliveryId: input.deliveryId
+      };
+      const result = await this.application.turns.runtimeContinuation(command);
+      this.wake(result);
+      return result;
+    });
   }
 
   /**
@@ -376,29 +398,31 @@ export class ReliableConversationRunner {
     target?: CompressionCommandTarget;
   }): Promise<ReliableManualCompressionResult> {
     this.requireOpen();
-    const replay = await this.inspectManualCompression({
-      commandId: input.commandId,
-      conversationId: input.conversationId,
-      target: input.target
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const replay = await this.inspectManualCompression({
+        commandId: input.commandId,
+        conversationId: input.conversationId,
+        target: input.target
+      });
+      if (replay) return replay;
+      const started = await this.admitManualCompression(input);
+      const turnId = requireId(started.turnId, 'Manual compression Turn.id');
+      if (started.admitted !== true) {
+        throw new Error('手动压缩维护 Turn 未取得当前对话执行租约。');
+      }
+      // Use the same registered DriveSlot as ordinary Turns. This makes remote durable interrupts,
+      // lease renewal/handoff and waitForIdle observe maintenance work; scheduleDrive classifies the
+      // Turn from its immutable TurnIntent payload before choosing a driver.
+      const slot = this.scheduleDrive(input.conversationId, turnId);
+      if (!slot) throw new Error('手动压缩维护 Turn 未能进入可靠调度。');
+      await slot.task;
+      if (slot.error) throw slot.error;
+      return {
+        turnId,
+        deduplicated: started.deduplicated,
+        ...(slot.maintenanceResult ? { compression: slot.maintenanceResult } : {})
+      };
     });
-    if (replay) return replay;
-    const started = await this.admitManualCompression(input);
-    const turnId = requireId(started.turnId, 'Manual compression Turn.id');
-    if (started.admitted !== true) {
-      throw new Error('手动压缩维护 Turn 未取得当前对话执行租约。');
-    }
-    // Use the same registered DriveSlot as ordinary Turns. This makes remote durable interrupts,
-    // lease renewal/handoff and waitForIdle observe maintenance work; scheduleDrive classifies the
-    // Turn from its immutable TurnIntent payload before choosing a driver.
-    const slot = this.scheduleDrive(input.conversationId, turnId);
-    if (!slot) throw new Error('手动压缩维护 Turn 未能进入可靠调度。');
-    await slot.task;
-    if (slot.error) throw slot.error;
-    return {
-      turnId,
-      deduplicated: started.deduplicated,
-      ...(slot.maintenanceResult ? { compression: slot.maintenanceResult } : {})
-    };
   }
 
   /**
@@ -417,47 +441,49 @@ export class ReliableConversationRunner {
     };
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const commandSourceKey = `manual-compression:${input.commandId}:turn`;
-    const sourceTurnId = await this.manualCompressionSourceTurn(
-      input.conversationId,
-      input.childExecution?.childExecutionId
-    );
-    const execution = input.childExecution
-      ? {
-          conversationId: input.conversationId,
-          leaseOwnerId: requireId(input.childExecution.leaseOwnerId, 'Child scheduler lease owner'),
-          hostBootId: this.application.database.hostBootId,
-          leaseExpiresAt: new Date(Date.now() + this.leaseDurationMs).toISOString(),
-          membership: {
-            kind: 'child_execution' as const,
-            childExecutionId: requireId(
-              input.childExecution.childExecutionId,
-              'Manual compression ChildExecution.id'
-            )
-          }
-        }
-      : this.lease(input.conversationId);
-    return this.application.turns.runtimeContinuation({
-      source: { kind: 'internal', key: commandSourceKey },
-      ...execution,
-      sourceTurnId,
-      // Calls which predate target freezing retain the exact v1 descriptor. Every UI command now
-      // supplies a frozen target and therefore emits v2; recovery must continue to understand
-      // already-persisted v1 Turns without rewriting their identity or payload shape.
-      maintenance: input.target
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const commandSourceKey = `manual-compression:${input.commandId}:turn`;
+      const sourceTurnId = await this.manualCompressionSourceTurn(
+        input.conversationId,
+        input.childExecution?.childExecutionId
+      );
+      const execution = input.childExecution
         ? {
-            kind: 'manual_context_compression',
-            version: 2,
-            compressSegmentCount: input.compressSegmentCount,
-            target: input.target,
-            commandSourceKey
+            conversationId: input.conversationId,
+            leaseOwnerId: requireId(input.childExecution.leaseOwnerId, 'Child scheduler lease owner'),
+            hostBootId: this.application.database.hostBootId,
+            leaseExpiresAt: new Date(Date.now() + this.leaseDurationMs).toISOString(),
+            membership: {
+              kind: 'child_execution' as const,
+              childExecutionId: requireId(
+                input.childExecution.childExecutionId,
+                'Manual compression ChildExecution.id'
+              )
+            }
           }
-        : {
-            kind: 'manual_context_compression',
-            version: 1,
-            compressSegmentCount: input.compressSegmentCount,
-            commandSourceKey
-          }
+        : this.lease(input.conversationId);
+      return this.application.turns.runtimeContinuation({
+        source: { kind: 'internal', key: commandSourceKey },
+        ...execution,
+        sourceTurnId,
+        // Calls which predate target freezing retain the exact v1 descriptor. Every UI command now
+        // supplies a frozen target and therefore emits v2; recovery must continue to understand
+        // already-persisted v1 Turns without rewriting their identity or payload shape.
+        maintenance: input.target
+          ? {
+              kind: 'manual_context_compression',
+              version: 2,
+              compressSegmentCount: input.compressSegmentCount,
+              target: input.target,
+              commandSourceKey
+            }
+          : {
+              kind: 'manual_context_compression',
+              version: 1,
+              compressSegmentCount: input.compressSegmentCount,
+              commandSourceKey
+            }
+      });
     });
   }
 
@@ -471,6 +497,9 @@ export class ReliableConversationRunner {
       conversationId: requireId(input.conversationId, 'Manual compression Conversation.id'),
       turnId: requireId(input.turnId, 'Manual compression Turn.id')
     };
+    // The caller holds the execution fence; it must also hold this Conversation's runtime
+    // ownership. Driving peer-owned work is never allowed, even through an established fence.
+    await this.conversationOwners.assertOwned(slot.conversationId);
     const frozen = await this.readManualCompressionDrive(slot);
     return frozen ? this.driveManualCompression(slot, frozen) : null;
   }
@@ -578,10 +607,25 @@ export class ReliableConversationRunner {
    * resumable active Turn according to identity.json, finalizes orphan Turns, and level-triggers
    * ordinary queued admission. Scheduling is idempotent; use waitForIdle() only when shutdown/tests
    * need to drain the resulting work.
+   *
+   * Every recovered Conversation is first claimed through the runtime owner manager. A
+   * Conversation owned by a live/unknown peer Host is skipped (reported as live-owned) without
+   * poisoning unrelated recovery; resume candidates stay level-triggered via deferredRecovery so
+   * a later peer release/shutdown still reclaims execution in this Host.
+   *
+   * Passing conversationId scopes every repository scan and ownership claim to that one
+   * Conversation: a view taking over a crashed peer's Conversation recovers it inside this
+   * already-running Host without a reboot or a global sweep.
    */
-  public async recoverStartup(signal?: AbortSignal): Promise<ReliableConversationRunnerRecoveryReport> {
+  public async recoverStartup(
+    signal?: AbortSignal,
+    conversationId?: string
+  ): Promise<ReliableConversationRunnerRecoveryReport> {
     this.requireOpen();
     signal?.throwIfAborted();
+    const scopedConversationId = conversationId === undefined
+      ? undefined
+      : requireId(conversationId, 'Recovery Conversation.id');
     const childTurnIds = new Set(
       (await listAllDomainRows(this.application.database, 'ChildExecutionActiveTurnLink'))
         .map((link) => requireId(link.turn_id, 'ChildExecutionActiveTurnLink.turn_id'))
@@ -589,7 +633,10 @@ export class ReliableConversationRunner {
     // The mutable active pointer is committed atomically with every child Turn admission. Reading
     // it avoids scanning immutable historical membership while still preventing this runner from
     // replacing the child coordinator's lease generation.
-    const activeTurns = (await listAllDomainRows(this.application.database, 'Turn', { status: 'active' }))
+    const activeTurns = (await listAllDomainRows(this.application.database, 'Turn', {
+      status: 'active',
+      ...(scopedConversationId ? { conversation_id: scopedConversationId } : {})
+    }))
       .filter((turn) => !childTurnIds.has(requireId(turn.id, 'Turn.id')))
       .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at))
         || String(left.id).localeCompare(String(right.id)));
@@ -602,14 +649,26 @@ export class ReliableConversationRunner {
       queuedConversationIds: []
     };
     const admissionBlockedConversationIds = new Set<string>();
+    const ownership = new Map<string, boolean>();
     for (const turn of activeTurns) {
       signal?.throwIfAborted();
       const turnId = requireId(turn.id, 'Turn.id');
-      const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+      const turnConversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
       const facts = await this.application.turns.recoveryFacts(turnId);
       if (facts.judgment === 'needs_human') {
         report.needsHumanTurnIds.push(turnId);
-        admissionBlockedConversationIds.add(conversationId);
+        admissionBlockedConversationIds.add(turnConversationId);
+        continue;
+      }
+      if (!await this.tryOwnConversation(turnConversationId, ownership)) {
+        // A live peer Host owns this Conversation. Skipping it must not poison unrelated
+        // recovery; the resume candidate stays level-triggered for a later release/shutdown.
+        report.liveOwnedTurnIds.push(turnId);
+        admissionBlockedConversationIds.add(turnConversationId);
+        if (facts.judgment === 'resume') {
+          this.deferredRecovery.set(turnId, { conversationId: turnConversationId, turnId });
+          this.ensureExternalWakePolling();
+        }
         continue;
       }
       if (facts.judgment === 'finalize') {
@@ -624,24 +683,28 @@ export class ReliableConversationRunner {
       }
       const claimed = await this.application.turns.claimRecoveryExecution({
         turnId,
-        ...this.lease(conversationId)
+        ...this.lease(turnConversationId)
       });
       if (!claimed) {
         // A live owner or another recovery contender won the exact-row CAS. Both are safe,
         // non-error startup outcomes; this Host must not schedule the Turn.
         report.liveOwnedTurnIds.push(turnId);
-        admissionBlockedConversationIds.add(conversationId);
-        this.deferredRecovery.set(turnId, { conversationId, turnId });
+        admissionBlockedConversationIds.add(turnConversationId);
+        this.deferredRecovery.set(turnId, { conversationId: turnConversationId, turnId });
         this.ensureExternalWakePolling();
         continue;
       }
       report.resumedTurnIds.push(turnId);
-      admissionBlockedConversationIds.add(conversationId);
-      this.scheduleDrive(conversationId, turnId);
+      admissionBlockedConversationIds.add(turnConversationId);
+      this.scheduleDrive(turnConversationId, turnId);
     }
 
     const [queued, childIntentLinks] = await Promise.all([
-      listAllDomainRows(this.application.database, 'TurnIntent', { state: 'queued', turn_id: null }),
+      listAllDomainRows(this.application.database, 'TurnIntent', {
+        state: 'queued',
+        turn_id: null,
+        ...(scopedConversationId ? { conversation_id: scopedConversationId } : {})
+      }),
       listAllDomainRows(this.application.database, 'ChildExecutionIntentLink', { state: 'pending' })
     ]);
     const childIntentIds = new Set(childIntentLinks.map((link) => String(link.turn_intent_id)));
@@ -650,10 +713,13 @@ export class ReliableConversationRunner {
       .filter((intent) => !admissionBlockedConversationIds.has(String(intent.conversation_id)))
       .map((intent) => requireId(intent.conversation_id, 'TurnIntent.conversation_id'))
     )].sort();
-    report.queuedConversationIds.push(...queuedConversationIds);
-    for (const conversationId of queuedConversationIds) {
+    for (const queuedConversationId of queuedConversationIds) {
       signal?.throwIfAborted();
-      this.scheduleAdmission(conversationId);
+      // Queued admission drains only under this Host's Conversation ownership; a live peer owner
+      // drains its own queue and is skipped here.
+      if (!await this.tryOwnConversation(queuedConversationId, ownership)) continue;
+      report.queuedConversationIds.push(queuedConversationId);
+      this.scheduleAdmission(queuedConversationId);
     }
     return report;
   }
@@ -666,23 +732,25 @@ export class ReliableConversationRunner {
     reason: string;
   }): Promise<TurnCommandResult> {
     this.requireOpen();
-    const result = await this.application.turns.interrupt({
-      source: { kind: 'command', key: input.commandId },
-      turnId: input.turnId,
-      ...(input.expectedLeaseGeneration
-        ? { expectedLeaseGeneration: input.expectedLeaseGeneration }
-        : {}),
-      reason: input.reason
-    });
-    this.scheduleDrive(input.conversationId, input.turnId);
-    void this.cancelLocalExecution(input.conversationId, input.turnId, input.reason).catch((error) => {
-      this.onError(error, {
-        operation: 'drive',
-        conversationId: input.conversationId,
-        turnId: input.turnId
+    return this.conversationOwners.run(input.conversationId, async () => {
+      const result = await this.application.turns.interrupt({
+        source: { kind: 'command', key: input.commandId },
+        turnId: input.turnId,
+        ...(input.expectedLeaseGeneration
+          ? { expectedLeaseGeneration: input.expectedLeaseGeneration }
+          : {}),
+        reason: input.reason
       });
+      this.scheduleDrive(input.conversationId, input.turnId);
+      void this.cancelLocalExecution(input.conversationId, input.turnId, input.reason).catch((error) => {
+        this.onError(error, {
+          operation: 'drive',
+          conversationId: input.conversationId,
+          turnId: input.turnId
+        });
+      });
+      return result;
     });
-    return result;
   }
 
   public async waitForIdle(): Promise<void> {
@@ -733,7 +801,7 @@ export class ReliableConversationRunner {
       terminal: false,
       task: Promise.resolve()
     };
-    const task = this.runDriveSlot(slot)
+    const task = this.runOwnedDriveSlot(slot)
       .catch(async (error) => {
         slot.error = error;
         let terminationPending = false;
@@ -754,9 +822,32 @@ export class ReliableConversationRunner {
     return slot;
   }
 
+  /**
+   * Every asynchronous drive pins its Conversation runtime ownership for the entire slot
+   * lifetime, so an idle ownership release can never race a scheduled drive. A Conversation
+   * owned by a live peer Host is a quiet stand-down, not an error: the level-triggered deferred
+   * candidate reclaims execution here once the peer releases ownership or shuts down.
+   */
+  private async runOwnedDriveSlot(slot: DriveSlot): Promise<void> {
+    try {
+      await this.conversationOwners.run(slot.conversationId, () => this.runDriveSlot(slot));
+    } catch (error) {
+      if (isConversationRuntimeOwnerBusyError(error)) {
+        slot.terminal = true;
+        slot.completedGeneration = slot.requestedGeneration;
+        this.deferExecutionRecovery(slot);
+        return;
+      }
+      throw error;
+    }
+  }
+
   private async runDriveSlot(slot: DriveSlot): Promise<void> {
     for (;;) {
       if (this.disposed) return;
+      // Driving/dispatching requires this Host to own the Conversation runtime. The enclosing
+      // ownership pin makes this a cheap invariant assertion rather than an acquisition.
+      await this.conversationOwners.assertOwned(slot.conversationId);
       const generation = slot.requestedGeneration;
       try {
         let fence = await this.application.turns.executionLeaseFence({
@@ -1141,6 +1232,7 @@ export class ReliableConversationRunner {
     ) return;
     this.externalWakePollInFlight = true;
     try {
+      const ownership = new Map<string, boolean>();
       await this.cancelDurablyInterruptedLocalTurns();
       if (this.waitingOwned.size > 0) {
         const localWake = this.localWakeRequested;
@@ -1148,6 +1240,12 @@ export class ReliableConversationRunner {
         const version = await this.application.database.externalDataVersion();
         for (const waiting of [...this.waitingOwned.values()]) {
           if (!localWake && waiting.externalDataVersion === version) continue;
+          if (!await this.tryOwnConversation(waiting.conversationId, ownership)) {
+            // A live peer Host owns this Conversation now; its runner observes and drives the
+            // waiting Turn. Keeping the local entry would auto-drive peer-owned work.
+            this.waitingOwned.delete(waiting.turnId);
+            continue;
+          }
           const observation = await this.observeWaitingWake(waiting.turnId);
           if (observation.fingerprint === waiting.wakeFingerprint) {
             // SQLite data_version is database-global. A different Conversation/Turn committed;
@@ -1167,6 +1265,9 @@ export class ReliableConversationRunner {
           this.terminationRecoveryFailures.delete(deferred.turnId);
           continue;
         }
+        // A live/unknown peer Conversation owner must never be displaced. The candidate stays
+        // level-triggered so a later peer release/shutdown still reclaims execution here.
+        if (!await this.tryOwnConversation(deferred.conversationId, ownership)) continue;
         const claimed = await this.application.turns.claimRecoveryExecution({
           turnId: deferred.turnId,
           ...this.lease(deferred.conversationId)
@@ -1549,11 +1650,25 @@ export class ReliableConversationRunner {
       completedGeneration: 0n,
       task: Promise.resolve()
     };
-    const task = this.runAdmissionSlot(slot)
+    const task = this.runOwnedAdmissionSlot(slot)
       .catch((error) => this.onError(error, { operation: 'admit-next', conversationId }))
       .finally(() => this.finishAdmissionSlot(slot));
     slot.task = task;
     this.admissions.set(conversationId, slot);
+  }
+
+  /**
+   * Queued admission drains only under this Host's Conversation runtime ownership, pinned through
+   * completion so an idle release cannot race an in-flight admission. A live peer owner drains
+   * its own queue; standing down is a safe no-op because the queued Intent stays durable.
+   */
+  private async runOwnedAdmissionSlot(slot: AdmissionSlot): Promise<void> {
+    try {
+      await this.conversationOwners.run(slot.conversationId, () => this.runAdmissionSlot(slot));
+    } catch (error) {
+      if (isConversationRuntimeOwnerBusyError(error)) return;
+      throw error;
+    }
   }
 
   private async runAdmissionSlot(slot: AdmissionSlot): Promise<void> {
@@ -1599,6 +1714,26 @@ export class ReliableConversationRunner {
       hostBootId: this.application.database.hostBootId,
       leaseExpiresAt: new Date(Date.now() + this.leaseDurationMs).toISOString()
     };
+  }
+
+  private get conversationOwners(): ConversationRuntimeOwnerManager {
+    return this.application.database.conversationOwners;
+  }
+
+  /**
+   * Claims a Conversation for recovery/poll work with stand-down semantics: false means a
+   * live/unknown peer Host owns it and this Host must not drive its work. Results are cached per
+   * recovery sweep/poll tick; each new tick re-evaluates, which keeps the level trigger alive.
+   */
+  private async tryOwnConversation(
+    conversationId: string,
+    cache: Map<string, boolean>
+  ): Promise<boolean> {
+    const cached = cache.get(conversationId);
+    if (cached !== undefined) return cached;
+    const owned = await this.conversationOwners.tryClaim(conversationId);
+    cache.set(conversationId, owned);
+    return owned;
   }
 
   private requireOpen(): void {

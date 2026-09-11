@@ -90,8 +90,15 @@ export class ConversationDeletionControlPlane {
       DOMAIN_REPOSITORIES.domain('Conversation').delete(targetId)
     ));
 
-    await this.database.transaction(steps);
-    return { deletedConversationIds: deletionOrder };
+    const ownershipOrder = [...deletionOrder].sort();
+    const deleteOwned = async (index: number): Promise<ConversationDeleteResult> => {
+      if (index < ownershipOrder.length) {
+        return this.database.conversationOwners.run(ownershipOrder[index], () => deleteOwned(index + 1));
+      }
+      await this.database.transaction(steps);
+      return { deletedConversationIds: deletionOrder };
+    };
+    return deleteOwned(0);
   }
 
   private async readSnapshot(rootConversationId: string): Promise<ConversationDeletionSnapshot | null> {

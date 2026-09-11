@@ -22,11 +22,6 @@ const {
   resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot
 } = require('../../dist/extension/backend/reliableKernel/vscodeRootAuthority.js');
-const {
-  WORKSPACE_RUNTIME_OWNER_FILE,
-  WorkspaceRuntimeOwnerBusyError,
-  acquireWorkspaceRuntimeOwnerClaim
-} = require('../../dist/extension/vscode/WorkspaceRuntimeOwnerClaim.js');
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { loadRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
@@ -92,52 +87,6 @@ test('Workspace身份稳定分流旧Runtime与兄弟隔离根', async () => {
   }
 });
 
-test('同Workspace owner互斥、死owner可接管且不同Workspace并行', async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-workspace-runtime-owner-'));
-  try {
-    const firstPath = path.join(root, 'first-owner');
-    const secondPath = path.join(root, 'second-owner');
-    const first = await acquireWorkspaceRuntimeOwnerClaim({
-      claimPath: firstPath,
-      workspaceKey: 'workspace:first'
-    });
-    await assert.rejects(
-      acquireWorkspaceRuntimeOwnerClaim({ claimPath: firstPath, workspaceKey: 'workspace:first' }),
-      (error) => error instanceof WorkspaceRuntimeOwnerBusyError
-        && error.owner.ownerToken === first.metadata.ownerToken
-    );
-
-    const second = await acquireWorkspaceRuntimeOwnerClaim({
-      claimPath: secondPath,
-      workspaceKey: 'workspace:second'
-    });
-    assert.notEqual(first.metadata.ownerToken, second.metadata.ownerToken);
-    await Promise.all([first.release(), second.release()]);
-
-    const deadPath = path.join(root, 'dead-owner');
-    await fs.mkdir(deadPath);
-    await fs.writeFile(path.join(deadPath, WORKSPACE_RUNTIME_OWNER_FILE), `${JSON.stringify({
-      workspaceKey: 'workspace:dead',
-      ownerToken: 'dead-owner-token',
-      pid: 2_147_483_647,
-      processStartIdentity: 'dead-process-start',
-      startedAt: new Date(0).toISOString()
-    })}\n`);
-
-    const contenders = await Promise.allSettled([
-      acquireWorkspaceRuntimeOwnerClaim({ claimPath: deadPath, workspaceKey: 'workspace:dead' }),
-      acquireWorkspaceRuntimeOwnerClaim({ claimPath: deadPath, workspaceKey: 'workspace:dead' })
-    ]);
-    const winners = contenders.filter((result) => result.status === 'fulfilled');
-    const losers = contenders.filter((result) => result.status === 'rejected');
-    assert.equal(winners.length, 1);
-    assert.equal(losers.length, 1);
-    assert.equal(losers[0].reason instanceof WorkspaceRuntimeOwnerBusyError, true);
-    await winners[0].value.release();
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
 
 test('两个配置Authority不会把对方Workspace持久化为不可用', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-workspace-environment-isolation-'));

@@ -203,6 +203,15 @@ export async function legacyRuntimeRequiresCutover(dataRootPathInput: string): P
 }
 
 /**
+ * Read-only startup-gate preflight: true when an interrupted cutover journal is present, i.e.
+ * {@link recoverInterruptedPhysicalCutover} would complete or roll back durable file operations.
+ */
+export async function physicalCutoverRecoveryRequired(dataRootPathInput: string): Promise<boolean> {
+  const dataRootPath = normalizedAbsolutePath(dataRootPathInput, 'cutover data root');
+  return (await readJournal(dataRootPath)) !== undefined;
+}
+
+/**
  * Completes or rolls back an interrupted archive before ordinary Runtime startup. It never guesses:
  * a valid pointer different from previousBinding means activation committed; every other state rolls
  * back the pre-activation file operations before the request may be retried.

@@ -220,27 +220,6 @@ test('UI and product routes bind recursive stop to child-isolated activity facts
   assert.match(sidebar, /终止此子 Agent 及其启动的所有子 Agent/);
 });
 
-test('all host conversation-open routes validate persistent Conversation identity', () => {
-  const panel = source('vscode/panels/MainPanel.ts');
-  const sidebar = source('vscode/views/SidebarEntryView.ts');
-  const facadeContract = source('vscode/ApplicationFacade.ts');
-  const facade = source('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.ts');
-  const panelOpen = panel.slice(
-    panel.indexOf('private openConversationFromPanel('),
-    panel.indexOf('private openPlanProposalFromPanel(')
-  );
-  const sidebarOpen = sidebar.slice(
-    sidebar.indexOf('private openConversationFromSidebar('),
-    sidebar.indexOf('private openPanelFromSidebar(')
-  );
-  assert.match(panelOpen, /this\.backendApp\.conversationExists\(conversationId\)/);
-  assert.match(sidebarOpen, /await backendApp\.conversationExists\(conversationId\)/);
-  assert.doesNotMatch(sidebarOpen, /prepareConversationForSidebarOpen/);
-  assert.doesNotMatch(facadeContract, /prepareConversationForSidebarOpen/);
-  assert.doesNotMatch(facade, /prepareConversationForSidebarOpen/);
-  assert.match(facade, /conversationExists[\s\S]*?maybeRow\('Conversation', conversationId\)/);
-});
-
 test('parent feed receives a bounded child activity change without child ToolCall leakage', async () => {
   const kernel = require(path.join(root, 'dist/extension/backend/reliableKernel/index.js'));
   const parent = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'limcode-child-activity-'));

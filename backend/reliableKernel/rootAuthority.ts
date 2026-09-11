@@ -13,6 +13,7 @@ import {
   type RuntimeEpochManifest,
   type RuntimeRootPaths
 } from './contracts';
+import { withRuntimeDataRootAdmission, withRuntimeMaintenance } from './runtimeHostControl';
 
 export class RootAuthorityError extends Error {
   public constructor(public readonly code: string, message: string, cause?: unknown) {
@@ -93,6 +94,12 @@ interface RootAuthorityValidationCache {
  * RootAuthority is the only component allowed to resolve and activate Runtime roots. Long-lived
  * services cache one immutable complete RootBinding, never a naked path. Root changes are offline:
  * callers must close the old service before opening one with the returned binding.
+ *
+ * Every production authority carries its configuration-root getter so Host registration and root
+ * maintenance always enter the shared admission boundary first (canonical order: configuration
+ * admission, then scope maintenance — never the reverse). A standalone authority without the
+ * getter falls back to its own control-root boundary, which is exactly the scope maintenance
+ * claim and therefore joins nested maintenance calls reentrantly.
  */
 export class RootAuthority {
   private readonly validationFlights = new Set<RootAuthorityValidationFlight>();
@@ -100,11 +107,26 @@ export class RootAuthority {
 
   public constructor(
     private readonly getDataRootPath: () => string,
-    private readonly validationObserver?: RootAuthorityValidationObserver
+    private readonly validationObserver?: RootAuthorityValidationObserver,
+    private readonly getConfigurationRootPath?: () => string
   ) {}
 
   public expectedPaths(): RuntimeRootPaths {
     return createRuntimeRootPaths(this.getDataRootPath());
+  }
+
+  /**
+   * The admission boundary shared by every Runtime Host rooted in the same configuration data
+   * root. Host registration (RuntimeDatabase.open) and every root mutation must run inside this
+   * claim so a configuration-root-wide operation (legacy physical cutover) is never raced by a
+   * new scope registering mid-enumeration. Nested calls join the outer claim per async scope.
+   */
+  public withRuntimeHostAdmission<T>(operation: () => Promise<T>): Promise<T> {
+    const configurationRootPath = this.getConfigurationRootPath?.();
+    if (configurationRootPath === undefined) {
+      return withRuntimeMaintenance(this.expectedPaths(), operation);
+    }
+    return withRuntimeDataRootAdmission(configurationRootPath, operation);
   }
 
   /** Reads the active pointer without requiring the referenced root/epoch to remain online. */

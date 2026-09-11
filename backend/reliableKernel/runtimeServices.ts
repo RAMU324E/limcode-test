@@ -144,9 +144,6 @@ export class ReliableKernelRuntimeRouter {
     return this.services.deliveries.create(command);
   }
 
-  public advanceDelivery(deliveryId: string) {
-    return this.services.deliveries.advance(requirePhaseFId(deliveryId, 'deliveryId'));
-  }
 
   public runRecovery(id: Parameters<PhaseFRecoveryScanner['run']>[0]) {
     return this.services.recovery.run(id);

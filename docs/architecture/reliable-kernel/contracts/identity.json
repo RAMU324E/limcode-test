@@ -10,6 +10,23 @@
     "dedupeBy": "CommandReceipt(source_kind,source_key)",
     "runIdAuthorityAllowed": false
   },
+  "conversationOwnerIdentity": {
+    "fields": [
+      "dataSetId",
+      "rootInstanceId",
+      "rootGeneration",
+      "conversationId",
+      "hostBootId",
+      "ownerToken",
+      "processId",
+      "processStartIdentity",
+      "startedAt"
+    ],
+    "scope": "authority.json#conversationHostOwnership",
+    "takeover": "仅在操作系统确认旧进程已退出或启动指纹证明 PID 已复用后认领；心跳延迟、租约过期和未知存活状态均不能抢占活宿主。",
+    "release": "核对 ownerToken；并发接管使用旧 ownerToken 的确定性隔离目录，不能移动新一代归属。",
+    "executionFence": "ExecutionLease 的 id、conversationId、turnId、ownerId、hostBootId、generation 继续约束所有执行写入；会话归属不替代 Turn 执行身份。"
+  },
   "effectIdentity": {
     "fields": [
       "operationId",
@@ -46,6 +63,7 @@
     "rule": "旧连接、旧尝试和终态后的迟到事件全部忽略。"
   },
   "recoveryJudgment": {
+    "precondition": "先认领对应 ConversationRuntimeOwner；未归本宿主的对话只读跳过。另一存活宿主的 ExecutionLease 不因过期而被接管。",
     "values": [
       "resume",
       "finalize",

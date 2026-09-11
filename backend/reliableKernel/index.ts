@@ -1,4 +1,6 @@
 export * from './contracts';
+export * from './ConversationRuntimeOwnerManager';
+export * from './runtimeHostControl';
 export * from './contentAddressedStore';
 export * from './contextSequence';
 export * from './contextCompression';

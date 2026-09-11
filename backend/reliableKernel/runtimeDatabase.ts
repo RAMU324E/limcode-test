@@ -46,6 +46,14 @@ import {
 } from './repositories';
 import { RootAuthority } from './rootAuthority';
 import {
+  ConversationRuntimeOwnerManager,
+  ConversationRuntimeOwnerReleasedError
+} from './ConversationRuntimeOwnerManager';
+import {
+  runtimeHostLivenessDirectory,
+  withRuntimeMaintenance
+} from './runtimeHostControl';
+import {
   currentExecutionLeaseFence,
   ExecutionHandoffError,
   executionLeaseFenceAssertion,
@@ -73,13 +81,9 @@ export class RuntimeDatabaseWorkerError extends Error {
   }
 }
 
-const OPEN_ROOT_POINTERS = new Set<string>();
-const HOST_LIVENESS_DIRECTORY = 'host-liveness';
+const OPEN_ROOT_POINTERS = new Map<string, string>();
 const HOST_HEARTBEAT_INTERVAL_MS = 5_000;
-// This does not shorten ExecutionLease ownership. A verifiably live process remains authoritative
-// regardless of heartbeat age; the grace is only a conservative fallback where the OS cannot
-// determine process identity/liveness.
-const HOST_HEARTBEAT_STALE_MS = 2 * 60_000;
+const CONVERSATION_OWNER_SWEEP_DELAY_MS = 50;
 
 interface RuntimeHostLivenessRecord {
   kind: 'limcode-runtime-host-liveness';
@@ -110,12 +114,17 @@ export class RuntimeDatabase {
   };
   private nextRequestId = 1;
   private closed = false;
+  private closePromise: Promise<void> | undefined;
   private readonly livenessId = randomUUID();
   private readonly startedAt = new Date().toISOString();
   private readonly processStartIdentity = readProcessStartIdentity(process.pid);
   private heartbeatTimer: NodeJS.Timeout | undefined;
   private heartbeatTask: Promise<void> = Promise.resolve();
   private heartbeatFailure: unknown;
+  public readonly conversationOwners: ConversationRuntimeOwnerManager;
+  private conversationOwnerSweepTimer: NodeJS.Timeout | undefined;
+  private conversationOwnerSweepTask: Promise<void> = Promise.resolve();
+  private conversationOwnerSweepsStopped = false;
 
   private constructor(
     private readonly authority: RootAuthority,
@@ -127,46 +136,67 @@ export class RuntimeDatabase {
     initialPerformanceMetrics?: RuntimePerformanceMetricsSink
   ) {
     if (initialPerformanceMetrics) this.performanceMetricSinks.add(initialPerformanceMetrics);
+    this.conversationOwners = new ConversationRuntimeOwnerManager(binding, hostBootId);
+    this.conversationOwners.setPendingWorkProbe((conversationId) =>
+      this.hasConversationRuntimeWork(conversationId));
     worker.on('message', (message: DatabaseWorkerResponse) => this.onMessage(message));
-    worker.on('error', (error) => this.failPending(error));
+    worker.on('error', (error) => {
+      this.closed = true;
+      this.failPending(error);
+    });
     worker.on('exit', (code) => {
-      OPEN_ROOT_POINTERS.delete(this.registryKey);
+      if (OPEN_ROOT_POINTERS.get(this.registryKey) === this.hostBootId) {
+        OPEN_ROOT_POINTERS.delete(this.registryKey);
+      }
       this.stopHeartbeatTimer();
-      void this.unregisterHostLiveness().catch(() => undefined);
-      if (!this.closed && code !== 0) this.failPending(new Error(`SQLite database worker exited with code ${code}.`));
+      // Unexpected worker exit is not proof that this Host's external capabilities quiesced:
+      // the liveness record and durable conversation owners stay fail-closed until an explicit
+      // graceful close() drains and fences the work (or the OS proves the process dead).
+      const unexpected = !this.closed && !this.closePromise;
+      this.closed = true;
+      if (unexpected || code !== 0) this.failPending(new Error(`SQLite database worker exited with code ${code}.`));
     });
   }
 
+  /**
+   * Opens the shared Runtime root. The short control-root maintenance claim is held through
+   * worker startup and Host liveness registration so destructive maintenance (reset, archive,
+   * cutover, data-root switch) can never race a new Host whose record is not yet visible; the
+   * claim is released before any execution work runs.
+   */
   public static async open(
     authority: RootAuthority,
     options: { hostBootId?: string; performanceMetrics?: RuntimePerformanceMetricsSink } = {}
   ): Promise<RuntimeDatabase> {
-    const binding = await authority.current();
     const hostBootId = options.hostBootId ?? randomUUID();
-    const registryKey = binding.paths.rootPointerPath;
-    if (OPEN_ROOT_POINTERS.has(registryKey)) {
-      throw new Error(`A Runtime database worker is already open for ${registryKey}.`);
-    }
-    OPEN_ROOT_POINTERS.add(registryKey);
-    const worker = createWorker({ mode: 'runtime', binding, hostBootId });
-    try {
-      const ready = await waitForReady(worker, 'runtime');
-      const database = new RuntimeDatabase(
-        authority,
-        binding,
-        hostBootId,
-        worker,
-        ready.workerThreadId,
-        registryKey,
-        options.performanceMetrics
-      );
-      await database.registerHostLiveness();
-      return database;
-    } catch (error) {
-      OPEN_ROOT_POINTERS.delete(registryKey);
-      await worker.terminate();
-      throw error;
-    }
+    // Selection, pointer recovery and registration all join admission before scope maintenance.
+    return authority.withRuntimeHostAdmission(() => withRuntimeMaintenance(authority.expectedPaths(), async () => {
+      const binding = await authority.current();
+      const registryKey = binding.paths.rootPointerPath;
+      if (OPEN_ROOT_POINTERS.has(registryKey)) {
+        throw new Error(`A Runtime database worker is already open for ${registryKey}.`);
+      }
+      OPEN_ROOT_POINTERS.set(registryKey, hostBootId);
+      const worker = createWorker({ mode: 'runtime', binding, hostBootId });
+      try {
+        const ready = await waitForReady(worker, 'runtime');
+        const database = new RuntimeDatabase(
+          authority,
+          binding,
+          hostBootId,
+          worker,
+          ready.workerThreadId,
+          registryKey,
+          options.performanceMetrics
+        );
+        await database.registerHostLiveness();
+        return database;
+      } catch (error) {
+        if (OPEN_ROOT_POINTERS.get(registryKey) === hostBootId) OPEN_ROOT_POINTERS.delete(registryKey);
+        await worker.terminate();
+        throw error;
+      }
+    }));
   }
 
   public async transaction(steps: RepositoryTransactionStep[]): Promise<RuntimeCommitResult> {
@@ -291,10 +321,25 @@ export class RuntimeDatabase {
   }
 
   /**
+   * Fixed worker-side EXISTS probe: durable pending work for one conversation across
+   * active/queued Turns, finalization, delivery/wake, effect, process and child gaps. The
+   * conversation owner manager consults it before any idle release; historical terminal facts
+   * alone never retain ownership.
+   */
+  public async hasConversationRuntimeWork(conversationId: string): Promise<boolean> {
+    return this.request<boolean>({
+      kind: 'conversationRuntimeWork',
+      conversationId: requireNonEmptyText(conversationId, 'conversationId')
+    });
+  }
+
+  /**
    * Cross-Extension-Host liveness used before rebinding an ExecutionLease. The file identity is
-   * bound to this immutable Runtime root and Host boot; a definitely dead/reused pid is rejected
-   * immediately. A verifiably live process is never displaced merely because its event loop was
-   * delayed; heartbeat age is consulted only when the OS process result is inconclusive.
+   * bound to this immutable Runtime root and Host boot; false is returned only for a definitely
+   * dead/reused process identity or a missing/retired registration. Any unknown OS state is
+   * conservative (alive): a live or unverifiable peer is never displaced, regardless of
+   * heartbeat age. The heartbeat exists only to fence THIS Host's own failure, never to judge
+   * peers.
    */
   public async isHostAlive(hostBootIdInput: string): Promise<boolean> {
     const hostBootId = requireNonEmptyText(hostBootIdInput, 'hostBootId');
@@ -302,11 +347,7 @@ export class RuntimeDatabase {
     await this.validateBinding('host_liveness');
     const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
     if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
-    const processState = inspectRecordedProcess(record);
-    if (processState === 'dead') return false;
-    if (processState === 'alive') return true;
-    const heartbeatAt = Date.parse(record.heartbeatAt);
-    return Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= HOST_HEARTBEAT_STALE_MS;
+    return inspectRecordedProcess(record) !== 'dead';
   }
 
   public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
@@ -414,6 +455,12 @@ export class RuntimeDatabase {
     fence: ExecutionLeaseFence | undefined,
     request: DatabaseWorkerRequestPayload
   ): Promise<T> {
+    // Cheap local fence: once this Host released the conversation owner, stale fenced callbacks
+    // (e.g. a late provider stream event) must fail without any filesystem read per event.
+    // Receipt/recovery writers deliberately run without a fence and stay unaffected.
+    if (fence && !this.conversationOwners.owns(fence.conversationId)) {
+      throw new ConversationRuntimeOwnerReleasedError(fence.conversationId, fence.turnId);
+    }
     try {
       return await this.request<T>(request);
     } catch (error) {
@@ -447,17 +494,36 @@ export class RuntimeDatabase {
     return this.request<DatabaseWorkerDiagnostics>({ kind: 'inspect' });
   }
 
-  public async close(): Promise<void> {
-    if (this.closed) return;
+  /**
+   * Close ordering: sweep timers stop and any in-flight idle sweep (whose probe still reads the
+   * database) completes while the worker is open; the writer is fenced next, and only then are
+   * durable conversation owner records released — never before, and never after another Host
+   * could have registered this Host's liveness identity.
+   */
+  public close(): Promise<void> {
+    this.closePromise ??= this.closeRuntime();
+    return this.closePromise;
+  }
+
+  private async closeRuntime(): Promise<void> {
     this.stopHeartbeatTimer();
+    this.conversationOwnerSweepsStopped = true;
+    if (this.conversationOwnerSweepTimer) {
+      clearTimeout(this.conversationOwnerSweepTimer);
+      this.conversationOwnerSweepTimer = undefined;
+    }
     try {
       await this.heartbeatTask.catch(() => undefined);
-      await this.sendRequest<null>({ kind: 'close' });
+      await this.conversationOwnerSweepTask.catch(() => undefined);
+      if (!this.closed) await this.sendRequest<null>({ kind: 'close' });
     } finally {
       this.closed = true;
-      OPEN_ROOT_POINTERS.delete(this.registryKey);
+      if (OPEN_ROOT_POINTERS.get(this.registryKey) === this.hostBootId) {
+        OPEN_ROOT_POINTERS.delete(this.registryKey);
+      }
       this.commitListeners.clear();
       await this.worker.terminate();
+      await this.conversationOwners.close().catch(() => undefined);
       await this.unregisterHostLiveness().catch(() => undefined);
       this.performanceMetricSinks.clear();
     }
@@ -516,8 +582,9 @@ export class RuntimeDatabase {
           this.failPending(error);
           this.closed = true;
           this.commitListeners.clear();
-          void this.worker.terminate()
-            .finally(() => this.unregisterHostLiveness().catch(() => undefined));
+          // Registration and conversation owners are retained fail-closed; only an explicit
+          // graceful close() unregisters after the writer is fenced and work is drained.
+          void this.worker.terminate().catch(() => undefined);
         });
     }, HOST_HEARTBEAT_INTERVAL_MS);
     this.heartbeatTimer.unref();
@@ -557,12 +624,28 @@ export class RuntimeDatabase {
     this.heartbeatTimer = undefined;
   }
 
+  /**
+   * Commit-triggered idle sweep, coalesced so a commit burst schedules at most one bounded pass
+   * and only one sweep ever runs at a time. Sweep probes are ordinary worker reads, so the pass
+   * must finish before the worker closes (see close()).
+   */
+  private scheduleConversationOwnerSweep(): void {
+    if (this.closed || this.conversationOwnerSweepsStopped || this.conversationOwnerSweepTimer) return;
+    this.conversationOwnerSweepTimer = setTimeout(() => {
+      this.conversationOwnerSweepTimer = undefined;
+      this.conversationOwnerSweepTask = this.conversationOwnerSweepTask
+        .then(() => this.conversationOwners.sweepIdle())
+        .catch(() => undefined);
+    }, CONVERSATION_OWNER_SWEEP_DELAY_MS);
+    this.conversationOwnerSweepTimer.unref();
+  }
+
   private hostLivenessPath(hostBootId: string): string {
     const digest = createHash('sha256')
       .update('limcode-runtime-host-liveness\0')
       .update(hostBootId)
       .digest('hex');
-    return path.join(this.binding.paths.dataRootPath, HOST_LIVENESS_DIRECTORY, `${digest}.json`);
+    return path.join(runtimeHostLivenessDirectory(this.binding.paths), `${digest}.json`);
   }
 
   private sendRequest<T>(request: DatabaseWorkerRequestPayload): Promise<T> {
@@ -608,6 +691,7 @@ export class RuntimeDatabase {
             durationMs: performance.now() - startedAtMs
           });
         }
+        this.scheduleConversationOwnerSweep();
       }
       return;
     }
@@ -738,7 +822,10 @@ function databaseMetricRequestKind(
   kind: DatabaseWorkerRequestPayload['kind']
 ): RuntimeDatabaseMetricRequestKind {
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
-  return kind === 'clientVisibleMessageHistoryPage' ? 'clientKeysetPage' : kind;
+  if (kind === 'clientVisibleMessageHistoryPage') return 'clientKeysetPage';
+  // The conversation pending-work probe is one fixed worker read snapshot.
+  if (kind === 'conversationRuntimeWork') return 'snapshot';
+  return kind;
 }
 
 async function readHostLiveness(filePath: string): Promise<RuntimeHostLivenessRecord | undefined> {

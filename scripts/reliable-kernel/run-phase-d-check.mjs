@@ -350,7 +350,7 @@ async function checkToolModelResultExactlyOnce() {
       () => undefined,
       recoveryTurns(ctx, crashFiles)
     );
-    await crashScanner.reconcileCommittedFacts();
+    await crashScanner.reconcileCommittedFacts(undefined, { acquisition: 'claim' });
     const crashRecovered = await effects.readTerminalResult(crashTool.toolCallId, true);
     assert.equal(crashRecovered.status, 'succeeded');
     assert.equal((await list(ctx.database, 'ToolModelResult', { tool_call_id: crashTool.toolCallId })).length, 1);
@@ -1685,7 +1685,7 @@ async function checkEffectReceiptReconcile() {
       () => undefined,
       recoveryTurns(ctx, files)
     );
-    const resumed = await scanner.reconcileCommittedFacts();
+    const resumed = await scanner.reconcileCommittedFacts(undefined, { acquisition: 'claim' });
     const terminal = await effects.readTerminalResult(tool.toolCallId, true);
     assert.equal(resumed.receipts, 1);
     assert.equal(terminal.status, 'succeeded');

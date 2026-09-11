@@ -9,6 +9,13 @@
     "sessionState": "memory-only",
     "rule": "事务提交后直接返回类型化变化；网页视图重载或发现缺口时重新读取有界快照。"
   },
+  "crossHostSynchronization": {
+    "detection": "sqlite-externalDataVersion",
+    "notification": "local-onCommit-is-not-cross-host",
+    "projection": "bounded-snapshot-required-on-external-change",
+    "backgroundWake": "persistent-RuntimeDeliveryWake-owner-routed-level-scan",
+    "daemonRequired": false
+  },
   "session": {
     "fields": [
       "sessionId",
@@ -26,6 +33,13 @@
     "maxQueuedBytes": 4194304,
     "snapshotRequiredCoalesced": true,
     "queueOverflowRule": "先将共享当前ACK基线的未发送changes按(type,id)压缩为最新净变化；压缩后仍越过batch/bytes硬上限时，丢弃尚未发送的普通changes并合并为一个snapshot-required控制状态，等待当前inflight结束后读取新快照。"
+  },
+  "conversationViews": {
+    "mainChat": "single-flight-open-and-focus-existing-per-host",
+    "foreignOwner": "reject-only-the-occupied-conversation",
+    "auxiliaryViews": "share-conversation-owner-with-independent-view-references",
+    "hiddenView": "retain-ownership",
+    "lastViewClosed": "release-only-after-runtime-work-and-command-pins-settle"
   },
   "snapshot": {
     "projections": [

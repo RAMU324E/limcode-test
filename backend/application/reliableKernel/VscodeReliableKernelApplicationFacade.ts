@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { StorageDataResetResult } from '../../capabilities/types';
@@ -9,6 +8,7 @@ import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/
 import { RUNTIME_KERNEL_EPOCH } from '../../reliableKernel/contracts';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
+import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { readNativeSteeringInFlight } from '../../reliableKernel/nativeSteering';
 import { isNativeRequest, readNativeMessageContextRevisions } from '../../reliableKernel/conversationForkContext';
@@ -19,6 +19,11 @@ import {
   type VscodeWorkspaceRuntimePlacement
 } from '../../reliableKernel/vscodeRootAuthority';
 import type { RuntimeCommitResult } from '../../reliableKernel/contracts';
+import {
+  assertRuntimeHostsOffline,
+  withRuntimeDataRootAdmission,
+  withRuntimeMaintenance
+} from '../../reliableKernel/runtimeHostControl';
 import {
   DEFAULT_CONVERSATION_TITLE,
   displayConversationTitle
@@ -47,8 +52,8 @@ import type {
 } from '../../../vscode/ApplicationFacade';
 import { VscodeReliableKernelCommandRouter } from './VscodeReliableKernelCommandRouter';
 import {
-  VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY,
-  VscodeReliableKernelCutoverCoordinator
+  VscodeReliableKernelCutoverCoordinator,
+  archiveCurrentRuntimeRootForReset
 } from './VscodeReliableKernelCutoverCoordinator';
 import { VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
@@ -69,10 +74,6 @@ const HISTORY_CONTENT_READ_CONCURRENCY = 4;
 const DEFAULT_HISTORY_PAGE_SIZE = 50;
 const INTERACTION_ATTENTION_REFRESH_DELAY_MS = 25;
 
-export interface VscodeReliableKernelApplicationFacadeOpenOptions {
-  /** Startup may pre-resolve and claim this immutable placement before importing the full backend. */
-  runtimePlacement?: VscodeWorkspaceRuntimePlacement;
-}
 
 /** VS Code shell facade backed only by the reliable SQLite/CAS Runtime and independent settings authority. */
 export class VscodeReliableKernelApplicationFacade implements ApplicationFacade {
@@ -80,6 +81,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   public readonly onDidChangeConversationHistory = this.historyEmitter.event;
 
   private readonly webviews = new Map<BridgeClientId, vscode.Webview>();
+  /** Attach-meta Conversation binding per client; a feed may never retarget beyond it. */
+  private readonly webviewConversationIds = new Map<BridgeClientId, string>();
   private readonly commandRouter: VscodeReliableKernelCommandRouter;
   private readonly externalHistoryWatcher: ExternalDataVersionWatcher;
   private readonly interactionAttentionNotifier: InteractionAttentionNotifier;
@@ -118,7 +121,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.commandRouter = new VscodeReliableKernelCommandRouter(product, {
       broadcast: (message) => this.broadcast(message),
       createConversation: (options) => this.createConversation(options),
-      forkConversation: (request) => this.forkConversation(request)
+      forkConversation: (request) => this.forkConversation(request),
+      conversationIdForClient: (clientId) => this.webviewConversationIds.get(clientId)
     });
     this.externalHistoryWatcher = new ExternalDataVersionWatcher(
       () => product.application.database.externalDataVersion(),
@@ -146,36 +150,44 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   public static async open(
-    context: vscode.ExtensionContext,
-    options: VscodeReliableKernelApplicationFacadeOpenOptions = {}
+    context: vscode.ExtensionContext
   ): Promise<VscodeReliableKernelApplicationFacade> {
     await loadCommittedGlobalStatus(context);
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
-    const runtimePlacement = options.runtimePlacement ?? await resolveVscodeWorkspaceRuntimePlacement(
-      getPaths(),
-      resolveVscodeWorkspaceRuntimeScope({
-        workspaceFileUri: vscode.workspace.workspaceFile?.toString(),
-        workspaceFolderUris: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString())
-      })
-    );
-    const authority = createVscodeRootAuthority(runtimePlacement);
-    const rootPreparation = await new VscodeReliableKernelCutoverCoordinator(
-      authority,
-      runtimePlacement.runtimeScopeRootPath
-    ).ensureCurrentRoot();
-    if (rootPreparation.epochMigrationBackupPath) {
-      console.warn(
-        `[LimCode] 已把第 ${rootPreparation.epochMigratedFrom} 代运行数据无损升级到 `
-        + `第 ${RUNTIME_KERNEL_EPOCH} 代，升级前数据库备份位于 ${rootPreparation.epochMigrationBackupPath}。`
+    // The data-root admission serializes placement/cutover across every workspace scope sharing
+    // this configuration root. It is acquired before placement resolution and the scope
+    // maintenance claim nests inside it; both lock orders (open and reset) agree.
+    return withRuntimeDataRootAdmission(path.resolve(getPaths().globalStoragePath), async () => {
+      const runtimePlacement = await resolveVscodeWorkspaceRuntimePlacement(
+        getPaths(),
+        resolveVscodeWorkspaceRuntimeScope({
+          workspaceFileUri: vscode.workspace.workspaceFile?.toString(),
+          workspaceFolderUris: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString())
+        })
       );
-    } else if (rootPreparation.epochResetBackupPath) {
-      console.warn(
-        `[LimCode] 已把第 ${rootPreparation.epochResetFrom} 代运行数据归档到 `
-        + `${rootPreparation.epochResetBackupPath}，并创建第 ${RUNTIME_KERNEL_EPOCH} 代运行数据。`
-      );
-    }
-    const product = await VscodeReliableKernelProductRuntime.open(context, { authority, runtimePlacement });
-    return new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
+      const authority = createVscodeRootAuthority(runtimePlacement);
+      // Root preparation and Runtime open share one short maintenance claim with the database
+      // worker-ready + Host liveness registration, so a peer open or reset cannot interleave.
+      const product = await withRuntimeMaintenance(authority.expectedPaths(), async () => {
+        const rootPreparation = await new VscodeReliableKernelCutoverCoordinator(
+          authority,
+          runtimePlacement.runtimeScopeRootPath
+        ).ensureCurrentRoot();
+        if (rootPreparation.epochMigrationBackupPath) {
+          console.warn(
+            `[LimCode] 已把第 ${rootPreparation.epochMigratedFrom} 代运行数据无损升级到 `
+            + `第 ${RUNTIME_KERNEL_EPOCH} 代，升级前数据库备份位于 ${rootPreparation.epochMigrationBackupPath}。`
+          );
+        } else if (rootPreparation.epochResetBackupPath) {
+          console.warn(
+            `[LimCode] 已把第 ${rootPreparation.epochResetFrom} 代运行数据归档到 `
+            + `${rootPreparation.epochResetBackupPath}，并创建第 ${RUNTIME_KERNEL_EPOCH} 代运行数据。`
+          );
+        }
+        return VscodeReliableKernelProductRuntime.open(context, { authority, runtimePlacement });
+      });
+      return new VscodeReliableKernelApplicationFacade(context, product, getPaths, runtimePlacement);
+    });
   }
 
   /** Starts the history/watcher hydration after VS Code surfaces have been registered. */
@@ -213,36 +225,49 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     const agent = await this.product.configuration.resolveAgent({ agentType: 'main' });
     const now = new Date().toISOString();
     const projectFolder = this.resolveProjectFolderForNewConversation(options.projectFolderUri);
-    await this.product.application.database.transaction([
-      DOMAIN_REPOSITORIES.domain('Conversation').insert({
-        id: conversationId,
-        title: DEFAULT_CONVERSATION_TITLE,
-        status: 'active',
-        created_at: now,
-        updated_at: now
-      }),
-      DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
-        id: runtimeId('agent_conversation_link'),
-        conversation_id: conversationId,
-        agent_id: agent.agentId,
-        role: 'default',
-        created_at: now,
-        updated_at: now
-      }),
-      ...(projectFolder
-        ? projectFolderAssignmentSteps({
-            conversationId,
-            folder: { uri: projectFolder.uri.toString(), name: projectFolder.name },
-            now
-          })
-        : [])
-    ]);
-    await this.refreshConversationHistory();
+    // This Host owns the new Conversation from its first write. The opening view retains it
+    // through claim-before-open; without a view the owner idle-releases after this run.
+    await this.product.application.database.conversationOwners.run(conversationId, async () => {
+      await this.product.application.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Conversation').insert({
+          id: conversationId,
+          title: DEFAULT_CONVERSATION_TITLE,
+          status: 'active',
+          created_at: now,
+          updated_at: now
+        }),
+        DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+          id: runtimeId('agent_conversation_link'),
+          conversation_id: conversationId,
+          agent_id: agent.agentId,
+          role: 'default',
+          created_at: now,
+          updated_at: now
+        }),
+        ...(projectFolder
+          ? projectFolderAssignmentSteps({
+              conversationId,
+              folder: { uri: projectFolder.uri.toString(), name: projectFolder.name },
+              now
+            })
+          : [])
+      ]);
+      await this.refreshConversationHistory();
+    });
     return conversationId;
   }
 
   public async forkConversation(request: ConversationForkPayload): Promise<ConversationForkResult> {
     this.requireOpen();
+    const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
+    // The source Conversation DAG/configuration is read and copied under its ownership pin so a
+    // peer Host cannot mutate or delete it mid-fork.
+    return this.product.application.database.conversationOwners.run(sourceConversationId, () =>
+      this.forkConversationUnderOwnership(request)
+    );
+  }
+
+  private async forkConversationUnderOwnership(request: ConversationForkPayload): Promise<ConversationForkResult> {
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
     const messageId = requireText(request.messageId, 'Conversation fork messageId');
     const expectedRevisionId = requireText(request.expectedRevisionId, 'Conversation fork expectedRevisionId');
@@ -266,9 +291,13 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (revision.message_id !== messageId) {
         throw new Error('Conversation fork command was replayed with a different source Message.');
       }
-      await this.product.configuration.mutations.copyConversationConfiguration(
-        sourceConversationId,
-        conversationId
+      // The replayed branch target may be owned by a peer window; its configuration copy runs
+      // under the target ownership pin exactly like a fresh fork.
+      await this.product.application.database.conversationOwners.run(conversationId, () =>
+        this.product.configuration.mutations.copyConversationConfiguration(
+          sourceConversationId,
+          conversationId
+        )
       );
       return { conversationId, deduplicated: true };
     }
@@ -431,23 +460,33 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       role: 'default'
     }, 2);
     if (agentLinks.length !== 1) throw new Error('Fork 源 Conversation 缺少唯一默认 Agent 关系。');
-    const result = await this.product.application.runtime.conversationFork.fork({
-      idempotencyKey: commandId,
-      reuseKey,
-      sourceConversationId,
-      sourceContextRootId: sourceRootId,
-      sourceContextEndSegmentId,
-      sourceMessageRevisionId: revisionId,
-      expectedCurrentMessageRevisionId: revisionId,
-      ...(sourceTurnIds.length === 1 ? { sourceTurnId: sourceTurnIds[0] } : {}),
-      targetTitle: `${this.getConversationDisplayTitle(sourceConversationId)} 分支`,
-      targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
+    // The branch target is claimed BEFORE its first write: this Host owns the new Conversation
+    // through the fork transaction and the configuration copy. The id is derived from the fork
+    // command identity so concurrent same-command calls deterministically claim the same target
+    // (and a peer's claim refuses busy) instead of forking divergent targets. The opening view
+    // retains it via claim-before-open; without a view the owner idle-releases after this run.
+    const targetConversationId = stablePhaseFId('conversation', `conversation-fork:${commandId}`);
+    const result = await this.product.application.database.conversationOwners.run(targetConversationId, async () => {
+      const forkResult = await this.product.application.runtime.conversationFork.fork({
+        idempotencyKey: commandId,
+        reuseKey,
+        sourceConversationId,
+        sourceContextRootId: sourceRootId,
+        sourceContextEndSegmentId,
+        sourceMessageRevisionId: revisionId,
+        expectedCurrentMessageRevisionId: revisionId,
+        ...(sourceTurnIds.length === 1 ? { sourceTurnId: sourceTurnIds[0] } : {}),
+        targetConversationId,
+        targetTitle: `${this.getConversationDisplayTitle(sourceConversationId)} 分支`,
+        targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
+      });
+      await this.product.configuration.mutations.copyConversationConfiguration(
+        sourceConversationId,
+        forkResult.targetConversationId
+      );
+      await this.refreshConversationHistory();
+      return forkResult;
     });
-    await this.product.configuration.mutations.copyConversationConfiguration(
-      sourceConversationId,
-      result.targetConversationId
-    );
-    await this.refreshConversationHistory();
     return { conversationId: result.targetConversationId, deduplicated: result.deduplicated };
   }
 
@@ -460,6 +499,32 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     return !!await this.maybeRow('Conversation', conversationId);
   }
 
+  public async retainConversation(conversationId: string, referenceId: string): Promise<void> {
+    this.requireOpen();
+    const owners = this.product.application.database.conversationOwners;
+    await owners.retain(conversationId, referenceId);
+    try {
+      // A peer Host may have died owning this Conversation; converging it here turns the open
+      // into a takeover instead of a stale read-only view. The view reference stays held even
+      // when recovery fails: background convergence/idle sweeps keep retrying, and every
+      // mutation path still gates on ownership.
+      await this.product.recoverConversation(conversationId);
+    } catch (error) {
+      console.warn('[LimCode] Scoped Conversation recovery after claim failed; the view remains owned.', error);
+    }
+  }
+
+  public async releaseConversation(conversationId: string, referenceId: string): Promise<void> {
+    // Dispose may race facade teardown; the owner manager closes with the database and releases
+    // every reference, so a late release is a no-op rather than an error.
+    if (this.disposed || this.productClosed) return;
+    try {
+      await this.product.application.database.conversationOwners.release(conversationId, referenceId);
+    } catch (error) {
+      console.warn('[LimCode] Failed to release Conversation ownership reference.', error);
+    }
+  }
+
   public getConversationDisplayTitle(conversationId: string | undefined): string {
     if (!conversationId) return DEFAULT_CONVERSATION_TITLE;
     const entry = this.historyEntries.find((candidate) => candidate.id === conversationId);
@@ -468,23 +533,29 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public async renameConversationTitle(conversationId: string, title: string): Promise<boolean> {
     this.requireOpen();
-    const existing = await this.maybeRow('Conversation', conversationId);
-    if (!existing) return false;
-    const normalized = title.trim();
-    if (!normalized) throw new TypeError('Conversation 标题不能为空。');
-    await this.product.application.database.transaction([
-      DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
-        title: normalized,
-        updated_at: new Date().toISOString()
-      })
-    ]);
-    await this.refreshConversationHistory();
-    return true;
+    return this.product.application.database.conversationOwners.run(conversationId, async () => {
+      const existing = await this.maybeRow('Conversation', conversationId);
+      if (!existing) return false;
+      const normalized = title.trim();
+      if (!normalized) throw new TypeError('Conversation 标题不能为空。');
+      await this.product.application.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
+          title: normalized,
+          updated_at: new Date().toISOString()
+        })
+      ]);
+      await this.refreshConversationHistory();
+      return true;
+    });
   }
 
   public async deleteConversation(conversationId: string): Promise<string[] | null> {
     this.requireOpen();
-    const deleted = await this.product.application.conversationDeletion.delete(conversationId);
+    // The deletion control plane additionally pins every cascaded descendant before its
+    // transaction; this requested-id run is the facade boundary guard.
+    const deleted = await this.product.application.database.conversationOwners.run(conversationId, () =>
+      this.product.application.conversationDeletion.delete(conversationId)
+    );
     if (!deleted) return null;
     await this.refreshConversationHistory();
     return deleted.deletedConversationIds;
@@ -496,49 +567,51 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     target: ConversationAbortTarget
   ): Promise<ConversationAbortResult> {
     this.requireOpen();
-    const turnId = requireText(target.turnId, 'abort target Turn.id');
-    const expectedLeaseGeneration = requireDecimal(target.leaseGeneration, 'abort target lease generation');
-    const turn = await this.maybeRow('Turn', turnId);
-    if (!turn || turn.conversation_id !== conversationId) {
-      return { status: 'stale', reason: 'target_turn_not_current', turnId };
-    }
-    if (turn.status === 'terminated') {
-      return { status: 'already_satisfied', reason: 'target_turn_already_terminal', turnId };
-    }
-    if (turn.status !== 'active') return { status: 'stale', reason: 'target_turn_not_active', turnId };
-    const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
-    if (leases.length !== 1 || requireBigInt(leases[0].generation, 'ExecutionLease.generation') !== BigInt(expectedLeaseGeneration)) {
-      return { status: 'stale', reason: 'lease_generation_replaced', turnId };
-    }
-    try {
-      const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
-      if (childMemberships.length > 1) throw new Error('Turn 存在多个 ChildExecution 调度归属。');
-      if (childMemberships[0]) {
-        await this.product.childAgents.interruptSubtree({
-          sourceKey: `sidebar-child-interrupt:${requestId}`,
-          childExecutionId: requireText(
-            childMemberships[0].child_execution_id,
-            'ChildExecutionTurnLink.child_execution_id'
-          ),
-          reason: '用户从侧栏请求递归终止当前子 Agent。'
-        });
-      } else {
-        await this.product.conversations.interrupt({
-          commandId: requestId,
-          conversationId,
-          turnId,
-          expectedLeaseGeneration,
-          reason: '用户从侧栏请求终止当前 Conversation。'
-        });
-      }
-      return { status: 'committed', turnId };
-    } catch (error) {
+    return this.product.application.database.conversationOwners.run(conversationId, async () => {
+      const turnId = requireText(target.turnId, 'abort target Turn.id');
+      const expectedLeaseGeneration = requireDecimal(target.leaseGeneration, 'abort target lease generation');
       const turn = await this.maybeRow('Turn', turnId);
-      if (turn?.status === 'terminated') {
+      if (!turn || turn.conversation_id !== conversationId) {
+        return { status: 'stale', reason: 'target_turn_not_current', turnId };
+      }
+      if (turn.status === 'terminated') {
         return { status: 'already_satisfied', reason: 'target_turn_already_terminal', turnId };
       }
-      throw error;
-    }
+      if (turn.status !== 'active') return { status: 'stale', reason: 'target_turn_not_active', turnId };
+      const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
+      if (leases.length !== 1 || requireBigInt(leases[0].generation, 'ExecutionLease.generation') !== BigInt(expectedLeaseGeneration)) {
+        return { status: 'stale', reason: 'lease_generation_replaced', turnId };
+      }
+      try {
+        const childMemberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+        if (childMemberships.length > 1) throw new Error('Turn 存在多个 ChildExecution 调度归属。');
+        if (childMemberships[0]) {
+          await this.product.childAgents.interruptSubtree({
+            sourceKey: `sidebar-child-interrupt:${requestId}`,
+            childExecutionId: requireText(
+              childMemberships[0].child_execution_id,
+              'ChildExecutionTurnLink.child_execution_id'
+            ),
+            reason: '用户从侧栏请求递归终止当前子 Agent。'
+          });
+        } else {
+          await this.product.conversations.interrupt({
+            commandId: requestId,
+            conversationId,
+            turnId,
+            expectedLeaseGeneration,
+            reason: '用户从侧栏请求终止当前 Conversation。'
+          });
+        }
+        return { status: 'committed', turnId };
+      } catch (error) {
+        const turn = await this.maybeRow('Turn', turnId);
+        if (turn?.status === 'terminated') {
+          return { status: 'already_satisfied', reason: 'target_turn_already_terminal', turnId };
+        }
+        throw error;
+      }
+    });
   }
 
   public getConversationHistoryEntries(): SidebarConversationHistoryEntry[] {
@@ -586,33 +659,36 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   public async resetDevelopmentData(): Promise<StorageDataResetResult> {
     this.requireOpen();
-    const binding = this.product.application.database.binding;
-    const controlRoot = path.dirname(binding.paths.rootPointerPath);
     const storageRoot = this.runtimePlacement.runtimeScopeRootPath;
-    const backupRoot = path.join(storageRoot, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY);
-    const backupPath = path.join(backupRoot, timestampSlug());
-    this.unsubscribeCommit?.();
-    this.unsubscribeCommit = undefined;
-    this.unsubscribeSteering?.();
-    this.unsubscribeSteering = undefined;
-    this.productClosed = true;
-    await this.product.close();
-    let archived = false;
-    try {
-      await fs.mkdir(backupRoot, { recursive: true });
-      await fs.rename(controlRoot, backupPath);
-      archived = true;
-    } catch (error) {
-      if (!isMissingPathError(error)) throw error;
-    }
+
     const authority = createVscodeRootAuthority(this.runtimePlacement);
-    await new VscodeReliableKernelCutoverCoordinator(authority, storageRoot).ensureCurrentRoot();
-    return {
-      dataRootPath: storageRoot,
-      epoch: RUNTIME_KERNEL_EPOCH,
-      archivedEntries: archived ? [path.basename(controlRoot)] : [],
-      ...(archived ? { backupPath } : {})
-    };
+    const controlRootName = path.basename(path.dirname(authority.expectedPaths().rootPointerPath));
+    // Lock order matches open: data-root admission first, scope maintenance inside. An opening
+    // Host holds admission while waiting on the scope claim, so taking them in the same order
+    // here cannot deadlock; reverse order could.
+    return withRuntimeDataRootAdmission(this.runtimePlacement.configurationRootPath, () =>
+      withRuntimeMaintenance(authority.expectedPaths(), async () => {
+        // Peer windows on this data root must close before this Host stops its own writers. The
+        // preflight exempts only this Host's own liveness record and never steals a live/unknown peer.
+        await assertRuntimeHostsOffline(authority.expectedPaths(), this.product.application.database.hostBootId);
+        this.unsubscribeCommit?.();
+        this.unsubscribeCommit = undefined;
+        this.unsubscribeSteering?.();
+        this.unsubscribeSteering = undefined;
+        this.productClosed = true;
+        await this.product.close();
+        // The gated archive/reinitialize rechecks (without exemption) that every Host, including
+        // this one, has deregistered before mutating the control root.
+        const archive = await archiveCurrentRuntimeRootForReset(authority, storageRoot);
+        await new VscodeReliableKernelCutoverCoordinator(authority, storageRoot).ensureCurrentRoot();
+        return {
+          dataRootPath: storageRoot,
+          epoch: RUNTIME_KERNEL_EPOCH,
+          archivedEntries: archive.archived ? [controlRootName] : [],
+          ...(archive.backupPath ? { backupPath: archive.backupPath } : {})
+        };
+      })
+    );
   }
 
   public async inspectReliability(conversationId?: string): Promise<unknown> {
@@ -641,6 +717,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.requireOpen();
     const clientId = this.product.application.webviewFeed.attach(webview, meta);
     this.webviews.set(clientId, webview);
+    if (meta.conversationId?.trim()) this.webviewConversationIds.set(clientId, meta.conversationId.trim());
     return clientId;
   }
 
@@ -651,6 +728,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   public detachWebview(clientId: BridgeClientId): void {
     this.commandRouter.detachClient(clientId);
     this.webviews.delete(clientId);
+    this.webviewConversationIds.delete(clientId);
     this.product.application.webviewFeed.detach(clientId);
   }
 
@@ -1218,12 +1296,4 @@ function canonicalFolderUri(value: string): string {
   } catch {
     throw new TypeError('projectFolderUri 必须是有效的 URI。');
   }
-}
-
-function timestampSlug(): string {
-  return new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 17);
-}
-
-function isMissingPathError(error: unknown): boolean {
-  return Boolean(error) && typeof error === 'object' && (error as { code?: unknown }).code === 'ENOENT';
 }

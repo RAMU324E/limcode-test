@@ -55,6 +55,11 @@ export interface VscodeReliableKernelCommandRouterOptions {
     deduplicated: boolean;
   }>;
   openPlanProposal?(payload: { conversationId?: string; toolCallId?: string; planProposalId?: string; title?: string }): void;
+  /**
+   * The Conversation bound at attach time for one client. A feed may reconnect/resync only to
+   * this binding; in-panel navigation must go through the Host panel claim-before-open path.
+   */
+  conversationIdForClient?(clientId: string): string | undefined;
 }
 
 /** Normal Webview command route for reliable Runtime mutations. Bounded Feed remains the only data route. */
@@ -157,6 +162,16 @@ export class VscodeReliableKernelCommandRouter {
     this.settingsSaveBarrier.detach(clientId);
   }
 
+  /**
+   * Every Conversation-mutating command runs under the Conversation Runtime owner: this Host
+   * claims (or re-enters) ownership and pins it for the whole mutation, so a peer Host owning
+   * the Conversation rejects the command with `conversation-runtime-owner-busy` instead of
+   * racing it.
+   */
+  private runConversationCommand<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
+    return this.product.application.database.conversationOwners.run(conversationId, operation);
+  }
+
   /** 文件监听器发现其他 Extension Host 已提交设置后，重新读盘并广播。 */
   public async refreshGlobalSettings(section: GlobalSettingsGetPayload['section']): Promise<void> {
     const stored = await this.product.configuration.loadGlobalSettings(section);
@@ -227,14 +242,29 @@ export class VscodeReliableKernelCommandRouter {
         this.post(webview, { id: randomUUID(), type: BridgeMessageType.DebugCaptureObservationAck, channel: 'diagnostics', correlationId: message.id,
           payload: this.product.debugCapture.observeUi(clientId, requirePayload(message.payload, '界面取证')) });
         return;
-      case BridgeMessageType.ConversationOpen:
-        if (message.payload?.conversationId) {
-          await this.product.application.webviewFeed.setActiveConversation(clientId, message.payload.conversationId);
+      case BridgeMessageType.ConversationOpen: {
+        const conversationId = message.payload?.conversationId?.trim();
+        if (conversationId) {
+          if (this.options.conversationIdForClient?.(clientId) !== conversationId) {
+            // A feed may never retarget to a Conversation this view does not own. Navigation
+            // belongs to the Host panel claim-before-open path, which panels intercept first.
+            throw new Error('该对话导航必须由宿主面板路径完成；当前视图未持有目标会话。');
+          }
+          await this.product.application.webviewFeed.setActiveConversation(clientId, conversationId);
         }
         return;
-      case BridgeMessageType.ClientResync:
-        this.product.application.webviewFeed.reconnect(clientId, message.payload?.conversationId ?? null);
+      }
+      case BridgeMessageType.ClientResync: {
+        const requested = message.payload?.conversationId?.trim() || null;
+        const bound = this.options.conversationIdForClient?.(clientId) ?? null;
+        if (requested !== bound) {
+          // A hidden/reconnecting session must not silently bind a Conversation other than the
+          // one its view reference owns; resync always re-attaches to the view binding.
+          console.warn('[LimCode] Ignored ClientResync Conversation mismatch; reconnecting to the bound Conversation.');
+        }
+        this.product.application.webviewFeed.reconnect(clientId, bound);
         return;
+      }
       case BridgeMessageType.Ping:
         this.post(webview, {
           id: randomUUID(),
@@ -279,10 +309,12 @@ export class VscodeReliableKernelCommandRouter {
         return;
       case BridgeMessageType.ConversationCreate: {
         if (!this.options.createConversation) throw new Error('当前 Webview 容器不能创建 Conversation。');
-        const conversationId = await this.options.createConversation({
+        await this.options.createConversation({
           ...(message.payload?.projectFolderUri?.trim() ? { projectFolderUri: message.payload.projectFolderUri.trim() } : {})
         });
-        await this.product.application.webviewFeed.setActiveConversation(clientId, conversationId);
+        // Navigation to the new Conversation belongs to the Host panel claim-before-open path.
+        // This view's feed is never retargeted behind panel ownership; the creating Webview
+        // reaches the new Conversation through the intercepted ConversationOpen navigation.
         return;
       }
       case BridgeMessageType.ConversationFork: {
@@ -324,75 +356,91 @@ export class VscodeReliableKernelCommandRouter {
         return;
       case BridgeMessageType.ConversationWorkflowSelect: {
         const payload = requirePayload(message.payload, 'Conversation Workflow select');
-        await this.requireRow('Conversation', payload.conversationId);
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.selectConversationWorkflow(payload));
+        await this.runConversationCommand(payload.conversationId, async () => {
+          await this.requireRow('Conversation', payload.conversationId);
+          await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.selectConversationWorkflow(payload));
+        });
         return;
       }
       case BridgeMessageType.ModelProfileScopeSet: {
         const payload = requirePayload(message.payload, 'Model Profile scope set');
         if (payload.providerConfigId) await this.product.configuration.providerConfig(payload.providerConfigId);
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setModelProfile(payload));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setModelProfile(payload));
         return;
       }
       case BridgeMessageType.ModelProfileScopeClear: {
         const payload = requirePayload(message.payload, 'Model Profile scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearModelProfile(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearModelProfile(payload.scopeKind, payload.scopeId));
         return;
       }
-      case BridgeMessageType.ToolPolicyScopeSet:
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setToolPolicy(requirePayload(message.payload, 'Tool Policy scope set')));
+      case BridgeMessageType.ToolPolicyScopeSet: {
+        const payload = requirePayload(message.payload, 'Tool Policy scope set');
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setToolPolicy(payload));
         return;
+      }
       case BridgeMessageType.ToolPolicyScopeClear: {
         const payload = requirePayload(message.payload, 'Tool Policy scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearToolPolicy(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearToolPolicy(payload.scopeKind, payload.scopeId));
         return;
       }
-      case BridgeMessageType.SkillPolicyScopeSet:
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setSkillPolicy(requirePayload(message.payload, 'Skill Policy scope set')));
+      case BridgeMessageType.SkillPolicyScopeSet: {
+        const payload = requirePayload(message.payload, 'Skill Policy scope set');
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setSkillPolicy(payload));
         return;
+      }
       case BridgeMessageType.SkillPolicyScopeClear: {
         const payload = requirePayload(message.payload, 'Skill Policy scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearSkillPolicy(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearSkillPolicy(payload.scopeKind, payload.scopeId));
         return;
       }
-      case BridgeMessageType.SystemPromptScopeSet:
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setSystemPrompt(requirePayload(message.payload, 'System Prompt scope set')));
+      case BridgeMessageType.SystemPromptScopeSet: {
+        const payload = requirePayload(message.payload, 'System Prompt scope set');
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setSystemPrompt(payload));
         return;
+      }
       case BridgeMessageType.SystemPromptScopeClear: {
         const payload = requirePayload(message.payload, 'System Prompt scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearSystemPrompt(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearSystemPrompt(payload.scopeKind, payload.scopeId));
         return;
       }
-      case BridgeMessageType.RuntimeContextScopeSet:
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setRuntimeContext(requirePayload(message.payload, 'Runtime Context scope set')));
+      case BridgeMessageType.RuntimeContextScopeSet: {
+        const payload = requirePayload(message.payload, 'Runtime Context scope set');
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setRuntimeContext(payload));
         return;
+      }
       case BridgeMessageType.RuntimeContextScopeClear: {
         const payload = requirePayload(message.payload, 'Runtime Context scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearRuntimeContext(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearRuntimeContext(payload.scopeKind, payload.scopeId));
         return;
       }
-      case BridgeMessageType.PlanReviewPolicyScopeSet:
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setPlanReviewPolicy(requirePayload(message.payload, 'Plan Review Policy scope set')));
+      case BridgeMessageType.PlanReviewPolicyScopeSet: {
+        const payload = requirePayload(message.payload, 'Plan Review Policy scope set');
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setPlanReviewPolicy(payload));
         return;
+      }
       case BridgeMessageType.PlanReviewPolicyScopeClear: {
         const payload = requirePayload(message.payload, 'Plan Review Policy scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearPlanReviewPolicy(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearPlanReviewPolicy(payload.scopeKind, payload.scopeId));
         return;
       }
-      case BridgeMessageType.CheckpointPolicyScopeSet:
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setCheckpointPolicy(requirePayload(message.payload, 'Checkpoint Policy scope set')));
+      case BridgeMessageType.CheckpointPolicyScopeSet: {
+        const payload = requirePayload(message.payload, 'Checkpoint Policy scope set');
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setCheckpointPolicy(payload));
         return;
+      }
       case BridgeMessageType.CheckpointPolicyScopeClear: {
         const payload = requirePayload(message.payload, 'Checkpoint Policy scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearCheckpointPolicy(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearCheckpointPolicy(payload.scopeKind, payload.scopeId));
         return;
       }
-      case BridgeMessageType.WorkEnvironmentPolicyScopeSet:
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.setWorkEnvironmentPolicy(requirePayload(message.payload, 'Work Environment Policy scope set')));
+      case BridgeMessageType.WorkEnvironmentPolicyScopeSet: {
+        const payload = requirePayload(message.payload, 'Work Environment Policy scope set');
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.setWorkEnvironmentPolicy(payload));
         return;
+      }
       case BridgeMessageType.WorkEnvironmentPolicyScopeClear: {
         const payload = requirePayload(message.payload, 'Work Environment Policy scope clear');
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.clearWorkEnvironmentPolicy(payload.scopeKind, payload.scopeId));
+        await this.mutateScopedConfiguration(webview, message.id, payload, () => this.product.configuration.mutations.clearWorkEnvironmentPolicy(payload.scopeKind, payload.scopeId));
         return;
       }
       case BridgeMessageType.WorkEnvironmentUpsert:
@@ -403,8 +451,10 @@ export class VscodeReliableKernelCommandRouter {
         return;
       case BridgeMessageType.WorkEnvironmentSelect: {
         const payload = requirePayload(message.payload, 'Work Environment select');
-        await this.requireRow('Conversation', payload.conversationId);
-        await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.selectConversationWorkEnvironment(payload.conversationId, payload.workEnvironmentId));
+        await this.runConversationCommand(payload.conversationId, async () => {
+          await this.requireRow('Conversation', payload.conversationId);
+          await this.mutateConfiguration(webview, message.id, () => this.product.configuration.mutations.selectConversationWorkEnvironment(payload.conversationId, payload.workEnvironmentId));
+        });
         return;
       }
       case BridgeMessageType.WorkEnvironmentImportFromVscode: {
@@ -604,6 +654,21 @@ export class VscodeReliableKernelCommandRouter {
     await this.broadcastConfigurationSnapshot(webview, correlationId);
   }
 
+  /** Conversation-scoped configuration binds to a Conversation the same way turns do. */
+  private async mutateScopedConfiguration(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    scope: { scopeKind: string; scopeId?: string },
+    operation: () => Promise<unknown>
+  ): Promise<void> {
+    const conversationId = scope.scopeKind === 'conversation' ? scope.scopeId?.trim() : undefined;
+    if (conversationId) {
+      await this.runConversationCommand(conversationId, () => this.mutateConfiguration(webview, correlationId, operation));
+      return;
+    }
+    await this.mutateConfiguration(webview, correlationId, operation);
+  }
+
   private postProjectFolders(webview: vscode.Webview, correlationId?: string): void {
     this.post(webview, {
       id: randomUUID(),
@@ -723,13 +788,15 @@ export class VscodeReliableKernelCommandRouter {
     }
     const name = 'name' in payload.settings ? payload.settings.name.trim() : '';
     if (!name) throw new TypeError('Conversation 名称不能为空。');
-    await this.requireRow('Conversation', conversationId);
-    await this.product.application.database.transaction([
-      DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
-        title: name,
-        updated_at: new Date().toISOString()
-      })
-    ]);
+    await this.runConversationCommand(conversationId, async () => {
+      await this.requireRow('Conversation', conversationId);
+      await this.product.application.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
+          title: name,
+          updated_at: new Date().toISOString()
+        })
+      ]);
+    });
     const stored = await this.readConversationSettings(conversationId, payload.section);
     if (!stored) throw new Error(`Conversation ${conversationId} 不存在。`);
     this.broadcastOrPost(webview, this.conversationSettingsSnapshot(stored, correlationId));
@@ -819,16 +886,18 @@ export class VscodeReliableKernelCommandRouter {
   private async handleConversationAgentSelect(payload: ConversationAgentSelectPayload): Promise<void> {
     const conversationId = requireText(payload.conversationId, 'conversationId');
     const agentId = requireText(payload.agentId, 'agentId');
-    await this.requireRow('Conversation', conversationId);
-    await this.product.configuration.resolveAgent({ agentId });
-    const links = await this.list('AgentConversationLink', { conversation_id: conversationId, role: 'default' }, 2);
-    if (links.length !== 1) throw new Error('Conversation 缺少唯一默认 Agent Link。');
-    await this.product.application.database.transaction([
-      DOMAIN_REPOSITORIES.domain('AgentConversationLink').update(String(links[0].id), {
-        agent_id: agentId,
-        updated_at: new Date().toISOString()
-      })
-    ]);
+    await this.runConversationCommand(conversationId, async () => {
+      await this.requireRow('Conversation', conversationId);
+      await this.product.configuration.resolveAgent({ agentId });
+      const links = await this.list('AgentConversationLink', { conversation_id: conversationId, role: 'default' }, 2);
+      if (links.length !== 1) throw new Error('Conversation 缺少唯一默认 Agent Link。');
+      await this.product.application.database.transaction([
+        DOMAIN_REPOSITORIES.domain('AgentConversationLink').update(String(links[0].id), {
+          agent_id: agentId,
+          updated_at: new Date().toISOString()
+        })
+      ]);
+    });
   }
 
   private async exportPlanProposal(payload: PlanProposalExportPayload): Promise<void> {
@@ -966,6 +1035,16 @@ export class VscodeReliableKernelCommandRouter {
     requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue,
     payload: TurnStartPayload
   ): Promise<void> {
+    await this.runConversationCommand(payload.conversationId, () =>
+      this.handleTurnInputUnderOwnership(webview, correlationId, requestType, payload));
+  }
+
+  private async handleTurnInputUnderOwnership(
+    webview: vscode.Webview,
+    correlationId: string,
+    requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue,
+    payload: TurnStartPayload
+  ): Promise<void> {
     await this.product.ensureCapabilitiesReady();
     const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
     const childContent = childExecutionId
@@ -1063,13 +1142,14 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: GuidanceEditPayload
   ): Promise<void> {
-    const result = await this.product.conversations.editGuidance({
-      commandId: payload.command.commandId,
-      conversationId: payload.conversationId,
-      intentId: payload.intentId,
-      expectedRevisionSeq: payload.expectedRevisionSeq,
-      text: payload.text
-    });
+    const result = await this.runConversationCommand(payload.conversationId, () =>
+      this.product.conversations.editGuidance({
+        commandId: payload.command.commandId,
+        conversationId: payload.conversationId,
+        intentId: payload.intentId,
+        expectedRevisionSeq: payload.expectedRevisionSeq,
+        text: payload.text
+      }));
     this.postGuidanceControlResult(webview, correlationId, {
       commandId: payload.command.commandId,
       conversationId: payload.conversationId,
@@ -1085,12 +1165,13 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: GuidanceCancelPayload
   ): Promise<void> {
-    const result = await this.product.conversations.cancelGuidance({
-      commandId: payload.command.commandId,
-      conversationId: payload.conversationId,
-      intentId: payload.intentId,
-      expectedRevisionSeq: payload.expectedRevisionSeq
-    });
+    const result = await this.runConversationCommand(payload.conversationId, () =>
+      this.product.conversations.cancelGuidance({
+        commandId: payload.command.commandId,
+        conversationId: payload.conversationId,
+        intentId: payload.intentId,
+        expectedRevisionSeq: payload.expectedRevisionSeq
+      }));
     this.postGuidanceControlResult(webview, correlationId, {
       commandId: payload.command.commandId,
       conversationId: payload.conversationId,
@@ -1106,13 +1187,14 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: GuidanceHoldPayload
   ): Promise<void> {
-    const result = await this.product.conversations.setGuidanceHold({
-      commandId: payload.command.commandId,
-      conversationId: payload.conversationId,
-      intentId: payload.intentId,
-      expectedRevisionSeq: payload.expectedRevisionSeq,
-      hold: payload.hold
-    });
+    const result = await this.runConversationCommand(payload.conversationId, () =>
+      this.product.conversations.setGuidanceHold({
+        commandId: payload.command.commandId,
+        conversationId: payload.conversationId,
+        intentId: payload.intentId,
+        expectedRevisionSeq: payload.expectedRevisionSeq,
+        hold: payload.hold
+      }));
     this.postGuidanceControlResult(webview, correlationId, {
       commandId: payload.command.commandId,
       conversationId: payload.conversationId,
@@ -1128,11 +1210,12 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: GuidanceReorderPayload
   ): Promise<void> {
-    const result = await this.product.conversations.reorderGuidance({
-      commandId: payload.command.commandId,
-      conversationId: payload.conversationId,
-      items: payload.items
-    });
+    const result = await this.runConversationCommand(payload.conversationId, () =>
+      this.product.conversations.reorderGuidance({
+        commandId: payload.command.commandId,
+        conversationId: payload.conversationId,
+        items: payload.items
+      }));
     this.postGuidanceControlResult(webview, correlationId, {
       commandId: payload.command.commandId,
       conversationId: payload.conversationId,
@@ -1164,6 +1247,15 @@ export class VscodeReliableKernelCommandRouter {
     if (!Number.isSafeInteger(payload.leaseEpoch) || payload.leaseEpoch < 0) {
       throw new TypeError('Turn interrupt 缺少有效的 ExecutionLease generation。');
     }
+    await this.runConversationCommand(payload.conversationId, () =>
+      this.handleInterruptUnderOwnership(webview, correlationId, payload));
+  }
+
+  private async handleInterruptUnderOwnership(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: TurnInterruptPayload
+  ): Promise<void> {
     const turn = await this.maybeRow('Turn', payload.turnId);
     if (!turn) {
       console.info(`[LimCode] Treated stale Turn interrupt as already terminal: ${payload.turnId}`);
@@ -1249,6 +1341,15 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: MessageEditPayload
   ): Promise<void> {
+    await this.runConversationCommand(payload.conversationId, () =>
+      this.handleMessageEditUnderOwnership(webview, correlationId, payload));
+  }
+
+  private async handleMessageEditUnderOwnership(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: MessageEditPayload
+  ): Promise<void> {
     try {
       let result;
       if (payload.runAfterEdit) {
@@ -1319,6 +1420,15 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string,
     payload: MessageDeleteFromPayload
   ): Promise<void> {
+    await this.runConversationCommand(payload.conversationId, () =>
+      this.handleMessageDeleteUnderOwnership(webview, correlationId, payload));
+  }
+
+  private async handleMessageDeleteUnderOwnership(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: MessageDeleteFromPayload
+  ): Promise<void> {
     try {
       const result = await this.product.application.turns.delete({
         source: { kind: 'command', key: payload.command.commandId },
@@ -1345,6 +1455,15 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   private async handleMessageRetry(
+    webview: vscode.Webview,
+    correlationId: string,
+    payload: MessageRetryFromPayload
+  ): Promise<void> {
+    await this.runConversationCommand(payload.conversationId, () =>
+      this.handleMessageRetryUnderOwnership(webview, correlationId, payload));
+  }
+
+  private async handleMessageRetryUnderOwnership(
     webview: vscode.Webview,
     correlationId: string,
     payload: MessageRetryFromPayload
@@ -1431,6 +1550,16 @@ export class VscodeReliableKernelCommandRouter {
     payload: CompressionStartPayload
   ): Promise<void> {
     const conversationId = requireText(payload.conversationId, 'conversationId');
+    await this.runConversationCommand(conversationId, () =>
+      this.handleCompressionStartUnderOwnership(webview, correlationId, payload, conversationId));
+  }
+
+  private async handleCompressionStartUnderOwnership(
+    webview: vscode.Webview,
+    correlationId: string | undefined,
+    payload: CompressionStartPayload,
+    conversationId: string
+  ): Promise<void> {
     const commandId = requireText(payload.command?.commandId, 'compression commandId');
     await this.requireRow('Conversation', conversationId);
     const replay = await this.product.conversations.inspectManualCompression?.({
@@ -1593,67 +1722,70 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string | undefined,
     payload: InteractionResolvePayload
   ): Promise<void> {
-    const request = await this.requireRow('InteractionRequest', payload.interactionRequestId);
-    const owner = (await this.list('InteractionOwnerLink', { request_id: payload.interactionRequestId }, 2))[0];
-    const toolLink = (await this.list('InteractionToolCallLink', { request_id: payload.interactionRequestId }, 2))[0];
-    if (!owner || owner.turn_id !== payload.ownerTurnId) throw new Error('Interaction owner 已变化。');
-    if (!toolLink) throw new Error('Interaction 缺少 ToolCall 关系。');
-    let won: boolean;
-    if (request.request_kind === 'ask_user') {
-      const result = await this.product.application.interactions.resolveAskUser({
-        source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
-        requestId: payload.interactionRequestId,
-        response: payload.response,
-        cancelled: payload.decision === 'cancel' || payload.decision === 'reject'
-      });
-      won = result.won;
-    } else if (request.request_kind === 'file_change_approval') {
-      const changeSets = await this.list('FileChangeSet', { tool_call_id: toolLink.tool_call_id }, 2);
-      const changeSet = changeSets[0];
-      if (!changeSet) throw new Error('文件 Interaction 缺少 FileChangeSet。');
-      const result = await this.product.application.files.decide({
-        source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
-        changeSetId: String(changeSet.id),
-        decision: payload.decision === 'accept' || payload.decision === 'submit'
-          ? 'approved'
-          : payload.decision === 'cancel'
-            ? 'cancelled'
-            : 'rejected',
-        response: payload.response
-      });
-      won = result.won;
-      if (result.preparedEffect) {
-        await this.product.application.fileMutations.dispatchRecordAndReconcile(result.preparedEffect.effectIntentId);
+    const { requestKind, won } = await this.runConversationCommand(payload.conversationId, async () => {
+      const request = await this.requireRow('InteractionRequest', payload.interactionRequestId);
+      const owner = (await this.list('InteractionOwnerLink', { request_id: payload.interactionRequestId }, 2))[0];
+      const toolLink = (await this.list('InteractionToolCallLink', { request_id: payload.interactionRequestId }, 2))[0];
+      if (!owner || owner.turn_id !== payload.ownerTurnId) throw new Error('Interaction owner 已变化。');
+      if (!toolLink) throw new Error('Interaction 缺少 ToolCall 关系。');
+      if (request.request_kind === 'ask_user') {
+        const result = await this.product.application.interactions.resolveAskUser({
+          source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
+          requestId: payload.interactionRequestId,
+          response: payload.response,
+          cancelled: payload.decision === 'cancel' || payload.decision === 'reject'
+        });
+        return { requestKind: String(request.request_kind), won: result.won };
       }
-    } else if (request.request_kind === 'plan_review') {
-      const result = await this.product.application.interactions.resolvePlanReview({
-        source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
-        requestId: payload.interactionRequestId,
-        decision: payload.decision,
-        response: payload.response
-      });
-      won = result.won;
-    } else if (request.request_kind === 'exec_approval') {
-      const result = await this.product.application.interactions.resolveExecutionApproval({
-        source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
-        requestId: payload.interactionRequestId,
-        decision: payload.decision === 'accept' || payload.decision === 'submit'
-          ? 'accept'
-          : payload.decision === 'cancel'
-            ? 'cancel'
-            : 'reject',
-        response: payload.response
-      });
-      won = result.won;
-    } else {
+      if (request.request_kind === 'file_change_approval') {
+        const changeSets = await this.list('FileChangeSet', { tool_call_id: toolLink.tool_call_id }, 2);
+        const changeSet = changeSets[0];
+        if (!changeSet) throw new Error('文件 Interaction 缺少 FileChangeSet。');
+        const result = await this.product.application.files.decide({
+          source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
+          changeSetId: String(changeSet.id),
+          decision: payload.decision === 'accept' || payload.decision === 'submit'
+            ? 'approved'
+            : payload.decision === 'cancel'
+              ? 'cancelled'
+              : 'rejected',
+          response: payload.response
+        });
+        if (result.preparedEffect) {
+          await this.product.application.fileMutations.dispatchRecordAndReconcile(result.preparedEffect.effectIntentId);
+        }
+        return { requestKind: String(request.request_kind), won: result.won };
+      }
+      if (request.request_kind === 'plan_review') {
+        const result = await this.product.application.interactions.resolvePlanReview({
+          source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
+          requestId: payload.interactionRequestId,
+          decision: payload.decision,
+          response: payload.response
+        });
+        return { requestKind: String(request.request_kind), won: result.won };
+      }
+      if (request.request_kind === 'exec_approval') {
+        const result = await this.product.application.interactions.resolveExecutionApproval({
+          source: { kind: 'command', key: `interaction:${payload.interactionRequestId}:${payload.decision}:${correlationId ?? randomUUID()}` },
+          requestId: payload.interactionRequestId,
+          decision: payload.decision === 'accept' || payload.decision === 'submit'
+            ? 'accept'
+            : payload.decision === 'cancel'
+              ? 'cancel'
+              : 'reject',
+          response: payload.response
+        });
+        return { requestKind: String(request.request_kind), won: result.won };
+      }
       throw new Error(`不支持的可靠 Interaction 类型：${String(request.request_kind)}。`);
-    }
+    });
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
       correlationId,
       payload: {
-        requestType: String(request.request_kind),
+        requestType: requestKind,
         conversationId: payload.conversationId,
         targetId: payload.interactionRequestId,
         status: won ? 'committed' : 'already_resolved'
@@ -1698,6 +1830,7 @@ export class VscodeReliableKernelCommandRouter {
     }
     const toolCall = await this.requireRow('ToolCall', payload.toolCallId);
     const turn = await this.requireRow('Turn', String(toolCall.turn_id));
+    const turnConversationId = String(turn.conversation_id);
     if (toolCall.tool_name === 'run_agent') {
       const childLinks = await this.list('ChildExecutionParentLink', {
         source_tool_call_id: payload.toolCallId
@@ -1705,37 +1838,39 @@ export class VscodeReliableKernelCommandRouter {
       if (childLinks.length !== 1) {
         throw new Error('run_agent 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。');
       }
-      const result = await this.product.childAgents.interruptSubtree({
-        sourceKey: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
-        childExecutionId: String(childLinks[0].child_execution_id),
-        reason: payload.reason ?? '用户取消此子 Agent 执行。'
-      });
+      const result = await this.runConversationCommand(turnConversationId, () =>
+        this.product.childAgents.interruptSubtree({
+          sourceKey: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
+          childExecutionId: String(childLinks[0].child_execution_id),
+          reason: payload.reason ?? '用户取消此子 Agent 执行。'
+        }));
       this.post(webview, {
         id: randomUUID(),
         type: BridgeMessageType.InteractionResult,
         correlationId,
         payload: {
           requestType: BridgeMessageType.ToolExecutionCancel,
-          conversationId: String(turn.conversation_id),
+          conversationId: turnConversationId,
           targetId: payload.toolCallId,
           status: result.deduplicated ? 'already_applied' : 'committed'
         }
       });
       return;
     }
-    const interrupted = await this.product.conversations.interrupt({
-      commandId: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
-      conversationId: String(turn.conversation_id),
-      turnId: String(turn.id),
-      reason: payload.reason ?? '用户取消工具执行。'
-    });
+    const interrupted = await this.runConversationCommand(turnConversationId, () =>
+      this.product.conversations.interrupt({
+        commandId: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
+        conversationId: turnConversationId,
+        turnId: String(turn.id),
+        reason: payload.reason ?? '用户取消工具执行。'
+      }));
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,
       correlationId,
       payload: {
         requestType: BridgeMessageType.ToolExecutionCancel,
-        conversationId: String(turn.conversation_id),
+        conversationId: turnConversationId,
         targetId: payload.toolCallId,
         status: interrupted.ignoredBecauseTerminal
           ? 'already_satisfied'
@@ -1759,10 +1894,13 @@ export class VscodeReliableKernelCommandRouter {
     if (payload.conversationId !== undefined && payload.conversationId !== conversationId) {
       throw new Error('后台进程不属于当前 Conversation。');
     }
-    const observation = await this.product.application.processes.stopOwnedProcess(payload.processId);
-    if (observation.receipt) {
-      await this.product.application.processes.reconcileProcessExit(payload.processId);
-    }
+    const observation = await this.runConversationCommand(conversationId, async () => {
+      const result = await this.product.application.processes.stopOwnedProcess(payload.processId);
+      if (result.receipt) {
+        await this.product.application.processes.reconcileProcessExit(payload.processId);
+      }
+      return result;
+    });
     this.post(webview, {
       id: randomUUID(),
       type: BridgeMessageType.InteractionResult,

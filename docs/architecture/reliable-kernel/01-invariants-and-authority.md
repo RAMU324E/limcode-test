@@ -37,6 +37,26 @@ Webview：有界客户端读模型
 
 Runtime domain exact set 只在 [`authority.json#runtimeDomains`](./contracts/authority.json) 定义，并由 plan validator 与 Context/Subagent/Fork 合同交叉核验。
 
+### 2.1 多宿主与对话归属
+
+同一工作区允许多个 Runtime 宿主连接现有 SQLite/CAS；每个宿主有自己的 SQLite worker，写事务仍由 SQLite 串行提交。模型等待、工具执行和打开面板不持有工作区级锁。
+
+三种保护相互独立：
+
+| 保护 | 作用域 | 职责 |
+| --- | --- | --- |
+| `ConversationRuntimeOwnerManager` | 数据集身份 + Conversation ID | 决定服务对话的宿主，覆盖面板、命令、调度、恢复和后台唤醒 |
+| `ExecutionLease` | Conversation / Turn | 保留唯一执行身份与 owner/hostBootId/generation 栅栏，拒绝迟到执行写入 |
+| `runtimeHostControl` 维护互斥 | Runtime 数据根 | 串行化宿主注册与创建、升级、归档、重置；维护前拒绝其他存活或身份未知宿主 |
+
+归属记录位于 Runtime 控制目录，包含数据集/根身份、conversationId、hostBootId、ownerToken 和进程启动指纹，不进入 Conversation 配置，不保存第二套 Turn 状态。原子目录发布负责抢占唯一性；释放核对 token；死宿主接管使用旧 token 的确定性隔离目录。只有进程退出或 PID 启动指纹不匹配可证明失效，租约过期、心跳延迟和未知状态均不能抢占活宿主。
+
+同宿主主聊天页按对话共享正在打开的 Promise，重复打开聚焦已有面板。计划和工具详情等附属视图保留同一对话归属。关闭最后一个视图，仅在没有在途命令、执行、队列、回执收尾或待投递工作时释放；仍有后台工作则保留至收尾。外部 EffectReceipt / ProcessReceipt 按既有幂等规则落盘，后续继续执行和通知由目标对话宿主处理。
+
+配置根 admission 覆盖 placement 选择到宿主注册，锁顺序固定为配置根 admission → Runtime scope maintenance。旧文件 physical cutover 会过滤共享的 conversation settings / scope links，因此必须在此 admission 内核验所有 Runtime scopes 离线；不能只枚举当前目录后放任新 scope 注册。普通运行、模型等待和工具执行不持有 admission。
+
+生产入口：`backend/reliableKernel/ConversationRuntimeOwnerManager.ts`、`runtimeHostControl.ts`、`runtimeDatabase.ts`；界面入口和引用生命周期由 `vscode/panels/MainPanel.ts` 与 ApplicationFacade 对接。
+
 ## 3. 配置与 physical migration crosswalk
 
 配置对象和 ScopeLink 分别建模，不再用一个抽象 `Policy` 聚合：
@@ -67,7 +87,7 @@ agentSystem                → archive-reset（当前没有独立 AgentSystem au
 - `TurnIntent` 表达未来工作；
 - `PendingTurnInput` 表达当前 Turn 的补充；
 - `Turn` 表达已经开始的一次执行生命周期；
-- `ExecutionLease` 是 Conversation 当前执行 ownership；
+- `ExecutionLease` 是 Conversation 当前 Turn 的执行栅栏，不替代对话宿主归属；
 - `AuthoritySnapshot` 冻结本 Turn 的模型身份、执行权限与基础配置；
 - 新请求的压缩设置通过已有 `ModelRequest.settings_snapshot_object_id` 独立固定。保存配置不改写既有 Turn 或 ModelRequest；下一次尚未建立的请求读取对应模型的当前压缩配置，先行压缩与随后普通请求共用同一份设置；
 - `TurnTermination` 只表达终止事实；
@@ -158,6 +178,8 @@ Effect kind 首发包括 `mcp_tool_call`。MCP connection rebuild 不是 call re
 | `recovery.interrupted-subtree-incomplete` | F | interrupt_subtree 后仍有 active Turn/pending Intent |
 
 D 建 scanner framework，但不得实现 F 的领域规则。candidate gate 为每个 ID 提供独立 check，不能再用“恢复三类”复合 prose。
+
+扫描可以读取共享库，但会话状态修改、外部 dispatch、Turn admission 与 wake 必须先取得会话归属；其他存活宿主的工作只读跳过。当前宿主新认领一个崩溃对话时按该 conversationId 恢复，不要求重启窗口。
 
 ## 10. 文件事实
 

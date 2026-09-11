@@ -395,6 +395,23 @@ export class ReliableKernelApplication {
     return { phaseD, phaseF };
   }
 
+  /** Reconciles only a newly claimed conversation; opening a view must not recover its peers. */
+  public async recoverConversation(conversationId: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await this.database.conversationOwners.assertOwned(conversationId);
+    await this.phaseDRecovery.runAll(signal, conversationId);
+    await this.runtime.recovery.runAll(signal, conversationId);
+    signal?.throwIfAborted();
+    this.scheduleRuntimeConvergence();
+  }
+
+  /** External SQLite commits do not arrive through this host's onCommit listener. */
+  public async refreshExternalRuntimeWork(): Promise<void> {
+    if (this.convergenceClosed) return;
+    this.scheduleRuntimeConvergence();
+    await this.database.conversationOwners.sweepIdle();
+  }
+
   public close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closePromise = (async () => {
@@ -448,7 +465,9 @@ export class ReliableKernelApplication {
       });
       for (const intent of pendingFileMutations) {
         try {
-          await this.fileMutations.dispatchRecordAndReconcile(String(intent.id));
+          await this.convergeOwnedEffect(String(intent.id), () =>
+            this.fileMutations.dispatchRecordAndReconcile(String(intent.id))
+          );
         } catch (error) {
           failed += 1;
           this.diagnosticObserver?.observe({
@@ -474,7 +493,9 @@ export class ReliableKernelApplication {
         const fence = await this.runtime.effects.readEffectDispatchFence(effectIntentId);
         if (fence?.hostBootId !== this.database.hostBootId) continue;
         try {
-          await this.fileMutations.recoverDispatchedAndReconcile(effectIntentId);
+          await this.convergeOwnedEffect(effectIntentId, () =>
+            this.fileMutations.recoverDispatchedAndReconcile(effectIntentId)
+          );
         } catch (error) {
           failed += 1;
           this.diagnosticObserver?.observe({
@@ -515,6 +536,17 @@ export class ReliableKernelApplication {
     } else {
       this.convergenceRetryDelayMs = 0;
     }
+  }
+
+  private async convergeOwnedEffect(effectIntentId: string, operation: () => Promise<unknown>): Promise<void> {
+    const conversationId = await this.runtime.effects.conversationIdForEffect(effectIntentId);
+    if (conversationId === null) {
+      await operation();
+      return;
+    }
+    const owners = this.database.conversationOwners;
+    if (!owners.owns(conversationId)) return;
+    await owners.run(conversationId, async () => { await operation(); });
   }
 
   public beginHandoff(

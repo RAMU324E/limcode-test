@@ -11,6 +11,9 @@ const compiledRoot = process.env.LIMCODE_TEST_EXTENSION_ROOT
   ? path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT)
   : path.join(root, 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { ConversationRuntimeOwnerManager } = require(
+  path.join(compiledRoot, 'backend/reliableKernel/ConversationRuntimeOwnerManager.js')
+);
 const NOW = '2026-08-20T00:00:00.000Z';
 
 const authorityCompiler = {
@@ -64,6 +67,36 @@ test('父 Conversation 删除会递归删除全部 Subagent Conversation，但�
     assert.ok(await maybeGet(database, 'Conversation', 'fork'));
     assert.equal((await list(database, 'ChildExecution', {})).length, 0);
     assert.equal((await list(database, 'ConversationOriginLink', { conversation_id: 'fork' })).length, 1);
+  });
+});
+
+test('对话树任意节点被其他宿主打开时拒绝整棵删除且不留下部分删除', async () => {
+  await withRuntime('conversation-delete-owned-child', async ({ database, binding }) => {
+    await seedConversation(database, 'a-parent');
+    await seedConversation(database, 'z-child');
+    await seedStoppedChild(database, {
+      suffix: 'owned-child',
+      conversationId: 'z-child',
+      parentConversationId: 'a-parent',
+      parentTurnId: 'a-parent-turn'
+    });
+    const peer = new ConversationRuntimeOwnerManager(binding, 'other-window');
+    peer.setPendingWorkProbe(async () => false);
+    try {
+      await peer.retain('z-child', 'child-panel');
+      const control = new kernel.ConversationDeletionControlPlane(database);
+      await assert.rejects(control.delete('a-parent'), { code: 'conversation-runtime-owner-busy' });
+      assert.equal((await maybeGet(database, 'Conversation', 'a-parent')).title, 'a-parent');
+      assert.equal((await maybeGet(database, 'Conversation', 'z-child')).title, 'z-child');
+      assert.equal((await list(database, 'ChildExecution', {}))[0].child_conversation_id, 'z-child');
+
+      await peer.release('z-child', 'child-panel');
+      assert.deepEqual((await control.delete('a-parent')).deletedConversationIds, ['z-child', 'a-parent']);
+      assert.equal(await maybeGet(database, 'Conversation', 'a-parent'), null);
+      assert.equal(await maybeGet(database, 'Conversation', 'z-child'), null);
+    } finally {
+      await peer.close();
+    }
   });
 });
 

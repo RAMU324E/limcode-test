@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 import { toSqliteFilePath } from './sqliteFilePath';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
+import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import {
   approvedSubmitPlanTaskOperation,
   buildCurrentTurnTaskProjection,
@@ -187,6 +188,7 @@ async function start(): Promise<void> {
   let commitSeq = 0n;
   let closed = false;
   const contextCasCache = new VerifiedContextCasCache();
+  const conversationRuntimeWork = createConversationRuntimeWorkProbe(reader);
 
   post({ type: 'ready', workerThreadId: threadId, mode: data.mode });
   port.on('message', (request: DatabaseWorkerRequest) => {
@@ -244,6 +246,12 @@ async function start(): Promise<void> {
       if (request.kind === 'childProcessCleanupMaterializationCandidates') {
         assertDatabaseBinding(reader, data.binding);
         respond({ type: 'response', id: request.id, ok: true, result: executeChildProcessCleanupMaterializationCandidates(reader) });
+        return;
+      }
+      if (request.kind === 'conversationRuntimeWork') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = conversationRuntimeWork(requireRuntimeId(request.conversationId));
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'contextMaterialization') {

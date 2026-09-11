@@ -2,6 +2,7 @@ import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddr
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
+import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import {
   requireIsoTimestamp,
   requirePhaseFId,
@@ -253,6 +254,11 @@ export class ProcessCompletionDeliveryControlPlane {
     // Sweep facts that pre-date this pass. Facts created later by a failing reconciliation remain a
     // real crash boundary and are picked up by the next level-triggered pass.
     report.wakesCreated += await this.ensureRecoverableDeliveryWakes();
+    // Durable outbox rows stay host-agnostic, but only the target Conversation's owner may settle
+    // or dispatch its mutable execution. Foreign rows are left pending untouched — never claimed,
+    // never failed, never dead-lettered — so the owning Host's own level scan converges them.
+    const gate = new ConversationOwnershipGate(this.database, 'claim');
+    try {
     const dispatches = [
       ...await listAllDomainRows(this.database, 'ProcessCompletionDispatch', { state: 'pending' }),
       ...await listAllDomainRows(this.database, 'ProcessCompletionDispatch', { state: 'claimed' })
@@ -263,9 +269,19 @@ export class ProcessCompletionDeliveryControlPlane {
       const dispatchId = requirePhaseFId(dispatch.id, 'ProcessCompletionDispatch.id');
       let claim: DomainRow | null = null;
       try {
+        const targetConversationId = await this.dispatchConversationId(dispatch);
+        if (targetConversationId !== null && !await gate.check(targetConversationId)) continue;
         claim = await this.claimOutbox('ProcessCompletionDispatch', dispatch);
         if (!claim) continue;
-        const result = await this.reconcileDispatch(claim);
+        const claimedDispatch = claim;
+        const reconciled = targetConversationId === null
+          ? { ran: true as const, value: await this.reconcileDispatch(claimedDispatch) }
+          : await gate.run(targetConversationId, () => this.reconcileDispatch(claimedDispatch));
+        if (!reconciled.ran) {
+          await this.releaseClaim('ProcessCompletionDispatch', claim, { immediate: true }).catch(() => undefined);
+          continue;
+        }
+        const result = reconciled.value;
         if (result.completion.created) report.completionsCreated += 1;
         if (result.delivery.deliveryCreated) report.deliveriesCreated += 1;
         if (result.delivery.wakeCreated) report.wakesCreated += 1;
@@ -286,12 +302,21 @@ export class ProcessCompletionDeliveryControlPlane {
       const wakeId = requirePhaseFId(wake.id, 'RuntimeDeliveryWake.id');
       let claim: DomainRow | null = null;
       try {
+        const targetConversationId = await this.wakeConversationId(wake);
+        if (targetConversationId !== null && !await gate.check(targetConversationId)) continue;
         claim = await this.claimOutbox('RuntimeDeliveryWake', wake);
         if (!claim) continue;
-        const dispatched = await this.dispatchWake(claim);
-        if (dispatched === 'acknowledged') {
+        const claimedWake = claim;
+        const dispatched = targetConversationId === null
+          ? { ran: true as const, value: await this.dispatchWake(claimedWake) }
+          : await gate.run(targetConversationId, () => this.dispatchWake(claimedWake));
+        if (!dispatched.ran) {
+          await this.releaseClaim('RuntimeDeliveryWake', claim, { immediate: true }).catch(() => undefined);
+          continue;
+        }
+        if (dispatched.value === 'acknowledged') {
           report.wakesAcknowledged += 1;
-        } else if (dispatched === 'retry') {
+        } else if (dispatched.value === 'retry') {
           await this.releaseClaim('RuntimeDeliveryWake', claim);
         }
       } catch (error) {
@@ -300,8 +325,44 @@ export class ProcessCompletionDeliveryControlPlane {
         this.reportError('wake', wakeId, error);
       }
     }
+    } finally {
+      await gate.releaseClaimed();
+    }
     this.retryPollingNeeded = !this.closing && await this.hasOutstandingOutboxWork();
     return report;
+  }
+
+  /** Conversation that owns this dispatch's completion chain; null defers to reconcile validation. */
+  private async dispatchConversationId(dispatch: DomainRow): Promise<string | null> {
+    try {
+      const receipt = await this.maybeGet(
+        'ProcessReceipt',
+        requirePhaseFId(dispatch.process_receipt_id, 'ProcessCompletionDispatch.process_receipt_id')
+      );
+      if (!receipt) return null;
+      const sources = await this.listRows('ProcessCompletionSourceLink', { process_id: receipt.process_id }, 1);
+      return sources[0]
+        ? requirePhaseFId(sources[0].conversation_id, 'ProcessCompletionSourceLink.conversation_id')
+        : null;
+    } catch {
+      // Resolution races surface through the normal reconcile failure path instead.
+      return null;
+    }
+  }
+
+  /** Conversation a wake dispatches into; null defers to the dispatch-time source validation. */
+  private async wakeConversationId(wake: DomainRow): Promise<string | null> {
+    try {
+      const delivery = await this.maybeGet(
+        'RuntimeDelivery',
+        requirePhaseFId(wake.delivery_id, 'RuntimeDeliveryWake.delivery_id')
+      );
+      return delivery
+        ? requirePhaseFId(delivery.target_conversation_id, 'RuntimeDelivery.target_conversation_id')
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   private async hasOutstandingOutboxWork(): Promise<boolean> {
@@ -878,14 +939,19 @@ export class ProcessCompletionDeliveryControlPlane {
 
   private async releaseClaim(
     domain: 'ProcessCompletionDispatch' | 'RuntimeDeliveryWake',
-    claim: DomainRow
+    claim: DomainRow,
+    options: { immediate?: boolean } = {}
   ): Promise<void> {
     const id = requirePhaseFId(claim.id, `${domain}.id`);
     const now = this.timestamp();
-    const nextAttemptAt = addMilliseconds(now, retryDelay(
-      requireCounter(claim.attempt_count, `${domain}.attempt_count`),
-      this.retryBaseMs
-    ));
+    // Foreign-owner requeues stay immediately claimable: the owning Host's next level scan must
+    // not wait out a backoff meant for genuine handler failures.
+    const nextAttemptAt = options.immediate === true
+      ? null
+      : addMilliseconds(now, retryDelay(
+          requireCounter(claim.attempt_count, `${domain}.attempt_count`),
+          this.retryBaseMs
+        ));
     await this.database.transaction([
       DOMAIN_REPOSITORIES.domain(domain).assert(id, this.claimIdentity(claim)),
       DOMAIN_REPOSITORIES.domain(domain).update(id, {
