@@ -200,6 +200,7 @@
       "codec": "GlobalSettingsSectionCodec",
       "migrationEntryIds": [
         "setting.common",
+        "setting.network",
         "setting.llm",
         "setting.llmCompression",
         "setting.checkpointMaintenance",

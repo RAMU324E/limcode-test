@@ -489,6 +489,11 @@ export const PHYSICAL_CUTOVER_MANIFEST: PhysicalCutoverManifest = Object.freeze(
       "disposition": "preserve-whole"
     },
     {
+      "id": "setting.network",
+      "relativePath": "network.json",
+      "disposition": "preserve-whole"
+    },
+    {
       "id": "setting.appearance",
       "relativePath": "appearance.json",
       "disposition": "preserve-whole"

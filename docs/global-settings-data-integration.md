@@ -105,6 +105,15 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - 配置编辑只影响后续冻结请求。普通发送与 Enter 读取当前流式 `ModelRequest.stream_stats_json.nativeCapabilities`：支持原生转向时自动介入当前回复，不支持时仍按原有规则发送或排队；不提供独立转向按钮，也不能从尚未生效的可编辑设置推断当前连接能力。提交转向期间禁止重复发送，失败保留草稿与附件，不自动改为排队；编辑消息仍走原编辑流程。
 - 保存与重载必须保留模型级原生配置；发送前继续使用专用 plain-data 转换，禁止把 Pinia/Vue Proxy 放进 bridge payload。
 
+### 4.2 自定义 User-Agent
+
+- 主入口位于全局「其他」页的网络配置区域，提供 `默认 User-Agent（UA）`。数据使用 `network` section 的 `NetworkSettingsRecord { userAgent }`，通过现有 `settings.global.get/update/snapshot` 保存到当前 `settingsRootUri/network.json`，不进入 VS Code `globalState` 或 globalStatus。
+- 渠道默认配置与 LLM 专属配置不再提供独立 UA 输入框；特殊客户端身份仍通过各自的自定义请求头设置 `User-Agent`。优先级为：当前生效配置中的 `User-Agent` → `network.userAgent` → `EXTENSION_USER_AGENT`。LLM 专属配置继续整体替代渠道配置，不额外引入 UA 继承。
+- 全局 UA 随「保存其他设置」保存，清空后使用扩展默认值。自定义请求头编辑器保留正在编辑的尾随空格，避免逐字输入或保存确认把 UA 中的单词粘连；离开输入框后显示归一化结果。
+- 请求头覆盖按名称大小写不敏感处理，保留默认头的名称拼写，防止 SDK 补入另一个同名 UA 后被 HTTP 层拼接成多值。保存和重载继续使用现有纯数据转换、修订检查与当前配置根。
+- 全局默认 UA 应用于 LLM 的 HTTP 请求、WebSocket 握手及模型列表读取。后续请求重新读取默认值；WS 连接身份包含最终请求头，有效 UA 变化后使用新的握手连接，不复用旧 UA 的连接身份。
+- UA 仅改变 LLM 请求头，不模拟 TLS 指纹、浏览器能力、操作系统或网络出口，也不修改 shell、MCP 等其他客户端进程的 UA。
+
 ## 5. 前端对接标准
 
 1. 页面组件不要直接调用 bridge，统一通过对应 Pinia store action。

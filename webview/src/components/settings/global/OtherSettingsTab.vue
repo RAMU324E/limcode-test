@@ -4,13 +4,19 @@ import DebugCaptureSettings from './DebugCaptureSettings.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
+import { EXTENSION_USER_AGENT } from '@shared/extensionIdentity';
 
 const settings = useGlobalSettingsStore();
-const { loading: otherLoading, text: otherLoadingText } = useSettingsLoadingText('其他设置', 'global', undefined, { globalSettingsSections: ['common', 'attachments'] as const });
+const { loading: otherLoading, text: otherLoadingText } = useSettingsLoadingText('其他设置', 'global', undefined, { globalSettingsSections: ['common', 'network', 'attachments'] as const });
 
 function inputNumber(event: Event): number {
   const target = event.target as HTMLInputElement | null;
   return Number(target?.value ?? 20);
+}
+
+function saveOtherSettings(): void {
+  settings.saveCommon();
+  settings.saveNetwork();
 }
 </script>
 
@@ -29,6 +35,19 @@ function inputNumber(event: Event): number {
     <label class="global-settings-field">
       <span>网络代理地址（留空则直连；可省略 http://，例如 127.0.0.1:7897）</span>
       <input v-model="settings.common.proxy" type="text" placeholder="127.0.0.1:7897 或 http://127.0.0.1:7897" />
+    </label>
+
+    <label class="global-settings-field">
+      <span>默认 User-Agent（UA）</span>
+      <input
+        v-model="settings.network.userAgent"
+        type="text"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="默认 User-Agent"
+        :placeholder="EXTENSION_USER_AGENT"
+      />
+      <span class="global-settings-field-hint">统一用于 LLM 的 HTTP 请求与 WebSocket 握手；渠道或 LLM 专属配置中的 User-Agent 请求头可覆盖。留空使用 {{ EXTENSION_USER_AGENT }}，不模拟 TLS 指纹或完整客户端环境。</span>
     </label>
 
     <div class="global-settings-field">
@@ -55,7 +74,7 @@ function inputNumber(event: Event): number {
     </label>
 
     <div class="global-settings-actions">
-      <button type="button" @click="settings.saveCommon()">保存其他设置</button>
+      <button type="button" @click="saveOtherSettings">保存其他设置</button>
       <button type="button" class="secondary" @click="settings.requestAll()">重新读取</button>
       <span class="global-settings-status">{{ settings.status }}</span>
     </div>
@@ -69,6 +88,9 @@ function inputNumber(event: Event): number {
       </p>
       <p class="global-settings-path">
         路径配置保存位置：<code>{{ settings.filePaths.common || '正在获取 VS Code 配置存储位置…' }}</code>
+      </p>
+      <p class="global-settings-path">
+        网络设置：<code>{{ settings.filePaths.network || '正在获取网络设置路径…' }}</code>
       </p>
       <p class="global-settings-path">
         当前渠道选择：<code>{{ settings.filePaths.llm || '正在获取当前渠道配置路径…' }}</code>

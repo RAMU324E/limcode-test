@@ -16,6 +16,7 @@ import {
   defaultLlmPromptCacheTtlForProvider,
   type CheckpointMaintenanceSettingsRecord,
   type GlobalSettingsRecord,
+  type NetworkSettingsRecord,
   type GlobalSettingsSection,
   type GlobalSettingsSectionValue,
   type GlobalSettingsSnapshotPayload,
@@ -63,6 +64,7 @@ interface FetchedModelsDialogState {
 
 interface GlobalSettingsState {
   common: GlobalSettingsRecord;
+  network: NetworkSettingsRecord;
   /** LLM 全局选择信息：只保存当前激活的可复用渠道配置 id。 */
   llm: LlmSettingsRecord;
   /** 全局范围内可复用的渠道配置集合。 */
@@ -127,6 +129,10 @@ function settingsErrorStatus(requestType: string | undefined, message: string): 
 
 function emptyCommon(): GlobalSettingsRecord {
   return { dataFilePath: '', proxy: '', proxyShellAndMcp: false, activeDataRootPath: '', defaultDataRootPath: '' };
+}
+
+function emptyNetwork(): NetworkSettingsRecord {
+  return { userAgent: '' };
 }
 
 function emptyLlm(): LlmSettingsRecord {
@@ -815,6 +821,7 @@ function plainSettingsFromState(state: GlobalSettingsState, section: GlobalSetti
         activeDataRootPath: state.common.activeDataRootPath,
         defaultDataRootPath: state.common.defaultDataRootPath
       };
+    case 'network': return { userAgent: state.network.userAgent.trim() };
     case 'llm': return { activeProviderConfigId: state.llm.activeProviderConfigId };
     case 'llmProviderConfigs': return { configs: state.llmProviderConfigs.configs.map(toPlainProviderConfig) };
     case 'llmCompression': return toPlainCompressionSettings(state.llmCompression);
@@ -1077,6 +1084,7 @@ function startModelFetchTimeout(onTimeout: () => void): void {
 export const useGlobalSettingsStore = defineStore('globalSettings', {
   state: (): GlobalSettingsState => ({
     common: emptyCommon(),
+    network: emptyNetwork(),
     llm: emptyLlm(),
     llmProviderConfigs: emptyLlmProviderConfigs(),
     llmCompression: emptyLlmCompression(),
@@ -1270,6 +1278,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
           activeDataRootPath: this.common.activeDataRootPath,
           defaultDataRootPath: this.common.defaultDataRootPath
         }
+      });
+    },
+    saveNetwork(): void {
+      this.enqueueSettingsUpdate({
+        section: 'network',
+        settings: { userAgent: this.network.userAgent.trim() }
       });
     },
     setDebugCaptureSettings(patch: Partial<DebugCaptureSettings>): void {
@@ -2232,6 +2246,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     },
     applySectionSettings(section: GlobalSettingsSection, value: GlobalSettingsSectionValue): void {
       if (section === 'llm') this.llm = { ...emptyLlm(), ...(value as LlmSettingsRecord) };
+      else if (section === 'network') this.network = { ...emptyNetwork(), ...(value as NetworkSettingsRecord) };
       else if (section === 'llmProviderConfigs') {
         const settings = value as LlmProviderConfigsRecord;
         this.llmProviderConfigs = { configs: settings.configs.map(normalizeProviderConfigForUi) };

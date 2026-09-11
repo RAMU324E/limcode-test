@@ -4553,8 +4553,8 @@ function mergeHeaders(...records: Array<Record<string, string> | undefined>): Ll
       const key = rawKey.trim();
       if (!key) continue;
       const existingKey = Object.keys(result).find((candidate) => candidate.toLowerCase() === key.toLowerCase());
-      if (existingKey && existingKey !== key) delete result[existingKey];
-      result[key] = rawValue;
+      // 保留默认头的拼写，避免 SDK 再补同名头后被 fetch 拼接成多值。
+      result[existingKey ?? key] = rawValue;
     }
   }
   return Object.keys(result).length > 0 ? result : undefined;

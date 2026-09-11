@@ -1855,6 +1855,25 @@
         "unknownFilePolicy": "leave-untouched-unless-indexed"
       },
       {
+        "id": "setting.network",
+        "logicalDomain": "NetworkSettings",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "network.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "NetworkSettingsRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
         "id": "setting.appearance",
         "logicalDomain": "AppearanceSettings",
         "physicalKind": "settings-section",

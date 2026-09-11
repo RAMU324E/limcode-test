@@ -61,6 +61,37 @@ test('调试默认设置使用独立设置文件、现有修订检查与当前�
   }
 });
 
+test('全局 UA 随当前配置根持久化，旧窗口不能覆盖且损坏记录不回退默认值', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-network-settings-'));
+  try {
+    let currentRoot = path.join(root, 'first');
+    const getPaths = () => createVscodeStoragePaths(vscode.Uri.file(currentRoot));
+    const authority = new VscodeConfigurationAuthority(getPaths);
+    const peer = new VscodeConfigurationAuthority(getPaths);
+    const initial = await authority.loadGlobalSettings('network');
+    const stale = await peer.loadGlobalSettings('network');
+    const updated = await authority.saveGlobalSettings('network', {
+      userAgent: '  Global Client/1 (Windows)  '
+    }, initial.revision);
+    assert.deepEqual(updated.settings, { userAgent: 'Global Client/1 (Windows)' });
+    assert.equal(updated.filePath, path.join(currentRoot, 'settings', 'network.json'));
+    await assert.rejects(peer.saveGlobalSettings('network', { userAgent: 'stale client' }, stale.revision), /revision|版本|冲突/i);
+    assert.deepEqual((await peer.loadGlobalSettings('network')).settings, updated.settings);
+
+    currentRoot = path.join(root, 'second');
+    const switched = await authority.loadGlobalSettings('network');
+    assert.deepEqual(switched.settings, { userAgent: '' });
+    assert.equal(switched.filePath, path.join(currentRoot, 'settings', 'network.json'));
+    assert.deepEqual(JSON.parse(await fs.readFile(updated.filePath, 'utf8')).settings, updated.settings);
+    const damaged = JSON.parse(await fs.readFile(switched.filePath, 'utf8'));
+    damaged.settings.userAgent = 42;
+    await fs.writeFile(switched.filePath, JSON.stringify(damaged));
+    await assert.rejects(authority.loadGlobalSettings('network'), /内容损坏/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('ToolPolicy 层按能力上界收窄、深合并配置，并保持来源 deny 单调', () => {
   const resolved = resolveToolPolicyLayers([
     {

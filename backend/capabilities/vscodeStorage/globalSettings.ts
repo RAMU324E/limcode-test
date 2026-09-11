@@ -7,7 +7,8 @@ import type {
   GlobalSettingsSection,
   GlobalSettingsSectionValue,
   LlmCompressionSettingsRecord,
-  LlmSettingsRecord
+  LlmSettingsRecord,
+  NetworkSettingsRecord
 } from '../../../shared/protocol';
 import { createDefaultLlmCompressionSettings } from '../../../shared/protocol';
 import { ATTACHMENT_SETTINGS_FILE, CHECKPOINT_MAINTENANCE_SETTINGS_FILE, LLM_COMPRESSION_SETTINGS_FILE, LLM_SETTINGS_FILE, STORAGE_VERSION } from './constants';
@@ -40,6 +41,11 @@ const GLOBAL_SETTINGS_SECTION_SPECS: Record<FileBackedGlobalSettingsSection, {
   createDefault: () => GlobalSettingsSectionValue;
   normalize: (input: Partial<GlobalSettingsSectionValue> | undefined) => GlobalSettingsSectionValue;
 }> = {
+  network: {
+    fileName: 'network.json',
+    createDefault: () => ({ userAgent: '' }),
+    normalize: (input) => normalizeNetworkSettings(input as Partial<NetworkSettingsRecord> | undefined)
+  },
   debugCapture: {
     fileName: 'debug-capture.json',
     createDefault: normalizeDebugCaptureSettings,
@@ -75,6 +81,10 @@ const GLOBAL_SETTINGS_SECTION_SPECS: Record<FileBackedGlobalSettingsSection, {
 const DEFAULT_CHECKPOINT_AUTO_CLEANUP_DAYS = 7;
 const DEFAULT_CHECKPOINT_AUTO_DISMISS_SECONDS = 5;
 export const DEFAULT_ATTACHMENT_MAX_STORED_INLINE_FILE_MB = 20;
+
+function normalizeNetworkSettings(input: Partial<NetworkSettingsRecord> | undefined): NetworkSettingsRecord {
+  return { userAgent: typeof input?.userAgent === 'string' ? input.userAgent.trim() : '' };
+}
 
 export function createDefaultCheckpointMaintenanceSettings(): CheckpointMaintenanceSettingsRecord {
   return {
@@ -265,6 +275,7 @@ function isValidGlobalSettingsSectionValue(section: GlobalSettingsSection, value
   const record = asPlainObject(value);
   if (!record) return false;
   if (section === 'llm') return typeof record.activeProviderConfigId === 'string';
+  if (section === 'network') return typeof record.userAgent === 'string';
   if (section === 'llmCompression') {
     return Array.isArray(record.providerBindings) && Array.isArray(record.modelBindings)
       && (record.defaultConfigId === undefined || typeof record.defaultConfigId === 'string');

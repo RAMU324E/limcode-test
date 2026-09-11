@@ -251,6 +251,14 @@ test('OpenAI Responses WS session key 按 conversation 隔离且拒绝 global fa
   );
 });
 
+test('渠道 User-Agent 按大小写不敏感语义覆盖默认 UA，不与 SDK 默认值拼接', async () => {
+  const result = await dryRunLlmProvider(chatRequest('request-custom-user-agent'), {
+    settings: async () => providerConfig({ headers: { 'uSeR-aGeNt': 'Channel Client/2 (Windows)' } }),
+    headers: async () => ({ 'User-Agent': 'Global Client/1' })
+  });
+  assert.equal(new Headers(result.headers).get('user-agent'), 'Channel Client/2 (Windows)');
+});
+
 test('OpenAI Responses WS prompt cache key 按 conversation 隔离', async () => {
   const config = providerConfig({
     openaiResponsesTransport: 'websocket',

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { IconPlus, IconTrash } from '@tabler/icons-vue';
 import type { LlmProviderHeadersRecord } from '@shared/protocol';
 
@@ -12,6 +12,15 @@ const emit = defineEmits<{
 }>();
 
 const entries = computed(() => Object.entries(props.modelValue ?? {}));
+const headerValueDrafts = ref<LlmProviderHeadersRecord>({});
+
+watch(entries, (values) => {
+  const previous = headerValueDrafts.value;
+  // 设置会 trim 请求头值；保留编辑中的空格，避免 UA 等多段文本在保存确认后粘连。
+  headerValueDrafts.value = Object.fromEntries(values.map(([key, value]) => [
+    key, previous[key]?.trim() === value ? previous[key] : value
+  ]));
+}, { immediate: true });
 
 function emitHeaders(headers: LlmProviderHeadersRecord): void {
   emit('update:modelValue', Object.keys(headers).length > 0 ? headers : undefined);
@@ -45,7 +54,9 @@ function renameHeader(oldKey: string, event: Event): void {
 
 function updateHeaderValue(key: string, event: Event): void {
   const headers = cloneHeaders();
-  headers[key] = (event.target as HTMLInputElement).value;
+  const value = (event.target as HTMLInputElement).value;
+  headerValueDrafts.value[key] = value;
+  headers[key] = value;
   emitHeaders(headers);
 }
 
@@ -64,7 +75,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
     <header class="llm-headers-header">
       <div>
         <label>自定义请求头</label>
-        <p>请求头值必须是文本；同名请求头可能覆盖默认认证信息、版本或 User-Agent，请谨慎配置。</p>
+        <p>User-Agent 可覆盖网络设置中的默认 UA；请求头值必须是文本，覆盖默认认证信息或版本时请谨慎配置。</p>
       </div>
       <button type="button" class="llm-headers-add" @click="addHeader">
         <IconPlus stroke="2" aria-hidden="true" />
@@ -86,11 +97,12 @@ function uniqueKey(base: string, existingKeys: string[]): string {
         />
         <input
           class="llm-header-value"
-          :value="value"
+          :value="headerValueDrafts[key] ?? value"
           type="text"
           spellcheck="false"
           placeholder="请求头值"
           @input="updateHeaderValue(key, $event)"
+          @blur="headerValueDrafts[key] = value"
         />
         <button type="button" class="llm-header-remove" aria-label="移除请求头" @click="removeHeader(key)">
           <IconTrash stroke="2" aria-hidden="true" />

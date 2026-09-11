@@ -38,7 +38,7 @@ export interface WebviewClientMeta {
   planProposalId?: string;
 }
 
-export const GLOBAL_SETTINGS_SECTIONS = ['common', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'mcpServers', 'debugCapture'] as const;
+export const GLOBAL_SETTINGS_SECTIONS = ['common', 'network', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'mcpServers', 'debugCapture'] as const;
 export type GlobalSettingsSection = typeof GLOBAL_SETTINGS_SECTIONS[number];
 
 export const CONVERSATION_SETTINGS_SECTIONS = ['common', 'llm'] as const;
@@ -2739,6 +2739,10 @@ export interface GlobalSettingsRecord {
   activeDataRootPath: string;
   defaultDataRootPath: string;
 }
+export interface NetworkSettingsRecord {
+  /** LLM 请求的默认 User-Agent；空字符串使用扩展默认值，渠道或模型请求头可覆盖。 */
+  userAgent: string;
+}
 export interface CheckpointMaintenanceSettingsRecord {
   autoCleanupEnabled: boolean;
   autoCleanupDays: number;
@@ -2786,7 +2790,7 @@ export interface AppearanceSettingsRecord {
   /** AI 已输出工具调用、工具正在排队或执行时显示的文字。 */
   streamingTextToolExecuting: string;
 }
-export type GlobalSettingsSectionValue = GlobalSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | AttachmentSettingsRecord | McpServersSettingsRecord | DebugCaptureSettings;
+export type GlobalSettingsSectionValue = GlobalSettingsRecord | NetworkSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | AttachmentSettingsRecord | McpServersSettingsRecord | DebugCaptureSettings;
 export interface GlobalSettingsGetPayload {
   section: GlobalSettingsSection;
 }

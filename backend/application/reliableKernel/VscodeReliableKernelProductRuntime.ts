@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { EXTENSION_USER_AGENT } from '../../../shared/extensionIdentity';
-import type { GlobalSettingsRecord } from '../../../shared/protocol';
+import type { GlobalSettingsRecord, NetworkSettingsRecord } from '../../../shared/protocol';
 import { resolveDataRootUri } from '../../capabilities/vscodeStorage/globalStatus';
 import {
   createVscodeStoragePaths,
@@ -179,7 +179,11 @@ export class VscodeReliableKernelProductRuntime {
         // 宽容解析：允许用户省略 http:// scheme；非法值视为未设置（直连），不让请求侧抛 URL 错误。
         return normalizeProxySetting(proxy);
       },
-      headers: { 'User-Agent': EXTENSION_USER_AGENT },
+      headers: async () => {
+        const network = await configuration.loadGlobalSettings('network');
+        const userAgent = (network.settings as NetworkSettingsRecord).userAgent;
+        return { 'User-Agent': userAgent || EXTENSION_USER_AGENT };
+      },
       onTransportTrace: (trace) => {
         diagnostics.observe({
           eventKind: 'provider.transport.phase',

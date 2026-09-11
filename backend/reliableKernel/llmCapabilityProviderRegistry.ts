@@ -5,6 +5,7 @@ import type {
 } from '../../shared/protocol';
 import {
   createLlmProviderCapability,
+  type LlmProviderOptions,
   type LlmProviderTransportTrace
 } from '../capabilities/llmProvider';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
@@ -16,7 +17,7 @@ export interface ReliableLlmProviderRegistryOptions {
   debugCapture?: DebugCaptureRecorder;
   loadProviderConfig(providerConfigId: string): Promise<LlmProviderConfigRecord>;
   proxy?: () => string | undefined | Promise<string | undefined>;
-  headers?: Record<string, string>;
+  headers?: LlmProviderOptions['headers'];
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
   resolveAttachment?: (input: {
     attachmentId?: string;
@@ -60,7 +61,9 @@ export class ReliableLlmProviderRegistry implements ReliableAgentProviderRegistr
         );
       },
       ...(this.options.proxy ? { proxy: this.options.proxy } : {}),
-      ...(this.options.headers ? { headers: { ...this.options.headers } } : {}),
+      ...(this.options.headers ? {
+        headers: typeof this.options.headers === 'function' ? this.options.headers : { ...this.options.headers }
+      } : {}),
       ...(this.options.onTransportTrace ? { onTransportTrace: this.options.onTransportTrace } : {}),
       ...(this.options.resolveAttachment ? { resolveAttachment: this.options.resolveAttachment } : {})
     });
