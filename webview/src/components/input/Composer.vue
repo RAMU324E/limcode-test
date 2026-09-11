@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { IconBolt, IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
+import { IconFolder, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import {
   type AgentRecord,
@@ -94,18 +94,22 @@ const draft = computed({
   set: (next: string) => ui.setComposerDraft(next)
 });
 // Interaction 与普通输入是独立控制面：等待 AskUser/Plan 时，用户仍可创建排队 TurnIntent。
-const conversationInputDisabled = computed(() => props.disabled || Boolean(currentSubmissionCommandId.value));
+const conversationInputDisabled = computed(() =>
+  props.disabled || Boolean(currentSubmissionCommandId.value) || currentSteeringSubmitting.value
+);
 const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
 const sendTitle = computed(() => {
   if (currentSubmissionCommandId.value) return '正在确认消息已保存';
+  if (currentSteeringSubmitting.value) return '正在提交介入消息';
   if (ui.isEditing) return '提交编辑';
+  if (nativeSteeringAvailable.value) return '立即介入当前回复';
   return currentExecution.value ? '加入消息队列（不会解除当前审批或等待）' : '发送';
 });
 const currentExecution = computed(() => Object.values(reliableConversation.feed.records.Turn ?? {}).find((turn) =>
   turn.conversation_id === reliableConversation.conversationId.value && turn.status === 'active'
 ));
-/** 进行中的原生请求：只有它的冻结能力（response.created 时写入）决定转向入口是否存在。 */
+/** 只有进行中原生请求的冻结能力（response.created 时写入）决定普通发送是否使用转向。 */
 const activeStreamingModelRequest = computed(() => {
   const turn = currentExecution.value;
   if (!turn || typeof turn.id !== 'string') return undefined;
@@ -115,13 +119,6 @@ const activeStreamingModelRequest = computed(() => {
 });
 const nativeSteeringAvailable = computed(() =>
   modelRequestNativeCapabilities(activeStreamingModelRequest.value)?.steering === true
-);
-const canSteerNow = computed(() =>
-  nativeSteeringAvailable.value
-  && hasDraftContent.value
-  && !conversationInputDisabled.value
-  && !currentSteeringSubmitting.value
-  && !ui.isEditing
 );
 const canCompressCurrentContext = computed(() =>
   !currentExecution.value
@@ -294,7 +291,7 @@ watch(
     if (!commandId || !result) return;
     currentSteerCommandId.value = undefined;
     dismissSteeringSubmissionResult(commandId);
-    // 失败时保留草稿：转向输入可能从未落库，用户可修改后改用普通发送或重试。
+    // 失败时保留草稿和附件，不改为排队投递。
     if (!result.ok) return;
     attachmentSnapshots.value = { ...attachmentSnapshots.value, chat: [] };
     ui.clearChatDraft();
@@ -388,19 +385,14 @@ function submit(): void {
     emit('submit', text, content, currentTurnAuthoritySelection());
     return;
   }
+  if (nativeSteeringAvailable.value) {
+    const submission = steerCurrentTurn(text, content);
+    if (submission) currentSteerCommandId.value = submission.commandId;
+    return;
+  }
   const submission = sendMessage(text, content, currentTurnAuthoritySelection());
   if (!submission) return;
   currentSubmissionCommandId.value = submission.commandId;
-}
-
-/** 原生转向：立即把草稿注入进行中的原生请求；普通发送按钮仍只排队，停止按钮语义不变。 */
-function steerNow(): void {
-  if (!canSteerNow.value) return;
-  const text = draft.value.trim();
-  const content = buildMessageContent(text, selectedAttachments.value);
-  const submission = steerCurrentTurn(text, content);
-  if (!submission) return;
-  currentSteerCommandId.value = submission.commandId;
 }
 
 function openFilePicker(): void { fileInput.value?.click(); }
@@ -1014,17 +1006,6 @@ function middleEllipsis(value: string, maxLength: number): string {
         </svg>
       </button>
       <button
-        v-if="nativeSteeringAvailable"
-        type="button"
-        class="composer-steer"
-        :disabled="!canSteerNow"
-        aria-label="立即介入当前回复"
-        title="立即介入当前回复（原生转向）：把消息注入进行中的回复；普通发送仍只加入等待队列，停止按钮语义不变"
-        @click="steerNow"
-      >
-        <IconBolt class="composer-send-icon" stroke="2" aria-hidden="true" />
-      </button>
-      <button
         type="button"
         class="composer-send"
         :disabled="conversationInputDisabled || !hasDraftContent"
@@ -1553,7 +1534,6 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-send,
-.composer-steer,
 .composer-compact {
   flex: 0 0 auto;
   display: inline-flex;
@@ -1568,7 +1548,6 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-send:hover:not(:disabled),
-.composer-steer:hover:not(:disabled),
 .composer-compact:hover:not(:disabled) {
   color: var(--vscode-foreground);
   background: var(--vscode-list-hoverBackground, transparent);
@@ -1576,7 +1555,6 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-send:disabled,
-.composer-steer:disabled,
 .composer-compact:disabled {
   color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
   background: transparent;

@@ -102,7 +102,7 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - 能力只对 OpenAI Responses 的精确 Astra 型号及受支持快照开放。官方渠道可按渠道默认启用；第三方中继必须显式确认支持。HTTP/SSE 支持原生工具续接与动态推理；回合内转向和命名通道多路复用只在 WebSocket 模式开放。
 - 显式缓存复用 `promptCache`：`enabled`、`mode: 'explicit'`、`ttl: '30m'`。线级使用 `prompt_cache_options` 和符合条件的内容断点，不把旧 `prompt_cache_retention` 当作等价配置。
 - 每个工具的异步许可独立保存在 `ToolPolicy.toolConfigs[toolName].nativeAsync`。它不改变执行审批、变更应用、结果回传审批或调度策略；冻结工具定义中的 `metadata.nativeAsync` 经适配器映射为 `ToolSchema.async`，最终才成为线级声明的 `async`。
-- 配置编辑只影响后续冻结请求。聊天中的转向按钮读取当前 `ModelRequest.stream_stats_json.nativeCapabilities`，不能从尚未生效的可编辑设置推断当前连接能力。
+- 配置编辑只影响后续冻结请求。普通发送与 Enter 读取当前流式 `ModelRequest.stream_stats_json.nativeCapabilities`：支持原生转向时自动介入当前回复，不支持时仍按原有规则发送或排队；不提供独立转向按钮，也不能从尚未生效的可编辑设置推断当前连接能力。提交转向期间禁止重复发送，失败保留草稿与附件，不自动改为排队；编辑消息仍走原编辑流程。
 - 保存与重载必须保留模型级原生配置；发送前继续使用专用 plain-data 转换，禁止把 Pinia/Vue Proxy 放进 bridge payload。
 
 ## 5. 前端对接标准
