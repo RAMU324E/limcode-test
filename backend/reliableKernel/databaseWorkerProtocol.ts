@@ -374,6 +374,7 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'clientCollaborationHistoryPage'; input: ClientCollaborationHistoryPageInput }
   | { kind: 'conversationHistoryProjection'; input: ConversationHistoryProjectionInput }
   | { kind: 'externalDataVersion' }
+  | { kind: 'clientNavigationChanges' }
   /** Rows over every Runtime domain table, counted in one read transaction of the reader connection. */
   | { kind: 'countDomainRows' }
   /** Consistent SQLite Backup API copy of the live database into its own control root. */

@@ -32,6 +32,7 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'modelStreamActivity'
   | 'cancelCurrentModelRequest'
   | 'clientProjectionSnapshot'
+  | 'clientNavigationChanges'
   | 'clientKeysetPage'
   | 'conversationHistoryProjection'
   | 'externalDataVersion'

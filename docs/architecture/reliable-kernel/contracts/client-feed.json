@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-09-27-r1",
+  "contractRevision": "2026-10-15-r1",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -11,8 +11,10 @@
   },
   "crossHostSynchronization": {
     "detection": "sqlite-externalDataVersion",
-    "notification": "local-onCommit-is-not-cross-host",
-    "projection": "bounded-snapshot-required-on-external-change",
+    "notification": "bounded-memory-only-committed-changes-through-host-liveness-loopback-endpoint",
+    "projection": "complete-notifications-select-affected-session-scopes; current-SQLite-snapshot-for-relevant-records; bounded-navigation-only-delta-for-stable-membership; notification-gap-or-writer-membership-change-requires-snapshot",
+    "notificationBounds": { "maxBytesPerHost": 524288, "maxVisibleCommitsPerHost": 64, "maxChangesPerCommit": 128 },
+    "writerMembership": "random-marker-only-at-host-registration-and-unregistration; no-domain-rows-or-history",
     "backgroundWake": "persistent-RuntimeDeliveryWake-owner-routed-level-scan",
     "daemonRequired": false
   },
@@ -270,7 +272,7 @@
   ],
   "sequence": {
     "hostBootId": "每次 Extension Host 启动生成的新稳定随机 id",
-    "commitSeq": "同一 hostBootId 内由数据库提交路径单调分配的十进制整数字符串",
+    "commitSeq": "同一 hostBootId 内由数据库提交路径及外部导航观察路径单调分配的十进制整数字符串；观察通知不再次发布成该 Host 的 SQLite 提交",
     "persistenceAcrossHostRestart": false,
     "wireType": "decimal-integer-string",
     "rule": "hostBootId 变化或 commitSeq gap 时客户端丢弃本地增量状态并整份重取快照。"

@@ -1034,6 +1034,7 @@ export class BoundedClientFeed {
     if (!this.externalPollInitialization) {
       this.externalPollInitialization = (async () => {
         this.externalDataVersion = await this.database.externalDataVersion();
+        await this.database.externalClientChanges(true);
         if (this.sessions.size === 0 || this.externalPollTimer) return;
         this.externalPollTimer = setInterval(() => {
           void this.pollExternalCommits();
@@ -1060,7 +1061,44 @@ export class BoundedClientFeed {
       if (this.database.performanceMetrics) {
         this.database.recordPerformanceMetric({ kind: 'client_feed.external_change', sessionCount: this.sessions.size });
       }
-      for (const session of this.sessions.values()) this.enterSnapshotRequired(session, 'external_commit');
+      const changes = await this.database.externalClientChanges();
+      if (changes === null) {
+        for (const session of this.sessions.values()) this.enterSnapshotRequired(session, 'external_commit');
+        return;
+      }
+      if (changes.some(change => change.domain === 'Conversation')
+        && !await this.database.refreshExternalClientNavigation()) {
+        for (const session of this.sessions.values()) this.enterSnapshotRequired(session, 'external_commit');
+        return;
+      }
+      const scopedChanges = changes.filter(change => change.domain !== 'Conversation');
+      const candidates = committedTaskToolCandidates(scopedChanges);
+      for (const session of this.sessions.values()) {
+        // Navigation-only deltas do not include snapshot-only peers outside the bounded list.
+        if (changes.some(change => change.domain === 'Conversation'
+          && !session.navigationConversationIds.has(change.id)
+          && (change.id === session.activeConversationId
+            || session.activeRecordKeys.has(recordKey('Conversation', change.id))))) {
+          this.enterSnapshotRequired(session, 'external_commit');
+          continue;
+        }
+        if (scopedChanges.length === 0) continue;
+        if (session.initializing || session.refreshing || session.snapshotRequired) {
+          this.enterSnapshotRequired(session, 'external_commit');
+          continue;
+        }
+        // These notifications only select a scope. Relevant records are read from the current
+        // SQLite snapshot, never applied from another Host's potentially superseded row payload.
+        const relevant = scopedChanges.some(change => {
+          if (['ContextSequenceRoot', 'ConversationContextHeadLink', 'ProcessOutputChunk'].includes(change.domain)) return false;
+          if (change.kind === 'remove') return session.materializedRecordKeys.has(recordKey(change.domain, change.id))
+            || SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS.has(change.domain);
+          return Boolean(change.record && this.recordVisibleToSession(session, change.domain, change.id, change.record));
+        });
+        if (relevant || this.refreshForCommittedTaskCandidates(session, candidates)) {
+          this.enterSnapshotRequired(session, 'external_commit');
+        }
+      }
     } catch (error) {
       for (const session of [...this.sessions.values()]) this.closeFailedSession(session, error);
     } finally {
@@ -1073,6 +1111,7 @@ export class BoundedClientFeed {
     if (this.externalPollTimer) clearInterval(this.externalPollTimer);
     this.externalPollTimer = null;
     this.externalDataVersion = null;
+    this.database.resetExternalClientChanges();
   }
 }
 

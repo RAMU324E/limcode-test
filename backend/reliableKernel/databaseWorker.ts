@@ -278,6 +278,7 @@ async function start(): Promise<void> {
   const writerStatements = attachRuntimeStatementCache(writer);
   const readerStatements = attachRuntimeStatementCache(reader);
   let commitSeq = 0n;
+  let clientNavigation: Map<string, Record<string, unknown>> | undefined;
   let closed = false;
   /** The open maintenance transaction of a maintenance instance (see DatabaseWorkerData.maintenance). */
   let maintenance: MaintenanceTransaction | undefined;
@@ -553,7 +554,28 @@ async function start(): Promise<void> {
           commitSeq,
           clientProjectionContent
         );
+        // A later session's fresh snapshot must not erase changes still owed to older sessions.
+        clientNavigation ??= new Map((result.snapshot.navigationSummary.conversations as Array<Record<string, unknown>>)
+          .map(record => [String(record.id), record]));
         respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'clientNavigationChanges') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeClientProjectionSnapshot(reader, null, commitSeq, clientProjectionContent);
+        const records = result.snapshot.navigationSummary.conversations as Array<Record<string, unknown>>;
+        const previous = clientNavigation;
+        const stable = previous !== undefined && records.length === previous.size && records.every(record => previous.has(String(record.id)));
+        clientNavigation = new Map(records.map(record => [String(record.id), record]));
+        if (stable) {
+          const changes = records.filter(record => !isDeepStrictEqual(record, previous.get(String(record.id))))
+            .map(record => ({ domain: 'Conversation', kind: 'upsert' as const, id: String(record.id), record }));
+          if (changes.length > 0) {
+            commitSeq += 1n;
+            post({ type: 'commit', result: { commitSeq: commitSeq.toString(), changes, allocatedSequences: [], observedExternal: true } });
+          }
+        }
+        respond({ type: 'response', id: request.id, ok: true, result: stable });
         return;
       }
       if (request.kind === 'clientKeysetPage') {
