@@ -304,6 +304,84 @@ test('H4 one real merge invalidates selected evidence and preserves the inactive
   assert.equal(selected.row.context_root_id, 'inactive_handle_request_root');
 });
 
+test('compressed-tail truncation reuses the retained catalog and edits only the user suffix', async () => {
+  const { ContextSequenceControlPlane, contextSequenceNodeId } = kernelFile('contextSequence.js');
+  const { upgradeConversationContextHandles } = kernelFile('conversationContextHandleUpgrade.js');
+  for (const replace of [false, true]) {
+    const key = `h9-${replace}`, { conversationId } = await createTurn(key);
+    const content = await store.ingest(database, 'retained summary and message', 'text/plain');
+    const edited = await store.ingest(database, 'edited user input P99', 'text/plain');
+    const segment = suffix => key + '-segment-' + suffix;
+    const hiddenNode = contextSequenceNodeId(null, segment('hidden'));
+    const summaryNode = contextSequenceNodeId(null, segment('summary'));
+    const retainedNode = contextSequenceNodeId(hiddenNode, segment('retained'));
+    const userNode = contextSequenceNodeId(retainedNode, segment('user'));
+    const discardedNode = contextSequenceNodeId(userNode, segment('discarded'));
+    const root = (suffix, tail, count, seq) => ({ id: key + '-root-' + suffix, conversation_id: conversationId,
+      root_seq: seq, root_node_id: summaryNode, tail_node_id: tail, tail_segment_count: count,
+      segment_count: count + 1n, estimated_tokens: count + 1n, created_at: NOW });
+    const prefix = root('prefix', retainedNode, 1n, 1n), whole = root('whole', discardedNode, 3n, 2n);
+    const shape = row => ({ rootNodeId: row.root_node_id, tailNodeId: row.tail_node_id,
+      tailSegmentCount: row.tail_segment_count, segmentCount: row.segment_count });
+    const steps = [];
+    for (const [suffix, kind, parent, node] of [
+      ['hidden', 'runtime_context', null, hiddenNode], ['summary', 'compression', null, summaryNode],
+      ['retained', 'message', hiddenNode, retainedNode], ['user', 'message', retainedNode, userNode],
+      ['discarded', 'message', userNode, discardedNode]
+    ]) {
+      steps.push(repo('ContextSegment').insert({ id: segment(suffix), content_object_id: content.id,
+        segment_kind: kind, created_at: NOW }), repo('ContextSequenceNode').insert({ id: node,
+        parent_node_id: parent, segment_id: segment(suffix), created_at: NOW }));
+      if (kind !== 'message') continue;
+      const messageId = key + '-message-' + suffix, revisionId = messageId + '-revision';
+      steps.push(repo('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
+        repo('MessageRevision').insert({ id: revisionId, message_id: messageId, revision_seq: 1n,
+          role: suffix === 'user' ? 'user' : 'model', content_object_id: content.id, created_at: NOW }),
+        repo('MessagePartOfConversation').insert({ id: messageId + '-member', conversation_id: conversationId,
+          message_id: messageId, message_seq: BigInt(steps.length), created_at: NOW }),
+        repo('ContextSegmentSource').insert({ id: messageId + '-source', segment_id: segment(suffix),
+          source_kind: 'message_revision', source_id: revisionId, source_revision: 1n, created_at: NOW }));
+    }
+    const initial = await state.readConversationContextHandleStateRow(database, conversationId);
+    const prefixCatalog = { ...IMPORT_CATALOG, entries: [{ kind: 'process', ref: 'P1', target: key + '-retained' }] };
+    await database.transaction([...steps, repo('ContextSequenceRoot').insert(prefix), repo('ContextSequenceRoot').insert(whole),
+      repo('ConversationContextHeadLink').insert({ id: key + '-head', conversation_id: conversationId,
+        root_id: prefix.id, updated_at: NOW }),
+      ...await state.prepareReadyConversationContextHandleState({ database, contentStore: store, conversationId,
+        current: initial, contextRootId: prefix.id, rootShape: shape(prefix), catalog: prefixCatalog,
+        requiresNativeReset: false, now: NOW })]);
+    const current = await state.readConversationContextHandleStateRow(database, conversationId);
+    await database.transaction([
+      ...await state.prepareReadyConversationContextHandleState({ database, contentStore: store, conversationId,
+        current, contextRootId: whole.id, rootShape: shape(whole), requiresNativeReset: false, now: NOW,
+        catalog: { ...prefixCatalog, entries: [...prefixCatalog.entries,
+          { kind: 'process', ref: 'P2', target: key + '-discarded' }] } }),
+      repo('ConversationContextHeadLink').update(key + '-head', { root_id: whole.id, updated_at: NOW })]);
+    const context = new ContextSequenceControlPlane(database, store);
+    const editedRevisionId = key + '-edited-revision';
+    const mutation = await context.prepareMessageTruncateMutation({ conversationId,
+      messageRevisionId: key + '-message-user-revision', idempotencyKey: key,
+      ...(replace ? { replacement: { messageRevisionId: editedRevisionId, contentObjectId: edited.id,
+        contentByteLength: edited.byte_length, contentEstimatedTokens: 1 } } : {}) });
+    const nextRoot = mutation.steps.find(step => step.domain === 'ContextSequenceRoot' && step.kind === 'insert').row;
+    const occurrenceSteps = mutation.steps.flatMap(step => step.kind === 'savepoint' ? step.steps : [step]);
+    assert.equal(nextRoot.tail_node_id, replace ? contextSequenceNodeId(retainedNode,
+      occurrenceSteps.find(step => step.domain === 'ContextSegment' && step.kind === 'insert').row.id) : retainedNode);
+    await database.transaction([
+      ...(replace ? [repo('MessageRevision').insertWithNextSequence({ id: editedRevisionId, message_id: key + '-message-user',
+        role: 'user', content_object_id: edited.id, created_at: NOW },
+      { column: 'revision_seq', scope: { message_id: key + '-message-user' } })] : []), ...mutation.steps]);
+    const reads = [], originalRead = store.read.bind(store);
+    store.read = async metadata => { reads.push(metadata.id); return originalRead(metadata); };
+    try { await upgradeConversationContextHandles(database, store, conversationId); }
+    finally { store.read = originalRead; }
+    assert.equal(reads.includes(content.id), false, 'the proved prefix and compression history are not reread');
+    const ready = await state.readCurrentConversationContextHandleState(database, store, conversationId);
+    assert.deepEqual(ready.catalog.entries, prefixCatalog.entries, 'discarded output bindings stay excluded');
+    if (replace) assert.equal(ready.catalog.allocationHighWater.process, 99);
+  }
+});
+
 registerContextHandleBoundaryTests({
   kernel, kernelFile, load, compiled, require, Database, repo, NOW, modelRequestAggregate,
   temporary: () => configuration.root, database: () => database, store: () => store,

@@ -277,7 +277,7 @@ async function readReadyStateRow(database: RuntimeDatabase, store: ContentAddres
   row: DomainRow): Promise<CurrentContextHandleState> {
   const conversationId = String(row.conversation_id);
   if (row.state !== 'ready') throw Object.assign(
-    new Error('此对话的引用目录正在进行一次性升级。请在升级完成后继续；已保存的历史不会被删除。'),
+    new Error('此对话的引用目录正在整理。请在整理完成后继续；已保存的历史不会被删除。'),
     { code: 'MODEL_CONTEXT_HANDLE_UPGRADE_PENDING', conversationId });
   if (row.content_object_id === null) {
     return { row, catalog: emptyContextHandleCatalog(), requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };

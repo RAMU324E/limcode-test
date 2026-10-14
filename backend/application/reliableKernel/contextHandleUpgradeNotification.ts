@@ -38,10 +38,10 @@ export function upgradeContextHandlesWithProgress(application: ReliableKernelApp
       if (pending.every(row => skipped.has(String(row.conversation_id)))) return;
     }
     const failures = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
-      title: 'LimCode：升级对话引用目录（可取消后继续）', cancellable: true }, async (progress, token) => {
+      title: 'LimCode：整理对话引用目录（可取消后继续）', cancellable: true }, async (progress, token) => {
       const controller = new AbortController();
       const abort = () => controller.abort(signal?.reason ?? Object.assign(
-        new Error('对话引用目录升级已取消，下次可继续。'), { name: 'AbortError' }));
+        new Error('对话引用目录整理已取消，下次可继续。'), { name: 'AbortError' }));
       const cancellation = token.onCancellationRequested(abort);
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted || token.isCancellationRequested) abort();
@@ -52,7 +52,7 @@ export function upgradeContextHandlesWithProgress(application: ReliableKernelApp
           const now = Date.now();
           if (now - reportedAt < 100 && value.completedRequests !== value.totalRequests) return;
           reportedAt = now;
-          progress.report({ message: `对话 ${value.conversationIndex}/${value.conversationCount}，已核对 ${value.completedRequests}/${value.totalRequests} 份历史请求` });
+          progress.report({ message: `对话 ${value.conversationIndex}/${value.conversationCount}，已核对 ${value.completedRequests}/${value.totalRequests} 个历史片段` });
         }
       };
       try {
@@ -67,7 +67,7 @@ export function upgradeContextHandlesWithProgress(application: ReliableKernelApp
     if (!failures.length) return;
     for (const failure of failures) {
       notification.failed.set(failure.conversationId, failure);
-      console.error(`[LimCode] 对话 ${failure.conversationId} 的引用目录升级暂停。`, failure.error);
+      console.error(`[LimCode] 对话 ${failure.conversationId} 的引用目录整理暂停。`, failure.error);
       if (failure.error instanceof ModelHandleIdentityConflictError && failure.error.conflict) {
         // Error inspection otherwise collapses nested witnesses to [Object]. Only our bounded,
         // body-free identity diagnostics are serialized, never arbitrary provider/tool errors.
@@ -75,9 +75,9 @@ export function upgradeContextHandlesWithProgress(application: ReliableKernelApp
       }
     }
     void vscode.window.showWarningMessage(
-      `${failures.length} 个对话的引用目录暂未升级，其余对话已继续处理。原历史保留，详细原因见日志。`, '重试升级'
+      `${failures.length} 个对话的引用目录暂未整理完成，其余对话已继续处理。原历史保留，详细原因见日志。`, '重试整理'
     ).then(async action => {
-      if (action !== '重试升级' || signal?.aborted) return;
+      if (action !== '重试整理' || signal?.aborted) return;
       await job;
       notification.failed.clear();
       await upgradeContextHandlesWithProgress(application, signal);
