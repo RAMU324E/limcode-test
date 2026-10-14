@@ -115,7 +115,7 @@ export async function prepareContextHandleHeadTransition(input: {
   previousRootId: string | null; nextRootId: string; mode: 'append' | 'rewrite' | 'activate'; now: string;
   baseRootId?: string | null; activate?: boolean;
   rootShape?: ContextHandleRootShape;
-  /** The caller proved that only an identical final user occurrence is replaced. */
+  /** The caller proved that only a final user occurrence is deleted or replaced unchanged. */
   reuseCurrentCatalog?: boolean;
   occurrence?: ContextHandleOccurrenceEvidence; occurrences?: readonly ContextHandleOccurrenceEvidence[];
   current?: DomainRow;

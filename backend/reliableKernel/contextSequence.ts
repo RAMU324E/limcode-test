@@ -1579,15 +1579,15 @@ export class ContextSequenceControlPlane {
     const sourceSegmentId = requireId(sourceRow.segment_id, 'ContextSegmentSource.segment_id');
     const targetIndex = state.records.findIndex((record) => record.segment.id === sourceSegmentId);
     let prefix: EditableContextSegment[];
-    // Resubmitting the same final user input changes its revision, not the selected history.
-    // Compare existing content identities; do not expand compression or reread old bodies.
+    // A final user input cannot mint a frozen identity. Removing it or replacing it unchanged
+    // keeps the ready catalog, including reserved ordinals, without reopening compression history.
     let reuseCurrentCatalog = false;
-    if (replacement && targetIndex === state.records.length - 1 && targetIndex >= 0
+    if (targetIndex === state.records.length - 1 && targetIndex >= 0
       && state.records[targetIndex].segment.segment_kind === 'message'
-      && state.records[targetIndex].segment.content_object_id === replacement.contentObjectId) {
+      && (!replacement || state.records[targetIndex].segment.content_object_id === replacement.contentObjectId)) {
       const revision = await this.getOptional('MessageRevision', revisionId);
       reuseCurrentCatalog = revision?.role === 'user' && revision.revision_seq === sourceRow.source_revision
-        && revision.content_object_id === replacement.contentObjectId;
+        && revision.content_object_id === state.records[targetIndex].segment.content_object_id;
     }
     let blocks: DomainRow[] = [];
     if (targetIndex >= 0) {
@@ -1610,7 +1610,7 @@ export class ContextSequenceControlPlane {
       blocks = expanded.blocks;
     }
 
-    let estimatedTokens = reuseCurrentCatalog
+    let estimatedTokens = reuseCurrentCatalog && replacement
       ? requireBigInt(state.root.estimated_tokens, 'ContextSequenceRoot.estimated_tokens')
       : await this.estimateEditableContextTokens(prefix);
     const now = this.timestamp();
