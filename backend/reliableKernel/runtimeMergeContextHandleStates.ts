@@ -59,11 +59,13 @@ export class MergeContextHandleStates {
     const toolSegments = (toolCallId: unknown): void => {
       const conversationId = this.source.prepare(`SELECT owner.conversation_id FROM tool_call AS tool
         JOIN turn AS owner ON owner.id = tool.turn_id WHERE tool.id = ?`).pluck().get(toolCallId);
+      owner(conversationId);
       for (const source of this.source.prepare(`SELECT segment_id FROM context_segment_source
         WHERE source_kind = 'tool_call' AND source_id = ?`).all(toolCallId) as DomainRow[]) segment(conversationId, source.segment_id);
     };
     const requestSegments = (requestId: unknown): void => {
       const conversationId = requestOwner(requestId);
+      owner(conversationId);
       for (const link of this.source.prepare('SELECT message_id FROM model_request_message_link WHERE model_request_id = ?')
         .all(requestId) as DomainRow[]) messageSegments(conversationId, link.message_id);
       for (const link of this.source.prepare('SELECT tool_call_id FROM tool_call_source_link WHERE model_request_id = ?')
@@ -78,6 +80,8 @@ export class MergeContextHandleStates {
         WHERE source_kind = 'compression_block' AND source_id = ?`).all(blockId) as DomainRow[]) segment(conversationId, source.segment_id);
     };
     if (domain === 'Conversation') owner(row.id, true);
+    else if (domain === 'ConversationBranchLink') owner(row.target_conversation_id);
+    else if (domain === 'ConversationAttachmentHandleLink') owner(row.conversation_id);
     else if (domain === 'ConversationContextHeadLink') owner(row.conversation_id, true);
     else if (domain === 'ModelRequest') requestSegments(row.id);
     else if (domain === 'ModelRequestMessageLink') messageSegments(requestOwner(row.model_request_id), row.message_id);

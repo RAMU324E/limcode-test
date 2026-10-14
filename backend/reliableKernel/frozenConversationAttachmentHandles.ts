@@ -11,12 +11,19 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 const NATIVE_PROJECTION_KIND = 'native_child_handle_projection';
 const NATIVE_PROJECTION_CONTENT_TYPE = 'application/vnd.limcode.native-child-handle-projection+json';
 const RECIPE_CONTENT_TYPE = 'application/vnd.limcode.model-request-recipe+json';
+export const ATTACHMENT_RECOVERY_SOURCE_KIND = 'attachment-handle-recovery';
+
+interface RecoveryCompletion { id: string; sourceKey: string; stateId: string; provenanceRevision: bigint }
+const recoveries = new WeakMap<RuntimeDatabase, Map<string, {
+  key: string; promise: Promise<FrozenConversationAttachmentReservations>;
+}>>();
 
 export interface FrozenConversationAttachmentReservations {
   entries: ModelHandleEntry[];
   attachments: Map<string, DomainRow>;
   assertions: RepositoryTransactionStep[];
   createdAt?: string;
+  completion?: RecoveryCompletion;
 }
 
 /**
@@ -25,6 +32,39 @@ export interface FrozenConversationAttachmentReservations {
  * comes from the target's actual frozen evidence; no source Conversation or prose is consulted.
  */
 export async function readFrozenConversationAttachmentReservations(database: RuntimeDatabase,
+  contentStore: ContentAddressedStore, conversationId: string): Promise<FrozenConversationAttachmentReservations> {
+  const states = (await database.snapshot([DOMAIN_REPOSITORIES.domain('ConversationContextHandleState')
+    .list({ where: { conversation_id: conversationId }, limit: 1 })])).snapshot[0];
+  if (!Array.isArray(states) || states.length !== 1) throw frozenAttachmentError('Attachment recovery has no Conversation source scope.');
+  const state = states[0];
+  const provenanceRevision = BigInt(String(state.provenance_revision));
+  // Existing import provenance changes only when historical evidence is admitted, not on daily
+  // requests. The local root identity prevents an imported source receipt from certifying this root.
+  const sourceKey = JSON.stringify([database.binding.dataSetId, database.binding.rootInstanceId,
+    conversationId, provenanceRevision.toString()]);
+  const completion = { id: `${ATTACHMENT_RECOVERY_SOURCE_KIND}:${sourceKey}`, sourceKey,
+    stateId: id(state.id), provenanceRevision };
+  const receiptSnapshot = await database.snapshot([DOMAIN_REPOSITORIES.domain('CommandReceipt').get(completion.id)]);
+  let cache = recoveries.get(database);
+  if (receiptSnapshot.snapshot[0]) {
+    cache?.delete(conversationId);
+    return { entries: [], attachments: new Map(), assertions: [] };
+  }
+  if (!cache) { cache = new Map(); recoveries.set(database, cache); }
+  // Before recovery is committed, a preview's exact row assertions become stale if a new Turn
+  // is admitted. Reuse only the same observed commit; completed recovery ignores daily commits.
+  const key = `${sourceKey}:${receiptSnapshot.snapshotCommitSeq}`;
+  const existing = cache.get(conversationId);
+  if (existing?.key === key) return existing.promise;
+  const promise = readUnrecoveredReservations(database, contentStore, conversationId)
+    .then(frozen => ({ ...frozen, completion }));
+  const recovery = { key, promise };
+  cache.set(conversationId, recovery);
+  void promise.catch(() => { if (cache!.get(conversationId) === recovery) cache!.delete(conversationId); });
+  return promise;
+}
+
+async function readUnrecoveredReservations(database: RuntimeDatabase,
   contentStore: ContentAddressedStore, conversationId: string): Promise<FrozenConversationAttachmentReservations> {
   const branches = await listAllDomainRows(database, 'ConversationBranchLink', { target_conversation_id: conversationId });
   if (branches.length === 0) return { entries: [], attachments: new Map(), assertions: [] };
