@@ -52,6 +52,14 @@ export interface RuntimeAllocatedSequence {
   value: string;
 }
 
+export interface AttachmentProjectionChanges {
+  reset: boolean;
+  segments: string[];
+  blocks: string[];
+  revisions: string[];
+  messages: string[];
+}
+
 export interface RuntimeCommitResult {
   /** Memory-only observation of a peer frontier; never republish it as a new local SQLite commit. */
   observedExternal?: true;
@@ -60,6 +68,8 @@ export interface RuntimeCommitResult {
   allocatedSequences: RuntimeAllocatedSequence[];
   /** Bounded internal invalidations for client:none domains; never Client Feed row payloads. */
   internalChangedDomains?: string[];
+  /** Host-only attachment cache invalidations from the existing mutation boundary. */
+  attachmentProjectionChanges?: AttachmentProjectionChanges;
 }
 
 export interface SnapshotBarrier<T> {

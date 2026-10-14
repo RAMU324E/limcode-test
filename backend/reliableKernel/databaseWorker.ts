@@ -284,6 +284,11 @@ async function start(): Promise<void> {
   let maintenance: MaintenanceTransaction | undefined;
   const contextCasCache = new VerifiedContextCasCache();
   const attachmentScopeCache = new AttachmentProjectionScopeCache();
+  const postCommit = (result: RuntimeCommitResult): void => {
+    const changes = attachmentScopeCache.takeProjectionChanges();
+    if (changes) result.attachmentProjectionChanges = changes;
+    post({ type: 'commit', result });
+  };
   const conversationRuntimeWork = createConversationRuntimeWorkProbe(reader);
 
   post({ type: 'ready', workerThreadId: threadId, mode: data.mode });
@@ -362,7 +367,7 @@ async function start(): Promise<void> {
         const result = executeExecutionLeaseRenewal(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
-          post({ type: 'commit', result: result.commit });
+          postCommit(result.commit);
         }
         respond({ type: 'response', id: request.id, ok: true, result: result.renewal });
         return;
@@ -373,7 +378,7 @@ async function start(): Promise<void> {
           ? committedDurably(writer, () => executeTransaction(writer, request.steps, commitSeq + 1n, attachmentScopeCache))
           : executeTransaction(writer, request.steps, commitSeq + 1n, attachmentScopeCache);
         commitSeq += 1n;
-        post({ type: 'commit', result });
+        postCommit(result);
         // Only a reference: the host answers with the commit message's result (cloned once).
         respond({ type: 'response', id: request.id, ok: true, result: null, committed: result.commitSeq });
         return;
@@ -515,7 +520,7 @@ async function start(): Promise<void> {
         const result = executeModelStreamEvent(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
-          post({ type: 'commit', result: result.commit });
+          postCommit(result.commit);
         }
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
@@ -525,7 +530,7 @@ async function start(): Promise<void> {
         const result = executeModelStreamActivity(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
-          post({ type: 'commit', result: result.commit });
+          postCommit(result.commit);
         }
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
@@ -535,7 +540,7 @@ async function start(): Promise<void> {
         const result = executeCancelCurrentModelRequest(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
-          post({ type: 'commit', result: result.commit });
+          postCommit(result.commit);
         }
         respond({ type: 'response', id: request.id, ok: true, result });
         return;

@@ -27,25 +27,12 @@ interface PreparedAttachmentSegment {
   readonly catalog: readonly AttachmentCatalogEntry[];
 }
 
-interface PreparedProjectionWeight { bytes: number; segments: number }
-const preparedProjectionWeights = new WeakMap<PreparedAttachmentCatalogProjection, PreparedProjectionWeight>();
-
 /** Immutable prepared facts only: no database, source-row caches, or attachment bodies are retained. */
 export class PreparedAttachmentCatalogProjection {
   public constructor(
     private readonly segments: readonly PreparedAttachmentSegment[],
     private readonly additionalCatalog: readonly AttachmentCatalogEntry[]
-  ) {
-    const entryBytes = (entry: AttachmentCatalogEntry): number => 192
-      + 2 * (entry.attachmentId.length + entry.name.length + entry.mimeType.length);
-    preparedProjectionWeights.set(this, {
-      segments: segments.length,
-      bytes: 256 + segments.reduce((total, segment) => total + 160
-        + 2 * (segment.segmentId.length + segment.segmentKind.length)
-        + segment.catalog.reduce((sum, entry) => sum + entryBytes(entry), 0), 0)
-        + additionalCatalog.reduce((total, entry) => total + entryBytes(entry), 0)
-    });
-  }
+  ) {}
 
   public projectState(): AttachmentCatalogState {
     return this.reduceRange(0, this.segments.length, this.additionalCatalog);
@@ -112,42 +99,49 @@ export class PreparedAttachmentCatalogProjection {
   }
 }
 
-// Live database identity only. Retain validated catalog facts, never source rows or CAS bodies.
-// These are optimization budgets: oversized preparations still use the complete original reader.
-const PREPARED_PROJECTION_CACHE_LIMITS = Object.freeze({
-  entries: 8, segments: 32_768, bytes: 8 * 1024 * 1024
-});
+// Cache individual immutable segments, so growing a window does not expand its old compression.
+const PREPARED_PROJECTION_CACHE_LIMITS = { conversations: 8, bytes: 32 * 1024 * 1024 };
 const preparedProjectionCaches = new WeakMap<RuntimeDatabase, PreparedProjectionCache>();
-interface PreparedProjectionEntry extends PreparedProjectionWeight { value: PreparedAttachmentCatalogProjection }
+interface ProjectionDependencies {
+  segments: Set<string>; blocks: Set<string>; revisions: Set<string>; messages: Set<string>;
+}
+interface PreparedProjectionEntry {
+  segments: Map<string, PreparedAttachmentSegment>;
+  dependencies: ProjectionDependencies;
+  bytes: number;
+  pending: number;
+}
+interface PreparedProjectionRead {
+  value: PreparedAttachmentCatalogProjection;
+  segments: PreparedAttachmentSegment[];
+  dependencies: ProjectionDependencies;
+  reused: boolean;
+}
 
 class PreparedProjectionCache {
   private readonly entries = new Map<string, PreparedProjectionEntry>();
   private bytes = 0;
-  private segments = 0;
-  private revision = 0;
   private externalVersion?: string;
 
   public constructor(private readonly database: RuntimeDatabase) {
-    database.onCommit(() => {
-      // Client change records omit client:none domains, including AttachmentLink and lineage.
-      // Every local commit must invalidate, even when changes is empty. The worker's external
-      // data_version deliberately does not change for its own writes.
-      this.clear();
+    database.onCommit(commit => {
+      const changed = commit.attachmentProjectionChanges;
+      if (!changed) return;
+      if (changed.reset) { this.clear(); return; }
+      for (const [conversationId, entry] of this.entries) {
+        if (entry.pending > 0 || changed.segments.some(id => entry.dependencies.segments.has(id))
+          || changed.blocks.some(id => entry.dependencies.blocks.has(id))
+          || changed.revisions.some(id => entry.dependencies.revisions.has(id))
+          || changed.messages.some(id => entry.dependencies.messages.has(id))) {
+          this.entries.delete(conversationId); this.bytes -= entry.bytes;
+        }
+      }
     });
-  }
-
-  public read(key: string, prepare: () => Promise<PreparedAttachmentCatalogProjection>): Promise<PreparedAttachmentCatalogProjection> {
-    const keyBytes = key.length * 2 + 128;
-    if (keyBytes > PREPARED_PROJECTION_CACHE_LIMITS.bytes) return prepare();
-    // Do not coalesce pending callers: each has its own freshness boundary, and a concurrent
-    // writer must not turn a waiter's nominal hit into reuse of an earlier unfenced result.
-    return this.readFenced(key, keyBytes, prepare);
   }
 
   private clear(): void {
     this.entries.clear();
-    this.bytes = this.segments = 0;
-    this.revision++;
+    this.bytes = 0;
   }
 
   private synchronizeVersion(version: string): void {
@@ -157,46 +151,42 @@ class PreparedProjectionCache {
     }
   }
 
-  private async readFenced(key: string, keyBytes: number,
-    prepare: () => Promise<PreparedAttachmentCatalogProjection>): Promise<PreparedAttachmentCatalogProjection> {
+  public async read(conversationId: string,
+    prepare: (known: ReadonlyMap<string, PreparedAttachmentSegment>) => Promise<PreparedProjectionRead>): Promise<PreparedAttachmentCatalogProjection> {
     // This worker request revalidates the root binding, including on a cache hit or after close.
     const version = await this.database.externalDataVersion();
     this.synchronizeVersion(version);
-    const revision = this.revision;
-    const cached = this.entries.get(key);
-    // Never retry or conceal an error from the complete original ownership/lineage reader.
-    const value = cached?.value ?? await prepare();
-    const after = await this.database.externalDataVersion();
-    if (after !== version || revision !== this.revision) {
-      this.synchronizeVersion(after);
-      // A miss already ran the original reader: return its result without retaining it. A
-      // stale hit has not read current facts, so run that reader once without cache admission.
-      // Unrelated write churn therefore adds neither failures nor repeated full scans per call.
-      return cached ? prepare() : value;
+    let entry = this.entries.get(conversationId);
+    if (!entry) {
+      entry = { segments: new Map(), dependencies: { segments: new Set(), blocks: new Set(), revisions: new Set(), messages: new Set() }, bytes: 256, pending: 0 };
+      this.entries.set(conversationId, entry); this.bytes += entry.bytes;
     }
-    const existing = this.entries.get(key);
-    if (existing) {
-      // Another independent miss may have filled this slot while this caller was reading.
-      this.entries.delete(key);
-      this.entries.set(key, existing);
-    } else {
-      const weight = preparedProjectionWeights.get(value)!;
-      const bytes = keyBytes + weight.bytes;
-      const limits = PREPARED_PROJECTION_CACHE_LIMITS;
-      if (bytes <= limits.bytes && weight.segments <= limits.segments) {
-        while (this.entries.size >= limits.entries || this.bytes + bytes > limits.bytes
-          || this.segments + weight.segments > limits.segments) {
-          const oldest = this.entries.entries().next().value!;
-          this.entries.delete(oldest[0]);
-          this.bytes -= oldest[1].bytes;
-          this.segments -= oldest[1].segments;
-        }
-        this.entries.set(key, { value, bytes, segments: weight.segments });
-        this.bytes += bytes;
-        this.segments += weight.segments;
+    this.entries.delete(conversationId); this.entries.set(conversationId, entry);
+    let result: PreparedProjectionRead;
+    entry.pending++;
+    try { result = await prepare(entry.segments); } finally { entry.pending--; }
+    const after = await this.database.externalDataVersion();
+    if (after !== version || this.entries.get(conversationId) !== entry) {
+      this.synchronizeVersion(after);
+      return result.reused ? (await prepare(new Map())).value : result.value;
+    }
+    let addedBytes = 0;
+    for (const segment of result.segments) if (!entry.segments.has(segment.segmentId)) {
+      entry.segments.set(segment.segmentId, segment);
+      addedBytes += 160 + 2 * segment.segmentId.length + segment.catalog.reduce((sum, item) =>
+        sum + 192 + 2 * (item.attachmentId.length + item.name.length + item.mimeType.length), 0);
+    }
+    for (const kind of ['segments', 'blocks', 'revisions', 'messages'] as const) {
+      for (const id of result.dependencies[kind]) if (!entry.dependencies[kind].has(id)) {
+        entry.dependencies[kind].add(id); addedBytes += 96 + 2 * id.length;
       }
     }
-    return value;
+    entry.bytes += addedBytes; this.bytes += addedBytes;
+    while (this.entries.size > PREPARED_PROJECTION_CACHE_LIMITS.conversations || this.bytes > PREPARED_PROJECTION_CACHE_LIMITS.bytes) {
+      const [id, oldest] = this.entries.entries().next().value!;
+      this.entries.delete(id); this.bytes -= oldest.bytes;
+    }
+    return result.value;
   }
 
 }
@@ -217,6 +207,7 @@ export class AttachmentCatalogProjection {
   private readonly toolResultCache = new Map<string, DomainRow>();
   private readonly turnCache = new Map<string, DomainRow>();
   private readonly attachmentCache = new Map<string, DomainRow>();
+  private reusedSegments = false;
 
   public constructor(private readonly database: RuntimeDatabase) {}
 
@@ -257,25 +248,33 @@ export class AttachmentCatalogProjection {
     // caller retaining its arrays must not be able to publish facts under a different key.
     const selectedSegments = segments.map(segment => ({ segmentId: segment.segmentId }));
     const selectedRevisions = [...additionalMessageRevisionIds];
-    const key = JSON.stringify([selectedConversationId, selectedSegments.map(segment => segment.segmentId), selectedRevisions]);
     let cache = preparedProjectionCaches.get(this.database);
     if (!cache) { cache = new PreparedProjectionCache(this.database); preparedProjectionCaches.set(this.database, cache); }
-    return cache.read(key, () => new AttachmentCatalogProjection(this.database).prepareIsolated(
-      selectedConversationId, selectedSegments, selectedRevisions));
+    return cache.read(selectedConversationId, async known => {
+      const reader = new AttachmentCatalogProjection(this.database);
+      const value = await reader.prepareIsolated(selectedConversationId, selectedSegments, selectedRevisions, known);
+      return { value, segments: reader.preparedSegments, reused: reader.reusedSegments, dependencies: {
+        segments: new Set(reader.segmentCache.keys()), blocks: new Set(reader.compressionBlockCache.keys()),
+        revisions: new Set(reader.messageRevisionCache.keys()), messages: new Set(reader.messageMembershipCache.keys())
+      } };
+    });
   }
+
+  private preparedSegments: PreparedAttachmentSegment[] = [];
 
   private async prepareIsolated(
     conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
-    additionalMessageRevisionIds: readonly string[]
+    additionalMessageRevisionIds: readonly string[],
+    known: ReadonlyMap<string, PreparedAttachmentSegment> = new Map()
   ): Promise<PreparedAttachmentCatalogProjection> {
     const segmentIds = segments.map((segment) => requireId(segment.segmentId, 'segmentId'));
-    await this.primeSegments(conversationId, segmentIds);
-    await this.primeCompressionLineage(conversationId, segmentIds);
-    const revisionsBySegment: string[][] = [];
+    const missing = segmentIds.filter(id => !known.has(id));
+    await this.primeCompressionLineage(conversationId, missing, known);
+    const revisionsBySegment: Array<Array<string | readonly AttachmentCatalogEntry[]>> = [];
     for (const segmentId of segmentIds) {
-      const revisions: string[] = [];
-      await this.collectSegmentRevisions(conversationId, segmentId, revisions, new Set<string>());
+      const revisions: Array<string | readonly AttachmentCatalogEntry[]> = [];
+      await this.collectSegmentRevisions(conversationId, segmentId, revisions, new Set<string>(), known);
       revisionsBySegment.push(revisions);
     }
     const additionalRevisionIds = additionalMessageRevisionIds.map((revisionId) =>
@@ -288,7 +287,7 @@ export class AttachmentCatalogProjection {
       }
     }
 
-    const uniqueRevisions = [...new Set([...revisionsBySegment.flat(), ...additionalRevisionIds])];
+    const uniqueRevisions = [...new Set([...revisionsBySegment.flat().filter((id): id is string => typeof id === 'string'), ...additionalRevisionIds])];
     await this.primeDomainRows('MessageRevision', uniqueRevisions, this.messageRevisionCache);
     for (const [segmentId] of this.sourceCache) {
       for (const source of this.scopedSources(segmentId, conversationId)) {
@@ -322,8 +321,10 @@ export class AttachmentCatalogProjection {
     // Preserve every occurrence before cumulative deduplication: an output-only view must still
     // contain an attachment that also appeared earlier in the full Context.
     const preparedSegments = segmentIds.map((segmentId, index): PreparedAttachmentSegment => {
+      const cached = known.get(segmentId);
+      if (cached) return cached;
       const segmentCatalog = mergeAttachmentCatalog(...revisionsBySegment[index].map((revisionId) =>
-        catalogByRevision.get(revisionId) ?? []
+        typeof revisionId === 'string' ? catalogByRevision.get(revisionId) ?? [] : revisionId
       ));
       const segment = this.segmentCache.get(segmentId);
       if (!segment) throw new Error(`ContextSegment ${segmentId} cache was not primed.`);
@@ -333,6 +334,7 @@ export class AttachmentCatalogProjection {
         catalog: Object.freeze(segmentCatalog.map((entry) => Object.freeze(entry)))
       });
     });
+    this.preparedSegments = preparedSegments.filter(segment => !known.has(segment.segmentId));
     const additionalCatalog = mergeAttachmentCatalog(...additionalRevisionIds.map((revisionId) =>
       catalogByRevision.get(revisionId) ?? []
     ));
@@ -345,10 +347,13 @@ export class AttachmentCatalogProjection {
   private async collectSegmentRevisions(
     conversationId: string,
     segmentId: string,
-    revisions: string[],
-    path: Set<string>
+    revisions: Array<string | readonly AttachmentCatalogEntry[]>,
+    path: Set<string>,
+    known: ReadonlyMap<string, PreparedAttachmentSegment>
   ): Promise<void> {
     if (path.has(segmentId)) throw new Error(`Compression lineage cycle detected at ${segmentId}.`);
+    const cached = known.get(segmentId);
+    if (cached) { revisions.push(cached.catalog); this.reusedSegments = true; return; }
     const segment = await this.segment(segmentId);
     const segmentKind = requireSegmentKind(segment.segment_kind);
     const sources = this.scopedSources(segmentId, conversationId);
@@ -372,9 +377,8 @@ export class AttachmentCatalogProjection {
         const childSegmentIds = blockSources.map((source) =>
           requireId(source.segment_id, 'CompressionBlockSource.segment_id')
         );
-        await this.primeSegments(conversationId, childSegmentIds);
         for (const childSegmentId of childSegmentIds) {
-          await this.collectSegmentRevisions(conversationId, childSegmentId, revisions, path);
+          await this.collectSegmentRevisions(conversationId, childSegmentId, revisions, path, known);
         }
       } finally {
         path.delete(segmentId);
@@ -432,7 +436,8 @@ export class AttachmentCatalogProjection {
 
   private async primeCompressionLineage(
     conversationId: string,
-    rootSegmentIds: readonly string[]
+    rootSegmentIds: readonly string[],
+    known: ReadonlyMap<string, PreparedAttachmentSegment>
   ): Promise<void> {
     const expanded = new Set<string>();
     let frontier = [...new Set(rootSegmentIds)];
@@ -473,7 +478,7 @@ export class AttachmentCatalogProjection {
         }
         next.push(...blockSources.map((row) => requireId(row.segment_id, 'CompressionBlockSource.segment_id')));
       }
-      frontier = [...new Set(next)].filter((segmentId) => !expanded.has(segmentId));
+      frontier = [...new Set(next)].filter((segmentId) => !expanded.has(segmentId) && !known.has(segmentId));
     }
   }
 

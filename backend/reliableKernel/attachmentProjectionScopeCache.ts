@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import type { DomainRow, RepositoryMutation } from './repositories';
+import type { AttachmentProjectionChanges } from './contracts';
 
 export const ATTACHMENT_SCOPE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
 export const ATTACHMENT_SCOPE_CACHE_MAX_ENTRIES = 65_536;
@@ -26,6 +27,11 @@ export interface AttachmentScopeCacheCounters {
  * are storage limits only: an overlarge source set is still completely read and validated.
  */
 export class AttachmentProjectionScopeCache {
+  private projectionReset = false;
+  private readonly projectionKeys = {
+    segments: new Set<string>(), blocks: new Set<string>(), revisions: new Set<string>(), messages: new Set<string>()
+  };
+  private projectionKeyCount = 0;
   private readonly entries = new Map<string, Certificate>();
   private readonly candidates = new Set<AttachmentScopeCandidate>();
   private bytes = 0;
@@ -109,6 +115,7 @@ export class AttachmentProjectionScopeCache {
 
   /** Called at the real generic mutation boundary; rollback never resurrects an old proof. */
   public beforeMutation(mutation: RepositoryMutation, encodedInsert?: DomainRow): void {
+    this.captureProjectionChange(mutation, encodedInsert);
     if (!SCOPE_DOMAINS.has(mutation.domain) && !REVIEWED_DISJOINT_DOMAINS.has(mutation.domain)) {
       this.clear();
       return;
@@ -136,6 +143,38 @@ export class AttachmentProjectionScopeCache {
       return;
     }
     if (SCOPE_DOMAINS.has(mutation.domain)) this.clear();
+  }
+
+  public takeProjectionChanges(): AttachmentProjectionChanges | undefined {
+    if (!this.projectionReset && this.projectionKeyCount === 0) return undefined;
+    const result = { reset: this.projectionReset, segments: [...this.projectionKeys.segments],
+      blocks: [...this.projectionKeys.blocks], revisions: [...this.projectionKeys.revisions], messages: [...this.projectionKeys.messages] };
+    this.projectionReset = false;
+    this.projectionKeyCount = 0;
+    for (const keys of Object.values(this.projectionKeys)) keys.clear();
+    return result;
+  }
+
+  private captureProjectionChange(mutation: RepositoryMutation, encodedInsert?: DomainRow): void {
+    if (this.projectionReset) return;
+    if (mutation.kind === 'insert' && !mutation.historicalCopy) {
+      const route = mutation.domain === 'ContextSegmentSource' ? ['segments', 'segment_id'] as const
+        : mutation.domain === 'CompressionBlockSource' ? ['blocks', 'compression_block_id'] as const
+          : mutation.domain === 'AttachmentLink' ? ['revisions', 'message_revision_id'] as const
+            : mutation.domain === 'MessagePartOfConversation' ? ['messages', 'message_id'] as const : undefined;
+      if (!route) return;
+      const key = encodedInsert?.[route[1]] ?? mutation.row[route[1]];
+      if (typeof key === 'string' && this.projectionKeyCount < 4096) {
+        const keys = this.projectionKeys[route[0]];
+        if (!keys.has(key)) { keys.add(key); this.projectionKeyCount++; }
+        return;
+      }
+    } else if (mutation.kind === 'update') return;
+    else if (mutation.kind !== 'insert' && !SCOPE_DOMAINS.has(mutation.domain)
+      && !['AttachmentLink', 'CompressionBlockSource'].includes(mutation.domain)) return;
+    this.projectionReset = true;
+    this.projectionKeyCount = 0;
+    for (const keys of Object.values(this.projectionKeys)) keys.clear();
   }
 
   public inspect(): AttachmentScopeCacheCounters {
