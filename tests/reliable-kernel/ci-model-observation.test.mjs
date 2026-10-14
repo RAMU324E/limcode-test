@@ -9,6 +9,63 @@ before(async () => { fixture = await openProviderRuntimeFixture(); });
 after(async () => { await fixture?.close(); });
 afterEach(() => fixture.setFetch(() => sse([compatDelta({ content: 'reply' }), compatDelta({}, 'stop')])));
 
+test('普通请求冻结、预算和发送共用一次 Context 读取，发送前释放准备结果，下一轮不复用旧根', async () => {
+  await fixture.createConversation('one-context-read');
+  const database = fixture.app.database;
+  const provider = fixture.app.modelProvider;
+  const materialize = database.materializeContextContent.bind(database);
+  const prepare = provider.prepareOrdinaryRequestContext.bind(provider);
+  const reads = [];
+  const holders = [];
+  database.materializeContextContent = async rootId => { reads.push(rootId); return materialize(rootId); };
+  provider.prepareOrdinaryRequestContext = (...args) => {
+    const holder = prepare(...args);
+    assert.ok(holder.value.segments.every(segment => !('content' in segment)));
+    holders.push(holder);
+    return holder;
+  };
+  const sentRoots = [];
+  fixture.setFetch(() => {
+    assert.equal(reads.length, 1, 'freeze, preview and initial dispatch must read this root only once');
+    assert.equal(holders.at(-1).value, undefined, 'the waiting Agent loop must not retain the provider body');
+    sentRoots.push(reads[0]);
+    return sse([compatDelta({ content: 'reply' }), compatDelta({}, 'stop')]);
+  });
+  try {
+    await fixture.turn('one-context-read', 'first');
+    reads.length = 0;
+    await fixture.turn('one-context-read', 'second');
+    assert.notEqual(sentRoots[0], sentRoots[1]);
+    const persisted = fixture.requests.at(-1).request;
+    const replay = await provider.replay(persisted.modelRequestId);
+    assert.deepEqual(replay.context, persisted.context);
+    assert.equal(holders.every(holder => holder.value === undefined), true);
+  } finally {
+    database.materializeContextContent = materialize;
+    provider.prepareOrdinaryRequestContext = prepare;
+  }
+});
+
+test('压缩源准备释放旧 Context 后，普通发送按冻结根重读而不使用空准备结果', async () => {
+  await fixture.createConversation('discard-context');
+  const database = fixture.app.database;
+  const coordinator = fixture.app.compressionCoordinator;
+  const materialize = database.materializeContextContent.bind(database);
+  const coordinate = coordinator.coordinate.bind(coordinator);
+  let reads = 0;
+  database.materializeContextContent = (...args) => { reads++; return materialize(...args); };
+  coordinator.coordinate = command => {
+    command.beforeSourceMaterialization();
+    return coordinate(command);
+  };
+  fixture.setFetch(() => {
+    assert.equal(reads, 2, 'a released preparation must be rebuilt at the frozen request root');
+    return sse([compatDelta({ content: 'reply' }), compatDelta({}, 'stop')]);
+  });
+  try { await fixture.turn('discard-context', 'input'); }
+  finally { database.materializeContextContent = materialize; coordinator.coordinate = coordinate; }
+});
+
 test('Claude 绑定与 Gemini 文本尾签名各自提交，共享重启后首次请求保持正确回放', async () => {
   const claudeBodies = [];
   const geminiBodies = [];

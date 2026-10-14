@@ -35,7 +35,7 @@ import {
   type ContentObjectMetadata
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { ContextSequenceControlPlane, type MaterializedContextSegment } from './contextSequence';
+import { ContextSequenceControlPlane, type MaterializedContext, type MaterializedContextSegment } from './contextSequence';
 import {
   claudeTurnScopedCompaction,
   claudeTurnScopedRemindersEnabled,
@@ -326,6 +326,17 @@ export interface PreparedModelRequestRecipe {
   readonly recipe: PlainJsonValue;
 }
 
+type ContextSegmentMetadata = Omit<MaterializedContextSegment, 'content'>;
+
+/** One ordinary request's immutable root; the holder is emptied before provider I/O or compression. */
+export interface PreparedOrdinaryRequestContext {
+  value?: {
+    root: DomainRow;
+    segments: ContextSegmentMetadata[];
+    context: FullProviderRequest['context'];
+  };
+}
+
 /** Only these scalar/policy facts survive an adapter's ownership of the request body. */
 interface ProviderAttemptContinuation {
   retryPolicy: FrozenProviderRetryPolicy;
@@ -362,6 +373,7 @@ export interface ProviderDispatchOptions {
   signal?: AbortSignal;
   reconnect?: boolean;
   preparedRecipe?: PreparedModelRequestRecipe;
+  preparedContext?: PreparedOrdinaryRequestContext;
   /** Last-resort adapter deadline; transport-specific watchdogs should normally fire first. */
   timeoutMs?: number;
   /** Memory-only terminal overlay, emitted only after the matching durable failure/cancel fact. */
@@ -651,6 +663,7 @@ export class ModelProviderControlPlane {
   private readonly requestCancellations = new Map<string, Promise<ModelRequestCancelResult>>();
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private readonly preparedRecipes = new WeakSet<PreparedModelRequestRecipe>();
+  private readonly preparedContexts = new WeakSet<PreparedOrdinaryRequestContext>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
   private readonly historicalTurnReminders = new HistoricalTurnReminderCache();
@@ -924,7 +937,8 @@ export class ModelProviderControlPlane {
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
     socketGenerationInput: string | bigint,
-    preparedRecipe?: PreparedModelRequestRecipe
+    preparedRecipe?: PreparedModelRequestRecipe,
+    preparedContext?: PreparedOrdinaryRequestContext
   ): Promise<FullProviderRequest> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
@@ -951,8 +965,13 @@ export class ModelProviderControlPlane {
     );
     const settingsId = optionalId(request.settings_snapshot_object_id, 'ModelRequest.settings_snapshot_object_id');
     const settingsContent = settingsId ? await this.requireDomain('ContentObject', settingsId) : null;
-    const materializeStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
-    const materialized = await this.context.materialize(requireId(projection.root_id, 'ModelContextProjection.root_id'));
+    const rootId = requireId(projection.root_id, 'ModelContextProjection.root_id');
+    const reusable = this.ordinaryRequestContext(rootId, preparedContext);
+    if (reusable && isCompressionRecipe(loadedRecipe.recipe)) {
+      throw new TypeError('Ordinary prepared Context cannot supply a compression request.');
+    }
+    const materializeStartedAt = !reusable && this.database.performanceMetrics ? performance.now() : undefined;
+    const materialized = reusable ?? await this.context.materialize(rootId);
     if (materializeStartedAt !== undefined) {
       this.database.recordPerformanceMetric({
         kind: 'context.materialize',
@@ -1008,16 +1027,7 @@ export class ModelProviderControlPlane {
     const nativeAdmittedCallIds = isRecord(recipe) && isRecord(recipe.nativeResponses)
       ? await this.listNativeAdmittedProviderCallIds(contextConversationId, providerSegments)
       : undefined;
-    const providerContext = providerSegments.map((segment) => ({
-      segmentId: segment.segmentId,
-      segmentKind: segment.segmentKind,
-      messageRole: segment.messageRole,
-      ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
-      ...(segment.sourceRecipeObjectId ? { sourceRecipeObjectId: segment.sourceRecipeObjectId } : {}),
-      ...(segment.sourceModelRequestId ? { sourceModelRequestId: segment.sourceModelRequestId } : {}),
-      contentType: segment.contentObject.content_type,
-      content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
-    }));
+    const providerContext = reusable?.context ?? providerContextSegments(providerSegments as readonly MaterializedContextSegment[]);
     if (isRecord(recipe) && recipe.sourceReplay !== undefined
       && recipe.sourceReplay !== 'immutable_provenance') {
       throw new TypeError('Unsupported compression source replay policy.');
@@ -1081,8 +1091,31 @@ export class ModelProviderControlPlane {
     return this.buildFullRequest(modelRequestId, stats.attemptSeq, stats.socketGeneration);
   }
 
+  /** Decode once, retaining strings and metadata, never a second copy of the Context bytes. */
+  public prepareOrdinaryRequestContext(
+    materialized: MaterializedContext, prepared: PreparedOrdinaryRequestContext = {}
+  ): PreparedOrdinaryRequestContext {
+    prepared.value = {
+      root: materialized.root,
+      segments: materialized.segments.map(({ content: _content, ...metadata }) => metadata),
+      context: providerContextSegments(materialized.segments)
+    };
+    this.preparedContexts.add(prepared);
+    return prepared;
+  }
+
+  private ordinaryRequestContext(rootId: string, prepared?: PreparedOrdinaryRequestContext) {
+    if (!prepared?.value) return undefined;
+    if (!this.preparedContexts.has(prepared) || prepared.value.root.id !== rootId) {
+      throw new Error('Prepared ordinary Context differs from the immutable request root.');
+    }
+    return prepared.value;
+  }
+
   /** Builds a deterministic ordinary request preview without allocating a ModelRequest sequence. */
-  public async previewOrdinaryRequest(command: CreateModelRequestCommand): Promise<FullProviderRequest> {
+  public async previewOrdinaryRequest(
+    command: CreateModelRequestCommand, preparedContext?: PreparedOrdinaryRequestContext
+  ): Promise<FullProviderRequest> {
     const turnId = requireId(command.turnId, 'turnId');
     const contextRootId = requireId(command.contextRootId, 'contextRootId');
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
@@ -1091,7 +1124,7 @@ export class ModelProviderControlPlane {
     if (isCompressionRecipe(recipe)) throw new TypeError('Ordinary request preview cannot use a compression recipe.');
     const [frozen, materialized] = await Promise.all([
       readRequestTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId, command.settingsSnapshotContentObjectId),
-      this.context.materialize(contextRootId)
+      this.ordinaryRequestContext(contextRootId, preparedContext) ?? this.context.materialize(contextRootId)
     ]);
     if (requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id') !== frozen.conversationId) {
       throw new Error('Preview Context projection belongs to another Conversation.');
@@ -1105,16 +1138,8 @@ export class ModelProviderControlPlane {
       isRecord(recipe) ? recipe.attachmentCatalogState : undefined,
       'ModelRequest preview recipe.attachmentCatalogState'
     );
-    const providerContext = materialized.segments.map((segment) => ({
-      segmentId: segment.segmentId,
-      segmentKind: segment.segmentKind,
-      messageRole: segment.messageRole,
-      ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
-      ...(segment.sourceRecipeObjectId ? { sourceRecipeObjectId: segment.sourceRecipeObjectId } : {}),
-      ...(segment.sourceModelRequestId ? { sourceModelRequestId: segment.sourceModelRequestId } : {}),
-      contentType: segment.contentObject.content_type,
-      content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
-    }));
+    const providerContext = this.ordinaryRequestContext(contextRootId, preparedContext)?.context
+      ?? providerContextSegments(materialized.segments as readonly MaterializedContextSegment[]);
     assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,
       ...(requestAddenda.requestAddenda?.currentTurnInputs ?? [])
@@ -1384,7 +1409,7 @@ export class ModelProviderControlPlane {
     if (options.reconnect !== true && stats.socketGeneration !== '0') {
       throw new Error('ModelRequest was already dispatched; use reconnect explicitly.');
     }
-    const recipeRead = { recipe: options.preparedRecipe };
+    const recipeRead = { recipe: options.preparedRecipe, context: options.preparedContext };
 
     let attemptSeq = decimalBigInt(stats.attemptSeq, 'ModelRequest attemptSeq');
     let retryPolicy: FrozenProviderRetryPolicy | undefined;
@@ -1795,13 +1820,15 @@ export class ModelProviderControlPlane {
     repairOutput: boolean,
     retainedRetryPolicy: FrozenProviderRetryPolicy | undefined,
     signal?: AbortSignal,
-    recipeRead: { recipe?: PreparedModelRequestRecipe } = {}
+    recipeRead: { recipe?: PreparedModelRequestRecipe; context?: PreparedOrdinaryRequestContext } = {}
   ): Promise<PreparedProviderAttempt> {
     const fullRequest = await retryLocalExecution(async () => {
       this.assertNotHandingOff();
       recipeRead.recipe ??= await this.readModelRequestRecipe(request);
-      return this.buildFullRequest(modelRequestId, attemptSeq, socketGeneration, recipeRead.recipe);
+      return this.buildFullRequest(modelRequestId, attemptSeq, socketGeneration, recipeRead.recipe, recipeRead.context);
     }, { signal });
+    // Neither the awaiting Agent loop nor this dispatch's retry state retains the first body.
+    if (recipeRead.context) recipeRead.context.value = undefined;
     if (repairOutput) fullRequest.modelOutputRepair = true;
     const projectedRequest = adapter.prepareFullRequest?.(fullRequest);
     this.assertRequestPreflight(request, fullRequest, adapter, projectedRequest?.breakdown);
@@ -2899,7 +2926,7 @@ export class ModelProviderControlPlane {
   private async materializeTurnReminderHistory(
     authority: PlainJsonValue,
     recipe: PlainJsonValue,
-    segments: readonly MaterializedContextSegment[]
+    segments: readonly ContextSegmentMetadata[]
   ): Promise<TurnReminderHistoryEntry[] | undefined> {
     if (!reminderHistoryForRequest(recipe)) return undefined;
     const replayClaude = isRecord(recipe) && recipe.kind === 'reliable-agent-turn'
@@ -2990,8 +3017,8 @@ export class ModelProviderControlPlane {
 
   /** Published producers freeze delivery from this exact authority; unknown legacy facts keep recipe replay. */
   private async filterHistoricalReminderSources(
-    sources: MaterializedContextSegment[]
-  ): Promise<MaterializedContextSegment[]> {
+    sources: ContextSegmentMetadata[]
+  ): Promise<ContextSegmentMetadata[]> {
     const decisions = new Map<string, boolean>();
     const missing = new Map<string, ContextReminderAuthoritySource>();
     for (const source of sources) {
@@ -3109,7 +3136,7 @@ export class ModelProviderControlPlane {
   /** Admission is needed only for calls carried by this already materialized provider window. */
   private async listNativeAdmittedProviderCallIds(
     conversationId: string,
-    segments: readonly MaterializedContextSegment[]
+    segments: readonly ContextSegmentMetadata[]
   ): Promise<readonly string[]> {
     const segmentIds = segments.filter((segment) => segment.segmentKind === 'tool_pair')
       .map((segment) => segment.segmentId);
@@ -3432,6 +3459,19 @@ function compressionRequestSegments<T>(
   // The finite tail is retained verbatim by ContextCompression.create and must never be sent to
   // the compact Provider as summary source, otherwise the next request duplicates that tail.
   return segments.slice(0, count as number);
+}
+
+function providerContextSegments(segments: readonly MaterializedContextSegment[]): FullProviderRequest['context'] {
+  return segments.map(segment => ({
+    segmentId: segment.segmentId,
+    segmentKind: segment.segmentKind,
+    messageRole: segment.messageRole,
+    ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
+    ...(segment.sourceRecipeObjectId ? { sourceRecipeObjectId: segment.sourceRecipeObjectId } : {}),
+    ...(segment.sourceModelRequestId ? { sourceModelRequestId: segment.sourceModelRequestId } : {}),
+    contentType: segment.contentObject.content_type,
+    content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
+  }));
 }
 
 function isCompressionRecipe(recipe: PlainJsonValue): boolean {

@@ -139,6 +139,8 @@ export interface CoordinateCompressionCommand {
   providerContextOverflowRequestId?: string;
   /** Exact frozen ordinary request planning budget. Required for automatic compression; optional for manual. */
   requestBudget?: FullRequestPlanningBudget;
+  /** Release the ordinary preview before allocating a compression source/request body. */
+  beforeSourceMaterialization?(): void;
   /** Exact active-Turn input that may need request-level reinjection after this compression. */
   protectedCurrentInputTokens?: number;
   /** Frozen ordinary tool definitions; Provider-native compaction must use the same tool contract. */
@@ -657,6 +659,7 @@ export class ReliableContextCompressionCoordinator {
     }
     // Materialize source structure/content only after the level-trigger passes. Below-threshold checks
     // are the common path and should pay for one provider-aligned Context read, not three.
+    command.beforeSourceMaterialization?.();
     const { structure: materialized, content: semanticMaterialized } =
       await this.context.materializeWithStructure(headRootId);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };

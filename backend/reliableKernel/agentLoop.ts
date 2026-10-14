@@ -67,6 +67,7 @@ import {
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   type FullRequestProviderAdapter,
   type PreparedModelRequestRecipe,
+  type PreparedOrdinaryRequestContext,
   type ProviderDispatchControls,
   type ProviderTransientStreamEvent,
   type StreamEventResult
@@ -616,6 +617,7 @@ export class ReliableAgentLoop {
         const idempotencyKey = `agent-loop:${turnId}:round:${round}`;
         const expectedModelRequestId = modelRequestIdFor(turnId, idempotencyKey);
         let request = await this.maybeGet('ModelRequest', expectedModelRequestId);
+        let preparedContext: PreparedOrdinaryRequestContext | undefined;
         if (!request) {
           // A new root must not freeze an unresolved native call: close committed results left by
           // an interrupted/failed chain (this Turn or an earlier one) before anything else lands.
@@ -646,6 +648,7 @@ export class ReliableAgentLoop {
           const recoveredRebase = recoveredCompression?.recoveryDecision
             ? recoveredCompression.nativeRebase ?? planNativeCompressionRebase({ nativeEnabled: true, updates: [] })
             : undefined;
+          preparedContext = {};
           let frozenRecipe = await this.freezeOrdinaryRequestRecipe({
             settingsSnapshotContentObjectId,
             turnId,
@@ -658,7 +661,7 @@ export class ReliableAgentLoop {
               cacheReset: recoveredRebase.cacheReset, forceFullReason: recoveredRebase.forceFullReason,
               ...(recoveredRebase.freshConfigurationUpdate ? { freshConfigurationUpdate: recoveredRebase.freshConfigurationUpdate } : {})
             } } : {})
-          });
+          }, preparedContext);
           let planning = await this.prepareOrdinaryRequestPlanning({
             turnId,
             settingsSnapshotContentObjectId,
@@ -666,7 +669,7 @@ export class ReliableAgentLoop {
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             recipe: frozenRecipe,
             idempotencyKey
-          });
+          }, preparedContext);
           let planningBudget = planning.budget;
           // Full-request tokenization is model-independent planning data. Compression admission is
           // level-triggered by the Provider-observed Context estimate; ordinary sending is never
@@ -681,6 +684,7 @@ export class ReliableAgentLoop {
               authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
               headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
               trigger: 'auto', requestBudget: planningBudget,
+              beforeSourceMaterialization: () => { if (preparedContext) preparedContext.value = undefined; },
               protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
               modelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, frozenRecipe),
               tools: toolDefinitions
@@ -710,6 +714,7 @@ export class ReliableAgentLoop {
             // updates the plan carries no configuration_update but still resets the cache.
             const nativeRebasePlan = compression.nativeRebase
               ?? planNativeCompressionRebase({ nativeEnabled: true, updates: [] });
+            preparedContext = {};
             frozenRecipe = await this.freezeOrdinaryRequestRecipe({
               settingsSnapshotContentObjectId,
               turnId,
@@ -729,7 +734,7 @@ export class ReliableAgentLoop {
                     }
                   }
                 : {})
-            });
+            }, preparedContext);
             planning = await this.prepareOrdinaryRequestPlanning({
               turnId,
               settingsSnapshotContentObjectId,
@@ -737,7 +742,7 @@ export class ReliableAgentLoop {
               authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
               recipe: frozenRecipe,
               idempotencyKey
-            });
+            }, preparedContext);
             planningBudget = planning.budget;
             if (await this.terminateIfRequested(turnId, `round:${round}:after-capacity-compression`)) {
               return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
@@ -846,7 +851,8 @@ export class ReliableAgentLoop {
               turnId,
               modelRequestId,
               request,
-              preparedModelRequestRecipe
+              preparedModelRequestRecipe,
+              preparedContext
             );
           } catch (error) {
             if (isExecutionHandoffError(error)) throw error;
@@ -1162,13 +1168,13 @@ export class ReliableAgentLoop {
 
   /**
    * The full preview is needed only for provider-aligned planning. Return its small continuation
-   * facts before awaiting compression, so the old full Context is not retained alongside the
-   * coordinator's materialized source and the compression Provider's separately built request.
+   * facts only. The separate Context holder is released before compression materializes its source.
    */
   private async prepareOrdinaryRequestPlanning(
-    command: Parameters<ModelProviderControlPlane['previewOrdinaryRequest']>[0]
+    command: Parameters<ModelProviderControlPlane['previewOrdinaryRequest']>[0],
+    preparedContext?: PreparedOrdinaryRequestContext
   ): Promise<OrdinaryRequestPlanningFacts> {
-    const preview = await this.modelProvider.previewOrdinaryRequest(command);
+    const preview = await this.modelProvider.previewOrdinaryRequest(command, preparedContext);
     const adapter = await this.providers.resolve(preview.providerId);
     if (adapter.providerId !== preview.providerId) {
       throw new Error(`Provider registry returned ${adapter.providerId} for ${preview.providerId}.`);
@@ -1214,7 +1220,7 @@ export class ReliableAgentLoop {
       forceFullReason?: 'compression';
       freshConfigurationUpdate?: { effort: string };
     };
-  }): Promise<PlainJsonValue> {
+  }, contextHolder?: PreparedOrdinaryRequestContext): Promise<PlainJsonValue> {
     const [runtimeStatus, turnTaskCard, previousTaskCard] = await Promise.all([
       this.readRuntimeStatusCard(input.turnId),
       readCurrentTurnTaskCard(this.database, input.turnId),
@@ -1226,6 +1232,7 @@ export class ReliableAgentLoop {
     const { structure, content: materialized } = await this.context.materializeWithStructure(
       requireId(input.headRootId, 'headRootId')
     );
+    const preparedContext = this.modelProvider.prepareOrdinaryRequestContext(materialized, contextHolder);
     const [currentTurnState, nativeFreeze] = await Promise.all([
       this.readCurrentTurnInputReference(input.turnId, structure),
       this.readNativeRecipeFreeze({ ...input, scopeReset: runtimeStatus.requiresNativeReset, structure })
@@ -1240,7 +1247,7 @@ export class ReliableAgentLoop {
       conversationId,
       attachmentCatalogState.catalog
     );
-    const contextInputSources: unknown[] = materialized.segments.map((segment) => Buffer.from(segment.content).toString('utf8'));
+    const contextInputSources: unknown[] = preparedContext.value!.context.map(segment => segment.content);
     const handleSources: unknown[] = [
       ...contextInputSources,
       attachmentCatalogState.catalog,
@@ -2450,7 +2457,8 @@ export class ReliableAgentLoop {
     turnId: string,
     modelRequestId: string,
     request: DomainRow,
-    preparedRecipe: PreparedModelRequestRecipe
+    preparedRecipe: PreparedModelRequestRecipe,
+    preparedContext?: PreparedOrdinaryRequestContext
   ): Promise<NormalizedProviderOutput | typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE> {
     const providerId = requireText(request.provider_id, 'ModelRequest.provider_id');
     const modelId = requireText(request.model_id, 'ModelRequest.model_id');
@@ -2710,6 +2718,7 @@ export class ReliableAgentLoop {
     try {
       await this.modelProvider.dispatch(modelRequestId, wrapped, {
         preparedRecipe,
+        preparedContext,
         ...(reconnect ? { reconnect: true } : {}),
         // A transient transport failure after durable chain progress must not start a new Attempt
         // that re-sends the frozen input: admitted tools would be issued again under new
