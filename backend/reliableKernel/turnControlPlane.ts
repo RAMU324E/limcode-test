@@ -856,6 +856,8 @@ export class TurnControlPlane {
     const conversationId = requireId(input.conversationId, 'conversationId');
     return this.runOwnedConversationMutation(conversationId, async () => {
       for (;;) {
+        // A running Turn owns Context until it releases its lease. Do not prepare its successor.
+        if ((await this.listRows('ExecutionLease', { conversation_id: conversationId }, 1)).length > 0) return null;
         const queued = await listAllDomainRows(this.database, 'TurnIntent', {
           conversation_id: conversationId, state: TURN_INTENT_STATE_QUEUED, turn_id: null
         });
