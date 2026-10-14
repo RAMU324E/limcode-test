@@ -264,6 +264,19 @@ export const scenario1 = async getRuntime => {
     assert.equal(toolCancellationCalls, 0);
     assert.equal((await listRows(app.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued' })).length, 3);
 
+    const snapshot = app.database.snapshot;
+    let waitingContextReads = 0;
+    app.database.snapshot = function (reads, ...args) {
+      waitingContextReads += reads.filter(read => read.domain === 'ConversationContextHeadLink').length;
+      return snapshot.call(this, reads, ...args);
+    };
+    try {
+      assert.equal(await app.turns.admitNextQueued(scope.lease()), null);
+      assert.equal(waitingContextReads, 0, '当前工具未结束时不得准备排队消息的 Context');
+    } finally {
+      app.database.snapshot = snapshot;
+    }
+
     releaseTool();
     await withTimeout(runner.waitForIdle(), 10_000, '当前工具完成后引导消息未自动接续');
 
