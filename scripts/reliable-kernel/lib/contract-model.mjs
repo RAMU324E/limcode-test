@@ -26,7 +26,7 @@ export const CONTRACT_FILES = [
 ];
 
 const CONTRACT_REVISION = '2026-07-31-r4';
-const CLIENT_FEED_CONTRACT_REVISION = '2026-09-27-r1';
+const CLIENT_FEED_CONTRACT_REVISION = '2026-10-15-r1';
 const SUBAGENT_CONTRACT_REVISION = '2026-09-25-r7';
 // Contracts revised after the base revision; every other contract file stays at CONTRACT_REVISION.
 const FILE_CONTRACT_REVISIONS = new Map([
@@ -1706,10 +1706,11 @@ function validateClient(root, client, failures) {
   if (client?.persistence?.clientChangeLog !== false || client?.persistence?.clientCommitTables !== false) failures.push('第一版不得持久化前端变更日志或提交表');
   if (client?.persistence?.sessionState !== 'memory-only') failures.push('前端同步会话必须只在内存中');
   if (client?.crossHostSynchronization?.detection !== 'sqlite-externalDataVersion'
-    || client?.crossHostSynchronization?.projection !== 'bounded-snapshot-required-on-external-change'
+    || client?.crossHostSynchronization?.notification !== 'bounded-memory-only-committed-changes-through-host-liveness-loopback-endpoint'
+    || client?.crossHostSynchronization?.projection !== 'complete-notifications-select-affected-session-scopes; current-SQLite-snapshot-for-relevant-records; bounded-navigation-only-delta-for-stable-membership; notification-gap-or-writer-membership-change-requires-snapshot'
     || client?.crossHostSynchronization?.backgroundWake !== 'persistent-RuntimeDeliveryWake-owner-routed-level-scan'
     || client?.crossHostSynchronization?.daemonRequired !== false) {
-    failures.push('跨宿主同步必须检测外部 SQLite 提交并使用有界快照及归属路由的持久唤醒');
+    failures.push('跨宿主同步必须检测外部 SQLite 提交，以有界内存通知选择刷新范围，缺口重取快照，并保留归属路由的持久唤醒');
   }
   if (client?.conversationViews?.mainChat !== 'single-flight-open-and-focus-existing-per-host'
     || client?.conversationViews?.foreignOwner !== 'reject-only-the-occupied-conversation'

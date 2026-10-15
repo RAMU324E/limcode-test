@@ -63,9 +63,11 @@ dimensions 与计数字段必须在 metadata allowlist 内，合计不超过 9 �
 
 上表所有汇总的 dimensions 都另含 `hostBootId`。
 
-快照原因 `reasonCode`：`initial`（连接）、`client_request`（Webview 请求）、`commit_scope`（本 Host 提交超出增量范围）、`task_candidate`（任务卡片需要重算）、`change_batch_limit`/`queue_limit`（增量超过批量或队列上限）、`external_commit`（其它 Host 或连接的提交，当前只能整体失效）。一次快照读取期间又到来的请求，其原因留给紧接着的下一次快照；读取期间到来的本 Host 提交在快照发出后回放，其中超出增量范围的同样把 `commit_scope` 留给下一次快照。
+快照原因 `reasonCode`：`initial`（连接）、`client_request`（Webview 请求）、`commit_scope`（本 Host 提交超出增量范围）、`change_batch_limit`/`queue_limit`（增量超过批量或队列上限）、`external_commit`（其它 Host 的变化涉及当前视图，或提交通知缺失、超出缓冲、写入 Host 集合变化）。完整的内存提交通知仅用来判断范围；无关对话保存不读取当前面板历史，导航成员不变时仅查询有界对话列表发送增量，相关视图仍从当前 SQLite 读取快照。本 Host 的任务卡片与活动回合冻结目录分别经 `ConversationTaskList`、`ConversationExecutionBoundary` 派生增量更新，不重读消息窗口。一次快照读取期间又到来的请求，其原因留给紧接着的下一次快照；读取期间到来的本 Host 提交在快照发出后回放，其中超出增量范围的同样把 `commit_scope` 留给下一次快照。
 
 "外部提交成本"的统计口径：`feed.snapshot.summary` 中 `external_commit` 只覆盖对话面板的 Client Feed。侧栏历史列表的外部刷新走 Facade 的 `ExternalDataVersionWatcher`，运行工作的外部刷新走 ProductRuntime 的同名 watcher，二者都不产生 Feed 快照；它们的成本体现在 `database.request.summary` 的 `conversationHistoryProjection`、`externalDataVersion` 等 requestKind 中，汇总脚本会按 requestKind 列出。
+
+普通模型请求的任务卡在 worker 内按 Conversation 复用，空清单也复用；本 Host 的无关消息、流状态与改名不再查询历史任务或回放清单。任务结果、来源可见性或归属变化通过同事务 `ConversationTaskList` 标记失效，跨 Turn 只更新卡片的当前 Turn 与读取前沿。维护操作清空复用结果；跨窗口目前沿 SQLite `data_version` 在任何外部提交后清空，下次读取重算，不增加独立通知游标。
 
 逐条事件（每类每 5 分钟最多 20 条，汇总仍计入全部样本）：
 

@@ -1,4 +1,5 @@
 import type { SingleResponseMeasurement } from '../../shared/modelRequestMeasurement';
+import { ExternalClientCommits, type ClientCommitPeer } from './externalClientCommits';
 import { needsSingleResponseMeasurement, singleResponseMeasurementIdentity } from './singleResponseMeasurement';
 import type { NativePendingToolCall, NativePendingWorkInput, NativeSteeringInFlightEntry } from './nativeWorkTypes';
 import type { CurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
@@ -14,6 +15,7 @@ import { registerInProcessSqliteDatabase } from '../capabilities/filesystem/sqli
 import {
   ROOT_BINDING_POINTER_FILE,
   type RootBinding,
+  type AttachmentProjectionChanges,
   type RuntimeCommitResult,
   type SnapshotBarrier
 } from './contracts';
@@ -128,6 +130,7 @@ interface RuntimeHostLivenessRecord {
   processStartIdentity?: string;
   startedAt: string;
   heartbeatAt: string;
+  clientCommitPort?: number;
 }
 
 /** See RuntimeDatabase.durabilityCheckpoint: attempts, and the pause between them (about 1 s in all). */
@@ -135,6 +138,12 @@ const DURABILITY_CHECKPOINT_ATTEMPTS = 20;
 const DURABILITY_CHECKPOINT_RETRY_MS = 50;
 
 export class RuntimeDatabase {
+  private readonly externalClientCommits = new ExternalClientCommits();
+  private readonly externalAttachmentCommits = new ExternalClientCommits();
+  private clientWriterMembership: string | undefined;
+  private attachmentWriterMembership: string | undefined;
+  private attachmentExternalVersion: string | undefined;
+  private attachmentExternalSync?: Promise<AttachmentProjectionChanges[] | null>;
   private readonly historyPreparation: HistoryPreparationAdmission;
   private readonly pending = new Map<number, {
     resolve(value: unknown): void;
@@ -279,6 +288,7 @@ export class RuntimeDatabase {
           options.maintenance === true,
           options.historyPreparationConcurrency
         );
+        if (!database.maintenance) await database.externalClientCommits.start(database.livenessId, () => database!.snapshot([]));
         await database.registerHostLiveness();
         database.assertUsable();
         return database;
@@ -459,7 +469,7 @@ export class RuntimeDatabase {
     return this.request<SnapshotBarrier<DomainRow[]>>({ kind: 'snapshotAll', read });
   }
 
-  /** Latest task rewrite and update suffix, ordered and verified in one worker read snapshot. */
+  /** Complete current task card, reduced and reused on the worker within one read snapshot. */
   public currentTurnTaskSnapshot(turnId: string): Promise<SnapshotBarrier<CurrentTurnTaskSnapshot>> {
     return this.request({ kind: 'currentTurnTaskSnapshot', turnId });
   }
@@ -605,6 +615,64 @@ export class RuntimeDatabase {
     return version;
   }
 
+  public async externalClientChanges(baseline = false) {
+    const { peers, membership } = await this.externalCommitPeers();
+    const membershipChanged = this.clientWriterMembership !== undefined && membership !== this.clientWriterMembership;
+    this.clientWriterMembership = membership;
+    if (membershipChanged) this.externalClientCommits.reset();
+    const changes = await this.externalClientCommits.poll(peers, baseline || membershipChanged);
+    return membershipChanged && !baseline ? null : changes;
+  }
+
+  /** Independent notification cursor: a Client Feed poll must not consume attachment invalidations. */
+  public synchronizeAttachmentProjection(): Promise<AttachmentProjectionChanges[] | null> {
+    if (!this.attachmentExternalSync) {
+      this.attachmentExternalSync = this.readExternalAttachmentChanges().finally(() => { this.attachmentExternalSync = undefined; });
+    }
+    return this.attachmentExternalSync;
+  }
+
+  private async readExternalAttachmentChanges(): Promise<AttachmentProjectionChanges[] | null> {
+    const version = await this.externalDataVersion();
+    if (version === this.attachmentExternalVersion) return [];
+    const { peers, membership } = await this.externalCommitPeers();
+    const baseline = this.attachmentExternalVersion === undefined;
+    const membershipChanged = this.attachmentWriterMembership !== undefined && membership !== this.attachmentWriterMembership;
+    this.attachmentWriterMembership = membership;
+    if (membershipChanged) this.externalAttachmentCommits.reset();
+    const observed = await this.externalAttachmentCommits.pollAttachmentProjectionChanges(peers, baseline || membershipChanged);
+    const changes = baseline || membershipChanged ? null : observed;
+    const after = await this.request<string>({ kind: 'externalDataVersion', attachmentProjectionVersion: version,
+      attachmentProjectionChanges: changes });
+    this.attachmentExternalVersion = after;
+    return after === version ? changes : null;
+  }
+
+  private async externalCommitPeers(): Promise<{ peers: ClientCommitPeer[]; membership: string }> {
+    await this.assertUsableBinding('externalDataVersion');
+    const peers: ClientCommitPeer[] = [];
+    const directory = runtimeHostLivenessDirectory(this.binding.paths);
+    const membership = await fs.readFile(path.join(directory, '.client-membership'), 'utf8')
+      .catch(error => { if (isNotFoundError(error)) return ''; throw error; });
+    const files = await fs.readdir(directory).catch(error => { if (isNotFoundError(error)) return []; throw error; });
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      const record = await readHostLiveness(path.join(directory, file));
+      if (!record || record.hostBootId === this.hostBootId || !sameLivenessRoot(record, this.binding)) continue;
+      peers.push({ ...record, retired: recordedProcessVanished(record.processId) });
+    }
+    return { peers, membership };
+  }
+
+  public resetExternalClientChanges(): void {
+    this.externalClientCommits.reset();
+    this.clientWriterMembership = undefined;
+  }
+
+  public refreshExternalClientNavigation(): Promise<boolean> {
+    return this.request({ kind: 'clientNavigationChanges' });
+  }
+
   /**
    * The carried-work inventory of this whole data set (relocatedWorkInventory), read on the worker's
    * read connection: a data-root relocation settlement takes it again after each round, since
@@ -727,6 +795,8 @@ export class RuntimeDatabase {
   }
 
   private markClosed(): void {
+    this.externalClientCommits.close();
+    this.externalAttachmentCommits.close();
     this.closed = true;
     this.casAccess.fence();
     for (const listener of this.closeListeners) listener();
@@ -1008,6 +1078,7 @@ export class RuntimeDatabase {
 
   private async registerHostLiveness(): Promise<void> {
     await this.writeHostHeartbeat();
+    await this.publishClientWriterMembership();
     this.heartbeatTimer = setInterval(() => {
       this.heartbeatTask = this.heartbeatTask
         .then(() => this.writeHostHeartbeat())
@@ -1037,7 +1108,8 @@ export class RuntimeDatabase {
       processId: process.pid,
       ...(this.processStartIdentity ? { processStartIdentity: this.processStartIdentity } : {}),
       startedAt: this.startedAt,
-      heartbeatAt: new Date().toISOString()
+      heartbeatAt: new Date().toISOString(),
+      clientCommitPort: this.externalClientCommits.port
     };
     const target = this.hostLivenessPath(this.hostBootId);
     const directory = path.dirname(target);
@@ -1051,7 +1123,17 @@ export class RuntimeDatabase {
     const target = this.hostLivenessPath(this.hostBootId);
     const record = await readHostLiveness(target);
     if (record?.livenessId !== this.livenessId) return;
+    // One small lifecycle marker covers a writer that opens, commits and exits between polls.
+    // It is never updated per commit and stores no domain rows or history.
+    await this.publishClientWriterMembership();
     await fs.rm(target, { force: true });
+  }
+
+  private async publishClientWriterMembership(): Promise<void> {
+    const target = path.join(runtimeHostLivenessDirectory(this.binding.paths), '.client-membership');
+    const temporary = target + '.' + this.livenessId + '.tmp';
+    await fs.writeFile(temporary, randomUUID(), { encoding: 'utf8', mode: 0o600 });
+    await fs.rename(temporary, target);
   }
 
   private stopHeartbeatTimer(): void {
@@ -1113,6 +1195,7 @@ export class RuntimeDatabase {
 
   private onMessage(message: DatabaseWorkerResponse): void {
     if (message.type === 'commit') {
+      if (!message.result.observedExternal) this.externalClientCommits.record(message.result);
       this.lastCommit = message.result;
       const metrics = this.performanceMetrics;
       const startedAtMs = metrics ? performance.now() : undefined;

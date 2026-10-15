@@ -61,6 +61,8 @@ export interface AttachmentProjectionChanges {
 }
 
 export interface RuntimeCommitResult {
+  /** Memory-only observation of a peer frontier; never republish it as a new local SQLite commit. */
+  observedExternal?: true;
   commitSeq: string;
   changes: RuntimeChange[];
   allocatedSequences: RuntimeAllocatedSequence[];

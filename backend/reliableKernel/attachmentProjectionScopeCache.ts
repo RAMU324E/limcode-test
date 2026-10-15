@@ -59,6 +59,17 @@ export class AttachmentProjectionScopeCache {
     }
   }
 
+  /** Advances the existing source proofs using the same peer commit changes as the host cache. */
+  public synchronizeExternal(version: bigint, changes: AttachmentProjectionChanges[] | null): void {
+    if (changes === null || changes.some(change => change.reset || change.messages.length > 0)) {
+      this.clear();
+      this.externalInvalidations++;
+    } else {
+      for (const change of changes) for (const segmentId of change.segments) this.evict(segmentId);
+    }
+    this.externalVersion = version;
+  }
+
   /** Both values must come from this worker's writer, around the reader's first actual read. */
   public synchronizeSnapshot(before: bigint, after: bigint): boolean {
     if (before !== after) {

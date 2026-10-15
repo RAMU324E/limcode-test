@@ -333,10 +333,6 @@ export class BoundedClientFeed {
   private enqueueCommit(session: ClientFeedSession, commit: RuntimeCommitResult): void {
     if (session.closed || session.snapshotRequired) return;
     const scoped = this.scopeCommit(session, commit);
-    // The task card is a Conversation-derived snapshot, not a ToolOutcome or a visible ToolCall.
-    // A successful Operation may be durable before an earlier tool lets the ordered terminal
-    // writer emit ToolOutcome. Probe calls outside the live window by their committed identity.
-    const taskCandidates = committedTaskToolCandidates(commit.changes);
     // Imported terminal rows may carry the erroneous single-response chain label. Interpret
     // them at the bounded snapshot boundary, not by doing CAS I/O inside this sync commit listener.
     if (scoped.changes.some(change => change.domain === 'ModelRequest' && change.record
@@ -344,8 +340,8 @@ export class BoundedClientFeed {
       this.enterSnapshotRequired(session, 'commit_scope');
       return;
     }
-    if (scoped.requiresSnapshot || this.refreshForCommittedTaskCandidates(session, taskCandidates)) {
-      this.enterSnapshotRequired(session, scoped.requiresSnapshot ? 'commit_scope' : 'task_candidate');
+    if (scoped.requiresSnapshot) {
+      this.enterSnapshotRequired(session, 'commit_scope');
       return;
     }
     // Database commitSeq is intentionally allowed to jump on the wire. Commits with no visible
@@ -373,71 +369,6 @@ export class BoundedClientFeed {
     }
     session.queue.push(pending);
     session.queuedBytes += pending.bytes;
-  }
-
-  private refreshForCommittedTaskCandidates(
-    session: ClientFeedSession,
-    candidates: ReadonlyMap<string, boolean>
-  ): boolean {
-    if (candidates.size === 0 || !session.activeConversationId) return false;
-    const outsideWindow = new Map<string, boolean>();
-    for (const [toolCallId, settled] of candidates) {
-      const toolCall = session.materializedRecords.get(recordKey('ToolCall', toolCallId));
-      if (!toolCall || !settled) {
-        outsideWindow.set(toolCallId, settled);
-        continue;
-      }
-      if (
-        isTaskToolCall(toolCall)
-        && session.primaryTurnIds.has(recordStringField(toolCall, 'turn_id') ?? '')
-      ) return true;
-    }
-    if (outsideWindow.size > 0) {
-      const conversationId = session.activeConversationId;
-      void this.probeCommittedTaskCandidates(conversationId, outsideWindow)
-        .then((found) => {
-          if (found && !session.closed && session.activeConversationId === conversationId) {
-            this.enterSnapshotRequired(session, 'task_candidate');
-          }
-        })
-        .catch((error) => this.closeFailedSession(session, error));
-    }
-    return false;
-  }
-
-  private async probeCommittedTaskCandidates(
-    conversationId: string,
-    candidates: ReadonlyMap<string, boolean>
-  ): Promise<boolean> {
-    // One bounded pair of repository reads per commit. No CAS/tool execution, unbounded scans,
-    // schema write or second task table is required to locate the immutable owner Conversation.
-    const callIds = [...candidates.keys()];
-    const calls = await this.database.snapshot(callIds.map((id) =>
-      DOMAIN_REPOSITORIES.domain('ToolCall').get(id)));
-    const possible = calls.snapshot.flatMap((row, index) =>
-      row && !Array.isArray(row) && isTaskToolCall(row)
-        ? [{ id: callIds[index], row }]
-        : []);
-    if (possible.length === 0) return false;
-    const turnIds = [...new Set(possible.flatMap(({ row }) => {
-      const id = recordStringField(row, 'turn_id');
-      return id ? [id] : [];
-    }))];
-    const owners = await this.database.snapshot(turnIds.map((id) =>
-      DOMAIN_REPOSITORIES.domain('Turn').get(id)));
-    const ownedTurns = new Set(owners.snapshot.flatMap((row) =>
-      row && !Array.isArray(row) && row.conversation_id === conversationId
-        ? [recordStringField(row, 'id') ?? ''] : []));
-    const owned = possible.filter(({ row }) => ownedTurns.has(recordStringField(row, 'turn_id') ?? ''));
-    if (owned.some(({ id }) => candidates.get(id) === true)) return true;
-    const artifactOnly = owned.filter(({ id }) => candidates.get(id) === false);
-    if (artifactOnly.length === 0) return false;
-    const settled = await this.database.snapshot(artifactOnly.flatMap(({ id }) => [
-      DOMAIN_REPOSITORIES.domain('Operation').list({ where: { tool_call_id: id }, limit: 2 }),
-      DOMAIN_REPOSITORIES.domain('ToolOutcome').list({ where: { tool_call_id: id }, limit: 2 })
-    ]));
-    return artifactOnly.some((_, index) => [settled.snapshot[index * 2], settled.snapshot[index * 2 + 1]]
-      .some((rows) => Array.isArray(rows) && rows.some((row) => row.status === 'succeeded')));
   }
 
   private enterSnapshotRequired(session: ClientFeedSession, reason: ClientFeedSnapshotReason): void {
@@ -688,14 +619,6 @@ export class BoundedClientFeed {
         }
         const ownKey = recordKey(change.domain, change.id);
         const wasKnown = session.materializedRecordKeys.has(ownKey);
-        if (change.domain === 'Turn' && record.conversation_id === session.activeConversationId) {
-          const previousStatus = session.materializedRecords.get(ownKey)?.status;
-          if (previousStatus !== record.status && (previousStatus === 'active' || record.status === 'active')) {
-            // The frozen work-environment summary is a snapshot-only projection. Refresh it
-            // atomically when its active Turn appears or ends, including a child Conversation.
-            requiresSnapshot = true;
-          }
-        }
         accepted.push(acceptedChange);
         pending.splice(index, 1);
         if (wasKnown) {
@@ -779,6 +702,8 @@ export class BoundedClientFeed {
       case 'TurnIntent':
       case 'CompressionBlock':
       case 'ConversationContextStatus':
+      case 'ConversationTaskList':
+      case 'ConversationExecutionBoundary':
         return field('conversation_id') === activeConversationId;
       case 'ConversationBranchLink':
         return field('target_conversation_id') === activeConversationId
@@ -1034,6 +959,7 @@ export class BoundedClientFeed {
     if (!this.externalPollInitialization) {
       this.externalPollInitialization = (async () => {
         this.externalDataVersion = await this.database.externalDataVersion();
+        await this.database.externalClientChanges(true);
         if (this.sessions.size === 0 || this.externalPollTimer) return;
         this.externalPollTimer = setInterval(() => {
           void this.pollExternalCommits();
@@ -1060,7 +986,43 @@ export class BoundedClientFeed {
       if (this.database.performanceMetrics) {
         this.database.recordPerformanceMetric({ kind: 'client_feed.external_change', sessionCount: this.sessions.size });
       }
-      for (const session of this.sessions.values()) this.enterSnapshotRequired(session, 'external_commit');
+      const changes = await this.database.externalClientChanges();
+      if (changes === null) {
+        for (const session of this.sessions.values()) this.enterSnapshotRequired(session, 'external_commit');
+        return;
+      }
+      if (changes.some(change => change.domain === 'Conversation')
+        && !await this.database.refreshExternalClientNavigation()) {
+        for (const session of this.sessions.values()) this.enterSnapshotRequired(session, 'external_commit');
+        return;
+      }
+      const scopedChanges = changes.filter(change => change.domain !== 'Conversation');
+      for (const session of this.sessions.values()) {
+        // Navigation-only deltas do not include snapshot-only peers outside the bounded list.
+        if (changes.some(change => change.domain === 'Conversation'
+          && !session.navigationConversationIds.has(change.id)
+          && (change.id === session.activeConversationId
+            || session.activeRecordKeys.has(recordKey('Conversation', change.id))))) {
+          this.enterSnapshotRequired(session, 'external_commit');
+          continue;
+        }
+        if (scopedChanges.length === 0) continue;
+        if (session.initializing || session.refreshing || session.snapshotRequired) {
+          this.enterSnapshotRequired(session, 'external_commit');
+          continue;
+        }
+        // These notifications only select a scope. Relevant records are read from the current
+        // SQLite snapshot, never applied from another Host's potentially superseded row payload.
+        const relevant = scopedChanges.some(change => {
+          if (['ContextSequenceRoot', 'ConversationContextHeadLink', 'ProcessOutputChunk'].includes(change.domain)) return false;
+          if (change.kind === 'remove') return session.materializedRecordKeys.has(recordKey(change.domain, change.id))
+            || SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS.has(change.domain);
+          return Boolean(change.record && this.recordVisibleToSession(session, change.domain, change.id, change.record));
+        });
+        if (relevant) {
+          this.enterSnapshotRequired(session, 'external_commit');
+        }
+      }
     } catch (error) {
       for (const session of [...this.sessions.values()]) this.closeFailedSession(session, error);
     } finally {
@@ -1073,29 +1035,8 @@ export class BoundedClientFeed {
     if (this.externalPollTimer) clearInterval(this.externalPollTimer);
     this.externalPollTimer = null;
     this.externalDataVersion = null;
+    this.database.resetExternalClientChanges();
   }
-}
-
-/** Success is a committed Operation/Outcome fact, not a ToolCall argument or finalization guess. */
-function committedTaskToolCandidates(changes: readonly RuntimeChange[]): Map<string, boolean> {
-  const candidates = new Map<string, boolean>();
-  for (const change of changes) {
-    if (change.kind !== 'upsert' || !change.record) continue;
-    const toolCallId = recordStringField(change.record, 'tool_call_id');
-    if (!toolCallId) continue;
-    if (
-      (change.domain === 'Operation' || change.domain === 'ToolOutcome')
-      && change.record.status === 'succeeded'
-    ) candidates.set(toolCallId, true);
-    if (change.domain === 'ToolResultArtifact' && change.record.role === 'no_effect_result') {
-      candidates.set(toolCallId, candidates.get(toolCallId) === true);
-    }
-  }
-  return candidates;
-}
-
-function isTaskToolCall(record: Record<string, unknown>): boolean {
-  return record.tool_name === 'update_task_list' || record.tool_name === 'submit_plan';
 }
 
 function toReliableClientChange(change: ClientScopedRuntimeChange): ReliableKernelClientChange {
@@ -1111,7 +1052,11 @@ function toReliableClientChange(change: ClientScopedRuntimeChange): ReliableKern
     };
   }
   if (!change.record) throw new Error(`Committed client upsert ${change.domain}/${change.id} has no record projection.`);
-  const record = boundRecord(toWirePlain(change.record) as Record<string, PlainData>, change.domain);
+  // Apply the snapshot's nested item bounds, not one row's summary truncation to the whole card
+  // or frozen policy. Normal change-batch bounds still apply to the resulting projection.
+  const record = change.domain === 'ConversationTaskList' || change.domain === 'ConversationExecutionBoundary'
+    ? boundProjectionRecords(toWirePlain(change.record) as Record<string, PlainData>)
+    : boundRecord(toWirePlain(change.record) as Record<string, PlainData>, change.domain);
   if (record.id !== change.id) throw new Error('Committed client upsert record identity mismatch.');
   return { type: change.domain, operation: 'upsert', id: change.id, record };
 }
@@ -2905,9 +2850,6 @@ function planMessageWindowEviction(
     const toolCall = session.materializedRecords.get(toolCallKey);
     if (!toolCall) return { kind: 'snapshot' };
     if (toolCall.status !== 'terminal') return { kind: 'pinned' };
-    if (toolCall.tool_name === 'update_task_list' || toolCall.tool_name === 'submit_plan') {
-      return { kind: 'snapshot' };
-    }
     bundle.add(toolCallKey);
     for (const [key, link] of materializedRecordsMatching(
       session,

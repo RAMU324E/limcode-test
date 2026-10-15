@@ -1,6 +1,6 @@
 import { executeSingleResponseMeasurement } from './singleResponseMeasurement';
 import { readNativePendingWork, readNativeSteeringInFlightSnapshot, readNativeAdmittedProviderCallIds } from './nativeWorkSnapshot';
-import { readCurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
+import { CurrentTurnTaskCardCache } from './currentTurnTaskSnapshot';
 import { assertConversationContextHandleState, assertConversationContextHandleStateUpdate, assertContextRootHandleCatalog } from './conversationContextHandleStateInvariant';
 import { visitForkMessageCopyAssertions, visitForkMessageCopyInserts } from './forkMessageCopy';
 import { captureAnswerPresentation, assertAnswerPresentation, projectAnswerPresentation } from './answerPresentation';
@@ -59,6 +59,8 @@ import {
   projectCompressionBlockRecord,
   projectConversationCommandReceiptRecord,
   projectConversationContextStatusRecord,
+  projectConversationExecutionBoundaryRecord,
+  projectConversationTaskListRecord,
   projectMessageWindowRecord,
   projectProcessRecord,
   projectQueuedTurnIntentRecord,
@@ -280,12 +282,15 @@ async function start(): Promise<void> {
   const writerStatements = attachRuntimeStatementCache(writer);
   const readerStatements = attachRuntimeStatementCache(reader);
   let commitSeq = 0n;
+  let clientNavigation: Map<string, Record<string, unknown>> | undefined;
   let closed = false;
   /** The open maintenance transaction of a maintenance instance (see DatabaseWorkerData.maintenance). */
   let maintenance: MaintenanceTransaction | undefined;
   const contextCasCache = new VerifiedContextCasCache();
   const attachmentScopeCache = new AttachmentProjectionScopeCache();
+  const taskCards = new CurrentTurnTaskCardCache();
   const postCommit = (result: RuntimeCommitResult): void => {
+    taskCards.invalidate(result.changes);
     const changes = attachmentScopeCache.takeProjectionChanges();
     if (changes) result.attachmentProjectionChanges = changes;
     post({ type: 'commit', result });
@@ -316,6 +321,7 @@ async function start(): Promise<void> {
       if (request.kind.startsWith('maintenance')) {
         attachmentScopeCache.clear();
         historyMessageCounts.clear();
+        taskCards.clear();
       }
       if (request.kind === 'maintenanceRepairHistory') {
         assertDatabaseBinding(writer, data.binding);
@@ -429,9 +435,13 @@ async function start(): Promise<void> {
         return;
       }
       if (request.kind === 'currentTurnTaskSnapshot') {
+        const before = String(writer.pragma('data_version', { simple: true }));
         const snapshot = reader.transaction(() => {
           assertDatabaseBinding(reader, data.binding);
-          return readCurrentTurnTaskSnapshot(reader, request.turnId, clientProjectionContent.readVerifiedBytes);
+          const version = String(writer.pragma('data_version', { simple: true }));
+          taskCards.synchronizeExternalVersion(version);
+          // A peer commit during snapshot pinning is read normally but is not retained for reuse.
+          return taskCards.read(reader, request.turnId, clientProjectionContent.readVerifiedBytes, before === version);
         })();
         respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
@@ -564,7 +574,28 @@ async function start(): Promise<void> {
           commitSeq,
           clientProjectionContent
         );
+        // A later session's fresh snapshot must not erase changes still owed to older sessions.
+        clientNavigation ??= new Map((result.snapshot.navigationSummary.conversations as Array<Record<string, unknown>>)
+          .map(record => [String(record.id), record]));
         respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'clientNavigationChanges') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeClientProjectionSnapshot(reader, null, commitSeq, clientProjectionContent);
+        const records = result.snapshot.navigationSummary.conversations as Array<Record<string, unknown>>;
+        const previous = clientNavigation;
+        const stable = previous !== undefined && records.length === previous.size && records.every(record => previous.has(String(record.id)));
+        clientNavigation = new Map(records.map(record => [String(record.id), record]));
+        if (stable) {
+          const changes = records.filter(record => !isDeepStrictEqual(record, previous.get(String(record.id))))
+            .map(record => ({ domain: 'Conversation', kind: 'upsert' as const, id: String(record.id), record }));
+          if (changes.length > 0) {
+            commitSeq += 1n;
+            post({ type: 'commit', result: { commitSeq: commitSeq.toString(), changes, allocatedSequences: [], observedExternal: true } });
+          }
+        }
+        respond({ type: 'response', id: request.id, ok: true, result: stable });
         return;
       }
       if (request.kind === 'clientKeysetPage') {
@@ -628,6 +659,10 @@ async function start(): Promise<void> {
         // Reading it from the writer (rather than the separate reader) therefore excludes every
         // commit made by this RuntimeDatabase worker while still detecting other Extension Hosts.
         const result = BigInt(writer.pragma('data_version', { simple: true }) as number | bigint).toString();
+        if (request.attachmentProjectionChanges !== undefined) {
+          attachmentScopeCache.synchronizeExternal(BigInt(result),
+            request.attachmentProjectionVersion === result ? request.attachmentProjectionChanges : null);
+        }
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
@@ -662,6 +697,7 @@ async function start(): Promise<void> {
       closed = true;
       requestQueue.close();
       attachmentScopeCache.clear();
+      taskCards.clear();
       detachRuntimeStatementCache(reader);
       detachRuntimeStatementCache(writer);
       casByteAccess.close();
@@ -717,6 +753,16 @@ function configureTransactionChangeCapture(database: Database.Database): void {
     }
   }
 
+  const taskOwnersForMessages = (messageIds: string): string => `
+    INSERT INTO runtime_transaction_change (domain, id, kind)
+    SELECT 'ConversationTaskList', turn.conversation_id, 'upsert'
+      FROM tool_call_source_link AS source
+      JOIN tool_call AS call ON call.id = source.tool_call_id
+      JOIN turn ON turn.id = call.turn_id
+     WHERE source.message_id IN (${messageIds})
+       AND call.tool_name IN ('update_task_list', 'submit_plan');
+  `;
+
   // Message 是独立事实，conversation membership/current revision 也是独立 Link。Link 改变时
   // 重新投影 Message 窗口记录；尚未组成完整窗口的 Message 只产生幂等 remove，不阻塞写事务。
   for (const relation of [
@@ -726,12 +772,16 @@ function configureTransactionChangeCapture(database: Database.Database): void {
     for (const operation of ['insert', 'update', 'delete'] as const) {
       const row = operation === 'delete' ? 'OLD' : 'NEW';
       const kind = operation === 'delete' ? 'remove' : 'upsert';
+      const taskChange = relation.table === 'message_part_of_conversation'
+        ? taskOwnersForMessages(operation === 'update' ? 'OLD.message_id, NEW.message_id' : `${row}.message_id`)
+        : '';
       database.exec(`
         CREATE TEMP TRIGGER ${quote(`capture_message_from_${relation.table}_${operation}`)}
         AFTER ${operation.toUpperCase()} ON ${quote(relation.table)}
         BEGIN
           INSERT INTO runtime_transaction_change (domain, id, kind)
           VALUES ('Message', ${row}.${quote(relation.messageColumn)}, '${kind}');
+          ${taskChange}
         END
       `);
     }
@@ -835,6 +885,91 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       END
     `);
   }
+
+  // Task cards are independent of the live transcript window. Capture their committed owner
+  // even when the ordered ToolOutcome writer has not caught up or a fork copied only the result.
+  for (const table of ['operation', 'tool_outcome', 'tool_result_artifact', 'tool_call_source_link'] as const) {
+    for (const operation of ['insert', 'update', 'delete'] as const) {
+      const row = operation === 'delete' ? 'OLD' : 'NEW';
+      const relevant = table === 'operation' || table === 'tool_outcome'
+        ? `${row}.status = 'succeeded'`
+        : table === 'tool_result_artifact' ? `${row}.role = 'no_effect_result'` : '1';
+      database.exec(`
+        CREATE TEMP TRIGGER ${quote(`capture_task_list_from_${table}_${operation}`)}
+        AFTER ${operation.toUpperCase()} ON ${quote(table)}
+        WHEN ${relevant}
+        BEGIN
+          INSERT INTO runtime_transaction_change (domain, id, kind)
+          SELECT 'ConversationTaskList', turn.conversation_id, 'upsert'
+            FROM tool_call AS call
+            JOIN turn ON turn.id = call.turn_id
+           WHERE call.id = ${row}.tool_call_id
+             AND call.tool_name IN ('update_task_list', 'submit_plan')
+             ${table === 'tool_result_artifact' ? '' : `AND EXISTS (SELECT 1 FROM tool_result_artifact
+               WHERE tool_call_id = call.id AND role = 'no_effect_result')`};
+        END
+      `);
+    }
+  }
+  database.exec(`
+    CREATE TEMP TRIGGER capture_task_list_from_message_visibility
+    AFTER UPDATE OF deleted_at ON message
+    WHEN OLD.deleted_at IS NOT NEW.deleted_at
+    BEGIN ${taskOwnersForMessages('NEW.id')} END;
+
+    CREATE TEMP TRIGGER capture_task_list_from_call_delete
+    AFTER DELETE ON tool_call
+    WHEN OLD.tool_name IN ('update_task_list', 'submit_plan')
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      SELECT 'ConversationTaskList', conversation_id, 'upsert' FROM turn WHERE id = OLD.turn_id;
+    END;
+
+    CREATE TEMP TRIGGER capture_task_list_from_turn_delete
+    AFTER DELETE ON turn
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      VALUES ('ConversationTaskList', OLD.conversation_id, 'upsert');
+    END;
+  `);
+
+  // Only an active-generation transition changes these frozen display fields. Ordinary Turn
+  // heartbeats and tool/model stream commits do not re-read authority documents.
+  for (const operation of ['insert', 'update', 'delete'] as const) {
+    const row = operation === 'delete' ? 'OLD' : 'NEW';
+    const relevant = operation === 'update'
+      ? "OLD.status <> NEW.status AND (OLD.status = 'active' OR NEW.status = 'active')"
+      : `${row}.status = 'active'`;
+    database.exec(`
+      CREATE TEMP TRIGGER ${quote(`capture_execution_boundary_from_turn_${operation}`)}
+      AFTER ${operation.toUpperCase()} ON turn
+      WHEN ${relevant}
+      BEGIN
+        INSERT INTO runtime_transaction_change (domain, id, kind)
+        VALUES ('ConversationExecutionBoundary', ${row}.conversation_id, 'upsert');
+      END
+    `);
+  }
+  database.exec(`
+    CREATE TEMP TRIGGER capture_execution_boundary_from_authority
+    AFTER INSERT ON authority_snapshot
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      SELECT 'ConversationExecutionBoundary', conversation_id, 'upsert'
+        FROM turn WHERE id = NEW.turn_id AND status = 'active';
+    END
+  `);
+  for (const operation of ['insert', 'update'] as const) {
+    database.exec(`
+      CREATE TEMP TRIGGER ${quote(`capture_execution_boundary_from_child_turn_${operation}`)}
+      AFTER ${operation.toUpperCase()} ON child_execution_turn_link
+      BEGIN
+        INSERT INTO runtime_transaction_change (domain, id, kind)
+        SELECT 'ConversationExecutionBoundary', child_conversation_id, 'upsert'
+          FROM child_execution WHERE id = NEW.child_execution_id;
+      END
+    `);
+  }
 }
 
 function readInternalChangedDomains(database: Database.Database): string[] {
@@ -858,8 +993,18 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
   topology.set('ConversationContextStatus', topology.size);
   topology.set('ConversationCommandReceipt', topology.size);
   topology.set('ChildExecutionActivity', topology.size);
+  topology.set('ConversationTaskList', topology.size);
+  topology.set('ConversationExecutionBoundary', topology.size);
   return rows
     .map((row) => {
+      if (row.domain === 'ConversationTaskList' || row.domain === 'ConversationExecutionBoundary') {
+        if (!prepareCached(database, 'SELECT 1 FROM conversation WHERE id = ?').get(row.id)) {
+          return { ...row, kind: 'remove' as const };
+        }
+        return { ...row, record: row.domain === 'ConversationTaskList'
+          ? projectConversationTaskListRecord(database, row.id, clientProjectionContent)
+          : projectConversationExecutionBoundaryRecord(database, row.id, clientProjectionContent) };
+      }
       if (row.domain === 'ChildExecutionActivity') {
         if (row.kind === 'remove') return { ...row };
         const record = projectChildExecutionActivityRecord(database, row.id, clientProjectionContent);

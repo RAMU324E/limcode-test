@@ -260,6 +260,7 @@ test('snapshot byte trimming removes oldest collaboration causal bundle and pres
   const sent = [];
   const feed = new kernel.BoundedClientFeed({ binding: database.binding, hostBootId: 'trim-host',
     async externalDataVersion() { return '1'; },
+    async externalClientChanges() { return []; }, resetExternalClientChanges() {},
     async clientProjectionSnapshotAndSubscribe(_id, listener) { commit = listener; return { barrier: { snapshotCommitSeq: '1', snapshot: projection }, unsubscribe() {} }; } });
   try {
     const connection = await feed.connect({ activeConversationId: 'trim-self', send: (value) => sent.push(value) });

@@ -539,6 +539,9 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'CompressionBlock',
   /** Derived bounded view; not a persisted Runtime domain or schema-manifest entry. */
   'ConversationContextStatus',
+  /** Independent Conversation display fields; neither is a persisted Runtime domain. */
+  'ConversationTaskList',
+  'ConversationExecutionBoundary',
   /** Conversation-scoped durable acknowledgement; CommandReceipt itself remains client=none. */
   'ConversationCommandReceipt',
   'ChildExecution',
@@ -633,6 +636,7 @@ export function applyReliableKernelDataMessage(
     if (BigInt(commitSeq) <= priorCommitSeq) return requireSnapshot(current, 'commit-order');
     if (!Array.isArray(message.changes)) throw new TypeError('changes.changes must be an array.');
     const nextRecords: ReliableKernelBoundedClientState['records'] = { ...current.records };
+    let nextProjections = current.projections;
     const copiedTypes = new Set<string>();
     for (const change of message.changes) {
       if (!change || typeof change !== 'object' || Array.isArray(change)) throw new TypeError('Client change is invalid.');
@@ -642,6 +646,27 @@ export function applyReliableKernelDataMessage(
       const id = requireId(change.id, 'change.id');
       if (change.operation !== 'upsert' && change.operation !== 'remove') {
         throw new TypeError('Client change operation is invalid.');
+      }
+      if (change.type === 'ConversationTaskList' || change.type === 'ConversationExecutionBoundary') {
+        const window = nextProjections.activeConversationWindow;
+        if (!window || typeof window !== 'object' || Array.isArray(window) || window.conversationId !== id) {
+          throw new TypeError('Conversation display change does not belong to the active window.');
+        }
+        const record = change.record;
+        if (change.operation === 'upsert' && (!record || record.id !== id || record.conversation_id !== id)) {
+          throw new TypeError('Conversation display change identity is invalid.');
+        }
+        const fields = change.type === 'ConversationTaskList'
+          ? ['currentTaskList'] : ['activeTurnWorkEnvironment', 'childConversationBoundary'];
+        const updatedWindow = { ...window };
+        for (const field of fields) {
+          if (change.operation === 'upsert' && (!record || !(field in record))) {
+            throw new TypeError(`Conversation display change has no ${field}.`);
+          }
+          updatedWindow[field] = change.operation === 'remove' ? null : record![field];
+        }
+        nextProjections = { ...nextProjections, activeConversationWindow: updatedWindow };
+        continue;
       }
       if (!copiedTypes.has(change.type)) {
         nextRecords[change.type] = { ...(nextRecords[change.type] ?? {}) };
@@ -664,6 +689,7 @@ export function applyReliableKernelDataMessage(
       ...current,
       lastMessageSeq: messageSeq,
       lastCommitSeq: commitSeq,
+      projections: nextProjections,
       records: nextRecords,
       snapshotRequired: false
     };

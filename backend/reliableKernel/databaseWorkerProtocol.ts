@@ -3,7 +3,7 @@ import type { NativePendingWorkInput, NativePendingToolCall, NativeSteeringInFli
 import type { CurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
 import type { AttachmentScopeCacheCounters } from './attachmentProjectionScopeCache';
 import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
-import type { RootBinding, RuntimeCommitResult, SnapshotBarrier } from './contracts';
+import type { AttachmentProjectionChanges, RootBinding, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type {
   DomainRow,
   RepositoryInsertMutation,
@@ -373,7 +373,8 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'clientVisibleMessageHistoryPage'; input: ClientVisibleMessageHistoryPageInput }
   | { kind: 'clientCollaborationHistoryPage'; input: ClientCollaborationHistoryPageInput }
   | { kind: 'conversationHistoryProjection'; input: ConversationHistoryProjectionInput }
-  | { kind: 'externalDataVersion' }
+  | { kind: 'externalDataVersion'; attachmentProjectionVersion?: string; attachmentProjectionChanges?: AttachmentProjectionChanges[] | null }
+  | { kind: 'clientNavigationChanges' }
   /** Rows over every Runtime domain table, counted in one read transaction of the reader connection. */
   | { kind: 'countDomainRows' }
   /** Consistent SQLite Backup API copy of the live database into its own control root. */
