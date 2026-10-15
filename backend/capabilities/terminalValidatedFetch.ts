@@ -88,8 +88,8 @@ export function createTerminalValidatedFetch(
             tracker?.push(next.value);
             controller.enqueue(next.value);
             if (tracker?.canCloseBody && (expectedBytes === undefined || receivedBytes === expectedBytes)) {
-              // Gemini's final candidate and usage complete the response even when a gateway
-              // keeps the HTTP body open. Forward every byte already read, including tail frames.
+              // A complete provider terminal ends the response even when a gateway keeps the
+              // HTTP body open. Forward every byte already read, including tail frames.
               closed = true;
               controller.close();
               observation?.end('provider_terminal');
@@ -182,6 +182,7 @@ class SseTerminalTracker {
   private buffer = '';
   private currentEvent = '';
   private dataLines: string[] = [];
+  private sawProtocolEnd = false;
   private sawGeminiFinishReason = false;
   private sawGeminiFinalUsage = false;
   public sawTerminal = false;
@@ -194,7 +195,8 @@ class SseTerminalTracker {
   public get canCloseBody(): boolean {
     // A chunk may also contain the beginning of a later signature/tool/usage event.
     // Finish that SSE event before closing instead of passing a partial tail to the decoder.
-    return this.sawGeminiFinalUsage && !this.buffer && !this.currentEvent && !this.dataLines.length;
+    return (this.sawProtocolEnd || this.sawGeminiFinalUsage)
+      && !this.buffer && !this.currentEvent && !this.dataLines.length;
   }
 
   public push(bytes: Uint8Array): void {
@@ -246,10 +248,15 @@ class SseTerminalTracker {
     }
     // Named terminal events still carry status/usage needed by the empty-output guard.
     // Do not skip their JSON payload merely because the event name proves stream completion.
-    if (terminalEventName(event, this.provider)) this.sawTerminal = true;
+    if (terminalEventName(event, this.provider)) {
+      this.sawTerminal = true;
+      this.sawProtocolEnd = true;
+    }
     if (!data) return;
     try {
       const value = JSON.parse(data);
+      const type = terminalRecord(value)?.type;
+      if (typeof type === 'string' && terminalEventName(type, this.provider)) this.sawProtocolEnd = true;
       if (this.provider === 'gemini') {
         const record = terminalRecord(value);
         // The Gemini decoder consumes candidates[0]. Usage from an earlier generation

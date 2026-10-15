@@ -415,6 +415,61 @@ for (const separateUsage of [false, true]) {
   });
 }
 
+for (const provider of ['claude', 'openai-responses']) {
+  test(`${provider} 正式终态后保留最终用量并完成，不等待 HTTP EOF`, async () => {
+    const config = settings(provider);
+    const frame = value => `data: ${JSON.stringify(value)}\n\n`;
+    const item = { id: 'terminal-message', type: 'message', role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text: 'offline probe', annotations: [] }] };
+    const response = { id: 'terminal-response', object: 'response', status: 'completed', output: [item],
+      usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } };
+    const claude = provider === 'claude' ? await claudeSse([{ text: 'offline probe' }]).text() : '';
+    const prefix = provider === 'claude' ? claude.slice(0, claude.indexOf('event: message_stop'))
+      : frame({ type: 'response.created', response: { id: response.id, status: 'in_progress', output: [] } })
+        + frame({ type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'offline probe' })
+        + frame({ type: 'response.output_item.done', output_index: 0, item });
+    const terminal = provider === 'claude'
+      ? frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } })
+        + 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      : frame({ type: 'response.completed', response });
+    const encode = value => new TextEncoder().encode(value);
+    let controller, cancelled = false, timer, pending, sawOutput;
+    const outputReceived = new Promise(resolve => { sawOutput = resolve; });
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${provider} 正式终态后仍在等待 HTTP EOF`)), 1000);
+    });
+    await withFetch(() => new Response(new ReadableStream({
+      start(value) { controller = value; value.enqueue(encode(prefix)); },
+      cancel() { cancelled = true; return new Promise(() => {}); }
+    }), { headers: { 'content-type': 'text/event-stream' } }), async calls => {
+      const events = [];
+      pending = llm.startLlmProvider(startRequest(), event => {
+        events.push(event);
+        if (event.type === 'llm:delta') sawOutput();
+      }, { settings: async () => config });
+      try {
+        await Promise.race([outputReceived, deadline]);
+        // Claude message_delta and a completed output item still have protocol tail to read.
+        assert.equal(cancelled, false);
+        assert.equal(events.some(event => event.type === 'llm:done'), false);
+        controller.enqueue(encode(terminal));
+        await Promise.race([pending, deadline]);
+        assert.equal(calls.length, 1);
+        assert.equal(cancelled, true);
+        assert.equal(events.some(event => event.type === 'llm:error'), false);
+        const done = events.filter(event => event.type === 'llm:done');
+        assert.equal(done.length, 1);
+        assert.equal(done[0].payload.usageMetadata.promptTokenCount, 5);
+        assert.equal(done[0].payload.usageMetadata.candidatesTokenCount, provider === 'claude' ? 7 : 3);
+      } finally {
+        clearTimeout(timer);
+        if (!cancelled) controller.close();
+        await pending;
+      }
+    });
+  });
+}
+
 test('Responses 推理耗尽输出预算的 incomplete 是失败，工具与正文不丢失原格式', async () => {
   const config = settings('openai-responses', { generationConfig: { maxOutputTokens: 256 } });
   await withFetch(entry => { assertOutgoing(config, entry.body); return sse([
