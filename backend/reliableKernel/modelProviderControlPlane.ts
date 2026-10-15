@@ -301,7 +301,9 @@ export interface FullRequestProviderAdapter {
   /** Optional cooperative ordinary preparation; synchronous callers keep their existing API. */
   estimateFullRequestInputAsync?(request: FullProviderRequest, controls?: ModelProjectionWorkControls): Promise<ProjectedRequestTokenBreakdown>;
   /** One attempt's projected payload supplies both preflight and the actual send. */
-  prepareFullRequest?(request: FullProviderRequest): PreparedProviderRequest | undefined;
+  prepareFullRequest?(request: FullProviderRequest, prepared?: PreparedProviderRequest): PreparedProviderRequest | undefined;
+  /** Request-local ordinary projection shared by planning and the first dispatch. */
+  prepareFullRequestAsync?(request: FullProviderRequest, controls?: ModelProjectionWorkControls): Promise<PreparedProviderRequest | undefined>;
   sendFullRequestAsync?(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
   sendFullRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
   /**
@@ -334,6 +336,7 @@ export interface PreparedOrdinaryRequestContext {
     root: DomainRow;
     segments: ContextSegmentMetadata[];
     context: FullProviderRequest['context'];
+    providerRequest?: PreparedProviderRequest;
   };
 }
 
@@ -1104,6 +1107,13 @@ export class ModelProviderControlPlane {
     return prepared;
   }
 
+  public preparedContextForEstimation(prepared?: PreparedOrdinaryRequestContext) {
+    if (!prepared?.value) return undefined;
+    const value = this.ordinaryRequestContext(String(prepared.value.root.id), prepared)!;
+    return { root: value.root, segments: value.segments.map((segment, index) =>
+      ({ ...segment, content: value.context[index]!.content })) };
+  }
+
   private ordinaryRequestContext(rootId: string, prepared?: PreparedOrdinaryRequestContext) {
     if (!prepared?.value) return undefined;
     if (!this.preparedContexts.has(prepared) || prepared.value.root.id !== rootId) {
@@ -1190,7 +1200,8 @@ export class ModelProviderControlPlane {
   public async planFullRequestAsync(
     fullRequest: FullProviderRequest,
     adapter: FullRequestProviderAdapter,
-    controls: ModelProjectionWorkControls = {}
+    controls: ModelProjectionWorkControls = {},
+    preparedContext?: PreparedOrdinaryRequestContext
   ): Promise<FullRequestPlanningBudget> {
     if (adapter.providerId !== fullRequest.providerId) {
       throw providerConflict('Request preview adapter does not match its frozen provider.');
@@ -1199,15 +1210,17 @@ export class ModelProviderControlPlane {
       ? frozenCompressionPolicy(fullRequest.authoritySnapshot)
       : undefined;
     const context = frozenContextProfile(fullRequest.authoritySnapshot);
-    const breakdown = adapter.estimateFullRequestInputAsync
-      ? await adapter.estimateFullRequestInputAsync(fullRequest, {
-          ...controls,
-          checkpoint: async () => {
-            this.assertNotHandingOff(); await controls.checkpoint?.(); this.assertNotHandingOff();
-          }
-        })
+    const workControls = { ...controls, checkpoint: async () => {
+      this.assertNotHandingOff(); await controls.checkpoint?.(); this.assertNotHandingOff();
+    } };
+    const shared = preparedContext?.value;
+    const prepared = !compression && shared && adapter.prepareFullRequestAsync
+      ? await adapter.prepareFullRequestAsync(fullRequest, workControls) : undefined;
+    if (prepared && shared) shared.providerRequest = prepared;
+    const breakdown = prepared?.breakdown ?? (adapter.estimateFullRequestInputAsync
+      ? await adapter.estimateFullRequestInputAsync(fullRequest, workControls)
       : adapter.estimateFullRequestInput?.(fullRequest)
-        ?? fallbackRequestBreakdown(estimateFullProviderContextFallback(fullRequest));
+        ?? fallbackRequestBreakdown(estimateFullProviderContextFallback(fullRequest)));
     return calculateFullRequestPlanningBudget({
       contextWindowTokens: compression?.provider.contextWindowTokens ?? context.contextWindowTokens,
       maxOutputTokens: compression?.provider.maxOutputTokens
@@ -1828,9 +1841,10 @@ export class ModelProviderControlPlane {
       return this.buildFullRequest(modelRequestId, attemptSeq, socketGeneration, recipeRead.recipe, recipeRead.context);
     }, { signal });
     // Neither the awaiting Agent loop nor this dispatch's retry state retains the first body.
+    const preparedProjection = recipeRead.context?.value?.providerRequest;
     if (recipeRead.context) recipeRead.context.value = undefined;
     if (repairOutput) fullRequest.modelOutputRepair = true;
-    const projectedRequest = adapter.prepareFullRequest?.(fullRequest);
+    const projectedRequest = adapter.prepareFullRequest?.(fullRequest, preparedProjection);
     this.assertRequestPreflight(request, fullRequest, adapter, projectedRequest?.breakdown);
     // The first Attempt owns the frozen retry policy, as before. A reconnect/retry must not
     // acquire a second policy authority just because its request body is rebuilt.

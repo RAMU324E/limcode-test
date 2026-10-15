@@ -85,6 +85,15 @@ interface ObservedPrefixAnchor {
   totalTokens?: number;
 }
 
+type ContextTokenEstimateSegment = Omit<MaterializedContextSegment, 'content'> & { content: Buffer | string };
+export type ContextTokenEstimateSource = Pick<MaterializedContext, 'root'> & {
+  segments: ContextTokenEstimateSegment[];
+};
+
+function estimateSegmentText(segment: ContextTokenEstimateSegment): string {
+  return typeof segment.content === 'string' ? segment.content : segment.content.toString('utf8');
+}
+
 /**
  * Provider-aligned Context accounting.
  *
@@ -107,9 +116,10 @@ export class ReliableContextTokenEstimator {
     this.attachmentHandles = new ConversationAttachmentHandleRegistry(database, { contentStore });
   }
 
-  public async estimateRoot(rootIdInput: string): Promise<ReliableContextTokenEstimate> {
+  public async estimateRoot(rootIdInput: string, prepared?: ContextTokenEstimateSource): Promise<ReliableContextTokenEstimate> {
     const rootId = requireId(rootIdInput, 'rootId');
-    const materialized = await this.context.materialize(rootId);
+    if (prepared && prepared.root.id !== rootId) throw new Error('Prepared token estimate differs from the selected Context root.');
+    const materialized = prepared ?? await this.context.materialize(rootId);
     return (await this.estimateMaterializedRoot(materialized)).full;
   }
 
@@ -123,7 +133,7 @@ export class ReliableContextTokenEstimator {
 
   /** Context bytes and attachment facts are shared only within this public estimator call. */
   private async estimateMaterializedRoot(
-    materialized: MaterializedContext,
+    materialized: ContextTokenEstimateSource,
     requestedPrefix = materialized.segments.length
   ): Promise<{ full: ReliableContextTokenEstimate; prefixTokens: number }> {
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
@@ -173,7 +183,7 @@ export class ReliableContextTokenEstimator {
 
   private estimateObservedPrefix(
     conversationId: string,
-    current: readonly MaterializedContextSegment[],
+    current: readonly ContextTokenEstimateSegment[],
     currentProjected: number,
     anchor: ObservedPrefixAnchor,
     attachments: PreparedAttachmentCatalogProjection,
@@ -209,7 +219,7 @@ export class ReliableContextTokenEstimator {
 
   private async findObservedPrefix(
     conversationId: string,
-    current: readonly MaterializedContextSegment[]
+    current: readonly ContextTokenEstimateSegment[]
   ): Promise<ObservedPrefixAnchor | null> {
     const turns = (await listAllDomainRows(this.database, 'Turn', {
       conversation_id: conversationId
@@ -307,7 +317,7 @@ export class ReliableContextTokenEstimator {
 }
 
 export function estimateMaterializedContextTokens(
-  segments: readonly MaterializedContextSegment[],
+  segments: readonly ContextTokenEstimateSegment[],
   attachmentCatalogState: AttachmentCatalogState | unknown = { catalog: [], placements: [] },
   modelHandleCatalog: ModelHandleCatalog | unknown = { entries: [] }
 ): number {
@@ -316,7 +326,7 @@ export function estimateMaterializedContextTokens(
     segmentKind: segment.segmentKind,
     messageRole: segment.messageRole,
     contentType: segment.contentObject.content_type,
-    content: segment.content.toString('utf8')
+    content: estimateSegmentText(segment)
   })), attachmentCatalogState, modelHandleCatalog);
   const compressed = compressionEstimate(segments);
   if (compressed === undefined || segments.length === 0) return projected.tokenCount;
@@ -325,7 +335,7 @@ export function estimateMaterializedContextTokens(
     segmentKind: segments[0].segmentKind,
     messageRole: segments[0].messageRole,
     contentType: segments[0].contentObject.content_type,
-    content: segments[0].content.toString('utf8')
+    content: estimateSegmentText(segments[0])
   }]).tokenCount;
   // A stored estimate may count rendered state the projection does not, but it never undercuts what
   // the block's contents measure: blocks written before Claude compaction text was counted stored
@@ -466,10 +476,10 @@ export function hasUnsizedOpaqueCompaction(segments: readonly MaterializedContex
     && optionalTokenCount(envelope.providerOutputTokens) === undefined;
 }
 
-function compressionEstimate(segments: readonly MaterializedContextSegment[]): number | undefined {
+function compressionEstimate(segments: readonly ContextTokenEstimateSegment[]): number | undefined {
   const first = segments[0];
   if (!first || first.segmentKind !== 'compression') return undefined;
-  const envelope = parseRecord(first.content.toString('utf8'));
+  const envelope = parseRecord(estimateSegmentText(first));
   const stored = optionalTokenCount(envelope?.estimatedTokens);
   if (!envelope || stored === undefined) return stored;
   return envelope.kind === 'compression_contents' ? Math.max(stored, compressionEnvelopeResultTokens(envelope)) : stored;
@@ -515,7 +525,7 @@ function providerToolAllowed(
 
 function isSegmentPrefix(
   prefix: readonly StructuralContextRecord[],
-  complete: readonly MaterializedContextSegment[]
+  complete: readonly ContextTokenEstimateSegment[]
 ): boolean {
   return prefix.length <= complete.length && prefix.every((record, index) =>
     requireId(record.segment.id, 'ContextSegment.id') === complete[index]?.segmentId

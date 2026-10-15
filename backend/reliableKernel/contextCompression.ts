@@ -19,6 +19,7 @@ import {
   estimateMaterializedContextTokens,
   estimateMessageContentsTokens,
   ReliableContextTokenEstimator,
+  type ContextTokenEstimateSource,
   type ReliableContextTokenEstimateSource
 } from './contextTokenEstimator';
 import { MAX_PROVIDER_TOKEN_CALIBRATION_RATIO } from './modelFacingContextProjection';
@@ -175,7 +176,7 @@ export class ContextCompressionControlPlane {
   }
 
   public async evaluate(rootIdInput: string, authoritySnapshotIdInput: string, settingsSnapshotContentObjectId?: string,
-    preparedAuthority?: FrozenTurnAuthority): Promise<CompressionDecision> {
+    preparedAuthority?: FrozenTurnAuthority, preparedContext?: ContextTokenEstimateSource): Promise<CompressionDecision> {
     const rootId = requireId(rootIdInput, 'rootId');
     const authoritySnapshotId = requireId(authoritySnapshotIdInput, 'authoritySnapshotId');
     if (preparedAuthority && preparedAuthority.snapshot.id !== authoritySnapshotId) {
@@ -186,7 +187,7 @@ export class ContextCompressionControlPlane {
       preparedAuthority ? {
         profile: frozenContextProfile(preparedAuthority.document), conversationId: preparedAuthority.conversationId
       } : this.readFrozenProfile(authoritySnapshotId, settingsSnapshotContentObjectId),
-      this.tokenEstimator.estimateRoot(rootId)
+      this.tokenEstimator.estimateRoot(rootId, preparedContext)
     ]);
     if (frozen.conversationId !== estimate.conversationId) {
       throw new Error('AuthoritySnapshot belongs to another Conversation.');

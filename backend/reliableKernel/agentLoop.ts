@@ -685,6 +685,7 @@ export class ReliableAgentLoop {
               headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
               trigger: 'auto', requestBudget: planningBudget,
               beforeSourceMaterialization: () => { if (preparedContext) preparedContext.value = undefined; },
+              preparedContext: () => this.modelProvider.preparedContextForEstimation(preparedContext),
               protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
               modelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, frozenRecipe),
               tools: toolDefinitions
@@ -1193,7 +1194,7 @@ export class ReliableAgentLoop {
               error.name = 'AbortError'; throw error;
             }
           }
-        })
+        }, preparedContext)
       : this.modelProvider.planFullRequest(preview, adapter);
     const compression = asRecord(preview.authoritySnapshot)?.compression;
     return {
@@ -2679,8 +2680,8 @@ export class ReliableAgentLoop {
     const wrapped: FullRequestProviderAdapter = {
       providerId,
       ...(adapter.prepareFullRequest ? {
-        prepareFullRequest: (fullRequest) => {
-          const prepared = adapter.prepareFullRequest!(fullRequest);
+        prepareFullRequest: (fullRequest, projection) => {
+          const prepared = adapter.prepareFullRequest!(fullRequest, projection);
           if (!prepared) return undefined;
           const { attemptSeq, socketGeneration } = fullRequest;
           return { breakdown: prepared.breakdown, send: (controls) => {
