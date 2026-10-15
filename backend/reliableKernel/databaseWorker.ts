@@ -45,6 +45,7 @@ import { readSelectedContextAuthoritySource } from './selectedContextAuthoritySo
 import { executeRuntimeContentUsage } from './runtimeContentUsage';
 import { inventoryRelocatedWork } from './relocatedWorkInventory';
 import {
+  ConversationHistoryMessageCounts,
   deriveCommittedParentHandling,
   executeClientCollaborationHistoryPage,
   executeClientKeysetPage,
@@ -234,6 +235,7 @@ let measuringRequest: RequestMeasurement | undefined;
 const port = requireParentPort();
 const data = workerData as DatabaseWorkerData;
 const casByteAccess = new RuntimeSynchronousCasByteAccess(data.binding);
+let historyMessageCounts: ConversationHistoryMessageCounts;
 
 /**
  * Bounded verified-CAS read capability handed to the client projection module. The worker keeps
@@ -288,6 +290,7 @@ async function start(): Promise<void> {
     if (changes) result.attachmentProjectionChanges = changes;
     post({ type: 'commit', result });
   };
+  historyMessageCounts = new ConversationHistoryMessageCounts(writer);
   const conversationRuntimeWork = createConversationRuntimeWorkProbe(reader);
 
   post({ type: 'ready', workerThreadId: threadId, mode: data.mode });
@@ -310,7 +313,10 @@ async function start(): Promise<void> {
         throw new Error('Maintenance transactions run only on a Runtime database opened for maintenance.');
       }
       // Maintenance/raw repair never shares reusable read proofs, including rollback paths.
-      if (request.kind.startsWith('maintenance')) attachmentScopeCache.clear();
+      if (request.kind.startsWith('maintenance')) {
+        attachmentScopeCache.clear();
+        historyMessageCounts.clear();
+      }
       if (request.kind === 'maintenanceRepairHistory') {
         assertDatabaseBinding(writer, data.binding);
         const result = committedDurably(writer, () => repairHistoryTransaction(writer, request.input));
@@ -581,7 +587,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'conversationHistoryProjection') {
         assertDatabaseBinding(reader, data.binding);
-        const result = executeConversationHistoryProjection(reader, request.input);
+        const result = executeConversationHistoryProjection(reader, request.input, historyMessageCounts);
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
@@ -1909,6 +1915,7 @@ function executeMutation(
 
   // Removing proofs before SQL is safe even when the transaction/savepoint rolls back.
   // Inserts use their final encoded segment identity below.
+  historyMessageCounts.beforeMutation(mutation);
   if (mutation.kind !== 'insert') attachmentScopeCache.beforeMutation(mutation);
   if (mutation.kind === 'pruneModelStreamCheckpoints') {
     executeCheckpointPrune(database, mutation);

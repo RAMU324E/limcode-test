@@ -57,7 +57,7 @@ import type {
   ConversationHistoryProjectionResult
 } from './databaseWorkerProtocol';
 import { answerSubmissionClientOutcome } from './answerSubmissionOutcome';
-import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryMutation } from './repositories';
 import { quote, requireNonNegativeIntegerString, requireRuntimeId } from './runtimeSqlRows';
 import { prepareCached, prepareUncached } from './runtimeStatementCache';
 
@@ -1639,9 +1639,77 @@ export const CONVERSATION_HISTORY_EXACT_OFFSET_ROWS = 10_000;
  * the current last page inside the same read transaction, so a page emptied by deletions resolves
  * to the nearest existing page in one bounded read instead of a client-driven retry loop.
  */
+/** Worker-local counts; status writes never discard already counted message history. */
+export class ConversationHistoryMessageCounts {
+  private readonly counts = new Map<string, bigint>();
+  private externalVersion: bigint | undefined;
+
+  public constructor(private readonly writer: Database.Database) {}
+
+  public dataVersion(): bigint { return BigInt(this.writer.pragma('data_version', { simple: true }) as number | bigint); }
+
+  public synchronizeSnapshot(before: bigint, after: bigint): boolean {
+    if (before !== after || this.externalVersion !== after) this.clear();
+    this.externalVersion = before === after ? after : undefined;
+    return before === after;
+  }
+
+  public clear(): void { this.counts.clear(); }
+
+  /** Generic writer boundary also covers imported rows; rollback only costs a fresh count. */
+  public beforeMutation(mutation: RepositoryMutation): void {
+    if (this.counts.size === 0) return;
+    if (mutation.domain === 'Conversation' && mutation.kind === 'insert') {
+      this.counts.delete(String(mutation.row.id));
+    } else if (mutation.domain === 'Conversation' && mutation.kind === 'delete') {
+      this.counts.delete(mutation.id);
+    } else if (mutation.domain === 'MessagePartOfConversation' && mutation.kind === 'insert') {
+      this.counts.delete(String(mutation.row.conversation_id));
+    } else {
+      let messageId: unknown;
+      if (mutation.domain === 'Message' && mutation.kind === 'update' && 'deleted_at' in mutation.patch) {
+        messageId = mutation.id;
+      } else if (mutation.domain === 'MessageCurrentRevisionLink' && mutation.kind === 'insert') {
+        messageId = mutation.row.message_id;
+      } else if (mutation.domain === 'MessageCurrentRevisionLink' && mutation.kind === 'update'
+        && 'revision_id' in mutation.patch) {
+        if ('message_id' in mutation.patch) { this.clear(); return; }
+        const row = prepareCached(this.writer, `
+          SELECT current.message_id, previous.role AS old_role, next.role AS next_role
+            FROM message_current_revision_link AS current
+            JOIN message_revision AS previous ON previous.id = current.revision_id
+            JOIN message_revision AS next ON next.id = ?
+           WHERE current.id = ?
+        `).get(mutation.patch.revision_id, mutation.id) as DomainRow | undefined;
+        // Edits and native streaming revisions normally retain the same visible message count.
+        if (row && ['user', 'model'].includes(String(row.old_role)) === ['user', 'model'].includes(String(row.next_role))) return;
+        messageId = row?.message_id;
+      }
+      if (typeof messageId === 'string') {
+        const membership = prepareCached(this.writer, 'SELECT conversation_id FROM message_part_of_conversation WHERE message_id = ?')
+          .get(messageId) as DomainRow | undefined;
+        if (membership) this.counts.delete(String(membership.conversation_id));
+      }
+    }
+  }
+
+  public get(id: string): bigint | undefined {
+    const count = this.counts.get(id);
+    if (count !== undefined) { this.counts.delete(id); this.counts.set(id, count); }
+    return count;
+  }
+
+  public set(id: string, count: bigint): void {
+    this.counts.delete(id);
+    this.counts.set(id, count);
+    if (this.counts.size > 512) this.counts.delete(this.counts.keys().next().value!);
+  }
+}
+
 export function executeConversationHistoryProjection(
   database: Database.Database,
-  input: ConversationHistoryProjectionInput
+  input: ConversationHistoryProjectionInput,
+  messageCountCache?: ConversationHistoryMessageCounts
 ): ConversationHistoryProjectionResult {
   if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) {
     throw new RangeError(`Conversation history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
@@ -1662,8 +1730,13 @@ export function executeConversationHistoryProjection(
   const scope = conversationHistoryScopeSql(input, 'conversation');
   database.exec('BEGIN');
   try {
+    const before = messageCountCache?.dataVersion();
     const totalQuery = conversationHistoryTotalQuery(input);
     const totalRow = prepareCached(database, totalQuery.sql).get(totalQuery.params) as { total: bigint };
+    // The total query establishes the reader snapshot. Local writes invalidate at their mutation
+    // boundary; the writer's data_version changes only for commits from other connections.
+    const counts = messageCountCache?.synchronizeSnapshot(before!, messageCountCache.dataVersion())
+      ? messageCountCache : undefined;
     const page = conversationHistoryPageSeed(database, scope, input, Number(totalRow.total));
     const { seedRows, hasMore } = page;
     const seedIds = seedRows.map((row) => String(row.id));
@@ -1707,7 +1780,23 @@ export function executeConversationHistoryProjection(
       'id',
       conversationProjectLinks.map((row) => String(row.project_context_id))
     );
-    const messageSummaries = queryConversationMessageSummaries(database, conversationIds);
+    const availableCounts = new Map<string, bigint>();
+    for (const id of conversationIds) {
+      const count = counts?.get(id);
+      if (count !== undefined) availableCounts.set(id, count);
+    }
+    const missingCounts = conversationIds.filter(id => !availableCounts.has(id));
+    const freshSummaries = missingCounts.length > 0 ? queryConversationMessageSummaries(database, missingCounts) : [];
+    const freshCounts = new Map(freshSummaries.map(row => [String(row.conversation_id), BigInt(String(row.message_count))]));
+    for (const id of missingCounts) {
+      const count = freshCounts.get(id) ?? 0n;
+      availableCounts.set(id, count);
+      counts?.set(id, count);
+    }
+    const messageSummaries = counts ? conversationIds.flatMap(id => {
+      const count = availableCounts.get(id)!;
+      return count > 0n ? [{ conversation_id: id, message_count: count }] : [];
+    }) : freshSummaries;
     const latestVisible = queryLatestVisibleRevisions(database, conversationIds);
     const firstUser = queryFirstUserRevisions(database, conversationIds);
     const targetRevisionIds = [...new Set([
