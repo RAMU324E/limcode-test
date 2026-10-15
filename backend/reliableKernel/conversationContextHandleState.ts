@@ -118,8 +118,8 @@ export async function prepareContextHandleHeadTransition(input: {
   previousRootId: string | null; nextRootId: string; mode: 'append' | 'rewrite' | 'activate'; now: string;
   baseRootId?: string | null; activate?: boolean;
   rootShape?: ContextHandleRootShape;
-  /** Original chain tip before truncation, including the compressed source tip when no tail remains. */
-  compressedPrefixNodeId?: string | null;
+  /** Retained original chain, excluding an edited user occurrence appended after truncation. */
+  compressedPrefix?: { nodeId: string | null; tailSegmentCount: bigint };
   occurrence?: ContextHandleOccurrenceEvidence; occurrences?: readonly ContextHandleOccurrenceEvidence[];
   current?: DomainRow;
 }): Promise<ContextHandleHeadTransitionPlan> {
@@ -146,9 +146,9 @@ export async function prepareContextHandleHeadTransition(input: {
       }
     }
     const restored = !snapshot && current.state === 'ready' && input.rootShape
-      && input.compressedPrefixNodeId !== undefined
+      && input.compressedPrefix !== undefined
       ? await prepareCompressedPrefixCatalog(input.database, input.contentStore, input.conversationId,
-        input.nextRootId, input.rootShape, input.compressedPrefixNodeId, provenanceRevision, input.now)
+        input.nextRootId, input.rootShape, input.compressedPrefix, provenanceRevision, input.now)
       : undefined;
     if (restored) aliasSteps.push(...restored.steps);
     if (!activate) return { state: current, steps: aliasSteps };
@@ -208,7 +208,8 @@ export async function prepareContextHandleHeadTransition(input: {
 
 /** Restore the exact pre-compression prefix, adding only bindings used by the retained summary. */
 async function prepareCompressedPrefixCatalog(database: RuntimeDatabase, store: ContentAddressedStore,
-  conversationId: string, nextRootId: string, shape: ContextHandleRootShape, prefixNodeId: string | null,
+  conversationId: string, nextRootId: string, shape: ContextHandleRootShape,
+  retainedPrefix: { nodeId: string | null; tailSegmentCount: bigint },
   provenanceRevision: bigint, now: string): Promise<{ contentObjectId: string | null; steps: RepositoryTransactionStep[] } | undefined> {
   const get = async (domain: string, id: string): Promise<DomainRow | undefined> =>
     (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | undefined;
@@ -228,15 +229,15 @@ async function prepareCompressedPrefixCatalog(database: RuntimeDatabase, store: 
   const compressed = await get('ContextSequenceRoot', compressedRootId);
   if (!original || original.conversation_id !== conversationId || !compressed
     || compressed.conversation_id !== conversationId || compressed.root_node_id !== shape.rootNodeId
-    || shape.tailSegmentCount > BigInt(String(compressed.tail_segment_count))) return undefined;
+    || retainedPrefix.tailSegmentCount > BigInt(String(compressed.tail_segment_count))) return undefined;
   const compressedCatalog = await readContextRootHandleCatalogRow(database, conversationId, compressedRootId, provenanceRevision);
   if (!compressedCatalog) return undefined;
   const originalNode = await get('ContextSequenceNode', String(original.root_node_id));
   const originalSegment = originalNode && await get('ContextSegment', String(originalNode.segment_id));
   const originalCompressed = originalSegment?.segment_kind === 'compression';
-  const segmentCount = BigInt(String(original.segment_count)) - BigInt(String(compressed.tail_segment_count)) + shape.tailSegmentCount;
-  const originalShape: ContextHandleRootShape = { rootNodeId: originalCompressed ? original.root_node_id as string : prefixNodeId,
-    tailNodeId: originalCompressed && segmentCount > 1n ? prefixNodeId : null,
+  const segmentCount = BigInt(String(original.segment_count)) - BigInt(String(compressed.tail_segment_count)) + retainedPrefix.tailSegmentCount;
+  const originalShape: ContextHandleRootShape = { rootNodeId: originalCompressed ? original.root_node_id as string : retainedPrefix.nodeId,
+    tailNodeId: originalCompressed && segmentCount > 1n ? retainedPrefix.nodeId : null,
     tailSegmentCount: originalCompressed ? segmentCount - 1n : 0n, segmentCount };
   const where = { conversation_id: conversationId, provenance_revision: provenanceRevision, ...shapeRow(originalShape) };
   const found = (await database.snapshot([DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN)

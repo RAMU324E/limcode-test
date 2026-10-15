@@ -304,11 +304,13 @@ test('H4 one real merge invalidates selected evidence and preserves the inactive
   assert.equal(selected.row.context_root_id, 'inactive_handle_request_root');
 });
 
-test('retry after compression restores the original prefix catalog without expanding summary sources', async () => {
+test('retry and edit after compression restore the original prefix catalog without expanding summary sources', async () => {
   const { ContextSequenceControlPlane, contextSequenceNodeId } = kernelFile('contextSequence.js');
   const { ContextCompressionControlPlane } = kernelFile('contextCompression.js');
-  for (const [nested, firstTail, imported] of [[false, false, false], [true, false, false], [false, true, false], [false, false, true]]) {
-    const key = `compressed-retry-${nested}-${firstTail}-${imported}`, { conversationId, turnId } = await createTurn(key);
+  for (const [nested, firstTail, imported, edited = false] of [[false, false, false], [true, false, false],
+    [false, true, false], [false, false, true], [false, true, false, true], [false, false, false, true],
+    [true, false, false, true], [false, true, true, true]]) {
+    const key = `compressed-retry-${nested}-${firstTail}-${imported}-${edited}`, { conversationId, turnId } = await createTurn(key);
     const context = new ContextSequenceControlPlane(database, store);
     const compression = new ContextCompressionControlPlane(database, store);
     const authority = await store.ingest(database, JSON.stringify({ modelProfile: {
@@ -317,7 +319,7 @@ test('retry after compression restores the original prefix catalog without expan
     } }), 'application/json');
     await database.transaction([repo('AuthoritySnapshot').insert({ id: key + '-authority', turn_id: turnId,
       content_object_id: authority.id, created_at: NOW })]);
-    for (const [index, role] of ['user', 'model', 'user', 'model', 'tool'].entries()) {
+    for (const [index, role] of ['user', 'model', 'user', edited ? 'user' : 'model', 'tool'].entries()) {
       const content = await store.ingest(database, JSON.stringify({ role, parts: [{ text: `message ${index}` }] }), MESSAGE_TYPE);
       const messageId = `${key}-message-${index}`, revisionId = messageId + '-revision';
       await database.transaction([
@@ -371,9 +373,19 @@ test('retry after compression restores the original prefix catalog without expan
     store.read = async metadata => { reads.push(metadata.id); return originalRead(metadata); };
     database.snapshot = async requests => { queries.push(...requests); return originalSnapshot(requests); };
     try {
+      const editedRevisionId = key + '-edited-user';
+      const edit = edited ? await store.ingest(database,
+        JSON.stringify({ role: 'user', parts: [{ text: 'Changed input P7 P8 P9' }] }), MESSAGE_TYPE) : undefined;
       const plan = await new ContextSequenceControlPlane(database, store).prepareMessageTruncateMutation({ conversationId,
-        messageRevisionId: key + `-message-${firstTail ? 2 : 3}-revision`, idempotencyKey: key });
-      await database.transaction(plan.steps);
+        messageRevisionId: key + `-message-${firstTail ? 2 : 3}-revision`, idempotencyKey: key,
+        ...(edit ? { replacement: { messageRevisionId: editedRevisionId, contentObjectId: edit.id,
+          contentByteLength: edit.byte_length, contentEstimatedTokens: 5 } } : {}) });
+      await database.transaction([
+        ...(edit ? [repo('MessageRevision').insertWithNextSequence({ id: editedRevisionId,
+          message_id: key + `-message-${firstTail ? 2 : 3}`, role: 'user', content_object_id: edit.id, created_at: NOW
+        }, { column: 'revision_seq', scope: { message_id: key + `-message-${firstTail ? 2 : 3}` } })] : []),
+        ...plan.steps
+      ]);
       assert.equal((await state.readConversationContextHandleStateRow(database, conversationId)).state, imported ? 'pending' : 'ready');
       if (imported) continue; // Older generations cannot supply a directory for the imported scope.
       const ready = await state.readCurrentConversationContextHandleState(database, store, conversationId);
@@ -384,8 +396,9 @@ test('retry after compression restores the original prefix catalog without expan
       assert.ok(ready.requiresNativeReset);
       const selected = await new ContextSequenceControlPlane(database, store).materializeStructure(ready.row.context_root_id);
       assert.equal(selected.records[0].segment.id, compressed.summarySegmentId);
-      if (firstTail) assert.equal(selected.records.length, 1);
-      else assert.equal(selected.records.at(-1).node.id, original.records.at(-3).node.id);
+      if (firstTail) assert.equal(selected.records.length, edited ? 2 : 1);
+      else assert.equal(selected.records.at(edited ? -2 : -1).node.id, original.records.at(-3).node.id);
+      if (edited) assert.equal(selected.records.at(-1).segment.content_object_id, edit.id);
       assert.equal(queries.some(query => query.domain === 'CompressionBlockSource' || query.domain === 'ModelRequest'), false);
       const hiddenContent = original.records.slice(0, nested ? 1 : 2).map(record => record.segment.content_object_id);
       assert.equal(reads.some(id => hiddenContent.includes(id)), false, 'compressed source bodies are never opened');

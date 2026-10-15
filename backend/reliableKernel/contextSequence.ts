@@ -1681,9 +1681,13 @@ export class ContextSequenceControlPlane {
         ...(await prepareContextHandleHeadTransition({
           database: this.database, contentStore: this.contentStore, conversationId,
           previousRootId: state.rootId, nextRootId: rootId, mode: 'rewrite', now,
-          ...(retainedSummary && targetIndex > 0 && !replacement ? {
-            compressedPrefixNodeId: targetIndex > 1 ? requireId(state.records[targetIndex - 1].node.id, 'prefix node id')
-              : nullableId(state.records[1].node.parent_node_id, 'compression source prefix node id')
+          ...(retainedSummary && targetIndex > 0 ? {
+            compressedPrefix: {
+              nodeId: targetIndex > 1 ? requireId(state.records[targetIndex - 1].node.id, 'prefix node id')
+                : nullableId(state.records[1].node.parent_node_id, 'compression source prefix node id'),
+              // A manually edited user occurrence has no producer bindings to add to this prefix.
+              tailSegmentCount: BigInt(targetIndex - 1)
+            }
           } : {}),
           rootShape: {
             rootNodeId: retainedSummary ? summaryNodeId : lastNodeId,
