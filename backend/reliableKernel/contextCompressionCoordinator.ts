@@ -98,7 +98,7 @@ import {
 } from './modelProviderControlPlane';
 import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
-import { listAllDomainRows } from './repositoryPagination';
+import { listAllDomainRows, recentDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { nativeItemRevisionId } from './turnOutput';
 import {
@@ -1836,15 +1836,9 @@ export async function readLatestFrozenCompressionTools(
   conversationIdInput: string
 ): Promise<readonly CompressionToolDefinition[]> {
   const conversationId = requireId(conversationIdInput, 'conversationId');
-  const turns = (await listAllDomainRows(database, 'Turn', { conversation_id: conversationId }))
-    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
-      || String(right.id).localeCompare(String(left.id)));
-  for (const turn of turns) {
+  for await (const turn of recentDomainRows(database, 'Turn', { conversation_id: conversationId }, 'created_at')) {
     const turnId = requireId(turn.id, 'Turn.id');
-    const requests = (await listAllDomainRows(database, 'ModelRequest', { turn_id: turnId }))
-      .sort((left, right) => compareBigIntDescending(left.request_seq, right.request_seq)
-        || String(right.id).localeCompare(String(left.id)));
-    for (const request of requests) {
+    for await (const request of recentDomainRows(database, 'ModelRequest', { turn_id: turnId }, 'request_seq')) {
       const recipeRead = await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(
         requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
       )]);

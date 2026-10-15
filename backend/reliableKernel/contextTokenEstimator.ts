@@ -15,7 +15,7 @@ import {
 } from './contextSequence';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
-import { listAllDomainRows } from './repositoryPagination';
+import { listAllDomainRows, recentDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
 import type { ModelHandleCatalog } from './modelHandleCatalog';
@@ -211,21 +211,12 @@ export class ReliableContextTokenEstimator {
     conversationId: string,
     current: readonly MaterializedContextSegment[]
   ): Promise<ObservedPrefixAnchor | null> {
-    const turns = (await listAllDomainRows(this.database, 'Turn', {
-      conversation_id: conversationId
-    })).sort(compareRequestsNewestFirst);
-    // Query newest Turns lazily. A long Conversation can contain thousands of Turns; fanning out one
-    // SQLite request per historical Turn on every compression check would make token accounting the
-    // new bottleneck. The current/latest Turn normally resolves the baseline immediately.
-    for (const turn of turns) {
-      const requests = (await listAllDomainRows(this.database, 'ModelRequest', {
-        turn_id: requireId(turn.id, 'Turn.id')
-      })).filter((request) =>
-        request.status === 'terminal'
-        && request.terminal_state === 'completed'
-      ).sort(compareRequestsNewestFirst);
-
-      for (const request of requests) {
+    // Stable creation/sequence indexes give the actual latest request, independent of later
+    // status/usage updates. Stop at its usable prefix instead of loading and sorting all history.
+    for await (const turn of recentDomainRows(this.database, 'Turn', { conversation_id: conversationId }, 'created_at')) {
+      for await (const request of recentDomainRows(this.database, 'ModelRequest', {
+        turn_id: requireId(turn.id, 'Turn.id'), status: 'terminal', terminal_state: 'completed'
+      }, 'request_seq')) {
         const measurement = needsSingleResponseMeasurement(request)
           ? await this.database.singleResponseMeasurement(request) : undefined;
         const observedUsage = modelRequestObservedUsage(measurement
@@ -522,15 +513,6 @@ function isSegmentPrefix(
   );
 }
 
-function compareRequestsNewestFirst(left: DomainRow, right: DomainRow): number {
-  const leftTime = timestamp(left.updated_at) || timestamp(left.created_at);
-  const rightTime = timestamp(right.updated_at) || timestamp(right.created_at);
-  if (leftTime !== rightTime) return rightTime - leftTime;
-  const leftSeq = nonNegativeBigInt(left.request_seq);
-  const rightSeq = nonNegativeBigInt(right.request_seq);
-  return leftSeq < rightSeq ? 1 : leftSeq > rightSeq ? -1 : 0;
-}
-
 export function providerPromptTokens(value: unknown): number | undefined {
   const usage = usageRecord(value);
   // A native logical request may bill many separate physical prompts; TurnOutput's no-item
@@ -668,12 +650,6 @@ function rows(value: unknown): DomainRow[] {
 function requireId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
   return value.trim();
-}
-
-function timestamp(value: unknown): number {
-  if (typeof value !== 'string') return 0;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function nonNegativeBigInt(value: unknown): bigint {
