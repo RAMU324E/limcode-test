@@ -15,6 +15,7 @@ import { registerInProcessSqliteDatabase } from '../capabilities/filesystem/sqli
 import {
   ROOT_BINDING_POINTER_FILE,
   type RootBinding,
+  type AttachmentProjectionChanges,
   type RuntimeCommitResult,
   type SnapshotBarrier
 } from './contracts';
@@ -138,7 +139,11 @@ const DURABILITY_CHECKPOINT_RETRY_MS = 50;
 
 export class RuntimeDatabase {
   private readonly externalClientCommits = new ExternalClientCommits();
+  private readonly externalAttachmentCommits = new ExternalClientCommits();
   private clientWriterMembership: string | undefined;
+  private attachmentWriterMembership: string | undefined;
+  private attachmentExternalVersion: string | undefined;
+  private attachmentExternalSync?: Promise<AttachmentProjectionChanges[] | null>;
   private readonly historyPreparation: HistoryPreparationAdmission;
   private readonly pending = new Map<number, {
     resolve(value: unknown): void;
@@ -611,14 +616,44 @@ export class RuntimeDatabase {
   }
 
   public async externalClientChanges(baseline = false) {
+    const { peers, membership } = await this.externalCommitPeers();
+    const membershipChanged = this.clientWriterMembership !== undefined && membership !== this.clientWriterMembership;
+    this.clientWriterMembership = membership;
+    if (membershipChanged) this.externalClientCommits.reset();
+    const changes = await this.externalClientCommits.poll(peers, baseline || membershipChanged);
+    return membershipChanged && !baseline ? null : changes;
+  }
+
+  /** Independent notification cursor: a Client Feed poll must not consume attachment invalidations. */
+  public synchronizeAttachmentProjection(): Promise<AttachmentProjectionChanges[] | null> {
+    if (!this.attachmentExternalSync) {
+      this.attachmentExternalSync = this.readExternalAttachmentChanges().finally(() => { this.attachmentExternalSync = undefined; });
+    }
+    return this.attachmentExternalSync;
+  }
+
+  private async readExternalAttachmentChanges(): Promise<AttachmentProjectionChanges[] | null> {
+    const version = await this.externalDataVersion();
+    if (version === this.attachmentExternalVersion) return [];
+    const { peers, membership } = await this.externalCommitPeers();
+    const baseline = this.attachmentExternalVersion === undefined;
+    const membershipChanged = this.attachmentWriterMembership !== undefined && membership !== this.attachmentWriterMembership;
+    this.attachmentWriterMembership = membership;
+    if (membershipChanged) this.externalAttachmentCommits.reset();
+    const observed = await this.externalAttachmentCommits.pollAttachmentProjectionChanges(peers, baseline || membershipChanged);
+    const changes = baseline || membershipChanged ? null : observed;
+    const after = await this.request<string>({ kind: 'externalDataVersion', attachmentProjectionVersion: version,
+      attachmentProjectionChanges: changes });
+    this.attachmentExternalVersion = after;
+    return after === version ? changes : null;
+  }
+
+  private async externalCommitPeers(): Promise<{ peers: ClientCommitPeer[]; membership: string }> {
     await this.assertUsableBinding('externalDataVersion');
     const peers: ClientCommitPeer[] = [];
     const directory = runtimeHostLivenessDirectory(this.binding.paths);
     const membership = await fs.readFile(path.join(directory, '.client-membership'), 'utf8')
       .catch(error => { if (isNotFoundError(error)) return ''; throw error; });
-    const membershipChanged = this.clientWriterMembership !== undefined && membership !== this.clientWriterMembership;
-    this.clientWriterMembership = membership;
-    if (membershipChanged) this.externalClientCommits.reset();
     const files = await fs.readdir(directory).catch(error => { if (isNotFoundError(error)) return []; throw error; });
     for (const file of files) {
       if (!file.endsWith('.json')) continue;
@@ -626,8 +661,7 @@ export class RuntimeDatabase {
       if (!record || record.hostBootId === this.hostBootId || !sameLivenessRoot(record, this.binding)) continue;
       peers.push({ ...record, retired: recordedProcessVanished(record.processId) });
     }
-    const changes = await this.externalClientCommits.poll(peers, baseline || membershipChanged);
-    return membershipChanged && !baseline ? null : changes;
+    return { peers, membership };
   }
 
   public resetExternalClientChanges(): void {
@@ -762,6 +796,7 @@ export class RuntimeDatabase {
 
   private markClosed(): void {
     this.externalClientCommits.close();
+    this.externalAttachmentCommits.close();
     this.closed = true;
     this.casAccess.fence();
     for (const listener of this.closeListeners) listener();

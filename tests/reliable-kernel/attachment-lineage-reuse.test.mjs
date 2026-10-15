@@ -1,6 +1,37 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createConfigurationRoot, removeConfigurationRoot, withRuntime, kernelFile, repo, NOW, Database } from './fixtures/runtime-merge-fixture.mjs';
+import { once } from 'node:events';
+import { Worker } from 'node:worker_threads';
+import { createConfigurationRoot, removeConfigurationRoot, withRuntime, kernelFile, repo, NOW, Database, compiled } from './fixtures/runtime-merge-fixture.mjs';
+
+async function withPeerRuntime(database, run) {
+  const worker = new Worker(`
+    const { parentPort, workerData } = require('node:worker_threads');
+    const path = require('node:path');
+    const { RuntimeDatabase } = require(path.join(workerData.compiled, 'backend/reliableKernel/runtimeDatabase.js'));
+    const { RootAuthority } = require(path.join(workerData.compiled, 'backend/reliableKernel/rootAuthority.js'));
+    RuntimeDatabase.open(new RootAuthority(() => workerData.dataRootPath), { hostBootId: 'attachment-peer' }).then(database => {
+      parentPort.on('message', async steps => {
+        try {
+          if (steps === null) { await database.close(); parentPort.postMessage({ ok: true }); parentPort.close(); }
+          else { await database.transaction(steps); parentPort.postMessage({ ok: true }); }
+        } catch (error) { parentPort.postMessage({ error: String(error.stack) }); }
+      });
+      parentPort.postMessage({ ok: true });
+    }).catch(error => { throw error; });
+  `, { eval: true, workerData: { compiled, dataRootPath: database.binding.paths.dataRootPath } });
+  const exited = once(worker, 'exit');
+  const send = async steps => {
+    const response = once(worker, 'message');
+    worker.postMessage(steps);
+    const [result] = await response;
+    if (result.error) throw new Error(result.error);
+  };
+  try {
+    await once(worker, 'message');
+    await run({ transaction: send });
+  } finally { await send(null); await exited; }
+}
 
 test('attachment catalogs reuse compressed history after writes and window growth, and refresh changed old relationships', async () => {
   const configuration = await createConfigurationRoot();
@@ -39,7 +70,20 @@ test('attachment catalogs reuse compressed history after writes and window growt
       database.attachmentProjectionSegments = async (conversation, ids) => { reads.push(...ids); return originalSegments(conversation, ids); };
       database.attachmentProjectionLinks = async ids => { links.push(...ids); return originalLinks(ids); };
       const project = (...ids) => new AttachmentCatalogProjection(database).projectState(cid, ids.map(segmentId => ({ segmentId })));
+      await withPeerRuntime(database, async peer => {
       assert.deepEqual((await project('summary-2-segment')).catalog, [attachment('old-image')]);
+      const beforeExternal = (await database.inspect()).attachmentScopeCache;
+      await database.externalClientChanges(true);
+      await peer.transaction([repo('Conversation').update(cid, { title: 'a peer changed only the title', updated_at: NOW })]);
+      await database.externalClientChanges();
+      reads.length = links.length = 0;
+      assert.deepEqual((await project('summary-2-segment')).catalog, [attachment('old-image')]);
+      assert.deepEqual(reads, [], 'a peer title update does not expand historical compression, even after the feed consumes it');
+      await originalSegments(cid, ['old-segment']);
+      const afterExternal = (await database.inspect()).attachmentScopeCache;
+      assert.equal(afterExternal.externalInvalidations, beforeExternal.externalInvalidations,
+        'the worker source proofs also survive unrelated peer commits');
+      assert.ok(afterExternal.hits > beforeExternal.hits);
       reads.length = links.length = 0;
       await database.transaction([repo('CommandReceipt').insert({ id: 'ordinary-write', source_kind: 'fixture', source_key: 'ordinary',
         conversation_id: cid, turn_id: null, created_at: NOW })]);
@@ -73,6 +117,13 @@ test('attachment catalogs reuse compressed history after writes and window growt
       assert.ok(reads.includes('old-segment'), 'an external relationship change refreshes the compressed catalog');
       assert.deepEqual((await project('summary-3-segment')).catalog,
         [attachment('old-image'), attachment('race-image'), attachment('new-image')], 'a cold in-flight read must not cache relationships changed during its read');
+      reads.length = links.length = 0;
+      await peer.transaction(attach('external-image', 'old-revision', 3n));
+      await database.externalClientChanges();
+      assert.deepEqual((await project('summary-3-segment')).catalog,
+        [attachment('old-image'), attachment('race-image'), attachment('external-image'), attachment('new-image')]);
+      assert.ok(reads.includes('old-segment'), 'an external relationship insert refreshes the old compressed catalog');
+      });
     });
   } finally { await removeConfigurationRoot(configuration.root); }
 });

@@ -1,6 +1,6 @@
 import * as net from 'node:net';
 import { serialize, deserialize } from 'node:v8';
-import type { RuntimeChange, RuntimeCommitResult } from './contracts';
+import type { AttachmentProjectionChanges, RuntimeChange, RuntimeCommitResult } from './contracts';
 
 export interface ClientCommitPeer {
   hostBootId: string;
@@ -13,6 +13,7 @@ interface CommitPage {
   cursor: number;
   complete: boolean;
   changes: RuntimeChange[];
+  attachmentProjectionChanges: AttachmentProjectionChanges[];
 }
 
 /** Process-local notifications, not a durable ledger. A missing/overrun peer requires a snapshot. */
@@ -37,10 +38,11 @@ export class ExternalClientCommits {
         // Commit messages precede this worker barrier, including a transaction already in flight.
         await barrier();
         const complete = input.after === undefined || input.after >= this.floor && input.after <= this.cursor;
-        const changes = complete && input.after !== undefined
-          ? this.retained.filter(item => item.cursor > input.after!).flatMap(item => deserialize(item.body) as RuntimeChange[])
+        const commits = complete && input.after !== undefined
+          ? this.retained.filter(item => item.cursor > input.after!).map(item => deserialize(item.body) as Pick<RuntimeCommitResult, 'changes' | 'attachmentProjectionChanges'>)
           : [];
-        send(socket, { cursor: this.cursor, complete, changes } satisfies CommitPage);
+        send(socket, { cursor: this.cursor, complete, changes: commits.flatMap(commit => commit.changes),
+          attachmentProjectionChanges: commits.flatMap(commit => commit.attachmentProjectionChanges ? [commit.attachmentProjectionChanges] : []) } satisfies CommitPage);
       }).catch(() => socket.destroy());
     });
     this.server = server;
@@ -55,8 +57,9 @@ export class ExternalClientCommits {
 
   public record(commit: RuntimeCommitResult): void {
     const cursor = ++this.cursor;
-    if (commit.changes.length === 0) return; // Hidden streaming/lease writes need no retained payload.
-    const body = commit.changes.length <= 128 ? serialize(commit.changes) : undefined;
+    if (commit.changes.length === 0 && !commit.attachmentProjectionChanges) return;
+    const body = commit.changes.length <= 128
+      ? serialize({ changes: commit.changes, attachmentProjectionChanges: commit.attachmentProjectionChanges }) : undefined;
     if (!body || body.length > 512 * 1024) {
       this.floor = cursor;
       this.retained.length = 0;
@@ -74,11 +77,20 @@ export class ExternalClientCommits {
 
   /** Called before the initial snapshot and only on SQLite external changes thereafter. */
   public async poll(peers: ClientCommitPeer[], baseline = false): Promise<RuntimeChange[] | null> {
+    return (await this.pollPage(peers, baseline))?.changes ?? null;
+  }
+
+  public async pollAttachmentProjectionChanges(peers: ClientCommitPeer[], baseline = false): Promise<AttachmentProjectionChanges[] | null> {
+    return (await this.pollPage(peers, baseline))?.attachmentProjectionChanges ?? null;
+  }
+
+  private async pollPage(peers: ClientCommitPeer[], baseline: boolean): Promise<Pick<CommitPage, 'changes' | 'attachmentProjectionChanges'> | null> {
     const key = (peer: ClientCommitPeer) => peer.hostBootId + ':' + peer.livenessId;
     const live = new Set(peers.map(key));
     let complete = true;
     let advanced = false;
     const changes: RuntimeChange[] = [];
+    const attachmentProjectionChanges: AttachmentProjectionChanges[] = [];
     for (const id of this.peers.keys()) {
       if (!live.has(id)) { this.peers.delete(id); complete = false; }
     }
@@ -97,11 +109,12 @@ export class ExternalClientCommits {
         if (after === undefined && !baseline || !page.complete) complete = false;
         if (after !== undefined && page.cursor > after) advanced = true;
         changes.push(...page.changes);
+        attachmentProjectionChanges.push(...page.attachmentProjectionChanges);
       } catch { complete = false; }
     }));
     // A data_version change not explained by registered writers is an ordinary coarse refresh,
     // e.g. offline tooling or a writer whose process exited before its notification was retained.
-    return baseline || complete && advanced ? changes : null;
+    return baseline || complete && advanced ? { changes, attachmentProjectionChanges } : null;
   }
 
   public reset(): void { this.peers.clear(); }

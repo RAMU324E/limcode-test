@@ -16,6 +16,7 @@ import {
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import type { AttachmentProjectionChanges } from './contracts';
 
 export interface AttachmentCatalogProjectionSegment {
   segmentId: string;
@@ -121,22 +122,24 @@ interface PreparedProjectionRead {
 class PreparedProjectionCache {
   private readonly entries = new Map<string, PreparedProjectionEntry>();
   private bytes = 0;
-  private externalVersion?: string;
 
   public constructor(private readonly database: RuntimeDatabase) {
     database.onCommit(commit => {
       const changed = commit.attachmentProjectionChanges;
-      if (!changed) return;
-      if (changed.reset) { this.clear(); return; }
-      for (const [conversationId, entry] of this.entries) {
-        if (entry.pending > 0 || changed.segments.some(id => entry.dependencies.segments.has(id))
-          || changed.blocks.some(id => entry.dependencies.blocks.has(id))
-          || changed.revisions.some(id => entry.dependencies.revisions.has(id))
-          || changed.messages.some(id => entry.dependencies.messages.has(id))) {
-          this.entries.delete(conversationId); this.bytes -= entry.bytes;
-        }
-      }
+      if (changed) this.invalidate(changed);
     });
+  }
+
+  private invalidate(changed: AttachmentProjectionChanges): void {
+    if (changed.reset) { this.clear(); return; }
+    for (const [conversationId, entry] of this.entries) {
+      if (entry.pending > 0 || changed.segments.some(id => entry.dependencies.segments.has(id))
+        || changed.blocks.some(id => entry.dependencies.blocks.has(id))
+        || changed.revisions.some(id => entry.dependencies.revisions.has(id))
+        || changed.messages.some(id => entry.dependencies.messages.has(id))) {
+        this.entries.delete(conversationId); this.bytes -= entry.bytes;
+      }
+    }
   }
 
   private clear(): void {
@@ -144,18 +147,16 @@ class PreparedProjectionCache {
     this.bytes = 0;
   }
 
-  private synchronizeVersion(version: string): void {
-    if (version !== this.externalVersion) {
-      this.clear();
-      this.externalVersion = version;
-    }
+  private async synchronizeExternal(): Promise<void> {
+    const changes = await this.database.synchronizeAttachmentProjection();
+    if (changes === null) this.clear();
+    else for (const change of changes) this.invalidate(change);
   }
 
   public async read(conversationId: string,
     prepare: (known: ReadonlyMap<string, PreparedAttachmentSegment>) => Promise<PreparedProjectionRead>): Promise<PreparedAttachmentCatalogProjection> {
     // This worker request revalidates the root binding, including on a cache hit or after close.
-    const version = await this.database.externalDataVersion();
-    this.synchronizeVersion(version);
+    await this.synchronizeExternal();
     let entry = this.entries.get(conversationId);
     if (!entry) {
       entry = { segments: new Map(), dependencies: { segments: new Set(), blocks: new Set(), revisions: new Set(), messages: new Set() }, bytes: 256, pending: 0 };
@@ -165,9 +166,18 @@ class PreparedProjectionCache {
     let result: PreparedProjectionRead;
     entry.pending++;
     try { result = await prepare(entry.segments); } finally { entry.pending--; }
-    const after = await this.database.externalDataVersion();
-    if (after !== version || this.entries.get(conversationId) !== entry) {
-      this.synchronizeVersion(after);
+    // Include this read's new dependencies before applying peer changes observed during it.
+    if (this.entries.get(conversationId) === entry) {
+      for (const kind of ['segments', 'blocks', 'revisions', 'messages'] as const) {
+        for (const id of result.dependencies[kind]) if (!entry.dependencies[kind].has(id)) {
+          entry.dependencies[kind].add(id);
+          const bytes = 96 + 2 * id.length;
+          entry.bytes += bytes; this.bytes += bytes;
+        }
+      }
+    }
+    await this.synchronizeExternal();
+    if (this.entries.get(conversationId) !== entry) {
       return result.reused ? (await prepare(new Map())).value : result.value;
     }
     let addedBytes = 0;
@@ -175,11 +185,6 @@ class PreparedProjectionCache {
       entry.segments.set(segment.segmentId, segment);
       addedBytes += 160 + 2 * segment.segmentId.length + segment.catalog.reduce((sum, item) =>
         sum + 192 + 2 * (item.attachmentId.length + item.name.length + item.mimeType.length), 0);
-    }
-    for (const kind of ['segments', 'blocks', 'revisions', 'messages'] as const) {
-      for (const id of result.dependencies[kind]) if (!entry.dependencies[kind].has(id)) {
-        entry.dependencies[kind].add(id); addedBytes += 96 + 2 * id.length;
-      }
     }
     entry.bytes += addedBytes; this.bytes += addedBytes;
     while (this.entries.size > PREPARED_PROJECTION_CACHE_LIMITS.conversations || this.bytes > PREPARED_PROJECTION_CACHE_LIMITS.bytes) {
@@ -241,7 +246,7 @@ export class AttachmentCatalogProjection {
     // Invalid runtime inputs keep the original reader's validation order. Maintenance has no
     // commit stream, and repository test doubles must not claim freshness they cannot prove.
     if (this.database.maintenance || typeof this.database.onCommit !== 'function'
-      || typeof this.database.externalDataVersion !== 'function'
+      || typeof this.database.synchronizeAttachmentProjection !== 'function'
       || !Array.isArray(segments) || !segments.every(segment => segment && typeof segment.segmentId === 'string')
       || !Array.isArray(additionalMessageRevisionIds) || !additionalMessageRevisionIds.every(id => typeof id === 'string')) return prepare();
     // Snapshot the declared readonly input before the first asynchronous freshness fence. A

@@ -644,6 +644,10 @@ async function start(): Promise<void> {
         // Reading it from the writer (rather than the separate reader) therefore excludes every
         // commit made by this RuntimeDatabase worker while still detecting other Extension Hosts.
         const result = BigInt(writer.pragma('data_version', { simple: true }) as number | bigint).toString();
+        if (request.attachmentProjectionChanges !== undefined) {
+          attachmentScopeCache.synchronizeExternal(BigInt(result),
+            request.attachmentProjectionVersion === result ? request.attachmentProjectionChanges : null);
+        }
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
