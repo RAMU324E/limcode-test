@@ -52,12 +52,22 @@ export interface RuntimeAllocatedSequence {
   value: string;
 }
 
+export interface AttachmentProjectionChanges {
+  reset: boolean;
+  segments: string[];
+  blocks: string[];
+  revisions: string[];
+  messages: string[];
+}
+
 export interface RuntimeCommitResult {
   commitSeq: string;
   changes: RuntimeChange[];
   allocatedSequences: RuntimeAllocatedSequence[];
   /** Bounded internal invalidations for client:none domains; never Client Feed row payloads. */
   internalChangedDomains?: string[];
+  /** Host-only attachment cache invalidations from the existing mutation boundary. */
+  attachmentProjectionChanges?: AttachmentProjectionChanges;
 }
 
 export interface SnapshotBarrier<T> {
