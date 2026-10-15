@@ -43,22 +43,86 @@ export function registerContextHandleBoundaryTests(f) {
         { recipe: recipe.id, body: oldContent.id, checkpoints: 0 })
     ]);
     const registry = new ConversationAttachmentHandleRegistry(database, { contentStore: store, now: () => NOW });
-    assert.deepEqual(await registry.peek(conversationId, []), { entries: [] });
-    assert.deepEqual(await f.rows('ConversationAttachmentHandleLink', { conversation_id: conversationId }), []);
-    assert.deepEqual(await registry.ensure(conversationId, []), { entries: [] });
-    const [reserved] = await f.rows('ConversationAttachmentHandleLink', { conversation_id: conversationId });
-    assert.equal(reserved.attachment_id, oldAttachment.attachmentId);
-    assert.equal(reserved.handle_seq, 1n);
-    assert.deepEqual(await f.rows('AttachmentLink', { attachment_id: oldAttachment.attachmentId }), []);
-    const visible = await registry.ensure(conversationId, [newAttachment]);
-    assert.deepEqual(visible.entries, [{ kind: 'attachment', ref: 'F2', target: newAttachment.attachmentId,
-      name: newAttachment.name, mimeType: newAttachment.mimeType, sizeBytes: newAttachment.sizeBytes }]);
-    const catalog = handles.buildModelHandleCatalog([], visible.entries);
-    assert.throws(() => handles.resolveModelToolArguments('read', { attachmentRef: 'F1' }, catalog), /当前可用/);
-    assert.deepEqual(handles.resolveModelToolArguments('read', { attachmentRef: 'F2' }, catalog),
-      { attachmentId: newAttachment.attachmentId });
-    assert.equal((await f.rows('ConversationAttachmentHandleLink', { conversation_id: conversationId }))
-      .find(row => row.handle_seq === 1n).attachment_id, oldAttachment.attachmentId);
+    const historicalReads = [], originalRead = store.read.bind(store);
+    const historyDomains = new Set(['Turn', 'ModelRequest', 'ToolCallSourceLink', 'ToolCallEvent']);
+    const originalSnapshotAll = database.snapshotAll.bind(database);
+    let historicalQueries = 0;
+    database.snapshotAll = async read => {
+      if (historyDomains.has(read.domain)) historicalQueries++;
+      return originalSnapshotAll(read);
+    };
+    store.read = async metadata => {
+      if (metadata.id === recipe.id) historicalReads.push(metadata.id);
+      return originalRead(metadata);
+    };
+    try {
+      assert.deepEqual(await registry.peek(conversationId, []), { entries: [] });
+      const coldReads = historicalReads.length;
+      const coldQueries = historicalQueries;
+      assert.equal(coldReads, 1);
+      assert.deepEqual(await new ConversationAttachmentHandleRegistry(database, { contentStore: store })
+        .peek(conversationId, []), { entries: [] });
+      assert.equal(historicalReads.length, coldReads, 'previews share the one historical recovery');
+      assert.deepEqual(await f.rows('ConversationAttachmentHandleLink', { conversation_id: conversationId }), []);
+      await database.transaction([
+        repo('Turn').insert({ id: 'h6-admitted-input', conversation_id: conversationId, status: 'terminated',
+          created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+        repo('TurnTermination').insert({ id: 'h6-admitted-input-end', turn_id: 'h6-admitted-input',
+          terminal_status: 'completed', reason: 'fixture', created_at: NOW })
+      ]);
+      assert.deepEqual(await registry.ensure(conversationId, []), { entries: [] });
+      const recoveredReads = historicalReads.length, recoveredQueries = historicalQueries;
+      assert.equal(recoveredReads, coldReads + 1, 'an admitted Turn refreshes unfinished preview recovery');
+      assert.ok(recoveredQueries > coldQueries);
+      const [reserved] = await f.rows('ConversationAttachmentHandleLink', { conversation_id: conversationId });
+      assert.equal(reserved.attachment_id, oldAttachment.attachmentId);
+      assert.equal(reserved.handle_seq, 1n);
+      assert.deepEqual(await f.rows('AttachmentLink', { attachment_id: oldAttachment.attachmentId }), []);
+      await database.transaction(modelRequestAggregate(turnId, 'h6-daily-request', 2n,
+        { recipe: recipe.id, body: oldContent.id, checkpoints: 0 }));
+      const visible = await registry.ensure(conversationId, [newAttachment]);
+      assert.deepEqual(visible.entries, [{ kind: 'attachment', ref: 'F2', target: newAttachment.attachmentId,
+        name: newAttachment.name, mimeType: newAttachment.mimeType, sizeBytes: newAttachment.sizeBytes }]);
+      const catalog = handles.buildModelHandleCatalog([], visible.entries);
+      assert.throws(() => handles.resolveModelToolArguments('read', { attachmentRef: 'F1' }, catalog), /当前可用/);
+      assert.deepEqual(handles.resolveModelToolArguments('read', { attachmentRef: 'F2' }, catalog),
+        { attachmentId: newAttachment.attachmentId });
+      assert.equal((await f.rows('ConversationAttachmentHandleLink', { conversation_id: conversationId }))
+        .find(row => row.handle_seq === 1n).attachment_id, oldAttachment.attachmentId);
+      assert.equal(historicalReads.length, recoveredReads, 'ordinary sends do not reread historical recipes');
+      assert.equal(historicalQueries, recoveredQueries, 'ordinary sends do not query historical rows');
+    } finally { store.read = originalRead; database.snapshotAll = originalSnapshotAll; }
+    await f.reopen();
+    const reopenedStore = f.store(), reopenedRead = reopenedStore.read.bind(reopenedStore);
+    const reopenedDatabase = f.database(), reopenedSnapshotAll = reopenedDatabase.snapshotAll.bind(reopenedDatabase);
+    reopenedDatabase.snapshotAll = async read => {
+      assert.equal(historyDomains.has(read.domain), false, 'a restart does not query historical rows');
+      return reopenedSnapshotAll(read);
+    };
+    reopenedStore.read = async metadata => {
+      assert.notEqual(metadata.id, recipe.id, 'a restart uses the durable recovery receipt');
+      return reopenedRead(metadata);
+    };
+    try {
+      const reopenedRegistry = new ConversationAttachmentHandleRegistry(f.database(), { contentStore: reopenedStore });
+      assert.equal((await reopenedRegistry.ensure(conversationId, [newAttachment])).entries[0].ref, 'F2');
+      assert.equal((await reopenedRegistry.peek(conversationId, [newAttachment])).entries[0].ref, 'F2');
+    } finally { reopenedStore.read = reopenedRead; reopenedDatabase.snapshotAll = reopenedSnapshotAll; }
+    const afterRecovery = await state.readConversationContextHandleStateRow(f.database(), conversationId);
+    await f.database().transaction(state.importConversationContextHandleStateSteps(conversationId, NOW,
+      afterRecovery, afterRecovery.context_root_id, false));
+    let rerecovered = 0;
+    reopenedStore.read = async metadata => {
+      if (metadata.id === recipe.id) rerecovered++;
+      return reopenedRead(metadata);
+    };
+    try {
+      const importedRegistry = new ConversationAttachmentHandleRegistry(f.database(), { contentStore: reopenedStore });
+      await importedRegistry.ensure(conversationId, []);
+      assert.equal(rerecovered, 1, 'an imported provenance revision runs recovery once');
+      await importedRegistry.ensure(conversationId, []);
+      assert.equal(rerecovered, 1, 'the recovered import does not make daily sends scan again');
+    } finally { reopenedStore.read = reopenedRead; }
   });
 
   test('H7 a fork freezes its exact prefix in a private artifact and keeps creation scope after continuation and source deletion', async () => {

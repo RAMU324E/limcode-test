@@ -1625,10 +1625,15 @@ export class ContextSequenceControlPlane {
 
     const retainedSummary = prefix[0]?.segment.segment_kind === 'compression' ? prefix[0] : null;
     const tailSegments = retainedSummary ? prefix.slice(1) : prefix;
-    const nodes = buildSequenceNodes(
+    // A retained compressed tail may still link to nodes outside its visible range.
+    // Keep that exact prefix identity so its already-proved handle catalog remains reusable.
+    const retained = targetIndex >= 0 ? rebuildSuffix(state.records.slice(0, targetIndex + 1), targetIndex,
+      { replacementSegmentId, now }) : undefined;
+    const nodes = retained?.nodes ?? buildSequenceNodes(
       tailSegments.map((record) => requireId(record.segment.id, 'ContextSegment.id')),
       now
     );
+    const lastNodeId = retained ? retained.lastNodeId : nodes.length ? nodes[nodes.length - 1].id : null;
     const summaryNodeId = retainedSummary
       ? contextSequenceNodeId(null, requireId(retainedSummary.segment.id, 'retained compression segment id'))
       : null;
@@ -1668,9 +1673,9 @@ export class ContextSequenceControlPlane {
           conversation_id: conversationId,
           root_node_id: retainedSummary
             ? summaryNodeId
-            : nodes.length ? nodes[nodes.length - 1].id : null,
-          tail_node_id: retainedSummary && nodes.length ? nodes[nodes.length - 1].id : null,
-          tail_segment_count: retainedSummary ? BigInt(nodes.length) : 0n,
+            : lastNodeId,
+          tail_node_id: retainedSummary ? lastNodeId : null,
+          tail_segment_count: retainedSummary ? BigInt(tailSegments.length) : 0n,
           segment_count: BigInt(prefix.length),
           estimated_tokens: estimatedTokens,
           created_at: now
@@ -1679,9 +1684,9 @@ export class ContextSequenceControlPlane {
           database: this.database, contentStore: this.contentStore, conversationId,
           previousRootId: state.rootId, nextRootId: rootId, mode: 'rewrite', now,
           rootShape: {
-            rootNodeId: retainedSummary ? summaryNodeId : nodes.length ? nodes[nodes.length - 1].id : null,
-            tailNodeId: retainedSummary && nodes.length ? nodes[nodes.length - 1].id : null,
-            tailSegmentCount: retainedSummary ? BigInt(nodes.length) : 0n, segmentCount: BigInt(prefix.length)
+            rootNodeId: retainedSummary ? summaryNodeId : lastNodeId,
+            tailNodeId: retainedSummary ? lastNodeId : null,
+            tailSegmentCount: retainedSummary ? BigInt(tailSegments.length) : 0n, segmentCount: BigInt(prefix.length)
           }
         })).steps,
         ...headMutationSteps(conversationId, state.head, rootId, now)

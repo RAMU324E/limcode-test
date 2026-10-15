@@ -4,7 +4,7 @@ import { normalizeAttachmentCatalog } from './attachmentCatalog';
 import type { ModelHandleEntry } from './modelHandleCatalog';
 import { ContentAddressedStore } from './contentAddressedStore';
 import { RootAuthority } from './rootAuthority';
-import { frozenAttachmentError, readFrozenConversationAttachmentReservations,
+import { ATTACHMENT_RECOVERY_SOURCE_KIND, frozenAttachmentError, readFrozenConversationAttachmentReservations,
   type FrozenConversationAttachmentReservations } from './frozenConversationAttachmentHandles';
 import { DOMAIN_REPOSITORIES, savepoint, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -166,15 +166,19 @@ export class ConversationAttachmentHandleRegistry {
 
   /** Recover exact published addresses before any new allocation, including an empty visible set. */
   private async restoreFrozenReservations(conversationId: string, frozen: FrozenConversationAttachmentReservations): Promise<void> {
-    if (frozen.entries.length === 0) return;
+    const completion = frozen.completion;
+    if (!completion) return;
     const links = validateLinks(await this.readConversationLinks(conversationId), conversationId);
     assertFrozenReservationsAgree(links, frozen.entries);
     const missing = frozen.entries.filter(entry => !links.has(entry.target));
-    if (missing.length === 0) return;
-    const createdAt = requireText(frozen.createdAt, 'Frozen fork creation time');
+    const createdAt = frozen.createdAt ?? requireText(this.now(), 'clock result');
     const repository = DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink');
+    const receipts = DOMAIN_REPOSITORIES.domain('CommandReceipt');
     await this.database.transaction([
       DOMAIN_REPOSITORIES.domain('Conversation').assert(conversationId, {}),
+      DOMAIN_REPOSITORIES.domain('ConversationContextHandleState').assert(completion.stateId, {
+        conversation_id: conversationId, provenance_revision: completion.provenanceRevision
+      }),
       ...frozen.assertions,
       ...missing.flatMap((entry, index) => {
         const attachment = frozen.attachments.get(entry.target)!;
@@ -193,8 +197,17 @@ export class ConversationAttachmentHandleRegistry {
           ] }),
           repository.assert(linkId, { conversation_id: conversationId, attachment_id: entry.target, handle_seq: sequence })
         ];
-      })
-    ]);
+      }),
+      savepoint('attachment_recovery_completed', [receipts.insert({ id: completion.id,
+        source_kind: ATTACHMENT_RECOVERY_SOURCE_KIND, source_key: completion.sourceKey,
+        conversation_id: conversationId, turn_id: null, created_at: requireText(this.now(), 'clock result')
+      })], { kind: 'rollback-and-continue-on-unique', constraints: [
+        { domain: 'CommandReceipt', columns: ['id'] },
+        { domain: 'CommandReceipt', columns: ['source_kind', 'source_key'] }
+      ] }),
+      receipts.assert(completion.id, { source_kind: ATTACHMENT_RECOVERY_SOURCE_KIND,
+        source_key: completion.sourceKey, conversation_id: conversationId })
+    ], { durable: true });
     // A concurrent restore is idempotent; any concurrently assigned different address remains fatal.
     assertFrozenReservationsAgree(validateLinks(await this.readConversationLinks(conversationId), conversationId), frozen.entries);
   }
