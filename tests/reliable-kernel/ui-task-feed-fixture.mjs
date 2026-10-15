@@ -101,6 +101,27 @@ export async function createTaskRuntime() {
     };
     await settle('task-feed-base', { detail: { kind: 'task-list', operation: rewrite('pending') }, outcome: true });
     return { database, settle, close,
+      async startTurn({ asChild = false } = {}) {
+        const id = 'task-feed-active-turn';
+        const authority = await json({ workEnvironmentPolicy: { enabled: true,
+          defaultWorkEnvironmentId: 'frozen-directory', allowedWorkEnvironmentIds: ['frozen-directory'] } });
+        return database.transaction([
+          row('Turn', { id, conversation_id: conversationId, status: 'active', created_at: at, updated_at: at, terminal_at: null }),
+          row('AuthoritySnapshot', { id: `${id}-authority`, turn_id: id, content_object_id: authority, created_at: at }),
+          ...(asChild ? [
+            row('ChildExecution', { id: 'task-feed-child', child_conversation_id: conversationId, status: 'active', created_at: at, updated_at: at }),
+            row('ChildExecutionParentLink', { id: 'task-feed-child-parent', child_execution_id: 'task-feed-child',
+              source_tool_call_id: 'task-feed-foreign-plan', parent_child_execution_id: null, parent_turn_id: foreignTurnId, created_at: at }),
+            row('ChildExecutionTurnLink', { id: 'task-feed-child-first', child_execution_id: 'task-feed-child', turn_id: turnId, turn_seq: 1n, created_at: at }),
+            row('ChildExecutionTurnLink', { id: 'task-feed-child-latest', child_execution_id: 'task-feed-child', turn_id: id, turn_seq: 2n, created_at: at })
+          ] : [])
+        ]);
+      },
+      finishTurn() {
+        return database.transaction([kernel.DOMAIN_REPOSITORIES.domain('Turn').update('task-feed-active-turn', {
+          status: 'terminated', updated_at: at, terminal_at: at
+        })]);
+      },
       appendMessages(from, count) {
         return database.transaction(Array.from({ length: count }, (_value, offset) =>
           message(`task-feed-later-${from + offset}`, 3 + from + offset, 'user')).flat());

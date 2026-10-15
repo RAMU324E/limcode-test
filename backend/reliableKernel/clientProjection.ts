@@ -1320,6 +1320,36 @@ export function projectActiveTurnWorkEnvironment(
   return projection;
 }
 
+/** The same frozen display fields as a snapshot, without reading the message/tool window. */
+export function projectConversationExecutionBoundaryRecord(
+  database: Database.Database,
+  conversationId: string,
+  content: ClientProjectionContentAccess
+): DomainRow {
+  const turns = queryPlainRows(database,
+    'SELECT * FROM turn WHERE conversation_id = @conversationId AND status = \'active\' LIMIT 2',
+    { conversationId });
+  const documents: TurnAuthorityDocuments = new Map();
+  return {
+    id: conversationId,
+    conversation_id: conversationId,
+    activeTurnWorkEnvironment: projectActiveTurnWorkEnvironment(database, conversationId, turns, content, documents),
+    childConversationBoundary: projectChildConversationBoundary(database, conversationId, content, documents)
+  };
+}
+
+export function projectConversationTaskListRecord(
+  database: Database.Database,
+  conversationId: string,
+  content: ClientProjectionContentAccess
+): DomainRow {
+  return {
+    id: conversationId,
+    conversation_id: conversationId,
+    currentTaskList: projectCurrentTaskList(database, conversationId, content)
+  };
+}
+
 /**
  * The bound a Turn the user starts in this child conversation will inherit: the tool and skill
  * bound frozen by the child's first Turn and the work environments of its latest Turn. Null for a
@@ -1345,7 +1375,8 @@ export function projectChildConversationBoundary(
   `, { childExecutionId })[0];
   const first = turnAt('ASC');
   const latest = turnAt('DESC');
-  if (!first || !latest) throw new Error(`ChildExecution ${childExecutionId} has no Turn lineage.`);
+  // A reserved child may not have admitted its first Turn yet; there is no frozen boundary to show.
+  if (!first || !latest) return null;
   const firstTurnId = requireRuntimeId(first.turn_id);
   const latestTurnId = requireRuntimeId(latest.turn_id);
   const firstDocument = readTurnAuthorityDocument(database, firstTurnId, content, documents);

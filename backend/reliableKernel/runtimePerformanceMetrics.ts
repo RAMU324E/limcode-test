@@ -45,7 +45,6 @@ export type ClientFeedSnapshotReason =
   | 'initial'
   | 'client_request'
   | 'commit_scope'
-  | 'task_candidate'
   | 'change_batch_limit'
   | 'queue_limit'
   | 'external_commit';

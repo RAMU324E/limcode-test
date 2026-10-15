@@ -58,6 +58,8 @@ import {
   projectCompressionBlockRecord,
   projectConversationCommandReceiptRecord,
   projectConversationContextStatusRecord,
+  projectConversationExecutionBoundaryRecord,
+  projectConversationTaskListRecord,
   projectMessageWindowRecord,
   projectProcessRecord,
   projectQueuedTurnIntentRecord,
@@ -855,6 +857,71 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       END
     `);
   }
+
+  // Task cards are independent of the live transcript window. Capture their committed owner
+  // even when the ordered ToolOutcome writer has not caught up or a fork copied only the result.
+  for (const table of ['operation', 'tool_outcome', 'tool_result_artifact', 'tool_call_source_link'] as const) {
+    for (const operation of ['insert', 'update'] as const) {
+      const relevant = table === 'operation' || table === 'tool_outcome'
+        ? "NEW.status = 'succeeded'"
+        : table === 'tool_result_artifact' ? "NEW.role = 'no_effect_result'" : '1';
+      database.exec(`
+        CREATE TEMP TRIGGER ${quote(`capture_task_list_from_${table}_${operation}`)}
+        AFTER ${operation.toUpperCase()} ON ${quote(table)}
+        WHEN ${relevant}
+        BEGIN
+          INSERT INTO runtime_transaction_change (domain, id, kind)
+          SELECT 'ConversationTaskList', turn.conversation_id, 'upsert'
+            FROM tool_call AS call
+            JOIN turn ON turn.id = call.turn_id
+           WHERE call.id = NEW.tool_call_id
+             AND call.tool_name IN ('update_task_list', 'submit_plan')
+             AND EXISTS (SELECT 1 FROM tool_result_artifact
+                          WHERE tool_call_id = call.id AND role = 'no_effect_result')
+             AND (EXISTS (SELECT 1 FROM operation WHERE tool_call_id = call.id AND status = 'succeeded')
+                  OR EXISTS (SELECT 1 FROM tool_outcome WHERE tool_call_id = call.id AND status = 'succeeded'));
+        END
+      `);
+    }
+  }
+
+  // Only an active-generation transition changes these frozen display fields. Ordinary Turn
+  // heartbeats and tool/model stream commits do not re-read authority documents.
+  for (const operation of ['insert', 'update', 'delete'] as const) {
+    const row = operation === 'delete' ? 'OLD' : 'NEW';
+    const relevant = operation === 'update'
+      ? "OLD.status <> NEW.status AND (OLD.status = 'active' OR NEW.status = 'active')"
+      : `${row}.status = 'active'`;
+    database.exec(`
+      CREATE TEMP TRIGGER ${quote(`capture_execution_boundary_from_turn_${operation}`)}
+      AFTER ${operation.toUpperCase()} ON turn
+      WHEN ${relevant}
+      BEGIN
+        INSERT INTO runtime_transaction_change (domain, id, kind)
+        VALUES ('ConversationExecutionBoundary', ${row}.conversation_id, 'upsert');
+      END
+    `);
+  }
+  database.exec(`
+    CREATE TEMP TRIGGER capture_execution_boundary_from_authority
+    AFTER INSERT ON authority_snapshot
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      SELECT 'ConversationExecutionBoundary', conversation_id, 'upsert'
+        FROM turn WHERE id = NEW.turn_id AND status = 'active';
+    END
+  `);
+  for (const operation of ['insert', 'update'] as const) {
+    database.exec(`
+      CREATE TEMP TRIGGER ${quote(`capture_execution_boundary_from_child_turn_${operation}`)}
+      AFTER ${operation.toUpperCase()} ON child_execution_turn_link
+      BEGIN
+        INSERT INTO runtime_transaction_change (domain, id, kind)
+        SELECT 'ConversationExecutionBoundary', child_conversation_id, 'upsert'
+          FROM child_execution WHERE id = NEW.child_execution_id;
+      END
+    `);
+  }
 }
 
 function readInternalChangedDomains(database: Database.Database): string[] {
@@ -878,8 +945,18 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
   topology.set('ConversationContextStatus', topology.size);
   topology.set('ConversationCommandReceipt', topology.size);
   topology.set('ChildExecutionActivity', topology.size);
+  topology.set('ConversationTaskList', topology.size);
+  topology.set('ConversationExecutionBoundary', topology.size);
   return rows
     .map((row) => {
+      if (row.domain === 'ConversationTaskList' || row.domain === 'ConversationExecutionBoundary') {
+        if (!prepareCached(database, 'SELECT 1 FROM conversation WHERE id = ?').get(row.id)) {
+          return { ...row, kind: 'remove' as const };
+        }
+        return { ...row, record: row.domain === 'ConversationTaskList'
+          ? projectConversationTaskListRecord(database, row.id, clientProjectionContent)
+          : projectConversationExecutionBoundaryRecord(database, row.id, clientProjectionContent) };
+      }
       if (row.domain === 'ChildExecutionActivity') {
         if (row.kind === 'remove') return { ...row };
         const record = projectChildExecutionActivityRecord(database, row.id, clientProjectionContent);

@@ -370,6 +370,9 @@ test('任务：批准Plan建立rewrite基线，后续Turn只应用有效update',
 async function taskHarness(t) {
   const h = ui.stores(t); h.feed.$reset();
   const runtime = await createTaskRuntime(), feed = new kernel.BoundedClientFeed(runtime.database), frames = [];
+  let snapshotReads = 0;
+  const readSnapshot = runtime.database.clientProjectionSnapshot.bind(runtime.database);
+  runtime.database.clientProjectionSnapshot = (...args) => { snapshotReads += 1; return readSnapshot(...args); };
   t.after(async () => { feed.close(); await runtime.close(); });
   const connect = () => feed.connect({ activeConversationId: 'task-feed-conversation', send(frame) { frames.push(frame); } });
   let connection = await connect();
@@ -378,6 +381,7 @@ async function taskHarness(t) {
     h.feed.observeData(frame); feed.acknowledge({ sessionId: frame.sessionId, hostBootId: frame.hostBootId, messageSeq: frame.messageSeq }); return frame; };
   await drain(); const panel = (await ui.load('components/taskList/TaskListTopPanel.vue')).default;
   return { runtime, feed, store: h.feed, drain, render: async () => (await h.render(panel)).html,
+    get snapshotReads() { return snapshotReads; },
     async reconnect() { feed.disconnect(connection.sessionId); connection = await connect(); return drain(); }
   };
 }
@@ -388,17 +392,26 @@ test('任务：artifact经Feed和Pinia立即显示，滚出来源与重连后仍
   const before = await readCurrentTurnTaskCard(h.runtime.database, 'task-feed-turn');
   assert.equal(before.baselineToolCallId, 'task-feed-base');
   await h.runtime.settle('task-feed-update-one', { detail: { kind: 'task-list', operation: { kind: 'task_list.operation', mode: 'update', items: [{ title: 'Write tests', status: 'in_progress' }] } } });
-  const frame = await h.drain(); assert.equal(frame.projections.activeConversationWindow.currentTaskList.sourceToolCallId, 'task-feed-update-one');
+  const frame = await h.drain(); assert.equal(frame.type, 'reliable-kernel.changes');
+  assert.equal(h.store.projections.activeConversationWindow.currentTaskList.sourceToolCallId, 'task-feed-update-one');
+  assert.equal(h.snapshotReads, 1, 'settled task artifacts must not read the transcript snapshot');
   assert.ok((await h.render()).includes('Write tests'));
   await h.runtime.settle('task-feed-update-one', { operation: null, outcome: true }); await h.drain();
   assert.equal(h.store.projections.activeConversationWindow.currentTaskList.sourceToolCallId, 'task-feed-update-one');
+  await h.runtime.settle('task-feed-plan', { detail: { output: { kind: 'submit_plan.result', proposalId: 'task-feed-proposal', status: 'approved', executionTarget: 'current_conversation' } } });
+  assert.equal((await h.drain()).type, 'reliable-kernel.changes');
+  assert.equal(h.store.projections.activeConversationWindow.currentTaskList.sourceToolCallId, 'task-feed-plan');
+  assert.ok((await h.render()).includes('1/1'));
+  assert.equal(h.snapshotReads, 1);
   for (let from = 0; from < 205; from += 50) {
     await h.runtime.appendMessages(from, Math.min(50, 205 - from)); await h.drain();
   }
   await h.reconnect();
   assert.equal(h.store.records.ToolCall?.['task-feed-base'], undefined);
+  const reads = h.snapshotReads;
   await h.runtime.settle('task-feed-update-two', { detail: { kind: 'task-list', operation: { kind: 'task_list.operation', mode: 'update', items: [{ title: 'Write tests', status: 'completed' }] } } });
-  await h.drain(); assert.ok((await h.render()).includes('1/1'));
+  assert.equal((await h.drain()).type, 'reliable-kernel.changes'); assert.ok((await h.render()).includes('1/1'));
+  assert.equal(h.snapshotReads, reads, 'task tools outside the live window update through the same small delta');
   assert.equal(h.store.records.ToolCall?.['task-feed-update-two'], undefined);
   h.store.historyConversationId = 'task-feed-conversation';
   h.store.historyRecords = { Message: { old: { id: 'task-feed-old-message', conversation_id: 'task-feed-conversation', message_seq: '1', display_seq: '1', role: 'model' } } };
@@ -410,6 +423,31 @@ test('任务：artifact经Feed和Pinia立即显示，滚出来源与重连后仍
   assert.equal(latest.baselineToolCallId, 'task-feed-latest-rewrite');
   assert.equal(latest.operationCount, 1); assert.ok(latest.card.includes('Latest')); assert.equal(latest.card.includes('Write tests'), false);
   assert.ok((await h.render()).includes('0/1'));
+});
+
+test('Feed：回合开始和结束只更新冻结目录字段，Pinia状态与完整快照一致', async t => {
+  const h = await taskHarness(t);
+  await h.runtime.startTurn({ asChild: true });
+  const started = await h.drain();
+  assert.equal(started.type, 'reliable-kernel.changes');
+  assert.equal(h.snapshotReads, 1);
+  const window = h.store.projections.activeConversationWindow;
+  assert.deepEqual(window.activeTurnWorkEnvironment, { conversationId: 'task-feed-conversation',
+    turnId: 'task-feed-active-turn', enabled: true, defaultWorkEnvironmentId: 'frozen-directory',
+    allowedWorkEnvironmentIds: ['frozen-directory'] });
+  assert.equal(h.store.records.Turn['task-feed-active-turn'].status, 'active');
+  const expected = (await h.runtime.database.clientProjectionSnapshot('task-feed-conversation')).snapshot.activeConversationWindow;
+  assert.deepEqual(window.activeTurnWorkEnvironment, expected.activeTurnWorkEnvironment);
+  assert.deepEqual(window.childConversationBoundary, expected.childConversationBoundary);
+  assert.equal(window.childConversationBoundary.workEnvironment.turnId, 'task-feed-active-turn');
+  assert.deepEqual(window.childConversationBoundary.workEnvironment.allowedWorkEnvironmentIds, ['frozen-directory']);
+  const reads = h.snapshotReads;
+  await h.runtime.finishTurn();
+  assert.equal((await h.drain()).type, 'reliable-kernel.changes');
+  assert.equal(h.snapshotReads, reads);
+  assert.equal(h.store.projections.activeConversationWindow.activeTurnWorkEnvironment, null);
+  assert.deepEqual(h.store.projections.activeConversationWindow.childConversationBoundary, window.childConversationBoundary);
+  assert.equal(h.store.records.Turn['task-feed-active-turn'].status, 'terminated');
 });
 
 import { createHistoryFixture, projectionDatabase, projection, visited, sidebar, flushMicrotasks, P, Q } from './ui-history-fixture.mjs';
