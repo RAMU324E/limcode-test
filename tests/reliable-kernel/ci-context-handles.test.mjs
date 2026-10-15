@@ -478,6 +478,108 @@ test('unchanged user-tail resubmission or deletion keeps the ready catalog witho
   }
 });
 
+test('retry and edit after compression restore the original prefix catalog without expanding summary sources', async () => {
+  const { ContextSequenceControlPlane, contextSequenceNodeId } = kernelFile('contextSequence.js');
+  const { ContextCompressionControlPlane } = kernelFile('contextCompression.js');
+  for (const [nested, firstTail, imported, edited = false] of [[false, false, false], [true, false, false],
+    [false, true, false], [false, false, true], [false, true, false, true], [false, false, false, true],
+    [true, false, false, true], [false, true, true, true]]) {
+    const key = `compressed-retry-${nested}-${firstTail}-${imported}-${edited}`, { conversationId, turnId } = await createTurn(key);
+    const context = new ContextSequenceControlPlane(database, store);
+    const compression = new ContextCompressionControlPlane(database, store);
+    const authority = await store.ingest(database, JSON.stringify({ modelProfile: {
+      compressionThresholdTokens: 10000, contextWindowTokens: 20000,
+      tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
+    } }), 'application/json');
+    await database.transaction([repo('AuthoritySnapshot').insert({ id: key + '-authority', turn_id: turnId,
+      content_object_id: authority.id, created_at: NOW })]);
+    for (const [index, role] of ['user', 'model', 'user', edited ? 'user' : 'model', 'tool'].entries()) {
+      const content = await store.ingest(database, JSON.stringify({ role, parts: [{ text: `message ${index}` }] }), MESSAGE_TYPE);
+      const messageId = `${key}-message-${index}`, revisionId = messageId + '-revision';
+      await database.transaction([
+        repo('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
+        repo('MessageRevision').insert({ id: revisionId, message_id: messageId, revision_seq: 1n, role,
+          content_object_id: content.id, created_at: NOW }),
+        repo('MessagePartOfConversation').insert({ id: messageId + '-member', conversation_id: conversationId,
+          message_id: messageId, message_seq: BigInt(index + 1), created_at: NOW })
+      ]);
+      const current = await state.readConversationContextHandleStateRow(database, conversationId);
+      const base = current.context_root_id ? await context.materializeStructure(current.context_root_id) : null;
+      const compressedBase = base?.records[0]?.segment.segment_kind === 'compression';
+      const segmentId = messageId + '-segment';
+      const nodeId = contextSequenceNodeId(compressedBase ? base.root.tail_node_id : base?.root.root_node_id ?? null, segmentId);
+      const root = { id: `${key}-root-${index}`, conversation_id: conversationId, root_seq: (base?.root.root_seq ?? 0n) + 1n,
+        root_node_id: compressedBase ? base.root.root_node_id : nodeId, tail_node_id: compressedBase ? nodeId : null,
+        tail_segment_count: compressedBase ? base.root.tail_segment_count + 1n : 0n,
+        segment_count: (base?.root.segment_count ?? 0n) + 1n, estimated_tokens: 10n, created_at: NOW };
+      // The discarded suffix introduces P8. P9 must survive because the new summary uses it.
+      const entries = [{ kind: 'process', ref: 'P7', target: key + '-retained' },
+        ...(index >= 3 ? [{ kind: 'process', ref: 'P8', target: key + '-discarded' }] : []),
+        ...(index === 4 ? [{ kind: 'process', ref: 'P9', target: key + '-summary' }] : [])];
+      const head = (await rows('ConversationContextHeadLink', { conversation_id: conversationId }))[0];
+      await database.transaction([
+        repo('ContextSegment').insert({ id: segmentId, content_object_id: content.id, segment_kind: 'message', created_at: NOW }),
+        repo('ContextSegmentSource').insert({ id: messageId + '-source', segment_id: segmentId, source_kind: 'message_revision',
+          source_id: revisionId, source_revision: 1n, created_at: NOW }),
+        repo('ContextSequenceNode').insert({ id: nodeId, parent_node_id: compressedBase ? base.root.tail_node_id : base?.root.root_node_id ?? null,
+          segment_id: segmentId, created_at: NOW }), repo('ContextSequenceRoot').insert(root),
+        ...await state.prepareReadyConversationContextHandleState({ database, contentStore: store, conversationId,
+          current, contextRootId: root.id, catalog: { identityContractRevision: contract, retiredRefs: ['P1'], entries },
+          requiresNativeReset: false, now: NOW, rootShape: { rootNodeId: root.root_node_id,
+            tailNodeId: root.tail_node_id, tailSegmentCount: root.tail_segment_count, segmentCount: root.segment_count } }),
+        head ? repo('ConversationContextHeadLink').update(head.id, { root_id: root.id, updated_at: NOW })
+          : repo('ConversationContextHeadLink').insert({ id: key + '-head', conversation_id: conversationId, root_id: root.id, updated_at: NOW })]);
+      if (index === 1 && nested) await compression.create({ conversationId,
+        headRootId: root.id, authoritySnapshotId: key + '-authority', compressSegmentCount: 1,
+        title: 'earlier summary', summary: 'earlier summary', idempotencyKey: 'first' });
+    }
+    const originalRootId = await context.currentHeadRootId(conversationId);
+    const original = await context.materializeStructure(originalRootId);
+    const compressed = await compression.create({ conversationId, headRootId: originalRootId,
+      authoritySnapshotId: key + '-authority', compressSegmentCount: nested ? 1 : 2,
+      title: 'new summary', summary: 'retained summary P7 P9', idempotencyKey: 'second' });
+    if (imported) {
+      const current = await state.readConversationContextHandleStateRow(database, conversationId);
+      await database.transaction(state.importConversationContextHandleStateSteps(conversationId, NOW, current, compressed.rootId, false));
+    }
+    await reopen();
+    const reads = [], queries = [], originalRead = store.read.bind(store), originalSnapshot = database.snapshot.bind(database);
+    store.read = async metadata => { reads.push(metadata.id); return originalRead(metadata); };
+    database.snapshot = async requests => { queries.push(...requests); return originalSnapshot(requests); };
+    try {
+      const editedRevisionId = key + '-edited-user';
+      const edit = edited ? await store.ingest(database,
+        JSON.stringify({ role: 'user', parts: [{ text: 'Changed input P7 P8 P9' }] }), MESSAGE_TYPE) : undefined;
+      const plan = await new ContextSequenceControlPlane(database, store).prepareMessageTruncateMutation({ conversationId,
+        messageRevisionId: key + `-message-${firstTail ? 2 : 3}-revision`, idempotencyKey: key,
+        ...(edit ? { replacement: { messageRevisionId: editedRevisionId, contentObjectId: edit.id,
+          contentByteLength: edit.byte_length, contentEstimatedTokens: 5 } } : {}) });
+      await database.transaction([
+        ...(edit ? [repo('MessageRevision').insertWithNextSequence({ id: editedRevisionId,
+          message_id: key + `-message-${firstTail ? 2 : 3}`, role: 'user', content_object_id: edit.id, created_at: NOW
+        }, { column: 'revision_seq', scope: { message_id: key + `-message-${firstTail ? 2 : 3}` } })] : []),
+        ...plan.steps
+      ]);
+      assert.equal((await state.readConversationContextHandleStateRow(database, conversationId)).state, imported ? 'pending' : 'ready');
+      if (imported) continue; // Older generations cannot supply a directory for the imported scope.
+      const ready = await state.readCurrentConversationContextHandleState(database, store, conversationId);
+      assert.deepEqual(ready.catalog.entries, [{ kind: 'process', ref: 'P7', target: key + '-retained' },
+        { kind: 'process', ref: 'P9', target: key + '-summary' }]);
+      assert.deepEqual(ready.catalog.retiredRefs, ['P1']);
+      assert.ok(ready.catalog.allocationHighWater.process >= 9);
+      assert.ok(ready.requiresNativeReset);
+      const selected = await new ContextSequenceControlPlane(database, store).materializeStructure(ready.row.context_root_id);
+      assert.equal(selected.records[0].segment.id, compressed.summarySegmentId);
+      if (firstTail) assert.equal(selected.records.length, edited ? 2 : 1);
+      else assert.equal(selected.records.at(edited ? -2 : -1).node.id, original.records.at(-3).node.id);
+      if (edited) assert.equal(selected.records.at(-1).segment.content_object_id, edit.id);
+      assert.equal(queries.some(query => query.domain === 'CompressionBlockSource' || query.domain === 'ModelRequest'), false);
+      const hiddenContent = original.records.slice(0, nested ? 1 : 2).map(record => record.segment.content_object_id);
+      assert.equal(reads.some(id => hiddenContent.includes(id)), false, 'compressed source bodies are never opened');
+    } finally { store.read = originalRead; database.snapshot = originalSnapshot; }
+  }
+});
+
 registerContextHandleBoundaryTests({
   kernel, kernelFile, load, compiled, require, Database, repo, NOW, modelRequestAggregate,
   temporary: () => configuration.root, database: () => database, store: () => store,

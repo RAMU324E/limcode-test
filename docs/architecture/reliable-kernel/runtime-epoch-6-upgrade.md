@@ -50,6 +50,8 @@ RuntimeDeliveryAnswerPresentation 按 delivery_id 唯一，独立归属于接收
 
 epoch 6 同时新增 ConversationContextHandleState 与 ContextRootHandleCatalog 两个独立领域。升级事务只为每个已有 Conversation 的确切当前 head 插入 pending、revision=0、provenance_revision=0、content_object_id=NULL、requires_native_reset=1 的标记，按 250 行分页读取，不读 CAS、不在升级事务内回放历史或重建目录；之后由选中根的有界、可恢复检查点重建。
 
+压缩后截断可见尾段时，按选中压缩块的原始根、保留节点和同代结构索引恢复压缩前的确切前缀目录，只补入保留摘要实际使用的已证明引用；重试事务直接保存新根目录，不展开压缩来源或读取历史请求。缺少同代快照的位置仍保持 pending，不复用已丢弃输出的完整目录。
+
 紧凑普通 catalog-reference recipe、以 toolsReference.contentObjectId 冻结工具定义（application/vnd.limcode.frozen-tool-definitions+json 类型的不可变 CAS）的普通与原生压缩请求配方，以及新写入的至多 8192 字节 packed small-CAS，都改变读入语义，一并由 epoch 6 的整库栅栏控制准入：它们只用于新写入；升级保留每一条既有领域行、内联配方与 loose CAS 的原字节，不在启动时打包旧正文。旧 epoch 5 reader 在打开时拒绝 epoch 6，存活或身份未知的旧 Host 阻止升级。CAS 小正文存储只在准入 6 后按需建立，缺失是正常的旧库状态，已有未知或损坏的存储不可静默替换。
 
 旧内联 tools 配方保留原字节与原读取路径；引用缺失、类型或摘要不符时拒绝，绝不退回当前工具设置。该引用是独立于生产者 Turn/Conversation 的强 CAS 边：分支沿用原配方，删除源对话不删正文，整库复制与合库继续携带全部已登记 ContentObject；未来可达性 GC 必须沿 toolsReference.contentObjectId 保留正文。

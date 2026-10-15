@@ -1696,6 +1696,14 @@ export class ContextSequenceControlPlane {
           database: this.database, contentStore: this.contentStore, conversationId,
           previousRootId: state.rootId, nextRootId: rootId, mode: 'rewrite', now,
           reuseCurrentCatalog,
+          ...(retainedSummary && targetIndex > 0 ? {
+            compressedPrefix: {
+              nodeId: targetIndex > 1 ? requireId(state.records[targetIndex - 1].node.id, 'prefix node id')
+                : nullableId(state.records[1].node.parent_node_id, 'compression source prefix node id'),
+              // A manually edited user occurrence has no producer bindings to add to this prefix.
+              tailSegmentCount: BigInt(targetIndex - 1)
+            }
+          } : {}),
           rootShape: {
             rootNodeId: retainedSummary ? summaryNodeId : lastNodeId,
             tailNodeId: retainedSummary ? lastNodeId : null,

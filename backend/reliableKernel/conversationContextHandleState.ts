@@ -10,6 +10,9 @@ import { stablePhaseFId, isTransactionAssertionFailure } from './phaseFIdentity'
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { readContextHandleOccurrenceCatalog, type ContextHandleOccurrenceEvidence } from './contextHandleOccurrenceEvidence';
+import { compressionRootIdFor } from './contextCompression';
+import { selectConversationCompressionBlock } from './compressionBlockOwnership';
+import { listAllDomainRows } from './repositoryPagination';
 
 export const CONTEXT_HANDLE_STATE_DOMAIN = 'ConversationContextHandleState';
 export const CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN = 'ContextRootHandleCatalog';
@@ -117,6 +120,8 @@ export async function prepareContextHandleHeadTransition(input: {
   rootShape?: ContextHandleRootShape;
   /** The caller proved that only a final user occurrence is deleted or replaced unchanged. */
   reuseCurrentCatalog?: boolean;
+  /** Retained original chain, excluding an edited user occurrence appended after truncation. */
+  compressedPrefix?: { nodeId: string | null; tailSegmentCount: bigint };
   occurrence?: ContextHandleOccurrenceEvidence; occurrences?: readonly ContextHandleOccurrenceEvidence[];
   current?: DomainRow;
 }): Promise<ContextHandleHeadTransitionPlan> {
@@ -148,9 +153,16 @@ export async function prepareContextHandleHeadTransition(input: {
           input.nextRootId, snapshot.content_object_id as string | null, input.now, provenanceRevision, input.rootShape));
       }
     }
+    const restored = !snapshot && current.state === 'ready' && input.rootShape
+      && input.compressedPrefix !== undefined
+      ? await prepareCompressedPrefixCatalog(input.database, input.contentStore, input.conversationId,
+        input.nextRootId, input.rootShape, input.compressedPrefix, provenanceRevision, input.now)
+      : undefined;
+    if (restored) aliasSteps.push(...restored.steps);
     if (!activate) return { state: current, steps: aliasSteps };
     const state = { ...current, context_root_id: input.nextRootId, revision: revision(current) + 1n,
-      state: snapshot ? 'ready' : 'pending', content_object_id: snapshot?.content_object_id ?? null,
+      state: snapshot || restored ? 'ready' : 'pending',
+      content_object_id: restored ? restored.contentObjectId : snapshot?.content_object_id ?? null,
       requires_native_reset: revision(current) + 1n, updated_at: input.now };
     return { state, steps: [contextHandleStateAssertion(current), ...aliasSteps, ...(snapshot
       ? [DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN).assert(String(snapshot.id), {
@@ -200,6 +212,61 @@ export async function prepareContextHandleHeadTransition(input: {
     updated_at: input.now };
   steps.push(repository.update(String(current.id), statePatch(state)));
   return { state, steps };
+}
+
+/** Restore the exact pre-compression prefix, adding only bindings used by the retained summary. */
+async function prepareCompressedPrefixCatalog(database: RuntimeDatabase, store: ContentAddressedStore,
+  conversationId: string, nextRootId: string, shape: ContextHandleRootShape,
+  retainedPrefix: { nodeId: string | null; tailSegmentCount: bigint },
+  provenanceRevision: bigint, now: string): Promise<{ contentObjectId: string | null; steps: RepositoryTransactionStep[] } | undefined> {
+  const get = async (domain: string, id: string): Promise<DomainRow | undefined> =>
+    (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | undefined;
+  if (!shape.rootNodeId) return undefined;
+  const summaryNode = await get('ContextSequenceNode', shape.rootNodeId);
+  const summary = summaryNode && await get('ContextSegment', String(summaryNode.segment_id));
+  if (summary?.segment_kind !== 'compression') return undefined;
+  const sources = await listAllDomainRows(database, 'ContextSegmentSource', { segment_id: summary.id });
+  if (!sources.length) return undefined;
+  const block = await selectConversationCompressionBlock(database, String(summary.id), conversationId, sources);
+  const projections = (await database.snapshot([DOMAIN_REPOSITORIES.domain('ModelContextProjection')
+    .list({ where: { owner_kind: 'compression_block', owner_id: block.id }, limit: 1 })])).snapshot[0] as DomainRow[];
+  const projection = projections[0];
+  if (!projection || projection.purpose !== 'compression-source') return undefined;
+  const original = await get('ContextSequenceRoot', String(projection.root_id));
+  const compressedRootId = compressionRootIdFor(String(block.id), String(projection.root_id));
+  const compressed = await get('ContextSequenceRoot', compressedRootId);
+  if (!original || original.conversation_id !== conversationId || !compressed
+    || compressed.conversation_id !== conversationId || compressed.root_node_id !== shape.rootNodeId
+    || retainedPrefix.tailSegmentCount > BigInt(String(compressed.tail_segment_count))) return undefined;
+  const compressedCatalog = await readContextRootHandleCatalogRow(database, conversationId, compressedRootId, provenanceRevision);
+  if (!compressedCatalog) return undefined;
+  const originalNode = await get('ContextSequenceNode', String(original.root_node_id));
+  const originalSegment = originalNode && await get('ContextSegment', String(originalNode.segment_id));
+  const originalCompressed = originalSegment?.segment_kind === 'compression';
+  const segmentCount = BigInt(String(original.segment_count)) - BigInt(String(compressed.tail_segment_count)) + retainedPrefix.tailSegmentCount;
+  const originalShape: ContextHandleRootShape = { rootNodeId: originalCompressed ? original.root_node_id as string : retainedPrefix.nodeId,
+    tailNodeId: originalCompressed && segmentCount > 1n ? retainedPrefix.nodeId : null,
+    tailSegmentCount: originalCompressed ? segmentCount - 1n : 0n, segmentCount };
+  const where = { conversation_id: conversationId, provenance_revision: provenanceRevision, ...shapeRow(originalShape) };
+  const found = (await database.snapshot([DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN)
+    .list({ where, limit: 1 })])).snapshot[0] as DomainRow[];
+  const prefix = found[0];
+  if (!prefix) return undefined;
+  const base = await readCatalogForRow(database, store, { ...prefix, state: 'ready', requires_native_reset: 0n });
+  const lookup = await readCatalogForRow(database, store, { ...compressedCatalog, state: 'ready', requires_native_reset: 0n });
+  const metadata = await get('ContentObject', String(summary.content_object_id));
+  const additions = await readContextHandleOccurrenceCatalog(database, store,
+    { kind: 'compression', content: await store.read(metadata as unknown as ContentObjectMetadata) }, lookup);
+  const catalog = mergeModelHandleCatalogs(base, additions);
+  const content = sameCatalog(base, catalog) ? { contentObjectId: prefix.content_object_id as string | null, steps: [] }
+    : await prepareCatalogContent(database, store, conversationId, catalog);
+  return { contentObjectId: content.contentObjectId, steps: [
+    ...[prefix, compressedCatalog].map(row => DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN)
+      .assert(String(row.id), { conversation_id: conversationId, provenance_revision: provenanceRevision,
+        context_root_id: row.context_root_id, content_object_id: row.content_object_id })),
+    ...content.steps, ...await contextRootCatalogSnapshotSteps(database, conversationId, nextRootId,
+      content.contentObjectId, now, provenanceRevision, shape)
+  ] };
 }
 
 /** Fresh Conversation creators already own the explicit planned state in their transaction. */
