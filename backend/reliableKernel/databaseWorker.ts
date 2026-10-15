@@ -1,6 +1,6 @@
 import { executeSingleResponseMeasurement } from './singleResponseMeasurement';
 import { readNativePendingWork, readNativeSteeringInFlightSnapshot, readNativeAdmittedProviderCallIds } from './nativeWorkSnapshot';
-import { readCurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
+import { CurrentTurnTaskCardCache } from './currentTurnTaskSnapshot';
 import { assertConversationContextHandleState, assertConversationContextHandleStateUpdate, assertContextRootHandleCatalog } from './conversationContextHandleStateInvariant';
 import { visitForkMessageCopyAssertions, visitForkMessageCopyInserts } from './forkMessageCopy';
 import { captureAnswerPresentation, assertAnswerPresentation, projectAnswerPresentation } from './answerPresentation';
@@ -286,7 +286,9 @@ async function start(): Promise<void> {
   let maintenance: MaintenanceTransaction | undefined;
   const contextCasCache = new VerifiedContextCasCache();
   const attachmentScopeCache = new AttachmentProjectionScopeCache();
+  const taskCards = new CurrentTurnTaskCardCache();
   const postCommit = (result: RuntimeCommitResult): void => {
+    taskCards.invalidate(result.changes);
     const changes = attachmentScopeCache.takeProjectionChanges();
     if (changes) result.attachmentProjectionChanges = changes;
     post({ type: 'commit', result });
@@ -313,7 +315,7 @@ async function start(): Promise<void> {
         throw new Error('Maintenance transactions run only on a Runtime database opened for maintenance.');
       }
       // Maintenance/raw repair never shares reusable read proofs, including rollback paths.
-      if (request.kind.startsWith('maintenance')) attachmentScopeCache.clear();
+      if (request.kind.startsWith('maintenance')) { attachmentScopeCache.clear(); taskCards.clear(); }
       if (request.kind === 'maintenanceRepairHistory') {
         assertDatabaseBinding(writer, data.binding);
         const result = committedDurably(writer, () => repairHistoryTransaction(writer, request.input));
@@ -426,9 +428,13 @@ async function start(): Promise<void> {
         return;
       }
       if (request.kind === 'currentTurnTaskSnapshot') {
+        const before = String(writer.pragma('data_version', { simple: true }));
         const snapshot = reader.transaction(() => {
           assertDatabaseBinding(reader, data.binding);
-          return readCurrentTurnTaskSnapshot(reader, request.turnId, clientProjectionContent.readVerifiedBytes);
+          const version = String(writer.pragma('data_version', { simple: true }));
+          taskCards.synchronizeExternalVersion(version);
+          // A peer commit during snapshot pinning is read normally but is not retained for reuse.
+          return taskCards.read(reader, request.turnId, clientProjectionContent.readVerifiedBytes, before === version);
         })();
         respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
@@ -684,6 +690,7 @@ async function start(): Promise<void> {
       closed = true;
       requestQueue.close();
       attachmentScopeCache.clear();
+      taskCards.clear();
       detachRuntimeStatementCache(reader);
       detachRuntimeStatementCache(writer);
       casByteAccess.close();
@@ -739,6 +746,16 @@ function configureTransactionChangeCapture(database: Database.Database): void {
     }
   }
 
+  const taskOwnersForMessages = (messageIds: string): string => `
+    INSERT INTO runtime_transaction_change (domain, id, kind)
+    SELECT 'ConversationTaskList', turn.conversation_id, 'upsert'
+      FROM tool_call_source_link AS source
+      JOIN tool_call AS call ON call.id = source.tool_call_id
+      JOIN turn ON turn.id = call.turn_id
+     WHERE source.message_id IN (${messageIds})
+       AND call.tool_name IN ('update_task_list', 'submit_plan');
+  `;
+
   // Message 是独立事实，conversation membership/current revision 也是独立 Link。Link 改变时
   // 重新投影 Message 窗口记录；尚未组成完整窗口的 Message 只产生幂等 remove，不阻塞写事务。
   for (const relation of [
@@ -748,12 +765,16 @@ function configureTransactionChangeCapture(database: Database.Database): void {
     for (const operation of ['insert', 'update', 'delete'] as const) {
       const row = operation === 'delete' ? 'OLD' : 'NEW';
       const kind = operation === 'delete' ? 'remove' : 'upsert';
+      const taskChange = relation.table === 'message_part_of_conversation'
+        ? taskOwnersForMessages(operation === 'update' ? 'OLD.message_id, NEW.message_id' : `${row}.message_id`)
+        : '';
       database.exec(`
         CREATE TEMP TRIGGER ${quote(`capture_message_from_${relation.table}_${operation}`)}
         AFTER ${operation.toUpperCase()} ON ${quote(relation.table)}
         BEGIN
           INSERT INTO runtime_transaction_change (domain, id, kind)
           VALUES ('Message', ${row}.${quote(relation.messageColumn)}, '${kind}');
+          ${taskChange}
         END
       `);
     }
@@ -861,10 +882,11 @@ function configureTransactionChangeCapture(database: Database.Database): void {
   // Task cards are independent of the live transcript window. Capture their committed owner
   // even when the ordered ToolOutcome writer has not caught up or a fork copied only the result.
   for (const table of ['operation', 'tool_outcome', 'tool_result_artifact', 'tool_call_source_link'] as const) {
-    for (const operation of ['insert', 'update'] as const) {
+    for (const operation of ['insert', 'update', 'delete'] as const) {
+      const row = operation === 'delete' ? 'OLD' : 'NEW';
       const relevant = table === 'operation' || table === 'tool_outcome'
-        ? "NEW.status = 'succeeded'"
-        : table === 'tool_result_artifact' ? "NEW.role = 'no_effect_result'" : '1';
+        ? `${row}.status = 'succeeded'`
+        : table === 'tool_result_artifact' ? `${row}.role = 'no_effect_result'` : '1';
       database.exec(`
         CREATE TEMP TRIGGER ${quote(`capture_task_list_from_${table}_${operation}`)}
         AFTER ${operation.toUpperCase()} ON ${quote(table)}
@@ -874,16 +896,35 @@ function configureTransactionChangeCapture(database: Database.Database): void {
           SELECT 'ConversationTaskList', turn.conversation_id, 'upsert'
             FROM tool_call AS call
             JOIN turn ON turn.id = call.turn_id
-           WHERE call.id = NEW.tool_call_id
+           WHERE call.id = ${row}.tool_call_id
              AND call.tool_name IN ('update_task_list', 'submit_plan')
-             AND EXISTS (SELECT 1 FROM tool_result_artifact
-                          WHERE tool_call_id = call.id AND role = 'no_effect_result')
-             AND (EXISTS (SELECT 1 FROM operation WHERE tool_call_id = call.id AND status = 'succeeded')
-                  OR EXISTS (SELECT 1 FROM tool_outcome WHERE tool_call_id = call.id AND status = 'succeeded'));
+             ${table === 'tool_result_artifact' ? '' : `AND EXISTS (SELECT 1 FROM tool_result_artifact
+               WHERE tool_call_id = call.id AND role = 'no_effect_result')`};
         END
       `);
     }
   }
+  database.exec(`
+    CREATE TEMP TRIGGER capture_task_list_from_message_visibility
+    AFTER UPDATE OF deleted_at ON message
+    WHEN OLD.deleted_at IS NOT NEW.deleted_at
+    BEGIN ${taskOwnersForMessages('NEW.id')} END;
+
+    CREATE TEMP TRIGGER capture_task_list_from_call_delete
+    AFTER DELETE ON tool_call
+    WHEN OLD.tool_name IN ('update_task_list', 'submit_plan')
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      SELECT 'ConversationTaskList', conversation_id, 'upsert' FROM turn WHERE id = OLD.turn_id;
+    END;
+
+    CREATE TEMP TRIGGER capture_task_list_from_turn_delete
+    AFTER DELETE ON turn
+    BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+      VALUES ('ConversationTaskList', OLD.conversation_id, 'upsert');
+    END;
+  `);
 
   // Only an active-generation transition changes these frozen display fields. Ordinary Turn
   // heartbeats and tool/model stream commits do not re-read authority documents.

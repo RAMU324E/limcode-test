@@ -146,12 +146,8 @@ export async function readCurrentTurnTaskCard(
 ): Promise<FrozenTurnTaskCard | undefined> {
   const turnId = requiredText(turnIdInput, 'turnId');
   const barrier = await database.currentTurnTaskSnapshot(turnId);
-  const projection = buildCurrentTurnTaskProjection({
-    turnId,
-    operations: barrier.snapshot.operations,
-    frozenAtCommitSeq: barrier.snapshotCommitSeq
-  });
-  return projection ? freezeCurrentTurnTaskCard(projection) : undefined;
+  const card = barrier.snapshot.card;
+  return card ? { ...card, frozenAtCommitSeq: barrier.snapshotCommitSeq } : undefined;
 }
 
 export function freezeCurrentTurnTaskCard(projection: CurrentTurnTaskProjection): FrozenTurnTaskCard {

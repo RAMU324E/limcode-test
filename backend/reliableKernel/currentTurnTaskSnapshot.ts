@@ -1,22 +1,66 @@
 import type Database from 'better-sqlite3';
 import {
   approvedSubmitPlanTaskOperation,
+  buildCurrentTurnTaskProjection,
+  freezeCurrentTurnTaskCard,
   isApprovedCurrentConversationPlanArtifact,
   taskListOperationFromSettledArtifact,
-  type CurrentTurnTaskOperationFact
+  type CurrentTurnTaskOperationFact,
+  type FrozenTurnTaskCard
 } from './currentTurnTaskProjection';
+import type { RuntimeChange } from './contracts';
 import { toolArtifactIdentifiesCallInWorker } from './copiedToolIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { prepareCached } from './runtimeStatementCache';
 import { requireRuntimeId } from './runtimeSqlRows';
 
-/** Only the latest authoritative rewrite and its subsequent updates cross the worker boundary. */
+/** The complete task card is reduced once on the worker and frozen with the request frontier. */
 export interface CurrentTurnTaskSnapshot {
   turnId: string;
-  operations: CurrentTurnTaskOperationFact[];
+  card?: FrozenTurnTaskCard;
 }
 
 type ReadVerifiedBytes = (metadata: DomainRow) => Buffer;
+
+/** Local commits invalidate only affected task owners; peer commits use SQLite's data version. */
+export class CurrentTurnTaskCardCache {
+  private readonly cards = new Map<string, FrozenTurnTaskCard | undefined>();
+  private externalVersion?: string;
+
+  public clear(): void { this.cards.clear(); }
+
+  public synchronizeExternalVersion(version: string): void {
+    if (version !== this.externalVersion) this.clear();
+    this.externalVersion = version;
+  }
+
+  public invalidate(changes: readonly RuntimeChange[]): void {
+    for (const change of changes) {
+      if (change.domain === 'ConversationTaskList' || (change.domain === 'Conversation' && change.kind === 'remove')) {
+        this.cards.delete(change.id);
+      }
+    }
+  }
+
+  public read(database: Database.Database, turnIdInput: string, readVerifiedBytes: ReadVerifiedBytes,
+    reuse = true): CurrentTurnTaskSnapshot {
+    const turnId = requireRuntimeId(turnIdInput);
+    const turn = prepareCached(database, 'SELECT conversation_id FROM turn WHERE id = ?').get(turnId) as DomainRow | undefined;
+    if (!turn) throw new Error(`Turn ${turnId} is missing.`);
+    const conversationId = requireRuntimeId(turn.conversation_id);
+    let card = reuse ? this.cards.get(conversationId) : undefined;
+    if (!reuse || !this.cards.has(conversationId)) {
+      const projection = buildCurrentTurnTaskProjection({ turnId,
+        operations: readCurrentTurnTaskOperations(database, conversationId, readVerifiedBytes) });
+      card = projection && freezeCurrentTurnTaskCard(projection);
+      if (reuse) {
+        this.cards.set(conversationId, card);
+        if (this.cards.size > 8) this.cards.delete(this.cards.keys().next().value!);
+      }
+    }
+    return { turnId, ...(card ? { card: { ...card, turnId } } : {}) };
+  }
+}
 
 // Drive the scan from the existing conversation/message_seq index. CROSS JOIN keeps SQLite from
 // starting with every ToolCall and sorting the entire history before yielding its first candidate.
@@ -51,16 +95,11 @@ const TASK_CANDIDATES_SQL = `
  * CAS is read only for visited candidates. Once a valid rewrite is found, superseded artifacts
  * (even malformed/missing old bodies) have no authority over this card and are not opened.
  */
-export function readCurrentTurnTaskSnapshot(
+function readCurrentTurnTaskOperations(
   database: Database.Database,
-  turnIdInput: string,
+  conversationId: string,
   readVerifiedBytes: ReadVerifiedBytes
-): CurrentTurnTaskSnapshot {
-  const turnId = requireRuntimeId(turnIdInput);
-  const rawTurn = prepareCached(database, 'SELECT * FROM turn WHERE id = ?').get(turnId);
-  if (!rawTurn) throw new Error(`Turn ${turnId} is missing.`);
-  const turn = DOMAIN_REPOSITORIES.codec('Turn').decode(rawTurn as DomainRow);
-  const conversationId = requireRuntimeId(turn.conversation_id);
+): CurrentTurnTaskOperationFact[] {
   const operations: CurrentTurnTaskOperationFact[] = [];
   const candidates = prepareCached(database, TASK_CANDIDATES_SQL).iterate({ conversationId });
   for (const value of candidates) {
@@ -94,10 +133,10 @@ export function readCurrentTurnTaskSnapshot(
       sourceMessageSeq: nonNegativeInteger(row.source_message_seq, 'MessagePartOfConversation.message_seq'),
       providerOrdinal: nonNegativeInteger(row.source_provider_ordinal, 'ToolCallSourceLink.provider_ordinal')
     });
-    if (operation.mode === 'rewrite') return { turnId, operations: operations.reverse() };
+    if (operation.mode === 'rewrite') return operations.reverse();
   }
   // Update-only history has no baseline. Do not return a historical update inventory to the Host.
-  return { turnId, operations: [] };
+  return [];
 }
 
 function identifyArtifact(database: Database.Database, call: DomainRow, value: unknown): unknown {

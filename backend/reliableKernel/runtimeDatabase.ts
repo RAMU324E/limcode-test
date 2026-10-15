@@ -469,7 +469,7 @@ export class RuntimeDatabase {
     return this.request<SnapshotBarrier<DomainRow[]>>({ kind: 'snapshotAll', read });
   }
 
-  /** Latest task rewrite and update suffix, ordered and verified in one worker read snapshot. */
+  /** Complete current task card, reduced and reused on the worker within one read snapshot. */
   public currentTurnTaskSnapshot(turnId: string): Promise<SnapshotBarrier<CurrentTurnTaskSnapshot>> {
     return this.request({ kind: 'currentTurnTaskSnapshot', turnId });
   }

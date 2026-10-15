@@ -67,6 +67,8 @@ dimensions 与计数字段必须在 metadata allowlist 内，合计不超过 9 �
 
 "外部提交成本"的统计口径：`feed.snapshot.summary` 中 `external_commit` 只覆盖对话面板的 Client Feed。侧栏历史列表的外部刷新走 Facade 的 `ExternalDataVersionWatcher`，运行工作的外部刷新走 ProductRuntime 的同名 watcher，二者都不产生 Feed 快照；它们的成本体现在 `database.request.summary` 的 `conversationHistoryProjection`、`externalDataVersion` 等 requestKind 中，汇总脚本会按 requestKind 列出。
 
+普通模型请求的任务卡在 worker 内按 Conversation 复用，空清单也复用；本 Host 的无关消息、流状态与改名不再查询历史任务或回放清单。任务结果、来源可见性或归属变化通过同事务 `ConversationTaskList` 标记失效，跨 Turn 只更新卡片的当前 Turn 与读取前沿。维护操作清空复用结果；跨窗口目前沿 SQLite `data_version` 在任何外部提交后清空，下次读取重算，不增加独立通知游标。
+
 逐条事件（每类每 5 分钟最多 20 条，汇总仍计入全部样本）：
 
 - `database.busy`：requestKind、stage（`begin`/`body`/`commit`）、domain（事务首个写入领域）、reasonCode、lockWaitMs、elapsedMs；
