@@ -382,6 +382,102 @@ test('compressed-tail truncation reuses the retained catalog and edits only the 
   }
 });
 
+test('unchanged user-tail resubmission or deletion keeps the ready catalog without a prefix snapshot or lineage reads', async () => {
+  const { ContextSequenceControlPlane, contextSequenceNodeId } = kernelFile('contextSequence.js');
+  const { upgradeConversationContextHandles } = kernelFile('conversationContextHandleUpgrade.js');
+  const { estimateStoredModelFacingWindowTokens } = kernelFile('modelFacingContextProjection.js');
+  const summaryText = 'retained summary';
+  const summaryTokens = BigInt(await estimateStoredModelFacingWindowTokens({ length: 1,
+    read: async () => ({ segmentKind: 'compression', messageRole: null, contentType: 'text/plain', content: summaryText }) }));
+  for (const scenario of ['same-user', 'delete-user', 'changed-user', 'same-model', 'discard-model-output']) {
+    const key = 'unchanged-tail-' + scenario, { conversationId } = await createTurn(key);
+    const content = await store.ingest(database, 'P1 unchanged input', 'text/plain');
+    const summary = await store.ingest(database, summaryText, 'text/plain');
+    const different = await store.ingest(database, 'changed input', 'text/plain');
+    const summaryNode = contextSequenceNodeId(null, key + '-summary');
+    const tailNode = contextSequenceNodeId(null, key + '-tail');
+    const outputNode = contextSequenceNodeId(tailNode, key + '-output');
+    const messageId = key + '-message', revisionId = messageId + '-revision';
+    const hasOutput = scenario === 'discard-model-output';
+    const root = { id: key + '-root', conversation_id: conversationId, root_seq: 1n,
+      root_node_id: summaryNode, tail_node_id: hasOutput ? outputNode : tailNode,
+      tail_segment_count: hasOutput ? 2n : 1n, segment_count: hasOutput ? 3n : 2n,
+      estimated_tokens: 123n, created_at: NOW };
+    const initial = await state.readConversationContextHandleStateRow(database, conversationId);
+    await database.transaction([
+      repo('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
+      repo('MessageRevision').insert({ id: revisionId, message_id: messageId, revision_seq: 1n,
+        role: scenario === 'same-model' ? 'model' : 'user', content_object_id: content.id, created_at: NOW }),
+      repo('MessagePartOfConversation').insert({ id: key + '-member', conversation_id: conversationId,
+        message_id: messageId, message_seq: 1n, created_at: NOW }),
+      ...[['summary', 'compression', summaryNode, null], ['tail', 'message', tailNode, null],
+        ...(hasOutput ? [['output', 'message', outputNode, tailNode]] : [])].flatMap(([suffix, kind, node, parent]) => [
+        repo('ContextSegment').insert({ id: key + '-' + suffix, content_object_id: suffix === 'summary' ? summary.id : content.id, segment_kind: kind, created_at: NOW }),
+        repo('ContextSequenceNode').insert({ id: node, parent_node_id: parent, segment_id: key + '-' + suffix, created_at: NOW })
+      ]),
+      repo('ContextSegmentSource').insert({ id: key + '-source', segment_id: key + '-tail',
+        source_kind: 'message_revision', source_id: revisionId, source_revision: 1n, created_at: NOW }),
+      ...(hasOutput ? [
+        repo('Message').insert({ id: key + '-output-message', created_at: NOW, updated_at: NOW, deleted_at: null }),
+        repo('MessageRevision').insert({ id: key + '-output-revision', message_id: key + '-output-message',
+          revision_seq: 1n, role: 'model', content_object_id: content.id, created_at: NOW }),
+        repo('MessagePartOfConversation').insert({ id: key + '-output-member', conversation_id: conversationId,
+          message_id: key + '-output-message', message_seq: 2n, created_at: NOW }),
+        repo('ContextSegmentSource').insert({ id: key + '-output-source', segment_id: key + '-output',
+          source_kind: 'message_revision', source_id: key + '-output-revision', source_revision: 1n, created_at: NOW })
+      ] : []),
+      repo('ContextSequenceRoot').insert(root),
+      repo('ConversationContextHeadLink').insert({ id: key + '-head', conversation_id: conversationId, root_id: root.id, updated_at: NOW }),
+      ...await state.prepareReadyConversationContextHandleState({ database, contentStore: store, conversationId,
+        current: initial, contextRootId: root.id, catalog: IMPORT_CATALOG, requiresNativeReset: false, now: NOW,
+        rootShape: { rootNodeId: root.root_node_id, tailNodeId: root.tail_node_id,
+          tailSegmentCount: root.tail_segment_count, segmentCount: root.segment_count } })
+    ]);
+    assert.equal((await rows('ContextRootHandleCatalog', { conversation_id: conversationId })).length, 1);
+    const originalCatalog = await state.readConversationContextHandleStateRow(database, conversationId);
+    let previousRevisionId = revisionId;
+    for (let retry = 0; retry < (scenario === 'same-user' ? 2 : 1); retry++) {
+      const nextRevisionId = key + '-resubmitted-' + retry;
+      const replacement = scenario === 'changed-user' ? different : content;
+      const reads = [], originalRead = store.read.bind(store);
+      store.read = async metadata => { reads.push(metadata.id); return originalRead(metadata); };
+      try {
+        const sequence = new ContextSequenceControlPlane(database, store);
+        const deleting = scenario === 'delete-user';
+        const input = { conversationId, messageRevisionId: previousRevisionId, idempotencyKey: nextRevisionId };
+        const mutation = deleting ? await sequence.prepareMessageDeleteMutation(input)
+          : await sequence.prepareMessageTruncateMutation({ ...input,
+            replacement: { messageRevisionId: nextRevisionId, contentObjectId: replacement.id,
+              contentByteLength: replacement.byte_length, contentEstimatedTokens: 1 } });
+        await database.transaction([
+          ...(deleting ? [] : [repo('MessageRevision').insertWithNextSequence({ id: nextRevisionId, message_id: messageId,
+            role: scenario === 'same-model' ? 'model' : 'user', content_object_id: replacement.id, created_at: NOW },
+          { column: 'revision_seq', scope: { message_id: messageId } })]), ...mutation.steps
+        ]);
+        const current = await state.readConversationContextHandleStateRow(database, conversationId);
+        assert.equal(current.state, scenario === 'same-user' || deleting ? 'ready' : 'pending', scenario);
+        if (scenario === 'same-user' || deleting) {
+          assert.equal(current.content_object_id, originalCatalog.content_object_id);
+          assert.ok(current.requires_native_reset > 0n);
+          const progress = [];
+          await upgradeConversationContextHandles(database, store, conversationId, { onProgress: value => progress.push(value) });
+          assert.deepEqual(progress, []);
+          const [catalog] = await rows('ContextRootHandleCatalog', { conversation_id: conversationId, context_root_id: current.context_root_id });
+          assert.equal(catalog.content_object_id, originalCatalog.content_object_id);
+          assert.equal(catalog.tail_segment_count, deleting ? 0n : 1n);
+          assert.equal(catalog.segment_count, deleting ? 1n : 2n);
+          const [newRoot] = await rows('ContextSequenceRoot', { id: current.context_root_id });
+          assert.equal(newRoot.estimated_tokens, deleting ? summaryTokens : root.estimated_tokens);
+          assert.deepEqual(reads, deleting ? [summary.id, summary.id] : [],
+            'only the retained summary is read for deletion token estimation, never lineage or catalog bodies');
+        }
+      } finally { store.read = originalRead; }
+      previousRevisionId = nextRevisionId;
+      if (scenario === 'same-user' && retry === 0) await reopen();
+    }
+  }
+});
+
 registerContextHandleBoundaryTests({
   kernel, kernelFile, load, compiled, require, Database, repo, NOW, modelRequestAggregate,
   temporary: () => configuration.root, database: () => database, store: () => store,

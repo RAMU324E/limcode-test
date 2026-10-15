@@ -115,6 +115,8 @@ export async function prepareContextHandleHeadTransition(input: {
   previousRootId: string | null; nextRootId: string; mode: 'append' | 'rewrite' | 'activate'; now: string;
   baseRootId?: string | null; activate?: boolean;
   rootShape?: ContextHandleRootShape;
+  /** The caller proved that only a final user occurrence is deleted or replaced unchanged. */
+  reuseCurrentCatalog?: boolean;
   occurrence?: ContextHandleOccurrenceEvidence; occurrences?: readonly ContextHandleOccurrenceEvidence[];
   current?: DomainRow;
 }): Promise<ContextHandleHeadTransitionPlan> {
@@ -127,6 +129,12 @@ export async function prepareContextHandleHeadTransition(input: {
   if (input.mode !== 'append') {
     let snapshot = await readContextRootHandleCatalogRow(input.database, input.conversationId, input.nextRootId, provenanceRevision);
     const aliasSteps: RepositoryTransactionStep[] = [];
+    if (!snapshot && input.reuseCurrentCatalog && current.state === 'ready'
+      && typeof current.context_root_id === 'string' && input.rootShape) {
+      snapshot = await readContextRootHandleCatalogRow(input.database, input.conversationId, current.context_root_id, provenanceRevision);
+      if (snapshot) aliasSteps.push(...await contextRootCatalogSnapshotSteps(input.database, input.conversationId,
+        input.nextRootId, snapshot.content_object_id as string | null, input.now, provenanceRevision, input.rootShape));
+    }
     if (!snapshot && input.rootShape) {
       const where = { conversation_id: input.conversationId, provenance_revision: provenanceRevision, ...shapeRow(input.rootShape) };
       const found = (await input.database.snapshot([DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN)

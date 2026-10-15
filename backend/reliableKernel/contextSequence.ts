@@ -1579,6 +1579,16 @@ export class ContextSequenceControlPlane {
     const sourceSegmentId = requireId(sourceRow.segment_id, 'ContextSegmentSource.segment_id');
     const targetIndex = state.records.findIndex((record) => record.segment.id === sourceSegmentId);
     let prefix: EditableContextSegment[];
+    // A final user input cannot mint a frozen identity. Removing it or replacing it unchanged
+    // keeps the ready catalog, including reserved ordinals, without reopening compression history.
+    let reuseCurrentCatalog = false;
+    if (targetIndex === state.records.length - 1 && targetIndex >= 0
+      && state.records[targetIndex].segment.segment_kind === 'message'
+      && (!replacement || state.records[targetIndex].segment.content_object_id === replacement.contentObjectId)) {
+      const revision = await this.getOptional('MessageRevision', revisionId);
+      reuseCurrentCatalog = revision?.role === 'user' && revision.revision_seq === sourceRow.source_revision
+        && revision.content_object_id === state.records[targetIndex].segment.content_object_id;
+    }
     let blocks: DomainRow[] = [];
     if (targetIndex >= 0) {
       prefix = state.records.slice(0, targetIndex).map((record) => ({
@@ -1600,7 +1610,9 @@ export class ContextSequenceControlPlane {
       blocks = expanded.blocks;
     }
 
-    let estimatedTokens = await this.estimateEditableContextTokens(prefix);
+    let estimatedTokens = reuseCurrentCatalog && replacement
+      ? requireBigInt(state.root.estimated_tokens, 'ContextSequenceRoot.estimated_tokens')
+      : await this.estimateEditableContextTokens(prefix);
     const now = this.timestamp();
     let replacementSegmentId: string | null = null;
     const occurrenceSteps: RepositoryTransactionStep[] = [];
@@ -1620,7 +1632,7 @@ export class ContextSequenceControlPlane {
         segment: { id: replacementSegmentId, segment_kind: 'message' },
         contentObject: { byte_length: replacement.contentByteLength }
       });
-      estimatedTokens += replacement.contentEstimatedTokens;
+      if (!reuseCurrentCatalog) estimatedTokens += replacement.contentEstimatedTokens;
     }
 
     const retainedSummary = prefix[0]?.segment.segment_kind === 'compression' ? prefix[0] : null;
@@ -1683,6 +1695,7 @@ export class ContextSequenceControlPlane {
         ...(await prepareContextHandleHeadTransition({
           database: this.database, contentStore: this.contentStore, conversationId,
           previousRootId: state.rootId, nextRootId: rootId, mode: 'rewrite', now,
+          reuseCurrentCatalog,
           rootShape: {
             rootNodeId: retainedSummary ? summaryNodeId : lastNodeId,
             tailNodeId: retainedSummary ? lastNodeId : null,
