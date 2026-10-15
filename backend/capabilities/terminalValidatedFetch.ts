@@ -87,6 +87,14 @@ export function createTerminalValidatedFetch(
             observation?.raw(next.value);
             tracker?.push(next.value);
             controller.enqueue(next.value);
+            if (tracker?.canCloseBody && (expectedBytes === undefined || receivedBytes === expectedBytes)) {
+              // Gemini's final candidate and usage complete the response even when a gateway
+              // keeps the HTTP body open. Forward every byte already read, including tail frames.
+              closed = true;
+              controller.close();
+              observation?.end('provider_terminal');
+              void reader.cancel().catch(() => undefined);
+            }
             return;
           }
 
@@ -174,12 +182,20 @@ class SseTerminalTracker {
   private buffer = '';
   private currentEvent = '';
   private dataLines: string[] = [];
+  private sawGeminiFinishReason = false;
+  private sawGeminiFinalUsage = false;
   public sawTerminal = false;
 
   public constructor(
     private readonly provider: LlmProviderKind,
     private readonly onResponsesTerminal?: (terminal: ResponsesTerminalEvidence) => void
   ) {}
+
+  public get canCloseBody(): boolean {
+    // A chunk may also contain the beginning of a later signature/tool/usage event.
+    // Finish that SSE event before closing instead of passing a partial tail to the decoder.
+    return this.sawGeminiFinalUsage && !this.buffer && !this.currentEvent && !this.dataLines.length;
+  }
 
   public push(bytes: Uint8Array): void {
     this.buffer += this.decoder.decode(bytes, { stream: true });
@@ -234,6 +250,16 @@ class SseTerminalTracker {
     if (!data) return;
     try {
       const value = JSON.parse(data);
+      if (this.provider === 'gemini') {
+        const record = terminalRecord(value);
+        // The Gemini decoder consumes candidates[0]. Usage from an earlier generation
+        // chunk is provisional; accept it only together with or after its finishReason.
+        const candidate = Array.isArray(record?.candidates) ? terminalRecord(record.candidates[0]) : undefined;
+        if (nonEmptyReason(candidate?.finishReason)) this.sawGeminiFinishReason = true;
+        if (this.sawGeminiFinishReason && typeof terminalRecord(record?.usageMetadata)?.totalTokenCount === 'number') {
+          this.sawGeminiFinalUsage = true;
+        }
+      }
       if (this.provider === 'openai-responses') {
         const terminal = responsesTerminalEvidence(value);
         // response.incomplete 同样是这个响应的终态（https://platform.openai.com/docs/api-reference/responses-streaming），不是被截断的流。

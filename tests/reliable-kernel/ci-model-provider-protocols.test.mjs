@@ -347,6 +347,74 @@ test('Gemini 工具参数中的 finishReason 不充当终态，技能结果使�
   });
 });
 
+for (const separateUsage of [false, true]) {
+  test(separateUsage ? 'Gemini 等待独立终态用量并保留签名和工具尾部，不等待 HTTP EOF'
+    : 'Gemini 完整工具调用和 STOP 用量到齐后完成，不等待 HTTP EOF 或取消回执', async () => {
+    const config = settings('gemini');
+    const usage = { promptTokenCount: 5, candidatesTokenCount: 3, totalTokenCount: 8 };
+    const frame = value => `data: ${JSON.stringify(value)}\n\n`;
+    const encode = value => new TextEncoder().encode(value);
+    const tool = id => ({ functionCall: { id, name: 'edit', args: { path: 'a', mode: 'hunk', hunks: [] } } });
+    const terminal = geminiChunk([tool('complete-call')], 'STOP');
+    if (!separateUsage) terminal.usageMetadata = usage;
+    let controller, cancelled = false, timer, pending;
+    let sawCall;
+    const callReceived = new Promise(resolve => { sawCall = resolve; });
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Gemini 正式终态后仍在等待 HTTP EOF')), 1000);
+    });
+    await withFetch(() => new Response(new ReadableStream({
+      start(value) {
+        controller = value;
+        // Earlier usage is provisional and must not close a later STOP frame.
+        const prefix = separateUsage ? frame({ usageMetadata: { promptTokenCount: 5, totalTokenCount: 5 } }) : '';
+        controller.enqueue(encode(prefix + frame(terminal)));
+      },
+      cancel() {
+        cancelled = true;
+        // Transport cleanup must not hold model completion hostage either.
+        return separateUsage ? undefined : new Promise(() => {});
+      }
+    }), { headers: { 'content-type': 'text/event-stream' } }), async calls => {
+      const events = [];
+      pending = llm.startLlmProvider(startRequest([user('offline terminal probe')], { tools: [EDIT_TOOL] }), event => {
+        events.push(event);
+        if (event.type === 'llm:toolcall') sawCall();
+      }, { settings: async () => config });
+      try {
+        if (separateUsage) {
+          await Promise.race([callReceived, deadline]);
+          assert.equal(cancelled, false);
+          assert.equal(events.some(event => event.type === 'llm:done'), false);
+          const signedCall = { ...tool('tail-call'), thoughtSignature: 'SIGNED_CALL' };
+          const signedTail = frame(geminiChunk([{ text: '', thoughtSignature: 'SIGNED_TAIL' }]));
+          const split = Math.floor(signedTail.length / 2);
+          controller.enqueue(encode(frame(geminiChunk([signedCall])) + frame({ usageMetadata: usage })
+            + signedTail.slice(0, split)));
+          controller.enqueue(encode(signedTail.slice(split)));
+        }
+        await Promise.race([pending, deadline]);
+        assert.equal(calls.length, 1);
+        assert.equal(cancelled, true);
+        assert.equal(events.some(event => event.type === 'llm:error'), false);
+        const done = events.filter(event => event.type === 'llm:done');
+        assert.equal(done.length, 1);
+        assert.deepEqual(done[0].payload.usageMetadata, usage);
+        const toolCalls = events.filter(event => event.type === 'llm:toolcall').flatMap(event => event.payload.calls);
+        assert.deepEqual(toolCalls.map(call => call.id), separateUsage ? ['complete-call', 'tail-call'] : ['complete-call']);
+        if (separateUsage) {
+          assert.equal(toolCalls[1].thoughtSignature, 'gemini:SIGNED_CALL');
+          assert.ok(events.some(event => event.type === 'llm:delta' && event.payload.thoughtSignature === 'gemini:SIGNED_TAIL'));
+        }
+      } finally {
+        clearTimeout(timer);
+        if (!cancelled) controller.close();
+        await pending;
+      }
+    });
+  });
+}
+
 test('Responses 推理耗尽输出预算的 incomplete 是失败，工具与正文不丢失原格式', async () => {
   const config = settings('openai-responses', { generationConfig: { maxOutputTokens: 256 } });
   await withFetch(entry => { assertOutgoing(config, entry.body); return sse([
