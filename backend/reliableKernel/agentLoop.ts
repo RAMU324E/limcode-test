@@ -3496,16 +3496,19 @@ export class ReliableAgentLoop {
     kind: 'guidance' | 'runtime_continuation';
     revisionIds: string[];
   } | null> {
-    const [queued, childIntentLinks] = await Promise.all([
-      listAllDomainRows(this.database, 'TurnIntent', { conversation_id: conversationId }),
-      listAllDomainRows(this.database, 'ChildExecutionIntentLink', { state: 'pending' })
-    ]);
+    const queued = await listAllDomainRows(this.database, 'TurnIntent', {
+      conversation_id: conversationId, state: 'queued', turn_id: null
+    });
+    if (queued.length === 0) return null;
+    const childIntentLinks = (await this.database.snapshot(queued.map(intent =>
+      DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').list({
+        where: { turn_intent_id: requireId(intent.id, 'TurnIntent.id'), state: 'pending' }, limit: 1
+      })
+    ))).snapshot.flatMap(value => rows(value));
     const childIntentIds = new Set(childIntentLinks.map((link) =>
       requireId(link.turn_intent_id, 'ChildExecutionIntentLink.turn_intent_id')
     ));
-    const candidates = queued
-      .filter((intent) => intent.state === 'queued' && intent.turn_id === null)
-      .filter((intent) => !childIntentIds.has(requireId(intent.id, 'TurnIntent.id')));
+    const candidates = queued.filter((intent) => !childIntentIds.has(requireId(intent.id, 'TurnIntent.id')));
     const boundaryInputs: Array<{
       intent: DomainRow;
       kind: 'guidance' | 'runtime_continuation';
