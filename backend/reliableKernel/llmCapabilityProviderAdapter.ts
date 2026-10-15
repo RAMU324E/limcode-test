@@ -2340,6 +2340,8 @@ function replaceSchemaHandleText(value: unknown, catalog: ReadonlyModelHandleCat
 
 function modelFacingHandleText(value: string, catalog: ReadonlyModelHandleCatalog): string {
   let text = value;
+  const singleWorkEnvironment = new Set(catalog.entries
+    .filter(entry => entry.kind === 'workEnvironment').map(entry => entry.target)).size === 1;
   for (const [from, to] of [
     ['attachmentId', 'attachmentRef'],
     ['processId', 'processRef'],
@@ -2348,7 +2350,12 @@ function modelFacingHandleText(value: string, catalog: ReadonlyModelHandleCatalo
     ['answerBridgeId', 'childRef'],
     ['workEnvironmentId', 'workEnvironmentRef']
   ] as const) text = text.split(from).join(to);
-  for (const entry of catalog.entries) text = text.split(entry.target).join(entry.ref);
+  for (const entry of catalog.entries) text = text.split(entry.target).join(
+    singleWorkEnvironment && entry.kind === 'workEnvironment' ? 'current' : entry.ref);
+  if (singleWorkEnvironment) {
+    text = text.split('leading W# reference').join('listed work environment identifier')
+      .split('W# reference').join('work environment identifier');
+  }
   return text;
 }
 

@@ -7,6 +7,11 @@ const { WebSocketServer } = createRequire(import.meta.url)('ws');
 const session = load('backend/capabilities/openAIResponsesWebSocketSession.js');
 const { projectTurnReminder } = load('backend/reliableKernel/turnReminderProjection.js');
 const reminderLayout = load('backend/capabilities/turnReminderLayout.js');
+const handles = load('backend/reliableKernel/modelHandleCatalog.js');
+const environments = load('backend/world/modules/workEnvironment/toolDescription.js');
+const { createLocalFolderWorkEnvironmentRecord } = load('shared/workEnvironmentCatalog.js');
+const { switchWorkEnvironmentTool } = load('backend/world/modules/tools/definitions/switchWorkEnvironment/index.js');
+const { transferFilesTool } = load('backend/world/modules/tools/definitions/transferFiles/index.js');
 
 const snapshot = text => projectTurnReminder({ kind: 'reliable-agent-turn',
   turnReminderDelivery: 'user_history', runtimeStatusCard: { card: text } });
@@ -39,6 +44,51 @@ function nativePair(segmentId, sourceModelRequestId, responseId, callId, ordinal
 
 
 export function registerProviderCacheTest(test) {
+  test('单工作环境工具前缀不随 W# 分配变化，current 严格解析到冻结环境', async () => {
+    const environment = createLocalFolderWorkEnvironmentRecord({ id: 'work_environment_cache', name: 'cache',
+      uri: 'file:///workspace', rootPath: '/workspace' }, 1);
+    const tools = [switchWorkEnvironmentTool, transferFilesTool].map(({ declaration }) => {
+      const transfer = declaration.name === 'transfer';
+      const text = environments.workEnvironmentListText([environment], transfer
+        ? environments.TRANSFER_WORK_ENVIRONMENTS_TITLE : environments.SWITCH_WORK_ENVIRONMENTS_TITLE);
+      return { ...declaration, description: declaration.description + '\n\n' + text,
+        parameters: transfer
+          ? environments.withTransferEnvironmentParameterHints(declaration.parameters, text)
+          : environments.withWorkEnvironmentIdParameterHints(declaration.parameters, text) };
+    });
+    const catalog = ref => ({ entries: [{ kind: 'workEnvironment', ref, target: environment.id }] });
+    const config = settings('openai-responses');
+    const request = fullRequest(config, [user('task')], tools);
+    request.recipe.modelHandleCatalog = catalog('W1');
+    const first = await projectedWire(config, request);
+    const next = structuredClone(request);
+    next.recipe.modelHandleCatalog = catalog('W9');
+    const second = await projectedWire(config, next);
+    assert.deepEqual(first.body.tools, second.body.tools);
+    assert.match(JSON.stringify(first.body.tools), /current/);
+    assert.doesNotMatch(JSON.stringify(first.body.tools), /W1|W9|W#|work_environment_cache/);
+    assert.deepEqual(handles.resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'current' }, catalog('W9')),
+      { workEnvironmentId: environment.id });
+    assert.deepEqual(handles.resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'W9' }, catalog('W9')),
+      { workEnvironmentId: environment.id });
+    assert.throws(() => handles.resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'W1' },
+      { ...catalog('W9'), retiredRefs: ['W1'] }));
+    assert.throws(() => handles.resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: environment.id }, catalog('W9')));
+    assert.throws(() => handles.resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'current' }, { entries: [] }));
+    assert.throws(() => handles.resolveModelToolArguments('read', { attachmentRef: 'current' }, catalog('W9')));
+    const multiple = structuredClone(next);
+    multiple.recipe.modelHandleCatalog.entries.push({ kind: 'workEnvironment', ref: 'W10', target: 'another_environment' });
+    const multiWire = await projectedWire(config, multiple);
+    assert.match(JSON.stringify(multiWire.body.tools), /W9/);
+    assert.match(JSON.stringify(multiWire.body.tools), /W# reference/);
+    assert.throws(() => handles.resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'current' },
+      multiple.recipe.modelHandleCatalog));
+    assert.deepEqual(handles.resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'W9' },
+      multiple.recipe.modelHandleCatalog), { workEnvironmentId: environment.id });
+    assert.deepEqual(request.recipe.modelHandleCatalog, catalog('W1'));
+    assert.match(JSON.stringify(tools), /work_environment_cache/);
+  });
+
   test('Responses 历史快照沿真实物理响应保留，文字和纯工具输出都读取上次输入终点', async () => {
     const config = settings('openai-responses', { id: 'ci-history-cache', model: 'gpt-6-astra',
       promptCache: { enabled: true, mode: 'explicit', ttl: '30m' } });

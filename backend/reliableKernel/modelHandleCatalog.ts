@@ -896,6 +896,11 @@ function requireRefTarget(
   accepted = `上下文或工具结果中出现过的${shortRefForm(kind)}`
 ): string {
   const ref = optionalText(value);
+  if (kind === 'workEnvironment' && ref === 'current') {
+    const targets = [...new Set(catalog.entries.filter(entry => entry.kind === 'workEnvironment')
+      .map(entry => entry.target))];
+    if (targets.length === 1) return targets[0];
+  }
   if (ref && handleKindOfRef(ref) === kind && preparedModelHandleLookups.get(catalog)!.retiredRefs.has(ref)) {
     return rejectArgument(kind, argument,
       `${argument}=${ref} 是已失效的历史${kindNoun(kind, '引用')}；历史编号的对应关系不唯一，不能根据编号或时间猜测新引用。请依据当前工具结果或工作环境说明确认对象后，使用它的新引用。`);
