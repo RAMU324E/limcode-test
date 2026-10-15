@@ -138,6 +138,8 @@ const OPENAI_RESPONSES_WEBSOCKET_TIMEOUT_PHASES = new Set([
 
 /** 把现有无状态 LLM capability 适配为可靠内核 full-request Provider 边界。 */
 export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapter {
+  private readonly ordinaryPreparations = new WeakMap<PreparedProviderRequest, { request?: LlmStartRequest }>();
+
   public constructor(
     public readonly providerId: string,
     private readonly capability: LlmCapability,
@@ -172,11 +174,20 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     return completeModelProjection(estimateOrdinaryRequestInputWork(request));
   }
 
-  public prepareFullRequest(request: FullProviderRequest): PreparedProviderRequest | undefined {
+  public prepareFullRequest(request: FullProviderRequest, prepared?: PreparedProviderRequest): PreparedProviderRequest | undefined {
     if (request.providerId !== this.providerId) {
       throw new Error(`Provider request ${request.providerId} cannot use adapter ${this.providerId}.`);
     }
-    if (!isCompressionRequest(request.recipe)) return undefined;
+    if (!isCompressionRequest(request.recipe)) {
+      const pending = prepared && this.ordinaryPreparations.get(prepared);
+      if (!pending?.request) return undefined;
+      const projected = pending.request;
+      pending.request = undefined;
+      projected.reliableProviderAttempt = reliableProviderAttempt(request);
+      projected.nativeAsyncAdmittedCallIds = request.nativeAsyncAdmittedCallIds;
+      projected.claudeThinkingBinding = request.claudeThinkingBinding;
+      return this.prepareProjectedOrdinaryRequest(projected, request, prepared!.breakdown);
+    }
     const compact = toLlmCompactRequest(request);
     const forceAllErrors = forceCompressionRetries(request);
     const breakdown = estimateCompactProjection(compact);
@@ -193,6 +204,32 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         attachmentObservationRequirements: projected.attachmentObservationRequirements
       }, debugContext, controls, forceAllErrors);
     } };
+  }
+
+  public async prepareFullRequestAsync(request: FullProviderRequest,
+    controls: ModelProjectionWorkControls = {}): Promise<PreparedProviderRequest | undefined> {
+    if (request.providerId !== this.providerId) throw new Error(`Provider request ${request.providerId} cannot use adapter ${this.providerId}.`);
+    if (isCompressionRequest(request.recipe)) return undefined;
+    const projected = await completeModelProjectionCooperatively(toLlmStartRequestWork(request), controls);
+    const breakdown = await completeModelProjectionCooperatively(estimateOrdinaryProjectedInputWork(request, projected), controls);
+    return this.prepareProjectedOrdinaryRequest(projected, request, breakdown);
+  }
+
+  private prepareProjectedOrdinaryRequest(projected: LlmStartRequest, request: FullProviderRequest,
+    breakdown: ProjectedRequestTokenBreakdown): PreparedProviderRequest {
+    const debugContext = { conversationId: request.conversationId, modelRequestId: request.modelRequestId,
+      attemptSeq: request.attemptSeq, socketGeneration: request.socketGeneration };
+    const metadata = ordinaryStreamMetadata(request);
+    const pending = { request: projected as LlmStartRequest | undefined };
+    const prepared: PreparedProviderRequest = { breakdown, send: controls => {
+      const value = pending.request;
+      pending.request = undefined;
+      if (!value) throw new Error('Prepared ordinary request has already been transferred.');
+      if (this.debugCapture) setDebugCaptureContext(value, debugContext);
+      return this.startOrdinaryRequest(value, metadata, debugContext, controls);
+    } };
+    this.ordinaryPreparations.set(prepared, pending);
+    return prepared;
   }
 
   /** Kernel-only opt-in; existing synchronous estimate API and its error timing stay unchanged. */
@@ -812,6 +849,10 @@ function isGptModelId(modelId: string): boolean {
 
 function* estimateOrdinaryRequestInputWork(request: FullProviderRequest): ModelProjectionWork<ProjectedRequestTokenBreakdown> {
   const projected = yield* toLlmStartRequestWork(request);
+  return yield* estimateOrdinaryProjectedInputWork(request, projected);
+}
+
+function* estimateOrdinaryProjectedInputWork(request: FullProviderRequest, projected: LlmStartRequest): ModelProjectionWork<ProjectedRequestTokenBreakdown> {
   // 按实际发出的布局估算：网关拒绝过轮内系统消息的渠道与模型退回尾巴模式（与开关关闭时相同）。
   // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
   // 只有按 user 消息发出的历史提醒（拆分发出的只有运行状态卡那条 user 消息）计入上下文；本轮提醒照常计入

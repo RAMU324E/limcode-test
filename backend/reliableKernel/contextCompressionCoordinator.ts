@@ -59,6 +59,7 @@ import {
   estimateMaterializedContextTokens,
   providerPromptTokens
 } from './contextTokenEstimator';
+import type { ContextTokenEstimateSource } from './contextTokenEstimator';
 import {
   calculateCalibratedCompressionRooms,
   calculateEffectiveSummaryMaxTokens,
@@ -139,6 +140,10 @@ export interface CoordinateCompressionCommand {
   providerContextOverflowRequestId?: string;
   /** Exact frozen ordinary request planning budget. Required for automatic compression; optional for manual. */
   requestBudget?: FullRequestPlanningBudget;
+  /** Release the ordinary preview before allocating a compression source/request body. */
+  beforeSourceMaterialization?(): void;
+  /** Borrow already decoded immutable Context only while evaluating the automatic threshold. */
+  preparedContext?(): ContextTokenEstimateSource | undefined;
   /** Exact active-Turn input that may need request-level reinjection after this compression. */
   protectedCurrentInputTokens?: number;
   /** Frozen ordinary tool definitions; Provider-native compaction must use the same tool contract. */
@@ -600,7 +605,8 @@ export class ReliableContextCompressionCoordinator {
     const usesConfiguredThreshold = trigger === 'auto' && !command.providerContextOverflowRequestId;
     // Preserve the ordinary below-threshold short circuit before validating the detailed budget.
     const preparedBudget = usesConfiguredThreshold ? undefined : resolveRequestBudget();
-    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId, frozen);
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId,
+      frozen, command.preparedContext?.());
     if (usesConfiguredThreshold && !decision.shouldCompress) {
       return {
         status: 'skipped',
@@ -657,6 +663,7 @@ export class ReliableContextCompressionCoordinator {
     }
     // Materialize source structure/content only after the level-trigger passes. Below-threshold checks
     // are the common path and should pay for one provider-aligned Context read, not three.
+    command.beforeSourceMaterialization?.();
     const { structure: materialized, content: semanticMaterialized } =
       await this.context.materializeWithStructure(headRootId);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
