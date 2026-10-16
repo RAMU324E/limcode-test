@@ -174,6 +174,19 @@ test('H1 only admitted bindings publish; private allocations reserve ordinals an
   assert.equal(f.metrics.historicalFrontiers, 0);
 });
 
+
+
+test('H1 warm catalog reuses the same RuntimeDatabase/store cache before a reader snapshot', async () => {
+  const f = memory.fixture();
+  await memory.seedReady(f, memory.catalog(memory.processHandle(1)));
+  const queriesBeforeRead = f.metrics.queries.length;
+  const result = await readConversationContextHandleState(f.database, f.store, 'conversation');
+  assert.deepEqual(result.catalog.entries, [memory.processHandle(1)]);
+  assert.equal(f.metrics.reads.length, 0);
+  assert.ok(f.metrics.queries.slice(queriesBeforeRead).every(read =>
+    [state.CONTEXT_HANDLE_STATE_DOMAIN, 'ConversationContextHeadLink'].includes(read.domain)));
+});
+
 test('H2 retry branches bind the same process ref independently and reactivate exact immutable catalogs', async () => {
   const f = memory.fixture();
   await memory.seedReady(f, memory.catalog());

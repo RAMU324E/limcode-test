@@ -5807,13 +5807,37 @@ function unifiedPromptCacheFromSettings(
 function requestBodyWithOpenAIPromptCacheKey(settings: LlmProviderConfigRecord, conversationId?: string): LlmRequestBodyRecord | undefined {
   const requestBody = settings.requestBody;
   if (settings.provider !== 'openai-responses') return requestBody;
-  if (typeof requestBody?.prompt_cache_key === 'string' && requestBody.prompt_cache_key.trim()) return requestBody;
+  const configuredKey = normalizeOpenAIPromptCacheKey(requestBody?.prompt_cache_key);
+  if (configuredKey) {
+    return { ...(requestBody ?? {}), prompt_cache_key: configuredKey };
+  }
+  const sanitizedBody = removeInvalidOpenAIPromptCacheKey(requestBody);
   const promptCache = normalizePromptCache(settings.promptCache, settings.provider);
-  if (!promptCache.enabled || !conversationId?.trim()) return requestBody;
+  if (!promptCache.enabled || !conversationId?.trim()) return sanitizedBody;
   return {
-    ...(requestBody ?? {}),
-    prompt_cache_key: conversationId
+    ...(sanitizedBody ?? {}),
+    prompt_cache_key: boundedOpenAIPromptCacheKey(conversationId)
   };
+}
+
+function normalizeOpenAIPromptCacheKey(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim();
+  return key.length > 0 && key.length <= 64 ? key : undefined;
+}
+
+function boundedOpenAIPromptCacheKey(conversationId: string): string {
+  const key = conversationId.trim();
+  return key.length <= 64 ? key : key.slice(-64);
+}
+
+function removeInvalidOpenAIPromptCacheKey(
+  requestBody: LlmRequestBodyRecord | undefined
+): LlmRequestBodyRecord | undefined {
+  if (!requestBody || !Object.prototype.hasOwnProperty.call(requestBody, 'prompt_cache_key')) return requestBody;
+  const sanitized = { ...requestBody };
+  delete sanitized.prompt_cache_key;
+  return sanitized;
 }
 
 function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, conversationId?: string): { transport?: 'websocket'; webSocketSessionKey?: string } {

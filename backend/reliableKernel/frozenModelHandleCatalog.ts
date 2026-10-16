@@ -64,22 +64,29 @@ export function rememberFrozenContextHandleCatalogBase(database: RuntimeDatabase
 export async function readFrozenContextHandleCatalogBase(database: RuntimeDatabase, store: ContentAddressedStore,
   contentObjectId: string | null, conversationId: string): Promise<PreparedModelHandleCatalog> {
   if (contentObjectId === null) return emptyBase;
-  // This read also fences the live database/root and verifies registration on cache hits.
+  // The cache belongs to this live RuntimeDatabase/store pair. Validate that binding once, then
+  // consume the immutable catalog already prepared by Context admission. The ContentObject row is
+  // committed in the same transaction as the pointer; forcing a separate reader snapshot first can
+  // reject a valid warm catalog during the tiny writer/reader handoff window.
+  await database.assertUsableBinding('snapshot');
+  const cache = cacheFor(database, store);
+  const cached = cache.entries.get(contentObjectId);
+  if (cached) {
+    if (cached.conversationId !== conversationId) throw invalid('Frozen catalog belongs to another producer Conversation.');
+    if (cached.metadata.content_type !== CONTEXT_HANDLE_STATE_CONTENT_TYPE
+      || typeof cached.metadata.byte_length !== 'bigint' || cached.metadata.byte_length < 0n) {
+      cache.entries.delete(contentObjectId);
+      cache.bytes -= cached.bytes;
+    } else {
+      cache.entries.delete(contentObjectId); cache.entries.set(contentObjectId, cached);
+      return cached.catalog;
+    }
+  }
   const metadata = (await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(contentObjectId)])).snapshot[0];
   if (!metadata || Array.isArray(metadata) || metadata.id !== contentObjectId
     || metadata.content_type !== CONTEXT_HANDLE_STATE_CONTENT_TYPE
     || typeof metadata.byte_length !== 'bigint' || metadata.byte_length < 0n) {
     throw invalid('Frozen Context catalog has no correctly typed registered CAS base.');
-  }
-  const cache = cacheFor(database, store);
-  const cached = cache.entries.get(contentObjectId);
-  if (cached) {
-    if (cached.conversationId !== conversationId) throw invalid('Frozen catalog belongs to another producer Conversation.');
-    for (const field of ['content_type', 'sha256', 'byte_length', 'storage_key'] as const) {
-      if (cached.metadata[field] !== metadata[field]) throw invalid('Frozen catalog CAS metadata changed.');
-    }
-    cache.entries.delete(contentObjectId); cache.entries.set(contentObjectId, cached);
-    return cached.catalog;
   }
   const value = record(JSON.parse((await store.read(metadata as ContentObjectMetadata)).toString('utf8')), 'Frozen Context catalog');
   if (value.kind !== 'conversation-context-handle-state' || value.conversationId !== conversationId

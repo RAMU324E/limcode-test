@@ -10,6 +10,7 @@ const thinking = load('backend/capabilities/claudeThinkingAdaptation.js');
 const reminders = { ...load('backend/capabilities/claudeTurnScopedReminders.js'),
   ...load('backend/capabilities/turnReminderLayout.js') };
 const capabilities = load('shared/modelCapabilities.js');
+const runtimeDeliveryProjection = load('backend/reliableKernel/runtimeDeliveryProjection.js');
 const BINDING_ERROR = { status: 400, rawBody: { error: { message:
   'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. '
   + 'Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".' } } };
@@ -586,6 +587,65 @@ test('网关拒绝自动 effort 后同次调用重发，目标记忆随配置修
     assert.equal(calls[3].body.reasoning_effort, 'high');
   });
 });
+
+test('Responses prompt_cache_key 始终限制在 64 字符，超长自定义值不直接发给供应商', async () => {
+  const conversationId = `conversation_${'a'.repeat(64)}`;
+  const automatic = await wire(settings('openai-responses', { promptCache: { enabled: true, mode: 'key', ttl: '30m' } }),
+    [user('hello')], { conversationId });
+  assert.equal(automatic.body.prompt_cache_key, 'a'.repeat(64));
+  assert.equal(automatic.body.prompt_cache_key.length, 64);
+
+  const custom = await wire(settings('openai-responses', {
+    promptCache: { enabled: true, mode: 'key', ttl: '30m' },
+    requestBody: { prompt_cache_key: 'custom-key-that-is-too-long-'.padEnd(65, 'x') }
+  }), [user('hello')], { conversationId: 'short-conversation' });
+  assert.equal(custom.body.prompt_cache_key, 'short-conversation');
+
+  const disabled = await wire(settings('openai-responses', {
+    promptCache: { enabled: false, mode: 'key', ttl: '30m' },
+    requestBody: { prompt_cache_key: 'x'.repeat(65) }
+  }));
+  assert.equal('prompt_cache_key' in disabled.body, false);
+});
+
+test('后台 process completion envelope 的 Gemini 式回显不会进入流式或终态正文', async () => {
+  const config = settings('gemini', { model: 'gemini-2.5-pro' });
+  const request = fullRequest(config, [user('run the background command'), model([{ text: 'waiting' }])]);
+  const envelope = {
+    kind: 'process_completion', status: 'completed', sourceId: 'process-1', processId: 'process-1',
+    processReceiptId: 'receipt-1', deliveryId: 'delivery-1', inboxItemId: 'inbox-1', targetTurnId: 'turn-1',
+    deliveredAt: '2026-10-16T18:20:29.000Z',
+    note: runtimeDeliveryProjection.RUNTIME_DELIVERY_MODEL_NOTE,
+    content: { kind: 'process_completion', processId: 'process-1', processReceiptId: 'receipt-1', outcome: 'succeeded', exitCode: 0, output: 'done' }
+  };
+  request.context.push({ segmentId: 'runtime-delivery-1', segmentKind: 'runtime_context', messageRole: null,
+    contentType: runtimeDeliveryProjection.RUNTIME_DELIVERY_MODEL_CONTENT_TYPE, content: JSON.stringify(envelope) });
+  const events = [];
+  let projected;
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(config.id, fakeCapability((input, emit) => {
+    projected = input;
+    const runtimeText = input.contents.find(content => content.parts.some(part =>
+      'text' in part && part.text.startsWith('[Background command result:'))).parts[0].text;
+    const echoed = `_] ${runtimeText}真实回答`;
+    emit({ type: 'llm:delta', payload: { requestId: input.id, text: echoed.slice(0, 23) } });
+    emit({ type: 'llm:delta', payload: { requestId: input.id, text: echoed.slice(23) } });
+    emit({ type: 'llm:done', payload: { requestId: input.id, content: model([{ text: echoed }]) } });
+  }));
+  await adapter.sendFullRequest(request, {
+    async onEvent(event) {
+      events.push(event);
+      return { accepted: true, checkpointed: true, terminal: event.kind === 'completed' };
+    }
+  });
+  assert.ok(projected);
+  const visibleDeltas = events.filter(event => event.kind === 'output_delta' && event.content.type === 'text_delta')
+    .map(event => event.content.text).join('');
+  assert.equal(visibleDeltas, '真实回答');
+  const completed = events.find(event => event.kind === 'completed');
+  assert.equal(completed.content.parts.map(part => 'text' in part ? part.text : '').join(''), '真实回答');
+  assert.doesNotMatch(JSON.stringify(completed.content), /Background command result|process-1|receipt-1/);
+});
+
 
 test('可靠请求只采用 AuthoritySnapshot 冻结的前置提示词', async () => {
   const config = settings();
