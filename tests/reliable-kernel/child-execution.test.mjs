@@ -16,6 +16,127 @@ let f;
 before(async () => { f = await openChildFixture(); });
 after(async () => { await f?.close(); });
 
+test('取消子任务续跑同时收尾投递，旧 cancelled + ACK 残留也能收敛', async () => {
+  for (const legacy of [false, true]) {
+    const parent = await f.parent(`cancel-delivery-${legacy}`);
+    const turn = await f.app.turns.input(parent.input('delegate'));
+    const child = await f.app.runtime.children.spawn(f.command(await f.source(turn.turnId)));
+    await f.app.turns.terminal({ source: { kind: 'internal', key: `${child.childTurnId}-done` },
+      turnId: child.childTurnId, terminalStatus: 'completed', reason: 'fixture' });
+    await f.app.runtime.children.observeTurnTerminal(child.childExecutionId, child.childTurnId);
+    const id = `${child.childExecutionId}-result`;
+    await f.app.database.transaction([
+      repo('RuntimeInboxItem').insert({ id, dedupe_key: id, source_kind: 'process_receipt', source_id: `${id}-receipt`,
+        state: 'available', created_at: f.now(), updated_at: f.now() }),
+      repo('RuntimeDelivery').insert({ id, inbox_item_id: id, target_conversation_id: child.childConversationId,
+        target_turn_id: null, phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null,
+        created_at: f.now(), updated_at: f.now() }),
+      repo('RuntimeDeliveryWake').insert({ id, delivery_id: id, state: 'acknowledged', claim_owner_host_boot_id: null,
+        claim_generation: 0n, claim_expires_at: null, attempt_count: 1n, failure_count: 0n, next_attempt_at: null,
+        last_error: null, acknowledged_at: f.now(), created_at: f.now(), updated_at: f.now() })
+    ]);
+    const queued = await f.app.runtime.children.queueRuntimeDeliveryContinuation({ deliveryId: id,
+      childExecutionId: child.childExecutionId, sourceTurnId: child.childTurnId });
+    assert.ok(queued);
+    if (legacy) {
+      const [link] = await f.rows('ChildExecutionIntentLink', { turn_intent_id: queued.turnIntentId });
+      await f.app.database.transaction([
+        repo('TurnIntent').update(queued.turnIntentId, { state: 'cancelled', updated_at: f.now() }),
+        repo('ChildExecutionIntentLink').update(link.id, { state: 'cancelled', updated_at: f.now() }),
+        repo('ChildExecution').update(child.childExecutionId, { status: 'interrupted', updated_at: f.now() })
+      ]);
+      const [delivery] = await f.rows('RuntimeDelivery', { id });
+      const { ConversationOwnershipGate } = load('backend/reliableKernel/conversationOwnershipGate.js');
+      const gate = new ConversationOwnershipGate(f.app.database, 'claim');
+      try { assert.equal(await f.app.processDeliveries.settleCancelledChildDelivery(delivery, gate), true); }
+      finally { await gate.releaseClaimed(); }
+    } else {
+      await f.app.runtime.children.interruptSubtree({ sourceKey: `${id}-stop`, childExecutionId: child.childExecutionId, reason: '用户停止' });
+    }
+    assert.equal((await f.rows('RuntimeDelivery', { id }))[0].state, 'failed');
+    assert.equal((await f.rows('TurnIntent', { id: queued.turnIntentId }))[0].state, 'cancelled');
+    assert.equal((await f.rows('RuntimeDeliveryWake', { id }))[0].state, 'acknowledged');
+  }
+});
+
+test('无正文的子任务最终结果提交一次可读答案', async () => {
+  const parent = await f.parent('empty-final');
+  const turn = await f.app.turns.input(parent.input('delegate'));
+  const child = await f.app.runtime.children.spawn(f.command(await f.source(turn.turnId)));
+  const coordinator = f.coordinator();
+  await f.app.runtime.children.claimSpawnDispatch(child.effectIntentId);
+  const receipt = await f.app.runtime.children.recordSpawnReceipt({ sourceKey: `${child.childExecutionId}-spawned`,
+    attemptId: child.attemptId, outcome: 'succeeded', detail: { adapter: 'fixture' } });
+  await f.app.runtime.children.reconcileSpawnReceipt(receipt.effectReceiptId);
+  coordinator.triggerRecoveryPass = () => {};
+  try {
+    const input = { turnId: child.childTurnId, modelRequestId: 'empty-final-model', finalText: '' };
+    await coordinator.submitTurnFinalAnswer(input);
+    await coordinator.submitTurnFinalAnswer(input);
+    const answers = await f.rows('AnswerSubmission', { answer_bridge_id: child.answerBridgeId });
+    assert.equal(answers.length, 1);
+    const [payload] = await f.rows('AnswerPayload', { submission_id: answers[0].id });
+    const [metadata] = await f.rows('ContentObject', { id: payload.content_object_id });
+    assert.match((await f.app.contentStore.read(metadata)).toString('utf8'), /没有输出文字/);
+  } finally { await coordinator.dispose(); }
+});
+
+async function completedThoughtChild(t, label) {
+  const parent = await f.parent(label);
+  const turn = await f.app.turns.input(parent.input('delegate'));
+  const child = await f.app.runtime.children.spawn(f.command(await f.source(turn.turnId)));
+  await f.app.runtime.children.claimSpawnDispatch(child.effectIntentId);
+  const receipt = await f.app.runtime.children.recordSpawnReceipt({ sourceKey: `${child.childExecutionId}-spawned`,
+    attemptId: child.attemptId, outcome: 'succeeded', detail: { adapter: 'fixture' } });
+  await f.app.runtime.children.reconcileSpawnReceipt(receipt.effectReceiptId);
+  t.mock.method(f.app.providers, 'resolve', providerId => ({ providerId, async sendFullRequest(_request, controls) {
+    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ text: '只有思考', thought: true }] } });
+  } }));
+  await f.app.database.conversationOwners.run(child.childConversationId, () => f.app.agentLoop.drive(child.childTurnId));
+  await f.app.runtime.children.observeTurnTerminal(child.childExecutionId, child.childTurnId);
+  assert.equal((await f.rows('ChildExecution', { id: child.childExecutionId }))[0].status, 'idle');
+  assert.equal((await f.rows('AnswerSubmission', { answer_bridge_id: child.answerBridgeId })).length, 0);
+  const inventory = await f.app.database.relocatedWorkInventory();
+  assert.ok(inventory.conversations.find(row => row.conversationId === parent.id)?.childExecutionIds.includes(child.childExecutionId));
+  return { parent, parentTurnId: turn.turnId, child, inventory };
+}
+
+test('纯思考已完成但缺答案的任务进入收尾盘点，恢复只补交一次答案', async t => {
+  const { child } = await completedThoughtChild(t, 'recover-empty-final');
+  const coordinator = f.coordinator();
+  coordinator.triggerRecoveryPass = () => {};
+  coordinator.dependencies.agentLoop.readFinalOutput = f.app.agentLoop.readFinalOutput.bind(f.app.agentLoop);
+  const { ConversationOwnershipGate } = load('backend/reliableKernel/conversationOwnershipGate.js');
+  const owner = new ConversationOwnershipGate(f.app.database, 'claim');
+  try {
+    await coordinator.reconcileCompletedTaskAnswers(id => id === child.childExecutionId, undefined, owner);
+    await coordinator.reconcileCompletedTaskAnswers(id => id === child.childExecutionId, undefined, owner);
+    const answers = await f.rows('AnswerSubmission', { answer_bridge_id: child.answerBridgeId });
+    assert.equal(answers.length, 1);
+    const [payload] = await f.rows('AnswerPayload', { submission_id: answers[0].id });
+    const [metadata] = await f.rows('ContentObject', { id: payload.content_object_id });
+    assert.match((await f.app.contentStore.read(metadata)).toString('utf8'), /没有输出文字/);
+  } finally { await owner.releaseClaimed(); await coordinator.dispose(); }
+});
+
+test('历史合并收尾包含 idle 缺答案子任务，保留全部消息', async t => {
+  const { parent, parentTurnId, child, inventory } = await completedThoughtChild(t, 'settle-empty-final');
+  const fence = await f.app.turns.heldExecutionLeaseFence({ turnId: parentTurnId,
+    leaseOwnerId: `${parent.id}-owner`, hostBootId: f.app.database.hostBootId });
+  assert.ok(fence);
+  await f.app.turns.releaseExecutionLease(fence);
+  const { settleHistoricalMergeWork } = load('backend/application/reliableKernel/relocatedWorkSettlement.js');
+  const messages = await f.rows('MessagePartOfConversation', { conversation_id: child.childConversationId });
+  const excludedConversationIds = new Set((await f.rows('Conversation')).map(row => row.id)
+    .filter(id => id !== parent.id && id !== child.childConversationId));
+  const result = await settleHistoricalMergeWork({ application: f.app, inventory, excludedConversationIds });
+  assert.deepEqual(result.unsettled, []);
+  assert.deepEqual(result.live, []);
+  assert.equal((await f.rows('ChildExecution', { id: child.childExecutionId }))[0].status, 'interrupted');
+  assert.equal((await f.rows('AnswerBridge', { id: child.answerBridgeId }))[0].status, 'interrupted');
+  assert.deepEqual(await f.rows('MessagePartOfConversation', { conversation_id: child.childConversationId }), messages);
+});
+
 // One immutable authority graph, rather than a matrix over spawn/send/edit/provider entry points.
 test('child permissions and approval respect the complete frozen ancestor chain', async () => {
   const top = policy({ id: 'top', allowedTools: ['read', 'write'], sourceConfigs: { exa: { enabled: true, enabledTools: ['search'] } },

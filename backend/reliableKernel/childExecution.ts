@@ -1,3 +1,4 @@
+import { cancelIntentDeliverySteps } from './deliverySettlementSteps';
 import type { ExecutionLeaseFence } from './executionLeaseFence';
 import { committedInitialExecutionFence, requireInitialLeaseDuration } from './initialExecutionLease';
 import type { AttachmentIngestService, PreparedMessageAttachmentAdmission } from './attachmentIngest';
@@ -2158,6 +2159,12 @@ export class ChildExecutionControlPlane {
       command.sourceKey
     );
     const now = this.timestamp();
+    const cancelledDeliverySteps: RepositoryTransactionStep[] = [];
+    for (const link of targetPendingIntentLinks) {
+      cancelledDeliverySteps.push(...await cancelIntentDeliverySteps(
+        this.database, String(link.turn_intent_id), 'child-continuation-cancelled', now
+      ));
+    }
     const liveActiveTurns = targetActiveTurns.filter((turn) => turn.status === ACTIVE_TURN);
     const shouldTerminalize = liveActiveTurns.length === 0;
     const newTerminationTurns = targetActiveTurns.filter((turn) =>
@@ -2267,6 +2274,7 @@ export class ChildExecutionControlPlane {
         child_execution_intent_link_id: link.id,
         created_at: now
       })),
+      ...cancelledDeliverySteps,
       ...targetPendingIntentLinks.flatMap((link) => [
         DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(link.id as string, { state: 'pending' }),
         DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').update(link.id as string, {

@@ -649,7 +649,8 @@ async function forEachSourceChunk(
   } : undefined)) {
     timelineScanned += 1;
     if (options.collecting) options.exclusions?.observe(entry.schema.key, entry.row);
-    if (!entry.invalid && (!skipped || skipped.get(entry.schema.key, String(entry.row.id)) === undefined)) timelineChunk.push(entry);
+    if (!entry.invalid && (!skipped || skipped.get(entry.schema.key, String(entry.row.id)) === undefined)
+      && !options.exclusions?.includes(entry.schema.key, String(entry.row.id))) timelineChunk.push(entry);
     if (timelineChunk.length >= options.chunkRows) await flushTimeline();
     if (timelineScanned >= RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS) {
       await yieldThread();

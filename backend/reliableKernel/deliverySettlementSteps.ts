@@ -1,3 +1,4 @@
+import type { RuntimeDatabase } from './runtimeDatabase';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 
 /** What a waiting parent Turn is told when the user deleted the child Conversation whose answer it was owed. */
@@ -55,6 +56,29 @@ export function deadLetterDeliveryWakeSteps(
       state: 'dead_letter', claim_owner_host_boot_id: null, claim_expires_at: null,
       next_attempt_at: null, last_error: reason, updated_at: now
     }));
+  }
+  return steps;
+}
+
+/** The caller cancels/asserts the Intent in this same transaction. Never reopen its wake. */
+export async function cancelIntentDeliverySteps(
+  database: RuntimeDatabase, turnIntentId: string, reason: string, now: string
+): Promise<RepositoryTransactionStep[]> {
+  const links = (await database.snapshot([
+    DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink').list({ where: { turn_intent_id: turnIntentId }, limit: 2 })
+  ])).snapshot[0] as DomainRow[];
+  const steps: RepositoryTransactionStep[] = [DOMAIN_REPOSITORIES.domain('RuntimeDeliveryIntentLink')
+    .assertExactIds({ turn_intent_id: turnIntentId }, links.map(link => String(link.id)))];
+  for (const link of links) {
+    const deliveryId = String(link.delivery_id);
+    const { snapshot } = await database.snapshot([
+      DOMAIN_REPOSITORIES.domain('RuntimeDelivery').get(deliveryId),
+      DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({ where: { delivery_id: deliveryId }, limit: 2 })
+    ]);
+    const delivery = snapshot[0] as DomainRow | null;
+    if (!delivery || delivery.state !== 'pending') continue;
+    steps.push(...failPendingDeliverySteps(delivery, reason, now),
+      ...deadLetterDeliveryWakeSteps(deliveryId, snapshot[1] as DomainRow[], reason, now));
   }
   return steps;
 }
