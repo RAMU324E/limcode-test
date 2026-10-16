@@ -1972,13 +1972,22 @@ export async function listLlmProviderModels(config: LlmProviderConfigRecord, opt
   if (settings.provider === 'claude') {
     return discoverAnthropicModels(settings, proxyFetch ?? fetch, headers);
   }
-  const result = await unified.listAvailableModels({
+  const requestHeaders = settings.provider === 'gemini' && settings.apiKey
+    ? mergeHeaders({ 'x-goog-api-key': settings.apiKey }, headers)
+    : headers;
+  const fetchCatalog = (baseUrl: string) => unified.listAvailableModels({
     provider: settings.provider,
     apiKey: settings.apiKey,
-    baseUrl: settings.baseUrl,
+    baseUrl,
     ...(proxyFetch ? { fetch: proxyFetch } : {}),
-    ...(headers ? { headers } : {}),
+    ...(requestHeaders ? { headers: requestHeaders } : {}),
     outputFormat: 'unified'
+  });
+  const result = await fetchCatalog(settings.baseUrl).catch(async (error) => {
+    if (settings.provider === 'gemini' && /\/v1\/?$/i.test(settings.baseUrl)) {
+      return fetchCatalog(settings.baseUrl.replace(/\/v1\/?$/i, '/v1beta'));
+    }
+    throw error;
   });
 
   return result.models.map(modelCatalogEntryToRecord);
