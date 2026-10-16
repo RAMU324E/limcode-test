@@ -289,15 +289,15 @@ const activeTransport = computed<'http' | 'websocket'>(() => {
 });
 const runtimeTransportLabel = computed(() => activeTransport.value === 'websocket' ? 'WebSocket' : 'HTTP');
 const runtimeReloadRequired = computed(() => session.status === 'ready' && (!session.runtime || session.runtime.reloadRequired));
-const runtimeBadgeLabel = computed(() => runtimeReloadRequired.value ? '需重载' : '正常');
+const runtimeBadgeLabel = computed(() => session.runtimeError ? '连接已停止' : runtimeReloadRequired.value ? '需重载' : '正常');
 const runtimeDiagnosticRows = computed(() => {
   const config = activeChannelConfig.value;
   return [
     {
       label: '状态',
-      value: runtimeReloadRequired.value
+      value: session.runtimeError ?? (runtimeReloadRequired.value
         ? session.runtime ? '扩展已更新，需要重新加载窗口' : '扩展信息暂不可用，请重新加载窗口'
-        : '正常'
+        : '正常')
     },
     { label: '模型渠道', value: config?.name || (config ? providerLabel(config.provider) : '未选择') },
     { label: 'LLM', value: config ? selectedModelForConfig(config) || config.model || '未选择' : '未选择' },
@@ -572,7 +572,7 @@ function onWindowResize(): void {
 
 async function submit(): Promise<void> {
   const text = draft.value.trim();
-  if ((!text && selectedAttachments.value.length === 0) || conversationInputDisabled.value) return;
+  if (session.runtimeError || (!text && selectedAttachments.value.length === 0) || conversationInputDisabled.value) return;
   const draftRevision = submissionDraftRevision;
   const content = buildMessageContent(text, selectedAttachments.value);
   if (ui.isEditing) {
@@ -599,7 +599,7 @@ async function submit(): Promise<void> {
     } finally {
       delete savingSessionSelections.value[conversationId];
     }
-    if (submissionDraftRevision !== draftRevision || clientState.currentConversationId !== conversationId
+    if (session.runtimeError || submissionDraftRevision !== draftRevision || clientState.currentConversationId !== conversationId
       || draft.value.trim() !== text || conversationInputDisabled.value) return;
   }
   const submission = sendMessage(text, content, currentTurnAuthoritySelection());
@@ -1098,6 +1098,7 @@ function middleEllipsis(value: string, maxLength: number): string {
       </div>
     </div>
 
+    <p v-if="session.runtimeError" class="composer-runtime-error" role="alert">{{ session.runtimeError }}</p>
     <div class="composer-zone composer-zone-bottom" aria-label="输入框下方功能区">
       <div v-if="clientState.currentConversationId || agentOptions.length || workflowOptions.length || channelOptions.length || workEnvironmentOptions.length" class="composer-meta">
         <template v-if="agentOptions.length">
@@ -1266,7 +1267,7 @@ function middleEllipsis(value: string, maxLength: number): string {
         <button
           type="button"
           class="composer-send"
-          :disabled="conversationInputDisabled || !hasDraftContent"
+          :disabled="!!session.runtimeError || conversationInputDisabled || !hasDraftContent"
           :aria-label="sendTitle"
           :title="sendTitle"
           @click="submit"
@@ -1572,6 +1573,8 @@ function middleEllipsis(value: string, maxLength: number): string {
 .composer-side-abort {
   margin-top: auto;
 }
+
+.composer-runtime-error { margin: 4px 0; color: var(--vscode-errorForeground); white-space: normal; }
 
 .composer-meta {
   flex: 1 1 220px;

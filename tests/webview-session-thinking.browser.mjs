@@ -78,7 +78,7 @@ test('built chat can read thinking, recover an expired save session, and send wi
           }
         });
       } });
-      window.replaceHost = () => { host = 'host-b'; session = 'edit-b'; emit(T.Hello, { meta: { kind: 'mainPanel', conversationId: 'conversation' } }); };
+      window.replaceHost = (next = 'host-b') => { host = next; session = 'edit-b'; emit(T.Hello, { meta: { kind: 'mainPanel', conversationId: 'conversation' } }); };
     }, { T, state: createEmptyClientState() });
     await page.goto(`http://127.0.0.1:${server.address().port}`, { waitUntil: 'domcontentloaded' });
     const thinking = page.locator('.session-thinking-dropdown');
@@ -125,6 +125,17 @@ test('built chat can read thinking, recover an expired save session, and send wi
         .map(selector => { const rect = selector.getBoundingClientRect(); return rect.left >= meta.left - 1 && rect.right <= meta.right + 1; });
     });
     assert.ok(narrow.every(Boolean), '窄窗口可换行，但下拉框不能越出输入栏');
+    const keptDraft = await page.locator('textarea').inputValue();
+    await page.evaluate(T => window.postMessage({ id: 'runtime-failure', clientId: 'host-b', type: T.Error,
+      payload: { code: 'runtime_unavailable', message: '运行连接已停止：测试心跳失败，请重载窗口。' } }, '*'), T);
+    await page.locator('.composer-runtime-error').waitFor();
+    assert.equal(await send.isDisabled(), true);
+    assert.equal(await page.locator('textarea').inputValue(), keptDraft);
+    await page.evaluate(T => window.postMessage({ id: 'late-hello', clientId: 'host-b', type: T.Hello,
+      payload: { meta: { kind: 'mainPanel', conversationId: 'conversation' } } }, '*'), T);
+    assert.ok(await page.locator('.composer-runtime-error').isVisible(), '同一故障 Host 的迟到 Hello 不恢复可用状态');
+    await page.evaluate(() => window.replaceHost('host-c'));
+    await page.locator('.composer-runtime-error').waitFor({ state: 'hidden' });
     assert.deepEqual(errors, []);
   } catch (error) {
     console.error('Browser diagnostics:', errors, await page?.locator('body').innerText(), await page?.evaluate(() => window.requests));
@@ -149,11 +160,12 @@ test('history click keeps the visible message anchored after the production Vue 
     export const useReliableConversation = () => ({feed, conversationId, projection, ensureDetails(){}});
     export const useChat = () => ({conversationAction:ref(null), conversationActionPending:ref(false), conversationActionLabel:ref(null), conversationActionNotice:ref(null), forkPendingTargetIds:ref(new Set()), currentAuthoritySelection:()=>({}), currentTurnInputEchoes:ref([])});
     export const useGlobalSettingsStore = () => ({llmProviderConfigs:{configs:[]},llm:{}});
+    export const useSessionStore = () => ({ runtimeError: null });
     export const useModelProfileStore = () => ({effectiveFor:()=>({})});
     export const useReliableTimelinePresentationStore = () => ({isSuppressed:()=>false});
     window.fulfillEarlier = () => {projection.value={...projection.value,messages:rows(81,50)};feed.historyLoading=false;feed.historyLoadedPages++;};
   `;
-  const stubs = ['useReliableConversation', 'useChat', 'useGlobalSettingsStore', 'useModelProfileStore', 'useReliableTimelinePresentationStore'];
+  const stubs = ['useSessionStore', 'useReliableConversation', 'useChat', 'useGlobalSettingsStore', 'useModelProfileStore', 'useReliableTimelinePresentationStore'];
   const server = await createBrowserFixtureServer({
     dependencies: ['vue', '@tabler/icons-vue'],
     plugins: [{

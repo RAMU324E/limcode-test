@@ -89,6 +89,7 @@ export function useBridgeBootstrap(): void {
       const previousClientId = announcedClientId;
       if (message.clientId) announcedClientId = message.clientId;
       if (previousClientId && message.clientId && previousClientId !== message.clientId) {
+        session.runtimeError = null;
         modelProfiles.reconnectScopes();
         globalSettings.reconcilePendingSettings();
         systemPrompts.resetPendingSaveForReconnect();
@@ -151,6 +152,11 @@ export function useBridgeBootstrap(): void {
     bridge.on(BridgeMessageType.Error, (message) => {
       const payload = message.payload;
       if (!payload) return;
+      if (payload.code === 'runtime_unavailable') {
+        session.runtimeError = payload.message;
+        reliableFeed.cancelHistoryRequests();
+        return;
+      }
       if (payload.requestType === BridgeMessageType.Ready) {
         clientState.rejectConfigurationLoad(message.correlationId, payload.message);
       }

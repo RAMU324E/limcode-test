@@ -3388,7 +3388,9 @@ export type BridgeErrorCode =
   /** The Conversation named by a scoped request was deleted or never existed. */
   | 'stale_conversation'
   /** The fork command can never succeed and must not be replayed. */
-  | 'fork_rejected';
+  | 'fork_rejected'
+  /** This Host's Runtime failed; no new execution is admitted until reload. */
+  | 'runtime_unavailable';
 
 export interface BridgeErrorPayload {
   requestType?: string;

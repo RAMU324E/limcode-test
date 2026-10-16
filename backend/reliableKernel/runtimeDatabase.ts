@@ -165,14 +165,14 @@ export class RuntimeDatabase {
   };
   private nextRequestId = 1;
   private closed = false;
-  private readonly closeListeners = new Set<() => void>();
+  private readonly closeListeners = new Set<(failure?: Error) => void>();
+  private failure: Error | undefined;
   private closePromise: Promise<void> | undefined;
   private readonly livenessId = randomUUID();
   private readonly startedAt = new Date().toISOString();
   private readonly processStartIdentity = readProcessStartIdentity(process.pid);
   private heartbeatTimer: NodeJS.Timeout | undefined;
   private heartbeatTask: Promise<void> = Promise.resolve();
-  private heartbeatFailure: unknown;
   public readonly conversationOwners: ConversationRuntimeOwnerManager;
   private conversationOwnerSweepTimer: NodeJS.Timeout | undefined;
   private conversationOwnerSweepTask: Promise<void> = Promise.resolve();
@@ -197,7 +197,7 @@ export class RuntimeDatabase {
     if (initialPerformanceMetrics) this.performanceMetricSinks.add(initialPerformanceMetrics);
     this.conversationOwners = new ConversationRuntimeOwnerManager(binding, hostBootId);
     this.casAccess.onFailure((error) => {
-      this.markClosed();
+      this.markClosed(error);
       this.stopHistoryPreparation(error);
       this.failPending(error);
       void this.worker.terminate().catch(() => undefined);
@@ -210,7 +210,7 @@ export class RuntimeDatabase {
       && !await this.conversationExecutedByLivePeer(conversationId));
     worker.on('message', (message: DatabaseWorkerResponse) => this.onMessage(message));
     worker.on('error', (error) => {
-      this.markClosed();
+      this.markClosed(error);
       void this.casAccess.close().catch(() => undefined);
       this.stopHistoryPreparation(error);
       this.failPending(error);
@@ -221,10 +221,11 @@ export class RuntimeDatabase {
       // the liveness record and durable conversation owners stay fail-closed until an explicit
       // graceful close() drains and fences the work (or the OS proves the process dead).
       const unexpected = !this.closed && !this.closePromise;
-      this.markClosed();
+      const failure = unexpected || code !== 0 ? new Error(`SQLite database worker exited with code ${code}.`) : undefined;
+      this.markClosed(failure);
       void this.casAccess.close().catch(() => undefined);
-      this.stopHistoryPreparation(new ExecutionHandoffError('SQLite database worker exited.'));
-      if (unexpected || code !== 0) this.failPending(new Error(`SQLite database worker exited with code ${code}.`));
+      this.stopHistoryPreparation(this.failure ?? new ExecutionHandoffError('SQLite database worker exited.'));
+      if (failure) this.failPending(this.failure ?? failure);
     });
   }
 
@@ -310,7 +311,7 @@ export class RuntimeDatabase {
     // Capture before waiting; never adopt a newer lease generation when this scope is admitted.
     const fence = currentExecutionLeaseFence();
     return this.historyPreparation.run(async permit => {
-      if (this.closed) throw new Error('RuntimeDatabase is closed.');
+      this.assertUsable();
       if (fence) {
         if (!this.conversationOwners.owns(fence.conversationId) || !await this.executionFenceStillCurrent(fence)) {
           throw new ExecutionHandoffError(`Turn ${fence.turnId} lost its execution authority while awaiting history preparation.`);
@@ -723,7 +724,7 @@ export class RuntimeDatabase {
    */
   public async isHostAlive(hostBootIdInput: string): Promise<boolean> {
     const hostBootId = requireNonEmptyText(hostBootIdInput, 'hostBootId');
-    if (hostBootId === this.hostBootId) return !this.closed && this.heartbeatFailure === undefined;
+    if (hostBootId === this.hostBootId) return !this.closed;
     await this.validateBinding('host_liveness');
     const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
     if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
@@ -788,18 +789,24 @@ export class RuntimeDatabase {
   }
 
   /** Release process-local derived evidence on graceful close, worker failure or root fencing. */
-  public onClose(listener: () => void): () => void {
-    if (this.closed) { listener(); return () => undefined; }
+  public onClose(listener: (failure?: Error) => void): () => void {
+    if (this.closed) { listener(this.failure); return () => undefined; }
     this.closeListeners.add(listener);
     return () => this.closeListeners.delete(listener);
   }
 
-  private markClosed(): void {
+  private markClosed(failure?: unknown): void {
+    if (this.closed) return;
+    if (failure !== undefined) this.failure = failure instanceof Error ? failure : new Error(String(failure));
+    this.stopHeartbeatTimer();
     this.externalClientCommits.close();
     this.externalAttachmentCommits.close();
     this.closed = true;
     this.casAccess.fence();
-    for (const listener of this.closeListeners) listener();
+    for (const listener of this.closeListeners) {
+      try { listener(this.failure); }
+      catch (error) { console.error('[LimCode] Runtime close listener failed.', error); }
+    }
     this.closeListeners.clear();
   }
 
@@ -1030,15 +1037,8 @@ export class RuntimeDatabase {
   }
 
   private assertUsable(): void {
-    if (this.closed) throw new Error('RuntimeDatabase is closed.');
+    if (this.closed) throw this.failure ?? new Error('RuntimeDatabase is closed.');
     this.casAccess.assertUsable();
-    if (this.heartbeatFailure !== undefined) {
-      const error = new Error('RuntimeDatabase Host liveness heartbeat failed; requests are fenced until restart.') as Error & {
-        cause?: unknown;
-      };
-      error.cause = this.heartbeatFailure;
-      throw error;
-    }
   }
 
   private async request<T>(request: DatabaseWorkerRequestPayload, beforeSubmit?: () => void): Promise<T> {
@@ -1083,10 +1083,9 @@ export class RuntimeDatabase {
       this.heartbeatTask = this.heartbeatTask
         .then(() => this.writeHostHeartbeat())
         .catch((error) => {
-          this.heartbeatFailure = error;
           this.stopHeartbeatTimer();
           this.failPending(error);
-          this.markClosed();
+          this.markClosed(error);
           this.commitListeners.clear();
           // Registration and conversation owners are retained fail-closed; only an explicit
           // graceful close() unregisters after the writer is fenced and work is drained.
@@ -1116,7 +1115,7 @@ export class RuntimeDatabase {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     const temporary = `${target}.${this.livenessId}.tmp`;
     await fs.writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
-    await fs.rename(temporary, target);
+    await replaceHostRecord(temporary, target);
   }
 
   private async unregisterHostLiveness(): Promise<void> {
@@ -1133,7 +1132,7 @@ export class RuntimeDatabase {
     const target = path.join(runtimeHostLivenessDirectory(this.binding.paths), '.client-membership');
     const temporary = target + '.' + this.livenessId + '.tmp';
     await fs.writeFile(temporary, randomUUID(), { encoding: 'utf8', mode: 0o600 });
-    await fs.rename(temporary, target);
+    await replaceHostRecord(temporary, target);
   }
 
   private stopHeartbeatTimer(): void {
@@ -1166,7 +1165,7 @@ export class RuntimeDatabase {
   }
 
   private sendRequest<T>(request: DatabaseWorkerRequestPayload): Promise<T> {
-    if (this.closed) return Promise.reject(new Error('RuntimeDatabase is closed.'));
+    if (this.closed) return Promise.reject(this.failure ?? new Error('RuntimeDatabase is closed.'));
     const id = this.nextRequestId++;
     const metrics = this.performanceMetrics;
     const startedAtMs = metrics ? performance.now() : undefined;
@@ -1215,8 +1214,12 @@ export class RuntimeDatabase {
       return;
     }
     if (message.type === 'fatal') {
-      this.stopHistoryPreparation(new RuntimeDatabaseWorkerError(message.error));
-      this.failPending(new RuntimeDatabaseWorkerError(message.error));
+      const failure = new RuntimeDatabaseWorkerError(message.error);
+      this.markClosed(failure);
+      this.stopHistoryPreparation(failure);
+      this.failPending(failure);
+      void this.worker.terminate().catch(() => undefined);
+      void this.casAccess.close().catch(() => undefined);
       return;
     }
     if (message.type !== 'response') return;
@@ -1387,6 +1390,18 @@ function databaseMetricRequestKind(
   // checkpoint is the last step of the transactions before it.
   if (kind.startsWith('maintenance') || kind === 'durabilityCheckpoint') return 'transaction';
   return kind as RuntimeDatabaseMetricRequestKind;
+}
+
+/** Retry only Windows sharing violations, against the same already-written small record. */
+export async function replaceHostRecord(temporary: string, target: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try { await fs.rename(temporary, target); return; }
+    catch (error) {
+      if (process.platform !== 'win32' || attempt >= 10
+        || !['EPERM', 'EACCES', 'EBUSY'].includes(String((error as NodeJS.ErrnoException)?.code))) throw error;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
 }
 
 async function readHostLiveness(filePath: string): Promise<RuntimeHostLivenessRecord | undefined> {

@@ -5,6 +5,7 @@ import { projectCompressionNotices, type CompressionNotice as CompressionWarning
 import { useChat } from '@webview/composables/useChat';
 import { messageForkBlocked } from '@webview/composables/forkRequestLifecycle';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { useSessionStore } from '@webview/stores/useSessionStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useReliableTimelinePresentationStore } from '@webview/stores/useReliableTimelinePresentationStore';
@@ -58,6 +59,7 @@ const emit = defineEmits<{
   (event: 'edit-message', message: MessageRecord, deleteCount: number): void;
   (event: 'resend-as-new', message: MessageRecord): void;
 }>();
+const session = useSessionStore();
 const { feed, conversationId, projection, ensureDetails } = useReliableConversation();
 const {
   retryMessageFrom,
@@ -447,6 +449,7 @@ const activityModelLabel = computed(() => {
   return override || provider?.model?.trim() || 'LLM';
 });
 const activityLabel = computed(() => {
+  if (session.runtimeError) return '';
   const action = conversationAction.value;
   if (action?.action === 'retry' && action.phase !== 'running' && action.phase !== 'unconfirmed') {
     if (action.phase === 'requesting_stop') return '正在提交停止旧回复的请求';

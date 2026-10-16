@@ -1,3 +1,4 @@
+import { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 import { upgradeContextHandlesWithProgress } from './contextHandleUpgradeNotification';
 import { createRuntimeDeliveryWakeHandler } from './runtimeDeliveryWakeHandler';
 import * as vscode from 'vscode';
@@ -211,6 +212,15 @@ export class VscodeReliableKernelProductRuntime {
       },
       { onError: (error) => console.error('[LimCode] 跨宿主 Runtime 同步失败。', error) }
     );
+    this.application.database.onClose(failure => {
+      if (!failure || this.closing) return;
+      this.freezeNewExecution([]);
+      this.externalRuntimeWatcher.cancel();
+      this.conversations.dispose();
+      this.recoveryController.abort(failure);
+      void this.childAgents.quiesce(new ExecutionHandoffError(failure.message))
+        .catch(error => console.error('[LimCode] 子任务故障收尾未完成。', error));
+    });
   }
 
   public static async open(
