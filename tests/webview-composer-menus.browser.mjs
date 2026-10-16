@@ -100,6 +100,61 @@ async function bounds(page, selector) {
   return page.locator(selector).boundingBox();
 }
 
+test('真实输入栏全部菜单独立于按钮宽度，窄窗和大字体不越界', async t => {
+  const p = await pageFor(t);
+  for (const width of [320, 480, 1000]) {
+    await p.setViewportSize({ width, height: 800 });
+    for (const selector of ['.composer-agent-dropdown', '.composer-workflow-dropdown', '.composer-channel-dropdown', '.composer-work-environment-dropdown']) {
+      const button = p.locator(selector + ' > button');
+      await button.click();
+      const box = await bounds(p, selector + ' .settings-dropdown-panel');
+      assert.ok(box.width >= Math.min(280, width - 16) - 1, `${selector} at ${width}: ${box.width}`);
+      assert.ok(box.width > (await button.boundingBox()).width);
+      assert.ok((await p.locator(selector + ' input').boundingBox()).width > 150);
+      await p.locator(selector + ' input').press('Escape');
+      await p.locator(selector + ' .settings-dropdown-panel').waitFor({ state: 'hidden' });
+    }
+  }
+  await p.setViewportSize({ width: 360, height: 800 });
+  await p.evaluate(() => document.documentElement.style.setProperty('--font-size-sm', '20px'));
+  await p.locator('.composer-workflow-dropdown > button').click();
+  await bounds(p, '.composer-workflow-dropdown .settings-dropdown-panel');
+  if (screenshotDir) await p.screenshot({ path: `${screenshotDir}/workflow-narrow.png` });
+});
+
+test('目录说明不随搜索聚焦弹出，最末选项可点击', async t => {
+  const p = await pageFor(t);
+  await p.getByRole('button', { name: '工作目录说明', exact: true }).focus();
+  await p.getByRole('tooltip').waitFor();
+  await p.locator('.composer-work-environment-dropdown > button').click();
+  await p.getByRole('tooltip').waitFor({ state: 'hidden' });
+  assert.ok(await p.locator('.composer-directory-warning').isVisible());
+  const bottomOption = p.locator('.composer-work-environment-dropdown').getByRole('option', { name: /^工作目录 11\b/ });
+  await bottomOption.scrollIntoViewIfNeeded();
+  await bottomOption.focus();
+  assert.equal(await p.getByRole('tooltip').count(), 0);
+  if (screenshotDir) await p.screenshot({ path: `${screenshotDir}/directory-last-option.png` });
+  const search = p.locator('.composer-work-environment-dropdown input');
+  await search.fill('工作目录 11');
+  const last = p.locator('.composer-work-environment-dropdown').getByRole('option');
+  await last.click();
+  assert.equal(await p.getByRole('tooltip').count(), 0);
+  assert.ok(await p.evaluate(() => window.fixture.posted.some(m => m.type === 'workEnvironment.select' || m.payload?.workEnvironmentId === 'env-11')));
+});
+
+test('模型菜单宽窗并排、窄窗返回渠道，不再固定170px', async t => {
+  const p = await pageFor(t);
+  await p.locator('.composer-channel-dropdown > button').click();
+  await p.getByRole('button', { name: '切换该渠道的 LLM', exact: true }).click();
+  await p.getByRole('button', { name: '‹ 返回渠道' }).waitFor();
+  await bounds(p, '.composer-channel-dropdown .settings-dropdown-panel');
+  if (screenshotDir) await p.screenshot({ path: `${screenshotDir}/models-narrow.png` });
+  await p.getByRole('button', { name: '‹ 返回渠道' }).click();
+  await p.setViewportSize({ width: 1200, height: 800 });
+  await p.getByRole('button', { name: '切换该渠道的 LLM', exact: true }).click();
+  assert.ok((await bounds(p, '.channel-model-panel')).width >= 280);
+});
+
 test('协作查找跨空页显示进度、查完结束、停止不继续请求、失败保留游标', async t => {
   const p = await pageFor(t);
   await p.evaluate(() => window.fixture.mode.value = 'history');

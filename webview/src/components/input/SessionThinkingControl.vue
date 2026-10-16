@@ -126,19 +126,6 @@ const hint = computed(() => unconfiguredModel.value
   ...(inactiveOverride.value ? [inactiveOverride.value.reason || INACTIVE_SESSION_THINKING_NOTICE] : []),
   inheritChildren.value ? '这个对话派出的子 Agent 也使用这里的选择。' : '子 Agent 按它自己的 Agent 设置。'
 ].join('\n'));
-/** 面板至少 280px 宽；靠近窗口右边时向左移，窗口太窄时贴住左边距。 */
-function panelOffset(left: number, width: number, viewport: number): number {
-  const panelWidth = Math.min(Math.max(width, 280), viewport - 16);
-  return Math.max(8 - left, Math.min(0, viewport - 8 - (left + panelWidth)));
-}
-const panelLeft = ref(0);
-const root = ref<HTMLElement | null>(null);
-function alignPanel(): void {
-  const dropdown = root.value?.querySelector('.session-thinking-dropdown');
-  if (!dropdown || typeof window === 'undefined') return;
-  const rect = dropdown.getBoundingClientRect();
-  panelLeft.value = panelOffset(rect.left, rect.width, window.innerWidth);
-}
 const error = computed(() => unconfiguredModel.value
   ? '请先配置模型：在全局设置中添加并选择模型。'
   : localError.value || pending.value?.error || store.errorFor('conversation', props.conversationId)
@@ -180,7 +167,7 @@ function retry(): void {
 </script>
 
 <template>
-  <div ref="root" class="session-thinking-control" :title="hint" :style="{ '--session-thinking-panel-left': `${panelLeft}px` }">
+  <div class="session-thinking-control" :title="hint">
     <SettingsDropdown
       class="session-thinking-dropdown"
       :model-value="selected"
@@ -188,8 +175,8 @@ function retry(): void {
       :disabled="disabled"
       title="这个对话的思考强度（下一次请求生效）"
       placement="top"
+      panel-sizing="content"
       :max-height="320"
-      @open="alignPanel"
       @update:model-value="save"
     >
       <template #footer>
@@ -221,8 +208,6 @@ function retry(): void {
   color: var(--vscode-foreground); border-color: var(--vscode-panel-border, transparent);
   background: var(--vscode-list-hoverBackground, transparent);
 }
-/* At least 280px wide, never wider than the window; alignPanel() shifts it left near the right edge. */
-.session-thinking-dropdown :deep(.settings-dropdown-panel) { width: max(100%, 280px); max-width: calc(100vw - 16px); left: var(--session-thinking-panel-left, 0px); }
 .session-thinking-inherit { display: inline-flex; align-items: center; gap: 6px; white-space: normal; font-size: var(--font-size-sm); cursor: pointer; }
 .session-thinking-inherit-hint { margin: 4px 0 0 22px; color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); white-space: normal; }
 .session-thinking-error { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 220px; color: var(--vscode-errorForeground); font-size: 11px; }

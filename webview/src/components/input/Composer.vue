@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
+import { IconInfoCircle, IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import { toStructuredClonePlainData } from '@shared/plainData';
 import {
@@ -26,7 +26,8 @@ import { useReliableConversation } from '@webview/composables/useReliableConvers
 import RichContentEditor from '@webview/components/content/RichContentEditor.vue';
 import AskUserTopPanel from '@webview/components/askUser/AskUserTopPanel.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
-import SettingsSelectableList, { type SettingsSelectableListItem } from '@webview/components/settings/global/SettingsSelectableList.vue';
+import type { SettingsSelectableListItem } from '@webview/components/settings/global/SettingsSelectableList.vue';
+import ComposerModelMenu from './ComposerModelMenu.vue';
 import BackgroundCommandPanel from '@webview/components/input/BackgroundCommandPanel.vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
@@ -105,9 +106,10 @@ const agentDropdownCloseSignal = ref(0);
 const modeDropdownCloseSignal = ref(0);
 const channelDropdownCloseSignal = ref(0);
 const workEnvironmentDropdownCloseSignal = ref(0);
+const workEnvironmentMenuOpen = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 const attachmentScroller = ref<HTMLElement | null>(null);
-const channelModelPanel = ref<{ configId: string; style: Record<string, string> } | null>(null);
+const channelModelPanel = ref<{ configId: string; inline: boolean; style: Record<string, string> } | null>(null);
 const currentSubmissionCommandId = ref<string>();
 let currentSubmissionDraft: { conversationId: string; revision: number; generation: number; restoreFocus?: () => void } | undefined;
 const currentSteerCommandId = ref<string>();
@@ -220,7 +222,7 @@ const workEnvironmentOptions = computed<SettingsDropdownOption[]>(() =>
     .map((environment) => ({
       value: environment.id,
       label: environment.name,
-      description: middleEllipsis(workEnvironmentDisplayPath(environment), 58),
+      description: workEnvironmentDisplayPath(environment),
       icon: IconFolder
     }))
 );
@@ -819,27 +821,19 @@ function openChannelModelPanel(configId: string, event: MouseEvent): void {
   }
   const target = event.currentTarget instanceof HTMLElement ? event.currentTarget : undefined;
   if (!target) return;
-  channelModelPanel.value = { configId, style: channelModelPanelStyleFor(target) };
-}
-
-function channelModelPanelStyleFor(anchor: HTMLElement): Record<string, string> {
-  const rect = anchor.getBoundingClientRect();
-  const margin = 8;
-  const gap = 6;
-  const width = Math.min(170, Math.max(150, window.innerWidth - margin * 2));
-  const height = 220;
-  let left = rect.right + gap;
-  if (left + width > window.innerWidth - margin) left = rect.left - width - gap;
-  if (left < margin) left = Math.min(Math.max(margin, rect.left), Math.max(margin, window.innerWidth - width - margin));
-  let top = rect.top;
-  if (top + height > window.innerHeight - margin) top = window.innerHeight - height - margin;
-  if (top < margin) top = margin;
-  return {
-    left: `${Math.round(left)}px`,
-    top: `${Math.round(top)}px`,
-    width: `${Math.round(width)}px`,
-    height: `${height}px`
-  };
+  const rect = target.closest('.settings-dropdown-panel')?.getBoundingClientRect() ?? target.getBoundingClientRect();
+  const right = window.innerWidth - rect.right - 14;
+  const left = rect.left - 14;
+  const inline = Math.max(left, right) < 280;
+  const toRight = right >= 280;
+  const top = Math.max(8, Math.min(rect.top, window.innerHeight - 228));
+  channelModelPanel.value = { configId, inline, style: inline ? {} : {
+    ...(toRight ? { left: `${rect.right + 6}px` } : { right: `${window.innerWidth - rect.left + 6}px` }),
+    top: `${top}px`,
+    minWidth: '280px',
+    maxWidth: `${Math.min(420, toRight ? right : left)}px`,
+    '--composer-model-max-height': `${window.innerHeight - top - 8}px`
+  } };
 }
 
 function selectChannelModel(config: LlmProviderConfigRecord, item: SettingsSelectableListItem): void {
@@ -951,13 +945,7 @@ function agentSourceDescription(agent: AgentRecord): string {
   return `用户 Agent · ${agent.kind}`;
 }
 
-function middleEllipsis(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  const keep = Math.max(4, Math.floor((maxLength - 3) / 2));
-  const head = value.slice(0, keep);
-  const tail = value.slice(value.length - keep);
-  return `${head}…${tail}`;
-}
+
 </script>
 
 <template>
@@ -1103,6 +1091,8 @@ function middleEllipsis(value: string, maxLength: number): string {
       <div v-if="clientState.currentConversationId || agentOptions.length || workflowOptions.length || channelOptions.length || workEnvironmentOptions.length" class="composer-meta">
         <template v-if="agentOptions.length">
           <SettingsDropdown
+            panel-sizing="content"
+            placement="top"
             v-model="activeAgentId"
             class="composer-meta-dropdown composer-agent-dropdown"
             :options="agentOptions"
@@ -1116,6 +1106,8 @@ function middleEllipsis(value: string, maxLength: number): string {
         </template>
         <template v-if="workflowOptions.length">
           <SettingsDropdown
+            panel-sizing="content"
+            placement="top"
             v-model="activeWorkflowId"
             class="composer-meta-dropdown composer-workflow-dropdown"
             :options="workflowOptions"
@@ -1129,6 +1121,8 @@ function middleEllipsis(value: string, maxLength: number): string {
         </template>
         <template v-if="channelOptions.length">
           <SettingsDropdown
+            panel-sizing="content"
+            placement="top"
             v-model="activeChannelId"
             class="composer-meta-dropdown composer-channel-dropdown"
             :options="channelOptions"
@@ -1139,6 +1133,7 @@ function middleEllipsis(value: string, maxLength: number): string {
             :close-signal="channelDropdownCloseSignal"
             :max-height="220"
             @open="onChannelDropdownOpen"
+            @open-change="!$event && closeChannelModelPanel()"
           >
             <template #optionAction="{ option }">
               <button
@@ -1152,29 +1147,17 @@ function middleEllipsis(value: string, maxLength: number): string {
                 <span class="channel-model-toggle-caret" aria-hidden="true"></span>
               </button>
             </template>
+            <template v-if="channelModelPanel?.inline && channelModelPanelConfig" #panelContent>
+              <ComposerModelMenu inline :name="channelModelPanelConfig.name" :provider="providerLabel(channelModelPanelConfig.provider)"
+                :items="channelModelPanelItems" :selected-id="selectedModelForConfig(channelModelPanelConfig)"
+                @back="closeChannelModelPanel" @select="selectChannelModel(channelModelPanelConfig, $event)" />
+            </template>
             <template #panelOverlay="{ open }">
-              <section
-                v-if="open && channelModelPanel && channelModelPanelConfig"
-                class="channel-model-panel lc-dropdown-panel"
-                :style="channelModelPanel.style"
-                aria-label="切换 LLM"
-                @click.stop
-              >
-                <div class="channel-model-panel-title">
-                  <span>{{ channelModelPanelConfig.name }}</span>
-                  <small>{{ providerLabel(channelModelPanelConfig.provider) }}</small>
-                </div>
-                <SettingsSelectableList
-                  class="channel-model-list"
-                  :items="channelModelPanelItems"
-                  :selected-id="selectedModelForConfig(channelModelPanelConfig)"
-                  search-placeholder="筛选 LLM…"
-                  empty-text="该渠道暂无 LLM 列表。"
-                  no-match-text="没有匹配的 LLM。"
-                  :max-height="124"
-                  @select="selectChannelModel(channelModelPanelConfig, $event)"
-                />
-              </section>
+              <ComposerModelMenu v-if="open && channelModelPanel && !channelModelPanel.inline && channelModelPanelConfig"
+                class="channel-model-panel lc-dropdown-panel" :style="channelModelPanel.style"
+                :name="channelModelPanelConfig.name" :provider="providerLabel(channelModelPanelConfig.provider)"
+                :items="channelModelPanelItems" :selected-id="selectedModelForConfig(channelModelPanelConfig)"
+                @select="selectChannelModel(channelModelPanelConfig, $event)" />
             </template>
           </SettingsDropdown>
         </template>
@@ -1185,8 +1168,10 @@ function middleEllipsis(value: string, maxLength: number): string {
           :model="confirmedEffectiveModel?.model"
         />
         <template v-if="workEnvironmentSwitchingEnabled && (workEnvironmentOptions.length || workEnvironmentSelection.error)">
-          <HoverTooltipPanel class="composer-work-environment-trigger" :panel-title="frozenWorkEnvironmentSelection ? '下一回合工作目录' : '工作目录'" :rows="[{ label: '目录', value: workEnvironmentDescription }]">
+          <span class="composer-work-environment-trigger">
             <SettingsDropdown
+              panel-sizing="content"
+              placement="top"
               v-model="activeWorkEnvironmentId"
               class="composer-meta-dropdown composer-work-environment-dropdown"
               :options="workEnvironmentOptions"
@@ -1197,8 +1182,17 @@ function middleEllipsis(value: string, maxLength: number): string {
               :close-signal="workEnvironmentDropdownCloseSignal"
               :max-height="220"
               @open="onWorkEnvironmentDropdownOpen"
-            />
-          </HoverTooltipPanel>
+              @open-change="workEnvironmentMenuOpen = $event"
+            >
+              <template #header>
+                <p v-if="workEnvironmentSelection.error" class="composer-directory-warning">{{ workEnvironmentSelection.error }}</p>
+              </template>
+            </SettingsDropdown>
+            <HoverTooltipPanel :disabled="workEnvironmentMenuOpen" :panel-title="frozenWorkEnvironmentSelection ? '下一回合工作目录' : '工作目录'"
+              :rows="[{ label: '目录', value: workEnvironmentDescription }]">
+              <button type="button" class="composer-directory-info" aria-label="工作目录说明"><IconInfoCircle :size="14" /></button>
+            </HoverTooltipPanel>
+          </span>
         </template>
         <HoverTooltipPanel
           v-if="frozenWorkEnvironmentSelection || (!workEnvironmentSwitchingEnabled && (displayedWorkEnvironmentSelection.active || displayedWorkEnvironmentSelection.error))"
@@ -1612,8 +1606,14 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-work-environment-trigger {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
   max-width: 100%;
 }
+.composer-directory-info { display: inline-flex; padding: 3px; border: 0; color: var(--vscode-descriptionForeground); background: transparent; }
+.composer-directory-info:hover, .composer-directory-info:focus-visible { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+.composer-directory-warning { margin: 0 0 8px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; color: var(--vscode-editorWarning-foreground); font-size: var(--font-size-xs); }
 
 .composer-meta-dropdown :deep(button.settings-dropdown-button) {
   min-height: 24px;
@@ -1631,17 +1631,6 @@ function middleEllipsis(value: string, maxLength: number): string {
   color: var(--vscode-foreground);
   border-color: var(--vscode-panel-border, transparent);
   background: var(--vscode-list-hoverBackground, transparent);
-}
-
-.composer-meta-dropdown :deep(.settings-dropdown-panel) {
-  top: auto;
-  bottom: calc(100% + 4px);
-  width: 100%;
-}
-
-.composer-channel-dropdown :deep(.settings-dropdown-panel) {
-  width: 100%;
-  min-width: 100%;
 }
 
 .composer-channel-dropdown :deep(.settings-dropdown-option-row.has-option-action .project-option) {
@@ -1694,6 +1683,7 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .channel-model-panel {
+  width: max-content;
   position: fixed;
   z-index: 60;
   overflow: hidden;
@@ -1701,67 +1691,6 @@ function middleEllipsis(value: string, maxLength: number): string {
   border-radius: var(--radius-sm);
   background: var(--vscode-editor-background);
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24);
-}
-
-.channel-model-panel-title {
-  min-height: 42px;
-  padding: var(--space-2);
-  border-bottom: 1px solid var(--vscode-panel-border);
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 2px;
-}
-
-.channel-model-panel-title span {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--vscode-foreground);
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.channel-model-panel-title small {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.channel-model-list {
-  height: calc(100% - 42px);
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-}
-
-.channel-model-list :deep(.settings-selectable-filter) {
-  min-height: 28px;
-}
-
-.channel-model-list :deep(.settings-selectable-filter input) {
-  min-height: 26px;
-}
-
-.channel-model-list :deep(.settings-selectable-shell) {
-  min-height: 0;
-}
-
-.channel-model-list :deep(.settings-selectable-scroll) {
-  min-height: 0;
-}
-
-.channel-model-list :deep(.settings-selectable-items) {
-  padding: var(--space-1);
-}
-
-.channel-model-list :deep(.settings-selectable-item) {
-  min-height: 42px;
-  grid-template-columns: minmax(0, 1fr);
 }
 
 .composer-meta-dropdown :deep(.settings-dropdown-caret) {
