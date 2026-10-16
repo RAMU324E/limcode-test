@@ -120,6 +120,22 @@ const pendingHistoryAnchorId = ref<string | null>(null);
 const pendingScrollAnchor = ref<ScrollAnchor | null>(null);
 /** Timeline rows present when the user asked for older collaboration records. */
 const pendingCollaborationRowIds = shallowRef<Set<string> | null>(null);
+const collaborationSearching = ref(false);
+const collaborationSearchNotice = ref('');
+const collaborationSearchStart = ref(0);
+const collaborationScanned = computed(() => Math.max(0, feed.collaborationHistoryScannedRows - collaborationSearchStart.value));
+let collaborationSearchTimer: ReturnType<typeof setTimeout> | undefined;
+function stopCollaborationSearch(notice = '已停止查找'): void {
+  if (collaborationSearchTimer !== undefined) clearTimeout(collaborationSearchTimer);
+  collaborationSearchTimer = undefined;
+  collaborationSearching.value = false;
+  pendingCollaborationRowIds.value = null;
+  collaborationSearchNotice.value = notice;
+}
+onBeforeUnmount(() => stopCollaborationSearch(''));
+watch(() => feed.sessionId, () => stopCollaborationSearch(''));
+watch(() => feed.collaborationHistoryError, error => { if (error) stopCollaborationSearch('查找失败，可从当前位置重试'); });
+watch(() => session.runtimeError, error => { if (error) stopCollaborationSearch('运行连接已停止'); });
 const earliestLoadedFloor = computed(() => {
   const first = messages.value[0];
   if (!first) return 0;
@@ -275,6 +291,7 @@ watch(
 );
 
 watch(conversationId, () => {
+  stopCollaborationSearch('');
   pendingHistoryAnchorId.value = null;
   pendingCollaborationRowIds.value = null;
   pendingScrollAnchor.value = null;
@@ -309,12 +326,25 @@ watch(
   () => feed.collaborationHistoryLoadedPages,
   (pages, previousPages) => {
     const known = pendingCollaborationRowIds.value;
-    if (pages <= previousPages || !known) return;
-    pendingCollaborationRowIds.value = null;
+    if (pages <= previousPages || !known || !collaborationSearching.value) return;
     const firstNew = timelineRows.value.findIndex((row) => row.kind === 'collaboration' && !known.has(row.id));
-    if (firstNew < 0) return;
-    followLatestSegment.value = false;
-    segmentStart.value = clampTimelineSegmentStart(timelineRows.value.length, firstNew);
+    if (firstNew >= 0) {
+      stopCollaborationSearch('已找到更早的协作记录');
+      followLatestSegment.value = false;
+      segmentStart.value = clampTimelineSegmentStart(timelineRows.value.length, firstNew);
+      return;
+    }
+    if (!feed.collaborationHistoryHasMore) {
+      stopCollaborationSearch('没有更早的协作记录');
+      return;
+    }
+    // One request at a time; yield between empty/duplicate pages so progress and Stop can paint.
+    collaborationSearchTimer = setTimeout(() => {
+      collaborationSearchTimer = undefined;
+      if (collaborationSearching.value && !feed.requestEarlierCollaborationHistory(conversationId.value)) {
+        stopCollaborationSearch('查找已暂停');
+      }
+    }, 0);
   }
 );
 
@@ -583,11 +613,14 @@ async function restorePendingScrollAnchor(): Promise<void> {
 }
 
 function showEarlierCollaboration(): void {
-  if (feed.collaborationHistoryLoading || !feed.collaborationHistoryHasMore) return;
+  if (session.runtimeError || collaborationSearching.value || feed.collaborationHistoryLoading || !feed.collaborationHistoryHasMore) return;
   releaseStickyFromUserScroll(props.scroller);
   followLatestSegment.value = false;
-  const known = new Set(timelineRows.value.map((row) => row.id));
-  if (feed.requestEarlierCollaborationHistory(conversationId.value)) pendingCollaborationRowIds.value = known;
+  collaborationSearchStart.value = feed.collaborationHistoryScannedRows;
+  collaborationSearchNotice.value = '';
+  pendingCollaborationRowIds.value = new Set(timelineRows.value.map((row) => row.id));
+  collaborationSearching.value = true;
+  if (!feed.requestEarlierCollaborationHistory(conversationId.value)) stopCollaborationSearch('查找未开始，请重试');
 }
 
 function showEarlierSegment(): void {
@@ -786,12 +819,16 @@ function messageRenderKey(message: MessageRecord): string {
       v-if="feed.collaborationHistoryConversationId === conversationId && feed.collaborationHistoryHasMore"
       type="button"
       class="reliable-segment-control"
-      :disabled="feed.collaborationHistoryLoading"
+      :disabled="!!session.runtimeError || collaborationSearching || feed.collaborationHistoryLoading"
       @click="showEarlierCollaboration"
     >
-      {{ feed.collaborationHistoryLoading ? '正在加载更早协作记录'
-        : feed.collaborationHistoryScanProgress ? '继续查找更早协作记录' : '显示更早协作记录' }}
+      {{ collaborationSearching || feed.collaborationHistoryLoading ? '正在查找更早协作记录'
+        : '查找更早协作记录' }}
     </button>
+    <button v-if="collaborationSearching" type="button" class="reliable-segment-control" @click="stopCollaborationSearch()">停止查找</button>
+    <p v-if="collaborationSearching || collaborationSearchNotice" class="reliable-collaboration-progress" role="status">
+      {{ collaborationSearching ? '正在查找' : collaborationSearchNotice }} · 已检查 {{ collaborationScanned.toLocaleString() }} 条记录
+    </p>
     <p v-if="feed.collaborationHistoryError" class="reliable-history-error" role="alert">
       {{ feed.collaborationHistoryError }}
     </p>
@@ -955,6 +992,7 @@ function messageRenderKey(message: MessageRecord): string {
 </template>
 
 <style scoped>
+.reliable-collaboration-progress { color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); margin: 4px 0 8px; }
 .reliable-retry-boundary {
   margin: 4px 0 2px;
   padding: 5px 8px;

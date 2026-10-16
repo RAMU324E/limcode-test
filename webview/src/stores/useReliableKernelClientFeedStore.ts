@@ -200,6 +200,7 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   collaborationHistoryRequestPeerGeneration: number | null;
   collaborationHistoryRequestIsBootstrap: boolean;
   collaborationHistoryLoadedPages: number;
+  collaborationHistoryScannedRows: number;
   /**
    * Conversations this view saw removed by a committed change. A peer merely missing from the
    * bounded lists is unknown; only these read as deleted. Memory-only and bounded.
@@ -271,6 +272,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
     collaborationHistoryRequestPeerGeneration: null,
     collaborationHistoryRequestIsBootstrap: false,
     collaborationHistoryLoadedPages: 0,
+    collaborationHistoryScannedRows: 0,
     removedConversationIds: []
   }),
   getters: {
@@ -640,6 +642,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       this.collaborationHistoryError = null;
       this.collaborationHistoryRequestId = null;
       this.collaborationHistoryRequestIsBootstrap = false;
+      this.collaborationHistoryScannedRows += message.page.scannedRows;
       this.collaborationHistoryLoadedPages += 1;
       if (continueBootstrap) this.requestEarlierCollaborationHistory(message.conversationId, true);
     },
@@ -2079,6 +2082,7 @@ function resetCollaborationHistoryState(
   state.collaborationHistoryRequestPeerGeneration = null;
   state.collaborationHistoryRequestIsBootstrap = false;
   state.collaborationHistoryLoadedPages = 0;
+  state.collaborationHistoryScannedRows = 0;
 }
 
 /** Reject malformed, repeated or backward-lane cursors without deriving placement from them. */
