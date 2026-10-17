@@ -391,6 +391,122 @@ test('浏览、新建和添加模型不激活；目标绑定编辑与迟到确�
   assert.doesNotThrow(() => structuredClone(f.messagesOf(T.GlobalSettingsUpdate).at(-1).payload));
 });
 
+function modelListResponse(request, modelId = 'fetched-model') {
+  const { id, provider, baseUrl } = request.payload.config;
+  return { configId: id, provider, baseUrl, models: [{ id: modelId, name: modelId }] };
+}
+
+for (const [defaultProvider, targetProvider, targetId] of [
+  ['gemini', 'gemini', 'A'],
+  ['gemini', 'openai-compatible', 'B'],
+  ['gemini', 'openai-responses', 'B'],
+  ['openai-compatible', 'openai-compatible', 'A'],
+  ['openai-compatible', 'gemini', 'B']
+]) test(`获取模型按编辑目标接收且不激活：默认${defaultProvider}，目标${targetProvider}/${targetId}`, async t => {
+  const f = channelSettings(t), configs = f.global.llmProviderConfigs.configs;
+  configs[0].provider = defaultProvider;
+  configs.find(config => config.id === targetId).provider = targetProvider;
+  const channel = f.mount('Channel').view;
+  channel.editingConfigId = targetId;
+  f.global.requestModelsForActiveConfig(channel.editingConfigId);
+  const request = f.last(T.LlmProviderModelsGet);
+  assert.equal(request.payload.config.id, targetId);
+  assert.equal(f.global.fetchedModelsDialog.open, true, '打开弹窗不能触发取消');
+  assert.equal(f.global.fetchedModelsDialog.loading, true);
+  channel.editingConfigId = targetId === 'A' ? 'B' : 'A';
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(request), request.id);
+  assert.equal(f.global.fetchedModelsDialog.configId, targetId);
+  assert.equal(f.global.fetchedModelsDialog.loading, false);
+  assert.deepEqual(f.global.fetchedModelsDialog.models.map(model => model.id), ['fetched-model']);
+  const status = f.global.status;
+  await f.clock.advance(60_000);
+  assert.equal(f.global.status, status, '成功响应应清除获取超时');
+  f.global.addFetchedModelsToConfig(f.global.fetchedModelsDialog.models);
+  assert.ok(configs.find(config => config.id === targetId).models.some(model => model.id === 'fetched-model'));
+  assert.ok(!configs.find(config => config.id !== targetId).models.some(model => model.id === 'fetched-model'));
+  assert.equal(f.global.llm.activeProviderConfigId, 'A');
+});
+
+test('获取模型不因全局默认选择或无关渠道的端点变化而取消', t => {
+  const f = channelSettings(t);
+  f.global.requestModelsForActiveConfig('B');
+  const request = f.last(T.LlmProviderModelsGet), defaultConfig = f.global.activeLlmProviderConfig;
+  defaultConfig.baseUrl = 'https://other.example/v1';
+  defaultConfig.apiKey = 'changed';
+  defaultConfig.headers.Authorization = 'changed';
+  f.global.selectLlmProviderConfig('B');
+  f.global.selectLlmProviderConfig('A');
+  assert.equal(f.global.fetchedModelsDialog.open, true);
+  assert.equal(f.global.fetchedModelsDialog.loading, true);
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(request), request.id);
+  assert.equal(f.global.fetchedModelsDialog.loading, false);
+  assert.deepEqual(f.global.fetchedModelsDialog.models.map(model => model.id), ['fetched-model']);
+});
+
+test('获取模型允许目标配置的等价规范化和非端点编辑', t => {
+  const f = channelSettings(t), config = f.global.llmProviderConfigs.configs[1];
+  config.baseUrl = ' https://api.example/v1 ';
+  config.apiKey = ' key ';
+  config.headers = { ' X-Test ': ' value ' };
+  f.global.requestModelsForActiveConfig('B');
+  const request = f.last(T.LlmProviderModelsGet);
+  config.baseUrl = config.baseUrl.trim();
+  config.apiKey = config.apiKey.trim();
+  config.headers = { 'X-Test': 'value' };
+  config.name = 'renamed';
+  config.model = 'B-two';
+  assert.equal(f.global.fetchedModelsDialog.loading, true);
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(request), request.id);
+  assert.equal(f.global.fetchedModelsDialog.loading, false);
+  assert.deepEqual(f.global.fetchedModelsDialog.models.map(model => model.id), ['fetched-model']);
+});
+
+for (const [label, change] of [
+  ['类型', config => { config.provider = 'gemini'; }],
+  ['地址', config => { config.baseUrl = 'https://changed.example/v1'; }],
+  ['密钥', config => { config.apiKey = 'changed'; }],
+  ['请求头', config => { config.headers.Authorization = 'changed'; }],
+  ['删除', (_config, store) => { store.llmProviderConfigs.configs.splice(1, 1); }]
+]) test(`获取模型在非默认目标渠道${label}变化后取消并忽略旧响应`, async t => {
+  const f = channelSettings(t);
+  f.global.requestModelsForActiveConfig('B');
+  const request = f.last(T.LlmProviderModelsGet);
+  change(f.global.llmProviderConfigs.configs[1], f.global);
+  assert.equal(f.global.fetchedModelsDialog.open, false);
+  const status = f.global.status;
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(request), request.id);
+  await f.clock.advance(60_000);
+  assert.equal(f.global.fetchedModelsDialog.open, false);
+  assert.deepEqual(f.global.fetchedModelsDialog.models, []);
+  assert.equal(f.global.status, status, '取消后旧获取超时不能重开弹窗');
+});
+
+for (const targetId of ['A', 'B']) test(`获取模型的新请求${targetId}不被旧响应或错误覆盖`, async t => {
+  const f = channelSettings(t);
+  f.global.requestModelsForActiveConfig('B');
+  const oldRequest = f.last(T.LlmProviderModelsGet);
+  f.global.requestModelsForActiveConfig(targetId);
+  const request = f.last(T.LlmProviderModelsGet);
+  assert.notEqual(request.id, oldRequest.id);
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(oldRequest, 'old-model'), oldRequest.id);
+  f.global.setError('old error', { requestType: T.LlmProviderModelsGet, correlationId: oldRequest.id });
+  assert.equal(f.global.fetchedModelsDialog.open, true);
+  assert.equal(f.global.fetchedModelsDialog.loading, true);
+  assert.equal(f.global.fetchedModelsDialog.configId, targetId);
+  assert.deepEqual(f.global.fetchedModelsDialog.models, []);
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(request), request.id);
+  const status = f.global.status;
+  await f.clock.advance(60_000);
+  assert.equal(f.global.status, status);
+  assert.deepEqual(f.global.fetchedModelsDialog.models.map(model => model.id), ['fetched-model']);
+  f.global.requestModelsForActiveConfig(targetId);
+  const closedRequest = f.last(T.LlmProviderModelsGet);
+  f.global.closeFetchedModelsDialog();
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(closedRequest), closedRequest.id);
+  await f.clock.advance(60_000);
+  assert.equal(f.global.fetchedModelsDialog.open, false);
+});
+
 test('专业参数编辑挂载不写默认，数值清空不落为0，思考档位复用能力集合', async t => {
   const f = channelSettings(t), emitted = [];
   const config = { ...f.global.activeLlmProviderConfig, model: 'gpt-6-astra' };

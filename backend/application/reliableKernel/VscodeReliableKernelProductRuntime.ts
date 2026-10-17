@@ -60,6 +60,7 @@ import { isConversationRuntimeOwnerBusyError } from '../../reliableKernel/Conver
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import { retryLocalExecution } from '../../reliableKernel/localExecutionRecovery';
 import type { ConversationRecoveryResult } from '../../../vscode/ApplicationFacade';
+import { SYSTEM_TEMPORARY_WORK_ENVIRONMENT_ID, systemTemporaryDirectory } from '../../reliableKernel/systemTemporaryWorkEnvironment';
 
 export interface VscodeReliableKernelProductRuntimeOptions {
   /** Tests/candidate validation may supply an isolated authority. Production resolves it through getPaths(). */
@@ -401,6 +402,9 @@ export class VscodeReliableKernelProductRuntime {
         authorityCompiler: configuration,
         compressionSettingsAuthority: configuration,
         resolveWorkEnvironment: async (workEnvironmentId) => {
+          if (workEnvironmentId === SYSTEM_TEMPORARY_WORK_ENVIRONMENT_ID) {
+            return { id: workEnvironmentId, rootPath: systemTemporaryDirectory() };
+          }
           const environment = await configuration.workEnvironment(workEnvironmentId);
           if (!environment.available || environment.kind !== 'localFolder' || !environment.rootPath) return undefined;
           return { id: environment.id, rootPath: environment.rootPath };

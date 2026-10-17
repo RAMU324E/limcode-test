@@ -2759,8 +2759,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
         const pending = pendingModelFetches.get(this);
         if (!pending || pending.requestId !== correlationId || pending.configId !== payload.configId
           || pending.provider !== payload.provider || pending.baseUrl !== payload.baseUrl.trim()
-          || !this.fetchedModelsDialog.open || this.fetchedModelsDialog.configId !== pending.configId
-          || this.llm.activeProviderConfigId !== pending.configId) return;
+          || !this.fetchedModelsDialog.open || this.fetchedModelsDialog.configId !== pending.configId) return;
       } else if (payload.purpose === 'capability_probe') {
         const requests = pendingNativeProbes.get(this);
         const pending = correlationId ? requests?.get(correlationId) : undefined;
@@ -2863,14 +2862,18 @@ export const useGlobalSettingsStore: typeof useGlobalSettingsStoreDefinition = O
         });
       }, { flush: 'sync' }));
       scope.run(() => watch(() => {
-        const config = store.activeLlmProviderConfig;
+        const configId = store.fetchedModelsDialog.configId;
+        const config = store.llmProviderConfigs.configs.find(item => item.id === configId);
         // Match toPlainProviderConfig: an autosave that only trims transport fields does not
         // replace the endpoint/credentials that the in-flight request actually used.
-        return JSON.stringify([
+        return [configId, JSON.stringify([
           config?.id, config?.provider, config?.baseUrl?.trim(), config?.apiKey?.trim(),
           sanitizeHeaders(config?.headers)
-        ]);
-      }, () => store.closeFetchedModelsDialog(), { flush: 'sync' }));
+        ])] as const;
+      }, ([configId, endpoint], [previousConfigId, previousEndpoint]) => {
+        // Opening or replacing the dialog binds a new target; only changes to that target cancel it.
+        if (configId === previousConfigId && endpoint !== previousEndpoint) store.closeFetchedModelsDialog();
+      }, { flush: 'sync' }));
       const reset = store.$reset.bind(store);
       store.$reset = () => { pendingNativeProbes.delete(store); store.closeFetchedModelsDialog(); reset(); };
       const dispose = store.$dispose.bind(store);

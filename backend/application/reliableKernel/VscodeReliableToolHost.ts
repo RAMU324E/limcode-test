@@ -39,6 +39,7 @@ import { resolveFrozenWorkEnvironmentBoundary } from '../../reliableKernel/workE
 import { frozenSkillPolicy } from '../../reliableKernel/frozenAuthority';
 import { frozenToolPolicyDocument } from '../../reliableKernel/childExecutionBoundary';
 import { realPathOfNearestExisting } from '../../capabilities/vscodeFs';
+import { systemTemporaryDirectory, systemTemporaryWorkEnvironment } from '../../reliableKernel/systemTemporaryWorkEnvironment';
 import { lazySkillCatalogWithinPolicy, skillCatalogWithinPolicy } from '../../world/modules/skill/policy';
 import { describeSkillLookupFailure, renderSkillRecord } from '../../world/modules/skill/skillLookup';
 import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
@@ -414,7 +415,11 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     const policy = authorityWorkEnvironmentPolicy(authority.document);
     const records = await this.configuration.workEnvironments();
     const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
-    return cloneEnvironmentBoundary(boundary);
+    const local = boundary.allowed.some(environment => environment.kind === 'localFolder');
+    return {
+      ...(boundary.active ? { active: { ...boundary.active } } : {}),
+      allowed: local ? [...boundary.allowed, systemTemporaryWorkEnvironment()] : [...boundary.allowed]
+    };
   }
 
   private async loadAttachmentMaxBytes(): Promise<number> {
@@ -426,16 +431,6 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     }
     return maxMb * 1024 * 1024;
   }
-}
-
-function cloneEnvironmentBoundary(boundary: {
-  active?: WorkEnvironmentRecord;
-  allowed: WorkEnvironmentRecord[];
-}): { active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] } {
-  return {
-    ...(boundary.active ? { active: { ...boundary.active } } : {}),
-    allowed: boundary.allowed.map((environment) => ({ ...environment }))
-  };
 }
 
 function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {
