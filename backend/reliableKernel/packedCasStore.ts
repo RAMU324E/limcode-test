@@ -5,12 +5,13 @@ import { isMainThread } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { syncDirectoryDurablySync } from '../capabilities/filesystem/durableDirectorySync';
 import { requireCasObjectIdentity, type CasObjectIdentity } from './casObjectAccess';
-import { freezeRootBinding, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import type { HistoricalRootBinding } from './rootAuthority';
 import { fileDescriptorMatchesPathState, fileStateIdentity } from './fileTargetBoundary';
 import { looseCasObjectLocation, verifyCasObjectBytes } from './looseCasObjectAccess';
 import {
   PACKED_CAS_FILE, PACKED_CAS_MAX_BODY_BYTES, PACKED_CAS_MAX_QUEUED_BYTES,
-  packedCasRequestCharge, type PackedCasOpenOptions, type PackedCasPlacement, type PackedCasPublication
+  packedCasRequestCharge, type PackedCasIdentity, type PackedCasOpenOptions, type PackedCasPlacement, type PackedCasPublication
 } from './packedCasWorkerProtocol';
 import { toSqliteFilePath } from './sqliteFilePath';
 
@@ -35,25 +36,28 @@ const busyWait = new Int32Array(new SharedArrayBuffer(4));
  */
 export class PackedCasStore {
   public readonly databasePath: string;
-  private readonly binding: RootBinding;
+  private readonly binding: HistoricalRootBinding;
   private readonly readOnly: boolean;
   private database?: Database.Database;
   private identity?: fs.BigIntStats;
   private rootIdentity?: fs.BigIntStats;
   private closed = false;
 
-  public constructor(binding: RootBinding, options: PackedCasOpenOptions = {}) {
+  public constructor(binding: HistoricalRootBinding, options: PackedCasOpenOptions = {}) {
     if (isMainThread) throw new Error('Packed CAS SQLite connections belong to worker threads.');
-    if (binding.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) throw corrupt('Packed CAS requires current Runtime reader admission.');
-    this.binding = freezeRootBinding(binding);
+    if (binding.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH
+      && !(binding.runtimeKernelEpoch === 6 && options.readOnly === true)) {
+      throw corrupt('Packed CAS requires current Runtime admission or the exact published epoch-6 read-only admission.');
+    }
+    this.binding = binding;
     this.readOnly = options.readOnly === true;
     this.databasePath = path.join(binding.paths.casRootPath, PACKED_CAS_FILE);
-    this.withBusyRetry(() => this.openExisting());
+    withBusyRetry(() => this.openExisting());
   }
 
   public readBytes(object: CasObjectIdentity): Buffer | undefined {
     const identity = requireCasObjectIdentity(object);
-    return this.withBusyRetry(() => {
+    return withBusyRetry(() => {
       const database = this.openExisting();
       if (!database) return undefined;
       const row = database.prepare(READ_BODY_SQL).get(Buffer.from(identity.sha256, 'hex')) as { body: unknown } | undefined;
@@ -68,7 +72,7 @@ export class PackedCasStore {
   /** Presence/length only, preserving Runtime admission and backup coverage proof strength. */
   public inspectByteLength(object: CasObjectIdentity): bigint | undefined {
     const identity = requireCasObjectIdentity(object);
-    return this.withBusyRetry(() => {
+    return withBusyRetry(() => {
       const database = this.openExisting();
       if (!database) return undefined;
       const row = database.prepare('SELECT typeof(body) AS body_type, length(body) AS byte_length FROM cas_body WHERE digest = ?')
@@ -96,7 +100,7 @@ export class PackedCasStore {
       return { object, bytes, digest: Buffer.from(object.sha256, 'hex') };
     });
     if (!inputs.length) return [];
-    return this.withBusyRetry(() => {
+    return withBusyRetry(() => {
       // Validate a present store even when every requested key is still stored loose.
       let database = this.openExisting();
       const loose = inputs.map(entry => {
@@ -137,7 +141,7 @@ export class PackedCasStore {
 
   /** The caller snapshots Runtime metadata first; later immutable/orphan body rows are harmless. */
   public async snapshot(destination: string): Promise<boolean> {
-    const database = this.withBusyRetry(() => this.openExisting());
+    const database = withBusyRetry(() => this.openExisting());
     if (!database) return false;
     const target = path.resolve(destination);
     if (target === path.resolve(this.databasePath)) throw new Error('Packed CAS snapshot must have an independent destination.');
@@ -292,16 +296,6 @@ export class PackedCasStore {
     return database;
   }
 
-  private withBusyRetry<T>(operation: () => T): T {
-    for (let attempt = 0; ; attempt += 1) {
-      try { return operation(); } catch (error) {
-        const code = (error as { code?: unknown })?.code;
-        if ((code !== 'SQLITE_BUSY' && code !== 'SQLITE_LOCKED') || attempt >= BUSY_DELAYS_MS.length) throw error;
-        Atomics.wait(busyWait, 0, 0, BUSY_DELAYS_MS[attempt]);
-      }
-    }
-  }
-
   private assertWalBudget(database: Database.Database): void {
     const wal = statOrUndefined(`${this.databasePath}-wal`, true);
     if (!wal || wal.size < BigInt(WAL_PUBLICATION_PAUSE_BYTES)) return;
@@ -329,19 +323,134 @@ function configure(database: Database.Database, readOnly: boolean, creating = fa
   }
 }
 
-function assertSchemaAndBinding(database: Database.Database, binding: RootBinding): void {
+function assertSchema(database: Database.Database): void {
   const schema = database.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
     .raw().all() as unknown[][];
   if (JSON.stringify(schema) !== JSON.stringify(EXPECTED_SCHEMA)) throw corrupt('Packed CAS schema does not match its exact physical contract.');
+}
+
+function assertSchemaAndBinding(database: Database.Database, binding: HistoricalRootBinding): void {
+  assertSchema(database);
   assertBinding(database, binding);
 }
 
-function assertBinding(database: Database.Database, binding: RootBinding): void {
+function readBindingIdentity(database: Database.Database): PackedCasIdentity {
   const rows = database.prepare('SELECT singleton, data_set_id, root_instance_id, root_generation FROM cas_metadata LIMIT 2').all() as Array<Record<string, unknown>>;
   const row = rows[0];
-  if (rows.length !== 1 || row.singleton !== 1 || row.data_set_id !== binding.dataSetId
-    || row.root_instance_id !== binding.rootInstanceId || row.root_generation !== binding.rootGeneration) {
+  if (rows.length !== 1 || row.singleton !== 1 || typeof row.data_set_id !== 'string' || !row.data_set_id
+    || typeof row.root_instance_id !== 'string' || !row.root_instance_id
+    || typeof row.root_generation !== 'number' || !Number.isSafeInteger(row.root_generation) || row.root_generation <= 0) {
+    throw corrupt('Packed CAS metadata does not contain one valid root identity.');
+  }
+  return { dataSetId: row.data_set_id, rootInstanceId: row.root_instance_id, rootGeneration: row.root_generation };
+}
+
+function identityMatches(identity: PackedCasIdentity, binding: HistoricalRootBinding): boolean {
+  return identity.dataSetId === binding.dataSetId && identity.rootInstanceId === binding.rootInstanceId
+    && identity.rootGeneration === binding.rootGeneration;
+}
+
+function assertBinding(database: Database.Database, binding: HistoricalRootBinding): void {
+  if (!identityMatches(readBindingIdentity(database), binding)) {
     throw corrupt('Packed CAS identity does not match the authoritative RootBinding.');
+  }
+}
+
+/** Returns only the exact physical store identity; callers retain the authoritative binding check. */
+export function inspectPackedCasIdentity(binding: HistoricalRootBinding): PackedCasIdentity | undefined {
+  return withBusyRetry(() => withMaintenanceDatabase(binding, true, database => readBindingIdentity(database)));
+}
+
+/** The caller owns the offline root and an authenticated epoch-6 to epoch-7 journal. */
+export function migratePackedCasEpochIdentity(previous: HistoricalRootBinding, next: RootBinding, allowPrevious: boolean): void {
+  if (previous.runtimeKernelEpoch !== 6 || next.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH
+    || previous.dataSetId !== next.dataSetId || previous.rootInstanceId !== next.rootInstanceId
+    || next.rootGeneration !== previous.rootGeneration + 1 || next.pointerRevision !== previous.pointerRevision + 1
+    || Object.keys(previous.paths).some(key => previous.paths[key as keyof typeof previous.paths] !== next.paths[key as keyof typeof next.paths])) {
+    throw corrupt('Packed CAS identity migration requires the exact published epoch-6 to epoch-7 binding chain.');
+  }
+  withBusyRetry(() => withMaintenanceDatabase(next, false, database => {
+    const migrate = database.transaction(() => {
+      const identity = readBindingIdentity(database);
+      if (identityMatches(identity, next)) return;
+      if (!allowPrevious || !identityMatches(identity, previous)) {
+        throw corrupt('Packed CAS identity matches neither authorized side of its epoch migration.');
+      }
+      const updated = database.prepare(`UPDATE cas_metadata SET root_generation = ?
+        WHERE singleton = 1 AND data_set_id = ? AND root_instance_id = ? AND root_generation = ?`)
+        .run(next.rootGeneration, previous.dataSetId, previous.rootInstanceId, previous.rootGeneration);
+      if (updated.changes !== 1) throw corrupt('Packed CAS identity migration compare-and-swap failed.');
+      assertBinding(database, next);
+    });
+    migrate.immediate();
+    const checkpoint = database.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number; log: number; checkpointed: number }>;
+    if (checkpoint.length !== 1 || checkpoint[0].busy !== 0 || checkpoint[0].log !== checkpoint[0].checkpointed) {
+      throw new Error('Packed CAS identity migration checkpoint did not finish.');
+    }
+  }, true));
+}
+
+/** Metadata-only maintenance: exact schema and physical root/file fences, without reading cas_body. */
+function withMaintenanceDatabase<T>(binding: HistoricalRootBinding, readOnly: boolean, run: (database: Database.Database) => T, durable = false): T | undefined {
+  if (isMainThread) throw new Error('Packed CAS SQLite connections belong to worker threads.');
+  if (binding.runtimeKernelEpoch !== 6 && binding.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
+    throw corrupt('Packed CAS maintenance requires the published epoch-6 or current epoch admission.');
+  }
+  const file = path.join(binding.paths.casRootPath, PACKED_CAS_FILE);
+  let identity = statOrUndefined(file, true);
+  const assertCompanions = (): void => {
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      const info = statOrUndefined(`${file}${suffix}`, true);
+      if (info && !info.isFile()) throw corrupt('Packed CAS companion must be a regular file.');
+    }
+  };
+  if (!identity) {
+    const companion = ['-wal', '-shm', '-journal'].some(suffix => statOrUndefined(`${file}${suffix}`, true));
+    if (!companion) return undefined;
+    identity = statOrUndefined(file, true);
+    if (!identity) throw corrupt('Packed CAS companion exists without its database.');
+  }
+  if (!identity.isFile()) throw corrupt('Packed CAS database must be a regular file.');
+  assertCompanions();
+  const root = fs.statSync(binding.paths.casRootPath, { bigint: true });
+  if (!root.isDirectory()) throw corrupt('Packed CAS root must be a directory.');
+  const assertFiles = (): void => {
+    const currentRoot = statOrUndefined(binding.paths.casRootPath, false);
+    const current = statOrUndefined(file, true);
+    if (!currentRoot?.isDirectory() || !sameFile(currentRoot, root)
+      || !current?.isFile() || !sameFile(current, identity!)) throw corrupt('Packed CAS root or database changed during maintenance.');
+    assertCompanions();
+  };
+  const database = new Database(toSqliteFilePath(file), { readonly: readOnly, fileMustExist: true, timeout: 50 });
+  let result: T;
+  try {
+    configure(database, readOnly);
+    assertSchema(database);
+    assertFiles();
+    result = run(database);
+    assertFiles();
+  } finally { database.close(); }
+  if (durable) {
+    // The offline owner waits for SQLite close before opening its durability descriptor.
+    assertFiles();
+    const descriptor = fs.openSync(file, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      if (!sameFile(fs.fstatSync(descriptor, { bigint: true }), identity)) throw corrupt('Packed CAS database changed before durable sync.');
+      fs.fsyncSync(descriptor);
+      assertFiles();
+    } finally { fs.closeSync(descriptor); }
+    syncDirectoryDurablySync(binding.paths.casRootPath);
+  }
+  return result;
+}
+
+function withBusyRetry<T>(operation: () => T): T {
+  for (let attempt = 0; ; attempt += 1) {
+    try { return operation(); } catch (error) {
+      const code = (error as { code?: unknown })?.code;
+      if ((code !== 'SQLITE_BUSY' && code !== 'SQLITE_LOCKED') || attempt >= BUSY_DELAYS_MS.length) throw error;
+      Atomics.wait(busyWait, 0, 0, BUSY_DELAYS_MS[attempt]);
+    }
   }
 }
 

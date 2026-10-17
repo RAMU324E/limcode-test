@@ -321,3 +321,13 @@ UI 脚本在基线 HEAD 保持为本报告记录的提交时运行 `node --expos
 六名全新、无上下文的只读 subAgent 分别复审目录、正文状态、转向、阅读锚点、子任务与逻辑正文读取，并独立复现实际调用链。复审发现的旧 proof 目录复制、多跳段归属、加载期间新导航和最终删除竞态均在共同入口修正后回验；最终各组已确认问题全部闭合。目录实测保留基底对象并消除重复全目录 map，滚动后迟到正文的读点偏差为 0.21875px；已取消但等待未收尾时删除整笔回滚，终态结果仍由原 Phase D 按顺序物化。
 
 最终 `git diff --check` 通过。改动保留在当前工作树，沿用原 CAS 身份、引用计数和事务规则；本轮未新增哈希算法、内容指纹或校验账本。
+
+## 12. v0.0.44：修复已发布 epoch 6 的 Packed CAS 升级
+
+v0.0.43 安装后的 SSH 现场出现 `Packed CAS identity does not match the authoritative RootBinding.`：Runtime 已完成 6→7，根代次由 2 推进到 3，Packed CAS 的 `cas_metadata.root_generation` 仍为 2。两边的数据集和根身份相同，原升级的完成 journal、completion 和备份完整；Packed CAS 含 43,330 条正文。原升级夹具全部使用 loose CAS，漏掉了 epoch 6 已发布的 packed-only 正文。
+
+修复在原离线升级内统一推进两份身份：先核验旧 packed schema 和身份，在 Runtime 事务持久化之后，由原 packed worker 单事务更新 metadata 代次，checkpoint、关闭并持久同步后再发布根指针。正文行与 loose 文件保持原字节，普通 reader 继续严格校验完整身份。已完成升级但遗漏 packed 步骤的旧现场，只以确切匹配的原完成 journal、completion、旧绑定、manifest 和备份结构补齐；完成事实写回原记录，后续旧身份倒退明确拒绝。补齐中断后的重入复用同一身份核验，不重新扫描或计算整份备份摘要。已发布 epoch 6 的外来历史通过 recorded 身份只读打开私有副本，来源不原地升级。
+
+新增回归复现原 `packed-cas-corrupt`，并覆盖 packed-only 正文、混合 loose 消息和附件、数据库／packed／指针提交边界中断、旧 completed 补齐及再次中断、未知身份、已完成后倒退和完成凭据冲突。每项直接比较相关行及正文原字节，沿用现有 CAS 与事务合同。
+
+最终 extension 编译及 11 份合同检查通过。升级整文件 **22/22 通过**；CAS、外来历史和目录迁移三份相关测试 **38/38 通过**，共 60 项。独立只读复审确认正常升级、恢复和未知身份拒绝边界闭合；另经真实 epoch 6 外来只读查看读回 packed-only 消息、loose 消息与附件，来源的 epoch、代次和正文保持。未重跑未受影响的完整 UI／核心套件，沿用上一节结果；本次按故障影响范围验证。

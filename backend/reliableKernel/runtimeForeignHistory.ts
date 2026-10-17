@@ -915,7 +915,7 @@ export async function openPackedCasSnapshot(
   let worker: PackedCasWorkerClient | undefined;
   let copy: { databasePath: string; remove(): Promise<void> } | undefined;
   let closed = false;
-  if (binding.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+  if (binding.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH || binding.runtimeKernelEpoch === 6) {
     const file = path.join(binding.paths.casRootPath, PACKED_CAS_FILE);
     await assertNoSymbolicPath(containerRoot, binding.paths.casRootPath);
     if (await lstatIfPresent(file)) {
@@ -924,7 +924,7 @@ export async function openPackedCasSnapshot(
       try {
         worker = await PackedCasWorkerClient.open({ ...binding,
           paths: { ...binding.paths, casRootPath: path.dirname(copy.databasePath) }
-        } as RootBinding, { readOnly: true });
+        }, { readOnly: true });
       } catch (error) {
         await copy.remove();
         throw error;

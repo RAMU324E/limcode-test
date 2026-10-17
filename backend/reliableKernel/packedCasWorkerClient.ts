@@ -2,14 +2,17 @@ import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { registerInProcessSqliteDatabase } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import { requireCasObjectIdentity, type CasObjectIdentity } from './casObjectAccess';
-import { freezeRootBinding, type RootBinding } from './contracts';
+import type { RootBinding } from './contracts';
+import type { HistoricalRootBinding } from './rootAuthority';
 import { ExecutionHandoffError } from './executionLeaseFence';
 import {
   PACKED_CAS_FILE, PACKED_CAS_MAX_BODY_BYTES, PACKED_CAS_MAX_QUEUED_BYTES,
   PACKED_CAS_MAX_QUEUED_REQUESTS, packedCasRequestCharge,
+  type PackedCasIdentity, type PackedCasMaintenanceWorkerData, type PackedCasMaintenanceWorkerResponse,
   type PackedCasOpenOptions, type PackedCasOperation, type PackedCasPlacement,
   type PackedCasWorkerData, type PackedCasWorkerError, type PackedCasWorkerResponse
 } from './packedCasWorkerProtocol';
+export type { PackedCasIdentity } from './packedCasWorkerProtocol';
 
 interface PendingRequest {
   charge: number;
@@ -35,12 +38,12 @@ export class PackedCasWorkerClient {
   private didExit = false;
   private closePromise?: Promise<void>;
 
-  private constructor(binding: RootBinding, options: PackedCasOpenOptions) {
+  private constructor(binding: HistoricalRootBinding, options: PackedCasOpenOptions) {
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
     this.exited = new Promise(resolve => { this.exitResolve = resolve; });
     const release = registerInProcessSqliteDatabase(path.join(binding.paths.casRootPath, PACKED_CAS_FILE));
     try {
-      const data: PackedCasWorkerData = { binding: freezeRootBinding(binding), options: { ...options } };
+      const data: PackedCasWorkerData = { binding: copyBinding(binding), options: { ...options } };
       this.worker = new Worker(path.join(__dirname, 'packedCasWorker.js'), {
         workerData: data, resourceLimits: { maxOldGenerationSizeMb: 64, stackSizeMb: 4 }
       });
@@ -62,7 +65,9 @@ export class PackedCasWorkerClient {
     });
   }
 
-  public static async open(binding: RootBinding, options: PackedCasOpenOptions = {}): Promise<PackedCasWorkerClient> {
+  public static open(binding: RootBinding, options?: PackedCasOpenOptions): Promise<PackedCasWorkerClient>;
+  public static open(binding: HistoricalRootBinding, options: PackedCasOpenOptions & { readOnly: true }): Promise<PackedCasWorkerClient>;
+  public static async open(binding: HistoricalRootBinding, options: PackedCasOpenOptions = {}): Promise<PackedCasWorkerClient> {
     const client = new PackedCasWorkerClient(binding, options);
     try {
       await client.ready;
@@ -218,4 +223,47 @@ function workerError(error: PackedCasWorkerError): Error {
 
 function handoffError(): Error {
   return new ExecutionHandoffError('Packed CAS root is closing or changing ownership.');
+}
+
+/** A metadata-only probe. Ordinary store opens continue to require the whole binding identity. */
+export function inspectPackedCasIdentity(binding: HistoricalRootBinding): Promise<PackedCasIdentity | undefined> {
+  return runPackedCasMaintenance({ kind: 'inspectIdentity', binding: copyBinding(binding) });
+}
+
+/** The caller holds the offline root and has authenticated the exact journal's previous/next chain. */
+export async function migratePackedCasEpochIdentity(previous: HistoricalRootBinding, next: RootBinding, allowPrevious = true): Promise<void> {
+  await runPackedCasMaintenance({ kind: 'migrateEpochIdentity', previous: copyBinding(previous), next: copyBinding(next), allowPrevious });
+}
+
+function copyBinding<T extends HistoricalRootBinding>(binding: T): T {
+  return Object.freeze({ ...binding, paths: Object.freeze({ ...binding.paths }) });
+}
+
+function runPackedCasMaintenance(data: PackedCasMaintenanceWorkerData): Promise<PackedCasIdentity | undefined> {
+  const binding = data.kind === 'inspectIdentity' ? data.binding : data.next;
+  const release = registerInProcessSqliteDatabase(path.join(binding.paths.casRootPath, PACKED_CAS_FILE));
+  return new Promise((resolve, reject) => {
+    let response: PackedCasMaintenanceWorkerResponse | undefined;
+    let workerFailure: Error | undefined;
+    let worker: Worker;
+    try {
+      worker = new Worker(path.join(__dirname, 'packedCasWorker.js'), {
+        workerData: data, resourceLimits: { maxOldGenerationSizeMb: 64, stackSizeMb: 4 }
+      });
+    } catch (error) {
+      release();
+      reject(error);
+      return;
+    }
+    worker.on('message', (message: PackedCasMaintenanceWorkerResponse) => { response = message; });
+    worker.once('error', (error) => { workerFailure = error; });
+    worker.once('exit', code => {
+      release();
+      if (workerFailure) reject(workerFailure);
+      else if (code !== 0) reject(new Error(`Packed CAS maintenance worker exited with code ${code}.`));
+      else if (!response) reject(new Error('Packed CAS maintenance worker exited without its result.'));
+      else if (!response.ok) reject(workerError(response.error));
+      else resolve(response.identity);
+    });
+  });
 }

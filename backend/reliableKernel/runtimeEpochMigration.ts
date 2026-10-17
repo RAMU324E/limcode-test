@@ -42,6 +42,7 @@ import { backfillProvenRuntimeInputTimeline } from './timelineBackfill';
 import { assertRuntimeHostsOffline, withRuntimeMaintenance } from './runtimeHostControl';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import { toSqliteFilePath } from './sqliteFilePath';
+import { inspectPackedCasIdentity, migratePackedCasEpochIdentity, type PackedCasIdentity } from './packedCasWorkerClient';
 import {
   RootAuthority,
   RootAuthorityError,
@@ -131,6 +132,7 @@ export type RuntimeEpochMigrationFaultPoint =
   | 'before-backup'
   | 'after-backup'
   | 'after-database-commit'
+  | 'after-packed-cas-migration'
   | 'after-pointer-publication';
 
 export interface RuntimeEpochMigrationOptions {
@@ -156,6 +158,7 @@ interface HistoricalRuntimeEpochMigrationJournal {
   previousBinding: HistoricalRootBinding;
   nextBinding: HistoricalRootBinding;
   databaseBackupSha256?: string;
+  packedCasIdentityMigrated?: true;
   createdAt: string;
   updatedAt: string;
 }
@@ -175,7 +178,8 @@ export async function previousRuntimeEpochMigrationRequired(authority: RootAutho
   if (await readJournal(controlRoot) || await readMigrationJournal(controlRoot, 5)
     || await readMigrationJournal(controlRoot, 6)) return true;
   const initialPointer = await authority.readHistoricalPointerForCutover();
-  return isSupportedPreviousEpoch(initialPointer?.runtimeKernelEpoch);
+  return isSupportedPreviousEpoch(initialPointer?.runtimeKernelEpoch)
+    || await completedPackedCasRecoveryRequired(initialPointer);
 }
 
 /**
@@ -203,6 +207,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
     && !publishedEpoch5Journal
     && !publishedEpoch6Journal
     && !isSupportedPreviousEpoch(initialPointer?.runtimeKernelEpoch)
+    && !await completedPackedCasRecoveryRequired(initialPointer)
   ) {
     return undefined;
   }
@@ -226,6 +231,13 @@ export async function migratePreviousRuntimeEpochIfRequired(
     const previous = await authority.readHistoricalPointerForCutover();
     if (previous?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
       const binding = await authority.current();
+      assertMigratedDatabaseDurable(binding);
+      let recoveredCompletion = false;
+      if (!journal && await completedPackedCasRecoveryRequired(binding)) {
+        journal = await recoverCompletedPackedCasJournal(controlRoot, binding);
+        recoveredCompletion = true;
+        await writeJournal(controlRoot, journal);
+      }
       if (journal) {
         if (!sameBindingIdentity(binding, journal.nextBinding)) {
           throw new RootAuthorityError(
@@ -233,8 +245,9 @@ export async function migratePreviousRuntimeEpochIfRequired(
             'Completed pointer does not match the epoch migration journal.'
           );
         }
-        await verifyExistingBackup(controlRoot, journal);
-        assertMigratedDatabaseDurable(binding);
+        if (!recoveredCompletion) await verifyExistingBackup(controlRoot, journal,
+          journal.fromEpoch === 6 && journal.state === 'completed');
+        await migrateJournalPackedCas(controlRoot, journal, options);
         journal.state = 'completed';
         journal.updatedAt = new Date().toISOString();
         await writeJournal(controlRoot, journal);
@@ -258,6 +271,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
     }
 
     const validatedPredecessor = !journal ? await assertPreviousEpochRoot(previous) : undefined;
+    if (!journal && previous.runtimeKernelEpoch === 6) await assertPreviousPackedCasIdentity(previous);
     const next = await authority.stageInPlaceEpochMigration(previous);
     await fault(options, 'after-writer-fence');
 
@@ -282,6 +296,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
 
     const databaseState = inspectDatabaseBindingState(previous.paths.databasePath, previous, next);
     if (databaseState === 'previous') {
+      if (!validatedPredecessor && previous.runtimeKernelEpoch === 6) await assertPreviousPackedCasIdentity(previous);
       const predecessorSchemas = validatedPredecessor ?? await assertPreviousEpochRoot(previous);
       if (journal.state === 'fenced') {
         await fault(options, 'before-backup');
@@ -313,6 +328,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
     journal.updatedAt = new Date().toISOString();
     await writeJournal(controlRoot, journal);
     await fault(options, 'after-database-commit');
+    await migrateJournalPackedCas(controlRoot, journal, options);
 
     const binding = await authority.commitInPlaceEpochMigration(previous, next);
     await fault(options, 'after-pointer-publication');
@@ -332,6 +348,94 @@ export async function migratePreviousRuntimeEpochIfRequired(
 
 function isSupportedPreviousEpoch(epoch: number | undefined): epoch is 3 | 4 | 5 | 6 {
   return epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6;
+}
+
+function packedIdentityMatches(identity: PackedCasIdentity, binding: HistoricalRootBinding): boolean {
+  return identity.dataSetId === binding.dataSetId && identity.rootInstanceId === binding.rootInstanceId
+    && identity.rootGeneration === binding.rootGeneration;
+}
+
+function packedIdentityError(): Error {
+  return Object.assign(new Error('Packed CAS identity does not match the authoritative RootBinding.'), { code: 'packed-cas-corrupt' });
+}
+
+async function assertPreviousPackedCasIdentity(binding: HistoricalRootBinding): Promise<void> {
+  const identity = await inspectPackedCasIdentity(binding);
+  if (identity && !packedIdentityMatches(identity, binding)) throw packedIdentityError();
+}
+
+/** A prior generation requests maintenance; the completed journal still has to authorize it. */
+async function completedPackedCasRecoveryRequired(binding: HistoricalRootBinding | undefined): Promise<boolean> {
+  if (binding?.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) return false;
+  const identity = await inspectPackedCasIdentity(binding);
+  if (!identity || packedIdentityMatches(identity, binding)) return false;
+  if (identity.dataSetId !== binding.dataSetId || identity.rootInstanceId !== binding.rootInstanceId
+    || identity.rootGeneration !== binding.rootGeneration - 1) throw packedIdentityError();
+  return true;
+}
+
+async function migrateJournalPackedCas(controlRoot: string, journal: RuntimeEpochMigrationJournal,
+  options: RuntimeEpochMigrationOptions): Promise<void> {
+  if (journal.fromEpoch !== 6) return;
+  await migratePackedCasEpochIdentity(journal.previousBinding, journal.nextBinding, !journal.packedCasIdentityMigrated);
+  journal.packedCasIdentityMigrated = true;
+  journal.updatedAt = new Date().toISOString();
+  await writeJournal(controlRoot, journal);
+  await fault(options, 'after-packed-cas-migration');
+}
+
+/** Recover only the exact completed 6→7 transition emitted before its packed step existed. */
+async function recoverCompletedPackedCasJournal(controlRoot: string, binding: RootBinding): Promise<RuntimeEpochMigrationJournal> {
+  const backups = path.join(controlRoot, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY);
+  const directory = await fs.lstat(backups).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!directory?.isDirectory() || directory.isSymbolicLink()) throw packedIdentityError();
+  let matched: RuntimeEpochMigrationJournal | undefined;
+  for (const entry of await fs.readdir(backups, { withFileTypes: true })) {
+    if (!/^[0-9TZ-]+-[a-f0-9]{8}$/.test(entry.name)) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink()) throw invalidCompletedPackedJournal();
+    const backup = path.join(backups, entry.name);
+    const value = await readRegularMigrationJson(path.join(backup, 'epoch-migration-journal.completed.json'));
+    if (value === undefined) continue;
+    const record = requireRecord(value, 'CompletedRuntimeEpochMigrationJournal');
+    if (record.fromEpoch !== 6 || record.toEpoch !== RUNTIME_KERNEL_EPOCH) continue;
+    const parsed = parseMigrationJournal(value, RUNTIME_KERNEL_EPOCH);
+    if (!historicalBindingsEqual(parsed.nextBinding, binding)) continue;
+    if (parsed.state !== 'completed' || parsed.backupDirectoryName !== entry.name || matched) throw invalidCompletedPackedJournal();
+    const journal: RuntimeEpochMigrationJournal = { ...parsed, toEpoch: RUNTIME_KERNEL_EPOCH,
+      nextBinding: parseRootBinding(parsed.nextBinding) };
+    const receipt = requireRecord(await readRegularMigrationJson(path.join(backup, RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE)),
+      'RuntimeEpochMigrationCompletion');
+    if (receipt.kind !== MIGRATION_COMPLETION_KIND || receipt.attemptId !== journal.attemptId
+      || receipt.fromEpoch !== 6 || receipt.toEpoch !== RUNTIME_KERNEL_EPOCH
+      || typeof receipt.completedAt !== 'string' || !receipt.completedAt
+      || receipt.databaseBackupSha256 !== journal.databaseBackupSha256
+      || receipt.packedCasIdentityMigrated !== journal.packedCasIdentityMigrated
+      || !historicalBindingsEqual(parseHistoricalRootBinding(receipt.previousBinding), journal.previousBinding)
+      || !historicalBindingsEqual(parseHistoricalRootBinding(receipt.nextBinding), binding)) throw invalidCompletedPackedJournal();
+    if (journal.packedCasIdentityMigrated) throw packedIdentityError();
+    await verifyExistingBackup(controlRoot, journal, true);
+    matched = journal;
+  }
+  if (!matched) throw packedIdentityError();
+  return matched;
+}
+
+function invalidCompletedPackedJournal(): RootAuthorityError {
+  return new RootAuthorityError('runtime-epoch-migration-journal-invalid',
+    'Completed epoch-6 to epoch-7 migration records do not match.');
+}
+
+async function readRegularMigrationJson(file: string): Promise<unknown | undefined> {
+  const info = await fs.lstat(file).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!info) return undefined;
+  if (!info.isFile() || info.isSymbolicLink()) throw invalidCompletedPackedJournal();
+  return readJsonIfExists(file);
 }
 
 /**
@@ -1074,7 +1178,8 @@ async function ensureDatabaseBackup(
 
 async function verifyExistingBackup(
   controlRoot: string,
-  journal: HistoricalRuntimeEpochMigrationJournal
+  journal: HistoricalRuntimeEpochMigrationJournal,
+  identityOnly = false
 ): Promise<void> {
   const destination = path.join(
     backupRootPath(controlRoot, journal),
@@ -1086,13 +1191,26 @@ async function verifyExistingBackup(
       'Epoch migration backup is missing.'
     );
   }
-  const savedBinding = parseHistoricalRootBinding(await readJsonIfExists(
+  const readMetadata = identityOnly ? readRegularMigrationJson : readJsonIfExists;
+  const savedBinding = parseHistoricalRootBinding(await readMetadata(
     path.join(backupRootPath(controlRoot, journal), `root-binding.epoch-${journal.fromEpoch}.json`)));
   if (!historicalBindingsEqual(savedBinding, journal.previousBinding)) {
     throw new RootAuthorityError('runtime-epoch-migration-backup-invalid', 'Epoch migration backup binding changed.');
   }
-  assertPreviousEpochManifestValue(await readJsonIfExists(path.join(backupRootPath(controlRoot, journal),
+  assertPreviousEpochManifestValue(await readMetadata(path.join(backupRootPath(controlRoot, journal),
     `runtime-kernel-epoch.epoch-${journal.fromEpoch}.json`)), journal.previousBinding);
+  if (identityOnly) {
+    const info = await fs.lstat(destination);
+    if (!info.isFile() || info.isSymbolicLink()) throw invalidCompletedPackedJournal();
+    const database = new Database(toSqliteFilePath(destination), { readonly: true, fileMustExist: true });
+    try {
+      database.defaultSafeIntegers(true);
+      // A completed Runtime transition restores no body rows. Only its recorded identity,
+      // physical schema and manifest authorize the remaining packed metadata step.
+      assertPreviousEpochDatabaseSchema(database, journal.previousBinding);
+    } finally { database.close(); }
+    return;
+  }
   try {
     verifyBackupDatabase(destination, journal.previousBinding);
     if (await sha256File(destination) !== journal.databaseBackupSha256) {
@@ -1152,6 +1270,7 @@ async function finalizeJournal(
     previousBinding: journal.previousBinding,
     nextBinding: journal.nextBinding,
     databaseBackupSha256: journal.databaseBackupSha256,
+    ...(journal.packedCasIdentityMigrated ? { packedCasIdentityMigrated: true } : {}),
     completedAt: new Date().toISOString()
   });
   await fs.rm(journalPath(controlRoot, journal.toEpoch), { force: true });
@@ -1169,6 +1288,10 @@ async function readMigrationJournal(
 ): Promise<HistoricalRuntimeEpochMigrationJournal | undefined> {
   const value = await readJsonIfExists(journalPath(controlRoot, targetEpoch));
   if (value === undefined) return undefined;
+  return parseMigrationJournal(value, targetEpoch);
+}
+
+function parseMigrationJournal(value: unknown, targetEpoch: 5 | 6 | typeof RUNTIME_KERNEL_EPOCH): HistoricalRuntimeEpochMigrationJournal {
   const record = requireRecord(value, 'RuntimeEpochMigrationJournal');
   const states = new Set(['fenced', 'backed_up', 'database_committed', 'completed']);
   if (
@@ -1185,6 +1308,8 @@ async function readMigrationJournal(
     || typeof record.updatedAt !== 'string'
     || (record.databaseBackupSha256 !== undefined
       && (typeof record.databaseBackupSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.databaseBackupSha256)))
+    || (record.packedCasIdentityMigrated !== undefined && record.packedCasIdentityMigrated !== true)
+    || (record.packedCasIdentityMigrated === true && (record.fromEpoch !== 6 || record.toEpoch !== RUNTIME_KERNEL_EPOCH))
     || (record.state !== 'fenced' && typeof record.databaseBackupSha256 !== 'string')
   ) {
     throw new RootAuthorityError('runtime-epoch-migration-journal-invalid', 'Runtime epoch migration journal is invalid.');
@@ -1212,6 +1337,7 @@ async function readMigrationJournal(
     backupDirectoryName: record.backupDirectoryName,
     previousBinding, nextBinding,
     ...(typeof record.databaseBackupSha256 === 'string' ? { databaseBackupSha256: record.databaseBackupSha256 } : {}),
+    ...(record.packedCasIdentityMigrated === true ? { packedCasIdentityMigrated: true } : {}),
     createdAt: record.createdAt, updatedAt: record.updatedAt
   };
 }
