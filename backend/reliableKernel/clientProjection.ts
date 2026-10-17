@@ -1,7 +1,7 @@
 import { singleResponseMeasurementReader } from './singleResponseMeasurement';
 import { canonicalAnswerPresentations } from './answerPresentation';
 import { readTimelineWindow, canonicalDeliveryTimelineLinks, type TimelineWindow } from './clientTimelineHistory';
-import { normalizeCollaborationHistoryCursor } from './collaborationHistoryCursor';
+import { normalizeCollaborationHistoryCursor, normalizeCollaborationHistoryDirection } from './collaborationHistoryCursor';
 /**
  * Bounded client-facing projection over the runtime database: single-record client summaries used
  * by commit change capture, the atomic active-Conversation snapshot, keyset pages, visible Message
@@ -15,7 +15,8 @@ import type Database from 'better-sqlite3';
 import {
   RELIABLE_KERNEL_COLLABORATION_TEXT_PREVIEW_MAX_CHARACTERS,
   type ActiveTurnWorkEnvironmentProjection,
-  type ChildConversationBoundaryProjection
+  type ChildConversationBoundaryProjection,
+  type ReliableKernelCollaborationHistoryCursor
 } from '../../shared/reliableKernelClientFeed';
 import {
   DEFAULT_CONVERSATION_TITLE,
@@ -60,6 +61,7 @@ import { answerSubmissionClientOutcome } from './answerSubmissionOutcome';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryMutation } from './repositories';
 import { quote, requireNonNegativeIntegerString, requireRuntimeId } from './runtimeSqlRows';
 import { prepareCached, prepareUncached } from './runtimeStatementCache';
+import { NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE, parseNativeMessageComposition } from './logicalMessageContent';
 
 /**
  * Verified CAS content reading owned by the database worker. Client projection receives only this
@@ -177,7 +179,32 @@ export function projectCompressionBlockRecord(database: Database.Database, block
   return record;
 }
 
-export function projectMessageWindowRecord(database: Database.Database, messageId: string): DomainRow | null {
+/** The immutable item index remains available after the current revision becomes the final aggregate. */
+function messageItemIndexRevisionSql(): string {
+  return `(CASE WHEN content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}' OR NOT EXISTS (
+    SELECT 1 FROM model_request_message_link AS output
+      JOIN model_request AS request ON request.id = output.model_request_id
+     WHERE output.message_id = revision.message_id
+       AND request.status = 'terminal'
+       AND request.terminal_state NOT IN ('completed', 'native_chain_rebased')
+  ) THEN (SELECT item.id FROM message_revision AS item
+    JOIN content_object AS item_content ON item_content.id = item.content_object_id
+    WHERE item.message_id = revision.message_id
+      AND item_content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}'
+    ORDER BY item.revision_seq DESC LIMIT 1) ELSE NULL END)`;
+}
+
+function projectLogicalMessageMetadata(database: Database.Database, row: DomainRow,
+  content?: ClientProjectionContentAccess): DomainRow {
+  if (row.content_type !== NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE) return row;
+  if (!content) throw new Error('Native Message projection requires its bounded composition reader.');
+  const metadata = prepareCached(database, 'SELECT * FROM content_object WHERE id = ?').get(row.content_object_id) as DomainRow;
+  const root = parseNativeMessageComposition(JSON.parse(content.readVerifiedBytes(metadata).toString('utf8')));
+  return { ...row, stored_byte_length: row.byte_length, byte_length: BigInt(root.logicalByteLength), native_item_count: root.itemCount };
+}
+
+export function projectMessageWindowRecord(database: Database.Database, messageId: string,
+  content?: ClientProjectionContentAccess): DomainRow | null {
   const rows = queryPlainRows(database, `
     SELECT message.id,
            membership.conversation_id,
@@ -190,17 +217,18 @@ export function projectMessageWindowRecord(database: Database.Database, messageI
            revision.role,
            revision.content_object_id,
            content.content_type,
-           content.byte_length
+           content.byte_length,
+           ${messageItemIndexRevisionSql()} AS item_index_revision_id
       FROM message
       JOIN message_part_of_conversation AS membership ON membership.message_id = message.id
       JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
       JOIN message_revision AS revision ON revision.id = current_revision.revision_id
       JOIN content_object AS content ON content.id = revision.content_object_id
-     WHERE message.id = @messageId
+     WHERE message.id = @messageId AND message.deleted_at IS NULL
      LIMIT 1
   `, { messageId });
   if (rows.length > 1) throw new Error(`Message ${messageId} has multiple client window projections.`);
-  return rows[0] ?? null;
+  return rows[0] ? projectLogicalMessageMetadata(database, rows[0], content) : null;
 }
 
 /**
@@ -816,7 +844,8 @@ export function executeClientProjectionSnapshot(
              revision.role,
              revision.content_object_id,
              content.content_type,
-             content.byte_length
+             content.byte_length,
+           ${messageItemIndexRevisionSql()} AS item_index_revision_id
         FROM message_part_of_conversation AS membership
         JOIN message AS m ON m.id = membership.message_id
         JOIN message_current_revision_link AS current_revision ON current_revision.message_id = m.id
@@ -1206,7 +1235,7 @@ export function executeClientProjectionSnapshot(
       navigationSummary: { conversations },
       activeConversationWindow: {
         conversationId,
-        messages: messageRows,
+        messages: messageRows.map(row => projectLogicalMessageMetadata(database, row, content)),
         visibleMessageCount,
         lastMessageSeq: messageSummary.last_message_seq,
         projectContexts,
@@ -2010,7 +2039,8 @@ export function conversationHistoryTotalQuery(
 
 export function executeClientKeysetPage(
   database: Database.Database,
-  input: ClientKeysetPageInput
+  input: ClientKeysetPageInput,
+  content?: ClientProjectionContentAccess
 ): ClientKeysetPageResult {
   if (!Number.isSafeInteger(input.limit) || input.limit <= 0 || input.limit > CLIENT_PAGE_MAX_ROWS) {
     throw new RangeError(`Client keyset page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
@@ -2055,7 +2085,8 @@ export function executeClientKeysetPage(
                revision.role,
                revision.content_object_id,
                content.content_type,
-               content.byte_length
+               content.byte_length,
+           ${messageItemIndexRevisionSql()} AS item_index_revision_id
           FROM message_part_of_conversation AS membership
           JOIN message ON message.id = membership.message_id
           JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
@@ -2078,7 +2109,8 @@ export function executeClientKeysetPage(
     let hasMore = candidates.length > input.limit;
     const boundedCandidates = candidates.slice(0, input.limit);
     const rows: Array<Record<string, unknown>> = [];
-    for (const candidate of boundedCandidates) {
+    for (const rawCandidate of boundedCandidates) {
+      const candidate = input.query === 'message' ? projectLogicalMessageMetadata(database, rawCandidate, content) : rawCandidate;
       const tentative = [...rows, candidate];
       const last = tentative[tentative.length - 1];
       const responseProbe = {
@@ -2128,119 +2160,114 @@ export function executeClientVisibleMessageHistoryPage(
     throw new RangeError(`Visible Message history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
   }
   const conversationId = requireRuntimeId(input.conversationId);
-  const beforeMessageSeq = requireNonNegativeIntegerString(input.beforeMessageSeq, 'beforeMessageSeq');
-  if (beforeMessageSeq === '0') throw new RangeError('beforeMessageSeq must be positive.');
-  const beforeId = requireRuntimeId(input.beforeId);
-
+  const backwards = input.beforeMessageSeq !== undefined;
+  if (backwards === (input.afterMessageSeq !== undefined)
+    || (backwards ? input.afterId !== undefined : input.beforeId !== undefined)) {
+    throw new TypeError('Message history requires exactly one before or after keyset cursor.');
+  }
+  const cursorSeq = requireNonNegativeIntegerString(backwards ? input.beforeMessageSeq : input.afterMessageSeq, 'messageSeq');
+  const cursorId = requireRuntimeId(backwards ? input.beforeId : input.afterId);
+  const operator = backwards ? '<' : '>';
+  const order = backwards ? 'DESC' : 'ASC';
   database.exec('BEGIN');
   try {
-    // Seek the bounded page before computing ordinals. Absolute visible ranks still require a
-    // count of the older visible prefix, but only these candidates carry content and window rows.
+    // Select the bounded candidate range first. Visible floors are counted in this same snapshot.
     const candidates = queryPlainRows(database, `
       WITH page AS MATERIALIZED (
-        SELECT message.id,
-               membership.conversation_id,
-               membership.message_seq,
-               message.created_at,
-               message.updated_at,
-               message.deleted_at,
-               revision.id AS revision_id,
-               revision.revision_seq,
-               revision.role,
-               revision.content_object_id,
-               content.content_type,
-               content.byte_length
+        SELECT message.id, membership.conversation_id, membership.message_seq,
+               message.created_at, message.updated_at, message.deleted_at,
+               revision.id AS revision_id, revision.revision_seq, revision.role,
+               revision.content_object_id, content.content_type, content.byte_length,
+           ${messageItemIndexRevisionSql()} AS item_index_revision_id
           FROM message_part_of_conversation AS membership
           JOIN message ON message.id = membership.message_id
-          JOIN message_current_revision_link AS current_revision
-            ON current_revision.message_id = message.id
+          JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
           JOIN message_revision AS revision ON revision.id = current_revision.revision_id
           JOIN content_object AS content ON content.id = revision.content_object_id
          WHERE membership.conversation_id = @conversationId
-           AND membership.message_seq <= @beforeMessageSeq
-           AND (membership.message_seq < @beforeMessageSeq OR message.id < @beforeId)
-           AND message.deleted_at IS NULL
-           AND revision.role IN ('user', 'model')
-         ORDER BY membership.message_seq DESC, membership.message_id DESC
+           AND membership.message_seq ${operator}= @cursorSeq
+           AND (membership.message_seq ${operator} @cursorSeq OR message.id ${operator} @cursorId)
+           AND message.deleted_at IS NULL AND revision.role IN ('user', 'model')
+         ORDER BY membership.message_seq ${order}, membership.message_id ${order}
          LIMIT @limit
       )
       SELECT page.*,
-             (SELECT COUNT(*)
-                FROM message_part_of_conversation AS older
+             (SELECT COUNT(*) FROM message_part_of_conversation AS older
                 JOIN message ON message.id = older.message_id
-                JOIN message_current_revision_link AS current_revision
-                  ON current_revision.message_id = message.id
+                JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
                 JOIN message_revision AS revision ON revision.id = current_revision.revision_id
                WHERE older.conversation_id = @conversationId
-                 AND older.message_seq < (SELECT MIN(message_seq) FROM page)
-                 AND message.deleted_at IS NULL
-                 AND revision.role IN ('user', 'model'))
-             + ROW_NUMBER() OVER (ORDER BY page.message_seq ASC, page.id ASC) AS display_seq
-        FROM page
-       ORDER BY page.message_seq DESC, page.id DESC
-    `, {
-      conversationId,
-      beforeMessageSeq: BigInt(beforeMessageSeq),
-      beforeId,
-      limit: BigInt(input.limit + 1)
-    });
+                 AND (older.message_seq, older.message_id) <
+                     (SELECT message_seq, id FROM page ORDER BY message_seq, id LIMIT 1)
+                 AND message.deleted_at IS NULL AND revision.role IN ('user', 'model'))
+             + ROW_NUMBER() OVER (ORDER BY page.message_seq, page.id) AS display_seq
+        FROM page ORDER BY page.message_seq ${order}, page.id ${order}
+    `, { conversationId, cursorSeq: BigInt(cursorSeq), cursorId, limit: BigInt(input.limit + 1) });
 
     if (candidates.length === 0) {
       const empty: ClientVisibleMessageHistoryPageResult = {
-        records: {},
-        hasMore: false,
-        responseBytes: 0
+        records: {}, hasMoreBefore: false, hasMoreAfter: false, responseBytes: 0
       };
       settleClientWireResponseBytes(empty);
       database.exec('COMMIT');
       return empty;
     }
-
+    const laterThanBackwardPage = backwards && Boolean(prepareCached(database, `
+      SELECT 1 FROM message_part_of_conversation AS membership
+        JOIN message ON message.id = membership.message_id
+        JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
+        JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+       WHERE membership.conversation_id = @conversationId
+         AND (membership.message_seq, membership.message_id) > (@messageSeq, @messageId)
+         AND message.deleted_at IS NULL AND revision.role IN ('user', 'model') LIMIT 1
+    `).get({ conversationId, messageSeq: candidates[0].message_seq, messageId: candidates[0].id }));
     const maximumCount = Math.min(input.limit, candidates.length);
+    const facts = new Map<string, DomainRow[]>();
+    const wireRows = new Map<string, Map<string, DomainRow>>();
     const materialize = (count: number): ClientVisibleMessageHistoryPageResult => {
-      const messages = candidates.slice(0, count).reverse();
-      const oldest = messages[0];
-      const rawRecords = buildClientVisibleMessageHistoryRecords(database, messages, content);
+      const messages = candidates.slice(0, count);
+      if (backwards) messages.reverse();
+      const oldest = messages[0], newest = messages[messages.length - 1];
+      const rawRecords = buildClientVisibleMessageHistoryRecords(database, messages, content, facts);
+      const records: Record<string, DomainRow[]> = {};
+      for (const [domain, rows] of Object.entries(rawRecords)) {
+        let cached = wireRows.get(domain);
+        if (!cached) wireRows.set(domain, cached = new Map());
+        records[domain] = rows.map(row => {
+          const id = String(row.id);
+          let bounded = cached!.get(id);
+          if (!bounded) cached!.set(id, bounded = boundClientRecordSummary(row, domain));
+          return bounded;
+        });
+      }
       const result: ClientVisibleMessageHistoryPageResult = {
-        records: Object.fromEntries(Object.entries(rawRecords).map(([domain, rows]) => [
-          domain,
-          rows.map((row) => boundClientRecordSummary(row, domain))
-        ])),
-        nextBeforeMessageSeq: String(oldest.message_seq),
-        nextBeforeId: String(oldest.id),
-        hasMore: candidates.length > count,
+        records,
+        nextBeforeMessageSeq: String(oldest.message_seq), nextBeforeId: String(oldest.id),
+        nextAfterMessageSeq: String(newest.message_seq), nextAfterId: String(newest.id),
+        hasMoreBefore: BigInt(String(oldest.display_seq)) > 1n,
+        hasMoreAfter: backwards ? laterThanBackwardPage : candidates.length > count,
         responseBytes: 0
       };
       settleClientWireResponseBytes(result);
       return result;
     };
-
-    // Causal closure size varies by Message, so choose the largest anchor prefix that still fits
-    // one bounded response. Reducing count drops the oldest/farthest anchors, preserving keyset
-    // continuity from the caller's cursor.
-    let lower = 1;
-    let upper = maximumCount;
-    let selected: ClientVisibleMessageHistoryPageResult | undefined;
-    while (lower <= upper) {
-      const count = Math.floor((lower + upper) / 2);
-      const candidate = materialize(count);
-      if (candidate.responseBytes <= CLIENT_PAGE_MAX_BYTES) {
-        selected = candidate;
-        lower = count + 1;
-      } else {
-        upper = count - 1;
+    // The common case materializes exactly once. Oversized pages select a smaller closure from
+    // those same facts and already-bounded wire rows; no repeated SQL or body projection.
+    const full = materialize(maximumCount);
+    let selected = full.responseBytes <= CLIENT_PAGE_MAX_BYTES ? full : undefined;
+    if (!selected) {
+      let lower = 1, upper = maximumCount - 1;
+      while (lower <= upper) {
+        const count = Math.floor((lower + upper) / 2);
+        const candidate = materialize(count);
+        if (candidate.responseBytes <= CLIENT_PAGE_MAX_BYTES) { selected = candidate; lower = count + 1; }
+        else upper = count - 1;
       }
     }
     if (!selected) throw new Error('A single visible Message history summary exceeds maxPageBytes.');
-    if (selected.responseBytes > CLIENT_PAGE_MAX_BYTES) {
-      throw new Error('Visible Message history response exceeds maxPageBytes.');
-    }
     database.exec('COMMIT');
     return selected;
-  } catch (error) {
-    database.exec('ROLLBACK');
-    throw error;
-  }
+  } catch (error) { database.exec('ROLLBACK'); throw error; }
 }
 
 /** Materialize every dependency for a bounded, independently keyed set of accepted exchanges. */
@@ -2322,42 +2349,44 @@ export function executeClientCollaborationHistoryPage(
 ): ClientCollaborationHistoryPageResult {
   if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) throw new RangeError('Invalid exchange history limit.');
   const conversationId = requireRuntimeId(input.conversationId);
-  const cursor = normalizeCollaborationHistoryCursor(input.cursor) ?? { kind: 'exchange' as const };
+  const normalizedCursor = normalizeCollaborationHistoryCursor(input.cursor);
+  const direction = normalizeCollaborationHistoryDirection(input.direction, normalizedCursor);
+  const before = direction === 'before';
+  const cursor: ReliableKernelCollaborationHistoryCursor = normalizedCursor ?? (before ? { kind: 'exchange' } : { kind: 'answer' });
   if (cursor.kind === 'message') {
-    const legacy = executeCollaborationMessageInventoryPage(database, { conversationId, limit: input.limit,
-      ...(cursor.beforeMessageSeq === undefined ? {} : { beforeMessageSeq: cursor.beforeMessageSeq, beforeId: cursor.beforeId }) }, content);
-    const page: ClientCollaborationHistoryPageResult = {
-      records: legacy.records, hasMore: true, scannedRows: legacy.scannedRows, responseBytes: 0,
-      scanProgress: legacy.scanProgress || !legacy.hasMore,
-      nextCursor: legacy.hasMore ? { kind: 'message', beforeMessageSeq: legacy.nextBeforeMessageSeq!, beforeId: legacy.nextBeforeId! } : { kind: 'answer' }
-    };
-    settleClientWireResponseBytes(page);
-    if (page.responseBytes > CLIENT_PAGE_MAX_BYTES) {
-      if (input.limit <= 1) throw new Error('A single collaboration inventory item exceeds the final wire bound.');
-      return executeClientCollaborationHistoryPage(database, { ...input, limit: Math.max(1, Math.floor(input.limit / 2)) }, content);
-    }
-    return page;
+    return executeCollaborationMessageInventoryPage(database, { conversationId, limit: input.limit, direction, cursor }, content);
   }
   database.exec('BEGIN');
   try {
     let page: ClientCollaborationHistoryPageResult;
     if (cursor.kind === 'exchange') {
-      const before = cursor.beforeExchangeSeq === undefined ? undefined : BigInt(cursor.beforeExchangeSeq);
-      const window = readTimelineWindow(database, conversationId, input.limit, before);
+      const sequence = before ? cursor.beforeExchangeSeq : cursor.afterExchangeSeq;
+      const window = readTimelineWindow(database, conversationId, input.limit, sequence === undefined ? undefined : BigInt(sequence), direction);
       const ordered = [...window.receives.map(row => ({ kind: 'receive', row })), ...window.sends.map(row => ({ kind: 'send', row }))]
-        .sort((a, b) => compareRuntimeRowInteger(b.row.exchange_seq, a.row.exchange_seq));
+        .sort((a, b) => compareRuntimeRowInteger(b.row.exchange_seq, a.row.exchange_seq) * (before ? 1 : -1));
+      const oppositeEdge = ordered[0]?.row;
+      const oppositeExists = (oppositeEdge !== undefined || sequence !== undefined)
+        && ['runtime_delivery_timeline_link', 'collaboration_send_timeline_link'].some(table => queryPlainRows(database, `
+          SELECT id FROM ${table} WHERE conversation_id = @conversationId
+            ${oppositeEdge ? `AND exchange_seq ${before ? '>' : '<'} @sequence` : ''} LIMIT 1
+        `, { conversationId, ...(oppositeEdge ? { sequence: BigInt(String(oppositeEdge.exchange_seq)) } : {}) }).length > 0);
       let count = ordered.length;
       for (;;) {
         const selected = ordered.slice(0, count);
         const hasMore = window.hasMore || count < ordered.length;
-        page = {
+        const oldest = selected[before ? selected.length - 1 : 0]?.row;
+        const newest = selected[before ? 0 : selected.length - 1]?.row;
+        page = collaborationHistoryPage(cursor.kind, direction, {
           records: buildTimelineExchangeRecords(database, conversationId, {
             receives: selected.filter(item => item.kind === 'receive').map(item => item.row),
             sends: selected.filter(item => item.kind === 'send').map(item => item.row)
           }, content),
-          nextCursor: hasMore ? { kind: 'exchange', beforeExchangeSeq: String(selected[selected.length - 1].row.exchange_seq) } : { kind: 'message' },
-          hasMore: true, scanProgress: !hasMore, scannedRows: ordered.length, responseBytes: 0
-        };
+          nextBeforeCursor: { kind: 'exchange', ...(oldest ? { beforeExchangeSeq: String(oldest.exchange_seq) } : {}) },
+          nextAfterCursor: { kind: 'exchange', ...(newest ? { afterExchangeSeq: String(newest.exchange_seq) } : {}) },
+          hasMoreBefore: before ? hasMore : oppositeExists,
+          hasMoreAfter: before ? oppositeExists : hasMore,
+          scanProgress: false, scannedRows: ordered.length
+        });
         settleClientWireResponseBytes(page);
         if (page.responseBytes <= CLIENT_PAGE_MAX_BYTES) break;
         if (count <= 1) throw new Error('A single exchange history item exceeds the wire bound.');
@@ -2366,25 +2395,42 @@ export function executeClientCollaborationHistoryPage(
     } else {
       // One exact indexed suffix is materialized before the Inbox join. Empty non-answer
       // windows advance their last inspected delivery key without scanning other Conversations.
+      const boundaryCreatedAt = before ? cursor.beforeCreatedAt : cursor.afterCreatedAt;
+      const boundaryId = before ? cursor.beforeId : cursor.afterId;
       const candidates = queryPlainRows(database, `
         SELECT * FROM runtime_delivery WHERE target_conversation_id = @conversationId
-          ${cursor.beforeCreatedAt === undefined ? '' : 'AND (created_at, id) < (@beforeCreatedAt, @beforeId)'}
-         ORDER BY created_at DESC, id DESC LIMIT @limit
+          ${boundaryCreatedAt === undefined ? '' : `AND (created_at, id) ${before ? '<' : '>'} (@boundaryCreatedAt, @boundaryId)`}
+         ORDER BY created_at ${before ? 'DESC' : 'ASC'}, id ${before ? 'DESC' : 'ASC'} LIMIT @limit
       `, { conversationId, limit: BigInt(CLIENT_COLLABORATION_SCAN_MAX_ROWS),
-        ...(cursor.beforeCreatedAt === undefined ? {} : { beforeCreatedAt: cursor.beforeCreatedAt, beforeId: cursor.beforeId! }) });
+        ...(boundaryCreatedAt === undefined ? {} : { boundaryCreatedAt, boundaryId: boundaryId! }) });
       const inboxes = new Map(queryAllByIds(database, 'runtime_inbox_item', 'id', candidates.map(row => String(row.inbox_item_id))).map(row => [String(row.id), row]));
       const answers = candidates.filter(row => inboxes.get(String(row.inbox_item_id))?.source_kind === 'answer_submission');
+      const oppositeEdge = answers[0] ?? candidates[0];
+      const oppositeExists = (oppositeEdge !== undefined || boundaryCreatedAt !== undefined) && queryPlainRows(database, `
+        SELECT id FROM runtime_delivery WHERE target_conversation_id = @conversationId
+          ${oppositeEdge ? `AND (created_at, id) ${before ? '>' : '<'} (@createdAt, @id)` : ''} LIMIT 1
+      `, { conversationId, ...(oppositeEdge ? { createdAt: String(oppositeEdge.created_at), id: String(oppositeEdge.id) } : {}) }).length > 0;
+      const inspectedEdge = candidates[candidates.length - 1];
+      const beyondScan = candidates.length === CLIENT_COLLABORATION_SCAN_MAX_ROWS && inspectedEdge && queryPlainRows(database, `
+        SELECT id FROM runtime_delivery WHERE target_conversation_id = @conversationId
+          AND (created_at, id) ${before ? '<' : '>'} (@createdAt, @id) LIMIT 1
+      `, { conversationId, createdAt: String(inspectedEdge.created_at), id: String(inspectedEdge.id) }).length > 0;
       let count = Math.min(input.limit, answers.length);
       for (;;) {
         const selected = answers.slice(0, count);
         const clipped = count < answers.length;
-        const oldest = clipped ? selected[selected.length - 1] : candidates[candidates.length - 1];
-        const hasMore = clipped || candidates.length === CLIENT_COLLABORATION_SCAN_MAX_ROWS;
-        page = {
+        const continuedEdge = clipped ? selected[selected.length - 1] : inspectedEdge;
+        const oldest = before ? continuedEdge : oppositeEdge;
+        const newest = before ? oppositeEdge : continuedEdge;
+        const hasMore = clipped || Boolean(beyondScan);
+        page = collaborationHistoryPage(cursor.kind, direction, {
           records: buildTimelineExchangeRecords(database, conversationId, { receives: [], sends: [] }, content, selected.map(row => String(row.id))),
-          ...(hasMore && oldest ? { nextCursor: { kind: 'answer' as const, beforeCreatedAt: String(oldest.created_at), beforeId: String(oldest.id) } } : {}),
-          hasMore, scanProgress: selected.length === 0 && hasMore, scannedRows: candidates.length, responseBytes: 0
-        };
+          nextBeforeCursor: { kind: 'answer', ...(oldest ? { beforeCreatedAt: String(oldest.created_at), beforeId: String(oldest.id) } : {}) },
+          nextAfterCursor: { kind: 'answer', ...(newest ? { afterCreatedAt: String(newest.created_at), afterId: String(newest.id) } : {}) },
+          hasMoreBefore: before ? hasMore : oppositeExists,
+          hasMoreAfter: before ? oppositeExists : hasMore,
+          scanProgress: selected.length === 0 && hasMore, scannedRows: candidates.length
+        });
         const selectedIds = new Set(selected.map(row => String(row.id)));
         page.records.RuntimeDelivery = (page.records.RuntimeDelivery ?? []).map(row => selectedIds.has(String(row.id))
           ? { ...row, history_inventory_item: true } : row);
@@ -2399,6 +2445,21 @@ export function executeClientCollaborationHistoryPage(
   } catch (error) { database.exec('ROLLBACK'); throw error; }
 }
 
+/** Source transitions are reversible; no transcript time or Message floor is invented. */
+function collaborationHistoryPage(kind: ReliableKernelCollaborationHistoryCursor['kind'], direction: 'before' | 'after',
+  value: Omit<ClientCollaborationHistoryPageResult, 'nextCursor' | 'hasMore' | 'responseBytes'>): ClientCollaborationHistoryPageResult {
+  let { nextBeforeCursor, nextAfterCursor, hasMoreBefore, hasMoreAfter } = value;
+  const transitionBefore = !hasMoreBefore && kind !== 'answer';
+  const transitionAfter = !hasMoreAfter && kind !== 'exchange';
+  if (transitionBefore) { nextBeforeCursor = { kind: kind === 'exchange' ? 'message' : 'answer' }; hasMoreBefore = true; }
+  if (transitionAfter) { nextAfterCursor = { kind: kind === 'answer' ? 'message' : 'exchange' }; hasMoreAfter = true; }
+  const hasMore = direction === 'before' ? hasMoreBefore : hasMoreAfter;
+  const nextCursor = direction === 'before' ? nextBeforeCursor : nextAfterCursor;
+  return { ...value, nextBeforeCursor, nextAfterCursor, hasMoreBefore, hasMoreAfter,
+    ...(hasMore && nextCursor ? { nextCursor } : {}), hasMore,
+    scanProgress: value.scanProgress || (direction === 'before' ? transitionBefore : transitionAfter), responseBytes: 0 };
+}
+
 /**
  * Read collaboration envelopes by their own immutable sequence. Message membership (including an
  * empty transcript) is irrelevant. Select only ids connected to this Conversation by an explicit
@@ -2406,39 +2467,35 @@ export function executeClientCollaborationHistoryPage(
  */
 function executeCollaborationMessageInventoryPage(
   database: Database.Database,
-  input: { conversationId: string; limit: number; beforeMessageSeq?: string; beforeId?: string },
+  input: { conversationId: string; limit: number; direction: 'before' | 'after'; cursor: Extract<ReliableKernelCollaborationHistoryCursor, { kind: 'message' }> },
   content: ClientProjectionContentAccess
-): ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } {
+): ClientCollaborationHistoryPageResult {
   if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) {
     throw new RangeError(`Collaboration history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
   }
   const conversationId = requireRuntimeId(input.conversationId);
-  if ((input.beforeMessageSeq === undefined) !== (input.beforeId === undefined)) {
-    throw new TypeError('Collaboration history cursor requires both beforeMessageSeq and beforeId.');
-  }
-  const beforeMessageSeq = input.beforeMessageSeq === undefined ? undefined
-    : requireNonNegativeIntegerString(input.beforeMessageSeq, 'beforeMessageSeq');
-  if (beforeMessageSeq === '0') throw new RangeError('beforeMessageSeq must be positive.');
-  const beforeId = input.beforeId === undefined ? undefined : requireRuntimeId(input.beforeId);
+  const before = input.direction === 'before';
+  const boundaryMessageSeq = before ? input.cursor.beforeMessageSeq : input.cursor.afterMessageSeq;
+  const boundaryId = before ? input.cursor.beforeId : input.cursor.afterId;
   database.exec('BEGIN');
   try {
     // The epoch-5 Source/Target links index conversation_id with created_at, not message_seq.
     // Sorting all links for every page is unbounded. Inspect one fixed global-sequence window
     // instead; a page without any match advances with the last INSPECTED key, never a guessed time.
     // The unique message_seq makes id a cursor identity check, not a second ordering pass.
-    if (beforeMessageSeq !== undefined) {
+    if (boundaryMessageSeq !== undefined) {
       const anchor = queryPlainRows(database, `
         SELECT id FROM collaboration_message INDEXED BY ux_collaboration_message_02
-         WHERE message_seq = @beforeMessageSeq LIMIT 1
-      `, { beforeMessageSeq: BigInt(beforeMessageSeq) })[0];
-      if (anchor?.id !== beforeId) throw new Error('Collaboration history cursor does not identify its durable sequence.');
+         WHERE message_seq = @boundaryMessageSeq LIMIT 1
+      `, { boundaryMessageSeq: BigInt(boundaryMessageSeq) })[0];
+      if (anchor?.id !== boundaryId) throw new Error('Collaboration history cursor does not identify its durable sequence.');
     }
     const scanned = queryPlainRows(database, `
       WITH bounded AS MATERIALIZED (
         SELECT message.id, message.message_seq
           FROM collaboration_message AS message INDEXED BY ux_collaboration_message_02
-         ${beforeMessageSeq === undefined ? '' : 'WHERE message.message_seq < @beforeMessageSeq'}
-         ORDER BY message.message_seq DESC
+         ${boundaryMessageSeq === undefined ? '' : `WHERE message.message_seq ${before ? '<' : '>'} @boundaryMessageSeq`}
+         ORDER BY message.message_seq ${before ? 'DESC' : 'ASC'}
          LIMIT @scanLimit
       )
       SELECT bounded.id, bounded.message_seq,
@@ -2450,34 +2507,40 @@ function executeCollaborationMessageInventoryPage(
                 WHERE target.message_id = bounded.id AND target.conversation_id = @conversationId
              ) THEN 1 ELSE 0 END AS in_scope
         FROM bounded
-       ORDER BY bounded.message_seq DESC
+       ORDER BY bounded.message_seq ${before ? 'DESC' : 'ASC'}
     `, {
       conversationId,
       scanLimit: BigInt(CLIENT_COLLABORATION_SCAN_MAX_ROWS),
-      ...(beforeMessageSeq === undefined ? {} : { beforeMessageSeq: BigInt(beforeMessageSeq) })
+      ...(boundaryMessageSeq === undefined ? {} : { boundaryMessageSeq: BigInt(boundaryMessageSeq) })
     });
-    const oldestInspected = scanned[scanned.length - 1];
-    const olderGlobalExists = scanned.length === CLIENT_COLLABORATION_SCAN_MAX_ROWS && oldestInspected
+    const lastInspected = scanned[scanned.length - 1];
+    const furtherGlobalExists = scanned.length === CLIENT_COLLABORATION_SCAN_MAX_ROWS && lastInspected
       ? queryPlainRows(database, `
           SELECT id FROM collaboration_message INDEXED BY ux_collaboration_message_02
-           WHERE message_seq < @oldestInspectedSeq LIMIT 1
-        `, { oldestInspectedSeq: BigInt(String(oldestInspected.message_seq)) }).length > 0
+           WHERE message_seq ${before ? '<' : '>'} @lastInspectedSeq LIMIT 1
+        `, { lastInspectedSeq: BigInt(String(lastInspected.message_seq)) }).length > 0
       : false;
     const matches = scanned.filter((row) => row.in_scope === 1n || row.in_scope === 1);
     const candidates = matches.slice(0, input.limit + 1);
-    if (candidates.length === 0) {
-      const progress = olderGlobalExists;
-      const empty: ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } = {
-        records: {},
-        ...(progress ? {
-          nextBeforeMessageSeq: String(oldestInspected!.message_seq),
-          nextBeforeId: String(oldestInspected!.id)
-        } : {}),
-        hasMore: progress,
-        scanProgress: progress,
-        scannedRows: scanned.length,
-        responseBytes: 0
+    const oppositeEdge = candidates[0] ?? scanned[0];
+    const oppositeExists = (oppositeEdge !== undefined || boundaryMessageSeq !== undefined) && queryPlainRows(database, `
+      SELECT id FROM collaboration_message INDEXED BY ux_collaboration_message_02
+       ${oppositeEdge ? `WHERE message_seq ${before ? '>' : '<'} @oppositeSeq` : ''} LIMIT 1
+    `, oppositeEdge ? { oppositeSeq: BigInt(String(oppositeEdge.message_seq)) } : {}).length > 0;
+    const pageEdges = (continuedEdge: Record<string, unknown> | undefined, hasMore: boolean) => {
+      const oldest = before ? continuedEdge : oppositeEdge;
+      const newest = before ? oppositeEdge : continuedEdge;
+      return {
+        nextBeforeCursor: { kind: 'message' as const, ...(oldest ? { beforeMessageSeq: String(oldest.message_seq), beforeId: String(oldest.id) } : {}) },
+        nextAfterCursor: { kind: 'message' as const, ...(newest ? { afterMessageSeq: String(newest.message_seq), afterId: String(newest.id) } : {}) },
+        hasMoreBefore: before ? hasMore : oppositeExists,
+        hasMoreAfter: before ? oppositeExists : hasMore
       };
+    };
+    if (candidates.length === 0) {
+      const empty = collaborationHistoryPage('message', input.direction, {
+        records: {}, ...pageEdges(lastInspected, furtherGlobalExists), scanProgress: furtherGlobalExists, scannedRows: scanned.length
+      });
       settleClientWireResponseBytes(empty);
       database.exec('COMMIT');
       return empty;
@@ -2508,7 +2571,7 @@ function executeCollaborationMessageInventoryPage(
       return [...new Set(peerIds)].filter((id) => id && id !== conversationId).sort()
         .flatMap((id) => peers.has(id) ? [peers.get(id)!] : []);
     };
-    const materialize = (count: number): ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } => {
+    const materialize = (count: number): ClientCollaborationHistoryPageResult => {
       const selected = candidates.slice(0, count);
       const ids = selected.map((row) => String(row.id));
       const records: Record<string, DomainRow[]> = {};
@@ -2521,7 +2584,7 @@ function executeCollaborationMessageInventoryPage(
           return bounded;
         });
       };
-      include('CollaborationMessage', [...ids].reverse().map(projectMessage));
+      include('CollaborationMessage', (before ? [...ids].reverse() : ids).map(projectMessage));
       const sources = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', ids);
       const targets = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', ids);
       if (sources.length !== ids.length || targets.length !== ids.length) {
@@ -2555,20 +2618,15 @@ function executeCollaborationMessageInventoryPage(
         ...sources.map((row) => String(row.conversation_id)),
         ...targets.map((row) => String(row.conversation_id))
       ]));
-      const oldest = selected[selected.length - 1];
+      const continued = selected[selected.length - 1];
       // If the byte cap shortened a page, resume at its oldest OUTPUT row: newer matches in the
       // inspected window must never be skipped. Only a completely materialized underfull page can
       // advance across an inspected stretch of unrelated Conversations (including a zero-row page).
-      const progress = count === candidates.length && candidates.length < input.limit && olderGlobalExists;
-      const cursor = progress ? oldestInspected : oldest;
-      const page: ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } = {
-        records,
-        ...(cursor ? { nextBeforeMessageSeq: String(cursor.message_seq), nextBeforeId: String(cursor.id) } : {}),
-        hasMore: matches.length > count || olderGlobalExists,
-        scanProgress: progress,
-        scannedRows: scanned.length,
-        responseBytes: 0
-      };
+      const progress = count === candidates.length && candidates.length < input.limit && furtherGlobalExists;
+      const page = collaborationHistoryPage('message', input.direction, {
+        records, ...pageEdges(progress ? lastInspected : continued, matches.length > count || furtherGlobalExists),
+        scanProgress: progress, scannedRows: scanned.length
+      });
       settleClientWireResponseBytes(page);
       return page;
     };
@@ -2576,7 +2634,7 @@ function executeCollaborationMessageInventoryPage(
     // the byte cap is actually crossed.
     const maximumCount = Math.min(input.limit, candidates.length);
     const full = materialize(maximumCount);
-    let page: ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } | undefined = full.responseBytes <= CLIENT_PAGE_MAX_BYTES ? full : undefined;
+    let page: ClientCollaborationHistoryPageResult | undefined = full.responseBytes <= CLIENT_PAGE_MAX_BYTES ? full : undefined;
     let low = 1;
     let high = page ? 0 : maximumCount - 1;
     while (low <= high) {
@@ -2600,22 +2658,35 @@ function executeCollaborationMessageInventoryPage(
   }
 }
 
+const HISTORY_TABLE_DOMAINS = new Map(DOMAIN_REPOSITORIES.all().map(repository => [repository.schema.table, repository.schema.key]));
+
 function buildClientVisibleMessageHistoryRecords(
   database: Database.Database,
   messages: readonly Record<string, unknown>[],
-  content: ClientProjectionContentAccess
+  content: ClientProjectionContentAccess,
+  facts: Map<string, DomainRow[]>
 ): Record<string, DomainRow[]> {
   const records: Record<string, DomainRow[]> = {};
   const include = (domain: string, rows: readonly Record<string, unknown>[]): void => {
     const unique = mergeRowsById(rows);
+    if (!facts.has(domain)) facts.set(domain, unique);
     if (unique.length > 0) records[domain] = unique;
   };
+  const cachedRows = (domain: string, column: string, ids: readonly string[], read: () => DomainRow[]): DomainRow[] => {
+    const cached = facts.get(domain);
+    if (!cached) return read();
+    const selected = new Set(ids);
+    return cached.filter(row => selected.has(String(row[column])));
+  };
+  const readRows = (_database: Database.Database, table: string, column: string, ids: readonly string[]): DomainRow[] =>
+    cachedRows(HISTORY_TABLE_DOMAINS.get(table)!, column, ids, () => queryAllByIds(database, table, column, ids));
   const messageIds = messages.map((row) => String(row.id));
-  include('Message', messages);
+  include('Message', cachedRows('Message', 'id', messageIds,
+    () => messages.map(row => projectLogicalMessageMetadata(database, row, content))));
 
-  const messageTurnLinks = queryAllByIds(database, 'message_turn_link', 'message_id', messageIds);
-  const requestMessageLinks = queryAllByIds(database, 'model_request_message_link', 'message_id', messageIds);
-  const sourceLinks = queryAllByIds(database, 'tool_call_source_link', 'message_id', messageIds);
+  const messageTurnLinks = readRows(database, 'message_turn_link', 'message_id', messageIds);
+  const requestMessageLinks = readRows(database, 'model_request_message_link', 'message_id', messageIds);
+  const sourceLinks = readRows(database, 'tool_call_source_link', 'message_id', messageIds);
   include('MessageTurnLink', messageTurnLinks);
   include('ModelRequestMessageLink', requestMessageLinks);
   include('ToolCallSourceLink', sourceLinks);
@@ -2624,10 +2695,10 @@ function buildClientVisibleMessageHistoryRecords(
     ...requestMessageLinks.map((row) => String(row.model_request_id)),
     ...sourceLinks.map((row) => String(row.model_request_id))
   ])];
-  const modelRequests = queryAllByIds(database, 'model_request', 'id', requestIds)
+  const modelRequests = readRows(database, 'model_request', 'id', requestIds)
     .sort(compareModelRequestRows);
-  include('ModelRequest', singleResponseMeasurementReader(database, content).project(modelRequests));
-  include('ModelContextProjection', queryAllByIds(
+  include('ModelRequest', facts.has('ModelRequest') ? modelRequests : singleResponseMeasurementReader(database, content).project(modelRequests));
+  include('ModelContextProjection', readRows(
     database,
     'model_context_projection',
     'owner_id',
@@ -2635,52 +2706,52 @@ function buildClientVisibleMessageHistoryRecords(
   ).filter((row) => row.owner_kind === 'model_request'));
 
   const toolCallIds = [...new Set(sourceLinks.map((row) => String(row.tool_call_id)))];
-  const toolCalls = queryAllByIds(database, 'tool_call', 'id', toolCallIds)
+  const toolCalls = readRows(database, 'tool_call', 'id', toolCallIds)
     .sort(compareToolCallRows);
   include('ToolCall', toolCalls);
-  include('ToolCallPolicySnapshot', queryAllByIds(database, 'tool_call_policy_snapshot', 'tool_call_id', toolCallIds));
-  include('ToolCallEvent', queryLatestToolCallEvents(database, toolCallIds));
-  include('ToolExecution', queryAllByIds(database, 'tool_execution', 'tool_call_id', toolCallIds));
-  include('ToolOutcome', queryAllByIds(database, 'tool_outcome', 'tool_call_id', toolCallIds));
-  include('ToolModelResult', queryAllByIds(database, 'tool_model_result', 'tool_call_id', toolCallIds));
-  include('ToolResultArtifact', queryAllByIds(database, 'tool_result_artifact', 'tool_call_id', toolCallIds));
+  include('ToolCallPolicySnapshot', readRows(database, 'tool_call_policy_snapshot', 'tool_call_id', toolCallIds));
+  include('ToolCallEvent', cachedRows('ToolCallEvent', 'tool_call_id', toolCallIds, () => queryLatestToolCallEvents(database, toolCallIds)));
+  include('ToolExecution', readRows(database, 'tool_execution', 'tool_call_id', toolCallIds));
+  include('ToolOutcome', readRows(database, 'tool_outcome', 'tool_call_id', toolCallIds));
+  include('ToolModelResult', readRows(database, 'tool_model_result', 'tool_call_id', toolCallIds));
+  include('ToolResultArtifact', readRows(database, 'tool_result_artifact', 'tool_call_id', toolCallIds));
 
-  const interactionToolLinks = queryAllByIds(database, 'interaction_tool_call_link', 'tool_call_id', toolCallIds);
+  const interactionToolLinks = readRows(database, 'interaction_tool_call_link', 'tool_call_id', toolCallIds);
   const interactionRequestIds = [...new Set(interactionToolLinks.map((row) => String(row.request_id)))];
-  const interactionRequests = queryAllByIds(database, 'interaction_request', 'id', interactionRequestIds);
-  const interactionOwnerLinks = queryAllByIds(database, 'interaction_owner_link', 'request_id', interactionRequestIds);
+  const interactionRequests = readRows(database, 'interaction_request', 'id', interactionRequestIds);
+  const interactionOwnerLinks = readRows(database, 'interaction_owner_link', 'request_id', interactionRequestIds);
   include('InteractionToolCallLink', interactionToolLinks);
   include('InteractionRequest', interactionRequests);
   include('InteractionOwnerLink', interactionOwnerLinks);
-  include('InteractionResponse', queryAllByIds(database, 'interaction_response', 'request_id', interactionRequestIds));
+  include('InteractionResponse', readRows(database, 'interaction_response', 'request_id', interactionRequestIds));
 
-  const fileChangeSets = queryAllByIds(database, 'file_change_set', 'tool_call_id', toolCallIds);
+  const fileChangeSets = readRows(database, 'file_change_set', 'tool_call_id', toolCallIds);
   const fileChangeSetIds = fileChangeSets.map((row) => String(row.id));
-  const fileMutationReceipts = queryAllByIds(database, 'file_mutation_receipt', 'change_set_id', fileChangeSetIds);
+  const fileMutationReceipts = readRows(database, 'file_mutation_receipt', 'change_set_id', fileChangeSetIds);
   include('FileChangeSet', fileChangeSets);
-  include('FileChangeSetMember', queryAllByIds(database, 'file_change_set_member', 'change_set_id', fileChangeSetIds));
-  include('FileChangeDecision', queryAllByIds(database, 'file_change_decision', 'change_set_id', fileChangeSetIds));
+  include('FileChangeSetMember', readRows(database, 'file_change_set_member', 'change_set_id', fileChangeSetIds));
+  include('FileChangeDecision', readRows(database, 'file_change_decision', 'change_set_id', fileChangeSetIds));
   include('FileMutationReceipt', fileMutationReceipts);
-  include('FileMutationReceiptMember', queryAllByIds(
+  include('FileMutationReceiptMember', readRows(
     database,
     'file_mutation_receipt_member',
     'receipt_id',
     fileMutationReceipts.map((row) => String(row.id))
   ));
 
-  const processOriginLinks = queryAllByIds(database, 'process_origin_link', 'tool_call_id', toolCallIds);
+  const processOriginLinks = readRows(database, 'process_origin_link', 'tool_call_id', toolCallIds);
   const processIds = [...new Set(processOriginLinks.map((row) => String(row.process_id)))];
-  const processes = queryAllByIds(database, 'process', 'id', processIds)
-    .map((row) => projectProcessRecord(database, String(row.id), content));
+  const processes = readRows(database, 'process', 'id', processIds)
+    .map((row) => facts.has('Process') ? row : projectProcessRecord(database, String(row.id), content));
   include('ProcessOriginLink', processOriginLinks);
   include('Process', processes);
-  include('ProcessReceipt', queryAllByIds(database, 'process_receipt', 'process_id', processIds));
+  include('ProcessReceipt', readRows(database, 'process_receipt', 'process_id', processIds));
 
-  const childParentLinks = queryAllByIds(database, 'child_execution_parent_link', 'source_tool_call_id', toolCallIds);
+  const childParentLinks = readRows(database, 'child_execution_parent_link', 'source_tool_call_id', toolCallIds);
   const childExecutionIds = [...new Set(childParentLinks.map((row) => String(row.child_execution_id)))];
-  const childExecutions = queryAllByIds(database, 'child_execution', 'id', childExecutionIds);
-  const childActiveLinks = queryAllByIds(database, 'child_execution_active_turn_link', 'child_execution_id', childExecutionIds);
-  const childTurnLinks = queryLatestChildExecutionTurnLinks(database, childExecutionIds);
+  const childExecutions = readRows(database, 'child_execution', 'id', childExecutionIds);
+  const childActiveLinks = readRows(database, 'child_execution_active_turn_link', 'child_execution_id', childExecutionIds);
+  const childTurnLinks = cachedRows('ChildExecutionTurnLink', 'child_execution_id', childExecutionIds, () => queryLatestChildExecutionTurnLinks(database, childExecutionIds));
   const childTurnIds = [...new Set([
     ...childActiveLinks.map((row) => String(row.turn_id)),
     ...childTurnLinks.map((row) => String(row.turn_id))
@@ -2689,20 +2760,19 @@ function buildClientVisibleMessageHistoryRecords(
   include('ChildExecution', childExecutions);
   include('ChildExecutionActiveTurnLink', childActiveLinks);
   include('ChildExecutionTurnLink', childTurnLinks);
-  include('AgentConversationLink', queryAllByIds(
+  include('AgentConversationLink', readRows(
     database,
     'agent_conversation_link',
     'conversation_id',
     childExecutions.map((row) => String(row.child_conversation_id))
   ));
 
-  const answerBridges = queryAllByIds(database, 'answer_bridge', 'child_execution_id', childExecutionIds)
-    .map((row) => projectAnswerBridgeRecord(database, String(row.id)));
+  const answerBridges = readRows(database, 'answer_bridge', 'child_execution_id', childExecutionIds)
+    .map((row) => facts.has('AnswerBridge') ? row : projectAnswerBridgeRecord(database, String(row.id)));
   include('AnswerBridge', answerBridges);
-  include('AnswerSubmission', projectAnswerSubmissionRecords(
-    database,
-    answerBridges.flatMap((row) => row.current_submission_id ? [String(row.current_submission_id)] : [])
-  ));
+  const answerIds = answerBridges.flatMap(row => row.current_submission_id ? [String(row.current_submission_id)] : []);
+  include('AnswerSubmission', cachedRows('AnswerSubmission', 'id', answerIds,
+    () => projectAnswerSubmissionRecords(database, answerIds)));
 
   const rootTurnIds = [
     ...messageTurnLinks.map((row) => String(row.turn_id)),
@@ -2712,13 +2782,13 @@ function buildClientVisibleMessageHistoryRecords(
     ...childParentLinks.flatMap((row) => row.parent_turn_id ? [String(row.parent_turn_id)] : [])
   ];
   const turnIds = [...new Set([...rootTurnIds, ...childTurnIds])];
-  const turns = queryAllByIds(database, 'turn', 'id', turnIds)
-    .map((row) => row.status === 'active' ? projectTurnClientRecord(database, String(row.id), content) : row)
+  const turns = readRows(database, 'turn', 'id', turnIds)
+    .map((row) => !facts.has('Turn') && row.status === 'active' ? projectTurnClientRecord(database, String(row.id), content) : row)
     .sort(compareTurnRows);
   include('Turn', turns);
-  include('ExecutionLease', queryAllByIds(database, 'execution_lease', 'turn_id', turnIds));
-  include('TurnTermination', queryAllByIds(database, 'turn_termination', 'turn_id', turnIds));
-  include('TurnExecutorLink', queryAllByIds(database, 'turn_executor_link', 'turn_id', turnIds));
+  include('ExecutionLease', readRows(database, 'execution_lease', 'turn_id', turnIds));
+  include('TurnTermination', readRows(database, 'turn_termination', 'turn_id', turnIds));
+  include('TurnExecutorLink', readRows(database, 'turn_executor_link', 'turn_id', turnIds));
   return records;
 }
 
@@ -2925,6 +2995,7 @@ function queryVisibleMessageRowsByIds(
                revision.content_object_id,
                content.content_type,
                content.byte_length,
+               ${messageItemIndexRevisionSql()} AS item_index_revision_id,
                ROW_NUMBER() OVER (
                  ORDER BY membership.message_seq ASC, message.id ASC
                ) AS display_seq

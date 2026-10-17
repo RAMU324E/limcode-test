@@ -153,14 +153,15 @@ const publishedCases = [
   ['epoch3最早manifest变体', 3, { modelContextDetail: true }],
   ['epoch4标准', 4, {}],
   ['epoch4确切missing-link前驱', 4, { missingDeliveryLink: true }],
-  ['epoch5冻结格式与pending当前head', 5, { contextHead: true }]
+  ['epoch5冻结格式与pending当前head', 5, { contextHead: true }],
+  ['epoch6已发布113领域', 6, { contextHead: true }]
 ];
 async function published(name, epoch, options = {}) {
   return createPublishedRuntime(epoch, { attachment: true, ...options,
     configurationRoot: path.join(directory, name) });
 }
 async function assertPreserved(f, result) {
-  assert.equal(result.binding.runtimeKernelEpoch, 6);
+  assert.equal(result.binding.runtimeKernelEpoch, 7);
   assert.equal(result.binding.dataSetId, f.previous.dataSetId);
   assert.equal(result.binding.rootInstanceId, f.previous.rootInstanceId);
   assert.equal(await fs.readFile(f.settingsPath, 'utf8'), 'keep-settings');
@@ -184,19 +185,20 @@ async function assertPreserved(f, result) {
     }
   } finally { await db.close(); }
 }
-function publishedRows(f) {
+function publishedRows(f, epoch = 5) {
   const db = new Database(f.paths.databasePath, { readonly: true });
   try {
     db.defaultSafeIntegers(true);
-    const tables = new Set(kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS.map(row => row.table));
+    const schemas = epoch === 6 ? kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS;
+    const tables = new Set(schemas.map(row => row.table));
     return {
       ddl: db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").all()
-        .filter(row => tables.has(row.tbl_name) && !['ix_runtime_delivery_04', 'ix_runtime_delivery_05'].includes(row.name)),
-      rows: kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS.map(row => [row.table, db.prepare(`SELECT * FROM ${row.table} ORDER BY id`).all()])
+        .filter(row => tables.has(row.tbl_name) && (epoch === 6 || !['ix_runtime_delivery_04', 'ix_runtime_delivery_05'].includes(row.name))),
+      rows: schemas.map(row => [row.table, db.prepare(`SELECT * FROM ${row.table} ORDER BY id`).all()])
     };
   } finally { db.close(); }
 }
-for (const [label, epoch, options] of publishedCases) test(`发布${label}升级到6，历史、附件、身份和旧CAS保持`, async () => {
+for (const [label, epoch, options] of publishedCases) test(`发布${label}升级到7，历史、附件、身份和旧CAS保持`, async () => {
   const f = await published(label, epoch, options);
   const casBefore = await bytesTree(f.paths.casRootPath);
   let rowsBefore;
@@ -207,7 +209,12 @@ for (const [label, epoch, options] of publishedCases) test(`发布${label}升级
     '2dba9bcdb8341cd613808cb198f0fde920fe85316ee70a31c7158530b8e0fd3c');
     rowsBefore = publishedRows(f);
   }
+  if (epoch === 6) rowsBefore = publishedRows(f, 6);
   const result = await new Cutover(f.authority, f.scope).ensureCurrentRoot();
+  if (epoch === 6) {
+    assert.deepEqual(publishedRows(f, 6), rowsBefore);
+    assert.deepEqual(await bytesTree(f.paths.casRootPath), casBefore);
+  }
   assert.equal(result.epochMigratedFrom, epoch);
   assert.equal(result.binding.rootGeneration, f.previous.rootGeneration + 1);
   assert.equal(result.binding.pointerRevision, f.previous.pointerRevision + 1);
@@ -276,7 +283,7 @@ test('身份未知的目标Host阻止离线升级，原库与选择不变', asyn
   assert.deepEqual(await fs.readFile(f.paths.databasePath), bytes);
 });
 
-test('发布3→4的pending准入边界恢复后继续升级到6', async () => {
+test('发布3→4的pending准入边界恢复后继续升级到7', async () => {
   const f = await published('pending-3-to-4', 3);
   await fs.writeFile(f.paths.rootPendingPath, JSON.stringify({ ...f.previous, rootGeneration: f.previous.rootGeneration + 1,
     pointerRevision: f.previous.pointerRevision + 1, runtimeKernelEpoch: 4 }));
@@ -288,7 +295,7 @@ test('发布3→4的pending准入边界恢复后继续升级到6', async () => {
   await assert.rejects(fs.access(f.paths.rootPendingPath), { code: 'ENOENT' });
 });
 
-test('发布4→5提交后journal落后按提交事实恢复，再升级到6', async () => {
+test('发布4→5提交后journal落后按提交事实恢复，再升级到7', async () => {
   const f = await published('committed-4-to-5', 4, { omitLegacyContinuation: true });
   const retired = await seedCommittedEpoch4To5(f);
   const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: f.cleanupRoot }, {
@@ -317,4 +324,54 @@ test('升级备份损坏时拒绝恢复，原历史与根指针保留', async ()
   const db = new Database(f.paths.databasePath, { readonly: true });
   try { assert.equal(db.prepare('SELECT title FROM conversation WHERE id = ?').pluck().get(f.conversationId), f.title); }
   finally { db.close(); }
+});
+
+test('已发布升到6的中断先完成原目标，再独立升级到7', async () => {
+  for (const point of ['after-writer-fence', 'after-backup', 'after-database-commit', 'after-pointer-publication']) {
+    const f = await published(`pending-6-${point}`, 5, { contextHead: true });
+    const casBefore = await bytesTree(f.paths.casRootPath);
+    await assert.rejects(kernel.migratePreviousRuntimeEpochIfRequired(f.authority, {
+      onFaultPoint(actual) { if (actual === point) throw new Error(`interrupt ${point}`); }
+    }), new RegExp(`interrupt ${point}`));
+    const control = path.dirname(f.paths.dataRootPath);
+    const next6 = { ...f.previous, rootGeneration: f.previous.rootGeneration + 1,
+      pointerRevision: f.previous.pointerRevision + 1, runtimeKernelEpoch: 6 };
+    // Reuse the existing migrator's predecessor backup and exact persistent boundary as the
+    // published target-6 fixture. Its journal keeps the original target throughout recovery.
+    if (point !== 'after-writer-fence') {
+      const currentJournal = path.join(control, kernel.RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE);
+      const journal = JSON.parse(await fs.readFile(currentJournal));
+      await fs.writeFile(path.join(control, kernel.PUBLISHED_EPOCH_TO_6_JOURNAL_FILE),
+        JSON.stringify({ ...journal, toEpoch: 6, nextBinding: next6 }));
+      await fs.rm(currentJournal);
+    }
+    if (point === 'after-database-commit' || point === 'after-pointer-publication') {
+      const db = new Database(f.paths.databasePath);
+      try {
+        db.exec('BEGIN IMMEDIATE');
+        db.prepare('UPDATE schema_manifest SET runtime_kernel_epoch = 6').run();
+        db.prepare('UPDATE root_binding SET runtime_kernel_epoch = 6').run();
+        db.exec('COMMIT');
+        db.pragma('wal_checkpoint(TRUNCATE)');
+      } finally { db.close(); }
+    }
+    if (point === 'after-pointer-publication') {
+      await fs.writeFile(f.paths.rootPointerPath, JSON.stringify(next6));
+      const manifest = JSON.parse(await fs.readFile(f.paths.runtimeEpochPath));
+      await fs.writeFile(f.paths.runtimeEpochPath, JSON.stringify({ ...manifest, runtimeKernelEpoch: 6 }));
+    } else await fs.writeFile(f.paths.rootPendingPath, JSON.stringify(next6));
+
+    const result = await kernel.migratePreviousRuntimeEpochIfRequired(f.authority);
+    assert.equal(result.previousEpoch, 6);
+    assert.equal(result.binding.rootGeneration, f.previous.rootGeneration + 2);
+    assert.equal(result.binding.pointerRevision, f.previous.pointerRevision + 2);
+    const backups = path.join(control, kernel.RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY);
+    const completed = await Promise.all((await fs.readdir(backups)).map(async name =>
+      JSON.parse(await fs.readFile(path.join(backups, name, kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE)))));
+    assert.deepEqual(completed.map(row => row.toEpoch).sort(), [6, 7]);
+    assert.deepEqual(completed.find(row => row.toEpoch === 6).nextBinding, next6);
+    assert.deepEqual(await bytesTree(f.paths.casRootPath), casBefore);
+    await assertPreserved(f, result);
+    await assert.rejects(fs.access(path.join(control, kernel.PUBLISHED_EPOCH_TO_6_JOURNAL_FILE)), { code: 'ENOENT' });
+  }
 });

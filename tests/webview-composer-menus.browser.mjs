@@ -37,12 +37,21 @@ environments.allowedEnvironmentsForConversation = () => allowed;
 environments.environmentSelectionForConversation = () => ({ allowed, error: '工作环境未获当前策略允许：旧工作目录，请重新选择。' });
 environments.workEnvironmentEnabledForConversation = () => true;
 feed.projections = { activeConversationWindow: { conversationId: 'self' } };
-feed.sessionId = 'feed'; feed.collaborationHistoryConversationId = 'self'; feed.collaborationHistoryHasMore = true;
-feed.collaborationHistoryNextCursor = { kind: 'message' };
+feed.sessionId = 'feed'; feed.synchronizeCollaborationHistoryScope('self', true);
+feed.collaborationHistoryNextBeforeCursor = { kind: 'message' };
 feed.collaborationHistoryLoadedPages = 1;
 const posted = [];
 window.fixture = { client, settings, feed, mode, posted, hold: false, pages: 0, errors: false,
-  resetHistory() { feed.synchronizeCollaborationHistoryScope('self', true); feed.collaborationHistoryNextCursor = { kind: 'message' }; feed.collaborationHistoryLoadedPages = 1; this.pages = 0; },
+  resetHistory() { feed.synchronizeCollaborationHistoryScope('self', true); feed.collaborationHistoryNextBeforeCursor = { kind: 'message' }; feed.collaborationHistoryLoadedPages = 1; this.pages = 0; },
+  messagePage(records, sequence, scannedRows = 4096) {
+    const rows = records.CollaborationMessage ?? [];
+    const newest = rows.reduce((value, row) => !value || BigInt(row.message_seq) > BigInt(value.message_seq) ? row : value, null);
+    const oldest = rows.find(row => row.message_seq === String(sequence));
+    const nextBeforeCursor = { kind: 'message', beforeMessageSeq: String(sequence), beforeId: oldest?.id ?? 'cursor-' + sequence };
+    return { records, hasMoreBefore: true, hasMoreAfter: true, nextBeforeCursor,
+      nextAfterCursor: { kind: 'message', afterMessageSeq: newest?.message_seq ?? String(sequence), afterId: newest?.id ?? 'cursor-' + sequence },
+      hasMore: true, nextCursor: nextBeforeCursor, scanProgress: rows.length === 0, scannedRows, responseBytes: 0 };
+  },
   handle(message) {
     posted.push(message);
     if (message.type !== 'reliable-kernel.collaboration-history-request') return;
@@ -50,8 +59,12 @@ window.fixture = { client, settings, feed, mode, posted, hold: false, pages: 0, 
     if (this.hold) return;
     setTimeout(() => {
       if (this.errors) { feed.observeCollaborationHistoryError({ ...message, message: '测试读取失败' }); return; }
-      feed.observeCollaborationHistoryResult({ ...message, page: { records: {}, hasMore: n < 4, scanProgress: n < 4,
-        scannedRows: 4096, responseBytes: 0, ...(n < 4 ? { nextCursor: { kind: 'message', beforeMessageSeq: String(100 - n), beforeId: 'm' + n } } : {}) } });
+      // Two empty message scans, then the real message -> answer transition and answer end.
+      const page = this.messagePage({}, 100 - n);
+      if (n === 3) { page.nextBeforeCursor = { kind: 'answer' }; page.nextCursor = page.nextBeforeCursor; }
+      if (n === 4) Object.assign(page, { hasMoreBefore: false, hasMore: false, scanProgress: false,
+        nextBeforeCursor: { kind: 'answer' }, nextAfterCursor: { kind: 'message' }, nextCursor: undefined });
+      feed.observeCollaborationHistoryResult({ ...message, page });
     }, 20);
   }
 };
@@ -161,21 +174,26 @@ test('协作查找跨空页显示进度、查完结束、停止不继续请求�
   await p.getByRole('button', { name: '查找更早协作记录', exact: true }).click();
   await p.getByText('没有更早的协作记录', { exact: false }).waitFor();
   assert.equal(await p.evaluate(() => window.fixture.pages), 4);
+  assert.deepEqual(await p.evaluate(() => window.fixture.posted
+    .filter(message => message.type === 'reliable-kernel.collaboration-history-request')
+    .map(message => [message.direction, message.cursor.kind])),
+  [['before', 'message'], ['before', 'message'], ['before', 'message'], ['before', 'answer']]);
   assert.match(await p.locator('.reliable-collaboration-progress').innerText(), /16,384/);
   await p.evaluate(() => { window.fixture.resetHistory(); window.fixture.hold = true; });
   await p.getByRole('button', { name: '查找更早协作记录', exact: true }).click();
   await p.getByRole('button', { name: '停止查找', exact: true }).click();
   await p.evaluate(() => {
     const f = window.fixture, message = f.posted.filter(m => m.type === 'reliable-kernel.collaboration-history-request').at(-1);
-    f.feed.observeCollaborationHistoryResult({ ...message, page: { records: {}, hasMore: true, scanProgress: true,
-      scannedRows: 4096, responseBytes: 0, nextCursor: { kind: 'message', beforeMessageSeq: '50', beforeId: 'stopped' } } });
+    f.feed.observeCollaborationHistoryResult({ ...message, page: f.messagePage({}, 50) });
   });
   await p.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   assert.equal(await p.evaluate(() => window.fixture.pages), 1);
   await p.evaluate(() => { window.fixture.hold = false; window.fixture.errors = true; });
   await p.getByRole('button', { name: '查找更早协作记录', exact: true }).click();
   await p.getByText('测试读取失败', { exact: true }).waitFor();
-  assert.equal(await p.evaluate(() => window.fixture.feed.collaborationHistoryNextCursor.beforeMessageSeq), '50');
+  assert.equal(await p.evaluate(() => window.fixture.feed.collaborationHistoryNextBeforeCursor.beforeMessageSeq), '50');
+  assert.equal(await p.evaluate(() => window.fixture.posted
+    .filter(message => message.type === 'reliable-kernel.collaboration-history-request').at(-1).cursor.beforeMessageSeq), '50');
 });
 
 test('协作查找跨过已展示卡片和空页，找到新卡片即停', async t => {
@@ -189,11 +207,17 @@ test('协作查找跨过已展示卡片和空页，找到新卡片即停', async
       CollaborationMessageTargetLink: [{ id: id + '-target', message_id: id, conversation_id: 'peer', inbox_item_id: id + '-inbox' }],
       CollaborationPeerConversation: [{ id: 'peer', title: '协作方', status: 'active' }]
     });
-    f.feed.records = Object.fromEntries(Object.entries(f.card('known', 90)).map(([domain, rows]) => [domain, Object.fromEntries(rows.map(row => [row.id, row]))]));
+    const known = f.card('known', 90);
+    f.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'feed', hostBootId: 'composer-fixture',
+      messageSeq: '1', snapshotCommitSeq: '0', projections: { activeConversationWindow: {
+        conversationId: 'self', collaborationMessages: known.CollaborationMessage,
+        collaborationMessageSourceLinks: known.CollaborationMessageSourceLink,
+        collaborationMessageTargetLinks: known.CollaborationMessageTargetLink,
+        collaborationPeerConversations: known.CollaborationPeerConversation
+      } } });
     f.reply = (records, sequence) => {
       const request = f.posted.filter(m => m.type === 'reliable-kernel.collaboration-history-request').at(-1);
-      f.feed.observeCollaborationHistoryResult({ ...request, page: { records, hasMore: true, scanProgress: false, scannedRows: 10,
-        responseBytes: 0, nextCursor: { kind: 'message', beforeMessageSeq: String(sequence), beforeId: 'cursor-' + sequence } } });
+      f.feed.observeCollaborationHistoryResult({ ...request, page: f.messagePage(records, sequence, 10) });
     };
     f.mode.value = 'history';
   });

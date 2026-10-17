@@ -77,6 +77,7 @@ import {
   NativeResponseTimingTracker,
   nonEmptyRecord,
   nowMonotonicMs,
+  observeNativeResponseCreated,
   shouldCloseThoughtBlock,
   stringifyJson,
   stripUndefined,
@@ -782,10 +783,7 @@ async function runLlmAttempt(
         // 真实物理 response 独立记账；重连/回放不得再加一次。同一 response 的
         // usage chunk 是更新而不是增量，逻辑 Done 的聚合只用于总计费。
         if (nativeUsage.beginResponse(nativeEvent.responseId)) responseTiming.responseCreated(nativeEvent.responseId);
-        nativeChain.current = {
-          responseId: nativeEvent.responseId,
-          ...(nativeEvent.previousResponseId ? { previousResponseId: nativeEvent.previousResponseId } : {})
-        };
+        observeNativeResponseCreated(nativeChain, nativeEvent);
       }
       if (hasModelOutputChunk(chunk)) responseTiming.outputObserved(chunkAt, chunkMark);
       // A terminal response can be the first complete proof of its output items. Persist those

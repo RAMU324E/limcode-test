@@ -2,6 +2,7 @@ import { CONTEXT_HANDLE_STATE_DOMAIN, emptyConversationContextHandleStateStep } 
 import { visitForkCopiedMessageSources } from './forkMessageCopy';
 import { selectConversationCompressionBlock } from './compressionBlockOwnership';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateContextSegmentTokens } from './contextTokenEstimator';
 import { prepareConversationForkSnapshot } from './conversationForkSnapshot';
@@ -274,7 +275,7 @@ export async function prepareChildContextFork(
   }
   await prefetch('ContentObject', segmentRows.map(segment => id(segment.content_object_id)));
   input.assertActive?.();
-  const segments = await estimateForkSegments(store, segmentRows, async objectId =>
+  const segments = await estimateForkSegments(new LogicalMessageContentReader(database, store), segmentRows, async objectId =>
     await get('ContentObject', objectId) as unknown as ContentObjectMetadata);
   const state = handleReservations.steps.find(step => step.kind === 'insert' && step.domain === CONTEXT_HANDLE_STATE_DOMAIN);
   if (!state || state.kind !== 'insert') throw new Error('Fork Context handle state must be seeded.');
@@ -304,7 +305,7 @@ export async function prepareChildContextFork(
 
 /** Estimate each immutable body/kind once, without retaining all inherited body buffers. */
 async function estimateForkSegments(
-  store: ContentAddressedStore,
+  store: Pick<LogicalMessageContentReader, 'readMany' | 'byteLength'>,
   segmentRows: readonly DomainRow[],
   readMetadata: (objectId: string) => Promise<ContentObjectMetadata>
 ): Promise<ChildContextForkPlan['segments']> {
@@ -324,7 +325,8 @@ async function estimateForkSegments(
     for (const [index, contentObject] of contentBatch.entries()) {
       for (const segmentKind of contentKinds.get(contentObject.id)!) {
         estimates.set(`${segmentKind}:${contentObject.id}`, estimateContextSegmentTokens({
-          segmentKind, messageRole: null, contentObject, content: contents[index]
+          segmentKind, messageRole: null,
+          contentObject: { ...contentObject, content_type: logicalMessageContentType(contentObject.content_type) }, content: contents[index]
         }));
       }
     }
@@ -333,13 +335,14 @@ async function estimateForkSegments(
   }
   for (const objectId of contentKinds.keys()) {
     const contentObject = await readMetadata(objectId);
+    const byteLength = BigInt(await store.byteLength(contentObject));
     if (contentBatch.length >= FORK_READ_BATCH_SIZE
-      || (contentBatch.length > 0 && contentBatchBytes + contentObject.byte_length > FORK_CONTENT_BATCH_BYTES)) {
+      || (contentBatch.length > 0 && contentBatchBytes + byteLength > FORK_CONTENT_BATCH_BYTES)) {
       await estimateBatch();
     }
     // An individual large object is still supported, but never shares its batch with another.
     contentBatch.push(contentObject);
-    contentBatchBytes += contentObject.byte_length;
+    contentBatchBytes += byteLength;
   }
   await estimateBatch();
   return segmentRows.map(segment => ({ segmentId: id(segment.id), estimatedTokens: estimates.get(

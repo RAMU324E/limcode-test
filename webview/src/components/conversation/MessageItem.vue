@@ -16,7 +16,8 @@ import {
   IconTrash,
   IconX
 } from '@tabler/icons-vue';
-import { isVisibleTextPart, type LlmUsageMetadataRecord, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
+import { isVisibleTextPart, type LlmUsageMetadataRecord, type MessageContent, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
+import type { ReliableMessageContentWindowPresentation } from '@webview/domain/reliableMessageContentWindow';
 import { terminationNotice as terminationNoticeText } from './terminationNotice';
 import RichContentView from '@webview/components/content/RichContentView.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
@@ -27,6 +28,9 @@ import { modelRunMetrics, type ModelRunRound } from './runMetricsModel';
 const props = withDefaults(
   defineProps<{
     message: MessageRecord;
+    scroller?: HTMLElement | null;
+    contentWindow?: ReliableMessageContentWindowPresentation;
+    loadCompleteContent?: () => Promise<MessageContent>;
     runId?: string;
     termination?: RunTerminationRecord;
     terminationNoticeSuppressed?: boolean;
@@ -50,6 +54,9 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
+  (event: 'earlier-content'): void;
+  (event: 'later-content'): void;
+  (event: 'retry-content'): void;
   (event: 'edit-message', message: MessageRecord): void;
   (event: 'resend-as-new', message: MessageRecord): void;
   (event: 'retry-from', message: MessageRecord): void;
@@ -108,6 +115,8 @@ const retryMutationBlocked = computed(() => props.mutationPending || props.retry
 const compactMutationBlocked = computed(() => props.mutationPending || props.compactBlocked);
 const forkMutationBlocked = computed(() => props.mutationPending || props.forkBlocked);
 const copied = ref(false);
+const copying = ref(false);
+const copyError = ref('');
 const terminatedContentExpanded = ref(false);
 const confirmRetryOpen = ref(false);
 const confirmDeleteOpen = ref(false);
@@ -608,18 +617,21 @@ function tokenUsageTooltipRows(item: TokenUsageItem): TooltipPanelItem[] {
 
 
 async function copyMessage(): Promise<void> {
-  const text = copyableMessageText.value;
-  if (!text) return;
-
-  const ok = await writeClipboard(text);
-  if (!ok) return;
-
-  copied.value = true;
-  if (copiedResetTimer !== undefined) window.clearTimeout(copiedResetTimer);
-  copiedResetTimer = window.setTimeout(() => {
-    copied.value = false;
-    copiedResetTimer = undefined;
-  }, 1400);
+  if (copying.value || !showMessageContent.value) return;
+  copying.value = true;
+  copyError.value = '';
+  try {
+    const content = props.loadCompleteContent ? await props.loadCompleteContent() : props.message.content;
+    const text = content.parts.filter(isVisibleTextPart).map(part => part.text).join('');
+    if (!text) return;
+    const ok = await writeClipboard(text);
+    if (!ok) { copyError.value = '复制失败，请重试。'; return; }
+    copied.value = true;
+    if (copiedResetTimer !== undefined) window.clearTimeout(copiedResetTimer);
+    copiedResetTimer = window.setTimeout(() => { copied.value = false; copiedResetTimer = undefined; }, 1400);
+  } catch (error) {
+    copyError.value = error instanceof Error ? error.message : '读取完整消息失败，请重试。';
+  } finally { copying.value = false; }
 }
 
 
@@ -780,13 +792,22 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
             <span class="message-detail-loading-bar" aria-hidden="true"></span>
             <span>内容加载中</span>
           </div>
+          <button v-if="showMessageContent && contentWindow && contentWindow.firstSequence > 1" type="button"
+            class="message-content-page-control" :disabled="contentWindow.loading" @click="emit('earlier-content')">显示前面的内容</button>
           <RichContentView
-            v-else-if="showMessageContent"
+            v-if="!detailLoading && showMessageContent"
             :parts="message.content.parts"
             :markdown="message.role !== 'user'"
             :streaming="streaming"
             :message-id="message.id"
+            :scroller="scroller"
           />
+          <button v-if="showMessageContent && contentWindow && contentWindow.lastSequence < contentWindow.totalItems" type="button"
+            class="message-content-page-control" :disabled="contentWindow.loading" @click="emit('later-content')">显示后面的内容</button>
+          <p v-if="contentWindow?.error" class="message-content-read-error" role="alert">{{ contentWindow.error }}</p>
+          <button v-if="contentWindow?.error && contentWindow.canRetry" type="button"
+            class="message-content-page-control" :disabled="contentWindow.loading" @click="emit('retry-content')">重试读取内容</button>
+          <p v-if="copyError" class="message-content-read-error" role="alert">{{ copyError }}</p>
         </div>
         <footer v-if="messageFooterVisible" class="message-footer">
           <div v-if="floorNumber > 0 || runMetricItems.length > 0" class="message-turn-metrics" aria-label="消息楼层与 LLM 调用指标">
@@ -894,9 +915,9 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
         type="button"
         class="message-action-button"
         :class="{ 'is-copied': copied }"
-        :disabled="!copyableMessageText"
-        :aria-label="copied ? '已复制消息' : '复制消息'"
-        :title="copied ? '已复制' : '复制消息'"
+        :disabled="copying || !showMessageContent || (!copyableMessageText && !loadCompleteContent)"
+        :aria-label="copying ? '正在读取完整消息' : copied ? '已复制消息' : '复制消息'"
+        :title="copying ? '正在读取完整消息' : copied ? '已复制' : '复制完整消息'"
         @click="copyMessage"
       >
         <IconCheck v-if="copied" class="message-action-icon" stroke="2" aria-hidden="true" />
@@ -950,6 +971,10 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 </template>
 
 <style scoped>
+.message-content-page-control { align-self: flex-start; border: 0; background: transparent; color: var(--vscode-descriptionForeground); cursor: pointer; padding: var(--space-2) 0; font: inherit; }
+.message-content-page-control:disabled { cursor: wait; opacity: .6; }
+.message-content-read-error { color: var(--vscode-errorForeground); font-size: var(--font-size-sm); }
+
 .message-floor {
   position: relative;
   width: 100%;

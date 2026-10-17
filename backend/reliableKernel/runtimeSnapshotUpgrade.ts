@@ -4,7 +4,7 @@ import type { RootBinding } from './contracts';
 import type { HistoricalRootBinding } from './rootAuthority';
 
 /**
- * The exact published epoch-3/4/5 upgrade of a private snapshot copy (upgradePublishedRuntimeSnapshot),
+ * The exact published epoch-3/4/5/6 upgrade of a private snapshot copy (upgradePublishedRuntimeSnapshot),
  * run in a short-lived worker thread so the extension host's main thread never blocks on it.
  *
  * POSIX lock rule (see runtimeSnapshotAudit): the worker opens only the private copy, and the caller

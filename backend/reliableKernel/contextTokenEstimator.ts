@@ -1,4 +1,5 @@
 import { modelRequestObservedUsage } from '../../shared/modelRequestMeasurement';
+import { logicalMessageContentType } from './logicalMessageContent';
 import { needsSingleResponseMeasurement } from './singleResponseMeasurement';
 import { providerRequestToolDefinitions } from './frozenToolDefinitions';
 import type { ReliableAgentToolDefinition } from './agentLoop';
@@ -316,7 +317,7 @@ export function estimateMaterializedContextTokens(
     segmentId: segment.segmentId,
     segmentKind: segment.segmentKind,
     messageRole: segment.messageRole,
-    contentType: segment.contentObject.content_type,
+    contentType: logicalMessageContentType(segment.contentObject.content_type),
     content: estimateSegmentText(segment)
   })), attachmentCatalogState, modelHandleCatalog);
   const compressed = compressionEstimate(segments);
@@ -325,7 +326,7 @@ export function estimateMaterializedContextTokens(
     segmentId: segments[0].segmentId,
     segmentKind: segments[0].segmentKind,
     messageRole: segments[0].messageRole,
-    contentType: segments[0].contentObject.content_type,
+    contentType: logicalMessageContentType(segments[0].contentObject.content_type),
     content: estimateSegmentText(segments[0])
   }]).tokenCount;
   // A stored estimate may count rendered state the projection does not, but it never undercuts what
@@ -342,7 +343,7 @@ export function estimateContextSegmentTokens(segment: Pick<
   'segmentKind' | 'messageRole' | 'contentObject' | 'content'
 >): number {
   const content = segment.content.toString('utf8');
-  const contentType = segment.contentObject.content_type;
+  const contentType = logicalMessageContentType(segment.contentObject.content_type);
   if (segment.segmentKind === 'tool_pair' || contentType === CONTENT_TYPE_TOOL_PAIR) {
     return estimateToolPairContentTokens(content);
   }

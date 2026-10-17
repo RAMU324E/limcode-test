@@ -73,6 +73,8 @@ import type { LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { MergeAggregatePreflight } from './runtimeMergeAggregatePreflight';
 import { MergeContextHandleStates,type MergeContextHandleStateUpdate } from './runtimeMergeContextHandleStates';
 import { RuntimeMergeConversationExclusions } from './runtimeMergeConversationExclusions';
+import { RUNTIME_MERGE_SYSTEM_CONTENT_TYPES, runtimeMergeRecipeContentReferences,
+  runtimeMergeSystemContentReferences } from './runtimeMergeConversationOwnership';
 import { RuntimeMergeSettlementBatch,type RuntimeMergeSettlementRequest } from './runtimeMergeSettlementBatch';
 import {
 findRuntimeIdentityOwner,readRuntimeDeletedConversations,readRuntimeIdentityAliases,readRuntimeMergeTargetIdentities,
@@ -347,7 +349,7 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   /** A previous commit was found through its exact id set; rows were not merged again. */
   recoveredCommit: boolean;
   /** The source was upgraded from a published predecessor immediately before merging. */
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   /**
    * Unfinished work closed before the merge (source backup kept beside the source): Turns ended as
    * cancelled or interrupted and queued, unsent user messages cancelled, as counted in the source.
@@ -1375,7 +1377,7 @@ interface SourceProgress {
    */
   files?: string;
   fingerprint?: RuntimeDataSetFingerprint;
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   /**
    * Unfinished work was (being) closed in the source; `complete` once every transition succeeded.
    * `earlier`: closed by an earlier attempt whose outcome did not say so (none in this attempt).
@@ -1554,7 +1556,7 @@ async function mergeSource(
     const limits = options.limits ?? RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
     stopIfAsked();
     const historicalPlan = (): Promise<RowPlan> => planSource(taken.snapshot.database, target, merged, state,
-      exclusions => indexSourceRecipeReferences(candidate, binding, taken.snapshot, exclusions, options.signal));
+      exclusions => indexSourceContentReferences(candidate, binding, taken.snapshot, exclusions, options.signal));
     let plan = mode.migration ? await planRows(taken.snapshot.database, target.database, await skippedSourceRows(taken.snapshot.database, target, merged, state))
       : await historicalPlan();
     if (mode.finalizeWork) {
@@ -1600,7 +1602,7 @@ async function mergeSource(
       stopIfAsked();
       plan = await historicalPlan();
       // Settlement can create new bodies; reuse the verification cache for unchanged ones while
-      // restoring recipe edges and any pre-existing missing-body exclusions on the new snapshot.
+      // restoring descriptor edges and any pre-existing missing-body exclusions on the new snapshot.
       await transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, true, state.exclusions);
       await state.exclusions!.finish(READ_CHUNK);
       const afterSettlement = state.exclusions!.excluded();
@@ -1898,10 +1900,10 @@ async function resolveSource(
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这份旧数据有未完成的归档或根切换恢复，暂时不能合并；可以只读查看，恢复完成后重试。' });
   }
   const epoch = candidate.runtimeKernelEpoch;
-  if ((epoch === 3 || epoch === 4 || epoch === 5) && mode.readOnly) {
+  if ((epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6) && mode.readOnly) {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-upgrade-pending', message: '这份旧聊天记录还是已发布的旧格式，启动时会先在后台升级，之后才能估计。' });
   }
-  if (epoch === 3 || epoch === 4 || epoch === 5) {
+  if (epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6) {
     const upgrade = await upgradeRuntimeDataSet(paths, {
       candidateId, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
     }).catch(async (error: unknown) => {
@@ -2798,8 +2800,8 @@ PickedSource as HistoricalMergePickedSource,Refusal as HistoricalMergeRefusal,Ro
 SourceProgress as HistoricalMergeSourceProgress,SourceRef as HistoricalMergeSourceRef,TargetContext as HistoricalMergeTargetContext
 };
 
-/** The row pre-scan records embedded references even when their request will be left out. */
-async function indexSourceRecipeReferences(
+/** The row pre-scan records contracted CAS edges even when one producer will be left out. */
+async function indexSourceContentReferences(
   candidate: HistoricalMergeCandidate,
   binding: HistoricalRootBinding,
   source: HistoricalCasSnapshot,
@@ -2808,42 +2810,78 @@ async function indexSourceRecipeReferences(
 ): Promise<void> {
   const sourceSignal = isForeignCandidate(candidate) ? candidate.hold.signal : undefined;
   if (sourceSignal) signal = signal && signal !== sourceSignal ? AbortSignal.any([signal, sourceSignal]) : sourceSignal;
-  const recipes = source.database.prepare(`SELECT request.id, object.storage_key, object.sha256, object.byte_length
-    FROM model_request request JOIN content_object object ON object.id=request.recipe_object_id`);
-  const objects = isForeignCandidate(candidate) ? candidate.hold.objects(candidate) : undefined;
-  let count = 0;
-  for (const row of recipes.iterate() as Iterable<{id:string;storage_key:string;sha256:string;byte_length:bigint}>) {
-    signal?.throwIfAborted();
-    if (++count % READ_CHUNK === 0) await new Promise(resolve => setImmediate(resolve));
-    try {
-      const object = requireCasObjectIdentity(row);
-      let bytes = await (objects?.readPackedBytes?.(object) ?? source.packedCas?.readBytes(object));
-      if (!bytes) {
-        const handle = objects ? await objects.open(object)
-          : await fs.open(looseCasObjectLocation(binding.paths.casRootPath, object).absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
-        try {
-          const chunks: Buffer[] = [];
-          for (;;) {
-            signal?.throwIfAborted();
-            const chunk = Buffer.alloc(64 * 1024);
-            const read = await handle.read(chunk, 0, chunk.length, null);
-            if (!read.bytesRead) break;
-            chunks.push(chunk.subarray(0, read.bytesRead));
-          }
-          bytes = Buffer.concat(chunks);
-        } finally { await handle.close(); }
-      }
-      exclusions.observeRecipe('ModelRequest', row.id, JSON.parse(bytes.toString('utf8')));
-    } catch (error) {
+  await inspectSourceContentReferences(source.database, binding, { signal, exclusions,
+    sourceObjects: isForeignCandidate(candidate) ? candidate.hold.objects(candidate) : undefined,
+    sourcePacked: source.packedCas });
+}
+
+/** Shared by historical merge and whole-root copy; no arbitrary content body is a graph source. */
+async function inspectSourceContentReferences(source: Database.Database, binding: HistoricalRootBinding, options: {
+  signal?: AbortSignal; exclusions?: RuntimeMergeConversationExclusions;
+  sourceObjects?: CasTransferSource; sourceAccess?: CasStoreAccess; sourcePacked?: CasPackedSource;
+}): Promise<void> {
+  const { signal, exclusions } = options;
+  const placeholders = RUNTIME_MERGE_SYSTEM_CONTENT_TYPES.map(() => '?').join(',');
+  const page = source.prepare(`SELECT rowid AS position,id,content_type,storage_key,sha256,byte_length FROM content_object
+    WHERE rowid>? AND (content_type IN (${placeholders}) OR id IN (SELECT recipe_object_id FROM model_request))
+    ORDER BY rowid LIMIT ${READ_CHUNK}`);
+  const registered = source.prepare('SELECT 1 FROM content_object WHERE id=?');
+  const problem = (id: string, code: string, message: string): void => {
+    if (exclusions) exclusions.contentProblem(id, code);
+    else throw new Outcome({ kind: 'failed', code, message });
+  };
+  for (let after = 0n;;) {
+    const rows = page.all(after, ...RUNTIME_MERGE_SYSTEM_CONTENT_TYPES) as Array<{
+      position: bigint; id: string; content_type: string; storage_key: string; sha256: string; byte_length: bigint;
+    }>;
+    if (!rows.length) break;
+    after = rows[rows.length - 1].position;
+    for (const row of rows) {
       signal?.throwIfAborted();
-      // The ordinary CAS transfer below supplies the source/target distinction and refusal.
-      // A malformed recipe is attributed to its request without parsing arbitrary other bodies.
-      if (error instanceof SyntaxError) {
-        const raw = source.database.prepare('SELECT * FROM model_request WHERE id=?').get(row.id) as Record<string,unknown>;
-        exclusions.exclude('ModelRequest', raw, 'runtime-data-set-merge-source-row-invalid');
+      let bytes: Buffer | undefined;
+      try {
+        const object = requireCasObjectIdentity(row);
+        const objects = options.sourceObjects;
+        bytes = objects ? await objects.readPackedBytes?.(object)
+          : options.sourceAccess ? await options.sourceAccess.readBytes(object) : await options.sourcePacked?.readBytes(object);
+        if (!bytes) {
+          const handle = objects ? await objects.open(object)
+            : await fs.open(looseCasObjectLocation(binding.paths.casRootPath, object).absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try {
+            const chunks: Buffer[] = [];
+            for (;;) {
+              signal?.throwIfAborted();
+              const chunk = Buffer.alloc(64 * 1024);
+              const read = await handle.read(chunk, 0, chunk.length, null);
+              if (!read.bytesRead) break;
+              chunks.push(chunk.subarray(0, read.bytesRead));
+            }
+            bytes = Buffer.concat(chunks);
+          } finally { await handle.close(); }
+        }
+      } catch {
+        signal?.throwIfAborted();
+        // Source/target byte failures still belong to the existing CAS transfer boundary below.
+        continue;
+      }
+      let references: readonly string[];
+      try {
+        const value: unknown = JSON.parse(bytes.toString('utf8'));
+        // Published inline recipes also used application/json, selected only by their owning row.
+        references = runtimeMergeSystemContentReferences(row.content_type, value)
+          ?? [...runtimeMergeRecipeContentReferences(value)];
+      } catch {
+        problem(row.id, 'runtime-data-set-merge-source-row-invalid', `来源系统正文描述无效：${row.id}。`);
+        continue;
+      }
+      exclusions?.observeContentReferences(row.id, references);
+      for (const id of references) if (!registered.get(id)) {
+        problem(id, 'runtime-data-set-merge-source-cas-invalid', `来源系统正文引用未登记的 CAS 对象：${id}。`);
       }
     }
+    await new Promise<void>(resolve => setImmediate(resolve));
   }
+  await exclusions?.finishContentReferences(READ_CHUNK);
 }
 
 async function transferSourceCas(
@@ -2950,7 +2988,7 @@ async function planSource(
   target: TargetContext,
   merged: readonly string[],
   state: SourceProgress,
-  indexRecipes?: (exclusions: RuntimeMergeConversationExclusions) => Promise<void>
+  indexContent?: (exclusions: RuntimeMergeConversationExclusions) => Promise<void>
 ): Promise<RowPlan> {
   const deleted = merged.length > 0 ? await deletedSinceMerge(source, target.database, merged) : undefined;
   state.skippedConversations = deleted?.count ?? 0;
@@ -2966,7 +3004,7 @@ async function planSource(
       if (!skipped?.get('Conversation')?.has(id)) state.exclusions.exclude('Conversation', { id }, 'runtime-data-set-merge-unfinished-work');
     }
     const first = await planRows(source, target.database, skipped, state.exclusions, true);
-    await indexRecipes?.(state.exclusions);
+    await indexContent?.(state.exclusions);
     if (!state.exclusions.hasExclusions()) { prepareSettlement(source, state); return first; }
     await state.exclusions.finish(READ_CHUNK);
     state.excluded = state.exclusions.excluded();
@@ -3713,6 +3751,7 @@ async function transferCas(
   const targetCas = path.resolve(targetBinding.paths.casRootPath);
   await assertNoSymbolicPath(sourceConfigurationRootPath, sourceCas);
   await assertNoSymbolicPath(targetConfigurationRootPath, targetCas);
+  if (!options.exclusions) await inspectSourceContentReferences(source, sourceBinding, options);
   // Streamed in rowid pages (no GROUP BY sort, no whole result on this thread): a storage key is
   // handled once, and every row of it must name the same length.
   const page = source.prepare(`
@@ -4181,7 +4220,7 @@ export interface RuntimeDataSetMigrationSource {
   /** Exact SQLite file state of the source the snapshot was taken from. */
   files: string;
   rows: number;
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   close(): Promise<void>;
 }
 
@@ -4286,7 +4325,7 @@ export function runtimeDataSetCopyRow(domain: string, raw: Record<string, unknow
  * The error a caller of the copy sees: a source refusal as RuntimeDataSetMergeError (code and
  * user-facing message, with the in-place upgrade noted); a cancellation and anything else unchanged.
  */
-export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 }): unknown {
+export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 | 6 }): unknown {
   if (error instanceof RuntimeDataSetMergeError || (error instanceof Error && error.name === 'AbortError')) return error;
   if (!(error instanceof Outcome) && !(error instanceof StopRequested) && !isRuntimeHostsActiveError(error) && !isRuntimeDataInvariant(error)) return error;
   const outcome = sourceOutcome(error, state);
@@ -4306,7 +4345,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   rememberFinalized, prepareSettlement, settlementSkippedConversationIds, completeHistoricalMerge, invariantRefusal, mergeTargetVersion, MERGE_DOMAIN_ORDER, IDENTITY_MERGE_DIFFERENCES, SKIPPED_WITH, SKIPPED_WITH_MEMBERS, MAX_REPORTED_CONFLICTS, READ_CHUNK,
   BACKUP_FREE_SPACE_MARGIN_BYTES, Outcome, StopRequested, MergedMeanwhile,
   targetContext, pickSources, runSourceAttempt, settledSource, resolveSource, recordedConversations, takeVerifiedSnapshot, withLocalPackedSnapshot,
-  countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, keptUnfinishedWork, indexSourceRecipeReferences, transferSourceCas, finalizeSource,
+  countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, keptUnfinishedWork, indexSourceContentReferences, transferSourceCas, finalizeSource,
   cachedAudit, auditFacts,
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, assertNoCommitElsewhere, mergeReadSql, sourceRow, errorCode, errorMessage,

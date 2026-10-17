@@ -1519,7 +1519,7 @@ export function useChat() {
   function reconcileCurrentTurnInputs(): void {
     const feed = reliableConversation.feed;
     reconcileTurnInputSubmissions(reliableRecords.value, feed.details, reliableConversation.conversationId.value,
-      feed.historyConversationId === reliableConversation.conversationId.value ? feed.historyRecords.Message ?? {} : {},
+      feed.committedRecords.Message ?? {},
       feed.snapshotRequired, feed.removedConversationIds);
   }
   /** Exact non-withdrawn input identities: persistence can recognize their unchanged submitted drafts. */

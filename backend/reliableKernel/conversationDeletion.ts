@@ -14,6 +14,8 @@ import { runtimeDeliveryInjectionSteps } from './answerDelivery';
 import type { ContentAddressedStore } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { CHILD_TURN_ANSWER_WAIT_OWNER_KIND, LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND } from './childExecution';
+import { ConversationDeletionBlockedError } from './conversationDeletionErrors';
+export { ConversationDeletionBlockedError } from './conversationDeletionErrors';
 
 export interface ConversationDeleteResult {
   deletedConversationIds: string[];
@@ -78,16 +80,6 @@ export interface ConversationDeletionInventory {
   work: ConversationDeletionWorkItem[];
 }
 
-/** The scope still has live work; the deletion command stops it first (conversationDeleteCommand). */
-export class ConversationDeletionBlockedError extends Error {
-  public readonly code = 'conversation-deletion-blocked';
-
-  public constructor(message: string) {
-    super(message);
-    this.name = 'ConversationDeletionBlockedError';
-  }
-}
-
 export function isConversationDeletionBlockedError(error: unknown): error is ConversationDeletionBlockedError {
   return error instanceof ConversationDeletionBlockedError
     || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'conversation-deletion-blocked');
@@ -105,6 +97,7 @@ interface ConversationDeletionSnapshot {
   childTurnLinks: DomainRow[];
   parentLinks: DomainRow[];
   parentWaits: DomainRow[];
+  continuationWaits: Array<{ operation: DomainRow; childExecutionId: string }>;
   executingToolCalls: DomainRow[];
   queuedIntents: Array<{ intent: DomainRow; revisionSeq: string }>;
   /** RuntimeDelivery rows addressed to the scope, every state. */
@@ -313,6 +306,8 @@ export class ConversationDeletionControlPlane {
     const scopeChildIds = new Set(snapshot.childExecutions.map((row) => String(row.id)));
     const childByConversation = new Map(snapshot.childExecutions.map((row) => [String(row.child_conversation_id), String(row.id)]));
     const childByTurn = new Map(snapshot.childTurnLinks.map((row) => [String(row.turn_id), String(row.child_execution_id)]));
+    const childByContinuationWait = new Map(snapshot.continuationWaits.map(({ operation, childExecutionId }) =>
+      [String(operation.id), childExecutionId]));
     const conversationOfChild = new Map(snapshot.childExecutions.map((row) => [String(row.id), String(row.child_conversation_id)]));
     const leaseByTurn = new Map(snapshot.leases.map((row) => [String(row.turn_id), row]));
     const toolsByTurn = new Map<string, string[]>();
@@ -358,11 +353,11 @@ export class ConversationDeletionControlPlane {
       work.push({ kind: 'child_continuation', conversationId: conversationOfChild.get(childExecutionId)!, id: String(link.turn_intent_id), childExecutionId });
     }
     for (const wait of snapshot.parentWaits) {
-      const childExecutionId = wait.owner_kind === CHILD_FOREGROUND_WAIT_OWNER_KIND
+      const childExecutionId = childByContinuationWait.get(String(wait.id)) ?? (wait.owner_kind === CHILD_FOREGROUND_WAIT_OWNER_KIND
         ? String(wait.owner_id)
         : wait.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND
           ? childByTurn.get(String(wait.owner_id))
-          : snapshot.answerBridges.find((bridge) => bridge.id === wait.owner_id)?.child_execution_id as string | undefined;
+          : snapshot.answerBridges.find((bridge) => bridge.id === wait.owner_id)?.child_execution_id as string | undefined);
       if (!childExecutionId || !scopeChildIds.has(childExecutionId)) continue;
       work.push({ kind: 'parent_wait', conversationId: conversationOfChild.get(childExecutionId)!, id: String(wait.id), childExecutionId });
     }
@@ -496,24 +491,27 @@ export class ConversationDeletionControlPlane {
         perConversation('TurnIntent', 'conversation_id', { state: 'queued' })
       ]);
     const activeTurnIds = targetTurns.filter((row) => row.status === 'active').map((row) => String(row.id));
-    const [parentWaits, executingToolCalls, queuedIntents, answerSubmissions] = await Promise.all([
+    const [directParentWaits, continuationWaitGroups, executingToolCalls, queuedIntents, answerSubmissions] = await Promise.all([
       Promise.all([
         ...[...targetChildExecutionIds].map((ownerId) => listAllDomainRows(this.database, 'Operation', {
           owner_kind: CHILD_FOREGROUND_WAIT_OWNER_KIND, owner_id: ownerId, status: 'waiting_answer'
-        })),
-        ...childTurnLinks.map((link) => listAllDomainRows(this.database, 'Operation', {
-          owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND, owner_id: String(link.turn_id), status: 'waiting_answer'
         })),
         ...answerBridges.map((bridge) => listAllDomainRows(this.database, 'Operation', {
           owner_kind: LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND, owner_id: String(bridge.id), status: 'waiting_answer'
         }))
       ]).then((rows) => rows.flat()),
+      Promise.all([...targetChildExecutionIds].map(async (childExecutionId) => {
+        const facts = (await this.database.childContinuationWaitFacts({ childExecutionId, status: 'waiting_answer' })).snapshot;
+        return facts.operations.map((operation) => ({ operation, childExecutionId }));
+      })),
       Promise.all(activeTurnIds.map((turnId) => listAllDomainRows(this.database, 'ToolCall', { turn_id: turnId, status: 'executing' })))
         .then((rows) => rows.flat()),
       this.queuedMessages(queued.filter((intent) => intent.turn_id === null)),
       Promise.all(answerBridges.map((bridge) => listAllDomainRows(this.database, 'AnswerSubmission', { answer_bridge_id: String(bridge.id) })))
         .then((rows) => rows.flat())
     ]);
+    const continuationWaits = continuationWaitGroups.flat();
+    const parentWaits = [...directParentWaits, ...continuationWaits.map(({ operation }) => operation)];
     const answerInboxItems = (await Promise.all(answerSubmissions.map((submission) => listAllDomainRows(this.database, 'RuntimeInboxItem', {
       source_kind: 'answer_submission', source_id: String(submission.id)
     })))).flat();
@@ -613,6 +611,7 @@ export class ConversationDeletionControlPlane {
       childTurnLinks,
       parentLinks,
       parentWaits,
+      continuationWaits,
       executingToolCalls,
       queuedIntents,
       deliveries: targetDeliveries,

@@ -82,6 +82,7 @@
       "file_change_set",
       "process",
       "child_execution",
+      "child_intent_answer_wait",
       "child_turn_answer_wait",
       "answer_bridge_wait",
       "model_request"
@@ -91,7 +92,7 @@
       "tool_call_id",
       "status"
     ],
-    "rule": "Operation 按具体协议归属所有者；子代理 spawn 归属稳定 ChildExecution，continuation answer wait 归属确定性的 child_turn_answer_wait/child Turn generation；answer_bridge_wait 仅用于精确恢复既有 legacy 记录，不再写入。tool_call_id 普通索引用于汇聚该 ToolCall 下全部 Operation 以触发 ToolOutcome。"
+    "rule": "Operation 按具体协议归属所有者；子代理 spawn 归属稳定 ChildExecution，continuation answer wait 使用 child_intent_answer_wait 直接归属确切 TurnIntent，准入后由该 Intent 的实际 Turn 限定答复代际。已发布 child_turn_answer_wait 和 answer_bridge_wait 保留确切读取与恢复，新写入不再使用。tool_call_id 普通索引用于汇聚该 ToolCall 下全部 Operation 以触发 ToolOutcome。"
   },
   "effectIntent": {
     "effectKinds": [

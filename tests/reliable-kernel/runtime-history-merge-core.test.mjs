@@ -231,6 +231,130 @@ test('来源坏正文局部剔除，目标已有坏正文保持原字节', async
   } finally { await fs.writeFile(targetFile, valid); }
 });
 
+test('C5 缺共享目录块沿根和 native proof 的 CAS 依赖闭包形成 partial', async t => {
+  const catalogStorage = load('contextHandleCatalogStorage.js');
+  const { NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE } = load('nativeToolFacts.js');
+  const { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION } = load('modelHandleCatalog.js');
+  for (const missing of ['body', 'registration']) await t.test(missing, async () => {
+    const prefix = `catalog_${missing}`;
+    const source = await home.source(prefix);
+    const rootOwner = prefix + '_root', proofOwner = prefix + '_proof', safe = prefix + '_safe';
+    await seed(source, [{ id: rootOwner }, { id: proofOwner }, { id: safe }]);
+    const block = await content(source, JSON.stringify({ kind: 'context-handle-catalog-block',
+      previousBlockContentObjectId: null, operations: [{ kind: 'bind', entry: {
+        kind: 'process', ref: 'P4', target: prefix + '_original_process' } }] }), catalogStorage.CONTEXT_HANDLE_CATALOG_BLOCK_CONTENT_TYPE);
+    const rootValue = conversationId => ({ kind: 'context-handle-catalog', conversationId,
+      identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+      tailBlockContentObjectId: block.id, allocationHighWater: {} });
+    const oldBase = await content(source, JSON.stringify(rootValue(prefix + '_deleted_producer')), catalogStorage.CONTEXT_HANDLE_CATALOG_CONTENT_TYPE);
+    const root = await content(source, JSON.stringify(rootValue(rootOwner)), catalogStorage.CONTEXT_HANDLE_CATALOG_CONTENT_TYPE);
+    const privateRoot = await content(source, JSON.stringify({ kind: 'native-private-handle-catalog', conversationId: proofOwner,
+      baseContentObjectId: oldBase.id, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+      tailBlockContentObjectId: null, allocationHighWater: {} }), catalogStorage.NATIVE_PRIVATE_HANDLE_CATALOG_CONTENT_TYPE);
+    const requestId = prefix + '_request';
+    await aggregate(source, proofOwner, requestId, { checkpoints: 1 });
+    const proof = await content(source, JSON.stringify({ kind: 'native_tool_call', content: {
+      type: 'native_tool_call', responseId: 'response', toolName: 'bash', providerCallId: 'call', providerOrdinal: 0, async: true,
+      arguments: { mode: 'output', processRef: 'P4' }, resolvedArguments: { mode: 'output', processId: prefix + '_original_process' },
+      modelHandleCatalogContentObjectId: privateRoot.id } }), NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE);
+    // An arbitrary user body with descriptor-looking keys is not a CAS dependency source.
+    const userJson = await content(source, JSON.stringify({ kind: 'context-handle-catalog',
+      tailBlockContentObjectId: 'not-a-system-reference' }), 'application/json');
+    raw(source, database => {
+      insert(database, 'ConversationContextHandleState', { ...emptyConversationContextHandleStateStep(rootOwner, NOW).row,
+        revision: 1n, content_object_id: root.id });
+      database.prepare('UPDATE model_stream_checkpoint SET checkpoint_kind=?,content_object_id=? WHERE id=?')
+        .run('native_tool_call', proof.id, `${requestId}_checkpoint_1`);
+      insertMessage(database, safe, userJson);
+      if (missing === 'registration') database.prepare('DELETE FROM content_object WHERE id=?').run(block.id);
+    });
+    if (missing === 'body') await fs.rm(loosePath(source.binding, block));
+    const report = await merge(home, [source]);
+    clean(report);
+    assert.deepEqual(report.merged[0].excluded.map(row => [row.conversationId, row.code]).sort(),
+      [rootOwner, proofOwner].sort().map(id => [id, 'runtime-data-set-merge-source-cas-invalid']));
+    assert.equal(await get('Conversation', rootOwner), null);
+    assert.equal(await get('Conversation', proofOwner), null);
+    assert.ok(await get('Conversation', safe));
+    assert.equal((await ledger(home, source)).state, 'partial');
+  });
+});
+
+test('已删除会话独占的坏目录依赖按删除闭包跳过，健康增量继续合并', async () => {
+  const source = await home.source('deleted-catalog-reference');
+  const owner = 'deleted_catalog_owner', increment = 'deleted_catalog_increment';
+  await seed(source, [{ id: owner }]);
+  const catalogStorage = load('contextHandleCatalogStorage.js');
+  const block = await content(source, JSON.stringify({ kind: 'context-handle-catalog-block',
+    previousBlockContentObjectId: null, operations: [{ kind: 'bind', entry: {
+      kind: 'process', ref: 'P1', target: 'deleted_catalog_process' } }] }), catalogStorage.CONTEXT_HANDLE_CATALOG_BLOCK_CONTENT_TYPE);
+  const root = await content(source, JSON.stringify({ kind: 'context-handle-catalog', conversationId: owner,
+    identityContractRevision: load('modelHandleCatalog.js').CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+    tailBlockContentObjectId: block.id, allocationHighWater: {} }), catalogStorage.CONTEXT_HANDLE_CATALOG_CONTENT_TYPE);
+  raw(source, database => insert(database, 'ConversationContextHandleState', {
+    ...emptyConversationContextHandleStateStep(owner, NOW).row, revision: 1n, content_object_id: root.id
+  }));
+  clean(await merge(home, [source]));
+  await new ConversationDeletionControlPlane(home.database).delete(owner);
+  await seed(source, [{ id: increment }]);
+  raw(source, database => database.prepare('DELETE FROM content_object WHERE id=?').run(block.id));
+
+  const report = await merge(home, [source]);
+  clean(report);
+  assert.equal(report.merged[0].skippedConversations, 1);
+  assert.equal(report.merged[0].insertedConversations, 1);
+  assert.deepEqual(report.merged[0].excluded ?? [], []);
+  assert.equal(await get('Conversation', owner), null);
+  assert.ok(await get('Conversation', increment));
+});
+
+test('没有实际归属的坏系统正文依赖仍拒绝合并', async () => {
+  const source = await home.source('unattributed-catalog-reference');
+  await seed(source, [{ id: 'unattributed_catalog_safe' }]);
+  const catalogStorage = load('contextHandleCatalogStorage.js');
+  await content(source, JSON.stringify({ kind: 'context-handle-catalog', conversationId: 'absent_catalog_owner',
+    identityContractRevision: load('modelHandleCatalog.js').CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+    tailBlockContentObjectId: 'unregistered_catalog_block', allocationHighWater: {} }), catalogStorage.CONTEXT_HANDLE_CATALOG_CONTENT_TYPE);
+
+  const report = await merge(home, [source]);
+  assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-unattributed');
+  assert.equal(report.merged.length, 0);
+  assert.equal(await get('Conversation', 'unattributed_catalog_safe'), null);
+});
+
+test('C5 整库复制后删除 producer 仍按目标目录根读取共享前缀', async () => {
+  const source = await home.source('catalog-copy');
+  await seed(source, [{ id: 'catalog_copy_producer' }, { id: 'catalog_copy_survivor' }]);
+  const catalog = { ...emptyContextHandleCatalog(), entries: Array.from({ length: 65 }, (_, index) => ({
+    kind: 'process', ref: `P${index + 1}`, target: `catalog-copy-process-${index + 1}` })) };
+  const sourceDatabase = await kernel.RuntimeDatabase.open(source.authority);
+  let producerContentId, survivorContentId;
+  try {
+    const store = kernel.ContentAddressedStore.forDatabase(source.authority, sourceDatabase);
+    await sourceDatabase.transaction(await prepareReadyConversationContextHandleState({ database: sourceDatabase, contentStore: store,
+      conversationId: 'catalog_copy_producer', catalog, requiresNativeReset: false, now: NOW }));
+    const producer = await readCurrentConversationContextHandleState(sourceDatabase, store, 'catalog_copy_producer');
+    await sourceDatabase.transaction(await prepareReadyConversationContextHandleState({ database: sourceDatabase, contentStore: store,
+      conversationId: 'catalog_copy_survivor', catalog: producer.catalog, requiresNativeReset: false, now: NOW }));
+    const survivor = await readCurrentConversationContextHandleState(sourceDatabase, store, 'catalog_copy_survivor');
+    producerContentId = producer.row.content_object_id; survivorContentId = survivor.row.content_object_id;
+    const content = async id => JSON.parse((await store.read((await sourceDatabase.snapshot([repo('ContentObject').get(id)])).snapshot[0])).toString());
+    assert.notEqual(producerContentId, survivorContentId);
+    assert.equal((await content(producerContentId)).tailBlockContentObjectId, (await content(survivorContentId)).tailBlockContentObjectId);
+  } finally { await sourceDatabase.close(); }
+  const destination = await target(home, 'catalog-copy-target');
+  await copy(home, source, destination, { batchRows: 7 });
+  const copied = await kernel.RuntimeDatabase.open(destination.dataSet.authority);
+  try {
+    await new ConversationDeletionControlPlane(copied).delete('catalog_copy_producer');
+    const store = kernel.ContentAddressedStore.forDatabase(destination.dataSet.authority, copied);
+    const survivor = await readCurrentConversationContextHandleState(copied, store, 'catalog_copy_survivor');
+    assert.deepEqual(survivor.catalog, catalog);
+    assert.equal(survivor.row.content_object_id, survivorContentId);
+    assert.ok((await copied.snapshot([repo('ContentObject').get(producerContentId)])).snapshot[0], 'CAS survives producer row deletion');
+  } finally { await copied.close(); }
+});
+
 test('规划后来源改变使过期计划推迟，下次导入新的内容', async () => {
   const source = await home.source('source-fence');
   await seed(source, [{ id: 'fence_original' }]);

@@ -1,0 +1,46 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.parent-handling-matrix",
+  "stableId": "candidate.parent-handling-matrix",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T10:17:51.260Z",
+  "assertionCount": 3,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "5d344fdf3a880d1c34e784b051002b48de031afe14105394cee38893e9451f28",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "008b012c5869cfad313407aa67cb16898abf0b86988a74e88b01a78df624333c",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.parent-handling-matrix"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "parentHandling完整precedence矩阵逐组合由Repository函数验证，非法consumed current/next无InputLink被拒绝",
+    "真实SQLite delivery覆盖pending/failed、notify consumed、current consumed未处理/已处理，且无关input不影响结果",
+    "前端只读取commit/Repository物化的parent_handling_state，不在Webview自行推导"
+  ],
+  "faults": [
+    "unrelated PendingTurnInput consumed before exact delivery input"
+  ],
+  "metrics": {
+    "matrixCases": 6,
+    "projectedState": "not_applicable"
+  }
+}

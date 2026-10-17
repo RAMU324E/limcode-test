@@ -1,4 +1,5 @@
 import { NATIVE_STEERING_IN_FLIGHT_STATES, type NativeSteeringInFlightEntry } from './nativeWorkTypes';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
 import {
@@ -16,7 +17,7 @@ import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
-import { listAllDomainRows } from './repositoryPagination';
+import type { NativeSteeringReceiptScope } from './conversationCurrentWorkSnapshot';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 /** PendingTurnInput.input_kind for Astra native steering submissions. */
@@ -73,6 +74,7 @@ const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
  */
 export class NativeSteeringStore {
   private readonly context: ContextSequenceControlPlane;
+  private readonly messageContents: LogicalMessageContentReader;
   private readonly now: () => string;
   private readonly attachments?: AttachmentIngestService;
 
@@ -84,6 +86,7 @@ export class NativeSteeringStore {
     this.now = options.now ?? (() => new Date().toISOString());
     this.attachments = options.attachments;
     this.context = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
   }
 
   /**
@@ -332,7 +335,7 @@ export class NativeSteeringStore {
       'ContentObject',
       requireId(revision.content_object_id, 'Native steering MessageRevision.content_object_id')
     ) as unknown as ContentObjectMetadata;
-    const content = await this.contentStore.read(metadata);
+    const content = await this.messageContents.read(metadata);
     const nextEnvelope: NativeSteerEnvelope = {
       ...existing.envelope,
       ...(input.responseId
@@ -350,8 +353,8 @@ export class NativeSteeringStore {
       messageRevisionId: revisionId,
       existingRevisionSeq: BigInt(String(revision.revision_seq)),
       contentObjectId: metadata.id,
-      contentByteLength: metadata.byte_length,
-      contentEstimatedTokens: estimateStoredMessageContentTokens(content, metadata.content_type)
+      contentByteLength: BigInt(content.byteLength),
+      contentEstimatedTokens: estimateStoredMessageContentTokens(content, logicalMessageContentType(metadata.content_type))
     });
     const now = this.now();
     await this.database.transaction([
@@ -376,31 +379,20 @@ export class NativeSteeringStore {
   }
 
   public async receiptsForTurn(turnIdInput: string): Promise<NativeSteeringReceipt[]> {
-    const turnId = requireId(turnIdInput, 'turnId');
-    const rows = await listAllDomainRows(this.database, 'PendingTurnInput', {
-      turn_id: turnId,
-      input_kind: NATIVE_STEER_INPUT_KIND
-    });
-    const receipts: NativeSteeringReceipt[] = [];
-    for (const row of rows.sort((left, right) =>
-      String(left.created_at).localeCompare(String(right.created_at))
-      || String(left.id).localeCompare(String(right.id))
-    )) {
-      receipts.push(nativeSteeringReceipt(row, await this.readEnvelope(row)));
-    }
-    return receipts;
+    return this.readReceipts({ turnId: requireId(turnIdInput, 'turnId') });
   }
 
   public async receiptsForConversation(conversationIdInput: string): Promise<NativeSteeringReceipt[]> {
-    const conversationId = requireId(conversationIdInput, 'conversationId');
-    const turns = (await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId }))
-      .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
-    const receipts: NativeSteeringReceipt[] = [];
-    for (const turn of turns) {
-      // Each Turn's receipts are already oldest-first; Turn order preserves conversation chronology.
-      receipts.push(...await this.receiptsForTurn(requireId(turn.id, 'Turn.id')));
-    }
-    return receipts;
+    return this.readReceipts({ conversationId: requireId(conversationIdInput, 'conversationId') });
+  }
+
+  private async readReceipts(scope: NativeSteeringReceiptScope): Promise<NativeSteeringReceipt[]> {
+    const { inputs, contentObjects } = (await this.database.nativeSteeringReceipts(scope)).snapshot;
+    if (inputs.length === 0) return [];
+    const bytes = await this.contentStore.readMany(contentObjects as unknown as ContentObjectMetadata[]);
+    const envelopes = new Map(contentObjects.map((metadata, index) => [metadata.id,
+      parseNativeSteerEnvelope(normalizePlainJson(JSON.parse(bytes[index].toString('utf8')), 'Native steering envelope'))]));
+    return inputs.map(row => nativeSteeringReceipt(row, envelopes.get(row.content_object_id)!));
   }
 
   private async readEnvelope(row: DomainRow): Promise<NativeSteerEnvelope> {

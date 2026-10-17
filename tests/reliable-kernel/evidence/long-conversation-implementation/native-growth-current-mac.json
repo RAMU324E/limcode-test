@@ -1,0 +1,250 @@
+{
+  "kind": "limcode-native-output-growth",
+  "measuredAt": "2026-10-17T07:44:16.547Z",
+  "node": "v24.15.0",
+  "platform": "darwin/arm64",
+  "itemBytes": 2048,
+  "rows": [
+    {
+      "items": 20,
+      "driveMs": 148.909,
+      "messageRevisions": {
+        "item": 20,
+        "cumulative": 20,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 88,
+      "newCasFiles": 2,
+      "newCasPhysicalBytes": 85287,
+      "newCasAllocatedBytes": 90112,
+      "byContentType": {
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 24,
+          "logicalBytes": 48276
+        },
+        "application/vnd.limcode.native-message-block+json": {
+          "objects": 20,
+          "logicalBytes": 59710
+        },
+        "application/vnd.limcode.native-message-composition+json": {
+          "objects": 20,
+          "logicalBytes": 4063
+        },
+        "application/vnd.limcode.message+json": {
+          "objects": 21,
+          "logicalBytes": 85666
+        },
+        "application/vnd.limcode.context-handle-catalog+json": {
+          "objects": 1,
+          "logicalBytes": 182
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1264
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 43080,
+        "aggregateRevision": 42586,
+        "compositionRoots": 4063,
+        "compositionBlocks": 59710,
+        "legacyCumulativeBodies": 0,
+        "itemOnlyAndAggregateBytes": 85666,
+        "totalCommittedMessageBytes": 149439,
+        "displayRevisionsOnly": 4063
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 89729,
+        "allRevisionsMs": 5.141,
+        "itemRevisionsBytes": 43080,
+        "itemRevisionsMs": 2.608
+      }
+    },
+    {
+      "items": 50,
+      "driveMs": 214.298,
+      "messageRevisions": {
+        "item": 50,
+        "cumulative": 50,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 191,
+      "newCasFiles": 5,
+      "newCasPhysicalBytes": 238822,
+      "newCasAllocatedBytes": 253952,
+      "byContentType": {
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 36,
+          "logicalBytes": 113960
+        },
+        "application/vnd.limcode.message+json": {
+          "objects": 51,
+          "logicalBytes": 214186
+        },
+        "application/vnd.limcode.native-message-composition+json": {
+          "objects": 50,
+          "logicalBytes": 10191
+        },
+        "application/vnd.limcode.native-message-block+json": {
+          "objects": 50,
+          "logicalBytes": 198526
+        },
+        "application/vnd.limcode.context-handle-catalog+json": {
+          "objects": 2,
+          "logicalBytes": 381
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1264
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 107730,
+        "aggregateRevision": 106456,
+        "compositionRoots": 10191,
+        "compositionBlocks": 198526,
+        "legacyCumulativeBodies": 0,
+        "itemOnlyAndAggregateBytes": 214186,
+        "totalCommittedMessageBytes": 422903,
+        "displayRevisionsOnly": 10191
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 224377,
+        "allRevisionsMs": 9.721,
+        "itemRevisionsBytes": 107730,
+        "itemRevisionsMs": 5.487
+      }
+    },
+    {
+      "items": 100,
+      "driveMs": 432.368,
+      "messageRevisions": {
+        "item": 100,
+        "cumulative": 100,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 346,
+      "newCasFiles": 11,
+      "newCasPhysicalBytes": 503884,
+      "newCasAllocatedBytes": 540672,
+      "byContentType": {
+        "application/vnd.limcode.native-message-composition+json": {
+          "objects": 100,
+          "logicalBytes": 20492
+        },
+        "application/vnd.limcode.native-message-block+json": {
+          "objects": 100,
+          "logicalBytes": 453742
+        },
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 36,
+          "logicalBytes": 220412
+        },
+        "application/vnd.limcode.message+json": {
+          "objects": 101,
+          "logicalBytes": 428386
+        },
+        "application/vnd.limcode.context-handle-catalog+json": {
+          "objects": 7,
+          "logicalBytes": 1653
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1265
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 215480,
+        "aggregateRevision": 212906,
+        "compositionRoots": 20492,
+        "compositionBlocks": 453742,
+        "legacyCumulativeBodies": 0,
+        "itemOnlyAndAggregateBytes": 428386,
+        "totalCommittedMessageBytes": 902620,
+        "displayRevisionsOnly": 20492
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 448878,
+        "allRevisionsMs": 15.176,
+        "itemRevisionsBytes": 215480,
+        "itemRevisionsMs": 7.198
+      }
+    },
+    {
+      "items": 200,
+      "driveMs": 777.777,
+      "messageRevisions": {
+        "item": 200,
+        "cumulative": 200,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 650,
+      "newCasFiles": 23,
+      "newCasPhysicalBytes": 1033476,
+      "newCasAllocatedBytes": 1118208,
+      "byContentType": {
+        "application/vnd.limcode.native-message-block+json": {
+          "objects": 200,
+          "logicalBytes": 917950
+        },
+        "application/vnd.limcode.message+json": {
+          "objects": 201,
+          "logicalBytes": 857186
+        },
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 36,
+          "logicalBytes": 433512
+        },
+        "application/vnd.limcode.native-message-composition+json": {
+          "objects": 200,
+          "logicalBytes": 41192
+        },
+        "application/vnd.limcode.context-handle-catalog+json": {
+          "objects": 11,
+          "logicalBytes": 2795
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1265
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 431180,
+        "aggregateRevision": 426006,
+        "compositionRoots": 41192,
+        "compositionBlocks": 917950,
+        "legacyCumulativeBodies": 0,
+        "itemOnlyAndAggregateBytes": 857186,
+        "totalCommittedMessageBytes": 1816328,
+        "displayRevisionsOnly": 41192
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 898378,
+        "allRevisionsMs": 25.118,
+        "itemRevisionsBytes": 431180,
+        "itemRevisionsMs": 16.376
+      }
+    }
+  ],
+  "method": "Compiled application, synthetic provider emitting the requested completed text items in one logical request; real SQLite and CAS. ContentObject.byte_length counts stored payload bytes: item/final MessageContent, display composition roots and bounded blocks are counted separately. Context handle state is initialized with the production helper. Timings are observational and are not correctness gates."
+}

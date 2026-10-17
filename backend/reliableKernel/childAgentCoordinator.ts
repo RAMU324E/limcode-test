@@ -10,7 +10,6 @@ import type { AnswerControlPlane, RuntimeDeliveryControlPlane } from './answerDe
 import { normalizeChildForkTurns, type ChildForkTurns } from './childContextFork';
 import { isEmptyToolArgument, normalizeToolInteger, ToolArgumentError, toolArgumentRecord } from '../../shared/toolArgumentUtils';
 import {
-  childContinuationTurnId,
   childExecutionSpawnIdentity,
   type ChildExecutionCancelCommand,
   type ChildExecutionCancelSubtreeResult,
@@ -63,8 +62,6 @@ import {
   RUN_AGENT_OPERATIONS
 } from '../world/modules/tools/definitions/runAgent';
 import {
-  listConversationChildTasks,
-  readConversationChildTask,
   childTaskSummary,
   sameConversationChildTaskState,
   type ConversationChildTaskProjection,
@@ -1242,7 +1239,8 @@ export class ReliableChildAgentCoordinator {
       }),
       listAllDomainRows(this.dependencies.database, 'Attempt', { status: 'pending' }),
       listAllDomainRows(this.dependencies.database, 'Attempt', { status: 'dispatched' }),
-      listAllDomainRows(this.dependencies.database, 'ChildExecutionActiveTurnLink')
+      scopedChildIds === undefined ? listAllDomainRows(this.dependencies.database, 'ChildExecutionActiveTurnLink')
+        : Promise.all([...scopedChildIds].map(id => this.list('ChildExecutionActiveTurnLink', { child_execution_id: id }, 2))).then(groups => groups.flat())
     ]);
     const scopedActiveLinks = scopedChildIds === undefined
       ? activeLinks
@@ -1358,11 +1356,9 @@ export class ReliableChildAgentCoordinator {
     for (const child of interruptingChildren) {
       signal?.throwIfAborted();
       const childExecutionId = requireId(child.id, 'ChildExecution.id');
-      const cancellationMemberships = await listAllDomainRows(
-        this.dependencies.database,
-        'ChildExecutionTurnLink',
-        { child_execution_id: childExecutionId }
-      );
+      const current = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
+      const cancellationMemberships = current.turnLinks.filter(member =>
+        member.turn_id === current.activeTurnLink?.turn_id || member.turn_id === current.latestTurnLink?.turn_id);
       for (const membership of cancellationMemberships) {
         membershipById.set(requireId(membership.id, 'ChildExecutionTurnLink.id'), membership);
       }
@@ -2105,18 +2101,18 @@ export class ReliableChildAgentCoordinator {
   private async inspectChildTasks(input: ReliableAgentToolDispatchInput,
     args: { [key: string]: PlainJsonValue }, operation: 'list' | 'read'): Promise<ChildDispatchResult> {
     const conversationId = await this.conversationForCaller(input);
-    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
     const scope = childTaskScope(args.scope);
     const limit = boundedChildTaskInteger(args.limit, 'limit', 32, 1, 100);
     const cursor = args.cursor === undefined ? undefined : requireText(args.cursor, 'run_agent.cursor');
     if (operation === 'list') {
-      const result = listConversationChildTasks(projection, { scope, limit,
+      const result = await this.dependencies.children.readConversationTaskList(conversationId, { scope, limit,
         ...(args.status === undefined ? {} : { status: requireChildExecutionStatus(args.status, 'run_agent.status') }),
         ...(cursor ? { cursor } : {}) });
       return this.settleOwnTool(input.toolCallId, { ...result, operation }, `run-agent-list:${input.toolCallId}`);
     }
+    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId, []);
     const task = await this.requireScopedChildTask(projection, requireText(args.answerBridgeId, 'run_agent.answerBridgeId'), scope);
-    const result = readConversationChildTask(projection, { childExecutionId: task.childExecutionId, scope, limit,
+    const result = await this.dependencies.children.readConversationTaskHistory(conversationId, { childExecutionId: task.childExecutionId, scope, limit,
       ...(cursor ? { cursor } : {}) });
     return this.settleOwnTool(input.toolCallId, { ...result, operation }, `run-agent-read:${input.toolCallId}`);
   }
@@ -2127,8 +2123,11 @@ export class ReliableChildAgentCoordinator {
     const scope = childTaskScope(args.scope);
     const timeoutMs = boundedChildTaskInteger(args.timeoutMs, 'timeoutMs', 0, 0, 60_000);
     const bridgeIds = childTaskWaitReferences(args);
+    const identities = await this.dependencies.children.readConversationTaskProjection(conversationId, []);
+    const requestedTasks = await Promise.all(bridgeIds.map(id => this.requireScopedChildTask(identities, id, scope)));
+    const childExecutionIds = requestedTasks.map(task => task.childExecutionId);
     const read = async () => {
-      const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
+      const projection = await this.dependencies.children.readConversationTaskProjection(conversationId, childExecutionIds);
       return Promise.all(bridgeIds.map(id => this.requireScopedChildTask(projection, id, scope)));
     };
     // Subscribe before the first asynchronous read; retain commits between reads and waits.
@@ -2164,7 +2163,7 @@ export class ReliableChildAgentCoordinator {
   private async scopedSnapshotForBridge(input: ReliableAgentToolDispatchInput,
     answerBridgeId: string, scope: 'direct' | 'tree' = 'direct'): Promise<ChildExecutionSnapshot> {
     const conversationId = await this.conversationForCaller(input);
-    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
+    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId, []);
     const task = await this.requireScopedChildTask(projection, answerBridgeId, scope);
     return this.dependencies.children.readExecutionSnapshot(task.childExecutionId);
   }
@@ -2379,7 +2378,7 @@ export class ReliableChildAgentCoordinator {
       this.triggerRecoveryPass();
       if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
       return this.waitContinuationForeground(input.toolCallId, answerBridgeId,
-        childContinuationTurnId(requireId(snapshot.childExecution.id, 'ChildExecution.id'), sent.turnIntentId), deadline!, signal);
+        sent.turnIntentId, deadline!, signal);
     }
     if (affectedTurnId) {
       try {
@@ -2410,6 +2409,7 @@ export class ReliableChildAgentCoordinator {
         }
         await this.dependencies.children.settleContinuationWaits({
           answerBridgeId,
+          turnIntentId: sent.turnIntentId,
           toolCallId: input.toolCallId,
           detail: { timeout: true },
           sourceIdentity: `foreground-timeout:${input.toolCallId}:${deadline}`,
@@ -2470,8 +2470,7 @@ export class ReliableChildAgentCoordinator {
     return this.waitContinuationForeground(
       input.toolCallId,
       answerBridgeId,
-      // Admission is deterministic: whichever owner admits the intent produces this exact Turn.
-      childContinuationTurnId(requireId(snapshot.childExecution.id, 'ChildExecution.id'), sent.turnIntentId),
+      sent.turnIntentId,
       deadline!,
       signal
     );
@@ -3022,7 +3021,7 @@ export class ReliableChildAgentCoordinator {
   private async waitContinuationForeground(
     toolCallId: string,
     answerBridgeId: string,
-    sourceTurnId: string,
+    turnIntentId: string,
     deadline: string,
     signal?: AbortSignal
   ): Promise<ChildDispatchResult> {
@@ -3030,7 +3029,8 @@ export class ReliableChildAgentCoordinator {
       if (this.handoff) throw this.handoff;
       const aborted = await this.settleUserAbort(toolCallId, signal, 'child-continuation-foreground-wait', true);
       if (aborted) return aborted;
-      if ((await this.get('Turn', sourceTurnId))?.status === 'terminated') {
+      const intent = await this.get('TurnIntent', turnIntentId);
+      if (typeof intent?.turn_id === 'string' && (await this.get('Turn', intent.turn_id))?.status === 'terminated') {
         await this.dependencies.children.settleInterruptedForegroundWait(toolCallId, signal);
       }
       const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
@@ -3041,7 +3041,7 @@ export class ReliableChildAgentCoordinator {
     }
     await this.dependencies.children.settleContinuationWaits({
       answerBridgeId,
-      sourceTurnId,
+      turnIntentId,
       toolCallId,
       detail: { timeout: true },
       sourceIdentity: `foreground-timeout:${toolCallId}:${deadline}`,
@@ -3145,8 +3145,8 @@ export class ReliableChildAgentCoordinator {
       if (termination?.terminal_status !== 'completed') continue;
       if ((await this.list('TurnFinalOutputFence', { turn_id: latest }, 1)).length === 0) continue;
       const answerBridgeId = requireId(bridge.id, 'AnswerBridge.id');
-      const history = await listAllDomainRows(this.dependencies.database, 'AnswerSubmission', { answer_bridge_id: answerBridgeId });
-      if (history.some((submission) => submission.turn_id === latest)) continue;
+      const existing = await this.list('AnswerSubmission', { answer_bridge_id: answerBridgeId, turn_id: latest }, 1);
+      if (existing.length > 0) continue;
       await gate.run(requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id'), async () => {
         if (!await this.dependencies.answers.isChildTaskTurn(latest)) return;
         const final = await this.dependencies.agentLoop.readFinalOutput(latest);

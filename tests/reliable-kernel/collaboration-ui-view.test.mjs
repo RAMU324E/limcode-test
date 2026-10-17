@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createWebviewSsrServer } from './webview-ssr-server.mjs';
+import { ready, steeringChainRecords, STEER_RECEIPT, twoSteeringChain, SECOND_STEER_RECEIPT } from './ui-conversation-projection-fixture.mjs';
 
 const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
@@ -55,7 +56,8 @@ before(async () => {
         if (message.type === 'reliable-kernel.collaboration-history-request' && !current.holdHistory) {
           queueMicrotask(() => current.feed.observe({ type: 'reliable-kernel.collaboration-history-result',
             sessionId: message.sessionId, requestId: message.requestId, conversationId: message.conversationId,
-            page: { records: {}, hasMore: false, scanProgress: false, scannedRows: 0, responseBytes: 0 } }));
+            page: { records: {}, hasMore: false, hasMoreBefore: false, hasMoreAfter: false,
+              scanProgress: false, scannedRows: 0, responseBytes: 0 } }));
         }
       }
     }; }
@@ -71,10 +73,14 @@ before(async () => {
     server.ssrLoadModule('/src/domain/reliableCollaborationTimeline.ts'),
     server.ssrLoadModule('/src/domain/reliableAgentStatusProjection.ts'),
     server.ssrLoadModule('/src/domain/reliableTransientLifecycle.ts'),
-    server.ssrLoadModule('/src/domain/reliableTransientModel.ts')
+    server.ssrLoadModule('/src/domain/reliableTransientModel.ts'),
+    server.ssrLoadModule('/src/composables/useReliableConversation.ts'),
+    server.ssrLoadModule('/src/composables/steeringReceipts.ts'),
+    server.ssrLoadModule(path.resolve('backend/capabilities/llmStreamEventProjection.ts'))
   ]);
   modules = { store: loaded[0], MessageList: loaded[1].default, QueuePanel: loaded[2].default,
-    timeline: loaded[3], status: loaded[4], transient: loaded[5], preview: loaded[6] };
+    timeline: loaded[3], status: loaded[4], transient: loaded[5], preview: loaded[6],
+    conversation: loaded[7], steering: loaded[8], stream: loaded[9] };
   globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
 });
 
@@ -306,6 +312,19 @@ test('real SQLite keyset advances through one foreign-only scan before scoped me
   assert.equal(older.records.CollaborationMessageTargetLink[0].message_id, 'page-own-old');
   assert.equal(older.responseBytes, wireBytes(older));
   assert.ok(older.responseBytes <= bounds.CLIENT_PAGE_MAX_BYTES);
+  const forwardEmpty = await history.backwardCollaboration({ conversationId: 'page-self', limit: 1,
+    direction: 'after', cursor: older.nextAfterCursor });
+  assert.equal(forwardEmpty.scannedRows, bounds.CLIENT_COLLABORATION_SCAN_MAX_ROWS);
+  assert.equal(forwardEmpty.records.CollaborationMessage, undefined);
+  assert.equal(forwardEmpty.scanProgress, true);
+  const restoredLatest = await history.backwardCollaboration({ conversationId: 'page-self', limit: 1,
+    direction: 'after', cursor: forwardEmpty.nextAfterCursor });
+  assert.deepEqual(restoredLatest.records, latest.records, 'forward hydration restores the complete newer message bundle');
+  const backwardEmpty = await history.backwardCollaboration({ conversationId: 'page-self', limit: 1,
+    cursor: restoredLatest.nextBeforeCursor });
+  const restoredOlder = await history.backwardCollaboration({ conversationId: 'page-self', limit: 1,
+    cursor: backwardEmpty.nextBeforeCursor });
+  assert.deepEqual(restoredOlder.records, older.records, 'the latest retry and source/target closure survive both directions');
   const native = new NativeDatabase(root.binding.paths.databasePath, { readonly: true });
   try {
     const plan = native.prepare(`EXPLAIN QUERY PLAN WITH bounded AS MATERIALIZED (
@@ -319,6 +338,95 @@ test('real SQLite keyset advances through one foreign-only scan before scoped me
     assert.match(plan, /ux_collaboration_message_source_link_01 \(message_id=\?\)/);
     assert.match(plan, /ux_collaboration_message_target_link_01 \(message_id=\?\)/);
   } finally { native.close(); }
+});
+
+test('collaboration history traverses exchanges, messages and accepted answers in both directions with the same closure', async () => {
+  const { runtimeDeliveryTimelineStep, collaborationSendTimelineStep } = require(path.join(compiled, 'backend/reliableKernel/timelineAcceptance.js'));
+  const self = 'roundtrip-self', peer = 'roundtrip-peer', child = 'roundtrip-child';
+  const payload = await cas.ingest(database, '协作来回正文 😀', 'text/vnd.limcode.collaboration-message');
+  const answerBody = await cas.ingest(database, '已接受的子任务答案 😀', 'text/plain');
+  await database.transaction([conversation(self), conversation(peer), conversation(child), turn('roundtrip-parent-turn', self),
+    row('ChildExecution', { id: 'roundtrip-child-execution', child_conversation_id: child, status: 'idle', created_at: NOW, updated_at: NOW }),
+    row('ChildExecutionParentLink', { id: 'roundtrip-child-parent', child_execution_id: 'roundtrip-child-execution',
+      parent_turn_id: 'roundtrip-parent-turn', parent_child_execution_id: null, source_tool_call_id: 'roundtrip-spawn-call', created_at: NOW }),
+    row('AnswerBridge', { id: 'roundtrip-answer-bridge', child_execution_id: 'roundtrip-child-execution',
+      current_submission_id: null, status: 'open', created_at: NOW, updated_at: NOW })]);
+  for (let index = 1; index <= 6; index++) {
+    const id = `roundtrip-message-${index}`, outgoing = index % 2 === 1;
+    await database.transaction([
+      ...envelope(id, outgoing ? self : peer, outgoing ? peer : self, payload.id),
+      ...(outgoing ? [collaborationSendTimelineStep({ conversationId: self, messageId: id, now: NOW })] : [
+        update('RuntimeDelivery', `${id}-delivery`, { phase: 'notify_only', updated_at: NOW }),
+        update('RuntimeDelivery', `${id}-delivery`, { state: 'consumed', updated_at: NOW }),
+        runtimeDeliveryTimelineStep({ conversationId: self, deliveryId: `${id}-delivery`, now: NOW })
+      ])
+    ]);
+  }
+  for (let index = 1; index <= 5; index++) {
+    const id = `roundtrip-answer-${index}`, childTurn = `roundtrip-child-turn-${index}`;
+    await database.transaction([
+      turn(childTurn, child),
+      row('AnswerSubmission', { id, answer_bridge_id: 'roundtrip-answer-bridge', submission_seq: BigInt(index),
+        turn_id: childTurn, interrupted: 0n, created_at: NOW }),
+      row('AnswerPayload', { id: `${id}-payload`, submission_id: id, title: `结果 ${index}`, content_object_id: answerBody.id,
+        byte_length: BigInt(answerBody.byte_length), created_at: NOW }),
+      row('RuntimeInboxItem', { id: `${id}-inbox`, dedupe_key: id, source_kind: 'answer_submission', source_id: id,
+        state: 'consumed', created_at: NOW, updated_at: NOW }),
+      row('RuntimeInboxPayloadLink', { id: `${id}-inbox-payload`, inbox_item_id: `${id}-inbox`, content_object_id: answerBody.id, created_at: NOW }),
+      row('RuntimeDelivery', { id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: self,
+        target_turn_id: null, phase: 'notify_only', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending',
+        failure_reason: null, created_at: NOW, updated_at: NOW }),
+      update('RuntimeDelivery', `${id}-delivery`, { state: 'consumed', updated_at: NOW }),
+      runtimeDeliveryTimelineStep({ conversationId: self, deliveryId: `${id}-delivery`, now: NOW }),
+      update('AnswerBridge', 'roundtrip-answer-bridge', { current_submission_id: id, updated_at: NOW })
+    ]);
+  }
+  const history = new kernel.ClientHistoryReader(database);
+  const contents = new kernel.ClientDetailReader(database, cas);
+  const beforeFacts = { exchange: new Map(), message: new Map(), answer: new Map() };
+  const afterFacts = { exchange: new Map(), message: new Map(), answer: new Map() };
+  const collect = (facts, kind, page) => {
+    assert.equal(page.responseBytes, wireBytes(page));
+    assert.ok(page.responseBytes <= bounds.CLIENT_PAGE_MAX_BYTES);
+    for (const [domain, rows] of Object.entries(page.records)) for (const record of rows) facts[kind].set(`${domain}:${record.id}`, record);
+  };
+  let cursor, last, lastKind, pages = 0;
+  for (;;) {
+    const kind = cursor?.kind ?? 'exchange';
+    last = await history.backwardCollaboration({ conversationId: self, cursor, limit: 2 });
+    collect(beforeFacts, kind, last); lastKind = kind;
+    assert.ok(++pages < 30, 'every bounded scan and source transition advances');
+    if (!last.hasMoreBefore) break;
+    cursor = last.nextBeforeCursor;
+    assert.ok(cursor);
+  }
+  assert.equal(lastKind, 'answer');
+  assert.equal([...beforeFacts.message.keys()].filter(key => key.startsWith('CollaborationMessage:')).length, 6);
+  assert.equal([...beforeFacts.answer.keys()].filter(key => key.startsWith('AnswerSubmission:')).length, 5);
+  assert.equal([...beforeFacts.exchange.keys()].filter(key => key.startsWith('RuntimeDeliveryTimelineLink:')
+    || key.startsWith('CollaborationSendTimelineLink:')).length, 11);
+  collect(afterFacts, lastKind, last);
+  pages = 0;
+  while (last.hasMoreAfter) {
+    cursor = last.nextAfterCursor;
+    assert.ok(cursor);
+    last = await history.backwardCollaboration({ conversationId: self, cursor, direction: 'after', limit: 2 });
+    collect(afterFacts, cursor.kind, last);
+    assert.ok(++pages < 30, 'forward source transitions and foreign-only scans advance');
+  }
+  assert.equal(cursor.kind, 'exchange');
+  for (const kind of ['exchange', 'message', 'answer']) {
+    assert.deepEqual([...afterFacts[kind]].sort(), [...beforeFacts[kind]].sort(), `${kind} reload includes exactly its original causal records`);
+  }
+  const accepted = [...afterFacts.answer].filter(([key]) => key.startsWith('RuntimeDeliveryAnswerPresentation:'));
+  assert.equal(accepted.length, 5);
+  for (const [, presentation] of accepted) {
+    const detail = await contents.read({ kind: 'accepted-answer-content', recordId: presentation.id,
+      conversationId: self, offset: 0, maxBytes: 4096 });
+    assert.equal(Buffer.from(detail.chunk, 'base64').toString('utf8'), '已接受的子任务答案 😀');
+  }
+  await assert.rejects(history.backwardCollaboration({ conversationId: self, direction: 'after',
+    cursor: { kind: 'message', beforeMessageSeq: '1', beforeId: 'wrong-direction' }, limit: 2 }), /direction/);
 });
 
 test('navigation discards late historical replies at Host and client session boundaries', async () => {
@@ -356,8 +464,88 @@ test('navigation discards late historical replies at Host and client session bou
     state.feed.observe({ type: 'reliable-kernel.collaboration-history-result', requestId: request.requestId, sessionId: 'client-old', conversationId: 'navigation-old',
       page: { records: { CollaborationMessage: [{ id: 'retired-message', message_seq: '1', mode: 'message' }] }, hasMore: false, responseBytes: 0 } });
     assert.equal(state.feed.collaborationHistoryConversationId, 'navigation-new');
-    assert.deepEqual(state.feed.collaborationHistoryRecords, {});
+    assert.deepEqual(state.feed.collaborationHistoryPages, []);
   } finally { bridge.detach(clientId); bridge.close(); }
+});
+
+test('collaboration reading pages stay bounded and restore mixed cards and accepted bodies when moving forward', async () => {
+  const state = openUi('resident-collaboration', { holdHistory: true }), feed = state.feed;
+  const messages = Array.from({ length: 5 }, (_, offset) => ({ id: `resident-message-${offset + 1}`,
+    revision_id: `resident-revision-${offset + 1}`, conversation_id: state.conversationId,
+    role: 'user', message_seq: String(offset + 1), display_seq: String(offset + 1), created_at: NOW }));
+  feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'resident-collaboration-session', hostBootId: 'resident-collaboration-host',
+    messageSeq: '1', snapshotCommitSeq: '0', projections: { activeConversationWindow: {
+      conversationId: state.conversationId, visibleMessageCount: '5', messages,
+      turns: [{ id: 'resident-turn', conversation_id: state.conversationId, status: 'terminated', created_at: NOW }],
+      messageTurnLinks: messages.map(message => ({ id: `link-${message.id}`, message_id: message.id, turn_id: 'resident-turn', role: 'user' }))
+    } } });
+  const serve = (direction, first) => {
+    if (!feed.collaborationHistoryLoading) assert.equal(feed.requestCollaborationHistoryPage(state.conversationId, direction), true);
+    const request = state.posted.findLast(value => value.type === 'reliable-kernel.collaboration-history-request');
+    assert.equal(request.direction, direction);
+    const records = { CollaborationPeerConversation: [{ id: 'resident-peer', title: '协作同伴', status: 'active' }],
+      RuntimeDelivery: [], RuntimeDeliveryTimelineLink: [], RuntimeInboxItem: [], CollaborationMessage: [],
+      CollaborationMessageSourceLink: [], CollaborationMessageTargetLink: [], RuntimeDeliveryAnswerPresentation: [] };
+    for (let sequence = first; sequence < first + 2; sequence++) {
+      const id = `resident-card-${sequence}`, inboxId = `resident-inbox-${sequence}`, deliveryId = `resident-delivery-${sequence}`;
+      const predecessor = Math.ceil(sequence / 2);
+      records.RuntimeDelivery.push({ id: deliveryId, inbox_item_id: inboxId, target_conversation_id: state.conversationId,
+        target_turn_id: 'resident-turn', attempt_seq: '1', state: 'consumed', created_at: NOW });
+      records.RuntimeDeliveryTimelineLink.push({ id: `resident-position-${sequence}`, delivery_id: deliveryId,
+        conversation_id: state.conversationId, predecessor_message_id: `resident-message-${predecessor}`,
+        predecessor_message_seq: String(predecessor), exchange_seq: String(sequence) });
+      if (sequence % 2) {
+        records.RuntimeInboxItem.push({ id: inboxId, source_kind: 'collaboration_message', source_id: id });
+        records.CollaborationMessage.push({ id, message_seq: String(sequence), mode: 'message', text_preview: `协作 ${sequence}` });
+        records.CollaborationMessageSourceLink.push({ id: `resident-source-${sequence}`, message_id: id, conversation_id: 'resident-peer', source_kind: 'tool' });
+        records.CollaborationMessageTargetLink.push({ id: `resident-target-${sequence}`, message_id: id, conversation_id: state.conversationId, inbox_item_id: inboxId });
+      } else {
+        const submissionId = `resident-submission-${sequence}`, acceptedId = `resident-accepted-${sequence}`;
+        records.RuntimeInboxItem.push({ id: inboxId, source_kind: 'answer_submission', source_id: submissionId });
+        records.RuntimeDeliveryAnswerPresentation.push({ id: acceptedId, conversation_id: state.conversationId,
+          delivery_id: deliveryId, inbox_item_id: inboxId, attempt_seq: '1', submission_id: submissionId, outcome: 'submitted',
+          child_conversation_id: 'resident-peer', peer_state: 'known', peer_title_preview: '协作同伴', answer_title_preview: `结果 ${sequence}` });
+        feed.details[`accepted-answer-content:${acceptedId}`] = { status: 'ready', text: `完整已接收正文 ${sequence}`, totalBytes: 40 };
+      }
+    }
+    feed.observe({ type: 'reliable-kernel.collaboration-history-result', sessionId: feed.sessionId,
+      conversationId: state.conversationId, requestId: request.requestId,
+      page: { records, nextBeforeCursor: { kind: 'exchange', beforeExchangeSeq: String(first) },
+        nextAfterCursor: { kind: 'exchange', afterExchangeSeq: String(first + 1) },
+        hasMoreBefore: first > 1, hasMoreAfter: first < 7,
+        hasMore: direction === 'before' ? first > 1 : first < 7, scanProgress: false, scannedRows: 2, responseBytes: 1000 } });
+    assert.equal(feed.collaborationHistoryError, null);
+    assert.ok(feed.collaborationHistoryPages.length <= 3);
+    assert.ok(Object.keys(feed.committedRecords.RuntimeDelivery).length <= 6);
+    return request;
+  };
+  serve('before', 7);
+  const firstView = await render();
+  const initialRows = firstView.setup.timelineRows.map(row => row.id);
+  assert.ok(initialRows.includes('resident-message-4'));
+  assert.equal(initialRows.indexOf('collaboration:resident-card-7'), initialRows.indexOf('resident-message-4') + 1);
+  assert.equal(initialRows.indexOf('collaboration:answer:resident-submission-8'), initialRows.indexOf('resident-message-4') + 2);
+  feed.setPinnedDetailKeys([]);
+  const held = 'accepted-answer-content:resident-accepted-8';
+  feed.setDetailOwnerKeys('resident-expanded-answer', [held]);
+  serve('before', 5); serve('before', 3); serve('before', 1);
+  assert.equal(feed.committedRecords.CollaborationMessage['resident-card-7'], undefined);
+  assert.equal(feed.acceptedAnswerPeerGenerations['resident-accepted-8'], undefined);
+  assert.ok(feed.details[held]);
+  feed.setDetailOwnerKeys('resident-expanded-answer', []);
+  assert.equal(feed.details[held], undefined);
+  assert.equal(serve('after', 3).cursor.afterExchangeSeq, '2');
+  assert.equal(serve('after', 5).cursor.afterExchangeSeq, '4');
+  assert.equal(serve('after', 7).cursor.afterExchangeSeq, '6');
+  assert.equal(feed.details[held].text, '完整已接收正文 8');
+  const nextView = await render(), rows = nextView.setup.timelineRows.map(row => row.id);
+  assert.equal(rows.indexOf('collaboration:resident-card-7'), rows.indexOf('resident-message-4') + 1);
+  assert.equal(rows.indexOf('collaboration:answer:resident-submission-8'), rows.indexOf('resident-message-4') + 2);
+  assert.equal(new Set(rows).size, rows.length);
+  const page = feed.collaborationHistoryPages.find(candidate => candidate.members.CollaborationMessage?.['resident-card-5']);
+  feed.retainCollaborationReadingPage({ messageId: 'resident-card-5' });
+  assert.equal(feed.collaborationHistoryCurrentPageId, page.id);
+  assert.equal(feed.collaborationHistoryNextAfterCursor.afterExchangeSeq, '6');
 });
 
 test('actual MessageList windows mixed timeline by proven position and retains recent messages', async () => {
@@ -382,6 +570,8 @@ test('actual MessageList windows mixed timeline by proven position and retains r
     RuntimeDeliveryTimelineLink: { positioned: { id: 'timeline-position', delivery_id: 'timeline-positioned-delivery', conversation_id: 'timeline-self',
       predecessor_message_id: 'timeline-m34', predecessor_message_seq: '34', exchange_seq: '1' } }
   };
+  feed.records = Object.fromEntries(Object.entries(feed.records).map(([domain, records]) => [domain, byId(Object.values(records))]));
+  feed.committedRecords = feed.records;
   const view = await render();
   assert.equal(view.setup.visibleTimelineRows.length, 30);
   assert.match(view.html, /data-timeline-row-key="timeline-m35"/);
@@ -435,6 +625,23 @@ test('deleted peer snapshot updates card and queue labels while received body re
   } finally { live.close(); }
 });
 
+test('unanchored failed Turns keep their own interrupted phases in the actual MessageList', async () => {
+  const { feed } = openUi('failed-self');
+  feed.projections.activeConversationWindow = { conversationId: 'failed-self' };
+  feed.records = {
+    Turn: byId(['tools', 'review'].map(id => ({ id: `failed-${id}`, conversation_id: 'failed-self', status: 'terminated', created_at: NOW }))),
+    ModelRequest: byId(['tools', 'review'].map(id => ({ id: `failed-request-${id}`, turn_id: `failed-${id}`, request_seq: '1', status: 'streaming' }))),
+    TurnTermination: byId(['tools', 'review'].map(id => ({ id: `failed-termination-${id}`, turn_id: `failed-${id}`, terminal_status: 'failed', reason: `${id} failed`, created_at: NOW }))),
+    ToolCall: { 'failed-call': { id: 'failed-call', turn_id: 'failed-tools', tool_name: 'read', status: 'executing' } },
+    InteractionRequest: { 'failed-interaction': { id: 'failed-interaction', request_kind: 'plan_review', status: 'pending' } },
+    InteractionOwnerLink: { 'failed-owner': { id: 'failed-owner', request_id: 'failed-interaction', turn_id: 'failed-review' } }
+  };
+  feed.committedRecords = feed.records;
+  const { setup } = await render();
+  assert.deepEqual(new Map(setup.unanchoredTerminationRows.map(({ termination }) => [termination.runId, termination.interruptedPhase])),
+    new Map([['failed-review', 'waiting_plan_review'], ['failed-tools', 'waiting_tools']]));
+});
+
 test('transient sequence gap keeps contiguous text and atomically adopts cumulative snapshot', () => {
   const state = openUi('transient-self');
   state.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'transient-session', hostBootId: 'transient-host', navigationGeneration: '7',
@@ -460,6 +667,279 @@ test('transient sequence gap keeps contiguous text and atomically adopts cumulat
   assert.ok(state.posted.some((value) => value.type === 'reliable-kernel.transient-ack' && value.deliveryId === 'transient-replay' && value.heads[0].streamSeq === '3'));
 });
 
+test('retry and runtime continuation stream before their first Message without rebuilding the source row', () => {
+  const state = openUi('unanchored-stream');
+  const view = modules.conversation.useReliableConversation();
+  for (const kind of ['retry', 'runtime-continuation']) {
+    state.conversationId = `${kind}-stream`;
+    const turnId = `${kind}-turn`, requestId = `${kind}-request`;
+    state.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: `${kind}-session`, hostBootId: 'unanchored-host',
+      messageSeq: '1', snapshotCommitSeq: '1', projections: { activeConversationWindow: {
+        conversationId: state.conversationId, visibleMessageCount: '1',
+        messages: [{ id: 'source', revision_id: 'source-revision', conversation_id: state.conversationId,
+          role: 'user', message_seq: '1', display_seq: '1', created_at: NOW }],
+        turns: [{ id: 'source-turn', conversation_id: state.conversationId, status: 'terminated', created_at: NOW },
+          { id: turnId, conversation_id: state.conversationId, status: 'active', created_at: NOW,
+            ...(kind === 'retry' ? { source_message_id: 'source' } : {}) }],
+        messageTurnLinks: [{ id: 'source-link', message_id: 'source', turn_id: 'source-turn', role: 'input' }],
+        modelRequests: [{ id: requestId, turn_id: turnId, request_seq: '1', status: 'streaming', model_id: 'model', created_at: NOW }]
+      } } });
+    state.feed.details['message-content:source-revision'] = ready(JSON.stringify({ role: 'user', parts: [{ text: 'source question' }] }));
+    const source = view.projection.value.messages[0];
+    const delta = (sequence, text) => ({ type: 'reliable-kernel.transient', sessionId: state.feed.sessionId,
+      hostBootId: state.feed.hostBootId, conversationId: state.conversationId, turnId, modelRequestId: requestId,
+      requestSeq: '1', providerId: 'provider', modelId: 'model', attemptSeq: '1', socketGeneration: '1',
+      afterCommitSeq: '1', fromStreamSeq: String(sequence), observedAt: NOW,
+      event: { kind: 'output_delta', streamSeq: String(sequence), content: { type: 'text_delta', text } } });
+    state.feed.observe(delta(1, 'first'));
+    const first = view.projection.value;
+    assert.deepEqual(first.messages.map(message => message.id), ['source', `transient:${requestId}`]);
+    assert.equal(first.messages[0], source);
+    state.feed.observe(delta(2, ' second'));
+    const second = view.projection.value;
+    assert.equal(second.messages[0], source);
+    assert.equal(second.index.messageIds, first.index.messageIds);
+    assert.equal(second.messages[1].content.parts[0].text, 'first second');
+  }
+});
+
+test('a steering successor hydrates its source window and copies the complete successor beyond resident items', async () => {
+  const state = openUi('conversation-a');
+  const { records, details } = steeringChainRecords();
+  delete records.ToolCall;
+  delete records.ToolCallSourceLink;
+  const parts = [JSON.parse(details['message-content:revision-a'].text).parts[0],
+    ...Array.from({ length: 129 }, (_, index) => ({ text: `successor-${index + 1}\n`,
+      outputItem: { id: `successor-item-${index + 1}`, ordinal: index + 1,
+        providerResponseId: 'resp-2', previousResponseId: 'resp-1' } }))];
+  records.Message['message-a'].item_index_revision_id = 'revision-a';
+  state.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'steering-copy-session', hostBootId: 'steering-copy-host',
+    messageSeq: '1', snapshotCommitSeq: '1', projections: { activeConversationWindow: {
+      conversationId: state.conversationId, visibleMessageCount: '2', messages: Object.values(records.Message),
+      turns: Object.values(records.Turn), messageTurnLinks: Object.values(records.MessageTurnLink),
+      modelRequests: Object.values(records.ModelRequest), modelRequestMessageLinks: Object.values(records.ModelRequestMessageLink)
+    } } });
+  state.feed.details['message-content:revision-steer'] = details['message-content:revision-steer'];
+  const items = parts.slice(0, 32).map((part, index) => ({ id: `copy-item-revision-${index + 1}`, sequence: index + 1,
+    revisionId: `copy-item-revision-${index + 1}`, contentObjectId: `copy-item-object-${index + 1}`,
+    partByteLength: Buffer.byteLength(JSON.stringify(part)), outputItem: part.outputItem }));
+  for (const item of items) if (item.sequence !== 2) state.feed.details[`message-content-item:${item.contentObjectId}`] =
+    ready(JSON.stringify({ role: 'model', parts: [parts[item.sequence - 1]] }));
+  state.feed.messageContentWindows['message-a'] = { indexRevisionId: 'revision-a', followTail: false,
+    currentAfterSequence: 0, currentPageKey: 'message-content-items:revision-a:0', pages: [{
+      key: 'message-content-items:revision-a:0', indexRevisionId: 'revision-a', items,
+      totalItems: parts.length, totalBytes: Buffer.byteLength(JSON.stringify(parts)), nextSequence: 32
+    }] };
+  const receipts = modules.steering.steeringReceiptsByConversationState();
+  const previousReceipts = receipts.value;
+  receipts.value = { [state.conversationId]: { [STEER_RECEIPT.submissionId]: STEER_RECEIPT } };
+  try {
+    const view = modules.conversation.useReliableConversation();
+    const successorId = 'message-a:steer-successor:resp-2';
+    assert.equal(view.projection.value.index.messageById.get(successorId).content.parts.length, 31);
+    assert.equal(view.projection.value.messageRevisionIdByMessageId[successorId], undefined);
+    view.ensureDetails({ messageIds: [successorId], includePendingInteractions: false });
+    const itemRequest = state.posted.find(message => message.type === 'reliable-kernel.detail-request'
+      && message.kind === 'message-content-item' && message.recordId === 'copy-item-object-2');
+    assert.ok(itemRequest, 'a visible successor owns the source Message content demand');
+    const reply = (request, value) => {
+      const bytes = Buffer.from(JSON.stringify(value));
+      state.feed.observeDetailResult({ sessionId: state.feed.sessionId, requestId: request.requestId,
+        detail: { recordId: request.recordId, offset: 0, totalBytes: bytes.length, chunk: bytes.toString('base64'), hasMore: false } });
+    };
+    reply(itemRequest, { role: 'model', parts: [parts[1]] });
+    const copying = view.completeMessageContent(successorId);
+    const fullRequest = state.posted.find(message => message.type === 'reliable-kernel.detail-request'
+      && message.kind === 'message-content' && message.recordId === 'revision-a');
+    assert.ok(fullRequest, 'copy reads the source revision even though the successor has no independent revision');
+    reply(fullRequest, { role: 'model', parts });
+    const content = await copying;
+    assert.deepEqual(content.parts, parts.slice(1));
+    assert.equal(state.feed.details['message-content:revision-a'], undefined);
+    assert.equal(state.feed.messageContentWindows['message-a'].pages[0].items.length, 32);
+  } finally { receipts.value = previousReceipts; }
+});
+
+async function withSteeringContentWindow({ parts, firstSequence, lastSequence = parts.length,
+  fixture = steeringChainRecords(), receipts = [STEER_RECEIPT] }, verify) {
+  const state = openUi('conversation-a');
+  const { records, details } = fixture;
+  delete records.ToolCall;
+  delete records.ToolCallSourceLink;
+  records.Message['message-a'].item_index_revision_id = 'revision-a';
+  state.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'steering-window-session', hostBootId: 'steering-window-host',
+    messageSeq: '1', snapshotCommitSeq: '1', projections: { activeConversationWindow: {
+      conversationId: state.conversationId, visibleMessageCount: String(Object.keys(records.Message).length),
+      messages: Object.values(records.Message), turns: Object.values(records.Turn),
+      messageTurnLinks: Object.values(records.MessageTurnLink), modelRequests: Object.values(records.ModelRequest),
+      modelRequestMessageLinks: Object.values(records.ModelRequestMessageLink)
+    } } });
+  for (const [key, detail] of Object.entries(details)) {
+    if (key !== 'message-content:revision-a') state.feed.details[key] = detail;
+  }
+  const items = parts.slice(firstSequence - 1, lastSequence).map((part, index) => {
+    const sequence = firstSequence + index;
+    const item = { id: `window-item-revision-${sequence}`, sequence, revisionId: `window-item-revision-${sequence}`,
+      contentObjectId: `window-item-object-${sequence}`, partByteLength: Buffer.byteLength(JSON.stringify(part)), outputItem: part.outputItem };
+    state.feed.details[`message-content-item:${item.contentObjectId}`] = ready(JSON.stringify({ role: 'model', parts: [part] }));
+    return item;
+  });
+  const key = `message-content-items:revision-a:${firstSequence - 1}`;
+  state.feed.messageContentWindows['message-a'] = { indexRevisionId: 'revision-a', followTail: false,
+    currentAfterSequence: firstSequence - 1, currentPageKey: key, pages: [{ key, indexRevisionId: 'revision-a', items,
+      totalItems: parts.length, totalBytes: Buffer.byteLength(JSON.stringify(parts)),
+      ...(lastSequence < parts.length ? { nextSequence: lastSequence } : {}) }] };
+  const receiptState = modules.steering.steeringReceiptsByConversationState();
+  const previousReceipts = receiptState.value;
+  receiptState.value = { [state.conversationId]: Object.fromEntries(receipts.map(receipt => [receipt.submissionId, receipt])) };
+  try {
+    const view = modules.conversation.useReliableConversation();
+    const copy = async (messageId) => {
+      const copying = view.completeMessageContent(messageId);
+      const request = state.posted.filter(message => message.type === 'reliable-kernel.detail-request'
+        && message.kind === 'message-content' && message.recordId === 'revision-a').at(-1);
+      assert.ok(request, 'complete copy reads the source revision outside the resident item window');
+      const bytes = Buffer.from(JSON.stringify({ role: 'model', parts }));
+      state.feed.observeDetailResult({ sessionId: state.feed.sessionId, requestId: request.requestId,
+        detail: { recordId: request.recordId, offset: 0, totalBytes: bytes.length, chunk: bytes.toString('base64'), hasMore: false } });
+      const content = await copying;
+      assert.equal(state.feed.details['message-content:revision-a'], undefined);
+      return content.parts;
+    };
+    await verify({ projection: view.projection, copy });
+    assert.deepEqual(state.feed.messageContentWindows['message-a'].pages[0].items.map(item => item.sequence), items.map(item => item.sequence));
+  } finally { receiptState.value = previousReceipts; }
+}
+
+function nativeSteeringContent(parts, submissionsBySuccessor) {
+  const chain = {};
+  return parts.map(part => {
+    const { providerResponseId: responseId, previousResponseId } = part.outputItem;
+    modules.stream.observeNativeResponseCreated(chain, { responseId, previousResponseId,
+      ...(submissionsBySuccessor[responseId] ? { submissionId: submissionsBySuccessor[responseId] } : {}) });
+    return modules.stream.fromUnifiedCompletedContent({ role: 'model', parts: [part] }, chain).parts[0];
+  });
+}
+
+test('a window starting inside the original response still splits a proven steering boundary and copies each full segment', async () => {
+  const parts = [
+    { text: 'before-1', outputItem: { id: 'before-1', ordinal: 1, providerResponseId: 'resp-1' } },
+    { text: 'before-2', outputItem: { id: 'before-2', ordinal: 2, providerResponseId: 'resp-1' } },
+    { text: 'after-steer', outputItem: { id: 'after-steer', ordinal: 1, providerResponseId: 'resp-2', previousResponseId: 'resp-1' } }
+  ];
+  await withSteeringContentWindow({ parts, firstSequence: 2 }, async ({ projection, copy }) => {
+    const successorId = 'message-a:steer-successor:resp-2';
+    assert.deepEqual(projection.value.index.messageById.get('message-a').content.parts, [parts[1]]);
+    assert.deepEqual(projection.value.index.messageById.get(successorId).content.parts, [parts[2]]);
+    assert.equal(projection.value.splitSourceMessageIdByMessageId[successorId], 'message-a');
+    assert.deepEqual(projection.value.pendingSteeringBoundaryMessageIds, []);
+    assert.deepEqual(await copy('message-a'), parts.slice(0, 2));
+    assert.deepEqual(await copy(successorId), parts.slice(2));
+  });
+});
+
+test('a window starting inside a proven steering successor keeps its identity and copies all successor items', async () => {
+  const parts = [
+    { text: 'before-steer', outputItem: { id: 'before', ordinal: 1, providerResponseId: 'resp-1' } },
+    ...Array.from({ length: 3 }, (_, index) => ({ text: `after-steer-${index + 1}`,
+      outputItem: { id: `after-${index + 1}`, ordinal: index + 1, providerResponseId: 'resp-2', previousResponseId: 'resp-1' } }))
+  ];
+  await withSteeringContentWindow({ parts, firstSequence: 3, lastSequence: 3 }, async ({ projection, copy }) => {
+    const successorId = 'message-a:steer-successor:resp-2';
+    assert.deepEqual(projection.value.index.messageById.get('message-a').content.parts, []);
+    assert.deepEqual(projection.value.index.messageById.get(successorId).content.parts, [parts[2]]);
+    assert.equal(projection.value.index.messageById.get(successorId).seq, 2.25);
+    assert.equal(projection.value.splitSourceMessageIdByMessageId[successorId], 'message-a');
+    assert.equal(projection.value.messageRevisionIdByMessageId[successorId], undefined);
+    assert.deepEqual(projection.value.pendingSteeringBoundaryMessageIds, []);
+    assert.deepEqual(await copy(successorId), parts.slice(1));
+  });
+});
+
+test('a window containing only a tool continuation inherits its proven steering successor and copies both responses', async () => {
+  const parts = nativeSteeringContent([
+    { text: 'before-steer', outputItem: { id: 'before', ordinal: 1, providerResponseId: 'resp-1' } },
+    { text: 'steering-successor', outputItem: { id: 'successor', ordinal: 1, providerResponseId: 'resp-2', previousResponseId: 'resp-1' } },
+    { text: 'tool-continuation', outputItem: { id: 'continuation', ordinal: 1, providerResponseId: 'resp-3', previousResponseId: 'resp-2' } }
+  ], { 'resp-2': STEER_RECEIPT.submissionId });
+  await withSteeringContentWindow({ parts, firstSequence: 3 }, async ({ projection, copy }) => {
+    const successorId = 'message-a:steer-successor:resp-2';
+    assert.deepEqual(projection.value.index.messageById.get('message-a').content.parts, []);
+    assert.deepEqual(projection.value.index.messageById.get(successorId).content.parts, [parts[2]]);
+    assert.equal(projection.value.index.messageById.has('message-a:steer-successor:resp-3'), false);
+    assert.equal(projection.value.index.messageById.get(successorId).seq, 2.25);
+    assert.equal(projection.value.splitSourceMessageIdByMessageId[successorId], 'message-a');
+    assert.deepEqual(projection.value.pendingSteeringBoundaryMessageIds, []);
+    assert.deepEqual(await copy(successorId), parts.slice(1));
+  });
+});
+
+test('a clipped multi-hop tool continuation keeps the producer steering segment for display and complete copy', async () => {
+  const wireParts = [
+    { text: 'before-steer', outputItem: { id: 'before', ordinal: 1, providerResponseId: 'resp-1' } },
+    ...[2, 3, 4].map(response => ({ text: `response-${response}`,
+      outputItem: { id: `item-${response}`, ordinal: 1, providerResponseId: `resp-${response}`, previousResponseId: `resp-${response - 1}` } }))
+  ];
+  const parts = nativeSteeringContent(wireParts, { 'resp-2': STEER_RECEIPT.submissionId });
+  assert.deepEqual(parts.slice(1).map(part => part.outputItem.steeringSuccessorResponseId), ['resp-2', 'resp-2', 'resp-2']);
+  await withSteeringContentWindow({ parts, firstSequence: 4 }, async ({ projection, copy }) => {
+    const successorId = 'message-a:steer-successor:resp-2';
+    assert.deepEqual(projection.value.index.messageById.get('message-a').content.parts, []);
+    assert.deepEqual(projection.value.index.messageById.get(successorId).content.parts, [parts[3]]);
+    assert.deepEqual(projection.value.pendingSteeringBoundaryMessageIds, []);
+    assert.deepEqual(await copy(successorId), parts.slice(1));
+  });
+});
+
+test('a clipped steering successor uses its producer segment when an intermediate response precedes it', async () => {
+  const parts = nativeSteeringContent([
+    { text: 'before-steer', outputItem: { id: 'before', ordinal: 1, providerResponseId: 'resp-1' } },
+    { text: 'intermediate', outputItem: { id: 'intermediate', ordinal: 1, providerResponseId: 'resp-2', previousResponseId: 'resp-1' } },
+    { text: 'after-steer', outputItem: { id: 'after', ordinal: 1, providerResponseId: 'resp-3', previousResponseId: 'resp-2' } }
+  ], { 'resp-3': STEER_RECEIPT.submissionId });
+  await withSteeringContentWindow({ parts, firstSequence: 3,
+    receipts: [{ ...STEER_RECEIPT, successorResponseId: 'resp-3' }] }, async ({ projection, copy }) => {
+    const successorId = 'message-a:steer-successor:resp-3';
+    assert.deepEqual(projection.value.index.messageById.get('message-a').content.parts, []);
+    assert.deepEqual(projection.value.index.messageById.get(successorId).content.parts, [parts[2]]);
+    assert.deepEqual(projection.value.pendingSteeringBoundaryMessageIds, []);
+    assert.deepEqual(await copy(successorId), parts.slice(2));
+  });
+});
+
+test('a steering segment admitted before the first aggregate output keeps its original message position', async () => {
+  const parts = nativeSteeringContent([2, 3, 4].map(response => ({ text: `response-${response}`,
+    outputItem: { id: `item-${response}`, ordinal: 1, providerResponseId: `resp-${response}`, previousResponseId: `resp-${response - 1}` } })),
+  { 'resp-2': STEER_RECEIPT.submissionId });
+  const fixture = steeringChainRecords();
+  fixture.records.Message['message-a'].message_seq = '3';
+  await withSteeringContentWindow({ parts, firstSequence: 3, fixture }, async ({ projection, copy }) => {
+    assert.deepEqual(projection.value.messages.map(message => message.id), ['message-steer', 'message-a']);
+    assert.deepEqual(projection.value.index.messageById.get('message-a').content.parts, [parts[2]]);
+    assert.deepEqual(projection.value.pendingSteeringBoundaryMessageIds, []);
+    assert.deepEqual(await copy('message-a'), parts);
+  });
+});
+
+test('an unresolved steering prefix keeps its warning while a later independently proven boundary splits and copies', async () => {
+  const parts = nativeSteeringContent([
+    { text: 'before-1', outputItem: { id: 'before-1', ordinal: 1, providerResponseId: 'resp-1' } },
+    { text: 'before-2', outputItem: { id: 'before-2', ordinal: 2, providerResponseId: 'resp-1' } },
+    { text: 'unresolved-successor', outputItem: { id: 'unresolved', ordinal: 1, providerResponseId: 'resp-2', previousResponseId: 'resp-1' } },
+    { text: 'proven-successor', outputItem: { id: 'proven', ordinal: 1, providerResponseId: 'resp-3', previousResponseId: 'resp-2' } }
+  ], { 'resp-2': STEER_RECEIPT.submissionId, 'resp-3': SECOND_STEER_RECEIPT.submissionId });
+  const receipts = [STEER_RECEIPT, { ...STEER_RECEIPT, submissionId: 'conflicting-submission' }, SECOND_STEER_RECEIPT];
+  await withSteeringContentWindow({ parts, firstSequence: 2, fixture: twoSteeringChain(), receipts }, async ({ projection, copy }) => {
+    const successorId = 'message-a:steer-successor:resp-3';
+    assert.equal(projection.value.index.messageById.has('message-a:steer-successor:resp-2'), false);
+    assert.deepEqual(projection.value.index.messageById.get('message-a').content.parts, parts.slice(1, 3));
+    assert.deepEqual(projection.value.index.messageById.get(successorId).content.parts, [parts[3]]);
+    assert.deepEqual(projection.value.pendingSteeringBoundaryMessageIds, ['message-a']);
+    assert.deepEqual(await copy('message-a'), parts.slice(0, 3));
+    assert.deepEqual(await copy(successorId), parts.slice(3));
+  });
+});
+
 test('tool preview hands off only when durable message body and matching tool facts are ready', () => {
   const requests = { request: { conversationId: 'handoff-self', turnId: 'handoff-turn', modelRequestId: 'request', requestSeq: '1',
     providerId: 'provider', modelId: 'model', afterCommitSeq: '1', streamSeq: '3', text: '', thought: '',
@@ -469,17 +949,17 @@ test('tool preview hands off only when durable message body and matching tool fa
   const records = { ModelRequest: { request: { id: 'request', turn_id: 'handoff-turn', request_seq: '1', status: 'terminal', terminal_state: 'completed' } },
     ModelRequestMessageLink: { link: { id: 'handoff-link', model_request_id: 'request', message_id: 'handoff-message' } },
     Message: { 'handoff-message': { id: 'handoff-message', revision_id: 'handoff-revision' } },
-    ToolCall: { call: { id: 'handoff-call', turn_id: 'handoff-turn', tool_name: 'read', status: 'queued' } } };
+    ToolCall: { 'handoff-call': { id: 'handoff-call', turn_id: 'handoff-turn', tool_name: 'read', status: 'queued' } } };
   const ready = { 'message-content:handoff-revision': { status: 'ready', text: '{}', totalBytes: 2 } };
   modules.transient.reconcileReliableTransientRequests(requests, records, ready);
   assert.ok(requests.request, 'body hydration alone retains the only complete tool preview');
-  assert.equal(modules.preview.shouldKeepTransientToolCallPreview(records.ToolCall.call, undefined), true);
+  assert.equal(modules.preview.shouldKeepTransientToolCallPreview(records.ToolCall['handoff-call'], undefined), true);
   records.ToolCallSourceLink = { source: { id: 'handoff-source', tool_call_id: 'handoff-call', model_request_id: 'request',
     message_id: 'handoff-message', provider_call_id: 'handoff-provider-call', provider_ordinal: 0 } };
   modules.transient.reconcileReliableTransientRequests(requests, records, {});
   assert.ok(requests.request, 'matching tool facts alone retain the preview until body hydration');
-  records.ToolCall.call.status = 'executing';
-  assert.equal(modules.preview.shouldKeepTransientToolCallPreview(records.ToolCall.call, undefined), false);
+  records.ToolCall['handoff-call'].status = 'executing';
+  assert.equal(modules.preview.shouldKeepTransientToolCallPreview(records.ToolCall['handoff-call'], undefined), false);
   modules.transient.reconcileReliableTransientRequests(requests, records, ready);
   assert.equal(requests.request, undefined);
 });

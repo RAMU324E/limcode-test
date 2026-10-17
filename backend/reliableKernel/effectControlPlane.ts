@@ -3218,9 +3218,8 @@ export class EffectControlPlane {
         `ModelRequest ${modelRequestId} has no persisted complete native call item at ${identity.attemptSeq}/${identity.socketGeneration}/${identity.streamSeq}.`
       );
     }
-    const checkpointContent = parseNativeToolCallCheckpoint(
-      await this.readCheckpointContent(checkpoint)
-    );
+    const checkpointProof = await this.readCheckpointEnvelope(checkpoint);
+    const checkpointContent = parseNativeToolCallCheckpoint(checkpointProof.content, checkpointProof.contentType);
     if (
       checkpointContent.toolName !== entry.toolName
       || checkpointContent.providerCallId !== providerCallId
@@ -3284,6 +3283,10 @@ export class EffectControlPlane {
   }
 
   private async readCheckpointContent(checkpoint: DomainRow): Promise<unknown> {
+    return (await this.readCheckpointEnvelope(checkpoint)).content;
+  }
+
+  private async readCheckpointEnvelope(checkpoint: DomainRow): Promise<{ content: unknown; contentType: string }> {
     const metadata = await this.requireContentObject(
       requireId(checkpoint.content_object_id, 'ModelStreamCheckpoint.content_object_id')
     );
@@ -3292,7 +3295,7 @@ export class EffectControlPlane {
       || envelope.streamSeq !== String(checkpoint.stream_seq)) {
       throw new TypeError(`Native checkpoint ${String(checkpoint.id)} has an invalid envelope identity.`);
     }
-    return envelope.content;
+    return { content: envelope.content, contentType: metadata.content_type };
   }
 
   /**

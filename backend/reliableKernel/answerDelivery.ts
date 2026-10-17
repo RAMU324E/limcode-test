@@ -1,4 +1,5 @@
 import { runtimeDeliveryTimelineStep } from './timelineAcceptance';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import {
   ContentAddressedStore,
   type ContentObjectMetadata,
@@ -183,6 +184,7 @@ const PROCESS_COMPLETION_MODEL_SOURCE_CONTENT_TYPE =
 export class AnswerControlPlane {
   private readonly now: () => string;
   private readonly automaticDeliveryRouter: AutomaticRuntimeDeliveryRouter;
+  private readonly messageContents: LogicalMessageContentReader;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -192,6 +194,7 @@ export class AnswerControlPlane {
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.automaticDeliveryRouter = new AutomaticRuntimeDeliveryRouter(database, contentStore);
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
   }
 
   public async submit(commandInput: AnswerSubmitCommand): Promise<AnswerSubmitResult> {
@@ -656,7 +659,7 @@ export class AnswerControlPlane {
       'ContentObject',
       requirePhaseFId(payload.content_object_id, 'AnswerPayload.content_object_id')
     ) as ContentObjectMetadata;
-    const content = (await this.contentStore.read(contentRow)).toString('utf8');
+    const content = (await this.messageContents.read(contentRow)).toString('utf8');
     const sourceTurnId = requirePhaseFId(snapshot.currentSubmission.turn_id, 'AnswerSubmission.turn_id');
     const title = payload.title === null ? null : requirePhaseFText(payload.title, 'AnswerPayload.title');
     const outcome = answerSubmissionOutcome(snapshot.currentSubmission, childExecutionId);
@@ -669,7 +672,7 @@ export class AnswerControlPlane {
         sourceTurnId,
         title,
         content,
-        contentType: contentRow.content_type
+        contentType: logicalMessageContentType(contentRow.content_type)
       };
     }
     return {
@@ -680,7 +683,7 @@ export class AnswerControlPlane {
       sourceTurnId,
       title,
       content,
-      contentType: contentRow.content_type,
+      contentType: logicalMessageContentType(contentRow.content_type),
       interrupted: outcome === 'interrupted'
     };
   }
@@ -812,7 +815,7 @@ export class AnswerControlPlane {
       'ContentObject',
       requirePhaseFId(payload.content_object_id, 'AnswerPayload.content_object_id')
     ) as ContentObjectMetadata;
-    const content = (await this.contentStore.read(contentRow)).toString('utf8');
+    const content = (await this.messageContents.read(contentRow)).toString('utf8');
     const title = payload.title === null
       ? null
       : requirePhaseFText(payload.title, 'AnswerPayload.title');
@@ -1045,8 +1048,8 @@ export class AnswerControlPlane {
         'ContentObject',
         requirePhaseFId(revision.content_object_id, 'MessageRevision.content_object_id')
       ) as ContentObjectMetadata;
-      const raw = (await this.contentStore.read(metadata)).toString('utf8');
-      const extracted = extractVisibleAssistantText(raw, metadata.content_type);
+      const raw = (await this.messageContents.read(metadata)).toString('utf8');
+      const extracted = extractVisibleAssistantText(raw, logicalMessageContentType(metadata.content_type));
       if (extracted) visible.push(extracted);
     }
     const joined = visible.join('\n\n').trim();

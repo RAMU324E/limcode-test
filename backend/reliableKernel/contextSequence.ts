@@ -1,4 +1,5 @@
 import type { AcceptedAnswerNotice } from './answerPresentation';
+import { LogicalMessageContentReader, logicalMessageContentType, NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE } from './logicalMessageContent';
 import { runtimeDeliveryTimelineStep } from './timelineAcceptance';
 import { createHash } from 'node:crypto';
 import {
@@ -271,6 +272,7 @@ const EXPECTED_OCCURRENCE_CONSTRAINTS = [
 export class ContextSequenceControlPlane {
   private readonly now: () => string;
   private readonly metricsObserver: ContextSequenceMetricsObserver | undefined;
+  private readonly messageContents: LogicalMessageContentReader;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -279,6 +281,7 @@ export class ContextSequenceControlPlane {
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.metricsObserver = options.metricsObserver;
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
   }
 
   public async appendContent(command: ContextAppendCommand): Promise<ContextAppendResult> {
@@ -1284,7 +1287,7 @@ export class ContextSequenceControlPlane {
     this.observeMetrics({ kind: 'materialize', mode: 'content', count: 1 });
     return {
       root: barrier.snapshot.root,
-      segments: materializeContextSegments(barrier.snapshot.records),
+      segments: await materializeContextSegments(barrier.snapshot.records, this.messageContents),
       snapshotCommitSeq: barrier.snapshotCommitSeq
     };
   }
@@ -1300,7 +1303,7 @@ export class ContextSequenceControlPlane {
     const { snapshotCommitSeq } = barrier;
     return {
       structure: { root, records, snapshotCommitSeq },
-      content: { root, segments: materializeContextSegments(records), snapshotCommitSeq }
+      content: { root, segments: await materializeContextSegments(records, this.messageContents), snapshotCommitSeq }
     };
   }
 
@@ -2079,8 +2082,8 @@ export class ContextSequenceControlPlane {
       read: async (index) => ({
         segmentKind: requireSegmentKind(records[index].segment.segment_kind),
         messageRole: null,
-        contentType: metadata[index].content_type,
-        content: (await this.contentStore.read(metadata[index])).toString('utf8')
+        contentType: logicalMessageContentType(metadata[index].content_type),
+        content: (await this.messageContents.read(metadata[index])).toString('utf8')
       })
     }));
   }
@@ -2902,8 +2905,9 @@ function staleHeadError(conversationId: string): Error & { code: string } {
   return error;
 }
 
-function materializeContextSegments(records: ContextContentMaterializationRecord[]): MaterializedContextSegment[] {
-  return records.map((record) => ({
+async function materializeContextSegments(records: ContextContentMaterializationRecord[],
+  messageContents: LogicalMessageContentReader): Promise<MaterializedContextSegment[]> {
+  const segments: MaterializedContextSegment[] = records.map((record) => ({
     nodeId: requireId(record.node.id, 'ContextSequenceNode.id'),
     parentNodeId: nullableId(record.node.parent_node_id, 'ContextSequenceNode.parent_node_id'),
     segmentId: requireId(record.segment.id, 'ContextSegment.id'),
@@ -2917,6 +2921,12 @@ function materializeContextSegments(records: ContextContentMaterializationRecord
     contentObject: asContentObjectMetadata(record.contentObject),
     content: bufferView(record.content)
   }));
+  for (const segment of segments) {
+    if (segment.contentObject.content_type === NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE) {
+      segment.content = await messageContents.read(segment.contentObject);
+    }
+  }
+  return segments;
 }
 
 function asContentObjectMetadata(row: DomainRow): ContentObjectMetadata {

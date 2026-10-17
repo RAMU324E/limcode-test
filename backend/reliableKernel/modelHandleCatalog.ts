@@ -38,14 +38,19 @@ export interface ModelHandleEntry {
   sizeBytes?: number;
 }
 
+export type ModelHandleCatalogOperation =
+  | { kind: 'bind'; entry: ModelHandleEntry }
+  | { kind: 'extend-metadata'; entry: ModelHandleEntry }
+  | { kind: 'retire'; ref: string };
+
 export interface ModelHandleCatalog {
-  entries: ModelHandleEntry[];
+  entries: readonly ModelHandleEntry[];
   /** Reserved ordinals without an active target binding; private scopes never contribute aliases. */
   allocationHighWater?: Partial<Record<ModelHandleKind, number>>;
   /** One current identity contract; unmarked published recipes remain immutable historical facts. */
   identityContractRevision?: string;
   /** Ambiguous published Context addresses are never assigned or resolved again. */
-  retiredRefs?: string[];
+  retiredRefs?: readonly string[];
 }
 
 /** Read-only catalog data accepted by projection helpers; persisted catalogs keep their plain shape. */
@@ -65,6 +70,16 @@ interface ModelHandleLookup {
   readonly byTarget: ReadonlyMap<string, Readonly<ModelHandleEntry>>;
   readonly byRef: ReadonlyMap<string, Readonly<ModelHandleEntry>>;
   readonly retiredRefs: ReadonlySet<string>;
+  readonly allocationFrontier: Readonly<Partial<Record<ModelHandleKind, number>>>;
+  readonly entryCount: number;
+  readonly orderByRef: ReadonlyMap<string, number>;
+  readonly firstOrder: number;
+  readonly nextOrder: number;
+  /** Native and frozen private views keep only facts added to their exact immutable base. */
+  readonly nativePrevious?: ModelHandleLookup;
+  readonly nativeAddedEntries?: readonly ModelHandleEntry[];
+  readonly nativeLeadingEntries?: readonly ModelHandleEntry[];
+  materializedEntries?: readonly ModelHandleEntry[];
   projectText?: (value: string) => string;
 }
 
@@ -80,18 +95,237 @@ export function prepareModelHandleCatalog(value: unknown): PreparedModelHandleCa
   const catalog = normalizeModelHandleCatalog(value);
   const byTarget = new Map<string, Readonly<ModelHandleEntry>>();
   const byRef = new Map<string, Readonly<ModelHandleEntry>>();
+  const orderByRef = new Map<string, number>();
+  const allocationFrontier = { ...catalog.allocationHighWater };
   for (const entry of catalog.entries) {
     Object.freeze(entry);
     byTarget.set(targetKey(entry.kind, entry.target), entry);
     byRef.set(entry.ref, entry);
+    orderByRef.set(entry.ref, orderByRef.size);
+    allocationFrontier[entry.kind] = Math.max(allocationFrontier[entry.kind] ?? 0, Number(entry.ref.slice(1)));
+  }
+  for (const ref of catalog.retiredRefs ?? []) {
+    const kind = handleKindOfRef(ref)!;
+    allocationFrontier[kind] = Math.max(allocationFrontier[kind] ?? 0, Number(ref.slice(1)));
   }
   Object.freeze(catalog.entries);
   if (catalog.retiredRefs) Object.freeze(catalog.retiredRefs);
   if (catalog.allocationHighWater) Object.freeze(catalog.allocationHighWater);
   // The opaque type has no wire marker; ownership is established only by the private map below.
   const prepared = Object.freeze(catalog) as unknown as PreparedModelHandleCatalog;
-  preparedModelHandleLookups.set(prepared, { byTarget, byRef, retiredRefs: new Set(catalog.retiredRefs) });
+  preparedModelHandleLookups.set(prepared, { byTarget, byRef, retiredRefs: new Set(catalog.retiredRefs),
+    allocationFrontier: Object.freeze(allocationFrontier), orderByRef, firstOrder: 0, nextOrder: catalog.entries.length,
+    entryCount: catalog.entries.length, materializedEntries: catalog.entries });
   return prepared;
+}
+
+/** Native results add only their discovered persistent facts to an immutable prepared view. */
+export function discoverPreparedModelHandleCatalog(catalogInput: ModelHandleCatalog,
+  values: readonly unknown[]): { catalog: PreparedModelHandleCatalog; delta: ModelHandleCatalogDelta } {
+  const base = prepareModelHandleCatalog(catalogInput);
+  const lookup = preparedModelHandleLookups.get(base)!;
+  const frontier = { ...lookup.allocationFrontier };
+  const candidates: ModelHandleCandidate[] = [];
+  const seen = new WeakSet<object>();
+  for (const value of values) collectCandidates(value, candidates, seen);
+  const added = new Map<string, ModelHandleEntry>();
+  const extended = new Map<string, ModelHandleEntry>();
+  for (const candidate of candidates) {
+    // F addresses only enter through the frozen attachment registry, never arbitrary result JSON.
+    if (candidate.kind === 'attachment') continue;
+    const key = targetKey(candidate.kind, candidate.target);
+    const fresh = added.get(key);
+    if (fresh) { mergeMetadata(fresh, candidate); continue; }
+    const previous = extended.get(key) ?? lookupEntry(lookup, 'byTarget', key);
+    if (previous) {
+      if (!previous.name && candidate.name || !previous.mimeType && candidate.mimeType
+        || previous.sizeBytes === undefined && candidate.sizeBytes !== undefined) {
+        const entry = { ...previous }; mergeMetadata(entry, candidate); extended.set(key, entry);
+      }
+      continue;
+    }
+    const ordinal = (frontier[candidate.kind] ?? 0) + 1;
+    if (!Number.isSafeInteger(ordinal)) throw new RangeError('Model handle has exhausted its safe ordinal range.');
+    frontier[candidate.kind] = ordinal;
+    added.set(key, { ...candidate, ref: `${HANDLE_PREFIX[candidate.kind]}${ordinal}` });
+  }
+  const delta = { addedEntries: [...added.values()], metadataExtensions: [...extended.values()] };
+  if (!added.size && !extended.size) return { catalog: base, delta };
+  const changedByRef = new Map<string, ModelHandleEntry>();
+  for (const entry of [...delta.addedEntries, ...delta.metadataExtensions]) {
+    Object.freeze(entry); changedByRef.set(entry.ref, entry);
+  }
+  Object.freeze(delta.addedEntries); Object.freeze(delta.metadataExtensions);
+  const nextLookup: ModelHandleLookup = {
+    byRef: changedByRef, byTarget: new Map([...added, ...extended]),
+    retiredRefs: new Set(), allocationFrontier: Object.freeze(frontier),
+    orderByRef: new Map(delta.addedEntries.map((entry, index) => [entry.ref, lookup.nextOrder + index])),
+    firstOrder: lookup.firstOrder, nextOrder: lookup.nextOrder + added.size,
+    entryCount: lookup.entryCount + added.size, nativePrevious: lookup, nativeAddedEntries: delta.addedEntries,
+    ...(added.size === 0 && lookup.projectText ? { projectText: lookup.projectText } : {})
+  };
+  // Previous private views remain immutable but need not retain full arrays or matchers. Their
+  // sparse facts still serve old references, and a later exact read can derive that view again.
+  if (lookup.nativePrevious) { lookup.materializedEntries = undefined; lookup.projectText = undefined; }
+  const catalog = preparedModelHandleView(nextLookup, base);
+  return { catalog, delta };
+}
+
+/** Replay validated private operations without rebuilding the base entries or lookup indexes. */
+export function prepareModelHandleCatalogOverlay(catalogInput: ModelHandleCatalog,
+  operations: readonly ModelHandleCatalogOperation[], options: {
+    leadingEntries?: readonly ModelHandleEntry[];
+    header?: { identityContractRevision: string | null; allocationHighWater: Partial<Record<ModelHandleKind, number>> };
+  } = {}): PreparedModelHandleCatalog {
+  const base = prepareModelHandleCatalog(catalogInput);
+  const lookup = preparedModelHandleLookups.get(base)!;
+  const identityContractRevision = options.header ? options.header.identityContractRevision : base.identityContractRevision;
+  const floor = options.header?.allocationHighWater ?? base.allocationHighWater;
+  if (!operations.length && !options.leadingEntries?.length
+    && identityContractRevision === base.identityContractRevision
+    && Object.keys(floor ?? {}).length === Object.keys(base.allocationHighWater ?? {}).length
+    && Object.entries(floor ?? {}).every(([kind, ordinal]) => base.allocationHighWater?.[kind as ModelHandleKind] === ordinal)) return base;
+  const byRef = new Map<string, Readonly<ModelHandleEntry>>();
+  const byTarget = new Map<string, Readonly<ModelHandleEntry>>();
+  const orderByRef = new Map<string, number>();
+  const retired = new Set<string>();
+  const added: ModelHandleEntry[] = [];
+  const leading: ModelHandleEntry[] = [];
+  const frontier = { ...lookup.allocationFrontier };
+  for (const [kind, ordinal] of Object.entries(floor ?? {})) frontier[kind as ModelHandleKind] = Math.max(frontier[kind as ModelHandleKind] ?? 0, ordinal);
+  let entryCount = lookup.entryCount, nextOrder = lookup.nextOrder;
+  const firstOrder = lookup.firstOrder - (options.leadingEntries?.length ?? 0);
+  const currentEntry = (ref: string): Readonly<ModelHandleEntry> | undefined => retired.has(ref) ? undefined
+    : byRef.get(ref) ?? lookupEntry(lookup, 'byRef', ref);
+  const apply = (operation: ModelHandleCatalogOperation, beforeBase = false): void => {
+    if (operation.kind === 'retire') {
+      if (currentEntry(operation.ref)) entryCount -= 1;
+      if (!lookupRetired(lookup, operation.ref)) retired.add(operation.ref);
+      const kind = handleKindOfRef(operation.ref)!;
+      frontier[kind] = Math.max(frontier[kind] ?? 0, Number(operation.ref.slice(1)));
+      return;
+    }
+    const entry = operation.entry;
+    const previous = currentEntry(entry.ref);
+    if (retired.has(entry.ref) || lookupRetired(lookup, entry.ref)) throw overlayError('A retired catalog reference cannot be rebound.');
+    if (operation.kind === 'bind') {
+      if (previous) throw overlayError('A catalog binding cannot replace an existing reference.');
+      orderByRef.set(entry.ref, beforeBase ? firstOrder + leading.length : nextOrder++);
+      (beforeBase ? leading : added).push(entry); entryCount += 1;
+    } else {
+      if (!previous || previous.kind !== entry.kind || previous.target !== entry.target) throw overlayError('Catalog metadata extension changed its identity.');
+      for (const key of ['name', 'mimeType', 'sizeBytes'] as const) {
+        if (previous[key] !== undefined && previous[key] !== entry[key]) throw overlayError('Catalog metadata extension replaced established metadata.');
+      }
+    }
+    Object.freeze(entry); byRef.set(entry.ref, entry); byTarget.set(targetKey(entry.kind, entry.target), entry);
+    frontier[entry.kind] = Math.max(frontier[entry.kind] ?? 0, Number(entry.ref.slice(1)));
+  };
+  for (const entry of options.leadingEntries ?? []) apply({ kind: 'bind', entry }, true);
+  for (const operation of operations) apply(operation);
+  // Final targets obey the same uniqueness rule as an ordinary normalized catalog. A later
+  // retirement may legitimately remove a previous owner of a target within this operation chain.
+  byTarget.clear();
+  for (const entry of byRef.values()) if (!retired.has(entry.ref)) {
+    const key = targetKey(entry.kind, entry.target), previous = lookupEntry(lookup, 'byTarget', key);
+    if (byTarget.has(key) || previous && previous.ref !== entry.ref && !retired.has(previous.ref)) {
+      throw overlayError(`Duplicate model handle target for ${entry.kind}: ${entry.target}`);
+    }
+    byTarget.set(key, entry);
+  }
+  const next: ModelHandleLookup = { byRef, byTarget, orderByRef, firstOrder, nextOrder,
+    retiredRefs: retired, allocationFrontier: Object.freeze(frontier), entryCount,
+    nativePrevious: lookup, nativeAddedEntries: Object.freeze(added), nativeLeadingEntries: Object.freeze(leading) };
+  let retiredRefs: readonly string[] | undefined;
+  const readRetired = (): readonly string[] => retired.size ? retiredRefs ??= Object.freeze([
+    ...base.retiredRefs ?? [], ...retired].sort(compareModelHandleRefs)) : base.retiredRefs ?? [];
+  return preparedModelHandleView(next, { identityContractRevision: identityContractRevision ?? undefined,
+    ...(identityContractRevision && floor && Object.keys(floor).length ? { allocationHighWater: Object.freeze({ ...floor }) } : {}) }, readRetired);
+}
+
+function overlayError(message: string): Error {
+  return Object.assign(new Error(message), { code: 'MODEL_CONTEXT_HANDLE_STATE_INVALID' });
+}
+
+/** A distinct diagnostic owner can share an already prepared immutable lookup. */
+export function sharedPreparedModelHandleCatalog(catalogInput: ModelHandleCatalog): PreparedModelHandleCatalog {
+  const base = prepareModelHandleCatalog(catalogInput);
+  return preparedModelHandleView(preparedModelHandleLookups.get(base)!, base);
+}
+
+function preparedModelHandleView(lookup: ModelHandleLookup,
+  fields: Pick<ReadonlyModelHandleCatalog, 'identityContractRevision' | 'allocationHighWater' | 'retiredRefs'>,
+  readRetired: () => readonly string[] = () => fields.retiredRefs ?? []): PreparedModelHandleCatalog {
+  const catalog = Object.freeze({
+    get entries() { return nativeViewEntries(lookup); },
+    ...(fields.identityContractRevision ? { identityContractRevision: fields.identityContractRevision,
+      get retiredRefs() { return readRetired(); } } : {}),
+    ...(fields.allocationHighWater ? { allocationHighWater: fields.allocationHighWater } : {})
+  }) as PreparedModelHandleCatalog;
+  preparedModelHandleLookups.set(catalog, lookup);
+  return catalog;
+}
+
+function lookupRetired(lookup: ModelHandleLookup, ref: string): boolean {
+  for (let current: ModelHandleLookup | undefined = lookup; current; current = current.nativePrevious) {
+    if (current.retiredRefs.has(ref)) return true;
+  }
+  return false;
+}
+
+function lookupEntry(lookup: ModelHandleLookup, index: 'byRef' | 'byTarget', key: string): Readonly<ModelHandleEntry> | undefined {
+  for (let current: ModelHandleLookup | undefined = lookup; current; current = current.nativePrevious) {
+    const entry = current[index].get(key);
+    if (entry) return lookupRetired(lookup, entry.ref) ? undefined : entry;
+  }
+  return undefined;
+}
+
+function nativeViewEntries(lookup: ModelHandleLookup): readonly ModelHandleEntry[] {
+  if (lookup.materializedEntries) return lookup.materializedEntries;
+  const views: ModelHandleLookup[] = [];
+  let base = lookup;
+  while (!base.materializedEntries) { views.push(base); base = base.nativePrevious!; }
+  const replacements = new Map<string, Readonly<ModelHandleEntry>>();
+  const added: ModelHandleEntry[] = [];
+  const leading: ModelHandleEntry[] = [];
+  const retired = new Set<string>();
+  for (const view of views) for (const entry of view.nativeLeadingEntries ?? []) leading.push(entry);
+  for (let index = views.length - 1; index >= 0; index -= 1) {
+    for (const [ref, entry] of views[index].byRef) replacements.set(ref, entry);
+    for (const entry of views[index].nativeAddedEntries!) added.push(entry);
+    for (const ref of views[index].retiredRefs) retired.add(ref);
+  }
+  return lookup.materializedEntries = Object.freeze([...leading, ...base.materializedEntries, ...added]
+    .filter(entry => !retired.has(entry.ref))
+    .map(entry => replacements.get(entry.ref) ?? entry));
+}
+
+/** High-water facts and selected identities use the prepared indexes, never a full entry scan. */
+export function modelHandleAllocationFrontier(catalogInput: ModelHandleCatalog): Readonly<Partial<Record<ModelHandleKind, number>>> {
+  return preparedModelHandleLookups.get(prepareModelHandleCatalog(catalogInput))!.allocationFrontier;
+}
+
+export function selectModelHandleEntries(catalogInput: ModelHandleCatalog, refs: ReadonlySet<string>,
+  targets: ReadonlySet<string>): ModelHandleEntry[] {
+  const lookup = preparedModelHandleLookups.get(prepareModelHandleCatalog(catalogInput))!;
+  const selected = new Map<string, ModelHandleEntry>();
+  for (const ref of refs) {
+    const entry = lookupEntry(lookup, 'byRef', ref);
+    if (entry && isPersistentContextHandle(entry.kind)) selected.set(entry.ref, entry);
+  }
+  for (const target of targets) {
+    const entry = lookupEntry(lookup, 'byTarget', target);
+    if (entry && isPersistentContextHandle(entry.kind)) selected.set(entry.ref, entry);
+  }
+  const order = (ref: string): number => {
+    for (let current: ModelHandleLookup | undefined = lookup; current; current = current.nativePrevious) {
+      const position = current.orderByRef.get(ref);
+      if (position !== undefined) return position;
+    }
+    throw new Error(`Prepared model handle ${ref} has no entry order.`);
+  };
+  return [...selected.values()].sort((left, right) => order(left.ref) - order(right.ref));
 }
 
 export const CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION = '2026-10-01';
@@ -260,15 +494,7 @@ export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog 
   const record = asRecord(value);
   if (!record) throw new TypeError('modelHandleCatalog must be an object when present.');
   if (preparedModelHandleLookups.has(record)) {
-    const prepared = value as PreparedModelHandleCatalog;
-    return {
-      entries: prepared.entries.map(entry => ({ ...entry })),
-      ...(prepared.allocationHighWater ? { allocationHighWater: { ...prepared.allocationHighWater } } : {}),
-      ...(prepared.identityContractRevision === undefined ? {} : {
-        identityContractRevision: prepared.identityContractRevision,
-        retiredRefs: [...prepared.retiredRefs!]
-      })
-    };
+    return value as PreparedModelHandleCatalog;
   }
   const hasContract = 'identityContractRevision' in record;
   if (hasContract && record.identityContractRevision !== CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION) {
@@ -509,7 +735,7 @@ function compareHandleText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function currentModelHandleCatalog(entries: ModelHandleEntry[], retiredRefs: string[],
+function currentModelHandleCatalog(entries: ModelHandleEntry[], retiredRefs: readonly string[],
   allocationHighWater?: Partial<Record<ModelHandleKind, number>>): ModelHandleCatalog {
   return { entries, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
     retiredRefs: [...retiredRefs].sort(compareModelHandleRefs),
@@ -558,7 +784,7 @@ export function modelHandleRef(
   const normalizedTarget = optionalText(target);
   if (!normalizedTarget) return undefined;
   const catalog = prepareModelHandleCatalog(catalogInput);
-  return preparedModelHandleLookups.get(catalog)!.byTarget.get(targetKey(kind, normalizedTarget))?.ref;
+  return lookupEntry(preparedModelHandleLookups.get(catalog)!, 'byTarget', targetKey(kind, normalizedTarget))?.ref;
 }
 
 export function modelHandleTarget(
@@ -569,7 +795,7 @@ export function modelHandleTarget(
   const normalizedRef = optionalText(ref);
   if (!normalizedRef) return undefined;
   const catalog = prepareModelHandleCatalog(catalogInput);
-  const entry = preparedModelHandleLookups.get(catalog)!.byRef.get(normalizedRef);
+  const entry = lookupEntry(preparedModelHandleLookups.get(catalog)!, 'byRef', normalizedRef);
   return entry?.kind === kind ? entry.target : undefined;
 }
 
@@ -749,9 +975,19 @@ function projectKnownValue(value: unknown, catalog: PreparedModelHandleCatalog):
 }
 
 function projectKnownText(value: string, catalog: PreparedModelHandleCatalog): string {
-  if (!value.length || !catalog.entries.length) return value;
-  const lookup = preparedModelHandleLookups.get(catalog)!;
-  lookup.projectText ??= createModelHandleTextProjection(catalog.entries);
+  let lookup = preparedModelHandleLookups.get(catalog)!;
+  if (!value.length || !lookup.entryCount) return value;
+  // Metadata does not change text identity. A string without any newly allocated target uses
+  // the already prepared predecessor matcher, avoiding a full catalog build for every status.
+  while (lookup.nativePrevious && !lookup.nativeAddedEntries!.some(entry => value.includes(entry.target))
+    && !lookup.nativeLeadingEntries?.some(entry => value.includes(entry.target))
+    && ![...lookup.retiredRefs].some(ref => {
+      const previous = lookupEntry(lookup.nativePrevious!, 'byRef', ref);
+      return previous !== undefined && value.includes(previous.target);
+    })) {
+    lookup = lookup.nativePrevious;
+  }
+  lookup.projectText ??= createModelHandleTextProjection(nativeViewEntries(lookup));
   return lookup.projectText(value);
 }
 

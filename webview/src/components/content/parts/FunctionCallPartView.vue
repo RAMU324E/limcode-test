@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, getCurrentInstance, onBeforeUnmount, ref, watch } from 'vue';
 import { IconFileDiff, IconTool, IconPlayerStop, IconRefresh } from '@tabler/icons-vue';
 import {
   ASK_USER_TOOL_NAME,
@@ -33,6 +33,7 @@ import {
   transientToolCallPreviewForMessage
 } from '@webview/domain/reliableTransientModel';
 import type { ReliableToolOutcomeProjectionStatus } from '@webview/domain/reliableConversationProjection';
+import { reliableToolCallForPart } from '@webview/domain/reliablePresentationIndex';
 import {
   reliableKernelDetailDemandSignature,
   reliableKernelDetailKey
@@ -73,6 +74,8 @@ const props = defineProps<{
 }>();
 
 const reliableConversation = useReliableConversation();
+const detailOwner = `function-call:${getCurrentInstance()!.uid}`;
+onBeforeUnmount(() => reliableConversation.feed.setDetailOwnerKeys(detailOwner, []));
 const interactions = useInteractionStore();
 const expanded = ref(false);
 const callDetailsExpanded = ref(false);
@@ -108,19 +111,9 @@ const observedCancelResult = computed(() => {
 let autoApplyCountdownTimer: ReturnType<typeof setInterval> | undefined;
 let cancelProjectionTimer: ReturnType<typeof setTimeout> | undefined;
 const CANCEL_PROJECTION_DEADLINE_MS = 30_000;
-const toolCall = computed<ToolCallRecord | undefined>(() => {
-  const partId = props.part.id;
-  if (!props.messageId) return undefined;
-  const calls = reliableConversation.projection.value.toolCallsByMessageId[props.messageId] ?? [];
-  const exact = partId
-    ? calls.find((call) => call.id === partId || call.functionCallId === partId)
-    : undefined;
-  if (exact) return exact;
-  return calls.find((call) =>
-    call.name === props.part.functionCall.name
-    && (props.toolOrdinal === undefined || call.schedulingOrdinal === props.toolOrdinal)
-  );
-});
+const toolCall = computed<ToolCallRecord | undefined>(() => reliableToolCallForPart(
+  reliableConversation.projection.value.index, props.messageId, props.part, props.toolOrdinal
+));
 const toolResult = computed(() => {
   const call = toolCall.value;
   if (!call) return undefined;
@@ -508,7 +501,10 @@ watch(
   expandedDetailDemandSignature,
   () => {
     const call = toolCall.value;
-    if (!call || (!expanded.value && !hasMandatoryInteraction.value)) return;
+    const hydrate = Boolean(call && (expanded.value || hasMandatoryInteraction.value));
+    reliableConversation.feed.setDetailOwnerKeys(detailOwner, hydrate
+      ? expandedDetailTargets(call!.id).map(({ kind, recordId }) => reliableKernelDetailKey(kind, recordId)) : []);
+    if (!call || !hydrate) return;
     reliableConversation.ensureDetails({
       toolCallIds: [call.id],
       priority: hasMandatoryInteraction.value ? 'critical' : 'expanded'

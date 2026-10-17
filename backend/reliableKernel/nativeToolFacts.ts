@@ -11,7 +11,10 @@
  * Stage E (contextSequence) can share it without a module cycle.
  */
 import type { ModelOutputItemReference } from '../../shared/protocol';
-import { normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { normalizeModelHandleCatalog, prepareModelHandleCatalog, type ModelHandleCatalog, type PreparedModelHandleCatalog } from './modelHandleCatalog';
+import { readNativePrivateHandleCatalog } from './contextHandleCatalogStorage';
+import type { RuntimeDatabase } from './runtimeDatabase';
+import type { ContentAddressedStore } from './contentAddressedStore';
 import { normalizePlainJson } from './plainJson';
 
 /** ToolCallEvent.event_kind marking the durable native async/sync streamed admission of a call. */
@@ -21,6 +24,8 @@ export const TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY = 'native_delivery';
 
 export const NATIVE_TOOL_ADMISSION_CONTENT_TYPE = 'application/vnd.limcode.native-tool-admission+json';
 export const NATIVE_TOOL_DELIVERY_CONTENT_TYPE = 'application/vnd.limcode.native-tool-delivery+json';
+export const NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE = 'application/vnd.limcode.native-tool-call-proof+json';
+export const LEGACY_NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE = 'application/vnd.limcode.model-stream-checkpoint+json';
 
 /** ModelStreamCheckpoint content type for a complete native call item (kind native_tool_call). */
 export const NATIVE_TOOL_CALL_CHECKPOINT_TYPE = 'native_tool_call';
@@ -77,7 +82,8 @@ export interface NativeToolCallCheckpointContent {
   /** Trusted local interpretation frozen beside (never instead of) the original provider args. */
   resolvedArguments: unknown;
   argumentResolutionError?: string;
-  modelHandleCatalog: ModelHandleCatalog;
+  modelHandleCatalog?: ModelHandleCatalog;
+  modelHandleCatalogContentObjectId?: string;
   providerCallId: string;
   providerOrdinal: number;
   async: boolean;
@@ -203,17 +209,20 @@ export function parseNativeOutputItem(value: unknown, label: string): ModelOutpu
   }
   const providerResponseId = optionalRecordText(record, 'providerResponseId', label);
   const previousResponseId = optionalRecordText(record, 'previousResponseId', label);
+  const steeringSuccessorResponseId = optionalRecordText(record, 'steeringSuccessorResponseId', label);
   return {
     id,
     ordinal,
     ...(phase ? { phase } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),
-    ...(previousResponseId ? { previousResponseId } : {})
+    ...(previousResponseId ? { previousResponseId } : {}),
+    ...(steeringSuccessorResponseId ? { steeringSuccessorResponseId } : {})
   };
 }
 
 /** Parses persisted native_tool_call checkpoint content; throws TypeError on any drift. */
-export function parseNativeToolCallCheckpoint(value: unknown): NativeToolCallCheckpointContent {
+export function parseNativeToolCallCheckpoint(value: unknown,
+  contentType = LEGACY_NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE): NativeToolCallCheckpointContent {
   const record = requireObjectRecord(value, 'Native tool-call checkpoint content');
   if (record.type !== NATIVE_TOOL_CALL_CHECKPOINT_TYPE) {
     throw new TypeError(`Native tool-call checkpoint content type must be ${NATIVE_TOOL_CALL_CHECKPOINT_TYPE}.`);
@@ -232,9 +241,17 @@ export function parseNativeToolCallCheckpoint(value: unknown): NativeToolCallChe
     throw new TypeError('Native tool-call checkpoint requires an arguments field.');
   }
   if (!('resolvedArguments' in record)) throw new TypeError('Native tool-call checkpoint requires frozen resolvedArguments.');
-  const catalogValue = requireObjectRecord(record.modelHandleCatalog, 'Native tool-call modelHandleCatalog');
-  if (!Array.isArray(catalogValue.entries)) throw new TypeError('Native tool-call checkpoint requires modelHandleCatalog.entries.');
-  const modelHandleCatalog = normalizeModelHandleCatalog(catalogValue);
+  let modelHandleCatalog: ModelHandleCatalog | undefined;
+  let modelHandleCatalogContentObjectId: string | undefined;
+  if (contentType === NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE) {
+    if ('modelHandleCatalog' in record) throw new TypeError('Native tool-call reference proof cannot embed a catalog.');
+    modelHandleCatalogContentObjectId = requireRecordText(record, 'modelHandleCatalogContentObjectId', 'Native tool-call checkpoint');
+  } else if (contentType === LEGACY_NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE) {
+    if ('modelHandleCatalogContentObjectId' in record) throw new TypeError('Published native tool-call proof requires its inline catalog.');
+    const catalogValue = requireObjectRecord(record.modelHandleCatalog, 'Native tool-call modelHandleCatalog');
+    if (!Array.isArray(catalogValue.entries)) throw new TypeError('Native tool-call checkpoint requires modelHandleCatalog.entries.');
+    modelHandleCatalog = normalizeModelHandleCatalog(catalogValue);
+  } else throw new TypeError('Native tool-call checkpoint has an unsupported content type.');
   // The frozen resolution is content-addressed authority captured when the call was proven. It is
   // never re-derived with the current resolver: a later build may interpret handle references
   // differently, and re-deriving would reject (or silently change) an in-flight call. Only its
@@ -249,13 +266,30 @@ export function parseNativeToolCallCheckpoint(value: unknown): NativeToolCallChe
     toolName,
     arguments: record.arguments,
     resolvedArguments: record.resolvedArguments,
-    modelHandleCatalog,
+    ...(modelHandleCatalog ? { modelHandleCatalog } : { modelHandleCatalogContentObjectId: modelHandleCatalogContentObjectId! }),
     ...(argumentResolutionError !== undefined ? { argumentResolutionError } : {}),
     providerCallId,
     providerOrdinal,
     async: record.async,
     ...(outputItem ? { outputItem } : {})
   };
+}
+
+/** Explicit epoch 7 checkpoint descriptor edge; user/tool JSON never enters this decoder. */
+export function nativeToolCallProofReferences(contentType: string, value: unknown): string[] | undefined {
+  if (contentType !== NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE) return undefined;
+  const envelope = requireObjectRecord(value, 'Native tool-call checkpoint envelope');
+  if (envelope.kind !== NATIVE_TOOL_CALL_CHECKPOINT_TYPE) throw new TypeError('Native tool-call checkpoint envelope kind mismatch.');
+  const proof = parseNativeToolCallCheckpoint(envelope.content, contentType);
+  return [proof.modelHandleCatalogContentObjectId!];
+}
+
+/** Context provenance uses the same explicit frozen view as the original native proof. */
+export async function readNativeToolCallCatalog(database: RuntimeDatabase, store: ContentAddressedStore,
+  proof: NativeToolCallCheckpointContent): Promise<PreparedModelHandleCatalog> {
+  return proof.modelHandleCatalogContentObjectId
+    ? (await readNativePrivateHandleCatalog(database, store, proof.modelHandleCatalogContentObjectId)).catalog
+    : prepareModelHandleCatalog(proof.modelHandleCatalog);
 }
 
 /** Parses persisted native_control checkpoint content (the provider native event JSON). */

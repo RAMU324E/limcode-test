@@ -1,0 +1,28 @@
+{
+  "kind": "limcode-phase-d-candidate-evidence",
+  "stableId": "candidate.recovery.file-change-unresolved",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:39:45.955Z",
+  "assertionCount": 7,
+  "assertions": [
+    "重开数据库后expired Decision、cancelled Outcome、唯一ModelResult在同一事务原子收口且无Effect",
+    "重复unresolved扫描不重复决定或模型结果",
+    "一个Turn受前序call_seq阻塞时只defer该候选，继续收口其他Turn并在前序完成后重扫",
+    "active且无Lease的唯一finalize组合由恢复事务收口文件Decision/结果/TurnTermination，不自造新lease",
+    "approved/dispatched工具未收口时Turn terminal事务拒绝并保留Lease；真实Receipt完成后才允许终止",
+    "终止枚举后并发提交的新提案由同一writer事务assertAll捕获，terminal回滚且不会留下terminated+pending",
+    "turn-terminal在删除lease前同事务原子写expired Decision、cancelled Outcome和唯一ModelResult；重启扫描无需补洞"
+  ],
+  "faults": [
+    "unresolved proposal across database reopen",
+    "atomic expiry closure",
+    "turn-terminal unresolved closure before lease release",
+    "turn-terminal rejects in-flight effect",
+    "turn-terminal snapshot race rollback",
+    "blocked Turn does not abort global scan",
+    "active no-lease finalize judgment",
+    "no external effect",
+    "repeat scan"
+  ]
+}

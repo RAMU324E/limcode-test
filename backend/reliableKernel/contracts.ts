@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 
-export const RUNTIME_KERNEL_EPOCH = 6;
+export const RUNTIME_KERNEL_EPOCH = 7;
 export const RUNTIME_DATABASE_FILE = 'limcode.sqlite';
 export const RUNTIME_CAS_DIRECTORY = 'cas';
 export const ROOT_BINDING_POINTER_FILE = 'root-binding.json';
@@ -37,12 +37,19 @@ export interface RuntimeEpochManifest {
 export type RuntimeDomainMutation = 'insert' | 'update' | 'delete';
 export type RuntimeClientMapping = 'none' | 'summary' | 'detail' | 'window';
 
+export interface RuntimeChangeScope {
+  conversationIds: string[];
+  references: Array<{ domain: string; id: string }>;
+}
+
 export interface RuntimeChange {
   domain: string;
   kind: 'upsert' | 'remove';
   id: string;
-  /** Final committed row projection for upsert; removals carry identity only. */
+  /** Final committed row projection for upsert. */
   record?: Record<string, unknown>;
+  /** Pre-delete owner/link identities for bounded local and cross-Host refresh selection. */
+  scope?: RuntimeChangeScope;
 }
 
 export interface RuntimeAllocatedSequence {

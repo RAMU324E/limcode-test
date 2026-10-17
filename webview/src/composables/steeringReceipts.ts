@@ -1,6 +1,6 @@
 import { ref } from 'vue';
 import { nativeSteeringStateFollows, type NativeSteeringReceipt } from '@shared/openAIResponsesNative';
-import { hasSteeringApplicationReceipt } from '../domain/steeringReceiptProof.ts';
+import { createSteeringReceiptIndex, hasSteeringApplicationReceipt, type SteeringReceiptIndex } from '../domain/steeringReceiptProof.ts';
 
 export { hasSteeringApplicationReceipt };
 
@@ -26,7 +26,7 @@ export function steeringReceiptsByConversationState() {
 /** 状态标签仅描述经证实的事实；ACK 与转向内容被模型消费是两件不同的事。 */
 export function steeringReceiptPresentation(
   receipt: NativeSteeringReceipt,
-  requestReceipts: readonly NativeSteeringReceipt[] = []
+  requestReceipts: readonly NativeSteeringReceipt[] | SteeringReceiptIndex = []
 ): SteeringReceiptPresentation {
   const provenApplied = hasSteeringApplicationReceipt(receipt, requestReceipts);
   switch (receipt.state) {
@@ -135,12 +135,13 @@ export function visibleSteeringReceipts(
   now: number,
   dismissedVersions: Readonly<Record<string, string>> = {}
 ): NativeSteeringReceipt[] {
-  return receipts.filter((receipt) =>
-    (receipt.state === 'failed' || hasSteeringApplicationReceipt(receipt, receipts))
+  const index = createSteeringReceiptIndex(receipts);
+  return receipts.filter((receipt) => {
+    const applied = hasSteeringApplicationReceipt(receipt, index);
+    return (receipt.state === 'failed' || applied)
     && dismissedVersions[steeringReceiptDismissKey(receipt)] !== steeringReceiptVersion(receipt)
-    && !(hasSteeringApplicationReceipt(receipt, receipts)
-      && receipt.updatedAt + STEERING_SUCCESS_NOTICE_MS <= now)
-  );
+    && !(applied && receipt.updatedAt + STEERING_SUCCESS_NOTICE_MS <= now);
+  });
 }
 
 /** 已证实生效的继续中/已完成回执只短暂显示；面板按期限唤醒，无需等待下一次推送。 */
@@ -150,8 +151,9 @@ export function nextSteeringSuccessExpiry(
   dismissedVersions: Readonly<Record<string, string>> = {}
 ): number | undefined {
   let earliest: number | undefined;
+  const index = createSteeringReceiptIndex(receipts);
   for (const receipt of receipts) {
-    if (!hasSteeringApplicationReceipt(receipt, receipts)) continue;
+    if (!hasSteeringApplicationReceipt(receipt, index)) continue;
     if (dismissedVersions[steeringReceiptDismissKey(receipt)] === steeringReceiptVersion(receipt)) continue;
     const deadline = receipt.updatedAt + STEERING_SUCCESS_NOTICE_MS;
     if (deadline <= now) continue;

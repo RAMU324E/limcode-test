@@ -114,6 +114,7 @@ export async function createPublishedRuntime(previousEpoch, options = {}) {
 
     const oldSchemas = previousEpoch === 3
       ? kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS
+      : previousEpoch === 6 ? kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS
       : previousEpoch === 5 ? kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS
       : options.missingDeliveryLink
         ? kernel.EPOCH_4_MISSING_DELIVERY_LINK_SCHEMAS

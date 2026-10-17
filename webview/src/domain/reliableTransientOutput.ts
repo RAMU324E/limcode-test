@@ -1,3 +1,4 @@
+import { reliableOutputItemIdentity } from './reliableOutputItemIdentity';
 import type {
   ContentPart,
   MessageContent,
@@ -109,7 +110,7 @@ export function applyReliableTransientOutputItem(
   current: readonly ContentPart[],
   outputItem: ModelOutputItemReference
 ): ContentPart[] {
-  return current.map((part) => part.outputItem?.id === outputItem.id
+  return current.map((part) => reliableOutputItemIdentity(part.outputItem) === reliableOutputItemIdentity(outputItem)
     ? { ...part, outputItem } as ContentPart
     : part);
 }
@@ -152,7 +153,7 @@ function textPartIndex(
     return parts.findIndex((part) =>
       'text' in part
       && (part.thought === true) === thought
-      && part.outputItem?.id === outputItem.id);
+      && reliableOutputItemIdentity(part.outputItem) === reliableOutputItemIdentity(outputItem));
   }
   const lastIndex = parts.length - 1;
   const last = parts[lastIndex];
@@ -162,10 +163,27 @@ function textPartIndex(
 }
 
 function insertByOutputOrdinal(parts: ContentPart[], part: ContentPart): ContentPart[] {
-  const ordinal = part.outputItem?.ordinal;
-  if (ordinal === undefined) return [...parts, part];
-  const insertionIndex = parts.findIndex((candidate) =>
-    candidate.outputItem !== undefined && candidate.outputItem.ordinal > ordinal);
-  if (insertionIndex < 0) return [...parts, part];
-  return [...parts.slice(0, insertionIndex), part, ...parts.slice(insertionIndex)];
+  const item = part.outputItem;
+  if (!item) return [...parts, part];
+  const responseId = item.providerResponseId;
+  let insertion = -1, lastSameResponse = -1, lastPredecessor = -1;
+  parts.forEach((candidate, index) => {
+    const existing = candidate.outputItem;
+    if (existing?.providerResponseId === responseId) {
+      lastSameResponse = index;
+      if (insertion < 0 && existing && existing.ordinal > item.ordinal) insertion = index;
+    }
+    if (item.previousResponseId && existing?.providerResponseId === item.previousResponseId) lastPredecessor = index;
+  });
+  if (insertion < 0) insertion = lastSameResponse >= 0 ? lastSameResponse + 1 : lastPredecessor >= 0 ? lastPredecessor + 1 : parts.length;
+  return [...parts.slice(0, insertion), part, ...parts.slice(insertion)];
+}
+
+
+/** A sealed item carries the exact committed part, replacing only that physical response item. */
+export function replaceReliableTransientCommittedPart(current: readonly ContentPart[], part: ContentPart): ContentPart[] {
+  const id = reliableOutputItemIdentity(part.outputItem);
+  const index = id ? current.findIndex(candidate => reliableOutputItemIdentity(candidate.outputItem) === id) : -1;
+  if (index < 0) return insertByOutputOrdinal([...current], part);
+  const next = [...current]; next[index] = part; return next;
 }

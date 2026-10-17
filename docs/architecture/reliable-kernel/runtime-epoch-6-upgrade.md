@@ -1,6 +1,6 @@
-# Runtime epoch 6 的已发布来源升级
+# Runtime epoch 6 已发布边界与 epoch 7 升级
 
-本文记录当前 epoch 6 的升级边界。开发期 main 上依次出现过的 epoch 6–10 从未发布，已合并为这一次从已发布 3/4/5 到 6 的升级；它们的历史描述、journal 和中断恢复都不保留。
+epoch 6 已随 v0.0.42 于 2026-10-17 发布，源码基线 cbd46a9876233713b16b15ab2bc827fb4935ca9f。当前 Runtime 为 epoch 7。下文保留已发布 epoch 6 的准确领域与内容准入定义；新的升级使用独立 epoch-to-7 journal。
 
 ## 已发布来源证据
 
@@ -11,11 +11,11 @@ Epoch 5 已公开发布，不能作为未发布格式原地补表。以下发布
 - [v0.0.34](https://github.com/lurenxing628/limcode-test/releases/tag/v0.0.34)：`6a8874b830b78eb1451cd0b2e0f7afda34cdd18f`
 - [v0.0.36](https://github.com/lurenxing628/limcode-test/releases/tag/v0.0.36)：`e804698866c5f139b09e23a1bb245ee353c37499`
 
-`schema/publishedEpoch5.ts` 固定上述来源的完整描述，不从当前域数组推导 epoch 5。对 `{ domains, triggers, metadata }` 的 JSON SHA-256 为 `2dba9bcdb8341cd613808cb198f0fde920fe85316ee70a31c7158530b8e0fd3c`；普通域和 trigger 的原 schema SHA-256 为 `d50137fca19f104776c13105925fad7df50d7020108b91102124d756d38ebbba`。当前 epoch-6 保持原 107 个领域的全部表、列、既有索引定义和顺序；唯一具名例外是在 RuntimeDelivery 的原索引后追加 `(target_conversation_id,state,created_at,id)` 与 `(target_conversation_id,created_at,id)` 两个范围读取索引，由升级事务显式创建。模块严格比较这个精确的新定义，其余任何漂移均拒绝；已发布 epoch-5 描述始终不变。
+`schema/publishedEpoch5.ts` 固定上述来源的完整描述，不从当前域数组推导 epoch 5。对 `{ domains, triggers, metadata }` 的 JSON SHA-256 为 `2dba9bcdb8341cd613808cb198f0fde920fe85316ee70a31c7158530b8e0fd3c`；普通域和 trigger 的原 schema SHA-256 为 `d50137fca19f104776c13105925fad7df50d7020108b91102124d756d38ebbba`。已发布 epoch-6 保持原 107 个领域的全部表、列、既有索引定义和顺序；唯一具名例外是在 RuntimeDelivery 的原索引后追加 `(target_conversation_id,state,created_at,id)` 与 `(target_conversation_id,created_at,id)` 两个范围读取索引，由升级事务显式创建。模块严格比较这个精确的新定义，其余任何漂移均拒绝；已发布 epoch-5 描述始终不变。
 
-## 唯一的新边界
+## 已发布 epoch 6 的边界
 
-当前 epoch 为 6，在原有 107 领域之后新增 RuntimeDeliveryTimelineLink、CollaborationSendTimelineLink 、TimelineImportProvenance 和 RuntimeDeliveryAnswerPresentation 四张独立 insert-only 关系表，以及下文的两个上下文句柄领域，共 113 个领域。升级先创建空表，仅按不可变 Context append 链身份、父节点关系与相邻物理 Message 成员证明历史输入的位置；不能证明的输入、历史发送及 notify-only 不写位置。绝不从 created_at、updated_at 或跨对象排序猜测旧消息的收发顺序。既有领域记录、CAS、附件和旧表/index/trigger 原地保留。
+epoch 6，在原有 107 领域之后新增 RuntimeDeliveryTimelineLink、CollaborationSendTimelineLink 、TimelineImportProvenance 和 RuntimeDeliveryAnswerPresentation 四张独立 insert-only 关系表，以及下文的两个上下文句柄领域，共 113 个领域。升级先创建空表，仅按不可变 Context append 链身份、父节点关系与相邻物理 Message 成员证明历史输入的位置；不能证明的输入、历史发送及 notify-only 不写位置。绝不从 created_at、updated_at 或跨对象排序猜测旧消息的收发顺序。既有领域记录、CAS、附件和旧表/index/trigger 原地保留。
 
 来源只接受：精确 epoch 3 的两个已发布 manifest、完整 epoch 4、严格缺 RuntimeDeliveryIntentLink 的已知 epoch-4 前驱、完整 epoch 5。其余缺表、DDL、manifest、RootBinding、完整性错误一律拒绝；不存在通用 migration fallback。未开始的 3/4 可以直接升级到 6，原 bounded Child continuation 转换仍只用于原来的两个适用前驱。
 
@@ -36,7 +36,7 @@ Epoch 5 已公开发布，不能作为未发布格式原地补表。以下发布
 
 ## 验证入口
 
-`tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs` 覆盖 3/4/5 正常保留、五个当前故障点、旧 3→4 与 3/4→5 各持久边界（3/4→5 覆盖从 pending 到 completed 的全部状态）、epoch-5 全旧域记录与物理对象不变、空 timeline 关系、跨两页的 pending 句柄标记，以及 DDL/manifest/backup/binding 漂移拒绝和已发布 epoch-5 reader 拒绝打开 epoch 6。实际运行须使用仓库构建后测试入口；仅源码检查不等于已运行测试。
+`tests/reliable-kernel/storage-root-upgrade.test.mjs` 覆盖 3/4/5 正常保留、五个当前故障点、旧 3→4 与 3/4→5 各持久边界（3/4→5 覆盖从 pending 到 completed 的全部状态）、epoch-5 全旧域记录与物理对象不变、空 timeline 关系、跨两页的 pending 句柄标记，以及 DDL/manifest/backup/binding 漂移拒绝和已发布 epoch-5 reader 拒绝打开 epoch 6。使用仓库构建后的测试入口执行。
 
 ## 已接收的子任务结果
 
@@ -57,3 +57,15 @@ epoch 6 同时新增 ConversationContextHandleState 与 ContextRootHandleCatalog
 旧内联 tools 配方保留原字节与原读取路径；引用缺失、类型或摘要不符时拒绝，绝不退回当前工具设置。该引用是独立于生产者 Turn/Conversation 的强 CAS 边：分支沿用原配方，删除源对话不删正文，整库复制与合库继续携带全部已登记 ContentObject；未来可达性 GC 必须沿 toolsReference.contentObjectId 保留正文。
 
 候选发现、只读 preflight、后台逐库升级、历史查看及本地合并来源使用同一已发布来源集合 3/4/5；外来拷贝仍不原地升级，必须已经是当前 epoch 才能通过核验。升级备份清理保留原 3→4 永久保留规则；精确 3/4→5 与 3/4/5→6 的完成记录受 7 天、同身份和完整覆盖证明约束，任一未完成 journal 阻止清理。
+
+## 当前 epoch 7
+
+`schema/publishedEpoch6.ts` 固定 v0.0.42 的 113 领域、索引、metadata 与 trigger，独立于当前定义。`LATEST_PUBLISHED_RUNTIME_KERNEL_EPOCH` 为 6，当前准入为 7；新格式只用于新写入。
+
+- 精确 6→7 沿原备份、离线 Host、单事务、RootBinding 和 durable journal 流程，只更新 manifest 准入 epoch 与绑定；原领域行、目录、proof、projection、Message 与 CAS 字节保留。
+- 精确 3/4/5→7 继续执行原有领域新增、时间线回填与当前 head pending 标记。
+- 已存在的 `epoch-to-6-migration.json` 及 pending 先按原目标完成 6；完成记录仍写 toEpoch=6，随后独立备份并升级到 7。原 3→4、3/4→5 的中断职责保留。
+- 新目录根和最多 32 条操作的尾块、新 native 私有目录引用 proof/result、新原生 Message item 组合统一由 epoch 7 准入。旧格式按确切 content_type/kind 读取，所有新引用接入原有复制、分支和合库的 CAS 依赖闭包。
+- 候选发现、只读 preflight、后台升级、外来副本与历史合库共同接受已发布 3/4/5/6；外来根只在私有副本升级。备份清理识别原目标 6 与当前目标 7 的完成记录，任一未完成 journal 继续阻止清理。
+
+这一轮不新增内容哈希、验证戳、证明账本或全文扫描校验。

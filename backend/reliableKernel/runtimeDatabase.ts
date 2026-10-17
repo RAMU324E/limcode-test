@@ -444,6 +444,23 @@ export class RuntimeDatabase {
     return this.request({ kind: 'nativeAdmittedProviderCallIds', conversationId, segmentIds: [...segmentIds] });
   }
 
+  /** Complete prepared/streaming/retrying set for this exact Turn. */
+  public activeModelRequests(turnId: string): Promise<SnapshotBarrier<DomainRow[]>> {
+    return this.request({ kind: 'activeModelRequests', turnId });
+  }
+
+  public modelRequestStopCandidates(turnId: string): Promise<SnapshotBarrier<import('./modelRequestWorkSnapshot').ModelRequestStopCandidates>> {
+    return this.request({ kind: 'modelRequestStopCandidates', turnId });
+  }
+
+  public currentConversationTurns(conversationId: string, includeLatest = false): Promise<SnapshotBarrier<import('./conversationCurrentWorkSnapshot').CurrentConversationTurns>> {
+    return this.request({ kind: 'currentConversationTurns', conversationId, includeLatest });
+  }
+
+  public nativeSteeringReceipts(scope: import('./conversationCurrentWorkSnapshot').NativeSteeringReceiptScope): Promise<SnapshotBarrier<import('./conversationCurrentWorkSnapshot').NativeSteeringReceiptFacts>> {
+    return this.request({ kind: 'nativeSteeringReceipts', scope });
+  }
+
   public async snapshot(
     reads: RepositoryRead[]
   ): Promise<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>> {
@@ -496,12 +513,29 @@ export class RuntimeDatabase {
     return this.request({ kind: 'selectedContextAuthoritySource', input });
   }
 
-  /** Full child lineage and task inputs from one SQLite read transaction; no in-memory runner state. */
-  public async conversationChildTaskSnapshot(conversationId: string): Promise<SnapshotBarrier<ConversationChildTaskFacts>> {
+  /** Current relationships or an explicit historical page from one read transaction. */
+  public async conversationChildTaskSnapshot(conversationId: string,
+    options?: import('./childTaskFactsSnapshot').ConversationChildTaskSnapshotOptions): Promise<SnapshotBarrier<ConversationChildTaskFacts>> {
     if (typeof conversationId !== 'string' || conversationId.length === 0) {
       throw new TypeError('conversationId must be non-empty.');
     }
-    return this.request<SnapshotBarrier<ConversationChildTaskFacts>>({ kind: 'conversationChildTaskSnapshot', conversationId });
+    return this.request<SnapshotBarrier<ConversationChildTaskFacts>>({ kind: 'conversationChildTaskSnapshot', conversationId, options });
+  }
+
+  public childExecutionSnapshot(childExecutionId: string): Promise<SnapshotBarrier<import('./childExecutionFactsSnapshot').ChildExecutionSnapshot>> {
+    return this.request({ kind: 'childExecutionSnapshot', childExecutionId });
+  }
+
+  public childExecutionList(limit: number): Promise<SnapshotBarrier<import('./childExecutionFactsSnapshot').ChildExecutionSnapshot[]>> {
+    return this.request({ kind: 'childExecutionList', limit });
+  }
+
+  public childExecutionSubtreeSnapshot(childExecutionId: string, includeDescendants = true): Promise<SnapshotBarrier<import('./childExecutionFactsSnapshot').ChildExecutionSubtreeFacts>> {
+    return this.request({ kind: 'childExecutionSubtreeSnapshot', childExecutionId, includeDescendants });
+  }
+
+  public childContinuationWaitFacts(input: import('./childExecutionFactsSnapshot').ChildContinuationWaitFactsInput): Promise<SnapshotBarrier<import('./childExecutionFactsSnapshot').ChildContinuationWaitFacts>> {
+    return this.request({ kind: 'childContinuationWaitFacts', input });
   }
 
   /** DB-side aggregate: returns only terminal processes whose registered chunk facts are incomplete. */
@@ -1380,6 +1414,9 @@ function databaseMetricRequestKind(
   kind: DatabaseWorkerRequestPayload['kind']
 ): RuntimeDatabaseMetricRequestKind {
   if (kind === 'nativePendingWork' || kind === 'nativeSteeringInFlight' || kind === 'nativeAdmittedProviderCallIds') return 'snapshot';
+  if (kind === 'activeModelRequests' || kind === 'modelRequestStopCandidates'
+    || kind === 'currentConversationTurns' || kind === 'nativeSteeringReceipts') return 'snapshot';
+  if (kind === 'childExecutionSnapshot' || kind === 'childExecutionList' || kind === 'childExecutionSubtreeSnapshot' || kind === 'childContinuationWaitFacts') return 'snapshot';
   if (kind === 'selectedContextAuthoritySource' || kind === 'singleResponseMeasurement') return 'snapshot';
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
   if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';

@@ -1,3 +1,4 @@
+import { reliableOutputItemIdentity } from './reliableOutputItemIdentity';
 import { modelRequestObservedUsage, modelRequestObservedTiming } from '@shared/modelRequestMeasurement';
 import type {
   FunctionCallPart,
@@ -18,12 +19,17 @@ import type {
 } from '@shared/protocol';
 import { reliableKernelDetailKey } from './reliableDetailKey.ts';
 import {
+  reliableMessageContentWindowState,
+  type ReliableMessageContentWindow, type ReliableMessageContentWindowPresentation
+} from './reliableMessageContentWindow.ts';
+import {
   modelRequestNativeCapabilities,
   modelRequestResponseMetrics,
   modelRequestStreamStats
 } from '../reliability/modelRequestStreamStats.ts';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
-import { hasSteeringApplicationReceipt } from './steeringReceiptProof.ts';
+import { createSteeringReceiptIndex, hasSteeringApplicationReceipt, type SteeringReceiptIndex } from './steeringReceiptProof.ts';
+import { createReliablePresentationIndex, withReliablePresentationMessages, type ReliablePresentationIndex } from './reliablePresentationIndex.ts';
 import type {
   ReliableKernelDetailState,
   ReliableKernelTransientState
@@ -36,6 +42,7 @@ export interface ReliableConversationProjectionInput {
   conversationId: string;
   records: ReliableClientRecordBuckets;
   details: Record<string, ReliableKernelDetailState>;
+  messageContentWindows?: Record<string, ReliableMessageContentWindow>;
   transientModelRequests?: Record<string, ReliableKernelTransientState>;
   lastCommitSeq?: string | null;
   /** Only a full snapshot defines which historical request roots belong to the live window. */
@@ -77,6 +84,8 @@ export type ReliableToolOutcomeProjectionStatus =
   | 'missing';
 
 export interface ReliableConversationProjection {
+  contentWindowByMessageId: Record<string, ReliableMessageContentWindowPresentation>;
+  index: ReliablePresentationIndex;
   messages: MessageRecord[];
   absoluteFloorByMessageId: Record<string, number>;
   toolCalls: ToolCallRecord[];
@@ -114,6 +123,7 @@ interface ParsedMessage {
   message: MessageRecord;
   turnId?: string;
   revisionReady: boolean;
+  windowFirstSequence?: number;
   /** 原生聚合消息在转向边界拆分后，后继 run 条目指向来源聚合消息。 */
   splitFromMessageId?: string;
 }
@@ -122,6 +132,20 @@ interface FunctionCallTarget {
   messageId: string;
   part: FunctionCallPart;
   ordinal: number;
+}
+
+interface FunctionCallTargetIndex {
+  messagesById: Map<string, ParsedMessage>;
+  targetsByOwnerId: Map<string, { byCallId: Map<string, FunctionCallTarget>; byOrdinal: Map<number, FunctionCallTarget> }>;
+  partsByMessageId: Map<string, Set<FunctionCallPart>>;
+  callIdsByMessageId: Map<string, Set<string>>;
+  appendedPartsByMessageId: Map<string, FunctionCallPart[]>;
+}
+
+interface TurnProjectionIndex {
+  requestsByTurn: Map<string, ReliableClientRecord[]>;
+  callsByTurn: Map<string, ReliableClientRecord[]>;
+  pendingInteractionByTurn: Map<string, ReliableClientRecord>;
 }
 
 interface ParsedMessageContentCacheEntry {
@@ -159,6 +183,29 @@ function normalizedDetail(detail: ReliableKernelDetailState): string {
 export function projectReliableConversation(
   input: ReliableConversationProjectionInput
 ): ReliableConversationProjection {
+  return projectReliableConversationTransient(projectReliableCommittedConversation(input), input);
+}
+
+interface ReliableCommittedProjectionContext {
+  input: ReliableConversationProjectionInput;
+  messagesById: Map<string, ParsedMessage>;
+  modelRequestById: Map<string, ReliableClientRecord>;
+  sourceMessageIdByTurnId: Map<string, string>;
+  messageIdByModelRequestId: Map<string, string>;
+  latestRequestSeqByTurn: Map<string, bigint>;
+  requestsByTurn: Map<string, ReliableClientRecord[]>;
+  callsByTurn: Map<string, ReliableClientRecord[]>;
+  messagesByTurn: Map<string, ParsedMessage[]>;
+  steeringMessagesByTurn: Map<string, ParsedMessage[]>;
+  requestSequenceAnchors: Map<string, number | undefined>;
+  toolCallsBySourceMessageId: Map<string, ToolCallRecord[]>;
+  sourceByToolCallId: Map<string, ReliableClientRecord>;
+}
+const committedProjectionContexts = new WeakMap<ReliableConversationProjection, ReliableCommittedProjectionContext>();
+
+export function projectReliableCommittedConversation(
+  input: ReliableConversationProjectionInput
+): ReliableConversationProjection {
   const conversationId = input.conversationId.trim();
   if (!conversationId) return emptyProjection();
   const messageFacts = values(input.records.Message)
@@ -181,6 +228,7 @@ export function projectReliableConversation(
   }
 
   const loadingMessageRevisionIds: string[] = [];
+  const contentWindowByMessageId: Record<string, ReliableMessageContentWindowPresentation> = {};
   const messageRevisionIdByMessageId: Record<string, string> = {};
   const parsedMessages: ParsedMessage[] = [];
   for (const record of messageFacts) {
@@ -191,9 +239,21 @@ export function projectReliableConversation(
     if (!id || !revisionId) continue;
     messageRevisionIdByMessageId[id] = revisionId;
     const detail = input.details[reliableKernelDetailKey('message-content', revisionId)];
-    if (!detail || detail.status === 'loading') loadingMessageRevisionIds.push(revisionId);
-    const content = detail?.status === 'ready'
-      ? parseMessageContent(detail, role)
+    const contentWindow = input.messageContentWindows?.[id];
+    const windowed = Boolean(record.item_index_revision_id) && input.messageContentWindows !== undefined;
+    const contentState = windowed ? reliableMessageContentWindowState(contentWindow, String(record.item_index_revision_id), input.details) : undefined;
+    const items = contentState?.items ?? [];
+    const itemParts = items.flatMap(item => {
+      const itemDetail = input.details[reliableKernelDetailKey('message-content-item', item.contentObjectId)];
+      return itemDetail?.status === 'ready' ? parseReliableMessageContent(itemDetail, role).parts
+        : item.outputItem ? [{ text: '', outputItem: item.outputItem }] : [];
+    });
+    if (windowed) {
+      contentWindowByMessageId[id] = contentState!.presentation;
+      if (contentWindowByMessageId[id]!.loading) loadingMessageRevisionIds.push(revisionId);
+    } else if (!detail || detail.status === 'loading') loadingMessageRevisionIds.push(revisionId);
+    const content = windowed ? { role, parts: itemParts } satisfies MessageContent : detail?.status === 'ready'
+      ? parseReliableMessageContent(detail, role)
       : detail?.status === 'error'
         ? {
             role,
@@ -216,12 +276,14 @@ export function projectReliableConversation(
         ...(role === 'user' && steeringInputMessageIds.has(id) ? { steeringInput: true as const } : {}),
         seq: integer(record.display_seq) || integer(record.message_seq)
       },
-      revisionReady: detail?.status === 'ready',
+      revisionReady: windowed ? contentState!.ready : detail?.status === 'ready',
+      ...(windowed ? { windowFirstSequence: items[0]?.sequence ?? 0 } : {}),
       ...(turnIdByMessageId[id] ? { turnId: turnIdByMessageId[id] } : {})
     });
   }
 
   const modelRequestsByTurn = groupBy(values(input.records.ModelRequest), (record) => text(record.turn_id));
+  const modelRequestById = firstBy(values(input.records.ModelRequest), (record) => text(record.id));
   const modelRequestMessageLinks = values(input.records.ModelRequestMessageLink);
   const modelRequestIdByMessageId: Record<string, string> = {};
   for (const link of modelRequestMessageLinks) {
@@ -236,31 +298,36 @@ export function projectReliableConversation(
     modelRequestsByTurn,
     modelRequestMessageLinks
   );
-  appendTransientMessages({
-    messages: parsedMessages,
-    transientByRequest: input.transientModelRequests ?? {},
-    conversationId,
-    modelRequestById: firstBy(values(input.records.ModelRequest), (record) => text(record.id)),
-    sourceMessageIdByTurnId: new Map(values(input.records.Turn).flatMap((turn) => {
-      const turnId = text(turn.id);
-      const sourceMessageId = text(turn.source_message_id);
+  parsedMessages.sort(compareParsedMessages);
+  for (const entry of parsedMessages) if (entry.turnId) turnIdByMessageId[entry.message.id] = entry.turnId;
+  const messageIdByModelRequestId = new Map(modelRequestMessageLinks.flatMap((link) => {
+    const requestId = text(link.model_request_id), messageId = text(link.message_id);
+    return requestId && messageId ? [[requestId, messageId] as const] : [];
+  }));
+  const latestRequestSeqByTurn = new Map<string, bigint>();
+  for (const [turnId, requests] of modelRequestsByTurn) {
+    let latest = 0n;
+    for (const request of requests) {
+      const sequence = positiveBigInt(request.request_seq) ?? 0n;
+      if (sequence > latest) latest = sequence;
+    }
+    latestRequestSeqByTurn.set(turnId, latest);
+  }
+  const baseParsedMessages = parsedMessages.map(entry => ({ ...entry }));
+  const context: ReliableCommittedProjectionContext = {
+    input, messagesById: new Map(baseParsedMessages.map(entry => [entry.message.id, entry])),
+    modelRequestById, messageIdByModelRequestId, latestRequestSeqByTurn, requestsByTurn: modelRequestsByTurn,
+    sourceMessageIdByTurnId: new Map(values(input.records.Turn).flatMap(turn => {
+      const turnId = text(turn.id), sourceMessageId = text(turn.source_message_id);
       return turnId && sourceMessageId ? [[turnId, sourceMessageId] as const] : [];
     })),
-    messageIdByModelRequestId: new Map(modelRequestMessageLinks.flatMap((link) => {
-      const requestId = text(link.model_request_id);
-      const messageId = text(link.message_id);
-      return requestId && messageId ? [[requestId, messageId] as const] : [];
-    })),
-    toolCallFacts: values(input.records.ToolCall),
-    lastCommitSeq: input.lastCommitSeq ?? undefined,
-    lastSnapshotCommitSeq: input.lastSnapshotCommitSeq ?? undefined
-  });
-  parsedMessages.sort(compareParsedMessages);
-  // A streaming reply belongs to its Turn like the saved one that replaces it, so what is placed at
-  // that Turn keeps its place while the reply streams.
-  for (const entry of parsedMessages) {
-    if (entry.turnId && entry.message.id.startsWith('transient:')) turnIdByMessageId[entry.message.id] = entry.turnId;
-  }
+    callsByTurn: groupBy(values(input.records.ToolCall), call => text(call.turn_id)),
+    messagesByTurn: groupBy(baseParsedMessages, entry => entry.turnId),
+    steeringMessagesByTurn: groupBy(baseParsedMessages.filter(entry => entry.message.steeringInput), entry => entry.turnId),
+    requestSequenceAnchors: new Map(),
+    toolCallsBySourceMessageId: new Map(),
+    sourceByToolCallId: firstBy(values(input.records.ToolCallSourceLink), link => text(link.tool_call_id))
+  };
   const steeringBoundaries = splitAggregateMessagesAtSteeringBoundaries(
     parsedMessages,
     input.steeringReceipts ?? [],
@@ -269,12 +336,14 @@ export function projectReliableConversation(
   const splitSourceMessageIdByMessageId = steeringBoundaries.splitSourceMessageIdByMessageId;
   // 拆分条目继承来源消息的 Turn 归属；终止/运行展示按同一 Turn 解释，不虚构独立边界。
   for (const [syntheticId, sourceId] of Object.entries(splitSourceMessageIdByMessageId)) {
+    if (contentWindowByMessageId[sourceId]) contentWindowByMessageId[syntheticId] = contentWindowByMessageId[sourceId]!;
     const turnId = turnIdByMessageId[sourceId];
     if (turnId) turnIdByMessageId[syntheticId] = turnId;
   }
   const absoluteFloorByMessageId = projectAbsoluteMessageFloors(parsedMessages);
 
-  const callsByTurn = groupBy(values(input.records.ToolCall), (record) => text(record.turn_id));
+  const callsByTurn = context.callsByTurn;
+  const turnIndex = createTurnProjectionIndex(input.records, modelRequestsByTurn, callsByTurn);
   const interactionProjection = projectReliableInteractions(input.records, input.details);
   const interactionByToolCallId = interactionProjection.byToolCallId;
   const executionsByCall = firstBy(values(input.records.ToolExecution), (record) => text(record.tool_call_id));
@@ -288,12 +357,11 @@ export function projectReliableConversation(
   const missingToolArgumentIds: string[] = [];
   const missingToolResultIds: string[] = [];
 
-  const messagesByTurn = groupBy(parsedMessages, (entry) => entry.turnId);
-  const sourceByToolCallId = firstBy(values(input.records.ToolCallSourceLink), (link) => text(link.tool_call_id));
+  const functionTargets = functionCallTargetIndex(parsedMessages);
+  const sourceByToolCallId = context.sourceByToolCallId;
   const policyByToolCallId = firstBy(values(input.records.ToolCallPolicySnapshot), (snapshot) => text(snapshot.tool_call_id));
   for (const [turnId, rawCalls] of callsByTurn) {
     if (!turnId) continue;
-    const functionTargets = functionCallTargets(messagesByTurn.get(turnId) ?? []);
     const orderedCalls = [...rawCalls].sort(compareSequence('call_seq'));
     for (const raw of orderedCalls) {
       const id = text(raw.id);
@@ -304,7 +372,6 @@ export function projectReliableConversation(
       const target = resolveFunctionCallTarget({
         raw,
         functionTargets,
-        messages: messagesByTurn.get(turnId) ?? [],
         sourceLink
       });
       if (!target) continue;
@@ -348,7 +415,7 @@ export function projectReliableConversation(
         ...(durationMs(execution) !== undefined ? { durationMs: durationMs(execution) } : {})
       });
       ensureProjectedFunctionCall(
-        parsedMessages,
+        functionTargets,
         target,
         id,
         name,
@@ -356,19 +423,27 @@ export function projectReliableConversation(
       );
     }
   }
+  for (const [messageId, parts] of functionTargets.appendedPartsByMessageId) {
+    const entry = functionTargets.messagesById.get(messageId)!;
+    entry.message = { ...entry.message, content: { ...entry.message.content, parts: [...entry.message.content.parts, ...parts] } };
+  }
 
   const fileChanges = projectReliableFileChanges(input.records, input.details);
   const childConversationIdByToolCallId = projectChildConversationIdsByToolCallId(
     input.records,
     conversationId
   );
-  const terminationByMessageId = projectTurnTerminations(input.records, parsedMessages, conversationId);
+  const terminationByMessageId = projectTurnTerminations(input.records, parsedMessages, conversationId, turnIndex);
   const toolCallsByMessageId = objectGroups(toolCalls, (call) => call.messageId);
   const toolCallEventsByCallId = objectGroups(toolCallEvents, (event) => event.toolCallId);
   const toolEventIdsByCallId = Object.fromEntries(Object.entries(toolCallEventsByCallId)
     .map(([toolCallId, events]) => [toolCallId, events.map((event) => event.id)]));
-  return {
-    messages: parsedMessages.map((entry) => entry.message),
+  const messages = parsedMessages.map((entry) => entry.message);
+  context.toolCallsBySourceMessageId = groupBy(toolCalls, call => text(sourceByToolCallId.get(call.id)?.message_id));
+  const projection: ReliableConversationProjection = {
+    index: createReliablePresentationIndex(messages, toolCalls, turnIdByMessageId, undefined,
+      [...context.callsByTurn].filter(([, calls]) => calls.some(call => call.status === 'terminal')).map(([turnId]) => turnId)),
+    messages,
     absoluteFloorByMessageId,
     toolCalls,
     toolCallsByMessageId,
@@ -379,6 +454,7 @@ export function projectReliableConversation(
     modelRequestIdByMessageId,
     messageRevisionIdByMessageId,
     splitSourceMessageIdByMessageId,
+    contentWindowByMessageId,
     pendingSteeringBoundaryMessageIds: steeringBoundaries.pendingSteeringBoundaryMessageIds,
     terminationByMessageId,
     toolResultByCallId,
@@ -395,6 +471,117 @@ export function projectReliableConversation(
     missingToolEventIds: toolEventProjection.missingIds,
     missingInteractionPromptIds: interactionProjection.missingPromptIds,
     missingFileDiffMemberIds: fileChanges.missingMemberIds
+  };
+  committedProjectionContexts.set(projection, context);
+  return projection;
+}
+
+/** A transient frame projects only its request's current Message and steering successors. */
+export function projectReliableConversationTransient(
+  committed: ReliableConversationProjection,
+  input: Pick<ReliableConversationProjectionInput, 'transientModelRequests' | 'lastCommitSeq' | 'lastSnapshotCommitSeq'> & {
+    transientSequenceAnchors?: ReadonlyMap<string, number>;
+  }
+): ReliableConversationProjection {
+  const context = committedProjectionContexts.get(committed);
+  if (!context) return committed;
+  const transientByRequest = input.transientModelRequests ?? {};
+  const selected = new Map<string, ParsedMessage>();
+  const selectedRequestIds = new Set<string>();
+  for (const transient of Object.values(transientByRequest)) {
+    if (transient.conversationId !== context.input.conversationId) continue;
+    selectedRequestIds.add(transient.modelRequestId);
+    const messageId = context.messageIdByModelRequestId.get(transient.modelRequestId);
+    const entry = messageId ? context.messagesById.get(messageId) : undefined;
+    if (entry) selected.set(entry.message.id, { ...entry });
+  }
+  if (selectedRequestIds.size === 0) return committed;
+  const messages = [...selected.values()];
+  appendTransientMessages({
+    messages, transientByRequest, conversationId: context.input.conversationId,
+    modelRequestById: context.modelRequestById, sourceMessageIdByTurnId: context.sourceMessageIdByTurnId,
+    messageIdByModelRequestId: context.messageIdByModelRequestId, latestRequestSeqByTurn: context.latestRequestSeqByTurn,
+    toolCallsByTurn: context.callsByTurn, messagesById: context.messagesById,
+    requestsByTurn: context.requestsByTurn, messagesByTurn: context.messagesByTurn,
+    contentWindows: context.input.messageContentWindows, requestSequenceAnchors: context.requestSequenceAnchors,
+    transientSequenceAnchors: input.transientSequenceAnchors,
+    lastCommitSeq: input.lastCommitSeq ?? undefined, lastSnapshotCommitSeq: input.lastSnapshotCommitSeq ?? undefined
+  });
+  const changedSources = new Set(messages.filter(entry =>
+    entry.message !== context.messagesById.get(entry.message.id)?.message).map(entry => entry.message.id));
+  if (changedSources.size === 0) return committed;
+  const receipts = (context.input.steeringReceipts ?? []).filter(receipt => selectedRequestIds.has(receipt.modelRequestId ?? ''));
+  const turns = new Set(Object.values(transientByRequest).map(transient => transient.turnId));
+  for (const turnId of turns) for (const entry of context.steeringMessagesByTurn.get(turnId) ?? []) {
+    if (!selected.has(entry.message.id)) { selected.set(entry.message.id, entry); messages.push({ ...entry }); }
+  }
+  const boundary = splitAggregateMessagesAtSteeringBoundaries(messages, receipts, committed.modelRequestIdByMessageId);
+  const targets = functionCallTargetIndex(messages);
+  const replacements = new Map<string, ToolCallRecord | undefined>();
+  for (const sourceId of changedSources) {
+    for (const call of context.toolCallsBySourceMessageId.get(sourceId) ?? []) {
+      const raw = context.input.records.ToolCall?.[call.id];
+      if (!raw) continue;
+      const target = resolveFunctionCallTarget({ raw, functionTargets: targets, sourceLink: context.sourceByToolCallId.get(call.id) });
+      if (!target) replacements.set(call.id, undefined);
+      else {
+        if (target.messageId !== call.messageId) replacements.set(call.id, { ...call, messageId: target.messageId });
+        ensureProjectedFunctionCall(targets, target, call.id, call.name, call.args);
+      }
+    }
+  }
+  for (const [id, parts] of targets.appendedPartsByMessageId) {
+    const entry = targets.messagesById.get(id)!;
+    entry.message = { ...entry.message, content: { ...entry.message.content, parts: [...entry.message.content.parts, ...parts] } };
+  }
+  const replaces = (id: string): boolean => changedSources.has(committed.splitSourceMessageIdByMessageId[id] ?? id);
+  const overlayEntries = messages.filter(entry => changedSources.has(entry.splitFromMessageId ?? entry.message.id));
+  const projectedMessages = [
+    ...committed.messages.filter(message => !replaces(message.id)),
+    ...overlayEntries.map(entry => entry.message)
+  ].sort((left, right) => left.seq - right.seq || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+  const turnIdByMessageId = { ...committed.turnIdByMessageId };
+  const absoluteFloorByMessageId = { ...committed.absoluteFloorByMessageId };
+  const splitSourceMessageIdByMessageId = Object.fromEntries(Object.entries(committed.splitSourceMessageIdByMessageId)
+    .filter(([id]) => !replaces(id)));
+  const terminationByMessageId = { ...committed.terminationByMessageId };
+  const contentWindowByMessageId = { ...committed.contentWindowByMessageId };
+  const terminationByTurn = new Map<string, RunTerminationRecord>();
+  for (const [id, termination] of Object.entries(terminationByMessageId)) {
+    if (replaces(id)) {
+      terminationByTurn.set(termination.runId, termination);
+      delete terminationByMessageId[id];
+    }
+  }
+  const lastOverlayByTurn = new Map(overlayEntries.flatMap(entry => entry.turnId ? [[entry.turnId, entry] as const] : []));
+  for (const entry of overlayEntries) {
+    if (entry.turnId) {
+      turnIdByMessageId[entry.message.id] = entry.turnId;
+      const termination = terminationByTurn.get(entry.turnId);
+      if (termination) {
+        const previous = lastOverlayByTurn.get(entry.turnId);
+        if (previous) terminationByMessageId[previous.message.id] = termination;
+      }
+    }
+    const source = entry.splitFromMessageId;
+    if (source) {
+      splitSourceMessageIdByMessageId[entry.message.id] = source;
+      if (committed.contentWindowByMessageId[source]) contentWindowByMessageId[entry.message.id] = committed.contentWindowByMessageId[source]!;
+    }
+    const floor = committed.absoluteFloorByMessageId[source ?? entry.message.id] ?? positiveCeiling(entry.message.seq);
+    if (floor !== undefined) absoluteFloorByMessageId[entry.message.id] = floor;
+  }
+  const toolCalls = replacements.size === 0 ? committed.toolCalls
+    : committed.toolCalls.flatMap(call => replacements.has(call.id) ? replacements.get(call.id) ? [replacements.get(call.id)!] : [] : [call]);
+  const toolCallsByMessageId = replacements.size === 0 ? committed.toolCallsByMessageId : objectGroups(toolCalls, call => call.messageId);
+  return {
+    ...committed, messages: projectedMessages, toolCalls, toolCallsByMessageId,
+    index: replacements.size === 0 ? withReliablePresentationMessages(committed.index, projectedMessages)
+      : createReliablePresentationIndex(projectedMessages, toolCalls, turnIdByMessageId, committed.index, committed.index.completedToolTurnIds),
+    turnIdByMessageId, absoluteFloorByMessageId, splitSourceMessageIdByMessageId, terminationByMessageId, contentWindowByMessageId,
+    pendingSteeringBoundaryMessageIds: [
+      ...committed.pendingSteeringBoundaryMessageIds.filter(id => !replaces(id)), ...boundary.pendingSteeringBoundaryMessageIds
+    ]
   };
 }
 
@@ -533,19 +720,19 @@ function appendTransientMessages(input: {
   modelRequestById: Map<string, ReliableClientRecord>;
   sourceMessageIdByTurnId: Map<string, string>;
   messageIdByModelRequestId: Map<string, string>;
-  toolCallFacts: ReliableClientRecord[];
+  toolCallsByTurn: ReadonlyMap<string, ReliableClientRecord[]>;
+  latestRequestSeqByTurn: ReadonlyMap<string, bigint>;
+  messagesById: ReadonlyMap<string, ParsedMessage>;
+  requestsByTurn: ReadonlyMap<string, ReliableClientRecord[]>;
+  messagesByTurn: ReadonlyMap<string, ParsedMessage[]>;
+  contentWindows?: Record<string, ReliableMessageContentWindow>;
+  requestSequenceAnchors: Map<string, number | undefined>;
+  transientSequenceAnchors?: ReadonlyMap<string, number>;
   lastCommitSeq?: string;
   lastSnapshotCommitSeq?: string;
 }): void {
   const { messages, transientByRequest, conversationId } = input;
-  const durableLatestRequestSeqByTurn = new Map<string, bigint>();
-  for (const request of input.modelRequestById.values()) {
-    const turnId = text(request.turn_id);
-    const requestSeq = positiveBigInt(request.request_seq);
-    if (!turnId || requestSeq === undefined) continue;
-    const current = durableLatestRequestSeqByTurn.get(turnId);
-    if (current === undefined || requestSeq > current) durableLatestRequestSeqByTurn.set(turnId, requestSeq);
-  }
+  const durableLatestRequestSeqByTurn = input.latestRequestSeqByTurn;
   const active = Object.values(transientByRequest)
     .filter((entry) => entry.conversationId === conversationId)
     .sort(compareTransientRequests);
@@ -569,19 +756,20 @@ function appendTransientMessages(input: {
     // 只有非原生路径保留「前序调用未终结则不显示新输出」的抑制。
     const nativeAsyncContinuation = request !== undefined
       && modelRequestNativeCapabilities(request)?.asyncTools === true;
-    if (!nativeAsyncContinuation && !priorToolCallsSettled(transient, request, input.toolCallFacts)) continue;
+    if (!nativeAsyncContinuation && !priorToolCallsSettled(transient, request, input.toolCallsByTurn.get(transient.turnId) ?? [])) continue;
 
     const linkedMessageId = input.messageIdByModelRequestId.get(transient.modelRequestId);
     const durableTarget = linkedMessageId
       ? messages.find((entry) => entry.message.id === linkedMessageId)
       : undefined;
 
+    if (linkedMessageId && input.contentWindows?.[linkedMessageId]?.followTail === false) continue;
     const content = transientMessageContent(transient);
     const hasVisibleContent = content.parts.length > 0;
     // 原生流式会把每个完成 item 的不可变 Revision 提前推进为当前 Revision（durableTarget
     // 在请求未终结时就 revisionReady）。此时瞬态仍持有在飞 item 的实时增量，必须继续合并；
     // 非原生路径保持原有「Revision 就绪即丢弃瞬态」的行为不变。
-    const nativeEarlyRevision = durableTarget?.revisionReady === true
+    const nativeEarlyRevision = durableTarget !== undefined
       && (hasOutputItemIdentity(durableTarget.message.content) || hasOutputItemIdentity(content));
     if (durableTarget?.revisionReady && (!nativeEarlyRevision || request?.status === 'terminal')) continue;
 
@@ -617,14 +805,20 @@ function appendTransientMessages(input: {
       && (terminalState === 'completed' || (!terminalState && transient.status === 'completed'));
     const historical = (durableLatestRequestSeqByTurn.get(transient.turnId) ?? requestSeq) > requestSeq;
     if (historical || (durableCompleted && linkedMessageId !== undefined)) continue;
-    const anchoredSequence = transientSequenceAnchor({
-      messages,
+    const localAnchoredSequence = input.requestSequenceAnchors.has(transient.modelRequestId)
+      ? input.requestSequenceAnchors.get(transient.modelRequestId) : transientSequenceAnchor({
+      messages: [...input.messagesById.values()],
+      messagesById: input.messagesById,
+      requests: input.requestsByTurn.get(transient.turnId) ?? [],
+      turnMessages: input.messagesByTurn.get(transient.turnId) ?? [],
       transient,
       requestSeq,
       modelRequestById: input.modelRequestById,
       sourceMessageIdByTurnId: input.sourceMessageIdByTurnId,
       messageIdByModelRequestId: input.messageIdByModelRequestId
     });
+    input.requestSequenceAnchors.set(transient.modelRequestId, localAnchoredSequence);
+    const anchoredSequence = localAnchoredSequence ?? input.transientSequenceAnchors?.get(transient.modelRequestId);
     if (anchoredSequence === undefined) continue;
     const responseMetrics = request ? modelRequestResponseMetrics(modelRequestStreamStats(request)) : undefined;
     messages.push({
@@ -688,6 +882,9 @@ function compareTransientRequests(
 
 function transientSequenceAnchor(input: {
   messages: ParsedMessage[];
+  messagesById: ReadonlyMap<string, ParsedMessage>;
+  requests: readonly ReliableClientRecord[];
+  turnMessages: readonly ParsedMessage[];
   transient: ReliableKernelTransientState;
   requestSeq: bigint;
   modelRequestById: Map<string, ReliableClientRecord>;
@@ -698,13 +895,12 @@ function transientSequenceAnchor(input: {
   let lowerRequestSeq = -1n;
   let upper: ParsedMessage | undefined;
   let upperRequestSeq: bigint | undefined;
-  for (const request of input.modelRequestById.values()) {
-    if (text(request.turn_id) !== input.transient.turnId) continue;
+  for (const request of input.requests) {
     const candidateRequestSeq = positiveBigInt(request.request_seq);
     const requestId = text(request.id);
     const messageId = requestId ? input.messageIdByModelRequestId.get(requestId) : undefined;
     const candidate = messageId
-      ? input.messages.find((entry) => entry.message.id === messageId)
+      ? input.messagesById.get(messageId)
       : undefined;
     if (!candidate || candidateRequestSeq === undefined) continue;
     if (candidateRequestSeq < input.requestSeq && candidateRequestSeq > lowerRequestSeq) {
@@ -718,8 +914,7 @@ function transientSequenceAnchor(input: {
       upperRequestSeq = candidateRequestSeq;
     }
   }
-  for (const candidate of input.messages) {
-    if (candidate.turnId !== input.transient.turnId) continue;
+  for (const candidate of input.turnMessages) {
     const candidateRequestSeq = positiveBigInt(candidate.record.request_seq);
     if (candidateRequestSeq !== undefined && candidateRequestSeq < input.requestSeq) {
       if (candidateRequestSeq > lowerRequestSeq) {
@@ -737,7 +932,7 @@ function transientSequenceAnchor(input: {
   if (!lower) {
     const sourceMessageId = input.sourceMessageIdByTurnId.get(input.transient.turnId);
     if (sourceMessageId) {
-      lower = input.messages.find((candidate) => candidate.message.id === sourceMessageId);
+      lower = input.messagesById.get(sourceMessageId);
     }
     if (!lower) lower = [...input.messages].sort(compareParsedMessages).pop();
   }
@@ -777,35 +972,39 @@ function hasOutputItemIdentity(content: MessageContent): boolean {
 function mergeTransientContentWithDurable(durable: MessageContent, transient: MessageContent): MessageContent {
   if (transient.parts.length === 0) return durable;
   if (durable.parts.length === 0) return transient;
-  const transientItemIds = new Set<string>();
-  const transientCallIds = new Set<string>();
-  for (const part of transient.parts) {
-    const itemId = text(partOutputItem(part)?.id);
-    if (itemId) transientItemIds.add(itemId);
-    if ('functionCall' in part) {
-      const callId = text(part.id);
-      if (callId) transientCallIds.add(callId);
+  const identity = (part: MessageContent['parts'][number]): string | undefined => reliableOutputItemIdentity(part.outputItem)
+    ?? ('functionCall' in part && part.id ? `call:${part.id}` : undefined);
+  const transientById = new Map(transient.parts.flatMap(part => { const id = identity(part); return id ? [[id, part] as const] : []; }));
+  const used = new Set<string>();
+  const groups = new Map<string, MessageContent['parts']>();
+  const responseOrder: string[] = [];
+  const append = (part: MessageContent['parts'][number]): void => {
+    const response = part.outputItem?.providerResponseId ?? '';
+    let group = groups.get(response);
+    if (!group) {
+      group = []; groups.set(response, group);
+      const predecessor = part.outputItem?.previousResponseId;
+      const prior = predecessor ? responseOrder.indexOf(predecessor) : -1;
+      if (prior >= 0) responseOrder.splice(prior + 1, 0, response); else responseOrder.push(response);
     }
-  }
-  const merged = [...transient.parts];
+    group.push(part);
+  };
   for (const part of durable.parts) {
-    const itemId = text(partOutputItem(part)?.id);
-    if (itemId && transientItemIds.has(itemId)) continue;
-    const callId = 'functionCall' in part ? text(part.id) : undefined;
-    if (callId && transientCallIds.has(callId)) continue;
-    // 无身份部分无法安全去重；瞬态累计已覆盖同时序内容，宁可不插回。
-    if (!itemId && !callId) continue;
-    const ordinal = partOutputItem(part)?.ordinal;
-    const insertAt = ordinal === undefined
-      ? -1
-      : merged.findIndex((candidate) => {
-          const candidateOrdinal = partOutputItem(candidate)?.ordinal;
-          return candidateOrdinal !== undefined && candidateOrdinal > ordinal;
-        });
-    if (insertAt >= 0) merged.splice(insertAt, 0, part);
-    else merged.push(part);
+    const id = identity(part);
+    if (!id) continue;
+    append(transientById.get(id) ?? part); used.add(id);
   }
-  return { role: transient.role, parts: merged };
+  for (const part of transient.parts) {
+    const id = identity(part);
+    if (!id || !used.has(id)) append(part);
+  }
+  const parts: MessageContent['parts'] = [];
+  for (const response of responseOrder) {
+    const group = groups.get(response)!;
+    group.sort((left, right) => (left.outputItem?.ordinal ?? Number.MAX_SAFE_INTEGER) - (right.outputItem?.ordinal ?? Number.MAX_SAFE_INTEGER));
+    for (const part of group) parts.push(part);
+  }
+  return { role: transient.role, parts };
 }
 
 function transientCausalFrontierReached(
@@ -905,7 +1104,7 @@ function compareParsedMessages(left: ParsedMessage, right: ParsedMessage): numbe
  * 不能使已经证明的前缀边界整段回退，也不能被挪进未经证明的后继消息。
  */
 function responseRunsByProviderResponseId(
-  content: MessageContent
+  content: MessageContent, allowSingle = false
 ): Array<{ responseId?: string; parts: MessageContent['parts'] }> | undefined {
   const runs: Array<{ responseId?: string; parts: MessageContent['parts'] }> = [];
   for (const part of content.parts) {
@@ -914,7 +1113,7 @@ function responseRunsByProviderResponseId(
     if (last && last.responseId === responseId) last.parts.push(part);
     else runs.push({ ...(responseId ? { responseId } : {}), parts: [part] });
   }
-  return runs.length >= 2 ? runs : undefined;
+  return runs.length >= (allowSingle ? 1 : 2) ? runs : undefined;
 }
 
 interface SteeringBoundaryProjection {
@@ -927,7 +1126,7 @@ interface SteeringBoundaryProjection {
  * response）。只在转向回执认领的边界上拆分或标记待确认：
  * - 没有任何回执认领的边界是同一段的续流（例如工具结果后的新 response），内容留在当前段；
  * - 恰好一条已证实回执认领、后继身份与盖章前驱一致、且对应真实转向用户 Message 时拆出新段；
- * - 被认领但无法证实（未生效、冲突、盖章不符、转向消息缺失）时停止拆分，其后内容留在当前段并标记待确认。
+ * - 被认领但无法证实（未生效、冲突、盖章不符、转向消息缺失）时内容留在当前段并标记待确认；后续边界继续独立判断。
  * 同一回合里还有未被任何回执覆盖的转向消息时，续流的归属无法确认，同样标记待确认。
  * 所有拆分只影响展示，ToolCallSourceLink 和持久化消息身份仍归来源聚合 Message。
  */
@@ -943,66 +1142,92 @@ function splitAggregateMessagesAtSteeringBoundaries(
   if (steeringReceipts.length === 0) return result;
   const messagesById = new Map(messages.map((entry) => [entry.message.id, entry]));
   const receiptMessageIds = new Set(steeringReceipts.flatMap((receipt) => receipt.messageId ? [receipt.messageId] : []));
+  const receiptsByRequest = groupBy([...steeringReceipts], (receipt) => receipt.modelRequestId);
+  const receiptIndex = createSteeringReceiptIndex(steeringReceipts);
+  const unaccountedSteerSeqByTurn = new Map<string, number>();
+  for (const entry of messages) {
+    if (entry.turnId && entry.message.role === 'user' && entry.message.steeringInput && !receiptMessageIds.has(entry.message.id)) {
+      unaccountedSteerSeqByTurn.set(entry.turnId, Math.max(unaccountedSteerSeqByTurn.get(entry.turnId) ?? 0, entry.message.seq));
+    }
+  }
   for (const entry of [...messages].sort(compareParsedMessages)) {
     if (entry.message.role !== 'model') continue;
-    const runs = responseRunsByProviderResponseId(entry.message.content);
-    if (!runs?.[0]?.responseId) continue;
+    const startsWithinWindow = (entry.windowFirstSequence ?? 1) > 1;
+    const runs = responseRunsByProviderResponseId(entry.message.content, startsWithinWindow);
+    if (!runs?.[0]) continue;
     const requestId = modelRequestIdByMessageId[entry.message.id];
     if (!requestId || !entry.turnId) continue;
-    const requestReceipts = steeringReceipts.filter((receipt) =>
-      receipt.modelRequestId === requestId
-      && receipt.conversationId === entry.message.conversationId
+    const requestReceipts = (receiptsByRequest.get(requestId) ?? []).filter((receipt) =>
+      receipt.conversationId === entry.message.conversationId
       && receipt.turnId === entry.turnId
     );
     if (requestReceipts.length === 0) continue;
+    const successorClaims = new Map<string, NativeSteeringReceipt[]>();
+    const predecessorClaims = new Map<string, NativeSteeringReceipt[]>();
+    const targetResponseIds = new Set<string>();
+    const openSubmissionIds = new Set<string>();
+    for (const receipt of requestReceipts) {
+      if (receipt.state === 'failed') continue;
+      openSubmissionIds.add(receipt.submissionId);
+      if (receipt.targetResponseId) targetResponseIds.add(receipt.targetResponseId);
+      const ids = receipt.successorResponseId ? [receipt.successorResponseId]
+        : [...new Set([receipt.targetResponseId, receipt.responseId].filter((id): id is string => Boolean(id)))];
+      const map = receipt.successorResponseId ? successorClaims : predecessorClaims;
+      for (const id of ids) {
+        const claims = map.get(id) ?? [];
+        claims.push(receipt);
+        map.set(id, claims);
+      }
+    }
 
-    const segments: Array<{ steer?: ParsedMessage; responseId?: string; parts: MessageContent['parts'] }> = [
-      { parts: [...runs[0]!.parts] }
-    ];
+    const segments: Array<{ steer?: ParsedMessage; responseId?: string; parts: MessageContent['parts']; pending?: boolean }> = [{ parts: [] }];
     const usedSubmissionIds = new Set<string>();
+    const earlierResponseIds = new Set<string>();
     let previousSteerSeq = entry.message.seq;
-    let unresolved = false;
     let continued = false;
-    for (let index = 1; index < runs.length; index += 1) {
+    for (let index = 0; index < runs.length; index += 1) {
       const run = runs[index]!;
       const current = segments[segments.length - 1]!;
-      if (unresolved) {
-        current.parts.push(...run.parts);
+      if (index === 0 && !startsWithinWindow) {
+        for (const part of run.parts) current.parts.push(part);
+        if (run.responseId) earlierResponseIds.add(run.responseId);
         continue;
       }
+      const windowStart = index === 0;
+      const previousResponseId = windowStart
+        ? text(partOutputItem(run.parts[0]!)?.previousResponseId) : runs[index - 1]!.responseId;
+      if (windowStart && previousResponseId) earlierResponseIds.add(previousResponseId);
       const boundary = classifySteeringBoundary({
-        runs, index, requestReceipts, usedSubmissionIds, messagesById, entry, previousSteerSeq
+        run, previousResponseId, windowStart, receiptIndex, successorClaims, predecessorClaims, targetResponseIds, openSubmissionIds,
+        earlierResponseIds, usedSubmissionIds, messagesById, entry, previousSteerSeq
       });
+      if (run.responseId) earlierResponseIds.add(run.responseId);
       if (boundary.kind === 'split') {
         usedSubmissionIds.add(boundary.receipt.submissionId);
         previousSteerSeq = boundary.steer.message.seq;
-        segments.push({ steer: boundary.steer, responseId: run.responseId, parts: [...run.parts] });
+        segments.push({ steer: boundary.steer, responseId: boundary.receipt.successorResponseId,
+          parts: [...run.parts], ...(boundary.pending ? { pending: true } : {}) });
         continue;
       }
-      current.parts.push(...run.parts);
-      if (boundary.kind === 'unresolved') unresolved = true;
-      else continued = true;
+      for (const part of run.parts) current.parts.push(part);
+      if (boundary.kind === 'unresolved') current.pending = true;
+      else if (!windowStart) continued = true;
     }
     // A steering Message of this Turn that no receipt accounts for may own a continuation.
-    const unaccountedSteer = continued && messages.some((candidate) =>
-      candidate.turnId === entry.turnId
-      && candidate.message.role === 'user'
-      && candidate.message.steeringInput === true
-      && candidate.message.seq > entry.message.seq
-      && !receiptMessageIds.has(candidate.message.id)
-    );
+    const unaccountedSteer = continued && (unaccountedSteerSeqByTurn.get(entry.turnId) ?? 0) > entry.message.seq;
     const originalMessage = entry.message;
-    const pendingIds = (lastId: string): void => {
-      if (unresolved || unaccountedSteer) result.pendingSteeringBoundaryMessageIds.push(lastId);
+    const pendingIds = (segment: typeof segments[number], id: string): void => {
+      if (segment.pending) result.pendingSteeringBoundaryMessageIds.push(id);
     };
     if (segments.length === 1) {
-      pendingIds(originalMessage.id);
+      if (segments[0]!.pending || unaccountedSteer) result.pendingSteeringBoundaryMessageIds.push(originalMessage.id);
       continue;
     }
     entry.message = {
       ...originalMessage,
       content: { ...originalMessage.content, parts: segments[0]!.parts }
     };
+    pendingIds(segments[0]!, originalMessage.id);
     let lastId = originalMessage.id;
     for (const segment of segments.slice(1)) {
       const syntheticId = `${originalMessage.id}:steer-successor:${segment.responseId}`;
@@ -1018,6 +1243,7 @@ function splitAggregateMessagesAtSteeringBoundaries(
         record: entry.record,
         ...(entry.turnId ? { turnId: entry.turnId } : {}),
         revisionReady: entry.revisionReady,
+        windowFirstSequence: entry.windowFirstSequence,
         splitFromMessageId: originalMessage.id,
         message: {
           ...messageBase,
@@ -1026,9 +1252,10 @@ function splitAggregateMessagesAtSteeringBoundaries(
           seq: segment.steer!.message.seq + 0.25
         }
       });
+      pendingIds(segment, syntheticId);
       lastId = syntheticId;
     }
-    pendingIds(lastId);
+    if (unaccountedSteer && !segments[segments.length - 1]!.pending) result.pendingSteeringBoundaryMessageIds.push(lastId);
   }
   messages.sort(compareParsedMessages);
   return result;
@@ -1037,66 +1264,116 @@ function splitAggregateMessagesAtSteeringBoundaries(
 type SteeringBoundary =
   | { kind: 'continuation' }
   | { kind: 'unresolved' }
-  | { kind: 'split'; receipt: NativeSteeringReceipt; steer: ParsedMessage };
+  | { kind: 'split'; receipt: NativeSteeringReceipt; steer: ParsedMessage; pending?: boolean };
 
 /**
  * A receipt claims the boundary into its recorded successor; one without a successor yet claims the
  * boundary after the response it steered (its target, or its latest observed response), since that
  * next response may be its successor. Failed receipts and receipts already placed claim nothing.
  */
-function classifySteeringBoundary(input: {
-  runs: Array<{ responseId?: string; parts: MessageContent['parts'] }>;
-  index: number;
-  requestReceipts: readonly NativeSteeringReceipt[];
+interface SteeringBoundaryInput {
+  run: { responseId?: string; parts: MessageContent['parts'] };
+  previousResponseId?: string;
+  windowStart: boolean;
+  receiptIndex: SteeringReceiptIndex;
+  successorClaims: ReadonlyMap<string, readonly NativeSteeringReceipt[]>;
+  predecessorClaims: ReadonlyMap<string, readonly NativeSteeringReceipt[]>;
+  targetResponseIds: ReadonlySet<string>;
+  openSubmissionIds: ReadonlySet<string>;
+  earlierResponseIds: ReadonlySet<string>;
   usedSubmissionIds: ReadonlySet<string>;
   messagesById: ReadonlyMap<string, ParsedMessage>;
   entry: ParsedMessage;
   previousSteerSeq: number;
-}): SteeringBoundary {
-  const run = input.runs[input.index]!;
-  const previousResponseId = input.runs[input.index - 1]!.responseId;
-  const open = input.requestReceipts.filter((receipt) =>
-    receipt.state !== 'failed' && !input.usedSubmissionIds.has(receipt.submissionId));
-  // Without both response identities the boundary cannot be told apart from a steer successor.
-  if (!run.responseId || !previousResponseId) return open.length > 0 ? { kind: 'unresolved' } : { kind: 'continuation' };
-  const claiming = open.filter((receipt) => receipt.successorResponseId
-    ? receipt.successorResponseId === run.responseId
-    : receipt.targetResponseId === previousResponseId || receipt.responseId === previousResponseId);
-  if (claiming.length === 0) return { kind: 'continuation' };
+}
+
+function classifySteeringBoundary(input: SteeringBoundaryInput): SteeringBoundary {
+  const { run, previousResponseId } = input;
+  const claiming = [...(run.responseId ? input.successorClaims.get(run.responseId) ?? [] : []),
+    ...(previousResponseId ? input.predecessorClaims.get(previousResponseId) ?? [] : [])]
+    .filter((receipt) => !input.usedSubmissionIds.has(receipt.submissionId));
+  let boundary: SteeringBoundary = { kind: 'continuation' };
+  if (claiming.length > 0) boundary = proveSteeringBoundary(input, claiming, 'boundary');
+  else if ((!run.responseId || (!previousResponseId && !input.windowStart))
+    && input.openSubmissionIds.size > input.usedSubmissionIds.size) boundary = { kind: 'unresolved' };
+  if (!input.windowStart || boundary.kind === 'split') return boundary;
+  // The item carries its actual steering segment independently of how many physical tool-result
+  // responses precede this window. Physical predecessor identity alone cannot recover that owner.
+  const segmentResponseId = text(partOutputItem(run.parts[0]!)?.steeringSuccessorResponseId);
+  if (!segmentResponseId) return boundary.kind === 'continuation' && run.responseId
+    && !input.targetResponseIds.has(run.responseId) && input.openSubmissionIds.size > input.usedSubmissionIds.size
+    ? { kind: 'unresolved' } : boundary;
+  const inheritedClaims = (input.successorClaims.get(segmentResponseId) ?? [])
+    .filter(receipt => !input.usedSubmissionIds.has(receipt.submissionId));
+  if (inheritedClaims.length === 0) return { kind: 'unresolved' };
+  const inherited = proveSteeringBoundary(input, inheritedClaims, 'segment');
+  if (inherited.kind === 'continuation') return boundary;
+  return inherited.kind === 'split' && boundary.kind === 'unresolved' ? { ...inherited, pending: true } : inherited;
+}
+
+function proveSteeringBoundary(
+  input: SteeringBoundaryInput,
+  claiming: readonly NativeSteeringReceipt[],
+  relation: 'boundary' | 'segment'
+): SteeringBoundary {
+  const { run, previousResponseId } = input;
   const receipt = claiming[0]!;
+  const segmentResponseId = text(partOutputItem(run.parts[0]!)?.steeringSuccessorResponseId);
   // 一个物理后继被两次转向同时认领是证据冲突，不能挑任意一条渲染为生效。
-  if (claiming.length !== 1 || !hasSteeringApplicationReceipt(receipt, input.requestReceipts)
-    || receipt.successorResponseId !== run.responseId) return { kind: 'unresolved' };
+  if (!run.responseId || claiming.length !== 1
+    || !hasSteeringApplicationReceipt(receipt, input.receiptIndex)
+    || receipt.successorResponseId !== (relation === 'boundary' ? run.responseId : segmentResponseId)) return { kind: 'unresolved' };
   // The steer targeted this response or an earlier one of the same request (a tool continuation
   // may come in between); the successor itself must be stamped as following the previous response.
-  const earlierResponseIds = new Set(input.runs.slice(0, input.index).map((candidate) => candidate.responseId));
-  if (!earlierResponseIds.has(receipt.targetResponseId)) return { kind: 'unresolved' };
-  if (run.parts.some((part) => text(partOutputItem(part)?.previousResponseId) !== previousResponseId)) {
-    return { kind: 'unresolved' };
-  }
+  if (segmentResponseId) {
+    if (run.parts.some(part => text(partOutputItem(part)?.steeringSuccessorResponseId) !== receipt.successorResponseId)) return { kind: 'unresolved' };
+  } else if (!previousResponseId || !input.earlierResponseIds.has(receipt.targetResponseId!)
+    || run.parts.some(part => text(partOutputItem(part)?.previousResponseId) !== previousResponseId)) return { kind: 'unresolved' };
   const steer = input.messagesById.get(receipt.messageId!);
-  if (!steer || steer.message.role !== 'user' || steer.turnId !== input.entry.turnId
-    || steer.message.seq <= input.previousSteerSeq) return { kind: 'unresolved' };
+  if (!steer || steer.message.role !== 'user' || steer.turnId !== input.entry.turnId) return { kind: 'unresolved' };
+  // Steering admitted before this aggregate's first output is already before the source Message;
+  // its segment needs no synthetic row at an earlier display position.
+  if (steer.message.seq <= input.entry.message.seq) return { kind: 'continuation' };
+  if (steer.message.seq <= input.previousSteerSeq) return { kind: 'unresolved' };
   return { kind: 'split', receipt, steer };
 }
 
-function functionCallTargets(messages: ParsedMessage[]): FunctionCallTarget[] {
-  const targets: FunctionCallTarget[] = [];
+function functionCallTargetIndex(messages: ParsedMessage[]): FunctionCallTargetIndex {
+  const index: FunctionCallTargetIndex = {
+    messagesById: new Map(), targetsByOwnerId: new Map(), partsByMessageId: new Map(),
+    callIdsByMessageId: new Map(), appendedPartsByMessageId: new Map()
+  };
+  const nextOrdinalByOwner = new Map<string, number>();
   for (const entry of [...messages].sort((left, right) => left.message.seq - right.message.seq)) {
-    let ordinal = 0;
+    index.messagesById.set(entry.message.id, entry);
+    const ownerId = entry.splitFromMessageId ?? entry.message.id;
+    const targets = index.targetsByOwnerId.get(ownerId) ?? { byCallId: new Map(), byOrdinal: new Map() };
+    index.targetsByOwnerId.set(ownerId, targets);
+    const parts = new Set<FunctionCallPart>();
+    const callIds = new Set<string>();
+    index.partsByMessageId.set(entry.message.id, parts);
+    index.callIdsByMessageId.set(entry.message.id, callIds);
+    let ordinal = nextOrdinalByOwner.get(ownerId) ?? 0;
     for (const part of entry.message.content.parts) {
       if (!('functionCall' in part)) continue;
-      targets.push({ messageId: entry.message.id, part, ordinal });
+      const target = { messageId: entry.message.id, part, ordinal };
+      parts.add(part);
+      const callId = text(part.id);
+      if (callId) {
+        callIds.add(callId);
+        if (!targets.byCallId.has(callId)) targets.byCallId.set(callId, target);
+      }
+      if ((entry.windowFirstSequence ?? 1) <= 1 && !targets.byOrdinal.has(ordinal)) targets.byOrdinal.set(ordinal, target);
       ordinal += 1;
     }
+    nextOrdinalByOwner.set(ownerId, ordinal);
   }
-  return targets;
+  return index;
 }
 
 function resolveFunctionCallTarget(input: {
   raw: ReliableClientRecord;
-  functionTargets: FunctionCallTarget[];
-  messages: ParsedMessage[];
+  functionTargets: FunctionCallTargetIndex;
   sourceLink?: ReliableClientRecord;
 }): FunctionCallTarget | undefined {
   // ToolCallSourceLink is the only authoritative owner relation. Guessing by Turn index, name,
@@ -1106,23 +1383,19 @@ function resolveFunctionCallTarget(input: {
   const providerCallId = text(input.sourceLink.provider_call_id);
   const linkedOwnerMessageId = text(input.sourceLink?.message_id);
   if (!linkedOwnerMessageId) return undefined;
-  const owner = input.messages.find((entry) => entry.message.id === linkedOwnerMessageId);
-  if (!owner) return undefined;
+  const owner = input.functionTargets.messagesById.get(linkedOwnerMessageId);
+  if (!owner || owner.turnId !== text(input.raw.turn_id)) return undefined;
   // 原生聚合消息在转向边界拆成多个展示条目后，durable part 可能落在任一拆分条目里；
   // ToolCallSourceLink 仍然只指向来源聚合消息，所以把解析范围扩大到它的全部拆分条目。
-  const ownerMessageIds = new Set([linkedOwnerMessageId]);
-  for (const entry of input.messages) {
-    if (entry.splitFromMessageId === linkedOwnerMessageId) ownerMessageIds.add(entry.message.id);
-  }
-  const ownerTargets = input.functionTargets.filter((target) => ownerMessageIds.has(target.messageId));
+  const ownerTargets = input.functionTargets.targetsByOwnerId.get(linkedOwnerMessageId);
   const providerOrdinal = integer(input.sourceLink.provider_ordinal);
   const exact = providerCallId
-    ? ownerTargets.find((candidate) => text(candidate.part.id) === providerCallId)
-    : ownerTargets.find((candidate) => candidate.ordinal === providerOrdinal);
+    ? ownerTargets?.byCallId.get(providerCallId)
+    : ownerTargets?.byOrdinal.get(providerOrdinal);
   if (exact) return exact;
   // While the Message body is still hydrating, the authoritative link is sufficient to create a
   // temporary target. Once that body is ready, a mismatch is an integrity failure and stays hidden.
-  if (owner.revisionReady) return undefined;
+  if (owner.revisionReady || owner.windowFirstSequence !== undefined) return undefined;
   return {
     messageId: linkedOwnerMessageId,
     ordinal: providerOrdinal,
@@ -1137,38 +1410,29 @@ function resolveFunctionCallTarget(input: {
 }
 
 function ensureProjectedFunctionCall(
-  messages: ParsedMessage[],
+  index: FunctionCallTargetIndex,
   target: FunctionCallTarget,
   toolCallId: string,
   toolName: string,
   serializedArgs: string
 ): void {
-  const message = messages.find((entry) => entry.message.id === target.messageId);
-  if (!message) return;
-  const functionParts = message.message.content.parts.filter((part): part is FunctionCallPart => 'functionCall' in part);
-  if (functionParts.includes(target.part)) return;
+  if (!index.messagesById.has(target.messageId)) return;
+  if (index.partsByMessageId.get(target.messageId)?.has(target.part)) return;
   const providerCallId = text(target.part.id);
-  if (functionParts.some((part) =>
-    (providerCallId && text(part.id) === providerCallId)
-    || text(part.id) === toolCallId
-  )) return;
+  const callIds = index.callIdsByMessageId.get(target.messageId)!;
+  if ((providerCallId && callIds.has(providerCallId)) || callIds.has(toolCallId)) return;
   const parsedArgs = parseJson(serializedArgs);
-  message.message = {
-    ...message.message,
-    content: {
-      ...message.message.content,
-      parts: [...message.message.content.parts, {
-        id: providerCallId ?? toolCallId,
-        functionCall: {
-          name: toolName,
-          args: parsedArgs === undefined ? target.part.functionCall.args : parsedArgs
-        }
-      }]
-    }
+  const part: FunctionCallPart = {
+    id: providerCallId ?? toolCallId,
+    functionCall: { name: toolName, args: parsedArgs === undefined ? target.part.functionCall.args : parsedArgs }
   };
+  callIds.add(part.id!);
+  const parts = index.appendedPartsByMessageId.get(target.messageId) ?? [];
+  parts.push(part);
+  index.appendedPartsByMessageId.set(target.messageId, parts);
 }
 
-function parseMessageContent(
+export function parseReliableMessageContent(
   detail: ReliableKernelDetailState,
   role: 'user' | 'model'
 ): MessageContent {
@@ -1333,26 +1597,45 @@ function booleanInteger(value: unknown): boolean | undefined {
   return undefined;
 }
 
+export interface ReliableModelRequestRetryIndex {
+  turns: Map<string, ReliableClientRecord>;
+  hasActiveTurn: boolean;
+  terminations: Map<string, ReliableClientRecord[]>;
+  latestRequests: Map<string, ReliableClientRecord>;
+  contextProjections: Map<string, ReliableClientRecord[]>;
+  heads: ReliableClientRecord[];
+}
+
+/** These relationships change at a committed boundary, independently of streamed message bodies. */
+export function createReliableModelRequestRetryIndex(records: ReliableClientRecordBuckets, conversationId: string): ReliableModelRequestRetryIndex {
+  const turns = new Map(values(records.Turn).filter(turn => text(turn.conversation_id) === conversationId).map(turn => [text(turn.id)!, turn]));
+  const latestRequests = new Map<string, ReliableClientRecord>();
+  const compare = compareSequence('request_seq');
+  for (const request of values(records.ModelRequest)) {
+    const turnId = text(request.turn_id), current = turnId ? latestRequests.get(turnId) : undefined;
+    if (turnId && (!current || compare(current, request) < 0)) latestRequests.set(turnId, request);
+  }
+  return { turns, hasActiveTurn: [...turns.values()].some(turn => turn.status === 'active'),
+    terminations: groupBy(values(records.TurnTermination), item => text(item.turn_id)), latestRequests,
+    contextProjections: groupBy(values(records.ModelContextProjection).filter(item => item.owner_kind === 'model_request'), item => text(item.owner_id)),
+    heads: values(records.ConversationContextStatus).filter(head => head.conversation_id === conversationId) };
+}
+
 /** A presentation of the same frozen-root conditions rechecked by TurnControlPlane on submission. */
 export function modelRequestRetryForTurn(
   records: ReliableClientRecordBuckets,
   conversationId: string,
-  turnId: string
+  turnId: string,
+  index: ReliableModelRequestRetryIndex = createReliableModelRequestRetryIndex(records, conversationId)
 ): { target?: Extract<MessageRetryTarget, { kind: 'model_request' }>; blockedReason?: string } {
-  const turns = values(records.Turn).filter((turn) => text(turn.conversation_id) === conversationId);
-  const turn = turns.find((candidate) => text(candidate.id) === turnId);
+  const turn = index.turns.get(turnId);
   if (!turn || turn.status !== 'terminated') return { blockedReason: '本轮尚未结束，请等待状态同步' };
-  if (turns.some((candidate) => candidate.status === 'active')) {
-    // New work makes an older failure historical; do not prompt users to stop it for that error.
-    return {};
-  }
-  const termination = values(records.TurnTermination).filter((item) => text(item.turn_id) === turnId);
+  if (index.hasActiveTurn) return {};
+  const termination = index.terminations.get(turnId) ?? [];
   if (termination.length !== 1 || termination[0].terminal_status !== 'failed') {
     return { blockedReason: '本轮已停止；如需继续，请发送新消息' };
   }
-  const requests = values(records.ModelRequest).filter((request) => text(request.turn_id) === turnId)
-    .sort(compareSequence('request_seq'));
-  const request = requests[requests.length - 1];
+  const request = index.latestRequests.get(turnId);
   const requestId = text(request?.id);
   if (!requestId) return { blockedReason: '本轮尚未创建模型请求，请重新发送消息' };
   const terminalState = text(request?.terminal_state) ?? '';
@@ -1360,9 +1643,7 @@ export function modelRequestRetryForTurn(
     || (terminalState !== 'provider_failed' && !terminalState.startsWith('provider_transient_'))) {
     return { blockedReason: '没有可重试的失败模型请求，请重新发送消息' };
   }
-  const projections = values(records.ModelContextProjection).filter((projection) =>
-    projection.owner_kind === 'model_request' && projection.owner_id === requestId);
-  const heads = values(records.ConversationContextStatus).filter((head) => head.conversation_id === conversationId);
+  const projections = index.contextProjections.get(requestId) ?? [], heads = index.heads;
   if (projections.length !== 1 || heads.length !== 1 || !text(projections[0].root_id) || !text(heads[0].root_id)) {
     return { blockedReason: '正在等待模型请求与当前上下文同步' };
   }
@@ -1375,7 +1656,8 @@ export function modelRequestRetryForTurn(
 /** Preserve the exact durable terminal identity even when a retry Turn owns no user Message. */
 export function projectReliableTurnTermination(
   raw: ReliableClientRecord,
-  records: ReliableClientRecordBuckets
+  records: ReliableClientRecordBuckets,
+  index: TurnProjectionIndex = createTurnProjectionIndex(records)
 ): RunTerminationRecord | undefined {
   const terminalStatus = text(raw.terminal_status);
   const id = text(raw.id);
@@ -1384,7 +1666,7 @@ export function projectReliableTurnTermination(
   const reason = textPreserveWhitespace(raw.reason) ?? terminalStatus;
   return {
     id, runId: turnId, kind: terminationKind(terminalStatus), actor: terminationActor(terminalStatus, reason),
-    interruptedPhase: inferredInterruptedPhase(turnId, records),
+    interruptedPhase: inferredInterruptedPhase(turnId, index),
     reasonCode: terminationReasonCode(terminalStatus, reason), detail: reason, createdAt: timestamp(raw.created_at)
   };
 }
@@ -1392,7 +1674,8 @@ export function projectReliableTurnTermination(
 function projectTurnTerminations(
   records: ReliableClientRecordBuckets,
   messages: ParsedMessage[],
-  conversationId: string
+  conversationId: string,
+  index: TurnProjectionIndex
 ): Record<string, RunTerminationRecord> {
   const byMessageId: Record<string, RunTerminationRecord> = {};
   const conversationTurnIds = new Set(values(records.Turn)
@@ -1413,7 +1696,7 @@ function projectTurnTerminations(
     const id = text(raw.id);
     const turnId = text(raw.turn_id);
     if (!id || !turnId || !conversationTurnIds.has(turnId)) continue;
-    const termination = projectReliableTurnTermination(raw, records);
+    const termination = projectReliableTurnTermination(raw, records, index);
     if (!termination) continue;
     const orderedModelTargets = [...(modelMessagesByTurn.get(turnId) ?? [])].sort(compareParsedMessages);
     const orderedUserTargets = [...(userMessagesByTurn.get(turnId) ?? [])].sort(compareParsedMessages);
@@ -1455,23 +1738,41 @@ function terminationReasonCode(value: string, reason: string): RunTerminationRec
   return 'invocation_failed';
 }
 
+export function createTurnProjectionIndex(
+  records: ReliableClientRecordBuckets,
+  requestsByTurn = groupBy(values(records.ModelRequest), (request) => text(request.turn_id)),
+  callsByTurn = groupBy(values(records.ToolCall), (call) => text(call.turn_id))
+): TurnProjectionIndex {
+  for (const requests of requestsByTurn.values()) requests.sort(compareSequence('request_seq'));
+  const turnByInteractionId = new Map<string, string[]>();
+  for (const link of values(records.InteractionOwnerLink)) {
+    const requestId = text(link.request_id);
+    const turnId = text(link.turn_id);
+    if (requestId && turnId) {
+      const turns = turnByInteractionId.get(requestId) ?? [];
+      turns.push(turnId);
+      turnByInteractionId.set(requestId, turns);
+    }
+  }
+  const pendingInteractionByTurn = new Map<string, ReliableClientRecord>();
+  for (const request of values(records.InteractionRequest)) {
+    if (request.status !== 'pending') continue;
+    for (const turnId of turnByInteractionId.get(text(request.id) ?? '') ?? []) {
+      if (!pendingInteractionByTurn.has(turnId)) pendingInteractionByTurn.set(turnId, request);
+    }
+  }
+  return { requestsByTurn, callsByTurn, pendingInteractionByTurn };
+}
+
 function inferredInterruptedPhase(
   turnId: string,
-  records: ReliableClientRecordBuckets
+  index: TurnProjectionIndex
 ): RunTerminationRecord['interruptedPhase'] {
-  const interactionOwnerIds = new Set(values(records.InteractionOwnerLink)
-    .filter((link) => text(link.turn_id) === turnId)
-    .map((link) => text(link.request_id))
-    .filter((id): id is string => id !== undefined));
-  const pendingInteraction = values(records.InteractionRequest).find((request) =>
-    interactionOwnerIds.has(text(request.id) ?? '') && request.status === 'pending'
-  );
+  const pendingInteraction = index.pendingInteractionByTurn.get(turnId);
   if (pendingInteraction?.request_kind === 'plan_review') return 'waiting_plan_review';
   if (pendingInteraction) return 'waiting_user';
-  if (values(records.ToolCall).some((call) => text(call.turn_id) === turnId && call.status !== 'terminal')) return 'waiting_tools';
-  const orderedRequests = values(records.ModelRequest)
-    .filter((request) => text(request.turn_id) === turnId)
-    .sort(compareSequence('request_seq'));
+  if (index.callsByTurn.get(turnId)?.some((call) => call.status !== 'terminal')) return 'waiting_tools';
+  const orderedRequests = index.requestsByTurn.get(turnId) ?? [];
   const latestRequest = orderedRequests[orderedRequests.length - 1];
   if (latestRequest?.status === 'streaming') return 'llm_streaming';
   if (latestRequest?.status === 'pending') return 'llm_request_pending';
@@ -1547,6 +1848,8 @@ function positiveCeiling(value: unknown): number | undefined {
 
 function emptyProjection(): ReliableConversationProjection {
   return {
+    contentWindowByMessageId: {},
+    index: createReliablePresentationIndex([], []),
     messages: [],
     absoluteFloorByMessageId: {},
     toolCalls: [],

@@ -1,6 +1,6 @@
 {
   "contractKind": "client-feed",
-  "contractRevision": "2026-10-15-r1",
+  "contractRevision": "2026-10-17-r1",
   "status": "planned",
   "scope": "扩展宿主向网页视图提供有界读模型，不把前端同步再做成一套永久账本。",
   "persistence": {
@@ -196,6 +196,12 @@
         "runtime_continuation"
       ],
       "runtimeContinuationRule": "运行时续跑预览必须经 RuntimeDeliveryIntentLink 解析到唯一 RuntimeDelivery，再按 RuntimeInboxItem.source_kind 投影后台进程或子 Agent 来源；禁止从 TurnIntent 文本猜测 delivery/source 身份。"
+    },
+    "nativeOutputSegments": {
+      "itemField": "outputItem.steeringSuccessorResponseId",
+      "source": "native-response.created-with-accepted-submission-identity",
+      "rule": "已接受转向的后继创建时确定段身份；同一物理链的普通工具续流继承该标量，新的转向更新它。流式、完成消息、工具proof与恢复、内容组合索引及Feed解析无损保留；完整投影和任意内容窗口使用同一段身份与既有回执证明分段。物理response/直接previous仍只描述相邻关系，不替代段身份；缺证仅标记实际未证明段。",
+      "history": "published-message-bytes-unchanged; no-off-window-body-reads; no-ancestor-arrays-or-window-history-maps"
     },
     "maxResponseBytes": 2097152,
     "chunkedRead": {

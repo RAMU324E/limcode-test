@@ -28,7 +28,7 @@ export async function listAllDomainRows(
   const repository = DOMAIN_REPOSITORIES.domain(domain);
   const snapshot = await database.snapshotAll(repository.list({
     where,
-    orderBy: { column: 'id', direction: 'asc' },
+    orderBy: { column: domain === 'ModelRequest' ? 'request_seq' : 'id', direction: 'asc' },
     limit: REPOSITORY_PAGE_SIZE
   }));
   return snapshot.snapshot;

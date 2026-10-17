@@ -218,7 +218,7 @@
       "AnswerSubmission"
     ],
     "bridgeOwner": "ChildExecution",
-    "continuationWaitOwner": "新 wait 使用 child_turn_answer_wait + 确定性 child Turn id；legacy answer_bridge_wait 只能通过 Operation/CommandReceipt/Intent/preset 精确恢复，不再生成。",
+    "continuationWaitOwner": "新 wait 使用 child_intent_answer_wait + TurnIntent.id；取消与未准入超时沿确切 Intent 选择，已准入答复沿 Intent.turn_id 限定代际。普通选择先读取未结算或待物化结果的实际工作，不遍历已收尾取消历史。已发布 child_turn_answer_wait 与 answer_bridge_wait 保留原有确切读取和恢复，不再生成。",
     "oneCurrentSubmissionPerBridge": true,
     "largeContent": "cas",
     "atomicCommit": "AnswerSubmission insert、AnswerBridge.current_submission_id update和RuntimeInboxItem insert在同一事务提交。",

@@ -52,6 +52,9 @@ if (process.argv[2] === '--authority-child') {
         database = await kernel.RuntimeDatabase.open(authority, { hostBootId: 'ci-snapshot-writer' });
       } else if (message.action === 'commit') {
         await database.transaction(interleavedSteps(message.id)); result = message.id;
+      } else if (message.action === 'mutate') {
+        const committed = await database.transaction(message.steps);
+        result = { changes: committed.changes.map(({ domain, id, kind, scope }) => ({ domain, id, kind, scope })) };
       } else if (message.action === 'writer-close') {
         await database.close(); database = undefined;
       } else if (message.action === 'window-open') {

@@ -25,7 +25,7 @@ export async function preflightRuntimeDataSet(
 ): Promise<RuntimeDataSetPreflightProblem | undefined> {
   const epoch = candidate.runtimeKernelEpoch;
   if (!candidate.dataSetId || epoch === undefined) return { code: 'runtime-data-set-empty', message: '这个历史库还没有数据。' };
-  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== RUNTIME_KERNEL_EPOCH) {
+  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6 && epoch !== RUNTIME_KERNEL_EPOCH) {
     return { code: 'runtime-data-set-epoch-unsupported', message: `这个历史库是不受支持的第 ${epoch} 代格式。` };
   }
   // An interrupted archive/cutover or root transition is an exact published recovery window: the

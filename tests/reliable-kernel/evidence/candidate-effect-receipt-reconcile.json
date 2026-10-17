@@ -1,0 +1,22 @@
+{
+  "kind": "limcode-phase-d-candidate-evidence",
+  "stableId": "candidate.effect-receipt-reconcile",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:45:26.122Z",
+  "assertionCount": 4,
+  "assertions": [
+    "Receipt提交后崩溃/重开数据库，现有D恢复入口自动发现receipt_written并续收口，不依赖内存回调或外部重派发",
+    "重复recovery source key稳定重放首次ToolModelResult ID",
+    "receipt在committed-facts扫描与hanging扫描之间提交时，runAll尾部barrier仍在同次启动收口",
+    "Intent提交后、dispatch前崩溃只留下pending意图，不伪造Receipt或外部结果"
+  ],
+  "faults": [
+    "receipt-committed-before-reconcile-crash",
+    "automatic receipt_written startup reconcile",
+    "receipt transition between recovery passes",
+    "database-reopen",
+    "duplicate recovery replay",
+    "intent-before-dispatch crash"
+  ]
+}

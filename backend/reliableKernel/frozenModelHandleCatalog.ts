@@ -1,56 +1,38 @@
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
-import { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, handleKindOfRef, isPersistentContextHandle,
-  normalizeModelHandleCatalog, prepareModelHandleCatalog, type ModelHandleCatalog,
+import { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+  modelHandleAllocationFrontier, normalizeModelHandleCatalog, prepareModelHandleCatalog,
+  prepareModelHandleCatalogOverlay, type ModelHandleCatalog,
   type ModelHandleEntry, type PreparedModelHandleCatalog } from './modelHandleCatalog';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import { CONTEXT_HANDLE_CATALOG_CONTENT_TYPE, LEGACY_CONTEXT_HANDLE_STATE_CONTENT_TYPE,
+  STORED_HANDLE_CATALOG_CACHE_LIMITS, cachedStoredHandleCatalog, rememberStoredHandleCatalog,
+  readStoredHandleCatalog, retainStoredHandleCatalog, storedHandleCatalog, type StoredHandleCatalog } from './contextHandleCatalogStorage';
 
-export const CONTEXT_HANDLE_STATE_CONTENT_TYPE = 'application/vnd.limcode.conversation-context-handle-state+json';
-export const FROZEN_MODEL_HANDLE_BASE_CACHE_LIMITS = Object.freeze({ entries: 8, bytes: 8 * 1024 * 1024 });
+export const CONTEXT_HANDLE_STATE_CONTENT_TYPE = LEGACY_CONTEXT_HANDLE_STATE_CONTENT_TYPE;
+export const FROZEN_MODEL_HANDLE_BASE_CACHE_LIMITS = STORED_HANDLE_CATALOG_CACHE_LIMITS;
 
 /** Only request-local facts are embedded; the base is an immutable CAS identity, never a pointer. */
 export interface FrozenModelHandleCatalogReference {
   baseContentObjectId: string | null;
-  attachmentEntries: ModelHandleEntry[];
-  addedEntries: ModelHandleEntry[];
-  metadataExtensions: ModelHandleEntry[];
+  attachmentEntries: readonly ModelHandleEntry[];
+  addedEntries: readonly ModelHandleEntry[];
+  metadataExtensions: readonly ModelHandleEntry[];
 }
 
-interface BaseEntry {
-  metadata: ContentObjectMetadata;
-  conversationId: string;
-  catalog: PreparedModelHandleCatalog;
-  bytes: number;
-}
-interface BaseCache { entries: Map<string, BaseEntry>; bytes: number }
-const bases = new WeakMap<RuntimeDatabase, WeakMap<ContentAddressedStore, BaseCache>>();
+const preparedRecipes = new WeakMap<object, PreparedModelHandleCatalog>();
+const preparedBases = new WeakMap<object, { database: RuntimeDatabase; store: ContentAddressedStore; base: StoredHandleCatalog }>();
 const emptyBase = prepareModelHandleCatalog({ entries: [], retiredRefs: [],
   identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION });
-
-function cacheFor(database: RuntimeDatabase, store: ContentAddressedStore): BaseCache {
-  let stores = bases.get(database);
-  if (!stores) { stores = new WeakMap(); bases.set(database, stores); }
-  let cache = stores.get(store);
-  if (!cache) { cache = { entries: new Map(), bytes: 0 }; stores.set(store, cache); }
-  return cache;
-}
 
 /** Charged from already-known immutable byte_length; never walk/stringify/hash a warm catalog. */
 export function rememberFrozenContextHandleCatalogBase(database: RuntimeDatabase, store: ContentAddressedStore,
   metadata: ContentObjectMetadata, conversationId: string, catalog: ModelHandleCatalog): PreparedModelHandleCatalog {
   const prepared = prepareModelHandleCatalog(catalog);
-  const bytes = 512 + metadata.id.length * 2 + conversationId.length * 2 + Number(metadata.byte_length) * 8;
-  const cache = cacheFor(database, store);
-  const old = cache.entries.get(metadata.id);
-  if (old) { cache.entries.delete(metadata.id); cache.bytes -= old.bytes; }
-  if (!Number.isSafeInteger(bytes) || bytes > FROZEN_MODEL_HANDLE_BASE_CACHE_LIMITS.bytes) return prepared;
-  cache.entries.set(metadata.id, { metadata: { ...metadata }, conversationId, catalog: prepared, bytes });
-  cache.bytes += bytes;
-  while (cache.entries.size > FROZEN_MODEL_HANDLE_BASE_CACHE_LIMITS.entries
-    || cache.bytes > FROZEN_MODEL_HANDLE_BASE_CACHE_LIMITS.bytes) {
-    const oldest = cache.entries.keys().next().value!;
-    cache.bytes -= cache.entries.get(oldest)!.bytes; cache.entries.delete(oldest);
-  }
+  const stored = storedHandleCatalog(database, store, prepared);
+  rememberStoredHandleCatalog(database, store, stored?.metadata.id === metadata.id ? stored
+    : { metadata: { ...metadata }, conversationId, catalog: prepared,
+      storedByteLength: stored?.storedByteLength ?? metadata.byte_length });
   return prepared;
 }
 
@@ -69,43 +51,33 @@ export async function readFrozenContextHandleCatalogBase(database: RuntimeDataba
   // committed in the same transaction as the pointer; forcing a separate reader snapshot first can
   // reject a valid warm catalog during the tiny writer/reader handoff window.
   await database.assertUsableBinding('snapshot');
-  const cache = cacheFor(database, store);
-  const cached = cache.entries.get(contentObjectId);
+  const cached = cachedStoredHandleCatalog(database, store, contentObjectId);
   if (cached) {
     if (cached.conversationId !== conversationId) throw invalid('Frozen catalog belongs to another producer Conversation.');
-    if (cached.metadata.content_type !== CONTEXT_HANDLE_STATE_CONTENT_TYPE
+    if (![CONTEXT_HANDLE_STATE_CONTENT_TYPE, CONTEXT_HANDLE_CATALOG_CONTENT_TYPE].includes(cached.metadata.content_type)
       || typeof cached.metadata.byte_length !== 'bigint' || cached.metadata.byte_length < 0n) {
-      cache.entries.delete(contentObjectId);
-      cache.bytes -= cached.bytes;
-    } else {
-      cache.entries.delete(contentObjectId); cache.entries.set(contentObjectId, cached);
-      return cached.catalog;
+      throw invalid('Frozen Context catalog has no correctly typed registered CAS base.');
     }
+    return cached.catalog;
   }
   const metadata = (await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(contentObjectId)])).snapshot[0];
   if (!metadata || Array.isArray(metadata) || metadata.id !== contentObjectId
-    || metadata.content_type !== CONTEXT_HANDLE_STATE_CONTENT_TYPE
+    || ![CONTEXT_HANDLE_STATE_CONTENT_TYPE, CONTEXT_HANDLE_CATALOG_CONTENT_TYPE].includes(String(metadata.content_type))
     || typeof metadata.byte_length !== 'bigint' || metadata.byte_length < 0n) {
     throw invalid('Frozen Context catalog has no correctly typed registered CAS base.');
   }
-  const value = record(JSON.parse((await store.read(metadata as ContentObjectMetadata)).toString('utf8')), 'Frozen Context catalog');
-  if (value.kind !== 'conversation-context-handle-state' || value.conversationId !== conversationId
-    || Object.keys(value).some(key => !['kind', 'conversationId', 'catalog'].includes(key))) {
-    throw invalid('Frozen Context catalog has invalid ownership or shape.');
-  }
-  const catalog = normalizeModelHandleCatalog(value.catalog);
-  if (catalog.identityContractRevision !== CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION
-    || catalog.entries.some(entry => !isPersistentContextHandle(entry.kind))) {
-    throw invalid('Frozen Context catalog requires current persistent identities.');
-  }
-  return rememberFrozenContextHandleCatalogBase(database, store, metadata as ContentObjectMetadata, conversationId, catalog);
+  const stored = await readStoredHandleCatalog(database, store, metadata as ContentObjectMetadata);
+  if (stored.conversationId !== conversationId) throw invalid('Frozen Context catalog belongs to another producer Conversation.');
+  return rememberFrozenContextHandleCatalogBase(database, store, stored.metadata, conversationId, stored.catalog);
 }
 
 /** Published inline recipes retain their original bytes; no replay substitutes the current state. */
 export async function resolveFrozenModelHandleCatalog(database: RuntimeDatabase, store: ContentAddressedStore,
-  recipeValue: unknown): Promise<ModelHandleCatalog> {
+  recipeValue: unknown): Promise<PreparedModelHandleCatalog> {
   const recipe = record(recipeValue, 'Frozen recipe');
-  if (!('modelHandleCatalogReference' in recipe)) return normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+  const prepared = preparedRecipes.get(recipe);
+  if (prepared) return prepared;
+  if (!('modelHandleCatalogReference' in recipe)) return prepareModelHandleCatalog(recipe.modelHandleCatalog);
   const reference = readReference(recipe);
   const scope = record(recipe.contextHandleScope, 'Frozen Context handle scope');
   if (typeof scope.conversationId !== 'string' || !scope.conversationId
@@ -115,38 +87,51 @@ export async function resolveFrozenModelHandleCatalog(database: RuntimeDatabase,
     throw invalid('Frozen catalog reference requires its exact producer scope.');
   }
   const base = await readFrozenContextHandleCatalogBase(database, store, reference.baseContentObjectId, scope.conversationId);
-  const byRef = new Map(base.entries.map(entry => [entry.ref, entry]));
-  const floors = { ...base.allocationHighWater };
-  for (const entry of base.entries) floors[entry.kind] = Math.max(floors[entry.kind] ?? 0, Number(entry.ref.slice(1)));
-  for (const ref of base.retiredRefs ?? []) {
-    // Every retired ordinal participates in allocation even when it has no active target.
-    const kind = handleKindOfRef(ref)!;
-    floors[kind] = Math.max(floors[kind] ?? 0, Number(ref.slice(1)));
-  }
+  const floors = { ...modelHandleAllocationFrontier(base) };
   for (const entry of reference.addedEntries) {
     const ordinal = Number(entry.ref.slice(1));
     if (ordinal !== (floors[entry.kind] ?? 0) + 1) throw invalid('Frozen catalog addition does not follow the reserved allocation frontier.');
     floors[entry.kind] = ordinal;
   }
-  const replacements = new Map<string, ModelHandleEntry>();
-  for (const entry of reference.metadataExtensions) {
-    const previous = byRef.get(entry.ref);
-    if (!previous || previous.kind !== entry.kind || previous.target !== entry.target) {
-      throw invalid('Frozen catalog metadata extension must identify an existing base entry.');
-    }
-    for (const key of ['name', 'mimeType', 'sizeBytes'] as const) {
-      if (previous[key] !== undefined && previous[key] !== entry[key]) {
-        throw invalid('Frozen catalog metadata extension cannot replace established metadata.');
-      }
-    }
-    replacements.set(entry.ref, entry);
-  }
-  return normalizeModelHandleCatalog({ ...base, entries: [
-    // Match builder seed ordering: attachments precede the persistent base and local additions.
-    ...reference.attachmentEntries,
-    ...base.entries.map(entry => replacements.get(entry.ref) ?? entry),
-    ...reference.addedEntries
-  ] });
+  const catalog = prepareModelHandleCatalogOverlay(base, [
+    ...reference.metadataExtensions.map(entry => ({ kind: 'extend-metadata' as const, entry })),
+    ...reference.addedEntries.map(entry => ({ kind: 'bind' as const, entry }))
+  ], { leadingEntries: reference.attachmentEntries });
+  rememberPreparedModelHandleBase(database, store, catalog, base);
+  return catalog;
+}
+
+/** The live request retains the exact persistent base even when it exceeds the idle LRU budget. */
+export function rememberPreparedModelHandleBase(database: RuntimeDatabase, store: ContentAddressedStore,
+  catalog: PreparedModelHandleCatalog, baseCatalog: ModelHandleCatalog): void {
+  const base = storedHandleCatalog(database, store, baseCatalog);
+  if (base) preparedBases.set(catalog, { database, store, base });
+}
+
+export function preparedModelHandleBase(database: RuntimeDatabase, store: ContentAddressedStore,
+  catalog: ModelHandleCatalog, contentObjectId: string | null | undefined): StoredHandleCatalog | undefined {
+  const retained = preparedBases.get(catalog);
+  return retained?.database === database && retained.store === store && retained.base.metadata.id === contentObjectId
+    ? retained.base : undefined;
+}
+
+/** Request holders publish their already-prepared base to all readers of that immutable CAS id. */
+export function retainPreparedModelHandleBase(database: RuntimeDatabase, store: ContentAddressedStore,
+  catalog: ModelHandleCatalog): (() => void) | undefined {
+  const retained = preparedBases.get(catalog);
+  return retained?.database === database && retained.store === store
+    ? retainStoredHandleCatalog(database, store, retained.base) : undefined;
+}
+
+/** Producer-owned immutable recipes carry their prepared lookup through preview, commit and use. */
+export function rememberPreparedFrozenModelHandleCatalog(recipe: object, catalog: unknown): PreparedModelHandleCatalog {
+  const prepared = prepareModelHandleCatalog(catalog);
+  preparedRecipes.set(recipe, prepared);
+  return prepared;
+}
+
+export function preparedFrozenModelHandleCatalog(recipe: unknown): PreparedModelHandleCatalog | undefined {
+  return recipe !== null && typeof recipe === 'object' ? preparedRecipes.get(recipe) : undefined;
 }
 
 /** Synchronous projection consumes a resolved catalog, or an unchanged published inline recipe. */
@@ -173,7 +158,7 @@ function readReference(recipe: Record<string, unknown>): FrozenModelHandleCatalo
     || !(reference.baseContentObjectId === null || typeof reference.baseContentObjectId === 'string' && reference.baseContentObjectId.length > 0)) {
     throw invalid('Frozen catalog reference has an invalid base or shape.');
   }
-  const entries = (key: string, attachment: boolean): ModelHandleEntry[] => {
+  const entries = (key: string, attachment: boolean): readonly ModelHandleEntry[] => {
     if (!Array.isArray(reference[key])) throw invalid(`Frozen catalog reference requires ${key}.`);
     const catalog = normalizeModelHandleCatalog({ entries: reference[key] });
     if (catalog.entries.some(entry => (entry.kind === 'attachment') !== attachment)) {

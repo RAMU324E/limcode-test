@@ -1,0 +1,49 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.client-queue-bounds",
+  "stableId": "candidate.client-queue-bounds",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:26:33.735Z",
+  "assertionCount": 3,
+  "provenance": {
+    "worktreeClean": true,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "ce6e3695e0a8823ed6b089e4022d2fb4d7ed362ad672c2cb7809fbffe3bacbce",
+    "sourceFileCount": 455,
+    "sourceFilesTracked": true,
+    "compiledKernelSha256": "f1536abe2fe3b04032bb384dcbbd7bd586182d7159cd6b1badaa0f3238cf2a3c",
+    "compiledFileCount": 194,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": true,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check=candidate.client-queue-bounds"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "slow ACK期间严格保持一个inflight；共享ACK基线的未发送changes压缩为一个最新commit range",
+    "未发送changes不占用messageSeq，ACK后以连续sequence发送一份原子净变化batch",
+    "重复更新相同400条可见记录时按(type,id)保留最终值，queuedBytes不随commit数量线性累加"
+  ],
+  "faults": [
+    "slow ACK repeated-record burst",
+    "slow ACK large repeated-record burst"
+  ],
+  "metrics": {
+    "maxInflight": 1,
+    "compactedQueuedBatches": 1,
+    "compactedWireMessages": 2,
+    "compactedLargeBatchBytes": 808138,
+    "compactedLargeBatchChanges": 400
+  }
+}

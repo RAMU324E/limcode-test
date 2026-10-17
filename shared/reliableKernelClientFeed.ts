@@ -2,6 +2,7 @@ import {
   toStructuredClonePlainData,
   type PlainData
 } from './plainData';
+import type { ModelOutputItemReference } from './protocol';
 
 export const RELIABLE_KERNEL_SNAPSHOT_MESSAGE = 'reliable-kernel.snapshot';
 export const RELIABLE_KERNEL_CHANGES_MESSAGE = 'reliable-kernel.changes';
@@ -138,6 +139,8 @@ export interface ReliableKernelSnapshotRequestMessage {
 
 export type ReliableKernelClientDetailKind =
   | 'message-content'
+  | 'message-content-item'
+  | 'message-content-items'
   | 'turn-intent-preview'
   | 'tool-arguments-content'
   | 'tool-result-content'
@@ -250,6 +253,25 @@ export interface ReliableKernelDetailRequestMessage {
   maxBytes: number;
   /** Freezes a mutable detail prefix after the first page; omitted on a new demand or refresh. */
   expectedTotalBytes?: number;
+  /** Native item index window: omitted starts at the tail, zero starts at the first item. */
+  itemAfterSequence?: number;
+  itemLimit?: number;
+}
+
+export interface ReliableKernelMessageContentItem {
+  id: string;
+  sequence: number;
+  revisionId: string;
+  contentObjectId: string;
+  partByteLength: number;
+  outputItem?: ModelOutputItemReference;
+}
+
+export interface ReliableKernelMessageContentItemsPage {
+  totalItems: number;
+  totalBytes: number;
+  items: ReliableKernelMessageContentItem[];
+  nextSequence?: number;
 }
 
 export interface ReliableKernelDetailResultMessage {
@@ -280,22 +302,26 @@ export interface ReliableKernelDetailErrorMessage {
   retryable?: boolean;
 }
 
-export interface ReliableKernelHistoryPageRequestMessage {
+export type ReliableKernelMessageHistoryCursor =
+  | { beforeMessageSeq: string; beforeId: string; afterMessageSeq?: never; afterId?: never }
+  | { afterMessageSeq: string; afterId: string; beforeMessageSeq?: never; beforeId?: never };
+
+export type ReliableKernelHistoryPageRequestMessage = ReliableKernelMessageHistoryCursor & {
   type: typeof RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE;
   requestId: string;
   sessionId?: string;
   conversationId: string;
-  /** Exclusive backward keyset cursor in durable Message membership order. */
-  beforeMessageSeq: string;
-  beforeId: string;
   limit: number;
-}
+};
 
 export interface ReliableKernelHistoryPage {
   records: Record<string, Array<Record<string, PlainData>>>;
   nextBeforeMessageSeq?: string;
   nextBeforeId?: string;
-  hasMore: boolean;
+  nextAfterMessageSeq?: string;
+  nextAfterId?: string;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
   responseBytes: number;
 }
 
@@ -317,9 +343,9 @@ export interface ReliableKernelHistoryPageErrorMessage {
 
 /** Accepted exchanges have their own conversation-local sequence, separate from Message floors. */
 export type ReliableKernelCollaborationHistoryCursor =
-  | { kind: 'exchange'; beforeExchangeSeq?: string }
-  | { kind: 'message'; beforeMessageSeq?: string; beforeId?: string }
-  | { kind: 'answer'; beforeCreatedAt?: string; beforeId?: string };
+  | { kind: 'exchange'; beforeExchangeSeq?: string; afterExchangeSeq?: string }
+  | { kind: 'message'; beforeMessageSeq?: string; beforeId?: string; afterMessageSeq?: string; afterId?: string }
+  | { kind: 'answer'; beforeCreatedAt?: string; beforeId?: string; afterCreatedAt?: string; afterId?: string };
 
 export interface ReliableKernelCollaborationHistoryRequestMessage {
   type: typeof RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE;
@@ -327,11 +353,18 @@ export interface ReliableKernelCollaborationHistoryRequestMessage {
   sessionId: string;
   conversationId: string;
   cursor?: ReliableKernelCollaborationHistoryCursor;
+  /** Each source is read by its own ordered key; an empty cursor enters that source's end. */
+  direction?: 'before' | 'after';
   limit: number;
 }
 
 export interface ReliableKernelCollaborationHistoryPage {
   records: Record<string, Array<Record<string, PlainData>>>;
+  nextBeforeCursor?: ReliableKernelCollaborationHistoryCursor;
+  nextAfterCursor?: ReliableKernelCollaborationHistoryCursor;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
+  /** Continuation in the requested direction, including an independent source transition. */
   nextCursor?: ReliableKernelCollaborationHistoryCursor;
   hasMore: boolean;
   /** An empty scan or transition to another independent historical source still advances. */

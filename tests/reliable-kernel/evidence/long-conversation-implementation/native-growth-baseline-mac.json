@@ -1,0 +1,218 @@
+{
+  "kind": "limcode-native-output-growth",
+  "measuredAt": "2026-10-17T07:39:08.671Z",
+  "node": "v24.15.0",
+  "platform": "darwin/arm64",
+  "itemBytes": 2048,
+  "rows": [
+    {
+      "items": 20,
+      "driveMs": 263.581,
+      "messageRevisions": {
+        "item": 20,
+        "cumulative": 20,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 66,
+      "newCasFiles": 18,
+      "newCasPhysicalBytes": 477161,
+      "newCasAllocatedBytes": 516096,
+      "byContentType": {
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 24,
+          "logicalBytes": 48276
+        },
+        "application/vnd.limcode.message+json": {
+          "objects": 39,
+          "logicalBytes": 488227
+        },
+        "application/vnd.limcode.conversation-context-handle-state+json": {
+          "objects": 1,
+          "logicalBytes": 203
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1264
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 43080,
+        "aggregateRevision": 42586,
+        "compositionRoots": 0,
+        "compositionBlocks": 0,
+        "legacyCumulativeBodies": 402561,
+        "itemOnlyAndAggregateBytes": 85666,
+        "totalCommittedMessageBytes": 488227,
+        "displayRevisionsOnly": 402561
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 532966,
+        "allRevisionsMs": 4.424,
+        "itemRevisionsBytes": 43080,
+        "itemRevisionsMs": 2.424
+      }
+    },
+    {
+      "items": 50,
+      "driveMs": 724.753,
+      "messageRevisions": {
+        "item": 50,
+        "cumulative": 50,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 139,
+      "newCasFiles": 48,
+      "newCasPhysicalBytes": 2808597,
+      "newCasAllocatedBytes": 2904064,
+      "byContentType": {
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 36,
+          "logicalBytes": 113960
+        },
+        "application/vnd.limcode.message+json": {
+          "objects": 99,
+          "logicalBytes": 2820442
+        },
+        "application/vnd.limcode.conversation-context-handle-state+json": {
+          "objects": 2,
+          "logicalBytes": 423
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1264
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 107730,
+        "aggregateRevision": 106456,
+        "compositionRoots": 0,
+        "compositionBlocks": 0,
+        "legacyCumulativeBodies": 2606256,
+        "itemOnlyAndAggregateBytes": 214186,
+        "totalCommittedMessageBytes": 2820442,
+        "displayRevisionsOnly": 2606256
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 2929051,
+        "allRevisionsMs": 11.612,
+        "itemRevisionsBytes": 107730,
+        "itemRevisionsMs": 4.399
+      }
+    },
+    {
+      "items": 100,
+      "driveMs": 1505.844,
+      "messageRevisions": {
+        "item": 100,
+        "cumulative": 100,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 244,
+      "newCasFiles": 98,
+      "newCasPhysicalBytes": 10952323,
+      "newCasAllocatedBytes": 11149312,
+      "byContentType": {
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 36,
+          "logicalBytes": 220412
+        },
+        "application/vnd.limcode.message+json": {
+          "objects": 199,
+          "logicalBytes": 10965467
+        },
+        "application/vnd.limcode.conversation-context-handle-state+json": {
+          "objects": 7,
+          "logicalBytes": 1800
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1265
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 215480,
+        "aggregateRevision": 212906,
+        "compositionRoots": 0,
+        "compositionBlocks": 0,
+        "legacyCumulativeBodies": 10537081,
+        "itemOnlyAndAggregateBytes": 428386,
+        "totalCommittedMessageBytes": 10965467,
+        "displayRevisionsOnly": 10537081
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 11180526,
+        "allRevisionsMs": 22.994,
+        "itemRevisionsBytes": 215480,
+        "itemRevisionsMs": 8.268
+      }
+    },
+    {
+      "items": 200,
+      "driveMs": 3112.889,
+      "messageRevisions": {
+        "item": 200,
+        "cumulative": 200,
+        "aggregate": 1,
+        "other": 0
+      },
+      "newContentObjects": 448,
+      "newCasFiles": 198,
+      "newCasPhysicalBytes": 43217573,
+      "newCasAllocatedBytes": 43618304,
+      "byContentType": {
+        "application/vnd.limcode.message+json": {
+          "objects": 399,
+          "logicalBytes": 43233317
+        },
+        "application/vnd.limcode.model-stream-checkpoint+json": {
+          "objects": 36,
+          "logicalBytes": 433512
+        },
+        "application/vnd.limcode.conversation-context-handle-state+json": {
+          "objects": 11,
+          "logicalBytes": 3026
+        },
+        "application/vnd.limcode.frozen-tool-definitions+json": {
+          "objects": 1,
+          "logicalBytes": 45
+        },
+        "application/vnd.limcode.model-request-recipe+json": {
+          "objects": 1,
+          "logicalBytes": 1265
+        }
+      },
+      "messageBytes": {
+        "itemRevisions": 431180,
+        "aggregateRevision": 426006,
+        "compositionRoots": 0,
+        "compositionBlocks": 0,
+        "legacyCumulativeBodies": 42376131,
+        "itemOnlyAndAggregateBytes": 857186,
+        "totalCommittedMessageBytes": 43233317,
+        "displayRevisionsOnly": 42376131
+      },
+      "reconcileRead": {
+        "allRevisionsBytes": 43661476,
+        "allRevisionsMs": 50.834,
+        "itemRevisionsBytes": 431180,
+        "itemRevisionsMs": 12.789
+      }
+    }
+  ],
+  "method": "Compiled application, synthetic provider emitting the requested completed text items in one logical request; real SQLite and CAS. ContentObject.byte_length counts stored payload bytes: item/final MessageContent, display composition roots and bounded blocks are counted separately. Context handle state is initialized with the production helper. Timings are observational and are not correctness gates."
+}

@@ -2659,12 +2659,14 @@ function modelOutputItemFromPayload(
     : undefined;
   const providerResponseId = optionalText(source?.providerResponseId);
   const previousResponseId = optionalText(source?.previousResponseId);
+  const steeringSuccessorResponseId = optionalText(source?.steeringSuccessorResponseId);
   return {
     id,
     ordinal,
     ...(phase ? { phase } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),
-    ...(previousResponseId ? { previousResponseId } : {})
+    ...(previousResponseId ? { previousResponseId } : {}),
+    ...(steeringSuccessorResponseId ? { steeringSuccessorResponseId } : {})
   };
 }
 

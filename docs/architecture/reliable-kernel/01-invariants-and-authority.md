@@ -304,7 +304,7 @@ SQLite long-lived connection 只能缓存由 RootAuthority 建立的 immutable f
 
 最终 VSIX 的 cutover-only coordinator 是 archive actor。它按 physical manifest journaled archive Runtime、filter settings/scope links、验证配置与外部 untouched 项，再创建 SQLite/CAS/epoch 并原子切 pointer。激活前失败按 journal 恢复；激活后不自动回退旧 writer。
 
-已发布 SQLite epoch 3/4/5 只允许按精确来源离线升级到当前 epoch 6。epoch 5（v0.0.24–v0.0.36）的 107 领域、metadata DDL 与 triggers 固定在独立历史描述中，并核对完整摘要；它已经公开发布，不在原 epoch 内补表或改 manifest。开发期 main 上出现过的 epoch 6–10 从未发布，已合并为这一次 5→6 升级，不保留它们的描述、journal 或升级路径。epoch 3 的完整 manifest 分为 v0.0.10–v0.0.12 的 `ModelContextProjection.client=detail` 与 v0.0.13–v0.0.14 的 `summary`；二者物理 DDL 和其余 86 个领域完全相同。v0.0.15–v0.0.21 的正常新建 epoch 4 为完整 91 领域；额外接受的缺 RuntimeDeliveryIntentLink 前驱仍须通过单一精确指纹与 continuation 语义校验，不能由任意缺表推导。升级先核验 table/index/trigger、manifest 与 RootBinding，设置 pending fence/持久 journal，建立并验证 SQLite Backup API 备份，再以单事务补齐当前领域并更新绑定；中断按 journal 向前收敛，旧版 3→4 与 3/4→5 的已知边界先单独认证恢复；旧升级已提交时先完成原来目标的指针与完成记录，再启动独立的 epoch-to-6 journal。Windows 仅在 SQLite 原生 I/O 使用 namespaced path，持久 RootBinding 保留 canonical path。
+已发布 SQLite epoch 3/4/5/6 只允许按精确来源离线升级到当前 epoch 7。epoch 5（v0.0.24–v0.0.36）的 107 领域、metadata DDL 与 triggers 固定在独立历史描述中，并核对完整摘要；它已经公开发布，不在原 epoch 内补表或改 manifest。epoch 6 已随 v0.0.42 发布，其 113 领域定义由 schema/publishedEpoch6.ts 固定；其它未发布的中间编号不保留迁移链。epoch 3 的完整 manifest 分为 v0.0.10–v0.0.12 的 `ModelContextProjection.client=detail` 与 v0.0.13–v0.0.14 的 `summary`；二者物理 DDL 和其余 86 个领域完全相同。v0.0.15–v0.0.21 的正常新建 epoch 4 为完整 91 领域；额外接受的缺 RuntimeDeliveryIntentLink 前驱仍须通过单一精确指纹与 continuation 语义校验，不能由任意缺表推导。升级先核验 table/index/trigger、manifest 与 RootBinding，设置 pending fence/持久 journal，建立并验证 SQLite Backup API 备份，再以单事务补齐当前领域并更新绑定；中断按 journal 向前收敛，旧版 3→4 与 3/4→5 的已知边界先单独认证恢复；旧升级已提交时先完成原来目标的指针与完成记录，再启动独立的 epoch-to-7 journal。Windows 仅在 SQLite 原生 I/O 使用 namespaced path，持久 RootBinding 保留 canonical path。
 
 epoch 6 在 epoch 5 之上新增 RuntimeDeliveryTimelineLink、CollaborationSendTimelineLink、TimelineImportProvenance、RuntimeDeliveryAnswerPresentation 四张 insert-only 时间线关系表，以及 ConversationContextHandleState 与 ContextRootHandleCatalog 两个独立领域，共 113 个领域；RuntimeDelivery 只在原索引后追加两个范围读取索引。升级在同一事务里只按可证明的输入回填时间线关系，并仅为确切当前 head 插入 pending 句柄标记，不重建历史目录。紧凑普通 catalog-reference recipe、冻结工具定义 toolsReference 配方和新写入的至多 8192 字节 packed small-CAS 改变读入语义，一并由 epoch 6 的整库栅栏控制准入：它们只用于新写入，升级保留所有既有领域行、内联配方与 loose CAS 字节，不在启动时打包旧正文；旧 epoch 5 reader 在打开时拒绝 epoch 6，存活或身份未知的旧 Host 阻止升级。旧内联工具配方仍按原冻结字节读取，新配方的工具 CAS 引用在复制与合库时随全部登记正文保留。CAS 小正文存储只在准入 6 后按需建立，缺失是正常的旧库状态，已有未知或损坏的存储不可静默替换。
 
@@ -376,3 +376,9 @@ epoch 6 在 epoch 5 之上新增 RuntimeDeliveryTimelineLink、CollaborationSend
 历史与存储管理只提供当前历史修复、存储占用、未能合并的旧数据、立即合并全部、迁移、清理备份和归档重置。不再提供选择、切换、保持分开、删除其他库、外来库列表或大库会话界面。没有选择且所有可检查候选均不合格时，在维护离线边界内保留不可用固定根为残留备份，建立固定当前根，旧来源登记待合并或残留；不绕过不可读物理边界。已有选择保持不变。立即合并全部复用正常 Runtime 启动入口，小来源在线合并，大来源直接调用准备与流式合并后端；明确操作从来源处理到结果通知保留明确请求语义与取消信号，复用独占协调、保存输入、取消和重载，不估时、不倒计时、不暂存会话结果。残留和部分合并来源不删除。
 
 旧大库会话适配层与只读估时、倒计时、剩余时间、实测速率账本已删除。流式后端只报告阶段和已处理行数；准备声明、备份、空间检查、单来源事务和取消回滚保持原语义。旧rates文件留在磁盘上不读不写，不新增清理扫描。
+
+## Epoch 7 的增量正文准入
+
+6→7 沿既有离线 Host、SQLite Backup API、单事务与 durable journal 升级，只更新 schema_manifest 的准入 epoch 和 RootBinding，保持全部领域行及 CAS 原字节。旧 epoch-to-6 pending/journal 先按原目标完成 6 的提交、指针发布与完成记录，再独立进入 7。
+
+新写入的目录使用固定大小根与至多 32 条操作的尾块；native 工具 proof/result 引用不可变私有目录；原生消息使用 item CAS、至多 32 条 item 的块和组合根。旧格式由确切 content_type/kind 读取，所有强 CAS 边沿原复制、分支和合库路径传递。只追加新事实，不引入额外内容哈希、验证戳或证明账本。

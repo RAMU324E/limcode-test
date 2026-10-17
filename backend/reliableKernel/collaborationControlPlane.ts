@@ -2,6 +2,7 @@ import { collaborationSendTimelineStep } from './timelineAcceptance';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { isCrossConversationFollowup, isCrossConversationSend, readCollaborationIdentity, type CollaborationIdentity } from './collaborationScope';
 import { collaborationWakePolicy } from './collaborationWake';
@@ -101,12 +102,17 @@ export interface CollaborationMessageSummary {
 export class CollaborationControlPlane {
   private readonly now: () => string;
   private readonly router: AutomaticRuntimeDeliveryRouter;
+  private readonly messageContents: LogicalMessageContentReader;
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore,
     private readonly deliveries: RuntimeDeliveryControlPlane,
     options: { now?: () => string } = {}
-  ) { this.now = options.now ?? (() => new Date().toISOString()); this.router = new AutomaticRuntimeDeliveryRouter(database, contentStore); }
+  ) {
+    this.now = options.now ?? (() => new Date().toISOString());
+    this.router = new AutomaticRuntimeDeliveryRouter(database, contentStore);
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
+  }
 
   /** Live keyset roster: paging limits presentation, never the authority of a known member. */
   public async listMembers(conversationId: string, input: { cursor?: string; limit?: number } = {}) {
@@ -286,9 +292,7 @@ export class CollaborationControlPlane {
         sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: request.state, message_id: replyToMessageId }), DOMAIN_REPOSITORIES.domain('CollaborationRequestTurnLink').assert(String(requestTurn.id), { turn_id: source.turnId }));
       }
     }
-    const turns = creating ? [] : await this.rows('Turn', { conversation_id: targetConversationId });
-    turns.sort(compareNewest);
-    const active = turns.filter((turn) => turn.status === 'active');
+    const active = creating ? [] : (await this.database.currentConversationTurns(targetConversationId)).snapshot.activeTurns;
     if (active.length > 1) throw new Error('Collaboration target has multiple active Turns.');
     // A manual compression or summary rebuild takes nothing in: a running-member notice finds the
     // target idle, and every other send waits for the next real Turn.
@@ -663,8 +667,8 @@ export class CollaborationControlPlane {
     // The transcript carries what people and models said; tool activity stays out of it.
     if (revision.role !== 'user' && revision.role !== 'model') return null;
     const metadata = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
-    const sizeBytes = Number(metadata.byte_length);
-    const text = sizeBytes > maxBytes ? null : visibleMessageText(String(metadata.content_type), (await this.contentStore.read(metadata)).toString('utf8'));
+    const sizeBytes = await this.messageContents.byteLength(metadata);
+    const text = sizeBytes > maxBytes ? null : visibleMessageText(logicalMessageContentType(metadata.content_type), (await this.messageContents.read(metadata)).toString('utf8'));
     return { role: String(revision.role), createdAt: String(revision.created_at), text, sizeBytes };
   }
 
@@ -800,8 +804,8 @@ export class CollaborationControlPlane {
       const revision = await this.existing('MessageRevision', String(current[0].revision_id));
       if (revision.role !== 'user') continue;
       const metadata = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
-      if (metadata.byte_length > 256_000n) continue;
-      const text = visibleMessageText(String(metadata.content_type), (await this.contentStore.read(metadata)).toString('utf8'));
+      if (await this.messageContents.byteLength(metadata) > 256_000) continue;
+      const text = visibleMessageText(logicalMessageContentType(metadata.content_type), (await this.messageContents.read(metadata)).toString('utf8'));
       if (text.trim()) return displayConversationTitleFromText(text, 80);
     }
     return stored;
@@ -944,7 +948,7 @@ export class CollaborationControlPlane {
       const revision = await this.existing('MessageRevision', String(current[0].revision_id));
       if (!['assistant', 'model'].includes(String(revision.role))) continue;
       const content = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
-      const text = visibleMessageText(String(content.content_type), (await this.contentStore.read(content)).toString('utf8')).trim();
+      const text = visibleMessageText(logicalMessageContentType(content.content_type), (await this.messageContents.read(content)).toString('utf8')).trim();
       if (text) return Buffer.byteLength(text) <= COLLABORATION_MESSAGE_MAX_TEXT_BYTES ? text : `${text.slice(0, 12000)}\n[Result truncated; read the destination task for the full answer.]`;
     }
     return null;

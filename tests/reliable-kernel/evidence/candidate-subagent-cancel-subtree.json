@@ -1,0 +1,54 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.subagent-cancel-subtree",
+  "stableId": "candidate.subagent-cancel-subtree",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:34:31.788Z",
+  "assertionCount": 6,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "b9190d12a0e28a8379e8c8d9bba7c7a7e67044ac3248d8367b5ddf910ef693b6",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "a40adc792ba10fcf831b7eae353962ab6742cc625788da1123f76effe2af0880",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.subagent-cancel-subtree"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "spawn原子写入ConversationOriginLink；启动恢复为旧ChildExecution补建稳定父对话lineage；并发同源spawn、重复dispatch/callback/reconcile按稳定identity收敛且不同请求不伪装dedupe",
+    "ChildExecution稳定ParentLink不随A continuation改写，B仍从旧Turn历史来源归属A树",
+    "interrupt_subtree用writer exact-set封住读写间并发spawn，重读稳定ParentLink后在同一成功事务覆盖全部active targets并取消pending Intent；请求本身不伪造Turn终态",
+    "A子树中断不误伤sibling/其他根树；叶节点interrupt_subtree只向该谱系当前ActiveTurnLink target写正常终止请求",
+    "父树登记interrupt_subtree后spawn在写入前拒绝，不留下半创建lineage",
+    "Plan winning commit是durable child intent；首次spawn后launch故障可幂等恢复，child已idle后的replay确认同一lineage且不重启"
+  ],
+  "faults": [
+    "spawn writer transaction fault after lineage/effect facts",
+    "concurrent identical spawn and duplicate callback",
+    "continuation after descendant creation",
+    "descendant spawn committed between cancel tree read and writer transaction",
+    "pending intent and active turns cancelled atomically",
+    "approved Plan commit before child launch with idempotent replay recovery"
+  ],
+  "metrics": {
+    "cancelledLineages": 3,
+    "siblingTerminationInputs": 1
+  }
+}

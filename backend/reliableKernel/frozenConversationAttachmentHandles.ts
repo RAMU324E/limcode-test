@@ -1,15 +1,14 @@
 import { frozenRecipeAttachmentHandles } from './frozenModelHandleCatalog';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { toolArtifactIdentifiesCall } from './copiedToolIdentity';
-import { isPersistentContextHandle, normalizeModelHandleCatalog,
-  type ModelHandleEntry } from './modelHandleCatalog';
+import type { ModelHandleEntry } from './modelHandleCatalog';
+import { parseNativeChildProjection } from './conversationChildHandles';
 import { normalizePlainJson } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 
 const NATIVE_PROJECTION_KIND = 'native_child_handle_projection';
-const NATIVE_PROJECTION_CONTENT_TYPE = 'application/vnd.limcode.native-child-handle-projection+json';
 const RECIPE_CONTENT_TYPE = 'application/vnd.limcode.model-request-recipe+json';
 export const ATTACHMENT_RECOVERY_SOURCE_KIND = 'attachment-handle-recovery';
 
@@ -108,16 +107,15 @@ async function readUnrecoveredReservations(database: RuntimeDatabase,
         if (call.turn_id !== turnId) throw frozenAttachmentError('Native attachment evidence belongs to another Turn.');
         for (const event of events) {
           assertions.push(DOMAIN_REPOSITORIES.domain('ToolCallEvent').assert(id(event.id), { ...where, content_object_id: event.content_object_id }));
-          const projection = await readFrozenObject(database, contentStore, id(event.content_object_id), NATIVE_PROJECTION_CONTENT_TYPE);
+          const projectionMetadata = row((await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject')
+            .get(id(event.content_object_id))])).snapshot[0], 'Frozen native attachment projection');
+          const projection = await parseNativeChildProjection(database, contentStore,
+            (await contentStore.read(projectionMetadata as unknown as ContentObjectMetadata)).toString('utf8'),
+            String(projectionMetadata.content_type));
           if (projection.kind !== NATIVE_PROJECTION_KIND || !await toolArtifactIdentifiesCall(database, projection.toolCallId, call)) {
             throw frozenAttachmentError('Native attachment projection has no proved carrier ToolCall.');
           }
-          const hasCatalog = 'modelHandleCatalog' in projection;
-          const catalog = normalizeModelHandleCatalog(hasCatalog ? projection.modelHandleCatalog : { entries: projection.childHandles });
-          if (!hasCatalog && catalog.entries.some(entry => !isPersistentContextHandle(entry.kind))) {
-            throw frozenAttachmentError('Legacy native child projection contains an attachment address.');
-          }
-          for (const entry of catalog.entries) {
+          for (const entry of projection.modelHandleCatalog.entries) {
             if (entry.kind !== 'attachment') continue;
             if (byRef.get(entry.ref) !== entry.target) throw frozenAttachmentError(`Native attachment reference ${entry.ref} is not frozen in its initial request.`);
             addFact(entry);

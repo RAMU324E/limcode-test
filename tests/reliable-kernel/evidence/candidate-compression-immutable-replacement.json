@@ -1,0 +1,50 @@
+{
+  "kind": "limcode-phase-e-candidate-evidence",
+  "checkId": "candidate.compression-immutable-replacement",
+  "passed": true,
+  "commitSha": "1e7e7b919da3c1332cf5fb7a16410e61ddd04782",
+  "measuredAt": "2026-08-21T07:16:12.933Z",
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "9de22998bc87474f587ef351bca39027235ef37b01169c7a5aa54b30f71c70cd",
+    "sourceTreeSha256": "6f42167623b2df585bb56ae44f52ded0bb67184e207fb280f627b2504ebe8c9e",
+    "sourceFileCount": 456,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "7cc992bafb2cc4aea0c825bb66f291a683820d72cf5bc26231d4b5892ff56777",
+    "compiledFileCount": 195,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-e-check.mjs",
+      "--check=candidate.compression-immutable-replacement"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "title/summary修改创建新block/segment/root/projection；previousStatus disposition显式持久化在immutable projection purpose；完整finite tail与source positions原样保留；exact retry保持commit/head/行/CAS零写入；same key的summary或previousStatus变化均明确冲突；旧历史字节级不变",
+    "Repository拒绝原地修改CompressionBlock title/summary；enable/disable/soft-delete实测只改变status；后续status变化也不会破坏已提交replacement的exact replay",
+    "title ContentObject在prepare后被并发提交、summary仍未提交时，每个ContentObject独立savepoint保证compression仍完整提交，不会整批跳过summary",
+    "自动压缩协调器把request kind/source prefix冻结进recipe，复用ModelRequest/Operation/Attempt/fence；exact replay零外调；provider-native MessageContent[]按版本化codec持久化并按token预算保留连续finite tail",
+    "自动压缩只由Provider实测基线优先的Context计量越过配置阈值触发；普通请求估算与物理输入预算仅用于规划和发送前校验，不再形成第二触发线",
+    "LLM capability adapter只发送冻结prefix，识别prior structured summary，并把CompactDone映射为单一durable completed事件；后续普通请求会展开版本化MessageContent[]而不是把JSON当Markdown",
+    "manual-only配置不会被自动调度；manualCurrentTurn在远低于冻结阈值时可显式压缩closed prefix，同时保留finite tail并冻结manual request kind",
+    "受保护tail使上下文越阈值但eligible prefix已不可缩小时，协调器按同head durable request精确跳过而不失败主Turn或重复外调",
+    "replacement与普通append竞态使用expected-head CAS：旧结果不能覆盖新head，旧block status不变且数据库无半提交",
+    "summary CAS已发布但SQLite stale-head事务未提交时只留下允许的orphan CAS，不留下Content/Block/Root悬空引用"
+  ],
+  "faults": [
+    "compression provider completed before ContextCompression head-CAS commit then exact coordinator replay",
+    "replacement CAS publish then concurrent head advance before SQLite commit"
+  ],
+  "metrics": {
+    "orphanCasFiles": 2
+  }
+}

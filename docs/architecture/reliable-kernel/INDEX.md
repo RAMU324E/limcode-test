@@ -44,6 +44,8 @@
 
 - [模型、工具调度与工具执行性能画像（生产历史 + 当前受控基准，非机器合同）](./TOOL-MODEL-PERFORMANCE-PROFILE.md)
 - [工具调度器与执行器性能优化方案（本机源码研究，非机器合同）](./TOOL-SCHEDULER-EXECUTOR-OPTIMIZATION.md)
+- [长会话与多 Agent 数据链性能优化方案（实施顺序、技能约束与验收）](./long-conversation-performance-plan.md)
+- [长会话与多 Agent 数据链性能优化实施报告（已实施、同机收益与验证结果）](./long-conversation-performance-implementation.md)
 - [每个数据目录只保留一个历史库（分期实施规划，非机器合同）](./one-history-library-plan.md)
 - [性能与打包边界](./appendices/performance-and-packaging-gates.md)
 - [可靠 Runtime 有界诊断](./appendices/runtime-diagnostics.md)

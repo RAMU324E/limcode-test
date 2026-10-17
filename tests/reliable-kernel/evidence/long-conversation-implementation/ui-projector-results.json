@@ -1,0 +1,211 @@
+{
+  "node": "v24.15.0",
+  "architecture": "arm64",
+  "baseline": "git HEAD source",
+  "current": "working tree production projector",
+  "fixture": "18k/200 messages; one user + model per Turn; one tool per model; 29 ready bodies; 3 exact tail replacements",
+  "results": [
+    {
+      "variant": "baseline",
+      "messages": 200,
+      "tools": 100,
+      "feedRecords": 1000,
+      "hydratedBodies": 29,
+      "initial": {
+        "milliseconds": 5.388,
+        "committedCalls": 1,
+        "assemblyCalls": 0,
+        "assemblyMs": 0,
+        "heapIncreaseMiB": 4.174
+      },
+      "tailSamplesMs": [
+        2.786,
+        2.507,
+        2.125
+      ],
+      "tailMedianMs": 2.507,
+      "tailCounts": [
+        {
+          "committedCalls": 1,
+          "historicalMessageProjections": 199,
+          "historicalBodyReads": 29,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 1,
+          "historicalMessageProjections": 199,
+          "historicalBodyReads": 29,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 1,
+          "historicalMessageProjections": 199,
+          "historicalBodyReads": 29,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        }
+      ],
+      "reusedHistoricalMessages": 0,
+      "reusedTools": 0,
+      "reusedToolArray": false,
+      "maxTailHeapIncreaseMiB": 2.116,
+      "retainedArrayContract": "Original complete projection."
+    },
+    {
+      "variant": "current",
+      "messages": 200,
+      "tools": 100,
+      "feedRecords": 1000,
+      "hydratedBodies": 29,
+      "initial": {
+        "milliseconds": 6.823,
+        "committedCalls": 101,
+        "assemblyCalls": 1,
+        "assemblyMs": 0.432,
+        "heapIncreaseMiB": 6.389
+      },
+      "tailSamplesMs": [
+        0.132,
+        0.107,
+        0.082
+      ],
+      "tailMedianMs": 0.107,
+      "tailCounts": [
+        {
+          "committedCalls": 0,
+          "historicalMessageProjections": 0,
+          "historicalBodyReads": 0,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 0,
+          "historicalMessageProjections": 0,
+          "historicalBodyReads": 0,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 0,
+          "historicalMessageProjections": 0,
+          "historicalBodyReads": 0,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        }
+      ],
+      "reusedHistoricalMessages": 199,
+      "reusedTools": 100,
+      "reusedToolArray": true,
+      "maxTailHeapIncreaseMiB": 0.07,
+      "retainedArrayContract": "One shallow message-array copy per delta; no full lookup/dictionary copy or sort."
+    },
+    {
+      "variant": "baseline",
+      "messages": 18000,
+      "tools": 9000,
+      "feedRecords": 90000,
+      "hydratedBodies": 29,
+      "initial": {
+        "milliseconds": 775.007,
+        "committedCalls": 1,
+        "assemblyCalls": 0,
+        "assemblyMs": 0,
+        "heapIncreaseMiB": 209.856
+      },
+      "tailSamplesMs": [
+        688.869,
+        481.52,
+        457.98
+      ],
+      "tailMedianMs": 481.52,
+      "tailCounts": [
+        {
+          "committedCalls": 1,
+          "historicalMessageProjections": 17999,
+          "historicalBodyReads": 29,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 1,
+          "historicalMessageProjections": 17999,
+          "historicalBodyReads": 29,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 1,
+          "historicalMessageProjections": 17999,
+          "historicalBodyReads": 29,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        }
+      ],
+      "reusedHistoricalMessages": 0,
+      "reusedTools": 0,
+      "reusedToolArray": false,
+      "maxTailHeapIncreaseMiB": 51.804,
+      "retainedArrayContract": "Original complete projection."
+    },
+    {
+      "variant": "current",
+      "messages": 18000,
+      "tools": 9000,
+      "feedRecords": 90000,
+      "hydratedBodies": 29,
+      "initial": {
+        "milliseconds": 212.429,
+        "committedCalls": 9001,
+        "assemblyCalls": 1,
+        "assemblyMs": 23.603,
+        "heapIncreaseMiB": 154.166
+      },
+      "tailSamplesMs": [
+        0.143,
+        0.145,
+        0.13
+      ],
+      "tailMedianMs": 0.143,
+      "tailCounts": [
+        {
+          "committedCalls": 0,
+          "historicalMessageProjections": 0,
+          "historicalBodyReads": 0,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 0,
+          "historicalMessageProjections": 0,
+          "historicalBodyReads": 0,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        },
+        {
+          "committedCalls": 0,
+          "historicalMessageProjections": 0,
+          "historicalBodyReads": 0,
+          "assemblyCalls": 0,
+          "assemblyMs": 0
+        }
+      ],
+      "reusedHistoricalMessages": 17999,
+      "reusedTools": 9000,
+      "reusedToolArray": true,
+      "maxTailHeapIncreaseMiB": 0.2,
+      "retainedArrayContract": "One shallow message-array copy per delta; no full lookup/dictionary copy or sort."
+    }
+  ],
+  "retention": {
+    "pagesVisited": 80,
+    "messagesVisited": 1600,
+    "liveMessages": 20,
+    "maximumResidentPages": 2,
+    "maximumResidentMessages": 60,
+    "maximumResidentBodies": 40,
+    "finalResidentMessages": 60,
+    "finalResidentBodies": 40
+  }
+}

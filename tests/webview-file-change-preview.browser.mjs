@@ -28,18 +28,31 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
       insert: { line: 1, content: 'unused-fixture-branch' } }
     : { mode: 'execute', command: 'npm test', explanation: '运行命令并收集结果' };
   const part = { id: 'provider-call', functionCall: { name: toolName, args } };
-  feed.projections.activeConversationWindow = { conversationId: 'conversation' };
-  feed.records = {
-    Turn: { turn: { id: 'turn', conversation_id: 'conversation', status: 'active' } },
-    Message: { message: { id: 'message', conversation_id: 'conversation', role: 'model', message_seq: '1',
-      revision_id: 'revision', created_at: '2026-10-09T10:00:00.000Z' } },
-    MessageTurnLink: { link: { id: 'link', message_id: 'message', turn_id: 'turn', role: 'model' } },
-    ToolCall: { call: { id: 'call', turn_id: 'turn', call_seq: '1', tool_name: toolName, status: 'terminal' } },
-    ToolCallSourceLink: { source: { id: 'source', tool_call_id: 'call', model_request_id: 'request',
-      message_id: 'message', provider_call_id: 'provider-call', provider_ordinal: 0 } },
-    ToolCallPolicySnapshot: { policy: { id: 'policy', tool_call_id: 'call', display_auto_expand: 0, display_auto_open_diff: 0 } },
-    ToolOutcome: { outcome: { id: 'outcome', tool_call_id: 'call', status: 'succeeded' } }
-  };
+  const session = { sessionId: 'file-preview-session', hostBootId: 'file-preview-host' };
+  // Real Feed messages update the canonical committed facts used by the card projector.
+  feed.observe({ type: 'reliable-kernel.snapshot', ...session, messageSeq: '1', snapshotCommitSeq: '1',
+    projections: { activeConversationWindow: {
+      conversationId: 'conversation',
+      turns: [{ id: 'turn', conversation_id: 'conversation', status: 'active' }],
+      messages: [{ id: 'message', conversation_id: 'conversation', role: 'model', message_seq: '1',
+        revision_id: 'revision', created_at: '2026-10-09T10:00:00.000Z' }],
+      messageTurnLinks: [{ id: 'link', message_id: 'message', turn_id: 'turn', role: 'model' }],
+      toolCalls: [{ id: 'call', turn_id: 'turn', call_seq: '1', tool_name: toolName, status: 'terminal' }],
+      toolCallSourceLinks: [{ id: 'source', tool_call_id: 'call', model_request_id: 'request',
+        message_id: 'message', provider_call_id: 'provider-call', provider_ordinal: 0 }],
+      toolCallPolicySnapshots: [{ id: 'policy', tool_call_id: 'call', display_auto_expand: 0, display_auto_open_diff: 0 }],
+      toolOutcomes: [{ id: 'outcome', tool_call_id: 'call', status: 'succeeded' }]
+    } }
+  });
+  window.deliverFileChanges = () => feed.observe({ type: 'reliable-kernel.changes', ...session,
+    messageSeq: '2', commitSeq: '2', changes: [
+      { type: 'FileChangeSet', id: 'set', operation: 'upsert',
+        record: { id: 'set', tool_call_id: 'call', status: 'applied' } },
+      { type: 'FileChangeSetMember', id: 'member', operation: 'upsert',
+        record: { id: 'member', change_set_id: 'set', member_seq: '1',
+          operation: 'replace_file', target_path: 'src/example.ts' } }
+    ]
+  });
   const detail = value => ({ status: 'ready', text: JSON.stringify(value) });
   feed.details['message-content:revision'] = detail({ role: 'model', parts: [part] });
   feed.details['tool-arguments-content:call'] = detail(args);
@@ -78,11 +91,7 @@ test('file preview loads arriving members, starts expanded and respects the user
     assert.equal(await page.getByText('原始参数', { exact: true }).count(), 0);
     assert.equal(await page.getByText('修改参数', { exact: true }).count(), 0);
 
-    await page.evaluate(() => {
-      window.feed.records.FileChangeSet = { set: { id: 'set', tool_call_id: 'call', status: 'applied' } };
-      window.feed.records.FileChangeSetMember = { member: { id: 'member', change_set_id: 'set', member_seq: '1',
-        operation: 'replace_file', target_path: 'src/example.ts' } };
-    });
+    await page.evaluate(() => window.deliverFileChanges());
     await page.waitForFunction(() => window.requests.some(request => request.kind === 'file-change-diff' && request.recordId === 'member'));
     await page.getByRole('button', { name: '使用执行记录中的修改前后内容查看差异，不依赖工作区当前文件' }).waitFor();
     await page.locator('.tool-diff-file-path').waitFor();
@@ -119,11 +128,7 @@ test('file preview loads arriving members, starts expanded and respects the user
       assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
       assert.match(await toggle.innerText(), /运行命令并收集结果/);
       assert.equal(await page.getByText('command output ready', { exact: true }).count(), 0);
-      await page.evaluate(() => {
-        window.feed.records.FileChangeSet = { set: { id: 'set', tool_call_id: 'call', status: 'applied' } };
-        window.feed.records.FileChangeSetMember = { member: { id: 'member', change_set_id: 'set', member_seq: '1',
-          operation: 'replace_file', target_path: 'src/example.ts' } };
-      });
+      await page.evaluate(() => window.deliverFileChanges());
       await setDiff('@@ -10,1 +10,1 @@\n-before\n+command generated change');
       assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
       assert.match(await toggle.innerText(), /运行命令并收集结果/);

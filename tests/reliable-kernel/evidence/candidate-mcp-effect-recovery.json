@@ -1,0 +1,27 @@
+{
+  "kind": "limcode-phase-d-candidate-evidence",
+  "stableId": "candidate.mcp-effect-recovery",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:41:57.086Z",
+  "assertionCount": 6,
+  "assertions": [
+    "MCP annotations只映射read/write/command，不建立MCP专用权限体系",
+    "MCP prepare复用既有ToolPolicy/PlanReviewPolicy gate；明确拒绝持久收口且不创建Attempt/Intent、不外调",
+    "MCP显式isError/adapter明确失败形成failed；只有dispatch后无法证明的连接异常形成outcome_unknown",
+    "MCP callback丢失并重启后不自动重试；连接重建不冒充调用恢复，落outcome_unknown",
+    "重复MCP recovery稳定重放首次unknown结果且外部调用仍为0",
+    "MCP风险只接受registry权威annotations；冲突提示在建Intent/外调前拒绝"
+  ],
+  "faults": [
+    "ToolPolicy/PlanReviewPolicy denial before intent",
+    "MCP success",
+    "observed MCP tool failure",
+    "explicit adapter failure",
+    "ambiguous transport failure",
+    "authoritative conflicting annotations",
+    "callback lost after dispatch",
+    "host restart no query",
+    "no automatic retry"
+  ]
+}

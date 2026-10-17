@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import {
   isFunctionCallPart,
   type ContentPart,
@@ -10,14 +10,17 @@ import {
 } from '@shared/protocol';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { reliableToolCallForPart } from '@webview/domain/reliablePresentationIndex';
+import { useContentBlockWindow } from '@webview/composables/useContentBlockWindow';
 import StreamingIndicatorTail from './StreamingIndicatorTail.vue';
-import { partViewComponent, toRenderNodes, type RichRenderNode } from './partRegistry';
+import { partViewComponent, RichRenderNodeProjector, type RichRenderNode } from './partRegistry';
 
 const props = defineProps<{
   parts: ContentPart[];
   streaming?: boolean;
   markdown?: boolean;
   messageId?: string;
+  scroller?: HTMLElement | null;
 }>();
 
 interface ToolBatchMeta {
@@ -39,14 +42,22 @@ interface ToolCallNodeInfo {
 
 const reliableConversation = useReliableConversation();
 const globalSettings = useGlobalSettingsStore();
-const nodes = computed(() => withToolBatchMeta(toRenderNodes(props.parts)));
+const nodeProjector = new RichRenderNodeProjector();
+const rawNodes = computed(() => nodeProjector.project(props.parts));
+let previousBatchNodes = new Map<string, RichRenderNode>();
+const nodes = computed(() => withToolBatchMeta(rawNodes.value));
+const blockKeys = computed<readonly string[]>((previous) => {
+  const next = nodes.value.map(node => node.key);
+  return previous?.length === next.length && next.every((key, index) => key === previous[index]) ? previous : next;
+});
+const root = ref<HTMLElement | null>(null);
+const blockWindow = useContentBlockWindow({ keys: blockKeys, root, scroller: computed(() => props.scroller) });
+const visibleNodes = computed(() => nodes.value.slice(blockWindow.start.value, blockWindow.end.value));
+const messageToolCalls = computed(() => props.messageId
+  ? reliableConversation.projection.value.toolCallsByMessageId[props.messageId] : undefined);
 const showToolExecutingTail = computed(() => {
   if (props.streaming || !props.messageId) return false;
-  return nodes.value.some((node) => {
-    if (node.kind !== 'functionCall') return false;
-    const call = toolCallForNode(node);
-    return call ? isToolExecutingStatus(call.status, call.progress) : false;
-  });
+  return messageToolCalls.value?.some(call => isToolExecutingStatus(call.status, call.progress)) ?? false;
 });
 const showStandaloneStreamingTail = computed(() => {
   if (!props.streaming || nodes.value.length === 0) return false;
@@ -112,7 +123,7 @@ function streamingPhase(): 'waiting' | 'thinking' | 'writing' {
 }
 
 function withToolBatchMeta(inputNodes: RichRenderNode[]): RichRenderNode[] {
-  const result = inputNodes.map((node) => ({ ...node, props: { ...node.props } }));
+  const result = inputNodes.map((node) => node.kind === 'functionCall' ? { ...node, props: { ...node.props } } : node);
   let segment: ToolCallNodeInfo[] = [];
   let functionOrdinal = 0;
 
@@ -140,6 +151,16 @@ function withToolBatchMeta(inputNodes: RichRenderNode[]): RichRenderNode[] {
   }
   flushSegment();
 
+  const next = new Map<string, RichRenderNode>();
+  for (let index = 0; index < result.length; index += 1) {
+    const node = result[index]!;
+    if (node.kind !== 'functionCall') continue;
+    const prior = previousBatchNodes.get(node.key);
+    const keys = Object.keys(node.props);
+    if (prior && keys.length === Object.keys(prior.props).length && keys.every(key => node.props[key] === prior.props[key])) result[index] = prior;
+    next.set(node.key, result[index]!);
+  }
+  previousBatchNodes = next;
   return result;
 }
 
@@ -197,17 +218,8 @@ function toolCallForNode(node: RichRenderNode): ToolCallRecord | undefined {
   const part = node.props.part;
   if (!isFunctionCallPart(part as ContentPart)) return undefined;
   const functionCallPart = part as FunctionCallPart;
-  const partId = functionCallPart.id;
-  const calls = reliableConversation.projection.value.toolCallsByMessageId[props.messageId] ?? [];
-  const exact = partId
-    ? calls.find((call) => call.id === partId || call.functionCallId === partId)
-    : undefined;
-  if (exact) return exact;
   const ordinal = typeof node.props.toolOrdinal === 'number' ? node.props.toolOrdinal : undefined;
-  return calls.find((call) =>
-    call.name === functionCallPart.functionCall.name
-    && (ordinal === undefined || call.schedulingOrdinal === ordinal)
-  );
+  return reliableToolCallForPart(reliableConversation.projection.value.index, props.messageId, functionCallPart, ordinal);
 }
 
 function isBlockingToolCall(call: ToolCallRecord): boolean {
@@ -238,14 +250,15 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
 </script>
 
 <template>
-  <div class="rich-content">
+  <div ref="root" class="rich-content">
     <template v-if="nodes.length">
-      <component
-        :is="partViewComponent(node.kind)"
-        v-for="(node, index) in nodes"
-        :key="node.key"
-        v-bind="nodeComponentProps(node, index)"
-      />
+      <div v-if="blockWindow.beforeHeight.value > 0" class="rich-content-spacer" :style="{ height: `${blockWindow.beforeHeight.value}px` }" aria-hidden="true" />
+      <div v-for="(node, index) in visibleNodes" :key="node.key"
+        :ref="element => blockWindow.bindBlock(node.key, element)"
+        class="rich-content-block" :data-content-block-key="node.key">
+        <component :is="partViewComponent(node.kind)" v-bind="nodeComponentProps(node, blockWindow.start.value + index)" />
+      </div>
+      <div v-if="blockWindow.afterHeight.value > 0" class="rich-content-spacer" :style="{ height: `${blockWindow.afterHeight.value}px` }" aria-hidden="true" />
       <div v-if="showStandaloneStreamingTail" class="rich-streaming-tail-row">
         <StreamingIndicatorTail :text="standaloneStreamingText" :variant="standaloneStreamingPhase" />
       </div>
@@ -272,6 +285,9 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
   gap: var(--space-2);
   min-width: 0;
 }
+
+.rich-content-block { min-width: 0; }
+.rich-content-spacer { flex-shrink: 0; pointer-events: none; }
 
 .rich-streaming-tail-row {
   color: var(--vscode-descriptionForeground);

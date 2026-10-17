@@ -6,6 +6,8 @@ import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { TURN_EXECUTION_PRESET_CONTENT_TYPE } from './runtimeDeliveryContinuationIdentity';
 
+export const CHILD_INTENT_ANSWER_WAIT_OWNER_KIND = 'child_intent_answer_wait';
+/** Published waits retain their original future-Turn owner. New waits own their Intent directly. */
 export const CHILD_TURN_ANSWER_WAIT_OWNER_KIND = 'child_turn_answer_wait';
 export const LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND = 'answer_bridge_wait';
 
@@ -22,10 +24,14 @@ export function sendIdentityIds(
     turnIntentRevisionId: stablePhaseFId('turn_intent_revision', 'child-send', ...scope),
     presetRevisionId: stablePhaseFId('turn_execution_preset_revision', 'child-send', ...scope),
     intentLinkId: stablePhaseFId('child_execution_intent_link', 'child-send', ...scope),
-    pendingTurnInputId: stablePhaseFId('pending_turn_input', 'child-send-intent', childExecutionId, stablePhaseFId('turn_intent', 'child-send', ...scope)),
+    pendingTurnInputId: queuedIntentPendingInputId(childExecutionId, stablePhaseFId('turn_intent', 'child-send', ...scope)),
     operationId: stablePhaseFId('operation', 'child-send', ...scope),
     pauseId: stablePhaseFId('outcome_pause', 'child-send', ...scope)
   };
+}
+
+export function queuedIntentPendingInputId(childExecutionId: string, turnIntentId: string): string {
+  return stablePhaseFId('pending_turn_input', 'child-send-intent', childExecutionId, turnIntentId);
 }
 
 export function childContinuationTurnId(childExecutionId: string, turnIntentId: string): string {
@@ -38,17 +44,28 @@ export function childContinuationTurnId(childExecutionId: string, turnIntentId: 
  * immutable mode preset and ChildExecutionIntentLink reconstruct one child-send command.
  * Timestamps and sequence proximity never participate in the mapping.
  */
+interface LegacyContinuationWaitInput {
+  childExecutionId: string;
+  operations: DomainRow[];
+  intentLinks: DomainRow[];
+  sourceTurnId?: string;
+  turnIntentId?: string;
+}
+
 export async function resolveLegacyContinuationWaitOperations(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
-  input: {
-    childExecutionId: string;
-    operations: DomainRow[];
-    intentLinks: DomainRow[];
-    sourceTurnId?: string;
-    turnIntentId?: string;
-  }
+  input: LegacyContinuationWaitInput
 ): Promise<DomainRow[]> {
+  return (await resolveLegacyContinuationWaitTargets(database, contentStore, input)).map(value => value.operation);
+}
+
+/** The exact admitted Turn is retained for callers that must inspect this legacy wait's target. */
+export async function resolveLegacyContinuationWaitTargets(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  input: LegacyContinuationWaitInput
+): Promise<Array<{ operation: DomainRow; turnId: string | null }>> {
   if (input.operations.length === 0) return [];
   const child = await requireExisting(database, 'ChildExecution', input.childExecutionId);
   const intentLinksById = new Map(input.intentLinks.map((link) => [String(link.id), link]));
@@ -124,7 +141,7 @@ export async function resolveLegacyContinuationWaitOperations(
     DOMAIN_REPOSITORIES.domain('TurnIntentRevision').get(match.ids.turnIntentRevisionId),
     DOMAIN_REPOSITORIES.domain('TurnExecutionPresetRevision').get(match.ids.presetRevisionId)
   ]));
-  const resolved: DomainRow[] = [];
+  const resolved: Array<{ operation: DomainRow; turnId: string | null }> = [];
   for (const [index, match] of matches.entries()) {
     const intent = requireRow(
       factSnapshot.snapshot[index * 3],
@@ -158,13 +175,14 @@ export async function resolveLegacyContinuationWaitOperations(
       );
     }
     if (input.sourceTurnId) {
-      if (intent.state !== 'admitted' || intent.turn_id !== input.sourceTurnId) {
+      if (intent.turn_id !== null && (intent.state !== 'admitted' || intent.turn_id !== input.sourceTurnId)) {
         throw new Error(
           `Legacy continuation wait ${String(match.operation.id)} is not admitted by its source Turn.`
         );
       }
     }
-    resolved.push(match.operation);
+    resolved.push({ operation: match.operation,
+      turnId: intent.state === 'admitted' ? requirePhaseFId(intent.turn_id, 'TurnIntent.turn_id') : null });
   }
   return resolved;
 }

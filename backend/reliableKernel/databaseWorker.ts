@@ -1,5 +1,11 @@
 import { executeSingleResponseMeasurement } from './singleResponseMeasurement';
+import { CLIENT_STRUCTURAL_REMOVAL_DOMAINS, clientRemovalScopeSql, mergeClientChangeScopes } from './clientChangeScope';
 import { readNativePendingWork, readNativeSteeringInFlightSnapshot, readNativeAdmittedProviderCallIds } from './nativeWorkSnapshot';
+import { readActiveModelRequests, readModelRequestStopCandidates } from './modelRequestWorkSnapshot';
+import { readCurrentConversationTurns, readNativeSteeringReceiptFacts } from './conversationCurrentWorkSnapshot';
+import { readChildExecutionSnapshot, readChildExecutionList, readChildExecutionSubtreeFacts, readChildContinuationWaitFacts } from './childExecutionFactsSnapshot';
+import { CHILD_INTENT_ANSWER_WAIT_OWNER_KIND } from './childSendLineage';
+import { ConversationDeletionBlockedError } from './conversationDeletionErrors';
 import { CurrentTurnTaskCardCache } from './currentTurnTaskSnapshot';
 import { assertConversationContextHandleState, assertConversationContextHandleStateUpdate, assertContextRootHandleCatalog } from './conversationContextHandleStateInvariant';
 import { visitForkMessageCopyAssertions, visitForkMessageCopyInserts } from './forkMessageCopy';
@@ -422,6 +428,18 @@ async function start(): Promise<void> {
         respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
       }
+      if (request.kind === 'activeModelRequests' || request.kind === 'modelRequestStopCandidates'
+        || request.kind === 'currentConversationTurns' || request.kind === 'nativeSteeringReceipts') {
+        const snapshot = reader.transaction(() => {
+          assertDatabaseBinding(reader, data.binding);
+          if (request.kind === 'activeModelRequests') return readActiveModelRequests(reader, request.turnId);
+          if (request.kind === 'modelRequestStopCandidates') return readModelRequestStopCandidates(reader, request.turnId);
+          if (request.kind === 'currentConversationTurns') return readCurrentConversationTurns(reader, request.conversationId, request.includeLatest);
+          return readNativeSteeringReceiptFacts(reader, request.scope);
+        })();
+        respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
+        return;
+      }
       if (request.kind === 'snapshot') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeSnapshot(reader, request.reads, commitSeq);
@@ -473,9 +491,21 @@ async function start(): Promise<void> {
       if (request.kind === 'conversationChildTaskSnapshot') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeConversationChildTaskSnapshot(
-          reader, request.conversationId, commitSeq, executeRead, clientProjectionContent.readVerifiedBytes
+          reader, request.conversationId, commitSeq, executeRead, clientProjectionContent.readVerifiedBytes, request.options
         );
         respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'childExecutionSnapshot' || request.kind === 'childExecutionList'
+        || request.kind === 'childExecutionSubtreeSnapshot' || request.kind === 'childContinuationWaitFacts') {
+        const snapshot = reader.transaction(() => {
+          assertDatabaseBinding(reader, data.binding);
+          if (request.kind === 'childExecutionSnapshot') return readChildExecutionSnapshot(reader, request.childExecutionId);
+          if (request.kind === 'childExecutionList') return readChildExecutionList(reader, request.limit);
+          if (request.kind === 'childContinuationWaitFacts') return readChildContinuationWaitFacts(reader, request.input);
+          return readChildExecutionSubtreeFacts(reader, request.childExecutionId, request.includeDescendants);
+        })();
+        respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
       }
       if (request.kind === 'processOutputRegistrationMismatches') {
@@ -600,7 +630,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'clientKeysetPage') {
         assertDatabaseBinding(reader, data.binding);
-        const result = executeClientKeysetPage(reader, request.input);
+        const result = executeClientKeysetPage(reader, request.input, clientProjectionContent);
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
@@ -720,7 +750,8 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       sequence INTEGER PRIMARY KEY,
       domain TEXT NOT NULL,
       id TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('upsert', 'remove'))
+      kind TEXT NOT NULL CHECK (kind IN ('upsert', 'remove')),
+      scope_json TEXT
     );
     CREATE TEMP TABLE runtime_transaction_internal_domain_change (
       domain TEXT PRIMARY KEY NOT NULL
@@ -742,12 +773,14 @@ function configureTransactionChangeCapture(database: Database.Database): void {
     for (const operation of ['insert', 'update', 'delete'] as const) {
       const row = operation === 'delete' ? 'OLD' : 'NEW';
       const kind = operation === 'delete' ? 'remove' : 'upsert';
+      const scope = operation === 'delete' && CLIENT_STRUCTURAL_REMOVAL_DOMAINS.has(schema.key)
+        || operation === 'update' && schema.key === 'Message' ? clientRemovalScopeSql(schema, row) : 'NULL';
       database.exec(`
         CREATE TEMP TRIGGER ${quote(`capture_${schema.table}_${operation}`)}
-        AFTER ${operation.toUpperCase()} ON ${quote(schema.table)}
+        ${operation === 'delete' ? 'BEFORE' : 'AFTER'} ${operation.toUpperCase()} ON ${quote(schema.table)}
         BEGIN
-          INSERT INTO runtime_transaction_change (domain, id, kind)
-          VALUES (${domain}, ${row}.id, '${kind}');
+          INSERT INTO runtime_transaction_change (domain, id, kind, scope_json)
+          VALUES (${domain}, ${row}.id, '${kind}', ${scope});
         END
       `);
     }
@@ -775,12 +808,14 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       const taskChange = relation.table === 'message_part_of_conversation'
         ? taskOwnersForMessages(operation === 'update' ? 'OLD.message_id, NEW.message_id' : `${row}.message_id`)
         : '';
+      const relationSchema = DOMAIN_REPOSITORIES.all().find(repository => repository.schema.table === relation.table)!.schema;
+      const scope = operation === 'delete' ? clientRemovalScopeSql(relationSchema, row) : 'NULL';
       database.exec(`
         CREATE TEMP TRIGGER ${quote(`capture_message_from_${relation.table}_${operation}`)}
-        AFTER ${operation.toUpperCase()} ON ${quote(relation.table)}
+        ${operation === 'delete' ? 'BEFORE' : 'AFTER'} ${operation.toUpperCase()} ON ${quote(relation.table)}
         BEGIN
-          INSERT INTO runtime_transaction_change (domain, id, kind)
-          VALUES ('Message', ${row}.${quote(relation.messageColumn)}, '${kind}');
+          INSERT INTO runtime_transaction_change (domain, id, kind, scope_json)
+          VALUES ('Message', ${row}.${quote(relation.messageColumn)}, '${kind}', ${scope});
           ${taskChange}
         END
       `);
@@ -979,16 +1014,17 @@ function readInternalChangedDomains(database: Database.Database): string[] {
 
 function readTransactionChanges(database: Database.Database): RuntimeChange[] {
   const rows = prepareCached(database, `
-    SELECT current.sequence, current.domain, current.id, current.kind
+    SELECT current.sequence, current.domain, current.id, current.kind, latest.scopes_json
       FROM runtime_transaction_change AS current
       JOIN (
-        SELECT domain, id, MAX(sequence) AS sequence
+        SELECT domain, id, MAX(sequence) AS sequence,
+               json_group_array(scope_json) FILTER (WHERE scope_json IS NOT NULL) AS scopes_json
           FROM runtime_transaction_change
          GROUP BY domain, id
       ) AS latest
         ON latest.sequence = current.sequence
      ORDER BY current.sequence
-  `).all() as Array<{ sequence: bigint; domain: string; id: string; kind: 'upsert' | 'remove' }>;
+  `).all() as Array<{ sequence: bigint; domain: string; id: string; kind: 'upsert' | 'remove'; scopes_json: string }>;
   const topology = new Map(DOMAIN_REPOSITORIES.all().map((repository, index) => [repository.schema.key, index]));
   topology.set('ConversationContextStatus', topology.size);
   topology.set('ConversationCommandReceipt', topology.size);
@@ -996,6 +1032,8 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
   topology.set('ConversationTaskList', topology.size);
   topology.set('ConversationExecutionBoundary', topology.size);
   return rows
+    .map(({ scopes_json, ...row }) => ({ ...row,
+      ...(scopes_json !== '[]' ? { scope: mergeClientChangeScopes(JSON.parse(scopes_json) as string[]) } : {}) }))
     .map((row) => {
       if (row.domain === 'ConversationTaskList' || row.domain === 'ConversationExecutionBoundary') {
         if (!prepareCached(database, 'SELECT 1 FROM conversation WHERE id = ?').get(row.id)) {
@@ -1032,7 +1070,7 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
         record = projectTurnClientRecord(database, row.id, clientProjectionContent);
       }
       if (row.domain === 'Message') {
-        const projected = projectMessageWindowRecord(database, row.id);
+        const projected = projectMessageWindowRecord(database, row.id, clientProjectionContent);
         if (!projected) return { ...row, kind: 'remove' as const };
         record = projected;
       }
@@ -1419,7 +1457,12 @@ function executeModelStreamEvent(
     }
     const contentId = requireRuntimeId(input.contentObject.id);
     assertPreparedContentInsert(input.contentObject, input.contentInsert);
-    const contentSteps: RepositoryTransactionStep[] = preparedContentObjectSteps([{
+    const relatedContentObjects = input.relatedContentObjects ?? [];
+    if (relatedContentObjects.length > 0 && input.checkpointKind !== 'native_tool_call') {
+      throw new TypeError('Only native tool-call checkpoints register frozen catalog dependencies.');
+    }
+    for (const related of relatedContentObjects) assertPreparedContentInsert(related.metadata, related.insert);
+    const contentSteps: RepositoryTransactionStep[] = preparedContentObjectSteps([...relatedContentObjects, {
       metadata: input.contentObject as ContentObjectMetadata,
       ...(input.contentInsert ? { insert: input.contentInsert } : {})
     }], 'model_stream_content');
@@ -2235,7 +2278,7 @@ function executeMutation(
     if (schema.key === 'Conversation') {
       const rows = prepareCached(database, `SELECT id FROM conversation WHERE ${predicates.join(' AND ')} LIMIT 2`).all(parameters) as Array<{ id: string }>;
       if (rows.length > mutation.maxChanges) throw new Error('Conversation.deleteWhere exceeded its scope.');
-      for (const row of rows) deleteConversationModelOperations(database, row.id);
+      for (const row of rows) prepareConversationDeletion(database, row.id);
     }
     const result = prepareCached(database, `DELETE FROM ${quote(schema.table)} WHERE ${predicates.join(' AND ')}`).run(parameters);
     if (result.changes > mutation.maxChanges) {
@@ -2247,19 +2290,26 @@ function executeMutation(
     if (schema.key === 'ModelStreamCheckpoint') {
       throw new Error('ModelStreamCheckpoint rows can only be pruned by the fixed writer stream-finalization operation.');
     }
-    if (schema.key === 'Conversation') deleteConversationModelOperations(database, id);
+    if (schema.key === 'Conversation') prepareConversationDeletion(database, id);
     const result = prepareCached(database, `DELETE FROM ${quote(schema.table)} WHERE id = ?`).run(id);
     if (result.changes !== 1) throw new Error(`${schema.repository} delete expected one row: ${id}`);
   }
 }
 
 /**
- * owner_kind/owner_id is a polymorphic soft reference, not an SQLite FK. The declared
- * Operation cascade-with-owner is implemented here in the same writer transaction, before the
- * Conversation -> Turn -> ModelRequest cascade erases the ownership evidence. Never a general
- * orphan sweep: retained effects/process history and operations of other owners are untouched.
+ * owner_kind/owner_id is a polymorphic soft reference, not an SQLite FK.
+ * A cancelled Intent can still own a parent wait. Assert its live work at the final writer boundary,
+ * then remove complete model Operations before Conversation cascades erase ownership evidence.
+ * Retained effects/process history and operations of other owners are untouched.
  */
-function deleteConversationModelOperations(database: Database.Database, conversationId: string): void {
+function prepareConversationDeletion(database: Database.Database, conversationId: string): void {
+  const waiting = prepareCached(database, `SELECT operation.id FROM operation INDEXED BY ix_operation_03
+    CROSS JOIN turn_intent AS intent
+    WHERE operation.status = 'waiting_answer' AND operation.owner_kind = ?
+      AND intent.id = operation.owner_id AND intent.conversation_id = ? LIMIT 1`)
+    .get(CHILD_INTENT_ANSWER_WAIT_OWNER_KIND, conversationId) as { id: string } | undefined;
+  if (waiting) throw new ConversationDeletionBlockedError(
+    `Conversation ${conversationId} still has an unsettled child continuation wait ${waiting.id}.`);
   const requests = prepareCached(database, `
     SELECT request.id, request.status FROM turn
       JOIN model_request AS request ON request.turn_id = turn.id
@@ -2480,14 +2530,9 @@ function assertCollectedRuntimeAggregates(
   database: Database.Database,
   touched: { modelRequestIds: ReadonlySet<string>; turnIds: ReadonlySet<string> }
 ): void {
-  const modelRequestIds = new Set(touched.modelRequestIds);
-  for (const turnId of touched.turnIds) {
-    const turn = prepareCached(database, 'SELECT status FROM turn WHERE id = ?').get(turnId) as { status?: unknown } | undefined;
-    if (turn?.status === 'active') continue;
-    const requests = prepareCached(database, 'SELECT id FROM model_request WHERE turn_id = ?').all(turnId) as Array<{ id: string }>;
-    for (const request of requests) modelRequestIds.add(requireRuntimeId(request.id));
-  }
-  for (const modelRequestId of modelRequestIds) assertModelRequestAggregate(database, modelRequestId);
+  // Each changed request/operation/attempt is checked here. A Turn's terminal-set assertion is
+  // part of its existing terminal writer; ending it does not mutate old request aggregates.
+  for (const modelRequestId of touched.modelRequestIds) assertModelRequestAggregate(database, modelRequestId);
 }
 
 /** A maintenance transaction's touched ids, rows of its TEMP scratch table. */
@@ -3314,15 +3359,19 @@ function executeSnapshotAll(
   read: RepositoryListRead,
   commitSeq: bigint
 ): SnapshotBarrier<DomainRow[]> {
-  if (read.orderBy?.column !== 'id' || read.orderBy.direction !== 'asc') {
-    throw new TypeError('snapshotAll requires id ascending order.');
+  const orderColumn = read.orderBy?.column ?? 'id';
+  if (read.orderBy?.direction !== 'asc'
+    || (orderColumn !== 'id' && (read.domain !== 'ModelRequest' || orderColumn !== 'request_seq'))) {
+    throw new TypeError('snapshotAll requires id order, or ModelRequest request_seq order.');
   }
   database.exec('BEGIN');
   try {
     const rows: DomainRow[] = [];
     let afterId = read.afterId;
+    let keyset = read.keyset;
     for (;;) {
-      const page = executeRead(database, { ...read, ...(afterId ? { afterId } : {}) });
+      const page = executeRead(database, { ...read,
+        ...(orderColumn === 'id' ? (afterId ? { afterId } : {}) : (keyset ? { keyset } : {})) });
       if (!Array.isArray(page)) throw new TypeError('snapshotAll list did not return rows.');
       rows.push(...page);
       if (page.length < read.limit) break;
@@ -3331,6 +3380,10 @@ function executeSnapshotAll(
         throw new Error('snapshotAll pagination did not advance.');
       }
       afterId = lastId;
+      if (orderColumn !== 'id') {
+        keyset = { column: orderColumn, value: page[page.length - 1]![orderColumn] as bigint | string,
+          id: lastId, direction: 'after' };
+      }
     }
     database.exec('COMMIT');
     return { snapshotCommitSeq: commitSeq.toString(), snapshot: rows };

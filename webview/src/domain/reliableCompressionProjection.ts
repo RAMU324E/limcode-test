@@ -1,3 +1,6 @@
+import { createReliablePresentationIndex, reliableCompressionAnchorAt, type ReliableMessageOrderIndex } from './reliablePresentationIndex.ts';
+import type { MessageRecord } from '@shared/protocol';
+
 export interface ReliableCompressionTimelineProjection {
   byAnchor: Record<string, Array<Record<string, unknown>>>;
 }
@@ -27,23 +30,23 @@ export interface ReliableCompressionRequestPurpose {
  */
 export function projectReliableCompressionTimeline(
   blocks: readonly Record<string, unknown>[],
-  messages: readonly ReliableCompressionTimelineMessage[]
+  messages: readonly ReliableCompressionTimelineMessage[] | ReliableMessageOrderIndex
 ): ReliableCompressionTimelineProjection {
   const byAnchor: ReliableCompressionTimelineProjection['byAnchor'] = {};
-  const visibleMessageIds = new Set(messages.map((message) => message.id).filter(Boolean));
+  const index = Array.isArray(messages)
+    ? createReliablePresentationIndex(messages as MessageRecord[], [])
+    : messages as ReliableMessageOrderIndex;
   for (const block of blocks) {
     const completedAt = timestamp(block.created_at ?? block.createdAt);
     let anchor = '';
     if (completedAt > 0) {
-      for (const message of messages) {
-        if (message.createdAt > 0 && message.createdAt <= completedAt) anchor = message.id;
-      }
+      anchor = reliableCompressionAnchorAt(index, completedAt) ?? '';
       // A block older than the bounded message window remains durable history, but placing it at
       // the first visible row would invent a false in-window chronology.
       if (!anchor) continue;
     } else {
       const sourceAnchor = text(block.anchor_message_id ?? block.anchorMessageId);
-      if (sourceAnchor && visibleMessageIds.has(sourceAnchor)) anchor = sourceAnchor;
+      if (sourceAnchor && index.messagePositionById.has(sourceAnchor)) anchor = sourceAnchor;
     }
     if (!anchor) continue;
     (byAnchor[anchor] ??= []).push(block);

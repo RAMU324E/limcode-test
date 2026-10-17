@@ -55,6 +55,7 @@ interface ReplayEntry {
   textSlots: Map<string, ReplayTextSlot>;
   progressSlots: Map<string, ReplayEventSlot>;
   toolSlots: Map<string, ReplayToolDeltaSlot>;
+  committedItemSlot?: ReplayEventSlot;
 }
 
 export interface ReliableTransientReplaySnapshot extends Omit<
@@ -63,8 +64,8 @@ export interface ReliableTransientReplaySnapshot extends Omit<
 > {}
 
 /**
- * Memory-only cumulative projection used only to heal Webview transport gaps. Durable authority
- * remains ModelRequest/Message. Text and argument fragments stay chunked until a snapshot is sent.
+ * Memory-only projection used to heal Webview transport gaps. Durable authority remains
+ * ModelRequest/Message. Only unsealed item fragments stay here; committed items are read by revision.
  */
 export class ReliableTransientReplayStore {
   private readonly entries = new Map<string, ReplayEntry>();
@@ -144,7 +145,7 @@ function createReplayEntry(key: string, event: ReliableAgentTransientEvent): Rep
     attemptSeq: event.attemptSeq,
     socketGeneration: event.socketGeneration,
     afterCommitSeq: event.afterCommitSeq,
-    headStreamSeq: decimal(event.event.streamSeq),
+    headStreamSeq: '0',
     observedAt: event.observedAt,
     updatedAt: timestamp(event.observedAt),
     terminal: false,
@@ -159,18 +160,19 @@ function createReplayEntry(key: string, event: ReliableAgentTransientEvent): Rep
 
 function ingestReplayEvent(entry: ReplayEntry, event: ReliableAgentTransientEvent): void {
   const streamSeq = decimal(event.event.streamSeq);
-  if (BigInt(streamSeq) <= BigInt(entry.headStreamSeq) && entry.slots.length > 0) return;
-  const previousHead = entry.slots.length > 0 ? BigInt(entry.headStreamSeq) : 0n;
+  if (BigInt(streamSeq) <= BigInt(entry.headStreamSeq)) return;
+  const previousHead = BigInt(entry.headStreamSeq);
   if (BigInt(coveredFromStreamSeq(event)) !== previousHead + 1n) entry.contiguous = false;
   entry.headStreamSeq = streamSeq;
   entry.observedAt = event.observedAt;
   entry.updatedAt = timestamp(event.observedAt);
-  entry.afterCommitSeq = event.afterCommitSeq;
+  if (BigInt(event.afterCommitSeq) > BigInt(entry.afterCommitSeq)) entry.afterCommitSeq = event.afterCommitSeq;
 
   if (event.event.kind === 'completed') {
     clearReplaySlots(entry);
     appendEventSlot(entry, event);
-    // The completed item carries the full final Provider output and replaces partial fragments.
+    // Completion replaces fragment replay. Native completion carries only a small marker;
+    // its committed item bodies are already available through the Message index.
     entry.contiguous = true;
     entry.terminal = true;
     return;
@@ -183,6 +185,11 @@ function ingestReplayEvent(entry: ReplayEntry, event: ReliableAgentTransientEven
 
   const content = record(event.event.content);
   const type = typeof content?.type === 'string' ? content.type : undefined;
+  if (event.event.kind === 'output_item_done' && content && text(content.committedRevisionId)
+      && outputItemIdentity(content.outputItem)) {
+    retireCommittedOutputItem(entry, event, content);
+    return;
+  }
   if ((type === 'text_delta' || type === 'thought_delta') && typeof content?.text === 'string') {
     ingestTextDelta(entry, event, content);
     return;
@@ -289,14 +296,45 @@ function ingestToolCallDeltas(
   });
 }
 
-function appendEventSlot(entry: ReplayEntry, event: ReliableAgentTransientEvent): void {
-  entry.slots.push({
+function retireCommittedOutputItem(
+  entry: ReplayEntry,
+  event: ReliableAgentTransientEvent,
+  content: Record<string, PlainData>
+): void {
+  const identity = outputItemIdentity(content.outputItem);
+  const removed = new Set<ReplaySlot>();
+  entry.slots = entry.slots.filter(slot => {
+    const slotContent = slot.kind === 'event' ? record(slot.item.event.content) : slot.content;
+    const remove = slot === entry.committedItemSlot || outputItemIdentity(slotContent?.outputItem) === identity;
+    if (remove) removed.add(slot);
+    return !remove;
+  });
+  for (const [key, slot] of entry.textSlots) if (removed.has(slot)) entry.textSlots.delete(key);
+  for (const [key, slot] of entry.progressSlots) if (removed.has(slot)) entry.progressSlots.delete(key);
+  for (const [key, slot] of entry.toolSlots) if (removed.has(slot)) entry.toolSlots.delete(key);
+  // A single small marker retains the transport head when all output has been committed. Its
+  // durable revision identifies the item; the live event's committedPart need not be retained.
+  entry.committedItemSlot = appendEventSlot(entry, {
+    ...event,
+    event: { ...event.event, content: {
+      type: content.type,
+      committedRevisionId: content.committedRevisionId,
+      ...(typeof content.committedContentObjectId === 'string' ? { committedContentObjectId: content.committedContentObjectId } : {}),
+      outputItem: content.outputItem
+    } as never }
+  });
+}
+
+function appendEventSlot(entry: ReplayEntry, event: ReliableAgentTransientEvent): ReplayEventSlot {
+  const slot: ReplayEventSlot = {
     kind: 'event',
     order: entry.nextOrder++,
     firstStreamSeq: decimal(event.event.streamSeq),
     firstFromStreamSeq: coveredFromStreamSeq(event),
     item: toBatchItem(event)
-  });
+  };
+  entry.slots.push(slot);
+  return slot;
 }
 
 function clearReplaySlots(entry: ReplayEntry): void {
@@ -304,6 +342,7 @@ function clearReplaySlots(entry: ReplayEntry): void {
   entry.textSlots.clear();
   entry.progressSlots.clear();
   entry.toolSlots.clear();
+  entry.committedItemSlot = undefined;
   entry.nextOrder = 0;
 }
 
@@ -322,7 +361,13 @@ function materializeReplayEntry(entry: ReplayEntry): ReliableTransientReplaySnap
     observedAt: entry.observedAt,
     events: [...entry.slots]
       .sort((left, right) => left.order - right.order)
-      .map(materializeSlot)
+      .map(slot => {
+        const item = materializeSlot(slot);
+        // One recovery snapshot waits for its greatest observed commit. Native item commits
+        // advance that barrier while later unsealed deltas still carry the dispatch barrier.
+        item.afterCommitSeq = entry.afterCommitSeq;
+        return item;
+      })
   };
 }
 
@@ -428,7 +473,7 @@ function outputItemIdentity(value: PlainData | undefined): string | undefined {
   const id = text(item?.id);
   const ordinal = item?.ordinal;
   if (!id || (typeof ordinal !== 'number' && typeof ordinal !== 'string')) return undefined;
-  return `${id}\0${String(ordinal)}`;
+  return `${text(item?.providerResponseId) ?? ''}\0${id}\0${String(ordinal)}`;
 }
 
 function record(value: unknown): Record<string, PlainData> | undefined {

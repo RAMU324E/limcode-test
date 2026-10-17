@@ -12,9 +12,11 @@ import {
   type OpenAIResponsesNativeHooks
 } from '../capabilities/openAIResponsesNativeControl';
 import { SKILLS_TOOL_NAME, type ModelOutputItemReference, type ModelResponseTiming } from '../../shared/protocol';
-import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { ContentAddressedStore, type ContentObjectMetadata, type PreparedContentObject } from './contentAddressedStore';
 import { freezeNativeChildToolProjection, readNativeRequestContextHandleCatalog, withChildHandles } from './conversationChildHandles';
-import { normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { prepareModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { readFrozenContextHandleCatalogBase, preparedModelHandleBase } from './frozenModelHandleCatalog';
+import { prepareStoredHandleCatalog, retainStoredHandleCatalog, storedHandleCatalog, type StoredHandleCatalog } from './contextHandleCatalogStorage';
 import { nativeToolOutputTextTokens, TOOL_RESULT_BATCH_MAX_TOKENS, SKILL_TOOL_RESULT_MAX_TOKENS } from './modelFacingContextProjection';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { nativePhysicalResponseBudgetPressure, type NativeLogicalRequestBudget } from './nativeCompressionGuard';
@@ -33,6 +35,8 @@ import {
   isNativeAdmissionBoundary,
   parseNativeControlCheckpoint,
   parseNativeToolCallCheckpoint,
+  NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE,
+  LEGACY_NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE,
   type NativeToolCallStreamIdentity
 } from './nativeToolFacts';
 import type {
@@ -48,6 +52,7 @@ import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './p
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE, serializeNativeMessageItem, type NativeMessageItem } from './logicalMessageContent';
 import {
   assistantMessageIdFor,
   assistantMessageRevisionIdFor,
@@ -96,6 +101,14 @@ interface NativeSessionCall {
   toolModelResultId?: string;
   resultOccurrence: boolean;
   delivered: boolean;
+  itemKey?: string;
+}
+
+export interface NativeCommittedMessageItem {
+  messageRevisionId: string;
+  contentObjectId: string;
+  commitSeq?: string;
+  part: Record<string, PlainJsonValue>;
 }
 
 interface NativeSessionResponse {
@@ -128,6 +141,8 @@ export interface NativeRequestSessionDeps {
   initialContextRootId: string;
   /** Immutable initial recipe catalog; committed native tool projections extend its child identities. */
   modelHandleCatalog?: ModelHandleCatalog;
+  modelHandleCatalogBaseContentObjectId?: string | null;
+  modelHandleCatalogProducerConversationId?: string;
   resolveAdapter: (providerId: string) => Promise<{
     providerId: string;
     materializeNativeToolOutput?(
@@ -184,8 +199,8 @@ export class NativeRequestSession {
    * response-scoped because provider output ordinals are response-local; re-stream replays dedupe
    * by key. The durable current projection is their aggregate.
    */
-  private readonly itemPartsOrdered: Array<{ key: string; part: Record<string, unknown> }> = [];
-  private readonly itemPartKeys = new Set<string>();
+  private readonly itemParts = new Map<string, { part: Record<string, PlainJsonValue>; contentObjectId?: string }>();
+  private readonly recoveredMessageItems: NativeMessageItem[] = [];
   /** Per-socket-generation call counts by response; reset on every new durable stream generation. */
   private readonly responseCallCounts = new Map<string, number>();
   private readonly steerReceipts = new Map<string, NativeSteeringReceipt>();
@@ -208,16 +223,20 @@ export class NativeRequestSession {
   private preparingCheckpoint = false;
   private lastBackpressureResponseId?: string;
   private childCatalog: ModelHandleCatalog;
+  private privateCatalog?: { stored: StoredHandleCatalog; contents: readonly PreparedContentObject[] };
+  private releasePrivateCatalog?: () => void;
   private readonly callResolutions = new Map<string, {
     arguments: PlainJsonValue;
     error?: string;
-    catalog: ModelHandleCatalog;
+    catalog?: ModelHandleCatalog;
+    catalogContentObjectId?: string;
+    catalogContents?: readonly PreparedContentObject[];
     /** Original provider arguments of the frozen proof; replay identity, never re-resolved. */
     original?: PlainJsonValue;
   }>();
 
   public constructor(private readonly deps: NativeRequestSessionDeps) {
-    this.childCatalog = normalizeModelHandleCatalog(deps.modelHandleCatalog);
+    this.childCatalog = prepareModelHandleCatalog(deps.modelHandleCatalog);
     this.creationFence = currentExecutionLeaseFence();
     this.unsubscribeSettlements = deps.tools.subscribeToolSettlements?.(
       { turnId: deps.turnId },
@@ -236,7 +255,7 @@ export class NativeRequestSession {
   }
 
   public currentModelHandleCatalog(): ModelHandleCatalog {
-    return normalizeModelHandleCatalog(this.childCatalog);
+    return this.childCatalog;
   }
 
   /**
@@ -254,7 +273,7 @@ export class NativeRequestSession {
    * not replay it (the model would redo admitted tools and duplicate items); it closes the chain.
    */
   public hasDurableChainProgress(): boolean {
-    return this.calls.size > 0 || this.itemPartsOrdered.length > 0
+    return this.calls.size > 0 || this.itemParts.size > 0
       // A steering Message applied to Context belongs to this chain's successor, not its input.
       || [...this.steerReceipts.values()].some(receipt =>
         receipt.modelRequestId === this.deps.modelRequestId
@@ -369,10 +388,11 @@ export class NativeRequestSession {
       const content = asRecord(envelope?.content);
       if (!content) throw new Error(`Native stream checkpoint ${String(checkpoint.id)} has no content.`);
       if (kind === 'native_tool_call') {
-        const proof = parseNativeToolCallCheckpoint(content);
+        const proof = parseNativeToolCallCheckpoint(content, String(metadata.content_type));
         this.callResolutions.set(proof.providerCallId, {
           arguments: normalizePlainJson(proof.resolvedArguments, 'Frozen native resolved arguments'),
-          catalog: proof.modelHandleCatalog,
+          ...(proof.modelHandleCatalog ? { catalog: proof.modelHandleCatalog }
+            : { catalogContentObjectId: proof.modelHandleCatalogContentObjectId }),
           original: normalizePlainJson(proof.arguments, 'Frozen native provider arguments'),
           ...(proof.argumentResolutionError !== undefined ? { error: proof.argumentResolutionError } : {})
         });
@@ -442,15 +462,33 @@ export class NativeRequestSession {
         const a = BigInt(String(left.revision_seq)); const b = BigInt(String(right.revision_seq));
         return a < b ? -1 : a > b ? 1 : 0;
       });
+      const current = await this.deps.database.snapshot([DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').list({
+        where: { message_id: message.id }, limit: 2
+      })]);
+      const currentLinks = current.snapshot[0] as DomainRow[];
+      if (currentLinks.length !== 1) throw new Error('Native Message requires one current revision.');
+      const currentRevision = revisions.find(revision => revision.id === currentLinks[0]!.revision_id);
+      if (!currentRevision) throw new Error('Native Message current revision is unavailable.');
+      const currentMetadata = await this.requireDomain('ContentObject', requireId(currentRevision.content_object_id, 'Native current content'));
+      const recoveringPublishedPrefix = currentMetadata.content_type !== NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE;
       // Each item's cumulative revision is committed after it in the same transaction and holds the
       // whole chain so far. Skip it and the final aggregate by identity instead of reading their
       // content, so a retry or takeover of a long chain reads O(items) bytes, not O(items^2).
       const projectionRevisionIds = new Set([
         assistantMessageRevisionIdFor(this.deps.turnId, this.deps.modelRequestId)
       ]);
-      const rebuildItem = (itemKey: string, part: Record<string, unknown>): void => {
-        this.recordItemPart(itemKey, part);
+      const rebuildItem = (itemKey: string, part: Record<string, unknown>, revision: DomainRow, metadata: ContentObjectMetadata): void => {
+        this.recordItemPart(itemKey, part, metadata.id);
+        if (asRecord(part.functionCall) && typeof part.id === 'string') {
+          const call = this.callByProviderId.get(part.id);
+          if (call) call.itemKey = itemKey;
+        }
         projectionRevisionIds.add(nativeCumulativeRevisionId(this.deps.turnId, this.deps.modelRequestId, itemKey));
+        if (recoveringPublishedPrefix) {
+          const serialized = serializeNativeMessageItem(part);
+          this.recoveredMessageItems.push({ revisionId: requireId(revision.id, 'Native item revision'), contentObjectId: metadata.id,
+            partByteLength: serialized.partByteLength, ...(serialized.outputItem ? { outputItem: serialized.outputItem } : {}) });
+        }
       };
       const rebuiltCallCounts = new Map<string, number>();
       for (const revision of revisions) {
@@ -477,7 +515,7 @@ export class NativeRequestSession {
           const itemKey = `call:${responseId}:${localCallIndex}`;
           if (revision.id !== nativeItemRevisionId(this.deps.turnId, this.deps.modelRequestId, itemKey)) continue;
           rebuiltCallCounts.set(responseId, localCallIndex + 1);
-          rebuildItem(itemKey, part);
+          rebuildItem(itemKey, part, revision, metadata);
         } else {
           const ordinal = typeof outputItem?.ordinal === 'number' && Number.isSafeInteger(outputItem.ordinal)
             ? outputItem.ordinal
@@ -485,7 +523,7 @@ export class NativeRequestSession {
           if (ordinal === undefined) continue;
           const itemKey = `content:${responseId}:${ordinal}`;
           if (revision.id !== nativeItemRevisionId(this.deps.turnId, this.deps.modelRequestId, itemKey)) continue;
-          rebuildItem(itemKey, part);
+          rebuildItem(itemKey, part, revision, metadata);
         }
       }
     }
@@ -647,18 +685,26 @@ export class NativeRequestSession {
     this.responseCallCounts.set(responseId, (this.responseCallCounts.get(responseId) ?? 0) + 1);
   }
 
-  private recordItemPart(key: string, part: Record<string, unknown>): boolean {
-    if (this.itemPartKeys.has(key)) {
-      const prior = this.itemPartsOrdered.find(item => item.key === key)!.part;
-      if (nativeAssistantComparablePart(normalizePlainJson(prior, 'Frozen native item') as Record<string, PlainJsonValue>)
+  private recordItemPart(key: string, part: Record<string, unknown>, contentObjectId?: string): boolean {
+    const prior = this.itemParts.get(key);
+    if (prior) {
+      if (nativeAssistantComparablePart(prior.part)
         !== nativeAssistantComparablePart(normalizePlainJson(part, 'Replayed native item') as Record<string, PlainJsonValue>)) {
         throw new Error(`Native output item ${key} changed its immutable completed facts.`);
       }
       return false;
     }
-    this.itemPartKeys.add(key);
-    this.itemPartsOrdered.push({ key, part });
+    this.itemParts.set(key, { part: normalizePlainJson(part, 'Native item') as Record<string, PlainJsonValue>,
+      ...(contentObjectId ? { contentObjectId } : {}) });
     return true;
+  }
+
+  private committedMessageItem(key: string, committed?: { contentObjectId: string; commitSeq?: string }): NativeCommittedMessageItem | undefined {
+    const entry = this.itemParts.get(key);
+    if (entry && committed) entry.contentObjectId = committed.contentObjectId;
+    return entry?.contentObjectId ? { messageRevisionId: nativeItemRevisionId(this.deps.turnId, this.deps.modelRequestId, key),
+      contentObjectId: entry.contentObjectId, part: entry.part,
+      ...(committed?.commitSeq ? { commitSeq: committed.commitSeq } : {}) } : undefined;
   }
 
   /**
@@ -694,6 +740,9 @@ export class NativeRequestSession {
               providerResponseId: responseId,
               ...(typeof outputItem.previousResponseId === 'string'
                 ? { previousResponseId: outputItem.previousResponseId }
+                : {}),
+              ...(typeof outputItem.steeringSuccessorResponseId === 'string'
+                ? { steeringSuccessorResponseId: outputItem.steeringSuccessorResponseId }
                 : {})
             }
           }
@@ -715,7 +764,9 @@ export class NativeRequestSession {
    * aggregate's array order, so re-stream duplicates and the terminal replay derive the same
    * ToolCall identity.
    */
-  public buildCallProof(item: NativeCallItemEnvelope): PlainJsonValue {
+  public async buildCallProof(item: NativeCallItemEnvelope): Promise<{
+    content: PlainJsonValue; contentType: string; relatedContentObjects: readonly PreparedContentObject[];
+  }> {
     const responseId = item.outputItem!.providerResponseId!;
     const knownCall = this.callByProviderId.get(item.call.id);
     if (knownCall && (knownCall.responseId !== responseId || knownCall.name !== item.call.name
@@ -731,19 +782,24 @@ export class NativeRequestSession {
     }
     // A frozen, content-addressed resolution is the authority for a replayed call; the current
     // resolver is consulted only for a call seen for the first time.
+    const privateCatalog = frozenResolution?.catalog || frozenResolution?.catalogContentObjectId
+      ? undefined : await this.preparePrivateCatalog();
     const resolution = frozenResolution ?? {
       ...this.deps.resolveCallArguments(item.call.name, item.call.arguments),
-      catalog: this.currentModelHandleCatalog(),
+      catalogContentObjectId: privateCatalog!.stored.metadata.id,
+      catalogContents: privateCatalog!.contents,
       original: normalizePlainJson(item.call.arguments, 'Native provider arguments')
     };
     this.callResolutions.set(item.call.id, resolution);
-    return normalizePlainJson({
+    return { contentType: resolution.catalog ? LEGACY_NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE : NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE,
+      relatedContentObjects: resolution.catalogContents ?? [], content: normalizePlainJson({
       type: 'native_tool_call',
       responseId,
       toolName: item.call.name,
       arguments: item.call.arguments,
       resolvedArguments: resolution.arguments,
-      modelHandleCatalog: resolution.catalog,
+      ...(resolution.catalog ? { modelHandleCatalog: resolution.catalog }
+        : { modelHandleCatalogContentObjectId: resolution.catalogContentObjectId }),
       ...(resolution.error !== undefined ? { argumentResolutionError: resolution.error } : {}),
       providerCallId: item.call.id,
       providerOrdinal: this.nextGlobalCallOrdinal(responseId, item.call.id),
@@ -753,7 +809,30 @@ export class NativeRequestSession {
       // The shared item reference survives proof → admission CAS → context unchanged, so
       // projection/recovery keeps response/ordinal identity after checkpoint pruning.
       outputItem: item.outputItem as unknown as PlainJsonValue
-    }, 'Native tool call proof');
+    }, 'Native tool call proof') };
+  }
+
+  private async preparePrivateCatalog(): Promise<{ stored: StoredHandleCatalog; contents: readonly PreparedContentObject[] }> {
+    if (this.privateCatalog) return this.privateCatalog;
+    const retained = preparedModelHandleBase(this.deps.database, this.deps.contentStore, this.childCatalog,
+      this.deps.modelHandleCatalogBaseContentObjectId);
+    const baseCatalog = !retained && this.deps.modelHandleCatalogBaseContentObjectId
+      ? await readFrozenContextHandleCatalogBase(this.deps.database, this.deps.contentStore,
+          this.deps.modelHandleCatalogBaseContentObjectId,
+          this.deps.modelHandleCatalogProducerConversationId ?? this.deps.conversationId) : undefined;
+    const prepared = await prepareStoredHandleCatalog({ database: this.deps.database, contentStore: this.deps.contentStore,
+      conversationId: this.deps.conversationId, kind: 'native-private', catalog: this.childCatalog,
+      ...(retained || baseCatalog ? { base: retained ?? storedHandleCatalog(this.deps.database, this.deps.contentStore, baseCatalog!) } : {}) });
+    this.holdPrivateCatalog(prepared);
+    return prepared;
+  }
+
+  private holdPrivateCatalog(value: { stored: StoredHandleCatalog; contents: readonly PreparedContentObject[] }): void {
+    const release = this.disposed ? undefined
+      : retainStoredHandleCatalog(this.deps.database, this.deps.contentStore, value.stored);
+    this.releasePrivateCatalog?.();
+    this.privateCatalog = value;
+    this.releasePrivateCatalog = release;
   }
 
   /** In-memory per-item text accumulation from incremental output deltas (never persisted). */
@@ -786,8 +865,18 @@ export class NativeRequestSession {
     streamSeq: string | bigint,
     result: StreamEventResult,
     signal?: AbortSignal
-  ): Promise<void> {
+  ): Promise<NativeCommittedMessageItem | undefined> {
     assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
+    if (result.checkpointed || result.ignoredReason === 'duplicate') {
+      const resolution = this.callResolutions.get(item.call.id);
+      if (resolution?.catalogContents) {
+        resolution.catalogContents = undefined;
+        const privateCatalog = this.privateCatalog;
+        if (privateCatalog && privateCatalog.stored.metadata.id === resolution.catalogContentObjectId) {
+          this.privateCatalog = { stored: privateCatalog.stored, contents: [] };
+        }
+      }
+    }
     const responseId = item.outputItem!.providerResponseId!;
     this.responseFor(responseId);
     const durableResponseCalls = [...this.calls.values()].filter(call => call.responseId === responseId).length;
@@ -800,7 +889,8 @@ export class NativeRequestSession {
       // A pruned proof can be checkpointed again on re-stream. SourceLink/native admission is
       // already the durable identity; never append a second item revision or re-execute its tool.
       if (!this.calls.has(toolCallId)) throw new Error(`Native admitted call ${item.call.id} was not recovered.`);
-      return;
+      const key = this.calls.get(toolCallId)?.itemKey;
+      return key ? this.committedMessageItem(key) : undefined;
     }
     if (!result.checkpointed) {
       if (result.ignoredReason === 'duplicate' && !this.calls.has(toolCallId)) {
@@ -810,7 +900,8 @@ export class NativeRequestSession {
         this.callByProviderId.set(call.providerCallId, call);
         await this.resumeCallFrontier(call);
       }
-      return;
+      const key = this.calls.get(toolCallId)?.itemKey;
+      return key ? this.committedMessageItem(key) : undefined;
     }
     this.countCallItem(responseId);
     const part = {
@@ -823,17 +914,20 @@ export class NativeRequestSession {
     this.recordItemPart(`call:${responseId}:${localCallIndex}`, part);
     // The proving revision is a real fact; the call's Context occurrence belongs to the native
     // tool pair append so the model never sees one call twice.
-    await this.deps.turnOutput.appendNativeAssistantItem({
+    const itemKey = `call:${responseId}:${localCallIndex}`;
+    const committed = await this.deps.turnOutput.appendNativeAssistantItem({
       turnId: this.deps.turnId,
       modelRequestId: this.deps.modelRequestId,
-      itemKey: `call:${responseId}:${localCallIndex}`,
-      content: canonicalPlainJson({ role: 'model', parts: [part] } as unknown as PlainJsonValue, 'Native call item revision'),
-      cumulativeContent: this.cumulativeItemContent(),
+      itemKey,
+      ...serializeNativeMessageItem(part),
+      recoveredItems: this.recoveredMessageItems,
       contentType: MESSAGE_CONTENT_TYPE,
       contextDisposition: 'exclude'
     }, { beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId) });
+    this.recoveredMessageItems.length = 0;
     assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     const call = this.newSessionCall(item, providerOrdinal, toolCallId, streamSeq);
+    call.itemKey = itemKey;
     this.calls.set(toolCallId, call);
     this.callByProviderId.set(call.providerCallId, call);
     if (call.asyncDeclared) {
@@ -846,6 +940,7 @@ export class NativeRequestSession {
       }
       await this.admitCall(call, { streamSeq: String(streamSeq) }, signal);
     }
+    return this.committedMessageItem(itemKey, committed);
   }
 
   private newSessionCall(
@@ -879,7 +974,7 @@ export class NativeRequestSession {
     event: ProviderOutputStreamEvent,
     result: StreamEventResult,
     signal?: AbortSignal
-  ): Promise<void> {
+  ): Promise<NativeCommittedMessageItem | undefined> {
     assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     // A terminal/foreign-identity result means the item belongs to a superseded stream; the
     // aggregate path already owns its content. Droppable-checkpoint misses still persist revisions.
@@ -892,7 +987,8 @@ export class NativeRequestSession {
     const responseId = typeof outputItem?.providerResponseId === 'string' && outputItem.providerResponseId.length > 0
       ? outputItem.providerResponseId
       : undefined;
-    const accumulator = this.itemAccumulators.get(JSON.stringify([responseId ?? '', itemId]));
+    const accumulatorKey = JSON.stringify([responseId ?? '', itemId]);
+    const accumulator = this.itemAccumulators.get(accumulatorKey);
     const thought = record.type === 'thought_done';
     const text = thought ? accumulator?.thought ?? '' : accumulator?.text ?? '';
     const ordinal = typeof outputItem?.ordinal === 'number' && Number.isSafeInteger(outputItem.ordinal)
@@ -923,21 +1019,25 @@ export class NativeRequestSession {
     const itemKey = `content:${responseId}:${ordinal}`;
     // A repeated done after later items must verify the same item, not re-freeze a later cumulative
     // projection as the old item's cumulative bytes.
-    if (!this.recordItemPart(itemKey, part)) return;
+    if (!this.recordItemPart(itemKey, part)) {
+      this.itemAccumulators.delete(accumulatorKey);
+      return this.committedMessageItem(itemKey);
+    }
     try {
-      await this.deps.turnOutput.appendNativeAssistantItem({
+      const committed = await this.deps.turnOutput.appendNativeAssistantItem({
         turnId: this.deps.turnId,
         modelRequestId: this.deps.modelRequestId,
         itemKey,
-        content: canonicalPlainJson({ role: 'model', parts: [part] } as unknown as PlainJsonValue, 'Native content item revision'),
-        cumulativeContent: this.cumulativeItemContent(),
+        ...serializeNativeMessageItem(part),
+        recoveredItems: this.recoveredMessageItems,
         contentType: MESSAGE_CONTENT_TYPE,
         contextDisposition: 'append'
       }, { beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId) });
+      this.recoveredMessageItems.length = 0;
+      this.itemAccumulators.delete(accumulatorKey);
+      return this.committedMessageItem(itemKey, committed);
     } catch (error) {
-      this.itemPartKeys.delete(itemKey);
-      const index = this.itemPartsOrdered.findIndex(item => item.key === itemKey);
-      if (index >= 0) this.itemPartsOrdered.splice(index, 1);
+      this.itemParts.delete(itemKey);
       throw error;
     }
   }
@@ -1191,10 +1291,26 @@ export class NativeRequestSession {
     this.unsubscribeSettlements = undefined;
     this.unregisterSteering?.();
     this.unregisterSteering = undefined;
+    try {
+      await this.disposeDurableFrontiers(outcome);
+    } finally {
+      this.controller = undefined;
+      this.releasePrivateCatalog?.();
+      this.releasePrivateCatalog = undefined;
+      this.privateCatalog = undefined;
+      this.callResolutions.clear();
+      this.itemParts.clear();
+      this.itemAccumulators.clear();
+      this.recoveredMessageItems.length = 0;
+      this.childCatalog = prepareModelHandleCatalog({ entries: [] });
+      this.deps.modelHandleCatalog = undefined;
+    }
+  }
+
+  private async disposeDurableFrontiers(outcome: 'completed' | 'failed' | 'cancelled' | 'handoff'): Promise<void> {
     if (outcome === 'handoff') {
       // The next lease generation recovers the exact durable frontier; nothing is cancelled,
       // settled, or finalized on behalf of a still-running detached effect.
-      this.controller = undefined;
       return;
     }
     // Every admitted call is closed independently: one call whose effect cannot be cancelled yet
@@ -1252,7 +1368,6 @@ export class NativeRequestSession {
       // The pending work above is durably disposed; the lane may end at the next boundary.
       this.controller?.endLogicalRequest();
     }
-    this.controller = undefined;
     // AgentLoop's request-boundary closure retries whatever could not be closed here.
     if (closureError !== undefined) throw closureError;
   }
@@ -1783,9 +1898,10 @@ export class NativeRequestSession {
       modelRequestId: this.deps.modelRequestId, toolCallId: call.toolCallId,
       toolModelResultId: call.toolModelResultId, messageRevisionId: String(revision.id),
       contentObjectId: metadata.id, toolName: call.name, raw,
-      catalog: this.childCatalog, now: this.deps.now()
+      catalog: this.childCatalog, privateCatalog: await this.preparePrivateCatalog(), now: this.deps.now()
     });
     this.childCatalog = frozen.catalog;
+    this.holdPrivateCatalog({ stored: frozen.privateCatalog, contents: frozen.catalogContents });
     // Every native result uses frozen bounded model bytes and a reserved handle catalog. The
     // ToolModelResult receipt and native delivery/admission facts remain separate and unchanged.
     return { type: 'function_call_output', callId: call.providerCallId, output: frozen.output };
@@ -1912,12 +2028,6 @@ export class NativeRequestSession {
   private async getOptional(domain: string, id: string): Promise<DomainRow | null> {
     const snapshot = await this.deps.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)]);
     return (snapshot.snapshot[0] as DomainRow | null) ?? null;
-  }
-
-  /** Whole-chain-so-far aggregate content; the durable current projection target per item. */
-  private cumulativeItemContent(): string {
-    const parts = this.itemPartsOrdered.map((entry) => entry.part);
-    return canonicalPlainJson({ role: 'model', parts } as unknown as PlainJsonValue, 'Native cumulative revision');
   }
 
   private diagnose(message: string): void {

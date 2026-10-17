@@ -280,3 +280,157 @@ test('私有只读快照保留WAL事实、mixed正文分页与Unicode续页，�
     assert.deepEqual(await captureFiles(sourceFiles(source)), before);
   } finally { await reader?.close(); writer.close(); }
 });
+
+test('C4 外来只读历史按组合根读回跨块前缀与Unicode续页，不依赖原生产库', async () => {
+  const { MESSAGE_CONTENT_TYPE, prepareNativeMessageComposition, serializeNativeMessageItem } = kernelFile('logicalMessageContent.js');
+  const producer = await initializeRoot(path.join(f.base, 'native-prefix-original'));
+  const database = await openRuntime(producer);
+  const expected = [];
+  try {
+    const store = openStore(producer, database);
+    await seedConversation(database, store, 'native-prefix');
+    let composition = null;
+    for (let index = 0; index < 33; index += 1) {
+      const text = index === 0 ? `${'a'.repeat(32767)}😀` : `\n片段 ${index}`;
+      expected.push(text);
+      const serialized = serializeNativeMessageItem({ text });
+      const item = await store.prepare(database, serialized.content, MESSAGE_CONTENT_TYPE);
+      const prepared = await prepareNativeMessageComposition(database, store, composition, {
+        revisionId: `native-prefix-item-${index}`, contentObjectId: item.metadata.id,
+        partByteLength: serialized.partByteLength, partByteOffset: serialized.partByteOffset
+      });
+      await database.transaction([item, ...prepared.relatedContentObjects, prepared.content]
+        .flatMap(content => content.insert ? [content.insert] : []));
+      composition = prepared.content.metadata;
+    }
+    await database.transaction([
+      repo('Message').insert({ id: 'native-prefix-model', created_at: NOW, updated_at: NOW, deleted_at: null }),
+      repo('MessageRevision').insert({ id: 'native-prefix-display', message_id: 'native-prefix-model',
+        revision_seq: 1n, role: 'model', content_object_id: composition.id, created_at: NOW }),
+      repo('MessageCurrentRevisionLink').insert({ id: 'native-prefix-current', message_id: 'native-prefix-model',
+        revision_id: 'native-prefix-display', updated_at: NOW }),
+      repo('MessagePartOfConversation').insert({ id: 'native-prefix-member', conversation_id: 'native-prefix',
+        message_id: 'native-prefix-model', message_seq: 2n, created_at: NOW })
+    ]);
+  } finally { await database.close(); }
+  const source = await copyRoot(producer);
+  await fs.rm(producer.scopeRoot, { recursive: true, force: true });
+  const before = await captureFiles(sourceFiles(source));
+  let reader;
+  try {
+    reader = await openRuntimeDataSetHistory(f.paths, source.root);
+    const first = await reader.readMessages('native-prefix', { after: '1', limit: 1 });
+    assert.equal(first.items[0].revisionId, 'native-prefix-display');
+    assert.equal(first.items[0].role, 'model');
+    assert.equal(first.items[0].hasMoreText, true);
+    const tail = await reader.readMessageText('native-prefix', first.items[0].id, { offset: first.items[0].nextTextOffset });
+    assert.equal(first.items[0].text + tail.text, expected.join(''));
+    assert.equal(tail.hasMore, false);
+    await reader.close(); reader = undefined;
+    assert.deepEqual(await captureFiles(sourceFiles(source)), before);
+  } finally { await reader?.close(); }
+});
+
+async function assertChangedCasFileRejected(database, object, ...demands) {
+  const file = path.join(database.binding.paths.casRootPath, object.storage_key);
+  const saved = `${file}.saved`;
+  const bytes = await fs.readFile(file);
+  await fs.rename(file, saved);
+  try {
+    await fs.writeFile(file, Buffer.alloc(bytes.length, 0x20));
+    for (const demand of demands) await assert.rejects(demand(), /digest|sha256|corrupt|mismatch|length/i);
+  } finally {
+    await fs.rm(file, { force: true });
+    await fs.rename(saved, file);
+  }
+}
+
+test('逻辑正文缓存复用解析结果时，组合根和已缓存块仍遵循CAS文件身份检查', async () => {
+  const { ContentAddressedStore } = kernelFile('contentAddressedStore.js');
+  const { LogicalMessageContentReader, MESSAGE_CONTENT_TYPE, prepareNativeMessageComposition,
+    serializeNativeMessageItem } = kernelFile('logicalMessageContent.js');
+  const source = await initializeRoot(path.join(f.base, 'logical-message-file-fence'));
+  const database = await openRuntime(source);
+  try {
+    const producer = ContentAddressedStore.loose(source.authority, database.binding);
+    const store = ContentAddressedStore.forDatabase(source.authority, database);
+    const serialized = serializeNativeMessageItem({ text: '缓存后仍核对原文件 🙂' });
+    const item = await producer.prepare(database, serialized.content, MESSAGE_CONTENT_TYPE);
+    const composition = await prepareNativeMessageComposition(database, producer, null, {
+      revisionId: 'file-fence-item', contentObjectId: item.metadata.id,
+      partByteLength: serialized.partByteLength, partByteOffset: serialized.partByteOffset
+    });
+    await database.transaction([item, ...composition.relatedContentObjects, composition.content]
+      .flatMap(content => content.insert ? [content.insert] : []));
+    const metadata = composition.content.metadata;
+    const blockMetadata = composition.relatedContentObjects[0].metadata;
+    await store.readMany([metadata, blockMetadata]);
+    const reader = new LogicalMessageContentReader(database, store);
+    await reader.readNativeItems(metadata, { limit: 1 });
+    await assertChangedCasFileRejected(database, metadata, () => reader.readChunk(metadata, 0, 1));
+    assert.deepEqual((await reader.readChunk(metadata, 0, 1)).chunk, Buffer.from('{'));
+    await assertChangedCasFileRejected(database, blockMetadata,
+      () => reader.readNativeItems(metadata, { limit: 1 }),
+      () => new LogicalMessageContentReader(database, store).readNativeItems(metadata, { limit: 1 }));
+    assert.equal((await reader.readNativeItems(metadata, { limit: 1 })).items[0].revisionId, 'file-fence-item');
+  } finally { await database.close(); }
+});
+
+test('逻辑组合根离开解析缓存后，既有正文缓存仍保留CAS文件身份检查', async () => {
+  const { ContentAddressedStore } = kernelFile('contentAddressedStore.js');
+  const { LogicalMessageContentReader, MESSAGE_CONTENT_TYPE, prepareNativeMessageComposition,
+    serializeNativeMessageItem } = kernelFile('logicalMessageContent.js');
+  const source = await initializeRoot(path.join(f.base, 'logical-message-eviction-fence'));
+  const database = await openRuntime(source);
+  try {
+    const producer = ContentAddressedStore.loose(source.authority, database.binding);
+    const store = ContentAddressedStore.forDatabase(source.authority, database);
+    const serialized = serializeNativeMessageItem({ text: '解析缓存逐出后的正文 🙂' });
+    const item = await producer.prepare(database, serialized.content, MESSAGE_CONTENT_TYPE);
+    await database.transaction(item.insert ? [item.insert] : []);
+    const reader = new LogicalMessageContentReader(database, store);
+    let first;
+    for (let index = 0; index < 65; index += 1) {
+      const composition = await prepareNativeMessageComposition(database, producer, null, {
+        revisionId: `evicted-root-item-${index}`, contentObjectId: item.metadata.id,
+        partByteLength: serialized.partByteLength, partByteOffset: serialized.partByteOffset
+      });
+      await database.transaction([...composition.relatedContentObjects, composition.content]
+        .flatMap(content => content.insert ? [content.insert] : []));
+      const metadata = composition.content.metadata;
+      first ??= metadata;
+      await store.read(metadata);
+      await reader.readChunk(metadata, 0, 1);
+    }
+    await assertChangedCasFileRejected(database, first, () => reader.readChunk(first, 0, 1));
+    assert.deepEqual((await reader.readChunk(first, 0, 1)).chunk, Buffer.from('{'));
+  } finally { await database.close(); }
+});
+
+test('已发布非canonical item重复解码实际正文时仍保留CAS文件身份检查', async () => {
+  const { ContentAddressedStore } = kernelFile('contentAddressedStore.js');
+  const { LogicalMessageContentReader, MESSAGE_CONTENT_TYPE, prepareNativeMessageComposition,
+    serializeNativeMessageItem } = kernelFile('logicalMessageContent.js');
+  const source = await initializeRoot(path.join(f.base, 'logical-message-published-item-fence'));
+  const database = await openRuntime(source);
+  try {
+    const producer = ContentAddressedStore.loose(source.authority, database.binding);
+    const store = ContentAddressedStore.forDatabase(source.authority, database);
+    const serialized = serializeNativeMessageItem({ text: '已发布正文的实际片段 🙂' });
+    const item = await producer.prepare(database,
+      JSON.stringify({ role: 'model', parts: [serialized.part] }, null, 2), MESSAGE_CONTENT_TYPE);
+    const composition = await prepareNativeMessageComposition(database, producer, null, {
+      revisionId: 'published-noncanonical-item', contentObjectId: item.metadata.id,
+      partByteLength: serialized.partByteLength
+    });
+    await database.transaction([item, ...composition.relatedContentObjects, composition.content]
+      .flatMap(content => content.insert ? [content.insert] : []));
+    await store.read(item.metadata);
+    const reader = new LogicalMessageContentReader(database, store);
+    const readPart = () => reader.readChunk(composition.content.metadata,
+      serialized.partByteOffset, serialized.partByteLength);
+    assert.deepEqual(JSON.parse((await readPart()).chunk.toString('utf8')), serialized.part);
+    await assertChangedCasFileRejected(database, item.metadata, readPart);
+    assert.deepEqual(JSON.parse((await readPart()).chunk.toString('utf8')), serialized.part);
+  } finally { await database.close(); }
+});

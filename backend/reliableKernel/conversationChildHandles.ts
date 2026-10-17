@@ -1,8 +1,9 @@
 import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { createHash } from 'node:crypto';
-import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { ContentAddressedStore, type ContentObjectMetadata, type PreparedContentObject } from './contentAddressedStore';
+import { prepareStoredHandleCatalog, readNativePrivateHandleCatalog, type StoredHandleCatalog } from './contextHandleCatalogStorage';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, isCollaborationHandleTool, isPersistentContextHandle, mergeModelHandleCatalogs, normalizeModelHandleCatalog, reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog, type ModelHandleEntry } from './modelHandleCatalog';
+import { discoverPreparedModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, isCollaborationHandleTool, isPersistentContextHandle, mergeModelHandleCatalogs, normalizeModelHandleCatalog, prepareModelHandleCatalog, reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog, type ModelHandleEntry } from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { ContextHandleReadMemo } from './contextHandleReadMemo';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
@@ -26,7 +27,7 @@ export async function readConversationChildHandles(
   contentStore: ContentAddressedStore,
   conversationId: string
 ): Promise<ModelHandleEntry[]> {
-  return (await readConversationContextHandleCatalog(database, contentStore, conversationId)).entries;
+  return [...(await readConversationContextHandleCatalog(database, contentStore, conversationId)).entries];
 }
 
 export async function readConversationContextHandleCatalog(
@@ -164,7 +165,8 @@ export function forkInheritedChildTargets(
 }
 
 export const NATIVE_CHILD_HANDLE_PROJECTION_EVENT = 'native_child_handle_projection';
-const NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE = 'application/vnd.limcode.native-child-handle-projection+json';
+export const NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE = 'application/vnd.limcode.native-child-handle-projection+json';
+export const NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE = 'application/vnd.limcode.native-tool-result-projection+json';
 
 interface NativeChildProjection {
   kind: typeof NATIVE_CHILD_HANDLE_PROJECTION_EVENT;
@@ -173,6 +175,7 @@ interface NativeChildProjection {
   toolModelResultId: string;
   toolName: string;
   modelHandleCatalog: ModelHandleCatalog;
+  privateCatalog?: StoredHandleCatalog;
   output: NonNullable<OpenAIResponsesToolOutput['output']>;
 }
 
@@ -196,7 +199,7 @@ export async function readNativeRequestChildHandles(
   contentStore: ContentAddressedStore,
   modelRequestId: string
 ): Promise<ModelHandleEntry[]> {
-  return (await readNativeRequestContextHandleCatalog(database, contentStore, modelRequestId)).entries;
+  return [...(await readNativeRequestContextHandleCatalog(database, contentStore, modelRequestId)).entries];
 }
 
 export async function readNativeRequestContextHandleCatalog(
@@ -230,14 +233,15 @@ async function readNativeRequestContextCatalogs(
   if (uncachedIds.length > 0) {
     const metadata = await database.snapshot(uncachedIds.map(id => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
     const contents = await contentStore.readMany(metadata.snapshot.map((row, index) => {
-      if (!row || Array.isArray(row) || row.content_type !== NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE) {
+      if (!row || Array.isArray(row) || !isNativeProjectionContentType(row.content_type)) {
         throw childHandleError(`Native child projection ${uncachedIds[index]} has no valid CAS content.`);
       }
       return row as unknown as ContentObjectMetadata;
     }));
     if (contents.length !== uncachedIds.length) throw childHandleError('Native child projection CAS batch is incomplete.');
     for (let index = 0; index < contents.length; index += 1) {
-      cache.nativeProjections.set(uncachedIds[index], parseNativeChildProjection(contents[index].toString('utf8'), cache.memo));
+      cache.nativeProjections.set(uncachedIds[index], await parseNativeChildProjection(database, contentStore,
+        contents[index].toString('utf8'), String((metadata.snapshot[index] as DomainRow).content_type), cache.memo));
     }
   }
   return events.map(event => {
@@ -259,8 +263,10 @@ export async function freezeNativeChildToolProjection(input: {
   toolName: string;
   raw: string;
   catalog: ModelHandleCatalog;
+  privateCatalog?: { stored: StoredHandleCatalog; contents: readonly PreparedContentObject[] };
   now: string;
-}): Promise<{ output: NonNullable<OpenAIResponsesToolOutput['output']>; catalog: ModelHandleCatalog }> {
+}): Promise<{ output: NonNullable<OpenAIResponsesToolOutput['output']>; catalog: ModelHandleCatalog;
+  privateCatalog: StoredHandleCatalog; catalogContents: readonly PreparedContentObject[] }> {
   const eventId = `native_child_projection_${createHash('sha256')
     .update(JSON.stringify([input.modelRequestId, input.toolCallId, input.toolModelResultId])).digest('hex')}`;
   const barrier = await input.database.snapshot([
@@ -274,37 +280,49 @@ export async function freezeNativeChildToolProjection(input: {
   if (!source || source.model_request_id !== input.modelRequestId || !request || Array.isArray(request)) {
     throw childHandleError('Native child projection source does not belong to the carrier ModelRequest.');
   }
+  const turn = (await input.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').get(String(request.turn_id))])).snapshot[0];
+  if (!turn || Array.isArray(turn) || typeof turn.conversation_id !== 'string') {
+    throw childHandleError('Native child projection carrier has no owning Conversation.');
+  }
   const existing = barrier.snapshot[0];
   if (existing && !Array.isArray(existing)) {
     const metadata = (await input.database.snapshot([
       DOMAIN_REPOSITORIES.domain('ContentObject').get(String(existing.content_object_id))
     ])).snapshot[0];
-    if (!metadata || Array.isArray(metadata) || metadata.content_type !== NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE) {
+    if (!metadata || Array.isArray(metadata) || !isNativeProjectionContentType(metadata.content_type)) {
       throw childHandleError('Frozen native child projection content is missing.');
     }
-    const frozen = parseNativeChildProjection((await input.contentStore.read(metadata as unknown as ContentObjectMetadata)).toString('utf8'));
+    const frozen = await parseNativeChildProjection(input.database, input.contentStore,
+      (await input.contentStore.read(metadata as unknown as ContentObjectMetadata)).toString('utf8'), String(metadata.content_type));
     if (frozen.modelRequestId !== input.modelRequestId || frozen.toolCallId !== input.toolCallId
       || frozen.toolModelResultId !== input.toolModelResultId || frozen.toolName !== input.toolName) {
       throw childHandleError('Frozen native child projection identity conflicts with its result.');
     }
-    return { output: frozen.output, catalog: withChildHandles(input.catalog, frozen.modelHandleCatalog) };
+    const catalog = prepareModelHandleCatalog(withChildHandles(input.catalog, frozen.modelHandleCatalog));
+    const view = await prepareStoredHandleCatalog({ database: input.database, contentStore: input.contentStore,
+      conversationId: turn.conversation_id, kind: 'native-private', catalog,
+      base: input.privateCatalog?.stored ?? frozen.privateCatalog });
+    return { output: frozen.output, catalog, privateCatalog: view.stored,
+      catalogContents: [...(input.privateCatalog?.contents ?? []), ...view.contents] };
   }
   const raw = normalizePlainJson(JSON.parse(input.raw), 'Native child ToolModelResult');
-  const discovered = persistentContextCatalog(buildModelHandleCatalog([isCollaborationHandleTool(input.toolName)
-    ? { kind: 'agent_collaboration', detail: raw } : raw], input.catalog));
-  const catalog = withChildHandles(input.catalog, discovered);
+  const discovered = discoverPreparedModelHandleCatalog(input.catalog, [isCollaborationHandleTool(input.toolName)
+    ? { kind: 'agent_collaboration', detail: raw } : raw]);
+  const catalog = discovered.catalog;
+  const initial = input.privateCatalog ?? await prepareStoredHandleCatalog({ database: input.database,
+    contentStore: input.contentStore, conversationId: turn.conversation_id, kind: 'native-private', catalog: input.catalog });
+  const view = await prepareStoredHandleCatalog({ database: input.database, contentStore: input.contentStore,
+    conversationId: turn.conversation_id, kind: 'native-private', catalog, base: initial.stored,
+    operations: [...discovered.delta.addedEntries.map(entry => ({ kind: 'bind' as const, entry })),
+      ...discovered.delta.metadataExtensions.map(entry => ({ kind: 'extend-metadata' as const, entry }))] });
   const output = projectNativeToolResultOutput(input.toolName, raw, catalog);
-  const frozen: NativeChildProjection = {
+  const frozen = {
     kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT, modelRequestId: input.modelRequestId,
     toolCallId: input.toolCallId, toolModelResultId: input.toolModelResultId, toolName: input.toolName,
-    modelHandleCatalog: catalog, output
+    modelHandleCatalogContentObjectId: view.stored.metadata.id, output
   };
   const content = await input.contentStore.prepare(input.database,
-    canonicalPlainJson(normalizePlainJson(frozen, 'Native child projection')), NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE);
-  const turn = (await input.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').get(String(request.turn_id))])).snapshot[0];
-  if (!turn || Array.isArray(turn) || typeof turn.conversation_id !== 'string') {
-    throw childHandleError('Native child projection carrier has no owning Conversation.');
-  }
+    canonicalPlainJson(frozen, 'Native child projection'), NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE);
   await input.database.transaction([
     DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { conversation_id: turn.conversation_id }),
     DOMAIN_REPOSITORIES.domain('ModelRequest').assert(input.modelRequestId, { turn_id: request.turn_id }),
@@ -319,13 +337,13 @@ export async function freezeNativeChildToolProjection(input: {
     }),
     DOMAIN_REPOSITORIES.domain('MessageRevision').assert(input.messageRevisionId, { content_object_id: input.contentObjectId }),
     DOMAIN_REPOSITORIES.domain('ToolCallEvent').assertNone({ id: eventId }),
-    ...preparedContentObjectSteps([content], 'native_child_projection'),
+    ...preparedContentObjectSteps([...initial.contents, ...view.contents, content], 'native_child_projection'),
     DOMAIN_REPOSITORIES.domain('ToolCallEvent').insertWithNextSequence({
       id: eventId, tool_call_id: input.toolCallId, event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT,
       content_object_id: content.metadata.id, created_at: input.now
     }, { column: 'event_seq', scope: { tool_call_id: input.toolCallId } })
   ]);
-  return { output, catalog };
+  return { output, catalog, privateCatalog: view.stored, catalogContents: [] };
 }
 
 export function withChildHandles(
@@ -333,9 +351,10 @@ export function withChildHandles(
   entries: readonly ModelHandleEntry[] | ModelHandleCatalog
 ): ModelHandleCatalog {
   const source = normalizeModelHandleCatalog(catalog);
-  const additions = Array.isArray(entries)
+  const additions: ModelHandleCatalog = Array.isArray(entries)
     ? { entries: entries.filter(entry => isPersistentContextHandle(entry.kind)) }
     : persistentContextCatalog(entries);
+  if (!additions.entries.length && !additions.retiredRefs?.length && !Object.keys(additions.allocationHighWater ?? {}).length) return source;
   const merged = mergeModelHandleCatalogs(source, additions);
   if (source.identityContractRevision !== undefined) return merged;
   if ((merged.retiredRefs?.length ?? 0) > 0) {
@@ -344,7 +363,8 @@ export function withChildHandles(
   return { entries: merged.entries };
 }
 
-function parseNativeChildProjection(text: string, memo?: ContextHandleReadMemo): NativeChildProjection {
+export async function parseNativeChildProjection(database: RuntimeDatabase, contentStore: ContentAddressedStore,
+  text: string, contentType: string, memo?: ContextHandleReadMemo): Promise<NativeChildProjection> {
   const value = JSON.parse(text) as PlainJsonValue;
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.kind !== NATIVE_CHILD_HANDLE_PROJECTION_EVENT
     || !(typeof value.output === 'string' || (Array.isArray(value.output) && value.output.every(block =>
@@ -355,6 +375,15 @@ function parseNativeChildProjection(text: string, memo?: ContextHandleReadMemo):
   for (const key of ['modelRequestId', 'toolCallId', 'toolModelResultId', 'toolName']) {
     if (typeof value[key] !== 'string' || !value[key]) throw childHandleError(`Native child projection lacks ${key}.`);
   }
+  if (contentType === NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE) {
+    const references = nativeToolResultProjectionReferences(contentType, value)!;
+    const privateCatalog = await readNativePrivateHandleCatalog(database, contentStore, references[0]);
+    return { kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT, modelRequestId: value.modelRequestId as string,
+      toolCallId: value.toolCallId as string, toolModelResultId: value.toolModelResultId as string, toolName: value.toolName as string,
+      modelHandleCatalog: privateCatalog.catalog, privateCatalog,
+      output: value.output as NonNullable<OpenAIResponsesToolOutput['output']> };
+  }
+  if (contentType !== NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE) throw childHandleError('Native result projection has an unsupported content type.');
   const hasCatalog = Object.prototype.hasOwnProperty.call(value, 'modelHandleCatalog');
   const hasLegacyEntries = Object.prototype.hasOwnProperty.call(value, 'childHandles');
   const allowedKeys = new Set(['kind', 'modelRequestId', 'toolCallId', 'toolModelResultId', 'toolName', 'output',
@@ -377,6 +406,21 @@ function parseNativeChildProjection(text: string, memo?: ContextHandleReadMemo):
     toolCallId: value.toolCallId as string, toolModelResultId: value.toolModelResultId as string,
     toolName: value.toolName as string, modelHandleCatalog,
     output: value.output as NonNullable<OpenAIResponsesToolOutput['output']> };
+}
+
+export function nativeToolResultProjectionReferences(contentType: string, value: unknown): string[] | undefined {
+  if (contentType !== NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE) return undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw childHandleError('Native result projection must be an object.');
+  const projection = value as Record<string, unknown>;
+  const allowed = ['kind', 'modelRequestId', 'toolCallId', 'toolModelResultId', 'toolName', 'modelHandleCatalogContentObjectId', 'output'];
+  if (projection.kind !== NATIVE_CHILD_HANDLE_PROJECTION_EVENT || Object.keys(projection).length !== allowed.length
+    || Object.keys(projection).some(key => !allowed.includes(key)) || typeof projection.modelHandleCatalogContentObjectId !== 'string'
+    || !projection.modelHandleCatalogContentObjectId) throw childHandleError('Native result projection has an invalid private catalog reference.');
+  return [projection.modelHandleCatalogContentObjectId];
+}
+
+function isNativeProjectionContentType(value: unknown): boolean {
+  return value === NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE || value === NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE;
 }
 
 /** A preview can allocate a newly spawned child before its ordinary recipe has been committed. */

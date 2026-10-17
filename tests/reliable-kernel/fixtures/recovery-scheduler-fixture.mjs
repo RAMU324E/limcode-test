@@ -27,6 +27,10 @@ const { readConversationContextHandleCatalog } = await import(pathToFileURL(
   path.join(compiledRoot, 'backend/reliableKernel/conversationChildHandles.js')
 ).href);
 
+const { LEGACY_NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE } = await import(pathToFileURL(
+  path.join(compiledRoot, 'backend/reliableKernel/nativeToolFacts.js')
+).href);
+
 function frozenPolicy() {
   return {
     displayAutoExpand: false,
@@ -318,7 +322,8 @@ async function persistNativeCheckpoint(app, request, streamSeq, checkpointKind, 
         request.identity.attemptSeq,
         request.identity.socketGeneration,
         String(streamSeq),
-        payload
+        payload,
+        { contentType: LEGACY_NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE }
       )
     : await app.modelProvider.recordStreamEvent(
         request.modelRequestId,

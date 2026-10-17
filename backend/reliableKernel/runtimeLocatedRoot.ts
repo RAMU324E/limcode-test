@@ -23,7 +23,7 @@ export interface LocatedRuntimeRoot {
   readonly located: RuntimeRootPaths;
   readonly recorded: HistoricalRootBinding;
   /**
-   * Foreign roots of an exact published epoch 3/4/5 only: their private snapshot copies are upgraded
+   * Foreign roots of an exact published epoch 3/4/5/6 only: their private snapshot copies are upgraded
    * to the current epoch (copyLocatedRuntimeDatabase), and the few bodies that upgrade converts (old
    * Child continuations) live in this private content-addressed directory below the current
    * configuration root, never in the foreign directory. Readers look here before the located CAS.

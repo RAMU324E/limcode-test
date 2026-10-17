@@ -1086,7 +1086,7 @@ export interface PreparedLargeMergeSource {
   casObjects: number;
   cas: RuntimeDataSetCasTransfer;
   finalized?: RuntimeDataSetMergeResult['finalized'];
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   /** Estimated exclusive time of this source (ms) and its range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE). */
 
 }
@@ -1472,7 +1472,7 @@ async function prepareSource(
         if (isAbort(error)) throw new engine.StopRequested();
         throw error;
       });
-      await engine.indexSourceRecipeReferences(candidate, binding, taken.snapshot, state.exclusions, input.signal);
+      await engine.indexSourceContentReferences(candidate, binding, taken.snapshot, state.exclusions, input.signal);
       progress('cas');
       await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified!, true, state.exclusions);
       if (state.exclusions!.hasExclusions()) {

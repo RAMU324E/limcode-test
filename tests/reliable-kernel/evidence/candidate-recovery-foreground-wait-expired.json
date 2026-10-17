@@ -1,0 +1,62 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.recovery.foreground-wait-expired",
+  "stableId": "candidate.recovery.foreground-wait-expired",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:32:27.836Z",
+  "assertionCount": 10,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "b9190d12a0e28a8379e8c8d9bba7c7a7e67044ac3248d8367b5ddf910ef693b6",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "a40adc792ba10fcf831b7eae353962ab6742cc625788da1123f76effe2af0880",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.recovery.foreground-wait-expired"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "run_agent启动槽固定为8；第9个在durable admission release后立即启动而不等待foreground结果，已释放槽的worker仍接收父取消",
+    "三个并行run_agent按逆call_seq同时超时：Operation/Artifact先独立结算，随后无需reload按call_seq物化全部ToolModelResult",
+    "三个并发初始Child均无TurnIntent，production维护分类返回null并全部进入AgentLoop完成，而非卡在准备上下文",
+    "Extension Host在failed TurnTermination后崩溃时，startup recovery先补failed AnswerSubmission/RuntimeDelivery再清active pointer",
+    "非handoff child drive异常立即失败前台ToolCall并释放active link/lease；后台模式提交failed AnswerSubmission与RuntimeDelivery，不等待deadline",
+    "三个并行background spawn逆call_seq结算时先写Operation/Artifact，再按序物化且无需reload",
+    "三个并行background continuation逆call_seq提交时同样通过Operation/Artifact两阶段结算",
+    "parent cancel先提交后，timeout与late answer均不能覆盖cancelled Operation/Artifact，first-wins保持单一结果",
+    "过期waiting_answer跨restart转后台控制句柄并只结算原ToolCall一次，deadline持久化事实被真实扫描",
+    "late answer仅进入AnswerSubmission/Inbox，不产生第二ToolModelResult也不强制启动父模型"
+  ],
+  "faults": [
+    "nine long foreground child starts with parent cancellation after durable admission release",
+    "three parallel foreground deadlines settle in reverse call_seq",
+    "three parallel initial child turns have no TurnIntent when maintenance dispatch runs",
+    "host restart after failed TurnTermination commit and before child reconciliation",
+    "non-handoff child drive throws before AgentLoop in foreground and background",
+    "parallel background spawn settlement behind call-order barrier",
+    "parallel background continuation settlement behind call-order barrier",
+    "cancel wins before foreground timeout and late answer",
+    "foreground wait deadline elapsed while Extension Host was down"
+  ],
+  "metrics": {
+    "firstReconciled": 1,
+    "parallelToolModelResults": 3,
+    "cancelledArtifacts": 1
+  }
+}

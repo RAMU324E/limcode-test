@@ -81,7 +81,7 @@ import {
   runtimeCommitNeedsInteractionAttention
 } from './interactionAttention';
 import {
-  conversationHistoryPresentationFromBytes,
+  ConversationHistoryContentReader,
   projectChildConversationHistory
 } from './conversationHistoryProjection';
 
@@ -116,6 +116,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private originLinks: ConversationOriginLinkRecord[] = [];
   private readonly historyPreviewByRevisionId = new Map<string, string>();
   private readonly historyTitleByRevisionId = new Map<string, string>();
+  private historyContentReader: ConversationHistoryContentReader | undefined;
   private historyRefresh: Promise<void> | undefined;
   private historyRefreshPending: {
     promise: Promise<void>;
@@ -881,6 +882,9 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       this.activeEditorSubscription?.dispose();
       this.activeEditorSubscription = undefined;
       this.externalHistoryWatcher.cancel();
+      this.historyContentReader = undefined;
+      this.historyPreviewByRevisionId.clear();
+      this.historyTitleByRevisionId.clear();
       // Host handoff must not wait behind a projection read which the old Host no longer needs.
       // Closing the product below rejects/settles ordinary database work; keep rejection observed.
       void this.hydration?.catch(() => undefined);
@@ -1166,16 +1170,18 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       titleIds.has(target.revisionId) && !this.historyTitleByRevisionId.has(target.revisionId)
       || previewIds.has(target.revisionId) && !this.historyPreviewByRevisionId.has(target.revisionId)
     );
+    const messageContents = this.historyContentReader ??= new ConversationHistoryContentReader(
+      this.product.application.database, this.product.application.contentStore);
     const settled = await mapSettledWithBoundedConcurrency(
       unresolved,
       HISTORY_CONTENT_READ_CONCURRENCY,
-      (target) => this.product.application.contentStore.read(target.content as unknown as ContentObjectMetadata)
+      (target) => messageContents.read(target.content as ContentObjectMetadata)
     );
     settled.forEach((result, index) => {
       if (result.status !== 'fulfilled') return;
       const target = unresolved[index];
       if (!target) return;
-      const presentation = conversationHistoryPresentationFromBytes(result.value, String(target.content.content_type));
+      const presentation = result.value;
       if (presentation.preview !== undefined) this.historyPreviewByRevisionId.set(target.revisionId, presentation.preview);
       if (presentation.titleContent) this.historyTitleByRevisionId.set(target.revisionId, displayConversationTitle({
         id: target.conversationId,

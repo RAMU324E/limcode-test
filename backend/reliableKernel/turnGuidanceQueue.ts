@@ -3,6 +3,7 @@ import type {
   ContentObjectMetadata
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import {
   initialGuidancePosition,
   inputTurnIntentEnvelope,
@@ -90,7 +91,10 @@ export interface TurnGuidanceQueueOperationsDeps {
  * content. Receipt identity and stable command-entity ids stay on the shared turn command wire.
  */
 export class TurnGuidanceQueueOperations {
-  public constructor(private readonly deps: TurnGuidanceQueueOperationsDeps) {}
+  private readonly messageContents: LogicalMessageContentReader;
+  public constructor(private readonly deps: TurnGuidanceQueueOperationsDeps) {
+    this.messageContents = new LogicalMessageContentReader(deps.database, deps.contentStore);
+  }
 
   public async reviseGuidanceText(command: TurnGuidanceEditCommand): Promise<TurnCommandResult> {
     const source = normalizeInitiatingSource(command.source, 'guidance');
@@ -105,11 +109,12 @@ export class TurnGuidanceQueueOperations {
 
     const current = await this.currentGuidanceIntent(conversationId, intentId);
     this.requireExpectedGuidanceRevision(current, expectedRevisionSeq);
-    const messageBytes = await this.deps.contentStore.read(current.messageContent);
+    const messageBytes = await this.messageContents.read(current.messageContent);
+    const contentType = logicalMessageContentType(current.messageContent.content_type);
     const editedMessage = await this.deps.contentStore.prepare(
       this.deps.database,
-      editGuidanceMessageContent(messageBytes, current.messageContent.content_type, text),
-      current.messageContent.content_type
+      editGuidanceMessageContent(messageBytes, contentType, text),
+      contentType
     );
     const now = this.timestamp();
     const envelopeContent = await this.deps.contentStore.prepare(

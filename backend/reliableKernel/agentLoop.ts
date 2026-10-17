@@ -1,5 +1,5 @@
 import { freezeToolDefinitions, resolveFrozenToolDefinitions } from './frozenToolDefinitions';
-import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
+import { rememberPreparedModelHandleBase, resolveFrozenModelHandleCatalog, retainPreparedModelHandleBase } from './frozenModelHandleCatalog';
 import { performance } from 'node:perf_hooks';
 import { readConversationContextHandleStateRow, readCurrentConversationContextHandleState } from './conversationContextHandleState';
 import { acceptedNoticeMetadata, type AcceptedAnswerNotice } from './answerPresentation';
@@ -38,6 +38,7 @@ import type { RuntimeDeliveryControlPlane } from './answerDelivery';
 import type { RuntimeDeliveryModelProjection } from './runtimeDeliveryProjection';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { ContextSequenceControlPlane, type MaterializedContextStructure } from './contextSequence';
 import { selectContextHandleBindings } from './contextHandleOccurrenceEvidence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
@@ -78,7 +79,7 @@ import {
 } from '../../shared/openAIResponsesCapabilities';
 import { nativeSessionCapabilities } from '../../shared/nativeSessionCapabilities';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
-import { NativeRequestSession } from './nativeRequestSession';
+import { NativeRequestSession, type NativeCommittedMessageItem } from './nativeRequestSession';
 import { NativeAsyncWorkPendingError, TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY, parseNativeControlCheckpoint } from './nativeToolFacts';
 import { readNativeSteeringInFlight } from './nativeSteering';
 import {
@@ -437,6 +438,7 @@ const OPEN_TASK_COMPLETION_CHECK_CARD = [
 export class ReliableAgentLoop {
   private readonly finalOutputObservers = new Set<ReliableTurnFinalOutputObserver>();
   private readonly context: ContextSequenceControlPlane;
+  private readonly messageContents: LogicalMessageContentReader;
   /**
    * Host-local in-flight native call executions. A recovery re-drive attaches to the running
    * execution instead of dispatching the same admitted ToolCall a second time.
@@ -474,6 +476,7 @@ export class ReliableAgentLoop {
     this.now = options.now ?? (() => new Date().toISOString());
     this.reconcileCommittedToolCall = options.reconcileCommittedToolCall;
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
     this.automaticDeliveries = new AutomaticRuntimeDeliveryRouter(database, contentStore);
   }
 
@@ -529,6 +532,7 @@ export class ReliableAgentLoop {
 
   public async drive(turnIdInput: string): Promise<ReliableAgentLoopResult> {
     const turnId = requireId(turnIdInput, 'turnId');
+    try {
     for (let retryNumber = 0; ; retryNumber += 1) {
       try {
         return await this.driveOnce(turnId, retryNumber < LOCAL_EXECUTION_MAX_RETRIES);
@@ -553,6 +557,9 @@ export class ReliableAgentLoop {
           }
         });
       }
+    }
+    } finally {
+      this.modelProvider.releasePreparedTurnRecipes(turnId);
     }
   }
 
@@ -756,9 +763,9 @@ export class ReliableAgentLoop {
               planningBudget.estimatedFullInputTokens, planningBudget.planningInputCapacityTokens);
           }
           if (compressionDecision) {
-            frozenRecipe = normalizePlainJson({
-              ...(frozenRecipe as { [key: string]: PlainJsonValue }), compressionDecision
-            }, 'Request compression recovery decision');
+            frozenRecipe = this.modelProvider.refreezeModelRequestRecipe(frozenRecipe, {
+              compressionDecision: compressionDecision as unknown as PlainJsonValue
+            });
           }
           if (readFrozenNativeCapabilities(requireRecord(frozenRecipe, 'Native request recipe'))) {
             const compressionPolicy = frozenCompressionPolicy(planning.compressionAuthority);
@@ -770,10 +777,9 @@ export class ReliableAgentLoop {
             };
             // Freeze the actual full-request planning budget with the recipe; a reconnected Host
             // must not derive a different safety capacity from mutable settings or a later head.
-            frozenRecipe = normalizePlainJson({
-              ...(frozenRecipe as { [key: string]: PlainJsonValue }),
-              nativeLogicalBudget: nativeBudget
-            }, 'Native logical request budget');
+            frozenRecipe = this.modelProvider.refreezeModelRequestRecipe(frozenRecipe, {
+              nativeLogicalBudget: nativeBudget as unknown as PlainJsonValue
+            });
             if (requestSequence > 1n) {
               const previousId = modelRequestIdFor(turnId,
                 `agent-loop:${turnId}:round:${(requestSequence - 1n).toString()}`);
@@ -825,144 +831,209 @@ export class ReliableAgentLoop {
           requestSequence,
           expectedModelRequestId
         );
-        const modelRequestRecipe = requireRecord(preparedModelRequestRecipe.recipe, 'ModelRequest recipe');
-        includeOpenTaskCompletionCheck = false;
-        if (recipeHasOpenTaskCompletionCheck(modelRequestRecipe)) {
-          openTaskCompletionCheckConsumed = true;
-        }
-        const modelRequestId = expectedModelRequestId;
-        modelRequestIds.push(modelRequestId);
-        if (await this.terminateIfRequested(turnId, `round:${round}:model-request:${modelRequestId}`)) {
-          return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
-        }
-        let dispatched: NormalizedProviderOutput | typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE;
-        if (request.status === 'terminal') {
-          if (await this.recoverProviderContextOverflow(turnId, request)) {
-            requestSequence += 1n;
-            continue agentRounds;
+        // Provider dispatch ends before assistant/tool Context admission. This round remains an
+        // actual consumer of its frozen base until those facts land, including terminal recovery.
+        const releaseRoundBase = retainPreparedModelHandleBase(this.database, this.contentStore,
+          preparedModelRequestRecipe.modelHandleCatalog);
+        try {
+          const modelRequestRecipe = requireRecord(preparedModelRequestRecipe.recipe, 'ModelRequest recipe');
+          includeOpenTaskCompletionCheck = false;
+          if (recipeHasOpenTaskCompletionCheck(modelRequestRecipe)) {
+            openTaskCompletionCheckConsumed = true;
           }
-          dispatched = request.terminal_state === NATIVE_CHAIN_REBASED_TERMINAL_STATE
-            ? NATIVE_CHAIN_REBASED_TERMINAL_STATE
-            : await this.readTerminalProviderOutput(modelRequestId);
-        } else {
-          this.observeLifecycle({ turnId, stage: 'provider_dispatch_started', round, modelRequestId });
-          try {
-            dispatched = await this.dispatchAndCapture(
-              requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-              turnId,
-              modelRequestId,
-              request,
-              preparedModelRequestRecipe,
-              preparedContext
-            );
-          } catch (error) {
-            if (isExecutionHandoffError(error)) throw error;
-            const failed = await this.requireExisting('ModelRequest', modelRequestId);
-            if (!await this.recoverProviderContextOverflow(turnId, failed)) throw error;
-            requestSequence += 1n;
-            continue agentRounds;
+          const modelRequestId = expectedModelRequestId;
+          modelRequestIds.push(modelRequestId);
+          if (await this.terminateIfRequested(turnId, `round:${round}:model-request:${modelRequestId}`)) {
+            return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
           }
-        }
-        if (dispatched === NATIVE_CHAIN_REBASED_TERMINAL_STATE) {
-          await this.assertNativeErrorRebaseBudget(turnId, modelRequestId);
-          // The sealed chain's items, admitted calls and closed results already live in Context;
-          // the Turn continues with a new full request (where queued runtime input is absorbed).
-          requestSequence += 1n;
-          continue agentRounds;
-        }
-        const output = dispatched;
-        this.observeLifecycle({ turnId, stage: 'provider_output_ready', round, modelRequestId });
-        if (await this.terminateIfRequested(turnId, `round:${round}:provider-output:${modelRequestId}`)) {
-          return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
-        }
-        const openTaskCompletion = decideOpenTaskCompletion(
-          modelRequestRecipe,
-          openTaskCompletionCheckConsumed
-        );
-        const shouldContinueOpenTasks = output.toolCalls.length === 0
-          && openTaskCompletion === 'continue_once';
-        if (output.toolCalls.length === 0 && !shouldContinueOpenTasks) {
-          const fence = await this.automaticDeliveries.establishFinalOutputFence({ turnId, modelRequestId });
-          if (!fence.established) {
-            if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
+          let dispatched: NormalizedProviderOutput | typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE;
+          if (request.status === 'terminal') {
+            if (await this.recoverProviderContextOverflow(turnId, request)) {
               requestSequence += 1n;
               continue agentRounds;
             }
-            const latestTurn = await this.requireExisting('Turn', turnId);
-            if (latestTurn.status !== 'active') {
+            dispatched = request.terminal_state === NATIVE_CHAIN_REBASED_TERMINAL_STATE
+              ? NATIVE_CHAIN_REBASED_TERMINAL_STATE
+              : await this.readTerminalProviderOutput(modelRequestId);
+          } else {
+            this.observeLifecycle({ turnId, stage: 'provider_dispatch_started', round, modelRequestId });
+            try {
+              dispatched = await this.dispatchAndCapture(
+                requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+                turnId,
+                modelRequestId,
+                request,
+                preparedModelRequestRecipe,
+                preparedContext
+              );
+            } catch (error) {
+              if (isExecutionHandoffError(error)) throw error;
+              const failed = await this.requireExisting('ModelRequest', modelRequestId);
+              if (!await this.recoverProviderContextOverflow(turnId, failed)) throw error;
+              requestSequence += 1n;
+              continue agentRounds;
+            }
+          }
+          if (dispatched === NATIVE_CHAIN_REBASED_TERMINAL_STATE) {
+            await this.assertNativeErrorRebaseBudget(turnId, modelRequestId);
+            // The sealed chain's items, admitted calls and closed results already live in Context;
+            // the Turn continues with a new full request (where queued runtime input is absorbed).
+            requestSequence += 1n;
+            continue agentRounds;
+          }
+          const output = dispatched;
+          this.observeLifecycle({ turnId, stage: 'provider_output_ready', round, modelRequestId });
+          if (await this.terminateIfRequested(turnId, `round:${round}:provider-output:${modelRequestId}`)) {
+            return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+          }
+          const openTaskCompletion = decideOpenTaskCompletion(
+            modelRequestRecipe,
+            openTaskCompletionCheckConsumed
+          );
+          const shouldContinueOpenTasks = output.toolCalls.length === 0
+            && openTaskCompletion === 'continue_once';
+          if (output.toolCalls.length === 0 && !shouldContinueOpenTasks) {
+            const fence = await this.automaticDeliveries.establishFinalOutputFence({ turnId, modelRequestId });
+            if (!fence.established) {
+              if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
+                requestSequence += 1n;
+                continue agentRounds;
+              }
+              const latestTurn = await this.requireExisting('Turn', turnId);
+              if (latestTurn.status !== 'active') {
+                return {
+                  turnId,
+                  terminalStatus: await this.readLoopTerminalStatus(turnId, latestTurn),
+                  modelRequestIds,
+                  assistantMessageIds,
+                  toolCallIds
+                };
+              }
+              throw new Error(`Turn ${turnId} could not establish final-output authority.`);
+            }
+            if (await this.terminateIfRequested(turnId, `round:${round}:final-output-fenced:${modelRequestId}`)) {
+              return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+            }
+          }
+          this.observeLifecycle({ turnId, stage: 'assistant_commit_started', round, modelRequestId });
+          const nativeCapabilities = readFrozenNativeCapabilities(modelRequestRecipe);
+          const message = nativeCapabilities
+            ? await this.turnOutput.appendNativeAssistantAggregate({
+                turnId,
+                modelRequestId,
+                content: JSON.stringify(providerOutputMessage(output)),
+                contentType: MESSAGE_CONTENT_TYPE
+              })
+            : await this.turnOutput.appendAssistantMessage({
+                turnId,
+                modelRequestId,
+                sourceKey: modelRequestId,
+                content: JSON.stringify(providerOutputMessage(output)),
+                contentType: MESSAGE_CONTENT_TYPE
+              });
+          assistantMessageIds.push(message.messageId);
+          this.observeLifecycle({ turnId, stage: 'assistant_commit_completed', round, modelRequestId });
+          if (shouldContinueOpenTasks) {
+            // This visible output remains an in-progress assistant message. The next frozen recipe owns
+            // the one durable completion-check marker, so crash recovery cannot create an endless loop.
+            openTaskCompletionCheckConsumed = true;
+            includeOpenTaskCompletionCheck = true;
+            requestSequence += 1n;
+            continue agentRounds;
+          }
+
+          if (output.toolCalls.length === 0) {
+            // The final-output fence was committed before this visible Message. Automatic runtime
+            // input must now target a new Turn; extending this Turn would rewrite a displayed final.
+            for (;;) {
+              if (await this.terminateIfRequested(turnId, `round:${round}:before-complete:${modelRequestId}`)) {
+                return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+              }
+              // Like the native path: a stop observed first means this Turn publishes no answer.
+              await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
+              this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
+              try {
+                await this.turns.terminal({
+                  source: { kind: 'internal', key: `agent-loop:${turnId}:complete:${modelRequestId}` },
+                  turnId,
+                  terminalStatus: 'completed',
+                  reason: openTaskCompletion === 'complete_with_open_tasks'
+                    ? 'model_completed_with_open_tasks'
+                    : 'model_completed_without_tool_calls'
+                });
+              } catch (error) {
+                if (isTurnTerminalInputConflictError(error)) {
+                  if (await this.terminateIfRequested(turnId, `round:${round}:final-output-fenced:${modelRequestId}`)) {
+                    return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+                  }
+                  throw new Error(
+                    `Runtime input crossed final-output fence for Turn ${turnId}: ${errorMessage(error)}`
+                  );
+                }
+                throw error;
+              }
+              this.observeLifecycle({ turnId, stage: 'turn_terminal_completed', round, modelRequestId });
+              this.observeOpenTasksAtFinal(turnId, round, modelRequestId, modelRequestRecipe);
+              const terminalTurn = await this.requireExisting('Turn', turnId);
               return {
                 turnId,
-                terminalStatus: await this.readLoopTerminalStatus(turnId, latestTurn),
+                terminalStatus: await this.readLoopTerminalStatus(turnId, terminalTurn),
                 modelRequestIds,
                 assistantMessageIds,
                 toolCallIds
               };
             }
-            throw new Error(`Turn ${turnId} could not establish final-output authority.`);
           }
-          if (await this.terminateIfRequested(turnId, `round:${round}:final-output-fenced:${modelRequestId}`)) {
+
+          const batch = await this.prepareProviderToolBatch({
+            turnId,
+            modelRequestId,
+            messageId: message.messageId,
+            output,
+            recipe: modelRequestRecipe
+          });
+          toolCallIds.push(...batch.map((call) => call.toolCallId));
+          if (await this.terminateIfRequested(
+            turnId,
+            `round:${round}:created-tool-batch`,
+            batch[0]?.toolCallId
+          )) {
             return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
           }
-        }
-        this.observeLifecycle({ turnId, stage: 'assistant_commit_started', round, modelRequestId });
-        const nativeCapabilities = readFrozenNativeCapabilities(modelRequestRecipe);
-        const message = nativeCapabilities
-          ? await this.turnOutput.appendNativeAssistantAggregate({
-              turnId,
-              modelRequestId,
-              content: JSON.stringify(providerOutputMessage(output)),
-              contentType: MESSAGE_CONTENT_TYPE
-            })
-          : await this.turnOutput.appendAssistantMessage({
-              turnId,
-              modelRequestId,
-              sourceKey: modelRequestId,
-              content: JSON.stringify(providerOutputMessage(output)),
-              contentType: MESSAGE_CONTENT_TYPE
-            });
-        assistantMessageIds.push(message.messageId);
-        this.observeLifecycle({ turnId, stage: 'assistant_commit_completed', round, modelRequestId });
-        if (shouldContinueOpenTasks) {
-          // This visible output remains an in-progress assistant message. The next frozen recipe owns
-          // the one durable completion-check marker, so crash recovery cannot create an endless loop.
-          openTaskCompletionCheckConsumed = true;
-          includeOpenTaskCompletionCheck = true;
-          requestSequence += 1n;
-          continue agentRounds;
-        }
-
-        if (output.toolCalls.length === 0) {
-          // The final-output fence was committed before this visible Message. Automatic runtime
-          // input must now target a new Turn; extending this Turn would rewrite a displayed final.
-          for (;;) {
-            if (await this.terminateIfRequested(turnId, `round:${round}:before-complete:${modelRequestId}`)) {
-              return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
-            }
-            // Like the native path: a stop observed first means this Turn publishes no answer.
-            await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
-            this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
-            try {
-              await this.turns.terminal({
-                source: { kind: 'internal', key: `agent-loop:${turnId}:complete:${modelRequestId}` },
+          const batchDispatch = nativeCapabilities
+            ? await this.dispatchNativeToolBatch({
+                conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
                 turnId,
-                terminalStatus: 'completed',
-                reason: openTaskCompletion === 'complete_with_open_tasks'
-                  ? 'model_completed_with_open_tasks'
-                  : 'model_completed_without_tool_calls'
+                round,
+                modelRequestId,
+                calls: batch
+              })
+            : await this.dispatchProviderToolBatch({
+                conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+                turnId,
+                round,
+                modelRequestId,
+                calls: batch
               });
-            } catch (error) {
-              if (isTurnTerminalInputConflictError(error)) {
-                if (await this.terminateIfRequested(turnId, `round:${round}:final-output-fenced:${modelRequestId}`)) {
-                  return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
-                }
-                throw new Error(
-                  `Runtime input crossed final-output fence for Turn ${turnId}: ${errorMessage(error)}`
-                );
-              }
-              throw error;
-            }
-            this.observeLifecycle({ turnId, stage: 'turn_terminal_completed', round, modelRequestId });
-            this.observeOpenTasksAtFinal(turnId, round, modelRequestId, modelRequestRecipe);
+          if (batchDispatch.status === 'interrupted') {
+            return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+          }
+          if (batchDispatch.status === 'waiting') {
+            return {
+              turnId,
+              terminalStatus: 'waiting',
+              modelRequestIds,
+              assistantMessageIds,
+              toolCallIds,
+              waitingToolCallId: batchDispatch.toolCallId
+            };
+          }
+          if (await this.completeForQueuedBoundaryInput({
+            turnId,
+            conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+            round,
+            modelRequestId
+          })) {
             const terminalTurn = await this.requireExisting('Turn', turnId);
             return {
               turnId,
@@ -972,122 +1043,63 @@ export class ReliableAgentLoop {
               toolCallIds
             };
           }
-        }
-
-        const batch = await this.prepareProviderToolBatch({
-          turnId,
-          modelRequestId,
-          messageId: message.messageId,
-          output,
-          recipe: modelRequestRecipe
-        });
-        toolCallIds.push(...batch.map((call) => call.toolCallId));
-        if (await this.terminateIfRequested(
-          turnId,
-          `round:${round}:created-tool-batch`,
-          batch[0]?.toolCallId
-        )) {
-          return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
-        }
-        const batchDispatch = nativeCapabilities
-          ? await this.dispatchNativeToolBatch({
-              conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-              turnId,
-              round,
-              modelRequestId,
-              calls: batch
-            })
-          : await this.dispatchProviderToolBatch({
-              conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-              turnId,
-              round,
-              modelRequestId,
-              calls: batch
-            });
-        if (batchDispatch.status === 'interrupted') {
-          return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
-        }
-        if (batchDispatch.status === 'waiting') {
-          return {
-            turnId,
-            terminalStatus: 'waiting',
-            modelRequestIds,
-            assistantMessageIds,
-            toolCallIds,
-            waitingToolCallId: batchDispatch.toolCallId
-          };
-        }
-        if (await this.completeForQueuedBoundaryInput({
-          turnId,
-          conversationId: requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-          round,
-          modelRequestId
-        })) {
-          const terminalTurn = await this.requireExisting('Turn', turnId);
-          return {
-            turnId,
-            terminalStatus: await this.readLoopTerminalStatus(turnId, terminalTurn),
-            modelRequestIds,
-            assistantMessageIds,
-            toolCallIds
-          };
-        }
-        // A native logical ModelRequest that delivered every call's result and received final
-        // successor text is complete: the aggregate is the final answer, never a new legacy round.
-        // Undelivered (HTTP-pending or unadmitted) calls still continue with a carrier request.
-        if (nativeCapabilities && await this.nativeLogicalRequestDeliveredAll(batch)) {
-          const fence = await this.automaticDeliveries.establishFinalOutputFence({ turnId, modelRequestId });
-          if (!fence.established) {
-            if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
-              requestSequence += 1n;
-              continue agentRounds;
-            }
-            const latestTurn = await this.requireExisting('Turn', turnId);
-            if (latestTurn.status !== 'active') {
-              return {
-                turnId,
-                terminalStatus: await this.readLoopTerminalStatus(turnId, latestTurn),
-                modelRequestIds,
-                assistantMessageIds,
-                toolCallIds
-              };
-            }
-            throw new Error(`Turn ${turnId} could not establish final-output authority.`);
-          }
-          if (await this.terminateIfRequested(turnId, `round:${round}:native-final-output-fenced:${modelRequestId}`)) {
-            return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
-          }
-          await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
-          this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
-          try {
-            await this.turns.terminal({
-              source: { kind: 'internal', key: `agent-loop:${turnId}:complete-native:${modelRequestId}` },
-              turnId,
-              terminalStatus: 'completed',
-              reason: 'native_logical_request_completed'
-            });
-          } catch (error) {
-            if (isTurnTerminalInputConflictError(error)) {
-              if (await this.terminateIfRequested(turnId, `round:${round}:native-final-output-fenced:${modelRequestId}`)) {
-                return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+          // A native logical ModelRequest that delivered every call's result and received final
+          // successor text is complete: the aggregate is the final answer, never a new legacy round.
+          // Undelivered (HTTP-pending or unadmitted) calls still continue with a carrier request.
+          if (nativeCapabilities && await this.nativeLogicalRequestDeliveredAll(batch)) {
+            const fence = await this.automaticDeliveries.establishFinalOutputFence({ turnId, modelRequestId });
+            if (!fence.established) {
+              if (await this.absorbRuntimeDeliveryInputs(turnId) > 0) {
+                requestSequence += 1n;
+                continue agentRounds;
               }
-              throw new Error(
-                `Runtime input crossed final-output fence for Turn ${turnId}: ${errorMessage(error)}`
-              );
+              const latestTurn = await this.requireExisting('Turn', turnId);
+              if (latestTurn.status !== 'active') {
+                return {
+                  turnId,
+                  terminalStatus: await this.readLoopTerminalStatus(turnId, latestTurn),
+                  modelRequestIds,
+                  assistantMessageIds,
+                  toolCallIds
+                };
+              }
+              throw new Error(`Turn ${turnId} could not establish final-output authority.`);
             }
-            throw error;
+            if (await this.terminateIfRequested(turnId, `round:${round}:native-final-output-fenced:${modelRequestId}`)) {
+              return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+            }
+            await this.notifyFinalOutput(turnId, modelRequestId, providerOutputMessage(output));
+            this.observeLifecycle({ turnId, stage: 'turn_terminal_started', round, modelRequestId });
+            try {
+              await this.turns.terminal({
+                source: { kind: 'internal', key: `agent-loop:${turnId}:complete-native:${modelRequestId}` },
+                turnId,
+                terminalStatus: 'completed',
+                reason: 'native_logical_request_completed'
+              });
+            } catch (error) {
+              if (isTurnTerminalInputConflictError(error)) {
+                if (await this.terminateIfRequested(turnId, `round:${round}:native-final-output-fenced:${modelRequestId}`)) {
+                  return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+                }
+                throw new Error(
+                  `Runtime input crossed final-output fence for Turn ${turnId}: ${errorMessage(error)}`
+                );
+              }
+              throw error;
+            }
+            this.observeLifecycle({ turnId, stage: 'turn_terminal_completed', round, modelRequestId });
+            const terminalTurn = await this.requireExisting('Turn', turnId);
+            return {
+              turnId,
+              terminalStatus: await this.readLoopTerminalStatus(turnId, terminalTurn),
+              modelRequestIds,
+              assistantMessageIds,
+              toolCallIds
+            };
           }
-          this.observeLifecycle({ turnId, stage: 'turn_terminal_completed', round, modelRequestId });
-          const terminalTurn = await this.requireExisting('Turn', turnId);
-          return {
-            turnId,
-            terminalStatus: await this.readLoopTerminalStatus(turnId, terminalTurn),
-            modelRequestIds,
-            assistantMessageIds,
-            toolCallIds
-          };
-        }
-        requestSequence += 1n;
+          requestSequence += 1n;
+        } finally { releaseRoundBase?.(); }
       }
     } catch (error) {
       if ((error as { code?: string }).code === 'MODEL_CONTEXT_HANDLE_UPGRADE_PENDING') {
@@ -1260,7 +1272,7 @@ export class ReliableAgentLoop {
         'ContentObject',
         reference.contentObjectId
       ) as unknown as ContentObjectMetadata;
-      const inputContent = (await this.contentStore.read(inputContentObject)).toString('utf8');
+      const inputContent = (await this.messageContents.read(inputContentObject)).toString('utf8');
       handleSources.push(inputContent);
       if (reference.reinject) contextInputSources.push(inputContent);
     }
@@ -1290,7 +1302,8 @@ export class ReliableAgentLoop {
     };
     // Share one immutable lookup during projection; replay resolves the frozen CAS base separately.
     const preparedModelHandles = prepareModelHandleCatalog(modelHandleCatalog);
-    const inputBindings = selectContextHandleBindings(contextInputSources, modelHandleCatalog);
+    rememberPreparedModelHandleBase(this.database, this.contentStore, preparedModelHandles, runtimeStatus.contextHandles);
+    const inputBindings = selectContextHandleBindings(contextInputSources, preparedModelHandles);
     const establishedInputRefs = new Map(runtimeStatus.contextHandles.entries.map(entry => [entry.ref, entry]));
     const contextHandleInputBindings = { ...inputBindings, entries: inputBindings.entries.filter(entry => {
       const established = establishedInputRefs.get(entry.ref);
@@ -1346,7 +1359,7 @@ export class ReliableAgentLoop {
     const nativeErrorRecovery = nativeFreeze.nativeResponses
       ? await this.readNativeErrorRecoveryBudget(input.turnId)
       : undefined;
-    return normalizePlainJson({
+    return this.modelProvider.prepareModelRequestRecipe(normalizePlainJson({
       kind: 'reliable-agent-turn',
       projectionRevision: '2026-08-21',
       round: input.round,
@@ -1377,7 +1390,7 @@ export class ReliableAgentLoop {
             ...(nativeFreeze.nativeResponses && runtimeStatus.requiresNativeReset
               ? { resetCache: true, forceFullReason: 'context_handle_identity_repair' } : {})
           } } : {})
-    }, 'Reliable Agent recipe');
+    }, 'Reliable Agent recipe'), preparedModelHandles);
   }
 
   /**
@@ -1642,10 +1655,10 @@ export class ReliableAgentLoop {
         currentSegmentIds.has(requireId(source.segment_id, 'ContextSegmentSource.segment_id')));
       const contentObjectId = requireId(revision.content_object_id, 'MessageRevision.content_object_id');
       const contentObject = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
-      const content = await this.contentStore.read(contentObject);
+      const content = await this.messageContents.read(contentObject);
       references.push({
         kind: 'current_turn_input', messageId, messageRevisionId, contentObjectId,
-        estimatedTokens: estimateStoredMessageContentTokens(content, contentObject.content_type),
+        estimatedTokens: estimateStoredMessageContentTokens(content, logicalMessageContentType(contentObject.content_type)),
         reinject: !presentInCurrentWindow
       });
     }
@@ -2473,7 +2486,7 @@ export class ReliableAgentLoop {
     if (nativeCapabilities) {
       const definitions = await this.readModelRequestToolDefinitions(modelRequestId, recipe);
       const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
-      const catalog = await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe);
+      const catalog = preparedRecipe.modelHandleCatalog;
       const projection = await this.list('ModelContextProjection', {
         owner_kind: 'model_request', owner_id: modelRequestId
       }, 2);
@@ -2495,6 +2508,10 @@ export class ReliableAgentLoop {
         budget: readFrozenNativeLogicalBudget(recipe),
         initialContextRootId: requireId(projection[0]!.root_id, 'ModelContextProjection.root_id'),
         modelHandleCatalog: catalog,
+        ...(asRecord(recipe.modelHandleCatalogReference) ? {
+          modelHandleCatalogBaseContentObjectId: asRecord(recipe.modelHandleCatalogReference)!.baseContentObjectId as string | null,
+          modelHandleCatalogProducerConversationId: requireId(asRecord(recipe.contextHandleScope)?.conversationId, 'Frozen catalog producer')
+        } : {}),
         resolveAdapter: async (id) => this.providers.resolve(id),
         resolveDefinition: (name) => definitionsByName.get(name) ?? unknownToolDefinition(name),
         freezePolicies: async (inputs) => this.freezeDispatchPolicies(inputs),
@@ -2617,7 +2634,7 @@ export class ReliableAgentLoop {
           return result;
         }
         const transientKind = event.kind;
-        const observe = (): void => this.observeTransientEvent({
+        const observe = (committed?: NativeCommittedMessageItem): void => this.observeTransientEvent({
           conversationId,
           turnId,
           modelRequestId,
@@ -2626,12 +2643,19 @@ export class ReliableAgentLoop {
           modelId,
           attemptSeq,
           socketGeneration,
-          afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
+          afterCommitSeq: committed?.commitSeq ?? dispatchBarrier.snapshotCommitSeq,
           fromStreamSeq: visibleFromStreamSeq(attemptSeq, socketGeneration, event.streamSeq),
           event: {
             kind: transientKind,
             streamSeq: event.streamSeq,
-            content: event.content,
+            content: committed ? normalizePlainJson({
+              type: requireRecord(event.content, 'Native committed item event').type,
+              committedRevisionId: committed.messageRevisionId,
+              committedContentObjectId: committed.contentObjectId,
+              committedPart: committed.part,
+              ...(committed.part.outputItem ? { outputItem: committed.part.outputItem } : {})
+            }, 'Native committed item transient') : activeSession && event.kind === 'completed'
+              ? { type: 'native_completed' } : event.content,
             ...(event.usage !== undefined ? { usage: event.usage } : {}),
             ...(event.timing !== undefined ? { timing: event.timing } : {})
           },
@@ -2644,24 +2668,25 @@ export class ReliableAgentLoop {
           if (event.kind === 'output_item_done') {
             const callItem = activeSession.parseCallItem(event.content);
             if (callItem) {
-              const proof = activeSession.buildCallProof(callItem);
+              const proof = await activeSession.buildCallProof(callItem);
               const result = await this.modelProvider.recordNativeToolCallProof(
                 modelRequestId,
                 attemptSeq,
                 socketGeneration,
                 event.streamSeq,
-                proof,
-                { beforeSubmit: () => assertProviderCallbackAuthority(controls.signal, modelRequestId) }
+                proof.content,
+                { contentType: proof.contentType, relatedContentObjects: proof.relatedContentObjects,
+                  beforeSubmit: () => assertProviderCallbackAuthority(controls.signal, modelRequestId) }
               );
               assertProviderCallbackAuthority(controls.signal, modelRequestId);
-              observe();
-              await activeSession.admitStreamedCall(callItem, event.streamSeq, result, controls.signal);
+              const committed = await activeSession.admitStreamedCall(callItem, event.streamSeq, result, controls.signal);
+              observe(committed);
               return result;
             }
             const result = await controls.onEvent(event);
             assertProviderCallbackAuthority(controls.signal, modelRequestId);
-            observe();
-            await activeSession.admitStreamedContentItem(event, result, controls.signal);
+            const committed = await activeSession.admitStreamedContentItem(event, result, controls.signal);
+            observe(committed);
             return result;
           }
         }
@@ -3205,7 +3230,7 @@ export class ReliableAgentLoop {
         const revision = await this.requireExisting('MessageRevision', requireId(current[0].revision_id, 'MessageCurrentRevisionLink.revision_id'));
         const metadata = await this.requireExisting('ContentObject', requireId(revision.content_object_id, 'MessageRevision.content_object_id'));
         const committed = normalizeProviderOutput(normalizePlainJson(JSON.parse(
-          (await this.contentStore.read(metadata as unknown as ContentObjectMetadata)).toString('utf8')
+          (await this.messageContents.read(metadata as unknown as ContentObjectMetadata)).toString('utf8')
         ), 'Native committed display Message')).content;
         const known = new Set(committed.parts.map(part => nativeAssistantPartIdentity({ ...part })));
         const parts = [...committed.parts, ...output.content.parts.filter(part => !known.has(nativeAssistantPartIdentity({ ...part })))];
@@ -3301,8 +3326,7 @@ export class ReliableAgentLoop {
   }
 
   private async cancelSupersededCompressionRequests(turnId: string, currentHeadRootId: string): Promise<void> {
-    const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
-    const activeRequests = requests.filter((request) => request.status !== 'terminal');
+    const activeRequests = (await this.database.activeModelRequests(turnId)).snapshot;
     const recipes = await this.readModelRequestRecipes(activeRequests);
     for (const request of activeRequests) {
       const requestId = requireId(request.id, 'ModelRequest.id');
@@ -3675,12 +3699,12 @@ export class ReliableAgentLoop {
     for (let attempt = 0; ; attempt += 1) {
       try {
         const metadata = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
-        const content = await this.contentStore.read(metadata);
+        const content = await this.messageContents.read(metadata);
         const projection = await this.runtimeDeliveries.projectInputForModel({
           pendingTurnInputId: inputId,
           contentObjectId,
           content,
-          contentType: requireText(metadata.content_type, 'ContentObject.content_type')
+          contentType: logicalMessageContentType(requireText(metadata.content_type, 'ContentObject.content_type'))
         });
         return projection ? { ...projection, inputContentObjectId: contentObjectId,
           ...(metadata.content_type === CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE
@@ -3712,9 +3736,9 @@ export class ReliableAgentLoop {
       await this.modelProvider.cancelTurnDispatches(turnId, `termination request observed at ${stage}`);
       // Stop preserves observed text/thought for the transcript, while cancelled requests and
       // their unclosed items remain excluded from model Context. The Turn still owns its lease.
-      const stoppedRequests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
-      for (const stopped of stoppedRequests) {
-        await this.materializeFailedPartialOutput(turnId, requireId(stopped.id, 'ModelRequest.id'), true);
+      const stopped = (await this.database.modelRequestStopCandidates(turnId)).snapshot;
+      for (const request of stopped.partialRequests) {
+        await this.materializeFailedPartialOutput(turnId, requireId(request.id, 'ModelRequest.id'), true);
       }
       await this.tools.cancelWaiting?.({
         turnId,
@@ -3725,7 +3749,8 @@ export class ReliableAgentLoop {
         turnId,
         `agent-loop:${turnId}:termination-request:${requireId(request.id, 'PendingTurnInput.id')}`,
         'turn_termination_requested',
-        pendingToolCallId
+        pendingToolCallId,
+        stopped.toolOutputRequests
       );
       await this.absorbRuntimeDeliveryInputs(turnId, 'leave');
       try {
@@ -3753,17 +3778,13 @@ export class ReliableAgentLoop {
     turnId: string,
     sourcePrefix: string,
     reason: 'turn_termination_requested' | 'turn_failed',
-    pendingToolCallId?: string
+    pendingToolCallId?: string,
+    toolOutputRequests?: readonly DomainRow[]
   ): Promise<void> {
     const turn = await this.requireExisting('Turn', turnId);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const representedToolCallIds = new Set<string>();
-    const requests = (await listAllDomainRows(this.database, 'ModelRequest', {
-      turn_id: turnId,
-      status: 'terminal',
-      terminal_state: 'completed'
-    }))
-      .sort((left, right) => compareInteger(left.request_seq, right.request_seq));
+    const requests = toolOutputRequests ?? (await this.database.modelRequestStopCandidates(turnId)).snapshot.toolOutputRequests;
 
     for (const request of requests) {
       const modelRequestId = requireId(request.id, 'ModelRequest.id');

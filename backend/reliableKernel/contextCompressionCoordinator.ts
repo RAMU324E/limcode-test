@@ -1,4 +1,5 @@
 import { recipeCurrentTurnInputs } from './turnReminderProjection';
+import { logicalMessageContentType } from './logicalMessageContent';
 import { freezeToolDefinitions, resolveFrozenToolDefinitions } from './frozenToolDefinitions';
 import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { createHash } from 'node:crypto';
@@ -849,7 +850,7 @@ export class ReliableContextCompressionCoordinator {
         .slice(0, desiredSourceSegmentCount).map(segment => ({
           segmentId: segment.segmentId, segmentKind: segment.segmentKind, messageRole: segment.messageRole,
           ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
-          contentType: segment.contentObject.content_type, content: segment.content.toString('utf8')
+          contentType: logicalMessageContentType(segment.contentObject.content_type), content: segment.content.toString('utf8')
         }));
       // Expand immutable native provenance once. Prefix offsets preserve each atomic source unit
       // while every candidate reuses the same prepared bytes and the original replay limits.
@@ -974,7 +975,7 @@ export class ReliableContextCompressionCoordinator {
           segmentKind: segment.segmentKind,
           messageRole: segment.messageRole,
           ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
-          contentType: segment.contentObject.content_type,
+          contentType: logicalMessageContentType(segment.contentObject.content_type),
           content: segment.content.toString('utf8')
         }));
       const handleSource = preparedCapacitySource?.expanded ?? (policy.methodKind !== 'provider_native' || command.sourceReplay
@@ -1175,7 +1176,7 @@ export class ReliableContextCompressionCoordinator {
         segmentId: segment.segmentId,
         segmentKind: segment.segmentKind,
         messageRole: segment.messageRole,
-        contentType: segment.contentObject.content_type,
+        contentType: logicalMessageContentType(segment.contentObject.content_type),
         content: segment.content.toString('utf8')
       }))
     ];
@@ -1793,7 +1794,7 @@ function selectCompressionPrefixByTokens(
         segmentId: segments[position].segmentId,
         segmentKind: segments[position].segmentKind,
         messageRole: segments[position].messageRole,
-        contentType: segments[position].contentObject.content_type,
+        contentType: logicalMessageContentType(segments[position].contentObject.content_type),
         content: segments[position].content.toString('utf8')
       })), groupAttachmentState, modelHandleCatalog).tokenCount,
       functionCallCount: functionResponseCount > 0 ? 1 : 0,
@@ -1814,7 +1815,7 @@ function storedContextItems(segments: readonly MaterializedContextSegment[]): St
     segmentId: segment.segmentId,
     segmentKind: segment.segmentKind,
     messageRole: segment.messageRole,
-    contentType: segment.contentObject.content_type,
+    contentType: logicalMessageContentType(segment.contentObject.content_type),
     content: segment.content.toString('utf8')
   }));
 }

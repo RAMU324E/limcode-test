@@ -1,0 +1,68 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.client-snapshot-bounds",
+  "stableId": "candidate.client-snapshot-bounds",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:26:32.642Z",
+  "assertionCount": 7,
+  "provenance": {
+    "worktreeClean": true,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "ce6e3695e0a8823ed6b089e4022d2fb4d7ed362ad672c2cb7809fbffe3bacbce",
+    "sourceFileCount": 455,
+    "sourceFilesTracked": true,
+    "compiledKernelSha256": "f1536abe2fe3b04032bb384dcbbd7bd586182d7159cd6b1badaa0f3238cf2a3c",
+    "compiledFileCount": 194,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": true,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check=candidate.client-snapshot-bounds"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "10,000个可见楼层的snapshot仍只发送最新200条且保留绝对display_seq=9801..10000；五类projection/单记录摘要/实际UTF-8总字节均受硬上限，task list不含正文/full Context；failed task artifact不做canonical解析且不阻断snapshot",
+    "5MiB裁剪按明确oldest-first/newest-first方向保留最新窗口，并按Message→Request→Tool→Process闭包保留request-message/tool-source/message-turn/process-origin bundle",
+    "超过10,000条message_seq+id keyset分页在中间插入新行后仍无重复/漏项，page rows/bytes有界、尾延迟受限且offset被拒绝",
+    "大型answer正文不进ClientState，details按recordId+offset+maxBytes分块；Context projection按root读取结构事实且不把owner误作CAS或返回正文；每个实际wire response≤2MiB",
+    "连续10,000条增量消息只产生100个有界atomic changes且不退化为snapshot风暴；Webview物化记录和Extension Host可达键均随200条窗口保持常数上限",
+    "可靠时间线使用30+8 segmented挂载上限、projection绝对楼层和瞬态向上取整；Message+Revision+detail状态驱动正文水合并以中性骨架展示；final工具参数快照持续到Message detail与匹配Tool facts可展示，pending交互或重试耗尽时显式交接；详情读取按250/750/2000ms有界退避且工具卡提供手动重试；Attempt 2+的持久自动恢复状态在无输出时优先展示，并在对应transient可见后让位；Bridge payload递归转plain且拒绝Map/function/class",
+    "currentTaskList按Conversation延续；新Turn无rewrite时保留原基线并允许后续update-only继续"
+  ],
+  "faults": [
+    "5MiB byte pressure across oppositely ordered causal projection arrays",
+    "keyset insertion between pages",
+    "detail payload larger than maxResponseBytes"
+  ],
+  "metrics": {
+    "seedTenThousandMs": 1000,
+    "snapshotTenThousandMs": 16,
+    "pageTenThousandTotalMs": 647,
+    "pageCount": 51,
+    "pageP95Ms": 14,
+    "pageMaxMs": 15,
+    "runtimeDatabaseBytes": 10010624,
+    "incrementalTenThousandMs": 1377,
+    "incrementalActiveRecordKeys": 432,
+    "incrementalMaterializedRecords": 224,
+    "incrementalMaxRecordsPerType": 200,
+    "incrementalLastMessageSeq": 20004,
+    "incrementalLastVisibleFloor": 20001,
+    "snapshotBytes": 272435,
+    "snapshotMessages": 200,
+    "keysetRows": 10003,
+    "detailChunks": 3,
+    "contextDetailBytes": 2116,
+    "maxMountedTimelineComponents": 38
+  }
+}

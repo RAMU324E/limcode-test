@@ -2,7 +2,9 @@ import { TextDecoder } from 'node:util';
 import Database from 'better-sqlite3';
 import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import { requireCasObjectIdentity } from './casObjectAccess';
+import type { ContentObjectMetadata } from './contentAddressedStore';
 import { assertCurrentSchema } from './databaseSchema';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import {
   copyLocatedRuntimeDatabase, heldDatabaseFiles, openLocatedCasAccess, relocateRuntimeRoot, withLocatedRuntimeRootFence,
@@ -130,6 +132,7 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
   private closeOperation?: Promise<void>;
   private readonly reads = new Set<Promise<unknown>>();
   private readonly textCache = new Map<string, string>();
+  private readonly messageContents: LogicalMessageContentReader;
 
   public constructor(
     private readonly paths: { globalStoragePath: string },
@@ -140,7 +143,39 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     private readonly cas: LocatedCasAccess,
     private held: HeldDatabaseFiles,
     private readonly view: RuntimeHistoryViewRegistration
-  ) {}
+  ) {
+    const read = async (metadata: ContentObjectMetadata): Promise<Buffer> => {
+      const object = requireCasObjectIdentity(metadata);
+      if (object.byte_length > MAX_MESSAGE_CONTENT_BYTES) {
+        throw new Error(`Historical ContentObject ${metadata.id} exceeds the 64 MiB message read limit.`);
+      }
+      return this.cas.readBytes(object);
+    };
+    this.messageContents = new LogicalMessageContentReader({
+      snapshot: async reads => ({
+        // This command owns one immutable SQLite copy; it has no online commit stream.
+        snapshotCommitSeq: '0',
+        snapshot: reads.map(read => {
+          if (read.kind !== 'get' || read.domain !== 'ContentObject') {
+            throw new TypeError('Historical Message reader only reads ContentObject identities from its snapshot.');
+          }
+          return this.requireRow('ContentObject', 'content_object', read.id);
+        })
+      })
+    }, {
+      read,
+      readMany: metadata => Promise.all(metadata.map(read)),
+      readChunk: async (metadata, offset, maxBytes) => {
+        // LocatedCasAccess retains the existing packed snapshot/loose descriptor verification.
+        // Explicit history text reads already materialize at most 64 MiB; slice its verified item.
+        const bytes = await read(metadata);
+        const end = Math.min(bytes.length, offset + maxBytes);
+        const hasMore = end < bytes.length;
+        return { chunk: bytes.subarray(offset, end), totalBytes: bytes.length, hasMore,
+          ...(hasMore ? { nextOffset: end } : {}) };
+      }
+    });
+  }
 
   public async listConversations(input: { limit?: number; after?: RuntimeHistoryConversationCursor } = {}) {
     return this.read(async () => {
@@ -273,13 +308,13 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     const id = text(metadata.id);
     const cached = this.textCache.get(id);
     if (cached !== undefined) return cached;
-    const object = requireCasObjectIdentity(metadata);
-    if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length < 0n || metadata.byte_length > MAX_MESSAGE_CONTENT_BYTES) {
+    const content = metadata as ContentObjectMetadata;
+    if (await this.messageContents.byteLength(content) > Number(MAX_MESSAGE_CONTENT_BYTES)) {
       throw new Error(`Historical ContentObject ${id} exceeds the 64 MiB message read limit or has an invalid length.`);
     }
-    const bytes = await this.cas.readBytes(object);
+    const bytes = await this.messageContents.read(content);
     const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    const decoded = decodeHistoryText(source, text(metadata.content_type));
+    const decoded = decodeHistoryText(source, logicalMessageContentType(text(metadata.content_type)));
     this.textCache.set(id, decoded);
     // Retain a single larger message for its continuation pages, with a hard 64 MiB source bound.
     while (this.textCache.size > 1 && (this.textCache.size > 8
