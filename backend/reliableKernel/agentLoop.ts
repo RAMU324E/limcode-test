@@ -819,6 +819,7 @@ export class ReliableAgentLoop {
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             recipe: frozenRecipe,
             projectedEstimatedTokens: planningBudget.estimatedFullInputTokens,
+            preparedContextHandleState: preparedContext?.contextHandleState,
             idempotencyKey
           });
           if (created.modelRequestId !== expectedModelRequestId) {
@@ -1246,6 +1247,7 @@ export class ReliableAgentLoop {
       requireId(input.headRootId, 'headRootId')
     );
     const preparedContext = this.modelProvider.prepareOrdinaryRequestContext(materialized, contextHolder);
+    preparedContext.contextHandleState = runtimeStatus.contextHandleState;
     const [currentTurnState, nativeFreeze] = await Promise.all([
       this.readCurrentTurnInputReference(input.turnId, structure),
       this.readNativeRecipeFreeze({ ...input, scopeReset: runtimeStatus.requiresNativeReset, structure })
@@ -1669,6 +1671,7 @@ export class ReliableAgentLoop {
     statusCard?: FrozenRuntimeStatusCard;
     /** Complete identity state, including retired addresses, frozen into the next request. */
     contextHandles: ModelHandleCatalog;
+    contextHandleState: Awaited<ReturnType<typeof readCurrentConversationContextHandleState>>;
     contextHandleBaseContentObjectId: string | null;
     requiresNativeReset: boolean;
     contextHandleScope: { conversationId: string; rootId: string | null; provenanceRevision: string; resetFence: string };
@@ -1696,11 +1699,11 @@ export class ReliableAgentLoop {
         ? [{ processId: requireId(row.id, 'Process.id'), status: 'running' as const }]
         : []);
     if (projection.totalChildCount === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
-      return { contextHandles: handleState.catalog, contextHandleBaseContentObjectId: handleState.row.content_object_id as string | null, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
+      return { contextHandles: handleState.catalog, contextHandleState: handleState, contextHandleBaseContentObjectId: handleState.row.content_object_id as string | null, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
         ...(forkIdentity ? { forkIdentity } : {}) };
     }
     const { children, totalChildCount, descendantCount, queuedInputCount, awaitingHandlingCount, activeChildCount } = projection;
-    return { contextHandles: handleState.catalog, contextHandleBaseContentObjectId: handleState.row.content_object_id as string | null, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
+    return { contextHandles: handleState.catalog, contextHandleState: handleState, contextHandleBaseContentObjectId: handleState.row.content_object_id as string | null, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
       ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
       kind: 'runtime_status_card',
       totalChildCount, descendantCount,

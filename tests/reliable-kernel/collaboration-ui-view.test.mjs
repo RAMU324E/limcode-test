@@ -456,7 +456,7 @@ test('navigation discards late historical replies at Host and client session bou
     assert.equal(sent.some((value) => value.type === 'reliable-kernel.collaboration-history-result'), false);
     const state = openUi('navigation-old', { holdHistory: true });
     state.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'client-old', hostBootId: 'navigation-host', messageSeq: '1', snapshotCommitSeq: '0',
-      projections: { activeConversationWindow: { conversationId: 'navigation-old' } } });
+       projections: { activeConversationWindow: { conversationId: 'navigation-old', visibleMessageCount: '1' } } });
     const request = state.posted.find((value) => value.type === 'reliable-kernel.collaboration-history-request');
     assert.ok(request);
     state.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'client-new', hostBootId: 'navigation-host', messageSeq: '1', snapshotCommitSeq: '0',
@@ -572,7 +572,12 @@ test('actual MessageList windows mixed timeline by proven position and retains r
   };
   feed.records = Object.fromEntries(Object.entries(feed.records).map(([domain, records]) => [domain, byId(Object.values(records))]));
   feed.committedRecords = feed.records;
+  feed.collaborationHistoryConversationId = 'timeline-self';
+  feed.collaborationHistoryHasMoreAfter = true;
   const view = await render();
+  assert.equal(view.setup.hasLaterSegment, false, '协作 after 游标不应把主消息尾部标成较新内容');
+  assert.doesNotMatch(view.html, /显示较新内容/);
+  assert.match(view.html, /查找较新协作记录/);
   assert.equal(view.setup.visibleTimelineRows.length, 30);
   assert.match(view.html, /data-timeline-row-key="timeline-m35"/);
   assert.doesNotMatch(view.html, /data-timeline-row-key="timeline-m1"/);
@@ -586,6 +591,19 @@ test('actual MessageList windows mixed timeline by proven position and retains r
   view.setup.showEarlierSegment();
   await flushFrames();
   assert.equal(view.setup.visibleTimelineRows.some((entry) => entry.id === 'timeline-m1'), true);
+});
+
+test('空新对话不自动扫描全局协作历史，也不显示历史导航控件', async () => {
+  const state = openUi('empty-new');
+  state.feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'empty-session', hostBootId: 'empty-host',
+    messageSeq: '1', snapshotCommitSeq: '1', projections: {
+      activeConversationWindow: { conversationId: 'empty-new', visibleMessageCount: '0' },
+      conversations: [{ id: 'empty-new', title: '新对话', status: 'active', created_at: NOW, updated_at: NOW }]
+    } });
+  const view = await render();
+  assert.equal(state.posted.filter((message) => message.type === 'reliable-kernel.collaboration-history-request').length, 0);
+  assert.doesNotMatch(view.html, /查找更早协作记录|显示更早内容|查找较新协作记录/);
+  assert.doesNotMatch(view.html, /已检查/);
 });
 
 test('deleted peer snapshot updates card and queue labels while received body remains readable', async () => {

@@ -96,13 +96,16 @@ export async function readContextRootHandleCatalogRow(database: RuntimeDatabase,
 }
 
 async function contextRootCatalogSnapshotSteps(database: RuntimeDatabase, conversationId: string,
-  contextRootId: string, contentObjectId: string | null, now: string, provenanceRevision = 0n, rootShape?: ContextHandleRootShape): Promise<RepositoryTransactionStep[]> {
+  contextRootId: string, contentObjectId: string | null, now: string, provenanceRevision = 0n,
+  rootShape?: ContextHandleRootShape, knownNewRoot = false): Promise<RepositoryTransactionStep[]> {
   const repository = DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN);
-  const existing = await readContextRootHandleCatalogRow(database, conversationId, contextRootId, provenanceRevision);
-  if (existing) {
-    if (existing.content_object_id !== contentObjectId) throw stateError('An immutable Context root catalog cannot be rebound.');
-    return [repository.assert(String(existing.id), { conversation_id: conversationId,
-      context_root_id: contextRootId, provenance_revision: provenanceRevision, content_object_id: contentObjectId })];
+  if (!knownNewRoot) {
+    const existing = await readContextRootHandleCatalogRow(database, conversationId, contextRootId, provenanceRevision);
+    if (existing) {
+      if (existing.content_object_id !== contentObjectId) throw stateError('An immutable Context root catalog cannot be rebound.');
+      return [repository.assert(String(existing.id), { conversation_id: conversationId,
+        context_root_id: contextRootId, provenance_revision: provenanceRevision, content_object_id: contentObjectId })];
+    }
   }
   const shape = rootShape ?? await readRootShape(database, conversationId, contextRootId);
   return [repository.assertNone({ conversation_id: conversationId, context_root_id: contextRootId, provenance_revision: provenanceRevision }),
@@ -122,6 +125,8 @@ export async function prepareContextHandleHeadTransition(input: {
   /** Retained original chain, excluding an edited user occurrence appended after truncation. */
   compressedPrefix?: { nodeId: string | null; tailSegmentCount: bigint };
   occurrence?: ContextHandleOccurrenceEvidence; occurrences?: readonly ContextHandleOccurrenceEvidence[];
+  /** Roots planned by one atomic append batch are known absent until its commit. */
+  knownNewRootIds?: ReadonlySet<string>;
   current?: DomainRow;
 }): Promise<ContextHandleHeadTransitionPlan> {
   const current = input.current ?? await readConversationContextHandleStateRow(input.database, input.conversationId);
@@ -203,7 +208,8 @@ export async function prepareContextHandleHeadTransition(input: {
     }
   }
   if (baseReady) steps.push(...await contextRootCatalogSnapshotSteps(input.database, input.conversationId,
-    input.nextRootId, contentObjectId, input.now, provenanceRevision, input.rootShape));
+    input.nextRootId, contentObjectId, input.now, provenanceRevision, input.rootShape,
+    input.knownNewRootIds?.has(input.nextRootId) === true));
   if (!activate) return { state: current, steps };
   const state = { ...current, context_root_id: input.nextRootId, revision: revision(current) + 1n,
     state: baseReady ? 'ready' : 'pending', content_object_id: baseReady ? contentObjectId : null,
@@ -380,8 +386,9 @@ export async function prepareConversationContextHandleUpdate(input: {
   contextRootId?: string;
   baseContentObjectId?: unknown;
   scope?: unknown;
+  current?: CurrentContextHandleState;
 }): Promise<RepositoryTransactionStep[]> {
-  const current = await readCurrentConversationContextHandleState(input.database, input.contentStore, input.conversationId);
+  const current = input.current ?? await readCurrentConversationContextHandleState(input.database, input.contentStore, input.conversationId);
   const incoming = persistentContextHandleCatalog(input.catalog);
   if (input.baseContentObjectId !== undefined && input.baseContentObjectId !== current.row.content_object_id) {
     throw frontierChanged();

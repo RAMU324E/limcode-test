@@ -674,6 +674,7 @@ export class ContextSequenceControlPlane {
       return plan;
     });
     const finalRootId = plans[plans.length - 1].rootId;
+    const knownNewRootIds = new Set(plans.map((plan) => plan.rootId));
     let handleState: DomainRow | undefined;
     const handleTransitions: RepositoryTransactionStep[][] = [];
     for (const plan of plans) {
@@ -687,7 +688,8 @@ export class ContextSequenceControlPlane {
         occurrences: [
           { kind: 'tool_call', toolCallId: plan.fact.toolCallId },
           { kind: 'tool_result', toolCallId: plan.fact.toolCallId, toolModelResultId: plan.fact.toolModelResultId }
-        ]
+        ],
+        knownNewRootIds
       });
       handleTransitions.push(transition.steps);
       handleState = transition.state;

@@ -7,6 +7,7 @@ import { frozenRecipeAttachmentHandles, preparedFrozenModelHandleCatalog,
   retainPreparedModelHandleBase } from './frozenModelHandleCatalog';
 import type { ModelProjectionWorkControls } from './modelProjectionWork';
 import { prepareConversationContextHandleUpdate, rethrowContextHandleStateRace } from './conversationContextHandleState';
+import type { CurrentContextHandleState } from './conversationContextHandleState';
 import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import { canonicalLlmProviderKind, type LlmThinkingConfigRecord, type LlmProviderKind } from '../../shared/protocol';
 
@@ -130,6 +131,8 @@ export interface CreateModelRequestCommand {
   settingsSnapshotContentObjectId?: string;
   /** Exact adapter projection estimate frozen by the ordinary request planner. */
   projectedEstimatedTokens?: number;
+  /** Context handle state already read while freezing the same request recipe. */
+  preparedContextHandleState?: CurrentContextHandleState;
   idempotencyKey: string;
 }
 
@@ -338,6 +341,8 @@ type ContextSegmentMetadata = Omit<MaterializedContextSegment, 'content'>;
 
 /** One ordinary request's immutable root; the holder is emptied before provider I/O or compression. */
 export interface PreparedOrdinaryRequestContext {
+  /** Current immutable handle state read while freezing the same recipe. */
+  contextHandleState?: CurrentContextHandleState;
   value?: {
     root: DomainRow;
     segments: ContextSegmentMetadata[];
@@ -869,6 +874,7 @@ export class ModelProviderControlPlane {
     const contextHandleSteps = isRecord(recipe) && (recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression')
       ? await prepareConversationContextHandleUpdate({ database: this.database, contentStore: this.contentStore,
           conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'), catalog: modelHandleCatalog,
+          current: command.preparedContextHandleState,
           ...(isRecord(recipe.modelHandleCatalogReference) ? { baseContentObjectId: recipe.modelHandleCatalogReference.baseContentObjectId } : {}),
           contextRootId, scope: recipe.contextHandleScope, source: compressionRequest ? 'compression' : 'ordinary', now }) : [];
     const steps: RepositoryTransactionStep[] = [

@@ -515,9 +515,13 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       // ACK means the ordered durable state was accepted. Send it before optional detail replay and
       // transient-overlay reconciliation so rendering work cannot head-of-line block the Feed.
       if (result.ack) bridge.postRaw(result.ack);
-      if (result.ack && nextConversationId && this.collaborationHistoryLoadedPages === 0
+      if (result.ack && nextConversationId && visibleMessageCount(result.state.projections) > 0n
+        && this.collaborationHistoryLoadedPages === 0
         && !this.collaborationHistoryLoading && !this.collaborationHistoryError) {
-        // Always bootstrap: a Conversation with no ordinary Message can still have older cards.
+        // An ordinary transcript gives bootstrap a real reading boundary. A brand-new empty
+        // Conversation has no possible local collaboration history, so do not scan the global
+        // collaboration inventory just to paint navigation controls.
+        this.collaborationHistoryHasMoreBefore = true;
         this.requestEarlierCollaborationHistory(nextConversationId, true);
       }
       for (const detail of replayDetails) {
@@ -2389,7 +2393,7 @@ function resetCollaborationHistoryState(
   state.collaborationHistoryCurrentPageId = null;
   state.collaborationHistoryNextBeforeCursor = null;
   state.collaborationHistoryNextAfterCursor = null;
-  state.collaborationHistoryHasMoreBefore = Boolean(conversationId);
+  state.collaborationHistoryHasMoreBefore = false;
   state.collaborationHistoryHasMoreAfter = false;
   state.collaborationHistoryScanProgress = false;
   state.collaborationHistoryLoading = false;

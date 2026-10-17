@@ -165,7 +165,7 @@ const readingHistoryLoading = computed(() => feed.historyLoading
 const hasEarlierSegment = computed(() => segmentStart.value > readingRun.value.start
   || canRequestEarlierHistory.value || canRequestEarlierCollaboration.value);
 const hasLaterSegment = computed(() => segmentEnd.value < readingRun.value.end
-  || readingRun.value.end < timelineRows.value.length || canRequestLaterHistory.value || canRequestLaterCollaboration.value);
+  || readingRun.value.end < timelineRows.value.length || canRequestLaterHistory.value);
 const earlierSegmentLabel = computed(() => readingHistoryLoading.value && pendingHistoryDirection.value === 'before'
   ? '正在加载更早内容'
   : feed.historyError && segmentStart.value === readingRun.value.start
