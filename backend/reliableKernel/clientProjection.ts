@@ -1822,6 +1822,7 @@ export function executeConversationHistoryProjection(
           FROM conversation_origin_link AS origin
           JOIN seed ON seed.id = origin.conversation_id
          WHERE origin.source_conversation_id IS NOT NULL
+           AND origin.source_tool_call_id IS NOT NULL
       )
       SELECT conversation.id, conversation.title, conversation.status,
              conversation.created_at, conversation.updated_at
