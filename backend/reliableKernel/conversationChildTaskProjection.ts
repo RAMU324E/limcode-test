@@ -231,7 +231,7 @@ const DEFAULT_PAGE_LIMIT = 32;
 const MAX_PAGE_LIMIT = 100;
 const CARD_SOURCE_LIMIT = 8;
 const SOURCE_PREVIEW_CHARACTERS = 320;
-const PAGE_TOKEN_BUDGET = 2_600;
+const PAGE_TOKEN_BUDGET = 7_800;
 const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
 
 /** All mutable facts are obtained in one worker read transaction; CAS bodies are read afterward. */
@@ -1131,7 +1131,7 @@ export function readConversationChildTask(
       end === body.text.length ? sourceIndex + 1 : sourceIndex,
       end === body.text.length ? 0 : end)) <= PAGE_TOKEN_BUDGET;
     let low = offset;
-    let high = Math.min(body.text.length, offset + 12000);
+    let high = Math.min(body.text.length, offset + 36000);
     while (low < high) {
       const middle = Math.ceil((low + high) / 2);
       if (fits(middle)) low = middle; else high = middle - 1;

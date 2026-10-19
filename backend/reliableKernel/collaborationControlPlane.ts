@@ -15,12 +15,13 @@ import { listAllDomainRows } from './repositoryPagination';
 import { isTransactionAssertionFailure, requirePhaseFId, stablePhaseFId, sqliteUniqueFailureIncludes } from './phaseFIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { estimateJsonTokens, estimateTextTokens } from './modelTokenEstimator';
+import { AGENT_MESSAGE_MAX_TEXT_BYTES } from './collaborationOutputBudget';
 import { forkSourceConversationIds } from './conversationChildHandles';
 import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, waitForLocalExecutionRetry } from './localExecutionRecovery';
 
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 /** Every collaboration message body is 1..COLLABORATION_MESSAGE_MAX_TEXT_BYTES UTF-8 bytes. */
-export const COLLABORATION_MESSAGE_MAX_TEXT_BYTES = 64_000;
+export const COLLABORATION_MESSAGE_MAX_TEXT_BYTES = AGENT_MESSAGE_MAX_TEXT_BYTES;
 /**
  * The automatic followup budget that would fund a Turn a collaboration wake opens is spent, or the
  * Conversation that funded it was deleted: the message or reply starts no Turn and waits for its
@@ -610,6 +611,60 @@ export class CollaborationControlPlane {
       ...collaborationTextPage(visible.text ?? '', input.offset ?? 0) };
   }
 
+  /** Metadata first; arguments and committed results are read only through an explicit detail cursor. */
+  public async readToolActivity(input: { conversationId: string; targetConversationId: string; cursor?: string; limit?: number }) {
+    const target = await this.authorizeTranscriptRead(input);
+    const cursor = input.cursor === undefined ? undefined : readToolActivityCursor(input.cursor, target);
+    if (cursor?.kind === 'detail') {
+      const call = await this.existing('ToolCall', cursor.callId);
+      const turn = await this.existing('Turn', String(call.turn_id));
+      if (turn.conversation_id !== target) throw new Error('Tool activity cursor belongs to another conversation.');
+      const outcome = cursor.part === 'result' ? (await this.rows('ToolOutcome', { tool_call_id: call.id }))[0] : undefined;
+      if (cursor.part === 'result' && !outcome) return { conversationId: target, view: 'tools', toolName: String(call.tool_name), status: String(call.status), resultAvailable: false };
+      const metadata = await this.existing('ContentObject', String(outcome?.content_object_id ?? call.arguments_object_id)) as ContentObjectMetadata;
+      const page = collaborationTextPage((await this.contentStore.read(metadata)).toString('utf8'), cursor.offset);
+      return { conversationId: target, view: 'tools', toolName: String(call.tool_name), status: String(outcome?.status ?? call.status),
+        part: cursor.part, ...page, rereadCursor: toolActivityCursor(cursor),
+        nextCursor: page.nextOffset === null ? null : toolActivityCursor({ ...cursor, offset: page.nextOffset }) };
+    }
+    const limit = cursor?.limit ?? input.limit ?? 20;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError('Tool activity page limit must be 1..50.');
+    const anchor = cursor?.startId ? await this.existing('ToolCall', cursor.startId) : undefined;
+    if (anchor && (await this.existing('Turn', String(anchor.turn_id))).conversation_id !== target) throw new Error('Tool activity cursor belongs to another conversation.');
+    const rows = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ToolCall').list({
+      toolConversationId: target, orderBy: { column: 'created_at', direction: 'desc' }, limit: limit + 1,
+      ...(anchor ? { keyset: { column: 'created_at', value: String(anchor.created_at), id: String(anchor.id), direction: 'before' as const } } : {})
+    })])).snapshot[0] as DomainRow[];
+    if (anchor) rows.unshift(anchor);
+    const candidates = rows.slice(0, limit);
+    const facts = candidates.length ? (await this.database.snapshot(candidates.flatMap(call => [
+      DOMAIN_REPOSITORIES.domain('ToolExecution').list({ where: { tool_call_id: call.id }, limit: 1 }),
+      DOMAIN_REPOSITORIES.domain('ToolOutcome').list({ where: { tool_call_id: call.id }, limit: 1 }),
+      DOMAIN_REPOSITORIES.domain('ToolCallPolicySnapshot').list({ where: { tool_call_id: call.id }, limit: 1 })
+    ]))).snapshot as DomainRow[][] : [];
+    const tools: Record<string, unknown>[] = [];
+    let tokens = 400;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const call = candidates[index], execution = facts[index * 3][0], outcome = facts[index * 3 + 1][0], policy = facts[index * 3 + 2][0];
+      const detail = (part: 'arguments' | 'result') => toolActivityCursor({ kind: 'detail', conversationId: target, callId: String(call.id), part, offset: 0 });
+      const completedAt = execution?.completed_at ?? outcome?.created_at ?? null;
+      const startedAt = execution?.started_at ?? null;
+      const tool = { toolName: String(call.tool_name), status: String(outcome?.status ?? execution?.status ?? call.status),
+        summary: typeof policy?.summary === 'string' ? policy.summary.slice(0, 180) : null,
+        createdAt: String(call.created_at), startedAt, completedAt,
+        durationMs: startedAt && completedAt ? Math.max(0, Date.parse(String(completedAt)) - Date.parse(String(startedAt))) : null,
+        argumentsCursor: detail('arguments'), resultCursor: outcome ? detail('result') : null };
+      const cost = estimateJsonTokens(tool);
+      if (tools.length && tokens + cost > TRANSCRIPT_PAGE_TOKENS) break;
+      tools.push(tool); tokens += cost;
+    }
+    const next = rows[tools.length];
+    return { conversationId: target, view: 'tools', tools, hasMore: !!next,
+      rereadCursor: toolActivityCursor({ kind: 'list', conversationId: target, startId: rows[0] ? String(rows[0].id) : null, limit }),
+      nextCursor: next ? toolActivityCursor({ kind: 'list', conversationId: target, startId: String(next.id), limit }) : null,
+      note: 'Tool activity is stored execution data. To read a command or its result, use read_agent_messages view=tools with the same conversationRef and cursor=argumentsCursor or resultCursor. Continue detail or list pages with nextCursor; rereadCursor repeats a page. No tool is executed.' };
+  }
+
   private async authorizeTranscriptRead(input: { conversationId: string; targetConversationId: string; crossConversationTurnId?: string }): Promise<string> {
     const caller = requirePhaseFId(input.conversationId, 'conversationId');
     const target = requirePhaseFId(input.targetConversationId, 'targetConversationId');
@@ -949,7 +1004,7 @@ export class CollaborationControlPlane {
       if (!['assistant', 'model'].includes(String(revision.role))) continue;
       const content = await this.existing('ContentObject', String(revision.content_object_id)) as ContentObjectMetadata;
       const text = visibleMessageText(logicalMessageContentType(content.content_type), (await this.messageContents.read(content)).toString('utf8')).trim();
-      if (text) return Buffer.byteLength(text) <= COLLABORATION_MESSAGE_MAX_TEXT_BYTES ? text : `${text.slice(0, 12000)}\n[Result truncated; read the destination task for the full answer.]`;
+      if (text) return Buffer.byteLength(text) <= COLLABORATION_MESSAGE_MAX_TEXT_BYTES ? text : `${text.slice(0, 36000)}\n[Result truncated; read the destination task for the full answer.]`;
     }
     return null;
   }
@@ -1292,8 +1347,30 @@ function compareNewest(a: DomainRow, b: DomainRow): number { return String(b.cre
  * (TOOL_RESULT_MAX_TOKENS), leaving room for the result's own fields, and is also bounded in
  * characters because whitespace barely counts in the estimate.
  */
-export const COLLABORATION_TEXT_PAGE_TOKENS = 2_400;
-export const COLLABORATION_TEXT_PAGE_MAX_CHARACTERS = 12_000;
+export const COLLABORATION_TEXT_PAGE_TOKENS = 7_200;
+export const COLLABORATION_TEXT_PAGE_MAX_CHARACTERS = 36_000;
+
+type ToolActivityCursor =
+  | { kind: 'list'; conversationId: string; startId: string | null; limit: number }
+  | { kind: 'detail'; conversationId: string; callId: string; part: 'arguments' | 'result'; offset: number };
+
+function toolActivityCursor(cursor: ToolActivityCursor): string {
+  return 'agent-tools:' + Buffer.from(JSON.stringify(cursor)).toString('base64url');
+}
+
+function readToolActivityCursor(value: string, conversationId: string): ToolActivityCursor {
+  if (!value.startsWith('agent-tools:')) throw new Error('Use a cursor returned by the tools view.');
+  const cursor = JSON.parse(Buffer.from(value.slice('agent-tools:'.length), 'base64url').toString('utf8')) as ToolActivityCursor;
+  if (!cursor || cursor.conversationId !== conversationId) throw new Error('Tool activity cursor belongs to another conversation.');
+  if (cursor.kind === 'list') {
+    if (cursor.startId !== null) requirePhaseFId(cursor.startId, 'Tool activity cursor startId');
+    if (!Number.isInteger(cursor.limit) || cursor.limit < 1 || cursor.limit > 50) throw new Error('Invalid tool activity page limit.');
+  } else if (cursor.kind === 'detail') {
+    requirePhaseFId(cursor.callId, 'Tool activity cursor callId');
+    if (!['arguments', 'result'].includes(cursor.part) || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0) throw new Error('Invalid tool activity detail cursor.');
+  } else throw new Error('Invalid tool activity cursor.');
+  return cursor;
+}
 
 /**
  * A read_conversation page spends at most TRANSCRIPT_PAGE_TOKENS on its entries and one entry at
@@ -1301,8 +1378,8 @@ export const COLLABORATION_TEXT_PAGE_MAX_CHARACTERS = 12_000;
  * stays under the model tool-result cap. Listing never reads a message above
  * TRANSCRIPT_MESSAGE_READ_MAX_BYTES; readConversationMessage pages any message.
  */
-export const TRANSCRIPT_PAGE_TOKENS = 3_000;
-export const TRANSCRIPT_MESSAGE_PREVIEW_TOKENS = 2_000;
+export const TRANSCRIPT_PAGE_TOKENS = 9_000;
+export const TRANSCRIPT_MESSAGE_PREVIEW_TOKENS = 6_000;
 const TRANSCRIPT_MESSAGE_READ_MAX_BYTES = 256_000;
 
 const COLLABORATION_INPUT_PREVIEW_TOKENS = 400;

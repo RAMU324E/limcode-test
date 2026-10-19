@@ -3644,6 +3644,11 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
     parameters.__mailbox_conversation = requireRuntimeId(read.collaborationConversationId);
     predicates.push(`(EXISTS (SELECT 1 FROM collaboration_message_source_link AS source WHERE source.message_id = collaboration_message.id AND source.conversation_id = @__mailbox_conversation) OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target WHERE target.message_id = collaboration_message.id AND target.conversation_id = @__mailbox_conversation))`);
   }
+  if (read.toolConversationId !== undefined) {
+    if (schema.key !== 'ToolCall') throw new TypeError('Tool conversation scope is only valid for ToolCall.');
+    parameters.__tool_conversation = requireRuntimeId(read.toolConversationId);
+    predicates.push('tool_call.turn_id IN (SELECT id FROM turn WHERE conversation_id = @__tool_conversation)');
+  }
   if (read.collaborationRootConversationId !== undefined) {
     if (schema.key !== 'ChildExecution') throw new TypeError('Collaboration roster scope is only valid for ChildExecution.');
     parameters.__collaboration_root = requireRuntimeId(read.collaborationRootConversationId);

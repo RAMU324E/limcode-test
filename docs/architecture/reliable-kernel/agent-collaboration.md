@@ -44,7 +44,8 @@
 - `list_agents` 只返回同根团队成员。
 - `send_agent_message` 保存同伴消息：目标在运行就在安全边界注入；目标空闲就开启它的一轮来读消息（见下文「唤醒空闲目标」）。工具结果的 `targetDelivery` 告诉发送方是哪一种：已送入运行中的轮次、会开启目标的一轮（或等目标当前一轮结束后开启）、自动续派预算已用完而等目标下一轮，或只等目标下一轮。
 - `followup_agent_task` 提交明确任务；活动目标在安全边界接收，空闲目标通过原调度器继续执行。
-- `read_agent_messages/wait_agent_messages` 有界读取和等待，不改变处理状态，不启动目标。`read_agent_messages` 用 M# `messageRef` 读取一条协作消息的全文时按页返回：每页至多 2400 个估算 token（`COLLABORATION_TEXT_PAGE_TOKENS`）和 12000 个字符，附 `offset`、`nextOffset` 与 `totalCharacters`，不拆开代理对；沿 `nextOffset` 读到 `null` 即得全文。`view=conversation` 时用 R# `messageRef` 以同样方式读取团队成员的一条对话消息。消息的发送方与接收方都能读，团队成员与跨对话的双方相同。
+- `read_agent_messages/wait_agent_messages` 有界读取和等待，不改变处理状态，不启动目标。`read_agent_messages` 用 M# `messageRef` 读取一条协作消息的全文时按页返回：每页至多 7200 个估算 token（`COLLABORATION_TEXT_PAGE_TOKENS`）和 36000 个字符，附 `offset`、`nextOffset` 与 `totalCharacters`，不拆开代理对；沿 `nextOffset` 读到 `null` 即得全文。`view=conversation` 时用 R# `messageRef` 以同样方式读取团队成员的一条对话消息。消息的发送方与接收方都能读，团队成员与跨对话的双方相同。
+- `read_agent_messages view=tools` 加团队成员的 `conversationRef`，按最新在前列出实际工具调用的名称、状态、摘要、开始/结束时间与耗时。列表只按目标对话的 Turn 索引读取元数据，不读取参数或结果正文。把某条记录的 `argumentsCursor` 或 `resultCursor` 作为同一视图的 `cursor`，可读取已保存的 shell 命令、参数、退出码和捕获的输出；长详情与更早列表沿 `nextCursor` 继续，`rereadCursor` 重读本页。结果尚未提交时 `resultCursor` 为 `null`，之后重新列举即可。沿用团队范围授权，不执行或重放工具，不新增后台扫描，也不自动把全部工具记录注入主 Agent 上下文。
 - 留言板代码保留，但第一期不向模型下发 `agent_board`。
 
 发送可选择排队到目标本轮结束：目标正在运行时，消息锚定当前 Turn 且不注入该 Turn；该 Turn 结束后，followup 由持久唤醒开启恰好一轮新 Turn，团队 message 同样由唤醒开启目标的一轮（跨对话 message 随目标下一轮带入）。跨对话 followup 还要求整轮独占，见下文「跨对话协作」。排队等待期间不做周期轮询，不拥有目标对话的宿主也一样：目标轮次结束的提交在本宿主直接触发扫描，其他宿主的提交或该轮的恢复通过外部数据版本变化触发扫描。完成后自动回送的结果不排队，仍在请求方运行中的 Turn 安全边界注入；请求方没有运行中的轮次时，团队回复和跨对话任务的回复都开启请求方的一轮（跨对话见下文「跨对话协作」）；子 Agent 发给父级的普通消息和回复也按相同规则唤醒，不必等待最终回答。若用户在该轮吸收前停止它，这条结果与其他投向该轮但还没被吸收的 message 一样改回等待下一轮：该轮的结束提交在同一事务里完成这一步（读取之后才送达的，提交会失败并重新读取），所以紧接着开始的下一轮一定能读到，不会与唤醒扫描竞争而漏到再下一轮。之后团队 message、团队回复和跨对话任务的回复都立即开启目标的新一轮（按下文「唤醒空闲目标」的规则和预算），不必等完它轮询已结束轮次时留下的退避；不唤醒的消息（留言板通知、跨对话 message）的唤醒随即结清，不再为它重试或让对话一直显示忙碌。
@@ -70,7 +71,7 @@
 
 手动压缩和从原始记录重建摘要的维护轮次不接收任何投递：开始时不带入等待下一轮的消息，运行期间到达的消息、回复和任务（包括重启后恢复扫描推进的投递）也不注入它，而是等它结束后由下一个真正的轮次带入或开启；团队的运行中成员通知把它视为空闲。
 
-消息正文保存到 CAS；消息、来源、目标、回复关系、任务请求和请求对应 Turn 分别持久化。每条协作消息正文为 1 到 64000 个 UTF-8 字节（常量 `COLLABORATION_MESSAGE_MAX_TEXT_BYTES`，位于 `collaborationControlPlane.ts`），超出时拒绝发送，不写入任何东西；自动回送的完成结果超出时截断，并提示到目标对话读取完整答复。接收方上下文中的协作信封至多 4000 个估算 token（`RUNTIME_DELIVERY_MODEL_MAX_TOKENS`），更长的正文只显示开头和结尾，截断标记写明读取全文的确切调用：`read_agent_messages with messageRef=M# and offset=0`，再沿 `nextOffset` 读到 `null`。发送结果仍为已接受，但接收方会先看到预览时附 `recipientSeesPreview` 与说明。
+消息正文保存到 CAS；消息、来源、目标、回复关系、任务请求和请求对应 Turn 分别持久化。每条协作消息正文为 1 到 192000 个 UTF-8 字节（常量 `COLLABORATION_MESSAGE_MAX_TEXT_BYTES`，位于 `collaborationControlPlane.ts`），超出时拒绝发送，不写入任何东西；自动回送的完成结果超出时截断，并提示到目标对话读取完整答复。接收方上下文中的协作信封与子任务答复至多 12000 个估算 token（`AGENT_REPORT_MAX_TOKENS`），更长的正文只显示开头和结尾，截断标记写明读取全文的确切调用：`read_agent_messages with messageRef=M# and offset=0`，再沿 `nextOffset` 读到 `null`。发送结果仍为已接受，但接收方会先看到预览时附 `recipientSeesPreview` 与说明。报告读取类工具的单项结果预算也扩大到普通工具的三倍，仍共享原来的批次预算；shell 等普通工具与后台进程完成通知保留原预算。
 
 没有轮次会回答的 followup 由收敛结算，请求不会一直停在等待状态。有三种情况：全部投递都失败（例如排队期间目标对话被删除，或续跑轮次始终无法建立权限）；投递被确认为通知而没有开启轮次（例如等待期间目标子任务被停止）；接收它的轮次已经结束，但回复送出前目标对话连同轮次被删除。
 
@@ -92,7 +93,7 @@
 开关就是授权（决定 §7.18）：后端按轮次冻结的开关直接向顶层对话提供并放行下列五个工具，不看工具列表；设置界面开关只写开关值本身，不写入任何作用域的 `allowedTools`。因此上层保存了不含这些工具的列表、下层各自保存了列表，或全局关闭而某个 Agent 自己开启，结果都只由该轮生效的开关决定。唯一与列表有关的规则是 `run_agent`：Turn 的有效工具列表不含 `run_agent` 时，只提供并放行列出和读取两个工具，发送、新建和分支都不提供；之后给列表加回 `run_agent`，发送类工具随下一轮出现，不需要其他改动。这五个工具的名字在任何工具列表里都被忽略：解析时从列表和默认工具集中去掉，设置页下一次保存列表时也会去掉；以前保存的 `crossConversationGrantedTools` 字段不再有意义，读取时忽略，不做迁移。开关是唯一的开关控制，工具设置里不能单独停用其中某一个工具，只能逐个把执行确认改为每次确认（`toolConfigs[工具名].autoApproveExecution: false`）。工具设置页把这五个工具显示为由开关控制（勾选框不可用），「Agent 协作」里的说明显示当前实际生效的状态：关闭、只提供列出和读取，或全部五个。工具设置的「恢复继承」只重置工具设置，保留「Agent 协作」里保存的开关和协作上限。
 
 - `list_conversations`、`read_conversation`（只读）：列出发起对话所在项目的其他活动顶层对话（见下文「项目范围」），读取其用户与模型消息，不启动、不改变、也不确认目标。结果附不可信数据提示。
-  - 每页从最新消息开始花预算：条目合计至多 3000 个估算 token（`TRANSCRIPT_PAGE_TOKENS`），单条至多 2000（`TRANSCRIPT_MESSAGE_PREVIEW_TOKENS`），整个结果低于 4000 token 的工具结果上限，最后的答复总会显示。
+  - 每页从最新消息开始花预算：条目合计至多 9000 个估算 token（`TRANSCRIPT_PAGE_TOKENS`），单条至多 6000（`TRANSCRIPT_MESSAGE_PREVIEW_TOKENS`），整个结果低于 12000 token 的协作工具结果上限，最后的答复总会显示。
   - 放不下的更早消息不列出，也不冒充超长消息：结果给出 `olderMessageRef`，以 `beforeMessageRef` 接着读，并附说明。
   - 超长消息只显示开头，标 `truncated` 并给出 `nextOffset`；用 `read_conversation` 的 R# `messageRef` 加 `offset` 按页读取全文。列举时不读取超过 256000 字节的消息正文，只给大小，全文同样按页读取。
   - 轮次收到的协作任务、消息和回复以 `role: collaboration` 条目排在该轮消息之前，附来源对话和模式，正文至多 400 个估算 token。分支不复制这些投递，所以分支的记录里没有它们。

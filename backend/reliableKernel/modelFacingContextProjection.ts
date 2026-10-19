@@ -46,6 +46,7 @@ import {
   renderSkillWithinTokens,
   skillLoadFailureText
 } from './skillToolResultProjection';
+import { agentReportTool } from './collaborationOutputBudget';
 
 /** Decimal compression-planning budgets. Only the body target below is Conversation-configurable. */
 export const TURN_REMINDER_MAX_TOKENS = 2_000;
@@ -858,6 +859,7 @@ function prepareTextToolResult(
 
 function projectTextToolResult(prepared: PreparedTextToolResult, allocatedTokens: number): ToolResultProjectionItem {
   const { input, toolName, skill, error, fullText, originalTokens } = prepared;
+  if (agentReportTool(toolName)) allocatedTokens *= 3;
   const measure = (text: string): number => estimateJsonTokens(modelTextToolResponse(text, error));
   let text = fullText;
   let reread: ToolResultRereadTarget | undefined;
@@ -1901,6 +1903,7 @@ function prepareToolResult(
     ...rawInput,
     toolName: requireText(rawInput.toolName, `toolResults[${index}].toolName`)
   };
+  if (agentReportTool(input.toolName)) perResultTokens *= 3;
   const readView = input.toolName === READ_TOOL_NAME ? readResultView(input.response) : undefined;
   const measurement = readView ? undefined : retainedMeasurement?.json
     ? { tokens: retainedMeasurement.tokens, ...retainedMeasurement.json }

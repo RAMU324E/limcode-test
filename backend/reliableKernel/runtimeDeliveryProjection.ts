@@ -9,6 +9,7 @@ import {
   type PlainJsonValue
 } from './plainJson';
 import { estimateTextTokens } from './modelTokenEstimator';
+import { AGENT_REPORT_MAX_TOKENS } from './collaborationOutputBudget';
 import {
   projectKnownToolValue,
   prepareModelHandleCatalog,
@@ -252,7 +253,7 @@ export function decodeRuntimeDeliveryModelEnvelope(
 /** Stable text sent under the Provider's ordinary user-role transport without granting authority. */
 export function renderRuntimeDeliveryModelEnvelope(
   envelopeInput: RuntimeDeliveryModelEnvelope,
-  maxTokens = RUNTIME_DELIVERY_MODEL_MAX_TOKENS,
+  maxTokens: number = envelopeInput.kind === 'process_completion' ? RUNTIME_DELIVERY_MODEL_MAX_TOKENS : AGENT_REPORT_MAX_TOKENS,
   modelHandleCatalog: ModelHandleCatalog | unknown = { entries: [] }
 ): string {
   const envelope = requireRuntimeDeliveryModelEnvelope(envelopeInput);

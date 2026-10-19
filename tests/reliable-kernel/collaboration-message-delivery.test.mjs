@@ -297,6 +297,20 @@ test('changed committed ToolCall arguments are rejected before collaboration or 
   assert.deepEqual(value.calls, []); assert.deepEqual(value.settlements, []);
 });
 
+test('the tools view preserves opaque activity cursors through the real dispatcher', async () => {
+  const args = { view: 'tools', targetConversationId: 'peer', cursor: 'agent-tools:detail' };
+  const value = frozenDispatcher('read_agent_messages', args);
+  value.dispatcher.dependencies.collaboration.readToolActivity = async input => {
+    assert.equal(input.cursor, args.cursor);
+    assert.equal(input.targetConversationId, 'peer');
+    return { view: 'tools', text: 'shell output', nextCursor: 'agent-tools:next', rereadCursor: args.cursor };
+  };
+  await value.dispatcher.dispatch(value.input, undefined, value.authority);
+  const detail = value.settlements[0].detail;
+  assert.equal(detail.nextCursor, 'agent-tools:next');
+  assert.equal(detail.nextAfterMessageId, undefined);
+});
+
 test('one followup commits once, is attributed as non-user input and returns one durable completion reply', async () => {
   const s = await f.scenario('followup'), source = await s.source();
   const input = { source, targetConversationId: s.root, text: 'review the evidence', mode: 'followup' };
@@ -505,7 +519,7 @@ async function seedTranscript(conversationId, text) {
 }
 
 test('a bounded peer transcript preview names a paged read that reconstructs long Chinese text', async () => {
-  const s = await f.scenario('transcript-pages'), text = '中文正文😀'.repeat(2000);
+  const s = await f.scenario('transcript-pages'), text = '中文正文😀'.repeat(6000);
   const messageId = await seedTranscript(s.outsider, text);
   const scope = { conversationId: s.root, targetConversationId: s.outsider, crossConversationTurnId: s.turn('root') };
   const preview = await f.app.runtime.collaboration.readConversation({ ...scope, limit: 1 });
@@ -515,7 +529,7 @@ test('a bounded peer transcript preview names a paged read that reconstructs lon
   for (let offset = 0; offset !== null;) {
     const page = await f.app.runtime.collaboration.readConversationMessage({ ...scope, messageId, offset });
     assert.equal(page.offset, offset);
-    assert.ok(Buffer.byteLength(JSON.stringify(page)) < 32768);
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) < 98304);
     chunks.push(page.text); offset = page.nextOffset;
   }
   assert.ok(chunks.length > 1);
